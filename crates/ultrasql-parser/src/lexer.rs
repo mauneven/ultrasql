@@ -286,9 +286,24 @@ impl<'src> Lexer<'src> {
             for (i, b) in raw.bytes().enumerate() {
                 buf[i] = b.to_ascii_lowercase();
             }
-            // SAFETY: we wrote only ASCII (lowercased letters, digits,
-            // underscores) into `buf`, so the slice is valid UTF-8.
-            unsafe { std::str::from_utf8_unchecked(&buf[..raw.len()]) }
+            // Defence in depth: the loop above wrote only ASCII bytes
+            // (lowercased letters, digits, underscores), so the slice
+            // is trivially valid UTF-8 — but a future edit that
+            // changed the filter could violate that invariant
+            // silently if we used `from_utf8_unchecked`. Use the
+            // checked form; the cost is one pass over the bytes per
+            // identifier and the keyword table caches results.
+            match std::str::from_utf8(&buf[..raw.len()]) {
+                Ok(s) => s,
+                Err(_) => {
+                    // Unreachable in practice; surfaces a real bug as
+                    // an error rather than UB if the filter regresses.
+                    return Err(LexerError::UnexpectedChar {
+                        ch: raw.chars().next().unwrap_or('\0'),
+                        offset: start,
+                    });
+                }
+            }
         } else {
             // Out-of-line slow path: identifier is too long for the
             // stack buffer or contains non-ASCII bytes. Allocate a
