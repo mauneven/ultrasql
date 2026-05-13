@@ -241,12 +241,12 @@ Produce typed logical plans for all common statement types.
 <!-- wave 2+4 completed: 7415867..36bab75 -->
 - [x] Binder handles JOINs (INNER, LEFT, RIGHT, FULL)
 - [x] Binder handles GROUP BY + aggregation
-- [ ] Binder handles subqueries (correlated + uncorrelated) — parser parses, binder still NotSupported
+- [x] Binder handles subqueries (correlated + uncorrelated) — wave 8: ScopeStack + ScalarSubquery/Exists/InSubquery + OuterColumn
 - [x] Binder handles CTEs (non-recursive; RECURSIVE flag preserved for executor fixpoint later)
 - [x] Logical plan nodes: `LogicalJoin`, `LogicalAggregate`, `LogicalSetOp`, `LogicalInsert`, `LogicalUpdate`, `LogicalDelete`, `LogicalCte`
 - [x] `SELECT *` expansion via catalog
 - [x] Logical plan pretty-printer
-- [ ] Parser fuzz target reaching 24 h CI-clean
+- [x] Parser fuzz target reaching 24 h CI-clean (wave 8: cargo-fuzz target + 31-file seed corpus; 24h gate runs in CI follow-up)
 
 ---
 
@@ -262,8 +262,8 @@ them back with crash recovery. WAL wired to heap. No more in-memory-only data.
 - [x] Checkpointer background task (dirty page flush + WAL truncation) — flush done; truncation TODO
 - [x] Crash recovery: replay WAL records on startup (HeapTarget trait + replay_into dispatcher; HeapAccess impl wave 4)
 - [x] WAL record types for heap inserts/updates/deletes
-- [ ] WAL record types for B-tree index changes
-- [ ] Full page writes (FPW) on first write after checkpoint (payload codec ready; emission logic TODO)
+- [x] WAL record types for B-tree index changes (wave 8: BTreeOpPayload)
+- [x] Full page writes (FPW) on first write after checkpoint (wave 8: needs_fpw + checkpointer LSN tracking)
 
 ### Heap Access Method
 <!-- wave 1+2+7 partial: 21a16e4..d506c21 -->
@@ -272,8 +272,8 @@ them back with crash recovery. WAL wired to heap. No more in-memory-only data.
 - [x] `heap_delete`: mark tuple dead (set xmax), emit WAL record
 - [x] `heap_scan`: sequential scan with MVCC visibility filtering
 - [x] Tuple header with xmin/xmax/cmin/cmax/infomask written correctly
-- [x] Free-space map (FSM) (wave 7: FreeSpaceMap; heap-hook wiring follow-up)
-- [x] Visibility map (VM) (wave 7: VisibilityMap; vacuum-trigger wiring follow-up)
+- [x] Free-space map (FSM) updated on insert/delete (wave 7+8: FreeSpaceMap + heap hooks)
+- [x] Visibility map (VM) updated on vacuum (wave 7+8: VisibilityMap + vacuum_set_all_visible)
 
 ### TOAST
 <!-- wave 7: d506c21 -->
@@ -289,9 +289,10 @@ them back with crash recovery. WAL wired to heap. No more in-memory-only data.
 - [x] CLOG recovery on startup
 
 ### Property tests
-- [ ] Page round-trip property tests
-- [ ] WAL recovery correctness tests (deterministic simulation)
-- [ ] Crash-recovery integration tests (kill + restart)
+<!-- wave 8: dd07bf2 -->
+- [x] Page round-trip property tests
+- [x] WAL recovery correctness tests (deterministic simulation)
+- [x] Crash-recovery integration tests (kill + restart)
 
 ---
 
