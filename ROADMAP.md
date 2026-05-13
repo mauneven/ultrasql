@@ -177,21 +177,22 @@ Produce typed logical plans for all common statement types.
 - [x] `TRUNCATE TABLE t`
 
 ### Parser: DDL
-- [ ] `CREATE TABLE t (col type [constraints], ...)`
-- [ ] `CREATE TABLE IF NOT EXISTS`
-- [ ] `CREATE TABLE t AS SELECT ...`
-- [ ] `DROP TABLE t` / `DROP TABLE IF EXISTS t CASCADE/RESTRICT`
-- [ ] `ALTER TABLE t ADD COLUMN col type`
-- [ ] `ALTER TABLE t DROP COLUMN col`
-- [ ] `ALTER TABLE t RENAME COLUMN old TO new`
-- [ ] `ALTER TABLE t RENAME TO new_name`
-- [ ] `CREATE SCHEMA s` / `DROP SCHEMA s`
-- [ ] `SET search_path TO schema, public`
-- [ ] `CREATE INDEX name ON t (col [ASC|DESC] [NULLS FIRST|LAST])`
-- [ ] `CREATE UNIQUE INDEX`
-- [ ] `CREATE INDEX IF NOT EXISTS`
-- [ ] `DROP INDEX` / `REINDEX TABLE/INDEX`
-- [ ] `CREATE SEQUENCE` / `ALTER SEQUENCE` / `DROP SEQUENCE`
+<!-- wave 2 completed: 7415867..7647f43 -->
+- [x] `CREATE TABLE t (col type [constraints], ...)`
+- [x] `CREATE TABLE IF NOT EXISTS`
+- [x] `CREATE TABLE t AS SELECT ...`
+- [x] `DROP TABLE t` / `DROP TABLE IF EXISTS t CASCADE/RESTRICT`
+- [x] `ALTER TABLE t ADD COLUMN col type`
+- [x] `ALTER TABLE t DROP COLUMN col`
+- [x] `ALTER TABLE t RENAME COLUMN old TO new`
+- [x] `ALTER TABLE t RENAME TO new_name`
+- [x] `CREATE SCHEMA s` / `DROP SCHEMA s`
+- [x] `SET search_path TO schema, public`
+- [x] `CREATE INDEX name ON t (col [ASC|DESC] [NULLS FIRST|LAST])`
+- [x] `CREATE UNIQUE INDEX`
+- [x] `CREATE INDEX IF NOT EXISTS`
+- [x] `DROP INDEX` / `REINDEX TABLE/INDEX`
+- [x] `CREATE SEQUENCE` / `ALTER SEQUENCE` / `DROP SEQUENCE`
 
 ### Parser: SELECT completeness
 - [ ] `SELECT *` (currently returns `NotSupported`)
@@ -235,13 +236,14 @@ Produce typed logical plans for all common statement types.
 - [ ] Parameter placeholders `$1`, `$2`, ... (prepared statements)
 
 ### Planner updates
+<!-- wave 2 partial: 7415867..7647f43 -->
 - [ ] Binder handles JOINs (INNER, LEFT, RIGHT, FULL)
 - [ ] Binder handles GROUP BY + aggregation
 - [ ] Binder handles subqueries (correlated + uncorrelated)
 - [ ] Binder handles CTEs
-- [ ] Logical plan nodes: `LogicalJoin`, `LogicalAggregate`, `LogicalUnion`, `LogicalInsert`, `LogicalUpdate`, `LogicalDelete`
+- [x] Logical plan nodes: `LogicalJoin`, `LogicalAggregate`, `LogicalUnion`, `LogicalInsert`, `LogicalUpdate`, `LogicalDelete` (Insert/Update/Delete shipped; Join/Aggregate/Union remain for wave 3)
 - [ ] `SELECT *` expansion via catalog
-- [ ] Logical plan pretty-printer
+- [x] Logical plan pretty-printer (display() extended for all DML variants)
 - [ ] Parser fuzz target reaching 24 h CI-clean
 
 ---
@@ -262,10 +264,10 @@ them back with crash recovery. WAL wired to heap. No more in-memory-only data.
 - [ ] Full page writes (FPW) on first write after checkpoint
 
 ### Heap Access Method
-<!-- wave 1 partial: 21a16e4..008b457 -->
-- [ ] `heap_insert`: write MVCC tuple to buffer pool page, emit WAL record (insert lands ok; WAL emission in wave 2)
+<!-- wave 1+2 partial: 21a16e4..7647f43 -->
+- [x] `heap_insert`: write MVCC tuple to buffer pool page, emit WAL record
 - [x] `heap_update`: HOT update chain when no indexed column changes
-- [ ] `heap_delete`: mark tuple dead (set xmax), emit WAL record (delete lands ok; WAL emission in wave 2)
+- [x] `heap_delete`: mark tuple dead (set xmax), emit WAL record
 - [x] `heap_scan`: sequential scan with MVCC visibility filtering
 - [x] Tuple header with xmin/xmax/cmin/cmax/infomask written correctly
 - [ ] Free-space map (FSM) updated on insert/delete
