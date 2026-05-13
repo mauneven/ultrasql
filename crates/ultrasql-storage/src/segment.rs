@@ -212,6 +212,15 @@ impl SegmentFile {
     }
 
     /// Build a fresh mmap for the file's current length.
+    //
+    // TODO(security): the mmap-as-`&[u8]` view rests on the threat-model
+    // assumption that no concurrent OS process mutates the segment file
+    // while UltraSQL is reading. If that assumption is violated, the
+    // view technically violates Rust's aliasing rules; mitigation is
+    // either advisory file locking or `MAP_PRIVATE` semantics. The
+    // existing buffer-pool checksum catches integrity violations, but
+    // not the soundness problem. Deferred — fix is non-trivial and the
+    // threat is documented in SECURITY.md.
     fn map(file: &File, len: u64) -> Result<MmapMut, SegmentError> {
         if len == 0 {
             return Err(SegmentError::Layout("cannot map a zero-length segment"));
@@ -225,6 +234,12 @@ impl SegmentFile {
         // no other entity in this address space maps the same range.
         // Length matches the file's reported metadata, taken under the
         // segment's exclusive growth lock.
+        //
+        // Threat model: external processes with write access to the
+        // segment file CAN race the mapping. UltraSQL's deployment
+        // contract is "the engine owns its data directory"; violating
+        // that assumption falls back to checksum-detect, not memory
+        // safety. See TODO(security) above.
         let map = unsafe { MmapOptions::new().len(len_usize).map_mut(file)? };
         Ok(map)
     }

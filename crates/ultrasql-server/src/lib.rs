@@ -348,6 +348,15 @@ where
 
     /// Read one frontend message, growing the buffer until the codec
     /// has a complete frame.
+    //
+    // TODO(security): add per-connection slow-loris timeout. A client
+    // that opens a TCP session and then dribbles bytes at 1 byte/minute
+    // currently holds the connection forever (the buffer grows up to
+    // MAX_MESSAGE_BYTES = 16 MiB, then decode rejects, but the session
+    // never times out on its own). Wrap the read in a tokio timer with
+    // a configurable `statement_timeout` / `idle_in_transaction_timeout`
+    // and tear the session down on expiry. Deferred because it requires
+    // wiring server-level config plumbing.
     async fn read_frontend(&mut self) -> Result<FrontendMessage, ServerError> {
         loop {
             if let Some(msg) = decode_frontend(&mut self.read_buf)? {
