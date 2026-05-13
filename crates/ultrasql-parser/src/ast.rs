@@ -68,6 +68,20 @@ pub enum Statement {
     AlterSequence(Box<AlterSequenceStmt>),
     /// `DROP SEQUENCE …`.
     DropSequence(DropSequenceStmt),
+    /// `SAVEPOINT name`.
+    Savepoint(SavepointStmt),
+    /// `ROLLBACK TO [SAVEPOINT] name`.
+    RollbackToSavepoint(RollbackToSavepointStmt),
+    /// `RELEASE [SAVEPOINT] name`.
+    ReleaseSavepoint(ReleaseSavepointStmt),
+    /// `EXPLAIN [ANALYZE] [VERBOSE] [(FORMAT …)] stmt`.
+    Explain(Box<ExplainStmt>),
+    /// `PREPARE name [(types)] AS stmt`.
+    Prepare(Box<PrepareStmt>),
+    /// `EXECUTE name [(args)]`.
+    Execute(ExecuteStmt),
+    /// `DEALLOCATE [ALL | name]`.
+    Deallocate(DeallocateStmt),
 }
 
 impl Statement {
@@ -94,6 +108,13 @@ impl Statement {
             Self::CreateSequence(s) => s.span,
             Self::AlterSequence(s) => s.span,
             Self::DropSequence(s) => s.span,
+            Self::Savepoint(s) => s.span,
+            Self::RollbackToSavepoint(s) => s.span,
+            Self::ReleaseSavepoint(s) => s.span,
+            Self::Explain(s) => s.span,
+            Self::Prepare(s) => s.span,
+            Self::Execute(s) => s.span,
+            Self::Deallocate(s) => s.span,
         }
     }
 }
@@ -653,26 +674,93 @@ pub struct TruncateStmt {
     pub span: Span,
 }
 
-/// A `SELECT` statement.
+// ============================================================================
+// SELECT-level AST — extended for v0.2
+// ============================================================================
+
+/// A `SELECT` statement, including optional WITH clause (CTEs) and set
+/// operations (UNION / INTERSECT / EXCEPT).
+///
+/// # Breaking change (v0.2)
+/// `from` is now `Vec<TableRef>` (was `Option<TableRef>`). The join tree is
+/// encoded as a left-deep chain of [`TableRef::Join`] nodes; comma-separated
+/// tables are canonicalised to `JoinOp::Cross`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SelectStmt {
-    /// Whether `DISTINCT` was specified.
-    pub distinct: bool,
+    /// DISTINCT / DISTINCT ON / ALL / no keyword.
+    pub distinct: Distinct,
     /// Output items.
     pub projection: Vec<SelectItem>,
-    /// `FROM` clause (zero or one table reference for now; joins land
-    /// in a follow-up).
-    pub from: Option<TableRef>,
+    /// `FROM` clause. Zero entries means no `FROM` (e.g. `SELECT 1`).
+    /// Multiple entries represent a left-deep join tree where comma-joins
+    /// have been canonicalised to `JoinOp::Cross`.
+    pub from: Vec<TableRef>,
     /// `WHERE` predicate.
     pub r#where: Option<Expr>,
+    /// `GROUP BY` expressions.
+    pub group_by: Vec<Expr>,
+    /// `HAVING` predicate (only meaningful when `group_by` is non-empty).
+    pub having: Option<Expr>,
     /// `ORDER BY` items.
     pub order_by: Vec<OrderItem>,
     /// `LIMIT n`.
     pub limit: Option<Expr>,
     /// `OFFSET n`.
     pub offset: Option<Expr>,
+    /// Chained UNION / INTERSECT / EXCEPT tails. In PostgreSQL, set ops bind
+    /// less tightly than ORDER BY / LIMIT. For v0.2 we represent the chain
+    /// here and leave precedence enforcement to the binder.
+    pub set_ops: Vec<SetOpTail>,
+    /// Leading `WITH [RECURSIVE]` CTEs.
+    pub ctes: Vec<Cte>,
     /// Source span.
     pub span: Span,
+}
+
+/// DISTINCT / DISTINCT ON / ALL / (implicit none).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Distinct {
+    /// No DISTINCT keyword (implicit ALL rows).
+    None,
+    /// `ALL` keyword was explicit.
+    All,
+    /// `DISTINCT` with no ON clause.
+    Distinct,
+    /// `DISTINCT ON (expr, …)`.
+    DistinctOn(Vec<Expr>),
+}
+
+/// One UNION / INTERSECT / EXCEPT tail following a SELECT body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetOpTail {
+    /// The set operation.
+    pub op: SetOp,
+    /// ALL or DISTINCT (default is DISTINCT per SQL standard).
+    pub quantifier: SetQuantifier,
+    /// Right-hand SELECT of the set operation.
+    pub right: Box<SelectStmt>,
+    /// Source span of this tail (from the keyword through to end of right).
+    pub span: Span,
+}
+
+/// Set operation kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetOp {
+    /// `UNION`.
+    Union,
+    /// `INTERSECT`.
+    Intersect,
+    /// `EXCEPT`.
+    Except,
+}
+
+/// Set quantifier for a set operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetQuantifier {
+    /// `DISTINCT` (default per SQL standard).
+    Distinct,
+    /// `ALL` — keep duplicates.
+    All,
 }
 
 /// One entry in the `SELECT` projection list.
@@ -702,8 +790,11 @@ pub enum SelectItem {
 }
 
 /// A table reference in the `FROM` clause.
+///
+/// The v0.2 extension adds [`TableRef::Join`] (explicit join syntax and
+/// comma-separated table lists canonicalised to CROSS JOIN) and
+/// [`TableRef::Subquery`] (derived tables).
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum TableRef {
     /// A bare table name with an optional alias.
     Named {
@@ -714,6 +805,80 @@ pub enum TableRef {
         /// Source span.
         span: Span,
     },
+    /// An explicit or implicit join between two table references.
+    ///
+    /// The parser builds a left-deep tree: the first table in the FROM
+    /// clause is the leftmost leaf; each subsequent join wraps the
+    /// current left side.
+    Join {
+        /// Left-hand table or sub-tree.
+        left: Box<Self>,
+        /// Join type.
+        op: JoinOp,
+        /// Right-hand table factor.
+        right: Box<Self>,
+        /// Join condition.
+        condition: JoinCondition,
+        /// Source span.
+        span: Span,
+    },
+    /// A derived table (subquery in FROM).
+    ///
+    /// PostgreSQL requires an alias on every derived table. Parsing
+    /// without an alias is a [`crate::parser::ParseError`].
+    Subquery {
+        /// The inner SELECT.
+        select: Box<SelectStmt>,
+        /// Required alias for the derived table.
+        alias: Identifier,
+        /// Optional column-alias list: `AS t(c1, c2, …)`.
+        column_aliases: Vec<Identifier>,
+        /// Source span.
+        span: Span,
+    },
+}
+
+/// Join operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinOp {
+    /// `[INNER] JOIN`.
+    Inner,
+    /// `LEFT [OUTER] JOIN`.
+    LeftOuter,
+    /// `RIGHT [OUTER] JOIN`.
+    RightOuter,
+    /// `FULL [OUTER] JOIN`.
+    FullOuter,
+    /// `CROSS JOIN` or comma-separated table factor.
+    Cross,
+}
+
+/// Join condition for an explicit join.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JoinCondition {
+    /// `ON expr`.
+    On(Expr),
+    /// `USING (col, …)`.
+    Using(Vec<Identifier>),
+    /// No condition (CROSS JOIN).
+    None,
+}
+
+/// Common table expression in a `WITH` clause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Cte {
+    /// CTE name.
+    pub name: Identifier,
+    /// Optional column-alias list: `cte_name(c1, c2, …)`.
+    pub column_aliases: Vec<Identifier>,
+    /// Whether `WITH RECURSIVE` was specified.
+    ///
+    /// The flag is replicated on every CTE in the same WITH clause.
+    pub recursive: bool,
+    /// The body SELECT.
+    pub query: Box<SelectStmt>,
+    /// Source span.
+    pub span: Span,
 }
 
 /// Order-by item.
@@ -785,6 +950,9 @@ pub struct Identifier {
 }
 
 /// SQL expression.
+///
+/// The enum is `#[non_exhaustive]` so that downstream crates are not broken
+/// when new expression kinds are added (e.g. window functions).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Expr {
@@ -859,6 +1027,74 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// Scalar subquery: `(SELECT …)`.
+    ///
+    /// The surrounding operator (`IN`, `EXISTS`, etc.) disambiguates the role.
+    Subquery {
+        /// The inner SELECT.
+        select: Box<SelectStmt>,
+        /// Source span.
+        span: Span,
+    },
+    /// `EXISTS (SELECT …)` / `NOT EXISTS (SELECT …)`.
+    Exists {
+        /// The inner SELECT.
+        select: Box<SelectStmt>,
+        /// `true` for `NOT EXISTS`.
+        negated: bool,
+        /// Source span.
+        span: Span,
+    },
+    /// `expr [NOT] IN (val, …)`.
+    InList {
+        /// The test expression.
+        expr: Box<Self>,
+        /// The list items (arbitrary expressions per PG).
+        items: Vec<Self>,
+        /// `true` for `NOT IN`.
+        negated: bool,
+        /// Source span.
+        span: Span,
+    },
+    /// `expr [NOT] IN (SELECT …)`.
+    InSubquery {
+        /// The test expression.
+        expr: Box<Self>,
+        /// The inner SELECT.
+        select: Box<SelectStmt>,
+        /// `true` for `NOT IN`.
+        negated: bool,
+        /// Source span.
+        span: Span,
+    },
+    /// `left_expr <op> ANY (SELECT …)`.
+    ///
+    /// The parser folds `lhs <op> ANY (sub)` into this node. Only
+    /// comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`) are valid
+    /// with `ANY`.
+    Any {
+        /// Left-hand expression.
+        expr: Box<Self>,
+        /// Comparison operator.
+        op: BinaryOp,
+        /// The inner SELECT.
+        select: Box<SelectStmt>,
+        /// Source span.
+        span: Span,
+    },
+    /// `left_expr <op> ALL (SELECT …)`.
+    ///
+    /// Like [`Expr::Any`] but with `ALL` semantics.
+    All {
+        /// Left-hand expression.
+        expr: Box<Self>,
+        /// Comparison operator.
+        op: BinaryOp,
+        /// The inner SELECT.
+        select: Box<SelectStmt>,
+        /// Source span.
+        span: Span,
+    },
 }
 
 impl Expr {
@@ -874,7 +1110,13 @@ impl Expr {
             | Self::Call { span, .. }
             | Self::IsNull { span, .. }
             | Self::Paren { span, .. }
-            | Self::Cast { span, .. } => *span,
+            | Self::Cast { span, .. }
+            | Self::Subquery { span, .. }
+            | Self::Exists { span, .. }
+            | Self::InList { span, .. }
+            | Self::InSubquery { span, .. }
+            | Self::Any { span, .. }
+            | Self::All { span, .. } => *span,
         }
     }
 }
@@ -1018,4 +1260,112 @@ impl BinaryOp {
     pub const fn is_right_associative(self) -> bool {
         matches!(self, Self::Pow)
     }
+
+    /// `true` iff this operator is a comparison operator valid for
+    /// `ANY (subquery)` and `ALL (subquery)`.
+    #[must_use]
+    pub const fn is_comparison(self) -> bool {
+        matches!(
+            self,
+            Self::Eq | Self::NotEq | Self::Lt | Self::LtEq | Self::Gt | Self::GtEq
+        )
+    }
+}
+
+// ============================================================================
+// Savepoint statements
+// ============================================================================
+
+/// `SAVEPOINT name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavepointStmt {
+    /// Savepoint name.
+    pub name: Identifier,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `ROLLBACK TO [SAVEPOINT] name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RollbackToSavepointStmt {
+    /// Savepoint name.
+    pub name: Identifier,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `RELEASE [SAVEPOINT] name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReleaseSavepointStmt {
+    /// Savepoint name.
+    pub name: Identifier,
+    /// Source span.
+    pub span: Span,
+}
+
+// ============================================================================
+// EXPLAIN statement
+// ============================================================================
+
+/// `EXPLAIN [ANALYZE] [VERBOSE] [(FORMAT TEXT|JSON)] stmt`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExplainStmt {
+    /// Whether `ANALYZE` was specified.
+    pub analyze: bool,
+    /// Whether `VERBOSE` was specified.
+    pub verbose: bool,
+    /// Output format.
+    pub format: ExplainFormat,
+    /// The inner statement being explained.
+    pub statement: Box<Statement>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Output format for `EXPLAIN`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplainFormat {
+    /// `FORMAT TEXT` (default).
+    Text,
+    /// `FORMAT JSON`.
+    Json,
+}
+
+// ============================================================================
+// PREPARE / EXECUTE / DEALLOCATE statements
+// ============================================================================
+
+/// `PREPARE name [(param_type, …)] AS stmt`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrepareStmt {
+    /// Prepared statement name.
+    pub name: Identifier,
+    /// Optional parameter type list.
+    pub param_types: Vec<Identifier>,
+    /// The statement body.
+    pub statement: Box<Statement>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `EXECUTE name [(arg, …)]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecuteStmt {
+    /// Prepared statement name.
+    pub name: Identifier,
+    /// Arguments (may be empty).
+    pub args: Vec<Expr>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `DEALLOCATE { ALL | name }`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeallocateStmt {
+    /// Prepared statement name, or `None` when `ALL` was specified.
+    pub name: Option<Identifier>,
+    /// Whether `ALL` was specified.
+    pub all: bool,
+    /// Source span.
+    pub span: Span,
 }

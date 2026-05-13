@@ -192,6 +192,15 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("session", TokenKind::KwSession),
         ("start", TokenKind::KwStart),
         ("to", TokenKind::KwTo),
+        // SELECT completeness keywords added for v0.2
+        ("deallocate", TokenKind::KwDeallocate),
+        ("execute", TokenKind::KwExecute),
+        ("format", TokenKind::KwFormat),
+        ("json", TokenKind::KwJson),
+        ("prepare", TokenKind::KwPrepare),
+        ("recursive", TokenKind::KwRecursive),
+        ("release", TokenKind::KwRelease),
+        ("verbose", TokenKind::KwVerbose),
     ];
 
     entries.iter().copied().collect()

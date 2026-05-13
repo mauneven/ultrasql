@@ -155,7 +155,10 @@ impl<'src> Parser<'src> {
     pub(crate) fn parse_one(&mut self) -> Result<Statement, ParseError> {
         let head = self.peek()?;
         match head.kind {
-            TokenKind::KwSelect => self.parse_select().map(|s| Statement::Select(Box::new(s))),
+            // SELECT or WITH … SELECT
+            TokenKind::KwSelect | TokenKind::KwWith => {
+                self.parse_select().map(|s| Statement::Select(Box::new(s)))
+            }
             TokenKind::KwInsert => self.parse_insert().map(|s| Statement::Insert(Box::new(s))),
             TokenKind::KwUpdate => self.parse_update().map(|s| Statement::Update(Box::new(s))),
             TokenKind::KwDelete => self.parse_delete().map(|s| Statement::Delete(Box::new(s))),
@@ -180,6 +183,10 @@ impl<'src> Parser<'src> {
                 if self.peek()?.kind == TokenKind::KwTransaction {
                     self.advance()?;
                 }
+                // ROLLBACK TO [SAVEPOINT] name
+                if self.peek()?.kind == TokenKind::KwTo {
+                    return self.parse_rollback_to_savepoint(tok.span.start);
+                }
                 Ok(Statement::Rollback { span: tok.span })
             }
             // ---- DDL --------------------------------------------------------
@@ -190,9 +197,37 @@ impl<'src> Parser<'src> {
             TokenKind::KwSet | TokenKind::KwShow | TokenKind::KwReset => {
                 self.parse_set_stmt().map(Statement::SetVar)
             }
+            // ---- Savepoints -------------------------------------------------
+            TokenKind::KwSavepoint => {
+                let tok = self.advance()?;
+                self.parse_savepoint(tok.span.start)
+            }
+            TokenKind::KwRelease => {
+                let tok = self.advance()?;
+                self.parse_release_savepoint(tok.span.start)
+            }
+            // ---- EXPLAIN ----------------------------------------------------
+            TokenKind::KwExplain => {
+                let tok = self.advance()?;
+                self.parse_explain(tok.span.start)
+            }
+            // ---- PREPARE / EXECUTE / DEALLOCATE ----------------------------
+            TokenKind::KwPrepare => {
+                let tok = self.advance()?;
+                self.parse_prepare(tok.span.start)
+            }
+            TokenKind::KwExecute => {
+                let tok = self.advance()?;
+                self.parse_execute(tok.span.start)
+            }
+            TokenKind::KwDeallocate => {
+                let tok = self.advance()?;
+                self.parse_deallocate(tok.span.start)
+            }
             other => Err(ParseError::Expected {
                 expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, ALTER, \
-                           REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, or ROLLBACK",
+                           REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \
+                           RELEASE, EXPLAIN, PREPARE, EXECUTE, or DEALLOCATE",
                 found: other,
                 offset: head.span.start as usize,
             }),
@@ -302,10 +337,13 @@ impl<'src> Parser<'src> {
                 prec + 1
             };
 
-            // Special case: IS NULL / IS NOT NULL — parsed by the
-            // prefix-handler path, not as a binary op. But we handle
-            // a bare `IS NULL` here by ignoring it; the prefix code
-            // covers it.
+            // Special post-infix: `<op> ANY/ALL (SELECT …)` — check before
+            // parsing the right-hand operand.
+            if let Some(any_all) = self.parse_any_all_expr(left.clone(), op)? {
+                left = any_all;
+                continue;
+            }
+
             let right = self.parse_expr_with_precedence(next_min)?;
             let span = Span::new(left.span().start, right.span().end);
             left = Expr::Binary {
@@ -332,9 +370,24 @@ impl<'src> Parser<'src> {
             };
         }
 
+        // Trailing [NOT] IN (…)
+        if self.peek()?.kind == TokenKind::KwIn {
+            self.advance()?; // IN
+            return self.parse_in_expr(left, false);
+        }
+        if self.peek()?.kind == TokenKind::KwNot {
+            // Could be NOT IN — peek ahead.
+            if self.lookahead_at(1)?.kind == TokenKind::KwIn {
+                self.advance()?; // NOT
+                self.advance()?; // IN
+                return self.parse_in_expr(left, true);
+            }
+        }
+
         Ok(left)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
         let tok = self.peek()?;
         match tok.kind {
@@ -346,6 +399,10 @@ impl<'src> Parser<'src> {
                     TokenKind::KwNot => UnaryOp::Not,
                     _ => unreachable!(),
                 };
+                // Special case: NOT EXISTS
+                if op == UnaryOp::Not && self.peek()?.kind == TokenKind::KwExists {
+                    return self.parse_exists_expr(true);
+                }
                 let rhs = self.parse_expr_with_precedence(7)?;
                 let span = Span::new(op_tok.span.start, rhs.span().end);
                 Ok(Expr::Unary {
@@ -420,7 +477,13 @@ impl<'src> Parser<'src> {
             }
 
             TokenKind::LParen => {
+                // Consume `(` first, then peek to determine if it's a
+                // subquery — this avoids an extra lookahead call
+                // (`lookahead_at`) inside a deeply recursive call chain.
                 let lp = self.advance()?;
+                if let Some(subq) = self.try_parse_subquery_after_lparen(lp.span)? {
+                    return Ok(subq);
+                }
                 let inner = self.parse_expr()?;
                 let rp = self.expect(TokenKind::RParen, ")")?;
                 Ok(Expr::Paren {
@@ -428,6 +491,8 @@ impl<'src> Parser<'src> {
                     span: Span::new(lp.span.start, rp.span.end),
                 })
             }
+
+            TokenKind::KwExists => self.parse_exists_expr(false),
 
             TokenKind::KwCast => self.parse_cast_expr(),
 
@@ -489,7 +554,25 @@ impl<'src> Parser<'src> {
             let mut args = Vec::new();
             if self.peek()?.kind != TokenKind::RParen {
                 loop {
-                    args.push(self.parse_expr()?);
+                    // Special case: `COUNT(*)` and similar aggregate
+                    // wildcard forms. Represent `*` as a `Column` with
+                    // a single-part name `*` — the binder turns this
+                    // into an aggregate wildcard.
+                    if self.peek()?.kind == TokenKind::Star {
+                        let star = self.advance()?;
+                        args.push(Expr::Column {
+                            name: crate::ast::ObjectName {
+                                parts: vec![crate::ast::Identifier {
+                                    value: "*".to_owned(),
+                                    quoted: false,
+                                    span: star.span,
+                                }],
+                                span: star.span,
+                            },
+                        });
+                    } else {
+                        args.push(self.parse_expr()?);
+                    }
                     if self.peek()?.kind != TokenKind::Comma {
                         break;
                     }
@@ -719,7 +802,7 @@ const fn is_type_name_keyword(kind: TokenKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{BinaryOp, Expr, SelectItem, SortDirection, Statement};
+    use crate::ast::{BinaryOp, Distinct, Expr, SelectItem, SortDirection, Statement};
 
     fn parse(src: &str) -> Statement {
         Parser::new(src)
@@ -731,9 +814,9 @@ mod tests {
     fn select_star() {
         let stmt = parse("SELECT * FROM users");
         let Statement::Select(s) = stmt else { panic!() };
-        assert!(!s.distinct);
+        assert!(matches!(s.distinct, Distinct::None));
         assert!(matches!(s.projection[0], SelectItem::Wildcard { .. }));
-        assert!(s.from.is_some());
+        assert!(!s.from.is_empty());
     }
 
     #[test]
@@ -868,7 +951,7 @@ mod tests {
     fn missing_from_returns_select_without_from() {
         let stmt = parse("SELECT 1 + 1");
         let Statement::Select(s) = stmt else { panic!() };
-        assert!(s.from.is_none());
+        assert!(s.from.is_empty());
     }
 
     #[test]

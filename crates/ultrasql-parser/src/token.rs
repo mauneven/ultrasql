@@ -319,6 +319,23 @@ pub enum TokenKind {
     KwStart,
     /// `TO` — used in `SET search_path TO …` and `RENAME … TO`.
     KwTo,
+    // ---- SELECT completeness keywords added for v0.2 ---------------------
+    /// `DEALLOCATE` — `DEALLOCATE [ALL | name]`.
+    KwDeallocate,
+    /// `EXECUTE` — `EXECUTE name [(args)]`.
+    KwExecute,
+    /// `FORMAT` — `EXPLAIN (FORMAT TEXT|JSON)`.
+    KwFormat,
+    /// `JSON` — `EXPLAIN (FORMAT JSON)`.
+    KwJson,
+    /// `PREPARE` — `PREPARE name AS stmt`.
+    KwPrepare,
+    /// `RECURSIVE` — `WITH RECURSIVE`.
+    KwRecursive,
+    /// `RELEASE` — `RELEASE [SAVEPOINT] name`.
+    KwRelease,
+    /// `VERBOSE` — `EXPLAIN VERBOSE`.
+    KwVerbose,
 }
 
 impl TokenKind {
