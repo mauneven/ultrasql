@@ -39,6 +39,16 @@ pub enum WalSinkError {
 ///    `xid`, or [`Lsn::ZERO`] if none.  Heap callers use this to fill the
 ///    `prev_lsn` field so records form a per-transaction linked list.
 ///
+/// # Failure contract
+///
+/// An implementation that returns `Err` from `append` **after** the caller
+/// has applied a page mutation will cause the calling thread to panic and
+/// tear down. Implementations should reserve `Err` for pre-mutation
+/// conditions (encoding rejection, queue-full before any page change).
+/// Once the on-disk page state has diverged from the WAL there is no safe
+/// way to continue; the only correct response is to abort the process so
+/// recovery starts from a consistent WAL position.
+///
 /// # Thread safety
 ///
 /// `WalSink` requires `Send + Sync` so it can be stored behind an `Arc` and
@@ -102,9 +112,17 @@ impl WalSink for NullWalSink {
 /// unambiguously "no record yet"). A per-XID map tracks the last LSN for
 /// each transaction so the heap's `prev_lsn` chaining can be tested.
 ///
-/// This type is exported only under `#[cfg(test)]` because it is not
-/// intended for production use.
-#[cfg(test)]
+/// This type is exported only under `#[cfg(test)]` or when the
+/// `test-support` feature is enabled so that integration tests in other
+/// crates (executor, recovery, …) can import it without pulling in
+/// production WAL writer state.  Enable the feature in your crate's
+/// dev-dependencies:
+///
+/// ```toml
+/// [dev-dependencies]
+/// ultrasql-storage = { workspace = true, features = ["testing"] }
+/// ```
+#[cfg(any(test, feature = "testing"))]
 pub mod test_support {
     use std::collections::HashMap;
 
@@ -136,7 +154,7 @@ pub mod test_support {
     }
 
     impl Inner {
-        fn next(&mut self) -> Lsn {
+        const fn next(&mut self) -> Lsn {
             self.next_lsn = self.next_lsn.saturating_add(1);
             Lsn::new(self.next_lsn)
         }

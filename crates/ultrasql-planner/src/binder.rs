@@ -301,16 +301,25 @@ fn bind_conflict_target(
 ///
 /// Each target column name is resolved against `table_schema`. Expression
 /// values are bound against the same schema (the pre-update row view).
+///
+/// PostgreSQL rejects `UPDATE t SET col=1, col=2`; this function mirrors
+/// that behaviour by returning [`PlanError::DuplicateColumn`] on the first
+/// repeated target.
 fn bind_assignments(
     set: &[Assignment],
     table_schema: &Schema,
 ) -> Result<Vec<(usize, ScalarExpr)>, PlanError> {
     let mut out = Vec::with_capacity(set.len());
+    let mut seen: std::collections::HashSet<usize> =
+        std::collections::HashSet::with_capacity(set.len());
     for a in set {
         let idx = table_schema
             .find(&a.target.value)
             .ok_or_else(|| PlanError::ColumnNotFound(a.target.value.clone()))?
             .0;
+        if !seen.insert(idx) {
+            return Err(PlanError::DuplicateColumn(a.target.value.clone()));
+        }
         let expr = bind_expr(&a.value, table_schema)?;
         out.push((idx, expr));
     }
@@ -1199,6 +1208,17 @@ mod tests {
         assert!(
             matches!(err, PlanError::ColumnNotFound(ref c) if c == "bogus"),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn binds_update_rejects_duplicate_target_column() {
+        let cat = users_catalog();
+        // PostgreSQL rejects `UPDATE t SET col=1, col=2` — mirror that.
+        let err = parse_and_bind("UPDATE users SET score = 1.0, score = 2.0", &cat).unwrap_err();
+        assert!(
+            matches!(err, PlanError::DuplicateColumn(ref c) if c == "score"),
+            "expected DuplicateColumn(score), got {err:?}"
         );
     }
 

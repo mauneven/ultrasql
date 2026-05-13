@@ -21,4 +21,6 @@ pub mod wal_sink;
 
 pub use buffer_pool::{BufferPool, BufferPoolError, BufferPoolStats, PageGuard, PageLoader};
 pub use page::{ItemId, ItemIdFlags, Page, PageError, PageHeader, PageKind, SlotIndex};
+#[cfg(any(test, feature = "testing"))]
+pub use wal_sink::test_support;
 pub use wal_sink::{NullWalSink, WalSink, WalSinkError};

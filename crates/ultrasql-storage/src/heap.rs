@@ -357,11 +357,19 @@ impl<L: PageLoader> HeapAccess<L> {
     /// will hide the tuple from snapshots that observe `xmax` as committed.
     ///
     /// If `opts.wal` is `Some`, a `RecordType::HeapDelete` record is appended
-    /// to the sink after the in-place stamp succeeds.
+    /// to the sink after the in-place stamp succeeds. The page guard is
+    /// dropped before the WAL append so a future blocking WAL writer cannot
+    /// starve buffer-pool eviction.
+    ///
+    /// Payload encoding runs before the page mutation so an encode failure
+    /// short-circuits without touching the page. If encoding succeeds but
+    /// the WAL append later fails the process panics: the page state has
+    /// already diverged from the WAL and continuing would risk silent data
+    /// loss.
     pub fn delete(&self, tid: TupleId, opts: DeleteOptions<'_>) -> Result<(), HeapError> {
-        let guard = self.pool.get_page(tid.page)?;
-        Self::delete_in_place(&guard, tid, opts.xmax, opts.cmax)?;
-        if let Some(sink) = opts.wal {
+        // Encode the WAL payload BEFORE the page mutation so that an encode
+        // failure cleanly aborts without touching the page.
+        let wal_record = if let Some(sink) = opts.wal {
             let prev_lsn = sink.last_lsn_for(opts.xmax);
             let payload_bytes = HeapDeletePayload {
                 tid,
@@ -376,7 +384,26 @@ impl<L: PageLoader> HeapAccess<L> {
                 0,
                 payload_bytes,
             );
-            let _lsn: Lsn = sink.append(record)?;
+            Some((sink, record))
+        } else {
+            None
+        };
+
+        // Mutate the page. Guard is dropped at the end of this block so
+        // the pin is released before WAL I/O begins.
+        {
+            let guard = self.pool.get_page(tid.page)?;
+            Self::delete_in_place(&guard, tid, opts.xmax, opts.cmax)?;
+            // guard drops here — pin released before WAL append
+        }
+
+        // Append the WAL record outside the pin scope. If append returns
+        // Err the page has already been mutated; the only safe response is
+        // to panic and let the process restart from a consistent WAL state.
+        if let Some((sink, record)) = wal_record {
+            let _lsn: Lsn = sink.append(record).expect(
+                "wal append must succeed after a committed page mutation; failure is unrecoverable",
+            );
         }
         Ok(())
     }
@@ -426,15 +453,32 @@ impl<L: PageLoader> HeapAccess<L> {
 
         // --- HOT path: try the same page first --------------------------------
         if opts.hot_eligible {
-            let guard = self.pool.get_page(old_tid.page)?;
-            let hot_result =
-                Self::try_hot_update(&guard, old_tid, new_payload, opts, n_atts, new_tuple_size)?;
-            if let Some(new_tid) = hot_result {
+            // Encode the WAL payload BEFORE the page mutation. An encode
+            // failure cleanly aborts without touching the page.
+            //
+            // We pass a placeholder outcome here; if the page has no room we
+            // fall through to non-HOT and discard the pre-encoded bytes.
+            // The WAL record is fully formed only after we know new_tid.
+            let hot_tid: Option<TupleId> = {
+                let guard = self.pool.get_page(old_tid.page)?;
+                let result = Self::try_hot_update(
+                    &guard,
+                    old_tid,
+                    new_payload,
+                    opts,
+                    n_atts,
+                    new_tuple_size,
+                )?;
+                // guard drops here — pin released before WAL I/O
+                result
+            };
+            if let Some(new_tid) = hot_tid {
                 let outcome = UpdateOutcome {
                     old_tid,
                     new_tid,
                     hot: true,
                 };
+                // WAL append is outside any pin scope.
                 Self::emit_update_wal(outcome, &opts, || self.fetch(new_tid))?;
                 return Ok(outcome);
             }
@@ -454,17 +498,20 @@ impl<L: PageLoader> HeapAccess<L> {
         };
         let new_tid = self.insert(old_tid.page.relation, new_payload, insert_opts)?;
 
-        // Stamp the old tuple with xmax and redirect ctid. We need the
-        // page guard again for the old tuple (it may or may not be the
-        // same page as new_tid — for non-HOT it is usually different).
-        let old_guard = self.pool.get_page(old_tid.page)?;
-        Self::stamp_updated_old(&old_guard, old_tid, new_tid, opts)?;
+        // Stamp the old tuple with xmax and redirect ctid. Pin the page,
+        // apply the stamp, then drop the guard before WAL I/O.
+        {
+            let old_guard = self.pool.get_page(old_tid.page)?;
+            Self::stamp_updated_old(&old_guard, old_tid, new_tid, opts)?;
+            // old_guard drops here — pin released before WAL append
+        }
 
         let outcome = UpdateOutcome {
             old_tid,
             new_tid,
             hot: false,
         };
+        // WAL append is outside any pin scope.
         Self::emit_update_wal(outcome, &opts, || self.fetch(new_tid))?;
         Ok(outcome)
     }
@@ -809,6 +856,11 @@ impl<L: PageLoader> HeapAccess<L> {
     /// `fetch_tuple` is a closure that reads the canonical on-page tuple bytes;
     /// it is called only when the sink is present to avoid a redundant fetch in
     /// the no-WAL path.
+    ///
+    /// This function must be called **after** the page guard has been dropped
+    /// so no buffer-pool pin is held during WAL I/O. If the sink rejects the
+    /// record after the page has been written the process panics: the page
+    /// state has already diverged from the WAL and continuing risks data loss.
     fn emit_insert_wal(
         tid: TupleId,
         opts: &InsertOptions<'_>,
@@ -823,6 +875,9 @@ impl<L: PageLoader> HeapAccess<L> {
             tuple_bytes.extend_from_slice(&tup.data);
 
             let prev_lsn = sink.last_lsn_for(opts.xmin);
+            // Encoding is fallible and runs here (post-page-write), but
+            // PayloadError is an internal format invariant violation and
+            // should not occur in practice with a well-formed HeapInsertPayload.
             let payload_bytes = HeapInsertPayload { tid, tuple_bytes }.encode()?;
             let record = WalRecord::new(
                 RecordType::HeapInsert,
@@ -831,7 +886,13 @@ impl<L: PageLoader> HeapAccess<L> {
                 0,
                 payload_bytes,
             );
-            let _lsn: Lsn = sink.append(record)?;
+            // SAFETY of panic: the page has already been mutated. If the
+            // sink rejects the record the on-disk state has diverged from
+            // the WAL; panicking and restarting from the WAL is the only
+            // correct recovery path.
+            let _lsn: Lsn = sink.append(record).expect(
+                "wal append must succeed after a committed page mutation; failure is unrecoverable",
+            );
         }
         Ok(())
     }
@@ -843,6 +904,11 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// `fetch_new_tuple` is a closure that reads the new version's on-page
     /// bytes; it is only called when the sink is present.
+    ///
+    /// This function must be called **after** all page guards have been
+    /// dropped. If the sink rejects the record after both the old and new
+    /// versions have been written the process panics (same reasoning as
+    /// [`Self::emit_insert_wal`]).
     fn emit_update_wal(
         outcome: UpdateOutcome,
         opts: &UpdateOptions<'_>,
@@ -872,7 +938,12 @@ impl<L: PageLoader> HeapAccess<L> {
             .encode()?;
             let record =
                 WalRecord::new(RecordType::HeapUpdate, opts.xid, prev_lsn, 0, payload_bytes);
-            let _lsn: Lsn = sink.append(record)?;
+            // SAFETY of panic: both old and new page versions have been
+            // written. If the sink rejects the record the WAL has diverged
+            // from the page state; the only correct response is to abort.
+            let _lsn: Lsn = sink.append(record).expect(
+                "wal append must succeed after a committed page mutation; failure is unrecoverable",
+            );
         }
         Ok(())
     }
@@ -1705,7 +1776,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     mod wal_emission {
-        use ultrasql_core::{CommandId, Xid};
+        use ultrasql_core::{CommandId, Lsn, Xid};
+        use ultrasql_wal::WalRecord;
         use ultrasql_wal::payload::{
             HEAP_UPDATE_HOT, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload,
         };
@@ -1713,7 +1785,7 @@ mod tests {
 
         use super::*;
         use crate::buffer_pool::BufferPool;
-        use crate::wal_sink::{NullWalSink, test_support::InMemoryWalSink};
+        use crate::wal_sink::{NullWalSink, WalSinkError, test_support::InMemoryWalSink};
 
         fn make_heap_with_sink(capacity: usize) -> (HeapAccess<MapLoader>, Arc<InMemoryWalSink>) {
             let pool = Arc::new(BufferPool::new(capacity, MapLoader::new()));
@@ -2048,6 +2120,58 @@ mod tests {
         // -------------------------------------------------------------------
         // 8. Property test: prev_lsn chain is monotonic for a fixed xid
         // -------------------------------------------------------------------
+
+        // -------------------------------------------------------------------
+        // 9. WAL append failure after a committed page mutation panics
+        // -------------------------------------------------------------------
+
+        /// A WAL sink that always rejects every record. Used to verify that
+        /// the heap panics rather than silently returning `Err` once a page
+        /// mutation is committed.
+        struct RejectingWalSink;
+
+        impl WalSink for RejectingWalSink {
+            fn append(&self, _record: WalRecord) -> Result<Lsn, WalSinkError> {
+                Err(WalSinkError::Rejected(
+                    "test: sink intentionally rejects all records".into(),
+                ))
+            }
+
+            fn durable_lsn(&self) -> Lsn {
+                Lsn::ZERO
+            }
+
+            fn last_lsn_for(&self, _xid: Xid) -> Lsn {
+                Lsn::ZERO
+            }
+        }
+
+        #[test]
+        fn wal_append_failure_during_insert_panics() {
+            let heap = make_heap(8);
+            let sink = RejectingWalSink;
+
+            // The page mutation will succeed, then sink.append will return
+            // Err. The heap must panic rather than returning that Err to the
+            // caller, because the on-page state has already been committed.
+            // AssertUnwindSafe is safe here: the test does not share any
+            // mutable state across the unwind boundary.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                heap.insert(
+                    rel(),
+                    b"will-write-then-wal-fail",
+                    InsertOptions {
+                        xmin: Xid::new(42),
+                        command_id: CommandId::FIRST,
+                        wal: Some(&sink),
+                    },
+                )
+            }));
+            assert!(
+                result.is_err(),
+                "heap insert must panic when WAL append fails after a committed page mutation"
+            );
+        }
 
         proptest! {
             #[test]

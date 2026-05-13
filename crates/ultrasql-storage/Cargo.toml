@@ -11,6 +11,12 @@ repository.workspace   = true
 [lints]
 workspace = true
 
+[features]
+# Expose InMemoryWalSink for integration tests in crates outside ultrasql-storage.
+# Future executor and recovery crates should enable this in their dev-dependencies:
+#   ultrasql-storage = { workspace = true, features = ["testing"] }
+testing = []
+
 [dependencies]
 ultrasql-core = { workspace = true }
 ultrasql-mvcc = { workspace = true }

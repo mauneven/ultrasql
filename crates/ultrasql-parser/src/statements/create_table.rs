@@ -163,34 +163,55 @@ impl Parser<'_> {
 
         // Consume any column-level constraints.
         loop {
+            // Optional CONSTRAINT name prefix before any column constraint.
+            let constraint_name: Option<Identifier> =
+                if self.peek()?.kind == TokenKind::KwConstraint {
+                    self.advance()?; // CONSTRAINT
+                    Some(self.parse_identifier()?)
+                } else {
+                    None
+                };
+
             match self.peek()?.kind {
                 TokenKind::KwNot => {
                     let not_tok = self.advance()?;
                     self.expect(TokenKind::KwNull, "NULL")?;
                     constraint_list.push(ColumnConstraint::NotNull {
+                        name: constraint_name,
                         span: Span::new(not_tok.span.start, self.peek()?.span.start),
                     });
                 }
                 TokenKind::KwNull => {
                     let tok = self.advance()?;
-                    constraint_list.push(ColumnConstraint::Null { span: tok.span });
+                    constraint_list.push(ColumnConstraint::Null {
+                        name: constraint_name,
+                        span: tok.span,
+                    });
                 }
                 TokenKind::KwDefault => {
                     let def_tok = self.advance()?;
                     let expr = self.parse_expr()?;
                     let span = Span::new(def_tok.span.start, expr.span().end);
-                    constraint_list.push(ColumnConstraint::Default { expr, span });
+                    constraint_list.push(ColumnConstraint::Default {
+                        name: constraint_name,
+                        expr,
+                        span,
+                    });
                 }
                 TokenKind::KwPrimary => {
                     let pk_tok = self.advance()?;
                     self.expect(TokenKind::KwKey, "KEY")?;
                     constraint_list.push(ColumnConstraint::PrimaryKey {
+                        name: constraint_name,
                         span: Span::new(pk_tok.span.start, self.peek()?.span.start),
                     });
                 }
                 TokenKind::KwUnique => {
                     let tok = self.advance()?;
-                    constraint_list.push(ColumnConstraint::Unique { span: tok.span });
+                    constraint_list.push(ColumnConstraint::Unique {
+                        name: constraint_name,
+                        span: tok.span,
+                    });
                 }
                 TokenKind::KwCheck => {
                     let chk_tok = self.advance()?;
@@ -198,6 +219,7 @@ impl Parser<'_> {
                     let expr = self.parse_expr()?;
                     let rp = self.expect(TokenKind::RParen, ")")?;
                     constraint_list.push(ColumnConstraint::Check {
+                        name: constraint_name,
                         expr,
                         span: Span::new(chk_tok.span.start, rp.span.end),
                     });
@@ -212,12 +234,25 @@ impl Parser<'_> {
                     };
                     let end = self.peek()?.span.start;
                     constraint_list.push(ColumnConstraint::References {
+                        name: constraint_name,
                         target_table,
                         target_columns,
                         span: Span::new(ref_tok.span.start, end),
                     });
                 }
-                _ => break,
+                _ => {
+                    // If we consumed a CONSTRAINT keyword but found no
+                    // recognisable constraint body, that is a parse error.
+                    if constraint_name.is_some() {
+                        let tok = self.peek()?;
+                        return Err(ParseError::Expected {
+                            expected: "NOT NULL, NULL, DEFAULT, PRIMARY KEY, UNIQUE, CHECK, or REFERENCES after CONSTRAINT name",
+                            found: tok.kind,
+                            offset: tok.span.start as usize,
+                        });
+                    }
+                    break;
+                }
             }
         }
 
@@ -232,15 +267,19 @@ impl Parser<'_> {
 
     /// Parse one table-level constraint.
     ///
-    /// Accepts an optional leading `CONSTRAINT name` label (consumed and
-    /// discarded — the name is not yet stored in the AST).
+    /// Accepts an optional leading `CONSTRAINT name` label. When present the
+    /// name is stored in the resulting [`TableConstraint`] variant so that
+    /// `ALTER TABLE … DROP CONSTRAINT name` can identify the constraint.
     pub(crate) fn parse_table_constraint(&mut self) -> Result<TableConstraint, ParseError> {
         let start = self.peek()?.span.start;
-        // Optional CONSTRAINT name
-        if self.peek()?.kind == TokenKind::KwConstraint {
+        // Optional CONSTRAINT name — stored rather than discarded so that
+        // DROP CONSTRAINT can identify constraints by name.
+        let constraint_name: Option<Identifier> = if self.peek()?.kind == TokenKind::KwConstraint {
             self.advance()?; // CONSTRAINT
-            self.parse_identifier()?; // name (discard for now)
-        }
+            Some(self.parse_identifier()?)
+        } else {
+            None
+        };
 
         match self.peek()?.kind {
             TokenKind::KwPrimary => {
@@ -249,6 +288,7 @@ impl Parser<'_> {
                 let cols = self.parse_ident_list_paren()?;
                 let end = self.peek()?.span.start;
                 Ok(TableConstraint::PrimaryKey {
+                    name: constraint_name,
                     columns: cols,
                     span: Span::new(start, end),
                 })
@@ -258,6 +298,7 @@ impl Parser<'_> {
                 let cols = self.parse_ident_list_paren()?;
                 let end = self.peek()?.span.start;
                 Ok(TableConstraint::Unique {
+                    name: constraint_name,
                     columns: cols,
                     span: Span::new(start, end),
                 })
@@ -275,6 +316,7 @@ impl Parser<'_> {
                 };
                 let end = self.peek()?.span.start;
                 Ok(TableConstraint::ForeignKey {
+                    name: constraint_name,
                     columns: cols,
                     target_table,
                     target_columns,
@@ -287,6 +329,7 @@ impl Parser<'_> {
                 let expr = self.parse_expr()?;
                 let rp = self.expect(TokenKind::RParen, ")")?;
                 Ok(TableConstraint::Check {
+                    name: constraint_name,
                     expr,
                     span: Span::new(start, rp.span.end),
                 })
@@ -446,16 +489,26 @@ mod tests {
         assert_eq!(stmt.columns.len(), 2);
         assert_eq!(stmt.columns[0].name.value, "id");
         assert_eq!(stmt.columns[0].data_type.name.value, "integer");
-        assert!(matches!(
-            stmt.columns[0].constraints[0],
-            ColumnConstraint::NotNull { .. }
-        ));
+        // Unnamed NOT NULL constraint.
+        assert!(
+            matches!(
+                stmt.columns[0].constraints[0],
+                ColumnConstraint::NotNull { name: None, .. }
+            ),
+            "got {:?}",
+            stmt.columns[0].constraints[0]
+        );
         assert_eq!(stmt.columns[1].data_type.type_modifiers, vec![255]);
         assert_eq!(stmt.table_constraints.len(), 1);
-        assert!(matches!(
-            stmt.table_constraints[0],
-            TableConstraint::PrimaryKey { .. }
-        ));
+        // Unnamed table-level PRIMARY KEY.
+        assert!(
+            matches!(
+                stmt.table_constraints[0],
+                TableConstraint::PrimaryKey { name: None, .. }
+            ),
+            "got {:?}",
+            stmt.table_constraints[0]
+        );
     }
 
     #[test]
@@ -493,12 +546,73 @@ mod tests {
         assert_eq!(stmt.table_constraints.len(), 2);
         assert!(matches!(
             stmt.table_constraints[0],
-            TableConstraint::Unique { .. }
+            TableConstraint::Unique { name: None, .. }
         ));
         assert!(matches!(
             stmt.table_constraints[1],
-            TableConstraint::ForeignKey { .. }
+            TableConstraint::ForeignKey { name: None, .. }
         ));
+    }
+
+    #[test]
+    fn parses_named_table_constraint_preserves_name() {
+        // CONSTRAINT <name> precedes each constraint body; the name must be
+        // stored in the AST rather than discarded so DROP CONSTRAINT can
+        // identify constraints by name.
+        let stmt = parse_create_table(
+            "CREATE TABLE orders ( \
+               id integer, \
+               user_id integer, \
+               CONSTRAINT pk_orders PRIMARY KEY (id), \
+               CONSTRAINT uq_user UNIQUE (user_id), \
+               CONSTRAINT chk_id CHECK (id > 0), \
+               CONSTRAINT fk_users FOREIGN KEY (user_id) REFERENCES users (id) \
+             )",
+        );
+        assert_eq!(stmt.table_constraints.len(), 4);
+        let TableConstraint::PrimaryKey { ref name, .. } = stmt.table_constraints[0] else {
+            panic!("expected PrimaryKey, got {:?}", stmt.table_constraints[0]);
+        };
+        assert_eq!(
+            name.as_ref().map(|n| n.value.as_str()),
+            Some("pk_orders"),
+            "PrimaryKey constraint name must be preserved"
+        );
+        let TableConstraint::Unique { ref name, .. } = stmt.table_constraints[1] else {
+            panic!("expected Unique, got {:?}", stmt.table_constraints[1]);
+        };
+        assert_eq!(name.as_ref().map(|n| n.value.as_str()), Some("uq_user"));
+        let TableConstraint::Check { ref name, .. } = stmt.table_constraints[2] else {
+            panic!("expected Check, got {:?}", stmt.table_constraints[2]);
+        };
+        assert_eq!(name.as_ref().map(|n| n.value.as_str()), Some("chk_id"));
+        let TableConstraint::ForeignKey { ref name, .. } = stmt.table_constraints[3] else {
+            panic!("expected ForeignKey, got {:?}", stmt.table_constraints[3]);
+        };
+        assert_eq!(name.as_ref().map(|n| n.value.as_str()), Some("fk_users"));
+    }
+
+    #[test]
+    fn parses_named_column_constraint_preserves_name() {
+        // Column-level CONSTRAINT name prefix must also be preserved.
+        let stmt = parse_create_table(
+            "CREATE TABLE t ( \
+               id integer CONSTRAINT pk_t PRIMARY KEY, \
+               score float CONSTRAINT chk_score CHECK (score >= 0) \
+             )",
+        );
+        assert_eq!(stmt.columns.len(), 2);
+        let ColumnConstraint::PrimaryKey { ref name, .. } = stmt.columns[0].constraints[0] else {
+            panic!(
+                "expected PrimaryKey, got {:?}",
+                stmt.columns[0].constraints[0]
+            );
+        };
+        assert_eq!(name.as_ref().map(|n| n.value.as_str()), Some("pk_t"));
+        let ColumnConstraint::Check { ref name, .. } = stmt.columns[1].constraints[0] else {
+            panic!("expected Check, got {:?}", stmt.columns[1].constraints[0]);
+        };
+        assert_eq!(name.as_ref().map(|n| n.value.as_str()), Some("chk_score"));
     }
 
     #[test]

@@ -150,16 +150,22 @@ pub struct ColumnDef {
 pub enum ColumnConstraint {
     /// `NOT NULL`.
     NotNull {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
         /// Source span.
         span: Span,
     },
     /// `NULL` (explicit nullable).
     Null {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
         /// Source span.
         span: Span,
     },
     /// `DEFAULT expr`.
     Default {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
         /// Default value expression.
         expr: Expr,
         /// Source span.
@@ -167,16 +173,22 @@ pub enum ColumnConstraint {
     },
     /// `PRIMARY KEY`.
     PrimaryKey {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
         /// Source span.
         span: Span,
     },
     /// `UNIQUE`.
     Unique {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
         /// Source span.
         span: Span,
     },
     /// `CHECK (expr)`.
     Check {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
         /// Constraint expression.
         expr: Expr,
         /// Source span.
@@ -184,6 +196,8 @@ pub enum ColumnConstraint {
     },
     /// `REFERENCES target_table [(target_columns)]`.
     References {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
         /// Referenced table.
         target_table: ObjectName,
         /// Referenced columns (may be empty if targeting the primary key).
@@ -198,6 +212,10 @@ pub enum ColumnConstraint {
 pub enum TableConstraint {
     /// `PRIMARY KEY (col, …)`.
     PrimaryKey {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        /// Preserved so `ALTER TABLE … DROP CONSTRAINT name` can identify the
+        /// constraint by name.
+        name: Option<Identifier>,
         /// Key columns.
         columns: Vec<Identifier>,
         /// Source span.
@@ -205,6 +223,8 @@ pub enum TableConstraint {
     },
     /// `UNIQUE (col, …)`.
     Unique {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
         /// Unique columns.
         columns: Vec<Identifier>,
         /// Source span.
@@ -212,6 +232,8 @@ pub enum TableConstraint {
     },
     /// `FOREIGN KEY (col, …) REFERENCES target_table [(target_col, …)]`.
     ForeignKey {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
         /// Local columns.
         columns: Vec<Identifier>,
         /// Referenced table.
@@ -223,6 +245,8 @@ pub enum TableConstraint {
     },
     /// `CHECK (expr)`.
     Check {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
         /// Constraint expression.
         expr: Expr,
         /// Source span.

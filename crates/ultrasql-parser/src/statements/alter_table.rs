@@ -180,10 +180,15 @@ mod tests {
         let AlterTableAction::AddConstraint { constraint, .. } = stmt.action else {
             panic!("expected AddConstraint")
         };
-        assert!(matches!(
-            constraint,
-            crate::ast::TableConstraint::ForeignKey { .. }
-        ));
+        // The constraint name from `CONSTRAINT fk_user` must be preserved.
+        let crate::ast::TableConstraint::ForeignKey { ref name, .. } = constraint else {
+            panic!("expected ForeignKey, got {constraint:?}");
+        };
+        assert_eq!(
+            name.as_ref().map(|n| n.value.as_str()),
+            Some("fk_user"),
+            "constraint name must be stored in the AST"
+        );
     }
 
     #[test]
