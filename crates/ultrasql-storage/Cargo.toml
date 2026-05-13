@@ -30,5 +30,14 @@ libc          = { workspace = true }
 tracing       = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
-rstest   = { workspace = true }
+proptest  = { workspace = true }
+rstest    = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "page"
+harness = false
+
+[[bench]]
+name = "buffer_pool"
+harness = false

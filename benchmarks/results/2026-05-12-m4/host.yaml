@@ -1,0 +1,42 @@
+host:
+  hostname: ultrasql-m4-mini
+  cpu_model: "Apple M4"
+  cpu_cores: 10
+  cpu_threads: 10
+  cpu_freq_ghz: 4.4
+  ram_gb: 16
+  storage:
+    type: NVMe
+    model: "Apple Fabric NVMe SSD (internal)"
+    size_gb: 512
+  os:
+    kernel: "Darwin 25.5.0"
+    name: "macOS"
+    version: "26.5"
+  rust:
+    channel: stable
+    version: "1.95.0"
+    target: aarch64-apple-darwin
+  ultrasql:
+    commit: 373bb69e3264bca51ed0b1c57c8784109a815d90
+    profile: bench (opt-level=3, lto=fat, codegen-units=1)
+    cargo_features: []
+    target_cpu: apple-m1   # Apple M4 still consumes the apple-m1 LLVM tuning
+  power:
+    plugged_in: true
+    thermal_state: nominal
+  criterion:
+    measurement_time_s: 2
+    warm_up_time_s: 1
+    samples_per_bench: 100
+
+scope:
+  category: microbenchmark
+  not_workload: true
+  notes: |
+    These are kernel-level latency measurements run in isolation in
+    release+LTO. They do NOT represent end-to-end OLTP/OLAP throughput.
+    The UltraSQL server is not executable end-to-end yet (no query
+    pipeline, no wire protocol, no segment-file I/O). Workload-level
+    benchmarks against PostgreSQL/MySQL/SQLite/DuckDB/ClickHouse are
+    blocked on v0.5 ("Execute") in ROADMAP.md.

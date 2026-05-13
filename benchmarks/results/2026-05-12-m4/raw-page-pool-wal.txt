@@ -1,0 +1,249 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.29s
+     Running unittests src/main.rs (target/release/deps/ultrasql_bench-fb8097cfadc36217)
+error: Unrecognized option: 'measurement-time'
+error: bench failed, to rerun pass `-p ultrasql-bench --bin ultrasql-bench`
+   Compiling memchr v2.8.0
+   Compiling crossbeam-queue v0.3.12
+   Compiling tracing-core v0.1.36
+   Compiling hashbrown v0.14.5
+   Compiling proptest v1.11.0
+   Compiling criterion v0.5.1
+   Compiling crossbeam v0.8.4
+   Compiling tracing v0.1.44
+   Compiling aho-corasick v1.1.4
+   Compiling dashmap v6.1.0
+   Compiling ultrasql-storage v0.0.1 ($REPO/crates/ultrasql-storage)
+   Compiling regex-automata v0.4.14
+   Compiling regex v1.12.3
+   Compiling rstest_macros v0.23.0
+   Compiling rstest v0.23.0
+    Finished `bench` profile [optimized + debuginfo] target(s) in 20.30s
+     Running benches/page.rs (target/release/deps/page-db83b9c453010fe6)
+Gnuplot not found, using plotters backend
+Benchmarking page/insert/16
+Benchmarking page/insert/16: Warming up for 1.0000 s
+Benchmarking page/insert/16: Collecting 100 samples in estimated 2.1538 s (61k iterations)
+Benchmarking page/insert/16: Analyzing
+page/insert/16          time:   [35.567 µs 35.669 µs 35.780 µs]
+                        thrpt:  [436.70 KiB/s 438.05 KiB/s 439.31 KiB/s]
+Found 2 outliers among 100 measurements (2.00%)
+  2 (2.00%) high mild
+Benchmarking page/insert/64
+Benchmarking page/insert/64: Warming up for 1.0000 s
+Benchmarking page/insert/64: Collecting 100 samples in estimated 2.0017 s (530k iterations)
+Benchmarking page/insert/64: Analyzing
+page/insert/64          time:   [3.7291 µs 3.7483 µs 3.7712 µs]
+                        thrpt:  [16.185 MiB/s 16.283 MiB/s 16.367 MiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  2 (2.00%) high mild
+  2 (2.00%) high severe
+Benchmarking page/insert/256
+Benchmarking page/insert/256: Warming up for 1.0000 s
+Benchmarking page/insert/256: Collecting 100 samples in estimated 2.0002 s (4.4M iterations)
+Benchmarking page/insert/256: Analyzing
+page/insert/256         time:   [439.42 ns 441.43 ns 444.36 ns]
+                        thrpt:  [549.42 MiB/s 553.07 MiB/s 555.60 MiB/s]
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+Benchmarking page/insert/1024
+Benchmarking page/insert/1024: Warming up for 1.0000 s
+Benchmarking page/insert/1024: Collecting 100 samples in estimated 2.0004 s (9.8M iterations)
+Benchmarking page/insert/1024: Analyzing
+page/insert/1024        time:   [201.17 ns 203.26 ns 207.15 ns]
+                        thrpt:  [4.6037 GiB/s 4.6919 GiB/s 4.7407 GiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  4 (4.00%) high severe
+
+Benchmarking page/read/scan_all_slots
+Benchmarking page/read/scan_all_slots: Warming up for 1.0000 s
+Benchmarking page/read/scan_all_slots: Collecting 100 samples in estimated 2.0005 s (16M iterations)
+Benchmarking page/read/scan_all_slots: Analyzing
+page/read/scan_all_slots
+                        time:   [126.06 ns 128.25 ns 130.84 ns]
+                        thrpt:  [917.12 Melem/s 935.69 Melem/s 951.96 Melem/s]
+Found 11 outliers among 100 measurements (11.00%)
+  2 (2.00%) high mild
+  9 (9.00%) high severe
+
+Benchmarking page/refresh_checksum_8KiB
+Benchmarking page/refresh_checksum_8KiB: Warming up for 1.0000 s
+Benchmarking page/refresh_checksum_8KiB: Collecting 100 samples in estimated 2.0011 s (7.5M iterations)
+Benchmarking page/refresh_checksum_8KiB: Analyzing
+page/refresh_checksum_8KiB
+                        time:   [265.60 ns 268.70 ns 273.63 ns]
+Found 9 outliers among 100 measurements (9.00%)
+  5 (5.00%) high mild
+  4 (4.00%) high severe
+
+   Compiling ultrasql-storage v0.0.1 ($REPO/crates/ultrasql-storage)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 12.41s
+     Running benches/buffer_pool.rs (target/release/deps/buffer_pool-caf5cebe894ed90a)
+Gnuplot not found, using plotters backend
+Benchmarking buffer_pool/hot_pin/single_page_repin
+Benchmarking buffer_pool/hot_pin/single_page_repin: Warming up for 1.0000 s
+Benchmarking buffer_pool/hot_pin/single_page_repin: Collecting 100 samples in estimated 2.0000 s (158M iterations)
+Benchmarking buffer_pool/hot_pin/single_page_repin: Analyzing
+buffer_pool/hot_pin/single_page_repin
+                        time:   [12.627 ns 12.654 ns 12.681 ns]
+                        thrpt:  [78.861 Melem/s 79.027 Melem/s 79.196 Melem/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+
+Benchmarking buffer_pool/cycle/64_pages
+Benchmarking buffer_pool/cycle/64_pages: Warming up for 1.0000 s
+Benchmarking buffer_pool/cycle/64_pages: Collecting 100 samples in estimated 2.0042 s (2.0M iterations)
+Benchmarking buffer_pool/cycle/64_pages: Analyzing
+buffer_pool/cycle/64_pages
+                        time:   [1.0189 µs 1.0571 µs 1.1020 µs]
+                        thrpt:  [58.078 Melem/s 60.543 Melem/s 62.812 Melem/s]
+Found 6 outliers among 100 measurements (6.00%)
+  2 (2.00%) high mild
+  4 (4.00%) high severe
+Benchmarking buffer_pool/cycle/256_pages
+Benchmarking buffer_pool/cycle/256_pages: Warming up for 1.0000 s
+Benchmarking buffer_pool/cycle/256_pages: Collecting 100 samples in estimated 2.2040 s (30k iterations)
+Benchmarking buffer_pool/cycle/256_pages: Analyzing
+buffer_pool/cycle/256_pages
+                        time:   [72.745 µs 73.468 µs 74.326 µs]
+                        thrpt:  [3.4443 Melem/s 3.4845 Melem/s 3.5192 Melem/s]
+Found 4 outliers among 100 measurements (4.00%)
+  1 (1.00%) high mild
+  3 (3.00%) high severe
+
+   Compiling syn v2.0.117
+   Compiling zerocopy-derive v0.8.48
+   Compiling serde_derive v1.0.228
+   Compiling thiserror-impl v2.0.18
+   Compiling tracing-attributes v0.1.31
+   Compiling thiserror v2.0.18
+   Compiling tracing v0.1.44
+   Compiling zerocopy v0.8.48
+   Compiling serde v1.0.228
+   Compiling tinytemplate v1.2.1
+   Compiling half v2.7.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling ahash v0.8.12
+   Compiling ultrasql-core v0.0.1 ($REPO/crates/ultrasql-core)
+   Compiling rand_chacha v0.9.0
+   Compiling ciborium-ll v0.2.2
+   Compiling proptest v1.11.0
+   Compiling ciborium v0.2.2
+   Compiling ultrasql-wal v0.0.1 ($REPO/crates/ultrasql-wal)
+   Compiling criterion v0.5.1
+    Finished `bench` profile [optimized + debuginfo] target(s) in 23.94s
+     Running benches/record.rs (target/release/deps/record-88ebe1f05fcfa77e)
+Gnuplot not found, using plotters backend
+Benchmarking wal/encode/0
+Benchmarking wal/encode/0: Warming up for 1.0000 s
+Benchmarking wal/encode/0: Collecting 100 samples in estimated 2.0001 s (97M iterations)
+Benchmarking wal/encode/0: Analyzing
+wal/encode/0            time:   [20.244 ns 20.580 ns 21.044 ns]
+                        thrpt:  [0.0000   B/s 0.0000   B/s 0.0000   B/s]
+Found 9 outliers among 100 measurements (9.00%)
+  1 (1.00%) high mild
+  8 (8.00%) high severe
+Benchmarking wal/encode/64
+Benchmarking wal/encode/64: Warming up for 1.0000 s
+Benchmarking wal/encode/64: Collecting 100 samples in estimated 2.0001 s (105M iterations)
+Benchmarking wal/encode/64: Analyzing
+wal/encode/64           time:   [19.000 ns 19.067 ns 19.133 ns]
+                        thrpt:  [3.1153 GiB/s 3.1261 GiB/s 3.1371 GiB/s]
+Benchmarking wal/encode/256
+Benchmarking wal/encode/256: Warming up for 1.0000 s
+Benchmarking wal/encode/256: Collecting 100 samples in estimated 2.0001 s (92M iterations)
+Benchmarking wal/encode/256: Analyzing
+wal/encode/256          time:   [21.538 ns 21.709 ns 21.872 ns]
+                        thrpt:  [10.901 GiB/s 10.983 GiB/s 11.070 GiB/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking wal/encode/1024
+Benchmarking wal/encode/1024: Warming up for 1.0000 s
+Benchmarking wal/encode/1024: Collecting 100 samples in estimated 2.0001 s (54M iterations)
+Benchmarking wal/encode/1024: Analyzing
+wal/encode/1024         time:   [35.757 ns 35.952 ns 36.239 ns]
+                        thrpt:  [26.316 GiB/s 26.526 GiB/s 26.671 GiB/s]
+Found 3 outliers among 100 measurements (3.00%)
+  1 (1.00%) high mild
+  2 (2.00%) high severe
+Benchmarking wal/encode/4096
+Benchmarking wal/encode/4096: Warming up for 1.0000 s
+Benchmarking wal/encode/4096: Collecting 100 samples in estimated 2.0004 s (19M iterations)
+Benchmarking wal/encode/4096: Analyzing
+wal/encode/4096         time:   [104.96 ns 107.08 ns 110.71 ns]
+                        thrpt:  [34.457 GiB/s 35.624 GiB/s 36.346 GiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+
+Benchmarking wal/decode/0
+Benchmarking wal/decode/0: Warming up for 1.0000 s
+Benchmarking wal/decode/0: Collecting 100 samples in estimated 2.0001 s (87M iterations)
+Benchmarking wal/decode/0: Analyzing
+wal/decode/0            time:   [23.009 ns 23.472 ns 24.127 ns]
+                        thrpt:  [0.0000   B/s 0.0000   B/s 0.0000   B/s]
+Found 5 outliers among 100 measurements (5.00%)
+  3 (3.00%) high mild
+  2 (2.00%) high severe
+Benchmarking wal/decode/64
+Benchmarking wal/decode/64: Warming up for 1.0000 s
+Benchmarking wal/decode/64: Collecting 100 samples in estimated 2.0001 s (46M iterations)
+Benchmarking wal/decode/64: Analyzing
+wal/decode/64           time:   [45.909 ns 48.458 ns 51.615 ns]
+                        thrpt:  [1.1548 GiB/s 1.2300 GiB/s 1.2983 GiB/s]
+Found 7 outliers among 100 measurements (7.00%)
+  1 (1.00%) high mild
+  6 (6.00%) high severe
+Benchmarking wal/decode/256
+Benchmarking wal/decode/256: Warming up for 1.0000 s
+Benchmarking wal/decode/256: Collecting 100 samples in estimated 2.0001 s (29M iterations)
+Benchmarking wal/decode/256: Analyzing
+wal/decode/256          time:   [61.786 ns 62.620 ns 64.085 ns]
+                        thrpt:  [3.7204 GiB/s 3.8074 GiB/s 3.8588 GiB/s]
+Found 3 outliers among 100 measurements (3.00%)
+  2 (2.00%) high mild
+  1 (1.00%) high severe
+Benchmarking wal/decode/1024
+Benchmarking wal/decode/1024: Warming up for 1.0000 s
+Benchmarking wal/decode/1024: Collecting 100 samples in estimated 2.0003 s (17M iterations)
+Benchmarking wal/decode/1024: Analyzing
+wal/decode/1024         time:   [119.47 ns 120.88 ns 122.66 ns]
+                        thrpt:  [7.7747 GiB/s 7.8896 GiB/s 7.9826 GiB/s]
+Found 14 outliers among 100 measurements (14.00%)
+  4 (4.00%) high mild
+  10 (10.00%) high severe
+Benchmarking wal/decode/4096
+Benchmarking wal/decode/4096: Warming up for 1.0000 s
+Benchmarking wal/decode/4096: Collecting 100 samples in estimated 2.0003 s (6.1M iterations)
+Benchmarking wal/decode/4096: Analyzing
+wal/decode/4096         time:   [322.36 ns 323.30 ns 324.30 ns]
+                        thrpt:  [11.763 GiB/s 11.799 GiB/s 11.834 GiB/s]
+Found 7 outliers among 100 measurements (7.00%)
+  7 (7.00%) high mild
+
+Benchmarking wal/buffer_append/64
+Benchmarking wal/buffer_append/64: Warming up for 1.0000 s
+Benchmarking wal/buffer_append/64: Collecting 100 samples in estimated 2.0002 s (19M iterations)
+Benchmarking wal/buffer_append/64: Analyzing
+wal/buffer_append/64    time:   [57.716 ns 57.907 ns 58.105 ns]
+                        thrpt:  [1.0258 GiB/s 1.0293 GiB/s 1.0327 GiB/s]
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild
+Benchmarking wal/buffer_append/256
+Benchmarking wal/buffer_append/256: Warming up for 1.0000 s
+Benchmarking wal/buffer_append/256: Collecting 100 samples in estimated 2.0002 s (18M iterations)
+Benchmarking wal/buffer_append/256: Analyzing
+wal/buffer_append/256   time:   [61.484 ns 61.639 ns 61.801 ns]
+                        thrpt:  [3.8578 GiB/s 3.8680 GiB/s 3.8777 GiB/s]
+Found 9 outliers among 100 measurements (9.00%)
+  9 (9.00%) high severe
+Benchmarking wal/buffer_append/1024
+Benchmarking wal/buffer_append/1024: Warming up for 1.0000 s
+Benchmarking wal/buffer_append/1024: Collecting 100 samples in estimated 2.0000 s (14M iterations)
+Benchmarking wal/buffer_append/1024: Analyzing
+wal/buffer_append/1024  time:   [94.604 ns 96.137 ns 99.021 ns]
+                        thrpt:  [9.6310 GiB/s 9.9199 GiB/s 10.081 GiB/s]
+Found 4 outliers among 100 measurements (4.00%)
+  3 (3.00%) high mild
+  1 (1.00%) high severe
+
