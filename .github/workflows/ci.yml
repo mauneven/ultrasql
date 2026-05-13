@@ -63,6 +63,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Materialize the toolchain that `rust-toolchain.toml` pins.
+      # Without this, the macos-14 image's bare `rustup-init` shim
+      # tries to handle `cargo build` as its own argument and fails
+      # with "unexpected argument 'build' found".
+      - run: rustup show active-toolchain || rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --all-targets
       - run: cargo test  --workspace --all-features -- --nocapture
