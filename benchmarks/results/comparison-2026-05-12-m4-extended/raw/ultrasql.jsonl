@@ -1,0 +1,8 @@
+sum-1m	{"workload":"sum","n_rows":1000000,"samples":8,"median_us":77.270,"min_us":75.500,"iterations_us":[95.375,86.666,77.750,78.375,76.125,76.791,75.500,76.417],"answer":"2019621396328"}
+sum-10m	{"workload":"sum","n_rows":10000000,"samples":8,"median_us":1170.104,"min_us":1133.084,"iterations_us":[1133.084,1162.916,1175.583,1158.625,1170.208,1170.000,1197.500,1201.083],"answer":"-2920477124575"}
+count-10m	{"workload":"count","n_rows":10000000,"samples":8,"median_us":0.000,"min_us":0.000,"iterations_us":[0.000,0.000,0.042,0.000,0.000,0.041,0.000,0.000],"answer":"10000000"}
+minmax-10m	{"workload":"minmax","n_rows":10000000,"samples":8,"median_us":2544.624,"min_us":2535.041,"iterations_us":[2541.500,2544.791,2544.458,2566.459,2535.041,2538.250,2549.958,2557.083],"answer":"98"}
+avg-10m	{"workload":"avg","n_rows":10000000,"samples":8,"median_us":1184.062,"min_us":1177.250,"iterations_us":[1182.708,1177.250,1182.750,1201.667,1198.125,1185.375,1211.708,1178.334],"answer":"-292047"}
+range-10m	{"workload":"range","n_rows":10000000,"samples":8,"median_us":31485.020,"min_us":30761.041,"iterations_us":[30761.041,31187.709,31430.584,31440.125,31556.542,31529.916,31868.666,31632.167],"answer":"4657292","range_lo":-1000000000,"range_hi":1000000000}
+filter-10m	{"workload":"filter","n_rows":10000000,"samples":8,"median_us":33200.709,"min_us":33127.125,"iterations_us":[33204.292,33225.500,33144.000,33127.125,33197.125,33193.917,33247.250,33252.167],"answer":"-1745795706789"}
+point-1m	{"workload":"point","n_rows":1000000,"samples":8,"median_us":6781.146,"min_us":6418.250,"iterations_us":[7230.709,6575.334,6714.834,6452.084,7104.125,8129.334,6847.459,6418.250],"answer":"hits=5041302012","point_batch":10000,"ns_per_lookup":678.11}
