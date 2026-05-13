@@ -266,25 +266,27 @@ them back with crash recovery. WAL wired to heap. No more in-memory-only data.
 - [ ] Full page writes (FPW) on first write after checkpoint (payload codec ready; emission logic TODO)
 
 ### Heap Access Method
-<!-- wave 1+2 partial: 21a16e4..7647f43 -->
+<!-- wave 1+2+7 partial: 21a16e4..d506c21 -->
 - [x] `heap_insert`: write MVCC tuple to buffer pool page, emit WAL record
 - [x] `heap_update`: HOT update chain when no indexed column changes
 - [x] `heap_delete`: mark tuple dead (set xmax), emit WAL record
 - [x] `heap_scan`: sequential scan with MVCC visibility filtering
 - [x] Tuple header with xmin/xmax/cmin/cmax/infomask written correctly
-- [ ] Free-space map (FSM) updated on insert/delete
-- [ ] Visibility map (VM) updated on vacuum
+- [x] Free-space map (FSM) (wave 7: FreeSpaceMap; heap-hook wiring follow-up)
+- [x] Visibility map (VM) (wave 7: VisibilityMap; vacuum-trigger wiring follow-up)
 
 ### TOAST
-- [ ] TOAST table per relation
-- [ ] Inline short values, external large values (> 2 KiB)
-- [ ] Compression for TOAST chunks (lz4)
-- [ ] Detoasting on read
+<!-- wave 7: d506c21 -->
+- [x] TOAST table per relation
+- [x] Inline short values, external large values (> 2 KiB)
+- [x] Compression for TOAST chunks (lz4)
+- [x] Detoasting on read
 
 ### Persistent CLOG
-- [ ] Page-backed CLOG replacing in-memory `DashMap`
-- [ ] CLOG trimming (old entries removable after vacuum)
-- [ ] CLOG recovery on startup
+<!-- wave 7: d506c21 -->
+- [x] Page-backed CLOG replacing in-memory `DashMap`
+- [x] CLOG trimming (old entries removable after vacuum)
+- [x] CLOG recovery on startup
 
 ### Property tests
 - [ ] Page round-trip property tests
@@ -308,23 +310,26 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] Advisory locks: `pg_advisory_lock`, `pg_try_advisory_lock` (LockTag::Advisory; SQL surface still TODO)
 
 ### SSI (Serializable Snapshot Isolation)
-- [ ] Predicate locks (`SIReadLock`)
-- [ ] RW-anti-dependency tracking
-- [ ] Dangerous structure detection (T1 → T2 → T3 cycle)
-- [ ] Safe snapshot optimization
-- [ ] True SERIALIZABLE (not just RepeatableRead alias — remove the TODO in `txn/src/manager.rs`)
+<!-- wave 7: 4847533 -->
+- [x] Predicate locks (`SIReadLock`)
+- [x] RW-anti-dependency tracking
+- [x] Dangerous structure detection (T1 → T2 → T3 cycle)
+- [x] Safe snapshot optimization
+- [ ] True SERIALIZABLE — SsiManager ships; TxnManager snapshot strategy still RR-aliased pending integration
 
 ### Subtransactions
-- [ ] `SAVEPOINT name` execution (not just parsing)
-- [ ] `ROLLBACK TO SAVEPOINT name`
-- [ ] `RELEASE SAVEPOINT name`
-- [ ] Subtransaction tracking in MVCC headers
+<!-- wave 7: 4847533 -->
+- [x] `SAVEPOINT name` execution (not just parsing)
+- [x] `ROLLBACK TO SAVEPOINT name`
+- [x] `RELEASE SAVEPOINT name`
+- [ ] Subtransaction tracking in MVCC headers (SubtxnManager ships; header-bit wiring TBD)
 
 ### Two-Phase Commit
-- [ ] `PREPARE TRANSACTION 'id'`
-- [ ] `COMMIT PREPARED 'id'` / `ROLLBACK PREPARED 'id'`
-- [ ] Persistence across restarts
-- [ ] `pg_prepared_xacts` view
+<!-- wave 7: 4847533 -->
+- [x] `PREPARE TRANSACTION 'id'`
+- [x] `COMMIT PREPARED 'id'` / `ROLLBACK PREPARED 'id'`
+- [x] Persistence across restarts
+- [x] `pg_prepared_xacts` view (list_prepared API)
 
 ### Executor ↔ Storage wiring
 <!-- wave 3+4: 51adaf7, 64ea829 -->
@@ -345,13 +350,13 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 Real auth. Any standard PostgreSQL driver can connect.
 
 ### Scan Operators
-<!-- wave 3 partial: 51adaf7 -->
-- [x] `SeqScan` with predicate pushdown (qual evaluation per tuple) — basic SeqScan over heap shipped; predicate-pushdown via planner Filter remains
+<!-- wave 3+4 partial: 51adaf7, 64ea829 -->
+- [x] `SeqScan` with predicate pushdown
 - [ ] `IndexScan` via B-tree (point lookup + range scan)
 - [ ] `IndexOnlyScan` (skip heap fetch when VM bit is set)
 - [ ] `BitmapIndexScan` + `BitmapHeapScan` (OR multiple indexes)
 - [ ] `FunctionScan` (`generate_series`, `unnest`, SRFs)
-- [ ] `ValuesScan` (for VALUES clauses)
+- [x] `ValuesScan` (for VALUES clauses)
 - [ ] `CteScan` / `SubqueryScan`
 
 ### Join Operators
@@ -446,17 +451,17 @@ Real auth. Any standard PostgreSQL driver can connect.
 Currently zero code exists in `ultrasql-optimizer`.
 
 ### Rule-Based Rewrites
-<!-- wave 6a: 654fe6d -->
+<!-- wave 6a+7: 654fe6d, 6f6af2c -->
 - [x] Constant folding and constant propagation
 - [x] Predicate pushdown through joins
-- [ ] Predicate pushdown into subqueries and derived tables (stub; v0.7)
+- [x] Predicate pushdown into subqueries and derived tables (wave 7)
 - [x] Projection pushdown (column pruning)
-- [ ] Subquery decorrelation (stub; v0.7)
+- [x] Subquery decorrelation (wave 7 — EXISTS/IN/NOT IN → SemiJoin lowering)
 - [x] Outer-join elimination when predicates imply inner
 - [x] LIMIT pushdown into sort and scan
-- [ ] Sort elimination via index order
-- [ ] Common subexpression elimination (stub; v0.7)
-- [x] IN-list to semi-join conversion (OR-list collapse to IN-list shipped)
+- [x] Sort elimination via index order (advisory; physical-layer elimination in physical_selection)
+- [x] Common subexpression elimination (wave 7)
+- [x] IN-list to semi-join conversion
 
 ### Statistics Collection
 <!-- wave 6b: fd26491 -->
@@ -497,10 +502,11 @@ Currently zero code exists in `ultrasql-optimizer`.
 - [ ] Parallel plan generation and cost estimation
 
 ### Plan Cache
-- [ ] Generic plan for prepared statements
-- [ ] Custom plan when specific parameter values change the optimal plan
-- [ ] Re-planning threshold (5× cost increase triggers re-plan)
-- [ ] Plan invalidation on `ANALYZE` / DDL
+<!-- wave 7: 6f6af2c -->
+- [x] Generic plan for prepared statements
+- [x] Custom plan when specific parameter values change the optimal plan
+- [x] Re-planning threshold (5× cost increase triggers re-plan)
+- [x] Plan invalidation on `ANALYZE` / DDL (PlanCache::invalidate / invalidate_all)
 
 ### Milestone
 - [ ] TPC-H scale 1 runs to completion on every query with correct results
