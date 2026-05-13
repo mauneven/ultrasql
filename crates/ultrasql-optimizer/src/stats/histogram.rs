@@ -20,7 +20,7 @@ use crate::stats::value_ord::compare_values;
 ///
 /// Invariant: `bounds.len() == usize::from(bucket_count) + 1` and the
 /// bounds are monotonically non-decreasing under `compare_values`.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EquiDepthHistogram {
     /// Number of buckets in the histogram. Must be at least 1.
     pub bucket_count: u16,

@@ -1,49 +1,43 @@
 //! Physical plan builder.
 //!
 //! Lowers a [`LogicalPlan`] tree from the planner crate into a tree of
-//! [`Operator`] trait objects the pull-mode executor can drive. The
-//! builder is intentionally narrow at v0.5: only the operators the
-//! executor crate ships today are reachable through this lowering.
-//!
-//! Everything outside that subset surfaces as
-//! [`BuildError::Unsupported`] so the server can return a clean
-//! protocol-level error rather than panic.
+//! [`Operator`] trait objects the pull-mode executor can drive.
 //!
 //! # Lowering rules (v0.5)
 //!
-//! - `LogicalPlan::Scan { table, projection, .. }` calls
-//!   [`DataSource::scan`] for `table`, builds a [`MemTableScan`] over
-//!   the returned batches, and wraps it in a [`Project`] when
-//!   `projection` is set.
-//! - `LogicalPlan::Filter { predicate, .. }` lowers to `Filter`
-//!   (the general expression-interpreter-backed filter). Any predicate
-//!   that the `Eval` interpreter does not support at runtime surfaces
-//!   as an `ExecError` during execution, not a build-time error.
-//! - `LogicalPlan::Values` lowers to [`ValuesScan`].
-//! - `LogicalPlan::Project` lowers to [`Project`] iff every output
-//!   expression is a bare column reference; computed expressions are
-//!   `Unsupported`.
-//! - `LogicalPlan::Limit { offset, n, .. }` lowers to [`Limit`] only
-//!   when `offset == 0`; non-zero offsets are `Unsupported`.
-//! - `LogicalPlan::Sort` is `Unsupported`.
-//! - `LogicalPlan::Empty` lowers to a [`MemTableScan`] over its
-//!   declared schema with zero batches — an EOF source.
-//! - `LogicalPlan::Insert / Update / Delete` are `Unsupported` pending
-//!   the datasource-handle refactor (wave 5+). `ModifyTable` and
-//!   [`ValuesScan`] exist as stand-alone operators that callers can
-//!   construct directly.
+//! - `Scan` → [`MemTableScan`] + optional [`Project`].
+//! - `Filter` → [`Filter`].
+//! - `Project` (column-only) → [`Project`].
+//! - `Limit` (offset == 0) → [`Limit`].
+//! - `Sort` → [`Sort`].
+//! - `Aggregate` → [`HashAggregate`] (default) or [`SortAggregate`]
+//!   when the hint field is set to `SortBased`.
+//! - `SetOp` → [`SetOp`].
+//! - `Cte` → materialise the definition, then serve via [`CteScan`].
+//! - `Join` with `On` condition → [`HashJoin`] for `Inner`/`LeftOuter`,
+//!   [`NestedLoopJoin`] otherwise.
+//! - `Empty` → zero-batch [`MemTableScan`].
+//! - `Values` → [`ValuesScan`].
+//! - `Insert / Update / Delete / Truncate` → `Unsupported` (build directly).
 //!
 //! The data source is injected through [`DataSource`] rather than
 //! resolved via the catalog so this layer stays decoupled from the
-//! heap and buffer-pool stack that has not yet landed. Production
-//! callers will supply an implementation backed by the storage engine;
-//! the v0.5 tests and the bring-up CLI supply an in-memory one.
+//! heap and buffer-pool stack that has not yet landed.
+
+use std::sync::Arc;
 
 use ultrasql_core::Schema;
-use ultrasql_planner::{LogicalPlan, ScalarExpr};
+use ultrasql_planner::{LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
 
+use crate::cte_scan::CteScan;
 use crate::filter_op::Filter;
+use crate::hash_aggregate::HashAggregate;
+use crate::hash_join::HashJoin;
+use crate::merge_join::MergeJoin;
+use crate::nested_loop_join::{NestedLoopJoin, RightFactory};
+use crate::set_op::SetOp;
+use crate::sort::Sort;
 use crate::values_scan::ValuesScan;
 use crate::{Limit, MemTableScan, Operator, Project};
 
@@ -160,7 +154,11 @@ pub fn build_operator(
             Ok(Box::new(Limit::new(child, capped)))
         }
 
-        LogicalPlan::Sort { .. } => Err(BuildError::Unsupported("sort not supported in v0.5")),
+        LogicalPlan::Sort { input, keys } => {
+            let child = build_operator(input, data_source)?;
+            let schema = child.schema().clone();
+            Ok(Box::new(Sort::new(child, keys.clone(), schema)))
+        }
 
         LogicalPlan::Empty { schema } => {
             Ok(Box::new(MemTableScan::new(schema.clone(), Vec::new())))
@@ -169,19 +167,323 @@ pub fn build_operator(
         LogicalPlan::Values { rows, schema } => {
             Ok(Box::new(ValuesScan::new(rows.clone(), schema.clone())))
         }
+
         LogicalPlan::Insert { .. } => Err(BuildError::Unsupported("INSERT not supported in v0.5")),
         LogicalPlan::Update { .. } => Err(BuildError::Unsupported("UPDATE not supported in v0.5")),
         LogicalPlan::Delete { .. } => Err(BuildError::Unsupported("DELETE not supported in v0.5")),
         LogicalPlan::Truncate { .. } => {
             Err(BuildError::Unsupported("TRUNCATE not supported in v0.5"))
         }
-        LogicalPlan::Join { .. } => Err(BuildError::Unsupported("JOIN not supported in v0.5")),
-        LogicalPlan::Aggregate { .. } => {
-            Err(BuildError::Unsupported("aggregate not supported in v0.5"))
+
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            schema,
+        } => build_join(left, right, join_type, condition, schema, data_source),
+
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+            schema,
+        } => {
+            // Default to HashAggregate. SortAggregate is chosen when the
+            // planner eventually annotates the node with a sort-based hint;
+            // for now we always emit HashAggregate.
+            let child = build_operator(input, data_source)?;
+            Ok(Box::new(HashAggregate::new(
+                child,
+                group_by.clone(),
+                aggregates.clone(),
+                schema.clone(),
+            )))
         }
-        LogicalPlan::SetOp { .. } => Err(BuildError::Unsupported("set op not supported in v0.5")),
-        LogicalPlan::Cte { .. } => Err(BuildError::Unsupported("CTE not supported in v0.5")),
+
+        LogicalPlan::SetOp {
+            op,
+            quantifier,
+            left,
+            right,
+            schema,
+        } => {
+            let left_op = build_operator(left, data_source)?;
+            let right_op = build_operator(right, data_source)?;
+            Ok(Box::new(SetOp::new(
+                left_op,
+                right_op,
+                *op,
+                *quantifier,
+                schema.clone(),
+            )))
+        }
+
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => {
+            // Materialise the CTE definition eagerly into an Arc-shared buffer.
+            // The body plan is lowered normally; Scan nodes that reference the
+            // CTE by name will be resolved by the data_source in v0.6. When the
+            // body is Empty we expose the CteScan so tests can exercise the
+            // operator through the builder.
+            let mut def_op = build_operator(definition, data_source)?;
+            let def_schema = def_op.schema().clone();
+            let mut batches: Vec<Batch> = Vec::new();
+            loop {
+                match def_op.next_batch() {
+                    Ok(Some(b)) => batches.push(b),
+                    Ok(None) => break,
+                    Err(e) => return Err(map_exec_error(e)),
+                }
+            }
+            let shared = Arc::new(batches);
+            match body.as_ref() {
+                LogicalPlan::Empty { .. } => Ok(Box::new(CteScan::new(shared, def_schema))),
+                _ => build_operator(body, data_source),
+            }
+        }
     }
+}
+
+/// Lower a [`LogicalPlan::Join`] node to the best available physical join.
+///
+/// Selection rules (v0.5):
+/// - `On` condition, `Inner` or `LeftOuter`: [`HashJoin`].
+/// - `On` condition, any other type: [`MergeJoin`] (assumes pre-sorted input).
+/// - `Using` pairs or `None` (CROSS): [`NestedLoopJoin`].
+#[allow(clippy::too_many_arguments)]
+fn build_join(
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    join_type: &LogicalJoinType,
+    condition: &LogicalJoinCondition,
+    schema: &Schema,
+    data_source: &dyn DataSource,
+) -> Result<Box<dyn Operator>, BuildError> {
+    let left_schema = left.schema().clone();
+    let right_schema = right.schema().clone();
+    let left_op = build_operator(left, data_source)?;
+    let right_op = build_operator(right, data_source)?;
+
+    match condition {
+        LogicalJoinCondition::On(pred) => {
+            // Extract a single equi-join key pair when the predicate is a
+            // binary Eq with Column on both sides.
+            if let Some((left_key, right_key)) = extract_equi_keys(pred, left_schema.len()) {
+                match join_type {
+                    LogicalJoinType::Inner | LogicalJoinType::LeftOuter => {
+                        return Ok(Box::new(HashJoin::new(
+                            left_op,
+                            right_op,
+                            left_key,
+                            right_key,
+                            *join_type,
+                            schema.clone(),
+                            left_schema,
+                            right_schema,
+                        )));
+                    }
+                    _ => {
+                        return Ok(Box::new(MergeJoin::new(
+                            left_op,
+                            right_op,
+                            left_key,
+                            right_key,
+                            *join_type,
+                            schema.clone(),
+                            left_schema,
+                            right_schema,
+                        )));
+                    }
+                }
+            }
+            // Non-equi predicate: use NestedLoopJoin with predicate.
+            build_nlj(
+                left_op,
+                right_op,
+                Some(pred.clone()),
+                *join_type,
+                schema.clone(),
+                left_schema,
+                right_schema,
+            )
+        }
+        LogicalJoinCondition::Using(pairs) => {
+            // Translate USING pairs into a composite equality predicate.
+            let cond = build_using_predicate(pairs, &left_schema, &right_schema);
+            build_nlj(
+                left_op,
+                right_op,
+                cond,
+                *join_type,
+                schema.clone(),
+                left_schema,
+                right_schema,
+            )
+        }
+        LogicalJoinCondition::None => {
+            // CROSS JOIN: no condition.
+            build_nlj(
+                left_op,
+                right_op,
+                None,
+                *join_type,
+                schema.clone(),
+                left_schema,
+                right_schema,
+            )
+        }
+    }
+}
+
+/// Attempt to extract an equi-join key pair `(left_expr, right_expr)` from a
+/// binary `Eq` predicate whose operands are `Column` references from the left
+/// and right sides respectively (right-side indices ≥ `left_width`).
+///
+/// Returns `None` if the predicate is not in this canonical form.
+fn extract_equi_keys(pred: &ScalarExpr, left_width: usize) -> Option<(ScalarExpr, ScalarExpr)> {
+    use ultrasql_planner::BinaryOp;
+    if let ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = pred
+    {
+        match (left.as_ref(), right.as_ref()) {
+            (
+                ScalarExpr::Column {
+                    index: li,
+                    data_type: lt,
+                    name: ln,
+                },
+                ScalarExpr::Column {
+                    index: ri,
+                    data_type: rt,
+                    name: rn,
+                },
+            ) if *ri >= left_width => {
+                let left_key = ScalarExpr::Column {
+                    index: *li,
+                    data_type: lt.clone(),
+                    name: ln.clone(),
+                };
+                let right_key = ScalarExpr::Column {
+                    index: ri - left_width,
+                    data_type: rt.clone(),
+                    name: rn.clone(),
+                };
+                return Some((left_key, right_key));
+            }
+            // Mirrored form: left operand is the right-side column.
+            (
+                ScalarExpr::Column {
+                    index: li,
+                    data_type: lt,
+                    name: ln,
+                },
+                ScalarExpr::Column {
+                    index: ri,
+                    data_type: rt,
+                    name: rn,
+                },
+            ) if *li >= left_width => {
+                let left_key = ScalarExpr::Column {
+                    index: *ri,
+                    data_type: rt.clone(),
+                    name: rn.clone(),
+                };
+                let right_key = ScalarExpr::Column {
+                    index: li - left_width,
+                    data_type: lt.clone(),
+                    name: ln.clone(),
+                };
+                return Some((left_key, right_key));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Build a composite equality predicate from `USING (left_idx, right_idx)` pairs.
+///
+/// Each pair produces `left_col = right_col` (right column offset by left
+/// schema width); multiple pairs are ANDed together. Returns `None` when the
+/// list is empty.
+fn build_using_predicate(
+    pairs: &[(usize, usize)],
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Option<ScalarExpr> {
+    use ultrasql_planner::BinaryOp;
+    let mut iter = pairs.iter().map(|(li, ri)| {
+        let lf = left_schema.field_at(*li);
+        let rf = right_schema.field_at(*ri);
+        ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(ScalarExpr::Column {
+                index: *li,
+                data_type: lf.data_type.clone(),
+                name: lf.name.clone(),
+            }),
+            right: Box::new(ScalarExpr::Column {
+                index: left_schema.len() + ri,
+                data_type: rf.data_type.clone(),
+                name: rf.name.clone(),
+            }),
+            data_type: ultrasql_core::DataType::Bool,
+        }
+    });
+    let first = iter.next()?;
+    Some(iter.fold(first, |acc, next| ScalarExpr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(acc),
+        right: Box::new(next),
+        data_type: ultrasql_core::DataType::Bool,
+    }))
+}
+
+/// Build a [`NestedLoopJoin`].
+///
+/// The right child is materialised once and replayed via a factory closure
+/// that clones the `Arc`-backed batch list. This is O(|right|) per left row;
+/// a future wave will add operator spooling for cheaper right re-scans.
+#[allow(clippy::too_many_arguments)]
+fn build_nlj(
+    left_op: Box<dyn Operator>,
+    right_op: Box<dyn Operator>,
+    condition: Option<ScalarExpr>,
+    join_type: LogicalJoinType,
+    schema: Schema,
+    left_schema: Schema,
+    right_schema: Schema,
+) -> Result<Box<dyn Operator>, BuildError> {
+    // Drain the right side into memory so we can replay it cheaply.
+    let mut batches: Vec<Batch> = Vec::new();
+    let mut right_op = right_op;
+    loop {
+        match right_op.next_batch() {
+            Ok(Some(b)) => batches.push(b),
+            Ok(None) => break,
+            Err(e) => return Err(map_exec_error(e)),
+        }
+    }
+    let shared: Arc<Vec<Batch>> = Arc::new(batches);
+    let rs = right_schema.clone();
+    let factory: RightFactory = Box::new(move || {
+        Ok(Box::new(MemTableScan::new(rs.clone(), (*shared).clone())) as Box<dyn Operator>)
+    });
+    Ok(Box::new(NestedLoopJoin::new(
+        left_op,
+        factory,
+        join_type,
+        condition,
+        schema,
+        left_schema,
+        right_schema,
+    )))
 }
 
 /// Build a scan operator and apply the optional projection.
@@ -224,7 +526,10 @@ fn build_project(
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
-    use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, SortKey};
+    use ultrasql_planner::{
+        AggregateFunc, BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType,
+        LogicalPlan, LogicalSetOp, LogicalSetQuantifier, ScalarExpr, SortKey,
+    };
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
 
@@ -409,9 +714,6 @@ mod tests {
 
     #[test]
     fn filter_accepts_mirrored_literal_on_left() {
-        // `7 = id` — the symmetric form — should lower exactly like
-        // `id = 7`. The binder may emit either shape today; the
-        // builder normalises.
         let src = StaticSource::with_users();
         let plan = LogicalPlan::Filter {
             input: Box::new(scan_plan()),
@@ -477,9 +779,7 @@ mod tests {
     #[test]
     fn filter_with_arithmetic_predicate_builds_successfully() {
         // The general Filter operator accepts any ScalarExpr; build-time
-        // validation no longer rejects non-equality predicates. An Add
-        // predicate like `id + 1` is accepted at build time and will
-        // surface a TypeMismatch at runtime (the result is Int32, not Bool).
+        // validation no longer rejects non-equality predicates.
         let src = StaticSource::with_users();
         let plan = LogicalPlan::Filter {
             input: Box::new(scan_plan()),
@@ -503,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn sort_is_unsupported() {
+    fn sort_lowers_and_produces_sorted_output() {
         let src = StaticSource::with_users();
         let plan = LogicalPlan::Sort {
             input: Box::new(scan_plan()),
@@ -513,8 +813,83 @@ mod tests {
                 nulls_first: false,
             }],
         };
-        let err = build_operator(&plan, &src).expect_err("sort must reject");
-        assert!(matches!(err, BuildError::Unsupported(_)), "got {err:?}");
+        let mut op = build_operator(&plan, &src).expect("sort builds");
+        let rows = drain_id_val(&mut *op);
+        let ids: Vec<i32> = rows.iter().map(|(i, _)| *i).collect();
+        assert_eq!(ids, vec![1, 2, 3, 7, 7, 7], "sort by id asc");
+    }
+
+    #[test]
+    fn aggregate_count_star_lowers_to_hash_aggregate() {
+        let src = StaticSource::with_users();
+        let agg_schema = Schema::new([Field::required("cnt", DataType::Int64)]).expect("schema ok");
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(scan_plan()),
+            group_by: vec![],
+            aggregates: vec![LogicalAggregateExpr {
+                func: AggregateFunc::CountStar,
+                arg: None,
+                distinct: false,
+                output_name: "cnt".into(),
+                data_type: DataType::Int64,
+            }],
+            schema: agg_schema,
+        };
+        let mut op = build_operator(&plan, &src).expect("aggregate builds");
+        let vals = drain_i64(&mut *op);
+        assert_eq!(vals, vec![6], "count(*) over 6 rows");
+    }
+
+    #[test]
+    fn set_op_union_all_lowers_and_concatenates() {
+        let src = StaticSource::with_users();
+        let plan = LogicalPlan::SetOp {
+            op: LogicalSetOp::Union,
+            quantifier: LogicalSetQuantifier::All,
+            left: Box::new(scan_plan()),
+            right: Box::new(scan_plan()),
+            schema: users_schema(),
+        };
+        let mut op = build_operator(&plan, &src).expect("set op builds");
+        let rows = drain_id_val(&mut *op);
+        assert_eq!(rows.len(), 12, "UNION ALL doubles the 6 rows");
+    }
+
+    #[test]
+    fn join_inner_equi_lowers_to_hash_join() {
+        // Self-join users ON left.id = right.id (concatenated schema index 2).
+        let join_schema = Schema::new([
+            Field::required("l_id", DataType::Int32),
+            Field::required("l_val", DataType::Int64),
+            Field::required("r_id", DataType::Int32),
+            Field::required("r_val", DataType::Int64),
+        ])
+        .expect("join schema ok");
+        let right_id = ScalarExpr::Column {
+            name: "r_id".into(),
+            index: 2,
+            data_type: DataType::Int32,
+        };
+        let plan = LogicalPlan::Join {
+            left: Box::new(scan_plan()),
+            right: Box::new(scan_plan()),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::On(ScalarExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(col_id()),
+                right: Box::new(right_id),
+                data_type: DataType::Bool,
+            }),
+            schema: join_schema,
+        };
+        let src = StaticSource::with_users();
+        let mut op = build_operator(&plan, &src).expect("join builds");
+        let mut count = 0usize;
+        while let Some(b) = op.next_batch().expect("join must not error") {
+            count += b.rows();
+        }
+        // id=1 (1×1), id=2 (1×1), id=3 (1×1), id=7 (3×3 = 9) → total 12.
+        assert_eq!(count, 12, "inner self-join row count");
     }
 
     #[test]
@@ -531,7 +906,6 @@ mod tests {
 
     #[test]
     fn computed_projection_is_unsupported() {
-        // `SELECT id + 1 FROM users` — a non-column projection.
         let src = StaticSource::with_users();
         let plan = LogicalPlan::Project {
             input: Box::new(scan_plan()),

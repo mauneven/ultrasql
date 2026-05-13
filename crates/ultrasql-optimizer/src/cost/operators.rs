@@ -271,7 +271,10 @@ pub fn cost_index_only_scan(
     let index_pages = (rows / 100.0).ceil();
     let startup = f64::from(index_height) * gucs.random_page_cost;
     CostEstimate {
-        total_cost: rows.mul_add(gucs.cpu_index_tuple_cost, startup + index_pages * gucs.random_page_cost),
+        total_cost: rows.mul_add(
+            gucs.cpu_index_tuple_cost,
+            startup + index_pages * gucs.random_page_cost,
+        ),
         startup_cost: startup,
         rows,
         width: 100,
@@ -294,11 +297,7 @@ pub fn cost_index_only_scan(
 /// `workers > 1`.
 ///
 /// If `workers` is 0 or 1, the estimate is returned unchanged.
-pub fn annotate_parallel(
-    input: CostEstimate,
-    workers: usize,
-    gucs: &CostGucs,
-) -> CostEstimate {
+pub fn annotate_parallel(input: CostEstimate, workers: usize, gucs: &CostGucs) -> CostEstimate {
     if workers <= 1 {
         return input;
     }
@@ -484,7 +483,10 @@ mod tests {
     /// `BitmapHeapScan` has non-zero startup and uses `seq_page_cost` for heap.
     #[test]
     fn bitmap_heap_scan_has_nonzero_startup_and_scales() {
-        let stats = FixedStats { rows: 100_000, pages: 1_000 };
+        let stats = FixedStats {
+            rows: 100_000,
+            pages: 1_000,
+        };
         let g = gucs();
         let est = cost_bitmap_heap_scan(&stats, "t", 3, 0.05, &g);
         assert!(est.startup_cost > 0.0, "startup should be > 0");
@@ -496,7 +498,10 @@ mod tests {
     /// because it skips heap I/O.
     #[test]
     fn index_only_scan_cheaper_than_index_scan() {
-        let stats = FixedStats { rows: 100_000, pages: 1_000 };
+        let stats = FixedStats {
+            rows: 100_000,
+            pages: 1_000,
+        };
         let g = gucs();
         let ios = cost_index_only_scan(&stats, "t", 3, 0.01, &g);
         let idx = cost_index_scan(&stats, "t", 3, 0.01, &g);
@@ -519,7 +524,11 @@ mod tests {
         };
         let g = gucs();
         let out = annotate_parallel(input, 4, &g);
-        assert!((out.total_cost - 250.0).abs() < 1e-9, "total={}", out.total_cost);
+        assert!(
+            (out.total_cost - 250.0).abs() < 1e-9,
+            "total={}",
+            out.total_cost
+        );
         assert!(out.startup_cost > input.startup_cost, "startup should grow");
     }
 

@@ -57,6 +57,17 @@ pub enum PhysicalOp {
     Filter,
     /// Column projection.
     Project,
+    /// Bitmap index scan: evaluates a predicate against an index and
+    /// returns a `TidBitmap`.  Multiple `BitmapIndexScan`s can be AND/OR
+    /// merged before the heap fetch.
+    BitmapIndexScan,
+    /// Bitmap heap scan: fetches rows from the heap for every TID set in a
+    /// `TidBitmap`.  Preferred when selectivity is in the range [0.5%, 10%]
+    /// or when two or more indexes apply to the same table.
+    BitmapHeapScan,
+    /// Index-only scan: reads index entries directly without a heap fetch
+    /// when the visibility map indicates all-visible pages.
+    IndexOnlyScan,
 }
 
 // ============================================================================

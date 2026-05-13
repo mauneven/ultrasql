@@ -21,6 +21,7 @@ pub mod selectivity;
 
 use ultrasql_planner::LogicalPlan;
 
+pub use crate::cost::operators::{annotate_parallel, cost_bitmap_heap_scan, cost_index_only_scan};
 use crate::cost::operators::{
     cost_aggregate, cost_filter, cost_hash_join, cost_nested_loop, cost_scan, cost_sort,
 };
@@ -130,6 +131,10 @@ pub struct CostGucs {
     pub cpu_index_tuple_cost: f64,
     /// CPU cost of a simple operator (comparison, hash, etc.). Default: 0.0025.
     pub cpu_operator_cost: f64,
+    /// Fixed overhead added to `startup_cost` when a parallel query is
+    /// annotated with `workers > 1`. Models worker spawn + synchronisation
+    /// costs.  Default: 1000.0 (PostgreSQL's `parallel_setup_cost`).
+    pub parallel_setup_cost: f64,
 }
 
 impl Default for CostGucs {
@@ -140,6 +145,7 @@ impl Default for CostGucs {
             cpu_tuple_cost: 0.01,
             cpu_index_tuple_cost: 0.005,
             cpu_operator_cost: 0.0025,
+            parallel_setup_cost: 1000.0,
         }
     }
 }

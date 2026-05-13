@@ -497,10 +497,11 @@ Currently zero code exists in `ultrasql-optimizer`.
 <!-- wave 6b: a030846 -->
 - [x] NestLoop vs HashJoin vs MergeJoin
 - [x] IndexScan vs SeqScan (BitmapHeapScan v0.7)
-- [ ] IndexOnlyScan when VM bit is set
+- [x] IndexOnlyScan when VM bit is set
+- [x] BitmapHeapScan when selectivity ∈ [0.5%, 10%] or ≥2 indexes apply
 - [x] HashAggregate vs SortAggregate (StreamAggregate v0.7)
 - [ ] Hash-based DISTINCT vs Sort-based DISTINCT
-- [ ] Parallel plan generation and cost estimation
+- [x] Parallel plan cost annotation (divide by N workers, add parallel_setup_cost)
 
 ### Plan Cache
 <!-- wave 7: 6f6af2c -->
@@ -514,33 +515,36 @@ Currently zero code exists in `ultrasql-optimizer`.
 
 ---
 
-## v0.7 — "Vectorize" ❌
+## v0.7 — "Vectorize" 🔄
 
 **Scope:** Vectorized batch execution for analytic pipelines.
 This is the main OLAP performance differentiator over PostgreSQL.
 
 ### Push-Based Pipeline Driver
 - [ ] Planner tags pipelines as vectorized (OLAP) vs scalar (OLTP)
-- [ ] Push-based pipeline driver replacing pull-based scaffold
-- [ ] Vectorized SeqScan emitting 4096-row batches
-- [ ] Vectorized filter kernel (SIMD selection vector)
-- [ ] Vectorized projection kernel
-- [ ] Vectorized hash join (build + probe over batches)
-- [ ] Vectorized hash aggregate
-- [ ] Vectorized sort
+- [x] Push-based pipeline driver (`VectorizedSink` / `VectorizedOperator` / `SinkVerdict`)
+- [x] Vectorized SeqScan emitting 4096-row batches
+- [x] Vectorized filter operator (SIMD fast path for col == scalar, Eval fallback)
+- [x] Vectorized projection operator
+- [x] Vectorized hash join (build pull + probe push, FNV-1a hash)
+- [x] Vectorized hash aggregate (SUM, COUNT per Int64 group key)
+- [x] Vectorized sort (permutation sort, 4096-row output chunks)
 
 ### SIMD Kernels
 - [ ] ARM64 NEON kernels for filter, comparison, arithmetic (aarch64)
 - [ ] AVX2 kernels for filter, comparison, arithmetic (x86_64)
 - [ ] AVX-512 kernels (optional, gated on CPUID check)
-- [ ] Auto-vectorized fallback (LLVM-generated, no intrinsics)
-- [ ] Scalar fallback for correctness — property tested against SIMD path
-- [ ] Bitmask-based NULL handling in SIMD kernels
+- [x] Auto-vectorized fallback (LLVM-generated, no intrinsics)
+- [x] Scalar fallback for correctness — property tested against SIMD path
+- [x] Bitmask-based NULL handling in SIMD kernels (64-lane Bitmap packing)
+- [x] Filter kernels: filter_eq_i32/i64/f64, filter_lt/gt_i32 with validity mask
+- [x] Arithmetic kernels: add/sub/mul_i64, compare_i64 (-1/0/1)
+- [x] Hash kernels: hash_i64 (FNV-1a), hash_text_bytes (Arrow offset buffer)
 
 ### Dictionary Encoding
-- [ ] Dictionary encoding for low-cardinality string columns
-- [ ] Dictionary-aware filter (compare dict codes, not strings)
-- [ ] Dictionary-aware GROUP BY
+- [x] Dictionary encoding for low-cardinality string columns (DictionaryColumn)
+- [x] Dictionary-aware filter (compare dict codes, not strings)
+- [x] Dictionary-aware GROUP BY (group_by_dict returns per-code row indices)
 - [ ] Automatic encoding selection based on cardinality
 
 ### JIT Compilation

@@ -48,7 +48,7 @@ use crate::rules::RewriteRule;
 ///
 /// // Inject the available indexes at construction time.
 /// let rule = SortElimination::new(vec![
-///     IndexHint { name: "idx_score".into(), columns: vec![2], unique: false, method: "btree" },
+///     IndexHint { name: "idx_score".into(), columns: vec![2], unique: false, method: "btree", all_visible: false },
 /// ]);
 /// ```
 #[derive(Debug)]
@@ -225,6 +225,7 @@ mod tests {
             columns,
             unique: false,
             method: "btree",
+            all_visible: false,
         }
     }
 

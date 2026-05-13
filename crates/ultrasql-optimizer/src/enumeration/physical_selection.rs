@@ -427,16 +427,28 @@ mod tests {
         n_distinct: f64,
     }
     impl StatsSource for RichStats {
-        fn row_count(&self, _: &str) -> u64 { self.rows }
-        fn page_count(&self, _: &str) -> u64 { self.pages }
-        fn null_frac(&self, _: &str, _: usize) -> f64 { 0.0 }
-        fn n_distinct(&self, _: &str, _: usize) -> f64 { self.n_distinct }
+        fn row_count(&self, _: &str) -> u64 {
+            self.rows
+        }
+        fn page_count(&self, _: &str) -> u64 {
+            self.pages
+        }
+        fn null_frac(&self, _: &str, _: usize) -> f64 {
+            0.0
+        }
+        fn n_distinct(&self, _: &str, _: usize) -> f64 {
+            self.n_distinct
+        }
     }
 
     /// `BitmapHeapScan` is chosen when ≥ 2 applicable indexes match.
     #[test]
     fn bitmap_heap_scan_selected_for_two_matching_indexes() {
-        let stats = RichStats { rows: 100_000, pages: 1_000, n_distinct: 100_000.0 };
+        let stats = RichStats {
+            rows: 100_000,
+            pages: 1_000,
+            n_distinct: 100_000.0,
+        };
         let preds = vec![
             ScalarExpr::Binary {
                 op: BinaryOp::Eq,
@@ -452,12 +464,18 @@ mod tests {
             },
         ];
         let idx0 = IndexHint {
-            name: "idx_c0".into(), columns: vec![0], unique: false,
-            method: "btree", all_visible: false,
+            name: "idx_c0".into(),
+            columns: vec![0],
+            unique: false,
+            method: "btree",
+            all_visible: false,
         };
         let idx1 = IndexHint {
-            name: "idx_c1".into(), columns: vec![1], unique: false,
-            method: "btree", all_visible: false,
+            name: "idx_c1".into(),
+            columns: vec![1],
+            unique: false,
+            method: "btree",
+            all_visible: false,
         };
         let gucs = CostGucs::default();
         let op = select_scan_physical("t", &preds, &[idx0, idx1], &stats, &gucs);
@@ -468,7 +486,11 @@ mod tests {
     #[test]
     fn bitmap_heap_scan_selected_for_medium_selectivity() {
         // n_distinct = 50 → sel = 1/50 = 2% → in [0.5%, 10%]
-        let stats = RichStats { rows: 100_000, pages: 1_000, n_distinct: 50.0 };
+        let stats = RichStats {
+            rows: 100_000,
+            pages: 1_000,
+            n_distinct: 50.0,
+        };
         let preds = vec![ScalarExpr::Binary {
             op: BinaryOp::Eq,
             left: Box::new(col(0)),
@@ -476,8 +498,11 @@ mod tests {
             data_type: DataType::Bool,
         }];
         let idx = IndexHint {
-            name: "idx_c0".into(), columns: vec![0], unique: false,
-            method: "btree", all_visible: false,
+            name: "idx_c0".into(),
+            columns: vec![0],
+            unique: false,
+            method: "btree",
+            all_visible: false,
         };
         let gucs = CostGucs::default();
         let op = select_scan_physical("t", &preds, &[idx], &stats, &gucs);
@@ -488,7 +513,11 @@ mod tests {
     #[test]
     fn index_only_scan_selected_when_all_visible() {
         // n_distinct = 10_000 → sel = 1/10_000 = 0.01% → ≤ 5%
-        let stats = RichStats { rows: 100_000, pages: 1_000, n_distinct: 10_000.0 };
+        let stats = RichStats {
+            rows: 100_000,
+            pages: 1_000,
+            n_distinct: 10_000.0,
+        };
         let preds = vec![ScalarExpr::Binary {
             op: BinaryOp::Eq,
             left: Box::new(col(0)),
@@ -496,8 +525,11 @@ mod tests {
             data_type: DataType::Bool,
         }];
         let idx = IndexHint {
-            name: "idx_c0".into(), columns: vec![0], unique: true,
-            method: "btree", all_visible: true,
+            name: "idx_c0".into(),
+            columns: vec![0],
+            unique: true,
+            method: "btree",
+            all_visible: true,
         };
         let gucs = CostGucs::default();
         let op = select_scan_physical("t", &preds, &[idx], &stats, &gucs);

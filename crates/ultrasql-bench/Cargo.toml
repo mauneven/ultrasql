@@ -53,6 +53,11 @@ path = "src/bin/tpch.rs"
 name = "readme-render"
 path = "src/bin/readme_render.rs"
 
+[[bench]]
+name    = "v07_vectorized"
+path    = "benches/v07_vectorized.rs"
+harness = false
+
 [dependencies]
 ultrasql-core     = { workspace = true }
 ultrasql-protocol = { workspace = true }
@@ -71,3 +76,8 @@ tempfile          = { workspace = true }
 # Optional deps gated behind the pg-runner feature.
 tokio-postgres    = { version = "0.7", optional = true }
 chrono            = { workspace = true, optional = true }
+
+[dev-dependencies]
+ultrasql-executor = { workspace = true }
+ultrasql-planner  = { workspace = true }
+criterion         = { workspace = true }
