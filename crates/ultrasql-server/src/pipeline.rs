@@ -127,6 +127,11 @@ pub fn lower_plan(
         } => lower_limit(input, *n, *offset, tables),
         LogicalPlan::Sort { .. } => Err(ServerError::Unsupported("ORDER BY")),
         LogicalPlan::Empty { .. } => Err(ServerError::Unsupported("SELECT without FROM")),
+        LogicalPlan::Values { .. } => Err(ServerError::Unsupported("VALUES")),
+        LogicalPlan::Insert { .. } => Err(ServerError::Unsupported("INSERT")),
+        LogicalPlan::Update { .. } => Err(ServerError::Unsupported("UPDATE")),
+        LogicalPlan::Delete { .. } => Err(ServerError::Unsupported("DELETE")),
+        LogicalPlan::Truncate { .. } => Err(ServerError::Unsupported("TRUNCATE")),
     }
 }
 

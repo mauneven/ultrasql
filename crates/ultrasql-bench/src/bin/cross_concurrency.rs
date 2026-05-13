@@ -521,6 +521,7 @@ fn run_insert_thread(
     let insert_opts = InsertOptions {
         xmin: xid,
         command_id: cid,
+        wal: None,
     };
     let mut payload = [0_u8; 16];
     let mut id_counter: u64 = (tid as u64).wrapping_mul(10_000_000);

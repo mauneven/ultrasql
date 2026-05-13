@@ -158,6 +158,14 @@ pub fn build_operator(
         LogicalPlan::Empty { schema } => {
             Ok(Box::new(MemTableScan::new(schema.clone(), Vec::new())))
         }
+
+        LogicalPlan::Values { .. } => Err(BuildError::Unsupported("VALUES not supported in v0.5")),
+        LogicalPlan::Insert { .. } => Err(BuildError::Unsupported("INSERT not supported in v0.5")),
+        LogicalPlan::Update { .. } => Err(BuildError::Unsupported("UPDATE not supported in v0.5")),
+        LogicalPlan::Delete { .. } => Err(BuildError::Unsupported("DELETE not supported in v0.5")),
+        LogicalPlan::Truncate { .. } => {
+            Err(BuildError::Unsupported("TRUNCATE not supported in v0.5"))
+        }
     }
 }
 
