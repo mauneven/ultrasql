@@ -18,8 +18,8 @@ pub mod writer;
 pub use applier::{ApplyError, HeapTarget, dispatch_record, replay_into};
 pub use buffer::{WalBuffer, WalBufferError};
 pub use payload::{
-    AbortPayload, CheckpointPayload, CommitPayload, FullPageWritePayload, HeapDeletePayload,
-    HeapInsertPayload, HeapUpdatePayload, PayloadError,
+    AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload,
+    FullPageWritePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload, PayloadError,
 };
 pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};
 pub use recovery::{RecoveryError, recover};

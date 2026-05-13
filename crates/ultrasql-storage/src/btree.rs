@@ -77,10 +77,14 @@ use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::endian::{
     read_i64_le, read_u16_le, read_u32_le, write_i64_le, write_u16_le, write_u32_le,
 };
-use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
+use ultrasql_core::{BlockNumber, Lsn, PageId, RelationId, TupleId, Xid};
+use ultrasql_wal::WalRecord;
+use ultrasql_wal::payload::{BTreeOpKind, BTreeOpPayload};
+use ultrasql_wal::record::RecordType;
 
 use crate::buffer_pool::{BufferPool, BufferPoolError, PageGuard, PageLoader};
 use crate::page::{PAGE_HEADER_SIZE, Page, PageError, PageHeader, PageKind};
+use crate::wal_sink::{WalSink, WalSinkError};
 
 // --- tunable parameters ----------------------------------------------------
 
@@ -139,6 +143,14 @@ pub enum BTreeError {
     /// A node on disk has a layout the reader does not understand.
     #[error("malformed btree node: {0}")]
     MalformedNode(&'static str),
+
+    /// The WAL sink rejected a record emitted for a B-tree mutation.
+    #[error("wal sink: {0}")]
+    Wal(#[from] WalSinkError),
+
+    /// Encoding a typed WAL payload failed.
+    #[error("wal payload encoding: {0}")]
+    WalPayload(#[from] ultrasql_wal::payload::PayloadError),
 }
 
 // --- key trait -------------------------------------------------------------
@@ -324,9 +336,27 @@ impl<L: PageLoader> BTree<L> {
 
     /// Insert `(key, value)` into the tree.
     ///
-    /// Returns [`BTreeError::DuplicateKey`] if `key` is already
-    /// present.
-    pub fn insert<K: Key>(&mut self, key: K, value: TupleId) -> Result<(), BTreeError> {
+    /// Returns [`BTreeError::DuplicateKey`] if `key` is already present.
+    ///
+    /// When `wal` is `Some`, a `RecordType::BTreeOp` record is appended for
+    /// each page mutation: one `BTreeOpKind::Insert` record for the leaf page
+    /// that received the new entry, and one `BTreeOpKind::Split` record for
+    /// each page split propagated up the tree. Records are emitted after the
+    /// relevant page guards are released, consistent with the heap's WAL
+    /// protocol.
+    ///
+    /// Pass `None` for `wal` during recovery replay (the WAL is the source of
+    /// truth) or in tests that do not care about WAL output.
+    ///
+    /// `xid` identifies the inserting transaction and is embedded in every
+    /// emitted record. It does not affect the tree's data.
+    pub fn insert<K: Key>(
+        &mut self,
+        key: K,
+        value: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), BTreeError> {
         // v0.5 only supports 8-byte keys (i64-shaped). The trait is
         // generic so callers can plug a custom Key type later; we
         // decode keys as i64 internally.
@@ -346,9 +376,66 @@ impl<L: PageLoader> BTree<L> {
         // Try to insert into the leaf, splitting if necessary.
         let split_result = self.insert_into_leaf(leaf_block, raw_key, value)?;
 
+        // Emit WAL record for the leaf insert (always, even when a split occurred).
+        if let Some(sink) = wal {
+            let prev_lsn = sink.last_lsn_for(xid);
+            let mut cv = vec![0_u8; 12]; // TupleId wire encoding
+            write_u32_le(&mut cv[0..4], value.page.relation.oid().raw());
+            write_u32_le(&mut cv[4..8], value.page.block.raw());
+            write_u16_le(&mut cv[8..10], value.slot);
+            // bytes 10-11: reserved zero
+            let payload = BTreeOpPayload {
+                op: BTreeOpKind::Insert,
+                index_rel: self.rel,
+                page: self.page_id(leaf_block),
+                key_bytes: key_buf.to_vec(),
+                child_or_value: cv,
+            }
+            .encode()?;
+            let record = WalRecord::new(RecordType::BTreeOp, xid, prev_lsn, 0, payload);
+            let lsn: Lsn = sink.append(record).expect(
+                "wal append must succeed after a committed btree page mutation; failure is unrecoverable",
+            );
+            // Stamp the leaf page LSN.
+            Self::stamp_page_lsn(&self.pool, self.page_id(leaf_block), lsn)?;
+        }
+
         if let Some((sep_key, new_right)) = split_result {
+            // Emit WAL record for the split before propagating up.
+            if let Some(sink) = wal {
+                let prev_lsn = sink.last_lsn_for(xid);
+                let mut sep_buf = [0_u8; 8];
+                write_i64_le(&mut sep_buf, sep_key);
+                let cv = new_right.raw().to_le_bytes().to_vec();
+                let payload = BTreeOpPayload {
+                    op: BTreeOpKind::Split,
+                    index_rel: self.rel,
+                    page: self.page_id(leaf_block),
+                    key_bytes: sep_buf.to_vec(),
+                    child_or_value: cv,
+                }
+                .encode()?;
+                let record = WalRecord::new(RecordType::BTreeOp, xid, prev_lsn, 0, payload);
+                sink.append(record).expect(
+                    "wal append must succeed after a committed btree split; failure is unrecoverable",
+                );
+            }
             self.propagate_split(path, sep_key, new_right)?;
         }
+        Ok(())
+    }
+
+    /// Stamp `page_id`'s LSN field with `lsn`.
+    ///
+    /// Called after a successful WAL append so the page's LSN is never
+    /// ahead of the WAL.
+    fn stamp_page_lsn(
+        pool: &Arc<BufferPool<L>>,
+        page_id: PageId,
+        lsn: Lsn,
+    ) -> Result<(), BTreeError> {
+        let guard = pool.get_page(page_id)?;
+        guard.write().set_lsn(lsn.raw());
         Ok(())
     }
 
@@ -1070,7 +1157,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::thread;
 
-    use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
+    use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 
     use super::*;
     use crate::buffer_pool::{BufferPool, PageLoader};
@@ -1132,7 +1219,8 @@ mod tests {
     #[test]
     fn insert_then_lookup_returns_value() {
         let mut tree = make_tree();
-        tree.insert::<i64>(42, tid(1, 2)).unwrap();
+        tree.insert::<i64>(42, tid(1, 2), Xid::new(1), None)
+            .unwrap();
         assert_eq!(tree.lookup::<i64>(42).unwrap(), Some(tid(1, 2)));
         assert!(tree.lookup::<i64>(43).unwrap().is_none());
     }
@@ -1143,7 +1231,8 @@ mod tests {
         for i in 0_i64..1000 {
             let block = u32::try_from(i).expect("fits in u32");
             let slot = u16::try_from(i & 0xFFFF).expect("fits in u16");
-            tree.insert::<i64>(i, tid(block, slot)).unwrap();
+            tree.insert::<i64>(i, tid(block, slot), Xid::new(1), None)
+                .unwrap();
         }
         for i in 0_i64..1000 {
             let block = u32::try_from(i).expect("fits in u32");
@@ -1174,7 +1263,8 @@ mod tests {
         for &k in &keys {
             let block = u32::try_from(k).expect("fits in u32");
             let slot = u16::try_from((k * 7) & 0xFFFF).expect("fits in u16");
-            tree.insert::<i64>(k, tid(block, slot)).unwrap();
+            tree.insert::<i64>(k, tid(block, slot), Xid::new(1), None)
+                .unwrap();
         }
         for &k in &keys {
             let block = u32::try_from(k).expect("fits in u32");
@@ -1192,7 +1282,8 @@ mod tests {
         let mut tree = make_tree();
         for i in 0_i64..200 {
             let block = u32::try_from(i).expect("fits in u32");
-            tree.insert::<i64>(i, tid(block, 0)).unwrap();
+            tree.insert::<i64>(i, tid(block, 0), Xid::new(1), None)
+                .unwrap();
         }
         let collected: Vec<(i64, TupleId)> = tree
             .range_scan::<i64>(0, None)
@@ -1210,7 +1301,8 @@ mod tests {
         let mut tree = make_tree();
         for i in 0_i64..200 {
             let block = u32::try_from(i).expect("fits in u32");
-            tree.insert::<i64>(i, tid(block, 0)).unwrap();
+            tree.insert::<i64>(i, tid(block, 0), Xid::new(1), None)
+                .unwrap();
         }
         let collected: Vec<i64> = tree
             .range_scan::<i64>(50, Some(120))
@@ -1224,8 +1316,10 @@ mod tests {
     #[test]
     fn duplicate_insert_returns_duplicate_key_error() {
         let mut tree = make_tree();
-        tree.insert::<i64>(7, tid(1, 0)).unwrap();
-        let err = tree.insert::<i64>(7, tid(2, 0)).unwrap_err();
+        tree.insert::<i64>(7, tid(1, 0), Xid::new(1), None).unwrap();
+        let err = tree
+            .insert::<i64>(7, tid(2, 0), Xid::new(1), None)
+            .unwrap_err();
         assert!(matches!(err, BTreeError::DuplicateKey), "got {err:?}");
         assert_eq!(tree.lookup::<i64>(7).unwrap(), Some(tid(1, 0)));
     }
@@ -1236,7 +1330,8 @@ mod tests {
         let mut tree = make_tree();
         for i in 0_i64..40 {
             let block = u32::try_from(i).expect("fits in u32");
-            tree.insert::<i64>(i, tid(block, 0)).unwrap();
+            tree.insert::<i64>(i, tid(block, 0), Xid::new(1), None)
+                .unwrap();
         }
         for i in 0_i64..40 {
             let block = u32::try_from(i).expect("fits in u32");
@@ -1256,7 +1351,8 @@ mod tests {
         let mut tree = make_tree();
         for i in 0_i64..1000 {
             let block = u32::try_from(i).expect("fits in u32");
-            tree.insert::<i64>(i, tid(block, 0)).unwrap();
+            tree.insert::<i64>(i, tid(block, 0), Xid::new(1), None)
+                .unwrap();
         }
         for i in 0_i64..1000 {
             let block = u32::try_from(i).expect("fits in u32");
@@ -1275,7 +1371,8 @@ mod tests {
         let mut tree = make_tree();
         for i in 0_i64..500 {
             let block = u32::try_from(i).expect("fits in u32");
-            tree.insert::<i64>(i, tid(block, 7)).unwrap();
+            tree.insert::<i64>(i, tid(block, 7), Xid::new(1), None)
+                .unwrap();
         }
         let tree = Arc::new(tree);
         let threads: Vec<_> = (0_i64..8)
@@ -1301,7 +1398,8 @@ mod tests {
         let mut tree = make_tree();
         for i in -50_i64..50 {
             let block = u32::try_from(i + 100).expect("fits in u32");
-            tree.insert::<i64>(i, tid(block, 0)).unwrap();
+            tree.insert::<i64>(i, tid(block, 0), Xid::new(1), None)
+                .unwrap();
         }
         for i in -50_i64..50 {
             let block = u32::try_from(i + 100).expect("fits in u32");
@@ -1324,7 +1422,8 @@ mod tests {
         let mut tree = make_tree();
         for i in 0_i64..100 {
             let block = u32::try_from(i).expect("fits in u32");
-            tree.insert::<i64>(i * 2, tid(block, 0)).unwrap();
+            tree.insert::<i64>(i * 2, tid(block, 0), Xid::new(1), None)
+                .unwrap();
         }
         // Start at 49 which is *between* keys 48 and 50; expect 50 first.
         let first = tree.range_scan::<i64>(49, None).next().unwrap().unwrap();
@@ -1337,7 +1436,8 @@ mod tests {
         let mut tree = BTree::create(Arc::clone(&pool), RelationId::new(7)).unwrap();
         for i in 0_i64..50 {
             let block = u32::try_from(i).expect("fits in u32");
-            tree.insert::<i64>(i, tid(block, 0)).unwrap();
+            tree.insert::<i64>(i, tid(block, 0), Xid::new(1), None)
+                .unwrap();
         }
         let root = tree.root_block();
         drop(tree);

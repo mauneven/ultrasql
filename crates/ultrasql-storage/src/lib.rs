@@ -25,6 +25,7 @@ pub mod page;
 pub mod segment;
 pub mod toast;
 pub mod vm;
+pub mod wal_applier;
 pub mod wal_sink;
 
 pub use buffer_pool::{BufferPool, BufferPoolError, BufferPoolStats, PageGuard, PageLoader};

@@ -2624,6 +2624,7 @@ dependencies = [
  "tracing",
  "ultrasql-core",
  "ultrasql-mvcc",
+ "ultrasql-storage",
  "ultrasql-wal",
  "xxhash-rust",
 ]
