@@ -43,7 +43,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 The default development host is Apple Mac mini M4 running macOS 26.
-Linux x86_64 and Linux ARM64 are also supported and exercised by CI.
+Linux x86_64 and Linux ARM64 are also supported. Test locally on your target
+platform before pushing; GitHub Actions is not used (to avoid metered costs).
 
 ---
 
