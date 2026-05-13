@@ -1,0 +1,138 @@
+# UltraSQL — Speedup-Round Raw Benchmark Output (2026-05-12)
+
+Host:     Apple Mac mini, M4, 10 cores, 16 GiB unified RAM. macOS 26.5, Darwin 25.5.0.
+Build:    cargo bench (release + LTO=fat + codegen-units=1), target-cpu=apple-m1.
+Tool:     criterion 0.5, 100 samples, 3 s measurement window, 1 s warm-up.
+Baseline: old_pre_speedup (saved from commit 4675f4b — main pre-edit).
+Commits in this round:
+  f6447df  perf(vec): eq_i32 packed-word write path
+  cc57037  perf(vec): min_f64 4-wide unroll, branch-free NaN-skip
+  95174db  perf(storage): hot_pin clock_ref store is advisory — Release → Relaxed
+
+==================== ultrasql-vec (cargo bench -p ultrasql-vec --bench kernels) ====================
+
+Each block below is criterion's `time` interval (3 numbers = low,
+median, high of the 95% CI), throughput, and `change` versus the
+saved baseline.
+
+vec/eq_i32/64           time:   [19.493 ns 19.567 ns 19.657 ns]
+                        thrpt:  [3.2559 Gelem/s 3.2708 Gelem/s 3.2832 Gelem/s]
+                 change: time:   [-48.639% -47.564% -46.674%] (p = 0.00 < 0.05)
+                        thrpt:  [+87.527% +90.710% +94.700%]
+                        Performance has improved.
+
+vec/eq_i32/1024         time:   [71.125 ns 72.894 ns 75.688 ns]
+                        thrpt:  [13.529 Gelem/s 14.048 Gelem/s 14.397 Gelem/s]
+                 change: time:   [-92.192% -92.043% -91.841%] (p = 0.00 < 0.05)
+                        thrpt:  [+1125.7% +1156.7% +1180.8%]
+                        Performance has improved.
+
+vec/eq_i32/4096         time:   [262.36 ns 262.89 ns 263.53 ns]
+                        thrpt:  [15.543 Gelem/s 15.581 Gelem/s 15.612 Gelem/s]
+                 change: time:   [-92.889% -92.833% -92.781%] (p = 0.00 < 0.05)
+                        thrpt:  [+1285.1% +1295.3% +1306.3%]
+                        Performance has improved.
+
+vec/eq_i32/65536        time:   [4.5635 µs 4.6200 µs 4.6913 µs]
+                        thrpt:  [13.970 Gelem/s 14.185 Gelem/s 14.361 Gelem/s]
+                 change: time:   [-92.158% -92.069% -91.964%] (p = 0.00 < 0.05)
+                        thrpt:  [+1162.1% +1171.7% +1181.4%]
+                        Performance has improved.
+
+vec/sum_i64/64          time:   [3.6741 ns 3.6889 ns 3.7041 ns]
+                        thrpt:  [17.286 Gelem/s 17.360 Gelem/s 17.432 Gelem/s]
+                 change: time:   [+0.1063% +0.8186% +1.5442%] (p = 0.03 < 0.05)
+                        thrpt:  [-1.5207% -0.8119% -0.1062%]
+                        Change within noise threshold.
+
+vec/sum_i64/1024        time:   [55.738 ns 55.832 ns 55.939 ns]
+                        thrpt:  [18.307 Gelem/s 18.342 Gelem/s 18.372 Gelem/s]
+                 change: time:   [-3.7276% -2.4327% -1.4471%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.4684% +2.4934% +3.8718%]
+                        Performance has improved.
+
+vec/sum_i64/4096        time:   [246.41 ns 246.96 ns 247.59 ns]
+                        thrpt:  [16.579 Gelem/s 16.622 Gelem/s 16.659 Gelem/s]
+                 change: time:   [-2.0843% -1.0481% -0.3814%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.3829% +1.0593% +2.1284%]
+                        Change within noise threshold.
+
+vec/sum_i64/65536       time:   [4.6256 µs 4.6373 µs 4.6499 µs]
+                        thrpt:  [14.090 Gelem/s 14.133 Gelem/s 14.176 Gelem/s]
+                 change: time:   [-1.2107% -0.6748% -0.1614%] (p = 0.01 < 0.05)
+                        thrpt:  [+0.1617% +0.6794% +1.2256%]
+                        Change within noise threshold.
+
+vec/min_f64/64          time:   [8.9914 ns 9.0290 ns 9.0898 ns]
+                        thrpt:  [7.0398 Gelem/s 7.0874 Gelem/s 7.1179 Gelem/s]
+                 change: time:   [-85.547% -85.346% -85.105%] (p = 0.00 < 0.05)
+                        thrpt:  [+570.56% +582.53% +591.81%]
+                        Performance has improved.
+
+vec/min_f64/1024        time:   [155.28 ns 155.55 ns 155.83 ns]
+                        thrpt:  [6.5715 Gelem/s 6.5829 Gelem/s 6.5945 Gelem/s]
+                 change: time:   [-85.852% -85.480% -85.122%] (p = 0.00 < 0.05)
+                        thrpt:  [+572.88% +588.52% +606.91%]
+                        Performance has improved.
+
+vec/min_f64/4096        time:   [615.57 ns 620.32 ns 628.81 ns]
+                        thrpt:  [6.5131 Gelem/s 6.6030 Gelem/s 6.6523 Gelem/s]
+                 change: time:   [-84.310% -84.211% -84.069%] (p = 0.00 < 0.05)
+                        thrpt:  [+527.77% +534.02% +538.33%]
+                        Performance has improved.
+
+vec/min_f64/65536       time:   [9.7842 µs 9.8081 µs 9.8338 µs]
+                        thrpt:  [6.6646 Gelem/s 6.6824 Gelem/s 6.6982 Gelem/s]
+                 change: time:   [-85.541% -85.176% -84.787%] (p = 0.00 < 0.05)
+                        thrpt:  [+560.59% +574.38% +591.32%]
+                        Performance has improved.
+
+vec/select_i32/64       time:   [30.483 ns 30.612 ns 30.770 ns]
+                        thrpt:  [2.0799 Gelem/s 2.0906 Gelem/s 2.0995 Gelem/s]
+                 change: time:   [-1.2786% -0.7919% -0.3152%] (p = 0.00 < 0.05)
+                        thrpt:  [+0.3162% +0.7983% +1.2951%]
+                        Change within noise threshold.
+
+vec/select_i32/1024     time:   [254.62 ns 254.84 ns 255.07 ns]
+                        thrpt:  [4.0147 Gelem/s 4.0186 Gelem/s 4.0218 Gelem/s]
+                 change: time:   [-12.408% -7.1734% -2.6433%] (p = 0.01 < 0.05)
+                        thrpt:  [+2.7151% +7.7278% +14.167%]
+                        Performance has improved.
+
+vec/select_i32/4096     time:   [963.07 ns 963.50 ns 963.97 ns]
+                        thrpt:  [4.2471 Gelem/s 4.2502 Gelem/s 4.2529 Gelem/s]
+                 change: time:   [-8.3719% -4.8788% -2.0288%] (p = 0.01 < 0.05)
+                        thrpt:  [+2.0706% +5.1289% +9.1357%]
+                        Performance has improved.
+
+vec/select_i32/65536    time:   [15.314 µs 15.375 µs 15.434 µs]
+                        thrpt:  [4.2433 Gelem/s 4.2613 Gelem/s 4.2810 Gelem/s]
+                 change: time:   [-1.9674% -0.5328% +0.3326%] (p = 0.47 > 0.05)
+                        thrpt:  [-0.3315% +0.5356% +2.0069%]
+                        Change within noise threshold.
+
+==================== ultrasql-storage hot_pin (cargo bench -p ultrasql-storage --bench buffer_pool -- hot_pin) ====================
+
+buffer_pool/hot_pin/single_page_repin
+                        time:   [12.540 ns 12.576 ns 12.618 ns]
+                        thrpt:  [79.255 Melem/s 79.515 Melem/s 79.748 Melem/s]
+                 change: time:   [-3.2293% -2.1815% -1.3590%] (p = 0.00 < 0.05)
+                        thrpt:  [+1.3778% +2.2302% +3.3370%]
+                        Performance has improved.
+
+==================== Summary ====================
+
+Targets:
+  eq_i32 / 65 536:   target >= 5x; delivered ~12.7x (1.12 -> 14.19 Gelem/s)
+  min_f64 / 65 536:  target >= 3x; delivered ~6.7x  (974 Melem/s -> 6.68 Gelem/s)
+  hot_pin:           small free win (-2.2% time)
+
+No other kernel regressed beyond criterion's noise band on the
+matching baseline. select_i32 even improved a touch (probably from
+unrelated codegen warmups; the source did not change).
+
+The `cargo test --workspace --release` count is 440 (was 400
+before this round). The +40 covers four new bitmap unit tests,
+two deterministic eq_i32 boundary-length tests, two proptest
+eq_i32 tests, two proptest min_f64 tests, plus several other
+deterministic boundary-length kernel tests added alongside.

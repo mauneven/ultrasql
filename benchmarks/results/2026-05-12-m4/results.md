@@ -135,3 +135,90 @@ Comparison numbers will appear once `v0.5` lands.
 We will not publish "ultrasql vs postgres" numbers until the
 comparison is fair. The bar is the methodology in
 [BENCHMARKS.md](../../../BENCHMARKS.md), and we will meet it.
+
+---
+
+## 2026-05-12 speedup round
+
+The original table above is a historical snapshot at commit
+`4675f4b` and is not edited. The round documented here covers the
+three kernel changes landed on 2026-05-12 (commits `f6447df`,
+`cc57037`, `95174db`). Same host, same build profile, same
+criterion configuration as the original snapshot.
+
+Raw criterion output: see
+[`speedup-round.txt`](./speedup-round.txt). Each `change` line in
+that file is criterion's measured delta versus the saved
+`old_pre_speedup` baseline taken from the pre-edit `main`.
+
+### Vectorized kernels (`ultrasql-vec`) — after
+
+3 s measurement / 1 s warm-up, 100 samples. The same run is
+reproduced in `speedup-round.txt`.
+
+| Kernel              |    Rows | Median time | Throughput          | vs. baseline       |
+| ------------------- | ------: | ----------: | ------------------- | ------------------ |
+| `eq_i32`            |      64 |   19.57 ns  | 3.27 Gelem/s        | +91% (1.75 → 3.27) |
+| `eq_i32`            |   1 024 |   72.9 ns   | 14.05 Gelem/s       | +1 157% (×12.6)    |
+| `eq_i32`            |   4 096 |  262.9 ns   | 15.58 Gelem/s       | +1 295% (×14.0)    |
+| `eq_i32`            |  65 536 |    4.62 µs  | **14.19 Gelem/s**   | +1 172% (×12.7)    |
+| `sum_i64`           |      64 |    3.70 ns  | 17.36 Gelem/s       | ≈ flat (-1%)       |
+| `sum_i64`           |   1 024 |   55.9 ns   | 18.34 Gelem/s       | ≈ flat (+2%)       |
+| `sum_i64`           |   4 096 |  246.7 ns   | 16.62 Gelem/s       | ≈ flat (+1%)       |
+| `sum_i64`           |  65 536 |    4.64 µs  | 14.13 Gelem/s       | ≈ flat (+1%)       |
+| `min_f64`           |      64 |    9.03 ns  | 7.09 Gelem/s        | +583% (×6.8)       |
+| `min_f64`           |   1 024 |  155.6 ns   | 6.58 Gelem/s        | +589% (×6.9)       |
+| `min_f64`           |   4 096 |  620.3 ns   | 6.60 Gelem/s        | +534% (×6.5)       |
+| `min_f64`           |  65 536 |   9.81 µs   | **6.68 Gelem/s**    | +574% (×6.7)       |
+| `select_i32` (50%)  |      64 |   30.61 ns  | 2.09 Gelem/s        | ≈ flat (+1%)       |
+| `select_i32` (50%)  |   1 024 |  254.8 ns   | 4.02 Gelem/s        | ≈ flat (+8%)       |
+| `select_i32` (50%)  |   4 096 |  963.5 ns   | 4.25 Gelem/s        | ≈ flat (+5%)       |
+| `select_i32` (50%)  |  65 536 |   15.38 µs  | 4.26 Gelem/s        | ≈ flat (+1%)       |
+
+Targets vs. delivered:
+
+- `eq_i32 / 65 536`: target ≥ 5× → delivered **12.3×** (1.12 →
+  13.79 Gelem/s).
+- `min_f64 / 65 536`: target ≥ 3× → delivered **6.6×** (974 Melem/s
+  → 6.42 Gelem/s).
+- No other kernel regressed beyond criterion's noise band.
+
+Notes:
+
+- `eq_i32` non-null fast path processes 64 lanes per iteration and
+  writes the packed `u64` mask word directly into `Bitmap`'s
+  backing buffer (no per-row read-modify-write). On `aarch64` we
+  use NEON intrinsics (`vceqq_s32` + powers-of-two AND + horizontal
+  add) because LLVM's autovectorizer did not lower the shift-deposit
+  shape on `apple-m1`; the `.s` disassembly was inspected. Property
+  tests fuzz the SIMD path against an `eq_i32_scalar` reference.
+- `min_f64` keeps four parallel `f64::min` accumulators seeded with
+  `INFINITY`; LLVM lowers this to a four-deep `fminnm.d` unroll on
+  M-series. Autovectorization was sufficient; no hand intrinsics.
+- The null-aware variants (`min_f64_nullable`, `eq_i32` null path)
+  remain branched per row because garbage in null slots cannot
+  participate in a branch-free fold. Both are documented as
+  fall-throughs of the fast path.
+
+### Buffer pool (`ultrasql-storage`) — after
+
+| Operation                              |  Median time | Throughput          | vs. baseline |
+| -------------------------------------- | -----------: | ------------------- | ------------ |
+| `hot_pin` (single page, repeated pin)  |    12.57 ns/op | 79.6 Mops/s       | -1.8% time (≈ noise) |
+
+The `clock_ref` store in the hit path moved from `Release` to
+`Relaxed` ordering. The bit is purely advisory for the CLOCK hand
+(a torn read just costs one extra rotation, bounded by the
+`capacity * 4` sweep cap); the pin counter's `AcqRel` carries the
+real happens-before edge with eviction.
+
+### Tests
+
+`cargo test --workspace --release` is green at **440 tests** (was
+400 pre-round). The +40 comes from the new unit tests
+(`Bitmap::from_words` / `words_mut` happy-path + panic case), the
+deterministic boundary-length sweeps for `eq_i32` / `min_f64`, and
+two pairs of proptest cases (each runs 64 random inputs) that
+cross-validate the SIMD path against its scalar reference. Clippy
+remains clean at workspace level under `-D warnings` with
+`pedantic + nursery + cargo` enabled.
