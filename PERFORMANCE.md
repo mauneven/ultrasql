@@ -149,9 +149,10 @@ layer is synchronous CPU work. The split is deliberate:
 - Every kernel has a scalar implementation that is the source of
   truth. SIMD paths are validated bit-for-bit against scalar in
   property tests.
-- `cfg(target_arch = "aarch64")` for NEON paths, `cfg(target_arch =
-  "x86_64")` for AVX2/AVX-512. Use `std::arch::is_aarch64_feature_detected!`
-  / `is_x86_feature_detected!` to feature-gate at runtime if needed.
+- `cfg(target_arch = "aarch64")` for ARM64 SIMD paths,
+  `cfg(target_arch = "x86_64")` for AVX2/AVX-512. Use
+  `std::arch::is_aarch64_feature_detected!` /
+  `is_x86_feature_detected!` to feature-gate at runtime if needed.
 - Hand-written intrinsics use `unsafe` with a `// SAFETY:` block per
   call site. The kernel module's `lib.rs` summarizes the invariants
   the kernels uphold.

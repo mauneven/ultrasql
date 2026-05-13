@@ -108,7 +108,7 @@ analytic queries.
 - [ ] Column batch primitives in `ultrasql-vec`.
 - [ ] Vectorized filter, projection, hash join build/probe, hash
       aggregate, sort.
-- [ ] NEON kernels on ARM64; AVX2 kernels on x86_64.
+- [ ] ARM64 SIMD kernels on aarch64; AVX2 kernels on x86_64.
 - [ ] Planner chooses scalar vs vectorized per pipeline.
 - [ ] TPC-H scale 10 runs to completion, throughput recorded.
 
@@ -135,7 +135,7 @@ analytic queries.
 
 ---
 
-## v1.0 — "Ship" (production-grade single-node)
+## v1.0 — "Ship" (single-node, fit for general use)
 
 **Definition of done:**
 

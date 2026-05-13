@@ -350,10 +350,10 @@ values), per-relation row count, per-relation page count, per-index
 correlation. Stats are refreshed by `ANALYZE` and incrementally by
 the heap on heavy modifications.
 
-**Rationale.** Cascades is the gold standard for cost-based search
-and is the basis of SQL Server's optimizer. The complexity is worth it
-because PostgreSQL's bottom-up dynamic programming becomes painful past
-8 relations and we want to leave room for cross-block optimization.
+**Rationale.** Cascades is widely used for cost-based search and is the
+basis of SQL Server's optimizer. PostgreSQL's bottom-up dynamic
+programming becomes painful past 8 relations; we want to leave room for
+cross-block optimization.
 
 ---
 

@@ -1,11 +1,7 @@
 # Contributing to UltraSQL
 
-Welcome. UltraSQL is built in the open by people who care about
-databases, performance, and the craft of systems software. Pull
-requests are welcome and we will read every one of them.
-
-This document tells you how to send one that has a good chance of
-landing.
+UltraSQL is developed in the open. Pull requests are welcome; this
+document tells you how to send one that has a good chance of landing.
 
 ---
 
@@ -22,9 +18,9 @@ For anything beyond a typo fix or a localized bug fix:
 3. For changes within a single crate that match the existing
    architecture, an issue is sufficient.
 
-We are unapologetic about this. UltraSQL has a coherent design; PRs
-that wander into shared invariants without discussion either get
-rewritten or rejected, which is bad for everyone's time.
+This matters because PRs that wander into shared invariants without
+discussion either get rewritten or rejected, which wastes everyone's
+time.
 
 ---
 

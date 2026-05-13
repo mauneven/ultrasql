@@ -1,8 +1,6 @@
-<div align="center">
-
 # UltraSQL
 
-**A hardware-aware, PostgreSQL-compatible SQL engine. Written in Rust.**
+PostgreSQL-compatible SQL engine in Rust. Pre-alpha.
 
 [![License: Apache 2.0 OR MIT](https://img.shields.io/badge/license-Apache_2.0_OR_MIT-blue.svg)](#license)
 [![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-orange.svg)](ROADMAP.md)
@@ -15,57 +13,70 @@
 [Contributing](CONTRIBUTING.md) ·
 [RFC Process](RFC_PROCESS.md)
 
-</div>
+---
+
+## Microbenchmarks (Apple M4, 2026-05-12)
+
+Numbers come straight from
+[`benchmarks/results/2026-05-12-m4/results.md`](benchmarks/results/2026-05-12-m4/results.md).
+Commit `373bb69e3264bca51ed0b1c57c8784109a815d90`, criterion 0.5, median of
+100 samples per row.
+
+| Bench                                  | Input        | Median  | Throughput        |
+| -------------------------------------- | ------------ | ------: | ----------------- |
+| `vec/sum_i64`                          | 65 536 i64s  | 4.70 µs | 13.94 Gelem/s     |
+| `vec/eq_i32`                           | 65 536 i32s  | 58.4 µs | 1.12 Gelem/s      |
+| `storage/page/insert` (1 024 B tuples) | fill 1 page  |  203 ns | 4.69 GiB/s        |
+| `storage/buffer_pool/hot_pin`          | 1 page       | 12.7 ns | 79.0 Mops/s       |
+| `wal/encode` (4 096 B payload)         | 1 record     |  107 ns | 35.6 GiB/s        |
+| `wal/buffer_append` (1 024 B record)   | 1 record     | 96.1 ns | 9.92 GiB/s        |
+
+Single-thread microbenchmarks on Apple M4 Mac mini, release+LTO. End-to-end
+query-engine benchmarks (TPC-B, TPC-C, TPC-H) blocked on v0.5 (see
+[ROADMAP.md](ROADMAP.md)).
 
 ---
 
-## What is UltraSQL?
+## What this is
 
-UltraSQL is a from-scratch open-source SQL database engine designed for the
-hardware reality of 2026 and beyond: many cores, deep cache hierarchies,
-wide SIMD units, NVMe storage with microsecond latencies, and predominantly
-ARM64 server fleets.
-
-The engineering thesis is simple. PostgreSQL is excellent. Its on-disk
-formats, MVCC semantics, wire protocol, and SQL dialect are battle-tested
-across three decades of production. But its execution model — process per
-connection, tuple-at-a-time iterators, B-link-tree-only indexing, single
-backend per query — predates the architectural shifts that define modern
-servers. UltraSQL keeps PostgreSQL's contracts (wire protocol, SQL surface,
-MVCC semantics, ACID guarantees) and rewrites the engine underneath them
-with first-principles attention to:
-
-- **Concurrency.** A thread-per-core async runtime, lock-free shared
-  structures where they pay for themselves, fine-grained latches everywhere
-  else, and an explicit cost model for synchronization.
-- **Memory.** Column-oriented in-memory format for OLAP paths, row-oriented
-  for OLTP paths, with a planner that chooses between them per pipeline
-  segment. Buffer pool sized for the unified memory hierarchy on Apple
-  Silicon and the NUMA hierarchy on commodity servers.
-- **SIMD.** NEON on ARM64, AVX2 / AVX-512 on x86_64. Kernels are written
-  once against a portable vector abstraction and lowered per target.
-- **I/O.** `io_uring` on Linux, kqueue on macOS, with batched group commit
-  for WAL. Direct I/O when the host supports it; mmap-with-prefetch when
-  it does not.
-- **Hybrid workloads.** A single engine for OLTP point queries and OLAP
-  scans, not two engines glued together. The planner picks pipelines and
-  formats; the executor handles both.
+UltraSQL is a from-scratch PostgreSQL-compatible OLTP+OLAP engine in pure
+Rust. Drop-in replacement target for PostgreSQL: same wire protocol v3, same
+SQL dialect, MVCC semantics. Single-node single-writer engine in pre-alpha;
+v0.1 milestone is a server that speaks the PG wire and passes a curated
+subset of the PostgreSQL regression suite.
 
 ## Status
 
-UltraSQL is in pre-alpha. Layered subsystems land in order: foundational
-types → storage primitives → WAL → MVCC → parser → planner → executor →
-wire protocol. The first milestone (`v0.1`) is a single-node, single-writer
-engine that speaks the PostgreSQL wire protocol and passes a curated subset
-of the PostgreSQL regression suite.
+Pre-alpha. The workspace compiles. CI runs fmt-check, clippy, and tests on
+Linux x86_64, Linux ARM64, and macOS ARM64.
 
-See [ROADMAP.md](ROADMAP.md) for the full plan. See
-[ARCHITECTURE.md](ARCHITECTURE.md) for how the pieces fit together.
+Shipped:
+
+- Cargo workspace, MSRV pin, dual-license, contributor docs.
+- Crate skeletons for every planned subsystem (see [Project structure](#project-structure)).
+- Foundational types in `ultrasql-core`: errors, OIDs, datums, schema.
+- PostgreSQL-token-set lexer in `ultrasql-parser`.
+- 8 KiB slotted page format with checksums.
+- Buffer pool (CLOCK-Pro) with sharded page table — hot-pin and cycle
+  benches running.
+- WAL record encode/decode and in-memory `WalBuffer::append`.
+- Vectorized kernels: `sum_i64`, `eq_i32`, `min_f64`, `select_i32`.
+
+Scaffolded but not implemented:
+
+- Parser beyond the lexer.
+- Binder, planner, optimizer.
+- Executor (no `next_batch()` calls anywhere).
+- MVCC, transaction manager, lock manager.
+- Wire protocol v3 — only the crate exists.
+- Catalog, server binary, CLI.
+- Segment-file I/O and WAL fsync path.
+
+See [ROADMAP.md](ROADMAP.md) for the version-by-version plan.
 
 ## Quick start
 
-Prerequisites: Rust 1.85+ (the workspace pins a stable channel via
-`rust-toolchain.toml`).
+Prerequisites: Rust 1.85+ (the workspace pins via `rust-toolchain.toml`).
 
 ```bash
 git clone https://github.com/mauneven/ultrasql.git
@@ -73,50 +84,32 @@ cd ultrasql
 
 cargo build --release
 cargo test --workspace
-cargo run --release --bin ultrasqld -- --help
+cargo bench --workspace        # criterion microbenchmarks
 ```
 
-On Apple Silicon the build uses `target-cpu=apple-m1`, which enables NEON,
-fp16, dotprod, and the LSE atomics that UltraSQL relies on for lock-free
-fast paths.
+There is no working server binary yet. `cargo run --bin ultrasqld` will
+build but exits immediately.
 
-## Comparison
+On Apple Silicon the build uses `target-cpu=apple-m1`, which enables ARM64
+SIMD, fp16, dotprod, and the LSE atomics the buffer pool uses for its
+lock-free fast paths.
 
-UltraSQL competes with — and learns from — every major SQL engine. The
-honest summary:
+## Comparison matrix
 
-|                        | UltraSQL          | PostgreSQL | MySQL  | SQLite | DuckDB | ClickHouse |
-| ---------------------- | ----------------- | ---------- | ------ | ------ | ------ | ---------- |
-| OLTP transactions      | Target            | Strong     | Strong | Single-writer | No  | No        |
-| OLAP scans             | Target            | Adequate   | Weak   | Weak   | Strong | Strong     |
-| MVCC                   | Yes               | Yes        | Yes (InnoDB) | No | No  | No         |
-| PostgreSQL wire        | Yes               | Native     | No     | No     | No     | No         |
-| Vectorized execution   | Yes               | Partial    | No     | No     | Yes    | Yes        |
-| SIMD kernels (NEON+x86)| Yes               | No         | No     | No     | Yes    | Yes        |
-| Async runtime          | Tokio             | Process    | Thread | Thread | Thread | Thread     |
-| In-memory format       | Hybrid row/col    | Row        | Row    | Row    | Column | Column     |
-| Implementation lang    | Rust              | C          | C++    | C      | C++    | C++        |
+Forward-looking. "Target" cells are roadmap commitments; UltraSQL does not
+ship them today. The non-Target cells describe the named engines.
 
-This table is forward-looking. The "Target" cells are honest commitments
-captured in [ROADMAP.md](ROADMAP.md); UltraSQL has not shipped them yet.
-
-## Benchmarks
-
-UltraSQL takes performance claims seriously. The repository contains an
-automated benchmark harness ([`crates/ultrasql-bench`](crates/ultrasql-bench))
-and a reproducibility methodology ([BENCHMARKS.md](BENCHMARKS.md)).
-
-Three rules:
-
-1. **No claim without commit.** Every published number traces to a commit
-   SHA, a host description, and a JSON result file in
-   `benchmarks/results/`.
-2. **Equal-effort comparisons.** When we benchmark against PostgreSQL,
-   MySQL, SQLite, DuckDB, or ClickHouse, we tune the comparison subjects to
-   their published best practices. We are not the only experts in the room.
-3. **No marketing prose.** We report p50 / p95 / p99 latencies, throughput,
-   and resource use. We do not say "blazing fast." We say "47k tx/s at p99
-   < 4 ms on M4 Mac mini, 32 connections, TPC-B 1× scale."
+|                              | UltraSQL          | PostgreSQL | MySQL  | SQLite | DuckDB | ClickHouse |
+| ---------------------------- | ----------------- | ---------- | ------ | ------ | ------ | ---------- |
+| OLTP transactions            | Target            | Strong     | Strong | Single-writer | No  | No        |
+| OLAP scans                   | Target            | Adequate   | Weak   | Weak   | Strong | Strong     |
+| MVCC                         | Yes               | Yes        | Yes (InnoDB) | No | No  | No         |
+| PostgreSQL wire              | Target            | Native     | No     | No     | No     | No         |
+| Vectorized execution         | Target            | Partial    | No     | No     | Yes    | Yes        |
+| SIMD kernels (ARM64+x86)     | Partial (vec)     | No         | No     | No     | Yes    | Yes        |
+| Async runtime                | Tokio             | Process    | Thread | Thread | Thread | Thread     |
+| In-memory format             | Hybrid row/col    | Row        | Row    | Row    | Column | Column     |
+| Implementation language      | Rust              | C          | C++    | C      | C++    | C++        |
 
 ## Project structure
 
@@ -154,12 +147,21 @@ ultrasql/
 └── .github/workflows/      CI for lint, test, bench, fuzz, sanitizers
 ```
 
+## Links
+
+- Architecture: [ARCHITECTURE.md](ARCHITECTURE.md)
+- Performance rules: [PERFORMANCE.md](PERFORMANCE.md)
+- Benchmark methodology: [BENCHMARKS.md](BENCHMARKS.md)
+- Latest microbench results: [benchmarks/results/2026-05-12-m4/results.md](benchmarks/results/2026-05-12-m4/results.md)
+- Roadmap: [ROADMAP.md](ROADMAP.md)
+- RFC process: [RFC_PROCESS.md](RFC_PROCESS.md)
+- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
+
 ## Contributing
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) first. UltraSQL is an engineering-
-serious project. Pull requests must come with tests; performance-sensitive
-changes must come with benchmarks. Larger changes go through the
-[RFC process](RFC_PROCESS.md).
+Read [CONTRIBUTING.md](CONTRIBUTING.md) first. PRs must come with tests;
+changes to benchmarked paths come with before/after numbers in the PR
+description. Larger changes go through the [RFC process](RFC_PROCESS.md).
 
 ## License
 
