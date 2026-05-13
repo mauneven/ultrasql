@@ -35,6 +35,41 @@ impl Bitmap {
         }
     }
 
+    /// Build a bitmap directly from a packed-word buffer.
+    ///
+    /// `words.len()` must be at least `len.div_ceil(64)`. Any high bits
+    /// in the last word beyond `len % 64` are forced to zero so that
+    /// [`Self::count_ones`] and word-level scans never see padding bits.
+    /// This is the constructor used by SIMD kernels that compute 64
+    /// lanes of mask at a time and want to commit the word directly
+    /// without going through [`Self::set`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `words.len() < len.div_ceil(64)`.
+    #[must_use]
+    pub fn from_words(mut words: Vec<u64>, len: usize) -> Self {
+        let required = len.div_ceil(64);
+        assert!(
+            words.len() >= required,
+            "Bitmap::from_words: words.len() = {} < required {} for {} bits",
+            words.len(),
+            required,
+            len
+        );
+        words.truncate(required);
+        if len % 64 != 0 {
+            let mask = (1_u64 << (len % 64)) - 1;
+            if let Some(last) = words.last_mut() {
+                *last &= mask;
+            }
+        }
+        Self {
+            bits: words,
+            len_bits: len,
+        }
+    }
+
     /// Number of logical bits.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -80,6 +115,16 @@ impl Bitmap {
     #[must_use]
     pub fn words(&self) -> &[u64] {
         &self.bits
+    }
+
+    /// Mutably borrow the underlying u64 words.
+    ///
+    /// Used by SIMD kernels that emit 64 packed lanes of mask in a
+    /// single store. The caller is responsible for keeping any bits
+    /// beyond `len % 64` (in the final word) zero so that
+    /// [`Self::count_ones`] and word-level scans stay correct.
+    pub fn words_mut(&mut self) -> &mut [u64] {
+        &mut self.bits
     }
 
     /// Iterate over indices whose bit is set.
@@ -184,5 +229,41 @@ mod tests {
         let bm = Bitmap::new(0, true);
         assert!(bm.is_empty());
         assert_eq!(bm.count_ones(), 0);
+    }
+
+    #[test]
+    fn from_words_round_trip() {
+        // 130 bits across 3 words. Set every other bit.
+        let words = vec![0xAAAA_AAAA_AAAA_AAAA_u64; 3];
+        let bm = Bitmap::from_words(words, 130);
+        assert_eq!(bm.len(), 130);
+        for i in 0..130 {
+            assert_eq!(bm.get(i), i % 2 == 1, "i = {i}");
+        }
+    }
+
+    #[test]
+    fn from_words_masks_trailing_bits() {
+        // 65 bits → 2 words; second word should be masked to bit 0 only.
+        let words = vec![u64::MAX, u64::MAX];
+        let bm = Bitmap::from_words(words, 65);
+        assert_eq!(bm.count_ones(), 65);
+        // High word should be exactly 1.
+        assert_eq!(bm.words()[1], 1);
+    }
+
+    #[test]
+    fn words_mut_lets_kernel_write_packed() {
+        let mut bm = Bitmap::new(192, false);
+        for w in bm.words_mut() {
+            *w = 0xFFFF_FFFF_FFFF_FFFF;
+        }
+        assert_eq!(bm.count_ones(), 192);
+    }
+
+    #[test]
+    #[should_panic(expected = "Bitmap::from_words")]
+    fn from_words_panics_on_short_buffer() {
+        let _ = Bitmap::from_words(vec![0], 65);
     }
 }
