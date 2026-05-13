@@ -34,9 +34,11 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod auth;
 pub mod error;
 pub mod pipeline;
 pub mod result_encoder;
+pub mod tls;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -36,3 +36,19 @@ tracing-subscriber = { workspace = true }
 clap               = { workspace = true }
 config             = { workspace = true }
 bytes              = { workspace = true }
+# Auth / crypto
+hmac               = { workspace = true }
+sha2               = { workspace = true }
+pbkdf2             = { workspace = true }
+base64             = { workspace = true }
+rand               = { workspace = true }
+ipnet              = { workspace = true }
+# TLS
+rustls             = { workspace = true }
+tokio-rustls       = { workspace = true }
+rustls-pemfile     = { workspace = true }
+parking_lot        = { workspace = true }
+
+[dev-dependencies]
+rcgen              = { workspace = true }
+tempfile           = { workspace = true }
