@@ -49,6 +49,8 @@ use dashmap::DashMap;
 use ultrasql_core::{CommandId, Lsn, Xid};
 use ultrasql_mvcc::{Snapshot, XidStatus, XidStatusOracle};
 
+use crate::savepoint::{SavepointError, Subtxn, SubtxnManager};
+
 /// Isolation level applied to a [`Transaction`].
 ///
 /// v0.5 implements snapshot semantics for [`Self::ReadCommitted`] and
@@ -120,6 +122,14 @@ pub struct Transaction {
     /// Current statement (command) within the transaction. Advances on
     /// every [`TransactionManager::refresh_snapshot`].
     pub current_command: CommandId,
+    /// Subtransaction / savepoint stack for this transaction.
+    ///
+    /// A freshly begun transaction has an empty stack.  `SAVEPOINT name`
+    /// pushes an entry via [`TransactionManager::begin_savepoint`];
+    /// `ROLLBACK TO SAVEPOINT` and `RELEASE SAVEPOINT` pop via
+    /// [`TransactionManager::rollback_to_savepoint`] and
+    /// [`TransactionManager::release_savepoint`].
+    pub subtxn_stack: SubtxnManager,
 }
 
 /// The transaction manager.
@@ -184,6 +194,7 @@ impl TransactionManager {
             isolation,
             start_lsn: Lsn::ZERO,
             current_command: CommandId::FIRST,
+            subtxn_stack: SubtxnManager::new(xid),
         }
     }
 
@@ -317,6 +328,104 @@ impl TransactionManager {
 
         let xmin = min_xid.unwrap_or(xmax);
         Snapshot::new(xmin, xmax, current_xid, current_command, xip)
+    }
+
+    // ---- savepoint helpers -------------------------------------------------
+
+    /// Set a savepoint named `name` within `txn`.
+    ///
+    /// Allocates a new subtransaction XID and records it on `txn`'s
+    /// subtransaction stack.  The returned [`Subtxn`] carries the XID and
+    /// command-id context that the executor needs to mark subsequent writes.
+    ///
+    /// The new subxid is recorded in the CLOG as `InProgress` immediately so
+    /// that visibility rules can apply to subtransaction writes.
+    pub fn begin_savepoint(&self, txn: &mut Transaction, name: &str) -> Subtxn {
+        let sp = txn.subtxn_stack.savepoint(
+            name,
+            || {
+                let raw = self.next_xid.fetch_add(1, Ordering::AcqRel);
+                let sub_xid = Xid::new(raw);
+                self.clog.insert(sub_xid, XidStatus::InProgress);
+                sub_xid
+            },
+            txn.current_command,
+        );
+        sp
+    }
+
+    /// Roll back `txn` to the savepoint named `name`.
+    ///
+    /// Pops all subtransactions set after `name` (inclusive) from the stack
+    /// and marks each of their XIDs as `Aborted` in the CLOG.  Returns the
+    /// aborted XIDs so the executor can undo their heap writes.
+    ///
+    /// Returns [`SavepointError::NotFound`] if no savepoint with that name
+    /// exists on `txn`'s stack.
+    pub fn rollback_to_savepoint(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+    ) -> Result<Vec<Xid>, SavepointError> {
+        let aborted_xids = txn.subtxn_stack.rollback_to(name)?;
+        for &sub_xid in &aborted_xids {
+            // Transition InProgress → Aborted.  If the entry is missing
+            // (programming error) the transition is a no-op.
+            if let Some(mut entry) = self.clog.get_mut(&sub_xid) {
+                if matches!(*entry.value(), XidStatus::InProgress) {
+                    *entry.value_mut() = XidStatus::Aborted;
+                }
+            }
+        }
+        Ok(aborted_xids)
+    }
+
+    /// Release the savepoint named `name` within `txn`.
+    ///
+    /// Removes the savepoint from the stack and marks its XID as `Committed`
+    /// in the CLOG, making the subtransaction's writes permanently visible to
+    /// the parent transaction (and to other transactions under normal MVCC
+    /// rules once the parent commits).
+    ///
+    /// Returns the committed subxid on success, or [`SavepointError::NotFound`]
+    /// if no savepoint with that name exists.
+    pub fn release_savepoint(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+    ) -> Result<Xid, SavepointError> {
+        let sub_xid = txn.subtxn_stack.release(name)?;
+        // Mark the subtransaction as committed so MVCC visibility picks it up.
+        if let Some(mut entry) = self.clog.get_mut(&sub_xid) {
+            if matches!(*entry.value(), XidStatus::InProgress) {
+                *entry.value_mut() = XidStatus::Committed;
+            }
+        }
+        Ok(sub_xid)
+    }
+
+    // ---- 2PC helper --------------------------------------------------------
+
+    /// Consume `txn` into the two-phase-commit coordinator.
+    ///
+    /// Records the XID under `gid` in `coordinator`, leaving the XID in the
+    /// CLOG as `InProgress` until the coordinator resolves it with
+    /// `commit_prepared` or `rollback_prepared`.
+    ///
+    /// The `Transaction` handle is consumed so it cannot be double-committed
+    /// via the normal path.
+    ///
+    /// Returns [`crate::two_phase::TwoPhaseError`] if the GID is a duplicate
+    /// or if state-file I/O fails.
+    pub fn prepare_transaction(
+        &self,
+        gid: &str,
+        txn: Transaction,
+        coordinator: &crate::two_phase::TwoPhaseCoordinator,
+    ) -> Result<(), crate::two_phase::TwoPhaseError> {
+        coordinator.prepare(gid, txn.xid)
+        // `txn` is dropped here; the CLOG entry remains `InProgress` until
+        // the coordinator resolves via `commit_prepared` / `rollback_prepared`.
     }
 
     fn terminate(&self, xid: Xid, new_status: XidStatus) -> Result<(), TxnError> {

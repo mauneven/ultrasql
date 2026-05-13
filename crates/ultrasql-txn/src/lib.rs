@@ -15,6 +15,16 @@
 //!   so visibility checks in `ultrasql-mvcc` can be served directly
 //!   from the live commit log.
 //!
+//! v0.4 additions:
+//!
+//! - [`ssi`] — PostgreSQL-style Serializable Snapshot Isolation (SSI):
+//!   predicate locks, rw-anti-dependency tracking, dangerous-structure
+//!   detection.
+//! - [`savepoint`] — Subtransaction / savepoint manager implementing
+//!   `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT`.
+//! - [`two_phase`] — Two-phase commit coordinator implementing
+//!   `PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK PREPARED`.
+//!
 //! The CLOG in this revision is an in-memory `DashMap`. A persistent,
 //! page-backed CLOG is tracked as a follow-up; the API does not change.
 //! The active-transactions snapshot is built by a full scan of the
@@ -26,6 +36,12 @@
 
 pub mod lock;
 pub mod manager;
+pub mod savepoint;
+pub mod ssi;
+pub mod two_phase;
 
 pub use lock::{LockError, LockManager, LockMode, LockRequest, LockTableSnapshot, LockTag};
 pub use manager::{IsolationLevel, Transaction, TransactionManager, TxnError};
+pub use savepoint::{SavepointError, Subtxn, SubtxnManager};
+pub use ssi::{PredicateLock, PredicateLockTag, SsiError, SsiManager};
+pub use two_phase::{PreparedTxn, TwoPhaseCoordinator, TwoPhaseError};

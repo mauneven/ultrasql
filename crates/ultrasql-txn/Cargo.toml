@@ -24,4 +24,10 @@ smallvec         = { workspace = true }
 tracing          = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+proptest  = { workspace = true }
+tempfile  = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name    = "txn_advanced"
+harness = false
