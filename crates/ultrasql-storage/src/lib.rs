@@ -8,11 +8,13 @@
 //! 4. Heap access method (PostgreSQL-style HOT-update-friendly tuple layout).
 //! 5. B+ tree index access method.
 //! 6. Free-space map + visibility map.
+//! 7. Checkpointer (periodic dirty-page flush driven by WAL durable LSN).
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod btree;
 pub mod buffer_pool;
+pub mod checkpointer;
 pub mod checksum;
 pub mod heap;
 pub mod page;
@@ -20,6 +22,7 @@ pub mod segment;
 pub mod wal_sink;
 
 pub use buffer_pool::{BufferPool, BufferPoolError, BufferPoolStats, PageGuard, PageLoader};
+pub use checkpointer::{Checkpointer, CheckpointerConfig};
 pub use page::{ItemId, ItemIdFlags, Page, PageError, PageHeader, PageKind, SlotIndex};
 #[cfg(any(test, feature = "testing"))]
 pub use wal_sink::test_support;

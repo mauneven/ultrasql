@@ -20,6 +20,13 @@
 //!   `clock_ref` bit; the next sweep finds the same frame again and
 //!   evicts it. (CLOCK-Pro is a known follow-up; the lint enforces
 //!   the same trait surface so the upgrade is a drop-in.)
+//! - **WAL integration.** An optional `Arc<dyn WalSink>` reference allows
+//!   [`BufferPool::try_flush_dirty`] to gate page flushes on the sink's
+//!   `durable_lsn`: a dirty page whose page-LSN exceeds the durable LSN
+//!   has not yet been durably logged and must not be written to disk (the
+//!   recovery invariant requires that WAL is always ahead of the data
+//!   files). When no sink is present, all dirty unpinned pages are
+//!   eligible for flushing.
 //!
 //! Concurrency
 //! -----------
@@ -32,6 +39,10 @@
 //!   table lock for the new `page_id`. The latch order is the global
 //!   "shard → frame" rule from [ARCHITECTURE.md](../../../ARCHITECTURE.md);
 //!   we never invert it.
+//! - `try_flush_dirty` acquires per-frame locks individually in frame-index
+//!   order (it never holds two simultaneously), so it does not introduce
+//!   new lock-ordering hazards with respect to the existing buffer-pool
+//!   ordering rules.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -42,6 +53,7 @@ use ultrasql_core::cache::CachePadded;
 use ultrasql_core::{Error, PageId, Result};
 
 use crate::page::Page;
+use crate::wal_sink::WalSink;
 
 /// Errors specific to the buffer pool.
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +125,16 @@ pub struct BufferPool<L: PageLoader> {
     page_table: DashMap<PageId, usize>,
     loader: L,
     clock_hand: AtomicUsize,
+    /// Optional WAL sink for LSN-gated dirty-page flushing.
+    ///
+    /// When `Some`, [`BufferPool::try_flush_dirty`] will only flush frames
+    /// whose page-LSN is ≤ the sink's `durable_lsn`. This ensures the WAL
+    /// is always written ahead of the data files, which is the fundamental
+    /// crash-recovery invariant.
+    ///
+    /// When `None`, all unpinned dirty frames are eligible for flushing
+    /// regardless of LSN.
+    wal_sink: Option<Arc<dyn WalSink>>,
     /// Cumulative counters.
     counters: Counters,
 }
@@ -168,7 +190,11 @@ impl Frame {
 }
 
 impl<L: PageLoader> BufferPool<L> {
-    /// Construct a buffer pool with `capacity` frames.
+    /// Construct a buffer pool with `capacity` frames and no WAL sink.
+    ///
+    /// Without a WAL sink, [`Self::try_flush_dirty`] treats every page LSN
+    /// as durable and will flush any unpinned dirty page. Use
+    /// [`Self::with_wal`] when WAL integration is required.
     #[must_use]
     pub fn new(capacity: usize, loader: L) -> Self {
         assert!(capacity > 0, "buffer pool capacity must be > 0");
@@ -180,8 +206,139 @@ impl<L: PageLoader> BufferPool<L> {
             page_table: DashMap::with_capacity(capacity),
             loader,
             clock_hand: AtomicUsize::new(0),
+            wal_sink: None,
             counters: Counters::default(),
         }
+    }
+
+    /// Construct a buffer pool with `capacity` frames and a WAL sink.
+    ///
+    /// The sink's [`WalSink::durable_lsn`] is consulted by
+    /// [`Self::try_flush_dirty`] to gate page flushes: a dirty frame
+    /// whose page-LSN exceeds the durable LSN will not be flushed because
+    /// the WAL record that describes the mutation has not yet been made
+    /// durable. This preserves the WAL-ahead-of-data-files invariant
+    /// required for crash recovery.
+    ///
+    /// Eviction itself does not flush dirty pages regardless of whether a
+    /// sink is present. Flushing is the checkpointer's job; the eviction
+    /// path simply skips dirty frames.
+    #[must_use]
+    pub fn with_wal(capacity: usize, loader: L, wal: Arc<dyn WalSink>) -> Self {
+        assert!(capacity > 0, "buffer pool capacity must be > 0");
+        let frames = (0..capacity)
+            .map(|_| CachePadded::new(Frame::empty()))
+            .collect();
+        Self {
+            frames,
+            page_table: DashMap::with_capacity(capacity),
+            loader,
+            clock_hand: AtomicUsize::new(0),
+            wal_sink: Some(wal),
+            counters: Counters::default(),
+        }
+    }
+
+    /// Flush dirty, unpinned frames to disk using the provided `writer`
+    /// callback.
+    ///
+    /// For each frame that is dirty and has `pin_count == 0`, this method
+    /// checks whether the frame's page-LSN is ≤ the WAL sink's
+    /// `durable_lsn` (or, if no sink is configured, treats all LSNs as
+    /// durable). If the LSN condition is satisfied the `writer` callback
+    /// is invoked with the `PageId` and a shared reference to the `Page`.
+    /// On a successful write the dirty bit is cleared so the frame becomes
+    /// eligible for eviction.
+    ///
+    /// The `writer` receives shared access to the page while the per-frame
+    /// read lock is held. Writer implementations must not attempt to
+    /// re-enter the buffer pool (no `get_page` calls inside `writer`); that
+    /// would deadlock because the read lock is already held.
+    ///
+    /// # Lock order
+    ///
+    /// This method acquires per-frame read locks individually in frame-index
+    /// order, never holding two simultaneously. This is consistent with the
+    /// global latch order documented in ARCHITECTURE.md §14.
+    ///
+    /// # Errors
+    ///
+    /// If `writer` returns an error the frame is left dirty and the error
+    /// is propagated. The count of successfully flushed pages before the
+    /// error occurred is lost (the caller can inspect `stats().dirty` to
+    /// assess remaining work). The checkpointer continues on errors and
+    /// retries on the next interval.
+    ///
+    /// # Returns
+    ///
+    /// The number of pages successfully flushed.
+    pub fn try_flush_dirty(
+        &self,
+        mut writer: impl FnMut(PageId, &Page) -> Result<()>,
+    ) -> Result<usize> {
+        let durable = self
+            .wal_sink
+            .as_ref()
+            .map_or(u64::MAX, |s| s.durable_lsn().raw());
+
+        let mut flushed: usize = 0;
+
+        for frame in &self.frames {
+            // Fast-path: skip frames that are obviously clean or pinned
+            // without taking any lock.
+            if !frame.dirty.load(Ordering::Acquire) {
+                continue;
+            }
+            if frame.pin_count.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+
+            // Acquire the meta lock to read the page_id and double-check
+            // the pin count atomically.
+            let page_id = {
+                let pid_slot = frame.page_id.lock();
+                if frame.pin_count.load(Ordering::Acquire) != 0 {
+                    continue;
+                }
+                match *pid_slot {
+                    Some(pid) => pid,
+                    None => continue,
+                }
+            };
+
+            // Read the page LSN under shared lock.
+            let page_lsn = {
+                let page_guard = frame.page.read();
+                match page_guard.as_ref() {
+                    Some(page) => page.header().lsn,
+                    None => continue,
+                }
+            };
+
+            // Gate on WAL durability. A page whose LSN exceeds the
+            // durable WAL position must not be written to disk: the WAL
+            // record describing the mutation is not yet guaranteed to
+            // survive a crash, so writing the page would violate the
+            // WAL-ahead-of-data-files invariant.
+            if page_lsn > durable {
+                continue;
+            }
+
+            // Invoke the writer with shared access to the page.
+            {
+                let page_guard = frame.page.read();
+                match page_guard.as_ref() {
+                    Some(page) => writer(page_id, page)?,
+                    None => continue,
+                }
+            }
+
+            // Clear the dirty bit only after a successful write.
+            frame.dirty.store(false, Ordering::Release);
+            flushed += 1;
+        }
+
+        Ok(flushed)
     }
 
     /// Acquire a page guard. On miss, the page is loaded via the
@@ -436,10 +593,11 @@ impl Drop for PageWrite<'_> {
 mod tests {
     use std::sync::Arc;
 
-    use ultrasql_core::{BlockNumber, PageId, RelationId};
+    use ultrasql_core::{BlockNumber, Lsn, PageId, RelationId, Xid};
 
     use super::*;
     use crate::page::Page;
+    use crate::wal_sink::WalSink;
 
     /// Loader that materializes blank heap pages.
     struct BlankLoader;
@@ -559,5 +717,167 @@ mod tests {
         // Dirty page is not auto-evicted yet, but resident count is
         // still 1.
         assert!(pool.stats().dirty >= 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // try_flush_dirty tests
+    // -----------------------------------------------------------------------
+
+    /// A `WalSink` stub that reports a fixed durable LSN.
+    struct FixedDurableSink {
+        durable: Lsn,
+    }
+
+    impl WalSink for FixedDurableSink {
+        fn append(
+            &self,
+            _record: ultrasql_wal::WalRecord,
+        ) -> Result<Lsn, crate::wal_sink::WalSinkError> {
+            Ok(Lsn::ZERO)
+        }
+
+        fn durable_lsn(&self) -> Lsn {
+            self.durable
+        }
+
+        fn last_lsn_for(&self, _xid: Xid) -> Lsn {
+            Lsn::ZERO
+        }
+    }
+
+    /// Pool with sink at `durable_lsn=100`, page with `lsn=50` and dirty bit
+    /// set. `try_flush_dirty` should call the writer once and clear the
+    /// dirty bit.
+    #[test]
+    fn try_flush_dirty_writes_clean_dirty_pages_with_durable_lsn() {
+        let sink: Arc<dyn WalSink> = Arc::new(FixedDurableSink {
+            durable: Lsn::new(100),
+        });
+        let pool = Arc::new(BufferPool::with_wal(4, BlankLoader, sink));
+
+        // Load and write to page 0 to mark it dirty with lsn=50.
+        {
+            let g = pool.get_page(pid(0)).unwrap();
+            let mut w = g.write();
+            w.set_lsn(50);
+        }
+        assert_eq!(pool.stats().dirty, 1);
+
+        // try_flush_dirty should flush the page.
+        let mut call_count: usize = 0;
+        let flushed = pool
+            .try_flush_dirty(|_page_id, _page| {
+                call_count += 1;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            call_count, 1,
+            "writer must be called once for the dirty page"
+        );
+        assert_eq!(flushed, 1);
+        assert_eq!(
+            pool.stats().dirty,
+            0,
+            "dirty bit must be cleared after flush"
+        );
+    }
+
+    /// Pool with sink at `durable_lsn=10`, page `lsn=100`. The page's LSN is
+    /// above the durable LSN so it must NOT be flushed.
+    #[test]
+    fn try_flush_dirty_skips_pages_above_durable_lsn() {
+        let sink: Arc<dyn WalSink> = Arc::new(FixedDurableSink {
+            durable: Lsn::new(10),
+        });
+        let pool = Arc::new(BufferPool::with_wal(4, BlankLoader, sink));
+
+        {
+            let g = pool.get_page(pid(0)).unwrap();
+            let mut w = g.write();
+            w.set_lsn(100); // above durable_lsn=10
+        }
+        assert_eq!(pool.stats().dirty, 1);
+
+        let mut call_count: usize = 0;
+        let flushed = pool
+            .try_flush_dirty(|_page_id, _page| {
+                call_count += 1;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            call_count, 0,
+            "writer must NOT be called for page above durable LSN"
+        );
+        assert_eq!(flushed, 0);
+        assert_eq!(pool.stats().dirty, 1, "dirty bit must NOT be cleared");
+    }
+
+    /// A pinned dirty page must not be flushed even if its LSN is durable.
+    #[test]
+    fn try_flush_dirty_skips_pinned_pages() {
+        let sink: Arc<dyn WalSink> = Arc::new(FixedDurableSink {
+            durable: Lsn::new(1000),
+        });
+        let pool = Arc::new(BufferPool::with_wal(4, BlankLoader, sink));
+
+        // Acquire a write guard and keep it alive so the frame stays pinned.
+        let guard = pool.get_page(pid(0)).unwrap();
+        {
+            let mut w = guard.write();
+            w.set_lsn(50);
+        }
+        // Frame is pinned (guard still alive) and dirty.
+        assert_eq!(pool.stats().pinned, 1);
+        assert_eq!(pool.stats().dirty, 1);
+
+        let mut call_count: usize = 0;
+        let flushed = pool
+            .try_flush_dirty(|_page_id, _page| {
+                call_count += 1;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(call_count, 0, "pinned page must not be flushed");
+        assert_eq!(flushed, 0);
+        // Let the guard drop so cleanup succeeds.
+        drop(guard);
+    }
+
+    /// Without a sink (`BufferPool::new`), all dirty unpinned pages are
+    /// flushed regardless of their LSN.
+    #[test]
+    fn try_flush_dirty_with_no_sink_treats_all_lsns_durable() {
+        let pool = Arc::new(BufferPool::new(4, BlankLoader));
+
+        // Two pages with different LSNs, both dirty.
+        {
+            let g0 = pool.get_page(pid(0)).unwrap();
+            g0.write().set_lsn(1_000_000);
+        }
+        {
+            let g1 = pool.get_page(pid(1)).unwrap();
+            g1.write().set_lsn(u64::MAX);
+        }
+        assert_eq!(pool.stats().dirty, 2);
+
+        let mut call_count: usize = 0;
+        let flushed = pool
+            .try_flush_dirty(|_page_id, _page| {
+                call_count += 1;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            call_count, 2,
+            "both pages must be flushed when no sink present"
+        );
+        assert_eq!(flushed, 2);
+        assert_eq!(pool.stats().dirty, 0);
     }
 }

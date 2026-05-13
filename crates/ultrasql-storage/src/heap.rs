@@ -311,7 +311,7 @@ impl<L: PageLoader> HeapAccess<L> {
             let page_id = PageId::new(rel, BlockNumber::new(block));
             match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
                 Ok(tid) => {
-                    Self::emit_insert_wal(tid, &opts, || self.fetch(tid))?;
+                    Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
                     return Ok(tid);
                 }
                 Err(HeapError::Page(PageError::NoSpace { .. })) => {}
@@ -330,7 +330,7 @@ impl<L: PageLoader> HeapAccess<L> {
             let page_id = PageId::new(rel, BlockNumber::new(new_block));
             match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
                 Ok(tid) => {
-                    Self::emit_insert_wal(tid, &opts, || self.fetch(tid))?;
+                    Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
                     return Ok(tid);
                 }
                 // A concurrent thread could have raced into this block
@@ -401,9 +401,13 @@ impl<L: PageLoader> HeapAccess<L> {
         // Err the page has already been mutated; the only safe response is
         // to panic and let the process restart from a consistent WAL state.
         if let Some((sink, record)) = wal_record {
-            let _lsn: Lsn = sink.append(record).expect(
+            let lsn: Lsn = sink.append(record).expect(
                 "wal append must succeed after a committed page mutation; failure is unrecoverable",
             );
+            // Stamp the page LSN so recovery knows the on-page state was
+            // logged at this LSN. WAL append completes before stamp so the
+            // page LSN is never ahead of the WAL.
+            Self::stamp_page_lsn(&self.pool, tid.page, lsn)?;
         }
         Ok(())
     }
@@ -479,7 +483,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     hot: true,
                 };
                 // WAL append is outside any pin scope.
-                Self::emit_update_wal(outcome, &opts, || self.fetch(new_tid))?;
+                Self::emit_update_wal(&self.pool, outcome, &opts, || self.fetch(new_tid))?;
                 return Ok(outcome);
             }
             // Page had no room; fall through to non-HOT path.
@@ -512,7 +516,7 @@ impl<L: PageLoader> HeapAccess<L> {
             hot: false,
         };
         // WAL append is outside any pin scope.
-        Self::emit_update_wal(outcome, &opts, || self.fetch(new_tid))?;
+        Self::emit_update_wal(&self.pool, outcome, &opts, || self.fetch(new_tid))?;
         Ok(outcome)
     }
 
@@ -851,7 +855,28 @@ impl<L: PageLoader> HeapAccess<L> {
     // WAL emission helpers
     // ---------------------------------------------------------------------------
 
-    /// Emit a `HeapInsert` WAL record if `opts.wal` is `Some`.
+    /// Stamp the page-LSN field of `page_id` with `lsn`.
+    ///
+    /// This must be called **after** the WAL append that assigned `lsn` so
+    /// the page's LSN is never ahead of the WAL. Recovery uses the page LSN
+    /// to determine whether a given page on disk already reflects a WAL
+    /// record (redo-skip optimisation).
+    ///
+    /// The stamp takes a fresh pin on the page, modifies the header under an
+    /// exclusive write lock, and releases the pin. The cost is one pin +
+    /// one write lock per WAL append — acceptable for correctness.
+    fn stamp_page_lsn(
+        pool: &Arc<BufferPool<L>>,
+        page_id: PageId,
+        lsn: Lsn,
+    ) -> Result<(), HeapError> {
+        let guard = pool.get_page(page_id)?;
+        guard.write().set_lsn(lsn.raw());
+        Ok(())
+    }
+
+    /// Emit a `HeapInsert` WAL record if `opts.wal` is `Some`, then stamp
+    /// the page's LSN with the assigned WAL LSN.
     ///
     /// `fetch_tuple` is a closure that reads the canonical on-page tuple bytes;
     /// it is called only when the sink is present to avoid a redundant fetch in
@@ -862,6 +887,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// record after the page has been written the process panics: the page
     /// state has already diverged from the WAL and continuing risks data loss.
     fn emit_insert_wal(
+        pool: &Arc<BufferPool<L>>,
         tid: TupleId,
         opts: &InsertOptions<'_>,
         fetch_tuple: impl FnOnce() -> Result<HeapTuple, HeapError>,
@@ -890,14 +916,18 @@ impl<L: PageLoader> HeapAccess<L> {
             // sink rejects the record the on-disk state has diverged from
             // the WAL; panicking and restarting from the WAL is the only
             // correct recovery path.
-            let _lsn: Lsn = sink.append(record).expect(
+            let lsn: Lsn = sink.append(record).expect(
                 "wal append must succeed after a committed page mutation; failure is unrecoverable",
             );
+            // Stamp the page LSN now that the WAL record is durable.
+            // WAL append happened before stamp so page LSN is never ahead of WAL.
+            Self::stamp_page_lsn(pool, tid.page, lsn)?;
         }
         Ok(())
     }
 
-    /// Emit a `HeapUpdate` WAL record if `opts.wal` is `Some`.
+    /// Emit a `HeapUpdate` WAL record if `opts.wal` is `Some`, then stamp
+    /// the affected pages' LSN with the assigned WAL LSN.
     ///
     /// `flags` has [`ultrasql_wal::payload::HEAP_UPDATE_HOT`] set when
     /// `outcome.hot` is `true`.
@@ -909,7 +939,12 @@ impl<L: PageLoader> HeapAccess<L> {
     /// dropped. If the sink rejects the record after both the old and new
     /// versions have been written the process panics (same reasoning as
     /// [`Self::emit_insert_wal`]).
+    ///
+    /// When the old and new pages differ (non-HOT), both pages are stamped
+    /// with the same LSN so recovery can skip redo on either if the page is
+    /// already up-to-date.
     fn emit_update_wal(
+        pool: &Arc<BufferPool<L>>,
         outcome: UpdateOutcome,
         opts: &UpdateOptions<'_>,
         fetch_new_tuple: impl FnOnce() -> Result<HeapTuple, HeapError>,
@@ -941,9 +976,16 @@ impl<L: PageLoader> HeapAccess<L> {
             // SAFETY of panic: both old and new page versions have been
             // written. If the sink rejects the record the WAL has diverged
             // from the page state; the only correct response is to abort.
-            let _lsn: Lsn = sink.append(record).expect(
+            let lsn: Lsn = sink.append(record).expect(
                 "wal append must succeed after a committed page mutation; failure is unrecoverable",
             );
+            // Stamp the new page with the WAL LSN.
+            Self::stamp_page_lsn(pool, outcome.new_tid.page, lsn)?;
+            // For non-HOT updates the old and new pages differ; stamp
+            // both so the page LSN reflects the mutation on both sides.
+            if outcome.old_tid.page != outcome.new_tid.page {
+                Self::stamp_page_lsn(pool, outcome.old_tid.page, lsn)?;
+            }
         }
         Ok(())
     }
@@ -2212,6 +2254,160 @@ mod tests {
                     );
                 }
             }
+        }
+
+        // -------------------------------------------------------------------
+        // LSN stamping tests (Deliverable B)
+        // -------------------------------------------------------------------
+
+        /// After a heap insert with a WAL sink, the page's `header.lsn`
+        /// must equal the LSN returned by the sink's `append`.
+        #[test]
+        fn insert_stamps_page_lsn_to_wal_append_lsn() {
+            let (heap, sink) = make_heap_with_sink(8);
+            let xid = Xid::new(10);
+
+            let tid = heap
+                .insert(
+                    rel(),
+                    b"lsn-test",
+                    InsertOptions {
+                        xmin: xid,
+                        command_id: CommandId::FIRST,
+                        wal: Some(sink.as_ref()),
+                    },
+                )
+                .unwrap();
+
+            // The sink assigned LSN 1 to the first record.
+            let records = sink.records();
+            let (expected_lsn, _) = records[0];
+
+            // Read the page directly from the pool and check the header LSN.
+            let guard = heap.pool.get_page(tid.page).unwrap();
+            let page_lsn = guard.read().header().lsn;
+            assert_eq!(
+                page_lsn,
+                expected_lsn.raw(),
+                "page LSN must equal WAL append LSN after insert"
+            );
+        }
+
+        /// For a HOT update, both the old and new tuples live on the same
+        /// page. That page's LSN must equal the LSN from the update's WAL
+        /// append.
+        ///
+        /// For a non-HOT update, both the old page and the new page must
+        /// be stamped with the same WAL append LSN.
+        #[test]
+        fn update_stamps_new_and_old_pages_when_different() {
+            // Use a large payload to force non-HOT (cross-page) update.
+            let (heap, sink) = make_heap_with_sink(32);
+            let big = [0xCC_u8; 7000];
+
+            // Insert the first tuple with no WAL to keep the sink clean.
+            let old_tid = heap
+                .insert(
+                    rel(),
+                    &big,
+                    InsertOptions {
+                        xmin: Xid::new(1),
+                        command_id: CommandId::FIRST,
+                        wal: None,
+                    },
+                )
+                .unwrap();
+            // Force block 1 to exist so the update has a non-HOT destination.
+            let _ = heap
+                .insert(
+                    rel(),
+                    &big,
+                    InsertOptions {
+                        xmin: Xid::new(1),
+                        command_id: CommandId::FIRST,
+                        wal: None,
+                    },
+                )
+                .unwrap();
+
+            let outcome = heap
+                .update(
+                    old_tid,
+                    &big,
+                    UpdateOptions {
+                        xid: Xid::new(2),
+                        command_id: CommandId::FIRST,
+                        hot_eligible: true, // hot requested but page is full
+                        wal: Some(sink.as_ref()),
+                    },
+                )
+                .unwrap();
+
+            assert!(
+                !outcome.hot,
+                "expected non-HOT update; old and new should be on different pages"
+            );
+            assert_ne!(outcome.old_tid.page, outcome.new_tid.page);
+
+            let records = sink.records();
+            let (expected_lsn, _) = records[0];
+
+            // Both pages must be stamped with the same LSN.
+            let old_guard = heap.pool.get_page(outcome.old_tid.page).unwrap();
+            let old_lsn = old_guard.read().header().lsn;
+            let new_guard = heap.pool.get_page(outcome.new_tid.page).unwrap();
+            let new_lsn = new_guard.read().header().lsn;
+
+            assert_eq!(
+                old_lsn,
+                expected_lsn.raw(),
+                "old page LSN must equal WAL update LSN"
+            );
+            assert_eq!(
+                new_lsn,
+                expected_lsn.raw(),
+                "new page LSN must equal WAL update LSN"
+            );
+        }
+
+        /// After a heap delete with a WAL sink, the page's `header.lsn`
+        /// must equal the LSN returned by the sink's `append`.
+        #[test]
+        fn delete_stamps_page_lsn() {
+            let (heap, sink) = make_heap_with_sink(8);
+
+            let tid = heap
+                .insert(
+                    rel(),
+                    b"to-delete",
+                    InsertOptions {
+                        xmin: Xid::new(10),
+                        command_id: CommandId::FIRST,
+                        wal: None, // no WAL for insert; clean sink for delete
+                    },
+                )
+                .unwrap();
+
+            heap.delete(
+                tid,
+                DeleteOptions {
+                    xmax: Xid::new(20),
+                    cmax: CommandId::new(3),
+                    wal: Some(sink.as_ref()),
+                },
+            )
+            .unwrap();
+
+            let records = sink.records();
+            let (expected_lsn, _) = records[0];
+
+            let guard = heap.pool.get_page(tid.page).unwrap();
+            let page_lsn = guard.read().header().lsn;
+            assert_eq!(
+                page_lsn,
+                expected_lsn.raw(),
+                "page LSN must equal WAL delete LSN after delete"
+            );
         }
     }
 }
