@@ -15,10 +15,10 @@
 //!   [`DataSource::scan`] for `table`, builds a [`MemTableScan`] over
 //!   the returned batches, and wraps it in a [`Project`] when
 //!   `projection` is set.
-//! - `LogicalPlan::Filter { predicate, .. }` lowers to [`Filter`]
+//! - `LogicalPlan::Filter { predicate, .. }` lowers to `Filter`
 //!   (the general expression-interpreter-backed filter). Any predicate
-//!   that the [`Eval`] interpreter does not support at runtime surfaces
-//!   as an [`ExecError`] during execution, not a build-time error.
+//!   that the `Eval` interpreter does not support at runtime surfaces
+//!   as an `ExecError` during execution, not a build-time error.
 //! - `LogicalPlan::Values` lowers to [`ValuesScan`].
 //! - `LogicalPlan::Project` lowers to [`Project`] iff every output
 //!   expression is a bare column reference; computed expressions are
@@ -29,7 +29,7 @@
 //! - `LogicalPlan::Empty` lowers to a [`MemTableScan`] over its
 //!   declared schema with zero batches — an EOF source.
 //! - `LogicalPlan::Insert / Update / Delete` are `Unsupported` pending
-//!   the datasource-handle refactor (wave 5+). [`ModifyTable`] and
+//!   the datasource-handle refactor (wave 5+). `ModifyTable` and
 //!   [`ValuesScan`] exist as stand-alone operators that callers can
 //!   construct directly.
 //!

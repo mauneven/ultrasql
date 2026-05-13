@@ -26,7 +26,7 @@ use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp};
 // Error type
 // ---------------------------------------------------------------------------
 
-/// Errors raised when [`Evaluator::eval`] cannot produce a result.
+/// Errors raised when [`Eval::eval`] cannot produce a result.
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
     /// A runtime type did not match what the expression expected.

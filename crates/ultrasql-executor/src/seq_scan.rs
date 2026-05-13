@@ -41,7 +41,7 @@ const BATCH_TARGET_ROWS: usize = 4096;
 /// `L` is the [`PageLoader`] implementation (in production: the segment
 /// loader; in tests: an in-memory map). `O` is the [`XidStatusOracle`]
 /// implementation (in production: the CLOG-backed oracle; in tests:
-/// [`MapOracle`](ultrasql_mvcc::status::test_support::MapOracle)).
+/// `ultrasql_mvcc::status::test_support::MapOracle`).
 ///
 /// # Send bound
 ///

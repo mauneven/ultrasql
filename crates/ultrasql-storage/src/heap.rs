@@ -23,8 +23,8 @@
 //! - [`HeapAccess::scan`] — iterate every normal slot of every page in a
 //!   relation, in `(block, slot)` order, without any visibility filter.
 //! - [`HeapAccess::scan_visible`] — like `scan` but applies MVCC
-//!   visibility inline via a [`Snapshot`](ultrasql_mvcc::Snapshot) and
-//!   an [`XidStatusOracle`](ultrasql_mvcc::XidStatusOracle).
+//!   visibility inline via a `Snapshot` and an `XidStatusOracle`
+//!   (see `ultrasql-mvcc`).
 //!
 //! Block allocation
 //! ----------------

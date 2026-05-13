@@ -22,7 +22,7 @@
 //!   Used as a unit-test fixture for downstream operator tests; production
 //!   scans use [`SeqScan`] instead.
 //! - [`SeqScan`] — sequential heap scan backed by the storage subsystem.
-//!   Drives [`ultrasql_storage::HeapAccess::scan_visible`] with MVCC
+//!   Drives `ultrasql_storage::HeapAccess::scan_visible` with MVCC
 //!   visibility, decodes tuple payloads via [`RowCodec`], and emits
 //!   4096-row [`ultrasql_vec::Batch`]es.
 //! - [`RowCodec`] — stable v0.5 binary codec for translating between
@@ -30,7 +30,7 @@
 //! - [`FilterEqI32`] — predicate filter for `col == const_i32` (placeholder).
 //! - [`Filter`] — general predicate filter backed by the [`Eval`] interpreter.
 //! - [`ValuesScan`] — leaf operator materialising a `VALUES (...)` list.
-//! - [`ModifyTable`] — INSERT/UPDATE/DELETE mutations through [`HeapAccess`].
+//! - [`ModifyTable`] — INSERT/UPDATE/DELETE mutations through `HeapAccess`.
 //! - [`Eval`] — scalar expression interpreter; used by [`Filter`] and callers
 //!   that need row-level expression evaluation without a full operator.
 //! - [`Project`] — column projection.
