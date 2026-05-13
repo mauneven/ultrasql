@@ -11,10 +11,7 @@
 //! either succeeds with the so-far-built node or reports a tagged
 //! error.
 
-use crate::ast::{
-    BinaryOp, Expr, Identifier, Literal, NullsOrder, ObjectName, OrderItem, SelectItem, SelectStmt,
-    SortDirection, Statement, TableRef, UnaryOp,
-};
+use crate::ast::{BinaryOp, Expr, Identifier, Literal, Statement, UnaryOp};
 use crate::lexer::{Lexer, LexerError};
 use crate::span::Span;
 use crate::token::{Token, TokenKind};
@@ -95,7 +92,7 @@ pub const MAX_PARSE_DEPTH: u32 = 1024;
 /// SQL parser.
 #[derive(Debug)]
 pub struct Parser<'src> {
-    source: &'src str,
+    pub(crate) source: &'src str,
     lexer: Lexer<'src>,
     /// One-token lookahead. `None` means "not yet read".
     peeked: Option<Token>,
@@ -155,7 +152,7 @@ impl<'src> Parser<'src> {
 
     // ---------------- statement-level ------------------------------------
 
-    fn parse_one(&mut self) -> Result<Statement, ParseError> {
+    pub(crate) fn parse_one(&mut self) -> Result<Statement, ParseError> {
         let head = self.peek()?;
         match head.kind {
             TokenKind::KwSelect => self.parse_select().map(|s| Statement::Select(Box::new(s))),
@@ -189,238 +186,9 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_select(&mut self) -> Result<SelectStmt, ParseError> {
-        let start = self.expect(TokenKind::KwSelect, "SELECT")?;
-        let distinct = self.match_kw(TokenKind::KwDistinct);
-        let projection = self.parse_select_list()?;
-
-        let from = if self.match_kw(TokenKind::KwFrom) {
-            Some(self.parse_table_ref()?)
-        } else {
-            None
-        };
-
-        let r#where = if self.match_kw(TokenKind::KwWhere) {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        let order_by = if self.match_kw(TokenKind::KwOrder) {
-            self.expect(TokenKind::KwBy, "BY")?;
-            self.parse_order_list()?
-        } else {
-            Vec::new()
-        };
-
-        let limit = if self.match_kw(TokenKind::KwLimit) {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        let offset = if self.match_kw(TokenKind::KwOffset) {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        let end_tok = self.peek()?;
-        let end = end_tok.span.start;
-        let span = Span::new(start.span.start, end);
-
-        Ok(SelectStmt {
-            distinct,
-            projection,
-            from,
-            r#where,
-            order_by,
-            limit,
-            offset,
-            span,
-        })
-    }
-
-    fn parse_select_list(&mut self) -> Result<Vec<SelectItem>, ParseError> {
-        let mut items = Vec::new();
-        loop {
-            items.push(self.parse_select_item()?);
-            if self.peek()?.kind != TokenKind::Comma {
-                return Ok(items);
-            }
-            self.advance()?;
-        }
-    }
-
-    fn parse_select_item(&mut self) -> Result<SelectItem, ParseError> {
-        // `*`
-        if self.peek()?.kind == TokenKind::Star {
-            let tok = self.advance()?;
-            return Ok(SelectItem::Wildcard { span: tok.span });
-        }
-
-        // `name.*` ?
-        if matches!(
-            self.peek()?.kind,
-            TokenKind::Identifier | TokenKind::QuotedIdentifier
-        ) && self.lookahead_two_is(TokenKind::Dot, TokenKind::Star)
-        {
-            let ident = self.parse_identifier()?;
-            self.advance()?; // dot
-            let star = self.advance()?; // star
-            return Ok(SelectItem::QualifiedWildcard {
-                qualifier: ident.clone(),
-                span: Span::new(ident.span.start, star.span.end),
-            });
-        }
-
-        let expr = self.parse_expr()?;
-        let alias = if self.match_kw(TokenKind::KwAs)
-            || (matches!(
-                self.peek()?.kind,
-                TokenKind::Identifier | TokenKind::QuotedIdentifier
-            ) && !self.next_token_is_reserved_clause())
-        {
-            Some(self.parse_identifier()?)
-        } else {
-            None
-        };
-        let span_start = expr.span().start;
-        let expr_end = expr.span().end;
-        let span_end = alias.as_ref().map_or(expr_end, |a| a.span.end);
-        Ok(SelectItem::Expr {
-            expr,
-            alias,
-            span: Span::new(span_start, span_end),
-        })
-    }
-
-    fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
-        let name = self.parse_object_name()?;
-        let alias = if self.match_kw(TokenKind::KwAs)
-            || (matches!(
-                self.peek()?.kind,
-                TokenKind::Identifier | TokenKind::QuotedIdentifier
-            ) && !self.next_token_is_reserved_clause())
-        {
-            Some(self.parse_identifier()?)
-        } else {
-            None
-        };
-        let end = alias.as_ref().map_or(name.span.end, |a| a.span.end);
-        Ok(TableRef::Named {
-            span: Span::new(name.span.start, end),
-            name,
-            alias,
-        })
-    }
-
-    fn parse_order_list(&mut self) -> Result<Vec<OrderItem>, ParseError> {
-        let mut items = Vec::new();
-        loop {
-            let expr = self.parse_expr()?;
-            let direction = if self.match_kw(TokenKind::KwAsc) {
-                SortDirection::Asc
-            } else if self.match_kw(TokenKind::KwDesc) {
-                SortDirection::Desc
-            } else {
-                SortDirection::Asc
-            };
-            let nulls = if self.match_kw(TokenKind::KwNulls) {
-                // NULLS FIRST | NULLS LAST
-                let n = self.advance()?;
-                if n.text(self.source)
-                    .is_some_and(|t| t.eq_ignore_ascii_case("first"))
-                {
-                    NullsOrder::First
-                } else if n
-                    .text(self.source)
-                    .is_some_and(|t| t.eq_ignore_ascii_case("last"))
-                {
-                    NullsOrder::Last
-                } else {
-                    return Err(ParseError::Expected {
-                        expected: "FIRST or LAST",
-                        found: n.kind,
-                        offset: n.span.start as usize,
-                    });
-                }
-            } else {
-                NullsOrder::Default
-            };
-            let span_start = expr.span().start;
-            let span_end = self.peek()?.span.start;
-            items.push(OrderItem {
-                expr,
-                direction,
-                nulls,
-                span: Span::new(span_start, span_end),
-            });
-            if self.peek()?.kind != TokenKind::Comma {
-                return Ok(items);
-            }
-            self.advance()?;
-        }
-    }
-
-    fn parse_object_name(&mut self) -> Result<ObjectName, ParseError> {
-        let first = self.parse_identifier()?;
-        let mut parts = vec![first.clone()];
-        let start = first.span.start;
-        let mut end = first.span.end;
-        while self.peek()?.kind == TokenKind::Dot {
-            // Look past the dot — if the next token is `*`, this is
-            // not part of the name and we leave the dot in place for
-            // the caller.
-            if self.lookahead_at(1)?.kind == TokenKind::Star {
-                break;
-            }
-            self.advance()?; // dot
-            let ident = self.parse_identifier()?;
-            end = ident.span.end;
-            parts.push(ident);
-        }
-        Ok(ObjectName {
-            parts,
-            span: Span::new(start, end),
-        })
-    }
-
-    fn parse_identifier(&mut self) -> Result<Identifier, ParseError> {
-        let tok = self.peek()?;
-        match tok.kind {
-            TokenKind::Identifier => {
-                let tok = self.advance()?;
-                let raw = tok.text(self.source).unwrap_or("");
-                Ok(Identifier {
-                    value: raw.to_ascii_lowercase(),
-                    quoted: false,
-                    span: tok.span,
-                })
-            }
-            TokenKind::QuotedIdentifier => {
-                let tok = self.advance()?;
-                let raw = tok.text(self.source).unwrap_or("");
-                // Strip the outer quotes and collapse "" to ".
-                let inner = &raw[1..raw.len() - 1];
-                let value = inner.replace("\"\"", "\"");
-                Ok(Identifier {
-                    value,
-                    quoted: true,
-                    span: tok.span,
-                })
-            }
-            other => Err(ParseError::Expected {
-                expected: "identifier",
-                found: other,
-                offset: tok.span.start as usize,
-            }),
-        }
-    }
-
     // ---------------- expressions ----------------------------------------
 
-    fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+    pub(crate) fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_expr_with_precedence(0)
     }
 
@@ -588,7 +356,7 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_cast_expr(&mut self) -> Result<Expr, ParseError> {
+    pub(crate) fn parse_cast_expr(&mut self) -> Result<Expr, ParseError> {
         let cast = self.advance()?; // CAST
         self.expect(TokenKind::LParen, "(")?;
         let expr = self.parse_expr()?;
@@ -606,7 +374,7 @@ impl<'src> Parser<'src> {
     /// identifiers (`my_domain`) or the SQL reserved type-name
     /// keywords (`integer`, `varchar`, `timestamp`, ...). This helper
     /// accepts both.
-    fn parse_type_name(&mut self) -> Result<Identifier, ParseError> {
+    pub(crate) fn parse_type_name(&mut self) -> Result<Identifier, ParseError> {
         let tok = self.peek()?;
         match tok.kind {
             TokenKind::Identifier | TokenKind::QuotedIdentifier => self.parse_identifier(),
@@ -719,7 +487,7 @@ impl<'src> Parser<'src> {
     /// [`ParseError::DepthExceeded`] when the configured limit is
     /// reached. Every entry into [`Self::parse_expr_with_precedence`]
     /// pairs an `enter_depth` with a matching `leave_depth`.
-    fn enter_depth(&mut self) -> Result<(), ParseError> {
+    pub(crate) fn enter_depth(&mut self) -> Result<(), ParseError> {
         if self.depth >= MAX_PARSE_DEPTH {
             let offset = self
                 .peeked
@@ -734,14 +502,14 @@ impl<'src> Parser<'src> {
         Ok(())
     }
 
-    fn leave_depth(&mut self) {
+    pub(crate) fn leave_depth(&mut self) {
         debug_assert!(self.depth > 0, "leave_depth without matching enter_depth");
         self.depth = self.depth.saturating_sub(1);
     }
 
     // ---------------- token helpers --------------------------------------
 
-    fn peek(&mut self) -> Result<&Token, ParseError> {
+    pub(crate) fn peek(&mut self) -> Result<&Token, ParseError> {
         if self.peeked.is_none() {
             let t = self.lexer.next_token()?;
             self.peeked = Some(t);
@@ -754,7 +522,7 @@ impl<'src> Parser<'src> {
     /// would return. Callers in this parser never ask for more than
     /// two tokens of lookahead, so the linear re-tokenization cost is
     /// negligible.
-    fn lookahead_at(&mut self, distance: usize) -> Result<Token, ParseError> {
+    pub(crate) fn lookahead_at(&mut self, distance: usize) -> Result<Token, ParseError> {
         debug_assert!(distance >= 1);
         // Ensure we have a buffered peeked token; this fixes the
         // lexer offset to "just past that token's end".
@@ -768,7 +536,7 @@ impl<'src> Parser<'src> {
         Ok(tok)
     }
 
-    fn lookahead_two_is(&mut self, a: TokenKind, b: TokenKind) -> bool {
+    pub(crate) fn lookahead_two_is(&mut self, a: TokenKind, b: TokenKind) -> bool {
         // We only ever check from after the *current* peeked token, so
         // this looks one past peek and one past that.
         let Ok(first) = self.lookahead_at(1) else {
@@ -783,14 +551,18 @@ impl<'src> Parser<'src> {
         second.kind == b
     }
 
-    fn advance(&mut self) -> Result<Token, ParseError> {
+    pub(crate) fn advance(&mut self) -> Result<Token, ParseError> {
         if let Some(t) = self.peeked.take() {
             return Ok(t);
         }
         self.lexer.next_token().map_err(ParseError::from)
     }
 
-    fn expect(&mut self, kind: TokenKind, name: &'static str) -> Result<Token, ParseError> {
+    pub(crate) fn expect(
+        &mut self,
+        kind: TokenKind,
+        name: &'static str,
+    ) -> Result<Token, ParseError> {
         let head = self.peek()?;
         if head.kind == kind {
             return self.advance();
@@ -805,7 +577,7 @@ impl<'src> Parser<'src> {
         })
     }
 
-    fn match_kw(&mut self, kind: TokenKind) -> bool {
+    pub(crate) fn match_kw(&mut self, kind: TokenKind) -> bool {
         if matches!(self.peek().map(|t| t.kind), Ok(k) if k == kind) {
             let _ = self.advance();
             return true;
@@ -813,7 +585,7 @@ impl<'src> Parser<'src> {
         false
     }
 
-    fn next_token_is_reserved_clause(&mut self) -> bool {
+    pub(crate) fn next_token_is_reserved_clause(&mut self) -> bool {
         let kind = self.peek().map_or(TokenKind::Eof, |t| t.kind);
         matches!(
             kind,
@@ -862,7 +634,7 @@ const fn is_type_name_keyword(kind: TokenKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::Statement;
+    use crate::ast::{BinaryOp, Expr, SelectItem, SortDirection, Statement};
 
     fn parse(src: &str) -> Statement {
         Parser::new(src)

@@ -12,6 +12,7 @@ pub mod keywords;
 pub mod lexer;
 pub mod parser;
 pub mod span;
+pub mod statements;
 pub mod token;
 
 pub use lexer::Lexer;
