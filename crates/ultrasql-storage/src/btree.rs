@@ -35,7 +35,7 @@
 //! Each B-tree page reuses the standard page header. The body holds a
 //! packed array of fixed-size entries from `PAGE_HEADER_SIZE` up to
 //! `pd_lower` (which advances forward as entries are inserted). The
-//! special area at the tail of the page stores [`NodeMeta`].
+//! special area at the tail of the page stores the node metadata.
 //!
 //! ```text
 //! 0                                                              PAGE_SIZE
@@ -99,7 +99,7 @@ const INTERNAL_ENTRY_SIZE: usize = 16;
 /// Size of a leaf-node entry in bytes: `[key (8) | rel (4) | block (4) | slot (2) | pad (2)]`.
 const LEAF_ENTRY_SIZE: usize = 20;
 
-/// Size of [`NodeMeta`] on disk.
+/// Size of the per-node metadata block on disk.
 const NODE_META_SIZE: usize = 24;
 
 /// Special-area offset within a B-tree page.
@@ -108,10 +108,10 @@ const NODE_SPECIAL_OFFSET: usize = PAGE_SIZE - NODE_META_SIZE;
 /// Sentinel meaning "no right sibling."
 const NO_SIBLING: u32 = u32::MAX;
 
-/// Bit in [`NodeMeta::flags`] indicating a leaf page.
+/// Bit in the node-meta `flags` field indicating a leaf page.
 const FLAG_LEAF: u16 = 1 << 0;
 
-/// Bit in [`NodeMeta::flags`] indicating that [`NodeMeta::high_key`] is set.
+/// Bit in the node-meta `flags` field indicating that `high_key` is set.
 const FLAG_HAS_HIGH_KEY: u16 = 1 << 1;
 
 // --- errors ----------------------------------------------------------------

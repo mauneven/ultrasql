@@ -11,9 +11,9 @@
 //!   [`TransactionManager::begin`].
 //! - [`IsolationLevel`] enumerates the supported isolation levels.
 //! - [`TxnError`] carries the error type returned from commit / abort.
-//! - [`TransactionManager`] implements [`XidStatusOracle`] so visibility
-//!   checks in `ultrasql-mvcc` can be served directly from the live
-//!   commit log.
+//! - [`TransactionManager`] implements [`ultrasql_mvcc::XidStatusOracle`]
+//!   so visibility checks in `ultrasql-mvcc` can be served directly
+//!   from the live commit log.
 //!
 //! The CLOG in this revision is an in-memory `DashMap`. A persistent,
 //! page-backed CLOG is tracked as a follow-up; the API does not change.

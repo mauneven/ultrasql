@@ -276,7 +276,7 @@ pub fn sum_i64(column: &NumericColumn<i64>) -> i64 {
 /// with four-deep accumulator unrolling. Autovectorization is
 /// sufficient here, so no hand intrinsics are used.
 ///
-/// The null-aware path is a separate [`min_f64_nullable`] kernel; the
+/// The null-aware path is a separate `min_f64_nullable` kernel; the
 /// non-null fast path stays branch-free.
 #[must_use]
 pub fn min_f64(column: &NumericColumn<f64>) -> Option<f64> {

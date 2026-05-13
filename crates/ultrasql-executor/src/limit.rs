@@ -16,7 +16,7 @@ use crate::{ExecError, Operator};
 /// Produces at most `n` rows across all emitted batches. Once the
 /// budget is exhausted, [`Operator::next_batch`] returns `Ok(None)`
 /// without pulling another batch from the child. The terminal batch is
-/// truncated to the remaining row budget via [`slice_batch`].
+/// truncated to the remaining row budget via an internal helper.
 ///
 /// `Limit` does not perform a `LIMIT n OFFSET k` rewrite; an OFFSET
 /// operator will land alongside the planner work for row-skipping.

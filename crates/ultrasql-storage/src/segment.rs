@@ -366,8 +366,12 @@ fn full_fsync(file: &File) -> Result<(), SegmentError> {
     Ok(())
 }
 
+// Linux fallback: ordinary fsync (`sync_all`) is already invoked at
+// the call site; this stub keeps the macOS / non-macOS function
+// signatures identical so the caller does not need a cfg arm.
 #[cfg(not(target_os = "macos"))]
-const fn full_fsync(_file: &File) -> Result<(), SegmentError> {
+#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
+fn full_fsync(_file: &File) -> Result<(), SegmentError> {
     Ok(())
 }
 

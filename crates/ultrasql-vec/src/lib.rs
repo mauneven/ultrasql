@@ -10,7 +10,7 @@
 //!
 //! - [`bitmap`] — packed null bitmap with set/get and a popcount
 //!   primitive.
-//! - [`column`] — typed columnar buffers (`Int32`, `Int64`, `Float64`,
+//! - [`mod@column`] — typed columnar buffers (`Int32`, `Int64`, `Float64`,
 //!   `Bool`, `Utf8`). Each variant exposes a slice accessor and a
 //!   nulls bitmap.
 //! - [`batch`] — `Batch`: an ordered set of `Column`s with a uniform

@@ -2,7 +2,7 @@
 //!
 //! The manager hands out [`Transaction`] handles, tracks their lifecycle
 //! in an in-memory commit log (CLOG), and serves visibility queries via
-//! [`XidStatusOracle`].
+//! the [`ultrasql_mvcc::XidStatusOracle`] trait.
 //!
 //! Lifecycle
 //! ---------

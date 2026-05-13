@@ -28,8 +28,9 @@
 //!
 //! Once the executor grows a general expression evaluator and the
 //! filter operator stops being type-fussy, this module collapses to a
-//! one-line delegation to [`build_operator`]; the integration point
-//! is [`lower_plan`] and its `SampleTables` parameter.
+//! one-line delegation to
+//! [`ultrasql_executor::physical::build_operator`]; the integration
+//! point is `lower_plan` and its `SampleTables` parameter.
 
 use std::collections::HashMap;
 
