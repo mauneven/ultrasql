@@ -9,10 +9,28 @@
 //! The unary and binary operator enums are re-exported from
 //! [`ultrasql_parser::ast`] verbatim — the parser already produced the
 //! right discrimination and we have nothing to add at this layer.
+//!
+//! ## Subquery variants
+//!
+//! Three variants represent subqueries that remain in the expression tree
+//! until the optimizer's decorrelation pass lowers them to joins:
+//!
+//! - [`ScalarExpr::ScalarSubquery`] — a `(SELECT single_col …)` used as a
+//!   scalar value.  Must project exactly one column (enforced by the binder).
+//! - [`ScalarExpr::Exists`] — `EXISTS (SELECT …)` / `NOT EXISTS (…)`.
+//!   Result type is always `Bool`.
+//! - [`ScalarExpr::InSubquery`] — `expr [NOT] IN (SELECT …)`.  Result type
+//!   is always `Bool`.
+//!
+//! Correlated subqueries additionally reference outer columns via
+//! [`ScalarExpr::OuterColumn`], whose `frame_depth` tells the optimizer how
+//! many scope levels outward the reference escapes.
 
 use std::fmt;
 
 use ultrasql_core::{DataType, Value};
+
+use crate::plan::LogicalPlan;
 
 pub use ultrasql_parser::ast::{BinaryOp, UnaryOp};
 
@@ -83,11 +101,83 @@ pub enum ScalarExpr {
         /// `true` for `IS NOT NULL`.
         negated: bool,
     },
+
+    /// A reference to a column in an *outer* query scope.
+    ///
+    /// Produced when column resolution inside a subquery fails against the
+    /// subquery's own FROM clause but succeeds in one of the enclosing
+    /// outer scopes.  The optimizer's decorrelation pass consumes these
+    /// references when lifting the subquery into a join.
+    ///
+    /// `frame_depth` is 1-based: 1 means the immediately enclosing query,
+    /// 2 means one level further out, etc.
+    OuterColumn {
+        /// Column name retained for EXPLAIN readability.
+        name: String,
+        /// How many scope levels outward this reference escapes.
+        frame_depth: usize,
+        /// 0-based index within the outer frame's schema.
+        column_index: usize,
+        /// Inferred type of the outer column.
+        data_type: DataType,
+    },
+
+    /// A scalar subquery: `(SELECT single_column …)`.
+    ///
+    /// The binder enforces that the inner plan projects exactly one column.
+    /// The result type equals that column's type.
+    ///
+    /// `correlated = true` when the subplan contains at least one
+    /// [`ScalarExpr::OuterColumn`] reference.  Uncorrelated scalar
+    /// subqueries may be evaluated once and memoised by the executor.
+    ScalarSubquery {
+        /// The bound inner plan (arity exactly 1).
+        subplan: Box<LogicalPlan>,
+        /// `true` when the subplan references at least one outer column.
+        correlated: bool,
+        /// Result type — identical to the single column's type in `subplan`.
+        data_type: DataType,
+    },
+
+    /// `[NOT] EXISTS (SELECT …)`.
+    ///
+    /// Result type is always `Bool`.  `correlated = true` when the subplan
+    /// contains at least one [`ScalarExpr::OuterColumn`].
+    Exists {
+        /// The bound inner plan.
+        subplan: Box<LogicalPlan>,
+        /// `true` for `NOT EXISTS`.
+        negated: bool,
+        /// `true` when the subplan references at least one outer column.
+        correlated: bool,
+    },
+
+    /// `expr [NOT] IN (SELECT single_column …)`.
+    ///
+    /// The binder enforces that the inner plan projects exactly one column
+    /// and that its type is comparable to `expr`'s type.  Result type is
+    /// always `Bool`.
+    InSubquery {
+        /// The left-hand test expression (bound against the *outer* scope).
+        expr: Box<Self>,
+        /// The bound inner plan (arity exactly 1).
+        subplan: Box<LogicalPlan>,
+        /// `true` for `NOT IN`.
+        negated: bool,
+        /// `true` when the subplan references at least one outer column.
+        correlated: bool,
+        /// Type of the inner column — retained for the optimizer's type
+        /// checking when building the join condition.
+        data_type: DataType,
+    },
 }
 
 impl ScalarExpr {
-    /// The static result type of this expression. `IsNull` always
-    /// reports `Bool`.
+    /// The static result type of this expression.
+    ///
+    /// - `IsNull` / `Exists` / `InSubquery` always return `Bool`.
+    /// - `ScalarSubquery` returns the type of the single projected column.
+    /// - `OuterColumn` returns the outer column's type.
     #[must_use]
     pub fn data_type(&self) -> DataType {
         match self {
@@ -95,8 +185,34 @@ impl ScalarExpr {
             | Self::Literal { data_type, .. }
             | Self::Parameter { data_type, .. }
             | Self::Unary { data_type, .. }
-            | Self::Binary { data_type, .. } => data_type.clone(),
-            Self::IsNull { .. } => DataType::Bool,
+            | Self::Binary { data_type, .. }
+            | Self::OuterColumn { data_type, .. }
+            | Self::ScalarSubquery { data_type, .. } => data_type.clone(),
+            // IN/EXISTS/IS NULL always produce Bool.
+            Self::IsNull { .. } | Self::Exists { .. } | Self::InSubquery { .. } => DataType::Bool,
+        }
+    }
+
+    /// Returns `true` when this expression or any sub-expression is an
+    /// [`ScalarExpr::OuterColumn`].
+    ///
+    /// Used by the binder to detect whether a subquery is correlated.
+    #[must_use]
+    pub fn contains_outer_column(&self) -> bool {
+        match self {
+            Self::OuterColumn { .. } => true,
+            // Subquery variants: correlation of the *enclosing* query is
+            // tracked independently; we do not recurse into nested subplans.
+            Self::Column { .. }
+            | Self::Literal { .. }
+            | Self::Parameter { .. }
+            | Self::ScalarSubquery { .. }
+            | Self::Exists { .. }
+            | Self::InSubquery { .. } => false,
+            Self::Unary { expr, .. } | Self::IsNull { expr, .. } => expr.contains_outer_column(),
+            Self::Binary { left, right, .. } => {
+                left.contains_outer_column() || right.contains_outer_column()
+            }
         }
     }
 }
@@ -114,6 +230,40 @@ impl fmt::Display for ScalarExpr {
             Self::IsNull { expr, negated } => {
                 let kw = if *negated { "IS NOT NULL" } else { "IS NULL" };
                 write!(f, "({expr} {kw})")
+            }
+            Self::OuterColumn {
+                name, frame_depth, ..
+            } => write!(f, "outer[{frame_depth}].{name}"),
+            Self::ScalarSubquery { correlated, .. } => {
+                let tag = if *correlated { "correlated" } else { "scalar" };
+                write!(f, "(SUBQUERY[{tag}])")
+            }
+            Self::Exists {
+                negated,
+                correlated,
+                ..
+            } => {
+                let not = if *negated { "NOT " } else { "" };
+                let tag = if *correlated {
+                    "correlated"
+                } else {
+                    "uncorrelated"
+                };
+                write!(f, "{not}EXISTS[{tag}]")
+            }
+            Self::InSubquery {
+                expr,
+                negated,
+                correlated,
+                ..
+            } => {
+                let not = if *negated { " NOT" } else { "" };
+                let tag = if *correlated {
+                    "correlated"
+                } else {
+                    "uncorrelated"
+                };
+                write!(f, "({expr}{not} IN SUBQUERY[{tag}])")
             }
         }
     }

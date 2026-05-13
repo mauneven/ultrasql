@@ -21,6 +21,7 @@ pub mod catalog;
 pub mod error;
 pub mod expr;
 pub mod plan;
+pub mod scope;
 
 pub use binder::bind;
 pub use catalog::{Catalog, InMemoryCatalog, TableMeta};

@@ -60,6 +60,7 @@ use crate::plan::{
     AggregateFunc, ConflictTarget, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType,
     LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, SortKey,
 };
+use crate::scope::{ScopeFrame, ScopeStack};
 
 /// Bind a [`Statement`] against the supplied catalog and produce a
 /// typed logical plan.
@@ -72,11 +73,12 @@ use crate::plan::{
 /// - a type mismatch in an operator,
 /// - a construct the binder does not yet implement.
 pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+    let mut scope = ScopeStack::new();
     match stmt {
-        Statement::Select(s) => bind_select(s, catalog),
-        Statement::Insert(s) => bind_insert(s, catalog),
-        Statement::Update(s) => bind_update(s, catalog),
-        Statement::Delete(s) => bind_delete(s, catalog),
+        Statement::Select(s) => bind_select(s, catalog, &mut scope),
+        Statement::Insert(s) => bind_insert(s, catalog, &mut scope),
+        Statement::Update(s) => bind_update(s, catalog, &mut scope),
+        Statement::Delete(s) => bind_delete(s, catalog, &mut scope),
         Statement::Truncate(s) => bind_truncate(s, catalog),
         Statement::Begin { .. } | Statement::Commit { .. } | Statement::Rollback { .. } => Err(
             PlanError::NotSupported("transaction control statements are not planner targets"),
@@ -102,7 +104,11 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
 /// 5. Bind `ON CONFLICT` (if present). `EXCLUDED` references in DO UPDATE
 ///    assignments are not supported in v0.2.
 /// 6. Bind `RETURNING` expressions against the table schema.
-fn bind_insert(s: &InsertStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+fn bind_insert(
+    s: &InsertStmt,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
     // 1. Catalog lookup.
     let table_name = object_name_simple(&s.table);
     let meta = catalog
@@ -145,9 +151,9 @@ fn bind_insert(s: &InsertStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, Pla
                 schema: empty_schema,
             }
         }
-        InsertSource::Values(rows) => bind_values_rows(rows, expected_arity)?,
+        InsertSource::Values(rows) => bind_values_rows(rows, expected_arity, catalog, scope)?,
         InsertSource::Select(sel) => {
-            let plan = bind_select(sel, catalog)?;
+            let plan = bind_select(sel, catalog, scope)?;
             // Arity check.
             if plan.schema().len() != expected_arity {
                 return Err(PlanError::TypeMismatch(format!(
@@ -163,11 +169,11 @@ fn bind_insert(s: &InsertStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, Pla
     let on_conflict = s
         .on_conflict
         .as_ref()
-        .map(|oc| bind_on_conflict(oc, table_schema))
+        .map(|oc| bind_on_conflict(oc, table_schema, catalog, scope))
         .transpose()?;
 
     // 5. Bind RETURNING.
-    let returning = bind_returning(&s.returning, table_schema)?;
+    let returning = bind_returning(&s.returning, table_schema, catalog, scope)?;
     let returning_schema = build_returning_schema(&returning)?;
 
     Ok(LogicalPlan::Insert {
@@ -184,7 +190,12 @@ fn bind_insert(s: &InsertStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, Pla
 ///
 /// Every row must have exactly `expected_arity` cells; ragged rows are
 /// rejected with [`PlanError::TypeMismatch`].
-fn bind_values_rows(rows: &[Vec<Expr>], expected_arity: usize) -> Result<LogicalPlan, PlanError> {
+fn bind_values_rows(
+    rows: &[Vec<Expr>],
+    expected_arity: usize,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
     // Use an empty schema as the binding context — value cells must be
     // self-contained (literals, parameters, simple expressions). Column
     // references to other tables are not allowed inside a VALUES clause.
@@ -199,8 +210,11 @@ fn bind_values_rows(rows: &[Vec<Expr>], expected_arity: usize) -> Result<Logical
                 row.len()
             )));
         }
-        let bound_cells: Result<Vec<_>, _> = row.iter().map(|e| bind_expr(e, &empty)).collect();
-        bound_rows.push(bound_cells?);
+        let mut bound_cells = Vec::with_capacity(row.len());
+        for e in row {
+            bound_cells.push(bind_expr(e, &empty, catalog, scope)?);
+        }
+        bound_rows.push(bound_cells);
     }
 
     // Infer column types: for each column position, take the numeric_join
@@ -255,6 +269,8 @@ fn bind_values_rows(rows: &[Vec<Expr>], expected_arity: usize) -> Result<Logical
 fn bind_on_conflict(
     oc: &OnConflict,
     table_schema: &Schema,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
 ) -> Result<LogicalOnConflict, PlanError> {
     match oc {
         OnConflict::DoNothing { target, .. } => {
@@ -271,11 +287,11 @@ fn bind_on_conflict(
             ..
         } => {
             let resolved_target = bind_conflict_target(target, table_schema)?;
-            let assignments = bind_assignments(set, table_schema)?;
+            let assignments = bind_assignments(set, table_schema, catalog, scope)?;
             let where_expr = r#where
                 .as_ref()
                 .map(|e| {
-                    let pred = bind_expr(e, table_schema)?;
+                    let pred = bind_expr(e, table_schema, catalog, scope)?;
                     if pred.data_type() != DataType::Bool && pred.data_type() != DataType::Null {
                         return Err(PlanError::TypeMismatch(
                             "ON CONFLICT DO UPDATE WHERE predicate must be boolean".into(),
@@ -320,6 +336,8 @@ fn bind_conflict_target(
 fn bind_assignments(
     set: &[Assignment],
     table_schema: &Schema,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
 ) -> Result<Vec<(usize, ScalarExpr)>, PlanError> {
     let mut out = Vec::with_capacity(set.len());
     let mut seen: std::collections::HashSet<usize> =
@@ -332,7 +350,7 @@ fn bind_assignments(
         if !seen.insert(idx) {
             return Err(PlanError::DuplicateColumn(a.target.value.clone()));
         }
-        let expr = bind_expr(&a.value, table_schema)?;
+        let expr = bind_expr(&a.value, table_schema, catalog, scope)?;
         out.push((idx, expr));
     }
     Ok(out)
@@ -349,7 +367,11 @@ fn bind_assignments(
 ///
 /// `UPDATE … FROM other_table` is not supported in v0.2; a non-empty
 /// `from` list returns [`PlanError::NotSupported`].
-fn bind_update(s: &UpdateStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+fn bind_update(
+    s: &UpdateStmt,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
     // UPDATE … FROM: not supported in v0.2.
     if !s.from.is_empty() {
         return Err(PlanError::NotSupported(
@@ -371,7 +393,7 @@ fn bind_update(s: &UpdateStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, Pla
     };
 
     if let Some(pred_ast) = &s.r#where {
-        let pred = bind_expr(pred_ast, table_schema)?;
+        let pred = bind_expr(pred_ast, table_schema, catalog, scope)?;
         let pred_ty = pred.data_type();
         if pred_ty != DataType::Bool && pred_ty != DataType::Null {
             return Err(PlanError::TypeMismatch(format!(
@@ -385,10 +407,10 @@ fn bind_update(s: &UpdateStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, Pla
     }
 
     // Assignments — value expressions are bound against the table schema.
-    let assignments = bind_assignments(&s.set, table_schema)?;
+    let assignments = bind_assignments(&s.set, table_schema, catalog, scope)?;
 
     // RETURNING.
-    let returning = bind_returning(&s.returning, table_schema)?;
+    let returning = bind_returning(&s.returning, table_schema, catalog, scope)?;
     let returning_schema = build_returning_schema(&returning)?;
 
     Ok(LogicalPlan::Update {
@@ -411,7 +433,11 @@ fn bind_update(s: &UpdateStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, Pla
 ///
 /// `DELETE … USING other_table` is not supported in v0.2; a non-empty
 /// `using` list returns [`PlanError::NotSupported`].
-fn bind_delete(s: &DeleteStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+fn bind_delete(
+    s: &DeleteStmt,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
     // DELETE … USING: not supported in v0.2.
     if !s.using.is_empty() {
         return Err(PlanError::NotSupported(
@@ -433,7 +459,7 @@ fn bind_delete(s: &DeleteStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, Pla
     };
 
     if let Some(pred_ast) = &s.r#where {
-        let pred = bind_expr(pred_ast, table_schema)?;
+        let pred = bind_expr(pred_ast, table_schema, catalog, scope)?;
         let pred_ty = pred.data_type();
         if pred_ty != DataType::Bool && pred_ty != DataType::Null {
             return Err(PlanError::TypeMismatch(format!(
@@ -447,7 +473,7 @@ fn bind_delete(s: &DeleteStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, Pla
     }
 
     // RETURNING.
-    let returning = bind_returning(&s.returning, table_schema)?;
+    let returning = bind_returning(&s.returning, table_schema, catalog, scope)?;
     let returning_schema = build_returning_schema(&returning)?;
 
     Ok(LogicalPlan::Delete {
@@ -507,7 +533,11 @@ struct ScopeEntry {
 /// Handles: CTEs, FROM clause (single tables, explicit joins, subqueries),
 /// wildcard expansion, GROUP BY + aggregates, HAVING, set operations,
 /// ORDER BY, LIMIT / OFFSET.
-fn bind_select(select: &SelectStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+fn bind_select(
+    select: &SelectStmt,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
     if !matches!(select.distinct, Distinct::None | Distinct::All) {
         return Err(PlanError::NotSupported("SELECT DISTINCT"));
     }
@@ -516,7 +546,7 @@ fn bind_select(select: &SelectStmt, catalog: &dyn Catalog) -> Result<LogicalPlan
     let mut cte_catalog: Vec<(String, Schema)> = Vec::new();
     let mut cte_plans: Vec<(String, bool, LogicalPlan)> = Vec::new();
     for cte in &select.ctes {
-        let cte_plan = bind_select_with_ctes(&cte.query, catalog, &cte_catalog)?;
+        let cte_plan = bind_select_with_ctes(&cte.query, catalog, &cte_catalog, scope)?;
         let cte_schema = cte_plan.schema().clone();
         let cte_name = cte.name.value.to_ascii_lowercase();
         // Apply column aliases if provided.
@@ -530,11 +560,11 @@ fn bind_select(select: &SelectStmt, catalog: &dyn Catalog) -> Result<LogicalPlan
     }
 
     // Bind the main query body using the CTE overlay.
-    let mut plan = bind_select_body(select, catalog, &cte_catalog)?;
+    let mut plan = bind_select_body(select, catalog, &cte_catalog, scope)?;
 
     // Fold set-op tails left-to-right.
     for tail in &select.set_ops {
-        let right_plan = bind_select_with_ctes(&tail.right, catalog, &cte_catalog)?;
+        let right_plan = bind_select_with_ctes(&tail.right, catalog, &cte_catalog, scope)?;
         plan = bind_set_op(plan, tail.op, tail.quantifier, right_plan)?;
     }
 
@@ -561,12 +591,13 @@ fn bind_select_with_ctes(
     select: &SelectStmt,
     catalog: &dyn Catalog,
     cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
 ) -> Result<LogicalPlan, PlanError> {
     // First process any nested CTEs, then the body.
     let mut nested_cte_catalog: Vec<(String, Schema)> = cte_catalog.to_vec();
     let mut nested_cte_plans: Vec<(String, bool, LogicalPlan)> = Vec::new();
     for cte in &select.ctes {
-        let cte_plan = bind_select_with_ctes(&cte.query, catalog, &nested_cte_catalog)?;
+        let cte_plan = bind_select_with_ctes(&cte.query, catalog, &nested_cte_catalog, scope)?;
         let cte_schema = cte_plan.schema().clone();
         let cte_name = cte.name.value.to_ascii_lowercase();
         let cte_schema = if cte.column_aliases.is_empty() {
@@ -578,11 +609,11 @@ fn bind_select_with_ctes(
         nested_cte_plans.push((cte_name, cte.recursive, cte_plan));
     }
 
-    let mut plan = bind_select_body(select, catalog, &nested_cte_catalog)?;
+    let mut plan = bind_select_body(select, catalog, &nested_cte_catalog, scope)?;
 
     // Fold set-op tails.
     for tail in &select.set_ops {
-        let right_plan = bind_select_with_ctes(&tail.right, catalog, &nested_cte_catalog)?;
+        let right_plan = bind_select_with_ctes(&tail.right, catalog, &nested_cte_catalog, scope)?;
         plan = bind_set_op(plan, tail.op, tail.quantifier, right_plan)?;
     }
 
@@ -696,10 +727,12 @@ fn bind_set_op(
 ///
 /// Does *not* handle set-op tails or CTE wrapping; that is done by
 /// [`bind_select`] / [`bind_select_with_ctes`].
+#[allow(clippy::too_many_lines)]
 fn bind_select_body(
     select: &SelectStmt,
     catalog: &dyn Catalog,
     cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
 ) -> Result<LogicalPlan, PlanError> {
     if !matches!(select.distinct, Distinct::None | Distinct::All) {
         return Err(PlanError::NotSupported("SELECT DISTINCT"));
@@ -708,13 +741,13 @@ fn bind_select_body(
     // ------------------------------------------------------------------
     // FROM clause → join tree
     // ------------------------------------------------------------------
-    let (mut plan, scope) = bind_from(&select.from, catalog, cte_catalog)?;
+    let (mut plan, from_scope) = bind_from(&select.from, catalog, cte_catalog, scope)?;
 
     // ------------------------------------------------------------------
     // WHERE
     // ------------------------------------------------------------------
     if let Some(pred_ast) = &select.r#where {
-        let pred = bind_expr(pred_ast, plan.schema())?;
+        let pred = bind_expr(pred_ast, plan.schema(), catalog, scope)?;
         let pred_ty = pred.data_type();
         if pred_ty != DataType::Bool && pred_ty != DataType::Null {
             return Err(PlanError::TypeMismatch(format!(
@@ -737,10 +770,10 @@ fn bind_select_body(
     let having_has_agg = select.having.as_ref().is_some_and(expr_has_aggregate);
 
     if has_group_by || has_aggregates || having_has_agg {
-        plan = bind_aggregate(plan, select, &scope)?;
+        plan = bind_aggregate(plan, select, &from_scope, catalog, scope)?;
         // HAVING goes above the aggregate.
         if let Some(having_ast) = &select.having {
-            let pred = bind_expr(having_ast, plan.schema())?;
+            let pred = bind_expr(having_ast, plan.schema(), catalog, scope)?;
             let pred_ty = pred.data_type();
             if pred_ty != DataType::Bool && pred_ty != DataType::Null {
                 return Err(PlanError::TypeMismatch(format!(
@@ -753,7 +786,7 @@ fn bind_select_body(
             };
         }
         // Projection after aggregation binds against aggregate output schema.
-        let projected = bind_projection_agg(&select.projection, plan.schema())?;
+        let projected = bind_projection_agg(&select.projection, plan.schema(), catalog, scope)?;
         let proj_fields: Vec<Field> = projected
             .iter()
             .map(|(e, name)| Field::nullable(name, e.data_type()))
@@ -761,7 +794,7 @@ fn bind_select_body(
         let proj_schema = Schema::new(proj_fields)
             .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
 
-        let sort_keys = bind_order_by(&select.order_by, plan.schema())?;
+        let sort_keys = bind_order_by(&select.order_by, plan.schema(), catalog, scope)?;
         if !sort_keys.is_empty() {
             plan = LogicalPlan::Sort {
                 input: Box::new(plan),
@@ -778,7 +811,13 @@ fn bind_select_body(
         // ------------------------------------------------------------------
         // Non-aggregate path: SELECT list → ORDER BY → projection
         // ------------------------------------------------------------------
-        let projected = bind_projection_with_scope(&select.projection, plan.schema(), &scope)?;
+        let projected = bind_projection_with_scope(
+            &select.projection,
+            plan.schema(),
+            &from_scope,
+            catalog,
+            scope,
+        )?;
         let proj_fields: Vec<Field> = projected
             .iter()
             .map(|(e, name)| Field::nullable(name, e.data_type()))
@@ -786,7 +825,7 @@ fn bind_select_body(
         let proj_schema = Schema::new(proj_fields)
             .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
 
-        let sort_keys = bind_order_by(&select.order_by, plan.schema())?;
+        let sort_keys = bind_order_by(&select.order_by, plan.schema(), catalog, scope)?;
         if !sort_keys.is_empty() {
             plan = LogicalPlan::Sort {
                 input: Box::new(plan),
@@ -843,6 +882,7 @@ fn bind_from(
     from_items: &[TableRef],
     catalog: &dyn Catalog,
     cte_catalog: &[(String, Schema)],
+    outer_scope: &mut ScopeStack,
 ) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
     if from_items.is_empty() {
         return Ok((
@@ -856,14 +896,14 @@ fn bind_from(
     // Fold left-to-right.
     let mut iter = from_items.iter();
     let first = iter.next().expect("at least one item checked above");
-    let (mut plan, mut scope) = bind_table_ref(first, catalog, cte_catalog)?;
+    let (mut plan, mut from_scope) = bind_table_ref(first, catalog, cte_catalog, outer_scope)?;
 
     for item in iter {
-        let (right_plan, right_scope) = bind_table_ref(item, catalog, cte_catalog)?;
+        let (right_plan, right_scope) = bind_table_ref(item, catalog, cte_catalog, outer_scope)?;
         // Comma-join: CROSS JOIN.
-        let offset = scope.len();
+        let offset = from_scope.len();
         let join_schema = concat_schemas_cross(plan.schema(), right_plan.schema())?;
-        let merged_scope = merge_scopes(scope, right_scope, offset);
+        let merged_scope = merge_scopes(from_scope, right_scope, offset);
         plan = LogicalPlan::Join {
             left: Box::new(plan),
             right: Box::new(right_plan),
@@ -871,10 +911,10 @@ fn bind_from(
             condition: LogicalJoinCondition::None,
             schema: join_schema,
         };
-        scope = merged_scope;
+        from_scope = merged_scope;
     }
 
-    Ok((plan, scope))
+    Ok((plan, from_scope))
 }
 
 /// Bind a single [`TableRef`] AST node into `(LogicalPlan, scope)`.
@@ -882,6 +922,7 @@ fn bind_table_ref(
     table_ref: &TableRef,
     catalog: &dyn Catalog,
     cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
 ) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
     match table_ref {
         TableRef::Named { name, alias, .. } => {
@@ -907,7 +948,7 @@ fn bind_table_ref(
                 meta.schema
             };
 
-            let scope: Vec<ScopeEntry> = schema
+            let from_scope: Vec<ScopeEntry> = schema
                 .fields()
                 .iter()
                 .enumerate()
@@ -922,7 +963,7 @@ fn bind_table_ref(
                 schema,
                 projection: None,
             };
-            Ok((plan, scope))
+            Ok((plan, from_scope))
         }
         TableRef::Subquery {
             select,
@@ -930,7 +971,7 @@ fn bind_table_ref(
             column_aliases,
             ..
         } => {
-            let inner_plan = bind_select_with_ctes(select, catalog, cte_catalog)?;
+            let inner_plan = bind_select_with_ctes(select, catalog, cte_catalog, scope)?;
             let inner_schema = inner_plan.schema().clone();
             // Apply column aliases if provided.
             let inner_schema = if column_aliases.is_empty() {
@@ -939,7 +980,7 @@ fn bind_table_ref(
                 apply_column_aliases(&inner_schema, column_aliases)?
             };
             let qualifier = alias.value.clone();
-            let scope: Vec<ScopeEntry> = inner_schema
+            let from_scope: Vec<ScopeEntry> = inner_schema
                 .fields()
                 .iter()
                 .enumerate()
@@ -953,7 +994,7 @@ fn bind_table_ref(
             // SubqueryScan variant yet, we use the plan directly and construct
             // a new scan-like wrapper by re-projecting to apply the alias schema.
             let plan = rebuild_subquery_plan(inner_plan, &inner_schema, &qualifier)?;
-            Ok((plan, scope))
+            Ok((plan, from_scope))
         }
         TableRef::Join {
             left,
@@ -961,7 +1002,7 @@ fn bind_table_ref(
             right,
             condition,
             ..
-        } => bind_explicit_join(left, *op, right, condition, catalog, cte_catalog),
+        } => bind_explicit_join(left, *op, right, condition, catalog, cte_catalog, scope),
     }
 }
 
@@ -1009,9 +1050,10 @@ fn bind_explicit_join(
     condition: &JoinCondition,
     catalog: &dyn Catalog,
     cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
 ) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
-    let (left_plan, left_scope) = bind_table_ref(left_ref, catalog, cte_catalog)?;
-    let (right_plan, right_scope) = bind_table_ref(right_ref, catalog, cte_catalog)?;
+    let (left_plan, left_scope) = bind_table_ref(left_ref, catalog, cte_catalog, scope)?;
+    let (right_plan, right_scope) = bind_table_ref(right_ref, catalog, cte_catalog, scope)?;
 
     let join_type = match op {
         JoinOp::Inner => LogicalJoinType::Inner,
@@ -1025,7 +1067,7 @@ fn bind_explicit_join(
         JoinCondition::None => {
             let join_schema = concat_schemas_cross(left_plan.schema(), right_plan.schema())?;
             let left_len = left_scope.len();
-            let scope = merge_scopes(left_scope, right_scope, left_len);
+            let out_scope = merge_scopes(left_scope, right_scope, left_len);
             Ok((
                 LogicalPlan::Join {
                     left: Box::new(left_plan),
@@ -1034,14 +1076,14 @@ fn bind_explicit_join(
                     condition: LogicalJoinCondition::None,
                     schema: join_schema,
                 },
-                scope,
+                out_scope,
             ))
         }
         JoinCondition::On(pred_ast) => {
             // Build the concatenated schema to bind the ON predicate against.
             let concat_schema =
                 concat_schemas_for_join(left_plan.schema(), right_plan.schema(), join_type)?;
-            let pred = bind_expr(pred_ast, &concat_schema)?;
+            let pred = bind_expr(pred_ast, &concat_schema, catalog, scope)?;
             if pred.data_type() != DataType::Bool && pred.data_type() != DataType::Null {
                 return Err(PlanError::TypeMismatch(format!(
                     "JOIN ON predicate must be boolean, got {}",
@@ -1049,7 +1091,7 @@ fn bind_explicit_join(
                 )));
             }
             let left_len = left_scope.len();
-            let scope = merge_scopes(left_scope, right_scope, left_len);
+            let out_scope = merge_scopes(left_scope, right_scope, left_len);
             Ok((
                 LogicalPlan::Join {
                     left: Box::new(left_plan),
@@ -1058,7 +1100,7 @@ fn bind_explicit_join(
                     condition: LogicalJoinCondition::On(pred),
                     schema: concat_schema,
                 },
-                scope,
+                out_scope,
             ))
         }
         JoinCondition::Using(cols) => {
@@ -1066,7 +1108,7 @@ fn bind_explicit_join(
             let schema =
                 build_using_schema(left_plan.schema(), right_plan.schema(), &pairs, join_type)?;
             let left_len = left_scope.len();
-            let scope = merge_scopes(left_scope, right_scope, left_len);
+            let out_scope = merge_scopes(left_scope, right_scope, left_len);
             Ok((
                 LogicalPlan::Join {
                     left: Box::new(left_plan),
@@ -1075,7 +1117,7 @@ fn bind_explicit_join(
                     condition: LogicalJoinCondition::Using(pairs),
                     schema,
                 },
-                scope,
+                out_scope,
             ))
         }
     }
@@ -1346,28 +1388,35 @@ fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> DataType {
 fn bind_aggregate(
     input: LogicalPlan,
     select: &SelectStmt,
-    _scope: &[ScopeEntry],
+    _from_scope: &[ScopeEntry],
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
 ) -> Result<LogicalPlan, PlanError> {
     let input_schema = input.schema().clone();
 
     // Bind GROUP BY expressions against the input schema.
-    let group_by: Result<Vec<ScalarExpr>, PlanError> = select
-        .group_by
-        .iter()
-        .map(|e| bind_expr(e, &input_schema))
-        .collect();
-    let group_by = group_by?;
+    let mut group_by: Vec<ScalarExpr> = Vec::with_capacity(select.group_by.len());
+    for e in &select.group_by {
+        group_by.push(bind_expr(e, &input_schema, catalog, scope)?);
+    }
 
     // Collect aggregate calls from the SELECT projection and (if present)
     // from HAVING.
     let mut aggregates: Vec<LogicalAggregateExpr> = Vec::new();
     for item in &select.projection {
         if let SelectItem::Expr { expr, alias, .. } = item {
-            collect_aggregates(expr, alias.as_ref(), &input_schema, &mut aggregates)?;
+            collect_aggregates(
+                expr,
+                alias.as_ref(),
+                &input_schema,
+                &mut aggregates,
+                catalog,
+                scope,
+            )?;
         }
     }
     if let Some(having) = &select.having {
-        collect_aggregates(having, None, &input_schema, &mut aggregates)?;
+        collect_aggregates(having, None, &input_schema, &mut aggregates, catalog, scope)?;
     }
 
     // Build the output schema.
@@ -1419,6 +1468,8 @@ fn collect_aggregates(
     alias: Option<&ultrasql_parser::ast::Identifier>,
     input_schema: &Schema,
     out: &mut Vec<LogicalAggregateExpr>,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
 ) -> Result<(), PlanError> {
     match expr {
         Expr::Call {
@@ -1443,7 +1494,7 @@ fn collect_aggregates(
                 let (arg_expr, arg_ty) = if args_empty_or_star {
                     (None, DataType::Null)
                 } else {
-                    let bound = bind_expr(&args[0], input_schema)?;
+                    let bound = bind_expr(&args[0], input_schema, catalog, scope)?;
                     let ty = bound.data_type();
                     (Some(bound), ty)
                 };
@@ -1474,11 +1525,11 @@ fn collect_aggregates(
             }
         }
         Expr::Paren { expr: inner, .. } | Expr::Unary { expr: inner, .. } => {
-            collect_aggregates(inner, alias, input_schema, out)
+            collect_aggregates(inner, alias, input_schema, out, catalog, scope)
         }
         Expr::Binary { left, right, .. } => {
-            collect_aggregates(left, None, input_schema, out)?;
-            collect_aggregates(right, None, input_schema, out)
+            collect_aggregates(left, None, input_schema, out, catalog, scope)?;
+            collect_aggregates(right, None, input_schema, out, catalog, scope)
         }
         // Non-aggregate expressions are fine in GROUP BY columns.
         _ => Ok(()),
@@ -1497,6 +1548,8 @@ fn derive_agg_output_name(func_name: &str, _args: &[Expr]) -> String {
 fn bind_projection_agg(
     items: &[SelectItem],
     agg_schema: &Schema,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
 ) -> Result<Vec<(ScalarExpr, String)>, PlanError> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -1517,7 +1570,7 @@ fn bind_projection_agg(
             SelectItem::Expr { expr, alias, .. } => {
                 // If this is an aggregate call, replace with a column ref into
                 // the aggregate schema.
-                let bound = bind_expr_or_agg_ref(expr, agg_schema)?;
+                let bound = bind_expr_or_agg_ref(expr, agg_schema, catalog, scope)?;
                 let name = alias
                     .as_ref()
                     .map_or_else(|| derive_output_name(expr, &bound), |a| a.value.clone());
@@ -1530,7 +1583,12 @@ fn bind_projection_agg(
 
 /// Bind an expression, replacing aggregate calls with column references
 /// into the post-aggregate schema.
-fn bind_expr_or_agg_ref(expr: &Expr, agg_schema: &Schema) -> Result<ScalarExpr, PlanError> {
+fn bind_expr_or_agg_ref(
+    expr: &Expr,
+    agg_schema: &Schema,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
     match expr {
         Expr::Call { name, args, .. } => {
             let func_name = name
@@ -1551,9 +1609,9 @@ fn bind_expr_or_agg_ref(expr: &Expr, agg_schema: &Schema) -> Result<ScalarExpr, 
             }
             // Not an aggregate or not found by derived name: fall through to
             // regular expression binding against the post-aggregate schema.
-            bind_expr(expr, agg_schema)
+            bind_expr(expr, agg_schema, catalog, scope)
         }
-        _ => bind_expr(expr, agg_schema),
+        _ => bind_expr(expr, agg_schema, catalog, scope),
     }
 }
 
@@ -1565,14 +1623,16 @@ fn bind_expr_or_agg_ref(expr: &Expr, agg_schema: &Schema) -> Result<ScalarExpr, 
 fn bind_projection_with_scope(
     items: &[SelectItem],
     input: &Schema,
-    scope: &[ScopeEntry],
+    from_scope: &[ScopeEntry],
+    catalog: &dyn Catalog,
+    outer_scope: &mut ScopeStack,
 ) -> Result<Vec<(ScalarExpr, String)>, PlanError> {
     let mut out = Vec::new();
     for item in items {
         match item {
             SelectItem::Wildcard { .. } => {
                 // Expand to all columns in the FROM scope.
-                if scope.is_empty() {
+                if from_scope.is_empty() {
                     // No FROM: expand from the input schema directly.
                     for (i, f) in input.fields().iter().enumerate() {
                         out.push((
@@ -1585,7 +1645,7 @@ fn bind_projection_with_scope(
                         ));
                     }
                 } else {
-                    for entry in scope {
+                    for entry in from_scope {
                         out.push((
                             ScalarExpr::Column {
                                 name: entry.field.name.clone(),
@@ -1599,7 +1659,7 @@ fn bind_projection_with_scope(
             }
             SelectItem::QualifiedWildcard { qualifier, .. } => {
                 let q = &qualifier.value;
-                let matching: Vec<_> = scope
+                let matching: Vec<_> = from_scope
                     .iter()
                     .filter(|e| e.qualifier.eq_ignore_ascii_case(q))
                     .collect();
@@ -1618,7 +1678,7 @@ fn bind_projection_with_scope(
                 }
             }
             SelectItem::Expr { expr, alias, .. } => {
-                let bound = bind_expr(expr, input)?;
+                let bound = bind_expr(expr, input, catalog, outer_scope)?;
                 let name = alias
                     .as_ref()
                     .map_or_else(|| derive_output_name(expr, &bound), |a| a.value.clone());
@@ -1645,10 +1705,12 @@ fn build_returning_schema(returning: &[(ScalarExpr, String)]) -> Result<Schema, 
     Schema::new(fields).map_err(|e| PlanError::TypeMismatch(format!("RETURNING schema: {e}")))
 }
 
-/// Bind a `RETURNING` projection list against `scope`.
+/// Bind a `RETURNING` projection list against `table_schema`.
 fn bind_returning(
     items: &[SelectItem],
-    scope: &Schema,
+    table_schema: &Schema,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
 ) -> Result<Vec<(ScalarExpr, String)>, PlanError> {
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -1657,7 +1719,7 @@ fn bind_returning(
                 return Err(PlanError::NotSupported("wildcard in RETURNING clause"));
             }
             SelectItem::Expr { expr, alias, .. } => {
-                let bound = bind_expr(expr, scope)?;
+                let bound = bind_expr(expr, table_schema, catalog, scope)?;
                 let name = alias
                     .as_ref()
                     .map_or_else(|| derive_output_name(expr, &bound), |a| a.value.clone());
@@ -1691,10 +1753,15 @@ fn derive_output_name(ast: &Expr, bound: &ScalarExpr) -> String {
     }
 }
 
-fn bind_order_by(items: &[OrderItem], input: &Schema) -> Result<Vec<SortKey>, PlanError> {
+fn bind_order_by(
+    items: &[OrderItem],
+    input: &Schema,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<Vec<SortKey>, PlanError> {
     let mut keys = Vec::with_capacity(items.len());
     for item in items {
-        let expr = bind_expr(&item.expr, input)?;
+        let expr = bind_expr(&item.expr, input, catalog, scope)?;
         let asc = matches!(item.direction, SortDirection::Asc);
         let nulls_first = match item.nulls {
             NullsOrder::First => true,
@@ -1725,23 +1792,130 @@ fn bind_unsigned_literal(expr: &Expr, label: &'static str) -> Result<u64, PlanEr
     }
 }
 
-fn bind_expr(expr: &Expr, input: &Schema) -> Result<ScalarExpr, PlanError> {
+/// Walk a bound logical plan and return `true` if any expression node
+/// anywhere in the tree is a [`crate::expr::ScalarExpr::OuterColumn`].
+///
+/// Used after binding a subquery's inner plan to decide whether to mark
+/// the enclosing [`crate::expr::ScalarExpr::ScalarSubquery`],
+/// [`crate::expr::ScalarExpr::Exists`], or
+/// [`crate::expr::ScalarExpr::InSubquery`] as correlated.
+fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan { .. } | LogicalPlan::Empty { .. } | LogicalPlan::Truncate { .. } => {
+            false
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            expr_contains_outer(predicate) || plan_contains_outer_column(input)
+        }
+        LogicalPlan::Project { input, exprs, .. } => {
+            exprs.iter().any(|(e, _)| expr_contains_outer(e)) || plan_contains_outer_column(input)
+        }
+        LogicalPlan::Sort { input, keys } => {
+            keys.iter().any(|k| expr_contains_outer(&k.expr)) || plan_contains_outer_column(input)
+        }
+        LogicalPlan::Limit { input, .. } => plan_contains_outer_column(input),
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+            ..
+        } => {
+            group_by.iter().any(expr_contains_outer)
+                || aggregates
+                    .iter()
+                    .any(|a| a.arg.as_ref().is_some_and(expr_contains_outer))
+                || plan_contains_outer_column(input)
+        }
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            plan_contains_outer_column(left) || plan_contains_outer_column(right)
+        }
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => plan_contains_outer_column(definition) || plan_contains_outer_column(body),
+        LogicalPlan::Values { rows, .. } => {
+            rows.iter().flat_map(|r| r.iter()).any(expr_contains_outer)
+        }
+        LogicalPlan::Insert {
+            source,
+            on_conflict,
+            returning,
+            ..
+        } => {
+            plan_contains_outer_column(source)
+                || on_conflict.as_ref().is_some_and(|oc| match oc {
+                    LogicalOnConflict::DoNothing { .. } => false,
+                    LogicalOnConflict::DoUpdate {
+                        assignments,
+                        r#where,
+                        ..
+                    } => {
+                        assignments.iter().any(|(_, e)| expr_contains_outer(e))
+                            || r#where.as_ref().is_some_and(expr_contains_outer)
+                    }
+                })
+                || returning.iter().any(|(e, _)| expr_contains_outer(e))
+        }
+        LogicalPlan::Update {
+            assignments,
+            input,
+            returning,
+            ..
+        } => {
+            assignments.iter().any(|(_, e)| expr_contains_outer(e))
+                || plan_contains_outer_column(input)
+                || returning.iter().any(|(e, _)| expr_contains_outer(e))
+        }
+        LogicalPlan::Delete {
+            input, returning, ..
+        } => {
+            plan_contains_outer_column(input)
+                || returning.iter().any(|(e, _)| expr_contains_outer(e))
+        }
+    }
+}
+
+/// Return `true` if a [`ScalarExpr`] contains any
+/// [`crate::expr::ScalarExpr::OuterColumn`] node.
+fn expr_contains_outer(expr: &crate::expr::ScalarExpr) -> bool {
+    expr.contains_outer_column()
+}
+
+/// Bind a scalar expression into a typed [`ScalarExpr`].
+///
+/// - `input` is the schema of the operator whose output this expression
+///   is evaluated against (e.g. the FROM schema for a WHERE predicate).
+/// - `catalog` is the full catalog, needed to bind table references inside
+///   subquery expressions.
+/// - `scope` is the outer-scope stack used to resolve correlated column
+///   references when `bind_expr` is called while already inside a subquery.
+///
+/// # Errors
+///
+/// Returns [`PlanError`] on type mismatches, unknown identifiers, or
+/// unsupported expression forms.
+#[allow(clippy::too_many_lines)]
+fn bind_expr(
+    expr: &Expr,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
     match expr {
         Expr::Literal(lit) => Ok(bind_literal(lit)),
-        Expr::Column { name } => bind_column(name, input),
+        Expr::Column { name } => bind_column(name, input, scope),
         Expr::Parameter { index, .. } => Ok(ScalarExpr::Parameter {
             index: *index,
             data_type: DataType::Null,
         }),
-        Expr::Paren { expr, .. } => bind_expr(expr, input),
+        Expr::Paren { expr, .. } => bind_expr(expr, input, catalog, scope),
         Expr::Unary {
             op, expr: inner, ..
-        } => bind_unary(*op, inner, input),
+        } => bind_unary(*op, inner, input, catalog, scope),
         Expr::Binary {
             op, left, right, ..
-        } => bind_binary(*op, left, right, input),
+        } => bind_binary(*op, left, right, input, catalog, scope),
         Expr::IsNull { expr, negated, .. } => Ok(ScalarExpr::IsNull {
-            expr: Box::new(bind_expr(expr, input)?),
+            expr: Box::new(bind_expr(expr, input, catalog, scope)?),
             negated: *negated,
         }),
         Expr::Call { name, args, .. } => {
@@ -1778,6 +1952,150 @@ fn bind_expr(expr: &Expr, input: &Schema) -> Result<ScalarExpr, PlanError> {
             }
         }
         Expr::Cast { .. } => Err(PlanError::NotSupported("CAST expressions")),
+
+        // ------------------------------------------------------------------
+        // Subquery variants
+        // ------------------------------------------------------------------
+
+        // Scalar subquery: `(SELECT col FROM …)`.
+        //
+        // The inner plan must project exactly one column; otherwise the
+        // binder returns [`PlanError::TypeMismatch`].
+        //
+        // Push `input` as an outer scope frame so that correlated column
+        // references inside the inner SELECT resolve to the outer query's
+        // columns at `frame_depth = 1`.
+        Expr::Subquery {
+            select: inner_select,
+            ..
+        } => {
+            scope.push(ScopeFrame {
+                schema: input.clone(),
+                qualifier: None,
+            });
+            let inner_result = bind_select_with_ctes(inner_select, catalog, &[], scope);
+            scope.pop();
+            let inner_plan = inner_result?;
+            if inner_plan.schema().len() != 1 {
+                return Err(PlanError::TypeMismatch(format!(
+                    "scalar subquery must return exactly 1 column, got {}",
+                    inner_plan.schema().len()
+                )));
+            }
+            let data_type = inner_plan.schema().field_at(0).data_type.clone();
+            let correlated = plan_contains_outer_column(&inner_plan);
+            Ok(ScalarExpr::ScalarSubquery {
+                subplan: Box::new(inner_plan),
+                correlated,
+                data_type,
+            })
+        }
+
+        // `[NOT] EXISTS (SELECT …)`.
+        Expr::Exists {
+            select: inner_select,
+            negated,
+            ..
+        } => {
+            scope.push(ScopeFrame {
+                schema: input.clone(),
+                qualifier: None,
+            });
+            let inner_result = bind_select_with_ctes(inner_select, catalog, &[], scope);
+            scope.pop();
+            let inner_plan = inner_result?;
+            let correlated = plan_contains_outer_column(&inner_plan);
+            Ok(ScalarExpr::Exists {
+                subplan: Box::new(inner_plan),
+                negated: *negated,
+                correlated,
+            })
+        }
+
+        // `expr [NOT] IN (SELECT single_col …)`.
+        Expr::InSubquery {
+            expr: lhs_ast,
+            select: inner_select,
+            negated,
+            ..
+        } => {
+            let lhs = bind_expr(lhs_ast, input, catalog, scope)?;
+            scope.push(ScopeFrame {
+                schema: input.clone(),
+                qualifier: None,
+            });
+            let inner_result = bind_select_with_ctes(inner_select, catalog, &[], scope);
+            scope.pop();
+            let inner_plan = inner_result?;
+            if inner_plan.schema().len() != 1 {
+                return Err(PlanError::TypeMismatch(format!(
+                    "IN subquery must return exactly 1 column, got {}",
+                    inner_plan.schema().len()
+                )));
+            }
+            let inner_type = inner_plan.schema().field_at(0).data_type.clone();
+            if !comparable(&lhs.data_type(), &inner_type) {
+                return Err(PlanError::TypeMismatch(format!(
+                    "IN subquery: left type {} is not comparable to subquery column type {}",
+                    lhs.data_type(),
+                    inner_type,
+                )));
+            }
+            let correlated = plan_contains_outer_column(&inner_plan);
+            Ok(ScalarExpr::InSubquery {
+                expr: Box::new(lhs),
+                subplan: Box::new(inner_plan),
+                negated: *negated,
+                correlated,
+                data_type: inner_type,
+            })
+        }
+
+        // `expr = ANY (SELECT …)` — lowered to `InSubquery` with negated=false.
+        //
+        // Only `=` is supported; any other operator returns
+        // [`PlanError::NotSupported`].
+        Expr::Any {
+            expr: lhs_ast,
+            op,
+            select: inner_select,
+            ..
+        } => {
+            if *op != BinaryOp::Eq {
+                return Err(PlanError::NotSupported(
+                    "ANY with non-equality operator (only `= ANY` is supported)",
+                ));
+            }
+            let lhs = bind_expr(lhs_ast, input, catalog, scope)?;
+            scope.push(ScopeFrame {
+                schema: input.clone(),
+                qualifier: None,
+            });
+            let inner_result = bind_select_with_ctes(inner_select, catalog, &[], scope);
+            scope.pop();
+            let inner_plan = inner_result?;
+            if inner_plan.schema().len() != 1 {
+                return Err(PlanError::TypeMismatch(format!(
+                    "= ANY subquery must return exactly 1 column, got {}",
+                    inner_plan.schema().len()
+                )));
+            }
+            let inner_type = inner_plan.schema().field_at(0).data_type.clone();
+            let correlated = plan_contains_outer_column(&inner_plan);
+            Ok(ScalarExpr::InSubquery {
+                expr: Box::new(lhs),
+                subplan: Box::new(inner_plan),
+                negated: false,
+                correlated,
+                data_type: inner_type,
+            })
+        }
+
+        // `ALL (SELECT …)` — not supported at this layer.
+        Expr::All { .. } => Err(PlanError::NotSupported(
+            "ALL subquery expressions are not supported",
+        )),
+
         _ => Err(PlanError::NotSupported("expression variant")),
     }
 }
@@ -1841,6 +2159,7 @@ fn parse_integer_literal(text: &str) -> (Value, DataType) {
 fn bind_column(
     name: &ultrasql_parser::ast::ObjectName,
     input: &Schema,
+    scope: &ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
     let col_name = name
         .parts
@@ -1855,6 +2174,16 @@ fn bind_column(
         .enumerate()
         .filter(|(_, f)| f.name.eq_ignore_ascii_case(&col_name));
     let Some((index, field)) = hits.next() else {
+        // Column not found in the inner scope — try outer scopes.  This
+        // produces an OuterColumn when we are inside a subquery.
+        if let Some(outer_ref) = scope.resolve(&col_name) {
+            return Ok(ScalarExpr::OuterColumn {
+                name: col_name,
+                frame_depth: outer_ref.frame_depth,
+                column_index: outer_ref.column_index,
+                data_type: outer_ref.data_type,
+            });
+        }
         return Err(PlanError::ColumnNotFound(col_name));
     };
     if hits.next().is_some() {
@@ -1867,8 +2196,14 @@ fn bind_column(
     })
 }
 
-fn bind_unary(op: UnaryOp, inner: &Expr, input: &Schema) -> Result<ScalarExpr, PlanError> {
-    let bound = bind_expr(inner, input)?;
+fn bind_unary(
+    op: UnaryOp,
+    inner: &Expr,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let bound = bind_expr(inner, input, catalog, scope)?;
     let inner_ty = bound.data_type();
     let data_type = match op {
         UnaryOp::Neg | UnaryOp::Pos => {
@@ -1915,9 +2250,11 @@ fn bind_binary(
     left: &Expr,
     right: &Expr,
     input: &Schema,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
-    let l = bind_expr(left, input)?;
-    let r = bind_expr(right, input)?;
+    let l = bind_expr(left, input, catalog, scope)?;
+    let r = bind_expr(right, input, catalog, scope)?;
     let data_type = binary_result_type(op, l.data_type(), r.data_type())?;
     Ok(ScalarExpr::Binary {
         op,
@@ -2885,6 +3222,273 @@ mod tests {
     // -----------------------------------------------------------------------
     // Property test
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Subquery tests
+    // -----------------------------------------------------------------------
+
+    /// A two-table catalog: `users (id INT, name TEXT, score FLOAT8)`
+    /// and `orders (oid INT, user_id INT)`.
+    fn subquery_catalog() -> InMemoryCatalog {
+        let users_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("name", DataType::Text { max_len: None }),
+            Field::nullable("score", DataType::Float64),
+        ])
+        .expect("schema ok");
+        let orders_schema = Schema::new([
+            Field::required("oid", DataType::Int32),
+            Field::required("user_id", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let mut cat = InMemoryCatalog::new();
+        cat.register("users", TableMeta::new(users_schema));
+        cat.register("orders", TableMeta::new(orders_schema));
+        cat
+    }
+
+    #[test]
+    fn binds_uncorrelated_exists_subquery() {
+        // `EXISTS (SELECT oid FROM orders)` has no outer column references.
+        let cat = subquery_catalog();
+        let plan = parse_and_bind(
+            "SELECT id FROM users WHERE EXISTS (SELECT oid FROM orders)",
+            &cat,
+        )
+        .expect("bind ok");
+        // Walk to the Filter and check its predicate.
+        fn find_filter(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Filter { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Limit { input, .. }
+                | LogicalPlan::Sort { input, .. } => find_filter(input),
+                _ => None,
+            }
+        }
+        let filter = find_filter(&plan).expect("should have Filter");
+        let LogicalPlan::Filter { predicate, .. } = filter else {
+            panic!("expected Filter");
+        };
+        let ScalarExpr::Exists {
+            negated,
+            correlated,
+            ..
+        } = predicate
+        else {
+            panic!("expected Exists predicate, got {predicate:?}");
+        };
+        assert!(!negated, "should not be negated");
+        assert!(!correlated, "no outer column reference → uncorrelated");
+    }
+
+    #[test]
+    fn binds_correlated_exists_subquery() {
+        // `EXISTS (SELECT oid FROM orders WHERE user_id = id)` — `id` is not in
+        // `orders`, so it resolves to the outer `users.id`.
+        let cat = subquery_catalog();
+        let plan = parse_and_bind(
+            "SELECT id FROM users WHERE EXISTS (SELECT oid FROM orders WHERE user_id = id)",
+            &cat,
+        )
+        .expect("bind ok");
+        fn find_filter(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Filter { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Limit { input, .. }
+                | LogicalPlan::Sort { input, .. } => find_filter(input),
+                _ => None,
+            }
+        }
+        let filter = find_filter(&plan).expect("should have Filter");
+        let LogicalPlan::Filter { predicate, .. } = filter else {
+            panic!("expected Filter");
+        };
+        let ScalarExpr::Exists { correlated, .. } = predicate else {
+            panic!("expected Exists, got {predicate:?}");
+        };
+        assert!(correlated, "id resolves to outer users.id → correlated");
+    }
+
+    #[test]
+    fn binds_in_subquery_arity_1_check_rejects_multi_column() {
+        // `id IN (SELECT oid, user_id FROM orders)` — 2-column subquery must fail.
+        let cat = subquery_catalog();
+        let err = parse_and_bind(
+            "SELECT id FROM users WHERE id IN (SELECT oid, user_id FROM orders)",
+            &cat,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PlanError::TypeMismatch(_)),
+            "multi-column IN subquery should be TypeMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn binds_scalar_subquery_returns_scalar_subquery_expr() {
+        // `(SELECT oid FROM orders LIMIT 1)` used as a scalar in the projection.
+        let cat = subquery_catalog();
+        let plan = parse_and_bind(
+            "SELECT id, (SELECT oid FROM orders LIMIT 1) FROM users",
+            &cat,
+        )
+        .expect("bind ok");
+        let LogicalPlan::Project { exprs, .. } = &plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        // Second expression should be a ScalarSubquery.
+        let (second_expr, _) = &exprs[1];
+        assert!(
+            matches!(
+                second_expr,
+                ScalarExpr::ScalarSubquery {
+                    correlated: false,
+                    ..
+                }
+            ),
+            "expected uncorrelated ScalarSubquery, got {second_expr:?}"
+        );
+    }
+
+    #[test]
+    fn binds_not_in_subquery() {
+        let cat = subquery_catalog();
+        let plan = parse_and_bind(
+            "SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM orders)",
+            &cat,
+        )
+        .expect("bind ok");
+        fn find_filter(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Filter { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Limit { input, .. }
+                | LogicalPlan::Sort { input, .. } => find_filter(input),
+                _ => None,
+            }
+        }
+        let filter = find_filter(&plan).expect("should have Filter");
+        let LogicalPlan::Filter { predicate, .. } = filter else {
+            panic!("expected Filter");
+        };
+        let ScalarExpr::InSubquery { negated, .. } = predicate else {
+            panic!("expected InSubquery, got {predicate:?}");
+        };
+        assert!(negated, "NOT IN should produce negated=true");
+    }
+
+    #[test]
+    fn binds_any_eq_lowers_to_exists() {
+        // `id = ANY (SELECT user_id FROM orders)` should bind as InSubquery with
+        // negated=false (the same representation as `id IN (…)`).
+        let cat = subquery_catalog();
+        let plan = parse_and_bind(
+            "SELECT id FROM users WHERE id = ANY (SELECT user_id FROM orders)",
+            &cat,
+        )
+        .expect("bind ok");
+        fn find_filter(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Filter { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Limit { input, .. }
+                | LogicalPlan::Sort { input, .. } => find_filter(input),
+                _ => None,
+            }
+        }
+        let filter = find_filter(&plan).expect("should have Filter");
+        let LogicalPlan::Filter { predicate, .. } = filter else {
+            panic!("expected Filter");
+        };
+        assert!(
+            matches!(predicate, ScalarExpr::InSubquery { negated: false, .. }),
+            "= ANY should lower to InSubquery(negated=false), got {predicate:?}"
+        );
+    }
+
+    #[test]
+    fn binds_any_with_lt_returns_not_supported() {
+        let cat = subquery_catalog();
+        let err = parse_and_bind(
+            "SELECT id FROM users WHERE id < ANY (SELECT user_id FROM orders)",
+            &cat,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PlanError::NotSupported(_)),
+            "< ANY should be NotSupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn binder_rejects_scalar_subquery_with_multi_column_projection() {
+        let cat = subquery_catalog();
+        let err = parse_and_bind(
+            "SELECT id, (SELECT oid, user_id FROM orders LIMIT 1) FROM users",
+            &cat,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PlanError::TypeMismatch(_)),
+            "multi-column scalar subquery should be TypeMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn outer_column_correctly_tracks_frame_depth_in_nested_subquery() {
+        // Outer query scans `users`.  The subquery scans `orders`.  Inside the
+        // subquery's WHERE, `id` is not in `orders` so it should resolve as
+        // `OuterColumn { frame_depth: 1, … }`.
+        let cat = subquery_catalog();
+        let plan = parse_and_bind(
+            "SELECT id FROM users WHERE EXISTS (SELECT oid FROM orders WHERE user_id = id)",
+            &cat,
+        )
+        .expect("bind ok");
+        // Navigate to the Exists predicate's inner plan.
+        fn find_exists_pred(plan: &LogicalPlan) -> Option<&ScalarExpr> {
+            match plan {
+                LogicalPlan::Filter { predicate, .. } => {
+                    if matches!(predicate, ScalarExpr::Exists { .. }) {
+                        Some(predicate)
+                    } else {
+                        None
+                    }
+                }
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_exists_pred(input),
+                _ => None,
+            }
+        }
+        let pred = find_exists_pred(&plan).expect("should find Exists predicate");
+        let ScalarExpr::Exists { subplan, .. } = pred else {
+            panic!("expected Exists");
+        };
+        // The inner plan should have a Filter with an outer-column reference.
+        fn find_outer_col(plan: &LogicalPlan) -> Option<usize> {
+            match plan {
+                LogicalPlan::Filter { predicate, .. } => {
+                    // Predicate is `user_id = id` — a Binary with the right side
+                    // being an OuterColumn.
+                    if let ScalarExpr::Binary { right, .. } = predicate {
+                        if let ScalarExpr::OuterColumn { frame_depth, .. } = right.as_ref() {
+                            return Some(*frame_depth);
+                        }
+                    }
+                    None
+                }
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_outer_col(input),
+                _ => None,
+            }
+        }
+        let depth = find_outer_col(subplan).expect("should find OuterColumn in subplan");
+        assert_eq!(depth, 1, "column is one level out → frame_depth = 1");
+    }
 
     proptest! {
         /// Any random join tree over a fixed set of 3 tables binds without error.
