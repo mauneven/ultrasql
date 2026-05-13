@@ -1,86 +1,61 @@
-# UltraSQL Benchmark Methodology
+# Benchmark Methodology
 
-UltraSQL's benchmark culture is built on a single principle: **every
-published number is reproducible by anyone, on the same hardware,
-running the same scripts.** This document defines what that means.
-
-If you publish a benchmark in a PR description, in
-`benchmarks/results/`, or on the project website, it must conform to
-the rules below. Numbers that do not conform are removed without
-discussion.
+Every published number is reproducible: same hardware, same dataset,
+same scripts. Numbers that cannot be reproduced are removed.
 
 ---
 
-## 1. What gets measured
+## Categories
 
-UltraSQL tracks the following categories. Each category has a fixed
-set of metrics and a fixed workload definition; see `benchmarks/`
-for the scripts.
+### OLTP
 
-### 1.1 OLTP throughput
+- TPC-B (the four standard transactions).
+- TPC-C (NewOrder / Payment / OrderStatus / Delivery / StockLevel).
+- Sysbench-style point reads, point writes, update-in-place.
 
-- TPC-B (a curated subset implementing the four standard transactions).
-- TPC-C (full standard, NewOrder / Payment / OrderStatus / Delivery /
-  StockLevel).
-- Sysbench-style point reads, point writes, and update-in-place.
+Metrics: throughput (tx/s), latency p50 / p95 / p99 / p99.9 (µs), CPU
+utilization, RSS, disk read / write bandwidth.
 
-Metrics:
+### OLAP
 
-- Throughput in `tx/s` at sustained steady state.
-- Latency p50, p95, p99, p99.9 in microseconds.
-- CPU utilization, RSS, disk read / write bandwidth.
-
-### 1.2 OLAP throughput
-
-- TPC-H scale factors 1, 10, 100 (where the host has the disk).
-- ClickBench (the hits.parquet workload).
+- TPC-H scale factors 1, 10, 100 (where the disk fits).
+- ClickBench (`hits.parquet`).
 - Star Schema Benchmark scale 100.
 
-Metrics:
+Metrics: geometric mean of query time across the standard query set,
+per-query elapsed time, memory high-watermark.
 
-- Geometric mean query time across the standard query set.
-- Per-query elapsed time.
-- Memory high-watermark.
+### Microbenchmarks
 
-### 1.3 Microbenchmarks
+Live in `crates/*/benches/` under `criterion`. Cover: inserts/sec into
+the heap (with and without WAL), reads/sec from the buffer pool (hot,
+warm, cold), join throughput (NLJ, hash, merge), aggregation
+throughput per-row and per-batch, WAL throughput, replication lag,
+index build and lookup, parser tokens/sec, planner plans/sec on a
+representative query mix, wire protocol parse/serialize throughput.
 
-These live in `crates/*/benches/` using `criterion`. They measure:
+### Startup and cold cache
 
-- Inserts/sec into the heap (no WAL, with WAL).
-- Reads/sec from the buffer pool (hot, warm, cold).
-- Join throughput (NLJ, hash join, merge join) on synthetic data.
-- Aggregation throughput per-row and per-batch.
-- WAL throughput (records/sec, bytes/sec).
-- Replication lag (when replication is implemented).
-- Index build, lookup, and range-scan throughput.
-- Parser tokens/sec.
-- Planner plans/sec on a representative query mix.
-- Wire protocol parse/serialize throughput.
+Time to first connection ready after `ultrasqld` startup. Time to
+first query result after a cold cache.
 
-### 1.4 Startup and cold-cache
+### Memory
 
-- Time to first connection ready after `ultrasqld` startup.
-- Time to first query result after a cold cache.
-
-### 1.5 Memory
-
-- Resident set size at idle, at 1k QPS, at peak.
-- Per-connection overhead.
-- Buffer-pool hit ratio at typical workloads.
+Resident set size at idle, at 1k QPS, at peak. Per-connection
+overhead. Buffer-pool hit ratio at typical workloads.
 
 ---
 
-## 2. Host description format
+## Host descriptor
 
-Every benchmark result file embeds a `host` block. The exact fields
-are:
+Every result file embeds a `host` block:
 
 ```yaml
 host:
-  hostname: hostname-or-anonymized-id
-  cpu_model: "Apple M4"           # exact model string
-  cpu_cores: 10                   # physical
-  cpu_threads: 10                 # logical (M4 has no SMT)
+  hostname: anonymized-or-real
+  cpu_model: "Apple M4"
+  cpu_cores: 10
+  cpu_threads: 10
   cpu_freq_ghz: 4.4
   ram_gb: 24
   storage:
@@ -96,7 +71,7 @@ host:
     version: "1.95.0"
     target: aarch64-apple-darwin
   ultrasql:
-    commit: "<git sha at time of run>"
+    commit: "<sha>"
     profile: release
     cargo_features: []
   power:
@@ -104,13 +79,11 @@ host:
     thermal_state: nominal
 ```
 
-If you cannot fill all fields, the result is not publishable.
+Incomplete host descriptors are not publishable.
 
 ---
 
-## 3. Workload configuration format
-
-Each benchmark run records its full configuration:
+## Workload descriptor
 
 ```yaml
 workload:
@@ -127,11 +100,11 @@ workload:
 
 ---
 
-## 4. Comparison rules
+## Cross-engine comparisons
 
-When UltraSQL is compared against another engine — PostgreSQL,
-CockroachDB, DuckDB, ClickHouse, etc. — the comparison run records the
-competitor's configuration with the same level of detail:
+When comparing against another engine (PostgreSQL, MySQL, SQLite,
+DuckDB, ClickHouse), the comparison records the competitor's
+configuration with the same level of detail:
 
 ```yaml
 postgres:
@@ -151,24 +124,19 @@ postgres:
 
 The comparison must:
 
-- Use the same client driver where possible (the wire protocol path is
-  identical for UltraSQL and PostgreSQL).
+- Use the same client driver where the wire protocol allows it.
 - Use the same dataset, generated by the same script with the same
   seed.
-- Run on the same host within the same five-minute window when
-  practical, to minimize ambient noise.
-- Tune the competitor per the competitor's published guidance. We do
-  not benchmark PostgreSQL out-of-the-box and present it as evidence.
+- Run on the same host within the same window where practical.
+- Tune the competitor per its published guidance.
 
 A comparison that violates any of these is invalid.
 
 ---
 
-## 5. Output format
+## Output format
 
-Each benchmark run writes a JSON record under
-`benchmarks/results/<workload>/<host-id>/<timestamp>.json`. The
-record includes:
+Each run writes `benchmarks/results/<workload>/<host>/<timestamp>.json`:
 
 ```json
 {
@@ -189,56 +157,39 @@ record includes:
 }
 ```
 
-Comparison runs sit next to each other; the dashboard renders them
-together.
+Comparison runs land in the same directory; the dashboard renders
+them together.
 
 ---
 
-## 6. Statistical hygiene
+## Statistics
 
-- A "result" is the **median over 5 runs**, each ≥ 60 s after a
-  ≥ 60 s warmup. The full distribution is recorded; the median is
-  the headline number.
-- Latency percentiles are computed by HDR histograms in the harness,
-  not by post-processing log samples.
-- A difference is reported as significant only if the 99% confidence
+- A result is the **median of 5 runs**, each ≥ 60 s after a ≥ 60 s
+  warmup. The full distribution is recorded; the median is the
+  headline.
+- Latency percentiles come from HDR histograms in the harness, not
+  from post-processing log samples.
+- A difference is reported as significant only if its 99% confidence
   interval excludes zero.
-- We do not report best-of-N. Best-of-N is the worst-of-N for honesty.
+- Best-of-N is never used.
 
 ---
 
-## 7. Reproducibility checklist
+## Reproducibility checklist
 
-Before publishing a benchmark, satisfy every box:
-
-- [ ] The benchmark script is committed in `benchmarks/`.
-- [ ] The host description is filled in completely.
-- [ ] The workload configuration is committed.
-- [ ] The data generator is deterministic given a seed.
-- [ ] The comparison subject is configured per its published best
-      practices.
-- [ ] Five runs were performed; the JSON record includes the median
-      and the full distribution.
-- [ ] The commit SHA is recorded.
-- [ ] The result file lives under `benchmarks/results/`.
-- [ ] A diff against the previous baseline is documented if it exists.
+- [ ] Benchmark script committed under `benchmarks/`.
+- [ ] Host descriptor complete.
+- [ ] Workload configuration committed.
+- [ ] Data generator deterministic given a seed.
+- [ ] Comparison subjects configured per published best practices.
+- [ ] Five runs performed; distribution recorded; median is the
+      headline.
+- [ ] Commit SHA recorded.
+- [ ] Result file in `benchmarks/results/`.
+- [ ] Diff against previous baseline documented when one exists.
 
 ---
 
-## 8. What we never do
+## Disagreements
 
-- We never publish numbers from "throwaway" runs to make a point.
-- We never compare a release UltraSQL build to a debug PostgreSQL
-  build.
-- We never enable WAL fsync on one side and disable it on the other.
-- We never use a smaller dataset than is needed to exercise the I/O
-  path under test.
-- We never publish marketing prose like "blazing fast" or "10× faster"
-  without the configuration that produces the number.
-
----
-
-## 9. Where to send disagreements
-
-Benchmark methodology disputes are RFC-level changes. Open an RFC if
-you believe the rules above are wrong; do not silently violate them.
+Open an RFC. Methodology changes go through `rfcs/`.
