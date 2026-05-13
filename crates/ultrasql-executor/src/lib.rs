@@ -29,6 +29,7 @@
 mod filter;
 mod limit;
 mod mem_table_scan;
+pub mod physical;
 mod project;
 
 use std::fmt::Debug;

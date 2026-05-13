@@ -1774,6 +1774,7 @@ dependencies = [
  "ultrasql-core",
  "ultrasql-mvcc",
  "ultrasql-optimizer",
+ "ultrasql-planner",
  "ultrasql-storage",
  "ultrasql-txn",
  "ultrasql-vec",

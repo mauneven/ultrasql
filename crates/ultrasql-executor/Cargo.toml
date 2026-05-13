@@ -19,6 +19,7 @@ ultrasql-txn       = { workspace = true }
 ultrasql-vec       = { workspace = true }
 ultrasql-optimizer = { workspace = true }
 ultrasql-catalog   = { workspace = true }
+ultrasql-planner   = { workspace = true }
 thiserror          = { workspace = true }
 crossbeam          = { workspace = true }
 smallvec           = { workspace = true }
