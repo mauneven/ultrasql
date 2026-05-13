@@ -70,7 +70,27 @@ pub enum ParseError {
         /// Byte offset.
         offset: usize,
     },
+
+    /// Expression nesting exceeded the configured depth limit. The
+    /// bound guards the call stack against adversarial inputs such as
+    /// `((((((...))))))` that would otherwise blow the stack on the
+    /// server before any other validation runs.
+    #[error("expression depth exceeded {limit} at offset {offset}")]
+    DepthExceeded {
+        /// Configured maximum nesting depth.
+        limit: u32,
+        /// Byte offset of the deepest token reached.
+        offset: usize,
+    },
 }
+
+/// Maximum recursive expression depth accepted by the parser.
+///
+/// The bound is a fixed-size circuit breaker against adversarial inputs
+/// (a million nested parentheses would otherwise crash the server
+/// before any other validation runs); legitimate SQL never approaches
+/// this depth.
+pub const MAX_PARSE_DEPTH: u32 = 1024;
 
 /// SQL parser.
 #[derive(Debug)]
@@ -79,6 +99,10 @@ pub struct Parser<'src> {
     lexer: Lexer<'src>,
     /// One-token lookahead. `None` means "not yet read".
     peeked: Option<Token>,
+    /// Current expression-recursion depth. Bounded by
+    /// [`MAX_PARSE_DEPTH`]. Reset implicitly between statements because
+    /// statement-level entry points construct fresh expression scopes.
+    depth: u32,
 }
 
 impl<'src> Parser<'src> {
@@ -89,6 +113,7 @@ impl<'src> Parser<'src> {
             source,
             lexer: Lexer::new(source),
             peeked: None,
+            depth: 0,
         }
     }
 
@@ -400,6 +425,13 @@ impl<'src> Parser<'src> {
     }
 
     fn parse_expr_with_precedence(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
+        self.enter_depth()?;
+        let result = self.parse_expr_with_precedence_inner(min_prec);
+        self.leave_depth();
+        result
+    }
+
+    fn parse_expr_with_precedence_inner(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut left = self.parse_prefix()?;
 
         while let Some((op, op_span)) = self.peek_binary_op()? {
@@ -679,6 +711,32 @@ impl<'src> Parser<'src> {
             }
         }
         Ok(())
+    }
+
+    // ---------------- recursion guard ------------------------------------
+
+    /// Increment the expression-recursion depth counter, returning a
+    /// [`ParseError::DepthExceeded`] when the configured limit is
+    /// reached. Every entry into [`Self::parse_expr_with_precedence`]
+    /// pairs an `enter_depth` with a matching `leave_depth`.
+    fn enter_depth(&mut self) -> Result<(), ParseError> {
+        if self.depth >= MAX_PARSE_DEPTH {
+            let offset = self
+                .peeked
+                .as_ref()
+                .map_or_else(|| self.lexer.offset(), |t| t.span.start as usize);
+            return Err(ParseError::DepthExceeded {
+                limit: MAX_PARSE_DEPTH,
+                offset,
+            });
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn leave_depth(&mut self) {
+        debug_assert!(self.depth > 0, "leave_depth without matching enter_depth");
+        self.depth = self.depth.saturating_sub(1);
     }
 
     // ---------------- token helpers --------------------------------------
@@ -971,5 +1029,47 @@ mod tests {
     fn unsupported_statement_rejected() {
         let err = Parser::new("DROP TABLE t").parse_statement().unwrap_err();
         assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    /// Adversarial input: deeply-nested parentheses must be rejected
+    /// with a `DepthExceeded` error rather than overflow the call
+    /// stack. The depth bound is [`MAX_PARSE_DEPTH`]; we craft input
+    /// that comfortably exceeds it.
+    #[test]
+    fn deeply_nested_parens_rejected_without_overflow() {
+        let depth = (MAX_PARSE_DEPTH as usize) + 64;
+        let mut sql = String::with_capacity(depth * 2 + 16);
+        sql.push_str("SELECT ");
+        for _ in 0..depth {
+            sql.push('(');
+        }
+        sql.push('1');
+        for _ in 0..depth {
+            sql.push(')');
+        }
+        let err = Parser::new(&sql).parse_statement().unwrap_err();
+        assert!(
+            matches!(err, ParseError::DepthExceeded { .. }),
+            "expected DepthExceeded, got {err:?}"
+        );
+    }
+
+    /// A query at a depth comfortably below the limit must still
+    /// succeed; the bound exists to refuse pathological inputs, not
+    /// reasonable ones.
+    #[test]
+    fn parens_below_limit_succeed() {
+        let depth = 256_usize;
+        let mut sql = String::with_capacity(depth * 2 + 16);
+        sql.push_str("SELECT ");
+        for _ in 0..depth {
+            sql.push('(');
+        }
+        sql.push('1');
+        for _ in 0..depth {
+            sql.push(')');
+        }
+        let stmt = Parser::new(&sql).parse_statement().expect("must parse");
+        assert!(matches!(stmt, Statement::Select(_)));
     }
 }
