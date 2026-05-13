@@ -17,6 +17,8 @@ pub mod checksum;
 pub mod heap;
 pub mod page;
 pub mod segment;
+pub mod wal_sink;
 
 pub use buffer_pool::{BufferPool, BufferPoolError, BufferPoolStats, PageGuard, PageLoader};
 pub use page::{ItemId, ItemIdFlags, Page, PageError, PageHeader, PageKind, SlotIndex};
+pub use wal_sink::{NullWalSink, WalSink, WalSinkError};

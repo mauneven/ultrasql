@@ -40,12 +40,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
-use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, TupleId, Xid};
+use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
 use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
+use ultrasql_wal::WalRecord;
+use ultrasql_wal::payload::{
+    HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload, PayloadError,
+};
+use ultrasql_wal::record::RecordType;
 
 use crate::buffer_pool::{BufferPool, BufferPoolError, PageGuard, PageLoader};
 use crate::page::PageError;
+use crate::wal_sink::{WalSink, WalSinkError};
 
 /// Errors raised by the heap access method.
 #[derive(Debug, thiserror::Error)]
@@ -68,31 +74,61 @@ pub enum HeapError {
     /// would have to grow past [`u32::MAX`] blocks for this to fire.
     #[error("relation is out of blocks")]
     OutOfBlocks,
+
+    /// The [`WalSink`] rejected a record.
+    #[error("wal sink: {0}")]
+    Wal(#[from] WalSinkError),
+
+    /// Encoding a typed WAL payload failed.
+    #[error("wal payload encoding: {0}")]
+    WalPayload(#[from] PayloadError),
 }
 
-/// Options threaded into an insert. The caller knows its
-/// transaction id and the current command id within that transaction;
-/// the heap stamps both into the tuple header before writing the slot.
-#[derive(Clone, Copy, Debug)]
-pub struct InsertOptions {
+/// Options threaded into an insert.
+///
+/// The caller knows its transaction id and the current command id within
+/// that transaction; the heap stamps both into the tuple header before
+/// writing the slot.
+///
+/// The optional `wal` sink, when present, receives a fully-formed
+/// `HeapInsert` WAL record after the tuple has been written to the page.
+/// Pass `None` to skip WAL emission (e.g. during recovery or in tests
+/// that do not care about WAL output).
+#[derive(Clone, Copy)]
+pub struct InsertOptions<'a> {
     /// XID of the inserting transaction.
     pub xmin: Xid,
     /// Command id within `xmin` that issued the insert.
     pub command_id: CommandId,
+    /// Optional WAL sink. When `Some`, the heap appends a
+    /// `RecordType::HeapInsert` record after a successful insert.
+    pub wal: Option<&'a dyn WalSink>,
+}
+
+impl std::fmt::Debug for InsertOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InsertOptions")
+            .field("xmin", &self.xmin)
+            .field("command_id", &self.command_id)
+            .field("wal", &self.wal.is_some())
+            .finish()
+    }
 }
 
 /// Options threaded into an update.
 ///
-/// The caller supplies the XID and command id of the updating
-/// transaction. `hot_eligible` signals that no indexed column changed
-/// in this update, so an in-page HOT chain is safe; the heap will try
-/// to satisfy that hint when there is enough room on the same page.
+/// The caller supplies the XID and command id of the updating transaction.
+/// `hot_eligible` signals that no indexed column changed in this update, so
+/// an in-page HOT chain is safe; the heap will try to satisfy that hint when
+/// there is enough room on the same page.
 ///
-/// **WAL hook.** A future iteration will add an optional WAL sink field
-/// here (e.g. `wal_sink: Option<&dyn WalSink>`) so WAL emission can be
-/// wired without changing the call sites. No WAL dependency is taken now.
-#[derive(Clone, Copy, Debug)]
-pub struct UpdateOptions {
+/// The optional `wal` sink, when present, receives a fully-formed
+/// `HeapUpdate` WAL record after the new version has been written and the
+/// old tuple's header has been stamped. The record's flags will have
+/// [`ultrasql_wal::payload::HEAP_UPDATE_HOT`] set when the update was
+/// performed as HOT.
+#[derive(Clone, Copy)]
+pub struct UpdateOptions<'a> {
     /// XID performing the update (stamped as `xmax` on the old version
     /// and `xmin` on the new version).
     pub xid: Xid,
@@ -100,6 +136,47 @@ pub struct UpdateOptions {
     pub command_id: CommandId,
     /// `true` if no indexed column changed — a HOT update is allowed.
     pub hot_eligible: bool,
+    /// Optional WAL sink. When `Some`, the heap appends a
+    /// `RecordType::HeapUpdate` record after a successful update.
+    pub wal: Option<&'a dyn WalSink>,
+}
+
+impl std::fmt::Debug for UpdateOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateOptions")
+            .field("xid", &self.xid)
+            .field("command_id", &self.command_id)
+            .field("hot_eligible", &self.hot_eligible)
+            .field("wal", &self.wal.is_some())
+            .finish()
+    }
+}
+
+/// Options threaded into a delete.
+///
+/// The caller supplies the XID and command id of the deleting transaction.
+///
+/// The optional `wal` sink, when present, receives a fully-formed
+/// `HeapDelete` WAL record after the tuple's header has been stamped.
+#[derive(Clone, Copy)]
+pub struct DeleteOptions<'a> {
+    /// XID performing the delete (stamped as `xmax` in the tuple header).
+    pub xmax: Xid,
+    /// Command id within `xmax` that issued the delete.
+    pub cmax: CommandId,
+    /// Optional WAL sink. When `Some`, the heap appends a
+    /// `RecordType::HeapDelete` record after a successful delete.
+    pub wal: Option<&'a dyn WalSink>,
+}
+
+impl std::fmt::Debug for DeleteOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeleteOptions")
+            .field("xmax", &self.xmax)
+            .field("cmax", &self.cmax)
+            .field("wal", &self.wal.is_some())
+            .finish()
+    }
 }
 
 /// Result of a successful update.
@@ -215,7 +292,7 @@ impl<L: PageLoader> HeapAccess<L> {
         &self,
         rel: RelationId,
         payload: &[u8],
-        opts: InsertOptions,
+        opts: InsertOptions<'_>,
     ) -> Result<TupleId, HeapError> {
         let counter = self.counter_for(rel);
         let existing = counter.load(Ordering::Acquire);
@@ -233,7 +310,10 @@ impl<L: PageLoader> HeapAccess<L> {
         for block in 0..existing {
             let page_id = PageId::new(rel, BlockNumber::new(block));
             match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
-                Ok(tid) => return Ok(tid),
+                Ok(tid) => {
+                    Self::emit_insert_wal(tid, &opts, || self.fetch(tid))?;
+                    return Ok(tid);
+                }
                 Err(HeapError::Page(PageError::NoSpace { .. })) => {}
                 Err(other) => return Err(other),
             }
@@ -249,7 +329,10 @@ impl<L: PageLoader> HeapAccess<L> {
             }
             let page_id = PageId::new(rel, BlockNumber::new(new_block));
             match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
-                Ok(tid) => return Ok(tid),
+                Ok(tid) => {
+                    Self::emit_insert_wal(tid, &opts, || self.fetch(tid))?;
+                    return Ok(tid);
+                }
                 // A concurrent thread could have raced into this block
                 // and used the space — extend again.
                 Err(HeapError::Page(PageError::NoSpace { .. })) => {}
@@ -267,15 +350,35 @@ impl<L: PageLoader> HeapAccess<L> {
         Self::decode_tuple(tid, &owned)
     }
 
-    /// Mark a tuple deleted at `(xmax, cmax)`.
+    /// Mark a tuple deleted.
     ///
     /// The slot stays allocated and the payload is left untouched; only
     /// the header's `xmax`/`cmax` fields move. A later visibility check
-    /// will hide the tuple from snapshots that observe `xmax` as
-    /// committed.
-    pub fn delete(&self, tid: TupleId, xmax: Xid, cmax: CommandId) -> Result<(), HeapError> {
+    /// will hide the tuple from snapshots that observe `xmax` as committed.
+    ///
+    /// If `opts.wal` is `Some`, a `RecordType::HeapDelete` record is appended
+    /// to the sink after the in-place stamp succeeds.
+    pub fn delete(&self, tid: TupleId, opts: DeleteOptions<'_>) -> Result<(), HeapError> {
         let guard = self.pool.get_page(tid.page)?;
-        Self::delete_in_place(&guard, tid, xmax, cmax)
+        Self::delete_in_place(&guard, tid, opts.xmax, opts.cmax)?;
+        if let Some(sink) = opts.wal {
+            let prev_lsn = sink.last_lsn_for(opts.xmax);
+            let payload_bytes = HeapDeletePayload {
+                tid,
+                xmax: opts.xmax,
+                cmax: opts.cmax,
+            }
+            .encode()?;
+            let record = WalRecord::new(
+                RecordType::HeapDelete,
+                opts.xmax,
+                prev_lsn,
+                0,
+                payload_bytes,
+            );
+            let _lsn: Lsn = sink.append(record)?;
+        }
+        Ok(())
     }
 
     /// Replace a tuple's payload with HOT-chain support.
@@ -310,7 +413,7 @@ impl<L: PageLoader> HeapAccess<L> {
         &self,
         old_tid: TupleId,
         new_payload: &[u8],
-        opts: UpdateOptions,
+        opts: UpdateOptions<'_>,
     ) -> Result<UpdateOutcome, HeapError> {
         let new_tuple_size = TUPLE_HEADER_SIZE
             .checked_add(new_payload.len())
@@ -327,21 +430,27 @@ impl<L: PageLoader> HeapAccess<L> {
             let hot_result =
                 Self::try_hot_update(&guard, old_tid, new_payload, opts, n_atts, new_tuple_size)?;
             if let Some(new_tid) = hot_result {
-                return Ok(UpdateOutcome {
+                let outcome = UpdateOutcome {
                     old_tid,
                     new_tid,
                     hot: true,
-                });
+                };
+                Self::emit_update_wal(outcome, &opts, || self.fetch(new_tid))?;
+                return Ok(outcome);
             }
             // Page had no room; fall through to non-HOT path.
         }
 
         // --- Non-HOT path: insert on any page, then stamp old -----------------
         //
-        // Build insert options from the update's xid/cid.
+        // Build insert options from the update's xid/cid.  Pass wal: None
+        // here because the outer update path emits its own HeapUpdate record
+        // that covers both old and new positions; we do not want a
+        // spurious HeapInsert record for the internal insert.
         let insert_opts = InsertOptions {
             xmin: opts.xid,
             command_id: opts.command_id,
+            wal: None,
         };
         let new_tid = self.insert(old_tid.page.relation, new_payload, insert_opts)?;
 
@@ -351,11 +460,13 @@ impl<L: PageLoader> HeapAccess<L> {
         let old_guard = self.pool.get_page(old_tid.page)?;
         Self::stamp_updated_old(&old_guard, old_tid, new_tid, opts)?;
 
-        Ok(UpdateOutcome {
+        let outcome = UpdateOutcome {
             old_tid,
             new_tid,
             hot: false,
-        })
+        };
+        Self::emit_update_wal(outcome, &opts, || self.fetch(new_tid))?;
+        Ok(outcome)
     }
 
     /// Sequential scan over `rel`'s pages. The first version starts at
@@ -421,7 +532,7 @@ impl<L: PageLoader> HeapAccess<L> {
         &self,
         page_id: PageId,
         payload: &[u8],
-        opts: InsertOptions,
+        opts: InsertOptions<'_>,
         n_atts: u16,
         tuple_size: usize,
     ) -> Result<TupleId, HeapError> {
@@ -446,7 +557,7 @@ impl<L: PageLoader> HeapAccess<L> {
         guard: &PageGuard<L>,
         page_id: PageId,
         payload: &[u8],
-        opts: InsertOptions,
+        opts: InsertOptions<'_>,
         n_atts: u16,
         tuple_size: usize,
     ) -> Result<TupleId, HeapError> {
@@ -552,7 +663,7 @@ impl<L: PageLoader> HeapAccess<L> {
         guard: &PageGuard<L>,
         old_tid: TupleId,
         new_payload: &[u8],
-        opts: UpdateOptions,
+        opts: UpdateOptions<'_>,
         n_atts: u16,
         new_tuple_size: usize,
     ) -> Result<Option<TupleId>, HeapError> {
@@ -639,7 +750,7 @@ impl<L: PageLoader> HeapAccess<L> {
         guard: &PageGuard<L>,
         old_tid: TupleId,
         new_tid: TupleId,
-        opts: UpdateOptions,
+        opts: UpdateOptions<'_>,
     ) -> Result<(), HeapError> {
         let mut page = guard.write();
         let bytes = page.read_tuple(old_tid.slot)?;
@@ -687,6 +798,83 @@ impl<L: PageLoader> HeapAccess<L> {
         let mut buf = [0_u8; TUPLE_HEADER_SIZE];
         header.encode(&mut buf);
         buf
+    }
+
+    // ---------------------------------------------------------------------------
+    // WAL emission helpers
+    // ---------------------------------------------------------------------------
+
+    /// Emit a `HeapInsert` WAL record if `opts.wal` is `Some`.
+    ///
+    /// `fetch_tuple` is a closure that reads the canonical on-page tuple bytes;
+    /// it is called only when the sink is present to avoid a redundant fetch in
+    /// the no-WAL path.
+    fn emit_insert_wal(
+        tid: TupleId,
+        opts: &InsertOptions<'_>,
+        fetch_tuple: impl FnOnce() -> Result<HeapTuple, HeapError>,
+    ) -> Result<(), HeapError> {
+        if let Some(sink) = opts.wal {
+            let tup = fetch_tuple()?;
+            // Reconstruct full on-page bytes: header || payload.
+            let mut tuple_bytes = Vec::with_capacity(TUPLE_HEADER_SIZE + tup.data.len());
+            tuple_bytes.resize(TUPLE_HEADER_SIZE, 0);
+            tup.header.encode(&mut tuple_bytes[..TUPLE_HEADER_SIZE]);
+            tuple_bytes.extend_from_slice(&tup.data);
+
+            let prev_lsn = sink.last_lsn_for(opts.xmin);
+            let payload_bytes = HeapInsertPayload { tid, tuple_bytes }.encode()?;
+            let record = WalRecord::new(
+                RecordType::HeapInsert,
+                opts.xmin,
+                prev_lsn,
+                0,
+                payload_bytes,
+            );
+            let _lsn: Lsn = sink.append(record)?;
+        }
+        Ok(())
+    }
+
+    /// Emit a `HeapUpdate` WAL record if `opts.wal` is `Some`.
+    ///
+    /// `flags` has [`ultrasql_wal::payload::HEAP_UPDATE_HOT`] set when
+    /// `outcome.hot` is `true`.
+    ///
+    /// `fetch_new_tuple` is a closure that reads the new version's on-page
+    /// bytes; it is only called when the sink is present.
+    fn emit_update_wal(
+        outcome: UpdateOutcome,
+        opts: &UpdateOptions<'_>,
+        fetch_new_tuple: impl FnOnce() -> Result<HeapTuple, HeapError>,
+    ) -> Result<(), HeapError> {
+        if let Some(sink) = opts.wal {
+            let new_tup = fetch_new_tuple()?;
+            let mut new_tuple_bytes = Vec::with_capacity(TUPLE_HEADER_SIZE + new_tup.data.len());
+            new_tuple_bytes.resize(TUPLE_HEADER_SIZE, 0);
+            new_tup
+                .header
+                .encode(&mut new_tuple_bytes[..TUPLE_HEADER_SIZE]);
+            new_tuple_bytes.extend_from_slice(&new_tup.data);
+
+            let flags = if outcome.hot {
+                ultrasql_wal::payload::HEAP_UPDATE_HOT
+            } else {
+                0
+            };
+            let prev_lsn = sink.last_lsn_for(opts.xid);
+            let payload_bytes = HeapUpdatePayload {
+                old_tid: outcome.old_tid,
+                new_tid: outcome.new_tid,
+                flags,
+                new_tuple_bytes,
+            }
+            .encode()?;
+            let record =
+                WalRecord::new(RecordType::HeapUpdate, opts.xid, prev_lsn, 0, payload_bytes);
+            let _lsn: Lsn = sink.append(record)?;
+        }
+        Ok(())
     }
 
     /// Extract `(offset, length)` of slot `slot` by reading its
@@ -933,10 +1121,19 @@ mod tests {
         RelationId::new(42)
     }
 
-    fn opts(xid: u64) -> InsertOptions {
+    fn opts(xid: u64) -> InsertOptions<'static> {
         InsertOptions {
             xmin: Xid::new(xid),
             command_id: CommandId::FIRST,
+            wal: None,
+        }
+    }
+
+    fn del_opts(xmax: u64, cmax: u32) -> DeleteOptions<'static> {
+        DeleteOptions {
+            xmax: Xid::new(xmax),
+            cmax: CommandId::new(cmax),
+            wal: None,
         }
     }
 
@@ -998,7 +1195,7 @@ mod tests {
         let heap = make_heap(8);
         let payload = b"row";
         let tid = heap.insert(rel(), payload, opts(100)).unwrap();
-        heap.delete(tid, Xid::new(200), CommandId::new(3)).unwrap();
+        heap.delete(tid, del_opts(200, 3)).unwrap();
         let got = heap.fetch(tid).unwrap();
         assert_eq!(got.header.xmax, Xid::new(200));
         assert_eq!(got.header.cmax, CommandId::new(3));
@@ -1107,12 +1304,20 @@ mod tests {
                 InsertOptions {
                     xmin: bad_xid,
                     command_id: CommandId::FIRST,
+                    wal: None,
                 },
             )
             .unwrap();
         let to_delete_tid = heap.insert(rel(), b"will-be-deleted", opts(100)).unwrap();
-        heap.delete(to_delete_tid, Xid::new(102), CommandId::FIRST)
-            .unwrap();
+        heap.delete(
+            to_delete_tid,
+            DeleteOptions {
+                xmax: Xid::new(102),
+                cmax: CommandId::FIRST,
+                wal: None,
+            },
+        )
+        .unwrap();
 
         let oracle = MapOracle::new();
         oracle.set_committed(committed_xid);
@@ -1205,11 +1410,12 @@ mod tests {
     // UpdateOptions / UpdateOutcome helpers
     // -----------------------------------------------------------------------
 
-    fn update_opts(xid: u64) -> UpdateOptions {
+    fn update_opts(xid: u64) -> UpdateOptions<'static> {
         UpdateOptions {
             xid: Xid::new(xid),
             command_id: CommandId::FIRST,
             hot_eligible: true,
+            wal: None,
         }
     }
 
@@ -1272,6 +1478,7 @@ mod tests {
             xid: Xid::new(200),
             command_id: CommandId::FIRST,
             hot_eligible: true, // we ask for HOT but the page is full
+            wal: None,
         };
         let outcome = heap.update(tid, &big, uo).unwrap();
         assert!(!outcome.hot, "expected non-HOT when page is full");
@@ -1291,7 +1498,15 @@ mod tests {
     fn update_rejected_on_already_deleted_tuple() {
         let heap = make_heap(8);
         let tid = heap.insert(rel(), b"to-delete", opts(100)).unwrap();
-        heap.delete(tid, Xid::new(150), CommandId::FIRST).unwrap();
+        heap.delete(
+            tid,
+            DeleteOptions {
+                xmax: Xid::new(150),
+                cmax: CommandId::FIRST,
+                wal: None,
+            },
+        )
+        .unwrap();
 
         let uo = update_opts(200);
         let err = heap.update(tid, b"should-fail", uo).unwrap_err();
@@ -1380,6 +1595,7 @@ mod tests {
                 InsertOptions {
                     xmin: Xid::new(42),
                     command_id: CommandId::FIRST,
+                    wal: None,
                 },
             )
             .unwrap();
@@ -1429,6 +1645,7 @@ mod tests {
                     .insert(rel(), p, InsertOptions {
                         xmin: insert_xid,
                         command_id: CommandId::FIRST,
+                        wal: None,
                     })
                     .unwrap();
                 tids.push(tid);
@@ -1443,7 +1660,15 @@ mod tests {
                     break;
                 }
                 if should_delete {
-                    heap.delete(tids[i], delete_xid, CommandId::FIRST).unwrap();
+                    heap.delete(
+                        tids[i],
+                        DeleteOptions {
+                            xmax: delete_xid,
+                            cmax: CommandId::FIRST,
+                            wal: None,
+                        },
+                    )
+                    .unwrap();
                 } else {
                     expected_count += 1;
                 }
@@ -1472,6 +1697,397 @@ mod tests {
                 visible.len(),
                 expected_count
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // WAL emission tests (Deliverable C)
+    // -----------------------------------------------------------------------
+
+    mod wal_emission {
+        use ultrasql_core::{CommandId, Xid};
+        use ultrasql_wal::payload::{
+            HEAP_UPDATE_HOT, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload,
+        };
+        use ultrasql_wal::record::RecordType;
+
+        use super::*;
+        use crate::buffer_pool::BufferPool;
+        use crate::wal_sink::{NullWalSink, test_support::InMemoryWalSink};
+
+        fn make_heap_with_sink(capacity: usize) -> (HeapAccess<MapLoader>, Arc<InMemoryWalSink>) {
+            let pool = Arc::new(BufferPool::new(capacity, MapLoader::new()));
+            let heap = HeapAccess::new(pool);
+            let sink = Arc::new(InMemoryWalSink::new());
+            (heap, sink)
+        }
+
+        fn rel() -> RelationId {
+            RelationId::new(99)
+        }
+
+        // -------------------------------------------------------------------
+        // 1. insert emits HeapInsert with expected payload
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn insert_emits_heap_insert_record_with_expected_payload() {
+            let (heap, sink) = make_heap_with_sink(8);
+
+            let tid = heap
+                .insert(
+                    rel(),
+                    b"hello wal",
+                    InsertOptions {
+                        xmin: Xid::new(10),
+                        command_id: CommandId::FIRST,
+                        wal: Some(sink.as_ref()),
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(sink.len(), 1, "expected one WAL record");
+            let records = sink.records();
+            let (_lsn, record) = &records[0];
+            assert_eq!(record.header.record_type, RecordType::HeapInsert);
+            assert_eq!(record.header.xid, Xid::new(10));
+
+            // Decode the payload and verify tid.
+            let payload = HeapInsertPayload::decode(&record.payload).unwrap();
+            assert_eq!(payload.tid, tid, "WAL payload tid must match returned tid");
+
+            // tuple_bytes must match what heap.fetch returns.
+            let fetched = heap.fetch(tid).unwrap();
+            let mut expected_bytes = vec![0_u8; TUPLE_HEADER_SIZE + fetched.data.len()];
+            fetched
+                .header
+                .encode(&mut expected_bytes[..TUPLE_HEADER_SIZE]);
+            expected_bytes[TUPLE_HEADER_SIZE..].copy_from_slice(&fetched.data);
+
+            assert_eq!(
+                payload.tuple_bytes, expected_bytes,
+                "WAL tuple_bytes must match on-page canonical bytes"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // 2. HOT update emits HeapUpdate with HOT flag set
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn update_emits_heap_update_record_with_hot_flag() {
+            let (heap, sink) = make_heap_with_sink(16);
+
+            let old_tid = heap
+                .insert(
+                    rel(),
+                    b"original",
+                    InsertOptions {
+                        xmin: Xid::new(1),
+                        command_id: CommandId::FIRST,
+                        wal: Some(sink.as_ref()),
+                    },
+                )
+                .unwrap();
+
+            // Use a fresh sink so only the update record appears.
+            let sink2 = Arc::new(InMemoryWalSink::new());
+
+            let outcome = heap
+                .update(
+                    old_tid,
+                    b"updated",
+                    UpdateOptions {
+                        xid: Xid::new(2),
+                        command_id: CommandId::FIRST,
+                        hot_eligible: true,
+                        wal: Some(sink2.as_ref()),
+                    },
+                )
+                .unwrap();
+
+            assert!(
+                outcome.hot,
+                "expected HOT update for small tuple on fresh page"
+            );
+            assert_eq!(sink2.len(), 1, "expected exactly one update record");
+
+            let records = sink2.records();
+            let (_lsn, record) = &records[0];
+            assert_eq!(record.header.record_type, RecordType::HeapUpdate);
+
+            let payload = HeapUpdatePayload::decode(&record.payload).unwrap();
+            assert_eq!(payload.old_tid, outcome.old_tid);
+            assert_eq!(payload.new_tid, outcome.new_tid);
+            assert_ne!(payload.flags & HEAP_UPDATE_HOT, 0, "HOT flag must be set");
+        }
+
+        // -------------------------------------------------------------------
+        // 3. Non-HOT update does not have HOT flag
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn update_emits_heap_update_record_without_hot_flag_when_falling_back() {
+            let (heap, sink) = make_heap_with_sink(32);
+
+            // Fill the page with a large tuple so there is no room for another.
+            let big = [0xBB_u8; 7000];
+            let old_tid = heap
+                .insert(
+                    rel(),
+                    &big,
+                    InsertOptions {
+                        xmin: Xid::new(1),
+                        command_id: CommandId::FIRST,
+                        wal: None,
+                    },
+                )
+                .unwrap();
+            // Second large insert forces block 1 to be allocated.
+            let _ = heap
+                .insert(
+                    rel(),
+                    &big,
+                    InsertOptions {
+                        xmin: Xid::new(1),
+                        command_id: CommandId::FIRST,
+                        wal: None,
+                    },
+                )
+                .unwrap();
+
+            // Update the first tuple; page is full so it falls back to non-HOT.
+            let outcome = heap
+                .update(
+                    old_tid,
+                    &big,
+                    UpdateOptions {
+                        xid: Xid::new(2),
+                        command_id: CommandId::FIRST,
+                        hot_eligible: true, // asked for HOT but page is full
+                        wal: Some(sink.as_ref()),
+                    },
+                )
+                .unwrap();
+
+            assert!(!outcome.hot, "expected non-HOT fall-back when page is full");
+            assert_ne!(
+                outcome.old_tid.page.block, outcome.new_tid.page.block,
+                "new version must be on a different block"
+            );
+
+            assert_eq!(sink.len(), 1);
+            let records = sink.records();
+            let (_lsn, record) = &records[0];
+            let payload = HeapUpdatePayload::decode(&record.payload).unwrap();
+            assert_eq!(
+                payload.flags & HEAP_UPDATE_HOT,
+                0,
+                "HOT flag must NOT be set"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // 4. delete emits HeapDelete
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn delete_emits_heap_delete_record() {
+            let (heap, sink) = make_heap_with_sink(8);
+
+            let tid = heap
+                .insert(
+                    rel(),
+                    b"to-delete",
+                    InsertOptions {
+                        xmin: Xid::new(10),
+                        command_id: CommandId::FIRST,
+                        wal: None,
+                    },
+                )
+                .unwrap();
+
+            heap.delete(
+                tid,
+                DeleteOptions {
+                    xmax: Xid::new(20),
+                    cmax: CommandId::new(3),
+                    wal: Some(sink.as_ref()),
+                },
+            )
+            .unwrap();
+
+            assert_eq!(sink.len(), 1, "expected one delete record");
+            let records = sink.records();
+            let (_lsn, record) = &records[0];
+            assert_eq!(record.header.record_type, RecordType::HeapDelete);
+            assert_eq!(record.header.xid, Xid::new(20));
+
+            let payload = HeapDeletePayload::decode(&record.payload).unwrap();
+            assert_eq!(payload.tid, tid);
+            assert_eq!(payload.xmax, Xid::new(20));
+            assert_eq!(payload.cmax, CommandId::new(3));
+        }
+
+        // -------------------------------------------------------------------
+        // 5. NullWalSink drops records silently
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn null_sink_drops_records_silently() {
+            let heap = make_heap(8);
+            let null = NullWalSink;
+
+            // Should not panic; NullWalSink always returns Ok(Lsn::ZERO).
+            let tid = heap
+                .insert(
+                    rel(),
+                    b"test",
+                    InsertOptions {
+                        xmin: Xid::new(1),
+                        command_id: CommandId::FIRST,
+                        wal: Some(&null),
+                    },
+                )
+                .unwrap();
+
+            // The tuple must be readable even when the sink discards the record.
+            let got = heap.fetch(tid).unwrap();
+            assert_eq!(got.data, b"test");
+        }
+
+        // -------------------------------------------------------------------
+        // 6. wal: None emits nothing
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn wal_sink_none_emits_nothing() {
+            let (heap, sink) = make_heap_with_sink(8);
+
+            // Insert without WAL — the provided sink should receive zero records.
+            let tid = heap
+                .insert(
+                    rel(),
+                    b"no-wal",
+                    InsertOptions {
+                        xmin: Xid::new(5),
+                        command_id: CommandId::FIRST,
+                        wal: None,
+                    },
+                )
+                .unwrap();
+
+            // Delete with a *separate* sink to confirm it gets one record
+            // while the insert-side sink got zero.
+            let del_sink = Arc::new(InMemoryWalSink::new());
+            heap.delete(
+                tid,
+                DeleteOptions {
+                    xmax: Xid::new(6),
+                    cmax: CommandId::FIRST,
+                    wal: Some(del_sink.as_ref()),
+                },
+            )
+            .unwrap();
+
+            assert_eq!(sink.len(), 0, "no-WAL insert must emit zero records");
+            assert_eq!(del_sink.len(), 1, "delete with sink must emit one record");
+        }
+
+        // -------------------------------------------------------------------
+        // 7. prev_lsn chains within a xid
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn last_lsn_chains_within_xid() {
+            let (heap, sink) = make_heap_with_sink(8);
+            let xid = Xid::new(77);
+
+            // First insert: prev_lsn should be Lsn::ZERO (no prior record).
+            let _t1 = heap
+                .insert(
+                    rel(),
+                    b"first",
+                    InsertOptions {
+                        xmin: xid,
+                        command_id: CommandId::FIRST,
+                        wal: Some(sink.as_ref()),
+                    },
+                )
+                .unwrap();
+
+            let records_snapshot = sink.records();
+            let (lsn1, rec1) = &records_snapshot[0];
+            assert_eq!(
+                rec1.header.prev_lsn,
+                ultrasql_core::Lsn::ZERO,
+                "first record prev_lsn must be ZERO"
+            );
+
+            // Second insert for the same xid: prev_lsn must equal lsn1.
+            let _t2 = heap
+                .insert(
+                    rel(),
+                    b"second",
+                    InsertOptions {
+                        xmin: xid,
+                        command_id: CommandId::FIRST,
+                        wal: Some(sink.as_ref()),
+                    },
+                )
+                .unwrap();
+
+            let records = sink.records();
+            let (_lsn2, rec2) = &records[1];
+            assert_eq!(
+                rec2.header.prev_lsn, *lsn1,
+                "second record prev_lsn must equal first record lsn"
+            );
+        }
+
+        // -------------------------------------------------------------------
+        // 8. Property test: prev_lsn chain is monotonic for a fixed xid
+        // -------------------------------------------------------------------
+
+        proptest! {
+            #[test]
+            fn prop_prev_lsn_chain_monotonic(
+                n in 2_usize..=20,
+            ) {
+                let (heap, sink) = make_heap_with_sink(256);
+                let xid = Xid::new(42);
+
+                for i in 0..n {
+                    let payload = (i as u8).to_le_bytes();
+                    heap.insert(
+                        rel(),
+                        &payload,
+                        InsertOptions {
+                            xmin: xid,
+                            command_id: CommandId::FIRST,
+                            wal: Some(sink.as_ref()),
+                        },
+                    )
+                    .unwrap();
+                }
+
+                let records = sink.records();
+                prop_assert_eq!(records.len(), n);
+
+                // For each record after the first, prev_lsn must equal the
+                // LSN assigned to the immediately preceding record.
+                for i in 1..n {
+                    let j = i - 1;
+                    let (prev_lsn, _) = &records[j];
+                    let (_, cur_rec) = &records[i];
+                    prop_assert_eq!(
+                        cur_rec.header.prev_lsn,
+                        *prev_lsn,
+                        "record[{}].prev_lsn must equal records[{}].lsn",
+                        i, j
+                    );
+                }
+            }
         }
     }
 }
