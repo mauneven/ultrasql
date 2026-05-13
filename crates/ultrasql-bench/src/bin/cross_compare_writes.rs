@@ -53,7 +53,7 @@ use clap::{Parser, ValueEnum};
 use tempfile::TempDir;
 use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::{HeapAccess, InsertOptions};
+use ultrasql_storage::heap::{DeleteOptions, HeapAccess, InsertOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_storage::segment::{SegmentConfig, SegmentFileManager};
 use ultrasql_wal::buffer::WalBuffer;
@@ -327,6 +327,7 @@ impl Engine {
             InsertOptions {
                 xmin: xid,
                 command_id: CommandId::FIRST,
+                wal: None,
             },
         )?;
         Ok(tid)
@@ -341,7 +342,14 @@ impl Engine {
         self.wal_buffer
             .append(&rec)
             .map_err(|e| anyhow::anyhow!("wal buffer append: {e}"))?;
-        self.heap.delete(tid, xmax, CommandId::FIRST)?;
+        self.heap.delete(
+            tid,
+            DeleteOptions {
+                xmax,
+                cmax: CommandId::FIRST,
+                wal: None,
+            },
+        )?;
         Ok(())
     }
 

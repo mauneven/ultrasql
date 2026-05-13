@@ -2428,6 +2428,7 @@ dependencies = [
  "ultrasql-protocol",
  "ultrasql-storage",
  "ultrasql-vec",
+ "ultrasql-wal",
 ]
 
 [[package]]

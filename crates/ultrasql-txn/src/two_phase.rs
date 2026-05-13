@@ -35,7 +35,7 @@
 //!
 //! All shared state lives in a [`DashMap`]; operations on distinct GIDs never
 //! contend.  Operations on the same GID (e.g. a concurrent `COMMIT PREPARED`
-//! and `ROLLBACK PREPARED`) are serialised by the DashMap entry's shard lock
+//! and `ROLLBACK PREPARED`) are serialised by the [`DashMap`] entry's shard lock
 //! via the `entry()` API.
 
 use std::fs;
@@ -206,9 +206,8 @@ impl TwoPhaseCoordinator {
         let mut count: usize = 0;
 
         for dir_entry_result in entries {
-            let dir_entry = match dir_entry_result {
-                Ok(d) => d,
-                Err(_) => continue, // skip unreadable entries
+            let Ok(dir_entry) = dir_entry_result else {
+                continue; // skip unreadable entries
             };
 
             let path = dir_entry.path();
@@ -216,9 +215,8 @@ impl TwoPhaseCoordinator {
                 continue;
             }
 
-            let content = match fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
             };
 
             // Derive a placeholder GID from the filename for error messages.

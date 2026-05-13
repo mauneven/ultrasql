@@ -212,8 +212,8 @@ impl SsiManager {
                     continue;
                 }
 
-                let t1_committed = self.rw_conflicts.get(t1).map_or(false, |e| e.committed);
-                let t3_committed = self.rw_conflicts.get(t3).map_or(false, |e| e.committed);
+                let t1_committed = self.rw_conflicts.get(t1).is_some_and(|e| e.committed);
+                let t3_committed = self.rw_conflicts.get(t3).is_some_and(|e| e.committed);
 
                 // The structure is dangerous if any leg has committed.
                 if t1_committed || pivot_committed || t3_committed {
@@ -270,7 +270,7 @@ impl SsiManager {
             .unwrap_or_default()
     }
 
-    /// Resolve a [`LockTag`] to the coarsest-matching [`PredicateLockTag`]
+    /// Resolve a `LockTag` to the coarsest-matching [`PredicateLockTag`]
     /// that a reader might hold, and check whether any registered transaction
     /// holds a predicate lock that covers it.
     ///
@@ -364,6 +364,7 @@ mod tests {
     /// Here we model the canonical T1 → T2 → T3 dangerous structure:
     ///   - T1 has a predicate lock and T2 wrote into T1's range (T1 in-in of T2).
     ///   - T2 has a predicate lock and T3 wrote into T2's range (T2 in-in of T3).
+    ///
     ///   T2 is therefore the pivot with both an in-conflict-in (from T1) and an
     ///   in-conflict-out (to T3).  When T1 commits, the structure becomes
     ///   dangerous.

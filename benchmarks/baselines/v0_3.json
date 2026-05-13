@@ -1,0 +1,60 @@
+{
+  "stage": "v0_3",
+  "host": {
+    "cpu": "Apple M4",
+    "cores": 12,
+    "ram_gb": 64,
+    "os": "darwin 25.5.0"
+  },
+  "git_commit": "e09a11d",
+  "captured_at": "2026-05-13T00:00:00Z",
+  "tolerance_pct": 5.0,
+  "benchmarks": {
+    "point_lookup": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {
+        "postgres17": 0.0,
+        "duckdb": 0.0
+      }
+    },
+    "range_scan": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {
+        "postgres17": 0.0,
+        "duckdb": 0.0
+      }
+    },
+    "insert_throughput": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {
+        "postgres17": 0.0
+      }
+    },
+    "hash_aggregate": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {
+        "postgres17": 0.0,
+        "duckdb": 0.0
+      }
+    },
+    "sort_large": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {
+        "postgres17": 0.0
+      }
+    },
+    "tpch_q1": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {
+        "postgres17": 0.0,
+        "duckdb": 0.0
+      }
+    }
+  }
+}

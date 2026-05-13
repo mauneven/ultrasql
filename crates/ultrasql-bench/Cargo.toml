@@ -30,8 +30,20 @@ name = "cross_compare"
 path = "src/bin/cross_compare.rs"
 
 [[bin]]
+name = "cross_compare_writes"
+path = "src/bin/cross_compare_writes.rs"
+
+[[bin]]
 name = "cross_concurrency"
 path = "src/bin/cross_concurrency.rs"
+
+[[bin]]
+name = "point_lookup"
+path = "src/bin/point_lookup.rs"
+
+[[bin]]
+name = "regression-gate"
+path = "src/bin/regression_gate.rs"
 
 [[bin]]
 name = "tpch"
@@ -42,6 +54,7 @@ ultrasql-core     = { workspace = true }
 ultrasql-protocol = { workspace = true }
 ultrasql-vec      = { workspace = true }
 ultrasql-storage  = { workspace = true }
+ultrasql-wal      = { workspace = true }
 anyhow            = { workspace = true }
 clap              = { workspace = true }
 tokio             = { workspace = true }

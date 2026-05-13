@@ -98,7 +98,7 @@ impl SubtxnManager {
     /// Create a new [`SubtxnManager`] for a transaction with the given parent
     /// XID.
     #[must_use]
-    pub fn new(parent: Xid) -> Self {
+    pub const fn new(parent: Xid) -> Self {
         Self {
             parent_xid: parent,
             stack: Mutex::new(Vec::new()),
@@ -160,6 +160,7 @@ impl SubtxnManager {
         // removed — after rollback the savepoint no longer exists and must be
         // re-established via another `SAVEPOINT name` if needed.
         let removed: Vec<Xid> = stack.drain(pos..).map(|s| s.xid).collect();
+        drop(stack);
         Ok(removed)
     }
 
@@ -184,8 +185,9 @@ impl SubtxnManager {
                 .ok_or_else(|| SavepointError::NotFound {
                     name: name.to_owned(),
                 })?;
-        let entry = stack.remove(pos);
-        Ok(entry.xid)
+        let xid = stack.remove(pos).xid;
+        drop(stack);
+        Ok(xid)
     }
 
     /// Return a snapshot of the current savepoint stack (bottom to top).

@@ -1,7 +1,9 @@
 //! Advanced transaction benchmarks: SSI, savepoints, and 2PC.
 //!
 //! Run with:
-//!   cargo bench --package ultrasql-txn --bench txn_advanced
+//!   `cargo bench --package ultrasql-txn --bench txn_advanced`
+
+#![allow(clippy::missing_docs_in_private_items)]
 
 use std::sync::Arc;
 
@@ -40,7 +42,7 @@ fn bench_ssi_commit_throughput(c: &mut Criterion) {
 
             // Seed a deterministic pseudo-random stream with a simple LCG.
             let mut state: u64 = 0xDEAD_BEEF_CAFE_1337;
-            let mut lcg = |s: &mut u64| -> u64 {
+            let lcg = |s: &mut u64| -> u64 {
                 *s = s
                     .wrapping_mul(6_364_136_223_846_793_005)
                     .wrapping_add(1_442_695_040_888_963_407);
@@ -107,7 +109,7 @@ fn bench_savepoint_depth_100(c: &mut Criterion) {
 
 // ─── 2PC benchmark ───────────────────────────────────────────────────────────
 
-/// Measure prepare + commit_prepared round-trip latency.
+/// Measure prepare + `commit_prepared` round-trip latency.
 fn bench_2pc_prepare_commit(c: &mut Criterion) {
     let dir = TempDir::new().expect("tempdir");
     let state_dir = dir.path().to_path_buf();

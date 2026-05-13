@@ -341,7 +341,7 @@ impl TransactionManager {
     /// The new subxid is recorded in the CLOG as `InProgress` immediately so
     /// that visibility rules can apply to subtransaction writes.
     pub fn begin_savepoint(&self, txn: &mut Transaction, name: &str) -> Subtxn {
-        let sp = txn.subtxn_stack.savepoint(
+        txn.subtxn_stack.savepoint(
             name,
             || {
                 let raw = self.next_xid.fetch_add(1, Ordering::AcqRel);
@@ -350,8 +350,7 @@ impl TransactionManager {
                 sub_xid
             },
             txn.current_command,
-        );
-        sp
+        )
     }
 
     /// Roll back `txn` to the savepoint named `name`.
@@ -417,6 +416,10 @@ impl TransactionManager {
     ///
     /// Returns [`crate::two_phase::TwoPhaseError`] if the GID is a duplicate
     /// or if state-file I/O fails.
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "by-value enforces the at-most-once lifecycle invariant: prepare consumes the Transaction handle"
+    )]
     pub fn prepare_transaction(
         &self,
         gid: &str,
