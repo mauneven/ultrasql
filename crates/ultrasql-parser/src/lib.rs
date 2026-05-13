@@ -7,11 +7,14 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod ast;
 pub mod keywords;
 pub mod lexer;
+pub mod parser;
 pub mod span;
 pub mod token;
 
 pub use lexer::Lexer;
+pub use parser::{ParseError, Parser};
 pub use span::Span;
 pub use token::{Token, TokenKind};
