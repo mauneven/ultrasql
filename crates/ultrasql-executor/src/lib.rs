@@ -27,32 +27,44 @@
 //!   4096-row [`ultrasql_vec::Batch`]es.
 //! - [`RowCodec`] — stable v0.5 binary codec for translating between
 //!   `Vec<Value>` rows and the byte payloads stored on heap pages.
-//! - [`FilterEqI32`] — predicate filter for `col == const_i32` (placeholder
-//!   pending the general expression-eval module).
+//! - [`FilterEqI32`] — predicate filter for `col == const_i32` (placeholder).
+//! - [`Filter`] — general predicate filter backed by the [`Eval`] interpreter.
+//! - [`ValuesScan`] — leaf operator materialising a `VALUES (...)` list.
+//! - [`ModifyTable`] — INSERT/UPDATE/DELETE mutations through [`HeapAccess`].
+//! - [`Eval`] — scalar expression interpreter; used by [`Filter`] and callers
+//!   that need row-level expression evaluation without a full operator.
 //! - [`Project`] — column projection.
 //! - [`Limit`] — row cap across all output batches.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod eval;
 mod filter;
+pub(crate) mod filter_op;
 mod limit;
 mod mem_table_scan;
+pub mod modify;
 pub mod physical;
 mod project;
 mod row_codec;
 mod seq_scan;
+mod values_scan;
 
 use std::fmt::Debug;
 
 use ultrasql_core::Schema;
 use ultrasql_vec::Batch;
 
+pub use eval::{Eval, EvalError};
 pub use filter::FilterEqI32;
+pub use filter_op::Filter;
 pub use limit::Limit;
 pub use mem_table_scan::MemTableScan;
+pub use modify::{ModifyKind, ModifyTable};
 pub use project::Project;
 pub use row_codec::{RowCodec, RowCodecError};
 pub use seq_scan::{SeqScan, build_batch};
+pub use values_scan::ValuesScan;
 
 /// Errors raised by the executor.
 ///

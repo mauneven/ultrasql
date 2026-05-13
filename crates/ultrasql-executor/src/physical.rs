@@ -15,10 +15,11 @@
 //!   [`DataSource::scan`] for `table`, builds a [`MemTableScan`] over
 //!   the returned batches, and wraps it in a [`Project`] when
 //!   `projection` is set.
-//! - `LogicalPlan::Filter { predicate, .. }` accepts only the canonical
-//!   shape produced by the v0.5 planner for an `Int32 = const` check:
-//!   `Column == Literal::Int32(_)` (or the symmetric mirror). Any other
-//!   shape is `Unsupported`.
+//! - `LogicalPlan::Filter { predicate, .. }` lowers to [`Filter`]
+//!   (the general expression-interpreter-backed filter). Any predicate
+//!   that the [`Eval`] interpreter does not support at runtime surfaces
+//!   as an [`ExecError`] during execution, not a build-time error.
+//! - `LogicalPlan::Values` lowers to [`ValuesScan`].
 //! - `LogicalPlan::Project` lowers to [`Project`] iff every output
 //!   expression is a bare column reference; computed expressions are
 //!   `Unsupported`.
@@ -27,6 +28,10 @@
 //! - `LogicalPlan::Sort` is `Unsupported`.
 //! - `LogicalPlan::Empty` lowers to a [`MemTableScan`] over its
 //!   declared schema with zero batches — an EOF source.
+//! - `LogicalPlan::Insert / Update / Delete` are `Unsupported` pending
+//!   the datasource-handle refactor (wave 5+). [`ModifyTable`] and
+//!   [`ValuesScan`] exist as stand-alone operators that callers can
+//!   construct directly.
 //!
 //! The data source is injected through [`DataSource`] rather than
 //! resolved via the catalog so this layer stays decoupled from the
@@ -34,11 +39,13 @@
 //! callers will supply an implementation backed by the storage engine;
 //! the v0.5 tests and the bring-up CLI supply an in-memory one.
 
-use ultrasql_core::{DataType, Schema, Value};
-use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
+use ultrasql_core::Schema;
+use ultrasql_planner::{LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
 
-use crate::{FilterEqI32, Limit, MemTableScan, Operator, Project};
+use crate::filter_op::Filter;
+use crate::values_scan::ValuesScan;
+use crate::{Limit, MemTableScan, Operator, Project};
 
 /// Pluggable backing store for [`build_operator`].
 ///
@@ -134,7 +141,7 @@ pub fn build_operator(
 
         LogicalPlan::Filter { input, predicate } => {
             let child = build_operator(input, data_source)?;
-            build_filter(child, predicate)
+            Ok(Box::new(Filter::new(child, predicate.clone())))
         }
 
         LogicalPlan::Project { input, exprs, .. } => {
@@ -159,13 +166,21 @@ pub fn build_operator(
             Ok(Box::new(MemTableScan::new(schema.clone(), Vec::new())))
         }
 
-        LogicalPlan::Values { .. } => Err(BuildError::Unsupported("VALUES not supported in v0.5")),
+        LogicalPlan::Values { rows, schema } => {
+            Ok(Box::new(ValuesScan::new(rows.clone(), schema.clone())))
+        }
         LogicalPlan::Insert { .. } => Err(BuildError::Unsupported("INSERT not supported in v0.5")),
         LogicalPlan::Update { .. } => Err(BuildError::Unsupported("UPDATE not supported in v0.5")),
         LogicalPlan::Delete { .. } => Err(BuildError::Unsupported("DELETE not supported in v0.5")),
         LogicalPlan::Truncate { .. } => {
             Err(BuildError::Unsupported("TRUNCATE not supported in v0.5"))
         }
+        LogicalPlan::Join { .. } => Err(BuildError::Unsupported("JOIN not supported in v0.5")),
+        LogicalPlan::Aggregate { .. } => {
+            Err(BuildError::Unsupported("aggregate not supported in v0.5"))
+        }
+        LogicalPlan::SetOp { .. } => Err(BuildError::Unsupported("set op not supported in v0.5")),
+        LogicalPlan::Cte { .. } => Err(BuildError::Unsupported("CTE not supported in v0.5")),
     }
 }
 
@@ -203,62 +218,6 @@ fn build_project(
     }
     Project::new(child, indices)
         .map(|p| Box::new(p) as Box<dyn Operator>)
-        .map_err(map_exec_error)
-}
-
-/// Lower a single boolean predicate to a [`FilterEqI32`] over `child`.
-///
-/// The only accepted shape is `Column == Literal::Int32(_)` (or the
-/// mirror `Literal::Int32(_) == Column`). Anything else is
-/// `Unsupported`.
-fn build_filter(
-    child: Box<dyn Operator>,
-    predicate: &ScalarExpr,
-) -> Result<Box<dyn Operator>, BuildError> {
-    let ScalarExpr::Binary {
-        op: BinaryOp::Eq,
-        left,
-        right,
-        ..
-    } = predicate
-    else {
-        return Err(BuildError::Unsupported(
-            "filter predicate shape not supported in v0.5",
-        ));
-    };
-
-    let (col_idx, constant) = match (left.as_ref(), right.as_ref()) {
-        (
-            ScalarExpr::Column {
-                index,
-                data_type: DataType::Int32,
-                ..
-            },
-            ScalarExpr::Literal {
-                value: Value::Int32(k),
-                ..
-            },
-        )
-        | (
-            ScalarExpr::Literal {
-                value: Value::Int32(k),
-                ..
-            },
-            ScalarExpr::Column {
-                index,
-                data_type: DataType::Int32,
-                ..
-            },
-        ) => (*index, *k),
-        _ => {
-            return Err(BuildError::Unsupported(
-                "filter predicate shape not supported in v0.5",
-            ));
-        }
-    };
-
-    FilterEqI32::new(child, col_idx, constant)
-        .map(|f| Box::new(f) as Box<dyn Operator>)
         .map_err(map_exec_error)
 }
 
@@ -516,10 +475,11 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_predicate_shape_is_reported() {
-        // `id + 1` is a perfectly valid bound expression, but the v0.5
-        // executor can only filter `Column == Int32-literal`. We expect
-        // `Unsupported`, not a panic and not `Type`.
+    fn filter_with_arithmetic_predicate_builds_successfully() {
+        // The general Filter operator accepts any ScalarExpr; build-time
+        // validation no longer rejects non-equality predicates. An Add
+        // predicate like `id + 1` is accepted at build time and will
+        // surface a TypeMismatch at runtime (the result is Int32, not Bool).
         let src = StaticSource::with_users();
         let plan = LogicalPlan::Filter {
             input: Box::new(scan_plan()),
@@ -530,8 +490,16 @@ mod tests {
                 data_type: DataType::Int32,
             },
         };
-        let err = build_operator(&plan, &src).expect_err("filter must reject shape");
-        assert!(matches!(err, BuildError::Unsupported(_)), "got {err:?}");
+        // Builds without error now that Filter accepts all predicates.
+        let mut op = build_operator(&plan, &src).expect("general filter must build");
+        // Runtime evaluation of a non-boolean predicate surfaces as TypeMismatch.
+        let err = op
+            .next_batch()
+            .expect_err("non-boolean predicate must error at runtime");
+        assert!(
+            matches!(err, crate::ExecError::TypeMismatch(_)),
+            "expected TypeMismatch, got {err:?}"
+        );
     }
 
     #[test]
