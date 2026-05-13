@@ -355,22 +355,25 @@ Real auth. Any standard PostgreSQL driver can connect.
 - [ ] `CteScan` / `SubqueryScan`
 
 ### Join Operators
-- [ ] `NestLoop` (with inner rescan)
-- [ ] `HashJoin` (build + probe, spill to disk)
+<!-- wave 5 partial: 3d5e315 -->
+- [x] `NestLoop` (with inner rescan via factory closure)
+- [x] `HashJoin` (build + probe — Inner+LeftOuter; Right/Full/Semi/Anti and disk spill TBD)
 - [ ] `MergeJoin` (requires sorted input)
-- [ ] All join types: INNER, LEFT, RIGHT, FULL, ANTI, SEMI
+- [x] All join types: INNER, LEFT, RIGHT, FULL (via NLJ); ANTI/SEMI TBD
 
 ### Aggregation Operators
-- [ ] `HashAggregate` with spill-to-disk
+<!-- wave 5 partial: 3d5e315 -->
+- [x] `HashAggregate` (spill-to-disk TBD)
 - [ ] `SortAggregate` (streaming over sorted input)
-- [ ] Standard aggregates: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG, JSON_AGG
+- [x] Standard aggregates: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG (JSON_AGG TBD)
 - [ ] Statistical aggregates: STDDEV, VARIANCE, CORR, PERCENTILE_CONT, PERCENTILE_DISC
 - [ ] Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE
 - [ ] `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)`
 - [ ] `WindowAgg` operator
 
 ### Other Operators
-- [ ] `Sort` with external sort (spill when exceeds `work_mem`)
+<!-- wave 5 partial: 3d5e315 -->
+- [x] `Sort` (in-memory; external spill TBD)
 - [ ] `Unique` (DISTINCT)
 - [ ] `SetOp` (UNION/INTERSECT/EXCEPT, hashed and sorted)
 - [ ] `RecursiveUnion` (WITH RECURSIVE)
@@ -393,28 +396,31 @@ Real auth. Any standard PostgreSQL driver can connect.
 - [ ] `temp_file_limit` enforcement
 
 ### Wire Protocol: Extended Query
-- [ ] `Parse` — parse named/unnamed statement, return `ParseComplete`
-- [ ] `Bind` — bind parameters to portal, return `BindComplete`
-- [ ] `Describe` — return `RowDescription` / `ParameterDescription`
-- [ ] `Execute` — execute named portal, stream `DataRow`, return `CommandComplete`
-- [ ] `Sync` — sync after error, return `ReadyForQuery`
-- [ ] `Close` — close statement or portal
-- [ ] Pipeline mode (multiple Parse/Bind/Execute before Sync)
+<!-- wave 5 codec: 266d5de (server dispatch TBD) -->
+- [x] `Parse` — codec ships; server dispatch TBD
+- [x] `Bind` — codec ships
+- [x] `Describe` — codec ships
+- [x] `Execute` — codec ships
+- [x] `Sync` — codec ships
+- [x] `Close` — codec ships
+- [ ] Pipeline mode (server-side multi-message handling)
 - [ ] Server-side statement cache (keyed by name)
 - [ ] Named portals (cursor via extended protocol)
 - [ ] Binary transfer format for numeric, timestamp, etc.
 
 ### Authentication
-- [ ] `SCRAM-SHA-256` real implementation (currently bypassed)
+<!-- wave 5: 2700107 -->
+- [x] `SCRAM-SHA-256` real implementation (RFC 5802 + 7677)
 - [ ] `MD5` password auth (legacy, behind config flag)
-- [ ] `trust` auth method (for local dev)
-- [ ] `pg_hba.conf` equivalent — host-based auth rules
-- [ ] Roles and passwords stored in `pg_authid`
+- [x] `trust` auth method (via HbaMethod::Trust)
+- [x] `pg_hba.conf` equivalent — host-based auth rules
+- [x] Roles and passwords stored in `pg_authid` (in-memory; persistent in v0.8)
 
 ### SSL/TLS
-- [ ] `SSLRequest` handling (currently rejected)
-- [ ] TLS upgrade via `rustls`
-- [ ] `ssl_cert_file`, `ssl_key_file`, `ssl_ca_file` config
+<!-- wave 5: 2700107 -->
+- [x] `SSLRequest` handling
+- [x] TLS upgrade via `rustls`
+- [x] `ssl_cert_file`, `ssl_key_file`, `ssl_ca_file` config
 
 ### Other Protocol Features
 - [ ] `COPY TO STDOUT` / `COPY FROM STDIN` wire format
