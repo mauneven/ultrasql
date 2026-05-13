@@ -55,13 +55,7 @@ fn bench_buffer_append(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal/buffer_append");
     for &n in &[64_usize, 256, 1024] {
         let payload = vec![0xFFu8; n];
-        let rec = WalRecord::new(
-            RecordType::HeapInsert,
-            Xid::new(1),
-            Lsn::ZERO,
-            0,
-            payload,
-        );
+        let rec = WalRecord::new(RecordType::HeapInsert, Xid::new(1), Lsn::ZERO, 0, payload);
         group.throughput(Throughput::Bytes(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter_with_setup(

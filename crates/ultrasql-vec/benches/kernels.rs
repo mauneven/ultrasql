@@ -50,9 +50,7 @@ fn bench_sum_i64(c: &mut Criterion) {
 fn bench_min_f64(c: &mut Criterion) {
     let mut group = c.benchmark_group("vec/min_f64");
     for &n in SIZES {
-        let col = NumericColumn::from_data(
-            (0..n).map(|i| f64::from(i as i32) * 0.5_f64).collect(),
-        );
+        let col = NumericColumn::from_data((0..n).map(|i| f64::from(i as i32) * 0.5_f64).collect());
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bencher, _| {
             bencher.iter(|| {
