@@ -156,6 +156,10 @@ impl<'src> Parser<'src> {
         let head = self.peek()?;
         match head.kind {
             TokenKind::KwSelect => self.parse_select().map(|s| Statement::Select(Box::new(s))),
+            TokenKind::KwInsert => self.parse_insert().map(|s| Statement::Insert(Box::new(s))),
+            TokenKind::KwUpdate => self.parse_update().map(|s| Statement::Update(Box::new(s))),
+            TokenKind::KwDelete => self.parse_delete().map(|s| Statement::Delete(Box::new(s))),
+            TokenKind::KwTruncate => self.parse_truncate().map(Statement::Truncate),
             TokenKind::KwBegin => {
                 let tok = self.advance()?;
                 // Optional TRANSACTION.
@@ -179,7 +183,7 @@ impl<'src> Parser<'src> {
                 Ok(Statement::Rollback { span: tok.span })
             }
             other => Err(ParseError::Expected {
-                expected: "SELECT, BEGIN, COMMIT, or ROLLBACK",
+                expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, BEGIN, COMMIT, or ROLLBACK",
                 found: other,
                 offset: head.span.start as usize,
             }),

@@ -155,6 +155,8 @@ pub enum TokenKind {
     KwBoth,
     KwBy,
     KwCase,
+    /// `CASCADE` — used in `TRUNCATE … CASCADE` and DDL.
+    KwCascade,
     KwCast,
     KwChar,
     KwCharacter,
@@ -162,6 +164,8 @@ pub enum TokenKind {
     KwCollate,
     KwColumn,
     KwCommit,
+    /// `CONFLICT` — used in `ON CONFLICT`.
+    KwConflict,
     KwConstraint,
     KwCreate,
     KwCross,
@@ -197,6 +201,8 @@ pub enum TokenKind {
     KwIlike,
     KwIn,
     KwIndex,
+    /// `IDENTITY` — used in `TRUNCATE … RESTART IDENTITY`.
+    KwIdentity,
     KwInner,
     KwInsert,
     KwInt,
@@ -215,6 +221,8 @@ pub enum TokenKind {
     KwLimit,
     KwNatural,
     KwNot,
+    /// `NOTHING` — used in `ON CONFLICT DO NOTHING`.
+    KwNothing,
     KwNull,
     KwNulls,
     KwNumeric,
@@ -232,6 +240,8 @@ pub enum TokenKind {
     KwPrimary,
     KwReal,
     KwReferences,
+    /// `RESTART` — used in `TRUNCATE … RESTART IDENTITY`.
+    KwRestart,
     KwReturning,
     KwRight,
     KwRollback,

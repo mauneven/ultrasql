@@ -11,14 +11,22 @@ use crate::span::Span;
 
 /// Top-level SQL statement.
 ///
-/// `SelectStmt` is comparatively large, so it lives behind a `Box` to
-/// keep the enum's stack size small. Pattern matching looks the same
-/// to callers.
+/// `SelectStmt` and the DML statement types are comparatively large, so
+/// they live behind a `Box` to keep the enum's stack size small. Pattern
+/// matching looks the same to callers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Statement {
     /// `SELECT ...`.
     Select(Box<SelectStmt>),
+    /// `INSERT INTO ...`.
+    Insert(Box<InsertStmt>),
+    /// `UPDATE ...`.
+    Update(Box<UpdateStmt>),
+    /// `DELETE FROM ...`.
+    Delete(Box<DeleteStmt>),
+    /// `TRUNCATE TABLE ...`.
+    Truncate(TruncateStmt),
     /// `BEGIN [TRANSACTION]`.
     Begin {
         /// Source span.
@@ -39,12 +47,137 @@ pub enum Statement {
 impl Statement {
     /// Source span enclosing this statement.
     #[must_use]
-    pub const fn span(&self) -> Span {
+    pub fn span(&self) -> Span {
         match self {
             Self::Select(s) => s.span,
+            Self::Insert(s) => s.span,
+            Self::Update(s) => s.span,
+            Self::Delete(s) => s.span,
+            Self::Truncate(s) => s.span,
             Self::Begin { span } | Self::Commit { span } | Self::Rollback { span } => *span,
         }
     }
+}
+
+/// An `INSERT` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InsertStmt {
+    /// Target table.
+    pub table: ObjectName,
+    /// Explicit column list (empty means all columns, positional).
+    pub columns: Vec<Identifier>,
+    /// Source of rows to insert.
+    pub source: InsertSource,
+    /// Optional `ON CONFLICT` clause.
+    pub on_conflict: Option<OnConflict>,
+    /// Optional `RETURNING` projection list (empty = no RETURNING).
+    pub returning: Vec<SelectItem>,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// The source of rows in an `INSERT` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InsertSource {
+    /// `VALUES (a, b), (c, d), ...` — one `Vec<Expr>` per row.
+    Values(Vec<Vec<Expr>>),
+    /// `INSERT ... SELECT ...`.
+    Select(Box<SelectStmt>),
+    /// `INSERT ... DEFAULT VALUES`.
+    DefaultValues,
+}
+
+/// `ON CONFLICT` clause of an `INSERT` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OnConflict {
+    /// `ON CONFLICT [target] DO NOTHING`.
+    DoNothing {
+        /// Optional conflict target (columns).
+        target: Option<ConflictTarget>,
+        /// Source span.
+        span: Span,
+    },
+    /// `ON CONFLICT target DO UPDATE SET ...`.
+    DoUpdate {
+        /// Conflict target (columns).
+        target: ConflictTarget,
+        /// `SET` assignments.
+        set: Vec<Assignment>,
+        /// Optional `WHERE` filter on the update.
+        r#where: Option<Expr>,
+        /// Source span.
+        span: Span,
+    },
+}
+
+/// Conflict target in an `ON CONFLICT` clause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConflictTarget {
+    /// The indexed columns whose uniqueness constraint was violated.
+    pub columns: Vec<Identifier>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// A `col = expr` assignment used in `UPDATE … SET` and
+/// `ON CONFLICT … DO UPDATE SET`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Assignment {
+    /// Target column name.
+    pub target: Identifier,
+    /// New value expression.
+    pub value: Expr,
+    /// Source span.
+    pub span: Span,
+}
+
+/// An `UPDATE` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateStmt {
+    /// Target table.
+    pub table: ObjectName,
+    /// Optional alias for the target table.
+    pub alias: Option<Identifier>,
+    /// `SET` assignments (must be non-empty).
+    pub set: Vec<Assignment>,
+    /// Optional `FROM` clause (additional table references).
+    pub from: Vec<TableRef>,
+    /// Optional `WHERE` predicate.
+    pub r#where: Option<Expr>,
+    /// Optional `RETURNING` projection list (empty = no RETURNING).
+    pub returning: Vec<SelectItem>,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// A `DELETE` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeleteStmt {
+    /// Target table.
+    pub table: ObjectName,
+    /// Optional alias for the target table.
+    pub alias: Option<Identifier>,
+    /// Optional `USING` clause (additional table references).
+    pub using: Vec<TableRef>,
+    /// Optional `WHERE` predicate.
+    pub r#where: Option<Expr>,
+    /// Optional `RETURNING` projection list (empty = no RETURNING).
+    pub returning: Vec<SelectItem>,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// A `TRUNCATE TABLE` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TruncateStmt {
+    /// Tables to truncate (one or more).
+    pub tables: Vec<ObjectName>,
+    /// Whether `RESTART IDENTITY` was specified.
+    pub restart_identity: bool,
+    /// Whether `CASCADE` was specified.
+    pub cascade: bool,
+    /// Source span of the entire statement.
+    pub span: Span,
 }
 
 /// A `SELECT` statement.
