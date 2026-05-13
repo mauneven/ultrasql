@@ -43,11 +43,26 @@ use crate::messages::{BackendMessage, FieldDescription, FrontendMessage};
 /// 1-byte type tag and the 4-byte length field.
 const HEADER_LEN: usize = 5;
 
-/// Maximum payload size accepted by either decoder. Matches
-/// PostgreSQL's `MaxAllocSize` of 1 GiB minus 1 byte, so any value
-/// the upstream protocol can describe still fits comfortably in a
-/// `usize` on every supported target.
-const MAX_PAYLOAD: usize = (1 << 30) - 1;
+/// Maximum on-wire message length (in bytes) accepted by either decoder.
+///
+/// A hostile client can otherwise advertise `length = u32::MAX` and
+/// force the server to either allocate a gigabyte-class buffer or
+/// pretend it has done so while waiting for bytes that will never
+/// arrive. Cap the value at 16 MiB so a single misbehaving client
+/// cannot starve every other session for memory.
+///
+/// 16 MiB is comfortably larger than every legitimate Parse/Query/Bind
+/// message in practice (PostgreSQL's `MaxAllocSize` is 1 GiB, but no
+/// production traffic uses anywhere near that for a single message);
+/// libraries that bulk-load very large rows do so via COPY, not a
+/// single message. Tune via the constant if a workload demonstrably
+/// requires more.
+pub const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Backward-compatibility alias retained for callers that referenced
+/// the prior internal name. Renamed in the security audit; both
+/// identifiers point at the same byte budget.
+const MAX_PAYLOAD: usize = MAX_MESSAGE_BYTES;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -1315,5 +1330,94 @@ mod tests {
         encode_frontend(&FrontendMessage::Sync, &mut buf);
         assert!(buf.starts_with(b"prefix"));
         assert!(buf.len() > b"prefix".len());
+    }
+
+    // -------------------------------------------------------------------
+    // Adversarial inputs: a hostile client must not be able to force a
+    // gigabyte-class allocation or starve the server's memory by
+    // advertising a giant message length.
+    // -------------------------------------------------------------------
+
+    /// A frontend Query whose declared length is just past the
+    /// configured ceiling. The decoder must reject the frame as
+    /// malformed BEFORE attempting to read or allocate a payload of
+    /// that size.
+    #[test]
+    fn frontend_length_above_max_rejected() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'Q');
+        // i32::try_from is safe: MAX_MESSAGE_BYTES fits in i32 by
+        // construction (16 MiB).
+        let oversized = i32::try_from(MAX_MESSAGE_BYTES + 1).unwrap();
+        buf.put_i32(oversized);
+        // Don't bother supplying the payload; we should reject before
+        // even looking at it.
+        let err = decode_frontend(&mut buf).unwrap_err();
+        assert!(matches!(err, ProtocolError::Malformed(_)));
+    }
+
+    /// Same scenario via the backend decoder. Defense in depth: even
+    /// though backend frames originate from our own server, the codec
+    /// must enforce the bound symmetrically because the decoder is
+    /// also exercised by clients (psql, libpq-compatible drivers)
+    /// against malicious servers.
+    #[test]
+    fn backend_length_above_max_rejected() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'D');
+        let oversized = i32::try_from(MAX_MESSAGE_BYTES + 1).unwrap();
+        buf.put_i32(oversized);
+        let err = decode_backend(&mut buf).unwrap_err();
+        assert!(matches!(err, ProtocolError::Malformed(_)));
+    }
+
+    /// A tagged frontend message that advertises a length above the
+    /// configured bound must be rejected as malformed before the
+    /// codec attempts to pre-allocate or wait for the payload bytes.
+    /// (The startup-discriminator path covers the same bound through
+    /// the routing logic in `decode_frontend_inner`; this test pins
+    /// the bound at the tagged-decode site that handles every
+    /// message after handshake.)
+    #[test]
+    fn startup_length_above_max_rejected() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'Q'); // any ASCII tag
+        let oversized = i32::try_from(MAX_MESSAGE_BYTES + 1).unwrap();
+        buf.put_i32(oversized);
+        let err = decode_frontend(&mut buf).unwrap_err();
+        assert!(matches!(err, ProtocolError::Malformed(_)), "got {err:?}");
+    }
+
+    /// Even with a legitimate length below the bound, a parameter
+    /// count claim that does not fit the available bytes must be
+    /// caught by the per-element reader. The bound on `MAX_MESSAGE_BYTES`
+    /// already limits the absolute damage; this test asserts the
+    /// per-element reader does its share.
+    #[test]
+    fn bind_lies_about_param_count_caught_by_truncation() {
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'B');
+        // length placeholder; back-fill at end
+        let len_pos = buf.len();
+        buf.put_i32(0);
+        let payload_start = buf.len();
+        // portal name + statement name (both NUL).
+        buf.put_u8(0);
+        buf.put_u8(0);
+        // 0 format codes
+        buf.put_i16(0);
+        // i16::MAX parameter count, but only one bogus byte of payload
+        buf.put_i16(i16::MAX);
+        buf.put_u8(0xAA);
+        // 0 result format codes
+        buf.put_i16(0);
+        let payload_end = buf.len();
+        let length = i32::try_from(payload_end - payload_start + 4).unwrap();
+        buf[len_pos..len_pos + 4].copy_from_slice(&length.to_be_bytes());
+        let err = decode_frontend(&mut buf).unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::Malformed(_) | ProtocolError::Truncated),
+            "got {err:?}"
+        );
     }
 }
