@@ -41,13 +41,17 @@
 pub mod eval;
 mod filter;
 pub(crate) mod filter_op;
+mod hash_aggregate;
+mod hash_join;
 mod limit;
 mod mem_table_scan;
 pub mod modify;
+mod nested_loop_join;
 pub mod physical;
 mod project;
 mod row_codec;
 mod seq_scan;
+mod sort;
 mod values_scan;
 
 use std::fmt::Debug;
@@ -58,12 +62,16 @@ use ultrasql_vec::Batch;
 pub use eval::{Eval, EvalError};
 pub use filter::FilterEqI32;
 pub use filter_op::Filter;
+pub use hash_aggregate::HashAggregate;
+pub use hash_join::HashJoin;
 pub use limit::Limit;
 pub use mem_table_scan::MemTableScan;
 pub use modify::{ModifyKind, ModifyTable};
+pub use nested_loop_join::NestedLoopJoin;
 pub use project::Project;
 pub use row_codec::{RowCodec, RowCodecError};
 pub use seq_scan::{SeqScan, build_batch};
+pub use sort::Sort;
 pub use values_scan::ValuesScan;
 
 /// Errors raised by the executor.
@@ -110,6 +118,13 @@ pub enum ExecError {
     /// surface — typically a length-mismatch between projected columns.
     #[error(transparent)]
     Batch(#[from] ultrasql_vec::BatchError),
+
+    /// An operator variant or join type that is not yet implemented.
+    ///
+    /// The string names the unsupported construct so callers can map it
+    /// to a stable SQLSTATE or surface a descriptive error message.
+    #[error("unsupported: {0}")]
+    Unsupported(&'static str),
 }
 
 /// Physical execution operator.
