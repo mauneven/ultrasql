@@ -4,6 +4,26 @@
 //! that is the source of truth. SIMD specializations land alongside
 //! the scalar versions and are validated bit-for-bit against scalar
 //! in property tests.
+//!
+//! Sub-modules
+//! -----------
+//! - [`filter`]     — filter kernels: `filter_eq_i32/i64`, `filter_lt/gt_i32`, `filter_eq_f64`.
+//! - [`arithmetic`] — arithmetic kernels: `add/sub/mul_i64`, `compare_i64`.
+//! - [`hash`]       — hash kernels: `hash_i64`, `hash_text_bytes` (FNV-1a).
+
+pub mod arithmetic;
+pub mod filter;
+pub mod hash;
+
+pub use arithmetic::{
+    add_i64, add_i64_scalar, compare_i64, compare_i64_scalar, mul_i64, mul_i64_scalar, sub_i64,
+    sub_i64_scalar,
+};
+pub use filter::{
+    filter_eq_f64, filter_eq_f64_scalar, filter_eq_i32, filter_eq_i32_scalar, filter_eq_i64,
+    filter_eq_i64_scalar, filter_gt_i32, filter_gt_i32_scalar, filter_lt_i32, filter_lt_i32_scalar,
+};
+pub use hash::{hash_i64, hash_i64_scalar, hash_text_bytes, hash_text_bytes_scalar};
 
 use crate::bitmap::Bitmap;
 use crate::column::NumericColumn;

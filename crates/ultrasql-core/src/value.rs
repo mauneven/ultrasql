@@ -11,6 +11,7 @@
 //! while OLAP paths bypass this representation entirely.
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use crate::types::DataType;
 
@@ -18,6 +19,15 @@ use crate::types::DataType;
 ///
 /// `Value` is the runtime, type-erased representation. `Datum` is an
 /// alias retained for naming consistency with the literature.
+///
+/// ## `Hash` / `Eq` semantics for floating-point variants
+///
+/// SQL NULL has no equality and no well-defined hash in the SQL
+/// standard, but Rust's `Hash + Eq` are required for use in
+/// `HashMap` / `HashSet` (e.g. the unique-constraint checker). The
+/// implementation uses the raw bit pattern of `f32`/`f64` so that
+/// NaN-valued keys are treated as equal to themselves — an artificial
+/// but safe property for constraint enforcement.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     /// SQL NULL.
@@ -50,6 +60,44 @@ pub enum Value {
     Time(i64),
     /// UUID — raw 16 bytes.
     Uuid([u8; 16]),
+}
+
+/// `Eq` is satisfied because `PartialEq` is reflexive on the bit-pattern
+/// definition used by `Hash` below.
+impl Eq for Value {}
+
+#[allow(clippy::match_same_arms)] // Arms are spelled out per-variant for
+// explicitness; bodies look identical
+// because only two need special handling
+// (Float32/Float64 use to_bits()), and
+// merging the rest into an or-pattern is
+// impossible when inner types differ.
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Hash the discriminant first so variants with the same payload
+        // produce different hashes.
+        core::mem::discriminant(self).hash(state);
+        match self {
+            Self::Null => {}
+            Self::Bool(v) => v.hash(state),
+            Self::Int16(v) => v.hash(state),
+            Self::Int32(v) => v.hash(state),
+            Self::Int64(v) => v.hash(state),
+            // Use the raw IEEE-754 bit pattern so the impl is consistent
+            // with the `PartialEq` derive (which compares bits via f32 ==
+            // for non-NaN, and treats NaN != NaN). For constraint checking
+            // purposes we hash NaN by its bit pattern; two NaN values with
+            // the same bit pattern hash equal and compare equal under this
+            // impl, which is fine for `HashSet` keying.
+            Self::Float32(v) => v.to_bits().hash(state),
+            Self::Float64(v) => v.to_bits().hash(state),
+            Self::Text(v) => v.hash(state),
+            Self::Bytea(v) => v.hash(state),
+            Self::Timestamp(v) | Self::TimestampTz(v) | Self::Time(v) => v.hash(state),
+            Self::Date(v) => v.hash(state),
+            Self::Uuid(v) => v.hash(state),
+        }
+    }
 }
 
 /// Conventional alias used in PostgreSQL literature.

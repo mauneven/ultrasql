@@ -201,6 +201,117 @@ pub fn cost_aggregate(input: CostEstimate, n_groups: f64, gucs: &CostGucs) -> Co
 }
 
 // ============================================================================
+// Bitmap heap scan
+// ============================================================================
+
+/// Cost of a bitmap heap scan preceded by one or more bitmap index scans.
+///
+/// The bitmap index scan phase costs like a regular index scan but uses
+/// sequential I/O for the heap portion: once the bitmap is built, pages are
+/// fetched in physical order, amortising random-access overhead.
+///
+/// - Bitmap build cost: `startup_cost` of `cost_index_scan` (root-to-leaf
+///   traversal) plus `match_rows * cpu_index_tuple_cost`.
+/// - Heap fetch cost: `heap_pages * seq_page_cost + rows * cpu_tuple_cost`,
+///   because pages are read in order (not random).
+///
+/// `heap_pages` is estimated as `ceil(rows / 100)` (same heuristic as index
+/// scan). `rows` = `total_rows * selectivity`.
+///
+/// This is preferred over a plain `IndexScan` when selectivity ∈ [0.5%, 10%]
+/// or when two or more indexes apply.
+pub fn cost_bitmap_heap_scan(
+    stats: &dyn StatsSource,
+    table: &str,
+    index_height: u32,
+    selectivity: f64,
+    gucs: &CostGucs,
+) -> CostEstimate {
+    let total_rows = stats.row_count(table) as f64;
+    let rows = total_rows * selectivity;
+    let heap_pages = (rows / 100.0).ceil();
+    let startup = rows.mul_add(
+        gucs.cpu_index_tuple_cost,
+        f64::from(index_height) * gucs.random_page_cost,
+    );
+    let heap_cost = heap_pages.mul_add(gucs.seq_page_cost, rows * gucs.cpu_tuple_cost);
+    CostEstimate {
+        total_cost: startup + heap_cost,
+        startup_cost: startup,
+        rows,
+        width: 100,
+    }
+}
+
+// ============================================================================
+// Index-only scan
+// ============================================================================
+
+/// Cost of an index-only scan (no heap fetch required).
+///
+/// When the visibility map indicates all pages are all-visible, the index
+/// entry itself contains all required column values and no heap page needs
+/// to be read.
+///
+/// Formula: same as [`cost_index_scan`] but with `random_page_cost` for heap
+/// replaced by zero, since no heap I/O is performed.
+///
+/// - Startup cost: `index_height * random_page_cost`.
+/// - Total cost: startup + `index_pages * random_page_cost`
+///   + `rows * cpu_index_tuple_cost`.
+pub fn cost_index_only_scan(
+    stats: &dyn StatsSource,
+    table: &str,
+    index_height: u32,
+    selectivity: f64,
+    gucs: &CostGucs,
+) -> CostEstimate {
+    let total_rows = stats.row_count(table) as f64;
+    let rows = total_rows * selectivity;
+    let index_pages = (rows / 100.0).ceil();
+    let startup = f64::from(index_height) * gucs.random_page_cost;
+    CostEstimate {
+        total_cost: rows.mul_add(gucs.cpu_index_tuple_cost, startup + index_pages * gucs.random_page_cost),
+        startup_cost: startup,
+        rows,
+        width: 100,
+    }
+}
+
+// ============================================================================
+// Parallel cost annotation
+// ============================================================================
+
+/// Apply a parallel-query cost annotation to an existing `CostEstimate`.
+///
+/// The total cost is divided by `workers` (modelling perfect parallel speedup),
+/// then `parallel_setup_cost` is added to the startup cost to account for
+/// worker spawning overhead.
+///
+/// This function annotates the *planner's estimate* only; it does not
+/// implement actual parallel execution.  Physical operators remain unchanged;
+/// the annotation influences join enumeration and plan selection when
+/// `workers > 1`.
+///
+/// If `workers` is 0 or 1, the estimate is returned unchanged.
+pub fn annotate_parallel(
+    input: CostEstimate,
+    workers: usize,
+    gucs: &CostGucs,
+) -> CostEstimate {
+    if workers <= 1 {
+        return input;
+    }
+    let w = workers as f64;
+    CostEstimate {
+        total_cost: input.total_cost / w,
+        startup_cost: input.startup_cost + gucs.parallel_setup_cost,
+        rows: input.rows,
+        width: input.width,
+    }
+}
+
+// ============================================================================
 // Filter
 // ============================================================================
 
@@ -368,5 +479,62 @@ mod tests {
             nlj.total_cost,
             hj.total_cost,
         );
+    }
+
+    /// `BitmapHeapScan` has non-zero startup and uses `seq_page_cost` for heap.
+    #[test]
+    fn bitmap_heap_scan_has_nonzero_startup_and_scales() {
+        let stats = FixedStats { rows: 100_000, pages: 1_000 };
+        let g = gucs();
+        let est = cost_bitmap_heap_scan(&stats, "t", 3, 0.05, &g);
+        assert!(est.startup_cost > 0.0, "startup should be > 0");
+        assert!(est.total_cost >= est.startup_cost);
+        assert!((est.rows - 5_000.0).abs() < 1e-6, "rows={}", est.rows);
+    }
+
+    /// `IndexOnlyScan` is cheaper than `IndexScan` for the same parameters
+    /// because it skips heap I/O.
+    #[test]
+    fn index_only_scan_cheaper_than_index_scan() {
+        let stats = FixedStats { rows: 100_000, pages: 1_000 };
+        let g = gucs();
+        let ios = cost_index_only_scan(&stats, "t", 3, 0.01, &g);
+        let idx = cost_index_scan(&stats, "t", 3, 0.01, &g);
+        assert!(
+            ios.total_cost < idx.total_cost,
+            "IndexOnlyScan={} should be < IndexScan={}",
+            ios.total_cost,
+            idx.total_cost,
+        );
+    }
+
+    /// `annotate_parallel` divides total cost by `workers` and adds setup.
+    #[test]
+    fn annotate_parallel_divides_cost_and_adds_setup() {
+        let input = CostEstimate {
+            total_cost: 1000.0,
+            startup_cost: 10.0,
+            rows: 500.0,
+            width: 8,
+        };
+        let g = gucs();
+        let out = annotate_parallel(input, 4, &g);
+        assert!((out.total_cost - 250.0).abs() < 1e-9, "total={}", out.total_cost);
+        assert!(out.startup_cost > input.startup_cost, "startup should grow");
+    }
+
+    /// `annotate_parallel` with `workers=1` returns unchanged estimate.
+    #[test]
+    fn annotate_parallel_noop_for_single_worker() {
+        let input = CostEstimate {
+            total_cost: 500.0,
+            startup_cost: 5.0,
+            rows: 100.0,
+            width: 8,
+        };
+        let g = gucs();
+        let out = annotate_parallel(input, 1, &g);
+        assert!((out.total_cost - input.total_cost).abs() < 1e-9);
+        assert!((out.startup_cost - input.startup_cost).abs() < 1e-9);
     }
 }

@@ -35,44 +35,86 @@
 //!   that need row-level expression evaluation without a full operator.
 //! - [`Project`] — column projection.
 //! - [`Limit`] — row cap across all output batches.
+//! - [`Sort`] — in-memory sort with optional spill.
+//! - [`HashJoin`] — hash equi-join (Inner, LeftOuter).
+//! - [`MergeJoin`] — merge equi-join over sorted inputs (all join types).
+//! - [`HashAggregate`] — hash-based GROUP BY / aggregate.
+//! - [`SortAggregate`] — streaming aggregate over sorted input.
+//! - [`WindowAgg`] — window function evaluation.
+//! - [`Unique`] — DISTINCT deduplication (hash or sort mode).
+//! - [`SetOp`] — UNION / INTERSECT / EXCEPT.
+//! - [`ResultOp`] — single-row constant projection.
+//! - [`Materialize`] — pipeline-breaker buffer.
+//! - [`LockRows`] — per-row lock callback pass-through.
+//! - [`WorkMemBudget`] — per-query work-memory budget.
+//! - [`IndexScan`] — B-tree index scan (point + range) over pre-probed payloads.
+//! - [`FunctionScan`] — set-returning function scan (`generate_series`).
+//! - [`CteScan`] — replay a materialised CTE buffer.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod bitmap_heap_scan;
+pub mod cte_scan;
 pub mod eval;
 mod filter;
 pub(crate) mod filter_op;
+pub mod function_scan;
 mod hash_aggregate;
 mod hash_join;
+pub mod index_scan;
 mod limit;
-mod mem_table_scan;
+pub mod lock_rows;
+pub mod materialize;
+pub mod mem_table_scan;
+pub mod merge_join;
 pub mod modify;
 mod nested_loop_join;
 pub mod physical;
 mod project;
+pub mod push_pipeline;
+pub mod result_op;
 mod row_codec;
 mod seq_scan;
+pub mod set_op;
 mod sort;
+pub mod sort_aggregate;
+pub mod unique;
 mod values_scan;
+pub mod vec_ops;
+pub mod window_agg;
+pub mod work_mem;
 
 use std::fmt::Debug;
 
 use ultrasql_core::Schema;
 use ultrasql_vec::Batch;
 
+pub use cte_scan::CteScan;
 pub use eval::{Eval, EvalError};
 pub use filter::FilterEqI32;
 pub use filter_op::Filter;
+pub use function_scan::FunctionScan;
 pub use hash_aggregate::HashAggregate;
 pub use hash_join::HashJoin;
+pub use index_scan::IndexScan;
 pub use limit::Limit;
+pub use lock_rows::LockRows;
+pub use materialize::Materialize;
 pub use mem_table_scan::MemTableScan;
+pub use merge_join::MergeJoin;
 pub use modify::{ModifyKind, ModifyTable};
 pub use nested_loop_join::NestedLoopJoin;
 pub use project::Project;
+pub use result_op::ResultOp;
 pub use row_codec::{RowCodec, RowCodecError};
 pub use seq_scan::{SeqScan, build_batch};
+pub use set_op::SetOp;
 pub use sort::Sort;
+pub use sort_aggregate::SortAggregate;
+pub use unique::Unique;
 pub use values_scan::ValuesScan;
+pub use window_agg::WindowAgg;
+pub use work_mem::WorkMemBudget;
 
 /// Errors raised by the executor.
 ///
@@ -254,5 +296,78 @@ mod tests {
         assert_eq!(project.schema().len(), 1);
         assert_eq!(project.schema().field_at(0).name, "val");
         assert_eq!(project.schema().field_at(0).data_type, DataType::Int64);
+    }
+
+    /// End-to-end pipeline: `MemTableScan` → `Sort` → `Unique` → `LockRows`.
+    ///
+    /// Uses a single-column `(id i32)` schema so that `Unique` in Sort mode
+    /// deduplicates on the same key used for sorting. Verifies that the new
+    /// v0.5 operators interoperate correctly: sort, deduplicate, then pass
+    /// each unique row through a lock callback.
+    #[test]
+    fn pipeline_sort_unique_lock_rows_end_to_end() {
+        use std::sync::{Arc, Mutex};
+        use ultrasql_planner::{ScalarExpr, SortKey};
+
+        use crate::{
+            Sort,
+            lock_rows::LockRows,
+            unique::{Unique, UniqueMode},
+        };
+
+        // Single-column schema so Unique compares on the one column.
+        let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
+
+        // Three 7s, one 1, one 3.
+        let rows: Vec<i32> = vec![7, 1, 3, 7, 7];
+        let input_batch = {
+            use ultrasql_vec::column::NumericColumn;
+            Batch::new([Column::Int32(NumericColumn::from_data(rows))]).expect("batch ok")
+        };
+        let scan = MemTableScan::new(schema.clone(), vec![input_batch]);
+
+        let sort_keys = vec![SortKey {
+            expr: ScalarExpr::Column {
+                name: "id".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            },
+            asc: true,
+            nulls_first: false,
+        }];
+        let sort = Sort::new(Box::new(scan), sort_keys, schema.clone());
+        let unique = Unique::new(Box::new(sort), UniqueMode::Sort);
+
+        // Record row count seen by the lock callback.
+        let locked_rows: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let counter = Arc::clone(&locked_rows);
+        let lock_rows = LockRows::new(
+            Box::new(unique),
+            Box::new(move |_batch, _row_idx| {
+                *counter.lock().expect("mutex ok") += 1;
+                Ok(())
+            }),
+        );
+        let mut root: Box<dyn Operator> = Box::new(lock_rows);
+
+        // Collect all output rows.
+        let mut ids: Vec<i32> = Vec::new();
+        while let Some(b) = root.next_batch().expect("pipeline must not error") {
+            match &b.columns()[0] {
+                Column::Int32(c) => ids.extend_from_slice(c.data()),
+                other => panic!("unexpected column: {other:?}"),
+            }
+        }
+
+        // After sort+unique: 1, 3, 7 (deduplicated, sorted).
+        assert_eq!(
+            ids,
+            vec![1, 3, 7],
+            "sort+unique output must be deduplicated and ordered"
+        );
+
+        // LockRows must have called the callback once per output row.
+        let locked = *locked_rows.lock().expect("mutex ok");
+        assert_eq!(locked, 3, "lock callback must fire once per unique row");
     }
 }

@@ -47,6 +47,10 @@ ipnet              = { workspace = true }
 rustls             = { workspace = true }
 tokio-rustls       = { workspace = true }
 parking_lot        = { workspace = true }
+dashmap            = { workspace = true }
+# MD5 legacy auth
+md5                = { workspace = true }
+hex                = { workspace = true }
 
 [dev-dependencies]
 rcgen              = { workspace = true }

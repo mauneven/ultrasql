@@ -388,6 +388,25 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
+    // Property test: output is always sorted ascending on column `a`
+    // -------------------------------------------------------------------------
+
+    proptest::proptest! {
+        #[test]
+        fn prop_sort_output_is_ordered(mut values in proptest::collection::vec(i32::MIN..=i32::MAX, 0..256usize)) {
+            let schema = schema_i32_i64();
+            let rows: Vec<(i32, i64)> = values.iter().copied().map(|v| (v, i64::from(v))).collect();
+            let scan = MemTableScan::new(schema.clone(), vec![make_batch(&rows)]);
+            let keys = vec![SortKey { expr: col_a(), asc: true, nulls_first: false }];
+            let mut sort = Sort::new(Box::new(scan), keys, schema);
+            let out = drain_rows(&mut sort);
+            let out_ids: Vec<i32> = out.iter().map(|(a, _)| *a).collect();
+            values.sort();
+            proptest::prop_assert_eq!(out_ids, values, "Sort output must be non-decreasing");
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Test 5: output is chunked into 4096-row batches
     // -------------------------------------------------------------------------
 

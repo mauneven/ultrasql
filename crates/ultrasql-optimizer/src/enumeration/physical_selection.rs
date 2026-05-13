@@ -26,6 +26,12 @@ use ultrasql_planner::{BinaryOp, LogicalJoinCondition, ScalarExpr, SortKey};
 
 use crate::cost::operators::{cost_hash_join, cost_merge_join, cost_nested_loop};
 use crate::cost::{CostEstimate, CostGucs, StatsSource};
+
+// Selectivity window for which BitmapHeapScan is preferred over IndexScan.
+// Lower bound: 0.5% (below this, IndexScan's random I/O is fine).
+// Upper bound: 10% (above this, SeqScan wins).
+const BITMAP_SEL_LO: f64 = 0.005;
+const BITMAP_SEL_HI: f64 = 0.10;
 use crate::enumeration::PhysicalOp;
 
 // ============================================================================
@@ -46,6 +52,9 @@ pub struct IndexHint {
     pub unique: bool,
     /// Index access method: `"btree"` or `"hash"`.
     pub method: &'static str,
+    /// Whether all pages of this index's heap are marked all-visible in
+    /// the visibility map.  When `true`, `IndexOnlyScan` is eligible.
+    pub all_visible: bool,
 }
 
 // ============================================================================
@@ -147,9 +156,18 @@ pub fn select_agg_physical(
 
 /// Select the physical scan operator.
 ///
-/// Chooses `IndexScan` when an index is available whose leading column
-/// matches a predicate column AND the estimated output rows are at most
-/// 5% of the total table rows. Otherwise returns `SeqScan`.
+/// The selection logic, in priority order:
+///
+/// 1. **`IndexOnlyScan`** — when a matching index exists with `all_visible =
+///    true` (all heap pages are all-visible in the VM) and selectivity ≤ 5%.
+///    No heap fetch is required.
+/// 2. **`BitmapHeapScan`** — when ≥ 2 applicable indexes exist, OR when a
+///    single index matches and selectivity ∈ [`BITMAP_SEL_LO`, `BITMAP_SEL_HI`]
+///    (0.5%–10%).  Bitmap access reads heap pages in physical order, beating
+///    random-I/O index scans for medium selectivities.
+/// 3. **`IndexScan`** — when a single index matches and selectivity ≤ 5%.
+/// 4. **`SeqScan`** — fallback when no index applies or selectivity is too
+///    high for index access.
 pub fn select_scan_physical(
     table: &str,
     predicates: &[ScalarExpr],
@@ -162,24 +180,50 @@ pub fn select_scan_physical(
         return PhysicalOp::SeqScan;
     }
 
+    // Collect matching (index, selectivity) pairs.
+    let mut matches: Vec<(&IndexHint, f64)> = Vec::new();
     for hint in available_indexes {
         if hint.columns.is_empty() {
             continue;
         }
         let leading_col = hint.columns[0];
-        // Check if any predicate references the leading index column.
         for pred in predicates {
             if predicate_references_column(pred, leading_col) {
-                // Estimate selectivity for this predicate.
                 let sel =
                     crate::cost::selectivity::selectivity(pred, stats, table, total_rows as u64);
-                if sel * total_rows <= 0.05 * total_rows {
-                    return PhysicalOp::IndexScan;
-                }
+                matches.push((hint, sel));
+                break; // one predicate per index is enough
             }
         }
     }
 
+    // ── 1. IndexOnlyScan ────────────────────────────────────────────────────
+    for &(hint, sel) in &matches {
+        if hint.all_visible && sel <= 0.05 {
+            return PhysicalOp::IndexOnlyScan;
+        }
+    }
+
+    // ── 2. BitmapHeapScan ───────────────────────────────────────────────────
+    // Use BitmapHeapScan when ≥2 indexes match, or when selectivity is in the
+    // medium range where sequential-order heap access beats random I/O.
+    if matches.len() >= 2 {
+        return PhysicalOp::BitmapHeapScan;
+    }
+    if let Some(&(_, sel)) = matches.first() {
+        if (BITMAP_SEL_LO..=BITMAP_SEL_HI).contains(&sel) {
+            return PhysicalOp::BitmapHeapScan;
+        }
+    }
+
+    // ── 3. IndexScan ────────────────────────────────────────────────────────
+    if let Some(&(_, sel)) = matches.first() {
+        if sel <= 0.05 {
+            return PhysicalOp::IndexScan;
+        }
+    }
+
+    // ── 4. SeqScan (fallback) ───────────────────────────────────────────────
     PhysicalOp::SeqScan
 }
 
@@ -358,6 +402,7 @@ mod tests {
             columns: vec![0],
             unique: false,
             method: "btree",
+            all_visible: false,
         };
         let gucs = CostGucs::default();
         let op = select_scan_physical("t", &preds, &[idx], &HighRowStats, &gucs);
@@ -373,5 +418,89 @@ mod tests {
         let gucs = CostGucs::default();
         let op = select_join_physical(left, right, &cond, &gucs, None);
         assert_eq!(op, PhysicalOp::HashJoin, "USING should select HashJoin");
+    }
+
+    /// Stats that return a fixed row/page/n_distinct count.
+    struct RichStats {
+        rows: u64,
+        pages: u64,
+        n_distinct: f64,
+    }
+    impl StatsSource for RichStats {
+        fn row_count(&self, _: &str) -> u64 { self.rows }
+        fn page_count(&self, _: &str) -> u64 { self.pages }
+        fn null_frac(&self, _: &str, _: usize) -> f64 { 0.0 }
+        fn n_distinct(&self, _: &str, _: usize) -> f64 { self.n_distinct }
+    }
+
+    /// `BitmapHeapScan` is chosen when ≥ 2 applicable indexes match.
+    #[test]
+    fn bitmap_heap_scan_selected_for_two_matching_indexes() {
+        let stats = RichStats { rows: 100_000, pages: 1_000, n_distinct: 100_000.0 };
+        let preds = vec![
+            ScalarExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(col(0)),
+                right: Box::new(lit_int(1)),
+                data_type: DataType::Bool,
+            },
+            ScalarExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(col(1)),
+                right: Box::new(lit_int(2)),
+                data_type: DataType::Bool,
+            },
+        ];
+        let idx0 = IndexHint {
+            name: "idx_c0".into(), columns: vec![0], unique: false,
+            method: "btree", all_visible: false,
+        };
+        let idx1 = IndexHint {
+            name: "idx_c1".into(), columns: vec![1], unique: false,
+            method: "btree", all_visible: false,
+        };
+        let gucs = CostGucs::default();
+        let op = select_scan_physical("t", &preds, &[idx0, idx1], &stats, &gucs);
+        assert_eq!(op, PhysicalOp::BitmapHeapScan, "got {op:?}");
+    }
+
+    /// `BitmapHeapScan` is chosen for selectivity in the [0.5%, 10%] window.
+    #[test]
+    fn bitmap_heap_scan_selected_for_medium_selectivity() {
+        // n_distinct = 50 → sel = 1/50 = 2% → in [0.5%, 10%]
+        let stats = RichStats { rows: 100_000, pages: 1_000, n_distinct: 50.0 };
+        let preds = vec![ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(col(0)),
+            right: Box::new(lit_int(42)),
+            data_type: DataType::Bool,
+        }];
+        let idx = IndexHint {
+            name: "idx_c0".into(), columns: vec![0], unique: false,
+            method: "btree", all_visible: false,
+        };
+        let gucs = CostGucs::default();
+        let op = select_scan_physical("t", &preds, &[idx], &stats, &gucs);
+        assert_eq!(op, PhysicalOp::BitmapHeapScan, "got {op:?}");
+    }
+
+    /// `IndexOnlyScan` is chosen when `all_visible = true` and selectivity ≤ 5%.
+    #[test]
+    fn index_only_scan_selected_when_all_visible() {
+        // n_distinct = 10_000 → sel = 1/10_000 = 0.01% → ≤ 5%
+        let stats = RichStats { rows: 100_000, pages: 1_000, n_distinct: 10_000.0 };
+        let preds = vec![ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(col(0)),
+            right: Box::new(lit_int(7)),
+            data_type: DataType::Bool,
+        }];
+        let idx = IndexHint {
+            name: "idx_c0".into(), columns: vec![0], unique: true,
+            method: "btree", all_visible: true,
+        };
+        let gucs = CostGucs::default();
+        let op = select_scan_physical("t", &preds, &[idx], &stats, &gucs);
+        assert_eq!(op, PhysicalOp::IndexOnlyScan, "got {op:?}");
     }
 }
