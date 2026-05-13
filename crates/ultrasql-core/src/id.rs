@@ -453,10 +453,7 @@ mod tests {
 
     #[test]
     fn tuple_id_display() {
-        let tid = TupleId::new(
-            PageId::new(RelationId::new(7), BlockNumber::new(13)),
-            5,
-        );
+        let tid = TupleId::new(PageId::new(RelationId::new(7), BlockNumber::new(13)), 5);
         assert_eq!(format!("{tid}"), "7/13:5");
     }
 

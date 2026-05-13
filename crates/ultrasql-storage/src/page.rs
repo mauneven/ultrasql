@@ -264,15 +264,12 @@ impl PageHeader {
     /// of a page.
     pub fn decode(bytes: &[u8; PAGE_SIZE]) -> Result<Self, PageError> {
         let lsn = read_u64_le(&bytes[0..8]).map_err(|_| PageError::Malformed("lsn"))?;
-        let checksum =
-            read_u32_le(&bytes[8..12]).map_err(|_| PageError::Malformed("checksum"))?;
+        let checksum = read_u32_le(&bytes[8..12]).map_err(|_| PageError::Malformed("checksum"))?;
         let flags = read_u16_le(&bytes[12..14]).map_err(|_| PageError::Malformed("flags"))?;
-        let kind_raw =
-            read_u16_le(&bytes[14..16]).map_err(|_| PageError::Malformed("kind"))?;
+        let kind_raw = read_u16_le(&bytes[14..16]).map_err(|_| PageError::Malformed("kind"))?;
         let lower = read_u16_le(&bytes[16..18]).map_err(|_| PageError::Malformed("lower"))?;
         let upper = read_u16_le(&bytes[18..20]).map_err(|_| PageError::Malformed("upper"))?;
-        let special =
-            read_u16_le(&bytes[20..22]).map_err(|_| PageError::Malformed("special"))?;
+        let special = read_u16_le(&bytes[20..22]).map_err(|_| PageError::Malformed("special"))?;
         let version = bytes[22];
 
         let kind = PageKind::from_u16(kind_raw).ok_or(PageError::Malformed("unknown page kind"))?;
@@ -636,7 +633,10 @@ mod tests {
         assert_eq!(page.read_tuple(slot).unwrap(), payload);
         let h = page.header();
         assert_eq!(h.slot_count(), 1);
-        assert_eq!(h.free_space(), PAGE_SIZE - PAGE_HEADER_SIZE - ITEMID_SIZE - payload.len());
+        assert_eq!(
+            h.free_space(),
+            PAGE_SIZE - PAGE_HEADER_SIZE - ITEMID_SIZE - payload.len()
+        );
     }
 
     #[test]

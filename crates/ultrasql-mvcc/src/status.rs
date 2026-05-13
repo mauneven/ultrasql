@@ -101,7 +101,11 @@ pub mod test_support {
             if xid == Xid::FROZEN {
                 return XidStatus::Frozen;
             }
-            *self.states.read().get(&xid).unwrap_or(&XidStatus::InProgress)
+            *self
+                .states
+                .read()
+                .get(&xid)
+                .unwrap_or(&XidStatus::InProgress)
         }
     }
 }

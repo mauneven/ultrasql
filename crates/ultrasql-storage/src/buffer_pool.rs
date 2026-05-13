@@ -172,7 +172,9 @@ impl<L: PageLoader> BufferPool<L> {
     #[must_use]
     pub fn new(capacity: usize, loader: L) -> Self {
         assert!(capacity > 0, "buffer pool capacity must be > 0");
-        let frames = (0..capacity).map(|_| CachePadded::new(Frame::empty())).collect();
+        let frames = (0..capacity)
+            .map(|_| CachePadded::new(Frame::empty()))
+            .collect();
         Self {
             frames,
             page_table: DashMap::with_capacity(capacity),
@@ -193,8 +195,12 @@ impl<L: PageLoader> BufferPool<L> {
         self.counters.gets.fetch_add(1, Ordering::Relaxed);
 
         if let Some(frame_idx) = self.lookup(page_id) {
-            self.frames[frame_idx].pin_count.fetch_add(1, Ordering::AcqRel);
-            self.frames[frame_idx].clock_ref.store(true, Ordering::Release);
+            self.frames[frame_idx]
+                .pin_count
+                .fetch_add(1, Ordering::AcqRel);
+            self.frames[frame_idx]
+                .clock_ref
+                .store(true, Ordering::Release);
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(PageGuard {
                 pool: Arc::clone(self),
@@ -256,9 +262,7 @@ impl<L: PageLoader> BufferPool<L> {
     fn acquire_frame_for(&self, _new_page_id: PageId) -> Result<usize, BufferPoolError> {
         // First, look for a free frame.
         for (idx, frame) in self.frames.iter().enumerate() {
-            if frame.pin_count.load(Ordering::Acquire) == 0
-                && frame.page_id.lock().is_none()
-            {
+            if frame.pin_count.load(Ordering::Acquire) == 0 && frame.page_id.lock().is_none() {
                 return Ok(idx);
             }
         }
@@ -314,7 +318,6 @@ impl<L: PageLoader> BufferPool<L> {
         // before unpin.
         frame.pin_count.fetch_sub(1, Ordering::Release);
     }
-
 }
 
 /// RAII guard returned by [`BufferPool::get_page`].
@@ -476,7 +479,11 @@ mod tests {
         let _g2 = pool.get_page(pid(2)).unwrap();
         let _g3 = pool.get_page(pid(3)).unwrap();
         let stats = pool.stats();
-        assert!(stats.evictions >= 1, "expected ≥1 eviction, got {}", stats.evictions);
+        assert!(
+            stats.evictions >= 1,
+            "expected ≥1 eviction, got {}",
+            stats.evictions
+        );
         assert_eq!(stats.resident, 2);
     }
 

@@ -183,7 +183,9 @@ mod tests {
     #[test]
     fn append_assigns_monotonic_lsns() {
         let buf = WalBuffer::new(64 * 1024, Lsn::new(1000));
-        let a = buf.append(&rec(RecordType::HeapInsert, b"a", Lsn::ZERO)).unwrap();
+        let a = buf
+            .append(&rec(RecordType::HeapInsert, b"a", Lsn::ZERO))
+            .unwrap();
         let b = buf.append(&rec(RecordType::HeapInsert, b"bb", a)).unwrap();
         let c = buf.append(&rec(RecordType::HeapInsert, b"ccc", b)).unwrap();
         assert_eq!(a, Lsn::new(1000));
@@ -195,7 +197,8 @@ mod tests {
     fn drain_returns_appended_bytes_in_order() {
         let buf = WalBuffer::new(64 * 1024, Lsn::new(0));
         for i in 0_u8..5 {
-            buf.append(&rec(RecordType::HeapInsert, &[i], Lsn::ZERO)).unwrap();
+            buf.append(&rec(RecordType::HeapInsert, &[i], Lsn::ZERO))
+                .unwrap();
         }
         let drained = buf.drain();
         // We can decode the records back out of the byte stream in
@@ -216,14 +219,17 @@ mod tests {
     fn full_buffer_rejects_appends() {
         // Set capacity just under one record's worth.
         let buf = WalBuffer::new(20, Lsn::new(0));
-        let err = buf.append(&rec(RecordType::HeapInsert, b"abc", Lsn::ZERO)).unwrap_err();
+        let err = buf
+            .append(&rec(RecordType::HeapInsert, b"abc", Lsn::ZERO))
+            .unwrap_err();
         assert!(matches!(err, WalBufferError::Full { .. }));
     }
 
     #[test]
     fn drain_resets_used_to_zero() {
         let buf = WalBuffer::new(1024, Lsn::new(0));
-        buf.append(&rec(RecordType::HeapInsert, b"x", Lsn::ZERO)).unwrap();
+        buf.append(&rec(RecordType::HeapInsert, b"x", Lsn::ZERO))
+            .unwrap();
         assert!(buf.buffered_bytes() > 0);
         let _ = buf.drain();
         assert_eq!(buf.buffered_bytes(), 0);
@@ -241,7 +247,9 @@ mod tests {
     fn next_lsn_advances_with_appends() {
         let buf = WalBuffer::new(1024, Lsn::new(100));
         assert_eq!(buf.next_lsn(), Lsn::new(100));
-        let _ = buf.append(&rec(RecordType::HeapInsert, b"x", Lsn::ZERO)).unwrap();
+        let _ = buf
+            .append(&rec(RecordType::HeapInsert, b"x", Lsn::ZERO))
+            .unwrap();
         assert!(buf.next_lsn() > Lsn::new(100));
     }
 }

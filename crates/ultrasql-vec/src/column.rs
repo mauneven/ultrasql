@@ -330,7 +330,11 @@ mod tests {
 
     #[test]
     fn string_column_round_trip() {
-        let c = StringColumn::from_data(vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]);
+        let c = StringColumn::from_data(vec![
+            "alpha".to_string(),
+            "beta".to_string(),
+            "gamma".to_string(),
+        ]);
         assert_eq!(c.len(), 3);
         assert_eq!(c.value(0), "alpha");
         assert_eq!(c.value(1), "beta");

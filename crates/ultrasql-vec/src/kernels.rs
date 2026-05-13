@@ -31,8 +31,7 @@ pub fn eq_i32(a: &NumericColumn<i32>, b: &NumericColumn<i32>) -> Bitmap {
     // and AVX2 on x86-64-v3 without intrinsics for this shape.
     for i in 0..n {
         let matched = xa[i] == xb[i];
-        let nulls_ok = a.nulls().is_none_or(|m| m.get(i))
-            && b.nulls().is_none_or(|m| m.get(i));
+        let nulls_ok = a.nulls().is_none_or(|m| m.get(i)) && b.nulls().is_none_or(|m| m.get(i));
         if matched && nulls_ok {
             out.set(i, true);
         }
@@ -44,12 +43,7 @@ pub fn eq_i32(a: &NumericColumn<i32>, b: &NumericColumn<i32>) -> Bitmap {
 #[must_use]
 pub fn sum_i64(column: &NumericColumn<i64>) -> i64 {
     column.nulls().map_or_else(
-        || {
-            column
-                .data()
-                .iter()
-                .fold(0_i64, |a, b| a.wrapping_add(*b))
-        },
+        || column.data().iter().fold(0_i64, |a, b| a.wrapping_add(*b)),
         |nulls| {
             let mut s: i64 = 0;
             for (i, v) in column.data().iter().enumerate() {
@@ -151,11 +145,7 @@ mod tests {
     fn min_f64_skips_nan_and_nulls() {
         let mut nulls = Bitmap::new(5, true);
         nulls.set(0, false);
-        let c = NumericColumn::with_nulls(
-            vec![f64::NAN, 1.0, 0.5, f64::NAN, 2.0],
-            nulls,
-        )
-        .unwrap();
+        let c = NumericColumn::with_nulls(vec![f64::NAN, 1.0, 0.5, f64::NAN, 2.0], nulls).unwrap();
         // Row 0 null, rows 1/4 are 1.0/2.0, row 2 = 0.5, row 3 NaN.
         assert_eq!(min_f64(&c), Some(0.5));
     }

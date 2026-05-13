@@ -18,12 +18,15 @@ macro_rules! impl_reader {
         /// Returns an error if `buf` is shorter than the integer width.
         #[inline]
         pub fn $name(buf: &[u8]) -> Result<$ty, TryFromSliceError> {
-            let arr: [u8; $size] = buf.get(..$size).ok_or_else(|| {
-                // Force a TryFromSliceError. The standard way to mint
-                // one is via TryInto on a slice of wrong size.
-                let empty: &[u8] = &[];
-                <[u8; $size]>::try_from(empty).unwrap_err()
-            })?.try_into()?;
+            let arr: [u8; $size] = buf
+                .get(..$size)
+                .ok_or_else(|| {
+                    // Force a TryFromSliceError. The standard way to mint
+                    // one is via TryInto on a slice of wrong size.
+                    let empty: &[u8] = &[];
+                    <[u8; $size]>::try_from(empty).unwrap_err()
+                })?
+                .try_into()?;
             Ok(<$ty>::from_le_bytes(arr))
         }
     };

@@ -241,9 +241,7 @@ impl<'src> Lexer<'src> {
                                 self.advance();
                             }
                             None => {
-                                return Err(LexerError::UnterminatedBlockComment {
-                                    offset: start,
-                                });
+                                return Err(LexerError::UnterminatedBlockComment { offset: start });
                             }
                         }
                     }

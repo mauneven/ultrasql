@@ -5,6 +5,9 @@
 //! readable results into `benchmarks/results/`.
 
 fn main() -> std::process::ExitCode {
-    eprintln!("ultrasql-bench {} — not yet implemented", env!("CARGO_PKG_VERSION"));
+    eprintln!(
+        "ultrasql-bench {} — not yet implemented",
+        env!("CARGO_PKG_VERSION")
+    );
     std::process::ExitCode::from(0)
 }

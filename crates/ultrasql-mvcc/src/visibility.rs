@@ -240,7 +240,10 @@ mod tests {
         let snap = snap(10, 60, 50, 2); // observing at command 2
         let oracle = MapOracle::new();
         oracle.set_in_progress(Xid::new(50));
-        assert_eq!(is_visible(&header, &snap, &oracle), Visibility::DeletedByOwn);
+        assert_eq!(
+            is_visible(&header, &snap, &oracle),
+            Visibility::DeletedByOwn
+        );
     }
 
     #[test]

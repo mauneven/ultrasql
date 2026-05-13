@@ -12,8 +12,8 @@
 //! error.
 
 use crate::ast::{
-    BinaryOp, Expr, Identifier, Literal, NullsOrder, ObjectName, OrderItem, SelectItem,
-    SelectStmt, SortDirection, Statement, TableRef, UnaryOp,
+    BinaryOp, Expr, Identifier, Literal, NullsOrder, ObjectName, OrderItem, SelectItem, SelectStmt,
+    SortDirection, Statement, TableRef, UnaryOp,
 };
 use crate::lexer::{Lexer, LexerError};
 use crate::span::Span;
@@ -304,9 +304,14 @@ impl<'src> Parser<'src> {
             let nulls = if self.match_kw(TokenKind::KwNulls) {
                 // NULLS FIRST | NULLS LAST
                 let n = self.advance()?;
-                if n.text(self.source).is_some_and(|t| t.eq_ignore_ascii_case("first")) {
+                if n.text(self.source)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("first"))
+                {
                     NullsOrder::First
-                } else if n.text(self.source).is_some_and(|t| t.eq_ignore_ascii_case("last")) {
+                } else if n
+                    .text(self.source)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("last"))
+                {
                     NullsOrder::Last
                 } else {
                     return Err(ParseError::Expected {
@@ -490,7 +495,10 @@ impl<'src> Parser<'src> {
                 } else {
                     raw.to_owned()
                 };
-                Ok(Expr::Literal(Literal::String { value, span: t.span }))
+                Ok(Expr::Literal(Literal::String {
+                    value,
+                    span: t.span,
+                }))
             }
             TokenKind::KwNull => {
                 let t = self.advance()?;
@@ -514,10 +522,12 @@ impl<'src> Parser<'src> {
             TokenKind::Parameter => {
                 let t = self.advance()?;
                 let raw = t.text(self.source).unwrap_or("");
-                let n: u32 = raw[1..].parse().map_err(|_| ParseError::ParameterOutOfRange {
-                    text: raw.to_owned(),
-                    offset: t.span.start as usize,
-                })?;
+                let n: u32 = raw[1..]
+                    .parse()
+                    .map_err(|_| ParseError::ParameterOutOfRange {
+                        text: raw.to_owned(),
+                        offset: t.span.start as usize,
+                    })?;
                 Ok(Expr::Parameter {
                     index: n,
                     span: t.span,
@@ -703,11 +713,15 @@ impl<'src> Parser<'src> {
     fn lookahead_two_is(&mut self, a: TokenKind, b: TokenKind) -> bool {
         // We only ever check from after the *current* peeked token, so
         // this looks one past peek and one past that.
-        let Ok(first) = self.lookahead_at(1) else { return false };
+        let Ok(first) = self.lookahead_at(1) else {
+            return false;
+        };
         if first.kind != a {
             return false;
         }
-        let Ok(second) = self.lookahead_at(2) else { return false };
+        let Ok(second) = self.lookahead_at(2) else {
+            return false;
+        };
         second.kind == b
     }
 
@@ -854,7 +868,13 @@ mod tests {
         let SelectItem::Expr { expr, .. } = &s.projection[0] else {
             panic!()
         };
-        assert!(matches!(expr, Expr::Binary { op: BinaryOp::Eq, .. }));
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -864,7 +884,13 @@ mod tests {
         let SelectItem::Expr { expr, .. } = &s.projection[0] else {
             panic!()
         };
-        let Expr::Call { distinct, args, name, .. } = expr else {
+        let Expr::Call {
+            distinct,
+            args,
+            name,
+            ..
+        } = expr
+        else {
             panic!()
         };
         assert!(distinct);
@@ -885,7 +911,10 @@ mod tests {
     #[test]
     fn begin_commit_rollback_transactions() {
         assert!(matches!(parse("BEGIN"), Statement::Begin { .. }));
-        assert!(matches!(parse("BEGIN TRANSACTION"), Statement::Begin { .. }));
+        assert!(matches!(
+            parse("BEGIN TRANSACTION"),
+            Statement::Begin { .. }
+        ));
         assert!(matches!(parse("COMMIT"), Statement::Commit { .. }));
         assert!(matches!(parse("ROLLBACK"), Statement::Rollback { .. }));
     }

@@ -29,7 +29,10 @@ impl Bitmap {
                 *last &= mask;
             }
         }
-        Self { bits, len_bits: len }
+        Self {
+            bits,
+            len_bits: len,
+        }
     }
 
     /// Number of logical bits.

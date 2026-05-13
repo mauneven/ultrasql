@@ -11,6 +11,4 @@ pub mod buffer;
 pub mod record;
 
 pub use buffer::{WalBuffer, WalBufferError};
-pub use record::{
-    RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader,
-};
+pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};

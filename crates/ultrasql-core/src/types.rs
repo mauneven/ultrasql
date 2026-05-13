@@ -99,11 +99,9 @@ impl DataType {
             Self::Bool => Some(1),
             Self::Int16 => Some(2),
             Self::Int32 | Self::Float32 | Self::Date => Some(4),
-            Self::Int64
-            | Self::Float64
-            | Self::Time
-            | Self::Timestamp
-            | Self::TimestampTz => Some(8),
+            Self::Int64 | Self::Float64 | Self::Time | Self::Timestamp | Self::TimestampTz => {
+                Some(8)
+            }
             Self::Interval | Self::Uuid => Some(16),
             _ => None,
         }
@@ -192,13 +190,11 @@ impl DataType {
 
         // Float absorbs integer.
         if self.is_float() || other.is_float() {
-            return Ok(
-                if self == &Self::Float64 || other == &Self::Float64 {
-                    Self::Float64
-                } else {
-                    Self::Float32
-                },
-            );
+            return Ok(if self == &Self::Float64 || other == &Self::Float64 {
+                Self::Float64
+            } else {
+                Self::Float32
+            });
         }
 
         // Both integer: widen.
@@ -330,7 +326,10 @@ mod tests {
     fn display_matches_sql_names() {
         assert_eq!(DataType::Int32.to_string(), "integer");
         assert_eq!(DataType::Int64.to_string(), "bigint");
-        assert_eq!(DataType::Text { max_len: Some(50) }.to_string(), "varchar(50)");
+        assert_eq!(
+            DataType::Text { max_len: Some(50) }.to_string(),
+            "varchar(50)"
+        );
         assert_eq!(DataType::Text { max_len: None }.to_string(), "text");
         assert_eq!(
             DataType::Array(Box::new(DataType::Int32)).to_string(),
