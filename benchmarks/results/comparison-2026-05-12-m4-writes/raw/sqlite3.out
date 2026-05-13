@@ -1,0 +1,148 @@
+wal
+Run Time: real 0.002 user 0.000062 sys 0.001257
+Run Time: real 0.000 user 0.000003 sys 0.000001
+Run Time: real 0.000 user 0.000001 sys 0.000001
+Run Time: real 0.003 user 0.000057 sys 0.000242
+Run Time: real 0.000 user 0.000044 sys 0.000022
+Run Time: real 0.000 user 0.000014 sys 0.000003
+Run Time: real 0.004 user 0.000059 sys 0.000465
+Run Time: real 0.034 user 0.033237 sys 0.001255
+--measure-insert-bulk-100k--
+Run Time: real 0.001 user 0.000312 sys 0.000029
+Run Time: real 0.000 user 0.000033 sys 0.000015
+-- iter-1 begin
+Run Time: real 0.034 user 0.032856 sys 0.000930
+-- iter-1 end
+Run Time: real 0.000 user 0.000280 sys 0.000028
+Run Time: real 0.000 user 0.000028 sys 0.000015
+-- iter-2 begin
+Run Time: real 0.038 user 0.033043 sys 0.002387
+-- iter-2 end
+Run Time: real 0.001 user 0.000383 sys 0.000144
+Run Time: real 0.000 user 0.000045 sys 0.000010
+-- iter-3 begin
+Run Time: real 0.034 user 0.032799 sys 0.001004
+-- iter-3 end
+Run Time: real 0.000 user 0.000293 sys 0.000035
+Run Time: real 0.000 user 0.000033 sys 0.000013
+-- iter-4 begin
+Run Time: real 0.034 user 0.032793 sys 0.001183
+-- iter-4 end
+--end-measure--
+Run Time: real 0.000 user 0.000010 sys 0.000002
+Run Time: real 0.000 user 0.000040 sys 0.000014
+Run Time: real 0.435 user 0.414545 sys 0.016155
+--measure-insert-bulk-1m--
+Run Time: real 0.006 user 0.003416 sys 0.002084
+Run Time: real 0.000 user 0.000051 sys 0.000022
+-- iter-1 begin
+Run Time: real 0.449 user 0.424795 sys 0.016278
+-- iter-1 end
+Run Time: real 0.007 user 0.003478 sys 0.001980
+Run Time: real 0.000 user 0.000055 sys 0.000021
+-- iter-2 begin
+Run Time: real 0.469 user 0.439012 sys 0.017795
+-- iter-2 end
+Run Time: real 0.008 user 0.003498 sys 0.002787
+Run Time: real 0.000 user 0.000060 sys 0.000028
+-- iter-3 begin
+Run Time: real 0.531 user 0.491062 sys 0.021399
+-- iter-3 end
+Run Time: real 0.011 user 0.003428 sys 0.002368
+Run Time: real 0.000 user 0.000061 sys 0.000020
+-- iter-4 begin
+Run Time: real 0.459 user 0.434361 sys 0.015762
+-- iter-4 end
+--end-measure--
+Run Time: real 0.000 user 0.000017 sys 0.000003
+Run Time: real 0.003 user 0.000065 sys 0.000296
+Run Time: real 0.460 user 0.435302 sys 0.017305
+Run Time: real 0.065 user 0.047254 sys 0.013059
+--measure-update-1m--
+Run Time: real 0.005 user 0.003292 sys 0.001392
+Run Time: real 0.000 user 0.000052 sys 0.000019
+Run Time: real 0.538 user 0.507952 sys 0.020059
+-- iter-1 begin
+Run Time: real 0.064 user 0.046474 sys 0.014112
+-- iter-1 end
+Run Time: real 0.006 user 0.003911 sys 0.001487
+Run Time: real 0.000 user 0.000055 sys 0.000019
+Run Time: real 0.470 user 0.447142 sys 0.016088
+-- iter-2 begin
+Run Time: real 0.062 user 0.046764 sys 0.012458
+-- iter-2 end
+Run Time: real 0.006 user 0.003351 sys 0.001311
+Run Time: real 0.000 user 0.000053 sys 0.000020
+Run Time: real 0.476 user 0.451231 sys 0.016854
+-- iter-3 begin
+Run Time: real 0.067 user 0.047804 sys 0.014012
+-- iter-3 end
+Run Time: real 0.006 user 0.003621 sys 0.001638
+Run Time: real 0.000 user 0.000067 sys 0.000023
+Run Time: real 0.465 user 0.442450 sys 0.015966
+-- iter-4 begin
+Run Time: real 0.062 user 0.045532 sys 0.012280
+-- iter-4 end
+--end-measure--
+Run Time: real 0.000 user 0.000014 sys 0.000002
+Run Time: real 0.000 user 0.000061 sys 0.000290
+Run Time: real 0.034 user 0.033122 sys 0.000869
+Run Time: real 0.007 user 0.005641 sys 0.000477
+--measure-delete-100k--
+Run Time: real 0.000 user 0.000225 sys 0.000033
+Run Time: real 0.000 user 0.000036 sys 0.000009
+Run Time: real 0.038 user 0.033149 sys 0.001616
+-- iter-1 begin
+Run Time: real 0.007 user 0.005524 sys 0.000622
+-- iter-1 end
+Run Time: real 0.000 user 0.000234 sys 0.000038
+Run Time: real 0.000 user 0.000036 sys 0.000010
+Run Time: real 0.033 user 0.032933 sys 0.000492
+-- iter-2 begin
+Run Time: real 0.009 user 0.005671 sys 0.001220
+-- iter-2 end
+Run Time: real 0.001 user 0.000265 sys 0.000188
+Run Time: real 0.000 user 0.000036 sys 0.000007
+Run Time: real 0.034 user 0.033078 sys 0.000589
+-- iter-3 begin
+Run Time: real 0.006 user 0.005607 sys 0.000421
+-- iter-3 end
+Run Time: real 0.000 user 0.000197 sys 0.000033
+Run Time: real 0.000 user 0.000033 sys 0.000008
+Run Time: real 0.040 user 0.033099 sys 0.001324
+-- iter-4 begin
+Run Time: real 0.006 user 0.005651 sys 0.000542
+-- iter-4 end
+--end-measure--
+Run Time: real 0.000 user 0.000007 sys 0.000002
+Run Time: real 0.004 user 0.003167 sys 0.000245
+Run Time: real 0.000 user 0.000003 sys 0.000002
+Run Time: real 0.000 user 0.000023 sys 0.000007
+Run Time: real 0.032 user 0.032145 sys 0.000527
+Run Time: real 0.018 user 0.011857 sys 0.002353
+--measure-upsert-100k--
+Run Time: real 0.001 user 0.000370 sys 0.000206
+Run Time: real 0.000 user 0.000036 sys 0.000008
+Run Time: real 0.034 user 0.032961 sys 0.000537
+-- iter-1 begin
+Run Time: real 0.012 user 0.011747 sys 0.000445
+-- iter-1 end
+Run Time: real 0.000 user 0.000283 sys 0.000024
+Run Time: real 0.000 user 0.000031 sys 0.000008
+Run Time: real 0.037 user 0.032838 sys 0.001337
+-- iter-2 begin
+Run Time: real 0.012 user 0.011872 sys 0.000573
+-- iter-2 end
+Run Time: real 0.001 user 0.000261 sys 0.000048
+Run Time: real 0.000 user 0.000032 sys 0.000009
+Run Time: real 0.033 user 0.032838 sys 0.000497
+-- iter-3 begin
+Run Time: real 0.016 user 0.012016 sys 0.001246
+-- iter-3 end
+Run Time: real 0.001 user 0.000319 sys 0.000179
+Run Time: real 0.000 user 0.000047 sys 0.000010
+Run Time: real 0.033 user 0.032356 sys 0.000550
+-- iter-4 begin
+Run Time: real 0.012 user 0.011358 sys 0.000447
+-- iter-4 end
+--end-measure--

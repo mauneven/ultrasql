@@ -1,0 +1,334 @@
+{
+  "comparison": "writes cross-engine, 2026-05-12, Apple M4",
+  "host": "Apple M4 Mac mini, 16 GiB, macOS 26.5",
+  "workloads": [
+    "insert-bulk-100k",
+    "insert-bulk-1m",
+    "update-1m",
+    "delete-100k",
+    "upsert-100k"
+  ],
+  "datasets_sha256": {
+    "data_idval_100k.csv": "c69dc63efb95ce71472b526e4debd42366e27cab898cd4893b573b06635b8032",
+    "data_idval_1m.csv": "eaecb87046bb4314fc88667551c1861b94ff7b12267f30b5bb63c525e176bd10"
+  },
+  "iter_count_deviations": {
+    "insert-bulk-100k": {
+      "ultrasql_iters": 4,
+      "sql_iters": 4,
+      "reason": "reduced from 8 to 4 to fit overall wall-clock budget; per-iter cost is small (~3s) so distribution is still stable"
+    },
+    "insert-bulk-1m": {
+      "ultrasql_iters": 2,
+      "sql_iters": 4,
+      "reason": "v0.5 HeapAccess::insert is O(blocks)/insert with no FSM; each iter ~80s; reduced from the 4-iter floor to 2 to fit 25-min wall-clock cap"
+    },
+    "update-1m": {
+      "ultrasql_iters": 0,
+      "sql_iters": 4,
+      "reason": "UltraSQL skipped: ~30 min/iter at v0.5 (preload + delete-then-insert \u00d7 1M, each re-insert pays the O(blocks) walk); not runnable inside the 25-min cap"
+    },
+    "delete-100k": {
+      "ultrasql_iters": 4,
+      "sql_iters": 4,
+      "reason": "reduced from 8 to 4 to fit overall wall-clock budget; per-iter cost is small (~80ms) so distribution is still stable"
+    },
+    "upsert-100k": {
+      "ultrasql_iters": 0,
+      "sql_iters": 4,
+      "reason": "UltraSQL skipped: no native ON CONFLICT path at v0.5"
+    }
+  },
+  "results": {
+    "insert-bulk-100k": {
+      "UltraSQL (kernel)": {
+        "median_us": 1540937.46,
+        "min_us": 1455879.29,
+        "samples": 4,
+        "iterations_us": [
+          1483828.166,
+          1455879.292,
+          1598046.75,
+          1687661.625
+        ],
+        "answer": "inserted=100000",
+        "n_rows": 100000,
+        "note": "heap-access + WAL group-commit; kernel-level (no SQL pipeline)"
+      },
+      "DuckDB": {
+        "median_us": 36500.0,
+        "min_us": 36000.0,
+        "samples": 4,
+        "iterations_us": [
+          37000.0,
+          36000.0,
+          37000.0,
+          36000.0
+        ],
+        "note": "ATTACH-to-file; CHECKPOINT inside the timed region"
+      },
+      "SQLite": {
+        "median_us": 34000.0,
+        "min_us": 34000.0,
+        "samples": 4,
+        "iterations_us": [
+          34000.0,
+          38000.0,
+          34000.0,
+          34000.0
+        ],
+        "note": "tempfile; WAL mode; synchronous=NORMAL"
+      },
+      "PostgreSQL": {
+        "median_us": 333559.5,
+        "min_us": 285751.0,
+        "samples": 4,
+        "iterations_us": [
+          331774.0,
+          504384.0,
+          285751.0,
+          335345.0
+        ],
+        "note": "psql \\timing; synchronous_commit=on; fsync=on"
+      },
+      "ClickHouse": {
+        "median_us": 5000.0,
+        "min_us": 4000.0,
+        "samples": 4,
+        "iterations_us": [
+          5000.0,
+          5000.0,
+          4000.0,
+          5000.0
+        ],
+        "note": "MergeTree on disk; --time stderr elapsed; UPDATE/DELETE via ALTER + mutations_sync=2"
+      }
+    },
+    "insert-bulk-1m": {
+      "UltraSQL (kernel)": {
+        "median_us": 91687607.6,
+        "min_us": 89848984.08,
+        "samples": 2,
+        "iterations_us": [
+          93526231.125,
+          89848984.083
+        ],
+        "answer": "inserted=1000000",
+        "n_rows": 1000000,
+        "note": "heap-access + WAL group-commit; kernel-level (no SQL pipeline)"
+      },
+      "DuckDB": {
+        "median_us": 348000.0,
+        "min_us": 320000.0,
+        "samples": 4,
+        "iterations_us": [
+          345000.0,
+          361000.0,
+          351000.0,
+          320000.0
+        ],
+        "note": "ATTACH-to-file; CHECKPOINT inside the timed region"
+      },
+      "SQLite": {
+        "median_us": 464000.0,
+        "min_us": 449000.0,
+        "samples": 4,
+        "iterations_us": [
+          449000.0,
+          469000.0,
+          531000.0,
+          459000.0
+        ],
+        "note": "tempfile; WAL mode; synchronous=NORMAL"
+      },
+      "PostgreSQL": {
+        "median_us": 3789053.0,
+        "min_us": 3667032.0,
+        "samples": 4,
+        "iterations_us": [
+          3850087.0,
+          3667032.0,
+          3810956.0,
+          3767150.0
+        ],
+        "note": "psql \\timing; synchronous_commit=on; fsync=on"
+      },
+      "ClickHouse": {
+        "median_us": 51000.0,
+        "min_us": 47000.0,
+        "samples": 4,
+        "iterations_us": [
+          52000.0,
+          55000.0,
+          47000.0,
+          50000.0
+        ],
+        "note": "MergeTree on disk; --time stderr elapsed; UPDATE/DELETE via ALTER + mutations_sync=2"
+      }
+    },
+    "update-1m": {
+      "UltraSQL (kernel)": {
+        "skipped": true,
+        "reason": "each iteration ~30 min wall-clock at v0.5 (no FSM, O(blocks)/insert \u00d7 1M rows + WAL fsync); not runnable inside the 25-min cap"
+      },
+      "DuckDB": {
+        "median_us": 46000.0,
+        "min_us": 45000.0,
+        "samples": 4,
+        "iterations_us": [
+          46000.0,
+          46000.0,
+          45000.0,
+          53000.0
+        ],
+        "note": "ATTACH-to-file; CHECKPOINT inside the timed region"
+      },
+      "SQLite": {
+        "median_us": 63000.0,
+        "min_us": 62000.0,
+        "samples": 4,
+        "iterations_us": [
+          64000.0,
+          62000.0,
+          67000.0,
+          62000.0
+        ],
+        "note": "tempfile; WAL mode; synchronous=NORMAL"
+      },
+      "PostgreSQL": {
+        "median_us": 6571357.0,
+        "min_us": 5546649.0,
+        "samples": 4,
+        "iterations_us": [
+          7214281.0,
+          5546649.0,
+          6590572.0,
+          6552142.0
+        ],
+        "note": "psql \\timing; synchronous_commit=on; fsync=on"
+      },
+      "ClickHouse": {
+        "median_us": 28000.0,
+        "min_us": 27000.0,
+        "samples": 4,
+        "iterations_us": [
+          28000.0,
+          29000.0,
+          27000.0,
+          28000.0
+        ],
+        "note": "MergeTree on disk; --time stderr elapsed; UPDATE/DELETE via ALTER + mutations_sync=2"
+      }
+    },
+    "delete-100k": {
+      "UltraSQL (kernel)": {
+        "median_us": 91070.98,
+        "min_us": 85050.75,
+        "samples": 4,
+        "iterations_us": [
+          94336.042,
+          89053.625,
+          85050.75,
+          93088.333
+        ],
+        "answer": "scanned=100000",
+        "n_rows": 100000,
+        "note": "heap-access + WAL group-commit; kernel-level (no SQL pipeline)"
+      },
+      "DuckDB": {
+        "median_us": 35500.0,
+        "min_us": 35000.0,
+        "samples": 4,
+        "iterations_us": [
+          35000.0,
+          35000.0,
+          36000.0,
+          37000.0
+        ],
+        "note": "ATTACH-to-file; CHECKPOINT inside the timed region"
+      },
+      "SQLite": {
+        "median_us": 6500.0,
+        "min_us": 6000.0,
+        "samples": 4,
+        "iterations_us": [
+          7000.0,
+          9000.0,
+          6000.0,
+          6000.0
+        ],
+        "note": "tempfile; WAL mode; synchronous=NORMAL"
+      },
+      "PostgreSQL": {
+        "median_us": 12207.0,
+        "min_us": 9934.0,
+        "samples": 4,
+        "iterations_us": [
+          13770.0,
+          10644.0,
+          9934.0,
+          15372.0
+        ],
+        "note": "psql \\timing; synchronous_commit=on; fsync=on"
+      },
+      "ClickHouse": {
+        "median_us": 9000.0,
+        "min_us": 9000.0,
+        "samples": 4,
+        "iterations_us": [
+          9000.0,
+          10000.0,
+          9000.0,
+          9000.0
+        ],
+        "note": "MergeTree on disk; --time stderr elapsed; UPDATE/DELETE via ALTER + mutations_sync=2"
+      }
+    },
+    "upsert-100k": {
+      "UltraSQL (kernel)": {
+        "skipped": true,
+        "reason": "no native ON CONFLICT path at v0.5"
+      },
+      "DuckDB": {
+        "median_us": 9000.0,
+        "min_us": 8000.0,
+        "samples": 4,
+        "iterations_us": [
+          9000.0,
+          8000.0,
+          9000.0,
+          11000.0
+        ],
+        "note": "ATTACH-to-file; CHECKPOINT inside the timed region"
+      },
+      "SQLite": {
+        "median_us": 12000.0,
+        "min_us": 12000.0,
+        "samples": 4,
+        "iterations_us": [
+          12000.0,
+          12000.0,
+          16000.0,
+          12000.0
+        ],
+        "note": "tempfile; WAL mode; synchronous=NORMAL"
+      },
+      "PostgreSQL": {
+        "median_us": 264798.0,
+        "min_us": 249612.0,
+        "samples": 4,
+        "iterations_us": [
+          263848.0,
+          265748.0,
+          249612.0,
+          269232.0
+        ],
+        "note": "psql \\timing; synchronous_commit=on; fsync=on"
+      },
+      "ClickHouse": {
+        "skipped": true,
+        "reason": "no native ON CONFLICT; ReplacingMergeTree changes semantics"
+      }
+    }
+  }
+}

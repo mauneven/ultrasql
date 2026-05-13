@@ -1,0 +1,178 @@
+{
+  "comparison": "point-lookup, cross-engine, hot-session, 2026-05-12 (Apple M4)",
+  "host": "Apple M4 Mac mini, 16 GiB, macOS 26.5",
+  "workload": "point-10m-probes",
+  "description": "100,000 random point lookups by id against a 10,000,000-row (id BIGINT PRIMARY KEY, x BIGINT) table in a single hot session.",
+  "datasets_sha256": {
+    "data_id_10m.csv": "3e249eae4d627a81e3aba6cbf869e47d2385561965b3e1c621fc3b2eee207e39",
+    "probes_100k.txt": "228d6fef1f85ddd1249ace51f4c6bafc341e27963769279c67d3b3db2cc41879"
+  },
+  "methodology_md": "methodology.md",
+  "prior_comparison_path": "benchmarks/results/comparison-2026-05-12-m4-extended/results.json#point-10m",
+  "results": {
+    "point-10m-probes": {
+      "UltraSQL (kernel, BTree<i64>)": {
+        "median_ns_per_probe": 2639.455,
+        "min_ns_per_probe": 2206.734,
+        "max_ns_per_probe": 2987.251,
+        "total_wall_ns_median_run": 263945500,
+        "probes": 100000,
+        "runs": 3,
+        "note": null,
+        "raw": {
+          "workload": "point-10m-probes",
+          "engine": "UltraSQL (kernel, BTree<i64>)",
+          "n_rows": 10000000,
+          "probes": 100000,
+          "runs": 3,
+          "warmup_probes": 10000,
+          "median_ns_per_probe": 2639.455,
+          "min_ns_per_probe": 2206.734,
+          "max_ns_per_probe": 2987.251,
+          "total_wall_ns_median_run": 263945500,
+          "run_ns": [
+            298725125,
+            220673375,
+            263945500
+          ],
+          "per_probe_ns": [
+            2987.251,
+            2206.734,
+            2639.455
+          ],
+          "build_ns": 348219895416,
+          "answer": "hits=499814412580"
+        }
+      },
+      "SQLite": {
+        "median_ns_per_probe": 1100.382,
+        "min_ns_per_probe": 1095.292,
+        "max_ns_per_probe": 1115.096,
+        "total_wall_ns_median_run": 110038167,
+        "probes": 100000,
+        "runs": 3,
+        "note": "python3 sqlite3 :memory:; INTEGER PRIMARY KEY (rowid index)",
+        "raw": {
+          "workload": "point-10m-probes",
+          "engine": "SQLite",
+          "n_rows": 10000000,
+          "probes": 100000,
+          "runs": 3,
+          "warmup_probes": 10000,
+          "median_ns_per_probe": 1100.382,
+          "min_ns_per_probe": 1095.292,
+          "max_ns_per_probe": 1115.096,
+          "total_wall_ns_median_run": 110038167,
+          "run_ns": [
+            109529166,
+            111509583,
+            110038167
+          ],
+          "per_probe_ns": [
+            1095.292,
+            1115.096,
+            1100.382
+          ],
+          "setup_ns": 16692634292,
+          "note": "python3 sqlite3 :memory:; INTEGER PRIMARY KEY (rowid index)"
+        }
+      },
+      "DuckDB": {
+        "median_ns_per_probe": 50747.233,
+        "min_ns_per_probe": 49818.678,
+        "max_ns_per_probe": 53189.127,
+        "total_wall_ns_median_run": 5074723292,
+        "probes": 100000,
+        "runs": 3,
+        "note": "python3 duckdb 1.5.2 in-process; threads=1; PK auto-index",
+        "raw": {
+          "workload": "point-10m-probes",
+          "engine": "DuckDB",
+          "n_rows": 10000000,
+          "probes": 100000,
+          "runs": 3,
+          "warmup_probes": 10000,
+          "median_ns_per_probe": 50747.233,
+          "min_ns_per_probe": 49818.678,
+          "max_ns_per_probe": 53189.127,
+          "total_wall_ns_median_run": 5074723292,
+          "run_ns": [
+            5318912667,
+            5074723292,
+            4981867791
+          ],
+          "per_probe_ns": [
+            53189.127,
+            50747.233,
+            49818.678
+          ],
+          "setup_ns": 4283218750,
+          "note": "python3 duckdb 1.5.2 in-process; threads=1; PK auto-index"
+        }
+      },
+      "PostgreSQL": {
+        "median_ns_per_probe": 35758.03,
+        "min_ns_per_probe": 30180.253,
+        "max_ns_per_probe": 45083.372,
+        "total_wall_ns_median_run": 3575803042,
+        "probes": 100000,
+        "runs": 3,
+        "note": "python3 psycopg 3; same connection; server-side prepared statement; Unix socket",
+        "raw": {
+          "workload": "point-10m-probes",
+          "engine": "PostgreSQL",
+          "n_rows": 10000000,
+          "probes": 100000,
+          "runs": 3,
+          "warmup_probes": 10000,
+          "median_ns_per_probe": 35758.03,
+          "min_ns_per_probe": 30180.253,
+          "max_ns_per_probe": 45083.372,
+          "total_wall_ns_median_run": 3575803042,
+          "run_ns": [
+            3575803042,
+            3018025333,
+            4508337167
+          ],
+          "per_probe_ns": [
+            35758.03,
+            30180.253,
+            45083.372
+          ],
+          "setup_ns": 781701166,
+          "note": "python3 psycopg 3; same connection; server-side prepared statement; Unix socket"
+        }
+      },
+      "ClickHouse": {
+        "median_ns_per_probe": 10301300.275,
+        "min_ns_per_probe": 10301300.275,
+        "max_ns_per_probe": 10301300.275,
+        "total_wall_ns_median_run": 1030130027500,
+        "probes": 100000,
+        "runs": 1,
+        "note": "clickhouse local; MergeTree PK on id; 100k literal SELECTs per run; capped at 1 run (per-engine target overage; OLTP unfit, see methodology.md)",
+        "raw": {
+          "workload": "point-10m-probes",
+          "engine": "ClickHouse",
+          "n_rows": 10000000,
+          "probes": 100000,
+          "runs": 1,
+          "warmup_probes": 10000,
+          "median_ns_per_probe": 10301300.275,
+          "min_ns_per_probe": 10301300.275,
+          "max_ns_per_probe": 10301300.275,
+          "total_wall_ns_median_run": 1030130027500,
+          "run_ns": [
+            1030130027500
+          ],
+          "per_probe_ns": [
+            10301300.275
+          ],
+          "setup_ns": 2599651417,
+          "status": "ok",
+          "note": "clickhouse local; MergeTree PK on id; 100k literal SELECTs per run; capped at 1 run (per-engine target overage; OLTP unfit, see methodology.md)"
+        }
+      }
+    }
+  }
+}
