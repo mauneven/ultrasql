@@ -1,0 +1,112 @@
+//! Catalog traits.
+//!
+//! Two layered traits:
+//!
+//! - [`Catalog`] — read-only lookups. Cheap; the binder and the
+//!   optimizer call it on every statement.
+//! - [`MutableCatalog`] — DDL operations. Distinct trait so a caller
+//!   that only reads (the binder) cannot accidentally mutate.
+//!
+//! Implementations must be `Send + Sync` so a single catalog handle can
+//! be shared across worker threads. Read paths must not deadlock with
+//! write paths: the in-memory implementation uses sharded maps to
+//! guarantee that.
+
+use ultrasql_core::Oid;
+
+use crate::entry::{IndexEntry, TableEntry};
+use crate::error::CatalogError;
+
+/// Read-only catalog interface.
+///
+/// All methods are case-insensitive in their name arguments — SQL
+/// identifiers compare case-insensitively unless quoted, and the
+/// catalog stores its lookup key folded to ASCII lowercase. Callers
+/// receive owned [`TableEntry`] / [`IndexEntry`] values; cloning is
+/// cheap (the heavy field, [`ultrasql_core::Schema`], is internally
+/// `Arc`-shared).
+pub trait Catalog: Send + Sync {
+    /// Resolve a table by its bare relation name.
+    ///
+    /// Returns `None` when no table by that case-folded name is
+    /// registered. The name comparison ignores ASCII case.
+    fn lookup_table(&self, name: &str) -> Option<TableEntry>;
+
+    /// Resolve a table by its OID.
+    ///
+    /// Returns `None` when no live table holds that OID. Catalog
+    /// dropped-table tombstones are *not* returned through this path;
+    /// tombstones are an internal concern of the persistent
+    /// implementation.
+    fn lookup_table_by_oid(&self, oid: Oid) -> Option<TableEntry>;
+
+    /// Enumerate all live tables.
+    ///
+    /// The returned slice has no defined order. Callers that need a
+    /// deterministic listing should sort by `oid` or by `name` at the
+    /// call site; sorting inside the catalog would impose a cost on
+    /// every consumer.
+    fn list_tables(&self) -> Vec<TableEntry>;
+
+    /// Resolve an index by its name.
+    ///
+    /// Returns `None` when no live index by that case-folded name is
+    /// registered.
+    fn lookup_index(&self, name: &str) -> Option<IndexEntry>;
+
+    /// Enumerate every index whose `table_oid` matches the supplied
+    /// argument. The returned list is empty if there are no indexes,
+    /// or if `table_oid` does not name a live table.
+    fn list_indexes_for_table(&self, table_oid: Oid) -> Vec<IndexEntry>;
+}
+
+/// DDL-capable catalog.
+///
+/// Implementations are required to be `Send + Sync` (inherited via the
+/// [`Catalog`] supertrait). Mutating methods are called from DDL
+/// statement execution; reads can run concurrently with writes, but the
+/// implementation must guarantee that a successful create is visible to
+/// every subsequent read on the same thread (the in-memory
+/// implementation publishes through `DashMap`, which gives this for
+/// free).
+pub trait MutableCatalog: Catalog {
+    /// Register a new table.
+    ///
+    /// # Errors
+    /// - [`CatalogError::AlreadyExists`] when another live table shares
+    ///   the case-folded name or the OID.
+    fn create_table(&self, entry: TableEntry) -> Result<(), CatalogError>;
+
+    /// Remove a table by name. The associated indexes are dropped too;
+    /// callers do *not* have to drop indexes individually first.
+    ///
+    /// # Errors
+    /// - [`CatalogError::NotFound`] when no table by that name is
+    ///   registered.
+    fn drop_table(&self, name: &str) -> Result<(), CatalogError>;
+
+    /// Register a new index.
+    ///
+    /// # Errors
+    /// - [`CatalogError::AlreadyExists`] when another index by that
+    ///   name (or that OID) exists.
+    /// - [`CatalogError::SchemaConflict`] when `table_oid` does not
+    ///   name a registered table, or when any column attnum in
+    ///   `columns` is out of range for that table's schema.
+    fn create_index(&self, entry: IndexEntry) -> Result<(), CatalogError>;
+
+    /// Remove an index by name.
+    ///
+    /// # Errors
+    /// - [`CatalogError::NotFound`] when no index by that name is
+    ///   registered.
+    fn drop_index(&self, name: &str) -> Result<(), CatalogError>;
+
+    /// Update the `n_blocks` size hint stored on a table entry.
+    /// Called by ANALYZE, by bulk loaders, and by the heap when it
+    /// extends a relation.
+    ///
+    /// # Errors
+    /// - [`CatalogError::NotFound`] when no table holds that OID.
+    fn update_table_size(&self, oid: Oid, n_blocks: u32) -> Result<(), CatalogError>;
+}
