@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod applier;
 pub mod buffer;
 pub mod payload;
 pub mod record;
@@ -14,6 +15,7 @@ pub mod recovery;
 pub(crate) mod segment;
 pub mod writer;
 
+pub use applier::{ApplyError, HeapTarget, dispatch_record, replay_into};
 pub use buffer::{WalBuffer, WalBufferError};
 pub use payload::{
     AbortPayload, CheckpointPayload, CommitPayload, FullPageWritePayload, HeapDeletePayload,
