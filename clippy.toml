@@ -1,0 +1,42 @@
+# Configuration for clippy lints. Project-wide.
+
+# Identifiers that clippy::doc_markdown should not flag as
+# "missing backticks." These are product, system, and project names
+# we mention often in prose docs.
+doc-valid-idents = [
+    "UltraSQL",
+    "PostgreSQL",
+    "MySQL",
+    "SQLite",
+    "DuckDB",
+    "ClickHouse",
+    "CockroachDB",
+    "AVX2",
+    "AVX-512",
+    "ARM64",
+    "ARMv8",
+    "NEON",
+    "io_uring",
+    "InnoDB",
+    "OLTP",
+    "OLAP",
+    "MVCC",
+    "ACID",
+    "B+",
+    "L1",
+    "L2",
+    "L3",
+    "lz4",
+    "LZ4",
+    "ZSTD",
+    "zstd",
+    "NUMA",
+    "TLB",
+    "M1",
+    "M2",
+    "M3",
+    "M4",
+    "macOS",
+    "MacOS",
+    "..",
+]
