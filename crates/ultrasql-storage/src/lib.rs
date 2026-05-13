@@ -9,6 +9,8 @@
 //! 5. B+ tree index access method.
 //! 6. Free-space map + visibility map.
 //! 7. Checkpointer (periodic dirty-page flush driven by WAL durable LSN).
+//! 8. TOAST (oversize attribute storage) — inline ≤ 2 KiB, external otherwise.
+//! 9. Persistent CLOG — page-backed commit-log, 2 bits per XID.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -16,14 +18,22 @@ pub mod btree;
 pub mod buffer_pool;
 pub mod checkpointer;
 pub mod checksum;
+pub mod clog;
+pub mod fsm;
 pub mod heap;
 pub mod page;
 pub mod segment;
+pub mod toast;
+pub mod vm;
 pub mod wal_sink;
 
 pub use buffer_pool::{BufferPool, BufferPoolError, BufferPoolStats, PageGuard, PageLoader};
 pub use checkpointer::{Checkpointer, CheckpointerConfig};
+pub use clog::{ClogError, PersistentClog};
+pub use fsm::FreeSpaceMap;
 pub use page::{ItemId, ItemIdFlags, Page, PageError, PageHeader, PageKind, SlotIndex};
+pub use toast::{ToastDatum, ToastError, ToastPointer, ToastTable, maybe_toast};
+pub use vm::VisibilityMap;
 #[cfg(any(test, feature = "testing"))]
 pub use wal_sink::test_support;
 pub use wal_sink::{NullWalSink, WalSink, WalSinkError};

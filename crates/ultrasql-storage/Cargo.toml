@@ -36,6 +36,7 @@ smallvec      = { workspace = true }
 memmap2       = { workspace = true }
 libc          = { workspace = true }
 tracing       = { workspace = true }
+lz4_flex      = { workspace = true }
 
 [dev-dependencies]
 ultrasql-mvcc = { workspace = true, features = ["testing"] }
@@ -50,4 +51,8 @@ harness = false
 
 [[bench]]
 name = "buffer_pool"
+harness = false
+
+[[bench]]
+name = "storage_extras"
 harness = false
