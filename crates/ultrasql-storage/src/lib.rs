@@ -11,7 +11,9 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod buffer_pool;
 pub mod checksum;
 pub mod page;
 
+pub use buffer_pool::{BufferPool, BufferPoolError, BufferPoolStats, PageGuard, PageLoader};
 pub use page::{ItemId, ItemIdFlags, Page, PageError, PageHeader, PageKind, SlotIndex};
