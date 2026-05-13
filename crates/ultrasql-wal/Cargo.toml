@@ -1,0 +1,27 @@
+[package]
+name        = "ultrasql-wal"
+description = "UltraSQL write-ahead log: append-only durability layer with group commit."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ultrasql-core = { workspace = true }
+thiserror     = { workspace = true }
+parking_lot   = { workspace = true }
+crossbeam     = { workspace = true }
+crossbeam-queue = { workspace = true }
+bytes         = { workspace = true }
+byteorder     = { workspace = true }
+crc32c        = { workspace = true }
+tracing       = { workspace = true }
+libc          = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

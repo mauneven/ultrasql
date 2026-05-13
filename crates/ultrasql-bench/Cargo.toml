@@ -1,0 +1,26 @@
+[package]
+name        = "ultrasql-bench"
+description = "UltraSQL benchmark harness: TPC-B, TPC-C, TPC-H, micro-benchmarks."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ultrasql-bench"
+path = "src/main.rs"
+
+[dependencies]
+ultrasql-core     = { workspace = true }
+ultrasql-protocol = { workspace = true }
+anyhow            = { workspace = true }
+clap              = { workspace = true }
+tokio             = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }

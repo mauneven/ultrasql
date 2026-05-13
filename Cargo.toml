@@ -1,0 +1,152 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ultrasql-core",
+    "crates/ultrasql-storage",
+    "crates/ultrasql-wal",
+    "crates/ultrasql-mvcc",
+    "crates/ultrasql-txn",
+    "crates/ultrasql-parser",
+    "crates/ultrasql-planner",
+    "crates/ultrasql-optimizer",
+    "crates/ultrasql-executor",
+    "crates/ultrasql-vec",
+    "crates/ultrasql-catalog",
+    "crates/ultrasql-protocol",
+    "crates/ultrasql-server",
+    "crates/ultrasql-cli",
+    "crates/ultrasql-bench",
+]
+default-members = ["crates/ultrasql-server", "crates/ultrasql-cli"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+authors = ["UltraSQL Contributors"]
+repository = "https://github.com/mauneven/ultrasql"
+homepage = "https://ultrasql.org"
+documentation = "https://docs.ultrasql.org"
+readme = "README.md"
+keywords = ["database", "sql", "postgresql", "oltp", "olap"]
+categories = ["database-implementations"]
+
+[workspace.dependencies]
+# Internal
+ultrasql-core      = { path = "crates/ultrasql-core",      version = "0.0.1" }
+ultrasql-storage   = { path = "crates/ultrasql-storage",   version = "0.0.1" }
+ultrasql-wal       = { path = "crates/ultrasql-wal",       version = "0.0.1" }
+ultrasql-mvcc      = { path = "crates/ultrasql-mvcc",      version = "0.0.1" }
+ultrasql-txn       = { path = "crates/ultrasql-txn",       version = "0.0.1" }
+ultrasql-parser    = { path = "crates/ultrasql-parser",    version = "0.0.1" }
+ultrasql-planner   = { path = "crates/ultrasql-planner",   version = "0.0.1" }
+ultrasql-optimizer = { path = "crates/ultrasql-optimizer", version = "0.0.1" }
+ultrasql-executor  = { path = "crates/ultrasql-executor",  version = "0.0.1" }
+ultrasql-vec       = { path = "crates/ultrasql-vec",       version = "0.0.1" }
+ultrasql-catalog   = { path = "crates/ultrasql-catalog",   version = "0.0.1" }
+ultrasql-protocol  = { path = "crates/ultrasql-protocol",  version = "0.0.1" }
+
+# Error handling
+thiserror = "2"
+anyhow    = "1"
+
+# Concurrency / sync
+parking_lot = "0.12"
+crossbeam   = "0.8"
+crossbeam-utils = "0.8"
+crossbeam-queue = "0.3"
+dashmap     = "6"
+arc-swap    = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# Hashing / checksums
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crc32c      = "0.6"
+ahash       = "0.8"
+
+# Serialization
+bytes  = "1"
+byteorder = "1"
+bincode = "1"
+
+# Logging / tracing / metrics
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Testing / bench
+proptest   = "1"
+quickcheck = "1"
+criterion  = { version = "0.5", features = ["html_reports"] }
+rstest     = "0.23"
+
+# CLI / config
+clap   = { version = "4", features = ["derive", "env"] }
+config = "0.14"
+
+# Numerics / time
+num-traits = "0.2"
+chrono     = "0.4"
+
+# Misc
+smallvec   = "1"
+arrayvec   = "0.7"
+once_cell  = "1"
+memmap2    = "0.9"
+libc       = "0.2"
+
+[profile.dev]
+opt-level     = 0
+debug         = true
+overflow-checks = true
+
+[profile.test]
+opt-level = 1
+debug     = true
+
+[profile.bench]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+debug         = 1
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+strip         = "symbols"
+panic         = "abort"
+debug         = 0
+incremental   = false
+overflow-checks = false
+
+# Profile for shipping with debuginfo (used by perf, flamegraph, dtrace).
+[profile.release-with-debug]
+inherits = "release"
+strip    = "none"
+debug    = "full"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub        = "warn"
+missing_debug_implementations = "warn"
+rust_2018_idioms       = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all          = { level = "warn", priority = -1 }
+pedantic     = { level = "warn", priority = -1 }
+nursery      = { level = "warn", priority = -1 }
+cargo        = { level = "warn", priority = -1 }
+# Pragmatic relaxations — these false-positive on database engine code.
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss          = "allow"
+cast_precision_loss     = "allow"
+multiple_crate_versions = "allow"
+cargo_common_metadata   = "allow"

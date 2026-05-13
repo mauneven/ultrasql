@@ -1,0 +1,24 @@
+[package]
+name        = "ultrasql-optimizer"
+description = "UltraSQL cost-based optimizer: transformation rules, join enumeration, plan costing."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ultrasql-core    = { workspace = true }
+ultrasql-planner = { workspace = true }
+ultrasql-catalog = { workspace = true }
+thiserror        = { workspace = true }
+smallvec         = { workspace = true }
+ahash            = { workspace = true }
+tracing          = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

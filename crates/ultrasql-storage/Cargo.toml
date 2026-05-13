@@ -1,0 +1,34 @@
+[package]
+name        = "ultrasql-storage"
+description = "UltraSQL storage engine: pages, buffer pool, heap, B+ tree, segment files."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ultrasql-core = { workspace = true }
+thiserror     = { workspace = true }
+parking_lot   = { workspace = true }
+crossbeam     = { workspace = true }
+crossbeam-utils = { workspace = true }
+dashmap       = { workspace = true }
+arc-swap      = { workspace = true }
+bytes         = { workspace = true }
+byteorder     = { workspace = true }
+xxhash-rust   = { workspace = true }
+crc32c        = { workspace = true }
+ahash         = { workspace = true }
+smallvec      = { workspace = true }
+memmap2       = { workspace = true }
+libc          = { workspace = true }
+tracing       = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rstest   = { workspace = true }

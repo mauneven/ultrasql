@@ -1,0 +1,37 @@
+[package]
+name        = "ultrasql-server"
+description = "UltraSQL server binary: accepts wire-protocol connections and dispatches queries."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ultrasqld"
+path = "src/main.rs"
+
+[dependencies]
+ultrasql-core      = { workspace = true }
+ultrasql-storage   = { workspace = true }
+ultrasql-wal       = { workspace = true }
+ultrasql-mvcc      = { workspace = true }
+ultrasql-txn       = { workspace = true }
+ultrasql-parser    = { workspace = true }
+ultrasql-planner   = { workspace = true }
+ultrasql-optimizer = { workspace = true }
+ultrasql-executor  = { workspace = true }
+ultrasql-vec       = { workspace = true }
+ultrasql-catalog   = { workspace = true }
+ultrasql-protocol  = { workspace = true }
+thiserror          = { workspace = true }
+anyhow             = { workspace = true }
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap               = { workspace = true }
+config             = { workspace = true }

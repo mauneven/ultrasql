@@ -1,0 +1,23 @@
+[package]
+name        = "ultrasql-protocol"
+description = "UltraSQL PostgreSQL wire protocol v3 implementation."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+
+[lints]
+workspace = true
+
+[dependencies]
+ultrasql-core = { workspace = true }
+thiserror     = { workspace = true }
+bytes         = { workspace = true }
+byteorder     = { workspace = true }
+tokio         = { workspace = true }
+tracing       = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -1,0 +1,16 @@
+UltraSQL
+Copyright 2026 UltraSQL Contributors
+
+This product includes software developed by the UltraSQL project
+(https://github.com/mauneven/ultrasql).
+
+UltraSQL is dual-licensed under the Apache License, Version 2.0
+(see LICENSE-APACHE) and the MIT License (see LICENSE-MIT). Users may
+choose either license at their option. New contributions are accepted
+under both licenses simultaneously.
+
+This project draws conceptual inspiration from prior art in the
+relational database community, including PostgreSQL, SQLite, DuckDB,
+ClickHouse, CockroachDB, and the published research literature. No
+PostgreSQL source code is copied; wire-protocol compatibility is
+implemented from the published protocol specification.

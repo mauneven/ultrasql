@@ -1,0 +1,27 @@
+[package]
+name        = "ultrasql-core"
+description = "UltraSQL foundational types: errors, scalar values, schema, identifiers."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+homepage.workspace     = true
+documentation.workspace = true
+readme.workspace       = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror   = { workspace = true }
+bytes       = { workspace = true }
+byteorder   = { workspace = true }
+smallvec    = { workspace = true }
+ahash       = { workspace = true }
+xxhash-rust = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rstest   = { workspace = true }

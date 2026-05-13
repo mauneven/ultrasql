@@ -1,0 +1,50 @@
+# Build artifacts
+/target/
+**/target/
+*.rs.bk
+Cargo.lock.bak
+
+# Profiling / debug
+*.profraw
+*.profdata
+*.svg
+flamegraph.svg
+perf.data
+perf.data.old
+cargo-timing*.html
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Database runtime
+/data/
+/wal/
+/snapshots/
+*.db
+*.wal
+
+# Coverage
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# Fuzz
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/coverage/
+
+# Local secrets / config
+.env
+.env.local
+local.toml
+
+# Benchmark artifacts (intermediate; committed results live in benchmarks/results)
+target/criterion/

@@ -1,0 +1,42 @@
+# Target-specific tuning. UltraSQL is hardware-aware: on Apple Silicon we lean
+# on the M-series NEON unit, large vector registers, and the unified memory
+# system. We do NOT set `target-cpu=native` globally because reproducible
+# benchmarks require explicit, named CPU baselines.
+
+[build]
+# Use the system linker (lld is faster on Linux but not always available on
+# macOS without extra setup; keep the default to avoid surprising contributors).
+incremental = true
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    # Apple M1/M2/M3/M4 share the apple-m1 LLVM target. M4-specific tuning is
+    # not yet upstreamed; apple-m1 already enables NEON, fp16, dotprod, fhm,
+    # rcpc, sha3, sm4, lse, paca, pacg, etc. — everything M4 supports.
+    "-C", "target-cpu=apple-m1",
+]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-C", "target-cpu=x86-64-v3",
+    "-C", "link-arg=-fuse-ld=lld",
+]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+    "-C", "target-cpu=neoverse-n1",
+    "-C", "link-arg=-fuse-ld=lld",
+]
+
+[net]
+git-fetch-with-cli = true
+
+[alias]
+b   = "build"
+br  = "build --release"
+t   = "test"
+tr  = "test --release"
+c   = "check --workspace --all-targets"
+fmt-check = "fmt --all -- --check"
+lint = "clippy --workspace --all-targets --all-features -- -D warnings"
+bench-all = "bench --workspace"
