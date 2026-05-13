@@ -155,25 +155,26 @@ No user-facing features.
 
 ---
 
-## v0.2 — "Parse and Plan" ❌
+## v0.2 — "Parse and Plan" 🔄
 
 **Scope:** Parse and bind the full DML + core DDL SQL surface.
 Produce typed logical plans for all common statement types.
 
 ### Parser: DML
-- [ ] `INSERT INTO t (cols) VALUES (...)`
-- [ ] `INSERT INTO t (cols) VALUES (...), (...), (...)` (multi-row)
-- [ ] `INSERT INTO t SELECT ...`
-- [ ] `INSERT ... ON CONFLICT DO NOTHING`
-- [ ] `INSERT ... ON CONFLICT (col) DO UPDATE SET ...` (UPSERT)
-- [ ] `INSERT ... RETURNING ...`
-- [ ] `UPDATE t SET col = expr WHERE ...`
-- [ ] `UPDATE t SET col = expr FROM other WHERE ...`
-- [ ] `UPDATE ... RETURNING ...`
-- [ ] `DELETE FROM t WHERE ...`
-- [ ] `DELETE FROM t USING other WHERE ...`
-- [ ] `DELETE ... RETURNING ...`
-- [ ] `TRUNCATE TABLE t`
+<!-- wave 1 completed: 21a16e4..008b457 -->
+- [x] `INSERT INTO t (cols) VALUES (...)`
+- [x] `INSERT INTO t (cols) VALUES (...), (...), (...)` (multi-row)
+- [x] `INSERT INTO t SELECT ...`
+- [x] `INSERT ... ON CONFLICT DO NOTHING`
+- [x] `INSERT ... ON CONFLICT (col) DO UPDATE SET ...` (UPSERT)
+- [x] `INSERT ... RETURNING ...`
+- [x] `UPDATE t SET col = expr WHERE ...`
+- [x] `UPDATE t SET col = expr FROM other WHERE ...`
+- [x] `UPDATE ... RETURNING ...`
+- [x] `DELETE FROM t WHERE ...`
+- [x] `DELETE FROM t USING other WHERE ...`
+- [x] `DELETE ... RETURNING ...`
+- [x] `TRUNCATE TABLE t`
 
 ### Parser: DDL
 - [ ] `CREATE TABLE t (col type [constraints], ...)`
@@ -245,26 +246,28 @@ Produce typed logical plans for all common statement types.
 
 ---
 
-## v0.3 — "Page and Pool" ❌
+## v0.3 — "Page and Pool" 🔄
 
 **Scope:** A working storage engine that persists tuples and reads
 them back with crash recovery. WAL wired to heap. No more in-memory-only data.
 
 ### WAL ↔ Storage Integration
+<!-- wave 1 partial: 21a16e4..008b457 -->
 - [ ] WAL writer wired to buffer pool dirty pages
 - [ ] WAL LSN stamped on every page write
 - [ ] Checkpointer background task (dirty page flush + WAL truncation)
 - [ ] Crash recovery: replay WAL records on startup
-- [ ] WAL record types for heap inserts/updates/deletes
+- [x] WAL record types for heap inserts/updates/deletes (payload codecs landed; storage emission in wave 2)
 - [ ] WAL record types for B-tree index changes
 - [ ] Full page writes (FPW) on first write after checkpoint
 
 ### Heap Access Method
-- [ ] `heap_insert`: write MVCC tuple to buffer pool page, emit WAL record
-- [ ] `heap_update`: HOT update chain when no indexed column changes
-- [ ] `heap_delete`: mark tuple dead (set xmax), emit WAL record
-- [ ] `heap_scan`: sequential scan with MVCC visibility filtering
-- [ ] Tuple header with xmin/xmax/cmin/cmax/infomask written correctly
+<!-- wave 1 partial: 21a16e4..008b457 -->
+- [ ] `heap_insert`: write MVCC tuple to buffer pool page, emit WAL record (insert lands ok; WAL emission in wave 2)
+- [x] `heap_update`: HOT update chain when no indexed column changes
+- [ ] `heap_delete`: mark tuple dead (set xmax), emit WAL record (delete lands ok; WAL emission in wave 2)
+- [x] `heap_scan`: sequential scan with MVCC visibility filtering
+- [x] Tuple header with xmin/xmax/cmin/cmax/infomask written correctly
 - [ ] Free-space map (FSM) updated on insert/delete
 - [ ] Visibility map (VM) updated on vacuum
 
