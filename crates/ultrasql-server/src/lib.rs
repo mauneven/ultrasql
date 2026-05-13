@@ -220,7 +220,9 @@ where
                         (b'C', "08P01".to_string()),
                         (
                             b'M',
-                            format!("unsupported frontend protocol {major}.{minor}; server supports 3.0"),
+                            format!(
+                                "unsupported frontend protocol {major}.{minor}; server supports 3.0"
+                            ),
                         ),
                     ],
                 })

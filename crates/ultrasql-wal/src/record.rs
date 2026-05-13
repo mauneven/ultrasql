@@ -406,7 +406,10 @@ mod tests {
     fn total_length_just_past_ceiling_rejected() {
         let mut bytes = vec![0_u8; RECORD_HEADER_SIZE];
         let just_past = u32::try_from(MAX_RECORD_BYTES + 1).expect("fits in u32 by construction");
-        write_u32_le(&mut bytes[TOTAL_LEN_OFFSET..TOTAL_LEN_OFFSET + 4], just_past);
+        write_u32_le(
+            &mut bytes[TOTAL_LEN_OFFSET..TOTAL_LEN_OFFSET + 4],
+            just_past,
+        );
         bytes[RTYPE_OFFSET] = RecordType::HeapInsert as u8;
         let err = WalRecord::decode(&bytes).unwrap_err();
         assert!(matches!(err, WalRecordError::Malformed(_)), "got {err:?}");
