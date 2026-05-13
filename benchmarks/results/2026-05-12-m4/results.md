@@ -177,10 +177,10 @@ reproduced in `speedup-round.txt`.
 
 Targets vs. delivered:
 
-- `eq_i32 / 65 536`: target ≥ 5× → delivered **12.3×** (1.12 →
-  13.79 Gelem/s).
-- `min_f64 / 65 536`: target ≥ 3× → delivered **6.6×** (974 Melem/s
-  → 6.42 Gelem/s).
+- `eq_i32 / 65 536`: target ≥ 5× → delivered **12.7×** (1.12 →
+  14.19 Gelem/s).
+- `min_f64 / 65 536`: target ≥ 3× → delivered **6.7×** (974 Melem/s
+  → 6.68 Gelem/s).
 - No other kernel regressed beyond criterion's noise band.
 
 Notes:
