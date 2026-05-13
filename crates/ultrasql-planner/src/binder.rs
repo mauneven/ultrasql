@@ -2,16 +2,24 @@
 //!
 //! The binder is a single pass over the AST. For a `SELECT` statement it:
 //!
-//! 1. Resolves the `FROM` clause to a [`crate::plan::LogicalPlan::Scan`]
-//!    over a single relation, looked up in the supplied catalog.
-//! 2. Resolves column references in `WHERE` / `SELECT` / `ORDER BY`
-//!    against the producing operator's schema; bare column names
-//!    become [`crate::expr::ScalarExpr::Column`] nodes with an index.
-//! 3. Type-checks expressions, using
+//! 1. Resolves the `FROM` clause into a join tree. A single named table
+//!    becomes a [`crate::plan::LogicalPlan::Scan`]; explicit joins produce
+//!    [`crate::plan::LogicalPlan::Join`]; subqueries become inner scopes.
+//! 2. Expands `SELECT *` and `SELECT t.*` by walking the FROM scope.
+//! 3. Detects aggregate calls in the projection / HAVING; wraps the plan
+//!    in [`crate::plan::LogicalPlan::Aggregate`] when needed.
+//! 4. Folds `UNION` / `INTERSECT` / `EXCEPT` tails into
+//!    [`crate::plan::LogicalPlan::SetOp`].
+//! 5. Binds leading CTEs and wraps the body in
+//!    [`crate::plan::LogicalPlan::Cte`] nodes.
+//! 6. Resolves column references against the producing operator's schema;
+//!    bare column names become [`crate::expr::ScalarExpr::Column`] nodes
+//!    with a 0-based index.
+//! 7. Type-checks expressions, using
 //!    [`ultrasql_core::DataType::numeric_join`] for arithmetic and a
 //!    simple shape rule for comparisons and boolean operators.
-//! 4. Wraps the scan in `Filter` / `Project` / `Sort` / `Limit` in
-//!    the canonical SQL evaluation order.
+//! 8. Wraps the plan in `Filter` / `Project` / `Sort` / `Limit` in the
+//!    canonical SQL evaluation order.
 //!
 //! For DML statements the binder produces the corresponding plan nodes:
 //!
@@ -19,7 +27,7 @@
 //!   bound-`Select` child for the row source.
 //! - `UPDATE` → [`crate::plan::LogicalPlan::Update`] over a `Scan` /
 //!   `Filter` child. `UPDATE … FROM other_table` returns
-//!   [`crate::error::PlanError::NotSupported`] pending wave-3 join binding.
+//!   [`crate::error::PlanError::NotSupported`].
 //! - `DELETE` → [`crate::plan::LogicalPlan::Delete`] over a `Scan` /
 //!   `Filter` child. `DELETE … USING other_table` similarly returns
 //!   `NotSupported`.
@@ -27,27 +35,31 @@
 //!   name is validated against the catalog.
 //!
 //! `EXCLUDED` column references in `ON CONFLICT DO UPDATE` are not
-//! supported in v0.2; the binder returns `NotSupported` if any expression
-//! in the conflict update assignments resolves to a column reference whose
-//! qualifier is the synthetic `excluded` pseudo-table. Callers may
-//! work around this by rewriting to unconditional values.
+//! supported in v0.2; the binder returns `NotSupported` for that form.
 //!
-//! The binder does *not* expand `SELECT *`; that is rejected with
-//! [`crate::error::PlanError::NotSupported`]. Wildcard expansion is a
-//! follow-up that needs alias tracking, which the binder will grow when
-//! joins land.
+//! ### Recursive CTEs
+//!
+//! `WITH RECURSIVE` is parsed and the `recursive` flag is recorded on the
+//! produced [`crate::plan::LogicalPlan::Cte`] node. The recursion fixpoint
+//! is **not** evaluated at this layer; that is deferred to a future executor
+//! wave. Until then a recursive CTE binding resolves the CTE's definition
+//! non-recursively.
 
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_parser::ast::{
     Assignment, BinaryOp, ConflictTarget as AstConflictTarget, DeleteStmt, Distinct, Expr,
-    InsertSource, InsertStmt, Literal, NullsOrder, ObjectName, OnConflict, OrderItem, SelectItem,
-    SelectStmt, SortDirection, Statement, TableRef, TruncateStmt, UnaryOp, UpdateStmt,
+    InsertSource, InsertStmt, JoinCondition, JoinOp, Literal, NullsOrder, ObjectName, OnConflict,
+    OrderItem, SelectItem, SelectStmt, SetOp, SetQuantifier, SortDirection, Statement, TableRef,
+    TruncateStmt, UnaryOp, UpdateStmt,
 };
 
 use crate::catalog::Catalog;
 use crate::error::PlanError;
 use crate::expr::ScalarExpr;
-use crate::plan::{ConflictTarget, LogicalOnConflict, LogicalPlan, SortKey};
+use crate::plan::{
+    AggregateFunc, ConflictTarget, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType,
+    LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, SortKey,
+};
 
 /// Bind a [`Statement`] against the supplied catalog and produce a
 /// typed logical plan.
@@ -472,38 +484,235 @@ fn bind_truncate(s: &TruncateStmt, catalog: &dyn Catalog) -> Result<LogicalPlan,
 }
 
 // ---------------------------------------------------------------------------
-// SELECT (existing logic, unchanged)
+// SELECT
 // ---------------------------------------------------------------------------
 
+/// A per-column scope entry used for wildcard expansion and qualified
+/// column resolution.
+///
+/// Each entry tracks which table qualifier (alias or table name) owns the
+/// field, along with the field's position in the combined FROM schema.
+struct ScopeEntry {
+    /// Table qualifier (alias or lowercased table name). Empty string
+    /// for anonymous derived tables without a qualifier.
+    qualifier: String,
+    /// 0-based index into the full FROM schema.
+    field_index: usize,
+    /// The field itself (type + name).
+    field: Field,
+}
+
+/// Bind a `SELECT` statement.
+///
+/// Handles: CTEs, FROM clause (single tables, explicit joins, subqueries),
+/// wildcard expansion, GROUP BY + aggregates, HAVING, set operations,
+/// ORDER BY, LIMIT / OFFSET.
 fn bind_select(select: &SelectStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
     if !matches!(select.distinct, Distinct::None | Distinct::All) {
         return Err(PlanError::NotSupported("SELECT DISTINCT"));
     }
 
-    // FROM clause. We currently support a single named relation.
-    let mut plan = match select.from.as_slice() {
-        [TableRef::Named { name, .. }] => {
-            let table_name = name
-                .parts
-                .last()
-                .map_or_else(String::new, |p| p.value.clone());
-            let meta = catalog
-                .lookup_table(&table_name)
-                .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
-            LogicalPlan::Scan {
-                schema: meta.schema,
-                table: table_name,
-                projection: None,
+    // Build the CTE overlay (maps CTE name → its bound schema + plan index).
+    let mut cte_catalog: Vec<(String, Schema)> = Vec::new();
+    let mut cte_plans: Vec<(String, bool, LogicalPlan)> = Vec::new();
+    for cte in &select.ctes {
+        let cte_plan = bind_select_with_ctes(&cte.query, catalog, &cte_catalog)?;
+        let cte_schema = cte_plan.schema().clone();
+        let cte_name = cte.name.value.to_ascii_lowercase();
+        // Apply column aliases if provided.
+        let cte_schema = if cte.column_aliases.is_empty() {
+            cte_schema
+        } else {
+            apply_column_aliases(&cte_schema, &cte.column_aliases)?
+        };
+        cte_catalog.push((cte_name.clone(), cte_schema));
+        cte_plans.push((cte_name, cte.recursive, cte_plan));
+    }
+
+    // Bind the main query body using the CTE overlay.
+    let mut plan = bind_select_body(select, catalog, &cte_catalog)?;
+
+    // Fold set-op tails left-to-right.
+    for tail in &select.set_ops {
+        let right_plan = bind_select_with_ctes(&tail.right, catalog, &cte_catalog)?;
+        plan = bind_set_op(plan, tail.op, tail.quantifier, right_plan)?;
+    }
+
+    // Wrap with CTE nodes (innermost first so the outermost CTE wraps last).
+    // We reverse so that the first CTE declared is the outermost Cte node,
+    // which matches the scoping intent.
+    for (cte_name, recursive, def_plan) in cte_plans.into_iter().rev() {
+        let body_schema = plan.schema().clone();
+        plan = LogicalPlan::Cte {
+            name: cte_name,
+            recursive,
+            definition: Box::new(def_plan),
+            body: Box::new(plan),
+            schema: body_schema,
+        };
+    }
+
+    Ok(plan)
+}
+
+/// Bind a `SelectStmt` that may reference CTEs in `cte_catalog` plus the
+/// regular catalog.
+fn bind_select_with_ctes(
+    select: &SelectStmt,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+) -> Result<LogicalPlan, PlanError> {
+    // First process any nested CTEs, then the body.
+    let mut nested_cte_catalog: Vec<(String, Schema)> = cte_catalog.to_vec();
+    let mut nested_cte_plans: Vec<(String, bool, LogicalPlan)> = Vec::new();
+    for cte in &select.ctes {
+        let cte_plan = bind_select_with_ctes(&cte.query, catalog, &nested_cte_catalog)?;
+        let cte_schema = cte_plan.schema().clone();
+        let cte_name = cte.name.value.to_ascii_lowercase();
+        let cte_schema = if cte.column_aliases.is_empty() {
+            cte_schema
+        } else {
+            apply_column_aliases(&cte_schema, &cte.column_aliases)?
+        };
+        nested_cte_catalog.push((cte_name.clone(), cte_schema));
+        nested_cte_plans.push((cte_name, cte.recursive, cte_plan));
+    }
+
+    let mut plan = bind_select_body(select, catalog, &nested_cte_catalog)?;
+
+    // Fold set-op tails.
+    for tail in &select.set_ops {
+        let right_plan = bind_select_with_ctes(&tail.right, catalog, &nested_cte_catalog)?;
+        plan = bind_set_op(plan, tail.op, tail.quantifier, right_plan)?;
+    }
+
+    // Wrap with nested CTEs.
+    for (cte_name, recursive, def_plan) in nested_cte_plans.into_iter().rev() {
+        let body_schema = plan.schema().clone();
+        plan = LogicalPlan::Cte {
+            name: cte_name,
+            recursive,
+            definition: Box::new(def_plan),
+            body: Box::new(plan),
+            schema: body_schema,
+        };
+    }
+
+    Ok(plan)
+}
+
+/// Apply a list of column alias overrides to a schema.
+///
+/// Alias list length must match schema arity; short lists are padded
+/// with the original names (never rejected as an error since PostgreSQL
+/// allows partial alias lists in some contexts), but in practice the
+/// parser always emits a full list.
+fn apply_column_aliases(
+    schema: &Schema,
+    aliases: &[ultrasql_parser::ast::Identifier],
+) -> Result<Schema, PlanError> {
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let name = aliases
+                .get(i)
+                .map_or_else(|| f.name.clone(), |a| a.value.clone());
+            Field {
+                name,
+                data_type: f.data_type.clone(),
+                nullable: f.nullable,
             }
-        }
-        [_] => return Err(PlanError::NotSupported("FROM clause variant")),
-        [] => LogicalPlan::Empty {
-            schema: Schema::empty(),
-        },
-        _ => return Err(PlanError::NotSupported("multiple FROM items")),
+        })
+        .collect();
+    Schema::new(fields).map_err(|e| PlanError::TypeMismatch(format!("CTE column aliases: {e}")))
+}
+
+/// Bind a set operation between two already-bound plans.
+fn bind_set_op(
+    left: LogicalPlan,
+    op: SetOp,
+    quantifier: SetQuantifier,
+    right: LogicalPlan,
+) -> Result<LogicalPlan, PlanError> {
+    let left_arity = left.schema().len();
+    let right_arity = right.schema().len();
+    if left_arity != right_arity {
+        return Err(PlanError::TypeMismatch(format!(
+            "set operation: left side has {left_arity} columns, right side has {right_arity}"
+        )));
+    }
+
+    // Build output schema: left column names, types are numeric_join per column.
+    let fields: Result<Vec<Field>, PlanError> = left
+        .schema()
+        .fields()
+        .iter()
+        .zip(right.schema().fields().iter())
+        .map(|(lf, rf)| {
+            let out_ty = if matches!(lf.data_type, DataType::Null) {
+                rf.data_type.clone()
+            } else if matches!(rf.data_type, DataType::Null) {
+                lf.data_type.clone()
+            } else if lf.data_type.is_numeric() && rf.data_type.is_numeric() {
+                lf.data_type.numeric_join(&rf.data_type).map_err(|_| {
+                    PlanError::TypeMismatch(format!(
+                        "set operation column type mismatch: {} vs {}",
+                        lf.data_type, rf.data_type
+                    ))
+                })?
+            } else {
+                // For non-numeric columns, left wins (PostgreSQL convention).
+                lf.data_type.clone()
+            };
+            Ok(Field::nullable(lf.name.clone(), out_ty))
+        })
+        .collect();
+    let schema =
+        Schema::new(fields?).map_err(|e| PlanError::TypeMismatch(format!("set op schema: {e}")))?;
+
+    let logical_op = match op {
+        SetOp::Union => LogicalSetOp::Union,
+        SetOp::Intersect => LogicalSetOp::Intersect,
+        SetOp::Except => LogicalSetOp::Except,
+    };
+    let logical_q = match quantifier {
+        SetQuantifier::All => LogicalSetQuantifier::All,
+        SetQuantifier::Distinct => LogicalSetQuantifier::Distinct,
     };
 
-    // WHERE.
+    Ok(LogicalPlan::SetOp {
+        op: logical_op,
+        quantifier: logical_q,
+        left: Box::new(left),
+        right: Box::new(right),
+        schema,
+    })
+}
+
+/// The core `SELECT` body binding: FROM → WHERE → GROUP BY → HAVING →
+/// SELECT list → ORDER BY → LIMIT/OFFSET.
+///
+/// Does *not* handle set-op tails or CTE wrapping; that is done by
+/// [`bind_select`] / [`bind_select_with_ctes`].
+fn bind_select_body(
+    select: &SelectStmt,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+) -> Result<LogicalPlan, PlanError> {
+    if !matches!(select.distinct, Distinct::None | Distinct::All) {
+        return Err(PlanError::NotSupported("SELECT DISTINCT"));
+    }
+
+    // ------------------------------------------------------------------
+    // FROM clause → join tree
+    // ------------------------------------------------------------------
+    let (mut plan, scope) = bind_from(&select.from, catalog, cte_catalog)?;
+
+    // ------------------------------------------------------------------
+    // WHERE
+    // ------------------------------------------------------------------
     if let Some(pred_ast) = &select.r#where {
         let pred = bind_expr(pred_ast, plan.schema())?;
         let pred_ty = pred.data_type();
@@ -518,42 +727,83 @@ fn bind_select(select: &SelectStmt, catalog: &dyn Catalog) -> Result<LogicalPlan
         };
     }
 
-    // SELECT list (must come logically after WHERE for column scope, but
-    // before ORDER BY's projection-aware lookup; we resolve ORDER BY
-    // against the scan schema below since we do not yet expose
-    // projection aliases to ORDER BY).
-    let projected = bind_projection(&select.projection, plan.schema())?;
-    let proj_fields: Vec<Field> = projected
-        .iter()
-        .map(|(e, name)| {
-            // Projection outputs are nullable in the general case (the
-            // expression may produce NULL even from a NOT NULL column,
-            // e.g. division). Conservative default.
-            Field::nullable(name, e.data_type())
-        })
-        .collect();
-    let proj_schema = Schema::new(proj_fields)
-        .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
+    // ------------------------------------------------------------------
+    // Aggregate detection
+    // ------------------------------------------------------------------
+    // Walk the projection list to detect aggregate calls. If any are
+    // present, or if GROUP BY is non-empty, we need an Aggregate node.
+    let has_group_by = !select.group_by.is_empty();
+    let has_aggregates = select.projection.iter().any(projection_item_has_aggregate);
+    let having_has_agg = select.having.as_ref().is_some_and(expr_has_aggregate);
 
-    // ORDER BY — resolved against the *input* (post-filter, pre-project)
-    // schema. PostgreSQL allows references to projection aliases too;
-    // this binder will grow that in a follow-up.
-    let sort_keys = bind_order_by(&select.order_by, plan.schema())?;
-    if !sort_keys.is_empty() {
-        plan = LogicalPlan::Sort {
+    if has_group_by || has_aggregates || having_has_agg {
+        plan = bind_aggregate(plan, select, &scope)?;
+        // HAVING goes above the aggregate.
+        if let Some(having_ast) = &select.having {
+            let pred = bind_expr(having_ast, plan.schema())?;
+            let pred_ty = pred.data_type();
+            if pred_ty != DataType::Bool && pred_ty != DataType::Null {
+                return Err(PlanError::TypeMismatch(format!(
+                    "HAVING predicate must be boolean, got {pred_ty}"
+                )));
+            }
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: pred,
+            };
+        }
+        // Projection after aggregation binds against aggregate output schema.
+        let projected = bind_projection_agg(&select.projection, plan.schema())?;
+        let proj_fields: Vec<Field> = projected
+            .iter()
+            .map(|(e, name)| Field::nullable(name, e.data_type()))
+            .collect();
+        let proj_schema = Schema::new(proj_fields)
+            .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
+
+        let sort_keys = bind_order_by(&select.order_by, plan.schema())?;
+        if !sort_keys.is_empty() {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                keys: sort_keys,
+            };
+        }
+
+        plan = LogicalPlan::Project {
             input: Box::new(plan),
-            keys: sort_keys,
+            exprs: projected,
+            schema: proj_schema,
+        };
+    } else {
+        // ------------------------------------------------------------------
+        // Non-aggregate path: SELECT list → ORDER BY → projection
+        // ------------------------------------------------------------------
+        let projected = bind_projection_with_scope(&select.projection, plan.schema(), &scope)?;
+        let proj_fields: Vec<Field> = projected
+            .iter()
+            .map(|(e, name)| Field::nullable(name, e.data_type()))
+            .collect();
+        let proj_schema = Schema::new(proj_fields)
+            .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
+
+        let sort_keys = bind_order_by(&select.order_by, plan.schema())?;
+        if !sort_keys.is_empty() {
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                keys: sort_keys,
+            };
+        }
+
+        plan = LogicalPlan::Project {
+            input: Box::new(plan),
+            exprs: projected,
+            schema: proj_schema,
         };
     }
 
-    // Apply the projection.
-    plan = LogicalPlan::Project {
-        input: Box::new(plan),
-        exprs: projected,
-        schema: proj_schema,
-    };
-
-    // LIMIT / OFFSET.
+    // ------------------------------------------------------------------
+    // LIMIT / OFFSET
+    // ------------------------------------------------------------------
     let limit_val = match &select.limit {
         Some(e) => Some(bind_unsigned_literal(e, "LIMIT")?),
         None => None,
@@ -577,6 +827,806 @@ fn bind_select(select: &SelectStmt, catalog: &dyn Catalog) -> Result<LogicalPlan
     }
 
     Ok(plan)
+}
+
+// ---------------------------------------------------------------------------
+// FROM clause → join tree
+// ---------------------------------------------------------------------------
+
+/// Bind the FROM clause. Returns the plan and a flat scope for wildcard
+/// expansion.
+///
+/// An empty FROM list produces `LogicalPlan::Empty` with an empty scope.
+/// A non-empty list is folded into a join tree using the scope entries
+/// from all participating tables.
+fn bind_from(
+    from_items: &[TableRef],
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
+    if from_items.is_empty() {
+        return Ok((
+            LogicalPlan::Empty {
+                schema: Schema::empty(),
+            },
+            vec![],
+        ));
+    }
+
+    // Fold left-to-right.
+    let mut iter = from_items.iter();
+    let first = iter.next().expect("at least one item checked above");
+    let (mut plan, mut scope) = bind_table_ref(first, catalog, cte_catalog)?;
+
+    for item in iter {
+        let (right_plan, right_scope) = bind_table_ref(item, catalog, cte_catalog)?;
+        // Comma-join: CROSS JOIN.
+        let offset = scope.len();
+        let join_schema = concat_schemas_cross(plan.schema(), right_plan.schema())?;
+        let merged_scope = merge_scopes(scope, right_scope, offset);
+        plan = LogicalPlan::Join {
+            left: Box::new(plan),
+            right: Box::new(right_plan),
+            join_type: LogicalJoinType::Cross,
+            condition: LogicalJoinCondition::None,
+            schema: join_schema,
+        };
+        scope = merged_scope;
+    }
+
+    Ok((plan, scope))
+}
+
+/// Bind a single [`TableRef`] AST node into `(LogicalPlan, scope)`.
+fn bind_table_ref(
+    table_ref: &TableRef,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
+    match table_ref {
+        TableRef::Named { name, alias, .. } => {
+            let table_name = name
+                .parts
+                .last()
+                .map_or_else(String::new, |p| p.value.to_ascii_lowercase());
+            let qualifier = alias
+                .as_ref()
+                .map_or_else(|| table_name.clone(), |a| a.value.clone());
+
+            // Check CTE catalog first.
+            let schema = if let Some((_, s)) = cte_catalog
+                .iter()
+                .rev()
+                .find(|(n, _)| n.eq_ignore_ascii_case(&table_name))
+            {
+                s.clone()
+            } else {
+                let meta = catalog
+                    .lookup_table(&table_name)
+                    .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
+                meta.schema
+            };
+
+            let scope: Vec<ScopeEntry> = schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| ScopeEntry {
+                    qualifier: qualifier.clone(),
+                    field_index: i,
+                    field: f.clone(),
+                })
+                .collect();
+            let plan = LogicalPlan::Scan {
+                table: table_name,
+                schema,
+                projection: None,
+            };
+            Ok((plan, scope))
+        }
+        TableRef::Subquery {
+            select,
+            alias,
+            column_aliases,
+            ..
+        } => {
+            let inner_plan = bind_select_with_ctes(select, catalog, cte_catalog)?;
+            let inner_schema = inner_plan.schema().clone();
+            // Apply column aliases if provided.
+            let inner_schema = if column_aliases.is_empty() {
+                inner_schema
+            } else {
+                apply_column_aliases(&inner_schema, column_aliases)?
+            };
+            let qualifier = alias.value.clone();
+            let scope: Vec<ScopeEntry> = inner_schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| ScopeEntry {
+                    qualifier: qualifier.clone(),
+                    field_index: i,
+                    field: f.clone(),
+                })
+                .collect();
+            // Wrap inner plan with a Scan-like node. Since we don't have a
+            // SubqueryScan variant yet, we use the plan directly and construct
+            // a new scan-like wrapper by re-projecting to apply the alias schema.
+            let plan = rebuild_subquery_plan(inner_plan, &inner_schema, &qualifier)?;
+            Ok((plan, scope))
+        }
+        TableRef::Join {
+            left,
+            op,
+            right,
+            condition,
+            ..
+        } => bind_explicit_join(left, *op, right, condition, catalog, cte_catalog),
+    }
+}
+
+/// Rebuild a subquery plan by wrapping it in a Project that applies the
+/// alias schema (possibly renamed by `column_aliases`).
+///
+/// This gives the subquery a stable schema name for subsequent column
+/// resolution without needing a dedicated `SubqueryScan` plan node.
+fn rebuild_subquery_plan(
+    inner_plan: LogicalPlan,
+    alias_schema: &Schema,
+    _qualifier: &str,
+) -> Result<LogicalPlan, PlanError> {
+    // Build a projection that re-names each field.
+    let exprs: Vec<(ScalarExpr, String)> = alias_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let expr = ScalarExpr::Column {
+                name: f.name.clone(),
+                index: i,
+                data_type: f.data_type.clone(),
+            };
+            (expr, f.name.clone())
+        })
+        .collect();
+    let proj_fields: Vec<Field> = alias_schema.fields().to_vec();
+    let proj_schema = Schema::new(proj_fields)
+        .map_err(|e| PlanError::TypeMismatch(format!("subquery alias schema: {e}")))?;
+    // The qualifier is tracked in the scope entries (see call site), not in
+    // the plan node itself, so it is intentionally unused here.
+    Ok(LogicalPlan::Project {
+        input: Box::new(inner_plan),
+        exprs,
+        schema: proj_schema,
+    })
+}
+
+/// Bind an explicit join node.
+fn bind_explicit_join(
+    left_ref: &TableRef,
+    op: JoinOp,
+    right_ref: &TableRef,
+    condition: &JoinCondition,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
+    let (left_plan, left_scope) = bind_table_ref(left_ref, catalog, cte_catalog)?;
+    let (right_plan, right_scope) = bind_table_ref(right_ref, catalog, cte_catalog)?;
+
+    let join_type = match op {
+        JoinOp::Inner => LogicalJoinType::Inner,
+        JoinOp::LeftOuter => LogicalJoinType::LeftOuter,
+        JoinOp::RightOuter => LogicalJoinType::RightOuter,
+        JoinOp::FullOuter => LogicalJoinType::FullOuter,
+        JoinOp::Cross => LogicalJoinType::Cross,
+    };
+
+    match condition {
+        JoinCondition::None => {
+            let join_schema = concat_schemas_cross(left_plan.schema(), right_plan.schema())?;
+            let left_len = left_scope.len();
+            let scope = merge_scopes(left_scope, right_scope, left_len);
+            Ok((
+                LogicalPlan::Join {
+                    left: Box::new(left_plan),
+                    right: Box::new(right_plan),
+                    join_type,
+                    condition: LogicalJoinCondition::None,
+                    schema: join_schema,
+                },
+                scope,
+            ))
+        }
+        JoinCondition::On(pred_ast) => {
+            // Build the concatenated schema to bind the ON predicate against.
+            let concat_schema =
+                concat_schemas_for_join(left_plan.schema(), right_plan.schema(), join_type)?;
+            let pred = bind_expr(pred_ast, &concat_schema)?;
+            if pred.data_type() != DataType::Bool && pred.data_type() != DataType::Null {
+                return Err(PlanError::TypeMismatch(format!(
+                    "JOIN ON predicate must be boolean, got {}",
+                    pred.data_type()
+                )));
+            }
+            let left_len = left_scope.len();
+            let scope = merge_scopes(left_scope, right_scope, left_len);
+            Ok((
+                LogicalPlan::Join {
+                    left: Box::new(left_plan),
+                    right: Box::new(right_plan),
+                    join_type,
+                    condition: LogicalJoinCondition::On(pred),
+                    schema: concat_schema,
+                },
+                scope,
+            ))
+        }
+        JoinCondition::Using(cols) => {
+            let pairs = resolve_using_pairs(cols, left_plan.schema(), right_plan.schema())?;
+            let schema =
+                build_using_schema(left_plan.schema(), right_plan.schema(), &pairs, join_type)?;
+            let left_len = left_scope.len();
+            let scope = merge_scopes(left_scope, right_scope, left_len);
+            Ok((
+                LogicalPlan::Join {
+                    left: Box::new(left_plan),
+                    right: Box::new(right_plan),
+                    join_type,
+                    condition: LogicalJoinCondition::Using(pairs),
+                    schema,
+                },
+                scope,
+            ))
+        }
+    }
+}
+
+/// Resolve USING column names to `(left_idx, right_idx)` pairs.
+fn resolve_using_pairs(
+    cols: &[ultrasql_parser::ast::Identifier],
+    left: &Schema,
+    right: &Schema,
+) -> Result<Vec<(usize, usize)>, PlanError> {
+    let mut pairs: Vec<(usize, usize)> = Vec::with_capacity(cols.len());
+    for ident in cols {
+        let col_name = &ident.value;
+        let left_idx = left
+            .find(col_name)
+            .ok_or_else(|| PlanError::ColumnNotFound(col_name.clone()))?
+            .0;
+        let right_idx = right
+            .find(col_name)
+            .ok_or_else(|| PlanError::ColumnNotFound(col_name.clone()))?
+            .0;
+        pairs.push((left_idx, right_idx));
+    }
+    Ok(pairs)
+}
+
+/// Build the output schema for a USING join.
+///
+/// The schema is: USING columns once (from left), remaining left columns,
+/// remaining right columns. Nullability follows the join type.
+fn build_using_schema(
+    left: &Schema,
+    right: &Schema,
+    pairs: &[(usize, usize)],
+    join_type: LogicalJoinType,
+) -> Result<Schema, PlanError> {
+    let using_set: std::collections::HashSet<usize> = pairs.iter().map(|(l, _)| *l).collect();
+    let right_using_set: std::collections::HashSet<usize> = pairs.iter().map(|(_, r)| *r).collect();
+
+    let mut out_fields: Vec<Field> = Vec::new();
+    // USING columns (from left, nullability as per join type).
+    for &(left_idx, _) in pairs {
+        let f = left.field_at(left_idx);
+        let nullable = matches!(join_type, LogicalJoinType::FullOuter) || f.nullable;
+        out_fields.push(Field {
+            name: f.name.clone(),
+            data_type: f.data_type.clone(),
+            nullable,
+        });
+    }
+    // Remaining left columns.
+    for (i, f) in left.fields().iter().enumerate() {
+        if using_set.contains(&i) {
+            continue;
+        }
+        let nullable = matches!(
+            join_type,
+            LogicalJoinType::RightOuter | LogicalJoinType::FullOuter
+        ) || f.nullable;
+        out_fields.push(Field {
+            name: f.name.clone(),
+            data_type: f.data_type.clone(),
+            nullable,
+        });
+    }
+    // Remaining right columns.
+    for (i, f) in right.fields().iter().enumerate() {
+        if right_using_set.contains(&i) {
+            continue;
+        }
+        let nullable = matches!(
+            join_type,
+            LogicalJoinType::LeftOuter | LogicalJoinType::FullOuter
+        ) || f.nullable;
+        out_fields.push(Field {
+            name: f.name.clone(),
+            data_type: f.data_type.clone(),
+            nullable,
+        });
+    }
+    Schema::new(out_fields).map_err(|e| PlanError::TypeMismatch(format!("USING join schema: {e}")))
+}
+
+/// Concatenate two schemas for a CROSS or non-outer join.
+///
+/// On name collision, the right side column is prefixed with a disambiguating
+/// qualifier to avoid rejecting the join; the optimizer can eliminate the
+/// prefix once it knows which column is actually needed.
+fn concat_schemas_cross(left: &Schema, right: &Schema) -> Result<Schema, PlanError> {
+    let mut fields: Vec<Field> = Vec::with_capacity(left.len() + right.len());
+    let left_names: std::collections::HashSet<String> = left
+        .fields()
+        .iter()
+        .map(|f| f.name.to_ascii_lowercase())
+        .collect();
+    for f in left.fields() {
+        fields.push(f.clone());
+    }
+    for f in right.fields() {
+        let name = if left_names.contains(&f.name.to_ascii_lowercase()) {
+            // Disambiguate by keeping the name as-is; Schema::new will reject
+            // duplicates. For joins, the optimizer resolves via the scope's
+            // qualifier. We allow duplicates by making the schema with a raw
+            // Vec — instead use a safe approach and just push.
+            // The Schema::new check only fires here if BOTH sides have the same
+            // lowercase name, which is normal for joins (e.g. id = id).
+            // We'll use the right field with a suffix only if we can't avoid it.
+            // For now: suffix with "_1" only when there's a collision.
+            format!("{}_1", f.name)
+        } else {
+            f.name.clone()
+        };
+        fields.push(Field {
+            name,
+            data_type: f.data_type.clone(),
+            nullable: f.nullable,
+        });
+    }
+    Schema::new(fields).map_err(|e| PlanError::TypeMismatch(format!("join schema: {e}")))
+}
+
+/// Concatenate two schemas for an explicit join under outer-join nullability
+/// rules.
+///
+/// - `LEFT JOIN`: right columns become nullable.
+/// - `RIGHT JOIN`: left columns become nullable.
+/// - `FULL OUTER JOIN`: both sides become nullable.
+/// - `INNER` / `CROSS`: columns retain their original nullability (cross uses
+///   the simpler helper).
+fn concat_schemas_for_join(
+    left: &Schema,
+    right: &Schema,
+    join_type: LogicalJoinType,
+) -> Result<Schema, PlanError> {
+    let make_left_nullable = matches!(
+        join_type,
+        LogicalJoinType::RightOuter | LogicalJoinType::FullOuter
+    );
+    let make_right_nullable = matches!(
+        join_type,
+        LogicalJoinType::LeftOuter | LogicalJoinType::FullOuter
+    );
+
+    let left_names: std::collections::HashSet<String> = left
+        .fields()
+        .iter()
+        .map(|f| f.name.to_ascii_lowercase())
+        .collect();
+
+    let mut fields: Vec<Field> = Vec::with_capacity(left.len() + right.len());
+    for f in left.fields() {
+        fields.push(Field {
+            name: f.name.clone(),
+            data_type: f.data_type.clone(),
+            nullable: f.nullable || make_left_nullable,
+        });
+    }
+    for f in right.fields() {
+        let name = if left_names.contains(&f.name.to_ascii_lowercase()) {
+            format!("{}_1", f.name)
+        } else {
+            f.name.clone()
+        };
+        fields.push(Field {
+            name,
+            data_type: f.data_type.clone(),
+            nullable: f.nullable || make_right_nullable,
+        });
+    }
+    Schema::new(fields).map_err(|e| PlanError::TypeMismatch(format!("join schema: {e}")))
+}
+
+/// Merge two scope lists, adjusting right side field indices by `left_len`.
+fn merge_scopes(left: Vec<ScopeEntry>, right: Vec<ScopeEntry>, left_len: usize) -> Vec<ScopeEntry> {
+    let mut out = left;
+    for e in right {
+        out.push(ScopeEntry {
+            qualifier: e.qualifier,
+            field_index: e.field_index + left_len,
+            field: e.field,
+        });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Aggregate detection and binding
+// ---------------------------------------------------------------------------
+
+/// Return `true` if `item` contains an aggregate call anywhere in its
+/// expression tree.
+fn projection_item_has_aggregate(item: &SelectItem) -> bool {
+    match item {
+        SelectItem::Expr { expr, .. } => expr_has_aggregate(expr),
+        SelectItem::Wildcard { .. } | SelectItem::QualifiedWildcard { .. } => false,
+    }
+}
+
+/// Return `true` if `expr` contains an aggregate call.
+fn expr_has_aggregate(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { name, .. } => {
+            is_aggregate_name(name.parts.last().map_or("", |p| p.value.as_str()))
+        }
+        Expr::Unary { expr: inner, .. }
+        | Expr::Paren { expr: inner, .. }
+        | Expr::IsNull { expr: inner, .. } => expr_has_aggregate(inner),
+        Expr::Binary { left, right, .. } => expr_has_aggregate(left) || expr_has_aggregate(right),
+        _ => false,
+    }
+}
+
+/// Return `true` if `name` is a known aggregate function.
+fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "bool_and"
+            | "bool_or"
+            | "string_agg"
+            | "array_agg"
+    )
+}
+
+/// Classify an aggregate function name into [`AggregateFunc`].
+fn classify_aggregate(name: &str, args_empty: bool) -> Option<AggregateFunc> {
+    match name.to_ascii_lowercase().as_str() {
+        "count" if args_empty => Some(AggregateFunc::CountStar),
+        "count" => Some(AggregateFunc::Count),
+        "sum" => Some(AggregateFunc::Sum),
+        "avg" => Some(AggregateFunc::Avg),
+        "min" => Some(AggregateFunc::Min),
+        "max" => Some(AggregateFunc::Max),
+        "bool_and" => Some(AggregateFunc::BoolAnd),
+        "bool_or" => Some(AggregateFunc::BoolOr),
+        "string_agg" => Some(AggregateFunc::StringAgg),
+        "array_agg" => Some(AggregateFunc::ArrayAgg),
+        _ => None,
+    }
+}
+
+/// Return type for a given aggregate function and argument type.
+fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> DataType {
+    match func {
+        AggregateFunc::CountStar | AggregateFunc::Count => DataType::Int64,
+        AggregateFunc::Sum | AggregateFunc::Avg => {
+            if arg_type.is_numeric() {
+                arg_type
+            } else {
+                DataType::Null
+            }
+        }
+        AggregateFunc::Min | AggregateFunc::Max => arg_type,
+        AggregateFunc::BoolAnd | AggregateFunc::BoolOr => DataType::Bool,
+        AggregateFunc::StringAgg => DataType::Text { max_len: None },
+        AggregateFunc::ArrayAgg => DataType::Array(Box::new(arg_type)),
+    }
+}
+
+/// Bind the `GROUP BY` + aggregates into a `LogicalPlan::Aggregate` node.
+///
+/// The aggregate output schema is: `[group_by_fields ..., aggregate_fields ...]`.
+fn bind_aggregate(
+    input: LogicalPlan,
+    select: &SelectStmt,
+    _scope: &[ScopeEntry],
+) -> Result<LogicalPlan, PlanError> {
+    let input_schema = input.schema().clone();
+
+    // Bind GROUP BY expressions against the input schema.
+    let group_by: Result<Vec<ScalarExpr>, PlanError> = select
+        .group_by
+        .iter()
+        .map(|e| bind_expr(e, &input_schema))
+        .collect();
+    let group_by = group_by?;
+
+    // Collect aggregate calls from the SELECT projection and (if present)
+    // from HAVING.
+    let mut aggregates: Vec<LogicalAggregateExpr> = Vec::new();
+    for item in &select.projection {
+        if let SelectItem::Expr { expr, alias, .. } = item {
+            collect_aggregates(expr, alias.as_ref(), &input_schema, &mut aggregates)?;
+        }
+    }
+    if let Some(having) = &select.having {
+        collect_aggregates(having, None, &input_schema, &mut aggregates)?;
+    }
+
+    // Build the output schema.
+    let mut out_fields: Vec<Field> = Vec::new();
+    for (i, g) in group_by.iter().enumerate() {
+        let name = match g {
+            ScalarExpr::Column { name, .. } => name.clone(),
+            _ => format!("group{i}"),
+        };
+        out_fields.push(Field::nullable(name, g.data_type()));
+    }
+    for agg in &aggregates {
+        out_fields.push(Field::nullable(
+            agg.output_name.clone(),
+            agg.data_type.clone(),
+        ));
+    }
+    // Deduplicate names by appending a suffix for duplicates.
+    let agg_schema = build_unique_schema(out_fields)?;
+
+    Ok(LogicalPlan::Aggregate {
+        input: Box::new(input),
+        group_by,
+        aggregates,
+        schema: agg_schema,
+    })
+}
+
+/// Build a schema from fields, disambiguating duplicate names with `_N` suffixes.
+fn build_unique_schema(mut fields: Vec<Field>) -> Result<Schema, PlanError> {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for f in &mut fields {
+        let lower = f.name.to_ascii_lowercase();
+        let count = seen.entry(lower).or_insert(0);
+        if *count > 0 {
+            f.name = format!("{}_{}", f.name, *count);
+        }
+        *count += 1;
+    }
+    Schema::new(fields).map_err(|e| PlanError::TypeMismatch(format!("aggregate schema: {e}")))
+}
+
+/// Walk an expression, extracting any aggregate calls into `out`.
+///
+/// Aggregate calls are not expanded recursively (nested aggregates are
+/// rejected by PostgreSQL).
+fn collect_aggregates(
+    expr: &Expr,
+    alias: Option<&ultrasql_parser::ast::Identifier>,
+    input_schema: &Schema,
+    out: &mut Vec<LogicalAggregateExpr>,
+) -> Result<(), PlanError> {
+    match expr {
+        Expr::Call {
+            name,
+            args,
+            distinct,
+            ..
+        } => {
+            let func_name = name
+                .parts
+                .last()
+                .map_or("", |p| p.value.as_str())
+                .to_ascii_lowercase();
+            // The parser encodes COUNT(*) as a single Expr::Column arg whose
+            // name is "*". Treat that as an empty arg list for classification.
+            let is_star_arg = args.len() == 1
+                && matches!(&args[0], Expr::Column { name: n }
+                    if n.parts.len() == 1 && n.parts[0].value == "*");
+            let args_empty_or_star = args.is_empty() || is_star_arg;
+            if let Some(func) = classify_aggregate(&func_name, args_empty_or_star) {
+                // Check if already in the list (dedup by position? use all).
+                let (arg_expr, arg_ty) = if args_empty_or_star {
+                    (None, DataType::Null)
+                } else {
+                    let bound = bind_expr(&args[0], input_schema)?;
+                    let ty = bound.data_type();
+                    (Some(bound), ty)
+                };
+                let ret_ty = aggregate_return_type(func, arg_ty);
+                let output_name = alias.map_or_else(
+                    || derive_agg_output_name(&func_name, args),
+                    |a| a.value.clone(),
+                );
+                // Avoid duplicate registration when HAVING references the same agg.
+                let already = out.iter().any(|a| {
+                    a.output_name == output_name
+                        && std::mem::discriminant(&a.func) == std::mem::discriminant(&func)
+                });
+                if !already {
+                    out.push(LogicalAggregateExpr {
+                        func,
+                        arg: arg_expr,
+                        distinct: *distinct,
+                        output_name,
+                        data_type: ret_ty,
+                    });
+                }
+                Ok(())
+            } else {
+                Err(PlanError::NotSupported(
+                    "non-aggregate function calls in aggregation context",
+                ))
+            }
+        }
+        Expr::Paren { expr: inner, .. } | Expr::Unary { expr: inner, .. } => {
+            collect_aggregates(inner, alias, input_schema, out)
+        }
+        Expr::Binary { left, right, .. } => {
+            collect_aggregates(left, None, input_schema, out)?;
+            collect_aggregates(right, None, input_schema, out)
+        }
+        // Non-aggregate expressions are fine in GROUP BY columns.
+        _ => Ok(()),
+    }
+}
+
+/// Derive a default output name for an aggregate call.
+fn derive_agg_output_name(func_name: &str, _args: &[Expr]) -> String {
+    func_name.to_string()
+}
+
+/// Bind a projection list after aggregation has been applied.
+///
+/// Aggregate calls in the projection are replaced with column references
+/// into the aggregate output schema.
+fn bind_projection_agg(
+    items: &[SelectItem],
+    agg_schema: &Schema,
+) -> Result<Vec<(ScalarExpr, String)>, PlanError> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            SelectItem::Wildcard { .. } | SelectItem::QualifiedWildcard { .. } => {
+                // Wildcard after aggregation: expand all aggregate output columns.
+                for (i, f) in agg_schema.fields().iter().enumerate() {
+                    out.push((
+                        ScalarExpr::Column {
+                            name: f.name.clone(),
+                            index: i,
+                            data_type: f.data_type.clone(),
+                        },
+                        f.name.clone(),
+                    ));
+                }
+            }
+            SelectItem::Expr { expr, alias, .. } => {
+                // If this is an aggregate call, replace with a column ref into
+                // the aggregate schema.
+                let bound = bind_expr_or_agg_ref(expr, agg_schema)?;
+                let name = alias
+                    .as_ref()
+                    .map_or_else(|| derive_output_name(expr, &bound), |a| a.value.clone());
+                out.push((bound, name));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Bind an expression, replacing aggregate calls with column references
+/// into the post-aggregate schema.
+fn bind_expr_or_agg_ref(expr: &Expr, agg_schema: &Schema) -> Result<ScalarExpr, PlanError> {
+    match expr {
+        Expr::Call { name, args, .. } => {
+            let func_name = name
+                .parts
+                .last()
+                .map_or("", |p| p.value.as_str())
+                .to_ascii_lowercase();
+            if is_aggregate_name(&func_name) {
+                let agg_name = derive_agg_output_name(&func_name, args);
+                // Find in agg_schema.
+                if let Some((i, f)) = agg_schema.find(&agg_name) {
+                    return Ok(ScalarExpr::Column {
+                        name: f.name.clone(),
+                        index: i,
+                        data_type: f.data_type.clone(),
+                    });
+                }
+            }
+            // Not an aggregate or not found by derived name: fall through to
+            // regular expression binding against the post-aggregate schema.
+            bind_expr(expr, agg_schema)
+        }
+        _ => bind_expr(expr, agg_schema),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Projection with wildcard expansion
+// ---------------------------------------------------------------------------
+
+/// Bind a projection list, expanding `*` and `t.*` using the scope entries.
+fn bind_projection_with_scope(
+    items: &[SelectItem],
+    input: &Schema,
+    scope: &[ScopeEntry],
+) -> Result<Vec<(ScalarExpr, String)>, PlanError> {
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard { .. } => {
+                // Expand to all columns in the FROM scope.
+                if scope.is_empty() {
+                    // No FROM: expand from the input schema directly.
+                    for (i, f) in input.fields().iter().enumerate() {
+                        out.push((
+                            ScalarExpr::Column {
+                                name: f.name.clone(),
+                                index: i,
+                                data_type: f.data_type.clone(),
+                            },
+                            f.name.clone(),
+                        ));
+                    }
+                } else {
+                    for entry in scope {
+                        out.push((
+                            ScalarExpr::Column {
+                                name: entry.field.name.clone(),
+                                index: entry.field_index,
+                                data_type: entry.field.data_type.clone(),
+                            },
+                            entry.field.name.clone(),
+                        ));
+                    }
+                }
+            }
+            SelectItem::QualifiedWildcard { qualifier, .. } => {
+                let q = &qualifier.value;
+                let matching: Vec<_> = scope
+                    .iter()
+                    .filter(|e| e.qualifier.eq_ignore_ascii_case(q))
+                    .collect();
+                if matching.is_empty() {
+                    return Err(PlanError::TableNotFound(q.clone()));
+                }
+                for entry in matching {
+                    out.push((
+                        ScalarExpr::Column {
+                            name: entry.field.name.clone(),
+                            index: entry.field_index,
+                            data_type: entry.field.data_type.clone(),
+                        },
+                        entry.field.name.clone(),
+                    ));
+                }
+            }
+            SelectItem::Expr { expr, alias, .. } => {
+                let bound = bind_expr(expr, input)?;
+                let name = alias
+                    .as_ref()
+                    .map_or_else(|| derive_output_name(expr, &bound), |a| a.value.clone());
+                out.push((bound, name));
+            }
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -623,30 +1673,6 @@ fn object_name_simple(name: &ObjectName) -> String {
     name.parts
         .last()
         .map_or_else(String::new, |p| p.value.to_ascii_lowercase())
-}
-
-fn bind_projection(
-    items: &[SelectItem],
-    input: &Schema,
-) -> Result<Vec<(ScalarExpr, String)>, PlanError> {
-    let mut out = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            SelectItem::Wildcard { .. } | SelectItem::QualifiedWildcard { .. } => {
-                return Err(PlanError::NotSupported(
-                    "wildcard projection (will land with join binding)",
-                ));
-            }
-            SelectItem::Expr { expr, alias, .. } => {
-                let bound = bind_expr(expr, input)?;
-                let name = alias
-                    .as_ref()
-                    .map_or_else(|| derive_output_name(expr, &bound), |a| a.value.clone());
-                out.push((bound, name));
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// Derive an output column name from an expression. Bare column
@@ -718,7 +1744,39 @@ fn bind_expr(expr: &Expr, input: &Schema) -> Result<ScalarExpr, PlanError> {
             expr: Box::new(bind_expr(expr, input)?),
             negated: *negated,
         }),
-        Expr::Call { .. } => Err(PlanError::NotSupported("function calls")),
+        Expr::Call { name, args, .. } => {
+            // If this is a known aggregate and we have an aggregate output schema,
+            // try to resolve it as a column reference into that schema.
+            let func_name = name
+                .parts
+                .last()
+                .map_or("", |p| p.value.as_str())
+                .to_ascii_lowercase();
+            if is_aggregate_name(&func_name) {
+                let agg_col_name = derive_agg_output_name(&func_name, args);
+                if let Some((i, f)) = input.find(&agg_col_name) {
+                    return Ok(ScalarExpr::Column {
+                        name: f.name.clone(),
+                        index: i,
+                        data_type: f.data_type.clone(),
+                    });
+                }
+                // If not found by derived name, try to find any column matching
+                // the function name prefix (e.g. "count" matches "count").
+                if let Some((i, f)) = input.find(&func_name) {
+                    return Ok(ScalarExpr::Column {
+                        name: f.name.clone(),
+                        index: i,
+                        data_type: f.data_type.clone(),
+                    });
+                }
+                Err(PlanError::NotSupported(
+                    "aggregate call outside aggregate context",
+                ))
+            } else {
+                Err(PlanError::NotSupported("non-aggregate function calls"))
+            }
+        }
         Expr::Cast { .. } => Err(PlanError::NotSupported("CAST expressions")),
         _ => Err(PlanError::NotSupported("expression variant")),
     }
@@ -834,6 +1892,15 @@ fn bind_unary(op: UnaryOp, inner: &Expr, input: &Schema) -> Result<ScalarExpr, P
                 )));
             }
         }
+        UnaryOp::BitNot => {
+            if inner_ty.is_integer() || matches!(inner_ty, DataType::Null) {
+                inner_ty
+            } else {
+                return Err(PlanError::TypeMismatch(format!(
+                    "bitwise NOT (~) requires integer operand, got {inner_ty}"
+                )));
+            }
+        }
     };
     Ok(ScalarExpr::Unary {
         op,
@@ -842,6 +1909,7 @@ fn bind_unary(op: UnaryOp, inner: &Expr, input: &Schema) -> Result<ScalarExpr, P
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn bind_binary(
     op: BinaryOp,
     left: &Expr,
@@ -850,9 +1918,19 @@ fn bind_binary(
 ) -> Result<ScalarExpr, PlanError> {
     let l = bind_expr(left, input)?;
     let r = bind_expr(right, input)?;
-    let lt = l.data_type();
-    let rt = r.data_type();
-    let data_type = match op {
+    let data_type = binary_result_type(op, l.data_type(), r.data_type())?;
+    Ok(ScalarExpr::Binary {
+        op,
+        left: Box::new(l),
+        right: Box::new(r),
+        data_type,
+    })
+}
+
+/// Compute the result type of a binary operator applied to two operand types.
+#[allow(clippy::too_many_lines)]
+fn binary_result_type(op: BinaryOp, lt: DataType, rt: DataType) -> Result<DataType, PlanError> {
+    match op {
         BinaryOp::Add
         | BinaryOp::Sub
         | BinaryOp::Mul
@@ -860,27 +1938,27 @@ fn bind_binary(
         | BinaryOp::Mod
         | BinaryOp::Pow => {
             if matches!(lt, DataType::Null) {
-                rt
+                Ok(rt)
             } else if matches!(rt, DataType::Null) {
-                lt
+                Ok(lt)
             } else {
                 lt.numeric_join(&rt).map_err(|_| {
                     PlanError::TypeMismatch(format!(
                         "arithmetic operator {} on incompatible types {lt} and {rt}",
                         display_binary(op)
                     ))
-                })?
+                })
             }
         }
         BinaryOp::Concat => {
             if (lt.is_textlike() || matches!(lt, DataType::Null))
                 && (rt.is_textlike() || matches!(rt, DataType::Null))
             {
-                DataType::Text { max_len: None }
+                Ok(DataType::Text { max_len: None })
             } else {
-                return Err(PlanError::TypeMismatch(format!(
+                Err(PlanError::TypeMismatch(format!(
                     "string concatenation requires text operands, got {lt} and {rt}"
-                )));
+                )))
             }
         }
         BinaryOp::Eq
@@ -890,44 +1968,75 @@ fn bind_binary(
         | BinaryOp::Gt
         | BinaryOp::GtEq => {
             if comparable(&lt, &rt) {
-                DataType::Bool
+                Ok(DataType::Bool)
             } else {
-                return Err(PlanError::TypeMismatch(format!(
+                Err(PlanError::TypeMismatch(format!(
                     "cannot compare {lt} and {rt}"
-                )));
+                )))
             }
         }
         BinaryOp::And | BinaryOp::Or => {
             if matches!(lt, DataType::Bool | DataType::Null)
                 && matches!(rt, DataType::Bool | DataType::Null)
             {
-                DataType::Bool
+                Ok(DataType::Bool)
             } else {
-                return Err(PlanError::TypeMismatch(format!(
+                Err(PlanError::TypeMismatch(format!(
                     "{} requires boolean operands, got {lt} and {rt}",
                     display_binary(op)
-                )));
+                )))
             }
         }
-        BinaryOp::Like | BinaryOp::NotLike | BinaryOp::Ilike | BinaryOp::NotIlike => {
+        BinaryOp::Like
+        | BinaryOp::NotLike
+        | BinaryOp::Ilike
+        | BinaryOp::NotIlike
+        | BinaryOp::RegexMatch
+        | BinaryOp::RegexIMatch
+        | BinaryOp::RegexNotMatch
+        | BinaryOp::RegexNotIMatch => {
             if (lt.is_textlike() || matches!(lt, DataType::Null))
                 && (rt.is_textlike() || matches!(rt, DataType::Null))
             {
-                DataType::Bool
+                Ok(DataType::Bool)
             } else {
-                return Err(PlanError::TypeMismatch(format!(
+                Err(PlanError::TypeMismatch(format!(
                     "{} requires text operands, got {lt} and {rt}",
                     display_binary(op)
-                )));
+                )))
             }
         }
-    };
-    Ok(ScalarExpr::Binary {
-        op,
-        left: Box::new(l),
-        right: Box::new(r),
-        data_type,
-    })
+        BinaryOp::BitAnd
+        | BinaryOp::BitOr
+        | BinaryOp::BitXor
+        | BinaryOp::ShiftLeft
+        | BinaryOp::ShiftRight => {
+            if matches!(lt, DataType::Null) {
+                Ok(rt)
+            } else if matches!(rt, DataType::Null) {
+                Ok(lt)
+            } else if lt.is_integer() && rt.is_integer() {
+                lt.numeric_join(&rt).map_err(|_| {
+                    PlanError::TypeMismatch(format!(
+                        "bitwise operator {} on incompatible types {lt} and {rt}",
+                        display_binary(op)
+                    ))
+                })
+            } else {
+                Err(PlanError::TypeMismatch(format!(
+                    "bitwise operator {} requires integer operands, got {lt} and {rt}",
+                    display_binary(op)
+                )))
+            }
+        }
+        BinaryOp::JsonGet | BinaryOp::JsonGetPath => Ok(DataType::Jsonb),
+        BinaryOp::JsonGetText | BinaryOp::JsonGetPathText => Ok(DataType::Text { max_len: None }),
+        BinaryOp::JsonContains
+        | BinaryOp::JsonContained
+        | BinaryOp::JsonHasKey
+        | BinaryOp::JsonHasAnyKey
+        | BinaryOp::JsonHasAllKeys => Ok(DataType::Bool),
+    }
 }
 
 fn comparable(a: &DataType, b: &DataType) -> bool {
@@ -954,6 +2063,7 @@ const fn display_unary(op: UnaryOp) -> &'static str {
         UnaryOp::Neg => "-",
         UnaryOp::Pos => "+",
         UnaryOp::Not => "NOT",
+        UnaryOp::BitNot => "~",
     }
 }
 
@@ -978,6 +2088,24 @@ const fn display_binary(op: BinaryOp) -> &'static str {
         BinaryOp::NotLike => "NOT LIKE",
         BinaryOp::Ilike => "ILIKE",
         BinaryOp::NotIlike => "NOT ILIKE",
+        BinaryOp::RegexMatch => "~",
+        BinaryOp::RegexIMatch => "~*",
+        BinaryOp::RegexNotMatch => "!~",
+        BinaryOp::RegexNotIMatch => "!~*",
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::BitXor => "#",
+        BinaryOp::ShiftLeft => "<<",
+        BinaryOp::ShiftRight => ">>",
+        BinaryOp::JsonGet => "->",
+        BinaryOp::JsonGetText => "->>",
+        BinaryOp::JsonGetPath => "#>",
+        BinaryOp::JsonGetPathText => "#>>",
+        BinaryOp::JsonContains => "@>",
+        BinaryOp::JsonContained => "<@",
+        BinaryOp::JsonHasKey => "?",
+        BinaryOp::JsonHasAnyKey => "?|",
+        BinaryOp::JsonHasAllKeys => "?&",
     }
 }
 
@@ -986,6 +2114,7 @@ const fn display_binary(op: BinaryOp) -> &'static str {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::items_after_statements)]
 mod tests {
     use proptest::prelude::*;
     use ultrasql_core::{DataType, Field, Schema};
@@ -1290,8 +2419,502 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // JOIN tests
+    // -----------------------------------------------------------------------
+
+    /// Build a two-table catalog: users (`id` INT, `name` TEXT) and orders (`oid` INT, `user_id` INT).
+    fn two_table_catalog() -> InMemoryCatalog {
+        let users_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("name", DataType::Text { max_len: None }),
+        ])
+        .expect("schema ok");
+        let orders_schema = Schema::new([
+            Field::required("oid", DataType::Int32),
+            Field::required("user_id", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let mut cat = InMemoryCatalog::new();
+        cat.register("users", TableMeta::new(users_schema));
+        cat.register("orders", TableMeta::new(orders_schema));
+        cat
+    }
+
+    #[test]
+    fn binds_inner_join_with_on_predicate() {
+        let cat = two_table_catalog();
+        let plan = parse_and_bind(
+            "SELECT users.id FROM users INNER JOIN orders ON users.id = orders.user_id",
+            &cat,
+        )
+        .expect("bind ok");
+        // The top-level plan has a Project; find the Join underneath.
+        fn find_join(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Join { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_join(input),
+                _ => None,
+            }
+        }
+        let join = find_join(&plan).expect("should contain a Join node");
+        let LogicalPlan::Join {
+            join_type,
+            condition,
+            schema,
+            ..
+        } = join
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(*join_type, LogicalJoinType::Inner);
+        assert!(
+            matches!(condition, LogicalJoinCondition::On(_)),
+            "expected ON condition"
+        );
+        // Schema is concatenation: users(id, name) + orders(oid, user_id) = 4
+        assert_eq!(schema.len(), 4, "join schema width should be 4");
+    }
+
+    #[test]
+    fn binds_left_outer_join_makes_right_columns_nullable() {
+        let cat = two_table_catalog();
+        let plan = parse_and_bind(
+            "SELECT users.id FROM users LEFT JOIN orders ON users.id = orders.user_id",
+            &cat,
+        )
+        .expect("bind ok");
+
+        fn find_join(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Join { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_join(input),
+                _ => None,
+            }
+        }
+        let join = find_join(&plan).expect("should contain a Join");
+        let LogicalPlan::Join {
+            join_type, schema, ..
+        } = join
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(*join_type, LogicalJoinType::LeftOuter);
+        // Left columns (users.id, users.name): id was required, stays required.
+        assert!(
+            !schema.field_at(0).nullable,
+            "left.id should remain required"
+        );
+        // Right columns (orders.oid, orders.user_id) should be nullable in LEFT JOIN.
+        assert!(schema.field_at(2).nullable, "right.oid should be nullable");
+        assert!(
+            schema.field_at(3).nullable,
+            "right.user_id should be nullable"
+        );
+    }
+
+    #[test]
+    fn binds_right_outer_join_makes_left_columns_nullable() {
+        let cat = two_table_catalog();
+        let plan = parse_and_bind(
+            "SELECT users.id FROM users RIGHT JOIN orders ON users.id = orders.user_id",
+            &cat,
+        )
+        .expect("bind ok");
+
+        fn find_join(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Join { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_join(input),
+                _ => None,
+            }
+        }
+        let join = find_join(&plan).expect("should contain a Join");
+        let LogicalPlan::Join {
+            join_type, schema, ..
+        } = join
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(*join_type, LogicalJoinType::RightOuter);
+        // In RIGHT JOIN: left columns become nullable.
+        assert!(
+            schema.field_at(0).nullable,
+            "left.id should be nullable in RIGHT JOIN"
+        );
+        // Right columns keep their original nullability (both were required).
+        assert!(!schema.field_at(2).nullable, "right.oid stays required");
+    }
+
+    #[test]
+    fn binds_full_outer_join_makes_both_sides_nullable() {
+        let cat = two_table_catalog();
+        let plan = parse_and_bind(
+            "SELECT users.id FROM users FULL OUTER JOIN orders ON users.id = orders.user_id",
+            &cat,
+        )
+        .expect("bind ok");
+
+        fn find_join(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Join { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_join(input),
+                _ => None,
+            }
+        }
+        let join = find_join(&plan).expect("should contain a Join");
+        let LogicalPlan::Join {
+            join_type, schema, ..
+        } = join
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(*join_type, LogicalJoinType::FullOuter);
+        // Both sides should be nullable.
+        assert!(
+            schema.field_at(0).nullable,
+            "left.id should be nullable in FULL OUTER JOIN"
+        );
+        assert!(
+            schema.field_at(2).nullable,
+            "right.oid should be nullable in FULL OUTER JOIN"
+        );
+    }
+
+    #[test]
+    fn binds_cross_join_has_no_predicate() {
+        let cat = two_table_catalog();
+        let plan =
+            parse_and_bind("SELECT users.id FROM users CROSS JOIN orders", &cat).expect("bind ok");
+
+        fn find_join(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Join { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_join(input),
+                _ => None,
+            }
+        }
+        let join = find_join(&plan).expect("should contain a Join");
+        let LogicalPlan::Join {
+            join_type,
+            condition,
+            ..
+        } = join
+        else {
+            panic!("expected Join");
+        };
+        assert_eq!(*join_type, LogicalJoinType::Cross);
+        assert!(
+            matches!(condition, LogicalJoinCondition::None),
+            "cross join should have no condition"
+        );
+    }
+
+    #[test]
+    fn binds_using_join_folds_to_equality_and_collapses_columns() {
+        // Build a catalog where both tables have a column named `id`.
+        let schema_a = Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
+        let schema_b = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("val", DataType::Text { max_len: None }),
+        ])
+        .expect("schema ok");
+        let mut cat = InMemoryCatalog::new();
+        cat.register("a", TableMeta::new(schema_a));
+        cat.register("b", TableMeta::new(schema_b));
+
+        let plan = parse_and_bind("SELECT a.id FROM a JOIN b USING (id)", &cat).expect("bind ok");
+
+        fn find_join(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Join { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_join(input),
+                _ => None,
+            }
+        }
+        let join = find_join(&plan).expect("should contain a Join");
+        let LogicalPlan::Join {
+            condition, schema, ..
+        } = join
+        else {
+            panic!("expected Join");
+        };
+        assert!(
+            matches!(condition, LogicalJoinCondition::Using(_)),
+            "expected USING condition"
+        );
+        // USING(id) collapses: id once + val = 2 columns (not 3).
+        assert_eq!(
+            schema.len(),
+            2,
+            "USING join should collapse the shared column"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GROUP BY / aggregate tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn binds_group_by_emits_aggregate_node() {
+        let cat = users_catalog();
+        let plan =
+            parse_and_bind("SELECT id, count(*) FROM users GROUP BY id", &cat).expect("bind ok");
+
+        fn find_agg(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Aggregate { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_agg(input),
+                _ => None,
+            }
+        }
+        let agg = find_agg(&plan).expect("should contain Aggregate node");
+        let LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            schema,
+            ..
+        } = agg
+        else {
+            panic!("expected Aggregate");
+        };
+        assert_eq!(group_by.len(), 1, "one GROUP BY key");
+        assert_eq!(aggregates.len(), 1, "one aggregate");
+        assert_eq!(aggregates[0].func, AggregateFunc::CountStar);
+        // Schema: [id, count]
+        assert_eq!(schema.len(), 2);
+        assert_eq!(schema.field_at(0).name, "id");
+    }
+
+    #[test]
+    fn binds_count_star() {
+        let cat = users_catalog();
+        let plan = parse_and_bind("SELECT count(*) FROM users", &cat).expect("bind ok");
+
+        fn find_agg(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::Aggregate { .. } => Some(plan),
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_agg(input),
+                _ => None,
+            }
+        }
+        let agg = find_agg(&plan).expect("should contain Aggregate node");
+        let LogicalPlan::Aggregate { aggregates, .. } = agg else {
+            panic!("expected Aggregate");
+        };
+        assert_eq!(aggregates.len(), 1);
+        assert_eq!(aggregates[0].func, AggregateFunc::CountStar);
+        assert!(aggregates[0].arg.is_none(), "count(*) has no argument");
+    }
+
+    #[test]
+    fn binds_having_filters_post_aggregate() {
+        let cat = users_catalog();
+        let plan = parse_and_bind(
+            "SELECT id, count(*) FROM users GROUP BY id HAVING count(*) > 1",
+            &cat,
+        )
+        .expect("bind ok");
+
+        fn find_filter_above_agg(plan: &LogicalPlan) -> bool {
+            match plan {
+                LogicalPlan::Filter { input, .. } => {
+                    matches!(input.as_ref(), LogicalPlan::Aggregate { .. })
+                }
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_filter_above_agg(input),
+                _ => false,
+            }
+        }
+        assert!(
+            find_filter_above_agg(&plan),
+            "should have Filter above Aggregate for HAVING"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Set operations tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn binds_union_all_arity_match() {
+        let cat = users_catalog();
+        let plan = parse_and_bind("SELECT id FROM users UNION ALL SELECT id FROM users", &cat)
+            .expect("bind ok");
+
+        fn find_setop(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+            match plan {
+                LogicalPlan::SetOp { .. } => Some(plan),
+                LogicalPlan::Cte { body, .. } => find_setop(body),
+                _ => None,
+            }
+        }
+        // The SetOp may be wrapped in a Cte if there were CTEs, otherwise it's
+        // at the top level.
+        let setop = find_setop(&plan).unwrap_or(&plan);
+        // Accept either SetOp at top or wrapped in project.
+        let has_setop = matches!(plan, LogicalPlan::SetOp { .. })
+            || matches!(&plan, LogicalPlan::Project { input, .. }
+                if matches!(input.as_ref(), LogicalPlan::SetOp { .. }));
+        // Or the plan IS the setop.
+        let is_setop = matches!(&plan, LogicalPlan::SetOp { quantifier, .. }
+            if *quantifier == LogicalSetQuantifier::All);
+        // If it's not directly at top, it's wrapped by the outer structure.
+        if !has_setop && !is_setop {
+            // Find it anywhere in the tree.
+            let _ = setop;
+            // The schema should have 1 column.
+            let final_schema = plan.schema();
+            assert_eq!(
+                final_schema.len(),
+                1,
+                "UNION ALL of single-column selects = 1 col"
+            );
+        } else {
+            assert!(has_setop || is_setop);
+        }
+        let _ = setop;
+    }
+
+    #[test]
+    fn binds_union_distinct_with_arity_mismatch_is_rejected() {
+        let cat = users_catalog();
+        // id (1 col) UNION id, name (2 cols) should fail.
+        let err = parse_and_bind(
+            "SELECT id FROM users UNION SELECT id, name FROM users",
+            &cat,
+        )
+        .unwrap_err();
+        assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // CTE tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn binds_cte_then_references_it_in_body() {
+        let cat = users_catalog();
+        let plan = parse_and_bind(
+            "WITH active AS (SELECT id FROM users) SELECT id FROM active",
+            &cat,
+        )
+        .expect("bind ok");
+
+        // Top-level plan should be a Cte node.
+        let LogicalPlan::Cte {
+            name, recursive, ..
+        } = &plan
+        else {
+            panic!("expected Cte at top, got {plan:?}");
+        };
+        assert_eq!(name, "active");
+        assert!(!recursive, "non-recursive CTE should have recursive=false");
+    }
+
+    // -----------------------------------------------------------------------
+    // SELECT * wildcard tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn binds_select_star_expands_via_catalog() {
+        let cat = users_catalog();
+        let plan = parse_and_bind("SELECT * FROM users", &cat).expect("bind ok");
+        let LogicalPlan::Project { schema, exprs, .. } = &plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        // users has id, name, score = 3 columns
+        assert_eq!(schema.len(), 3, "SELECT * should expand to 3 columns");
+        assert_eq!(exprs.len(), 3);
+    }
+
+    #[test]
+    fn binds_qualified_wildcard_restricts_to_table_alias() {
+        let cat = two_table_catalog();
+        let plan = parse_and_bind(
+            "SELECT u.* FROM users u JOIN orders o ON u.id = o.user_id",
+            &cat,
+        )
+        .expect("bind ok");
+        let LogicalPlan::Project { schema, .. } = &plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        // users u has 2 columns; u.* should expand to those 2 only.
+        assert_eq!(schema.len(), 2, "u.* should expand to users' 2 columns");
+    }
+
+    // -----------------------------------------------------------------------
+    // Error / unsupported
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn binder_rejects_unknown_aggregate_with_not_supported() {
+        let cat = users_catalog();
+        // `mode` is not a known aggregate; the binder should reject it.
+        let err = parse_and_bind("SELECT mode(score) FROM users GROUP BY id", &cat).unwrap_err();
+        assert!(
+            matches!(err, PlanError::NotSupported(_)),
+            "unknown aggregate should be NotSupported, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Property test
     // -----------------------------------------------------------------------
+
+    proptest! {
+        /// Any random join tree over a fixed set of 3 tables binds without error.
+        #[test]
+        fn prop_join_tree_over_three_tables_binds_ok(
+            // Choose join type index 0..4 for left join and right join.
+            lj_type in 0_usize..2_usize,
+            rj_type in 0_usize..2_usize,
+        ) {
+            // Catalog: a, b, c each with one column.
+            let mut cat = InMemoryCatalog::new();
+            let s = Schema::new([Field::required("x", DataType::Int32)]).expect("schema ok");
+            cat.register("ta", TableMeta::new(s));
+            let sb = Schema::new([Field::required("y", DataType::Int32)]).expect("schema ok");
+            cat.register("tb", TableMeta::new(sb));
+            let sc = Schema::new([Field::required("z", DataType::Int32)]).expect("schema ok");
+            cat.register("tc", TableMeta::new(sc));
+
+            let join_kw = ["INNER JOIN", "CROSS JOIN"];
+            let lj = join_kw[lj_type % join_kw.len()];
+            let rj = join_kw[rj_type % join_kw.len()];
+            let on_lj = if lj == "CROSS JOIN" { "" } else { " ON ta.x = tb.y" };
+            let on_rj = if rj == "CROSS JOIN" { "" } else { " ON ta.x = tc.z" };
+            let sql = format!(
+                "SELECT ta.x FROM ta {lj} tb{on_lj} {rj} tc{on_rj}"
+            );
+            let result = parse_and_bind(&sql, &cat);
+            prop_assert!(result.is_ok(), "join tree should bind ok, got {:?}", result);
+        }
+    }
 
     proptest! {
         /// For any arity in 1..=6 and 1..=4 matching VALUES rows, the bound

@@ -26,7 +26,10 @@ pub use binder::bind;
 pub use catalog::{Catalog, InMemoryCatalog, TableMeta};
 pub use error::PlanError;
 pub use expr::{BinaryOp, ScalarExpr, UnaryOp};
-pub use plan::{ConflictTarget, LogicalOnConflict, LogicalPlan, SortKey};
+pub use plan::{
+    AggregateFunc, ConflictTarget, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType,
+    LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, SortKey,
+};
 
 #[cfg(test)]
 mod tests {
@@ -133,9 +136,14 @@ mod tests {
     }
 
     #[test]
-    fn select_star_is_not_supported() {
-        let err = parse_and_bind("SELECT * FROM users").unwrap_err();
-        assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+    fn select_star_expands_to_all_columns() {
+        // After wave-3 binder expansion, SELECT * now works.
+        let plan = parse_and_bind("SELECT * FROM users").expect("bind ok");
+        let LogicalPlan::Project { schema, .. } = &plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        // users has 3 columns: id, name, score
+        assert_eq!(schema.len(), 3, "wildcard should expand to all 3 columns");
     }
 
     #[test]

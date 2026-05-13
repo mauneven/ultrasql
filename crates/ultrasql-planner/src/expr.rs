@@ -124,9 +124,11 @@ const fn display_unary(op: UnaryOp) -> &'static str {
         UnaryOp::Neg => "-",
         UnaryOp::Pos => "+",
         UnaryOp::Not => "NOT ",
+        UnaryOp::BitNot => "~",
     }
 }
 
+#[allow(clippy::too_many_lines)]
 const fn display_binary(op: BinaryOp) -> &'static str {
     match op {
         BinaryOp::Add => "+",
@@ -148,6 +150,24 @@ const fn display_binary(op: BinaryOp) -> &'static str {
         BinaryOp::NotLike => "NOT LIKE",
         BinaryOp::Ilike => "ILIKE",
         BinaryOp::NotIlike => "NOT ILIKE",
+        BinaryOp::RegexMatch => "~",
+        BinaryOp::RegexIMatch => "~*",
+        BinaryOp::RegexNotMatch => "!~",
+        BinaryOp::RegexNotIMatch => "!~*",
+        BinaryOp::BitAnd => "&",
+        BinaryOp::BitOr => "|",
+        BinaryOp::BitXor => "#",
+        BinaryOp::ShiftLeft => "<<",
+        BinaryOp::ShiftRight => ">>",
+        BinaryOp::JsonGet => "->",
+        BinaryOp::JsonGetText => "->>",
+        BinaryOp::JsonGetPath => "#>",
+        BinaryOp::JsonGetPathText => "#>>",
+        BinaryOp::JsonContains => "@>",
+        BinaryOp::JsonContained => "<@",
+        BinaryOp::JsonHasKey => "?",
+        BinaryOp::JsonHasAnyKey => "?|",
+        BinaryOp::JsonHasAllKeys => "?&",
     }
 }
 

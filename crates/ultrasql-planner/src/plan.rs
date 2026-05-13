@@ -8,9 +8,126 @@
 
 use std::fmt;
 
-use ultrasql_core::Schema;
+use ultrasql_core::{DataType, Schema};
 
 use crate::expr::ScalarExpr;
+
+// ============================================================================
+// Join types
+// ============================================================================
+
+/// Logical join type.
+///
+/// These match the SQL standard join modifiers: `INNER`, `LEFT OUTER`,
+/// `RIGHT OUTER`, `FULL OUTER`, and `CROSS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalJoinType {
+    /// `[INNER] JOIN` — only rows with matches on both sides.
+    Inner,
+    /// `LEFT [OUTER] JOIN` — all left rows; unmatched right columns are NULL.
+    LeftOuter,
+    /// `RIGHT [OUTER] JOIN` — all right rows; unmatched left columns are NULL.
+    RightOuter,
+    /// `FULL [OUTER] JOIN` — all rows from both sides; unmatched columns are NULL.
+    FullOuter,
+    /// `CROSS JOIN` or comma-separated table factor — Cartesian product.
+    Cross,
+}
+
+/// Resolved join condition.
+///
+/// `On` carries a bound scalar predicate. `Using` encodes the matched
+/// column index pairs `(left_idx, right_idx)` for collapsed-column USING
+/// semantics. `None` means CROSS JOIN.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LogicalJoinCondition {
+    /// `ON expr` — an explicit join predicate over the concatenated schema.
+    On(ScalarExpr),
+    /// `USING (col, …)` — each pair is `(left_column_index, right_column_index)`.
+    ///
+    /// The output schema exposes the joined column once (from the left side).
+    Using(Vec<(usize, usize)>),
+    /// No condition (CROSS JOIN).
+    None,
+}
+
+// ============================================================================
+// Set-operation types
+// ============================================================================
+
+/// Set operation kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalSetOp {
+    /// `UNION` — union of the two row sets.
+    Union,
+    /// `INTERSECT` — intersection of the two row sets.
+    Intersect,
+    /// `EXCEPT` — rows in left but not in right.
+    Except,
+}
+
+/// Set quantifier applied to a set operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalSetQuantifier {
+    /// `DISTINCT` (default per SQL standard) — duplicates are removed.
+    Distinct,
+    /// `ALL` — duplicates are preserved.
+    All,
+}
+
+// ============================================================================
+// Aggregate types
+// ============================================================================
+
+/// Standard SQL aggregate functions supported by the binder.
+///
+/// Each variant corresponds to one built-in aggregate name recognised by
+/// the binder's aggregate detection pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggregateFunc {
+    /// `COUNT(*)` — count all rows.
+    CountStar,
+    /// `COUNT(expr)` — count non-NULL values.
+    Count,
+    /// `SUM(expr)`.
+    Sum,
+    /// `AVG(expr)`.
+    Avg,
+    /// `MIN(expr)`.
+    Min,
+    /// `MAX(expr)`.
+    Max,
+    /// `BOOL_AND(expr)`.
+    BoolAnd,
+    /// `BOOL_OR(expr)`.
+    BoolOr,
+    /// `STRING_AGG(expr, delimiter)`.
+    StringAgg,
+    /// `ARRAY_AGG(expr)`.
+    ArrayAgg,
+}
+
+/// A single aggregate call in a `GROUP BY` / aggregation node.
+///
+/// `output_name` is the column name in the output schema; `data_type`
+/// is the result type of the aggregate function.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogicalAggregateExpr {
+    /// Which aggregate function to compute.
+    pub func: AggregateFunc,
+    /// The argument expression; `None` for `COUNT(*)`.
+    pub arg: Option<ScalarExpr>,
+    /// Whether `DISTINCT` was specified on the argument.
+    pub distinct: bool,
+    /// Output column name (from alias or derived from the call expression).
+    pub output_name: String,
+    /// Result data type of this aggregate.
+    pub data_type: DataType,
+}
+
+// ============================================================================
+// SortKey and conflict types (pre-existing)
+// ============================================================================
 
 /// A sort key for `ORDER BY`.
 #[derive(Clone, Debug, PartialEq)]
@@ -56,6 +173,10 @@ pub enum LogicalOnConflict {
         r#where: Option<ScalarExpr>,
     },
 }
+
+// ============================================================================
+// LogicalPlan
+// ============================================================================
 
 /// The bound, type-checked logical plan tree.
 #[derive(Clone, Debug, PartialEq)]
@@ -209,6 +330,89 @@ pub enum LogicalPlan {
         /// Always an empty schema — `TRUNCATE` returns no rows.
         schema: Schema,
     },
+
+    /// Join two child plans.
+    ///
+    /// For `LEFT JOIN`, every column on the right side of `schema` is
+    /// nullable. For `RIGHT JOIN`, every column on the left side is
+    /// nullable. For `FULL OUTER JOIN`, both sides are nullable.
+    /// `CROSS JOIN` has `condition = LogicalJoinCondition::None`.
+    ///
+    /// The `schema` is the concatenation of the left and right schemas
+    /// under the appropriate outer-join nullability rules, except for
+    /// `USING` joins where the joined column appears only once.
+    Join {
+        /// Left input plan.
+        left: Box<Self>,
+        /// Right input plan.
+        right: Box<Self>,
+        /// Join type.
+        join_type: LogicalJoinType,
+        /// Join condition.
+        condition: LogicalJoinCondition,
+        /// Output schema (concatenation under outer-join nullability rules).
+        schema: Schema,
+    },
+
+    /// Group-by / aggregate computation.
+    ///
+    /// The output schema is `[group_by_columns ..., aggregate_columns ...]`.
+    /// Group-by columns preserve the input field name except for non-column
+    /// expressions which are named `group0`, `group1`, etc. Aggregate
+    /// columns use `LogicalAggregateExpr::output_name`.
+    Aggregate {
+        /// Input plan to aggregate over.
+        input: Box<Self>,
+        /// Group-by key expressions.
+        group_by: Vec<ScalarExpr>,
+        /// Aggregate function calls.
+        aggregates: Vec<LogicalAggregateExpr>,
+        /// Output schema: group-by columns then aggregate columns.
+        schema: Schema,
+    },
+
+    /// Set operation (UNION / INTERSECT / EXCEPT).
+    ///
+    /// Both sides must have the same arity; column types are the
+    /// `numeric_join` of the two sides per column (binder-enforced).
+    SetOp {
+        /// Set operation kind.
+        op: LogicalSetOp,
+        /// ALL or DISTINCT quantifier.
+        quantifier: LogicalSetQuantifier,
+        /// Left input.
+        left: Box<Self>,
+        /// Right input.
+        right: Box<Self>,
+        /// Output schema (derived from the left side's schema).
+        schema: Schema,
+    },
+
+    /// Non-recursive or flag-recursive CTE.
+    ///
+    /// The `definition` plan is the CTE's body. The `body` plan is the
+    /// main query that may reference the CTE by name. For
+    /// `WITH RECURSIVE`, `recursive = true`; the planner records this
+    /// flag but the recursive fixpoint is deferred to the executor
+    /// (wave 5). Until then a recursive CTE binding resolves
+    /// non-recursively.
+    Cte {
+        /// CTE name (used in `Scan` references inside `body`).
+        name: String,
+        /// Whether `WITH RECURSIVE` was specified.
+        ///
+        /// # Note
+        /// Recursion is not yet executed: the executor does not implement
+        /// the fixpoint loop. This flag is preserved so planning round-trips
+        /// correctly; a future executor wave will consume it.
+        recursive: bool,
+        /// The CTE definition plan.
+        definition: Box<Self>,
+        /// The main query that consumes the CTE.
+        body: Box<Self>,
+        /// Output schema — identical to `body.schema()`.
+        schema: Schema,
+    },
 }
 
 impl LogicalPlan {
@@ -223,7 +427,11 @@ impl LogicalPlan {
             | Self::Insert { schema, .. }
             | Self::Update { schema, .. }
             | Self::Delete { schema, .. }
-            | Self::Truncate { schema, .. } => schema,
+            | Self::Truncate { schema, .. }
+            | Self::Join { schema, .. }
+            | Self::Aggregate { schema, .. }
+            | Self::SetOp { schema, .. }
+            | Self::Cte { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
                 input.schema()
             }
@@ -403,6 +611,124 @@ impl LogicalPlan {
                 }
                 out.push('\n');
             }
+            Self::Join {
+                left,
+                right,
+                join_type,
+                condition,
+                ..
+            } => {
+                out.push_str(&pad);
+                let jt = match join_type {
+                    LogicalJoinType::Inner => "Inner",
+                    LogicalJoinType::LeftOuter => "LeftOuter",
+                    LogicalJoinType::RightOuter => "RightOuter",
+                    LogicalJoinType::FullOuter => "FullOuter",
+                    LogicalJoinType::Cross => "Cross",
+                };
+                out.push_str("Join[");
+                out.push_str(jt);
+                out.push_str("]: ");
+                match condition {
+                    LogicalJoinCondition::On(pred) => {
+                        let _ = fmt::write(out, format_args!("ON {pred}"));
+                    }
+                    LogicalJoinCondition::Using(pairs) => {
+                        out.push_str("USING(");
+                        for (i, (l, r)) in pairs.iter().enumerate() {
+                            if i > 0 {
+                                out.push(',');
+                            }
+                            let _ = fmt::write(out, format_args!("{l}={r}"));
+                        }
+                        out.push(')');
+                    }
+                    LogicalJoinCondition::None => {
+                        out.push_str("(none)");
+                    }
+                }
+                out.push('\n');
+                left.display_into(indent + 2, out);
+                right.display_into(indent + 2, out);
+            }
+            Self::Aggregate {
+                input,
+                group_by,
+                aggregates,
+                ..
+            } => {
+                out.push_str(&pad);
+                out.push_str("Aggregate: group_by=[");
+                for (i, g) in group_by.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = fmt::write(out, format_args!("{g}"));
+                }
+                out.push_str("] aggs=[");
+                for (i, agg) in aggregates.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let func_name = match agg.func {
+                        AggregateFunc::CountStar => "count(*)",
+                        AggregateFunc::Count => "count",
+                        AggregateFunc::Sum => "sum",
+                        AggregateFunc::Avg => "avg",
+                        AggregateFunc::Min => "min",
+                        AggregateFunc::Max => "max",
+                        AggregateFunc::BoolAnd => "bool_and",
+                        AggregateFunc::BoolOr => "bool_or",
+                        AggregateFunc::StringAgg => "string_agg",
+                        AggregateFunc::ArrayAgg => "array_agg",
+                    };
+                    if let Some(arg) = &agg.arg {
+                        let dist = if agg.distinct { "DISTINCT " } else { "" };
+                        let _ = fmt::write(
+                            out,
+                            format_args!("{func_name}({dist}{arg}) AS {}", agg.output_name),
+                        );
+                    } else {
+                        let _ = fmt::write(out, format_args!("{func_name} AS {}", agg.output_name));
+                    }
+                }
+                out.push_str("]\n");
+                input.display_into(indent + 2, out);
+            }
+            Self::SetOp {
+                op,
+                quantifier,
+                left,
+                right,
+                ..
+            } => {
+                out.push_str(&pad);
+                let op_str = match op {
+                    LogicalSetOp::Union => "Union",
+                    LogicalSetOp::Intersect => "Intersect",
+                    LogicalSetOp::Except => "Except",
+                };
+                let q_str = match quantifier {
+                    LogicalSetQuantifier::All => "All",
+                    LogicalSetQuantifier::Distinct => "Distinct",
+                };
+                let _ = fmt::write(out, format_args!("SetOp[{op_str} {q_str}]\n"));
+                left.display_into(indent + 2, out);
+                right.display_into(indent + 2, out);
+            }
+            Self::Cte {
+                name,
+                recursive,
+                definition,
+                body,
+                ..
+            } => {
+                out.push_str(&pad);
+                let rec = if *recursive { " RECURSIVE" } else { "" };
+                let _ = fmt::write(out, format_args!("Cte{rec}: {name}\n"));
+                definition.display_into(indent + 2, out);
+                body.display_into(indent + 2, out);
+            }
         }
     }
 }
@@ -561,5 +887,139 @@ mod tests {
         assert!(dump.contains("Insert:"), "got: {dump}");
         assert!(dump.contains("table=users"), "got: {dump}");
         assert!(dump.contains("cols=[0,2,3]"), "got: {dump}");
+    }
+
+    /// The aggregate output schema lists group-by columns first, then
+    /// aggregate columns.
+    #[test]
+    fn aggregate_schema_orders_group_by_then_aggregates() {
+        let input_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("score", DataType::Float64),
+        ])
+        .expect("schema ok");
+        let input = LogicalPlan::Scan {
+            table: "users".into(),
+            schema: input_schema,
+            projection: None,
+        };
+        let agg_schema = Schema::new([
+            Field::nullable("id", DataType::Int32),
+            Field::nullable("cnt", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(input),
+            group_by: vec![col("id", 0, DataType::Int32)],
+            aggregates: vec![LogicalAggregateExpr {
+                func: AggregateFunc::CountStar,
+                arg: None,
+                distinct: false,
+                output_name: "cnt".into(),
+                data_type: DataType::Int64,
+            }],
+            schema: agg_schema,
+        };
+        assert_eq!(plan.schema().len(), 2);
+        assert_eq!(plan.schema().field_at(0).name, "id");
+        assert_eq!(plan.schema().field_at(1).name, "cnt");
+    }
+
+    /// A Join plan's schema is the concatenation of the left and right schemas
+    /// under outer-join nullability: right columns become nullable in a LEFT JOIN.
+    #[test]
+    fn join_schema_concatenates_under_outer_nullability() {
+        let left_schema = Schema::new([Field::required("a", DataType::Int32)]).expect("schema ok");
+        let right_schema =
+            Schema::new([Field::nullable("b", DataType::Float64)]).expect("schema ok");
+        let left = LogicalPlan::Scan {
+            table: "t1".into(),
+            schema: left_schema,
+            projection: None,
+        };
+        let right = LogicalPlan::Scan {
+            table: "t2".into(),
+            schema: right_schema,
+            projection: None,
+        };
+        // For a LEFT JOIN the right field 'b' is already nullable; left field
+        // 'a' stays required.
+        let join_schema = Schema::new([
+            Field::required("a", DataType::Int32),   // left: stays required
+            Field::nullable("b", DataType::Float64), // right: nullable
+        ])
+        .expect("schema ok");
+        let plan = LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: LogicalJoinType::LeftOuter,
+            condition: LogicalJoinCondition::None,
+            schema: join_schema,
+        };
+        assert_eq!(plan.schema().len(), 2);
+        assert!(
+            !plan.schema().field_at(0).nullable,
+            "left col should be required"
+        );
+        assert!(
+            plan.schema().field_at(1).nullable,
+            "right col should be nullable"
+        );
+    }
+
+    /// `display()` renders a nested join tree.
+    #[test]
+    fn display_renders_join_tree() {
+        let s = Schema::new([Field::required("x", DataType::Int32)]).expect("schema ok");
+        let scan_a = LogicalPlan::Scan {
+            table: "a".into(),
+            schema: s.clone(),
+            projection: None,
+        };
+        let scan_b = LogicalPlan::Scan {
+            table: "b".into(),
+            schema: s,
+            projection: None,
+        };
+        let join_schema = Schema::new([Field::required("x", DataType::Int32)]).expect("schema ok");
+        let join = LogicalPlan::Join {
+            left: Box::new(scan_a),
+            right: Box::new(scan_b),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::On(col("x", 0, DataType::Int32)),
+            schema: join_schema,
+        };
+        let dump = join.display(0);
+        assert!(dump.contains("Join[Inner]"), "got: {dump}");
+        assert!(dump.contains("ON x"), "got: {dump}");
+        assert!(dump.contains("Scan: a"), "got: {dump}");
+        assert!(dump.contains("Scan: b"), "got: {dump}");
+    }
+
+    /// `display()` renders the aggregate node with function names.
+    #[test]
+    fn display_renders_aggregate_with_function_names() {
+        let input = LogicalPlan::Scan {
+            table: "t".into(),
+            schema: Schema::new([Field::required("v", DataType::Int32)]).expect("schema ok"),
+            projection: None,
+        };
+        let agg_schema =
+            Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(input),
+            group_by: vec![],
+            aggregates: vec![LogicalAggregateExpr {
+                func: AggregateFunc::Sum,
+                arg: Some(col("v", 0, DataType::Int32)),
+                distinct: false,
+                output_name: "total".into(),
+                data_type: DataType::Int64,
+            }],
+            schema: agg_schema,
+        };
+        let dump = plan.display(0);
+        assert!(dump.contains("sum"), "got: {dump}");
+        assert!(dump.contains("total"), "got: {dump}");
     }
 }
