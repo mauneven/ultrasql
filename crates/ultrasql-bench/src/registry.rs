@@ -373,7 +373,44 @@ const fn stub_run(_ctx: &BenchContext) -> BenchResult {
 ///    `benchmarks/baselines/<stage>.json`.
 pub static REGISTRY: &[BenchSpec] = &SPECS;
 
-static SPECS: [BenchSpec; 6] = [
+static SPECS: [BenchSpec; 16] = [
+    // ------------------------------------------------------------------
+    // v0.3 — write-side (storage) benchmarks
+    // ------------------------------------------------------------------
+    BenchSpec {
+        id: "insert_throughput_10k",
+        stage: Stage::V0_3,
+        workload: Workload::InsertThroughput,
+        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        run: stub_run,
+    },
+    BenchSpec {
+        id: "update_throughput_10k",
+        stage: Stage::V0_3,
+        workload: Workload::UpdateThroughput,
+        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        run: stub_run,
+    },
+    BenchSpec {
+        id: "delete_throughput_10k",
+        stage: Stage::V0_3,
+        workload: Workload::DeleteThroughput,
+        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        run: stub_run,
+    },
+    // ------------------------------------------------------------------
+    // v0.5 — mixed OLTP
+    // ------------------------------------------------------------------
+    BenchSpec {
+        id: "mixed_oltp_pgbench_like",
+        stage: Stage::V0_5,
+        workload: Workload::MixedOltp,
+        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        run: stub_run,
+    },
+    // ------------------------------------------------------------------
+    // v0.6 — plan + execute benchmarks
+    // ------------------------------------------------------------------
     BenchSpec {
         id: "point_lookup",
         stage: Stage::V0_6,
@@ -426,6 +463,82 @@ static SPECS: [BenchSpec; 6] = [
             (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
             (Engine::DuckDb, FloorMetric::ThroughputRatio(0.5)),
         ],
+        run: stub_run,
+    },
+    // ------------------------------------------------------------------
+    // v0.7 — vectorized-kernel benchmarks
+    //
+    // `select_sum_65k_i64`: `SELECT SUM(x) FROM t` over 65 536 i64 rows,
+    //   hot cache. Competitor floor: UltraSQL (kernel) ≥ DuckDB.
+    //
+    // `select_avg_10m_i64`: `SELECT AVG(x) FROM t` over 10 000 000 i64.
+    //   Competitor floor: UltraSQL (kernel) ≥ ClickHouse.
+    // ------------------------------------------------------------------
+    BenchSpec {
+        id: "select_sum_65k_i64",
+        stage: Stage::V0_7,
+        workload: Workload::AnalyticAggregate,
+        competitor_floors: &[
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::ClickHouse, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(1.0)),
+        ],
+        run: stub_run,
+    },
+    BenchSpec {
+        id: "select_avg_10m_i64",
+        stage: Stage::V0_7,
+        workload: Workload::AnalyticAggregate,
+        competitor_floors: &[
+            (Engine::ClickHouse, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(1.0)),
+        ],
+        run: stub_run,
+    },
+    BenchSpec {
+        id: "tpch_q22",
+        stage: Stage::V0_7,
+        workload: Workload::TpchQ22,
+        competitor_floors: &[
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(0.5)),
+        ],
+        run: stub_run,
+    },
+    // ------------------------------------------------------------------
+    // v0.8 — index + constraint benchmarks
+    // ------------------------------------------------------------------
+    BenchSpec {
+        id: "btree_point_lookup",
+        stage: Stage::V0_8,
+        workload: Workload::PointLookup,
+        competitor_floors: &[
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(1.0)),
+        ],
+        run: stub_run,
+    },
+    // ------------------------------------------------------------------
+    // v0.9 — operations benchmarks
+    // ------------------------------------------------------------------
+    BenchSpec {
+        id: "tpcb_32conn",
+        stage: Stage::V0_9,
+        workload: Workload::MixedOltp,
+        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        run: stub_run,
+    },
+    // ------------------------------------------------------------------
+    // v1.0 — GA benchmarks
+    // ------------------------------------------------------------------
+    BenchSpec {
+        id: "tpcc_5types",
+        stage: Stage::V1_0,
+        workload: Workload::MixedOltp,
+        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
         run: stub_run,
     },
 ];

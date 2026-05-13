@@ -1,5 +1,5 @@
 {
-  "stage": "v0_3",
+  "stage": "v0_7",
   "host": {
     "cpu": "Apple M4",
     "cores": 12,
@@ -10,25 +10,32 @@
   "captured_at": "2026-05-13T00:00:00Z",
   "tolerance_pct": 5.0,
   "benchmarks": {
-    "insert_throughput_10k": {
+    "select_sum_65k_i64": {
       "throughput_per_sec": 0.0,
       "p99_us": 0.0,
       "competitors": {
-        "postgres17": 0.0
+        "duckdb": 0.0,
+        "clickhouse": 0.0,
+        "postgres17": 0.0,
+        "sqlite3": 0.0
       }
     },
-    "update_throughput_10k": {
+    "select_avg_10m_i64": {
       "throughput_per_sec": 0.0,
       "p99_us": 0.0,
       "competitors": {
-        "postgres17": 0.0
+        "clickhouse": 0.0,
+        "duckdb": 0.0,
+        "postgres17": 0.0,
+        "sqlite3": 0.0
       }
     },
-    "delete_throughput_10k": {
+    "tpch_q22": {
       "throughput_per_sec": 0.0,
       "p99_us": 0.0,
       "competitors": {
-        "postgres17": 0.0
+        "postgres17": 0.0,
+        "duckdb": 0.0
       }
     }
   }

@@ -48,7 +48,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
+use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::page::Page;
@@ -169,7 +169,7 @@ fn build_tree(n: usize, insert_seed: u64) -> Result<(BTree<BlankLoader>, u128)> 
     for &k in &perm {
         let block = u32::try_from(k & 0xFFFF_FFFF).unwrap_or(0);
         let slot = u16::try_from((k.wrapping_mul(31)) & 0xFFFF).unwrap_or(0);
-        tree.insert::<i64>(k, tid(block, slot))
+        tree.insert::<i64>(k, tid(block, slot), Xid::FIRST_USER, None)
             .context("btree insert")?;
     }
     let build_ns = build_t0.elapsed().as_nanos();

@@ -360,7 +360,7 @@ fn run_read_point(args: &Args) -> Result<String> {
     for &k in &perm {
         let block = u32::try_from(k & 0xFFFF_FFFF).unwrap_or(0);
         let slot = u16::try_from((k.wrapping_mul(31)) & 0xFFFF).unwrap_or(0);
-        tree.insert::<i64>(k, make_tid(block, slot))
+        tree.insert::<i64>(k, make_tid(block, slot), Xid::FIRST_USER, None)
             .context("btree insert")?;
     }
 
@@ -522,6 +522,8 @@ fn run_insert_thread(
         xmin: xid,
         command_id: cid,
         wal: None,
+        fsm: None,
+        vm: None,
     };
     let mut payload = [0_u8; 16];
     let mut id_counter: u64 = (tid as u64).wrapping_mul(10_000_000);

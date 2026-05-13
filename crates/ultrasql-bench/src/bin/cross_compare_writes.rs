@@ -328,6 +328,8 @@ impl Engine {
                 xmin: xid,
                 command_id: CommandId::FIRST,
                 wal: None,
+                fsm: None,
+                vm: None,
             },
         )?;
         Ok(tid)
@@ -348,6 +350,8 @@ impl Engine {
                 xmax,
                 cmax: CommandId::FIRST,
                 wal: None,
+                fsm: None,
+                vm: None,
             },
         )?;
         Ok(())

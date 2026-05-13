@@ -49,6 +49,10 @@ path = "src/bin/regression_gate.rs"
 name = "tpch"
 path = "src/bin/tpch.rs"
 
+[[bin]]
+name = "readme-render"
+path = "src/bin/readme_render.rs"
+
 [dependencies]
 ultrasql-core     = { workspace = true }
 ultrasql-protocol = { workspace = true }

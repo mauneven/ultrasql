@@ -48,7 +48,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
-use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
+use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::page::Page;
@@ -443,7 +443,7 @@ fn run_point(args: &Args) -> Result<String> {
         // Encode tid deterministically.
         let block = u32::try_from(k & 0xFFFF_FFFF).unwrap_or(0);
         let slot = u16::try_from((k.wrapping_mul(31)) & 0xFFFF).unwrap_or(0);
-        tree.insert::<i64>(k, tid(block, slot))
+        tree.insert::<i64>(k, tid(block, slot), Xid::FIRST_USER, None)
             .context("btree insert")?;
     }
 

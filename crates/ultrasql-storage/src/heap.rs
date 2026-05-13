@@ -37,7 +37,7 @@
 //! counter goes away.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
@@ -45,7 +45,7 @@ use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
 use ultrasql_wal::WalRecord;
 use ultrasql_wal::payload::{
-    HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload, PayloadError,
+    FullPageWritePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload, PayloadError,
 };
 use ultrasql_wal::record::RecordType;
 
@@ -94,6 +94,14 @@ pub enum HeapError {
 /// `HeapInsert` WAL record after the tuple has been written to the page.
 /// Pass `None` to skip WAL emission (e.g. during recovery or in tests
 /// that do not care about WAL output).
+///
+/// The optional `fsm` reference, when present, is consulted to locate an
+/// existing block with sufficient free space before allocating a new block,
+/// and is updated after the insert to reflect the page's new free space.
+///
+/// The optional `vm` reference, when present, has the affected page's VM
+/// bits cleared after each insert to indicate the page is no longer
+/// all-visible.
 #[derive(Clone, Copy)]
 pub struct InsertOptions<'a> {
     /// XID of the inserting transaction.
@@ -103,6 +111,13 @@ pub struct InsertOptions<'a> {
     /// Optional WAL sink. When `Some`, the heap appends a
     /// `RecordType::HeapInsert` record after a successful insert.
     pub wal: Option<&'a dyn WalSink>,
+    /// Optional free-space map. When `Some`, the heap uses the FSM to
+    /// locate a target block before the linear scan, and updates the FSM
+    /// after a successful insert.
+    pub fsm: Option<&'a crate::fsm::FreeSpaceMap>,
+    /// Optional visibility map. When `Some`, the heap clears the page's
+    /// all-visible bit after a successful insert.
+    pub vm: Option<&'a crate::vm::VisibilityMap>,
 }
 
 impl std::fmt::Debug for InsertOptions<'_> {
@@ -111,6 +126,8 @@ impl std::fmt::Debug for InsertOptions<'_> {
             .field("xmin", &self.xmin)
             .field("command_id", &self.command_id)
             .field("wal", &self.wal.is_some())
+            .field("fsm", &self.fsm.is_some())
+            .field("vm", &self.vm.is_some())
             .finish()
     }
 }
@@ -127,6 +144,9 @@ impl std::fmt::Debug for InsertOptions<'_> {
 /// old tuple's header has been stamped. The record's flags will have
 /// [`ultrasql_wal::payload::HEAP_UPDATE_HOT`] set when the update was
 /// performed as HOT.
+///
+/// The optional `vm` reference, when present, has both the old and new
+/// pages' VM bits cleared after the update.
 #[derive(Clone, Copy)]
 pub struct UpdateOptions<'a> {
     /// XID performing the update (stamped as `xmax` on the old version
@@ -139,6 +159,9 @@ pub struct UpdateOptions<'a> {
     /// Optional WAL sink. When `Some`, the heap appends a
     /// `RecordType::HeapUpdate` record after a successful update.
     pub wal: Option<&'a dyn WalSink>,
+    /// Optional visibility map. When `Some`, the heap clears both the old
+    /// and new pages' all-visible bits after a successful update.
+    pub vm: Option<&'a crate::vm::VisibilityMap>,
 }
 
 impl std::fmt::Debug for UpdateOptions<'_> {
@@ -148,6 +171,7 @@ impl std::fmt::Debug for UpdateOptions<'_> {
             .field("command_id", &self.command_id)
             .field("hot_eligible", &self.hot_eligible)
             .field("wal", &self.wal.is_some())
+            .field("vm", &self.vm.is_some())
             .finish()
     }
 }
@@ -158,6 +182,14 @@ impl std::fmt::Debug for UpdateOptions<'_> {
 ///
 /// The optional `wal` sink, when present, receives a fully-formed
 /// `HeapDelete` WAL record after the tuple's header has been stamped.
+///
+/// The optional `fsm` reference, when present, is updated with the page's
+/// new free space after the delete (the space is not immediately reclaimed
+/// until VACUUM, but we optimistically record the dead-tuple size as free
+/// so future inserters see the block as a candidate).
+///
+/// The optional `vm` reference, when present, has the affected page's VM
+/// bits cleared after a successful delete.
 #[derive(Clone, Copy)]
 pub struct DeleteOptions<'a> {
     /// XID performing the delete (stamped as `xmax` in the tuple header).
@@ -167,6 +199,12 @@ pub struct DeleteOptions<'a> {
     /// Optional WAL sink. When `Some`, the heap appends a
     /// `RecordType::HeapDelete` record after a successful delete.
     pub wal: Option<&'a dyn WalSink>,
+    /// Optional free-space map. When `Some`, the heap records the page's
+    /// post-delete free space so future inserters can find the block.
+    pub fsm: Option<&'a crate::fsm::FreeSpaceMap>,
+    /// Optional visibility map. When `Some`, the heap clears the page's
+    /// all-visible bit after a successful delete.
+    pub vm: Option<&'a crate::vm::VisibilityMap>,
 }
 
 impl std::fmt::Debug for DeleteOptions<'_> {
@@ -232,11 +270,24 @@ pub trait Catalog: Send + Sync {
 /// not own any per-statement state, so a single value can serve every
 /// concurrent query against the same buffer pool.
 pub struct HeapAccess<L: PageLoader> {
-    pool: Arc<BufferPool<L>>,
+    /// Buffer pool. `pub(crate)` so the WAL applier in `wal_applier.rs`
+    /// can pin pages directly during recovery without going through the
+    /// public `fetch`/`insert`/`delete` methods (which would re-emit WAL).
+    pub(crate) pool: Arc<BufferPool<L>>,
     /// Per-relation block counters. Maintained internally for v0.5
     /// because the catalog crate is not yet wired; once the catalog
     /// arrives, this field will be replaced with a `&dyn Catalog`.
     block_counters: DashMap<RelationId, Arc<AtomicU32>>,
+    /// Raw LSN (as `u64`) of the most recent checkpoint. Shared with the
+    /// checkpointer so both can read and update it under the same `Arc`.
+    ///
+    /// Before a page mutation, if a WAL sink is present, the heap checks
+    /// whether the page's on-disk LSN is less than `last_checkpoint_lsn`.
+    /// If so, it emits a `RecordType::FullPageWrite` record carrying the
+    /// entire page image before the mutation record. This ensures that
+    /// recovery after a torn partial-page write can restore the page to a
+    /// consistent state.
+    pub last_checkpoint_lsn: Arc<AtomicU64>,
 }
 
 impl<L: PageLoader> std::fmt::Debug for HeapAccess<L> {
@@ -249,11 +300,35 @@ impl<L: PageLoader> std::fmt::Debug for HeapAccess<L> {
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Build a new heap access bound to `pool`.
+    ///
+    /// The `last_checkpoint_lsn` is an optional shared atomic that tracks the
+    /// LSN of the most recent checkpoint. Pass `None` to create a standalone
+    /// `HeapAccess` that never emits full-page-write records (suitable for
+    /// tests or WAL-less configurations). Pass `Some(Arc<AtomicU64>)` from
+    /// the same `Arc` used by the checkpointer to enable FPW emission.
     #[must_use]
     pub fn new(pool: Arc<BufferPool<L>>) -> Self {
         Self {
             pool,
             block_counters: DashMap::new(),
+            last_checkpoint_lsn: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Build a new heap access that shares `last_checkpoint_lsn` with the
+    /// checkpointer (or any other writer that advances the checkpoint LSN).
+    ///
+    /// Prefer this constructor in production; use [`Self::new`] in tests
+    /// that do not care about FPW emission.
+    #[must_use]
+    pub fn with_checkpoint_lsn(
+        pool: Arc<BufferPool<L>>,
+        last_checkpoint_lsn: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            pool,
+            block_counters: DashMap::new(),
+            last_checkpoint_lsn,
         }
     }
 
@@ -278,16 +353,22 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// Algorithm:
     ///
-    /// 1. Walk existing blocks `0..N` in ascending order. For each
+    /// 1. If `opts.fsm` is `Some`, consult it for a block with at least
+    ///    `tuple_size` bytes free and try that block first.
+    /// 2. Walk existing blocks `0..N` in ascending order. For each
     ///    block, pin the page exclusive, try to insert; on success,
     ///    backfill the header's `ctid` with the chosen [`TupleId`]
     ///    and return.
-    /// 2. If no existing block has room, allocate a new block, pin it
+    /// 3. If no existing block has room, allocate a new block, pin it
     ///    exclusively (the buffer pool materializes the page from the
     ///    loader, which is expected to hand back a fresh heap page),
     ///    and insert there.
-    /// 3. If allocation fails because the block counter has been
+    /// 4. If allocation fails because the block counter has been
     ///    exhausted, return [`HeapError::OutOfBlocks`].
+    ///
+    /// After a successful insert, if `opts.fsm` is `Some` the FSM is
+    /// updated with the page's new free space, and if `opts.vm` is `Some`
+    /// the page's all-visible bit is cleared.
     pub fn insert(
         &self,
         rel: RelationId,
@@ -306,12 +387,35 @@ impl<L: PageLoader> HeapAccess<L> {
             .checked_add(payload.len())
             .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
 
+        // If an FSM is present, try its hint first before the linear scan.
+        if let Some(fsm) = opts.fsm {
+            let min_free = u32::try_from(tuple_size + crate::page::ITEMID_SIZE).unwrap_or(u32::MAX);
+            if let Some(hint_block) = fsm.find_block_with_at_least(rel, min_free) {
+                let page_id = PageId::new(rel, hint_block);
+                match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
+                    Ok(tid) => {
+                        Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
+                        // Update FSM and VM after the successful insert.
+                        Self::post_insert_fsm_vm(&self.pool, tid.page, opts);
+                        return Ok(tid);
+                    }
+                    // Hint was stale (page filled up since we recorded it);
+                    // fall through to the linear scan.
+                    Err(HeapError::Page(PageError::NoSpace { .. })) => {
+                        fsm.invalidate_block(rel, hint_block);
+                    }
+                    Err(other) => return Err(other),
+                }
+            }
+        }
+
         // Try every block we know about.
         for block in 0..existing {
             let page_id = PageId::new(rel, BlockNumber::new(block));
             match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
                 Ok(tid) => {
                     Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
+                    Self::post_insert_fsm_vm(&self.pool, tid.page, opts);
                     return Ok(tid);
                 }
                 Err(HeapError::Page(PageError::NoSpace { .. })) => {}
@@ -331,6 +435,7 @@ impl<L: PageLoader> HeapAccess<L> {
             match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
                 Ok(tid) => {
                     Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
+                    Self::post_insert_fsm_vm(&self.pool, tid.page, opts);
                     return Ok(tid);
                 }
                 // A concurrent thread could have raced into this block
@@ -370,6 +475,16 @@ impl<L: PageLoader> HeapAccess<L> {
         // Encode the WAL payload BEFORE the page mutation so that an encode
         // failure cleanly aborts without touching the page.
         let wal_record = if let Some(sink) = opts.wal {
+            // Emit a full-page-write record if this is the first mutation of
+            // the page since the last checkpoint. FPW must precede the mutation
+            // record so recovery can restore the page before applying the delete.
+            Self::maybe_emit_fpw(
+                &self.pool,
+                tid.page,
+                sink,
+                &self.last_checkpoint_lsn,
+                opts.xmax,
+            )?;
             let prev_lsn = sink.last_lsn_for(opts.xmax);
             let payload_bytes = HeapDeletePayload {
                 tid,
@@ -409,6 +524,10 @@ impl<L: PageLoader> HeapAccess<L> {
             // page LSN is never ahead of the WAL.
             Self::stamp_page_lsn(&self.pool, tid.page, lsn)?;
         }
+        // Update FSM (optimistically record the dead tuple's space as free so
+        // future inserters can find this block) and clear the VM all-visible
+        // bit (the page now has a deleted tuple invisible to future snapshots).
+        Self::post_delete_fsm_vm(&self.pool, tid.page, opts);
         Ok(())
     }
 
@@ -463,6 +582,17 @@ impl<L: PageLoader> HeapAccess<L> {
             // We pass a placeholder outcome here; if the page has no room we
             // fall through to non-HOT and discard the pre-encoded bytes.
             // The WAL record is fully formed only after we know new_tid.
+            //
+            // Emit FPW before the HOT-update mutation if WAL is present.
+            if let Some(sink) = opts.wal {
+                Self::maybe_emit_fpw(
+                    &self.pool,
+                    old_tid.page,
+                    sink,
+                    &self.last_checkpoint_lsn,
+                    opts.xid,
+                )?;
+            }
             let hot_tid: Option<TupleId> = {
                 let guard = self.pool.get_page(old_tid.page)?;
                 let result = Self::try_hot_update(
@@ -484,6 +614,10 @@ impl<L: PageLoader> HeapAccess<L> {
                 };
                 // WAL append is outside any pin scope.
                 Self::emit_update_wal(&self.pool, outcome, &opts, || self.fetch(new_tid))?;
+                // HOT update: both versions on the same page; clear VM once.
+                if let Some(vm) = opts.vm {
+                    vm.clear(new_tid.page.relation, new_tid.page.block);
+                }
                 return Ok(outcome);
             }
             // Page had no room; fall through to non-HOT path.
@@ -499,8 +633,25 @@ impl<L: PageLoader> HeapAccess<L> {
             xmin: opts.xid,
             command_id: opts.command_id,
             wal: None,
+            fsm: None,
+            vm: None,
         };
         let new_tid = self.insert(old_tid.page.relation, new_payload, insert_opts)?;
+
+        // Emit FPW for the old page before stamping it. The new page FPW
+        // would be emitted by the internal insert's WAL path, but since
+        // insert_opts.wal is None the caller is responsible for covering the
+        // new page via emit_update_wal. The HeapUpdate record already carries
+        // the new tuple bytes so recovery can redo both pages.
+        if let Some(sink) = opts.wal {
+            Self::maybe_emit_fpw(
+                &self.pool,
+                old_tid.page,
+                sink,
+                &self.last_checkpoint_lsn,
+                opts.xid,
+            )?;
+        }
 
         // Stamp the old tuple with xmax and redirect ctid. Pin the page,
         // apply the stamp, then drop the guard before WAL I/O.
@@ -517,6 +668,13 @@ impl<L: PageLoader> HeapAccess<L> {
         };
         // WAL append is outside any pin scope.
         Self::emit_update_wal(&self.pool, outcome, &opts, || self.fetch(new_tid))?;
+        // Non-HOT: old and new may be on different pages — clear VM on both.
+        if let Some(vm) = opts.vm {
+            vm.clear(old_tid.page.relation, old_tid.page.block);
+            if old_tid.page != new_tid.page {
+                vm.clear(new_tid.page.relation, new_tid.page.block);
+            }
+        }
         Ok(outcome)
     }
 
@@ -563,9 +721,30 @@ impl<L: PageLoader> HeapAccess<L> {
         }
     }
 
+    /// Mark a page as all-visible in the visibility map.
+    ///
+    /// Called by vacuum after verifying that every live tuple on `block`
+    /// is visible to the oldest active snapshot. Callers must ensure that
+    /// no concurrent mutation is in progress on the page; stamping a page
+    /// all-visible while a writer holds a pin on it is a visibility error.
+    ///
+    /// This is a thin wrapper over [`VisibilityMap::mark_all_visible`]
+    /// provided here so the executor does not need to import the VM type
+    /// directly when it calls into the heap.
+    pub fn vacuum_set_all_visible(
+        &self,
+        rel: RelationId,
+        block: BlockNumber,
+        vm: &crate::vm::VisibilityMap,
+    ) {
+        vm.mark_all_visible(rel, block);
+    }
+
     // ----------------- private helpers ---------------------------------
 
-    fn counter_for(&self, rel: RelationId) -> Arc<AtomicU32> {
+    /// Get or create the block counter for `rel`. `pub(crate)` so the WAL
+    /// applier can call `advance_counter` without re-introducing a public API.
+    pub(crate) fn counter_for(&self, rel: RelationId) -> Arc<AtomicU32> {
         if let Some(existing) = self.block_counters.get(&rel) {
             return Arc::clone(&existing);
         }
@@ -587,6 +766,19 @@ impl<L: PageLoader> HeapAccess<L> {
         n_atts: u16,
         tuple_size: usize,
     ) -> Result<TupleId, HeapError> {
+        // Emit a full-page-write record if this is the first modification of
+        // the page since the last checkpoint. The FPW is emitted under a
+        // shared pin so the read and the WAL append complete before we take
+        // the exclusive write lock below.
+        if let Some(sink) = opts.wal {
+            Self::maybe_emit_fpw(
+                &self.pool,
+                page_id,
+                sink,
+                &self.last_checkpoint_lsn,
+                opts.xmin,
+            )?;
+        }
         let guard = self.pool.get_page(page_id)?;
         Self::insert_into_pinned(&guard, page_id, payload, opts, n_atts, tuple_size)
     }
@@ -852,6 +1044,54 @@ impl<L: PageLoader> HeapAccess<L> {
     }
 
     // ---------------------------------------------------------------------------
+    // FSM / VM post-mutation hooks
+    // ---------------------------------------------------------------------------
+
+    /// Read the free space of `page_id` from the buffer pool and return it as
+    /// a `u32`, clamping to `u32::MAX` if the `usize` does not fit.
+    fn page_free_space(pool: &Arc<BufferPool<L>>, page_id: PageId) -> u32 {
+        // A pool miss here is non-fatal for FSM accuracy; we simply return 0
+        // to cause the FSM to record the block as full, which is conservative
+        // and safe.
+        pool.get_page(page_id).ok().map_or(0, |guard| {
+            let free = guard.read().header().free_space();
+            u32::try_from(free).unwrap_or(u32::MAX)
+        })
+    }
+
+    /// Update FSM and clear VM bits after a successful insert.
+    ///
+    /// Called after the WAL record has been appended (if any) and the page
+    /// guard has been dropped.  Both hooks are best-effort: a failure to pin
+    /// the page for the FSM read is treated as "no free space known" (the FSM
+    /// records 0, which is conservative).
+    fn post_insert_fsm_vm(pool: &Arc<BufferPool<L>>, page_id: PageId, opts: InsertOptions<'_>) {
+        if let Some(fsm) = opts.fsm {
+            let free = Self::page_free_space(pool, page_id);
+            fsm.record_free_space(page_id.relation, page_id.block, free);
+        }
+        if let Some(vm) = opts.vm {
+            vm.clear(page_id.relation, page_id.block);
+        }
+    }
+
+    /// Update FSM and clear VM bits after a successful delete.
+    ///
+    /// The FSM update is optimistic: we record the dead tuple's space as free
+    /// immediately so future inserters see the block as a candidate. Vacuum
+    /// will eventually reclaim the space; until then the insert will discover
+    /// (via `NoSpace`) that the category was too optimistic and fall back.
+    fn post_delete_fsm_vm(pool: &Arc<BufferPool<L>>, page_id: PageId, opts: DeleteOptions<'_>) {
+        if let Some(fsm) = opts.fsm {
+            let free = Self::page_free_space(pool, page_id);
+            fsm.record_free_space(page_id.relation, page_id.block, free);
+        }
+        if let Some(vm) = opts.vm {
+            vm.clear(page_id.relation, page_id.block);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // WAL emission helpers
     // ---------------------------------------------------------------------------
 
@@ -872,6 +1112,87 @@ impl<L: PageLoader> HeapAccess<L> {
     ) -> Result<(), HeapError> {
         let guard = pool.get_page(page_id)?;
         guard.write().set_lsn(lsn.raw());
+        Ok(())
+    }
+
+    /// Emit a `RecordType::FullPageWrite` WAL record for `page_id` if the
+    /// page's current on-disk LSN is older than `last_checkpoint_lsn`.
+    ///
+    /// Full-page-write records carry a verbatim copy of the 8 KiB page image
+    /// so that crash recovery can restore the page to a known-consistent state
+    /// even if a previous write left a torn partial image on disk. The FPW
+    /// must be appended **before** the mutation record so the replay sequence
+    /// is: restore page → apply mutation.
+    ///
+    /// This function is called before every page mutation when a WAL sink is
+    /// present. If the page's LSN is already ≥ `last_checkpoint_lsn` no FPW
+    /// is needed (the page has been modified since the last checkpoint, so a
+    /// full copy was already emitted earlier in the current checkpoint cycle).
+    ///
+    /// The function pins the page under a **shared** read lock to capture the
+    /// image, appends the FPW record, then releases the pin. No exclusive lock
+    /// is held during WAL I/O, which is consistent with the pattern used by
+    /// `emit_insert_wal` and friends.
+    fn maybe_emit_fpw(
+        pool: &Arc<BufferPool<L>>,
+        page_id: PageId,
+        sink: &dyn WalSink,
+        last_checkpoint_lsn: &AtomicU64,
+        xid: Xid,
+    ) -> Result<(), HeapError> {
+        use ultrasql_core::constants::PAGE_SIZE;
+
+        let checkpoint_lsn = last_checkpoint_lsn.load(Ordering::Acquire);
+        if checkpoint_lsn == 0 {
+            // No checkpoint has occurred yet; FPW not needed.
+            return Ok(());
+        }
+
+        // Read the page under a shared lock to check its LSN and capture bytes.
+        let (page_lsn, page_bytes) = {
+            let guard = pool.get_page(page_id)?;
+            let page = guard.read();
+            let lsn = page.header().lsn;
+            // Copy the full page image into an owned Vec so we release the
+            // shared pin before appending to the WAL (no pin during WAL I/O).
+            let bytes = page.as_bytes().to_vec();
+            drop(page);
+            (lsn, bytes)
+        };
+
+        // FPW only needed on the *first* mutation after the last checkpoint.
+        if page_lsn >= checkpoint_lsn {
+            return Ok(());
+        }
+
+        // Sanity: page_bytes must be exactly PAGE_SIZE.
+        if page_bytes.len() != PAGE_SIZE {
+            // This should never happen given the buffer pool's invariants.
+            return Err(HeapError::MalformedHeader(
+                "page_bytes length is not PAGE_SIZE; cannot emit FPW",
+            ));
+        }
+
+        let payload = FullPageWritePayload {
+            page: page_id,
+            page_bytes,
+        };
+        let prev_lsn = sink.last_lsn_for(xid);
+        let record = WalRecord::new(
+            RecordType::FullPageWrite,
+            xid,
+            prev_lsn,
+            0,
+            payload.encode(),
+        );
+        // FPW must succeed; if the sink rejects it the page mutation must not
+        // proceed or the WAL would be missing the page image needed for recovery.
+        let lsn: Lsn = sink
+            .append(record)
+            .expect("FPW wal append must succeed before a page mutation; failure is unrecoverable");
+        // Stamp the page LSN with the FPW LSN so we don't emit duplicate FPWs
+        // for subsequent mutations in the same checkpoint cycle.
+        Self::stamp_page_lsn(pool, page_id, lsn)?;
         Ok(())
     }
 
@@ -1239,6 +1560,8 @@ mod tests {
             xmin: Xid::new(xid),
             command_id: CommandId::FIRST,
             wal: None,
+            fsm: None,
+            vm: None,
         }
     }
 
@@ -1247,6 +1570,8 @@ mod tests {
             xmax: Xid::new(xmax),
             cmax: CommandId::new(cmax),
             wal: None,
+            fsm: None,
+            vm: None,
         }
     }
 
@@ -1417,6 +1742,8 @@ mod tests {
                 InsertOptions {
                     xmin: bad_xid,
                     command_id: CommandId::FIRST,
+                    fsm: None,
+                    vm: None,
                     wal: None,
                 },
             )
@@ -1427,6 +1754,8 @@ mod tests {
             DeleteOptions {
                 xmax: Xid::new(102),
                 cmax: CommandId::FIRST,
+                fsm: None,
+                vm: None,
                 wal: None,
             },
         )
@@ -1529,6 +1858,7 @@ mod tests {
             command_id: CommandId::FIRST,
             hot_eligible: true,
             wal: None,
+            vm: None,
         }
     }
 
@@ -1592,6 +1922,7 @@ mod tests {
             command_id: CommandId::FIRST,
             hot_eligible: true, // we ask for HOT but the page is full
             wal: None,
+            vm: None,
         };
         let outcome = heap.update(tid, &big, uo).unwrap();
         assert!(!outcome.hot, "expected non-HOT when page is full");
@@ -1616,6 +1947,8 @@ mod tests {
             DeleteOptions {
                 xmax: Xid::new(150),
                 cmax: CommandId::FIRST,
+                fsm: None,
+                vm: None,
                 wal: None,
             },
         )
@@ -1708,6 +2041,8 @@ mod tests {
                 InsertOptions {
                     xmin: Xid::new(42),
                     command_id: CommandId::FIRST,
+                    fsm: None,
+                    vm: None,
                     wal: None,
                 },
             )
@@ -1758,6 +2093,8 @@ mod tests {
                     .insert(rel(), p, InsertOptions {
                         xmin: insert_xid,
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: None,
                     })
                     .unwrap();
@@ -1778,6 +2115,8 @@ mod tests {
                         DeleteOptions {
                             xmax: delete_xid,
                             cmax: CommandId::FIRST,
+                            fsm: None,
+                            vm: None,
                             wal: None,
                         },
                     )
@@ -1855,6 +2194,8 @@ mod tests {
                     InsertOptions {
                         xmin: Xid::new(10),
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: Some(sink.as_ref()),
                     },
                 )
@@ -1899,6 +2240,8 @@ mod tests {
                     InsertOptions {
                         xmin: Xid::new(1),
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: Some(sink.as_ref()),
                     },
                 )
@@ -1916,6 +2259,7 @@ mod tests {
                         command_id: CommandId::FIRST,
                         hot_eligible: true,
                         wal: Some(sink2.as_ref()),
+                        vm: None,
                     },
                 )
                 .unwrap();
@@ -1953,6 +2297,8 @@ mod tests {
                     InsertOptions {
                         xmin: Xid::new(1),
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: None,
                     },
                 )
@@ -1965,6 +2311,8 @@ mod tests {
                     InsertOptions {
                         xmin: Xid::new(1),
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: None,
                     },
                 )
@@ -1980,6 +2328,7 @@ mod tests {
                         command_id: CommandId::FIRST,
                         hot_eligible: true, // asked for HOT but page is full
                         wal: Some(sink.as_ref()),
+                        vm: None,
                     },
                 )
                 .unwrap();
@@ -2016,6 +2365,8 @@ mod tests {
                     InsertOptions {
                         xmin: Xid::new(10),
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: None,
                     },
                 )
@@ -2026,6 +2377,8 @@ mod tests {
                 DeleteOptions {
                     xmax: Xid::new(20),
                     cmax: CommandId::new(3),
+                    fsm: None,
+                    vm: None,
                     wal: Some(sink.as_ref()),
                 },
             )
@@ -2060,6 +2413,8 @@ mod tests {
                     InsertOptions {
                         xmin: Xid::new(1),
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: Some(&null),
                     },
                 )
@@ -2086,6 +2441,8 @@ mod tests {
                     InsertOptions {
                         xmin: Xid::new(5),
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: None,
                     },
                 )
@@ -2099,6 +2456,8 @@ mod tests {
                 DeleteOptions {
                     xmax: Xid::new(6),
                     cmax: CommandId::FIRST,
+                    fsm: None,
+                    vm: None,
                     wal: Some(del_sink.as_ref()),
                 },
             )
@@ -2125,6 +2484,8 @@ mod tests {
                     InsertOptions {
                         xmin: xid,
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: Some(sink.as_ref()),
                     },
                 )
@@ -2146,6 +2507,8 @@ mod tests {
                     InsertOptions {
                         xmin: xid,
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: Some(sink.as_ref()),
                     },
                 )
@@ -2205,6 +2568,8 @@ mod tests {
                     InsertOptions {
                         xmin: Xid::new(42),
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: Some(&sink),
                     },
                 )
@@ -2231,6 +2596,8 @@ mod tests {
                         InsertOptions {
                             xmin: xid,
                             command_id: CommandId::FIRST,
+                            fsm: None,
+                            vm: None,
                             wal: Some(sink.as_ref()),
                         },
                     )
@@ -2274,6 +2641,8 @@ mod tests {
                     InsertOptions {
                         xmin: xid,
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: Some(sink.as_ref()),
                     },
                 )
@@ -2313,6 +2682,8 @@ mod tests {
                     InsertOptions {
                         xmin: Xid::new(1),
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: None,
                     },
                 )
@@ -2325,6 +2696,8 @@ mod tests {
                     InsertOptions {
                         xmin: Xid::new(1),
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: None,
                     },
                 )
@@ -2339,6 +2712,7 @@ mod tests {
                         command_id: CommandId::FIRST,
                         hot_eligible: true, // hot requested but page is full
                         wal: Some(sink.as_ref()),
+                        vm: None,
                     },
                 )
                 .unwrap();
@@ -2383,6 +2757,8 @@ mod tests {
                     InsertOptions {
                         xmin: Xid::new(10),
                         command_id: CommandId::FIRST,
+                        fsm: None,
+                        vm: None,
                         wal: None, // no WAL for insert; clean sink for delete
                     },
                 )
@@ -2393,6 +2769,8 @@ mod tests {
                 DeleteOptions {
                     xmax: Xid::new(20),
                     cmax: CommandId::new(3),
+                    fsm: None,
+                    vm: None,
                     wal: Some(sink.as_ref()),
                 },
             )

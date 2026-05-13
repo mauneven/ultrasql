@@ -7,12 +7,18 @@
 //! The Postgres execution path is gated behind the `pg-runner` Cargo feature.
 //! Without the feature, [`run_postgres`] returns an error.
 
-use std::time::Instant;
+use anyhow::{Result, bail};
 
-use anyhow::{Context, Result, bail};
+#[cfg(feature = "pg-runner")]
+use anyhow::Context;
 
-use crate::tpch::baseline::{QueryTimings, median, p95};
+use crate::tpch::baseline::QueryTimings;
+#[cfg(feature = "pg-runner")]
+use crate::tpch::baseline::{median, p95};
+#[cfg(feature = "pg-runner")]
 use crate::tpch::queries;
+#[cfg(feature = "pg-runner")]
+use std::time::Instant;
 
 /// Result from running all 22 queries against one engine.
 #[derive(Debug)]

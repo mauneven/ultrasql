@@ -10,6 +10,13 @@
   "captured_at": "2026-05-13T00:00:00Z",
   "tolerance_pct": 5.0,
   "benchmarks": {
+    "mixed_oltp_pgbench_like": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {
+        "postgres17": 0.0
+      }
+    },
     "point_lookup": {
       "throughput_per_sec": 0.0,
       "p99_us": 0.0,

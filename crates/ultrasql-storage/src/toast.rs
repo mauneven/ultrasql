@@ -215,6 +215,8 @@ impl<L: PageLoader> ToastTable<L> {
             xmin: Xid::BOOTSTRAP,
             command_id: CommandId::FIRST,
             wal: None,
+            fsm: None,
+            vm: None,
         };
 
         for (seq, chunk) in stored_bytes.chunks(TOAST_MAX_CHUNK_SIZE).enumerate() {
@@ -324,6 +326,8 @@ impl<L: PageLoader> ToastTable<L> {
                 xmax: Xid::BOOTSTRAP,
                 cmax: CommandId::FIRST,
                 wal: None,
+                fsm: None,
+                vm: None,
             };
             for tid in tids {
                 self.heap.delete(tid, delete_opts)?;
