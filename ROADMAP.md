@@ -195,26 +195,27 @@ Produce typed logical plans for all common statement types.
 - [x] `CREATE SEQUENCE` / `ALTER SEQUENCE` / `DROP SEQUENCE`
 
 ### Parser: SELECT completeness
-- [ ] `SELECT *` (currently returns `NotSupported`)
-- [ ] `SELECT t.*` and table aliases
-- [ ] Column aliases: `SELECT col AS alias`
-- [ ] `INNER JOIN ... ON ...`
-- [ ] `LEFT / RIGHT / FULL OUTER JOIN ... ON ...`
-- [ ] `CROSS JOIN` / `JOIN ... USING (col)`
-- [ ] `GROUP BY col1, col2` / `HAVING expr`
-- [ ] `DISTINCT` / `DISTINCT ON (expr)`
-- [ ] `UNION [ALL]` / `INTERSECT [ALL]` / `EXCEPT [ALL]`
-- [ ] Subqueries in `FROM` (derived tables)
-- [ ] Scalar subqueries in `WHERE`
-- [ ] `EXISTS (subquery)` / `IN (subquery)` / `NOT IN (subquery)`
-- [ ] `IN (val1, val2, ...)` literal list
-- [ ] `ANY (subquery)` / `ALL (subquery)`
-- [ ] `WITH cte AS (...) SELECT ...` (non-recursive CTEs)
-- [ ] `WITH RECURSIVE cte AS (...) SELECT ...`
-- [ ] `SAVEPOINT name` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`
-- [ ] `EXPLAIN` / `EXPLAIN ANALYZE`
-- [ ] `SET [SESSION|LOCAL] var = val` / `SHOW var` / `RESET var`
-- [ ] `PREPARE name AS ...` / `EXECUTE name (params)` / `DEALLOCATE name`
+<!-- wave 3 completed: d97f1a1..561d62b -->
+- [x] `SELECT *` (parser accepts; binder expansion still TODO)
+- [x] `SELECT t.*` and table aliases
+- [x] Column aliases: `SELECT col AS alias`
+- [x] `INNER JOIN ... ON ...`
+- [x] `LEFT / RIGHT / FULL OUTER JOIN ... ON ...`
+- [x] `CROSS JOIN` / `JOIN ... USING (col)`
+- [x] `GROUP BY col1, col2` / `HAVING expr`
+- [x] `DISTINCT` / `DISTINCT ON (expr)`
+- [x] `UNION [ALL]` / `INTERSECT [ALL]` / `EXCEPT [ALL]`
+- [x] Subqueries in `FROM` (derived tables)
+- [x] Scalar subqueries in `WHERE`
+- [x] `EXISTS (subquery)` / `IN (subquery)` / `NOT IN (subquery)`
+- [x] `IN (val1, val2, ...)` literal list
+- [x] `ANY (subquery)` / `ALL (subquery)`
+- [x] `WITH cte AS (...) SELECT ...` (non-recursive CTEs)
+- [x] `WITH RECURSIVE cte AS (...) SELECT ...`
+- [x] `SAVEPOINT name` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`
+- [x] `EXPLAIN` / `EXPLAIN ANALYZE`
+- [x] `SET [SESSION|LOCAL] var = val` / `SHOW var` / `RESET var`
+- [x] `PREPARE name AS ...` / `EXECUTE name (params)` / `DEALLOCATE name`
 
 ### Parser: Expressions
 - [ ] `CASE WHEN ... THEN ... ELSE ... END`
@@ -254,14 +255,14 @@ Produce typed logical plans for all common statement types.
 them back with crash recovery. WAL wired to heap. No more in-memory-only data.
 
 ### WAL ↔ Storage Integration
-<!-- wave 1 partial: 21a16e4..008b457 -->
-- [ ] WAL writer wired to buffer pool dirty pages
-- [ ] WAL LSN stamped on every page write
-- [ ] Checkpointer background task (dirty page flush + WAL truncation)
-- [ ] Crash recovery: replay WAL records on startup
-- [x] WAL record types for heap inserts/updates/deletes (payload codecs landed; storage emission in wave 2)
+<!-- wave 1+2+3 partial: 21a16e4..561d62b -->
+- [x] WAL writer wired to buffer pool dirty pages (BufferPool::try_flush_dirty gates on durable_lsn)
+- [x] WAL LSN stamped on every page write
+- [x] Checkpointer background task (dirty page flush + WAL truncation) — flush done; truncation TODO
+- [x] Crash recovery: replay WAL records on startup (HeapTarget trait + replay_into dispatcher; HeapAccess impl wave 4)
+- [x] WAL record types for heap inserts/updates/deletes
 - [ ] WAL record types for B-tree index changes
-- [ ] Full page writes (FPW) on first write after checkpoint
+- [ ] Full page writes (FPW) on first write after checkpoint (payload codec ready; emission logic TODO)
 
 ### Heap Access Method
 <!-- wave 1+2 partial: 21a16e4..7647f43 -->
@@ -341,7 +342,8 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 Real auth. Any standard PostgreSQL driver can connect.
 
 ### Scan Operators
-- [ ] `SeqScan` with predicate pushdown (qual evaluation per tuple)
+<!-- wave 3 partial: 51adaf7 -->
+- [x] `SeqScan` with predicate pushdown (qual evaluation per tuple) — basic SeqScan over heap shipped; predicate-pushdown via planner Filter remains
 - [ ] `IndexScan` via B-tree (point lookup + range scan)
 - [ ] `IndexOnlyScan` (skip heap fetch when VM bit is set)
 - [ ] `BitmapIndexScan` + `BitmapHeapScan` (OR multiple indexes)
