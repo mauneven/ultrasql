@@ -1851,6 +1851,7 @@ name = "ultrasql-server"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "config",
  "thiserror",
