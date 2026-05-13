@@ -16,9 +16,15 @@ workspace = true
 name = "ultrasql-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "cross_compare"
+path = "src/bin/cross_compare.rs"
+
 [dependencies]
 ultrasql-core     = { workspace = true }
 ultrasql-protocol = { workspace = true }
+ultrasql-vec      = { workspace = true }
+ultrasql-storage  = { workspace = true }
 anyhow            = { workspace = true }
 clap              = { workspace = true }
 tokio             = { workspace = true }
