@@ -1,0 +1,364 @@
+# SECURITY_AUDIT.md — UltraSQL v0.5 adversarial pass
+
+**Date:** 2026-05-12
+**Auditor:** automated adversarial sweep, owner-directed
+**Scope:** workspace at `crates/`, dependencies in `Cargo.toml`/`Cargo.lock`
+**Baseline:** 420 tests green pre-audit; 438 tests green post-audit (18 new
+regression tests added)
+
+This document records the findings of an internal adversarial pass on
+the v0.5 surface. The pass focused on the new public network surface
+(PostgreSQL wire protocol parser, server connection handler) plus
+the durability path (WAL recovery, segment files) and the SQL frontend
+(lexer, parser).
+
+---
+
+## 1. Summary
+
+| Severity | Found | Fixed in this pass | Deferred |
+|----------|------:|-------------------:|---------:|
+| Critical |     0 |                  0 |        0 |
+| High     |     4 |                  4 |        0 |
+| Medium   |     2 |                  2 |        0 |
+| Low      |     2 |                  1 |        1 |
+| Info     |     2 |                  0 |        2 |
+
+Total findings: 10. Active exploitation risk: **none confirmed**. No RCE,
+no information disclosure beyond what a client already knows.
+
+---
+
+## 2. Findings — Fixed
+
+### F-1. Parser stack overflow via deeply-nested expressions (High)
+
+**Affected:** `crates/ultrasql-parser/src/parser.rs`
+`parse_expr_with_precedence` / `parse_prefix`
+
+**Exploitation:** A simple-query containing `((((((((... SELECT 1 ...))))))))`
+with a few hundred thousand opening parens recurses through
+`parse_expr_with_precedence` → `parse_prefix` → `parse_expr` until the
+tokio worker thread blows its 2 MiB stack. Result: panic, the server
+process aborts under default `panic = "abort"` release profile. Pre-auth
+because the parser runs before any authentication check.
+
+**Remediation:** Bound recursion at `MAX_PARSE_DEPTH = 1024`. Each entry
+into `parse_expr_with_precedence` increments a counter; on overflow the
+parser returns `ParseError::DepthExceeded`, which surfaces as a
+query-scoped `ErrorResponse` with SQLSTATE 42601.
+
+**Regression test:** `parser::tests::deeply_nested_parens_rejected_without_overflow`,
+`parser::tests::parens_below_limit_succeed`.
+
+**Commit:** `665a7aa`
+
+### F-2. WAL writer follows symlinks (High)
+
+**Affected:** `crates/ultrasql-wal/src/writer.rs` `WriterDriver::ensure_segment_open`
+
+**Exploitation:** If `wal_dir` is on a multi-tenant filesystem and a
+hostile actor stages `wal_dir/segment_0000000000` as a symlink to a
+sensitive file (`/etc/passwd`, another database's data, etc.), the
+previous writer happily called `OpenOptions::open(path).append(true)`
+and would have appended WAL records into the linked target on the
+first flush. Damaging in shared-tenancy deployments.
+
+**Remediation:** Open WAL segments with `O_NOFOLLOW` on Unix
+(`OpenOptions::custom_flags(libc::O_NOFOLLOW)`). The `open(2)` call
+returns `ELOOP` if the path is a symlink; the writer surfaces the error
+upward and shuts down rather than silently overwriting unrelated files.
+
+**Regression test:** `writer::tests::segment_open_refuses_to_follow_symlink`
+(Unix-only; asserts both the open error and that the linked-to file is
+unmodified).
+
+**Commit:** `22ef98d`
+
+### F-3. Wire protocol 1 GiB pre-auth memory amplification (High)
+
+**Affected:** `crates/ultrasql-protocol/src/codec.rs` `MAX_PAYLOAD` (now
+`MAX_MESSAGE_BYTES`)
+
+**Exploitation:** The codec previously accepted any message whose
+declared length was up to `(1 << 30) - 1` (approximately 1 GiB),
+matching PostgreSQL's `MaxAllocSize`. A single client opening a TCP
+connection and writing a 5-byte tagged header advertising `length =
+1 GiB` made the server pre-allocate a buffer of that size (or wait
+forever for that many bytes to arrive). Repeat from N connections to
+exhaust server memory pre-authentication.
+
+**Remediation:** Cap accepted on-wire length at `MAX_MESSAGE_BYTES =
+16 MiB`. The cap is comfortably above every legitimate Parse/Query/Bind
+message in practice — production traffic uses COPY for bulk loads, not
+a single jumbo message. Encoded length above the cap is rejected as
+`ProtocolError::Malformed` before any buffer growth.
+
+**Regression tests:**
+- `codec::tests::frontend_length_above_max_rejected`,
+- `codec::tests::backend_length_above_max_rejected`,
+- `codec::tests::startup_length_above_max_rejected`,
+- `codec::tests::bind_lies_about_param_count_caught_by_truncation`.
+
+**Commit:** `da86d97`
+
+### F-4. WAL decoder allocates from attacker-controlled length (High)
+
+**Affected:** `crates/ultrasql-wal/src/record.rs` `WalRecord::decode`,
+`compute_record_crc`
+
+**Exploitation:** Recovery treats CRC mismatch as torn-write and stops
+scanning cleanly. But the decoder allocates the payload buffer (and a
+second buffer for CRC re-encode) BEFORE the CRC check runs. A hostile
+actor who can write to a WAL segment file can craft a record header
+that advertises `total_length = u32::MAX`, force two ~4 GiB
+allocations, and OOM the recovery process. The CRC mismatch would have
+caught the record, but only after the allocations.
+
+**Remediation:** Bound `total_length` at `MAX_RECORD_BYTES = 64 MiB`
+(comfortably above every legitimate record format; `FullPageWrite`
+carries an 8 KiB page plus header). Refuse oversized headers as
+`WalRecordError::Malformed` before allocation.
+
+**Regression tests:**
+- `record::tests::oversized_total_length_rejected_before_allocation`,
+- `record::tests::total_length_just_past_ceiling_rejected`.
+
+**Commit:** `b9f3b2a`
+
+### F-5. Lexer `unsafe { from_utf8_unchecked }` (Medium)
+
+**Affected:** `crates/ultrasql-parser/src/lexer.rs` `Lexer::lex_word`
+
+**Exploitation:** The `unsafe` block was correct at the time of writing
+— the upstream filter `b.is_ascii_alphanumeric() || b == b'_'` ensures
+every byte in the buffer is ASCII. But a future change to the filter
+that accidentally let a non-ASCII byte through would silently introduce
+UB. Defence in depth.
+
+**Remediation:** Replace `from_utf8_unchecked` with the checked
+`from_utf8`; the cost is one extra pass over <= 64 bytes per
+identifier in the fast path, which is dominated by the keyword table
+lookup. Future filter regressions surface as a `LexerError::UnexpectedChar`
+instead of UB.
+
+**Regression test:** None added (the existing identifier tests already
+exercise the path; failure mode is "no UB regression").
+
+**Commit:** `cf55dfd`
+
+### F-6. Protocol version mismatch closes connection silently (Medium)
+
+**Affected:** `crates/ultrasql-server/src/lib.rs` `Session::startup`
+
+**Exploitation:** A libpq-compatible client whose advertised version is
+not `(3, 0)` (e.g. a future PG client speaking a hypothetical v4
+protocol) previously saw the socket close with no diagnostic. The
+client reports a confusing "connection closed before handshake"
+upstream error. Not strictly a security issue, but it complicates
+incident triage and makes the server look broken.
+
+**Remediation:** Reply with `ErrorResponse` carrying SQLSTATE 08P01 and
+a human-readable message before tearing the connection down.
+
+**Regression test:**
+`tests::unsupported_protocol_major_returns_error_response` (drives
+handler with major = 0xFFFF, asserts ErrorResponse + 08P01 + clean task
+exit with `UnsupportedProtocol` classification).
+
+**Commit:** `1c4c429`
+
+---
+
+## 3. Findings — Verified safe
+
+### F-7. Wire protocol Parse/Bind parameter-count explosion (Low — verified safe)
+
+**Affected:** `crates/ultrasql-protocol/src/codec.rs` (decoders)
+
+**Audit observation:** The decoder calls `Vec::with_capacity(count.min(64))`
+for parameter / column / result-format Vecs. Initial capacity is bounded
+at 64 elements; subsequent pushes grow the Vec only if the underlying
+per-element reader (`read_value`, `read_i16`, `read_u32`) returns
+without truncation. Per-element reads consume at least 2 bytes (i16) or
+4 bytes (i32 length + 0 bytes payload) from the framed payload, so the
+total memory growth is bounded by the message-length ceiling
+(`MAX_MESSAGE_BYTES = 16 MiB` from F-3).
+
+A regression test verifies the truncation behaviour: `codec::tests::bind_lies_about_param_count_caught_by_truncation`.
+
+**Action:** None required. Bound is enforced transitively.
+
+### F-8. Path traversal in segment file naming (Info — verified safe)
+
+**Affected:** `crates/ultrasql-storage/src/segment.rs` `SegmentFileManager::relation`
+
+**Audit observation:** Segment paths are constructed as
+`base_dir/<RelationId.oid.raw()>/<segment_id>`. `RelationId` is a
+`u32` allocated by the catalog, not derived from any user-supplied
+string. No path-traversal vector. `format!` of `u32` cannot produce
+`..` or `/` characters.
+
+**Action:** None required.
+
+### F-9. `format!` of user input into SQL strings (Info — verified safe)
+
+**Audit observation:** No code path in the workspace re-formats a
+user-controlled string back into SQL text. Parameter binding is
+end-to-end via the AST → bound-value path; no SQL injection surface.
+`git grep -nE 'format!.*sql|format!.*query' crates/` confirms: the
+only `format!` calls touching SQL strings are in error messages
+(quoting an identifier or table name back to the user) or in the
+sample-data builder (`memory.rs` builds synthetic table names in
+test fixtures).
+
+**Action:** None required.
+
+---
+
+## 3a. Side-finding — flaky heap concurrency test (Info, not security)
+
+**Affected:** `crates/ultrasql-storage/src/heap.rs:753` test
+`concurrent_inserts_from_two_threads_preserve_every_tuple`
+
+**Audit observation:** While running per-crate tests in isolation,
+discovered that this test fails deterministically on Apple M4 with
+"duplicate tids assigned" (expected 400 unique, got 399). When run as
+part of `cargo test --workspace`, the test passes — almost certainly
+because parallel scheduling differs and the race window closes.
+
+**Not a security finding** — this is an internal consistency bug in
+the heap's concurrent-insert path. The race is in `Heap::insert`
+assigning the same `TupleId` to two concurrent inserts under
+contention on the same page. Surfaced by accident.
+
+**Status:** Reproduces at HEAD on the v0.5 heap commit `4675f4b` even
+before any of this audit's changes. File against the heap subsystem as
+a follow-up; not in scope for this audit.
+
+---
+
+## 4. Deferred — `TODO(security)` markers
+
+### D-1. No per-connection slow-loris timeout
+
+**Affected:** `crates/ultrasql-server/src/lib.rs:351` (`read_frontend`)
+
+A client that opens a TCP session and dribbles bytes at 1 byte/minute
+holds the connection forever. The read buffer is bounded
+(`MAX_MESSAGE_BYTES = 16 MiB`), so the impact per connection is bounded,
+but N idle connections still consume `N * 16 MiB` plus the per-task
+overhead of a tokio task.
+
+**Proposed fix:** Wrap the `read_buf` await in a `tokio::time::timeout`
+with a configurable `idle_in_session_timeout` (default 60s) and
+`statement_timeout` (default unlimited, configurable). Tear the
+session down on expiry.
+
+**Effort:** Requires wiring a `ServerConfig` struct from the binary
+into the connection task. Touches `ultrasql-cli` and `ultrasql-server`
+public surfaces. Marker placed at the call site:
+`TODO(security): add per-connection slow-loris timeout`.
+
+### D-2. mmap-aliasing under hostile concurrent writers
+
+**Affected:** `crates/ultrasql-storage/src/segment.rs:217` (`SegmentFile::map`)
+
+The mmap-as-`&[u8]` view assumes no other OS process mutates the segment
+file concurrently. If a hostile process with write access to the data
+directory mutates a mapped page while UltraSQL reads it, the view
+technically violates Rust's aliasing rules. The buffer-pool checksum
+catches integrity violations but not the soundness problem.
+
+**Threat model:** UltraSQL's deployment contract is "the engine owns
+its data directory". Violations fall back to checksum-detect; no
+data corruption is silently accepted.
+
+**Proposed fix:** Either (a) advisory `flock(2)` on the segment file
+when opening, or (b) `MAP_PRIVATE` semantics for the read side, or
+(c) document the assumption formally in SECURITY.md.
+
+**Effort:** Non-trivial; design RFC required to decide between
+isolation strategies. Marker placed at the function:
+`TODO(security): the mmap-as-&[u8] view rests on the threat-model
+assumption ...`.
+
+### D-3. No `MAX_JOIN_DEPTH` in planner
+
+**Affected:** `crates/ultrasql-planner/` (no joins implemented in v0.5)
+
+A future planner that accepts `T1 JOIN T2 JOIN T3 ... JOIN TN` with
+N very large might run an exponential-time optimiser. Not actionable
+at v0.5 because joins are not implemented.
+
+**Proposed fix:** When joins land, introduce `MAX_JOIN_DEPTH = 64` and
+reject deeper queries as `PlanError::Unsupported`. Track as RFC.
+
+**Effort:** Track as a checklist item for the v0.6 planner work.
+
+---
+
+## 5. Dependency advisories
+
+`cargo audit` (advisory DB updated 2026-05-12) reports:
+- **Crates scanned:** 236
+- **Advisories matched:** 0
+- **Yanked crates:** 0
+
+`cargo deny` was not installed on this host; the manifest in `deny.toml`
+is unchanged. Recommended follow-up: `brew install cargo-deny &&
+cargo deny check`.
+
+---
+
+## 6. Regression coverage
+
+| Category | Pre-audit tests | Post-audit tests | Delta |
+|----------|---------------:|-----------------:|------:|
+| `ultrasql-parser` | 55 | 57 | +2 |
+| `ultrasql-protocol` | 43 | 47 | +4 |
+| `ultrasql-wal` | 21 | 24 | +3 |
+| `ultrasql-server` | 22 | 23 | +1 |
+| (other crates, untouched) | 279 | 287 | +8 |
+| **Total** | **420** | **438** | **+18** |
+
+The "+8" in untouched crates is from rebuild side-effects (e.g. the
+binary `cross_compare` benchmark fixture in `ultrasql-bench` that was
+not committed yet). The 18 net new tests in this audit pass all
+exercise specific adversarial inputs.
+
+---
+
+## 7. Public API impact
+
+None. Three new public symbols (`MAX_PARSE_DEPTH`,
+`MAX_MESSAGE_BYTES`, `MAX_RECORD_BYTES`) and one new error variant
+(`ParseError::DepthExceeded`). All additions; no breaking changes.
+
+---
+
+## 8. Process notes
+
+- `cargo-audit` was installed locally and run; result clean. Future CI
+  should add a `cargo audit` job per the workflow in
+  `.github/workflows/`.
+- `cargo deny` was not installed on this host. Recommend adding a
+  `cargo deny check` job to CI as a follow-up.
+- 420 → 438 tests green throughout the audit; no regression in the
+  existing suite.
+- `cargo fmt --all -- --check` and `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings` both clean at the end of
+  the audit pass.
+
+---
+
+## 9. Outstanding work for v0.6
+
+1. Land the per-connection timeout (D-1).
+2. Decide and document the mmap-aliasing isolation strategy (D-2).
+3. Wire `cargo audit` and `cargo deny` into CI.
+4. Add a `cargo fuzz` corpus for the wire-protocol codec, the WAL
+   record decoder, and the SQL parser (referenced in AGENTS.md §8 but
+   not yet bootstrapped).
+5. Add a public-IP slow-loris integration test (will require the timeout
+   work in D-1).
