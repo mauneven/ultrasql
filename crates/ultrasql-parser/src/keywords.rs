@@ -201,6 +201,14 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("recursive", TokenKind::KwRecursive),
         ("release", TokenKind::KwRelease),
         ("verbose", TokenKind::KwVerbose),
+        // Expression-completeness keywords added for v0.2 (wave 4)
+        ("at", TokenKind::KwAt),
+        ("coalesce", TokenKind::KwCoalesce),
+        ("greatest", TokenKind::KwGreatest),
+        ("least", TokenKind::KwLeast),
+        ("nullif", TokenKind::KwNullif),
+        ("overlaps", TokenKind::KwOverlaps),
+        ("zone", TokenKind::KwZone),
     ];
 
     entries.iter().copied().collect()

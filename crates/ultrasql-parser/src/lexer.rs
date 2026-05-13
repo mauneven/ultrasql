@@ -604,12 +604,14 @@ impl<'src> Lexer<'src> {
         let b2 = self.peek_at(2);
 
         let token = match (b0, b1, b2) {
-            // 3-byte operators first.
+            // 3-byte operators first (maximal-munch ordering).
             (b'!', Some(b'~'), Some(b'*')) => three(self, TokenKind::NotTildeStar),
             (b'-', Some(b'>'), Some(b'>')) => three(self, TokenKind::ArrowDouble),
             (b'#', Some(b'>'), Some(b'>')) => three(self, TokenKind::HashArrowDouble),
 
             // 2-byte operators.
+            (b'<', Some(b'<'), _) => two(self, TokenKind::ShiftLeft),
+            (b'>', Some(b'>'), _) => two(self, TokenKind::ShiftRight),
             (b'<', Some(b'='), _) => two(self, TokenKind::LtEq),
             (b'>', Some(b'='), _) => two(self, TokenKind::GtEq),
             (b'<', Some(b'>'), _) | (b'!', Some(b'='), _) => two(self, TokenKind::NotEq),
@@ -621,6 +623,8 @@ impl<'src> Lexer<'src> {
             (b'@', Some(b'>'), _) => two(self, TokenKind::AtArrow),
             (b'<', Some(b'@'), _) => two(self, TokenKind::ArrowAt),
             (b':', Some(b':'), _) => two(self, TokenKind::ColonColon),
+            (b'?', Some(b'|'), _) => two(self, TokenKind::QuestionPipe),
+            (b'?', Some(b'&'), _) => two(self, TokenKind::QuestionAmpersand),
 
             // 1-byte operators / punctuation.
             (b'(', _, _) => one(self, TokenKind::LParen),
@@ -642,6 +646,9 @@ impl<'src> Lexer<'src> {
             (b'~', _, _) => one(self, TokenKind::Tilde),
             (b':', _, _) => one(self, TokenKind::Colon),
             (b'?', _, _) => one(self, TokenKind::QuestionMark),
+            (b'&', _, _) => one(self, TokenKind::Ampersand),
+            (b'|', _, _) => one(self, TokenKind::Pipe),
+            (b'#', _, _) => one(self, TokenKind::Hash),
 
             (other, _, _) => {
                 // Carve out an error including the actual char. For
@@ -922,6 +929,72 @@ mod tests {
                 TokenKind::TildeStar,
                 TokenKind::NotTilde,
                 TokenKind::NotTildeStar,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn bitwise_operators() {
+        let src = "& | # << >>";
+        let k = kinds(src);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Ampersand,
+                TokenKind::Pipe,
+                TokenKind::Hash,
+                TokenKind::ShiftLeft,
+                TokenKind::ShiftRight,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn json_question_operators() {
+        let src = "? ?| ?&";
+        let k = kinds(src);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::QuestionMark,
+                TokenKind::QuestionPipe,
+                TokenKind::QuestionAmpersand,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn pipe_pipe_wins_over_pipe() {
+        // || must lex as Concat, not as two Pipe tokens.
+        let src = "a || b | c";
+        let k = kinds(src);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::Identifier,
+                TokenKind::Concat,
+                TokenKind::Identifier,
+                TokenKind::Pipe,
+                TokenKind::Identifier,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn shift_left_wins_over_lt() {
+        let src = "<< >> < >";
+        let k = kinds(src);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::ShiftLeft,
+                TokenKind::ShiftRight,
+                TokenKind::Lt,
+                TokenKind::Gt,
                 TokenKind::Eof,
             ]
         );

@@ -129,7 +129,7 @@ pub enum TokenKind {
     AtArrow,
     /// `<@` — `contained by`.
     ArrowAt,
-    /// `~`  — POSIX regex match.
+    /// `~`  — POSIX regex match (also unary bitwise NOT in prefix position).
     Tilde,
     /// `!~` — POSIX regex non-match.
     NotTilde,
@@ -137,6 +137,20 @@ pub enum TokenKind {
     TildeStar,
     /// `!~*` — case-insensitive POSIX regex non-match.
     NotTildeStar,
+    /// `&` — bitwise AND.
+    Ampersand,
+    /// `|` — bitwise OR.
+    Pipe,
+    /// `#` — bitwise XOR (PostgreSQL).
+    Hash,
+    /// `<<` — bitwise shift left.
+    ShiftLeft,
+    /// `>>` — bitwise shift right.
+    ShiftRight,
+    /// `?|` — JSON has-any-key.
+    QuestionPipe,
+    /// `?&` — JSON has-all-keys.
+    QuestionAmpersand,
 
     // ---- keywords (sorted alphabetically for sanity) --------------------
     KwAbort,
@@ -336,6 +350,21 @@ pub enum TokenKind {
     KwRelease,
     /// `VERBOSE` — `EXPLAIN VERBOSE`.
     KwVerbose,
+    // ---- Expression-completeness keywords added for v0.2 (wave 4) ----------
+    /// `AT` — used in `expr AT TIME ZONE zone`.
+    KwAt,
+    /// `COALESCE` — `COALESCE(a, b, …)`.
+    KwCoalesce,
+    /// `GREATEST` — `GREATEST(a, b, …)`.
+    KwGreatest,
+    /// `LEAST` — `LEAST(a, b, …)`.
+    KwLeast,
+    /// `NULLIF` — `NULLIF(a, b)`.
+    KwNullif,
+    /// `OVERLAPS` — `(a, b) OVERLAPS (c, d)`.
+    KwOverlaps,
+    /// `ZONE` — used in `AT TIME ZONE`.
+    KwZone,
 }
 
 impl TokenKind {

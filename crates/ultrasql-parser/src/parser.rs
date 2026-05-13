@@ -87,7 +87,12 @@ pub enum ParseError {
 /// (a million nested parentheses would otherwise crash the server
 /// before any other validation runs); legitimate SQL never approaches
 /// this depth.
-pub const MAX_PARSE_DEPTH: u32 = 1024;
+///
+/// The value is intentionally conservative: the expression parser now
+/// supports many more constructs (CASE, BETWEEN, postfix casts, etc.) so
+/// each nesting level consumes a larger stack frame. 512 is still far above
+/// any reasonable real-world SQL nesting depth.
+pub const MAX_PARSE_DEPTH: u32 = 512;
 
 /// SQL parser.
 #[derive(Debug)]
@@ -319,16 +324,86 @@ impl<'src> Parser<'src> {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     fn parse_expr_with_precedence_inner(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut left = self.parse_prefix()?;
 
-        while let Some((op, op_span)) = self.peek_binary_op()? {
+        // Pratt binary-operator loop with integrated postfix constructs.
+        'outer: loop {
+            // ----------------------------------------------------------------
+            // Postfix operators evaluated before the next binary-op check.
+            // Ordering: :: (cast) > [] (subscript) > AT TIME ZONE > BETWEEN >
+            //           IS > NOT BETWEEN/IN > IN.
+            // ----------------------------------------------------------------
+
+            // postfix `::type` — may chain (e.g. `x::int::text`).
+            while self.peek()?.kind == TokenKind::ColonColon {
+                self.advance()?; // ::
+                let target = self.parse_type_name()?;
+                let span = Span::new(left.span().start, target.span.end);
+                left = Expr::PostfixCast {
+                    expr: Box::new(left),
+                    target,
+                    span,
+                };
+            }
+
+            // postfix `[index]` or `[lower:upper]` — may chain.
+            while self.peek()?.kind == TokenKind::LBracket {
+                left = self.parse_subscript_or_slice(left)?;
+            }
+
+            // `expr AT TIME ZONE zone`
+            if self.peek()?.kind == TokenKind::KwAt
+                && self.lookahead_two_is(TokenKind::KwTime, TokenKind::KwZone)
+            {
+                left = self.parse_at_time_zone(left)?;
+                continue 'outer;
+            }
+
+            // `expr [NOT] BETWEEN [SYMMETRIC] low AND high`
+            if self.peek()?.kind == TokenKind::KwBetween {
+                left = self.parse_between_body(left, false)?;
+                continue 'outer;
+            }
+            if self.peek()?.kind == TokenKind::KwNot {
+                // Peek: NOT BETWEEN
+                if self.lookahead_at(1)?.kind == TokenKind::KwBetween {
+                    self.advance()?; // NOT
+                    left = self.parse_between_body(left, true)?;
+                    continue 'outer;
+                }
+            }
+
+            // `expr IS [NOT] NULL / TRUE / FALSE / UNKNOWN / DISTINCT FROM`
+            if self.peek()?.kind == TokenKind::KwIs {
+                left = self.parse_is_postfix(left)?;
+                continue 'outer;
+            }
+
+            // `expr [NOT] IN (…)` — consumed here rather than the binary loop.
+            if self.peek()?.kind == TokenKind::KwIn {
+                self.advance()?; // IN
+                return self.parse_in_expr(left, false);
+            }
+            if self.peek()?.kind == TokenKind::KwNot
+                && self.lookahead_at(1)?.kind == TokenKind::KwIn
+            {
+                self.advance()?; // NOT
+                self.advance()?; // IN
+                return self.parse_in_expr(left, true);
+            }
+
+            // ----------------------------------------------------------------
+            // Standard Pratt binary-op check.
+            // ----------------------------------------------------------------
+            let Some((op, op_span)) = self.peek_binary_op()? else {
+                break 'outer;
+            };
             let prec = op.precedence();
             if prec < min_prec {
-                break;
+                break 'outer;
             }
-            // Consume the operator tokens (may be 1 or 2 lexer
-            // tokens — e.g. `NOT LIKE`).
             self.consume_binary_op(op)?;
 
             let next_min = if op.is_right_associative() {
@@ -337,11 +412,10 @@ impl<'src> Parser<'src> {
                 prec + 1
             };
 
-            // Special post-infix: `<op> ANY/ALL (SELECT …)` — check before
-            // parsing the right-hand operand.
+            // Special post-infix: `<op> ANY/ALL (SELECT …)`.
             if let Some(any_all) = self.parse_any_all_expr(left.clone(), op)? {
                 left = any_all;
-                continue;
+                continue 'outer;
             }
 
             let right = self.parse_expr_with_precedence(next_min)?;
@@ -353,57 +427,193 @@ impl<'src> Parser<'src> {
                 span: Span::new(span.start, span.end.max(op_span.end)),
             };
         }
-        // (`op_span` is the position of the operator within the
-        // current iteration; we keep it so future error messages can
-        // point at the operator, not the right-hand operand.)
-
-        // Trailing IS NULL / IS NOT NULL.
-        if self.peek()?.kind == TokenKind::KwIs {
-            let is_tok = self.advance()?;
-            let negated = self.match_kw(TokenKind::KwNot);
-            self.expect(TokenKind::KwNull, "NULL")?;
-            let span = Span::new(left.span().start, is_tok.span.end);
-            left = Expr::IsNull {
-                expr: Box::new(left),
-                negated,
-                span,
-            };
-        }
-
-        // Trailing [NOT] IN (…)
-        if self.peek()?.kind == TokenKind::KwIn {
-            self.advance()?; // IN
-            return self.parse_in_expr(left, false);
-        }
-        if self.peek()?.kind == TokenKind::KwNot {
-            // Could be NOT IN — peek ahead.
-            if self.lookahead_at(1)?.kind == TokenKind::KwIn {
-                self.advance()?; // NOT
-                self.advance()?; // IN
-                return self.parse_in_expr(left, true);
-            }
-        }
 
         Ok(left)
+    }
+
+    /// Parse `BETWEEN [SYMMETRIC] low AND high` after `expr` and the (optional
+    /// `NOT` and the) `BETWEEN` keyword have been consumed by the caller.
+    ///
+    /// The AND inside `BETWEEN … AND …` is not a boolean AND: we parse the
+    /// lower and upper bounds at precedence 4 (one above comparison) so that
+    /// a bare `AND` terminates the bound expression without consuming it.
+    fn parse_between_body(&mut self, expr: Expr, negated: bool) -> Result<Expr, ParseError> {
+        let start = expr.span().start;
+        self.advance()?; // BETWEEN
+        let symmetric = self.match_kw(TokenKind::KwSymmetric);
+        // Precedence 4 stops before AND (prec 2) but allows arithmetic.
+        let low = self.parse_expr_with_precedence(4)?;
+        self.expect(TokenKind::KwAnd, "AND")?;
+        let high = self.parse_expr_with_precedence(4)?;
+        let span = Span::new(start, high.span().end);
+        Ok(Expr::Between {
+            expr: Box::new(expr),
+            low: Box::new(low),
+            high: Box::new(high),
+            negated,
+            symmetric,
+            span,
+        })
+    }
+
+    /// Parse `IS [NOT] NULL / TRUE / FALSE / UNKNOWN / DISTINCT FROM`.
+    ///
+    /// The `IS` keyword is the current token and has not been consumed.
+    fn parse_is_postfix(&mut self, expr: Expr) -> Result<Expr, ParseError> {
+        let _is_tok = self.advance()?; // IS
+        let start = expr.span().start;
+        let negated = self.match_kw(TokenKind::KwNot);
+
+        let tok = self.peek()?;
+        match tok.kind {
+            TokenKind::KwNull => {
+                let end = self.advance()?.span.end;
+                Ok(Expr::IsNull {
+                    expr: Box::new(expr),
+                    negated,
+                    span: Span::new(start, end),
+                })
+            }
+            TokenKind::KwTrue => {
+                let end = self.advance()?.span.end;
+                Ok(Expr::IsBoolean {
+                    expr: Box::new(expr),
+                    value: true,
+                    is_unknown: false,
+                    negated,
+                    span: Span::new(start, end),
+                })
+            }
+            TokenKind::KwFalse => {
+                let end = self.advance()?.span.end;
+                Ok(Expr::IsBoolean {
+                    expr: Box::new(expr),
+                    value: false,
+                    is_unknown: false,
+                    negated,
+                    span: Span::new(start, end),
+                })
+            }
+            TokenKind::KwUnknown => {
+                let end = self.advance()?.span.end;
+                Ok(Expr::IsBoolean {
+                    expr: Box::new(expr),
+                    // `value` is unused when `is_unknown` is true; use `true`
+                    // as a neutral placeholder.
+                    value: true,
+                    is_unknown: true,
+                    negated,
+                    span: Span::new(start, end),
+                })
+            }
+            TokenKind::KwDistinct => {
+                self.advance()?; // DISTINCT
+                self.expect(TokenKind::KwFrom, "FROM")?;
+                let right = self.parse_expr_with_precedence(4)?;
+                let span = Span::new(start, right.span().end);
+                Ok(Expr::IsDistinctFrom {
+                    left: Box::new(expr),
+                    right: Box::new(right),
+                    negated,
+                    span,
+                })
+            }
+            other => Err(ParseError::Expected {
+                expected: "NULL, TRUE, FALSE, UNKNOWN, or DISTINCT FROM after IS",
+                found: other,
+                offset: tok.span.start as usize,
+            }),
+        }
+    }
+
+    /// Parse `expr[index]` or `expr[lower:upper]` after identifying `[`.
+    fn parse_subscript_or_slice(&mut self, expr: Expr) -> Result<Expr, ParseError> {
+        let start = expr.span().start;
+        self.advance()?; // [
+
+        // `[:upper]` — lower absent, colon present immediately.
+        if self.peek()?.kind == TokenKind::Colon {
+            self.advance()?; // :
+            let upper = if self.peek()?.kind == TokenKind::RBracket {
+                None
+            } else {
+                Some(Box::new(self.parse_expr()?))
+            };
+            let end = self.expect(TokenKind::RBracket, "]")?.span.end;
+            return Ok(Expr::ArraySlice {
+                expr: Box::new(expr),
+                lower: None,
+                upper,
+                span: Span::new(start, end),
+            });
+        }
+
+        // Parse an expression; decide slice vs subscript by the next token.
+        let inner = self.parse_expr()?;
+
+        if self.peek()?.kind == TokenKind::Colon {
+            // Slice: `[lower:upper]` or `[lower:]`.
+            self.advance()?; // :
+            let upper = if self.peek()?.kind == TokenKind::RBracket {
+                None
+            } else {
+                Some(Box::new(self.parse_expr()?))
+            };
+            let end = self.expect(TokenKind::RBracket, "]")?.span.end;
+            Ok(Expr::ArraySlice {
+                expr: Box::new(expr),
+                lower: Some(Box::new(inner)),
+                upper,
+                span: Span::new(start, end),
+            })
+        } else {
+            // Subscript: `[index]`.
+            let end = self.expect(TokenKind::RBracket, "]")?.span.end;
+            Ok(Expr::ArraySubscript {
+                expr: Box::new(expr),
+                index: Box::new(inner),
+                span: Span::new(start, end),
+            })
+        }
+    }
+
+    /// Parse `expr AT TIME ZONE zone_expr`.
+    ///
+    /// The `AT` keyword is the current token (not yet consumed).
+    fn parse_at_time_zone(&mut self, expr: Expr) -> Result<Expr, ParseError> {
+        let start = expr.span().start;
+        self.advance()?; // AT
+        self.expect(TokenKind::KwTime, "TIME")?;
+        self.expect(TokenKind::KwZone, "ZONE")?;
+        // Zone is a high-precedence expression (e.g. string literal or ident).
+        let zone = self.parse_expr_with_precedence(8)?;
+        let span = Span::new(start, zone.span().end);
+        Ok(Expr::AtTimeZone {
+            expr: Box::new(expr),
+            zone: Box::new(zone),
+            span,
+        })
     }
 
     #[allow(clippy::too_many_lines)]
     fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
         let tok = self.peek()?;
         match tok.kind {
-            TokenKind::Plus | TokenKind::Minus | TokenKind::KwNot => {
+            TokenKind::Plus | TokenKind::Minus | TokenKind::KwNot | TokenKind::Tilde => {
                 let op_tok = self.advance()?;
                 let op = match op_tok.kind {
                     TokenKind::Plus => UnaryOp::Pos,
                     TokenKind::Minus => UnaryOp::Neg,
                     TokenKind::KwNot => UnaryOp::Not,
+                    TokenKind::Tilde => UnaryOp::BitNot,
                     _ => unreachable!(),
                 };
                 // Special case: NOT EXISTS
                 if op == UnaryOp::Not && self.peek()?.kind == TokenKind::KwExists {
                     return self.parse_exists_expr(true);
                 }
-                let rhs = self.parse_expr_with_precedence(7)?;
+                // Unary operators bind tighter than any binary operator.
+                let rhs = self.parse_expr_with_precedence(9)?;
                 let span = Span::new(op_tok.span.start, rhs.span().end);
                 Ok(Expr::Unary {
                     op,
@@ -478,16 +688,61 @@ impl<'src> Parser<'src> {
 
             TokenKind::LParen => {
                 // Consume `(` first, then peek to determine if it's a
-                // subquery — this avoids an extra lookahead call
-                // (`lookahead_at`) inside a deeply recursive call chain.
+                // subquery or a ROW/OVERLAPS paren list.
                 let lp = self.advance()?;
                 if let Some(subq) = self.try_parse_subquery_after_lparen(lp.span)? {
                     return Ok(subq);
                 }
-                let inner = self.parse_expr()?;
+                // Parse a parenthesised expression list: could be a single
+                // paren-expr, a ROW, or the LHS of OVERLAPS.
+                let first = self.parse_expr()?;
+                if self.peek()?.kind == TokenKind::Comma {
+                    // Multiple expressions inside parens — candidate ROW or OVERLAPS LHS.
+                    let mut fields = vec![first];
+                    while self.peek()?.kind == TokenKind::Comma {
+                        self.advance()?;
+                        fields.push(self.parse_expr()?);
+                    }
+                    let rp = self.expect(TokenKind::RParen, ")")?;
+                    let paren_span = Span::new(lp.span.start, rp.span.end);
+
+                    // If `OVERLAPS` follows, this is the LHS period.
+                    if self.peek()?.kind == TokenKind::KwOverlaps {
+                        if fields.len() != 2 {
+                            return Err(ParseError::Expected {
+                                expected: "exactly two expressions before OVERLAPS",
+                                found: TokenKind::KwOverlaps,
+                                offset: self.peek()?.span.start as usize,
+                            });
+                        }
+                        self.advance()?; // OVERLAPS
+                        self.expect(TokenKind::LParen, "(")?;
+                        let rs = self.parse_expr()?;
+                        self.expect(TokenKind::Comma, ",")?;
+                        let re = self.parse_expr()?;
+                        let rp2 = self.expect(TokenKind::RParen, ")")?;
+                        let mut iter = fields.into_iter();
+                        let ls = iter.next().expect("len checked above");
+                        let le = iter.next().expect("len checked above");
+                        return Ok(Expr::Overlaps {
+                            left_start: Box::new(ls),
+                            left_end: Box::new(le),
+                            right_start: Box::new(rs),
+                            right_end: Box::new(re),
+                            span: Span::new(lp.span.start, rp2.span.end),
+                        });
+                    }
+
+                    // Otherwise emit a Row expression.
+                    return Ok(Expr::Row {
+                        fields,
+                        span: paren_span,
+                    });
+                }
+
                 let rp = self.expect(TokenKind::RParen, ")")?;
                 Ok(Expr::Paren {
-                    expr: Box::new(inner),
+                    expr: Box::new(first),
                     span: Span::new(lp.span.start, rp.span.end),
                 })
             }
@@ -495,6 +750,18 @@ impl<'src> Parser<'src> {
             TokenKind::KwExists => self.parse_exists_expr(false),
 
             TokenKind::KwCast => self.parse_cast_expr(),
+
+            TokenKind::KwCase => self.parse_case_expr(),
+
+            TokenKind::KwCoalesce => self.parse_coalesce_expr(),
+
+            TokenKind::KwNullif => self.parse_nullif_expr(),
+
+            TokenKind::KwGreatest => self.parse_greatest_least_expr(true),
+
+            TokenKind::KwLeast => self.parse_greatest_least_expr(false),
+
+            TokenKind::KwRow => self.parse_row_expr(),
 
             TokenKind::Identifier | TokenKind::QuotedIdentifier => self.parse_ident_or_call(),
 
@@ -504,6 +771,126 @@ impl<'src> Parser<'src> {
                 offset: tok.span.start as usize,
             }),
         }
+    }
+
+    /// Parse `CASE [operand] WHEN … THEN … [ELSE …] END`.
+    fn parse_case_expr(&mut self) -> Result<Expr, ParseError> {
+        let case_tok = self.advance()?; // CASE
+        let start = case_tok.span.start;
+
+        // Optional operand (simple CASE): absent when the next token is WHEN,
+        // ELSE, or END (i.e. this is a searched CASE).
+        let operand = if matches!(
+            self.peek()?.kind,
+            TokenKind::KwWhen | TokenKind::KwElse | TokenKind::KwEnd
+        ) {
+            None
+        } else {
+            Some(Box::new(self.parse_expr()?))
+        };
+
+        // One or more WHEN … THEN … branches.
+        let mut branches = Vec::new();
+        while self.peek()?.kind == TokenKind::KwWhen {
+            self.advance()?; // WHEN
+            let when_expr = self.parse_expr()?;
+            self.expect(TokenKind::KwThen, "THEN")?;
+            let then_expr = self.parse_expr()?;
+            branches.push((when_expr, then_expr));
+        }
+        if branches.is_empty() {
+            return Err(ParseError::Expected {
+                expected: "WHEN clause in CASE expression",
+                found: self.peek()?.kind,
+                offset: self.peek()?.span.start as usize,
+            });
+        }
+
+        // Optional ELSE.
+        let else_expr = if self.match_kw(TokenKind::KwElse) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+
+        let end_tok = self.expect(TokenKind::KwEnd, "END")?;
+        Ok(Expr::Case {
+            operand,
+            branches,
+            else_expr,
+            span: Span::new(start, end_tok.span.end),
+        })
+    }
+
+    /// Parse `COALESCE(a, b, …)`.
+    fn parse_coalesce_expr(&mut self) -> Result<Expr, ParseError> {
+        let kw = self.advance()?; // COALESCE
+        self.expect(TokenKind::LParen, "(")?;
+        let args = self.parse_expr_list_inner()?;
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        Ok(Expr::Coalesce {
+            args,
+            span: Span::new(kw.span.start, rp.span.end),
+        })
+    }
+
+    /// Parse `NULLIF(a, b)`.
+    fn parse_nullif_expr(&mut self) -> Result<Expr, ParseError> {
+        let kw = self.advance()?; // NULLIF
+        self.expect(TokenKind::LParen, "(")?;
+        let a = self.parse_expr()?;
+        self.expect(TokenKind::Comma, ",")?;
+        let b = self.parse_expr()?;
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        Ok(Expr::NullIf {
+            a: Box::new(a),
+            b: Box::new(b),
+            span: Span::new(kw.span.start, rp.span.end),
+        })
+    }
+
+    /// Parse `GREATEST(…)` or `LEAST(…)`.
+    fn parse_greatest_least_expr(&mut self, is_greatest: bool) -> Result<Expr, ParseError> {
+        let kw = self.advance()?; // GREATEST / LEAST
+        self.expect(TokenKind::LParen, "(")?;
+        let args = self.parse_expr_list_inner()?;
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        let span = Span::new(kw.span.start, rp.span.end);
+        if is_greatest {
+            Ok(Expr::Greatest { args, span })
+        } else {
+            Ok(Expr::Least { args, span })
+        }
+    }
+
+    /// Parse `ROW(a, b, …)`.
+    fn parse_row_expr(&mut self) -> Result<Expr, ParseError> {
+        let kw = self.advance()?; // ROW
+        self.expect(TokenKind::LParen, "(")?;
+        let fields = if self.peek()?.kind == TokenKind::RParen {
+            Vec::new()
+        } else {
+            self.parse_expr_list_inner()?
+        };
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        Ok(Expr::Row {
+            fields,
+            span: Span::new(kw.span.start, rp.span.end),
+        })
+    }
+
+    /// Parse a comma-separated expression list for function argument lists.
+    ///
+    /// Unlike [`parse_expr_list`] in `select.rs`, this helper is used
+    /// exclusively inside parentheses and always returns at least one
+    /// expression.
+    fn parse_expr_list_inner(&mut self) -> Result<Vec<Expr>, ParseError> {
+        let mut args = vec![self.parse_expr()?];
+        while self.peek()?.kind == TokenKind::Comma {
+            self.advance()?;
+            args.push(self.parse_expr()?);
+        }
+        Ok(args)
     }
 
     pub(crate) fn parse_cast_expr(&mut self) -> Result<Expr, ParseError> {
@@ -595,7 +982,7 @@ impl<'src> Parser<'src> {
 
     fn peek_binary_op(&mut self) -> Result<Option<(BinaryOp, Span)>, ParseError> {
         // Snapshot the peek values so we can release the borrow before
-        // calling lookahead_at for NOT LIKE / NOT ILIKE.
+        // calling lookahead_at for two-token operators such as NOT LIKE.
         let (kind, span) = {
             let tok = self.peek()?;
             (tok.kind, tok.span)
@@ -618,8 +1005,29 @@ impl<'src> Parser<'src> {
             TokenKind::KwOr => BinaryOp::Or,
             TokenKind::KwLike => BinaryOp::Like,
             TokenKind::KwIlike => BinaryOp::Ilike,
+            // Regex operators (produced by the lexer as distinct token kinds).
+            TokenKind::Tilde => BinaryOp::RegexMatch,
+            TokenKind::TildeStar => BinaryOp::RegexIMatch,
+            TokenKind::NotTilde => BinaryOp::RegexNotMatch,
+            TokenKind::NotTildeStar => BinaryOp::RegexNotIMatch,
+            // Bitwise operators.
+            TokenKind::Ampersand => BinaryOp::BitAnd,
+            TokenKind::Pipe => BinaryOp::BitOr,
+            TokenKind::Hash => BinaryOp::BitXor,
+            TokenKind::ShiftLeft => BinaryOp::ShiftLeft,
+            TokenKind::ShiftRight => BinaryOp::ShiftRight,
+            // JSON operators.
+            TokenKind::Arrow => BinaryOp::JsonGet,
+            TokenKind::ArrowDouble => BinaryOp::JsonGetText,
+            TokenKind::HashArrow => BinaryOp::JsonGetPath,
+            TokenKind::HashArrowDouble => BinaryOp::JsonGetPathText,
+            TokenKind::AtArrow => BinaryOp::JsonContains,
+            TokenKind::ArrowAt => BinaryOp::JsonContained,
+            TokenKind::QuestionMark => BinaryOp::JsonHasKey,
+            TokenKind::QuestionPipe => BinaryOp::JsonHasAnyKey,
+            TokenKind::QuestionAmpersand => BinaryOp::JsonHasAllKeys,
             TokenKind::KwNot => {
-                // NOT LIKE / NOT ILIKE
+                // NOT LIKE / NOT ILIKE — the only two-keyword binary operators.
                 let next = self.lookahead_at(1)?;
                 return match next.kind {
                     TokenKind::KwLike => Ok(Some((BinaryOp::NotLike, span))),
@@ -643,6 +1051,7 @@ impl<'src> Parser<'src> {
                 self.expect(TokenKind::KwIlike, "ILIKE")?;
             }
             _ => {
+                // All other operators are a single token.
                 self.advance()?;
             }
         }
@@ -802,7 +1211,7 @@ const fn is_type_name_keyword(kind: TokenKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{BinaryOp, Distinct, Expr, SelectItem, SortDirection, Statement};
+    use crate::ast::{BinaryOp, Distinct, Expr, SelectItem, SortDirection, Statement, UnaryOp};
 
     fn parse(src: &str) -> Statement {
         Parser::new(src)
@@ -1012,5 +1421,818 @@ mod tests {
         }
         let stmt = Parser::new(&sql).parse_statement().expect("must parse");
         assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    // ── helpers ─────────────────────────────────────────────────────────────
+
+    /// Parse a bare expression from `SELECT <expr>` and return it.
+    fn parse_expr(src: &str) -> Expr {
+        let sql = format!("SELECT {src}");
+        let stmt = Parser::new(&sql)
+            .parse_statement()
+            .unwrap_or_else(|e| panic!("parse_expr failed for {src:?}: {e}"));
+        let Statement::Select(s) = stmt else { panic!() };
+        let SelectItem::Expr { expr, .. } = s.projection.into_iter().next().unwrap() else {
+            panic!()
+        };
+        expr
+    }
+
+    /// Expect parsing `SELECT <src>` to produce a [`ParseError`].
+    fn parse_err(src: &str) -> ParseError {
+        let sql = format!("SELECT {src}");
+        Parser::new(&sql)
+            .parse_statement()
+            .expect_err("expected parse error")
+    }
+
+    // ── CASE expressions ────────────────────────────────────────────────────
+
+    #[test]
+    fn searched_case_basic() {
+        let expr = parse_expr("CASE WHEN x > 0 THEN 'pos' WHEN x < 0 THEN 'neg' ELSE 'zero' END");
+        let Expr::Case {
+            operand,
+            branches,
+            else_expr,
+            ..
+        } = expr
+        else {
+            panic!()
+        };
+        assert!(operand.is_none(), "searched CASE has no operand");
+        assert_eq!(branches.len(), 2);
+        assert!(else_expr.is_some());
+    }
+
+    #[test]
+    fn simple_case_basic() {
+        let expr = parse_expr("CASE x WHEN 1 THEN 'one' WHEN 2 THEN 'two' END");
+        let Expr::Case {
+            operand,
+            branches,
+            else_expr,
+            ..
+        } = expr
+        else {
+            panic!()
+        };
+        assert!(operand.is_some(), "simple CASE has operand");
+        assert_eq!(branches.len(), 2);
+        assert!(else_expr.is_none());
+    }
+
+    #[test]
+    fn case_no_when_is_error() {
+        // CASE END without at least one WHEN clause is a parse error.
+        let err = parse_err("CASE END");
+        assert!(matches!(
+            err,
+            ParseError::Expected { .. } | ParseError::UnexpectedEof { .. }
+        ));
+    }
+
+    // ── COALESCE ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn coalesce_two_args() {
+        let expr = parse_expr("COALESCE(a, 0)");
+        let Expr::Coalesce { args, .. } = expr else {
+            panic!()
+        };
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn coalesce_many_args() {
+        let expr = parse_expr("COALESCE(a, b, c, d)");
+        let Expr::Coalesce { args, .. } = expr else {
+            panic!()
+        };
+        assert_eq!(args.len(), 4);
+    }
+
+    #[test]
+    fn coalesce_empty_is_error() {
+        let err = parse_err("COALESCE()");
+        assert!(matches!(
+            err,
+            ParseError::Expected { .. } | ParseError::UnexpectedEof { .. }
+        ));
+    }
+
+    // ── NULLIF ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn nullif_basic() {
+        let expr = parse_expr("NULLIF(x, 0)");
+        assert!(matches!(expr, Expr::NullIf { .. }));
+    }
+
+    #[test]
+    fn nullif_with_string() {
+        let expr = parse_expr("NULLIF(name, '')");
+        let Expr::NullIf { a, b, .. } = expr else {
+            panic!()
+        };
+        assert!(matches!(*a, Expr::Column { .. }));
+        assert!(matches!(*b, Expr::Literal(_)));
+    }
+
+    #[test]
+    fn nullif_too_few_args_is_error() {
+        let err = parse_err("NULLIF(x)");
+        assert!(matches!(
+            err,
+            ParseError::Expected { .. } | ParseError::UnexpectedEof { .. }
+        ));
+    }
+
+    // ── GREATEST / LEAST ────────────────────────────────────────────────────
+
+    #[test]
+    fn greatest_two_args() {
+        let expr = parse_expr("GREATEST(a, b)");
+        let Expr::Greatest { args, .. } = expr else {
+            panic!()
+        };
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn least_many_args() {
+        let expr = parse_expr("LEAST(1, 2, 3, 4)");
+        let Expr::Least { args, .. } = expr else {
+            panic!()
+        };
+        assert_eq!(args.len(), 4);
+    }
+
+    #[test]
+    fn greatest_empty_is_error() {
+        let err = parse_err("GREATEST()");
+        assert!(matches!(
+            err,
+            ParseError::Expected { .. } | ParseError::UnexpectedEof { .. }
+        ));
+    }
+
+    // ── BETWEEN ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn between_basic() {
+        let expr = parse_expr("x BETWEEN 1 AND 10");
+        let Expr::Between {
+            negated, symmetric, ..
+        } = expr
+        else {
+            panic!()
+        };
+        assert!(!negated);
+        assert!(!symmetric);
+    }
+
+    #[test]
+    fn not_between() {
+        let expr = parse_expr("x NOT BETWEEN 1 AND 10");
+        let Expr::Between { negated, .. } = expr else {
+            panic!()
+        };
+        assert!(negated);
+    }
+
+    #[test]
+    fn between_symmetric() {
+        let expr = parse_expr("x BETWEEN SYMMETRIC 10 AND 1");
+        let Expr::Between { symmetric, .. } = expr else {
+            panic!()
+        };
+        assert!(symmetric);
+    }
+
+    #[test]
+    fn between_missing_and_is_error() {
+        let err = parse_err("x BETWEEN 1 10");
+        assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    #[test]
+    fn between_and_does_not_consume_outer_and() {
+        // The AND inside BETWEEN must not eat the outer boolean AND.
+        let expr = parse_expr("x BETWEEN 1 AND 10 AND y = 2");
+        // Top-level should be a boolean AND of (Between, Binary{Eq}).
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::And,
+                ..
+            }
+        ));
+    }
+
+    // ── IS DISTINCT FROM ────────────────────────────────────────────────────
+
+    #[test]
+    fn is_distinct_from_basic() {
+        let expr = parse_expr("x IS DISTINCT FROM NULL");
+        assert!(matches!(expr, Expr::IsDistinctFrom { negated: false, .. }));
+    }
+
+    #[test]
+    fn is_not_distinct_from() {
+        let expr = parse_expr("x IS NOT DISTINCT FROM NULL");
+        assert!(matches!(expr, Expr::IsDistinctFrom { negated: true, .. }));
+    }
+
+    #[test]
+    fn is_distinct_from_missing_from_is_error() {
+        let err = parse_err("x IS DISTINCT NULL");
+        assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    // ── IS TRUE / FALSE / UNKNOWN ────────────────────────────────────────────
+
+    #[test]
+    fn is_true() {
+        let expr = parse_expr("x IS TRUE");
+        assert!(matches!(
+            expr,
+            Expr::IsBoolean {
+                value: true,
+                is_unknown: false,
+                negated: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn is_not_false() {
+        let expr = parse_expr("x IS NOT FALSE");
+        assert!(matches!(
+            expr,
+            Expr::IsBoolean {
+                value: false,
+                negated: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn is_unknown() {
+        let expr = parse_expr("x IS UNKNOWN");
+        assert!(matches!(
+            expr,
+            Expr::IsBoolean {
+                is_unknown: true,
+                negated: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn is_not_unknown() {
+        let expr = parse_expr("x IS NOT UNKNOWN");
+        assert!(matches!(
+            expr,
+            Expr::IsBoolean {
+                is_unknown: true,
+                negated: true,
+                ..
+            }
+        ));
+    }
+
+    // ── postfix cast `::` ────────────────────────────────────────────────────
+
+    #[test]
+    fn postfix_cast_integer() {
+        let expr = parse_expr("x::integer");
+        let Expr::PostfixCast { target, .. } = expr else {
+            panic!()
+        };
+        assert_eq!(target.value, "integer");
+    }
+
+    #[test]
+    fn postfix_cast_chain() {
+        // x::text::varchar — two successive casts.
+        let expr = parse_expr("x::text::varchar");
+        let Expr::PostfixCast {
+            expr: inner,
+            target: outer_target,
+            ..
+        } = expr
+        else {
+            panic!()
+        };
+        assert_eq!(outer_target.value, "varchar");
+        assert!(matches!(*inner, Expr::PostfixCast { .. }));
+    }
+
+    #[test]
+    fn postfix_cast_missing_type_is_error() {
+        let err = parse_err("x::");
+        assert!(matches!(
+            err,
+            ParseError::Expected { .. } | ParseError::UnexpectedEof { .. }
+        ));
+    }
+
+    // ── array subscript `[]` ─────────────────────────────────────────────────
+
+    #[test]
+    fn array_subscript_basic() {
+        let expr = parse_expr("arr[1]");
+        assert!(matches!(expr, Expr::ArraySubscript { .. }));
+    }
+
+    #[test]
+    fn array_subscript_expression_index() {
+        let expr = parse_expr("arr[i + 1]");
+        let Expr::ArraySubscript { index, .. } = expr else {
+            panic!()
+        };
+        assert!(matches!(
+            *index,
+            Expr::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn array_subscript_unclosed_is_error() {
+        let err = parse_err("arr[1");
+        assert!(matches!(
+            err,
+            ParseError::Expected { .. } | ParseError::UnexpectedEof { .. }
+        ));
+    }
+
+    // ── array slice `[:]` ────────────────────────────────────────────────────
+
+    #[test]
+    fn array_slice_both_bounds() {
+        let expr = parse_expr("arr[2:5]");
+        let Expr::ArraySlice { lower, upper, .. } = expr else {
+            panic!()
+        };
+        assert!(lower.is_some());
+        assert!(upper.is_some());
+    }
+
+    #[test]
+    fn array_slice_lower_only() {
+        let expr = parse_expr("arr[2:]");
+        let Expr::ArraySlice { lower, upper, .. } = expr else {
+            panic!()
+        };
+        assert!(lower.is_some());
+        assert!(upper.is_none());
+    }
+
+    #[test]
+    fn array_slice_upper_only() {
+        let expr = parse_expr("arr[:5]");
+        let Expr::ArraySlice { lower, upper, .. } = expr else {
+            panic!()
+        };
+        assert!(lower.is_none());
+        assert!(upper.is_some());
+    }
+
+    // ── AT TIME ZONE ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn at_time_zone_string_literal() {
+        let expr = parse_expr("now() AT TIME ZONE 'UTC'");
+        assert!(matches!(expr, Expr::AtTimeZone { .. }));
+    }
+
+    #[test]
+    fn at_time_zone_identifier() {
+        let expr = parse_expr("ts AT TIME ZONE tz_col");
+        assert!(matches!(expr, Expr::AtTimeZone { .. }));
+    }
+
+    #[test]
+    fn at_time_zone_missing_zone_expr_is_error() {
+        // The zone expression is mandatory after AT TIME ZONE.
+        let err = parse_err("ts AT TIME ZONE");
+        assert!(matches!(
+            err,
+            ParseError::Expected { .. } | ParseError::UnexpectedEof { .. }
+        ));
+    }
+
+    // ── OVERLAPS ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn overlaps_basic() {
+        let expr = parse_expr("(a, b) OVERLAPS (c, d)");
+        assert!(matches!(expr, Expr::Overlaps { .. }));
+    }
+
+    #[test]
+    fn overlaps_fields_are_captured() {
+        let expr = parse_expr("(t1, t2) OVERLAPS (t3, t4)");
+        let Expr::Overlaps {
+            left_start,
+            left_end,
+            right_start,
+            right_end,
+            ..
+        } = expr
+        else {
+            panic!()
+        };
+        // Check all four fields were parsed as column references.
+        assert!(matches!(*left_start, Expr::Column { .. }));
+        assert!(matches!(*left_end, Expr::Column { .. }));
+        assert!(matches!(*right_start, Expr::Column { .. }));
+        assert!(matches!(*right_end, Expr::Column { .. }));
+    }
+
+    #[test]
+    fn overlaps_missing_second_pair_is_error() {
+        let err = parse_err("(a, b) OVERLAPS c");
+        assert!(matches!(err, ParseError::Expected { .. }));
+    }
+
+    // ── ROW constructor ──────────────────────────────────────────────────────
+
+    #[test]
+    fn row_explicit_keyword() {
+        let expr = parse_expr("ROW(1, 2, 3)");
+        let Expr::Row { fields, .. } = expr else {
+            panic!()
+        };
+        assert_eq!(fields.len(), 3);
+    }
+
+    #[test]
+    fn row_single_field() {
+        let expr = parse_expr("ROW(42)");
+        let Expr::Row { fields, .. } = expr else {
+            panic!()
+        };
+        assert_eq!(fields.len(), 1);
+    }
+
+    #[test]
+    fn row_empty_is_accepted() {
+        // PostgreSQL accepts ROW() as a zero-element row constructor.
+        let expr = parse_expr("ROW()");
+        let Expr::Row { fields, .. } = expr else {
+            panic!()
+        };
+        assert_eq!(fields.len(), 0);
+    }
+
+    #[test]
+    fn row_unclosed_paren_is_error() {
+        let err = parse_err("ROW(1, 2");
+        assert!(matches!(
+            err,
+            ParseError::Expected { .. } | ParseError::UnexpectedEof { .. }
+        ));
+    }
+
+    // ── regex operators ─────────────────────────────────────────────────────
+
+    #[test]
+    fn regex_match_operator() {
+        let expr = parse_expr("name ~ '^A'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::RegexMatch,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn regex_imatch_operator() {
+        let expr = parse_expr("name ~* '^a'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::RegexIMatch,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn regex_not_match_operator() {
+        let expr = parse_expr("name !~ '^A'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::RegexNotMatch,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn regex_not_imatch_operator() {
+        let expr = parse_expr("name !~* '^a'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::RegexNotIMatch,
+                ..
+            }
+        ));
+    }
+
+    // ── bitwise operators ────────────────────────────────────────────────────
+
+    #[test]
+    fn bitwise_and_operator() {
+        let expr = parse_expr("x & 0xff");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::BitAnd,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bitwise_or_operator() {
+        let expr = parse_expr("x | 0x01");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::BitOr,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bitwise_xor_operator() {
+        let expr = parse_expr("x # y");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::BitXor,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn shift_left_operator() {
+        let expr = parse_expr("x << 2");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::ShiftLeft,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn shift_right_operator() {
+        let expr = parse_expr("x >> 2");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::ShiftRight,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unary_bitnot_operator() {
+        let expr = parse_expr("~x");
+        assert!(matches!(
+            expr,
+            Expr::Unary {
+                op: UnaryOp::BitNot,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn bitwise_precedence_tighter_than_comparison() {
+        // `x & mask = 0` should parse as `(x & mask) = 0` not `x & (mask = 0)`.
+        let expr = parse_expr("x & 255 = 0");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn shift_lower_precedence_than_add() {
+        // Level 5 (<<) is *lower* than level 6 (+), so `a + b << 3`
+        // parses as `(a + b) << 3` — top-level operator is ShiftLeft.
+        let expr = parse_expr("a + b << 3");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::ShiftLeft,
+                ..
+            }
+        ));
+    }
+
+    // ── JSON operators ───────────────────────────────────────────────────────
+
+    #[test]
+    fn json_get_by_key() {
+        let expr = parse_expr("doc -> 'key'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::JsonGet,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn json_get_text() {
+        let expr = parse_expr("doc ->> 'key'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::JsonGetText,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn json_get_path() {
+        let expr = parse_expr("doc #> '{a,b}'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::JsonGetPath,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn json_get_path_text() {
+        let expr = parse_expr("doc #>> '{a,b}'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::JsonGetPathText,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn json_contains() {
+        let expr = parse_expr("doc @> '{\"a\":1}'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::JsonContains,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn json_contained_by() {
+        let expr = parse_expr("doc <@ '{\"a\":1}'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::JsonContained,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn json_has_key() {
+        let expr = parse_expr("doc ? 'key'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::JsonHasKey,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn json_has_any_key() {
+        let expr = parse_expr("doc ?| keys");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::JsonHasAnyKey,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn json_has_all_keys() {
+        let expr = parse_expr("doc ?& keys");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::JsonHasAllKeys,
+                ..
+            }
+        ));
+    }
+
+    /// JSON operators bind tighter than comparison: `doc -> 'k' = 'v'`
+    /// parses as `(doc -> 'k') = 'v'`.
+    #[test]
+    fn json_get_tighter_than_eq() {
+        let expr = parse_expr("doc -> 'k' = 'v'");
+        assert!(matches!(
+            expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                ..
+            }
+        ));
+    }
+
+    // ── operator precedence property test ────────────────────────────────────
+
+    /// A table-driven precedence check: build an expression `a OP1 b OP2 c`
+    /// and assert the parse tree reflects the correct associativity.
+    ///
+    /// For each pair `(low_op, high_op)` where `high_op` binds more tightly,
+    /// `a LOW b HIGH c` must parse as `a LOW (b HIGH c)` — i.e. the top-level
+    /// operator is `low_op`.
+    #[test]
+    fn binary_op_precedence_pairs() {
+        let cases: &[(&str, BinaryOp, &str, BinaryOp)] = &[
+            // low_expr, low_op, high_expr, high_op
+            ("a OR b AND c", BinaryOp::Or, "b AND c", BinaryOp::And),
+            ("a AND b = c", BinaryOp::And, "b = c", BinaryOp::Eq),
+            ("a = b + c", BinaryOp::Eq, "b + c", BinaryOp::Add),
+            ("a + b * c", BinaryOp::Add, "b * c", BinaryOp::Mul),
+            ("a * b ^ c", BinaryOp::Mul, "b ^ c", BinaryOp::Pow),
+            ("a << b + c", BinaryOp::ShiftLeft, "b + c", BinaryOp::Add),
+            ("a = b & c", BinaryOp::Eq, "b & c", BinaryOp::BitAnd),
+        ];
+
+        for (src, expected_top, _rhs_src, expected_rhs) in cases {
+            let expr = parse_expr(src);
+            let Expr::Binary {
+                op: top_op, right, ..
+            } = expr
+            else {
+                panic!("expected Binary for {src:?}, got {expr:?}");
+            };
+            assert_eq!(top_op, *expected_top, "top op mismatch for {src:?}");
+            // The right operand should carry the tighter operator.
+            let Expr::Binary { op: rhs_op, .. } = *right else {
+                panic!("expected Binary rhs for {src:?}");
+            };
+            assert_eq!(rhs_op, *expected_rhs, "rhs op mismatch for {src:?}");
+        }
+    }
+
+    /// Right-associativity of `^`: `a ^ b ^ c` must parse as `a ^ (b ^ c)`.
+    #[test]
+    fn pow_is_right_associative() {
+        let expr = parse_expr("a ^ b ^ c");
+        let Expr::Binary {
+            op: BinaryOp::Pow,
+            right,
+            ..
+        } = expr
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            *right,
+            Expr::Binary {
+                op: BinaryOp::Pow,
+                ..
+            }
+        ));
     }
 }
