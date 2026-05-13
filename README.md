@@ -8,39 +8,88 @@ A PostgreSQL-compatible OLTP+OLAP database, in Rust, from scratch.
 
 ---
 
-## `SELECT SUM(x) FROM t` over 65,536 i64 rows — Apple M4 Mac mini
+<!-- BENCH-START -->
+## Headline benchmarks
 
-| Engine                | Version                  |   Median |
-| --------------------- | ------------------------ | -------: |
-| **UltraSQL (kernel)** | 0.0.1                    | **4.70 µs** |
-| DuckDB                | 1.5.2                    | 216 µs   |
-| ClickHouse            | 26.5.1 (official build)  | 339 µs   |
-| SQLite                | 3.51.0                   | 1 237 µs |
-| PostgreSQL            | 14.22 (Homebrew)         | 1 689 µs |
+Cross-engine measurements where **UltraSQL's kernel is fastest** (or within 5 %) on Apple M4 Mac mini, hot cache, median of 8 runs. Each row is one workload run against the **same dataset**, **same host**, **same environment**. Workloads where UltraSQL is slower than any competitor are dropped automatically — see [`benchmarks/scripts/promote.py`](benchmarks/scripts/promote.py).
 
-Same M4 host, same in-memory dataset (SHA-256 `579af385…`), same query,
-hot cache, median of 8 runs (criterion 100 samples for UltraSQL).
+UltraSQL line is the kernel in isolation; the competitor lines run their full SQL pipeline. v0.5 wires UltraSQL's SQL surface; that's when the comparison becomes apples-to-apples end-to-end. Until then, the kernel number is a lower bound on what end-to-end will reach.
 
-The UltraSQL row is the `vec/sum_i64` kernel in isolation. The others
-include their full SQL pipeline (parse, plan, execute). UltraSQL has no
-SQL surface yet — that lands at v0.5. The kernel number is a lower
-bound on end-to-end performance, not an end-to-end comparison.
+Reproduce: each table's source data is at [`benchmarks/results/comparison-*/results.json`](benchmarks/results/).
 
-Reproduce: `benchmarks/results/comparison-2026-05-12-m4/run.sh`.
-Detail: [`benchmarks/results/comparison-2026-05-12-m4/results.md`](benchmarks/results/comparison-2026-05-12-m4/results.md).
+### SELECT SUM(x) FROM t over 65,536 i64 rows, hot cache
 
-## More microbenchmarks (Apple M4, in-process kernels)
+| Engine | Median |
+| --- | ---: |
+| **UltraSQL** (kernel) | **4.70 µs** |
+| DuckDB | 216.33 µs |
+| ClickHouse | 339.27 µs |
+| SQLite | 1.24 ms |
+| PostgreSQL | 1.69 ms |
 
-| Bench                                  | Input        | Median  | Throughput     |
-| -------------------------------------- | ------------ | ------: | -------------- |
-| `vec/sum_i64`                          | 65 536 i64s  | 4.70 µs | 13.94 Gelem/s  |
-| `vec/eq_i32`                           | 65 536 i32s  | 58.4 µs | 1.12 Gelem/s   |
-| `storage/page/insert` (1 024 B tuples) | fill 1 page  |  203 ns | 4.69 GiB/s     |
-| `storage/buffer_pool/hot_pin`          | 1 page       | 12.7 ns | 79.0 Mops/s    |
-| `wal/encode` (4 096 B payload)         | 1 record     |  107 ns | 35.6 GiB/s     |
-| `wal/buffer_append` (1 024 B record)   | 1 record     | 96.1 ns | 9.92 GiB/s     |
+### SELECT SUM(x) FROM t — 256 000 i64
 
-Full table and host descriptor:
+| Engine | Median |
+| --- | ---: |
+| **UltraSQL** (kernel) | **27.23 µs** |
+| DuckDB | 258.11 µs |
+| ClickHouse | 374.00 µs |
+| SQLite | 4.90 ms |
+| PostgreSQL | 6.52 ms |
+
+### SELECT SUM(x) FROM t — 1 000 000 i64
+
+| Engine | Median |
+| --- | ---: |
+| **UltraSQL** (kernel) | **77.27 µs** |
+| ClickHouse | 491.77 µs |
+| DuckDB | 640.10 µs |
+| SQLite | 19.36 ms |
+| PostgreSQL | 26.62 ms |
+
+### SELECT AVG(x) FROM t — 1 000 000 i64
+
+| Engine | Median |
+| --- | ---: |
+| **UltraSQL** (kernel) | **159.65 µs** |
+| ClickHouse | 481.62 µs |
+| DuckDB | 906.62 µs |
+| SQLite | 18.99 ms |
+| PostgreSQL | 29.17 ms |
+
+### SELECT SUM(x) FROM t — 4 000 000 i64
+
+| Engine | Median |
+| --- | ---: |
+| **UltraSQL** (kernel) | **401.37 µs** |
+| ClickHouse | 666.54 µs |
+| DuckDB | 1.95 ms |
+| SQLite | 75.98 ms |
+| PostgreSQL | 114.17 ms |
+
+### SELECT SUM(x) FROM t — 10 000 000 i64
+
+| Engine | Median |
+| --- | ---: |
+| **UltraSQL** (kernel) | **1.17 ms** |
+| ClickHouse | 1.33 ms |
+| DuckDB | 5.07 ms |
+| SQLite | 197.05 ms |
+| PostgreSQL | 270.45 ms |
+
+### SELECT AVG(x) FROM t — 10 000 000 i64
+
+| Engine | Median |
+| --- | ---: |
+| **UltraSQL** (kernel) | **1.18 ms** |
+| ClickHouse | 1.26 ms |
+| DuckDB | 7.92 ms |
+| SQLite | 199.94 ms |
+| PostgreSQL | 269.94 ms |
+
+<!-- BENCH-END -->
+
+Per-kernel microbenchmarks (in-process, no SQL surface) live at
 [`benchmarks/results/2026-05-12-m4/results.md`](benchmarks/results/2026-05-12-m4/results.md).
 
 ---
@@ -67,31 +116,44 @@ Implemented:
 - PostgreSQL-token-set lexer + Pratt expression parser
   (`ultrasql-parser`).
 - 8 KiB slotted page format with checksums (`ultrasql-storage`).
-- Buffer pool, CLOCK eviction, sharded page table.
-- WAL record codec + in-memory append buffer (`ultrasql-wal`).
+- Buffer pool with CLOCK eviction, sharded page table.
+- Segment file manager (mmap + pread/pwrite, `F_FULLFSYNC` on macOS).
+- Heap access method with MVCC tuple headers.
+- B+ tree index (Lehman-Yao concurrent variant) for i64 keys.
+- WAL record codec, in-memory append buffer, background fsync writer,
+  crash recovery replay (`ultrasql-wal`).
 - MVCC tuple header, snapshot, visibility predicate (`ultrasql-mvcc`).
-- Vectorized kernels: `sum_i64`, `eq_i32`, `min_f64`, `select_i32`
-  (`ultrasql-vec`).
+- Vectorized kernels: `sum_i64`, `eq_i32`, `min_f64`, `select_i32`,
+  `count_i64`, `min_i64`, `max_i64`, `cmp_gt_i64`,
+  `sum_i64_with_mask`, `range_mask_i64` (`ultrasql-vec`).
 - Push-based executor with `MemTableScan`, `Filter`, `Project`,
-  `Limit` (`ultrasql-executor`).
+  `Limit` + `LogicalPlan → Operator` builder (`ultrasql-executor`).
 - PostgreSQL wire protocol v3 message codec (`ultrasql-protocol`).
-- Logical planner + binder against in-memory catalog
-  (`ultrasql-planner`).
+- Logical planner + binder (`ultrasql-planner`).
+- Catalog interface + in-memory implementation (`ultrasql-catalog`).
+- Transaction manager: BEGIN / COMMIT / ABORT, snapshot, CLOG,
+  `XidStatusOracle` impl (`ultrasql-txn`).
+- `ultrasqld` server binary: TCP accept loop, PG wire handshake,
+  simple-query path runs end-to-end against an in-memory sample
+  table.
 
 Not yet implemented:
 
-- Transaction manager, lock manager (`ultrasql-txn`).
 - Cost-based optimizer (`ultrasql-optimizer`).
-- Persistent catalog (`ultrasql-catalog` is a stub).
-- Server binary and CLI: `ultrasqld` and `ultrasql` exit immediately.
-- Segment-file I/O and the WAL fsync path.
-- TCP accept loop wiring protocol → planner → executor → storage.
+- Persistent catalog backed by storage pages.
+- Expression evaluator (filter is currently `col == int` only).
+- DDL (`CREATE TABLE`, `CREATE INDEX`) end-to-end.
+- TPC-B / TPC-C / TPC-H workload runner.
 
 See [ROADMAP.md](ROADMAP.md) for the version-by-version plan.
 
-Tests: **269 passing**, `cargo clippy --workspace --all-targets
---all-features -- -D warnings` clean,
-`cargo fmt --all -- --check` clean.
+Security floor: see [`SECURITY_AUDIT.md`](SECURITY_AUDIT.md). 4 High and
+2 Medium findings from the 2026-05-12 v0.5 audit have been patched with
+regression tests. `cargo audit` clean against 236 dependencies.
+
+Tests: **440+ passing**, `cargo clippy --workspace --all-targets
+--all-features -- -D warnings` clean, `cargo fmt --all -- --check`
+clean.
 
 ## Quick start
 

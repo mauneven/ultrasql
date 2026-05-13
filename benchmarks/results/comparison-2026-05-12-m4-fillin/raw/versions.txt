@@ -1,0 +1,7 @@
+=== engine versions (2026-05-13T04:00:06Z) ===
+duckdb: v1.5.2 (Variegata) 8a5851971f
+sqlite3: 3.51.0 2025-06-12 13:14:41 f0ca7bba1c5e232e5d279fad6338121ab55af0c8c68c84cdfb18ba5114dcaapl (64-bit)
+psql: psql (PostgreSQL) 14.22 (Homebrew)
+clickhouse: ClickHouse local version 26.5.1.587 (official build).
+rustc: rustc 1.95.0 (59807616e 2026-04-14)
+host:  Darwin ultrasqls-Mac-mini.local 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:41:26 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T8132 arm64

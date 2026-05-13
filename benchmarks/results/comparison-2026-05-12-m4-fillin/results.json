@@ -1,0 +1,349 @@
+{
+  "comparison": "fill-in cross-engine, 2026-05-12, Apple M4",
+  "host": "Apple M4 Mac mini, 16 GiB, macOS 26.5",
+  "workloads": [
+    "sum-256k",
+    "sum-4m",
+    "count-1m",
+    "avg-1m"
+  ],
+  "datasets_sha256": {
+    "data_x_256k.csv": "0650e0ffecc24b50f4144198a5d6f2db5ff6a5ddd7ebde2ae5aeafd17c5b6bc4",
+    "data_x_1m.csv": "31f54bbb9568730e7cc40b9621de632d9166c7e8fa3ecd1d02d21ab182c3ed33",
+    "data_x_4m.csv": "98cc59dc50ad51c79ce9132633231221f06b809b34861b6734338fe590b0250a"
+  },
+  "results": {
+    "sum-256k": {
+      "UltraSQL (kernel)": {
+        "median_us": 27.23,
+        "min_us": 27.12,
+        "samples": 8,
+        "iterations_us": [
+          27.25,
+          27.209,
+          27.208,
+          34.375,
+          27.458,
+          27.708,
+          27.125,
+          27.167
+        ],
+        "answer": "681229054427",
+        "n_rows": 256000,
+        "note": "vec kernels; kernel only, no SQL pipeline"
+      },
+      "DuckDB": {
+        "median_us": 258.11,
+        "min_us": 225.62,
+        "samples": 8,
+        "iterations_us": [
+          954.46,
+          244.21,
+          228.33,
+          225.62,
+          253.67,
+          328.08,
+          296.42,
+          262.54
+        ]
+      },
+      "SQLite": {
+        "median_us": 4904.0,
+        "min_us": 4726.0,
+        "samples": 8,
+        "iterations_us": [
+          4978.0,
+          5024.0,
+          4726.0,
+          4874.0,
+          4925.0,
+          4950.0,
+          4883.0,
+          4868.0
+        ],
+        "note": "user time, microsecond resolution; :memory: db"
+      },
+      "PostgreSQL": {
+        "median_us": 6522.5,
+        "min_us": 6468.0,
+        "samples": 8,
+        "iterations_us": [
+          6670.0,
+          6788.0,
+          6631.0,
+          6533.0,
+          6468.0,
+          6511.0,
+          6505.0,
+          6512.0
+        ],
+        "note": "psql \\timing; same session; 10 warmup queries per workload"
+      },
+      "ClickHouse": {
+        "median_us": 374.0,
+        "min_us": 280.62,
+        "samples": 8,
+        "iterations_us": [
+          95118.08,
+          854.33,
+          427.04,
+          377.46,
+          364.17,
+          370.54,
+          280.62,
+          325.67
+        ],
+        "note": "statistics.elapsed; Memory engine"
+      }
+    },
+    "sum-4m": {
+      "UltraSQL (kernel)": {
+        "median_us": 401.37,
+        "min_us": 392.58,
+        "samples": 8,
+        "iterations_us": [
+          403.291,
+          396.791,
+          392.583,
+          400.958,
+          411.416,
+          394.5,
+          415.042,
+          401.791
+        ],
+        "answer": "1656749245536",
+        "n_rows": 4000000,
+        "note": "vec kernels; kernel only, no SQL pipeline"
+      },
+      "DuckDB": {
+        "median_us": 1952.27,
+        "min_us": 1807.54,
+        "samples": 8,
+        "iterations_us": [
+          1807.54,
+          1826.62,
+          1864.08,
+          1944.12,
+          2115.54,
+          1974.08,
+          1960.42,
+          1978.04
+        ]
+      },
+      "SQLite": {
+        "median_us": 75977.0,
+        "min_us": 75301.0,
+        "samples": 8,
+        "iterations_us": [
+          76200.0,
+          76366.0,
+          75969.0,
+          75649.0,
+          75985.0,
+          83001.0,
+          75301.0,
+          75926.0
+        ],
+        "note": "user time, microsecond resolution; :memory: db"
+      },
+      "PostgreSQL": {
+        "median_us": 114174.5,
+        "min_us": 112224.0,
+        "samples": 8,
+        "iterations_us": [
+          113699.0,
+          112224.0,
+          112867.0,
+          114840.0,
+          209797.0,
+          117200.0,
+          114209.0,
+          114140.0
+        ],
+        "note": "psql \\timing; same session; 10 warmup queries per workload"
+      },
+      "ClickHouse": {
+        "median_us": 666.54,
+        "min_us": 636.92,
+        "samples": 8,
+        "iterations_us": [
+          744.46,
+          686.88,
+          645.17,
+          663.79,
+          677.92,
+          669.29,
+          636.92,
+          650.54
+        ],
+        "note": "statistics.elapsed; Memory engine"
+      }
+    },
+    "count-1m": {
+      "UltraSQL (kernel)": {
+        "median_us": 0.0,
+        "min_us": 0.0,
+        "samples": 8,
+        "iterations_us": [
+          0.042,
+          0.042,
+          0.0,
+          0.0,
+          0.0,
+          0.042,
+          0.0,
+          0.0
+        ],
+        "answer": "1000000",
+        "n_rows": 1000000,
+        "note": "vec kernels; kernel only, no SQL pipeline"
+      },
+      "DuckDB": {
+        "median_us": 264.83,
+        "min_us": 221.5,
+        "samples": 8,
+        "iterations_us": [
+          285.79,
+          289.79,
+          243.88,
+          235.38,
+          396.17,
+          221.5,
+          444.25,
+          225.75
+        ]
+      },
+      "SQLite": {
+        "median_us": 57.5,
+        "min_us": 53.0,
+        "samples": 8,
+        "iterations_us": [
+          59.0,
+          58.0,
+          57.0,
+          53.0,
+          53.0,
+          60.0,
+          56.0,
+          58.0
+        ],
+        "note": "user time, microsecond resolution; :memory: db"
+      },
+      "PostgreSQL": {
+        "median_us": 22098.5,
+        "min_us": 21866.0,
+        "samples": 8,
+        "iterations_us": [
+          21892.0,
+          22118.0,
+          22439.0,
+          22052.0,
+          22915.0,
+          22273.0,
+          21866.0,
+          22079.0
+        ],
+        "note": "psql \\timing; same session; 10 warmup queries per workload"
+      },
+      "ClickHouse": {
+        "median_us": 298.11,
+        "min_us": 277.38,
+        "samples": 8,
+        "iterations_us": [
+          297.46,
+          277.38,
+          291.17,
+          331.42,
+          298.75,
+          292.33,
+          329.96,
+          372.46
+        ],
+        "note": "statistics.elapsed; Memory engine"
+      }
+    },
+    "avg-1m": {
+      "UltraSQL (kernel)": {
+        "median_us": 159.65,
+        "min_us": 114.0,
+        "samples": 8,
+        "iterations_us": [
+          114.0,
+          163.541,
+          143.5,
+          155.75,
+          166.667,
+          139.0,
+          206.958,
+          176.209
+        ],
+        "answer": "2019621",
+        "n_rows": 1000000,
+        "note": "vec kernels; kernel only, no SQL pipeline"
+      },
+      "DuckDB": {
+        "median_us": 906.62,
+        "min_us": 897.79,
+        "samples": 8,
+        "iterations_us": [
+          900.13,
+          897.79,
+          904.08,
+          909.67,
+          908.58,
+          906.0,
+          907.25,
+          977.38
+        ]
+      },
+      "SQLite": {
+        "median_us": 18992.5,
+        "min_us": 18585.0,
+        "samples": 8,
+        "iterations_us": [
+          23212.0,
+          21625.0,
+          18882.0,
+          19103.0,
+          18732.0,
+          18698.0,
+          19266.0,
+          18585.0
+        ],
+        "note": "user time, microsecond resolution; :memory: db"
+      },
+      "PostgreSQL": {
+        "median_us": 29174.0,
+        "min_us": 28129.0,
+        "samples": 8,
+        "iterations_us": [
+          28955.0,
+          28921.0,
+          32349.0,
+          31069.0,
+          29308.0,
+          29508.0,
+          29040.0,
+          28129.0
+        ],
+        "note": "psql \\timing; same session; 10 warmup queries per workload"
+      },
+      "ClickHouse": {
+        "median_us": 481.62,
+        "min_us": 400.96,
+        "samples": 8,
+        "iterations_us": [
+          11273.21,
+          513.62,
+          513.71,
+          474.17,
+          489.08,
+          459.58,
+          442.75,
+          400.96
+        ],
+        "note": "statistics.elapsed; Memory engine"
+      }
+    }
+  }
+}

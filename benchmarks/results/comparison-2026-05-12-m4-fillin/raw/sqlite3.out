@@ -1,0 +1,104 @@
+memory
+Run Time: real 0.001 user 0.000033 sys 0.000854
+Run Time: real 0.000 user 0.000002 sys 0.000000
+Run Time: real 0.000 user 0.000001 sys 0.000000
+Run Time: real 0.000 user 0.000024 sys 0.000018
+Run Time: real 0.000 user 0.000016 sys 0.000000
+Run Time: real 0.000 user 0.000013 sys 0.000002
+Run Time: real 0.002 user 0.001275 sys 0.000411
+681229054427
+Run Time: real 0.005 user 0.004955 sys 0.000006
+681229054427
+Run Time: real 0.005 user 0.004950 sys 0.000004
+681229054427
+Run Time: real 0.005 user 0.004911 sys 0.000001
+--measure-sum-256k--
+681229054427
+Run Time: real 0.005 user 0.004978 sys 0.000002
+681229054427
+Run Time: real 0.005 user 0.005024 sys 0.000000
+681229054427
+Run Time: real 0.005 user 0.004726 sys 0.000001
+681229054427
+Run Time: real 0.005 user 0.004874 sys 0.000036
+681229054427
+Run Time: real 0.005 user 0.004925 sys 0.000012
+681229054427
+Run Time: real 0.005 user 0.004950 sys 0.000001
+681229054427
+Run Time: real 0.004 user 0.004883 sys 0.000002
+681229054427
+Run Time: real 0.005 user 0.004868 sys 0.000000
+--end-measure--
+1656749245536
+Run Time: real 0.077 user 0.076209 sys 0.000035
+1656749245536
+Run Time: real 0.076 user 0.076214 sys 0.000081
+1656749245536
+Run Time: real 0.077 user 0.076507 sys 0.000071
+--measure-sum-4m--
+1656749245536
+Run Time: real 0.076 user 0.076200 sys 0.000124
+1656749245536
+Run Time: real 0.077 user 0.076366 sys 0.000083
+1656749245536
+Run Time: real 0.076 user 0.075969 sys 0.000181
+1656749245536
+Run Time: real 0.076 user 0.075649 sys 0.000129
+1656749245536
+Run Time: real 0.076 user 0.075985 sys 0.000094
+1656749245536
+Run Time: real 0.087 user 0.083001 sys 0.000481
+1656749245536
+Run Time: real 0.076 user 0.075301 sys 0.000098
+1656749245536
+Run Time: real 0.076 user 0.075926 sys 0.000076
+--end-measure--
+1000000
+Run Time: real 0.000 user 0.000272 sys 0.000000
+1000000
+Run Time: real 0.000 user 0.000062 sys 0.000000
+1000000
+Run Time: real 0.000 user 0.000054 sys 0.000000
+--measure-count-1m--
+1000000
+Run Time: real 0.000 user 0.000059 sys 0.000000
+1000000
+Run Time: real 0.000 user 0.000058 sys 0.000000
+1000000
+Run Time: real 0.000 user 0.000057 sys 0.000001
+1000000
+Run Time: real 0.001 user 0.000053 sys 0.000000
+1000000
+Run Time: real 0.000 user 0.000053 sys 0.000000
+1000000
+Run Time: real 0.000 user 0.000060 sys 0.000000
+1000000
+Run Time: real 0.000 user 0.000056 sys 0.000000
+1000000
+Run Time: real 0.000 user 0.000058 sys 0.000000
+--end-measure--
+2019621.396328
+Run Time: real 0.019 user 0.018720 sys 0.000039
+2019621.396328
+Run Time: real 0.019 user 0.018906 sys 0.000003
+2019621.396328
+Run Time: real 0.020 user 0.019796 sys 0.000096
+--measure-avg-1m--
+2019621.396328
+Run Time: real 0.026 user 0.023212 sys 0.000504
+2019621.396328
+Run Time: real 0.023 user 0.021625 sys 0.000394
+2019621.396328
+Run Time: real 0.019 user 0.018882 sys 0.000022
+2019621.396328
+Run Time: real 0.019 user 0.019103 sys 0.000097
+2019621.396328
+Run Time: real 0.019 user 0.018732 sys 0.000023
+2019621.396328
+Run Time: real 0.019 user 0.018698 sys 0.000012
+2019621.396328
+Run Time: real 0.019 user 0.019266 sys 0.000029
+2019621.396328
+Run Time: real 0.019 user 0.018585 sys 0.000004
+--end-measure--
