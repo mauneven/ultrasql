@@ -63,7 +63,7 @@ cargo test --workspace --all-features
 step "regression gate (benchmark regression + competitor floor check)"
 
 _run_regression_gate() {
-    cargo run --release --bin regression-gate -- \
+    cargo run --release --package ultrasql-bench --bin regression-gate -- \
         --stage current \
         --iterations 5 \
         --warmup 1
