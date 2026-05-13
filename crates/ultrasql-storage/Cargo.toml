@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 ultrasql-core = { workspace = true }
+ultrasql-mvcc = { workspace = true }
 thiserror     = { workspace = true }
 parking_lot   = { workspace = true }
 crossbeam     = { workspace = true }
@@ -30,6 +31,7 @@ libc          = { workspace = true }
 tracing       = { workspace = true }
 
 [dev-dependencies]
+ultrasql-mvcc = { workspace = true, features = ["testing"] }
 proptest  = { workspace = true }
 rstest    = { workspace = true }
 criterion = { workspace = true }

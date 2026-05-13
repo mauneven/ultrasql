@@ -1895,6 +1895,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "ultrasql-core",
+ "ultrasql-mvcc",
  "xxhash-rust",
 ]
 
