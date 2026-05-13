@@ -9,7 +9,7 @@
 //! Wire-up
 //! -------
 //!
-//! [`HeapAccess`] sits on top of a [`BufferPool`] and provides four
+//! [`HeapAccess`] sits on top of a [`BufferPool`] and provides six
 //! operations:
 //!
 //! - [`HeapAccess::insert`] — append a tuple to a relation, growing the
@@ -18,8 +18,13 @@
 //!   visibility.
 //! - [`HeapAccess::delete`] — stamp `xmax`/`cmax` into the in-place
 //!   header so a subsequent visibility check returns `Invisible`.
+//! - [`HeapAccess::update`] — replace a tuple's payload, attempting an
+//!   in-page HOT update before falling back to a cross-page insert.
 //! - [`HeapAccess::scan`] — iterate every normal slot of every page in a
-//!   relation, in `(block, slot)` order.
+//!   relation, in `(block, slot)` order, without any visibility filter.
+//! - [`HeapAccess::scan_visible`] — like `scan` but applies MVCC
+//!   visibility inline via a [`Snapshot`](ultrasql_mvcc::Snapshot) and
+//!   an [`XidStatusOracle`](ultrasql_mvcc::XidStatusOracle).
 //!
 //! Block allocation
 //! ----------------
@@ -30,22 +35,14 @@
 //! `ultrasql-catalog` agent to implement; once wired, the catalog
 //! becomes the authoritative source of block counts and the internal
 //! counter goes away.
-//!
-//! TODO(visibility-aware scan): the current [`HeapScan`] yields every
-//! normal slot regardless of visibility and silently skips
-//! `Unused`/`Dead`/`Redirect` slots. A future iteration will accept a
-//! [`Snapshot`](ultrasql_mvcc::Snapshot) and an
-//! [`XidStatusOracle`](ultrasql_mvcc::XidStatusOracle) and apply
-//! [`is_visible`](ultrasql_mvcc::is_visible) inline so deletes don't
-//! materialize at all.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
 use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, TupleId, Xid};
-use ultrasql_mvcc::TupleHeader;
-use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
+use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
+use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
 
 use crate::buffer_pool::{BufferPool, BufferPoolError, PageGuard, PageLoader};
 use crate::page::PageError;
@@ -82,6 +79,40 @@ pub struct InsertOptions {
     pub xmin: Xid,
     /// Command id within `xmin` that issued the insert.
     pub command_id: CommandId,
+}
+
+/// Options threaded into an update.
+///
+/// The caller supplies the XID and command id of the updating
+/// transaction. `hot_eligible` signals that no indexed column changed
+/// in this update, so an in-page HOT chain is safe; the heap will try
+/// to satisfy that hint when there is enough room on the same page.
+///
+/// **WAL hook.** A future iteration will add an optional WAL sink field
+/// here (e.g. `wal_sink: Option<&dyn WalSink>`) so WAL emission can be
+/// wired without changing the call sites. No WAL dependency is taken now.
+#[derive(Clone, Copy, Debug)]
+pub struct UpdateOptions {
+    /// XID performing the update (stamped as `xmax` on the old version
+    /// and `xmin` on the new version).
+    pub xid: Xid,
+    /// Command id within `xid`.
+    pub command_id: CommandId,
+    /// `true` if no indexed column changed — a HOT update is allowed.
+    pub hot_eligible: bool,
+}
+
+/// Result of a successful update.
+#[derive(Clone, Copy, Debug)]
+pub struct UpdateOutcome {
+    /// [`TupleId`] of the old version (unchanged from the caller's
+    /// input).
+    pub old_tid: TupleId,
+    /// [`TupleId`] of the newly-written version.
+    pub new_tid: TupleId,
+    /// `true` when the update was performed as HOT — old and new
+    /// versions live on the same page and are linked via `ctid`.
+    pub hot: bool,
 }
 
 /// A heap tuple as returned by [`HeapAccess::fetch`] and the scan
@@ -243,6 +274,80 @@ impl<L: PageLoader> HeapAccess<L> {
         Self::delete_in_place(&guard, tid, xmax, cmax)
     }
 
+    /// Replace a tuple's payload with HOT-chain support.
+    ///
+    /// **Algorithm:**
+    ///
+    /// 1. Pin the page holding `old_tid` exclusively.
+    /// 2. Reject if the slot's current header has `xmax != INVALID`
+    ///    (i.e. the tuple is not alive): returns
+    ///    [`HeapError::MalformedHeader`].
+    /// 3. **HOT path** (`opts.hot_eligible == true` and the page has
+    ///    room): allocate a new slot on the *same* page for the new
+    ///    version, set the new tuple's `infomask = HOT_UPDATED | UPDATED`
+    ///    and `xmin = opts.xid`, then patch the old tuple's header in
+    ///    place: `xmax = opts.xid`, `cmax = opts.command_id`,
+    ///    `infomask |= HOT_UPDATED`, `ctid = new_tid`.  Returns
+    ///    `UpdateOutcome { hot: true }`.
+    /// 4. **Non-HOT path**: insert the new version on any page with room
+    ///    (may grow the relation), then stamp the old tuple's `xmax`,
+    ///    `cmax`, `infomask |= UPDATED`, and `ctid = new_tid`.  Returns
+    ///    `UpdateOutcome { hot: false }`.
+    ///
+    /// **Lock order (for future multi-page case):** when old and new
+    /// versions land on *different* pages, the new-version page is
+    /// pinned *before* the old-version page (lower block number first in
+    /// a fully concurrent implementation).  In the current v0.3
+    /// single-writer model both pins are taken within this function
+    /// without contention.
+    pub fn update(
+        &self,
+        old_tid: TupleId,
+        new_payload: &[u8],
+        opts: UpdateOptions,
+    ) -> Result<UpdateOutcome, HeapError> {
+        let new_tuple_size = TUPLE_HEADER_SIZE
+            .checked_add(new_payload.len())
+            .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
+        let n_atts = u16::try_from(new_payload.len()).unwrap_or(u16::MAX);
+
+        // --- HOT path: try the same page first --------------------------------
+        if opts.hot_eligible {
+            let guard = self.pool.get_page(old_tid.page)?;
+            let hot_result =
+                Self::try_hot_update(&guard, old_tid, new_payload, opts, n_atts, new_tuple_size)?;
+            if let Some(new_tid) = hot_result {
+                return Ok(UpdateOutcome {
+                    old_tid,
+                    new_tid,
+                    hot: true,
+                });
+            }
+            // Page had no room; fall through to non-HOT path.
+        }
+
+        // --- Non-HOT path: insert on any page, then stamp old -----------------
+        //
+        // Build insert options from the update's xid/cid.
+        let insert_opts = InsertOptions {
+            xmin: opts.xid,
+            command_id: opts.command_id,
+        };
+        let new_tid = self.insert(old_tid.page.relation, new_payload, insert_opts)?;
+
+        // Stamp the old tuple with xmax and redirect ctid. We need the
+        // page guard again for the old tuple (it may or may not be the
+        // same page as new_tid — for non-HOT it is usually different).
+        let old_guard = self.pool.get_page(old_tid.page)?;
+        Self::stamp_updated_old(&old_guard, old_tid, new_tid, opts)?;
+
+        Ok(UpdateOutcome {
+            old_tid,
+            new_tid,
+            hot: false,
+        })
+    }
+
     /// Sequential scan over `rel`'s pages. The first version starts at
     /// block 0 and walks to `block_count - 1`. Pages are pinned one at
     /// a time; the iterator owns no concurrent state.
@@ -259,6 +364,30 @@ impl<L: PageLoader> HeapAccess<L> {
             current_slot: 0,
             slot_cap: 0,
             block_loaded: false,
+        }
+    }
+
+    /// Sequential scan with MVCC visibility applied inline.
+    ///
+    /// Tuples invisible to `snapshot` under `oracle` are silently
+    /// skipped — the caller never sees them. This replaces the bare
+    /// [`Self::scan`] for executor code that holds a snapshot; the
+    /// original `scan` is kept for tools that genuinely want every
+    /// slot regardless of visibility.
+    ///
+    /// Resolves the former `TODO(visibility-aware scan)` in this
+    /// module's top-of-file doc comment.
+    pub const fn scan_visible<'a, O: XidStatusOracle + ?Sized>(
+        &'a self,
+        rel: RelationId,
+        block_count: u32,
+        snapshot: &'a Snapshot,
+        oracle: &'a O,
+    ) -> VisibleHeapScan<'a, L, O> {
+        VisibleHeapScan {
+            inner: self.scan(rel, block_count),
+            snapshot,
+            oracle,
         }
     }
 
@@ -392,6 +521,138 @@ impl<L: PageLoader> HeapAccess<L> {
             return Err(HeapError::MalformedHeader("slot shorter than header"));
         }
         page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
+        Ok(())
+    }
+
+    /// Attempt a HOT (same-page) update.
+    ///
+    /// Returns `Ok(Some(new_tid))` if the new version fit on the same
+    /// page as `old_tid`, `Ok(None)` if the page lacks room (the
+    /// caller should fall back to the non-HOT path).
+    ///
+    /// When this function succeeds it has already patched the old
+    /// tuple's header in place.
+    ///
+    /// Clippy's `significant_drop_tightening` would prefer the
+    /// [`PageWrite`](crate::buffer_pool::PageWrite) be dropped before
+    /// the closing brace, but `page_bytes` borrows from `page`, so the
+    /// borrow checker requires the guard to live until function exit.
+    #[allow(clippy::significant_drop_tightening)]
+    fn try_hot_update(
+        guard: &PageGuard<L>,
+        old_tid: TupleId,
+        new_payload: &[u8],
+        opts: UpdateOptions,
+        n_atts: u16,
+        new_tuple_size: usize,
+    ) -> Result<Option<TupleId>, HeapError> {
+        let mut page = guard.write();
+
+        // Verify the old tuple is alive before touching anything.
+        {
+            let bytes = page.read_tuple(old_tid.slot)?;
+            if bytes.len() < TUPLE_HEADER_SIZE {
+                return Err(HeapError::MalformedHeader("slot shorter than header"));
+            }
+            let (hdr, _) = TupleHeader::decode(&bytes[..TUPLE_HEADER_SIZE])
+                .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+            if !hdr.is_alive() {
+                return Err(HeapError::MalformedHeader("update on deleted tuple"));
+            }
+        }
+
+        // Check whether there is room for the new version on this page.
+        let free = page.header().free_space();
+        if free < new_tuple_size + crate::page::ITEMID_SIZE {
+            // Not enough room — signal fallback to caller.
+            return Ok(None);
+        }
+
+        // Build the new tuple bytes (header + payload). We don't know
+        // the final slot yet so we use a tentative tid; it will be
+        // patched after insert_tuple returns.
+        let tentative_tid = TupleId::new(old_tid.page, 0);
+        let mut new_hdr = TupleHeader::fresh(opts.xid, opts.command_id, tentative_tid, n_atts);
+        // New version is marked HOT_UPDATED | UPDATED so index scans
+        // know the chain does not cross page boundaries.
+        new_hdr
+            .infomask
+            .set(InfoMask::HOT_UPDATED | InfoMask::UPDATED);
+
+        let mut new_tuple_bytes = Vec::with_capacity(new_tuple_size);
+        new_tuple_bytes.resize(TUPLE_HEADER_SIZE, 0);
+        new_hdr.encode(&mut new_tuple_bytes[..TUPLE_HEADER_SIZE]);
+        new_tuple_bytes.extend_from_slice(new_payload);
+
+        let new_slot = page.insert_tuple(&new_tuple_bytes)?;
+        let new_tid = TupleId::new(old_tid.page, new_slot);
+
+        // Patch the new tuple's ctid to point at itself (terminal
+        // version in the chain).
+        let mut patched_new_hdr = new_hdr;
+        patched_new_hdr.ctid = new_tid;
+        let new_hdr_bytes = Self::collect_header_bytes(&patched_new_hdr);
+        let page_bytes = page.as_bytes_mut();
+        let (new_off, _) = Self::slot_window(page_bytes, new_slot)?;
+        page_bytes[new_off..new_off + TUPLE_HEADER_SIZE].copy_from_slice(&new_hdr_bytes);
+
+        // Patch the old tuple's header in place: set xmax/cmax,
+        // HOT_UPDATED flag, and redirect ctid to the new version.
+        let (old_off, old_len) = Self::slot_window(page_bytes, old_tid.slot)?;
+        if old_len < TUPLE_HEADER_SIZE {
+            return Err(HeapError::MalformedHeader("old slot shorter than header"));
+        }
+        let (mut old_hdr, _) =
+            TupleHeader::decode(&page_bytes[old_off..old_off + TUPLE_HEADER_SIZE])
+                .ok_or(HeapError::MalformedHeader("old header decode failed"))?;
+        old_hdr.xmax = opts.xid;
+        old_hdr.cmax = opts.command_id;
+        old_hdr.infomask.set(InfoMask::HOT_UPDATED);
+        old_hdr.ctid = new_tid;
+        let old_hdr_bytes = Self::collect_header_bytes(&old_hdr);
+        page_bytes[old_off..old_off + TUPLE_HEADER_SIZE].copy_from_slice(&old_hdr_bytes);
+
+        Ok(Some(new_tid))
+    }
+
+    /// Stamp the old tuple's header for the non-HOT update case.
+    ///
+    /// Sets `xmax`, `cmax`, `infomask |= UPDATED`, and `ctid = new_tid`
+    /// on the old tuple identified by `old_tid`.
+    ///
+    /// Clippy's `significant_drop_tightening` would prefer the
+    /// [`PageWrite`](crate::buffer_pool::PageWrite) be dropped before
+    /// the closing brace, but `page_bytes` borrows from `page`, so the
+    /// borrow checker requires the guard to live until function exit.
+    #[allow(clippy::significant_drop_tightening)]
+    fn stamp_updated_old(
+        guard: &PageGuard<L>,
+        old_tid: TupleId,
+        new_tid: TupleId,
+        opts: UpdateOptions,
+    ) -> Result<(), HeapError> {
+        let mut page = guard.write();
+        let bytes = page.read_tuple(old_tid.slot)?;
+        if bytes.len() < TUPLE_HEADER_SIZE {
+            return Err(HeapError::MalformedHeader("slot shorter than header"));
+        }
+        let (mut hdr, _) = TupleHeader::decode(&bytes[..TUPLE_HEADER_SIZE])
+            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+        if !hdr.is_alive() {
+            return Err(HeapError::MalformedHeader("update on deleted tuple"));
+        }
+        hdr.xmax = opts.xid;
+        hdr.cmax = opts.command_id;
+        hdr.infomask.set(InfoMask::UPDATED);
+        hdr.ctid = new_tid;
+        let hdr_bytes = Self::collect_header_bytes(&hdr);
+
+        let page_bytes = page.as_bytes_mut();
+        let (slot_offset, slot_length) = Self::slot_window(page_bytes, old_tid.slot)?;
+        if slot_length < TUPLE_HEADER_SIZE {
+            return Err(HeapError::MalformedHeader("slot shorter than header"));
+        }
+        page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
         Ok(())
     }
 
@@ -542,6 +803,54 @@ impl<L: PageLoader> HeapScan<'_, L> {
     fn slot_cap(guard: &PageGuard<L>) -> u16 {
         let page = guard.read();
         page.header().slot_count()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Visibility-aware scan
+// ---------------------------------------------------------------------------
+
+/// Iterator yielded by [`HeapAccess::scan_visible`].
+///
+/// Wraps [`HeapScan`] and applies `is_visible` to each tuple before
+/// yielding it. Tuples that are `Invisible` or `DeletedByOwn` are
+/// silently skipped; only [`Visibility::Visible`] tuples reach the
+/// caller.  I/O and decode errors are still propagated as
+/// `Err(HeapError)`.
+pub struct VisibleHeapScan<'a, L: PageLoader, O: XidStatusOracle + ?Sized> {
+    inner: HeapScan<'a, L>,
+    snapshot: &'a Snapshot,
+    oracle: &'a O,
+}
+
+impl<L: PageLoader, O: XidStatusOracle + ?Sized> std::fmt::Debug for VisibleHeapScan<'_, L, O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VisibleHeapScan")
+            .field("inner", &self.inner)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<L: PageLoader, O: XidStatusOracle + ?Sized> Iterator for VisibleHeapScan<'_, L, O> {
+    type Item = Result<HeapTuple, HeapError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.inner.next()? {
+                Err(e) => return Some(Err(e)),
+                Ok(tup) => {
+                    if matches!(
+                        is_visible(&tup.header, self.snapshot, self.oracle),
+                        Visibility::Visible
+                    ) {
+                        return Some(Ok(tup));
+                    }
+                    // Invisible (other txn in-progress, aborted, deleted
+                    // before our snapshot) or DeletedByOwn — skip and
+                    // continue the loop.
+                }
+            }
+        }
     }
 }
 
@@ -878,5 +1187,279 @@ mod tests {
         let heap = make_heap(8);
         let mut it = heap.scan(rel(), 0);
         assert!(it.next().is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // UpdateOptions / UpdateOutcome helpers
+    // -----------------------------------------------------------------------
+
+    fn update_opts(xid: u64) -> UpdateOptions {
+        UpdateOptions {
+            xid: Xid::new(xid),
+            command_id: CommandId::FIRST,
+            hot_eligible: true,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Deliverable A tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn update_creates_hot_chain_when_eligible_and_room() {
+        let heap = make_heap(16);
+
+        // Insert a small tuple that leaves plenty of room on the page.
+        let tid = heap.insert(rel(), b"original", opts(100)).unwrap();
+
+        let uo = update_opts(200);
+        let outcome = heap.update(tid, b"updated-payload", uo).unwrap();
+
+        assert!(outcome.hot, "expected HOT update when page has room");
+        assert_eq!(outcome.old_tid, tid);
+        // Both tids must live on the same page (same block).
+        assert_eq!(
+            outcome.old_tid.page.block, outcome.new_tid.page.block,
+            "HOT: old and new must be on the same block"
+        );
+
+        // Old version: xmax stamped, ctid redirects to new.
+        let old = heap.fetch(tid).unwrap();
+        assert_eq!(old.header.xmax, Xid::new(200));
+        assert_eq!(old.header.ctid, outcome.new_tid);
+        assert!(
+            old.header.infomask.contains(InfoMask::HOT_UPDATED),
+            "old tuple must have HOT_UPDATED bit set"
+        );
+
+        // New version: xmin set, ctid self-referential (terminal).
+        let new_tup = heap.fetch(outcome.new_tid).unwrap();
+        assert_eq!(new_tup.header.xmin, Xid::new(200));
+        assert_eq!(new_tup.header.ctid, outcome.new_tid);
+        assert!(
+            new_tup.header.infomask.contains(InfoMask::HOT_UPDATED),
+            "new tuple must have HOT_UPDATED bit set"
+        );
+        assert_eq!(new_tup.data, b"updated-payload");
+    }
+
+    #[test]
+    fn update_falls_back_to_non_hot_when_page_full() {
+        let heap = make_heap(32);
+        // Fill the page with big tuples so there is < (header + 1 byte) left.
+        // 7000 bytes per tuple: fits once with room for header but not for a
+        // second same-size write.
+        let big = [0xAA_u8; 7000];
+        let tid = heap.insert(rel(), &big, opts(100)).unwrap();
+        // Insert another large tuple; this should spill to block 1.
+        let _ = heap.insert(rel(), &big, opts(100)).unwrap();
+
+        // Now update the first tuple on block 0.  The page is too full for
+        // another 7000-byte tuple in-place.
+        let uo = UpdateOptions {
+            xid: Xid::new(200),
+            command_id: CommandId::FIRST,
+            hot_eligible: true, // we ask for HOT but the page is full
+        };
+        let outcome = heap.update(tid, &big, uo).unwrap();
+        assert!(!outcome.hot, "expected non-HOT when page is full");
+
+        // New version lands on a different block.
+        assert_ne!(
+            outcome.old_tid.page.block, outcome.new_tid.page.block,
+            "non-HOT: old and new must be on different blocks"
+        );
+
+        // Old tuple has xmax stamped.
+        let old = heap.fetch(tid).unwrap();
+        assert_eq!(old.header.xmax, Xid::new(200));
+    }
+
+    #[test]
+    fn update_rejected_on_already_deleted_tuple() {
+        let heap = make_heap(8);
+        let tid = heap.insert(rel(), b"to-delete", opts(100)).unwrap();
+        heap.delete(tid, Xid::new(150), CommandId::FIRST).unwrap();
+
+        let uo = update_opts(200);
+        let err = heap.update(tid, b"should-fail", uo).unwrap_err();
+        assert!(
+            matches!(err, HeapError::MalformedHeader(_)),
+            "expected MalformedHeader on update of deleted tuple, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Deliverable B tests
+    // -----------------------------------------------------------------------
+
+    fn committed_snap(current_xid: u64) -> Snapshot {
+        // Snapshot where all xids < 50 are outside the active set.
+        Snapshot::new(
+            Xid::new(50),
+            Xid::new(500),
+            Xid::new(current_xid),
+            CommandId::FIRST,
+            std::iter::empty(),
+        )
+    }
+
+    #[test]
+    fn visibility_scan_filters_aborted_inserts() {
+        let heap = make_heap(16);
+        let committed_tid = heap.insert(rel(), b"committed", opts(10)).unwrap();
+        let _aborted_tid = heap.insert(rel(), b"aborted", opts(20)).unwrap();
+
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::new(10));
+        oracle.set_aborted(Xid::new(20));
+
+        let snap = committed_snap(999);
+        let blocks = heap.block_count(rel());
+        let visible: Vec<HeapTuple> = heap
+            .scan_visible(rel(), blocks, &snap, &oracle)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].tid, committed_tid);
+        assert_eq!(visible[0].data, b"committed");
+    }
+
+    #[test]
+    fn visibility_scan_filters_uncommitted_other_txn_inserts() {
+        let heap = make_heap(16);
+        let _in_progress_tid = heap.insert(rel(), b"in-progress", opts(300)).unwrap();
+
+        let oracle = MapOracle::new();
+        oracle.set_in_progress(Xid::new(300));
+
+        // Snapshot taken with 300 in-progress: xmin=50, xmax=500,
+        // current_xid=999 (different from 300).
+        let snap = Snapshot::new(
+            Xid::new(50),
+            Xid::new(500),
+            Xid::new(999),
+            CommandId::FIRST,
+            [Xid::new(300)],
+        );
+
+        let blocks = heap.block_count(rel());
+        let visible: Vec<HeapTuple> = heap
+            .scan_visible(rel(), blocks, &snap, &oracle)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(
+            visible.is_empty(),
+            "in-progress insert from another txn must be invisible"
+        );
+    }
+
+    #[test]
+    fn visibility_scan_includes_own_uncommitted_writes() {
+        let heap = make_heap(16);
+        // Insert with the same xid that will be the snapshot's
+        // current_xid, at command_id 0.
+        let own_tid = heap
+            .insert(
+                rel(),
+                b"own-write",
+                InsertOptions {
+                    xmin: Xid::new(42),
+                    command_id: CommandId::FIRST,
+                },
+            )
+            .unwrap();
+
+        let oracle = MapOracle::new();
+        oracle.set_in_progress(Xid::new(42));
+
+        // Snapshot at command 1: own write at command 0 is visible.
+        let snap = Snapshot::new(
+            Xid::new(10),
+            Xid::new(100),
+            Xid::new(42),
+            CommandId::new(1), // later than cmin=0
+            std::iter::empty(),
+        );
+
+        let blocks = heap.block_count(rel());
+        let visible: Vec<HeapTuple> = heap
+            .scan_visible(rel(), blocks, &snap, &oracle)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].tid, own_tid);
+    }
+
+    // Property test: for any set of inserts + random deletes, the
+    // visibility-aware scan returns exactly the non-deleted tuples when
+    // all xids are committed.
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn prop_visible_scan_matches_non_deleted(
+            payloads in proptest::collection::vec(proptest::collection::vec(0u8..=255, 1..=100), 1..=30),
+            delete_mask in proptest::collection::vec(proptest::bool::ANY, 1..=30),
+        ) {
+            let heap = make_heap(256);
+            let insert_xid = Xid::new(1);
+
+            let oracle = MapOracle::new();
+            oracle.set_committed(insert_xid);
+
+            let mut tids = Vec::new();
+            for p in &payloads {
+                let tid = heap
+                    .insert(rel(), p, InsertOptions {
+                        xmin: insert_xid,
+                        command_id: CommandId::FIRST,
+                    })
+                    .unwrap();
+                tids.push(tid);
+            }
+
+            let mut expected_count: usize = 0;
+            let delete_xid = Xid::new(2);
+            oracle.set_committed(delete_xid);
+
+            for (i, &should_delete) in delete_mask.iter().enumerate() {
+                if i >= tids.len() {
+                    break;
+                }
+                if should_delete {
+                    heap.delete(tids[i], delete_xid, CommandId::FIRST).unwrap();
+                } else {
+                    expected_count += 1;
+                }
+            }
+            // Tuples beyond the delete_mask length are never deleted.
+            expected_count += tids.len().saturating_sub(delete_mask.len());
+
+            let snap = Snapshot::new(
+                Xid::new(0),
+                Xid::new(100),
+                Xid::new(999),
+                CommandId::FIRST,
+                std::iter::empty(),
+            );
+
+            let blocks = heap.block_count(rel());
+            let visible: Vec<HeapTuple> = heap
+                .scan_visible(rel(), blocks, &snap, &oracle)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+
+            prop_assert_eq!(
+                visible.len(),
+                expected_count,
+                "scan_visible returned {} tuples, expected {}",
+                visible.len(),
+                expected_count
+            );
+        }
     }
 }
