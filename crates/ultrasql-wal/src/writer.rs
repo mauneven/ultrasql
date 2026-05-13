@@ -31,6 +31,8 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -365,11 +367,7 @@ impl WriterDriver {
             return Ok(());
         }
         let path = segment_path(&self.dir, self.current_index);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(false)
-            .open(&path)?;
+        let file = open_segment_file(&path)?;
         let size = file.metadata()?.len();
         debug!(?path, current_size = size, "wal writer opened segment");
         self.current_file = Some(file);
@@ -434,6 +432,26 @@ fn peek_record_length(bytes: &[u8]) -> Result<u64, WalWriterError> {
         )));
     }
     Ok(u64::from(total))
+}
+
+/// Open (or create) a WAL segment file for append.
+///
+/// On Unix the file is opened with `O_NOFOLLOW` so that a hostile actor
+/// who plants `wal_dir/segment_*` as a symlink to a sensitive file
+/// (`/etc/passwd`, another database's data file, etc.) cannot trick the
+/// writer into appending WAL records into the symlinked target. The
+/// `open(2)` call fails with `ELOOP` in that case and the writer
+/// surfaces the error to its caller, who tears the writer thread down
+/// rather than silently overwriting unrelated files.
+///
+/// On non-Unix targets the flag is unavailable and the open is plain.
+#[cfg_attr(not(unix), allow(unused_variables))]
+fn open_segment_file(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true).read(false);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW);
+    opts.open(path)
 }
 
 /// Determine the index to use for the next segment to be written to a
@@ -524,5 +542,36 @@ mod tests {
         let next_lsn = buffer.next_lsn();
         writer.shutdown().unwrap();
         assert!(buffer.durable_lsn() >= next_lsn);
+    }
+
+    /// Hostile-fs scenario: an attacker has staged a symlink at
+    /// `wal_dir/segment_0000000000` pointing at a sensitive file. The
+    /// writer must refuse to follow the link rather than appending WAL
+    /// bytes into the linked target. We assert the open returns an
+    /// `ELOOP`-class error.
+    #[cfg(unix)]
+    #[test]
+    fn segment_open_refuses_to_follow_symlink() {
+        use std::os::unix::fs::symlink;
+        let dir = TempDir::new().unwrap();
+        let target_dir = TempDir::new().unwrap();
+        let target = target_dir.path().join("victim");
+        std::fs::write(&target, b"original").unwrap();
+        let link = segment_path(dir.path(), 0);
+        symlink(&target, &link).unwrap();
+
+        let err = open_segment_file(&link).expect_err("open must refuse symlink");
+        // POSIX returns ELOOP; some platforms surface it as
+        // `FilesystemLoop`, others as `Other`. Either way it must NOT
+        // be Ok.
+        let raw = err.raw_os_error();
+        assert!(
+            raw == Some(libc::ELOOP) || err.kind() == std::io::ErrorKind::Other,
+            "expected ELOOP, got {err:?}"
+        );
+
+        // The target file's contents must be unchanged.
+        let after = std::fs::read(&target).unwrap();
+        assert_eq!(after, b"original");
     }
 }
