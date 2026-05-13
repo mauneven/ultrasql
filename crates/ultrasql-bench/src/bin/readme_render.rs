@@ -38,7 +38,8 @@
     clippy::needless_pass_by_value,
     clippy::uninlined_format_args,
     clippy::items_after_statements,
-    clippy::similar_names
+    clippy::similar_names,
+    clippy::redundant_closure_for_method_calls
 )]
 
 use std::collections::HashMap;
@@ -47,7 +48,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
-use serde_json;
 
 // ---------------------------------------------------------------------------
 // CLI

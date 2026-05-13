@@ -40,7 +40,7 @@
 //!   build is part of the timed region because the equivalent SQL
 //!   engine query also re-evaluates the predicate per execution.
 
-#![allow(clippy::print_stdout)]
+#![allow(clippy::print_stdout, clippy::unnecessary_lazy_evaluations)]
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};

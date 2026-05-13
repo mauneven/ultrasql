@@ -9,7 +9,7 @@
 //!    stage's `benchmarks/baselines/<stage>.json` file.
 //! 2. For every engine listed in a spec's [`BenchSpec::competitor_floors`],
 //!    UltraSQL's metric meets the declared [`FloorMetric`]. The policy
-//!    floor is [`FloorMetric::ThroughputRatio(2.0)`] — UltraSQL must
+//!    floor is `FloorMetric::ThroughputRatio(2.0)` — UltraSQL must
 //!    achieve at least 2× the competitor's throughput on every workload.
 //!    There is no parity floor anywhere in the registry.
 //!

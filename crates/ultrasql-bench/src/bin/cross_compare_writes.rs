@@ -41,6 +41,7 @@
 
 #![allow(clippy::print_stdout)]
 #![allow(clippy::too_many_lines)]
+#![allow(clippy::unnecessary_lazy_evaluations)]
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};

@@ -49,7 +49,11 @@
 //! [`std::thread`] gives the cleanest model of "T independent
 //! clients."
 
-#![allow(clippy::print_stdout, clippy::enum_variant_names)]
+#![allow(
+    clippy::print_stdout,
+    clippy::enum_variant_names,
+    clippy::unnecessary_lazy_evaluations
+)]
 
 use std::io::BufRead;
 use std::path::PathBuf;

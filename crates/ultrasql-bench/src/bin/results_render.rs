@@ -47,7 +47,20 @@
 //! One `## <workload>` section per workload, each with a Markdown table
 //! ranking engines best-to-worst by median latency.
 
-#![allow(clippy::print_stdout, clippy::print_stderr)]
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::option_if_let_else,
+    clippy::ref_option,
+    clippy::needless_pass_by_value,
+    clippy::needless_borrows_for_generic_args,
+    clippy::map_unwrap_or,
+    clippy::doc_markdown,
+    clippy::redundant_pub_crate,
+    clippy::single_match_else,
+    clippy::ptr_arg,
+    clippy::unnecessary_lazy_evaluations
+)]
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
