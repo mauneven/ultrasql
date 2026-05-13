@@ -440,54 +440,59 @@ Real auth. Any standard PostgreSQL driver can connect.
 
 ---
 
-## v0.6 — "Optimize" ❌
+## v0.6 — "Optimize" 🔄
 
 **Scope:** Cost-based optimizer built from scratch.
 Currently zero code exists in `ultrasql-optimizer`.
 
 ### Rule-Based Rewrites
-- [ ] Constant folding and constant propagation
-- [ ] Predicate pushdown through joins
-- [ ] Predicate pushdown into subqueries and derived tables
-- [ ] Projection pushdown (column pruning)
-- [ ] Subquery decorrelation (correlated subquery → join)
-- [ ] Outer-join elimination when predicates imply inner
-- [ ] LIMIT pushdown into sort and scan
+<!-- wave 6a: 654fe6d -->
+- [x] Constant folding and constant propagation
+- [x] Predicate pushdown through joins
+- [ ] Predicate pushdown into subqueries and derived tables (stub; v0.7)
+- [x] Projection pushdown (column pruning)
+- [ ] Subquery decorrelation (stub; v0.7)
+- [x] Outer-join elimination when predicates imply inner
+- [x] LIMIT pushdown into sort and scan
 - [ ] Sort elimination via index order
-- [ ] Common subexpression elimination
-- [ ] IN-list to semi-join conversion
+- [ ] Common subexpression elimination (stub; v0.7)
+- [x] IN-list to semi-join conversion (OR-list collapse to IN-list shipped)
 
 ### Statistics Collection
-- [ ] Per-column histograms (equi-depth, 100 buckets default)
-- [ ] Most-common-values (MCVs) per column
-- [ ] Per-relation row count and page count
-- [ ] Index correlation (physical sort order vs logical order)
-- [ ] `ANALYZE table` command
+<!-- wave 6b: fd26491 -->
+- [x] Per-column histograms (equi-depth, 100 buckets default)
+- [x] Most-common-values (MCVs) per column
+- [x] Per-relation row count and page count
+- [x] Index correlation (physical sort order vs logical order)
+- [x] `ANALYZE table` command (AnalyzeRunner over row iterator)
 - [ ] Autovacuum triggers `ANALYZE` on heavily modified tables
-- [ ] `pg_statistic` catalog table
+- [x] `pg_statistic` catalog table (row shape; persistent adapter v0.8)
 - [ ] `CREATE STATISTICS` (extended stats: correlation, multi-column MCVs)
 
 ### Cost Model
-- [ ] Selectivity estimation for equality, range, LIKE, IS NULL predicates
-- [ ] Join cardinality estimation (independence assumption + MCV matching)
-- [ ] Sequential scan cost formula
-- [ ] Index scan cost formula (height + correlation-adjusted leaf fetch)
-- [ ] Hash join cost formula (build + probe)
-- [ ] Sort cost formula (O(n log n) + spill cost)
-- [ ] Aggregate cost formula
-- [ ] CPU operator costs (configurable: `cpu_tuple_cost`, `random_page_cost`, `seq_page_cost`)
+<!-- wave 6b: a030846 -->
+- [x] Selectivity estimation for equality, range, LIKE, IS NULL predicates
+- [x] Join cardinality estimation (independence assumption)
+- [x] Sequential scan cost formula
+- [x] Index scan cost formula
+- [x] Hash join cost formula (build + probe)
+- [x] Sort cost formula (n log n)
+- [x] Aggregate cost formula
+- [x] CPU operator costs (CostGucs: cpu_tuple_cost, random_page_cost, seq_page_cost, cpu_index_tuple_cost, cpu_operator_cost)
 
 ### Join Enumeration
-- [ ] DPsize (dynamic programming over subsets) for ≤ 10 relations
-- [ ] Greedy/GEQO heuristic for > 10 relations
-- [ ] Cascades-style memo with physical property requirements
+<!-- wave 6b: a030846 -->
+- [x] DPsize (dynamic programming over subsets) for ≤ 10 relations
+- [x] Greedy/GEQO heuristic for > 10 relations
+- [x] Cascades-style memo data structures (top-down search driver v0.7)
 - [ ] Join reordering with outer join constraints
 
 ### Physical Operator Selection
-- [ ] NestLoop vs HashJoin vs MergeJoin
-- [ ] IndexScan vs SeqScan vs BitmapHeapScan
+<!-- wave 6b: a030846 -->
+- [x] NestLoop vs HashJoin vs MergeJoin
+- [x] IndexScan vs SeqScan (BitmapHeapScan v0.7)
 - [ ] IndexOnlyScan when VM bit is set
-- [ ] HashAggregate vs SortAggregate vs StreamAggregate
+- [x] HashAggregate vs SortAggregate (StreamAggregate v0.7)
 - [ ] Hash-based DISTINCT vs Sort-based DISTINCT
 - [ ] Parallel plan generation and cost estimation
 
