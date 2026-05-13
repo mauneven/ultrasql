@@ -370,7 +370,7 @@ fn run(args: Args) -> Result<i32> {
                 floor_failures.len()
             );
             for msg in &floor_failures {
-                eprintln!("  FLOOR_FAIL  {msg}");
+                eprintln!("{msg}");
             }
         }
         // Prefer EXIT_REGRESSION over EXIT_COMPETITOR_LOSS so the caller
@@ -527,10 +527,15 @@ fn check_competitor_floors(
                 let required = competitor_tput * ratio;
                 if our_throughput > 0.0 && our_throughput < required {
                     let actual_ratio = our_throughput / competitor_tput;
+                    let gap_pct = (ratio - actual_ratio) * 100.0;
                     failures.push(format!(
-                        "{id} vs {engine}: throughput ratio {actual_ratio:.3} \
-                         < required {ratio:.3} \
-                         (ours={our_throughput:.0} ops/s, theirs={competitor_tput:.0} ops/s)"
+                        "COMPETITOR LOSS — benchmark {id}:\n\
+                         \x20 UltraSQL throughput     = {our_throughput:.0} ops/s\n\
+                         \x20 {engine} throughput     = {competitor_tput:.0} ops/s\n\
+                         \x20 Required ratio          = ≥ {ratio:.2}\n\
+                         \x20 Actual ratio            = {actual_ratio:.2}\n\
+                         \x20 Gap                     = {gap_pct:.1}% short\n\
+                         \nPerformance push required before this commit can land."
                     ));
                 }
             }
@@ -541,10 +546,15 @@ fn check_competitor_floors(
                 let allowed = competitor_p99 * ratio;
                 if our_p99_us > 0.0 && our_p99_us > allowed {
                     let actual_ratio = our_p99_us / competitor_p99;
+                    let gap_pct = (actual_ratio - ratio) * 100.0;
                     failures.push(format!(
-                        "{id} vs {engine}: p99 latency ratio {actual_ratio:.3} \
-                         > allowed {ratio:.3} \
-                         (ours={our_p99_us:.1} µs, theirs={competitor_p99:.1} µs)"
+                        "COMPETITOR LOSS — benchmark {id}:\n\
+                         \x20 UltraSQL p99 latency    = {our_p99_us:.1} µs\n\
+                         \x20 {engine} p99 latency    = {competitor_p99:.1} µs\n\
+                         \x20 Required ratio          = ≤ {ratio:.2}\n\
+                         \x20 Actual ratio            = {actual_ratio:.2}\n\
+                         \x20 Gap                     = {gap_pct:.1}% short\n\
+                         \nPerformance push required before this commit can land."
                     ));
                 }
             }
@@ -746,10 +756,11 @@ mod tests {
 
     #[test]
     fn passes_when_no_regression_and_floors_met() {
-        // Baseline throughput = 100_000; current = 100_000 (0% change).
-        // Competitor throughput = 80_000; floor = 1.0× (we need ≥ 80_000).
-        let baseline = make_baseline(100_000.0, 0.0, 80_000.0, "postgres17");
-        let result = make_result(100_000.0, vec![]);
+        // Baseline throughput = 200_000; current = 200_000 (0% change).
+        // Competitor throughput = 80_000; floor = 2.0× (we need ≥ 160_000).
+        // Our 200_000 ≥ 160_000, so no floor failure.
+        let baseline = make_baseline(200_000.0, 0.0, 80_000.0, "postgres17");
+        let result = make_result(200_000.0, vec![]);
         let mut reg_failures = Vec::new();
         check_regression(
             "point_lookup",
@@ -766,11 +777,11 @@ mod tests {
         );
 
         let floors: &[(Engine, FloorMetric)] =
-            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))];
+            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(2.0))];
         let mut floor_failures = Vec::new();
         check_competitor_floors(
             "point_lookup",
-            100_000.0,
+            200_000.0,
             50.0,
             floors,
             None,
@@ -790,10 +801,10 @@ mod tests {
 
     #[test]
     fn detects_competitor_floor_violation() {
-        // Competitor throughput = 100_000; floor = 1.0×; ours = 60_000 → fail.
+        // Competitor throughput = 100_000; floor = 2.0×; ours = 60_000 → fail.
         let baseline = make_baseline(60_000.0, 0.0, 100_000.0, "postgres17");
         let floors: &[(Engine, FloorMetric)] =
-            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))];
+            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(2.0))];
         let mut failures = Vec::new();
         check_competitor_floors(
             "point_lookup",
@@ -812,6 +823,130 @@ mod tests {
             failures[0].contains("postgres17"),
             "message should name engine: {}",
             failures[0]
+        );
+        assert!(
+            failures[0].contains("COMPETITOR LOSS"),
+            "message should contain 'COMPETITOR LOSS': {}",
+            failures[0]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // competitor_floor_2x_throughput_passes_when_ultrasql_at_2_5x
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn competitor_floor_2x_throughput_passes_when_ultrasql_at_2_5x() {
+        // Competitor = 100_000 ops/s; floor = 2.0×; ours = 250_000 (2.5×) → pass.
+        let baseline = make_baseline(250_000.0, 0.0, 100_000.0, "postgres17");
+        let floors: &[(Engine, FloorMetric)] =
+            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(2.0))];
+        let mut failures = Vec::new();
+        check_competitor_floors(
+            "point_lookup",
+            250_000.0,
+            50.0,
+            floors,
+            None,
+            Some(&baseline),
+            &mut failures,
+        );
+        assert!(
+            failures.is_empty(),
+            "2.5× should pass a 2.0× floor; got: {:?}",
+            failures
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // competitor_floor_2x_throughput_fails_when_ultrasql_at_1_8x
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn competitor_floor_2x_throughput_fails_when_ultrasql_at_1_8x() {
+        // Competitor = 100_000 ops/s; floor = 2.0×; ours = 180_000 (1.8×) → fail.
+        let baseline = make_baseline(180_000.0, 0.0, 100_000.0, "postgres17");
+        let floors: &[(Engine, FloorMetric)] =
+            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(2.0))];
+        let mut failures = Vec::new();
+        check_competitor_floors(
+            "point_lookup",
+            180_000.0,
+            50.0,
+            floors,
+            None,
+            Some(&baseline),
+            &mut failures,
+        );
+        assert!(!failures.is_empty(), "1.8× should fail a 2.0× floor");
+        assert!(
+            failures[0].contains("COMPETITOR LOSS"),
+            "failure message must contain 'COMPETITOR LOSS': {}",
+            failures[0]
+        );
+        assert!(
+            failures[0].contains("Performance push required"),
+            "failure message must contain the push-required line: {}",
+            failures[0]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // competitor_floor_2x_throughput_fails_when_at_exactly_2x_minus_epsilon
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn competitor_floor_2x_throughput_fails_when_at_exactly_2x_minus_epsilon() {
+        // Competitor = 100_000 ops/s; floor = 2.0×; ours = 199_999 (< 200_000) → fail.
+        let baseline = make_baseline(199_999.0, 0.0, 100_000.0, "duckdb");
+        let floors: &[(Engine, FloorMetric)] =
+            &[(Engine::DuckDb, FloorMetric::ThroughputRatio(2.0))];
+        let mut failures = Vec::new();
+        check_competitor_floors(
+            "point_lookup",
+            199_999.0,
+            50.0,
+            floors,
+            None,
+            Some(&baseline),
+            &mut failures,
+        );
+        assert!(
+            !failures.is_empty(),
+            "199_999 ops/s should fail a 2.0× floor against 100_000 ops/s"
+        );
+        assert!(
+            failures[0].contains("duckdb"),
+            "failure message must name the engine: {}",
+            failures[0]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // floor_skipped_when_competitor_baseline_is_zero
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn floor_skipped_when_competitor_baseline_is_zero() {
+        // Competitor baseline is 0.0 (not yet measured) — floor must be skipped.
+        // make_baseline passes 0.0 for competitor_tput, which omits the entry.
+        let baseline = make_baseline(100_000.0, 0.0, 0.0, "postgres17");
+        let floors: &[(Engine, FloorMetric)] =
+            &[(Engine::Postgres17, FloorMetric::ThroughputRatio(2.0))];
+        let mut failures = Vec::new();
+        check_competitor_floors(
+            "point_lookup",
+            50_000.0, // ours is only 0.5× — would fail if data existed
+            50.0,
+            floors,
+            None,
+            Some(&baseline),
+            &mut failures,
+        );
+        assert!(
+            failures.is_empty(),
+            "floor must be skipped when competitor baseline is 0.0; got: {:?}",
+            failures
         );
     }
 

@@ -190,6 +190,27 @@ them together.
 
 ---
 
+## Competitor floor policy
+
+Every benchmark in `registry.rs` carries a `FloorMetric` per competitor:
+
+- `ThroughputRatio(2.0)` — UltraSQL must achieve at least 2× the
+  competitor's throughput on this workload.
+- `LatencyRatio(0.5)` — UltraSQL must run at most half the
+  competitor's latency on this workload.
+
+This is the "50% better in any case" policy. Any commit that fails
+to meet the floor on any registered competitor is rejected by the
+pre-push regression gate. No exceptions; tighten the kernel until
+the gate passes.
+
+The gate runs against `benchmarks/results/latest/results.json`. If
+a competitor's number is 0.0 (not yet measured), the floor for that
+engine is skipped — but the commit still must beat every measured
+engine by ≥ 2×.
+
+---
+
 ## Disagreements
 
 Open an RFC. Methodology changes go through `rfcs/`.

@@ -5,10 +5,13 @@
 //! regression gate iterates [`REGISTRY`], runs each benchmark whose
 //! stage matches the requested filter, and enforces:
 //!
-//! 1. No >5% throughput regression vs the corresponding entry in the
+//! 1. No throughput regression vs the corresponding entry in the
 //!    stage's `benchmarks/baselines/<stage>.json` file.
 //! 2. For every engine listed in a spec's [`BenchSpec::competitor_floors`],
-//!    UltraSQL's metric meets the declared [`FloorMetric`].
+//!    UltraSQL's metric meets the declared [`FloorMetric`]. The policy
+//!    floor is [`FloorMetric::ThroughputRatio(2.0)`] — UltraSQL must
+//!    achieve at least 2× the competitor's throughput on every workload.
+//!    There is no parity floor anywhere in the registry.
 //!
 //! # Adding a new benchmark
 //!
@@ -186,24 +189,27 @@ impl std::fmt::Display for Engine {
 
 /// Minimum acceptable performance ratio between UltraSQL and a competitor.
 ///
-/// Both variants express a ratio: values > 1.0 mean UltraSQL must outperform
-/// the competitor, values < 1.0 allow UltraSQL to be proportionally slower.
-/// The current ROADMAP target for v0.5 is ≥ 1.0× PostgreSQL on point lookups
-/// and inserts; analytical targets widen to 2× at v0.7.
+/// Both variants express a ratio where UltraSQL must beat the competitor by
+/// the given factor. The project floor is `ThroughputRatio(2.0)` — UltraSQL
+/// must achieve at least 2× the competitor's throughput on every workload, or
+/// `LatencyRatio(0.5)` — UltraSQL's p99 latency must be at most half the
+/// competitor's. No parity floor (`ThroughputRatio(1.0)`) exists anywhere in
+/// the registry.
 #[derive(Clone, Copy, Debug)]
 pub enum FloorMetric {
     /// UltraSQL's throughput (ops/s or rows/s) must be ≥ `ratio ×`
     /// competitor throughput.
     ///
-    /// Example: `ThroughputRatio(1.0)` means "at least as fast as the
-    /// competitor". `ThroughputRatio(0.5)` means "no worse than 2× slower".
+    /// The canonical value is `2.0`: UltraSQL must run at least twice as fast
+    /// as the competitor. `ThroughputRatio(1.0)` (parity) is not used in the
+    /// registry — every floor demands a genuine performance advantage.
     ThroughputRatio(f64),
 
     /// UltraSQL's p99 latency must be ≤ `ratio ×` competitor p99 latency.
     ///
-    /// Lower is better for latency, so `LatencyRatio(1.0)` means "p99 no
-    /// worse than the competitor's p99". `LatencyRatio(2.0)` allows UltraSQL
-    /// to be up to 2× slower at p99.
+    /// Lower is better for latency. The canonical value is `0.5`: UltraSQL's
+    /// p99 must be at most half the competitor's p99, i.e. at least 2× faster
+    /// at tail latency.
     LatencyRatio(f64),
 }
 
@@ -376,48 +382,80 @@ pub static REGISTRY: &[BenchSpec] = &SPECS;
 static SPECS: [BenchSpec; 16] = [
     // ------------------------------------------------------------------
     // v0.3 — write-side (storage) benchmarks
+    //
+    // Bulk-write workloads: postgres17, duckdb, sqlite3, cockroachdb all
+    // at 2× throughput floor (policy floor: ThroughputRatio(2.0)).
     // ------------------------------------------------------------------
     BenchSpec {
         id: "insert_throughput_10k",
         stage: Stage::V0_3,
         workload: Workload::InsertThroughput,
-        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        competitor_floors: &[
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
+        ],
         run: stub_run,
     },
     BenchSpec {
         id: "update_throughput_10k",
         stage: Stage::V0_3,
         workload: Workload::UpdateThroughput,
-        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        competitor_floors: &[
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
+        ],
         run: stub_run,
     },
     BenchSpec {
         id: "delete_throughput_10k",
         stage: Stage::V0_3,
         workload: Workload::DeleteThroughput,
-        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        competitor_floors: &[
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
+        ],
         run: stub_run,
     },
     // ------------------------------------------------------------------
     // v0.5 — mixed OLTP
+    //
+    // OLTP point lookup / mixed: postgres17, sqlite3, cockroachdb at 2×.
     // ------------------------------------------------------------------
     BenchSpec {
         id: "mixed_oltp_pgbench_like",
         stage: Stage::V0_5,
         workload: Workload::MixedOltp,
-        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        competitor_floors: &[
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
+        ],
         run: stub_run,
     },
     // ------------------------------------------------------------------
     // v0.6 — plan + execute benchmarks
+    //
+    // OLAP scan / aggregate / join / TPC-H:
+    //   postgres17, duckdb, clickhouse, sqlite3 at 2×.
+    // OLTP point lookup:
+    //   postgres17, sqlite3, cockroachdb at 2×.
+    // Bulk writes:
+    //   postgres17, duckdb, sqlite3, cockroachdb at 2×.
     // ------------------------------------------------------------------
     BenchSpec {
         id: "point_lookup",
         stage: Stage::V0_6,
         workload: Workload::PointLookup,
         competitor_floors: &[
-            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::DuckDb, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
         run: stub_run,
     },
@@ -426,8 +464,10 @@ static SPECS: [BenchSpec; 16] = [
         stage: Stage::V0_6,
         workload: Workload::RangeScan,
         competitor_floors: &[
-            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::DuckDb, FloorMetric::ThroughputRatio(0.5)),
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
         ],
         run: stub_run,
     },
@@ -435,7 +475,12 @@ static SPECS: [BenchSpec; 16] = [
         id: "insert_throughput",
         stage: Stage::V0_6,
         workload: Workload::InsertThroughput,
-        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        competitor_floors: &[
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
+        ],
         run: stub_run,
     },
     BenchSpec {
@@ -443,8 +488,10 @@ static SPECS: [BenchSpec; 16] = [
         stage: Stage::V0_6,
         workload: Workload::HashAggregate,
         competitor_floors: &[
-            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::DuckDb, FloorMetric::ThroughputRatio(0.5)),
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
         ],
         run: stub_run,
     },
@@ -452,7 +499,12 @@ static SPECS: [BenchSpec; 16] = [
         id: "sort_large",
         stage: Stage::V0_6,
         workload: Workload::SortLarge,
-        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        competitor_floors: &[
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
+        ],
         run: stub_run,
     },
     BenchSpec {
@@ -460,8 +512,9 @@ static SPECS: [BenchSpec; 16] = [
         stage: Stage::V0_6,
         workload: Workload::TpchQ1,
         competitor_floors: &[
-            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::DuckDb, FloorMetric::ThroughputRatio(0.5)),
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
         ],
         run: stub_run,
     },
@@ -469,20 +522,22 @@ static SPECS: [BenchSpec; 16] = [
     // v0.7 — vectorized-kernel benchmarks
     //
     // `select_sum_65k_i64`: `SELECT SUM(x) FROM t` over 65 536 i64 rows,
-    //   hot cache. Competitor floor: UltraSQL (kernel) ≥ DuckDB.
+    //   hot cache. All four competitor engines at 2× throughput floor.
     //
     // `select_avg_10m_i64`: `SELECT AVG(x) FROM t` over 10 000 000 i64.
-    //   Competitor floor: UltraSQL (kernel) ≥ ClickHouse.
+    //   All four competitor engines at 2× throughput floor.
+    //
+    // `tpch_q22`: TPC-H Q22 correlated subquery. TPC-H engines at 2×.
     // ------------------------------------------------------------------
     BenchSpec {
         id: "select_sum_65k_i64",
         stage: Stage::V0_7,
         workload: Workload::AnalyticAggregate,
         competitor_floors: &[
-            (Engine::DuckDb, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::ClickHouse, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::Sqlite3, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
         ],
         run: stub_run,
     },
@@ -491,10 +546,10 @@ static SPECS: [BenchSpec; 16] = [
         stage: Stage::V0_7,
         workload: Workload::AnalyticAggregate,
         competitor_floors: &[
-            (Engine::ClickHouse, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::DuckDb, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::Sqlite3, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
         ],
         run: stub_run,
     },
@@ -503,42 +558,58 @@ static SPECS: [BenchSpec; 16] = [
         stage: Stage::V0_7,
         workload: Workload::TpchQ22,
         competitor_floors: &[
-            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::DuckDb, FloorMetric::ThroughputRatio(0.5)),
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
         ],
         run: stub_run,
     },
     // ------------------------------------------------------------------
     // v0.8 — index + constraint benchmarks
+    //
+    // OLTP point lookup via B-tree: postgres17, sqlite3, cockroachdb at 2×.
     // ------------------------------------------------------------------
     BenchSpec {
         id: "btree_point_lookup",
         stage: Stage::V0_8,
         workload: Workload::PointLookup,
         competitor_floors: &[
-            (Engine::Postgres17, FloorMetric::ThroughputRatio(1.0)),
-            (Engine::DuckDb, FloorMetric::ThroughputRatio(1.0)),
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
         run: stub_run,
     },
     // ------------------------------------------------------------------
     // v0.9 — operations benchmarks
+    //
+    // High-concurrency mixed OLTP: postgres17, sqlite3, cockroachdb at 2×.
     // ------------------------------------------------------------------
     BenchSpec {
         id: "tpcb_32conn",
         stage: Stage::V0_9,
         workload: Workload::MixedOltp,
-        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        competitor_floors: &[
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
+        ],
         run: stub_run,
     },
     // ------------------------------------------------------------------
     // v1.0 — GA benchmarks
+    //
+    // Full TPC-C mixed OLTP: postgres17, sqlite3, cockroachdb at 2×.
     // ------------------------------------------------------------------
     BenchSpec {
         id: "tpcc_5types",
         stage: Stage::V1_0,
         workload: Workload::MixedOltp,
-        competitor_floors: &[(Engine::Postgres17, FloorMetric::ThroughputRatio(1.0))],
+        competitor_floors: &[
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
+        ],
         run: stub_run,
     },
 ];
