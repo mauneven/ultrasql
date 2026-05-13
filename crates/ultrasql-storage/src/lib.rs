@@ -10,3 +10,8 @@
 //! 6. Free-space map + visibility map.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
+
+pub mod checksum;
+pub mod page;
+
+pub use page::{ItemId, ItemIdFlags, Page, PageError, PageHeader, PageKind, SlotIndex};
