@@ -36,6 +36,10 @@ pub mod stats;
 
 pub use error::OptimizeError;
 pub use rules::{RewriteRule, RuleSet};
+pub use stats::{
+    AnalyzeOptions, AnalyzeRunner, ColumnStats, EquiDepthHistogram, InMemoryStatsCatalog,
+    MostCommonValues, PgStatisticRow, RelationStats, StatsCatalog, StatsError,
+};
 
 use tracing::debug;
 use ultrasql_planner::LogicalPlan;
