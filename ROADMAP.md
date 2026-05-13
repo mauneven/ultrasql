@@ -218,33 +218,34 @@ Produce typed logical plans for all common statement types.
 - [x] `PREPARE name AS ...` / `EXECUTE name (params)` / `DEALLOCATE name`
 
 ### Parser: Expressions
-- [ ] `CASE WHEN ... THEN ... ELSE ... END`
-- [ ] `COALESCE(a, b, ...)` / `NULLIF(a, b)`
-- [ ] `GREATEST(...)` / `LEAST(...)`
-- [ ] `BETWEEN ... AND ...`
-- [ ] `LIKE` / `ILIKE` / `NOT LIKE`
-- [ ] `IS NULL` / `IS NOT NULL`
-- [ ] `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`
-- [ ] `CAST(x AS type)` and `x::type`
-- [ ] String concatenation `||`
-- [ ] Regex: `~`, `~*`, `!~`, `!~*`
-- [ ] Bitwise: `&`, `|`, `#`, `~`, `<<`, `>>`
-- [ ] JSON operators: `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`
-- [ ] Array subscript `arr[n]`, slice `arr[m:n]`
-- [ ] `AT TIME ZONE`
-- [ ] `OVERLAPS`
-- [ ] `ROW(a, b, c)` constructor
-- [ ] Parameter placeholders `$1`, `$2`, ... (prepared statements)
+<!-- wave 4 completed: db1bb21..36bab75 -->
+- [x] `CASE WHEN ... THEN ... ELSE ... END`
+- [x] `COALESCE(a, b, ...)` / `NULLIF(a, b)`
+- [x] `GREATEST(...)` / `LEAST(...)`
+- [x] `BETWEEN ... AND ...`
+- [x] `LIKE` / `ILIKE` / `NOT LIKE`
+- [x] `IS NULL` / `IS NOT NULL`
+- [x] `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`
+- [x] `CAST(x AS type)` and `x::type`
+- [x] String concatenation `||`
+- [x] Regex: `~`, `~*`, `!~`, `!~*`
+- [x] Bitwise: `&`, `|`, `#`, `~`, `<<`, `>>`
+- [x] JSON operators: `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`
+- [x] Array subscript `arr[n]`, slice `arr[m:n]`
+- [x] `AT TIME ZONE`
+- [x] `OVERLAPS`
+- [x] `ROW(a, b, c)` constructor
+- [x] Parameter placeholders `$1`, `$2`, ... (prepared statements)
 
 ### Planner updates
-<!-- wave 2 partial: 7415867..7647f43 -->
-- [ ] Binder handles JOINs (INNER, LEFT, RIGHT, FULL)
-- [ ] Binder handles GROUP BY + aggregation
-- [ ] Binder handles subqueries (correlated + uncorrelated)
-- [ ] Binder handles CTEs
-- [x] Logical plan nodes: `LogicalJoin`, `LogicalAggregate`, `LogicalUnion`, `LogicalInsert`, `LogicalUpdate`, `LogicalDelete` (Insert/Update/Delete shipped; Join/Aggregate/Union remain for wave 3)
-- [ ] `SELECT *` expansion via catalog
-- [x] Logical plan pretty-printer (display() extended for all DML variants)
+<!-- wave 2+4 completed: 7415867..36bab75 -->
+- [x] Binder handles JOINs (INNER, LEFT, RIGHT, FULL)
+- [x] Binder handles GROUP BY + aggregation
+- [ ] Binder handles subqueries (correlated + uncorrelated) — parser parses, binder still NotSupported
+- [x] Binder handles CTEs (non-recursive; RECURSIVE flag preserved for executor fixpoint later)
+- [x] Logical plan nodes: `LogicalJoin`, `LogicalAggregate`, `LogicalSetOp`, `LogicalInsert`, `LogicalUpdate`, `LogicalDelete`, `LogicalCte`
+- [x] `SELECT *` expansion via catalog
+- [x] Logical plan pretty-printer
 - [ ] Parser fuzz target reaching 24 h CI-clean
 
 ---
@@ -298,12 +299,13 @@ them back with crash recovery. WAL wired to heap. No more in-memory-only data.
 serializable (SSI). Real row-level locking. Deadlock detection.
 
 ### Lock Manager
-- [ ] Fastpath relation locks (per-backend cache, no central state)
-- [ ] Central lock table: `DashMap<LockTag, LockEntry>` with wait-for graph
-- [ ] Deadlock detector background thread (configurable interval, default 1 s)
-- [ ] Tuple-level locks for concurrent updates
-- [ ] `SELECT FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` enforcement
-- [ ] Advisory locks: `pg_advisory_lock`, `pg_try_advisory_lock`
+<!-- wave 4 partial: db1bb21 -->
+- [x] Fastpath relation locks (per-backend cache, no central state)
+- [x] Central lock table: `DashMap<LockTag, LockEntry>` with wait-for graph
+- [x] Deadlock detector background thread (configurable interval, default 1 s)
+- [x] Tuple-level locks for concurrent updates (LockTag::Tuple supported)
+- [ ] `SELECT FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` enforcement (executor wiring pending)
+- [x] Advisory locks: `pg_advisory_lock`, `pg_try_advisory_lock` (LockTag::Advisory; SQL surface still TODO)
 
 ### SSI (Serializable Snapshot Isolation)
 - [ ] Predicate locks (`SIReadLock`)
@@ -325,9 +327,10 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [ ] `pg_prepared_xacts` view
 
 ### Executor ↔ Storage wiring
-- [ ] `SeqScan` operator reading real heap pages (replacing `MemTableScan`)
-- [ ] `ModifyTable` operator for INSERT/UPDATE/DELETE on real heap
-- [ ] Executor uses real `TransactionManager` snapshot for visibility
+<!-- wave 3+4: 51adaf7, 64ea829 -->
+- [x] `SeqScan` operator reading real heap pages (replacing `MemTableScan`)
+- [x] `ModifyTable` operator for INSERT/UPDATE/DELETE on real heap (standalone; physical lowering pending datasource refactor)
+- [x] Executor uses real `TransactionManager` snapshot for visibility (SeqScan accepts Snapshot+Oracle)
 
 ### Tests
 - [ ] Loom-based concurrency model tests for lock manager
@@ -378,9 +381,10 @@ Real auth. Any standard PostgreSQL driver can connect.
 - [ ] `Result` (constant expressions)
 
 ### Expression Evaluation
-- [ ] Full general expression interpreter (replace hardcoded `FilterEqI32`)
+<!-- wave 4 partial: 64ea829 -->
+- [x] Full general expression interpreter (replace hardcoded `FilterEqI32`)
 - [ ] Vectorized expression eval over batches (OLAP pipelines)
-- [ ] NULL propagation correctness in all operators
+- [x] NULL propagation correctness in all operators (Kleene 3VL in Eval)
 - [ ] Type coercion / implicit casts at execution time
 
 ### Memory Management
