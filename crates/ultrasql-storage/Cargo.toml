@@ -33,6 +33,7 @@ tracing       = { workspace = true }
 proptest  = { workspace = true }
 rstest    = { workspace = true }
 criterion = { workspace = true }
+tempfile  = "3"
 
 [[bench]]
 name = "page"
