@@ -42,4 +42,8 @@ pub use kernels::{
     filter_eq_f64, filter_eq_f64_scalar, filter_eq_i32, filter_eq_i32_scalar, filter_eq_i64,
     filter_eq_i64_scalar, filter_gt_i32, filter_gt_i32_scalar, filter_lt_i32, filter_lt_i32_scalar,
 };
+pub use kernels::{
+    filter_sum_i64_where_gt_zero, filter_sum_i64_where_gt_zero_scalar,
+    filter_sum_i64_where_gt_zero_with_validity,
+};
 pub use kernels::{hash_i64, hash_i64_scalar, hash_text_bytes, hash_text_bytes_scalar};

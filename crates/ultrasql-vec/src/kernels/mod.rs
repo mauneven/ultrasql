@@ -8,11 +8,13 @@
 //! Sub-modules
 //! -----------
 //! - [`filter`]     — filter kernels: `filter_eq_i32/i64`, `filter_lt/gt_i32`, `filter_eq_f64`.
+//! - [`filter_sum`] — fused branchless filter+sum kernels.
 //! - [`arithmetic`] — arithmetic kernels: `add/sub/mul_i64`, `compare_i64`.
 //! - [`hash`]       — hash kernels: `hash_i64`, `hash_text_bytes` (FNV-1a).
 
 pub mod arithmetic;
 pub mod filter;
+pub mod filter_sum;
 pub mod hash;
 
 pub use arithmetic::{
@@ -22,6 +24,10 @@ pub use arithmetic::{
 pub use filter::{
     filter_eq_f64, filter_eq_f64_scalar, filter_eq_i32, filter_eq_i32_scalar, filter_eq_i64,
     filter_eq_i64_scalar, filter_gt_i32, filter_gt_i32_scalar, filter_lt_i32, filter_lt_i32_scalar,
+};
+pub use filter_sum::{
+    filter_sum_i64_where_gt_zero, filter_sum_i64_where_gt_zero_scalar,
+    filter_sum_i64_where_gt_zero_with_validity,
 };
 pub use hash::{hash_i64, hash_i64_scalar, hash_text_bytes, hash_text_bytes_scalar};
 
