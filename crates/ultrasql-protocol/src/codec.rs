@@ -37,7 +37,7 @@
 use bytes::{Buf, BufMut, BytesMut};
 
 use crate::error::ProtocolError;
-use crate::messages::{BackendMessage, FieldDescription, FrontendMessage};
+use crate::messages::{BackendMessage, DescribeKind, FieldDescription, FrontendMessage};
 
 /// Length of the framing prefix on every non-startup message: the
 /// 1-byte type tag and the 4-byte length field.
@@ -92,6 +92,11 @@ pub fn decode_frontend(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, Pr
 /// The bytes are appended to the existing contents of `buf`; callers
 /// that need a fresh allocation should pass a freshly-constructed
 /// [`BytesMut`].
+// The large match arms are unavoidable for a complete wire-protocol
+// codec: each variant encodes a structurally distinct message type.
+// Splitting into per-variant helpers would only add indirection without
+// improving readability.
+#[allow(clippy::too_many_lines)]
 pub fn encode_frontend(msg: &FrontendMessage, buf: &mut BytesMut) {
     match msg {
         FrontendMessage::StartupMessage {
@@ -142,12 +147,16 @@ pub fn encode_frontend(msg: &FrontendMessage, buf: &mut BytesMut) {
             });
         }
         FrontendMessage::Describe { kind, name } => {
+            // Spec §55.7: Describe (F), Byte1('D'), Int32 len,
+            // Byte1 ('S' or 'P'), String name.
             write_tagged(buf, b'D', |payload| {
-                payload.put_u8(*kind);
+                payload.put_u8(describe_kind_byte(*kind));
                 write_cstring(payload, name);
             });
         }
         FrontendMessage::Execute { portal, max_rows } => {
+            // Spec §55.7: Execute (F), Byte1('E'), Int32 len,
+            // String portal, Int32 max_rows.
             write_tagged(buf, b'E', |payload| {
                 write_cstring(payload, portal);
                 payload.put_i32(*max_rows);
@@ -158,6 +167,53 @@ pub fn encode_frontend(msg: &FrontendMessage, buf: &mut BytesMut) {
         FrontendMessage::Password { password } => {
             write_tagged(buf, b'p', |payload| {
                 write_cstring(payload, password);
+            });
+        }
+        FrontendMessage::Close { kind, name } => {
+            // Spec §55.7: Close (F), Byte1('C'), Int32 len,
+            // Byte1 ('S' or 'P'), String name.
+            write_tagged(buf, b'C', |payload| {
+                payload.put_u8(describe_kind_byte(*kind));
+                write_cstring(payload, name);
+            });
+        }
+        FrontendMessage::Flush => write_tagged(buf, b'H', |_| {}),
+        FrontendMessage::CopyData(data) => {
+            // Spec §55.7: CopyData (F&B), Byte1('d'), Int32 len,
+            // Byte[n] data.
+            write_tagged(buf, b'd', |payload| {
+                payload.put_slice(data);
+            });
+        }
+        FrontendMessage::CopyDone => write_tagged(buf, b'c', |_| {}),
+        FrontendMessage::CopyFail(msg) => {
+            // Spec §55.7: CopyFail (F), Byte1('f'), Int32 len,
+            // String error_message.
+            write_tagged(buf, b'f', |payload| {
+                write_cstring(payload, msg);
+            });
+        }
+        FrontendMessage::FunctionCall {
+            function_oid,
+            arg_formats,
+            args,
+            result_format,
+        } => {
+            // Spec §55.7: FunctionCall (F), Byte1('F'), Int32 len,
+            // Int32 funcid, Int16 nformat_codes, Int16[nformat_codes] format_codes,
+            // Int16 nargs, for each: Int32 len (-1 = NULL) + Byte[len],
+            // Int16 result_format.
+            write_tagged(buf, b'F', |payload| {
+                payload.put_u32(*function_oid);
+                payload.put_i16(i16_from_usize(arg_formats.len()));
+                for code in arg_formats {
+                    payload.put_u16(*code);
+                }
+                payload.put_i16(i16_from_usize(args.len()));
+                for value in args {
+                    write_value(payload, value.as_deref());
+                }
+                payload.put_u16(*result_format);
             });
         }
     }
@@ -174,6 +230,10 @@ pub fn decode_backend(buf: &mut BytesMut) -> Result<Option<BackendMessage>, Prot
 }
 
 /// Encode a [`BackendMessage`] into `buf`.
+// Same rationale as `encode_frontend`: every message variant differs
+// structurally and splitting the match into per-variant helpers buys
+// nothing.
+#[allow(clippy::too_many_lines)]
 pub fn encode_backend(msg: &BackendMessage, buf: &mut BytesMut) {
     match msg {
         BackendMessage::AuthenticationOk => {
@@ -246,6 +306,59 @@ pub fn encode_backend(msg: &BackendMessage, buf: &mut BytesMut) {
         BackendMessage::NoticeResponse { fields } => {
             write_tagged(buf, b'N', |payload| write_error_fields(payload, fields));
         }
+        BackendMessage::ParseComplete => write_tagged(buf, b'1', |_| {}),
+        BackendMessage::BindComplete => write_tagged(buf, b'2', |_| {}),
+        BackendMessage::CloseComplete => write_tagged(buf, b'3', |_| {}),
+        BackendMessage::NoData => write_tagged(buf, b'n', |_| {}),
+        BackendMessage::ParameterDescription { type_oids } => {
+            // Spec §55.7: ParameterDescription (B), Byte1('t'),
+            // Int32 len, Int16 nparams, Int32[nparams] type_oids.
+            write_tagged(buf, b't', |payload| {
+                payload.put_i16(i16_from_usize(type_oids.len()));
+                for oid in type_oids {
+                    payload.put_u32(*oid);
+                }
+            });
+        }
+        BackendMessage::PortalSuspended => write_tagged(buf, b's', |_| {}),
+        BackendMessage::CopyInResponse {
+            overall_format,
+            column_formats,
+        } => {
+            // Spec §55.7: CopyInResponse (B), Byte1('G'),
+            // Int32 len, Int8 overall_format, Int16 ncols,
+            // Int16[ncols] column_formats.
+            write_tagged(buf, b'G', |payload| {
+                payload.put_u8(*overall_format);
+                payload.put_i16(i16_from_usize(column_formats.len()));
+                for code in column_formats {
+                    payload.put_u16(*code);
+                }
+            });
+        }
+        BackendMessage::CopyOutResponse {
+            overall_format,
+            column_formats,
+        } => {
+            // Spec §55.7: CopyOutResponse (B), Byte1('H'),
+            // Int32 len, Int8 overall_format, Int16 ncols,
+            // Int16[ncols] column_formats.
+            write_tagged(buf, b'H', |payload| {
+                payload.put_u8(*overall_format);
+                payload.put_i16(i16_from_usize(column_formats.len()));
+                for code in column_formats {
+                    payload.put_u16(*code);
+                }
+            });
+        }
+        BackendMessage::CopyData(data) => {
+            // Spec §55.7: CopyData (F&B), Byte1('d'),
+            // Int32 len, Byte[n] data.
+            write_tagged(buf, b'd', |payload| {
+                payload.put_slice(data);
+            });
+        }
+        BackendMessage::CopyDone => write_tagged(buf, b'c', |_| {}),
     }
 }
 
@@ -314,6 +427,8 @@ fn decode_frontend_inner(bytes: &[u8]) -> Result<(FrontendMessage, usize), Proto
     Ok((msg, total))
 }
 
+// Large match; same structural argument as encode_frontend.
+#[allow(clippy::too_many_lines)]
 fn decode_frontend_payload(
     first: u8,
     payload: PayloadReader<'_>,
@@ -376,16 +491,17 @@ fn decode_frontend_payload(
             }
         }
         b'D' => {
+            // Spec §55.7: Describe (F). Byte1 kind ('S' or 'P'),
+            // String name.
             let mut p = payload;
-            let kind = p.read_u8()?;
-            if kind != b'S' && kind != b'P' {
-                return Err(ProtocolError::Malformed("describe kind"));
-            }
+            let kind_byte = p.read_u8()?;
+            let kind = describe_kind_from_byte(kind_byte)?;
             let name = p.read_cstring()?;
             p.ensure_drained()?;
             FrontendMessage::Describe { kind, name }
         }
         b'E' => {
+            // Spec §55.7: Execute (F). String portal, Int32 max_rows.
             let mut p = payload;
             let portal = p.read_cstring()?;
             let max_rows = p.read_i32()?;
@@ -405,6 +521,68 @@ fn decode_frontend_payload(
             let password = p.read_cstring()?;
             p.ensure_drained()?;
             FrontendMessage::Password { password }
+        }
+        b'C' => {
+            // Spec §55.7: Close (F). Byte1 kind ('S' or 'P'),
+            // String name.
+            let mut p = payload;
+            let kind_byte = p.read_u8()?;
+            let kind = describe_kind_from_byte(kind_byte)?;
+            let name = p.read_cstring()?;
+            p.ensure_drained()?;
+            FrontendMessage::Close { kind, name }
+        }
+        b'H' => {
+            // Spec §55.7: Flush (F). No payload.
+            payload.ensure_drained()?;
+            FrontendMessage::Flush
+        }
+        b'd' => {
+            // Spec §55.7: CopyData (F&B). Byte[n] data — all remaining
+            // payload bytes.
+            let mut p = payload;
+            let data = p.read_remaining();
+            FrontendMessage::CopyData(data)
+        }
+        b'c' => {
+            // Spec §55.7: CopyDone (F&B). No payload.
+            payload.ensure_drained()?;
+            FrontendMessage::CopyDone
+        }
+        b'f' => {
+            // Spec §55.7: CopyFail (F). String error_message.
+            let mut p = payload;
+            let msg = p.read_cstring()?;
+            p.ensure_drained()?;
+            FrontendMessage::CopyFail(msg)
+        }
+        b'F' => {
+            // Spec §55.7: FunctionCall (F).
+            // Int32 funcid, Int16 nformat_codes, Int16[nformat_codes],
+            // Int16 nargs, for each: Int32 len + data,
+            // Int16 result_format.
+            let mut p = payload;
+            let function_oid = p.read_u32()?;
+            let nformats = p.read_i16()?;
+            let nformats = nonneg_usize(nformats, "function call format count")?;
+            let mut arg_formats = Vec::with_capacity(nformats.min(64));
+            for _ in 0..nformats {
+                arg_formats.push(p.read_u16()?);
+            }
+            let nargs = p.read_i16()?;
+            let nargs = nonneg_usize(nargs, "function call arg count")?;
+            let mut args = Vec::with_capacity(nargs.min(64));
+            for _ in 0..nargs {
+                args.push(p.read_value()?);
+            }
+            let result_format = p.read_u16()?;
+            p.ensure_drained()?;
+            FrontendMessage::FunctionCall {
+                function_oid,
+                arg_formats,
+                args,
+                result_format,
+            }
         }
         other => return Err(ProtocolError::UnknownMessageType(other)),
     };
@@ -472,6 +650,8 @@ fn decode_backend_inner(bytes: &[u8]) -> Result<(BackendMessage, usize), Protoco
     Ok((msg, total))
 }
 
+// Large match; same structural argument as encode_backend.
+#[allow(clippy::too_many_lines)]
 fn decode_backend_payload(
     first: u8,
     mut p: PayloadReader<'_>,
@@ -553,6 +733,85 @@ fn decode_backend_payload(
             let fields = read_error_fields(&mut p)?;
             p.ensure_drained()?;
             BackendMessage::NoticeResponse { fields }
+        }
+        b'1' => {
+            // Spec §55.7: ParseComplete (B). No payload.
+            p.ensure_drained()?;
+            BackendMessage::ParseComplete
+        }
+        b'2' => {
+            // Spec §55.7: BindComplete (B). No payload.
+            p.ensure_drained()?;
+            BackendMessage::BindComplete
+        }
+        b'3' => {
+            // Spec §55.7: CloseComplete (B). No payload.
+            p.ensure_drained()?;
+            BackendMessage::CloseComplete
+        }
+        b'n' => {
+            // Spec §55.7: NoData (B). No payload.
+            p.ensure_drained()?;
+            BackendMessage::NoData
+        }
+        b't' => {
+            // Spec §55.7: ParameterDescription (B).
+            // Int16 nparams, Int32[nparams] type_oids.
+            let count = p.read_i16()?;
+            let count = nonneg_usize(count, "parameter description count")?;
+            let mut type_oids = Vec::with_capacity(count.min(64));
+            for _ in 0..count {
+                type_oids.push(p.read_u32()?);
+            }
+            p.ensure_drained()?;
+            BackendMessage::ParameterDescription { type_oids }
+        }
+        b's' => {
+            // Spec §55.7: PortalSuspended (B). No payload.
+            p.ensure_drained()?;
+            BackendMessage::PortalSuspended
+        }
+        b'G' => {
+            // Spec §55.7: CopyInResponse (B).
+            // Int8 overall_format, Int16 ncols, Int16[ncols] col_formats.
+            let overall_format = p.read_u8()?;
+            let ncols = p.read_i16()?;
+            let ncols = nonneg_usize(ncols, "copy-in column count")?;
+            let mut column_formats = Vec::with_capacity(ncols.min(64));
+            for _ in 0..ncols {
+                column_formats.push(p.read_u16()?);
+            }
+            p.ensure_drained()?;
+            BackendMessage::CopyInResponse {
+                overall_format,
+                column_formats,
+            }
+        }
+        b'H' => {
+            // Spec §55.7: CopyOutResponse (B).
+            // Int8 overall_format, Int16 ncols, Int16[ncols] col_formats.
+            let overall_format = p.read_u8()?;
+            let ncols = p.read_i16()?;
+            let ncols = nonneg_usize(ncols, "copy-out column count")?;
+            let mut column_formats = Vec::with_capacity(ncols.min(64));
+            for _ in 0..ncols {
+                column_formats.push(p.read_u16()?);
+            }
+            p.ensure_drained()?;
+            BackendMessage::CopyOutResponse {
+                overall_format,
+                column_formats,
+            }
+        }
+        b'd' => {
+            // Spec §55.7: CopyData (F&B). All remaining payload bytes.
+            let data = p.read_remaining();
+            BackendMessage::CopyData(data)
+        }
+        b'c' => {
+            // Spec §55.7: CopyDone (F&B). No payload.
+            p.ensure_drained()?;
+            BackendMessage::CopyDone
         }
         other => return Err(ProtocolError::UnknownMessageType(other)),
     };
@@ -697,6 +956,32 @@ fn write_error_fields(buf: &mut BytesMut, fields: &[(u8, String)]) {
 }
 
 // ---------------------------------------------------------------------------
+// DescribeKind ↔ wire byte helpers
+// ---------------------------------------------------------------------------
+
+/// Encode a [`DescribeKind`] to its 1-byte wire representation.
+///
+/// `Statement` → `b'S'`, `Portal` → `b'P'` per the PostgreSQL spec.
+const fn describe_kind_byte(kind: DescribeKind) -> u8 {
+    match kind {
+        DescribeKind::Statement => b'S',
+        DescribeKind::Portal => b'P',
+    }
+}
+
+/// Decode a [`DescribeKind`] from its 1-byte wire representation.
+///
+/// Returns [`ProtocolError::Malformed`] for any byte other than `b'S'`
+/// or `b'P'`.
+const fn describe_kind_from_byte(b: u8) -> Result<DescribeKind, ProtocolError> {
+    match b {
+        b'S' => Ok(DescribeKind::Statement),
+        b'P' => Ok(DescribeKind::Portal),
+        _ => Err(ProtocolError::Malformed("describe/close kind byte")),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Integer-conversion helpers that surface protocol errors rather than
 // panic on bad input.
 // ---------------------------------------------------------------------------
@@ -774,6 +1059,16 @@ impl<'a> PayloadReader<'a> {
         let mut out = [0_u8; 2];
         self.read_exact(&mut out)?;
         Ok(u16::from_be_bytes(out))
+    }
+
+    /// Consume and return all remaining bytes in the payload.
+    ///
+    /// Used for variable-length opaque payloads such as `CopyData`
+    /// where the entire framed body is the data.
+    fn read_remaining(&mut self) -> Vec<u8> {
+        let v = self.bytes.to_vec();
+        self.bytes = &[];
+        v
     }
 
     fn read_u32(&mut self) -> Result<u32, ProtocolError> {
@@ -967,7 +1262,7 @@ mod tests {
     #[test]
     fn describe_statement_round_trip() {
         let msg = FrontendMessage::Describe {
-            kind: b'S',
+            kind: DescribeKind::Statement,
             name: "stmt1".into(),
         };
         assert_eq!(round_trip_frontend(&msg), msg);
@@ -976,7 +1271,7 @@ mod tests {
     #[test]
     fn describe_portal_round_trip() {
         let msg = FrontendMessage::Describe {
-            kind: b'P',
+            kind: DescribeKind::Portal,
             name: String::new(),
         };
         assert_eq!(round_trip_frontend(&msg), msg);
@@ -1316,7 +1611,7 @@ mod tests {
         buf.put_u8(b'D');
         // length = 4 + 1 (kind) + 1 (NUL for empty name) = 6
         buf.put_i32(6);
-        buf.put_u8(b'X'); // not S or P
+        buf.put_u8(b'X'); // not S or P — must be rejected
         buf.put_u8(0);
         let err = decode_frontend(&mut buf).unwrap_err();
         assert!(matches!(err, ProtocolError::Malformed(_)));
@@ -1419,5 +1714,423 @@ mod tests {
             matches!(err, ProtocolError::Malformed(_) | ProtocolError::Truncated),
             "got {err:?}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Extended Query Protocol — frontend messages
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn close_statement_round_trip() {
+        let msg = FrontendMessage::Close {
+            kind: DescribeKind::Statement,
+            name: "my_stmt".into(),
+        };
+        assert_eq!(round_trip_frontend(&msg), msg);
+    }
+
+    #[test]
+    fn close_portal_round_trip() {
+        let msg = FrontendMessage::Close {
+            kind: DescribeKind::Portal,
+            name: String::new(),
+        };
+        assert_eq!(round_trip_frontend(&msg), msg);
+    }
+
+    #[test]
+    fn close_invalid_kind_rejected() {
+        // Hand-build a Close ('C') with an invalid kind byte.
+        // length = 4 + 1 (kind) + 1 (NUL for empty name) = 6
+        let mut buf = BytesMut::new();
+        buf.put_u8(b'C');
+        buf.put_i32(6);
+        buf.put_u8(b'Z'); // not S or P
+        buf.put_u8(0);
+        let err = decode_frontend(&mut buf).unwrap_err();
+        assert!(matches!(err, ProtocolError::Malformed(_)));
+    }
+
+    #[test]
+    fn flush_round_trip() {
+        assert_eq!(
+            round_trip_frontend(&FrontendMessage::Flush),
+            FrontendMessage::Flush
+        );
+    }
+
+    #[test]
+    fn copy_data_frontend_round_trip() {
+        let msg = FrontendMessage::CopyData(b"row1\trow2\n".to_vec());
+        assert_eq!(round_trip_frontend(&msg), msg);
+    }
+
+    #[test]
+    fn copy_data_frontend_empty_round_trip() {
+        let msg = FrontendMessage::CopyData(Vec::new());
+        assert_eq!(round_trip_frontend(&msg), msg);
+    }
+
+    #[test]
+    fn copy_done_frontend_round_trip() {
+        assert_eq!(
+            round_trip_frontend(&FrontendMessage::CopyDone),
+            FrontendMessage::CopyDone
+        );
+    }
+
+    #[test]
+    fn copy_fail_round_trip() {
+        let msg = FrontendMessage::CopyFail("client aborted COPY".into());
+        assert_eq!(round_trip_frontend(&msg), msg);
+    }
+
+    #[test]
+    fn copy_fail_empty_message_round_trip() {
+        let msg = FrontendMessage::CopyFail(String::new());
+        assert_eq!(round_trip_frontend(&msg), msg);
+    }
+
+    #[test]
+    fn function_call_round_trip() {
+        let msg = FrontendMessage::FunctionCall {
+            function_oid: 1234,
+            arg_formats: vec![0, 1],
+            args: vec![Some(b"hello".to_vec()), None, Some(b"world".to_vec())],
+            result_format: 0,
+        };
+        assert_eq!(round_trip_frontend(&msg), msg);
+    }
+
+    #[test]
+    fn function_call_no_args_round_trip() {
+        let msg = FrontendMessage::FunctionCall {
+            function_oid: 42,
+            arg_formats: vec![],
+            args: vec![],
+            result_format: 1,
+        };
+        assert_eq!(round_trip_frontend(&msg), msg);
+    }
+
+    /// Realistic specimen: named statement + named portal, several text
+    /// params, mixed result formats. Exercises the full Bind/Describe/
+    /// Execute/Close pipeline in one buffer.
+    #[test]
+    fn extended_query_pipeline_specimen() {
+        let parse = FrontendMessage::Parse {
+            name: "get_user".into(),
+            sql: "SELECT id, name FROM users WHERE id = $1".into(),
+            param_types: vec![23],
+        };
+        let bind = FrontendMessage::Bind {
+            portal_name: "p_get_user".into(),
+            statement_name: "get_user".into(),
+            params: vec![Some(b"42".to_vec())],
+            result_formats: vec![0, 0],
+        };
+        let describe = FrontendMessage::Describe {
+            kind: DescribeKind::Portal,
+            name: "p_get_user".into(),
+        };
+        let execute = FrontendMessage::Execute {
+            portal: "p_get_user".into(),
+            max_rows: 0,
+        };
+        let close = FrontendMessage::Close {
+            kind: DescribeKind::Portal,
+            name: "p_get_user".into(),
+        };
+
+        for msg in &[parse, bind, describe, execute, close, FrontendMessage::Sync] {
+            assert_eq!(round_trip_frontend(msg), *msg);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Extended Query Protocol — truncation rejection for new frontend
+    // messages.
+    // -------------------------------------------------------------------
+
+    /// Every prefix of a Close message shorter than the full encoding
+    /// must return `Ok(None)` without consuming any bytes.
+    #[test]
+    fn close_truncated_returns_none() {
+        let msg = FrontendMessage::Close {
+            kind: DescribeKind::Statement,
+            name: "stmt".into(),
+        };
+        let mut full = BytesMut::new();
+        encode_frontend(&msg, &mut full);
+        for cut in 0..full.len() {
+            let mut buf = BytesMut::from(&full[..cut]);
+            let before = buf.len();
+            let result = decode_frontend(&mut buf).expect("no protocol error on prefix");
+            assert!(result.is_none(), "expected None at cut={cut}");
+            assert_eq!(buf.len(), before, "consumed bytes at cut={cut}");
+        }
+    }
+
+    /// Every prefix of a `CopyFail` message shorter than the full encoding
+    /// must return `Ok(None)`.
+    #[test]
+    fn copy_fail_truncated_returns_none() {
+        let msg = FrontendMessage::CopyFail("something went wrong".into());
+        let mut full = BytesMut::new();
+        encode_frontend(&msg, &mut full);
+        for cut in 0..full.len() {
+            let mut buf = BytesMut::from(&full[..cut]);
+            let before = buf.len();
+            let result = decode_frontend(&mut buf).expect("no protocol error on prefix");
+            assert!(result.is_none(), "expected None at cut={cut}");
+            assert_eq!(buf.len(), before);
+        }
+    }
+
+    /// Every prefix of a `FunctionCall` message must return `Ok(None)`.
+    #[test]
+    fn function_call_truncated_returns_none() {
+        let msg = FrontendMessage::FunctionCall {
+            function_oid: 99,
+            arg_formats: vec![0],
+            args: vec![Some(b"arg".to_vec())],
+            result_format: 0,
+        };
+        let mut full = BytesMut::new();
+        encode_frontend(&msg, &mut full);
+        for cut in 0..full.len() {
+            let mut buf = BytesMut::from(&full[..cut]);
+            let before = buf.len();
+            let result = decode_frontend(&mut buf).expect("no protocol error on prefix");
+            assert!(result.is_none(), "expected None at cut={cut}");
+            assert_eq!(buf.len(), before);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Extended Query Protocol — golden-bytes tests (byte-exact layout).
+    // -------------------------------------------------------------------
+
+    /// Golden bytes test for `Flush`.
+    ///
+    /// `Flush` must encode as exactly: `b'H'` (1 byte) + `0x00_00_00_04`
+    /// (i32 BE length = 4, no payload). This pins the spec-mandated
+    /// wire layout so a regression in `write_tagged` is caught
+    /// immediately.
+    #[test]
+    fn flush_golden_bytes() {
+        let mut buf = BytesMut::new();
+        encode_frontend(&FrontendMessage::Flush, &mut buf);
+        // tag + length(4)
+        assert_eq!(&buf[..], &[b'H', 0, 0, 0, 4]);
+    }
+
+    /// Golden bytes test for `ParseComplete`.
+    ///
+    /// `ParseComplete` must encode as: `b'1'` + `0x00_00_00_04`.
+    #[test]
+    fn parse_complete_golden_bytes() {
+        let mut buf = BytesMut::new();
+        encode_backend(&BackendMessage::ParseComplete, &mut buf);
+        assert_eq!(&buf[..], &[b'1', 0, 0, 0, 4]);
+    }
+
+    /// Golden bytes test for a small `CopyData` payload.
+    ///
+    /// For `CopyData(b"AB")`:
+    /// - tag `b'd'` (1 byte)
+    /// - length = 4 (length field) + 2 (payload) = 6, encoded big-endian
+    /// - payload `b'A'`, `b'B'`
+    #[test]
+    fn copy_data_frontend_golden_bytes() {
+        let mut buf = BytesMut::new();
+        encode_frontend(&FrontendMessage::CopyData(b"AB".to_vec()), &mut buf);
+        assert_eq!(&buf[..], &[b'd', 0, 0, 0, 6, b'A', b'B']);
+    }
+
+    /// Decode the same hand-rolled `CopyData` bytes and assert the
+    /// decoded message matches.
+    #[test]
+    fn copy_data_frontend_golden_decode() {
+        // tag='d', length=6, data="AB"
+        let raw: &[u8] = &[b'd', 0, 0, 0, 6, b'A', b'B'];
+        let mut buf = BytesMut::from(raw);
+        let msg = decode_frontend(&mut buf).unwrap().unwrap();
+        assert_eq!(msg, FrontendMessage::CopyData(b"AB".to_vec()));
+        assert!(buf.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Extended Query Protocol — backend messages
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parse_complete_round_trip() {
+        assert_eq!(
+            round_trip_backend(&BackendMessage::ParseComplete),
+            BackendMessage::ParseComplete
+        );
+    }
+
+    #[test]
+    fn bind_complete_round_trip() {
+        assert_eq!(
+            round_trip_backend(&BackendMessage::BindComplete),
+            BackendMessage::BindComplete
+        );
+    }
+
+    #[test]
+    fn close_complete_round_trip() {
+        assert_eq!(
+            round_trip_backend(&BackendMessage::CloseComplete),
+            BackendMessage::CloseComplete
+        );
+    }
+
+    #[test]
+    fn no_data_round_trip() {
+        assert_eq!(
+            round_trip_backend(&BackendMessage::NoData),
+            BackendMessage::NoData
+        );
+    }
+
+    #[test]
+    fn parameter_description_round_trip() {
+        let msg = BackendMessage::ParameterDescription {
+            type_oids: vec![23, 25, 700],
+        };
+        assert_eq!(round_trip_backend(&msg), msg);
+    }
+
+    #[test]
+    fn parameter_description_empty_round_trip() {
+        let msg = BackendMessage::ParameterDescription { type_oids: vec![] };
+        assert_eq!(round_trip_backend(&msg), msg);
+    }
+
+    #[test]
+    fn portal_suspended_round_trip() {
+        assert_eq!(
+            round_trip_backend(&BackendMessage::PortalSuspended),
+            BackendMessage::PortalSuspended
+        );
+    }
+
+    #[test]
+    fn copy_in_response_round_trip() {
+        let msg = BackendMessage::CopyInResponse {
+            overall_format: 0,
+            column_formats: vec![0, 0, 0],
+        };
+        assert_eq!(round_trip_backend(&msg), msg);
+    }
+
+    #[test]
+    fn copy_in_response_binary_round_trip() {
+        let msg = BackendMessage::CopyInResponse {
+            overall_format: 1,
+            column_formats: vec![1, 0, 1],
+        };
+        assert_eq!(round_trip_backend(&msg), msg);
+    }
+
+    #[test]
+    fn copy_out_response_round_trip() {
+        let msg = BackendMessage::CopyOutResponse {
+            overall_format: 0,
+            column_formats: vec![0, 1],
+        };
+        assert_eq!(round_trip_backend(&msg), msg);
+    }
+
+    #[test]
+    fn copy_data_backend_round_trip() {
+        let msg = BackendMessage::CopyData(b"col1\tcol2\n".to_vec());
+        assert_eq!(round_trip_backend(&msg), msg);
+    }
+
+    #[test]
+    fn copy_data_backend_empty_round_trip() {
+        let msg = BackendMessage::CopyData(Vec::new());
+        assert_eq!(round_trip_backend(&msg), msg);
+    }
+
+    #[test]
+    fn copy_done_backend_round_trip() {
+        assert_eq!(
+            round_trip_backend(&BackendMessage::CopyDone),
+            BackendMessage::CopyDone
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Backend truncation rejection for new message types.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn parameter_description_truncated_returns_none() {
+        let msg = BackendMessage::ParameterDescription {
+            type_oids: vec![23, 25],
+        };
+        let mut full = BytesMut::new();
+        encode_backend(&msg, &mut full);
+        for cut in 0..full.len() {
+            let mut buf = BytesMut::from(&full[..cut]);
+            let before = buf.len();
+            let result = decode_backend(&mut buf).expect("no protocol error on prefix");
+            assert!(result.is_none(), "expected None at cut={cut}");
+            assert_eq!(buf.len(), before);
+        }
+    }
+
+    #[test]
+    fn copy_in_response_truncated_returns_none() {
+        let msg = BackendMessage::CopyInResponse {
+            overall_format: 0,
+            column_formats: vec![0, 0],
+        };
+        let mut full = BytesMut::new();
+        encode_backend(&msg, &mut full);
+        for cut in 0..full.len() {
+            let mut buf = BytesMut::from(&full[..cut]);
+            let before = buf.len();
+            let result = decode_backend(&mut buf).expect("no protocol error on prefix");
+            assert!(result.is_none(), "expected None at cut={cut}");
+            assert_eq!(buf.len(), before);
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Property test: Parse round-trips with arbitrary query strings
+    // and param-type vectors.
+    // -------------------------------------------------------------------
+
+    proptest::proptest! {
+        /// Arbitrary `Parse` messages round-trip identically through
+        /// encode → decode. Covers query strings up to 1 KiB and
+        /// param-type vectors up to 16 entries.
+        #[test]
+        fn parse_round_trips_arbitrary(
+            name in "[a-zA-Z_][a-zA-Z0-9_]{0,31}",
+            // Query strings with printable ASCII (excluding NUL which is
+            // the cstring terminator and therefore illegal on the wire).
+            sql in "[\\x01-\\x7e]{0,1024}",
+            param_types in proptest::collection::vec(0_u32..=0xFFFF_u32, 0..=16),
+        ) {
+            let msg = FrontendMessage::Parse {
+                name,
+                sql,
+                param_types,
+            };
+            let mut buf = BytesMut::new();
+            encode_frontend(&msg, &mut buf);
+            let decoded = decode_frontend(&mut buf)
+                .expect("decode ok")
+                .expect("some");
+            proptest::prop_assert_eq!(decoded, msg);
+            proptest::prop_assert!(buf.is_empty());
+        }
     }
 }

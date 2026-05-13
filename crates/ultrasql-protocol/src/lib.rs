@@ -43,4 +43,4 @@ pub mod messages;
 
 pub use codec::{decode_backend, decode_frontend, encode_backend, encode_frontend};
 pub use error::ProtocolError;
-pub use messages::{BackendMessage, FieldDescription, FrontendMessage};
+pub use messages::{BackendMessage, DescribeKind, FieldDescription, FrontendMessage};

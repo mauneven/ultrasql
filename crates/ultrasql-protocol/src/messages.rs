@@ -24,6 +24,20 @@
 //! the byte-order translation so the typed messages exposed here look
 //! like ordinary host-endian values.
 
+/// Selector byte used in [`FrontendMessage::Describe`] and
+/// [`FrontendMessage::Close`] to distinguish between a named prepared
+/// statement and a named portal.
+///
+/// PostgreSQL wire spec: the byte `b'S'` means "statement";
+/// the byte `b'P'` means "portal". These are the only two legal values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DescribeKind {
+    /// Describe or close a named prepared statement (`b'S'`).
+    Statement,
+    /// Describe or close a named portal (`b'P'`).
+    Portal,
+}
+
 /// Per-column field description in a [`BackendMessage::RowDescription`].
 ///
 /// All offsets and OIDs are PostgreSQL-compatible. `type_size` is
@@ -121,8 +135,8 @@ pub enum FrontendMessage {
 
     /// Describe (`'D'`): request metadata about a portal or statement.
     Describe {
-        /// `b'S'` to describe a statement, `b'P'` to describe a portal.
-        kind: u8,
+        /// Whether to describe a prepared statement or a portal.
+        kind: DescribeKind,
         /// Name of the target portal or statement.
         name: String,
     },
@@ -149,6 +163,62 @@ pub enum FrontendMessage {
         /// Password bytes (cleartext or hashed, depending on the
         /// authentication request the server sent).
         password: String,
+    },
+
+    /// Close (`'C'`): destroy a named prepared statement or portal.
+    ///
+    /// After a `Close` the server replies with
+    /// [`BackendMessage::CloseComplete`] (or [`BackendMessage::ErrorResponse`]
+    /// if the named object does not exist and the server chooses to
+    /// surface the error).
+    Close {
+        /// Whether to close a prepared statement or a portal.
+        kind: DescribeKind,
+        /// Name of the statement or portal to close; empty string names
+        /// the unnamed object.
+        name: String,
+    },
+
+    /// Flush (`'H'`): request that the server flush any pending output.
+    ///
+    /// The server sends all queued outgoing messages without waiting for
+    /// the next `Sync`. Flush does not change the transaction state.
+    Flush,
+
+    /// `CopyData` (`'d'`): a block of data in a COPY stream.
+    ///
+    /// In a COPY FROM STDIN flow the client sends one or more
+    /// `CopyData` messages followed by a [`Self::CopyDone`] or
+    /// [`Self::CopyFail`]. The payload is opaque bytes; their meaning
+    /// is determined by the COPY format negotiated earlier.
+    CopyData(Vec<u8>),
+
+    /// `CopyDone` (`'c'`): signals the end of a successful COPY FROM STDIN stream.
+    CopyDone,
+
+    /// `CopyFail` (`'f'`): signals that the client-side COPY FROM STDIN
+    /// operation failed.
+    ///
+    /// The string is a human-readable error message. The server will
+    /// abort the COPY and return an `ErrorResponse`.
+    CopyFail(String),
+
+    /// `FunctionCall` (`'F'`): invoke a server-side function via the
+    /// legacy function-call sub-protocol.
+    ///
+    /// UltraSQL decodes the message tag and payload length but does not
+    /// implement the sub-protocol. The dispatcher returns
+    /// `ErrorResponse` with `SQLSTATE 0A000` (feature not supported)
+    /// when this variant is received.
+    FunctionCall {
+        /// OID of the function to call.
+        function_oid: u32,
+        /// Per-argument format codes (`0` = text, `1` = binary).
+        arg_formats: Vec<u16>,
+        /// Argument values; `None` is SQL NULL.
+        args: Vec<Option<Vec<u8>>>,
+        /// Result format code (`0` = text, `1` = binary).
+        result_format: u16,
     },
 }
 
@@ -242,4 +312,63 @@ pub enum BackendMessage {
         /// `(field_type, value)` pairs in transmission order.
         fields: Vec<(u8, String)>,
     },
+
+    /// `ParseComplete` (`'1'`): the `Parse` step of the Extended Query
+    /// protocol succeeded and the statement is ready to be bound.
+    ParseComplete,
+
+    /// `BindComplete` (`'2'`): the `Bind` step of the Extended Query
+    /// protocol succeeded and the portal is ready to be executed.
+    BindComplete,
+
+    /// `CloseComplete` (`'3'`): a `Close` message was processed
+    /// successfully.
+    CloseComplete,
+
+    /// `NoData` (`'n'`): sent in response to a `Describe` when the
+    /// statement or portal produces no row data (e.g. `INSERT`, `UPDATE`,
+    /// `DELETE`, `SET`, `CREATE TABLE`, …).
+    NoData,
+
+    /// `ParameterDescription` (`'t'`): sent in response to a `Describe`
+    /// of a prepared statement. Lists the OIDs of the statement's
+    /// parameter types in declaration order.
+    ParameterDescription {
+        /// Parameter type OIDs, in declaration order. An empty vector
+        /// means the statement has no parameters.
+        type_oids: Vec<u32>,
+    },
+
+    /// `PortalSuspended` (`'s'`): returned by `Execute` when the
+    /// portal's row limit was reached before the query ran to
+    /// completion. The portal remains open; a subsequent `Execute` will
+    /// resume from where it was suspended.
+    PortalSuspended,
+
+    /// `CopyInResponse` (`'G'`): the server is requesting a
+    /// COPY FROM STDIN data stream from the client.
+    CopyInResponse {
+        /// Overall copy format: `0` = text, `1` = binary.
+        overall_format: u8,
+        /// Per-column format codes (`0` = text, `1` = binary).
+        column_formats: Vec<u16>,
+    },
+
+    /// `CopyOutResponse` (`'H'`): the server is initiating a
+    /// COPY TO STDOUT data stream to the client.
+    CopyOutResponse {
+        /// Overall copy format: `0` = text, `1` = binary.
+        overall_format: u8,
+        /// Per-column format codes (`0` = text, `1` = binary).
+        column_formats: Vec<u16>,
+    },
+
+    /// `CopyData` (`'d'`): a block of data in a COPY stream from the
+    /// server to the client. Follows a [`Self::CopyOutResponse`]; ends
+    /// with a [`Self::CopyDone`] or [`Self::ErrorResponse`].
+    CopyData(Vec<u8>),
+
+    /// `CopyDone` (`'c'`): signals the end of a COPY stream from the
+    /// server to the client.
+    CopyDone,
 }
