@@ -19,6 +19,14 @@
 //! --------------------------
 //!
 //! - [`MemTableScan`] — leaf operator emitting pre-built in-memory batches.
+//!   Used as a unit-test fixture for downstream operator tests; production
+//!   scans use [`SeqScan`] instead.
+//! - [`SeqScan`] — sequential heap scan backed by the storage subsystem.
+//!   Drives [`ultrasql_storage::HeapAccess::scan_visible`] with MVCC
+//!   visibility, decodes tuple payloads via [`RowCodec`], and emits
+//!   4096-row [`ultrasql_vec::Batch`]es.
+//! - [`RowCodec`] — stable v0.5 binary codec for translating between
+//!   `Vec<Value>` rows and the byte payloads stored on heap pages.
 //! - [`FilterEqI32`] — predicate filter for `col == const_i32` (placeholder
 //!   pending the general expression-eval module).
 //! - [`Project`] — column projection.
@@ -31,6 +39,8 @@ mod limit;
 mod mem_table_scan;
 pub mod physical;
 mod project;
+mod row_codec;
+mod seq_scan;
 
 use std::fmt::Debug;
 
@@ -41,6 +51,8 @@ pub use filter::FilterEqI32;
 pub use limit::Limit;
 pub use mem_table_scan::MemTableScan;
 pub use project::Project;
+pub use row_codec::{RowCodec, RowCodecError};
+pub use seq_scan::{SeqScan, build_batch};
 
 /// Errors raised by the executor.
 ///

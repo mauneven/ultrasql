@@ -27,4 +27,7 @@ tracing            = { workspace = true }
 ahash              = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+proptest            = { workspace = true }
+parking_lot         = { workspace = true }
+ultrasql-mvcc       = { workspace = true, features = ["testing"] }
+ultrasql-storage    = { workspace = true, features = ["testing"] }

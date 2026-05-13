@@ -1768,6 +1768,7 @@ version = "0.0.1"
 dependencies = [
  "ahash",
  "crossbeam",
+ "parking_lot",
  "proptest",
  "smallvec",
  "thiserror",

@@ -39,9 +39,9 @@
 
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_parser::ast::{
-    Assignment, BinaryOp, ConflictTarget as AstConflictTarget, DeleteStmt, Expr, InsertSource,
-    InsertStmt, Literal, NullsOrder, ObjectName, OnConflict, OrderItem, SelectItem, SelectStmt,
-    SortDirection, Statement, TableRef, TruncateStmt, UnaryOp, UpdateStmt,
+    Assignment, BinaryOp, ConflictTarget as AstConflictTarget, DeleteStmt, Distinct, Expr,
+    InsertSource, InsertStmt, Literal, NullsOrder, ObjectName, OnConflict, OrderItem, SelectItem,
+    SelectStmt, SortDirection, Statement, TableRef, TruncateStmt, UnaryOp, UpdateStmt,
 };
 
 use crate::catalog::Catalog;
@@ -476,13 +476,13 @@ fn bind_truncate(s: &TruncateStmt, catalog: &dyn Catalog) -> Result<LogicalPlan,
 // ---------------------------------------------------------------------------
 
 fn bind_select(select: &SelectStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
-    if select.distinct {
+    if !matches!(select.distinct, Distinct::All) {
         return Err(PlanError::NotSupported("SELECT DISTINCT"));
     }
 
     // FROM clause. We currently support a single named relation.
-    let mut plan = match &select.from {
-        Some(TableRef::Named { name, .. }) => {
+    let mut plan = match select.from.as_slice() {
+        [TableRef::Named { name, .. }] => {
             let table_name = name
                 .parts
                 .last()
@@ -496,10 +496,11 @@ fn bind_select(select: &SelectStmt, catalog: &dyn Catalog) -> Result<LogicalPlan
                 projection: None,
             }
         }
-        Some(_) => return Err(PlanError::NotSupported("FROM clause variant")),
-        None => LogicalPlan::Empty {
+        [_] => return Err(PlanError::NotSupported("FROM clause variant")),
+        [] => LogicalPlan::Empty {
             schema: Schema::empty(),
         },
+        _ => return Err(PlanError::NotSupported("multiple FROM items")),
     };
 
     // WHERE.
