@@ -1,0 +1,1 @@
+SELECT CASE WHEN a>0 THEN 'pos' ELSE 'np' END, COALESCE(b, c), x BETWEEN 1 AND 10, a::text || ' ' || b->>'k' FROM t

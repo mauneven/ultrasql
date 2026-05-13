@@ -1,0 +1,1 @@
+SELECT * FROM t WHERE name ~ '^foo' AND email !~* '@bar'

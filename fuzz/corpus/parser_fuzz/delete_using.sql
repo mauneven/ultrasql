@@ -1,0 +1,1 @@
+DELETE FROM t USING other WHERE t.k = other.k

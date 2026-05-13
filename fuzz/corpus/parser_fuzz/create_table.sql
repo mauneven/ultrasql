@@ -1,0 +1,1 @@
+CREATE TABLE t (id int PRIMARY KEY, name text NOT NULL DEFAULT 'x')

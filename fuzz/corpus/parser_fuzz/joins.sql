@@ -1,0 +1,1 @@
+SELECT * FROM a JOIN b ON a.id = b.aid LEFT JOIN c USING (k)

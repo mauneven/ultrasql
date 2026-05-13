@@ -17,6 +17,9 @@ members = [
     "crates/ultrasql-cli",
     "crates/ultrasql-bench",
 ]
+# fuzz/ is its own standalone crate requiring a nightly toolchain; exclude
+# it from the workspace so `cargo test --workspace` does not pull it in.
+exclude = ["fuzz"]
 default-members = ["crates/ultrasql-server", "crates/ultrasql-cli"]
 
 [workspace.package]

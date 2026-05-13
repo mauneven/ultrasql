@@ -1,0 +1,4 @@
+# Crash reproducers written by libfuzzer — commit them manually alongside a fix.
+artifacts/
+# cargo-fuzz build output
+target/

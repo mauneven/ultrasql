@@ -1,0 +1,1 @@
+SELECT 'héllo', 'こんにちは', '🎉' FROM t

@@ -1,0 +1,1 @@
+SELECT a[1], a[2:5] FROM t

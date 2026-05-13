@@ -36,10 +36,11 @@ coverage/
 lcov.info
 tarpaulin-report.html
 
-# Fuzz
-fuzz/corpus/
+# Fuzz — seed corpus in fuzz/corpus/ IS committed (see AGENTS.md §8).
+# Only build output and crash artefacts are ignored.
 fuzz/artifacts/
 fuzz/coverage/
+fuzz/target/
 
 # Local secrets / config
 .env

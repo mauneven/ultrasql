@@ -108,4 +108,27 @@ else
     _run_regression_gate
 fi
 
+# ---------------------------------------------------------------------------
+# Parser fuzz smoke (15 s, nightly only)
+# ---------------------------------------------------------------------------
+#
+# Runs the parser_fuzz target for a short wall-clock budget to catch
+# obvious panics before they reach CI. Skipped silently when:
+#   - no nightly toolchain is installed, or
+#   - cargo-fuzz is not installed.
+#
+# This is a smoke check only; the full 24h CI-clean gate required by
+# ROADMAP §"v0.2" runs in CI, not here.
+
+if rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
+    step "parser fuzz smoke (15s)"
+    if command -v cargo-fuzz >/dev/null 2>&1; then
+        (cd fuzz && cargo +nightly fuzz run parser_fuzz -- -max_total_time=15) || exit 1
+    else
+        printf "   cargo-fuzz not installed — skipped\n"
+    fi
+else
+    printf "\n\033[1;33m== fuzz smoke skipped (no nightly toolchain) ==\033[0m\n"
+fi
+
 printf "\n\033[1;32m== all gates green; push allowed ==\033[0m\n"
