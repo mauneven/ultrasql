@@ -34,6 +34,8 @@ mod error;
 pub mod rules;
 pub mod stats;
 
+pub use cost::{CostEstimate, CostGucs, CostModel, NoStats, StatsSource};
+pub use enumeration::{JoinEnumerator, Memo, PhysicalOp, choose_enumerator};
 pub use error::OptimizeError;
 pub use rules::{RewriteRule, RuleSet};
 pub use stats::{
