@@ -57,3 +57,7 @@ harness = false
 [[bench]]
 name = "storage_extras"
 harness = false
+
+[[bench]]
+name = "v08"
+harness = false

@@ -1149,6 +1149,563 @@ impl<L: PageLoader, K: Key> RangeIter<'_, L, K> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Backward range iterator (reverse scan)
+// ---------------------------------------------------------------------------
+
+/// Backward range iterator — yields `(key, TupleId)` pairs in
+/// *descending* key order from `start` (inclusive) down to `end`
+/// (exclusive if provided, unbounded otherwise).
+///
+/// The implementation collects all leaf entries in the range with a
+/// forward scan and then reverses the result. A production
+/// implementation would walk the sibling chain right-to-left using a
+/// doubly-linked leaf list; that optimization is
+/// `TODO(btree-backward-efficient)`.
+pub struct BackwardRangeIter<'a, L: PageLoader, K: Key> {
+    /// Items collected from the forward scan, in ascending order.
+    items: Vec<(K, TupleId)>,
+    /// Current position (counts down).
+    pos: usize,
+    _tree: std::marker::PhantomData<&'a BTree<L>>,
+}
+
+impl<L: PageLoader, K: Key> std::fmt::Debug for BackwardRangeIter<'_, L, K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackwardRangeIter")
+            .field("remaining", &self.pos)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<L: PageLoader, K: Key> Iterator for BackwardRangeIter<'_, L, K> {
+    type Item = Result<(K, TupleId), BTreeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos == 0 {
+            return None;
+        }
+        self.pos -= 1;
+        Some(Ok(self.items[self.pos]))
+    }
+}
+
+impl<L: PageLoader> BTree<L> {
+    /// Backward (descending) range scan.
+    ///
+    /// Yields `(key, TupleId)` pairs in descending key order starting
+    /// from `start` (inclusive) down to `end` (exclusive if `Some`,
+    /// unbounded if `None`).
+    ///
+    /// The iterator collects the forward range into a `Vec` and
+    /// reverses it.  `TODO(btree-backward-efficient)`: walk the leaf
+    /// chain right-to-left once the leaf list is doubly-linked.
+    pub fn backward_scan<K: Key>(
+        &self,
+        start: K,
+        end: Option<K>,
+    ) -> Result<BackwardRangeIter<'_, L, K>, BTreeError> {
+        // Collect forward scan.
+        let items: Vec<(K, TupleId)> = self
+            .range_scan::<K>(
+                end.unwrap_or(start),
+                if end.is_some() { None } else { None },
+            )
+            .filter_map(std::result::Result::ok)
+            .filter(|(k, _)| end.is_none_or(|e| *k >= e) && *k <= start)
+            .collect();
+        // range_scan walks ascending; reverse in memory.
+        let mut items = items;
+        items.reverse();
+        let pos = items.len();
+        Ok(BackwardRangeIter {
+            items,
+            pos,
+            _tree: std::marker::PhantomData,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-column key support
+// ---------------------------------------------------------------------------
+
+/// A composite key made of multiple fixed-width components.
+///
+/// Each component is an `i64` value. The composite key encodes all
+/// components concatenated in little-endian order, making the encoding
+/// length `N * 8` bytes.
+///
+/// v0.8 restricts component count to 1–8 (yielding 8–64 bytes). The
+/// existing `BTree` `Key` trait requires `SIZE == 8`; composite keys
+/// bypass that restriction by using the byte-slice `AccessMethod`
+/// interface instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CompositeKey<const N: usize> {
+    /// Component values in declaration order.
+    pub values: [i64; N],
+}
+
+impl<const N: usize> CompositeKey<N> {
+    /// Construct a composite key from an array of `i64` values.
+    #[must_use]
+    pub const fn new(values: [i64; N]) -> Self {
+        Self { values }
+    }
+
+    /// Encode the composite key into a byte buffer.
+    ///
+    /// The buffer must be exactly `N * 8` bytes long.
+    pub fn encode_into(&self, out: &mut [u8]) {
+        assert_eq!(out.len(), N * 8, "buffer length must equal N*8");
+        for (i, &v) in self.values.iter().enumerate() {
+            write_i64_le(&mut out[i * 8..i * 8 + 8], v);
+        }
+    }
+
+    /// Decode a composite key from a byte buffer.
+    pub fn decode_from(bytes: &[u8]) -> Self {
+        assert_eq!(bytes.len(), N * 8, "buffer length must equal N*8");
+        let mut values = [0_i64; N];
+        for (i, v) in values.iter_mut().enumerate() {
+            *v = read_i64_le(&bytes[i * 8..i * 8 + 8]).unwrap_or(0);
+        }
+        Self { values }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Expression index helper
+// ---------------------------------------------------------------------------
+
+/// An expression index stores keys computed by a caller-supplied
+/// function rather than direct column values.
+///
+/// The `ExprIndexAdapter` wraps a `BTree` (via the `AccessMethod`
+/// interface) and a key-extraction function. The caller inserts rows;
+/// the adapter extracts the key, encodes it, and forwards to the
+/// underlying index.
+///
+/// # Usage
+///
+/// ```ignore
+/// let idx = ExprIndexAdapter::new(
+///     BTreeAccessMethod::new(true),
+///     |row| {
+///         // Expression: lower(email)
+///         if let Some(Value::Text(s)) = row.get(2) {
+///             s.to_lowercase().into_bytes()
+///         } else {
+///             vec![]
+///         }
+///     },
+/// );
+/// idx.insert_row(&row, tid).unwrap();
+/// ```
+pub struct ExprIndexAdapter {
+    inner: Box<dyn crate::access_method::AccessMethod>,
+    key_fn: Box<dyn Fn(&[ultrasql_core::Value]) -> Vec<u8> + Send + Sync>,
+}
+
+impl std::fmt::Debug for ExprIndexAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExprIndexAdapter").finish_non_exhaustive()
+    }
+}
+
+impl ExprIndexAdapter {
+    /// Construct an expression index adapter.
+    ///
+    /// - `inner` — underlying access method (typically `BTreeAccessMethod`).
+    /// - `key_fn` — maps a row to the index key bytes.
+    pub fn new(
+        inner: impl crate::access_method::AccessMethod + 'static,
+        key_fn: impl Fn(&[ultrasql_core::Value]) -> Vec<u8> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: Box::new(inner),
+            key_fn: Box::new(key_fn),
+        }
+    }
+
+    /// Insert a row into the expression index.
+    pub fn insert_row(
+        &self,
+        row: &[ultrasql_core::Value],
+        tid: TupleId,
+    ) -> Result<(), crate::access_method::AccessMethodError> {
+        let key = (self.key_fn)(row);
+        self.inner.insert(&key, tid)
+    }
+
+    /// Look up a pre-encoded expression key.
+    pub fn lookup_key(
+        &self,
+        key: &[u8],
+    ) -> Result<Vec<TupleId>, crate::access_method::AccessMethodError> {
+        self.inner.lookup(key)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Partial index predicate wrapper
+// ---------------------------------------------------------------------------
+
+/// A partial index only indexes rows satisfying a predicate.
+///
+/// The `PartialIndexAdapter` wraps any `AccessMethod` and filters
+/// inserts through a WHERE-clause predicate. Rows that do not satisfy
+/// the predicate are silently skipped.
+pub struct PartialIndexAdapter {
+    inner: Box<dyn crate::access_method::AccessMethod>,
+    predicate: Box<dyn Fn(&[ultrasql_core::Value]) -> bool + Send + Sync>,
+    key_fn: Box<dyn Fn(&[ultrasql_core::Value]) -> Vec<u8> + Send + Sync>,
+}
+
+impl std::fmt::Debug for PartialIndexAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PartialIndexAdapter")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialIndexAdapter {
+    /// Construct a partial index adapter.
+    ///
+    /// - `inner` — underlying access method.
+    /// - `key_fn` — extracts the key bytes from a row.
+    /// - `predicate` — returns `true` when a row should be indexed.
+    pub fn new(
+        inner: impl crate::access_method::AccessMethod + 'static,
+        key_fn: impl Fn(&[ultrasql_core::Value]) -> Vec<u8> + Send + Sync + 'static,
+        predicate: impl Fn(&[ultrasql_core::Value]) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: Box::new(inner),
+            key_fn: Box::new(key_fn),
+            predicate: Box::new(predicate),
+        }
+    }
+
+    /// Insert a row if the predicate passes.
+    ///
+    /// Returns `Ok(())` silently when the predicate is false (the row
+    /// is not indexed).
+    pub fn insert_row(
+        &self,
+        row: &[ultrasql_core::Value],
+        tid: TupleId,
+    ) -> Result<(), crate::access_method::AccessMethodError> {
+        if !(self.predicate)(row) {
+            return Ok(()); // Row does not satisfy the partial predicate.
+        }
+        let key = (self.key_fn)(row);
+        self.inner.insert(&key, tid)
+    }
+
+    /// Look up a pre-encoded key.
+    pub fn lookup_key(
+        &self,
+        key: &[u8],
+    ) -> Result<Vec<TupleId>, crate::access_method::AccessMethodError> {
+        self.inner.lookup(key)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Covering index (INCLUDE columns) wrapper
+// ---------------------------------------------------------------------------
+
+/// Leaf payload for a covering index entry.
+///
+/// In a covering index the leaf stores the primary key columns plus
+/// additional INCLUDE columns. This struct holds the INCLUDE payload as
+/// raw bytes alongside the `TupleId`; the executor can satisfy a query
+/// without visiting the heap.
+///
+/// TODO(btree-covering-persistent): store the INCLUDE payload on the
+/// leaf page in the buffer pool rather than in memory.
+#[derive(Clone, Debug)]
+pub struct CoveringEntry {
+    /// Tuple identifier (used as a fallback when INCLUDE columns
+    /// do not satisfy the query).
+    pub tid: TupleId,
+    /// Additional INCLUDE column bytes, serialized by the caller.
+    pub include_payload: Vec<u8>,
+}
+
+/// A covering index that stores INCLUDE column payloads alongside
+/// the indexed key.
+///
+/// Keys are managed by the inner `AccessMethod`; INCLUDE payloads are
+/// stored in a side-table indexed by `TupleId`.
+pub struct CoveringIndexAdapter {
+    inner: Box<dyn crate::access_method::AccessMethod>,
+    key_fn: Box<dyn Fn(&[ultrasql_core::Value]) -> Vec<u8> + Send + Sync>,
+    include_fn: Box<dyn Fn(&[ultrasql_core::Value]) -> Vec<u8> + Send + Sync>,
+    /// INCLUDE payloads keyed by `TupleId`.
+    payloads: parking_lot::Mutex<std::collections::HashMap<u64, Vec<u8>>>,
+}
+
+impl std::fmt::Debug for CoveringIndexAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoveringIndexAdapter")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Encode a `TupleId` to a `u64` for use as a hash map key.
+fn tid_to_u64(tid: TupleId) -> u64 {
+    let rel_oid = u64::from(tid.page.relation.0.raw());
+    let block = u64::from(tid.page.block.raw());
+    let slot = u64::from(tid.slot);
+    (rel_oid << 48) | (block << 16) | slot
+}
+
+impl CoveringIndexAdapter {
+    /// Construct a covering index adapter.
+    ///
+    /// - `key_fn` — produces the key bytes from a row.
+    /// - `include_fn` — produces the INCLUDE column payload bytes.
+    pub fn new(
+        inner: impl crate::access_method::AccessMethod + 'static,
+        key_fn: impl Fn(&[ultrasql_core::Value]) -> Vec<u8> + Send + Sync + 'static,
+        include_fn: impl Fn(&[ultrasql_core::Value]) -> Vec<u8> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: Box::new(inner),
+            key_fn: Box::new(key_fn),
+            include_fn: Box::new(include_fn),
+            payloads: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Insert a row, storing the INCLUDE payload alongside the key.
+    pub fn insert_row(
+        &self,
+        row: &[ultrasql_core::Value],
+        tid: TupleId,
+    ) -> Result<(), crate::access_method::AccessMethodError> {
+        let key = (self.key_fn)(row);
+        let payload = (self.include_fn)(row);
+        self.inner.insert(&key, tid)?;
+        self.payloads.lock().insert(tid_to_u64(tid), payload);
+        Ok(())
+    }
+
+    /// Look up key + INCLUDE payloads for all matching entries.
+    pub fn lookup_covering(
+        &self,
+        key: &[u8],
+    ) -> Result<Vec<CoveringEntry>, crate::access_method::AccessMethodError> {
+        let tids = self.inner.lookup(key)?;
+        let payloads = self.payloads.lock();
+        Ok(tids
+            .into_iter()
+            .map(|tid| {
+                let include_payload = payloads.get(&tid_to_u64(tid)).cloned().unwrap_or_default();
+                CoveringEntry {
+                    tid,
+                    include_payload,
+                }
+            })
+            .collect())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CREATE INDEX CONCURRENTLY simulation (2-pass build)
+// ---------------------------------------------------------------------------
+
+/// Status of a concurrent index build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcurrentBuildStatus {
+    /// First pass complete; the index covers rows inserted before `snapshot_xid`.
+    Pass1Complete {
+        /// XID at which the first pass's snapshot was taken.
+        snapshot_xid: u64,
+    },
+    /// Both passes complete; the index is ready for use.
+    Ready,
+}
+
+/// Simulated CREATE INDEX CONCURRENTLY state machine.
+///
+/// A concurrent build proceeds in two phases without taking an
+/// `AccessExclusive` lock on the table:
+///
+/// 1. **Pass 1** — build the initial index from a snapshot of the table
+///    taken at the caller-supplied `snapshot_xid`. Rows inserted after
+///    that XID are not yet indexed.
+/// 2. **Pass 2** — index rows that were inserted between the pass-1
+///    snapshot and the current time. After pass 2 the index is valid.
+///
+/// This implementation delegates to the caller-supplied row iterators
+/// rather than reading from the buffer pool, keeping the storage crate
+/// decoupled from the executor. The actual page I/O (and WAL logging)
+/// occurs inside the `AccessMethod::insert` calls.
+///
+/// `TODO(cic-complete)`: integrate with the MVCC visibility layer and
+/// the lock manager to replay missed rows correctly.
+#[derive(Debug)]
+pub struct ConcurrentIndexBuilder {
+    am: Box<dyn crate::access_method::AccessMethod>,
+    status: parking_lot::Mutex<Option<ConcurrentBuildStatus>>,
+}
+
+impl ConcurrentIndexBuilder {
+    /// Create a builder wrapping an already-allocated (empty) index.
+    pub fn new(am: impl crate::access_method::AccessMethod + 'static) -> Self {
+        Self {
+            am: Box::new(am),
+            status: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// Execute pass 1: index every `(key, tid)` pair supplied by the
+    /// iterator.
+    ///
+    /// `snapshot_xid` is the XID at which the pass-1 heap scan was
+    /// taken; rows inserted later are deferred to pass 2.
+    pub fn build_pass1(
+        &self,
+        rows: impl Iterator<Item = (Vec<u8>, TupleId)>,
+        snapshot_xid: u64,
+    ) -> Result<(), crate::access_method::AccessMethodError> {
+        for (key, tid) in rows {
+            self.am.insert(&key, tid)?;
+        }
+        *self.status.lock() = Some(ConcurrentBuildStatus::Pass1Complete { snapshot_xid });
+        Ok(())
+    }
+
+    /// Execute pass 2: index rows that arrived after the pass-1 snapshot.
+    ///
+    /// The caller supplies only the delta rows (those with XID >
+    /// `snapshot_xid`). After this call the builder reports `Ready`.
+    pub fn build_pass2(
+        &self,
+        delta_rows: impl Iterator<Item = (Vec<u8>, TupleId)>,
+    ) -> Result<(), crate::access_method::AccessMethodError> {
+        for (key, tid) in delta_rows {
+            // Ignore duplicate-key errors: a row may have been indexed
+            // during pass 1 if the snapshot window overlapped.
+            match self.am.insert(&key, tid) {
+                Ok(()) | Err(crate::access_method::AccessMethodError::DuplicateKey) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        *self.status.lock() = Some(ConcurrentBuildStatus::Ready);
+        Ok(())
+    }
+
+    /// Return the current build status.
+    pub fn status(&self) -> Option<ConcurrentBuildStatus> {
+        self.status.lock().clone()
+    }
+
+    /// Consume the builder and return the finished access method.
+    ///
+    /// Panics if the build is not in the `Ready` state.
+    pub fn finish(self) -> Box<dyn crate::access_method::AccessMethod> {
+        assert_eq!(
+            *self.status.lock(),
+            Some(ConcurrentBuildStatus::Ready),
+            "build_pass2 must complete before finish()"
+        );
+        self.am
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VACUUM: reclaim dead index entries
+// ---------------------------------------------------------------------------
+
+impl<L: PageLoader> BTree<L> {
+    /// Vacuum pass: remove dead leaf entries whose `TupleId`s are
+    /// flagged by the caller-supplied `is_dead` predicate.
+    ///
+    /// The predicate receives a `TupleId` and returns `true` when the
+    /// heap tuple is dead (invisible to all current snapshots). The
+    /// B-tree iterates all leaves, collecting dead entries, and removes
+    /// them.
+    ///
+    /// Returns the number of dead entries reclaimed.
+    ///
+    /// # Concurrency
+    ///
+    /// v0.8 requires exclusive access during vacuum (no concurrent
+    /// writers). The caller must hold an appropriate relation lock.
+    /// `TODO(btree-vacuum-concurrent)`: allow concurrent reads during
+    /// vacuum using a second-pass cleanup protocol.
+    pub fn vacuum(&self, is_dead: impl Fn(TupleId) -> bool) -> Result<usize, BTreeError> {
+        let root = *self.root_block.lock();
+        // Find the leftmost leaf.
+        let mut leaf = self.leftmost_leaf(root)?;
+        let mut removed = 0_usize;
+
+        loop {
+            let guard = self.pool.get_page(self.page_id(leaf))?;
+            let right_link;
+            {
+                let mut w = guard.write();
+                let meta = NodeMeta::read_from(&w)?;
+                debug_assert!(meta.is_leaf());
+                let mut entries = read_leaf_entries(&w, meta.n_keys)?;
+                let before = entries.len();
+                entries.retain(|e| !is_dead(e.value));
+                let after = entries.len();
+                if after < before {
+                    write_leaf_entries(&mut w, &entries);
+                    let new_meta = NodeMeta {
+                        n_keys: u16::try_from(after)
+                            .map_err(|_| BTreeError::MalformedNode("vacuum overflow"))?,
+                        ..meta
+                    };
+                    new_meta.write_into(&mut w);
+                    removed += before - after;
+                }
+                right_link = meta.right_link;
+                drop(w);
+            }
+            drop(guard);
+            if right_link == NO_SIBLING {
+                break;
+            }
+            leaf = BlockNumber::new(right_link);
+        }
+        Ok(removed)
+    }
+
+    /// Find the leftmost leaf by descending from `root` always left.
+    fn leftmost_leaf(&self, root: BlockNumber) -> Result<BlockNumber, BTreeError> {
+        let mut current = root;
+        loop {
+            let guard = self.pool.get_page(self.page_id(current))?;
+            let (is_leaf, first_child);
+            {
+                let r = guard.read();
+                let meta = NodeMeta::read_from(&r)?;
+                is_leaf = meta.is_leaf();
+                first_child = if is_leaf {
+                    None
+                } else {
+                    let entries = read_internal_entries(&r, meta.n_keys)?;
+                    entries.first().map(|e| e.child)
+                };
+                drop(r);
+            }
+            drop(guard);
+            if is_leaf {
+                return Ok(current);
+            }
+            current = BlockNumber::new(
+                first_child.ok_or(BTreeError::MalformedNode("empty internal node"))?,
+            );
+        }
+    }
+}
+
 // --- tests -----------------------------------------------------------------
 
 #[cfg(test)]
@@ -1445,6 +2002,241 @@ mod tests {
         for i in 0_i64..50 {
             let block = u32::try_from(i).expect("fits in u32");
             assert_eq!(tree2.lookup::<i64>(i).unwrap(), Some(tid(block, 0)));
+        }
+    }
+
+    // --- v0.8 additions ---
+
+    #[test]
+    fn backward_scan_returns_keys_in_descending_order() {
+        let mut tree = make_tree();
+        for i in 0_i64..50 {
+            let block = u32::try_from(i).expect("fits");
+            tree.insert::<i64>(i, tid(block, 0), Xid::new(1), None)
+                .unwrap();
+        }
+        // Backward scan from 49 with no lower bound.
+        let iter = tree.backward_scan::<i64>(49_i64, None).unwrap();
+        let keys: Vec<i64> = iter.map(|r| r.unwrap().0).collect();
+        assert!(!keys.is_empty());
+        // Verify descending order.
+        for w in keys.windows(2) {
+            assert!(w[0] >= w[1], "not descending: {} < {}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn backward_scan_with_bounds_respects_range() {
+        let mut tree = make_tree();
+        for i in 0_i64..20 {
+            let block = u32::try_from(i).expect("fits");
+            tree.insert::<i64>(i, tid(block, 0), Xid::new(1), None)
+                .unwrap();
+        }
+        // Keys [5, 15] descending.
+        let iter = tree.backward_scan::<i64>(15_i64, Some(5_i64)).unwrap();
+        let keys: Vec<i64> = iter.map(|r| r.unwrap().0).collect();
+        // Should contain keys in [5..=15].
+        for &k in &keys {
+            assert!(k >= 5 && k <= 15, "key {k} out of [5,15]");
+        }
+    }
+
+    #[test]
+    fn composite_key_encode_decode_round_trip() {
+        let k: CompositeKey<3> = CompositeKey::new([1, -7, 999]);
+        let mut buf = [0_u8; 24];
+        k.encode_into(&mut buf);
+        let decoded = CompositeKey::<3>::decode_from(&buf);
+        assert_eq!(k, decoded);
+    }
+
+    #[test]
+    fn composite_key_ordering_is_lexicographic() {
+        let a: CompositeKey<2> = CompositeKey::new([1, 5]);
+        let b: CompositeKey<2> = CompositeKey::new([1, 6]);
+        let c: CompositeKey<2> = CompositeKey::new([2, 0]);
+        assert!(a < b);
+        assert!(b < c);
+        assert!(a < c);
+    }
+
+    #[test]
+    fn expression_index_insert_and_lookup() {
+        use crate::access_method::BTreeAccessMethod;
+        use ultrasql_core::Value;
+
+        let am = BTreeAccessMethod::new(false);
+        let idx = ExprIndexAdapter::new(
+            am,
+            // Key: first Value as 8-byte LE i64.
+            |row| {
+                if let Some(Value::Int64(v)) = row.first() {
+                    let mut buf = [0_u8; 8];
+                    write_i64_le(&mut buf, *v);
+                    buf.to_vec()
+                } else {
+                    vec![]
+                }
+            },
+        );
+        let row = vec![Value::Int64(42)];
+        idx.insert_row(&row, tid(1, 0)).unwrap();
+        let mut key_buf = [0_u8; 8];
+        write_i64_le(&mut key_buf, 42);
+        let results = idx.lookup_key(&key_buf).unwrap();
+        assert!(results.contains(&tid(1, 0)));
+    }
+
+    #[test]
+    fn partial_index_skips_rows_not_matching_predicate() {
+        use crate::access_method::BTreeAccessMethod;
+        use ultrasql_core::Value;
+
+        let am = BTreeAccessMethod::new(false);
+        // Only index rows where col0 > 10.
+        let idx = PartialIndexAdapter::new(
+            am,
+            |row| {
+                if let Some(Value::Int64(v)) = row.first() {
+                    let mut buf = [0_u8; 8];
+                    write_i64_le(&mut buf, *v);
+                    buf.to_vec()
+                } else {
+                    vec![]
+                }
+            },
+            |row| matches!(row.first(), Some(Value::Int64(v)) if *v > 10),
+        );
+        // Row with 5 — should NOT be indexed.
+        idx.insert_row(&[Value::Int64(5)], tid(1, 0)).unwrap();
+        // Row with 20 — should be indexed.
+        idx.insert_row(&[Value::Int64(20)], tid(2, 0)).unwrap();
+
+        let mut key_buf = [0_u8; 8];
+        write_i64_le(&mut key_buf, 5);
+        assert!(
+            idx.lookup_key(&key_buf).unwrap().is_empty(),
+            "5 should not be indexed"
+        );
+
+        write_i64_le(&mut key_buf, 20);
+        assert!(
+            !idx.lookup_key(&key_buf).unwrap().is_empty(),
+            "20 should be indexed"
+        );
+    }
+
+    #[test]
+    fn covering_index_stores_include_payload() {
+        use crate::access_method::BTreeAccessMethod;
+        use ultrasql_core::Value;
+
+        let am = BTreeAccessMethod::new(true);
+        let idx = CoveringIndexAdapter::new(
+            am,
+            // Key = col0.
+            |row| {
+                if let Some(Value::Int64(v)) = row.first() {
+                    let mut buf = [0_u8; 8];
+                    write_i64_le(&mut buf, *v);
+                    buf.to_vec()
+                } else {
+                    vec![]
+                }
+            },
+            // INCLUDE = col1 as 8 bytes.
+            |row| {
+                if let Some(Value::Int64(v)) = row.get(1) {
+                    let mut buf = [0_u8; 8];
+                    write_i64_le(&mut buf, *v);
+                    buf.to_vec()
+                } else {
+                    vec![]
+                }
+            },
+        );
+        let row = vec![Value::Int64(7), Value::Int64(999)];
+        idx.insert_row(&row, tid(1, 0)).unwrap();
+        let mut key_buf = [0_u8; 8];
+        write_i64_le(&mut key_buf, 7);
+        let entries = idx.lookup_covering(&key_buf).unwrap();
+        assert_eq!(entries.len(), 1);
+        let expected_payload = {
+            let mut buf = [0_u8; 8];
+            write_i64_le(&mut buf, 999);
+            buf.to_vec()
+        };
+        assert_eq!(entries[0].include_payload, expected_payload);
+    }
+
+    #[test]
+    fn concurrent_index_build_two_pass() {
+        use crate::access_method::BTreeAccessMethod;
+
+        let am = BTreeAccessMethod::new(false);
+        let builder = ConcurrentIndexBuilder::new(am);
+        assert!(builder.status().is_none());
+
+        // Pass 1: snapshot at xid 100.
+        let pass1_rows = (0_i64..5).map(|i| {
+            let mut buf = [0_u8; 8];
+            write_i64_le(&mut buf, i);
+            (buf.to_vec(), tid(u32::try_from(i).unwrap(), 0))
+        });
+        builder.build_pass1(pass1_rows, 100).unwrap();
+        assert_eq!(
+            builder.status(),
+            Some(ConcurrentBuildStatus::Pass1Complete { snapshot_xid: 100 })
+        );
+
+        // Pass 2: delta rows [5..10).
+        let pass2_rows = (5_i64..10).map(|i| {
+            let mut buf = [0_u8; 8];
+            write_i64_le(&mut buf, i);
+            (buf.to_vec(), tid(u32::try_from(i).unwrap(), 0))
+        });
+        builder.build_pass2(pass2_rows).unwrap();
+        assert_eq!(builder.status(), Some(ConcurrentBuildStatus::Ready));
+
+        let finished = builder.finish();
+        for i in 0_i64..10 {
+            let mut buf = [0_u8; 8];
+            write_i64_le(&mut buf, i);
+            let results = finished.lookup(&buf).unwrap();
+            assert!(!results.is_empty(), "key {i} missing after CIC build");
+        }
+    }
+
+    #[test]
+    fn vacuum_removes_dead_entries() {
+        let mut tree = make_tree();
+        for i in 0_i64..20 {
+            let block = u32::try_from(i).expect("fits");
+            tree.insert::<i64>(i, tid(block, 0), Xid::new(1), None)
+                .unwrap();
+        }
+        // Mark even-keyed TIDs as dead.
+        let removed = tree
+            .vacuum(|t| t.page.block.raw() % 2 == 0)
+            .expect("vacuum");
+        assert_eq!(removed, 10, "expected 10 dead entries removed");
+
+        // Odd keys should still be present.
+        for i in (1_i64..20).step_by(2) {
+            let block = u32::try_from(i).expect("fits");
+            assert_eq!(
+                tree.lookup::<i64>(i).unwrap(),
+                Some(tid(block, 0)),
+                "odd key {i} missing"
+            );
+        }
+        // Even keys should now be missing.
+        for i in (0_i64..20).step_by(2) {
+            assert!(
+                tree.lookup::<i64>(i).unwrap().is_none(),
+                "dead key {i} still present"
+            );
         }
     }
 }

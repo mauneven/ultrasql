@@ -32,10 +32,14 @@
 
 mod entry;
 mod error;
+pub mod information_schema;
 mod memory;
+pub mod persistent;
 mod traits;
+pub mod views;
 
 pub use entry::{IndexEntry, TableEntry};
 pub use error::CatalogError;
 pub use memory::{FIRST_USER_OID, InMemoryCatalog};
+pub use persistent::PersistentCatalog;
 pub use traits::{Catalog, MutableCatalog};

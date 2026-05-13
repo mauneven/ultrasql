@@ -14,15 +14,18 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod access_method;
 pub mod btree;
 pub mod buffer_pool;
 pub mod checkpointer;
 pub mod checksum;
 pub mod clog;
+pub mod constraints;
 pub mod fsm;
 pub mod heap;
 pub mod page;
 pub mod segment;
+pub mod sequence;
 pub mod toast;
 pub mod vm;
 pub mod wal_applier;
