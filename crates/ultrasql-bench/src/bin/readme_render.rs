@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::Deserialize;
+use serde_json;
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -58,6 +59,11 @@ use serde::Deserialize;
 /// value for each benchmark id, then rewrites the `<!-- BEGIN AUTO: BENCH:id
 /// -->` / `<!-- END AUTO: BENCH:id -->` blocks in `--readme`. With `--check`
 /// exits non-zero when the file would change without writing it.
+///
+/// Resolution order for UltraSQL latency values:
+/// 1. `benchmarks/results/latest/results.json` (most-recent measured run).
+/// 2. `--baselines` directory (stage gate baselines, slower-moving).
+/// 3. Static defaults compiled into the binary.
 #[derive(Parser, Debug)]
 #[command(name = "readme-render", about = "Rewrite README benchmark tables")]
 struct Args {
@@ -68,6 +74,12 @@ struct Args {
     /// Directory containing baseline JSON files (`*.json`).
     #[arg(long, default_value = "benchmarks/baselines")]
     baselines: PathBuf,
+
+    /// Path to the most-recently-measured results.json produced by
+    /// `results-render`. When non-empty, values from this file take
+    /// precedence over the `--baselines` data.
+    #[arg(long, default_value = "benchmarks/results/latest/results.json")]
+    latest_results: PathBuf,
 
     /// Dry-run mode: exit 1 if README would change, exit 0 if already
     /// up-to-date. Does not write the file.
@@ -383,6 +395,77 @@ fn load_baselines(dir: &Path) -> Result<HashMap<String, BaselineEntry>> {
     Ok(merged)
 }
 
+/// Attempt to read `results/latest/results.json` and overlay any non-zero
+/// UltraSQL `median_us` values into the existing baseline map.
+///
+/// The `results.json` schema is:
+/// ```json
+/// { "workloads": { "<name>": { "engines": [ {"rank":1,"engine":"ultrasql","median_us":…} ] } } }
+/// ```
+///
+/// This function is best-effort: if the file is absent, empty, or malformed,
+/// it logs a message on stderr and returns without modifying `baseline`.
+fn merge_latest_results(path: &Path, baseline: &mut HashMap<String, BaselineEntry>) {
+    if !path.exists() {
+        return;
+    }
+    let raw = match std::fs::read_to_string(path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("readme-render: cannot read {}: {e}", path.display());
+            return;
+        }
+    };
+    let doc: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("readme-render: malformed {}: {e}", path.display());
+            return;
+        }
+    };
+
+    // Map workload names in results.json to benchmark IDs used by the README.
+    // Only map workloads that have a direct README marker counterpart.
+    let workload_to_bench_id: &[(&str, &str)] =
+        &[("sum", "select_sum_65k_i64"), ("avg", "select_avg_10m_i64")];
+
+    let Some(workloads) = doc.get("workloads").and_then(|v| v.as_object()) else {
+        return;
+    };
+
+    for (workload_name, bench_id) in workload_to_bench_id {
+        let Some(wl) = workloads.get(*workload_name) else {
+            continue;
+        };
+        let Some(engines) = wl.get("engines").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        // Find the UltraSQL engine entry and extract median_us.
+        for engine in engines {
+            let name = engine.get("engine").and_then(|v| v.as_str()).unwrap_or("");
+            if !name.to_lowercase().contains("ultrasql") {
+                continue;
+            }
+            let Some(median_us) = engine.get("median_us").and_then(|v| v.as_f64()) else {
+                continue;
+            };
+            if median_us <= 0.0 {
+                continue;
+            }
+            // Overwrite the existing baseline entry for this benchmark id.
+            let entry = baseline
+                .entry((*bench_id).to_string())
+                .or_insert_with(|| BaselineEntry {
+                    p99_us: 0.0,
+                    competitors: HashMap::new(),
+                });
+            entry.p99_us = median_us;
+            eprintln!("readme-render: overlay {bench_id} from latest results → {median_us:.3} µs");
+            break;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Table resolution
 // ---------------------------------------------------------------------------
@@ -452,8 +535,18 @@ fn main() -> std::process::ExitCode {
     } else {
         root.join(&args.baselines)
     };
+    let latest_results_path = if args.latest_results.is_absolute() {
+        args.latest_results.clone()
+    } else {
+        root.join(&args.latest_results)
+    };
 
-    match run(&readme_path, &baselines_path, args.check) {
+    match run(
+        &readme_path,
+        &baselines_path,
+        &latest_results_path,
+        args.check,
+    ) {
         Ok(changed) => {
             if args.check && changed {
                 eprintln!(
@@ -472,12 +565,22 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// Core logic: load baselines, build tables, rewrite README.
+/// Core logic: load baselines (+ optional latest results), build tables,
+/// rewrite README.
 ///
 /// Returns `true` when the README content would change (or did change when
 /// `check` is `false`).
-pub fn run(readme_path: &Path, baselines_path: &Path, check: bool) -> Result<bool> {
-    let baseline = load_baselines(baselines_path)?;
+pub fn run(
+    readme_path: &Path,
+    baselines_path: &Path,
+    latest_results_path: &Path,
+    check: bool,
+) -> Result<bool> {
+    let mut baseline = load_baselines(baselines_path)?;
+    // Overlay values from the most-recent run when the file exists and
+    // contains non-zero UltraSQL latencies. The latest run takes
+    // precedence over the stage-gate baselines.
+    merge_latest_results(latest_results_path, &mut baseline);
     let tables = build_tables(&baseline);
 
     let original = std::fs::read_to_string(readme_path)
@@ -635,7 +738,10 @@ rest\n";
         .expect("write readme");
 
         // No baseline files — static defaults will be used.
-        let changed = run(&readme_path, &baselines_dir, true).expect("run check");
+        // Pass a non-existent latest-results path; merge_latest_results
+        // is a no-op when the file does not exist.
+        let no_latest = baselines_dir.join("nonexistent.json");
+        let changed = run(&readme_path, &baselines_dir, &no_latest, true).expect("run check");
         assert!(changed, "stale README should be detected as changed");
 
         // File must NOT have been modified in check mode.

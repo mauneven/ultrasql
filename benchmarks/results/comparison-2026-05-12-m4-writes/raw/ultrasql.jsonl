@@ -1,5 +1,0 @@
-insert-bulk-100k	{"workload":"insert-bulk","n_rows":100000,"samples":4,"median_us":1540937.458,"min_us":1455879.292,"iterations_us":[1483828.166,1455879.292,1598046.750,1687661.625],"answer":"inserted=100000"}
-insert-bulk-1m	{"workload":"insert-bulk","n_rows":1000000,"samples":2,"median_us":91687607.604,"min_us":89848984.083,"iterations_us":[93526231.125,89848984.083],"answer":"inserted=1000000"}
-update-1m	{"workload":"update","skipped":true,"reason":"each iteration ~30 min wall-clock at v0.5 (no FSM, O(blocks)/insert × 1M rows + WAL fsync); not runnable inside the 25-min cap"}
-delete-100k	{"workload":"delete","n_rows":100000,"samples":4,"median_us":91070.979,"min_us":85050.750,"iterations_us":[94336.042,89053.625,85050.750,93088.333],"answer":"scanned=100000"}
-upsert-100k	{"workload":"upsert","skipped":true,"reason":"no native ON CONFLICT path at v0.5"}

@@ -1,10 +1,9 @@
 //! UltraSQL cross-engine **write** comparison harness.
 //!
 //! Companion to the `cross_compare` driver: this binary covers the
-//! write side of the workload matrix. The companion `run.sh` in
-//! `benchmarks/results/comparison-2026-05-12-m4-writes/` invokes this
-//! binary once per workload row and parses the JSON line it prints on
-//! stdout.
+//! write side of the workload matrix. The companion `benchmarks/run.sh`
+//! invokes this binary once per workload row and parses the JSON line
+//! it prints on stdout.
 //!
 //! Supported workloads:
 //!
@@ -33,9 +32,10 @@
 //!   pool is written back to its segment file and fsynced via
 //!   [`SegmentFileManager::fsync_relation`]. Both events are inside the
 //!   timed region.
-//! - 1 warmup iteration, then 8 measured. The medians, minimums, and
-//!   per-iteration distribution are written to stdout as one JSON
-//!   object. Wall-clock is `std::time::Instant`, nanosecond resolution.
+//! - Iteration counts are controlled by the `--tier` flag:
+//!   `low` (default): 1 warmup + 5 measured at 100 000-row datasets;
+//!   `ultra`: 2 warmup + 8 measured at 1 000 000-row datasets.
+//!   Individual `--warmup` / `--iters` flags override tier defaults.
 //! - The CSV input columns are `(id, val)` — same shape the SQL engines
 //!   use. Parsing happens once, before the timed region.
 
@@ -50,6 +50,19 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
+
+/// Benchmark tier controlling dataset size and iteration counts.
+///
+/// `low` targets fast feedback (CI / development); `ultra` targets
+/// publishable numbers from a larger, more realistic dataset.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, ValueEnum)]
+enum Tier {
+    /// 100 000 rows, 5 measured iterations, 1 warmup.
+    #[default]
+    Low,
+    /// 1 000 000 rows, 8 measured iterations, 2 warmup.
+    Ultra,
+}
 use tempfile::TempDir;
 use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
@@ -81,21 +94,46 @@ struct Args {
     #[arg(long, value_enum)]
     workload: Workload,
 
+    /// Benchmark tier: `low` (100k rows, 5 iters, 1 warmup) or
+    /// `ultra` (1M rows, 8 iters, 2 warmup). Individual `--warmup`
+    /// and `--iters` flags override the tier defaults when set
+    /// explicitly.
+    #[arg(long, value_enum, default_value_t = Tier::Low)]
+    tier: Tier,
+
     /// Path to a CSV with header `id,val` and one `(i64, i64)` row per
     /// line. Used as the input dataset for INSERT, the preload for
     /// UPDATE / DELETE.
     #[arg(long)]
     data: PathBuf,
 
-    /// Number of warmup iterations. The default is 1 because each
-    /// iteration creates a fresh tempdir + WAL writer; warmup costs
-    /// add up quickly.
-    #[arg(long, default_value_t = 1)]
-    warmup: usize,
+    /// Number of warmup iterations. Overrides the tier default when
+    /// set explicitly.
+    #[arg(long)]
+    warmup: Option<usize>,
 
-    /// Number of measured iterations.
-    #[arg(long, default_value_t = 8)]
-    iters: usize,
+    /// Number of measured iterations. Overrides the tier default when
+    /// set explicitly.
+    #[arg(long)]
+    iters: Option<usize>,
+}
+
+impl Args {
+    /// Effective warmup iteration count: explicit flag overrides tier default.
+    fn effective_warmup(&self) -> usize {
+        self.warmup.unwrap_or_else(|| match self.tier {
+            Tier::Low => 1,
+            Tier::Ultra => 2,
+        })
+    }
+
+    /// Effective measured iteration count: explicit flag overrides tier default.
+    fn effective_iters(&self) -> usize {
+        self.iters.unwrap_or_else(|| match self.tier {
+            Tier::Low => 5,
+            Tier::Ultra => 8,
+        })
+    }
 }
 
 fn main() -> Result<()> {
@@ -427,7 +465,13 @@ fn run_insert_bulk(args: &Args) -> Result<String> {
         Ok(())
     };
 
-    let us = run_iterations(args.warmup, args.iters, frames, prepare, body)?;
+    let us = run_iterations(
+        args.effective_warmup(),
+        args.effective_iters(),
+        frames,
+        prepare,
+        body,
+    )?;
     let answer = format!("inserted={n}");
     Ok(emit_json("insert-bulk", n, &us, &answer, &[]))
 }
@@ -478,7 +522,13 @@ fn run_update(args: &Args) -> Result<String> {
         Ok(())
     };
 
-    let us = run_iterations(args.warmup, args.iters, frames, prepare, body)?;
+    let us = run_iterations(
+        args.effective_warmup(),
+        args.effective_iters(),
+        frames,
+        prepare,
+        body,
+    )?;
     let answer = format!("updated={n}");
     Ok(emit_json("update", n, &us, &answer, &[]))
 }
@@ -513,7 +563,13 @@ fn run_delete(args: &Args) -> Result<String> {
         Ok(())
     };
 
-    let us = run_iterations(args.warmup, args.iters, frames, prepare, body)?;
+    let us = run_iterations(
+        args.effective_warmup(),
+        args.effective_iters(),
+        frames,
+        prepare,
+        body,
+    )?;
     let answer = format!("scanned={n}");
     Ok(emit_json("delete", n, &us, &answer, &[]))
 }

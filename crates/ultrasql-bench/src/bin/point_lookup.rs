@@ -1,10 +1,12 @@
 //! UltraSQL point-lookup harness for the cross-engine comparison.
 //!
-//! Builds a `BTree<i64>` over 10 000 000 deterministic `(id, x)` pairs in
+//! Builds a `BTree<i64>` over a deterministic set of `(id, x)` pairs in
 //! the in-memory buffer pool, primes a hot session, and times **only the
 //! probes**. The same probe set is shared across every engine in the
 //! comparison so each engine answers the same questions in the same
-//! order.
+//! order. The `--tier` flag controls tree size:
+//! - `low` (default): 100 000 keys.
+//! - `ultra`: 10 000 000 keys.
 //!
 //! The fairness contract is: every engine pays for its session setup
 //! once (CSV load, prepared statement, warmup), then we measure only
@@ -47,8 +49,20 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
+
+/// Benchmark tier controlling B-tree size.
+///
+/// `low` targets fast feedback; `ultra` targets publishable numbers.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, ValueEnum)]
+enum Tier {
+    /// 100 000-key B-tree.
+    #[default]
+    Low,
+    /// 10 000 000-key B-tree.
+    Ultra,
+}
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::page::Page;
@@ -56,12 +70,18 @@ use ultrasql_storage::page::Page;
 #[derive(Parser, Debug)]
 #[command(
     name = "point_lookup",
-    about = "UltraSQL point-lookup driver: build 10M-key BTree, time 100k hot probes"
+    about = "UltraSQL point-lookup driver: build BTree<i64>, time hot probes"
 )]
 struct Args {
-    /// Number of keys to insert into the `BTree`.
-    #[arg(long, default_value_t = 10_000_000)]
-    point_n: usize,
+    /// Benchmark tier: `low` (100k keys) or `ultra` (10M keys).
+    /// The `--point-n` flag overrides the tier default when set explicitly.
+    #[arg(long, value_enum, default_value_t = Tier::Low)]
+    tier: Tier,
+
+    /// Number of keys to insert into the `BTree`. Overrides the tier
+    /// default when set explicitly.
+    #[arg(long)]
+    point_n: Option<usize>,
 
     /// Number of measured probes per run.
     #[arg(long, default_value_t = 100_000)]
@@ -88,6 +108,16 @@ struct Args {
     /// file in addition to being printed to stdout.
     #[arg(long)]
     out: Option<PathBuf>,
+}
+
+impl Args {
+    /// Effective key count: explicit `--point-n` overrides tier default.
+    fn effective_point_n(&self) -> usize {
+        self.point_n.unwrap_or_else(|| match self.tier {
+            Tier::Low => 100_000,
+            Tier::Ultra => 10_000_000,
+        })
+    }
 }
 
 /// In-memory buffer-pool loader that returns blank heap pages.
@@ -302,15 +332,16 @@ fn format_result_json(
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let point_n = args.effective_point_n();
 
-    let (tree, build_ns) = build_tree(args.point_n, args.insert_seed)?;
-    let n_i64 = i64::try_from(args.point_n).context("point_n exceeds i64::MAX")?;
+    let (tree, build_ns) = build_tree(point_n, args.insert_seed)?;
+    let n_i64 = i64::try_from(point_n).context("point_n exceeds i64::MAX")?;
     let keys = gen_probe_keys(args.probes, n_i64, args.probe_seed);
     warmup(&tree, &keys, args.warmup_probes);
     let (run_ns, last_hits) = measure(&tree, &keys, args.runs);
 
     let json = format_result_json(
-        args.point_n,
+        point_n,
         args.probes,
         args.runs,
         args.warmup_probes,

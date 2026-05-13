@@ -134,31 +134,56 @@ A comparison that violates any of these is invalid.
 
 ---
 
-## Output format
+## Two-Tier Benchmark Policy
 
-Each run writes `benchmarks/results/<workload>/<host>/<timestamp>.json`:
+Every benchmark driver binary (`cross_compare`, `cross_compare_writes`,
+`cross_concurrency`, `point_lookup`) accepts a `--tier {low,ultra}` flag:
+
+| Tier | Row count | Measured iters | Warmup | Purpose |
+|------|-----------|---------------|--------|---------|
+| `low` (default) | 100 000 | 5 | 1 | Fast feedback — CI, development, pre-push. |
+| `ultra` | 10 000 000 (reads) / 1 000 000 (writes) | 8 | 2 | Publishable numbers. |
+
+There are no intermediate tiers. The `--warmup` and `--iters` flags can
+override the tier defaults when a specific iteration count is needed.
+
+## Results Directory Policy
+
+- `benchmarks/baselines/` — stage-gate baselines (slow-moving; updated at
+  milestones; committed). Read by `regression-gate`.
+- `benchmarks/results/latest/` — most-recent run (fast-moving; overwritten
+  on every `benchmarks/run.sh` invocation; committed). Read by
+  `readme-render` as the highest-priority data source. Contains:
+  - `raw/<workload>-<engine>.json` — per-engine raw output.
+  - `results.md` — rendered Markdown table (auto-updated by pre-commit hook).
+  - `results.json` — machine-readable normalized summary.
+  - `methodology.md` — host descriptor and reproduction instructions.
+- No other `benchmarks/results/*` directories are permitted on `main`.
+  The CI check `benchmarks/check_no_legacy_dirs.sh` enforces this.
+
+## Output Format
+
+Cross-engine comparison runs write per-engine raw JSON to
+`benchmarks/results/latest/raw/<workload>-<engine>.json`:
 
 ```json
 {
-  "schema_version": 1,
-  "workload": { ... },
-  "host":     { ... },
-  "subject":  "ultrasql",
-  "metrics": {
-    "throughput_tx_per_s": 47239.0,
-    "latency_p50_us": 480.0,
-    "latency_p95_us": 1820.0,
-    "latency_p99_us": 3940.0,
-    "latency_p99_9_us": 9210.0,
-    "cpu_percent_avg": 64.3,
-    "rss_mb_peak": 4982.0
-  },
-  "notes": "stable steady-state after 60s warmup"
+  "workload":      "<name>",
+  "n_rows":        <integer>,
+  "samples":       <integer>,
+  "median_us":     <float>,
+  "min_us":        <float>,
+  "iterations_us": [<float>, ...],
+  "answer":        "<checksum or summary string>"
 }
 ```
 
-Comparison runs land in the same directory; the dashboard renders
-them together.
+The `results-render` binary reads every `*.json` file in `raw/` and
+produces `results.md` and `results.json`. Both files are committed and
+kept current by the pre-commit hook when raw JSON is staged.
+
+Comparison runs land in `latest/`; the dashboard renders them from
+`latest/results.json`.
 
 ---
 

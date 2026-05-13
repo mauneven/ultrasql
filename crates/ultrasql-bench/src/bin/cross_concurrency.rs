@@ -3,10 +3,8 @@
 //! Spawns `T` `std::thread`s and drives one of four workloads against
 //! the kernel/heap API for a fixed wall-clock window, then emits a
 //! single-line JSON record summarising total throughput across all
-//! threads. The companion `run.sh` in
-//! `benchmarks/results/comparison-2026-05-12-m4-concurrency/` invokes
-//! this binary once per `(workload, threads)` cell and parses the
-//! output.
+//! threads. The companion `benchmarks/run.sh` invokes this binary once
+//! per `(workload, threads)` cell and parses the output.
 //!
 //! Workloads
 //! ---------
@@ -31,6 +29,10 @@
 //!   values in a private `NumericColumn` and rewrites them in place
 //!   (`v += 1`). Heap has no in-place UPDATE at v0.5; this measures
 //!   the data plane the eventual UPDATE will pay.
+//!
+//! The `--tier` flag controls the dataset size:
+//! - `low` (default): 100 000-row dataset.
+//! - `ultra`: 10 000 000-row dataset.
 //!
 //! Methodology
 //! -----------
@@ -66,6 +68,19 @@ use ultrasql_storage::page::Page;
 use ultrasql_vec::column::NumericColumn;
 use ultrasql_vec::sum_i64;
 
+/// Benchmark tier controlling dataset size.
+///
+/// `low` targets fast feedback (CI / development); `ultra` targets
+/// publishable numbers from a large dataset.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, ValueEnum)]
+enum Tier {
+    /// 100 000-row dataset.
+    #[default]
+    Low,
+    /// 10 000 000-row dataset.
+    Ultra,
+}
+
 /// Selectable workloads. The `Conc` prefix is preserved on every
 /// variant because it matches the `conc-*` keys used by the runner
 /// script and the `results.json` layout.
@@ -91,6 +106,12 @@ struct Args {
     #[arg(long, value_enum)]
     workload: Workload,
 
+    /// Benchmark tier: `low` (100k-row dataset) or `ultra` (10M-row
+    /// dataset). The `--dataset-rows` flag overrides the tier default
+    /// when set explicitly.
+    #[arg(long, value_enum, default_value_t = Tier::Low)]
+    tier: Tier,
+
     /// Number of worker threads.
     #[arg(long)]
     threads: usize,
@@ -108,8 +129,9 @@ struct Args {
     warmup_secs: u64,
 
     /// Dataset size for `conc-read-sum` and `conc-read-point`.
-    #[arg(long, default_value_t = 1_000_000)]
-    dataset_rows: usize,
+    /// Overrides the tier default when set explicitly.
+    #[arg(long)]
+    dataset_rows: Option<usize>,
 
     /// Number of rows each thread owns in `conc-insert` /
     /// `conc-update`. The thread saturates the measured window — the
@@ -124,6 +146,16 @@ struct Args {
     /// header `x`, then one i64 per line.
     #[arg(long)]
     data: Option<PathBuf>,
+}
+
+impl Args {
+    /// Effective dataset row count: explicit flag overrides tier default.
+    fn effective_dataset_rows(&self) -> usize {
+        self.dataset_rows.unwrap_or_else(|| match self.tier {
+            Tier::Low => 100_000,
+            Tier::Ultra => 10_000_000,
+        })
+    }
 }
 
 fn main() -> Result<()> {
@@ -172,7 +204,7 @@ fn load_or_synthesize_dataset(args: &Args) -> Result<Vec<i64>> {
     if let Some(path) = &args.data {
         let f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
         let r = std::io::BufReader::new(f);
-        let mut out = Vec::with_capacity(args.dataset_rows);
+        let mut out = Vec::with_capacity(args.effective_dataset_rows());
         let mut header_skipped = false;
         for line in r.lines() {
             let line = line?;
@@ -192,8 +224,8 @@ fn load_or_synthesize_dataset(args: &Args) -> Result<Vec<i64>> {
         Ok(out)
     } else {
         let mut s: u64 = 0xDEAD_BEEF_CAFE_F00D;
-        let mut out = Vec::with_capacity(args.dataset_rows);
-        for _ in 0..args.dataset_rows {
+        let mut out = Vec::with_capacity(args.effective_dataset_rows());
+        for _ in 0..args.effective_dataset_rows() {
             s = xorshift64(s);
             // Map u64 -> i64 by bit reinterpretation; the kernel does
             // not care about the sign of the input.
@@ -229,7 +261,7 @@ fn emit_json(workload: Workload, threads: usize, args: &Args, ops_per_sec: &[f64
         args.measure_secs,
         args.warmup_secs,
         args.rows_per_thread,
-        args.dataset_rows,
+        args.effective_dataset_rows(),
         med,
         max,
         parts.join(","),
@@ -342,7 +374,7 @@ fn run_read_sum_thread(slice: &[i64], stop: &AtomicBool) -> u64 {
 // --- conc-read-point -----------------------------------------------------
 
 fn run_read_point(args: &Args) -> Result<String> {
-    let n = args.dataset_rows;
+    let n = args.effective_dataset_rows();
     // Mirror cross_compare's sizing rule: ≥ n/24 frames so the v0.5
     // pool never has to evict a dirty page mid-build.
     let frames = (n / 24 + 8_192).max(32_768);

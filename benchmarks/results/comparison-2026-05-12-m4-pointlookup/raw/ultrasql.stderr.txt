@@ -1,2 +1,0 @@
-point_lookup: building BTree<i64> with 10000000 keys, pool capacity 866101 frames (6766 MiB)
-point_lookup: build complete in 348.22 s (34822 ns/insert)

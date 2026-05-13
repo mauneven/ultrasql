@@ -1,5 +1,0 @@
-31f54bbb9568730e7cc40b9621de632d9166c7e8fa3ecd1d02d21ab182c3ed33  /tmp/ultracmp/data_x_1m.csv
-00f59a969cd4200a44a5f9ec30affcd289a40f4e501e66ef9843667a1ef8069b  /tmp/ultracmp/data_x_10m.csv
-02c09f9d3034e250bc530338a6d40c670bcc45ea184c5a05b7173f6f79704888  /tmp/ultracmp/data_y_10m.csv
-f315bb10fdd1b47142744d9aff861acf44045f50c7f4cef5d70aaa3bba06d46d  /tmp/ultracmp/data_xy_10m.csv
-3e249eae4d627a81e3aba6cbf869e47d2385561965b3e1c621fc3b2eee207e39  /tmp/ultracmp/data_id_10m.csv

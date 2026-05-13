@@ -2,9 +2,8 @@
 //!
 //! Runs an individual workload against the existing kernels and emits
 //! a single-line JSON record to stdout describing the median latency
-//! and per-iteration distribution. The companion `run.sh` in
-//! `benchmarks/results/comparison-2026-05-12-m4-extended/` invokes
-//! this binary once per workload row and parses the output.
+//! and per-iteration distribution. The companion `benchmarks/run.sh`
+//! invokes this binary once per workload row and parses the output.
 //!
 //! The supported workloads are:
 //!
@@ -28,9 +27,12 @@
 //! - Same deterministic CSV input the SQL engines see (`--data` path).
 //!   For two-column workloads the second column is provided via
 //!   `--data2`.
-//! - 3 warmup iterations, then 8 measured iterations. The medians,
-//!   minimums, and individual measurements are written to stdout as
-//!   one JSON object. Wall-clock is `std::time::Instant`, nanosecond
+//! - Iteration counts are controlled by the `--tier` flag:
+//!   `low` (default) runs 1 warmup + 5 measured iterations at 100 000 rows;
+//!   `ultra` runs 2 warmup + 8 measured iterations at 10 000 000 rows.
+//!   Individual `--warmup` / `--iters` flags can further override the defaults.
+//!   The medians, minimums, and individual measurements are written to stdout
+//!   as one JSON object. Wall-clock is `std::time::Instant`, nanosecond
 //!   resolution. Results are reported in microseconds.
 //! - Each iteration consumes the entire dataset (the engines do too —
 //!   there is no projection pushdown for these queries).
@@ -57,6 +59,19 @@ use ultrasql_vec::{
     cmp_gt_i64, count_i64, max_i64, min_i64, range_mask_i64, sum_i64, sum_i64_with_mask,
 };
 
+/// Benchmark tier controlling dataset size and iteration counts.
+///
+/// `low` targets fast feedback (CI / development); `ultra` targets
+/// publishable numbers from a large, cache-pressure-inducing dataset.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default, ValueEnum)]
+enum Tier {
+    /// 100 000 rows, 5 measured iterations, 1 warmup.
+    #[default]
+    Low,
+    /// 10 000 000 rows, 8 measured iterations, 2 warmup.
+    Ultra,
+}
+
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
 enum Workload {
     Sum,
@@ -80,6 +95,13 @@ struct Args {
     #[arg(long, value_enum)]
     workload: Workload,
 
+    /// Benchmark tier: `low` (100k rows, 5 iters, 1 warmup) or
+    /// `ultra` (10M rows, 8 iters, 2 warmup). Individual `--warmup`
+    /// and `--iters` flags override the tier defaults when set
+    /// explicitly.
+    #[arg(long, value_enum, default_value_t = Tier::Low)]
+    tier: Tier,
+
     /// Path to the single-column CSV (header `x`, then one i64 per row).
     #[arg(long)]
     data: PathBuf,
@@ -97,13 +119,15 @@ struct Args {
     #[arg(long, default_value_t = 1_000_000)]
     range_hi: i64,
 
-    /// Number of warmup iterations.
-    #[arg(long, default_value_t = 3)]
-    warmup: usize,
+    /// Number of warmup iterations. Overrides the tier default when
+    /// set explicitly.
+    #[arg(long)]
+    warmup: Option<usize>,
 
-    /// Number of measured iterations.
-    #[arg(long, default_value_t = 8)]
-    iters: usize,
+    /// Number of measured iterations. Overrides the tier default when
+    /// set explicitly.
+    #[arg(long)]
+    iters: Option<usize>,
 
     /// For the `point` workload, how many random lookups to perform
     /// per measured iteration. The reported microseconds-per-iteration
@@ -115,8 +139,34 @@ struct Args {
     /// B-tree before measuring. Smaller than the row counts used by
     /// SQL engines because the in-process B+ tree pool cannot evict
     /// dirty pages and must fit the entire tree in RAM.
-    #[arg(long, default_value_t = 1_000_000)]
-    point_n: usize,
+    #[arg(long)]
+    point_n: Option<usize>,
+}
+
+impl Args {
+    /// Effective warmup iteration count: explicit flag overrides tier default.
+    fn effective_warmup(&self) -> usize {
+        self.warmup.unwrap_or_else(|| match self.tier {
+            Tier::Low => 1,
+            Tier::Ultra => 2,
+        })
+    }
+
+    /// Effective measured iteration count: explicit flag overrides tier default.
+    fn effective_iters(&self) -> usize {
+        self.iters.unwrap_or_else(|| match self.tier {
+            Tier::Low => 5,
+            Tier::Ultra => 8,
+        })
+    }
+
+    /// Effective B-tree key count for the `point` workload.
+    fn effective_point_n(&self) -> usize {
+        self.point_n.unwrap_or_else(|| match self.tier {
+            Tier::Low => 100_000,
+            Tier::Ultra => 1_000_000,
+        })
+    }
 }
 
 fn main() -> Result<()> {
@@ -248,8 +298,8 @@ fn run_sum(args: &Args) -> Result<String> {
     Ok(time_iters(
         "sum",
         n,
-        args.warmup,
-        args.iters,
+        args.effective_warmup(),
+        args.effective_iters(),
         || sum_i64(&col),
         &[],
     ))
@@ -262,8 +312,8 @@ fn run_count(args: &Args) -> Result<String> {
     Ok(time_iters(
         "count",
         n,
-        args.warmup,
-        args.iters,
+        args.effective_warmup(),
+        args.effective_iters(),
         || count_i64(&col),
         &[],
     ))
@@ -276,8 +326,8 @@ fn run_min(args: &Args) -> Result<String> {
     Ok(time_iters(
         "min",
         n,
-        args.warmup,
-        args.iters,
+        args.effective_warmup(),
+        args.effective_iters(),
         || min_i64(&col).map_or(0_i64, |v| v),
         &[],
     ))
@@ -290,8 +340,8 @@ fn run_max(args: &Args) -> Result<String> {
     Ok(time_iters(
         "max",
         n,
-        args.warmup,
-        args.iters,
+        args.effective_warmup(),
+        args.effective_iters(),
         || max_i64(&col).map_or(0_i64, |v| v),
         &[],
     ))
@@ -304,8 +354,8 @@ fn run_minmax(args: &Args) -> Result<String> {
     Ok(time_iters(
         "minmax",
         n,
-        args.warmup,
-        args.iters,
+        args.effective_warmup(),
+        args.effective_iters(),
         || {
             let lo = min_i64(&col).unwrap_or(0);
             let hi = max_i64(&col).unwrap_or(0);
@@ -323,8 +373,8 @@ fn run_avg(args: &Args) -> Result<String> {
     Ok(time_iters(
         "avg",
         n,
-        args.warmup,
-        args.iters,
+        args.effective_warmup(),
+        args.effective_iters(),
         || {
             let s = sum_i64(&col);
             let c = count_i64(&col);
@@ -356,8 +406,8 @@ fn run_filter(args: &Args) -> Result<String> {
     Ok(time_iters(
         "filter",
         n,
-        args.warmup,
-        args.iters,
+        args.effective_warmup(),
+        args.effective_iters(),
         || {
             let mask = cmp_gt_i64(&col_y, 0);
             sum_i64_with_mask(&col_x, &mask)
@@ -375,8 +425,8 @@ fn run_range(args: &Args) -> Result<String> {
     Ok(time_iters(
         "range",
         n,
-        args.warmup,
-        args.iters,
+        args.effective_warmup(),
+        args.effective_iters(),
         || {
             let m = range_mask_i64(&col, lo, hi);
             m.count_ones()
@@ -413,7 +463,7 @@ fn run_point(args: &Args) -> Result<String> {
     //    pool does not yet evict dirty pages. We estimate ~256
     //    entries per leaf for 8-byte keys + 8-byte values + entry
     //    framing, and reserve generous headroom.
-    let n = args.point_n;
+    let n = args.effective_point_n();
     // The v0.5 buffer pool refuses to evict dirty pages; we must size
     // it to hold every leaf + internal page the workload dirties. The
     // B-tree caps a leaf at 32 entries (see btree.rs::MAX_LEAF_ENTRIES),
@@ -464,7 +514,7 @@ fn run_point(args: &Args) -> Result<String> {
     }
 
     // 4) Warm up.
-    for _ in 0..args.warmup {
+    for _ in 0..args.effective_warmup() {
         let mut hits: i64 = 0;
         for &k in &keys {
             if let Some(t) = tree.lookup::<i64>(k).unwrap_or(None) {
@@ -475,9 +525,9 @@ fn run_point(args: &Args) -> Result<String> {
     }
 
     // 5) Time `iters` runs of `probes` lookups each.
-    let mut us: Vec<f64> = Vec::with_capacity(args.iters);
+    let mut us: Vec<f64> = Vec::with_capacity(args.effective_iters());
     let mut last_hits: i64 = 0;
-    for _ in 0..args.iters {
+    for _ in 0..args.effective_iters() {
         let t0 = Instant::now();
         let mut hits: i64 = 0;
         for &k in &keys {

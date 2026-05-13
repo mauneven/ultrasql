@@ -53,6 +53,10 @@ path = "src/bin/tpch.rs"
 name = "readme-render"
 path = "src/bin/readme_render.rs"
 
+[[bin]]
+name = "results-render"
+path = "src/bin/results_render.rs"
+
 [[bench]]
 name    = "v07_vectorized"
 path    = "benches/v07_vectorized.rs"

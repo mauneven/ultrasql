@@ -1,4 +1,0 @@
-sum-256k	{"workload":"sum","n_rows":256000,"samples":8,"median_us":27.230,"min_us":27.125,"iterations_us":[27.250,27.209,27.208,34.375,27.458,27.708,27.125,27.167],"answer":"681229054427"}
-sum-4m	{"workload":"sum","n_rows":4000000,"samples":8,"median_us":401.375,"min_us":392.583,"iterations_us":[403.291,396.791,392.583,400.958,411.416,394.500,415.042,401.791],"answer":"1656749245536"}
-count-1m	{"workload":"count","n_rows":1000000,"samples":8,"median_us":0.000,"min_us":0.000,"iterations_us":[0.042,0.042,0.000,0.000,0.000,0.042,0.000,0.000],"answer":"1000000"}
-avg-1m	{"workload":"avg","n_rows":1000000,"samples":8,"median_us":159.645,"min_us":114.000,"iterations_us":[114.000,163.541,143.500,155.750,166.667,139.000,206.958,176.209],"answer":"2019621"}
