@@ -198,9 +198,19 @@ impl<L: PageLoader> BufferPool<L> {
             self.frames[frame_idx]
                 .pin_count
                 .fetch_add(1, Ordering::AcqRel);
+            // `clock_ref` is purely advisory for the CLOCK eviction
+            // hand: setting it tells the next sweep "this frame was
+            // recently used; please come back later." A torn / stale
+            // read from the eviction thread is harmless — the worst
+            // case is one extra rotation of the hand before the bit
+            // takes effect, which is still bounded by the (capacity *
+            // 4) outer attempt cap in `acquire_frame_for`. The pin
+            // count above already supplies the AcqRel needed to
+            // synchronize with eviction; the clock-ref store has no
+            // happens-before consumers, so `Relaxed` is sufficient.
             self.frames[frame_idx]
                 .clock_ref
-                .store(true, Ordering::Release);
+                .store(true, Ordering::Relaxed);
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(PageGuard {
                 pool: Arc::clone(self),
