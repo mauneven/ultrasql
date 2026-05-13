@@ -24,6 +24,8 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod lock;
 pub mod manager;
 
+pub use lock::{LockError, LockManager, LockMode, LockRequest, LockTableSnapshot, LockTag};
 pub use manager::{IsolationLevel, Transaction, TransactionManager, TxnError};
