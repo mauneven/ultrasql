@@ -8,12 +8,17 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod buffer;
+pub mod payload;
 pub mod record;
 pub mod recovery;
 pub(crate) mod segment;
 pub mod writer;
 
 pub use buffer::{WalBuffer, WalBufferError};
+pub use payload::{
+    AbortPayload, CheckpointPayload, CommitPayload, FullPageWritePayload, HeapDeletePayload,
+    HeapInsertPayload, HeapUpdatePayload, PayloadError,
+};
 pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};
 pub use recovery::{RecoveryError, recover};
 pub use writer::{WalWriter, WalWriterConfig, WalWriterError};
