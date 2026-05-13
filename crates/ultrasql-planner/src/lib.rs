@@ -26,7 +26,7 @@ pub use binder::bind;
 pub use catalog::{Catalog, InMemoryCatalog, TableMeta};
 pub use error::PlanError;
 pub use expr::{BinaryOp, ScalarExpr, UnaryOp};
-pub use plan::{LogicalPlan, SortKey};
+pub use plan::{ConflictTarget, LogicalOnConflict, LogicalPlan, SortKey};
 
 #[cfg(test)]
 mod tests {

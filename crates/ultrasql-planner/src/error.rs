@@ -28,6 +28,10 @@ pub enum PlanError {
     #[error("type mismatch: {0}")]
     TypeMismatch(String),
 
+    /// The same column name appeared more than once in a column list.
+    #[error("duplicate column: '{0}'")]
+    DuplicateColumn(String),
+
     /// The construct is syntactically valid but not yet implemented by
     /// the binder. Carries a `'static` reason so this branch stays
     /// cheap.
