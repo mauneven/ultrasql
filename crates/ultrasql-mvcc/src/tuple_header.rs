@@ -53,6 +53,14 @@ impl InfoMask {
     /// Tuple has been frozen by vacuum. `xmin` is no longer
     /// authoritative; treat the tuple as visible to all snapshots.
     pub const FROZEN: u16 = 1 << 8;
+    /// Tuple was written by a subtransaction (savepoint).
+    ///
+    /// When this bit is set, `xmin` identifies the subtransaction XID
+    /// rather than the top-level transaction XID. Visibility rules must
+    /// consult the subtransaction rollback set: a subtransaction whose
+    /// XID appears in the rollback set is treated as aborted, making
+    /// its tuples invisible even to the parent transaction.
+    pub const SUBXACT: u16 = 1 << 9;
 
     /// Wrap an existing 16-bit mask.
     #[must_use]
@@ -86,6 +94,16 @@ impl InfoMask {
     #[must_use]
     pub const fn is_frozen(self) -> bool {
         self.contains(Self::FROZEN)
+    }
+
+    /// `true` iff [`Self::SUBXACT`] is set.
+    ///
+    /// When `true`, `xmin` in the owning [`TupleHeader`] is a
+    /// subtransaction XID. Callers must check whether that subtransaction
+    /// has been rolled back before treating the tuple as visible.
+    #[must_use]
+    pub const fn is_subxact(self) -> bool {
+        self.contains(Self::SUBXACT)
     }
 }
 
@@ -188,6 +206,15 @@ impl TupleHeader {
     #[must_use]
     pub const fn is_alive(&self) -> bool {
         self.xmax.is_invalid()
+    }
+
+    /// `true` if this tuple was written by a subtransaction.
+    ///
+    /// When `true`, callers should verify that `self.xmin` is not in the
+    /// rolled-back subtransaction set before treating the tuple as visible.
+    #[must_use]
+    pub const fn is_subxact(&self) -> bool {
+        self.infomask.is_subxact()
     }
 
     /// Mark this tuple deleted by `xmax` at command `cmax`.

@@ -15,4 +15,4 @@ pub mod visibility;
 pub use snapshot::Snapshot;
 pub use status::{XidStatus, XidStatusOracle};
 pub use tuple_header::{InfoMask, TupleHeader};
-pub use visibility::{Visibility, is_visible};
+pub use visibility::{NoSubxacts, SubxactOracle, Visibility, is_visible, is_visible_ext};

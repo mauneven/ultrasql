@@ -10,7 +10,44 @@ use ultrasql_core::Xid;
 
 use crate::snapshot::Snapshot;
 use crate::status::{XidStatus, XidStatusOracle};
-use crate::tuple_header::TupleHeader;
+use crate::tuple_header::{InfoMask, TupleHeader};
+
+/// Oracle consulted when a tuple has the [`InfoMask::SUBXACT`] bit set.
+///
+/// Implementations return `true` if the given subtransaction XID was
+/// rolled back within its parent transaction.  A tuple with `SUBXACT` set
+/// whose `xmin` returns `true` here is invisible even to the parent
+/// transaction — it was written under a savepoint that was subsequently
+/// rolled back.
+///
+/// A no-op implementation (always returns `false`) is correct when
+/// subtransactions are not in use or when the CLOG already marks the subxid
+/// as `Aborted` (visibility will then reject it via the normal oracle path).
+/// The dedicated oracle exists for the case where the parent transaction is
+/// still in progress and the CLOG entry for the subxid is `Aborted` but
+/// the caller wants a fast local check without a CLOG lookup.
+pub trait SubxactOracle: Send + Sync {
+    /// Return `true` iff `subxid` was rolled back within its parent
+    /// transaction.
+    fn is_rolled_back(&self, subxid: Xid) -> bool;
+}
+
+/// A [`SubxactOracle`] that always returns `false`.
+///
+/// Use this when no subtransaction tracking is available or when the
+/// normal XID-status oracle already handles aborted subtransactions via
+/// CLOG entries.
+/// A no-op [`SubxactOracle`] for use when subtransactions are not tracked.
+///
+/// See module-level docs for usage.
+#[derive(Debug)]
+pub struct NoSubxacts;
+
+impl SubxactOracle for NoSubxacts {
+    fn is_rolled_back(&self, _subxid: Xid) -> bool {
+        false
+    }
+}
 
 /// Outcome of a visibility check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +67,11 @@ pub enum Visibility {
 /// Decide whether `header` is visible to `snapshot`, consulting the
 /// `oracle` for transaction status when needed.
 ///
+/// This is the core MVCC predicate used by heap scans. For scenarios
+/// involving subtransaction rollback tracking, prefer
+/// [`is_visible_ext`] which accepts an additional [`SubxactOracle`]
+/// parameter.
+///
 /// Decision tree (mirroring HeapTupleSatisfiesMVCC):
 ///
 /// 1. **Frozen tuples** are visible to everyone.
@@ -45,14 +87,65 @@ pub enum Visibility {
 /// 4. If the deleter is committed before the snapshot, the tuple is
 ///    invisible.
 /// 5. Otherwise the tuple is visible.
+///
+/// Note: tuples with the [`InfoMask::SUBXACT`] bit set are handled
+/// correctly when the CLOG already marks the subtransaction `Aborted`.
+/// For the in-transaction case where the parent is still in-progress,
+/// use [`is_visible_ext`] with a proper [`SubxactOracle`].
 #[must_use]
 pub fn is_visible<O: XidStatusOracle + ?Sized>(
     header: &TupleHeader,
     snapshot: &Snapshot,
     oracle: &O,
 ) -> Visibility {
+    is_visible_ext(header, snapshot, oracle, &NoSubxacts)
+}
+
+/// Decide whether `header` is visible, with subtransaction rollback
+/// awareness.
+///
+/// Extends [`is_visible`] with an additional [`SubxactOracle`] consulted
+/// when the tuple has the [`InfoMask::SUBXACT`] bit set. A tuple written
+/// by a rolled-back savepoint is invisible even to the parent transaction.
+///
+/// Decision tree (mirroring `HeapTupleSatisfiesMVCC` with subtxn extension):
+///
+/// 1. **Frozen tuples** are visible to everyone.
+/// 2. If the tuple has the [`InfoMask::SUBXACT`] bit set and `subxact`
+///    reports the `xmin` subtransaction XID as rolled back, the tuple is
+///    invisible — it was written under a savepoint that was rolled back.
+/// 3. If the inserter is the current transaction:
+///    - if the insert command is **after** the snapshot's current
+///      command, the tuple is invisible.
+///    - if the deleter is also the current transaction at an earlier
+///      command, the tuple is **[`Visibility::DeletedByOwn`]**.
+///    - otherwise the tuple is visible.
+/// 4. If the inserter is **not** committed (in progress or aborted)
+///    according to the snapshot, the tuple is invisible.
+/// 5. If the deleter is committed before the snapshot, the tuple is
+///    invisible.
+/// 6. Otherwise the tuple is visible.
+#[must_use]
+pub fn is_visible_ext<O, S>(
+    header: &TupleHeader,
+    snapshot: &Snapshot,
+    oracle: &O,
+    subxact: &S,
+) -> Visibility
+where
+    O: XidStatusOracle + ?Sized,
+    S: SubxactOracle + ?Sized,
+{
     if header.infomask.is_frozen() {
         return Visibility::Visible;
+    }
+
+    // --- subtransaction rollback check ----------------------------------
+
+    if header.infomask.contains(InfoMask::SUBXACT) && subxact.is_rolled_back(header.xmin) {
+        // Written under a savepoint that was subsequently rolled back.
+        // Invisible even to the parent transaction.
+        return Visibility::Invisible;
     }
 
     // --- check xmin -----------------------------------------------------
@@ -270,5 +363,53 @@ mod tests {
         oracle.set_committed(Xid::new(5));
         oracle.set_in_progress(Xid::new(18));
         assert_eq!(is_visible(&header, &snap, &oracle), Visibility::Visible);
+    }
+
+    // ── subtransaction visibility ─────────────────────────────────────────────
+
+    /// A tuple with SUBXACT set whose subxid is in the rolled-back set
+    /// must be invisible, even when the CLOG would say committed.
+    #[test]
+    fn subxact_rolled_back_tuple_is_invisible() {
+        use std::collections::HashSet;
+
+        struct RolledBackOracle(HashSet<u64>);
+        impl SubxactOracle for RolledBackOracle {
+            fn is_rolled_back(&self, subxid: Xid) -> bool {
+                self.0.contains(&subxid.raw())
+            }
+        }
+
+        let mut header = h(42, 0, 0, 0);
+        header.infomask.set(InfoMask::SUBXACT);
+
+        let snap = snap(10, 60, 50, 1);
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::new(42));
+
+        let rolled = RolledBackOracle([42].into_iter().collect());
+        assert_eq!(
+            is_visible_ext(&header, &snap, &oracle, &rolled),
+            Visibility::Invisible,
+            "rolled-back savepoint tuple must be invisible"
+        );
+    }
+
+    /// A tuple with SUBXACT set whose subxid is NOT rolled back follows
+    /// normal MVCC rules.
+    #[test]
+    fn subxact_not_rolled_back_follows_normal_rules() {
+        let mut header = h(5, 0, 0, 0);
+        header.infomask.set(InfoMask::SUBXACT);
+
+        let snap = snap(10, 20, 50, 0);
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::new(5));
+
+        assert_eq!(
+            is_visible_ext(&header, &snap, &oracle, &NoSubxacts),
+            Visibility::Visible,
+            "non-rolled-back savepoint tuple must be visible when committed"
+        );
     }
 }

@@ -19,11 +19,15 @@
 //!
 //! - [`ssi`] — PostgreSQL-style Serializable Snapshot Isolation (SSI):
 //!   predicate locks, rw-anti-dependency tracking, dangerous-structure
-//!   detection.
+//!   detection, and real `SERIALIZABLE` isolation via
+//!   [`TransactionManager::new_with_ssi`].
 //! - [`savepoint`] — Subtransaction / savepoint manager implementing
-//!   `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT`.
+//!   `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE SAVEPOINT`, with
+//!   rolled-back subtransaction tracking for MVCC visibility.
 //! - [`two_phase`] — Two-phase commit coordinator implementing
 //!   `PREPARE TRANSACTION`, `COMMIT PREPARED`, `ROLLBACK PREPARED`.
+//! - [`row_lock`] — Row-level locking API for `SELECT FOR UPDATE`,
+//!   `FOR SHARE`, `FOR NO KEY UPDATE`, and `FOR KEY SHARE`.
 //!
 //! The CLOG in this revision is an in-memory `DashMap`. A persistent,
 //! page-backed CLOG is tracked as a follow-up; the API does not change.
@@ -36,12 +40,14 @@
 
 pub mod lock;
 pub mod manager;
+pub mod row_lock;
 pub mod savepoint;
 pub mod ssi;
 pub mod two_phase;
 
 pub use lock::{LockError, LockManager, LockMode, LockRequest, LockTableSnapshot, LockTag};
 pub use manager::{IsolationLevel, Transaction, TransactionManager, TxnError};
+pub use row_lock::{RowLockExt, RowLockMode, RowLockRequest};
 pub use savepoint::{SavepointError, Subtxn, SubtxnManager};
 pub use ssi::{PredicateLock, PredicateLockTag, SsiError, SsiManager};
 pub use two_phase::{PreparedTxn, TwoPhaseCoordinator, TwoPhaseError};

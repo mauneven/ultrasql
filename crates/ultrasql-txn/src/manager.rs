@@ -43,13 +43,16 @@
 //!
 //! No `unwrap` or `expect` is used in non-test code in this module.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use ultrasql_core::{CommandId, Lsn, Xid};
 use ultrasql_mvcc::{Snapshot, XidStatus, XidStatusOracle};
 
+use crate::lock::LockManager;
 use crate::savepoint::{SavepointError, Subtxn, SubtxnManager};
+use crate::ssi::{PredicateLockTag, SsiError, SsiManager};
 
 /// Isolation level applied to a [`Transaction`].
 ///
@@ -67,8 +70,14 @@ pub enum IsolationLevel {
     /// life of the transaction. `refresh_snapshot` only bumps the
     /// command id.
     RepeatableRead,
-    /// Same snapshot strategy as [`Self::RepeatableRead`] in v0.5;
-    /// predicate locking will gate this level once implemented.
+    /// True Serializable Snapshot Isolation (SSI).
+    ///
+    /// Uses the same fixed snapshot strategy as [`Self::RepeatableRead`]
+    /// for reads, and additionally registers the transaction with
+    /// [`SsiManager`] to track rw-anti-dependency edges. On commit,
+    /// the SSI manager checks for dangerous structures (T1 → T2 → T3
+    /// cycles); if a cycle is found, the commit fails with
+    /// [`TxnError::SerializationFailure`].
     Serializable,
 }
 
@@ -92,6 +101,20 @@ pub enum TxnError {
     Unknown {
         /// The XID that was not found.
         xid: Xid,
+    },
+    /// A serialization anomaly was detected by the SSI manager during
+    /// commit. The transaction identified by `victim` must abort and
+    /// retry.
+    ///
+    /// This error is only returned for transactions begun with
+    /// [`IsolationLevel::Serializable`] when a [`SsiManager`] is
+    /// installed in the [`TransactionManager`].
+    #[error("serialization failure: transaction {victim:?} is the pivot; {detail}")]
+    SerializationFailure {
+        /// The XID that was chosen as the pivot victim.
+        victim: Xid,
+        /// Human-readable description of the conflict structure.
+        detail: String,
     },
 }
 
@@ -136,6 +159,10 @@ pub struct Transaction {
 ///
 /// Owns the XID counter and the in-memory CLOG. One instance per server;
 /// the manager is `Send + Sync` and intended to be shared via `Arc`.
+///
+/// When an [`SsiManager`] is installed (via [`TransactionManager::new_with_ssi`]),
+/// transactions begun at [`IsolationLevel::Serializable`] are registered
+/// with the SSI manager and their commits are checked for dangerous structures.
 #[derive(Debug)]
 pub struct TransactionManager {
     /// The XID allocator. Stores the *next* XID to hand out.
@@ -146,6 +173,16 @@ pub struct TransactionManager {
     /// that transition is owned by the vacuum subsystem and is not
     /// performed here.
     clog: DashMap<Xid, XidStatus>,
+    /// Optional SSI conflict tracker. Present only when the server is
+    /// configured to support [`IsolationLevel::Serializable`] isolation.
+    /// `None` causes Serializable to alias `RepeatableRead` (the pre-v0.4
+    /// behaviour).
+    ssi: Option<Arc<SsiManager>>,
+    /// Lock manager for row-level and relation-level locks.
+    ///
+    /// Owned here so commit/abort can release all locks held by the
+    /// terminating transaction.
+    pub lock_manager: Arc<LockManager>,
 }
 
 impl Default for TransactionManager {
@@ -155,14 +192,35 @@ impl Default for TransactionManager {
 }
 
 impl TransactionManager {
-    /// Construct a fresh manager.
+    /// Construct a fresh manager with no SSI support.
     ///
     /// The XID counter starts at [`Xid::FIRST_USER`]. The CLOG is empty.
+    /// Transactions begun with [`IsolationLevel::Serializable`] will
+    /// alias [`IsolationLevel::RepeatableRead`] until an [`SsiManager`]
+    /// is installed via [`Self::new_with_ssi`].
     #[must_use]
     pub fn new() -> Self {
         Self {
             next_xid: AtomicU64::new(Xid::FIRST_USER.raw()),
             clog: DashMap::new(),
+            ssi: None,
+            lock_manager: Arc::new(LockManager::new()),
+        }
+    }
+
+    /// Construct a manager with full SSI support.
+    ///
+    /// Transactions begun with [`IsolationLevel::Serializable`] will be
+    /// registered in `ssi` and their commits will undergo the
+    /// dangerous-structure check.  Returns [`TxnError::SerializationFailure`]
+    /// when a cycle is detected.
+    #[must_use]
+    pub fn new_with_ssi(ssi: Arc<SsiManager>) -> Self {
+        Self {
+            next_xid: AtomicU64::new(Xid::FIRST_USER.raw()),
+            clog: DashMap::new(),
+            ssi: Some(ssi),
+            lock_manager: Arc::new(LockManager::new()),
         }
     }
 
@@ -187,6 +245,14 @@ impl TransactionManager {
 
         // 3. Sample the active transactions and the high-water XID.
         let snapshot = self.build_snapshot(xid, CommandId::FIRST);
+
+        // 4. Register with SSI if this is a serializable transaction and an
+        //    SSI manager is installed.
+        if isolation == IsolationLevel::Serializable {
+            if let Some(ssi) = &self.ssi {
+                ssi.register_xid(xid);
+            }
+        }
 
         Transaction {
             xid,
@@ -229,6 +295,12 @@ impl TransactionManager {
 
     /// Commit `txn`. Marks the XID `Committed` in the CLOG.
     ///
+    /// For [`IsolationLevel::Serializable`] transactions with an installed
+    /// [`SsiManager`], the SSI manager's dangerous-structure check is run
+    /// after the CLOG entry is flipped. If a serialization anomaly is
+    /// detected, the commit fails with [`TxnError::SerializationFailure`]
+    /// and the caller must call [`Self::abort`] to roll back.
+    ///
     /// Returns [`TxnError::AlreadyTerminated`] if the XID has already
     /// been committed or aborted, [`TxnError::Unknown`] if the XID is
     /// not in the CLOG. Both indicate misuse; callers are expected to
@@ -243,7 +315,29 @@ impl TransactionManager {
         reason = "by-value enforces the at-most-once lifecycle invariant"
     )]
     pub fn commit(&self, txn: Transaction) -> Result<(), TxnError> {
-        self.terminate(txn.xid, XidStatus::Committed)
+        let xid = txn.xid;
+        let isolation = txn.isolation;
+        self.terminate(xid, XidStatus::Committed)?;
+
+        // Release all row-level and relation-level locks.
+        self.lock_manager.release_all(xid);
+
+        // SSI check: only for serializable transactions with an installed manager.
+        if isolation == IsolationLevel::Serializable {
+            if let Some(ssi) = &self.ssi {
+                if let Err(SsiError::Serialization { victim, detail }) = ssi.commit(xid) {
+                    // The SSI manager marked us committed before detecting the
+                    // cycle; we must immediately abort to restore consistency.
+                    // Flip the CLOG entry back to Aborted using the force path
+                    // since the entry is now Committed, not InProgress.
+                    self.force_abort(xid);
+                    ssi.abort(xid);
+                    return Err(TxnError::SerializationFailure { victim, detail });
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Abort `txn`. Marks the XID `Aborted` in the CLOG.
@@ -255,7 +349,21 @@ impl TransactionManager {
         reason = "by-value enforces the at-most-once lifecycle invariant"
     )]
     pub fn abort(&self, txn: Transaction) -> Result<(), TxnError> {
-        self.terminate(txn.xid, XidStatus::Aborted)
+        let xid = txn.xid;
+        let isolation = txn.isolation;
+        self.terminate(xid, XidStatus::Aborted)?;
+
+        // Release all row-level and relation-level locks.
+        self.lock_manager.release_all(xid);
+
+        // Notify SSI of the abort so the entry can be removed.
+        if isolation == IsolationLevel::Serializable {
+            if let Some(ssi) = &self.ssi {
+                ssi.abort(xid);
+            }
+        }
+
+        Ok(())
     }
 
     /// Current oldest in-progress XID.
@@ -375,6 +483,9 @@ impl TransactionManager {
                     *entry.value_mut() = XidStatus::Aborted;
                 }
             }
+            // Track the rollback locally so visibility code can detect
+            // SUBXACT-flagged tuples written by this savepoint.
+            txn.subtxn_stack.record_rolled_back(sub_xid);
         }
         Ok(aborted_xids)
     }
@@ -446,6 +557,43 @@ impl TransactionManager {
                 Ok(())
             }
             other => Err(TxnError::AlreadyTerminated { xid, status: other }),
+        }
+    }
+
+    /// Force-set the CLOG entry for `xid` to `Aborted`, regardless of the
+    /// current status.
+    ///
+    /// Used exclusively by the SSI commit path to roll back a transaction
+    /// that was optimistically flipped to `Committed` but subsequently
+    /// found to be the pivot of a dangerous structure.  Callers must hold
+    /// the SSI manager's entry for `xid` while invoking this to prevent
+    /// concurrent observers from seeing a partially-committed state.
+    fn force_abort(&self, xid: Xid) {
+        if let Some(mut entry) = self.clog.get_mut(&xid) {
+            *entry.value_mut() = XidStatus::Aborted;
+        }
+    }
+
+    // ── SSI pass-through methods ─────────────────────────────────────────────
+
+    /// Record a predicate lock for a serializable transaction.
+    ///
+    /// Pass-through to [`SsiManager::add_predicate_lock`]. No-ops when no
+    /// [`SsiManager`] is installed or when `xid` was not begun at
+    /// [`IsolationLevel::Serializable`].
+    pub fn record_predicate_lock(&self, xid: Xid, tag: PredicateLockTag) {
+        if let Some(ssi) = &self.ssi {
+            ssi.add_predicate_lock(xid, tag);
+        }
+    }
+
+    /// Record an rw-anti-dependency edge from `reader` to `writer`.
+    ///
+    /// Pass-through to [`SsiManager::record_rw_conflict`]. No-ops when no
+    /// [`SsiManager`] is installed.
+    pub fn record_rw_conflict(&self, reader: Xid, writer: Xid) {
+        if let Some(ssi) = &self.ssi {
+            ssi.record_rw_conflict(reader, writer);
         }
     }
 }
@@ -597,8 +745,8 @@ mod tests {
 
     #[test]
     fn serializable_refresh_keeps_snapshot_like_rr() {
-        // TODO(serializable): predicate locking lands separately. For
-        // v0.5 the snapshot strategy mirrors RepeatableRead.
+        // v0.4: Serializable uses a fixed snapshot (same as RepeatableRead)
+        // combined with SSI conflict tracking via SsiManager.
         let mgr = TransactionManager::new();
         let _t1 = mgr.begin(IsolationLevel::ReadCommitted);
 
@@ -751,5 +899,131 @@ mod tests {
         let max = sorted.last().copied().expect("non-empty");
         assert_eq!(min.raw(), first);
         assert_eq!(max.raw(), last);
+    }
+
+    // ── SSI integration ────────────────────────────────────────────────────
+
+    #[test]
+    fn serializable_with_ssi_no_conflict_commits_cleanly() {
+        let ssi = Arc::new(crate::ssi::SsiManager::new());
+        let mgr = TransactionManager::new_with_ssi(Arc::clone(&ssi));
+
+        let t1 = mgr.begin(IsolationLevel::Serializable);
+        let t2 = mgr.begin(IsolationLevel::Serializable);
+
+        // No rw-conflict edges → both must commit.
+        mgr.commit(t1).unwrap();
+        mgr.commit(t2).unwrap();
+    }
+
+    #[test]
+    fn serializable_with_ssi_pivot_fails_with_serialization_failure() {
+        use ultrasql_core::RelationId;
+
+        let ssi = Arc::new(crate::ssi::SsiManager::new());
+        let mgr = TransactionManager::new_with_ssi(Arc::clone(&ssi));
+
+        let t1 = mgr.begin(IsolationLevel::Serializable);
+        let t2 = mgr.begin(IsolationLevel::Serializable);
+        let t3 = mgr.begin(IsolationLevel::Serializable);
+
+        // Build T1 --rw--> T2 --rw--> T3 (T2 is pivot).
+        mgr.record_rw_conflict(t1.xid, t2.xid);
+        mgr.record_rw_conflict(t2.xid, t3.xid);
+
+        // T1 commits first — marks one leg as committed.
+        mgr.commit(t1).unwrap();
+
+        // T2 is the pivot → must fail.
+        let err = mgr.commit(t2).expect_err("T2 (pivot) must fail");
+        assert!(
+            matches!(err, TxnError::SerializationFailure { .. }),
+            "expected SerializationFailure, got {err:?}"
+        );
+
+        // After T2's commit fails, its CLOG entry must be Aborted.
+        assert_eq!(mgr.status(t2.xid), XidStatus::Aborted);
+
+        // T3 has no conflict-in so it commits cleanly.
+        mgr.commit(t3).unwrap();
+        assert_eq!(mgr.status(t3.xid), XidStatus::Committed);
+    }
+
+    #[test]
+    fn commit_releases_all_locks_on_commit() {
+        use crate::lock::{LockMode, LockRequest, LockTag};
+        use ultrasql_core::RelationId;
+
+        let mgr = TransactionManager::new();
+        let t = mgr.begin(IsolationLevel::ReadCommitted);
+        let xid = t.xid;
+
+        let tag = LockTag::Relation(RelationId::new(1));
+        mgr.lock_manager
+            .acquire(LockRequest {
+                xid,
+                tag,
+                mode: LockMode::Exclusive,
+            })
+            .unwrap();
+
+        // Lock must be held.
+        let snap = mgr.lock_manager.inspect(tag).expect("entry must exist");
+        assert!(snap.grants.iter().any(|(x, _)| *x == xid));
+
+        // Commit — must release all locks.
+        mgr.commit(t).unwrap();
+
+        // Entry pruned (no grants, no waiters).
+        assert!(
+            mgr.lock_manager.inspect(tag).is_none(),
+            "lock must be released on commit"
+        );
+    }
+
+    #[test]
+    fn abort_releases_all_locks_on_abort() {
+        use crate::lock::{LockMode, LockRequest, LockTag};
+        use ultrasql_core::RelationId;
+
+        let mgr = TransactionManager::new();
+        let t = mgr.begin(IsolationLevel::ReadCommitted);
+        let xid = t.xid;
+
+        let tag = LockTag::Relation(RelationId::new(2));
+        mgr.lock_manager
+            .acquire(LockRequest {
+                xid,
+                tag,
+                mode: LockMode::Share,
+            })
+            .unwrap();
+
+        // Abort — must release all locks.
+        mgr.abort(t).unwrap();
+
+        assert!(
+            mgr.lock_manager.inspect(tag).is_none(),
+            "lock must be released on abort"
+        );
+    }
+
+    #[test]
+    fn savepoint_rollback_records_rolled_back_subxid() {
+        let mgr = TransactionManager::new();
+        let mut t = mgr.begin(IsolationLevel::ReadCommitted);
+
+        let sp = mgr.begin_savepoint(&mut t, "sp1");
+        let sub_xid = sp.xid;
+
+        // Roll back to "sp1" — sub_xid should be marked rolled back.
+        let aborted = mgr.rollback_to_savepoint(&mut t, "sp1").unwrap();
+        assert!(aborted.contains(&sub_xid));
+        assert!(
+            t.subtxn_stack.is_rolled_back(sub_xid),
+            "sub_xid must be in the rolled-back set after rollback_to_savepoint"
+        );
+
+        mgr.commit(t).unwrap();
     }
 }

@@ -31,3 +31,7 @@ criterion = { workspace = true }
 [[bench]]
 name    = "txn_advanced"
 harness = false
+
+[[bench]]
+name    = "txn_v04"
+harness = false

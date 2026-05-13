@@ -29,6 +29,8 @@
 //! uncontended in practice; it exists only so the type can be held inside an
 //! `Arc<SubtxnManager>` without `RefCell`.
 
+use std::collections::HashSet;
+
 use parking_lot::Mutex;
 use ultrasql_core::{CommandId, Xid};
 
@@ -67,29 +69,44 @@ pub enum SavepointError {
 /// [`Self::savepoint`] and shrinks on [`Self::rollback_to`] (which may
 /// pop multiple entries) or [`Self::release`] (which pops exactly one).
 ///
+/// Also maintains a per-parent set of rolled-back subtransaction XIDs so
+/// that visibility code can detect tuples written by rolled-back savepoints
+/// even when the parent transaction is still in progress (i.e. when the
+/// [`crate::manager::TransactionManager`] CLOG already marks those subxids
+/// `Aborted` but callers want a fast local check).
+///
 /// # Send + Sync
 ///
 /// [`SubtxnManager`] is `Send + Sync` because `parking_lot::Mutex` is
-/// `Send + Sync` and `Vec<Subtxn>` contains only `Send + Sync` types.
+/// `Send + Sync` and all inner collections contain only `Send + Sync` types.
 #[derive(Debug)]
 pub struct SubtxnManager {
     /// Parent (top-level) XID.  Informational; not mutated after construction.
     parent_xid: Xid,
     /// Stack of active savepoints, LIFO order.
     stack: Mutex<Vec<Subtxn>>,
+    /// XIDs of subtransactions that have been rolled back within this
+    /// top-level transaction.  Entries are added by
+    /// [`Self::record_rolled_back`] (typically called by the transaction
+    /// manager after updating the CLOG) and never removed — aborted state
+    /// is permanent.
+    rolled_back: Mutex<HashSet<Xid>>,
 }
 
 impl Clone for SubtxnManager {
-    /// Clone the manager, producing a snapshot of the current stack.
+    /// Clone the manager, producing a snapshot of the current stack and
+    /// rolled-back set.
     ///
     /// The cloned instance shares no lock with the original; subsequent
     /// mutations to either are independent.  This matches the semantics
     /// needed for cloning a [`crate::manager::Transaction`] handle.
     fn clone(&self) -> Self {
         let stack_clone = self.stack.lock().clone();
+        let rolled_back_clone = self.rolled_back.lock().clone();
         Self {
             parent_xid: self.parent_xid,
             stack: Mutex::new(stack_clone),
+            rolled_back: Mutex::new(rolled_back_clone),
         }
     }
 }
@@ -98,10 +115,11 @@ impl SubtxnManager {
     /// Create a new [`SubtxnManager`] for a transaction with the given parent
     /// XID.
     #[must_use]
-    pub const fn new(parent: Xid) -> Self {
+    pub fn new(parent: Xid) -> Self {
         Self {
             parent_xid: parent,
             stack: Mutex::new(Vec::new()),
+            rolled_back: Mutex::new(HashSet::new()),
         }
     }
 
@@ -200,6 +218,25 @@ impl SubtxnManager {
     /// Return the depth of the savepoint stack (number of active savepoints).
     pub fn depth(&self) -> usize {
         self.stack.lock().len()
+    }
+
+    /// Record `subxid` as having been rolled back within this transaction.
+    ///
+    /// Called by the transaction manager after marking the subtransaction
+    /// `Aborted` in the CLOG.  Visibility code consults
+    /// [`Self::is_rolled_back`] when it encounters a tuple with the
+    /// `SUBXACT` infomask bit set.
+    pub fn record_rolled_back(&self, subxid: Xid) {
+        self.rolled_back.lock().insert(subxid);
+    }
+
+    /// Return `true` if `subxid` was rolled back within this transaction.
+    ///
+    /// This is a local, lock-free-when-uncontended alternative to querying
+    /// the CLOG.  The set only grows; entries are never removed.
+    #[must_use]
+    pub fn is_rolled_back(&self, subxid: Xid) -> bool {
+        self.rolled_back.lock().contains(&subxid)
     }
 }
 
