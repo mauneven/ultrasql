@@ -30,6 +30,6 @@ pub use batch::{Batch, BatchError};
 pub use bitmap::Bitmap;
 pub use column::{Column, ColumnError};
 pub use kernels::{
-    cmp_gt_i64, count_i64, eq_i32, max_i64, min_f64, min_i64, range_mask_i64, select_i32, sum_i64,
-    sum_i64_with_mask,
+    cmp_gt_i64, cmp_gt_i64_scalar, count_i64, eq_i32, max_i64, min_f64, min_i64, range_mask_i64,
+    select_i32, sum_i64, sum_i64_with_mask,
 };

@@ -1,0 +1,2 @@
+insert-bulk-100k	{"workload":"insert-bulk","n_rows":100000,"samples":4,"median_us":1540937.458,"min_us":1455879.292,"iterations_us":[1483828.166,1455879.292,1598046.750,1687661.625],"answer":"inserted=100000"}
+insert-bulk-1m	

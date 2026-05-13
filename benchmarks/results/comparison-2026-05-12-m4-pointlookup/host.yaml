@@ -1,0 +1,98 @@
+host:
+  hostname: ultrasql-m4-mini
+  cpu_model: "Apple M4"
+  cpu_cores: 10
+  cpu_threads: 10
+  cpu_freq_ghz: 4.4
+  ram_gb: 16
+  storage:
+    type: NVMe
+    model: "Apple Fabric NVMe SSD (internal)"
+    size_gb: 512
+  os:
+    kernel: "Darwin 25.5.0"
+    name: "macOS"
+    version: "26.5"
+  rust:
+    channel: stable
+    version: "1.95.0"
+    target: aarch64-apple-darwin
+  ultrasql:
+    commit: HEAD                       # filled in by the commit that records these results
+    profile: release (opt-level=3, lto=fat, codegen-units=1)
+    cargo_features: []
+    target_cpu: apple-m1               # Apple M4 still consumes the apple-m1 LLVM tuning
+  power:
+    plugged_in: true
+    thermal_state: nominal
+
+scope:
+  category: point-lookup, cross-engine, hot-session
+  workload: "SELECT x FROM t WHERE id = ? — 100,000 probes against a 10,000,000-row indexed table"
+  notes: |
+    Apples-to-apples point-lookup methodology. Every engine builds a
+    10M-row table with (id BIGINT PRIMARY KEY, x BIGINT), opens a hot
+    session (CSV import, prepared statement, 10,000 throwaway warmup
+    probes), and is then timed running a single 100,000-probe loop
+    against a shared deterministic probe set. We report median latency
+    per probe (over 3 runs) and the total wall time of the median run.
+
+    The fairness rule is: every engine pays for its own session setup
+    once (table load, index build, prepared statement, warmup); we
+    measure only the probe loop. This corrects the prior
+    `comparison-2026-05-12-m4-extended/point-10m` row, which reported
+    the per-iteration wall time of a 10,000-probe batch and called it
+    "per-probe" in some tables — off by a factor of 10,000.
+
+engines_measured:
+  - name: UltraSQL (kernel, BTree<i64>)
+    version: 0.0.1
+    method: "crates/ultrasql-bench/src/bin/point_lookup.rs — native Rust BTree::lookup loop, std::time::Instant"
+    samples: 3 runs of 100,000 probes (median across runs)
+    binary: target/release/point_lookup
+    notes: |
+      No SQL pipeline yet; this measures the v0.5 BTree<i64> directly
+      over the in-memory buffer pool. Buffer-pool capacity is sized to
+      hold every leaf + internal page (the v0.5 pool refuses to evict
+      dirty pages). No client/IPC overhead; reported number is the
+      data-plane cost.
+  - name: SQLite
+    version: "3.51.0 2025-06-12"
+    method: "python3 sqlite3 :memory:; prepared statement; time.perf_counter_ns around the probe loop"
+    samples: 3 runs of 100,000 probes
+    notes: |
+      INTEGER PRIMARY KEY makes the table itself the index (rowid). The
+      Python loop adds constant overhead per probe; we document this in
+      methodology.md.
+  - name: PostgreSQL
+    version: "14.22 (Homebrew)"
+    method: "python3 psycopg 3.3.4; PREPARE/EXECUTE same session over Unix socket; time.perf_counter_ns around the probe loop"
+    samples: 3 runs of 100,000 probes
+    notes: |
+      max_parallel_workers_per_gather=0; id BIGINT PRIMARY KEY (auto
+      B-tree index). Wire-protocol round-trip cost is part of the
+      number.
+  - name: DuckDB
+    version: "1.5.2 (Variegata) 8a5851971f"
+    method: "python3 duckdb 1.5.2 in-process; PREPARE/EXECUTE same connection; time.perf_counter_ns around the probe loop"
+    samples: 3 runs of 100,000 probes
+    notes: |
+      threads=1; id BIGINT PRIMARY KEY. DuckDB's bulk-OLAP design pays
+      a non-trivial per-query latency for tiny single-row queries.
+  - name: ClickHouse
+    version: "26.5.1.587 (official build)"
+    method: "clickhouse local; MergeTree with PRIMARY KEY (id); 100,000 SELECTs in a single multi-query script"
+    samples: 1 run of 100,000 probes (capped — see notes)
+    notes: |
+      ClickHouse is not designed for OLTP point lookups. We measure it
+      honestly under MergeTree with id as the primary key; the per-
+      query overhead dwarfs the data-plane cost and the result is a
+      loss for ClickHouse. The comparison is still honest — ClickHouse
+      simply isn't built for this access pattern. On the reference
+      host a single 100k-probe run takes ~10 minutes; we cap at 1 run
+      (overriding the per-engine ≤5-minute target) so the total
+      script wall clock stays inside the 20-minute budget.
+
+datasets:
+  data_id_10m.csv: "10,000,000 rows of (id BIGINT, x BIGINT). id is a deterministic permutation of 0..10M (xorshift seed 0xC0FFEE in run.sh's Python generator); x is the same i64 stream as comparison-2026-05-12-m4-extended (seed 0xDEADBEEF). Header `id,x`."
+  probes_100k.txt: "100,000 deterministic probe ids (one per line). xorshift seed 0xCAFE_BABE_F00D_1234, reduced into [0, 10,000,000) via rem_euclid. The UltraSQL Rust binary generates these in-process from the same seed."

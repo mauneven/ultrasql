@@ -1,0 +1,1467 @@
+{
+  "comparison": "concurrency cross-engine, 2026-05-12, Apple M4",
+  "host": "Apple M4 Mac mini, 16 GiB, macOS 26.5",
+  "workloads": [
+    "conc-read-sum",
+    "conc-read-point",
+    "conc-insert",
+    "conc-update"
+  ],
+  "thread_counts": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32
+  ],
+  "measure_secs": 5,
+  "warmup_secs": 1,
+  "repeats": 3,
+  "datasets_sha256": {
+    "data_x_1m.csv": "31f54bbb9568730e7cc40b9621de632d9166c7e8fa3ecd1d02d21ab182c3ed33",
+    "data_id_1m.csv": "2716b1953373a2cb7606936de9278f553cc9cab87538be7e52e4537b257786ba"
+  },
+  "results": {
+    "conc-read-sum-T32": {
+      "UltraSQL (kernel)": {
+        "median_us": 0.4786,
+        "min_us": 0.4562,
+        "samples": 3,
+        "iterations_us": [
+          0.4801,
+          0.4786,
+          0.4562
+        ],
+        "ops_per_sec_median": 2089215.37,
+        "threads": 32,
+        "note": "kernel/heap fan-out via std::thread; no SQL pipeline (T=32 concurrency cell)"
+      },
+      "PostgreSQL": {
+        "median_us": 41597.3378,
+        "min_us": 32874.9762,
+        "samples": 3,
+        "iterations_us": [
+          62727.8471,
+          41589.762,
+          32874.9762
+        ],
+        "ops_per_sec_median": 24.04,
+        "threads": 32,
+        "note": "pgbench tps; one statement = one op (T=32 concurrency cell)"
+      },
+      "SQLite": {
+        "median_us": 24527.8391,
+        "min_us": 24273.8891,
+        "samples": 3,
+        "iterations_us": [
+          25550.8677,
+          24273.8891,
+          24527.8924
+        ],
+        "ops_per_sec_median": 40.77,
+        "threads": 32,
+        "note": "shared-cache :memory:, T independent SELECTs (T=32 concurrency cell)"
+      },
+      "DuckDB": {
+        "median_us": 117.3648,
+        "min_us": 114.6679,
+        "samples": 3,
+        "iterations_us": [
+          120.0632,
+          114.6679,
+          117.3649
+        ],
+        "ops_per_sec_median": 8520.44,
+        "threads": 32,
+        "note": "T cursors on a shared DuckDB :memory: db; one statement = one op (T=32 concurrency cell)"
+      },
+      "ClickHouse": {
+        "skipped": true,
+        "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+      }
+    },
+    "conc-read-point-T32": {
+      "UltraSQL (kernel)": {
+        "median_us": 1.081,
+        "min_us": 1.0768,
+        "samples": 3,
+        "iterations_us": [
+          1.081,
+          1.0865,
+          1.0768
+        ],
+        "ops_per_sec_median": 925066.11,
+        "threads": 32,
+        "note": "kernel/heap fan-out via std::thread; no SQL pipeline (T=32 concurrency cell)"
+      },
+      "PostgreSQL": {
+        "median_us": 34.8514,
+        "min_us": 34.4792,
+        "samples": 3,
+        "iterations_us": [
+          56.6974,
+          34.8514,
+          34.4792
+        ],
+        "ops_per_sec_median": 28693.27,
+        "threads": 32,
+        "note": "pgbench tps; one statement = one op (T=32 concurrency cell)"
+      },
+      "SQLite": {
+        "median_us": 24.0048,
+        "min_us": 14.4006,
+        "samples": 3,
+        "iterations_us": [
+          24.0048,
+          14.4006,
+          24.2847
+        ],
+        "ops_per_sec_median": 41658.38,
+        "threads": 32,
+        "note": "shared-cache :memory:, T independent SELECTs (T=32 concurrency cell)"
+      },
+      "DuckDB": {
+        "median_us": 151.5271,
+        "min_us": 80.5001,
+        "samples": 3,
+        "iterations_us": [
+          238.9749,
+          151.5271,
+          80.5001
+        ],
+        "ops_per_sec_median": 6599.48,
+        "threads": 32,
+        "note": "T cursors on a shared DuckDB :memory: db; one statement = one op (T=32 concurrency cell)"
+      },
+      "ClickHouse": {
+        "skipped": true,
+        "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+      }
+    },
+    "conc-insert-T32": {
+      "UltraSQL (kernel)": {
+        "median_us": 9.1954,
+        "min_us": 9.1088,
+        "samples": 3,
+        "iterations_us": [
+          9.2068,
+          9.1954,
+          9.1088
+        ],
+        "ops_per_sec_median": 108750.43,
+        "threads": 32,
+        "note": "kernel/heap fan-out via std::thread; no SQL pipeline (T=32 concurrency cell)"
+      },
+      "PostgreSQL": {
+        "median_us": 43.1397,
+        "min_us": 42.0617,
+        "samples": 3,
+        "iterations_us": [
+          42.0617,
+          48.5951,
+          43.1397
+        ],
+        "ops_per_sec_median": 23180.5,
+        "threads": 32,
+        "note": "pgbench tps; one statement = one op (T=32 concurrency cell)"
+      },
+      "SQLite": {
+        "median_us": 674.3361,
+        "min_us": 521.5595,
+        "samples": 3,
+        "iterations_us": [
+          674.3383,
+          521.5595,
+          680.5729
+        ],
+        "ops_per_sec_median": 1482.94,
+        "threads": 32,
+        "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves (T=32 concurrency cell)"
+      },
+      "DuckDB": {
+        "median_us": 49.6914,
+        "min_us": 49.2486,
+        "samples": 3,
+        "iterations_us": [
+          50.1328,
+          49.6914,
+          49.2486
+        ],
+        "ops_per_sec_median": 20124.19,
+        "threads": 32,
+        "note": "T private :memory: DuckDB instances (no multi-writer to single DB) (T=32 concurrency cell)"
+      },
+      "ClickHouse": {
+        "skipped": true,
+        "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+      }
+    },
+    "conc-update-T16": {
+      "UltraSQL (kernel)": {
+        "median_us": 0.0,
+        "min_us": 0.0,
+        "samples": 3,
+        "iterations_us": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "ops_per_sec_median": 63417891120.89,
+        "threads": 16,
+        "note": "kernel/heap fan-out via std::thread; no SQL pipeline (T=16 concurrency cell)"
+      },
+      "PostgreSQL": {
+        "median_us": 3.6684,
+        "min_us": 3.1032,
+        "samples": 3,
+        "iterations_us": [
+          3.806,
+          3.1032,
+          3.6684
+        ],
+        "ops_per_sec_median": 272597.1,
+        "threads": 16,
+        "note": "pgbench tps \u00d7 10000 rows/stmt (T=16 concurrency cell)"
+      },
+      "SQLite": {
+        "median_us": 0.0777,
+        "min_us": 0.0683,
+        "samples": 3,
+        "iterations_us": [
+          0.1981,
+          0.0683,
+          0.0777
+        ],
+        "ops_per_sec_median": 12873986.4,
+        "threads": 16,
+        "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves (T=16 concurrency cell)"
+      },
+      "DuckDB": {
+        "median_us": 0.3356,
+        "min_us": 0.3217,
+        "samples": 3,
+        "iterations_us": [
+          0.4175,
+          0.3217,
+          0.3356
+        ],
+        "ops_per_sec_median": 2980020.33,
+        "threads": 16,
+        "note": "T private :memory: DuckDB instances (no multi-writer to single DB) (T=16 concurrency cell)"
+      },
+      "ClickHouse": {
+        "skipped": true,
+        "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+      }
+    },
+    "conc-read-sum": {
+      "T1": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 9324.45,
+          "max_ops_per_sec": 9742.84,
+          "iterations_ops_per_sec": [
+            8289.06,
+            9742.84,
+            9324.45
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 57.92,
+          "max_ops_per_sec": 62.934447,
+          "iterations_ops_per_sec": [
+            62.934447,
+            57.919318,
+            47.585268
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 40.82,
+          "max_ops_per_sec": 40.9326449888442,
+          "iterations_ops_per_sec": [
+            40.9326449888442,
+            40.82037063665144,
+            40.52692859416626
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 2909.81,
+          "max_ops_per_sec": 3017.928328850323,
+          "iterations_ops_per_sec": [
+            3017.928328850323,
+            2775.0583920398203,
+            2909.8106661511392
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T2": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 33575.91,
+          "max_ops_per_sec": 43457.4,
+          "iterations_ops_per_sec": [
+            33143.42,
+            33575.91,
+            43457.4
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 66.29,
+          "max_ops_per_sec": 70.754754,
+          "iterations_ops_per_sec": [
+            63.08287,
+            70.754754,
+            66.28661
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 40.41,
+          "max_ops_per_sec": 41.05811956201695,
+          "iterations_ops_per_sec": [
+            40.38075303252526,
+            40.4054248640431,
+            41.05811956201695
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 4142.9,
+          "max_ops_per_sec": 4383.883958033639,
+          "iterations_ops_per_sec": [
+            3681.4210213199813,
+            4142.895694285612,
+            4383.883958033639
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T4": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 140268.58,
+          "max_ops_per_sec": 148415.69,
+          "iterations_ops_per_sec": [
+            140268.58,
+            148415.69,
+            135405.33
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 50.14,
+          "max_ops_per_sec": 51.745027,
+          "iterations_ops_per_sec": [
+            39.207116,
+            51.745027,
+            50.135326
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 41.42,
+          "max_ops_per_sec": 41.442667848967936,
+          "iterations_ops_per_sec": [
+            41.352113029934614,
+            41.41849999119151,
+            41.442667848967936
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 5617.94,
+          "max_ops_per_sec": 5833.011221579301,
+          "iterations_ops_per_sec": [
+            5833.011221579301,
+            5617.935185663534,
+            5385.971828375574
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T8": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 374362.41,
+          "max_ops_per_sec": 399242.53,
+          "iterations_ops_per_sec": [
+            399242.53,
+            349685.53,
+            374362.41
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 31.62,
+          "max_ops_per_sec": 33.848161,
+          "iterations_ops_per_sec": [
+            31.618652,
+            33.848161,
+            28.170202
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 41.95,
+          "max_ops_per_sec": 42.0677315742376,
+          "iterations_ops_per_sec": [
+            41.94725009941311,
+            42.0677315742376,
+            28.168359093425046
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 7310.58,
+          "max_ops_per_sec": 7515.482240033857,
+          "iterations_ops_per_sec": [
+            7310.583329942032,
+            7515.482240033857,
+            7233.752992328356
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T16": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 1039777.82,
+          "max_ops_per_sec": 1057430.87,
+          "iterations_ops_per_sec": [
+            1039777.82,
+            829684.82,
+            1057430.87
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 22.22,
+          "max_ops_per_sec": 24.604254,
+          "iterations_ops_per_sec": [
+            24.604254,
+            22.216164,
+            21.98873
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 35.42,
+          "max_ops_per_sec": 39.517927772851344,
+          "iterations_ops_per_sec": [
+            18.160986178256234,
+            35.42024576758577,
+            39.517927772851344
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 7843.06,
+          "max_ops_per_sec": 7892.728855416812,
+          "iterations_ops_per_sec": [
+            7668.598163625599,
+            7892.728855416812,
+            7843.058676954837
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T32": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 2089215.37,
+          "max_ops_per_sec": 2192142.66,
+          "iterations_ops_per_sec": [
+            2082827.55,
+            2089215.37,
+            2192142.66
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 24.04,
+          "max_ops_per_sec": 30.418273,
+          "iterations_ops_per_sec": [
+            15.941883,
+            24.044379,
+            30.418273
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 40.77,
+          "max_ops_per_sec": 41.19652991004176,
+          "iterations_ops_per_sec": [
+            39.137614073181,
+            41.19652991004176,
+            40.76991138691002
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 8520.44,
+          "max_ops_per_sec": 8720.83892647115,
+          "iterations_ops_per_sec": [
+            8328.94588823768,
+            8720.83892647115,
+            8520.438449642126
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      }
+    },
+    "conc-read-point": {
+      "T1": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 1048820.42,
+          "max_ops_per_sec": 1131777.55,
+          "iterations_ops_per_sec": [
+            1131777.55,
+            1048820.42,
+            919959.01
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 14736.52,
+          "max_ops_per_sec": 17910.543908,
+          "iterations_ops_per_sec": [
+            14736.52462,
+            11714.090032,
+            17910.543908
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 665225.81,
+          "max_ops_per_sec": 678206.0162052896,
+          "iterations_ops_per_sec": [
+            572009.1172949282,
+            665225.8105852616,
+            678206.0162052896
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 7235.63,
+          "max_ops_per_sec": 7390.230784161645,
+          "iterations_ops_per_sec": [
+            6141.3193172351,
+            7390.230784161645,
+            7235.634650745002
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T2": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 1097735.99,
+          "max_ops_per_sec": 1110140.77,
+          "iterations_ops_per_sec": [
+            1110140.77,
+            1097735.99,
+            1000598.86
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 26728.05,
+          "max_ops_per_sec": 29918.612013,
+          "iterations_ops_per_sec": [
+            29918.612013,
+            26728.049004,
+            24606.580028
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 343018.15,
+          "max_ops_per_sec": 355734.19682002795,
+          "iterations_ops_per_sec": [
+            355734.19682002795,
+            294091.4620204444,
+            343018.14828314097
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 11101.38,
+          "max_ops_per_sec": 11719.27214486898,
+          "iterations_ops_per_sec": [
+            9431.035420919283,
+            11719.27214486898,
+            11101.381562438544
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T4": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 731685.71,
+          "max_ops_per_sec": 767397.1,
+          "iterations_ops_per_sec": [
+            731685.71,
+            676360.9,
+            767397.1
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 19869.7,
+          "max_ops_per_sec": 33055.02164,
+          "iterations_ops_per_sec": [
+            6452.482484,
+            19869.697617,
+            33055.02164
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 145605.59,
+          "max_ops_per_sec": 159355.4395528465,
+          "iterations_ops_per_sec": [
+            138489.2199527602,
+            145605.59451380343,
+            159355.4395528465
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 12768.76,
+          "max_ops_per_sec": 13183.326867879283,
+          "iterations_ops_per_sec": [
+            12768.760851596748,
+            12749.53696344024,
+            13183.326867879283
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T8": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 609300.8,
+          "max_ops_per_sec": 610556.32,
+          "iterations_ops_per_sec": [
+            610556.32,
+            609300.8,
+            592840.42
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 32014.59,
+          "max_ops_per_sec": 32629.263037,
+          "iterations_ops_per_sec": [
+            32014.58982,
+            32629.263037,
+            29913.536017
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 95515.9,
+          "max_ops_per_sec": 133430.28363453114,
+          "iterations_ops_per_sec": [
+            95515.89978311065,
+            133430.28363453114,
+            67756.2920478577
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 14875.44,
+          "max_ops_per_sec": 14896.078914013335,
+          "iterations_ops_per_sec": [
+            14896.078914013335,
+            14404.75934256137,
+            14875.437146158962
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T16": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 617885.16,
+          "max_ops_per_sec": 618564.44,
+          "iterations_ops_per_sec": [
+            612168.17,
+            618564.44,
+            617885.16
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 32132.35,
+          "max_ops_per_sec": 33336.517394,
+          "iterations_ops_per_sec": [
+            32132.350699,
+            33336.517394,
+            30199.237995
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 55812.34,
+          "max_ops_per_sec": 73258.29369162142,
+          "iterations_ops_per_sec": [
+            49406.42479042069,
+            55812.34234842613,
+            73258.29369162142
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 15848.75,
+          "max_ops_per_sec": 15851.828248389395,
+          "iterations_ops_per_sec": [
+            15851.828248389395,
+            15848.75078846955,
+            5381.511939341472
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T32": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 925066.11,
+          "max_ops_per_sec": 928679.83,
+          "iterations_ops_per_sec": [
+            925066.11,
+            920357.51,
+            928679.83
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 28693.27,
+          "max_ops_per_sec": 29002.959099,
+          "iterations_ops_per_sec": [
+            17637.502617,
+            28693.272986,
+            29002.959099
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 41658.38,
+          "max_ops_per_sec": 69441.74937399388,
+          "iterations_ops_per_sec": [
+            41658.384101368545,
+            69441.74937399388,
+            41178.2542106382
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory:, T independent SELECTs"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 6599.48,
+          "max_ops_per_sec": 12422.347216979104,
+          "iterations_ops_per_sec": [
+            4184.54008156505,
+            6599.480508434517,
+            12422.347216979104
+          ],
+          "samples": 3,
+          "note": "T cursors on a shared DuckDB :memory: db; one statement = one op"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      }
+    },
+    "conc-insert": {
+      "T1": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 55186.72,
+          "max_ops_per_sec": 55606.6,
+          "iterations_ops_per_sec": [
+            55606.6,
+            55057.59,
+            55186.72
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 10719.57,
+          "max_ops_per_sec": 11248.827789,
+          "iterations_ops_per_sec": [
+            10719.569146,
+            11248.827789,
+            9350.134933
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 595934.19,
+          "max_ops_per_sec": 653251.6941281084,
+          "iterations_ops_per_sec": [
+            653251.6941281084,
+            579286.5495013569,
+            595934.1931063414
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 10817.53,
+          "max_ops_per_sec": 11138.005806225561,
+          "iterations_ops_per_sec": [
+            7422.336562194002,
+            10817.53000142377,
+            11138.005806225561
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T2": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 38469.65,
+          "max_ops_per_sec": 38759.25,
+          "iterations_ops_per_sec": [
+            38469.65,
+            38413.1,
+            38759.25
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 14891.67,
+          "max_ops_per_sec": 17778.637045,
+          "iterations_ops_per_sec": [
+            17778.637045,
+            14891.671674,
+            6801.88041
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 157491.31,
+          "max_ops_per_sec": 158117.34982899993,
+          "iterations_ops_per_sec": [
+            157491.3149892907,
+            156750.28567895835,
+            158117.34982899993
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 14286.56,
+          "max_ops_per_sec": 15316.929388206438,
+          "iterations_ops_per_sec": [
+            14286.563060660952,
+            8770.490073912802,
+            15316.929388206438
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T4": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 42350.15,
+          "max_ops_per_sec": 42689.5,
+          "iterations_ops_per_sec": [
+            42035.16,
+            42689.5,
+            42350.15
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 11703.56,
+          "max_ops_per_sec": 20075.222145,
+          "iterations_ops_per_sec": [
+            8697.12215,
+            11703.559191,
+            20075.222145
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 30013.66,
+          "max_ops_per_sec": 34462.07635091328,
+          "iterations_ops_per_sec": [
+            27697.9124684932,
+            30013.661420481407,
+            34462.07635091328
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 20300.82,
+          "max_ops_per_sec": 20775.53141379191,
+          "iterations_ops_per_sec": [
+            20775.53141379191,
+            19904.300764638483,
+            20300.816770303336
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T8": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 54652.03,
+          "max_ops_per_sec": 54812.85,
+          "iterations_ops_per_sec": [
+            54812.85,
+            54411.45,
+            54652.03
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 16213.2,
+          "max_ops_per_sec": 17038.863341,
+          "iterations_ops_per_sec": [
+            9430.405498,
+            16213.202856,
+            17038.863341
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 12937.12,
+          "max_ops_per_sec": 17285.572623513017,
+          "iterations_ops_per_sec": [
+            12710.612699636238,
+            17285.572623513017,
+            12937.119180189591
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 20780.98,
+          "max_ops_per_sec": 20903.057778106493,
+          "iterations_ops_per_sec": [
+            19466.64252706413,
+            20903.057778106493,
+            20780.976726494766
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T16": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 77409.85,
+          "max_ops_per_sec": 77712.35,
+          "iterations_ops_per_sec": [
+            77712.35,
+            77223.43,
+            77409.85
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 15812.62,
+          "max_ops_per_sec": 17237.260738,
+          "iterations_ops_per_sec": [
+            15812.616932,
+            9886.380616,
+            17237.260738
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 4382.76,
+          "max_ops_per_sec": 4698.360814091055,
+          "iterations_ops_per_sec": [
+            4382.756247340296,
+            4698.360814091055,
+            3994.5631164555894
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 20631.82,
+          "max_ops_per_sec": 20657.19468637502,
+          "iterations_ops_per_sec": [
+            20657.19468637502,
+            19312.160424618993,
+            20631.823138185762
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T32": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 108750.43,
+          "max_ops_per_sec": 109783.7,
+          "iterations_ops_per_sec": [
+            108615.95,
+            108750.43,
+            109783.7
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 23180.5,
+          "max_ops_per_sec": 23774.59406,
+          "iterations_ops_per_sec": [
+            23774.59406,
+            20578.215329,
+            23180.496413
+          ],
+          "samples": 3,
+          "note": "pgbench tps; one statement = one op"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 1482.94,
+          "max_ops_per_sec": 1917.3268812879192,
+          "iterations_ops_per_sec": [
+            1482.9351843886661,
+            1917.3268812879192,
+            1469.3503359860345
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 20124.19,
+          "max_ops_per_sec": 20305.15937385279,
+          "iterations_ops_per_sec": [
+            19947.01551026175,
+            20124.19223012486,
+            20305.15937385279
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      }
+    },
+    "conc-update": {
+      "T1": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 12713267127.16,
+          "max_ops_per_sec": 14123566645.47,
+          "iterations_ops_per_sec": [
+            14123566645.47,
+            12713267127.16,
+            11527028074.76
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 50429.26,
+          "max_ops_per_sec": 198164.69,
+          "iterations_ops_per_sec": [
+            198164.69,
+            49267.149999999994,
+            50429.259999999995
+          ],
+          "samples": 3,
+          "note": "pgbench tps \u00d7 10000 rows/stmt"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 16476299.92,
+          "max_ops_per_sec": 17319077.85206865,
+          "iterations_ops_per_sec": [
+            16476299.922893276,
+            15483466.904813023,
+            17319077.85206865
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 3021964.97,
+          "max_ops_per_sec": 3099270.384464983,
+          "iterations_ops_per_sec": [
+            3099270.384464983,
+            3021964.9714373173,
+            3005107.1840547514
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T2": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 27016599881.69,
+          "max_ops_per_sec": 27169321872.22,
+          "iterations_ops_per_sec": [
+            22662986935.67,
+            27016599881.69,
+            27169321872.22
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 169335.76,
+          "max_ops_per_sec": 186184.22,
+          "iterations_ops_per_sec": [
+            186184.22,
+            169335.75999999998,
+            12612.9
+          ],
+          "samples": 3,
+          "note": "pgbench tps \u00d7 10000 rows/stmt"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 15718715.49,
+          "max_ops_per_sec": 17768463.425199807,
+          "iterations_ops_per_sec": [
+            15185453.829872865,
+            17768463.425199807,
+            15718715.493903982
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 3006308.65,
+          "max_ops_per_sec": 3376302.555440538,
+          "iterations_ops_per_sec": [
+            3376302.555440538,
+            2681105.195792814,
+            3006308.6540146023
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T4": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 38799835207.21,
+          "max_ops_per_sec": 40143181339.59,
+          "iterations_ops_per_sec": [
+            38799835207.21,
+            28285958592.54,
+            40143181339.59
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 291435.4,
+          "max_ops_per_sec": 302382.44,
+          "iterations_ops_per_sec": [
+            291435.4,
+            302382.44,
+            210076.32
+          ],
+          "samples": 3,
+          "note": "pgbench tps \u00d7 10000 rows/stmt"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 13979582.03,
+          "max_ops_per_sec": 14793333.916702915,
+          "iterations_ops_per_sec": [
+            13979582.029368177,
+            14793333.916702915,
+            10238250.6698308
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 4100901.45,
+          "max_ops_per_sec": 4137576.930263402,
+          "iterations_ops_per_sec": [
+            3611574.4074397213,
+            4100901.45174692,
+            4137576.930263402
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T8": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 50485580141.65,
+          "max_ops_per_sec": 53053804525.51,
+          "iterations_ops_per_sec": [
+            50485580141.65,
+            53053804525.51,
+            48417967504.6
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 140065.17,
+          "max_ops_per_sec": 215261.81,
+          "iterations_ops_per_sec": [
+            215261.81,
+            140065.17,
+            60768.659999999996
+          ],
+          "samples": 3,
+          "note": "pgbench tps \u00d7 10000 rows/stmt"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 12610641.04,
+          "max_ops_per_sec": 13436144.930040745,
+          "iterations_ops_per_sec": [
+            13436144.930040745,
+            12610641.042007491,
+            8925419.908976175
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 3944340.34,
+          "max_ops_per_sec": 4186940.4094936647,
+          "iterations_ops_per_sec": [
+            4186940.4094936647,
+            3685984.105614081,
+            3944340.344051011
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T16": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 63417891120.89,
+          "max_ops_per_sec": 64211592497.25,
+          "iterations_ops_per_sec": [
+            63417891120.89,
+            64211592497.25,
+            58169373275.49
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 272597.1,
+          "max_ops_per_sec": 322251.66000000003,
+          "iterations_ops_per_sec": [
+            262744.22000000003,
+            322251.66000000003,
+            272597.1
+          ],
+          "samples": 3,
+          "note": "pgbench tps \u00d7 10000 rows/stmt"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 12873986.4,
+          "max_ops_per_sec": 14635089.125993669,
+          "iterations_ops_per_sec": [
+            5047752.9882239755,
+            14635089.125993669,
+            12873986.39639124
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 2980020.33,
+          "max_ops_per_sec": 3108549.1557148644,
+          "iterations_ops_per_sec": [
+            2394940.0671403375,
+            3108549.1557148644,
+            2980020.3316518683
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      },
+      "T32": {
+        "UltraSQL (kernel)": {
+          "median_ops_per_sec": 60521436402.51,
+          "max_ops_per_sec": 62647082057.51,
+          "iterations_ops_per_sec": [
+            60521436402.51,
+            59692211987.52,
+            62647082057.51
+          ],
+          "samples": 3,
+          "note": "kernel/heap fan-out via std::thread; no SQL pipeline"
+        },
+        "PostgreSQL": {
+          "median_ops_per_sec": 611774.73,
+          "max_ops_per_sec": 636515.2,
+          "iterations_ops_per_sec": [
+            636515.2,
+            544123.83,
+            611774.73
+          ],
+          "samples": 3,
+          "note": "pgbench tps \u00d7 10000 rows/stmt"
+        },
+        "SQLite": {
+          "median_ops_per_sec": 13309626.17,
+          "max_ops_per_sec": 13683859.534560252,
+          "iterations_ops_per_sec": [
+            13683859.534560252,
+            11866713.014787432,
+            13309626.165154371
+          ],
+          "samples": 3,
+          "note": "shared-cache :memory: db; SQLite serialises writes globally \u2014 INSERT/UPDATE numbers are the rate the single writer achieves"
+        },
+        "DuckDB": {
+          "median_ops_per_sec": 684121.8,
+          "max_ops_per_sec": 1488510.0740635628,
+          "iterations_ops_per_sec": [
+            344935.41350099246,
+            684121.7974301658,
+            1488510.0740635628
+          ],
+          "samples": 3,
+          "note": "T private :memory: DuckDB instances (no multi-writer to single DB)"
+        },
+        "ClickHouse": {
+          "skipped": true,
+          "reason": "ClickHouse is an OLAP-focused engine; multi-client concurrency on small OLTP workloads is outside its design point"
+        }
+      }
+    }
+  }
+}

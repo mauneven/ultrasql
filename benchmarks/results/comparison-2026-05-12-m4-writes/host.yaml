@@ -1,0 +1,110 @@
+host:
+  hostname: ultrasql-m4-mini
+  cpu_model: "Apple M4"
+  cpu_cores: 10
+  cpu_threads: 10
+  cpu_freq_ghz: 4.4
+  ram_gb: 16
+  storage:
+    type: NVMe
+    model: "Apple Fabric NVMe SSD (internal)"
+    size_gb: 512
+  os:
+    kernel: "Darwin 25.5.0"
+    name: "macOS"
+    version: "26.5"
+  rust:
+    channel: stable
+    version: "1.95.0"
+    target: aarch64-apple-darwin
+  ultrasql:
+    # Filled at run time by the orchestrator; equal to the new
+    # cross_compare_writes commit.
+    commit: see ../comparison-2026-05-12-m4-extended/host.yaml for the
+            parent comparison's commit; this run adds
+            crates/ultrasql-bench/src/bin/cross_compare_writes.rs on
+            top of it.
+    profile: release (opt-level=3, lto=fat, codegen-units=1)
+    cargo_features: []
+    target_cpu: apple-m1   # Apple M4 still consumes the apple-m1 LLVM tuning
+  power:
+    plugged_in: true
+    thermal_state: nominal
+
+scope:
+  category: cross-engine comparison (writes)
+  workloads:
+    - "INSERT 100,000 rows of (id i64 PK, val i64) into an empty relation"
+    - "INSERT 1,000,000 rows of (id i64 PK, val i64) into an empty relation"
+    - "UPDATE every row's val = val + 1 in a 1,000,000-row table"
+    - "DELETE every row matching val > 0 in a 100,000-row table"
+    - "UPSERT 100,000 rows (INSERT ... ON CONFLICT (id) DO UPDATE) into a preloaded 100,000-row table"
+  notes: |
+    Companion to the read comparisons in
+    ../comparison-2026-05-12-m4-extended/ and -fillin/. Same five
+    engines, same host, same deterministic seed pattern. Every engine
+    runs in its **normal durable mode**: PostgreSQL with
+    synchronous_commit=on, fsync=on, full_page_writes=on; SQLite in
+    WAL mode with synchronous=NORMAL (the default); DuckDB attached to
+    a file so its checkpoint hits storage; ClickHouse MergeTree on
+    disk; UltraSQL with WalWriter (group-commit fsync via
+    F_FULLFSYNC) plus an explicit segment-file fsync per iteration.
+
+    UltraSQL is measured at the heap-access-method level, not via the
+    SQL pipeline (none exists at v0.5 — see ROADMAP.md). Every other
+    engine runs its full SQL pipeline. The UltraSQL row is therefore
+    a lower bound on what the eventual SQL-surface engine will reach,
+    not a like-for-like result.
+
+    `upsert-100k` is **skipped on UltraSQL** because the heap has no
+    native upsert / ON CONFLICT path; rather than fabricate a
+    `lookup + insert/update` composition that would misrepresent the
+    eventual planner-driven path, we mark the row skipped with a
+    reason.
+
+engines_measured:
+  - name: UltraSQL (kernel)
+    version: 0.0.1
+    method: cross_compare_writes driver — heap access + WAL group-commit measured in isolation
+    samples: 8 per workload (4 for insert-bulk-1m / update-1m — see below)
+    binary: target/release/cross_compare_writes
+    durability: WalWriter group-commit fsync (F_FULLFSYNC on macOS) + SegmentFileManager fsync per iteration
+  - name: DuckDB
+    version: "1.5.2 (Variegata) 8a5851971f"
+    method: PRAGMA enable_profiling=json (latency); ATTACH to a file so CHECKPOINT hits storage
+    samples: 8 per workload
+    threads: 1 (PRAGMA threads=1)
+    durability: CHECKPOINT after the workload to flush the WAL
+  - name: SQLite
+    version: "3.51.0 2025-06-12"
+    method: .timer on (user time, microsecond resolution)
+    samples: 8 per workload
+    db: tempfile (not :memory: — see methodology.md)
+    durability: PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL (default)
+  - name: PostgreSQL
+    version: "14.22 (Homebrew)"
+    method: psql \timing (millisecond + 3 decimal digit precision)
+    samples: 8 per workload
+    transport: Unix socket
+    settings: "synchronous_commit = on (default); fsync = on (default)"
+  - name: ClickHouse
+    version: "26.5.1.587 (official build)"
+    method: clickhouse local --format=JSON statistics.elapsed
+    samples: 8 per workload
+    engine: MergeTree (on-disk, fair comparison for a write workload)
+
+iter_count_deviations:
+  insert-bulk-100k: { ultrasql_iters: 4, sql_iters: 4, reason: "~3s/iter; reduced from 8 to fit overall budget" }
+  insert-bulk-1m:   { ultrasql_iters: 2, sql_iters: 4, reason: "UltraSQL ~80s/iter (v0.5 heap has no FSM, O(blocks)/insert); below the 4-iter floor to stay under 25-min cap" }
+  update-1m:        { ultrasql_iters: 0, sql_iters: 4, reason: "UltraSQL skipped: ~30 min/iter at v0.5 (preload + delete-then-insert × 1M with the O(blocks) walk on every re-insert); not runnable inside the 25-min cap" }
+  delete-100k:      { ultrasql_iters: 4, sql_iters: 4, reason: "~80ms/iter; reduced from 8 to fit overall budget" }
+  upsert-100k:      { ultrasql_iters: 0, sql_iters: 4, reason: "UltraSQL skipped (no native ON CONFLICT at v0.5); SQL engines run 4 iters" }
+
+skipped:
+  upsert-100k:
+    engine: UltraSQL (kernel)
+    reason: "no native ON CONFLICT path at v0.5; planned for the SQL-surface bring-up in v0.7"
+
+datasets:
+  data_idval_100k.csv: "100,000   (id i64, val i64) rows, header `id,val`, seed 0xDEADBEEF"
+  data_idval_1m.csv:   "1,000,000 (id i64, val i64) rows, header `id,val`, seed 0xDEADBEEF (prefix of the 1M stream)"
