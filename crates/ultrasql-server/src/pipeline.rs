@@ -132,6 +132,10 @@ pub fn lower_plan(
         LogicalPlan::Update { .. } => Err(ServerError::Unsupported("UPDATE")),
         LogicalPlan::Delete { .. } => Err(ServerError::Unsupported("DELETE")),
         LogicalPlan::Truncate { .. } => Err(ServerError::Unsupported("TRUNCATE")),
+        LogicalPlan::Join { .. } => Err(ServerError::Unsupported("JOIN")),
+        LogicalPlan::Aggregate { .. } => Err(ServerError::Unsupported("GROUP BY / aggregate")),
+        LogicalPlan::SetOp { .. } => Err(ServerError::Unsupported("UNION / INTERSECT / EXCEPT")),
+        LogicalPlan::Cte { .. } => Err(ServerError::Unsupported("WITH (CTE)")),
     }
 }
 
