@@ -38,6 +38,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::server::TlsStream;
@@ -73,6 +75,10 @@ pub enum TlsError {
     /// The rustls configuration was rejected (e.g. certificate/key mismatch).
     #[error("rustls config error: {0}")]
     Rustls(#[from] rustls::Error),
+
+    /// A PEM file failed to parse.
+    #[error("PEM parse error: {0}")]
+    Pem(#[from] rustls::pki_types::pem::Error),
 }
 
 // ── TlsConfig ─────────────────────────────────────────────────────────────────
@@ -108,12 +114,14 @@ impl TlsHandshake {
     /// Build a [`rustls::ServerConfig`] from the given [`TlsConfig`].
     ///
     /// Reads the certificate and private key files from disk, parses them
-    /// with [`rustls_pemfile`], and returns a configured
-    /// [`rustls::ServerConfig`] ready for use with [`TlsHandshake::upgrade`].
+    /// with the `PemObject` API from `rustls-pki-types`, and returns a
+    /// configured [`rustls::ServerConfig`] ready for use with
+    /// [`TlsHandshake::upgrade`].
     ///
     /// # Errors
     ///
     /// - [`TlsError::Io`] if a file cannot be read.
+    /// - [`TlsError::Pem`] if a PEM file is malformed.
     /// - [`TlsError::NoCertificate`] if the cert file contains no valid cert.
     /// - [`TlsError::NoPrivateKey`] if the key file contains no valid
     ///   PKCS#8 key.
@@ -121,12 +129,8 @@ impl TlsHandshake {
     pub fn build_server_config(cfg: &TlsConfig) -> Result<Arc<rustls::ServerConfig>, TlsError> {
         // Load certificates.
         let cert_pem = std::fs::read(&cfg.cert_file)?;
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut cert_pem.as_slice())
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .map(rustls::pki_types::CertificateDer::into_owned)
-                .collect();
+        let certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_slice_iter(&cert_pem).collect::<Result<Vec<_>, _>>()?;
         if certs.is_empty() {
             return Err(TlsError::NoCertificate {
                 path: cfg.cert_file.clone(),
@@ -135,14 +139,15 @@ impl TlsHandshake {
 
         // Load private key (PKCS#8 only).
         let key_pem = std::fs::read(&cfg.key_file)?;
-        let private_key = rustls_pemfile::pkcs8_private_keys(&mut key_pem.as_slice())
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .next()
-            .map(rustls::pki_types::PrivateKeyDer::Pkcs8)
-            .ok_or_else(|| TlsError::NoPrivateKey {
-                path: cfg.key_file.clone(),
-            })?;
+        let private_key = match PrivatePkcs8KeyDer::from_pem_slice(&key_pem) {
+            Ok(k) => PrivateKeyDer::Pkcs8(k),
+            Err(rustls::pki_types::pem::Error::NoItemsFound) => {
+                return Err(TlsError::NoPrivateKey {
+                    path: cfg.key_file.clone(),
+                });
+            }
+            Err(e) => return Err(TlsError::Pem(e)),
+        };
 
         let server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
@@ -198,20 +203,11 @@ mod tests {
         cert_pem: &[u8],
         key_pem: &[u8],
     ) -> Arc<rustls::ServerConfig> {
-        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-            rustls_pemfile::certs(&mut { cert_pem })
-                .collect::<Result<Vec<_>, _>>()
-                .expect("parse certs")
-                .into_iter()
-                .map(rustls::pki_types::CertificateDer::into_owned)
-                .collect();
-        let private_key = rustls_pemfile::pkcs8_private_keys(&mut { key_pem })
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
             .collect::<Result<Vec<_>, _>>()
-            .expect("parse key")
-            .into_iter()
-            .next()
-            .map(rustls::pki_types::PrivateKeyDer::Pkcs8)
-            .expect("key present");
+            .expect("parse certs");
+        let private_key =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from_pem_slice(key_pem).expect("parse key"));
         let config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, private_key)

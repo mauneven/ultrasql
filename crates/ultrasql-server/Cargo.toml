@@ -46,7 +46,6 @@ ipnet              = { workspace = true }
 # TLS
 rustls             = { workspace = true }
 tokio-rustls       = { workspace = true }
-rustls-pemfile     = { workspace = true }
 parking_lot        = { workspace = true }
 
 [dev-dependencies]
