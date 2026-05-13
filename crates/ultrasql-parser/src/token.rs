@@ -1,0 +1,322 @@
+//! SQL token kinds and the `Token` type.
+//!
+//! `TokenKind` enumerates every token the lexer can produce. Most
+//! variants are unit (the value is the kind itself); literal-bearing
+//! variants reference their text via the `Token`'s span, which is
+//! cheaper to copy than the text.
+
+use crate::span::Span;
+
+/// Tokens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Token {
+    /// What kind of token this is.
+    pub kind: TokenKind,
+    /// Source span — byte offsets into the original SQL text.
+    pub span: Span,
+}
+
+impl Token {
+    /// Construct a token.
+    #[inline]
+    #[must_use]
+    pub const fn new(kind: TokenKind, span: Span) -> Self {
+        Self { kind, span }
+    }
+
+    /// Convenience: textual slice of the token from the original source.
+    #[inline]
+    #[must_use]
+    pub fn text<'src>(&self, source: &'src str) -> Option<&'src str> {
+        self.span.slice(source)
+    }
+}
+
+/// Kinds of tokens the lexer can produce.
+///
+/// The enum is `Copy` and used as a hash-map key during keyword lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(clippy::module_name_repetitions, clippy::too_many_lines)]
+pub enum TokenKind {
+    // ---- structural ----------------------------------------------------
+    /// End of input.
+    Eof,
+
+    // ---- literals ------------------------------------------------------
+    /// Integer literal (decimal, hex `0x`, octal `0o`, binary `0b`).
+    Integer,
+    /// Floating-point literal: `1.5`, `.5`, `1e10`, `1.5e-3`.
+    Float,
+    /// Single-quoted string literal: `'hello'`. Embedded `''` becomes
+    /// a single `'`.
+    String,
+    /// E-prefixed string with C-style escapes: `E'\n\t'`.
+    EscapedString,
+    /// Dollar-quoted string: `$tag$body$tag$`.
+    DollarString,
+    /// Boolean / NULL keywords come through as their keyword tokens, not
+    /// as literal kinds.
+
+    // ---- identifiers ---------------------------------------------------
+    /// Unquoted identifier (case-folded to lower case by convention,
+    /// though the lexer preserves the raw span; case-folding is done at
+    /// keyword lookup time).
+    Identifier,
+    /// Quoted identifier (`"col Name"`). Case is preserved verbatim.
+    QuotedIdentifier,
+    /// Positional parameter: `$1`, `$2`, ...
+    Parameter,
+
+    // ---- punctuation ---------------------------------------------------
+    /// `(`
+    LParen,
+    /// `)`
+    RParen,
+    /// `[`
+    LBracket,
+    /// `]`
+    RBracket,
+    /// `,`
+    Comma,
+    /// `;`
+    Semicolon,
+    /// `.`
+    Dot,
+    /// `::`
+    ColonColon,
+    /// `:`
+    Colon,
+    /// `*` (also an operator; the parser routes by context).
+    Star,
+    /// `?` — driver-style positional placeholder. PostgreSQL uses `$N`;
+    /// we keep `?` for compatibility with ODBC-style clients.
+    QuestionMark,
+
+    // ---- operators -----------------------------------------------------
+    /// `+`
+    Plus,
+    /// `-`
+    Minus,
+    /// `/`
+    Slash,
+    /// `%`
+    Percent,
+    /// `^`
+    Caret,
+    /// `=`
+    Eq,
+    /// `<>`, `!=`
+    NotEq,
+    /// `<`
+    Lt,
+    /// `<=`
+    LtEq,
+    /// `>`
+    Gt,
+    /// `>=`
+    GtEq,
+    /// `||` — string / array concatenation in PostgreSQL.
+    Concat,
+    /// `->` — JSON object access.
+    Arrow,
+    /// `->>` — JSON object access returning text.
+    ArrowDouble,
+    /// `#>` — JSON path access.
+    HashArrow,
+    /// `#>>` — JSON path access returning text.
+    HashArrowDouble,
+    /// `@>` — `contains`.
+    AtArrow,
+    /// `<@` — `contained by`.
+    ArrowAt,
+    /// `~`  — POSIX regex match.
+    Tilde,
+    /// `!~` — POSIX regex non-match.
+    NotTilde,
+    /// `~*` — case-insensitive POSIX regex match.
+    TildeStar,
+    /// `!~*` — case-insensitive POSIX regex non-match.
+    NotTildeStar,
+
+    // ---- keywords (sorted alphabetically for sanity) --------------------
+    KwAbort,
+    KwAll,
+    KwAlter,
+    KwAnalyze,
+    KwAnd,
+    KwAny,
+    KwArray,
+    KwAs,
+    KwAsc,
+    KwBegin,
+    KwBetween,
+    KwBigint,
+    KwBoolean,
+    KwBoth,
+    KwBy,
+    KwCase,
+    KwCast,
+    KwChar,
+    KwCharacter,
+    KwCheck,
+    KwCollate,
+    KwColumn,
+    KwCommit,
+    KwConstraint,
+    KwCreate,
+    KwCross,
+    KwCurrentDate,
+    KwCurrentTime,
+    KwCurrentTimestamp,
+    KwDate,
+    KwDecimal,
+    KwDefault,
+    KwDelete,
+    KwDesc,
+    KwDistinct,
+    KwDo,
+    KwDouble,
+    KwDrop,
+    KwElse,
+    KwEnd,
+    KwEscape,
+    KwExcept,
+    KwExists,
+    KwExplain,
+    KwFalse,
+    KwFetch,
+    KwFilter,
+    KwFloat,
+    KwFor,
+    KwForeign,
+    KwFrom,
+    KwFull,
+    KwGroup,
+    KwGrouping,
+    KwHaving,
+    KwIlike,
+    KwIn,
+    KwIndex,
+    KwInner,
+    KwInsert,
+    KwInt,
+    KwInteger,
+    KwIntersect,
+    KwInterval,
+    KwInto,
+    KwIs,
+    KwIsolation,
+    KwJoin,
+    KwKey,
+    KwLateral,
+    KwLeading,
+    KwLeft,
+    KwLike,
+    KwLimit,
+    KwNatural,
+    KwNot,
+    KwNull,
+    KwNulls,
+    KwNumeric,
+    KwOf,
+    KwOffset,
+    KwOn,
+    KwOnly,
+    KwOr,
+    KwOrder,
+    KwOuter,
+    KwOver,
+    KwPartition,
+    KwPlacing,
+    KwPrecision,
+    KwPrimary,
+    KwReal,
+    KwReferences,
+    KwReturning,
+    KwRight,
+    KwRollback,
+    KwRow,
+    KwRows,
+    KwSavepoint,
+    KwSelect,
+    KwSerializable,
+    KwSet,
+    KwShow,
+    KwSimilar,
+    KwSmallint,
+    KwSome,
+    KwSymmetric,
+    KwTable,
+    KwTemp,
+    KwTemporary,
+    KwText,
+    KwThen,
+    KwTime,
+    KwTimestamp,
+    KwTrailing,
+    KwTransaction,
+    KwTrue,
+    KwTruncate,
+    KwUnion,
+    KwUnique,
+    KwUnknown,
+    KwUpdate,
+    KwUsing,
+    KwValues,
+    KwVarchar,
+    KwVacuum,
+    KwWhen,
+    KwWhere,
+    KwWindow,
+    KwWith,
+    KwWithin,
+}
+
+impl TokenKind {
+    /// Whether this kind corresponds to a SQL keyword.
+    #[must_use]
+    pub const fn is_keyword(self) -> bool {
+        // Keyword variants begin at KwAbort. We exploit the structural
+        // ordering to make this a single integer comparison.
+        (self as u32) >= (Self::KwAbort as u32)
+    }
+
+    /// Whether this kind is a literal — string or number.
+    #[must_use]
+    pub const fn is_literal(self) -> bool {
+        matches!(
+            self,
+            Self::Integer | Self::Float | Self::String | Self::EscapedString | Self::DollarString
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyword_classifier() {
+        assert!(TokenKind::KwSelect.is_keyword());
+        assert!(TokenKind::KwAbort.is_keyword());
+        assert!(!TokenKind::Identifier.is_keyword());
+        assert!(!TokenKind::Eq.is_keyword());
+        assert!(!TokenKind::Integer.is_keyword());
+    }
+
+    #[test]
+    fn literal_classifier() {
+        assert!(TokenKind::Integer.is_literal());
+        assert!(TokenKind::Float.is_literal());
+        assert!(TokenKind::String.is_literal());
+        assert!(!TokenKind::Identifier.is_literal());
+        assert!(!TokenKind::KwSelect.is_literal());
+    }
+
+    #[test]
+    fn token_text_retrieves_slice() {
+        let src = "SELECT *";
+        let tok = Token::new(TokenKind::KwSelect, Span::new(0, 6));
+        assert_eq!(tok.text(src), Some("SELECT"));
+    }
+}
