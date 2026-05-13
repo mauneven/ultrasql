@@ -9,6 +9,11 @@
 
 pub mod buffer;
 pub mod record;
+pub mod recovery;
+pub(crate) mod segment;
+pub mod writer;
 
 pub use buffer::{WalBuffer, WalBufferError};
 pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};
+pub use recovery::{RecoveryError, recover};
+pub use writer::{WalWriter, WalWriterConfig, WalWriterError};

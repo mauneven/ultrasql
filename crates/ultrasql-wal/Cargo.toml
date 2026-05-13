@@ -26,6 +26,7 @@ libc          = { workspace = true }
 [dev-dependencies]
 proptest  = { workspace = true }
 criterion = { workspace = true }
+tempfile  = "3"
 
 [[bench]]
 name = "record"
