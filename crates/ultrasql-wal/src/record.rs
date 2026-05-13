@@ -30,6 +30,20 @@ const FLAGS_OFFSET: usize = 25;
 /// Size of [`WalRecordHeader`] in bytes.
 pub const RECORD_HEADER_SIZE: usize = 28;
 
+/// Hard ceiling on a single record's encoded size.
+///
+/// Defends recovery against a corrupted or maliciously crafted segment
+/// file that claims a record `total_length` of `u32::MAX`: without this
+/// bound, the decoder would allocate gigabyte-class buffers (one for
+/// the payload copy, one for the CRC re-encode) before the CRC even
+/// gets checked.
+///
+/// 64 MiB is comfortably above every legitimate record format used
+/// today (the widest is `FullPageWrite` carrying an 8 KiB page plus
+/// header overhead). Future record types that legitimately need more
+/// must update this constant explicitly.
+pub const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
+
 // Compile-time sanity.
 const _: () = assert!(RECORD_HEADER_SIZE > FLAGS_OFFSET);
 const _: () = assert!(RECORD_HEADER_SIZE % 4 == 0);
@@ -182,6 +196,15 @@ impl WalRecord {
         let total = header.total_length as usize;
         if total < RECORD_HEADER_SIZE {
             return Err(WalRecordError::Malformed("total_length too small"));
+        }
+        // Hostile-disk defence: an on-disk record that claims a giant
+        // total_length must be refused before we allocate a buffer that
+        // big. CRC mismatch is the normal way recovery treats a torn
+        // tail, but the attacker controls bytes, so without this bound
+        // they could engineer a crafted segment that forces gigabyte
+        // allocations BEFORE the CRC check runs.
+        if total > MAX_RECORD_BYTES {
+            return Err(WalRecordError::Malformed("total_length above ceiling"));
         }
         if bytes.len() < total {
             return Err(WalRecordError::Truncated {
@@ -352,5 +375,40 @@ mod tests {
             assert_eq!(used, bytes.len());
             assert_eq!(decoded.payload, payload);
         }
+    }
+
+    /// Adversarial input: a record header that claims `total_length`
+    /// far above any legitimate value must be refused before the
+    /// decoder allocates gigabyte-class buffers for the payload copy
+    /// or CRC re-encode. Required because recovery treats CRC
+    /// mismatch as torn-write — without this bound, a hostile actor
+    /// who writes to a WAL file could force the recoverer to OOM
+    /// before reaching the CRC check that would otherwise reject the
+    /// record.
+    #[test]
+    fn oversized_total_length_rejected_before_allocation() {
+        let mut bytes = vec![0_u8; RECORD_HEADER_SIZE];
+        // Encode an attacker-controlled header that points past the
+        // ceiling. Use u32::MAX so the test is independent of the
+        // exact cap value.
+        write_u32_le(&mut bytes[TOTAL_LEN_OFFSET..TOTAL_LEN_OFFSET + 4], u32::MAX);
+        write_u32_le(&mut bytes[CRC_OFFSET..CRC_OFFSET + 4], 0xDEAD_BEEF);
+        bytes[RTYPE_OFFSET] = RecordType::HeapInsert as u8;
+        let err = WalRecord::decode(&bytes).unwrap_err();
+        assert!(matches!(err, WalRecordError::Malformed(_)), "got {err:?}");
+    }
+
+    /// A header that claims `total_length` exactly one past the
+    /// ceiling triggers the same path — pin the boundary so a future
+    /// tweak to `MAX_RECORD_BYTES` is caught by this test rather than
+    /// silently downgrading the protection.
+    #[test]
+    fn total_length_just_past_ceiling_rejected() {
+        let mut bytes = vec![0_u8; RECORD_HEADER_SIZE];
+        let just_past = u32::try_from(MAX_RECORD_BYTES + 1).expect("fits in u32 by construction");
+        write_u32_le(&mut bytes[TOTAL_LEN_OFFSET..TOTAL_LEN_OFFSET + 4], just_past);
+        bytes[RTYPE_OFFSET] = RecordType::HeapInsert as u8;
+        let err = WalRecord::decode(&bytes).unwrap_err();
+        assert!(matches!(err, WalRecordError::Malformed(_)), "got {err:?}");
     }
 }
