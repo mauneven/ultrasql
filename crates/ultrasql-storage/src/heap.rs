@@ -220,7 +220,11 @@ impl<L: PageLoader> HeapAccess<L> {
         let counter = self.counter_for(rel);
         let existing = counter.load(Ordering::Acquire);
 
-        let n_atts = u16::try_from(payload.len()).unwrap_or(u16::MAX);
+        // TODO(attr-count): heap does not yet know per-tuple attribute counts;
+        // planner-side encoding will populate this in v0.4. Until then, store 0
+        // explicitly so future readers cannot mistake a clipped byte-length for
+        // a real count.
+        let n_atts: u16 = 0;
         let tuple_size = TUPLE_HEADER_SIZE
             .checked_add(payload.len())
             .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
@@ -294,12 +298,14 @@ impl<L: PageLoader> HeapAccess<L> {
     ///    `cmax`, `infomask |= UPDATED`, and `ctid = new_tid`.  Returns
     ///    `UpdateOutcome { hot: false }`.
     ///
-    /// **Lock order (for future multi-page case):** when old and new
-    /// versions land on *different* pages, the new-version page is
-    /// pinned *before* the old-version page (lower block number first in
-    /// a fully concurrent implementation).  In the current v0.3
-    /// single-writer model both pins are taken within this function
-    /// without contention.
+    /// **Lock order (intended for future multi-page case):** the design
+    /// intention is to pin the new-version page before the old-version
+    /// page when they differ (lower block number first in a fully
+    /// concurrent implementation).  The current implementation does not
+    /// hold both page guards simultaneously — `insert` pins and releases
+    /// the new page, then `stamp_updated_old` separately pins the old
+    /// page — so the ordering is not yet structurally enforced.  This
+    /// comment tracks the intended invariant for the concurrent path.
     pub fn update(
         &self,
         old_tid: TupleId,
@@ -309,7 +315,11 @@ impl<L: PageLoader> HeapAccess<L> {
         let new_tuple_size = TUPLE_HEADER_SIZE
             .checked_add(new_payload.len())
             .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
-        let n_atts = u16::try_from(new_payload.len()).unwrap_or(u16::MAX);
+        // TODO(attr-count): heap does not yet know per-tuple attribute counts;
+        // planner-side encoding will populate this in v0.4. Until then, store 0
+        // explicitly so future readers cannot mistake a clipped byte-length for
+        // a real count.
+        let n_atts: u16 = 0;
 
         // --- HOT path: try the same page first --------------------------------
         if opts.hot_eligible {
@@ -705,8 +715,10 @@ impl<L: PageLoader> HeapAccess<L> {
                 .map_err(|_| HeapError::MalformedHeader("itemid slice"))?,
         );
         let id = ItemId::from_raw(raw);
-        let offset = id.offset() as usize;
-        let length = id.length() as usize;
+        let offset = usize::try_from(id.offset())
+            .map_err(|_| HeapError::MalformedHeader("itemid offset overflow"))?;
+        let length = usize::try_from(id.length())
+            .map_err(|_| HeapError::MalformedHeader("itemid length overflow"))?;
         Ok((offset, length))
     }
 }

@@ -43,7 +43,7 @@ use crate::record::{MAX_RECORD_BYTES, RECORD_HEADER_SIZE};
 ///
 /// Computed as `MAX_RECORD_BYTES - RECORD_HEADER_SIZE - MAX_FIXED_OVERHEAD`,
 /// where `MAX_FIXED_OVERHEAD` is the largest fixed-overhead section among all
-/// payload types (`HeapUpdate` has 33 bytes of fixed fields). This keeps any
+/// payload types (`HeapUpdate` has 32 bytes of fixed fields). This keeps any
 /// single WAL record comfortably under the ceiling enforced by `WalRecord`.
 pub const MAX_VARIABLE_PAYLOAD_BYTES: usize = MAX_RECORD_BYTES - RECORD_HEADER_SIZE - 64; // 64 bytes headroom for largest fixed section
 
@@ -95,12 +95,22 @@ pub enum PayloadError {
 const TID_SIZE: usize = 12;
 
 /// Encode `tid` into `buf[..TID_SIZE]`.
-fn encode_tid(buf: &mut [u8; TID_SIZE], tid: TupleId) {
+///
+/// Returns `PayloadError::Malformed` when the block number exceeds the 24-bit
+/// wire field (`> 0x00FF_FFFF`).
+fn encode_tid(buf: &mut [u8; TID_SIZE], tid: TupleId) -> Result<(), PayloadError> {
+    let block = tid.page.block.raw();
+    if block > 0x00FF_FFFF {
+        return Err(PayloadError::Malformed(
+            "tid block number exceeds 24-bit wire field",
+        ));
+    }
     write_u32_le(&mut buf[0..4], tid.page.relation.oid().raw());
     // Only the low 24 bits of BlockNumber are meaningful; high byte reserved zero.
-    write_u32_le(&mut buf[4..8], tid.page.block.raw() & 0x00FF_FFFF);
+    write_u32_le(&mut buf[4..8], block);
     write_u16_le(&mut buf[8..10], tid.slot);
     write_u16_le(&mut buf[10..12], 0); // reserved
+    Ok(())
 }
 
 /// Decode a `TupleId` from `bytes[..TID_SIZE]`.
@@ -183,16 +193,19 @@ pub struct HeapInsertPayload {
 
 impl HeapInsertPayload {
     /// Encode this payload into a freshly-allocated byte vector.
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Returns `PayloadError::Malformed` when the `tid`'s block number exceeds
+    /// the 24-bit wire field.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
         let tuple_len = u32::try_from(self.tuple_bytes.len())
             .expect("tuple_bytes length fits in u32 — enforced at construction");
         let mut out = vec![0_u8; TID_SIZE + 4 + self.tuple_bytes.len()];
         let mut tid_buf = [0_u8; TID_SIZE];
-        encode_tid(&mut tid_buf, self.tid);
+        encode_tid(&mut tid_buf, self.tid)?;
         out[..TID_SIZE].copy_from_slice(&tid_buf);
         write_u32_le(&mut out[TID_SIZE..TID_SIZE + 4], tuple_len);
         out[TID_SIZE + 4..].copy_from_slice(&self.tuple_bytes);
-        out
+        Ok(out)
     }
 
     /// Decode a `HeapInsertPayload` from a byte slice.
@@ -210,9 +223,11 @@ impl HeapInsertPayload {
             });
         }
         let tid = decode_tid(bytes)?;
-        let tuple_len = read_u32_le(&bytes[TID_SIZE..TID_SIZE + 4])
-            .map_err(|_| PayloadError::Malformed("heap_insert tuple_len"))?
-            as usize;
+        let tuple_len = usize::try_from(
+            read_u32_le(&bytes[TID_SIZE..TID_SIZE + 4])
+                .map_err(|_| PayloadError::Malformed("heap_insert tuple_len"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("heap_insert tuple_len usize overflow"))?;
         if tuple_len > MAX_VARIABLE_PAYLOAD_BYTES {
             return Err(PayloadError::Malformed(
                 "heap_insert tuple_len exceeds ceiling",
@@ -278,21 +293,24 @@ const HEAP_UPDATE_FLAGS_RESERVED: u8 = !HEAP_UPDATE_HOT;
 
 impl HeapUpdatePayload {
     /// Encode this payload into a freshly-allocated byte vector.
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Returns `PayloadError::Malformed` when either `old_tid` or `new_tid`'s
+    /// block number exceeds the 24-bit wire field.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
         const FIXED: usize = TID_SIZE + TID_SIZE + 1 + 3 + 4; // 32
         let new_len = u32::try_from(self.new_tuple_bytes.len())
             .expect("new_tuple_bytes length fits in u32 — enforced at construction");
         let mut out = vec![0_u8; FIXED + self.new_tuple_bytes.len()];
         let mut buf = [0_u8; TID_SIZE];
-        encode_tid(&mut buf, self.old_tid);
+        encode_tid(&mut buf, self.old_tid)?;
         out[..TID_SIZE].copy_from_slice(&buf);
-        encode_tid(&mut buf, self.new_tid);
+        encode_tid(&mut buf, self.new_tid)?;
         out[TID_SIZE..TID_SIZE * 2].copy_from_slice(&buf);
         out[TID_SIZE * 2] = self.flags;
         // bytes 25-27: reserved zero (already zeroed by vec! initializer)
         write_u32_le(&mut out[28..32], new_len);
         out[FIXED..].copy_from_slice(&self.new_tuple_bytes);
-        out
+        Ok(out)
     }
 
     /// Decode a `HeapUpdatePayload` from a byte slice.
@@ -315,9 +333,11 @@ impl HeapUpdatePayload {
         if flags & HEAP_UPDATE_FLAGS_RESERVED != 0 {
             return Err(PayloadError::FlagsReserved(flags));
         }
-        let new_len = read_u32_le(&bytes[28..32])
-            .map_err(|_| PayloadError::Malformed("heap_update new_len"))?
-            as usize;
+        let new_len = usize::try_from(
+            read_u32_le(&bytes[28..32])
+                .map_err(|_| PayloadError::Malformed("heap_update new_len"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("heap_update new_len usize overflow"))?;
         if new_len > MAX_VARIABLE_PAYLOAD_BYTES {
             return Err(PayloadError::Malformed(
                 "heap_update new_len exceeds ceiling",
@@ -369,16 +389,19 @@ pub struct HeapDeletePayload {
 
 impl HeapDeletePayload {
     /// Encode this payload into a freshly-allocated byte vector.
-    pub fn encode(&self) -> Vec<u8> {
+    ///
+    /// Returns `PayloadError::Malformed` when the `tid`'s block number exceeds
+    /// the 24-bit wire field.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
         const SIZE: usize = TID_SIZE + 8 + 4 + 4;
         let mut out = vec![0_u8; SIZE];
         let mut tid_buf = [0_u8; TID_SIZE];
-        encode_tid(&mut tid_buf, self.tid);
+        encode_tid(&mut tid_buf, self.tid)?;
         out[..TID_SIZE].copy_from_slice(&tid_buf);
         write_u64_le(&mut out[TID_SIZE..TID_SIZE + 8], self.xmax.raw());
         write_u32_le(&mut out[TID_SIZE + 8..TID_SIZE + 12], self.cmax.raw());
         // bytes TID_SIZE+12 .. SIZE: reserved zero (already zeroed)
-        out
+        Ok(out)
     }
 
     /// Decode a `HeapDeletePayload` from a byte slice.
@@ -645,9 +668,11 @@ impl FullPageWritePayload {
             });
         }
         let page = decode_page_id(bytes)?;
-        let page_bytes_len = read_u32_le(&bytes[PAGE_ID_SIZE..PAGE_ID_SIZE + 4])
-            .map_err(|_| PayloadError::Malformed("fpw page_bytes_len"))?
-            as usize;
+        let page_bytes_len = usize::try_from(
+            read_u32_le(&bytes[PAGE_ID_SIZE..PAGE_ID_SIZE + 4])
+                .map_err(|_| PayloadError::Malformed("fpw page_bytes_len"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("fpw page_bytes_len usize overflow"))?;
         if page_bytes_len != PAGE_SIZE {
             return Err(PayloadError::Malformed(
                 "fpw page_bytes_len must equal PAGE_SIZE",
@@ -704,7 +729,7 @@ mod tests {
             tid: tid(1, 0, 0),
             tuple_bytes: vec![],
         };
-        assert_eq!(HeapInsertPayload::decode(&p.encode()).unwrap(), p);
+        assert_eq!(HeapInsertPayload::decode(&p.encode().unwrap()).unwrap(), p);
     }
 
     #[test]
@@ -713,7 +738,7 @@ mod tests {
             tid: tid(7, 42, 13),
             tuple_bytes: (0_u8..64).collect(),
         };
-        assert_eq!(HeapInsertPayload::decode(&p.encode()).unwrap(), p);
+        assert_eq!(HeapInsertPayload::decode(&p.encode().unwrap()).unwrap(), p);
     }
 
     // ── HeapUpdatePayload ─────────────────────────────────────────────────
@@ -726,7 +751,7 @@ mod tests {
             flags: 0,
             new_tuple_bytes: vec![],
         };
-        assert_eq!(HeapUpdatePayload::decode(&p.encode()).unwrap(), p);
+        assert_eq!(HeapUpdatePayload::decode(&p.encode().unwrap()).unwrap(), p);
     }
 
     #[test]
@@ -737,7 +762,7 @@ mod tests {
             flags: HEAP_UPDATE_HOT,
             new_tuple_bytes: (0_u8..=127).collect(),
         };
-        assert_eq!(HeapUpdatePayload::decode(&p.encode()).unwrap(), p);
+        assert_eq!(HeapUpdatePayload::decode(&p.encode().unwrap()).unwrap(), p);
     }
 
     // ── HeapDeletePayload ─────────────────────────────────────────────────
@@ -749,7 +774,7 @@ mod tests {
             xmax: Xid::INVALID,
             cmax: CommandId::FIRST,
         };
-        assert_eq!(HeapDeletePayload::decode(&p.encode()).unwrap(), p);
+        assert_eq!(HeapDeletePayload::decode(&p.encode().unwrap()).unwrap(), p);
     }
 
     #[test]
@@ -759,7 +784,7 @@ mod tests {
             xmax: Xid::new(1_234_567),
             cmax: CommandId::new(2),
         };
-        assert_eq!(HeapDeletePayload::decode(&p.encode()).unwrap(), p);
+        assert_eq!(HeapDeletePayload::decode(&p.encode().unwrap()).unwrap(), p);
     }
 
     // ── CommitPayload ─────────────────────────────────────────────────────
@@ -842,6 +867,22 @@ mod tests {
         assert_eq!(FullPageWritePayload::decode(&p.encode()).unwrap(), p);
     }
 
+    #[test]
+    fn encode_rejects_block_above_24_bit_field() {
+        let p = HeapInsertPayload {
+            tid: TupleId::new(
+                PageId::new(RelationId::new(1), BlockNumber::new(0x0100_0000)),
+                0,
+            ),
+            tuple_bytes: vec![],
+        };
+        let err = p.encode().unwrap_err();
+        assert!(
+            matches!(err, PayloadError::Malformed(_)),
+            "expected Malformed for block > 24-bit, got {err:?}"
+        );
+    }
+
     // ── Negative tests ────────────────────────────────────────────────────
 
     #[test]
@@ -855,7 +896,7 @@ mod tests {
         // Encode by hand, bypassing the encode-time reserved-flag check is
         // not performed (encode trusts the caller at construction time).
         // Use decode on a manually crafted buffer instead.
-        let mut raw = p.encode(); // encode writes flags = 0b1000_0000 verbatim
+        let mut raw = p.encode().unwrap(); // encode writes flags = 0b1000_0000 verbatim
         let err = HeapUpdatePayload::decode(&raw).unwrap_err();
         assert!(
             matches!(err, PayloadError::FlagsReserved(0b1000_0000)),
@@ -874,7 +915,7 @@ mod tests {
             tid: tid(1, 0, 0),
             tuple_bytes: b"hello world".to_vec(),
         };
-        let mut raw = p.encode();
+        let mut raw = p.encode().unwrap();
         raw.truncate(raw.len() - 1);
         let err = HeapInsertPayload::decode(&raw).unwrap_err();
         assert!(matches!(err, PayloadError::Truncated { .. }), "got {err:?}");
@@ -888,7 +929,7 @@ mod tests {
             flags: 0,
             new_tuple_bytes: b"hello".to_vec(),
         };
-        let mut raw = p.encode();
+        let mut raw = p.encode().unwrap();
         raw.truncate(raw.len() - 1);
         let err = HeapUpdatePayload::decode(&raw).unwrap_err();
         assert!(matches!(err, PayloadError::Truncated { .. }), "got {err:?}");
@@ -901,7 +942,7 @@ mod tests {
             xmax: Xid::new(99),
             cmax: CommandId::new(1),
         };
-        let mut raw = p.encode();
+        let mut raw = p.encode().unwrap();
         raw.truncate(raw.len() - 1);
         let err = HeapDeletePayload::decode(&raw).unwrap_err();
         assert!(matches!(err, PayloadError::Truncated { .. }), "got {err:?}");
@@ -954,6 +995,9 @@ mod tests {
         let err = FullPageWritePayload::decode(&raw).unwrap_err();
         assert!(matches!(err, PayloadError::Truncated { .. }), "got {err:?}");
     }
+    // NOTE: FullPageWritePayload::encode does not encode a TupleId and uses
+    // PAGE_ID_SIZE (u32 fields without 24-bit restriction), so no block-limit
+    // test is needed here.
 
     #[test]
     fn heap_insert_gigantic_tuple_len_rejected() {
@@ -1007,7 +1051,7 @@ mod tests {
                 tid: tid(rel, block, slot),
                 tuple_bytes,
             };
-            prop_assert_eq!(HeapInsertPayload::decode(&p.encode()).unwrap(), p);
+            prop_assert_eq!(HeapInsertPayload::decode(&p.encode().unwrap()).unwrap(), p);
         }
 
         #[test]
@@ -1028,7 +1072,7 @@ mod tests {
                 flags,
                 new_tuple_bytes,
             };
-            prop_assert_eq!(HeapUpdatePayload::decode(&p.encode()).unwrap(), p);
+            prop_assert_eq!(HeapUpdatePayload::decode(&p.encode().unwrap()).unwrap(), p);
         }
     }
 }

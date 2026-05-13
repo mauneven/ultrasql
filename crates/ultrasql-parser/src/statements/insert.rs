@@ -152,13 +152,6 @@ impl Parser<'_> {
                 }
             }
         }
-        if exprs.is_empty() {
-            return Err(ParseError::Expected {
-                expected: "expression",
-                found: TokenKind::RParen,
-                offset: 0,
-            });
-        }
         Ok(exprs)
     }
 
