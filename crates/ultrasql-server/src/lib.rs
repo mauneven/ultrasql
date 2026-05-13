@@ -206,6 +206,25 @@ where
             }
         };
         if major != 3 {
+            // Reply with an `ErrorResponse` so a libpq client that
+            // happens to advertise a future protocol version sees a
+            // proper SQLSTATE and a human-readable message before the
+            // socket closes; without this the client sees only EOF and
+            // reports a confusing "connection closed before handshake"
+            // error. The reply is best-effort — if it fails we still
+            // propagate the original UnsupportedProtocol error.
+            let _ = self
+                .send(&BackendMessage::ErrorResponse {
+                    fields: vec![
+                        (b'S', "FATAL".to_string()),
+                        (b'C', "08P01".to_string()),
+                        (
+                            b'M',
+                            format!("unsupported frontend protocol {major}.{minor}; server supports 3.0"),
+                        ),
+                    ],
+                })
+                .await;
             return Err(ServerError::UnsupportedProtocol { major, minor });
         }
 
@@ -670,6 +689,65 @@ mod tests {
         send_frontend(&mut client, &FrontendMessage::Terminate).await;
         drop(client);
         handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// Adversarial input: a client that advertises `protocol_major =
+    /// 0xFFFF` (or any non-3 value, including the negotiated future
+    /// minor protocol number used by clients targeting newer servers)
+    /// must be rejected cleanly with an `ErrorResponse` carrying
+    /// SQLSTATE 08P01, followed by a clean connection close — not a
+    /// panic, not a silent EOF.
+    #[tokio::test]
+    async fn unsupported_protocol_major_returns_error_response() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = server();
+        let handle = tokio::spawn(handle_connection(server_side, state));
+
+        // Send a startup with a wildly future major.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::StartupMessage {
+                protocol_major: 0xFFFF,
+                protocol_minor: 0,
+                params: vec![("user".to_string(), "anyone".to_string())],
+            },
+        )
+        .await;
+
+        // Drain whatever bytes the server sent back before closing.
+        let mut buf = BytesMut::with_capacity(1024);
+        let mut tmp = [0_u8; 1024];
+        loop {
+            let n = client.read(&mut tmp).await.expect("read");
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+
+        // The first decoded backend message must be an ErrorResponse
+        // with SQLSTATE 08P01.
+        let msg = ultrasql_protocol::decode_backend(&mut buf)
+            .expect("decode")
+            .expect("non-empty");
+        match msg {
+            BackendMessage::ErrorResponse { fields } => {
+                let code = fields
+                    .iter()
+                    .find_map(|(c, v)| (*c == b'C').then(|| v.clone()))
+                    .expect("SQLSTATE field present");
+                assert_eq!(code, "08P01");
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+
+        // The handler task must have returned with the
+        // UnsupportedProtocol classification (not a panic).
+        let result = handle.await.expect("task joins");
+        assert!(matches!(
+            result,
+            Err(ServerError::UnsupportedProtocol { major: 0xFFFF, .. })
+        ));
     }
 
     #[tokio::test]
