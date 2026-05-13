@@ -31,12 +31,14 @@
 pub mod cost;
 pub mod enumeration;
 mod error;
+pub mod plan_cache;
 pub mod rules;
 pub mod stats;
 
 pub use cost::{CostEstimate, CostGucs, CostModel, NoStats, StatsSource};
 pub use enumeration::{JoinEnumerator, Memo, PhysicalOp, choose_enumerator};
 pub use error::OptimizeError;
+pub use plan_cache::{PlanCache, PlanCacheConfig, PlanCacheEntry, PlanCacheKey};
 pub use rules::{RewriteRule, RuleSet};
 pub use stats::{
     AnalyzeOptions, AnalyzeRunner, ColumnStats, EquiDepthHistogram, InMemoryStatsCatalog,

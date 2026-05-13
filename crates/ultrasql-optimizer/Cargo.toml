@@ -19,6 +19,12 @@ thiserror        = { workspace = true }
 smallvec         = { workspace = true }
 ahash            = { workspace = true }
 tracing          = { workspace = true }
+dashmap          = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
+proptest  = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name    = "optimizer_rules"
+harness = false

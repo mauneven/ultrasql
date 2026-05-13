@@ -22,11 +22,15 @@
 //! 5. [`LimitPushdown`] — push limits through projections; fuse with sort
 //!    (v0.7 placeholder).
 //! 6. [`InListToSemi`] — collapse OR-lists of equality on the same column.
+//! 7. [`SubqueryDecorrelation`] — transform correlated subqueries to joins.
+//! 8. [`CommonSubExprElimination`] — hoist duplicate `ScalarExpr` sub-trees.
+//! 9. [`PredicatePushdownSubquery`] — push filters into derived tables and CTEs.
 //!
-//! ## Stub rules (not registered)
+//! ## Advisory rules (registered but produce no structural rewrite)
 //!
-//! - [`CommonSubExprElimination`] — returns `None` until v0.7.
-//! - [`SubqueryDecorrelation`] — returns `None` until v0.7.
+//! - [`SortElimination`] — logs when a sort can be eliminated via an index;
+//!   requires an `IndexHint` catalog to be injected at construction time.
+//!   Not included in `default_rules()` (no catalog available statically).
 
 pub mod common_subexpr;
 pub mod constant_fold;
@@ -34,7 +38,9 @@ pub mod in_list_to_semi;
 pub mod limit_pushdown;
 pub mod outer_join_elimination;
 pub mod predicate_pushdown;
+pub mod predicate_pushdown_subquery;
 pub mod projection_pushdown;
+pub mod sort_elimination;
 pub mod subquery_decorrelation;
 
 pub use common_subexpr::CommonSubExprElimination;
@@ -43,7 +49,9 @@ pub use in_list_to_semi::InListToSemi;
 pub use limit_pushdown::LimitPushdown;
 pub use outer_join_elimination::OuterJoinElimination;
 pub use predicate_pushdown::PredicatePushdown;
+pub use predicate_pushdown_subquery::PredicatePushdownSubquery;
 pub use projection_pushdown::ProjectionPushdown;
+pub use sort_elimination::SortElimination;
 pub use subquery_decorrelation::SubqueryDecorrelation;
 
 use ultrasql_planner::LogicalPlan;
@@ -120,9 +128,9 @@ impl RuleSet {
     /// Create a rule set pre-populated with all built-in rules in the
     /// canonical application order.
     ///
-    /// Stub rules ([`CommonSubExprElimination`], [`SubqueryDecorrelation`])
-    /// are **not** included because they return `None` unconditionally and
-    /// would only add loop overhead.
+    /// [`SortElimination`] is **not** included because it requires an
+    /// index catalog to be injected at construction time; add it explicitly
+    /// via [`RuleSet::add`] when the catalog is available.
     #[must_use]
     pub fn default_rules() -> Self {
         let mut rs = Self::new();
@@ -132,6 +140,9 @@ impl RuleSet {
         rs.add(Box::new(OuterJoinElimination));
         rs.add(Box::new(LimitPushdown));
         rs.add(Box::new(InListToSemi));
+        rs.add(Box::new(SubqueryDecorrelation));
+        rs.add(Box::new(CommonSubExprElimination));
+        rs.add(Box::new(PredicatePushdownSubquery));
         rs
     }
 
