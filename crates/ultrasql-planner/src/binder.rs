@@ -476,7 +476,7 @@ fn bind_truncate(s: &TruncateStmt, catalog: &dyn Catalog) -> Result<LogicalPlan,
 // ---------------------------------------------------------------------------
 
 fn bind_select(select: &SelectStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
-    if !matches!(select.distinct, Distinct::All) {
+    if !matches!(select.distinct, Distinct::None | Distinct::All) {
         return Err(PlanError::NotSupported("SELECT DISTINCT"));
     }
 
