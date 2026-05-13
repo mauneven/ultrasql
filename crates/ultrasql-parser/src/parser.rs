@@ -182,10 +182,91 @@ impl<'src> Parser<'src> {
                 }
                 Ok(Statement::Rollback { span: tok.span })
             }
+            // ---- DDL --------------------------------------------------------
+            TokenKind::KwCreate => self.parse_create(),
+            TokenKind::KwDrop => self.parse_drop(),
+            TokenKind::KwAlter => self.parse_alter(),
+            TokenKind::KwReindex => self.parse_reindex().map(Statement::Reindex),
+            TokenKind::KwSet | TokenKind::KwShow | TokenKind::KwReset => {
+                self.parse_set_stmt().map(Statement::SetVar)
+            }
             other => Err(ParseError::Expected {
-                expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, BEGIN, COMMIT, or ROLLBACK",
+                expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, ALTER, \
+                           REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, or ROLLBACK",
                 found: other,
                 offset: head.span.start as usize,
+            }),
+        }
+    }
+
+    /// Dispatch `CREATE …` to the appropriate sub-parser based on the
+    /// keyword that follows `CREATE`.
+    fn parse_create(&mut self) -> Result<Statement, ParseError> {
+        let create_tok = self.advance()?; // CREATE
+        let start = create_tok.span.start;
+
+        let tok = self.peek()?;
+        match tok.kind {
+            TokenKind::KwTable => self.parse_create_table(start),
+            TokenKind::KwSchema => self.parse_create_schema(start).map(Statement::CreateSchema),
+            TokenKind::KwIndex => self
+                .parse_create_index(start, false)
+                .map(|s| Statement::CreateIndex(Box::new(s))),
+            TokenKind::KwUnique => {
+                // CREATE UNIQUE INDEX …
+                self.advance()?; // UNIQUE
+                self.parse_create_index(start, true)
+                    .map(|s| Statement::CreateIndex(Box::new(s)))
+            }
+            TokenKind::KwSequence => self
+                .parse_create_sequence(start)
+                .map(|s| Statement::CreateSequence(Box::new(s))),
+            other => Err(ParseError::Expected {
+                expected: "TABLE, SCHEMA, INDEX, UNIQUE, or SEQUENCE after CREATE",
+                found: other,
+                offset: tok.span.start as usize,
+            }),
+        }
+    }
+
+    /// Dispatch `DROP …` to the appropriate sub-parser based on the
+    /// keyword that follows `DROP`.
+    fn parse_drop(&mut self) -> Result<Statement, ParseError> {
+        let drop_tok = self.advance()?; // DROP
+        let start = drop_tok.span.start;
+
+        let tok = self.peek()?;
+        match tok.kind {
+            TokenKind::KwTable => self.parse_drop_table(start).map(Statement::DropTable),
+            TokenKind::KwSchema => self.parse_drop_schema(start).map(Statement::DropSchema),
+            TokenKind::KwIndex => self.parse_drop_index(start).map(Statement::DropIndex),
+            TokenKind::KwSequence => self.parse_drop_sequence(start).map(Statement::DropSequence),
+            other => Err(ParseError::Expected {
+                expected: "TABLE, SCHEMA, INDEX, or SEQUENCE after DROP",
+                found: other,
+                offset: tok.span.start as usize,
+            }),
+        }
+    }
+
+    /// Dispatch `ALTER …` to the appropriate sub-parser based on the
+    /// keyword that follows `ALTER`.
+    fn parse_alter(&mut self) -> Result<Statement, ParseError> {
+        let alter_tok = self.advance()?; // ALTER
+        let start = alter_tok.span.start;
+
+        let tok = self.peek()?;
+        match tok.kind {
+            TokenKind::KwTable => self
+                .parse_alter_table(start)
+                .map(|s| Statement::AlterTable(Box::new(s))),
+            TokenKind::KwSequence => self
+                .parse_alter_sequence(start)
+                .map(|s| Statement::AlterSequence(Box::new(s))),
+            other => Err(ParseError::Expected {
+                expected: "TABLE or SEQUENCE after ALTER",
+                found: other,
+                offset: tok.span.start as usize,
             }),
         }
     }
@@ -803,7 +884,8 @@ mod tests {
 
     #[test]
     fn unsupported_statement_rejected() {
-        let err = Parser::new("DROP TABLE t").parse_statement().unwrap_err();
+        // A truly unknown statement keyword should produce an error.
+        let err = Parser::new("VACUUM t").parse_statement().unwrap_err();
         assert!(matches!(err, ParseError::Expected { .. }));
     }
 

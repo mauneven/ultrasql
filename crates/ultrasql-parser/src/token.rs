@@ -280,6 +280,45 @@ pub enum TokenKind {
     KwWindow,
     KwWith,
     KwWithin,
+    // ---- DDL keywords added for v0.2 -------------------------------------
+    /// `ADD` — used in `ALTER TABLE … ADD COLUMN / ADD CONSTRAINT`.
+    KwAdd,
+    /// `CACHE` — used in `CREATE SEQUENCE … CACHE n`.
+    KwCache,
+    /// `CYCLE` — used in `CREATE SEQUENCE … CYCLE / NO CYCLE`.
+    KwCycle,
+    /// `IF` — used in `CREATE TABLE IF NOT EXISTS` / `DROP TABLE IF EXISTS`.
+    KwIf,
+    /// `INCLUDE` — used in `CREATE INDEX … INCLUDE (col, …)`.
+    KwInclude,
+    /// `INCREMENT` — used in `CREATE SEQUENCE … INCREMENT BY n`.
+    KwIncrement,
+    /// `LOCAL` — used in `SET LOCAL …`.
+    KwLocal,
+    /// `MAXVALUE` — used in `CREATE SEQUENCE … MAXVALUE n`.
+    KwMaxvalue,
+    /// `MINVALUE` — used in `CREATE SEQUENCE … MINVALUE n`.
+    KwMinvalue,
+    /// `NO` — used in `NO CYCLE`, `NO MINVALUE`, `NO MAXVALUE`.
+    KwNo,
+    /// `REINDEX` — `REINDEX TABLE / INDEX name`.
+    KwReindex,
+    /// `RENAME` — used in `ALTER TABLE … RENAME COLUMN / RENAME TO`.
+    KwRename,
+    /// `RESET` — used in `RESET var`.
+    KwReset,
+    /// `RESTRICT` — used in `DROP TABLE … RESTRICT`.
+    KwRestrict,
+    /// `SCHEMA` — used in `CREATE SCHEMA` / `DROP SCHEMA`.
+    KwSchema,
+    /// `SEQUENCE` — used in `CREATE SEQUENCE` / `DROP SEQUENCE`.
+    KwSequence,
+    /// `SESSION` — used in `SET SESSION …`.
+    KwSession,
+    /// `START` — used in `CREATE SEQUENCE … START WITH n`.
+    KwStart,
+    /// `TO` — used in `SET search_path TO …` and `RENAME … TO`.
+    KwTo,
 }
 
 impl TokenKind {

@@ -172,6 +172,26 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("window", TokenKind::KwWindow),
         ("with", TokenKind::KwWith),
         ("within", TokenKind::KwWithin),
+        // DDL keywords added for v0.2
+        ("add", TokenKind::KwAdd),
+        ("cache", TokenKind::KwCache),
+        ("cycle", TokenKind::KwCycle),
+        ("if", TokenKind::KwIf),
+        ("include", TokenKind::KwInclude),
+        ("increment", TokenKind::KwIncrement),
+        ("local", TokenKind::KwLocal),
+        ("maxvalue", TokenKind::KwMaxvalue),
+        ("minvalue", TokenKind::KwMinvalue),
+        ("no", TokenKind::KwNo),
+        ("reindex", TokenKind::KwReindex),
+        ("rename", TokenKind::KwRename),
+        ("reset", TokenKind::KwReset),
+        ("restrict", TokenKind::KwRestrict),
+        ("schema", TokenKind::KwSchema),
+        ("sequence", TokenKind::KwSequence),
+        ("session", TokenKind::KwSession),
+        ("start", TokenKind::KwStart),
+        ("to", TokenKind::KwTo),
     ];
 
     entries.iter().copied().collect()

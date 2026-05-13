@@ -42,6 +42,32 @@ pub enum Statement {
         /// Source span.
         span: Span,
     },
+    /// `CREATE TABLE …`.
+    CreateTable(Box<CreateTableStmt>),
+    /// `CREATE TABLE … AS SELECT …`.
+    CreateTableAs(Box<CreateTableAsStmt>),
+    /// `DROP TABLE …`.
+    DropTable(DropTableStmt),
+    /// `ALTER TABLE …`.
+    AlterTable(Box<AlterTableStmt>),
+    /// `CREATE SCHEMA …`.
+    CreateSchema(CreateSchemaStmt),
+    /// `DROP SCHEMA …`.
+    DropSchema(DropSchemaStmt),
+    /// `SET [SESSION|LOCAL] var = val` / `SHOW var` / `RESET var`.
+    SetVar(SetVarStmt),
+    /// `CREATE [UNIQUE] INDEX …`.
+    CreateIndex(Box<CreateIndexStmt>),
+    /// `DROP INDEX …`.
+    DropIndex(DropIndexStmt),
+    /// `REINDEX TABLE/INDEX …`.
+    Reindex(ReindexStmt),
+    /// `CREATE SEQUENCE …`.
+    CreateSequence(Box<CreateSequenceStmt>),
+    /// `ALTER SEQUENCE …`.
+    AlterSequence(Box<AlterSequenceStmt>),
+    /// `DROP SEQUENCE …`.
+    DropSequence(DropSequenceStmt),
 }
 
 impl Statement {
@@ -55,8 +81,431 @@ impl Statement {
             Self::Delete(s) => s.span,
             Self::Truncate(s) => s.span,
             Self::Begin { span } | Self::Commit { span } | Self::Rollback { span } => *span,
+            Self::CreateTable(s) => s.span,
+            Self::CreateTableAs(s) => s.span,
+            Self::DropTable(s) => s.span,
+            Self::AlterTable(s) => s.span,
+            Self::CreateSchema(s) => s.span,
+            Self::DropSchema(s) => s.span,
+            Self::SetVar(s) => s.span,
+            Self::CreateIndex(s) => s.span,
+            Self::DropIndex(s) => s.span,
+            Self::Reindex(s) => s.span,
+            Self::CreateSequence(s) => s.span,
+            Self::AlterSequence(s) => s.span,
+            Self::DropSequence(s) => s.span,
         }
     }
+}
+
+// ============================================================================
+// DDL AST nodes
+// ============================================================================
+
+/// `CREATE TABLE t (col type [constraints], …)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateTableStmt {
+    /// Whether `IF NOT EXISTS` was specified.
+    pub if_not_exists: bool,
+    /// Table name (possibly schema-qualified).
+    pub name: ObjectName,
+    /// Column definitions.
+    pub columns: Vec<ColumnDef>,
+    /// Table-level constraints.
+    pub table_constraints: Vec<TableConstraint>,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// `CREATE TABLE t AS SELECT …`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateTableAsStmt {
+    /// Whether `IF NOT EXISTS` was specified.
+    pub if_not_exists: bool,
+    /// Table name (possibly schema-qualified).
+    pub name: ObjectName,
+    /// Optional explicit column-name list `(col1, col2, …)`.
+    pub columns: Vec<Identifier>,
+    /// The SELECT statement that provides rows.
+    pub source: Box<SelectStmt>,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// One column definition inside `CREATE TABLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnDef {
+    /// Column name.
+    pub name: Identifier,
+    /// Declared SQL type.
+    pub data_type: TypeName,
+    /// Column-level constraints.
+    pub constraints: Vec<ColumnConstraint>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Column-level constraint inside a `CREATE TABLE` column definition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ColumnConstraint {
+    /// `NOT NULL`.
+    NotNull {
+        /// Source span.
+        span: Span,
+    },
+    /// `NULL` (explicit nullable).
+    Null {
+        /// Source span.
+        span: Span,
+    },
+    /// `DEFAULT expr`.
+    Default {
+        /// Default value expression.
+        expr: Expr,
+        /// Source span.
+        span: Span,
+    },
+    /// `PRIMARY KEY`.
+    PrimaryKey {
+        /// Source span.
+        span: Span,
+    },
+    /// `UNIQUE`.
+    Unique {
+        /// Source span.
+        span: Span,
+    },
+    /// `CHECK (expr)`.
+    Check {
+        /// Constraint expression.
+        expr: Expr,
+        /// Source span.
+        span: Span,
+    },
+    /// `REFERENCES target_table [(target_columns)]`.
+    References {
+        /// Referenced table.
+        target_table: ObjectName,
+        /// Referenced columns (may be empty if targeting the primary key).
+        target_columns: Vec<Identifier>,
+        /// Source span.
+        span: Span,
+    },
+}
+
+/// Table-level constraint inside `CREATE TABLE` or `ALTER TABLE ADD CONSTRAINT`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableConstraint {
+    /// `PRIMARY KEY (col, …)`.
+    PrimaryKey {
+        /// Key columns.
+        columns: Vec<Identifier>,
+        /// Source span.
+        span: Span,
+    },
+    /// `UNIQUE (col, …)`.
+    Unique {
+        /// Unique columns.
+        columns: Vec<Identifier>,
+        /// Source span.
+        span: Span,
+    },
+    /// `FOREIGN KEY (col, …) REFERENCES target_table [(target_col, …)]`.
+    ForeignKey {
+        /// Local columns.
+        columns: Vec<Identifier>,
+        /// Referenced table.
+        target_table: ObjectName,
+        /// Referenced columns (may be empty).
+        target_columns: Vec<Identifier>,
+        /// Source span.
+        span: Span,
+    },
+    /// `CHECK (expr)`.
+    Check {
+        /// Constraint expression.
+        expr: Expr,
+        /// Source span.
+        span: Span,
+    },
+}
+
+/// Parsed SQL type name, including optional type modifiers and array suffix.
+///
+/// Mirrors the CAST-target structure but is richer: it carries numeric
+/// modifiers (e.g. `VARCHAR(255)` → `[255]`) and an array flag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeName {
+    /// Canonical lower-case type name.
+    pub name: Identifier,
+    /// Type modifiers: `VARCHAR(255)` → `[255]`, `NUMERIC(10,2)` → `[10, 2]`.
+    pub type_modifiers: Vec<u32>,
+    /// Whether the type has a trailing `[]` (array type).
+    pub is_array: bool,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `DROP TABLE [IF EXISTS] name [, …] [CASCADE|RESTRICT]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropTableStmt {
+    /// Whether `IF EXISTS` was specified.
+    pub if_exists: bool,
+    /// Tables to drop (one or more).
+    pub names: Vec<ObjectName>,
+    /// Whether `CASCADE` was specified (vs. `RESTRICT` or omitted).
+    pub cascade: bool,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `ALTER TABLE name action`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlterTableStmt {
+    /// Table to alter.
+    pub name: ObjectName,
+    /// The single action to perform.
+    pub action: AlterTableAction,
+    /// Source span.
+    pub span: Span,
+}
+
+/// One action clause of an `ALTER TABLE` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AlterTableAction {
+    /// `ADD [COLUMN] col type [constraints]`.
+    AddColumn {
+        /// Column definition to add.
+        column: ColumnDef,
+        /// Source span.
+        span: Span,
+    },
+    /// `DROP [COLUMN] col [CASCADE|RESTRICT]`.
+    DropColumn {
+        /// Column to drop.
+        name: Identifier,
+        /// Whether `CASCADE` was specified.
+        cascade: bool,
+        /// Source span.
+        span: Span,
+    },
+    /// `RENAME COLUMN old TO new`.
+    RenameColumn {
+        /// Old column name.
+        old: Identifier,
+        /// New column name.
+        new: Identifier,
+        /// Source span.
+        span: Span,
+    },
+    /// `RENAME TO new_name`.
+    RenameTable {
+        /// New table name.
+        new_name: Identifier,
+        /// Source span.
+        span: Span,
+    },
+    /// `ADD CONSTRAINT name constraint`.
+    AddConstraint {
+        /// Constraint definition.
+        constraint: TableConstraint,
+        /// Source span.
+        span: Span,
+    },
+    /// `DROP CONSTRAINT name [CASCADE|RESTRICT]`.
+    DropConstraint {
+        /// Constraint name.
+        name: Identifier,
+        /// Whether `CASCADE` was specified.
+        cascade: bool,
+        /// Source span.
+        span: Span,
+    },
+}
+
+/// `CREATE SCHEMA [IF NOT EXISTS] name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateSchemaStmt {
+    /// Whether `IF NOT EXISTS` was specified.
+    pub if_not_exists: bool,
+    /// Schema name.
+    pub name: Identifier,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `DROP SCHEMA [IF EXISTS] name [, …] [CASCADE|RESTRICT]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropSchemaStmt {
+    /// Whether `IF EXISTS` was specified.
+    pub if_exists: bool,
+    /// Schema names to drop.
+    pub names: Vec<Identifier>,
+    /// Whether `CASCADE` was specified.
+    pub cascade: bool,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `SET [SESSION|LOCAL] var = val` / `SHOW var` / `RESET var`.
+///
+/// A single statement covering all GUC (Grand Unified Configuration)
+/// manipulation forms supported by PostgreSQL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetVarStmt {
+    /// Scope modifier and action type.
+    pub scope: SetScope,
+    /// Variable name (e.g. `search_path`, `statement_timeout`).
+    pub name: Identifier,
+    /// Value to assign.
+    pub value: SetValue,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Scope or action type for a `SET`/`SHOW`/`RESET` statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetScope {
+    /// `SET [SESSION] var = val` — session-level setting (default).
+    Session,
+    /// `SET LOCAL var = val` — transaction-local setting.
+    Local,
+    /// `SHOW var` — display current value.
+    Show,
+    /// `RESET var` — restore to default.
+    Reset,
+}
+
+/// Value expression(s) for a `SET` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SetValue {
+    /// `DEFAULT` — restore to default.
+    Default,
+    /// One or more expressions: `SET search_path TO schema, public`.
+    Values(Vec<Expr>),
+}
+
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON table [USING method] (columns) [INCLUDE (...)] [WHERE expr]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateIndexStmt {
+    /// Whether `UNIQUE` was specified.
+    pub unique: bool,
+    /// Whether `IF NOT EXISTS` was specified.
+    pub if_not_exists: bool,
+    /// Optional explicit index name.
+    pub name: Option<Identifier>,
+    /// Table to index.
+    pub table: ObjectName,
+    /// Index method (`btree`, `hash`, `gin`, `gist`, …).
+    pub method: Option<Identifier>,
+    /// Index key columns / expressions.
+    pub columns: Vec<IndexColumn>,
+    /// Optional partial-index predicate.
+    pub r#where: Option<Expr>,
+    /// `INCLUDE (col, …)` covering columns.
+    pub include: Vec<Identifier>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// One entry in the `CREATE INDEX` column list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexColumn {
+    /// Key expression (commonly a bare column reference).
+    pub expr: Expr,
+    /// Sort direction.
+    pub direction: SortDirection,
+    /// Null ordering.
+    pub nulls: NullsOrder,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `DROP INDEX [IF EXISTS] name [, …] [CASCADE|RESTRICT]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropIndexStmt {
+    /// Whether `IF EXISTS` was specified.
+    pub if_exists: bool,
+    /// Index names to drop.
+    pub names: Vec<ObjectName>,
+    /// Whether `CASCADE` was specified.
+    pub cascade: bool,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `REINDEX { INDEX | TABLE } name`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReindexStmt {
+    /// Whether the target is an index or a table.
+    pub kind: ReindexKind,
+    /// Target object name.
+    pub name: ObjectName,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Target kind for a `REINDEX` statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReindexKind {
+    /// `REINDEX INDEX name`.
+    Index,
+    /// `REINDEX TABLE name`.
+    Table,
+}
+
+/// `CREATE SEQUENCE [IF NOT EXISTS] name [options]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateSequenceStmt {
+    /// Whether `IF NOT EXISTS` was specified.
+    pub if_not_exists: bool,
+    /// Sequence name.
+    pub name: ObjectName,
+    /// Sequence options.
+    pub options: Vec<SequenceOption>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `ALTER SEQUENCE name [options]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlterSequenceStmt {
+    /// Sequence name.
+    pub name: ObjectName,
+    /// Options to change.
+    pub options: Vec<SequenceOption>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `DROP SEQUENCE [IF EXISTS] name [, …] [CASCADE|RESTRICT]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropSequenceStmt {
+    /// Whether `IF EXISTS` was specified.
+    pub if_exists: bool,
+    /// Sequence names to drop.
+    pub names: Vec<ObjectName>,
+    /// Whether `CASCADE` was specified.
+    pub cascade: bool,
+    /// Source span.
+    pub span: Span,
+}
+
+/// One option clause in `CREATE SEQUENCE` or `ALTER SEQUENCE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SequenceOption {
+    /// `START [WITH] n`.
+    Start(i64),
+    /// `INCREMENT [BY] n`.
+    Increment(i64),
+    /// `MINVALUE n` or `NO MINVALUE`.
+    MinValue(Option<i64>),
+    /// `MAXVALUE n` or `NO MAXVALUE`.
+    MaxValue(Option<i64>),
+    /// `CACHE n`.
+    Cache(u64),
+    /// `CYCLE` or `NO CYCLE`.
+    Cycle(bool),
 }
 
 /// An `INSERT` statement.
