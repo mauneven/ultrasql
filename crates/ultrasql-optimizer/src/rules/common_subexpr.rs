@@ -34,6 +34,8 @@
 //! duplicate sub-trees. It reaches a fixed point after at most one pass per
 //! duplicate (bounded by the expression size).
 
+#![allow(clippy::match_same_arms)]
+
 use std::collections::HashMap;
 
 use std::cmp::Reverse;
@@ -297,6 +299,11 @@ fn expr_size(expr: &ScalarExpr) -> usize {
             1 + expr_size(inner)
         }
         ScalarExpr::Binary { left, right, .. } => 1 + expr_size(left) + expr_size(right),
+        // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => 1,
     }
 }
 
@@ -339,6 +346,11 @@ fn collect_subtrees(expr: &ScalarExpr, freq: &mut HashMap<ExprKey, (usize, Scala
             collect_subtrees(inner, freq);
         }
         ScalarExpr::Column { .. } | ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {}
+        // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => {}
     }
 }
 
@@ -393,6 +405,11 @@ fn substitute(
         ScalarExpr::Column { .. } | ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {
             expr.clone()
         }
+        // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => expr.clone(),
     }
 }
 

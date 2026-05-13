@@ -89,7 +89,7 @@ struct BaselineEntry {
     #[serde(default)]
     p99_us: f64,
     /// Per-competitor median latency values recorded at the same time, keyed
-    /// by [`Engine::as_str`] (e.g. `"postgres17"`). 0.0 = placeholder.
+    /// by `Engine::as_str` (e.g. `"postgres17"`). 0.0 = placeholder.
     ///
     /// Reserved for future use: competitor rows may be driven from baseline
     /// data when cross-engine recording is wired. Not yet consumed by the

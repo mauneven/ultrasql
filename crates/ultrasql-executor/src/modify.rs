@@ -230,6 +230,8 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                     xmin: self.insert_xmin,
                     command_id: self.insert_command_id,
                     wal: wal_ref,
+                    fsm: None,
+                    vm: None,
                 },
             )
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
@@ -287,6 +289,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                     command_id: self.delete_cmax,
                     hot_eligible: true,
                     wal: wal_ref,
+                    vm: None,
                 },
             )
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
@@ -307,6 +310,8 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                     xmax: self.delete_xmax,
                     cmax: self.delete_cmax,
                     wal: wal_ref,
+                    fsm: None,
+                    vm: None,
                 },
             )
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;

@@ -20,12 +20,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
+use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, TupleId};
 use ultrasql_core::{Lsn, Xid};
 use ultrasql_wal::buffer::WalBuffer;
-use ultrasql_wal::payload::{HeapInsertPayload, HeapDeletePayload};
+use ultrasql_wal::payload::{HeapDeletePayload, HeapInsertPayload};
 use ultrasql_wal::record::{RecordType, WalRecord};
 use ultrasql_wal::{WalWriter, WalWriterConfig, recover};
-use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, TupleId};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -246,11 +246,8 @@ fn recovery_walks_across_segment_boundary() {
     let seg_count = std::fs::read_dir(dir.path())
         .unwrap()
         .filter(|e| {
-            e.as_ref().is_ok_and(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("segment_")
-            })
+            e.as_ref()
+                .is_ok_and(|e| e.file_name().to_string_lossy().starts_with("segment_"))
         })
         .count();
     assert!(
@@ -266,5 +263,8 @@ fn recovery_walks_across_segment_boundary() {
     })
     .unwrap();
 
-    assert_eq!(count, N, "all {N} records must survive the segment boundary");
+    assert_eq!(
+        count, N,
+        "all {N} records must survive the segment boundary"
+    );
 }

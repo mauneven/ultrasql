@@ -183,6 +183,24 @@ fn eval_expr(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Value
             let is_null = matches!(val, Value::Null);
             Ok(Value::Bool(is_null ^ negated))
         }
+
+        // Subquery / outer-scope variants are produced by the binder but
+        // are not yet runnable by the row-at-a-time interpreter. The
+        // optimizer's subquery-decorrelation rule lowers them to joins
+        // before the executor sees them; if any survive here it is a
+        // bug upstream.
+        ScalarExpr::OuterColumn { .. } => Err(EvalError::Unsupported(
+            "outer-column reference reached the executor; decorrelation rule should have removed it",
+        )),
+        ScalarExpr::ScalarSubquery { .. } => Err(EvalError::Unsupported(
+            "scalar subquery reached the executor; decorrelation rule should have removed it",
+        )),
+        ScalarExpr::Exists { .. } => Err(EvalError::Unsupported(
+            "EXISTS subquery reached the executor; decorrelation rule should have removed it",
+        )),
+        ScalarExpr::InSubquery { .. } => Err(EvalError::Unsupported(
+            "IN subquery reached the executor; decorrelation rule should have removed it",
+        )),
     }
 }
 

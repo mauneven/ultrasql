@@ -29,8 +29,8 @@
 use std::sync::atomic::Ordering;
 
 use ultrasql_core::BlockNumber;
-use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 use ultrasql_mvcc::TupleHeader;
+use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 use ultrasql_wal::applier::{ApplyError, HeapTarget};
 use ultrasql_wal::payload::{
     FullPageWritePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload,
@@ -58,10 +58,13 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         self.advance_counter(rel, page_id.block);
 
         // Obtain an exclusive pin on the page.
-        let guard = self.pool.get_page(page_id).map_err(|e| ApplyError::Refused {
-            operation: "heap_insert",
-            detail: format!("buffer pool: {e}"),
-        })?;
+        let guard = self
+            .pool
+            .get_page(page_id)
+            .map_err(|e| ApplyError::Refused {
+                operation: "heap_insert",
+                detail: format!("buffer pool: {e}"),
+            })?;
 
         let mut page = guard.write();
 
@@ -105,13 +108,13 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
 
         // Write the new tuple onto its page.
         {
-            let guard =
-                self.pool
-                    .get_page(new_page_id)
-                    .map_err(|e| ApplyError::Refused {
-                        operation: "heap_update_new",
-                        detail: format!("buffer pool: {e}"),
-                    })?;
+            let guard = self
+                .pool
+                .get_page(new_page_id)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "heap_update_new",
+                    detail: format!("buffer pool: {e}"),
+                })?;
             let mut page = guard.write();
             let slot_count = page.header().slot_count();
             if payload.new_tid.slot >= slot_count
@@ -129,21 +132,21 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
 
         // Stamp the old tuple's header: read it, set xmax/cmax, write back.
         {
-            let guard =
-                self.pool
-                    .get_page(old_page_id)
-                    .map_err(|e| ApplyError::Refused {
-                        operation: "heap_update_old",
-                        detail: format!("buffer pool: {e}"),
-                    })?;
+            let guard = self
+                .pool
+                .get_page(old_page_id)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "heap_update_old",
+                    detail: format!("buffer pool: {e}"),
+                })?;
             let mut page = guard.write();
             // Read the existing header bytes.
-            let existing = page.read_tuple(payload.old_tid.slot).map_err(|e| {
-                ApplyError::Refused {
-                    operation: "heap_update_old",
-                    detail: format!("read slot: {e}"),
-                }
-            })?;
+            let existing =
+                page.read_tuple(payload.old_tid.slot)
+                    .map_err(|e| ApplyError::Refused {
+                        operation: "heap_update_old",
+                        detail: format!("read slot: {e}"),
+                    })?;
             if existing.len() < TUPLE_HEADER_SIZE {
                 return Err(ApplyError::Refused {
                     operation: "heap_update_old",
@@ -151,9 +154,11 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 });
             }
             let (mut hdr, _) =
-                TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| ApplyError::Refused {
-                    operation: "heap_update_old",
-                    detail: String::from("header decode failed"),
+                TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
+                    ApplyError::Refused {
+                        operation: "heap_update_old",
+                        detail: String::from("header decode failed"),
+                    }
                 })?;
 
             // Decode xmax from the new tuple header (the new version's xmin
@@ -161,9 +166,9 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             // version's xmax).
             let (new_hdr, _) = TupleHeader::decode(&payload.new_tuple_bytes[..TUPLE_HEADER_SIZE])
                 .ok_or_else(|| ApplyError::Refused {
-                    operation: "heap_update_old",
-                    detail: String::from("new header decode failed"),
-                })?;
+                operation: "heap_update_old",
+                detail: String::from("new header decode failed"),
+            })?;
             hdr.xmax = new_hdr.xmin;
             hdr.cmax = new_hdr.cmin;
             hdr.ctid = payload.new_tid;
@@ -198,26 +203,27 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let page_id = payload.tid.page;
         self.advance_counter(page_id.relation, page_id.block);
 
-        let guard = self.pool.get_page(page_id).map_err(|e| ApplyError::Refused {
-            operation: "heap_delete",
-            detail: format!("buffer pool: {e}"),
-        })?;
+        let guard = self
+            .pool
+            .get_page(page_id)
+            .map_err(|e| ApplyError::Refused {
+                operation: "heap_delete",
+                detail: format!("buffer pool: {e}"),
+            })?;
 
         let mut page = guard.write();
-        let existing = page
-            .read_tuple(payload.tid.slot)
-            .map_err(|e| match e {
-                // If the slot doesn't exist, the record is already beyond
-                // what's on this page — treat as idempotent no-op.
-                PageError::InvalidSlot { .. } | PageError::DeadSlot(_) => ApplyError::Refused {
-                    operation: "heap_delete",
-                    detail: format!("read slot: {e}"),
-                },
-                other => ApplyError::Refused {
-                    operation: "heap_delete",
-                    detail: format!("read slot: {other}"),
-                },
-            })?;
+        let existing = page.read_tuple(payload.tid.slot).map_err(|e| match e {
+            // If the slot doesn't exist, the record is already beyond
+            // what's on this page — treat as idempotent no-op.
+            PageError::InvalidSlot { .. } | PageError::DeadSlot(_) => ApplyError::Refused {
+                operation: "heap_delete",
+                detail: format!("read slot: {e}"),
+            },
+            other => ApplyError::Refused {
+                operation: "heap_delete",
+                detail: format!("read slot: {other}"),
+            },
+        })?;
         if existing.len() < TUPLE_HEADER_SIZE {
             return Err(ApplyError::Refused {
                 operation: "heap_delete",
@@ -225,9 +231,11 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             });
         }
         let (mut hdr, _) =
-            TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| ApplyError::Refused {
-                operation: "heap_delete",
-                detail: String::from("header decode failed"),
+            TupleHeader::decode(&existing[..TUPLE_HEADER_SIZE]).ok_or_else(|| {
+                ApplyError::Refused {
+                    operation: "heap_delete",
+                    detail: String::from("header decode failed"),
+                }
             })?;
 
         // Idempotency: if xmax is already set to the same xid, skip.
@@ -270,10 +278,13 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let page_id = payload.page;
         self.advance_counter(page_id.relation, page_id.block);
 
-        let guard = self.pool.get_page(page_id).map_err(|e| ApplyError::Refused {
-            operation: "fpw",
-            detail: format!("buffer pool: {e}"),
-        })?;
+        let guard = self
+            .pool
+            .get_page(page_id)
+            .map_err(|e| ApplyError::Refused {
+                operation: "fpw",
+                detail: format!("buffer pool: {e}"),
+            })?;
 
         let mut page = guard.write();
         if payload.page_bytes.len() != PAGE_SIZE {
@@ -307,8 +318,12 @@ impl<L: PageLoader> HeapAccess<L> {
         // CAS loop: advance only if the current value is less than `needed`.
         let mut current = counter.load(Ordering::Acquire);
         while current < needed {
-            match counter.compare_exchange_weak(current, needed, Ordering::AcqRel, Ordering::Acquire)
-            {
+            match counter.compare_exchange_weak(
+                current,
+                needed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => break,
                 Err(actual) => current = actual,
             }
@@ -324,8 +339,8 @@ mod tests {
     use parking_lot::Mutex;
     use ultrasql_core::constants::PAGE_SIZE;
     use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, Result, TupleId, Xid};
-    use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
     use ultrasql_mvcc::TupleHeader;
+    use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
     use ultrasql_wal::applier::HeapTarget;
     use ultrasql_wal::payload::{HeapDeletePayload, HeapInsertPayload};
 
@@ -405,10 +420,7 @@ mod tests {
         let tid = tuple_id(0, 0);
         let tuple_bytes = minimal_tuple(1, tid);
 
-        let payload = HeapInsertPayload {
-            tid,
-            tuple_bytes,
-        };
+        let payload = HeapInsertPayload { tid, tuple_bytes };
         heap.apply_insert(&payload).unwrap();
 
         // Verify the tuple is readable via fetch.
@@ -422,10 +434,7 @@ mod tests {
         let heap = make_heap();
         let tid = tuple_id(0, 0);
         let tuple_bytes = minimal_tuple(1, tid);
-        let payload = HeapInsertPayload {
-            tid,
-            tuple_bytes,
-        };
+        let payload = HeapInsertPayload { tid, tuple_bytes };
         heap.apply_insert(&payload).unwrap();
         // Second application of the same record must not fail.
         heap.apply_insert(&payload).unwrap();
@@ -511,4 +520,3 @@ mod tests {
         assert_eq!(heap.block_count(rel()), 5);
     }
 }
-

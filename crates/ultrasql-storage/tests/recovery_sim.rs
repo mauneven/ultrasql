@@ -86,9 +86,7 @@ mod loader {
 /// are kept separately (as the WAL would survive a crash). The
 /// post-crash recovery builds a fresh `HeapAccess` from the same loader,
 /// replays the WAL, and the tuples should match.
-fn make_persistent_heap(
-    loader: loader::MapLoader,
-) -> HeapAccess<loader::MapLoader> {
+fn make_persistent_heap(loader: loader::MapLoader) -> HeapAccess<loader::MapLoader> {
     let pool = Arc::new(BufferPool::new(256, loader));
     HeapAccess::new(pool)
 }
@@ -233,7 +231,10 @@ fn crash_recovery_visible_tuples_match_committed_only() {
     // We simplify: scan ALL slots, and count those where:
     //   xmin ∈ committed  AND  (xmax == INVALID OR xmax ∈ aborted)
     let n_blocks = recovery_heap.block_count(rel());
-    assert!(n_blocks > 0, "recovery must have written at least one block");
+    assert!(
+        n_blocks > 0,
+        "recovery must have written at least one block"
+    );
 
     let mut visible = 0_u64;
     for tuple in recovery_heap.scan(rel(), n_blocks).flatten() {
@@ -252,9 +253,8 @@ fn crash_recovery_visible_tuples_match_committed_only() {
     // Committed deletes: xid_raw % 10 == 1 AND odd: 1, 11, 21, 31, 41 → 5 deletes.
     // Updates don't change the net visible count (old xmax = committing xid,
     // new tuple xmin = same committing xid, both visible rules apply).
-    let n_committed_deletes: u64 = (1..=N_XIDS)
-        .filter(|&x| x % 2 == 1 && x % 10 == 1)
-        .count() as u64;
+    let n_committed_deletes: u64 =
+        (1..=N_XIDS).filter(|&x| x % 2 == 1 && x % 10 == 1).count() as u64;
     let n_committed = N_XIDS / 2; // 25 committed xids
     let expected = n_committed * (INSERTS_PER_XID as u64) - n_committed_deletes;
 

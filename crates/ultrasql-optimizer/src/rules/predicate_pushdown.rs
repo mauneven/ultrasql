@@ -14,6 +14,8 @@
 //!    into a new `Filter(right)`. Conjuncts that reference both sides are
 //!    merged into the join's ON condition via AND.
 
+#![allow(clippy::match_same_arms)]
+
 use std::collections::HashSet;
 
 use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalPlan, ScalarExpr};
@@ -328,6 +330,11 @@ fn collect_cols(expr: &ScalarExpr, out: &mut HashSet<usize>) {
             collect_cols(expr, out);
         }
         ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {}
+        // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => {}
     }
 }
 
@@ -376,6 +383,11 @@ fn remap_expr(expr: &ScalarExpr, exprs: &[(ScalarExpr, String)]) -> ScalarExpr {
             negated: *negated,
         },
         ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => expr.clone(),
+        // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => expr.clone(),
     }
 }
 
@@ -421,6 +433,11 @@ fn remap_right_indices(expr: &ScalarExpr, left_width: usize) -> ScalarExpr {
             negated: *negated,
         },
         ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => expr.clone(),
+        // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => expr.clone(),
     }
 }
 

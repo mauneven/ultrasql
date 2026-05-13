@@ -56,6 +56,8 @@
 //! - CTE name appears more than once in the body (materialised multiple times).
 //! - Predicate contains a parameter (`$N`) that cannot be safely pushed.
 
+#![allow(clippy::match_same_arms)]
+
 use std::collections::HashSet;
 
 use ultrasql_planner::{LogicalPlan, ScalarExpr};
@@ -366,6 +368,11 @@ fn collect_cols(expr: &ScalarExpr, out: &mut HashSet<usize>) {
             collect_cols(inner, out);
         }
         ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {}
+        // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => {}
     }
 }
 
@@ -380,6 +387,11 @@ fn predicate_has_parameter(expr: &ScalarExpr) -> bool {
             predicate_has_parameter(inner)
         }
         ScalarExpr::Column { .. } | ScalarExpr::Literal { .. } => false,
+        // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => false,
     }
 }
 
@@ -423,6 +435,11 @@ fn remap_through_project(predicate: &ScalarExpr, exprs: &[(ScalarExpr, String)])
             negated: *negated,
         },
         ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => predicate.clone(),
+        // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => predicate.clone(),
     }
 }
 

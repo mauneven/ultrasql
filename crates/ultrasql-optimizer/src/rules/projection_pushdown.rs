@@ -13,6 +13,8 @@
 //! the same logical columns as before, addressed through their new consecutive
 //! positions in the projected scan schema.
 
+#![allow(clippy::match_same_arms)]
+
 use std::collections::HashSet;
 
 use ultrasql_core::{Field, Schema};
@@ -216,6 +218,11 @@ fn collect_refs(expr: &ScalarExpr, out: &mut HashSet<usize>) {
             collect_refs(expr, out);
         }
         ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {}
+        // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => {}
     }
 }
 
@@ -260,6 +267,11 @@ fn reindex_expr(expr: &ScalarExpr, remap: &[usize]) -> ScalarExpr {
             negated: *negated,
         },
         ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => expr.clone(),
+        // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => expr.clone(),
     }
 }
 

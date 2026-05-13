@@ -396,6 +396,8 @@ mod tests {
             xmin: Xid::new(xid),
             command_id: CommandId::FIRST,
             wal: None,
+            fsm: None,
+            vm: None,
         }
     }
 

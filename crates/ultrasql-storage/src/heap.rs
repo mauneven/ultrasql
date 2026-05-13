@@ -728,7 +728,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// no concurrent mutation is in progress on the page; stamping a page
     /// all-visible while a writer holds a pin on it is a visibility error.
     ///
-    /// This is a thin wrapper over [`VisibilityMap::mark_all_visible`]
+    /// This is a thin wrapper over `VisibilityMap::mark_all_visible`
     /// provided here so the executor does not need to import the VM type
     /// directly when it calls into the heap.
     pub fn vacuum_set_all_visible(
