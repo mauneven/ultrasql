@@ -1,0 +1,52 @@
+# cargo-deny configuration.
+#
+# Three guarantees:
+#   1. No known security advisories in any transitive dependency.
+#   2. No GPL-family licenses without an explicit waiver.
+#   3. No banned crates (e.g. yanked or unmaintained primitives).
+
+[graph]
+all-features = true
+
+[advisories]
+db-path = "~/.cargo/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unlicense",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+
+deny = [
+    # Crates that have been superseded; do not re-introduce.
+    { name = "openssl", reason = "use rustls" },
+    { name = "openssl-sys", reason = "use rustls-native-certs" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

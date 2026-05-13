@@ -1,0 +1,61 @@
+name: fuzz
+
+# Runs a short, bounded fuzz session on every PR that touches a fuzz
+# target's crate. Nightly job extends the budget and uploads any new
+# corpus entries.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/ultrasql-parser/**'
+      - 'crates/ultrasql-wal/**'
+      - 'crates/ultrasql-protocol/**'
+      - 'fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  schedule:
+    - cron: '0 5 * * *'        # 05:00 UTC daily
+  workflow_dispatch:
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+  RUST_BACKTRACE: 1
+
+jobs:
+  cargo-fuzz:
+    name: cargo-fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - lexer
+          - wire-protocol
+          - wal-record
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: short fuzz session
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: |
+          # Per-PR budget: 60 seconds, fail on any crash.
+          cargo fuzz run "$FUZZ_TARGET" -- -max_total_time=60
+      - name: extended fuzz (nightly only)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          FUZZ_TARGET: ${{ matrix.target }}
+        run: cargo fuzz run "$FUZZ_TARGET" -- -max_total_time=900
+      - name: upload corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
