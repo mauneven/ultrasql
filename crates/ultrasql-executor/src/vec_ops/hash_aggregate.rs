@@ -166,7 +166,7 @@ impl AccumulateSink {
         for (k, state) in pairs {
             keys.push(k);
             counts.push(state.count);
-            for (agg_i, &ref idx_opt) in sum_idx_per_agg.iter().enumerate() {
+            for (agg_i, idx_opt) in sum_idx_per_agg.iter().enumerate() {
                 if let Some(si) = idx_opt {
                     sums[*si].push(*state.sums.get(agg_i).unwrap_or(&0));
                 }

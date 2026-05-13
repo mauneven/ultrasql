@@ -30,7 +30,8 @@
 
 use std::sync::Arc;
 
-use ultrasql_txn::{IsolationLevel, SsiManager, TransactionManager, TxnError};
+use ultrasql_mvcc::XidStatusOracle;
+use ultrasql_txn::{IsolationLevel, SsiManager, TransactionManager};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -52,7 +53,7 @@ fn mgr_ser() -> Arc<TransactionManager> {
 /// XID wins the xmax slot (enforced by the lock manager or CAS at the
 /// storage layer).
 ///
-/// At the TxnManager level we assert that both T1 and T2 can begin and
+/// At the `TxnManager` level we assert that both T1 and T2 can begin and
 /// terminate without corrupting the CLOG (no double-commit).
 #[test]
 #[ignore = "full Hermitage gate — enable when executor layer is wired"]
@@ -74,7 +75,7 @@ fn g0_dirty_write_prevented() {
 /// G1a (dirty read): T1 writes a value and then aborts; T2 must not see
 /// T1's intermediate (aborted) write.
 ///
-/// The TxnManager oracle correctly marks T1 as Aborted after
+/// The `TxnManager` oracle correctly marks T1 as Aborted after
 /// `abort(t1)`, so any snapshot-based visibility check will exclude T1's
 /// writes.
 #[test]
@@ -103,7 +104,6 @@ fn g1a_dirty_read_prevented() {
         !t2.snapshot.xip.contains(&t1_xid),
         "after T1 aborts and T2 refreshes, T1 must no longer be in-progress"
     );
-    use ultrasql_mvcc::XidStatusOracle;
     assert!(mgr.is_aborted(t1_xid), "oracle must report T1 as Aborted");
 
     mgr.commit(t2).unwrap();
@@ -114,7 +114,7 @@ fn g1a_dirty_read_prevented() {
 /// G1b (intermediate read): T1 performs two writes; a concurrent T2 must
 /// not see an intermediate state (only the first write, not the second).
 ///
-/// At the TxnManager level this collapses to: T2 cannot see T1's writes
+/// At the `TxnManager` level this collapses to: T2 cannot see T1's writes
 /// until T1 commits. All of T1's writes share T1's XID in xmin; the
 /// snapshot sees them all or none.
 #[test]
@@ -258,7 +258,7 @@ fn pmp_predicate_many_preceders_prevented_at_rr() {
 /// Under RR/Serializable, the lock manager (row locks from `FOR UPDATE`)
 /// prevents both from reading and writing concurrently without conflict.
 ///
-/// At the TxnManager level we verify that both transactions can be
+/// At the `TxnManager` level we verify that both transactions can be
 /// properly sequenced without CLOG corruption.
 #[test]
 #[ignore = "full Hermitage gate — enable when executor layer is wired"]

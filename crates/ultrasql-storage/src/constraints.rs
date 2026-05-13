@@ -322,7 +322,8 @@ impl ConstraintChecker {
                         continue; // NULLs never participate in uniqueness
                     }
                     if let Some(set_lock) = &self.unique_sets[i] {
-                        if !set_lock.lock().insert(key) {
+                        let inserted = set_lock.lock().insert(key);
+                        if !inserted {
                             return Err(ConstraintError::UniqueViolation);
                         }
                     }
@@ -408,7 +409,7 @@ impl ConstraintChecker {
     ///
     /// Mutates `row` in place. Only `None` or `Some(Null)` positions
     /// whose constraint column matches are touched.
-    pub fn apply_defaults(&self, row: &mut Vec<Option<Value>>) {
+    pub fn apply_defaults(&self, row: &mut [Option<Value>]) {
         for c in &self.constraints {
             if let Constraint::Default { column, expr } = c {
                 if let Some(slot) = row.get_mut(*column) {
@@ -426,7 +427,7 @@ impl ConstraintChecker {
     /// overwritten regardless of what the caller supplied. Identity
     /// columns are driven by the sequence at the executor layer and are
     /// left untouched here.
-    pub fn apply_generated(&self, row: &mut Vec<Value>) {
+    pub fn apply_generated(&self, row: &mut [Value]) {
         for c in &self.constraints {
             if let Constraint::GeneratedAlwaysAsStored { column, expr } = c {
                 let value = expr.apply(row).unwrap_or(Value::Null);
@@ -450,6 +451,8 @@ mod tests {
     use ultrasql_core::Oid;
 
     use super::*;
+
+    type ParentKeySet = Arc<Mutex<HashSet<Vec<Value>>>>;
 
     fn no_fk(constraints: Vec<Constraint>) -> ConstraintChecker {
         ConstraintChecker::new(constraints, |_, _| true, |_, _| Vec::new())
@@ -556,7 +559,7 @@ mod tests {
 
     #[test]
     fn fk_insert_passes_when_parent_exists() {
-        let parent_keys: Arc<Mutex<HashSet<Vec<Value>>>> = Arc::new(Mutex::new(HashSet::new()));
+        let parent_keys: ParentKeySet = Arc::new(Mutex::new(HashSet::new()));
         parent_keys.lock().insert(vec![Value::Int64(1)]);
         let pk = Arc::clone(&parent_keys);
         let c = ConstraintChecker::new(

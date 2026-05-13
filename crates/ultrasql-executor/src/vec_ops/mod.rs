@@ -1,7 +1,7 @@
 //! Vectorized operator implementations for the push-based pipeline.
 //!
-//! Each operator here implements [`VectorizedOperator`] and processes data in
-//! 4096-row batches. Operators are wired together via [`VectorizedSink`].
+//! Each operator here implements `VectorizedOperator` and processes data in
+//! 4096-row batches. Operators are wired together via `VectorizedSink`.
 //!
 //! ## Operators
 //!

@@ -3,8 +3,8 @@
 //! [`VectorizedSeqScan`] wraps any [`Operator`] that produces batches and
 //! re-emits them via the push [`VectorizedSink`] protocol.
 //!
-//! In production the underlying `Operator` is a [`SeqScan`]; in tests it is
-//! a [`MemTableScan`]. The vectorized wrapper adds no semantics — it exists
+//! In production the underlying `Operator` is a `SeqScan`; in tests it is
+//! a `MemTableScan`. The vectorized wrapper adds no semantics — it exists
 //! to bridge the pull model into the push pipeline.
 
 use ultrasql_core::Schema;

@@ -36,7 +36,7 @@
 //! - [`Project`] — column projection.
 //! - [`Limit`] — row cap across all output batches.
 //! - [`Sort`] — in-memory sort with optional spill.
-//! - [`HashJoin`] — hash equi-join (Inner, LeftOuter).
+//! - [`HashJoin`] — hash equi-join (Inner, `LeftOuter`).
 //! - [`MergeJoin`] — merge equi-join over sorted inputs (all join types).
 //! - [`HashAggregate`] — hash-based GROUP BY / aggregate.
 //! - [`SortAggregate`] — streaming aggregate over sorted input.
@@ -335,7 +335,7 @@ mod tests {
             asc: true,
             nulls_first: false,
         }];
-        let sort = Sort::new(Box::new(scan), sort_keys, schema.clone());
+        let sort = Sort::new(Box::new(scan), sort_keys, schema);
         let unique = Unique::new(Box::new(sort), UniqueMode::Sort);
 
         // Record row count seen by the lock callback.

@@ -48,7 +48,7 @@ impl CteScan {
     /// - `batches` — the full materialised output of the CTE definition plan.
     /// - `schema` — the output schema, which must match every batch in `batches`.
     #[must_use]
-    pub fn new(batches: Arc<Vec<Batch>>, schema: Schema) -> Self {
+    pub const fn new(batches: Arc<Vec<Batch>>, schema: Schema) -> Self {
         Self {
             batches,
             schema,
@@ -62,7 +62,7 @@ impl CteScan {
     /// After reset the next [`Operator::next_batch`] call emits the first
     /// batch again. This is used when the same CTE is referenced more than
     /// once in the outer query.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.cursor = 0;
         self.eof = false;
     }

@@ -29,6 +29,8 @@
 //! CURRENT ROW` (the SQL default for functions that use the frame).
 //! `RANGE` frames and explicit frame bounds are a v0.6 follow-up.
 
+#![allow(clippy::cast_possible_wrap)]
+
 use ultrasql_core::{Schema, Value};
 use ultrasql_planner::ScalarExpr;
 use ultrasql_vec::Batch;
@@ -159,6 +161,7 @@ impl Operator for WindowAgg {
 }
 
 impl WindowAgg {
+    #[allow(clippy::too_many_lines)]
     fn execute(&mut self) -> Result<Vec<Vec<Value>>, ExecError> {
         // Drain child.
         let mut all_rows: Vec<Vec<Value>> = Vec::new();
@@ -190,7 +193,7 @@ impl WindowAgg {
         let mut current_key: Option<Vec<Value>> = None;
 
         for (idx, key) in partition_keys.iter().enumerate() {
-            let same = current_key.as_ref().map_or(false, |ck| keys_equal(ck, key));
+            let same = current_key.as_ref().is_some_and(|ck| keys_equal(ck, key));
             if !same {
                 if !current_partition.is_empty() {
                     partitions.push(current_partition.clone());
@@ -242,7 +245,7 @@ impl WindowAgg {
                             .collect();
                         let same = prev_order_key
                             .as_ref()
-                            .map_or(false, |pk| keys_equal(pk, &order_key));
+                            .is_some_and(|pk| keys_equal(pk, &order_key));
                         if same {
                             ranks[pos] = Value::Int64(rank as i64);
                         } else {
@@ -266,7 +269,7 @@ impl WindowAgg {
                             .iter()
                             .map(|ev| ev.eval(&all_rows[idx]).unwrap_or(Value::Null))
                             .collect();
-                        let same = prev_key.as_ref().map_or(false, |pk| keys_equal(pk, &key));
+                        let same = prev_key.as_ref().is_some_and(|pk| keys_equal(pk, &key));
                         if !same {
                             base_rank = pos + 1;
                             prev_key = Some(key);
@@ -285,7 +288,7 @@ impl WindowAgg {
                             .iter()
                             .map(|ev| ev.eval(&all_rows[idx]).unwrap_or(Value::Null))
                             .collect();
-                        let same = prev_key.as_ref().map_or(false, |pk| keys_equal(pk, &key));
+                        let same = prev_key.as_ref().is_some_and(|pk| keys_equal(pk, &key));
                         if !same {
                             if prev_key.is_some() {
                                 dense += 1;
@@ -312,7 +315,8 @@ impl WindowAgg {
                                 default.clone()
                             } else {
                                 let prev_idx = sorted_indices[pos - offset];
-                                ev.eval(&all_rows[prev_idx]).unwrap_or(default.clone())
+                                ev.eval(&all_rows[prev_idx])
+                                    .unwrap_or_else(|_| default.clone())
                             }
                         })
                         .collect()
@@ -333,25 +337,24 @@ impl WindowAgg {
                                 default.clone()
                             } else {
                                 let next_idx = sorted_indices[pos + offset];
-                                ev.eval(&all_rows[next_idx]).unwrap_or(default.clone())
+                                ev.eval(&all_rows[next_idx])
+                                    .unwrap_or_else(|_| default.clone())
                             }
                         })
                         .collect()
                 }
                 WindowFunc::FirstValue(expr) => {
                     let ev = Eval::new(expr.clone());
-                    let first = sorted_indices
-                        .first()
-                        .map(|&i| ev.eval(&all_rows[i]).unwrap_or(Value::Null))
-                        .unwrap_or(Value::Null);
+                    let first = sorted_indices.first().map_or(Value::Null, |&i| {
+                        ev.eval(&all_rows[i]).unwrap_or(Value::Null)
+                    });
                     vec![first; n]
                 }
                 WindowFunc::LastValue(expr) => {
                     let ev = Eval::new(expr.clone());
-                    let last = sorted_indices
-                        .last()
-                        .map(|&i| ev.eval(&all_rows[i]).unwrap_or(Value::Null))
-                        .unwrap_or(Value::Null);
+                    let last = sorted_indices.last().map_or(Value::Null, |&i| {
+                        ev.eval(&all_rows[i]).unwrap_or(Value::Null)
+                    });
                     vec![last; n]
                 }
                 WindowFunc::NthValue { expr, n: nth } => {

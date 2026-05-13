@@ -46,6 +46,7 @@ pub struct IndexScan {
     codec: RowCodec,
     eof: bool,
     /// Decoded row buffer filled in chunks of 4096.
+    #[allow(dead_code)]
     pending: Vec<Vec<Value>>,
 }
 

@@ -8,9 +8,9 @@
 //! # Supported aggregate functions
 //!
 //! Same set as [`HashAggregate`]: COUNT(*), COUNT(expr), SUM, AVG, MIN,
-//! MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG plus the statistical
-//! extensions added in v0.5 (STDDEV, VARIANCE, CORR, PERCENTILE_CONT,
-//! PERCENTILE_DISC).
+//! MAX, `BOOL_AND`, `BOOL_OR`, `STRING_AGG`, `ARRAY_AGG` plus the statistical
+//! extensions added in v0.5 (STDDEV, VARIANCE, CORR, `PERCENTILE_CONT`,
+//! `PERCENTILE_DISC`).
 //!
 //! # NULL semantics
 //!
@@ -42,6 +42,7 @@ const BATCH_TARGET_ROWS: usize = 4096;
 // ---------------------------------------------------------------------------
 
 /// Per-group accumulator for a single aggregate function.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum AggState {
     CountStar(i64),
@@ -55,19 +56,19 @@ pub(crate) enum AggState {
     StringAgg(Vec<String>, String),
     ArrayAgg(Vec<Value>),
     /// Running sum and count for STDDEV / VARIANCE.
-    /// Fields: (sum_x, sum_x2, count).
+    /// Fields: (`sum_x`, `sum_x2`, count).
     Variance(f64, f64, i64),
     /// Same accumulator for STDDEV (standard deviation).
     Stddev(f64, f64, i64),
-    /// For CORR(y, x): (sum_x, sum_y, sum_xy, sum_x2, sum_y2, count).
+    /// For CORR(y, x): (`sum_x`, `sum_y`, `sum_xy`, `sum_x2`, `sum_y2`, count).
     Corr(f64, f64, f64, f64, f64, i64),
-    /// PERCENTILE_CONT: accumulates all values for linear interpolation.
+    /// `PERCENTILE_CONT`: accumulates all values for linear interpolation.
     PercentileCont(Vec<f64>, f64 /* fraction */),
-    /// PERCENTILE_DISC: accumulates all values for discrete selection.
+    /// `PERCENTILE_DISC`: accumulates all values for discrete selection.
     PercentileDisc(Vec<f64>, f64 /* fraction */),
 }
 
-fn init_state(agg: &LogicalAggregateExpr) -> AggState {
+const fn init_state(agg: &LogicalAggregateExpr) -> AggState {
     match agg.func {
         AggregateFunc::CountStar => AggState::CountStar(0),
         AggregateFunc::Count => AggState::Count(0),
@@ -86,6 +87,7 @@ fn init_states(aggs: &[LogicalAggregateExpr]) -> Vec<AggState> {
     aggs.iter().map(init_state).collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn accumulate(
     state: &mut AggState,
     agg: &LogicalAggregateExpr,
@@ -130,7 +132,7 @@ fn accumulate(
             if let Some(v) = arg {
                 if !v.is_null() {
                     *cur = Some(match cur.take() {
-                        None => v.clone(),
+                        None => v,
                         Some(e) => {
                             if value_lt(&v, &e) {
                                 v
@@ -146,7 +148,7 @@ fn accumulate(
             if let Some(v) = arg {
                 if !v.is_null() {
                     *cur = Some(match cur.take() {
-                        None => v.clone(),
+                        None => v,
                         Some(e) => {
                             if value_lt(&e, &v) {
                                 v
@@ -294,7 +296,7 @@ fn finalise(state: &AggState) -> Value {
                 Value::Float64(sorted[lo])
             } else {
                 let frac_part = row_number - lo as f64;
-                Value::Float64(sorted[lo] * (1.0 - frac_part) + sorted[hi] * frac_part)
+                Value::Float64(sorted[hi].mul_add(frac_part, sorted[lo] * (1.0 - frac_part)))
             }
         }
         AggState::PercentileDisc(vals, frac) => {
@@ -464,9 +466,7 @@ impl SortAggregate {
                     .map(|ev| ev.eval(row).unwrap_or(Value::Null))
                     .collect();
 
-                let same_group = current_key
-                    .as_ref()
-                    .map_or(false, |ck| keys_equal(ck, &key));
+                let same_group = current_key.as_ref().is_some_and(|ck| keys_equal(ck, &key));
 
                 if !same_group {
                     // Emit previous group if any.
@@ -519,6 +519,7 @@ impl SortAggregate {
 ///
 /// These are constructed by callers that want the extended statistical
 /// aggregates and are mapped onto the internal [`AggState`] variants.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) enum StatAggFunc {
     /// Sample standard deviation.
@@ -536,7 +537,8 @@ pub(crate) enum StatAggFunc {
 /// Build an initial [`AggState`] for a statistical aggregate.
 ///
 /// Callers that want STDDEV etc. call this and manage the state directly.
-pub(crate) fn init_stat_state(func: &StatAggFunc) -> AggState {
+#[allow(dead_code)]
+pub(crate) const fn init_stat_state(func: &StatAggFunc) -> AggState {
     match func {
         StatAggFunc::Stddev => AggState::Stddev(0.0, 0.0, 0),
         StatAggFunc::Variance => AggState::Variance(0.0, 0.0, 0),
@@ -547,6 +549,7 @@ pub(crate) fn init_stat_state(func: &StatAggFunc) -> AggState {
 }
 
 /// Accumulate a single f64 value into a statistical aggregate state.
+#[allow(dead_code)]
 pub(crate) fn accumulate_stat(state: &mut AggState, x: f64) {
     match state {
         AggState::Variance(sx, sx2, cnt) | AggState::Stddev(sx, sx2, cnt) => {
@@ -562,6 +565,7 @@ pub(crate) fn accumulate_stat(state: &mut AggState, x: f64) {
 }
 
 /// Finalise a statistical aggregate state to a [`Value`].
+#[allow(dead_code)]
 pub(crate) fn finalise_stat(state: &AggState) -> Value {
     finalise(state)
 }

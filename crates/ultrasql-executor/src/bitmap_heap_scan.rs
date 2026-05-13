@@ -21,6 +21,9 @@
 //! are merged word-by-word before the heap fetch, which is more cache-friendly
 //! than sorting and merging TID lists.
 
+#![allow(clippy::type_complexity)]
+#![allow(clippy::needless_collect)]
+
 use std::fmt;
 
 use ultrasql_core::{Schema, Value};
@@ -79,7 +82,7 @@ impl TidBitmap {
     /// # Panics
     ///
     /// Panics if the two bitmaps have different capacities.
-    pub fn or_merge(&mut self, other: &TidBitmap) {
+    pub fn or_merge(&mut self, other: &Self) {
         assert_eq!(
             self.capacity, other.capacity,
             "TidBitmap::or_merge: capacity mismatch"
@@ -94,7 +97,7 @@ impl TidBitmap {
     /// # Panics
     ///
     /// Panics if the two bitmaps have different capacities.
-    pub fn and_merge(&mut self, other: &TidBitmap) {
+    pub fn and_merge(&mut self, other: &Self) {
         assert_eq!(
             self.capacity, other.capacity,
             "TidBitmap::and_merge: capacity mismatch"
@@ -244,6 +247,9 @@ impl Operator for BitmapHeapScan {
         }
 
         // Materialise the set-bits iterator on the first call.
+        // The collect is intentional: the iterator borrows self.bitmap so it
+        // cannot be stored directly in self.iter_pos without a self-referential
+        // struct.
         if self.iter_pos.is_none() {
             let indices: Vec<usize> = self.bitmap.iter_ones().collect();
             self.iter_pos = Some(Box::new(indices.into_iter()));
@@ -285,7 +291,7 @@ impl Operator for BitmapHeapScan {
 /// the row is returned directly from the index entry without a heap fetch.
 /// When the VM bit is clear, the row is fetched from the heap store.
 pub struct IndexOnlyScan {
-    /// Index entries: (key, row_id, projected columns).
+    /// Index entries: (key, `row_id`, projected columns).
     index_entries: Vec<Vec<Value>>,
     /// Visibility map: `true` means row is all-visible (skip heap fetch).
     vm: Vec<bool>,
@@ -314,7 +320,7 @@ impl IndexOnlyScan {
     /// - `heap_rows`     — fallback heap rows when the VM bit is clear.
     /// - `schema`        — output schema.
     #[must_use]
-    pub fn new(
+    pub const fn new(
         index_entries: Vec<Vec<Value>>,
         vm: Vec<bool>,
         heap_rows: Vec<Vec<Value>>,
@@ -507,7 +513,7 @@ mod tests {
         while let Some(b) = heap_scan.next_batch().unwrap() {
             batch_sizes.push(b.rows());
         }
-        assert!(batch_sizes.iter().any(|&s| s == 4096));
+        assert!(batch_sizes.contains(&4096));
         assert_eq!(batch_sizes.iter().sum::<usize>(), 5_000);
     }
 
@@ -521,7 +527,7 @@ mod tests {
         // All rows visible.
         let vm = vec![true; n];
         let schema = schema_id_val();
-        let mut scan = IndexOnlyScan::new(index_entries.clone(), vm, heap_rows, schema);
+        let mut scan = IndexOnlyScan::new(index_entries, vm, heap_rows, schema);
 
         let mut total = 0;
         while let Some(b) = scan.next_batch().unwrap() {

@@ -420,7 +420,7 @@ mod tests {
         assert_eq!(op, PhysicalOp::HashJoin, "USING should select HashJoin");
     }
 
-    /// Stats that return a fixed row/page/n_distinct count.
+    /// Stats that return a fixed `row/page/n_distinct` count.
     struct RichStats {
         rows: u64,
         pages: u64,

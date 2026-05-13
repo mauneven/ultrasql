@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use ultrasql_mvcc::XidStatusOracle;
-use ultrasql_txn::{IsolationLevel, SsiManager, TransactionManager, TxnError};
+use ultrasql_txn::{IsolationLevel, SsiManager, TransactionManager};
 
 // ── Read Committed ────────────────────────────────────────────────────────────
 
@@ -33,7 +33,7 @@ use ultrasql_txn::{IsolationLevel, SsiManager, TransactionManager, TxnError};
 ///   T0: begin(RC)  ← T0 is started first to become part of T1's xip
 ///   T1: begin(RC)  ← T1 sees T0 as in-progress
 ///   T0: commit
-///   T1: refresh_snapshot → T0 no longer in xip
+///   T1: `refresh_snapshot` → T0 no longer in xip
 #[test]
 fn read_committed_sees_concurrent_commit_after_refresh() {
     let mgr = Arc::new(TransactionManager::new());
@@ -327,7 +327,7 @@ fn serializable_victim_is_aborted_in_oracle() {
     );
 }
 
-/// Serializable without an installed SsiManager aliases RepeatableRead —
+/// Serializable without an installed `SsiManager` aliases `RepeatableRead` —
 /// both transactions commit even under write-skew conditions.
 #[test]
 fn serializable_without_ssi_aliases_repeatable_read() {

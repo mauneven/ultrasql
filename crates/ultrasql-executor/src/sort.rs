@@ -401,7 +401,7 @@ mod tests {
             let mut sort = Sort::new(Box::new(scan), keys, schema);
             let out = drain_rows(&mut sort);
             let out_ids: Vec<i32> = out.iter().map(|(a, _)| *a).collect();
-            values.sort();
+            values.sort_unstable();
             proptest::prop_assert_eq!(out_ids, values, "Sort output must be non-decreasing");
         }
     }

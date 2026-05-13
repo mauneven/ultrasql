@@ -20,6 +20,10 @@
 //!   executor can reference the concrete types. Full implementations are
 //!   deferred to v1.x; stub bodies are tagged `TODO(<index>-complete)`.
 
+#![allow(clippy::significant_drop_tightening)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::type_complexity)]
+
 use parking_lot::Mutex;
 use thiserror::Error;
 use ultrasql_core::TupleId;
@@ -93,8 +97,8 @@ pub trait AccessMethod: Send + Sync + std::fmt::Debug {
 /// [`AccessMethod`] wrapper around the Lehman-Yao B+ tree.
 ///
 /// The inner tree uses `i64` keys encoded as little-endian 8-byte
-/// slices. Callers must pre-encode keys accordingly; [`insert`],
-/// [`lookup`], and [`delete`] return
+/// slices. Callers must pre-encode keys accordingly; [`Self::insert`],
+/// [`Self::lookup`], and [`Self::delete`] return
 /// [`AccessMethodError::Storage`] for malformed key lengths.
 ///
 /// # Thread safety

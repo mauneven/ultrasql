@@ -17,15 +17,15 @@
 //!
 //! - **UNION ALL**: concatenate left and right without deduplication.
 //! - **UNION DISTINCT**: union with hash-deduplication.
-//! - **INTERSECT [ALL]**: count rows in left, match against right.
-//! - **EXCEPT [ALL]**: count rows in left, subtract right counts.
+//! - **INTERSECT \[ALL\]**: count rows in left, match against right.
+//! - **EXCEPT \[ALL\]**: count rows in left, subtract right counts.
 //!
 //! # NULL semantics
 //!
 //! Two NULLs are treated as equal for set operations (same as `DISTINCT`
 //! semantics, matching PostgreSQL behaviour).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use ultrasql_core::{Schema, Value};
@@ -230,11 +230,11 @@ impl SetOp {
                     out
                 } else {
                     // UNION DISTINCT — deduplicate combined set.
-                    let mut seen: HashMap<RowKey, ()> = HashMap::new();
+                    let mut seen: HashSet<RowKey> = HashSet::new();
                     let mut out = Vec::new();
                     for row in left_rows.into_iter().chain(right_rows) {
                         let key = RowKey::from_row(&row);
-                        if seen.insert(key, ()).is_none() {
+                        if seen.insert(key) {
                             out.push(row);
                         }
                     }
@@ -261,15 +261,13 @@ impl SetOp {
                     out
                 } else {
                     // INTERSECT DISTINCT: rows in both sets.
-                    let right_set: HashMap<RowKey, ()> = right_rows
-                        .iter()
-                        .map(|r| (RowKey::from_row(r), ()))
-                        .collect();
-                    let mut seen: HashMap<RowKey, ()> = HashMap::new();
+                    let right_set: HashSet<RowKey> =
+                        right_rows.iter().map(|r| RowKey::from_row(r)).collect();
+                    let mut seen: HashSet<RowKey> = HashSet::new();
                     let mut out = Vec::new();
                     for row in left_rows {
                         let key = RowKey::from_row(&row);
-                        if right_set.contains_key(&key) && seen.insert(key, ()).is_none() {
+                        if right_set.contains(&key) && seen.insert(key) {
                             out.push(row);
                         }
                     }
@@ -296,15 +294,13 @@ impl SetOp {
                     out
                 } else {
                     // EXCEPT DISTINCT: rows in left but not in right.
-                    let right_set: HashMap<RowKey, ()> = right_rows
-                        .iter()
-                        .map(|r| (RowKey::from_row(r), ()))
-                        .collect();
-                    let mut seen: HashMap<RowKey, ()> = HashMap::new();
+                    let right_set: HashSet<RowKey> =
+                        right_rows.iter().map(|r| RowKey::from_row(r)).collect();
+                    let mut seen: HashSet<RowKey> = HashSet::new();
                     let mut out = Vec::new();
                     for row in left_rows {
                         let key = RowKey::from_row(&row);
-                        if !right_set.contains_key(&key) && seen.insert(key, ()).is_none() {
+                        if !right_set.contains(&key) && seen.insert(key) {
                             out.push(row);
                         }
                     }

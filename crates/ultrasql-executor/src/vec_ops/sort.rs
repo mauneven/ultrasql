@@ -77,6 +77,7 @@ impl VectorizedSort {
 
 impl VectorizedOperator for VectorizedSort {
     fn drive(&mut self, sink: &mut dyn VectorizedSink) -> Result<(), ExecError> {
+        const BATCH_SIZE: usize = 4096;
         // Accumulate all rows.
         let mut collect = CollectAllSink {
             batches: Vec::new(),
@@ -130,7 +131,6 @@ impl VectorizedOperator for VectorizedSort {
         });
 
         // Emit sorted batches of up to 4096 rows.
-        const BATCH_SIZE: usize = 4096;
         for chunk in perm.chunks(BATCH_SIZE) {
             let batch = gather_rows(&cols_data, chunk)?;
             if sink.consume(batch)? == SinkVerdict::Stop {

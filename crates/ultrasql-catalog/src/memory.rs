@@ -524,12 +524,8 @@ mod tests {
             handles.push(thread::spawn(move || {
                 for i in 0..PER_THREAD {
                     let name = format!("tbl_{t}_{i}");
-                    let entry = TableEntry::new(
-                        cat.next_oid(),
-                        name.clone(),
-                        "public".to_owned(),
-                        users_schema(),
-                    );
+                    let entry =
+                        TableEntry::new(cat.next_oid(), name, "public".to_owned(), users_schema());
                     cat.create_table(entry)
                         .expect("disjoint names never collide");
                 }

@@ -110,14 +110,19 @@ impl CancelRegistry {
     ///
     /// Returns `true` if the entry was found and the secret matched.
     pub fn request_cancel(&self, pid: u32, secret: u32) -> bool {
-        let entries = self.entries.lock();
-        if let Some(entry) = entries.get(&pid) {
-            if entry.secret == secret {
-                entry.flag.cancel();
-                return true;
-            }
+        let flag = {
+            let entries = self.entries.lock();
+            entries
+                .get(&pid)
+                .filter(|e| e.secret == secret)
+                .map(|e| e.flag.clone())
+        };
+        if let Some(f) = flag {
+            f.cancel();
+            true
+        } else {
+            false
         }
-        false
     }
 }
 

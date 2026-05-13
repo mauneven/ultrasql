@@ -200,18 +200,22 @@ pub mod test_support {
         }
 
         fn durable_lsn(&self) -> Lsn {
-            let inner = self.inner.lock();
             // All records in this mock are immediately "durable".
-            if inner.next_lsn == 0 {
+            let next_lsn = self.inner.lock().next_lsn;
+            if next_lsn == 0 {
                 Lsn::ZERO
             } else {
-                Lsn::new(inner.next_lsn)
+                Lsn::new(next_lsn)
             }
         }
 
         fn last_lsn_for(&self, xid: Xid) -> Lsn {
-            let inner = self.inner.lock();
-            inner.last_lsn.get(&xid.raw()).copied().unwrap_or(Lsn::ZERO)
+            self.inner
+                .lock()
+                .last_lsn
+                .get(&xid.raw())
+                .copied()
+                .unwrap_or(Lsn::ZERO)
         }
     }
 }

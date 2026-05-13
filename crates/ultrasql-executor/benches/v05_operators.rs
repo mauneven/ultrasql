@@ -5,10 +5,10 @@
 //! than dominated by allocation.
 //!
 //! Run with:
-//!   cargo bench -p ultrasql-executor --bench v05_operators
+//!   cargo bench -p ultrasql-executor --bench `v05_operators`
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use ultrasql_core::{DataType, Field, Schema, Value};
+use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_executor::{
     FunctionScan, HashAggregate, MemTableScan, Operator, Sort, SortAggregate, Unique,
     merge_join::MergeJoin, unique::UniqueMode,
@@ -91,8 +91,7 @@ fn bench_hash_aggregate(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let batch = int32_batch(N);
-                let schema = schema_i32();
-                let scan = MemTableScan::new(schema.clone(), vec![batch]);
+                let scan = MemTableScan::new(schema_i32(), vec![batch]);
                 let out_schema =
                     Schema::new([Field::required("cnt", DataType::Int64)]).expect("schema ok");
                 HashAggregate::new(
@@ -123,8 +122,7 @@ fn bench_sort_aggregate(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let batch = int32_i64_batch(N);
-                let schema = schema_i32_i64();
-                let scan = MemTableScan::new(schema.clone(), vec![batch]);
+                let scan = MemTableScan::new(schema_i32_i64(), vec![batch]);
                 let out_schema = Schema::new([
                     Field::required("k", DataType::Int32),
                     Field::required("cnt", DataType::Int64),
@@ -161,14 +159,13 @@ fn bench_unique_hash(c: &mut Criterion) {
     c.bench_function("unique/hash_mode_4096_rows_1024_unique", |b| {
         b.iter_batched(
             || {
-                let schema = schema_i32();
                 // Values 0..1024 repeated four times.
                 let data: Vec<i32> = (0..i32::try_from(N).expect("fits"))
                     .map(|i| i % 1024)
                     .collect();
                 let batch =
                     Batch::new([Column::Int32(NumericColumn::from_data(data))]).expect("batch ok");
-                let scan = MemTableScan::new(schema.clone(), vec![batch]);
+                let scan = MemTableScan::new(schema_i32(), vec![batch]);
                 Unique::new(Box::new(scan), UniqueMode::Hash)
             },
             |mut op| drain(&mut op),

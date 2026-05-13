@@ -179,9 +179,7 @@ impl VectorizedSink for ProbeHashSink<'_> {
                 .iter()
                 .map(|&(_, bi, ri)| {
                     let build_batch = &self.build_batches[bi];
-                    get_i64_col(build_batch, bc)
-                        .map(|c| c.data()[ri])
-                        .unwrap_or(0)
+                    get_i64_col(build_batch, bc).map_or(0, |c| c.data()[ri])
                 })
                 .collect();
             out_cols.push(Column::Int64(NumericColumn::from_data(col_data)));
@@ -189,8 +187,8 @@ impl VectorizedSink for ProbeHashSink<'_> {
 
         // Project probe columns to matched rows
         let mut final_cols: Vec<Column> = Vec::with_capacity(out_cols.len());
-        for pc in 0..probe_cols.len() {
-            let selected: Column = match &probe_cols[pc] {
+        for probe_col in probe_cols {
+            let selected: Column = match probe_col {
                 Column::Int32(c) => Column::Int32(NumericColumn::from_data(
                     joined.iter().map(|&(pi, _, _)| c.data()[pi]).collect(),
                 )),

@@ -27,6 +27,8 @@
 //! A streaming variant requiring only O(k) extra memory (where k is the
 //! maximum number of rows with the same key) is a future optimisation.
 
+use std::cmp::Ordering;
+
 use ultrasql_core::{Schema, Value};
 use ultrasql_planner::{LogicalJoinType, ScalarExpr};
 use ultrasql_vec::Batch;
@@ -121,6 +123,7 @@ impl Operator for MergeJoin {
 }
 
 impl MergeJoin {
+    #[allow(clippy::too_many_lines)]
     fn execute(&mut self) -> Result<Vec<Vec<Value>>, ExecError> {
         if self.join_type == LogicalJoinType::Cross {
             return Err(ExecError::Unsupported(
@@ -173,7 +176,6 @@ impl MergeJoin {
                 continue;
             }
 
-            use std::cmp::Ordering;
             match compare_values_nullable(&lk, &rk, false) {
                 Ordering::Less => {
                     li += 1;

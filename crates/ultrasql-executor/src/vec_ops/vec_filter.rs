@@ -175,9 +175,7 @@ fn materialise_selection(batch: &Batch, mask: &Bitmap) -> Result<Batch, ExecErro
             Column::Utf8(c) => {
                 use ultrasql_vec::column::StringColumn;
                 Column::Utf8(StringColumn::from_data(
-                    mask.iter_ones()
-                        .map(|i| c.value(i).to_owned())
-                        .collect::<Vec<_>>(),
+                    mask.iter_ones().map(|i| c.value(i).to_owned()),
                 ))
             }
         };

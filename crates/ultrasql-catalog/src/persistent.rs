@@ -622,7 +622,7 @@ mod tests {
         let toid = tbl.oid;
         cat.create_table(tbl).expect("create");
         let idx = IndexEntry::new(cat.next_oid(), "items_pk", toid, vec![0], true);
-        cat.create_index(idx.clone()).expect("idx create");
+        cat.create_index(idx).expect("idx create");
         let snap = cat.snapshot();
         assert!(snap.indexes.contains_key("items_pk"));
         assert!(!snap.indexes_by_table[&toid].is_empty());

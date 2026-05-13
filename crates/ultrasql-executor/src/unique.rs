@@ -236,7 +236,7 @@ impl Unique {
                 let is_dup = self
                     .last_row
                     .as_ref()
-                    .map_or(false, |prev| rows_equal_for_distinct(prev, &row));
+                    .is_some_and(|prev| rows_equal_for_distinct(prev, &row));
                 if !is_dup {
                     self.last_row = Some(row.clone());
                     survivors.push(row);

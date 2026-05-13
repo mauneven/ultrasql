@@ -4,6 +4,9 @@
 //! Run with:
 //!   cargo bench --bench v08 -p ultrasql-storage
 
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::cast_possible_wrap)]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread;

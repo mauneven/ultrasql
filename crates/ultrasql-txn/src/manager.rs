@@ -918,14 +918,14 @@ mod tests {
 
     #[test]
     fn serializable_with_ssi_pivot_fails_with_serialization_failure() {
-        use ultrasql_core::RelationId;
-
         let ssi = Arc::new(crate::ssi::SsiManager::new());
         let mgr = TransactionManager::new_with_ssi(Arc::clone(&ssi));
 
         let t1 = mgr.begin(IsolationLevel::Serializable);
         let t2 = mgr.begin(IsolationLevel::Serializable);
         let t3 = mgr.begin(IsolationLevel::Serializable);
+        let t2_xid = t2.xid;
+        let t3_xid = t3.xid;
 
         // Build T1 --rw--> T2 --rw--> T3 (T2 is pivot).
         mgr.record_rw_conflict(t1.xid, t2.xid);
@@ -942,11 +942,11 @@ mod tests {
         );
 
         // After T2's commit fails, its CLOG entry must be Aborted.
-        assert_eq!(mgr.status(t2.xid), XidStatus::Aborted);
+        assert_eq!(mgr.status(t2_xid), XidStatus::Aborted);
 
         // T3 has no conflict-in so it commits cleanly.
         mgr.commit(t3).unwrap();
-        assert_eq!(mgr.status(t3.xid), XidStatus::Committed);
+        assert_eq!(mgr.status(t3_xid), XidStatus::Committed);
     }
 
     #[test]

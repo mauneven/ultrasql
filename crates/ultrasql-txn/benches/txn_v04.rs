@@ -1,5 +1,5 @@
 //! v0.4 benchmarks: SSI commit-throughput under contention and
-//! ForUpdate row-lock acquire/release latency.
+//! `ForUpdate` row-lock acquire/release latency.
 //!
 //! Run with:
 //!   `cargo bench --package ultrasql-txn --bench txn_v04`

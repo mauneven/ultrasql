@@ -8,7 +8,7 @@
 //!
 //! # Use cases
 //!
-//! - Right side of a NestedLoopJoin (child is rescanned for each left row).
+//! - Right side of a `NestedLoopJoin` (child is rescanned for each left row).
 //! - CTE materialisation (the definition is executed once and replayed).
 //! - Subquery decorrelation checkpoints.
 //!
@@ -67,7 +67,7 @@ impl Materialize {
     ///
     /// This does **not** re-execute the child; it only rewinds the read
     /// cursor over the already-materialised batches.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.cursor = 0;
         self.eof = false;
     }

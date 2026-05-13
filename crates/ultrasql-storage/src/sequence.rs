@@ -66,7 +66,7 @@ pub enum SequenceError {
 /// Options that define a sequence's behaviour.
 ///
 /// Mirrors the arguments accepted by PostgreSQL's `CREATE SEQUENCE`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SequenceOptions {
     /// First value returned by the sequence. Defaults to `min` for
     /// ascending sequences and `max` for descending ones.
@@ -250,18 +250,18 @@ impl Sequence {
         Ok(value)
     }
 
-    /// Return the last value returned by [`nextval`] on this handle.
+    /// Return the last value returned by [`Self::nextval`] on this handle.
     ///
     /// # Errors
     ///
-    /// Returns [`SequenceError::NotCalled`] if [`nextval`] has never
+    /// Returns [`SequenceError::NotCalled`] if [`Self::nextval`] has never
     /// been called on this handle.
     pub fn currval(&self) -> Result<i64, SequenceError> {
         self.currval.lock().ok_or(SequenceError::NotCalled)
     }
 
     /// Return the last value returned by any sequence in the current
-    /// session. For this implementation it is identical to [`currval`]
+    /// session. For this implementation it is identical to [`Self::currval`]
     /// because we track per-handle.
     pub fn lastval(&self) -> Result<i64, SequenceError> {
         self.currval()
@@ -278,16 +278,18 @@ impl Sequence {
     /// Returns [`SequenceError::OutOfRange`] when `value` is outside the
     /// sequence's configured `[min, max]` range.
     pub fn setval(&self, value: i64, is_called: bool) -> Result<(), SequenceError> {
-        let mut state = self.state.lock();
-        if value < state.min_value || value > state.max_value {
-            return Err(SequenceError::OutOfRange {
-                value,
-                min: state.min_value,
-                max: state.max_value,
-            });
+        {
+            let mut state = self.state.lock();
+            if value < state.min_value || value > state.max_value {
+                return Err(SequenceError::OutOfRange {
+                    value,
+                    min: state.min_value,
+                    max: state.max_value,
+                });
+            }
+            state.last_value = value;
+            state.is_called = is_called;
         }
-        state.last_value = value;
-        state.is_called = is_called;
         if is_called {
             *self.currval.lock() = Some(value);
         }

@@ -10,7 +10,7 @@
 //! - `Project` (column-only) → [`Project`].
 //! - `Limit` (offset == 0) → [`Limit`].
 //! - `Sort` → [`Sort`].
-//! - `Aggregate` → [`HashAggregate`] (default) or [`SortAggregate`]
+//! - `Aggregate` → [`HashAggregate`] (default) or `SortAggregate`
 //!   when the hint field is set to `SortBased`.
 //! - `SetOp` → [`SetOp`].
 //! - `Cte` → materialise the definition, then serve via [`CteScan`].
@@ -181,7 +181,7 @@ pub fn build_operator(
             join_type,
             condition,
             schema,
-        } => build_join(left, right, join_type, condition, schema, data_source),
+        } => build_join(left, right, *join_type, condition, schema, data_source),
 
         LogicalPlan::Aggregate {
             input,
@@ -256,7 +256,7 @@ pub fn build_operator(
 fn build_join(
     left: &LogicalPlan,
     right: &LogicalPlan,
-    join_type: &LogicalJoinType,
+    join_type: LogicalJoinType,
     condition: &LogicalJoinCondition,
     schema: &Schema,
     data_source: &dyn DataSource,
@@ -278,7 +278,7 @@ fn build_join(
                             right_op,
                             left_key,
                             right_key,
-                            *join_type,
+                            join_type,
                             schema.clone(),
                             left_schema,
                             right_schema,
@@ -290,7 +290,7 @@ fn build_join(
                             right_op,
                             left_key,
                             right_key,
-                            *join_type,
+                            join_type,
                             schema.clone(),
                             left_schema,
                             right_schema,
@@ -303,7 +303,7 @@ fn build_join(
                 left_op,
                 right_op,
                 Some(pred.clone()),
-                *join_type,
+                join_type,
                 schema.clone(),
                 left_schema,
                 right_schema,
@@ -316,7 +316,7 @@ fn build_join(
                 left_op,
                 right_op,
                 cond,
-                *join_type,
+                join_type,
                 schema.clone(),
                 left_schema,
                 right_schema,
@@ -328,7 +328,7 @@ fn build_join(
                 left_op,
                 right_op,
                 None,
-                *join_type,
+                join_type,
                 schema.clone(),
                 left_schema,
                 right_schema,
@@ -410,7 +410,7 @@ fn extract_equi_keys(pred: &ScalarExpr, left_width: usize) -> Option<(ScalarExpr
 /// Build a composite equality predicate from `USING (left_idx, right_idx)` pairs.
 ///
 /// Each pair produces `left_col = right_col` (right column offset by left
-/// schema width); multiple pairs are ANDed together. Returns `None` when the
+/// schema width); multiple pairs are `AND`ed together. Returns `None` when the
 /// list is empty.
 fn build_using_predicate(
     pairs: &[(usize, usize)],

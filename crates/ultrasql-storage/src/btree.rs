@@ -68,6 +68,8 @@
 //! - Duplicate keys are rejected with [`BTreeError::DuplicateKey`].
 //! - Deletions are not yet implemented (insert + read-only at v0.5).
 
+#![allow(clippy::type_complexity)]
+
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1207,10 +1209,7 @@ impl<L: PageLoader> BTree<L> {
     ) -> Result<BackwardRangeIter<'_, L, K>, BTreeError> {
         // Collect forward scan.
         let items: Vec<(K, TupleId)> = self
-            .range_scan::<K>(
-                end.unwrap_or(start),
-                if end.is_some() { None } else { None },
-            )
+            .range_scan::<K>(end.unwrap_or(start), None)
             .filter_map(std::result::Result::ok)
             .filter(|(k, _)| end.is_none_or(|e| *k >= e) && *k <= start)
             .collect();
@@ -2038,7 +2037,7 @@ mod tests {
         let keys: Vec<i64> = iter.map(|r| r.unwrap().0).collect();
         // Should contain keys in [5..=15].
         for &k in &keys {
-            assert!(k >= 5 && k <= 15, "key {k} out of [5,15]");
+            assert!((5..=15).contains(&k), "key {k} out of [5,15]");
         }
     }
 

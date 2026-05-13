@@ -1,15 +1,15 @@
 //! Per-query work memory budget.
 //!
 //! [`WorkMemBudget`] tracks how many bytes of scratch memory a query is
-//! allowed to allocate inside in-memory operators (Sort, HashAggregate,
-//! HashJoin). When a reservation request would push usage above the
+//! allowed to allocate inside in-memory operators (Sort, `HashAggregate`,
+//! `HashJoin`). When a reservation request would push usage above the
 //! configured limit, the caller receives [`ExecError::Unsupported`] (or
 //! triggers spill, depending on the operator).
 //!
 //! # Design
 //!
-//! The budget is backed by a single [`AtomicU64`] so all clones of the
-//! surrounding [`Arc<WorkMemBudget>`] share the same byte counter across
+//! The budget is backed by a single `AtomicU64` so all clones of the
+//! surrounding `Arc<WorkMemBudget>` share the same byte counter across
 //! operator threads. Reservations are returned via [`WorkMemReservation`],
 //! which releases the bytes in its `Drop` implementation — ensuring
 //! that temporary allocations are always returned even when an operator
@@ -43,8 +43,8 @@ pub const fn temp_file_limit() -> u64 {
 /// Per-query work memory budget.
 ///
 /// Shared via `Arc<WorkMemBudget>` across operators that need scratch
-/// memory (Sort, HashAggregate, HashJoin). The budget is enforced
-/// cooperatively: each operator must call [`reserve`] before allocating
+/// memory (Sort, `HashAggregate`, `HashJoin`). The budget is enforced
+/// cooperatively: each operator must call `reserve` before allocating
 /// and the returned [`WorkMemReservation`] must be kept alive for the
 /// duration of the allocation.
 ///

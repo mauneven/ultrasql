@@ -1,4 +1,4 @@
-//! LockRows pass-through operator.
+//! `LockRows` pass-through operator.
 //!
 //! [`LockRows`] wraps a child operator and calls a row-lock callback for
 //! every row it emits. This implements the `SELECT FOR UPDATE` /
@@ -22,6 +22,8 @@
 //! For v0.5 the lock callback is user-supplied. In production the server
 //! will inject a closure backed by `ultrasql_txn::LockManager::lock_tuple`.
 //! Tests pass a no-op closure.
+
+#![allow(clippy::type_complexity)]
 
 use ultrasql_core::Schema;
 use ultrasql_vec::Batch;

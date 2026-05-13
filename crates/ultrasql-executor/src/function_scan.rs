@@ -3,7 +3,7 @@
 //! [`FunctionScan`] evaluates a set-returning function and emits its rows
 //! as batches. For v0.5 only `generate_series` is implemented.
 //!
-//! # generate_series
+//! # `generate_series`
 //!
 //! `generate_series(start, stop, step)` emits integer rows from `start` to
 //! `stop` (inclusive) stepping by `step`. Negative `step` allows

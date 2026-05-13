@@ -387,7 +387,7 @@ mod tests {
         let oracle = MapOracle::new();
         oracle.set_committed(Xid::new(42));
 
-        let rolled = RolledBackOracle([42].into_iter().collect());
+        let rolled = RolledBackOracle(std::iter::once(42).collect());
         assert_eq!(
             is_visible_ext(&header, &snap, &oracle, &rolled),
             Visibility::Invisible,

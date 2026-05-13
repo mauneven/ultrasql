@@ -247,9 +247,8 @@ mod tests {
 
     #[test]
     fn vectorized_operator_drives_sink_to_completion() {
-        let schema = int32_schema();
         let mut op = ConstOp {
-            schema: schema.clone(),
+            schema: int32_schema(),
             batches: vec![make_batch(&[1, 2]), make_batch(&[3, 4, 5])],
             pos: 0,
         };
