@@ -322,6 +322,16 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
         }
         self.done = true;
 
+        // For UPDATE we accumulate every batch's `(old_tid, payload)`
+        // edits into a single Vec and hand the whole set to
+        // `heap.update_many` in one call after the child is drained.
+        // The bulk-UPDATE path inside `update_many` pays a fixed
+        // per-call cost (sort, page-group walk, insert_batch dispatch,
+        // column-cache invalidate); coalescing across batches drops
+        // that overhead from `O(n_batches)` to `O(1)` while keeping the
+        // per-row cost identical.
+        let mut all_update_edits: Vec<(TupleId, UpdatePayload)> = Vec::new();
+
         // Drain the entire child input.
         loop {
             let Some(batch) = self.child.next_batch()? else {
@@ -381,22 +391,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         }
                         edits
                     };
-                    let n = edits.len();
-                    let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
-                    self.heap
-                        .update_many(
-                            edits,
-                            UpdateOptions {
-                                xid: self.delete_xmax,
-                                command_id: self.delete_cmax,
-                                hot_eligible: true,
-                                wal: wal_ref,
-                                vm: None,
-                            },
-                        )
-                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-                    let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
-                    self.affected = self.affected.saturating_add(n_u64);
+                    if all_update_edits.is_empty() {
+                        all_update_edits = edits;
+                    } else {
+                        all_update_edits.extend(edits);
+                    }
                 }
                 ModifyKind::Insert => {
                     let child_schema = self.child.schema().clone();
@@ -408,6 +407,27 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     }
                 }
             }
+        }
+
+        // Single bulk UPDATE call after every input batch has been
+        // accumulated. See the `all_update_edits` comment above.
+        if matches!(self.kind, ModifyKind::Update { .. }) && !all_update_edits.is_empty() {
+            let n = all_update_edits.len();
+            let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
+            self.heap
+                .update_many(
+                    all_update_edits,
+                    UpdateOptions {
+                        xid: self.delete_xmax,
+                        command_id: self.delete_cmax,
+                        hot_eligible: true,
+                        wal: wal_ref,
+                        vm: None,
+                    },
+                )
+                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+            let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
+            self.affected = self.affected.saturating_add(n_u64);
         }
 
         // Emit the affected-row-count batch.
