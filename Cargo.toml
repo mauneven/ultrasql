@@ -64,7 +64,7 @@ dashmap     = "6"
 arc-swap    = "1"
 
 # Async
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "macros", "sync", "signal"] }
 futures = "0.3"
 
 # Hashing / checksums
@@ -128,37 +128,38 @@ libc       = "0.2"
 
 [profile.dev]
 opt-level       = 0
-debug           = "line-tables-only"
+debug           = 0
 overflow-checks = true
 incremental     = true
 split-debuginfo = "unpacked"
 
 [profile.test]
-opt-level       = 0
-debug           = "line-tables-only"
+opt-level       = 1
+debug           = 0
 incremental     = true
 split-debuginfo = "unpacked"
 
 [profile.bench]
 opt-level     = 3
-lto           = "thin"
-codegen-units = 16
-debug         = "line-tables-only"
+lto           = false
+codegen-units = 256
+debug         = 0
 incremental   = true
 
-# Default release profile: fast compile, near-peak runtime. Used by `cargo
-# build --release` and every iteration loop (agents, bench harness).
-# `lto = "thin"` keeps ~95% of fat-LTO's runtime perf with ~3× faster
-# compile; `codegen-units = 16` costs <5% runtime for a similar compile
-# speedup; `incremental = true` saves 20-30s on rebuilds. For absolute peak
-# runtime use `--profile release-ship`.
+# Default release profile: fast compile, ~95% runtime. Optimised for the
+# tight agent iteration loop (edit → build → bench → repeat). Thin LTO
+# preserves most cross-crate inlining at ~3× faster compile vs fat;
+# codegen-units = 16 splits per-crate codegen across cores without
+# fragmenting binary cache lines too much. Cut release tarballs and
+# regression-gate baseline runs with `--profile release-ship` for peak
+# performance.
 [profile.release]
 opt-level       = 3
 lto             = "thin"
 codegen-units   = 16
 strip           = "symbols"
 panic           = "abort"
-debug           = "line-tables-only"
+debug           = 0
 incremental     = true
 overflow-checks = false
 
