@@ -84,21 +84,23 @@ best practices, median of 5 runs ≥ 60 s each after ≥ 60 s warmup.
 
 ## Current State Snapshot
 
+<!-- reconciled 2026-05-13 against actual code; see commits 4147d50..HEAD -->
+
 | Crate | Status |
 |-------|--------|
-| `ultrasql-core` | ✅ Solid — types, OIDs, Datum, Schema, identifiers |
-| `ultrasql-storage` | ⚠️ Structures present, WAL/MVCC integration = 0 |
-| `ultrasql-wal` | ⚠️ WAL writes, recovery exists, not wired to storage |
-| `ultrasql-mvcc` | ✅ Snapshot + visibility rules implemented |
-| `ultrasql-txn` | ✅ TxnManager working, in-memory CLOG |
-| `ultrasql-parser` | ⚠️ Only SELECT + BEGIN/COMMIT/ROLLBACK |
-| `ultrasql-planner` | ⚠️ Basic binder, local catalog, no JOINs |
-| `ultrasql-optimizer` | ❌ Empty file. Zero code. |
-| `ultrasql-executor` | ⚠️ Only MemTableScan (in-memory, no real storage) |
-| `ultrasql-vec` | ⚠️ Batch/column/kernels scaffolded |
-| `ultrasql-catalog` | ⚠️ In-memory only, no persistence |
-| `ultrasql-protocol` | ⚠️ Simple Query only; Extended Protocol rejected |
-| `ultrasql-server` | ⚠️ No real auth, no real storage, hardcoded sample data |
+| `ultrasql-core` | ✅ Types, OIDs, Datum, Schema, identifiers |
+| `ultrasql-storage` | ✅ Pages, buffer pool (CLOCK-Pro), heap AM, B+ tree, FSM, VM, TOAST, persistent CLOG, WAL applier — `crates/ultrasql-storage/src/lib.rs` |
+| `ultrasql-wal` | ✅ Records, group commit, recovery, FPW; HeapTarget replay wired — `crates/ultrasql-wal/src/lib.rs` |
+| `ultrasql-mvcc` | ✅ Snapshot + visibility rules (PostgreSQL `HeapTupleSatisfiesMVCC`) |
+| `ultrasql-txn` | ✅ TxnManager, lock manager, SSI scaffolding, savepoints, 2PC |
+| `ultrasql-parser` | ✅ Full DML + DDL + CTE + Extended Protocol Parse/Bind |
+| `ultrasql-planner` | ✅ Binder for SELECT/INSERT/UPDATE/DELETE, JOINs, GROUP BY, subqueries, CTEs; ⚠️ no `LogicalPlan::CreateTable` variant yet, BEGIN/COMMIT/ROLLBACK rejected at `binder.rs:83` |
+| `ultrasql-optimizer` | ✅ Rule-based rewrites, cost model, DPsize/GEQO join enumeration, physical selection, plan cache (~1077 LOC across `lib.rs` + `plan_cache.rs`) |
+| `ultrasql-executor` | ✅ SeqScan, ModifyTable, NestLoop, HashJoin, HashAggregate, Sort, ValuesScan, Filter, Project, Limit shipped; ⚠️ server still lowers Scan → MemTableScan over sample data |
+| `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash), dictionary encoding, vectorized sort/HashJoin/HashAggregate |
+| `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ⚠️ bootstrap-from-heap falls back to initial snapshot (no typed tuple decoder yet) |
+| `ultrasql-protocol` | ✅ Wire codec for Simple Query + Extended Query (Parse/Bind/Describe/Execute/Sync/Close) |
+| `ultrasql-server` | ⚠️ SCRAM-SHA-256 + TLS shipped; Simple Query traverses parser→binder→pipeline→MemTableScan; **CREATE TABLE / INSERT / UPDATE / DELETE / Extended Query / BEGIN-COMMIT all rejected via `ServerError::Unsupported`** (`pipeline.rs:131..134`, `lib.rs:371`) — the v0.3→v0.5 wiring gap blocks any real workload over the wire |
 
 ---
 
