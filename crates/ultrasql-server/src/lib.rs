@@ -803,11 +803,44 @@ where
         // Behaviour depends on TxnState. The `run_dml_or_select` helper
         // already transitions `InTransaction → Failed` on any execution
         // error, so no explicit `fail_if_in_transaction` is needed here.
-        let optimised_plan = match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
-            Ok(p) => p,
-            Err(e) => return Err(self.fail_if_in_transaction(e)),
+        // Skip the optimizer + plan cache for trivial `INSERT VALUES`
+        // plans. The cost-based optimizer has no rewrites that
+        // apply to a leaf `Insert { source: Values }` shape, and
+        // the plan-cache lookup hashes the entire SQL text — for a
+        // 10 000-row bulk INSERT that is a ~150 KB hash on every
+        // iteration (cross_compare_sql uses a unique table name
+        // per iter so the cache always misses). Bypass is
+        // INSERT-only — UPDATE / DELETE need the optimizer's
+        // canonicalisation passes for the lowerer's
+        // `build_filtered_tid_scan` shape contract.
+        let optimised_plan = if Self::is_trivial_insert_values(&plan) {
+            plan
+        } else {
+            match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
+                Ok(p) => p,
+                Err(e) => return Err(self.fail_if_in_transaction(e)),
+            }
         };
         self.run_dml_or_select(&optimised_plan, &catalog_snapshot)
+    }
+
+    /// `true` iff `plan` is `Insert { source: Values { .. }, .. }`
+    /// with no `ON CONFLICT` / `RETURNING` — see the call site for
+    /// why this bypasses the optimizer + plan-cache lookup.
+    fn is_trivial_insert_values(plan: &LogicalPlan) -> bool {
+        let LogicalPlan::Insert {
+            source,
+            on_conflict,
+            returning,
+            ..
+        } = plan
+        else {
+            return false;
+        };
+        if on_conflict.is_some() || !returning.is_empty() {
+            return false;
+        }
+        matches!(source.as_ref(), LogicalPlan::Values { .. })
     }
 
     /// Apply the cost-based optimizer to a DML/SELECT plan and return
