@@ -31,6 +31,16 @@
 
 #![allow(clippy::print_stdout)]
 #![allow(clippy::print_stderr)]
+// Legacy per-iter OLAP helpers `run_select_iter` / `run_sum_iter` /
+// `run_avg_iter` / `run_filter_sum_iter` are retained for the
+// historical "fresh table per iter" measurement mode. The current
+// `--workload` dispatch routes every OLAP path through the
+// shared-table helpers `run_shared_select_scan` /
+// `run_shared_olap_aggregate` to match the per-engine competitor
+// scripts. Keep the older functions compiling so a follow-on
+// `--mode legacy-per-iter` flag can flip back if a reviewer needs
+// the old shape.
+#![allow(dead_code)]
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -166,19 +176,73 @@ async fn main() -> Result<()> {
     // Run warmup + measured iterations.
     let mut iters_us: Vec<f64> = Vec::with_capacity(args.iters);
     let total_iters = args.warmup + args.iters;
-    for i in 0..total_iters {
-        let micros = match args.workload {
-            Workload::InsertBulk => run_insert_iter(bound, args.rows, i).await?,
-            Workload::SelectScan => run_select_iter(bound, args.rows, i).await?,
-            Workload::SumScalar => run_sum_iter(bound, args.rows, i).await?,
-            Workload::AvgScalar => run_avg_iter(bound, args.rows, i).await?,
-            Workload::FilterSum => run_filter_sum_iter(bound, args.rows, i).await?,
-            Workload::UpdateBulk => run_update_iter(bound, args.rows, i).await?,
-            Workload::DeleteBulk => run_delete_iter(bound, args.rows, i).await?,
-            Workload::MixedOltp => run_mixed_oltp_iter(bound, args.rows, i).await?,
-        };
-        if i >= args.warmup {
-            iters_us.push(micros);
+
+    // Shared-table OLAP workloads: preload **once** outside the
+    // timed region, then run the query N times against the same
+    // relation. Matches the per-engine pattern every competitor
+    // script uses (DuckDB / ClickHouse / SQLite / PostgreSQL all
+    // build the relation once via their persistent driver
+    // connection and time the query repeated N times). Anything
+    // else would compare cold-cache UltraSQL against warm-cache
+    // peers.
+    match args.workload {
+        Workload::SelectScan => {
+            run_shared_select_scan(bound, args.rows, args.warmup, total_iters, &mut iters_us)
+                .await?;
+        }
+        Workload::SumScalar => {
+            run_shared_olap_aggregate(
+                bound,
+                args.rows,
+                args.warmup,
+                total_iters,
+                &mut iters_us,
+                "bench_sum_shared",
+                |t| format!("SELECT SUM(x) FROM {t}"),
+            )
+            .await?;
+        }
+        Workload::AvgScalar => {
+            run_shared_olap_aggregate(
+                bound,
+                args.rows,
+                args.warmup,
+                total_iters,
+                &mut iters_us,
+                "bench_avg_shared",
+                |t| format!("SELECT AVG(x) FROM {t}"),
+            )
+            .await?;
+        }
+        Workload::FilterSum => {
+            let threshold = args.rows / 2;
+            run_shared_olap_aggregate(
+                bound,
+                args.rows,
+                args.warmup,
+                total_iters,
+                &mut iters_us,
+                "bench_filter_sum_shared",
+                move |t| format!("SELECT SUM(x) FROM {t} WHERE x > {threshold}"),
+            )
+            .await?;
+        }
+        _ => {
+            for i in 0..total_iters {
+                let micros = match args.workload {
+                    Workload::InsertBulk => run_insert_iter(bound, args.rows, i).await?,
+                    Workload::UpdateBulk => run_update_iter(bound, args.rows, i).await?,
+                    Workload::DeleteBulk => run_delete_iter(bound, args.rows, i).await?,
+                    Workload::MixedOltp => run_mixed_oltp_iter(bound, args.rows, i).await?,
+                    Workload::SelectScan
+                    | Workload::SumScalar
+                    | Workload::AvgScalar
+                    | Workload::FilterSum => unreachable!("handled above"),
+                };
+                if i >= args.warmup {
+                    iters_us.push(micros);
+                }
+            }
         }
     }
 
@@ -576,6 +640,122 @@ async fn run_delete_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result
     drop(client);
     conn_handle.abort();
     Ok(elapsed_us)
+}
+
+/// Shared-table SELECT-scan workload: preload `n_rows` once, then
+/// drain `SELECT id, val FROM t` N times in a row on the same
+/// relation (warmup + measured iters) under a single
+/// `tokio-postgres` connection.
+///
+/// Matches the methodology every competitor script uses (the
+/// preload is paid once outside the timed region, the persistent
+/// driver connection runs N queries against the same materialised
+/// relation). Mirrors `run_clickhouse_writes.sh::run_select_scan`.
+async fn run_shared_select_scan(
+    server: SocketAddr,
+    n_rows: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<()> {
+    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .context("tokio-postgres connect to ultrasqld")?;
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("tokio-postgres connection error: {e}");
+        }
+    });
+
+    let table = "bench_select_scan_shared";
+    client
+        .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, val INT)"))
+        .await
+        .with_context(|| format!("CREATE TABLE {table}"))?;
+    preload_chunked(&client, table, n_rows).await?;
+
+    let query = format!("SELECT id, val FROM {table}");
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(&query)
+            .await
+            .with_context(|| format!("SELECT from {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let row_count = messages
+            .iter()
+            .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+            .count();
+        if row_count != n_rows {
+            anyhow::bail!("row count mismatch: expected {n_rows}, observed {row_count}");
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+        }
+    }
+
+    drop(client);
+    conn_handle.abort();
+    Ok(())
+}
+
+/// Shared-table analytical aggregate workload: preload once, then
+/// run `query_fn(table_name)` N times on the same `(id INT, x INT)`
+/// relation under a single `tokio-postgres` connection. Drives
+/// `SUM(x)`, `AVG(x)`, and `SUM(x) WHERE x > threshold` via a
+/// caller-supplied closure that interpolates the table name.
+async fn run_shared_olap_aggregate<F>(
+    server: SocketAddr,
+    n_rows: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+    table: &str,
+    query_fn: F,
+) -> Result<()>
+where
+    F: Fn(&str) -> String,
+{
+    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .context("tokio-postgres connect to ultrasqld")?;
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("tokio-postgres connection error: {e}");
+        }
+    });
+
+    client
+        .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, x INT)"))
+        .await
+        .with_context(|| format!("CREATE TABLE {table}"))?;
+    preload_chunked(&client, table, n_rows).await?;
+
+    let query = query_fn(table);
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(&query)
+            .await
+            .with_context(|| format!("aggregate on {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let row_count = messages
+            .iter()
+            .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+            .count();
+        if row_count != 1 {
+            anyhow::bail!("aggregate row count mismatch: expected 1, observed {row_count}");
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+        }
+    }
+
+    drop(client);
+    conn_handle.abort();
+    Ok(())
 }
 
 /// Mixed-OLTP pgbench-like 1-second-window workload.
