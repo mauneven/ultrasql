@@ -151,79 +151,57 @@ run_update() {
     local wl="update_throughput_10k"
     echo "  workload: ${wl}"
 
-    # Full script (preload + update).
-    local update_sql
-    update_sql="$(mktemp /tmp/sqlite_update_XXXX.sql)"
-    python3 - "$N_ROWS" "$update_sql" <<'PYEOF'
-import sys, random
+    # Persistent in-process connection via the Python sqlite3 driver:
+    # preload N_ROWS once outside the timed region, then per iteration
+    # time `BEGIN; UPDATE all rows; ROLLBACK;` so each sample measures
+    # the same UPDATE against the same row image. Avoids the
+    # subtract-two-process methodology that clamped against
+    # `max(v, 1.0)` and blew variance on sub-millisecond queries.
+    local samples_raw
+    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" <<'PYEOF'
+import sys, time, random
+import sqlite3
+
 n = int(sys.argv[1])
-out = sys.argv[2]
+n_iters = int(sys.argv[2])
+
 rng = random.Random(0xC0FFEE)
 ids = list(range(n))
 rng.shuffle(ids)
-vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
-with open(out, "w") as f:
-    f.write("CREATE TABLE bench_write(id INTEGER PRIMARY KEY, val INTEGER);\n")
-    chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-    vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
-    for ch, vc in zip(chunks, vchunks):
-        rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
-        f.write(f"INSERT INTO bench_write(id,val) VALUES {rows};\n")
-    f.write("BEGIN;\n")
-    f.write(f"UPDATE bench_write SET val = val + 1 WHERE id BETWEEN 0 AND {n-1};\n")
-    f.write("COMMIT;\n")
+vals = [rng.randint(-(2**31), 2**31 - 1) for _ in range(n)]
+
+con = sqlite3.connect(":memory:", isolation_level=None)
+con.execute("PRAGMA journal_mode=MEMORY;")
+con.execute("PRAGMA synchronous=OFF;")
+con.execute("PRAGMA temp_store=MEMORY;")
+con.execute("CREATE TABLE bench_write(id INTEGER PRIMARY KEY, val INTEGER);")
+con.execute("BEGIN;")
+con.executemany(
+    "INSERT INTO bench_write(id,val) VALUES (?, ?);",
+    list(zip(ids, vals)),
+)
+con.execute("COMMIT;")
+
+for _ in range(2):
+    con.execute("BEGIN;")
+    con.execute(f"UPDATE bench_write SET val = val + 1 WHERE id BETWEEN 0 AND {n-1};")
+    con.execute("ROLLBACK;")
+
+for _ in range(n_iters):
+    con.execute("BEGIN;")
+    t0 = time.perf_counter()
+    con.execute(f"UPDATE bench_write SET val = val + 1 WHERE id BETWEEN 0 AND {n-1};")
+    t1 = time.perf_counter()
+    con.execute("ROLLBACK;")
+    print((t1 - t0) * 1e6)
 PYEOF
+)"
 
-    # Preload-only script.
-    local preload_sql
-    preload_sql="$(mktemp /tmp/sqlite_preload_XXXX.sql)"
-    python3 - "$N_ROWS" "$preload_sql" <<'PYEOF'
-import sys, random
-n = int(sys.argv[1])
-out = sys.argv[2]
-rng = random.Random(0xC0FFEE)
-ids = list(range(n))
-rng.shuffle(ids)
-vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
-with open(out, "w") as f:
-    f.write("CREATE TABLE bench_write(id INTEGER PRIMARY KEY, val INTEGER);\n")
-    chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-    vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
-    for ch, vc in zip(chunks, vchunks):
-        rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
-        f.write(f"INSERT INTO bench_write(id,val) VALUES {rows};\n")
-PYEOF
-
-    local samples_full=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$update_sql" | sqlite3 :memory: >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_full+=("$dt")
-    done
-
-    local samples_preload=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$preload_sql" | sqlite3 :memory: >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_preload+=("$dt")
-    done
-
-    rm -f "$update_sql" "$preload_sql"
-
-    local preload_median
-    preload_median="$(compute_median "${samples_preload[@]}")"
     local samples=()
-    for dt_full in "${samples_full[@]}"; do
-        local net
-        net="$(python3 -c "v = $dt_full - $preload_median; print(max(v, 1.0))")"
-        samples+=("$net")
-    done
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        samples+=("$line")
+    done <<< "$samples_raw"
 
     local median_us
     median_us="$(compute_median "${samples[@]}")"
@@ -239,77 +217,56 @@ run_delete() {
     local wl="delete_throughput_10k"
     echo "  workload: ${wl}"
 
-    local delete_sql
-    delete_sql="$(mktemp /tmp/sqlite_delete_XXXX.sql)"
-    python3 - "$N_ROWS" "$delete_sql" <<'PYEOF'
-import sys, random
+    # Persistent in-process connection via the Python sqlite3 driver:
+    # preload N_ROWS once outside the timed region, then per iteration
+    # time `BEGIN; DELETE all rows; ROLLBACK;` so each sample measures
+    # the same DELETE against the same row image. Avoids the
+    # subtract-two-process methodology and its `max(v, 1.0)` clamp.
+    local samples_raw
+    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" <<'PYEOF'
+import sys, time, random
+import sqlite3
+
 n = int(sys.argv[1])
-out = sys.argv[2]
+n_iters = int(sys.argv[2])
+
 rng = random.Random(0xC0FFEE)
 ids = list(range(n))
 rng.shuffle(ids)
-vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
-with open(out, "w") as f:
-    f.write("CREATE TABLE bench_write(id INTEGER PRIMARY KEY, val INTEGER);\n")
-    chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-    vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
-    for ch, vc in zip(chunks, vchunks):
-        rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
-        f.write(f"INSERT INTO bench_write(id,val) VALUES {rows};\n")
-    f.write("BEGIN;\n")
-    f.write(f"DELETE FROM bench_write WHERE id BETWEEN 0 AND {n-1};\n")
-    f.write("COMMIT;\n")
+vals = [rng.randint(-(2**31), 2**31 - 1) for _ in range(n)]
+
+con = sqlite3.connect(":memory:", isolation_level=None)
+con.execute("PRAGMA journal_mode=MEMORY;")
+con.execute("PRAGMA synchronous=OFF;")
+con.execute("PRAGMA temp_store=MEMORY;")
+con.execute("CREATE TABLE bench_write(id INTEGER PRIMARY KEY, val INTEGER);")
+con.execute("BEGIN;")
+con.executemany(
+    "INSERT INTO bench_write(id,val) VALUES (?, ?);",
+    list(zip(ids, vals)),
+)
+con.execute("COMMIT;")
+
+for _ in range(2):
+    con.execute("BEGIN;")
+    con.execute(f"DELETE FROM bench_write WHERE id BETWEEN 0 AND {n-1};")
+    con.execute("ROLLBACK;")
+
+for _ in range(n_iters):
+    con.execute("BEGIN;")
+    t0 = time.perf_counter()
+    con.execute(f"DELETE FROM bench_write WHERE id BETWEEN 0 AND {n-1};")
+    t1 = time.perf_counter()
+    con.execute("ROLLBACK;")
+    print((t1 - t0) * 1e6)
 PYEOF
+)"
 
-    local preload_sql
-    preload_sql="$(mktemp /tmp/sqlite_preload2_XXXX.sql)"
-    python3 - "$N_ROWS" "$preload_sql" <<'PYEOF'
-import sys, random
-n = int(sys.argv[1])
-out = sys.argv[2]
-rng = random.Random(0xC0FFEE)
-ids = list(range(n))
-rng.shuffle(ids)
-vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
-with open(out, "w") as f:
-    f.write("CREATE TABLE bench_write(id INTEGER PRIMARY KEY, val INTEGER);\n")
-    chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-    vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
-    for ch, vc in zip(chunks, vchunks):
-        rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
-        f.write(f"INSERT INTO bench_write(id,val) VALUES {rows};\n")
-PYEOF
-
-    local samples_full=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$delete_sql" | sqlite3 :memory: >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_full+=("$dt")
-    done
-
-    local samples_preload=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$preload_sql" | sqlite3 :memory: >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_preload+=("$dt")
-    done
-
-    rm -f "$delete_sql" "$preload_sql"
-
-    local preload_median
-    preload_median="$(compute_median "${samples_preload[@]}")"
     local samples=()
-    for dt_full in "${samples_full[@]}"; do
-        local net
-        net="$(python3 -c "v = $dt_full - $preload_median; print(max(v, 1.0))")"
-        samples+=("$net")
-    done
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        samples+=("$line")
+    done <<< "$samples_raw"
 
     local median_us
     median_us="$(compute_median "${samples[@]}")"
@@ -399,77 +356,49 @@ run_select_scan() {
     local wl="select_scan_10k"
     echo "  workload: ${wl}"
 
-    # SQLite :memory: is stateless per invocation; preload + scan in the
-    # same script and subtract the preload-only baseline, matching the
-    # methodology used by run_update / run_delete above.
+    # Persistent in-process connection via the Python sqlite3 driver:
+    # preload N_ROWS once outside the timed region, then time a full
+    # `SELECT id, val FROM bench_select_scan` that drains every row via
+    # `fetchall()`. Avoids the subtract-two-process methodology that
+    # clamped fast scans against `max(v, 1.0)`.
+    local samples_raw
+    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" <<'PYEOF'
+import sys, time
+import sqlite3
 
-    local scan_sql
-    scan_sql="$(mktemp /tmp/sqlite_select_scan_XXXX.sql)"
-    python3 - "$N_ROWS" "$scan_sql" <<'PYEOF'
-import sys
 n = int(sys.argv[1])
-out = sys.argv[2]
-with open(out, "w") as f:
-    f.write("CREATE TABLE bench_select_scan(id INTEGER NOT NULL, val INTEGER);\n")
-    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
-    for ch in chunks:
-        rows = ",".join(f"({j},{j * 10})" for j in ch)
-        f.write(f"INSERT INTO bench_select_scan(id,val) VALUES {rows};\n")
-    # Timed SELECT — emit all rows so the CLI drains the full result set.
-    f.write("SELECT id, val FROM bench_select_scan;\n")
+n_iters = int(sys.argv[2])
+
+con = sqlite3.connect(":memory:", isolation_level=None)
+con.execute("PRAGMA journal_mode=MEMORY;")
+con.execute("PRAGMA synchronous=OFF;")
+con.execute("PRAGMA temp_store=MEMORY;")
+con.execute("CREATE TABLE bench_select_scan(id INTEGER NOT NULL, val INTEGER);")
+con.execute("BEGIN;")
+con.executemany(
+    "INSERT INTO bench_select_scan(id,val) VALUES (?, ?);",
+    [(j, j * 10) for j in range(n)],
+)
+con.execute("COMMIT;")
+
+for _ in range(2):
+    con.execute("SELECT id, val FROM bench_select_scan;").fetchall()
+
+for _ in range(n_iters):
+    t0 = time.perf_counter()
+    rows = con.execute("SELECT id, val FROM bench_select_scan;").fetchall()
+    t1 = time.perf_counter()
+    if len(rows) != n:
+        sys.stderr.write(f"run_select_scan: row mismatch (got {len(rows)}, expected {n})\n")
+    print((t1 - t0) * 1e6)
 PYEOF
+)"
 
-    local preload_sql
-    preload_sql="$(mktemp /tmp/sqlite_select_preload_XXXX.sql)"
-    python3 - "$N_ROWS" "$preload_sql" <<'PYEOF'
-import sys
-n = int(sys.argv[1])
-out = sys.argv[2]
-with open(out, "w") as f:
-    f.write("CREATE TABLE bench_select_scan(id INTEGER NOT NULL, val INTEGER);\n")
-    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
-    for ch in chunks:
-        rows = ",".join(f"({j},{j * 10})" for j in ch)
-        f.write(f"INSERT INTO bench_select_scan(id,val) VALUES {rows};\n")
-PYEOF
-
-    # Row-count sanity check on a one-shot run.
-    local rowcount
-    rowcount="$(printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$scan_sql" | sqlite3 :memory: | wc -l | tr -d '[:space:]')"
-    if [[ "$rowcount" -ne "$N_ROWS" ]]; then
-        echo "    WARNING: row count mismatch: expected $N_ROWS, observed $rowcount" >&2
-    fi
-
-    local samples_full=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$scan_sql" | sqlite3 :memory: >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_full+=("$dt")
-    done
-
-    local samples_preload=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$preload_sql" | sqlite3 :memory: >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_preload+=("$dt")
-    done
-
-    rm -f "$scan_sql" "$preload_sql"
-
-    local preload_median
-    preload_median="$(compute_median "${samples_preload[@]}")"
     local samples=()
-    for dt_full in "${samples_full[@]}"; do
-        local net
-        net="$(python3 -c "v = $dt_full - $preload_median; print(max(v, 1.0))")"
-        samples+=("$net")
-    done
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        samples+=("$line")
+    done <<< "$samples_raw"
 
     local median_us
     median_us="$(compute_median "${samples[@]}")"
@@ -481,9 +410,11 @@ PYEOF
 # ---------------------------------------------------------------------------
 # Helper: run a SELECT against bench_analytical with the given query.
 # Args: workload_id, n_rows, query_sql
-# SQLite :memory: is stateless per invocation, so preload + query is timed
-# together and a preload-only baseline is subtracted (same methodology as
-# run_update / run_delete / run_select_scan above).
+# Uses the Python sqlite3 driver: opens an in-memory connection once, runs
+# the preload outside the timed region, then times the query across
+# N_ITERS iterations with `.fetchall()` to force materialization.
+# Avoids the subtract-two-process methodology that clamped sub-ms queries
+# against `max(v, 1.0)`.
 # ---------------------------------------------------------------------------
 run_analytical() {
     local wl="$1"
@@ -491,67 +422,45 @@ run_analytical() {
     local query="$3"
     echo "  workload: ${wl} (n_rows=${n_rows})"
 
-    local scan_sql
-    scan_sql="$(mktemp /tmp/sqlite_analytical_XXXX.sql)"
-    python3 - "$n_rows" "$scan_sql" "$query" <<'PYEOF'
-import sys
+    local samples_raw
+    samples_raw="$(python3 - "$n_rows" "$query" "$N_ITERS" <<'PYEOF'
+import sys, time
+import sqlite3
+
 n = int(sys.argv[1])
-out = sys.argv[2]
-query = sys.argv[3]
-with open(out, "w") as f:
-    f.write("CREATE TABLE bench_analytical(id INTEGER NOT NULL, x INTEGER);\n")
-    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
-    for ch in chunks:
-        rows = ",".join(f"({j},{j * 10})" for j in ch)
-        f.write(f"INSERT INTO bench_analytical(id,x) VALUES {rows};\n")
-    # Timed query — emits a scalar result the CLI drains.
-    f.write(query + "\n")
+query = sys.argv[2]
+n_iters = int(sys.argv[3])
+
+con = sqlite3.connect(":memory:", isolation_level=None)
+con.execute("PRAGMA journal_mode=MEMORY;")
+con.execute("PRAGMA synchronous=OFF;")
+con.execute("PRAGMA temp_store=MEMORY;")
+con.execute("CREATE TABLE bench_analytical(id INTEGER NOT NULL, x INTEGER);")
+con.execute("BEGIN;")
+con.executemany(
+    "INSERT INTO bench_analytical(id,x) VALUES (?, ?);",
+    [(j, j * 10) for j in range(n)],
+)
+con.execute("COMMIT;")
+
+for _ in range(2):
+    con.execute(query).fetchall()
+
+for _ in range(n_iters):
+    t0 = time.perf_counter()
+    rows = con.execute(query).fetchall()
+    t1 = time.perf_counter()
+    if not rows:
+        sys.stderr.write("run_analytical: empty result set\n")
+    print((t1 - t0) * 1e6)
 PYEOF
+)"
 
-    local preload_sql
-    preload_sql="$(mktemp /tmp/sqlite_analytical_preload_XXXX.sql)"
-    python3 - "$n_rows" "$preload_sql" <<'PYEOF'
-import sys
-n = int(sys.argv[1])
-out = sys.argv[2]
-with open(out, "w") as f:
-    f.write("CREATE TABLE bench_analytical(id INTEGER NOT NULL, x INTEGER);\n")
-    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
-    for ch in chunks:
-        rows = ",".join(f"({j},{j * 10})" for j in ch)
-        f.write(f"INSERT INTO bench_analytical(id,x) VALUES {rows};\n")
-PYEOF
-
-    local samples_full=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$scan_sql" | sqlite3 :memory: >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_full+=("$dt")
-    done
-
-    local samples_preload=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        printf '%s\n' "$SQLITE_PREAMBLE" | cat - "$preload_sql" | sqlite3 :memory: >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_preload+=("$dt")
-    done
-
-    rm -f "$scan_sql" "$preload_sql"
-
-    local preload_median
-    preload_median="$(compute_median "${samples_preload[@]}")"
     local samples=()
-    for dt_full in "${samples_full[@]}"; do
-        local net
-        net="$(python3 -c "v = $dt_full - $preload_median; print(max(v, 1.0))")"
-        samples+=("$net")
-    done
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        samples+=("$line")
+    done <<< "$samples_raw"
 
     local median_us
     median_us="$(compute_median "${samples[@]}")"

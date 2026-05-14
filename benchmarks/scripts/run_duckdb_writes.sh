@@ -142,90 +142,53 @@ run_update() {
     local wl="update_throughput_10k"
     echo "  workload: ${wl}"
 
-    # Generate a pre-load + update script.
-    local update_sql
-    update_sql="$(mktemp /tmp/duckdb_update_XXXX.sql)"
-    python3 - "$N_ROWS" "$update_sql" <<'PYEOF'
-import sys, random
+    # Persistent in-process connection via the duckdb Python driver:
+    # preload N_ROWS once outside the timed region, then per iteration
+    # time `BEGIN; UPDATE all rows; ROLLBACK;` — the rollback restores
+    # the row image after each timed sample so every iteration measures
+    # the same amount of work against the same starting state.
+    local samples_raw
+    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" <<'PYEOF'
+import sys, time, random
+import duckdb
+
 n = int(sys.argv[1])
-out = sys.argv[2]
+n_iters = int(sys.argv[2])
+
 rng = random.Random(0xC0FFEE)
 ids = list(range(n))
 rng.shuffle(ids)
-vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
-with open(out, "w") as f:
-    # Preload
-    f.write("CREATE OR REPLACE TABLE bench_write(id BIGINT PRIMARY KEY, val BIGINT);\n")
-    chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-    vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
-    for ch, vc in zip(chunks, vchunks):
-        rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
-        f.write(f"INSERT INTO bench_write(id,val) VALUES {rows};\n")
-    # Timed UPDATE (DuckDB :memory: times the whole script; we measure
-    # externally to separate preload from measured work).
-    f.write("BEGIN TRANSACTION;\n")
-    f.write(f"UPDATE bench_write SET val = val + 1 WHERE id BETWEEN 0 AND {n-1};\n")
-    f.write("COMMIT;\n")
+vals = [rng.randint(-(2**31), 2**31 - 1) for _ in range(n)]
+
+con = duckdb.connect(":memory:")
+con.execute("CREATE TABLE bench_write(id BIGINT PRIMARY KEY, val BIGINT);")
+for chunk_start in range(0, n, 1000):
+    rows = ",".join(
+        f"({ids[i]},{vals[i]})"
+        for i in range(chunk_start, min(chunk_start + 1000, n))
+    )
+    con.execute(f"INSERT INTO bench_write(id,val) VALUES {rows};")
+
+for _ in range(2):
+    con.execute("BEGIN TRANSACTION;")
+    con.execute(f"UPDATE bench_write SET val = val + 1 WHERE id BETWEEN 0 AND {n-1};")
+    con.execute("ROLLBACK;")
+
+for _ in range(n_iters):
+    con.execute("BEGIN TRANSACTION;")
+    t0 = time.perf_counter()
+    con.execute(f"UPDATE bench_write SET val = val + 1 WHERE id BETWEEN 0 AND {n-1};")
+    t1 = time.perf_counter()
+    con.execute("ROLLBACK;")
+    print((t1 - t0) * 1e6)
 PYEOF
+)"
 
-    # We need to separate preload cost from update cost.
-    # Strategy: build the DB with preload in a tempfile, then feed a tiny
-    # update-only script against it via stdin. DuckDB :memory: resets on
-    # each invocation, so we measure the full CREATE + INSERT + UPDATE
-    # and subtract the preload baseline measured separately.
-
-    # Measure full script (preload + update).
-    local samples_full=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        duckdb :memory: < "$update_sql" >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_full+=("$dt")
-    done
-
-    # Measure preload-only baseline.
-    local preload_sql
-    preload_sql="$(mktemp /tmp/duckdb_preload_XXXX.sql)"
-    python3 - "$N_ROWS" "$preload_sql" <<'PYEOF'
-import sys, random
-n = int(sys.argv[1])
-out = sys.argv[2]
-rng = random.Random(0xC0FFEE)
-ids = list(range(n))
-rng.shuffle(ids)
-vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
-with open(out, "w") as f:
-    f.write("CREATE OR REPLACE TABLE bench_write(id BIGINT PRIMARY KEY, val BIGINT);\n")
-    chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-    vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
-    for ch, vc in zip(chunks, vchunks):
-        rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
-        f.write(f"INSERT INTO bench_write(id,val) VALUES {rows};\n")
-PYEOF
-
-    local samples_preload=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        duckdb :memory: < "$preload_sql" >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_preload+=("$dt")
-    done
-
-    rm -f "$update_sql" "$preload_sql"
-
-    # Net samples: full - preload median subtracted per-sample.
-    local preload_median
-    preload_median="$(compute_median "${samples_preload[@]}")"
     local samples=()
-    for dt_full in "${samples_full[@]}"; do
-        local net
-        net="$(python3 -c "v = $dt_full - $preload_median; print(max(v, 1.0))")"
-        samples+=("$net")
-    done
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        samples+=("$line")
+    done <<< "$samples_raw"
 
     local median_us
     median_us="$(compute_median "${samples[@]}")"
@@ -241,79 +204,53 @@ run_delete() {
     local wl="delete_throughput_10k"
     echo "  workload: ${wl}"
 
-    # Generate a preload + delete script.
-    local delete_sql
-    delete_sql="$(mktemp /tmp/duckdb_delete_XXXX.sql)"
-    python3 - "$N_ROWS" "$delete_sql" <<'PYEOF'
-import sys, random
+    # Persistent in-process connection via the duckdb Python driver:
+    # preload N_ROWS once outside the timed region, then per iteration
+    # time `BEGIN; DELETE all rows; ROLLBACK;` — the rollback restores
+    # the table so each iteration measures the same DELETE work against
+    # the same starting state. Avoids the subtract-two-process timing.
+    local samples_raw
+    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" <<'PYEOF'
+import sys, time, random
+import duckdb
+
 n = int(sys.argv[1])
-out = sys.argv[2]
+n_iters = int(sys.argv[2])
+
 rng = random.Random(0xC0FFEE)
 ids = list(range(n))
 rng.shuffle(ids)
-vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
-with open(out, "w") as f:
-    f.write("CREATE OR REPLACE TABLE bench_write(id BIGINT PRIMARY KEY, val BIGINT);\n")
-    chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-    vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
-    for ch, vc in zip(chunks, vchunks):
-        rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
-        f.write(f"INSERT INTO bench_write(id,val) VALUES {rows};\n")
-    f.write("BEGIN TRANSACTION;\n")
-    f.write(f"DELETE FROM bench_write WHERE id BETWEEN 0 AND {n-1};\n")
-    f.write("COMMIT;\n")
+vals = [rng.randint(-(2**31), 2**31 - 1) for _ in range(n)]
+
+con = duckdb.connect(":memory:")
+con.execute("CREATE TABLE bench_write(id BIGINT PRIMARY KEY, val BIGINT);")
+for chunk_start in range(0, n, 1000):
+    rows = ",".join(
+        f"({ids[i]},{vals[i]})"
+        for i in range(chunk_start, min(chunk_start + 1000, n))
+    )
+    con.execute(f"INSERT INTO bench_write(id,val) VALUES {rows};")
+
+for _ in range(2):
+    con.execute("BEGIN TRANSACTION;")
+    con.execute(f"DELETE FROM bench_write WHERE id BETWEEN 0 AND {n-1};")
+    con.execute("ROLLBACK;")
+
+for _ in range(n_iters):
+    con.execute("BEGIN TRANSACTION;")
+    t0 = time.perf_counter()
+    con.execute(f"DELETE FROM bench_write WHERE id BETWEEN 0 AND {n-1};")
+    t1 = time.perf_counter()
+    con.execute("ROLLBACK;")
+    print((t1 - t0) * 1e6)
 PYEOF
+)"
 
-    # Measure preload baseline separately (same approach as update).
-    local preload_sql
-    preload_sql="$(mktemp /tmp/duckdb_preload2_XXXX.sql)"
-    python3 - "$N_ROWS" "$preload_sql" <<'PYEOF'
-import sys, random
-n = int(sys.argv[1])
-out = sys.argv[2]
-rng = random.Random(0xC0FFEE)
-ids = list(range(n))
-rng.shuffle(ids)
-vals = [rng.randint(-2**31, 2**31-1) for _ in range(n)]
-with open(out, "w") as f:
-    f.write("CREATE OR REPLACE TABLE bench_write(id BIGINT PRIMARY KEY, val BIGINT);\n")
-    chunks = [ids[i:i+1000] for i in range(0, n, 1000)]
-    vchunks = [vals[i:i+1000] for i in range(0, n, 1000)]
-    for ch, vc in zip(chunks, vchunks):
-        rows = ",".join(f"({i},{v})" for i, v in zip(ch, vc))
-        f.write(f"INSERT INTO bench_write(id,val) VALUES {rows};\n")
-PYEOF
-
-    local samples_full=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        duckdb :memory: < "$delete_sql" >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_full+=("$dt")
-    done
-
-    local samples_preload=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        duckdb :memory: < "$preload_sql" >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_preload+=("$dt")
-    done
-
-    rm -f "$delete_sql" "$preload_sql"
-
-    local preload_median
-    preload_median="$(compute_median "${samples_preload[@]}")"
     local samples=()
-    for dt_full in "${samples_full[@]}"; do
-        local net
-        net="$(python3 -c "v = $dt_full - $preload_median; print(max(v, 1.0))")"
-        samples+=("$net")
-    done
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        samples+=("$line")
+    done <<< "$samples_raw"
 
     local median_us
     median_us="$(compute_median "${samples[@]}")"
@@ -410,70 +347,44 @@ run_select_scan() {
     local wl="select_scan_10k"
     echo "  workload: ${wl}"
 
-    # DuckDB :memory: is stateless per invocation; preload + scan in the same
-    # script and subtract the preload-only baseline, matching the strategy
-    # used by run_update / run_delete above.
+    # Persistent in-process connection via the duckdb Python driver:
+    # preload N_ROWS once outside the timed region, then time a full
+    # `SELECT id, val FROM bench_select_scan` that drains every row via
+    # `fetchall()`. Avoids the subtract-two-process methodology that
+    # clamped fast scans against `max(v, 1.0)`.
+    local samples_raw
+    samples_raw="$(python3 - "$N_ROWS" "$N_ITERS" <<'PYEOF'
+import sys, time
+import duckdb
 
-    local scan_sql
-    scan_sql="$(mktemp /tmp/duckdb_select_scan_XXXX.sql)"
-    python3 - "$N_ROWS" "$scan_sql" <<'PYEOF'
-import sys
 n = int(sys.argv[1])
-out = sys.argv[2]
-with open(out, "w") as f:
-    f.write("CREATE OR REPLACE TABLE bench_select_scan(id INTEGER NOT NULL, val INTEGER);\n")
-    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
-    for ch in chunks:
-        rows = ",".join(f"({j},{j * 10})" for j in ch)
-        f.write(f"INSERT INTO bench_select_scan(id,val) VALUES {rows};\n")
-    # Timed SELECT — emit all rows so the CLI drains the full result set.
-    f.write("SELECT id, val FROM bench_select_scan;\n")
+n_iters = int(sys.argv[2])
+
+con = duckdb.connect(":memory:")
+con.execute("CREATE TABLE bench_select_scan(id INTEGER NOT NULL, val INTEGER);")
+chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
+for ch in chunks:
+    rows = ",".join(f"({j},{j * 10})" for j in ch)
+    con.execute(f"INSERT INTO bench_select_scan(id,val) VALUES {rows};")
+
+for _ in range(2):
+    con.execute("SELECT id, val FROM bench_select_scan;").fetchall()
+
+for _ in range(n_iters):
+    t0 = time.perf_counter()
+    rows = con.execute("SELECT id, val FROM bench_select_scan;").fetchall()
+    t1 = time.perf_counter()
+    if len(rows) != n:
+        sys.stderr.write(f"run_select_scan: row mismatch (got {len(rows)}, expected {n})\n")
+    print((t1 - t0) * 1e6)
 PYEOF
+)"
 
-    local preload_sql
-    preload_sql="$(mktemp /tmp/duckdb_select_preload_XXXX.sql)"
-    python3 - "$N_ROWS" "$preload_sql" <<'PYEOF'
-import sys
-n = int(sys.argv[1])
-out = sys.argv[2]
-with open(out, "w") as f:
-    f.write("CREATE OR REPLACE TABLE bench_select_scan(id INTEGER NOT NULL, val INTEGER);\n")
-    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
-    for ch in chunks:
-        rows = ",".join(f"({j},{j * 10})" for j in ch)
-        f.write(f"INSERT INTO bench_select_scan(id,val) VALUES {rows};\n")
-PYEOF
-
-    local samples_full=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        duckdb :memory: < "$scan_sql" >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_full+=("$dt")
-    done
-
-    local samples_preload=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        duckdb :memory: < "$preload_sql" >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_preload+=("$dt")
-    done
-
-    rm -f "$scan_sql" "$preload_sql"
-
-    local preload_median
-    preload_median="$(compute_median "${samples_preload[@]}")"
     local samples=()
-    for dt_full in "${samples_full[@]}"; do
-        local net
-        net="$(python3 -c "v = $dt_full - $preload_median; print(max(v, 1.0))")"
-        samples+=("$net")
-    done
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        samples+=("$line")
+    done <<< "$samples_raw"
 
     local median_us
     median_us="$(compute_median "${samples[@]}")"
@@ -485,9 +396,16 @@ PYEOF
 # ---------------------------------------------------------------------------
 # Helper: run a SELECT against bench_analytical with the given query.
 # Args: workload_id, n_rows, query_sql
-# DuckDB :memory: is stateless per invocation, so preload + query is timed
-# together and a preload-only baseline is subtracted (same methodology as
-# run_update / run_delete / run_select_scan above).
+# Uses the duckdb Python driver: opens an in-memory connection once, runs
+# the preload outside the timed region, then times the query across
+# N_ITERS iterations with `.fetchall()` to force materialization (DuckDB
+# query objects are lazy until consumed).
+#
+# Older methodology launched `duckdb :memory:` per iteration, timed
+# preload+query, then subtracted a preload-only baseline. Sub-millisecond
+# queries had `full - preload_median` swing negative and got clamped to
+# `max(v, 1.0)`, reporting a 1.0 µs floor that was harness noise, not
+# DuckDB performance.
 # ---------------------------------------------------------------------------
 run_analytical() {
     local wl="$1"
@@ -495,66 +413,42 @@ run_analytical() {
     local query="$3"
     echo "  workload: ${wl} (n_rows=${n_rows})"
 
-    local scan_sql
-    scan_sql="$(mktemp /tmp/duckdb_analytical_XXXX.sql)"
-    python3 - "$n_rows" "$scan_sql" "$query" <<'PYEOF'
-import sys
+    local samples_raw
+    samples_raw="$(python3 - "$n_rows" "$query" "$N_ITERS" <<'PYEOF'
+import sys, time
+import duckdb
+
 n = int(sys.argv[1])
-out = sys.argv[2]
-query = sys.argv[3]
-with open(out, "w") as f:
-    f.write("CREATE OR REPLACE TABLE bench_analytical(id INTEGER NOT NULL, x INTEGER);\n")
-    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
-    for ch in chunks:
-        rows = ",".join(f"({j},{j * 10})" for j in ch)
-        f.write(f"INSERT INTO bench_analytical(id,x) VALUES {rows};\n")
-    f.write(query + "\n")
+query = sys.argv[2]
+n_iters = int(sys.argv[3])
+
+con = duckdb.connect(":memory:")
+con.execute("CREATE TABLE bench_analytical(id INTEGER NOT NULL, x INTEGER);")
+# Preload outside the timed region.
+chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
+for ch in chunks:
+    rows = ",".join(f"({j},{j * 10})" for j in ch)
+    con.execute(f"INSERT INTO bench_analytical(id,x) VALUES {rows};")
+
+# Warmup: prime caches, parser, type checks.
+for _ in range(2):
+    con.execute(query).fetchall()
+
+for _ in range(n_iters):
+    t0 = time.perf_counter()
+    rows = con.execute(query).fetchall()
+    t1 = time.perf_counter()
+    if not rows:
+        sys.stderr.write("run_analytical: empty result set\n")
+    print((t1 - t0) * 1e6)
 PYEOF
+)"
 
-    local preload_sql
-    preload_sql="$(mktemp /tmp/duckdb_analytical_preload_XXXX.sql)"
-    python3 - "$n_rows" "$preload_sql" <<'PYEOF'
-import sys
-n = int(sys.argv[1])
-out = sys.argv[2]
-with open(out, "w") as f:
-    f.write("CREATE OR REPLACE TABLE bench_analytical(id INTEGER NOT NULL, x INTEGER);\n")
-    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
-    for ch in chunks:
-        rows = ",".join(f"({j},{j * 10})" for j in ch)
-        f.write(f"INSERT INTO bench_analytical(id,x) VALUES {rows};\n")
-PYEOF
-
-    local samples_full=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        duckdb :memory: < "$scan_sql" >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_full+=("$dt")
-    done
-
-    local samples_preload=()
-    for (( i=0; i<N_ITERS; i++ )); do
-        local t0 t1 dt
-        t0="$(python3 -c 'import time; print(time.perf_counter())')"
-        duckdb :memory: < "$preload_sql" >/dev/null
-        t1="$(python3 -c 'import time; print(time.perf_counter())')"
-        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
-        samples_preload+=("$dt")
-    done
-
-    rm -f "$scan_sql" "$preload_sql"
-
-    local preload_median
-    preload_median="$(compute_median "${samples_preload[@]}")"
     local samples=()
-    for dt_full in "${samples_full[@]}"; do
-        local net
-        net="$(python3 -c "v = $dt_full - $preload_median; print(max(v, 1.0))")"
-        samples+=("$net")
-    done
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        samples+=("$line")
+    done <<< "$samples_raw"
 
     local median_us
     median_us="$(compute_median "${samples[@]}")"
