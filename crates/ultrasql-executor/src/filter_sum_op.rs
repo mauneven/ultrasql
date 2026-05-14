@@ -38,7 +38,7 @@ use ultrasql_storage::column_cache::CachedColumns;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
 use ultrasql_vec::kernels::{
-    CmpOp, cmp_i32_scalar, filter_sum_i32_widening_gt, sum_i32_widening_with_mask,
+    CmpOp, cmp_i32_scalar, filter_sum_i32_widening_gt, sum_i32_widening, sum_i32_widening_with_mask,
 };
 
 use crate::{ExecError, Operator};
@@ -201,6 +201,162 @@ impl Operator for CachedFilterSumI32Scan {
             Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
         } else {
             Column::Int64(NumericColumn::from_data(vec![total]))
+        };
+        let batch = Batch::new([result_col]).map_err(ExecError::from)?;
+        Ok(Some(batch))
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.output_schema
+    }
+}
+
+/// Direct-from-cache pure SUM operator (no filter).
+///
+/// Pipeline lowering wires this when the plan is
+/// `Aggregate { group_by: [], aggregates: [Sum(Int32 col)] }`
+/// over a `Scan` whose relation already has a live column-cache
+/// entry. Runs the hand-NEON `sum_i32_widening` kernel once over
+/// the full cached column — no batch slicing, no per-batch
+/// allocations.
+pub struct CachedSumI32Scan {
+    columns: Arc<CachedColumns>,
+    sum_col: usize,
+    output_schema: Schema,
+    done: bool,
+}
+
+impl std::fmt::Debug for CachedSumI32Scan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedSumI32Scan")
+            .field("sum_col", &self.sum_col)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CachedSumI32Scan {
+    #[must_use]
+    pub fn new(columns: Arc<CachedColumns>, sum_col: usize, output_name: String) -> Self {
+        let output_schema = Schema::new([Field::required(output_name, DataType::Int64)])
+            .expect("output schema is trivially well-formed");
+        Self {
+            columns,
+            sum_col,
+            output_schema,
+            done: false,
+        }
+    }
+}
+
+impl Operator for CachedSumI32Scan {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let col = match &self.columns.columns[self.sum_col] {
+            Column::Int32(c) => c,
+            _ => {
+                return Err(ExecError::TypeMismatch(
+                    "CachedSumI32Scan: sum column must be Int32".to_owned(),
+                ));
+            }
+        };
+        let n_rows = col.len();
+        let total = sum_i32_widening(col);
+        let result_col = if n_rows == 0 {
+            let mut nulls = ultrasql_vec::Bitmap::new(1, false);
+            nulls.set(0, false);
+            Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+        } else {
+            Column::Int64(NumericColumn::from_data(vec![total]))
+        };
+        let batch = Batch::new([result_col]).map_err(ExecError::from)?;
+        Ok(Some(batch))
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.output_schema
+    }
+}
+
+/// Direct-from-cache pure AVG operator (no filter).
+///
+/// Computes `Float64(sum_i32_widening(col)) / count(non_null)`
+/// over the full cached column in a single kernel pass + a
+/// scalar divide. Output schema is `[("avg", Float64)]`.
+pub struct CachedAvgI32Scan {
+    columns: Arc<CachedColumns>,
+    sum_col: usize,
+    output_schema: Schema,
+    done: bool,
+}
+
+impl std::fmt::Debug for CachedAvgI32Scan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedAvgI32Scan")
+            .field("sum_col", &self.sum_col)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CachedAvgI32Scan {
+    #[must_use]
+    pub fn new(columns: Arc<CachedColumns>, sum_col: usize, output_name: String) -> Self {
+        let output_schema = Schema::new([Field::required(output_name, DataType::Float64)])
+            .expect("output schema is trivially well-formed");
+        Self {
+            columns,
+            sum_col,
+            output_schema,
+            done: false,
+        }
+    }
+}
+
+impl Operator for CachedAvgI32Scan {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let col = match &self.columns.columns[self.sum_col] {
+            Column::Int32(c) => c,
+            _ => {
+                return Err(ExecError::TypeMismatch(
+                    "CachedAvgI32Scan: sum column must be Int32".to_owned(),
+                ));
+            }
+        };
+        let n_rows = col.len();
+        // Count non-null entries. Our cached columns currently
+        // never carry a null bitmap (only non-nullable columns
+        // are cached for now), so this is always `n_rows`.
+        let non_null = col.nulls().map_or(n_rows, |bm| {
+            let mut c = 0_usize;
+            for i in 0..bm.len() {
+                if bm.get(i) {
+                    c += 1;
+                }
+            }
+            c
+        });
+        let result_col = if non_null == 0 {
+            let mut nulls = ultrasql_vec::Bitmap::new(1, false);
+            nulls.set(0, false);
+            Column::Float64(
+                NumericColumn::with_nulls(vec![0.0_f64], nulls).expect("matching lengths"),
+            )
+        } else {
+            let total = sum_i32_widening(col);
+            // Cast through f64 once; matches PostgreSQL's
+            // `AVG(int) → float8` widening rule under the bench's
+            // schema (the binder declares the aggregate's result
+            // type as Float64).
+            let avg = (total as f64) / (non_null as f64);
+            Column::Float64(NumericColumn::from_data(vec![avg]))
         };
         let batch = Batch::new([result_col]).map_err(ExecError::from)?;
         Ok(Some(batch))

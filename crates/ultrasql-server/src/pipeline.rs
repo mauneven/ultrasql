@@ -54,7 +54,9 @@ use std::sync::Arc;
 
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
-use ultrasql_executor::filter_sum_op::{CachedFilterSumI32Scan, FilterSumI32Scan};
+use ultrasql_executor::filter_sum_op::{
+    CachedAvgI32Scan, CachedFilterSumI32Scan, CachedSumI32Scan, FilterSumI32Scan,
+};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
     CteScan, Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan,
@@ -724,6 +726,15 @@ pub fn lower_query(
             if let Some(fused) = try_lower_fused_filter_sum_i32(input, group_by, aggregates, ctx)? {
                 return Ok(fused);
             }
+            // Fast path: pure `SELECT SUM(col_i32) FROM t` /
+            // `SELECT AVG(col_i32) FROM t` over a cache-live
+            // relation. Reads the cached column directly through
+            // the hand-NEON kernel — no SeqScan batch slicing.
+            if let Some(direct) =
+                try_lower_cached_scalar_aggregate_i32(input, group_by, aggregates, ctx)?
+            {
+                return Ok(direct);
+            }
             // Mirror `ultrasql_executor::physical::build_operator` — default
             // to a hash-based aggregate. The child is lowered recursively
             // through this same real-heap-aware path so the aggregate can
@@ -1087,6 +1098,85 @@ fn shift_column_indices(expr: &ScalarExpr, by: usize) -> ScalarExpr {
 /// assignment **target** column indices stay un-shifted because
 /// `apply_update` re-indexes them against the relation schema, not the
 /// child batch shape.
+
+/// Try to lower pure-scalar SUM or AVG over an `Int32` column on a
+/// cache-live relation into [`CachedSumI32Scan`] /
+/// [`CachedAvgI32Scan`].
+///
+/// Matches:
+///
+/// ```text
+///     Aggregate { group_by: [], aggregates: [Sum(Column { col, Int32 })] }
+///       └── Scan { table }
+/// ```
+///
+/// (or `Avg` instead of `Sum`) and the relation already has a
+/// live entry in `HeapAccess::column_cache`. Returns `Ok(None)`
+/// when the shape does not match or the cache is empty — caller
+/// falls through to the generic `HashAggregate(SeqScan)` chain
+/// which populates the cache as a side effect of its first walk.
+fn try_lower_cached_scalar_aggregate_i32(
+    input: &LogicalPlan,
+    group_by: &[ScalarExpr],
+    aggregates: &[ultrasql_planner::LogicalAggregateExpr],
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    use ultrasql_planner::AggregateFunc;
+
+    if !group_by.is_empty() || aggregates.len() != 1 {
+        return Ok(None);
+    }
+    let agg = &aggregates[0];
+    if agg.distinct {
+        return Ok(None);
+    }
+    let target_col = match &agg.arg {
+        Some(ScalarExpr::Column {
+            index,
+            data_type: ultrasql_core::DataType::Int32,
+            ..
+        }) => *index,
+        _ => return Ok(None),
+    };
+
+    let LogicalPlan::Scan { table, .. } = input else {
+        return Ok(None);
+    };
+    let folded = table.to_ascii_lowercase();
+    let entry = match ctx.catalog_snapshot.tables.get(&folded) {
+        Some(entry) => entry,
+        None => return Ok(None),
+    };
+    if target_col >= entry.schema.len()
+        || !matches!(
+            entry.schema.field_at(target_col).data_type,
+            ultrasql_core::DataType::Int32
+        )
+    {
+        return Ok(None);
+    }
+
+    let rel_id = RelationId(entry.oid);
+    let Some(columns) = ctx.heap.column_cache.get(rel_id) else {
+        return Ok(None);
+    };
+
+    let op: Box<dyn Operator> = match agg.func {
+        AggregateFunc::Sum => Box::new(CachedSumI32Scan::new(
+            columns,
+            target_col,
+            agg.output_name.clone(),
+        )),
+        AggregateFunc::Avg => Box::new(CachedAvgI32Scan::new(
+            columns,
+            target_col,
+            agg.output_name.clone(),
+        )),
+        _ => return Ok(None),
+    };
+    Ok(Some(op))
+}
+
 /// Try to lower
 ///
 /// ```text
