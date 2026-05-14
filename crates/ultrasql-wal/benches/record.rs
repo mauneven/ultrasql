@@ -8,6 +8,9 @@ const PAYLOAD_SIZES: &[usize] = &[0_usize, 64, 256, 1024, 4096];
 
 fn bench_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal/encode");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &n in PAYLOAD_SIZES {
         let payload = vec![0xAAu8; n];
         let rec = WalRecord::new(
@@ -30,6 +33,9 @@ fn bench_encode(c: &mut Criterion) {
 
 fn bench_decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal/decode");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &n in PAYLOAD_SIZES {
         let payload = vec![0x55u8; n];
         let rec = WalRecord::new(
@@ -53,6 +59,9 @@ fn bench_decode(c: &mut Criterion) {
 
 fn bench_buffer_append(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal/buffer_append");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &n in &[64_usize, 256, 1024] {
         let payload = vec![0xFFu8; n];
         let rec = WalRecord::new(RecordType::HeapInsert, Xid::new(1), Lsn::ZERO, 0, payload);

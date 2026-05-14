@@ -18,6 +18,9 @@ const SIZES: &[usize] = &[64, 1_024, 4_096, 65_536];
 
 fn bench_eq_i32(c: &mut Criterion) {
     let mut group = c.benchmark_group("vec/eq_i32");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &n in SIZES {
         let a = NumericColumn::from_data((0..n as i32).collect());
         let b = NumericColumn::from_data((0..n as i32).map(|x| x ^ (x & 1)).collect());
@@ -34,6 +37,9 @@ fn bench_eq_i32(c: &mut Criterion) {
 
 fn bench_sum_i64(c: &mut Criterion) {
     let mut group = c.benchmark_group("vec/sum_i64");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &n in SIZES {
         let col = NumericColumn::from_data((0..n as i64).collect());
         group.throughput(Throughput::Elements(n as u64));
@@ -49,6 +55,9 @@ fn bench_sum_i64(c: &mut Criterion) {
 
 fn bench_min_f64(c: &mut Criterion) {
     let mut group = c.benchmark_group("vec/min_f64");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &n in SIZES {
         let col = NumericColumn::from_data((0..n).map(|i| f64::from(i as i32) * 0.5_f64).collect());
         group.throughput(Throughput::Elements(n as u64));
@@ -64,6 +73,9 @@ fn bench_min_f64(c: &mut Criterion) {
 
 fn bench_select_i32(c: &mut Criterion) {
     let mut group = c.benchmark_group("vec/select_i32");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &n in SIZES {
         let col = NumericColumn::from_data((0..n as i32).collect());
         // 50% selectivity (every other row).

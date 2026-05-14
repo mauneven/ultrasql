@@ -27,6 +27,9 @@ fn bench_ssi_via_txn_manager(c: &mut Criterion) {
     const N: u64 = 500;
 
     let mut group = c.benchmark_group("ssi_via_txn_manager");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
 
     // Variant 1: no conflicts.
     group.bench_function(BenchmarkId::new("no_contention", N), |b| {
@@ -104,6 +107,9 @@ fn bench_for_update_acquire_release(c: &mut Criterion) {
     let tid = TupleId::new(PageId::new(RelationId::new(1), BlockNumber::new(0)), 0);
 
     let mut group = c.benchmark_group("row_lock");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
 
     group.bench_function("for_update_acquire_release_no_contention", |b| {
         let mut xid_counter: u64 = 1;

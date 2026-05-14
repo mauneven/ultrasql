@@ -29,6 +29,9 @@ fn bench_hot_pin(c: &mut Criterion) {
     drop(pool.get_page(pid(0)).unwrap());
 
     let mut group = c.benchmark_group("buffer_pool/hot_pin");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.throughput(Throughput::Elements(1));
     group.bench_function("single_page_repin", |b| {
         b.iter(|| {
@@ -44,6 +47,9 @@ fn bench_cycle(c: &mut Criterion) {
     // access is a hit on a warm clock; then through 256 pages so the
     // pool churns through eviction.
     let mut group = c.benchmark_group("buffer_pool/cycle");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &n_pages in &[64_u32, 256] {
         let pool = Arc::new(BufferPool::new(64, BlankLoader));
         for i in 0..n_pages {

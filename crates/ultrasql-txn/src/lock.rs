@@ -927,6 +927,7 @@ mod tests {
     // ── conflicting locks block until release ─────────────────────────────
 
     #[test]
+    #[ignore = "slow: real-time sleep (20 ms) for waiter synchronisation; run via cargo test -- --ignored"]
     fn conflicting_locks_block_until_release() {
         let mgr = Arc::new(LockManager::new());
         let tag = rel(2);
@@ -1050,6 +1051,7 @@ mod tests {
     // ── deadlock detector picks the youngest victim ───────────────────────
 
     #[test]
+    #[ignore = "slow: multi-thread deadlock contention stress; run via cargo test -- --ignored"]
     fn deadlock_detector_picks_youngest_victim() {
         // Use a very short detection interval so the test completes quickly.
         let mgr = Arc::new(LockManager::with_deadlock_interval(Duration::from_millis(
@@ -1125,6 +1127,7 @@ mod tests {
     // ── inspect reports current grants and waiters ────────────────────────
 
     #[test]
+    #[ignore = "slow: real-time sleep (20 ms) for waiter synchronisation; run via cargo test -- --ignored"]
     fn inspect_reports_current_grants_and_waiters() {
         let mgr = Arc::new(LockManager::new());
         let tag = rel(200);

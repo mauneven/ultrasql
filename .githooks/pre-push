@@ -5,11 +5,26 @@
 #
 # Mirrors .github/workflows/ci.yml. If a new CI gate lands, add it here.
 #
-# Regression gate escape hatch:
-#   ULTRASQL_SKIP_BENCH=1 git push
+# Gate order (optimised for fast failure):
+#   1. cargo fmt --all -- --check          (~1 s)
+#   2. cargo clippy (lib tests only)       (~30 s after first compile)
+#   3. cargo test --lib                    (lib tests only; skip integration)
+#   4. cargo doc (strict)                  (~20 s)
+#   5. cargo deny check advisories         (skip bans/licenses/sources — CI handles them)
+#   6. regression-gate --smoke             (~5 s, "did it crash?" only)
 #
-# This skips the regression gate for documentation-only commits. The gate
-# is also automatically skipped when only .md / docs/** files changed.
+# Full suite (integration tests + full deny + full bench) is run by CI on merge.
+# Before promoting a perf-sensitive commit run `make bench-full` locally.
+#
+# Pre-push escape hatches:
+#   ULTRASQL_SKIP_BENCH=1 git push
+#     Skips the regression gate.  Allowed ONLY for documentation-only commits.
+#   --no-verify
+#     Bypasses ALL gates.  Use only when you know what you are doing.
+#
+# Auto-skip conditions (no escape hatch needed):
+#   - Only .md / docs/** files changed  → regression gate skipped.
+#   - Only benches/** or benchmarks/results/latest/** changed  → regression gate skipped.
 
 set -e -o pipefail
 
@@ -24,75 +39,90 @@ if ! command -v cargo >/dev/null 2>&1; then
     fi
 fi
 
+# Maximise parallelism so cargo phases don't serialize unnecessarily.
+export CARGO_BUILD_JOBS
+CARGO_BUILD_JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+
 step() {
     printf "\n\033[1m== %s ==\033[0m\n" "$1"
 }
 
+# ── 1. Format ────────────────────────────────────────────────────────────────
+
 step "cargo fmt --all -- --check"
 cargo fmt --all -- --check
 
+# ── 2. Clippy ────────────────────────────────────────────────────────────────
+
 step "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# ── 3. Tests (lib only; integration tests run in CI) ─────────────────────────
+#
+# Using --lib skips the slower integration test binaries in tests/ while still
+# exercising all #[test] items embedded inside crate source files.
+
+step "cargo test --workspace --all-features --lib"
+cargo test --workspace --all-features --lib
+
+# ── 4. Docs ──────────────────────────────────────────────────────────────────
 
 step "cargo doc --workspace --all-features --no-deps  (strict)"
 RUSTDOCFLAGS="-D warnings -D rustdoc::broken-intra-doc-links" \
     cargo doc --workspace --all-features --no-deps
 
+# ── 5. cargo-deny (advisories only; bans/licenses/sources in CI) ─────────────
+
 if command -v cargo-deny >/dev/null 2>&1; then
-    step "cargo deny check advisories bans licenses sources"
-    cargo deny check advisories bans licenses sources
+    step "cargo deny check advisories"
+    cargo deny check advisories
 else
     printf "\n\033[1;33m== cargo-deny not installed locally — skipped. brew install cargo-deny ==\033[0m\n"
 fi
 
-step "cargo test --workspace --all-features"
-cargo test --workspace --all-features
-
-# ---------------------------------------------------------------------------
-# Regression gate
-# ---------------------------------------------------------------------------
+# ── 6. Regression gate ───────────────────────────────────────────────────────
 #
-# Detects whether the push includes any non-documentation file changes. If
-# only .md files or docs/** changed the gate is skipped to avoid making
-# documentation PRs expensive.
+# Detects whether the push includes any non-documentation / non-bench file
+# changes. Skips the gate when:
+#   a) ULTRASQL_SKIP_BENCH=1 is set in the environment.
+#   b) Every changed file is docs-only (.md, docs/**).
+#   c) Every changed file is bench-only (benches/**, benchmarks/results/latest/**).
 #
-# Full skip: ULTRASQL_SKIP_BENCH=1 git push
-#   Allowed ONLY for documentation-only commits. Using this on a source
-#   change is a policy violation; the CI bench job will catch it anyway.
+# Pre-push uses --smoke (1 iteration, no competitor-floor checks, ≤ 5 s).
+# Full sweep: make bench-full
 
-step "regression gate (benchmark regression + competitor floor check)"
+step "regression gate (smoke — crash check only)"
 
-_run_regression_gate() {
+_run_regression_gate_smoke() {
     cargo run --release --package ultrasql-bench --bin regression-gate -- \
         --stage current \
-        --iterations 5 \
-        --warmup 1
+        --smoke
 }
 
 _changed_files() {
     # List files changed between the remote tip and the local HEAD.
     # On a brand-new branch or before the first push, compare against the
     # merge-base with main; fall back to HEAD~1 when that fails.
-    local remote_ref
-    # Read the remote tip SHA from the hook's stdin (format: <local ref> <local sha> <remote ref> <remote sha>)
-    # We use git diff-tree against the recorded remote sha when available.
     if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
         git diff --name-only HEAD~1 HEAD 2>/dev/null || true
     fi
 }
 
-_is_docs_only() {
+_is_gate_skip_only() {
+    # Return 0 (true) when EVERY changed file matches the skip pattern:
+    #   .md files, docs/**, benches/**, benchmarks/results/latest/**
     local changed
     changed=$(_changed_files)
     if [ -z "$changed" ]; then
         # No detectable diff — be conservative and run the gate.
         return 1
     fi
-    # Return 0 (true) only when EVERY changed file is docs-only.
     while IFS= read -r f; do
         case "$f" in
-            *.md | docs/* | docs\\*) ;;  # docs-only file: continue
-            *) return 1 ;;               # source file found: not docs-only
+            *.md | docs/* | docs\\*) ;;                          # docs-only
+            */benches/* | benches/*)  ;;                         # bench source
+            benchmarks/results/latest/*) ;;                      # bench results
+            *) return 1 ;;                                       # source file
         esac
     done <<< "$changed"
     return 0
@@ -102,23 +132,18 @@ if [ -n "${ULTRASQL_SKIP_BENCH:-}" ]; then
     printf "\n\033[1;33m== regression gate skipped (ULTRASQL_SKIP_BENCH set) ==\033[0m\n"
     printf "   NOTE: allowed only for documentation-only commits.\n"
     printf "   The CI bench job will enforce the gate on the remote.\n"
-elif _is_docs_only; then
-    printf "\n\033[1;33m== regression gate skipped (docs-only diff detected) ==\033[0m\n"
+elif _is_gate_skip_only; then
+    printf "\n\033[1;33m== regression gate skipped (docs/bench-only diff detected) ==\033[0m\n"
 else
-    _run_regression_gate
+    _run_regression_gate_smoke
 fi
 
-# ---------------------------------------------------------------------------
-# Parser fuzz smoke (15 s, nightly only)
-# ---------------------------------------------------------------------------
+# ── 7. Parser fuzz smoke (15 s, nightly only) ────────────────────────────────
 #
 # Runs the parser_fuzz target for a short wall-clock budget to catch
 # obvious panics before they reach CI. Skipped silently when:
 #   - no nightly toolchain is installed, or
 #   - cargo-fuzz is not installed.
-#
-# This is a smoke check only; the full 24h CI-clean gate required by
-# ROADMAP §"v0.2" runs in CI, not here.
 
 if rustup toolchain list 2>/dev/null | grep -q '^nightly'; then
     step "parser fuzz smoke (15s)"

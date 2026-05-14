@@ -25,6 +25,9 @@ fn bench_ssi_commit_throughput(c: &mut Criterion) {
     const N: u64 = 1_000;
 
     let mut group = c.benchmark_group("ssi");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.bench_function(BenchmarkId::new("commit_throughput", N), |b| {
         b.iter(|| {
             let mgr = SsiManager::new();
@@ -77,6 +80,9 @@ fn bench_savepoint_depth_100(c: &mut Criterion) {
     const DEPTH: u64 = 100;
 
     let mut group = c.benchmark_group("savepoint");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.bench_function(BenchmarkId::new("set_and_release_depth", DEPTH), |b| {
         b.iter(|| {
             let parent_xid = Xid::new(1);
@@ -116,6 +122,9 @@ fn bench_2pc_prepare_commit(c: &mut Criterion) {
     let coord = Arc::new(TwoPhaseCoordinator::new(state_dir));
 
     let mut group = c.benchmark_group("two_phase");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.bench_function("prepare_and_commit_prepared", |b| {
         let mut counter: u64 = 1;
         b.iter(|| {

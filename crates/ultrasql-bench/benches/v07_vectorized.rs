@@ -142,6 +142,9 @@ fn bench_seq_scan_filter_1m(c: &mut Criterion) {
     };
 
     let mut group = c.benchmark_group("vec/seq_scan_filter_1m");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.throughput(Throughput::Elements(n_rows as u64));
     group.bench_function("filter_k_eq_42", |b| {
         b.iter(|| {
@@ -173,6 +176,9 @@ fn bench_hash_agg_1m(c: &mut Criterion) {
     .expect("schema ok");
 
     let mut group = c.benchmark_group("vec/hash_agg_sum_count_1m");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.throughput(Throughput::Elements(n_rows as u64));
     group.bench_function("count_star_sum_v", |b| {
         b.iter(|| {
@@ -215,9 +221,11 @@ fn bench_hash_join_100k_x_1m(c: &mut Criterion) {
     .expect("schema ok");
 
     let mut group = c.benchmark_group("vec/hash_join_100k_x_1m");
-    group.throughput(Throughput::Elements(n_probe as u64));
-    // Use sample_size(10) because this benchmark is intentionally heavy
+    // Use sample_size(10) because this benchmark is intentionally heavy.
     group.sample_size(10);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.throughput(Throughput::Elements(n_probe as u64));
     group.bench_function("inner_join_on_k", |b| {
         b.iter(|| {
             let build_scan = MemTableScan::new(build_schema.clone(), build_batches.clone());
@@ -271,6 +279,9 @@ fn bench_dict_filter_vs_raw(c: &mut Criterion) {
     let target_i64 = 0i64;
 
     let mut group = c.benchmark_group("vec/dict_filter_vs_raw");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.throughput(Throughput::Elements(n as u64));
 
     group.bench_function("dict_code_filter", |b| {
@@ -299,6 +310,9 @@ fn bench_filter_eq_i32_simd(c: &mut Criterion) {
     let sizes: &[usize] = &[1_024, 4_096, 65_536, 1_048_576];
 
     let mut group = c.benchmark_group("vec/filter_eq_i32_simd");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &n in sizes {
         let data: Vec<i32> = (0..n as i32).map(|x| x % 100).collect();
         let col = NumericColumn::from_data(data);

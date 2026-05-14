@@ -159,6 +159,9 @@ fn bench_decorrelation(c: &mut Criterion) {
 
     let rule = SubqueryDecorrelation;
     let mut group = c.benchmark_group("optimizer/decorrelation");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.throughput(Throughput::Elements(N));
 
     group.bench_function("exists_1k", |b| {
@@ -181,6 +184,9 @@ fn bench_cse(c: &mut Criterion) {
     let rule = CommonSubExprElimination;
 
     let mut group = c.benchmark_group("optimizer/cse");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.throughput(Throughput::Elements(1));
 
     group.bench_function("hoist_duplicate_subexpr", |b| {
@@ -215,6 +221,9 @@ fn bench_plan_cache(c: &mut Criterion) {
     }
 
     let mut group = c.benchmark_group("optimizer/plan_cache");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.throughput(Throughput::Elements(ITERATIONS));
 
     group.bench_function("hot_cache_10k_lookups", |b| {

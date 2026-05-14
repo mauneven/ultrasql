@@ -41,6 +41,9 @@ const fn rel(n: u32) -> RelationId {
 
 fn bench_toast(c: &mut Criterion) {
     let mut group = c.benchmark_group("toast");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
 
     for &size in &[1024_usize, 100 * 1024, 1024 * 1024] {
         let data: Vec<u8> = (0u8..=255).cycle().take(size).collect();
@@ -90,6 +93,9 @@ const CLOG_N: u64 = 100_000;
 
 fn bench_clog(c: &mut Criterion) {
     let mut group = c.benchmark_group("clog");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.throughput(Throughput::Elements(CLOG_N));
 
     group.bench_function("set_100k", |b| {
@@ -143,6 +149,9 @@ const FSM_M: u32 = 1_000_000;
 
 fn bench_fsm(c: &mut Criterion) {
     let mut group = c.benchmark_group("fsm");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.throughput(Throughput::Elements(u64::from(FSM_M)));
 
     group.bench_function("record_free_space_1M", |b| {
@@ -184,6 +193,9 @@ const VM_M: u32 = 1_000_000;
 
 fn bench_vm(c: &mut Criterion) {
     let mut group = c.benchmark_group("vm");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     group.throughput(Throughput::Elements(u64::from(VM_M)));
 
     group.bench_function("is_all_visible_1M", |b| {

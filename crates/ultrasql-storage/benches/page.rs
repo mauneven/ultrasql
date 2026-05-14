@@ -5,6 +5,9 @@ use ultrasql_storage::Page;
 
 fn bench_insert(c: &mut Criterion) {
     let mut group = c.benchmark_group("page/insert");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     for &tuple_size in &[16_usize, 64, 256, 1024] {
         let tuple = vec![0xABu8; tuple_size];
         group.throughput(Throughput::Bytes(tuple_size as u64));
@@ -26,6 +29,9 @@ fn bench_insert(c: &mut Criterion) {
 
 fn bench_read(c: &mut Criterion) {
     let mut group = c.benchmark_group("page/read");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     let tuple = vec![0xCDu8; 64];
     let mut page = Page::new_heap();
     let mut slots = Vec::new();

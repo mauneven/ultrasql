@@ -59,7 +59,11 @@ fn drain(op: &mut dyn Operator) {
 // ---------------------------------------------------------------------------
 
 fn bench_sort(c: &mut Criterion) {
-    c.bench_function("sort/4096_i32_sorted_input", |b| {
+    let mut group = c.benchmark_group("sort");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.bench_function("4096_i32_sorted_input", |b| {
         b.iter_batched(
             || {
                 let batch = int32_batch(N);
@@ -80,6 +84,7 @@ fn bench_sort(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -87,7 +92,11 @@ fn bench_sort(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_hash_aggregate(c: &mut Criterion) {
-    c.bench_function("hash_aggregate/count_star_4096_rows", |b| {
+    let mut group = c.benchmark_group("hash_aggregate");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.bench_function("count_star_4096_rows", |b| {
         b.iter_batched(
             || {
                 let batch = int32_batch(N);
@@ -111,6 +120,7 @@ fn bench_hash_aggregate(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +128,11 @@ fn bench_hash_aggregate(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_sort_aggregate(c: &mut Criterion) {
-    c.bench_function("sort_aggregate/count_star_4096_rows_grouped", |b| {
+    let mut group = c.benchmark_group("sort_aggregate");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.bench_function("count_star_4096_rows_grouped", |b| {
         b.iter_batched(
             || {
                 let batch = int32_i64_batch(N);
@@ -149,6 +163,7 @@ fn bench_sort_aggregate(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -156,7 +171,11 @@ fn bench_sort_aggregate(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_unique_hash(c: &mut Criterion) {
-    c.bench_function("unique/hash_mode_4096_rows_1024_unique", |b| {
+    let mut group = c.benchmark_group("unique");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.bench_function("hash_mode_4096_rows_1024_unique", |b| {
         b.iter_batched(
             || {
                 // Values 0..1024 repeated four times.
@@ -172,6 +191,7 @@ fn bench_unique_hash(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +199,11 @@ fn bench_unique_hash(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_merge_join(c: &mut Criterion) {
-    c.bench_function("merge_join/inner_4096x4096_sorted_keys", |b| {
+    let mut group = c.benchmark_group("merge_join");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.bench_function("inner_4096x4096_sorted_keys", |b| {
         b.iter_batched(
             || {
                 let left_schema = schema_i32();
@@ -216,6 +240,7 @@ fn bench_merge_join(c: &mut Criterion) {
             BatchSize::SmallInput,
         );
     });
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -223,13 +248,18 @@ fn bench_merge_join(c: &mut Criterion) {
 // ---------------------------------------------------------------------------
 
 fn bench_generate_series(c: &mut Criterion) {
-    c.bench_function("function_scan/generate_series_4096", |b| {
+    let mut group = c.benchmark_group("function_scan");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.bench_function("generate_series_4096", |b| {
         b.iter_batched(
             || FunctionScan::generate_series(0, i64::try_from(N - 1).expect("fits"), 1),
             |mut op| drain(&mut op),
             BatchSize::SmallInput,
         );
     });
+    group.finish();
 }
 
 criterion_group!(

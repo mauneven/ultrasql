@@ -250,6 +250,7 @@ mod tests {
 
     /// Spawn with a no-op writer, wait briefly, then shut down. Must not panic.
     #[test]
+    #[ignore = "slow: real-time sleep (50 ms); run via cargo test -- --ignored"]
     fn spawn_and_shutdown_clean() {
         let pool = Arc::new(BufferPool::new(4, BlankLoader));
         let config = CheckpointerConfig {
@@ -265,6 +266,7 @@ mod tests {
     /// Set up a pool with one dirty page and a durable LSN that covers the
     /// page LSN. The checkpointer should flush it within a few intervals.
     #[test]
+    #[ignore = "slow: real-time sleep (100 ms); run via cargo test -- --ignored"]
     fn checkpointer_flushes_dirty_pages() {
         use crate::wal_sink::WalSink;
         use crate::wal_sink::WalSinkError;

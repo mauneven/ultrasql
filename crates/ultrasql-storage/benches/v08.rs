@@ -39,6 +39,9 @@ fn i64_key(v: i64) -> [u8; 8] {
 
 fn bench_btree_multi_column(c: &mut Criterion) {
     let mut group = c.benchmark_group("btree_multicolumn");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
 
     const N: usize = 100_000; // 100K for CI; bump to 1M for local runs
     group.throughput(Throughput::Elements(N as u64));
@@ -81,6 +84,9 @@ fn bench_btree_multi_column(c: &mut Criterion) {
 
 fn bench_hash_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("hash_lookup");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
     const N: usize = 100_000;
     group.throughput(Throughput::Elements(N as u64));
 
@@ -107,6 +113,9 @@ fn bench_hash_lookup(c: &mut Criterion) {
 
 fn bench_brin_summarize(c: &mut Criterion) {
     let mut group = c.benchmark_group("brin_summarize");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
 
     // 10M rows / 128 pages_per_range = ~78K ranges.
     const TOTAL_BLOCKS: u32 = 78_125;
@@ -140,6 +149,9 @@ fn bench_sequence_nextval_contention(c: &mut Criterion) {
     use ultrasql_storage::sequence::{Sequence, SequenceOptions};
 
     let mut group = c.benchmark_group("sequence_nextval");
+    group.sample_size(20);
+    group.measurement_time(std::time::Duration::from_secs(3));
+    group.warm_up_time(std::time::Duration::from_secs(1));
 
     for threads in [1, 4, 8, 16] {
         group.bench_with_input(

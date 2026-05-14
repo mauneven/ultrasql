@@ -46,6 +46,38 @@ The default development host is Apple Mac mini M4 running macOS 26.
 Linux x86_64 and Linux ARM64 are also supported. Test locally on your target
 platform before pushing; GitHub Actions is not used (to avoid metered costs).
 
+### Pre-push gate vs CI
+
+The pre-push hook is a **fast smoke gate** (target < 90 s total):
+
+| Step | What runs | Why |
+|------|-----------|-----|
+| `cargo fmt --check` | format check | ~1 s |
+| `cargo clippy` | lints | ~30 s after first compile |
+| `cargo test --lib` | lib-level unit tests only | faster than `--workspace` |
+| `cargo doc` (strict) | doc warnings | ~20 s |
+| `cargo deny check advisories` | CVE scan | skips bans/licenses |
+| `regression-gate --smoke` | 1 run/benchmark, no floors | ≤ 5 s |
+
+Full suite gates (integration tests, full `--deny`, full bench sweep) run on
+the remote CI at merge time. This is intentional: pre-push is a "did this
+compile and not obviously crash?" check, not a correctness gate.
+
+**Before merging a performance-sensitive change**, run the full bench sweep
+locally and include before/after numbers in your PR description:
+
+```bash
+make bench-full     # full sweep (iterations=8, warmup=2)
+make bench-record   # full sweep + write baselines/<stage>.json
+```
+
+Slow tests (multi-thread contention stress, real-time sleeps) are tagged
+`#[ignore]` and skipped by `--lib`. Run them with:
+
+```bash
+cargo test --workspace -- --ignored
+```
+
 ---
 
 ## 3. Sending a pull request

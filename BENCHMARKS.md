@@ -147,6 +147,33 @@ Every benchmark driver binary (`cross_compare`, `cross_compare_writes`,
 There are no intermediate tiers. The `--warmup` and `--iters` flags can
 override the tier defaults when a specific iteration count is needed.
 
+## Pre-Push Gate vs Full Sweep
+
+The `pre-push` hook runs `regression-gate --smoke`:
+- One iteration per benchmark, zero warmup rounds.
+- Competitor-floor checks skipped.
+- Target wall-clock: ≤ 5 seconds.
+- Purpose: "did this crash?" sanity check.
+
+Before promoting a performance-sensitive commit (one that changes a hot
+path, a vectorized kernel, or the executor plan) **you must run the full
+sweep locally**:
+
+```
+make bench-full
+```
+
+Full sweep parameters: `--iterations 8 --warmup 2`.  To record a new
+baseline after a measured improvement:
+
+```
+make bench-record
+```
+
+The CI bench job also runs the full sweep on every merge; a smoke-only
+pre-push does not absolve a contributor of the obligation to show
+before/after numbers in the PR description.
+
 ## Results Directory Policy
 
 - `benchmarks/baselines/` — stage-gate baselines (slow-moving; updated at
