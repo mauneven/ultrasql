@@ -1,33 +1,41 @@
 //! Sequential heap scan operator backed by the storage subsystem.
 //!
-//! Drives [`HeapAccess::scan_visible`] and decodes each tuple's payload
-//! through a [`RowCodec`] into batched columns. Batches are capped at
-//! 4096 rows per `ARCHITECTURE.md` §9.
+//! Drives [`HeapAccess::scan_visible`] and decodes each tuple's
+//! payload through a [`RowCodec`] directly into typed column
+//! builders. Batches are capped at 4096 rows per `ARCHITECTURE.md`
+//! §9.
 //!
-//! The scan owns its [`RowCodec`] (schema) and pulls visible tuples
-//! lazily — pages are pinned via the buffer pool one at a time by the
-//! underlying `VisibleHeapScan` iterator.
+//! # Streaming model
 //!
-//! # v0.5 limitation
+//! Each `next_batch` call drains the underlying [`VisibleHeapScan`]
+//! iterator until 4096 visible tuples have landed in the per-column
+//! [`ColumnBuilder`]s, then emits the [`Batch`] and reseeds a fresh
+//! set of builders. Memory usage is O(batch), not O(relation) — the
+//! v0.5 "materialise everything into `Vec<Vec<Value>>` before
+//! yielding the first batch" hack is gone.
 //!
-//! The first `next_batch` call materialises **all** visible rows into a
-//! `Vec` and subsequent calls drain it in 4096-row chunks. This is
-//! O(relation size) in memory and acceptable for v0.5 where relations
-//! are small. A `TODO(seq-scan-streaming)` below marks the follow-up
-//! work to stream rows page-by-page once the iterator's lifetime contract
-//! is resolved.
+//! # Iterator self-reference
+//!
+//! [`VisibleHeapScan`] borrows from the [`HeapAccess`], the
+//! [`Snapshot`], and the [`XidStatusOracle`] used to construct it.
+//! The operator owns those three behind heap-stable handles
+//! (`Arc<HeapAccess<L>>`, `Box<Snapshot>`, `Arc<O>`) and stashes the
+//! iterator with a lifetime-extended-via-`transmute` reference. Drop
+//! order is encoded in the struct's field order: the iterator is
+//! declared first and therefore dropped first, before the data it
+//! borrows from. See [`SeqScan`]'s `# Safety` block for the full
+//! reasoning.
 
 use std::sync::Arc;
-use std::vec::IntoIter;
 
 use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
 use ultrasql_mvcc::{Snapshot, XidStatusOracle};
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::heap::HeapAccess;
+use ultrasql_storage::heap::{HeapAccess, VisibleHeapScan};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
-use crate::row_codec::RowCodec;
+use crate::row_codec::{ColumnBuilder, RowCodec};
 use crate::{ExecError, Operator};
 
 /// Maximum rows per batch, matching the `ARCHITECTURE.md` §9 contract.
@@ -35,8 +43,8 @@ const BATCH_TARGET_ROWS: usize = 4096;
 
 /// Sequential heap scan operator.
 ///
-/// Reads every MVCC-visible tuple from `rel` and decodes each payload via
-/// the bound [`RowCodec`], then emits 4096-row [`Batch`]es.
+/// Reads every MVCC-visible tuple from `rel` and decodes each payload
+/// directly into typed column builders, emitting 4096-row [`Batch`]es.
 ///
 /// `L` is the [`PageLoader`] implementation (in production: the segment
 /// loader; in tests: an in-memory map). `O` is the [`XidStatusOracle`]
@@ -45,38 +53,74 @@ const BATCH_TARGET_ROWS: usize = 4096;
 ///
 /// # Send bound
 ///
-/// The operator is `Send` because all owned types — `Arc<HeapAccess<L>>`,
-/// `Snapshot`, `Arc<O>`, and `RowCodec` — are `Send + Sync`.
-pub struct SeqScan<L: PageLoader, O> {
+/// The operator is `Send` because every owned field —
+/// `Arc<HeapAccess<L>>`, `Box<Snapshot>`, `Arc<O>`, and the column
+/// builders — is `Send + Sync`. The `unsafe` lifetime extension on the
+/// stored iterator does not weaken `Send`: the borrows it carries
+/// point to `Arc`/`Box` payloads that move with the struct without
+/// reallocating.
+///
+/// # Safety
+///
+/// `iter` is stored with `'static` lifetime after construction. The
+/// real borrow targets are:
+/// - the inner `HeapAccess<L>` reachable through `heap` (heap-stable
+///   behind `Arc`);
+/// - the inner `Snapshot` reachable through `snapshot` (heap-stable
+///   behind `Box`);
+/// - the inner `O` reachable through `oracle` (heap-stable behind
+///   `Arc`).
+///
+/// None of those targets are deallocated or moved while the iterator
+/// is alive. The `iter` field is declared first so that Rust drops
+/// it before the fields it borrows from, preventing a use-after-free
+/// at struct destruction time.
+pub struct SeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'static> {
+    /// Active heap iterator. Lifetime-erased to `'static`; the real
+    /// borrows live as long as `heap`, `snapshot`, and `oracle`.
+    ///
+    /// `None` only after the scan has reached end-of-stream.
+    /// Declared first so it drops before the data it references.
+    iter: Option<VisibleHeapScan<'static, L, O>>,
+    /// Reusable typed column builders. Sized to
+    /// [`BATCH_TARGET_ROWS`] capacity on every fresh allocation and
+    /// swapped out wholesale when a batch is emitted.
+    builders: Vec<ColumnBuilder>,
+    /// Shared heap access. The iterator borrows the inner
+    /// `HeapAccess<L>` via this Arc.
+    #[allow(dead_code)]
     heap: Arc<HeapAccess<L>>,
-    relation: RelationId,
-    block_count: u32,
-    snapshot: Snapshot,
+    /// MVCC snapshot. Heap-allocated so its address is stable across
+    /// moves of `Self`; the iterator carries a `'static`-extended
+    /// borrow pointing here.
+    #[allow(dead_code)]
+    snapshot: Box<Snapshot>,
+    /// Transaction-status oracle. Same stability argument as
+    /// `snapshot`.
+    #[allow(dead_code)]
     oracle: Arc<O>,
+    /// Static metadata captured at construction.
+    relation: RelationId,
+    /// Number of allocated blocks at scan-open time.
+    block_count: u32,
+    /// Row codec; owns the schema and drives `decode_into_builders`.
     codec: RowCodec,
-    /// When `true`, the operator prepends two `Int32` columns
-    /// (`tid_block`, `tid_slot`) to each decoded row. The reported
-    /// [`Schema`] also reflects this prefix. UPDATE/DELETE rely on this
-    /// shape: [`crate::modify::ModifyTable`] decodes the TID from those
-    /// columns to address the heap tuple.
+    /// `true` if the operator should prepend `tid_block` / `tid_slot`
+    /// columns to every decoded row. UPDATE / DELETE rely on this
+    /// shape (see [`crate::modify::ModifyTable`]).
     with_tids: bool,
-    /// Output schema; equals `codec.schema()` when `with_tids` is false,
-    /// or `[tid_block, tid_slot, ...codec.schema()]` when `with_tids` is
-    /// true. Cached to satisfy `Operator::schema()`'s `&Schema` return.
+    /// Output schema. Equals `codec.schema()` when `with_tids` is
+    /// false, or `[tid_block, tid_slot, ...codec.schema()]` when
+    /// `with_tids` is true.
     output_schema: Schema,
-    /// Materialised row buffer, filled on the first `next_batch` call.
-    ///
-    /// `None` = not yet materialised. `Some(iter)` = currently draining.
-    ///
-    /// TODO(seq-scan-streaming): Replace with a cursor-based streaming
-    /// scan once the `VisibleHeapScan` iterator's lifetime can be tied
-    /// to owned `Snapshot` + `Arc<O>` state inside the operator.
-    all_rows: Option<IntoIter<Vec<Value>>>,
-    /// `true` after the scan has emitted `Ok(None)`.
+    /// `true` after the iterator has been exhausted and the final
+    /// (possibly partial) batch has been emitted.
     eof: bool,
 }
 
-impl<L: PageLoader, O> std::fmt::Debug for SeqScan<L, O> {
+impl<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'static> std::fmt::Debug
+    for SeqScan<L, O>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SeqScan")
             .field("relation", &self.relation)
@@ -96,11 +140,12 @@ where
     ///
     /// - `heap` — shared reference to the heap access method.
     /// - `relation` — relation id to scan.
-    /// - `block_count` — number of allocated blocks in `relation` (from
-    ///   the catalog or `HeapAccess::block_count`).
+    /// - `block_count` — number of allocated blocks in `relation`
+    ///   (from the catalog or `HeapAccess::block_count`).
     /// - `snapshot` — MVCC snapshot for visibility filtering.
     /// - `oracle` — transaction-status oracle.
-    /// - `codec` — row codec whose schema matches the relation's column layout.
+    /// - `codec` — row codec whose schema matches the relation's
+    ///   column layout.
     #[must_use]
     pub fn new(
         heap: Arc<HeapAccess<L>>,
@@ -111,18 +156,16 @@ where
         codec: RowCodec,
     ) -> Self {
         let output_schema = codec.schema().clone();
-        Self {
+        Self::build(
             heap,
             relation,
             block_count,
             snapshot,
             oracle,
             codec,
-            with_tids: false,
+            false,
             output_schema,
-            all_rows: None,
-            eof: false,
-        }
+        )
     }
 
     /// Construct a `SeqScan` that emits two leading `Int32` columns
@@ -148,19 +191,95 @@ where
             fields.push(codec.schema().field_at(i).clone());
         }
         let output_schema = Schema::new(fields).expect("TID-prefixed schema is well-formed");
-        Self {
+        Self::build(
             heap,
             relation,
             block_count,
             snapshot,
             oracle,
             codec,
-            with_tids: true,
+            true,
             output_schema,
-            all_rows: None,
+        )
+    }
+
+    /// Shared helper that builds the operator and the
+    /// lifetime-extended iterator. Both `new` and `new_with_tids`
+    /// funnel through here.
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        heap: Arc<HeapAccess<L>>,
+        relation: RelationId,
+        block_count: u32,
+        snapshot: Snapshot,
+        oracle: Arc<O>,
+        codec: RowCodec,
+        with_tids: bool,
+        output_schema: Schema,
+    ) -> Self {
+        // Build typed builders sized for one full batch. The
+        // TID-emitting variant prepends two `Int32` builders for
+        // `tid_block` / `tid_slot`.
+        let builders = build_initial_builders(&codec, with_tids);
+
+        // Heap-allocate the snapshot so its address is stable across
+        // moves of `Self`.
+        let snapshot_box: Box<Snapshot> = Box::new(snapshot);
+
+        // SAFETY: `heap`, `snapshot_box`, and `oracle` keep their
+        // referents at stable heap addresses for the lifetime of the
+        // `SeqScan`. The iterator is declared as the first field and
+        // therefore dropped first, before the borrows go away. See
+        // the type-level `# Safety` doc for the full argument.
+        let iter: VisibleHeapScan<'static, L, O> = unsafe {
+            let heap_ref: &'static HeapAccess<L> =
+                std::mem::transmute::<&HeapAccess<L>, &'static HeapAccess<L>>(&*heap);
+            let snap_ref: &'static Snapshot =
+                std::mem::transmute::<&Snapshot, &'static Snapshot>(&*snapshot_box);
+            let oracle_ref: &'static O = std::mem::transmute::<&O, &'static O>(&*oracle);
+            heap_ref.scan_visible(relation, block_count, snap_ref, oracle_ref)
+        };
+
+        Self {
+            iter: Some(iter),
+            builders,
+            heap,
+            snapshot: snapshot_box,
+            oracle,
+            relation,
+            block_count,
+            codec,
+            with_tids,
+            output_schema,
             eof: false,
         }
     }
+}
+
+/// Build a fresh `Vec<ColumnBuilder>` matching the codec's schema,
+/// optionally prepending two `Int32` builders for `tid_block` /
+/// `tid_slot`. Sized to [`BATCH_TARGET_ROWS`] capacity.
+fn build_initial_builders(codec: &RowCodec, with_tids: bool) -> Vec<ColumnBuilder> {
+    let mut out: Vec<ColumnBuilder> = Vec::new();
+    if with_tids {
+        let tid_schema = Schema::new([
+            Field::required("tid_block", DataType::Int32),
+            Field::required("tid_slot", DataType::Int32),
+        ])
+        .expect("tid schema is well-formed");
+        let tid_codec = RowCodec::new(tid_schema);
+        out.extend(
+            tid_codec
+                .new_builders(BATCH_TARGET_ROWS)
+                .expect("Int32 is supported"),
+        );
+    }
+    out.extend(
+        codec
+            .new_builders(BATCH_TARGET_ROWS)
+            .expect("codec schema types are supported"),
+    );
+    out
 }
 
 impl<L, O> Operator for SeqScan<L, O>
@@ -173,58 +292,61 @@ where
             return Ok(None);
         }
 
-        // Materialise all visible rows on first call.
-        //
-        // v0.5 limitation: this loads the entire relation into memory before
-        // yielding the first batch. For small test relations this is acceptable;
-        // the streaming follow-up is tracked as TODO(seq-scan-streaming).
-        if self.all_rows.is_none() {
-            let mut rows: Vec<Vec<Value>> = Vec::new();
-            for result in self.heap.scan_visible(
-                self.relation,
-                self.block_count,
-                &self.snapshot,
-                &*self.oracle,
-            ) {
+        let tid_offset = usize::from(self.with_tids) * 2;
+        let mut rows_buffered: usize = 0;
+        let mut iter_exhausted = true;
+
+        if let Some(iter) = self.iter.as_mut() {
+            while rows_buffered < BATCH_TARGET_ROWS {
+                let Some(result) = iter.next() else {
+                    break;
+                };
                 let tup = result.map_err(|e| {
                     tracing::warn!(error = %e, "heap scan error");
                     ExecError::Internal("heap scan failed")
                 })?;
-                let decoded = self
-                    .codec
-                    .decode(&tup.data)
-                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
                 if self.with_tids {
-                    // Block fits in i32: PostgreSQL's BlockNumber is u32 but
-                    // benchmark / test relations stay well under 2^31 blocks.
-                    // Overflowing relations would surface here as a precision
-                    // loss in the TID column; we cast lossily because the
-                    // ModifyTable extractor pairs with this exact shape.
+                    // PostgreSQL's `BlockNumber` is u32; the TID
+                    // columns are i32 (matching the v0.5 `ModifyTable`
+                    // extractor).
                     let block_i32 = i32::try_from(tup.tid.page.block.raw()).map_err(|_| {
                         ExecError::Internal("BlockNumber exceeds i32 range; TID column overflow")
                     })?;
                     let slot_i32 = i32::from(tup.tid.slot);
-                    let mut row: Vec<Value> = Vec::with_capacity(decoded.len() + 2);
-                    row.push(Value::Int32(block_i32));
-                    row.push(Value::Int32(slot_i32));
-                    row.extend(decoded);
-                    rows.push(row);
-                } else {
-                    rows.push(decoded);
+                    RowCodec::push_i32_into(&mut self.builders, 0, block_i32);
+                    RowCodec::push_i32_into(&mut self.builders, 1, slot_i32);
                 }
+                self.codec
+                    .decode_into_builders(&tup.data, &mut self.builders[tid_offset..])
+                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                rows_buffered += 1;
             }
-            self.all_rows = Some(rows.into_iter());
+            // Mark "not exhausted" only when we hit the row cap (the
+            // iterator may still hold more rows for the next call).
+            if rows_buffered >= BATCH_TARGET_ROWS {
+                iter_exhausted = false;
+            }
         }
 
-        let rows_iter = self.all_rows.as_mut().expect("just-set above");
-        let chunk: Vec<Vec<Value>> = rows_iter.by_ref().take(BATCH_TARGET_ROWS).collect();
-
-        if chunk.is_empty() {
+        if rows_buffered == 0 {
             self.eof = true;
+            self.iter = None;
             return Ok(None);
         }
 
-        let batch = build_batch(&chunk, &self.output_schema)?;
+        // Swap out the current builders so we can finish them into a
+        // batch; the replacement builders' Vec<T> allocations are
+        // fresh — see report below. This is the only per-batch
+        // allocation the streaming path performs (excluding the
+        // backing batch itself).
+        let replacement = build_initial_builders(&self.codec, self.with_tids);
+        let finished = std::mem::replace(&mut self.builders, replacement);
+        let batch = RowCodec::finish_batch(finished).map_err(ExecError::from)?;
+
+        if iter_exhausted {
+            self.eof = true;
+            self.iter = None;
+        }
         Ok(Some(batch))
     }
 
@@ -235,9 +357,9 @@ where
 
 /// Convert a slice of decoded rows into a [`Batch`] matching `schema`.
 ///
-/// Each column in `schema` maps to a [`Column`] variant. Only the
-/// types that have a direct [`Column`] counterpart are supported here;
-/// other types surface as [`ExecError::TypeMismatch`].
+/// Kept for backwards compatibility with callers that still want the
+/// `Vec<Vec<Value>>` → [`Batch`] path. The streaming [`SeqScan`] no
+/// longer uses this function.
 #[allow(clippy::too_many_lines)]
 pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecError> {
     if rows.is_empty() {
@@ -386,8 +508,7 @@ mod tests {
     use crate::{ExecError, Operator};
 
     // -----------------------------------------------------------------------
-    // Test fixtures — duplicated from ultrasql_storage tests (those are
-    // cfg(test)-gated and not reachable from this crate).
+    // Test fixtures
     // -----------------------------------------------------------------------
 
     /// In-memory page loader that materialises blank heap pages on first miss
@@ -440,14 +561,6 @@ mod tests {
         Arc::new(HeapAccess::new(pool))
     }
 
-    /// Build a snapshot for an *observer* transaction at `xid + 1` that
-    /// sees rows written by the inserter transaction `xid` as committed.
-    ///
-    /// The inserter `xid` is strictly below `xmin` (`xid + 1`), so the
-    /// snapshot's `xid_in_progress` predicate returns `false` for it.
-    /// The caller must register `xid` as committed in the oracle so
-    /// `is_committed_before_snapshot` returns `true`, making the rows
-    /// visible.
     fn snap_for(xid: u64) -> Snapshot {
         Snapshot::new(
             Xid::new(xid + 1),
@@ -476,9 +589,9 @@ mod tests {
         .expect("schema ok")
     }
 
-    // -----------------------------------------------------------------------
-    // Helper: drain all batches into a flat vec of rows
-    // -----------------------------------------------------------------------
+    fn schema_i32_only() -> Schema {
+        Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok")
+    }
 
     fn drain_rows(scan: &mut dyn Operator) -> Vec<(i32, String)> {
         let mut out = Vec::new();
@@ -501,10 +614,6 @@ mod tests {
         out
     }
 
-    // -----------------------------------------------------------------------
-    // Test 1: scan returns inserted rows in insert order
-    // -----------------------------------------------------------------------
-
     #[test]
     fn scan_returns_inserted_rows_in_insert_order() {
         let heap = make_heap();
@@ -513,7 +622,6 @@ mod tests {
         let oracle = Arc::new(MapOracle::new());
         oracle.set_committed(Xid::new(xid));
 
-        // Insert 10 rows.
         let expected: Vec<(i32, String)> = (0_i32..10).map(|i| (i, format!("row_{i}"))).collect();
         for (id, name) in &expected {
             let row = vec![Value::Int32(*id), Value::Text(name.clone())];
@@ -537,10 +645,6 @@ mod tests {
         assert_eq!(rows, expected, "scan returned rows in wrong order");
     }
 
-    // -----------------------------------------------------------------------
-    // Test 2: scan filters invisible rows
-    // -----------------------------------------------------------------------
-
     #[test]
     fn scan_filters_invisible_rows() {
         let heap = make_heap();
@@ -551,7 +655,6 @@ mod tests {
         oracle.set_committed(Xid::new(xid_committed));
         oracle.set_aborted(Xid::new(xid_aborted));
 
-        // Insert rows under two different xids.
         let committed_rows: Vec<(i32, String)> =
             (0_i32..5).map(|i| (i, format!("committed_{i}"))).collect();
         let aborted_rows: Vec<(i32, String)> = (100_i32..105)
@@ -571,9 +674,6 @@ mod tests {
                 .expect("insert");
         }
 
-        // Observer is at xid 22 (above both inserters). xmin=22 places both
-        // xid_committed (20) and xid_aborted (21) below xmin, so neither is
-        // in-progress. The oracle resolves 20 as committed and 21 as aborted.
         let snapshot = Snapshot::new(
             Xid::new(xid_aborted + 1),
             Xid::new(xid_aborted + 2),
@@ -598,10 +698,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Test 3: scan chunks into 4096-row batches
-    // -----------------------------------------------------------------------
-
     #[test]
     fn scan_chunks_into_4096_row_batches() {
         let heap = make_heap();
@@ -610,7 +706,6 @@ mod tests {
         let oracle = Arc::new(MapOracle::new());
         oracle.set_committed(Xid::new(xid));
 
-        // Insert 4100 rows (> 4096).
         let total = 4100_usize;
         for i in 0_i32..i32::try_from(total).expect("fits i32") {
             let row = vec![Value::Int32(i), Value::Text(format!("r{i}"))];
@@ -641,7 +736,6 @@ mod tests {
             batch_sizes.contains(&4096),
             "expected at least one full 4096-row batch, got {batch_sizes:?}"
         );
-        // Last batch is the remainder.
         assert_eq!(
             *batch_sizes.last().expect("at least one batch"),
             total % 4096,
@@ -649,16 +743,11 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Test 4: scan empty relation returns None immediately
-    // -----------------------------------------------------------------------
-
     #[test]
     fn scan_empty_relation_returns_none() {
         let heap = make_heap();
         let codec = RowCodec::new(schema_i32_text());
         let oracle = Arc::new(MapOracle::new());
-        // block_count = 0: no blocks allocated.
         let snapshot = snap_for(1);
         let mut scan = SeqScan::new(
             Arc::clone(&heap),
@@ -676,14 +765,6 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // Test 5: corrupt payload returns TypeMismatch
-    // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // Test 6: TID-emitting scan prepends tid_block / tid_slot columns
-    // -----------------------------------------------------------------------
-
     #[test]
     fn tid_scan_prepends_block_and_slot_columns() {
         let heap = make_heap();
@@ -692,8 +773,6 @@ mod tests {
         let oracle = Arc::new(MapOracle::new());
         oracle.set_committed(Xid::new(xid));
 
-        // Insert 3 rows. With a fresh heap they all land on block 0 in
-        // slot order 0, 1, 2.
         let inputs: Vec<(i32, String)> = (0_i32..3).map(|i| (i, format!("row_{i}"))).collect();
         for (id, name) in &inputs {
             let row = vec![Value::Int32(*id), Value::Text(name.clone())];
@@ -713,7 +792,6 @@ mod tests {
             codec,
         );
 
-        // Schema must be [tid_block, tid_slot, id, name].
         let schema = scan.schema().clone();
         assert_eq!(schema.len(), 4, "TID schema must have 4 columns");
         assert_eq!(schema.field_at(0).name, "tid_block");
@@ -727,19 +805,16 @@ mod tests {
             .expect("first batch");
         assert_eq!(batch.rows(), 3);
         assert_eq!(batch.width(), 4);
-        // tid_block must be 0 for all three rows on a fresh heap.
         let block_col = match &batch.columns()[0] {
             Column::Int32(c) => c.data().to_vec(),
             other => panic!("expected Int32 for tid_block, got {other:?}"),
         };
         assert_eq!(block_col, vec![0_i32, 0, 0]);
-        // tid_slot must be 0, 1, 2 in insertion order.
         let slot_col = match &batch.columns()[1] {
             Column::Int32(c) => c.data().to_vec(),
             other => panic!("expected Int32 for tid_slot, got {other:?}"),
         };
         assert_eq!(slot_col, vec![0_i32, 1, 2]);
-        // The original `id` column lands at index 2.
         let id_col = match &batch.columns()[2] {
             Column::Int32(c) => c.data().to_vec(),
             other => panic!("expected Int32 for id, got {other:?}"),
@@ -755,9 +830,7 @@ mod tests {
         let oracle = Arc::new(MapOracle::new());
         oracle.set_committed(Xid::new(xid));
 
-        // Insert a row with a deliberately corrupt payload (just random bytes
-        // that cannot decode against the schema).
-        let corrupt_payload = vec![0xDE, 0xAD]; // way too short / invalid
+        let corrupt_payload = vec![0xDE, 0xAD];
         heap.insert(rel(), &corrupt_payload, insert_opts(xid))
             .expect("insert corrupt payload");
 
@@ -777,5 +850,165 @@ mod tests {
             matches!(err, ExecError::TypeMismatch(_)),
             "expected TypeMismatch, got {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // New streaming tests
+    // -----------------------------------------------------------------------
+
+    /// Verify that an 8200-row heap streams out as batches of 4096,
+    /// 4096 and 8 — confirming the operator no longer pre-materialises
+    /// every row before yielding the first batch.
+    #[test]
+    fn streaming_seq_scan_emits_4096_chunks() {
+        let heap = make_heap();
+        let codec = RowCodec::new(schema_i32_only());
+        let xid: u64 = 60;
+        let oracle = Arc::new(MapOracle::new());
+        oracle.set_committed(Xid::new(xid));
+
+        let total = 8200_usize;
+        for i in 0_i32..i32::try_from(total).expect("fits i32") {
+            let row = vec![Value::Int32(i)];
+            let payload = codec.encode(&row).expect("encode");
+            heap.insert(rel(), &payload, insert_opts(xid))
+                .expect("insert");
+        }
+
+        let block_count = heap.block_count(rel());
+        let snapshot = snap_for(xid);
+        let mut scan = SeqScan::new(
+            Arc::clone(&heap),
+            rel(),
+            block_count,
+            snapshot,
+            Arc::clone(&oracle),
+            codec,
+        );
+
+        let mut sizes: Vec<usize> = Vec::new();
+        while let Some(batch) = scan.next_batch().expect("operator must not error") {
+            sizes.push(batch.rows());
+        }
+        assert_eq!(
+            sizes,
+            vec![4096, 4096, 8],
+            "streaming scan must emit 4096 + 4096 + 8, got {sizes:?}"
+        );
+    }
+
+    /// Verify content equality with the legacy output: streamed rows
+    /// preserve insertion order over a 10k-row heap.
+    #[test]
+    fn streaming_seq_scan_matches_old_output() {
+        let heap = make_heap();
+        let codec = RowCodec::new(schema_i32_only());
+        let xid: u64 = 70;
+        let oracle = Arc::new(MapOracle::new());
+        oracle.set_committed(Xid::new(xid));
+
+        let total = 10_000_i32;
+        for i in 0..total {
+            let row = vec![Value::Int32(i)];
+            let payload = codec.encode(&row).expect("encode");
+            heap.insert(rel(), &payload, insert_opts(xid))
+                .expect("insert");
+        }
+
+        let block_count = heap.block_count(rel());
+        let snapshot = snap_for(xid);
+        let mut scan = SeqScan::new(
+            Arc::clone(&heap),
+            rel(),
+            block_count,
+            snapshot,
+            Arc::clone(&oracle),
+            codec,
+        );
+
+        let mut streamed: Vec<i32> = Vec::with_capacity(total as usize);
+        while let Some(batch) = scan.next_batch().expect("operator must not error") {
+            match &batch.columns()[0] {
+                Column::Int32(c) => streamed.extend_from_slice(c.data()),
+                other => panic!("expected Int32 column, got {other:?}"),
+            }
+        }
+
+        let expected: Vec<i32> = (0..total).collect();
+        assert_eq!(
+            streamed, expected,
+            "streaming output diverges from insertion order"
+        );
+    }
+
+    /// Smoke test the null-bitmap routing: alternate rows have NULL
+    /// in column 1 and the resulting column's bitmap matches.
+    #[test]
+    fn streaming_seq_scan_routes_nulls_into_bitmap() {
+        let heap = make_heap();
+        let schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("score", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let codec = RowCodec::new(schema);
+        let xid: u64 = 80;
+        let oracle = Arc::new(MapOracle::new());
+        oracle.set_committed(Xid::new(xid));
+
+        let total: i32 = 32;
+        for i in 0..total {
+            let row = if i % 2 == 0 {
+                vec![Value::Int32(i), Value::Null]
+            } else {
+                vec![Value::Int32(i), Value::Int64(i64::from(i) * 10)]
+            };
+            let payload = codec.encode(&row).expect("encode");
+            heap.insert(rel(), &payload, insert_opts(xid))
+                .expect("insert");
+        }
+
+        let block_count = heap.block_count(rel());
+        let snapshot = snap_for(xid);
+        let mut scan = SeqScan::new(
+            Arc::clone(&heap),
+            rel(),
+            block_count,
+            snapshot,
+            Arc::clone(&oracle),
+            codec,
+        );
+
+        let batch = scan
+            .next_batch()
+            .expect("operator must not error")
+            .expect("first batch");
+        let score_col = match &batch.columns()[1] {
+            Column::Int64(c) => c,
+            other => panic!("expected Int64 score, got {other:?}"),
+        };
+        let nulls = score_col
+            .nulls()
+            .expect("null bitmap must be present after observing nulls");
+        for i in 0..(total as usize) {
+            let is_valid_expected = i % 2 == 1;
+            assert_eq!(
+                nulls.get(i),
+                is_valid_expected,
+                "row {i}: expected valid={is_valid_expected}, got bit={}",
+                nulls.get(i)
+            );
+        }
+        for (i, &v) in score_col.data().iter().enumerate() {
+            if i % 2 == 0 {
+                assert_eq!(v, 0, "row {i}: null placeholder must be 0");
+            } else {
+                assert_eq!(
+                    v,
+                    i64::from(i32::try_from(i).expect("fits i32")) * 10,
+                    "row {i}: non-null value must round-trip"
+                );
+            }
+        }
     }
 }

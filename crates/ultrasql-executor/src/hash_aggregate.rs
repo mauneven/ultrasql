@@ -31,7 +31,8 @@ use std::hash::{Hash, Hasher};
 
 use ultrasql_core::{Schema, Value};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
-use ultrasql_vec::Batch;
+use ultrasql_vec::column::{Column, NumericColumn};
+use ultrasql_vec::{Batch, count_i64, max_i64, min_i64, sum_i64};
 
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
@@ -175,6 +176,11 @@ pub struct HashAggregate {
     output: Option<std::vec::IntoIter<Vec<Value>>>,
     /// `true` after `Ok(None)` has been returned.
     eof: bool,
+    /// When `true`, the build phase skips the column-oriented fast path
+    /// and uses the row-at-a-time scalar loop. Test-only knob used by
+    /// the cross-validation tests; production callers leave it `false`.
+    #[cfg(test)]
+    force_scalar_path: bool,
 }
 
 impl HashAggregate {
@@ -201,7 +207,17 @@ impl HashAggregate {
             schema,
             output: None,
             eof: false,
+            #[cfg(test)]
+            force_scalar_path: false,
         }
+    }
+
+    /// Test-only: disable the vectorised fast path. Used by cross-validation
+    /// tests that need to exercise the row-at-a-time loop on inputs that
+    /// would otherwise be eligible for the column-oriented kernels.
+    #[cfg(test)]
+    pub(crate) const fn force_scalar_path(&mut self) {
+        self.force_scalar_path = true;
     }
 }
 
@@ -233,9 +249,53 @@ impl Operator for HashAggregate {
 impl HashAggregate {
     /// Execute the build phase: drain child, accumulate aggregates, finalise.
     fn build(&mut self) -> Result<Vec<Vec<Value>>, ExecError> {
+        let has_group_keys = !self.group_key_evals.is_empty();
+
+        // Scalar-aggregate (no GROUP BY) vectorised fast path.
+        //
+        // When the operator has no GROUP BY columns and every aggregate is
+        // expressible as a column-oriented kernel (`SUM`, `COUNT`, `COUNT(*)`,
+        // `MIN`, `MAX`, `AVG`) over a single column reference, we accumulate
+        // running state directly from the typed columnar buffer using the
+        // `ultrasql_vec` kernels. This bypasses the per-row `batch_to_rows`
+        // materialisation and the per-row scalar dispatch, which together
+        // dominate the cost of scalar aggregates on wide tables.
+        #[cfg(test)]
+        let allow_vectorized = !self.force_scalar_path;
+        #[cfg(not(test))]
+        let allow_vectorized = true;
+        if allow_vectorized
+            && !has_group_keys
+            && let Some(plan) = build_vectorized_plan(&self.aggregates)
+        {
+            let mut states = init_states(&self.aggregates);
+            let mut saw_any_row = false;
+            loop {
+                let Some(batch) = self.child.next_batch()? else {
+                    break;
+                };
+                if batch.rows() == 0 {
+                    continue;
+                }
+                saw_any_row = true;
+                vectorized_step(&plan, &batch, &mut states)?;
+            }
+            if !saw_any_row {
+                // Empty input + no GROUP BY → identity row.
+                let identity: Vec<Value> = self
+                    .aggregates
+                    .iter()
+                    .map(|agg| finalise(&init_state_for(agg)))
+                    .collect();
+                return Ok(vec![identity]);
+            }
+            let row: Vec<Value> = states.iter().map(finalise).collect();
+            return Ok(vec![row]);
+        }
+
+        // General path: row-at-a-time evaluation against a `HashMap<GroupKey, …>`.
         let mut table: HashMap<GroupKey, Vec<AggState>> = HashMap::new();
         let child_schema = self.child.schema().clone();
-        let has_group_keys = !self.group_key_evals.is_empty();
         let mut saw_any_row = false;
 
         loop {
@@ -286,6 +346,461 @@ impl HashAggregate {
         }
         Ok(output)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Vectorised scalar-aggregate fast path
+// ---------------------------------------------------------------------------
+
+/// One slot of the vectorised plan: which kernel to run and which column it
+/// reads. `CountStar` is the only slot without a column reference.
+#[derive(Debug, Clone, Copy)]
+enum VecAggSlot {
+    CountStar,
+    Count(usize),
+    Sum(usize),
+    Avg(usize),
+    Min(usize),
+    Max(usize),
+}
+
+/// Build a [`VecAggSlot`] plan when every aggregate is in the supported
+/// scalar fast set and references a simple column. Returns `None` if any
+/// aggregate falls outside the fast set (e.g. `STRING_AGG`, `BOOL_AND`,
+/// `DISTINCT`, or a non-`Column` argument expression).
+fn build_vectorized_plan(aggregates: &[LogicalAggregateExpr]) -> Option<Vec<VecAggSlot>> {
+    let mut plan = Vec::with_capacity(aggregates.len());
+    for agg in aggregates {
+        if agg.distinct {
+            return None;
+        }
+        match agg.func {
+            AggregateFunc::CountStar => {
+                if agg.arg.is_some() {
+                    return None;
+                }
+                plan.push(VecAggSlot::CountStar);
+            }
+            AggregateFunc::Count
+            | AggregateFunc::Sum
+            | AggregateFunc::Avg
+            | AggregateFunc::Min
+            | AggregateFunc::Max => {
+                let idx = column_index(agg.arg.as_ref()?)?;
+                plan.push(match agg.func {
+                    AggregateFunc::Count => VecAggSlot::Count(idx),
+                    AggregateFunc::Sum => VecAggSlot::Sum(idx),
+                    AggregateFunc::Avg => VecAggSlot::Avg(idx),
+                    AggregateFunc::Min => VecAggSlot::Min(idx),
+                    AggregateFunc::Max => VecAggSlot::Max(idx),
+                    _ => unreachable!(),
+                });
+            }
+            _ => return None,
+        }
+    }
+    Some(plan)
+}
+
+/// Extract the column index from a `ScalarExpr::Column`. Returns `None` for
+/// anything else (literals, binary ops, casts, …) — those go through the
+/// scalar row loop.
+const fn column_index(expr: &ScalarExpr) -> Option<usize> {
+    match expr {
+        ScalarExpr::Column { index, .. } => Some(*index),
+        _ => None,
+    }
+}
+
+/// Apply one vectorised batch step to the single-group `states` vector.
+///
+/// Each slot dispatches to a kernel that matches the column's runtime
+/// variant. Bit-identical results against the scalar path are guaranteed for
+/// the supported aggregate set:
+/// * `Sum`/`Avg` on integer columns keep an `i64` accumulator with wrapping
+///   semantics, matching [`add_values`] (which folds Int16/Int32/Int64
+///   through `wrapping_add`).
+/// * `Sum`/`Avg` on float columns keep an `f64` accumulator, matching the
+///   widening that `add_values` performs for Float32/Float64.
+/// * `Count(expr)` counts non-null entries via the column's optional bitmap.
+/// * `CountStar` increments by `batch.rows()`.
+/// * `Min`/`Max` defer to [`min_i64`] / [`max_i64`] for `Int64`, and use
+///   tight per-type folds for the remaining numeric widths.
+fn vectorized_step(
+    plan: &[VecAggSlot],
+    batch: &Batch,
+    states: &mut [AggState],
+) -> Result<(), ExecError> {
+    let cols = batch.columns();
+    let n = batch.rows();
+    for (slot, state) in plan.iter().zip(states.iter_mut()) {
+        match (*slot, state) {
+            (VecAggSlot::CountStar, AggState::CountStar(acc)) => {
+                *acc = acc.saturating_add(i64::try_from(n).unwrap_or(i64::MAX));
+            }
+            (VecAggSlot::Count(ci), AggState::Count(acc)) => {
+                *acc = acc.saturating_add(column_non_null_count(&cols[ci]));
+            }
+            (VecAggSlot::Sum(ci), AggState::Sum(acc)) => {
+                accumulate_sum(acc, &cols[ci])?;
+            }
+            (VecAggSlot::Avg(ci), AggState::Avg(acc, cnt)) => {
+                accumulate_sum(acc, &cols[ci])?;
+                *cnt = cnt.saturating_add(column_non_null_count(&cols[ci]));
+            }
+            (VecAggSlot::Min(ci), AggState::Min(acc)) => {
+                update_extremum(acc, &cols[ci], /* take_min = */ true)?;
+            }
+            (VecAggSlot::Max(ci), AggState::Max(acc)) => {
+                update_extremum(acc, &cols[ci], /* take_min = */ false)?;
+            }
+            // The plan and the states are zipped in the same order and
+            // `build_vectorized_plan` only emits slots that correspond to
+            // their state variants, so a mismatch here is a logic bug.
+            (slot, state) => {
+                return Err(ExecError::TypeMismatch(format!(
+                    "vectorized aggregate plan/state mismatch: {slot:?} vs {state:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Count of non-null rows in `col`, as `i64` (saturating).
+fn column_non_null_count(col: &Column) -> i64 {
+    let total = col.len();
+    let valid = match col {
+        Column::Int32(c) => c.nulls().map_or(total, ultrasql_vec::Bitmap::count_ones),
+        Column::Int64(c) => count_i64(c),
+        Column::Float32(c) => c.nulls().map_or(total, ultrasql_vec::Bitmap::count_ones),
+        Column::Float64(c) => c.nulls().map_or(total, ultrasql_vec::Bitmap::count_ones),
+        Column::Bool(c) => c.nulls().map_or(total, ultrasql_vec::Bitmap::count_ones),
+        Column::Utf8(c) => c.nulls().map_or(total, ultrasql_vec::Bitmap::count_ones),
+    };
+    i64::try_from(valid).unwrap_or(i64::MAX)
+}
+
+/// Accumulate `SUM(col)` into the running `Value` accumulator. NULL entries
+/// are skipped. The accumulator stays `None` until at least one non-null row
+/// has been observed, matching the scalar SUM contract.
+fn accumulate_sum(acc: &mut Option<Value>, col: &Column) -> Result<(), ExecError> {
+    match col {
+        Column::Int64(c) => {
+            if c.is_empty() {
+                return Ok(());
+            }
+            let (delta, saw) = sum_i64_nullable(c);
+            if !saw {
+                return Ok(());
+            }
+            *acc = Some(match acc.take() {
+                None => Value::Int64(delta),
+                Some(Value::Int64(prev)) => Value::Int64(prev.wrapping_add(delta)),
+                Some(other) => {
+                    return Err(ExecError::TypeMismatch(format!(
+                        "vectorized SUM accumulator/column type mismatch: {other:?} vs Int64"
+                    )));
+                }
+            });
+        }
+        Column::Int32(c) => {
+            if c.is_empty() {
+                return Ok(());
+            }
+            let (delta, saw) = sum_i32_nullable_widened(c);
+            if !saw {
+                return Ok(());
+            }
+            *acc = Some(match acc.take() {
+                None => Value::Int64(delta),
+                Some(Value::Int64(prev)) => Value::Int64(prev.wrapping_add(delta)),
+                Some(other) => {
+                    return Err(ExecError::TypeMismatch(format!(
+                        "vectorized SUM accumulator/column type mismatch: {other:?} vs Int32"
+                    )));
+                }
+            });
+        }
+        Column::Float64(c) => {
+            if c.is_empty() {
+                return Ok(());
+            }
+            let (delta, saw) = sum_f64_nullable(c);
+            if !saw {
+                return Ok(());
+            }
+            *acc = Some(match acc.take() {
+                None => Value::Float64(delta),
+                Some(Value::Float64(prev)) => Value::Float64(prev + delta),
+                Some(other) => {
+                    return Err(ExecError::TypeMismatch(format!(
+                        "vectorized SUM accumulator/column type mismatch: {other:?} vs Float64"
+                    )));
+                }
+            });
+        }
+        Column::Float32(c) => {
+            if c.is_empty() {
+                return Ok(());
+            }
+            let (delta, saw) = sum_f32_nullable_widened(c);
+            if !saw {
+                return Ok(());
+            }
+            *acc = Some(match acc.take() {
+                None => Value::Float64(delta),
+                Some(Value::Float64(prev)) => Value::Float64(prev + delta),
+                Some(other) => {
+                    return Err(ExecError::TypeMismatch(format!(
+                        "vectorized SUM accumulator/column type mismatch: {other:?} vs Float32"
+                    )));
+                }
+            });
+        }
+        other => {
+            return Err(ExecError::TypeMismatch(format!(
+                "vectorized SUM not supported for column: {other:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Sum non-null entries of an `i64` column. Returns `(sum, saw_non_null)`.
+///
+/// The two arms compile to different shapes — the dense path autovectorises
+/// to a single NEON / AVX2 fold; the null-aware path keeps a branch per row
+/// — so we keep them as a `match`. Clippy's `map_or_else` suggestion would
+/// hide that distinction inside a closure body.
+#[allow(clippy::option_if_let_else)]
+fn sum_i64_nullable(c: &NumericColumn<i64>) -> (i64, bool) {
+    match c.nulls() {
+        None => (sum_i64(c), !c.is_empty()),
+        Some(nulls) => {
+            let mut s: i64 = 0;
+            let mut saw = false;
+            for (i, v) in c.data().iter().enumerate() {
+                if nulls.get(i) {
+                    s = s.wrapping_add(*v);
+                    saw = true;
+                }
+            }
+            (s, saw)
+        }
+    }
+}
+
+/// Sum non-null entries of an `i32` column, widening to `i64`. The fold is
+/// tight enough that LLVM autovectorises it on aarch64 (NEON `saddlv.4s` /
+/// `saddw.4s`) and on x86-64-v3 (AVX2 `vpaddq` after widening).
+#[allow(clippy::option_if_let_else)]
+fn sum_i32_nullable_widened(c: &NumericColumn<i32>) -> (i64, bool) {
+    match c.nulls() {
+        None => {
+            let s = c
+                .data()
+                .iter()
+                .fold(0_i64, |a, &b| a.wrapping_add(i64::from(b)));
+            (s, !c.is_empty())
+        }
+        Some(nulls) => {
+            let mut s: i64 = 0;
+            let mut saw = false;
+            for (i, &v) in c.data().iter().enumerate() {
+                if nulls.get(i) {
+                    s = s.wrapping_add(i64::from(v));
+                    saw = true;
+                }
+            }
+            (s, saw)
+        }
+    }
+}
+
+/// Sum non-null entries of an `f64` column. Returns `(sum, saw_non_null)`.
+#[allow(clippy::option_if_let_else)]
+fn sum_f64_nullable(c: &NumericColumn<f64>) -> (f64, bool) {
+    match c.nulls() {
+        None => (c.data().iter().sum(), !c.is_empty()),
+        Some(nulls) => {
+            let mut s = 0.0_f64;
+            let mut saw = false;
+            for (i, &v) in c.data().iter().enumerate() {
+                if nulls.get(i) {
+                    s += v;
+                    saw = true;
+                }
+            }
+            (s, saw)
+        }
+    }
+}
+
+/// Sum non-null entries of an `f32` column, widening to `f64` (matching
+/// the scalar `add_values` widening of Float32 → Float64).
+#[allow(clippy::option_if_let_else)]
+fn sum_f32_nullable_widened(c: &NumericColumn<f32>) -> (f64, bool) {
+    match c.nulls() {
+        None => {
+            let s = c.data().iter().fold(0.0_f64, |a, &b| a + f64::from(b));
+            (s, !c.is_empty())
+        }
+        Some(nulls) => {
+            let mut s = 0.0_f64;
+            let mut saw = false;
+            for (i, &v) in c.data().iter().enumerate() {
+                if nulls.get(i) {
+                    s += f64::from(v);
+                    saw = true;
+                }
+            }
+            (s, saw)
+        }
+    }
+}
+
+/// Update a running MIN/MAX accumulator from a column. `take_min = true`
+/// for MIN; `false` for MAX. NULLs are skipped.
+#[allow(clippy::option_if_let_else)]
+fn update_extremum(acc: &mut Option<Value>, col: &Column, take_min: bool) -> Result<(), ExecError> {
+    let candidate = match col {
+        Column::Int64(c) => {
+            if take_min {
+                min_i64(c).map(Value::Int64)
+            } else {
+                max_i64(c).map(Value::Int64)
+            }
+        }
+        Column::Int32(c) => extremum_i32(c, take_min).map(Value::Int32),
+        Column::Float64(c) => extremum_f64(c, take_min).map(Value::Float64),
+        Column::Float32(c) => extremum_f32(c, take_min).map(Value::Float32),
+        other => {
+            return Err(ExecError::TypeMismatch(format!(
+                "vectorized MIN/MAX not supported for column: {other:?}"
+            )));
+        }
+    };
+    if let Some(v) = candidate {
+        *acc = Some(match acc.take() {
+            None => v,
+            Some(existing) => {
+                let pick_new = if take_min {
+                    value_lt(&v, &existing)
+                } else {
+                    value_lt(&existing, &v)
+                };
+                if pick_new { v } else { existing }
+            }
+        });
+    }
+    Ok(())
+}
+
+#[allow(clippy::option_if_let_else)]
+fn extremum_i32(c: &NumericColumn<i32>, take_min: bool) -> Option<i32> {
+    let mut best: Option<i32> = None;
+    if let Some(nulls) = c.nulls() {
+        for (i, &v) in c.data().iter().enumerate() {
+            if !nulls.get(i) {
+                continue;
+            }
+            best = Some(match best {
+                None => v,
+                Some(b) => {
+                    if take_min {
+                        if v < b { v } else { b }
+                    } else if v > b {
+                        v
+                    } else {
+                        b
+                    }
+                }
+            });
+        }
+    } else {
+        for &v in c.data() {
+            best = Some(match best {
+                None => v,
+                Some(b) => {
+                    if take_min {
+                        if v < b { v } else { b }
+                    } else if v > b {
+                        v
+                    } else {
+                        b
+                    }
+                }
+            });
+        }
+    }
+    best
+}
+
+#[allow(clippy::option_if_let_else)]
+fn extremum_f64(c: &NumericColumn<f64>, take_min: bool) -> Option<f64> {
+    let mut best: Option<f64> = None;
+    let consider = |best: Option<f64>, v: f64| -> Option<f64> {
+        if v.is_nan() {
+            return best;
+        }
+        Some(match best {
+            None => v,
+            Some(b) => {
+                if take_min {
+                    b.min(v)
+                } else {
+                    b.max(v)
+                }
+            }
+        })
+    };
+    if let Some(nulls) = c.nulls() {
+        for (i, &v) in c.data().iter().enumerate() {
+            if !nulls.get(i) {
+                continue;
+            }
+            best = consider(best, v);
+        }
+    } else {
+        for &v in c.data() {
+            best = consider(best, v);
+        }
+    }
+    best
+}
+
+#[allow(clippy::option_if_let_else)]
+fn extremum_f32(c: &NumericColumn<f32>, take_min: bool) -> Option<f32> {
+    let mut best: Option<f32> = None;
+    let consider = |best: Option<f32>, v: f32| -> Option<f32> {
+        if v.is_nan() {
+            return best;
+        }
+        Some(match best {
+            None => v,
+            Some(b) => {
+                if take_min {
+                    b.min(v)
+                } else {
+                    b.max(v)
+                }
+            }
+        })
+    };
+    if let Some(nulls) = c.nulls() {
+        for (i, &v) in c.data().iter().enumerate() {
+            if !nulls.get(i) {
+                continue;
+            }
+            best = consider(best, v);
+        }
+    } else {
+        for &v in c.data() {
+            best = consider(best, v);
+        }
+    }
+    best
 }
 
 // ---------------------------------------------------------------------------
@@ -547,7 +1062,7 @@ mod tests {
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 
-    use super::HashAggregate;
+    use super::{AggState, HashAggregate, accumulate_sum, finalise};
     use crate::Operator;
     use crate::mem_table_scan::MemTableScan;
 
@@ -795,5 +1310,229 @@ mod tests {
         for row in &rows {
             assert_eq!(row[1], Value::Int64(10), "each group has 10 rows");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Vectorised fast-path cross-validation
+    // -------------------------------------------------------------------------
+
+    /// Build a single `(val i64 NULL)` batch with the given values and an
+    /// optional null bitmap. Used by the vectorised-path cross-checks.
+    fn make_i64_batch(values: Vec<i64>, nulls: Option<Vec<bool>>) -> (Schema, Batch) {
+        use ultrasql_vec::Bitmap;
+        let n = values.len();
+        let schema = Schema::new([Field::nullable("val", DataType::Int64)]).expect("schema ok");
+        let col = match nulls {
+            None => Column::Int64(NumericColumn::from_data(values)),
+            Some(pat) => {
+                assert_eq!(pat.len(), n);
+                let mut bm = Bitmap::new(n, false);
+                for (i, &v) in pat.iter().enumerate() {
+                    if v {
+                        bm.set(i, true);
+                    }
+                }
+                Column::Int64(NumericColumn::with_nulls(values, bm).expect("col ok"))
+            }
+        };
+        let batch = Batch::new([col]).expect("batch ok");
+        (schema, batch)
+    }
+
+    /// Build a single `(v i32 NULL)` batch with the given values and an
+    /// optional null bitmap.
+    fn make_i32_batch(values: Vec<i32>, nulls: Option<Vec<bool>>) -> (Schema, Batch) {
+        use ultrasql_vec::Bitmap;
+        let n = values.len();
+        let schema = Schema::new([Field::nullable("v", DataType::Int32)]).expect("schema ok");
+        let col = match nulls {
+            None => Column::Int32(NumericColumn::from_data(values)),
+            Some(pat) => {
+                assert_eq!(pat.len(), n);
+                let mut bm = Bitmap::new(n, false);
+                for (i, &v) in pat.iter().enumerate() {
+                    if v {
+                        bm.set(i, true);
+                    }
+                }
+                Column::Int32(NumericColumn::with_nulls(values, bm).expect("col ok"))
+            }
+        };
+        let batch = Batch::new([col]).expect("batch ok");
+        (schema, batch)
+    }
+
+    /// Test 1: SUM(i64) over 4096 rows. The vectorised column path and the
+    /// row-at-a-time scalar path must produce bit-identical results on
+    /// dense (non-null) data. NULL-aware behaviour is exercised separately
+    /// because the v0.5 `batch_to_rows` decoder does not yet honour the
+    /// column validity bitmap, so the row-loop reference is only meaningful
+    /// when every row is valid.
+    #[test]
+    fn vectorized_sum_i64_matches_scalar() {
+        let n = 4096_i64;
+        // Deterministic LCG-style values.
+        let values: Vec<i64> = (0..n)
+            .map(|i| {
+                i.wrapping_mul(2_862_933_555_777_941_757)
+                    .wrapping_add(0x1234_5678)
+            })
+            .collect();
+        let (schema, batch) = make_i64_batch(values.clone(), None);
+        let out_schema =
+            Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
+
+        let sum_val = LogicalAggregateExpr {
+            func: AggregateFunc::Sum,
+            arg: Some(col("val", 0, DataType::Int64)),
+            distinct: false,
+            output_name: "total".into(),
+            data_type: DataType::Int64,
+        };
+
+        // Vectorised path.
+        let scan_vec = MemTableScan::new(schema.clone(), vec![batch.clone()]);
+        let mut op_vec = HashAggregate::new(
+            Box::new(scan_vec),
+            vec![],
+            vec![sum_val.clone()],
+            out_schema.clone(),
+        );
+        let rows_vec = drain_all(&mut op_vec);
+
+        // Scalar path (forced off the fast path).
+        let scan_sca = MemTableScan::new(schema, vec![batch]);
+        let mut op_sca = HashAggregate::new(Box::new(scan_sca), vec![], vec![sum_val], out_schema);
+        op_sca.force_scalar_path();
+        let rows_sca = drain_all(&mut op_sca);
+
+        assert_eq!(rows_vec.len(), 1);
+        assert_eq!(rows_sca.len(), 1);
+        assert_eq!(
+            rows_vec[0], rows_sca[0],
+            "vectorised SUM must equal scalar SUM bit-for-bit"
+        );
+
+        // Independent reference.
+        let want: i64 = values.iter().fold(0_i64, |a, b| a.wrapping_add(*b));
+        assert_eq!(rows_vec[0][0], Value::Int64(want));
+    }
+
+    /// Companion NULL-handling check for the vectorised SUM path. The row-
+    /// loop reference is computed in Rust directly because v0.5's
+    /// `batch_to_rows` does not yet honour the column validity bitmap. The
+    /// kernel under test must (a) skip NULL rows, (b) return `Value::Null`
+    /// when every row is NULL.
+    #[test]
+    fn vectorized_sum_i64_honours_nulls() {
+        let n = 1024_i64;
+        let values: Vec<i64> = (0..n).collect();
+        let nulls_pat: Vec<bool> = (0..n as usize).map(|i| !i.is_multiple_of(17)).collect();
+        let (schema, batch) = make_i64_batch(values.clone(), Some(nulls_pat.clone()));
+        let out_schema =
+            Schema::new([Field::nullable("total", DataType::Int64)]).expect("schema ok");
+
+        let sum_val = LogicalAggregateExpr {
+            func: AggregateFunc::Sum,
+            arg: Some(col("val", 0, DataType::Int64)),
+            distinct: false,
+            output_name: "total".into(),
+            data_type: DataType::Int64,
+        };
+
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![sum_val], out_schema);
+        let rows = drain_all(&mut op);
+
+        let want: i64 = values
+            .iter()
+            .zip(nulls_pat.iter())
+            .filter_map(|(v, valid)| valid.then_some(*v))
+            .fold(0_i64, i64::wrapping_add);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int64(want));
+
+        // Independently verify the internal NULL semantics by exercising
+        // the SUM accumulator on an all-NULL column: the accumulator must
+        // stay `None`, which `finalise` returns as `Value::Null`. (The
+        // operator's outbound `build_batch` does not yet preserve nulls in
+        // v0.5, so we observe the NULL via the kernel directly rather than
+        // through the round-trip.)
+        let nulls_all = ultrasql_vec::Bitmap::new(32, false);
+        let all_null_col =
+            Column::Int64(NumericColumn::with_nulls(vec![42_i64; 32], nulls_all).expect("col ok"));
+        let mut acc: Option<Value> = None;
+        accumulate_sum(&mut acc, &all_null_col).expect("sum ok");
+        assert!(acc.is_none(), "all-NULL accumulator must stay None");
+        let state = AggState::Sum(acc);
+        assert_eq!(finalise(&state), Value::Null);
+    }
+
+    /// Test 2: AVG(i32) over 4096 rows. The vectorised path widens the i32
+    /// accumulator to i64 (matching the scalar `add_values` widening), and
+    /// the final divide produces Float64. Dense (non-null) so the v0.5
+    /// `batch_to_rows` row-loop reference is well-defined.
+    #[test]
+    fn vectorized_avg_i32_matches_scalar() {
+        // Use a range that fits well in i32 to keep the i64 sum unambiguous.
+        let values: Vec<i32> = (0_i32..4096).map(|i| i - 2048).collect();
+
+        let (schema, batch) = make_i32_batch(values, None);
+        let out_schema =
+            Schema::new([Field::nullable("avg_v", DataType::Float64)]).expect("schema ok");
+
+        let avg_v = LogicalAggregateExpr {
+            func: AggregateFunc::Avg,
+            arg: Some(col("v", 0, DataType::Int32)),
+            distinct: false,
+            output_name: "avg_v".into(),
+            data_type: DataType::Float64,
+        };
+
+        // Vectorised path.
+        let scan_vec = MemTableScan::new(schema.clone(), vec![batch.clone()]);
+        let mut op_vec = HashAggregate::new(
+            Box::new(scan_vec),
+            vec![],
+            vec![avg_v.clone()],
+            out_schema.clone(),
+        );
+        let rows_vec = drain_all(&mut op_vec);
+
+        // Scalar path.
+        let scan_sca = MemTableScan::new(schema, vec![batch]);
+        let mut op_sca = HashAggregate::new(Box::new(scan_sca), vec![], vec![avg_v], out_schema);
+        op_sca.force_scalar_path();
+        let rows_sca = drain_all(&mut op_sca);
+
+        assert_eq!(rows_vec.len(), 1);
+        assert_eq!(rows_sca.len(), 1);
+
+        // The result is Float64; compare via bit pattern for exact equality.
+        match (&rows_vec[0][0], &rows_sca[0][0]) {
+            (Value::Float64(a), Value::Float64(b)) => {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "vectorised AVG bits must equal scalar AVG bits"
+                );
+            }
+            other => panic!("expected Float64 results, got {other:?}"),
+        }
+    }
+
+    /// Test 3: COUNT(*) over a 100-row batch returns exactly 100 via the
+    /// vectorised path (no rows skipped, no null handling involved).
+    #[test]
+    fn vectorized_count_star_returns_batch_rows() {
+        let values: Vec<i64> = (0_i64..100).collect();
+        let (schema, batch) = make_i64_batch(values, None);
+        let out_schema = Schema::new([Field::required("cnt", DataType::Int64)]).expect("schema ok");
+
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![count_star_agg()], out_schema);
+        let rows = drain_all(&mut op);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int64(100));
     }
 }

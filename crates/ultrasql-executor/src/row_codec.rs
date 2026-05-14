@@ -4,42 +4,19 @@
 //! buffer suitable for use as the `payload` of a heap tuple. The codec
 //! is the inverse of `decode` and is stable for v0.5.
 //!
-//! Wire format
-//! -----------
-//!
-//! ```text
-//!  null_bitmap (ceil(n / 8) bytes, LSB-first per column)
-//!  field_0 …    fixed-width fields in schema order, little-endian
-//!  field_n      variable-width fields: u32 length prefix + bytes
-//! ```
-//!
-//! Only NOT-NULL fields' bytes appear (a column whose bitmap bit is set
-//! contributes zero bytes). Nullability is determined per-row, not
-//! per-schema.
-//!
-//! Supported types in v0.5
+//! Streaming decode (v0.6)
 //! -----------------------
 //!
-//! - `DataType::Bool`         — 1 byte
-//! - `DataType::Int16`        — 2 bytes (LE)
-//! - `DataType::Int32`        — 4 bytes (LE)
-//! - `DataType::Int64`        — 8 bytes (LE)
-//! - `DataType::Float32`      — 4 bytes (LE)
-//! - `DataType::Float64`      — 8 bytes (LE)
-//! - `DataType::Text { .. }`  — u32 length-prefixed UTF-8
-//! - `DataType::Null`         — column-level marker; rows always encode the bitmap bit
-//!
-//! Unsupported types return [`RowCodecError::UnsupportedType`] in encode
-//! and decode. Adding a type is straightforward; do not silently accept
-//! a type the codec can't round-trip.
+//! [`RowCodec::decode_into_builders`] decodes a tuple's bytes
+//! directly into a parallel slice of [`ColumnBuilder`]s, skipping the
+//! `Vec<Value>` row intermediate.
 
 use ultrasql_core::{DataType, Schema, Value};
+use ultrasql_vec::Batch;
+use ultrasql_vec::bitmap::Bitmap;
+use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
 /// Binary codec bound to a fixed [`Schema`].
-///
-/// The schema determines the expected column count and types. A single
-/// `RowCodec` instance is safe to reuse for many rows — the internal
-/// encoding/decoding state is entirely stack-allocated.
 #[derive(Clone, Debug)]
 pub struct RowCodec {
     schema: Schema,
@@ -47,8 +24,6 @@ pub struct RowCodec {
 
 impl RowCodec {
     /// Bind a codec to `schema`.
-    ///
-    /// Every subsequent `encode`/`decode` call is checked against this schema.
     #[must_use]
     pub const fn new(schema: Schema) -> Self {
         Self { schema }
@@ -62,16 +37,11 @@ impl RowCodec {
 
     /// Encode `row` into a byte payload.
     ///
-    /// The row must have the same arity as the codec's schema and each
-    /// value must be type-compatible with the corresponding field.
-    ///
     /// # Errors
     ///
     /// - [`RowCodecError::Arity`] — `row.len() != schema.len()`.
-    /// - [`RowCodecError::Type`] — a value's runtime type does not
-    ///   match the schema field's declared type.
-    /// - [`RowCodecError::UnsupportedType`] — the field's `DataType`
-    ///   is not in the v0.5 supported set.
+    /// - [`RowCodecError::Type`] — runtime/schema type mismatch.
+    /// - [`RowCodecError::UnsupportedType`] — unsupported `DataType`.
     pub fn encode(&self, row: &[Value]) -> Result<Vec<u8>, RowCodecError> {
         let n = self.schema.len();
         if row.len() != n {
@@ -80,26 +50,19 @@ impl RowCodec {
                 row: row.len(),
             });
         }
-
-        // Null bitmap: ceil(n / 8) bytes, LSB = column 0.
         let bitmap_bytes = n.div_ceil(8);
         let mut bitmap = vec![0_u8; bitmap_bytes];
         let mut payload: Vec<u8> = Vec::new();
 
         for (col_idx, (value, field)) in row.iter().zip(self.schema.fields().iter()).enumerate() {
             if matches!(value, Value::Null) {
-                // Set the null bit; no data bytes contributed.
                 let byte = col_idx / 8;
                 let bit = col_idx % 8;
                 bitmap[byte] |= 1 << bit;
                 continue;
             }
-
-            // Non-null: check type compatibility and append data bytes.
             match (&field.data_type, value) {
-                (DataType::Bool, Value::Bool(v)) => {
-                    payload.push(u8::from(*v));
-                }
+                (DataType::Bool, Value::Bool(v)) => payload.push(u8::from(*v)),
                 (DataType::Int16, Value::Int16(v)) => {
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
@@ -126,9 +89,6 @@ impl RowCodec {
                     payload.extend_from_slice(bytes);
                 }
                 (DataType::Null, _) => {
-                    // DataType::Null columns are always encoded as null;
-                    // if we reach here the value is not Value::Null which
-                    // is a type mismatch.
                     return Err(RowCodecError::Type {
                         column: col_idx,
                         expected: field.data_type.clone(),
@@ -136,8 +96,6 @@ impl RowCodec {
                     });
                 }
                 (expected, got) => {
-                    // Check for unsupported type first (takes priority over
-                    // type-mismatch so the caller sees a clear message).
                     if !is_supported_type(expected) {
                         return Err(RowCodecError::UnsupportedType {
                             column: col_idx,
@@ -152,48 +110,38 @@ impl RowCodec {
                 }
             }
         }
-
-        // Prepend the bitmap.
         let mut out = bitmap;
         out.extend_from_slice(&payload);
         Ok(out)
     }
 
-    /// Decode a byte payload previously produced by [`Self::encode`] back
-    /// into a `Vec<Value>`.
+    /// Decode a byte payload previously produced by [`Self::encode`].
     ///
     /// # Errors
     ///
-    /// - [`RowCodecError::Truncated`] — the buffer is shorter than the
-    ///   bitmap or any field's data.
-    /// - [`RowCodecError::UnsupportedType`] — a field's `DataType` is not
-    ///   in the v0.5 supported set.
-    /// - [`RowCodecError::InvalidUtf8`] — a `Text` field contains
-    ///   invalid UTF-8.
+    /// - [`RowCodecError::Truncated`] — buffer too short.
+    /// - [`RowCodecError::UnsupportedType`] — unsupported `DataType`.
+    /// - [`RowCodecError::InvalidUtf8`] — invalid UTF-8 in a Text.
     #[allow(clippy::too_many_lines)]
     pub fn decode(&self, bytes: &[u8]) -> Result<Vec<Value>, RowCodecError> {
         let n = self.schema.len();
         let bitmap_bytes = n.div_ceil(8);
-
         if bytes.len() < bitmap_bytes {
             return Err(RowCodecError::Truncated {
                 needed: bitmap_bytes,
                 have: bytes.len(),
             });
         }
-
         let bitmap = &bytes[..bitmap_bytes];
         let mut cursor = bitmap_bytes;
         let mut row: Vec<Value> = Vec::with_capacity(n);
 
         for (col_idx, field) in self.schema.fields().iter().enumerate() {
-            // Check null bit.
             let null_bit = (bitmap[col_idx / 8] >> (col_idx % 8)) & 1;
             if null_bit != 0 {
                 row.push(Value::Null);
                 continue;
             }
-
             let value = match &field.data_type {
                 DataType::Bool => {
                     let needed = cursor + 1;
@@ -293,7 +241,6 @@ impl RowCodec {
                     Value::Float64(f64::from_le_bytes(raw))
                 }
                 DataType::Text { .. } => {
-                    // u32 length prefix
                     let len_end = cursor + 4;
                     if bytes.len() < len_end {
                         return Err(RowCodecError::Truncated {
@@ -323,10 +270,6 @@ impl RowCodec {
                     Value::Text(s)
                 }
                 DataType::Null => {
-                    // DataType::Null columns are always null in the bitmap;
-                    // if the null bit was zero something is wrong. Treat as
-                    // an unsupported-type decode (the bitmap should have had
-                    // the bit set).
                     return Err(RowCodecError::UnsupportedType {
                         column: col_idx,
                         ty: DataType::Null,
@@ -341,12 +284,503 @@ impl RowCodec {
             };
             row.push(value);
         }
-
         Ok(row)
+    }
+
+    /// Initialise a `Vec<ColumnBuilder>` matching this codec's schema.
+    ///
+    /// # Errors
+    ///
+    /// [`RowCodecError::UnsupportedType`] for unsupported types.
+    pub(crate) fn new_builders(
+        &self,
+        capacity: usize,
+    ) -> Result<Vec<ColumnBuilder>, RowCodecError> {
+        let mut out: Vec<ColumnBuilder> = Vec::with_capacity(self.schema.len());
+        for (idx, field) in self.schema.fields().iter().enumerate() {
+            out.push(ColumnBuilder::new(&field.data_type, capacity, idx)?);
+        }
+        Ok(out)
+    }
+
+    /// Decode one tuple's `bytes` directly into `builders`.
+    ///
+    /// # Errors
+    ///
+    /// Same shape as [`Self::decode`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `builders.len() != self.schema.len()`.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn decode_into_builders(
+        &self,
+        bytes: &[u8],
+        builders: &mut [ColumnBuilder],
+    ) -> Result<(), RowCodecError> {
+        let n = self.schema.len();
+        assert_eq!(builders.len(), n, "builders.len() must equal schema.len()");
+        let bitmap_bytes = n.div_ceil(8);
+        if bytes.len() < bitmap_bytes {
+            return Err(RowCodecError::Truncated {
+                needed: bitmap_bytes,
+                have: bytes.len(),
+            });
+        }
+        let bitmap = &bytes[..bitmap_bytes];
+        let mut cursor = bitmap_bytes;
+
+        for (col_idx, field) in self.schema.fields().iter().enumerate() {
+            let null_bit = (bitmap[col_idx / 8] >> (col_idx % 8)) & 1;
+            if null_bit != 0 {
+                builders[col_idx].push_null();
+                continue;
+            }
+            match (&field.data_type, &mut builders[col_idx]) {
+                (DataType::Bool, ColumnBuilder::Bool { data, nulls }) => {
+                    let needed = cursor + 1;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    data.push(u8::from(bytes[cursor] != 0));
+                    cursor += 1;
+                    nulls.push_valid();
+                }
+                (DataType::Int16, ColumnBuilder::Int16 { data, nulls }) => {
+                    let needed = cursor + 2;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 2] = bytes[cursor..cursor + 2].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 2;
+                    data.push(i32::from(i16::from_le_bytes(raw)));
+                    nulls.push_valid();
+                }
+                (DataType::Int32, ColumnBuilder::Int32 { data, nulls }) => {
+                    let needed = cursor + 4;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 4] = bytes[cursor..cursor + 4].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 4;
+                    data.push(i32::from_le_bytes(raw));
+                    nulls.push_valid();
+                }
+                (DataType::Int64, ColumnBuilder::Int64 { data, nulls }) => {
+                    let needed = cursor + 8;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 8] = bytes[cursor..cursor + 8].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 8;
+                    data.push(i64::from_le_bytes(raw));
+                    nulls.push_valid();
+                }
+                (DataType::Float32, ColumnBuilder::Float32 { data, nulls }) => {
+                    let needed = cursor + 4;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 4] = bytes[cursor..cursor + 4].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 4;
+                    data.push(f32::from_le_bytes(raw));
+                    nulls.push_valid();
+                }
+                (DataType::Float64, ColumnBuilder::Float64 { data, nulls }) => {
+                    let needed = cursor + 8;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 8] = bytes[cursor..cursor + 8].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 8;
+                    data.push(f64::from_le_bytes(raw));
+                    nulls.push_valid();
+                }
+                (
+                    DataType::Text { .. },
+                    ColumnBuilder::Utf8 {
+                        offsets,
+                        values,
+                        nulls,
+                    },
+                ) => {
+                    let len_end = cursor + 4;
+                    if bytes.len() < len_end {
+                        return Err(RowCodecError::Truncated {
+                            needed: len_end,
+                            have: bytes.len(),
+                        });
+                    }
+                    let len_raw: [u8; 4] = bytes[cursor..cursor + 4].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed: len_end,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    let str_len = usize::try_from(u32::from_le_bytes(len_raw))
+                        .expect("u32 fits in usize on all supported targets");
+                    cursor += 4;
+                    let str_end = cursor + str_len;
+                    if bytes.len() < str_end {
+                        return Err(RowCodecError::Truncated {
+                            needed: str_end,
+                            have: bytes.len(),
+                        });
+                    }
+                    if std::str::from_utf8(&bytes[cursor..str_end]).is_err() {
+                        return Err(RowCodecError::InvalidUtf8(
+                            String::from_utf8(bytes[cursor..str_end].to_vec())
+                                .expect_err("just observed invalid utf8"),
+                            "text column",
+                        ));
+                    }
+                    values.extend_from_slice(&bytes[cursor..str_end]);
+                    cursor += str_len;
+                    let new_end = u32::try_from(values.len()).map_err(|_| {
+                        RowCodecError::UnsupportedType {
+                            column: col_idx,
+                            ty: field.data_type.clone(),
+                        }
+                    })?;
+                    offsets.push(new_end);
+                    nulls.push_valid();
+                }
+                (DataType::Null, _) => {
+                    return Err(RowCodecError::UnsupportedType {
+                        column: col_idx,
+                        ty: DataType::Null,
+                    });
+                }
+                (other, _) => {
+                    return Err(RowCodecError::UnsupportedType {
+                        column: col_idx,
+                        ty: other.clone(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Finalise a row of builders into a `Batch`.
+    ///
+    /// # Errors
+    ///
+    /// [`ultrasql_vec::BatchError`] if builders disagree on length.
+    pub(crate) fn finish_batch(
+        builders: Vec<ColumnBuilder>,
+    ) -> Result<Batch, ultrasql_vec::BatchError> {
+        Batch::new(finish_builders(builders))
+    }
+
+    /// Inject an `Int32` into `builders[col_idx]`. Used to prepend TID
+    /// columns in the scan operator.
+    pub(crate) fn push_i32_into(builders: &mut [ColumnBuilder], col_idx: usize, v: i32) {
+        builders[col_idx].push_i32(v);
     }
 }
 
-/// Whether `ty` is in the v0.5 supported set for encoding.
+// ---------------------------------------------------------------------------
+// Streaming column builders
+// ---------------------------------------------------------------------------
+
+/// Lazy packed null tracker that grows by one bit per row at O(1)
+/// amortised cost. The [`Bitmap`] is materialised lazily on first
+/// observed null and finalised at `finish` time.
+#[derive(Debug, Default)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct NullTracker {
+    words: Vec<u64>,
+    len: usize,
+    active: bool,
+}
+
+impl NullTracker {
+    /// Mark a previously-pushed row as valid.
+    #[inline]
+    pub(crate) fn push_valid(&mut self) {
+        if !self.active {
+            return;
+        }
+        let bit_idx = self.len;
+        let word_idx = bit_idx / 64;
+        if word_idx >= self.words.len() {
+            self.words.push(0);
+        }
+        self.words[word_idx] |= 1_u64 << (bit_idx % 64);
+        self.len += 1;
+    }
+
+    /// Mark a previously-pushed row as null, activating the tracker
+    /// if necessary.
+    #[inline]
+    fn push_null(&mut self, prior_rows: usize) {
+        if !self.active {
+            self.activate(prior_rows);
+        }
+        let bit_idx = self.len;
+        let word_idx = bit_idx / 64;
+        if word_idx >= self.words.len() {
+            self.words.push(0);
+        }
+        self.len += 1;
+    }
+
+    #[cold]
+    fn activate(&mut self, prior_rows: usize) {
+        debug_assert!(!self.active);
+        self.active = true;
+        let words = prior_rows.div_ceil(64);
+        self.words = vec![u64::MAX; words];
+        if prior_rows % 64 != 0 {
+            let mask = (1_u64 << (prior_rows % 64)) - 1;
+            if let Some(last) = self.words.last_mut() {
+                *last &= mask;
+            }
+        }
+        self.len = prior_rows;
+    }
+
+    fn finish(self) -> Option<Bitmap> {
+        if self.active {
+            Some(Bitmap::from_words(self.words, self.len))
+        } else {
+            None
+        }
+    }
+}
+
+/// Per-column accumulator owning a typed `Vec<T>` plus a null tracker.
+#[derive(Debug)]
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) enum ColumnBuilder {
+    Bool {
+        data: Vec<u8>,
+        nulls: NullTracker,
+    },
+    Int16 {
+        data: Vec<i32>,
+        nulls: NullTracker,
+    },
+    Int32 {
+        data: Vec<i32>,
+        nulls: NullTracker,
+    },
+    Int64 {
+        data: Vec<i64>,
+        nulls: NullTracker,
+    },
+    Float32 {
+        data: Vec<f32>,
+        nulls: NullTracker,
+    },
+    Float64 {
+        data: Vec<f64>,
+        nulls: NullTracker,
+    },
+    Utf8 {
+        offsets: Vec<u32>,
+        values: Vec<u8>,
+        nulls: NullTracker,
+    },
+}
+
+impl ColumnBuilder {
+    fn new(ty: &DataType, capacity: usize, col_idx: usize) -> Result<Self, RowCodecError> {
+        Ok(match ty {
+            DataType::Bool => Self::Bool {
+                data: Vec::with_capacity(capacity),
+                nulls: NullTracker::default(),
+            },
+            DataType::Int16 => Self::Int16 {
+                data: Vec::with_capacity(capacity),
+                nulls: NullTracker::default(),
+            },
+            DataType::Int32 => Self::Int32 {
+                data: Vec::with_capacity(capacity),
+                nulls: NullTracker::default(),
+            },
+            DataType::Int64 => Self::Int64 {
+                data: Vec::with_capacity(capacity),
+                nulls: NullTracker::default(),
+            },
+            DataType::Float32 => Self::Float32 {
+                data: Vec::with_capacity(capacity),
+                nulls: NullTracker::default(),
+            },
+            DataType::Float64 => Self::Float64 {
+                data: Vec::with_capacity(capacity),
+                nulls: NullTracker::default(),
+            },
+            DataType::Text { .. } => Self::Utf8 {
+                offsets: {
+                    let mut o = Vec::with_capacity(capacity + 1);
+                    o.push(0);
+                    o
+                },
+                values: Vec::with_capacity(capacity.saturating_mul(16)),
+                nulls: NullTracker::default(),
+            },
+            other => {
+                return Err(RowCodecError::UnsupportedType {
+                    column: col_idx,
+                    ty: other.clone(),
+                });
+            }
+        })
+    }
+
+    fn push_null(&mut self) {
+        match self {
+            Self::Bool { data, nulls } => {
+                let prior = data.len();
+                nulls.push_null(prior);
+                data.push(0);
+            }
+            Self::Int16 { data, nulls } | Self::Int32 { data, nulls } => {
+                let prior = data.len();
+                nulls.push_null(prior);
+                data.push(0);
+            }
+            Self::Int64 { data, nulls } => {
+                let prior = data.len();
+                nulls.push_null(prior);
+                data.push(0);
+            }
+            Self::Float32 { data, nulls } => {
+                let prior = data.len();
+                nulls.push_null(prior);
+                data.push(0.0);
+            }
+            Self::Float64 { data, nulls } => {
+                let prior = data.len();
+                nulls.push_null(prior);
+                data.push(0.0);
+            }
+            Self::Utf8 {
+                offsets,
+                values,
+                nulls,
+            } => {
+                let prior = offsets.len().saturating_sub(1);
+                nulls.push_null(prior);
+                offsets.push(u32::try_from(values.len()).unwrap_or(u32::MAX));
+            }
+        }
+    }
+
+    fn push_i32(&mut self, v: i32) {
+        match self {
+            Self::Int32 { data, nulls } | Self::Int16 { data, nulls } => {
+                data.push(v);
+                nulls.push_valid();
+            }
+            _ => unreachable!("push_i32 called on non-Int32/Int16 builder"),
+        }
+    }
+}
+
+fn finish_builders(builders: Vec<ColumnBuilder>) -> Vec<Column> {
+    let mut out: Vec<Column> = Vec::with_capacity(builders.len());
+    for b in builders {
+        let col = match b {
+            ColumnBuilder::Bool { data, nulls: _ } => {
+                let bools: Vec<bool> = data.iter().map(|&b| b != 0).collect();
+                Column::Bool(BoolColumn::from_data(bools))
+            }
+            ColumnBuilder::Int16 { data, nulls } | ColumnBuilder::Int32 { data, nulls } => {
+                match nulls.finish() {
+                    Some(bm) => Column::Int32(
+                        NumericColumn::with_nulls(data, bm).expect("builder length invariant"),
+                    ),
+                    None => Column::Int32(NumericColumn::from_data(data)),
+                }
+            }
+            ColumnBuilder::Int64 { data, nulls } => match nulls.finish() {
+                Some(bm) => Column::Int64(
+                    NumericColumn::with_nulls(data, bm).expect("builder length invariant"),
+                ),
+                None => Column::Int64(NumericColumn::from_data(data)),
+            },
+            ColumnBuilder::Float32 { data, nulls } => match nulls.finish() {
+                Some(bm) => Column::Float32(
+                    NumericColumn::with_nulls(data, bm).expect("builder length invariant"),
+                ),
+                None => Column::Float32(NumericColumn::from_data(data)),
+            },
+            ColumnBuilder::Float64 { data, nulls } => match nulls.finish() {
+                Some(bm) => Column::Float64(
+                    NumericColumn::with_nulls(data, bm).expect("builder length invariant"),
+                ),
+                None => Column::Float64(NumericColumn::from_data(data)),
+            },
+            ColumnBuilder::Utf8 {
+                offsets,
+                values,
+                nulls: _,
+            } => Column::Utf8(string_column_from_parts(&offsets, &values)),
+        };
+        out.push(col);
+    }
+    out
+}
+
+fn string_column_from_parts(offsets: &[u32], values: &[u8]) -> StringColumn {
+    let n = offsets.len().saturating_sub(1);
+    let mut rows: Vec<String> = Vec::with_capacity(n);
+    for i in 0..n {
+        let start = offsets[i] as usize;
+        let end = offsets[i + 1] as usize;
+        let s = String::from_utf8(values[start..end].to_vec())
+            .expect("StringColumn builder invariant: values are validated UTF-8");
+        rows.push(s);
+    }
+    StringColumn::from_data(rows)
+}
+
 const fn is_supported_type(ty: &DataType) -> bool {
     matches!(
         ty,
@@ -364,46 +798,41 @@ const fn is_supported_type(ty: &DataType) -> bool {
 /// Errors raised by [`RowCodec`].
 #[derive(Debug, thiserror::Error)]
 pub enum RowCodecError {
-    /// The row's column count does not match the schema.
+    /// Arity mismatch.
     #[error("arity mismatch: schema has {schema}, row has {row}")]
     Arity {
-        /// Number of columns declared in the schema.
+        /// Schema arity.
         schema: usize,
-        /// Number of values in the row supplied by the caller.
+        /// Caller-supplied row arity.
         row: usize,
     },
-
-    /// A value's runtime type does not match the schema field's declared
-    /// type.
+    /// Type mismatch.
     #[error("type mismatch at column {column}: expected {expected}, got {got}")]
     Type {
-        /// Zero-based column index.
+        /// Column index.
         column: usize,
-        /// The schema's declared type for this column.
+        /// Expected schema type.
         expected: DataType,
-        /// Human-readable name of the actual value type.
+        /// Runtime type name.
         got: String,
     },
-
-    /// The payload is shorter than the codec's minimum expectation.
+    /// Truncated payload.
     #[error("payload truncated: needed {needed}, have {have}")]
     Truncated {
-        /// Minimum number of bytes required at the current cursor position.
+        /// Required byte count.
         needed: usize,
-        /// Actual length of the supplied buffer.
+        /// Actual byte count.
         have: usize,
     },
-
-    /// The schema contains a type this codec version cannot handle.
+    /// Unsupported type.
     #[error("unsupported type at column {column}: {ty}")]
     UnsupportedType {
-        /// Zero-based column index.
+        /// Column index.
         column: usize,
-        /// The unsupported type.
+        /// Unsupported `DataType`.
         ty: DataType,
     },
-
-    /// A `Text` field contained bytes that are not valid UTF-8.
+    /// Invalid UTF-8 in a Text column.
     #[error("invalid utf8 at column {1}: {0}")]
     InvalidUtf8(#[source] std::string::FromUtf8Error, &'static str),
 }
@@ -415,165 +844,117 @@ mod tests {
 
     use super::{RowCodec, RowCodecError};
 
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
     fn schema_bool() -> Schema {
-        Schema::new([Field::required("b", DataType::Bool)]).expect("schema ok")
+        Schema::new([Field::required("b", DataType::Bool)]).unwrap()
     }
-
     fn schema_i16() -> Schema {
-        Schema::new([Field::required("n", DataType::Int16)]).expect("schema ok")
+        Schema::new([Field::required("n", DataType::Int16)]).unwrap()
     }
-
     fn schema_i32() -> Schema {
-        Schema::new([Field::required("n", DataType::Int32)]).expect("schema ok")
+        Schema::new([Field::required("n", DataType::Int32)]).unwrap()
     }
-
     fn schema_i64() -> Schema {
-        Schema::new([Field::required("n", DataType::Int64)]).expect("schema ok")
+        Schema::new([Field::required("n", DataType::Int64)]).unwrap()
     }
-
     fn schema_f32() -> Schema {
-        Schema::new([Field::required("f", DataType::Float32)]).expect("schema ok")
+        Schema::new([Field::required("f", DataType::Float32)]).unwrap()
     }
-
     fn schema_f64() -> Schema {
-        Schema::new([Field::required("f", DataType::Float64)]).expect("schema ok")
+        Schema::new([Field::required("f", DataType::Float64)]).unwrap()
     }
-
     fn schema_text() -> Schema {
-        Schema::new([Field::required("s", DataType::Text { max_len: None })]).expect("schema ok")
+        Schema::new([Field::required("s", DataType::Text { max_len: None })]).unwrap()
     }
-
     fn schema_mixed() -> Schema {
         Schema::new([
             Field::nullable("id", DataType::Int32),
             Field::required("name", DataType::Text { max_len: None }),
             Field::nullable("score", DataType::Float64),
         ])
-        .expect("schema ok")
+        .unwrap()
     }
-
     fn schema_all_nullable() -> Schema {
         Schema::new([
             Field::nullable("a", DataType::Int32),
             Field::nullable("b", DataType::Text { max_len: None }),
         ])
-        .expect("schema ok")
+        .unwrap()
     }
-
-    // -----------------------------------------------------------------------
-    // Round-trip tests for each supported type
-    // -----------------------------------------------------------------------
 
     #[test]
     fn round_trip_bool_true() {
         let codec = RowCodec::new(schema_bool());
         let row = vec![Value::Bool(true)];
-        let bytes = codec.encode(&row).expect("encode");
-        let decoded = codec.decode(&bytes).expect("decode");
-        assert_eq!(decoded, row);
+        let bytes = codec.encode(&row).unwrap();
+        assert_eq!(codec.decode(&bytes).unwrap(), row);
     }
-
     #[test]
     fn round_trip_bool_false() {
         let codec = RowCodec::new(schema_bool());
         let row = vec![Value::Bool(false)];
-        let bytes = codec.encode(&row).expect("encode");
-        let decoded = codec.decode(&bytes).expect("decode");
-        assert_eq!(decoded, row);
+        let bytes = codec.encode(&row).unwrap();
+        assert_eq!(codec.decode(&bytes).unwrap(), row);
     }
-
     #[test]
     fn round_trip_int16() {
         let codec = RowCodec::new(schema_i16());
         for v in [i16::MIN, -1, 0, 1, i16::MAX] {
             let row = vec![Value::Int16(v)];
-            let bytes = codec.encode(&row).expect("encode");
-            let decoded = codec.decode(&bytes).expect("decode");
-            assert_eq!(decoded, row, "round-trip failed for i16={v}");
+            assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
     }
-
     #[test]
     fn round_trip_int32() {
         let codec = RowCodec::new(schema_i32());
         for v in [i32::MIN, -42, 0, 42, i32::MAX] {
             let row = vec![Value::Int32(v)];
-            let bytes = codec.encode(&row).expect("encode");
-            let decoded = codec.decode(&bytes).expect("decode");
-            assert_eq!(decoded, row, "round-trip failed for i32={v}");
+            assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
     }
-
     #[test]
     fn round_trip_int64() {
         let codec = RowCodec::new(schema_i64());
         for v in [i64::MIN, -1, 0, 1, i64::MAX] {
             let row = vec![Value::Int64(v)];
-            let bytes = codec.encode(&row).expect("encode");
-            let decoded = codec.decode(&bytes).expect("decode");
-            assert_eq!(decoded, row, "round-trip failed for i64={v}");
+            assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
     }
-
     #[test]
     fn round_trip_float32() {
         let codec = RowCodec::new(schema_f32());
         for v in [f32::NEG_INFINITY, -1.5, 0.0, 1.5, f32::INFINITY] {
             let row = vec![Value::Float32(v)];
-            let bytes = codec.encode(&row).expect("encode");
-            let decoded = codec.decode(&bytes).expect("decode");
-            assert_eq!(decoded, row, "round-trip failed for f32={v}");
+            assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
     }
-
     #[test]
     fn round_trip_float64() {
         let codec = RowCodec::new(schema_f64());
         for v in [f64::NEG_INFINITY, -1.5, 0.0, 1.5, f64::INFINITY] {
             let row = vec![Value::Float64(v)];
-            let bytes = codec.encode(&row).expect("encode");
-            let decoded = codec.decode(&bytes).expect("decode");
-            assert_eq!(decoded, row, "round-trip failed for f64={v}");
+            assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
     }
-
     #[test]
     fn round_trip_text() {
         let codec = RowCodec::new(schema_text());
         for s in ["", "hello", "unicode: \u{1F600}", &"x".repeat(1024)] {
             let row = vec![Value::Text(s.to_owned())];
-            let bytes = codec.encode(&row).expect("encode");
-            let decoded = codec.decode(&bytes).expect("decode");
-            assert_eq!(decoded, row, "round-trip failed for text={s:?}");
+            assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Null handling
-    // -----------------------------------------------------------------------
-
     #[test]
     fn all_null_row() {
         let codec = RowCodec::new(schema_all_nullable());
         let row = vec![Value::Null, Value::Null];
-        let bytes = codec.encode(&row).expect("encode");
-        let decoded = codec.decode(&bytes).expect("decode");
-        assert_eq!(decoded, row);
+        assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
     }
-
     #[test]
     fn mixed_nulls() {
         let codec = RowCodec::new(schema_mixed());
         let row = vec![Value::Null, Value::Text("alice".into()), Value::Null];
-        let bytes = codec.encode(&row).expect("encode");
-        let decoded = codec.decode(&bytes).expect("decode");
-        assert_eq!(decoded, row);
+        assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
     }
-
     #[test]
     fn no_nulls_in_mixed_schema() {
         let codec = RowCodec::new(schema_mixed());
@@ -582,107 +963,59 @@ mod tests {
             Value::Text("bob".into()),
             Value::Float64(9.9),
         ];
-        let bytes = codec.encode(&row).expect("encode");
-        let decoded = codec.decode(&bytes).expect("decode");
-        assert_eq!(decoded, row);
+        assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
     }
-
-    // -----------------------------------------------------------------------
-    // Negative: arity mismatch
-    // -----------------------------------------------------------------------
-
     #[test]
     fn arity_mismatch_on_encode_returns_arity_error() {
         let codec = RowCodec::new(schema_i32());
-        let row = vec![Value::Int32(1), Value::Int32(2)]; // too many
-        let err = codec.encode(&row).expect_err("arity mismatch must fail");
-        assert!(
-            matches!(err, RowCodecError::Arity { schema: 1, row: 2 }),
-            "unexpected error: {err:?}"
-        );
+        let err = codec
+            .encode(&[Value::Int32(1), Value::Int32(2)])
+            .expect_err("arity mismatch");
+        assert!(matches!(err, RowCodecError::Arity { schema: 1, row: 2 }));
     }
-
     #[test]
     fn arity_mismatch_empty_row_on_nonempty_schema() {
         let codec = RowCodec::new(schema_i32());
-        let err = codec.encode(&[]).expect_err("arity mismatch must fail");
-        assert!(
-            matches!(err, RowCodecError::Arity { schema: 1, row: 0 }),
-            "unexpected error: {err:?}"
-        );
+        let err = codec.encode(&[]).expect_err("arity mismatch");
+        assert!(matches!(err, RowCodecError::Arity { schema: 1, row: 0 }));
     }
-
-    // -----------------------------------------------------------------------
-    // Negative: truncated payload on decode
-    // -----------------------------------------------------------------------
-
     #[test]
     fn truncated_payload_on_decode_returns_truncated_error() {
         let codec = RowCodec::new(schema_i32());
-        // A valid payload has 1 bitmap byte + 4 data bytes = 5 bytes.
-        // Pass only 3 bytes — too short for the data.
-        let err = codec
-            .decode(&[0x00, 0x01, 0x02])
-            .expect_err("truncated must fail");
-        assert!(
-            matches!(err, RowCodecError::Truncated { .. }),
-            "unexpected error: {err:?}"
-        );
+        let err = codec.decode(&[0x00, 0x01, 0x02]).expect_err("truncated");
+        assert!(matches!(err, RowCodecError::Truncated { .. }));
     }
-
     #[test]
     fn empty_payload_on_nonempty_schema_returns_truncated() {
         let codec = RowCodec::new(schema_i32());
-        let err = codec.decode(&[]).expect_err("truncated must fail");
-        assert!(
-            matches!(err, RowCodecError::Truncated { .. }),
-            "unexpected error: {err:?}"
-        );
+        let err = codec.decode(&[]).expect_err("truncated");
+        assert!(matches!(err, RowCodecError::Truncated { .. }));
     }
-
-    // -----------------------------------------------------------------------
-    // Property test: encode → decode identity
-    // -----------------------------------------------------------------------
 
     proptest! {
         #[test]
         fn prop_round_trip_i32(v: i32) {
             let codec = RowCodec::new(schema_i32());
             let row = vec![Value::Int32(v)];
-            let bytes = codec.encode(&row).expect("encode");
-            let decoded = codec.decode(&bytes).expect("decode");
-            prop_assert_eq!(decoded, row);
+            prop_assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
-
         #[test]
         fn prop_round_trip_i64(v: i64) {
             let codec = RowCodec::new(schema_i64());
             let row = vec![Value::Int64(v)];
-            let bytes = codec.encode(&row).expect("encode");
-            let decoded = codec.decode(&bytes).expect("decode");
-            prop_assert_eq!(decoded, row);
+            prop_assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
-
         #[test]
         fn prop_round_trip_text(s in ".*") {
             let codec = RowCodec::new(schema_text());
             let row = vec![Value::Text(s)];
-            let bytes = codec.encode(&row).expect("encode");
-            let decoded = codec.decode(&bytes).expect("decode");
-            prop_assert_eq!(decoded, row);
+            prop_assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
-
         #[test]
         fn prop_round_trip_mixed(id: i32, name in "[a-zA-Z0-9]{0,32}", score: f64) {
             let codec = RowCodec::new(schema_mixed());
-            let row = vec![
-                Value::Int32(id),
-                Value::Text(name),
-                Value::Float64(score),
-            ];
-            let bytes = codec.encode(&row).expect("encode");
-            let decoded = codec.decode(&bytes).expect("decode");
-            prop_assert_eq!(decoded, row);
+            let row = vec![Value::Int32(id), Value::Text(name), Value::Float64(score)];
+            prop_assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
     }
 }

@@ -675,6 +675,178 @@ pub fn range_mask_i64(column: &NumericColumn<i64>, lo: i64, hi: i64) -> Bitmap {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Column-vs-scalar comparison kernels for `i32` and `i64`.
+//
+// Each kernel produces a [`Bitmap`] whose bit `i` is set iff the row
+// satisfies the comparison AND is non-null. The kernels follow the same
+// 64-lane pack-into-`u64` shape as [`cmp_gt_i64`] so LLVM autovectorizes
+// the inner block (NEON `cmgt.4s`/`cmgt.2d` on aarch64, `vpcmpgtd`/`vpcmpgtq`
+// on x86-64-v3). The trailing partial word is handled scalar.
+//
+// All kernels honour SQL NULL semantics in the WHERE-clause sense: a NULL
+// row never passes the predicate (3VL `UNKNOWN` is treated as `false`).
+// ---------------------------------------------------------------------------
+
+/// Per-row comparison opcode used by the column-vs-scalar kernels below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpOp {
+    /// `col == scalar`.
+    Eq,
+    /// `col != scalar`.
+    Ne,
+    /// `col <  scalar`.
+    Lt,
+    /// `col <= scalar`.
+    Le,
+    /// `col >  scalar`.
+    Gt,
+    /// `col >= scalar`.
+    Ge,
+}
+
+#[inline]
+const fn cmp_i32_lane(op: CmpOp, a: i32, b: i32) -> bool {
+    match op {
+        CmpOp::Eq => a == b,
+        CmpOp::Ne => a != b,
+        CmpOp::Lt => a < b,
+        CmpOp::Le => a <= b,
+        CmpOp::Gt => a > b,
+        CmpOp::Ge => a >= b,
+    }
+}
+
+#[inline]
+const fn cmp_i64_lane(op: CmpOp, a: i64, b: i64) -> bool {
+    match op {
+        CmpOp::Eq => a == b,
+        CmpOp::Ne => a != b,
+        CmpOp::Lt => a < b,
+        CmpOp::Le => a <= b,
+        CmpOp::Gt => a > b,
+        CmpOp::Ge => a >= b,
+    }
+}
+
+#[inline]
+fn pack_cmp_i32_64(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
+    let mut mask: u64 = 0;
+    for chunk in 0..8_usize {
+        let off = chunk * 8;
+        let mut byte: u64 = 0;
+        byte |= u64::from(cmp_i32_lane(op, a[off], scalar));
+        byte |= u64::from(cmp_i32_lane(op, a[off + 1], scalar)) << 1;
+        byte |= u64::from(cmp_i32_lane(op, a[off + 2], scalar)) << 2;
+        byte |= u64::from(cmp_i32_lane(op, a[off + 3], scalar)) << 3;
+        byte |= u64::from(cmp_i32_lane(op, a[off + 4], scalar)) << 4;
+        byte |= u64::from(cmp_i32_lane(op, a[off + 5], scalar)) << 5;
+        byte |= u64::from(cmp_i32_lane(op, a[off + 6], scalar)) << 6;
+        byte |= u64::from(cmp_i32_lane(op, a[off + 7], scalar)) << 7;
+        mask |= byte << (chunk * 8);
+    }
+    mask
+}
+
+#[inline]
+fn cmp_i32_pack_into(a: &[i32], scalar: i32, op: CmpOp, words: &mut [u64]) {
+    debug_assert!(words.len() >= a.len().div_ceil(64));
+    let mut chunks = a.chunks_exact(64);
+    let full_words = chunks.len();
+    for (out_word, c) in words.iter_mut().zip(&mut chunks) {
+        let arr: &[i32; 64] = c
+            .try_into()
+            .expect("chunks_exact(64) yields 64-element slices");
+        *out_word = pack_cmp_i32_64(arr, scalar, op);
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let mut mask: u64 = 0;
+        for (j, &v) in rest.iter().enumerate() {
+            mask |= u64::from(cmp_i32_lane(op, v, scalar)) << j;
+        }
+        words[full_words] = mask;
+    }
+}
+
+#[inline]
+fn pack_cmp_i64_64(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
+    let mut mask: u64 = 0;
+    for chunk in 0..8_usize {
+        let off = chunk * 8;
+        let mut byte: u64 = 0;
+        byte |= u64::from(cmp_i64_lane(op, a[off], scalar));
+        byte |= u64::from(cmp_i64_lane(op, a[off + 1], scalar)) << 1;
+        byte |= u64::from(cmp_i64_lane(op, a[off + 2], scalar)) << 2;
+        byte |= u64::from(cmp_i64_lane(op, a[off + 3], scalar)) << 3;
+        byte |= u64::from(cmp_i64_lane(op, a[off + 4], scalar)) << 4;
+        byte |= u64::from(cmp_i64_lane(op, a[off + 5], scalar)) << 5;
+        byte |= u64::from(cmp_i64_lane(op, a[off + 6], scalar)) << 6;
+        byte |= u64::from(cmp_i64_lane(op, a[off + 7], scalar)) << 7;
+        mask |= byte << (chunk * 8);
+    }
+    mask
+}
+
+#[inline]
+fn cmp_i64_pack_into(a: &[i64], scalar: i64, op: CmpOp, words: &mut [u64]) {
+    debug_assert!(words.len() >= a.len().div_ceil(64));
+    let mut chunks = a.chunks_exact(64);
+    let full_words = chunks.len();
+    for (out_word, c) in words.iter_mut().zip(&mut chunks) {
+        let arr: &[i64; 64] = c
+            .try_into()
+            .expect("chunks_exact(64) yields 64-element slices");
+        *out_word = pack_cmp_i64_64(arr, scalar, op);
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let mut mask: u64 = 0;
+        for (j, &v) in rest.iter().enumerate() {
+            mask |= u64::from(cmp_i64_lane(op, v, scalar)) << j;
+        }
+        words[full_words] = mask;
+    }
+}
+
+/// Generic column-vs-scalar comparison for `i32`.
+///
+/// Bit `i` of the output is set iff the row is non-null AND the
+/// comparison `column[i] <op> scalar` is true. NULL rows are masked to
+/// 0 — matching SQL three-valued logic for `WHERE` clauses where
+/// `UNKNOWN` is treated as `false`.
+#[must_use]
+pub fn cmp_i32_scalar(column: &NumericColumn<i32>, scalar: i32, op: CmpOp) -> Bitmap {
+    let n = column.len();
+    let mut words = vec![0_u64; n.div_ceil(64)];
+    cmp_i32_pack_into(column.data(), scalar, op, &mut words);
+    if let Some(nulls) = column.nulls() {
+        for (w, &v) in words.iter_mut().zip(nulls.words().iter()) {
+            *w &= v;
+        }
+    }
+    Bitmap::from_words(words, n)
+}
+
+/// Generic column-vs-scalar comparison for `i64`.
+///
+/// See [`cmp_i32_scalar`] for semantics. With `op = Gt` this is the
+/// same shape as [`cmp_gt_i64`]; the dispatcher routes the five
+/// remaining opcodes through this entry point so the executor's fast
+/// path can call a single function regardless of operator.
+#[must_use]
+pub fn cmp_i64_scalar(column: &NumericColumn<i64>, scalar: i64, op: CmpOp) -> Bitmap {
+    let n = column.len();
+    let mut words = vec![0_u64; n.div_ceil(64)];
+    cmp_i64_pack_into(column.data(), scalar, op, &mut words);
+    if let Some(nulls) = column.nulls() {
+        for (w, &v) in words.iter_mut().zip(nulls.words().iter()) {
+            *w &= v;
+        }
+    }
+    Bitmap::from_words(words, n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -889,6 +1061,75 @@ mod tests {
         let got = sum_i64_with_mask(&c, &mask);
         let want: i64 = data.iter().filter(|&&v| v > 0).copied().sum();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn cmp_i32_scalar_all_ops_basic() {
+        let data = vec![-10_i32, 0, 5, 5, 7, 100];
+        let c = NumericColumn::from_data(data);
+        let cases = [
+            (CmpOp::Eq, 5, vec![false, false, true, true, false, false]),
+            (CmpOp::Ne, 5, vec![true, true, false, false, true, true]),
+            (CmpOp::Lt, 5, vec![true, true, false, false, false, false]),
+            (CmpOp::Le, 5, vec![true, true, true, true, false, false]),
+            (CmpOp::Gt, 5, vec![false, false, false, false, true, true]),
+            (CmpOp::Ge, 5, vec![false, false, true, true, true, true]),
+        ];
+        for (op, s, expected) in cases {
+            let m = cmp_i32_scalar(&c, s, op);
+            for (i, &want) in expected.iter().enumerate() {
+                assert_eq!(m.get(i), want, "op={op:?} i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn cmp_i32_scalar_with_nulls_zeros_null_rows() {
+        let mut nulls = Bitmap::new(4, true);
+        nulls.set(1, false);
+        let c = NumericColumn::with_nulls(vec![1_i32, 999, 2, 3], nulls).unwrap();
+        let m = cmp_i32_scalar(&c, 0, CmpOp::Gt);
+        assert!(m.get(0));
+        assert!(!m.get(1), "null row must be 0 in the mask");
+        assert!(m.get(2));
+        assert!(m.get(3));
+    }
+
+    #[test]
+    fn cmp_i32_scalar_long_input_matches_naive() {
+        // Cover lengths past the 64-lane fast-path boundary.
+        for &n in &[0_usize, 1, 63, 64, 65, 128, 1023, 1024, 4096] {
+            let data: Vec<i32> = (0..n)
+                .map(|i| i32::try_from(i).unwrap_or(0).wrapping_mul(7) - 50)
+                .collect();
+            let c = NumericColumn::from_data(data.clone());
+            let m = cmp_i32_scalar(&c, 100, CmpOp::Gt);
+            for (i, &v) in data.iter().enumerate() {
+                assert_eq!(m.get(i), v > 100, "n={n} i={i}");
+            }
+        }
+    }
+
+    #[test]
+    fn cmp_i64_scalar_matches_cmp_gt_i64_on_gt() {
+        let data: Vec<i64> = (0_i64..2048)
+            .map(|i| i.wrapping_mul(2_862_933_555_777_941_757) ^ 0x42)
+            .collect();
+        let c = NumericColumn::from_data(data);
+        let want = cmp_gt_i64(&c, 0);
+        let got = cmp_i64_scalar(&c, 0, CmpOp::Gt);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn cmp_i64_scalar_all_ops_basic() {
+        let c = NumericColumn::from_data(vec![-1_i64, 0, 5, 5, 10]);
+        assert_eq!(cmp_i64_scalar(&c, 5, CmpOp::Eq).count_ones(), 2);
+        assert_eq!(cmp_i64_scalar(&c, 5, CmpOp::Ne).count_ones(), 3);
+        assert_eq!(cmp_i64_scalar(&c, 5, CmpOp::Lt).count_ones(), 2);
+        assert_eq!(cmp_i64_scalar(&c, 5, CmpOp::Le).count_ones(), 4);
+        assert_eq!(cmp_i64_scalar(&c, 5, CmpOp::Gt).count_ones(), 1);
+        assert_eq!(cmp_i64_scalar(&c, 5, CmpOp::Ge).count_ones(), 3);
     }
 
     #[test]

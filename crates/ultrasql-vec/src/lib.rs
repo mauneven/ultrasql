@@ -32,12 +32,12 @@ pub use batch::{Batch, BatchError};
 pub use bitmap::Bitmap;
 pub use column::{Column, ColumnError};
 pub use kernels::{
-    add_i64, add_i64_scalar, compare_i64, compare_i64_scalar, mul_i64, mul_i64_scalar, sub_i64,
-    sub_i64_scalar,
+    CmpOp, cmp_gt_i64, cmp_gt_i64_scalar, cmp_i32_scalar, cmp_i64_scalar, count_i64, eq_i32,
+    max_i64, min_f64, min_i64, range_mask_i64, select_i32, sum_i64, sum_i64_with_mask,
 };
 pub use kernels::{
-    cmp_gt_i64, cmp_gt_i64_scalar, count_i64, eq_i32, max_i64, min_f64, min_i64, range_mask_i64,
-    select_i32, sum_i64, sum_i64_with_mask,
+    add_i64, add_i64_scalar, compare_i64, compare_i64_scalar, mul_i64, mul_i64_scalar, sub_i64,
+    sub_i64_scalar,
 };
 pub use kernels::{
     filter_eq_f64, filter_eq_f64_scalar, filter_eq_i32, filter_eq_i32_scalar, filter_eq_i64,
