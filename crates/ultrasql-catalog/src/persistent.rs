@@ -518,7 +518,11 @@ impl PersistentCatalog {
         let attribute_blocks = heap.block_count(pg_attribute_rel);
         let mut attrs_by_relation: std::collections::HashMap<
             Oid,
-            Vec<(crate::persistent::AttributeRow, ultrasql_core::DataType, bool)>,
+            Vec<(
+                crate::persistent::AttributeRow,
+                ultrasql_core::DataType,
+                bool,
+            )>,
         > = std::collections::HashMap::new();
         let mut total_attrs: u32 = 0;
         if attribute_blocks > 0 {
@@ -547,9 +551,8 @@ impl PersistentCatalog {
             let tuple = result.map_err(|e| {
                 CatalogError::schema_conflict(format!("heap scan error on pg_class: {e}"))
             })?;
-            let class_row = ClassRow::decode(&tuple.data).map_err(|e| {
-                CatalogError::schema_conflict(format!("decode pg_class row: {e}"))
-            })?;
+            let class_row = ClassRow::decode(&tuple.data)
+                .map_err(|e| CatalogError::schema_conflict(format!("decode pg_class row: {e}")))?;
             // Skip system relations — they live in the initial snapshot.
             if class_row.oid.raw() < crate::memory::FIRST_USER_OID {
                 continue;
