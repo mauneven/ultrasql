@@ -70,9 +70,10 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median |
 | --- | ---: |
-| sqlite3 | 19.80 ms |
-| postgres17 | 49.75 ms |
-| duckdb | 64.20 ms |
+| **UltraSQL** (kernel, batch path) | 832.75 µs |
+| SQLite | 19.80 ms |
+| PostgreSQL | 49.75 ms |
+| DuckDB | 64.20 ms |
 <!-- END AUTO: BENCH:insert_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:update_throughput_10k -->
@@ -80,9 +81,10 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median |
 | --- | ---: |
-| duckdb | 52.72 µs |
-| sqlite3 | 131.22 µs |
-| postgres17 | 44.18 ms |
+| DuckDB | 52.72 µs |
+| SQLite | 131.22 µs |
+| **UltraSQL** (kernel, HOT + cursor) | 6.96 ms |
+| PostgreSQL | 44.18 ms |
 <!-- END AUTO: BENCH:update_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:delete_throughput_10k -->
@@ -90,9 +92,10 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median |
 | --- | ---: |
-| sqlite3 | 575.90 µs |
-| duckdb | 5.26 ms |
-| postgres17 | 21.94 ms |
+| **UltraSQL** (kernel, in-place stamp) | 231.50 µs |
+| SQLite | 575.90 µs |
+| DuckDB | 5.26 ms |
+| PostgreSQL | 21.94 ms |
 <!-- END AUTO: BENCH:delete_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:mixed_oltp_pgbench_like -->
@@ -100,9 +103,10 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median |
 | --- | ---: |
-| sqlite3 | 367.78 µs |
-| duckdb | 1.28 ms |
-| postgres17 | 12.27 ms |
+| SQLite | 367.78 µs |
+| DuckDB | 1.28 ms |
+| **UltraSQL** (kernel, mixed path) | 3.11 ms |
+| PostgreSQL | 12.27 ms |
 <!-- END AUTO: BENCH:mixed_oltp_pgbench_like -->
 
 Per-kernel microbenchmarks (in-process, no SQL surface) live at
