@@ -101,6 +101,7 @@ PYEOF
     bash benchmarks/scripts/run_postgres_writes.sh
     bash benchmarks/scripts/run_duckdb_writes.sh
     bash benchmarks/scripts/run_sqlite3_writes.sh
+    bash benchmarks/scripts/run_clickhouse_writes.sh
 
     # Render results.
     echo "--- Rendering results ---"
