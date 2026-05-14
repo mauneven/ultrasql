@@ -538,14 +538,25 @@ serializable (SSI). Real row-level locking. Deadlock detection.
   `BufferPool::with_wal(WalWriter)` at server start, build the
   `WalSink` adapter, and re-run `cross_compare_sql` with the
   durable runtime to publish post-WAL throughput numbers.
-- [ ] **Undo-log GC story missing** — `UndoRelationLog` grows
-  unbounded. Each UPDATE pushes 9-byte pre-images that are never
-  trimmed. Long-running workloads will accumulate undo entries until
-  the per-relation `RwLock<Vec<_>>` is dominated by historical
-  pre-images that no live snapshot needs. **Fix plan**: track
-  oldest-active-snapshot xmin in `TransactionManager`, trim undo
-  entries whose `writer_xid < oldest_active_xmin` on every commit
-  (or on a periodic vacuum tick).
+- [x] **Undo-log GC** (Item 3 Phase A `e26da30`, Phase B `f7e5646`).
+  `HeapAccess::vacuum_undo_log(oldest_active_xid)` walks every
+  per-relation `UndoRelationLog` and drops entries whose
+  `writer_xid` is below the threshold; the threshold is the
+  `TransactionManager::oldest_in_progress()` value (PostgreSQL's
+  `latestCompletedXid + 1` semantics). `Server::note_commit_for_gc`
+  fires the trim every `UNDO_GC_INTERVAL_COMMITS = 64` successful
+  commits across autocommit / explicit COMMIT / Extended-Query
+  Execute. Tests in
+  `crates/ultrasql-storage/tests/vacuum.rs`.
+- [ ] **Heap dead-slot reclamation (full VACUUM)** (Item 3 Phase C).
+  The trim above frees undo memory but does not compact dead heap
+  slots — a long DELETE-heavy workload still grows the heap. Phase
+  C builds a page-level compactor that walks the heap, identifies
+  slots whose `xmax` is committed below the oldest-active-xid, and
+  marks the item-id dead so future inserts can recycle the space.
+  Index dead-entry reclamation already lives in
+  `BTree::vacuum(is_dead)`; the missing piece is the heap-side
+  driver and the autovacuum cadence that runs both together.
 - [ ] **Persistent catalog typed-tuple decoder missing** —
   `PersistentCatalog::bootstrap_from_heap` falls back to the initial
   in-memory snapshot. User tables created in a previous session are
