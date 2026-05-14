@@ -214,6 +214,13 @@ fn run(args: Args) -> Result<i32> {
 
     if args.smoke {
         eprintln!("regression-gate: SMOKE mode — one run per benchmark, no competitor checks");
+        // Signal every run module to use tiny dataset sizes. Set before
+        // any benchmark fn fires. SAFETY: single-threaded process startup,
+        // no other thread can read this concurrently.
+        // SAFETY: we are still single-threaded at this point in `run`.
+        unsafe {
+            std::env::set_var("ULTRASQL_BENCH_SMOKE", "1");
+        }
     }
     eprintln!("regression-gate: stage = {stage}");
 
