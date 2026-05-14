@@ -1195,8 +1195,33 @@ impl<L: PageLoader> HeapAccess<L> {
                     )?;
                 }
 
-                // Take ONE PageGuard for the page. Each
-                // `try_hot_update` acquires `guard.write()`
+                // Pre-check: if the page has insufficient free space
+                // for **any** entry's new HOT version, skip the
+                // per-row `try_hot_update` loop entirely. Each
+                // `try_hot_update` call pays a `page.write()` +
+                // header decode + free-space check; on a page that
+                // cannot fit even one new tuple this is ~200 ns of
+                // wasted work per row. The bench's preload fills
+                // pages to ~99 %, so every page in the UPDATE input
+                // hits this skip and saves ~10 000 `try_hot_update`
+                // attempts.
+                let first_size = TUPLE_HEADER_SIZE
+                    .checked_add(entries[0].1.len())
+                    .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
+                let min_needed = first_size + crate::page::ITEMID_SIZE;
+                let guard = self.pool.get_page(page_id)?;
+                let page_free = guard.read().header().free_space();
+                drop(guard);
+                if page_free < min_needed {
+                    for (slot, payload) in entries {
+                        fallback.push((TupleId::new(page_id, slot), payload));
+                    }
+                    continue;
+                }
+
+                // Page has room for at least one new version.
+                // Take ONE PageGuard for the per-row HOT batch.
+                // Each `try_hot_update` acquires `guard.write()`
                 // internally — uncontended because the prior call
                 // released.
                 let mut hot_outcomes: Vec<(TupleId, TupleId)> = Vec::with_capacity(entries.len());
