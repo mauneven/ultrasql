@@ -90,7 +90,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
     let preload_payloads: Vec<[u8; 12]> = (0..n_i32)
         .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
         .collect();
-    let preload_rows: Vec<&[u8]> = preload_payloads.iter().map(|p| p.as_slice()).collect();
+    let preload_rows: Vec<&[u8]> = preload_payloads.iter().map(<[u8; 12]>::as_slice).collect();
     let mut tids: Vec<TupleId> = heap
         .insert_batch(REL, &preload_rows, insert_opts)
         .expect("preload insert_batch must succeed");
@@ -201,12 +201,17 @@ mod tests {
     /// The test replicates the bench setup inline so it can inspect the final
     /// heap state via `scan_visible`.
     #[test]
+    #[allow(clippy::items_after_statements)] // const N_ITERS reads better near the loop it bounds
     fn update_bench_final_val_equals_original_plus_n_iterations() {
         let _guard = SmokeGuard::new();
 
         const N_ITERS: usize = 3;
 
-        // Replicate the benchmark's setup phase.
+        // Replicate the benchmark's setup phase. `ROWS_PER_ITER` is 32
+        // in tests so the `(_ / 50).max(1)` arithmetic is redundant —
+        // we keep it for symmetry with the prod-path budgeting and
+        // silence clippy.
+        #[allow(clippy::unnecessary_min_or_max)]
         let frames = (ROWS_PER_ITER / 50).max(1) + 512;
         let pool = Arc::new(BufferPool::new(frames, BlankLoader));
         let heap = HeapAccess::new(Arc::clone(&pool));

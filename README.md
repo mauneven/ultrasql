@@ -92,8 +92,8 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median |
 | --- | ---: |
-| **UltraSQL** (kernel, in-place stamp) | 584.21 µs |
 | SQLite | 575.90 µs |
+| **UltraSQL** (kernel, in-place stamp) | 584.21 µs |
 | DuckDB | 5.26 ms |
 | PostgreSQL | 21.94 ms |
 <!-- END AUTO: BENCH:delete_throughput_10k -->

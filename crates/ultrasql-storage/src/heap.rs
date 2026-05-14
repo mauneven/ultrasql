@@ -432,7 +432,9 @@ impl<L: PageLoader> HeapAccess<L> {
         // The cursor is purely advisory; if it points past `existing` we
         // clamp to zero. If the cached page is full we fall through to
         // the forward scan from the cursor.
-        let start = cursor.load(Ordering::Acquire).min(existing.saturating_sub(1));
+        let start = cursor
+            .load(Ordering::Acquire)
+            .min(existing.saturating_sub(1));
         for block in start..existing {
             let page_id = PageId::new(rel, BlockNumber::new(block));
             match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
@@ -573,11 +575,14 @@ impl<L: PageLoader> HeapAccess<L> {
         let n_atts: u16 = 0;
 
         let counter = self.counter_for(rel);
+        let insert_cursor = self.cursor_for(rel);
         let mut block_count = counter.load(Ordering::Acquire);
-        // Per-relation cursor: start scanning for room at the highest
-        // known block. Most relations are append-only; the tail page is
-        // overwhelmingly the page with free space.
-        let mut cursor: u32 = block_count.saturating_sub(1);
+        // Per-relation cursor: start scanning for room at the cached
+        // tail hint, falling back to the highest known block. Most
+        // relations are append-only; the tail page is overwhelmingly
+        // the page with free space.
+        let cached = insert_cursor.load(Ordering::Acquire);
+        let mut cursor: u32 = cached.min(block_count.saturating_sub(1));
         let mut row_idx: usize = 0;
 
         while row_idx < rows.len() {
@@ -600,6 +605,9 @@ impl<L: PageLoader> HeapAccess<L> {
             Self::post_insert_fsm_vm(&self.pool, page_id, opts);
 
             if row_idx == rows.len() {
+                // Cache the last block we wrote into so the next batch
+                // (or per-row `insert`) starts here.
+                insert_cursor.store(cursor, Ordering::Release);
                 break;
             }
 

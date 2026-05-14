@@ -95,7 +95,7 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
     let preload_payloads: Vec<[u8; 12]> = (0..n_i32)
         .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
         .collect();
-    let preload_rows: Vec<&[u8]> = preload_payloads.iter().map(|p| p.as_slice()).collect();
+    let preload_rows: Vec<&[u8]> = preload_payloads.iter().map(<[u8; 12]>::as_slice).collect();
     let mut tids: Vec<TupleId> = Vec::with_capacity(max_rows);
     let preloaded = heap
         .insert_batch(REL, &preload_rows, insert_opts)
@@ -290,7 +290,7 @@ mod tests {
         let preload_payloads: Vec<[u8; 12]> = (0..n_i32)
             .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
             .collect();
-        let preload_rows: Vec<&[u8]> = preload_payloads.iter().map(|p| p.as_slice()).collect();
+        let preload_rows: Vec<&[u8]> = preload_payloads.iter().map(<[u8; 12]>::as_slice).collect();
         let mut tids: Vec<TupleId> = heap
             .insert_batch(REL, &preload_rows, insert_opts)
             .expect("preload must succeed");

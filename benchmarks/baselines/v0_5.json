@@ -6,17 +6,17 @@
     "ram_gb": 0,
     "os": "macos unknown"
   },
-  "git_commit": "a4949c3",
-  "captured_at": "2026-05-14T02:41:18Z",
+  "git_commit": "a12618b",
+  "captured_at": "2026-05-14T03:01:49Z",
   "tolerance_pct": 5.0,
   "benchmarks": {
     "mixed_oltp_pgbench_like": {
-      "throughput_per_sec": 94423.32000683513,
-      "p99_us": 119930.459,
+      "throughput_per_sec": 3344341.791731115,
+      "p99_us": 3452.125,
       "competitors": {
-        "cockroachdb": 0.0,
+        "postgres17": 0.0,
         "sqlite3": 0.0,
-        "postgres17": 0.0
+        "cockroachdb": 0.0
       }
     }
   }

@@ -77,7 +77,7 @@ fn preload(
     let payloads: Vec<[u8; 12]> = (0..n_i32)
         .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
         .collect();
-    let rows: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    let rows: Vec<&[u8]> = payloads.iter().map(<[u8; 12]>::as_slice).collect();
     let tids: Vec<TupleId> = heap
         .insert_batch(REL, &rows, opts)
         .expect("preload insert_batch must succeed");
