@@ -76,6 +76,8 @@ pub(crate) struct SetupState {
     #[allow(dead_code)] // pool must outlive heap — dropping it would invalidate heap
     pub(crate) pool: Arc<BufferPool<BlankLoader>>,
     /// Heap accessor for the relation populated by [`setup`].
+    /// Used only in `#[cfg(test)]` to call `scan_visible` for post-state assertions.
+    #[allow(dead_code)]
     pub(crate) heap: HeapAccess<BlankLoader>,
 }
 
@@ -102,7 +104,11 @@ pub(crate) fn setup(n: usize) -> SetupState {
     let rows: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
     heap.insert_batch(REL, &rows, opts)
         .expect("insert_batch must succeed during setup");
-    SetupState { rows: n, pool, heap }
+    SetupState {
+        rows: n,
+        pool,
+        heap,
+    }
 }
 
 /// Times inserting `state.rows` rows into a *fresh* pool.
