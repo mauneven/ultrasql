@@ -47,18 +47,20 @@
 
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_parser::ast::{
-    Assignment, BinaryOp, ColumnConstraint, ConflictTarget as AstConflictTarget, CreateTableStmt,
-    DeleteStmt, Distinct, Expr, InsertSource, InsertStmt, JoinCondition, JoinOp, Literal,
-    NullsOrder, ObjectName, OnConflict, OrderItem, SelectItem, SelectStmt, SetOp, SetQuantifier,
-    SortDirection, Statement, TableRef, TruncateStmt, TypeName, UnaryOp, UpdateStmt,
+    AlterTableAction, AlterTableStmt, Assignment, BinaryOp, ColumnConstraint,
+    ConflictTarget as AstConflictTarget, CreateIndexStmt, CreateTableStmt, DeleteStmt, Distinct,
+    DropTableStmt, Expr, InsertSource, InsertStmt, JoinCondition, JoinOp, Literal, NullsOrder,
+    ObjectName, OnConflict, OrderItem, SelectItem, SelectStmt, SetOp, SetQuantifier, SortDirection,
+    Statement, TableRef, TruncateStmt, TypeName, UnaryOp, UpdateStmt,
 };
 
 use crate::catalog::Catalog;
 use crate::error::PlanError;
 use crate::expr::ScalarExpr;
 use crate::plan::{
-    AggregateFunc, ConflictTarget, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType,
-    LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, SortKey,
+    AggregateFunc, ConflictTarget, LogicalAggregateExpr, LogicalAlterTableAction,
+    LogicalJoinCondition, LogicalJoinType, LogicalOnConflict, LogicalPlan, LogicalSetOp,
+    LogicalSetQuantifier, SortKey,
 };
 use crate::scope::{ScopeFrame, ScopeStack};
 
@@ -81,6 +83,9 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::Delete(s) => bind_delete(s, catalog, &mut scope),
         Statement::Truncate(s) => bind_truncate(s, catalog),
         Statement::CreateTable(s) => bind_create_table(s, catalog),
+        Statement::CreateIndex(s) => bind_create_index(s, catalog),
+        Statement::DropTable(s) => bind_drop_table(s, catalog),
+        Statement::AlterTable(s) => bind_alter_table(s, catalog),
         Statement::Begin { .. } | Statement::Commit { .. } | Statement::Rollback { .. } => Err(
             PlanError::NotSupported("transaction control statements are not planner targets"),
         ),
@@ -612,6 +617,205 @@ fn resolve_column_nullability(constraints: &[ColumnConstraint]) -> Result<bool, 
         }
     }
     Ok(nullable)
+}
+
+// ---------------------------------------------------------------------------
+// CREATE INDEX
+// ---------------------------------------------------------------------------
+
+/// Bind a `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON table (cols)`.
+///
+/// Accepted shapes for this wave:
+///
+/// - bare column-reference keys only (`(col1, col2, ...)`); expression
+///   keys and `USING method` other than `btree` (or no method, which
+///   defaults to btree) return [`PlanError::NotSupported`].
+/// - no `INCLUDE` covering list, no partial-index `WHERE` predicate,
+///   no per-key direction / nulls ordering (sort options on the index
+///   key are parsed but not actionable until [`crate::plan::LogicalPlan`]
+///   carries them through).
+///
+/// The binder synthesises a default index name `"{table}_{c1}_{c2}_..._idx"`
+/// when one was not supplied so the executor always has a stable
+/// catalog key to write.
+fn bind_create_index(s: &CreateIndexStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+    // Resolve the target table.
+    let table_name = object_name_simple(&s.table);
+    let meta = catalog
+        .lookup_table(&table_name)
+        .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
+    let table_schema = &meta.schema;
+
+    if s.r#where.is_some() {
+        return Err(PlanError::NotSupported(
+            "CREATE INDEX: WHERE (partial index)",
+        ));
+    }
+    if !s.include.is_empty() {
+        return Err(PlanError::NotSupported(
+            "CREATE INDEX: INCLUDE (covering columns)",
+        ));
+    }
+    if let Some(method) = &s.method {
+        if !method.value.eq_ignore_ascii_case("btree") {
+            return Err(PlanError::NotSupported(
+                "CREATE INDEX: only btree method is supported",
+            ));
+        }
+    }
+
+    if s.columns.is_empty() {
+        return Err(PlanError::NotSupported("CREATE INDEX: zero key columns"));
+    }
+    let mut col_indices: Vec<usize> = Vec::with_capacity(s.columns.len());
+    let mut col_names: Vec<String> = Vec::with_capacity(s.columns.len());
+    for key in &s.columns {
+        let col_name = match &key.expr {
+            Expr::Column { name } if name.parts.len() == 1 => name.parts[0].value.clone(),
+            _ => {
+                return Err(PlanError::NotSupported(
+                    "CREATE INDEX: only bare column-reference keys are supported",
+                ));
+            }
+        };
+        let folded = col_name.to_ascii_lowercase();
+        let (idx, _) = table_schema
+            .find(&folded)
+            .ok_or_else(|| PlanError::ColumnNotFound(col_name.clone()))?;
+        col_indices.push(idx);
+        col_names.push(folded);
+    }
+
+    let index_name = s.name.as_ref().map_or_else(
+        || synthesise_index_name(&table_name, &col_names),
+        |ident| ident.value.to_ascii_lowercase(),
+    );
+
+    Ok(LogicalPlan::CreateIndex {
+        index_name,
+        table_name,
+        columns: col_indices,
+        unique: s.unique,
+        if_not_exists: s.if_not_exists,
+        schema: Schema::empty(),
+    })
+}
+
+/// Build a stable default index name when the user did not supply one:
+/// `{table}_{col1}_{col2}_..._idx`. Matches PostgreSQL's
+/// `ChooseIndexName` for the common single-column / multi-column case
+/// closely enough that EXPLAIN-style output stays familiar.
+fn synthesise_index_name(table: &str, columns: &[String]) -> String {
+    let mut s = String::with_capacity(table.len() + 16);
+    s.push_str(table);
+    for c in columns {
+        s.push('_');
+        s.push_str(c);
+    }
+    s.push_str("_idx");
+    s
+}
+
+// ---------------------------------------------------------------------------
+// DROP TABLE
+// ---------------------------------------------------------------------------
+
+/// Bind a `DROP TABLE [IF EXISTS] name [, ...] [CASCADE|RESTRICT]`.
+///
+/// Each name is folded to lowercase and resolved against the catalog.
+/// Without `IF EXISTS`, a missing relation is rejected with
+/// [`PlanError::TableNotFound`]; with `IF EXISTS`, missing relations
+/// are silently dropped from the resulting plan so the executor never
+/// has to re-check the catalog.
+fn bind_drop_table(s: &DropTableStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+    let mut tables: Vec<String> = Vec::with_capacity(s.names.len());
+    for obj in &s.names {
+        let name = object_name_simple(obj);
+        if catalog.lookup_table(&name).is_some() {
+            tables.push(name);
+        } else if !s.if_exists {
+            return Err(PlanError::TableNotFound(name));
+        }
+    }
+    Ok(LogicalPlan::DropTable {
+        tables,
+        if_exists: s.if_exists,
+        cascade: s.cascade,
+        schema: Schema::empty(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// ALTER TABLE
+// ---------------------------------------------------------------------------
+
+/// Bind an `ALTER TABLE name ADD [COLUMN] col type` statement.
+///
+/// This wave supports only `ADD COLUMN`. Every other parser-level
+/// action (`DROP COLUMN`, `RENAME COLUMN`, `RENAME TO`,
+/// `ADD CONSTRAINT`, `DROP CONSTRAINT`) is rejected with
+/// [`PlanError::NotSupported`] so the dispatcher contract stays
+/// honest; subsequent waves can add arms as the executor grows the
+/// matching kernel.
+///
+/// For `ADD COLUMN` the binder resolves the column's data type and
+/// nullability against the same v0.5 column-constraint matrix used by
+/// `CREATE TABLE` and rejects duplicate column names up front
+/// ([`PlanError::DuplicateColumn`]).
+fn bind_alter_table(s: &AlterTableStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+    let table_name = object_name_simple(&s.name);
+    let meta = catalog
+        .lookup_table(&table_name)
+        .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
+    let table_schema = &meta.schema;
+
+    let action = match &s.action {
+        AlterTableAction::AddColumn { column, .. } => {
+            let new_name = column.name.value.clone();
+            if table_schema.find(&new_name.to_ascii_lowercase()).is_some() {
+                return Err(PlanError::DuplicateColumn(new_name));
+            }
+            let dtype = resolve_type_name(&column.data_type)?;
+            let nullable = resolve_column_nullability(&column.constraints)?;
+            let field = if nullable {
+                Field::nullable(new_name, dtype)
+            } else {
+                Field::required(new_name, dtype)
+            };
+            LogicalAlterTableAction::AddColumn { column: field }
+        }
+        AlterTableAction::DropColumn { .. } => {
+            return Err(PlanError::NotSupported(
+                "ALTER TABLE: DROP COLUMN not yet supported",
+            ));
+        }
+        AlterTableAction::RenameColumn { .. } => {
+            return Err(PlanError::NotSupported(
+                "ALTER TABLE: RENAME COLUMN not yet supported",
+            ));
+        }
+        AlterTableAction::RenameTable { .. } => {
+            return Err(PlanError::NotSupported(
+                "ALTER TABLE: RENAME TO not yet supported",
+            ));
+        }
+        AlterTableAction::AddConstraint { .. } => {
+            return Err(PlanError::NotSupported(
+                "ALTER TABLE: ADD CONSTRAINT not yet supported",
+            ));
+        }
+        AlterTableAction::DropConstraint { .. } => {
+            return Err(PlanError::NotSupported(
+                "ALTER TABLE: DROP CONSTRAINT not yet supported",
+            ));
+        }
+    };
+
+    Ok(LogicalPlan::AlterTable {
+        table_name,
+        action,
+        schema: Schema::empty(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1949,7 +2153,10 @@ fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         LogicalPlan::Scan { .. }
         | LogicalPlan::Empty { .. }
         | LogicalPlan::Truncate { .. }
-        | LogicalPlan::CreateTable { .. } => false,
+        | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::AlterTable { .. } => false,
         LogicalPlan::Filter { input, predicate } => {
             expr_contains_outer(predicate) || plan_contains_outer_column(input)
         }
@@ -3875,5 +4082,148 @@ mod tests {
                 prop_assert_eq!(r.len(), arity);
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // CREATE INDEX / DROP TABLE / ALTER TABLE — DDL binder tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn binds_create_index_resolves_column_index_and_synthesises_name() {
+        let plan = parse_bind_ok("CREATE INDEX ON users (id)");
+        let LogicalPlan::CreateIndex {
+            index_name,
+            table_name,
+            columns,
+            unique,
+            if_not_exists,
+            ..
+        } = plan
+        else {
+            panic!("expected CreateIndex plan");
+        };
+        assert_eq!(table_name, "users");
+        assert_eq!(columns, vec![0]);
+        assert!(!unique);
+        assert!(!if_not_exists);
+        // Synthesised name uses the {table}_{cols}_idx convention.
+        assert_eq!(index_name, "users_id_idx");
+    }
+
+    #[test]
+    fn binds_create_unique_index_honours_unique_flag_and_explicit_name() {
+        let plan = parse_bind_ok("CREATE UNIQUE INDEX IF NOT EXISTS users_pk ON users (id)");
+        let LogicalPlan::CreateIndex {
+            index_name,
+            unique,
+            if_not_exists,
+            ..
+        } = plan
+        else {
+            panic!("expected CreateIndex plan");
+        };
+        assert!(unique);
+        assert!(if_not_exists);
+        assert_eq!(index_name, "users_pk");
+    }
+
+    #[test]
+    fn create_index_rejects_unknown_column() {
+        let cat = users_catalog();
+        let err =
+            parse_and_bind("CREATE INDEX bad_idx ON users (does_not_exist)", &cat).unwrap_err();
+        assert!(matches!(err, PlanError::ColumnNotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn create_index_rejects_unknown_table() {
+        let cat = users_catalog();
+        let err = parse_and_bind("CREATE INDEX bad_idx ON nonexistent (id)", &cat).unwrap_err();
+        assert!(matches!(err, PlanError::TableNotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn binds_drop_table_with_known_relation() {
+        let plan = parse_bind_ok("DROP TABLE users");
+        let LogicalPlan::DropTable {
+            tables, if_exists, ..
+        } = plan
+        else {
+            panic!("expected DropTable plan");
+        };
+        assert_eq!(tables, vec!["users".to_string()]);
+        assert!(!if_exists);
+    }
+
+    #[test]
+    fn drop_table_if_exists_silently_omits_missing_relations() {
+        let plan = parse_bind_ok("DROP TABLE IF EXISTS users, nope");
+        let LogicalPlan::DropTable {
+            tables, if_exists, ..
+        } = plan
+        else {
+            panic!("expected DropTable plan");
+        };
+        assert!(if_exists);
+        // `nope` is silently filtered; `users` remains.
+        assert_eq!(tables, vec!["users".to_string()]);
+    }
+
+    #[test]
+    fn drop_table_without_if_exists_rejects_missing_relation() {
+        let cat = users_catalog();
+        let err = parse_and_bind("DROP TABLE nonexistent", &cat).unwrap_err();
+        assert!(matches!(err, PlanError::TableNotFound(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn binds_alter_table_add_column_resolves_field() {
+        let plan = parse_bind_ok("ALTER TABLE users ADD COLUMN extra INTEGER");
+        let LogicalPlan::AlterTable {
+            table_name, action, ..
+        } = plan
+        else {
+            panic!("expected AlterTable plan");
+        };
+        assert_eq!(table_name, "users");
+        let LogicalAlterTableAction::AddColumn { column } = action;
+        assert_eq!(column.name, "extra");
+        assert_eq!(column.data_type, DataType::Int32);
+        assert!(column.nullable, "ADD COLUMN defaults to nullable");
+    }
+
+    #[test]
+    fn binds_alter_table_add_column_not_null() {
+        let plan = parse_bind_ok("ALTER TABLE users ADD COLUMN flag BOOLEAN NOT NULL");
+        let LogicalPlan::AlterTable { action, .. } = plan else {
+            panic!("expected AlterTable plan");
+        };
+        let LogicalAlterTableAction::AddColumn { column } = action;
+        assert_eq!(column.data_type, DataType::Bool);
+        assert!(!column.nullable);
+    }
+
+    #[test]
+    fn alter_table_add_column_rejects_duplicate_name() {
+        let cat = users_catalog();
+        let err = parse_and_bind("ALTER TABLE users ADD COLUMN id INTEGER", &cat).unwrap_err();
+        assert!(
+            matches!(err, PlanError::DuplicateColumn(ref c) if c == "id"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn alter_table_drop_column_returns_not_supported() {
+        let cat = users_catalog();
+        let err = parse_and_bind("ALTER TABLE users DROP COLUMN score", &cat).unwrap_err();
+        assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn alter_table_rename_returns_not_supported() {
+        let cat = users_catalog();
+        let err = parse_and_bind("ALTER TABLE users RENAME TO subscribers", &cat).unwrap_err();
+        assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
     }
 }

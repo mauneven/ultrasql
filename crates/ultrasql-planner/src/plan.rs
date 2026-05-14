@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use ultrasql_core::{DataType, Schema};
+use ultrasql_core::{DataType, Field, Schema};
 
 use crate::expr::ScalarExpr;
 
@@ -440,6 +440,96 @@ pub enum LogicalPlan {
         /// Output schema — identical to `body.schema()`.
         schema: Schema,
     },
+
+    /// Create a B+ tree index on one or more columns of a base table.
+    ///
+    /// The binder validates that `table_name` resolves in the catalog
+    /// and that every column listed in `columns` exists in that
+    /// table's schema. The optional `index_name` is preserved as-is
+    /// when supplied; the binder synthesises `"{table}_{col1}_{...}_idx"`
+    /// otherwise so the executor always has a stable name to register
+    /// in `pg_index`.
+    ///
+    /// `unique` records whether `CREATE UNIQUE INDEX` was specified;
+    /// it propagates into the resulting catalog entry. `if_not_exists`
+    /// short-circuits without an error when the index name already
+    /// exists.
+    ///
+    /// `USING method`, `INCLUDE`, `WHERE` partial-index predicates,
+    /// and expression keys (anything other than a bare column
+    /// reference) return [`crate::error::PlanError::NotSupported`]
+    /// in this wave; the binder rejects them up front so the executor
+    /// arm stays minimal.
+    CreateIndex {
+        /// Index name (caller-supplied or binder-synthesised). Always
+        /// lowercase.
+        index_name: String,
+        /// Target table (lowercase).
+        table_name: String,
+        /// 0-based column indices into the table schema, in index key
+        /// order.
+        columns: Vec<usize>,
+        /// Whether `UNIQUE` was specified.
+        unique: bool,
+        /// Whether `IF NOT EXISTS` was specified.
+        if_not_exists: bool,
+        /// Always [`Schema::empty`]; DDL emits no rows.
+        schema: Schema,
+    },
+
+    /// Drop one or more base tables and (cascading) their indexes.
+    ///
+    /// The binder lowercases every name and validates that — for the
+    /// non-`IF EXISTS` form — each named relation exists in the
+    /// catalog. Missing relations with `IF EXISTS` are simply omitted
+    /// from `tables` so the executor never sees them. `CASCADE` is
+    /// preserved on the plan node so future revisions that consult
+    /// `pg_depend` can honour it; today the catalog drop is
+    /// unconditional (associated indexes are always removed).
+    DropTable {
+        /// Lowercase table names to drop, in the user's order.
+        tables: Vec<String>,
+        /// Whether `IF EXISTS` was specified.
+        if_exists: bool,
+        /// Whether `CASCADE` was specified.
+        cascade: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// Alter an existing base table.
+    ///
+    /// The action is one of [`LogicalAlterTableAction`]; the binder
+    /// rejects every other parser-level action (DROP COLUMN, RENAME
+    /// COLUMN, RENAME TO, ADD/DROP CONSTRAINT) until the corresponding
+    /// rewrite path is wired in a follow-up wave.
+    AlterTable {
+        /// Lowercase target table name.
+        table_name: String,
+        /// Resolved, type-checked action.
+        action: LogicalAlterTableAction,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+}
+
+/// Resolved `ALTER TABLE` action.
+///
+/// The binder pre-resolves every reference (column types,
+/// nullability) so the executor can apply the change without touching
+/// the parser again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogicalAlterTableAction {
+    /// `ALTER TABLE t ADD [COLUMN] c TYPE [NULL | NOT NULL]`.
+    ///
+    /// The new column is appended to the end of the table's schema.
+    /// `column` carries the resolved [`Field`] (name, type,
+    /// nullability) so the executor can grow the schema without
+    /// re-parsing the type name.
+    AddColumn {
+        /// The resolved column being added.
+        column: Field,
+    },
 }
 
 impl LogicalPlan {
@@ -459,7 +549,10 @@ impl LogicalPlan {
             | Self::Join { schema, .. }
             | Self::Aggregate { schema, .. }
             | Self::SetOp { schema, .. }
-            | Self::Cte { schema, .. } => schema,
+            | Self::Cte { schema, .. }
+            | Self::CreateIndex { schema, .. }
+            | Self::DropTable { schema, .. }
+            | Self::AlterTable { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
                 input.schema()
             }
@@ -783,6 +876,64 @@ impl LogicalPlan {
                 let _ = fmt::write(out, format_args!("Cte{rec}: {name}\n"));
                 definition.display_into(indent + 2, out);
                 body.display_into(indent + 2, out);
+            }
+            Self::CreateIndex {
+                index_name,
+                table_name,
+                columns,
+                unique,
+                if_not_exists,
+                ..
+            } => {
+                out.push_str(&pad);
+                let u = if *unique { "Unique" } else { "" };
+                let inx = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "Create{u}Index{inx}: {index_name} ON {table_name} (cols=[{cols}])\n",
+                        cols = columns
+                            .iter()
+                            .map(usize::to_string)
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    ),
+                );
+            }
+            Self::DropTable {
+                tables,
+                if_exists,
+                cascade,
+                ..
+            } => {
+                out.push_str(&pad);
+                let inx = if *if_exists { " IF EXISTS" } else { "" };
+                let csc = if *cascade { " CASCADE" } else { "" };
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "DropTable{inx}: tables=[{names}]{csc}\n",
+                        names = tables.join(", ")
+                    ),
+                );
+            }
+            Self::AlterTable {
+                table_name, action, ..
+            } => {
+                out.push_str(&pad);
+                match action {
+                    LogicalAlterTableAction::AddColumn { column } => {
+                        let _ = fmt::write(
+                            out,
+                            format_args!(
+                                "AlterTable: {table_name} ADD COLUMN {} {:?}{}\n",
+                                column.name,
+                                column.data_type,
+                                if column.nullable { "" } else { " NOT NULL" }
+                            ),
+                        );
+                    }
+                }
             }
         }
     }

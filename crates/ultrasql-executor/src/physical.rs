@@ -124,6 +124,7 @@ fn map_exec_error(err: crate::ExecError) -> BuildError {
 ///
 /// Returns [`BuildError`] on any of the conditions documented in the
 /// module-level lowering rules.
+#[allow(clippy::too_many_lines)]
 pub fn build_operator(
     plan: &LogicalPlan,
     data_source: &dyn DataSource,
@@ -174,8 +175,11 @@ pub fn build_operator(
         LogicalPlan::Truncate { .. } => {
             Err(BuildError::Unsupported("TRUNCATE not supported in v0.5"))
         }
-        LogicalPlan::CreateTable { .. } => Err(BuildError::Unsupported(
-            "CREATE TABLE is DDL and is dispatched outside the operator pipeline",
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::AlterTable { .. } => Err(BuildError::Unsupported(
+            "DDL is dispatched outside the operator pipeline",
         )),
 
         LogicalPlan::Join {

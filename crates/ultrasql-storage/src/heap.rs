@@ -356,6 +356,20 @@ impl<L: PageLoader> HeapAccess<L> {
             .map_or(0, |c| c.load(Ordering::Acquire))
     }
 
+    /// Borrow the underlying buffer pool.
+    ///
+    /// Exposed so subsystems that need raw page access against the
+    /// same pool — notably the server's `CREATE INDEX` path, which
+    /// instantiates a [`crate::btree::BTree`] over the same pool used
+    /// by the heap — can clone the inner `Arc` without going through
+    /// `HeapAccess`'s tuple-oriented API. Returning a `&Arc<...>`
+    /// keeps the call non-allocating; callers `Arc::clone` if they
+    /// need a fresh owned handle.
+    #[must_use]
+    pub const fn buffer_pool(&self) -> &Arc<BufferPool<L>> {
+        &self.pool
+    }
+
     /// Insert a tuple into the relation.
     ///
     /// The header is built in-place from `opts` and the tuple's own

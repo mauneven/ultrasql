@@ -71,10 +71,39 @@ pub enum ServerError {
     #[error("unsupported in v0.5: {0}")]
     Unsupported(&'static str),
 
+    /// A DDL kernel (catalog mutation, B-tree build, ALTER rewrite,
+    /// etc.) failed at runtime with a dynamic message — for example
+    /// a storage error encountered while populating an index, or a
+    /// row codec failure during a relation rewrite.
+    ///
+    /// Distinct from [`ServerError::Unsupported`] (which carries a
+    /// static `&'static str` for cheap construction) and from
+    /// [`ServerError::Catalog`] (which only wraps the typed catalog
+    /// error enum). DDL paths consume this when they bubble up an
+    /// error whose context is more useful than a single
+    /// thiserror-derived variant.
+    #[error("DDL failed: {0}")]
+    Ddl(String),
+
     /// A catalog operation (CREATE/DROP/ALTER) was rejected — for
     /// example, `CREATE TABLE` on an existing relation.
     #[error("catalog error: {0}")]
     Catalog(#[from] ultrasql_catalog::CatalogError),
+}
+
+impl ServerError {
+    /// Build a [`ServerError::Ddl`] from any displayable message.
+    ///
+    /// Convenience constructor used by the DDL dispatch paths in
+    /// `lib.rs` so the call sites stay compact:
+    ///
+    /// ```ignore
+    /// op.map_err(|e| ServerError::ddl(format_args!("CREATE INDEX: {e}")))?;
+    /// ```
+    #[must_use]
+    pub fn ddl<M: Into<String>>(msg: M) -> Self {
+        Self::Ddl(msg.into())
+    }
 }
 
 impl ServerError {
@@ -93,6 +122,7 @@ impl ServerError {
                 | Self::Execute(_)
                 | Self::Build(_)
                 | Self::Unsupported(_)
+                | Self::Ddl(_)
                 | Self::Catalog(_)
         )
     }
@@ -115,7 +145,8 @@ impl ServerError {
             Self::Build(_) | Self::Unsupported(_) => "0A000", // feature_not_supported
             Self::UnsupportedProtocol { .. } => "08P01",      // protocol_violation
             Self::Catalog(_) => "42000",                      // generic catalog failure
-            // Internal: Execute/IO/Protocol/UnexpectedEof all map here.
+            // Internal-style: Execute/IO/Protocol/UnexpectedEof and the
+            // dynamic Ddl message all map to XX000.
             _ => "XX000",
         }
     }

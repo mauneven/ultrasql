@@ -364,7 +364,10 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
         | LogicalPlan::Empty { .. }
         | LogicalPlan::Values { .. }
         | LogicalPlan::Truncate { .. }
-        | LogicalPlan::CreateTable { .. } => Ok(None),
+        | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::AlterTable { .. } => Ok(None),
     }
 }
 

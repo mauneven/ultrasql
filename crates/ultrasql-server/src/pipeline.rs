@@ -141,12 +141,15 @@ pub fn lower_plan(
         LogicalPlan::Update { .. } => Err(ServerError::Unsupported("UPDATE")),
         LogicalPlan::Delete { .. } => Err(ServerError::Unsupported("DELETE")),
         LogicalPlan::Truncate { .. } => Err(ServerError::Unsupported("TRUNCATE")),
-        // CREATE TABLE is DDL and is dispatched ahead of the lowerer in
+        // DDL is dispatched ahead of the lowerer in
         // `lib.rs::execute_query`. Reaching here means the dispatcher
         // missed a case; surface it as a planner-pipeline bug rather
         // than as a silent fall-through.
-        LogicalPlan::CreateTable { .. } => Err(ServerError::Unsupported(
-            "CREATE TABLE reached operator lowerer; expected DDL dispatch path",
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::AlterTable { .. } => Err(ServerError::Unsupported(
+            "DDL reached operator lowerer; expected DDL dispatch path",
         )),
         LogicalPlan::Join { .. } => Err(ServerError::Unsupported("JOIN")),
         LogicalPlan::Aggregate { .. } => Err(ServerError::Unsupported("GROUP BY / aggregate")),
@@ -486,8 +489,11 @@ pub fn lower_query(
             ..
         } => lower_real_delete(table, input, returning, ctx),
         LogicalPlan::Truncate { .. } => Err(ServerError::Unsupported("TRUNCATE")),
-        LogicalPlan::CreateTable { .. } => Err(ServerError::Unsupported(
-            "CREATE TABLE reached operator lowerer; expected DDL dispatch path",
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::AlterTable { .. } => Err(ServerError::Unsupported(
+            "DDL reached operator lowerer; expected DDL dispatch path",
         )),
         LogicalPlan::Join { .. } => Err(ServerError::Unsupported("JOIN")),
         LogicalPlan::Aggregate {

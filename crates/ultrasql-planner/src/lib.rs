@@ -28,8 +28,9 @@ pub use catalog::{Catalog, InMemoryCatalog, TableMeta};
 pub use error::PlanError;
 pub use expr::{BinaryOp, ScalarExpr, UnaryOp};
 pub use plan::{
-    AggregateFunc, ConflictTarget, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType,
-    LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, SortKey,
+    AggregateFunc, ConflictTarget, LogicalAggregateExpr, LogicalAlterTableAction,
+    LogicalJoinCondition, LogicalJoinType, LogicalOnConflict, LogicalPlan, LogicalSetOp,
+    LogicalSetQuantifier, SortKey,
 };
 
 #[cfg(test)]

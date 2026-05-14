@@ -19,7 +19,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
-use ultrasql_core::Oid;
+use ultrasql_core::{Field, Oid, Schema};
 
 use crate::entry::{IndexEntry, TableEntry};
 use crate::error::CatalogError;
@@ -266,6 +266,40 @@ impl MutableCatalog for InMemoryCatalog {
             by_name.n_blocks = n_blocks;
         }
         Ok(())
+    }
+
+    fn alter_table_add_column(
+        &self,
+        name: &str,
+        column: Field,
+    ) -> Result<TableEntry, CatalogError> {
+        let key = fold_name(name);
+        // Capture the existing entry under the by-name shard lock so a
+        // concurrent DDL cannot delete it under us between the read and
+        // the write.
+        let existing = {
+            let guard = self
+                .tables_by_name
+                .get(&key)
+                .ok_or_else(|| CatalogError::not_found(name.to_owned()))?;
+            guard.value().clone()
+        };
+        // Build a wider schema with the new field appended.
+        let mut fields: Vec<Field> = existing.schema.fields().to_vec();
+        fields.push(column);
+        let new_schema = Schema::new(fields)
+            .map_err(|e| CatalogError::schema_conflict(format!("ALTER TABLE ADD COLUMN: {e}")))?;
+        let mut updated = existing.clone();
+        updated.schema = new_schema;
+        // Write through both indexes. Hold them sequentially to keep
+        // the lock graph linearisable.
+        if let Some(mut entry) = self.tables_by_name.get_mut(&key) {
+            *entry = updated.clone();
+        }
+        if let Some(mut entry) = self.tables_by_oid.get_mut(&existing.oid) {
+            *entry = updated.clone();
+        }
+        Ok(updated)
     }
 }
 
@@ -567,5 +601,48 @@ mod tests {
         }
         assert_eq!(success.load(Ordering::Relaxed), 1);
         assert_eq!(cat.list_tables().len(), 1);
+    }
+
+    #[test]
+    fn alter_table_add_column_extends_schema() {
+        let cat = InMemoryCatalog::new();
+        let entry = make_table(&cat, "items");
+        let oid = entry.oid;
+        cat.create_table(entry).expect("create");
+        let new_col = Field::nullable("note", DataType::Text { max_len: None });
+        let updated = cat
+            .alter_table_add_column("items", new_col.clone())
+            .expect("ALTER ADD COLUMN succeeds");
+        assert_eq!(updated.oid, oid, "OID is preserved");
+        assert_eq!(updated.schema.len(), 4);
+        assert_eq!(updated.schema.field_at(3), &new_col);
+        // Lookup observes the new schema.
+        let by_name = cat.lookup_table("items").expect("still present");
+        assert_eq!(by_name.schema.len(), 4);
+        let by_oid = cat.lookup_table_by_oid(oid).expect("by oid");
+        assert_eq!(by_oid.schema.len(), 4);
+    }
+
+    #[test]
+    fn alter_table_add_column_rejects_unknown_relation() {
+        let cat = InMemoryCatalog::new();
+        let err = cat
+            .alter_table_add_column("nope", Field::nullable("x", DataType::Int32))
+            .expect_err("unknown relation must fail");
+        assert!(matches!(err, CatalogError::NotFound(_)));
+    }
+
+    #[test]
+    fn alter_table_add_column_rejects_duplicate_column_name() {
+        let cat = InMemoryCatalog::new();
+        cat.create_table(make_table(&cat, "items")).expect("create");
+        // Duplicate field name (case-folded).
+        let err = cat
+            .alter_table_add_column("items", Field::nullable("ID", DataType::Int32))
+            .expect_err("duplicate column must fail");
+        assert!(
+            matches!(err, CatalogError::SchemaConflict(_)),
+            "got {err:?}"
+        );
     }
 }

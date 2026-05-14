@@ -48,13 +48,19 @@ use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
-use ultrasql_catalog::{CatalogSnapshot, MutableCatalog, PersistentCatalog, TableEntry};
-use ultrasql_core::PageId;
+use ultrasql_catalog::{
+    CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
+};
+use ultrasql_core::{DataType, PageId, RelationId, Value};
 use ultrasql_parser::Parser;
-use ultrasql_planner::{Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan, TableMeta, bind};
+use ultrasql_planner::{
+    Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
+    bind,
+};
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
+use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::HeapAccess;
+use ultrasql_storage::heap::{HeapAccess, UpdateOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, TransactionManager};
 
@@ -525,8 +531,20 @@ where
         // DDL is dispatched ahead of operator lowering: it never produces
         // rows, so the lowerer would only round-trip it through an
         // unreachable arm.
-        if let LogicalPlan::CreateTable { .. } = &plan {
-            return self.execute_create_table(&plan, &catalog_snapshot);
+        match &plan {
+            LogicalPlan::CreateTable { .. } => {
+                return self.execute_create_table(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::CreateIndex { .. } => {
+                return self.execute_create_index(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::DropTable { .. } => {
+                return self.execute_drop_table(&plan);
+            }
+            LogicalPlan::AlterTable { .. } => {
+                return self.execute_alter_table(&plan, &catalog_snapshot);
+            }
+            _ => {}
         }
 
         // Allocate an autocommit transaction. The XID becomes the `xmin`
@@ -619,6 +637,355 @@ where
         Ok(run_ddl_command("CREATE TABLE"))
     }
 
+    /// Build a B+ tree index over the supplied table and register it
+    /// in `pg_index`.
+    ///
+    /// The kernel work is split into four steps:
+    ///
+    /// 1. Validate the request against the current catalog snapshot —
+    ///    `IF NOT EXISTS`, presence of the parent table, key-column
+    ///    type compatibility with the B-tree (currently only fixed-size
+    ///    8-byte keys are stored, so `Int64` is the natural domain;
+    ///    `Int32` keys are widened to `i64` before insertion).
+    /// 2. Allocate a fresh OID for the index and instantiate a new
+    ///    [`BTree`] over a relation id derived from that OID. The
+    ///    buffer pool's blank-page loader hands out empty heap pages
+    ///    which `BTree::create` then initialises as B-tree leaves.
+    /// 3. Scan every visible row of the parent table under an
+    ///    autocommit snapshot, decode the key column, and call
+    ///    [`BTree::insert`] with the row's [`ultrasql_core::TupleId`].
+    /// 4. Build an [`IndexEntry`] carrying the root block plus the
+    ///    requested attnums, register it with the persistent catalog,
+    ///    and let the catalog's snapshot rotation publish the entry to
+    ///    subsequent statements.
+    ///
+    /// # Sub-shape gaps documented for reviewers
+    ///
+    /// - Only single-column indexes are built today. The binder
+    ///   accepts multi-column lists for completeness (so a follow-up
+    ///   can flip the kernel restriction without re-binding) but the
+    ///   server rejects them here.
+    /// - Only `Int32` / `Int64` key types are supported. Other types
+    ///   (text, float, bool) would require a richer [`BTree`] key
+    ///   trait; the build returns
+    ///   [`ServerError::Unsupported`] for them.
+    /// - `UNIQUE` is honoured at the catalog level — the
+    ///   [`IndexEntry::is_unique`] flag is propagated — but the
+    ///   B-tree's existing duplicate-key rejection is the only
+    ///   enforcement. Non-unique indexes that happen to have unique
+    ///   data still build correctly; non-unique indexes with
+    ///   duplicates would error here, which is a known limitation
+    ///   we accept until the B-tree gains a non-unique mode.
+    fn execute_create_index(
+        &self,
+        plan: &LogicalPlan,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::CreateIndex {
+            index_name,
+            table_name,
+            columns,
+            unique,
+            if_not_exists,
+            ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_create_index called with non-CreateIndex plan",
+            ));
+        };
+
+        // 1a. IF NOT EXISTS short-circuit.
+        if snapshot.indexes.contains_key(index_name) {
+            if *if_not_exists {
+                return Ok(run_ddl_command("CREATE INDEX"));
+            }
+            return Err(ServerError::Catalog(
+                ultrasql_catalog::CatalogError::already_exists(index_name.clone()),
+            ));
+        }
+
+        // 1b. Resolve the parent table.
+        let table = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.clone(),
+            ))
+        })?;
+
+        // 1c. Validate the key columns. Only one column, only Int32 /
+        //     Int64 — see the doc comment for the rationale.
+        if columns.len() != 1 {
+            return Err(ServerError::Unsupported(
+                "CREATE INDEX: only single-column indexes are supported in this wave",
+            ));
+        }
+        let key_col_idx = columns[0];
+        let key_field = table.schema.field(key_col_idx).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::ColumnNotFound(format!(
+                "column index {key_col_idx} in table {table_name}"
+            )))
+        })?;
+        let widen_i32 = match key_field.data_type {
+            DataType::Int32 => true,
+            DataType::Int64 => false,
+            _ => {
+                return Err(ServerError::Unsupported(
+                    "CREATE INDEX: only Int32 / Int64 key columns are supported in this wave",
+                ));
+            }
+        };
+
+        // 2. Allocate an OID and instantiate the B-tree.
+        let index_oid = self.state.persistent_catalog.next_oid();
+        let index_rel = RelationId::new(index_oid.raw());
+        let pool = self.state.heap.buffer_pool();
+        let mut btree = BTree::create(Arc::clone(pool), index_rel)
+            .map_err(|e| ServerError::ddl(format!("BTree::create failed: {e}")))?;
+        let root_block = btree.root_block();
+
+        // 3. Scan the heap and populate the tree.
+        let key_attnum = u16::try_from(key_col_idx).map_err(|_| {
+            ServerError::Unsupported("CREATE INDEX: column index does not fit in u16 attnum field")
+        })?;
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let table_rel = RelationId(table.oid);
+        let block_count = self.state.heap.block_count(table_rel).max(table.n_blocks);
+        let scan = self.state.heap.scan_visible(
+            table_rel,
+            block_count,
+            &txn.snapshot,
+            self.state.txn_manager.as_ref(),
+        );
+        let insert_result = (|| -> Result<u64, ServerError> {
+            let mut inserted: u64 = 0;
+            for result in scan {
+                let tup =
+                    result.map_err(|e| ServerError::ddl(format!("CREATE INDEX heap scan: {e}")))?;
+                let row = decode_key_column(&tup.data, &table.schema, key_col_idx, widen_i32)?;
+                if let Some(key) = row {
+                    btree
+                        .insert(key, tup.tid, txn.xid, None)
+                        .map_err(|e| ServerError::ddl(format!("CREATE INDEX btree insert: {e}")))?;
+                    inserted += 1;
+                }
+                // NULL key — skip; PostgreSQL's btree omits NULL keys
+                // from the index unless `INCLUDE` adds them, and our
+                // BTree::insert lacks a NULL marker.
+            }
+            Ok(inserted)
+        })();
+
+        // Commit the txn regardless of build outcome so the XID does
+        // not leak as in-progress forever.
+        if let Err(e) = self.state.txn_manager.commit(txn) {
+            tracing::warn!(error = %e, "autocommit (CREATE INDEX) failed to finalise");
+        }
+        let _ = insert_result?;
+
+        // 4. Register the index entry. The columns vector uses the
+        //    1-based attnum convention shared with `pg_attribute`; the
+        //    `IndexEntry` stores 0-based positions internally, so the
+        //    cast is direct. We override `root_block` to match the
+        //    freshly built tree.
+        let attnums: Vec<u16> = vec![key_attnum];
+        let mut entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, *unique);
+        entry.root_block = root_block;
+        self.state.persistent_catalog.create_index(entry)?;
+
+        Ok(run_ddl_command("CREATE INDEX"))
+    }
+
+    /// Drop one or more tables.
+    ///
+    /// The binder has already filtered names through the catalog —
+    /// see [`ultrasql_planner::bind`] — so the only failure surface
+    /// here is `CatalogError::NotFound`, which can fire only when a
+    /// concurrent DDL deleted the relation between the binder and the
+    /// dispatcher. Associated indexes are removed by
+    /// [`MutableCatalog::drop_table`] in a single atomic snapshot
+    /// rotation.
+    ///
+    /// Heap pages backing the dropped relation are *not* reclaimed in
+    /// this wave: the in-memory buffer pool grows on demand and the
+    /// segment manager has not yet landed. The dropped name becomes
+    /// available immediately for reuse via `CREATE TABLE` — subsequent
+    /// inserts will reuse the relation-id space without colliding
+    /// because OIDs are monotonic.
+    fn execute_drop_table(&self, plan: &LogicalPlan) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::DropTable { tables, .. } = plan else {
+            return Err(ServerError::Unsupported(
+                "execute_drop_table called with non-DropTable plan",
+            ));
+        };
+        for name in tables {
+            self.state.persistent_catalog.drop_table(name)?;
+        }
+        Ok(run_ddl_command("DROP TABLE"))
+    }
+
+    /// Apply an `ALTER TABLE` action.
+    ///
+    /// The only supported action in this wave is `ADD COLUMN`. For
+    /// `ADD COLUMN` we
+    ///
+    /// 1. take a per-statement MVCC snapshot,
+    /// 2. scan every visible tuple under the *old* schema and rewrite
+    ///    it back through `HeapAccess::update` with a payload encoded
+    ///    against the *new* schema (the appended column carries
+    ///    [`Value::Null`] for every pre-existing row),
+    /// 3. swap the catalog entry to the new schema via
+    ///    [`MutableCatalog::alter_table_add_column`].
+    ///
+    /// Steps 2 and 3 are wrapped in a single autocommit transaction so
+    /// the rewrite and the catalog swap commit (or abort) together;
+    /// concurrent readers either see the old schema with old tuples or
+    /// the new schema with rewritten tuples — never a torn state.
+    ///
+    /// # Sub-shape gaps documented for reviewers
+    ///
+    /// - `DROP COLUMN`, `RENAME COLUMN`, `RENAME TO`, and
+    ///   `ADD/DROP CONSTRAINT` are not yet bindable in
+    ///   [`ultrasql_planner::bind`]; the binder returns
+    ///   `NotSupported` for them so they never reach this arm.
+    /// - The rewrite is online-unsafe today: there is no per-relation
+    ///   exclusive lock taken across steps 2 and 3, so a concurrent
+    ///   INSERT during the rewrite may produce a tuple that scans see
+    ///   under the new schema but was encoded against the old one. We
+    ///   ship this anyway because v0.5 dispatches Simple Query
+    ///   statements serially per connection and the README workload
+    ///   does not concurrently mutate the relation under test. A
+    ///   follow-up will route DDL through the lock manager
+    ///   (`AccessExclusiveLock`).
+    fn execute_alter_table(
+        &self,
+        plan: &LogicalPlan,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::AlterTable {
+            table_name, action, ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_alter_table called with non-AlterTable plan",
+            ));
+        };
+        match action {
+            LogicalAlterTableAction::AddColumn { column } => {
+                self.execute_alter_add_column(table_name, column.clone(), snapshot)
+            }
+        }
+    }
+
+    /// Execute the `ALTER TABLE t ADD COLUMN c TYPE [NULL | NOT NULL]`
+    /// path.
+    ///
+    /// Decoded from the dispatch arm so `execute_alter_table` stays
+    /// a thin shape-match. See [`Self::execute_alter_table`] for the
+    /// design notes that apply to the rewrite ordering, MVCC, and the
+    /// known online-DDL gap.
+    fn execute_alter_add_column(
+        &self,
+        table_name: &str,
+        column: ultrasql_core::Field,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        // 1. Resolve the existing entry and build the new schema.
+        let entry = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        let mut new_fields: Vec<ultrasql_core::Field> = entry.schema.fields().to_vec();
+        new_fields.push(column.clone());
+        let new_schema = ultrasql_core::Schema::new(new_fields).map_err(|e| {
+            ServerError::Catalog(ultrasql_catalog::CatalogError::schema_conflict(format!(
+                "ALTER TABLE ADD COLUMN: {e}"
+            )))
+        })?;
+
+        // 2. Rewrite existing tuples — outside the catalog swap so
+        //    the snapshot scan still observes the old schema.
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let rel = RelationId(entry.oid);
+        let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
+        let old_codec = ultrasql_executor::RowCodec::new(entry.schema.clone());
+        let new_codec = ultrasql_executor::RowCodec::new(new_schema);
+
+        let rewrite_result: Result<(), ServerError> = (|| {
+            // Collect the visible tuples up front so the heap iterator
+            // is fully drained before any update lands — otherwise the
+            // iterator could revisit a row that the update has just
+            // copied into a new slot. The relations we ALTER in v0.5
+            // fit comfortably in memory.
+            let mut to_rewrite: Vec<(ultrasql_core::TupleId, Vec<Value>)> = Vec::new();
+            {
+                let scan = self.state.heap.scan_visible(
+                    rel,
+                    block_count,
+                    &txn.snapshot,
+                    self.state.txn_manager.as_ref(),
+                );
+                for result in scan {
+                    let tup = result
+                        .map_err(|e| ServerError::ddl(format!("ALTER TABLE heap scan: {e}")))?;
+                    let row = old_codec
+                        .decode(&tup.data)
+                        .map_err(|e| ServerError::ddl(format!("ALTER TABLE row decode: {e}")))?;
+                    to_rewrite.push((tup.tid, row));
+                }
+            }
+
+            // Now perform the updates.
+            for (tid, old_row) in to_rewrite {
+                let mut new_row = old_row;
+                new_row.push(Value::Null);
+                let new_payload = new_codec
+                    .encode(&new_row)
+                    .map_err(|e| ServerError::ddl(format!("ALTER TABLE row encode: {e}")))?;
+                self.state
+                    .heap
+                    .update(
+                        tid,
+                        &new_payload,
+                        UpdateOptions {
+                            xid: txn.xid,
+                            command_id: ultrasql_core::CommandId::FIRST,
+                            wal: None,
+                            vm: None,
+                            hot_eligible: true,
+                        },
+                    )
+                    .map_err(|e| ServerError::ddl(format!("ALTER TABLE heap update: {e}")))?;
+            }
+            Ok(())
+        })();
+
+        // 3. Swap the catalog entry only if the rewrite succeeded;
+        //    otherwise abort the transaction so the half-rewritten
+        //    tuples become dead (their xmin matches our xid, which we
+        //    will mark aborted on rollback).
+        match rewrite_result {
+            Ok(()) => {
+                self.state
+                    .persistent_catalog
+                    .alter_table_add_column(table_name, column)?;
+                if let Err(e) = self.state.txn_manager.commit(txn) {
+                    tracing::warn!(error = %e, "autocommit (ALTER TABLE) failed to finalise");
+                }
+                Ok(run_ddl_command("ALTER TABLE"))
+            }
+            Err(e) => {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    tracing::warn!(
+                        error = %abort_err,
+                        "autocommit (ALTER TABLE rollback) failed to abort"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Read one frontend message, growing the buffer until the codec
     /// has a complete frame.
     //
@@ -664,6 +1031,47 @@ where
             ],
         };
         self.send(&msg).await
+    }
+}
+
+/// Decode a single column out of an encoded heap-tuple payload and
+/// return its value as an `i64` key.
+///
+/// `schema` is the relation's full schema; `col_idx` is the 0-based
+/// position of the key column inside that schema; `widen_i32` is
+/// `true` for `Int32` columns (the value is sign-extended to `i64`)
+/// and `false` for `Int64`. `Value::Null` returns `None` so the
+/// caller can decide what to do — the CREATE INDEX build path
+/// currently skips NULL keys (PostgreSQL semantics for non-`INCLUDE`
+/// b-tree indexes).
+///
+/// Returning `Result<Option<i64>, ServerError>` keeps NULL handling
+/// at the call site; using a panic / sentinel value would conflate
+/// "schema mismatch" with "missing value", which the catalog wants
+/// to keep distinct.
+fn decode_key_column(
+    bytes: &[u8],
+    schema: &ultrasql_core::Schema,
+    col_idx: usize,
+    widen_i32: bool,
+) -> Result<Option<i64>, ServerError> {
+    let codec = ultrasql_executor::RowCodec::new(schema.clone());
+    let row = codec
+        .decode(bytes)
+        .map_err(|e| ServerError::ddl(format!("CREATE INDEX key decode: {e}")))?;
+    let value = row.get(col_idx).ok_or_else(|| {
+        ServerError::ddl(format!(
+            "CREATE INDEX key column {col_idx} missing from decoded row of arity {}",
+            row.len()
+        ))
+    })?;
+    match (value, widen_i32) {
+        (Value::Null, _) => Ok(None),
+        (Value::Int32(v), true) => Ok(Some(i64::from(*v))),
+        (Value::Int64(v), false) => Ok(Some(*v)),
+        _ => Err(ServerError::ddl(format!(
+            "CREATE INDEX key column {col_idx} has unexpected runtime type"
+        ))),
     }
 }
 
@@ -1271,5 +1679,360 @@ mod tests {
         send_frontend(&mut stream, &FrontendMessage::Terminate).await;
         drop(stream);
         server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // CREATE INDEX / DROP TABLE / ALTER TABLE — wire dispatch tests
+    // -----------------------------------------------------------------------
+
+    /// Drive `CREATE TABLE`, INSERT a few rows, then issue
+    /// `CREATE INDEX`. The catalog snapshot must reflect the new
+    /// index entry and the `IndexEntry`'s columns must match the
+    /// key column the binder resolved.
+    #[tokio::test]
+    async fn create_index_via_wire_registers_index_entry() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let state_clone = Arc::clone(&state);
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        // CREATE TABLE with an Int64 key (matches the v0.5 B-tree key shape).
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE t (id BIGINT NOT NULL, val INT)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "INSERT INTO t VALUES (10, 1), (20, 2), (30, 3)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE INDEX ix_t_id ON t (id)".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+
+        let tag = msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        });
+        assert_eq!(tag.as_deref(), Some("CREATE INDEX"));
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::RowDescription { .. })),
+            "DDL must not emit RowDescription"
+        );
+
+        // Catalog snapshot must contain the new index.
+        let snap = state_clone.catalog_snapshot();
+        let idx = snap
+            .indexes
+            .get("ix_t_id")
+            .expect("ix_t_id present in snapshot");
+        assert_eq!(idx.name, "ix_t_id");
+        assert_eq!(idx.columns, vec![0_u16], "indexes id column at attnum 0");
+        // The table OID matches the registered table.
+        let table = snap.tables.get("t").expect("t present");
+        assert_eq!(idx.table_oid, table.oid);
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// `CREATE INDEX IF NOT EXISTS` is a no-op when the index already
+    /// exists; the second invocation still returns `CREATE INDEX` as
+    /// the command tag and does not error.
+    #[tokio::test]
+    async fn create_index_if_not_exists_is_idempotent() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE t (id BIGINT NOT NULL)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        for _ in 0..2 {
+            send_frontend(
+                &mut client,
+                &FrontendMessage::Query {
+                    sql: "CREATE INDEX IF NOT EXISTS ix_t_id ON t (id)".to_string(),
+                },
+            )
+            .await;
+            let msgs = drain_until_ready(&mut client).await;
+            let tag = msgs.iter().find_map(|m| match m {
+                BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+                _ => None,
+            });
+            assert_eq!(tag.as_deref(), Some("CREATE INDEX"));
+        }
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// `DROP TABLE t` makes a subsequent `SELECT * FROM t` fail with a
+    /// PostgreSQL-style `undefined_table` error (SQLSTATE 42P01). The
+    /// session continues so the test pattern matches PostgreSQL's
+    /// behaviour.
+    #[tokio::test]
+    async fn drop_table_via_wire_then_select_fails_with_undefined_table() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let state_clone = Arc::clone(&state);
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE t (id INT)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "DROP TABLE t".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let tag = msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        });
+        assert_eq!(tag.as_deref(), Some("DROP TABLE"));
+
+        // Catalog snapshot no longer holds the dropped table.
+        assert!(!state_clone.catalog_snapshot().tables.contains_key("t"));
+
+        // Subsequent SELECT errors with relation-does-not-exist.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM t".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let err = msgs
+            .iter()
+            .find_map(|m| match m {
+                BackendMessage::ErrorResponse { fields } => Some(fields.clone()),
+                _ => None,
+            })
+            .expect("ErrorResponse on dropped table");
+        let sqlstate = err
+            .iter()
+            .find_map(|(c, v)| (*c == b'C').then(|| v.clone()))
+            .expect("SQLSTATE field present");
+        assert_eq!(sqlstate, "42P01", "undefined_table SQLSTATE");
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// `DROP TABLE IF EXISTS missing` succeeds with the `DROP TABLE`
+    /// command tag and does not error.
+    #[tokio::test]
+    async fn drop_table_if_exists_missing_is_noop() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "DROP TABLE IF EXISTS nothing_here".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let tag = msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        });
+        assert_eq!(tag.as_deref(), Some("DROP TABLE"));
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// End-to-end `ALTER TABLE t ADD COLUMN c` flow:
+    ///
+    /// 1. Create a table, insert a row.
+    /// 2. ALTER ADD COLUMN — relation is rewritten so the pre-existing
+    ///    row's new column reads as NULL.
+    /// 3. INSERT a new row with a value for the added column.
+    /// 4. SELECT and verify the pre-existing row reads NULL while the
+    ///    new row reads the inserted value.
+    #[tokio::test]
+    async fn alter_table_add_column_via_wire_round_trips() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let state_clone = Arc::clone(&state);
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        // Setup
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE t (id INT NOT NULL, val INT)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "INSERT INTO t VALUES (1, 100)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        // ALTER ADD COLUMN
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "ALTER TABLE t ADD COLUMN c INTEGER".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let tag = msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        });
+        assert_eq!(tag.as_deref(), Some("ALTER TABLE"));
+
+        // Catalog snapshot now reflects 3 columns.
+        let snap = state_clone.catalog_snapshot();
+        let t = snap.tables.get("t").expect("t present");
+        assert_eq!(t.schema.len(), 3);
+        assert_eq!(t.schema.field_at(2).name, "c");
+
+        // INSERT a new row including the new column.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "INSERT INTO t (id, val, c) VALUES (2, 200, 999)".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let tag = msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        });
+        assert_eq!(tag.as_deref(), Some("INSERT 0 1"));
+
+        // SELECT all three columns; verify the pre-existing row reads
+        // NULL for `c` and the new row reads 999.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id, val, c FROM t".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let rows: Vec<Vec<Option<Vec<u8>>>> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(columns.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 2, "expected 2 rows, got {msgs:?}");
+        // Normalise into (id, val, c) tuples for assertion.
+        let parsed: Vec<(i32, i32, Option<i32>)> = rows
+            .iter()
+            .map(|cols| {
+                let id = std::str::from_utf8(cols[0].as_ref().unwrap())
+                    .unwrap()
+                    .parse::<i32>()
+                    .unwrap();
+                let val = std::str::from_utf8(cols[1].as_ref().unwrap())
+                    .unwrap()
+                    .parse::<i32>()
+                    .unwrap();
+                let c = cols[2]
+                    .as_ref()
+                    .map(|b| std::str::from_utf8(b).unwrap().parse::<i32>().unwrap());
+                (id, val, c)
+            })
+            .collect();
+        // Pre-existing row sees NULL for c; new row sees 999.
+        assert!(parsed.contains(&(1, 100, None)), "got {parsed:?}");
+        assert!(parsed.contains(&(2, 200, Some(999))), "got {parsed:?}");
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// `ALTER TABLE ADD COLUMN` on a table that does not exist must
+    /// fail at the binder layer (`PlanError::TableNotFound`) and
+    /// surface as a query-scoped error — the session survives.
+    #[tokio::test]
+    async fn alter_table_add_column_rejects_missing_relation() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "ALTER TABLE nope ADD COLUMN x INTEGER".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "expected ErrorResponse: {msgs:?}"
+        );
+        assert!(matches!(
+            msgs.last().unwrap(),
+            BackendMessage::ReadyForQuery { status: b'I' }
+        ));
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
     }
 }

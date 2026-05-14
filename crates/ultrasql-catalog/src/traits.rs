@@ -12,7 +12,7 @@
 //! write paths: the in-memory implementation uses sharded maps to
 //! guarantee that.
 
-use ultrasql_core::Oid;
+use ultrasql_core::{Field, Oid};
 
 use crate::entry::{IndexEntry, TableEntry};
 use crate::error::CatalogError;
@@ -109,4 +109,19 @@ pub trait MutableCatalog: Catalog {
     /// # Errors
     /// - [`CatalogError::NotFound`] when no table holds that OID.
     fn update_table_size(&self, oid: Oid, n_blocks: u32) -> Result<(), CatalogError>;
+
+    /// Append `column` to the named table's schema and atomically
+    /// publish the new entry.
+    ///
+    /// The table's [`Oid`] is preserved; only `schema` is rebuilt
+    /// with the additional [`Field`] appended at the end.
+    ///
+    /// # Errors
+    /// - [`CatalogError::NotFound`] when no table by `name` is
+    ///   registered.
+    /// - [`CatalogError::SchemaConflict`] when appending the field
+    ///   would violate a [`ultrasql_core::Schema`] invariant (e.g. a
+    ///   duplicate column name after case-folding).
+    fn alter_table_add_column(&self, name: &str, column: Field)
+    -> Result<TableEntry, CatalogError>;
 }

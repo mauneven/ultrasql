@@ -284,7 +284,10 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::Update { .. }
             | LogicalPlan::Delete { .. }
             | LogicalPlan::Truncate { .. }
-            | LogicalPlan::CreateTable { .. } => zero_estimate(),
+            | LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::DropTable { .. }
+            | LogicalPlan::AlterTable { .. } => zero_estimate(),
         }
     }
 }

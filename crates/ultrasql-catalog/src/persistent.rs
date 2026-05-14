@@ -47,7 +47,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use ultrasql_core::{Oid, RelationId};
+use ultrasql_core::{Field, Oid, RelationId, Schema};
 use ultrasql_storage::buffer_pool::PageLoader;
 use ultrasql_storage::heap::HeapAccess;
 
@@ -738,6 +738,38 @@ impl MutableCatalog for PersistentCatalog {
         self.rebuild_snapshot();
         Ok(())
     }
+
+    fn alter_table_add_column(
+        &self,
+        name: &str,
+        column: Field,
+    ) -> Result<TableEntry, CatalogError> {
+        let key = fold_name(name);
+        let _guard = self.write_lock.lock();
+        // Snapshot the existing entry under the write lock so the
+        // schema rebuild observes a stable input even when concurrent
+        // readers race a snapshot acquisition.
+        let existing = self
+            .tables_by_name
+            .get(&key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .value()
+            .clone();
+        let mut fields: Vec<Field> = existing.schema.fields().to_vec();
+        fields.push(column);
+        let new_schema = Schema::new(fields)
+            .map_err(|e| CatalogError::schema_conflict(format!("ALTER TABLE ADD COLUMN: {e}")))?;
+        let mut updated = existing.clone();
+        updated.schema = new_schema;
+        if let Some(mut entry) = self.tables_by_name.get_mut(&key) {
+            *entry = updated.clone();
+        }
+        if let Some(mut entry) = self.tables_by_oid.get_mut(&existing.oid) {
+            *entry = updated.clone();
+        }
+        self.rebuild_snapshot();
+        Ok(updated)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -988,6 +1020,33 @@ mod tests {
         let snap_after = cat.snapshot();
         assert_eq!(snap_after.tables.len(), 9);
         assert!(snap_after.tables.contains_key("extra_table"));
+    }
+
+    /// `alter_table_add_column` on the persistent catalog extends the
+    /// schema, preserves the OID, and the new entry is reflected in the
+    /// next snapshot taken via `ArcSwap`.
+    #[test]
+    fn alter_table_add_column_persistent_updates_snapshot() {
+        use ultrasql_core::{DataType, Field};
+
+        let cat = PersistentCatalog::new();
+        let entry = make_table(&cat, "items");
+        let oid = entry.oid;
+        cat.create_table(entry).expect("create");
+
+        let new_col = Field::nullable("note", DataType::Text { max_len: None });
+        let updated = cat
+            .alter_table_add_column("items", new_col.clone())
+            .expect("ALTER ADD COLUMN");
+        assert_eq!(updated.oid, oid);
+        assert_eq!(updated.schema.len(), 3);
+        assert_eq!(updated.schema.field_at(2), &new_col);
+
+        // Fresh snapshot reflects the wider schema.
+        let snap = cat.snapshot();
+        let snap_entry = snap.tables.get("items").expect("present");
+        assert_eq!(snap_entry.schema.len(), 3);
+        assert_eq!(snap_entry.oid, oid);
     }
 
     /// Write a synthetic `pg_class` entry directly to the `DashMap` (simulating
