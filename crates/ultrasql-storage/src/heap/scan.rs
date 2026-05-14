@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ahash::AHashMap;
+use dashmap::DashMap;
 use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
 use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
@@ -173,23 +174,91 @@ impl<L: PageLoader> HeapAccess<L> {
                 // field it needs.
                 let (header, _) = TupleHeader::decode(&slot_bytes[..TUPLE_HEADER_SIZE])
                     .ok_or(HeapError::MalformedHeader("header decode failed"))?;
-                let visible = matches!(
-                    is_visible(&header, snapshot, oracle),
-                    Visibility::Visible,
-                );
+                let outcome = is_visible(&header, snapshot, oracle);
                 if header.xmax.is_invalid() {
+                    let visible = matches!(outcome, Visibility::Visible);
                     xmin_cache = Some((header.xmin, header.infomask.bits(), visible));
                 }
-                if !visible {
-                    continue;
-                }
                 let tid = TupleId::new(page_id, slot);
-                f(tid, &header, &slot_bytes[TUPLE_HEADER_SIZE..])?;
+                match outcome {
+                    Visibility::Visible => {
+                        f(tid, &header, &slot_bytes[TUPLE_HEADER_SIZE..])?;
+                    }
+                    Visibility::VisiblePreImage => {
+                        // The slot's payload is the post-image of an
+                        // in-place UPDATE the reader's snapshot does
+                        // not yet see committed. Substitute the
+                        // pre-image from the per-relation undo log.
+                        // Lookup is by `(tid, writer_xid == header.xmax)`;
+                        // multiple in-place updates on the same slot
+                        // produce a chain we walk newest-to-oldest,
+                        // picking the youngest entry whose writer is
+                        // still invisible to this snapshot. A missing
+                        // entry means VACUUM trimmed it after we lost
+                        // the right to see the pre-image — treat as
+                        // invisible (the safe direction).
+                        if let Some(pre) =
+                            Self::lookup_undo_pre_image(&self.undo_log, rel, tid, &header,
+                                snapshot, oracle)
+                        {
+                            f(tid, &header, &pre)?;
+                        }
+                    }
+                    Visibility::Invisible | Visibility::DeletedByOwn => {}
+                }
             }
             drop(page);
             drop(guard);
         }
         Ok(())
+    }
+
+    /// Walk the per-relation undo log newest-to-oldest looking for
+    /// the youngest pre-image whose `writer_xid` is still invisible
+    /// to `snapshot`. Returns owned bytes so the scan callback can
+    /// keep its borrow across iterations.
+    ///
+    /// Lock order: caller has already dropped (or never acquired)
+    /// the page-write guard; this only takes the per-relation
+    /// `RwLock<UndoRelationLog>` for a read.
+    fn lookup_undo_pre_image<O: XidStatusOracle + ?Sized>(
+        undo_log: &Arc<DashMap<RelationId, parking_lot::RwLock<UndoRelationLog>>>,
+        rel: RelationId,
+        tid: TupleId,
+        _header: &TupleHeader,
+        snapshot: &Snapshot,
+        oracle: &O,
+    ) -> Option<Vec<u8>> {
+        let log = undo_log.get(&rel)?;
+        let log = log.read();
+        // Entries are appended in `(tid, writer_xid)` order; we walk
+        // backwards for newest-first. For the bench's autocommit
+        // workload `entries` is short; binary search by tid would be
+        // a follow-up.
+        for entry in log.entries.iter().rev() {
+            if entry.tid != tid {
+                continue;
+            }
+            // Pick the first (youngest) entry whose writer's commit
+            // is *not* visible to this snapshot. That is the pre-
+            // image the reader logically observes.
+            let writer_xmax = entry.writer_xid;
+            let visible = if snapshot.is_current_xid(writer_xmax) {
+                true
+            } else if snapshot.xid_in_progress(writer_xmax) {
+                false
+            } else {
+                matches!(
+                    oracle.status(writer_xmax),
+                    ultrasql_mvcc::status::XidStatus::Committed
+                        | ultrasql_mvcc::status::XidStatus::Frozen,
+                )
+            };
+            if !visible {
+                return Some(entry.old_payload.to_vec());
+            }
+        }
+        None
     }
 
     pub fn scan_visible_walker<'a, O: XidStatusOracle + ?Sized>(
@@ -215,6 +284,8 @@ impl<L: PageLoader> HeapAccess<L> {
             snapshot,
             oracle,
             xmin_cache: None,
+            undo_log: Arc::clone(&self.undo_log),
+            pre_image_scratch: Vec::new(),
         }
     }
 

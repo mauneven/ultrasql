@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use ahash::AHashMap;
+use dashmap::DashMap;
 use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
 use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
@@ -67,6 +68,17 @@ pub struct VisibleHeapWalker<'a, L: PageLoader, O: XidStatusOracle + ?Sized> {
     pub(super) oracle: &'a O,
     /// Same `(xmin, infomask, visibility)` cache as `VisibleHeapScan`.
     pub(super) xmin_cache: Option<(Xid, u16, bool)>,
+    /// Per-relation undo log, shared with the heap. Consulted when
+    /// the visibility predicate returns
+    /// [`Visibility::VisiblePreImage`] for an `UPDATED_IN_PLACE`
+    /// tuple whose writer xmax is not visible to this snapshot.
+    pub(super) undo_log: Arc<DashMap<RelationId, parking_lot::RwLock<UndoRelationLog>>>,
+    /// Scratch buffer the walker copies a pre-image payload into
+    /// when [`Visibility::VisiblePreImage`] fires. The returned
+    /// `&[u8]` borrows from here; the borrow is invalidated by the
+    /// next `try_next` call exactly like the page-scratch slot
+    /// borrow.
+    pub(super) pre_image_scratch: Vec<u8>,
 }
 
 impl<L: PageLoader, O: XidStatusOracle + ?Sized> std::fmt::Debug for VisibleHeapWalker<'_, L, O> {
@@ -164,45 +176,101 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
             let (header, _) = TupleHeader::decode(&slot_bytes[..TUPLE_HEADER_SIZE])
                 .ok_or(HeapError::MalformedHeader("header decode failed"))?;
 
-            let visible = if header.xmax.is_invalid() {
+            // Run the full visibility predicate. The cache below
+            // only short-circuits the `Visible` ⇄ `Invisible` axis
+            // for tuples with `xmax == INVALID`; tuples whose xmax
+            // is set (including the `UPDATED_IN_PLACE` case that
+            // returns `VisiblePreImage`) always pay the full
+            // `is_visible` call.
+            let outcome = if header.xmax.is_invalid() {
                 let infomask_bits = header.infomask.bits();
-                if let Some((cxmin, cinfo, cv)) = self.xmin_cache {
-                    if cxmin == header.xmin && cinfo == infomask_bits {
-                        cv
-                    } else {
-                        let v = matches!(
-                            is_visible(&header, self.snapshot, self.oracle),
-                            Visibility::Visible,
-                        );
-                        self.xmin_cache = Some((header.xmin, infomask_bits, v));
-                        v
-                    }
-                } else {
-                    let v = matches!(
-                        is_visible(&header, self.snapshot, self.oracle),
-                        Visibility::Visible,
-                    );
+                let cache_hit = self
+                    .xmin_cache
+                    .filter(|(cxmin, cinfo, _)| {
+                        *cxmin == header.xmin && *cinfo == infomask_bits
+                    })
+                    .map(|(_, _, v)| {
+                        if v {
+                            Visibility::Visible
+                        } else {
+                            Visibility::Invisible
+                        }
+                    });
+                cache_hit.unwrap_or_else(|| {
+                    let o = is_visible(&header, self.snapshot, self.oracle);
+                    let v = matches!(o, Visibility::Visible);
                     self.xmin_cache = Some((header.xmin, infomask_bits, v));
-                    v
-                }
+                    o
+                })
             } else {
-                matches!(
-                    is_visible(&header, self.snapshot, self.oracle),
-                    Visibility::Visible,
-                )
+                is_visible(&header, self.snapshot, self.oracle)
             };
 
-            if !visible {
-                continue;
-            }
-
             let tid = TupleId::new(page_id, slot);
-            // Payload is the bytes after the tuple header within the
-            // slot window we already validated above.
-            let payload = &self.page_scratch[offset + TUPLE_HEADER_SIZE..offset + length];
-            return Ok(Some((tid, header, payload)));
+            match outcome {
+                Visibility::Visible => {
+                    let payload =
+                        &self.page_scratch[offset + TUPLE_HEADER_SIZE..offset + length];
+                    return Ok(Some((tid, header, payload)));
+                }
+                Visibility::VisiblePreImage => {
+                    // Substitute the pre-image from the per-relation
+                    // undo log. Walk newest-to-oldest, pick the
+                    // youngest entry whose writer is still invisible
+                    // to this snapshot. Missing entry → VACUUM trimmed
+                    // it; treat as invisible (the safe direction).
+                    self.pre_image_scratch.clear();
+                    if let Some(payload) = lookup_undo_pre_image_owned(
+                        &self.undo_log,
+                        self.rel,
+                        tid,
+                        self.snapshot,
+                        self.oracle,
+                    ) {
+                        self.pre_image_scratch.extend_from_slice(&payload);
+                        return Ok(Some((tid, header, &self.pre_image_scratch[..])));
+                    }
+                    // Fall through to next slot.
+                }
+                Visibility::Invisible | Visibility::DeletedByOwn => {}
+            }
         }
     }
+}
+
+/// Shared helper — same contract as
+/// [`super::HeapAccess::lookup_undo_pre_image`] but accessible to the
+/// free walker struct without borrowing `self`.
+fn lookup_undo_pre_image_owned<O: XidStatusOracle + ?Sized>(
+    undo_log: &DashMap<RelationId, parking_lot::RwLock<UndoRelationLog>>,
+    rel: RelationId,
+    tid: TupleId,
+    snapshot: &Snapshot,
+    oracle: &O,
+) -> Option<Vec<u8>> {
+    let log_handle = undo_log.get(&rel)?;
+    let log = log_handle.read();
+    for entry in log.entries.iter().rev() {
+        if entry.tid != tid {
+            continue;
+        }
+        let writer = entry.writer_xid;
+        let visible = if snapshot.is_current_xid(writer) {
+            true
+        } else if snapshot.xid_in_progress(writer) {
+            false
+        } else {
+            matches!(
+                oracle.status(writer),
+                ultrasql_mvcc::status::XidStatus::Committed
+                    | ultrasql_mvcc::status::XidStatus::Frozen,
+            )
+        };
+        if !visible {
+            return Some(entry.old_payload.to_vec());
+        }
+    }
+    None
 }
 
 /// `PAGE_HEADER_SIZE + slot * ITEMID_SIZE` — mirrors

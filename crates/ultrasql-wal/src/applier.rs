@@ -13,8 +13,8 @@
 //! [`ApplyError::UnknownPayload`].
 
 use crate::payload::{
-    AbortPayload, CheckpointPayload, CommitPayload, FullPageWritePayload, HeapDeletePayload,
-    HeapInsertPayload, HeapUpdatePayload, PayloadError,
+    AbortPayload, CheckpointPayload, CommitPayload, FullPageWritePayload, HeapDeleteInPlacePayload,
+    HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlacePayload, HeapUpdatePayload, PayloadError,
 };
 use crate::record::{RecordType, WalRecord};
 use crate::recovery::RecoveryError;
@@ -90,6 +90,40 @@ pub trait HeapTarget: Send + Sync {
         })
     }
 
+    /// Apply an in-place update record: rewrite the slot's payload
+    /// bytes with `post_image_bytes`, stamp `xmax`/`cmax`/
+    /// `infomask | UPDATED | UPDATED_IN_PLACE` on the header, and
+    /// re-insert the `(tid, writer_xid, pre_image_bytes)` triple
+    /// into the in-memory undo log so concurrent readers with
+    /// snapshots that pre-date the writer's commit observe the
+    /// pre-image. Default refuses; the heap implementor overrides.
+    fn apply_update_in_place(
+        &self,
+        payload: &HeapUpdateInPlacePayload,
+    ) -> Result<(), ApplyError> {
+        let _ = payload;
+        Err(ApplyError::Refused {
+            operation: "heap_update_in_place",
+            detail: String::from("not implemented"),
+        })
+    }
+
+    /// Apply an in-place delete record: stamp `xmax`/`cmax` on the
+    /// tuple header. Same semantic shape as `apply_delete`; kept as
+    /// a distinct method so a future implementor can branch on
+    /// "this came from the fused single-pass path" for telemetry or
+    /// VACUUM hints.
+    fn apply_delete_in_place(
+        &self,
+        payload: &HeapDeleteInPlacePayload,
+    ) -> Result<(), ApplyError> {
+        let _ = payload;
+        Err(ApplyError::Refused {
+            operation: "heap_delete_in_place",
+            detail: String::from("not implemented"),
+        })
+    }
+
     /// Apply a full-page-write record by restoring the page image verbatim.
     fn apply_full_page_write(&self, payload: &FullPageWritePayload) -> Result<(), ApplyError> {
         let _ = payload;
@@ -143,6 +177,12 @@ pub fn dispatch_record(target: &dyn HeapTarget, record: &WalRecord) -> Result<()
         RecordType::HeapInsert => target.apply_insert(&HeapInsertPayload::decode(bytes)?),
         RecordType::HeapUpdate => target.apply_update(&HeapUpdatePayload::decode(bytes)?),
         RecordType::HeapDelete => target.apply_delete(&HeapDeletePayload::decode(bytes)?),
+        RecordType::HeapUpdateInPlace => {
+            target.apply_update_in_place(&HeapUpdateInPlacePayload::decode(bytes)?)
+        }
+        RecordType::HeapDeleteInPlace => {
+            target.apply_delete_in_place(&HeapDeleteInPlacePayload::decode(bytes)?)
+        }
         RecordType::FullPageWrite => {
             target.apply_full_page_write(&FullPageWritePayload::decode(bytes)?)
         }

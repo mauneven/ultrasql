@@ -360,6 +360,167 @@ impl HeapUpdatePayload {
 }
 
 // ---------------------------------------------------------------------------
+// HeapUpdateInPlacePayload
+// ---------------------------------------------------------------------------
+
+/// Payload for a `RecordType::HeapUpdateInPlace` WAL record.
+///
+/// Records the in-place rewrite of a tuple's payload by the
+/// single-pass UPDATE path. Carries both the pre-image and the
+/// post-image so recovery can:
+/// - Re-apply the in-place mutation to the page bytes at `tid`
+///   (post-image), and
+/// - Rebuild the in-memory `UndoRelationLog` entry for the writer
+///   xid (pre-image), so concurrent readers with snapshots that
+///   pre-date this commit observe the right payload.
+///
+/// Wire layout (little-endian):
+/// ```text
+///  0  12   tid (TupleId — block_number 24b, slot 8b, relation 32b)
+/// 12   8   writer_xid (u64)
+/// 20   4   command_id (u32)
+/// 24   4   pre_len (u32)
+/// 28   4   post_len (u32)
+/// 32  ..   pre_image_bytes (pre_len bytes)
+///  +  ..   post_image_bytes (post_len bytes)
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapUpdateInPlacePayload {
+    /// Slot whose payload was rewritten. The `ctid` stays at `tid`
+    /// (no version forwarding under the in-place model).
+    pub tid: TupleId,
+    /// Transaction that performed the in-place UPDATE.
+    pub writer_xid: Xid,
+    /// Command within `writer_xid` that performed the UPDATE.
+    pub command_id: CommandId,
+    /// Pre-update payload bytes (no tuple header). Same length as
+    /// `post_image_bytes` for the fixed-width fused-update shape
+    /// today; the field carries an explicit length so future
+    /// variable-width shapes ride the same record.
+    pub pre_image_bytes: Vec<u8>,
+    /// Post-update payload bytes (no tuple header).
+    pub post_image_bytes: Vec<u8>,
+}
+
+impl HeapUpdateInPlacePayload {
+    /// Encode this payload into a freshly-allocated byte vector.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        const FIXED: usize = TID_SIZE + 8 + 4 + 4 + 4; // 32
+        let pre_len = u32::try_from(self.pre_image_bytes.len())
+            .map_err(|_| PayloadError::Malformed("heap_update_in_place pre_len overflow"))?;
+        let post_len = u32::try_from(self.post_image_bytes.len())
+            .map_err(|_| PayloadError::Malformed("heap_update_in_place post_len overflow"))?;
+        let total = FIXED + self.pre_image_bytes.len() + self.post_image_bytes.len();
+        let mut out = vec![0_u8; total];
+        let mut tid_buf = [0_u8; TID_SIZE];
+        encode_tid(&mut tid_buf, self.tid)?;
+        out[..TID_SIZE].copy_from_slice(&tid_buf);
+        write_u64_le(&mut out[TID_SIZE..TID_SIZE + 8], self.writer_xid.raw());
+        write_u32_le(&mut out[TID_SIZE + 8..TID_SIZE + 12], self.command_id.raw());
+        write_u32_le(&mut out[TID_SIZE + 12..TID_SIZE + 16], pre_len);
+        write_u32_le(&mut out[TID_SIZE + 16..TID_SIZE + 20], post_len);
+        let pre_off = FIXED;
+        let post_off = FIXED + self.pre_image_bytes.len();
+        out[pre_off..post_off].copy_from_slice(&self.pre_image_bytes);
+        out[post_off..total].copy_from_slice(&self.post_image_bytes);
+        Ok(out)
+    }
+
+    /// Decode a `HeapUpdateInPlacePayload` from a byte slice.
+    pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
+        const FIXED: usize = TID_SIZE + 8 + 4 + 4 + 4;
+        if bytes.len() < FIXED {
+            return Err(PayloadError::Truncated {
+                needed: FIXED,
+                have: bytes.len(),
+            });
+        }
+        let tid = decode_tid(bytes)?;
+        let writer_xid = Xid::new(
+            read_u64_le(&bytes[TID_SIZE..TID_SIZE + 8])
+                .map_err(|_| PayloadError::Malformed("heap_update_in_place writer_xid"))?,
+        );
+        let command_id = CommandId::new(
+            read_u32_le(&bytes[TID_SIZE + 8..TID_SIZE + 12])
+                .map_err(|_| PayloadError::Malformed("heap_update_in_place command_id"))?,
+        );
+        let pre_len = usize::try_from(
+            read_u32_le(&bytes[TID_SIZE + 12..TID_SIZE + 16])
+                .map_err(|_| PayloadError::Malformed("heap_update_in_place pre_len"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("heap_update_in_place pre_len usize"))?;
+        let post_len = usize::try_from(
+            read_u32_le(&bytes[TID_SIZE + 16..TID_SIZE + 20])
+                .map_err(|_| PayloadError::Malformed("heap_update_in_place post_len"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("heap_update_in_place post_len usize"))?;
+        if pre_len > MAX_VARIABLE_PAYLOAD_BYTES || post_len > MAX_VARIABLE_PAYLOAD_BYTES {
+            return Err(PayloadError::Malformed(
+                "heap_update_in_place image length exceeds ceiling",
+            ));
+        }
+        let needed = FIXED + pre_len + post_len;
+        if bytes.len() < needed {
+            return Err(PayloadError::Truncated {
+                needed,
+                have: bytes.len(),
+            });
+        }
+        let pre_off = FIXED;
+        let post_off = FIXED + pre_len;
+        Ok(Self {
+            tid,
+            writer_xid,
+            command_id,
+            pre_image_bytes: bytes[pre_off..post_off].to_vec(),
+            post_image_bytes: bytes[post_off..needed].to_vec(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HeapDeleteInPlacePayload
+// ---------------------------------------------------------------------------
+
+/// Payload for a `RecordType::HeapDeleteInPlace` WAL record. Same
+/// shape as [`HeapDeletePayload`]; the distinct record type lets
+/// recovery distinguish whether the original write went through the
+/// classical `delete_many` path or the single-pass
+/// `delete_int32_pair_inplace` path. For DELETE both record types
+/// replay identically (stamp `xmax`/`cmax`), but keeping them
+/// distinct preserves auditability and matches the in-place UPDATE
+/// pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeapDeleteInPlacePayload {
+    /// Slot of the deleted tuple.
+    pub tid: TupleId,
+    /// Transaction that performed the delete.
+    pub xmax: Xid,
+    /// Command within `xmax` that performed the delete.
+    pub cmax: CommandId,
+}
+
+impl HeapDeleteInPlacePayload {
+    /// Encode into a freshly-allocated byte vector. Same wire shape
+    /// as [`HeapDeletePayload::encode`].
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        HeapDeletePayload {
+            tid: self.tid,
+            xmax: self.xmax,
+            cmax: self.cmax,
+        }
+        .encode()
+    }
+
+    /// Decode from a byte slice. Same wire shape as
+    /// [`HeapDeletePayload::decode`].
+    pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
+        let HeapDeletePayload { tid, xmax, cmax } = HeapDeletePayload::decode(bytes)?;
+        Ok(Self { tid, xmax, cmax })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // HeapDeletePayload
 // ---------------------------------------------------------------------------
 

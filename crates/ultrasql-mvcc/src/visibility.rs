@@ -52,7 +52,8 @@ impl SubxactOracle for NoSubxacts {
 /// Outcome of a visibility check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Visibility {
-    /// The tuple is visible to the snapshot.
+    /// The tuple is visible to the snapshot — read the slot's
+    /// payload bytes directly.
     Visible,
     /// The tuple is not visible — and the executor should skip past
     /// it without further processing.
@@ -62,6 +63,19 @@ pub enum Visibility {
     /// command. Returned for completeness; an UPDATE statement uses
     /// this to short-circuit.
     DeletedByOwn,
+    /// The tuple is visible **but the slot's current bytes are the
+    /// post-image of an in-place UPDATE the reader's snapshot does
+    /// not yet see committed**. The caller must consult the
+    /// per-relation undo log keyed by `(tid, writer_xid)` to recover
+    /// the pre-update payload bytes the reader should observe.
+    ///
+    /// Emitted only for tuples carrying [`InfoMask::UPDATED_IN_PLACE`]
+    /// whose `xmax` is either still in-progress, aborted, or
+    /// committed *after* the reader's snapshot. The reader's
+    /// snapshot therefore predates the UPDATE; without this signal
+    /// the caller would return the post-image, silently violating
+    /// snapshot isolation.
+    VisiblePreImage,
 }
 
 /// Decide whether `header` is visible to `snapshot`, consulting the
@@ -162,6 +176,23 @@ where
             return Visibility::Invisible;
         }
 
+        // In-place UPDATE we performed ourselves at a prior command:
+        // the slot's current bytes are the right view. The classical
+        // "DeletedByOwn" branch below treats `xmax == current_xid` as
+        // a delete; for in-place updates that is wrong — the slot
+        // still represents a live tuple, just with a newer payload.
+        if header.infomask.contains(InfoMask::UPDATED_IN_PLACE)
+            && snapshot.is_current_xid(header.xmax)
+        {
+            if header.cmax >= snapshot.current_command {
+                // Own UPDATE issued at a future command — this command
+                // index should still see the pre-image (own pending
+                // write is not visible to commands ≤ cmax).
+                return Visibility::VisiblePreImage;
+            }
+            return Visibility::Visible;
+        }
+
         // If we then deleted it in a subsequent command, surface the
         // distinct DeletedByOwn outcome.
         if snapshot.is_current_xid(header.xmax) && header.cmax < snapshot.current_command {
@@ -189,17 +220,30 @@ where
     // `UPDATED_IN_PLACE` bit means the slot's payload is the
     // *post-update* version. The pre-update version is held in the
     // heap's side-channel undo log keyed by `TupleId`. The tuple is
-    // therefore *always visible* under MVCC — both the pre- and
-    // post-update views exist for some snapshot — and the scan
-    // path is responsible for picking the correct payload from
-    // either the slot bytes (post-update) or the undo log
-    // (pre-update) depending on whether xmax is visible in the
-    // reader's snapshot. The classical "xmax committed → invisible"
-    // rule applies only to *delete* (and to the legacy out-of-place
-    // UPDATE path that materialises a separate new tuple version
-    // at a different `ctid`).
+    // therefore always *visible* under MVCC — both the pre- and
+    // post-update views exist for some snapshot — but which view a
+    // reader observes depends on whether xmax is committed-before-
+    // snapshot:
+    //   - If yes (or xmax == current_xid, our own write), the slot
+    //     bytes are the right payload: return `Visible`.
+    //   - If no (xmax in-progress, aborted, or in the snapshot's
+    //     future), the reader's snapshot predates the update: return
+    //     `VisiblePreImage` so the caller substitutes the undo-log
+    //     entry's pre-image bytes.
     if header.infomask.contains(InfoMask::UPDATED_IN_PLACE) {
-        return Visibility::Visible;
+        if snapshot.is_current_xid(header.xmax) {
+            // Own write. Visible to commands strictly after `cmax`.
+            if header.cmax < snapshot.current_command {
+                return Visibility::Visible;
+            }
+            // Own write at a future command — pre-image is the right
+            // view for this command index.
+            return Visibility::VisiblePreImage;
+        }
+        if is_committed_before_snapshot(header.xmax, snapshot, oracle) {
+            return Visibility::Visible;
+        }
+        return Visibility::VisiblePreImage;
     }
 
     if snapshot.is_current_xid(header.xmax) {
@@ -428,5 +472,77 @@ mod tests {
             Visibility::Visible,
             "non-rolled-back savepoint tuple must be visible when committed"
         );
+    }
+
+    // ---------------------------------------------------------------
+    // UPDATED_IN_PLACE — cross-snapshot pre-image disclosure
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn in_place_update_post_image_when_writer_committed_before_snapshot() {
+        // Writer xid 7 committed; reader's snapshot xmax = 20 (so
+        // writer is visible). Reader should see the slot's post-
+        // image — `Visibility::Visible`.
+        let mut header = h(5, 0, 7, 0);
+        header.infomask.set(InfoMask::UPDATED_IN_PLACE);
+        let snap = snap(10, 20, 50, 0);
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::new(5));
+        oracle.set_committed(Xid::new(7));
+        assert_eq!(is_visible(&header, &snap, &oracle), Visibility::Visible);
+    }
+
+    #[test]
+    fn in_place_update_pre_image_when_writer_in_progress() {
+        // Writer xid 15 still in-progress; reader's snapshot does
+        // NOT see it. Reader must observe the pre-image via the
+        // undo log — `Visibility::VisiblePreImage`.
+        let mut header = h(5, 0, 15, 0);
+        header.infomask.set(InfoMask::UPDATED_IN_PLACE);
+        let snap = Snapshot::new(
+            Xid::new(10),
+            Xid::new(20),
+            Xid::new(50),
+            CommandId::new(0),
+            [Xid::new(15)],
+        );
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::new(5));
+        oracle.set_in_progress(Xid::new(15));
+        assert_eq!(
+            is_visible(&header, &snap, &oracle),
+            Visibility::VisiblePreImage,
+            "concurrent in-place UPDATE must surface the pre-image to a snapshot that pre-dates the writer's commit",
+        );
+    }
+
+    #[test]
+    fn in_place_update_pre_image_when_writer_committed_after_snapshot() {
+        // Writer xid 25 committed but with xid ≥ snapshot's xmax —
+        // committed *after* this snapshot was taken. Reader must
+        // see the pre-image.
+        let mut header = h(5, 0, 25, 0);
+        header.infomask.set(InfoMask::UPDATED_IN_PLACE);
+        let snap = snap(10, 20, 50, 0);
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::new(5));
+        oracle.set_committed(Xid::new(25));
+        assert_eq!(
+            is_visible(&header, &snap, &oracle),
+            Visibility::VisiblePreImage,
+            "writer committed after the reader's snapshot was taken: pre-image is the right view",
+        );
+    }
+
+    #[test]
+    fn in_place_update_own_write_post_image_after_command_boundary() {
+        // We performed the in-place UPDATE ourselves at command 0;
+        // we're now running at command 3 — our own post-image is
+        // the right view.
+        let mut header = h(50, 0, 50, 0);
+        header.infomask.set(InfoMask::UPDATED_IN_PLACE);
+        let snap = snap(10, 60, 50, 3);
+        let oracle = MapOracle::new();
+        assert_eq!(is_visible(&header, &snap, &oracle), Visibility::Visible);
     }
 }

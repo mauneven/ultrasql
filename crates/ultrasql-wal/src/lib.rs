@@ -19,7 +19,8 @@ pub use applier::{ApplyError, HeapTarget, dispatch_record, replay_into};
 pub use buffer::{WalBuffer, WalBufferError};
 pub use payload::{
     AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload,
-    FullPageWritePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload, PayloadError,
+    FullPageWritePayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
+    HeapUpdateInPlacePayload, HeapUpdatePayload, PayloadError,
 };
 pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};
 pub use recovery::{RecoveryError, recover};

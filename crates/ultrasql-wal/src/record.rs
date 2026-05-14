@@ -103,6 +103,18 @@ pub enum RecordType {
     Checkpoint = 7,
     /// A B+ tree index page was modified.
     BTreeOp = 8,
+    /// A tuple was updated **in place** — the slot's payload bytes
+    /// were rewritten by an `update_int32_pair_inplace_undo`-style
+    /// path. The payload carries both the pre-image and the
+    /// post-image so recovery can rebuild both the page bytes and
+    /// the in-memory [`UndoRelationLog`] entry.
+    HeapUpdateInPlace = 9,
+    /// A tuple was deleted **in place** via the single-pass
+    /// `delete_int32_pair_inplace` path. Equivalent semantics to
+    /// `HeapDelete` but the record carries enough metadata for
+    /// recovery to stamp the source slot's `xmax`/`cmax` and clear
+    /// the `UPDATED_IN_PLACE` bit if previously set.
+    HeapDeleteInPlace = 10,
     /// A no-op marker (used to round records up to alignment
     /// boundaries; ignored on replay).
     Nop = 255,
@@ -120,6 +132,8 @@ impl RecordType {
             6 => Self::Abort,
             7 => Self::Checkpoint,
             8 => Self::BTreeOp,
+            9 => Self::HeapUpdateInPlace,
+            10 => Self::HeapDeleteInPlace,
             255 => Self::Nop,
             other => return Err(WalRecordError::UnknownType(other)),
         })
