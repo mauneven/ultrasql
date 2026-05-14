@@ -104,7 +104,7 @@ pub use materialize::Materialize;
 pub use mem_table_scan::MemTableScan;
 pub use merge_join::MergeJoin;
 pub use modify::{ModifyKind, ModifyTable};
-pub use nested_loop_join::NestedLoopJoin;
+pub use nested_loop_join::{NestedLoopJoin, RightFactory};
 pub use project::Project;
 pub use result_op::ResultOp;
 pub use row_codec::{RowCodec, RowCodecError};

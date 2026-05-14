@@ -47,7 +47,6 @@ const BATCH_TARGET_ROWS: usize = 4096;
 /// The closure takes no arguments and returns a fresh `Box<dyn Operator>`
 /// positioned at the start of the right-side scan. The closure is `Send`
 /// so the operator itself satisfies the `Operator: Send` bound.
-#[allow(unreachable_pub)]
 pub type RightFactory = Box<dyn Fn() -> Result<Box<dyn Operator>, ExecError> + Send>;
 
 /// Nested-loop join operator.

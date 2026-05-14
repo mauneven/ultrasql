@@ -41,11 +41,14 @@ use ultrasql_catalog::{CatalogSnapshot, TableEntry};
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
-    Filter, FilterEqI32, HashAggregate, Limit, MemTableScan, ModifyKind, ModifyTable, Operator,
-    Project, RowCodec, SeqScan, Sort, ValuesScan,
+    Filter, FilterEqI32, HashAggregate, HashJoin, Limit, MemTableScan, ModifyKind, ModifyTable,
+    NestedLoopJoin, Operator, Project, RightFactory, RowCodec, SeqScan, Sort, ValuesScan,
 };
 use ultrasql_mvcc::Snapshot;
-use ultrasql_planner::{BinaryOp, InMemoryCatalog, LogicalPlan, ScalarExpr, TableMeta};
+use ultrasql_planner::{
+    BinaryOp, InMemoryCatalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr,
+    TableMeta,
+};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
@@ -146,6 +149,31 @@ pub fn lower_plan(
             let schema = child.schema().clone();
             Ok(Box::new(Sort::new(child, keys.clone(), schema)))
         }
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            schema,
+        } => {
+            // Sample-table path: recurse into the children through
+            // `lower_plan`, then dispatch through the same operator
+            // selection rule the real-heap path uses (see
+            // `lower_join`).
+            let left_schema = left.schema().clone();
+            let right_schema = right.schema().clone();
+            let left_op = lower_plan(left, tables)?;
+            let right_op = lower_plan(right, tables)?;
+            lower_join(
+                left_op,
+                right_op,
+                left_schema,
+                right_schema,
+                *join_type,
+                condition,
+                schema.clone(),
+            )
+        }
         LogicalPlan::Empty { .. } => Err(ServerError::Unsupported("SELECT without FROM")),
         LogicalPlan::Values { .. } => Err(ServerError::Unsupported("VALUES")),
         LogicalPlan::Insert { .. } => Err(ServerError::Unsupported("INSERT")),
@@ -162,7 +190,6 @@ pub fn lower_plan(
         | LogicalPlan::AlterTable { .. } => Err(ServerError::Unsupported(
             "DDL reached operator lowerer; expected DDL dispatch path",
         )),
-        LogicalPlan::Join { .. } => Err(ServerError::Unsupported("JOIN")),
         LogicalPlan::Aggregate { .. } => Err(ServerError::Unsupported("GROUP BY / aggregate")),
         LogicalPlan::SetOp { .. } => Err(ServerError::Unsupported("UNION / INTERSECT / EXCEPT")),
         LogicalPlan::Cte { .. } => Err(ServerError::Unsupported("WITH (CTE)")),
@@ -530,7 +557,33 @@ pub fn lower_query(
         | LogicalPlan::AlterTable { .. } => Err(ServerError::Unsupported(
             "DDL reached operator lowerer; expected DDL dispatch path",
         )),
-        LogicalPlan::Join { .. } => Err(ServerError::Unsupported("JOIN")),
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            condition,
+            schema,
+        } => {
+            // Lower the join's children first so the same real-heap path
+            // (`SeqScan`-aware) feeds the operator. The selection rule
+            // (HashJoin vs NestedLoopJoin) is delegated to `lower_join`
+            // so the sample-table path in `lower_plan` and the
+            // catalog-aware path here stay bit-identical in dispatch
+            // semantics.
+            let left_schema = left.schema().clone();
+            let right_schema = right.schema().clone();
+            let left_op = lower_query(left, ctx)?;
+            let right_op = lower_query(right, ctx)?;
+            lower_join(
+                left_op,
+                right_op,
+                left_schema,
+                right_schema,
+                *join_type,
+                condition,
+                schema.clone(),
+            )
+        }
         LogicalPlan::Aggregate {
             input,
             group_by,
@@ -897,6 +950,330 @@ fn lower_project_columns(
     Ok(Box::new(Project::new(child, indices)?))
 }
 
+// ---------------------------------------------------------------------------
+// Join lowering
+// ---------------------------------------------------------------------------
+
+/// Pick a join operator for a [`LogicalPlan::Join`] and connect its two
+/// already-lowered children.
+///
+/// Selection rule (v0.5):
+///
+/// - `On(pred)` where `pred` is a single binary-`Eq` whose operands are
+///   `Column` references straddling the left/right schemas (and both
+///   sides carry a hash-friendly scalar type) **and** `join_type` is
+///   [`LogicalJoinType::Inner`] or [`LogicalJoinType::LeftOuter`]
+///   → [`HashJoin`]. The build side is the left child (matching the
+///   executor's convention that `HashJoin::new`'s first argument is the
+///   build input). We have no row-count estimate available — the
+///   catalog tracks `n_blocks` but not tuple counts — so we follow the
+///   planner's left/right ordering verbatim. A `LEFT JOIN` requires
+///   left = build for correct unmatched-row emission; the binder
+///   already places the preserving side on the left, so this default is
+///   semantically forced for `LeftOuter`.
+/// - `On(pred)` with any other shape (non-equi, computed key,
+///   multi-clause `AND`, `OR`, NULL test, …) → [`NestedLoopJoin`] with
+///   the full predicate. NLJ evaluates the predicate via [`Eval`], so
+///   it handles every well-typed boolean expression the binder emits.
+/// - `Using(pairs)` → composite equality predicate fed to NLJ. The
+///   binder still produces a non-collapsed concatenated schema in this
+///   path (see `physical::build_join` for the same dispatch); a future
+///   wave may switch to a USING-aware `HashJoin` when collapsed-column
+///   semantics matter.
+/// - `None` (CROSS) → NLJ with no condition.
+///
+/// `RightOuter` and `FullOuter` are routed through NLJ even when the
+/// predicate is equi: the current [`HashJoin`] only supports `Inner`
+/// and `LeftOuter` (`hash_join::HashJoin::execute` rejects the others
+/// with [`ExecError::Unsupported`]). NLJ supports all five SQL join
+/// kinds, so the dispatch is correctness-driven, not performance-
+/// driven; a future commit can lift `Right`/`Full` to `HashJoin` once the
+/// operator grows the build-side fixup phase.
+fn lower_join(
+    left: Box<dyn Operator>,
+    right: Box<dyn Operator>,
+    left_schema: Schema,
+    right_schema: Schema,
+    join_type: LogicalJoinType,
+    condition: &LogicalJoinCondition,
+    out_schema: Schema,
+) -> Result<Box<dyn Operator>, ServerError> {
+    match condition {
+        LogicalJoinCondition::On(pred) => {
+            if matches!(
+                join_type,
+                LogicalJoinType::Inner | LogicalJoinType::LeftOuter
+            ) {
+                if let Some((left_key, right_key)) =
+                    extract_hash_friendly_equi_keys(pred, left_schema.len())
+                {
+                    // HashJoin: left = build, right = probe. See the
+                    // function docs for the rationale.
+                    return Ok(Box::new(HashJoin::new(
+                        left,
+                        right,
+                        left_key,
+                        right_key,
+                        join_type,
+                        out_schema,
+                        left_schema,
+                        right_schema,
+                    )));
+                }
+            }
+            // Non-equi predicate, type-ineligible equi predicate, or an
+            // outer-join kind the HashJoin does not yet support → NLJ.
+            build_nested_loop_join(
+                left,
+                right,
+                Some(pred.clone()),
+                join_type,
+                out_schema,
+                left_schema,
+                right_schema,
+            )
+        }
+        LogicalJoinCondition::Using(pairs) => {
+            let cond = build_using_predicate(pairs, &left_schema, &right_schema);
+            build_nested_loop_join(
+                left,
+                right,
+                cond,
+                join_type,
+                out_schema,
+                left_schema,
+                right_schema,
+            )
+        }
+        LogicalJoinCondition::None => build_nested_loop_join(
+            left,
+            right,
+            None,
+            join_type,
+            out_schema,
+            left_schema,
+            right_schema,
+        ),
+    }
+}
+
+/// Drain `right` into a memory-resident batch list, then wrap the
+/// result in a [`NestedLoopJoin`] whose right factory replays the
+/// drained batches.
+///
+/// The materialisation is necessary because [`NestedLoopJoin`] re-opens
+/// the right side once per left row through its `RightFactory`
+/// closure. A streaming right child cannot be replayed; spooling it
+/// into batch storage gives the closure an O(1) `clone()` per
+/// iteration. See `physical.rs::build_nlj` for the same approach.
+///
+/// # Errors
+///
+/// Returns a [`ServerError::Execute`] if the right child errors during
+/// the drain phase.
+fn build_nested_loop_join(
+    left: Box<dyn Operator>,
+    right: Box<dyn Operator>,
+    condition: Option<ScalarExpr>,
+    join_type: LogicalJoinType,
+    out_schema: Schema,
+    left_schema: Schema,
+    right_schema: Schema,
+) -> Result<Box<dyn Operator>, ServerError> {
+    // Spool the right side once so each left-row iteration cheaply
+    // clones the batch list rather than re-running the upstream
+    // pipeline (which might be a real heap scan over thousands of
+    // blocks).
+    let mut right_op = right;
+    let mut batches: Vec<Batch> = Vec::new();
+    while let Some(batch) = right_op.next_batch()? {
+        batches.push(batch);
+    }
+    let shared: Arc<Vec<Batch>> = Arc::new(batches);
+    let factory_schema = right_schema.clone();
+    let factory: RightFactory = Box::new(move || {
+        Ok(
+            Box::new(MemTableScan::new(factory_schema.clone(), (*shared).clone()))
+                as Box<dyn Operator>,
+        )
+    });
+    Ok(Box::new(NestedLoopJoin::new(
+        left,
+        factory,
+        join_type,
+        condition,
+        out_schema,
+        left_schema,
+        right_schema,
+    )))
+}
+
+/// Return `true` if `dt` is a scalar type for which `Value::Hash` is
+/// well-defined and `==` is reflexive (no NaN games).
+///
+/// Floats are excluded so a join key with `Float32::NAN` keeps NULL-like
+/// semantics under SQL (NaN never equals NaN per IEEE-754, even though
+/// the [`HashJoin`] hash impl currently hashes the bit pattern). Lifting
+/// floats into `HashJoin` can land once the binder rewrites
+/// `a.x = b.x` to `a.x = b.x AND a.x = a.x` for floats (or once we
+/// formally specify the semantics).
+const fn is_hash_friendly(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Bool
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Text { .. }
+            | DataType::Bytea
+            | DataType::Date
+            | DataType::Time
+            | DataType::Timestamp
+            | DataType::TimestampTz
+            | DataType::Uuid
+    )
+}
+
+/// Recognise a binary-`Eq` predicate of the form `Column(left) = Column(right)`
+/// (or its commuted form) where the left column lives in the left schema
+/// and the right column lives in the right schema (i.e. its raw index is
+/// ≥ `left_width`).
+///
+/// Returns the `(left_key, right_key)` expression pair, with the right
+/// key's index *rebased* to be local to the right schema (subtracts
+/// `left_width`). Returns `None` when:
+///
+/// - The top-level operator is not [`BinaryOp::Eq`].
+/// - Either operand is not a bare column reference.
+/// - Both columns live on the same side.
+/// - The column data type is not [`is_hash_friendly`].
+///
+/// Mirrors `physical::extract_equi_keys` so the dispatcher in
+/// [`lower_join`] picks the same operator the optimizer's builder
+/// would. The type-friendliness gate is the addition: the builder
+/// accepts any data type, but the server prefers a deterministic
+/// fallback to NLJ for float keys until the binder's float-NULL rewrite
+/// lands.
+fn extract_hash_friendly_equi_keys(
+    pred: &ScalarExpr,
+    left_width: usize,
+) -> Option<(ScalarExpr, ScalarExpr)> {
+    let ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = pred
+    else {
+        return None;
+    };
+    let (l_col, r_col) = match (left.as_ref(), right.as_ref()) {
+        (
+            ScalarExpr::Column {
+                index: li,
+                data_type: lt,
+                name: ln,
+            },
+            ScalarExpr::Column {
+                index: ri,
+                data_type: rt,
+                name: rn,
+            },
+        ) if *li < left_width && *ri >= left_width => {
+            if !is_hash_friendly(lt) || !is_hash_friendly(rt) {
+                return None;
+            }
+            (
+                ScalarExpr::Column {
+                    name: ln.clone(),
+                    index: *li,
+                    data_type: lt.clone(),
+                },
+                ScalarExpr::Column {
+                    name: rn.clone(),
+                    index: ri - left_width,
+                    data_type: rt.clone(),
+                },
+            )
+        }
+        // Commuted form: right-side column is the *left* operand.
+        (
+            ScalarExpr::Column {
+                index: li,
+                data_type: lt,
+                name: ln,
+            },
+            ScalarExpr::Column {
+                index: ri,
+                data_type: rt,
+                name: rn,
+            },
+        ) if *li >= left_width && *ri < left_width => {
+            if !is_hash_friendly(lt) || !is_hash_friendly(rt) {
+                return None;
+            }
+            (
+                ScalarExpr::Column {
+                    name: rn.clone(),
+                    index: *ri,
+                    data_type: rt.clone(),
+                },
+                ScalarExpr::Column {
+                    name: ln.clone(),
+                    index: li - left_width,
+                    data_type: lt.clone(),
+                },
+            )
+        }
+        _ => return None,
+    };
+    Some((l_col, r_col))
+}
+
+/// Build a composite equality predicate from `USING (left_idx, right_idx)`
+/// pairs, AND-conjoining each `left_col = right_col` equality.
+///
+/// Right-side column indices are offset by `left_schema.len()` so the
+/// predicate evaluates against the concatenated left++right row layout
+/// the join produces. Returns `None` when `pairs` is empty (degenerate
+/// USING clause).
+///
+/// Mirrors `physical::build_using_predicate`. Lives here so the
+/// server-side lowerer is self-contained; converging on a single shared
+/// helper lands when the server delegates to `physical::build_operator`
+/// in v0.6 (see ROADMAP P0 "Server invokes optimizer").
+fn build_using_predicate(
+    pairs: &[(usize, usize)],
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Option<ScalarExpr> {
+    let mut iter = pairs.iter().map(|(li, ri)| {
+        let lf = left_schema.field_at(*li);
+        let rf = right_schema.field_at(*ri);
+        ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(ScalarExpr::Column {
+                index: *li,
+                data_type: lf.data_type.clone(),
+                name: lf.name.clone(),
+            }),
+            right: Box::new(ScalarExpr::Column {
+                index: left_schema.len() + ri,
+                data_type: rf.data_type.clone(),
+                name: rf.name.clone(),
+            }),
+            data_type: DataType::Bool,
+        }
+    });
+    let first = iter.next()?;
+    Some(iter.fold(first, |acc, next| ScalarExpr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(acc),
+        right: Box::new(next),
+        data_type: DataType::Bool,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,5 +1456,298 @@ mod tests {
         };
         let err = lower_plan(&p, &tables).expect_err("must reject");
         assert!(matches!(err, ServerError::Plan(_)));
+    }
+
+    // ----------------------------------------------------------------
+    // JOIN dispatch (Wave A item A4)
+    // ----------------------------------------------------------------
+
+    /// Helper: build a typed `Column` reference. Index is the column's
+    /// position in the *concatenated* (left++right) schema for join-on
+    /// predicates, or its native position when the column lives on a
+    /// single side.
+    fn column(name: &str, index: usize, data_type: DataType) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.into(),
+            index,
+            data_type,
+        }
+    }
+
+    /// Helper: build an Int32 literal.
+    fn lit_i32(v: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Int32(v),
+            data_type: DataType::Int32,
+        }
+    }
+
+    /// Helper: build an int32 single-column schema named `name`.
+    fn schema_int_col(name: &str) -> Schema {
+        Schema::new([Field::required(name, DataType::Int32)]).expect("schema ok")
+    }
+
+    /// Helper: build a `(name, val)` row of Int32 literals.
+    fn int_row(v: i32) -> Vec<ScalarExpr> {
+        vec![lit_i32(v)]
+    }
+
+    /// Walk a fresh operator producing `(Int32, Int32)` batches and
+    /// collect `(left, right)` pairs. NULLs decode to `0` because the
+    /// v0.5 `build_batch` does not emit a per-column null bitmap (see
+    /// `hash_join.rs::hash_join_left_outer_unmatched_rows` for the
+    /// documented behaviour).
+    fn collect_pairs(op: &mut dyn Operator) -> Vec<(i32, i32)> {
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch().expect("operator must not error") {
+            assert_eq!(batch.width(), 2, "expected two-column join output");
+            match (&batch.columns()[0], &batch.columns()[1]) {
+                (
+                    ultrasql_vec::column::Column::Int32(l),
+                    ultrasql_vec::column::Column::Int32(r),
+                ) => {
+                    assert_eq!(l.data().len(), r.data().len());
+                    for (a, b) in l.data().iter().zip(r.data().iter()) {
+                        out.push((*a, *b));
+                    }
+                }
+                other => panic!("unexpected column layout: {other:?}"),
+            }
+        }
+        out
+    }
+
+    /// Build a minimal `LowerCtx` suitable for `lower_query` calls that
+    /// never touch the real heap (Values-rooted plans).
+    fn synthetic_ctx(tables: &SampleTables) -> LowerCtx<'_> {
+        use std::sync::Arc as StdArc;
+        use ultrasql_catalog::PersistentCatalog;
+        use ultrasql_storage::buffer_pool::BufferPool;
+        use ultrasql_storage::heap::HeapAccess;
+        use ultrasql_txn::TransactionManager;
+
+        let catalog = StdArc::new(PersistentCatalog::new());
+        let pool = StdArc::new(BufferPool::new(64, BlankPageLoader));
+        let heap = StdArc::new(HeapAccess::new(pool));
+        let txn = StdArc::new(TransactionManager::new());
+        let mvcc_snapshot = txn
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted)
+            .snapshot;
+        LowerCtx {
+            tables,
+            catalog_snapshot: catalog.snapshot(),
+            heap,
+            snapshot: mvcc_snapshot,
+            oracle: StdArc::clone(&txn),
+            xid: Xid::new(0),
+            command_id: CommandId::FIRST,
+        }
+    }
+
+    /// Build two single-column `Int32` Values children with the given
+    /// rows, the binder-shaped concatenated join schema, and a typed
+    /// `LogicalPlan::Join` ready to be lowered.
+    fn build_int_join_plan(
+        left_rows: &[i32],
+        right_rows: &[i32],
+        join_type: LogicalJoinType,
+        condition: LogicalJoinCondition,
+    ) -> LogicalPlan {
+        let left_schema = schema_int_col("l");
+        let right_schema = schema_int_col("r");
+        let out_schema = Schema::new([
+            Field::required("l", DataType::Int32),
+            Field::required("r", DataType::Int32),
+        ])
+        .expect("concat schema ok");
+        let left = LogicalPlan::Values {
+            rows: left_rows.iter().map(|v| int_row(*v)).collect(),
+            schema: left_schema,
+        };
+        let right = LogicalPlan::Values {
+            rows: right_rows.iter().map(|v| int_row(*v)).collect(),
+            schema: right_schema,
+        };
+        LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type,
+            condition,
+            schema: out_schema,
+        }
+    }
+
+    /// Equi predicate over a binder-shaped concatenated schema where
+    /// the right column lives at index 1.
+    fn equi_eq_predicate() -> LogicalJoinCondition {
+        LogicalJoinCondition::On(ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(column("l", 0, DataType::Int32)),
+            right: Box::new(column("r", 1, DataType::Int32)),
+            data_type: DataType::Bool,
+        })
+    }
+
+    /// Non-equi predicate `left.l < right.r` — should fall through to
+    /// NLJ in [`lower_join`].
+    fn non_equi_lt_predicate() -> LogicalJoinCondition {
+        LogicalJoinCondition::On(ScalarExpr::Binary {
+            op: BinaryOp::Lt,
+            left: Box::new(column("l", 0, DataType::Int32)),
+            right: Box::new(column("r", 1, DataType::Int32)),
+            data_type: DataType::Bool,
+        })
+    }
+
+    /// Lower a synthetic Inner equi-join through `lower_query` and
+    /// assert the operator picked is [`HashJoin`] (via `Debug` output —
+    /// the operator type appears in the `{op:?}` rendering).
+    #[test]
+    fn lower_query_inner_equi_join_picks_hash_join() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let plan = build_int_join_plan(
+            &[1, 2, 3, 4],
+            &[2, 3, 5],
+            LogicalJoinType::Inner,
+            equi_eq_predicate(),
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        // The debug representation of `HashJoin` begins with that name.
+        let debug = format!("{op:?}");
+        assert!(
+            debug.starts_with("HashJoin"),
+            "expected HashJoin, got: {debug}"
+        );
+        let mut pairs = collect_pairs(op.as_mut());
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(2, 2), (3, 3)]);
+    }
+
+    /// Lower a synthetic Inner non-equi join. The predicate is
+    /// `l.l < r.r`, which is not hash-eligible, so the dispatch must
+    /// pick [`NestedLoopJoin`].
+    #[test]
+    fn lower_query_inner_non_equi_join_falls_back_to_nlj() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let plan = build_int_join_plan(
+            &[1, 2, 3],
+            &[2, 4],
+            LogicalJoinType::Inner,
+            non_equi_lt_predicate(),
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        let debug = format!("{op:?}");
+        assert!(
+            debug.starts_with("NestedLoopJoin"),
+            "expected NestedLoopJoin, got: {debug}"
+        );
+        // 1<2, 1<4, 2<4, 3<4 = 4 matches.
+        let mut pairs = collect_pairs(op.as_mut());
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(1, 2), (1, 4), (2, 4), (3, 4)]);
+    }
+
+    /// Lower a LEFT OUTER equi join. Build = left so unmatched left
+    /// rows survive; `HashJoin` is the chosen operator.
+    ///
+    /// Unmatched right columns decode to `0` here because `build_batch`
+    /// does not yet emit a per-column null bitmap (the same v0.5
+    /// limitation documented in `hash_join.rs::hash_join_left_outer_unmatched_rows`).
+    #[test]
+    fn lower_query_left_outer_equi_join_picks_hash_join_and_pads() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let plan = build_int_join_plan(
+            &[1, 2, 3],
+            &[2, 4],
+            LogicalJoinType::LeftOuter,
+            equi_eq_predicate(),
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        let debug = format!("{op:?}");
+        assert!(
+            debug.starts_with("HashJoin"),
+            "expected HashJoin, got: {debug}"
+        );
+        let mut pairs = collect_pairs(op.as_mut());
+        pairs.sort_unstable();
+        // (2,2) is the match; (1,*) and (3,*) are unmatched left rows
+        // emitted with right-side NULLs encoded as 0.
+        assert_eq!(pairs, vec![(1, 0), (2, 2), (3, 0)]);
+    }
+
+    /// LEFT OUTER over a non-equi predicate must dispatch to NLJ (the
+    /// only operator that can serve it correctly today).
+    #[test]
+    fn lower_query_left_outer_non_equi_join_falls_back_to_nlj() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let plan = build_int_join_plan(
+            &[1, 5, 10],
+            &[2, 7],
+            LogicalJoinType::LeftOuter,
+            non_equi_lt_predicate(),
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        let debug = format!("{op:?}");
+        assert!(
+            debug.starts_with("NestedLoopJoin"),
+            "expected NestedLoopJoin, got: {debug}"
+        );
+        // 1 matches 2 and 7; 5 matches 7; 10 matches nothing (LeftOuter
+        // emits (10, NULL)).
+        let mut pairs = collect_pairs(op.as_mut());
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(1, 2), (1, 7), (5, 7), (10, 0)]);
+    }
+
+    /// CROSS JOIN dispatches to NLJ with no condition. Output is the
+    /// Cartesian product.
+    #[test]
+    fn lower_query_cross_join_dispatches_to_nlj() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let plan = build_int_join_plan(
+            &[1, 2],
+            &[10, 20, 30],
+            LogicalJoinType::Cross,
+            LogicalJoinCondition::None,
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        let debug = format!("{op:?}");
+        assert!(
+            debug.starts_with("NestedLoopJoin"),
+            "expected NestedLoopJoin, got: {debug}"
+        );
+        let pairs = collect_pairs(op.as_mut());
+        assert_eq!(pairs.len(), 6, "2 × 3 Cartesian = 6 rows");
+    }
+
+    /// RIGHT OUTER must NOT be silently downgraded to a different join
+    /// kind. With an equi predicate the dispatcher routes to NLJ (which
+    /// supports `RightOuter`) — confirms our explicit "do not silently
+    /// pick `HashJoin` for an unsupported outer kind" promise.
+    #[test]
+    fn lower_query_right_outer_equi_join_uses_nlj_not_hash_join() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let plan = build_int_join_plan(
+            &[2],
+            &[1, 2, 3],
+            LogicalJoinType::RightOuter,
+            equi_eq_predicate(),
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        let debug = format!("{op:?}");
+        assert!(
+            debug.starts_with("NestedLoopJoin"),
+            "RightOuter must not pick HashJoin; got: {debug}"
+        );
+        // Inner match: (2,2). RightOuter emits (NULL, 1) and (NULL, 3).
+        let mut pairs = collect_pairs(op.as_mut());
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(0, 1), (0, 3), (2, 2)]);
     }
 }
