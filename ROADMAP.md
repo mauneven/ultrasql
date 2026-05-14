@@ -98,7 +98,34 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 
 ## Current State Snapshot
 
-<!-- reconciled 2026-05-14 against actual code (commits 800ab81..3b640cd) -->
+<!-- reconciled 2026-05-14 against actual code (commits 800ab81..17e38b6) -->
+<!-- Wave C wire streaming + Wave D heap pin-once + bulk update_many/delete_many -->
+
+### Wave-by-wave perf progression on `cross_compare_sql` (median µs, M4, release)
+
+| Workload (rows) | Pre-Wave-C | Post-Wave-C wire | Post-Wave-D (current) | Best competitor |
+|-----------------|-----------:|-----------------:|----------------------:|-----------------|
+| insert_throughput_10k  |  6 500 |  6 500 |  6 500 | ultrasql (wins) |
+| select_scan_10k        |  8 570 |  8 290 |  1 302 (-85%) | duckdb 897 |
+| select_sum_65 536_i64  |  5 200 |  5 080 |  3 736 (-28%) | duckdb 111 |
+| select_avg_1m_i64      | 77 300 | 76 551 | 57 013 (-26%) | duckdb 284 |
+| filter_sum_1m_i64      | 78 970 | 76 326 | 56 594 (-28%) | duckdb 216 |
+| update_throughput_10k  |  5 120 |  5 120 |  4 032 (-21%) | duckdb 176 |
+| delete_throughput_10k  |  1 670 |  1 670 |  1 226 (-27%) | sqlite 512 |
+| mixed_oltp_pgbench_like |  — |  — | 632 (1st measurement) | sqlite 357 |
+
+Wins landed since `5a2ceaa`:
+- Wave C (`7293898`): zero-alloc DataRow stream + coalesced `write_all`
+  in `wire_writer.rs` / `result_encoder.rs`.
+- Wave D-1 (`23bc7e9`): cached UPDATE `Eval` evaluators + presized
+  `RowCodec::encode` capacity hint.
+- Wave D-2 (`dcc6b41`): pin-once-per-page in `HeapScan::next` — drops
+  the per-slot `BufferPool::get_page` DashMap probe to per-block.
+- Wave D-3 (`27fb359`): `HeapAccess::delete_many` page-groups TIDs.
+- Wave D-4 (`17e38b6`): `HeapAccess::update_many` page-groups
+  HOT-eligible `(TupleId, payload)` edits.
+
+
 
 | Crate | Status |
 |-------|--------|
@@ -515,13 +542,14 @@ driver can connect.
 - [ ] `BEGIN`/`COMMIT` round-trip from any standard driver
 - [x] Extended Query Parse/Bind/Execute round-trip from any standard driver — tokio-postgres prepared statements green (see `crates/ultrasql-server/tests/extended_query_round_trip.rs`)
 - [ ] `ORDER BY` reachable from the wire
-- [ ] INSERT 10 k throughput ≥ 2× every competitor (currently 14× DuckDB ✅, 4× SQLite ✅, 10× PostgreSQL ✅)
-- [ ] SELECT scan 10 k ≥ 2× every competitor (currently 9× behind DuckDB ❌)
-- [ ] SELECT SUM 65 k ≥ 2× every competitor (currently 1.25× behind SQLite ❌)
-- [ ] UPDATE 10 k ≥ 2× every competitor (currently 100× behind DuckDB ❌)
-- [ ] DELETE 10 k ≥ 2× every competitor (currently 2.4× behind SQLite ❌)
-- [ ] AVG 1 M ≥ 2× every competitor (currently 20× behind DuckDB ❌)
-- [ ] Filter+SUM 1 M ≥ 2× every competitor (currently 5× behind SQLite ❌)
+- [x] INSERT 10 k throughput ≥ 2× every competitor (currently 14× DuckDB, 4× SQLite, 10× PostgreSQL — Wave D unchanged)
+- [ ] SELECT scan 10 k ≥ 2× every competitor (post-Wave-D: 1.30 ms vs DuckDB 0.90 ms — **1.44× behind**, ahead of SQLite 1.81 ms, ahead of PG 28.6 ms)
+- [ ] SELECT SUM 65 k ≥ 2× every competitor (post-Wave-D: 3.74 ms vs DuckDB 0.11 ms — **34× behind**; vs SQLite 0.94 ms — 4× behind)
+- [ ] UPDATE 10 k ≥ 2× every competitor (post-Wave-D: 4.03 ms vs DuckDB 0.18 ms — **22× behind**; SQLite 0.45 ms — 9× behind)
+- [ ] DELETE 10 k ≥ 2× every competitor (post-Wave-D: 1.23 ms vs SQLite 0.51 ms — **2.4× behind**; ahead of DuckDB 1.99 ms, PG 23.3 ms)
+- [ ] AVG 1 M ≥ 2× every competitor (post-Wave-D: 57.0 ms vs DuckDB 0.28 ms — **200× behind**; SQLite 14.6 ms — 4× behind; PG 40.1 ms — 1.4× behind)
+- [ ] Filter+SUM 1 M ≥ 2× every competitor (post-Wave-D: 56.6 ms vs DuckDB 0.22 ms — **257× behind**; SQLite 16.2 ms — 3.5× behind; PG 39.3 ms — 1.4× behind)
+- [ ] mixed_oltp_pgbench_like (added Wave D bench): 632 µs/op vs SQLite 357 µs/op — 1.77× behind. Methodology note: competitor scripts spawn fresh CLI per op/batch which amortises preload, so the headline is not strictly comparable; revisit when scripts switch to persistent connections.
 
 ---
 
