@@ -17,7 +17,6 @@ async fn startup_handshake_completes() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 #[tokio::test]
 async fn simple_query_returns_three_data_rows() {
     let (mut client, server_side) = tokio::io::duplex(8192);
@@ -78,7 +77,6 @@ async fn simple_query_returns_three_data_rows() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 #[tokio::test]
 async fn filter_and_limit_narrow_result_to_one_row() {
     let (mut client, server_side) = tokio::io::duplex(8192);
@@ -112,7 +110,6 @@ async fn filter_and_limit_narrow_result_to_one_row() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 #[tokio::test]
 async fn unknown_table_reports_error_then_ready_idle() {
     let (mut client, server_side) = tokio::io::duplex(8192);
@@ -144,7 +141,6 @@ async fn unknown_table_reports_error_then_ready_idle() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-
 
 #[tokio::test]
 async fn parse_error_reports_error_response() {
@@ -182,7 +178,6 @@ async fn parse_error_reports_error_response() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 #[tokio::test]
 async fn terminate_ends_the_session_cleanly() {
     let (mut client, server_side) = tokio::io::duplex(8192);
@@ -196,7 +191,6 @@ async fn terminate_ends_the_session_cleanly() {
     let result = handle.await.expect("task joins");
     result.expect("clean exit on Terminate");
 }
-
 
 #[tokio::test]
 async fn empty_query_returns_empty_query_response() {
@@ -220,7 +214,6 @@ async fn empty_query_returns_empty_query_response() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-
 
 /// Adversarial input: a client that advertises `protocol_major =
 /// 0xFFFF` (or any non-3 value, including the negotiated future
@@ -281,7 +274,6 @@ async fn unsupported_protocol_major_returns_error_response() {
     ));
 }
 
-
 /// `TxnState::ready_for_query_status` maps each variant to the
 /// correct PostgreSQL status byte. Unit test, no I/O.
 #[test]
@@ -296,4 +288,3 @@ fn txn_state_ready_for_query_status_matches_postgres() {
     assert_eq!(TxnState::InTransaction(txn1).ready_for_query_status(), b'T');
     assert_eq!(TxnState::Failed(txn2).ready_for_query_status(), b'E');
 }
-

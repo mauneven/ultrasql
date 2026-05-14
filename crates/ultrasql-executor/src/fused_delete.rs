@@ -106,8 +106,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
             }
         };
         let wal_sink_arc = self.heap.wal_sink().cloned();
-        let wal_sink: Option<&dyn ultrasql_storage::WalSink> =
-            wal_sink_arc.as_deref();
+        let wal_sink: Option<&dyn ultrasql_storage::WalSink> = wal_sink_arc.as_deref();
         let n = self
             .heap
             .delete_int32_pair_inplace(

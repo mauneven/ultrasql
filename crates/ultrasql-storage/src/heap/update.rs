@@ -24,12 +24,12 @@ use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
 use crate::page::PageError;
 use crate::wal_sink::WalSink;
 
-use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry,
-    UndoRelationLog, UpdateOptions, UpdateOutcome, UpdatePayload,
-};
 use super::scan::{HeapScan, VisibleHeapScan};
 use super::walker::VisibleHeapWalker;
+use super::{
+    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
+    UpdateOptions, UpdateOutcome, UpdatePayload,
+};
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Replace a tuple's payload with HOT-chain support.
@@ -311,11 +311,10 @@ impl<L: PageLoader> HeapAccess<L> {
                     // Move every entry in the run straight to fallback.
                     fallback.reserve(group_len);
                     for k in i..j {
-                        let (tid, payload) =
-                            std::mem::replace(&mut edits_vec[k], (
-                                TupleId::new(page_id, 0),
-                                UpdatePayload::new(),
-                            ));
+                        let (tid, payload) = std::mem::replace(
+                            &mut edits_vec[k],
+                            (TupleId::new(page_id, 0), UpdatePayload::new()),
+                        );
                         fallback.push((tid, payload));
                     }
                     i = j;
@@ -345,11 +344,10 @@ impl<L: PageLoader> HeapAccess<L> {
                         )? {
                             Some(new_tid) => hot_outcomes.push((old_tid, new_tid)),
                             None => {
-                                let (tid, payload) =
-                                    std::mem::replace(&mut edits_vec[k], (
-                                        TupleId::new(page_id, 0),
-                                        UpdatePayload::new(),
-                                    ));
+                                let (tid, payload) = std::mem::replace(
+                                    &mut edits_vec[k],
+                                    (TupleId::new(page_id, 0), UpdatePayload::new()),
+                                );
                                 fallback.push((tid, payload));
                             }
                         }
@@ -517,5 +515,4 @@ impl<L: PageLoader> HeapAccess<L> {
             xmin_cache: None,
         }
     }
-
 }

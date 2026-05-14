@@ -92,11 +92,7 @@ pub(crate) fn write_data_row(sink: &mut BytesMut, batch_columns: &[Column], row:
 /// match in `write_cell`.
 ///
 /// Caller verifies the shape upfront (`fast_int32_pair_data_rows`).
-pub(crate) fn write_int32_pair_data_rows(
-    sink: &mut BytesMut,
-    a: &[i32],
-    b: &[i32],
-) {
+pub(crate) fn write_int32_pair_data_rows(sink: &mut BytesMut, a: &[i32], b: &[i32]) {
     debug_assert_eq!(a.len(), b.len());
     let n = a.len();
     if n == 0 {

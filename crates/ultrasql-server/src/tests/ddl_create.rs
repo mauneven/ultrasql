@@ -4,7 +4,6 @@
 
 use super::*;
 
-
 #[tokio::test]
 async fn create_table_persists_to_catalog_via_wire() {
     let (mut client, server_side) = tokio::io::duplex(8192);
@@ -54,7 +53,6 @@ async fn create_table_persists_to_catalog_via_wire() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-
 
 #[tokio::test]
 async fn create_insert_select_round_trip_through_wire() {
@@ -150,7 +148,6 @@ async fn create_insert_select_round_trip_through_wire() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 #[tokio::test]
 async fn create_table_duplicate_rejected_with_query_scoped_error() {
     let (mut client, server_side) = tokio::io::duplex(8192);
@@ -215,7 +212,6 @@ async fn create_table_duplicate_rejected_with_query_scoped_error() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 #[tokio::test]
 async fn integration_real_tcp_select_round_trips_rows() {
     // Use port 0 to let the kernel pick an ephemeral port.
@@ -246,7 +242,6 @@ async fn integration_real_tcp_select_round_trips_rows() {
     drop(stream);
     server_handle.abort();
 }
-
 
 // -----------------------------------------------------------------------
 // CREATE INDEX / DROP TABLE / ALTER TABLE — wire dispatch tests
@@ -321,7 +316,6 @@ async fn create_index_via_wire_registers_index_entry() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 /// `CREATE INDEX IF NOT EXISTS` is a no-op when the index already
 /// exists; the second invocation still returns `CREATE INDEX` as
 /// the command tag and does not error.
@@ -361,4 +355,3 @@ async fn create_index_if_not_exists_is_idempotent() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-

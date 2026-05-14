@@ -4,7 +4,6 @@
 
 use super::*;
 
-
 /// `BEGIN; INSERT; INSERT; COMMIT;` — both rows visible after commit.
 /// `BEGIN; INSERT; ROLLBACK;` — row not persisted.
 /// `ReadyForQuery` status byte reflects state at every step.
@@ -120,7 +119,6 @@ async fn begin_commit_persists_rows_rollback_discards() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 /// `BEGIN; UPDATE; ROLLBACK;` — UPDATE is undone.
 #[tokio::test]
 async fn begin_update_rollback_reverts_value() {
@@ -171,7 +169,6 @@ async fn begin_update_rollback_reverts_value() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-
 
 /// A statement that errors inside a transaction transitions the
 /// session to the `Failed` state. Subsequent statements (other than
@@ -272,7 +269,6 @@ async fn failed_transaction_rejects_subsequent_statements_until_rollback() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 /// Implicit autocommit still works: `INSERT` outside any `BEGIN`
 /// commits immediately and is visible to the next statement.
 #[tokio::test]
@@ -314,7 +310,6 @@ async fn implicit_autocommit_still_persists_writes() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-
 
 /// `BEGIN` while a transaction is already open emits a
 /// `NoticeResponse` (WARNING) and leaves the session in
@@ -368,7 +363,6 @@ async fn nested_begin_emits_warning_but_keeps_session_in_tx() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 /// `COMMIT` / `ROLLBACK` outside a transaction emit a
 /// `NoticeResponse` (WARNING) but still succeed with the
 /// corresponding command tag.
@@ -395,4 +389,3 @@ async fn commit_and_rollback_outside_tx_emit_warning() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-

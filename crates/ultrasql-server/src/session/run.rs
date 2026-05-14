@@ -28,6 +28,7 @@ use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
+use super::Session;
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
@@ -35,10 +36,9 @@ use crate::result_encoder::{
     self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
 };
 use crate::{
-    BlankPageLoader, CombinedCatalog, Server, TxnState, notice_warning, run_plan_in_txn,
-    decode_key_column,
+    BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
+    run_plan_in_txn,
 };
-use super::Session;
 
 impl<RW> Session<RW>
 where
@@ -179,7 +179,8 @@ where
                 if !err.is_query_scoped() {
                     return Err(err);
                 }
-                self.send_error_with_ready(&err.to_string(), err.sqlstate()).await?;
+                self.send_error_with_ready(&err.to_string(), err.sqlstate())
+                    .await?;
             }
         }
         Ok(())
@@ -253,12 +254,14 @@ where
     /// verbatim. Otherwise we fall back to the legacy
     /// `Vec<BackendMessage>` shape and coalesce its encoded form into
     /// one syscall.
-    pub(crate) async fn send_query_result(&mut self, result: SelectResult) -> Result<(), ServerError> {
+    pub(crate) async fn send_query_result(
+        &mut self,
+        result: SelectResult,
+    ) -> Result<(), ServerError> {
         if let Some(body) = result.streamed_body.as_ref() {
             self.send_raw(body).await
         } else {
             self.send_messages_coalesced(&result.messages).await
         }
     }
-
 }

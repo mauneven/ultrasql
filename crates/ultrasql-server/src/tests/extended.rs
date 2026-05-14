@@ -4,7 +4,6 @@
 
 use super::*;
 
-
 /// Extended Query round-trip over the in-memory duplex transport.
 ///
 /// `Parse → Bind → Describe(Portal) → Execute → Sync` against
@@ -99,7 +98,6 @@ async fn extended_query_round_trip_select() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 /// Parameter substitution end-to-end over the duplex transport.
 ///
 /// `SELECT id FROM users WHERE id = $1` with `$1 = 2` should
@@ -157,7 +155,6 @@ async fn extended_query_round_trip_with_parameter() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-
 
 /// Extended Query round-trip for BEGIN / INSERT / COMMIT — prepared
 /// statements and unnamed portals.  Mirrors the Simple Query test
@@ -248,7 +245,6 @@ async fn extended_query_begin_insert_commit_round_trips() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 /// Extended Query ROLLBACK discards the in-flight write.
 #[tokio::test]
 async fn extended_query_begin_insert_rollback_discards() {
@@ -317,4 +313,3 @@ async fn extended_query_begin_insert_rollback_discards() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-

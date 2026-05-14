@@ -266,7 +266,22 @@ pub struct Server {
     /// `Send + Sync` holds via [`PlanCache`]'s internal `DashMap`; no
     /// outer `Mutex` is needed.
     pub plan_cache: Arc<PlanCache>,
+    /// Successful-commit counter used to trigger periodic undo-log GC.
+    ///
+    /// Every successful commit (explicit `COMMIT` or autocommit) calls
+    /// [`Server::note_commit_for_gc`], which bumps this counter and,
+    /// every [`UNDO_GC_INTERVAL_COMMITS`] commits, fires
+    /// [`HeapAccess::vacuum_undo_log`] with the txn manager's current
+    /// `oldest_in_progress()`. Trimming on a counter rather than per
+    /// commit keeps the hot path cheap (one atomic add) and amortises
+    /// the GC walk across many small transactions.
+    pub vacuum_commit_counter: std::sync::atomic::AtomicU64,
 }
+
+/// Run undo-log GC every `UNDO_GC_INTERVAL_COMMITS` successful
+/// commits. The trim itself is `O(total live undo entries)` so we
+/// keep it out of the per-commit critical path.
+pub const UNDO_GC_INTERVAL_COMMITS: u64 = 64;
 
 impl Server {
     /// Build a server pre-loaded with the canonical sample database.
@@ -455,7 +470,6 @@ where
 /// the workload"; the workload here is single-threaded).
 mod session;
 use session::Session;
-
 
 /// Decode a single column out of an encoded heap-tuple payload and
 /// return its value as an `i64` key.

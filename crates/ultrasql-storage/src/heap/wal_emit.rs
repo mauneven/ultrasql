@@ -26,8 +26,8 @@ use crate::page::PageError;
 use crate::wal_sink::WalSink;
 
 use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry,
-    UndoRelationLog, UpdateOptions, UpdateOutcome, UpdatePayload,
+    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
+    UpdateOptions, UpdateOutcome, UpdatePayload,
 };
 
 impl<L: PageLoader> HeapAccess<L> {

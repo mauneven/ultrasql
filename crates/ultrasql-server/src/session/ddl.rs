@@ -28,6 +28,7 @@ use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
+use super::Session;
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
@@ -35,10 +36,9 @@ use crate::result_encoder::{
     self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
 };
 use crate::{
-    BlankPageLoader, CombinedCatalog, Server, TxnState, notice_warning, run_plan_in_txn,
-    decode_key_column,
+    BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
+    run_plan_in_txn,
 };
-use super::Session;
 
 impl<RW> Session<RW>
 where
@@ -272,7 +272,10 @@ where
     /// available immediately for reuse via `CREATE TABLE` — subsequent
     /// inserts will reuse the relation-id space without colliding
     /// because OIDs are monotonic.
-    pub(crate) fn execute_drop_table(&self, plan: &LogicalPlan) -> Result<SelectResult, ServerError> {
+    pub(crate) fn execute_drop_table(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<SelectResult, ServerError> {
         let LogicalPlan::DropTable { tables, .. } = plan else {
             return Err(ServerError::Unsupported(
                 "execute_drop_table called with non-DropTable plan",
@@ -286,5 +289,4 @@ where
         self.plan_cache_invalidate();
         Ok(run_ddl_command("DROP TABLE"))
     }
-
 }

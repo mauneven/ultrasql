@@ -28,6 +28,7 @@ use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
+use super::Session;
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
@@ -35,10 +36,9 @@ use crate::result_encoder::{
     self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
 };
 use crate::{
-    BlankPageLoader, CombinedCatalog, Server, TxnState, notice_warning, run_plan_in_txn,
-    decode_key_column,
+    BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
+    run_plan_in_txn,
 };
-use super::Session;
 
 impl<RW> Session<RW>
 where
@@ -180,16 +180,15 @@ where
         // INSERT-only — UPDATE / DELETE need the optimizer's
         // canonicalisation passes for the lowerer's
         // `build_filtered_tid_scan` shape contract.
-        let optimised_plan = if Self::is_trivial_insert_values(&plan)
-            || Self::is_fused_update_shape(&plan)
-        {
-            plan
-        } else {
-            match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
-                Ok(p) => p,
-                Err(e) => return Err(self.fail_if_in_transaction(e)),
-            }
-        };
+        let optimised_plan =
+            if Self::is_trivial_insert_values(&plan) || Self::is_fused_update_shape(&plan) {
+                plan
+            } else {
+                match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
+                    Ok(p) => p,
+                    Err(e) => return Err(self.fail_if_in_transaction(e)),
+                }
+            };
         self.run_dml_or_select(&optimised_plan, &catalog_snapshot)
     }
 
@@ -414,5 +413,4 @@ where
         }
         err
     }
-
 }

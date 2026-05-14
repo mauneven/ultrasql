@@ -28,6 +28,7 @@ use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
+use super::Session;
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
@@ -35,10 +36,9 @@ use crate::result_encoder::{
     self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
 };
 use crate::{
-    BlankPageLoader, CombinedCatalog, Server, TxnState, notice_warning, run_plan_in_txn,
-    decode_key_column,
+    BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
+    run_plan_in_txn,
 };
-use super::Session;
 
 impl<RW> Session<RW>
 where
@@ -61,7 +61,10 @@ where
     ///   PostgreSQL's behaviour of treating a failed-block commit as a
     ///   rollback so the application's "did the COMMIT really land?"
     ///   check still works.
-    pub(crate) fn execute_txn_control(&mut self, plan: &LogicalPlan) -> Result<SelectResult, ServerError> {
+    pub(crate) fn execute_txn_control(
+        &mut self,
+        plan: &LogicalPlan,
+    ) -> Result<SelectResult, ServerError> {
         match plan {
             LogicalPlan::Begin { .. } => self.execute_begin(),
             LogicalPlan::Commit { .. } => self.execute_commit(),
@@ -211,7 +214,10 @@ where
     ///   (`no_active_sql_transaction`).
     /// - Unknown savepoint name: SQLSTATE `3B001`
     ///   (`invalid_savepoint_specification`).
-    pub(crate) fn execute_rollback_to_savepoint(&mut self, name: &str) -> Result<SelectResult, ServerError> {
+    pub(crate) fn execute_rollback_to_savepoint(
+        &mut self,
+        name: &str,
+    ) -> Result<SelectResult, ServerError> {
         // We need to take ownership of the inner txn to mutate it, then
         // put it back in the correct state variant.
         let prior_failed = matches!(self.txn_state, TxnState::Failed(_));
@@ -263,7 +269,10 @@ where
     /// transitions the session to `Failed` (matching PostgreSQL: any
     /// statement that errors inside a transaction block aborts the
     /// block until COMMIT/ROLLBACK).
-    pub(crate) fn execute_release_savepoint(&mut self, name: &str) -> Result<SelectResult, ServerError> {
+    pub(crate) fn execute_release_savepoint(
+        &mut self,
+        name: &str,
+    ) -> Result<SelectResult, ServerError> {
         let release_ok = match &mut self.txn_state {
             TxnState::Idle => {
                 return Err(ServerError::Savepoint(
@@ -287,5 +296,4 @@ where
             Err(self.fail_if_in_transaction(ServerError::SavepointNotFound(name.to_owned())))
         }
     }
-
 }

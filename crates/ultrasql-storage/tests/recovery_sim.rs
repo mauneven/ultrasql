@@ -415,8 +415,7 @@ fn crash_recovery_in_place_update_restores_post_image_and_undo_log() {
     );
     let recovery_heap = make_persistent_heap(loader::MapLoader::new());
     for (_, rec) in &records {
-        dispatch_record(&recovery_heap, rec)
-            .expect("dispatch_record during replay");
+        dispatch_record(&recovery_heap, rec).expect("dispatch_record during replay");
     }
 
     // Phase 3: every visible row should reflect the post-image.
@@ -527,8 +526,7 @@ fn crash_recovery_in_place_delete_stamps_xmax() {
 
     let recovery_heap = make_persistent_heap(loader::MapLoader::new());
     for (_, rec) in &records {
-        dispatch_record(&recovery_heap, rec)
-            .expect("dispatch_record during replay");
+        dispatch_record(&recovery_heap, rec).expect("dispatch_record during replay");
     }
 
     let mut deleted_rows = 0_usize;
@@ -543,10 +541,7 @@ fn crash_recovery_in_place_delete_stamps_xmax() {
             undeleted_rows += 1;
         }
     }
-    assert_eq!(
-        deleted_rows, ROWS,
-        "every replayed row should carry xmax=2"
-    );
+    assert_eq!(deleted_rows, ROWS, "every replayed row should carry xmax=2");
     assert_eq!(
         undeleted_rows, 0,
         "no row should be left without an xmax stamp"

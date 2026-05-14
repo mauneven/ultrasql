@@ -25,8 +25,8 @@ use crate::page::PageError;
 use crate::wal_sink::WalSink;
 
 use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry,
-    UndoRelationLog, UpdateOptions, UpdateOutcome, UpdatePayload,
+    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
+    UpdateOptions, UpdateOutcome, UpdatePayload,
 };
 
 impl<L: PageLoader> HeapAccess<L> {
@@ -262,8 +262,8 @@ impl<L: PageLoader> HeapAccess<L> {
             .copy_from_slice(&new_tid.page.relation.0.raw().to_le_bytes());
 
         // Stamp ctid block+slot packing (bytes 36..40).
-        let block_slot_packed = (new_tid.page.block.raw() & 0x00FF_FFFF)
-            | ((u32::from(new_tid.slot)) << 24);
+        let block_slot_packed =
+            (new_tid.page.block.raw() & 0x00FF_FFFF) | ((u32::from(new_tid.slot)) << 24);
         page_bytes[ctid_rel_at + 4..ctid_rel_at + 8]
             .copy_from_slice(&block_slot_packed.to_le_bytes());
 
@@ -342,7 +342,11 @@ impl<L: PageLoader> HeapAccess<L> {
     /// guard has been dropped.  Both hooks are best-effort: a failure to pin
     /// the page for the FSM read is treated as "no free space known" (the FSM
     /// records 0, which is conservative).
-    pub(super) fn post_insert_fsm_vm(pool: &Arc<BufferPool<L>>, page_id: PageId, opts: InsertOptions<'_>) {
+    pub(super) fn post_insert_fsm_vm(
+        pool: &Arc<BufferPool<L>>,
+        page_id: PageId,
+        opts: InsertOptions<'_>,
+    ) {
         if let Some(fsm) = opts.fsm {
             let free = Self::page_free_space(pool, page_id);
             fsm.record_free_space(page_id.relation, page_id.block, free);
@@ -358,7 +362,11 @@ impl<L: PageLoader> HeapAccess<L> {
     /// immediately so future inserters see the block as a candidate. Vacuum
     /// will eventually reclaim the space; until then the insert will discover
     /// (via `NoSpace`) that the category was too optimistic and fall back.
-    pub(super) fn post_delete_fsm_vm(pool: &Arc<BufferPool<L>>, page_id: PageId, opts: DeleteOptions<'_>) {
+    pub(super) fn post_delete_fsm_vm(
+        pool: &Arc<BufferPool<L>>,
+        page_id: PageId,
+        opts: DeleteOptions<'_>,
+    ) {
         if let Some(fsm) = opts.fsm {
             let free = Self::page_free_space(pool, page_id);
             fsm.record_free_space(page_id.relation, page_id.block, free);
@@ -401,5 +409,4 @@ impl<L: PageLoader> HeapAccess<L> {
             .map_err(|_| HeapError::MalformedHeader("itemid length overflow"))?;
         Ok((offset, length))
     }
-
 }

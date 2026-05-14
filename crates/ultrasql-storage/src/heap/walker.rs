@@ -26,10 +26,9 @@ use crate::page::PageError;
 use crate::wal_sink::WalSink;
 
 use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry,
-    UndoRelationLog, UpdateOptions, UpdateOutcome, UpdatePayload,
+    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
+    UpdateOptions, UpdateOutcome, UpdatePayload,
 };
-
 
 /// Visibility-filtered sequential scan that yields borrowed slot
 /// payload slices.
@@ -186,9 +185,7 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
                 let infomask_bits = header.infomask.bits();
                 let cache_hit = self
                     .xmin_cache
-                    .filter(|(cxmin, cinfo, _)| {
-                        *cxmin == header.xmin && *cinfo == infomask_bits
-                    })
+                    .filter(|(cxmin, cinfo, _)| *cxmin == header.xmin && *cinfo == infomask_bits)
                     .map(|(_, _, v)| {
                         if v {
                             Visibility::Visible
@@ -209,8 +206,7 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
             let tid = TupleId::new(page_id, slot);
             match outcome {
                 Visibility::Visible => {
-                    let payload =
-                        &self.page_scratch[offset + TUPLE_HEADER_SIZE..offset + length];
+                    let payload = &self.page_scratch[offset + TUPLE_HEADER_SIZE..offset + length];
                     return Ok(Some((tid, header, payload)));
                 }
                 Visibility::VisiblePreImage => {
@@ -281,4 +277,3 @@ fn lookup_undo_pre_image_owned<O: XidStatusOracle + ?Sized>(
 const fn ultrasql_storage_page_item_id_offset(slot: u16) -> usize {
     crate::page::PAGE_HEADER_SIZE + (slot as usize) * crate::page::ITEMID_SIZE
 }
-

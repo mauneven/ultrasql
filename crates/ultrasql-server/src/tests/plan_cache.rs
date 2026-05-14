@@ -4,7 +4,6 @@
 
 use super::*;
 
-
 // -----------------------------------------------------------------------
 // Wave B: optimizer + plan cache.
 //
@@ -60,7 +59,6 @@ async fn plan_cache_simple_query_repeat_reuses_optimised_plan() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 /// Two distinct SELECTs produce two cache entries — the cache key is
 /// the SQL text, so different text should not collide.
 #[tokio::test]
@@ -98,7 +96,6 @@ async fn plan_cache_distinct_sql_text_produces_distinct_entries() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-
 
 /// A `CREATE TABLE` clears every entry in the plan cache; a query
 /// run after the DDL therefore inserts a fresh entry rather than
@@ -150,7 +147,6 @@ async fn plan_cache_ddl_invalidates_every_entry() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 /// Cross-protocol cache sharing: a Simple Query primes the cache;
 /// an Extended Query `Parse` over the same SQL text hits the cache
 /// and does NOT insert a second entry. The headline win of the
@@ -197,7 +193,6 @@ async fn plan_cache_shared_between_simple_and_extended_query() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-
 
 /// `WHERE id = 42` over an indexed column still picks `IndexScan`
 /// when the bound plan flows through the optimizer first.
@@ -259,4 +254,3 @@ async fn optimizer_route_still_selects_index_scan() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-

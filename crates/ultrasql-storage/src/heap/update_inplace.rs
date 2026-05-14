@@ -25,8 +25,8 @@ use crate::page::PageError;
 use crate::wal_sink::WalSink;
 
 use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry,
-    UndoRelationLog, UpdateOptions, UpdateOutcome, UpdatePayload,
+    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
+    UpdateOptions, UpdateOutcome, UpdatePayload,
 };
 
 impl<L: PageLoader> HeapAccess<L> {
@@ -114,19 +114,16 @@ impl<L: PageLoader> HeapAccess<L> {
                     let payload_off = offset + TUPLE_HEADER_SIZE;
                     let pre = &entry.old_payload;
                     let copy_len = pre.len().min(length - TUPLE_HEADER_SIZE);
-                    bytes[payload_off..payload_off + copy_len]
-                        .copy_from_slice(&pre[..copy_len]);
+                    bytes[payload_off..payload_off + copy_len].copy_from_slice(&pre[..copy_len]);
                     // Clear xmax (bytes 8..16), cmax (20..24), and
                     // the UPDATED + UPDATED_IN_PLACE bits in
                     // infomask (24..26). Leave xmin / other
                     // header fields untouched.
                     bytes[offset + 8..offset + 16].copy_from_slice(&[0u8; 8]);
                     bytes[offset + 20..offset + 24].copy_from_slice(&[0u8; 4]);
-                    let cur_im =
-                        u16::from_le_bytes([bytes[offset + 24], bytes[offset + 25]]);
+                    let cur_im = u16::from_le_bytes([bytes[offset + 24], bytes[offset + 25]]);
                     let new_im = cur_im & !(InfoMask::UPDATED | InfoMask::UPDATED_IN_PLACE);
-                    bytes[offset + 24..offset + 26]
-                        .copy_from_slice(&new_im.to_le_bytes());
+                    bytes[offset + 24..offset + 26].copy_from_slice(&new_im.to_le_bytes());
                     total_restored += 1;
                 }
                 drop(page);
@@ -284,15 +281,13 @@ impl<L: PageLoader> HeapAccess<L> {
             let mut src_page = src_guard.write();
             let src_bytes = src_page.as_bytes_mut();
             let src_slot_count = {
-                let hdr = crate::page::PageHeader::decode(src_bytes)
-                    .map_err(HeapError::Page)?;
+                let hdr = crate::page::PageHeader::decode(src_bytes).map_err(HeapError::Page)?;
                 hdr.slot_count()
             };
 
             for src_slot in 0..src_slot_count {
                 // ItemId decode.
-                let item_id_off =
-                    PAGE_HEADER_SIZE + usize::from(src_slot) * ITEMID_SIZE;
+                let item_id_off = PAGE_HEADER_SIZE + usize::from(src_slot) * ITEMID_SIZE;
                 let item_raw = u32::from_le_bytes([
                     src_bytes[item_id_off],
                     src_bytes[item_id_off + 1],
@@ -305,7 +300,9 @@ impl<L: PageLoader> HeapAccess<L> {
                 let length = ((item_raw >> 2) & 0x7FFF) as usize;
                 let offset = ((item_raw >> 17) & 0x7FFF) as usize;
                 if length < TUPLE_HEADER_SIZE
-                    || offset.checked_add(length).is_none_or(|e| e > src_bytes.len())
+                    || offset
+                        .checked_add(length)
+                        .is_none_or(|e| e > src_bytes.len())
                 {
                     return Err(HeapError::MalformedHeader("slot shorter than header"));
                 }
@@ -330,29 +327,23 @@ impl<L: PageLoader> HeapAccess<L> {
 
                 let visible = if xmax_raw == 0 {
                     match xmin_cache {
-                        Some((cxmin, cinfo, cv))
-                            if cxmin == xmin_xid && cinfo == infomask_bits =>
-                        {
+                        Some((cxmin, cinfo, cv)) if cxmin == xmin_xid && cinfo == infomask_bits => {
                             cv
                         }
                         _ => {
-                            let (h, _) = TupleHeader::decode(
-                                &src_bytes[offset..offset + TUPLE_HEADER_SIZE],
-                            )
-                            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
-                            let v = matches!(
-                                is_visible(&h, snapshot, oracle),
-                                Visibility::Visible,
-                            );
+                            let (h, _) =
+                                TupleHeader::decode(&src_bytes[offset..offset + TUPLE_HEADER_SIZE])
+                                    .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                            let v =
+                                matches!(is_visible(&h, snapshot, oracle), Visibility::Visible,);
                             xmin_cache = Some((h.xmin, h.infomask.bits(), v));
                             v
                         }
                     }
                 } else {
-                    let (h, _) = TupleHeader::decode(
-                        &src_bytes[offset..offset + TUPLE_HEADER_SIZE],
-                    )
-                    .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                    let (h, _) =
+                        TupleHeader::decode(&src_bytes[offset..offset + TUPLE_HEADER_SIZE])
+                            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
                     matches!(is_visible(&h, snapshot, oracle), Visibility::Visible)
                 };
                 if !visible {
@@ -412,10 +403,8 @@ impl<L: PageLoader> HeapAccess<L> {
                 //   bytes 24..26  infomask | UPDATED | UPDATED_IN_PLACE
                 src_bytes[offset + 8..offset + 16].copy_from_slice(&xid_bytes);
                 src_bytes[offset + 20..offset + 24].copy_from_slice(&cmd_bytes);
-                let new_infomask =
-                    infomask_bits | InfoMask::UPDATED | InfoMask::UPDATED_IN_PLACE;
-                src_bytes[offset + 24..offset + 26]
-                    .copy_from_slice(&new_infomask.to_le_bytes());
+                let new_infomask = infomask_bits | InfoMask::UPDATED | InfoMask::UPDATED_IN_PLACE;
+                src_bytes[offset + 24..offset + 26].copy_from_slice(&new_infomask.to_le_bytes());
 
                 // Overwrite the payload with the new (id, val) — same
                 // 8-byte region the prior values occupied. The
@@ -427,7 +416,8 @@ impl<L: PageLoader> HeapAccess<L> {
 
                 if wal.is_some() {
                     let last = wal_scratch.last_mut().expect("just pushed");
-                    last.2.copy_from_slice(&src_bytes[payload_off..payload_off + 9]);
+                    last.2
+                        .copy_from_slice(&src_bytes[payload_off..payload_off + 9]);
                 }
 
                 total_updated += 1;
@@ -446,14 +436,8 @@ impl<L: PageLoader> HeapAccess<L> {
             if let Some(sink) = wal {
                 let mut last_lsn = ultrasql_core::Lsn::ZERO;
                 for (tid, pre, post) in wal_scratch.iter() {
-                    let lsn = Self::emit_update_in_place_wal(
-                        sink,
-                        *tid,
-                        xid,
-                        command_id,
-                        pre,
-                        post,
-                    )?;
+                    let lsn =
+                        Self::emit_update_in_place_wal(sink, *tid, xid, command_id, pre, post)?;
                     last_lsn = lsn;
                 }
                 if !wal_scratch.is_empty() {
@@ -492,5 +476,4 @@ impl<L: PageLoader> HeapAccess<L> {
 
         Ok(total_updated)
     }
-
 }

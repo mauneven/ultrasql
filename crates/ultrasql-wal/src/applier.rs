@@ -14,7 +14,8 @@
 
 use crate::payload::{
     AbortPayload, CheckpointPayload, CommitPayload, FullPageWritePayload, HeapDeleteInPlacePayload,
-    HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlacePayload, HeapUpdatePayload, PayloadError,
+    HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
+    PayloadError,
 };
 use crate::record::{RecordType, WalRecord};
 use crate::recovery::RecoveryError;
@@ -97,10 +98,7 @@ pub trait HeapTarget: Send + Sync {
     /// into the in-memory undo log so concurrent readers with
     /// snapshots that pre-date the writer's commit observe the
     /// pre-image. Default refuses; the heap implementor overrides.
-    fn apply_update_in_place(
-        &self,
-        payload: &HeapUpdateInPlacePayload,
-    ) -> Result<(), ApplyError> {
+    fn apply_update_in_place(&self, payload: &HeapUpdateInPlacePayload) -> Result<(), ApplyError> {
         let _ = payload;
         Err(ApplyError::Refused {
             operation: "heap_update_in_place",
@@ -113,10 +111,7 @@ pub trait HeapTarget: Send + Sync {
     /// a distinct method so a future implementor can branch on
     /// "this came from the fused single-pass path" for telemetry or
     /// VACUUM hints.
-    fn apply_delete_in_place(
-        &self,
-        payload: &HeapDeleteInPlacePayload,
-    ) -> Result<(), ApplyError> {
+    fn apply_delete_in_place(&self, payload: &HeapDeleteInPlacePayload) -> Result<(), ApplyError> {
         let _ = payload;
         Err(ApplyError::Refused {
             operation: "heap_delete_in_place",

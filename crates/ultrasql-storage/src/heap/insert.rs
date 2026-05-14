@@ -25,8 +25,8 @@ use crate::page::PageError;
 use crate::wal_sink::WalSink;
 
 use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry,
-    UndoRelationLog, UpdateOptions, UpdateOutcome, UpdatePayload,
+    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
+    UpdateOptions, UpdateOutcome, UpdatePayload,
 };
 
 impl<L: PageLoader> HeapAccess<L> {
@@ -396,8 +396,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 u16::try_from((cur_lower - crate::page::PAGE_HEADER_SIZE) / ITEMID_SIZE)
                     .map_err(|_| HeapError::MalformedHeader("slot count overflow"))?;
             let final_tid = TupleId::new(page_id, slot_count);
-            let tuple_header =
-                TupleHeader::fresh(opts.xmin, opts.command_id, final_tid, n_atts);
+            let tuple_header = TupleHeader::fresh(opts.xmin, opts.command_id, final_tid, n_atts);
 
             // Reserve `tuple_size` bytes at the top of the page body.
             cur_upper -= tuple_size;
@@ -406,8 +405,7 @@ impl<L: PageLoader> HeapAccess<L> {
             // (zero scratch copy).
             tuple_header.encode(&mut page_bytes[cur_upper..cur_upper + TUPLE_HEADER_SIZE]);
             // Copy the row body straight in.
-            page_bytes[cur_upper + TUPLE_HEADER_SIZE..cur_upper + tuple_size]
-                .copy_from_slice(row);
+            page_bytes[cur_upper + TUPLE_HEADER_SIZE..cur_upper + tuple_size].copy_from_slice(row);
 
             // Write the slot's `ItemId` (4 bytes) inline.
             let item = ItemId::new(cur_upper as u32, tuple_len_u32, ItemIdFlags::Normal);
@@ -511,5 +509,4 @@ impl<L: PageLoader> HeapAccess<L> {
         page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
         Ok(final_tid)
     }
-
 }

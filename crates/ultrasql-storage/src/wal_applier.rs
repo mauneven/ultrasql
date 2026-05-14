@@ -274,10 +274,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// post-image already matches the slot bytes and whose xmax
     /// already equals `writer_xid` is a no-op.
     #[allow(clippy::significant_drop_tightening)]
-    fn apply_update_in_place(
-        &self,
-        payload: &HeapUpdateInPlacePayload,
-    ) -> Result<(), ApplyError> {
+    fn apply_update_in_place(&self, payload: &HeapUpdateInPlacePayload) -> Result<(), ApplyError> {
         let page_id = payload.tid.page;
         let rel = page_id.relation;
         self.advance_counter(rel, page_id.block);
@@ -290,12 +287,12 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 detail: format!("buffer pool: {e}"),
             })?;
         let mut page = guard.write();
-        let existing =
-            page.read_tuple(payload.tid.slot)
-                .map_err(|e| ApplyError::Refused {
-                    operation: "heap_update_in_place",
-                    detail: format!("read slot: {e}"),
-                })?;
+        let existing = page
+            .read_tuple(payload.tid.slot)
+            .map_err(|e| ApplyError::Refused {
+                operation: "heap_update_in_place",
+                detail: format!("read slot: {e}"),
+            })?;
         if existing.len() < TUPLE_HEADER_SIZE {
             return Err(ApplyError::Refused {
                 operation: "heap_update_in_place",
@@ -348,9 +345,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         if slot_len < TUPLE_HEADER_SIZE + payload.post_image_bytes.len() {
             return Err(ApplyError::Refused {
                 operation: "heap_update_in_place",
-                detail: format!(
-                    "slot length {slot_len} too small for header + post-image"
-                ),
+                detail: format!("slot length {slot_len} too small for header + post-image"),
             });
         }
         page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
@@ -393,10 +388,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// `infomask | UPDATED` on the tuple header. Idempotent: an
     /// already-stamped slot with the same `xmax` is a no-op.
     #[allow(clippy::significant_drop_tightening)]
-    fn apply_delete_in_place(
-        &self,
-        payload: &HeapDeleteInPlacePayload,
-    ) -> Result<(), ApplyError> {
+    fn apply_delete_in_place(&self, payload: &HeapDeleteInPlacePayload) -> Result<(), ApplyError> {
         let page_id = payload.tid.page;
         self.advance_counter(page_id.relation, page_id.block);
 
@@ -408,12 +400,12 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 detail: format!("buffer pool: {e}"),
             })?;
         let mut page = guard.write();
-        let existing =
-            page.read_tuple(payload.tid.slot)
-                .map_err(|e| ApplyError::Refused {
-                    operation: "heap_delete_in_place",
-                    detail: format!("read slot: {e}"),
-                })?;
+        let existing = page
+            .read_tuple(payload.tid.slot)
+            .map_err(|e| ApplyError::Refused {
+                operation: "heap_delete_in_place",
+                detail: format!("read slot: {e}"),
+            })?;
         if existing.len() < TUPLE_HEADER_SIZE {
             return Err(ApplyError::Refused {
                 operation: "heap_delete_in_place",

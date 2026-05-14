@@ -68,7 +68,6 @@ async fn complete_startup(client: &mut (impl AsyncRead + AsyncWrite + Unpin)) {
     );
 }
 
-
 // -----------------------------------------------------------------------
 // Transaction-control state machine — Simple Query duplex tests
 // -----------------------------------------------------------------------
@@ -92,8 +91,8 @@ fn command_tag(msgs: &[BackendMessage]) -> Option<String> {
 }
 
 mod basic;
-mod extended;
-mod ddl_create;
 mod ddl_alter;
-mod txn;
+mod ddl_create;
+mod extended;
 mod plan_cache;
+mod txn;

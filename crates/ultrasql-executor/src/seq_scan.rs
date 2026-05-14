@@ -494,7 +494,11 @@ where
         // the response buffer and skip mid-stream `BytesMut::reserve`
         // reallocations.
         self.cache_read.as_ref().and_then(|state| {
-            state.columns.columns.first().map(ultrasql_vec::column::Column::len)
+            state
+                .columns
+                .columns
+                .first()
+                .map(ultrasql_vec::column::Column::len)
         })
     }
 }

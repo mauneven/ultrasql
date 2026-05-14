@@ -16,14 +16,14 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::extended::ExtendedConnState;
 use crate::{READ_BUFFER_INITIAL, Server, TxnState};
 
-mod startup;
-mod run;
-mod execute;
-mod txn;
-mod ddl;
 mod alter;
+mod ddl;
+mod execute;
 mod ext;
 mod io;
+mod run;
+mod startup;
+mod txn;
 
 pub(crate) struct Session<RW> {
     pub(super) io: RW,

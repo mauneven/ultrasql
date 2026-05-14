@@ -25,11 +25,11 @@ use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
 use crate::page::PageError;
 use crate::wal_sink::WalSink;
 
-use super::{
-    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry,
-    UndoRelationLog, UpdateOptions, UpdateOutcome, UpdatePayload,
-};
 use super::walker::VisibleHeapWalker;
+use super::{
+    DeleteOptions, HeapAccess, HeapError, HeapTuple, InsertOptions, UndoEntry, UndoRelationLog,
+    UpdateOptions, UpdateOutcome, UpdatePayload,
+};
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Read a tuple by id. Visibility is not enforced — callers running
@@ -108,8 +108,8 @@ impl<L: PageLoader> HeapAccess<L> {
             let page_bytes = page.as_bytes();
             let slot_count = page.header().slot_count();
             for slot in 0..slot_count {
-                let item_id_off = crate::page::PAGE_HEADER_SIZE
-                    + usize::from(slot) * crate::page::ITEMID_SIZE;
+                let item_id_off =
+                    crate::page::PAGE_HEADER_SIZE + usize::from(slot) * crate::page::ITEMID_SIZE;
                 let raw = u32::from_le_bytes([
                     page_bytes[item_id_off],
                     page_bytes[item_id_off + 1],
@@ -135,12 +135,10 @@ impl<L: PageLoader> HeapAccess<L> {
                 // Minimal-decode visibility cache lookup. Reads only
                 // `xmin` (bytes 0..8), `xmax` (8..16), `infomask`
                 // (24..26) — see the comment above the loop.
-                let xmin_raw = u64::from_le_bytes(
-                    slot_bytes[0..8].try_into().expect("8-byte slice"),
-                );
-                let xmax_raw = u64::from_le_bytes(
-                    slot_bytes[8..16].try_into().expect("8-byte slice"),
-                );
+                let xmin_raw =
+                    u64::from_le_bytes(slot_bytes[0..8].try_into().expect("8-byte slice"));
+                let xmax_raw =
+                    u64::from_le_bytes(slot_bytes[8..16].try_into().expect("8-byte slice"));
                 let infomask_bits =
                     u16::from_le_bytes(slot_bytes[24..26].try_into().expect("2-byte slice"));
                 let xmin_xid = Xid::new(xmin_raw);
@@ -160,9 +158,8 @@ impl<L: PageLoader> HeapAccess<L> {
                             // keeps the existing `FnMut(tid, header,
                             // payload)` contract intact without
                             // re-paying the full header decode.
-                            let header = TupleHeader::minimal_for_visible_cache_hit(
-                                xmin_xid, infomask_bits,
-                            );
+                            let header =
+                                TupleHeader::minimal_for_visible_cache_hit(xmin_xid, infomask_bits);
                             f(tid, &header, &slot_bytes[TUPLE_HEADER_SIZE..])?;
                             continue;
                         }
@@ -197,10 +194,14 @@ impl<L: PageLoader> HeapAccess<L> {
                         // entry means VACUUM trimmed it after we lost
                         // the right to see the pre-image — treat as
                         // invisible (the safe direction).
-                        if let Some(pre) =
-                            Self::lookup_undo_pre_image(&self.undo_log, rel, tid, &header,
-                                snapshot, oracle)
-                        {
+                        if let Some(pre) = Self::lookup_undo_pre_image(
+                            &self.undo_log,
+                            rel,
+                            tid,
+                            &header,
+                            snapshot,
+                            oracle,
+                        ) {
                             f(tid, &header, &pre)?;
                         }
                     }
@@ -288,7 +289,6 @@ impl<L: PageLoader> HeapAccess<L> {
             pre_image_scratch: Vec::new(),
         }
     }
-
 }
 
 /// Iterator yielded by [`HeapAccess::scan`].
@@ -507,4 +507,3 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> Iterator for VisibleHeapScan<'_
         }
     }
 }
-

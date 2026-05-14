@@ -178,10 +178,7 @@ impl TupleHeader {
             infomask: InfoMask::from_bits(infomask_bits),
             n_atts: 0,
             data_offset: 0,
-            ctid: TupleId::new(
-                PageId::new(RelationId::new(0), BlockNumber::new(0)),
-                0,
-            ),
+            ctid: TupleId::new(PageId::new(RelationId::new(0), BlockNumber::new(0)), 0),
         }
     }
 

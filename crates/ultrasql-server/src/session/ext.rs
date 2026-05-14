@@ -28,6 +28,7 @@ use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
+use super::Session;
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
@@ -35,10 +36,9 @@ use crate::result_encoder::{
     self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
 };
 use crate::{
-    BlankPageLoader, CombinedCatalog, Server, TxnState, notice_warning, run_plan_in_txn,
-    decode_key_column,
+    BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
+    run_plan_in_txn,
 };
-use super::Session;
 
 impl<RW> Session<RW>
 where
@@ -253,7 +253,11 @@ where
     /// / ROLLBACK TO / RELEASE) are dispatched directly against the
     /// session's [`TxnState`] via [`Self::execute_txn_control`] —
     /// `execute_portal` never sees them.
-    pub(crate) async fn handle_execute(&mut self, portal: &str, max_rows: i32) -> Result<(), ServerError> {
+    pub(crate) async fn handle_execute(
+        &mut self,
+        portal: &str,
+        max_rows: i32,
+    ) -> Result<(), ServerError> {
         if self.extended.pipeline_failed {
             return Ok(());
         }
@@ -352,7 +356,8 @@ where
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
                 };
-                let res = crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
+                let res =
+                    crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
                 if res.is_ok() {
                     if let Err(e) = self.state.txn_manager.commit(txn) {
                         tracing::warn!(
@@ -381,7 +386,8 @@ where
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
                 };
-                let res = crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
+                let res =
+                    crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
                 self.txn_state = if res.is_ok() {
                     TxnState::InTransaction(txn)
                 } else {
@@ -427,5 +433,4 @@ where
         self.io.flush().await?;
         Ok(())
     }
-
 }

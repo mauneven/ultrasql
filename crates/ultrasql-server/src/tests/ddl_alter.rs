@@ -4,7 +4,6 @@
 
 use super::*;
 
-
 /// `DROP TABLE t` makes a subsequent `SELECT * FROM t` fail with a
 /// PostgreSQL-style `undefined_table` error (SQLSTATE 42P01). The
 /// session continues so the test pattern matches PostgreSQL's
@@ -70,7 +69,6 @@ async fn drop_table_via_wire_then_select_fails_with_undefined_table() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 /// `DROP TABLE IF EXISTS missing` succeeds with the `DROP TABLE`
 /// command tag and does not error.
 #[tokio::test]
@@ -98,7 +96,6 @@ async fn drop_table_if_exists_missing_is_noop() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-
 
 /// End-to-end `ALTER TABLE t ADD COLUMN c` flow:
 ///
@@ -216,7 +213,6 @@ async fn alter_table_add_column_via_wire_round_trips() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 /// `ALTER TABLE ADD COLUMN` on a table that does not exist must
 /// fail at the binder layer (`PlanError::TableNotFound`) and
 /// surface as a query-scoped error — the session survives.
@@ -249,7 +245,6 @@ async fn alter_table_add_column_rejects_missing_relation() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-
 
 /// `TRUNCATE TABLE t` emits `TRUNCATE TABLE` as the command tag,
 /// does not emit a `RowDescription`, and the relation is empty as
@@ -327,7 +322,6 @@ async fn truncate_via_wire_empties_relation() {
     handle.await.expect("task joins").expect("clean exit");
 }
 
-
 /// `TRUNCATE TABLE nope` errors with the table-not-found SQLSTATE
 /// (42P01) and the session survives — the binder rejects the
 /// reference and the wire path surfaces it as a query-scoped
@@ -361,4 +355,3 @@ async fn truncate_rejects_missing_relation() {
     drop(client);
     handle.await.expect("task joins").expect("clean exit");
 }
-

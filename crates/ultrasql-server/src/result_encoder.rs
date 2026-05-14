@@ -264,8 +264,7 @@ pub fn run_select_streamed(op: &mut dyn Operator) -> Result<SelectResult, Server
     let initial_cap = match op.estimated_row_count() {
         Some(rows) => {
             let cols = op.schema().len().max(1);
-            let body = rows
-                .saturating_mul(PER_ROW_OVERHEAD_BYTES + cols * PER_CELL_BYTES_ESTIMATE);
+            let body = rows.saturating_mul(PER_ROW_OVERHEAD_BYTES + cols * PER_CELL_BYTES_ESTIMATE);
             body.saturating_add(ROWDESC_AND_TAG_BYTES)
         }
         None => 32 * 1024,

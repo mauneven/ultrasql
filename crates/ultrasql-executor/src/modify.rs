@@ -418,8 +418,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         payloads.push(payload);
                     }
                     let n = payloads.len();
-                    let payload_refs: Vec<&[u8]> =
-                        payloads.iter().map(Vec::as_slice).collect();
+                    let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
                     let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
                     self.heap
                         .insert_batch(
