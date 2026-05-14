@@ -47,7 +47,7 @@ after re-running `cross_compare_sql`.
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 109.29 µs | `█                                   ` |
+| **UltraSQL** | 97.08 µs | `█                                   ` |
 | DuckDB | 111.42 µs | `█                                   ` |
 | ClickHouse | 674.67 µs | `█                                   ` |
 | SQLite | 938.88 µs | `█                                   ` |
@@ -59,7 +59,7 @@ after re-running `cross_compare_sql`.
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 152.71 µs | `█                                   ` |
+| **UltraSQL** | 155.42 µs | `█                                   ` |
 | DuckDB | 216.46 µs | `█                                   ` |
 | ClickHouse | 1.66 ms | `██                                  ` |
 | SQLite | 16.20 ms | `███████████████                     ` |
@@ -71,7 +71,7 @@ after re-running `cross_compare_sql`.
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 157.67 µs | `█                                   ` |
+| **UltraSQL** | 155.62 µs | `█                                   ` |
 | DuckDB | 283.85 µs | `█                                   ` |
 | ClickHouse | 2.05 ms | `██                                  ` |
 | SQLite | 14.61 ms | `█████████████                       ` |
@@ -85,7 +85,7 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 4.48 ms | `███                                 ` |
+| **UltraSQL** | 4.95 ms | `███                                 ` |
 | SQLite | 20.23 ms | `████████████                        ` |
 | PostgreSQL | 48.38 ms | `████████████████████████████        ` |
 | ClickHouse | 62.83 ms | `████████████████████████████████████` |
@@ -97,8 +97,8 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 768.83 µs | `█                                   ` |
 | DuckDB | 897.42 µs | `█                                   ` |
+| **UltraSQL** | 912.25 µs | `█                                   ` |
 | ClickHouse | 1.17 ms | `█                                   ` |
 | SQLite | 1.81 ms | `██                                  ` |
 | PostgreSQL | 28.60 ms | `████████████████████████████████████` |
@@ -110,8 +110,8 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 | Engine | Median | Relative |
 | --- | ---: | --- |
 | DuckDB | 176.25 µs | `█                                   ` |
+| **UltraSQL** | 303.17 µs | `█                                   ` |
 | SQLite | 451.08 µs | `█                                   ` |
-| **UltraSQL** | 1.27 ms | `█                                   ` |
 | ClickHouse | 3.50 ms | `██                                  ` |
 | PostgreSQL | 64.42 ms | `████████████████████████████████████` |
 <!-- END AUTO: BENCH:update_throughput_10k -->
@@ -121,7 +121,7 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 406.50 µs | `█                                   ` |
+| **UltraSQL** | 395.92 µs | `█                                   ` |
 | SQLite | 512.33 µs | `█                                   ` |
 | DuckDB | 1.99 ms | `███                                 ` |
 | ClickHouse | 3.37 ms | `█████                               ` |
@@ -133,7 +133,7 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 309.22 µs | `█                                   ` |
+| **UltraSQL** | 279.37 µs | `█                                   ` |
 | SQLite | 357.35 µs | `█                                   ` |
 | DuckDB | 1.25 ms | `██                                  ` |
 | PostgreSQL | 11.63 ms | `███████████████████                 ` |
@@ -161,7 +161,11 @@ Implemented:
 - 8 KiB slotted page format with checksums (`ultrasql-storage`).
 - Buffer pool with CLOCK eviction, sharded page table.
 - Segment file manager (mmap + pread/pwrite, `F_FULLFSYNC` on macOS).
-- Heap access method with MVCC tuple headers.
+- Heap access method with MVCC tuple headers — INSERT / UPDATE /
+  DELETE all end-to-end over the wire through `ModifyTable`,
+  `HeapAccess::update_many`, the single-pass
+  `HeapAccess::update_int32_pair_in_place_add` for narrow shapes,
+  and the bulk `HeapAccess::delete_many` path.
 - B+ tree index (Lehman-Yao concurrent variant) for i64 keys.
 - WAL record codec, in-memory append buffer, background fsync writer,
   crash recovery replay (`ultrasql-wal`).
@@ -170,34 +174,48 @@ Implemented:
   `count_i64`, `min_i64`, `max_i64`, `cmp_gt_i64`,
   `sum_i64_with_mask`, `range_mask_i64` (`ultrasql-vec`).
 - Push-based executor with `MemTableScan`, `Filter`, `Project`,
-  `Limit` + `LogicalPlan → Operator` builder (`ultrasql-executor`).
-- PostgreSQL wire protocol v3 message codec (`ultrasql-protocol`).
-- Logical planner + binder (`ultrasql-planner`).
-- Catalog interface + in-memory implementation (`ultrasql-catalog`).
+  `Limit`, `HashAggregate`, `HashJoin`, `Sort`, `IndexScan`,
+  `CteScan`, fused `FilterSumI32Scan` /
+  `CachedFilterSumI32Scan` / `CachedSumI32Scan` /
+  `CachedAvgI32Scan` / `FusedUpdateInt32Add` operators +
+  `LogicalPlan → Operator` builder (`ultrasql-executor`).
+- PostgreSQL wire protocol v3 message codec — Simple Query +
+  Extended Query (Parse/Bind/Describe/Execute/Sync/Close/Flush),
+  `TCP_NODELAY` on accepted connections, response coalesced into
+  one `write_all` per statement (`ultrasql-protocol`,
+  `ultrasql-server`).
+- Logical planner + binder for SELECT / INSERT / UPDATE / DELETE /
+  CTE / BEGIN-COMMIT-ROLLBACK / SAVEPOINT (`ultrasql-planner`).
+- Catalog interface + in-memory implementation with `arc-swap`
+  per-statement snapshots (`ultrasql-catalog`).
 - Transaction manager: BEGIN / COMMIT / ABORT, snapshot, CLOG,
-  `XidStatusOracle` impl (`ultrasql-txn`).
-- `ultrasqld` server binary: TCP accept loop, PG wire handshake,
-  Simple Query path runs end-to-end against the real heap —
-  `CREATE TABLE`, `INSERT`, and `SELECT` traverse parser → binder →
-  catalog snapshot → autocommit transaction → `ModifyTable` /
-  `SeqScan` → `RowDescription`/`DataRow`/`CommandComplete` over the
-  wire.
+  `XidStatusOracle` impl, per-session `TxnState`
+  (`Idle`/`InTransaction`/`Failed`) wired to PostgreSQL-faithful
+  `ReadyForQuery` status bytes and `25P02` failed-block rejection
+  (`ultrasql-txn`).
+- `ultrasqld` server binary: TCP accept loop, SCRAM-SHA-256 + TLS,
+  PG wire handshake, Simple + Extended Query paths end-to-end —
+  `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`,
+  `TRUNCATE`, non-recursive `WITH`, `BEGIN` / `COMMIT` /
+  `ROLLBACK` all traverse parser → binder → catalog snapshot →
+  optimizer → autocommit / explicit transaction → physical
+  operator → `RowDescription` / `DataRow` / `CommandComplete`.
 - Wire-protocol cross-engine bench driver
   (`cross_compare_sql`): drives UltraSQL through `tokio-postgres`
   for apples-to-apples comparison against PostgreSQL 17, SQLite,
-  and DuckDB through each engine's native client.
+  DuckDB, and ClickHouse through each engine's native client.
 - Cost-based optimizer (`ultrasql-optimizer`): rule rewrites, cost
   model, DPsize join enumeration, physical operator selection,
-  plan cache (~1077 LOC).
+  plan cache shared between Simple Query and Extended Query
+  (~1077 LOC).
 
 Not yet implemented:
 
-- `UPDATE` / `DELETE` over the real heap (binder produces the
-  plan; the executor needs a TID prepender to surface the row id
-  before `ModifyTable` rewrites the tuple).
-- Extended Query protocol dispatch (`Parse` / `Bind` / `Execute`)
-  in the server. Codecs ship in `ultrasql-protocol`; the
-  session-loop wiring is the Wave 3 follow-up.
+- `INSERT ... SELECT`, `INSERT ... ON CONFLICT`, `RETURNING`.
+- `JOIN`, `ORDER BY`, set operators (`UNION` / `INTERSECT` /
+  `EXCEPT`) in `lower_query` — kernel operators exist, wiring
+  lands in v0.6+.
+- `BETWEEN` and `IS NULL` in the binder.
 - Persistent catalog tuple encoder (`pg_class` / `pg_attribute`
   read paths still fall back to the initial in-memory snapshot
   on restart).
