@@ -36,7 +36,11 @@
 //! Results are logged to `target/criterion/`. The ratio printed at the end
 //! of each run is push_throughput / pull_throughput (higher = push wins).
 
-#![allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::doc_markdown
+)]
 
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use ultrasql_core::{DataType, Field, Schema, Value};

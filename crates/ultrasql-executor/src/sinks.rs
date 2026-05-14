@@ -56,13 +56,13 @@ impl SumSink {
     /// Valid after the pipeline's [`finalize`](VectorizedSink::finalize) has
     /// been called.
     #[must_use]
-    pub fn final_value(&self) -> i64 {
+    pub const fn final_value(&self) -> i64 {
         self.sum
     }
 
     /// Return the total number of rows accumulated.
     #[must_use]
-    pub fn samples(&self) -> u64 {
+    pub const fn samples(&self) -> u64 {
         self.samples
     }
 }
@@ -133,7 +133,7 @@ impl CountSink {
     /// Valid after the pipeline's [`finalize`](VectorizedSink::finalize) has
     /// been called.
     #[must_use]
-    pub fn count(&self) -> u64 {
+    pub const fn count(&self) -> u64 {
         self.count
     }
 }

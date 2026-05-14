@@ -3,7 +3,7 @@
 //! Simulates `SELECT x FROM t ORDER BY x DESC` over 1 000 000 `i64` values.
 //! Each measured iteration sorts a fresh copy of the data in descending
 //! order using Rust's `sort_unstable` (the same comparison core the
-//! [`ultrasql_executor::Sort`] operator uses for numeric keys once it
+//! `ultrasql_executor::Sort` operator uses for numeric keys once it
 //! inlines the comparison).
 //!
 //! Throughput = `ROW_COUNT / median_elapsed_seconds`.

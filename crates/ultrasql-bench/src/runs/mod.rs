@@ -10,7 +10,7 @@
 //! (`#[cfg(test)]`) use small constants so the test suite completes quickly.
 //! The binary-level smoke test (in `regression_gate.rs`) sets the
 //! `ULTRASQL_BENCH_SMOKE` environment variable; each module calls
-//! [`smoke_row_count`] to select the appropriate size at runtime.
+//! `smoke_row_count` to select the appropriate size at runtime.
 //!
 //! # Timing contract
 //!
@@ -18,7 +18,7 @@
 //! 1. Runs `ctx.warmup_iterations` iterations without recording samples.
 //! 2. Runs `ctx.iterations` iterations and records one `f64` per iteration
 //!    (elapsed microseconds) into `samples`.
-//! 3. Returns a [`BenchResult`] with `throughput_per_sec`, `p50_latency_us`,
+//! 3. Returns a `BenchResult` with `throughput_per_sec`, `p50_latency_us`,
 //!    `p99_latency_us` computed from `samples`.
 
 /// Returns `smoke` if the `ULTRASQL_BENCH_SMOKE` environment variable is

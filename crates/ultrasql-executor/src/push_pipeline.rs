@@ -36,7 +36,7 @@
 //! [`VectorizedPipeline::drive`] executes the chain stage-by-stage: each
 //! stage is driven into an intermediate [`CollectSink`]; the accumulated
 //! batches become the input of the next stage via a
-//! [`BatchSourceOperator`] wrapper. The last stage drives the
+//! `BatchSourceOperator` wrapper. The last stage drives the
 //! caller-supplied terminal sink directly.
 //!
 //! This design avoids lifetime-juggling between operators and ensures every
@@ -186,7 +186,7 @@ impl VectorizedOperator for BatchSourceOperator {
 /// them stage-by-stage:
 ///
 /// 1. Stage 0 (source) is driven into an internal [`CollectSink`].
-/// 2. The collected batches are wrapped in a [`BatchSourceOperator`] and fed
+/// 2. The collected batches are wrapped in a `BatchSourceOperator` and fed
 ///    into stage 1.
 /// 3. This repeats for each subsequent stage.
 /// 4. The final stage is driven directly into the caller-supplied terminal
@@ -224,7 +224,7 @@ impl VectorizedPipeline {
     ///
     /// Equals the schema of the last operator in the chain.
     #[must_use]
-    pub fn schema(&self) -> &Schema {
+    pub const fn schema(&self) -> &Schema {
         &self.schema
     }
 
@@ -232,7 +232,7 @@ impl VectorizedPipeline {
     ///
     /// Executes all stages in order. Each intermediate stage is driven into
     /// a [`CollectSink`]; the collected batches are handed to the next stage
-    /// via a [`BatchSourceOperator`] wrapper. The last stage feeds
+    /// via a `BatchSourceOperator` wrapper. The last stage feeds
     /// `terminal_sink` directly and then calls `terminal_sink.finalize()`.
     ///
     /// # Errors
@@ -359,7 +359,7 @@ impl VectorizedPipeline {
 /// Builder for [`VectorizedPipeline`].
 ///
 /// Operators must be added in source-to-sink order. Call [`source`] first,
-/// then zero or more [`then`] calls, then [`build`].
+/// then zero or more [`then`] calls, then `build`.
 ///
 /// ## Usage patterns
 ///
@@ -501,6 +501,7 @@ impl VectorizedSink for CollectSink {
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::cast_possible_wrap)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema};
     use ultrasql_vec::column::{Column, NumericColumn};
@@ -685,7 +686,7 @@ mod tests {
         };
 
         // Pre-compose the chain: VectorizedFilter wraps VectorizedSeqScan.
-        let scan = MemTableScan::new(schema.clone(), batches);
+        let scan = MemTableScan::new(schema, batches);
         let vscan = VectorizedSeqScan::new(Box::new(scan));
         let filter = VectorizedFilter::new(Box::new(vscan), pred);
 
@@ -716,7 +717,7 @@ mod tests {
         assert_eq!(pipeline.schema().field_at(0).name, "v");
     }
 
-    /// End-to-end test: VectorizedSeqScan → VectorizedFilter → SumSink over
+    /// End-to-end test: `VectorizedSeqScan` → `VectorizedFilter` → `SumSink` over
     /// a 1 000-row in-memory dataset.
     ///
     /// Dataset: 1 000 rows of `(x: i64, y: i64)` where `y = row_index`.
@@ -777,7 +778,7 @@ mod tests {
             data_type: DataType::Bool,
         };
 
-        let scan = MemTableScan::new(schema.clone(), batches);
+        let scan = MemTableScan::new(schema, batches);
         let vscan = VectorizedSeqScan::new(Box::new(scan));
         let filter = VectorizedFilter::new(Box::new(vscan), pred);
 

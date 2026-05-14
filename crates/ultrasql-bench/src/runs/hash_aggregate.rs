@@ -3,7 +3,7 @@
 //! Simulates `SELECT COUNT(*), SUM(value) FROM t GROUP BY group_id` over
 //! 1 000 000 rows with 1 000 distinct `group_id` values. The implementation
 //! uses a `HashMap<i32, (i64, i64)>` (group → `(count, sum)`) which mirrors
-//! the kernel-level logic of [`ultrasql_executor::HashAggregate`] without
+//! the kernel-level logic of `ultrasql_executor::HashAggregate` without
 //! depending on the executor crate (which is a dev-dependency only).
 //!
 //! Additionally, the [`ultrasql_vec::kernels::hash_i64`] kernel is called
