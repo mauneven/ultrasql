@@ -16,6 +16,14 @@
 //! - [`LogicalPlan::Limit`] (without offset) -> [`Limit`].
 //! - [`LogicalPlan::Sort`] -> [`Sort`] (in-memory; spill-to-disk lands
 //!   with the `work_mem` budget in v0.6).
+//! - [`LogicalPlan::SetOp`] -> [`SetOp`] for `UNION`, `INTERSECT`, and
+//!   `EXCEPT` (each in both `ALL` and `DISTINCT` quantifier forms).
+//!   The two children are lowered recursively through the same path so
+//!   a set-op can sit on top of any other supported lowering. The
+//!   binder is responsible for arity and per-column type compatibility
+//!   (see `binder::bind_set_op`); we re-check arity at lowering time
+//!   so a hand-built plan that bypasses the binder still surfaces a
+//!   precise error rather than producing wrong rows.
 //!
 //! ## Why an inline lowerer
 //!
@@ -42,7 +50,7 @@ use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
     Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan, ModifyKind,
-    ModifyTable, NestedLoopJoin, Operator, Project, RightFactory, RowCodec, SeqScan, Sort,
+    ModifyTable, NestedLoopJoin, Operator, Project, RightFactory, RowCodec, SeqScan, SetOp, Sort,
     ValuesScan,
 };
 use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
@@ -193,7 +201,29 @@ pub fn lower_plan(
             "DDL reached operator lowerer; expected DDL dispatch path",
         )),
         LogicalPlan::Aggregate { .. } => Err(ServerError::Unsupported("GROUP BY / aggregate")),
-        LogicalPlan::SetOp { .. } => Err(ServerError::Unsupported("UNION / INTERSECT / EXCEPT")),
+        LogicalPlan::SetOp {
+            op,
+            quantifier,
+            left,
+            right,
+            schema,
+        } => {
+            // Sample-table path. The set-op operator is the same kernel
+            // used on the real-heap path; see `lower_query` for the
+            // production lowering and the schema-compatibility note.
+            let left_schema = left.schema();
+            let right_schema = right.schema();
+            check_set_op_schemas(left_schema, right_schema)?;
+            let left_op = lower_plan(left, tables)?;
+            let right_op = lower_plan(right, tables)?;
+            Ok(Box::new(SetOp::new(
+                left_op,
+                right_op,
+                *op,
+                *quantifier,
+                schema.clone(),
+            )))
+        }
         LogicalPlan::Cte { .. } => Err(ServerError::Unsupported("WITH (CTE)")),
     }
 }
@@ -477,6 +507,12 @@ pub struct LowerCtx<'a> {
 ///   expression evaluator follow-up.
 /// - Everything else is rejected — JOIN, GROUP BY, set ops, CTEs land
 ///   in subsequent waves.
+// One arm per `LogicalPlan` variant; the dispatcher is intentionally
+// linear so a new wave (set-ops here in A7) adds a clearly-bounded arm.
+// Each arm with non-trivial logic delegates to a helper (`lower_join`,
+// `lower_real_update`, `lower_set_op_real`, ...) so the per-arm body
+// stays small even though the total file is large.
+#[allow(clippy::too_many_lines)]
 pub fn lower_query(
     plan: &LogicalPlan,
     ctx: &LowerCtx<'_>,
@@ -630,9 +666,64 @@ pub fn lower_query(
                 schema.clone(),
             )))
         }
-        LogicalPlan::SetOp { .. } => Err(ServerError::Unsupported("UNION / INTERSECT / EXCEPT")),
+        LogicalPlan::SetOp {
+            op,
+            quantifier,
+            left,
+            right,
+            schema,
+        } => lower_set_op_real(*op, *quantifier, left, right, schema.clone(), ctx),
         LogicalPlan::Cte { .. } => Err(ServerError::Unsupported("WITH (CTE)")),
     }
+}
+
+/// Re-check the contract `bind_set_op` enforces: both inputs must have
+/// the same arity. Per-column type-compatibility is the binder's job;
+/// we only catch the arity mismatch here so a hand-built plan that
+/// skipped binding fails with a precise error instead of crashing the
+/// kernel.
+fn check_set_op_schemas(left: &Schema, right: &Schema) -> Result<(), ServerError> {
+    if left.len() != right.len() {
+        return Err(ServerError::Unsupported(
+            "set operation: left and right sides must have the same number of columns",
+        ));
+    }
+    Ok(())
+}
+
+/// Build a [`SetOp`] over the catalog-aware [`lower_query`] path.
+///
+/// The two children are lowered through the same real-heap-aware path
+/// so a set-op can sit on top of `SeqScan` over a persistent relation,
+/// an in-memory `Values`/`MemTableScan`, or any other supported source.
+/// The executor's `SetOp` kernel
+/// (`crates/ultrasql-executor/src/set_op.rs`) implements all six SQL
+/// shapes (UNION / INTERSECT / EXCEPT × ALL / DISTINCT) with a
+/// hash-counting algorithm, treating two NULLs as equal (matching
+/// PostgreSQL `DISTINCT` semantics). The kernel is fully materialising:
+/// it drains both inputs before emitting its first row, so the operator
+/// is a pipeline breaker bounded by the same in-memory footprint as
+/// `HashAggregate` / `Sort` until the v0.7 `work_mem` spill lands.
+///
+/// Schema-compatibility: the binder enforces arity and per-column
+/// `numeric_join` compatibility (see `binder::bind_set_op`). We re-check
+/// arity through [`check_set_op_schemas`] so a hand-built plan that
+/// bypassed the binder still surfaces a precise error rather than
+/// producing wrong rows.
+fn lower_set_op_real(
+    op: ultrasql_planner::LogicalSetOp,
+    quantifier: ultrasql_planner::LogicalSetQuantifier,
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    out_schema: Schema,
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    check_set_op_schemas(left.schema(), right.schema())?;
+    let left_op = lower_query(left, ctx)?;
+    let right_op = lower_query(right, ctx)?;
+    Ok(Box::new(SetOp::new(
+        left_op, right_op, op, quantifier, out_schema,
+    )))
 }
 
 /// Lower a `Scan` node by trying the persistent catalog first; if the
@@ -2170,6 +2261,215 @@ mod tests {
         let mut pairs = collect_pairs(op.as_mut());
         pairs.sort_unstable();
         assert_eq!(pairs, vec![(0, 1), (0, 3), (2, 2)]);
+    }
+
+    // ----------------------------------------------------------------
+    // SetOp dispatch (Wave A item A7)
+    // ----------------------------------------------------------------
+
+    /// Build a single-column `Int32` [`LogicalPlan::Values`] from a slice
+    /// of integers. Helper for the `SetOp` unit tests below.
+    fn build_int_values_plan(rows: &[i32]) -> LogicalPlan {
+        LogicalPlan::Values {
+            rows: rows.iter().map(|v| int_row(*v)).collect(),
+            schema: schema_int_col("v"),
+        }
+    }
+
+    /// Build a [`LogicalPlan::SetOp`] over two `Values` children with a
+    /// single `Int32` column. The output schema is built the same way
+    /// `bind_set_op` does (nullable copies of the left side's columns)
+    /// so the kernel-shaped plan exactly mirrors what the binder emits.
+    fn build_int_set_op_plan(
+        left_rows: &[i32],
+        right_rows: &[i32],
+        op: ultrasql_planner::LogicalSetOp,
+        quantifier: ultrasql_planner::LogicalSetQuantifier,
+    ) -> LogicalPlan {
+        let out_schema = Schema::new([Field::nullable("v", DataType::Int32)]).expect("schema ok");
+        LogicalPlan::SetOp {
+            op,
+            quantifier,
+            left: Box::new(build_int_values_plan(left_rows)),
+            right: Box::new(build_int_values_plan(right_rows)),
+            schema: out_schema,
+        }
+    }
+
+    /// Walk a `SetOp` operator and collect its emitted Int32 values into a
+    /// sorted `Vec` for order-independent assertion. The kernel emits
+    /// rows in left-insertion order; the tests sort to keep assertions
+    /// robust against any future ordering refinement that does not
+    /// change the multiset of rows.
+    fn drain_int_setop(op: &mut dyn Operator) -> Vec<i32> {
+        let mut out: Vec<i32> = Vec::new();
+        while let Some(batch) = op.next_batch().expect("setop operator must not error") {
+            assert_eq!(batch.width(), 1, "SetOp output schema is one column wide");
+            if let ultrasql_vec::column::Column::Int32(col) = &batch.columns()[0] {
+                out.extend_from_slice(col.data());
+            } else {
+                panic!("unexpected column layout for single-Int32 set-op output");
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// `SELECT v FROM l UNION SELECT v FROM r` — duplicates removed,
+    /// surviving rows are the distinct union.
+    #[test]
+    fn lower_query_union_distinct_deduplicates() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let plan = build_int_set_op_plan(
+            &[1, 2, 2, 3],
+            &[2, 3, 4],
+            ultrasql_planner::LogicalSetOp::Union,
+            ultrasql_planner::LogicalSetQuantifier::Distinct,
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        assert_eq!(drain_int_setop(op.as_mut()), vec![1, 2, 3, 4]);
+    }
+
+    /// `SELECT v FROM l UNION ALL SELECT v FROM r` — duplicates kept.
+    #[test]
+    fn lower_query_union_all_concatenates() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let plan = build_int_set_op_plan(
+            &[1, 2, 2],
+            &[2, 3, 3],
+            ultrasql_planner::LogicalSetOp::Union,
+            ultrasql_planner::LogicalSetQuantifier::All,
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        assert_eq!(drain_int_setop(op.as_mut()), vec![1, 2, 2, 2, 3, 3]);
+    }
+
+    /// `SELECT v FROM l INTERSECT SELECT v FROM r` — distinct rows in both.
+    #[test]
+    fn lower_query_intersect_distinct_returns_common_distinct_rows() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let plan = build_int_set_op_plan(
+            &[1, 2, 2, 3],
+            &[2, 3, 3, 4],
+            ultrasql_planner::LogicalSetOp::Intersect,
+            ultrasql_planner::LogicalSetQuantifier::Distinct,
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        assert_eq!(drain_int_setop(op.as_mut()), vec![2, 3]);
+    }
+
+    /// `SELECT v FROM l INTERSECT ALL SELECT v FROM r` — multiset
+    /// intersection: emit each row up to `min(left_count, right_count)`
+    /// times.
+    #[test]
+    fn lower_query_intersect_all_respects_multiset_min_counts() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        // left: 1×{1}, 3×{2}, 1×{3}; right: 2×{2}, 1×{3}, 1×{4}.
+        // multiset min: 0×{1}, 2×{2}, 1×{3} → [2, 2, 3].
+        let plan = build_int_set_op_plan(
+            &[1, 2, 2, 2, 3],
+            &[2, 2, 3, 4],
+            ultrasql_planner::LogicalSetOp::Intersect,
+            ultrasql_planner::LogicalSetQuantifier::All,
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        assert_eq!(drain_int_setop(op.as_mut()), vec![2, 2, 3]);
+    }
+
+    /// `SELECT v FROM l EXCEPT SELECT v FROM r` — distinct left rows
+    /// absent from right.
+    #[test]
+    fn lower_query_except_distinct_returns_left_minus_right() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let plan = build_int_set_op_plan(
+            &[1, 2, 2, 3],
+            &[2, 4],
+            ultrasql_planner::LogicalSetOp::Except,
+            ultrasql_planner::LogicalSetQuantifier::Distinct,
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        assert_eq!(drain_int_setop(op.as_mut()), vec![1, 3]);
+    }
+
+    /// `SELECT v FROM l EXCEPT ALL SELECT v FROM r` — multiset
+    /// difference: subtract right counts from left counts.
+    #[test]
+    fn lower_query_except_all_subtracts_right_counts_from_left() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        // left: 1×{1}, 3×{2}, 1×{3}; right: 1×{2}, 1×{4}.
+        // multiset diff: 1×{1}, 2×{2}, 1×{3} → [1, 2, 2, 3].
+        let plan = build_int_set_op_plan(
+            &[1, 2, 2, 2, 3],
+            &[2, 4],
+            ultrasql_planner::LogicalSetOp::Except,
+            ultrasql_planner::LogicalSetQuantifier::All,
+        );
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        assert_eq!(drain_int_setop(op.as_mut()), vec![1, 2, 2, 3]);
+    }
+
+    /// Hand-built `SetOp` plan whose two children have different arities
+    /// must be rejected by the lowerer with a precise `Unsupported`
+    /// error rather than panicking inside the kernel.
+    #[test]
+    fn lower_query_set_op_rejects_arity_mismatch() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        // Left has 1 column, right has 2.
+        let left_schema = schema_int_col("v");
+        let right_schema = Schema::new([
+            Field::required("a", DataType::Int32),
+            Field::required("b", DataType::Int32),
+        ])
+        .expect("two-col schema");
+        let left_plan = LogicalPlan::Values {
+            rows: vec![int_row(1)],
+            schema: left_schema.clone(),
+        };
+        let right_plan = LogicalPlan::Values {
+            rows: vec![vec![lit_i32(1), lit_i32(2)]],
+            schema: right_schema,
+        };
+        let plan = LogicalPlan::SetOp {
+            op: ultrasql_planner::LogicalSetOp::Union,
+            quantifier: ultrasql_planner::LogicalSetQuantifier::All,
+            left: Box::new(left_plan),
+            right: Box::new(right_plan),
+            schema: left_schema,
+        };
+        let err = lower_query(&plan, &ctx).expect_err("must reject arity mismatch");
+        assert!(matches!(err, ServerError::Unsupported(_)));
+    }
+
+    /// The sample-table lowerer accepts `SetOp` too — keep both lowering
+    /// paths bit-identical in dispatch semantics. We use a parsed SQL
+    /// `SELECT id FROM users UNION ALL SELECT id FROM users` plan over
+    /// the sample fixture so the test exercises the binder, the lowerer,
+    /// and the kernel together.
+    #[test]
+    fn lower_plan_union_all_via_sample_path() {
+        let (catalog, tables) = fixture();
+        let p = plan(
+            "SELECT id FROM users UNION ALL SELECT id FROM users",
+            &catalog,
+        );
+        let mut op = lower_plan(&p, &tables).expect("lowers");
+        let mut ids: Vec<i32> = Vec::new();
+        while let Some(batch) = op.next_batch().expect("ok") {
+            if let ultrasql_vec::column::Column::Int32(col) = &batch.columns()[0] {
+                ids.extend_from_slice(col.data());
+            }
+        }
+        ids.sort_unstable();
+        // The fixture has ids = [1, 2, 3]; UNION ALL of two copies =
+        // [1, 1, 2, 2, 3, 3] (sorted for stable comparison).
+        assert_eq!(ids, vec![1, 1, 2, 2, 3, 3]);
     }
 
     // ----------------------------------------------------------------
