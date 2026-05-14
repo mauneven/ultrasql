@@ -45,16 +45,20 @@ general row-oriented path and the numbers will differ. The fused paths
 are tracked optimisations that should generalise; until they do, the
 table reads as a per-shape fast path.
 
-**Durability gap**: the in-place UPDATE / DELETE paths
-(`update_int32_pair_inplace_undo`, `delete_int32_pair_inplace`) currently
-emit **no WAL** — they're not crash-safe. The pre-image undo log is
-in-memory only. Production durability requires routing through the
-classical `update_many` / `delete_many` paths (which **do** emit WAL),
-and those are the paths a non-`(Int32, Int32)` UPDATE / DELETE will use.
-Closing the durability gap on the fast path is a tracked P0 item; the
-benchmark numbers are honest measurements of the code as it stands but
-**should not be read as a claim of full PostgreSQL on-disk MVCC durability
-on those workloads**.
+**Durability status**: the in-place UPDATE / DELETE paths
+(`update_int32_pair_inplace_undo`, `delete_int32_pair_inplace`) **now
+emit per-row `HeapUpdateInPlace` / `HeapDeleteInPlace` WAL records**
+behind FPW + page-LSN stamping when a `WalSink` is wired into the
+buffer pool, and the recovery applier rebuilds both the on-page
+post-image and the in-memory pre-image undo log
+(`crates/ultrasql-storage/tests/recovery_sim.rs` covers both paths
+deterministically). The remaining work is plumbing the on-disk
+`WalWriter` into `BufferPool::with_wal` at server start so the
+runtime path is durable end to end — tracked as Item 1 Part C. Until
+that ships, the server constructs the pool without a sink, so the
+benchmark numbers reflect a non-durable runtime configuration and
+**should not yet be read as a claim of full PostgreSQL on-disk MVCC
+durability on those workloads**.
 
 Methodology and raw data: [BENCHMARKS.md](BENCHMARKS.md) and
 [`benchmarks/results/`](benchmarks/results/).

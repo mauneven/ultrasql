@@ -236,16 +236,22 @@ real wire protocol.
 
 1. **Durability of the in-place fast path.** Wave F-1's
    `update_int32_pair_inplace_undo` and Wave F-3's
-   `delete_int32_pair_inplace` emit **no WAL records**. The
-   pre-image undo log is in-memory only. A crash between the
-   page mutation and the next checkpoint loses the UPDATE/DELETE
-   on restart. The classical `update_many` / `delete_many` paths
-   *do* emit WAL; the fused fast path is therefore production-
-   unsafe and is gated to the executor's `(Int32, Int32) SET col
-   ± lit` shape. **P0 follow-up**: add `RecordType::HeapUpdateInPlace`
-   payload carrying pre + post image, emit per row before the
-   page mutation, stamp page LSN, write deterministic-simulation
-   crash tests at every WAL byte boundary.
+   `delete_int32_pair_inplace` **now emit per-row
+   `HeapUpdateInPlace` / `HeapDeleteInPlace` WAL records**
+   behind FPW + page-LSN stamping when the buffer pool is
+   constructed with a `WalSink` (Item 1 Part B, `5fd0c97`).
+   The recovery applier rebuilds both the on-page post-image
+   and the in-memory pre-image undo log; deterministic
+   crash-recovery tests in
+   `crates/ultrasql-storage/tests/recovery_sim.rs`
+   (`crash_recovery_in_place_update_restores_post_image_and_undo_log`,
+   `crash_recovery_in_place_delete_stamps_xmax`) cover both
+   paths. **Remaining work** (Item 1 Part C): plumb the on-disk
+   `WalWriter` into `BufferPool::with_wal` at server start so
+   the runtime path is durable end to end. Until that ships
+   the server constructs `BufferPool::new()` and the fused
+   paths receive `None`, so the bench numbers below still
+   reflect a non-durable runtime configuration.
 2. **Shape specialisation.** `FusedUpdateInt32Add`,
    `FusedDeleteInt32Pair`, `write_int32_pair_data_rows`, and the
    in-place undo path all match exactly the `(Int32, Int32) col
@@ -513,16 +519,25 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 
 ### ⚠️ P0 correctness debt added by Wave F (must close before any v0.7 work)
 
-- [ ] **In-place UPDATE / DELETE emit no WAL** —
-  `update_int32_pair_inplace_undo` / `delete_int32_pair_inplace` mutate
-  pages without writing a WAL record. The undo log is in-memory only.
-  On a crash between page write and checkpoint, the UPDATE is lost on
-  restart. The bench numbers describe a non-durable contract. **Fix
-  plan**: new `RecordType::HeapUpdateInPlace` payload (pre + post +
-  tid + xmax/cmax), emit per row before the page mutation under the
-  same write guard, stamp page LSN, write deterministic-simulation
-  crash tests that cut the WAL at every byte boundary across an
-  in-place UPDATE.
+- [x] **In-place UPDATE / DELETE WAL emission + replay** (Item 1
+  Part B, `5fd0c97`). `update_int32_pair_inplace_undo` and
+  `delete_int32_pair_inplace` now emit per-row
+  `RecordType::HeapUpdateInPlace` / `HeapDeleteInPlace` records
+  with FPW + page-LSN stamping when the buffer pool is configured
+  with a `WalSink`. The applier
+  (`HeapAccess::apply_update_in_place` / `apply_delete_in_place`)
+  rewrites the slot payload, stamps the header, and rebuilds the
+  in-memory pre-image undo log so cross-snapshot readers still
+  resolve through `Visibility::VisiblePreImage`. Deterministic
+  crash-recovery tests in
+  `crates/ultrasql-storage/tests/recovery_sim.rs` cover both paths.
+- [ ] **Plumb the on-disk `WalWriter` sink into the server** (Item 1
+  Part C). The server currently builds the buffer pool via
+  `BufferPool::new()`, so the runtime sink is `None` and the
+  emission code lands as dead capability. Wire
+  `BufferPool::with_wal(WalWriter)` at server start, build the
+  `WalSink` adapter, and re-run `cross_compare_sql` with the
+  durable runtime to publish post-WAL throughput numbers.
 - [ ] **Undo-log GC story missing** — `UndoRelationLog` grows
   unbounded. Each UPDATE pushes 9-byte pre-images that are never
   trimmed. Long-running workloads will accumulate undo entries until
