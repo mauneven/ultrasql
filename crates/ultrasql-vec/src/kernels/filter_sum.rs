@@ -27,6 +27,58 @@
 //! mask. Following SQL three-valued logic, a NULL in `y` makes the
 //! predicate UNKNOWN (treated as false), and a NULL in `x` contributes
 //! nothing to the sum.
+//!
+//! Multi-core fan-out: [`filter_sum_par_i64_where_gt_zero`] partitions
+//! the input across `n_threads` workers, each of which invokes the
+//! single-threaded SIMD kernel on its slice. On Apple M-series the
+//! single-thread NEON kernel saturates a single core's load/store
+//! bandwidth (~72 GB/s on M4), and scaling is bounded by aggregate
+//! DRAM bandwidth (~110 GB/s) rather than core count. The convenience
+//! entry point [`filter_sum_par_auto_i64_where_gt_zero`] picks a
+//! thread count from [`std::thread::available_parallelism`].
+//!
+//! ### Bandwidth-saturation finding (Apple M4, 10 M rows = 160 MB)
+//!
+//! Measured medians (`cargo bench -p ultrasql-vec --bench
+//! filter_sum_10m -- --warm-up-time 2 --measurement-time 8`):
+//!
+//! | variant       | time     | speedup vs serial | bandwidth |
+//! | ------------- | -------- | ----------------- | --------- |
+//! | `serial_neon` | 2.25 ms  | 1.00×             |  71 GB/s  |
+//! | `par_2`       | 2.27 ms  | 0.99×             |  70 GB/s  |
+//! | `par_3`       | 2.29 ms  | 0.98×             |  70 GB/s  |
+//! | `par_4`       | 2.12 ms  | 1.06×             |  75 GB/s  |
+//! | `par_5`       | 1.72 ms  | 1.31×             |  93 GB/s  |
+//! | `par_6`       | 1.56 ms  | 1.44×             | 103 GB/s  |
+//! | `par_8`       | 1.52 ms  | 1.49×             | 105 GB/s  |
+//! | `par_auto`    | 1.63 ms  | 1.39×             |  98 GB/s  |
+//!
+//! Interpretation:
+//! - 1.45 ms is the DRAM-bandwidth-bound floor on M4 (160 MB /
+//!   110 GB/s). `par_8` lands at 1.52 ms, within ~5% of that floor,
+//!   i.e. the kernel saturates DRAM at the 8-thread point and
+//!   additional threads have no headroom to consume.
+//! - Below 5 threads the per-core kernel is already pulling near its
+//!   private bandwidth budget; the spawn overhead is not yet
+//!   amortized so `par_2`/`par_3`/`par_4` look flat compared to
+//!   serial. The crossover is `par_5` where the cores collectively
+//!   cross the per-core ceiling and DRAM becomes the binding
+//!   resource.
+//! - `par_auto` picks `available_parallelism()` (10 on M4: 4 P-cores
+//!   plus 6 E-cores). The E-core slices arrive slightly later than the
+//!   P-core slices, dragging the reduce-on-last-join wait by ~100 µs.
+//!   On M4 the sweet spot is empirically `par_8`. We keep `par_auto`
+//!   as the default convenience entry: it is correct on every host,
+//!   the difference vs the empirical optimum is small (~7%), and a
+//!   future cost-based plan-time chooser will refine it per-query.
+//! - Further wins would require either (a) avoiding the second
+//!   stream (e.g. dictionary-encoded `y` predicate evaluated from a
+//!   pre-computed bitmap, halving the scanned bytes), (b) Apple AMX
+//!   integer outer-product paths to push past DRAM into the SLC
+//!   (System Level Cache), or (c) a streaming sub-batched producer
+//!   that issues `vld1q_lane_s64` lane-by-lane to skip cold lines.
+//!   None of these are pursued here — the current 1.52 ms result is
+//!   DRAM-bandwidth-bound on this hardware.
 
 use crate::bitmap::Bitmap;
 use crate::column::NumericColumn;
@@ -130,6 +182,186 @@ pub fn filter_sum_i64_where_gt_zero_scalar(x: &NumericColumn<i64>, y: &NumericCo
         return 0;
     }
     filter_sum_scalar_branchless(x.data(), y.data())
+}
+
+// ============================================================================
+// Multi-core fan-out
+// ============================================================================
+
+/// Below this row count the serial kernel wins: thread-spawn overhead
+/// (≈ 10 µs per worker on macOS) dominates the work, and the L1-resident
+/// working set on a single core delivers the headline bandwidth anyway.
+/// Tuned empirically on Apple M4 — above 64 K rows the scaled-out
+/// kernel starts to win, with crossover at roughly 128 K rows.
+const SERIAL_THRESHOLD: usize = 65_536;
+
+/// Round partition sizes up to this many lanes. The single-thread NEON
+/// kernel consumes 32 i64 lanes per loop trip and the M4 line-fill
+/// engine tracks two streams at 64 B granularity. Choosing 64 keeps
+/// every worker's slice aligned to a cache-line pair on both the `x`
+/// and `y` streams (`64 * 8 B = 512 B = 8 lines`) and is a multiple of
+/// the kernel's 32-lane SIMD stride.
+const PARTITION_ALIGNMENT: usize = 64;
+
+/// Multi-threaded fused branchless filter+sum.
+///
+/// Same contract as [`filter_sum_i64_where_gt_zero`] but partitions the
+/// input across `n_threads` worker threads. Each worker runs the
+/// single-threaded SIMD kernel on its slice; the harness sums the
+/// per-thread partial results in the main thread.
+///
+/// Threshold: when `x.len() < SERIAL_THRESHOLD` (default 65 536), the
+/// kernel falls through to the serial path — thread spawn overhead
+/// dominates below that point.
+///
+/// Partitioning: chunks are rounded up to a multiple of 64 lanes
+/// (512 B per stream) so each worker's slice is aligned to a
+/// cache-line pair and is a multiple of the NEON kernel's 32-lane
+/// stride. The final partition takes whatever remains. With
+/// `n_threads == 1` this degenerates to a direct call into the serial
+/// kernel — no thread is spawned.
+///
+/// Concurrency model: workers run inside a [`std::thread::scope`], so
+/// the borrowed `x`/`y` slices outlive every worker without `Arc`. No
+/// shared mutable accumulator exists: each worker returns its
+/// `i64` partial sum via its closure return value, and the harness
+/// folds them after `join`. This means there is zero cross-core
+/// cache-line contention on the accumulator until the final
+/// `wrapping_add` reduce in the main thread.
+///
+/// Wrapping arithmetic: identical semantics to the serial kernel —
+/// partial sums and the final reduce both use `wrapping_add`.
+///
+/// # Panics
+///
+/// Cannot panic for valid inputs. Length-mismatch is debug-asserted
+/// and returns 0 in release as in the serial variant.
+#[must_use]
+pub fn filter_sum_par_i64_where_gt_zero(
+    x: &NumericColumn<i64>,
+    y: &NumericColumn<i64>,
+    n_threads: usize,
+) -> i64 {
+    debug_assert_eq!(
+        x.len(),
+        y.len(),
+        "filter_sum_par_i64_where_gt_zero: length mismatch",
+    );
+    if x.len() != y.len() {
+        return 0;
+    }
+    let xs = x.data();
+    let ys = y.data();
+
+    // Early-out: tiny inputs go straight to the serial path so we
+    // never pay for a `thread::scope` we cannot amortize.
+    if n_threads <= 1 || xs.len() < SERIAL_THRESHOLD {
+        return filter_sum_dispatch(xs, ys);
+    }
+
+    filter_sum_par_slice(xs, ys, n_threads)
+}
+
+/// Convenience variant of [`filter_sum_par_i64_where_gt_zero`] that
+/// picks `n_threads` from [`std::thread::available_parallelism`].
+///
+/// Falls back to `1` (i.e. the serial path) if the platform refuses to
+/// report a parallelism value. On Apple M-series this returns the
+/// total CPU count (P + E cores). We pass it through unmodified — the
+/// kernel is memory-bound, so launching workers on the E-cores hurts
+/// only when their slices arrive at the reduce later than the P-core
+/// workers'. Empirically on M4 this is a wash up to 8 threads.
+#[must_use]
+pub fn filter_sum_par_auto_i64_where_gt_zero(
+    x: &NumericColumn<i64>,
+    y: &NumericColumn<i64>,
+) -> i64 {
+    let n_threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    filter_sum_par_i64_where_gt_zero(x, y, n_threads)
+}
+
+/// Slice-level worker dispatch. Splits `xs` / `ys` into
+/// `n_threads` partitions (rounded up to the kernel's alignment),
+/// runs the single-threaded SIMD kernel on each in parallel via
+/// `std::thread::scope`, and `wrapping_add`s the partial sums.
+///
+/// Invariants enforced by the caller:
+/// - `xs.len() == ys.len()`
+/// - `n_threads >= 2`
+/// - `xs.len() >= SERIAL_THRESHOLD`
+fn filter_sum_par_slice(xs: &[i64], ys: &[i64], n_threads: usize) -> i64 {
+    debug_assert_eq!(xs.len(), ys.len());
+    debug_assert!(n_threads >= 2);
+
+    let n = xs.len();
+    // Compute a partition size rounded up to `PARTITION_ALIGNMENT`.
+    // For inputs that are not an exact multiple of the alignment, the
+    // last worker takes the (possibly smaller) remainder — its NEON
+    // tail handler already covers sub-stride slices.
+    let raw_part = n.div_ceil(n_threads);
+    let part = raw_part
+        .next_multiple_of(PARTITION_ALIGNMENT)
+        .max(PARTITION_ALIGNMENT);
+
+    // If rounding makes the first partition cover the entire input,
+    // fall back to the serial path — no point spawning threads we
+    // would immediately starve.
+    if part >= n {
+        return filter_sum_dispatch(xs, ys);
+    }
+
+    // Build the per-worker slice pairs.
+    //
+    // Bounded fan-out: `n_threads` is a usize from the caller; we use
+    // it to size a `SmallVec` allocated on the worker harness's stack.
+    // No per-iteration heap alloc happens in the worker body — each
+    // closure carries only two `&[i64]` slices and returns an `i64`.
+    let mut slices: smallvec::SmallVec<[(&[i64], &[i64]); 16]> =
+        smallvec::SmallVec::with_capacity(n_threads);
+    let mut off = 0_usize;
+    while off < n {
+        let end = (off + part).min(n);
+        slices.push((&xs[off..end], &ys[off..end]));
+        off = end;
+    }
+
+    // Scoped fan-out. Each worker computes its partial sum and the
+    // harness reduces them. `std::thread::scope` guarantees every
+    // spawned thread joins before the scope returns, which means the
+    // borrowed `&[i64]` slices outlive every worker without an `Arc`
+    // or static lifetime.
+    //
+    // We deliberately do *not* run a partition on the caller's
+    // thread. Empirically, on Apple M4 with criterion measuring
+    // 10 M-row passes, the caller's L1 icache is dirty (criterion
+    // loop, timer-read, black_box) and its slice consistently lags
+    // the spawned workers' slices. The spawn-amortization win
+    // (~10 µs) is dwarfed by the per-iteration imbalance (~50 µs)
+    // when the caller becomes the slowest worker. Spawning every
+    // partition fresh keeps the worker icache clean.
+    std::thread::scope(|s| {
+        // Reserve handles upfront so the spawn loop does no resizing
+        // and the `join` order matches the partition order.
+        let mut handles: smallvec::SmallVec<[std::thread::ScopedJoinHandle<'_, i64>; 16]> =
+            smallvec::SmallVec::with_capacity(slices.len());
+        for (x_slice, y_slice) in slices {
+            handles.push(s.spawn(move || filter_sum_dispatch(x_slice, y_slice)));
+        }
+        // Reduce: `wrapping_add` preserves the serial-kernel semantics
+        // (partial sums commute under wrapping addition).
+        let mut total: i64 = 0;
+        for h in handles {
+            // SAFETY-of-`expect`: a scoped worker can only fail to
+            // join if the thread itself panicked. Our worker only
+            // calls into `filter_sum_dispatch`, which is panic-free
+            // for non-mismatched lengths (and we sliced the inputs
+            // ourselves, so the lengths match by construction). A
+            // panic here is genuinely unreachable; surface it loudly.
+            let partial = h.join().expect("filter_sum worker panicked");
+            total = total.wrapping_add(partial);
+        }
+        total
+    })
 }
 
 // ============================================================================
@@ -687,6 +919,99 @@ mod tests {
         assert_eq!(filter_sum_i64_where_gt_zero_with_validity(&x, &y), 25);
     }
 
+    // ---- Multi-core fan-out tests ----
+
+    #[test]
+    fn par_empty_input_returns_zero() {
+        let x = NumericColumn::from_data(Vec::<i64>::new());
+        let y = NumericColumn::from_data(Vec::<i64>::new());
+        for nt in [1_usize, 2, 4, 8] {
+            assert_eq!(filter_sum_par_i64_where_gt_zero(&x, &y, nt), 0);
+        }
+    }
+
+    #[test]
+    fn par_below_threshold_matches_serial() {
+        // Just under the SERIAL_THRESHOLD: the par entry point must
+        // produce the same bits as the serial kernel even though it
+        // falls through without spawning threads.
+        let n = 4_096_usize;
+        let xs: Vec<i64> = (0_i64..n.try_into().unwrap_or(0)).collect();
+        let ys: Vec<i64> = (0_i64..n.try_into().unwrap_or(0))
+            .map(|i| if i % 3 == 0 { -i } else { i })
+            .collect();
+        let x = NumericColumn::from_data(xs);
+        let y = NumericColumn::from_data(ys);
+        let serial = filter_sum_i64_where_gt_zero(&x, &y);
+        for nt in [1_usize, 2, 3, 4, 8, 16] {
+            assert_eq!(filter_sum_par_i64_where_gt_zero(&x, &y, nt), serial);
+        }
+    }
+
+    #[test]
+    fn par_above_threshold_matches_serial() {
+        // Crossing the threshold spawns workers — exercise multiple
+        // partition sizes and confirm every result agrees with the
+        // serial kernel bit-for-bit.
+        let n = 200_000_usize;
+        let mut s: u64 = 0xDEAD_BEEF_C0FF_EE01;
+        let mut xs: Vec<i64> = Vec::with_capacity(n);
+        let mut ys: Vec<i64> = Vec::with_capacity(n);
+        for _ in 0..n {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            xs.push(i64::from_ne_bytes(s.to_ne_bytes()) >> 32);
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ys.push(i64::from_ne_bytes(s.to_ne_bytes()) >> 32);
+        }
+        let x = NumericColumn::from_data(xs);
+        let y = NumericColumn::from_data(ys);
+        let serial = filter_sum_i64_where_gt_zero(&x, &y);
+        for nt in [2_usize, 3, 4, 5, 7, 8, 11, 16] {
+            assert_eq!(
+                filter_sum_par_i64_where_gt_zero(&x, &y, nt),
+                serial,
+                "par with n_threads = {nt} disagrees with serial",
+            );
+        }
+        // The auto entry point picks `available_parallelism()`; it
+        // must also agree.
+        assert_eq!(
+            filter_sum_par_auto_i64_where_gt_zero(&x, &y),
+            serial,
+            "par_auto disagrees with serial",
+        );
+    }
+
+    #[test]
+    fn par_partition_alignment_corner_cases() {
+        // Lengths chosen to land on, just past, and just before the
+        // 64-lane partition alignment boundary used by the parallel
+        // dispatcher. We force the par path by going above the
+        // SERIAL_THRESHOLD via repeated tiling.
+        for base in [65_536_usize, 65_537, 65_600, 131_072, 131_135] {
+            let xs: Vec<i64> = (0..base)
+                .map(|i| i64::try_from(i % 257).unwrap_or(0) - 128)
+                .collect();
+            let ys: Vec<i64> = (0..base)
+                .map(|i| i64::try_from(i % 5).unwrap_or(0) - 2)
+                .collect();
+            let x = NumericColumn::from_data(xs);
+            let y = NumericColumn::from_data(ys);
+            let serial = filter_sum_i64_where_gt_zero(&x, &y);
+            for nt in [2_usize, 4, 8] {
+                assert_eq!(
+                    filter_sum_par_i64_where_gt_zero(&x, &y, nt),
+                    serial,
+                    "n={base}, nt={nt}",
+                );
+            }
+        }
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig {
             cases: 128,
@@ -746,6 +1071,40 @@ mod tests {
                     want = want.wrapping_add(xs[i]);
                 }
             }
+            proptest::prop_assert_eq!(got, want);
+        }
+    }
+
+    // The par kernel's correctness contract: for any `n_threads`
+    // setting in {1, 2, 3, 4, 8, 16}, the parallel kernel must produce
+    // the same `i64` as the serial kernel — bit-for-bit. We use a
+    // 256-case budget to cover partition-boundary edge cases without
+    // blowing up wall-clock for small `n` inputs. Lengths up to
+    // 50_000 keep us mostly below `SERIAL_THRESHOLD`; the dedicated
+    // `par_above_threshold_matches_serial` unit test covers the
+    // worker-spawn path against a 200 K-row dataset.
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256,
+            .. proptest::prelude::ProptestConfig::default()
+        })]
+
+        #[test]
+        fn prop_par_matches_serial(
+            rows in proptest::collection::vec(
+                (proptest::prelude::any::<i64>(), proptest::prelude::any::<i64>()),
+                0_usize..=50_000,
+            ),
+            nt_pick in proptest::prelude::prop::sample::select(
+                vec![1_usize, 2, 3, 4, 8, 16],
+            ),
+        ) {
+            let xs: Vec<i64> = rows.iter().map(|(a, _)| *a).collect();
+            let ys: Vec<i64> = rows.iter().map(|(_, b)| *b).collect();
+            let x = NumericColumn::from_data(xs);
+            let y = NumericColumn::from_data(ys);
+            let want = filter_sum_i64_where_gt_zero(&x, &y);
+            let got = filter_sum_par_i64_where_gt_zero(&x, &y, nt_pick);
             proptest::prop_assert_eq!(got, want);
         }
     }

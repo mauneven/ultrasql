@@ -27,7 +27,8 @@ pub use filter::{
 };
 pub use filter_sum::{
     filter_sum_i64_where_gt_zero, filter_sum_i64_where_gt_zero_scalar,
-    filter_sum_i64_where_gt_zero_with_validity,
+    filter_sum_i64_where_gt_zero_with_validity, filter_sum_par_auto_i64_where_gt_zero,
+    filter_sum_par_i64_where_gt_zero,
 };
 pub use hash::{hash_i64, hash_i64_scalar, hash_text_bytes, hash_text_bytes_scalar};
 
