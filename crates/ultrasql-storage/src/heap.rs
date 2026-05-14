@@ -1296,8 +1296,12 @@ impl<L: PageLoader> HeapAccess<L> {
             current_block: 0,
             current_slot: 0,
             slot_count: 0,
-            current_guard: None,
-            scratch: Vec::with_capacity(64),
+            // Per-block bulk page copy: PAGE_SIZE bytes preallocated
+            // once so the per-block `extend_from_slice(page_bytes)`
+            // never reallocates. The previous per-slot read-lock /
+            // tuple-copy cycle is replaced with one read-lock /
+            // 8 KiB memcpy per block.
+            page_scratch: Vec::with_capacity(ultrasql_core::constants::PAGE_SIZE),
             snapshot,
             oracle,
             xmin_cache: None,
@@ -2122,15 +2126,21 @@ pub struct VisibleHeapWalker<'a, L: PageLoader, O: XidStatusOracle + ?Sized> {
     current_block: u32,
     current_slot: u16,
     slot_count: u16,
-    /// Pin for the current block. Held across every slot read on the
-    /// page; dropped on block transition so the frame becomes
-    /// eligible for eviction again.
-    current_guard: Option<PageGuard<L>>,
-    /// Reusable buffer holding the most-recent slot's bytes (header +
-    /// payload). `clear`-then-`extend_from_slice` per slot reuses the
-    /// allocation; capacity grows past the preallocated 64 bytes
-    /// once and then stays constant.
-    scratch: Vec<u8>,
+    /// `PAGE_SIZE` (8 KiB) buffer holding the most-recent **whole**
+    /// block's bytes. On block transition the walker pins the page
+    /// once, acquires the per-frame read lock once, memcpys the 8 KiB
+    /// page into this scratch, then drops the lock and the pin. Every
+    /// per-slot read then walks the slot directory inside this
+    /// buffer with no further lock acquires.
+    ///
+    /// The bulk copy is semantically equivalent to per-slot reads
+    /// under a fixed snapshot: visibility decisions depend on
+    /// `(header, snapshot, oracle.status(xid))`, all of which are
+    /// monotone or fixed across the scan. A writer that mutates the
+    /// page after our copy is seen by subsequent blocks but not by
+    /// the current one — the same point-in-time view a per-slot
+    /// reader would observe at its read time.
+    page_scratch: Vec<u8>,
     snapshot: &'a Snapshot,
     oracle: &'a O,
     /// Same `(xmin, infomask, visibility)` cache as `VisibleHeapScan`.
@@ -2159,13 +2169,16 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
     pub fn try_next(&mut self) -> Result<Option<(TupleId, TupleHeader, &[u8])>, HeapError> {
         loop {
             if self.current_block >= self.block_count {
-                self.current_guard = None;
                 return Ok(None);
             }
 
             let page_id = PageId::new(self.rel, BlockNumber::new(self.current_block));
 
-            if self.current_guard.is_none() {
+            // Block transition: pin + read-lock + memcpy 8 KiB to
+            // scratch, then drop both lock and pin. Subsequent slot
+            // reads work entirely off the local scratch buffer with
+            // no further lock acquires.
+            if self.page_scratch.is_empty() {
                 let guard = match self.pool.get_page(page_id) {
                     Ok(g) => g,
                     Err(e) => {
@@ -2174,13 +2187,20 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
                         return Err(HeapError::from(e));
                     }
                 };
-                self.slot_count = guard.read().header().slot_count();
+                {
+                    let page = guard.read();
+                    self.slot_count = page.header().slot_count();
+                    self.page_scratch.clear();
+                    self.page_scratch
+                        .extend_from_slice(page.as_bytes().as_slice());
+                }
                 self.current_slot = 0;
-                self.current_guard = Some(guard);
+                drop(guard);
             }
 
             if self.current_slot >= self.slot_count {
-                self.current_guard = None;
+                // Free the page buffer for the next block's memcpy.
+                self.page_scratch.clear();
                 self.current_block = self.current_block.saturating_add(1);
                 self.current_slot = 0;
                 continue;
@@ -2189,34 +2209,37 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
             let slot = self.current_slot;
             self.current_slot += 1;
 
-            // Copy this slot's bytes into the reusable scratch buffer
-            // under the per-frame read lock, then drop the lock. The
-            // copy is a single small memcpy; the `Vec::extend_from_slice`
-            // never reallocates after the first iteration.
-            let copy_ok = {
-                let guard = self
-                    .current_guard
-                    .as_ref()
-                    .expect("guard set above before slot read");
-                let page = guard.read();
-                match page.read_tuple(slot) {
-                    Ok(bytes) => {
-                        self.scratch.clear();
-                        self.scratch.extend_from_slice(bytes);
-                        true
-                    }
-                    Err(PageError::DeadSlot(_) | PageError::InvalidSlot { .. }) => false,
-                    Err(e) => return Err(HeapError::from(e)),
-                }
-            };
-            if !copy_ok {
+            // Parse the slot directory entry from the cached page
+            // bytes. The item-id layout matches `page::ItemId`:
+            //   bits 0..2   flags (1 = Normal)
+            //   bits 2..17  length (15 bits)
+            //   bits 17..32 offset (15 bits)
+            let item_id_off = ultrasql_storage_page_item_id_offset(slot);
+            // `item_id_off + 4 <= PAGE_HEADER_SIZE + slot_count * 4 <= PAGE_SIZE`
+            // because `slot < slot_count` guards the high bound and
+            // `page_scratch` always holds a full page.
+            let raw = u32::from_le_bytes([
+                self.page_scratch[item_id_off],
+                self.page_scratch[item_id_off + 1],
+                self.page_scratch[item_id_off + 2],
+                self.page_scratch[item_id_off + 3],
+            ]);
+            let flags = raw & 0b11;
+            // ItemIdFlags::Normal == 1; skip Unused / Dead / Redirect.
+            if flags != 1 {
                 continue;
             }
-
-            if self.scratch.len() < TUPLE_HEADER_SIZE {
+            let length = ((raw >> 2) & 0x7FFF) as usize;
+            let offset = ((raw >> 17) & 0x7FFF) as usize;
+            if length < TUPLE_HEADER_SIZE
+                || offset
+                    .checked_add(length)
+                    .is_none_or(|end| end > self.page_scratch.len())
+            {
                 return Err(HeapError::MalformedHeader("slot shorter than header"));
             }
-            let (header, _) = TupleHeader::decode(&self.scratch[..TUPLE_HEADER_SIZE])
+            let slot_bytes = &self.page_scratch[offset..offset + length];
+            let (header, _) = TupleHeader::decode(&slot_bytes[..TUPLE_HEADER_SIZE])
                 .ok_or(HeapError::MalformedHeader("header decode failed"))?;
 
             let visible = if header.xmax.is_invalid() {
@@ -2252,10 +2275,21 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
             }
 
             let tid = TupleId::new(page_id, slot);
-            let payload = &self.scratch[TUPLE_HEADER_SIZE..];
+            // Payload is the bytes after the tuple header within the
+            // slot window we already validated above.
+            let payload = &self.page_scratch[offset + TUPLE_HEADER_SIZE..offset + length];
             return Ok(Some((tid, header, payload)));
         }
     }
+}
+
+/// `PAGE_HEADER_SIZE + slot * ITEMID_SIZE` — mirrors
+/// `crate::page::Page::item_id_offset` which is currently
+/// `pub(crate)`-private and so unreachable from the walker's
+/// inline slot-dir parse.
+#[inline]
+const fn ultrasql_storage_page_item_id_offset(slot: u16) -> usize {
+    crate::page::PAGE_HEADER_SIZE + (slot as usize) * crate::page::ITEMID_SIZE
 }
 
 impl<L: PageLoader, O: XidStatusOracle + ?Sized> Iterator for VisibleHeapScan<'_, L, O> {
