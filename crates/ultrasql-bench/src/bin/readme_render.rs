@@ -421,17 +421,29 @@ fn load_baselines(dir: &Path) -> Result<HashMap<String, BaselineEntry>> {
     Ok(merged)
 }
 
-/// Attempt to read `results/latest/results.json` and overlay any non-zero
-/// UltraSQL `median_us` values into the existing baseline map.
+/// Attempt to read `results/latest/results.json` and:
+/// - overlay non-zero UltraSQL `median_us` values into the baseline map, and
+/// - extract write-side competitor rows into `write_side` for the four
+///   write-benchmark README markers.
 ///
 /// The `results.json` schema is:
 /// ```json
 /// { "workloads": { "<name>": { "engines": [ {"rank":1,"engine":"ultrasql","median_us":…} ] } } }
 /// ```
 ///
+/// Write-side workload names in `results.json` map to README benchmark ids:
+/// - `insert_throughput_10k`  → `insert_throughput_10k`
+/// - `update_throughput_10k`  → `update_throughput_10k`
+/// - `delete_throughput_10k`  → `delete_throughput_10k`
+/// - `mixed_oltp_pgbench_like` → `mixed_oltp_pgbench_like`
+///
 /// This function is best-effort: if the file is absent, empty, or malformed,
-/// it logs a message on stderr and returns without modifying `baseline`.
-fn merge_latest_results(path: &Path, baseline: &mut HashMap<String, BaselineEntry>) {
+/// it logs a message on stderr and returns without modifying either map.
+fn merge_latest_results(
+    path: &Path,
+    baseline: &mut HashMap<String, BaselineEntry>,
+    write_side: &mut HashMap<String, Vec<(String, f64)>>,
+) {
     if !path.exists() {
         return;
     }
@@ -452,14 +464,24 @@ fn merge_latest_results(path: &Path, baseline: &mut HashMap<String, BaselineEntr
 
     // Map workload names in results.json to benchmark IDs used by the README.
     // Only map workloads that have a direct README marker counterpart.
-    let workload_to_bench_id: &[(&str, &str)] =
+    let read_workload_map: &[(&str, &str)] =
         &[("sum", "select_sum_65k_i64"), ("avg", "select_avg_10m_i64")];
+
+    // Write-side workloads: the workload name in results.json is the same as
+    // the README benchmark id.
+    let write_workload_ids: &[&str] = &[
+        "insert_throughput_10k",
+        "update_throughput_10k",
+        "delete_throughput_10k",
+        "mixed_oltp_pgbench_like",
+    ];
 
     let Some(workloads) = doc.get("workloads").and_then(|v| v.as_object()) else {
         return;
     };
 
-    for (workload_name, bench_id) in workload_to_bench_id {
+    // --- Read-side: overlay UltraSQL baseline values ---
+    for (workload_name, bench_id) in read_workload_map {
         let Some(wl) = workloads.get(*workload_name) else {
             continue;
         };
@@ -490,6 +512,37 @@ fn merge_latest_results(path: &Path, baseline: &mut HashMap<String, BaselineEntr
             break;
         }
     }
+
+    // --- Write-side: extract all engine rows ranked by median_us ---
+    for bench_id in write_workload_ids {
+        let Some(wl) = workloads.get(*bench_id) else {
+            continue;
+        };
+        let Some(engines_arr) = wl.get("engines").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let mut rows: Vec<(String, f64)> = engines_arr
+            .iter()
+            .filter_map(|e| {
+                let name = e.get("engine").and_then(|v| v.as_str())?;
+                let median_us = e.get("median_us").and_then(|v| v.as_f64())?;
+                if median_us <= 0.0 {
+                    return None;
+                }
+                Some((name.to_string(), median_us))
+            })
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        // Sort ascending by median (best first).
+        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!(
+            "readme-render: write-side {bench_id} — {} engines from latest results",
+            rows.len()
+        );
+        write_side.insert((*bench_id).to_string(), rows);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -500,20 +553,27 @@ fn merge_latest_results(path: &Path, baseline: &mut HashMap<String, BaselineEntr
 /// benchmark ids.
 ///
 /// For each id in `STATIC_DEFAULTS`:
-/// - If the baseline has a non-zero `p99_us` for UltraSQL, the baseline row
-///   replaces the static default for the UltraSQL row.
-/// - Competitor values in the baseline are preferred over static defaults when
-///   non-zero.
-/// - When all relevant values are zero (i.e. no baseline data), the static
-///   defaults are used verbatim.
-fn build_tables(baseline: &HashMap<String, BaselineEntry>) -> HashMap<String, String> {
+/// - Read-side benchmarks (non-empty `rows`): UltraSQL row is overridden from
+///   `baseline` when a non-zero `p99_us` is available; competitor rows use the
+///   static defaults.
+/// - Write-side benchmarks (empty `rows`): if `write_side` contains measured
+///   data for the id, those rows are used verbatim. Otherwise the table falls
+///   back to the "not yet measured" notice.
+fn build_tables(
+    baseline: &HashMap<String, BaselineEntry>,
+    write_side: &HashMap<String, Vec<(String, f64)>>,
+) -> HashMap<String, String> {
     let mut tables = HashMap::new();
 
     for static_table in STATIC_DEFAULTS {
         // Build the row list, preferring baseline data where available.
         let rows: Vec<(String, f64)> = if static_table.rows.is_empty() {
-            // Write-side benchmarks: no data yet.
-            Vec::new()
+            // Write-side benchmarks: use latest measured rows when available.
+            if let Some(measured) = write_side.get(static_table.id) {
+                measured.clone()
+            } else {
+                Vec::new()
+            }
         } else {
             static_table
                 .rows
@@ -603,11 +663,13 @@ pub fn run(
     check: bool,
 ) -> Result<bool> {
     let mut baseline = load_baselines(baselines_path)?;
+    // Write-side competitor rows extracted from the latest results.json.
+    let mut write_side: HashMap<String, Vec<(String, f64)>> = HashMap::new();
     // Overlay values from the most-recent run when the file exists and
     // contains non-zero UltraSQL latencies. The latest run takes
     // precedence over the stage-gate baselines.
-    merge_latest_results(latest_results_path, &mut baseline);
-    let tables = build_tables(&baseline);
+    merge_latest_results(latest_results_path, &mut baseline, &mut write_side);
+    let tables = build_tables(&baseline, &write_side);
 
     let original = std::fs::read_to_string(readme_path)
         .with_context(|| format!("read README at {}", readme_path.display()))?;
@@ -797,7 +859,7 @@ rest\n";
             },
         );
 
-        let tables = build_tables(&baseline);
+        let tables = build_tables(&baseline, &HashMap::new());
         let table = tables
             .get("select_sum_65k_i64")
             .expect("select_sum_65k_i64 must be in tables");
@@ -859,7 +921,7 @@ rest\n";
     /// string so no marker block is silently left empty.
     #[test]
     fn static_defaults_cover_known_ids() {
-        let tables = build_tables(&HashMap::new());
+        let tables = build_tables(&HashMap::new(), &HashMap::new());
         for st in STATIC_DEFAULTS {
             let table = tables.get(st.id).expect("missing table for static id");
             assert!(!table.is_empty(), "table for {} must not be empty", st.id);
@@ -886,7 +948,7 @@ rest\n";
             },
         );
 
-        let tables = build_tables(&baseline);
+        let tables = build_tables(&baseline, &HashMap::new());
         let table = tables
             .get("filter_sum_10m_i64")
             .expect("filter_sum_10m_i64 must be present in tables");

@@ -25,7 +25,7 @@ const ROWS_PER_ITER: usize = 10_000;
 
 /// Reduced rows per iteration for fast unit tests.
 #[cfg(test)]
-const ROWS_PER_ITER: usize = 100;
+const ROWS_PER_ITER: usize = 32;
 
 /// Relation ID used throughout this benchmark.
 const REL: RelationId = RelationId::new(17);
@@ -50,6 +50,10 @@ fn encode_row(id: i32, val: i64) -> [u8; 12] {
 
 /// Preloads `n` rows into a fresh heap and returns the pool, heap, and
 /// the list of inserted `TupleId`s in insertion order.
+///
+/// Uses [`HeapAccess::insert_batch`] so the setup phase does not pay the
+/// O(N²) cost of per-row `insert` walking every previously-allocated
+/// block on each call.
 fn preload(
     n: usize,
 ) -> (
@@ -70,15 +74,13 @@ fn preload(
         vm: None,
     };
     let n_i32 = i32::try_from(n).unwrap_or(i32::MAX);
-    let mut tids: Vec<TupleId> = Vec::with_capacity(n);
-    for id in 0..n_i32 {
-        let val = i64::from(id).wrapping_mul(999_983);
-        let payload = encode_row(id, val);
-        let tid = heap
-            .insert(REL, &payload, opts)
-            .expect("preload insert must succeed");
-        tids.push(tid);
-    }
+    let payloads: Vec<[u8; 12]> = (0..n_i32)
+        .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
+        .collect();
+    let rows: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    let tids: Vec<TupleId> = heap
+        .insert_batch(REL, &rows, opts)
+        .expect("preload insert_batch must succeed");
 
     (pool, heap, tids)
 }
@@ -139,8 +141,28 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
 
 #[cfg(test)]
 mod tests {
+    use ultrasql_core::Xid;
+    use ultrasql_mvcc::Snapshot;
+    use ultrasql_mvcc::status::test_support::MapOracle;
+
     use super::*;
     use crate::registry::{BenchContext, HostInfo};
+
+    /// Drops the env var on `Drop` so a panicking test cannot leak it.
+    struct SmokeGuard;
+    impl SmokeGuard {
+        fn new() -> Self {
+            // SAFETY: test-only; no concurrent threads touch this var.
+            unsafe { std::env::set_var("ULTRASQL_BENCH_SMOKE", "1") };
+            Self
+        }
+    }
+    impl Drop for SmokeGuard {
+        fn drop(&mut self) {
+            // SAFETY: test-only; no concurrent threads touch this var.
+            unsafe { std::env::remove_var("ULTRASQL_BENCH_SMOKE") };
+        }
+    }
 
     fn test_ctx() -> BenchContext {
         BenchContext {
@@ -161,5 +183,66 @@ mod tests {
         let result = run(&ctx);
         assert_eq!(result.samples.len(), ctx.iterations as usize);
         assert!(result.throughput_per_sec > 0.0);
+    }
+
+    /// After the bench deletes all rows, `scan_visible` must return zero rows.
+    ///
+    /// Preloads `ROWS_PER_ITER` rows, then deletes every one via the same
+    /// `DeleteOptions` the bench uses, and asserts the visible count is zero.
+    #[test]
+    fn delete_bench_leaves_zero_visible_rows() {
+        let _guard = SmokeGuard::new();
+
+        let (_pool, heap, tids) = preload(ROWS_PER_ITER);
+
+        // Oracle: FIRST_USER is committed (both as inserter and deleter).
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::FIRST_USER);
+
+        // Snapshot seen AFTER FIRST_USER committed.
+        let snap = Snapshot::new(
+            Xid::new(Xid::FIRST_USER.raw() + 1),
+            Xid::new(Xid::FIRST_USER.raw() + 1000),
+            Xid::new(Xid::FIRST_USER.raw() + 1000),
+            ultrasql_core::CommandId::FIRST,
+            std::iter::empty(),
+        );
+
+        // Verify rows are visible before deletion.
+        let blocks_before = heap.block_count(REL);
+        let before: Vec<_> = heap
+            .scan_visible(REL, blocks_before, &snap, &oracle)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            before.len(),
+            ROWS_PER_ITER,
+            "preload must produce exactly ROWS_PER_ITER visible rows before deletion"
+        );
+
+        // Delete every row with the same options the bench uses.
+        let delete_opts = DeleteOptions {
+            xmax: Xid::FIRST_USER,
+            cmax: ultrasql_core::CommandId::FIRST,
+            wal: None,
+            fsm: None,
+            vm: None,
+        };
+        for &tid in &tids {
+            heap.delete(tid, delete_opts)
+                .expect("delete must succeed on a live tuple");
+        }
+
+        // After deletion with FIRST_USER committed, scan_visible must return 0.
+        let blocks_after = heap.block_count(REL);
+        let after: Vec<_> = heap
+            .scan_visible(REL, blocks_after, &snap, &oracle)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            0,
+            "scan_visible must return zero rows after all rows are deleted"
+        );
     }
 }

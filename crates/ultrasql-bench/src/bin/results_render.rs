@@ -549,6 +549,119 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // results_render_skips_not_available_rows
+    // -----------------------------------------------------------------------
+
+    /// When one engine file carries `{"engine":"x","status":"not_available"}`,
+    /// the renderer must skip that file and exclude it from the Markdown table.
+    #[test]
+    fn results_render_skips_not_available_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Normal engine record.
+        let good = r#"{
+            "workload": "insert_throughput_10k",
+            "n_rows": 10000,
+            "samples": 8,
+            "median_us": 5000.0,
+            "min_us": 4900.0,
+            "iterations_us": [4900.0, 5000.0, 5100.0],
+            "answer": "inserted=10000"
+        }"#;
+        std::fs::write(dir.path().join("insert_throughput_10k-ultrasql.json"), good)
+            .expect("write ultrasql record");
+
+        // Unavailable engine record — must be skipped.
+        let na = r#"{"engine":"postgres17","status":"not_available","workload":"insert_throughput_10k"}"#;
+        std::fs::write(dir.path().join("insert_throughput_10k-postgres17.json"), na)
+            .expect("write not_available record");
+
+        // load_raw_dir should fail to deserialize the not_available record
+        // (it lacks `median_us`) and skip it with a warning.
+        let mut by_workload = load_raw_dir(dir.path()).expect("load_raw_dir");
+        for results in by_workload.values_mut() {
+            rank_engines(results);
+        }
+
+        let md = render_md(&by_workload);
+        // The good engine must appear.
+        assert!(md.contains("ultrasql"), "ultrasql row must be present");
+        // The not_available engine must not appear as a table row.
+        assert!(
+            !md.contains("postgres17"),
+            "not_available engine must be absent from rendered table: {md}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // results_render_orders_by_median_ascending
+    // -----------------------------------------------------------------------
+
+    /// When UltraSQL has a lower median than a competitor, it must appear
+    /// first (rank 1) in the rendered output.
+    #[test]
+    fn results_render_orders_by_median_ascending() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // UltraSQL: fast.
+        let ultra = r#"{
+            "workload": "insert_throughput_10k",
+            "n_rows": 10000,
+            "samples": 8,
+            "median_us": 500.0,
+            "min_us": 490.0,
+            "iterations_us": [490.0, 500.0, 510.0],
+            "answer": "inserted=10000"
+        }"#;
+        std::fs::write(
+            dir.path().join("insert_throughput_10k-ultrasql.json"),
+            ultra,
+        )
+        .expect("write ultrasql record");
+
+        // Competitor: slow.
+        let pg = r#"{
+            "workload": "insert_throughput_10k",
+            "n_rows": 10000,
+            "samples": 8,
+            "median_us": 50000.0,
+            "min_us": 49000.0,
+            "iterations_us": [49000.0, 50000.0, 51000.0],
+            "answer": "inserted=10000"
+        }"#;
+        std::fs::write(dir.path().join("insert_throughput_10k-postgres17.json"), pg)
+            .expect("write postgres record");
+
+        let mut by_workload = load_raw_dir(dir.path()).expect("load_raw_dir");
+        for results in by_workload.values_mut() {
+            rank_engines(results);
+        }
+
+        let json_str = render_json(&by_workload).expect("render_json");
+        let json: serde_json::Value = serde_json::from_str(&json_str).expect("parse json");
+        let engines = &json["workloads"]["insert_throughput_10k"]["engines"];
+        assert!(engines.is_array(), "engines must be an array");
+
+        let rank1 = &engines[0];
+        let rank2 = &engines[1];
+        assert_eq!(rank1["rank"], 1, "rank1 must be 1");
+        assert_eq!(
+            rank1["engine"], "ultrasql",
+            "ultrasql (lower median) must be rank 1"
+        );
+        assert_eq!(rank2["rank"], 2, "rank2 must be 2");
+        assert_eq!(
+            rank2["engine"], "postgres17",
+            "postgres17 (higher median) must be rank 2"
+        );
+        assert!(
+            rank1["median_us"].as_f64().unwrap_or(f64::MAX)
+                < rank2["median_us"].as_f64().unwrap_or(0.0),
+            "rank 1 median must be smaller than rank 2 median"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Rank ordering in JSON output
     // -----------------------------------------------------------------------
 

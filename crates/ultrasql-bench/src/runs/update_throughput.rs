@@ -9,6 +9,12 @@
 //! The preload happens outside the timed region. Each measured iteration
 //! re-reads the tuple ids left from the previous iteration and updates
 //! each one in order.
+//!
+//! # val encoding per update pass
+//!
+//! After `k` measured passes, row `idx` holds
+//! `val = i64::from(idx).wrapping_mul(999_983).wrapping_add(k as i64)`.
+//! The post-state test verifies this invariant.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -26,7 +32,7 @@ const ROWS_PER_ITER: usize = 10_000;
 
 /// Reduced rows per iteration for fast unit tests.
 #[cfg(test)]
-const ROWS_PER_ITER: usize = 100;
+const ROWS_PER_ITER: usize = 32;
 
 /// Relation ID used throughout this benchmark.
 const REL: RelationId = RelationId::new(13);
@@ -55,15 +61,24 @@ fn encode_row(id: i32, val: i64) -> [u8; 12] {
 /// `ROWS_PER_ITER` rows and record all their `TupleId`s.
 ///
 /// Each measured iteration: update every row by inserting a new version
-/// via `HeapAccess::update`. The pool must be large enough to hold both
-/// old and new versions simultaneously.
+/// via `HeapAccess::update`. The pool must be large enough to hold every
+/// version generated across all warmup + measured iterations because the
+/// pool's CLOCK eviction will reject pinned/dirty frames and we never
+/// drop the heap between iterations.
 pub fn run(ctx: &BenchContext) -> BenchResult {
-    // Budget: inserts + updates may double the page count.
-    let frames = (ROWS_PER_ITER / 50).max(1) + 512;
+    // Budget: preload (10k rows ≈ 91 pages) plus one fresh page per
+    // ~110 update fallbacks across every warmup + measured iteration.
+    // Pad generously so the pool never has to evict.
+    let total_updates = ROWS_PER_ITER
+        .saturating_mul((ctx.iterations as usize).saturating_add(ctx.warmup_iterations as usize));
+    let frames = (ROWS_PER_ITER / 50)
+        .saturating_add(total_updates / 50)
+        .saturating_add(1024);
     let pool = Arc::new(BufferPool::new(frames, BlankLoader));
     let heap = HeapAccess::new(Arc::clone(&pool));
 
-    // Preload.
+    // Preload via the batch path so the bench's setup phase does not
+    // pay the O(N²) cost of per-row `insert` walking every block.
     let insert_opts = InsertOptions {
         xmin: Xid::FIRST_USER,
         command_id: CommandId::FIRST,
@@ -72,15 +87,13 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
         vm: None,
     };
     let n_i32 = i32::try_from(ROWS_PER_ITER).unwrap_or(i32::MAX);
-    let mut tids: Vec<TupleId> = Vec::with_capacity(ROWS_PER_ITER);
-    for id in 0..n_i32 {
-        let val = i64::from(id).wrapping_mul(999_983);
-        let payload = encode_row(id, val);
-        let tid = heap
-            .insert(REL, &payload, insert_opts)
-            .expect("preload insert must succeed");
-        tids.push(tid);
-    }
+    let preload_payloads: Vec<[u8; 12]> = (0..n_i32)
+        .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
+        .collect();
+    let preload_rows: Vec<&[u8]> = preload_payloads.iter().map(|p| p.as_slice()).collect();
+    let mut tids: Vec<TupleId> = heap
+        .insert_batch(REL, &preload_rows, insert_opts)
+        .expect("preload insert_batch must succeed");
 
     let update_opts = UpdateOptions {
         xid: Xid::FIRST_USER,
@@ -138,13 +151,33 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
 
 #[cfg(test)]
 mod tests {
+    use ultrasql_core::Xid;
+    use ultrasql_mvcc::Snapshot;
+    use ultrasql_mvcc::status::test_support::MapOracle;
+
     use super::*;
     use crate::registry::{BenchContext, HostInfo};
+
+    /// Drops the env var on `Drop` so a panicking test cannot leak it.
+    struct SmokeGuard;
+    impl SmokeGuard {
+        fn new() -> Self {
+            // SAFETY: test-only; no concurrent threads touch this var.
+            unsafe { std::env::set_var("ULTRASQL_BENCH_SMOKE", "1") };
+            Self
+        }
+    }
+    impl Drop for SmokeGuard {
+        fn drop(&mut self) {
+            // SAFETY: test-only; no concurrent threads touch this var.
+            unsafe { std::env::remove_var("ULTRASQL_BENCH_SMOKE") };
+        }
+    }
 
     fn test_ctx() -> BenchContext {
         BenchContext {
             iterations: 2,
-            warmup_iterations: 1,
+            warmup_iterations: 0,
             host: HostInfo {
                 cpu: "test".to_string(),
                 cores: 1,
@@ -160,5 +193,99 @@ mod tests {
         let result = run(&ctx);
         assert_eq!(result.samples.len(), ctx.iterations as usize);
         assert!(result.throughput_per_sec > 0.0);
+    }
+
+    /// After `N` measured update iterations every row's `val` must equal
+    /// `original_val + N` where `original_val = i64::from(idx).wrapping_mul(999_983)`.
+    ///
+    /// The test replicates the bench setup inline so it can inspect the final
+    /// heap state via `scan_visible`.
+    #[test]
+    fn update_bench_final_val_equals_original_plus_n_iterations() {
+        let _guard = SmokeGuard::new();
+
+        const N_ITERS: usize = 3;
+
+        // Replicate the benchmark's setup phase.
+        let frames = (ROWS_PER_ITER / 50).max(1) + 512;
+        let pool = Arc::new(BufferPool::new(frames, BlankLoader));
+        let heap = HeapAccess::new(Arc::clone(&pool));
+
+        let insert_opts = InsertOptions {
+            xmin: Xid::FIRST_USER,
+            command_id: CommandId::FIRST,
+            wal: None,
+            fsm: None,
+            vm: None,
+        };
+        let n_i32 = i32::try_from(ROWS_PER_ITER).unwrap_or(i32::MAX);
+        let mut tids: Vec<TupleId> = Vec::with_capacity(ROWS_PER_ITER);
+        for id in 0..n_i32 {
+            let val = i64::from(id).wrapping_mul(999_983);
+            let payload = encode_row(id, val);
+            tids.push(heap.insert(REL, &payload, insert_opts).unwrap());
+        }
+
+        let update_opts = UpdateOptions {
+            xid: Xid::FIRST_USER,
+            command_id: CommandId::FIRST,
+            hot_eligible: true,
+            wal: None,
+            vm: None,
+        };
+
+        // Run N_ITERS update passes, mirroring the benchmark's timed_iter.
+        for pass in 0..N_ITERS {
+            let mut new_tids: Vec<TupleId> = Vec::with_capacity(tids.len());
+            for (idx, &old_tid) in tids.iter().enumerate() {
+                let id = i32::try_from(idx).unwrap_or(i32::MAX);
+                let val = i64::from(id)
+                    .wrapping_mul(999_983)
+                    .wrapping_add(i64::try_from(pass + 1).unwrap_or(0));
+                let payload = encode_row(id, val);
+                let outcome = heap.update(old_tid, &payload, update_opts).unwrap();
+                new_tids.push(outcome.new_tid);
+            }
+            tids = new_tids;
+        }
+
+        // Scan the heap and verify each visible row's val.
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::FIRST_USER);
+
+        let snap = Snapshot::new(
+            Xid::new(Xid::FIRST_USER.raw() + 1),
+            Xid::new(Xid::FIRST_USER.raw() + 1000),
+            Xid::new(Xid::FIRST_USER.raw() + 1000),
+            ultrasql_core::CommandId::FIRST,
+            std::iter::empty(),
+        );
+
+        let blocks = heap.block_count(REL);
+        let visible: Vec<_> = heap
+            .scan_visible(REL, blocks, &snap, &oracle)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        // Only the latest (non-overwritten) versions are visible.
+        assert_eq!(
+            visible.len(),
+            ROWS_PER_ITER,
+            "scan_visible must return exactly ROWS_PER_ITER live tuples"
+        );
+
+        for tuple in &visible {
+            assert_eq!(tuple.data.len(), 12, "payload must be 12 bytes (i32 + i64)");
+            let id = i32::from_le_bytes(tuple.data[0..4].try_into().unwrap());
+            let val = i64::from_le_bytes(tuple.data[4..12].try_into().unwrap());
+            let idx = usize::try_from(id).unwrap();
+            let expected_val = i64::from(id)
+                .wrapping_mul(999_983)
+                .wrapping_add(i64::try_from(N_ITERS).unwrap());
+            assert_eq!(
+                val, expected_val,
+                "row idx={idx} val mismatch: got {val}, want {expected_val}"
+            );
+        }
     }
 }

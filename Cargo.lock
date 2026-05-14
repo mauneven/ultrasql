@@ -2503,6 +2503,7 @@ dependencies = [
  "tracing-subscriber",
  "ultrasql-core",
  "ultrasql-executor",
+ "ultrasql-mvcc",
  "ultrasql-planner",
  "ultrasql-protocol",
  "ultrasql-storage",

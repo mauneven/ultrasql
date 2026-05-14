@@ -88,5 +88,6 @@ chrono            = { workspace = true, optional = true }
 
 [dev-dependencies]
 ultrasql-executor = { workspace = true }
+ultrasql-mvcc     = { workspace = true, features = ["testing"] }
 ultrasql-planner  = { workspace = true }
 criterion         = { workspace = true }

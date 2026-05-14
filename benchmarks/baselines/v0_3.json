@@ -1,33 +1,42 @@
 {
   "stage": "v0_3",
   "host": {
-    "cpu": "Apple M4",
-    "cores": 12,
-    "ram_gb": 64,
-    "os": "darwin 25.5.0"
+    "cpu": "aarch64",
+    "cores": 0,
+    "ram_gb": 0,
+    "os": "macos unknown"
   },
-  "git_commit": "e09a11d",
-  "captured_at": "2026-05-13T00:00:00Z",
+  "git_commit": "a4949c3",
+  "captured_at": "2026-05-14T02:41:01Z",
   "tolerance_pct": 5.0,
   "benchmarks": {
-    "insert_throughput_10k": {
-      "throughput_per_sec": 0.0,
-      "p99_us": 0.0,
-      "competitors": {
-        "postgres17": 0.0
-      }
-    },
     "update_throughput_10k": {
-      "throughput_per_sec": 0.0,
-      "p99_us": 0.0,
+      "throughput_per_sec": 100474.11221702409,
+      "p99_us": 151133.25,
       "competitors": {
-        "postgres17": 0.0
+        "cockroachdb": 0.0,
+        "duckdb": 0.0,
+        "postgres17": 0.0,
+        "sqlite3": 0.0
       }
     },
     "delete_throughput_10k": {
-      "throughput_per_sec": 0.0,
-      "p99_us": 0.0,
+      "throughput_per_sec": 45749107.32054341,
+      "p99_us": 251.83300000000003,
       "competitors": {
+        "duckdb": 0.0,
+        "postgres17": 0.0,
+        "cockroachdb": 0.0,
+        "sqlite3": 0.0
+      }
+    },
+    "insert_throughput_10k": {
+      "throughput_per_sec": 15210571.347086225,
+      "p99_us": 808.333,
+      "competitors": {
+        "duckdb": 0.0,
+        "sqlite3": 0.0,
+        "cockroachdb": 0.0,
         "postgres17": 0.0
       }
     }

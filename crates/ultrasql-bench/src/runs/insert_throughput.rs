@@ -10,9 +10,17 @@
 //! The pool-creation cost is included in the timed region because it
 //! corresponds to `CREATE TABLE` cost and is small compared to the
 //! inserts at 10 000 rows.
+//!
+//! # Setup / run split
+//!
+//! [`setup`] allocates a fresh pool and inserts `n` rows; the result is
+//! kept alive in [`SetupState`] so tests can call [`HeapAccess::scan_visible`]
+//! to verify the post-state.  [`run_one_iter`] times a *fresh* pool + insert
+//! batch per call — this matches the benchmark's "empty table" signal.
+//! [`run`] calls both in the right order.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ultrasql_core::{CommandId, PageId, RelationId, Xid};
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
@@ -27,7 +35,7 @@ const PROD_ROWS_PER_ITER: usize = 10_000;
 
 /// Reduced rows per iteration for fast unit tests.
 #[cfg(test)]
-const TEST_ROWS_PER_ITER: usize = 100;
+const TEST_ROWS_PER_ITER: usize = 32;
 
 /// Smoke-mode rows per iteration (used when `ULTRASQL_BENCH_SMOKE` is set).
 #[allow(dead_code)] // used only in non-test builds via smoke_row_count
@@ -37,8 +45,11 @@ const SMOKE_ROWS_PER_ITER: usize = 50;
 const REL: RelationId = RelationId::new(11);
 
 /// In-memory buffer-pool loader.
+///
+/// Must be `pub(crate)` so [`SetupState`]'s type parameters are visible at
+/// the same scope as the struct.
 #[derive(Debug, Default)]
-struct BlankLoader;
+pub(crate) struct BlankLoader;
 
 impl PageLoader for BlankLoader {
     fn load(&self, _page_id: PageId) -> ultrasql_core::Result<Page> {
@@ -54,14 +65,27 @@ fn encode_row(id: i32, val: i64) -> [u8; 12] {
     buf
 }
 
-/// Runs one insert iteration: fresh pool + `n` inserts.
+/// Heap state produced by [`setup`] and consumed by [`run_one_iter`].
 ///
-/// Returns elapsed microseconds.
-fn run_one_iteration(n: usize) -> f64 {
-    // Size the pool to avoid eviction: ~110 rows per 8 KiB page.
-    let frames = (n / 100).max(1) + 128;
-    let t0 = Instant::now();
+/// The pool and heap are kept alive here so tests can verify the post-state
+/// via [`HeapAccess::scan_visible`] after [`setup`] returns.
+pub(crate) struct SetupState {
+    /// Number of rows inserted during setup.
+    pub(crate) rows: usize,
+    /// Pool that backs `heap`; kept alive so the heap remains valid.
+    #[allow(dead_code)] // pool must outlive heap — dropping it would invalidate heap
+    pub(crate) pool: Arc<BufferPool<BlankLoader>>,
+    /// Heap accessor for the relation populated by [`setup`].
+    pub(crate) heap: HeapAccess<BlankLoader>,
+}
 
+/// Allocates a fresh pool and inserts `n` rows of `(i32 id, i64 val)`
+/// via [`HeapAccess::insert_batch`].
+///
+/// Returns a [`SetupState`] that callers can use for post-state assertions or
+/// pass to [`run_one_iter`] for timing.
+pub(crate) fn setup(n: usize) -> SetupState {
+    let frames = (n / 100).max(1) + 128;
     let pool = Arc::new(BufferPool::new(frames, BlankLoader));
     let heap = HeapAccess::new(Arc::clone(&pool));
     let opts = InsertOptions {
@@ -72,17 +96,47 @@ fn run_one_iteration(n: usize) -> f64 {
         vm: None,
     };
     let n_i32 = i32::try_from(n).unwrap_or(i32::MAX);
-    for id in 0..n_i32 {
-        let val = i64::from(id).wrapping_mul(999_983);
-        let payload = encode_row(id, val);
-        heap.insert(REL, &payload, opts)
-            .expect("insert must succeed during benchmark");
-    }
-    // Prevent the compiler from hoisting any heap operations out of the
-    // timed region.
-    std::hint::black_box(heap.block_count(REL));
+    let payloads: Vec<[u8; 12]> = (0..n_i32)
+        .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
+        .collect();
+    let rows: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    heap.insert_batch(REL, &rows, opts)
+        .expect("insert_batch must succeed during setup");
+    SetupState { rows: n, pool, heap }
+}
 
-    t0.elapsed().as_secs_f64() * 1_000_000.0 // µs
+/// Times inserting `state.rows` rows into a *fresh* pool.
+///
+/// Each call allocates a brand-new [`BufferPool`] + [`HeapAccess`] inside the
+/// timed region so the measurement is "10 k inserts into an empty relation" —
+/// matching the `CREATE TABLE … INSERT INTO …` latency for an empty table.
+/// The `state` argument carries only the desired row count; it is not mutated.
+///
+/// Returns the elapsed wall time.
+pub(crate) fn run_one_iter(state: &SetupState) -> Duration {
+    let opts = InsertOptions {
+        xmin: Xid::FIRST_USER,
+        command_id: CommandId::FIRST,
+        wal: None,
+        fsm: None,
+        vm: None,
+    };
+    let n_i32 = i32::try_from(state.rows).unwrap_or(i32::MAX);
+    let payloads: Vec<[u8; 12]> = (0..n_i32)
+        .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
+        .collect();
+    let rows: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    let frames = (state.rows / 100).max(1) + 128;
+    let t0 = Instant::now();
+    let pool = Arc::new(BufferPool::new(frames, BlankLoader));
+    let heap = HeapAccess::new(Arc::clone(&pool));
+    let tids = heap
+        .insert_batch(REL, &rows, opts)
+        .expect("insert_batch must succeed during benchmark");
+    let elapsed = t0.elapsed();
+    std::hint::black_box(heap.block_count(REL));
+    std::hint::black_box(tids.len());
+    elapsed
 }
 
 /// Runs the insert-throughput benchmark.
@@ -92,13 +146,16 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
     #[cfg(not(test))]
     let rows_per_iter = crate::runs::smoke_row_count(PROD_ROWS_PER_ITER, SMOKE_ROWS_PER_ITER);
 
+    let state = setup(rows_per_iter);
+
     for _ in 0..ctx.warmup_iterations {
-        run_one_iteration(rows_per_iter);
+        run_one_iter(&state);
     }
 
     let mut samples: Vec<f64> = Vec::with_capacity(ctx.iterations as usize);
     for _ in 0..ctx.iterations {
-        samples.push(run_one_iteration(rows_per_iter));
+        let elapsed = run_one_iter(&state);
+        samples.push(elapsed.as_secs_f64() * 1_000_000.0);
     }
 
     let median_us = median_f64(&samples);
@@ -120,8 +177,30 @@ pub fn run(ctx: &BenchContext) -> BenchResult {
 
 #[cfg(test)]
 mod tests {
+    use ultrasql_core::Xid;
+    use ultrasql_mvcc::Snapshot;
+    use ultrasql_mvcc::status::test_support::MapOracle;
+
     use super::*;
     use crate::registry::{BenchContext, HostInfo};
+
+    /// Drops the env var on `Drop` so a panicking test cannot leak it into
+    /// other tests running in the same process.
+    struct SmokeGuard;
+    impl SmokeGuard {
+        fn new() -> Self {
+            // SAFETY: test-only; no concurrent thread in this process modifies
+            // ULTRASQL_BENCH_SMOKE at the same time.
+            unsafe { std::env::set_var("ULTRASQL_BENCH_SMOKE", "1") };
+            Self
+        }
+    }
+    impl Drop for SmokeGuard {
+        fn drop(&mut self) {
+            // SAFETY: same as above.
+            unsafe { std::env::remove_var("ULTRASQL_BENCH_SMOKE") };
+        }
+    }
 
     fn test_ctx() -> BenchContext {
         BenchContext {
@@ -142,5 +221,68 @@ mod tests {
         let result = run(&ctx);
         assert_eq!(result.samples.len(), ctx.iterations as usize);
         assert!(result.throughput_per_sec > 0.0);
+    }
+
+    /// Verifies that `setup(n)` inserts exactly `n` visible tuples, and that
+    /// `run_one_iter` performs real work (non-zero elapsed time) without
+    /// mutating the setup heap (each iter uses its own fresh pool).
+    ///
+    /// Uses `scan_visible` with a committed snapshot so the assertion is
+    /// independent of any MVCC filtering quirk.
+    #[test]
+    fn insert_bench_actually_inserts_expected_row_count() {
+        let _guard = SmokeGuard::new();
+
+        // Oracle: FIRST_USER is committed.
+        let oracle = MapOracle::new();
+        oracle.set_committed(Xid::FIRST_USER);
+
+        // Snapshot: xmin > FIRST_USER so rows inserted by FIRST_USER are visible.
+        let snap = Snapshot::new(
+            Xid::new(Xid::FIRST_USER.raw() + 1),
+            Xid::new(Xid::FIRST_USER.raw() + 1000),
+            Xid::new(Xid::FIRST_USER.raw() + 1000),
+            ultrasql_core::CommandId::FIRST,
+            std::iter::empty(),
+        );
+
+        // Part 1: setup populates exactly TEST_ROWS_PER_ITER visible rows.
+        let state = setup(TEST_ROWS_PER_ITER);
+
+        let blocks = state.heap.block_count(REL);
+        let visible: Vec<_> = state
+            .heap
+            .scan_visible(REL, blocks, &snap, &oracle)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            visible.len(),
+            TEST_ROWS_PER_ITER,
+            "setup must insert exactly TEST_ROWS_PER_ITER ({TEST_ROWS_PER_ITER}) \
+             visible rows; got {}",
+            visible.len()
+        );
+
+        // Part 2: run_one_iter uses its own fresh heap each call.
+        // Verify real work was done (elapsed > 0) and setup heap is untouched.
+        let elapsed = run_one_iter(&state);
+        assert!(
+            elapsed.as_nanos() > 0,
+            "run_one_iter must take non-zero time (no-op detected)"
+        );
+
+        let blocks_after = state.heap.block_count(REL);
+        let visible_after: Vec<_> = state
+            .heap
+            .scan_visible(REL, blocks_after, &snap, &oracle)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            visible_after.len(),
+            TEST_ROWS_PER_ITER,
+            "setup heap must remain at TEST_ROWS_PER_ITER rows after run_one_iter \
+             (each timed iter uses a fresh pool)"
+        );
     }
 }

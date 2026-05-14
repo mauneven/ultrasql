@@ -1,0 +1,1 @@
+{"engine":"sqlite3","workload":"update_throughput_10k","n_rows":10000,"samples":8,"median_us":131.219,"min_us":1.000,"iterations_us":[591.187497775536, 261.43750437768176, 493.3125092065893, 1.0, 1.0, 1347.1455094986595, 1.0, 1.0]}

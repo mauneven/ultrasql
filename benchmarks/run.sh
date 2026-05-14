@@ -3,6 +3,7 @@
 #
 # Usage:
 #   benchmarks/run.sh [low|ultra] [engines]
+#   benchmarks/run.sh ultra writes
 #
 # Arguments:
 #   tier     "low" (default) or "ultra"
@@ -11,6 +12,8 @@
 #
 #   engines  Comma-separated list of engines to include.
 #            Defaults to: postgres17,duckdb,sqlite3,clickhouse,cockroachdb
+#            Special value: "writes" — run only the write-side workloads ×
+#            all available competitor engines (postgres17, duckdb, sqlite3).
 #
 # Pre-requisites:
 #   - Rust toolchain on PATH (cargo).
@@ -32,6 +35,86 @@ cd "$REPO_ROOT"
 
 tier="${1:-low}"
 engines="${2:-postgres17,duckdb,sqlite3,clickhouse,cockroachdb}"
+
+# ---------------------------------------------------------------------------
+# "ultra writes" subcommand: write-side workloads × all available engines
+# ---------------------------------------------------------------------------
+if [[ "$tier" == "ultra" && "$engines" == "writes" ]]; then
+    out="benchmarks/results/latest"
+    raw="$out/raw"
+    mkdir -p "$raw"
+
+    echo "=== UltraSQL write-side competitor benchmark  tier=ultra ==="
+
+    # Build the UltraSQL write binary and the renderer.
+    echo "--- Building bench binaries ---"
+    cargo build --release \
+        --package ultrasql-bench \
+        --bin cross_compare_writes \
+        --bin results-render
+
+    BIN="target/release"
+
+    # Generate write dataset (10 000 rows — matches the workload spec).
+    DATADIR="/tmp/ultracmp-writes-$$"
+    mkdir -p "$DATADIR"
+    trap 'rm -rf "$DATADIR"' EXIT
+
+    echo "--- Generating write dataset (10 000 rows) in $DATADIR ---"
+    python3 - "$DATADIR" <<'PYEOF'
+import sys, random, csv
+datadir = sys.argv[1]
+n = 10_000
+rng = random.Random(0xC0FFEE)
+ids = list(range(n))
+rng.shuffle(ids)
+vals = [rng.randint(-2**31, 2**31 - 1) for _ in range(n)]
+with open(f"{datadir}/data_write.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["id", "val"])
+    for i, v in zip(ids, vals):
+        w.writerow([i, v])
+print(f"Generated data_write.csv ({n} rows)")
+PYEOF
+
+    # UltraSQL kernel write workloads.
+    echo "--- Running UltraSQL kernel write workloads ---"
+    for wl in insert-bulk update delete; do
+        echo "  workload: $wl"
+        "$BIN/cross_compare_writes" \
+            --workload "$wl" \
+            --tier low \
+            --iters 8 \
+            --warmup 1 \
+            --data "$DATADIR/data_write.csv" \
+            > "$raw/${wl}-ultrasql.json"
+    done
+
+    # Competitor write workloads.
+    echo "--- Running competitor write workloads ---"
+    export RAW_DIR="$raw"
+    export N_ITERS=8
+    export N_ROWS=10000
+    export PGUSER="${PGUSER:-$(id -un)}"
+    export PGDATABASE="${PGDATABASE:-ultrasql_bench}"
+
+    bash benchmarks/scripts/run_postgres_writes.sh
+    bash benchmarks/scripts/run_duckdb_writes.sh
+    bash benchmarks/scripts/run_sqlite3_writes.sh
+
+    # Render results.
+    echo "--- Rendering results ---"
+    "$BIN/results-render" \
+        --raw-dir "$raw" \
+        --output-md "$out/results.md" \
+        --output-json "$out/results.json"
+
+    echo ""
+    echo "=== Done. Results in $out/ ==="
+    echo "    $out/results.md"
+    echo "    $out/results.json"
+    exit 0
+fi
 
 if [[ "$tier" != "low" && "$tier" != "ultra" ]]; then
     echo "Error: tier must be 'low' or 'ultra', got '$tier'" >&2

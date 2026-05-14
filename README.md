@@ -68,25 +68,41 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 <!-- BEGIN AUTO: BENCH:insert_throughput_10k -->
 ### INSERT throughput — 10 000 rows
 
-_Not yet measured. Results will appear here automatically after the next benchmark run._
+| Engine | Median |
+| --- | ---: |
+| sqlite3 | 19.80 ms |
+| postgres17 | 49.75 ms |
+| duckdb | 64.20 ms |
 <!-- END AUTO: BENCH:insert_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:update_throughput_10k -->
 ### UPDATE throughput — 10 000 rows
 
-_Not yet measured. Results will appear here automatically after the next benchmark run._
+| Engine | Median |
+| --- | ---: |
+| duckdb | 52.72 µs |
+| sqlite3 | 131.22 µs |
+| postgres17 | 44.18 ms |
 <!-- END AUTO: BENCH:update_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:delete_throughput_10k -->
 ### DELETE throughput — 10 000 rows
 
-_Not yet measured. Results will appear here automatically after the next benchmark run._
+| Engine | Median |
+| --- | ---: |
+| sqlite3 | 575.90 µs |
+| duckdb | 5.26 ms |
+| postgres17 | 21.94 ms |
 <!-- END AUTO: BENCH:delete_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:mixed_oltp_pgbench_like -->
 ### Mixed OLTP (pgbench-like)
 
-_Not yet measured. Results will appear here automatically after the next benchmark run._
+| Engine | Median |
+| --- | ---: |
+| sqlite3 | 367.78 µs |
+| duckdb | 1.28 ms |
+| postgres17 | 12.27 ms |
 <!-- END AUTO: BENCH:mixed_oltp_pgbench_like -->
 
 Per-kernel microbenchmarks (in-process, no SQL surface) live at

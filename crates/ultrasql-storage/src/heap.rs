@@ -278,6 +278,17 @@ pub struct HeapAccess<L: PageLoader> {
     /// because the catalog crate is not yet wired; once the catalog
     /// arrives, this field will be replaced with a `&dyn Catalog`.
     block_counters: DashMap<RelationId, Arc<AtomicU32>>,
+    /// Per-relation insertion cursor hint: block number known to have
+    /// had free space the last time we inserted there.
+    ///
+    /// `insert` consults this hint before its linear-scan fallback so
+    /// the common case ("there is room on the tail page") is O(1)
+    /// instead of O(N) in the number of allocated blocks. The hint may
+    /// be stale (a concurrent insert may have filled the page); the
+    /// caller handles that by retrying with a linear scan starting at
+    /// the hint. The cursor is an `Arc<AtomicU32>` so reads/writes are
+    /// lock-free and shared safely across threads.
+    insert_cursor: DashMap<RelationId, Arc<AtomicU32>>,
     /// Raw LSN (as `u64`) of the most recent checkpoint. Shared with the
     /// checkpointer so both can read and update it under the same `Arc`.
     ///
@@ -311,6 +322,7 @@ impl<L: PageLoader> HeapAccess<L> {
         Self {
             pool,
             block_counters: DashMap::new(),
+            insert_cursor: DashMap::new(),
             last_checkpoint_lsn: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -328,6 +340,7 @@ impl<L: PageLoader> HeapAccess<L> {
         Self {
             pool,
             block_counters: DashMap::new(),
+            insert_cursor: DashMap::new(),
             last_checkpoint_lsn,
         }
     }
@@ -376,6 +389,7 @@ impl<L: PageLoader> HeapAccess<L> {
         opts: InsertOptions<'_>,
     ) -> Result<TupleId, HeapError> {
         let counter = self.counter_for(rel);
+        let cursor = self.cursor_for(rel);
         let existing = counter.load(Ordering::Acquire);
 
         // TODO(attr-count): heap does not yet know per-tuple attribute counts;
@@ -397,6 +411,7 @@ impl<L: PageLoader> HeapAccess<L> {
                         Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
                         // Update FSM and VM after the successful insert.
                         Self::post_insert_fsm_vm(&self.pool, tid.page, opts);
+                        cursor.store(tid.page.block.raw(), Ordering::Release);
                         return Ok(tid);
                     }
                     // Hint was stale (page filled up since we recorded it);
@@ -409,13 +424,41 @@ impl<L: PageLoader> HeapAccess<L> {
             }
         }
 
-        // Try every block we know about.
-        for block in 0..existing {
+        // Start the linear scan at the cached cursor block (the tail of
+        // the relation in the common append-only case). Pages before the
+        // cursor are statistically unlikely to have room — skipping them
+        // turns the per-row insert from O(N) into amortised O(1).
+        //
+        // The cursor is purely advisory; if it points past `existing` we
+        // clamp to zero. If the cached page is full we fall through to
+        // the forward scan from the cursor.
+        let start = cursor.load(Ordering::Acquire).min(existing.saturating_sub(1));
+        for block in start..existing {
             let page_id = PageId::new(rel, BlockNumber::new(block));
             match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
                 Ok(tid) => {
                     Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
                     Self::post_insert_fsm_vm(&self.pool, tid.page, opts);
+                    cursor.store(block, Ordering::Release);
+                    return Ok(tid);
+                }
+                Err(HeapError::Page(PageError::NoSpace { .. })) => {}
+                Err(other) => return Err(other),
+            }
+        }
+
+        // Cursor was past the first page with room. Sweep from block 0
+        // up to `start` so this method remains semantically equivalent
+        // to "try every page before extending". This branch only fires
+        // when the cursor is stale (older inserts deleted on a page
+        // before the tail, or concurrent extension).
+        for block in 0..start {
+            let page_id = PageId::new(rel, BlockNumber::new(block));
+            match self.try_insert_into(page_id, payload, opts, n_atts, tuple_size) {
+                Ok(tid) => {
+                    Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
+                    Self::post_insert_fsm_vm(&self.pool, tid.page, opts);
+                    cursor.store(block, Ordering::Release);
                     return Ok(tid);
                 }
                 Err(HeapError::Page(PageError::NoSpace { .. })) => {}
@@ -436,6 +479,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 Ok(tid) => {
                     Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
                     Self::post_insert_fsm_vm(&self.pool, tid.page, opts);
+                    cursor.store(new_block, Ordering::Release);
                     return Ok(tid);
                 }
                 // A concurrent thread could have raced into this block
@@ -444,6 +488,221 @@ impl<L: PageLoader> HeapAccess<L> {
                 Err(other) => return Err(other),
             }
         }
+    }
+
+    /// Insert many tuples into the same relation under a single page
+    /// pin per page touched.
+    ///
+    /// `insert` pins, mutates, and releases a page for every row, and
+    /// scans `0..block_count` blocks on every call. For bulk loads this
+    /// is O(N²) in the number of inserted rows because every late row
+    /// re-walks every earlier (full) page before finding the tail.
+    ///
+    /// `insert_batch` short-circuits that walk by holding a single
+    /// page-write guard across as many rows as fit on the current page,
+    /// then moving to the next page exactly when the page returns
+    /// [`PageError::NoSpace`]. Pages already known to be full are
+    /// skipped without taking the write lock — only the guarded
+    /// candidate is locked.
+    ///
+    /// Semantics are byte-for-byte equivalent to calling
+    /// [`Self::insert`] N times in order, but with a much tighter
+    /// inner loop:
+    ///
+    /// - The MVCC header for every row uses `opts.xmin` /
+    ///   `opts.command_id`, identical to `insert`.
+    /// - Each tuple's `ctid` is patched to its assigned [`TupleId`]
+    ///   after slot allocation, identical to `insert`.
+    /// - WAL emission, if `opts.wal` is `Some`, runs exactly once per
+    ///   tuple (just like `insert`); the batch path is meaningful only
+    ///   when `opts.wal` is `None` (the WAL emission path serializes on
+    ///   the sink and dominates the per-row cost).
+    /// - FSM hints and VM clears, when `opts.fsm` / `opts.vm` are
+    ///   `Some`, run once per *page touched*, not per row. This is a
+    ///   strict improvement over `insert`'s per-row hooks because the
+    ///   page's free-space at the end of the batch is the only value
+    ///   that matters for the next batch.
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<TupleId>` of length `rows.len()`, in the same order as
+    /// the input. On error, the returned vec contains the [`TupleId`]s
+    /// of every row inserted so far — the partial result is
+    /// recoverable by the caller (no rollback is attempted because
+    /// callers that need transactional rollback must use the
+    /// txn-manager surface, not the heap directly).
+    ///
+    /// # Errors
+    ///
+    /// - [`HeapError::BufferPool`] if the buffer pool cannot pin a
+    ///   target page.
+    /// - [`HeapError::Page`] for any non-`NoSpace` page error
+    ///   (`NoSpace` is handled internally by advancing to the next
+    ///   block).
+    /// - [`HeapError::MalformedHeader`] if a per-row tuple size
+    ///   overflows `usize`.
+    /// - [`HeapError::OutOfBlocks`] if the relation's block counter
+    ///   reaches `u32::MAX`.
+    /// - [`HeapError::Wal`] or [`HeapError::WalPayload`] if WAL
+    ///   emission is configured and fails.
+    ///
+    /// # Concurrency
+    ///
+    /// `insert_batch` holds at most one page-write lock at any moment.
+    /// It is safe to call concurrently from multiple threads against
+    /// the same relation; concurrent batches may interleave on pages
+    /// and produce non-contiguous slot assignments within a page.
+    /// Block-counter monotonicity is preserved through `AcqRel`
+    /// `fetch_add` on the per-relation counter, matching
+    /// [`Self::insert`].
+    pub fn insert_batch(
+        &self,
+        rel: RelationId,
+        rows: &[&[u8]],
+        opts: InsertOptions<'_>,
+    ) -> Result<Vec<TupleId>, HeapError> {
+        let mut out: Vec<TupleId> = Vec::with_capacity(rows.len());
+        if rows.is_empty() {
+            return Ok(out);
+        }
+
+        // TODO(attr-count): heap does not yet know per-tuple attribute counts;
+        // planner-side encoding will populate this in v0.4. Until then, store 0
+        // explicitly so future readers cannot mistake a clipped byte-length for
+        // a real count.
+        let n_atts: u16 = 0;
+
+        let counter = self.counter_for(rel);
+        let mut block_count = counter.load(Ordering::Acquire);
+        // Per-relation cursor: start scanning for room at the highest
+        // known block. Most relations are append-only; the tail page is
+        // overwhelmingly the page with free space.
+        let mut cursor: u32 = block_count.saturating_sub(1);
+        let mut row_idx: usize = 0;
+
+        while row_idx < rows.len() {
+            // (1) If no block has ever been allocated, grow first.
+            if block_count == 0 {
+                let new_block = counter.fetch_add(1, Ordering::AcqRel);
+                if new_block == u32::MAX {
+                    counter.store(u32::MAX, Ordering::Release);
+                    return Err(HeapError::OutOfBlocks);
+                }
+                block_count = new_block.saturating_add(1);
+                cursor = new_block;
+            }
+
+            let page_id = PageId::new(rel, BlockNumber::new(cursor));
+            let drained =
+                Self::batch_fill_page(&self.pool, page_id, rows, &mut out, row_idx, opts, n_atts)?;
+            row_idx += drained;
+            // After this page, the post hooks fire once for the affected page.
+            Self::post_insert_fsm_vm(&self.pool, page_id, opts);
+
+            if row_idx == rows.len() {
+                break;
+            }
+
+            // (2) Page is full. Advance to the next known block, or
+            // allocate a new one when we've walked past the tail.
+            cursor = cursor.saturating_add(1);
+            if cursor >= block_count {
+                let new_block = counter.fetch_add(1, Ordering::AcqRel);
+                if new_block == u32::MAX {
+                    counter.store(u32::MAX, Ordering::Release);
+                    return Err(HeapError::OutOfBlocks);
+                }
+                block_count = new_block.saturating_add(1);
+                cursor = new_block;
+            }
+        }
+
+        // WAL emission, if configured. Runs in the same per-row pattern
+        // as `insert`, after every page mutation and outside any pin.
+        if opts.wal.is_some() {
+            for &tid in &out {
+                Self::emit_insert_wal(&self.pool, tid, &opts, || self.fetch(tid))?;
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Fill `page_id` with as many of `rows[row_idx..]` as fit under a
+    /// single exclusive page guard.
+    ///
+    /// Returns the number of rows consumed. Per-row [`TupleId`]s are
+    /// appended to `out`. A return of zero means the page had no room
+    /// for even the first remaining row; the caller should advance to
+    /// the next page.
+    ///
+    /// FSM/VM hooks are *not* invoked here: this helper is responsible
+    /// only for the page-local fill loop. The caller fires the
+    /// per-page post-hooks once after each call so the FSM sees the
+    /// final post-batch free space (and the page guard is released
+    /// before the FSM/VM lookup).
+    ///
+    /// Clippy's `significant_drop_tightening` would prefer the
+    /// [`PageWrite`](crate::buffer_pool::PageWrite) be dropped before
+    /// the closing brace, but `page_bytes` borrows from `page`, so the
+    /// borrow checker requires the guard to live until function exit.
+    #[allow(clippy::significant_drop_tightening)]
+    fn batch_fill_page(
+        pool: &Arc<BufferPool<L>>,
+        page_id: PageId,
+        rows: &[&[u8]],
+        out: &mut Vec<TupleId>,
+        row_idx: usize,
+        opts: InsertOptions<'_>,
+        n_atts: u16,
+    ) -> Result<usize, HeapError> {
+        let guard = pool.get_page(page_id)?;
+        let mut page = guard.write();
+        let mut filled: usize = 0;
+        // Scratch buffer reused for every row in this page to avoid the
+        // per-row `Vec` allocation `insert_into_pinned` does.
+        let mut scratch: Vec<u8> = Vec::with_capacity(TUPLE_HEADER_SIZE + 64);
+
+        for row in &rows[row_idx..] {
+            let tuple_size = TUPLE_HEADER_SIZE
+                .checked_add(row.len())
+                .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
+
+            // Fast-path: skip pages that obviously cannot hold this tuple.
+            let free = page.header().free_space();
+            if free < tuple_size + crate::page::ITEMID_SIZE {
+                break;
+            }
+
+            scratch.clear();
+            scratch.resize(TUPLE_HEADER_SIZE, 0);
+            let tentative_tid = TupleId::new(page_id, 0);
+            let header = TupleHeader::fresh(opts.xmin, opts.command_id, tentative_tid, n_atts);
+            header.encode(&mut scratch[..TUPLE_HEADER_SIZE]);
+            scratch.extend_from_slice(row);
+
+            let slot = match page.insert_tuple(&scratch) {
+                Ok(s) => s,
+                Err(PageError::NoSpace { .. }) => break,
+                Err(e) => return Err(HeapError::Page(e)),
+            };
+
+            // Patch the ctid to point at the assigned slot. We re-encode
+            // the header inline into the page bytes rather than calling
+            // through `collect_header_bytes` so this stays a single copy.
+            let final_tid = TupleId::new(page_id, slot);
+            let mut patched_header = header;
+            patched_header.ctid = final_tid;
+            let header_bytes = Self::collect_header_bytes(&patched_header);
+            let page_bytes = page.as_bytes_mut();
+            let (slot_offset, _) = Self::slot_window(page_bytes, slot)?;
+            page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
+
+            out.push(final_tid);
+            filled += 1;
+        }
+
+        Ok(filled)
     }
 
     /// Read a tuple by id. Visibility is not enforced — callers running
@@ -754,6 +1013,28 @@ impl<L: PageLoader> HeapAccess<L> {
             dashmap::mapref::entry::Entry::Vacant(v) => {
                 v.insert(Arc::clone(&counter));
                 counter
+            }
+        }
+    }
+
+    /// Get or create the insertion cursor for `rel`. The cursor stores
+    /// the block number the heap last successfully inserted into; it is
+    /// used as the starting point for the linear-scan fallback in
+    /// [`Self::insert`].
+    ///
+    /// The cursor is purely advisory — a stale value (e.g. the page is
+    /// now full) causes one wasted attempt and falls through to the
+    /// existing linear scan from the cursor forward.
+    fn cursor_for(&self, rel: RelationId) -> Arc<AtomicU32> {
+        if let Some(existing) = self.insert_cursor.get(&rel) {
+            return Arc::clone(&existing);
+        }
+        let cursor = Arc::new(AtomicU32::new(0));
+        match self.insert_cursor.entry(rel) {
+            dashmap::mapref::entry::Entry::Occupied(o) => Arc::clone(o.get()),
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                v.insert(Arc::clone(&cursor));
+                cursor
             }
         }
     }

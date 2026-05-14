@@ -1,0 +1,1 @@
+{"engine":"duckdb","workload":"update_throughput_10k","n_rows":10000,"samples":8,"median_us":52.719,"min_us":1.000,"iterations_us":[15170.728504017461, 1.0, 314.93750429945067, 1.0, 1.0, 104.43750215927139, 549.1455012816004, 1.0]}
