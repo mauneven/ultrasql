@@ -31,6 +31,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod bootstrap;
+pub mod encoding;
 mod entry;
 mod error;
 pub mod information_schema;
@@ -40,6 +41,10 @@ mod traits;
 pub mod views;
 
 pub use bootstrap::initial_snapshot;
+pub use encoding::{
+    DecodeError as RowDecodeError, EncodeError as RowEncodeError, decode_attribute_row,
+    encode_attribute_row, schema_from_attributes,
+};
 pub use entry::{IndexEntry, TableEntry};
 pub use error::CatalogError;
 pub use memory::{FIRST_USER_OID, InMemoryCatalog};
