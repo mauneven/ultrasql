@@ -1268,6 +1268,42 @@ impl<L: PageLoader> HeapAccess<L> {
         }
     }
 
+    /// Visibility-filtered sequential scan that yields **borrowed**
+    /// slot bytes — zero `Vec<u8>` allocations per tuple.
+    ///
+    /// [`Self::scan_visible`] yields a fully-owned `HeapTuple` whose
+    /// `data: Vec<u8>` is a fresh allocation per slot. On a 1 M-row
+    /// analytic scan that path pays ~1 M allocator dispatches + 1 M
+    /// `Vec::drop` calls — measurable wall time even on a hot
+    /// allocator.
+    ///
+    /// `scan_visible_walker` returns a [`VisibleHeapWalker`] whose
+    /// `try_next` writes the slot bytes into a reusable internal
+    /// buffer (preallocated to one tuple's worth) and hands the
+    /// caller a `&[u8]` view into that buffer. The borrow is valid
+    /// until the next `try_next` call.
+    pub fn scan_visible_walker<'a, O: XidStatusOracle + ?Sized>(
+        &'a self,
+        rel: RelationId,
+        block_count: u32,
+        snapshot: &'a Snapshot,
+        oracle: &'a O,
+    ) -> VisibleHeapWalker<'a, L, O> {
+        VisibleHeapWalker {
+            pool: &self.pool,
+            rel,
+            block_count,
+            current_block: 0,
+            current_slot: 0,
+            slot_count: 0,
+            current_guard: None,
+            scratch: Vec::with_capacity(64),
+            snapshot,
+            oracle,
+            xmin_cache: None,
+        }
+    }
+
     /// Mark a page as all-visible in the visibility map.
     ///
     /// Called by vacuum after verifying that every live tuple on `block`
@@ -2061,6 +2097,164 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> std::fmt::Debug for VisibleHeap
         f.debug_struct("VisibleHeapScan")
             .field("inner", &self.inner)
             .finish_non_exhaustive()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Zero-alloc visibility walker — see `HeapAccess::scan_visible_walker`.
+// ---------------------------------------------------------------------------
+
+/// Visibility-filtered sequential scan that yields borrowed slot
+/// payload slices.
+///
+/// Constructed via [`HeapAccess::scan_visible_walker`]. The walker
+/// owns one [`PageGuard`] at a time (released at block boundaries)
+/// and one [`Vec<u8>`] scratch buffer reused across every slot read;
+/// per-tuple work is zero allocation.
+///
+/// The borrow returned by [`Self::try_next`] is valid until the
+/// next `try_next` call — the `&mut self` receiver prevents
+/// overlapping borrows.
+pub struct VisibleHeapWalker<'a, L: PageLoader, O: XidStatusOracle + ?Sized> {
+    pool: &'a Arc<BufferPool<L>>,
+    rel: RelationId,
+    block_count: u32,
+    current_block: u32,
+    current_slot: u16,
+    slot_count: u16,
+    /// Pin for the current block. Held across every slot read on the
+    /// page; dropped on block transition so the frame becomes
+    /// eligible for eviction again.
+    current_guard: Option<PageGuard<L>>,
+    /// Reusable buffer holding the most-recent slot's bytes (header +
+    /// payload). `clear`-then-`extend_from_slice` per slot reuses the
+    /// allocation; capacity grows past the preallocated 64 bytes
+    /// once and then stays constant.
+    scratch: Vec<u8>,
+    snapshot: &'a Snapshot,
+    oracle: &'a O,
+    /// Same `(xmin, infomask, visibility)` cache as `VisibleHeapScan`.
+    xmin_cache: Option<(Xid, u16, bool)>,
+}
+
+impl<L: PageLoader, O: XidStatusOracle + ?Sized> std::fmt::Debug for VisibleHeapWalker<'_, L, O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VisibleHeapWalker")
+            .field("rel", &self.rel)
+            .field("current_block", &self.current_block)
+            .field("current_slot", &self.current_slot)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
+    /// Advance to the next MVCC-visible tuple and return a borrowed
+    /// view of its `(TupleId, TupleHeader, payload_bytes)`.
+    ///
+    /// Returns `Ok(None)` when the relation is exhausted, `Err(_)` on
+    /// I/O / decode failure. The `payload_bytes` slice borrows from
+    /// the walker's internal scratch buffer; the borrow is
+    /// invalidated by the next call.
+    #[allow(clippy::type_complexity)]
+    pub fn try_next(&mut self) -> Result<Option<(TupleId, TupleHeader, &[u8])>, HeapError> {
+        loop {
+            if self.current_block >= self.block_count {
+                self.current_guard = None;
+                return Ok(None);
+            }
+
+            let page_id = PageId::new(self.rel, BlockNumber::new(self.current_block));
+
+            if self.current_guard.is_none() {
+                let guard = match self.pool.get_page(page_id) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        self.current_block = self.current_block.saturating_add(1);
+                        self.current_slot = 0;
+                        return Err(HeapError::from(e));
+                    }
+                };
+                self.slot_count = guard.read().header().slot_count();
+                self.current_slot = 0;
+                self.current_guard = Some(guard);
+            }
+
+            if self.current_slot >= self.slot_count {
+                self.current_guard = None;
+                self.current_block = self.current_block.saturating_add(1);
+                self.current_slot = 0;
+                continue;
+            }
+
+            let slot = self.current_slot;
+            self.current_slot += 1;
+
+            // Copy this slot's bytes into the reusable scratch buffer
+            // under the per-frame read lock, then drop the lock. The
+            // copy is a single small memcpy; the `Vec::extend_from_slice`
+            // never reallocates after the first iteration.
+            let copy_ok = {
+                let guard = self
+                    .current_guard
+                    .as_ref()
+                    .expect("guard set above before slot read");
+                let page = guard.read();
+                match page.read_tuple(slot) {
+                    Ok(bytes) => {
+                        self.scratch.clear();
+                        self.scratch.extend_from_slice(bytes);
+                        true
+                    }
+                    Err(PageError::DeadSlot(_) | PageError::InvalidSlot { .. }) => false,
+                    Err(e) => return Err(HeapError::from(e)),
+                }
+            };
+            if !copy_ok {
+                continue;
+            }
+
+            if self.scratch.len() < TUPLE_HEADER_SIZE {
+                return Err(HeapError::MalformedHeader("slot shorter than header"));
+            }
+            let (header, _) = TupleHeader::decode(&self.scratch[..TUPLE_HEADER_SIZE])
+                .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+
+            let visible = if header.xmax.is_invalid() {
+                let infomask_bits = header.infomask.bits();
+                if let Some((cxmin, cinfo, cv)) = self.xmin_cache {
+                    if cxmin == header.xmin && cinfo == infomask_bits {
+                        cv
+                    } else {
+                        let v = matches!(
+                            is_visible(&header, self.snapshot, self.oracle),
+                            Visibility::Visible,
+                        );
+                        self.xmin_cache = Some((header.xmin, infomask_bits, v));
+                        v
+                    }
+                } else {
+                    let v = matches!(
+                        is_visible(&header, self.snapshot, self.oracle),
+                        Visibility::Visible,
+                    );
+                    self.xmin_cache = Some((header.xmin, infomask_bits, v));
+                    v
+                }
+            } else {
+                matches!(
+                    is_visible(&header, self.snapshot, self.oracle),
+                    Visibility::Visible,
+                )
+            };
+
+            if !visible {
+                continue;
+            }
+
+            let tid = TupleId::new(page_id, slot);
+            let payload = &self.scratch[TUPLE_HEADER_SIZE..];
+            return Ok(Some((tid, header, payload)));
+        }
     }
 }
 

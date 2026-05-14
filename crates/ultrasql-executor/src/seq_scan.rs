@@ -31,7 +31,7 @@ use std::sync::Arc;
 use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
 use ultrasql_mvcc::{Snapshot, XidStatusOracle};
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::heap::{HeapAccess, VisibleHeapScan};
+use ultrasql_storage::heap::{HeapAccess, VisibleHeapWalker};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
@@ -76,12 +76,17 @@ const BATCH_TARGET_ROWS: usize = 4096;
 /// it before the fields it borrows from, preventing a use-after-free
 /// at struct destruction time.
 pub struct SeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'static> {
-    /// Active heap iterator. Lifetime-erased to `'static`; the real
+    /// Active heap walker. Lifetime-erased to `'static`; the real
     /// borrows live as long as `heap`, `snapshot`, and `oracle`.
+    ///
+    /// Uses the zero-alloc [`VisibleHeapWalker`] which writes each
+    /// slot's bytes into an internal scratch buffer and hands the
+    /// caller a borrowed slice — no per-tuple `Vec<u8>` allocations
+    /// in the streaming path.
     ///
     /// `None` only after the scan has reached end-of-stream.
     /// Declared first so it drops before the data it references.
-    iter: Option<VisibleHeapScan<'static, L, O>>,
+    iter: Option<VisibleHeapWalker<'static, L, O>>,
     /// Reusable typed column builders. Sized to
     /// [`BATCH_TARGET_ROWS`] capacity on every fresh allocation and
     /// swapped out wholesale when a batch is emitted.
@@ -231,13 +236,13 @@ where
         // `SeqScan`. The iterator is declared as the first field and
         // therefore dropped first, before the borrows go away. See
         // the type-level `# Safety` doc for the full argument.
-        let iter: VisibleHeapScan<'static, L, O> = unsafe {
+        let iter: VisibleHeapWalker<'static, L, O> = unsafe {
             let heap_ref: &'static HeapAccess<L> =
                 std::mem::transmute::<&HeapAccess<L>, &'static HeapAccess<L>>(&*heap);
             let snap_ref: &'static Snapshot =
                 std::mem::transmute::<&Snapshot, &'static Snapshot>(&*snapshot_box);
             let oracle_ref: &'static O = std::mem::transmute::<&O, &'static O>(&*oracle);
-            heap_ref.scan_visible(relation, block_count, snap_ref, oracle_ref)
+            heap_ref.scan_visible_walker(relation, block_count, snap_ref, oracle_ref)
         };
 
         Self {
@@ -296,33 +301,33 @@ where
         let mut rows_buffered: usize = 0;
         let mut iter_exhausted = true;
 
-        if let Some(iter) = self.iter.as_mut() {
+        if let Some(walker) = self.iter.as_mut() {
             while rows_buffered < BATCH_TARGET_ROWS {
-                let Some(result) = iter.next() else {
-                    break;
-                };
-                let tup = result.map_err(|e| {
+                let item = walker.try_next().map_err(|e| {
                     tracing::warn!(error = %e, "heap scan error");
                     ExecError::Internal("heap scan failed")
                 })?;
+                let Some((tid, _header, payload)) = item else {
+                    break;
+                };
                 if self.with_tids {
                     // PostgreSQL's `BlockNumber` is u32; the TID
                     // columns are i32 (matching the v0.5 `ModifyTable`
                     // extractor).
-                    let block_i32 = i32::try_from(tup.tid.page.block.raw()).map_err(|_| {
+                    let block_i32 = i32::try_from(tid.page.block.raw()).map_err(|_| {
                         ExecError::Internal("BlockNumber exceeds i32 range; TID column overflow")
                     })?;
-                    let slot_i32 = i32::from(tup.tid.slot);
+                    let slot_i32 = i32::from(tid.slot);
                     RowCodec::push_i32_into(&mut self.builders, 0, block_i32);
                     RowCodec::push_i32_into(&mut self.builders, 1, slot_i32);
                 }
                 self.codec
-                    .decode_into_builders(&tup.data, &mut self.builders[tid_offset..])
+                    .decode_into_builders(payload, &mut self.builders[tid_offset..])
                     .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
                 rows_buffered += 1;
             }
             // Mark "not exhausted" only when we hit the row cap (the
-            // iterator may still hold more rows for the next call).
+            // walker may still hold more rows for the next call).
             if rows_buffered >= BATCH_TARGET_ROWS {
                 iter_exhausted = false;
             }
