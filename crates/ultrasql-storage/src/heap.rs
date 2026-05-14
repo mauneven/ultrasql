@@ -1199,28 +1199,45 @@ impl<L: PageLoader> HeapAccess<L> {
     where
         I: IntoIterator<Item = (TupleId, UpdatePayload)>,
     {
-        let mut by_page: ahash::AHashMap<PageId, Vec<(u16, UpdatePayload)>> =
-            ahash::AHashMap::new();
-        for (tid, payload) in edits {
-            by_page
-                .entry(tid.page)
-                .or_default()
-                .push((tid.slot, payload));
-        }
-        if by_page.is_empty() {
+        // Materialise the edits up front. The previous implementation
+        // built an `AHashMap<PageId, Vec<(slot, payload)>>` to group
+        // entries by source page; the hash inserts plus per-page Vec
+        // growth amortised to ~80 µs on a 10 000-row bulk UPDATE.
+        //
+        // The bulk-UPDATE caller (`ModifyTable`) consumes batches
+        // emitted by a sequential `SeqScan`, which yields tuples in
+        // `PageId` order. So the materialised Vec is *already* sorted
+        // by page; one sort pass + a linear group-by-run walk replaces
+        // the HashMap entirely.
+        let mut edits_vec: Vec<(TupleId, UpdatePayload)> = edits.into_iter().collect();
+        if edits_vec.is_empty() {
             return Ok(0);
         }
+        // A `sort_unstable_by_key` over already-sorted input is O(n)
+        // in practice (the comparison-based sort detects the existing
+        // order via its merge ascent). Run it unconditionally so the
+        // walk below can assume strict page-grouping without auditing
+        // every caller.
+        edits_vec.sort_unstable_by(|a, b| a.0.page.cmp(&b.0.page).then_with(|| a.0.slot.cmp(&b.0.slot)));
 
         let mut total = 0_usize;
-        // HOT-failed entries fall back to the per-tuple `update`
-        // path. Collected after each page's batch so we don't try to
-        // re-enter `update` while still holding the page's `PageGuard`.
+        // HOT-failed entries fall back to the bulk-non-HOT path. We
+        // build the fallback Vec by appending in the same page-major
+        // order we walk; `fallback` is therefore implicitly sorted by
+        // `old_tid.page`, which the post-`insert_batch` stamp loop
+        // exploits with another run-length walk.
         let mut fallback: Vec<(TupleId, UpdatePayload)> = Vec::new();
 
-        for (page_id, mut entries) in by_page {
-            // Sort by slot to walk the page slot-directory in
-            // ascending order — keeps page cache lines hot.
-            entries.sort_unstable_by_key(|(slot, _)| *slot);
+        // Linear walk: identify each maximal run of entries sharing a
+        // `PageId` and process them under a single per-page guard.
+        let mut i = 0;
+        while i < edits_vec.len() {
+            let page_id = edits_vec[i].0.page;
+            let mut j = i + 1;
+            while j < edits_vec.len() && edits_vec[j].0.page == page_id {
+                j += 1;
+            }
+            let group_len = j - i;
 
             if opts.hot_eligible {
                 // FPW once per page before any HOT mutation on this page.
@@ -1245,16 +1262,24 @@ impl<L: PageLoader> HeapAccess<L> {
                 // hits this skip and saves ~10 000 `try_hot_update`
                 // attempts.
                 let first_size = TUPLE_HEADER_SIZE
-                    .checked_add(entries[0].1.len())
+                    .checked_add(edits_vec[i].1.len())
                     .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
                 let min_needed = first_size + crate::page::ITEMID_SIZE;
                 let guard = self.pool.get_page(page_id)?;
                 let page_free = guard.read().header().free_space();
                 drop(guard);
                 if page_free < min_needed {
-                    for (slot, payload) in entries {
-                        fallback.push((TupleId::new(page_id, slot), payload));
+                    // Move every entry in the run straight to fallback.
+                    fallback.reserve(group_len);
+                    for k in i..j {
+                        let (tid, payload) =
+                            std::mem::replace(&mut edits_vec[k], (
+                                TupleId::new(page_id, 0),
+                                UpdatePayload::new(),
+                            ));
+                        fallback.push((tid, payload));
                     }
+                    i = j;
                     continue;
                 }
 
@@ -1263,24 +1288,31 @@ impl<L: PageLoader> HeapAccess<L> {
                 // Each `try_hot_update` acquires `guard.write()`
                 // internally — uncontended because the prior call
                 // released.
-                let mut hot_outcomes: Vec<(TupleId, TupleId)> = Vec::with_capacity(entries.len());
+                let mut hot_outcomes: Vec<(TupleId, TupleId)> = Vec::with_capacity(group_len);
                 {
                     let guard = self.pool.get_page(page_id)?;
-                    for (slot, payload) in &entries {
+                    for k in i..j {
                         let new_tuple_size = TUPLE_HEADER_SIZE
-                            .checked_add(payload.len())
+                            .checked_add(edits_vec[k].1.len())
                             .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
-                        let old_tid = TupleId::new(page_id, *slot);
+                        let old_tid = edits_vec[k].0;
                         match Self::try_hot_update(
                             &guard,
                             old_tid,
-                            payload,
+                            &edits_vec[k].1,
                             opts,
                             0,
                             new_tuple_size,
                         )? {
                             Some(new_tid) => hot_outcomes.push((old_tid, new_tid)),
-                            None => fallback.push((old_tid, payload.clone())),
+                            None => {
+                                let (tid, payload) =
+                                    std::mem::replace(&mut edits_vec[k], (
+                                        TupleId::new(page_id, 0),
+                                        UpdatePayload::new(),
+                                    ));
+                                fallback.push((tid, payload));
+                            }
                         }
                     }
                     // guard drops here — pin released before WAL I/O
@@ -1308,12 +1340,19 @@ impl<L: PageLoader> HeapAccess<L> {
                     self.column_cache.bump_version(page_id.relation);
                 }
             } else {
-                // Caller disabled HOT for every entry — funnel them
-                // straight to the non-HOT fallback.
-                for (slot, payload) in entries {
-                    fallback.push((TupleId::new(page_id, slot), payload));
+                // Caller disabled HOT for every entry in the run —
+                // funnel them straight to the non-HOT fallback.
+                fallback.reserve(group_len);
+                for k in i..j {
+                    let (tid, payload) = std::mem::replace(
+                        &mut edits_vec[k],
+                        (TupleId::new(page_id, 0), UpdatePayload::new()),
+                    );
+                    fallback.push((tid, payload));
                 }
             }
+
+            i = j;
         }
 
         // Non-HOT fallback — bulk path.
@@ -1353,29 +1392,31 @@ impl<L: PageLoader> HeapAccess<L> {
             let rel = fallback[0].0.page.relation;
             let new_tids = self.insert_batch(rel, &payloads, insert_opts)?;
 
-            let mut by_old_page: ahash::AHashMap<PageId, Vec<(u16, TupleId)>> =
-                ahash::AHashMap::new();
-            for ((old_tid, _), new_tid) in fallback.iter().zip(new_tids.iter()) {
-                by_old_page
-                    .entry(old_tid.page)
-                    .or_default()
-                    .push((old_tid.slot, *new_tid));
-            }
-            for (page_id, slots_and_new) in by_old_page {
-                // Bulk stamp every old tuple on this page under one
-                // PageWrite. `stamp_updated_old_inline` writes only
-                // the four header fields that change (xmax / cmax /
-                // infomask / ctid) at fixed offsets, skipping the
-                // full `TupleHeader::decode` + re-`encode` that
-                // `stamp_updated_old` paid per row.
+            // `fallback` was built by appending in old-page order
+            // during the page-run walk above, so the zip pairs
+            // `(old_tid, new_tid)` are already grouped by
+            // `old_tid.page`. A linear run-length walk replaces the
+            // former `by_old_page` HashMap: every page-group is
+            // processed under one `PageWrite`, exactly as before, but
+            // without the per-row hash + Vec-grow overhead the
+            // HashMap accumulator paid.
+            debug_assert_eq!(fallback.len(), new_tids.len());
+            let mut k = 0;
+            while k < fallback.len() {
+                let page_id = fallback[k].0.page;
+                let mut m = k + 1;
+                while m < fallback.len() && fallback[m].0.page == page_id {
+                    m += 1;
+                }
+                // [k, m) is one source-page run.
                 let guard = self.pool.get_page(page_id)?;
                 let mut page = guard.write();
                 let page_bytes = page.as_bytes_mut();
-                for (slot, new_tid) in &slots_and_new {
+                for idx in k..m {
                     Self::stamp_updated_old_inline(
                         page_bytes,
-                        *slot,
-                        *new_tid,
+                        fallback[idx].0.slot,
+                        new_tids[idx],
                         opts.xid,
                         opts.command_id,
                     )?;
@@ -1385,6 +1426,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 if let Some(vm) = opts.vm {
                     vm.clear(page_id.relation, page_id.block);
                 }
+                k = m;
             }
             total = total.saturating_add(fallback.len());
             self.column_cache.bump_version(rel);
