@@ -375,17 +375,17 @@ impl<L: PageLoader> std::fmt::Debug for HeapAccess<L> {
     }
 }
 
-
-mod insert;
 mod delete;
-mod update;
-mod update_inplace;
-mod scan;
 mod helpers;
-mod wal_emit;
-mod walker;
+mod insert;
+mod scan;
 #[cfg(test)]
 mod tests;
+mod update;
+mod update_inplace;
+mod vacuum;
+mod wal_emit;
+mod walker;
 
 impl<L: PageLoader> HeapAccess<L> {
     /// Build a new heap access bound to `pool`.
