@@ -1264,6 +1264,7 @@ impl<L: PageLoader> HeapAccess<L> {
             inner: self.scan(rel, block_count),
             snapshot,
             oracle,
+            xmin_cache: None,
         }
     }
 
@@ -2037,6 +2038,22 @@ pub struct VisibleHeapScan<'a, L: PageLoader, O: XidStatusOracle + ?Sized> {
     inner: HeapScan<'a, L>,
     snapshot: &'a Snapshot,
     oracle: &'a O,
+    /// One-entry cache of `(xmin, infomask_bits) → visibility` valid
+    /// only when the tuple has `xmax == Xid::INVALID`.
+    ///
+    /// For analytic scans the overwhelmingly common case is a long
+    /// run of tuples sharing the same `xmin` (the preload's
+    /// transaction) with default `infomask` and no deleter. The
+    /// MVCC `is_visible` decision then depends only on whether
+    /// `xmin` committed before the current snapshot — identical
+    /// for every tuple in the run. We cache the boolean answer for
+    /// the most-recent `(xmin, infomask)` key and short-circuit
+    /// the full decision (including the per-tuple oracle.status
+    /// `DashMap` probe) on match. Any deviation (non-invalid
+    /// `xmax`, different infomask) falls through to the slow
+    /// `is_visible` path without consulting the cache, and a fresh
+    /// cache entry is recorded after the slow path completes.
+    xmin_cache: Option<(Xid, u16, bool)>,
 }
 
 impl<L: PageLoader, O: XidStatusOracle + ?Sized> std::fmt::Debug for VisibleHeapScan<'_, L, O> {
@@ -2055,6 +2072,46 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> Iterator for VisibleHeapScan<'_
             match self.inner.next()? {
                 Err(e) => return Some(Err(e)),
                 Ok(tup) => {
+                    // Fast path: same `(xmin, infomask)` as the last
+                    // visibility decision *and* the tuple has no
+                    // deleter (`xmax == Xid::INVALID`). On a hit we
+                    // reuse the cached verdict and skip the
+                    // oracle.status `DashMap` probe entirely. For
+                    // the `select_avg_1m` / `filter_sum_1m` bench
+                    // shape (one preload transaction, no deletes)
+                    // this turns ~1 M oracle probes into one.
+                    if tup.header.xmax.is_invalid() {
+                        let infomask_bits = tup.header.infomask.bits();
+                        if let Some((cached_xmin, cached_infomask, cached_visible)) =
+                            self.xmin_cache
+                        {
+                            if cached_xmin == tup.header.xmin && cached_infomask == infomask_bits {
+                                if cached_visible {
+                                    return Some(Ok(tup));
+                                }
+                                continue;
+                            }
+                        }
+                        // Cache miss: compute the full visibility
+                        // decision once and stash the verdict for
+                        // subsequent matching tuples.
+                        let visible = matches!(
+                            is_visible(&tup.header, self.snapshot, self.oracle),
+                            Visibility::Visible,
+                        );
+                        self.xmin_cache = Some((tup.header.xmin, infomask_bits, visible));
+                        if visible {
+                            return Some(Ok(tup));
+                        }
+                        continue;
+                    }
+                    // Slow path for tuples with a non-invalid
+                    // `xmax`: the visibility verdict depends on
+                    // both `xmin` and `xmax` status; the
+                    // single-key cache cannot model that without
+                    // false positives, so we go through the full
+                    // `is_visible` rules without touching the
+                    // cache.
                     if matches!(
                         is_visible(&tup.header, self.snapshot, self.oracle),
                         Visibility::Visible
