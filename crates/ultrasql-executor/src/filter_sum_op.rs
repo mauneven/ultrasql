@@ -31,7 +31,10 @@
 //! widening rule for `SUM(INT)` and the binder's
 //! `AggregateFunc::Sum` result type.
 
+use std::sync::Arc;
+
 use ultrasql_core::{DataType, Field, Schema};
+use ultrasql_storage::column_cache::CachedColumns;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
 use ultrasql_vec::kernels::{
@@ -103,6 +106,108 @@ impl FilterSumI32Scan {
             output_schema,
             done: false,
         }
+    }
+}
+
+/// Direct-from-cache variant of [`FilterSumI32Scan`].
+///
+/// When the relation already has a live
+/// [`ColumnCache`][ultrasql_storage::column_cache::ColumnCache]
+/// entry, pipeline lowering wires this operator instead of the
+/// `SeqScan(cache) → FilterSumI32Scan` chain. The cache-driving
+/// `SeqScan` would copy the entire column out of the cache via
+/// `slice_column` (one 4 MB `memcpy` per 1 M-row Int32 column)
+/// before passing it to `FilterSumI32Scan`. Reading directly from
+/// the `Arc<CachedColumns>` borrow skips that copy and runs the
+/// fused SIMD kernel once over the full relation.
+pub struct CachedFilterSumI32Scan {
+    columns: Arc<CachedColumns>,
+    predicate_col: usize,
+    predicate_threshold: i32,
+    predicate_op: CmpOp,
+    sum_col: usize,
+    output_schema: Schema,
+    done: bool,
+}
+
+impl std::fmt::Debug for CachedFilterSumI32Scan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedFilterSumI32Scan")
+            .field("predicate_col", &self.predicate_col)
+            .field("predicate_threshold", &self.predicate_threshold)
+            .field("predicate_op", &self.predicate_op)
+            .field("sum_col", &self.sum_col)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CachedFilterSumI32Scan {
+    /// Build the cached-input fused operator. Caller is responsible
+    /// for verifying that `predicate_col` and `sum_col` reference
+    /// `Int32` columns inside `columns.columns`.
+    #[must_use]
+    pub fn new(
+        columns: Arc<CachedColumns>,
+        predicate_col: usize,
+        predicate_threshold: i32,
+        predicate_op: CmpOp,
+        sum_col: usize,
+        output_name: String,
+    ) -> Self {
+        let output_schema = Schema::new([Field::required(output_name, DataType::Int64)])
+            .expect("output schema is trivially well-formed");
+        Self {
+            columns,
+            predicate_col,
+            predicate_threshold,
+            predicate_op,
+            sum_col,
+            output_schema,
+            done: false,
+        }
+    }
+}
+
+impl Operator for CachedFilterSumI32Scan {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+
+        let cols = &self.columns.columns;
+        let (pred_col, sum_col) = match (&cols[self.predicate_col], &cols[self.sum_col]) {
+            (Column::Int32(p), Column::Int32(s)) => (p, s),
+            _ => {
+                return Err(ExecError::TypeMismatch(
+                    "CachedFilterSumI32Scan: predicate and sum columns must both be Int32"
+                        .to_owned(),
+                ));
+            }
+        };
+        let n_rows = pred_col.len();
+        let total = if self.predicate_col == self.sum_col && matches!(self.predicate_op, CmpOp::Gt)
+        {
+            filter_sum_i32_widening_gt(sum_col.data(), self.predicate_threshold)
+        } else {
+            let mask = cmp_i32_scalar(pred_col, self.predicate_threshold, self.predicate_op);
+            sum_i32_widening_with_mask(sum_col, &mask)
+        };
+
+        let result_col = if n_rows == 0 {
+            let mut nulls = ultrasql_vec::Bitmap::new(1, false);
+            nulls.set(0, false);
+            Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+        } else {
+            Column::Int64(NumericColumn::from_data(vec![total]))
+        };
+        let batch = Batch::new([result_col]).map_err(ExecError::from)?;
+        Ok(Some(batch))
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.output_schema
     }
 }
 

@@ -54,7 +54,7 @@ use std::sync::Arc;
 
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
-use ultrasql_executor::filter_sum_op::FilterSumI32Scan;
+use ultrasql_executor::filter_sum_op::{CachedFilterSumI32Scan, FilterSumI32Scan};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
     CteScan, Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan,
@@ -1170,9 +1170,30 @@ fn try_lower_fused_filter_sum_i32(
         return Ok(None);
     }
 
-    // Build inner SeqScan + wrap in fused operator. The SeqScan
-    // automatically picks up the column-cache path when an entry
-    // is live for this relation.
+    // Cache-driven fast path: when the relation already has a
+    // live column-cache entry, skip the SeqScan layer entirely
+    // and run the fused SIMD kernel directly over the cached
+    // `Arc<CachedColumns>`. The cache-driving `SeqScan` would
+    // otherwise copy each column out via `slice_column` (one
+    // ~4 MB memcpy per 1 M-row Int32 column) before passing the
+    // batch through the operator pipeline.
+    let rel_id = RelationId(entry.oid);
+    if let Some(columns) = ctx.heap.column_cache.get(rel_id) {
+        let fused = CachedFilterSumI32Scan::new(
+            columns,
+            pred_col,
+            pred_lit,
+            pred_op,
+            sum_col,
+            agg.output_name.clone(),
+        );
+        return Ok(Some(Box::new(fused)));
+    }
+
+    // Cache miss — drive the regular SeqScan path. The first
+    // SeqScan over a relation populates the column cache as a
+    // side effect of its walk, so subsequent queries hit the
+    // direct-from-cache branch above.
     let scan = lower_heap_scan(entry, ctx);
     let fused = FilterSumI32Scan::new(
         scan,
