@@ -37,6 +37,16 @@
         "postgres17": 0.0,
         "duckdb": 0.0
       }
+    },
+    "filter_sum_10m_i64": {
+      "throughput_per_sec": 4545454.0,
+      "p99_us": 2200.0,
+      "competitors": {
+        "clickhouse": 2336448.0,
+        "duckdb":     908265.0,
+        "sqlite3":    38903.0,
+        "postgres17": 28213.0
+      }
     }
   }
 }

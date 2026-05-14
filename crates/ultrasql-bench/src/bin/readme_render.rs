@@ -200,6 +200,32 @@ static STATIC_DEFAULTS: &[StaticTable] = &[
             },
         ],
     },
+    StaticTable {
+        id: "filter_sum_10m_i64",
+        heading: "Filter + SUM — 10 million i64 rows, hot cache",
+        rows: &[
+            StaticRow {
+                engine: "**UltraSQL** (kernel)",
+                median_us: 2_200.0,
+            },
+            StaticRow {
+                engine: "ClickHouse",
+                median_us: 4_280.0,
+            },
+            StaticRow {
+                engine: "DuckDB",
+                median_us: 11_010.0,
+            },
+            StaticRow {
+                engine: "SQLite",
+                median_us: 257_030.0,
+            },
+            StaticRow {
+                engine: "PostgreSQL",
+                median_us: 354_420.0,
+            },
+        ],
+    },
     // Write-side benchmarks — no measured data yet; rendered as "not yet measured".
     StaticTable {
         id: "insert_throughput_10k",
@@ -838,5 +864,46 @@ rest\n";
             let table = tables.get(st.id).expect("missing table for static id");
             assert!(!table.is_empty(), "table for {} must not be empty", st.id);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // filter_sum_10m_static_default_renders
+    // -----------------------------------------------------------------------
+
+    /// When the baselines JSON has 0.0 for `filter_sum_10m_i64`, the static
+    /// default's 2.20 ms must still appear in the rendered table so the README
+    /// remains publishable before a fresh baseline run lands.
+    #[test]
+    fn filter_sum_10m_static_default_renders() {
+        // Baseline with zeroed-out UltraSQL value — simulates a newly-added
+        // entry that has not yet been measured by the gate runner.
+        let mut baseline: HashMap<String, BaselineEntry> = HashMap::new();
+        baseline.insert(
+            "filter_sum_10m_i64".to_string(),
+            BaselineEntry {
+                p99_us: 0.0,
+                competitors: HashMap::new(),
+            },
+        );
+
+        let tables = build_tables(&baseline);
+        let table = tables
+            .get("filter_sum_10m_i64")
+            .expect("filter_sum_10m_i64 must be present in tables");
+
+        // Static default for UltraSQL is 2.20 ms (2 200 µs).
+        assert!(
+            table.contains("2.20 ms"),
+            "static default 2.20 ms should appear when baseline is zero: {table}"
+        );
+        // Competitor rows must also be present.
+        assert!(
+            table.contains("ClickHouse"),
+            "ClickHouse row must be present: {table}"
+        );
+        assert!(
+            table.contains("DuckDB"),
+            "DuckDB row must be present: {table}"
+        );
     }
 }

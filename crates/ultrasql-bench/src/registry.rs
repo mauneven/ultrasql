@@ -379,7 +379,7 @@ const fn stub_run(_ctx: &BenchContext) -> BenchResult {
 ///    `benchmarks/baselines/<stage>.json`.
 pub static REGISTRY: &[BenchSpec] = &SPECS;
 
-static SPECS: [BenchSpec; 16] = [
+static SPECS: [BenchSpec; 17] = [
     // ------------------------------------------------------------------
     // v0.3 — write-side (storage) benchmarks
     //
@@ -552,6 +552,18 @@ static SPECS: [BenchSpec; 16] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
         ],
         run: stub_run,
+    },
+    BenchSpec {
+        id: "filter_sum_10m_i64",
+        stage: Stage::V0_7,
+        workload: Workload::AnalyticAggregate,
+        competitor_floors: &[
+            (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
+            (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
+        ],
+        run: stub_run, // real run wires in once the bench-driver dispatcher lands
     },
     BenchSpec {
         id: "tpch_q22",
