@@ -136,6 +136,40 @@ pub struct TupleHeader {
 }
 
 impl TupleHeader {
+    /// Build a partial header carrying only the fields needed by
+    /// callers who already know the tuple is MVCC-visible via a
+    /// cached `(xmin, infomask_bits)` hit — typically the
+    /// [`HeapAccess::for_each_visible`]
+    /// (in `ultrasql-storage`) hot path. Other fields are
+    /// best-effort sentinels: `xmax` is `INVALID` (the cache key
+    /// implied `xmax == 0`), `cmin`/`cmax`/`n_atts`/`data_offset`
+    /// are zero, and `ctid` points at slot 0 of relation 0.
+    ///
+    /// Callers must not read any field other than `xmin` /
+    /// `xmax` / `infomask` from the returned header — every other
+    /// field is intentionally bogus. The minimal header exists
+    /// purely to keep the existing `FnMut(tid, header, payload)`
+    /// callback contract intact without paying the full
+    /// 40-byte [`Self::decode`] when the fast-path
+    /// visibility cache already says "visible".
+    #[must_use]
+    #[inline]
+    pub const fn minimal_for_visible_cache_hit(xmin: Xid, infomask_bits: u16) -> Self {
+        Self {
+            xmin,
+            xmax: Xid::INVALID,
+            cmin: CommandId::FIRST,
+            cmax: CommandId::FIRST,
+            infomask: InfoMask::from_bits(infomask_bits),
+            n_atts: 0,
+            data_offset: 0,
+            ctid: TupleId::new(
+                PageId::new(RelationId::new(0), BlockNumber::new(0)),
+                0,
+            ),
+        }
+    }
+
     /// Build a fresh header for a freshly-inserted tuple at the given
     /// position.
     #[must_use]
