@@ -82,7 +82,7 @@ pub fn run_ddl_command(tag: &str) -> SelectResult {
 /// slot for the inserted row); the others use `UPDATE N` / `DELETE N`.
 ///
 /// The operator's output schema is the single-column
-/// `affected_rows: Int64` produced by [`ModifyTable`]; this function
+/// `affected_rows: Int64` produced by `ModifyTable`; this function
 /// reads that column and folds it into the row-count.
 pub fn run_modify_command(
     op: &mut dyn Operator,
