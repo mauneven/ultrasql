@@ -95,9 +95,16 @@ impl Filter {
     /// fast path handled the input, `Ok(None)` when the predicate shape
     /// or type combination is not covered by the SIMD kernels and the
     /// caller must fall back to the scalar interpreter.
-    fn try_fast_path(&self, input: &Batch) -> Result<Option<Batch>, ExecError> {
+    /// Returns:
+    /// - `Ok(Some(out))` when the fast path handled the input. `out`
+    ///   is either a freshly-materialised selection or the input
+    ///   itself when every row passed (see all-pass shortcut below).
+    /// - `Ok(None)` when the predicate shape or type combination is
+    ///   outside the SIMD kernels and the caller must fall back to
+    ///   the scalar interpreter.
+    fn try_fast_path(&self, input: Batch) -> Result<TryFastPath, ExecError> {
         let Some(fp) = self.fast.as_ref() else {
-            return Ok(None);
+            return Ok(TryFastPath::Unhandled(input));
         };
         let cols = input.columns();
         let key_col = cols
@@ -122,16 +129,45 @@ impl Filter {
         };
 
         let Some(mask) = mask else {
-            return Ok(None);
+            return Ok(TryFastPath::Unhandled(input));
         };
 
         let selected = mask.count_ones();
+
+        // All-pass shortcut. When every row in the input batch
+        // satisfies the predicate, materialising a fresh
+        // `Vec<Column>` via `select_column` is pure copy overhead —
+        // the input batch already represents the desired output. We
+        // hand the batch through unchanged.
+        //
+        // This is safe because `mask` is the AND of the predicate
+        // result with the key column's validity bitmap. A 1-bit in
+        // every row position therefore implies (a) the predicate
+        // accepted every key, and (b) no key value was NULL, so the
+        // input contains no row that the slow path would have
+        // filtered out.
+        //
+        // Hot on the cross_compare_sql `UPDATE … WHERE id < n_rows`
+        // shape, which is a predicate that matches every preloaded
+        // row.
+        if selected == input.rows() {
+            return Ok(TryFastPath::Handled(input));
+        }
+
         let mut out_cols: Vec<Column> = Vec::with_capacity(cols.len());
         for col in cols {
             out_cols.push(select_column(col, &mask, selected));
         }
-        Batch::new(out_cols).map(Some).map_err(ExecError::from)
+        Ok(TryFastPath::Handled(Batch::new(out_cols)?))
     }
+}
+
+/// Result of [`Filter::try_fast_path`]. Carries the input batch
+/// through when the fast path did not apply so the caller can hand
+/// it to the slow path without re-fetching it from the child.
+enum TryFastPath {
+    Handled(Batch),
+    Unhandled(Batch),
 }
 
 impl Operator for Filter {
@@ -141,9 +177,10 @@ impl Operator for Filter {
         };
 
         // Fast path: column-op-literal over Int32/Int64.
-        if let Some(out) = self.try_fast_path(&input)? {
-            return Ok(Some(out));
-        }
+        let input = match self.try_fast_path(input)? {
+            TryFastPath::Handled(out) => return Ok(Some(out)),
+            TryFastPath::Unhandled(b) => b,
+        };
 
         // Decode the batch into rows, apply the predicate, collect survivors.
         let rows = batch_to_rows(&input, &self.schema)?;
