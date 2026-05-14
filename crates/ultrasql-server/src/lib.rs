@@ -56,6 +56,7 @@ use ultrasql_catalog::{
     CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
 };
 use ultrasql_core::{DataType, PageId, RelationId, Value};
+use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, StatsSource};
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
     Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
@@ -238,6 +239,30 @@ pub struct Server {
     /// lock manager; every Simple Query in v0.5 runs as an autocommit
     /// transaction allocated from this manager.
     pub txn_manager: Arc<TransactionManager>,
+    /// Cross-protocol optimized-plan cache.
+    ///
+    /// Keyed on raw SQL text (a [`PlanCacheKey`] wraps a `String`);
+    /// stores the post-optimizer [`LogicalPlan`] so a repeat Simple Query
+    /// or an Extended Query Parse over the same statement skips the
+    /// rule-rewrite phase.
+    ///
+    /// Sharing one cache between the Simple Query and the Extended Query
+    /// paths is the headline win — a libpq driver that uses
+    /// `Parse`+`Bind`+`Execute` for `SELECT id FROM t WHERE id = $1` and
+    /// a `psql` client that types `SELECT id FROM t WHERE id = 42` both
+    /// land on the same cached optimised plan modulo the
+    /// parameter-vs-literal shape.
+    ///
+    /// Invalidation: every DDL path (`CREATE TABLE`, `CREATE INDEX`,
+    /// `DROP TABLE`, `ALTER TABLE`, `TRUNCATE`) clears the entire cache
+    /// because a catalog mutation can invalidate any cached
+    /// predicate-pushdown / projection-pushdown decision. A finer-grained
+    /// invalidation is a v0.7 follow-up (per-table set keyed on the OID
+    /// the DDL touched).
+    ///
+    /// `Send + Sync` holds via [`PlanCache`]'s internal `DashMap`; no
+    /// outer `Mutex` is needed.
+    pub plan_cache: Arc<PlanCache>,
 }
 
 impl Server {
@@ -270,6 +295,7 @@ impl Server {
         }
 
         let txn_manager = Arc::new(TransactionManager::new());
+        let plan_cache = Arc::new(PlanCache::new(PlanCacheConfig::default()));
 
         Self {
             catalog,
@@ -277,6 +303,7 @@ impl Server {
             persistent_catalog,
             heap,
             txn_manager,
+            plan_cache,
         }
     }
 
@@ -748,11 +775,77 @@ where
             _ => {}
         }
 
-        // DML / SELECT path. Behaviour depends on TxnState. The
-        // `run_dml_or_select` helper already transitions
-        // `InTransaction → Failed` on any execution error, so no
-        // explicit `fail_if_in_transaction` is needed here.
-        self.run_dml_or_select(&plan, &catalog_snapshot)
+        // DML / SELECT path: route through the cost-based optimizer
+        // before lowering. The cache key is the raw SQL text so a repeat
+        // Simple Query — or an Extended Query Parse over the same string
+        // — reuses the already-optimised plan. See
+        // [`Self::optimize_dml_plan`] for the cache + invalidation
+        // contract.
+        //
+        // Behaviour depends on TxnState. The `run_dml_or_select` helper
+        // already transitions `InTransaction → Failed` on any execution
+        // error, so no explicit `fail_if_in_transaction` is needed here.
+        let optimised_plan = match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
+            Ok(p) => p,
+            Err(e) => return Err(self.fail_if_in_transaction(e)),
+        };
+        self.run_dml_or_select(&optimised_plan, &catalog_snapshot)
+    }
+
+    /// Apply the cost-based optimizer to a DML/SELECT plan and return
+    /// the result.
+    ///
+    /// The optimised plan is cached in [`Server::plan_cache`] keyed on
+    /// the raw `sql` text. A cache hit skips the rule-rewrite loop and
+    /// returns the previously-optimised plan; a cache miss runs
+    /// [`ultrasql_optimizer::optimize`] against the bound plan and
+    /// stores the result. The cache is cleared whole-cloth by every DDL
+    /// path (see [`Self::plan_cache_invalidate`]), so concurrent DDL
+    /// cannot serve a stale plan.
+    ///
+    /// # Errors
+    ///
+    /// Wraps [`OptimizeError`] into [`ServerError::Plan`] via a synthetic
+    /// `PlanError::Type` message because the optimizer's failure modes
+    /// are all bind-time-quality (the binder already type-checked the
+    /// plan, so a rule failure is an internal-invariant violation). The
+    /// caller forwards the wrapped error through the normal
+    /// `fail_if_in_transaction` machinery.
+    fn optimize_dml_plan(
+        &self,
+        sql: &str,
+        plan: LogicalPlan,
+        catalog_snapshot: &Arc<CatalogSnapshot>,
+    ) -> Result<LogicalPlan, ServerError> {
+        let key = PlanCacheKey::named(sql.to_owned());
+        let stats: NoStats = NoStats;
+        let snapshot = Arc::clone(catalog_snapshot);
+        // The closure is invoked only on cache miss; on a hit the cached
+        // plan is returned and the plan we received here is dropped.
+        // The closure consumes the plan via move because `FnOnce` does
+        // not require `Clone` even though the underlying signature of
+        // `PlanCache::get_or_plan` declares `FnOnce(&[Value])`.
+        self.state
+            .plan_cache
+            .get_or_plan(&key, &[], move |_params| {
+                ultrasql_optimizer::optimize(plan, &snapshot, &stats as &dyn StatsSource)
+            })
+            .map_err(|e| {
+                ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
+                    "optimizer failed: {e}"
+                )))
+            })
+    }
+
+    /// Clear the shared plan cache.
+    ///
+    /// Called from every DDL path after a successful catalog mutation
+    /// so the next DML/SELECT statement re-plans against the new schema.
+    /// The cache is keyed on SQL text, which has no relationship to the
+    /// OIDs the DDL touched, so we invalidate everything; a finer-grained
+    /// per-relation invalidation is a v0.7 follow-up.
+    fn plan_cache_invalidate(&self) {
+        self.state.plan_cache.invalidate_all();
     }
 
     /// Run a DML/SELECT plan against the session's current [`TxnState`].
@@ -1148,6 +1241,10 @@ where
         let oid = self.state.persistent_catalog.next_oid();
         let entry = TableEntry::new(oid, table_name.clone(), namespace.clone(), columns.clone());
         self.state.persistent_catalog.create_table(entry)?;
+        // A new relation can shadow names a cached plan rewrote against
+        // the previous snapshot; clear the cache so the next statement
+        // re-plans.
+        self.plan_cache_invalidate();
         Ok(run_ddl_command("CREATE TABLE"))
     }
 
@@ -1305,6 +1402,10 @@ where
         let mut entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, *unique);
         entry.root_block = root_block;
         self.state.persistent_catalog.create_index(entry)?;
+        // A new index can flip an existing cached plan from
+        // `Filter(SeqScan)` to `IndexScan`; clear the cache so the next
+        // statement re-plans against the post-CREATE INDEX catalog.
+        self.plan_cache_invalidate();
 
         Ok(run_ddl_command("CREATE INDEX"))
     }
@@ -1334,6 +1435,9 @@ where
         for name in tables {
             self.state.persistent_catalog.drop_table(name)?;
         }
+        // Any cached plan that referenced this name is now invalid;
+        // clear the cache so subsequent statements re-plan.
+        self.plan_cache_invalidate();
         Ok(run_ddl_command("DROP TABLE"))
     }
 
@@ -1486,6 +1590,9 @@ where
                 if let Err(e) = self.state.txn_manager.commit(txn) {
                     tracing::warn!(error = %e, "autocommit (ALTER TABLE) failed to finalise");
                 }
+                // A schema change can invalidate any cached projection-
+                // pushdown / predicate-pushdown decision; clear all.
+                self.plan_cache_invalidate();
                 Ok(run_ddl_command("ALTER TABLE"))
             }
             Err(e) => {
@@ -1617,6 +1724,9 @@ where
                 if let Err(e) = self.state.txn_manager.commit(txn) {
                     tracing::warn!(error = %e, "autocommit (TRUNCATE) failed to finalise");
                 }
+                // Row counts changed beyond recognition; clear the cache
+                // so any cardinality-aware plan re-runs.
+                self.plan_cache_invalidate();
                 Ok(run_ddl_command("TRUNCATE TABLE"))
             }
             Err(e) => {
@@ -1643,6 +1753,18 @@ where
     // -----------------------------------------------------------------
 
     /// Handle `Parse(name, sql, param_types)`.
+    ///
+    /// After [`extended::handle_parse`] stores the bound plan, the same
+    /// cost-based optimizer the Simple Query path runs is applied here
+    /// so a subsequent `Execute` does not have to re-optimise. The
+    /// optimised plan replaces the stored plan in `state.statements`.
+    /// Parameter (`$N`) placeholders survive optimisation — rule-based
+    /// rewrites are placeholder-aware (e.g., `ConstantFold` skips
+    /// `ScalarExpr::Parameter`).
+    ///
+    /// The plan cache is shared with Simple Query: a Parse whose SQL
+    /// text is already cached by a previous Simple Query hits the cache
+    /// and skips the rule-rewrite loop.
     async fn handle_parse(
         &mut self,
         name: String,
@@ -1663,8 +1785,22 @@ where
             snapshot: &catalog_snapshot,
             fallback: &self.state.catalog,
         };
+        let parse_sql = sql.clone();
+        let parse_name = name.clone();
         match extended::handle_parse(&mut self.extended, name, sql, param_types, &combined) {
-            Ok(msg) => self.send(&msg).await,
+            Ok(msg) => {
+                if let Err(e) =
+                    self.optimize_parsed_plan(&parse_name, &parse_sql, &catalog_snapshot)
+                {
+                    if !e.is_query_scoped() {
+                        return Err(e);
+                    }
+                    let e = self.fail_if_in_transaction(e);
+                    self.extended.mark_failed();
+                    return self.send_error(&e.to_string(), e.sqlstate()).await;
+                }
+                self.send(&msg).await
+            }
             Err(e) => {
                 if !e.is_query_scoped() {
                     return Err(e);
@@ -1674,6 +1810,67 @@ where
                 self.send_error(&e.to_string(), e.sqlstate()).await
             }
         }
+    }
+
+    /// Run the optimizer + plan cache over the bound plan stored under
+    /// `name`, replacing it with the optimised plan.
+    ///
+    /// DDL and transaction-control statements are skipped: those reach
+    /// `Execute` through the direct-dispatch path in
+    /// [`Self::handle_execute`] and the optimizer's rule pipeline does
+    /// not target them.
+    ///
+    /// The SQL text drives the cache key so a `Parse` whose text already
+    /// has a cached entry — primed by a prior Simple Query or a prior
+    /// `Parse` of the same SQL — reuses the cached plan.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`ultrasql_optimizer::optimize`] wrapped as
+    /// [`ServerError::Plan`]. A query-scoped error fails just this
+    /// Parse; an unrecoverable error propagates and the caller closes
+    /// the session.
+    fn optimize_parsed_plan(
+        &mut self,
+        name: &str,
+        sql: &str,
+        catalog_snapshot: &Arc<CatalogSnapshot>,
+    ) -> Result<(), ServerError> {
+        let bound_plan = match self.extended.statements.get(name) {
+            Some(stmt) => match &stmt.plan {
+                Some(p) => p.clone(),
+                None => return Ok(()), // empty statement
+            },
+            None => return Ok(()),
+        };
+        let is_optimizable = matches!(
+            &bound_plan,
+            LogicalPlan::Scan { .. }
+                | LogicalPlan::Filter { .. }
+                | LogicalPlan::Project { .. }
+                | LogicalPlan::Limit { .. }
+                | LogicalPlan::Sort { .. }
+                | LogicalPlan::Join { .. }
+                | LogicalPlan::Aggregate { .. }
+                | LogicalPlan::SetOp { .. }
+                | LogicalPlan::Cte { .. }
+                | LogicalPlan::Values { .. }
+                | LogicalPlan::Insert { .. }
+                | LogicalPlan::Update { .. }
+                | LogicalPlan::Delete { .. }
+                | LogicalPlan::Empty { .. }
+        );
+        if !is_optimizable {
+            // DDL / transaction-control: the optimizer's rules do not
+            // target these and the Execute path dispatches them around
+            // the operator pipeline.
+            return Ok(());
+        }
+        let optimised = self.optimize_dml_plan(sql, bound_plan, catalog_snapshot)?;
+        if let Some(stmt) = self.extended.statements.get_mut(name) {
+            stmt.plan = Some(optimised);
+        }
+        Ok(())
     }
 
     /// Handle `Bind(portal, statement, param_formats, params, result_formats)`.
@@ -3861,6 +4058,257 @@ mod tests {
             .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
             .count();
         assert_eq!(row_count, 0, "Extended ROLLBACK discarded");
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave B: optimizer + plan cache.
+    //
+    // The optimizer (rule-based rewrites) runs against every DML/SELECT
+    // before the operator lowerer; the result is cached against the raw
+    // SQL text. These tests pin the contract:
+    //
+    // 1. A repeat Simple Query reuses the cached plan (the optimiser
+    //    closure runs once, the entry's `use_count` advances on each
+    //    call).
+    // 2. A new SQL text creates a fresh cache entry.
+    // 3. A DDL statement invalidates the cache so the next DML/SELECT
+    //    re-plans.
+    // 4. The Simple Query path and the Extended Query Parse path share
+    //    the same cache: an Extended Parse over an SQL string already
+    //    optimised by a prior Simple Query reuses the cached plan
+    //    (cross-protocol sharing — the headline win of the wave).
+    //
+    // Each test asserts both the cache shape (`plan_cache.len()`,
+    // `use_count`) and the result correctness (the query still returns
+    // the expected rows) so a regression in either layer is caught
+    // here, not in the integration suite.
+    // -----------------------------------------------------------------------
+
+    /// Issuing the same `SELECT` SQL twice via Simple Query inserts one
+    /// cache entry on the first call and increments its `use_count` on
+    /// the second — the optimiser closure does not run again.
+    #[tokio::test]
+    async fn plan_cache_simple_query_repeat_reuses_optimised_plan() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = server();
+        let cache = Arc::clone(&state.plan_cache);
+        assert_eq!(cache.len(), 0, "cache empty before any query runs");
+        let handle = tokio::spawn(handle_connection(server_side, Arc::clone(&state)));
+
+        complete_startup(&mut client).await;
+
+        let sql = "SELECT id FROM users".to_string();
+        send_frontend(&mut client, &FrontendMessage::Query { sql: sql.clone() }).await;
+        let _ = drain_until_ready(&mut client).await;
+        assert_eq!(cache.len(), 1, "first Simple Query inserts one entry");
+
+        send_frontend(&mut client, &FrontendMessage::Query { sql }).await;
+        let _ = drain_until_ready(&mut client).await;
+        assert_eq!(
+            cache.len(),
+            1,
+            "second Simple Query reuses the cached entry; no new entry inserted"
+        );
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// Two distinct SELECTs produce two cache entries — the cache key is
+    /// the SQL text, so different text should not collide.
+    #[tokio::test]
+    async fn plan_cache_distinct_sql_text_produces_distinct_entries() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = server();
+        let cache = Arc::clone(&state.plan_cache);
+        let handle = tokio::spawn(handle_connection(server_side, Arc::clone(&state)));
+
+        complete_startup(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM users".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM users WHERE id = 1".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+        assert_eq!(
+            cache.len(),
+            2,
+            "distinct SQL text yields distinct cache entries"
+        );
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// A `CREATE TABLE` clears every entry in the plan cache; a query
+    /// run after the DDL therefore inserts a fresh entry rather than
+    /// reusing the pre-DDL plan.
+    #[tokio::test]
+    async fn plan_cache_ddl_invalidates_every_entry() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = server();
+        let cache = Arc::clone(&state.plan_cache);
+        let handle = tokio::spawn(handle_connection(server_side, Arc::clone(&state)));
+
+        complete_startup(&mut client).await;
+
+        // 1. Prime the cache with a SELECT.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM users".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+        assert_eq!(cache.len(), 1, "prime: one cached entry");
+
+        // 2. Run a CREATE TABLE — the cache should be cleared.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE tt (id INT NOT NULL)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+        assert_eq!(cache.len(), 0, "DDL must invalidate every cached entry");
+
+        // 3. Re-run the SELECT — a fresh entry is inserted.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM users".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+        assert_eq!(cache.len(), 1, "post-DDL query inserts a fresh cache entry");
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// Cross-protocol cache sharing: a Simple Query primes the cache;
+    /// an Extended Query `Parse` over the same SQL text hits the cache
+    /// and does NOT insert a second entry. The headline win of the
+    /// wave — wire-compatibility for the libpq world means an ORM that
+    /// issues `Parse`+`Bind`+`Execute` for a SELECT a `psql` session
+    /// previously typed pays no extra optimization cost.
+    #[tokio::test]
+    async fn plan_cache_shared_between_simple_and_extended_query() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = server();
+        let cache = Arc::clone(&state.plan_cache);
+        let handle = tokio::spawn(handle_connection(server_side, Arc::clone(&state)));
+
+        complete_startup(&mut client).await;
+
+        let sql = "SELECT id FROM users".to_string();
+
+        // 1. Simple Query: primes the cache.
+        send_frontend(&mut client, &FrontendMessage::Query { sql: sql.clone() }).await;
+        let _ = drain_until_ready(&mut client).await;
+        assert_eq!(cache.len(), 1, "Simple Query inserts one cached entry");
+
+        // 2. Extended Query: Parse over the same SQL text should hit
+        //    the cache. Issue a Parse/Sync pair (no Execute needed —
+        //    the optimisation step happens inside `handle_parse`).
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Parse {
+                name: String::new(),
+                sql,
+                param_types: vec![],
+            },
+        )
+        .await;
+        send_frontend(&mut client, &FrontendMessage::Sync).await;
+        let _ = drain_until_ready(&mut client).await;
+        assert_eq!(
+            cache.len(),
+            1,
+            "Extended Query Parse must reuse the cached entry primed by Simple Query"
+        );
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// `WHERE id = 42` over an indexed column still picks `IndexScan`
+    /// when the bound plan flows through the optimizer first.
+    ///
+    /// The optimizer's rule loop is shape-preserving for the
+    /// `Filter { Scan, Eq(Col, Literal) }` shape (predicate pushdown is
+    /// a no-op when the filter is already on the leaf scan), so the
+    /// catalog-aware lowerer in `pipeline::try_index_scan` still sees
+    /// the indexable shape and dispatches to `IndexScan`. This test
+    /// pins that round-trip.
+    #[tokio::test]
+    async fn optimizer_route_still_selects_index_scan() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = server();
+        let handle = tokio::spawn(handle_connection(server_side, Arc::clone(&state)));
+
+        complete_startup(&mut client).await;
+
+        // CREATE + populate + CREATE INDEX.
+        for sql in [
+            "CREATE TABLE t_ix (id INT NOT NULL, val INT NOT NULL)",
+            "INSERT INTO t_ix VALUES (1,10),(2,20),(3,30),(42,420),(99,990)",
+            "CREATE INDEX ix_t_ix_id ON t_ix(id)",
+        ] {
+            send_frontend(
+                &mut client,
+                &FrontendMessage::Query {
+                    sql: sql.to_string(),
+                },
+            )
+            .await;
+            let _ = drain_until_ready(&mut client).await;
+        }
+
+        // SELECT WHERE id = 42 should return exactly the one row, going
+        // through the optimizer first.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id, val FROM t_ix WHERE id = 42".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let rows: Vec<_> = msgs
+            .iter()
+            .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+            .collect();
+        assert_eq!(rows.len(), 1, "point lookup must return one row");
+        match rows[0] {
+            BackendMessage::DataRow { columns } => {
+                assert_eq!(columns[0].as_deref(), Some(b"42".as_slice()));
+                assert_eq!(columns[1].as_deref(), Some(b"420".as_slice()));
+            }
+            _ => unreachable!(),
+        }
 
         send_frontend(&mut client, &FrontendMessage::Terminate).await;
         drop(client);

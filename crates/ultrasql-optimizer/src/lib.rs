@@ -25,6 +25,15 @@
 //! let plan = LogicalPlan::Empty { schema: Schema::empty() };
 //! let optimized = Optimizer::new().optimize(plan).expect("optimize ok");
 //! ```
+//!
+//! ## Server entry point ([`optimize`])
+//!
+//! Callers that want the canonical pipeline — rule-based rewrites
+//! configured against a [`ultrasql_catalog::CatalogSnapshot`] and a
+//! [`StatsSource`] — invoke the top-level [`optimize`] function. The
+//! server's DML/SELECT path uses it before lowering a plan into operator
+//! trees so every query feels predicate pushdown, projection pushdown,
+//! constant folding, and the rest of the registered rule set.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -45,8 +54,44 @@ pub use stats::{
     MostCommonValues, PgStatisticRow, RelationStats, StatsCatalog, StatsError,
 };
 
+use std::sync::Arc;
+
 use tracing::debug;
+use ultrasql_catalog::CatalogSnapshot;
 use ultrasql_planner::LogicalPlan;
+
+// ============================================================================
+// Top-level entry point: `optimize`
+// ============================================================================
+
+/// Run the canonical optimization pipeline against `plan`.
+///
+/// Today this is the rule-based rewriter ([`Optimizer::new`] applied to
+/// `plan`). The function accepts the per-statement
+/// [`CatalogSnapshot`] and a [`StatsSource`] so future waves can extend
+/// the pipeline with cost-aware physical selection — the call shape is
+/// stable across that evolution.
+///
+/// The function deliberately returns [`LogicalPlan`]: the optimizer
+/// participates only at the logical level. Lowering a `LogicalPlan` to a
+/// `Box<dyn Operator>` is the server's responsibility (it owns the heap,
+/// MVCC oracle, XID/command-id, and CTE materialisation buffers the
+/// operator tree binds against). The optimizer crate does not depend on
+/// `ultrasql-executor`, and adding that edge would invert the existing
+/// dependency direction (executor → optimizer for cost-model imports).
+///
+/// # Errors
+///
+/// - [`OptimizeError::DidNotConverge`] when the rule loop hits its
+///   iteration cap without reaching a fixed point.
+/// - [`OptimizeError::RuleFailed`] when any rule returns an error.
+pub fn optimize(
+    plan: LogicalPlan,
+    _catalog_snapshot: &Arc<CatalogSnapshot>,
+    _stats: &dyn StatsSource,
+) -> Result<LogicalPlan, OptimizeError> {
+    Optimizer::new().optimize(plan)
+}
 
 // ============================================================================
 // Optimizer
@@ -363,5 +408,74 @@ mod tests {
         } else {
             panic!("expected Filter");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Top-level `optimize` entry point
+    //
+    // These tests pin the contract the server relies on: the function
+    // takes the same arguments the eventual cost-aware physical pipeline
+    // will accept (LogicalPlan + CatalogSnapshot + StatsSource), returns
+    // an optimised LogicalPlan, and produces the same rewrites the
+    // existing `Optimizer::new().optimize` driver produces. The signature
+    // is stable across the upcoming cost-aware physical-selection work
+    // (the catalog and stats arguments are passed verbatim into future
+    // rule sets that consult them).
+    // -----------------------------------------------------------------------
+
+    /// `optimize` returns a logical plan whose Filter has been pushed
+    /// under the Project — same rewrite the [`Optimizer::new`] driver
+    /// produces. Confirms the public entry point dispatches to the
+    /// default rule set.
+    #[test]
+    fn optimize_top_level_applies_default_rules() {
+        use std::sync::Arc;
+        use ultrasql_catalog::PersistentCatalog;
+
+        let proj_schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
+        let project = LogicalPlan::Project {
+            input: Box::new(scan("t")),
+            exprs: vec![(col("id", 0), "id".into())],
+            schema: proj_schema,
+        };
+        let predicate = ScalarExpr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(eq(lit_i32(1), lit_i32(1))),
+            right: Box::new(eq(col("id", 0), lit_i32(5))),
+            data_type: DataType::Bool,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(project),
+            predicate,
+        };
+
+        let catalog = Arc::new(PersistentCatalog::new());
+        let snapshot = catalog.snapshot();
+        let stats = NoStats;
+        let result = optimize(plan, &snapshot, &stats as &dyn StatsSource).expect("optimize ok");
+
+        // After constant folding (1 = 1 → true) and predicate
+        // pushdown, the top node becomes the Project with the Filter
+        // beneath it.
+        assert!(
+            matches!(&result, LogicalPlan::Project { .. }),
+            "expected Project on top, got: {result:?}"
+        );
+    }
+
+    /// `optimize` is idempotent on a plan with no applicable rewrites.
+    /// A bare Scan reaches a fixed point in zero rule passes.
+    #[test]
+    fn optimize_top_level_is_identity_on_fixed_point_plan() {
+        use std::sync::Arc;
+        use ultrasql_catalog::PersistentCatalog;
+
+        let plan = scan("t");
+        let catalog = Arc::new(PersistentCatalog::new());
+        let snapshot = catalog.snapshot();
+        let stats = NoStats;
+        let result =
+            optimize(plan.clone(), &snapshot, &stats as &dyn StatsSource).expect("optimize ok");
+        assert_eq!(result, plan, "plan with no applicable rules is unchanged");
     }
 }

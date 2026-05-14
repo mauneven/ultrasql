@@ -109,7 +109,7 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 | `ultrasql-txn` | ✅ TxnManager kernel: BEGIN/COMMIT/ABORT, lock manager, SSI scaffolding, savepoints, 2PC; ✅ wired through binder + server for `BEGIN`/`COMMIT`/`ROLLBACK` end-to-end (per-session `TxnState` machine; `ReadyForQuery` status byte mirrors PostgreSQL's `'I'`/`'T'`/`'E'`); ⚠️ SAVEPOINT/RELEASE/ROLLBACK TO accepted on the wire but executor does not yet stamp tuples with subxact xid — partial-rollback semantics for already-written rows is a follow-up |
 | `ultrasql-parser` | ✅ Full DML + DDL + CTE + Extended Protocol Parse/Bind syntax |
 | `ultrasql-planner` | ✅ Binder for SELECT/INSERT/UPDATE/DELETE, JOINs, GROUP BY, subqueries, CTEs, BEGIN/COMMIT/ROLLBACK/SAVEPOINT; ⚠️ `BETWEEN` not yet bound (cross_compare_sql workaround uses `id < N`) |
-| `ultrasql-optimizer` | ✅ Rule-based rewrites, cost model, DPsize/GEQO join enumeration, physical selection, plan cache (~1077 LOC across `lib.rs` + `plan_cache.rs`); ⚠️ not exercised by server's inline `lower_query` (the server bypasses `physical::build_operator`) |
+| `ultrasql-optimizer` | ✅ Rule-based rewrites, cost model, DPsize/GEQO join enumeration, physical selection, plan cache (~1077 LOC across `lib.rs` + `plan_cache.rs`); ✅ public `optimize(plan, &snapshot, &dyn StatsSource)` entry point wired into the server's DML/SELECT path (Wave B v0.6); `PlanCache` shared between Simple Query and Extended Query Parse keyed on SQL text; every DDL clears the cache |
 | `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit, CteScan; ⚠️ recursive CTE fixpoint loop deferred to v0.6 |
 | `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, dictionary encoding, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
 | `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ⚠️ bootstrap-from-heap falls back to initial snapshot (no typed tuple decoder yet) |
@@ -162,7 +162,7 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 | **P0** | v0.5: Binder support for `BETWEEN`, `IS NULL` (latter for completeness) | UPDATE / DELETE benchmark parity, ANSI surface |
 | **P0** | v0.5: `IndexScan` wired in `lower_query` (B-tree already exists) | Point-lookup workload — currently SeqScan only |
 | **P0** | Win the ≥ 2× perf gate on every bench in README (currently only INSERT passes) | Every release after v0.5 |
-| **P0** | v0.6: Server invokes optimizer (`physical::build_operator`) instead of inline `lower_query` | Cost-aware physical selection, plan cache |
+| **P0** | ~~v0.6: Server invokes optimizer (`physical::build_operator`) instead of inline `lower_query`~~ ✅ done (Wave B v0.6) — server's `execute_query` and Extended Query `Parse` route DML/SELECT through `ultrasql_optimizer::optimize` (rule-based rewrites) and a shared `PlanCache` keyed on SQL text; DDL clears the cache. Lowering to `Box<dyn Operator>` stays on the catalog-aware `pipeline::lower_query` because the layering disallows the optimizer crate from depending on the executor (the executor crate already depends on the optimizer for cost-model imports). | (was) Cost-aware physical selection, plan cache |
 | **P1** | v1.x: JSONB, NUMERIC, arrays | Modern apps, financial workloads |
 | **P1** | v0.8: Constraints (NOT NULL, FK, CHECK, DEFAULT) | Data integrity |
 | **P1** | v0.8: Persistent catalog typed-tuple decoder | Survive restart with user tables |
@@ -588,8 +588,8 @@ driver can connect.
 - [x] Plan invalidation on `ANALYZE` / DDL (PlanCache::invalidate / invalidate_all)
 
 ### Integration
-- [ ] Server `execute_query` delegates to `optimizer::optimize` then `physical::build_operator` instead of inline `lower_query`
-- [ ] Plan cache shared between Simple Query and Extended Query
+- [x] Server `execute_query` delegates to `optimizer::optimize` before lowering (Wave B v0.6); lowering still happens on the catalog-aware `pipeline::lower_query` because crate layering blocks the optimizer from depending on the executor (executor → optimizer is the existing edge, used for cost-model re-exports). The public `optimize(plan, &snapshot, &dyn StatsSource)` signature is the stable surface the future cost-aware physical-selection wave will extend.
+- [x] Plan cache shared between Simple Query and Extended Query — keyed on raw SQL text; every DDL path (`CREATE TABLE`, `CREATE INDEX`, `DROP TABLE`, `ALTER TABLE`, `TRUNCATE`) clears every entry.
 
 ### Milestone
 - [ ] TPC-H scale 1 runs to completion on every query with correct results

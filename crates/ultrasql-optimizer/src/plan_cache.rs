@@ -159,10 +159,25 @@ impl Default for PlanCacheConfig {
 ///     Ok(LogicalPlan::Empty { schema: Schema::empty() })
 /// }).expect("plan ok");
 /// ```
-#[allow(missing_debug_implementations)]
 pub struct PlanCache {
     entries: DashMap<PlanCacheKey, PlanCacheEntry>,
     config: PlanCacheConfig,
+}
+
+impl std::fmt::Debug for PlanCache {
+    /// Print the cache shape without iterating every entry.
+    ///
+    /// The entry list can be large (1024 entries by default) and each
+    /// entry holds a [`LogicalPlan`] tree; rendering all of that would
+    /// turn an idle `tracing::debug!` into a CPU spike. We instead
+    /// print the configured limits and the current entry count, which
+    /// is all callers actually need.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlanCache")
+            .field("entries", &self.entries.len())
+            .field("config", &self.config)
+            .finish()
+    }
 }
 
 impl PlanCache {
