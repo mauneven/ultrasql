@@ -83,6 +83,26 @@ impl Catalog for InMemoryCatalog {
     }
 }
 
+/// Adapter so the binder can read from a persistent
+/// [`ultrasql_catalog::CatalogSnapshot`] directly.
+///
+/// The persistent catalog hands out immutable [`CatalogSnapshot`]s for
+/// wait-free reads; this impl projects each `TableEntry` down to the
+/// schema-only [`TableMeta`] the binder needs. `lookup_index` and other
+/// catalog APIs do not flow through the planner trait, so they are not
+/// exposed here.
+///
+/// The case-folding contract is the same as [`InMemoryCatalog`]: the
+/// snapshot stores names already folded to ASCII lowercase, so we fold
+/// the query before lookup.
+impl Catalog for ultrasql_catalog::CatalogSnapshot {
+    fn lookup_table(&self, name: &str) -> Option<TableMeta> {
+        self.tables
+            .get(&name.to_ascii_lowercase())
+            .map(|entry| TableMeta::new(entry.schema.clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{DataType, Field};

@@ -47,10 +47,10 @@
 
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_parser::ast::{
-    Assignment, BinaryOp, ConflictTarget as AstConflictTarget, DeleteStmt, Distinct, Expr,
-    InsertSource, InsertStmt, JoinCondition, JoinOp, Literal, NullsOrder, ObjectName, OnConflict,
-    OrderItem, SelectItem, SelectStmt, SetOp, SetQuantifier, SortDirection, Statement, TableRef,
-    TruncateStmt, UnaryOp, UpdateStmt,
+    Assignment, BinaryOp, ColumnConstraint, ConflictTarget as AstConflictTarget, CreateTableStmt,
+    DeleteStmt, Distinct, Expr, InsertSource, InsertStmt, JoinCondition, JoinOp, Literal,
+    NullsOrder, ObjectName, OnConflict, OrderItem, SelectItem, SelectStmt, SetOp, SetQuantifier,
+    SortDirection, Statement, TableRef, TruncateStmt, TypeName, UnaryOp, UpdateStmt,
 };
 
 use crate::catalog::Catalog;
@@ -80,6 +80,7 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::Update(s) => bind_update(s, catalog, &mut scope),
         Statement::Delete(s) => bind_delete(s, catalog, &mut scope),
         Statement::Truncate(s) => bind_truncate(s, catalog),
+        Statement::CreateTable(s) => bind_create_table(s, catalog),
         Statement::Begin { .. } | Statement::Commit { .. } | Statement::Rollback { .. } => Err(
             PlanError::NotSupported("transaction control statements are not planner targets"),
         ),
@@ -482,6 +483,135 @@ fn bind_delete(
         returning,
         schema: returning_schema,
     })
+}
+
+// ---------------------------------------------------------------------------
+// CREATE TABLE
+// ---------------------------------------------------------------------------
+
+/// Bind a `CREATE TABLE` statement.
+///
+/// The v0.5 binder accepts:
+///
+/// - one- or two-part relation names (`t`, `public.t`),
+/// - `IF NOT EXISTS`,
+/// - column types: `INT/INTEGER/INT4`, `BIGINT/INT8`, `SMALLINT/INT2`,
+///   `REAL/FLOAT4`, `DOUBLE PRECISION/FLOAT8/FLOAT`, `BOOLEAN/BOOL`,
+///   `TEXT`, `VARCHAR(n)`, `CHAR(n)`, `BYTEA`,
+/// - column constraints: `NULL`, `NOT NULL`, `PRIMARY KEY` (implies
+///   NOT NULL).
+///
+/// Everything else (DEFAULT, UNIQUE, CHECK, REFERENCES, table-level
+/// constraints, array column types, unsupported type names) returns
+/// [`PlanError::NotSupported`]. A duplicate column name returns
+/// [`PlanError::DuplicateColumn`]; a relation that already exists when
+/// `IF NOT EXISTS` is absent returns [`PlanError::DuplicateTable`].
+fn bind_create_table(s: &CreateTableStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+    if !s.table_constraints.is_empty() {
+        return Err(PlanError::NotSupported(
+            "CREATE TABLE: table-level constraints",
+        ));
+    }
+    let table_name = object_name_simple(&s.name);
+    let namespace = object_name_namespace(&s.name);
+    if !s.if_not_exists && catalog.lookup_table(&table_name).is_some() {
+        return Err(PlanError::DuplicateTable(table_name));
+    }
+    if s.columns.is_empty() {
+        return Err(PlanError::NotSupported("CREATE TABLE: zero columns"));
+    }
+    let mut fields: Vec<Field> = Vec::with_capacity(s.columns.len());
+    for col in &s.columns {
+        let name = col.name.value.clone();
+        let folded = name.to_ascii_lowercase();
+        if fields.iter().any(|f| f.name.to_ascii_lowercase() == folded) {
+            return Err(PlanError::DuplicateColumn(name));
+        }
+        let dtype = resolve_type_name(&col.data_type)?;
+        let nullable = resolve_column_nullability(&col.constraints)?;
+        let field = if nullable {
+            Field::nullable(name, dtype)
+        } else {
+            Field::required(name, dtype)
+        };
+        fields.push(field);
+    }
+    let columns =
+        Schema::new(fields).expect("column dedup precheck guarantees Schema::new cannot fail");
+    Ok(LogicalPlan::CreateTable {
+        table_name,
+        namespace,
+        columns,
+        if_not_exists: s.if_not_exists,
+        schema: Schema::empty(),
+    })
+}
+
+/// Pull the namespace component out of a possibly-qualified relation
+/// name. `t` → `"public"`; `s.t` → `"s"`; `c.s.t` → `"s"`.
+fn object_name_namespace(name: &ObjectName) -> String {
+    if name.parts.len() >= 2 {
+        let idx = name.parts.len() - 2;
+        name.parts[idx].value.to_ascii_lowercase()
+    } else {
+        String::from("public")
+    }
+}
+
+/// Resolve a parser [`TypeName`] to an UltraSQL [`DataType`].
+///
+/// The v0.5 type surface is intentionally narrow; types outside the
+/// listed set return [`PlanError::NotSupported`]. Length modifiers
+/// (e.g. `VARCHAR(255)`) are honored where the target [`DataType`]
+/// carries a `max_len` slot.
+fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
+    if t.is_array {
+        return Err(PlanError::NotSupported("CREATE TABLE: ARRAY column types"));
+    }
+    let max_len_modifier = || t.type_modifiers.first().copied();
+    match t.name.value.as_str() {
+        "int" | "integer" | "int4" => Ok(DataType::Int32),
+        "bigint" | "int8" => Ok(DataType::Int64),
+        "smallint" | "int2" => Ok(DataType::Int16),
+        "bool" | "boolean" => Ok(DataType::Bool),
+        "real" | "float4" => Ok(DataType::Float32),
+        "double" | "double precision" | "float" | "float8" => Ok(DataType::Float64),
+        "text" => Ok(DataType::Text { max_len: None }),
+        "varchar" | "character varying" | "char" | "character" | "bpchar" => Ok(DataType::Text {
+            max_len: max_len_modifier(),
+        }),
+        "bytea" => Ok(DataType::Bytea),
+        _ => Err(PlanError::NotSupported(
+            "CREATE TABLE: column type not implemented in v0.5",
+        )),
+    }
+}
+
+/// Determine whether a column is nullable from its constraint list.
+///
+/// Returns `true` (nullable) when no `NOT NULL` or `PRIMARY KEY`
+/// constraint is present. `PRIMARY KEY` implies `NOT NULL`. Other
+/// constraint kinds (DEFAULT, UNIQUE, CHECK, REFERENCES) return
+/// [`PlanError::NotSupported`].
+fn resolve_column_nullability(constraints: &[ColumnConstraint]) -> Result<bool, PlanError> {
+    let mut nullable = true;
+    for c in constraints {
+        match c {
+            ColumnConstraint::NotNull { .. } | ColumnConstraint::PrimaryKey { .. } => {
+                nullable = false;
+            }
+            ColumnConstraint::Null { .. } => nullable = true,
+            ColumnConstraint::Default { .. }
+            | ColumnConstraint::Unique { .. }
+            | ColumnConstraint::Check { .. }
+            | ColumnConstraint::References { .. } => {
+                return Err(PlanError::NotSupported(
+                    "CREATE TABLE: only NULL / NOT NULL / PRIMARY KEY column constraints in v0.5",
+                ));
+            }
+        }
+    }
+    Ok(nullable)
 }
 
 // ---------------------------------------------------------------------------
@@ -1801,9 +1931,10 @@ fn bind_unsigned_literal(expr: &Expr, label: &'static str) -> Result<u64, PlanEr
 /// [`crate::expr::ScalarExpr::InSubquery`] as correlated.
 fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
     match plan {
-        LogicalPlan::Scan { .. } | LogicalPlan::Empty { .. } | LogicalPlan::Truncate { .. } => {
-            false
-        }
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::Empty { .. }
+        | LogicalPlan::Truncate { .. }
+        | LogicalPlan::CreateTable { .. } => false,
         LogicalPlan::Filter { input, predicate } => {
             expr_contains_outer(predicate) || plan_contains_outer_column(input)
         }
@@ -2751,6 +2882,174 @@ mod tests {
         let err = parse_and_bind("TRUNCATE TABLE nope", &cat).unwrap_err();
         assert!(
             matches!(err, PlanError::TableNotFound(ref t) if t == "nope"),
+            "got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // CREATE TABLE
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn binds_create_table_resolves_basic_column_types() {
+        let cat = InMemoryCatalog::new();
+        let plan = parse_and_bind(
+            "CREATE TABLE accounts (id BIGINT NOT NULL, name TEXT, balance FLOAT8)",
+            &cat,
+        )
+        .expect("bind ok");
+        let LogicalPlan::CreateTable {
+            table_name,
+            namespace,
+            columns,
+            if_not_exists,
+            schema,
+        } = plan
+        else {
+            panic!("expected CreateTable, got other plan");
+        };
+        assert_eq!(table_name, "accounts");
+        assert_eq!(namespace, "public");
+        assert!(!if_not_exists);
+        assert_eq!(schema, Schema::empty());
+        assert_eq!(columns.len(), 3);
+        assert_eq!(columns.fields()[0].name, "id");
+        assert_eq!(columns.fields()[0].data_type, DataType::Int64);
+        assert!(!columns.fields()[0].nullable, "NOT NULL honored");
+        assert_eq!(
+            columns.fields()[1].data_type,
+            DataType::Text { max_len: None }
+        );
+        assert!(columns.fields()[1].nullable, "no constraint = nullable");
+        assert_eq!(columns.fields()[2].data_type, DataType::Float64);
+    }
+
+    #[test]
+    fn binds_create_table_with_varchar_modifier() {
+        let cat = InMemoryCatalog::new();
+        let plan = parse_and_bind("CREATE TABLE t (s VARCHAR(255))", &cat).expect("bind ok");
+        let LogicalPlan::CreateTable { columns, .. } = plan else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(
+            columns.fields()[0].data_type,
+            DataType::Text { max_len: Some(255) }
+        );
+    }
+
+    #[test]
+    fn binds_create_table_primary_key_implies_not_null() {
+        let cat = InMemoryCatalog::new();
+        let plan = parse_and_bind("CREATE TABLE t (id INT PRIMARY KEY)", &cat).expect("bind ok");
+        let LogicalPlan::CreateTable { columns, .. } = plan else {
+            panic!("expected CreateTable");
+        };
+        assert!(!columns.fields()[0].nullable);
+    }
+
+    #[test]
+    fn binds_create_table_duplicate_column_rejected() {
+        let cat = InMemoryCatalog::new();
+        let err = parse_and_bind("CREATE TABLE t (id INT, id INT)", &cat).unwrap_err();
+        assert!(
+            matches!(err, PlanError::DuplicateColumn(ref c) if c == "id"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn binds_create_table_existing_relation_rejected() {
+        let cat = users_catalog();
+        let err = parse_and_bind("CREATE TABLE users (id INT)", &cat).unwrap_err();
+        assert!(
+            matches!(err, PlanError::DuplicateTable(ref t) if t == "users"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn binds_create_table_if_not_exists_skips_existence_check() {
+        let cat = users_catalog();
+        let plan =
+            parse_and_bind("CREATE TABLE IF NOT EXISTS users (id INT)", &cat).expect("bind ok");
+        let LogicalPlan::CreateTable {
+            if_not_exists,
+            table_name,
+            ..
+        } = plan
+        else {
+            panic!("expected CreateTable");
+        };
+        assert!(if_not_exists);
+        assert_eq!(table_name, "users");
+    }
+
+    #[test]
+    fn binds_create_table_with_qualified_namespace() {
+        let cat = InMemoryCatalog::new();
+        let plan = parse_and_bind("CREATE TABLE my_ns.events (id INT)", &cat).expect("bind ok");
+        let LogicalPlan::CreateTable {
+            table_name,
+            namespace,
+            ..
+        } = plan
+        else {
+            panic!("expected CreateTable");
+        };
+        assert_eq!(namespace, "my_ns");
+        assert_eq!(table_name, "events");
+    }
+
+    #[test]
+    fn binds_create_table_rejects_unsupported_constraints() {
+        let cat = InMemoryCatalog::new();
+        let err = parse_and_bind("CREATE TABLE t (id INT UNIQUE)", &cat).unwrap_err();
+        assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+
+        let err = parse_and_bind("CREATE TABLE t (id INT DEFAULT 7)", &cat).unwrap_err();
+        assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+
+        let err = parse_and_bind("CREATE TABLE t (id INT CHECK (id > 0))", &cat).unwrap_err();
+        assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn binds_create_table_rejects_unsupported_column_type() {
+        let cat = InMemoryCatalog::new();
+        let err = parse_and_bind("CREATE TABLE t (id NUMERIC(10, 2))", &cat).unwrap_err();
+        assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn binds_create_table_persistent_catalog_via_snapshot_adapter() {
+        // CatalogSnapshot from ultrasql-catalog implements `Catalog`,
+        // so the binder can consume a persistent snapshot directly
+        // (the seam the server uses to bind against PersistentCatalog).
+        use ultrasql_catalog::TableEntry;
+        let snap = ultrasql_catalog::CatalogSnapshot {
+            tables: {
+                let mut m = std::collections::HashMap::new();
+                let schema =
+                    Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
+                m.insert(
+                    "products".to_string(),
+                    TableEntry::new(ultrasql_core::Oid::new(100), "products", "public", schema),
+                );
+                m
+            },
+            tables_by_oid: std::collections::HashMap::new(),
+            indexes: std::collections::HashMap::new(),
+            indexes_by_table: std::collections::HashMap::new(),
+        };
+        // Creating an already-existing relation through the snapshot
+        // adapter surfaces DuplicateTable, proving the binder reaches
+        // the snapshot.
+        let stmt = Parser::new("CREATE TABLE products (id INT)")
+            .parse_statement()
+            .expect("parse ok");
+        let err = bind(&stmt, &snap).unwrap_err();
+        assert!(
+            matches!(err, PlanError::DuplicateTable(ref t) if t == "products"),
             "got {err:?}"
         );
     }

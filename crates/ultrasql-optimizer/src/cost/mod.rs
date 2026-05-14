@@ -277,13 +277,14 @@ impl<'s> CostModel<'s> {
 
             LogicalPlan::Cte { body, .. } => self.estimate(body),
 
-            // DML and source nodes: neutral estimate (rows and cost = 0).
+            // DML / DDL / source nodes: neutral estimate (rows and cost = 0).
             LogicalPlan::Empty { .. }
             | LogicalPlan::Values { .. }
             | LogicalPlan::Insert { .. }
             | LogicalPlan::Update { .. }
             | LogicalPlan::Delete { .. }
-            | LogicalPlan::Truncate { .. } => zero_estimate(),
+            | LogicalPlan::Truncate { .. }
+            | LogicalPlan::CreateTable { .. } => zero_estimate(),
         }
     }
 }

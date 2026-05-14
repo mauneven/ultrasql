@@ -32,6 +32,11 @@ pub enum PlanError {
     #[error("duplicate column: '{0}'")]
     DuplicateColumn(String),
 
+    /// `CREATE TABLE` named a relation that already exists and
+    /// `IF NOT EXISTS` was not specified.
+    #[error("relation already exists: '{0}'")]
+    DuplicateTable(String),
+
     /// The construct is syntactically valid but not yet implemented by
     /// the binder. Carries a `'static` reason so this branch stays
     /// cheap.

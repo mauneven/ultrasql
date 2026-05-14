@@ -174,6 +174,9 @@ pub fn build_operator(
         LogicalPlan::Truncate { .. } => {
             Err(BuildError::Unsupported("TRUNCATE not supported in v0.5"))
         }
+        LogicalPlan::CreateTable { .. } => Err(BuildError::Unsupported(
+            "CREATE TABLE is DDL and is dispatched outside the operator pipeline",
+        )),
 
         LogicalPlan::Join {
             left,

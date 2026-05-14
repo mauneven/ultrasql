@@ -331,6 +331,33 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// Create a new base table.
+    ///
+    /// The binder produces a fully resolved column [`Schema`] so the
+    /// executor can persist the relation without re-parsing column
+    /// types. The v0.5 binder accepts only NULL / NOT NULL / PRIMARY
+    /// KEY (which implies NOT NULL) at the column level; DEFAULT,
+    /// UNIQUE, CHECK, REFERENCES, and table-level constraints return
+    /// [`crate::error::PlanError::NotSupported`].
+    CreateTable {
+        /// Case-folded bare relation name (no namespace qualifier).
+        table_name: String,
+        /// SQL namespace (e.g. `"public"`). Distinct from `columns` —
+        /// PostgreSQL calls this the "schema" but inside the planner
+        /// "schema" means a column shape, so we rename to avoid the
+        /// double-meaning.
+        namespace: String,
+        /// Resolved column metadata — the row shape of the relation
+        /// being created.
+        columns: Schema,
+        /// Whether `IF NOT EXISTS` was specified. When true the
+        /// executor short-circuits if the relation already exists.
+        if_not_exists: bool,
+        /// Always [`Schema::empty`]; DDL emits no rows. Carried for
+        /// uniform [`LogicalPlan::schema`] access by callers.
+        schema: Schema,
+    },
+
     /// Join two child plans.
     ///
     /// For `LEFT JOIN`, every column on the right side of `schema` is
@@ -428,6 +455,7 @@ impl LogicalPlan {
             | Self::Update { schema, .. }
             | Self::Delete { schema, .. }
             | Self::Truncate { schema, .. }
+            | Self::CreateTable { schema, .. }
             | Self::Join { schema, .. }
             | Self::Aggregate { schema, .. }
             | Self::SetOp { schema, .. }
@@ -610,6 +638,33 @@ impl LogicalPlan {
                     out.push_str(" CASCADE");
                 }
                 out.push('\n');
+            }
+            Self::CreateTable {
+                table_name,
+                namespace,
+                columns,
+                if_not_exists,
+                ..
+            } => {
+                out.push_str(&pad);
+                out.push_str("CreateTable: ");
+                out.push_str(namespace);
+                out.push('.');
+                out.push_str(table_name);
+                if *if_not_exists {
+                    out.push_str(" IF NOT EXISTS");
+                }
+                out.push_str(" (");
+                for (i, f) in columns.fields().iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = fmt::write(out, format_args!("{} {:?}", f.name, f.data_type));
+                    if !f.nullable {
+                        out.push_str(" NOT NULL");
+                    }
+                }
+                out.push_str(")\n");
             }
             Self::Join {
                 left,
