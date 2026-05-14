@@ -2449,8 +2449,137 @@ fn bind_expr(
             "ALL subquery expressions are not supported",
         )),
 
+        // `expr [NOT] BETWEEN [SYMMETRIC] low AND high` is rewritten at
+        // bind time into an equivalent boolean tree of comparisons.
+        // SQL:2016 specifies the equivalence; PostgreSQL's planner uses
+        // the same rewrite.
+        Expr::Between {
+            expr: subject,
+            low,
+            high,
+            negated,
+            symmetric,
+            ..
+        } => bind_between(
+            subject, low, high, *negated, *symmetric, input, catalog, scope,
+        ),
+
         _ => Err(PlanError::NotSupported("expression variant")),
     }
+}
+
+/// Bind `expr [NOT] BETWEEN [SYMMETRIC] low AND high` into an equivalent
+/// boolean tree over the existing comparison and boolean operators.
+///
+/// The rewrites mirror the SQL:2016 specification and PostgreSQL's
+/// planner behaviour:
+///
+/// - `expr BETWEEN low AND high` ⇒ `expr >= low AND expr <= high`.
+/// - `expr NOT BETWEEN low AND high` ⇒ `expr < low OR expr > high`.
+/// - `expr BETWEEN SYMMETRIC low AND high` ⇒
+///   `(expr >= low AND expr <= high) OR (expr >= high AND expr <= low)`.
+/// - `expr NOT BETWEEN SYMMETRIC low AND high` ⇒
+///   `(expr < low OR expr > high) AND (expr < high OR expr > low)`.
+///
+/// Each of `expr`, `low`, and `high` is bound exactly once; the bound
+/// `expr` is cloned wherever the rewrite needs an additional reference
+/// to it. This means side-effectful expressions (function calls,
+/// sequence next-val, etc.) are evaluated more than once at runtime —
+/// PostgreSQL documents the same limitation and we accept it for the
+/// same reason: the existing comparison + boolean operators already
+/// flow through the SIMD-aware [`crate::expr::ScalarExpr::Binary`]
+/// pipeline, and synthesising a Let-style binding would grow the plan
+/// language for no measurable benefit on the SQL surface UltraSQL
+/// implements today (pure column / literal predicates).
+#[allow(clippy::too_many_arguments)]
+fn bind_between(
+    subject: &Expr,
+    low: &Expr,
+    high: &Expr,
+    negated: bool,
+    symmetric: bool,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let bound_expr = bind_expr(subject, input, catalog, scope)?;
+    let bound_low = bind_expr(low, input, catalog, scope)?;
+    let bound_high = bind_expr(high, input, catalog, scope)?;
+
+    // The forward range test: `expr >= low AND expr <= high`.
+    let forward = make_range_test(
+        bound_expr.clone(),
+        bound_low.clone(),
+        bound_high.clone(),
+        negated,
+    )?;
+    if !symmetric {
+        return Ok(forward);
+    }
+    // The reversed range test, with low/high swapped. The combining
+    // connective is `OR` for the affirmative form (a value satisfies
+    // either ordering) and `AND` for the negated form (the value lies
+    // outside both ranges).
+    let reversed = make_range_test(bound_expr, bound_high, bound_low, negated)?;
+    let combine_op = if negated { BinaryOp::And } else { BinaryOp::Or };
+    Ok(ScalarExpr::Binary {
+        op: combine_op,
+        left: Box::new(forward),
+        right: Box::new(reversed),
+        data_type: DataType::Bool,
+    })
+}
+
+/// Build one bound boolean predicate of the form
+/// `expr op_low low <connect> expr op_high high`, where the operators
+/// are picked by `negated`:
+///
+/// - `negated = false` → `expr >= low AND expr <= high`.
+/// - `negated = true`  → `expr <  low OR  expr >  high`.
+///
+/// The two comparison subterms are validated through
+/// [`binary_result_type`] so that type errors (e.g. comparing a text
+/// column to an integer bound) surface as
+/// [`PlanError::TypeMismatch`], matching the diagnostics callers see
+/// from an explicit `expr >= low AND expr <= high` predicate.
+fn make_range_test(
+    bound_expr: ScalarExpr,
+    bound_low: ScalarExpr,
+    bound_high: ScalarExpr,
+    negated: bool,
+) -> Result<ScalarExpr, PlanError> {
+    let (lo_op, hi_op, connect) = if negated {
+        (BinaryOp::Lt, BinaryOp::Gt, BinaryOp::Or)
+    } else {
+        (BinaryOp::GtEq, BinaryOp::LtEq, BinaryOp::And)
+    };
+    let lo_cmp = make_binary(lo_op, bound_expr.clone(), bound_low)?;
+    let hi_cmp = make_binary(hi_op, bound_expr, bound_high)?;
+    Ok(ScalarExpr::Binary {
+        op: connect,
+        left: Box::new(lo_cmp),
+        right: Box::new(hi_cmp),
+        data_type: DataType::Bool,
+    })
+}
+
+/// Construct a [`ScalarExpr::Binary`] over already-bound operands.
+///
+/// The operands' types are checked via [`binary_result_type`] exactly
+/// as in [`bind_binary`], so the rewrite produces the same diagnostics
+/// callers would see from the explicit `>=` / `<=` / `<` / `>` form.
+pub(crate) fn make_binary(
+    op: BinaryOp,
+    left: ScalarExpr,
+    right: ScalarExpr,
+) -> Result<ScalarExpr, PlanError> {
+    let data_type = binary_result_type(op, left.data_type(), right.data_type())?;
+    Ok(ScalarExpr::Binary {
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
+        data_type,
+    })
 }
 
 fn bind_literal(lit: &Literal) -> ScalarExpr {
@@ -4009,6 +4138,236 @@ mod tests {
         }
         let depth = find_outer_col(subplan).expect("should find OuterColumn in subplan");
         assert_eq!(depth, 1, "column is one level out → frame_depth = 1");
+    }
+
+    // -----------------------------------------------------------------------
+    // BETWEEN tests — the binder rewrites BETWEEN into a comparison tree
+    // -----------------------------------------------------------------------
+
+    /// Extract the bound WHERE predicate from a SELECT plan that the
+    /// binder shaped as `Project { Filter { Scan } }`.
+    fn predicate_of(plan: &LogicalPlan) -> &ScalarExpr {
+        fn find_filter(plan: &LogicalPlan) -> &LogicalPlan {
+            match plan {
+                LogicalPlan::Filter { .. } => plan,
+                LogicalPlan::Project { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. } => find_filter(input),
+                _ => panic!("expected Filter under plan, got {plan:?}"),
+            }
+        }
+        match find_filter(plan) {
+            LogicalPlan::Filter { predicate, .. } => predicate,
+            other => panic!("expected Filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn binds_between_as_ge_and_le() {
+        // The canonical rewrite: BETWEEN low AND high becomes
+        // `expr >= low AND expr <= high`.
+        let plan = parse_bind_ok("SELECT id FROM users WHERE id BETWEEN 5 AND 10");
+        let pred = predicate_of(&plan);
+        // Top-level: AND.
+        let ScalarExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            data_type,
+        } = pred
+        else {
+            panic!("expected AND at the root, got {pred:?}");
+        };
+        assert_eq!(*data_type, DataType::Bool);
+
+        // Left arm: `id >= 5`.
+        let ScalarExpr::Binary {
+            op: BinaryOp::GtEq,
+            left: lo_l,
+            right: lo_r,
+            ..
+        } = left.as_ref()
+        else {
+            panic!("expected GtEq on left, got {left:?}");
+        };
+        assert!(matches!(lo_l.as_ref(), ScalarExpr::Column { name, .. } if name == "id"));
+        assert!(matches!(
+            lo_r.as_ref(),
+            ScalarExpr::Literal {
+                value: Value::Int32(5),
+                ..
+            }
+        ));
+
+        // Right arm: `id <= 10`.
+        let ScalarExpr::Binary {
+            op: BinaryOp::LtEq,
+            left: hi_l,
+            right: hi_r,
+            ..
+        } = right.as_ref()
+        else {
+            panic!("expected LtEq on right, got {right:?}");
+        };
+        assert!(matches!(hi_l.as_ref(), ScalarExpr::Column { name, .. } if name == "id"));
+        assert!(matches!(
+            hi_r.as_ref(),
+            ScalarExpr::Literal {
+                value: Value::Int32(10),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn binds_not_between_as_lt_or_gt() {
+        let plan = parse_bind_ok("SELECT id FROM users WHERE id NOT BETWEEN 5 AND 10");
+        let pred = predicate_of(&plan);
+        let ScalarExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } = pred
+        else {
+            panic!("expected OR at the root, got {pred:?}");
+        };
+        assert!(matches!(
+            left.as_ref(),
+            ScalarExpr::Binary {
+                op: BinaryOp::Lt,
+                ..
+            }
+        ));
+        assert!(matches!(
+            right.as_ref(),
+            ScalarExpr::Binary {
+                op: BinaryOp::Gt,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn binds_between_mixed_numeric_types() {
+        // `score` is FLOAT8 in the users catalog. A BETWEEN against an
+        // integer pair must bind cleanly through the same numeric-join
+        // promotion that the explicit comparison form uses.
+        let plan = parse_bind_ok("SELECT id FROM users WHERE score BETWEEN 1 AND 100");
+        let pred = predicate_of(&plan);
+        assert!(matches!(
+            pred,
+            ScalarExpr::Binary {
+                op: BinaryOp::And,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn binds_between_symmetric_emits_or_of_two_ranges() {
+        let plan = parse_bind_ok("SELECT id FROM users WHERE id BETWEEN SYMMETRIC 10 AND 5");
+        let pred = predicate_of(&plan);
+        // BETWEEN SYMMETRIC: (forward) OR (reversed).
+        let ScalarExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } = pred
+        else {
+            panic!("expected OR at the root, got {pred:?}");
+        };
+        // Each arm is a `(>= AND <=)` tree.
+        for (label, arm) in [("forward", left.as_ref()), ("reversed", right.as_ref())] {
+            assert!(
+                matches!(
+                    arm,
+                    ScalarExpr::Binary {
+                        op: BinaryOp::And,
+                        ..
+                    }
+                ),
+                "SYMMETRIC {label} arm should be AND, got {arm:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn binds_not_between_symmetric_emits_and_of_two_ranges() {
+        let plan = parse_bind_ok("SELECT id FROM users WHERE id NOT BETWEEN SYMMETRIC 10 AND 5");
+        let pred = predicate_of(&plan);
+        // NOT BETWEEN SYMMETRIC: (forward NOT) AND (reversed NOT).
+        let ScalarExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } = pred
+        else {
+            panic!("expected AND at the root, got {pred:?}");
+        };
+        for (label, arm) in [("forward", left.as_ref()), ("reversed", right.as_ref())] {
+            assert!(
+                matches!(
+                    arm,
+                    ScalarExpr::Binary {
+                        op: BinaryOp::Or,
+                        ..
+                    }
+                ),
+                "NOT SYMMETRIC {label} arm should be OR, got {arm:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn binds_between_rewrite_renders_as_full_tree() {
+        // Lock down the exact textual form of the rewrite so it surfaces
+        // unambiguously in EXPLAIN-style output.
+        let plan = parse_bind_ok("SELECT id FROM users WHERE id BETWEEN 5 AND 10");
+        let pred = predicate_of(&plan);
+        assert_eq!(pred.to_string(), "((id >= 5) AND (id <= 10))");
+    }
+
+    #[test]
+    fn binds_between_uses_existing_type_check_to_reject_incompatible_bounds() {
+        // `name` is TEXT; bound by an integer literal is not comparable
+        // — the binder must surface a TypeMismatch the same way it
+        // would for the equivalent `name >= 1 AND name <= 10`.
+        let cat = users_catalog();
+        let err =
+            parse_and_bind("SELECT id FROM users WHERE name BETWEEN 1 AND 10", &cat).unwrap_err();
+        assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+    }
+
+    proptest! {
+        /// BETWEEN binds without error for every integer pair drawn from the
+        /// supported i32 range — the rewrite never invents a type it does not
+        /// already accept on plain comparisons.
+        #[test]
+        fn prop_between_int_pair_binds_ok(
+            lo in -1_000_000_i32..=1_000_000_i32,
+            hi in -1_000_000_i32..=1_000_000_i32,
+        ) {
+            let cat = users_catalog();
+            let sql = format!("SELECT id FROM users WHERE id BETWEEN {lo} AND {hi}");
+            let result = parse_and_bind(&sql, &cat);
+            prop_assert!(result.is_ok(), "BETWEEN should bind, got {:?}", result);
+        }
+
+        /// NOT BETWEEN binds without error for every integer pair drawn from
+        /// the supported i32 range.
+        #[test]
+        fn prop_not_between_int_pair_binds_ok(
+            lo in -1_000_000_i32..=1_000_000_i32,
+            hi in -1_000_000_i32..=1_000_000_i32,
+        ) {
+            let cat = users_catalog();
+            let sql = format!("SELECT id FROM users WHERE id NOT BETWEEN {lo} AND {hi}");
+            let result = parse_and_bind(&sql, &cat);
+            prop_assert!(result.is_ok(), "NOT BETWEEN should bind, got {:?}", result);
+        }
     }
 
     proptest! {
