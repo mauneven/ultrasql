@@ -85,7 +85,7 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 3.22 ms | `██                                  ` |
+| **UltraSQL** | 3.26 ms | `██                                  ` |
 | SQLite | 20.23 ms | `████████████                        ` |
 | PostgreSQL | 48.38 ms | `████████████████████████████        ` |
 | ClickHouse | 62.83 ms | `████████████████████████████████████` |
@@ -97,7 +97,7 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 764.88 µs | `█                                   ` |
+| **UltraSQL** | 828.67 µs | `█                                   ` |
 | DuckDB | 897.42 µs | `█                                   ` |
 | ClickHouse | 1.17 ms | `█                                   ` |
 | SQLite | 1.81 ms | `██                                  ` |
@@ -109,7 +109,7 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 161.38 µs | `█                                   ` |
+| **UltraSQL** | 158.33 µs | `█                                   ` |
 | DuckDB | 176.25 µs | `█                                   ` |
 | SQLite | 451.08 µs | `█                                   ` |
 | ClickHouse | 3.50 ms | `██                                  ` |
@@ -121,7 +121,7 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 141.00 µs | `█                                   ` |
+| **UltraSQL** | 144.17 µs | `█                                   ` |
 | SQLite | 512.33 µs | `█                                   ` |
 | DuckDB | 1.99 ms | `███                                 ` |
 | ClickHouse | 3.37 ms | `█████                               ` |
@@ -133,7 +133,7 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 122.95 µs | `█                                   ` |
+| **UltraSQL** | 126.79 µs | `█                                   ` |
 | SQLite | 357.35 µs | `█                                   ` |
 | DuckDB | 1.25 ms | `██                                  ` |
 | PostgreSQL | 11.63 ms | `███████████████████                 ` |
