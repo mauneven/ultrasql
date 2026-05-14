@@ -1644,6 +1644,365 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(())
     }
 
+    /// Single-pass MVCC-correct UPDATE for the narrow `(Int32, Int32)
+    /// SET col_i = col_i ± delta [WHERE col_j cmp lit]` shape.
+    ///
+    /// Replaces the default three-phase plan (scan → `update_many` →
+    /// `insert_batch` + stamp) with a single page-major traversal:
+    /// each source page is pinned **write-exclusive** exactly once,
+    /// every visible tuple that passes the predicate is read off
+    /// that page, the new version is written directly into the
+    /// currently-active destination page, and the source slot's
+    /// header is stamped (xmax / cmax / infomask / ctid) before the
+    /// source page is released. Destination pages are allocated via
+    /// the relation's atomic block counter and pinned write-
+    /// exclusive across multiple source pages until they fill, at
+    /// which point a new destination block is grown.
+    ///
+    /// What the single-pass path eliminates compared to the default
+    /// plan:
+    ///
+    /// - The intermediate `Vec<(TupleId, UpdatePayload)>` fallback
+    ///   buffer that the default path holds across the two phases
+    ///   (10 000 entries on the bench shape).
+    /// - The second pin per source page (the default path pins the
+    ///   source once for the visibility-walker read and once again
+    ///   for the stamp pass; here both happen under one write pin).
+    /// - The sort + page-run group pass inside `update_many`.
+    /// - The HOT pre-check (this path is shape-restricted to the
+    ///   bulk-update case where source pages are full anyway).
+    ///
+    /// Returns the count of tuples updated. Caller is responsible
+    /// for bumping the column cache version exactly once after the
+    /// call.
+    ///
+    /// # Safety / correctness
+    ///
+    /// The fields the visibility cache reads
+    /// (xmin / xmax / infomask) are pulled directly from on-disk
+    /// byte offsets without paying a full `TupleHeader::decode`.
+    /// Cache misses (and any tuple whose xmax is set) fall back to
+    /// the full decode + `is_visible` so non-trivial CLOG state is
+    /// handled correctly.
+    ///
+    /// # Concurrency
+    ///
+    /// Holds at most two write-exclusive page guards at a time: one
+    /// source page and one destination page. They are always
+    /// different pages (source belongs to `rel`'s existing blocks
+    /// in [0, block_count); destination is a freshly-allocated
+    /// block beyond block_count when the call begins).
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_int32_pair_in_place_add<O, P>(
+        &self,
+        rel: RelationId,
+        block_count: u32,
+        snapshot: &Snapshot,
+        oracle: &O,
+        predicate: P,
+        target_col: u8,
+        delta: i32,
+        xid: Xid,
+        command_id: CommandId,
+    ) -> Result<usize, HeapError>
+    where
+        O: XidStatusOracle + ?Sized,
+        P: Fn(i32, i32) -> bool,
+    {
+        use crate::page::{ITEMID_SIZE, ItemId, ItemIdFlags, PAGE_HEADER_SIZE, Page};
+
+        const NEW_TUPLE_SIZE: usize = TUPLE_HEADER_SIZE + 9;
+
+        let counter = self.counter_for(rel);
+        let mut total_updated: usize = 0;
+        let mut xmin_cache: Option<(Xid, u16, bool)> = None;
+
+        // Destination state. Allocated lazily on the first qualifying
+        // tuple — relations that match the predicate on zero rows pay
+        // no destination block at all.
+        struct DestState<L: PageLoader> {
+            page_id: PageId,
+            guard: PageGuard<L>,
+            header: crate::page::PageHeader,
+            cur_lower: usize,
+            cur_upper: usize,
+        }
+        let mut dest: Option<DestState<L>> = None;
+
+        // Scratch buffer for per-source-page candidates. Reused
+        // across source pages. Pre-allocated for the worst-case
+        // page (~166 tuples per 8 KiB page for the (Int32, Int32)
+        // shape) so the per-source-page collection pass never grows
+        // it once warm.
+        let mut candidates: Vec<(u16, i32, i32)> = Vec::with_capacity(200);
+
+        for src_block in 0..block_count {
+            let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
+            let src_guard = self.pool.get_page(src_page_id)?;
+            let mut src_page = src_guard.write();
+            let src_bytes = src_page.as_bytes_mut();
+            let src_slot_count = {
+                let hdr = crate::page::PageHeader::decode(src_bytes)
+                    .map_err(HeapError::Page)?;
+                hdr.slot_count()
+            };
+
+            // Pass 1 — scan this source page's slots, collect every
+            // visible + predicate-passing slot into `candidates`.
+            // No dest pin acquired in this pass; the source page's
+            // write guard is held read-only here (we only read
+            // `src_bytes`).
+            candidates.clear();
+            for src_slot in 0..src_slot_count {
+                // ItemId decode.
+                let item_id_off =
+                    PAGE_HEADER_SIZE + usize::from(src_slot) * ITEMID_SIZE;
+                let item_raw = u32::from_le_bytes([
+                    src_bytes[item_id_off],
+                    src_bytes[item_id_off + 1],
+                    src_bytes[item_id_off + 2],
+                    src_bytes[item_id_off + 3],
+                ]);
+                if item_raw & 0b11 != 1 {
+                    continue;
+                }
+                let length = ((item_raw >> 2) & 0x7FFF) as usize;
+                let offset = ((item_raw >> 17) & 0x7FFF) as usize;
+                if length < TUPLE_HEADER_SIZE
+                    || offset.checked_add(length).is_none_or(|e| e > src_bytes.len())
+                {
+                    return Err(HeapError::MalformedHeader("slot shorter than header"));
+                }
+
+                // Minimal-decode visibility check.
+                let xmin_raw = u64::from_le_bytes(
+                    src_bytes[offset..offset + 8]
+                        .try_into()
+                        .expect("8-byte slice"),
+                );
+                let xmax_raw = u64::from_le_bytes(
+                    src_bytes[offset + 8..offset + 16]
+                        .try_into()
+                        .expect("8-byte slice"),
+                );
+                let infomask_bits = u16::from_le_bytes(
+                    src_bytes[offset + 24..offset + 26]
+                        .try_into()
+                        .expect("2-byte slice"),
+                );
+                let xmin_xid = Xid::new(xmin_raw);
+
+                let visible = if xmax_raw == 0 {
+                    match xmin_cache {
+                        Some((cxmin, cinfo, cv))
+                            if cxmin == xmin_xid && cinfo == infomask_bits =>
+                        {
+                            cv
+                        }
+                        _ => {
+                            let (h, _) =
+                                TupleHeader::decode(&src_bytes[offset..offset + TUPLE_HEADER_SIZE])
+                                    .ok_or(HeapError::MalformedHeader(
+                                        "header decode failed",
+                                    ))?;
+                            let v = matches!(
+                                is_visible(&h, snapshot, oracle),
+                                Visibility::Visible,
+                            );
+                            xmin_cache = Some((h.xmin, h.infomask.bits(), v));
+                            v
+                        }
+                    }
+                } else {
+                    let (h, _) =
+                        TupleHeader::decode(&src_bytes[offset..offset + TUPLE_HEADER_SIZE])
+                            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                    matches!(is_visible(&h, snapshot, oracle), Visibility::Visible)
+                };
+                if !visible {
+                    continue;
+                }
+
+                // Decode (id, val) from payload [null_byte, id_le, val_le].
+                let payload_off = offset + TUPLE_HEADER_SIZE;
+                if payload_off + 9 > offset + length {
+                    return Err(HeapError::MalformedHeader(
+                        "payload shorter than (Int32, Int32)",
+                    ));
+                }
+                let id = i32::from_le_bytes([
+                    src_bytes[payload_off + 1],
+                    src_bytes[payload_off + 2],
+                    src_bytes[payload_off + 3],
+                    src_bytes[payload_off + 4],
+                ]);
+                let val = i32::from_le_bytes([
+                    src_bytes[payload_off + 5],
+                    src_bytes[payload_off + 6],
+                    src_bytes[payload_off + 7],
+                    src_bytes[payload_off + 8],
+                ]);
+
+                if !predicate(id, val) {
+                    continue;
+                }
+
+                let (new_id, new_val) = if target_col == 0 {
+                    (id.wrapping_add(delta), val)
+                } else {
+                    (id, val.wrapping_add(delta))
+                };
+                candidates.push((src_slot, new_id, new_val));
+            }
+
+            // Pass 2 — flush every candidate into a destination page
+            // and stamp the source slot under the source page's
+            // write guard. The dest page's write lock is acquired
+            // exactly once per chunk that fits in the current dest
+            // page (and at most twice when the chunk crosses a dest
+            // page boundary), replacing the prior per-tuple
+            // `guard.write()` / `drop` pair that paid ~30 ns per
+            // visible row in lock-cycle overhead alone.
+            let mut cand_idx = 0;
+            while cand_idx < candidates.len() {
+                // Ensure dest has room for at least one new tuple.
+                if dest.as_ref().is_none_or(|s| {
+                    s.cur_upper.saturating_sub(s.cur_lower) < NEW_TUPLE_SIZE + ITEMID_SIZE
+                }) {
+                    // Finalise the existing dest page header (writes
+                    // lower / upper) before releasing.
+                    if let Some(state) = dest.take() {
+                        let mut state = state;
+                        let mut page = state.guard.write();
+                        let bytes = page.as_bytes_mut();
+                        state.header.lower = state.cur_lower as u16;
+                        state.header.upper = state.cur_upper as u16;
+                        state.header.encode(bytes);
+                        drop(page);
+                        drop(state.guard);
+                    }
+                    let new_block = counter.fetch_add(1, Ordering::AcqRel);
+                    if new_block == u32::MAX {
+                        counter.store(u32::MAX, Ordering::Release);
+                        return Err(HeapError::OutOfBlocks);
+                    }
+                    let dest_pid = PageId::new(rel, BlockNumber::new(new_block));
+                    let dest_guard = self.pool.get_page(dest_pid)?;
+                    let header = {
+                        let page = dest_guard.read();
+                        page.header()
+                    };
+                    let cur_lower = header.lower as usize;
+                    let cur_upper = header.upper as usize;
+                    dest = Some(DestState::<L> {
+                        page_id: dest_pid,
+                        guard: dest_guard,
+                        header,
+                        cur_lower,
+                        cur_upper,
+                    });
+                }
+                let dest_state = dest.as_mut().expect("dest just allocated");
+
+                let dest_room = dest_state.cur_upper - dest_state.cur_lower;
+                let max_in_dest = dest_room / (NEW_TUPLE_SIZE + ITEMID_SIZE);
+                let remaining = candidates.len() - cand_idx;
+                let n_write = remaining.min(max_in_dest);
+                debug_assert!(n_write > 0, "free-space check guarantees one fit");
+
+                let dest_page_id = dest_state.page_id;
+                let dest_pid_rel = dest_page_id.relation.0.raw();
+                let dest_pid_block = dest_page_id.block.raw();
+
+                // Single dest write-lock acquire for this batch of
+                // up to `n_write` new tuples — replacing the prior
+                // per-tuple acquire/release pair.
+                let mut dest_page = dest_state.guard.write();
+                let dest_bytes = dest_page.as_bytes_mut();
+
+                for i in 0..n_write {
+                    let (src_slot, new_id, new_val) = candidates[cand_idx + i];
+
+                    let dest_slot = u16::try_from(
+                        (dest_state.cur_lower - PAGE_HEADER_SIZE) / ITEMID_SIZE,
+                    )
+                    .map_err(|_| HeapError::MalformedHeader("dest slot overflow"))?;
+
+                    dest_state.cur_upper -= NEW_TUPLE_SIZE;
+                    let new_tuple_off = dest_state.cur_upper;
+                    let new_payload_off = new_tuple_off + TUPLE_HEADER_SIZE;
+
+                    // Write only the non-zero header fields — the
+                    // dest slot region is zero on a fresh page.
+                    dest_bytes[new_tuple_off..new_tuple_off + 8]
+                        .copy_from_slice(&xid.raw().to_le_bytes());
+                    let ctid_rel_at = new_tuple_off + 32;
+                    dest_bytes[ctid_rel_at..ctid_rel_at + 4]
+                        .copy_from_slice(&dest_pid_rel.to_le_bytes());
+                    let block_slot_packed = (dest_pid_block & 0x00FF_FFFF)
+                        | ((u32::from(dest_slot)) << 24);
+                    dest_bytes[ctid_rel_at + 4..ctid_rel_at + 8]
+                        .copy_from_slice(&block_slot_packed.to_le_bytes());
+
+                    // Payload (null bitmap is zero — skip it).
+                    dest_bytes[new_payload_off + 1..new_payload_off + 5]
+                        .copy_from_slice(&new_id.to_le_bytes());
+                    dest_bytes[new_payload_off + 5..new_payload_off + 9]
+                        .copy_from_slice(&new_val.to_le_bytes());
+
+                    // ItemId.
+                    let item = ItemId::new(
+                        new_tuple_off as u32,
+                        NEW_TUPLE_SIZE as u32,
+                        ItemIdFlags::Normal,
+                    );
+                    let id_off = Page::item_id_offset(dest_slot);
+                    dest_bytes[id_off..id_off + ITEMID_SIZE]
+                        .copy_from_slice(&item.into_raw().to_le_bytes());
+
+                    dest_state.cur_lower += ITEMID_SIZE;
+                    let new_tid = TupleId::new(dest_page_id, dest_slot);
+
+                    // Stamp the source slot under the source page's
+                    // write guard. `src_bytes` is the source page's
+                    // mutable byte buffer; `dest_bytes` is the dest
+                    // page's — disjoint pages, disjoint borrows.
+                    Self::stamp_updated_old_inline(
+                        src_bytes,
+                        src_slot,
+                        new_tid,
+                        xid,
+                        command_id,
+                    )?;
+                }
+                drop(dest_page);
+                cand_idx += n_write;
+                total_updated += n_write;
+            }
+
+            // Drop source page write guard.
+            drop(src_page);
+            drop(src_guard);
+        }
+
+        // Finalise the last destination page header, if any.
+        if let Some(mut state) = dest.take() {
+            let mut page = state.guard.write();
+            let bytes = page.as_bytes_mut();
+            state.header.lower = state.cur_lower as u16;
+            state.header.upper = state.cur_upper as u16;
+            state.header.encode(bytes);
+            drop(page);
+            drop(state.guard);
+        }
+
+        if total_updated > 0 {
+            self.column_cache.bump_version(rel);
+        }
+
+        Ok(total_updated)
+    }
+
     pub fn scan_visible_walker<'a, O: XidStatusOracle + ?Sized>(
         &'a self,
         rel: RelationId,

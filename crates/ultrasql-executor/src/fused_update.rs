@@ -170,89 +170,39 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
         // contiguous memory but `SmallVec`'s inline storage means each
         // entry's payload stays on the stack until update_many consumes
         // it.
-        let cap_upper = (self.block_count as usize).saturating_mul(180);
-        let mut edits: Vec<(ultrasql_core::TupleId, UpdatePayload)> = Vec::with_capacity(cap_upper);
-
         let predicate = self.predicate;
         let target_col = self.target_col;
         let delta = self.delta;
 
-        // `for_each_visible` holds the per-page read guard for the
-        // duration of one page's slot loop and reads each slot's
-        // bytes directly off the buffer-pool page — no per-page 8 KiB
-        // memcpy into a walker-side scratch buffer. Cheaper than
-        // `scan_visible_walker` when the caller's only job is to
-        // pull `(tid, payload)` and immediately consume them, which
-        // is exactly this operator's shape.
-        self.heap
-            .for_each_visible(
+        // Single-pass UPDATE: scan, predicate-filter, write new
+        // version, and stamp the old slot under one source-page
+        // write guard. Bypasses `update_many` / `insert_batch` and
+        // the intermediate edits Vec entirely; see
+        // `HeapAccess::update_int32_pair_in_place_add` for the
+        // page-traversal contract.
+        let predicate_fn = |id: i32, val: i32| -> bool {
+            match predicate {
+                None => true,
+                Some(pred) => {
+                    let key = if pred.col_index == 0 { id } else { val };
+                    pred.op.check(key, pred.literal)
+                }
+            }
+        };
+        let n = self
+            .heap
+            .update_int32_pair_in_place_add(
                 self.relation,
                 self.block_count,
                 &self.snapshot,
                 &*self.oracle,
-                |tid, _header, payload| {
-                    // `(Int32, Int32)` relation payload layout:
-                    //   byte 0      null bitmap (always 0 for the bench shape)
-                    //   bytes 1..5  id   little-endian i32
-                    //   bytes 5..9  val  little-endian i32
-                    if payload.len() < 9 {
-                        return Err(ultrasql_storage::heap::HeapError::MalformedHeader(
-                            "fused UPDATE expected a 9-byte (Int32, Int32) payload",
-                        ));
-                    }
-                    let id = i32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-                    let val = i32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
-
-                    if let Some(pred) = predicate {
-                        let key = if pred.col_index == 0 { id } else { val };
-                        if !pred.op.check(key, pred.literal) {
-                            return Ok(());
-                        }
-                    }
-
-                    let (new_id, new_val) = if target_col == 0 {
-                        (id.wrapping_add(delta), val)
-                    } else {
-                        (id, val.wrapping_add(delta))
-                    };
-
-                    let mut new_payload = UpdatePayload::new();
-                    new_payload.push(0_u8);
-                    new_payload.extend_from_slice(&new_id.to_le_bytes());
-                    new_payload.extend_from_slice(&new_val.to_le_bytes());
-                    edits.push((tid, new_payload));
-                    Ok(())
-                },
+                predicate_fn,
+                target_col,
+                delta,
+                self.xid,
+                self.command_id,
             )
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-
-        let n = edits.len();
-        if n > 0 {
-            // For the (Int32, Int32) bulk-UPDATE shape this operator
-            // handles, every source page is at the post-preload
-            // ~99%-full mark and `try_hot_update`'s pre-check
-            // therefore short-circuits every page-group on its first
-            // pin. Skipping the HOT branch entirely (the per-page
-            // pin + header decode + free-space comparison) saves
-            // ~10 µs on a 10 000-row UPDATE without changing
-            // correctness — every row would have hit the bulk-
-            // non-HOT fallback anyway. When this operator's shape
-            // gate widens to relations with partially-empty pages we
-            // can revisit, but the present preconditions guarantee
-            // there is no HOT win to forfeit.
-            self.heap
-                .update_many(
-                    edits,
-                    UpdateOptions {
-                        xid: self.xid,
-                        command_id: self.command_id,
-                        hot_eligible: false,
-                        wal: None,
-                        vm: None,
-                    },
-                )
-                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-        }
 
         let affected_i64 = i64::try_from(n).unwrap_or(i64::MAX);
         let batch = Batch::new([Column::Int64(NumericColumn::from_data(vec![affected_i64]))])
