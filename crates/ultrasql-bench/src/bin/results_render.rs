@@ -370,11 +370,13 @@ fn render_md(by_workload: &HashMap<String, Vec<EngineResult>>) -> String {
          implements MVCC UPDATE / DELETE — every mutation creates a new \
          tuple version and stamps the old one. SQLite's UPDATE measured \
          here runs under `PRAGMA journal_mode=MEMORY` + `synchronous=OFF` \
-         and writes in place (no MVCC). The `update_throughput_10k` row \
-         is the only workload where this semantic gap shows: against \
-         PostgreSQL (also MVCC + wire protocol) UltraSQL UPDATE is **118× \
-         faster** (0.55 ms vs 64.42 ms). Every other workload is \
-         apples-to-apples across engine semantics.\n\n",
+         and writes in place (no MVCC). On the wire-comparable, \
+         MVCC-comparable engine — PostgreSQL — UltraSQL UPDATE is **158× \
+         faster** on this shape (0.41 ms vs 64.42 ms). DuckDB's UPDATE \
+         leads the table through a non-MVCC delta-encoded update path; \
+         UltraSQL takes second place while preserving full MVCC \
+         semantics over a tokio-postgres wire path. Every other workload \
+         is apples-to-apples across engine semantics.\n\n",
     );
     out.push_str(
         "Tables are ordered fastest → slowest. The `Relative` column shows \
