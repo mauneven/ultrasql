@@ -690,18 +690,28 @@ where
     /// `write_all`. See `handle_query` for motivation.
     async fn send_query_result_with_ready(
         &mut self,
-        result: SelectResult,
+        mut result: SelectResult,
     ) -> Result<(), ServerError> {
         let ready = BackendMessage::ReadyForQuery {
             status: self.txn_state.ready_for_query_status(),
         };
+        // Streamed-body path: append `ReadyForQuery` directly to the
+        // result's existing `BytesMut` and write it out without an
+        // extra round through `self.write_buf`. For a 10 000-row
+        // `select_scan_10k` response that streamed body is ~250 KB;
+        // copying it into a second buffer used to add a memcpy of
+        // the whole response on every query. Appending `ready` (5
+        // bytes) to the tail keeps the wire reply on a single
+        // `write_all` + `flush` and saves the per-byte copy.
+        if let Some(body) = result.streamed_body.as_mut() {
+            encode_backend(&ready, body);
+            self.io.write_all(body).await?;
+            self.io.flush().await?;
+            return Ok(());
+        }
         self.write_buf.clear();
-        if let Some(body) = result.streamed_body.as_ref() {
-            self.write_buf.extend_from_slice(body);
-        } else {
-            for msg in &result.messages {
-                encode_backend(msg, &mut self.write_buf);
-            }
+        for msg in &result.messages {
+            encode_backend(msg, &mut self.write_buf);
         }
         encode_backend(&ready, &mut self.write_buf);
         self.io.write_all(&self.write_buf).await?;

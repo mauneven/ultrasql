@@ -193,6 +193,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// page being updated. No destination guard is acquired because
     /// no destination page exists.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     pub fn update_int32_pair_inplace_undo<O, P>(
         &self,
         rel: RelationId,

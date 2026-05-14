@@ -259,6 +259,7 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// Holds **one** write-exclusive page guard at a time.
     #[allow(clippy::too_many_arguments)]
+    #[inline]
     pub fn delete_int32_pair_inplace<O, P>(
         &self,
         rel: RelationId,
