@@ -18,10 +18,13 @@
 //! - `StartupMessage` / `AuthenticationOk` / `ParameterStatus` /
 //!   `BackendKeyData` / `ReadyForQuery` — full handshake.
 //! - Simple Query (`'Q'`) — parsed, bound, lowered, and executed.
+//! - Extended Query (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`/`Close`/
+//!   `Flush`) — routed through the per-connection state machine in
+//!   [`extended`]. Parameter values are substituted into the bound
+//!   logical plan and executed through the same `pipeline::lower_query`
+//!   path Simple Query uses; the result encoder honours text/binary
+//!   per-column format codes.
 //! - Terminate (`'X'`) — closes the session.
-//! - Extended-protocol messages (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`,
-//!   `Password`) — answered with a single `ErrorResponse` + a
-//!   `ReadyForQuery 'E'`. The extended protocol lands in a follow-up.
 //!
 //! ## Execution
 //!
@@ -36,6 +39,7 @@
 
 pub mod auth;
 pub mod error;
+pub mod extended;
 pub mod pipeline;
 pub mod result_encoder;
 pub mod tls;
@@ -337,11 +341,18 @@ where
 }
 
 /// Per-connection state machine.
+///
+/// `extended` holds the Extended Query Protocol's prepared-statement and
+/// portal caches. It is owned by the session and accessed only by the
+/// connection's own task, so no synchronisation primitive guards it
+/// (per AGENTS.md §5: "default to the simplest primitive that meets the
+/// workload"; the workload here is single-threaded).
 struct Session<RW> {
     io: RW,
     read_buf: BytesMut,
     write_buf: BytesMut,
     state: Arc<Server>,
+    extended: extended::ExtendedConnState,
 }
 
 impl<RW> Session<RW>
@@ -354,6 +365,7 @@ where
             read_buf: BytesMut::with_capacity(READ_BUFFER_INITIAL),
             write_buf: BytesMut::with_capacity(READ_BUFFER_INITIAL),
             state,
+            extended: extended::ExtendedConnState::new(),
         }
     }
 
@@ -427,6 +439,16 @@ where
     }
 
     /// Main per-query loop. Returns on clean termination.
+    ///
+    /// Two message families are dispatched here:
+    ///
+    /// - Simple Query (`'Q'`) — parsed, bound, lowered, and executed
+    ///   end-to-end in [`Self::handle_query`].
+    /// - Extended Query (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`/
+    ///   `Close`/`Flush`) — routed to [`Self::handle_extended`]. The
+    ///   spec defines a pipelined contract: errors silence subsequent
+    ///   extended messages until a `Sync` resets the flag and the
+    ///   server emits `ReadyForQuery`.
     async fn run(&mut self) -> Result<(), ServerError> {
         loop {
             let msg = match self.read_frontend().await {
@@ -439,15 +461,43 @@ where
                     self.handle_query(&sql).await?;
                 }
                 FrontendMessage::Terminate => return Ok(()),
-                FrontendMessage::Parse { .. }
-                | FrontendMessage::Bind { .. }
-                | FrontendMessage::Describe { .. }
-                | FrontendMessage::Execute { .. }
-                | FrontendMessage::Sync => {
-                    self.send_error("extended query not supported in v0.5", "0A000")
-                        .await?;
-                    self.send(&BackendMessage::ReadyForQuery { status: b'E' })
-                        .await?;
+                FrontendMessage::Parse {
+                    name,
+                    sql,
+                    param_types,
+                } => {
+                    self.handle_parse(name, sql, param_types).await?;
+                }
+                FrontendMessage::Bind {
+                    portal_name,
+                    statement_name,
+                    param_formats,
+                    params,
+                    result_formats,
+                } => {
+                    self.handle_bind(
+                        portal_name,
+                        statement_name,
+                        param_formats,
+                        params,
+                        result_formats,
+                    )
+                    .await?;
+                }
+                FrontendMessage::Describe { kind, name } => {
+                    self.handle_describe(kind, &name).await?;
+                }
+                FrontendMessage::Execute { portal, max_rows } => {
+                    self.handle_execute(&portal, max_rows).await?;
+                }
+                FrontendMessage::Sync => {
+                    self.handle_sync().await?;
+                }
+                FrontendMessage::Close { kind, name } => {
+                    self.handle_extended_close(kind, &name).await?;
+                }
+                FrontendMessage::Flush => {
+                    self.handle_flush().await?;
                 }
                 FrontendMessage::Password { .. } => {
                     // Auth is not yet a state in the loop; if a client
@@ -986,6 +1036,195 @@ where
         }
     }
 
+    // -----------------------------------------------------------------
+    // Extended Query Protocol dispatch.
+    //
+    // Each Parse/Bind/Describe/Execute/Close handler runs synchronously
+    // through the kernel in `extended.rs`. The handler returns either
+    // `Ok(messages)` to emit on the wire, or a query-scoped error that
+    // marks the pipeline as failed. Subsequent extended messages are
+    // silently dropped (per the PostgreSQL spec) until a `Sync` resets
+    // the failure flag and emits `ReadyForQuery`.
+    // -----------------------------------------------------------------
+
+    /// Handle `Parse(name, sql, param_types)`.
+    async fn handle_parse(
+        &mut self,
+        name: String,
+        sql: String,
+        param_types: Vec<u32>,
+    ) -> Result<(), ServerError> {
+        if self.extended.pipeline_failed {
+            return Ok(());
+        }
+        // Capture a per-statement catalog snapshot — identical pattern
+        // to `execute_query` so binding observes the same catalog the
+        // forthcoming `Execute` will use. Plans are stored bound, not
+        // re-bound at Execute time, so concurrent DDL between Parse and
+        // Execute is invisible to the prepared statement (PostgreSQL
+        // exhibits the same behaviour with `pg_proc` snapshotting).
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        let combined = CombinedCatalog {
+            snapshot: &catalog_snapshot,
+            fallback: &self.state.catalog,
+        };
+        match extended::handle_parse(&mut self.extended, name, sql, param_types, &combined) {
+            Ok(msg) => self.send(&msg).await,
+            Err(e) => {
+                if !e.is_query_scoped() {
+                    return Err(e);
+                }
+                self.extended.mark_failed();
+                self.send_error(&e.to_string(), e.sqlstate()).await
+            }
+        }
+    }
+
+    /// Handle `Bind(portal, statement, param_formats, params, result_formats)`.
+    async fn handle_bind(
+        &mut self,
+        portal_name: String,
+        statement_name: String,
+        param_formats: Vec<i16>,
+        params: Vec<Option<Vec<u8>>>,
+        result_formats: Vec<i16>,
+    ) -> Result<(), ServerError> {
+        if self.extended.pipeline_failed {
+            return Ok(());
+        }
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        let combined = CombinedCatalog {
+            snapshot: &catalog_snapshot,
+            fallback: &self.state.catalog,
+        };
+        match extended::handle_bind(
+            &mut self.extended,
+            portal_name,
+            &statement_name,
+            &param_formats,
+            &params,
+            result_formats,
+            Some(&combined),
+        ) {
+            Ok(msg) => self.send(&msg).await,
+            Err(e) => {
+                if !e.is_query_scoped() {
+                    return Err(e);
+                }
+                self.extended.mark_failed();
+                self.send_error(&e.to_string(), e.sqlstate()).await
+            }
+        }
+    }
+
+    /// Handle `Describe(kind, name)`.
+    async fn handle_describe(
+        &mut self,
+        kind: ultrasql_protocol::DescribeKind,
+        name: &str,
+    ) -> Result<(), ServerError> {
+        if self.extended.pipeline_failed {
+            return Ok(());
+        }
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        let combined = CombinedCatalog {
+            snapshot: &catalog_snapshot,
+            fallback: &self.state.catalog,
+        };
+        let result = match kind {
+            ultrasql_protocol::DescribeKind::Statement => {
+                extended::handle_describe_statement(&self.extended, name, Some(&combined))
+            }
+            ultrasql_protocol::DescribeKind::Portal => {
+                extended::handle_describe_portal(&self.extended, name).map(|m| vec![m])
+            }
+        };
+        match result {
+            Ok(msgs) => {
+                for m in &msgs {
+                    self.send(m).await?;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if !e.is_query_scoped() {
+                    return Err(e);
+                }
+                self.extended.mark_failed();
+                self.send_error(&e.to_string(), e.sqlstate()).await
+            }
+        }
+    }
+
+    /// Handle `Execute(portal, max_rows)`. Runs the portal end-to-end
+    /// using the same `lower_query` / executor path Simple Query uses.
+    async fn handle_execute(&mut self, portal: &str, max_rows: i32) -> Result<(), ServerError> {
+        if self.extended.pipeline_failed {
+            return Ok(());
+        }
+        // Build a transaction + LowerCtx exactly like `execute_query`.
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let ctx = pipeline::LowerCtx {
+            tables: &self.state.tables,
+            catalog_snapshot: Arc::clone(&catalog_snapshot),
+            heap: Arc::clone(&self.state.heap),
+            snapshot: txn.snapshot.clone(),
+            oracle: Arc::clone(&self.state.txn_manager),
+            xid: txn.xid,
+            command_id: ultrasql_core::CommandId::FIRST,
+        };
+        let outcome = extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
+        // Commit before sending (same ordering as `execute_query`).
+        if let Err(e) = self.state.txn_manager.commit(txn) {
+            tracing::warn!(error = %e, "autocommit failed to finalise (Extended Execute)");
+        }
+        match outcome {
+            Ok(out) => {
+                for m in &out.messages {
+                    self.send(m).await?;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                if !e.is_query_scoped() {
+                    return Err(e);
+                }
+                self.extended.mark_failed();
+                self.send_error(&e.to_string(), e.sqlstate()).await
+            }
+        }
+    }
+
+    /// Handle `Sync`. Always emits `ReadyForQuery 'I'` (idle), since we
+    /// run every statement in its own autocommit transaction in v0.5.
+    async fn handle_sync(&mut self) -> Result<(), ServerError> {
+        self.extended.reset_on_sync();
+        self.send(&BackendMessage::ReadyForQuery { status: b'I' })
+            .await
+    }
+
+    /// Handle `Close(kind, name)`. Always emits `CloseComplete` even
+    /// when the named object does not exist (per spec).
+    async fn handle_extended_close(
+        &mut self,
+        kind: ultrasql_protocol::DescribeKind,
+        name: &str,
+    ) -> Result<(), ServerError> {
+        if self.extended.pipeline_failed {
+            return Ok(());
+        }
+        let msg = extended::handle_close(&mut self.extended, kind, name);
+        self.send(&msg).await
+    }
+
+    /// Handle `Flush`. Flush already happens inside `send`; this is a
+    /// no-op on top of that.
+    async fn handle_flush(&mut self) -> Result<(), ServerError> {
+        self.io.flush().await?;
+        Ok(())
+    }
+
     /// Read one frontend message, growing the buffer until the codec
     /// has a complete frame.
     //
@@ -1350,33 +1589,152 @@ mod tests {
         handle.await.expect("task joins").expect("clean exit");
     }
 
+    /// Extended Query round-trip over the in-memory duplex transport.
+    ///
+    /// `Parse → Bind → Describe(Portal) → Execute → Sync` against
+    /// `SELECT id FROM users` should return the same three rows the
+    /// Simple Query path produces. This is the duplex-level smoke test;
+    /// the real-driver test against `tokio-postgres` lives in
+    /// `crates/ultrasql-server/tests/extended_query_round_trip.rs`.
     #[tokio::test]
-    async fn extended_protocol_parse_is_rejected_with_error() {
+    async fn extended_query_round_trip_select() {
         let (mut client, server_side) = tokio::io::duplex(8192);
         let state = server();
         let handle = tokio::spawn(handle_connection(server_side, state));
 
         complete_startup(&mut client).await;
+
+        // Parse
         send_frontend(
             &mut client,
             &FrontendMessage::Parse {
-                name: String::new(),
-                sql: "SELECT 1".to_string(),
+                name: "s1".to_string(),
+                sql: "SELECT id FROM users".to_string(),
                 param_types: vec![],
             },
         )
         .await;
+        // Bind
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Bind {
+                portal_name: "p1".to_string(),
+                statement_name: "s1".to_string(),
+                param_formats: vec![],
+                params: vec![],
+                result_formats: vec![],
+            },
+        )
+        .await;
+        // Describe(Portal)
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Describe {
+                kind: ultrasql_protocol::DescribeKind::Portal,
+                name: "p1".to_string(),
+            },
+        )
+        .await;
+        // Execute
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Execute {
+                portal: "p1".to_string(),
+                max_rows: 0,
+            },
+        )
+        .await;
+        // Sync — triggers ReadyForQuery.
+        send_frontend(&mut client, &FrontendMessage::Sync).await;
+
         let msgs = drain_until_ready(&mut client).await;
+
+        // ParseComplete and BindComplete are present.
         assert!(
             msgs.iter()
-                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+                .any(|m| matches!(m, BackendMessage::ParseComplete)),
+            "missing ParseComplete: {msgs:?}"
         );
-        // Extended-protocol rejection sets the ready-for-query status
-        // to 'E' (error) so libpq clients sync.
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, BackendMessage::BindComplete)),
+            "missing BindComplete: {msgs:?}"
+        );
+        // RowDescription from Describe(Portal).
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, BackendMessage::RowDescription { .. })),
+            "missing RowDescription: {msgs:?}"
+        );
+        // Three data rows.
+        let n_rows = msgs
+            .iter()
+            .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+            .count();
+        assert_eq!(n_rows, 3, "expected 3 data rows: {msgs:?}");
+        // CommandComplete + ReadyForQuery 'I' at the end.
         assert!(matches!(
             msgs.last().unwrap(),
-            BackendMessage::ReadyForQuery { status: b'E' }
+            BackendMessage::ReadyForQuery { status: b'I' }
         ));
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// Parameter substitution end-to-end over the duplex transport.
+    ///
+    /// `SELECT id FROM users WHERE id = $1` with `$1 = 2` should
+    /// return exactly one row.
+    #[tokio::test]
+    async fn extended_query_round_trip_with_parameter() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = server();
+        let handle = tokio::spawn(handle_connection(server_side, state));
+
+        complete_startup(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Parse {
+                name: String::new(),
+                sql: "SELECT id FROM users WHERE id = $1".to_string(),
+                param_types: vec![23], // int4
+            },
+        )
+        .await;
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Bind {
+                portal_name: String::new(),
+                statement_name: String::new(),
+                param_formats: vec![1], // binary
+                params: vec![Some(2_i32.to_be_bytes().to_vec())],
+                result_formats: vec![],
+            },
+        )
+        .await;
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Execute {
+                portal: String::new(),
+                max_rows: 0,
+            },
+        )
+        .await;
+        send_frontend(&mut client, &FrontendMessage::Sync).await;
+
+        let msgs = drain_until_ready(&mut client).await;
+        let rows: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(columns.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "expected one matching row: {msgs:?}");
+        assert_eq!(rows[0][0].as_deref(), Some(b"2".as_slice()));
 
         send_frontend(&mut client, &FrontendMessage::Terminate).await;
         drop(client);

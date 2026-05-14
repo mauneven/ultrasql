@@ -131,11 +131,11 @@ pub fn run_select(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
         for row in 0..row_count {
             let mut columns = Vec::with_capacity(batch.width());
             for col in batch.columns() {
-                columns.push(encode_value(col, row));
+                columns.push(encode_text_value(col, row));
             }
             messages.push(BackendMessage::DataRow { columns });
         }
-        rows = rows.saturating_add(row_count as u64);
+        rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
     }
 
     messages.push(BackendMessage::CommandComplete {
@@ -162,12 +162,16 @@ fn build_row_description(schema: &Schema) -> BackendMessage {
     BackendMessage::RowDescription { fields }
 }
 
-/// Encode column row `i` as a PostgreSQL text-format value.
+/// Encode column row `row` of `col` as a PostgreSQL text-format value.
 ///
 /// The protocol crate already encodes `None` as SQL `NULL` (length -1
 /// on the wire), so we represent SQL NULL as `None`. Other values are
 /// serialized into UTF-8 bytes using their natural display form.
-fn encode_value(col: &Column, row: usize) -> Option<Vec<u8>> {
+///
+/// `pub(crate)` because the Extended Query dispatcher in `extended.rs`
+/// shares this encoder for any result column the client requested in
+/// text format (the default per the protocol spec).
+pub(crate) fn encode_text_value(col: &Column, row: usize) -> Option<Vec<u8>> {
     if let Some(nulls) = column_nulls(col) {
         // Convention from `ultrasql-vec`: 1 bit = valid, 0 bit = null.
         if !nulls.get(row) {

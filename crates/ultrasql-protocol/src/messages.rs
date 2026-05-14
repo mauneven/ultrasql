@@ -122,14 +122,24 @@ pub enum FrontendMessage {
         portal_name: String,
         /// Source statement name; empty for the unnamed statement.
         statement_name: String,
-        /// Parameter values, in declaration order. UltraSQL exposes a
-        /// simplified Bind that omits the per-parameter format-code
-        /// arrays; callers that need binary parameters should use
-        /// [`Self::Parse`] with explicit type OIDs and supply binary
-        /// payloads through the value bytes.
+        /// Per-parameter format codes (`0` = text, `1` = binary). Three
+        /// conventions are spec-defined:
+        ///
+        /// - empty vector → every parameter is in text format,
+        /// - single element → that single code applies to every
+        ///   parameter (the libpq "all-same" shortcut),
+        /// - one element per parameter → element `i` governs `params[i]`.
+        ///
+        /// The decoder preserves the raw vector verbatim; callers
+        /// resolve the convention via the rules above. Earlier
+        /// versions of this enum discarded this field; preserving it
+        /// is required for binary-format clients (e.g. `tokio-postgres`
+        /// in its default prepared-statement path).
+        param_formats: Vec<i16>,
+        /// Parameter values, in declaration order.
         params: Vec<Option<Vec<u8>>>,
         /// Per-column result format codes (`0` = text, `1` = binary).
-        /// An empty vector means "default to text for every column".
+        /// Same three conventions as `param_formats`.
         result_formats: Vec<i16>,
     },
 

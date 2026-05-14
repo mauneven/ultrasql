@@ -126,16 +126,17 @@ pub fn encode_frontend(msg: &FrontendMessage, buf: &mut BytesMut) {
         FrontendMessage::Bind {
             portal_name,
             statement_name,
+            param_formats,
             params,
             result_formats,
         } => {
             write_tagged(buf, b'B', |payload| {
                 write_cstring(payload, portal_name);
                 write_cstring(payload, statement_name);
-                // Parameter format codes: zero indicates "default text
-                // for every parameter", matching this crate's
-                // simplified Bind shape.
-                payload.put_i16(0);
+                payload.put_i16(i16_from_usize(param_formats.len()));
+                for code in param_formats {
+                    payload.put_i16(*code);
+                }
                 payload.put_i16(i16_from_usize(params.len()));
                 for value in params {
                     write_value(payload, value.as_deref());
@@ -463,12 +464,13 @@ fn decode_frontend_payload(
             let statement_name = p.read_cstring()?;
             let format_count = p.read_i16()?;
             let format_count = nonneg_usize(format_count, "bind format count")?;
-            // The simplified Bind serializer always emits zero
-            // per-parameter format codes (meaning "all text"). The
-            // decoder accepts any count and skips the values to stay
-            // interoperable with libpq clients.
+            // Per-spec: empty → all-text; single → applies to every
+            // parameter; one-per → per-parameter. The decoder
+            // preserves the raw vector; the resolution rules live in
+            // the consumer.
+            let mut param_formats = Vec::with_capacity(format_count.min(64));
             for _ in 0..format_count {
-                let _ = p.read_i16()?;
+                param_formats.push(p.read_i16()?);
             }
             let param_count = p.read_i16()?;
             let param_count = nonneg_usize(param_count, "bind param count")?;
@@ -486,6 +488,7 @@ fn decode_frontend_payload(
             FrontendMessage::Bind {
                 portal_name,
                 statement_name,
+                param_formats,
                 params,
                 result_formats,
             }
@@ -1248,6 +1251,7 @@ mod tests {
         let msg = FrontendMessage::Bind {
             portal_name: "p1".into(),
             statement_name: "stmt1".into(),
+            param_formats: vec![],
             params: vec![
                 Some(b"42".to_vec()),
                 None,
@@ -1257,6 +1261,33 @@ mod tests {
             result_formats: vec![0, 1],
         };
         assert_eq!(round_trip_frontend(&msg), msg);
+    }
+
+    #[test]
+    fn bind_round_trip_with_binary_param_formats() {
+        // libpq's "all-same" shortcut: one format code applies to
+        // every parameter. Also verifies the per-parameter form.
+        let all_binary = FrontendMessage::Bind {
+            portal_name: String::new(),
+            statement_name: String::new(),
+            param_formats: vec![1],
+            params: vec![Some(42_i32.to_be_bytes().to_vec())],
+            result_formats: vec![1],
+        };
+        assert_eq!(round_trip_frontend(&all_binary), all_binary);
+
+        let per_param = FrontendMessage::Bind {
+            portal_name: "p".into(),
+            statement_name: "s".into(),
+            param_formats: vec![1, 0, 1],
+            params: vec![
+                Some(7_i64.to_be_bytes().to_vec()),
+                Some(b"text".to_vec()),
+                Some(vec![1]),
+            ],
+            result_formats: vec![],
+        };
+        assert_eq!(round_trip_frontend(&per_param), per_param);
     }
 
     #[test]
@@ -1826,6 +1857,7 @@ mod tests {
         let bind = FrontendMessage::Bind {
             portal_name: "p_get_user".into(),
             statement_name: "get_user".into(),
+            param_formats: vec![],
             params: vec![Some(b"42".to_vec())],
             result_formats: vec![0, 0],
         };

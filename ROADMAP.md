@@ -114,7 +114,7 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 | `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, dictionary encoding, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
 | `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ⚠️ bootstrap-from-heap falls back to initial snapshot (no typed tuple decoder yet) |
 | `ultrasql-protocol` | ✅ Wire codec for Simple Query + Extended Query (Parse/Bind/Describe/Execute/Sync/Close) |
-| `ultrasql-server` | ✅ SCRAM-SHA-256 + TLS, Simple Query end-to-end for `CREATE TABLE`, `INSERT VALUES`, `SELECT`/`SELECT SUM`/`SELECT AVG`/`SELECT WHERE`, `UPDATE`, `DELETE` through real heap; ⚠️ Extended Query dispatch + BEGIN/COMMIT + JOIN/ORDER BY/SET OPs not yet wired |
+| `ultrasql-server` | ✅ SCRAM-SHA-256 + TLS, Simple Query end-to-end for `CREATE TABLE`, `INSERT VALUES`, `SELECT`/`SELECT SUM`/`SELECT AVG`/`SELECT WHERE`, `UPDATE`, `DELETE` through real heap; ✅ Extended Query dispatch (Parse/Bind/Describe/Execute/Sync/Close/Flush) with parameter substitution through the same path; ⚠️ BEGIN/COMMIT + JOIN/ORDER BY/SET OPs not yet wired |
 
 ### Wire-protocol coverage matrix
 
@@ -139,7 +139,7 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 | `BEGIN / COMMIT / ROLLBACK` | ✅ | ❌ | ❌ | ❌ |
 | `SAVEPOINT / RELEASE / ROLLBACK TO` | ✅ | ❌ | ❌ | ❌ |
 | `PREPARE / EXECUTE / DEALLOCATE` (Simple Query) | ✅ | ❌ | ❌ | ❌ |
-| Extended Query (Parse/Bind/Execute) | ✅ codec | n/a | ❌ dispatch | ❌ |
+| Extended Query (Parse/Bind/Execute) | ✅ codec | n/a | ✅ dispatch | ✅ |
 | `EXPLAIN` / `EXPLAIN ANALYZE` | ✅ | ❌ | ❌ | ❌ |
 | `BETWEEN ... AND ...` | ✅ | ❌ | ❌ | ❌ |
 | `WITH cte AS (...)` | ✅ | ✅ | ❌ | ❌ |
@@ -155,7 +155,7 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 | Priority | Area | Blocking |
 |----------|------|---------|
 | **P0** | v0.5: BEGIN/COMMIT/ROLLBACK end-to-end (binder + server dispatch) | Every multi-statement workload, mixed_oltp_pgbench_like bench, ORM correctness |
-| **P0** | v0.5: Extended Query dispatch in server | Every ORM and every driver beyond simple psql |
+| **P0** | ~~v0.5: Extended Query dispatch in server~~ ✅ done — Parse/Bind/Describe/Execute/Sync/Close/Flush wired via `extended.rs`; tokio-postgres prepared-statement round-trips green | (was) Every ORM and every driver beyond simple psql |
 | **P0** | v0.5: Wire ORDER BY (`LogicalPlan::Sort`) in `lower_query` | Any ranked output, TPC-H Q1 |
 | **P0** | v0.5: Wire `LogicalPlan::Join` and `SetOp` in `lower_query` | All TPC-H, all real analytical workloads |
 | **P0** | v0.5: Binder support for `BETWEEN`, `IS NULL` (latter for completeness) | UPDATE / DELETE benchmark parity, ANSI surface |
@@ -446,16 +446,17 @@ driver can connect.
 
 ### Wire Protocol: Extended Query
 - [x] `Parse` codec
-- [x] `Bind` codec
+- [x] `Bind` codec (with per-parameter format codes preserved on decode)
 - [x] `Describe` codec
 - [x] `Execute` codec
 - [x] `Sync` codec
 - [x] `Close` codec
-- [ ] **Server-side dispatch** for all of the above (the codec is encode-only today; no `lib.rs` handler accepts them)
-- [ ] Pipeline mode (server-side multi-message handling)
-- [ ] Server-side statement cache (keyed by name)
-- [ ] Named portals (cursor via extended protocol)
-- [ ] Binary transfer format for numeric, timestamp, etc.
+- [x] **Server-side dispatch** for all of the above — `crates/ultrasql-server/src/extended.rs`; parameter values are decoded (text + binary) and substituted into the bound `LogicalPlan` so the same `lower_query` path runs both Simple and Extended; tokio-postgres prepared-statement round-trip green for `CREATE TABLE` (Simple) + `INSERT VALUES($1, $2)`, `SELECT * FROM t`, `SELECT WHERE col=$1`, `SELECT SUM(x)`, `UPDATE SET x=$1 WHERE id=$2`, `DELETE WHERE id=$1`
+- [x] Server-side statement cache (keyed by name; per-connection)
+- [x] Named portals (cursor via extended protocol)
+- [x] Per-column binary transfer format for int2/int4/int8/bool/text (float4/float8 binary v0.6)
+- [ ] Pipeline mode (server-side multi-message handling beyond the current Sync-bounded pipeline)
+- [ ] `max_rows` partial-execution + `PortalSuspended` resumption (currently sends `PortalSuspended` then drops the portal)
 
 ### Transaction Control (wire)
 - [ ] `BEGIN` / `COMMIT` / `ROLLBACK` round-trip
@@ -506,7 +507,7 @@ driver can connect.
 ### Milestones (must hold before v0.5 ships)
 - [x] tokio-postgres can `CREATE TABLE`, `INSERT VALUES`, `SELECT ... WHERE col op lit`, `SELECT SUM/AVG`, `UPDATE`, `DELETE` end-to-end against `ultrasqld`
 - [ ] `BEGIN`/`COMMIT` round-trip from any standard driver
-- [ ] Extended Query Parse/Bind/Execute round-trip from any standard driver
+- [x] Extended Query Parse/Bind/Execute round-trip from any standard driver — tokio-postgres prepared statements green (see `crates/ultrasql-server/tests/extended_query_round_trip.rs`)
 - [ ] `ORDER BY` reachable from the wire
 - [ ] INSERT 10 k throughput ≥ 2× every competitor (currently 14× DuckDB ✅, 4× SQLite ✅, 10× PostgreSQL ✅)
 - [ ] SELECT scan 10 k ≥ 2× every competitor (currently 9× behind DuckDB ❌)
