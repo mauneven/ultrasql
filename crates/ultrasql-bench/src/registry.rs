@@ -347,11 +347,16 @@ pub fn p99_f64(values: &[f64]) -> f64 {
 // Stub implementations for the v0.6 starter set
 // ---------------------------------------------------------------------------
 
-/// Stub run function used for all six starter benchmarks.
+/// Stub run function for benchmarks that are not yet implemented.
 ///
 /// Returns placeholder zeros so the registry compiles and the gate can parse
-/// the baseline without a live UltraSQL execution path. Real implementations
-/// will replace these stubs as the corresponding executor paths land.
+/// the baseline without a live UltraSQL execution path. All benchmarks
+/// previously using this stub have been wired to real implementations in
+/// [`crate::runs`]. The remaining stubs (`tpcb_32conn`, `tpcc_5types`) use
+/// their own module-level run functions that also return zeros.
+///
+/// Kept here for reference and future deferred benchmarks.
+#[allow(dead_code)]
 const fn stub_run(_ctx: &BenchContext) -> BenchResult {
     BenchResult {
         throughput_per_sec: 0.0,
@@ -396,7 +401,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
             (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::insert_throughput::run,
     },
     BenchSpec {
         id: "update_throughput_10k",
@@ -408,7 +413,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
             (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::update_throughput::run,
     },
     BenchSpec {
         id: "delete_throughput_10k",
@@ -420,7 +425,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
             (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::delete_throughput::run,
     },
     // ------------------------------------------------------------------
     // v0.5 — mixed OLTP
@@ -436,7 +441,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
             (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::mixed_oltp::run,
     },
     // ------------------------------------------------------------------
     // v0.6 — plan + execute benchmarks
@@ -457,7 +462,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
             (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::point_lookup::run,
     },
     BenchSpec {
         id: "range_scan",
@@ -469,7 +474,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::range_scan::run,
     },
     BenchSpec {
         id: "insert_throughput",
@@ -481,7 +486,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
             (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::insert_throughput::run,
     },
     BenchSpec {
         id: "hash_aggregate",
@@ -493,7 +498,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::hash_aggregate::run,
     },
     BenchSpec {
         id: "sort_large",
@@ -505,7 +510,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::sort_large::run,
     },
     BenchSpec {
         id: "tpch_q1",
@@ -516,7 +521,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
             (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::tpch_q1::run,
     },
     // ------------------------------------------------------------------
     // v0.7 — vectorized-kernel benchmarks
@@ -539,7 +544,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::select_sum_65k::run,
     },
     BenchSpec {
         id: "select_avg_10m_i64",
@@ -551,7 +556,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::select_avg_10m::run,
     },
     BenchSpec {
         id: "filter_sum_10m_i64",
@@ -563,7 +568,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
             (Engine::Postgres17, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run, // real run wires in once the bench-driver dispatcher lands
+        run: crate::runs::filter_sum_10m::run,
     },
     BenchSpec {
         id: "tpch_q22",
@@ -574,7 +579,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::DuckDb, FloorMetric::ThroughputRatio(2.0)),
             (Engine::ClickHouse, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::tpch_q22::run,
     },
     // ------------------------------------------------------------------
     // v0.8 — index + constraint benchmarks
@@ -590,7 +595,7 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
             (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        run: crate::runs::btree_point_lookup::run,
     },
     // ------------------------------------------------------------------
     // v0.9 — operations benchmarks
@@ -606,7 +611,9 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
             (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        // TODO(v0.9-tpcb): real implementation in runs::tpcb once the
+        // async connection handler and multi-writer WAL path land.
+        run: crate::runs::tpcb::run,
     },
     // ------------------------------------------------------------------
     // v1.0 — GA benchmarks
@@ -622,7 +629,9 @@ static SPECS: [BenchSpec; 17] = [
             (Engine::Sqlite3, FloorMetric::ThroughputRatio(2.0)),
             (Engine::CockroachDb, FloorMetric::ThroughputRatio(2.0)),
         ],
-        run: stub_run,
+        // TODO(v1.0-tpcc): real implementation in runs::tpcc once all
+        // 5 TPC-C transaction types are implemented.
+        run: crate::runs::tpcc::run,
     },
 ];
 

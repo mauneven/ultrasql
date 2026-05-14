@@ -12,4 +12,5 @@
 //! | `pg-runner` | Enables the PostgreSQL execution path in [`tpch::runner`] and [`tpch::load`], pulling in `tokio-postgres`. |
 
 pub mod registry;
+pub mod runs;
 pub mod tpch;

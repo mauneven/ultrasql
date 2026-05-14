@@ -1161,12 +1161,22 @@ mod tests {
     }
 
     /// Verify that all benchmarks in the default registry complete without
-    /// panicking within the 5-second smoke budget.  Stubs return in
-    /// nanoseconds, so this is a pure correctness / "no crash" gate.
+    /// panicking.  This is a pure correctness / "no crash" gate; it is not
+    /// a performance gate.
+    ///
+    /// The `ULTRASQL_BENCH_SMOKE` environment variable is set before
+    /// running so that each benchmark module selects its smoke-mode dataset
+    /// size (a few hundred rows) rather than the production size (up to
+    /// 1 000 000 rows). This keeps the test fast in debug builds while still
+    /// exercising every real code path.
     #[test]
     fn smoke_completes_under_5_seconds_on_default_registry() {
         use std::time::Instant;
         use ultrasql_bench::registry::{BenchContext, HostInfo, REGISTRY, Stage};
+
+        // Enable smoke-mode sizing in benchmark modules.
+        // SAFETY: single-threaded test process; no other thread reads this var.
+        unsafe { std::env::set_var("ULTRASQL_BENCH_SMOKE", "1") };
 
         let ctx = BenchContext {
             iterations: 1,
@@ -1185,6 +1195,9 @@ mod tests {
             let _result = (spec.run)(&ctx);
         }
         let elapsed = start.elapsed();
+
+        // Clean up so we don't affect other tests in this process.
+        unsafe { std::env::remove_var("ULTRASQL_BENCH_SMOKE") };
 
         assert!(
             elapsed.as_secs() < 5,
