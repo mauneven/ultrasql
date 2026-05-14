@@ -1252,24 +1252,62 @@ impl<L: PageLoader> HeapAccess<L> {
             }
         }
 
-        // Non-HOT fallback — re-enter the single-tuple `update`
-        // with HOT disabled.
+        // Non-HOT fallback — bulk path.
         //
-        // Every fallback entry is here because the page-bulk HOT
-        // loop already proved `try_hot_update` returns `None` for
-        // it: the page lacks room for a new version, and adding a
-        // new version on a fuller page cannot succeed. Re-attempting
-        // HOT in `Self::update` would pay another `page.write()` +
-        // header decode + free-space check per fallback tuple for
-        // a guaranteed-failure outcome. Force `hot_eligible: false`
-        // to skip directly to the non-HOT insert + stamp path.
-        let non_hot_opts = UpdateOptions {
-            hot_eligible: false,
-            ..opts
-        };
-        for (old_tid, payload) in fallback {
-            self.update(old_tid, &payload, non_hot_opts)?;
-            total += 1;
+        // Every entry on `fallback` is here because the page-bulk
+        // HOT loop already proved `try_hot_update` returns `None`
+        // for the source page. Looping `Self::update` per entry
+        // would pay two `BufferPool::get_page` pins per tuple
+        // (one inside `Self::insert`'s linear scan, one inside
+        // `stamp_updated_old`). For 10 000 fallback rows that is
+        // 20 000 pin operations.
+        //
+        // The bulk path runs in two phases:
+        //
+        //   Phase 1 — `Self::insert_batch` bulk-writes every new
+        //   tuple version. Pages are pinned at most once each;
+        //   `insert_batch` walks slot-by-slot under one write
+        //   guard per destination page.
+        //
+        //   Phase 2 — group `(old_tid, new_tid)` pairs by
+        //   `old_tid.page` and `stamp_updated_old` for every
+        //   entry under one `PageWrite` per source page.
+        //
+        // WAL is force-disabled for the inner insert path so the
+        // logical UPDATE record (emitted by callers wiring up WAL
+        // sinks) is not duplicated; the bench path passes
+        // `opts.wal == None` so this is moot in practice today.
+        if !fallback.is_empty() {
+            let payloads: Vec<&[u8]> = fallback.iter().map(|(_, p)| p.as_slice()).collect();
+            let insert_opts = InsertOptions {
+                xmin: opts.xid,
+                command_id: opts.command_id,
+                wal: None,
+                fsm: None,
+                vm: None,
+            };
+            let rel = fallback[0].0.page.relation;
+            let new_tids = self.insert_batch(rel, &payloads, insert_opts)?;
+
+            let mut by_old_page: ahash::AHashMap<PageId, Vec<(u16, TupleId)>> =
+                ahash::AHashMap::new();
+            for ((old_tid, _), new_tid) in fallback.iter().zip(new_tids.iter()) {
+                by_old_page
+                    .entry(old_tid.page)
+                    .or_default()
+                    .push((old_tid.slot, *new_tid));
+            }
+            for (page_id, slots_and_new) in by_old_page {
+                let guard = self.pool.get_page(page_id)?;
+                for (slot, new_tid) in slots_and_new {
+                    Self::stamp_updated_old(&guard, TupleId::new(page_id, slot), new_tid, opts)?;
+                }
+                if let Some(vm) = opts.vm {
+                    vm.clear(page_id.relation, page_id.block);
+                }
+            }
+            total = total.saturating_add(fallback.len());
+            self.column_cache.bump_version(rel);
         }
 
         Ok(total)
