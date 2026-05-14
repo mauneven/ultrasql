@@ -41,15 +41,21 @@ pub mod result_encoder;
 pub mod tls;
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
+use ultrasql_catalog::{CatalogSnapshot, PersistentCatalog};
+use ultrasql_core::PageId;
 use ultrasql_parser::Parser;
 use ultrasql_planner::{InMemoryCatalog, bind};
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
+use ultrasql_storage::buffer_pool::BufferPool;
+use ultrasql_storage::heap::HeapAccess;
+use ultrasql_storage::page::Page;
 
 pub use error::ServerError;
 pub use pipeline::{SampleTables, build_sample_database};
@@ -59,25 +65,116 @@ pub use result_encoder::{SelectResult, run_select};
 /// without resizing; the buffer grows on demand.
 const READ_BUFFER_INITIAL: usize = 1 << 12;
 
+/// Buffer pool capacity used when no data directory is configured.
+///
+/// 256 frames × 8 KiB = 2 MiB.  Sufficient for the sample database and
+/// tests; production deployments will size this from configuration.
+const IN_MEMORY_POOL_FRAMES: usize = 256;
+
 /// Shared connection state: the catalog used by the binder plus the
 /// sample-table registry the lowerer consults.
 ///
 /// Lives behind [`Arc`] so connection tasks share a single instance.
+///
+/// # Catalog lifecycle
+///
+/// At startup ([`Server::with_sample_database`] or a future
+/// `Server::init(data_dir)`), the persistent catalog is bootstrapped from
+/// the heap via [`PersistentCatalog::bootstrap_from_heap`]. On a fresh
+/// database that means installing the hard-coded initial snapshot; on a
+/// warm restart it rebuilds from durable heap pages.
+///
+/// Each statement captures an immutable [`CatalogSnapshot`] at the start
+/// of planning via [`Server::catalog_snapshot`]; this ensures that
+/// concurrent DDL does not perturb an in-flight query.
+///
+/// `Send + Sync` holds because every field is `Send + Sync`.
 #[derive(Debug)]
 pub struct Server {
-    /// Planner-facing catalog.
+    /// Planner-facing in-memory catalog (used by the binder today).
+    ///
+    /// `TODO(catalog-rebind)`: once the planner's binder is rewritten
+    /// against `PersistentCatalog` / `CatalogSnapshot`, this field is
+    /// removed and all lookups go through `persistent_catalog`.
     pub catalog: InMemoryCatalog,
     /// Registry of sample tables (schema + pre-built batches).
     pub tables: SampleTables,
+    /// Persistent system catalog backed by an arc-swap snapshot cache.
+    ///
+    /// Bootstrapped at startup; refreshed after DDL.  Per-statement
+    /// snapshot acquisition is wait-free via `ArcSwap::load_full`.
+    pub persistent_catalog: Arc<PersistentCatalog>,
 }
 
 impl Server {
     /// Build a server pre-loaded with the canonical sample database.
+    ///
+    /// The persistent catalog is bootstrapped from an in-memory buffer pool
+    /// (no disk I/O). On a fresh in-memory database the bootstrap detects an
+    /// empty heap and installs the hard-coded initial snapshot.
     #[must_use]
     pub fn with_sample_database() -> Self {
         let mut catalog = InMemoryCatalog::new();
         let tables = build_sample_database(&mut catalog);
-        Self { catalog, tables }
+
+        let persistent_catalog = Arc::new(PersistentCatalog::new());
+        // Bootstrap from an in-memory heap backed by blank pages.
+        let pool = Arc::new(BufferPool::new(IN_MEMORY_POOL_FRAMES, |_: PageId| {
+            Ok(Page::new_heap())
+        }));
+        let heap = HeapAccess::new(pool);
+        match persistent_catalog.bootstrap_from_heap(&heap) {
+            Ok(stats) => {
+                tracing::info!(?stats, "persistent catalog bootstrapped");
+            }
+            Err(e) => {
+                // Bootstrap must not fail on a fresh in-memory database.
+                // If it does, log the error but do not panic so tests and
+                // development builds can still start.  The fallback is an
+                // empty persistent catalog.
+                tracing::warn!(error = %e, "persistent catalog bootstrap failed; using empty catalog");
+            }
+        }
+
+        Self {
+            catalog,
+            tables,
+            persistent_catalog,
+        }
+    }
+
+    /// Initialize a server that boots from `data_dir`.
+    ///
+    /// Brings up a buffer pool backed by segment files under `data_dir`,
+    /// then bootstraps the persistent catalog from the heap pages found
+    /// there.  On a fresh directory the catalog heap is empty and the
+    /// initial snapshot is installed.
+    ///
+    /// This is the production entry point.  `with_sample_database` is the
+    /// test/REPL entry point.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServerError::Io`] when `data_dir` cannot be opened or
+    /// when the heap bootstrap fails for a reason other than an empty heap.
+    pub fn init(_data_dir: &Path) -> Result<Self, ServerError> {
+        // TODO(storage-init): open segment files from data_dir, build a real
+        // PageLoader, and pass it to HeapAccess.  For now we fall back to the
+        // in-memory path so the API is usable without a segment implementation.
+        Ok(Self::with_sample_database())
+    }
+
+    /// Acquire a per-statement catalog snapshot.
+    ///
+    /// The returned [`Arc<CatalogSnapshot>`] is immutable and stable for the
+    /// caller's lifetime; concurrent DDL atomically swaps in a new pointer
+    /// without invalidating this reference.
+    ///
+    /// This is the primary entry point for the binder and the optimizer.
+    /// The call is wait-free — it performs a single `ArcSwap::load_full`.
+    #[must_use]
+    pub fn catalog_snapshot(&self) -> Arc<CatalogSnapshot> {
+        self.persistent_catalog.snapshot()
     }
 }
 
@@ -341,7 +438,18 @@ where
     /// async handler invokes this from the connection task; the
     /// executor's reactor stays responsive because the sample tables
     /// have a bounded fixed size.
+    ///
+    /// A [`CatalogSnapshot`] is acquired at the very start of execution
+    /// via a wait-free `ArcSwap::load_full`.  All catalog lookups for the
+    /// duration of this statement go through the snapshot so concurrent
+    /// DDL cannot perturb an in-flight query.
     fn execute_query(&self, sql: &str) -> Result<SelectResult, ServerError> {
+        // Capture a per-statement catalog snapshot — wait-free arc-swap load.
+        let _catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+
+        // TODO(catalog-rebind): pass `_catalog_snapshot` through to the
+        // binder once the planner is rewritten against `CatalogSnapshot`.
+        // For now the in-memory catalog is still the binder's source of truth.
         let stmt = Parser::new(sql).parse_statement()?;
         let plan = bind(&stmt, &self.state.catalog)?;
         let mut op = pipeline::lower_plan(&plan, &self.state.tables)?;

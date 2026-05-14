@@ -2516,12 +2516,14 @@ version = "0.0.1"
 dependencies = [
  "ahash",
  "arc-swap",
+ "criterion",
  "dashmap",
  "parking_lot",
  "smallvec",
  "thiserror",
  "tracing",
  "ultrasql-core",
+ "ultrasql-storage",
 ]
 
 [[package]]

@@ -30,6 +30,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod bootstrap;
 mod entry;
 mod error;
 pub mod information_schema;
@@ -38,8 +39,9 @@ pub mod persistent;
 mod traits;
 pub mod views;
 
+pub use bootstrap::initial_snapshot;
 pub use entry::{IndexEntry, TableEntry};
 pub use error::CatalogError;
 pub use memory::{FIRST_USER_OID, InMemoryCatalog};
-pub use persistent::PersistentCatalog;
+pub use persistent::{CatalogSnapshot, CatalogStats, PersistentCatalog};
 pub use traits::{Catalog, MutableCatalog};

@@ -11,12 +11,25 @@ repository.workspace   = true
 [lints]
 workspace = true
 
+[features]
+# Expose test helpers (e.g. InMemoryLoader) for downstream crates.
+testing = ["ultrasql-storage/testing"]
+
 [dependencies]
-ultrasql-core = { workspace = true }
-thiserror     = { workspace = true }
-parking_lot   = { workspace = true }
-dashmap       = { workspace = true }
-arc-swap      = { workspace = true }
-ahash         = { workspace = true }
-smallvec      = { workspace = true }
-tracing       = { workspace = true }
+ultrasql-core    = { workspace = true }
+ultrasql-storage = { workspace = true }
+thiserror        = { workspace = true }
+parking_lot      = { workspace = true }
+dashmap          = { workspace = true }
+arc-swap         = { workspace = true }
+ahash            = { workspace = true }
+smallvec         = { workspace = true }
+tracing          = { workspace = true }
+
+[dev-dependencies]
+criterion        = { workspace = true }
+ultrasql-storage = { workspace = true, features = ["testing"] }
+
+[[bench]]
+name    = "persistent_catalog"
+harness = false
