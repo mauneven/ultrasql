@@ -1734,7 +1734,15 @@ impl<L: PageLoader> HeapAccess<L> {
         // page (~166 tuples per 8 KiB page for the (Int32, Int32)
         // shape) so the per-source-page collection pass never grows
         // it once warm.
-        let mut candidates: Vec<(u16, i32, i32)> = Vec::with_capacity(200);
+        //
+        // Layout: `(src_slot, src_tuple_offset, new_id, new_val)`.
+        // We carry the source slot's byte offset captured during the
+        // ItemId decode in pass 1 so the pass-2 stamp can write the
+        // four header fields directly at that offset, skipping the
+        // `Page::slot_window`-style re-decode inside the per-tuple
+        // `stamp_updated_old_inline` call (~10 ns / row of saved
+        // ItemId-read + flag-decode work).
+        let mut candidates: Vec<(u16, u32, i32, i32)> = Vec::with_capacity(200);
 
         for src_block in 0..block_count {
             let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
@@ -1852,7 +1860,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 } else {
                     (id, val.wrapping_add(delta))
                 };
-                candidates.push((src_slot, new_id, new_val));
+                candidates.push((src_slot, offset as u32, new_id, new_val));
             }
 
             // Pass 2 — flush every candidate into a destination page
@@ -1920,8 +1928,13 @@ impl<L: PageLoader> HeapAccess<L> {
                 let mut dest_page = dest_state.guard.write();
                 let dest_bytes = dest_page.as_bytes_mut();
 
+                let xid_bytes = xid.raw().to_le_bytes();
+                let cmd_bytes = command_id.raw().to_le_bytes();
+                let rel_bytes = dest_pid_rel.to_le_bytes();
+
                 for i in 0..n_write {
-                    let (src_slot, new_id, new_val) = candidates[cand_idx + i];
+                    let (src_slot, src_off_u32, new_id, new_val) = candidates[cand_idx + i];
+                    let src_off = src_off_u32 as usize;
 
                     let dest_slot = u16::try_from(
                         (dest_state.cur_lower - PAGE_HEADER_SIZE) / ITEMID_SIZE,
@@ -1932,19 +1945,19 @@ impl<L: PageLoader> HeapAccess<L> {
                     let new_tuple_off = dest_state.cur_upper;
                     let new_payload_off = new_tuple_off + TUPLE_HEADER_SIZE;
 
-                    // Write only the non-zero header fields — the
-                    // dest slot region is zero on a fresh page.
+                    // Dest-side write: only the non-zero header
+                    // fields. xmin at offset 0, ctid at offset 32.
                     dest_bytes[new_tuple_off..new_tuple_off + 8]
-                        .copy_from_slice(&xid.raw().to_le_bytes());
+                        .copy_from_slice(&xid_bytes);
                     let ctid_rel_at = new_tuple_off + 32;
                     dest_bytes[ctid_rel_at..ctid_rel_at + 4]
-                        .copy_from_slice(&dest_pid_rel.to_le_bytes());
+                        .copy_from_slice(&rel_bytes);
                     let block_slot_packed = (dest_pid_block & 0x00FF_FFFF)
                         | ((u32::from(dest_slot)) << 24);
                     dest_bytes[ctid_rel_at + 4..ctid_rel_at + 8]
                         .copy_from_slice(&block_slot_packed.to_le_bytes());
 
-                    // Payload (null bitmap is zero — skip it).
+                    // Payload (null bitmap is zero — skip).
                     dest_bytes[new_payload_off + 1..new_payload_off + 5]
                         .copy_from_slice(&new_id.to_le_bytes());
                     dest_bytes[new_payload_off + 5..new_payload_off + 9]
@@ -1961,19 +1974,33 @@ impl<L: PageLoader> HeapAccess<L> {
                         .copy_from_slice(&item.into_raw().to_le_bytes());
 
                     dest_state.cur_lower += ITEMID_SIZE;
-                    let new_tid = TupleId::new(dest_page_id, dest_slot);
 
-                    // Stamp the source slot under the source page's
-                    // write guard. `src_bytes` is the source page's
-                    // mutable byte buffer; `dest_bytes` is the dest
-                    // page's — disjoint pages, disjoint borrows.
-                    Self::stamp_updated_old_inline(
-                        src_bytes,
-                        src_slot,
-                        new_tid,
-                        xid,
-                        command_id,
-                    )?;
+                    // Source-side stamp: inline writes at the exact
+                    // byte offsets we captured during pass-1 ItemId
+                    // decode. Skips the `stamp_updated_old_inline`
+                    // call's `slot_window` re-decode (~10 ns / row
+                    // saved). Layout matches `TupleHeader::encode`:
+                    //   bytes  8..16  xmax
+                    //   bytes 20..24  cmax
+                    //   bytes 24..26  infomask | UPDATED
+                    //   bytes 32..36  ctid relation
+                    //   bytes 36..40  ctid block+slot packing
+                    src_bytes[src_off + 8..src_off + 16].copy_from_slice(&xid_bytes);
+                    src_bytes[src_off + 20..src_off + 24].copy_from_slice(&cmd_bytes);
+                    let cur_infomask = u16::from_le_bytes([
+                        src_bytes[src_off + 24],
+                        src_bytes[src_off + 25],
+                    ]);
+                    let new_infomask = cur_infomask | InfoMask::UPDATED;
+                    src_bytes[src_off + 24..src_off + 26]
+                        .copy_from_slice(&new_infomask.to_le_bytes());
+                    src_bytes[src_off + 32..src_off + 36]
+                        .copy_from_slice(&dest_pid_rel.to_le_bytes());
+                    let stamp_block_slot = (dest_pid_block & 0x00FF_FFFF)
+                        | ((u32::from(dest_slot)) << 24);
+                    src_bytes[src_off + 36..src_off + 40]
+                        .copy_from_slice(&stamp_block_slot.to_le_bytes());
+                    let _ = src_slot;
                 }
                 drop(dest_page);
                 cand_idx += n_write;
