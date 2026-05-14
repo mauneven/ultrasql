@@ -17,6 +17,12 @@ autobins = false
 # pulling in tokio-postgres. Off by default so the crate builds cleanly
 # without a running Postgres instance.
 pg-runner = ["dep:tokio-postgres", "dep:chrono"]
+# Enables the wire-protocol cross-engine benchmark driver
+# (`cross_compare_sql`): spawns an in-process `ultrasqld` and connects
+# via `tokio-postgres` so UltraSQL is measured through the same SQL
+# pipeline that production clients use. Off by default because it
+# pulls the full server stack into the bench crate's dependency graph.
+sql-bench = ["pg-runner", "dep:ultrasql-server"]
 
 [lints]
 workspace = true
@@ -57,6 +63,11 @@ path = "src/bin/readme_render.rs"
 name = "results-render"
 path = "src/bin/results_render.rs"
 
+[[bin]]
+name = "cross_compare_sql"
+path = "src/bin/cross_compare_sql.rs"
+required-features = ["sql-bench"]
+
 [[bench]]
 name    = "v07_vectorized"
 path    = "benches/v07_vectorized.rs"
@@ -82,9 +93,10 @@ serde             = { version = "1", features = ["derive"] }
 serde_json        = "1"
 sha2              = { workspace = true }
 tempfile          = { workspace = true }
-# Optional deps gated behind the pg-runner feature.
+# Optional deps gated behind the pg-runner / sql-bench features.
 tokio-postgres    = { version = "0.7", optional = true }
 chrono            = { workspace = true, optional = true }
+ultrasql-server   = { workspace = true, optional = true }
 
 [dev-dependencies]
 ultrasql-executor = { workspace = true }

@@ -377,10 +377,53 @@ fn render_table(heading: &str, rows: &[(String, f64)]) -> String {
         return out;
     }
 
-    out.push_str("| Engine | Median |\n");
-    out.push_str("| --- | ---: |\n");
+    // Scale the ASCII bar to the slowest row. The slowest row is the
+    // first element after the descending sort `build_tables` applies.
+    let max_us = rows.iter().map(|(_, us)| *us).fold(0.0_f64, f64::max);
+
+    out.push_str("| Engine | Median | Relative |\n");
+    out.push_str("| --- | ---: | --- |\n");
     for (engine, us) in rows {
-        let _ = writeln!(out, "| {} | {} |", engine, format_duration(*us));
+        let bar = render_bar(*us, max_us);
+        let _ = writeln!(out, "| {} | {} | `{bar}` |", engine, format_duration(*us));
+    }
+    out
+}
+
+/// Normalize an engine name from its raw bench-runner form (e.g.
+/// `"ultrasql"`, `"postgres17"`) to the display form used elsewhere
+/// in the README and in the read-side static defaults (e.g.
+/// `"**UltraSQL**"`, `"PostgreSQL"`). Unknown names pass through
+/// unchanged.
+fn display_engine_name(raw: &str) -> String {
+    match raw.to_ascii_lowercase().as_str() {
+        "ultrasql" => "**UltraSQL**".to_string(),
+        "postgres" | "postgres17" | "postgresql" => "PostgreSQL".to_string(),
+        "duckdb" => "DuckDB".to_string(),
+        "sqlite" | "sqlite3" => "SQLite".to_string(),
+        "clickhouse" => "ClickHouse".to_string(),
+        _ => raw.to_string(),
+    }
+}
+
+/// Render a fixed-width ASCII bar proportional to `value / max`. The
+/// bar uses block characters so it lines up monospace; an empty bar
+/// (one cell) is reserved for genuine zero values so the column never
+/// looks broken in Markdown.
+fn render_bar(value: f64, max: f64) -> String {
+    const WIDTH: usize = 18;
+    if max <= 0.0 || !value.is_finite() {
+        return " ".repeat(WIDTH);
+    }
+    let ratio = (value / max).clamp(0.0, 1.0);
+    let cells = (ratio * WIDTH as f64).round() as usize;
+    let cells = cells.clamp(1, WIDTH);
+    let mut out = String::with_capacity(WIDTH);
+    for _ in 0..cells {
+        out.push('█');
+    }
+    for _ in cells..WIDTH {
+        out.push(' ');
     }
     out
 }
@@ -620,7 +663,8 @@ fn merge_latest_results(
         if rows.is_empty() {
             continue;
         }
-        // Sort ascending by median (best first).
+        // Sort here is informational only; `build_tables` re-sorts
+        // descending (slowest first) before rendering.
         rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         eprintln!(
             "readme-render: write-side {bench_id} — {} engines from latest results",
@@ -651,38 +695,35 @@ fn build_tables(
     let mut tables = HashMap::new();
 
     for static_table in STATIC_DEFAULTS {
-        // UltraSQL rows are deliberately filtered out at render time: the
-        // current bench drivers (`cross_compare`, `cross_compare_writes`)
-        // measure UltraSQL at the storage / vectorized-kernel level, while
-        // every competitor row is measured through that engine's full SQL
-        // surface. Publishing both side-by-side would imply parity that
-        // does not exist yet. The README rows return once the
-        // wire-protocol bench driver (`cross_compare_sql`, Wave 3) ships
-        // measurements through `psql`/libpq — see ROADMAP.md and
-        // BENCHMARKS.md for the methodology gate. `_baseline` is kept in
-        // the signature so the callsite still merges latest results into
-        // it (preserves the data path for the Wave 3 reactivation).
-        let mut rows: Vec<(String, f64)> = if static_table.rows.is_empty() {
-            write_side
-                .get(static_table.id)
-                .map_or_else(Vec::new, Clone::clone)
-                .into_iter()
-                .filter(|(engine, _)| !engine.contains("UltraSQL"))
-                .collect()
-        } else {
-            static_table
-                .rows
-                .iter()
-                .filter(|r| !r.engine.contains("UltraSQL"))
-                .map(|r| (r.engine.to_string(), r.median_us))
-                .collect()
-        };
+        // `write_side` carries the most-recent measured rows for every
+        // engine that ran the workload (UltraSQL from
+        // `cross_compare_sql`, competitors from their native clients).
+        // When the latest run covered a workload, it is the source of
+        // truth — the static defaults are stale by definition. When
+        // the latest run did not cover the workload, fall back to the
+        // static defaults (competitors only; UltraSQL kernel rows are
+        // intentionally filtered).
+        let mut rows: Vec<(String, f64)> = write_side.get(static_table.id).map_or_else(
+            || {
+                static_table
+                    .rows
+                    .iter()
+                    .filter(|r| !r.engine.contains("UltraSQL"))
+                    .map(|r| (r.engine.to_string(), r.median_us))
+                    .collect()
+            },
+            |measured| {
+                measured
+                    .iter()
+                    .map(|(name, us)| (display_engine_name(name), *us))
+                    .collect()
+            },
+        );
 
-        // Sort ascending by median (fastest engine on top) so the
-        // rendered table reflects the actual measured ordering, not the
-        // order in STATIC_DEFAULTS (which may be stale after a baseline
-        // run shifts UltraSQL above or below a competitor).
-        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort descending by median (slowest engine on top). The
+        // slowest row sets the scale for the ASCII relative-time bar
+        // rendered alongside each engine.
+        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let table = render_table(static_table.heading, &rows);
         tables.insert(static_table.id.to_string(), table);
@@ -993,7 +1034,7 @@ rest\n";
     #[test]
     fn render_table_with_rows_contains_header() {
         let rows = vec![
-            ("**UltraSQL** (kernel)".to_string(), 4.70_f64),
+            ("**UltraSQL**".to_string(), 4.70_f64),
             ("DuckDB".to_string(), 216.33_f64),
         ];
         let table = render_table("SUM heading", &rows);
@@ -1005,8 +1046,16 @@ rest\n";
             table.contains("| Median |"),
             "table must have median column header"
         );
+        assert!(
+            table.contains("| Relative |"),
+            "table must have relative-time column header"
+        );
         assert!(table.contains("4.70 µs"));
         assert!(table.contains("216.33 µs"));
+        assert!(
+            table.contains('█'),
+            "ASCII bar block character must appear in every row"
+        );
     }
 
     // -----------------------------------------------------------------------

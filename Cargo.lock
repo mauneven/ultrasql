@@ -2506,6 +2506,7 @@ dependencies = [
  "ultrasql-mvcc",
  "ultrasql-planner",
  "ultrasql-protocol",
+ "ultrasql-server",
  "ultrasql-storage",
  "ultrasql-vec",
  "ultrasql-wal",

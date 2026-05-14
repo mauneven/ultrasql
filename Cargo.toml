@@ -49,6 +49,7 @@ ultrasql-executor  = { path = "crates/ultrasql-executor",  version = "0.0.1" }
 ultrasql-vec       = { path = "crates/ultrasql-vec",       version = "0.0.1" }
 ultrasql-catalog   = { path = "crates/ultrasql-catalog",   version = "0.0.1" }
 ultrasql-protocol  = { path = "crates/ultrasql-protocol",  version = "0.0.1" }
+ultrasql-server    = { path = "crates/ultrasql-server",    version = "0.0.1" }
 
 # Error handling
 thiserror = "2"
