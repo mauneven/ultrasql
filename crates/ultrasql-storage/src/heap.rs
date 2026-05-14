@@ -1212,12 +1212,23 @@ impl<L: PageLoader> HeapAccess<L> {
             }
         }
 
-        // Non-HOT fallback — re-enter the single-tuple `update`.
-        // This path is rare on append-style workloads where the new
-        // payload is the same width as the old (`val = val + 1`
-        // bench shape always HOT-succeeds).
+        // Non-HOT fallback — re-enter the single-tuple `update`
+        // with HOT disabled.
+        //
+        // Every fallback entry is here because the page-bulk HOT
+        // loop already proved `try_hot_update` returns `None` for
+        // it: the page lacks room for a new version, and adding a
+        // new version on a fuller page cannot succeed. Re-attempting
+        // HOT in `Self::update` would pay another `page.write()` +
+        // header decode + free-space check per fallback tuple for
+        // a guaranteed-failure outcome. Force `hot_eligible: false`
+        // to skip directly to the non-HOT insert + stamp path.
+        let non_hot_opts = UpdateOptions {
+            hot_eligible: false,
+            ..opts
+        };
         for (old_tid, payload) in fallback {
-            self.update(old_tid, &payload, opts)?;
+            self.update(old_tid, &payload, non_hot_opts)?;
             total += 1;
         }
 
