@@ -1932,17 +1932,27 @@ impl<L: PageLoader> HeapAccess<L> {
                 let cmd_bytes = command_id.raw().to_le_bytes();
                 let rel_bytes = dest_pid_rel.to_le_bytes();
 
+                // Hoist the dest-slot counter out of the inner loop
+                // so each iteration just adds 1 instead of paying
+                // `(cur_lower - PAGE_HEADER_SIZE) / ITEMID_SIZE` +
+                // `u16::try_from` (~5 ns / row of pure index math).
+                let initial_dest_slot = u16::try_from(
+                    (dest_state.cur_lower - PAGE_HEADER_SIZE) / ITEMID_SIZE,
+                )
+                .map_err(|_| HeapError::MalformedHeader("dest slot overflow"))?;
+                // Mutable cursors that the inner loop bumps once per
+                // tuple. We write back into `dest_state` at the end.
+                let mut next_dest_slot = initial_dest_slot;
+                let mut next_dest_upper = dest_state.cur_upper;
+
                 for i in 0..n_write {
                     let (src_slot, src_off_u32, new_id, new_val) = candidates[cand_idx + i];
                     let src_off = src_off_u32 as usize;
 
-                    let dest_slot = u16::try_from(
-                        (dest_state.cur_lower - PAGE_HEADER_SIZE) / ITEMID_SIZE,
-                    )
-                    .map_err(|_| HeapError::MalformedHeader("dest slot overflow"))?;
+                    let dest_slot = next_dest_slot;
 
-                    dest_state.cur_upper -= NEW_TUPLE_SIZE;
-                    let new_tuple_off = dest_state.cur_upper;
+                    next_dest_upper -= NEW_TUPLE_SIZE;
+                    let new_tuple_off = next_dest_upper;
                     let new_payload_off = new_tuple_off + TUPLE_HEADER_SIZE;
 
                     // Dest-side write: only the non-zero header
@@ -1973,7 +1983,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     dest_bytes[id_off..id_off + ITEMID_SIZE]
                         .copy_from_slice(&item.into_raw().to_le_bytes());
 
-                    dest_state.cur_lower += ITEMID_SIZE;
+                    next_dest_slot += 1;
 
                     // Source-side stamp: inline writes at the exact
                     // byte offsets we captured during pass-1 ItemId
@@ -2003,6 +2013,11 @@ impl<L: PageLoader> HeapAccess<L> {
                     let _ = src_slot;
                 }
                 drop(dest_page);
+                // Write back the cursors we bumped inside the inner
+                // loop so the next batch's `ensure dest` decision
+                // sees the new free-space figure.
+                dest_state.cur_upper = next_dest_upper;
+                dest_state.cur_lower += n_write * ITEMID_SIZE;
                 cand_idx += n_write;
                 total_updated += n_write;
             }
