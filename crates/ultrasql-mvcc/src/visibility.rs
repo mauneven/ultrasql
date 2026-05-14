@@ -185,6 +185,23 @@ where
         return Visibility::Visible;
     }
 
+    // In-place UPDATE semantics: a non-`INVALID` xmax with the
+    // `UPDATED_IN_PLACE` bit means the slot's payload is the
+    // *post-update* version. The pre-update version is held in the
+    // heap's side-channel undo log keyed by `TupleId`. The tuple is
+    // therefore *always visible* under MVCC — both the pre- and
+    // post-update views exist for some snapshot — and the scan
+    // path is responsible for picking the correct payload from
+    // either the slot bytes (post-update) or the undo log
+    // (pre-update) depending on whether xmax is visible in the
+    // reader's snapshot. The classical "xmax committed → invisible"
+    // rule applies only to *delete* (and to the legacy out-of-place
+    // UPDATE path that materialises a separate new tuple version
+    // at a different `ctid`).
+    if header.infomask.contains(InfoMask::UPDATED_IN_PLACE) {
+        return Visibility::Visible;
+    }
+
     if snapshot.is_current_xid(header.xmax) {
         // We deleted it ourselves. Hidden at the deleting command and
         // every later command in the same transaction.

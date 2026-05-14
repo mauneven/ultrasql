@@ -191,7 +191,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
         };
         let n = self
             .heap
-            .update_int32_pair_in_place_add(
+            .update_int32_pair_inplace_undo(
                 self.relation,
                 self.block_count,
                 &self.snapshot,

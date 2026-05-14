@@ -62,6 +62,21 @@ impl InfoMask {
     /// its tuples invisible even to the parent transaction.
     pub const SUBXACT: u16 = 1 << 9;
 
+    /// Tuple was updated **in place** — the slot's payload bytes hold
+    /// the *post-update* version, and a side-channel undo log carries
+    /// the *pre-update* payload keyed by the same `TupleId`.
+    ///
+    /// When this bit is set together with a non-`INVALID` `xmax`,
+    /// `is_visible` still classifies visibility using the standard
+    /// rules, but scan paths must consult the undo log to recover the
+    /// pre-update payload when the reader's snapshot does not yet see
+    /// `xmax` as committed. Tuples without this bit follow the
+    /// classical PostgreSQL contract: a non-`INVALID` `xmax` means the
+    /// tuple has been deleted (or moved to a new `ctid` via the
+    /// out-of-place new-version path), and the slot payload is the
+    /// pre-update / pre-delete state.
+    pub const UPDATED_IN_PLACE: u16 = 1 << 10;
+
     /// Wrap an existing 16-bit mask.
     #[must_use]
     pub const fn from_bits(bits: u16) -> Self {

@@ -14,7 +14,7 @@ Dataset:         10000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 395.08 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 440.00 µs | `█                                               ` | 8 |
 | 2 | sqlite3 | 512.33 µs | `█                                               ` | 8 |
 | 3 | duckdb | 1.99 ms | `████                                            ` | 8 |
 | 4 | clickhouse | 3.37 ms | `███████                                         ` | 8 |
@@ -26,7 +26,7 @@ Dataset:       1000000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 124.83 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 99.46 µs | `█                                               ` | 8 |
 | 2 | duckdb | 216.46 µs | `█                                               ` | 8 |
 | 3 | clickhouse | 1.66 ms | `██                                              ` | 8 |
 | 4 | sqlite3 | 16.20 ms | `████████████████████                            ` | 8 |
@@ -38,7 +38,7 @@ Dataset:         10000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 4.20 ms | `███                                             ` | 8 |
+| 1 | ultrasql | 5.46 ms | `████                                            ` | 8 |
 | 2 | sqlite3 | 20.23 ms | `███████████████                                 ` | 8 |
 | 3 | postgres17 | 48.38 ms | `█████████████████████████████████████           ` | 8 |
 | 4 | clickhouse | 62.83 ms | `████████████████████████████████████████████████` | 8 |
@@ -50,7 +50,7 @@ Dataset:         10000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 282.35 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 120.85 µs | `█                                               ` | 8 |
 | 2 | sqlite3 | 357.35 µs | `█                                               ` | 8 |
 | 3 | duckdb | 1.25 ms | `███                                             ` | 8 |
 | 4 | postgres17 | 11.63 ms | `█████████████████████████                       ` | 8 |
@@ -62,7 +62,7 @@ Dataset:       1000000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 123.25 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 103.12 µs | `█                                               ` | 8 |
 | 2 | duckdb | 283.85 µs | `█                                               ` | 8 |
 | 3 | clickhouse | 2.05 ms | `██                                              ` | 8 |
 | 4 | sqlite3 | 14.61 ms | `█████████████████                               ` | 8 |
@@ -74,9 +74,9 @@ Dataset:         10000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 729.38 µs | `█                                               ` | 8 |
-| 2 | duckdb | 897.42 µs | `██                                              ` | 8 |
-| 3 | clickhouse | 1.17 ms | `██                                              ` | 8 |
+| 1 | duckdb | 897.42 µs | `██                                              ` | 8 |
+| 2 | clickhouse | 1.17 ms | `██                                              ` | 8 |
+| 3 | ultrasql | 1.56 ms | `███                                             ` | 8 |
 | 4 | sqlite3 | 1.81 ms | `███                                             ` | 8 |
 | 5 | postgres17 | 28.60 ms | `████████████████████████████████████████████████` | 8 |
 
@@ -86,7 +86,7 @@ Dataset:         65536 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 84.38 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 67.71 µs | `█                                               ` | 8 |
 | 2 | duckdb | 111.42 µs | `█                                               ` | 8 |
 | 3 | clickhouse | 674.67 µs | `█                                               ` | 8 |
 | 4 | sqlite3 | 938.88 µs | `█                                               ` | 8 |
@@ -99,7 +99,7 @@ Dataset:         10000 rows
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
 | 1 | duckdb | 176.25 µs | `█                                               ` | 8 |
-| 2 | ultrasql | 309.17 µs | `█                                               ` | 8 |
+| 2 | ultrasql | 192.62 µs | `█                                               ` | 8 |
 | 3 | sqlite3 | 451.08 µs | `█                                               ` | 8 |
 | 4 | clickhouse | 3.50 ms | `███                                             ` | 8 |
 | 5 | postgres17 | 64.42 ms | `████████████████████████████████████████████████` | 8 |
