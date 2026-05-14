@@ -32,28 +32,25 @@ The short version: **be a colleague.** The longer version follows.
 ## 3. Reporting
 
 If you witness or experience behavior that violates this Code of
-Conduct, report it to: **conduct@ultrasql.org**.
+Conduct, report it via **GitHub Issues**: <https://github.com/mauneven/ultrasql/issues>.
 
-Reports are confidential. They are read by the steering committee.
-We will acknowledge receipt within 72 hours and follow up with the
-reporter on next steps.
-
-You may also raise issues directly with a project maintainer if you
-prefer.
+Mark the issue `[conduct]` in the title. Reports are read by the
+project maintainers. We will acknowledge receipt within 72
+hours and follow up with the reporter on next steps.
 
 ## 4. Enforcement
 
 Responses range from a private conversation to a temporary or
-permanent ban from project spaces. The steering committee decides the
-response based on severity and pattern. Decisions are documented
-internally; the reporter is informed of the outcome.
+permanent ban from project spaces. Project maintainers decide
+the response based on severity and pattern. The reporter is informed
+of the outcome.
 
 ## 5. Scope
 
 This Code of Conduct applies in all project spaces: GitHub
-repositories, GitHub Discussions, mailing lists, chat channels,
-conferences and events where UltraSQL is represented, and any private
-communications between contributors related to project work.
+repositories, GitHub Discussions, conferences and events where
+UltraSQL is represented, and any private communications related to
+project work.
 
 ## 6. Attribution
 

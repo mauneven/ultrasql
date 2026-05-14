@@ -13,8 +13,8 @@ the project at its current pre-1.0 stage.
 
 **Please do not file public issues for security vulnerabilities.**
 
-Send a report to: **security@ultrasql.org** (PGP key fingerprint
-published at <https://ultrasql.org/security/pgp.asc>).
+Report via **GitHub Security Advisory**:
+<https://github.com/mauneven/ultrasql/security/advisories/new>
 
 Include in the report:
 
@@ -64,8 +64,7 @@ guidance:
   data that should be redacted), defense-in-depth gaps that do not
   enable a direct attack.
 
-The maintainer team assigns severity. Disagreements are documented
-in the advisory.
+Project maintainers assign severity and document the reasoning in the advisory.
 
 ---
 
