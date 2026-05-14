@@ -2039,9 +2039,12 @@ impl<L: PageLoader> HeapAccess<L> {
         let mut total_updated: usize = 0;
         let mut xmin_cache: Option<(Xid, u16, bool)> = None;
 
-        // Per-source-page scratch buffer for undo entries. Bulk-
-        // appended to the per-relation undo log once per page so we
-        // pay one `RwLock::write` per page instead of one per row.
+        // Per-source-page scratch for the undo log. The slot-major
+        // walk pushes one record at a time and we move them all into
+        // the per-relation log once per page under a single
+        // `RwLock::write` acquire. Using `Vec` (not `SmallVec`) here
+        // because the page-level scratch is reused across pages and
+        // the 9-byte payload fits inline in `UpdatePayload` anyway.
         let mut undo_scratch: Vec<UndoEntry> = Vec::with_capacity(200);
 
         let xid_bytes = xid.raw().to_le_bytes();
@@ -2160,11 +2163,10 @@ impl<L: PageLoader> HeapAccess<L> {
                     (id, val.wrapping_add(delta))
                 };
 
-                // Capture pre-image into scratch (9 bytes: 0 + id + val).
+                // Capture pre-image (9 bytes: 0 + id + val) directly
+                // from the slot bytes — no decode + re-encode pair.
                 let mut pre_image = UpdatePayload::new();
-                pre_image.push(0_u8);
-                pre_image.extend_from_slice(&id.to_le_bytes());
-                pre_image.extend_from_slice(&val.to_le_bytes());
+                pre_image.extend_from_slice(&src_bytes[payload_off..payload_off + 9]);
                 undo_scratch.push(UndoEntry {
                     tid: TupleId::new(src_page_id, src_slot),
                     writer_xid: xid,
