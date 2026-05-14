@@ -1931,13 +1931,23 @@ impl<L: PageLoader> HeapAccess<L> {
             drop(src_guard);
 
             // Bulk-append this page's undo entries to the relation's
-            // undo log under one write-lock acquire.
+            // undo log under one write-lock acquire. Pre-reserve
+            // capacity on the relation log's first write to avoid the
+            // geometric-growth reallocation chain when a large UPDATE
+            // pushes thousands of pre-images: we have a tight upper
+            // bound (`block_count × max-tuples-per-page`) without
+            // walking the heap.
             if !undo_scratch.is_empty() {
                 let log_handle = self
                     .undo_log
                     .entry(rel)
                     .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
                 let mut log = log_handle.write();
+                if log.entries.is_empty() {
+                    // Approx 154 (Int32, Int32) tuples per 8 KiB page.
+                    let upper = (block_count as usize).saturating_mul(160);
+                    log.entries.reserve(upper);
+                }
                 log.entries.extend(undo_scratch.drain(..));
             }
         }

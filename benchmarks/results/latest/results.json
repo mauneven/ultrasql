@@ -1,5 +1,5 @@
 {
-  "rendered_at": "2026-05-28T20:27:48Z",
+  "rendered_at": "2026-05-28T20:35:23Z",
   "schema_version": 1,
   "workloads": {
     "delete_throughput_10k": {
@@ -663,6 +663,24 @@
     "update_throughput_10k": {
       "engines": [
         {
+          "engine": "ultrasql",
+          "iterations_us": [
+            120.041,
+            133.0,
+            133.125,
+            136.833,
+            137.541,
+            168.375,
+            174.5,
+            178.958
+          ],
+          "median_us": 137.541,
+          "min_us": 120.041,
+          "n_rows": 10000,
+          "rank": 1,
+          "samples": 8
+        },
+        {
           "engine": "duckdb",
           "iterations_us": [
             169.12500723265111,
@@ -676,24 +694,6 @@
           ],
           "median_us": 176.25,
           "min_us": 169.125,
-          "n_rows": 10000,
-          "rank": 1,
-          "samples": 8
-        },
-        {
-          "engine": "ultrasql",
-          "iterations_us": [
-            166.208,
-            173.125,
-            183.875,
-            191.75,
-            192.625,
-            199.834,
-            204.79100000000005,
-            207.291
-          ],
-          "median_us": 192.625,
-          "min_us": 166.208,
           "n_rows": 10000,
           "rank": 2,
           "samples": 8
