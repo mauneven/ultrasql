@@ -37,18 +37,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ultrasql_catalog::{CatalogSnapshot, TableEntry};
+use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
-    Filter, FilterEqI32, HashAggregate, HashJoin, Limit, MemTableScan, ModifyKind, ModifyTable,
-    NestedLoopJoin, Operator, Project, RightFactory, RowCodec, SeqScan, Sort, ValuesScan,
+    Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan, ModifyKind,
+    ModifyTable, NestedLoopJoin, Operator, Project, RightFactory, RowCodec, SeqScan, Sort,
+    ValuesScan,
 };
-use ultrasql_mvcc::Snapshot;
+use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
 use ultrasql_planner::{
     BinaryOp, InMemoryCatalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr,
     TableMeta,
 };
+use ultrasql_storage::btree::BTree;
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
@@ -497,6 +499,32 @@ pub fn lower_query(
             lower_project_columns(child, exprs)
         }
         LogicalPlan::Filter { input, predicate } => {
+            // Index-aware fast path: when the filter sits directly on top
+            // of a catalog-resolved table scan and the predicate is one
+            // of the indexable shapes recognised by `try_index_scan`, we
+            // probe the B-tree and emit an [`IndexScan`] over the
+            // matching tuple payloads — never materialising a SeqScan.
+            //
+            // The dispatcher returns `Ok(None)` when:
+            //   - the input is not a bare `Scan { table }` over a
+            //     persistent relation,
+            //   - the table has no B-tree index on the predicate's
+            //     column,
+            //   - the predicate's shape is outside the indexable set,
+            //   - the index's key column is not Int32 / Int64 (the only
+            //     types A10 lifted into the on-disk B-tree).
+            // In every miss case we fall back to the general
+            // `Filter(SeqScan)` plan; that fallback is the existing
+            // behaviour, so a query over an unindexed column or a
+            // text-typed key never regresses.
+            //
+            // The dispatcher returns `Err(_)` only when an indexable
+            // shape was recognised but probing the B-tree or fetching a
+            // heap tuple raised a storage error — those are not
+            // recoverable by falling back, so we propagate.
+            if let Some(op) = try_index_scan(input, predicate, ctx)? {
+                return Ok(op);
+            }
             let child = lower_query(input, ctx)?;
             Ok(Box::new(Filter::new(child, predicate.clone())))
         }
@@ -948,6 +976,399 @@ fn lower_project_columns(
         }
     }
     Ok(Box::new(Project::new(child, indices)?))
+}
+
+// ---------------------------------------------------------------------------
+// Index-scan lowering
+// ---------------------------------------------------------------------------
+
+/// Inclusive lower / inclusive upper bound on an `i64`-shaped index key.
+///
+/// `None` on either side means "unbounded in that direction".
+/// `low == high` represents a point-lookup probe.
+///
+/// The bounds are normalised to *inclusive* on both ends — caller code
+/// that observes a strict `<` or `>` operator pre-adjusts the bound by
+/// ±1 via `i64::checked_add` / `i64::checked_sub` so a downstream
+/// range scan can treat every bound uniformly. When an adjustment would
+/// overflow the bound is clamped to the corresponding sentinel
+/// ([`i64::MAX`] / [`i64::MIN`]); the resulting range is empty in the
+/// overflow-toward-infinity direction, which preserves predicate
+/// semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IndexKeyRange {
+    /// Inclusive lower bound, or `None` for unbounded below.
+    low: Option<i64>,
+    /// Inclusive upper bound, or `None` for unbounded above.
+    high: Option<i64>,
+}
+
+impl IndexKeyRange {
+    /// Point probe: `key == k`.
+    const fn point(k: i64) -> Self {
+        Self {
+            low: Some(k),
+            high: Some(k),
+        }
+    }
+}
+
+/// Try to lower a `Filter { Scan(table), predicate }` shape into an
+/// [`IndexScan`] operator backed by a B-tree probe.
+///
+/// Returns:
+/// - `Ok(Some(op))` when the table is catalog-resolved, has a single-
+///   column Int32/Int64 B-tree index covering the predicate's column,
+///   and the predicate matches an [indexable shape](#indexable-shapes).
+/// - `Ok(None)` for any other case so the caller falls back to the
+///   default [`Filter(SeqScan)`] plan. The fallback path is the
+///   non-regressing default: a query that does not match an indexable
+///   shape, hits an unindexed column, or runs against the sample-table
+///   registry continues to use the existing sequential scan + filter
+///   path.
+/// - `Err(_)` only when the B-tree probe or heap fetch itself fails;
+///   those errors are not recoverable by trying a different operator.
+///
+/// # Indexable shapes
+///
+/// In this wave the dispatcher recognises:
+/// - `col = literal` → point lookup.
+/// - `col < literal`, `col <= literal`, `col > literal`, `col >= literal`
+///   → one-sided range scan.
+/// - `col BETWEEN lo AND hi` (binder-rewritten into
+///   `col >= lo AND col <= hi`) → bounded range scan.
+/// - `lo <= col AND col <= hi` and equivalent rewrites whose operands
+///   commute (the binder may emit any of `>=`, `<=`, `>`, `<` on either
+///   side of an AND) → bounded range scan.
+///
+/// Compound predicates joined by `OR`, `NOT`, or anything beyond a
+/// single conjunction of column-vs-literal comparisons fall through to
+/// `Ok(None)`. The binder produces precisely these shapes for
+/// `BETWEEN` (see `bind_between`); broader rewrites land with the
+/// optimizer's predicate canonicaliser in a later wave.
+///
+/// # Why a single helper instead of a planner emission
+///
+/// We pattern-match in `lower_query` rather than teaching the planner
+/// to emit `LogicalPlan::IndexScan` directly. Two reasons:
+/// 1. The planner currently emits `Filter { Scan, predicate }` for
+///    every WHERE clause; adding an `IndexScan` node would force every
+///    consumer of `LogicalPlan` (binder tests, optimizer rewrites,
+///    debug printers, EXPLAIN plumbing) to learn the new variant.
+/// 2. The catalog snapshot is materialised in [`LowerCtx`], not in the
+///    binder. Doing the dispatch here keeps the catalog-look-up local
+///    to one function and the planner stays catalog-snapshot-free,
+///    which the optimizer wave (v0.6 P0) needs to remain
+///    plan-cache-friendly.
+fn try_index_scan(
+    input: &LogicalPlan,
+    predicate: &ScalarExpr,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    // Step 1: the input must be a bare base-table scan over a relation
+    // the catalog snapshot knows about. Sample-table scans never have
+    // an index, so we let them fall back to SeqScan-equivalent shapes.
+    let LogicalPlan::Scan { table, .. } = input else {
+        return Ok(None);
+    };
+    let Some(table_entry) = ctx.catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+
+    // Step 2: extract `(column_index, key_range)` from the predicate.
+    // A miss (None) means the shape is not indexable.
+    let Some((col_idx, range)) = match_indexable_predicate(predicate) else {
+        return Ok(None);
+    };
+
+    // Step 3: locate an index covering exactly this column. A10's
+    // CREATE INDEX path emits `IndexEntry::columns` as a single-element
+    // `Vec<u16>` of 0-based attnums; we look up by that exact shape.
+    // A composite index that *starts with* this column would also
+    // satisfy a point lookup, but the storage layer only supports
+    // 8-byte keys today, so we conservatively require a single-column
+    // match.
+    let Some(index_entry) = find_single_column_index(&ctx.catalog_snapshot, table_entry, col_idx)
+    else {
+        return Ok(None);
+    };
+
+    // Step 4: confirm the indexed column's type is one the B-tree can
+    // store. A10 only widens Int32 / Int64 into the i64 key space;
+    // other types (text, float, bool) fall back to SeqScan.
+    let Some(_widen) = key_type_for_btree(table_entry, col_idx) else {
+        return Ok(None);
+    };
+
+    // Step 5: probe the B-tree, fetch matching tuples from the heap
+    // with MVCC visibility applied, and wrap them in an IndexScan.
+    let payloads = probe_index(index_entry, range, ctx)?;
+    let codec = RowCodec::new(table_entry.schema.clone());
+    Ok(Some(Box::new(IndexScan::new(payloads, codec))))
+}
+
+/// Decode a `WHERE` predicate into an `(column_index, IndexKeyRange)`
+/// pair when its shape is one the B-tree dispatcher can probe.
+///
+/// Recognised top-level shapes:
+/// - `Binary(op, Column, Literal)` for `op ∈ {Eq, Lt, LtEq, Gt, GtEq}`
+///   (or commuted operand order).
+/// - `Binary(And, sub_left, sub_right)` where both subterms are
+///   single-side comparisons on the same column — produces a bounded
+///   range. This is the canonical post-binder shape for `BETWEEN`.
+///
+/// Returns `None` for anything else; the caller falls back to a
+/// general filter.
+fn match_indexable_predicate(predicate: &ScalarExpr) -> Option<(usize, IndexKeyRange)> {
+    if let Some((col, range)) = match_simple_comparison(predicate) {
+        return Some((col, range));
+    }
+    // Conjunction of two single-side comparisons on the same column.
+    let ScalarExpr::Binary {
+        op: BinaryOp::And,
+        left,
+        right,
+        ..
+    } = predicate
+    else {
+        return None;
+    };
+    let (left_col, left_range) = match_simple_comparison(left)?;
+    let (right_col, right_range) = match_simple_comparison(right)?;
+    if left_col != right_col {
+        return None;
+    }
+    let combined = IndexKeyRange {
+        low: max_lower_bound(left_range.low, right_range.low),
+        high: min_upper_bound(left_range.high, right_range.high),
+    };
+    Some((left_col, combined))
+}
+
+/// Decode a single `Column op Literal` (or commuted) comparison into an
+/// `(column_index, IndexKeyRange)`. Returns `None` when the operand
+/// types are not Int32 / Int64, the literal cannot be represented as
+/// `i64`, or the operator is not a comparison.
+///
+/// Strict-bound operators are normalised to inclusive bounds via
+/// `±1` adjustment (`x > 5` becomes `low = Some(6)`,
+/// `x < 5` becomes `high = Some(4)`). Overflowing the adjustment
+/// clamps to the sentinel; the resulting range is empty, which is
+/// correctness-preserving (no tuple's i64 key is `> i64::MAX`).
+fn match_simple_comparison(expr: &ScalarExpr) -> Option<(usize, IndexKeyRange)> {
+    let ScalarExpr::Binary {
+        op, left, right, ..
+    } = expr
+    else {
+        return None;
+    };
+    // Decompose into (column_idx, literal_as_i64, op_with_col_on_left).
+    let (col_idx, raw_lit, op_normalised) = match (left.as_ref(), right.as_ref()) {
+        (col @ ScalarExpr::Column { .. }, lit @ ScalarExpr::Literal { .. }) => {
+            let idx = column_idx_for_int_key(col)?;
+            let lit_val = literal_as_i64(lit)?;
+            (idx, lit_val, *op)
+        }
+        (lit @ ScalarExpr::Literal { .. }, col @ ScalarExpr::Column { .. }) => {
+            let idx = column_idx_for_int_key(col)?;
+            let lit_val = literal_as_i64(lit)?;
+            // Flip the operator so `lit op col` reads as `col flipped_op lit`.
+            let flipped = match op {
+                BinaryOp::Eq => BinaryOp::Eq,
+                BinaryOp::Lt => BinaryOp::Gt,
+                BinaryOp::LtEq => BinaryOp::GtEq,
+                BinaryOp::Gt => BinaryOp::Lt,
+                BinaryOp::GtEq => BinaryOp::LtEq,
+                _ => return None,
+            };
+            (idx, lit_val, flipped)
+        }
+        _ => return None,
+    };
+    let range = match op_normalised {
+        BinaryOp::Eq => IndexKeyRange::point(raw_lit),
+        BinaryOp::Lt => IndexKeyRange {
+            low: None,
+            high: raw_lit.checked_sub(1),
+        },
+        BinaryOp::LtEq => IndexKeyRange {
+            low: None,
+            high: Some(raw_lit),
+        },
+        BinaryOp::Gt => IndexKeyRange {
+            low: raw_lit.checked_add(1),
+            high: None,
+        },
+        BinaryOp::GtEq => IndexKeyRange {
+            low: Some(raw_lit),
+            high: None,
+        },
+        _ => return None,
+    };
+    Some((col_idx, range))
+}
+
+/// Read the column index from a [`ScalarExpr::Column`] whose data type
+/// is a `B-tree-supported` integer (`Int32` or `Int64`). Returns
+/// `None` for non-column expressions, NULL columns, or non-integer
+/// types.
+const fn column_idx_for_int_key(expr: &ScalarExpr) -> Option<usize> {
+    let ScalarExpr::Column {
+        index, data_type, ..
+    } = expr
+    else {
+        return None;
+    };
+    match data_type {
+        DataType::Int32 | DataType::Int64 => Some(*index),
+        _ => None,
+    }
+}
+
+/// Lift an integer-typed literal to `i64`. `Int32` is sign-extended
+/// via the lossless `i64::from(i32)` widening conversion. Returns
+/// `None` for non-integer literals (text, float, NULL, …).
+fn literal_as_i64(expr: &ScalarExpr) -> Option<i64> {
+    let ScalarExpr::Literal { value, .. } = expr else {
+        return None;
+    };
+    match value {
+        Value::Int32(v) => Some(i64::from(*v)),
+        Value::Int64(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// Pick the tighter (i.e., larger) lower bound from two candidates.
+/// `None` means "no constraint"; any concrete bound wins over `None`.
+const fn max_lower_bound(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(x), Some(y)) => Some(if x > y { x } else { y }),
+    }
+}
+
+/// Pick the tighter (i.e., smaller) upper bound from two candidates.
+const fn min_upper_bound(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some(x), Some(y)) => Some(if x < y { x } else { y }),
+    }
+}
+
+/// Return the [`IndexEntry`] that covers exactly the single column
+/// `col_idx` of `table_entry`, if any. Composite indexes whose first
+/// key is `col_idx` are *not* returned today: the on-disk B-tree only
+/// supports 8-byte keys, so a composite index could not be probed
+/// through the existing API.
+fn find_single_column_index<'a>(
+    snapshot: &'a CatalogSnapshot,
+    table_entry: &TableEntry,
+    col_idx: usize,
+) -> Option<&'a IndexEntry> {
+    let attnum = u16::try_from(col_idx).ok()?;
+    let indexes = snapshot.indexes_by_table.get(&table_entry.oid)?;
+    indexes
+        .iter()
+        .find(|e| e.columns.len() == 1 && e.columns[0] == attnum)
+}
+
+/// Confirm the keyed column has a type the B-tree can store. Returns
+/// `Some(widen)` where `widen == true` for Int32 (key is sign-extended
+/// to `i64`) and `false` for Int64 (key is stored directly). Returns
+/// `None` for any other type so the caller falls back to `SeqScan`.
+///
+/// Mirrors the check in `Server::execute_create_index` — keep the two
+/// in sync, or a `CREATE INDEX` that succeeds will produce an index a
+/// `SELECT` cannot probe.
+fn key_type_for_btree(table_entry: &TableEntry, col_idx: usize) -> Option<bool> {
+    let field = table_entry.schema.field(col_idx)?;
+    match field.data_type {
+        DataType::Int32 => Some(true),
+        DataType::Int64 => Some(false),
+        _ => None,
+    }
+}
+
+/// Probe the B-tree for every tuple satisfying `range` and return the
+/// (visible) heap payloads in B-tree-order.
+///
+/// Visibility is enforced inline: a tuple whose MVCC header is not
+/// visible to `ctx.snapshot` under `ctx.oracle` is silently dropped.
+/// This means the `IndexScan` operator never sees a tuple a `SeqScan`
+/// would hide; the user observes the same row set whether or not the
+/// index is consulted.
+///
+/// # Errors
+///
+/// Returns [`ServerError::Ddl`] when the B-tree probe or heap fetch
+/// fails. The `Ddl` variant carries a dynamic message and is the
+/// appropriate channel for runtime storage faults; the simpler
+/// `Unsupported` channel is reserved for shape-level rejections that
+/// the caller can recover from by falling back to `SeqScan`.
+fn probe_index(
+    index_entry: &IndexEntry,
+    range: IndexKeyRange,
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<Vec<u8>>, ServerError> {
+    let index_rel = RelationId::new(index_entry.oid.raw());
+    let pool = ctx.heap.buffer_pool();
+    let btree: BTree<BlankPageLoader> =
+        BTree::open(Arc::clone(pool), index_rel, index_entry.root_block);
+
+    // Collect the matching TupleIds. A point lookup uses the cheap
+    // `lookup` path; everything else walks the leaf chain via
+    // `range_scan` between `[low, high+1)` (half-open). `range_scan`'s
+    // upper bound is exclusive, so we add 1 to `high` to keep the
+    // inclusive contract — overflowing to `None` (i.e., scan to the
+    // end of the leaf chain) when `high == i64::MAX`.
+    let mut tids: Vec<ultrasql_core::TupleId> = Vec::new();
+    match (range.low, range.high) {
+        (Some(lo), Some(hi)) if lo == hi => {
+            if let Some(tid) = btree
+                .lookup::<i64>(lo)
+                .map_err(|e| ServerError::ddl(format!("IndexScan btree lookup: {e}")))?
+            {
+                tids.push(tid);
+            }
+        }
+        (low, high) => {
+            // Walk the half-open `[start, end_exclusive)`. `start =
+            // low.unwrap_or(i64::MIN)` and `end_exclusive =
+            // high.map(|h| h.checked_add(1))` — when the +1 overflows we
+            // pass `None` to mean "scan to the end of the leaf chain".
+            let start = low.unwrap_or(i64::MIN);
+            // `i64::MAX + 1` overflows to `None`, which `range_scan`
+            // treats as "unbounded above" — exactly the contract we want.
+            let end_exclusive: Option<i64> = high.and_then(|h| h.checked_add(1));
+            for entry in btree.range_scan::<i64>(start, end_exclusive) {
+                let (_key, tid) =
+                    entry.map_err(|e| ServerError::ddl(format!("IndexScan btree scan: {e}")))?;
+                tids.push(tid);
+            }
+        }
+    }
+
+    // Fetch the heap tuples in B-tree order and apply MVCC visibility
+    // inline. An index entry whose heap tuple is invisible to the
+    // statement's snapshot is silently dropped — the same outcome a
+    // SeqScan would deliver. We use [`HeapAccess::fetch`] (no
+    // visibility check) plus an explicit `is_visible` call rather than
+    // chaining through `scan_visible` because the latter walks a
+    // block-by-block iterator we cannot project onto an arbitrary
+    // TupleId list.
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(tids.len());
+    for tid in tids {
+        let tuple = ctx
+            .heap
+            .fetch(tid)
+            .map_err(|e| ServerError::ddl(format!("IndexScan heap fetch: {e}")))?;
+        let visibility = is_visible(&tuple.header, &ctx.snapshot, ctx.oracle.as_ref());
+        if matches!(visibility, Visibility::Visible) {
+            payloads.push(tuple.data);
+        }
+    }
+    Ok(payloads)
 }
 
 // ---------------------------------------------------------------------------
@@ -1749,5 +2170,485 @@ mod tests {
         let mut pairs = collect_pairs(op.as_mut());
         pairs.sort_unstable();
         assert_eq!(pairs, vec![(0, 1), (0, 3), (2, 2)]);
+    }
+
+    // ----------------------------------------------------------------
+    // IndexScan dispatch (Wave A item A5)
+    // ----------------------------------------------------------------
+
+    use std::sync::Arc as StdArc;
+
+    use ultrasql_catalog::{MutableCatalog, PersistentCatalog};
+    use ultrasql_core::TupleId;
+    use ultrasql_executor::{ExecError, RowCodec};
+    use ultrasql_storage::btree::BTree;
+    use ultrasql_storage::buffer_pool::BufferPool;
+    use ultrasql_storage::heap::{HeapAccess, InsertOptions};
+    use ultrasql_txn::TransactionManager;
+
+    /// Fixture for `IndexScan` tests: a populated persistent catalog,
+    /// a heap with rows, and (optionally) a B-tree index registered
+    /// against the catalog. The catalog snapshot is rebuilt after the
+    /// index is registered so a subsequent `LowerCtx::catalog_snapshot`
+    /// observation sees it.
+    struct IndexFixture {
+        catalog: StdArc<PersistentCatalog>,
+        heap: StdArc<HeapAccess<BlankPageLoader>>,
+        txn_manager: StdArc<TransactionManager>,
+        /// XID under which the rows were inserted (committed before the
+        /// fixture is handed out).
+        loader_xid: Xid,
+        /// Snapshot captured *after* the loader transaction committed,
+        /// so `is_visible` returns `Visible` for every fixture row.
+        reader_snapshot: ultrasql_mvcc::Snapshot,
+    }
+
+    /// Construct a fresh fixture and load `rows` of
+    /// `(id INT NOT NULL, val INT NOT NULL)` data, registering an
+    /// (optionally-present) B-tree index over `id`.
+    fn build_index_fixture(
+        table_name: &str,
+        rows: &[(i32, i32)],
+        with_index: bool,
+    ) -> (IndexFixture, ultrasql_catalog::TableEntry, Vec<TupleId>) {
+        let catalog = StdArc::new(PersistentCatalog::new());
+        let pool = StdArc::new(BufferPool::new(64, BlankPageLoader));
+        let heap = StdArc::new(HeapAccess::new(StdArc::clone(&pool)));
+        let txn_manager = StdArc::new(TransactionManager::new());
+
+        // Create the table in the catalog under a fresh OID.
+        let schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("val", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let oid = catalog.next_oid();
+        let entry = ultrasql_catalog::TableEntry::new(oid, table_name, "public", schema.clone());
+        catalog.create_table(entry.clone()).expect("create table");
+
+        // Load rows under a single autocommit-style transaction. The
+        // schema is moved into the codec here — no later use.
+        let txn = txn_manager.begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let codec = RowCodec::new(schema);
+        let rel = RelationId(oid);
+        let mut tids: Vec<TupleId> = Vec::with_capacity(rows.len());
+        for (id, val) in rows {
+            let payload = codec
+                .encode(&[Value::Int32(*id), Value::Int32(*val)])
+                .expect("encode row");
+            let opts = InsertOptions {
+                xmin: txn.xid,
+                command_id: CommandId::FIRST,
+                wal: None,
+                fsm: None,
+                vm: None,
+            };
+            let tid = heap.insert(rel, &payload, opts).expect("heap insert");
+            tids.push(tid);
+        }
+        let loader_xid = txn.xid;
+        txn_manager.commit(txn).expect("commit loader");
+
+        // Build the B-tree index (if requested) using the same shape
+        // `Server::execute_create_index` uses.
+        if with_index {
+            let index_oid = catalog.next_oid();
+            let index_rel = RelationId::new(index_oid.raw());
+            let mut btree = BTree::create(StdArc::clone(&pool), index_rel).expect("btree create");
+            let root_block = btree.root_block();
+            for (i, (id, _val)) in rows.iter().enumerate() {
+                let key: i64 = i64::from(*id);
+                btree
+                    .insert::<i64>(key, tids[i], loader_xid, None)
+                    .expect("btree insert");
+            }
+            let mut idx_entry =
+                ultrasql_catalog::IndexEntry::new(index_oid, "ix_id", oid, vec![0_u16], false);
+            idx_entry.root_block = root_block;
+            catalog.create_index(idx_entry).expect("index register");
+        }
+
+        // Snapshot *after* the loader commits so visibility sees the rows.
+        let reader_txn = txn_manager.begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let reader_snapshot = reader_txn.snapshot.clone();
+        txn_manager.commit(reader_txn).expect("commit reader-stub");
+
+        (
+            IndexFixture {
+                catalog,
+                heap,
+                txn_manager,
+                loader_xid,
+                reader_snapshot,
+            },
+            entry,
+            tids,
+        )
+    }
+
+    impl IndexFixture {
+        fn ctx<'a>(&'a self, tables: &'a SampleTables) -> LowerCtx<'a> {
+            LowerCtx {
+                tables,
+                catalog_snapshot: self.catalog.snapshot(),
+                heap: StdArc::clone(&self.heap),
+                snapshot: self.reader_snapshot.clone(),
+                oracle: StdArc::clone(&self.txn_manager),
+                xid: self.loader_xid,
+                command_id: CommandId::FIRST,
+            }
+        }
+    }
+
+    /// Build a `Filter { Scan(table), predicate }` plan over `table_name`
+    /// with the canonical `(id INT, val INT)` schema.
+    fn build_filter_scan_plan(table_name: &str, predicate: ScalarExpr) -> LogicalPlan {
+        let schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("val", DataType::Int32),
+        ])
+        .expect("schema ok");
+        LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Scan {
+                table: table_name.into(),
+                schema,
+                projection: None,
+            }),
+            predicate,
+        }
+    }
+
+    /// Build `id = lit` over the canonical fixture schema. `id` is
+    /// column index 0 with `Int32` type.
+    fn eq_id_literal(v: i32) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(ScalarExpr::Column {
+                name: "id".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Int32(v),
+                data_type: DataType::Int32,
+            }),
+            data_type: DataType::Bool,
+        }
+    }
+
+    /// Build `id BETWEEN lo AND hi` as the binder would: rewrites into
+    /// `id >= lo AND id <= hi`.
+    fn between_id_literal(lo: i32, hi: i32) -> ScalarExpr {
+        let id_col = || ScalarExpr::Column {
+            name: "id".into(),
+            index: 0,
+            data_type: DataType::Int32,
+        };
+        let lit = |v: i32| ScalarExpr::Literal {
+            value: Value::Int32(v),
+            data_type: DataType::Int32,
+        };
+        ScalarExpr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(ScalarExpr::Binary {
+                op: BinaryOp::GtEq,
+                left: Box::new(id_col()),
+                right: Box::new(lit(lo)),
+                data_type: DataType::Bool,
+            }),
+            right: Box::new(ScalarExpr::Binary {
+                op: BinaryOp::LtEq,
+                left: Box::new(id_col()),
+                right: Box::new(lit(hi)),
+                data_type: DataType::Bool,
+            }),
+            data_type: DataType::Bool,
+        }
+    }
+
+    /// Drain a (id INT, val INT) operator and return the row pairs.
+    fn drain_id_val(op: &mut dyn Operator) -> Result<Vec<(i32, i32)>, ExecError> {
+        let mut out = Vec::new();
+        while let Some(b) = op.next_batch()? {
+            match (&b.columns()[0], &b.columns()[1]) {
+                (
+                    ultrasql_vec::column::Column::Int32(ids),
+                    ultrasql_vec::column::Column::Int32(vals),
+                ) => {
+                    for (i, v) in ids.data().iter().zip(vals.data().iter()) {
+                        out.push((*i, *v));
+                    }
+                }
+                _ => panic!("unexpected column layout"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// `WHERE id = 42` against an indexed table picks `IndexScan` and
+    /// returns the one matching row.
+    #[test]
+    fn lower_query_eq_indexed_column_picks_index_scan() {
+        let rows: Vec<(i32, i32)> = (1..=100).map(|i| (i, i * 10)).collect();
+        let (fix, _entry, _) = build_index_fixture("t_eq_indexed", &rows, true);
+        let tables = SampleTables::new();
+        let ctx = fix.ctx(&tables);
+        let plan = build_filter_scan_plan("t_eq_indexed", eq_id_literal(42));
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        let debug = format!("{op:?}");
+        assert!(
+            debug.starts_with("IndexScan"),
+            "expected IndexScan, got: {debug}"
+        );
+        let pairs = drain_id_val(op.as_mut()).expect("drain");
+        assert_eq!(pairs, vec![(42, 420)]);
+    }
+
+    /// `WHERE id = 42` against an *unindexed* table falls back to
+    /// `Filter(SeqScan)`. The `Debug` starts with `Filter` (the outer
+    /// operator); `SeqScan` is the inner child.
+    #[test]
+    fn lower_query_eq_unindexed_column_falls_back_to_filter_seq_scan() {
+        let rows: Vec<(i32, i32)> = (1..=100).map(|i| (i, i * 10)).collect();
+        let (fix, _entry, _) = build_index_fixture("t_eq_unindexed", &rows, false);
+        let tables = SampleTables::new();
+        let ctx = fix.ctx(&tables);
+        let plan = build_filter_scan_plan("t_eq_unindexed", eq_id_literal(42));
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        let debug = format!("{op:?}");
+        assert!(
+            !debug.starts_with("IndexScan"),
+            "must not pick IndexScan over an unindexed column; got: {debug}"
+        );
+        let pairs = drain_id_val(op.as_mut()).expect("drain");
+        assert_eq!(pairs, vec![(42, 420)]);
+    }
+
+    /// `WHERE id BETWEEN 10 AND 20` against an indexed table picks
+    /// `IndexScan` and returns rows 10..=20 in ascending order.
+    #[test]
+    fn lower_query_between_indexed_column_picks_index_scan() {
+        let rows: Vec<(i32, i32)> = (1..=100).map(|i| (i, i * 10)).collect();
+        let (fix, _entry, _) = build_index_fixture("t_between_indexed", &rows, true);
+        let tables = SampleTables::new();
+        let ctx = fix.ctx(&tables);
+        let plan = build_filter_scan_plan("t_between_indexed", between_id_literal(10, 20));
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        let debug = format!("{op:?}");
+        assert!(
+            debug.starts_with("IndexScan"),
+            "expected IndexScan for BETWEEN, got: {debug}"
+        );
+        let pairs = drain_id_val(op.as_mut()).expect("drain");
+        let expected: Vec<(i32, i32)> = (10..=20).map(|i| (i, i * 10)).collect();
+        assert_eq!(pairs, expected);
+    }
+
+    /// `WHERE val = 100` against a table whose index is on `id` (not
+    /// `val`) falls back to SeqScan+Filter — confirms the catalog-look-up
+    /// honours the column attnum.
+    #[test]
+    fn lower_query_eq_unindexed_when_index_on_other_column() {
+        let rows: Vec<(i32, i32)> = (1..=10).map(|i| (i, i * 10)).collect();
+        let (fix, _entry, _) = build_index_fixture("t_other_col_index", &rows, true);
+        let tables = SampleTables::new();
+        let ctx = fix.ctx(&tables);
+        let predicate = ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(ScalarExpr::Column {
+                name: "val".into(),
+                index: 1,
+                data_type: DataType::Int32,
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Int32(50),
+                data_type: DataType::Int32,
+            }),
+            data_type: DataType::Bool,
+        };
+        let plan = build_filter_scan_plan("t_other_col_index", predicate);
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        let debug = format!("{op:?}");
+        assert!(
+            !debug.starts_with("IndexScan"),
+            "must not pick IndexScan when the index does not cover the predicate's column; got: {debug}"
+        );
+        let pairs = drain_id_val(op.as_mut()).expect("drain");
+        assert_eq!(pairs, vec![(5, 50)]);
+    }
+
+    /// `WHERE id > 95` picks `IndexScan` with an open upper bound and
+    /// returns rows 96..=100.
+    #[test]
+    fn lower_query_gt_indexed_column_picks_index_scan() {
+        let rows: Vec<(i32, i32)> = (1..=100).map(|i| (i, i * 10)).collect();
+        let (fix, _entry, _) = build_index_fixture("t_gt_indexed", &rows, true);
+        let tables = SampleTables::new();
+        let ctx = fix.ctx(&tables);
+        let predicate = ScalarExpr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(ScalarExpr::Column {
+                name: "id".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Int32(95),
+                data_type: DataType::Int32,
+            }),
+            data_type: DataType::Bool,
+        };
+        let plan = build_filter_scan_plan("t_gt_indexed", predicate);
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        let debug = format!("{op:?}");
+        assert!(
+            debug.starts_with("IndexScan"),
+            "expected IndexScan for `>`, got: {debug}"
+        );
+        let pairs = drain_id_val(op.as_mut()).expect("drain");
+        let expected: Vec<(i32, i32)> = (96..=100).map(|i| (i, i * 10)).collect();
+        assert_eq!(pairs, expected);
+    }
+
+    /// MVCC visibility: a row inserted after the reader's snapshot must
+    /// NOT appear in the `IndexScan` output, just as it would not appear
+    /// in a `SeqScan`.
+    #[test]
+    fn lower_query_index_scan_honours_mvcc_visibility() {
+        let rows: Vec<(i32, i32)> = (1..=5).map(|i| (i, i * 10)).collect();
+        let (fix, _entry, _tids) = build_index_fixture("t_mvcc", &rows, true);
+        let tables = SampleTables::new();
+        let ctx = fix.ctx(&tables);
+
+        // Insert a row under a *new* (uncommitted) transaction; its
+        // xmin is > reader_snapshot.xmax, so the reader must not see it.
+        // We don't even need to register it in the index — IndexScan
+        // would only see it if the heap fetch returned it as visible.
+        let schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("val", DataType::Int32),
+        ])
+        .expect("schema");
+        let codec = RowCodec::new(schema);
+        let entry = fix
+            .catalog
+            .snapshot()
+            .tables
+            .get("t_mvcc")
+            .expect("entry")
+            .clone();
+        let invisible_txn = fix
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let payload = codec
+            .encode(&[Value::Int32(99), Value::Int32(990)])
+            .expect("encode");
+        let opts = InsertOptions {
+            xmin: invisible_txn.xid,
+            command_id: CommandId::FIRST,
+            wal: None,
+            fsm: None,
+            vm: None,
+        };
+        let _ = fix
+            .heap
+            .insert(RelationId(entry.oid), &payload, opts)
+            .expect("insert");
+        // Deliberately do NOT commit `invisible_txn`. The reader's
+        // snapshot was taken before this transaction began, so even
+        // after the row lands in the heap the reader sees `Visibility !=
+        // Visible`.
+
+        // Point lookup on a key we know was loaded before the snapshot.
+        let plan = build_filter_scan_plan("t_mvcc", eq_id_literal(3));
+        let mut op = lower_query(&plan, &ctx).expect("lowers");
+        let pairs = drain_id_val(op.as_mut()).expect("drain");
+        assert_eq!(pairs, vec![(3, 30)]);
+    }
+
+    /// A predicate not in the indexable shape set (`id + 1 = 42`) falls
+    /// back to `SeqScan` + `Filter` even when the column is indexed.
+    #[test]
+    fn lower_query_arithmetic_predicate_falls_back_to_filter() {
+        let rows: Vec<(i32, i32)> = (1..=10).map(|i| (i, i * 10)).collect();
+        let (fix, _entry, _) = build_index_fixture("t_arith_fallback", &rows, true);
+        let tables = SampleTables::new();
+        let ctx = fix.ctx(&tables);
+        // `id + 1 = 42` — left side is not a bare column reference.
+        let predicate = ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(ScalarExpr::Binary {
+                op: BinaryOp::Add,
+                left: Box::new(ScalarExpr::Column {
+                    name: "id".into(),
+                    index: 0,
+                    data_type: DataType::Int32,
+                }),
+                right: Box::new(ScalarExpr::Literal {
+                    value: Value::Int32(1),
+                    data_type: DataType::Int32,
+                }),
+                data_type: DataType::Int32,
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Int32(42),
+                data_type: DataType::Int32,
+            }),
+            data_type: DataType::Bool,
+        };
+        let plan = build_filter_scan_plan("t_arith_fallback", predicate);
+        let op = lower_query(&plan, &ctx).expect("lowers");
+        let debug = format!("{op:?}");
+        assert!(
+            !debug.starts_with("IndexScan"),
+            "must not pick IndexScan when the predicate's column is wrapped in an expression; got: {debug}"
+        );
+    }
+
+    /// `match_indexable_predicate` returns `None` for a literal-only
+    /// predicate (`TRUE`).
+    #[test]
+    fn match_indexable_predicate_rejects_constant_predicate() {
+        let pred = ScalarExpr::Literal {
+            value: Value::Bool(true),
+            data_type: DataType::Bool,
+        };
+        assert!(match_indexable_predicate(&pred).is_none());
+    }
+
+    /// Helper smoke test: bound normalisation is correct for strict
+    /// operators. `id > 5` should normalise to `low = Some(6)`, no
+    /// upper bound; `id < 5` to `high = Some(4)`, no lower bound.
+    #[test]
+    fn match_simple_comparison_normalises_strict_bounds() {
+        let id_col = ScalarExpr::Column {
+            name: "id".into(),
+            index: 0,
+            data_type: DataType::Int32,
+        };
+        let lit5 = ScalarExpr::Literal {
+            value: Value::Int32(5),
+            data_type: DataType::Int32,
+        };
+        let gt = ScalarExpr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(id_col.clone()),
+            right: Box::new(lit5.clone()),
+            data_type: DataType::Bool,
+        };
+        let (idx, range) = match_simple_comparison(&gt).expect("gt matches");
+        assert_eq!(idx, 0);
+        assert_eq!(range.low, Some(6));
+        assert_eq!(range.high, None);
+
+        let lt = ScalarExpr::Binary {
+            op: BinaryOp::Lt,
+            left: Box::new(id_col),
+            right: Box::new(lit5),
+            data_type: DataType::Bool,
+        };
+        let (_, range) = match_simple_comparison(&lt).expect("lt matches");
+        assert_eq!(range.low, None);
+        assert_eq!(range.high, Some(4));
     }
 }
