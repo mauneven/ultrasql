@@ -59,6 +59,7 @@ pub mod eval;
 mod filter;
 pub(crate) mod filter_op;
 pub mod filter_sum_op;
+pub mod fused_update;
 pub mod function_scan;
 mod hash_aggregate;
 mod hash_join;

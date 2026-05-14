@@ -57,6 +57,7 @@ use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
 use ultrasql_executor::filter_sum_op::{
     CachedAvgI32Scan, CachedFilterSumI32Scan, CachedSumI32Scan, FilterSumI32Scan,
 };
+use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
     CteScan, Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan,
@@ -1356,6 +1357,172 @@ fn extract_int32_col_op_lit(
     }
 }
 
+/// Detect the `(Int32, Int32)` UPDATE shape and lower it to the
+/// single-operator [`FusedUpdateInt32Add`] when every precondition
+/// holds. Returns `Ok(None)` for any non-matching shape so the
+/// caller falls back to the default `ModifyTable(Filter(SeqScan))`
+/// plan.
+///
+/// Preconditions:
+///
+/// 1. Relation schema is exactly `[Int32, Int32]`.
+/// 2. Exactly one assignment, with target column 0 or 1, body
+///    `Column { Int32 } ± Int32 literal` (or the mirror
+///    `Int32 literal + Column { Int32 }` for `+`).
+/// 3. `input` is either a bare `Scan { table }` or
+///    `Filter { Scan { table }, predicate }` where `predicate` is
+///    one of the Int32-typed shapes [`extract_int32_col_op_lit`]
+///    accepts.
+fn try_build_fused_update(
+    target_table: &str,
+    entry: &TableEntry,
+    assignments: &[(usize, ScalarExpr)],
+    input: &LogicalPlan,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    // Schema must be exactly (Int32, Int32). No extra columns, no
+    // NULLability change — `FusedUpdateInt32Add` reads a fixed
+    // 9-byte payload layout.
+    let fields = entry.schema.fields();
+    if fields.len() != 2
+        || fields[0].data_type != DataType::Int32
+        || fields[1].data_type != DataType::Int32
+    {
+        return Ok(None);
+    }
+
+    if assignments.len() != 1 {
+        return Ok(None);
+    }
+    let (target_col_usize, assign_expr) = &assignments[0];
+    if *target_col_usize > 1 {
+        return Ok(None);
+    }
+    let target_col = u8::try_from(*target_col_usize).expect("target_col fits in u8");
+
+    // The assignment body must read the target column and add (or
+    // subtract) an Int32 literal. Subtraction is normalised to
+    // `delta = -literal`.
+    let (op, left, right) = match assign_expr {
+        ScalarExpr::Binary {
+            op, left, right, ..
+        } => (*op, left.as_ref(), right.as_ref()),
+        _ => return Ok(None),
+    };
+    let read_col_idx = |e: &ScalarExpr| -> Option<usize> {
+        match e {
+            ScalarExpr::Column {
+                index,
+                data_type: DataType::Int32,
+                ..
+            } => Some(*index),
+            _ => None,
+        }
+    };
+    let read_lit_i32 = |e: &ScalarExpr| -> Option<i32> {
+        match e {
+            ScalarExpr::Literal {
+                value: Value::Int32(v),
+                ..
+            } => Some(*v),
+            _ => None,
+        }
+    };
+    let delta: i32 = match op {
+        BinaryOp::Add => {
+            if let (Some(c), Some(l)) = (read_col_idx(left), read_lit_i32(right)) {
+                if c != *target_col_usize {
+                    return Ok(None);
+                }
+                l
+            } else if let (Some(l), Some(c)) = (read_lit_i32(left), read_col_idx(right)) {
+                if c != *target_col_usize {
+                    return Ok(None);
+                }
+                l
+            } else {
+                return Ok(None);
+            }
+        }
+        BinaryOp::Sub => {
+            // Only `col - lit` is well-defined as `+ (-lit)` —
+            // `lit - col` does not decompose to a single add.
+            if let (Some(c), Some(l)) = (read_col_idx(left), read_lit_i32(right)) {
+                if c != *target_col_usize {
+                    return Ok(None);
+                }
+                l.checked_neg().ok_or(ServerError::Plan(
+                    ultrasql_planner::PlanError::TypeMismatch(
+                        "UPDATE delta overflows i32 negation".to_owned(),
+                    ),
+                ))?
+            } else {
+                return Ok(None);
+            }
+        }
+        _ => return Ok(None),
+    };
+
+    // Validate input shape and extract the optional predicate. The
+    // shape contract mirrors `build_filtered_tid_scan`'s contract
+    // (Scan or Filter(Scan) over the same target table).
+    let predicate: Option<FusedPredicate> = match input {
+        LogicalPlan::Scan { table, .. } => {
+            if !table.eq_ignore_ascii_case(target_table) {
+                return Ok(None);
+            }
+            None
+        }
+        LogicalPlan::Filter {
+            input: filter_input,
+            predicate,
+        } => {
+            let LogicalPlan::Scan { table, .. } = filter_input.as_ref() else {
+                return Ok(None);
+            };
+            if !table.eq_ignore_ascii_case(target_table) {
+                return Ok(None);
+            }
+            let Some((pred_col_idx, cmp, lit)) = extract_int32_col_op_lit(predicate) else {
+                return Ok(None);
+            };
+            if pred_col_idx > 1 {
+                return Ok(None);
+            }
+            let fused_cmp = match cmp {
+                ultrasql_vec::kernels::CmpOp::Eq => FusedCmp::Eq,
+                ultrasql_vec::kernels::CmpOp::Ne => FusedCmp::Ne,
+                ultrasql_vec::kernels::CmpOp::Lt => FusedCmp::Lt,
+                ultrasql_vec::kernels::CmpOp::Le => FusedCmp::Le,
+                ultrasql_vec::kernels::CmpOp::Gt => FusedCmp::Gt,
+                ultrasql_vec::kernels::CmpOp::Ge => FusedCmp::Ge,
+            };
+            Some(FusedPredicate {
+                col_index: u8::try_from(pred_col_idx).expect("col idx fits in u8"),
+                op: fused_cmp,
+                literal: lit,
+            })
+        }
+        _ => return Ok(None),
+    };
+
+    let rel = RelationId(entry.oid);
+    let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
+    let op = FusedUpdateInt32Add::new(
+        Arc::clone(&ctx.heap),
+        rel,
+        ctx.snapshot.clone(),
+        Arc::clone(&ctx.oracle),
+        block_count,
+        predicate,
+        target_col,
+        delta,
+        ctx.xid,
+        ctx.command_id,
+    );
+    Ok(Some(Box::new(op)))
+}
+
 fn lower_real_update(
     table: &str,
     assignments: &[(usize, ScalarExpr)],
@@ -1375,6 +1542,16 @@ fn lower_real_update(
                 table.to_string(),
             ))
         })?;
+
+    // Fast-path: when the relation, assignment, and optional filter
+    // all match the `(Int32, Int32) WHERE col cmp lit SET col_i =
+    // col_i ± lit` shape, bypass the SeqScan + Filter + ModifyTable
+    // chain entirely and lower to the single `FusedUpdateInt32Add`
+    // operator. Saves ~150 µs / 10 000-row UPDATE on the bench shape
+    // — see the operator's module header for the full motivation.
+    if let Some(fused) = try_build_fused_update(table, entry, assignments, input, ctx)? {
+        return Ok(fused);
+    }
 
     let child = build_filtered_tid_scan(table, entry, input, ctx)?;
 

@@ -1493,6 +1493,111 @@ impl<L: PageLoader> HeapAccess<L> {
     /// buffer (preallocated to one tuple's worth) and hands the
     /// caller a `&[u8]` view into that buffer. The borrow is valid
     /// until the next `try_next` call.
+    /// Callback-style visitor over every MVCC-visible tuple in `rel`.
+    ///
+    /// Faster than [`Self::scan_visible_walker`] when the caller does
+    /// not need to escape with a `&[u8]` reference between yields. The
+    /// walker variant memcpys each 8 KiB page into a scratch buffer so
+    /// the page lock is released between slot reads; for relations
+    /// scanned end-to-end inside one operator there is no other lock
+    /// contender, and the memcpy is pure overhead. `for_each_visible`
+    /// holds the page-read guard for the whole slot loop on one page
+    /// and invokes `f(tid, payload)` per visible slot directly off the
+    /// page bytes — no per-page memcpy, no per-slot tuple-copy.
+    ///
+    /// Visibility uses the same path as `scan_visible_walker`
+    /// (`is_visible` against `snapshot` / `oracle`, with the
+    /// per-`xmin` cache).
+    ///
+    /// # Errors
+    ///
+    /// Buffer-pool pin failures or malformed page metadata return
+    /// [`HeapError`]; the visitor stops on the first error.
+    pub fn for_each_visible<O, F>(
+        &self,
+        rel: RelationId,
+        block_count: u32,
+        snapshot: &Snapshot,
+        oracle: &O,
+        mut f: F,
+    ) -> Result<(), HeapError>
+    where
+        O: XidStatusOracle + ?Sized,
+        F: FnMut(TupleId, &TupleHeader, &[u8]) -> Result<(), HeapError>,
+    {
+        let mut xmin_cache: Option<(Xid, u16, bool)> = None;
+        for block in 0..block_count {
+            let page_id = PageId::new(rel, BlockNumber::new(block));
+            let guard = self.pool.get_page(page_id)?;
+            let page = guard.read();
+            let page_bytes = page.as_bytes();
+            let slot_count = page.header().slot_count();
+            for slot in 0..slot_count {
+                let item_id_off = crate::page::PAGE_HEADER_SIZE
+                    + usize::from(slot) * crate::page::ITEMID_SIZE;
+                let raw = u32::from_le_bytes([
+                    page_bytes[item_id_off],
+                    page_bytes[item_id_off + 1],
+                    page_bytes[item_id_off + 2],
+                    page_bytes[item_id_off + 3],
+                ]);
+                let flags = raw & 0b11;
+                if flags != 1 {
+                    // ItemIdFlags::Normal == 1; skip Unused / Dead / Redirect.
+                    continue;
+                }
+                let length = ((raw >> 2) & 0x7FFF) as usize;
+                let offset = ((raw >> 17) & 0x7FFF) as usize;
+                if length < TUPLE_HEADER_SIZE
+                    || offset
+                        .checked_add(length)
+                        .is_none_or(|end| end > page_bytes.len())
+                {
+                    return Err(HeapError::MalformedHeader("slot shorter than header"));
+                }
+                let slot_bytes = &page_bytes[offset..offset + length];
+                let (header, _) = TupleHeader::decode(&slot_bytes[..TUPLE_HEADER_SIZE])
+                    .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+
+                let visible = if header.xmax.is_invalid() {
+                    let infomask_bits = header.infomask.bits();
+                    if let Some((cxmin, cinfo, cv)) = xmin_cache {
+                        if cxmin == header.xmin && cinfo == infomask_bits {
+                            cv
+                        } else {
+                            let v = matches!(
+                                is_visible(&header, snapshot, oracle),
+                                Visibility::Visible,
+                            );
+                            xmin_cache = Some((header.xmin, infomask_bits, v));
+                            v
+                        }
+                    } else {
+                        let v = matches!(
+                            is_visible(&header, snapshot, oracle),
+                            Visibility::Visible,
+                        );
+                        xmin_cache = Some((header.xmin, infomask_bits, v));
+                        v
+                    }
+                } else {
+                    matches!(
+                        is_visible(&header, snapshot, oracle),
+                        Visibility::Visible,
+                    )
+                };
+                if !visible {
+                    continue;
+                }
+                let tid = TupleId::new(page_id, slot);
+                f(tid, &header, &slot_bytes[TUPLE_HEADER_SIZE..])?;
+            }
+            drop(page);
+            drop(guard);
+        }
+        Ok(())
+    }
+
     pub fn scan_visible_walker<'a, O: XidStatusOracle + ?Sized>(
         &'a self,
         rel: RelationId,
