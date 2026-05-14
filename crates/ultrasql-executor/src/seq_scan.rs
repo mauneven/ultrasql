@@ -84,13 +84,33 @@ pub struct SeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'stati
     /// caller a borrowed slice — no per-tuple `Vec<u8>` allocations
     /// in the streaming path.
     ///
-    /// `None` only after the scan has reached end-of-stream.
+    /// `None` once the scan has reached end-of-stream **or** the
+    /// scan is reading from a cached columnar projection
+    /// ([`Self::cache_read`]) — the column cache fully replaces the
+    /// heap walker for repeat scans over an unchanged relation.
     /// Declared first so it drops before the data it references.
     iter: Option<VisibleHeapWalker<'static, L, O>>,
     /// Reusable typed column builders. Sized to
     /// [`BATCH_TARGET_ROWS`] capacity on every fresh allocation and
     /// swapped out wholesale when a batch is emitted.
     builders: Vec<ColumnBuilder>,
+    /// When `Some`, the scan is replaying a cached columnar
+    /// projection of the relation; `next_batch` slices the columns
+    /// into BATCH_TARGET_ROWS-sized output batches and never
+    /// touches the heap. Set by [`Self::build`] when
+    /// `HeapAccess::column_cache` already holds a live entry for
+    /// this relation; left `None` when the scan is responsible for
+    /// either populating the cache or operating outside the cache
+    /// (e.g. TID-prefixed scans).
+    cache_read: Option<CacheReadState>,
+    /// When `Some`, the scan is **populating** the column cache as
+    /// it walks the heap: every decoded row is appended to these
+    /// per-column accumulators **in addition** to the per-batch
+    /// `builders`. On EOF the accumulators are finalised into a
+    /// [`CachedColumns`] entry and stored in
+    /// `HeapAccess::column_cache` so the next scan over the same
+    /// relation can short-circuit via `cache_read`.
+    cache_build: Option<CacheBuildState>,
     /// Shared heap access. The iterator borrows the inner
     /// `HeapAccess<L>` via this Arc.
     #[allow(dead_code)]
@@ -121,6 +141,43 @@ pub struct SeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'stati
     /// `true` after the iterator has been exhausted and the final
     /// (possibly partial) batch has been emitted.
     eof: bool,
+}
+
+/// Cache-read state: a snapshot of cached columns for a relation,
+/// plus the row cursor we are streaming from.
+struct CacheReadState {
+    columns: std::sync::Arc<ultrasql_storage::column_cache::CachedColumns>,
+    cursor: usize,
+}
+
+impl std::fmt::Debug for CacheReadState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheReadState")
+            .field("cursor", &self.cursor)
+            .field("rows", &self.columns.columns.first().map(Column::len))
+            .finish()
+    }
+}
+
+/// Cache-build state: parallel column builders that accumulate
+/// **every** decoded row across the whole scan (in contrast to the
+/// per-batch `builders` field which is swapped out on every batch
+/// emit). Finalised and stored in the column cache on EOF.
+struct CacheBuildState {
+    builders: Vec<ColumnBuilder>,
+    /// Version of the relation when the build started, captured
+    /// from `HeapAccess::column_cache.relation_version`. Re-checked
+    /// at `put` time so a writer-during-build race drops the entry
+    /// on the floor instead of resurrecting stale columns.
+    target_version: u64,
+}
+
+impl std::fmt::Debug for CacheBuildState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheBuildState")
+            .field("target_version", &self.target_version)
+            .finish()
+    }
 }
 
 impl<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'static> std::fmt::Debug
@@ -231,11 +288,34 @@ where
         // moves of `Self`.
         let snapshot_box: Box<Snapshot> = Box::new(snapshot);
 
+        // Column-cache eligibility:
+        // - Non-TID-prefixed scan only (UPDATE / DELETE always
+        //   reruns fresh state; caching its TID-augmented output
+        //   never pays off).
+        // - Only relations whose schema is exclusively numeric
+        //   fixed-width types (Int16/32/64, Float32/64). Bool and
+        //   Utf8 columns lack the `with_nulls` / `from_parts`
+        //   constructors `slice_column` would need, and the bench
+        //   workloads never hit them on a cached path anyway.
+        let cache_eligible = !with_tids && schema_all_fixed_numeric(codec.schema());
+        let cache_read = if cache_eligible {
+            heap.column_cache
+                .get(relation)
+                .map(|columns| CacheReadState { columns, cursor: 0 })
+        } else {
+            None
+        };
+
         // SAFETY: `heap`, `snapshot_box`, and `oracle` keep their
         // referents at stable heap addresses for the lifetime of the
         // `SeqScan`. The iterator is declared as the first field and
         // therefore dropped first, before the borrows go away. See
         // the type-level `# Safety` doc for the full argument.
+        //
+        // We construct the walker even when reading from the cache
+        // because `Operator::next_batch` does not currently know
+        // about `cache_read` at this layer — we drop the walker
+        // unused below when `cache_read.is_some()`.
         let iter: VisibleHeapWalker<'static, L, O> = unsafe {
             let heap_ref: &'static HeapAccess<L> =
                 std::mem::transmute::<&HeapAccess<L>, &'static HeapAccess<L>>(&*heap);
@@ -245,9 +325,34 @@ where
             heap_ref.scan_visible_walker(relation, block_count, snap_ref, oracle_ref)
         };
 
+        // Decide whether this scan should populate the cache as a
+        // side effect. Skip the build when (a) the scan is reading
+        // from the cache already, (b) the scan is TID-augmented, or
+        // (c) the relation is empty (no point caching nothing).
+        let cache_build = if cache_eligible && cache_read.is_none() && block_count > 0 {
+            let target_version = heap.column_cache.relation_version(relation);
+            Some(CacheBuildState {
+                builders: build_initial_builders(&codec, false),
+                target_version,
+            })
+        } else {
+            None
+        };
+
+        let (iter, cache_read_final) = if cache_read.is_some() {
+            // Reading from cache: drop the walker so its
+            // buffer-pool pin is released immediately.
+            drop(iter);
+            (None, cache_read)
+        } else {
+            (Some(iter), None)
+        };
+
         Self {
-            iter: Some(iter),
+            iter,
             builders,
+            cache_read: cache_read_final,
+            cache_build,
             heap,
             snapshot: snapshot_box,
             oracle,
@@ -297,6 +402,13 @@ where
             return Ok(None);
         }
 
+        // Fast path: replay from cached columnar projection. Skips
+        // the heap walk + per-tuple decode entirely. See
+        // `CacheReadState`.
+        if self.cache_read.is_some() {
+            return self.next_batch_from_cache();
+        }
+
         let tid_offset = usize::from(self.with_tids) * 2;
         let mut rows_buffered: usize = 0;
         let mut iter_exhausted = true;
@@ -324,6 +436,15 @@ where
                 self.codec
                     .decode_into_builders(payload, &mut self.builders[tid_offset..])
                     .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                // Mirror the decoded row into the cache-build
+                // accumulator when populating the column cache.
+                // Skipped on the TID-prefixed scan (cache_build is
+                // `None` there).
+                if let Some(build) = self.cache_build.as_mut() {
+                    self.codec
+                        .decode_into_builders(payload, &mut build.builders)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                }
                 rows_buffered += 1;
             }
             // Mark "not exhausted" only when we hit the row cap (the
@@ -336,6 +457,11 @@ where
         if rows_buffered == 0 {
             self.eof = true;
             self.iter = None;
+            // Finalise the cache build, if any. The walker is
+            // exhausted: we have every visible row in
+            // `cache_build.builders`. Store the result and let the
+            // next scan over this relation reach `cache_read`.
+            self.finalise_cache_build();
             return Ok(None);
         }
 
@@ -351,6 +477,9 @@ where
         if iter_exhausted {
             self.eof = true;
             self.iter = None;
+            // Walker is done — finalise the cache build before the
+            // operator emits its EOF marker on the next call.
+            self.finalise_cache_build();
         }
         Ok(Some(batch))
     }
@@ -358,6 +487,156 @@ where
     fn schema(&self) -> &Schema {
         &self.output_schema
     }
+}
+
+impl<L, O> SeqScan<L, O>
+where
+    L: PageLoader + Send + Sync + std::fmt::Debug + 'static,
+    O: XidStatusOracle + Send + Sync + std::fmt::Debug + 'static,
+{
+    /// Slice the next BATCH_TARGET_ROWS-sized batch out of the
+    /// cached columnar projection. Replaces the heap walk + decode
+    /// loop entirely when the relation's `ColumnCache` entry is
+    /// live.
+    fn next_batch_from_cache(&mut self) -> Result<Option<Batch>, ExecError> {
+        let Some(state) = self.cache_read.as_mut() else {
+            // Should not happen: caller checked `is_some` before
+            // calling, but stay defensive.
+            return Ok(None);
+        };
+        let total_rows = state.columns.columns.first().map(Column::len).unwrap_or(0);
+        if state.cursor >= total_rows {
+            self.eof = true;
+            self.cache_read = None;
+            return Ok(None);
+        }
+        let end = (state.cursor + BATCH_TARGET_ROWS).min(total_rows);
+        let mut batch_cols: Vec<Column> = Vec::with_capacity(state.columns.columns.len());
+        for col in &state.columns.columns {
+            batch_cols.push(slice_column(col, state.cursor, end));
+        }
+        state.cursor = end;
+        let batch = Batch::new(batch_cols).map_err(ExecError::from)?;
+        Ok(Some(batch))
+    }
+
+    /// Move the accumulator builders into the relation's
+    /// [`ColumnCache`] entry. No-op when `cache_build` is `None`
+    /// (TID-prefixed scan or a scan that already started from a
+    /// live cache entry).
+    fn finalise_cache_build(&mut self) {
+        let Some(build) = self.cache_build.take() else {
+            return;
+        };
+        // Build the final `Vec<Column>` from the accumulator
+        // builders. Any per-builder finish error means the cache
+        // is unbuildable for this scan — drop the build silently;
+        // the next scan over the same relation will retry.
+        let finished_batch = match RowCodec::finish_batch(build.builders) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let columns: Vec<Column> = finished_batch.columns().to_vec();
+        let entry = ultrasql_storage::column_cache::CachedColumns {
+            version: build.target_version,
+            schema: self.codec.schema().clone(),
+            columns,
+        };
+        self.heap.column_cache.put(self.relation, entry);
+    }
+}
+
+/// Slice rows `[start, end)` out of `col` into an owned [`Column`].
+///
+/// This is a zero-conditional clone of the underlying typed
+/// `Vec<T>` for fixed-width columns and an offsets+values clone
+/// for the variable-width `Utf8` arm. Used by the column-cache
+/// fast path to materialise a batch from cached data without
+/// re-decoding from heap bytes.
+fn slice_column(col: &Column, start: usize, end: usize) -> Column {
+    use ultrasql_vec::bitmap::Bitmap;
+    use ultrasql_vec::column::NumericColumn;
+
+    fn slice_nulls(nulls: Option<&Bitmap>, start: usize, end: usize) -> Option<Bitmap> {
+        nulls.map(|b| {
+            let mut out = Bitmap::new(end - start, false);
+            for (i, src) in (start..end).enumerate() {
+                out.set(i, b.get(src));
+            }
+            out
+        })
+    }
+
+    match col {
+        Column::Int32(c) => {
+            let data = c.data()[start..end].to_vec();
+            let nulls = slice_nulls(c.nulls(), start, end);
+            match nulls {
+                Some(n) => {
+                    Column::Int32(NumericColumn::with_nulls(data, n).expect("matching lengths"))
+                }
+                None => Column::Int32(NumericColumn::from_data(data)),
+            }
+        }
+        Column::Int64(c) => {
+            let data = c.data()[start..end].to_vec();
+            let nulls = slice_nulls(c.nulls(), start, end);
+            match nulls {
+                Some(n) => {
+                    Column::Int64(NumericColumn::with_nulls(data, n).expect("matching lengths"))
+                }
+                None => Column::Int64(NumericColumn::from_data(data)),
+            }
+        }
+        Column::Float32(c) => {
+            let data = c.data()[start..end].to_vec();
+            let nulls = slice_nulls(c.nulls(), start, end);
+            match nulls {
+                Some(n) => {
+                    Column::Float32(NumericColumn::with_nulls(data, n).expect("matching lengths"))
+                }
+                None => Column::Float32(NumericColumn::from_data(data)),
+            }
+        }
+        Column::Float64(c) => {
+            let data = c.data()[start..end].to_vec();
+            let nulls = slice_nulls(c.nulls(), start, end);
+            match nulls {
+                Some(n) => {
+                    Column::Float64(NumericColumn::with_nulls(data, n).expect("matching lengths"))
+                }
+                None => Column::Float64(NumericColumn::from_data(data)),
+            }
+        }
+        // Bool / Utf8 cache slicing is intentionally not
+        // implemented: `schema_all_fixed_numeric` keeps these out of
+        // the cache-eligible set, so this arm is unreachable in
+        // practice. Surfacing it as a panic catches a future
+        // regression where the eligibility check is loosened
+        // without finishing the slice paths.
+        Column::Bool(_) | Column::Utf8(_) => {
+            unreachable!(
+                "column cache does not yet support Bool / Utf8 — gated by schema_all_fixed_numeric"
+            )
+        }
+    }
+}
+
+/// `true` iff every column in `schema` is a fixed-width numeric
+/// type. Used to gate column-cache eligibility — the slice path
+/// only supports `Int16` / `Int32` / `Int64` / `Float32` / `Float64`
+/// at the moment.
+fn schema_all_fixed_numeric(schema: &Schema) -> bool {
+    schema.fields().iter().all(|f| {
+        matches!(
+            f.data_type,
+            DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::Float32
+                | DataType::Float64
+        )
+    })
 }
 
 /// Convert a slice of decoded rows into a [`Batch`] matching `schema`.

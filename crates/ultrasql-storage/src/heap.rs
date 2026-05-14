@@ -299,6 +299,12 @@ pub struct HeapAccess<L: PageLoader> {
     /// recovery after a torn partial-page write can restore the page to a
     /// consistent state.
     pub last_checkpoint_lsn: Arc<AtomicU64>,
+    /// Per-relation columnar projection cache. Populated lazily by the
+    /// first `SeqScan` (no-TID mode) over a relation; invalidated by
+    /// every `insert` / `update` / `delete` (and their bulk variants)
+    /// through the version-bump mechanism. See
+    /// [`crate::column_cache::ColumnCache`].
+    pub column_cache: Arc<crate::column_cache::ColumnCache>,
 }
 
 impl<L: PageLoader> std::fmt::Debug for HeapAccess<L> {
@@ -324,6 +330,7 @@ impl<L: PageLoader> HeapAccess<L> {
             block_counters: DashMap::new(),
             insert_cursor: DashMap::new(),
             last_checkpoint_lsn: Arc::new(AtomicU64::new(0)),
+            column_cache: Arc::new(crate::column_cache::ColumnCache::new()),
         }
     }
 
@@ -342,6 +349,7 @@ impl<L: PageLoader> HeapAccess<L> {
             block_counters: DashMap::new(),
             insert_cursor: DashMap::new(),
             last_checkpoint_lsn,
+            column_cache: Arc::new(crate::column_cache::ColumnCache::new()),
         }
     }
 
@@ -397,6 +405,20 @@ impl<L: PageLoader> HeapAccess<L> {
     /// updated with the page's new free space, and if `opts.vm` is `Some`
     /// the page's all-visible bit is cleared.
     pub fn insert(
+        &self,
+        rel: RelationId,
+        payload: &[u8],
+        opts: InsertOptions<'_>,
+    ) -> Result<TupleId, HeapError> {
+        let tid = self.insert_inner(rel, payload, opts)?;
+        // Invalidate the columnar projection cache for this
+        // relation — a new row makes any cached `Vec<Column>`
+        // stale until the next `SeqScan` re-builds it.
+        self.column_cache.bump_version(rel);
+        Ok(tid)
+    }
+
+    fn insert_inner(
         &self,
         rel: RelationId,
         payload: &[u8],
@@ -647,6 +669,8 @@ impl<L: PageLoader> HeapAccess<L> {
             }
         }
 
+        // Invalidate columnar projection cache.
+        self.column_cache.bump_version(rel);
         Ok(out)
     }
 
@@ -809,6 +833,10 @@ impl<L: PageLoader> HeapAccess<L> {
         // future inserters can find this block) and clear the VM all-visible
         // bit (the page now has a deleted tuple invisible to future snapshots).
         Self::post_delete_fsm_vm(&self.pool, tid.page, opts);
+        // Invalidate the columnar projection cache for this
+        // relation — a mutated row makes any cached `Vec<Column>`
+        // stale until the next `SeqScan` re-builds it.
+        self.column_cache.bump_version(tid.page.relation);
         Ok(())
     }
 
@@ -931,6 +959,10 @@ impl<L: PageLoader> HeapAccess<L> {
 
             // FSM/VM hooks fire once per page touched.
             Self::post_delete_fsm_vm(&self.pool, page_id, opts);
+            // Column-cache invalidation: bump the relation's version
+            // for every page we touch. The first bump invalidates the
+            // entry; subsequent bumps just move the version forward.
+            self.column_cache.bump_version(page_id.relation);
             total += slots.len();
         }
         Ok(total)
@@ -1023,6 +1055,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 if let Some(vm) = opts.vm {
                     vm.clear(new_tid.page.relation, new_tid.page.block);
                 }
+                self.column_cache.bump_version(old_tid.page.relation);
                 return Ok(outcome);
             }
             // Page had no room; fall through to non-HOT path.
@@ -1080,6 +1113,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 vm.clear(new_tid.page.relation, new_tid.page.block);
             }
         }
+        self.column_cache.bump_version(old_tid.page.relation);
         Ok(outcome)
     }
 
@@ -1191,6 +1225,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 // Per-HOT-success: emit WAL, clear VM. When
                 // `opts.wal` is `None` this is a no-op (the bulk DML
                 // path on cross_compare_sql).
+                let mut had_hot_outcome = false;
                 for (old_tid, new_tid) in hot_outcomes {
                     let outcome = UpdateOutcome {
                         old_tid,
@@ -1202,6 +1237,11 @@ impl<L: PageLoader> HeapAccess<L> {
                         vm.clear(new_tid.page.relation, new_tid.page.block);
                     }
                     total += 1;
+                    had_hot_outcome = true;
+                }
+                if had_hot_outcome {
+                    // Invalidate the column cache for this relation.
+                    self.column_cache.bump_version(page_id.relation);
                 }
             } else {
                 // Caller disabled HOT for every entry — funnel them

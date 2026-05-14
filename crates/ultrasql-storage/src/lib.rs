@@ -20,6 +20,7 @@ pub mod buffer_pool;
 pub mod checkpointer;
 pub mod checksum;
 pub mod clog;
+pub mod column_cache;
 pub mod constraints;
 pub mod fsm;
 pub mod heap;

@@ -20,6 +20,7 @@ testing = []
 [dependencies]
 ultrasql-core = { workspace = true }
 ultrasql-mvcc = { workspace = true }
+ultrasql-vec  = { workspace = true }
 ultrasql-wal  = { workspace = true }
 thiserror     = { workspace = true }
 parking_lot   = { workspace = true }
