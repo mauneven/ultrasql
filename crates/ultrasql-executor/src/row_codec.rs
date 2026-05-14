@@ -17,22 +17,59 @@ use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
 /// Binary codec bound to a fixed [`Schema`].
+///
+/// Caches a `fixed_width_lower_bound` precomputed at construction. The
+/// bound is the sum of `DataType::fixed_size()` for every fixed-width
+/// column in the schema plus the null-bitmap prologue, and is used as
+/// the initial capacity hint for [`Self::encode`]. Variable-width
+/// columns (`Text`) contribute 0 to the lower bound; the encoder still
+/// reallocates if the row exceeds it.
 #[derive(Clone, Debug)]
 pub struct RowCodec {
     schema: Schema,
+    /// Cached `Vec::with_capacity` hint for `encode`. Computed once.
+    fixed_width_lower_bound: usize,
 }
 
 impl RowCodec {
     /// Bind a codec to `schema`.
     #[must_use]
-    pub const fn new(schema: Schema) -> Self {
-        Self { schema }
+    pub fn new(schema: Schema) -> Self {
+        let bound = Self::compute_fixed_width_lower_bound(&schema);
+        Self {
+            schema,
+            fixed_width_lower_bound: bound,
+        }
     }
 
     /// The schema this codec was bound to.
     #[must_use]
     pub const fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    /// Lower bound on the encoded byte length, computed once at
+    /// construction time. Used as the initial capacity for the
+    /// `Vec<u8>` returned by [`Self::encode`] so the first push does
+    /// not reallocate for typical fixed-width payloads.
+    #[must_use]
+    pub const fn fixed_width_lower_bound(&self) -> usize {
+        self.fixed_width_lower_bound
+    }
+
+    /// Compute the encoded-payload lower bound: null-bitmap bytes
+    /// plus the sum of each column's fixed size. Variable-width columns
+    /// add zero — the encoder will grow past the lower bound for those.
+    fn compute_fixed_width_lower_bound(schema: &Schema) -> usize {
+        let n = schema.len();
+        let bitmap_bytes = n.div_ceil(8);
+        let mut acc = bitmap_bytes;
+        for field in schema.fields() {
+            if let Some(sz) = field.data_type.fixed_size() {
+                acc = acc.saturating_add(sz);
+            }
+        }
+        acc
     }
 
     /// Encode `row` into a byte payload.
@@ -52,7 +89,11 @@ impl RowCodec {
         }
         let bitmap_bytes = n.div_ceil(8);
         let mut bitmap = vec![0_u8; bitmap_bytes];
-        let mut payload: Vec<u8> = Vec::new();
+        // Pre-size to the cached fixed-width lower bound. For
+        // fixed-width schemas this is the exact final length; varlena
+        // schemas grow past it but the first push never reallocates.
+        let payload_cap = self.fixed_width_lower_bound.saturating_sub(bitmap_bytes);
+        let mut payload: Vec<u8> = Vec::with_capacity(payload_cap);
 
         for (col_idx, (value, field)) in row.iter().zip(self.schema.fields().iter()).enumerate() {
             if matches!(value, Value::Null) {
@@ -110,7 +151,8 @@ impl RowCodec {
                 }
             }
         }
-        let mut out = bitmap;
+        let mut out = Vec::with_capacity(bitmap.len() + payload.len());
+        out.extend_from_slice(&bitmap);
         out.extend_from_slice(&payload);
         Ok(out)
     }

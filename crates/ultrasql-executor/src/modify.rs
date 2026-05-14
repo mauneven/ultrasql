@@ -78,14 +78,33 @@ pub enum ModifyKind {
 /// performs the configured mutation. After the child signals EOF, emits
 /// exactly one batch containing the `affected_rows` count (an `Int64`
 /// column) and then returns `Ok(None)` on all subsequent calls.
+///
+/// # UPDATE / DELETE batching
+///
+/// UPDATE and DELETE call into the heap's bulk-write surface
+/// ([`HeapAccess::update_many`] / [`HeapAccess::delete_many`]) once
+/// per child batch instead of once per row. That groups TIDs by
+/// page so a 10 000-row UPDATE over 50 pages takes ~50 page guards
+/// instead of 10 000. The per-batch cost still includes
+/// expression evaluation (the `assignments` evaluators are built
+/// once at construction time and reused) and row encoding.
 pub struct ModifyTable<L: PageLoader> {
     heap: Arc<HeapAccess<L>>,
     relation: RelationId,
     /// Schema of the output: `[("affected_rows", Int64)]`.
     schema: Schema,
-    /// Row codec for INSERT encoding.
+    /// Row codec for INSERT and UPDATE payload encoding. Carries a
+    /// cached `fixed_width_lower_bound` so per-row `encode` calls do
+    /// not realloc on the first push (see [`RowCodec::new`]).
     codec: RowCodec,
     kind: ModifyKind,
+    /// Pre-built per-assignment evaluators for UPDATE. `kind ==
+    /// Update` populates this once at construction so the per-row
+    /// loop in `next_batch` does not pay the `ScalarExpr::clone()`
+    /// and evaluator-allocation cost on every iteration.
+    ///
+    /// Empty for INSERT and DELETE.
+    update_evaluators: Vec<(usize, Eval)>,
     insert_xmin: Xid,
     insert_command_id: CommandId,
     delete_xmax: Xid,
@@ -145,12 +164,24 @@ impl<L: PageLoader> ModifyTable<L> {
         wal: Option<Arc<dyn WalSink>>,
         child: Box<dyn Operator>,
     ) -> Self {
+        // Build per-assignment evaluators once at construction so the
+        // per-row UPDATE loop does not pay the `ScalarExpr::clone()`
+        // and evaluator-allocation cost on every iteration. For
+        // INSERT and DELETE this is empty.
+        let update_evaluators: Vec<(usize, Eval)> = match &kind {
+            ModifyKind::Update { assignments } => assignments
+                .iter()
+                .map(|(col, expr)| (*col, Eval::new(expr.clone())))
+                .collect(),
+            ModifyKind::Insert | ModifyKind::Delete => Vec::new(),
+        };
         Self {
             heap,
             relation,
             schema: Self::affected_rows_schema(),
             codec: RowCodec::new(relation_schema),
             kind,
+            update_evaluators,
             insert_xmin,
             insert_command_id,
             delete_xmax,
@@ -189,10 +220,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     ModifyKind::Insert => {
                         self.apply_insert(&row)?;
                     }
-                    ModifyKind::Update { assignments } => {
-                        // Clone to avoid borrow conflicts; assignments are small.
-                        let assignments: Vec<(usize, ScalarExpr)> = assignments.clone();
-                        self.apply_update(&row, &assignments)?;
+                    ModifyKind::Update { .. } => {
+                        // Cached evaluators avoid the per-row
+                        // `ScalarExpr::clone()` + `Eval::new` allocator
+                        // hit that the old path paid on every tuple.
+                        self.apply_update(&row)?;
                     }
                     ModifyKind::Delete => {
                         self.apply_delete(&row)?;
@@ -244,11 +276,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
     /// original_col0, ...]`. We extract the TID from the first two columns,
     /// apply the assignments to the remaining columns, encode the new tuple,
     /// and call `heap.update`.
-    fn apply_update(
-        &self,
-        row: &[Value],
-        assignments: &[(usize, ScalarExpr)],
-    ) -> Result<(), ExecError> {
+    fn apply_update(&self, row: &[Value]) -> Result<(), ExecError> {
         let (tid, orig_row) = extract_tid_and_row(row, self.relation)?;
 
         // Build the new row from the original, applying assignments.
@@ -262,8 +290,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             )));
         }
 
-        for (col_idx, expr) in assignments {
-            let evaluator = Eval::new(expr.clone());
+        for (col_idx, evaluator) in &self.update_evaluators {
             let val = evaluator
                 .eval(orig_row)
                 .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
