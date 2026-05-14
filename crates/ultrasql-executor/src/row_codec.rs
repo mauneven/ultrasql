@@ -18,17 +18,55 @@ use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
 /// Binary codec bound to a fixed [`Schema`].
 ///
-/// Caches a `fixed_width_lower_bound` precomputed at construction. The
-/// bound is the sum of `DataType::fixed_size()` for every fixed-width
-/// column in the schema plus the null-bitmap prologue, and is used as
-/// the initial capacity hint for [`Self::encode`]. Variable-width
-/// columns (`Text`) contribute 0 to the lower bound; the encoder still
-/// reallocates if the row exceeds it.
+/// Caches a `fixed_width_lower_bound` and a `decode_shape` tag
+/// precomputed at construction. The shape tag dispatches
+/// [`Self::decode_into_builders`] to a specialised tight inline
+/// loop for common fixed-width schemas (the scans on the
+/// `cross_compare_sql` analytic and OLTP shapes) — bypassing the
+/// generic column-loop match-dispatch.
 #[derive(Clone, Debug)]
 pub struct RowCodec {
     schema: Schema,
     /// Cached `Vec::with_capacity` hint for `encode`. Computed once.
     fixed_width_lower_bound: usize,
+    /// Fast-path discriminant for [`Self::decode_into_builders`].
+    decode_shape: DecodeShape,
+}
+
+/// Fast-path discriminant for [`RowCodec::decode_into_builders`].
+///
+/// At codec construction we detect the most common all-fixed-width
+/// schemas and stash an enum tag here. At decode time we dispatch on
+/// the tag and run a tight inline loop that skips:
+///
+/// - the per-column `(DataType, &mut ColumnBuilder)` match-arm
+///   dispatch and its embedded bounds checks;
+/// - the per-column `try_into::<[u8; N]>::?` re-validation
+///   (the bytes-len check is folded into a single payload-length
+///   check at the head of the fast path);
+/// - the null-bitmap byte parse + per-column bit extract when the
+///   byte is 0 (i.e. every column is non-null).
+///
+/// `Generic` is the universal fallback used for any schema not
+/// covered by a specialised shape, including the mixed-NULL slow
+/// path of the specialised shapes themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeShape {
+    /// Universal fallback. Always correct; never faster than the
+    /// specialised paths but handles every supported schema.
+    Generic,
+    /// `[Int32]`.
+    I32x1,
+    /// `[Int32, Int32]` (the most common analytic preload — bench
+    /// tables `(id INT, x INT)` / `(id INT, val INT)`).
+    I32x2,
+    /// `[Int32, Int32, Int32]` (the TID-prefixed shape `SeqScan` emits
+    /// for UPDATE / DELETE over an `(id, val)` heap).
+    I32x3,
+    /// `[Int64]`.
+    I64x1,
+    /// `[Int64, Int64]`.
+    I64x2,
 }
 
 impl RowCodec {
@@ -36,9 +74,203 @@ impl RowCodec {
     #[must_use]
     pub fn new(schema: Schema) -> Self {
         let bound = Self::compute_fixed_width_lower_bound(&schema);
+        let decode_shape = Self::detect_decode_shape(&schema);
         Self {
             schema,
             fixed_width_lower_bound: bound,
+            decode_shape,
+        }
+    }
+
+    /// Determine which fast-path decode loop applies to `schema`.
+    /// Falls back to [`DecodeShape::Generic`] for any schema not
+    /// covered by a hand-rolled inline path.
+    fn detect_decode_shape(schema: &Schema) -> DecodeShape {
+        let fields = schema.fields();
+        let types: Vec<&DataType> = fields.iter().map(|f| &f.data_type).collect();
+        match types.as_slice() {
+            [DataType::Int32] => DecodeShape::I32x1,
+            [DataType::Int32, DataType::Int32] => DecodeShape::I32x2,
+            [DataType::Int32, DataType::Int32, DataType::Int32] => DecodeShape::I32x3,
+            [DataType::Int64] => DecodeShape::I64x1,
+            [DataType::Int64, DataType::Int64] => DecodeShape::I64x2,
+            _ => DecodeShape::Generic,
+        }
+    }
+
+    /// Dispatch a fast-path decode for the all-non-null branch of the
+    /// detected [`DecodeShape`]. Returns `Some(())` on a hit,
+    /// `None` to fall through to the generic path (NULL present,
+    /// truncated tuple, or schema not covered by a fast path).
+    ///
+    /// The fast path:
+    ///
+    /// - Reads the leading null-bitmap byte and bails to the generic
+    ///   path if any of the schema's NULL bits are set.
+    /// - Confirms the payload has the exact fixed width for the
+    ///   shape (single bounds check, not one per column).
+    /// - Inline-decodes each fixed-width column via
+    ///   `i32::from_le_bytes` / `i64::from_le_bytes` on stack-resident
+    ///   4- / 8-byte arrays — no `try_into` round trips, no
+    ///   `&mut ColumnBuilder` match dispatch.
+    /// - Marks every position valid via `nulls.push_valid()`.
+    #[inline]
+    #[allow(clippy::too_many_lines)]
+    fn try_decode_fast_path(
+        shape: DecodeShape,
+        bytes: &[u8],
+        builders: &mut [ColumnBuilder],
+    ) -> Result<Option<()>, RowCodecError> {
+        // Common preamble: 1 bitmap byte for any schema with ≤ 8
+        // columns. All specialised shapes are 1-, 2-, or 3-column,
+        // so the bitmap byte count is always 1.
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let bitmap0 = bytes[0];
+        if bitmap0 != 0 {
+            // Any column is NULL — defer to the generic path which
+            // emits `push_null()` correctly.
+            return Ok(None);
+        }
+        match shape {
+            DecodeShape::Generic => Ok(None),
+            DecodeShape::I32x1 => {
+                if bytes.len() < 1 + 4 {
+                    return Err(RowCodecError::Truncated {
+                        needed: 1 + 4,
+                        have: bytes.len(),
+                    });
+                }
+                let v0 = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+                if let ColumnBuilder::Int32 { data, nulls } = &mut builders[0] {
+                    data.push(v0);
+                    nulls.push_valid();
+                    Ok(Some(()))
+                } else {
+                    // Builder mismatch: caller built the wrong
+                    // builder type for this codec. Defer to generic
+                    // path which surfaces a clearer error.
+                    Ok(None)
+                }
+            }
+            DecodeShape::I32x2 => {
+                if bytes.len() < 1 + 8 {
+                    return Err(RowCodecError::Truncated {
+                        needed: 1 + 8,
+                        have: bytes.len(),
+                    });
+                }
+                let v0 = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+                let v1 = i32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+                let (head, tail) = builders.split_at_mut(1);
+                if let (
+                    ColumnBuilder::Int32 {
+                        data: d0,
+                        nulls: n0,
+                    },
+                    ColumnBuilder::Int32 {
+                        data: d1,
+                        nulls: n1,
+                    },
+                ) = (&mut head[0], &mut tail[0])
+                {
+                    d0.push(v0);
+                    n0.push_valid();
+                    d1.push(v1);
+                    n1.push_valid();
+                    Ok(Some(()))
+                } else {
+                    Ok(None)
+                }
+            }
+            DecodeShape::I32x3 => {
+                if bytes.len() < 1 + 12 {
+                    return Err(RowCodecError::Truncated {
+                        needed: 1 + 12,
+                        have: bytes.len(),
+                    });
+                }
+                let v0 = i32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+                let v1 = i32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+                let v2 = i32::from_le_bytes([bytes[9], bytes[10], bytes[11], bytes[12]]);
+                let (head, rest) = builders.split_at_mut(1);
+                let (mid, tail) = rest.split_at_mut(1);
+                if let (
+                    ColumnBuilder::Int32 {
+                        data: d0,
+                        nulls: n0,
+                    },
+                    ColumnBuilder::Int32 {
+                        data: d1,
+                        nulls: n1,
+                    },
+                    ColumnBuilder::Int32 {
+                        data: d2,
+                        nulls: n2,
+                    },
+                ) = (&mut head[0], &mut mid[0], &mut tail[0])
+                {
+                    d0.push(v0);
+                    n0.push_valid();
+                    d1.push(v1);
+                    n1.push_valid();
+                    d2.push(v2);
+                    n2.push_valid();
+                    Ok(Some(()))
+                } else {
+                    Ok(None)
+                }
+            }
+            DecodeShape::I64x1 => {
+                if bytes.len() < 1 + 8 {
+                    return Err(RowCodecError::Truncated {
+                        needed: 1 + 8,
+                        have: bytes.len(),
+                    });
+                }
+                let raw: [u8; 8] = bytes[1..9].try_into().expect("len checked above");
+                let v0 = i64::from_le_bytes(raw);
+                if let ColumnBuilder::Int64 { data, nulls } = &mut builders[0] {
+                    data.push(v0);
+                    nulls.push_valid();
+                    Ok(Some(()))
+                } else {
+                    Ok(None)
+                }
+            }
+            DecodeShape::I64x2 => {
+                if bytes.len() < 1 + 16 {
+                    return Err(RowCodecError::Truncated {
+                        needed: 1 + 16,
+                        have: bytes.len(),
+                    });
+                }
+                let r0: [u8; 8] = bytes[1..9].try_into().expect("len checked above");
+                let r1: [u8; 8] = bytes[9..17].try_into().expect("len checked above");
+                let v0 = i64::from_le_bytes(r0);
+                let v1 = i64::from_le_bytes(r1);
+                let (head, tail) = builders.split_at_mut(1);
+                if let (
+                    ColumnBuilder::Int64 {
+                        data: d0,
+                        nulls: n0,
+                    },
+                    ColumnBuilder::Int64 {
+                        data: d1,
+                        nulls: n1,
+                    },
+                ) = (&mut head[0], &mut tail[0])
+                {
+                    d0.push(v0);
+                    n0.push_valid();
+                    d1.push(v1);
+                    n1.push_valid();
+                    Ok(Some(()))
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 
@@ -362,6 +594,16 @@ impl RowCodec {
     ) -> Result<(), RowCodecError> {
         let n = self.schema.len();
         assert_eq!(builders.len(), n, "builders.len() must equal schema.len()");
+
+        // Fast-path dispatch: the all-non-null branch of the most
+        // common all-fixed-width schemas skips the per-column match
+        // dispatch and `try_into` round-trip entirely. If the null
+        // bitmap byte is non-zero (any NULL present) we fall through
+        // to the generic path which handles bit-by-bit nulls.
+        if Self::try_decode_fast_path(self.decode_shape, bytes, builders)? == Some(()) {
+            return Ok(());
+        }
+
         let bitmap_bytes = n.div_ceil(8);
         if bytes.len() < bitmap_bytes {
             return Err(RowCodecError::Truncated {
