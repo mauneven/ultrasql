@@ -86,7 +86,44 @@ where
         }
         let oid = self.state.persistent_catalog.next_oid();
         let entry = TableEntry::new(oid, table_name.clone(), namespace.clone(), columns.clone());
-        self.state.persistent_catalog.create_table(entry)?;
+        self.state.persistent_catalog.create_table(entry.clone())?;
+        // Persist the typed pg_class + pg_attribute rows so a restart
+        // can rebuild this `TableEntry` via
+        // `PersistentCatalog::bootstrap_from_heap`. The DDL runs in an
+        // autocommit transaction allocated on the spot; the rows are
+        // stamped with that xid so MVCC visibility lines up with the
+        // user-table relations created in the same statement.
+        let ddl_txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let ddl_xid = ddl_txn.xid;
+        let ddl_command_id = ddl_txn.current_command;
+        if let Err(e) = self.state.persistent_catalog.persist_table_rows(
+            &entry,
+            self.state.heap.as_ref(),
+            ddl_xid,
+            ddl_command_id,
+        ) {
+            // Abort the catalog-write txn before surfacing the error so
+            // the CLOG entry is closed and the rollback path cleans
+            // any partial in-place undo entries (there are none for
+            // pg_class inserts, but symmetry matters for future
+            // expansion).
+            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "abort of catalog-write txn failed after persist_table_rows error",
+                );
+            }
+            return Err(e.into());
+        }
+        if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
+            tracing::warn!(
+                error = %commit_err,
+                "catalog-write txn failed to commit; restart visibility may differ",
+            );
+        }
         // A new relation can shadow names a cached plan rewrote against
         // the previous snapshot; clear the cache so the next statement
         // re-plans.

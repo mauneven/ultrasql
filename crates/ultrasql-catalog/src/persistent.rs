@@ -487,19 +487,13 @@ impl PersistentCatalog {
         &self,
         heap: &HeapAccess<L>,
     ) -> Result<CatalogStats, CatalogError> {
-        // Determine whether there is any heap data for the system catalog
-        // tables.  We check block_count for pg_class (OID 1259) as the
-        // representative system table — if it has no blocks, this is a fresh
-        // database.
-        //
-        // TODO(catalog-persistent-heap): when DDL writes typed tuples to the
-        // catalog heap, decode them here and build a full snapshot from the
-        // durable state.  For now the heap scan falls back to the initial
-        // snapshot because no typed encoder/decoder exists yet.
-        let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
-        let block_count = heap.block_count(pg_class_rel);
+        use crate::encoding::{decode_attribute_row, schema_from_attributes};
 
-        if block_count == 0 {
+        let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
+        let pg_attribute_rel = RelationId::new(bootstrap::PG_ATTRIBUTE_OID);
+        let class_blocks = heap.block_count(pg_class_rel);
+
+        if class_blocks == 0 {
             // Fresh database — install the initial hard-coded snapshot.
             let snap = initial_snapshot();
             let stats = CatalogStats::initial();
@@ -511,44 +505,86 @@ impl PersistentCatalog {
             return Ok(stats);
         }
 
-        // Warm restart: scan the heap and decode catalog rows.
-        //
-        // The system table schemas used for bootstrap are defined in
-        // `bootstrap.rs` and match the v0.8 column layout.  Each scanned
-        // tuple's raw `data` bytes are decoded into the corresponding row
-        // type.
-        //
-        // For this PR the scan is partially implemented: we read pg_class to
-        // rebuild the `TableEntry` list.  The pg_attribute scan and attribute
-        // reconstruction into `Schema` is deferred until the executor can
-        // write typed tuples.  For now we merge the initial snapshot entries
-        // with whatever we find on the heap.
+        // Warm restart. Start from the initial snapshot (which carries
+        // every system relation), then overlay any user-defined tables
+        // we find in pg_class.
         let initial = initial_snapshot();
-        let tables: std::collections::HashMap<String, TableEntry> = initial.tables.clone();
-        let tables_by_oid: std::collections::HashMap<Oid, TableEntry> =
+        let mut tables: std::collections::HashMap<String, TableEntry> = initial.tables.clone();
+        let mut tables_by_oid: std::collections::HashMap<Oid, TableEntry> =
             initial.tables_by_oid.clone();
 
-        let mut relations: u32 = tables.len() as u32;
-
-        // Scan pg_class blocks.  Each slot carries a raw payload but since
-        // the executor does not yet encode typed catalog tuples, we iterate
-        // and count them without decoding.
-        let pg_class_scan = heap.scan(pg_class_rel, block_count);
-        for result in pg_class_scan {
-            match result {
-                Ok(_heap_tuple) => {
-                    // TODO(catalog-persistent-heap): decode heap_tuple.data into
-                    // a ClassRow and then into a TableEntry, then insert into
-                    // tables/tables_by_oid.
-                    relations = relations.saturating_add(1);
-                }
-                Err(e) => {
-                    return Err(CatalogError::schema_conflict(format!(
-                        "heap scan error on pg_class: {e}"
-                    )));
-                }
+        // Group attribute rows by `attrelid` so the per-relation schema
+        // can be rebuilt in one pass.
+        let attribute_blocks = heap.block_count(pg_attribute_rel);
+        let mut attrs_by_relation: std::collections::HashMap<
+            Oid,
+            Vec<(crate::persistent::AttributeRow, ultrasql_core::DataType, bool)>,
+        > = std::collections::HashMap::new();
+        let mut total_attrs: u32 = 0;
+        if attribute_blocks > 0 {
+            let attr_scan = heap.scan(pg_attribute_rel, attribute_blocks);
+            for result in attr_scan {
+                let tuple = result.map_err(|e| {
+                    CatalogError::schema_conflict(format!("heap scan error on pg_attribute: {e}"))
+                })?;
+                let (row, dt, nullable) = decode_attribute_row(&tuple.data).map_err(|e| {
+                    CatalogError::schema_conflict(format!("decode pg_attribute row: {e}"))
+                })?;
+                attrs_by_relation
+                    .entry(row.attrelid)
+                    .or_default()
+                    .push((row, dt, nullable));
+                total_attrs = total_attrs.saturating_add(1);
             }
         }
+
+        // Decode pg_class rows. Each user table maps to one TableEntry
+        // whose schema is rebuilt from the matching attribute rows.
+        let class_scan = heap.scan(pg_class_rel, class_blocks);
+        let mut user_relations: u32 = 0;
+        let mut highest_oid: u32 = self.next_oid.load(Ordering::Acquire);
+        for result in class_scan {
+            let tuple = result.map_err(|e| {
+                CatalogError::schema_conflict(format!("heap scan error on pg_class: {e}"))
+            })?;
+            let class_row = ClassRow::decode(&tuple.data).map_err(|e| {
+                CatalogError::schema_conflict(format!("decode pg_class row: {e}"))
+            })?;
+            // Skip system relations — they live in the initial snapshot.
+            if class_row.oid.raw() < crate::memory::FIRST_USER_OID {
+                continue;
+            }
+            let attrs = attrs_by_relation.remove(&class_row.oid).unwrap_or_default();
+            let schema = schema_from_attributes(attrs).map_err(|e| {
+                CatalogError::schema_conflict(format!(
+                    "rebuild schema for oid {}: {e}",
+                    class_row.oid.raw(),
+                ))
+            })?;
+            let schema_name = if class_row.relnamespace.raw() == bootstrap::PG_CATALOG_OID {
+                "pg_catalog".to_owned()
+            } else {
+                "public".to_owned()
+            };
+            let entry = TableEntry {
+                oid: class_row.oid,
+                name: class_row.relname.clone(),
+                schema_name,
+                schema,
+                created_at_lsn: ultrasql_core::Lsn::ZERO,
+                n_blocks: class_row.relpages,
+                root_block: ultrasql_core::BlockNumber::new(class_row.relfilenode),
+            };
+            let key = class_row.relname.to_ascii_lowercase();
+            tables.insert(key, entry.clone());
+            tables_by_oid.insert(entry.oid, entry);
+            user_relations = user_relations.saturating_add(1);
+            highest_oid = highest_oid.max(class_row.oid.raw().saturating_add(1));
+        }
+        // Bump the OID allocator past every observed OID so a
+        // subsequent `next_oid` call cannot collide with a restored
+        // relation.
+        self.next_oid.store(highest_oid, Ordering::Release);
 
         let snap = CatalogSnapshot {
             tables,
@@ -556,18 +592,102 @@ impl PersistentCatalog {
             indexes: initial.indexes,
             indexes_by_table: initial.indexes_by_table,
         };
-
         let stats = CatalogStats {
             namespaces: CatalogStats::initial().namespaces,
-            relations,
-            attributes: 0,
+            relations: CatalogStats::initial().relations + user_relations,
+            attributes: total_attrs,
             indexes: 0,
             constraints: 0,
         };
-
         self.install_snapshot(snap);
         tracing::debug!(?stats, "catalog bootstrapped from heap");
         Ok(stats)
+    }
+
+    /// Encode and write `entry` into the persistent `pg_class` /
+    /// `pg_attribute` heaps so a subsequent
+    /// [`Self::bootstrap_from_heap`] call can rebuild this
+    /// `TableEntry` after restart.
+    ///
+    /// This is the durable counterpart to [`Self::create_table`]
+    /// (which only updates the in-memory `DashMap`s). DDL callers
+    /// invoke both: first `create_table` so the planner sees the new
+    /// relation, then `persist_table_rows` so the next restart finds
+    /// it on disk. Heap I/O happens through the same `xmin`/
+    /// `command_id` the DDL transaction owns so MVCC visibility
+    /// rules apply uniformly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError::SchemaConflict`] when the column's
+    /// [`DataType`](ultrasql_core::DataType) is outside the catalog-
+    /// persistable set (e.g. `Array`, `Record`), or when a heap I/O
+    /// failure prevents either pg_class or pg_attribute from
+    /// accepting the row.
+    pub fn persist_table_rows<L: PageLoader>(
+        &self,
+        entry: &TableEntry,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::encode_attribute_row;
+        use crate::persistent::{AttributeRow, ClassRow, RelKind};
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
+        let pg_attribute_rel = RelationId::new(bootstrap::PG_ATTRIBUTE_OID);
+
+        let namespace_oid = if entry.schema_name == "pg_catalog" {
+            Oid::new(bootstrap::PG_CATALOG_OID)
+        } else {
+            Oid::new(bootstrap::PUBLIC_OID)
+        };
+
+        let class_row = ClassRow {
+            oid: entry.oid,
+            relname: entry.name.clone(),
+            relnamespace: namespace_oid,
+            relkind: RelKind::Table,
+            relpages: entry.n_blocks,
+            reltuples: 0.0,
+            relfilenode: entry.root_block.raw(),
+            relhasindex: false,
+        };
+        let class_bytes = class_row.encode();
+        let class_opts = InsertOptions {
+            xmin,
+            command_id,
+            wal: None,
+            fsm: None,
+            vm: None,
+        };
+        heap.insert(pg_class_rel, &class_bytes, class_opts)
+            .map_err(|e| CatalogError::schema_conflict(format!("pg_class insert: {e}")))?;
+
+        for (i, field) in entry.schema.fields().iter().enumerate() {
+            let attr_row = AttributeRow {
+                attrelid: entry.oid,
+                attname: field.name.clone(),
+                atttypid: 0,
+                attnum: i16::try_from(i + 1).unwrap_or(i16::MAX),
+                attnotnull: !field.nullable,
+                atthasdef: false,
+                attisdropped: false,
+            };
+            let bytes = encode_attribute_row(&attr_row, &field.data_type, field.nullable)
+                .map_err(|e| CatalogError::schema_conflict(format!("encode pg_attribute: {e}")))?;
+            let attr_opts = InsertOptions {
+                xmin,
+                command_id,
+                wal: None,
+                fsm: None,
+                vm: None,
+            };
+            heap.insert(pg_attribute_rel, &bytes, attr_opts)
+                .map_err(|e| CatalogError::schema_conflict(format!("pg_attribute insert: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Rebuild and swap in a new snapshot.
@@ -1049,46 +1169,67 @@ mod tests {
         assert_eq!(snap_entry.oid, oid);
     }
 
-    /// Write a synthetic `pg_class` entry directly to the `DashMap` (simulating
-    /// what a future DDL executor will do), then call `bootstrap_from_heap` on
-    /// a non-empty heap. The relation must survive the round-trip.
+    /// Round-trip a user-defined table through `persist_table_rows`
+    /// → `bootstrap_from_heap`. The relation must survive the round-
+    /// trip with its full schema (column names, types, nullability).
     #[test]
     fn bootstrap_round_trip_preserves_known_relation() {
         use std::sync::Arc;
-        use ultrasql_core::{CommandId, PageId, RelationId, Xid};
+        use ultrasql_core::{CommandId, DataType, Field, PageId, Schema, Xid};
         use ultrasql_storage::buffer_pool::BufferPool;
-        use ultrasql_storage::heap::{HeapAccess, InsertOptions};
+        use ultrasql_storage::heap::HeapAccess;
         use ultrasql_storage::page::Page;
 
-        // Build a heap with a real pool so we can insert a tuple.
         let pool = Arc::new(BufferPool::new(64, |_: PageId| Ok(Page::new_heap())));
         let heap = HeapAccess::new(pool);
 
-        // Insert one dummy byte into the pg_class relation so that
-        // `block_count` > 0, which triggers the warm-restart code path.
-        let pg_class_rel = RelationId::new(crate::bootstrap::PG_CLASS_OID);
-        let insert_opts = InsertOptions {
-            xmin: Xid::new(1),
-            command_id: CommandId::new(0),
-            wal: None,
-            fsm: None,
-            vm: None,
-        };
-        heap.insert(pg_class_rel, &[0u8], insert_opts)
-            .expect("insert dummy tuple");
-
-        // Bootstrap should now take the warm-restart path.
+        // Build a representative user table and persist its rows.
         let cat = PersistentCatalog::new();
-        let stats = cat
+        let oid = cat.next_oid();
+        let entry = TableEntry::new(
+            oid,
+            "orders".to_owned(),
+            "public".to_owned(),
+            Schema::new(vec![
+                Field {
+                    name: "id".into(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                },
+                Field {
+                    name: "amount".into(),
+                    data_type: DataType::Int64,
+                    nullable: true,
+                },
+            ])
+            .expect("schema"),
+        );
+        cat.create_table(entry.clone()).expect("create_table");
+        cat.persist_table_rows(&entry, &heap, Xid::new(1), CommandId::new(0))
+            .expect("persist_table_rows");
+
+        // Reset to a clean catalog and bootstrap from the heap pages
+        // that the previous step wrote.
+        let cat2 = PersistentCatalog::new();
+        let stats = cat2
             .bootstrap_from_heap(&heap)
-            .expect("bootstrap must not fail");
+            .expect("bootstrap must succeed");
+        // Initial system relations plus the one user table.
+        assert!(stats.relations >= 9);
+        assert_eq!(stats.attributes, 2);
 
-        // The warm-restart path starts from the initial snapshot.
-        assert!(stats.relations >= 8, "must include system tables");
-
-        // The system relations must still be present.
-        let snap = cat.snapshot();
-        assert!(snap.tables.contains_key("pg_class"));
-        assert!(snap.tables.contains_key("pg_namespace"));
+        let snap = cat2.snapshot();
+        let restored = snap
+            .tables
+            .get("orders")
+            .expect("user relation present after bootstrap");
+        assert_eq!(restored.oid, oid);
+        assert_eq!(restored.schema.fields().len(), 2);
+        assert_eq!(restored.schema.fields()[0].name, "id");
+        assert_eq!(restored.schema.fields()[0].data_type, DataType::Int32);
+        assert!(!restored.schema.fields()[0].nullable);
+        assert_eq!(restored.schema.fields()[1].name, "amount");
+        assert_eq!(restored.schema.fields()[1].data_type, DataType::Int64);
+        assert!(restored.schema.fields()[1].nullable);
     }
 }
