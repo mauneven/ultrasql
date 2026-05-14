@@ -398,13 +398,43 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     }
                 }
                 ModifyKind::Insert => {
+                    // Batched INSERT: encode every row in this batch
+                    // once into per-row `Vec<u8>` payloads and hand
+                    // the slice to `heap.insert_batch`. That bulk
+                    // call pins each destination page exactly once
+                    // and writes every payload under one write guard
+                    // per page — replacing the prior per-row
+                    // `heap.insert` loop that re-entered the buffer
+                    // pool once per row.
                     let child_schema = self.child.schema().clone();
                     let rows = batch_to_rows(&batch, &child_schema)
                         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-                    for row in rows {
-                        self.apply_insert(&row)?;
-                        self.affected += 1;
+                    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
+                    for row in &rows {
+                        let payload = self
+                            .codec
+                            .encode(row)
+                            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                        payloads.push(payload);
                     }
+                    let n = payloads.len();
+                    let payload_refs: Vec<&[u8]> =
+                        payloads.iter().map(Vec::as_slice).collect();
+                    let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
+                    self.heap
+                        .insert_batch(
+                            self.relation,
+                            &payload_refs,
+                            ultrasql_storage::heap::InsertOptions {
+                                xmin: self.insert_xmin,
+                                command_id: self.insert_command_id,
+                                wal: wal_ref,
+                                fsm: None,
+                                vm: None,
+                            },
+                        )
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                    self.affected = self.affected.saturating_add(n as u64);
                 }
             }
         }
