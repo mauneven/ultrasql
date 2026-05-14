@@ -14,7 +14,7 @@ Dataset:         10000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 148.62 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 164.33 µs | `█                                               ` | 8 |
 | 2 | sqlite3 | 512.33 µs | `█                                               ` | 8 |
 | 3 | duckdb | 1.99 ms | `████                                            ` | 8 |
 | 4 | clickhouse | 3.37 ms | `███████                                         ` | 8 |
@@ -26,7 +26,7 @@ Dataset:       1000000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 133.54 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 121.58 µs | `█                                               ` | 8 |
 | 2 | duckdb | 216.46 µs | `█                                               ` | 8 |
 | 3 | clickhouse | 1.66 ms | `██                                              ` | 8 |
 | 4 | sqlite3 | 16.20 ms | `████████████████████                            ` | 8 |
@@ -50,7 +50,7 @@ Dataset:         10000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 115.93 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 132.14 µs | `█                                               ` | 8 |
 | 2 | sqlite3 | 357.35 µs | `█                                               ` | 8 |
 | 3 | duckdb | 1.25 ms | `███                                             ` | 8 |
 | 4 | postgres17 | 11.63 ms | `█████████████████████████                       ` | 8 |
@@ -62,7 +62,7 @@ Dataset:       1000000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 121.75 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 128.71 µs | `█                                               ` | 8 |
 | 2 | duckdb | 283.85 µs | `█                                               ` | 8 |
 | 3 | clickhouse | 2.05 ms | `██                                              ` | 8 |
 | 4 | sqlite3 | 14.61 ms | `█████████████████                               ` | 8 |
@@ -74,7 +74,7 @@ Dataset:         10000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 753.96 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 763.38 µs | `█                                               ` | 8 |
 | 2 | duckdb | 897.42 µs | `██                                              ` | 8 |
 | 3 | clickhouse | 1.17 ms | `██                                              ` | 8 |
 | 4 | sqlite3 | 1.81 ms | `███                                             ` | 8 |
@@ -86,7 +86,7 @@ Dataset:         65536 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 64.08 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 86.96 µs | `█                                               ` | 8 |
 | 2 | duckdb | 111.42 µs | `█                                               ` | 8 |
 | 3 | clickhouse | 674.67 µs | `█                                               ` | 8 |
 | 4 | sqlite3 | 938.88 µs | `█                                               ` | 8 |
@@ -99,7 +99,7 @@ Dataset:         10000 rows
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
 | 1 | duckdb | 176.25 µs | `█                                               ` | 8 |
-| 2 | ultrasql | 215.38 µs | `█                                               ` | 8 |
+| 2 | ultrasql | 243.50 µs | `█                                               ` | 8 |
 | 3 | sqlite3 | 451.08 µs | `█                                               ` | 8 |
 | 4 | clickhouse | 3.50 ms | `███                                             ` | 8 |
 | 5 | postgres17 | 64.42 ms | `████████████████████████████████████████████████` | 8 |
