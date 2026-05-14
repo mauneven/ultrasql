@@ -48,10 +48,10 @@ use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
-use ultrasql_catalog::{CatalogSnapshot, PersistentCatalog};
+use ultrasql_catalog::{CatalogSnapshot, MutableCatalog, PersistentCatalog, TableEntry};
 use ultrasql_core::PageId;
 use ultrasql_parser::Parser;
-use ultrasql_planner::{InMemoryCatalog, bind};
+use ultrasql_planner::{Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan, TableMeta, bind};
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
 use ultrasql_storage::buffer_pool::BufferPool;
 use ultrasql_storage::heap::HeapAccess;
@@ -59,7 +59,36 @@ use ultrasql_storage::page::Page;
 
 pub use error::ServerError;
 pub use pipeline::{SampleTables, build_sample_database};
-pub use result_encoder::{SelectResult, run_select};
+pub use result_encoder::{SelectResult, run_ddl_command, run_select};
+
+/// Read-only catalog view consulted by the binder during query
+/// execution.
+///
+/// The persistent catalog (`PersistentCatalog`) is the source of truth
+/// for user-created relations; the in-memory `InMemoryCatalog` carries
+/// the legacy sample-table registry (the v0.5 hard-coded `users`
+/// fixture). Lookups try the persistent snapshot first so a runtime
+/// `CREATE TABLE` immediately shadows any sample-table name collision;
+/// if the snapshot has no entry, we fall back to the sample-table
+/// catalog so existing duplex tests still resolve `users`.
+///
+/// The `'a` lifetime ties the view to the snapshot and in-memory
+/// catalog held by the calling [`Session`]; binding completes
+/// synchronously inside `execute_query` so the lifetime never escapes
+/// a single statement.
+struct CombinedCatalog<'a> {
+    snapshot: &'a CatalogSnapshot,
+    fallback: &'a InMemoryCatalog,
+}
+
+impl PlannerCatalog for CombinedCatalog<'_> {
+    fn lookup_table(&self, name: &str) -> Option<TableMeta> {
+        if let Some(meta) = PlannerCatalog::lookup_table(self.snapshot, name) {
+            return Some(meta);
+        }
+        self.fallback.lookup_table(name)
+    }
+}
 
 /// Default initial read buffer. Picked to fit a small startup message
 /// without resizing; the buffer grows on demand.
@@ -445,15 +474,73 @@ where
     /// DDL cannot perturb an in-flight query.
     fn execute_query(&self, sql: &str) -> Result<SelectResult, ServerError> {
         // Capture a per-statement catalog snapshot — wait-free arc-swap load.
-        let _catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        // The binder reads this snapshot first; if a name is not found there
+        // (a runtime CREATE TABLE never landed it), the in-memory sample
+        // catalog provides the legacy fallback.
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        let combined = CombinedCatalog {
+            snapshot: &catalog_snapshot,
+            fallback: &self.state.catalog,
+        };
 
-        // TODO(catalog-rebind): pass `_catalog_snapshot` through to the
-        // binder once the planner is rewritten against `CatalogSnapshot`.
-        // For now the in-memory catalog is still the binder's source of truth.
         let stmt = Parser::new(sql).parse_statement()?;
-        let plan = bind(&stmt, &self.state.catalog)?;
+        let plan = bind(&stmt, &combined)?;
+
+        // DDL is dispatched ahead of operator lowering: it never produces
+        // rows, so the lowerer would only round-trip it through an
+        // unreachable arm.
+        if let LogicalPlan::CreateTable { .. } = &plan {
+            return self.execute_create_table(&plan, &catalog_snapshot);
+        }
+
         let mut op = pipeline::lower_plan(&plan, &self.state.tables)?;
         run_select(op.as_mut())
+    }
+
+    /// Persist a `CREATE TABLE` into the catalog.
+    ///
+    /// Honors `IF NOT EXISTS` by short-circuiting when the relation
+    /// already exists in either the persistent snapshot or the
+    /// in-memory sample catalog. The resolved column [`Schema`] from
+    /// the binder is stored verbatim, so a subsequent statement that
+    /// captures a fresh snapshot will see the new relation.
+    ///
+    /// Currently a metadata-only operation: the segment file and the
+    /// `pg_class.relfilenode` block are allocated lazily on the first
+    /// `INSERT`. This matches PostgreSQL's `RelationSetNewRelfilenode`
+    /// timing closely enough that subsequent `INSERT` wiring (in a
+    /// follow-up commit) can stamp the right block number then.
+    fn execute_create_table(
+        &self,
+        plan: &LogicalPlan,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::CreateTable {
+            table_name,
+            namespace,
+            columns,
+            if_not_exists,
+            ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_create_table called with non-CreateTable plan",
+            ));
+        };
+        let exists_persistent = snapshot.tables.contains_key(table_name);
+        let exists_fallback = self.state.catalog.lookup_table(table_name).is_some();
+        if exists_persistent || exists_fallback {
+            if *if_not_exists {
+                return Ok(run_ddl_command("CREATE TABLE"));
+            }
+            return Err(ServerError::Catalog(
+                ultrasql_catalog::CatalogError::already_exists(table_name.clone()),
+            ));
+        }
+        let oid = self.state.persistent_catalog.next_oid();
+        let entry = TableEntry::new(oid, table_name.clone(), namespace.clone(), columns.clone());
+        self.state.persistent_catalog.create_table(entry)?;
+        Ok(run_ddl_command("CREATE TABLE"))
     }
 
     /// Read one frontend message, growing the buffer until the codec
@@ -869,6 +956,120 @@ mod tests {
             result,
             Err(ServerError::UnsupportedProtocol { major: 0xFFFF, .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn create_table_persists_to_catalog_via_wire() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let state_clone = Arc::clone(&state);
+        let handle = tokio::spawn(handle_connection(server_side, state));
+
+        complete_startup(&mut client).await;
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE accounts (id BIGINT NOT NULL, balance FLOAT8)".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+
+        // Server emits CommandComplete "CREATE TABLE" then ReadyForQuery 'I'.
+        let tag = msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        });
+        assert_eq!(tag.as_deref(), Some("CREATE TABLE"));
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::RowDescription { .. })),
+            "DDL must not emit RowDescription"
+        );
+        assert!(matches!(
+            msgs.last().unwrap(),
+            BackendMessage::ReadyForQuery { status: b'I' }
+        ));
+
+        // Catalog observably contains the new relation.
+        let snap = state_clone.catalog_snapshot();
+        let accounts = snap.tables.get("accounts").expect("accounts persisted");
+        assert_eq!(accounts.name, "accounts");
+        assert_eq!(accounts.schema_name, "public");
+        assert_eq!(accounts.schema.len(), 2);
+        assert!(
+            !accounts.schema.fields()[0].nullable,
+            "NOT NULL constraint applied"
+        );
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    #[tokio::test]
+    async fn create_table_duplicate_rejected_with_query_scoped_error() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+
+        complete_startup(&mut client).await;
+        // First create succeeds.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE t (id INT)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        // Second create on the same name errors but the session survives.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE t (id INT)".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let err = msgs
+            .iter()
+            .find_map(|m| match m {
+                BackendMessage::ErrorResponse { fields } => Some(fields.clone()),
+                _ => None,
+            })
+            .expect("ErrorResponse on duplicate");
+        let sqlstate = err
+            .iter()
+            .find_map(|(c, v)| (*c == b'C').then(|| v.clone()))
+            .expect("SQLSTATE field present");
+        assert_eq!(sqlstate, "42P07", "duplicate_table SQLSTATE");
+        // Session still healthy.
+        assert!(matches!(
+            msgs.last().unwrap(),
+            BackendMessage::ReadyForQuery { status: b'I' }
+        ));
+
+        // Third attempt with IF NOT EXISTS succeeds as a no-op.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE IF NOT EXISTS t (id INT)".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let tag = msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        });
+        assert_eq!(tag.as_deref(), Some("CREATE TABLE"));
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
     }
 
     #[tokio::test]

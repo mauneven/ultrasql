@@ -57,6 +57,23 @@ pub struct SelectResult {
     pub rows: u64,
 }
 
+/// Wrap a DDL execution result as the wire messages PostgreSQL would
+/// emit: a single `CommandComplete` tagged with the DDL command, no
+/// `RowDescription` and no `DataRow`.
+///
+/// `tag` is the tag literal — `"CREATE TABLE"`, `"DROP TABLE"`,
+/// `"CREATE INDEX"`, etc. The caller is responsible for emitting the
+/// trailing `ReadyForQuery`.
+#[must_use]
+pub fn run_ddl_command(tag: &str) -> SelectResult {
+    SelectResult {
+        messages: vec![BackendMessage::CommandComplete {
+            tag: tag.to_string(),
+        }],
+        rows: 0,
+    }
+}
+
 /// Drive `op` to completion and produce the corresponding wire
 /// messages.
 ///

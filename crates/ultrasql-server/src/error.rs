@@ -70,6 +70,11 @@ pub enum ServerError {
     /// physical plan yet. The string names the construct.
     #[error("unsupported in v0.5: {0}")]
     Unsupported(&'static str),
+
+    /// A catalog operation (CREATE/DROP/ALTER) was rejected — for
+    /// example, `CREATE TABLE` on an existing relation.
+    #[error("catalog error: {0}")]
+    Catalog(#[from] ultrasql_catalog::CatalogError),
 }
 
 impl ServerError {
@@ -88,6 +93,7 @@ impl ServerError {
                 | Self::Execute(_)
                 | Self::Build(_)
                 | Self::Unsupported(_)
+                | Self::Catalog(_)
         )
     }
 
@@ -97,10 +103,18 @@ impl ServerError {
     #[must_use]
     pub const fn sqlstate(&self) -> &'static str {
         match self {
-            Self::Parse(_) => "42601",                        // syntax_error
-            Self::Plan(_) => "42P01",                         // undefined_table (coarse)
+            Self::Parse(_) => "42601", // syntax_error
+            // duplicate_table — name collision from either layer
+            Self::Plan(ultrasql_planner::PlanError::DuplicateTable(_))
+            | Self::Catalog(ultrasql_catalog::CatalogError::AlreadyExists(_)) => "42P07",
+            Self::Plan(ultrasql_planner::PlanError::DuplicateColumn(_)) => "42701", // duplicate_column
+            Self::Plan(ultrasql_planner::PlanError::ColumnNotFound(_)) => "42703", // undefined_column
+            // undefined_table — coarse planner fallback plus the catalog
+            // NotFound that surfaces when DROP / ALTER fails to resolve a name
+            Self::Plan(_) | Self::Catalog(ultrasql_catalog::CatalogError::NotFound(_)) => "42P01",
             Self::Build(_) | Self::Unsupported(_) => "0A000", // feature_not_supported
             Self::UnsupportedProtocol { .. } => "08P01",      // protocol_violation
+            Self::Catalog(_) => "42000",                      // generic catalog failure
             // Internal: Execute/IO/Protocol/UnexpectedEof all map here.
             _ => "XX000",
         }
