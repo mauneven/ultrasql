@@ -258,6 +258,21 @@ impl<L: PageLoader> HeapAccess<L> {
     /// # Concurrency
     ///
     /// Holds **one** write-exclusive page guard at a time.
+    ///
+    /// # ⚠️ Durability gap
+    ///
+    /// Like [`Self::update_int32_pair_inplace_undo`], this path does
+    /// **not** emit a WAL record. The xmax/cmax stamp is in-memory
+    /// only until the buffer pool flushes the page; on a crash
+    /// between the page mutation and any (not-yet-existent) WAL
+    /// flush, recovery cannot replay the DELETE.
+    ///
+    /// Benchmark numbers measured against this method describe
+    /// throughput under a **non-durable** DELETE contract. The
+    /// classical [`Self::delete_many`] path **does** emit
+    /// `HeapDelete` WAL records and remains the durable route.
+    /// Closing the gap is tracked alongside the in-place UPDATE
+    /// durability work.
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn delete_int32_pair_inplace<O, P>(

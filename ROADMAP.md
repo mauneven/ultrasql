@@ -226,10 +226,44 @@ splitting `heap.rs` and `lib.rs` into bounded-size modules.
   hot dispatch wrappers. UPDATE 161 → 138 µs best (-14%); SELECT
   scan 765 → 658 µs best (-14%).
 
-**Result**: UltraSQL is the **measured fastest engine in the
-cross_compare_sql matrix on every workload**, while preserving the
-full PostgreSQL on-disk MVCC contract and the tokio-postgres wire
-protocol.
+**Result**: UltraSQL is the measured fastest engine in the
+`cross_compare_sql` matrix on every workload at the **session-level**
+MVCC contract (snapshot isolation, visible pre/post-image, undo-log
+backed rollback). The bench is run through tokio-postgres against the
+real wire protocol.
+
+### Caveats the bench numbers do NOT cover
+
+1. **Durability of the in-place fast path.** Wave F-1's
+   `update_int32_pair_inplace_undo` and Wave F-3's
+   `delete_int32_pair_inplace` emit **no WAL records**. The
+   pre-image undo log is in-memory only. A crash between the
+   page mutation and the next checkpoint loses the UPDATE/DELETE
+   on restart. The classical `update_many` / `delete_many` paths
+   *do* emit WAL; the fused fast path is therefore production-
+   unsafe and is gated to the executor's `(Int32, Int32) SET col
+   ± lit` shape. **P0 follow-up**: add `RecordType::HeapUpdateInPlace`
+   payload carrying pre + post image, emit per row before the
+   page mutation, stamp page LSN, write deterministic-simulation
+   crash tests at every WAL byte boundary.
+2. **Shape specialisation.** `FusedUpdateInt32Add`,
+   `FusedDeleteInt32Pair`, `write_int32_pair_data_rows`, and the
+   in-place undo path all match exactly the `(Int32, Int32) col
+   cmp Int32-lit / SET col ± Int32-lit` shape `cross_compare_sql`
+   uses. Three-column tables, `Int64`/`Text` columns, JOINs,
+   ORDER BY etc. all fall back to the general row-oriented path
+   and the numbers above will differ. The fused paths should
+   generalise via codegen across `(T1, T2, ...)`; until they do,
+   the matrix is a per-shape microbench, not a full-DB claim.
+3. **Wire-protocol coverage.** `ORDER BY`, `JOIN`,
+   `UNION`/`INTERSECT`/`EXCEPT`, `IndexScan`, `BETWEEN`,
+   `WITH RECURSIVE`, `EXPLAIN`, `PREPARE`/`EXECUTE`/`DEALLOCATE`,
+   `COPY`, `CancelRequest` are not yet reachable from
+   `lower_query`. No ORM works end-to-end yet.
+
+Closing items 1–3 is the v0.5 / v0.6 work plan. Until then the bench
+numbers describe what the engine *measures*, not what a production
+deployment can rely on.
 
 
 
@@ -476,6 +510,34 @@ them back with crash recovery. WAL wired to heap.
 
 **Scope:** ACID transactions with snapshot isolation and true
 serializable (SSI). Real row-level locking. Deadlock detection.
+
+### ⚠️ P0 correctness debt added by Wave F (must close before any v0.7 work)
+
+- [ ] **In-place UPDATE / DELETE emit no WAL** —
+  `update_int32_pair_inplace_undo` / `delete_int32_pair_inplace` mutate
+  pages without writing a WAL record. The undo log is in-memory only.
+  On a crash between page write and checkpoint, the UPDATE is lost on
+  restart. The bench numbers describe a non-durable contract. **Fix
+  plan**: new `RecordType::HeapUpdateInPlace` payload (pre + post +
+  tid + xmax/cmax), emit per row before the page mutation under the
+  same write guard, stamp page LSN, write deterministic-simulation
+  crash tests that cut the WAL at every byte boundary across an
+  in-place UPDATE.
+- [ ] **Undo-log GC story missing** — `UndoRelationLog` grows
+  unbounded. Each UPDATE pushes 9-byte pre-images that are never
+  trimmed. Long-running workloads will accumulate undo entries until
+  the per-relation `RwLock<Vec<_>>` is dominated by historical
+  pre-images that no live snapshot needs. **Fix plan**: track
+  oldest-active-snapshot xmin in `TransactionManager`, trim undo
+  entries whose `writer_xid < oldest_active_xmin` on every commit
+  (or on a periodic vacuum tick).
+- [ ] **Persistent catalog typed-tuple decoder missing** —
+  `PersistentCatalog::bootstrap_from_heap` falls back to the initial
+  in-memory snapshot. User tables created in a previous session are
+  recoverable via WAL replay into the catalog snapshot but the
+  on-disk `pg_class` / `pg_attribute` rows are not themselves
+  decoded. Restart-survival is therefore WAL-replay-dependent;
+  losing WAL = losing the catalog.
 
 > Kernel ships and the wire path for `BEGIN` / `COMMIT` / `ROLLBACK`
 > is now wired end-to-end: parser → binder → server `TxnState`

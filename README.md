@@ -25,13 +25,36 @@ serialize on every side.
 
 Tables are ordered **fastest → slowest**. The `Relative` column shows each
 engine's median as an ASCII bar relative to the slowest row (full bar =
-slowest, shortest bar = fastest). UltraSQL participates in every workload
-except `mixed_oltp_pgbench_like`, which requires multi-statement BEGIN/COMMIT
-transactions through the Simple Query path (Wave 5 follow-up). Where UltraSQL
-ranks last on analytical workloads, the gap is real: the v0.5 SeqScan
-materialises the whole relation on the first call and the HashAggregate
-decodes one `Value` at a time — both are tracked optimisations, neither is
-papered over here.
+slowest, shortest bar = fastest).
+
+### What these numbers measure honestly — and what they don't
+
+The `cross_compare_sql` matrix covers eight kernel-style workloads with one
+fixed `(id INT, val INT)` schema. Real-application coverage requires
+`ORDER BY`, `JOIN`, `INSERT ... SELECT`, `UNION`, `IndexScan`, and similar
+operators — most of those are kernel-complete inside UltraSQL but **not
+yet reachable through `lower_query`** in v0.5 / v0.6. Treat the matrix as
+a microbench suite, not a full PostgreSQL replacement claim.
+
+The fast UPDATE / DELETE / scan numbers below are produced by hand-rolled
+operators (`FusedUpdateInt32Add`, `FusedDeleteInt32Pair`,
+`write_int32_pair_data_rows`, the in-place undo-log path) that match the
+exact `(Int32, Int32) col cmp lit / SET col ± lit` shape this bench uses.
+A real query with three columns or a non-`Int32` type falls back to the
+general row-oriented path and the numbers will differ. The fused paths
+are tracked optimisations that should generalise; until they do, the
+table reads as a per-shape fast path.
+
+**Durability gap**: the in-place UPDATE / DELETE paths
+(`update_int32_pair_inplace_undo`, `delete_int32_pair_inplace`) currently
+emit **no WAL** — they're not crash-safe. The pre-image undo log is
+in-memory only. Production durability requires routing through the
+classical `update_many` / `delete_many` paths (which **do** emit WAL),
+and those are the paths a non-`(Int32, Int32)` UPDATE / DELETE will use.
+Closing the durability gap on the fast path is a tracked P0 item; the
+benchmark numbers are honest measurements of the code as it stands but
+**should not be read as a claim of full PostgreSQL on-disk MVCC durability
+on those workloads**.
 
 Methodology and raw data: [BENCHMARKS.md](BENCHMARKS.md) and
 [`benchmarks/results/`](benchmarks/results/).

@@ -366,17 +366,24 @@ fn render_md(by_workload: &HashMap<String, Vec<EngineResult>>) -> String {
          DELETE, mixed OLTP — now travels the wire path end-to-end through \
          `ultrasqld`. See [`../../BENCHMARKS.md`](../../BENCHMARKS.md) for \
          the methodology gate.\n\n\
-         > **Semantics note**: UltraSQL is PostgreSQL-compatible and \
-         implements MVCC UPDATE / DELETE — every mutation creates a new \
-         tuple version and stamps the old one. SQLite's UPDATE measured \
-         here runs under `PRAGMA journal_mode=MEMORY` + `synchronous=OFF` \
-         and writes in place (no MVCC). On the wire-comparable, \
-         MVCC-comparable engine — PostgreSQL — UltraSQL UPDATE is **158× \
-         faster** on this shape (0.41 ms vs 64.42 ms). DuckDB's UPDATE \
-         leads the table through a non-MVCC delta-encoded update path; \
-         UltraSQL takes second place while preserving full MVCC \
-         semantics over a tokio-postgres wire path. Every other workload \
-         is apples-to-apples across engine semantics.\n\n",
+         > **Honest scope note**: this matrix is eight kernel-style \
+         workloads on one fixed `(id INT, val INT)` schema. The UltraSQL \
+         UPDATE / DELETE rows are produced by hand-rolled operators \
+         (`FusedUpdateInt32Add`, `FusedDeleteInt32Pair`, the in-place \
+         undo-log path) that match exactly the `(Int32, Int32) col cmp \
+         lit / SET col ± lit` shape this bench uses; the fast SELECT \
+         scan row uses `write_int32_pair_data_rows`. A real workload \
+         with three columns or a non-Int32 type falls back to the \
+         general row-oriented path and the numbers will differ. Treat \
+         this matrix as a per-shape microbench, not a full PostgreSQL \
+         replacement claim. The wider operator surface — ORDER BY, \
+         JOIN, IndexScan, EXPLAIN, PREPARE/EXECUTE, COPY — is not yet \
+         reachable from `lower_query`.\n\n\
+         > **⚠️ Durability gap**: the in-place UPDATE / DELETE fast \
+         paths emit **no WAL**. Bench numbers describe a non-durable \
+         contract; the classical `update_many` / `delete_many` paths \
+         do emit WAL and are the durable route. Adding WAL to the \
+         in-place path is a tracked P0 item.\n\n",
     );
     out.push_str(
         "Tables are ordered fastest → slowest. The `Relative` column shows \

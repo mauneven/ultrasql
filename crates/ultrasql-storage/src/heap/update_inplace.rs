@@ -192,6 +192,39 @@ impl<L: PageLoader> HeapAccess<L> {
     /// Holds **one** write-exclusive page guard at a time — the source
     /// page being updated. No destination guard is acquired because
     /// no destination page exists.
+    ///
+    /// # ⚠️ Durability gap (v0.6-pre-alpha)
+    ///
+    /// This path does **not** emit a WAL record. The in-memory
+    /// `UndoRelationLog` is the only record of the pre-image, and the
+    /// page's mutated bytes are the only record of the post-image.
+    /// On a crash between the page-write and any (not-yet-existent)
+    /// WAL flush, recovery cannot:
+    /// - Re-apply a committed UPDATE that the buffer pool had not
+    ///   flushed yet (the WAL has nothing to replay).
+    /// - Restore the pre-image for an uncommitted UPDATE whose page
+    ///   *was* flushed (the undo log is in-memory only).
+    ///
+    /// In other words, every benchmark number measured against this
+    /// method describes throughput under a **non-durable** UPDATE
+    /// contract. The numbers are honest measurements of the code as
+    /// it stands; the public claim "full PostgreSQL on-disk MVCC
+    /// contract" is **not** currently met by this path. Closing the
+    /// gap requires (a) a new `RecordType::HeapUpdateInPlace`
+    /// payload carrying pre + post-image bytes, (b) `WalSink::append`
+    /// + page-LSN stamping inside the inner loop, and (c) a
+    /// deterministic-simulation crash test that runs the recovery
+    /// applier through every WAL byte boundary.
+    ///
+    /// Until that lands, the in-place path is gated to the
+    /// `(Int32, Int32) SET col ± lit` fused executor shape and is
+    /// suitable only for benchmark workloads. Production deployments
+    /// that need durability must route UPDATE through the classical
+    /// out-of-place [`HeapAccess::update_many`] path (which **does**
+    /// emit `HeapUpdate` WAL records — see `wal_emit.rs`).
+    ///
+    /// Tracked: ROADMAP P0 — undo-log durability story (no commit
+    /// reference yet).
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn update_int32_pair_inplace_undo<O, P>(
