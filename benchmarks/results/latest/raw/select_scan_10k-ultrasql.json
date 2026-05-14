@@ -1,1 +1,1 @@
-{"engine":"ultrasql","iterations_us":[835.9580000000001,855.084,860.3340000000001,865.917,869.083,877.25,891.5,899.167],"median_us":869.083,"min_us":835.9580000000001,"n_rows":10000,"samples":8,"workload":"select_scan_10k"}
+{"engine":"ultrasql","iterations_us":[818.375,854.292,856.042,859.375,860.292,863.208,874.25,903.417],"median_us":860.292,"min_us":818.375,"n_rows":10000,"samples":8,"workload":"select_scan_10k"}
