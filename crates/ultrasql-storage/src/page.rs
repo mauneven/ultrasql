@@ -480,6 +480,50 @@ impl Page {
         Ok(slot)
     }
 
+    /// Append a tuple to the page **without** scanning the slot
+    /// directory for a reusable (Unused) slot.
+    ///
+    /// Identical to [`Self::insert_tuple`] for pages that have no
+    /// reusable slots — the common case for freshly-loaded heap
+    /// pages and for HOT-update batches where the caller knows
+    /// every preceding slot is still Normal. Skipping
+    /// `find_reusable_slot`'s O(slot_count) linear scan drops a
+    /// quadratic per-tuple cost during bulk HOT updates from
+    /// `O(slot_count²)` total slot reads down to `O(slot_count)`.
+    ///
+    /// Caller's contract: this allocates a **new** slot at
+    /// `slot_count`. Use [`Self::insert_tuple`] when reusing a
+    /// previously-deleted slot matters (e.g. inside vacuum or
+    /// when reclaiming Unused entries).
+    pub fn insert_tuple_appended(&mut self, tuple: &[u8]) -> Result<SlotIndex, PageError> {
+        let tuple_len = u32::try_from(tuple.len())
+            .map_err(|_| PageError::Malformed("tuple too large for page"))?;
+        if tuple_len > ItemId::MAX_LENGTH {
+            return Err(PageError::Malformed("tuple length exceeds itemid"));
+        }
+
+        let mut header = self.header();
+        let needed = tuple.len() + ITEMID_SIZE;
+        let free = header.free_space();
+        if free < needed {
+            return Err(PageError::NoSpace {
+                needed,
+                available: free,
+            });
+        }
+
+        let new_upper = header.upper as usize - tuple.len();
+        self.bytes[new_upper..new_upper + tuple.len()].copy_from_slice(tuple);
+
+        let item = ItemId::new(new_upper as u32, tuple_len, ItemIdFlags::Normal);
+        let idx = header.slot_count();
+        self.write_item_id(idx, item);
+        header.lower = (header.lower as usize + ITEMID_SIZE) as u16;
+        header.upper = new_upper as u16;
+        header.encode(&mut self.bytes);
+        Ok(idx)
+    }
+
     /// Read a tuple by slot index. Returns a slice into the page's
     /// data area.
     pub fn read_tuple(&self, slot: SlotIndex) -> Result<&[u8], PageError> {

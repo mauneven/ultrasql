@@ -1557,7 +1557,13 @@ impl<L: PageLoader> HeapAccess<L> {
         new_hdr.encode(&mut new_tuple_bytes[..TUPLE_HEADER_SIZE]);
         new_tuple_bytes.extend_from_slice(new_payload);
 
-        let new_slot = page.insert_tuple(&new_tuple_bytes)?;
+        // HOT updates only ever create new tuple versions — never
+        // reuse a previously-deleted slot. Skip
+        // `Page::insert_tuple`'s O(slot_count) find-reusable-slot
+        // linear scan via the appended variant. For a 200-slot page
+        // with 200 HOT inserts this drops the scan cost from
+        // O(slot_count²) total to O(slot_count).
+        let new_slot = page.insert_tuple_appended(&new_tuple_bytes)?;
         let new_tid = TupleId::new(old_tid.page, new_slot);
 
         // Patch the new tuple's ctid to point at itself (terminal
