@@ -635,29 +635,90 @@ where
     async fn handle_query(&mut self, sql: &str) -> Result<(), ServerError> {
         let trimmed = sql.trim();
         if trimmed.is_empty() || trimmed == ";" {
-            self.send(&BackendMessage::EmptyQueryResponse).await?;
-            self.send(&BackendMessage::ReadyForQuery {
-                status: self.txn_state.ready_for_query_status(),
-            })
-            .await?;
+            // Coalesce `EmptyQueryResponse` + `ReadyForQuery` into one
+            // `write_all` so the empty-query reply stays a single
+            // syscall round-trip.
+            self.write_buf.clear();
+            encode_backend(&BackendMessage::EmptyQueryResponse, &mut self.write_buf);
+            encode_backend(
+                &BackendMessage::ReadyForQuery {
+                    status: self.txn_state.ready_for_query_status(),
+                },
+                &mut self.write_buf,
+            );
+            self.io.write_all(&self.write_buf).await?;
+            self.io.flush().await?;
             return Ok(());
         }
 
         match self.execute_query(trimmed) {
             Ok(result) => {
-                self.send_query_result(result).await?;
+                // Append the trailing `ReadyForQuery` to the same
+                // wire-buffer the query result writes so the whole
+                // response (CommandComplete / DataRow stream +
+                // ReadyForQuery) ships in one `write_all` + `flush`.
+                // Saves a per-statement syscall round-trip on the
+                // simple-query path; cumulative impact is visible on
+                // the cross_compare_sql bench shapes that issue one
+                // statement per wire roundtrip (UPDATE / DELETE /
+                // INSERT / mixed-oltp).
+                self.send_query_result_with_ready(result).await?;
             }
             Err(err) => {
                 if !err.is_query_scoped() {
                     return Err(err);
                 }
-                self.send_error(&err.to_string(), err.sqlstate()).await?;
+                self.send_error_with_ready(&err.to_string(), err.sqlstate()).await?;
             }
         }
-        self.send(&BackendMessage::ReadyForQuery {
+        Ok(())
+    }
+
+    /// Send the query result and the trailing `ReadyForQuery` in one
+    /// `write_all`. See `handle_query` for motivation.
+    async fn send_query_result_with_ready(
+        &mut self,
+        result: SelectResult,
+    ) -> Result<(), ServerError> {
+        let ready = BackendMessage::ReadyForQuery {
             status: self.txn_state.ready_for_query_status(),
-        })
-        .await?;
+        };
+        self.write_buf.clear();
+        if let Some(body) = result.streamed_body.as_ref() {
+            self.write_buf.extend_from_slice(body);
+        } else {
+            for msg in &result.messages {
+                encode_backend(msg, &mut self.write_buf);
+            }
+        }
+        encode_backend(&ready, &mut self.write_buf);
+        self.io.write_all(&self.write_buf).await?;
+        self.io.flush().await?;
+        Ok(())
+    }
+
+    /// Send an `ErrorResponse` immediately followed by `ReadyForQuery`
+    /// in one `write_all`.
+    async fn send_error_with_ready(
+        &mut self,
+        message: &str,
+        sqlstate: &str,
+    ) -> Result<(), ServerError> {
+        let err = BackendMessage::ErrorResponse {
+            fields: vec![
+                (b'S', "ERROR".to_string()),
+                (b'C', sqlstate.to_string()),
+                (b'M', message.to_string()),
+            ],
+        };
+        let ready = BackendMessage::ReadyForQuery {
+            status: self.txn_state.ready_for_query_status(),
+        };
+        self.write_buf.clear();
+        encode_backend(&err, &mut self.write_buf);
+        encode_backend(&ready, &mut self.write_buf);
+        self.io.write_all(&self.write_buf).await?;
+        self.io.flush().await?;
         Ok(())
     }
 
