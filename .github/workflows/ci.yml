@@ -60,11 +60,13 @@ jobs:
           - ubuntu-latest          # x86_64 Linux
           - ubuntu-24.04-arm       # ARM64 Linux
           - macos-14               # Apple Silicon
+          - windows-latest         # x86_64 Windows
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: ensure rustup cargo is first on PATH
+        shell: bash
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup default stable && cargo --version
       - run: cargo build --workspace --all-targets
