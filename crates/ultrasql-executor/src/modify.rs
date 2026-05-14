@@ -243,21 +243,37 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
                     self.affected = self.affected.saturating_add(n_u64);
                 }
-                ModifyKind::Insert | ModifyKind::Update { .. } => {
+                ModifyKind::Update { .. } => {
+                    // Bulk path: evaluate assignments for every row,
+                    // collect `(TupleId, new_payload_bytes)` pairs,
+                    // then hand the whole batch to
+                    // `heap.update_many`. Per-page pin + write-lock
+                    // are amortised across all updates on the page.
+                    let mut edits: Vec<(TupleId, Vec<u8>)> = Vec::with_capacity(rows.len());
+                    for row in &rows {
+                        let edit = self.compute_update_edit(row)?;
+                        edits.push(edit);
+                    }
+                    let n = edits.len();
+                    let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
+                    self.heap
+                        .update_many(
+                            edits,
+                            UpdateOptions {
+                                xid: self.delete_xmax,
+                                command_id: self.delete_cmax,
+                                hot_eligible: true,
+                                wal: wal_ref,
+                                vm: None,
+                            },
+                        )
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                    let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
+                    self.affected = self.affected.saturating_add(n_u64);
+                }
+                ModifyKind::Insert => {
                     for row in rows {
-                        match &self.kind {
-                            ModifyKind::Insert => {
-                                self.apply_insert(&row)?;
-                            }
-                            ModifyKind::Update { .. } => {
-                                // Cached evaluators avoid the per-row
-                                // `ScalarExpr::clone()` + `Eval::new`
-                                // allocator hit that the old path paid
-                                // on every tuple.
-                                self.apply_update(&row)?;
-                            }
-                            ModifyKind::Delete => unreachable!(),
-                        }
+                        self.apply_insert(&row)?;
                         self.affected += 1;
                     }
                 }
@@ -300,13 +316,18 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         Ok(())
     }
 
-    /// Apply a single UPDATE row.
+    /// Compute the `(old_tid, new_payload_bytes)` edit for a single
+    /// UPDATE input row.
     ///
-    /// The `row` slice must begin with `[tid_block: Int32, tid_slot: Int32,
-    /// original_col0, ...]`. We extract the TID from the first two columns,
-    /// apply the assignments to the remaining columns, encode the new tuple,
-    /// and call `heap.update`.
-    fn apply_update(&self, row: &[Value]) -> Result<(), ExecError> {
+    /// The `row` slice must begin with `[tid_block: Int32, tid_slot:
+    /// Int32, original_col0, ...]`. We extract the TID from the
+    /// first two columns, apply the cached evaluators to the
+    /// remaining columns to build the new row, and encode it through
+    /// the operator's precomputed [`RowCodec`] (with a
+    /// `fixed_width_lower_bound`-sized initial capacity so the first
+    /// push does not reallocate). The encoded payload is handed to
+    /// [`HeapAccess::update_many`] by the bulk caller.
+    fn compute_update_edit(&self, row: &[Value]) -> Result<(TupleId, Vec<u8>), ExecError> {
         let (tid, orig_row) = extract_tid_and_row(row, self.relation)?;
 
         // Build the new row from the original, applying assignments.
@@ -336,21 +357,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             .codec
             .encode(&new_row)
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-        let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
-        self.heap
-            .update(
-                tid,
-                &new_payload,
-                UpdateOptions {
-                    xid: self.delete_xmax,
-                    command_id: self.delete_cmax,
-                    hot_eligible: true,
-                    wal: wal_ref,
-                    vm: None,
-                },
-            )
-            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-        Ok(())
+        Ok((tid, new_payload))
     }
 }
 

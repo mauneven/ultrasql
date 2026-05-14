@@ -1083,6 +1083,147 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(outcome)
     }
 
+    /// Bulk-UPDATE the tuples in `edits`, grouped by page so each
+    /// affected page is pinned **at most once** for the HOT batch.
+    ///
+    /// `edits` is an iterator of `(old_tid, new_payload)` pairs.
+    /// `update_many` groups them by `old_tid.page` and attempts a
+    /// `try_hot_update` for every targeted slot under a single
+    /// [`PageGuard`] per page. Entries whose HOT path returns
+    /// `None` (the page lacks room for the new version) fall back
+    /// to the per-tuple non-HOT path via [`Self::update`].
+    ///
+    /// Semantics are equivalent to invoking [`Self::update`] N
+    /// times in order, except:
+    ///
+    /// - The per-page `BufferPool::get_page` (one `DashMap` shard
+    ///   probe + one atomic pin/unpin) is paid **once** rather than
+    ///   N times.
+    /// - The `try_hot_update` internal `guard.write()` is acquired
+    ///   uncontended for every entry on the page (the prior call
+    ///   has already released).
+    /// - WAL emission still happens once per row inside
+    ///   [`Self::emit_update_wal`]; when `opts.wal` is `None` (the
+    ///   bulk DML executor path on the `cross_compare_sql` bench)
+    ///   `emit_update_wal` is a no-op.
+    ///
+    /// Returns the count of successfully-updated tuples.
+    ///
+    /// # Errors
+    ///
+    /// Mirror [`Self::update`]: [`HeapError::BufferPool`] on pin
+    /// failure, [`HeapError::Page`] / [`HeapError::MalformedHeader`]
+    /// on slot decode failure, [`HeapError::WalPayload`] on encode
+    /// failure (encode happens before the page is mutated).
+    ///
+    /// # Concurrency
+    ///
+    /// At most one [`PageGuard`] is held at any instant for the HOT
+    /// batch on a given page. The guard is dropped before WAL I/O.
+    /// The non-HOT fallback re-enters [`Self::update`] for each
+    /// affected tuple — same locking discipline as the single-tuple
+    /// path.
+    pub fn update_many<I>(&self, edits: I, opts: UpdateOptions<'_>) -> Result<usize, HeapError>
+    where
+        I: IntoIterator<Item = (TupleId, Vec<u8>)>,
+    {
+        let mut by_page: ahash::AHashMap<PageId, Vec<(u16, Vec<u8>)>> = ahash::AHashMap::new();
+        for (tid, payload) in edits {
+            by_page
+                .entry(tid.page)
+                .or_default()
+                .push((tid.slot, payload));
+        }
+        if by_page.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total = 0_usize;
+        // HOT-failed entries fall back to the per-tuple `update`
+        // path. Collected after each page's batch so we don't try to
+        // re-enter `update` while still holding the page's `PageGuard`.
+        let mut fallback: Vec<(TupleId, Vec<u8>)> = Vec::new();
+
+        for (page_id, mut entries) in by_page {
+            // Sort by slot to walk the page slot-directory in
+            // ascending order — keeps page cache lines hot.
+            entries.sort_unstable_by_key(|(slot, _)| *slot);
+
+            if opts.hot_eligible {
+                // FPW once per page before any HOT mutation on this page.
+                if let Some(sink) = opts.wal {
+                    Self::maybe_emit_fpw(
+                        &self.pool,
+                        page_id,
+                        sink,
+                        &self.last_checkpoint_lsn,
+                        opts.xid,
+                    )?;
+                }
+
+                // Take ONE PageGuard for the page. Each
+                // `try_hot_update` acquires `guard.write()`
+                // internally — uncontended because the prior call
+                // released.
+                let mut hot_outcomes: Vec<(TupleId, TupleId)> = Vec::with_capacity(entries.len());
+                {
+                    let guard = self.pool.get_page(page_id)?;
+                    for (slot, payload) in &entries {
+                        let new_tuple_size = TUPLE_HEADER_SIZE
+                            .checked_add(payload.len())
+                            .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
+                        let old_tid = TupleId::new(page_id, *slot);
+                        match Self::try_hot_update(
+                            &guard,
+                            old_tid,
+                            payload,
+                            opts,
+                            0,
+                            new_tuple_size,
+                        )? {
+                            Some(new_tid) => hot_outcomes.push((old_tid, new_tid)),
+                            None => fallback.push((old_tid, payload.clone())),
+                        }
+                    }
+                    // guard drops here — pin released before WAL I/O
+                }
+
+                // Per-HOT-success: emit WAL, clear VM. When
+                // `opts.wal` is `None` this is a no-op (the bulk DML
+                // path on cross_compare_sql).
+                for (old_tid, new_tid) in hot_outcomes {
+                    let outcome = UpdateOutcome {
+                        old_tid,
+                        new_tid,
+                        hot: true,
+                    };
+                    Self::emit_update_wal(&self.pool, outcome, &opts, || self.fetch(new_tid))?;
+                    if let Some(vm) = opts.vm {
+                        vm.clear(new_tid.page.relation, new_tid.page.block);
+                    }
+                    total += 1;
+                }
+            } else {
+                // Caller disabled HOT for every entry — funnel them
+                // straight to the non-HOT fallback.
+                for (slot, payload) in entries {
+                    fallback.push((TupleId::new(page_id, slot), payload));
+                }
+            }
+        }
+
+        // Non-HOT fallback — re-enter the single-tuple `update`.
+        // This path is rare on append-style workloads where the new
+        // payload is the same width as the old (`val = val + 1`
+        // bench shape always HOT-succeeds).
+        for (old_tid, payload) in fallback {
+            self.update(old_tid, &payload, opts)?;
+            total += 1;
+        }
+
+        Ok(total)
+    }
+
     /// Sequential scan over `rel`'s pages. The first version starts at
     /// block 0 and walks to `block_count - 1`. Pages are pinned one at
     /// a time; the iterator owns no concurrent state.
