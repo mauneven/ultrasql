@@ -71,6 +71,13 @@ enum Workload {
     /// Matches the shape of
     /// `benchmarks/scripts/run_postgres_writes.sh::run_delete`.
     DeleteBulk,
+    /// Mixed OLTP pgbench-like — preload `--rows` (id INT, val INT)
+    /// tuples, then run a 1-second window of 50% point reads (SELECT
+    /// val WHERE id=?), 30% point updates (UPDATE SET val=val+1 WHERE
+    /// id=?), 20% inserts (INSERT VALUES (next_id, ?)). Reports
+    /// microseconds per operation (elapsed / op_count) — matches the
+    /// shape of `benchmarks/scripts/run_*_writes.sh::run_mixed`.
+    MixedOltp,
 }
 
 impl Workload {
@@ -83,6 +90,10 @@ impl Workload {
             Self::FilterSum => format!("filter_sum_{}_i64", k_or_raw(n_rows)),
             Self::UpdateBulk => format!("update_throughput_{}", k_or_raw(n_rows)),
             Self::DeleteBulk => format!("delete_throughput_{}", k_or_raw(n_rows)),
+            // The competitor scripts hard-code the id without a row-
+            // count suffix; matching ID keeps results-render's grouping
+            // happy.
+            Self::MixedOltp => "mixed_oltp_pgbench_like".to_string(),
         }
     }
 }
@@ -158,6 +169,7 @@ async fn main() -> Result<()> {
             Workload::FilterSum => run_filter_sum_iter(bound, args.rows, i).await?,
             Workload::UpdateBulk => run_update_iter(bound, args.rows, i).await?,
             Workload::DeleteBulk => run_delete_iter(bound, args.rows, i).await?,
+            Workload::MixedOltp => run_mixed_oltp_iter(bound, args.rows, i).await?,
         };
         if i >= args.warmup {
             iters_us.push(micros);
@@ -558,4 +570,115 @@ async fn run_delete_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result
     drop(client);
     conn_handle.abort();
     Ok(elapsed_us)
+}
+
+/// Mixed-OLTP pgbench-like 1-second-window workload.
+///
+/// Preloads `n_rows` of `(id INT, val INT)` outside the timed region
+/// (one persistent wire connection), then runs operations in a tight
+/// loop for `MIXED_WINDOW_SECS` real-time seconds: 50% point reads,
+/// 30% point updates, 20% inserts (monotonic `id` past the preload).
+/// Returns elapsed-microseconds / op_count to match the competitor
+/// scripts' `µs/op` shape (`benchmarks/scripts/run_*_writes.sh::run_mixed`).
+async fn run_mixed_oltp_iter(server: SocketAddr, n_rows: usize, ix: usize) -> Result<f64> {
+    use std::time::Duration;
+
+    /// Mirrors `benchmarks/scripts/run_*_writes.sh::run_mixed` window.
+    const MIXED_WINDOW_SECS: f64 = 1.0;
+
+    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .context("tokio-postgres connect to ultrasqld")?;
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("tokio-postgres connection error: {e}");
+        }
+    });
+
+    let table = format!("bench_mixed_{ix}");
+    client
+        .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, val INT)"))
+        .await
+        .with_context(|| format!("CREATE TABLE {table}"))?;
+    preload_chunked(&client, &table, n_rows).await?;
+
+    // Deterministic per-iteration seed so two iterations with the same
+    // `ix` produce identical op streams.
+    let seed = 0xBEEFu64.wrapping_add(u64::try_from(ix).unwrap_or(0));
+    let mut rng = SplitMix64::new(seed);
+    let n_rows_u64 = u64::try_from(n_rows).unwrap_or(u64::MAX);
+    let mut next_id = i64::try_from(n_rows).unwrap_or(i64::MAX);
+
+    let window = Duration::from_secs_f64(MIXED_WINDOW_SECS);
+    let started = Instant::now();
+    let mut count: u64 = 0;
+    while started.elapsed() < window {
+        let r = rng.next_unit_f64();
+        if r < 0.50 {
+            let row_id = i64::try_from(rng.next_u64() % n_rows_u64).unwrap_or(0);
+            let _ = client
+                .simple_query(&format!("SELECT val FROM {table} WHERE id = {row_id}"))
+                .await
+                .with_context(|| format!("SELECT WHERE id = ? on {table}"))?;
+        } else if r < 0.80 {
+            let row_id = i64::try_from(rng.next_u64() % n_rows_u64).unwrap_or(0);
+            let _ = client
+                .simple_query(&format!(
+                    "UPDATE {table} SET val = val + 1 WHERE id = {row_id}"
+                ))
+                .await
+                .with_context(|| format!("UPDATE WHERE id = ? on {table}"))?;
+        } else {
+            let new_val = rng.next_i32();
+            let _ = client
+                .simple_query(&format!(
+                    "INSERT INTO {table} (id, val) VALUES ({next_id}, {new_val})"
+                ))
+                .await
+                .with_context(|| format!("INSERT into {table}"))?;
+            next_id += 1;
+        }
+        count += 1;
+    }
+    let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+    let us_per_op = elapsed_us / count.max(1) as f64;
+
+    drop(client);
+    conn_handle.abort();
+    Ok(us_per_op)
+}
+
+/// Compact deterministic SplitMix64 PRNG. Same constants every
+/// engine's bench script uses to derive an op stream from the
+/// per-iteration seed; kept inline to avoid pulling `rand` into the
+/// bench crate dependency tree.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    const fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn next_unit_f64(&mut self) -> f64 {
+        // 53 high bits → [0, 1) uniform double, per the standard
+        // SplitMix64 → f64 mapping. Matches the SQLite/DuckDB Python
+        // baselines' `random.random()` distribution closely enough that
+        // the per-op mix matches across engines.
+        let bits = self.next_u64() >> 11;
+        let scale = 1.0_f64 / (1_u64 << 53) as f64;
+        bits as f64 * scale
+    }
+
+    fn next_i32(&mut self) -> i32 {
+        self.next_u64() as i32
+    }
 }
