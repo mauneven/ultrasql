@@ -645,36 +645,36 @@ fn merge_latest_results(
 ///   data for the id, those rows are used verbatim. Otherwise the table falls
 ///   back to the "not yet measured" notice.
 fn build_tables(
-    baseline: &HashMap<String, BaselineEntry>,
+    _baseline: &HashMap<String, BaselineEntry>,
     write_side: &HashMap<String, Vec<(String, f64)>>,
 ) -> HashMap<String, String> {
     let mut tables = HashMap::new();
 
     for static_table in STATIC_DEFAULTS {
-        // Build the row list, preferring baseline data where available.
+        // UltraSQL rows are deliberately filtered out at render time: the
+        // current bench drivers (`cross_compare`, `cross_compare_writes`)
+        // measure UltraSQL at the storage / vectorized-kernel level, while
+        // every competitor row is measured through that engine's full SQL
+        // surface. Publishing both side-by-side would imply parity that
+        // does not exist yet. The README rows return once the
+        // wire-protocol bench driver (`cross_compare_sql`, Wave 3) ships
+        // measurements through `psql`/libpq — see ROADMAP.md and
+        // BENCHMARKS.md for the methodology gate. `_baseline` is kept in
+        // the signature so the callsite still merges latest results into
+        // it (preserves the data path for the Wave 3 reactivation).
         let mut rows: Vec<(String, f64)> = if static_table.rows.is_empty() {
-            // Write-side benchmarks: use latest measured rows when available.
             write_side
                 .get(static_table.id)
                 .map_or_else(Vec::new, Clone::clone)
+                .into_iter()
+                .filter(|(engine, _)| !engine.contains("UltraSQL"))
+                .collect()
         } else {
             static_table
                 .rows
                 .iter()
-                .map(|r| {
-                    // For the UltraSQL row, try to pull from baseline.
-                    let us = if r.engine.contains("UltraSQL") {
-                        baseline
-                            .get(static_table.id)
-                            .filter(|e| e.p99_us > 0.0)
-                            .map_or(r.median_us, |e| e.p99_us)
-                    } else {
-                        // For competitor rows, the static defaults are the
-                        // authoritative user-supplied numbers. We keep them.
-                        r.median_us
-                    };
-                    (r.engine.to_string(), us)
-                })
+                .filter(|r| !r.engine.contains("UltraSQL"))
+                .map(|r| (r.engine.to_string(), r.median_us))
                 .collect()
         };
 
@@ -933,17 +933,17 @@ rest\n";
     // default_static_values_render_when_baseline_zero
     // -----------------------------------------------------------------------
 
-    /// When the baseline entry for a benchmark id has `p99_us = 0.0` (i.e. a
-    /// placeholder), the renderer must fall back to the static default values
-    /// so the README remains publishable.
+    /// Until the wire-protocol bench driver lands (Wave 3), UltraSQL rows
+    /// are filtered out of every rendered table — the static defaults
+    /// (kernel-only measurements) must not leak into the README even when
+    /// a baseline is populated. Competitor rows still appear unchanged.
     #[test]
-    fn default_static_values_render_when_baseline_zero() {
-        // Baseline with zeroed-out UltraSQL value.
+    fn ultrasql_row_filtered_out_of_rendered_read_tables() {
         let mut baseline: HashMap<String, BaselineEntry> = HashMap::new();
         baseline.insert(
             "select_sum_65k_i64".to_string(),
             BaselineEntry {
-                p99_us: 0.0,
+                p99_us: 4.70,
                 competitors: HashMap::new(),
             },
         );
@@ -953,10 +953,17 @@ rest\n";
             .get("select_sum_65k_i64")
             .expect("select_sum_65k_i64 must be in tables");
 
-        // Static default for UltraSQL is 4.70 µs.
         assert!(
-            table.contains("4.70 µs"),
-            "static default 4.70 µs should appear when baseline is zero: {table}"
+            !table.contains("UltraSQL"),
+            "UltraSQL row must be filtered (kernel-only until Wave 3): {table}"
+        );
+        assert!(
+            !table.contains("4.70 µs"),
+            "kernel-only UltraSQL value must not leak: {table}"
+        );
+        assert!(
+            table.contains("DuckDB"),
+            "competitor rows must still render: {table}"
         );
     }
 
@@ -1021,33 +1028,22 @@ rest\n";
     // filter_sum_10m_static_default_renders
     // -----------------------------------------------------------------------
 
-    /// When the baselines JSON has 0.0 for `filter_sum_10m_i64`, the static
-    /// default's 2.20 ms must still appear in the rendered table so the README
-    /// remains publishable before a fresh baseline run lands.
+    /// Competitor rows on `filter_sum_10m_i64` must still render even
+    /// though the UltraSQL row is filtered: the README needs to show the
+    /// shape of the comparison and the bar UltraSQL is targeting until
+    /// Wave 3 measurements land.
     #[test]
-    fn filter_sum_10m_static_default_renders() {
-        // Baseline with zeroed-out UltraSQL value — simulates a newly-added
-        // entry that has not yet been measured by the gate runner.
-        let mut baseline: HashMap<String, BaselineEntry> = HashMap::new();
-        baseline.insert(
-            "filter_sum_10m_i64".to_string(),
-            BaselineEntry {
-                p99_us: 0.0,
-                competitors: HashMap::new(),
-            },
-        );
-
+    fn filter_sum_10m_renders_competitor_rows_only() {
+        let baseline: HashMap<String, BaselineEntry> = HashMap::new();
         let tables = build_tables(&baseline, &HashMap::new());
         let table = tables
             .get("filter_sum_10m_i64")
             .expect("filter_sum_10m_i64 must be present in tables");
 
-        // Static default for UltraSQL is 2.20 ms (2 200 µs).
         assert!(
-            table.contains("2.20 ms"),
-            "static default 2.20 ms should appear when baseline is zero: {table}"
+            !table.contains("UltraSQL"),
+            "UltraSQL kernel row must be filtered: {table}"
         );
-        // Competitor rows must also be present.
         assert!(
             table.contains("ClickHouse"),
             "ClickHouse row must be present: {table}"
