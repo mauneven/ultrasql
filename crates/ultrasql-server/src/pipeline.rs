@@ -33,14 +33,23 @@
 //! point is `lower_plan` and its `SampleTables` parameter.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use ultrasql_core::{DataType, Field, Schema, Value};
+use ultrasql_catalog::{CatalogSnapshot, TableEntry};
+use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
 use ultrasql_executor::physical::{BuildError, DataSource};
-use ultrasql_executor::{FilterEqI32, Limit, MemTableScan, Operator, Project};
+use ultrasql_executor::{
+    Filter, FilterEqI32, Limit, MemTableScan, ModifyKind, ModifyTable, Operator, Project, RowCodec,
+    SeqScan, ValuesScan,
+};
+use ultrasql_mvcc::Snapshot;
 use ultrasql_planner::{BinaryOp, InMemoryCatalog, LogicalPlan, ScalarExpr, TableMeta};
+use ultrasql_storage::heap::HeapAccess;
+use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 
+use crate::BlankPageLoader;
 use crate::error::ServerError;
 
 /// Maximum LIMIT a v0.5 query may request. `Limit::new` takes a
@@ -361,6 +370,233 @@ pub fn build_sample_database(catalog: &mut InMemoryCatalog) -> SampleTables {
 
     tables.register(catalog, "users", schema, vec![batch]);
     tables
+}
+
+// ---------------------------------------------------------------------------
+// Real-heap-aware lowering
+// ---------------------------------------------------------------------------
+
+/// Context the catalog-aware lowerer needs to build operators that read
+/// from / write to the runtime heap.
+///
+/// Distinct from the legacy [`lower_plan`] (which only knows about
+/// [`SampleTables`]) because real `SELECT` and `INSERT` operators
+/// require:
+///
+/// - the resolved [`CatalogSnapshot`] to look up the target relation's
+///   OID and column schema,
+/// - a shared [`HeapAccess`] handle so the operator can read pages
+///   and write tuples,
+/// - an MVCC [`Snapshot`] plus a [`TransactionManager`] handle (as the
+///   `XidStatusOracle`) so visibility filtering is honest,
+/// - the XID and command id of the autocommit transaction this
+///   statement executes inside.
+///
+/// The struct is built per-statement in `Session::execute_query`.
+#[derive(Debug)]
+pub struct LowerCtx<'a> {
+    /// Legacy sample-table registry; used when the catalog snapshot has
+    /// no entry for a referenced table.
+    pub tables: &'a SampleTables,
+    /// Per-statement immutable catalog snapshot.
+    pub catalog_snapshot: Arc<CatalogSnapshot>,
+    /// Shared heap access handle.
+    pub heap: Arc<HeapAccess<BlankPageLoader>>,
+    /// MVCC snapshot taken at statement start.
+    pub snapshot: Snapshot,
+    /// Transaction manager (also serves as `XidStatusOracle` for
+    /// `SeqScan`'s visibility check).
+    pub oracle: Arc<TransactionManager>,
+    /// XID of the autocommit transaction.
+    pub xid: Xid,
+    /// Command id within `xid` for the current statement.
+    pub command_id: CommandId,
+}
+
+/// Lower a logical plan with full real-heap awareness.
+///
+/// Differences from [`lower_plan`]:
+///
+/// - A `Scan` whose table name resolves in `ctx.catalog_snapshot` is
+///   lowered to a [`SeqScan`] over real heap pages. A `Scan` whose
+///   name only resolves in the legacy [`SampleTables`] registry falls
+///   back to the v0.5 [`MemTableScan`] path.
+/// - `Insert` is lowered to a [`ModifyTable`] over real heap, with the
+///   autocommit transaction's XID/command-id stamped on every inserted
+///   tuple. `INSERT INTO t VALUES (...)` is the only source shape
+///   accepted in this phase; `INSERT INTO t SELECT ...` returns
+///   [`ServerError::Unsupported`].
+/// - `Values` is lowered to a [`ValuesScan`].
+/// - `Filter` uses the general [`Filter`] operator (Eval-backed)
+///   instead of the type-fussy [`FilterEqI32`] specialized path.
+/// - `Project` accepts only bare column references (same restriction
+///   as [`lower_plan`]); computed projections land with the general
+///   expression evaluator follow-up.
+/// - Everything else is rejected — JOIN, GROUP BY, set ops, CTEs land
+///   in subsequent waves.
+pub fn lower_query(
+    plan: &LogicalPlan,
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    match plan {
+        LogicalPlan::Scan { table, .. } => lower_catalog_or_sample_scan(table, ctx),
+        LogicalPlan::Insert {
+            table,
+            columns,
+            source,
+            on_conflict,
+            returning,
+            ..
+        } => lower_real_insert(table, columns, source, on_conflict.as_ref(), returning, ctx),
+        LogicalPlan::Values { rows, schema } => {
+            Ok(Box::new(ValuesScan::new(rows.clone(), schema.clone())))
+        }
+        LogicalPlan::Project { input, exprs, .. } => {
+            let child = lower_query(input, ctx)?;
+            lower_project_columns(child, exprs)
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            let child = lower_query(input, ctx)?;
+            Ok(Box::new(Filter::new(child, predicate.clone())))
+        }
+        LogicalPlan::Limit { input, n, offset } => {
+            if *offset != 0 {
+                return Err(ServerError::Unsupported("LIMIT with OFFSET"));
+            }
+            if *n > MAX_LIMIT {
+                return Err(ServerError::Unsupported("LIMIT exceeds server cap"));
+            }
+            let child = lower_query(input, ctx)?;
+            let n = usize::try_from(*n).unwrap_or(usize::MAX);
+            Ok(Box::new(Limit::new(child, n)))
+        }
+        LogicalPlan::Empty { .. } => Err(ServerError::Unsupported("SELECT without FROM")),
+        LogicalPlan::Sort { .. } => Err(ServerError::Unsupported("ORDER BY")),
+        LogicalPlan::Update { .. } => Err(ServerError::Unsupported("UPDATE")),
+        LogicalPlan::Delete { .. } => Err(ServerError::Unsupported("DELETE")),
+        LogicalPlan::Truncate { .. } => Err(ServerError::Unsupported("TRUNCATE")),
+        LogicalPlan::CreateTable { .. } => Err(ServerError::Unsupported(
+            "CREATE TABLE reached operator lowerer; expected DDL dispatch path",
+        )),
+        LogicalPlan::Join { .. } => Err(ServerError::Unsupported("JOIN")),
+        LogicalPlan::Aggregate { .. } => Err(ServerError::Unsupported("GROUP BY / aggregate")),
+        LogicalPlan::SetOp { .. } => Err(ServerError::Unsupported("UNION / INTERSECT / EXCEPT")),
+        LogicalPlan::Cte { .. } => Err(ServerError::Unsupported("WITH (CTE)")),
+    }
+}
+
+/// Lower a `Scan` node by trying the persistent catalog first; if the
+/// name is not registered there, falls back to the v0.5
+/// sample-table registry.
+fn lower_catalog_or_sample_scan(
+    table: &str,
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    let folded = table.to_ascii_lowercase();
+    if let Some(entry) = ctx.catalog_snapshot.tables.get(&folded) {
+        return Ok(lower_heap_scan(entry, ctx));
+    }
+    // Legacy path: sample tables.
+    let sample = ctx.tables.lookup(table).ok_or_else(|| {
+        ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+            table.to_string(),
+        ))
+    })?;
+    Ok(Box::new(MemTableScan::new(
+        sample.schema.clone(),
+        sample.batches.clone(),
+    )))
+}
+
+/// Construct a [`SeqScan`] for a real persistent relation.
+fn lower_heap_scan(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Box<dyn Operator> {
+    let rel = RelationId(entry.oid);
+    // The catalog's `n_blocks` stat is an estimate; the heap's
+    // counter is the truth. Take the larger of the two so a freshly
+    // created table (entry.n_blocks = 0) still scans the blocks that
+    // the heap has actually allocated through `insert`.
+    let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
+    let codec = RowCodec::new(entry.schema.clone());
+    let scan = SeqScan::new(
+        Arc::clone(&ctx.heap),
+        rel,
+        block_count,
+        ctx.snapshot.clone(),
+        Arc::clone(&ctx.oracle),
+        codec,
+    );
+    Box::new(scan)
+}
+
+/// Lower an `INSERT INTO t VALUES (...)` into a [`ModifyTable`]
+/// over the real heap.
+fn lower_real_insert(
+    table: &str,
+    columns: &[usize],
+    source: &LogicalPlan,
+    on_conflict: Option<&ultrasql_planner::LogicalOnConflict>,
+    returning: &[(ScalarExpr, String)],
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    if on_conflict.is_some() {
+        return Err(ServerError::Unsupported("INSERT ... ON CONFLICT"));
+    }
+    if !returning.is_empty() {
+        return Err(ServerError::Unsupported("INSERT ... RETURNING"));
+    }
+    let entry = ctx
+        .catalog_snapshot
+        .tables
+        .get(&table.to_ascii_lowercase())
+        .ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table.to_string(),
+            ))
+        })?;
+    if !columns.is_empty() && columns.len() != entry.schema.len() {
+        return Err(ServerError::Unsupported(
+            "INSERT with column list narrower than table; v0.5 requires every column",
+        ));
+    }
+    let LogicalPlan::Values { rows, schema } = source else {
+        return Err(ServerError::Unsupported(
+            "INSERT source other than VALUES (e.g. INSERT INTO t SELECT)",
+        ));
+    };
+    let child: Box<dyn Operator> = Box::new(ValuesScan::new(rows.clone(), schema.clone()));
+    let rel = RelationId(entry.oid);
+    let modify = ModifyTable::new(
+        Arc::clone(&ctx.heap),
+        rel,
+        entry.schema.clone(),
+        ModifyKind::Insert,
+        ctx.xid,
+        ctx.command_id,
+        Xid::new(0),
+        CommandId::FIRST,
+        None,
+        child,
+    );
+    Ok(Box::new(modify))
+}
+
+/// Lower a `Project` whose expressions are pure column references.
+fn lower_project_columns(
+    child: Box<dyn Operator>,
+    exprs: &[(ScalarExpr, String)],
+) -> Result<Box<dyn Operator>, ServerError> {
+    let mut indices: Vec<usize> = Vec::with_capacity(exprs.len());
+    for (expr, _name) in exprs {
+        match expr {
+            ScalarExpr::Column { index, .. } => indices.push(*index),
+            _ => {
+                return Err(ServerError::Unsupported(
+                    "SELECT expression; v0.5 only supports bare column references",
+                ));
+            }
+        }
+    }
+    Ok(Box::new(Project::new(child, indices)?))
 }
 
 #[cfg(test)]

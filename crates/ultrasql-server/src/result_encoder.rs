@@ -74,6 +74,44 @@ pub fn run_ddl_command(tag: &str) -> SelectResult {
     }
 }
 
+/// Drive a `ModifyTable` operator to completion and emit the
+/// PostgreSQL-compatible row-count `CommandComplete` tag.
+///
+/// `command` is one of `"INSERT"`, `"UPDATE"`, `"DELETE"`. `INSERT`
+/// uses the legacy `INSERT 0 N` shape (the `0` is the historical OID
+/// slot for the inserted row); the others use `UPDATE N` / `DELETE N`.
+///
+/// The operator's output schema is the single-column
+/// `affected_rows: Int64` produced by [`ModifyTable`]; this function
+/// reads that column and folds it into the row-count.
+pub fn run_modify_command(
+    op: &mut dyn Operator,
+    command: &str,
+) -> Result<SelectResult, ServerError> {
+    let mut affected: i64 = 0;
+    while let Some(batch) = op.next_batch()? {
+        if batch.rows() == 0 {
+            continue;
+        }
+        if let Some(Column::Int64(c)) = batch.columns().first() {
+            let data = c.data();
+            if !data.is_empty() {
+                affected = affected.saturating_add(data[0]);
+            }
+        }
+    }
+    let tag = if command.eq_ignore_ascii_case("INSERT") {
+        format!("INSERT 0 {affected}")
+    } else {
+        format!("{} {affected}", command.to_uppercase())
+    };
+    let rows = u64::try_from(affected.max(0)).unwrap_or(0);
+    Ok(SelectResult {
+        messages: vec![BackendMessage::CommandComplete { tag }],
+        rows,
+    })
+}
+
 /// Drive `op` to completion and produce the corresponding wire
 /// messages.
 ///

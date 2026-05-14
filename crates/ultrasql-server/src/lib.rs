@@ -53,13 +53,33 @@ use ultrasql_core::PageId;
 use ultrasql_parser::Parser;
 use ultrasql_planner::{Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan, TableMeta, bind};
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
-use ultrasql_storage::buffer_pool::BufferPool;
+use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::page::Page;
+use ultrasql_txn::{IsolationLevel, TransactionManager};
 
 pub use error::ServerError;
-pub use pipeline::{SampleTables, build_sample_database};
-pub use result_encoder::{SelectResult, run_ddl_command, run_select};
+pub use pipeline::{LowerCtx, SampleTables, build_sample_database};
+pub use result_encoder::{SelectResult, run_ddl_command, run_modify_command, run_select};
+
+/// In-memory `PageLoader` used by the development server.
+///
+/// Always returns a freshly-initialized heap page. Suitable for tests,
+/// in-process benchmarks, and the v0.5 reference runtime where there is
+/// no on-disk segment file yet. Production builds (`Server::init`)
+/// swap this for a segment-backed loader.
+///
+/// `BufferPool` and `HeapAccess` are generic over `PageLoader`; making
+/// the type concrete here lets us name the heap (`Arc<HeapAccess<BlankPageLoader>>`)
+/// on `Server` and on the per-statement lowering context.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlankPageLoader;
+
+impl PageLoader for BlankPageLoader {
+    fn load(&self, _page_id: PageId) -> ultrasql_core::Result<Page> {
+        Ok(Page::new_heap())
+    }
+}
 
 /// Read-only catalog view consulted by the binder during query
 /// execution.
@@ -133,6 +153,15 @@ pub struct Server {
     /// Bootstrapped at startup; refreshed after DDL.  Per-statement
     /// snapshot acquisition is wait-free via `ArcSwap::load_full`.
     pub persistent_catalog: Arc<PersistentCatalog>,
+    /// Heap access method for user-created tables. Shares one
+    /// in-process buffer pool across all connection sessions so a
+    /// row inserted on one session is visible to the next snapshot
+    /// on another session.
+    pub heap: Arc<HeapAccess<BlankPageLoader>>,
+    /// Transaction manager. Owns the XID allocator, the CLOG, and the
+    /// lock manager; every Simple Query in v0.5 runs as an autocommit
+    /// transaction allocated from this manager.
+    pub txn_manager: Arc<TransactionManager>,
 }
 
 impl Server {
@@ -147,12 +176,11 @@ impl Server {
         let tables = build_sample_database(&mut catalog);
 
         let persistent_catalog = Arc::new(PersistentCatalog::new());
-        // Bootstrap from an in-memory heap backed by blank pages.
-        let pool = Arc::new(BufferPool::new(IN_MEMORY_POOL_FRAMES, |_: PageId| {
-            Ok(Page::new_heap())
-        }));
-        let heap = HeapAccess::new(pool);
-        match persistent_catalog.bootstrap_from_heap(&heap) {
+        // One in-memory buffer pool for both catalog bootstrap and
+        // user-table DML so every connection observes the same heap.
+        let pool = Arc::new(BufferPool::new(IN_MEMORY_POOL_FRAMES, BlankPageLoader));
+        let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
+        match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
             Ok(stats) => {
                 tracing::info!(?stats, "persistent catalog bootstrapped");
             }
@@ -165,10 +193,14 @@ impl Server {
             }
         }
 
+        let txn_manager = Arc::new(TransactionManager::new());
+
         Self {
             catalog,
             tables,
             persistent_catalog,
+            heap,
+            txn_manager,
         }
     }
 
@@ -493,8 +525,48 @@ where
             return self.execute_create_table(&plan, &catalog_snapshot);
         }
 
-        let mut op = pipeline::lower_plan(&plan, &self.state.tables)?;
-        run_select(op.as_mut())
+        // Allocate an autocommit transaction. The XID becomes the `xmin`
+        // of every tuple inserted by this statement and the snapshot
+        // governs visibility for any SELECT.
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let ctx = LowerCtx {
+            tables: &self.state.tables,
+            catalog_snapshot: Arc::clone(&catalog_snapshot),
+            heap: Arc::clone(&self.state.heap),
+            snapshot: txn.snapshot.clone(),
+            oracle: Arc::clone(&self.state.txn_manager),
+            xid: txn.xid,
+            command_id: ultrasql_core::CommandId::FIRST,
+        };
+
+        let result = match &plan {
+            LogicalPlan::Insert { .. } => {
+                let mut op = pipeline::lower_query(&plan, &ctx)?;
+                run_modify_command(op.as_mut(), "INSERT")
+            }
+            LogicalPlan::Update { .. } => {
+                let mut op = pipeline::lower_query(&plan, &ctx)?;
+                run_modify_command(op.as_mut(), "UPDATE")
+            }
+            LogicalPlan::Delete { .. } => {
+                let mut op = pipeline::lower_query(&plan, &ctx)?;
+                run_modify_command(op.as_mut(), "DELETE")
+            }
+            _ => {
+                let mut op = pipeline::lower_query(&plan, &ctx)?;
+                run_select(op.as_mut())
+            }
+        };
+
+        // Commit the autocommit transaction so the XID's tuples become
+        // visible to subsequent snapshots. On failure (today: never
+        // under READ COMMITTED with no SSI conflicts) we still return
+        // the query result — the txn is the implementation detail.
+        if let Err(e) = self.state.txn_manager.commit(txn) {
+            tracing::warn!(error = %e, "autocommit failed to finalise");
+        }
+
+        result
     }
 
     /// Persist a `CREATE TABLE` into the catalog.
@@ -1002,6 +1074,100 @@ mod tests {
             !accounts.schema.fields()[0].nullable,
             "NOT NULL constraint applied"
         );
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    #[tokio::test]
+    async fn create_insert_select_round_trip_through_wire() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        // CREATE TABLE — Int32 columns so the literal `1` / `100`
+        // (default Int32 in the binder) types-match without casts.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE items (id INT NOT NULL, val INT)".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert!(matches!(
+            msgs.last().unwrap(),
+            BackendMessage::ReadyForQuery { status: b'I' }
+        ));
+
+        // INSERT three rows
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "INSERT INTO items VALUES (1, 100), (2, 200), (3, 300)".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let tag = msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            tag.as_deref(),
+            Some("INSERT 0 3"),
+            "INSERT must report 3 rows: {msgs:?}"
+        );
+        // INSERT must not emit a RowDescription.
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::RowDescription { .. })),
+            "INSERT must not emit RowDescription"
+        );
+
+        // SELECT * — runs SeqScan over the real heap.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id, val FROM items".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let rows: Vec<_> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(columns.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 3, "expected 3 rows, got {msgs:?}");
+        let select_tag = msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        });
+        assert_eq!(select_tag.as_deref(), Some("SELECT 3"));
+
+        // Sanity-check the row contents (text encoding).
+        let mut decoded: Vec<(i32, i32)> = rows
+            .iter()
+            .map(|cols| {
+                let id = std::str::from_utf8(cols[0].as_ref().unwrap())
+                    .unwrap()
+                    .parse::<i32>()
+                    .unwrap();
+                let val = std::str::from_utf8(cols[1].as_ref().unwrap())
+                    .unwrap()
+                    .parse::<i32>()
+                    .unwrap();
+                (id, val)
+            })
+            .collect();
+        decoded.sort_unstable();
+        assert_eq!(decoded, vec![(1, 100), (2, 200), (3, 300)]);
 
         send_frontend(&mut client, &FrontendMessage::Terminate).await;
         drop(client);
