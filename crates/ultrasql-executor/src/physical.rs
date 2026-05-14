@@ -8,7 +8,7 @@
 //! - `Scan` → [`MemTableScan`] + optional [`Project`].
 //! - `Filter` → [`Filter`].
 //! - `Project` (column-only) → [`Project`].
-//! - `Limit` (offset == 0) → [`Limit`].
+//! - `Limit` → [`Limit::with_offset`] (`LIMIT n` and `LIMIT n OFFSET m`).
 //! - `Sort` → [`Sort`].
 //! - `Aggregate` → [`HashAggregate`] (default) or `SortAggregate`
 //!   when the hint field is set to `SortBased`.
@@ -145,14 +145,17 @@ pub fn build_operator(
         }
 
         LogicalPlan::Limit { input, n, offset } => {
-            if *offset != 0 {
-                return Err(BuildError::Unsupported("OFFSET not supported in v0.5"));
-            }
             let child = build_operator(input, data_source)?;
-            let capped = usize::try_from(*n).map_err(|_| {
-                BuildError::Type(format!("LIMIT value {n} exceeds platform pointer width"))
-            })?;
-            Ok(Box::new(Limit::new(child, capped)))
+            // Saturate both `n` and `offset` into `usize`. The binder
+            // legitimately produces `u64::MAX` for `LIMIT NULL OFFSET m`
+            // (i.e. "no upper bound"), and the executor's `Limit`
+            // treats `usize::MAX` as that same sentinel. On 32-bit
+            // targets a literal `LIMIT 5_000_000_000` saturates to
+            // "all rows," which is the only sane outcome — we have no
+            // batch big enough to hit the cap regardless.
+            let limit = usize::try_from(*n).unwrap_or(usize::MAX);
+            let offset = usize::try_from(*offset).unwrap_or(usize::MAX);
+            Ok(Box::new(Limit::with_offset(child, limit, offset)))
         }
 
         LogicalPlan::Sort { input, keys } => {
@@ -900,15 +903,44 @@ mod tests {
     }
 
     #[test]
-    fn limit_with_offset_is_unsupported() {
+    fn limit_with_offset_skips_then_takes() {
+        // `users` fixture (StaticSource::with_users) is 6 rows split as
+        // 3+3. OFFSET 1 LIMIT 2 should skip the first row and emit the
+        // next two, confirming the builder lowers offset through to
+        // the executor.
         let src = StaticSource::with_users();
         let plan = LogicalPlan::Limit {
             input: Box::new(scan_plan()),
             n: 2,
             offset: 1,
         };
-        let err = build_operator(&plan, &src).expect_err("OFFSET must reject");
-        assert!(matches!(err, BuildError::Unsupported(_)), "got {err:?}");
+        let mut op = build_operator(&plan, &src).expect("OFFSET builds");
+        let mut count = 0usize;
+        while let Some(b) = op.next_batch().expect("offset must not error") {
+            count += b.rows();
+        }
+        assert_eq!(count, 2, "limit 2 offset 1 emits 2 rows");
+    }
+
+    #[test]
+    fn limit_null_with_offset_only_emits_tail() {
+        // OFFSET with no LIMIT is encoded by the binder as `n = u64::MAX`.
+        // Confirm the builder saturates and emits every row past the
+        // skip window without erroring on the "huge LIMIT" value.
+        let src = StaticSource::with_users();
+        let plan = LogicalPlan::Limit {
+            input: Box::new(scan_plan()),
+            n: u64::MAX,
+            offset: 3,
+        };
+        let mut op = build_operator(&plan, &src).expect("OFFSET-only builds");
+        let mut count = 0usize;
+        while let Some(b) = op.next_batch().expect("offset must not error") {
+            count += b.rows();
+        }
+        // `with_users` is 6 rows total (2 batches of 3); 6 - 3 = 3 rows
+        // past the skip window.
+        assert_eq!(count, 3, "offset 3 with no limit emits 3 rows");
     }
 
     #[test]

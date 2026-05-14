@@ -13,7 +13,8 @@
 //!   [`FilterEqI32`].
 //! - [`LogicalPlan::Project`] over pure column references ->
 //!   [`Project`].
-//! - [`LogicalPlan::Limit`] (without offset) -> [`Limit`].
+//! - [`LogicalPlan::Limit`] -> [`Limit`] (`LIMIT n OFFSET m`,
+//!   `OFFSET m` with no `LIMIT`, and the common `LIMIT n OFFSET 0`).
 //! - [`LogicalPlan::Sort`] -> [`Sort`] (in-memory; spill-to-disk lands
 //!   with the `work_mem` budget in v0.6).
 //! - [`LogicalPlan::SetOp`] -> [`SetOp`] for `UNION`, `INTERSECT`, and
@@ -73,9 +74,22 @@ use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 use crate::BlankPageLoader;
 use crate::error::ServerError;
 
-/// Maximum LIMIT a v0.5 query may request. `Limit::new` takes a
-/// `usize`, so we clamp `u64` plan values to a generous ceiling.
-const MAX_LIMIT: u64 = 1 << 32;
+/// Saturate a `u64` row count from the binder into the executor's
+/// `usize` row-count space.
+///
+/// `Limit::with_offset` accepts `usize` for both the row cap and the
+/// row-skip count. On 64-bit targets `usize == u64`, so the conversion
+/// never truncates. On 32-bit targets a plan value larger than
+/// `usize::MAX` saturates to "no further rows" — the operator handles
+/// `usize::MAX` as the "no limit" sentinel, matching how the binder
+/// already represents `OFFSET m` with no `LIMIT` clause. Saturation is
+/// safer than rejecting the statement: the binder may legitimately
+/// produce `u64::MAX` for the `LIMIT NULL` case, and a 32-bit user
+/// asking for a literal `LIMIT 5_000_000_000` is asking for "all rows"
+/// in practice.
+fn saturate_row_count(n: u64) -> usize {
+    usize::try_from(n).unwrap_or(usize::MAX)
+}
 
 /// Per-table fixture: schema plus pre-built batches.
 #[derive(Clone, Debug)]
@@ -402,17 +416,10 @@ fn lower_limit(
     offset: u64,
     tables: &SampleTables,
 ) -> Result<Box<dyn Operator>, ServerError> {
-    if offset != 0 {
-        return Err(ServerError::Unsupported("LIMIT with OFFSET"));
-    }
-    if n > MAX_LIMIT {
-        return Err(ServerError::Unsupported("LIMIT exceeds server cap"));
-    }
     let child = lower_plan(input, tables)?;
-    // Clamp into usize. We just verified `n <= MAX_LIMIT < usize::MAX`
-    // on any 64-bit target, so this conversion never truncates.
-    let n = usize::try_from(n).unwrap_or(usize::MAX);
-    Ok(Box::new(Limit::new(child, n)))
+    let limit = saturate_row_count(n);
+    let offset = saturate_row_count(offset);
+    Ok(Box::new(Limit::with_offset(child, limit, offset)))
 }
 
 /// Build the canonical `users(id INT, name TEXT, score DOUBLE)` sample
@@ -607,15 +614,10 @@ pub fn lower_query(
             Ok(Box::new(Filter::new(child, predicate.clone())))
         }
         LogicalPlan::Limit { input, n, offset } => {
-            if *offset != 0 {
-                return Err(ServerError::Unsupported("LIMIT with OFFSET"));
-            }
-            if *n > MAX_LIMIT {
-                return Err(ServerError::Unsupported("LIMIT exceeds server cap"));
-            }
             let child = lower_query(input, ctx)?;
-            let n = usize::try_from(*n).unwrap_or(usize::MAX);
-            Ok(Box::new(Limit::new(child, n)))
+            let limit = saturate_row_count(*n);
+            let offset = saturate_row_count(*offset);
+            Ok(Box::new(Limit::with_offset(child, limit, offset)))
         }
         LogicalPlan::Empty { .. } => Err(ServerError::Unsupported("SELECT without FROM")),
         LogicalPlan::Sort { input, keys } => {
@@ -656,8 +658,8 @@ pub fn lower_query(
             returning,
             ..
         } => lower_real_delete(table, input, returning, ctx),
-        LogicalPlan::Truncate { .. } => Err(ServerError::Unsupported("TRUNCATE")),
-        LogicalPlan::CreateTable { .. }
+        LogicalPlan::Truncate { .. }
+        | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. } => Err(ServerError::Unsupported(
@@ -1973,6 +1975,53 @@ mod tests {
         let mut op = lower_plan(&p, &tables).expect("lowers");
         let batch = op.next_batch().unwrap().expect("first batch");
         assert_eq!(batch.rows(), 1);
+    }
+
+    /// `LIMIT 1 OFFSET 1` over the 3-row sample skips the first row and
+    /// emits the second. Confirms the sample-path lowerer threads
+    /// `offset` through to the executor's `Limit::with_offset`.
+    #[test]
+    fn lowers_limit_with_offset() {
+        let (catalog, tables) = fixture();
+        let p = plan("SELECT id FROM users LIMIT 1 OFFSET 1", &catalog);
+        let mut op = lower_plan(&p, &tables).expect("lowers");
+        let mut ids: Vec<i32> = Vec::new();
+        while let Some(batch) = op.next_batch().expect("ok") {
+            if let ultrasql_vec::column::Column::Int32(col) = &batch.columns()[0] {
+                ids.extend_from_slice(col.data());
+            }
+        }
+        // Sample has ids [1,2,3]; LIMIT 1 OFFSET 1 yields the middle id.
+        assert_eq!(ids, vec![2]);
+    }
+
+    /// `OFFSET 2` with no `LIMIT` emits every row past the skip. The
+    /// binder lowers this as `Limit { n: u64::MAX, offset: 2 }`; the
+    /// pipeline saturates `u64::MAX` into the executor's
+    /// "no limit" sentinel.
+    #[test]
+    fn lowers_offset_only_without_limit() {
+        let (catalog, tables) = fixture();
+        let p = plan("SELECT id FROM users OFFSET 2", &catalog);
+        let mut op = lower_plan(&p, &tables).expect("lowers");
+        let mut ids: Vec<i32> = Vec::new();
+        while let Some(batch) = op.next_batch().expect("ok") {
+            if let ultrasql_vec::column::Column::Int32(col) = &batch.columns()[0] {
+                ids.extend_from_slice(col.data());
+            }
+        }
+        // Sample has 3 rows; OFFSET 2 → 1 row remaining (id=3).
+        assert_eq!(ids, vec![3]);
+    }
+
+    /// `LIMIT 0 OFFSET m` returns zero rows.
+    #[test]
+    fn lowers_zero_limit_with_offset() {
+        let (catalog, tables) = fixture();
+        let p = plan("SELECT id FROM users LIMIT 0 OFFSET 1", &catalog);
+        let mut op = lower_plan(&p, &tables).expect("lowers");
+        let first = op.next_batch().expect("ok");
+        assert!(first.is_none(), "LIMIT 0 must emit nothing");
     }
 
     #[test]

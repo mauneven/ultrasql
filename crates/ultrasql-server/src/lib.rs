@@ -64,7 +64,7 @@ use ultrasql_planner::{
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::{HeapAccess, UpdateOptions};
+use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, TransactionManager};
 
@@ -594,6 +594,9 @@ where
             LogicalPlan::AlterTable { .. } => {
                 return self.execute_alter_table(&plan, &catalog_snapshot);
             }
+            LogicalPlan::Truncate { .. } => {
+                return self.execute_truncate(&plan, &catalog_snapshot);
+            }
             _ => {}
         }
 
@@ -1030,6 +1033,137 @@ where
                     tracing::warn!(
                         error = %abort_err,
                         "autocommit (ALTER TABLE rollback) failed to abort"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Empty every relation named in the `TRUNCATE` statement.
+    ///
+    /// PostgreSQL's `TRUNCATE` takes `ACCESS EXCLUSIVE` and reclaims the
+    /// relfilenode in a single fast-path: drop the segment files, then
+    /// allocate a fresh empty heap on commit. UltraSQL's v0.5 in-memory
+    /// runtime has no segment manager wired into the server's
+    /// `BufferPool<BlankPageLoader>`, so the fast-path "swap the
+    /// relfilenode" hook does not yet exist on this path. Instead, we
+    /// open an autocommit MVCC transaction and stamp `xmax` on every
+    /// row visible to the txn's own snapshot by calling
+    /// [`HeapAccess::delete`] for each visible TID.
+    ///
+    /// Correctness notes:
+    ///
+    /// - The result is MVCC-correct under our snapshot model: a
+    ///   concurrent snapshot that pre-dates the truncate's commit
+    ///   continues to see every row (its `xmax` is committed-after
+    ///   from the older snapshot's POV); a snapshot taken after the
+    ///   commit sees the relation as empty.
+    /// - Dead-tuple pages stay on the heap. A subsequent `INSERT` will
+    ///   reuse free space inside them as it would after any DELETE,
+    ///   and `n_blocks` stays unchanged so future scans still cover
+    ///   the dead-tuple block range (necessary because a row inserted
+    ///   into one of those reused slots must still be discovered).
+    /// - The path is `O(rows visible to txn)` rather than O(1). For
+    ///   the wire-completion gate this is acceptable: TRUNCATE is no
+    ///   longer rejected, and a future segment-manager wiring can
+    ///   replace this body with the proper fast-path without touching
+    ///   any caller.
+    ///
+    /// `RESTART IDENTITY` and `CASCADE` are accepted by the parser and
+    /// the binder but currently have no effect at execution time:
+    ///
+    /// - `RESTART IDENTITY` reseeds owned sequences. UltraSQL does not
+    ///   yet implement `SERIAL` / sequence catalogs (see ROADMAP P1
+    ///   v0.6), so there are no sequences to reseed. The keyword is
+    ///   accept-and-ignore until that lands.
+    /// - `CASCADE` truncates dependent foreign-key children. UltraSQL
+    ///   does not yet enforce foreign keys at the catalog level, so
+    ///   there are no dependent relations to find. The keyword is
+    ///   accept-and-ignore until the foreign-key wave lands.
+    ///
+    /// Multi-table `TRUNCATE` truncates every table inside a single
+    /// autocommit transaction so the operation is atomic — either all
+    /// listed relations become empty in the next snapshot or none do.
+    fn execute_truncate(
+        &self,
+        plan: &LogicalPlan,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::Truncate { tables, .. } = plan else {
+            return Err(ServerError::Unsupported(
+                "execute_truncate called with non-Truncate plan",
+            ));
+        };
+
+        // Single autocommit txn so the multi-table case is atomic. A
+        // partial failure aborts the txn and every delete it stamped
+        // becomes invisible to subsequent snapshots.
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+
+        let truncate_result: Result<(), ServerError> = (|| {
+            for name in tables {
+                let entry = snapshot.tables.get(name).ok_or_else(|| {
+                    ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(name.clone()))
+                })?;
+                let rel = RelationId(entry.oid);
+                // The heap's resident block count is the source of
+                // truth for "how many blocks must I scan." We OR with
+                // the catalog's hint so a relation extended on a
+                // previous connection still gets a complete scan.
+                let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
+
+                // Snapshot every visible TID up front, then issue the
+                // deletes in a second pass. Holding the heap iterator
+                // open across delete calls would let the iterator
+                // revisit a tuple whose xmax we just stamped; flushing
+                // to a vector first avoids that race.
+                let mut tids: Vec<ultrasql_core::TupleId> = Vec::new();
+                {
+                    let scan = self.state.heap.scan_visible(
+                        rel,
+                        block_count,
+                        &txn.snapshot,
+                        self.state.txn_manager.as_ref(),
+                    );
+                    for result in scan {
+                        let tup = result
+                            .map_err(|e| ServerError::ddl(format!("TRUNCATE heap scan: {e}")))?;
+                        tids.push(tup.tid);
+                    }
+                }
+
+                for tid in tids {
+                    self.state
+                        .heap
+                        .delete(
+                            tid,
+                            DeleteOptions {
+                                xmax: txn.xid,
+                                cmax: ultrasql_core::CommandId::FIRST,
+                                wal: None,
+                                fsm: None,
+                                vm: None,
+                            },
+                        )
+                        .map_err(|e| ServerError::ddl(format!("TRUNCATE heap delete: {e}")))?;
+                }
+            }
+            Ok(())
+        })();
+
+        match truncate_result {
+            Ok(()) => {
+                if let Err(e) = self.state.txn_manager.commit(txn) {
+                    tracing::warn!(error = %e, "autocommit (TRUNCATE) failed to finalise");
+                }
+                Ok(run_ddl_command("TRUNCATE TABLE"))
+            }
+            Err(e) => {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    tracing::warn!(
+                        error = %abort_err,
+                        "autocommit (TRUNCATE rollback) failed to abort"
                     );
                 }
                 Err(e)
@@ -2377,6 +2511,116 @@ mod tests {
             &mut client,
             &FrontendMessage::Query {
                 sql: "ALTER TABLE nope ADD COLUMN x INTEGER".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "expected ErrorResponse: {msgs:?}"
+        );
+        assert!(matches!(
+            msgs.last().unwrap(),
+            BackendMessage::ReadyForQuery { status: b'I' }
+        ));
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// `TRUNCATE TABLE t` emits `TRUNCATE TABLE` as the command tag,
+    /// does not emit a `RowDescription`, and the relation is empty as
+    /// observed by a subsequent `SELECT *`.
+    #[tokio::test]
+    async fn truncate_via_wire_empties_relation() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE trunc_unit (id INT NOT NULL)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "INSERT INTO trunc_unit VALUES (1)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "INSERT INTO trunc_unit VALUES (2)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "TRUNCATE TABLE trunc_unit".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let tag = msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        });
+        assert_eq!(tag.as_deref(), Some("TRUNCATE TABLE"));
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::RowDescription { .. })),
+            "DDL must not emit RowDescription"
+        );
+
+        // Post-truncate SELECT returns no DataRow messages.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM trunc_unit".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let data_rows = msgs
+            .iter()
+            .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+            .count();
+        assert_eq!(data_rows, 0, "post-truncate SELECT must emit no DataRow");
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// `TRUNCATE TABLE nope` errors with the table-not-found SQLSTATE
+    /// (42P01) and the session survives — the binder rejects the
+    /// reference and the wire path surfaces it as a query-scoped
+    /// error, never tearing the connection.
+    #[tokio::test]
+    async fn truncate_rejects_missing_relation() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "TRUNCATE TABLE nope".to_string(),
             },
         )
         .await;

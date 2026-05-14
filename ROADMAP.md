@@ -132,10 +132,10 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 | `SELECT ... ORDER BY` | ✅ | ✅ | ❌ | ❌ |
 | `SELECT ... JOIN ...` | ✅ | ✅ | ❌ | ❌ |
 | `SELECT ... LIMIT n` (`OFFSET 0`) | ✅ | ✅ | ✅ | ✅ |
-| `SELECT ... LIMIT n OFFSET m` | ✅ | ✅ | ❌ | ❌ |
+| `SELECT ... LIMIT n OFFSET m` | ✅ | ✅ | ✅ | ✅ |
 | `UPDATE t SET col = expr WHERE ...` | ✅ | ✅ | ✅ | ✅ |
 | `DELETE FROM t WHERE ...` | ✅ | ✅ | ✅ | ✅ |
-| `TRUNCATE t` | ✅ | ✅ | ❌ | ❌ |
+| `TRUNCATE t` | ✅ | ✅ | ✅ | ✅ |
 | `BEGIN / COMMIT / ROLLBACK` | ✅ | ❌ | ❌ | ❌ |
 | `SAVEPOINT / RELEASE / ROLLBACK TO` | ✅ | ❌ | ❌ | ❌ |
 | `PREPARE / EXECUTE / DEALLOCATE` (Simple Query) | ✅ | ❌ | ❌ | ❌ |
