@@ -1,0 +1,1 @@
+{"engine":"ultrasql","iterations_us":[2111.959,2172.375,2173.875,2216.5840000000003,2279.875,2299.708,2303.833,2445.917],"median_us":2279.875,"min_us":2111.959,"n_rows":10000,"samples":8,"workload":"delete_throughput_10k"}

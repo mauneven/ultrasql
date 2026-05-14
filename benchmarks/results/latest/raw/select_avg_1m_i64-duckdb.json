@@ -1,0 +1,1 @@
+{"engine":"duckdb","workload":"select_avg_1m_i64","n_rows":1000000,"samples":5,"median_us":3762.208,"min_us":1.000,"iterations_us":[1.0, 1.0, 469924.00000453927, 652389.2490222352, 3762.208012631163]}

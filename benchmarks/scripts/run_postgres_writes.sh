@@ -7,9 +7,20 @@
 #   delete_throughput_10k  — BEGIN; DELETE 10 000 rows; COMMIT
 #   mixed_oltp_pgbench_like — 1-second window: 50% point reads, 30% updates,
 #                             20% inserts; reports ops/s converted to median_us
+#   select_scan_10k        — preload 10 000 rows; time `SELECT id, val FROM t`
+#                             draining the full result set
+#   select_sum_65k_i64     — preload 65 536 rows; time `SELECT SUM(x) FROM
+#                             bench_analytical`
+#   select_avg_1m_i64      — preload 1 000 000 rows; time `SELECT AVG(x) FROM
+#                             bench_analytical`
+#   filter_sum_1m_i64      — preload 1 000 000 rows; time `SELECT SUM(x) FROM
+#                             bench_analytical WHERE x > 5000000`
 #
 # Output: one JSON file per workload in $RAW_DIR:
 #   <workload>-postgres17.json
+#
+# An optional positional argument selects a single workload (e.g.
+# `select_scan_10k`); with no argument all workloads run.
 #
 # Environment (with defaults):
 #   PGHOST    (default: none — uses Unix socket)
@@ -34,7 +45,7 @@ PGUSER="${PGUSER:-$(id -un)}"
 
 if ! command -v psql >/dev/null 2>&1; then
     echo "run_postgres_writes.sh: WARNING: psql not found — skipping postgres17 benchmarks" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like; do
+    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
     done
@@ -43,7 +54,7 @@ fi
 
 if ! pg_isready -q 2>/dev/null; then
     echo "run_postgres_writes.sh: WARNING: PostgreSQL not accepting connections — skipping" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like; do
+    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
     done
@@ -53,7 +64,7 @@ fi
 # Validate connection.
 if ! psql -U "$PGUSER" -d postgres -c "SELECT 1" -q --no-align -t >/dev/null 2>&1; then
     echo "run_postgres_writes.sh: WARNING: cannot connect to PostgreSQL as $PGUSER — skipping" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like; do
+    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
     done
@@ -343,11 +354,146 @@ PYEOF
 }
 
 # ---------------------------------------------------------------------------
+# Workload: select_scan_10k
+# ---------------------------------------------------------------------------
+run_select_scan() {
+    local wl="select_scan_10k"
+    echo "  workload: ${wl}"
+
+    # Preload N_ROWS rows once, outside the timed region. Schema matches the
+    # UltraSQL select-scan blueprint in cross_compare_sql.rs: (id INT, val INT).
+    $PSQL <<SQL
+DROP TABLE IF EXISTS bench_select_scan;
+CREATE UNLOGGED TABLE bench_select_scan (id INT NOT NULL, val INT);
+SQL
+    python3 - "$N_ROWS" <<'PYEOF' | $PSQL >/dev/null
+import sys
+n = int(sys.argv[1])
+print("BEGIN;")
+chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
+for ch in chunks:
+    rows = ",".join(f"({j},{j * 10})" for j in ch)
+    print(f"INSERT INTO bench_select_scan(id,val) VALUES {rows};")
+print("COMMIT;")
+PYEOF
+
+    local samples=()
+    for (( i=0; i<N_ITERS; i++ )); do
+        local t0 t1 dt rowcount
+        t0="$(python3 -c 'import time; print(time.perf_counter())')"
+        rowcount="$($PSQL -c "SELECT id, val FROM bench_select_scan;" | wc -l | tr -d '[:space:]')"
+        t1="$(python3 -c 'import time; print(time.perf_counter())')"
+        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
+        if [[ "$rowcount" -ne "$N_ROWS" ]]; then
+            echo "    WARNING: row count mismatch on iter $i: expected $N_ROWS, observed $rowcount" >&2
+        fi
+        samples+=("$dt")
+    done
+
+    local median_us
+    median_us="$(compute_median "${samples[@]}")"
+    emit_json "$wl" "$N_ROWS" "$median_us" "${samples[@]}" \
+        > "${RAW_DIR}/${wl}-${ENGINE}.json"
+    echo "    median: ${median_us} µs"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: run a SELECT against bench_analytical with the given query.
+# Args: workload_id, n_rows, query_sql
+# Preloads bench_analytical(id INT, x INT) with rows (j, j*10) for j in 0..n,
+# then times the query across N_ITERS iterations.
+# ---------------------------------------------------------------------------
+run_analytical() {
+    local wl="$1"
+    local n_rows="$2"
+    local query="$3"
+    echo "  workload: ${wl} (n_rows=${n_rows})"
+
+    # Preload bench_analytical once. Schema matches the UltraSQL analytical
+    # blueprint in cross_compare_sql.rs: (id INT, x INT) with x = j * 10.
+    $PSQL <<SQL
+DROP TABLE IF EXISTS bench_analytical;
+CREATE UNLOGGED TABLE bench_analytical (id INT NOT NULL, x INT);
+SQL
+    python3 - "$n_rows" <<'PYEOF' | $PSQL >/dev/null
+import sys
+n = int(sys.argv[1])
+print("BEGIN;")
+chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
+for ch in chunks:
+    rows = ",".join(f"({j},{j * 10})" for j in ch)
+    print(f"INSERT INTO bench_analytical(id,x) VALUES {rows};")
+print("COMMIT;")
+PYEOF
+
+    local samples=()
+    for (( i=0; i<N_ITERS; i++ )); do
+        local t0 t1 dt
+        t0="$(python3 -c 'import time; print(time.perf_counter())')"
+        $PSQL -c "$query" >/dev/null
+        t1="$(python3 -c 'import time; print(time.perf_counter())')"
+        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
+        samples+=("$dt")
+    done
+
+    local median_us
+    median_us="$(compute_median "${samples[@]}")"
+    emit_json "$wl" "$n_rows" "$median_us" "${samples[@]}" \
+        > "${RAW_DIR}/${wl}-${ENGINE}.json"
+    echo "    median: ${median_us} µs"
+}
+
+# ---------------------------------------------------------------------------
+# Workload: select_sum_65k_i64
+# ---------------------------------------------------------------------------
+run_sum_scalar() {
+    run_analytical "select_sum_65k_i64" 65536 \
+        "SELECT SUM(x) FROM bench_analytical;"
+}
+
+# ---------------------------------------------------------------------------
+# Workload: select_avg_1m_i64
+# ---------------------------------------------------------------------------
+run_avg_scalar() {
+    run_analytical "select_avg_1m_i64" 1000000 \
+        "SELECT AVG(x) FROM bench_analytical;"
+}
+
+# ---------------------------------------------------------------------------
+# Workload: filter_sum_1m_i64
+# ---------------------------------------------------------------------------
+run_filter_sum() {
+    run_analytical "filter_sum_1m_i64" 1000000 \
+        "SELECT SUM(x) FROM bench_analytical WHERE x > 5000000;"
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-run_insert
-run_update
-run_delete
-run_mixed
+WORKLOAD="${1:-all}"
+case "$WORKLOAD" in
+    insert_throughput_10k)   run_insert ;;
+    update_throughput_10k)   run_update ;;
+    delete_throughput_10k)   run_delete ;;
+    mixed_oltp_pgbench_like) run_mixed ;;
+    select_scan_10k)         run_select_scan ;;
+    select_sum_65k_i64)      run_sum_scalar ;;
+    select_avg_1m_i64)       run_avg_scalar ;;
+    filter_sum_1m_i64)       run_filter_sum ;;
+    all)
+        run_insert
+        run_update
+        run_delete
+        run_mixed
+        run_select_scan
+        run_sum_scalar
+        run_avg_scalar
+        run_filter_sum
+        ;;
+    *)
+        echo "run_postgres_writes.sh: unknown workload '$WORKLOAD'" >&2
+        exit 2
+        ;;
+esac
 
 echo "run_postgres_writes.sh: done — results in ${RAW_DIR}/"

@@ -39,8 +39,8 @@ use ultrasql_catalog::{CatalogSnapshot, TableEntry};
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
-    Filter, FilterEqI32, Limit, MemTableScan, ModifyKind, ModifyTable, Operator, Project, RowCodec,
-    SeqScan, ValuesScan,
+    Filter, FilterEqI32, HashAggregate, Limit, MemTableScan, ModifyKind, ModifyTable, Operator,
+    Project, RowCodec, SeqScan, ValuesScan,
 };
 use ultrasql_mvcc::Snapshot;
 use ultrasql_planner::{BinaryOp, InMemoryCatalog, LogicalPlan, ScalarExpr, TableMeta};
@@ -472,14 +472,42 @@ pub fn lower_query(
         }
         LogicalPlan::Empty { .. } => Err(ServerError::Unsupported("SELECT without FROM")),
         LogicalPlan::Sort { .. } => Err(ServerError::Unsupported("ORDER BY")),
-        LogicalPlan::Update { .. } => Err(ServerError::Unsupported("UPDATE")),
-        LogicalPlan::Delete { .. } => Err(ServerError::Unsupported("DELETE")),
+        LogicalPlan::Update {
+            table,
+            assignments,
+            input,
+            returning,
+            ..
+        } => lower_real_update(table, assignments, input, returning, ctx),
+        LogicalPlan::Delete {
+            table,
+            input,
+            returning,
+            ..
+        } => lower_real_delete(table, input, returning, ctx),
         LogicalPlan::Truncate { .. } => Err(ServerError::Unsupported("TRUNCATE")),
         LogicalPlan::CreateTable { .. } => Err(ServerError::Unsupported(
             "CREATE TABLE reached operator lowerer; expected DDL dispatch path",
         )),
         LogicalPlan::Join { .. } => Err(ServerError::Unsupported("JOIN")),
-        LogicalPlan::Aggregate { .. } => Err(ServerError::Unsupported("GROUP BY / aggregate")),
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+            schema,
+        } => {
+            // Mirror `ultrasql_executor::physical::build_operator` — default
+            // to a hash-based aggregate. The child is lowered recursively
+            // through this same real-heap-aware path so the aggregate can
+            // sit on top of a `SeqScan` over a persistent relation.
+            let child = lower_query(input, ctx)?;
+            Ok(Box::new(HashAggregate::new(
+                child,
+                group_by.clone(),
+                aggregates.clone(),
+                schema.clone(),
+            )))
+        }
         LogicalPlan::SetOp { .. } => Err(ServerError::Unsupported("UNION / INTERSECT / EXCEPT")),
         LogicalPlan::Cte { .. } => Err(ServerError::Unsupported("WITH (CTE)")),
     }
@@ -578,6 +606,235 @@ fn lower_real_insert(
         child,
     );
     Ok(Box::new(modify))
+}
+
+/// Build a TID-emitting [`SeqScan`] over a persistent relation.
+///
+/// The resulting operator emits rows shaped
+/// `[tid_block: Int32, tid_slot: Int32, ...payload_cols]`, which is the
+/// contract [`ModifyTable`] expects for UPDATE and DELETE.
+fn build_tid_seq_scan(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Box<dyn Operator> {
+    let rel = RelationId(entry.oid);
+    let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
+    let codec = RowCodec::new(entry.schema.clone());
+    let scan = SeqScan::new_with_tids(
+        Arc::clone(&ctx.heap),
+        rel,
+        block_count,
+        ctx.snapshot.clone(),
+        Arc::clone(&ctx.oracle),
+        codec,
+    );
+    Box::new(scan)
+}
+
+/// Recursively rebuild `expr`, adding `by` to every
+/// [`ScalarExpr::Column`] index. Used by UPDATE / DELETE lowering: the
+/// scan now emits `[tid_block, tid_slot, ...orig_cols]`, but the
+/// binder produced column indices against the un-prefixed schema, so
+/// every reference must shift by +2 to remain correct.
+///
+/// Subquery-bearing variants (`ScalarSubquery`, `Exists`,
+/// `InSubquery`, `OuterColumn`) are not shifted — those would require
+/// recursing into a `LogicalPlan` and rewriting the outer-column
+/// references, which is out of scope for the basic UPDATE/DELETE path
+/// in this commit. The helper returns those variants verbatim; if a
+/// caller hands us one we have already rejected at higher levels.
+fn shift_column_indices(expr: &ScalarExpr, by: usize) -> ScalarExpr {
+    match expr {
+        ScalarExpr::Column {
+            name,
+            index,
+            data_type,
+        } => ScalarExpr::Column {
+            name: name.clone(),
+            index: index + by,
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Literal { value, data_type } => ScalarExpr::Literal {
+            value: value.clone(),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Parameter { index, data_type } => ScalarExpr::Parameter {
+            index: *index,
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Unary {
+            op,
+            expr,
+            data_type,
+        } => ScalarExpr::Unary {
+            op: *op,
+            expr: Box::new(shift_column_indices(expr, by)),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Binary {
+            op,
+            left,
+            right,
+            data_type,
+        } => ScalarExpr::Binary {
+            op: *op,
+            left: Box::new(shift_column_indices(left, by)),
+            right: Box::new(shift_column_indices(right, by)),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+            expr: Box::new(shift_column_indices(expr, by)),
+            negated: *negated,
+        },
+        // Subquery-bearing and outer-frame variants are returned
+        // unchanged. They cannot appear in a v0.5 UPDATE / DELETE
+        // predicate (the binder produces them only for SELECTs), so we
+        // would never observe them here in practice.
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => expr.clone(),
+    }
+}
+
+/// Lower an `UPDATE` plan into a [`ModifyTable`] with `ModifyKind::Update`.
+///
+/// The child operator is a TID-emitting [`SeqScan`] (optionally wrapped
+/// in [`Filter`] when the planner produced a `WHERE`). Predicate column
+/// indices are shifted by +2 to account for the leading TID columns;
+/// assignment **target** column indices stay un-shifted because
+/// `apply_update` re-indexes them against the relation schema, not the
+/// child batch shape.
+fn lower_real_update(
+    table: &str,
+    assignments: &[(usize, ScalarExpr)],
+    input: &LogicalPlan,
+    returning: &[(ScalarExpr, String)],
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    if !returning.is_empty() {
+        return Err(ServerError::Unsupported("UPDATE ... RETURNING"));
+    }
+    let entry = ctx
+        .catalog_snapshot
+        .tables
+        .get(&table.to_ascii_lowercase())
+        .ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table.to_string(),
+            ))
+        })?;
+
+    let child = build_filtered_tid_scan(table, entry, input, ctx)?;
+
+    // Assignment value expressions stay unshifted: `apply_update`
+    // strips the leading [tid_block, tid_slot] pair before passing the
+    // row to `Eval::eval`, so the value expression sees the relation's
+    // natural column layout. Likewise, the assignment's *target*
+    // column index addresses the relation schema directly.
+    let assignments: Vec<(usize, ScalarExpr)> = assignments.to_vec();
+
+    let rel = RelationId(entry.oid);
+    let modify = ModifyTable::new(
+        Arc::clone(&ctx.heap),
+        rel,
+        entry.schema.clone(),
+        ModifyKind::Update { assignments },
+        ctx.xid,
+        ctx.command_id,
+        ctx.xid,
+        ctx.command_id,
+        None,
+        child,
+    );
+    Ok(Box::new(modify))
+}
+
+/// Lower a `DELETE` plan into a [`ModifyTable`] with `ModifyKind::Delete`.
+///
+/// See [`lower_real_update`] for the TID-emitting scan / filter shape.
+fn lower_real_delete(
+    table: &str,
+    input: &LogicalPlan,
+    returning: &[(ScalarExpr, String)],
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    if !returning.is_empty() {
+        return Err(ServerError::Unsupported("DELETE ... RETURNING"));
+    }
+    let entry = ctx
+        .catalog_snapshot
+        .tables
+        .get(&table.to_ascii_lowercase())
+        .ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table.to_string(),
+            ))
+        })?;
+
+    let child = build_filtered_tid_scan(table, entry, input, ctx)?;
+
+    let rel = RelationId(entry.oid);
+    let modify = ModifyTable::new(
+        Arc::clone(&ctx.heap),
+        rel,
+        entry.schema.clone(),
+        ModifyKind::Delete,
+        ctx.xid,
+        ctx.command_id,
+        ctx.xid,
+        ctx.command_id,
+        None,
+        child,
+    );
+    Ok(Box::new(modify))
+}
+
+/// Build the TID-emitting child operator for an UPDATE / DELETE.
+///
+/// Recognises the binder's `Scan` / `Filter(Scan)` shapes:
+///
+/// - bare `Scan { table }` → TID-emitting `SeqScan`.
+/// - `Filter { Scan { table }, predicate }` → `Filter`(`SeqScan`),
+///   with every `Column { index }` in `predicate` shifted by +2 to
+///   re-target the TID-prefixed batch.
+///
+/// Any other input shape — the planner does not produce it for UPDATE
+/// / DELETE in v0.5 — surfaces as [`ServerError::Unsupported`].
+fn build_filtered_tid_scan(
+    target_table: &str,
+    entry: &TableEntry,
+    input: &LogicalPlan,
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    match input {
+        LogicalPlan::Scan { table, .. } => {
+            if !table.eq_ignore_ascii_case(target_table) {
+                return Err(ServerError::Unsupported(
+                    "UPDATE / DELETE child scan references a different table",
+                ));
+            }
+            Ok(build_tid_seq_scan(entry, ctx))
+        }
+        LogicalPlan::Filter {
+            input: filter_input,
+            predicate,
+        } => {
+            let LogicalPlan::Scan { table, .. } = filter_input.as_ref() else {
+                return Err(ServerError::Unsupported(
+                    "UPDATE / DELETE WHERE input must be a base-table scan",
+                ));
+            };
+            if !table.eq_ignore_ascii_case(target_table) {
+                return Err(ServerError::Unsupported(
+                    "UPDATE / DELETE child scan references a different table",
+                ));
+            }
+            let scan = build_tid_seq_scan(entry, ctx);
+            let shifted = shift_column_indices(predicate, 2);
+            Ok(Box::new(Filter::new(scan, shifted)))
+        }
+        _ => Err(ServerError::Unsupported(
+            "UPDATE / DELETE input shape; expected Scan or Filter(Scan)",
+        )),
+    }
 }
 
 /// Lower a `Project` whose expressions are pure column references.

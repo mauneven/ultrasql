@@ -485,14 +485,33 @@ fn finalise(state: &AggState) -> Value {
 // Arithmetic helpers
 // ---------------------------------------------------------------------------
 
-/// Add two values of the same numeric type, widening to Int64/Float64 where needed.
+/// Add two numeric values, widening to Int64 or Float64 as appropriate.
+///
+/// The `Sum` and `Avg` accumulators store the running total as the
+/// widened type (Int64 for integers, Float64 for floats) after the
+/// first non-null input — but the *new* row arrives unwidened from
+/// the child operator, so this helper must accept any mix of
+/// narrower-on-the-right and widened-on-the-left integer and float
+/// types. The output type is always the widened type to match.
 fn add_values(a: Value, b: Value) -> Result<Value, ExecError> {
     match (a, b) {
+        // Pure narrow-narrow promotions (first-step folding).
         (Value::Int16(x), Value::Int16(y)) => Ok(Value::Int64(i64::from(x) + i64::from(y))),
         (Value::Int32(x), Value::Int32(y)) => Ok(Value::Int64(i64::from(x) + i64::from(y))),
         (Value::Int64(x), Value::Int64(y)) => Ok(Value::Int64(x.wrapping_add(y))),
+        // Widened accumulator + narrower fresh row (the common case in
+        // SUM / AVG once the accumulator has stepped through one input).
+        (Value::Int64(x), Value::Int16(y)) | (Value::Int16(y), Value::Int64(x)) => {
+            Ok(Value::Int64(x.wrapping_add(i64::from(y))))
+        }
+        (Value::Int64(x), Value::Int32(y)) | (Value::Int32(y), Value::Int64(x)) => {
+            Ok(Value::Int64(x.wrapping_add(i64::from(y))))
+        }
         (Value::Float32(x), Value::Float32(y)) => Ok(Value::Float64(f64::from(x) + f64::from(y))),
         (Value::Float64(x), Value::Float64(y)) => Ok(Value::Float64(x + y)),
+        (Value::Float64(x), Value::Float32(y)) | (Value::Float32(y), Value::Float64(x)) => {
+            Ok(Value::Float64(x + f64::from(y)))
+        }
         (a, b) => Err(ExecError::TypeMismatch(format!(
             "sum type mismatch: {a:?} and {b:?}"
         ))),

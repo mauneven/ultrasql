@@ -150,81 +150,30 @@ struct StaticTable {
 static STATIC_DEFAULTS: &[StaticTable] = &[
     StaticTable {
         id: "select_sum_65k_i64",
-        heading: "SELECT SUM(x) FROM t — 65 536 i64 rows, hot cache",
-        rows: &[
-            StaticRow {
-                engine: "**UltraSQL** (kernel)",
-                median_us: 4.70,
-            },
-            StaticRow {
-                engine: "DuckDB",
-                median_us: 216.33,
-            },
-            StaticRow {
-                engine: "ClickHouse",
-                median_us: 339.27,
-            },
-            StaticRow {
-                engine: "SQLite",
-                median_us: 1_240.0,
-            },
-            StaticRow {
-                engine: "PostgreSQL",
-                median_us: 1_690.0,
-            },
-        ],
+        heading: "SELECT SUM(x) FROM t — 65 536 i32 rows (full wire round-trip)",
+        // Empty: all engine rows come from the latest wire-measured run in
+        // benchmarks/results/latest/raw/. Previously this table carried the
+        // kernel-level UltraSQL number (4.70 µs) alongside other engines'
+        // CLI numbers — that was apples-to-oranges and is removed.
+        rows: &[],
     },
     StaticTable {
-        id: "select_avg_10m_i64",
-        heading: "SELECT AVG(x) FROM t — 10 000 000 i64",
-        rows: &[
-            StaticRow {
-                engine: "**UltraSQL** (kernel)",
-                median_us: 1_180.0,
-            },
-            StaticRow {
-                engine: "ClickHouse",
-                median_us: 1_260.0,
-            },
-            StaticRow {
-                engine: "DuckDB",
-                median_us: 7_920.0,
-            },
-            StaticRow {
-                engine: "SQLite",
-                median_us: 199_940.0,
-            },
-            StaticRow {
-                engine: "PostgreSQL",
-                median_us: 269_940.0,
-            },
-        ],
+        id: "select_avg_1m_i64",
+        heading: "SELECT AVG(x) FROM t — 1 000 000 i32 rows (full wire round-trip)",
+        // Empty: every engine row comes from the latest wire-measured run in
+        // benchmarks/results/latest/raw/. Competitor numbers are measured via
+        // the engine's native CLI; UltraSQL via tokio-postgres → ultrasqld →
+        // SeqScan → HashAggregate. 1M (not 10M) because UltraSQL's v0.5 heap
+        // pool exhausts on 10M; once the buffer pool grows / SeqScan streams,
+        // the workload bumps back up.
+        rows: &[],
     },
     StaticTable {
-        id: "filter_sum_10m_i64",
-        heading: "Filter + SUM — 10 million i64 rows, hot cache",
-        rows: &[
-            StaticRow {
-                engine: "**UltraSQL** (kernel)",
-                median_us: 2_200.0,
-            },
-            StaticRow {
-                engine: "ClickHouse",
-                median_us: 4_280.0,
-            },
-            StaticRow {
-                engine: "DuckDB",
-                median_us: 11_010.0,
-            },
-            StaticRow {
-                engine: "SQLite",
-                median_us: 257_030.0,
-            },
-            StaticRow {
-                engine: "PostgreSQL",
-                median_us: 354_420.0,
-            },
-        ],
+        id: "filter_sum_1m_i64",
+        heading: "Filter + SUM — 1 000 000 i32 rows (full wire round-trip)",
+        // Same methodology as select_avg_1m_i64: all engines measured through
+        // their SQL surface, no kernel pre-aggregation.
+        rows: &[],
     },
     // Write-side benchmarks.
     //
@@ -235,25 +184,8 @@ static STATIC_DEFAULTS: &[StaticTable] = &[
     StaticTable {
         id: "insert_throughput_10k",
         heading: "INSERT throughput — 10 000 rows",
-        rows: &[
-            StaticRow {
-                engine: "**UltraSQL** (kernel, batch path)",
-                // 15.5M ops/s ≈ 645 µs / 10 000-row batch.
-                median_us: 645.0,
-            },
-            StaticRow {
-                engine: "SQLite",
-                median_us: 19_804.479,
-            },
-            StaticRow {
-                engine: "PostgreSQL",
-                median_us: 49_752.896,
-            },
-            StaticRow {
-                engine: "DuckDB",
-                median_us: 64_198.083,
-            },
-        ],
+        // All rows come from the latest wire-measured run.
+        rows: &[],
     },
     StaticTable {
         id: "select_scan_10k",
@@ -600,13 +532,16 @@ fn merge_latest_results(
     // Map workload names in results.json to benchmark IDs used by the README.
     // Only map workloads that have a direct README marker counterpart.
     let read_workload_map: &[(&str, &str)] =
-        &[("sum", "select_sum_65k_i64"), ("avg", "select_avg_10m_i64")];
+        &[("sum", "select_sum_65k_i64"), ("avg", "select_avg_1m_i64")];
 
     // Write-side workloads: the workload name in results.json is the same as
     // the README benchmark id.
     let write_workload_ids: &[&str] = &[
         "insert_throughput_10k",
         "select_scan_10k",
+        "select_sum_65k_i64",
+        "select_avg_1m_i64",
+        "filter_sum_1m_i64",
         "update_throughput_10k",
         "delete_throughput_10k",
         "mixed_oltp_pgbench_like",
@@ -979,44 +914,6 @@ rest\n";
     }
 
     // -----------------------------------------------------------------------
-    // default_static_values_render_when_baseline_zero
-    // -----------------------------------------------------------------------
-
-    /// Until the wire-protocol bench driver lands (Wave 3), UltraSQL rows
-    /// are filtered out of every rendered table — the static defaults
-    /// (kernel-only measurements) must not leak into the README even when
-    /// a baseline is populated. Competitor rows still appear unchanged.
-    #[test]
-    fn ultrasql_row_filtered_out_of_rendered_read_tables() {
-        let mut baseline: HashMap<String, BaselineEntry> = HashMap::new();
-        baseline.insert(
-            "select_sum_65k_i64".to_string(),
-            BaselineEntry {
-                p99_us: 4.70,
-                competitors: HashMap::new(),
-            },
-        );
-
-        let tables = build_tables(&baseline, &HashMap::new());
-        let table = tables
-            .get("select_sum_65k_i64")
-            .expect("select_sum_65k_i64 must be in tables");
-
-        assert!(
-            !table.contains("UltraSQL"),
-            "UltraSQL row must be filtered (kernel-only until Wave 3): {table}"
-        );
-        assert!(
-            !table.contains("4.70 µs"),
-            "kernel-only UltraSQL value must not leak: {table}"
-        );
-        assert!(
-            table.contains("DuckDB"),
-            "competitor rows must still render: {table}"
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // render_table_empty_rows_produces_not_yet_measured
     // -----------------------------------------------------------------------
 
@@ -1079,35 +976,5 @@ rest\n";
             let table = tables.get(st.id).expect("missing table for static id");
             assert!(!table.is_empty(), "table for {} must not be empty", st.id);
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // filter_sum_10m_static_default_renders
-    // -----------------------------------------------------------------------
-
-    /// Competitor rows on `filter_sum_10m_i64` must still render even
-    /// though the UltraSQL row is filtered: the README needs to show the
-    /// shape of the comparison and the bar UltraSQL is targeting until
-    /// Wave 3 measurements land.
-    #[test]
-    fn filter_sum_10m_renders_competitor_rows_only() {
-        let baseline: HashMap<String, BaselineEntry> = HashMap::new();
-        let tables = build_tables(&baseline, &HashMap::new());
-        let table = tables
-            .get("filter_sum_10m_i64")
-            .expect("filter_sum_10m_i64 must be present in tables");
-
-        assert!(
-            !table.contains("UltraSQL"),
-            "UltraSQL kernel row must be filtered: {table}"
-        );
-        assert!(
-            table.contains("ClickHouse"),
-            "ClickHouse row must be present: {table}"
-        );
-        assert!(
-            table.contains("DuckDB"),
-            "DuckDB row must be present: {table}"
-        );
     }
 }

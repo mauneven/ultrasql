@@ -116,12 +116,13 @@ const READ_BUFFER_INITIAL: usize = 1 << 12;
 
 /// Buffer pool capacity used when no data directory is configured.
 ///
-/// 4096 frames × 8 KiB = 32 MiB. Sized to cover the sample database,
+/// 65 536 frames × 8 KiB = 512 MiB. Sized to cover the sample database,
 /// the integration tests, and the wire-protocol benchmark driver
-/// (which loads ~10 k rows per iteration across multiple fresh
-/// relations on a single in-process Server). Production deployments
-/// will size this from configuration.
-const IN_MEMORY_POOL_FRAMES: usize = 4096;
+/// (which loads up to ~10 M rows per iteration across multiple fresh
+/// relations on a single in-process Server — large analytical workloads
+/// such as `select_avg_10m_i64` and `filter_sum_10m_i64`). Production
+/// deployments will size this from configuration.
+const IN_MEMORY_POOL_FRAMES: usize = 65_536;
 
 /// Shared connection state: the catalog used by the binder plus the
 /// sample-table registry the lowerer consults.

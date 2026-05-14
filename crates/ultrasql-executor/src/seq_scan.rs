@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::vec::IntoIter;
 
-use ultrasql_core::{DataType, RelationId, Schema, Value};
+use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
 use ultrasql_mvcc::{Snapshot, XidStatusOracle};
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::heap::HeapAccess;
@@ -54,6 +54,16 @@ pub struct SeqScan<L: PageLoader, O> {
     snapshot: Snapshot,
     oracle: Arc<O>,
     codec: RowCodec,
+    /// When `true`, the operator prepends two `Int32` columns
+    /// (`tid_block`, `tid_slot`) to each decoded row. The reported
+    /// [`Schema`] also reflects this prefix. UPDATE/DELETE rely on this
+    /// shape: [`crate::modify::ModifyTable`] decodes the TID from those
+    /// columns to address the heap tuple.
+    with_tids: bool,
+    /// Output schema; equals `codec.schema()` when `with_tids` is false,
+    /// or `[tid_block, tid_slot, ...codec.schema()]` when `with_tids` is
+    /// true. Cached to satisfy `Operator::schema()`'s `&Schema` return.
+    output_schema: Schema,
     /// Materialised row buffer, filled on the first `next_batch` call.
     ///
     /// `None` = not yet materialised. `Some(iter)` = currently draining.
@@ -92,7 +102,7 @@ where
     /// - `oracle` — transaction-status oracle.
     /// - `codec` — row codec whose schema matches the relation's column layout.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         heap: Arc<HeapAccess<L>>,
         relation: RelationId,
         block_count: u32,
@@ -100,6 +110,7 @@ where
         oracle: Arc<O>,
         codec: RowCodec,
     ) -> Self {
+        let output_schema = codec.schema().clone();
         Self {
             heap,
             relation,
@@ -107,6 +118,45 @@ where
             snapshot,
             oracle,
             codec,
+            with_tids: false,
+            output_schema,
+            all_rows: None,
+            eof: false,
+        }
+    }
+
+    /// Construct a `SeqScan` that emits two leading `Int32` columns
+    /// (`tid_block`, `tid_slot`) before every payload column.
+    ///
+    /// Required by UPDATE / DELETE lowering: the
+    /// [`crate::modify::ModifyTable`] operator extracts the tuple's
+    /// `TupleId` from those columns to address the heap. The rest of
+    /// the fields match [`SeqScan::new`].
+    #[must_use]
+    pub fn new_with_tids(
+        heap: Arc<HeapAccess<L>>,
+        relation: RelationId,
+        block_count: u32,
+        snapshot: Snapshot,
+        oracle: Arc<O>,
+        codec: RowCodec,
+    ) -> Self {
+        let mut fields: Vec<Field> = Vec::with_capacity(codec.schema().len() + 2);
+        fields.push(Field::required("tid_block", DataType::Int32));
+        fields.push(Field::required("tid_slot", DataType::Int32));
+        for i in 0..codec.schema().len() {
+            fields.push(codec.schema().field_at(i).clone());
+        }
+        let output_schema = Schema::new(fields).expect("TID-prefixed schema is well-formed");
+        Self {
+            heap,
+            relation,
+            block_count,
+            snapshot,
+            oracle,
+            codec,
+            with_tids: true,
+            output_schema,
             all_rows: None,
             eof: false,
         }
@@ -140,11 +190,28 @@ where
                     tracing::warn!(error = %e, "heap scan error");
                     ExecError::Internal("heap scan failed")
                 })?;
-                let row = self
+                let decoded = self
                     .codec
                     .decode(&tup.data)
                     .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-                rows.push(row);
+                if self.with_tids {
+                    // Block fits in i32: PostgreSQL's BlockNumber is u32 but
+                    // benchmark / test relations stay well under 2^31 blocks.
+                    // Overflowing relations would surface here as a precision
+                    // loss in the TID column; we cast lossily because the
+                    // ModifyTable extractor pairs with this exact shape.
+                    let block_i32 = i32::try_from(tup.tid.page.block.raw()).map_err(|_| {
+                        ExecError::Internal("BlockNumber exceeds i32 range; TID column overflow")
+                    })?;
+                    let slot_i32 = i32::from(tup.tid.slot);
+                    let mut row: Vec<Value> = Vec::with_capacity(decoded.len() + 2);
+                    row.push(Value::Int32(block_i32));
+                    row.push(Value::Int32(slot_i32));
+                    row.extend(decoded);
+                    rows.push(row);
+                } else {
+                    rows.push(decoded);
+                }
             }
             self.all_rows = Some(rows.into_iter());
         }
@@ -157,12 +224,12 @@ where
             return Ok(None);
         }
 
-        let batch = build_batch(&chunk, self.codec.schema())?;
+        let batch = build_batch(&chunk, &self.output_schema)?;
         Ok(Some(batch))
     }
 
     fn schema(&self) -> &Schema {
-        self.codec.schema()
+        &self.output_schema
     }
 }
 
@@ -612,6 +679,73 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test 5: corrupt payload returns TypeMismatch
     // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Test 6: TID-emitting scan prepends tid_block / tid_slot columns
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tid_scan_prepends_block_and_slot_columns() {
+        let heap = make_heap();
+        let codec = RowCodec::new(schema_i32_text());
+        let xid: u64 = 50;
+        let oracle = Arc::new(MapOracle::new());
+        oracle.set_committed(Xid::new(xid));
+
+        // Insert 3 rows. With a fresh heap they all land on block 0 in
+        // slot order 0, 1, 2.
+        let inputs: Vec<(i32, String)> = (0_i32..3).map(|i| (i, format!("row_{i}"))).collect();
+        for (id, name) in &inputs {
+            let row = vec![Value::Int32(*id), Value::Text(name.clone())];
+            let payload = codec.encode(&row).expect("encode");
+            heap.insert(rel(), &payload, insert_opts(xid))
+                .expect("insert");
+        }
+
+        let block_count = heap.block_count(rel());
+        let snapshot = snap_for(xid);
+        let mut scan = SeqScan::new_with_tids(
+            Arc::clone(&heap),
+            rel(),
+            block_count,
+            snapshot,
+            Arc::clone(&oracle),
+            codec,
+        );
+
+        // Schema must be [tid_block, tid_slot, id, name].
+        let schema = scan.schema().clone();
+        assert_eq!(schema.len(), 4, "TID schema must have 4 columns");
+        assert_eq!(schema.field_at(0).name, "tid_block");
+        assert_eq!(schema.field_at(0).data_type, DataType::Int32);
+        assert_eq!(schema.field_at(1).name, "tid_slot");
+        assert_eq!(schema.field_at(1).data_type, DataType::Int32);
+
+        let batch = scan
+            .next_batch()
+            .expect("must not error")
+            .expect("first batch");
+        assert_eq!(batch.rows(), 3);
+        assert_eq!(batch.width(), 4);
+        // tid_block must be 0 for all three rows on a fresh heap.
+        let block_col = match &batch.columns()[0] {
+            Column::Int32(c) => c.data().to_vec(),
+            other => panic!("expected Int32 for tid_block, got {other:?}"),
+        };
+        assert_eq!(block_col, vec![0_i32, 0, 0]);
+        // tid_slot must be 0, 1, 2 in insertion order.
+        let slot_col = match &batch.columns()[1] {
+            Column::Int32(c) => c.data().to_vec(),
+            other => panic!("expected Int32 for tid_slot, got {other:?}"),
+        };
+        assert_eq!(slot_col, vec![0_i32, 1, 2]);
+        // The original `id` column lands at index 2.
+        let id_col = match &batch.columns()[2] {
+            Column::Int32(c) => c.data().to_vec(),
+            other => panic!("expected Int32 for id, got {other:?}"),
+        };
+        assert_eq!(id_col, vec![0_i32, 1, 2]);
+    }
 
     #[test]
     fn scan_propagates_codec_errors_as_type_mismatch() {

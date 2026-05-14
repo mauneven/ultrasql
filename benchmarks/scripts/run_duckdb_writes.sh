@@ -7,9 +7,20 @@
 #   delete_throughput_10k  — BEGIN TRANSACTION; DELETE 10 000 rows; COMMIT
 #   mixed_oltp_pgbench_like — 1-second window: 50% point reads, 30% updates,
 #                             20% inserts; reports µs per op
+#   select_scan_10k        — preload 10 000 rows; time `SELECT id, val FROM t`
+#                             draining the full result set
+#   select_sum_65k_i64     — preload 65 536 rows; time `SELECT SUM(x) FROM
+#                             bench_analytical`
+#   select_avg_1m_i64      — preload 1 000 000 rows; time `SELECT AVG(x) FROM
+#                             bench_analytical`
+#   filter_sum_1m_i64      — preload 1 000 000 rows; time `SELECT SUM(x) FROM
+#                             bench_analytical WHERE x > 5000000`
 #
 # Output: one JSON file per workload in $RAW_DIR:
 #   <workload>-duckdb.json
+#
+# An optional positional argument selects a single workload (e.g.
+# `select_scan_10k`); with no argument all workloads run.
 #
 # Environment (with defaults):
 #   RAW_DIR  (default: benchmarks/results/latest/raw)
@@ -29,7 +40,7 @@ N_ROWS="${N_ROWS:-10000}"
 
 if ! command -v duckdb >/dev/null 2>&1; then
     echo "run_duckdb_writes.sh: WARNING: duckdb not found — skipping duckdb benchmarks" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like; do
+    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
     done
@@ -393,11 +404,216 @@ PYEOF
 }
 
 # ---------------------------------------------------------------------------
+# Workload: select_scan_10k
+# ---------------------------------------------------------------------------
+run_select_scan() {
+    local wl="select_scan_10k"
+    echo "  workload: ${wl}"
+
+    # DuckDB :memory: is stateless per invocation; preload + scan in the same
+    # script and subtract the preload-only baseline, matching the strategy
+    # used by run_update / run_delete above.
+
+    local scan_sql
+    scan_sql="$(mktemp /tmp/duckdb_select_scan_XXXX.sql)"
+    python3 - "$N_ROWS" "$scan_sql" <<'PYEOF'
+import sys
+n = int(sys.argv[1])
+out = sys.argv[2]
+with open(out, "w") as f:
+    f.write("CREATE OR REPLACE TABLE bench_select_scan(id INTEGER NOT NULL, val INTEGER);\n")
+    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
+    for ch in chunks:
+        rows = ",".join(f"({j},{j * 10})" for j in ch)
+        f.write(f"INSERT INTO bench_select_scan(id,val) VALUES {rows};\n")
+    # Timed SELECT — emit all rows so the CLI drains the full result set.
+    f.write("SELECT id, val FROM bench_select_scan;\n")
+PYEOF
+
+    local preload_sql
+    preload_sql="$(mktemp /tmp/duckdb_select_preload_XXXX.sql)"
+    python3 - "$N_ROWS" "$preload_sql" <<'PYEOF'
+import sys
+n = int(sys.argv[1])
+out = sys.argv[2]
+with open(out, "w") as f:
+    f.write("CREATE OR REPLACE TABLE bench_select_scan(id INTEGER NOT NULL, val INTEGER);\n")
+    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
+    for ch in chunks:
+        rows = ",".join(f"({j},{j * 10})" for j in ch)
+        f.write(f"INSERT INTO bench_select_scan(id,val) VALUES {rows};\n")
+PYEOF
+
+    local samples_full=()
+    for (( i=0; i<N_ITERS; i++ )); do
+        local t0 t1 dt
+        t0="$(python3 -c 'import time; print(time.perf_counter())')"
+        duckdb :memory: < "$scan_sql" >/dev/null
+        t1="$(python3 -c 'import time; print(time.perf_counter())')"
+        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
+        samples_full+=("$dt")
+    done
+
+    local samples_preload=()
+    for (( i=0; i<N_ITERS; i++ )); do
+        local t0 t1 dt
+        t0="$(python3 -c 'import time; print(time.perf_counter())')"
+        duckdb :memory: < "$preload_sql" >/dev/null
+        t1="$(python3 -c 'import time; print(time.perf_counter())')"
+        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
+        samples_preload+=("$dt")
+    done
+
+    rm -f "$scan_sql" "$preload_sql"
+
+    local preload_median
+    preload_median="$(compute_median "${samples_preload[@]}")"
+    local samples=()
+    for dt_full in "${samples_full[@]}"; do
+        local net
+        net="$(python3 -c "v = $dt_full - $preload_median; print(max(v, 1.0))")"
+        samples+=("$net")
+    done
+
+    local median_us
+    median_us="$(compute_median "${samples[@]}")"
+    emit_json "$wl" "$N_ROWS" "$median_us" "${samples[@]}" \
+        > "${RAW_DIR}/${wl}-${ENGINE}.json"
+    echo "    median: ${median_us} µs"
+}
+
+# ---------------------------------------------------------------------------
+# Helper: run a SELECT against bench_analytical with the given query.
+# Args: workload_id, n_rows, query_sql
+# DuckDB :memory: is stateless per invocation, so preload + query is timed
+# together and a preload-only baseline is subtracted (same methodology as
+# run_update / run_delete / run_select_scan above).
+# ---------------------------------------------------------------------------
+run_analytical() {
+    local wl="$1"
+    local n_rows="$2"
+    local query="$3"
+    echo "  workload: ${wl} (n_rows=${n_rows})"
+
+    local scan_sql
+    scan_sql="$(mktemp /tmp/duckdb_analytical_XXXX.sql)"
+    python3 - "$n_rows" "$scan_sql" "$query" <<'PYEOF'
+import sys
+n = int(sys.argv[1])
+out = sys.argv[2]
+query = sys.argv[3]
+with open(out, "w") as f:
+    f.write("CREATE OR REPLACE TABLE bench_analytical(id INTEGER NOT NULL, x INTEGER);\n")
+    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
+    for ch in chunks:
+        rows = ",".join(f"({j},{j * 10})" for j in ch)
+        f.write(f"INSERT INTO bench_analytical(id,x) VALUES {rows};\n")
+    f.write(query + "\n")
+PYEOF
+
+    local preload_sql
+    preload_sql="$(mktemp /tmp/duckdb_analytical_preload_XXXX.sql)"
+    python3 - "$n_rows" "$preload_sql" <<'PYEOF'
+import sys
+n = int(sys.argv[1])
+out = sys.argv[2]
+with open(out, "w") as f:
+    f.write("CREATE OR REPLACE TABLE bench_analytical(id INTEGER NOT NULL, x INTEGER);\n")
+    chunks = [list(range(i, min(i + 1000, n))) for i in range(0, n, 1000)]
+    for ch in chunks:
+        rows = ",".join(f"({j},{j * 10})" for j in ch)
+        f.write(f"INSERT INTO bench_analytical(id,x) VALUES {rows};\n")
+PYEOF
+
+    local samples_full=()
+    for (( i=0; i<N_ITERS; i++ )); do
+        local t0 t1 dt
+        t0="$(python3 -c 'import time; print(time.perf_counter())')"
+        duckdb :memory: < "$scan_sql" >/dev/null
+        t1="$(python3 -c 'import time; print(time.perf_counter())')"
+        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
+        samples_full+=("$dt")
+    done
+
+    local samples_preload=()
+    for (( i=0; i<N_ITERS; i++ )); do
+        local t0 t1 dt
+        t0="$(python3 -c 'import time; print(time.perf_counter())')"
+        duckdb :memory: < "$preload_sql" >/dev/null
+        t1="$(python3 -c 'import time; print(time.perf_counter())')"
+        dt="$(python3 -c "print(($t1 - $t0) * 1e6)")"
+        samples_preload+=("$dt")
+    done
+
+    rm -f "$scan_sql" "$preload_sql"
+
+    local preload_median
+    preload_median="$(compute_median "${samples_preload[@]}")"
+    local samples=()
+    for dt_full in "${samples_full[@]}"; do
+        local net
+        net="$(python3 -c "v = $dt_full - $preload_median; print(max(v, 1.0))")"
+        samples+=("$net")
+    done
+
+    local median_us
+    median_us="$(compute_median "${samples[@]}")"
+    emit_json "$wl" "$n_rows" "$median_us" "${samples[@]}" \
+        > "${RAW_DIR}/${wl}-${ENGINE}.json"
+    echo "    median: ${median_us} µs"
+}
+
+# ---------------------------------------------------------------------------
+# Workload: select_sum_65k_i64
+# ---------------------------------------------------------------------------
+run_sum_scalar() {
+    run_analytical "select_sum_65k_i64" 65536 \
+        "SELECT SUM(x) FROM bench_analytical;"
+}
+
+# ---------------------------------------------------------------------------
+# Workload: select_avg_1m_i64
+# ---------------------------------------------------------------------------
+run_avg_scalar() {
+    run_analytical "select_avg_1m_i64" 1000000 \
+        "SELECT AVG(x) FROM bench_analytical;"
+}
+
+# ---------------------------------------------------------------------------
+# Workload: filter_sum_1m_i64
+# ---------------------------------------------------------------------------
+run_filter_sum() {
+    run_analytical "filter_sum_1m_i64" 1000000 \
+        "SELECT SUM(x) FROM bench_analytical WHERE x > 5000000;"
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-run_insert
-run_update
-run_delete
-run_mixed
+WORKLOAD="${1:-all}"
+case "$WORKLOAD" in
+    insert_throughput_10k)   run_insert ;;
+    update_throughput_10k)   run_update ;;
+    delete_throughput_10k)   run_delete ;;
+    mixed_oltp_pgbench_like) run_mixed ;;
+    select_scan_10k)         run_select_scan ;;
+    select_sum_65k_i64)      run_sum_scalar ;;
+    select_avg_1m_i64)       run_avg_scalar ;;
+    filter_sum_1m_i64)       run_filter_sum ;;
+    all)
+        run_insert
+        run_update
+        run_delete
+        run_mixed
+        run_select_scan
+        run_sum_scalar
+        run_avg_scalar
+        run_filter_sum
+        ;;
+    *)
+        echo "run_duckdb_writes.sh: unknown workload '$WORKLOAD'" >&2
+        exit 2
+        ;;
+esac
 
 echo "run_duckdb_writes.sh: done — results in ${RAW_DIR}/"

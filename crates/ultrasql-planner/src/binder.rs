@@ -1495,12 +1495,27 @@ fn classify_aggregate(name: &str, args_empty: bool) -> Option<AggregateFunc> {
 }
 
 /// Return type for a given aggregate function and argument type.
+///
+/// The widening rules below mirror PostgreSQL and the executor's
+/// `add_values` helper in `ultrasql_executor::hash_aggregate`:
+///
+/// - `SUM` over any integer type returns `Int64` (BIGINT) so an
+///   accumulating fold of 32-bit inputs cannot silently overflow.
+/// - `SUM` over either floating type returns `Float64`.
+/// - `AVG` always returns `Float64`; the executor's `divide_value`
+///   helper performs the integer-to-float conversion when finalising.
 fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> DataType {
     match func {
         AggregateFunc::CountStar | AggregateFunc::Count => DataType::Int64,
-        AggregateFunc::Sum | AggregateFunc::Avg => {
+        AggregateFunc::Sum => match arg_type {
+            DataType::Int16 | DataType::Int32 | DataType::Int64 => DataType::Int64,
+            DataType::Float32 | DataType::Float64 => DataType::Float64,
+            other if other.is_numeric() => other,
+            _ => DataType::Null,
+        },
+        AggregateFunc::Avg => {
             if arg_type.is_numeric() {
-                arg_type
+                DataType::Float64
             } else {
                 DataType::Null
             }
