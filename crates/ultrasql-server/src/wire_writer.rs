@@ -357,9 +357,15 @@ mod tests {
         let mut scratch = [0u8; 20];
         assert_eq!(format_i64_into(&mut scratch, 9_876_543_210), b"9876543210");
         let mut scratch = [0u8; 20];
-        assert_eq!(format_i64_into(&mut scratch, i64::MAX), b"9223372036854775807");
+        assert_eq!(
+            format_i64_into(&mut scratch, i64::MAX),
+            b"9223372036854775807"
+        );
         let mut scratch = [0u8; 20];
-        assert_eq!(format_i64_into(&mut scratch, i64::MIN), b"-9223372036854775808");
+        assert_eq!(
+            format_i64_into(&mut scratch, i64::MIN),
+            b"-9223372036854775808"
+        );
     }
 
     /// `write_int32_text` and `write_int64_text` write zero allocations.
