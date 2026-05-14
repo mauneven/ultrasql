@@ -403,6 +403,18 @@ pub async fn serve_listener(listener: TcpListener, state: Arc<Server>) -> Result
                 continue;
             }
         };
+        // Disable Nagle's algorithm: queries and their responses are
+        // dispatched in single coalesced `write_all` calls already, so
+        // there is no batching for Nagle to add to. With Nagle on, the
+        // kernel can hold a small reply for up to ~40 ms waiting for a
+        // companion segment that never arrives, blowing the latency
+        // budget of every simple-query roundtrip. Logged-and-ignored
+        // failure: the stream still works without TCP_NODELAY, just
+        // slower, and we do not want a transient setsockopt error to
+        // kill an otherwise-fine connection.
+        if let Err(e) = stream.set_nodelay(true) {
+            warn!(target: "ultrasqld", %peer, error = %e, "TCP_NODELAY failed");
+        }
         debug!(target: "ultrasqld", %peer, "connection accepted");
         let state = Arc::clone(&state);
         tokio::spawn(async move {
