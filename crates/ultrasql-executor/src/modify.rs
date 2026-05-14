@@ -210,22 +210,16 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                 continue;
             }
 
-            // Decode batch into rows so we can operate per-row.
-            let child_schema = self.child.schema().clone();
-            let rows = batch_to_rows(&batch, &child_schema)
-                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-
             match &self.kind {
                 ModifyKind::Delete => {
-                    // Bulk path: extract every TID up front and hand
-                    // the whole batch to `heap.delete_many`, which
-                    // groups by page and acquires one write guard
-                    // per affected page (rather than per row).
-                    let mut tids: Vec<TupleId> = Vec::with_capacity(rows.len());
-                    for row in &rows {
-                        let (tid, _) = extract_tid_and_row(row, self.relation)?;
-                        tids.push(tid);
-                    }
+                    // Bulk path: read every TID **directly** from the
+                    // batch's first two columns (`tid_block`,
+                    // `tid_slot` — both non-nullable `Int32` per
+                    // `SeqScan::new_with_tids`) and hand the lot to
+                    // `heap.delete_many`. No `batch_to_rows`
+                    // materialisation, no per-row `Vec<Value>`
+                    // intermediate.
+                    let tids = extract_tids_from_batch(&batch, self.relation)?;
                     let n = tids.len();
                     let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
                     self.heap
@@ -244,6 +238,10 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     self.affected = self.affected.saturating_add(n_u64);
                 }
                 ModifyKind::Update { .. } => {
+                    // Decode batch into rows so we can operate per-row.
+                    let child_schema = self.child.schema().clone();
+                    let rows = batch_to_rows(&batch, &child_schema)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
                     // Bulk path: evaluate assignments for every row,
                     // collect `(TupleId, new_payload_bytes)` pairs,
                     // then hand the whole batch to
@@ -272,6 +270,9 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     self.affected = self.affected.saturating_add(n_u64);
                 }
                 ModifyKind::Insert => {
+                    let child_schema = self.child.schema().clone();
+                    let rows = batch_to_rows(&batch, &child_schema)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
                     for row in rows {
                         self.apply_insert(&row)?;
                         self.affected += 1;
@@ -359,6 +360,53 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
         Ok((tid, new_payload))
     }
+}
+
+/// Extract every `TupleId` from a `Batch` whose first two columns
+/// are `tid_block: Int32` and `tid_slot: Int32` — the shape
+/// `SeqScan::new_with_tids` emits for UPDATE / DELETE child operators.
+///
+/// Reads directly from the column arrays without materialising the
+/// batch as `Vec<Vec<Value>>` (the `batch_to_rows` path the per-row
+/// `extract_tid_and_row` helper used to drive). For a 10 000-row
+/// DELETE this drops one full pass over the payload columns + 10 000
+/// `Vec<Value>` allocations.
+fn extract_tids_from_batch(batch: &Batch, relation: RelationId) -> Result<Vec<TupleId>, ExecError> {
+    let cols = batch.columns();
+    if cols.len() < 2 {
+        return Err(ExecError::TypeMismatch(
+            "DELETE batch must carry leading (tid_block, tid_slot) columns".to_owned(),
+        ));
+    }
+    let (Column::Int32(block_col), Column::Int32(slot_col)) = (&cols[0], &cols[1]) else {
+        return Err(ExecError::TypeMismatch(
+            "TID columns must both be Int32".to_owned(),
+        ));
+    };
+    let block_data = block_col.data();
+    let slot_data = slot_col.data();
+    let n = batch.rows();
+    if block_data.len() < n || slot_data.len() < n {
+        return Err(ExecError::TypeMismatch(
+            "TID column length shorter than batch rows".to_owned(),
+        ));
+    }
+    let mut out: Vec<TupleId> = Vec::with_capacity(n);
+    for i in 0..n {
+        let block_u32 = u32::try_from(block_data[i]).map_err(|_| {
+            ExecError::TypeMismatch(format!(
+                "TID block value {} out of u32 range",
+                block_data[i]
+            ))
+        })?;
+        let slot_u16 = u16::try_from(slot_data[i]).map_err(|_| {
+            ExecError::TypeMismatch(format!("TID slot value {} out of u16 range", slot_data[i]))
+        })?;
+        let page_id =
+            ultrasql_core::PageId::new(relation, ultrasql_core::BlockNumber::new(block_u32));
+        out.push(TupleId::new(page_id, slot_u16));
+    }
+    Ok(out)
 }
 
 /// Extract a `TupleId` and the remaining column values from a row that
