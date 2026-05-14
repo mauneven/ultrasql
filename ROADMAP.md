@@ -557,13 +557,20 @@ serializable (SSI). Real row-level locking. Deadlock detection.
   Index dead-entry reclamation already lives in
   `BTree::vacuum(is_dead)`; the missing piece is the heap-side
   driver and the autovacuum cadence that runs both together.
-- [ ] **Persistent catalog typed-tuple decoder missing** —
-  `PersistentCatalog::bootstrap_from_heap` falls back to the initial
-  in-memory snapshot. User tables created in a previous session are
-  recoverable via WAL replay into the catalog snapshot but the
-  on-disk `pg_class` / `pg_attribute` rows are not themselves
-  decoded. Restart-survival is therefore WAL-replay-dependent;
-  losing WAL = losing the catalog.
+- [x] **Persistent catalog typed-tuple decoder** (Item 4 Phase A
+  `c1e1a0d`, Phase B `81f4001`). The catalog row encoders
+  (`ClassRow::encode/decode`, `encode_attribute_row` /
+  `decode_attribute_row`, `schema_from_attributes`) live in
+  `crates/ultrasql-catalog/src/encoding.rs`.
+  `PersistentCatalog::persist_table_rows` writes one ClassRow plus
+  one AttributeRow per field to the pg_class (OID 1259) /
+  pg_attribute (OID 1249) heaps; `bootstrap_from_heap` decodes
+  those rows on warm restart and rebuilds the user `TableEntry`
+  list with full schema. `Session::execute_create_table` calls
+  `persist_table_rows` on every successful CREATE TABLE under a
+  dedicated autocommit txn. Phase C handles DROP-table dead-row
+  visibility, pg_index persistence, and user-defined namespace
+  OIDs.
 
 > Kernel ships and the wire path for `BEGIN` / `COMMIT` / `ROLLBACK`
 > is now wired end-to-end: parser → binder → server `TxnState`
