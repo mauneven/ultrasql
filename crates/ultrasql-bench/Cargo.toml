@@ -62,6 +62,11 @@ name    = "v07_vectorized"
 path    = "benches/v07_vectorized.rs"
 harness = false
 
+[[bench]]
+name    = "push_vs_pull"
+path    = "benches/push_vs_pull.rs"
+harness = false
+
 [dependencies]
 ultrasql-core     = { workspace = true }
 ultrasql-protocol = { workspace = true }

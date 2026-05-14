@@ -76,6 +76,7 @@ pub mod result_op;
 mod row_codec;
 mod seq_scan;
 pub mod set_op;
+pub mod sinks;
 mod sort;
 pub mod sort_aggregate;
 pub mod unique;
@@ -115,6 +116,9 @@ pub use unique::Unique;
 pub use values_scan::ValuesScan;
 pub use window_agg::WindowAgg;
 pub use work_mem::WorkMemBudget;
+
+pub use push_pipeline::{CollectSink, VectorizedPipeline, VectorizedPipelineBuilder};
+pub use sinks::{CountSink, SumSink};
 
 /// Errors raised by the executor.
 ///
