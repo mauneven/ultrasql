@@ -623,7 +623,13 @@ impl Page {
         None
     }
 
-    const fn item_id_offset(slot: SlotIndex) -> usize {
+    /// Byte offset of the `ItemId` for `slot` within the page's
+    /// slot-directory array. Exposed `pub(crate)` so bulk-insert
+    /// paths in [`crate::heap`] can write item ids without paying
+    /// the per-tuple `page.header()` round trip that
+    /// [`Self::insert_tuple_appended`] performs.
+    #[must_use]
+    pub(crate) const fn item_id_offset(slot: SlotIndex) -> usize {
         PAGE_HEADER_SIZE + (slot as usize) * ITEMID_SIZE
     }
 

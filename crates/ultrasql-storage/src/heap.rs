@@ -40,6 +40,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use dashmap::DashMap;
+use smallvec::SmallVec;
 use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
 use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
@@ -52,6 +53,16 @@ use ultrasql_wal::record::RecordType;
 use crate::buffer_pool::{BufferPool, BufferPoolError, PageGuard, PageLoader};
 use crate::page::PageError;
 use crate::wal_sink::{WalSink, WalSinkError};
+
+/// Inline storage for an UPDATE's new-tuple payload.
+///
+/// `(Int32, Int32)` columnar UPDATEs encode a 9-byte body; most narrow
+/// row shapes fit in ≤ 16 bytes. The 16-byte inline buffer eliminates
+/// the per-row `Vec::with_capacity(9)` heap allocation that otherwise
+/// fires once per affected tuple on the bulk-UPDATE path (10 000 rows ⇒
+/// 10 000 tiny `mimalloc` calls). Wider rows spill to the heap exactly
+/// like a regular `Vec<u8>`, so the slow path is unchanged.
+pub type UpdatePayload = SmallVec<[u8; 16]>;
 
 /// Errors raised by the heap access method.
 #[derive(Debug, thiserror::Error)]
@@ -702,12 +713,21 @@ impl<L: PageLoader> HeapAccess<L> {
         opts: InsertOptions<'_>,
         n_atts: u16,
     ) -> Result<usize, HeapError> {
+        use crate::page::{ITEMID_SIZE, ItemId, ItemIdFlags, Page};
+
         let guard = pool.get_page(page_id)?;
         let mut page = guard.write();
         let mut filled: usize = 0;
-        // Scratch buffer reused for every row in this page to avoid the
-        // per-row `Vec` allocation `insert_into_pinned` does.
-        let mut scratch: Vec<u8> = Vec::with_capacity(TUPLE_HEADER_SIZE + 64);
+
+        // Decode the page header ONCE and drive every per-row insert
+        // by mutating local `lower`/`upper`/`slot_count` cursors. The
+        // header is re-encoded into the page bytes a single time, at
+        // the end of the loop, instead of once per row. For a 4 096-
+        // tuple bulk insert this drops ~4 096 `header.decode` +
+        // 4 096 `header.encode` round-trips down to one of each.
+        let mut header = page.header();
+        let mut cur_lower = header.lower as usize;
+        let mut cur_upper = header.upper as usize;
 
         for row in &rows[row_idx..] {
             let tuple_size = TUPLE_HEADER_SIZE
@@ -715,37 +735,55 @@ impl<L: PageLoader> HeapAccess<L> {
                 .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
 
             // Fast-path: skip pages that obviously cannot hold this tuple.
-            let free = page.header().free_space();
-            if free < tuple_size + crate::page::ITEMID_SIZE {
+            let free = cur_upper.saturating_sub(cur_lower);
+            if free < tuple_size + ITEMID_SIZE {
                 break;
             }
+            let tuple_len_u32 = u32::try_from(tuple_size)
+                .map_err(|_| HeapError::Page(PageError::Malformed("tuple too large for page")))?;
+            if tuple_len_u32 > ItemId::MAX_LENGTH {
+                return Err(HeapError::Page(PageError::Malformed(
+                    "tuple length exceeds itemid",
+                )));
+            }
 
-            scratch.clear();
-            scratch.resize(TUPLE_HEADER_SIZE, 0);
-            let tentative_tid = TupleId::new(page_id, 0);
-            let header = TupleHeader::fresh(opts.xmin, opts.command_id, tentative_tid, n_atts);
-            header.encode(&mut scratch[..TUPLE_HEADER_SIZE]);
-            scratch.extend_from_slice(row);
+            // Slot is predictable: `insert_tuple_appended` always uses
+            // `slot_count` as the new slot id. We compute it from the
+            // local `lower` cursor and bake the final `ctid` into the
+            // tuple header up front so no post-insert patch is needed.
+            let slot_count =
+                u16::try_from((cur_lower - crate::page::PAGE_HEADER_SIZE) / ITEMID_SIZE)
+                    .map_err(|_| HeapError::MalformedHeader("slot count overflow"))?;
+            let final_tid = TupleId::new(page_id, slot_count);
+            let tuple_header =
+                TupleHeader::fresh(opts.xmin, opts.command_id, final_tid, n_atts);
 
-            let slot = match page.insert_tuple(&scratch) {
-                Ok(s) => s,
-                Err(PageError::NoSpace { .. }) => break,
-                Err(e) => return Err(HeapError::Page(e)),
-            };
-
-            // Patch the ctid to point at the assigned slot. We re-encode
-            // the header inline into the page bytes rather than calling
-            // through `collect_header_bytes` so this stays a single copy.
-            let final_tid = TupleId::new(page_id, slot);
-            let mut patched_header = header;
-            patched_header.ctid = final_tid;
-            let header_bytes = Self::collect_header_bytes(&patched_header);
+            // Reserve `tuple_size` bytes at the top of the page body.
+            cur_upper -= tuple_size;
             let page_bytes = page.as_bytes_mut();
-            let (slot_offset, _) = Self::slot_window(page_bytes, slot)?;
-            page_bytes[slot_offset..slot_offset + TUPLE_HEADER_SIZE].copy_from_slice(&header_bytes);
+            // Encode the tuple header directly into the page bytes
+            // (zero scratch copy).
+            tuple_header.encode(&mut page_bytes[cur_upper..cur_upper + TUPLE_HEADER_SIZE]);
+            // Copy the row body straight in.
+            page_bytes[cur_upper + TUPLE_HEADER_SIZE..cur_upper + tuple_size]
+                .copy_from_slice(row);
 
+            // Write the slot's `ItemId` (4 bytes) inline.
+            let item = ItemId::new(cur_upper as u32, tuple_len_u32, ItemIdFlags::Normal);
+            let id_off = Page::item_id_offset(slot_count);
+            page_bytes[id_off..id_off + ITEMID_SIZE]
+                .copy_from_slice(&item.into_raw().to_le_bytes());
+
+            cur_lower += ITEMID_SIZE;
             out.push(final_tid);
             filled += 1;
+        }
+
+        // Re-encode the page header once, outside the per-tuple loop.
+        if filled > 0 {
+            header.lower = cur_lower as u16;
+            header.upper = cur_upper as u16;
+            header.encode(page.as_bytes_mut());
         }
 
         Ok(filled)
@@ -1159,9 +1197,10 @@ impl<L: PageLoader> HeapAccess<L> {
     /// path.
     pub fn update_many<I>(&self, edits: I, opts: UpdateOptions<'_>) -> Result<usize, HeapError>
     where
-        I: IntoIterator<Item = (TupleId, Vec<u8>)>,
+        I: IntoIterator<Item = (TupleId, UpdatePayload)>,
     {
-        let mut by_page: ahash::AHashMap<PageId, Vec<(u16, Vec<u8>)>> = ahash::AHashMap::new();
+        let mut by_page: ahash::AHashMap<PageId, Vec<(u16, UpdatePayload)>> =
+            ahash::AHashMap::new();
         for (tid, payload) in edits {
             by_page
                 .entry(tid.page)
@@ -1176,7 +1215,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // HOT-failed entries fall back to the per-tuple `update`
         // path. Collected after each page's batch so we don't try to
         // re-enter `update` while still holding the page's `PageGuard`.
-        let mut fallback: Vec<(TupleId, Vec<u8>)> = Vec::new();
+        let mut fallback: Vec<(TupleId, UpdatePayload)> = Vec::new();
 
         for (page_id, mut entries) in by_page {
             // Sort by slot to walk the page slot-directory in
@@ -1323,10 +1362,26 @@ impl<L: PageLoader> HeapAccess<L> {
                     .push((old_tid.slot, *new_tid));
             }
             for (page_id, slots_and_new) in by_old_page {
+                // Bulk stamp every old tuple on this page under one
+                // PageWrite. `stamp_updated_old_inline` writes only
+                // the four header fields that change (xmax / cmax /
+                // infomask / ctid) at fixed offsets, skipping the
+                // full `TupleHeader::decode` + re-`encode` that
+                // `stamp_updated_old` paid per row.
                 let guard = self.pool.get_page(page_id)?;
-                for (slot, new_tid) in slots_and_new {
-                    Self::stamp_updated_old(&guard, TupleId::new(page_id, slot), new_tid, opts)?;
+                let mut page = guard.write();
+                let page_bytes = page.as_bytes_mut();
+                for (slot, new_tid) in &slots_and_new {
+                    Self::stamp_updated_old_inline(
+                        page_bytes,
+                        *slot,
+                        *new_tid,
+                        opts.xid,
+                        opts.command_id,
+                    )?;
                 }
+                drop(page);
+                drop(guard);
                 if let Some(vm) = opts.vm {
                     vm.clear(page_id.relation, page_id.block);
                 }
@@ -1718,6 +1773,81 @@ impl<L: PageLoader> HeapAccess<L> {
     /// the closing brace, but `page_bytes` borrows from `page`, so the
     /// borrow checker requires the guard to live until function exit.
     #[allow(clippy::significant_drop_tightening)]
+    /// Tight inline variant of [`Self::stamp_updated_old`] that
+    /// writes only the four header fields a non-HOT UPDATE actually
+    /// changes (`xmax` / `cmax` / `infomask | UPDATED` / `ctid`) at
+    /// known fixed offsets within the slot, without paying a full
+    /// `TupleHeader::decode` + re-`encode` per row.
+    ///
+    /// Caller is responsible for holding a `PageWrite` over the
+    /// page; this helper performs no locking. Used by
+    /// `update_many`'s bulk-non-HOT fallback to stamp every entry
+    /// on a source page under a single page guard.
+    ///
+    /// Layout (mirrors `TupleHeader::encode`):
+    ///   bytes  0..8   xmin   (read-only here)
+    ///   bytes  8..16  xmax       ← stamped
+    ///   bytes 16..20  cmin   (read-only)
+    ///   bytes 20..24  cmax       ← stamped
+    ///   bytes 24..26  infomask   ← OR-ed with `UPDATED`
+    ///   bytes 26..28  n_atts (read-only)
+    ///   bytes 28..30  data_offset (read-only)
+    ///   bytes 30..32  reserved
+    ///   bytes 32..36  ctid relation   ← stamped
+    ///   bytes 36..40  ctid block+slot ← stamped
+    fn stamp_updated_old_inline(
+        page_bytes: &mut [u8; ultrasql_core::constants::PAGE_SIZE],
+        old_slot: u16,
+        new_tid: TupleId,
+        xid: Xid,
+        command_id: CommandId,
+    ) -> Result<(), HeapError> {
+        let (slot_offset, slot_length) = Self::slot_window(page_bytes, old_slot)?;
+        if slot_length < TUPLE_HEADER_SIZE {
+            return Err(HeapError::MalformedHeader("slot shorter than header"));
+        }
+
+        // Check tuple is alive — `is_alive == xmax.is_invalid()`,
+        // and `Xid::INVALID == 0`, so read the 8-byte xmax field
+        // and compare to zero. Eight bytes — one cache-line touch.
+        let xmax_at = slot_offset + 8;
+        let existing_xmax = u64::from_le_bytes(
+            page_bytes[xmax_at..xmax_at + 8]
+                .try_into()
+                .expect("8-byte slice"),
+        );
+        if existing_xmax != 0 {
+            return Err(HeapError::MalformedHeader("update on deleted tuple"));
+        }
+
+        // Stamp xmax (bytes 8..16).
+        page_bytes[xmax_at..xmax_at + 8].copy_from_slice(&xid.raw().to_le_bytes());
+
+        // Stamp cmax (bytes 20..24).
+        let cmax_at = slot_offset + 20;
+        page_bytes[cmax_at..cmax_at + 4].copy_from_slice(&command_id.raw().to_le_bytes());
+
+        // OR `UPDATED` into infomask (bytes 24..26).
+        let infomask_at = slot_offset + 24;
+        let cur_infomask =
+            u16::from_le_bytes([page_bytes[infomask_at], page_bytes[infomask_at + 1]]);
+        let new_infomask = cur_infomask | InfoMask::UPDATED;
+        page_bytes[infomask_at..infomask_at + 2].copy_from_slice(&new_infomask.to_le_bytes());
+
+        // Stamp ctid relation (bytes 32..36).
+        let ctid_rel_at = slot_offset + 32;
+        page_bytes[ctid_rel_at..ctid_rel_at + 4]
+            .copy_from_slice(&new_tid.page.relation.0.raw().to_le_bytes());
+
+        // Stamp ctid block+slot packing (bytes 36..40).
+        let block_slot_packed = (new_tid.page.block.raw() & 0x00FF_FFFF)
+            | ((u32::from(new_tid.slot)) << 24);
+        page_bytes[ctid_rel_at + 4..ctid_rel_at + 8]
+            .copy_from_slice(&block_slot_packed.to_le_bytes());
+
+        Ok(())
+    }
+
     fn stamp_updated_old(
         guard: &PageGuard<L>,
         old_tid: TupleId,

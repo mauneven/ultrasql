@@ -30,7 +30,9 @@ use std::sync::Arc;
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Value, Xid};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::heap::{DeleteOptions, HeapAccess, InsertOptions, UpdateOptions};
+use ultrasql_storage::heap::{
+    DeleteOptions, HeapAccess, InsertOptions, UpdateOptions, UpdatePayload,
+};
 use ultrasql_storage::wal_sink::WalSink;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
@@ -371,7 +373,8 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         let child_schema = self.child.schema().clone();
                         let rows = batch_to_rows(&batch, &child_schema)
                             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-                        let mut edits: Vec<(TupleId, Vec<u8>)> = Vec::with_capacity(rows.len());
+                        let mut edits: Vec<(TupleId, UpdatePayload)> =
+                            Vec::with_capacity(rows.len());
                         for row in &rows {
                             let edit = self.compute_update_edit(row)?;
                             edits.push(edit);
@@ -454,7 +457,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
     /// `fixed_width_lower_bound`-sized initial capacity so the first
     /// push does not reallocate). The encoded payload is handed to
     /// [`HeapAccess::update_many`] by the bulk caller.
-    fn compute_update_edit(&self, row: &[Value]) -> Result<(TupleId, Vec<u8>), ExecError> {
+    fn compute_update_edit(&self, row: &[Value]) -> Result<(TupleId, UpdatePayload), ExecError> {
         let (tid, orig_row) = extract_tid_and_row(row, self.relation)?;
 
         // Build the new row from the original, applying assignments.
@@ -484,7 +487,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             .codec
             .encode(&new_row)
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-        Ok((tid, new_payload))
+        // Move the encoded bytes into a `SmallVec<[u8; 16]>`; rows
+        // ≤ 16 bytes stay inline. `SmallVec::from_vec` reuses the
+        // existing heap buffer when the row spills.
+        let payload = UpdatePayload::from_vec(new_payload);
+        Ok((tid, payload))
     }
 }
 
@@ -509,7 +516,7 @@ fn build_update_edits_int32_pair(
     batch: &Batch,
     relation: RelationId,
     spec: UpdateFastPathInt32Pair,
-) -> Result<Vec<(TupleId, Vec<u8>)>, ExecError> {
+) -> Result<Vec<(TupleId, UpdatePayload)>, ExecError> {
     let cols = batch.columns();
     if cols.len() < 4 {
         return Err(ExecError::TypeMismatch(
@@ -537,7 +544,7 @@ fn build_update_edits_int32_pair(
             "UPDATE column length shorter than batch rows".to_owned(),
         ));
     }
-    let mut out: Vec<(TupleId, Vec<u8>)> = Vec::with_capacity(n);
+    let mut out: Vec<(TupleId, UpdatePayload)> = Vec::with_capacity(n);
     for i in 0..n {
         let block_u32 = u32::try_from(block_data[i]).map_err(|_| {
             ExecError::TypeMismatch(format!(
@@ -556,8 +563,10 @@ fn build_update_edits_int32_pair(
         } else {
             (id_v, val_v.wrapping_add(spec.delta))
         };
-        // Inline 9-byte payload encode.
-        let mut payload = Vec::with_capacity(9);
+        // Inline 9-byte payload assembled into a `SmallVec<[u8; 16]>`
+        // so the per-row encode pays no heap allocation: the entire
+        // body lives in the SmallVec's inline buffer.
+        let mut payload = UpdatePayload::new();
         payload.push(0_u8); // null bitmap: both non-NULL.
         payload.extend_from_slice(&new_id.to_le_bytes());
         payload.extend_from_slice(&new_val.to_le_bytes());
