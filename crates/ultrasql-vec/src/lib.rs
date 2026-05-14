@@ -25,6 +25,7 @@ pub mod batch;
 pub mod bitmap;
 pub mod column;
 pub mod dict;
+pub mod dict_i64;
 pub mod kernels;
 
 pub use batch::{Batch, BatchError};
@@ -48,3 +49,10 @@ pub use kernels::{
     filter_sum_par_i64_where_gt_zero,
 };
 pub use kernels::{hash_i64, hash_i64_scalar, hash_text_bytes, hash_text_bytes_scalar};
+
+pub use dict_i64::{
+    DictI64U8, DictI64U16, PredicateMask16, PredicateMask256, PredicateMask65536,
+    filter_sum_i64_where_dict_predicate, filter_sum_i64_where_dict_predicate_scalar,
+    filter_sum_i64_where_dict_predicate_tbl, filter_sum_i64_where_dict_predicate_u16,
+    filter_sum_par_auto_i64_where_dict_predicate, filter_sum_par_i64_where_dict_predicate,
+};
