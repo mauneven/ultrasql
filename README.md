@@ -97,7 +97,7 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | Relative |
 | --- | ---: | --- |
-| **UltraSQL** | 684.50 µs | `█                                   ` |
+| **UltraSQL** | 753.96 µs | `█                                   ` |
 | DuckDB | 897.42 µs | `█                                   ` |
 | ClickHouse | 1.17 ms | `█                                   ` |
 | SQLite | 1.81 ms | `██                                  ` |

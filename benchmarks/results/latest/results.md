@@ -74,7 +74,7 @@ Dataset:         10000 rows
 
 | Rank | Engine | Median time | Relative | Samples |
 |------|--------|-------------|----------|---------|
-| 1 | ultrasql | 684.50 µs | `█                                               ` | 8 |
+| 1 | ultrasql | 753.96 µs | `█                                               ` | 8 |
 | 2 | duckdb | 897.42 µs | `██                                              ` | 8 |
 | 3 | clickhouse | 1.17 ms | `██                                              ` | 8 |
 | 4 | sqlite3 | 1.81 ms | `███                                             ` | 8 |

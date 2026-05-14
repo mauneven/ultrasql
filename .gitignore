@@ -49,3 +49,4 @@ local.toml
 
 # Benchmark artifacts (intermediate; committed results live in benchmarks/results)
 target/criterion/
+.automation/

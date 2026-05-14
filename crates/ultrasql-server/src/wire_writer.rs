@@ -99,33 +99,62 @@ pub(crate) fn write_int32_pair_data_rows(
 ) {
     debug_assert_eq!(a.len(), b.len());
     let n = a.len();
+    if n == 0 {
+        return;
+    }
     // Worst-case wire size per row: 1 + 4 + 2 + (4 + 11) + (4 + 11) = 37
-    // bytes ("-2147483648" is the widest i32 text). The amortised
-    // case (3-5 digit values from a fresh preload) is ~25 bytes; we
-    // reserve the worst case once to skip every mid-loop resize.
+    // bytes ("-2147483648" is the widest i32 text). Reserve the
+    // worst case once to skip every mid-loop resize.
     sink.reserve(n * 37);
+    // Cast SAFETY: we just reserved `n * 37` contiguous capacity, so
+    // the spare region has at least that many writable bytes. We
+    // write into the raw slice and advance the BytesMut length once
+    // at the end; this collapses every per-row `put_*` call into a
+    // straight memcpy + index store.
+    let base_len = sink.len();
+    let cap = sink.capacity();
+    let writable = cap - base_len;
+    let raw_ptr: *mut u8 = unsafe { sink.as_mut_ptr().add(base_len) };
+    let raw: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(raw_ptr, writable) };
+
+    let mut off: usize = 0;
     let mut scratch_a = [0u8; 12];
     let mut scratch_b = [0u8; 12];
     for row in 0..n {
-        // DataRow envelope: 1 B tag, 4 B length placeholder, 2 B ncols.
-        sink.put_u8(DATA_ROW_TAG);
-        let length_index = sink.len();
-        sink.put_i32(0);
-        let payload_start = sink.len();
-        sink.put_i16(2);
+        // DataRow tag.
+        raw[off] = DATA_ROW_TAG;
+        off += 1;
+        let length_index = off;
+        off += 4; // length placeholder
+        let payload_start = off;
+        // ncols = 2 (big-endian i16).
+        raw[off] = 0;
+        raw[off + 1] = 2;
+        off += 2;
 
         let a_text = format_i32_into(&mut scratch_a, a[row]);
-        sink.put_i32(i32_from_usize(a_text.len()));
-        sink.put_slice(a_text);
+        let a_len = a_text.len();
+        raw[off..off + 4].copy_from_slice(&(i32_from_usize(a_len)).to_be_bytes());
+        off += 4;
+        raw[off..off + a_len].copy_from_slice(a_text);
+        off += a_len;
 
         let b_text = format_i32_into(&mut scratch_b, b[row]);
-        sink.put_i32(i32_from_usize(b_text.len()));
-        sink.put_slice(b_text);
+        let b_len = b_text.len();
+        raw[off..off + 4].copy_from_slice(&(i32_from_usize(b_len)).to_be_bytes());
+        off += 4;
+        raw[off..off + b_len].copy_from_slice(b_text);
+        off += b_len;
 
-        let payload_len = sink.len() - payload_start;
+        let payload_len = off - payload_start;
         let length = i32_from_usize(payload_len + 4);
-        sink[length_index..length_index + 4]
-            .copy_from_slice(&length.to_be_bytes());
+        raw[length_index..length_index + 4].copy_from_slice(&length.to_be_bytes());
+    }
+    // SAFETY: `off` ≤ `writable` because the worst-case-37-bytes
+    // reserve covers every row's maximum width; `raw` is the spare
+    // region of `sink` we reserved above.
+    unsafe {
+        sink.set_len(base_len + off);
     }
 }
 
