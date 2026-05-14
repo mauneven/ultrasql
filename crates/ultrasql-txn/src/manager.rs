@@ -173,6 +173,15 @@ pub struct TransactionManager {
     /// that transition is owned by the vacuum subsystem and is not
     /// performed here.
     clog: DashMap<Xid, XidStatus>,
+    /// Hot-path mirror of every XID currently in
+    /// [`XidStatus::InProgress`]. Updated atomically with `clog`: insert
+    /// on `begin`, remove on `terminate`. Holds a `BTreeSet` so
+    /// [`Self::build_snapshot`] reads `xmin` in O(log n) (first key) and
+    /// emits `xip` in O(n_in_progress) — without walking every
+    /// historically-committed CLOG entry. The full `clog` is still the
+    /// source of truth for visibility lookups (`XidStatusOracle`) and
+    /// recovery.
+    in_progress: parking_lot::Mutex<std::collections::BTreeSet<Xid>>,
     /// Optional SSI conflict tracker. Present only when the server is
     /// configured to support [`IsolationLevel::Serializable`] isolation.
     /// `None` causes Serializable to alias `RepeatableRead` (the pre-v0.4
@@ -203,6 +212,7 @@ impl TransactionManager {
         Self {
             next_xid: AtomicU64::new(Xid::FIRST_USER.raw()),
             clog: DashMap::new(),
+            in_progress: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             ssi: None,
             lock_manager: Arc::new(LockManager::new()),
         }
@@ -219,6 +229,7 @@ impl TransactionManager {
         Self {
             next_xid: AtomicU64::new(Xid::FIRST_USER.raw()),
             clog: DashMap::new(),
+            in_progress: parking_lot::Mutex::new(std::collections::BTreeSet::new()),
             ssi: Some(ssi),
             lock_manager: Arc::new(LockManager::new()),
         }
@@ -236,12 +247,16 @@ impl TransactionManager {
         let raw = self.next_xid.fetch_add(1, Ordering::AcqRel);
         let xid = Xid::new(raw);
 
-        // 2. Publish the XID as in-progress in the CLOG *before*
-        //    sampling the active set. This ordering matters: any
-        //    snapshot taken concurrently after this insert will observe
-        //    our XID either in `xip` or via `xmax`; both cases are
-        //    correct.
+        // 2. Publish the XID as in-progress in the CLOG *and* in the
+        //    hot-path `in_progress` mirror *before* sampling the
+        //    active set. Ordering matters: any snapshot taken
+        //    concurrently after these inserts will observe our XID
+        //    either in `xip` or via `xmax`; both cases are correct.
+        //    The clog stays the source of truth for visibility
+        //    queries; `in_progress` is the read-only set
+        //    `build_snapshot` walks.
         self.clog.insert(xid, XidStatus::InProgress);
+        self.in_progress.lock().insert(xid);
 
         // 3. Sample the active transactions and the high-water XID.
         let snapshot = self.build_snapshot(xid, CommandId::FIRST);
@@ -404,35 +419,40 @@ impl TransactionManager {
         let xmax_raw = self.next_xid.load(Ordering::Acquire);
         let xmax = Xid::new(xmax_raw);
 
-        // Walk the CLOG once. Building `xip` and computing `xmin` in
-        // the same pass keeps this O(n) where n is the number of CLOG
-        // entries. For v0.5 we expect n to be small enough that the
-        // simple scan is well below the per-statement budget.
-        let mut xip: Vec<Xid> = Vec::new();
+        // Walk the hot-path `in_progress` mirror instead of the full
+        // CLOG. `in_progress` only ever holds InProgress XIDs (begin
+        // inserts; terminate removes), so this is O(in-progress) per
+        // snapshot rather than O(total committed history). For an
+        // autocommit workload with no concurrent writers the set is
+        // typically empty or single-entry; the prior CLOG-walk path
+        // re-visited every historically-committed entry on every
+        // statement.
+        //
+        // `BTreeSet` gives us `xmin` (smallest element) in O(log n)
+        // and an ordered `xip` Vec via in-order iteration without an
+        // extra sort. Holding the lock briefly is fine: writers only
+        // contend on begin/commit/abort which are already serialised
+        // through the CLOG's per-shard locks.
+        let active = self.in_progress.lock();
+        let mut xip: Vec<Xid> = Vec::with_capacity(active.len());
         let mut min_xid: Option<Xid> = None;
-        for entry in &self.clog {
-            if !matches!(*entry.value(), XidStatus::InProgress) {
-                continue;
-            }
-            let xid = *entry.key();
-            // Exclude our own XID from the active set. The snapshot's
-            // `current_xid` slot identifies us; the visibility predicate
-            // treats `current_xid` specially.
+        for &xid in active.iter() {
+            // Exclude our own XID — the snapshot's `current_xid`
+            // slot identifies us; the visibility predicate treats
+            // `current_xid` specially.
             if xid == current_xid {
                 continue;
             }
             // Defensive: ignore any XID at or above the xmax we
-            // observed. Such an XID was inserted after our `xmax` load
-            // and falls into the implicit-future region by definition.
+            // observed. Such an XID was inserted after our `xmax`
+            // load and falls into the implicit-future region.
             if xid >= xmax {
                 continue;
             }
             xip.push(xid);
-            min_xid = Some(match min_xid {
-                Some(cur) if cur <= xid => cur,
-                _ => xid,
-            });
+            min_xid = Some(min_xid.map_or(xid, |cur| if cur <= xid { cur } else { xid }));
         }
+        drop(active);
 
         let xmin = min_xid.unwrap_or(xmax);
         Snapshot::new(xmin, xmax, current_xid, current_command, xip)
@@ -455,6 +475,7 @@ impl TransactionManager {
                 let raw = self.next_xid.fetch_add(1, Ordering::AcqRel);
                 let sub_xid = Xid::new(raw);
                 self.clog.insert(sub_xid, XidStatus::InProgress);
+                self.in_progress.lock().insert(sub_xid);
                 sub_xid
             },
             txn.current_command,
@@ -481,6 +502,8 @@ impl TransactionManager {
             if let Some(mut entry) = self.clog.get_mut(&sub_xid) {
                 if matches!(*entry.value(), XidStatus::InProgress) {
                     *entry.value_mut() = XidStatus::Aborted;
+                    drop(entry);
+                    self.in_progress.lock().remove(&sub_xid);
                 }
             }
             // Track the rollback locally so visibility code can detect
@@ -509,6 +532,8 @@ impl TransactionManager {
         if let Some(mut entry) = self.clog.get_mut(&sub_xid) {
             if matches!(*entry.value(), XidStatus::InProgress) {
                 *entry.value_mut() = XidStatus::Committed;
+                drop(entry);
+                self.in_progress.lock().remove(&sub_xid);
             }
         }
         Ok(sub_xid)
@@ -554,6 +579,10 @@ impl TransactionManager {
         match *entry.value() {
             XidStatus::InProgress => {
                 *entry.value_mut() = new_status;
+                // Drop the shard lock before touching `in_progress`
+                // to keep lock order: clog → in_progress.
+                drop(entry);
+                self.in_progress.lock().remove(&xid);
                 Ok(())
             }
             other => Err(TxnError::AlreadyTerminated { xid, status: other }),
@@ -571,6 +600,8 @@ impl TransactionManager {
     fn force_abort(&self, xid: Xid) {
         if let Some(mut entry) = self.clog.get_mut(&xid) {
             *entry.value_mut() = XidStatus::Aborted;
+            drop(entry);
+            self.in_progress.lock().remove(&xid);
         }
     }
 

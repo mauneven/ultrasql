@@ -227,11 +227,39 @@ pub fn stream_select(op: &mut dyn Operator, sink: &mut BytesMut) -> Result<u64, 
 /// is present. The row-count is propagated so callers (e.g. autocommit
 /// finalisation) keep their behaviour unchanged.
 pub fn run_select_streamed(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
-    // Initial capacity: an int-only `select_scan_10k` produces roughly
-    // ~14 bytes per row; round up to 32 to keep small queries from
-    // re-allocating mid-stream. Larger scans grow the buffer
-    // geometrically through `BytesMut::reserve`.
-    let mut sink = BytesMut::with_capacity(32 * 1024);
+    // Initial capacity: when the operator advertises its row count
+    // (column-cache replay, materialised CTE, LIMIT n) we can size
+    // the buffer to the exact wire-byte budget upfront and skip
+    // every `BytesMut::reserve` reallocation. The width estimate
+    // assumes each column expands to a 5-cell-overhead text-format
+    // datum averaging 8 bytes — generous enough for typical int /
+    // small-string scans without wasting more than one growth cycle
+    // when the relation is wider. Without a hint, fall back to the
+    // 32 KiB starting size so small queries stay on one allocation.
+    // DataRow wire layout per row: 1B tag + 4B length + 2B ncols +
+    // per column (4B length + ascii text). For a typical int column
+    // the ascii text is ~5-10 bytes; varchar columns can be wider.
+    // We size to 8B per column to stay tight on the common
+    // narrow-int case (the bench's `(id INT, val INT)` lands at
+    // ~25 B/row, and an 8 B/col bound puts us at 24 B/row + 7 B
+    // overhead = 31 B/row, just over the actual width).
+    //
+    // One extra growth cycle is cheap; over-allocating doubles the
+    // initial syscall cost (page-fault the pre-touched bytes), so
+    // we lean tight rather than generous.
+    const PER_ROW_OVERHEAD_BYTES: usize = 7; // tag + length + ncols
+    const PER_CELL_BYTES_ESTIMATE: usize = 12; // 4B length + ~8B text
+    const ROWDESC_AND_TAG_BYTES: usize = 256;
+    let initial_cap = match op.estimated_row_count() {
+        Some(rows) => {
+            let cols = op.schema().len().max(1);
+            let body = rows
+                .saturating_mul(PER_ROW_OVERHEAD_BYTES + cols * PER_CELL_BYTES_ESTIMATE);
+            body.saturating_add(ROWDESC_AND_TAG_BYTES)
+        }
+        None => 32 * 1024,
+    };
+    let mut sink = BytesMut::with_capacity(initial_cap);
     let rows = stream_select(op, &mut sink)?;
     Ok(SelectResult {
         messages: Vec::new(),

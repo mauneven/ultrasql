@@ -216,6 +216,24 @@ pub trait Operator: Send + Debug {
     ///
     /// The schema does not change for the lifetime of the operator.
     fn schema(&self) -> &Schema;
+
+    /// Best-effort upper bound on the total number of rows this
+    /// operator will emit across all `next_batch` calls. Used by
+    /// downstream wire-encoders to pre-reserve their output buffer
+    /// and skip mid-loop reallocations.
+    ///
+    /// The default returns `None` — callers must tolerate the absence
+    /// of a hint and fall back to geometric growth. Operators that
+    /// know their cardinality statically (column-cache replay,
+    /// materialised CTE replay, `LIMIT n`) override this method.
+    ///
+    /// The hint is advisory. Returning a value that turns out to be
+    /// wrong (because, e.g., a child operator hides rows under a
+    /// predicate the parent does not see) is not a contract
+    /// violation — the encoder grows past the reservation as usual.
+    fn estimated_row_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[cfg(test)]

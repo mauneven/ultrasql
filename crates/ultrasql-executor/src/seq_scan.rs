@@ -487,6 +487,16 @@ where
     fn schema(&self) -> &Schema {
         &self.output_schema
     }
+
+    fn estimated_row_count(&self) -> Option<usize> {
+        // Cache-read path knows the relation's total cardinality
+        // up front; advertise it so the wire-encoder can pre-reserve
+        // the response buffer and skip mid-stream `BytesMut::reserve`
+        // reallocations.
+        self.cache_read.as_ref().and_then(|state| {
+            state.columns.columns.first().map(ultrasql_vec::column::Column::len)
+        })
+    }
 }
 
 impl<L, O> SeqScan<L, O>
