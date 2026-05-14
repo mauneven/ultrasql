@@ -511,6 +511,92 @@ pub enum LogicalPlan {
         /// Always [`Schema::empty`].
         schema: Schema,
     },
+
+    /// `BEGIN [TRANSACTION]` — open an explicit transaction block.
+    ///
+    /// The planner produces this variant unconditionally; the server
+    /// inspects the session's transaction state to either transition
+    /// `Idle → InTransaction` or emit a `NoticeResponse` if a
+    /// transaction is already open (matching PostgreSQL's
+    /// `WARNING: there is already a transaction in progress`).
+    ///
+    /// `schema` is always [`Schema::empty`].
+    Begin {
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `COMMIT` — finalise the current explicit transaction block.
+    ///
+    /// In `Failed` state the server commits as a rollback (matching
+    /// PostgreSQL semantics) but still emits the `ROLLBACK` command
+    /// tag. In `Idle` state the server emits a `NoticeResponse`
+    /// `WARNING: there is no transaction in progress` and treats the
+    /// statement as a no-op.
+    ///
+    /// `schema` is always [`Schema::empty`].
+    Commit {
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `ROLLBACK` — abort the current explicit transaction block.
+    ///
+    /// In `Idle` state the server emits a `NoticeResponse`
+    /// `WARNING: there is no transaction in progress` and treats the
+    /// statement as a no-op.
+    ///
+    /// `schema` is always [`Schema::empty`].
+    Rollback {
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `SAVEPOINT name` — set a savepoint inside the current
+    /// transaction block.
+    ///
+    /// Outside a transaction the server rejects this with
+    /// `25P01` (`no_active_sql_transaction`).
+    ///
+    /// `schema` is always [`Schema::empty`].
+    Savepoint {
+        /// Case-preserved savepoint name (PostgreSQL lowercases
+        /// unquoted identifiers; the server treats the name
+        /// case-insensitively when matching `ROLLBACK TO` /
+        /// `RELEASE`).
+        name: String,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `ROLLBACK TO [SAVEPOINT] name` — roll back to a named
+    /// savepoint inside the current transaction block.
+    ///
+    /// Outside a transaction the server rejects this with `25P01`.
+    /// An unknown savepoint name surfaces as `3B001`
+    /// (`invalid_savepoint_specification`).
+    ///
+    /// `schema` is always [`Schema::empty`].
+    RollbackToSavepoint {
+        /// Savepoint name.
+        name: String,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `RELEASE [SAVEPOINT] name` — destroy a named savepoint inside
+    /// the current transaction block.
+    ///
+    /// Outside a transaction the server rejects this with `25P01`.
+    /// An unknown savepoint name surfaces as `3B001`.
+    ///
+    /// `schema` is always [`Schema::empty`].
+    ReleaseSavepoint {
+        /// Savepoint name.
+        name: String,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
 }
 
 /// Resolved `ALTER TABLE` action.
@@ -552,7 +638,13 @@ impl LogicalPlan {
             | Self::Cte { schema, .. }
             | Self::CreateIndex { schema, .. }
             | Self::DropTable { schema, .. }
-            | Self::AlterTable { schema, .. } => schema,
+            | Self::AlterTable { schema, .. }
+            | Self::Begin { schema }
+            | Self::Commit { schema }
+            | Self::Rollback { schema }
+            | Self::Savepoint { schema, .. }
+            | Self::RollbackToSavepoint { schema, .. }
+            | Self::ReleaseSavepoint { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
                 input.schema()
             }
@@ -934,6 +1026,30 @@ impl LogicalPlan {
                         );
                     }
                 }
+            }
+            Self::Begin { .. } => {
+                out.push_str(&pad);
+                out.push_str("Begin\n");
+            }
+            Self::Commit { .. } => {
+                out.push_str(&pad);
+                out.push_str("Commit\n");
+            }
+            Self::Rollback { .. } => {
+                out.push_str(&pad);
+                out.push_str("Rollback\n");
+            }
+            Self::Savepoint { name, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("Savepoint: {name}\n"));
+            }
+            Self::RollbackToSavepoint { name, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("RollbackToSavepoint: {name}\n"));
+            }
+            Self::ReleaseSavepoint { name, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("ReleaseSavepoint: {name}\n"));
             }
         }
     }

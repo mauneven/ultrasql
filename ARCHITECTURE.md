@@ -449,6 +449,18 @@ pool sized to (cores − 2) by default.
 catalog cache → start WAL writer → start checkpointer → bind listener
 → accept → on `SIGTERM`, drain → checkpoint → flush WAL → exit.
 
+**Per-session transaction state.** Each connection owns a
+`TxnState` machine with three variants — `Idle`, `InTransaction(txn)`,
+`Failed(txn)` — that mirrors the PostgreSQL `ReadyForQuery` status
+bytes (`'I'`, `'T'`, `'E'`). `BEGIN` transitions `Idle →
+InTransaction`; `COMMIT`/`ROLLBACK` finalise via
+`TxnManager::commit`/`abort` and return to `Idle`. Any executor error
+inside `InTransaction` transitions to `Failed`, and every subsequent
+non-transaction-control statement returns SQLSTATE `25P02` until the
+user issues `COMMIT` (treated as `ROLLBACK`) or `ROLLBACK`. The state
+is single-threaded per-session, so no synchronisation primitive
+guards it.
+
 ---
 
 ## 14. Latch order {#latch-order}

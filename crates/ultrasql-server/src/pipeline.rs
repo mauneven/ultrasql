@@ -220,6 +220,14 @@ pub fn lower_plan(
         | LogicalPlan::AlterTable { .. } => Err(ServerError::Unsupported(
             "DDL reached operator lowerer; expected DDL dispatch path",
         )),
+        LogicalPlan::Begin { .. }
+        | LogicalPlan::Commit { .. }
+        | LogicalPlan::Rollback { .. }
+        | LogicalPlan::Savepoint { .. }
+        | LogicalPlan::RollbackToSavepoint { .. }
+        | LogicalPlan::ReleaseSavepoint { .. } => Err(ServerError::Unsupported(
+            "transaction control reached operator lowerer; expected txn dispatch path",
+        )),
         LogicalPlan::Aggregate { .. } => Err(ServerError::Unsupported("GROUP BY / aggregate")),
         LogicalPlan::SetOp {
             op,
@@ -664,6 +672,14 @@ pub fn lower_query(
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. } => Err(ServerError::Unsupported(
             "DDL reached operator lowerer; expected DDL dispatch path",
+        )),
+        LogicalPlan::Begin { .. }
+        | LogicalPlan::Commit { .. }
+        | LogicalPlan::Rollback { .. }
+        | LogicalPlan::Savepoint { .. }
+        | LogicalPlan::RollbackToSavepoint { .. }
+        | LogicalPlan::ReleaseSavepoint { .. } => Err(ServerError::Unsupported(
+            "transaction control reached operator lowerer; expected txn dispatch path",
         )),
         LogicalPlan::Join {
             left,

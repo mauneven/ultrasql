@@ -86,9 +86,37 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::CreateIndex(s) => bind_create_index(s, catalog),
         Statement::DropTable(s) => bind_drop_table(s, catalog),
         Statement::AlterTable(s) => bind_alter_table(s, catalog),
-        Statement::Begin { .. } | Statement::Commit { .. } | Statement::Rollback { .. } => Err(
-            PlanError::NotSupported("transaction control statements are not planner targets"),
-        ),
+        // Transaction-control statements have no catalog dependency: the
+        // server inspects the per-session [`TxnState`] and dispatches
+        // accordingly. The binder emits the corresponding LogicalPlan
+        // variants so the Simple- and Extended-Query paths share a single
+        // dispatch surface.
+        Statement::Begin { .. } => Ok(LogicalPlan::Begin {
+            schema: Schema::empty(),
+        }),
+        Statement::Commit { .. } => Ok(LogicalPlan::Commit {
+            schema: Schema::empty(),
+        }),
+        Statement::Rollback { .. } => Ok(LogicalPlan::Rollback {
+            schema: Schema::empty(),
+        }),
+        // Savepoint statements: lowercase the name so `ROLLBACK TO`
+        // matches case-insensitively (PostgreSQL behaviour for unquoted
+        // identifiers). Infallible — the parser has already validated
+        // the AST shape, so these are direct AST → LogicalPlan
+        // translations with no further checking.
+        Statement::Savepoint(s) => Ok(LogicalPlan::Savepoint {
+            name: s.name.value.to_ascii_lowercase(),
+            schema: Schema::empty(),
+        }),
+        Statement::RollbackToSavepoint(s) => Ok(LogicalPlan::RollbackToSavepoint {
+            name: s.name.value.to_ascii_lowercase(),
+            schema: Schema::empty(),
+        }),
+        Statement::ReleaseSavepoint(s) => Ok(LogicalPlan::ReleaseSavepoint {
+            name: s.name.value.to_ascii_lowercase(),
+            schema: Schema::empty(),
+        }),
         _ => Err(PlanError::NotSupported("statement variant")),
     }
 }
@@ -2156,7 +2184,13 @@ fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
-        | LogicalPlan::AlterTable { .. } => false,
+        | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::Begin { .. }
+        | LogicalPlan::Commit { .. }
+        | LogicalPlan::Rollback { .. }
+        | LogicalPlan::Savepoint { .. }
+        | LogicalPlan::RollbackToSavepoint { .. }
+        | LogicalPlan::ReleaseSavepoint { .. } => false,
         LogicalPlan::Filter { input, predicate } => {
             expr_contains_outer(predicate) || plan_contains_outer_column(input)
         }

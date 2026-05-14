@@ -89,6 +89,29 @@ pub enum ServerError {
     /// example, `CREATE TABLE` on an existing relation.
     #[error("catalog error: {0}")]
     Catalog(#[from] ultrasql_catalog::CatalogError),
+
+    /// A statement was issued while the current explicit transaction
+    /// was already aborted by a prior error. Maps to PostgreSQL
+    /// SQLSTATE `25P02` (`in_failed_sql_transaction`); the user must
+    /// issue `COMMIT` (treated as `ROLLBACK`) or `ROLLBACK` to leave
+    /// the failed-block state before any further statements are
+    /// accepted.
+    #[error("current transaction is aborted, commands ignored until end of transaction block")]
+    TransactionAborted,
+
+    /// `SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` was issued
+    /// outside a transaction block. Maps to PostgreSQL SQLSTATE
+    /// `25P01` (`no_active_sql_transaction`). The string names the
+    /// failing construct.
+    #[error("{0}")]
+    Savepoint(&'static str),
+
+    /// `RELEASE` / `ROLLBACK TO SAVEPOINT` named an unknown savepoint.
+    /// Maps to PostgreSQL SQLSTATE `3B001`
+    /// (`invalid_savepoint_specification`). The string names the
+    /// missing savepoint.
+    #[error("savepoint '{0}' does not exist")]
+    SavepointNotFound(String),
 }
 
 impl ServerError {
@@ -124,6 +147,9 @@ impl ServerError {
                 | Self::Unsupported(_)
                 | Self::Ddl(_)
                 | Self::Catalog(_)
+                | Self::TransactionAborted
+                | Self::Savepoint(_)
+                | Self::SavepointNotFound(_)
         )
     }
 
@@ -145,6 +171,9 @@ impl ServerError {
             Self::Build(_) | Self::Unsupported(_) => "0A000", // feature_not_supported
             Self::UnsupportedProtocol { .. } => "08P01",      // protocol_violation
             Self::Catalog(_) => "42000",                      // generic catalog failure
+            Self::TransactionAborted => "25P02",              // in_failed_sql_transaction
+            Self::Savepoint(_) => "25P01",                    // no_active_sql_transaction
+            Self::SavepointNotFound(_) => "3B001",            // invalid_savepoint_specification
             // Internal-style: Execute/IO/Protocol/UnexpectedEof and the
             // dynamic Ddl message all map to XX000.
             _ => "XX000",

@@ -106,15 +106,15 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 | `ultrasql-storage` | ✅ Pages, buffer pool (CLOCK-Pro), heap AM, B+ tree, FSM, VM, TOAST, persistent CLOG, WAL applier — `crates/ultrasql-storage/src/lib.rs` |
 | `ultrasql-wal` | ✅ Records, group commit, recovery, FPW; HeapTarget replay wired — `crates/ultrasql-wal/src/lib.rs` |
 | `ultrasql-mvcc` | ✅ Snapshot + visibility rules (PostgreSQL `HeapTupleSatisfiesMVCC`) |
-| `ultrasql-txn` | ✅ TxnManager kernel: BEGIN/COMMIT/ABORT, lock manager, SSI scaffolding, savepoints, 2PC; ⚠️ none of `BEGIN`/`COMMIT`/`ROLLBACK` reaches the wire — binder rejects at `binder.rs:83` |
+| `ultrasql-txn` | ✅ TxnManager kernel: BEGIN/COMMIT/ABORT, lock manager, SSI scaffolding, savepoints, 2PC; ✅ wired through binder + server for `BEGIN`/`COMMIT`/`ROLLBACK` end-to-end (per-session `TxnState` machine; `ReadyForQuery` status byte mirrors PostgreSQL's `'I'`/`'T'`/`'E'`); ⚠️ SAVEPOINT/RELEASE/ROLLBACK TO accepted on the wire but executor does not yet stamp tuples with subxact xid — partial-rollback semantics for already-written rows is a follow-up |
 | `ultrasql-parser` | ✅ Full DML + DDL + CTE + Extended Protocol Parse/Bind syntax |
-| `ultrasql-planner` | ✅ Binder for SELECT/INSERT/UPDATE/DELETE, JOINs, GROUP BY, subqueries, CTEs; ⚠️ `BETWEEN` not yet bound (cross_compare_sql workaround uses `id < N`); BEGIN/COMMIT/ROLLBACK rejected |
+| `ultrasql-planner` | ✅ Binder for SELECT/INSERT/UPDATE/DELETE, JOINs, GROUP BY, subqueries, CTEs, BEGIN/COMMIT/ROLLBACK/SAVEPOINT; ⚠️ `BETWEEN` not yet bound (cross_compare_sql workaround uses `id < N`) |
 | `ultrasql-optimizer` | ✅ Rule-based rewrites, cost model, DPsize/GEQO join enumeration, physical selection, plan cache (~1077 LOC across `lib.rs` + `plan_cache.rs`); ⚠️ not exercised by server's inline `lower_query` (the server bypasses `physical::build_operator`) |
 | `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit, CteScan; ⚠️ recursive CTE fixpoint loop deferred to v0.6 |
 | `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, dictionary encoding, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
 | `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ⚠️ bootstrap-from-heap falls back to initial snapshot (no typed tuple decoder yet) |
 | `ultrasql-protocol` | ✅ Wire codec for Simple Query + Extended Query (Parse/Bind/Describe/Execute/Sync/Close) |
-| `ultrasql-server` | ✅ SCRAM-SHA-256 + TLS, Simple Query end-to-end for `CREATE TABLE`, `INSERT VALUES`, `SELECT`/`SELECT SUM`/`SELECT AVG`/`SELECT WHERE`, `UPDATE`, `DELETE` through real heap; ✅ Extended Query dispatch (Parse/Bind/Describe/Execute/Sync/Close/Flush) with parameter substitution through the same path; ⚠️ BEGIN/COMMIT + JOIN/ORDER BY/SET OPs not yet wired |
+| `ultrasql-server` | ✅ SCRAM-SHA-256 + TLS, Simple Query end-to-end for `CREATE TABLE`, `INSERT VALUES`, `SELECT`/`SELECT SUM`/`SELECT AVG`/`SELECT WHERE`, `UPDATE`, `DELETE` through real heap; ✅ Extended Query dispatch (Parse/Bind/Describe/Execute/Sync/Close/Flush) with parameter substitution through the same path; ✅ explicit transaction blocks (`BEGIN`/`COMMIT`/`ROLLBACK`) via both Simple and Extended Query, with PostgreSQL-faithful `ReadyForQuery` status bytes, `25P02` failed-block rejection, and COMMIT-as-ROLLBACK semantics |
 
 ### Wire-protocol coverage matrix
 
@@ -136,8 +136,8 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 | `UPDATE t SET col = expr WHERE ...` | ✅ | ✅ | ✅ | ✅ |
 | `DELETE FROM t WHERE ...` | ✅ | ✅ | ✅ | ✅ |
 | `TRUNCATE t` | ✅ | ✅ | ✅ | ✅ |
-| `BEGIN / COMMIT / ROLLBACK` | ✅ | ❌ | ❌ | ❌ |
-| `SAVEPOINT / RELEASE / ROLLBACK TO` | ✅ | ❌ | ❌ | ❌ |
+| `BEGIN / COMMIT / ROLLBACK` | ✅ | ✅ | ✅ | ✅ |
+| `SAVEPOINT / RELEASE / ROLLBACK TO` | ✅ | ✅ | ✅ wire path | ⚠️ tuples not yet stamped with subxid; partial rollback of writes deferred |
 | `PREPARE / EXECUTE / DEALLOCATE` (Simple Query) | ✅ | ❌ | ❌ | ❌ |
 | Extended Query (Parse/Bind/Execute) | ✅ codec | n/a | ✅ dispatch | ✅ |
 | `EXPLAIN` / `EXPLAIN ANALYZE` | ✅ | ❌ | ❌ | ❌ |
@@ -155,7 +155,7 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 
 | Priority | Area | Blocking |
 |----------|------|---------|
-| **P0** | v0.5: BEGIN/COMMIT/ROLLBACK end-to-end (binder + server dispatch) | Every multi-statement workload, mixed_oltp_pgbench_like bench, ORM correctness |
+| **P0** | ~~v0.5: BEGIN/COMMIT/ROLLBACK end-to-end (binder + server dispatch)~~ ✅ done — per-session `TxnState` machine (`Idle`/`InTransaction`/`Failed`); Simple + Extended Query round-trip; `ReadyForQuery` status byte mirrors PostgreSQL `'I'`/`'T'`/`'E'`; failed-block returns `25P02`; COMMIT in failed state aborts and returns `ROLLBACK` tag | (was) Every multi-statement workload, mixed_oltp_pgbench_like bench, ORM correctness |
 | **P0** | ~~v0.5: Extended Query dispatch in server~~ ✅ done — Parse/Bind/Describe/Execute/Sync/Close/Flush wired via `extended.rs`; tokio-postgres prepared-statement round-trips green | (was) Every ORM and every driver beyond simple psql |
 | **P0** | v0.5: Wire ORDER BY (`LogicalPlan::Sort`) in `lower_query` | Any ranked output, TPC-H Q1 |
 | **P0** | v0.5: Wire `LogicalPlan::Join` and `SetOp` in `lower_query` | All TPC-H, all real analytical workloads |
@@ -344,11 +344,15 @@ them back with crash recovery. WAL wired to heap.
 **Scope:** ACID transactions with snapshot isolation and true
 serializable (SSI). Real row-level locking. Deadlock detection.
 
-> Kernel ships but is **not yet integrated through the wire**: there
-> is no way for a tokio-postgres client to send `BEGIN` / `COMMIT` /
-> `ROLLBACK` / `SAVEPOINT` and have it traverse parser → binder →
-> server dispatch. Lower binder rejects at `binder.rs:83`. This is a
-> v0.5 P0.
+> Kernel ships and the wire path for `BEGIN` / `COMMIT` / `ROLLBACK`
+> is now wired end-to-end: parser → binder → server `TxnState`
+> dispatch, with PostgreSQL-faithful `ReadyForQuery` status bytes
+> (`'I'`/`'T'`/`'E'`), failed-block rejection via SQLSTATE `25P02`,
+> and COMMIT-as-ROLLBACK on failed-state commits. SAVEPOINT /
+> RELEASE / ROLLBACK TO travel the wire but the executor does not
+> yet stamp tuples with the savepoint's subxact xid, so writes
+> performed under a savepoint cannot be partially rolled back today
+> — that's a follow-up commit.
 
 ### Lock Manager
 - [x] Fastpath relation locks (per-backend cache, no central state)
@@ -370,7 +374,8 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] `ROLLBACK TO SAVEPOINT name` kernel
 - [x] `RELEASE SAVEPOINT name` kernel
 - [ ] Subtransaction tracking in MVCC headers (SubtxnManager ships; header-bit wiring TBD)
-- [ ] All three reachable from the wire (blocked on BEGIN/COMMIT)
+- [x] All three reachable from the wire — parser, binder, and server (`execute_savepoint` / `execute_rollback_to_savepoint` / `execute_release_savepoint`) round-trip via Simple + Extended Query
+- [ ] Executor stamps tuples with subxact xid so partial rollback of in-savepoint writes actually undoes those writes (today the parent xid is used, so SAVEPOINT/INSERT/ROLLBACK TO leaves the row committed with the parent)
 
 ### Two-Phase Commit
 - [x] `PREPARE TRANSACTION 'id'` kernel
@@ -460,16 +465,16 @@ driver can connect.
 - [ ] `max_rows` partial-execution + `PortalSuspended` resumption (currently sends `PortalSuspended` then drops the portal)
 
 ### Transaction Control (wire)
-- [ ] `BEGIN` / `COMMIT` / `ROLLBACK` round-trip
+- [x] `BEGIN` / `COMMIT` / `ROLLBACK` round-trip (Simple + Extended Query)
 - [ ] `BEGIN ISOLATION LEVEL ...`
-- [ ] Implicit transaction per statement (current behaviour) + explicit-transaction state machine
-- [ ] `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` round-trip
+- [x] Implicit transaction per statement (autocommit) + explicit-transaction state machine (`TxnState::Idle`/`InTransaction`/`Failed`)
+- [x] `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` round-trip (wire only — executor does not yet stamp tuples with subxid; see "Subtransactions" above)
 - [ ] `PREPARE` / `EXECUTE` / `DEALLOCATE` Simple-Query round-trip
 
 ### Binder gaps blocking wire
 - [ ] `BETWEEN ... AND ...` (parser accepts; binder rejects)
 - [ ] `SELECT ... FROM t WHERE col IS NULL` end-to-end verification
-- [ ] `BEGIN / COMMIT / ROLLBACK / SAVEPOINT` (binder rejects at `binder.rs:83`)
+- [x] `BEGIN / COMMIT / ROLLBACK / SAVEPOINT` (now bound to `LogicalPlan::{Begin, Commit, Rollback, Savepoint, ...}` variants)
 
 ### Authentication
 - [x] `SCRAM-SHA-256` real implementation (RFC 5802 + 7677)

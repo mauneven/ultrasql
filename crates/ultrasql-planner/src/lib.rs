@@ -183,4 +183,51 @@ mod tests {
         assert!(dump.contains("  Filter:"));
         assert!(dump.contains("    Scan: users"));
     }
+
+    /// `BEGIN` / `COMMIT` / `ROLLBACK` produce the corresponding
+    /// transaction-control [`LogicalPlan`] variants — they are no
+    /// longer rejected as "not a planner target."
+    #[test]
+    fn transaction_control_statements_bind_to_their_variants() {
+        assert!(matches!(
+            parse_and_bind("BEGIN").expect("bind ok"),
+            LogicalPlan::Begin { .. }
+        ));
+        assert!(matches!(
+            parse_and_bind("COMMIT").expect("bind ok"),
+            LogicalPlan::Commit { .. }
+        ));
+        assert!(matches!(
+            parse_and_bind("ROLLBACK").expect("bind ok"),
+            LogicalPlan::Rollback { .. }
+        ));
+    }
+
+    /// `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` / `RELEASE SAVEPOINT`
+    /// bind to their variants and carry the lower-cased savepoint
+    /// name so subsequent `ROLLBACK TO`/`RELEASE` match
+    /// case-insensitively (PostgreSQL behaviour for unquoted
+    /// identifiers).
+    #[test]
+    fn savepoint_statements_bind_with_lowercased_name() {
+        let LogicalPlan::Savepoint { name, .. } = parse_and_bind("SAVEPOINT Sp1").expect("bind ok")
+        else {
+            panic!("expected Savepoint variant");
+        };
+        assert_eq!(name, "sp1");
+
+        let LogicalPlan::RollbackToSavepoint { name, .. } =
+            parse_and_bind("ROLLBACK TO SAVEPOINT Sp1").expect("bind ok")
+        else {
+            panic!("expected RollbackToSavepoint variant");
+        };
+        assert_eq!(name, "sp1");
+
+        let LogicalPlan::ReleaseSavepoint { name, .. } =
+            parse_and_bind("RELEASE SAVEPOINT Sp1").expect("bind ok")
+        else {
+            panic!("expected ReleaseSavepoint variant");
+        };
+        assert_eq!(name, "sp1");
+    }
 }

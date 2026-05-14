@@ -66,11 +66,73 @@ use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
 use ultrasql_storage::page::Page;
-use ultrasql_txn::{IsolationLevel, TransactionManager};
+use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
 pub use error::ServerError;
 pub use pipeline::{LowerCtx, SampleTables, build_sample_database};
 pub use result_encoder::{SelectResult, run_ddl_command, run_modify_command, run_select};
+
+/// Per-session transaction-block state.
+///
+/// PostgreSQL exposes three transaction states to its clients via the
+/// `ReadyForQuery` status byte (`'I'`, `'T'`, `'E'`). UltraSQL mirrors
+/// these states so any libpq-style client that depends on the byte to
+/// decide whether to issue `ROLLBACK` (e.g. tokio-postgres, psql,
+/// pgbench) behaves identically.
+///
+/// The state is per-connection and accessed only by the connection's
+/// own task, so no synchronisation primitive is needed (AGENTS.md §5).
+///
+/// State transitions:
+///
+/// ```text
+///                        BEGIN
+///        Idle ───────────────────────────────► InTransaction
+///         ▲                                          │
+///         │ COMMIT (no-op + warning when Idle)       │
+///         │ ROLLBACK (no-op + warning when Idle)     │
+///         │                                          │
+///         │             COMMIT (success)             │
+///         │ ◄────────────────────────────────────────┤
+///         │                                          │ statement
+///         │             ROLLBACK                     │ errored
+///         │ ◄────────────────────────────────────────┼─────┐
+///         │                                          │     │
+///         │             COMMIT  (treated as          │     ▼
+///         │              ROLLBACK; tag = "ROLLBACK") │   Failed
+///         │ ◄────────────────────────────────────────┼─────┤
+///         │             ROLLBACK                     │     │
+///         └──────────────────────────────────────────┴─────┘
+/// ```
+///
+/// `Idle` ↔ `ReadyForQuery` `'I'`. `InTransaction` ↔ `'T'`. `Failed` ↔ `'E'`.
+#[derive(Debug)]
+pub enum TxnState {
+    /// No explicit transaction block is open. Each statement runs
+    /// inside its own autocommit transaction.
+    Idle,
+    /// An explicit `BEGIN` is in effect. Statements use this txn's xid
+    /// + snapshot until the user issues `COMMIT` or `ROLLBACK`.
+    InTransaction(Transaction),
+    /// A prior statement inside an explicit transaction errored. Until
+    /// the user sends `COMMIT` (treated as `ROLLBACK`) or `ROLLBACK`,
+    /// every subsequent statement returns the standard PostgreSQL
+    /// error: `current transaction is aborted, commands ignored until
+    /// end of transaction block` (SQLSTATE `25P02`).
+    Failed(Transaction),
+}
+
+impl TxnState {
+    /// The PostgreSQL `ReadyForQuery` status byte for this state.
+    #[must_use]
+    pub const fn ready_for_query_status(&self) -> u8 {
+        match self {
+            Self::Idle => b'I',
+            Self::InTransaction(_) => b'T',
+            Self::Failed(_) => b'E',
+        }
+    }
+}
 
 /// In-memory `PageLoader` used by the development server.
 ///
@@ -343,16 +405,19 @@ where
 /// Per-connection state machine.
 ///
 /// `extended` holds the Extended Query Protocol's prepared-statement and
-/// portal caches. It is owned by the session and accessed only by the
-/// connection's own task, so no synchronisation primitive guards it
-/// (per AGENTS.md §5: "default to the simplest primitive that meets the
-/// workload"; the workload here is single-threaded).
+/// portal caches. `txn_state` tracks whether an explicit `BEGIN` is
+/// open, whether the in-progress txn has errored, or whether the session
+/// is autocommitting. Both are owned by the session and accessed only by
+/// the connection's own task, so no synchronisation primitive guards
+/// them (per AGENTS.md §5: "default to the simplest primitive that meets
+/// the workload"; the workload here is single-threaded).
 struct Session<RW> {
     io: RW,
     read_buf: BytesMut,
     write_buf: BytesMut,
     state: Arc<Server>,
     extended: extended::ExtendedConnState,
+    txn_state: TxnState,
 }
 
 impl<RW> Session<RW>
@@ -366,6 +431,7 @@ where
             write_buf: BytesMut::with_capacity(READ_BUFFER_INITIAL),
             state,
             extended: extended::ExtendedConnState::new(),
+            txn_state: TxnState::Idle,
         }
     }
 
@@ -505,8 +571,10 @@ where
                     // a query-scoped error.
                     self.send_error("password message outside auth flow", "08P01")
                         .await?;
-                    self.send(&BackendMessage::ReadyForQuery { status: b'E' })
-                        .await?;
+                    self.send(&BackendMessage::ReadyForQuery {
+                        status: self.txn_state.ready_for_query_status(),
+                    })
+                    .await?;
                 }
                 FrontendMessage::StartupMessage { .. } => {
                     // A second StartupMessage is a protocol violation.
@@ -518,20 +586,30 @@ where
                 _ => {
                     self.send_error("unsupported frontend message", "0A000")
                         .await?;
-                    self.send(&BackendMessage::ReadyForQuery { status: b'E' })
-                        .await?;
+                    self.send(&BackendMessage::ReadyForQuery {
+                        status: self.txn_state.ready_for_query_status(),
+                    })
+                    .await?;
                 }
             }
         }
     }
 
     /// Execute a simple `'Q'` query end-to-end and write the response.
+    ///
+    /// The trailing `ReadyForQuery`'s status byte reflects the
+    /// session's [`TxnState`] *after* the statement has run: `'I'` for
+    /// `Idle`, `'T'` for `InTransaction`, `'E'` for `Failed`. Drivers
+    /// like tokio-postgres rely on this byte to decide whether to send
+    /// a `ROLLBACK` on pool return.
     async fn handle_query(&mut self, sql: &str) -> Result<(), ServerError> {
         let trimmed = sql.trim();
         if trimmed.is_empty() || trimmed == ";" {
             self.send(&BackendMessage::EmptyQueryResponse).await?;
-            self.send(&BackendMessage::ReadyForQuery { status: b'I' })
-                .await?;
+            self.send(&BackendMessage::ReadyForQuery {
+                status: self.txn_state.ready_for_query_status(),
+            })
+            .await?;
             return Ok(());
         }
 
@@ -548,8 +626,10 @@ where
                 self.send_error(&err.to_string(), err.sqlstate()).await?;
             }
         }
-        self.send(&BackendMessage::ReadyForQuery { status: b'I' })
-            .await?;
+        self.send(&BackendMessage::ReadyForQuery {
+            status: self.txn_state.ready_for_query_status(),
+        })
+        .await?;
         Ok(())
     }
 
@@ -564,7 +644,27 @@ where
     /// via a wait-free `ArcSwap::load_full`.  All catalog lookups for the
     /// duration of this statement go through the snapshot so concurrent
     /// DDL cannot perturb an in-flight query.
-    fn execute_query(&self, sql: &str) -> Result<SelectResult, ServerError> {
+    ///
+    /// ## Transaction routing
+    ///
+    /// The session's [`TxnState`] determines how the statement is wrapped:
+    ///
+    /// - `Idle` — a fresh autocommit transaction is allocated, the
+    ///   statement runs, and the transaction is committed on success
+    ///   (or aborted on error). This is the legacy path.
+    /// - `InTransaction(txn)` — the statement uses the existing
+    ///   transaction. The session's `command_id` is advanced and the
+    ///   `ReadCommitted` snapshot is refreshed. On error the session
+    ///   transitions to `Failed(txn)`; subsequent statements until
+    ///   `COMMIT`/`ROLLBACK` return SQLSTATE `25P02`.
+    /// - `Failed(_)` — every non-transaction-control statement is
+    ///   rejected with SQLSTATE `25P02`.
+    ///
+    /// Transaction-control statements (`BEGIN` / `COMMIT` / `ROLLBACK` /
+    /// `SAVEPOINT` / `ROLLBACK TO` / `RELEASE`) are dispatched separately
+    /// in [`Self::execute_txn_control`] so they can manipulate the
+    /// session's `txn_state` directly.
+    fn execute_query(&mut self, sql: &str) -> Result<SelectResult, ServerError> {
         // Capture a per-statement catalog snapshot — wait-free arc-swap load.
         // The binder reads this snapshot first; if a name is not found there
         // (a runtime CREATE TABLE never landed it), the in-memory sample
@@ -575,12 +675,60 @@ where
             fallback: &self.state.catalog,
         };
 
-        let stmt = Parser::new(sql).parse_statement()?;
-        let plan = bind(&stmt, &combined)?;
+        // Parser / binder errors inside an explicit transaction must
+        // also transition us to `Failed` — PostgreSQL marks the block
+        // as aborted regardless of whether the failure was at parse,
+        // plan, or execute time. Handle that uniformly here.
+        let stmt = match Parser::new(sql).parse_statement() {
+            Ok(s) => s,
+            Err(e) => return Err(self.fail_if_in_transaction(e.into())),
+        };
+        let plan = match bind(&stmt, &combined) {
+            Ok(p) => p,
+            Err(e) => return Err(self.fail_if_in_transaction(e.into())),
+        };
+
+        // Transaction-control statements own the session's TxnState.
+        match &plan {
+            LogicalPlan::Begin { .. }
+            | LogicalPlan::Commit { .. }
+            | LogicalPlan::Rollback { .. }
+            | LogicalPlan::Savepoint { .. }
+            | LogicalPlan::RollbackToSavepoint { .. }
+            | LogicalPlan::ReleaseSavepoint { .. } => {
+                return self.execute_txn_control(&plan);
+            }
+            _ => {}
+        }
+
+        // A statement issued while the explicit transaction has already
+        // errored must be rejected with the standard PostgreSQL SQLSTATE
+        // `25P02` until the user issues COMMIT/ROLLBACK.
+        if matches!(self.txn_state, TxnState::Failed(_)) {
+            return Err(ServerError::TransactionAborted);
+        }
 
         // DDL is dispatched ahead of operator lowering: it never produces
         // rows, so the lowerer would only round-trip it through an
-        // unreachable arm.
+        // unreachable arm. DDL inside an explicit transaction is
+        // rejected today because the catalog mutations are not
+        // transactional under the v0.5 catalog (see AGENTS.md §11; a
+        // follow-up RFC will add transactional DDL). The rejection
+        // transitions the txn to `Failed` so subsequent statements get
+        // SQLSTATE `25P02` until COMMIT/ROLLBACK.
+        let is_ddl = matches!(
+            &plan,
+            LogicalPlan::CreateTable { .. }
+                | LogicalPlan::CreateIndex { .. }
+                | LogicalPlan::DropTable { .. }
+                | LogicalPlan::AlterTable { .. }
+                | LogicalPlan::Truncate { .. }
+        );
+        if is_ddl && matches!(self.txn_state, TxnState::InTransaction(_)) {
+            return Err(self.fail_if_in_transaction(ServerError::Unsupported(
+                "DDL inside an explicit transaction block is not yet supported",
+            )));
+        }
         match &plan {
             LogicalPlan::CreateTable { .. } => {
                 return self.execute_create_table(&plan, &catalog_snapshot);
@@ -600,49 +748,361 @@ where
             _ => {}
         }
 
-        // Allocate an autocommit transaction. The XID becomes the `xmin`
-        // of every tuple inserted by this statement and the snapshot
-        // governs visibility for any SELECT.
-        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
-        let ctx = LowerCtx {
-            tables: &self.state.tables,
-            catalog_snapshot: Arc::clone(&catalog_snapshot),
-            heap: Arc::clone(&self.state.heap),
-            snapshot: txn.snapshot.clone(),
-            oracle: Arc::clone(&self.state.txn_manager),
-            xid: txn.xid,
-            command_id: ultrasql_core::CommandId::FIRST,
-            cte_buffers: std::collections::HashMap::new(),
-        };
+        // DML / SELECT path. Behaviour depends on TxnState. The
+        // `run_dml_or_select` helper already transitions
+        // `InTransaction → Failed` on any execution error, so no
+        // explicit `fail_if_in_transaction` is needed here.
+        self.run_dml_or_select(&plan, &catalog_snapshot)
+    }
 
-        let result = match &plan {
-            LogicalPlan::Insert { .. } => {
-                let mut op = pipeline::lower_query(&plan, &ctx)?;
-                run_modify_command(op.as_mut(), "INSERT")
+    /// Run a DML/SELECT plan against the session's current [`TxnState`].
+    ///
+    /// - `Idle` → open a fresh autocommit txn, run, commit on success
+    ///   (or abort on error); state stays `Idle`.
+    /// - `InTransaction` → refresh the per-statement snapshot, run
+    ///   inside the existing txn, don't commit. On success state stays
+    ///   `InTransaction`; on error transitions to `Failed`.
+    /// - `Failed` → unreachable (the caller guarded).
+    fn run_dml_or_select(
+        &mut self,
+        plan: &LogicalPlan,
+        catalog_snapshot: &Arc<CatalogSnapshot>,
+    ) -> Result<SelectResult, ServerError> {
+        match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
+            TxnState::Idle => {
+                let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+                let outcome = run_plan_in_txn(
+                    plan,
+                    &txn,
+                    Arc::clone(catalog_snapshot),
+                    &self.state.tables,
+                    Arc::clone(&self.state.heap),
+                    Arc::clone(&self.state.txn_manager),
+                );
+                self.finalise_autocommit(txn, outcome)
             }
-            LogicalPlan::Update { .. } => {
-                let mut op = pipeline::lower_query(&plan, &ctx)?;
-                run_modify_command(op.as_mut(), "UPDATE")
+            TxnState::InTransaction(mut txn) => {
+                self.state.txn_manager.refresh_snapshot(&mut txn);
+                let outcome = run_plan_in_txn(
+                    plan,
+                    &txn,
+                    Arc::clone(catalog_snapshot),
+                    &self.state.tables,
+                    Arc::clone(&self.state.heap),
+                    Arc::clone(&self.state.txn_manager),
+                );
+                // Transition: Ok → InTransaction; Err → Failed. The txn
+                // remains alive in the CLOG (InProgress) until the user
+                // issues COMMIT/ROLLBACK.
+                self.txn_state = if outcome.is_ok() {
+                    TxnState::InTransaction(txn)
+                } else {
+                    TxnState::Failed(txn)
+                };
+                outcome
             }
-            LogicalPlan::Delete { .. } => {
-                let mut op = pipeline::lower_query(&plan, &ctx)?;
-                run_modify_command(op.as_mut(), "DELETE")
+            TxnState::Failed(txn) => {
+                // Should be guarded by the caller; restore state.
+                self.txn_state = TxnState::Failed(txn);
+                Err(ServerError::TransactionAborted)
             }
-            _ => {
-                let mut op = pipeline::lower_query(&plan, &ctx)?;
-                run_select(op.as_mut())
-            }
-        };
-
-        // Commit the autocommit transaction so the XID's tuples become
-        // visible to subsequent snapshots. On failure (today: never
-        // under READ COMMITTED with no SSI conflicts) we still return
-        // the query result — the txn is the implementation detail.
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            tracing::warn!(error = %e, "autocommit failed to finalise");
         }
+    }
 
-        result
+    /// Commit-on-success / abort-on-error for the autocommit path.
+    /// Logs (does not surface) txn manager errors so the original
+    /// outcome reaches the client.
+    fn finalise_autocommit(
+        &self,
+        txn: Transaction,
+        outcome: Result<SelectResult, ServerError>,
+    ) -> Result<SelectResult, ServerError> {
+        match &outcome {
+            Ok(_) => {
+                if let Err(e) = self.state.txn_manager.commit(txn) {
+                    tracing::warn!(error = %e, "autocommit failed to finalise");
+                }
+            }
+            Err(_) => {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    tracing::warn!(error = %abort_err, "autocommit rollback failed");
+                }
+            }
+        }
+        outcome
+    }
+
+    /// If the session is currently `InTransaction`, transition to
+    /// `Failed` so subsequent statements get the `25P02` rejection
+    /// until COMMIT/ROLLBACK. This mirrors PostgreSQL: any failure
+    /// inside a transaction block — including parser errors, bind
+    /// errors, executor errors, and DDL-inside-tx rejections —
+    /// aborts the block.
+    ///
+    /// Statements outside a transaction (Idle) and statements while
+    /// already in a Failed block leave the state unchanged.
+    ///
+    /// Returns the original error verbatim so callers can `return`
+    /// with a single line.
+    fn fail_if_in_transaction(&mut self, err: ServerError) -> ServerError {
+        if matches!(self.txn_state, TxnState::InTransaction(_)) {
+            // Replace+match avoids needing to clone the Transaction
+            // handle out of the variant.
+            let prev = std::mem::replace(&mut self.txn_state, TxnState::Idle);
+            if let TxnState::InTransaction(txn) = prev {
+                self.txn_state = TxnState::Failed(txn);
+            }
+        }
+        err
+    }
+
+    /// Dispatch a transaction-control statement (BEGIN / COMMIT /
+    /// ROLLBACK / SAVEPOINT / ROLLBACK TO / RELEASE) against the
+    /// session's [`TxnState`].
+    ///
+    /// PostgreSQL semantics:
+    ///
+    /// - `BEGIN` inside an open transaction emits a `NoticeResponse`
+    ///   `WARNING: there is already a transaction in progress` and
+    ///   leaves the state unchanged.
+    /// - `COMMIT` / `ROLLBACK` outside a transaction emits a
+    ///   `NoticeResponse` `WARNING: there is no transaction in progress`
+    ///   and emits `COMMIT` / `ROLLBACK` as the command tag.
+    /// - `COMMIT` while in the `Failed` state aborts the transaction and
+    ///   returns the `ROLLBACK` tag — *not* `COMMIT` — matching
+    ///   PostgreSQL's behaviour of treating a failed-block commit as a
+    ///   rollback so the application's "did the COMMIT really land?"
+    ///   check still works.
+    fn execute_txn_control(&mut self, plan: &LogicalPlan) -> Result<SelectResult, ServerError> {
+        match plan {
+            LogicalPlan::Begin { .. } => self.execute_begin(),
+            LogicalPlan::Commit { .. } => self.execute_commit(),
+            LogicalPlan::Rollback { .. } => self.execute_rollback(),
+            LogicalPlan::Savepoint { name, .. } => self.execute_savepoint(name),
+            LogicalPlan::RollbackToSavepoint { name, .. } => {
+                self.execute_rollback_to_savepoint(name)
+            }
+            LogicalPlan::ReleaseSavepoint { name, .. } => self.execute_release_savepoint(name),
+            _ => Err(ServerError::Unsupported(
+                "execute_txn_control called with non-txn-control plan",
+            )),
+        }
+    }
+
+    /// `BEGIN` — open an explicit transaction. PostgreSQL emits a
+    /// WARNING (not an error) if a transaction is already open.
+    ///
+    /// Returns `Result` for parity with the other transaction-control
+    /// handlers (`execute_savepoint` etc.) so the dispatcher in
+    /// `execute_txn_control` can use a uniform call shape — even though
+    /// this specific arm never errors.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "uniform Result return across the txn-control dispatcher"
+    )]
+    fn execute_begin(&mut self) -> Result<SelectResult, ServerError> {
+        let warn = match &self.txn_state {
+            TxnState::Idle => {
+                let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+                self.txn_state = TxnState::InTransaction(txn);
+                None
+            }
+            TxnState::InTransaction(_) | TxnState::Failed(_) => {
+                Some("there is already a transaction in progress")
+            }
+        };
+        let mut messages: Vec<BackendMessage> = Vec::with_capacity(2);
+        if let Some(msg) = warn {
+            messages.push(notice_warning("25001", msg));
+        }
+        messages.push(BackendMessage::CommandComplete {
+            tag: "BEGIN".to_string(),
+        });
+        Ok(SelectResult { messages, rows: 0 })
+    }
+
+    /// `COMMIT` — finalise the current explicit transaction.
+    ///
+    /// PostgreSQL semantics: in `Failed` state COMMIT aborts the
+    /// transaction and returns the `ROLLBACK` tag. Outside a
+    /// transaction emits a WARNING and returns the `COMMIT` tag.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "uniform Result return across the txn-control dispatcher"
+    )]
+    fn execute_commit(&mut self) -> Result<SelectResult, ServerError> {
+        match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
+            TxnState::Idle => Ok(SelectResult {
+                messages: vec![
+                    notice_warning("25P01", "there is no transaction in progress"),
+                    BackendMessage::CommandComplete {
+                        tag: "COMMIT".to_string(),
+                    },
+                ],
+                rows: 0,
+            }),
+            TxnState::InTransaction(txn) => {
+                if let Err(e) = self.state.txn_manager.commit(txn) {
+                    tracing::warn!(error = %e, "explicit COMMIT failed to finalise");
+                }
+                Ok(SelectResult {
+                    messages: vec![BackendMessage::CommandComplete {
+                        tag: "COMMIT".to_string(),
+                    }],
+                    rows: 0,
+                })
+            }
+            TxnState::Failed(txn) => {
+                if let Err(e) = self.state.txn_manager.abort(txn) {
+                    tracing::warn!(error = %e, "explicit COMMIT (treated as rollback) failed");
+                }
+                // PostgreSQL emits the ROLLBACK tag here, not COMMIT.
+                Ok(SelectResult {
+                    messages: vec![BackendMessage::CommandComplete {
+                        tag: "ROLLBACK".to_string(),
+                    }],
+                    rows: 0,
+                })
+            }
+        }
+    }
+
+    /// `ROLLBACK` — abort the current explicit transaction.
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "uniform Result return across the txn-control dispatcher"
+    )]
+    fn execute_rollback(&mut self) -> Result<SelectResult, ServerError> {
+        match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
+            TxnState::Idle => Ok(SelectResult {
+                messages: vec![
+                    notice_warning("25P01", "there is no transaction in progress"),
+                    BackendMessage::CommandComplete {
+                        tag: "ROLLBACK".to_string(),
+                    },
+                ],
+                rows: 0,
+            }),
+            TxnState::InTransaction(txn) | TxnState::Failed(txn) => {
+                if let Err(e) = self.state.txn_manager.abort(txn) {
+                    tracing::warn!(error = %e, "explicit ROLLBACK failed");
+                }
+                Ok(SelectResult {
+                    messages: vec![BackendMessage::CommandComplete {
+                        tag: "ROLLBACK".to_string(),
+                    }],
+                    rows: 0,
+                })
+            }
+        }
+    }
+
+    /// `SAVEPOINT name` — set a savepoint inside the current
+    /// transaction block. Outside a transaction returns SQLSTATE
+    /// `25P01` (`no_active_sql_transaction`).
+    fn execute_savepoint(&mut self, name: &str) -> Result<SelectResult, ServerError> {
+        match &mut self.txn_state {
+            TxnState::Idle => Err(ServerError::Savepoint(
+                "SAVEPOINT can only be used in transaction blocks",
+            )),
+            TxnState::Failed(_) => Err(ServerError::TransactionAborted),
+            TxnState::InTransaction(txn) => {
+                self.state.txn_manager.begin_savepoint(txn, name);
+                Ok(SelectResult {
+                    messages: vec![BackendMessage::CommandComplete {
+                        tag: "SAVEPOINT".to_string(),
+                    }],
+                    rows: 0,
+                })
+            }
+        }
+    }
+
+    /// `ROLLBACK TO [SAVEPOINT] name` — roll back to the named
+    /// savepoint. The transaction remains alive; subsequent statements
+    /// run inside the same xid. If the current state is `Failed`, a
+    /// successful `ROLLBACK TO` clears the failure flag (matching
+    /// PostgreSQL behaviour).
+    ///
+    /// Errors:
+    ///
+    /// - Outside a transaction: SQLSTATE `25P01`
+    ///   (`no_active_sql_transaction`).
+    /// - Unknown savepoint name: SQLSTATE `3B001`
+    ///   (`invalid_savepoint_specification`).
+    fn execute_rollback_to_savepoint(&mut self, name: &str) -> Result<SelectResult, ServerError> {
+        // We need to take ownership of the inner txn to mutate it, then
+        // put it back in the correct state variant.
+        let prior_failed = matches!(self.txn_state, TxnState::Failed(_));
+        let state = std::mem::replace(&mut self.txn_state, TxnState::Idle);
+        match state {
+            TxnState::Idle => {
+                // `TxnState::Idle` is the default left behind by the
+                // replace; nothing to restore.
+                Err(ServerError::Savepoint(
+                    "ROLLBACK TO SAVEPOINT can only be used in transaction blocks",
+                ))
+            }
+            TxnState::InTransaction(mut txn) | TxnState::Failed(mut txn) => {
+                if self
+                    .state
+                    .txn_manager
+                    .rollback_to_savepoint(&mut txn, name)
+                    .is_ok()
+                {
+                    // Clear the failure flag: the rolled-back work is
+                    // undone so the user can continue.
+                    self.txn_state = TxnState::InTransaction(txn);
+                    Ok(SelectResult {
+                        messages: vec![BackendMessage::CommandComplete {
+                            tag: "ROLLBACK".to_string(),
+                        }],
+                        rows: 0,
+                    })
+                } else {
+                    // Unknown savepoint name. Restore the prior state
+                    // (the rollback did not fire so the txn is in the
+                    // same shape as before this call).
+                    self.txn_state = if prior_failed {
+                        TxnState::Failed(txn)
+                    } else {
+                        TxnState::InTransaction(txn)
+                    };
+                    Err(ServerError::SavepointNotFound(name.to_owned()))
+                }
+            }
+        }
+    }
+
+    /// `RELEASE [SAVEPOINT] name` — destroy a savepoint. Subsequent
+    /// `ROLLBACK TO` of the same name will fail.
+    ///
+    /// A savepoint-not-found error inside an explicit transaction
+    /// transitions the session to `Failed` (matching PostgreSQL: any
+    /// statement that errors inside a transaction block aborts the
+    /// block until COMMIT/ROLLBACK).
+    fn execute_release_savepoint(&mut self, name: &str) -> Result<SelectResult, ServerError> {
+        let release_ok = match &mut self.txn_state {
+            TxnState::Idle => {
+                return Err(ServerError::Savepoint(
+                    "RELEASE SAVEPOINT can only be used in transaction blocks",
+                ));
+            }
+            TxnState::Failed(_) => return Err(ServerError::TransactionAborted),
+            TxnState::InTransaction(txn) => {
+                self.state.txn_manager.release_savepoint(txn, name).is_ok()
+            }
+        };
+        if release_ok {
+            Ok(SelectResult {
+                messages: vec![BackendMessage::CommandComplete {
+                    tag: "RELEASE".to_string(),
+                }],
+                rows: 0,
+            })
+        } else {
+            Err(self.fail_if_in_transaction(ServerError::SavepointNotFound(name.to_owned())))
+        }
     }
 
     /// Persist a `CREATE TABLE` into the catalog.
@@ -1209,6 +1669,7 @@ where
                 if !e.is_query_scoped() {
                     return Err(e);
                 }
+                let e = self.fail_if_in_transaction(e);
                 self.extended.mark_failed();
                 self.send_error(&e.to_string(), e.sqlstate()).await
             }
@@ -1246,6 +1707,7 @@ where
                 if !e.is_query_scoped() {
                     return Err(e);
                 }
+                let e = self.fail_if_in_transaction(e);
                 self.extended.mark_failed();
                 self.send_error(&e.to_string(), e.sqlstate()).await
             }
@@ -1285,6 +1747,7 @@ where
                 if !e.is_query_scoped() {
                     return Err(e);
                 }
+                let e = self.fail_if_in_transaction(e);
                 self.extended.mark_failed();
                 self.send_error(&e.to_string(), e.sqlstate()).await
             }
@@ -1292,29 +1755,73 @@ where
     }
 
     /// Handle `Execute(portal, max_rows)`. Runs the portal end-to-end
-    /// using the same `lower_query` / executor path Simple Query uses.
+    /// using the same `lower_query` / executor path Simple Query uses,
+    /// and routes the plan through the session's [`TxnState`] so an
+    /// explicit BEGIN issued via Simple Query (or via a prior Extended
+    /// Execute) keeps subsequent Executes inside the same transaction.
+    ///
+    /// Transaction-control plans (BEGIN / COMMIT / ROLLBACK / SAVEPOINT
+    /// / ROLLBACK TO / RELEASE) are dispatched directly against the
+    /// session's [`TxnState`] via [`Self::execute_txn_control`] —
+    /// `execute_portal` never sees them.
     async fn handle_execute(&mut self, portal: &str, max_rows: i32) -> Result<(), ServerError> {
         if self.extended.pipeline_failed {
             return Ok(());
         }
-        // Build a transaction + LowerCtx exactly like `execute_query`.
-        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
-        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
-        let ctx = pipeline::LowerCtx {
-            tables: &self.state.tables,
-            catalog_snapshot: Arc::clone(&catalog_snapshot),
-            heap: Arc::clone(&self.state.heap),
-            snapshot: txn.snapshot.clone(),
-            oracle: Arc::clone(&self.state.txn_manager),
-            xid: txn.xid,
-            command_id: ultrasql_core::CommandId::FIRST,
-            cte_buffers: std::collections::HashMap::new(),
+
+        // Peek at the portal's plan up front: txn-control plans skip
+        // `execute_portal` entirely so the session's TxnState owns the
+        // transition. Cloning is cheap because the txn-control variants
+        // carry only a `Schema::empty()` (and an optional savepoint name).
+        let plan_clone = if let Some(p) = self.extended.portals.get(portal) {
+            p.plan.clone()
+        } else {
+            let err = ServerError::Unsupported("Execute: portal not found");
+            let err = self.fail_if_in_transaction(err);
+            self.extended.mark_failed();
+            return self.send_error(&err.to_string(), err.sqlstate()).await;
         };
-        let outcome = extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
-        // Commit before sending (same ordering as `execute_query`).
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            tracing::warn!(error = %e, "autocommit failed to finalise (Extended Execute)");
+
+        // Transaction-control plans take the dedicated TxnState dispatch.
+        if let Some(ref plan) = plan_clone {
+            if matches!(
+                plan,
+                LogicalPlan::Begin { .. }
+                    | LogicalPlan::Commit { .. }
+                    | LogicalPlan::Rollback { .. }
+                    | LogicalPlan::Savepoint { .. }
+                    | LogicalPlan::RollbackToSavepoint { .. }
+                    | LogicalPlan::ReleaseSavepoint { .. }
+            ) {
+                match self.execute_txn_control(plan) {
+                    Ok(result) => {
+                        for m in &result.messages {
+                            self.send(m).await?;
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if !e.is_query_scoped() {
+                            return Err(e);
+                        }
+                        self.extended.mark_failed();
+                        return self.send_error(&e.to_string(), e.sqlstate()).await;
+                    }
+                }
+            }
         }
+
+        // A statement inside a failed transaction block is rejected
+        // before we open any new resources.
+        if matches!(self.txn_state, TxnState::Failed(_)) {
+            let err = ServerError::TransactionAborted;
+            self.extended.mark_failed();
+            return self.send_error(&err.to_string(), err.sqlstate()).await;
+        }
+
+        // Non-txn-control path: route through TxnState.
+        let outcome = self.run_portal_routed(portal, max_rows);
+
         match outcome {
             Ok(out) => {
                 for m in &out.messages {
@@ -1332,12 +1839,83 @@ where
         }
     }
 
-    /// Handle `Sync`. Always emits `ReadyForQuery 'I'` (idle), since we
-    /// run every statement in its own autocommit transaction in v0.5.
+    /// Run a named portal under the current [`TxnState`].
+    ///
+    /// Mirrors [`Self::run_dml_or_select`] but drives the executor
+    /// through `extended::execute_portal` so the result-format codes
+    /// the client supplied at Bind time are honoured.
+    fn run_portal_routed(
+        &mut self,
+        portal: &str,
+        max_rows: i32,
+    ) -> Result<extended::ExecuteOutcome, ServerError> {
+        let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
+            TxnState::Idle => {
+                let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+                let ctx = pipeline::LowerCtx {
+                    tables: &self.state.tables,
+                    catalog_snapshot: Arc::clone(&catalog_snapshot),
+                    heap: Arc::clone(&self.state.heap),
+                    snapshot: txn.snapshot.clone(),
+                    oracle: Arc::clone(&self.state.txn_manager),
+                    xid: txn.xid,
+                    command_id: txn.current_command,
+                    cte_buffers: std::collections::HashMap::new(),
+                };
+                let res = extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
+                if res.is_ok() {
+                    if let Err(e) = self.state.txn_manager.commit(txn) {
+                        tracing::warn!(
+                            error = %e,
+                            "autocommit failed to finalise (Extended Execute)",
+                        );
+                    }
+                } else if let Err(e) = self.state.txn_manager.abort(txn) {
+                    tracing::warn!(
+                        error = %e,
+                        "autocommit rollback failed (Extended Execute)",
+                    );
+                }
+                // txn_state stays Idle.
+                res
+            }
+            TxnState::InTransaction(mut txn) => {
+                self.state.txn_manager.refresh_snapshot(&mut txn);
+                let ctx = pipeline::LowerCtx {
+                    tables: &self.state.tables,
+                    catalog_snapshot: Arc::clone(&catalog_snapshot),
+                    heap: Arc::clone(&self.state.heap),
+                    snapshot: txn.snapshot.clone(),
+                    oracle: Arc::clone(&self.state.txn_manager),
+                    xid: txn.xid,
+                    command_id: txn.current_command,
+                    cte_buffers: std::collections::HashMap::new(),
+                };
+                let res = extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
+                self.txn_state = if res.is_ok() {
+                    TxnState::InTransaction(txn)
+                } else {
+                    TxnState::Failed(txn)
+                };
+                res
+            }
+            TxnState::Failed(txn) => {
+                self.txn_state = TxnState::Failed(txn);
+                Err(ServerError::TransactionAborted)
+            }
+        }
+    }
+
+    /// Handle `Sync`. Emits a `ReadyForQuery` carrying the session's
+    /// current transaction state byte (`'I'` idle, `'T'` in a
+    /// transaction block, `'E'` in a failed transaction block).
     async fn handle_sync(&mut self) -> Result<(), ServerError> {
         self.extended.reset_on_sync();
-        self.send(&BackendMessage::ReadyForQuery { status: b'I' })
-            .await
+        self.send(&BackendMessage::ReadyForQuery {
+            status: self.txn_state.ready_for_query_status(),
+        })
+        .await
     }
 
     /// Handle `Close(kind, name)`. Always emits `CloseComplete` even
@@ -1424,6 +2002,74 @@ where
 /// at the call site; using a panic / sentinel value would conflate
 /// "schema mismatch" with "missing value", which the catalog wants
 /// to keep distinct.
+/// Build a PostgreSQL `NoticeResponse` carrying a `WARNING` with the
+/// given SQLSTATE and human-readable text.
+///
+/// `NoticeResponse` is shaped exactly like `ErrorResponse` on the wire
+/// (an `'N'` tag instead of `'E'`); a libpq client routes notices to a
+/// callback rather than aborting the operation. UltraSQL emits notices
+/// where PostgreSQL would emit them — most importantly for
+/// `BEGIN`-inside-tx, `COMMIT`-outside-tx, and `ROLLBACK`-outside-tx so
+/// drivers see the same behaviour they expect from PostgreSQL.
+fn notice_warning(sqlstate: &str, message: &str) -> BackendMessage {
+    BackendMessage::NoticeResponse {
+        fields: vec![
+            (b'S', "WARNING".to_string()),
+            (b'C', sqlstate.to_string()),
+            (b'M', message.to_string()),
+        ],
+    }
+}
+
+/// Run a non-DDL, non-transaction-control plan inside the given
+/// transaction and return the assembled wire-message result.
+///
+/// Owns no state of its own: it captures everything it needs by
+/// argument so both the Simple Query and Extended Query paths can call
+/// it. The caller is responsible for committing or aborting `txn` based
+/// on whether this function returned `Ok` or `Err`.
+///
+/// `command_id` is taken from `txn.current_command` so each statement
+/// inside an explicit transaction sees its own writes via the MVCC
+/// `cmin < current_command` rule.
+fn run_plan_in_txn(
+    plan: &LogicalPlan,
+    txn: &Transaction,
+    catalog_snapshot: Arc<CatalogSnapshot>,
+    tables: &SampleTables,
+    heap: Arc<HeapAccess<BlankPageLoader>>,
+    oracle: Arc<TransactionManager>,
+) -> Result<SelectResult, ServerError> {
+    let ctx = LowerCtx {
+        tables,
+        catalog_snapshot,
+        heap,
+        snapshot: txn.snapshot.clone(),
+        oracle,
+        xid: txn.xid,
+        command_id: txn.current_command,
+        cte_buffers: std::collections::HashMap::new(),
+    };
+    match plan {
+        LogicalPlan::Insert { .. } => {
+            let mut op = pipeline::lower_query(plan, &ctx)?;
+            run_modify_command(op.as_mut(), "INSERT")
+        }
+        LogicalPlan::Update { .. } => {
+            let mut op = pipeline::lower_query(plan, &ctx)?;
+            run_modify_command(op.as_mut(), "UPDATE")
+        }
+        LogicalPlan::Delete { .. } => {
+            let mut op = pipeline::lower_query(plan, &ctx)?;
+            run_modify_command(op.as_mut(), "DELETE")
+        }
+        _ => {
+            let mut op = pipeline::lower_query(plan, &ctx)?;
+            run_select(op.as_mut())
+        }
+    }
+}
+
 fn decode_key_column(
     bytes: &[u8],
     schema: &ultrasql_core::Schema,
@@ -2634,6 +3280,587 @@ mod tests {
             msgs.last().unwrap(),
             BackendMessage::ReadyForQuery { status: b'I' }
         ));
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    // -----------------------------------------------------------------------
+    // Transaction-control state machine — Simple Query duplex tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: extract the trailing `ReadyForQuery` status byte from a
+    /// drained message sequence.
+    fn ready_status(msgs: &[BackendMessage]) -> u8 {
+        match msgs.last().expect("non-empty msgs") {
+            BackendMessage::ReadyForQuery { status } => *status,
+            other => panic!("expected ReadyForQuery at end, got {other:?}"),
+        }
+    }
+
+    /// Helper: extract the `CommandComplete` tag from a drained message
+    /// sequence.
+    fn command_tag(msgs: &[BackendMessage]) -> Option<String> {
+        msgs.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        })
+    }
+
+    /// `TxnState::ready_for_query_status` maps each variant to the
+    /// correct PostgreSQL status byte. Unit test, no I/O.
+    #[test]
+    fn txn_state_ready_for_query_status_matches_postgres() {
+        // The Failed and InTransaction arms hold a Transaction handle,
+        // which we mint via a throwaway TxnManager.
+        let mgr = TransactionManager::new();
+        let txn1 = mgr.begin(IsolationLevel::ReadCommitted);
+        let txn2 = mgr.begin(IsolationLevel::ReadCommitted);
+
+        assert_eq!(TxnState::Idle.ready_for_query_status(), b'I');
+        assert_eq!(TxnState::InTransaction(txn1).ready_for_query_status(), b'T');
+        assert_eq!(TxnState::Failed(txn2).ready_for_query_status(), b'E');
+    }
+
+    /// `BEGIN; INSERT; INSERT; COMMIT;` — both rows visible after commit.
+    /// `BEGIN; INSERT; ROLLBACK;` — row not persisted.
+    /// `ReadyForQuery` status byte reflects state at every step.
+    #[tokio::test]
+    async fn begin_commit_persists_rows_rollback_discards() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        // CREATE TABLE — outside any txn.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE t (id INT NOT NULL, val INT)".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert_eq!(ready_status(&msgs), b'I');
+
+        // BEGIN
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "BEGIN".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert_eq!(command_tag(&msgs).as_deref(), Some("BEGIN"));
+        assert_eq!(ready_status(&msgs), b'T', "BEGIN → 'T' status");
+
+        // INSERT — inside txn
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "INSERT INTO t VALUES (1, 100)".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert_eq!(command_tag(&msgs).as_deref(), Some("INSERT 0 1"));
+        assert_eq!(ready_status(&msgs), b'T');
+
+        // INSERT
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "INSERT INTO t VALUES (2, 200)".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert_eq!(ready_status(&msgs), b'T');
+
+        // COMMIT
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "COMMIT".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert_eq!(command_tag(&msgs).as_deref(), Some("COMMIT"));
+        assert_eq!(ready_status(&msgs), b'I', "COMMIT → 'I'");
+
+        // SELECT — both rows visible.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM t".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let row_count = msgs
+            .iter()
+            .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+            .count();
+        assert_eq!(row_count, 2, "both committed rows visible");
+
+        // BEGIN; INSERT; ROLLBACK — row 3 must not persist.
+        for stmt in ["BEGIN", "INSERT INTO t VALUES (3, 300)", "ROLLBACK"] {
+            send_frontend(
+                &mut client,
+                &FrontendMessage::Query {
+                    sql: stmt.to_string(),
+                },
+            )
+            .await;
+            let _ = drain_until_ready(&mut client).await;
+        }
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM t".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let row_count = msgs
+            .iter()
+            .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+            .count();
+        assert_eq!(row_count, 2, "rolled-back INSERT did not persist");
+        assert_eq!(ready_status(&msgs), b'I');
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// `BEGIN; UPDATE; ROLLBACK;` — UPDATE is undone.
+    #[tokio::test]
+    async fn begin_update_rollback_reverts_value() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        // Setup
+        for sql in [
+            "CREATE TABLE t (id INT NOT NULL, val INT)",
+            "INSERT INTO t VALUES (1, 100)",
+        ] {
+            send_frontend(&mut client, &FrontendMessage::Query { sql: sql.into() }).await;
+            let _ = drain_until_ready(&mut client).await;
+        }
+
+        // BEGIN; UPDATE; ROLLBACK
+        for sql in [
+            "BEGIN",
+            "UPDATE t SET val = val + 999 WHERE id = 1",
+            "ROLLBACK",
+        ] {
+            send_frontend(&mut client, &FrontendMessage::Query { sql: sql.into() }).await;
+            let _ = drain_until_ready(&mut client).await;
+        }
+
+        // Verify val unchanged.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT val FROM t WHERE id = 1".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let rows: Vec<Vec<Option<Vec<u8>>>> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(columns.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_deref(), Some(b"100".as_slice()));
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// A statement that errors inside a transaction transitions the
+    /// session to the `Failed` state. Subsequent statements (other than
+    /// COMMIT / ROLLBACK) return SQLSTATE `25P02`. COMMIT in `Failed`
+    /// state returns the `ROLLBACK` tag (PostgreSQL semantics).
+    #[tokio::test]
+    async fn failed_transaction_rejects_subsequent_statements_until_rollback() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        // BEGIN
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "BEGIN".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert_eq!(ready_status(&msgs), b'T');
+
+        // Cause an error: select from a non-existent table.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT * FROM no_such_table".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "expected ErrorResponse for missing table"
+        );
+        assert_eq!(ready_status(&msgs), b'E', "post-error status → 'E'");
+
+        // A subsequent statement (a perfectly valid SELECT against the
+        // sample table) is rejected with `25P02` while in `Failed`.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM users".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let err = msgs
+            .iter()
+            .find_map(|m| match m {
+                BackendMessage::ErrorResponse { fields } => Some(fields.clone()),
+                _ => None,
+            })
+            .expect("ErrorResponse in failed state");
+        let sqlstate = err
+            .iter()
+            .find_map(|(c, v)| (*c == b'C').then(|| v.clone()))
+            .expect("SQLSTATE field present");
+        assert_eq!(sqlstate, "25P02", "failed-block SQLSTATE");
+        assert_eq!(ready_status(&msgs), b'E');
+
+        // COMMIT in failed state returns the `ROLLBACK` tag.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "COMMIT".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert_eq!(
+            command_tag(&msgs).as_deref(),
+            Some("ROLLBACK"),
+            "COMMIT in failed state returns ROLLBACK tag (PostgreSQL semantics)",
+        );
+        assert_eq!(ready_status(&msgs), b'I', "post-COMMIT status → 'I'");
+
+        // Session is healthy again — the same query that errored under
+        // `Failed` now runs normally.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM users".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+        );
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// Implicit autocommit still works: `INSERT` outside any `BEGIN`
+    /// commits immediately and is visible to the next statement.
+    #[tokio::test]
+    async fn implicit_autocommit_still_persists_writes() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        for sql in [
+            "CREATE TABLE t (id INT NOT NULL)",
+            "INSERT INTO t VALUES (1)",
+            "INSERT INTO t VALUES (2)",
+        ] {
+            send_frontend(&mut client, &FrontendMessage::Query { sql: sql.into() }).await;
+            let msgs = drain_until_ready(&mut client).await;
+            assert_eq!(
+                ready_status(&msgs),
+                b'I',
+                "autocommit always leaves status as 'I' after {sql}",
+            );
+        }
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM t".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let row_count = msgs
+            .iter()
+            .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+            .count();
+        assert_eq!(row_count, 2);
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// `BEGIN` while a transaction is already open emits a
+    /// `NoticeResponse` (WARNING) and leaves the session in
+    /// `InTransaction`. The PostgreSQL behaviour we mirror.
+    #[tokio::test]
+    async fn nested_begin_emits_warning_but_keeps_session_in_tx() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        // First BEGIN
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "BEGIN".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert_eq!(ready_status(&msgs), b'T');
+
+        // Nested BEGIN
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "BEGIN".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, BackendMessage::NoticeResponse { .. })),
+            "expected NoticeResponse for nested BEGIN: {msgs:?}"
+        );
+        assert_eq!(command_tag(&msgs).as_deref(), Some("BEGIN"));
+        assert_eq!(ready_status(&msgs), b'T', "nested BEGIN → still 'T'");
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "ROLLBACK".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// `COMMIT` / `ROLLBACK` outside a transaction emit a
+    /// `NoticeResponse` (WARNING) but still succeed with the
+    /// corresponding command tag.
+    #[tokio::test]
+    async fn commit_and_rollback_outside_tx_emit_warning() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        for sql in ["COMMIT", "ROLLBACK"] {
+            send_frontend(&mut client, &FrontendMessage::Query { sql: sql.into() }).await;
+            let msgs = drain_until_ready(&mut client).await;
+            assert!(
+                msgs.iter()
+                    .any(|m| matches!(m, BackendMessage::NoticeResponse { .. })),
+                "expected NoticeResponse for {sql} outside tx: {msgs:?}"
+            );
+            assert_eq!(command_tag(&msgs).as_deref(), Some(sql));
+            assert_eq!(ready_status(&msgs), b'I');
+        }
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// Extended Query round-trip for BEGIN / INSERT / COMMIT — prepared
+    /// statements and unnamed portals.  Mirrors the Simple Query test
+    /// `begin_commit_persists_rows_rollback_discards` over the
+    /// `Parse/Bind/Execute/Sync` path.
+    #[tokio::test]
+    async fn extended_query_begin_insert_commit_round_trips() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        // Setup CREATE TABLE via Simple Query (Extended doesn't accept
+        // CREATE TABLE today; see execute_portal docs).
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE t (id INT NOT NULL, val INT)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        // BEGIN via Extended Query (unnamed statement + portal).
+        for sql in ["BEGIN", "INSERT INTO t VALUES (1, 100)", "COMMIT"] {
+            send_frontend(
+                &mut client,
+                &FrontendMessage::Parse {
+                    name: String::new(),
+                    sql: sql.into(),
+                    param_types: vec![],
+                },
+            )
+            .await;
+            send_frontend(
+                &mut client,
+                &FrontendMessage::Bind {
+                    portal_name: String::new(),
+                    statement_name: String::new(),
+                    param_formats: vec![],
+                    params: vec![],
+                    result_formats: vec![],
+                },
+            )
+            .await;
+            send_frontend(
+                &mut client,
+                &FrontendMessage::Execute {
+                    portal: String::new(),
+                    max_rows: 0,
+                },
+            )
+            .await;
+            send_frontend(&mut client, &FrontendMessage::Sync).await;
+            let msgs = drain_until_ready(&mut client).await;
+            // Status reflects post-statement TxnState.
+            let expected_status = match sql {
+                "BEGIN" | "INSERT INTO t VALUES (1, 100)" => b'T',
+                "COMMIT" => b'I',
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                ready_status(&msgs),
+                expected_status,
+                "Extended {sql} → status {} (got {:?})",
+                expected_status as char,
+                msgs
+            );
+        }
+
+        // The inserted row is visible after COMMIT.
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM t".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let row_count = msgs
+            .iter()
+            .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+            .count();
+        assert_eq!(row_count, 1, "Extended BEGIN/INSERT/COMMIT persisted");
+
+        send_frontend(&mut client, &FrontendMessage::Terminate).await;
+        drop(client);
+        handle.await.expect("task joins").expect("clean exit");
+    }
+
+    /// Extended Query ROLLBACK discards the in-flight write.
+    #[tokio::test]
+    async fn extended_query_begin_insert_rollback_discards() {
+        let (mut client, server_side) = tokio::io::duplex(8192);
+        let state = Arc::new(Server::with_sample_database());
+        let handle = tokio::spawn(handle_connection(server_side, state));
+        complete_startup(&mut client).await;
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "CREATE TABLE t (id INT NOT NULL)".to_string(),
+            },
+        )
+        .await;
+        let _ = drain_until_ready(&mut client).await;
+
+        for sql in ["BEGIN", "INSERT INTO t VALUES (42)", "ROLLBACK"] {
+            send_frontend(
+                &mut client,
+                &FrontendMessage::Parse {
+                    name: String::new(),
+                    sql: sql.into(),
+                    param_types: vec![],
+                },
+            )
+            .await;
+            send_frontend(
+                &mut client,
+                &FrontendMessage::Bind {
+                    portal_name: String::new(),
+                    statement_name: String::new(),
+                    param_formats: vec![],
+                    params: vec![],
+                    result_formats: vec![],
+                },
+            )
+            .await;
+            send_frontend(
+                &mut client,
+                &FrontendMessage::Execute {
+                    portal: String::new(),
+                    max_rows: 0,
+                },
+            )
+            .await;
+            send_frontend(&mut client, &FrontendMessage::Sync).await;
+            let _ = drain_until_ready(&mut client).await;
+        }
+
+        send_frontend(
+            &mut client,
+            &FrontendMessage::Query {
+                sql: "SELECT id FROM t".to_string(),
+            },
+        )
+        .await;
+        let msgs = drain_until_ready(&mut client).await;
+        let row_count = msgs
+            .iter()
+            .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+            .count();
+        assert_eq!(row_count, 0, "Extended ROLLBACK discarded");
 
         send_frontend(&mut client, &FrontendMessage::Terminate).await;
         drop(client);

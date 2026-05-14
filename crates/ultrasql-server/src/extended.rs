@@ -630,7 +630,13 @@ fn infer_into(
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
-        | LogicalPlan::AlterTable { .. } => {}
+        | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::Begin { .. }
+        | LogicalPlan::Commit { .. }
+        | LogicalPlan::Rollback { .. }
+        | LogicalPlan::Savepoint { .. }
+        | LogicalPlan::RollbackToSavepoint { .. }
+        | LogicalPlan::ReleaseSavepoint { .. } => {}
         LogicalPlan::Filter { input, predicate } => {
             infer_into(input, catalog, out);
             infer_expr_types_from_predicate(predicate, out);
@@ -907,7 +913,13 @@ fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut F) {
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
-        | LogicalPlan::AlterTable { .. } => {}
+        | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::Begin { .. }
+        | LogicalPlan::Commit { .. }
+        | LogicalPlan::Rollback { .. }
+        | LogicalPlan::Savepoint { .. }
+        | LogicalPlan::RollbackToSavepoint { .. }
+        | LogicalPlan::ReleaseSavepoint { .. } => {}
         LogicalPlan::Filter { input, predicate } => {
             walk_plan_exprs(input, f);
             walk_expr(predicate, f);
@@ -1258,7 +1270,13 @@ where
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
-        | LogicalPlan::AlterTable { .. } => plan.clone(),
+        | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::Begin { .. }
+        | LogicalPlan::Commit { .. }
+        | LogicalPlan::Rollback { .. }
+        | LogicalPlan::Savepoint { .. }
+        | LogicalPlan::RollbackToSavepoint { .. }
+        | LogicalPlan::ReleaseSavepoint { .. } => plan.clone(),
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(map_plan_exprs(input, f)),
             predicate: f(predicate),
@@ -1658,10 +1676,20 @@ fn encode_binary_value(col: &ultrasql_vec::column::Column, row: usize) -> Option
 /// Build a `RowDescription` for the output schema of `plan`, or
 /// `NoData` for plans that yield no rows.
 fn row_description_for_plan(plan: &LogicalPlan) -> BackendMessage {
-    // DDL and modify-without-returning produce no row data.
+    // DDL, transaction-control, and modify-without-returning produce no row data.
     let no_rows = matches!(
         plan,
-        LogicalPlan::CreateTable { .. } | LogicalPlan::Truncate { .. }
+        LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::DropTable { .. }
+            | LogicalPlan::AlterTable { .. }
+            | LogicalPlan::Truncate { .. }
+            | LogicalPlan::Begin { .. }
+            | LogicalPlan::Commit { .. }
+            | LogicalPlan::Rollback { .. }
+            | LogicalPlan::Savepoint { .. }
+            | LogicalPlan::RollbackToSavepoint { .. }
+            | LogicalPlan::ReleaseSavepoint { .. }
     ) || matches!(plan, LogicalPlan::Insert { returning, .. } if returning.is_empty())
         || matches!(plan, LogicalPlan::Update { returning, .. } if returning.is_empty())
         || matches!(plan, LogicalPlan::Delete { returning, .. } if returning.is_empty());

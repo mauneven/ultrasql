@@ -184,6 +184,14 @@ pub fn build_operator(
         | LogicalPlan::AlterTable { .. } => Err(BuildError::Unsupported(
             "DDL is dispatched outside the operator pipeline",
         )),
+        LogicalPlan::Begin { .. }
+        | LogicalPlan::Commit { .. }
+        | LogicalPlan::Rollback { .. }
+        | LogicalPlan::Savepoint { .. }
+        | LogicalPlan::RollbackToSavepoint { .. }
+        | LogicalPlan::ReleaseSavepoint { .. } => Err(BuildError::Unsupported(
+            "transaction-control statements are dispatched outside the operator pipeline",
+        )),
 
         LogicalPlan::Join {
             left,

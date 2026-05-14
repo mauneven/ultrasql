@@ -277,7 +277,8 @@ impl<'s> CostModel<'s> {
 
             LogicalPlan::Cte { body, .. } => self.estimate(body),
 
-            // DML / DDL / source nodes: neutral estimate (rows and cost = 0).
+            // DML / DDL / source / transaction-control nodes: neutral
+            // estimate (rows and cost = 0).
             LogicalPlan::Empty { .. }
             | LogicalPlan::Values { .. }
             | LogicalPlan::Insert { .. }
@@ -287,7 +288,13 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::CreateTable { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropTable { .. }
-            | LogicalPlan::AlterTable { .. } => zero_estimate(),
+            | LogicalPlan::AlterTable { .. }
+            | LogicalPlan::Begin { .. }
+            | LogicalPlan::Commit { .. }
+            | LogicalPlan::Rollback { .. }
+            | LogicalPlan::Savepoint { .. }
+            | LogicalPlan::RollbackToSavepoint { .. }
+            | LogicalPlan::ReleaseSavepoint { .. } => zero_estimate(),
         }
     }
 }
