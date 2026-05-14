@@ -189,6 +189,14 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                 }
             }
         };
+        // Thread the buffer pool's WAL sink when present so per-row
+        // `HeapUpdateInPlace` records are emitted alongside the page
+        // mutation. The pool decides whether a sink is configured;
+        // tests using the no-sink constructor still exercise the
+        // mutation path with `None`.
+        let wal_sink_arc = self.heap.wal_sink().cloned();
+        let wal_sink: Option<&dyn ultrasql_storage::WalSink> =
+            wal_sink_arc.as_deref();
         let n = self
             .heap
             .update_int32_pair_inplace_undo(
@@ -201,6 +209,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                 delta,
                 self.xid,
                 self.command_id,
+                wal_sink,
             )
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
 

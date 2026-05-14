@@ -16,7 +16,8 @@ use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
 use ultrasql_wal::WalRecord;
 use ultrasql_wal::payload::{
-    FullPageWritePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload,
+    FullPageWritePayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
+    HeapUpdatePayload,
 };
 use ultrasql_wal::record::RecordType;
 
@@ -259,20 +260,16 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// Holds **one** write-exclusive page guard at a time.
     ///
-    /// # ⚠️ Durability gap
+    /// # Durability
     ///
-    /// Like [`Self::update_int32_pair_inplace_undo`], this path does
-    /// **not** emit a WAL record. The xmax/cmax stamp is in-memory
-    /// only until the buffer pool flushes the page; on a crash
-    /// between the page mutation and any (not-yet-existent) WAL
-    /// flush, recovery cannot replay the DELETE.
-    ///
-    /// Benchmark numbers measured against this method describe
-    /// throughput under a **non-durable** DELETE contract. The
-    /// classical [`Self::delete_many`] path **does** emit
-    /// `HeapDelete` WAL records and remains the durable route.
-    /// Closing the gap is tracked alongside the in-place UPDATE
-    /// durability work.
+    /// When `wal` is `Some`, per-row [`RecordType::HeapDeleteInPlace`]
+    /// records are appended after the page guard is dropped and the
+    /// page LSN is stamped with the last assigned LSN, mirroring the
+    /// FPW + per-row + page-LSN pattern in
+    /// [`Self::update_int32_pair_inplace_undo`]. A `None` value
+    /// retains the non-durable benchmark path for the executor's
+    /// fused operator (the pipeline lowerer threads the live sink in
+    /// when present).
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn delete_int32_pair_inplace<O, P>(
@@ -284,6 +281,7 @@ impl<L: PageLoader> HeapAccess<L> {
         predicate: P,
         xid: Xid,
         command_id: CommandId,
+        wal: Option<&dyn WalSink>,
     ) -> Result<usize, HeapError>
     where
         O: XidStatusOracle + ?Sized,
@@ -297,8 +295,32 @@ impl<L: PageLoader> HeapAccess<L> {
         let xid_bytes = xid.raw().to_le_bytes();
         let cmd_bytes = command_id.raw().to_le_bytes();
 
+        // Per-page TID scratch: collect under the write guard, emit
+        // WAL once the guard is dropped, same shape as the update
+        // path. Reused across pages.
+        let mut wal_scratch: Vec<TupleId> = if wal.is_some() {
+            Vec::with_capacity(256)
+        } else {
+            Vec::new()
+        };
+
         for src_block in 0..block_count {
             let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
+
+            // FPW: emit the canonical page image first if this is
+            // the first mutation since the last checkpoint. Matches
+            // the contract used by `delete_many` and
+            // `update_int32_pair_inplace_undo`.
+            if let Some(sink) = wal {
+                Self::maybe_emit_fpw(
+                    &self.pool,
+                    src_page_id,
+                    sink,
+                    &self.last_checkpoint_lsn,
+                    xid,
+                )?;
+            }
+
             let src_guard = self.pool.get_page(src_page_id)?;
             let mut src_page = src_guard.write();
             let src_bytes = src_page.as_bytes_mut();
@@ -400,11 +422,31 @@ impl<L: PageLoader> HeapAccess<L> {
                 src_bytes[offset + 24..offset + 26]
                     .copy_from_slice(&new_infomask.to_le_bytes());
 
+                if wal.is_some() {
+                    wal_scratch.push(TupleId::new(src_page_id, src_slot));
+                }
+
                 total_deleted += 1;
             }
 
             drop(src_page);
             drop(src_guard);
+
+            // Emit one WAL record per stamped slot with the page guard
+            // dropped. Stamp the page LSN with the last assigned LSN
+            // so recovery's redo-skip check covers every record on
+            // this page.
+            if let Some(sink) = wal {
+                let mut last_lsn = ultrasql_core::Lsn::ZERO;
+                for tid in wal_scratch.iter().copied() {
+                    let lsn = Self::emit_delete_in_place_wal(sink, tid, xid, command_id)?;
+                    last_lsn = lsn;
+                }
+                if !wal_scratch.is_empty() {
+                    Self::stamp_page_lsn(&self.pool, src_page_id, last_lsn)?;
+                }
+                wal_scratch.clear();
+            }
         }
 
         if total_deleted > 0 {

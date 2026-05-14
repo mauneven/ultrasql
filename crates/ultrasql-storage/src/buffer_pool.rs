@@ -239,6 +239,19 @@ impl<L: PageLoader> BufferPool<L> {
         }
     }
 
+    /// Borrow the configured WAL sink, if any.
+    ///
+    /// Heap access methods that emit per-row WAL records (the
+    /// in-place UPDATE / DELETE fused paths) call this to obtain a
+    /// reference to the buffer pool's sink. Returns `None` when the
+    /// pool was constructed via [`Self::new`] without a sink — that
+    /// configuration is reserved for tests and bring-up; production
+    /// callers use [`Self::with_wal`].
+    #[must_use]
+    pub fn wal_sink(&self) -> Option<&Arc<dyn WalSink>> {
+        self.wal_sink.as_ref()
+    }
+
     /// Flush dirty, unpinned frames to disk using the provided `writer`
     /// callback.
     ///

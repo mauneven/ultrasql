@@ -427,6 +427,18 @@ impl<L: PageLoader> HeapAccess<L> {
         }
     }
 
+    /// Borrow the buffer pool's WAL sink, if any.
+    ///
+    /// Convenience accessor for callers (fused executor paths, the
+    /// pipeline lowerer) that want to thread the same sink they hold
+    /// for the rest of the statement into the in-place UPDATE /
+    /// DELETE entry points without reaching through the pool field
+    /// directly.
+    #[must_use]
+    pub fn wal_sink(&self) -> Option<&Arc<dyn crate::wal_sink::WalSink>> {
+        self.pool.wal_sink()
+    }
+
     /// Number of blocks the heap has allocated to `rel`.
     ///
     /// This is the v0.5 stand-in for a catalog query. Callers that need

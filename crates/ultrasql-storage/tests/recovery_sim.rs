@@ -318,3 +318,237 @@ fn proptest_page_tuple_round_trips() {
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// In-place UPDATE / DELETE crash-recovery tests (Item 1 Part B)
+// ---------------------------------------------------------------------------
+
+/// Encode a 9-byte `(Int32, Int32)` payload in the on-page layout
+/// `update_int32_pair_inplace_undo` expects: a leading null-bitmap byte
+/// followed by the two little-endian i32 values.
+fn pair_payload(id: i32, val: i32) -> [u8; 9] {
+    let mut out = [0_u8; 9];
+    out[1..5].copy_from_slice(&id.to_le_bytes());
+    out[5..9].copy_from_slice(&val.to_le_bytes());
+    out
+}
+
+/// Decode the `(id, val)` pair out of an on-page payload slice.
+fn pair_decode(bytes: &[u8]) -> (i32, i32) {
+    let id = i32::from_le_bytes(bytes[1..5].try_into().expect("4B"));
+    let val = i32::from_le_bytes(bytes[5..9].try_into().expect("4B"));
+    (id, val)
+}
+
+/// Crash-recovery for `update_int32_pair_inplace_undo`.
+///
+/// Phase 1: insert N (Int32, Int32) tuples under xid=1 (committed),
+/// then run the in-place UPDATE under xid=2 with the WAL sink wired.
+/// Phase 2: drop the heap (simulated crash). Build a fresh heap on a
+/// new MapLoader and replay every record from the sink. The post-
+/// recovery scan must show every row's `val` column incremented by
+/// the delta supplied to the UPDATE, and the per-relation undo log
+/// must carry one entry per row so cross-snapshot readers can still
+/// resolve the pre-image.
+#[test]
+fn crash_recovery_in_place_update_restores_post_image_and_undo_log() {
+    use ultrasql_core::CommandId;
+    use ultrasql_mvcc::Snapshot;
+    use ultrasql_mvcc::status::test_support::MapOracle;
+    use ultrasql_storage::test_support::InMemoryWalSink;
+
+    const ROWS: usize = 200;
+    const DELTA: i32 = 5;
+
+    let sink = Arc::new(InMemoryWalSink::new());
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(1));
+    oracle.set_committed(Xid::new(2));
+
+    // Phase 1: insert + in-place update under a live heap with WAL.
+    let mut original_pairs: Vec<(i32, i32)> = Vec::with_capacity(ROWS);
+    {
+        let heap = make_persistent_heap(loader::MapLoader::new());
+        for i in 0..ROWS {
+            let id = i as i32;
+            let val = i as i32 * 10;
+            original_pairs.push((id, val));
+            let bytes = pair_payload(id, val);
+            heap.insert(rel(), &bytes, insert_opts(Xid::new(1), sink.as_ref()))
+                .expect("insert");
+        }
+        let n_blocks = heap.block_count(rel());
+        let snap = Snapshot::new(
+            Xid::new(2),
+            Xid::new(3),
+            Xid::new(2),
+            CommandId::FIRST,
+            std::iter::empty(),
+        );
+        let sink_ref: &dyn ultrasql_storage::wal_sink::WalSink = sink.as_ref();
+        let updated = heap
+            .update_int32_pair_inplace_undo(
+                rel(),
+                n_blocks,
+                &snap,
+                &oracle,
+                |_id, _val| true,
+                1,
+                DELTA,
+                Xid::new(2),
+                CommandId::FIRST,
+                Some(sink_ref),
+            )
+            .expect("in-place update");
+        assert_eq!(updated, ROWS, "every row should match the predicate");
+        // heap drops here — simulated crash.
+    }
+
+    // Phase 2: collect records and replay into a fresh heap.
+    let records = sink.records();
+    assert!(
+        records.iter().any(|(_, r)| matches!(
+            r.header.record_type,
+            ultrasql_wal::record::RecordType::HeapUpdateInPlace
+        )),
+        "WAL must contain at least one HeapUpdateInPlace record"
+    );
+    let recovery_heap = make_persistent_heap(loader::MapLoader::new());
+    for (_, rec) in &records {
+        dispatch_record(&recovery_heap, rec)
+            .expect("dispatch_record during replay");
+    }
+
+    // Phase 3: every visible row should reflect the post-image.
+    let mut recovered_pairs: Vec<(i32, i32)> = Vec::with_capacity(ROWS);
+    for tuple in recovery_heap
+        .scan(rel(), recovery_heap.block_count(rel()))
+        .flatten()
+    {
+        recovered_pairs.push(pair_decode(&tuple.data));
+    }
+    recovered_pairs.sort_by_key(|(id, _)| *id);
+    let expected_post: Vec<(i32, i32)> = original_pairs
+        .iter()
+        .map(|(id, val)| (*id, val.wrapping_add(DELTA)))
+        .collect();
+    assert_eq!(
+        recovered_pairs.len(),
+        ROWS,
+        "recovery should yield every row"
+    );
+    assert_eq!(
+        recovered_pairs, expected_post,
+        "post-recovery payloads must match the live post-image"
+    );
+
+    // Phase 4: undo log must have been rebuilt with one pre-image
+    // entry per row so cross-snapshot readers still resolve pre-image.
+    let log_handle = recovery_heap
+        .undo_log
+        .get(&rel())
+        .expect("undo log entry for rel");
+    let log = log_handle.read();
+    assert_eq!(
+        log.entries.len(),
+        ROWS,
+        "undo log must carry one pre-image entry per replayed row"
+    );
+    for entry in log.entries.iter() {
+        let (id, val) = pair_decode(&entry.old_payload);
+        let original_val = original_pairs
+            .iter()
+            .find_map(|(oid, oval)| if *oid == id { Some(*oval) } else { None })
+            .expect("id should match an original row");
+        assert_eq!(val, original_val, "undo pre-image should be original value");
+        assert_eq!(entry.writer_xid, Xid::new(2));
+    }
+}
+
+/// Crash-recovery for `delete_int32_pair_inplace`.
+///
+/// Same shape as the UPDATE test: insert under xid=1, in-place DELETE
+/// under xid=2, drop heap, replay sink records into fresh heap, then
+/// verify each row's header carries `xmax = 2` so any visibility check
+/// hides it.
+#[test]
+fn crash_recovery_in_place_delete_stamps_xmax() {
+    use ultrasql_core::CommandId;
+    use ultrasql_mvcc::Snapshot;
+    use ultrasql_mvcc::status::test_support::MapOracle;
+    use ultrasql_storage::test_support::InMemoryWalSink;
+
+    const ROWS: usize = 150;
+
+    let sink = Arc::new(InMemoryWalSink::new());
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(1));
+    oracle.set_committed(Xid::new(2));
+
+    {
+        let heap = make_persistent_heap(loader::MapLoader::new());
+        for i in 0..ROWS {
+            let bytes = pair_payload(i as i32, (i as i32) * 7);
+            heap.insert(rel(), &bytes, insert_opts(Xid::new(1), sink.as_ref()))
+                .expect("insert");
+        }
+        let n_blocks = heap.block_count(rel());
+        let snap = Snapshot::new(
+            Xid::new(2),
+            Xid::new(3),
+            Xid::new(2),
+            CommandId::FIRST,
+            std::iter::empty(),
+        );
+        let sink_ref: &dyn ultrasql_storage::wal_sink::WalSink = sink.as_ref();
+        let deleted = heap
+            .delete_int32_pair_inplace(
+                rel(),
+                n_blocks,
+                &snap,
+                &oracle,
+                |_id, _val| true,
+                Xid::new(2),
+                CommandId::FIRST,
+                Some(sink_ref),
+            )
+            .expect("in-place delete");
+        assert_eq!(deleted, ROWS);
+    }
+
+    let records = sink.records();
+    assert!(
+        records.iter().any(|(_, r)| matches!(
+            r.header.record_type,
+            ultrasql_wal::record::RecordType::HeapDeleteInPlace
+        )),
+        "WAL must contain at least one HeapDeleteInPlace record"
+    );
+
+    let recovery_heap = make_persistent_heap(loader::MapLoader::new());
+    for (_, rec) in &records {
+        dispatch_record(&recovery_heap, rec)
+            .expect("dispatch_record during replay");
+    }
+
+    let mut deleted_rows = 0_usize;
+    let mut undeleted_rows = 0_usize;
+    for tuple in recovery_heap
+        .scan(rel(), recovery_heap.block_count(rel()))
+        .flatten()
+    {
+        if tuple.header.xmax == Xid::new(2) {
+            deleted_rows += 1;
+        } else {
+            undeleted_rows += 1;
+        }
+    }
+    assert_eq!(
+        deleted_rows, ROWS,
+        "every replayed row should carry xmax=2"
+    );
+    assert_eq!(
+        undeleted_rows, 0,
+        "no row should be left without an xmax stamp"
+    );
+}

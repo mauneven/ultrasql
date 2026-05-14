@@ -16,7 +16,8 @@ use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
 use ultrasql_wal::WalRecord;
 use ultrasql_wal::payload::{
-    FullPageWritePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload,
+    FullPageWritePayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
+    HeapUpdateInPlacePayload, HeapUpdatePayload,
 };
 use ultrasql_wal::record::RecordType;
 
@@ -246,4 +247,79 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(())
     }
 
+    /// Emit a `RecordType::HeapUpdateInPlace` WAL record covering one
+    /// row of an in-place UPDATE.
+    ///
+    /// Carries both the pre-image and the post-image so recovery can
+    /// (a) restore the page bytes to the post-image, and (b) re-insert
+    /// the pre-image into the in-memory `UndoRelationLog` so any
+    /// in-flight snapshot that pre-dates the writer's commit still
+    /// observes the right view through `for_each_visible` / the walker.
+    ///
+    /// Returns the assigned LSN; the caller stamps the page LSN with
+    /// it. The caller MUST call this with the page write guard
+    /// dropped (no buffer-pool pin during WAL I/O), exactly like the
+    /// existing `emit_update_wal`. Per-row append rather than
+    /// batched-per-page so a torn write that cuts the WAL mid-batch
+    /// still has every applied row covered up to the cut.
+    ///
+    /// Failure semantics match `emit_update_wal`: a sink rejection
+    /// after the page mutation has committed panics, because the
+    /// only correct response is to crash and replay from the WAL.
+    pub(super) fn emit_update_in_place_wal(
+        sink: &dyn WalSink,
+        tid: TupleId,
+        writer_xid: Xid,
+        command_id: CommandId,
+        pre_image: &[u8],
+        post_image: &[u8],
+    ) -> Result<Lsn, HeapError> {
+        let prev_lsn = sink.last_lsn_for(writer_xid);
+        let payload_bytes = HeapUpdateInPlacePayload {
+            tid,
+            writer_xid,
+            command_id,
+            pre_image_bytes: pre_image.to_vec(),
+            post_image_bytes: post_image.to_vec(),
+        }
+        .encode()?;
+        let record = WalRecord::new(
+            RecordType::HeapUpdateInPlace,
+            writer_xid,
+            prev_lsn,
+            0,
+            payload_bytes,
+        );
+        let lsn: Lsn = sink.append(record).expect(
+            "wal append must succeed after a committed page mutation; failure is unrecoverable",
+        );
+        Ok(lsn)
+    }
+
+    /// Emit a `RecordType::HeapDeleteInPlace` WAL record covering one
+    /// row stamped dead by the single-pass `delete_int32_pair_inplace`
+    /// path. Same semantics as the classical
+    /// `RecordType::HeapDelete` record (xmax / cmax stamp) but kept
+    /// as a distinct type so VACUUM / recovery telemetry can branch
+    /// on path origin.
+    pub(super) fn emit_delete_in_place_wal(
+        sink: &dyn WalSink,
+        tid: TupleId,
+        xmax: Xid,
+        cmax: CommandId,
+    ) -> Result<Lsn, HeapError> {
+        let prev_lsn = sink.last_lsn_for(xmax);
+        let payload_bytes = HeapDeleteInPlacePayload { tid, xmax, cmax }.encode()?;
+        let record = WalRecord::new(
+            RecordType::HeapDeleteInPlace,
+            xmax,
+            prev_lsn,
+            0,
+            payload_bytes,
+        );
+        let lsn: Lsn = sink.append(record).expect(
+            "wal append must succeed after a committed page mutation; failure is unrecoverable",
+        );
+        Ok(lsn)
+    }
 }

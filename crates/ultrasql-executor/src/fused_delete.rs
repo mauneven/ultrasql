@@ -105,6 +105,9 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                 }
             }
         };
+        let wal_sink_arc = self.heap.wal_sink().cloned();
+        let wal_sink: Option<&dyn ultrasql_storage::WalSink> =
+            wal_sink_arc.as_deref();
         let n = self
             .heap
             .delete_int32_pair_inplace(
@@ -115,6 +118,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                 predicate_fn,
                 self.xid,
                 self.command_id,
+                wal_sink,
             )
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
 

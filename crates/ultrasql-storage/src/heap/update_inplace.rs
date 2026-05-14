@@ -193,38 +193,26 @@ impl<L: PageLoader> HeapAccess<L> {
     /// page being updated. No destination guard is acquired because
     /// no destination page exists.
     ///
-    /// # ⚠️ Durability gap (v0.6-pre-alpha)
+    /// # Durability
     ///
-    /// This path does **not** emit a WAL record. The in-memory
-    /// `UndoRelationLog` is the only record of the pre-image, and the
-    /// page's mutated bytes are the only record of the post-image.
-    /// On a crash between the page-write and any (not-yet-existent)
-    /// WAL flush, recovery cannot:
-    /// - Re-apply a committed UPDATE that the buffer pool had not
-    ///   flushed yet (the WAL has nothing to replay).
-    /// - Restore the pre-image for an uncommitted UPDATE whose page
-    ///   *was* flushed (the undo log is in-memory only).
+    /// When `wal` is `Some`, the inner loop emits one
+    /// [`RecordType::HeapUpdateInPlace`] record per applied row
+    /// (carrying pre + post-image bytes) after the per-page write
+    /// guard is dropped, and stamps the page LSN with the last
+    /// assigned LSN. A
+    /// [`RecordType::FullPageWrite`](ultrasql_wal::RecordType::FullPageWrite)
+    /// record is emitted first when the page has not been touched
+    /// since the previous checkpoint, mirroring the
+    /// [`HeapAccess::update_many`] / [`HeapAccess::delete_many`]
+    /// contract. Recovery rebuilds both the post-image and the
+    /// in-memory `UndoRelationLog` entry through
+    /// [`HeapTarget::apply_update_in_place`](ultrasql_wal::HeapTarget::apply_update_in_place).
     ///
-    /// In other words, every benchmark number measured against this
-    /// method describes throughput under a **non-durable** UPDATE
-    /// contract. The numbers are honest measurements of the code as
-    /// it stands; the public claim "full PostgreSQL on-disk MVCC
-    /// contract" is **not** currently met by this path. Closing the
-    /// gap requires (a) a new `RecordType::HeapUpdateInPlace`
-    /// payload carrying pre + post-image bytes, (b) `WalSink::append`
-    /// + page-LSN stamping inside the inner loop, and (c) a
-    /// deterministic-simulation crash test that runs the recovery
-    /// applier through every WAL byte boundary.
-    ///
-    /// Until that lands, the in-place path is gated to the
-    /// `(Int32, Int32) SET col ± lit` fused executor shape and is
-    /// suitable only for benchmark workloads. Production deployments
-    /// that need durability must route UPDATE through the classical
-    /// out-of-place [`HeapAccess::update_many`] path (which **does**
-    /// emit `HeapUpdate` WAL records — see `wal_emit.rs`).
-    ///
-    /// Tracked: ROADMAP P0 — undo-log durability story (no commit
-    /// reference yet).
+    /// When `wal` is `None`, no record is emitted — the configuration
+    /// used for unit tests and any future explicit `--no-wal` mode.
+    /// The buffer pool decides which mode applies via its configured
+    /// [`WalSink`](crate::wal_sink::WalSink); fused executor callers
+    /// pull the sink from [`HeapAccess::wal_sink`].
     #[allow(clippy::too_many_arguments)]
     #[inline]
     pub fn update_int32_pair_inplace_undo<O, P>(
@@ -238,6 +226,7 @@ impl<L: PageLoader> HeapAccess<L> {
         delta: i32,
         xid: Xid,
         command_id: CommandId,
+        wal: Option<&dyn WalSink>,
     ) -> Result<usize, HeapError>
     where
         O: XidStatusOracle + ?Sized,
@@ -257,11 +246,40 @@ impl<L: PageLoader> HeapAccess<L> {
         let mut undo_scratch: Vec<UndoEntry> =
             Vec::with_capacity((block_count as usize).saturating_mul(160).max(200));
 
+        // When a WAL sink is wired, collect per-row `(TupleId,
+        // pre_image, post_image)` triples *during* the page write
+        // and emit them with the page write guard dropped. Holding
+        // the per-frame `RwLock<Page>` write across WAL I/O would
+        // pin the buffer-pool frame for the duration of an fsync.
+        // Reusing one Vec across pages avoids allocator churn.
+        let mut wal_scratch: Vec<(TupleId, [u8; 9], [u8; 9])> = if wal.is_some() {
+            Vec::with_capacity(256)
+        } else {
+            Vec::new()
+        };
+
         let xid_bytes = xid.raw().to_le_bytes();
         let cmd_bytes = command_id.raw().to_le_bytes();
 
         for src_block in 0..block_count {
             let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
+
+            // FPW: if the page has not been mutated since the last
+            // checkpoint, emit a full-page-write record first so
+            // recovery has the canonical image to apply per-row
+            // post-images on top of. The FPW guard is on a shared
+            // read lock; emission completes before we acquire the
+            // exclusive write lock for the mutation.
+            if let Some(sink) = wal {
+                Self::maybe_emit_fpw(
+                    &self.pool,
+                    src_page_id,
+                    sink,
+                    &self.last_checkpoint_lsn,
+                    xid,
+                )?;
+            }
+
             let src_guard = self.pool.get_page(src_page_id)?;
             let mut src_page = src_guard.write();
             let src_bytes = src_page.as_bytes_mut();
@@ -375,8 +393,15 @@ impl<L: PageLoader> HeapAccess<L> {
                 // from the slot bytes — no decode + re-encode pair.
                 let mut pre_image = UpdatePayload::new();
                 pre_image.extend_from_slice(&src_bytes[payload_off..payload_off + 9]);
+                let tup_id = TupleId::new(src_page_id, src_slot);
+                if wal.is_some() {
+                    let mut pre_bytes = [0u8; 9];
+                    pre_bytes.copy_from_slice(&src_bytes[payload_off..payload_off + 9]);
+                    // Post bytes are filled in below before the loop tail.
+                    wal_scratch.push((tup_id, pre_bytes, [0u8; 9]));
+                }
                 undo_scratch.push(UndoEntry {
-                    tid: TupleId::new(src_page_id, src_slot),
+                    tid: tup_id,
                     writer_xid: xid,
                     old_payload: pre_image,
                 });
@@ -400,6 +425,11 @@ impl<L: PageLoader> HeapAccess<L> {
                 src_bytes[payload_off + 1..payload_off + 9]
                     .copy_from_slice(&payload_u64.to_le_bytes());
 
+                if wal.is_some() {
+                    let last = wal_scratch.last_mut().expect("just pushed");
+                    last.2.copy_from_slice(&src_bytes[payload_off..payload_off + 9]);
+                }
+
                 total_updated += 1;
             }
 
@@ -407,6 +437,30 @@ impl<L: PageLoader> HeapAccess<L> {
             // shared undo log; lock order is `page → undo`.
             drop(src_page);
             drop(src_guard);
+
+            // Emit one WAL record per applied row on this page, with
+            // the page guard dropped (no buffer-pool pin held during
+            // WAL I/O). Stamp the page LSN with the largest assigned
+            // LSN at the end so recovery's redo-skip check sees the
+            // page as covered by every record on it.
+            if let Some(sink) = wal {
+                let mut last_lsn = ultrasql_core::Lsn::ZERO;
+                for (tid, pre, post) in wal_scratch.iter() {
+                    let lsn = Self::emit_update_in_place_wal(
+                        sink,
+                        *tid,
+                        xid,
+                        command_id,
+                        pre,
+                        post,
+                    )?;
+                    last_lsn = lsn;
+                }
+                if !wal_scratch.is_empty() {
+                    Self::stamp_page_lsn(&self.pool, src_page_id, last_lsn)?;
+                }
+                wal_scratch.clear();
+            }
 
             // Defer per-page undo append: keep accumulating into the
             // local `undo_scratch` and bulk-move once after the
