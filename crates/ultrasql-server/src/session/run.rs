@@ -244,24 +244,4 @@ where
         self.io.flush().await?;
         Ok(())
     }
-
-    /// Dispatch a [`SelectResult`] over the wire in a single
-    /// `write_all` + `flush`.
-    ///
-    /// For the SELECT-streaming case the result carries a
-    /// `streamed_body` blob of pre-encoded `RowDescription` /
-    /// `DataRow` / `CommandComplete` bytes that we hand to the socket
-    /// verbatim. Otherwise we fall back to the legacy
-    /// `Vec<BackendMessage>` shape and coalesce its encoded form into
-    /// one syscall.
-    pub(crate) async fn send_query_result(
-        &mut self,
-        result: SelectResult,
-    ) -> Result<(), ServerError> {
-        if let Some(body) = result.streamed_body.as_ref() {
-            self.send_raw(body).await
-        } else {
-            self.send_messages_coalesced(&result.messages).await
-        }
-    }
 }

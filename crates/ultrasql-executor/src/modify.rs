@@ -30,9 +30,7 @@ use std::sync::Arc;
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Value, Xid};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::heap::{
-    DeleteOptions, HeapAccess, InsertOptions, UpdateOptions, UpdatePayload,
-};
+use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions, UpdatePayload};
 use ultrasql_storage::wal_sink::WalSink;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
@@ -472,29 +470,6 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
 }
 
 impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
-    /// Apply a single INSERT row.
-    fn apply_insert(&self, row: &[Value]) -> Result<(), ExecError> {
-        let payload = self
-            .codec
-            .encode(row)
-            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-        let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
-        self.heap
-            .insert(
-                self.relation,
-                &payload,
-                InsertOptions {
-                    xmin: self.insert_xmin,
-                    command_id: self.insert_command_id,
-                    wal: wal_ref,
-                    fsm: None,
-                    vm: None,
-                },
-            )
-            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-        Ok(())
-    }
-
     /// Compute the `(old_tid, new_payload_bytes)` edit for a single
     /// UPDATE input row.
     ///

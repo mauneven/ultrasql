@@ -41,16 +41,11 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use smallvec::SmallVec;
-use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
-use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
-use ultrasql_mvcc::{Snapshot, TupleHeader, Visibility, XidStatusOracle, is_visible};
-use ultrasql_wal::WalRecord;
-use ultrasql_wal::payload::{
-    FullPageWritePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdatePayload, PayloadError,
-};
-use ultrasql_wal::record::RecordType;
+use ultrasql_core::{BlockNumber, CommandId, RelationId, TupleId, Xid};
+use ultrasql_mvcc::TupleHeader;
+use ultrasql_wal::payload::PayloadError;
 
-use crate::buffer_pool::{BufferPool, BufferPoolError, PageGuard, PageLoader};
+use crate::buffer_pool::{BufferPool, BufferPoolError, PageLoader};
 use crate::page::PageError;
 use crate::wal_sink::{WalSink, WalSinkError};
 

@@ -482,8 +482,9 @@ impl HeapUpdateInPlacePayload {
 // HeapDeleteInPlacePayload
 // ---------------------------------------------------------------------------
 
-/// Payload for a `RecordType::HeapDeleteInPlace` WAL record. Same
-/// shape as [`HeapDeletePayload`]; the distinct record type lets
+/// Payload for a `RecordType::HeapDeleteInPlace` WAL record.
+///
+/// Same shape as [`HeapDeletePayload`]; the distinct record type lets
 /// recovery distinguish whether the original write went through the
 /// classical `delete_many` path or the single-pass
 /// `delete_int32_pair_inplace` path. For DELETE both record types

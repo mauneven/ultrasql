@@ -107,7 +107,7 @@ pub enum RecordType {
     /// were rewritten by an `update_int32_pair_inplace_undo`-style
     /// path. The payload carries both the pre-image and the
     /// post-image so recovery can rebuild both the page bytes and
-    /// the in-memory [`UndoRelationLog`] entry.
+    /// the in-memory `UndoRelationLog` entry.
     HeapUpdateInPlace = 9,
     /// A tuple was deleted **in place** via the single-pass
     /// `delete_int32_pair_inplace` path. Equivalent semantics to

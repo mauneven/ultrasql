@@ -39,7 +39,7 @@ use std::sync::Arc;
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Xid};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::heap::{HeapAccess, UpdateOptions, UpdatePayload};
+use ultrasql_storage::heap::HeapAccess;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};

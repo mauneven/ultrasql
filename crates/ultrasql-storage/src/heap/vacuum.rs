@@ -15,7 +15,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// strictly less than `oldest_active_xid`.
     ///
     /// `oldest_active_xid` is the smallest XID still in progress, as
-    /// reported by [`ultrasql_txn::TransactionManager::oldest_in_progress`].
+    /// reported by `ultrasql_txn::TransactionManager::oldest_in_progress`.
     /// When the heap's [`super::UndoRelationLog`] holds an entry whose
     /// writer XID is below that threshold, the writer must already
     /// have committed or aborted: aborted xids had their entries
@@ -26,7 +26,7 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// Returns the number of entries trimmed across every relation.
     /// Walks each per-relation log under its own write lock; concurrent
-    /// readers via [`super::HeapAccess::for_each_visible_with_undo`]
+    /// readers via `super::HeapAccess::for_each_visible_with_undo`
     /// see the trimmed log on their next lock acquire and fall back
     /// to the on-page bytes (which already reflect the post-image
     /// from the committed writer), matching the visibility predicate's

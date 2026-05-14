@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{BlockNumber, CommandId, PageId, Result, Xid};
 use ultrasql_mvcc::status::test_support::MapOracle;
+use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
 
 use super::*;

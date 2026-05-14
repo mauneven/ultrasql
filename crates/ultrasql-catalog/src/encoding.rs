@@ -9,7 +9,7 @@
 //! during bootstrap, not for client interoperability.
 //!
 //! Each row is a single payload the heap will wrap with a
-//! [`ultrasql_mvcc::TupleHeader`] at insert time, exactly like a user
+//! `ultrasql_mvcc::TupleHeader` at insert time, exactly like a user
 //! table row. Decoding consumes the slot's `data` slice (bytes after
 //! the tuple header).
 //!

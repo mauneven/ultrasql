@@ -775,12 +775,13 @@ pub fn cmp_gt_i64_scalar(column: &NumericColumn<i64>, scalar: i64) -> Bitmap {
     out
 }
 
-/// Fused predicate-and-sum over an `i32` column: returns
-/// `sum(data[i] for i where data[i] > threshold)`, widening to
-/// `i64`. Skips both the intermediate `Bitmap` materialisation and
-/// the per-bit iteration that `cmp_i32_scalar` + `sum_i32_widening_with_mask`
-/// pay separately — the entire `filter_sum` operator collapses to
-/// one tight SIMD loop on aarch64.
+/// Fused predicate-and-sum over an `i32` column.
+///
+/// Returns `sum(data[i] for i where data[i] > threshold)`, widening
+/// to `i64`. Skips both the intermediate `Bitmap` materialisation
+/// and the per-bit iteration that `cmp_i32_scalar` +
+/// `sum_i32_widening_with_mask` pay separately — the entire
+/// `filter_sum` operator collapses to one tight SIMD loop on aarch64.
 ///
 /// Equivalent to:
 ///
@@ -799,7 +800,7 @@ pub fn cmp_gt_i64_scalar(column: &NumericColumn<i64>, scalar: i64) -> Bitmap {
 pub fn filter_sum_i32_widening_gt(data: &[i32], threshold: i32) -> i64 {
     #[cfg(target_arch = "aarch64")]
     {
-        return filter_sum_i32_widening_gt_neon(data, threshold);
+        filter_sum_i32_widening_gt_neon(data, threshold)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -879,9 +880,11 @@ fn filter_sum_i32_widening_gt_neon(data: &[i32], threshold: i32) -> i64 {
 }
 
 /// Sum an `i32` column widened to `i64`, masked by an external
-/// predicate bitmap. Bit `i` set ⇒ lane `i` contributes. Skips
-/// the per-lane `Vec<i32>` materialisation a `select_column` +
-/// `sum_i32_widening` pair would pay.
+/// predicate bitmap.
+///
+/// Bit `i` set ⇒ lane `i` contributes. Skips the per-lane
+/// `Vec<i32>` materialisation a `select_column` + `sum_i32_widening`
+/// pair would pay.
 ///
 /// # Panics
 ///

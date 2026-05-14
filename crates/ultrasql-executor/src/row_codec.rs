@@ -20,7 +20,7 @@ use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 ///
 /// Caches a `fixed_width_lower_bound` and a `decode_shape` tag
 /// precomputed at construction. The shape tag dispatches
-/// [`Self::decode_into_builders`] to a specialised tight inline
+/// `Self::decode_into_builders` to a specialised tight inline
 /// loop for common fixed-width schemas (the scans on the
 /// `cross_compare_sql` analytic and OLTP shapes) — bypassing the
 /// generic column-loop match-dispatch.

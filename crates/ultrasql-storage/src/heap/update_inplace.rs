@@ -148,7 +148,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// [`HeapAccess::undo_log`] keyed by `TupleId`, so a concurrent
     /// reader whose snapshot does not yet see this UPDATE as
     /// committed can recover the pre-image from the side log
-    /// (handled in [`Self::for_each_visible_with_undo`]).
+    /// (handled in `Self::for_each_visible_with_undo`).
     ///
     /// What in-place wins versus the out-of-place plan:
     ///
@@ -174,7 +174,7 @@ impl<L: PageLoader> HeapAccess<L> {
     ///
     /// Tuples updated in place carry the
     /// [`InfoMask::UPDATED_IN_PLACE`] bit on top of the existing
-    /// `UPDATED` bit. Readers using [`Self::for_each_visible_with_undo`]
+    /// `UPDATED` bit. Readers using `Self::for_each_visible_with_undo`
     /// (or the standard `is_visible`-driven scan paths once the
     /// visibility predicate is taught about `UPDATED_IN_PLACE`) check
     /// whether the writer's xmax is visible in their snapshot:
@@ -197,7 +197,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// (carrying pre + post-image bytes) after the per-page write
     /// guard is dropped, and stamps the page LSN with the last
     /// assigned LSN. A
-    /// [`RecordType::FullPageWrite`](ultrasql_wal::RecordType::FullPageWrite)
+    /// [`ultrasql_wal::RecordType::FullPageWrite`]
     /// record is emitted first when the page has not been touched
     /// since the previous checkpoint, mirroring the
     /// [`HeapAccess::update_many`] / [`HeapAccess::delete_many`]
@@ -208,7 +208,7 @@ impl<L: PageLoader> HeapAccess<L> {
     /// When `wal` is `None`, no record is emitted — the configuration
     /// used for unit tests and any future explicit `--no-wal` mode.
     /// The buffer pool decides which mode applies via its configured
-    /// [`WalSink`](crate::wal_sink::WalSink); fused executor callers
+    /// [`crate::wal_sink::WalSink`]; fused executor callers
     /// pull the sink from [`HeapAccess::wal_sink`].
     #[allow(clippy::too_many_arguments)]
     #[inline]

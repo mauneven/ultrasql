@@ -201,7 +201,7 @@ impl<L: PageLoader> HeapAccess<L> {
     ///   uncontended for every entry on the page (the prior call
     ///   has already released).
     /// - WAL emission still happens once per row inside
-    ///   [`Self::emit_update_wal`]; when `opts.wal` is `None` (the
+    ///   `Self::emit_update_wal`; when `opts.wal` is `None` (the
     ///   bulk DML executor path on the `cross_compare_sql` bench)
     ///   `emit_update_wal` is a no-op.
     ///

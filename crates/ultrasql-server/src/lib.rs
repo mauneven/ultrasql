@@ -49,26 +49,18 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use bytes::BytesMut;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
-use ultrasql_catalog::{
-    CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
-};
-use ultrasql_core::{DataType, PageId, RelationId, Value};
-use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, StatsSource};
-use ultrasql_parser::Parser;
-use ultrasql_planner::{
-    Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
-    bind,
-};
-use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
-use ultrasql_storage::btree::BTree;
+use ultrasql_catalog::{CatalogSnapshot, PersistentCatalog};
+use ultrasql_core::{PageId, Value};
+use ultrasql_optimizer::{PlanCache, PlanCacheConfig};
+use ultrasql_planner::{Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan, TableMeta};
+use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
+use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::page::Page;
-use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
+use ultrasql_txn::{Transaction, TransactionManager};
 
 pub use error::ServerError;
 pub use pipeline::{LowerCtx, SampleTables, build_sample_database};

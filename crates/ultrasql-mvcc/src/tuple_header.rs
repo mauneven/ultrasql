@@ -154,7 +154,7 @@ impl TupleHeader {
     /// Build a partial header carrying only the fields needed by
     /// callers who already know the tuple is MVCC-visible via a
     /// cached `(xmin, infomask_bits)` hit — typically the
-    /// [`HeapAccess::for_each_visible`]
+    /// `HeapAccess::for_each_visible`
     /// (in `ultrasql-storage`) hot path. Other fields are
     /// best-effort sentinels: `xmax` is `INVALID` (the cache key
     /// implied `xmax == 0`), `cmin`/`cmax`/`n_atts`/`data_offset`

@@ -13,7 +13,7 @@
 //! - First `SeqScan` over a relation walks the heap normally **and**
 //!   accumulates the decoded columns into an [`Arc<CachedColumns>`]
 //!   entry keyed on the relation's monotonically-increasing
-//!   [`RelationVersion`].
+//!   relation version.
 //! - Subsequent `SeqScan`s over the **same** relation, **same**
 //!   version, skip the heap walk entirely and stream batches
 //!   directly from the cached columns.

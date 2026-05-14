@@ -66,49 +66,6 @@ where
         Ok(())
     }
 
-    /// Encode every message in `msgs` into the connection's write
-    /// buffer and dispatch it in a single `write_all` + `flush`.
-    ///
-    /// The naïve `for msg in msgs { self.send(msg).await? }` loop
-    /// issues one `write_all` + one `flush` per message. For a SELECT
-    /// that emits a `RowDescription`, N `DataRow`s, and a
-    /// `CommandComplete`, that is N+2 syscall round-trips per query
-    /// (or N+2 reactor wake-ups on the loopback path used by the
-    /// bench harness) — which dominates wall-clock time on
-    /// `select_scan_10k`. Coalescing collapses the dispatch to a
-    /// single round-trip without changing wire semantics, since
-    /// PostgreSQL's protocol does not require message-boundary flushes
-    /// between `RowDescription` / `DataRow` / `CommandComplete`.
-    pub(crate) async fn send_messages_coalesced(
-        &mut self,
-        msgs: &[BackendMessage],
-    ) -> Result<(), ServerError> {
-        self.write_buf.clear();
-        for msg in msgs {
-            encode_backend(msg, &mut self.write_buf);
-        }
-        if !self.write_buf.is_empty() {
-            self.io.write_all(&self.write_buf).await?;
-            self.io.flush().await?;
-        }
-        Ok(())
-    }
-
-    /// Write the raw bytes of one or more already-encoded backend
-    /// messages to the socket in a single `write_all` + `flush`.
-    ///
-    /// Used by the SELECT streaming path
-    /// ([`result_encoder::stream_select`]) which builds the wire bytes
-    /// directly into a scratch `BytesMut` to avoid materialising
-    /// `BackendMessage::DataRow` enums for every row of a large scan.
-    pub(crate) async fn send_raw(&mut self, bytes: &[u8]) -> Result<(), ServerError> {
-        if !bytes.is_empty() {
-            self.io.write_all(bytes).await?;
-            self.io.flush().await?;
-        }
-        Ok(())
-    }
-
     /// Send a PostgreSQL-compatible `ErrorResponse`. The fields are
     /// the minimal set every libpq client expects: severity, code,
     /// message.
