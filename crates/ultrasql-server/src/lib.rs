@@ -43,6 +43,7 @@ pub mod extended;
 pub mod pipeline;
 pub mod result_encoder;
 pub mod tls;
+pub mod wire_writer;
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -71,7 +72,9 @@ use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
 pub use error::ServerError;
 pub use pipeline::{LowerCtx, SampleTables, build_sample_database};
-pub use result_encoder::{SelectResult, run_ddl_command, run_modify_command, run_select};
+pub use result_encoder::{
+    SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
+};
 
 /// Per-session transaction-block state.
 ///
@@ -642,9 +645,7 @@ where
 
         match self.execute_query(trimmed) {
             Ok(result) => {
-                for msg in &result.messages {
-                    self.send(msg).await?;
-                }
+                self.send_query_result(result).await?;
             }
             Err(err) => {
                 if !err.is_query_scoped() {
@@ -658,6 +659,23 @@ where
         })
         .await?;
         Ok(())
+    }
+
+    /// Dispatch a [`SelectResult`] over the wire in a single
+    /// `write_all` + `flush`.
+    ///
+    /// For the SELECT-streaming case the result carries a
+    /// `streamed_body` blob of pre-encoded `RowDescription` /
+    /// `DataRow` / `CommandComplete` bytes that we hand to the socket
+    /// verbatim. Otherwise we fall back to the legacy
+    /// `Vec<BackendMessage>` shape and coalesce its encoded form into
+    /// one syscall.
+    async fn send_query_result(&mut self, result: SelectResult) -> Result<(), ServerError> {
+        if let Some(body) = result.streamed_body.as_ref() {
+            self.send_raw(body).await
+        } else {
+            self.send_messages_coalesced(&result.messages).await
+        }
     }
 
     /// Synchronous core of query execution: parse, bind, lower, run.
@@ -1011,7 +1029,11 @@ where
         messages.push(BackendMessage::CommandComplete {
             tag: "BEGIN".to_string(),
         });
-        Ok(SelectResult { messages, rows: 0 })
+        Ok(SelectResult {
+            messages,
+            streamed_body: None,
+            rows: 0,
+        })
     }
 
     /// `COMMIT` — finalise the current explicit transaction.
@@ -1032,6 +1054,7 @@ where
                         tag: "COMMIT".to_string(),
                     },
                 ],
+                streamed_body: None,
                 rows: 0,
             }),
             TxnState::InTransaction(txn) => {
@@ -1042,6 +1065,7 @@ where
                     messages: vec![BackendMessage::CommandComplete {
                         tag: "COMMIT".to_string(),
                     }],
+                    streamed_body: None,
                     rows: 0,
                 })
             }
@@ -1054,6 +1078,7 @@ where
                     messages: vec![BackendMessage::CommandComplete {
                         tag: "ROLLBACK".to_string(),
                     }],
+                    streamed_body: None,
                     rows: 0,
                 })
             }
@@ -1074,6 +1099,7 @@ where
                         tag: "ROLLBACK".to_string(),
                     },
                 ],
+                streamed_body: None,
                 rows: 0,
             }),
             TxnState::InTransaction(txn) | TxnState::Failed(txn) => {
@@ -1084,6 +1110,7 @@ where
                     messages: vec![BackendMessage::CommandComplete {
                         tag: "ROLLBACK".to_string(),
                     }],
+                    streamed_body: None,
                     rows: 0,
                 })
             }
@@ -1105,6 +1132,7 @@ where
                     messages: vec![BackendMessage::CommandComplete {
                         tag: "SAVEPOINT".to_string(),
                     }],
+                    streamed_body: None,
                     rows: 0,
                 })
             }
@@ -1150,6 +1178,7 @@ where
                         messages: vec![BackendMessage::CommandComplete {
                             tag: "ROLLBACK".to_string(),
                         }],
+                        streamed_body: None,
                         rows: 0,
                     })
                 } else {
@@ -1191,6 +1220,7 @@ where
                 messages: vec![BackendMessage::CommandComplete {
                     tag: "RELEASE".to_string(),
                 }],
+                streamed_body: None,
                 rows: 0,
             })
         } else {
@@ -2169,6 +2199,49 @@ where
         Ok(())
     }
 
+    /// Encode every message in `msgs` into the connection's write
+    /// buffer and dispatch it in a single `write_all` + `flush`.
+    ///
+    /// The naïve `for msg in msgs { self.send(msg).await? }` loop
+    /// issues one `write_all` + one `flush` per message. For a SELECT
+    /// that emits a `RowDescription`, N `DataRow`s, and a
+    /// `CommandComplete`, that is N+2 syscall round-trips per query
+    /// (or N+2 reactor wake-ups on the loopback path used by the
+    /// bench harness) — which dominates wall-clock time on
+    /// `select_scan_10k`. Coalescing collapses the dispatch to a
+    /// single round-trip without changing wire semantics, since
+    /// PostgreSQL's protocol does not require message-boundary flushes
+    /// between `RowDescription` / `DataRow` / `CommandComplete`.
+    async fn send_messages_coalesced(
+        &mut self,
+        msgs: &[BackendMessage],
+    ) -> Result<(), ServerError> {
+        self.write_buf.clear();
+        for msg in msgs {
+            encode_backend(msg, &mut self.write_buf);
+        }
+        if !self.write_buf.is_empty() {
+            self.io.write_all(&self.write_buf).await?;
+            self.io.flush().await?;
+        }
+        Ok(())
+    }
+
+    /// Write the raw bytes of one or more already-encoded backend
+    /// messages to the socket in a single `write_all` + `flush`.
+    ///
+    /// Used by the SELECT streaming path
+    /// ([`result_encoder::stream_select`]) which builds the wire bytes
+    /// directly into a scratch `BytesMut` to avoid materialising
+    /// `BackendMessage::DataRow` enums for every row of a large scan.
+    async fn send_raw(&mut self, bytes: &[u8]) -> Result<(), ServerError> {
+        if !bytes.is_empty() {
+            self.io.write_all(bytes).await?;
+            self.io.flush().await?;
+        }
+        Ok(())
+    }
+
     /// Send a PostgreSQL-compatible `ErrorResponse`. The fields are
     /// the minimal set every libpq client expects: severity, code,
     /// message.
@@ -2262,7 +2335,13 @@ fn run_plan_in_txn(
         }
         _ => {
             let mut op = pipeline::lower_query(plan, &ctx)?;
-            run_select(op.as_mut())
+            // Streaming wire-encode hot path: bypass the
+            // `Vec<BackendMessage>` materialisation and emit
+            // `RowDescription` + N `DataRow` + `CommandComplete`
+            // directly into a single `BytesMut`. The session dispatches
+            // the body in one `write_all` + `flush` rather than the
+            // per-message loop the legacy `run_select` requires.
+            run_select_streamed(op.as_mut())
         }
     }
 }

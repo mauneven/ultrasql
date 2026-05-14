@@ -19,12 +19,14 @@
 //!
 //! [`Batch`]: ultrasql_vec::Batch
 
+use bytes::BytesMut;
 use ultrasql_core::{DataType, Schema};
 use ultrasql_executor::Operator;
-use ultrasql_protocol::{BackendMessage, FieldDescription};
+use ultrasql_protocol::{BackendMessage, FieldDescription, encode_backend};
 use ultrasql_vec::column::Column;
 
 use crate::error::ServerError;
+use crate::wire_writer::write_data_row;
 
 /// PostgreSQL type OID for `bool`. Pulled from `pg_type.dat`.
 const PG_OID_BOOL: u32 = 16;
@@ -47,11 +49,26 @@ const FORMAT_TEXT: i16 = 0;
 
 /// Outcome of draining a single `SELECT` execution: the messages to
 /// send to the client, in transmission order.
+///
+/// The result is dispatched by [`crate::Session::send_query_result`]
+/// which prefers `streamed_body` when present (the SELECT hot-path
+/// streams its own wire bytes) and otherwise coalesces every entry of
+/// `messages` into a single `write_all` + `flush`.
 #[derive(Debug)]
 pub struct SelectResult {
     /// Ordered list of backend messages to emit, from `RowDescription`
-    /// through `CommandComplete`.
+    /// through `CommandComplete`. Used by every non-SELECT path
+    /// (DDL/DML tags, txn-control notices and tags, error envelopes)
+    /// and by the legacy `run_select` for callers that still want the
+    /// fully-materialised `BackendMessage` shape (tests, fallbacks).
     pub messages: Vec<BackendMessage>,
+    /// Optional pre-encoded wire-bytes blob produced by
+    /// [`stream_select`]. When `Some(_)`, the session sends this body
+    /// directly and ignores `messages`. The body contains
+    /// `RowDescription` + N `DataRow` + `CommandComplete` in
+    /// transmission order — the same sequence the legacy path would
+    /// have built as enum values and then encoded.
+    pub streamed_body: Option<BytesMut>,
     /// Number of rows produced. Mirrors the value embedded in the
     /// trailing `CommandComplete` tag.
     pub rows: u64,
@@ -70,6 +87,7 @@ pub fn run_ddl_command(tag: &str) -> SelectResult {
         messages: vec![BackendMessage::CommandComplete {
             tag: tag.to_string(),
         }],
+        streamed_body: None,
         rows: 0,
     }
 }
@@ -108,6 +126,7 @@ pub fn run_modify_command(
     let rows = u64::try_from(affected.max(0)).unwrap_or(0);
     Ok(SelectResult {
         messages: vec![BackendMessage::CommandComplete { tag }],
+        streamed_body: None,
         rows,
     })
 }
@@ -119,6 +138,11 @@ pub fn run_modify_command(
 /// Streaming straight to the socket is an optimization for after the
 /// connection loop matures — at v0.5, batches are small (3 rows in the
 /// sample table) so memory pressure is negligible.
+///
+/// Retained for callers that need the full `Vec<BackendMessage>` shape
+/// (tests, the Extended Query path before its own streaming refactor,
+/// and the txn-error / fallback paths in `lib.rs`). The hot path for
+/// Simple Query SELECT now goes through [`stream_select`].
 pub fn run_select(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
     let row_desc = build_row_description(op.schema());
     let mut messages = Vec::with_capacity(8);
@@ -141,7 +165,79 @@ pub fn run_select(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
     messages.push(BackendMessage::CommandComplete {
         tag: format!("SELECT {rows}"),
     });
-    Ok(SelectResult { messages, rows })
+    Ok(SelectResult {
+        messages,
+        streamed_body: None,
+        rows,
+    })
+}
+
+/// Drain `op` to completion, encoding every wire byte (`RowDescription`
+/// + N `DataRow` + `CommandComplete`) directly into `sink`. The caller
+/// is responsible for issuing the single `write_all` + `flush` after
+/// this returns and for emitting the trailing `ReadyForQuery`.
+///
+/// This is the production hot path for `SELECT ...` Simple Query
+/// execution. Compared to [`run_select`] it eliminates:
+///
+/// - the per-row `Vec<Option<Vec<u8>>>` allocation for the
+///   `BackendMessage::DataRow` payload (one `Vec` heap allocation, plus
+///   one per cell);
+/// - the per-cell text-format integer allocation (`i.to_string().into_bytes()`
+///   would heap-allocate twice per cell: once for the `String` body,
+///   once when `into_bytes` re-owns the underlying buffer);
+/// - the per-message encode-then-send loop in `Session::handle_query`,
+///   which previously issued one `write_all` + `flush` per `DataRow`
+///   (i.e. ~10 000 short writes for `select_scan_10k`).
+///
+/// Wire format is bit-identical to what `encode_backend` produces for
+/// the equivalent `BackendMessage::DataRow { columns }` (asserted in
+/// `wire_writer::tests`).
+///
+/// Returns the row count so the caller can update session bookkeeping;
+/// the same count is embedded in the `CommandComplete` tag that this
+/// function already wrote into `sink`.
+pub fn stream_select(op: &mut dyn Operator, sink: &mut BytesMut) -> Result<u64, ServerError> {
+    let row_desc = build_row_description(op.schema());
+    encode_backend(&row_desc, sink);
+
+    let mut rows: u64 = 0;
+    loop {
+        let Some(batch) = op.next_batch()? else { break };
+        let row_count = batch.rows();
+        let columns = batch.columns();
+        for row in 0..row_count {
+            write_data_row(sink, columns, row);
+        }
+        rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+    }
+
+    let tag = format!("SELECT {rows}");
+    encode_backend(&BackendMessage::CommandComplete { tag }, sink);
+    Ok(rows)
+}
+
+/// Convenience wrapper around [`stream_select`] that returns a
+/// [`SelectResult`] whose `streamed_body` field carries the encoded
+/// wire bytes. Drop-in replacement for [`run_select`] at the SELECT
+/// dispatch site in `run_plan_in_txn`.
+///
+/// The `messages` field is left empty by design: the session sends
+/// the streamed body verbatim and never iterates `messages` when one
+/// is present. The row-count is propagated so callers (e.g. autocommit
+/// finalisation) keep their behaviour unchanged.
+pub fn run_select_streamed(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
+    // Initial capacity: an int-only `select_scan_10k` produces roughly
+    // ~14 bytes per row; round up to 32 to keep small queries from
+    // re-allocating mid-stream. Larger scans grow the buffer
+    // geometrically through `BytesMut::reserve`.
+    let mut sink = BytesMut::with_capacity(32 * 1024);
+    let rows = stream_select(op, &mut sink)?;
+    Ok(SelectResult {
+        messages: Vec::new(),
+        streamed_body: Some(sink),
+        rows,
+    })
 }
 
 /// Translate a [`Schema`] into a [`BackendMessage::RowDescription`].
