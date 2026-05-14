@@ -1695,6 +1695,274 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(())
     }
 
+    /// Roll back every in-place UPDATE performed by `xid` by
+    /// restoring the slot's pre-image from the undo log and clearing
+    /// the `xmax / cmax / UPDATED / UPDATED_IN_PLACE` header bits.
+    ///
+    /// Walks every relation's undo log, splits its entries into
+    /// (kept, rolled-back), and rewrites each rolled-back slot's
+    /// payload + header. The kept entries are written back to the
+    /// per-relation log so future rollbacks of other XIDs can still
+    /// find them.
+    ///
+    /// Called by the server's transaction abort path
+    /// (`finalise_autocommit` on Err, explicit ROLLBACK, failed-
+    /// transaction COMMIT). Idempotent: a second call for the same
+    /// `xid` finds nothing to do.
+    pub fn rollback_in_place_updates(&self, xid: Xid) -> Result<usize, HeapError> {
+        let mut total_restored: usize = 0;
+        // Snapshot the keys upfront so we don't hold a `DashMap`
+        // shard read lock across the per-relation work.
+        let rels: Vec<RelationId> = self.undo_log.iter().map(|e| *e.key()).collect();
+        for rel in rels {
+            let Some(log_handle) = self.undo_log.get(&rel) else {
+                continue;
+            };
+            let mut log = log_handle.write();
+            if log.entries.is_empty() {
+                continue;
+            }
+            // Partition entries: keep everything not written by `xid`;
+            // collect the rolled-back set so we can apply them under
+            // page guards.
+            let mut to_apply: Vec<UndoEntry> = Vec::new();
+            let mut kept: Vec<UndoEntry> = Vec::with_capacity(log.entries.len());
+            for e in std::mem::take(&mut log.entries) {
+                if e.writer_xid == xid {
+                    to_apply.push(e);
+                } else {
+                    kept.push(e);
+                }
+            }
+            log.entries = kept;
+            drop(log);
+
+            if to_apply.is_empty() {
+                continue;
+            }
+
+            // Process per-page so each affected page is pinned once.
+            // Entries are sorted by tid (appended in (page, slot)
+            // order); `to_apply` therefore is sorted as well.
+            let mut i = 0;
+            while i < to_apply.len() {
+                let page_id = to_apply[i].tid.page;
+                let mut j = i + 1;
+                while j < to_apply.len() && to_apply[j].tid.page == page_id {
+                    j += 1;
+                }
+                let guard = self.pool.get_page(page_id)?;
+                let mut page = guard.write();
+                let bytes = page.as_bytes_mut();
+                for entry in &to_apply[i..j] {
+                    // Locate the slot via item-id.
+                    let item_id_off = crate::page::PAGE_HEADER_SIZE
+                        + usize::from(entry.tid.slot) * crate::page::ITEMID_SIZE;
+                    let item_raw = u32::from_le_bytes([
+                        bytes[item_id_off],
+                        bytes[item_id_off + 1],
+                        bytes[item_id_off + 2],
+                        bytes[item_id_off + 3],
+                    ]);
+                    if item_raw & 0b11 != 1 {
+                        continue;
+                    }
+                    let length = ((item_raw >> 2) & 0x7FFF) as usize;
+                    let offset = ((item_raw >> 17) & 0x7FFF) as usize;
+                    if length < TUPLE_HEADER_SIZE
+                        || offset.checked_add(length).is_none_or(|e| e > bytes.len())
+                    {
+                        return Err(HeapError::MalformedHeader("slot shorter than header"));
+                    }
+                    // Restore the payload bytes (pre-image is the
+                    // full payload; offset+TUPLE_HEADER_SIZE..end).
+                    let payload_off = offset + TUPLE_HEADER_SIZE;
+                    let pre = &entry.old_payload;
+                    let copy_len = pre.len().min(length - TUPLE_HEADER_SIZE);
+                    bytes[payload_off..payload_off + copy_len]
+                        .copy_from_slice(&pre[..copy_len]);
+                    // Clear xmax (bytes 8..16), cmax (20..24), and
+                    // the UPDATED + UPDATED_IN_PLACE bits in
+                    // infomask (24..26). Leave xmin / other
+                    // header fields untouched.
+                    bytes[offset + 8..offset + 16].copy_from_slice(&[0u8; 8]);
+                    bytes[offset + 20..offset + 24].copy_from_slice(&[0u8; 4]);
+                    let cur_im =
+                        u16::from_le_bytes([bytes[offset + 24], bytes[offset + 25]]);
+                    let new_im = cur_im & !(InfoMask::UPDATED | InfoMask::UPDATED_IN_PLACE);
+                    bytes[offset + 24..offset + 26]
+                        .copy_from_slice(&new_im.to_le_bytes());
+                    total_restored += 1;
+                }
+                drop(page);
+                drop(guard);
+                i = j;
+            }
+            self.column_cache.bump_version(rel);
+        }
+        Ok(total_restored)
+    }
+
+    /// Single-pass MVCC-correct DELETE for the narrow
+    /// `(Int32, Int32) [WHERE col_j cmp lit]` shape.
+    ///
+    /// Mirrors [`Self::update_int32_pair_inplace_undo`]: page-major
+    /// traversal, one source-page write guard at a time, ItemId +
+    /// minimal-visibility + payload decode inline. The slot's
+    /// payload is unchanged (DELETE leaves the bytes intact and uses
+    /// `xmax` to hide the tuple); only the header's `xmax / cmax /
+    /// infomask` triple is stamped.
+    ///
+    /// What this saves versus `ModifyTable(Filter(SeqScan))` →
+    /// `delete_many`:
+    /// - No intermediate `Vec<TupleId>` of qualifying TIDs.
+    /// - No per-page `AHashMap<PageId, Vec<u16>>` grouping pass.
+    /// - One write-pin per source page; the prior plan paid one for
+    ///   the scan's visibility walker and one for the stamp pass.
+    ///
+    /// # Concurrency
+    ///
+    /// Holds **one** write-exclusive page guard at a time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn delete_int32_pair_inplace<O, P>(
+        &self,
+        rel: RelationId,
+        block_count: u32,
+        snapshot: &Snapshot,
+        oracle: &O,
+        predicate: P,
+        xid: Xid,
+        command_id: CommandId,
+    ) -> Result<usize, HeapError>
+    where
+        O: XidStatusOracle + ?Sized,
+        P: Fn(i32, i32) -> bool,
+    {
+        use crate::page::{ITEMID_SIZE, PAGE_HEADER_SIZE};
+
+        let mut total_deleted: usize = 0;
+        let mut xmin_cache: Option<(Xid, u16, bool)> = None;
+
+        let xid_bytes = xid.raw().to_le_bytes();
+        let cmd_bytes = command_id.raw().to_le_bytes();
+
+        for src_block in 0..block_count {
+            let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
+            let src_guard = self.pool.get_page(src_page_id)?;
+            let mut src_page = src_guard.write();
+            let src_bytes = src_page.as_bytes_mut();
+            let src_slot_count = {
+                let hdr = crate::page::PageHeader::decode(src_bytes)
+                    .map_err(HeapError::Page)?;
+                hdr.slot_count()
+            };
+
+            for src_slot in 0..src_slot_count {
+                let item_id_off =
+                    PAGE_HEADER_SIZE + usize::from(src_slot) * ITEMID_SIZE;
+                let item_raw = u32::from_le_bytes([
+                    src_bytes[item_id_off],
+                    src_bytes[item_id_off + 1],
+                    src_bytes[item_id_off + 2],
+                    src_bytes[item_id_off + 3],
+                ]);
+                if item_raw & 0b11 != 1 {
+                    continue;
+                }
+                let length = ((item_raw >> 2) & 0x7FFF) as usize;
+                let offset = ((item_raw >> 17) & 0x7FFF) as usize;
+                if length < TUPLE_HEADER_SIZE
+                    || offset.checked_add(length).is_none_or(|e| e > src_bytes.len())
+                {
+                    return Err(HeapError::MalformedHeader("slot shorter than header"));
+                }
+
+                let xmin_raw = u64::from_le_bytes(
+                    src_bytes[offset..offset + 8].try_into().expect("8B"),
+                );
+                let xmax_raw = u64::from_le_bytes(
+                    src_bytes[offset + 8..offset + 16].try_into().expect("8B"),
+                );
+                let infomask_bits = u16::from_le_bytes(
+                    src_bytes[offset + 24..offset + 26].try_into().expect("2B"),
+                );
+                let xmin_xid = Xid::new(xmin_raw);
+
+                let visible = if xmax_raw == 0 {
+                    match xmin_cache {
+                        Some((cxmin, cinfo, cv))
+                            if cxmin == xmin_xid && cinfo == infomask_bits =>
+                        {
+                            cv
+                        }
+                        _ => {
+                            let (h, _) = TupleHeader::decode(
+                                &src_bytes[offset..offset + TUPLE_HEADER_SIZE],
+                            )
+                            .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                            let v = matches!(
+                                is_visible(&h, snapshot, oracle),
+                                Visibility::Visible,
+                            );
+                            xmin_cache = Some((h.xmin, h.infomask.bits(), v));
+                            v
+                        }
+                    }
+                } else {
+                    let (h, _) = TupleHeader::decode(
+                        &src_bytes[offset..offset + TUPLE_HEADER_SIZE],
+                    )
+                    .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+                    matches!(is_visible(&h, snapshot, oracle), Visibility::Visible)
+                };
+                if !visible {
+                    continue;
+                }
+
+                // Decode (id, val) so the predicate can decide.
+                let payload_off = offset + TUPLE_HEADER_SIZE;
+                if payload_off + 9 > offset + length {
+                    return Err(HeapError::MalformedHeader(
+                        "payload shorter than (Int32, Int32)",
+                    ));
+                }
+                let id = i32::from_le_bytes([
+                    src_bytes[payload_off + 1],
+                    src_bytes[payload_off + 2],
+                    src_bytes[payload_off + 3],
+                    src_bytes[payload_off + 4],
+                ]);
+                let val = i32::from_le_bytes([
+                    src_bytes[payload_off + 5],
+                    src_bytes[payload_off + 6],
+                    src_bytes[payload_off + 7],
+                    src_bytes[payload_off + 8],
+                ]);
+                if !predicate(id, val) {
+                    continue;
+                }
+
+                // Stamp xmax / cmax / infomask | UPDATED.
+                src_bytes[offset + 8..offset + 16].copy_from_slice(&xid_bytes);
+                src_bytes[offset + 20..offset + 24].copy_from_slice(&cmd_bytes);
+                let new_infomask = infomask_bits | InfoMask::UPDATED;
+                src_bytes[offset + 24..offset + 26]
+                    .copy_from_slice(&new_infomask.to_le_bytes());
+
+                total_deleted += 1;
+            }
+
+            drop(src_page);
+            drop(src_guard);
+        }
+
+        if total_deleted > 0 {
+            self.column_cache.bump_version(rel);
+        }
+
+        Ok(total_deleted)
+    }
+
     /// **In-place** MVCC-correct UPDATE for the narrow
     /// `(Int32, Int32) SET col_i = col_i ± delta [WHERE col_j cmp lit]`
     /// shape.

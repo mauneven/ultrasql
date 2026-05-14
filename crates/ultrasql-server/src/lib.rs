@@ -1082,6 +1082,13 @@ where
                 }
             }
             Err(_) => {
+                // Roll back any in-place UPDATE writes by this txn
+                // *before* terminating the CLOG entry, so the undo
+                // log walker still sees the writer's XID.
+                let xid = txn.xid;
+                if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
+                    tracing::warn!(error = %e, "in-place update rollback failed");
+                }
                 if let Err(abort_err) = self.state.txn_manager.abort(txn) {
                     tracing::warn!(error = %abort_err, "autocommit rollback failed");
                 }
@@ -1217,6 +1224,10 @@ where
                 })
             }
             TxnState::Failed(txn) => {
+                let xid = txn.xid;
+                if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
+                    tracing::warn!(error = %e, "in-place update rollback failed");
+                }
                 if let Err(e) = self.state.txn_manager.abort(txn) {
                     tracing::warn!(error = %e, "explicit COMMIT (treated as rollback) failed");
                 }
@@ -1250,6 +1261,10 @@ where
                 rows: 0,
             }),
             TxnState::InTransaction(txn) | TxnState::Failed(txn) => {
+                let xid = txn.xid;
+                if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
+                    tracing::warn!(error = %e, "in-place update rollback failed");
+                }
                 if let Err(e) = self.state.txn_manager.abort(txn) {
                     tracing::warn!(error = %e, "explicit ROLLBACK failed");
                 }

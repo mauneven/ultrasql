@@ -57,6 +57,7 @@ use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
 use ultrasql_executor::filter_sum_op::{
     CachedAvgI32Scan, CachedFilterSumI32Scan, CachedSumI32Scan, FilterSumI32Scan,
 };
+use ultrasql_executor::fused_delete::FusedDeleteInt32Pair;
 use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
@@ -1578,6 +1579,78 @@ fn lower_real_update(
     Ok(Box::new(modify))
 }
 
+/// Try to detect the `(Int32, Int32) [WHERE col cmp lit]` DELETE
+/// shape and lower it to [`FusedDeleteInt32Pair`]. Mirrors
+/// [`try_build_fused_update`] without the assignment-validation half.
+fn try_build_fused_delete(
+    target_table: &str,
+    entry: &TableEntry,
+    input: &LogicalPlan,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let fields = entry.schema.fields();
+    if fields.len() != 2
+        || fields[0].data_type != DataType::Int32
+        || fields[1].data_type != DataType::Int32
+    {
+        return Ok(None);
+    }
+
+    let predicate: Option<FusedPredicate> = match input {
+        LogicalPlan::Scan { table, .. } => {
+            if !table.eq_ignore_ascii_case(target_table) {
+                return Ok(None);
+            }
+            None
+        }
+        LogicalPlan::Filter {
+            input: filter_input,
+            predicate,
+        } => {
+            let LogicalPlan::Scan { table, .. } = filter_input.as_ref() else {
+                return Ok(None);
+            };
+            if !table.eq_ignore_ascii_case(target_table) {
+                return Ok(None);
+            }
+            let Some((pred_col_idx, cmp, lit)) = extract_int32_col_op_lit(predicate) else {
+                return Ok(None);
+            };
+            if pred_col_idx > 1 {
+                return Ok(None);
+            }
+            let fused_cmp = match cmp {
+                ultrasql_vec::kernels::CmpOp::Eq => FusedCmp::Eq,
+                ultrasql_vec::kernels::CmpOp::Ne => FusedCmp::Ne,
+                ultrasql_vec::kernels::CmpOp::Lt => FusedCmp::Lt,
+                ultrasql_vec::kernels::CmpOp::Le => FusedCmp::Le,
+                ultrasql_vec::kernels::CmpOp::Gt => FusedCmp::Gt,
+                ultrasql_vec::kernels::CmpOp::Ge => FusedCmp::Ge,
+            };
+            Some(FusedPredicate {
+                col_index: u8::try_from(pred_col_idx).expect("col idx fits in u8"),
+                op: fused_cmp,
+                literal: lit,
+            })
+        }
+        _ => return Ok(None),
+    };
+
+    let rel = RelationId(entry.oid);
+    let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
+    let op = FusedDeleteInt32Pair::new(
+        Arc::clone(&ctx.heap),
+        rel,
+        ctx.snapshot.clone(),
+        Arc::clone(&ctx.oracle),
+        block_count,
+        predicate,
+        ctx.xid,
+        ctx.command_id,
+    );
+    Ok(Some(Box::new(op)))
+}
+
 /// Lower a `DELETE` plan into a [`ModifyTable`] with `ModifyKind::Delete`.
 ///
 /// See [`lower_real_update`] for the TID-emitting scan / filter shape.
@@ -1599,6 +1672,14 @@ fn lower_real_delete(
                 table.to_string(),
             ))
         })?;
+
+    // Fast-path: when the relation matches the `(Int32, Int32)` shape
+    // and the optional filter is `Int32 col cmp Int32 lit`, bypass
+    // the SeqScan + Filter + ModifyTable chain and lower to the
+    // single-pass `FusedDeleteInt32Pair` operator.
+    if let Some(fused) = try_build_fused_delete(table, entry, input, ctx)? {
+        return Ok(fused);
+    }
 
     let child = build_filtered_tid_scan(table, entry, input, ctx)?;
 

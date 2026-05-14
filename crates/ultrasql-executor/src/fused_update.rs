@@ -75,7 +75,7 @@ pub enum FusedCmp {
 
 impl FusedCmp {
     #[inline]
-    const fn check(self, lhs: i32, rhs: i32) -> bool {
+    pub const fn check(self, lhs: i32, rhs: i32) -> bool {
         match self {
             Self::Eq => lhs == rhs,
             Self::Ne => lhs != rhs,
