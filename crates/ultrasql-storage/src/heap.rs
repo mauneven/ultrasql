@@ -2039,13 +2039,14 @@ impl<L: PageLoader> HeapAccess<L> {
         let mut total_updated: usize = 0;
         let mut xmin_cache: Option<(Xid, u16, bool)> = None;
 
-        // Per-source-page scratch for the undo log. The slot-major
-        // walk pushes one record at a time and we move them all into
-        // the per-relation log once per page under a single
-        // `RwLock::write` acquire. Using `Vec` (not `SmallVec`) here
-        // because the page-level scratch is reused across pages and
-        // the 9-byte payload fits inline in `UpdatePayload` anyway.
-        let mut undo_scratch: Vec<UndoEntry> = Vec::with_capacity(200);
+        // Local scratch buffer for the undo log. The slot-major walk
+        // pushes one record at a time across every source page; we
+        // move them all into the per-relation log in a single
+        // `parking_lot::RwLock::write` acquire at the end. Pre-sized
+        // to a tight upper bound (`block_count × 160` rows per page)
+        // so the inner loop never re-allocates.
+        let mut undo_scratch: Vec<UndoEntry> =
+            Vec::with_capacity((block_count as usize).saturating_mul(160).max(200));
 
         let xid_bytes = xid.raw().to_le_bytes();
         let cmd_bytes = command_id.raw().to_le_bytes();
@@ -2060,8 +2061,6 @@ impl<L: PageLoader> HeapAccess<L> {
                     .map_err(HeapError::Page)?;
                 hdr.slot_count()
             };
-
-            undo_scratch.clear();
 
             for src_slot in 0..src_slot_count {
                 // ItemId decode.
@@ -2200,26 +2199,28 @@ impl<L: PageLoader> HeapAccess<L> {
             drop(src_page);
             drop(src_guard);
 
-            // Bulk-append this page's undo entries to the relation's
-            // undo log under one write-lock acquire. Pre-reserve
-            // capacity on the relation log's first write to avoid the
-            // geometric-growth reallocation chain when a large UPDATE
-            // pushes thousands of pre-images: we have a tight upper
-            // bound (`block_count × max-tuples-per-page`) without
-            // walking the heap.
-            if !undo_scratch.is_empty() {
-                let log_handle = self
-                    .undo_log
-                    .entry(rel)
-                    .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
-                let mut log = log_handle.write();
-                if log.entries.is_empty() {
-                    // Approx 154 (Int32, Int32) tuples per 8 KiB page.
-                    let upper = (block_count as usize).saturating_mul(160);
-                    log.entries.reserve(upper);
-                }
-                log.entries.extend(undo_scratch.drain(..));
+            // Defer per-page undo append: keep accumulating into the
+            // local `undo_scratch` and bulk-move once after the
+            // entire UPDATE finishes. Saves one
+            // `parking_lot::RwLock::write` + `Vec::extend` per
+            // source page (typically 65 pages on the bench) and
+            // shrinks the per-relation log's growth pattern to a
+            // single push.
+        }
+
+        // Single append of every captured pre-image into the per-
+        // relation undo log under one write-lock acquire.
+        if !undo_scratch.is_empty() {
+            let log_handle = self
+                .undo_log
+                .entry(rel)
+                .or_insert_with(|| parking_lot::RwLock::new(UndoRelationLog::default()));
+            let mut log = log_handle.write();
+            if log.entries.is_empty() {
+                let upper = (block_count as usize).saturating_mul(160);
+                log.entries.reserve(upper);
             }
+            log.entries.append(&mut undo_scratch);
         }
 
         if total_updated > 0 {
