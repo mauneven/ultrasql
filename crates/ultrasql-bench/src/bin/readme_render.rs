@@ -256,6 +256,14 @@ static STATIC_DEFAULTS: &[StaticTable] = &[
         ],
     },
     StaticTable {
+        id: "select_scan_10k",
+        heading: "SELECT scan — 10 000 rows (full wire round-trip)",
+        // No static competitor rows; only UltraSQL is measured via the wire
+        // path so far. Competitor entries will appear once the bench scripts
+        // grow a SELECT-scan workload.
+        rows: &[],
+    },
+    StaticTable {
         id: "update_throughput_10k",
         heading: "UPDATE throughput — 10 000 rows",
         rows: &[
@@ -377,8 +385,7 @@ fn render_table(heading: &str, rows: &[(String, f64)]) -> String {
         return out;
     }
 
-    // Scale the ASCII bar to the slowest row. The slowest row is the
-    // first element after the descending sort `build_tables` applies.
+    // Scale the ASCII bar to the slowest row (max_us across all rows).
     let max_us = rows.iter().map(|(_, us)| *us).fold(0.0_f64, f64::max);
 
     out.push_str("| Engine | Median | Relative |\n");
@@ -411,7 +418,7 @@ fn display_engine_name(raw: &str) -> String {
 /// (one cell) is reserved for genuine zero values so the column never
 /// looks broken in Markdown.
 fn render_bar(value: f64, max: f64) -> String {
-    const WIDTH: usize = 18;
+    const WIDTH: usize = 36;
     if max <= 0.0 || !value.is_finite() {
         return " ".repeat(WIDTH);
     }
@@ -599,6 +606,7 @@ fn merge_latest_results(
     // the README benchmark id.
     let write_workload_ids: &[&str] = &[
         "insert_throughput_10k",
+        "select_scan_10k",
         "update_throughput_10k",
         "delete_throughput_10k",
         "mixed_oltp_pgbench_like",
@@ -664,7 +672,7 @@ fn merge_latest_results(
             continue;
         }
         // Sort here is informational only; `build_tables` re-sorts
-        // descending (slowest first) before rendering.
+        // ascending (fastest first) before rendering.
         rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         eprintln!(
             "readme-render: write-side {bench_id} — {} engines from latest results",
@@ -720,10 +728,10 @@ fn build_tables(
             },
         );
 
-        // Sort descending by median (slowest engine on top). The
+        // Sort ascending by median (fastest first). The
         // slowest row sets the scale for the ASCII relative-time bar
         // rendered alongside each engine.
-        rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let table = render_table(static_table.heading, &rows);
         tables.insert(static_table.id.to_string(), table);

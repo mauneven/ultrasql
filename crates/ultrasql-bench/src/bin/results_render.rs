@@ -267,15 +267,13 @@ fn format_duration(us: f64) -> String {
 // Ranking
 // ---------------------------------------------------------------------------
 
-/// Sort engines within a workload slowest-to-fastest (descending
-/// median_us) so the comparison reads "this is the bar competitors
-/// set; here is how UltraSQL sits against it." Ranks count down from
-/// the worst row so the absolute number still grows top-to-bottom in
-/// the rendered table; rank 1 is the slowest row.
+/// Sort engines within a workload fastest-to-slowest (ascending
+/// median_us) so the fastest engine appears first. Rank 1 is the
+/// fastest row.
 fn rank_engines(results: &mut Vec<EngineResult>) {
     results.sort_by(|a, b| {
-        b.median_us
-            .partial_cmp(&a.median_us)
+        a.median_us
+            .partial_cmp(&b.median_us)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 }
@@ -307,8 +305,7 @@ fn render_workload_md(workload: &str, results: &[EngineResult]) -> String {
 
     // ASCII bar scaling: the slowest row gets the full bar width;
     // every other row gets a proportionally shorter bar so the gap
-    // is visible at a glance. The slowest row sits on top after the
-    // descending sort, so we can pin the scale to `results[0]`.
+    // is visible at a glance.
     let max_us = results.iter().map(|r| r.median_us).fold(0.0_f64, f64::max);
 
     out.push_str("| Rank | Engine | Median time | Relative | Samples |\n");
@@ -316,7 +313,7 @@ fn render_workload_md(workload: &str, results: &[EngineResult]) -> String {
 
     let n = results.len();
     for (i, r) in results.iter().enumerate() {
-        // Rank 1 = slowest (row 0 after descending sort); rank N = fastest.
+        // Rank 1 = fastest (row 0 after ascending sort); rank N = slowest.
         let rank = i + 1;
         let bar = render_bar(r.median_us, max_us);
         let _ = writeln!(
@@ -334,9 +331,9 @@ fn render_workload_md(workload: &str, results: &[EngineResult]) -> String {
 
 /// Render a fixed-width ASCII bar whose length is proportional to
 /// `value / max`. `max == 0` (or a non-finite ratio) produces an
-/// empty bar; the longest bar is 24 cells.
+/// empty bar; the longest bar is 48 cells.
 fn render_bar(value: f64, max: f64) -> String {
-    const WIDTH: usize = 24;
+    const WIDTH: usize = 48;
     if max <= 0.0 || !value.is_finite() {
         return " ".repeat(WIDTH);
     }
@@ -369,7 +366,7 @@ fn render_md(by_workload: &HashMap<String, Vec<EngineResult>>) -> String {
          [`../../BENCHMARKS.md`](../../BENCHMARKS.md) for the methodology gate.\n\n",
     );
     out.push_str(
-        "Tables are ordered slowest → fastest. The `Relative` column shows \
+        "Tables are ordered fastest → slowest. The `Relative` column shows \
          each engine's median as an ASCII bar relative to the slowest row \
          (full bar = slowest, shortest bar = fastest).\n\n",
     );
@@ -511,11 +508,10 @@ mod tests {
     // rank_engines
     // -----------------------------------------------------------------------
 
-    /// Engines must be sorted descending (slowest first) by median_us
-    /// after ranking. The slowest engine sets the scale for the
-    /// ASCII relative-time bar in the rendered table.
+    /// Engines must be sorted ascending (fastest first) by median_us
+    /// after ranking.
     #[test]
-    fn rank_engines_sorts_descending() {
+    fn rank_engines_sorts_ascending() {
         let mut results = vec![
             EngineResult {
                 engine: "fast".into(),
@@ -537,8 +533,8 @@ mod tests {
             },
         ];
         rank_engines(&mut results);
-        assert_eq!(results[0].engine, "slow", "slowest first");
-        assert_eq!(results[1].engine, "fast", "fastest last");
+        assert_eq!(results[0].engine, "fast", "fastest first");
+        assert_eq!(results[1].engine, "slow", "slowest last");
     }
 
     // -----------------------------------------------------------------------
@@ -643,11 +639,11 @@ mod tests {
     // results_render_orders_by_median_ascending
     // -----------------------------------------------------------------------
 
-    /// When UltraSQL has a lower median than a competitor, the
-    /// slower competitor must appear first (rank 1, slowest) and
-    /// UltraSQL last (rank N, fastest).
+    /// When UltraSQL has a lower median than a competitor, UltraSQL
+    /// must appear first (rank 1, fastest) and the slower competitor
+    /// last (rank N, slowest).
     #[test]
-    fn results_render_orders_by_median_descending() {
+    fn results_render_orders_by_median_ascending() {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // UltraSQL: fast.
@@ -693,18 +689,18 @@ mod tests {
         let rank2 = &engines[1];
         assert_eq!(rank1["rank"], 1, "rank1 must be 1");
         assert_eq!(
-            rank1["engine"], "postgres17",
-            "postgres17 (higher median) must be rank 1 (slowest)"
+            rank1["engine"], "ultrasql",
+            "ultrasql (lower median) must be rank 1 (fastest)"
         );
         assert_eq!(rank2["rank"], 2, "rank2 must be 2");
         assert_eq!(
-            rank2["engine"], "ultrasql",
-            "ultrasql (lower median) must be rank 2 (fastest)"
+            rank2["engine"], "postgres17",
+            "postgres17 (higher median) must be rank 2 (slowest)"
         );
         assert!(
-            rank1["median_us"].as_f64().unwrap_or(0.0)
-                > rank2["median_us"].as_f64().unwrap_or(f64::MAX),
-            "rank 1 median must be larger than rank 2 median"
+            rank1["median_us"].as_f64().unwrap_or(f64::MAX)
+                < rank2["median_us"].as_f64().unwrap_or(0.0),
+            "rank 1 median must be smaller than rank 2 median"
         );
     }
 
@@ -713,8 +709,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// When two engines are present, ranks must be 1 and 2 with the
-    /// slower engine first (rank 1 = slowest after the descending
-    /// sort).
+    /// faster engine first (rank 1 = fastest after the ascending sort).
     #[test]
     fn rank_order_in_json() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -739,8 +734,8 @@ mod tests {
         let rank1 = &engines[0];
         let rank2 = &engines[1];
         assert_eq!(rank1["rank"], 1);
-        assert_eq!(rank1["engine"], "postgres", "slowest first");
+        assert_eq!(rank1["engine"], "ultrasql", "fastest first");
         assert_eq!(rank2["rank"], 2);
-        assert_eq!(rank2["engine"], "ultrasql", "fastest last");
+        assert_eq!(rank2["engine"], "postgres", "slowest last");
     }
 }
