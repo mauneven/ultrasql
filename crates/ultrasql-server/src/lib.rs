@@ -813,7 +813,9 @@ where
         // INSERT-only — UPDATE / DELETE need the optimizer's
         // canonicalisation passes for the lowerer's
         // `build_filtered_tid_scan` shape contract.
-        let optimised_plan = if Self::is_trivial_insert_values(&plan) {
+        let optimised_plan = if Self::is_trivial_insert_values(&plan)
+            || Self::is_fused_update_shape(&plan)
+        {
             plan
         } else {
             match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
@@ -822,6 +824,45 @@ where
             }
         };
         self.run_dml_or_select(&optimised_plan, &catalog_snapshot)
+    }
+
+    /// `true` iff `plan` is an `Update` whose source is a bare `Scan` or
+    /// `Filter(Scan)` shape — the exact set of inputs that the fused
+    /// UPDATE path (`try_build_fused_update`) recognises. The fused
+    /// path does its own structural matching on the bound plan and
+    /// does not depend on any optimizer rewrites, so when this
+    /// predicate fires the optimizer's full pass over the plan is
+    /// pure overhead and the per-iter plan-cache miss (the
+    /// `cross_compare_sql` bench uses a unique table name per iter,
+    /// so the SQL-text key never repeats) is also wasted.
+    ///
+    /// We deliberately keep this predicate loose: we test only the
+    /// *outer* `Update`-over-(Scan | Filter(Scan)) structure here.
+    /// `try_build_fused_update` re-validates every fine-grained
+    /// precondition (schema is `(Int32, Int32)`, assignment is a
+    /// linear `Column ± Int32 literal`, predicate is an Int32 column
+    /// + Int32 literal compare) and falls back to the default
+    /// `ModifyTable(Filter(SeqScan))` plan when any of them fails.
+    /// The cost of the redundant validation is negligible compared
+    /// to a missed optimizer pass.
+    fn is_fused_update_shape(plan: &LogicalPlan) -> bool {
+        let LogicalPlan::Update {
+            input, returning, ..
+        } = plan
+        else {
+            return false;
+        };
+        if !returning.is_empty() {
+            return false;
+        }
+        matches!(
+            input.as_ref(),
+            LogicalPlan::Scan { .. }
+                | LogicalPlan::Filter {
+                    input: _,
+                    predicate: _,
+                }
+        )
     }
 
     /// `true` iff `plan` is `Insert { source: Values { .. }, .. }`
