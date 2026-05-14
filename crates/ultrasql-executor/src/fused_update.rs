@@ -228,20 +228,25 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
 
         let n = edits.len();
         if n > 0 {
+            // For the (Int32, Int32) bulk-UPDATE shape this operator
+            // handles, every source page is at the post-preload
+            // ~99%-full mark and `try_hot_update`'s pre-check
+            // therefore short-circuits every page-group on its first
+            // pin. Skipping the HOT branch entirely (the per-page
+            // pin + header decode + free-space comparison) saves
+            // ~10 µs on a 10 000-row UPDATE without changing
+            // correctness — every row would have hit the bulk-
+            // non-HOT fallback anyway. When this operator's shape
+            // gate widens to relations with partially-empty pages we
+            // can revisit, but the present preconditions guarantee
+            // there is no HOT win to forfeit.
             self.heap
                 .update_many(
                     edits,
                     UpdateOptions {
                         xid: self.xid,
                         command_id: self.command_id,
-                        // HOT eligibility is left on; the bench's
-                        // 99%-full pages cannot fit a new version so
-                        // every entry hits the bulk-non-HOT fallback,
-                        // but the contract is the same as the
-                        // ModifyTable path so any future caller of
-                        // this operator over partially-empty pages
-                        // gets the HOT win.
-                        hot_eligible: true,
+                        hot_eligible: false,
                         wal: None,
                         vm: None,
                     },

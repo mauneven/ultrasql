@@ -1213,12 +1213,25 @@ impl<L: PageLoader> HeapAccess<L> {
         if edits_vec.is_empty() {
             return Ok(0);
         }
-        // A `sort_unstable_by_key` over already-sorted input is O(n)
-        // in practice (the comparison-based sort detects the existing
-        // order via its merge ascent). Run it unconditionally so the
-        // walk below can assume strict page-grouping without auditing
-        // every caller.
-        edits_vec.sort_unstable_by(|a, b| a.0.page.cmp(&b.0.page).then_with(|| a.0.slot.cmp(&b.0.slot)));
+        // Caller contract: `edits` arrives in `(page, slot)` ascending
+        // order. The two in-tree callers
+        // ([`ultrasql_executor::ModifyTable`] and the fused
+        // `FusedUpdateInt32Add` operator) both source their TIDs from
+        // a sequential heap walker that already yields tuples in
+        // block-major + slot-major order, so they meet the contract
+        // without an explicit sort. The previous implementation did a
+        // defensive `sort_unstable_by` on every call; that pass runs
+        // in O(n) on sorted input but still costs ~5-10 µs per
+        // 10 000-row UPDATE (mostly the comparator-call setup). A
+        // `debug_assert` documents the contract so a regression in a
+        // caller's input order trips a test run rather than silently
+        // producing per-page write storms.
+        debug_assert!(
+            edits_vec
+                .windows(2)
+                .all(|w| (w[0].0.page, w[0].0.slot) <= (w[1].0.page, w[1].0.slot)),
+            "update_many requires edits sorted by (PageId, slot)",
+        );
 
         let mut total = 0_usize;
         // HOT-failed entries fall back to the bulk-non-HOT path. We
