@@ -591,17 +591,14 @@ fn sum_i64_nullable(c: &NumericColumn<i64>) -> (i64, bool) {
     }
 }
 
-/// Sum non-null entries of an `i32` column, widening to `i64`. The fold is
-/// tight enough that LLVM autovectorises it on aarch64 (NEON `saddlv.4s` /
-/// `saddw.4s`) and on x86-64-v3 (AVX2 `vpaddq` after widening).
+/// Sum non-null entries of an `i32` column, widening to `i64`. Dispatches
+/// to the hand-NEON [`ultrasql_vec::kernels::sum_i32_widening`] on
+/// aarch64 and to the scalar fold on every other target.
 #[allow(clippy::option_if_let_else)]
 fn sum_i32_nullable_widened(c: &NumericColumn<i32>) -> (i64, bool) {
     match c.nulls() {
         None => {
-            let s = c
-                .data()
-                .iter()
-                .fold(0_i64, |a, &b| a.wrapping_add(i64::from(b)));
+            let s = ultrasql_vec::kernels::sum_i32_widening(c);
             (s, !c.is_empty())
         }
         Some(nulls) => {

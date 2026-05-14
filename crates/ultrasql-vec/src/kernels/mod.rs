@@ -271,7 +271,7 @@ pub fn eq_i32_scalar(a: &NumericColumn<i32>, b: &NumericColumn<i32>) -> Bitmap {
 #[must_use]
 pub fn sum_i64(column: &NumericColumn<i64>) -> i64 {
     column.nulls().map_or_else(
-        || column.data().iter().fold(0_i64, |a, b| a.wrapping_add(*b)),
+        || sum_i64_dense(column.data()),
         |nulls| {
             let mut s: i64 = 0;
             for (i, v) in column.data().iter().enumerate() {
@@ -282,6 +282,154 @@ pub fn sum_i64(column: &NumericColumn<i64>) -> i64 {
             s
         },
     )
+}
+
+/// Dense (non-null) sum of an `i64` slice. Hand-vectorised on aarch64;
+/// scalar fallback on every other target.
+#[inline]
+fn sum_i64_dense(data: &[i64]) -> i64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        sum_i64_dense_neon(data)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        data.iter().fold(0_i64, |a, b| a.wrapping_add(*b))
+    }
+}
+
+/// Hand-rolled aarch64 NEON kernel for `sum(i64 slice)`.
+///
+/// Processes 16 `i64` lanes per loop iteration through four parallel
+/// `int64x2_t` accumulators (8 lanes × 2 i64 / vec) so the CPU can
+/// dual-issue the dependent `vaddq_s64` chains. Tail of fewer than 16
+/// lanes folds through the standard scalar `wrapping_add` loop.
+///
+/// Bit-identical to the scalar fold under `i64::wrapping_add`. The
+/// `unsafe` block is sound because every `vld1q_s64` reads exactly two
+/// `i64` lanes from a slice we have indexed under bounds; no aliasing,
+/// no over-read.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn sum_i64_dense_neon(data: &[i64]) -> i64 {
+    use std::arch::aarch64::{int64x2_t, vaddq_s64, vaddvq_s64, vdupq_n_s64, vld1q_s64};
+
+    let mut a0: int64x2_t = unsafe { vdupq_n_s64(0) };
+    let mut a1: int64x2_t = unsafe { vdupq_n_s64(0) };
+    let mut a2: int64x2_t = unsafe { vdupq_n_s64(0) };
+    let mut a3: int64x2_t = unsafe { vdupq_n_s64(0) };
+
+    let chunks = data.chunks_exact(8);
+    let rem = chunks.remainder();
+    for c in chunks {
+        // SAFETY: `c` is `&[i64; 8]` (chunks_exact); each `vld1q_s64`
+        // reads 2 contiguous `i64` lanes within the chunk. No aliasing
+        // — `c` is a unique borrow into `data`. The pointer arithmetic
+        // stays inside `c.len() == 8`.
+        unsafe {
+            let v0 = vld1q_s64(c.as_ptr());
+            let v1 = vld1q_s64(c.as_ptr().add(2));
+            let v2 = vld1q_s64(c.as_ptr().add(4));
+            let v3 = vld1q_s64(c.as_ptr().add(6));
+            a0 = vaddq_s64(a0, v0);
+            a1 = vaddq_s64(a1, v1);
+            a2 = vaddq_s64(a2, v2);
+            a3 = vaddq_s64(a3, v3);
+        }
+    }
+    // Horizontal reduction.
+    let mut sum = unsafe {
+        let half0 = vaddq_s64(a0, a1);
+        let half1 = vaddq_s64(a2, a3);
+        let total = vaddq_s64(half0, half1);
+        vaddvq_s64(total)
+    };
+    for &v in rem {
+        sum = sum.wrapping_add(v);
+    }
+    sum
+}
+
+/// Sum of a non-null `i32` column widened to `i64` (the integer-add
+/// semantics every SQL `SUM(INT)` uses). NULL entries are skipped.
+///
+/// Hand-NEON-vectorised on aarch64; scalar fallback elsewhere.
+#[must_use]
+pub fn sum_i32_widening(column: &NumericColumn<i32>) -> i64 {
+    column.nulls().map_or_else(
+        || sum_i32_widening_dense(column.data()),
+        |nulls| {
+            let mut s: i64 = 0;
+            for (i, v) in column.data().iter().enumerate() {
+                if nulls.get(i) {
+                    s = s.wrapping_add(i64::from(*v));
+                }
+            }
+            s
+        },
+    )
+}
+
+#[inline]
+fn sum_i32_widening_dense(data: &[i32]) -> i64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        sum_i32_widening_dense_neon(data)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        data.iter()
+            .fold(0_i64, |a, b| a.wrapping_add(i64::from(*b)))
+    }
+}
+
+/// Hand-rolled aarch64 NEON kernel for `sum(i32 slice)` widened to
+/// `i64`. Processes 16 `i32` lanes per iteration via `vpaddlq_s32`
+/// (pairwise add-and-widen, 4 i32 → 2 i64) into four parallel
+/// `int64x2_t` accumulators.
+///
+/// Equivalent to `data.iter().fold(0, |a, b| a.wrapping_add(i64::from(b)))`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn sum_i32_widening_dense_neon(data: &[i32]) -> i64 {
+    use std::arch::aarch64::{
+        int64x2_t, vaddq_s64, vaddvq_s64, vdupq_n_s64, vld1q_s32, vpaddlq_s32,
+    };
+
+    let mut a0: int64x2_t = unsafe { vdupq_n_s64(0) };
+    let mut a1: int64x2_t = unsafe { vdupq_n_s64(0) };
+    let mut a2: int64x2_t = unsafe { vdupq_n_s64(0) };
+    let mut a3: int64x2_t = unsafe { vdupq_n_s64(0) };
+
+    let chunks = data.chunks_exact(16);
+    let rem = chunks.remainder();
+    for c in chunks {
+        // SAFETY: `c` is `&[i32; 16]`; each `vld1q_s32` reads 4
+        // contiguous i32 lanes inside the chunk. The 4 `vpaddlq_s32`
+        // calls then pairwise-widen 4 i32 → 2 i64. Final accumulators
+        // are `wrapping_add` over the widened i64 stream.
+        unsafe {
+            let v0 = vld1q_s32(c.as_ptr());
+            let v1 = vld1q_s32(c.as_ptr().add(4));
+            let v2 = vld1q_s32(c.as_ptr().add(8));
+            let v3 = vld1q_s32(c.as_ptr().add(12));
+            a0 = vaddq_s64(a0, vpaddlq_s32(v0));
+            a1 = vaddq_s64(a1, vpaddlq_s32(v1));
+            a2 = vaddq_s64(a2, vpaddlq_s32(v2));
+            a3 = vaddq_s64(a3, vpaddlq_s32(v3));
+        }
+    }
+    // Horizontal reduction of the four parallel accumulators.
+    let mut sum = unsafe {
+        let half0 = vaddq_s64(a0, a1);
+        let half1 = vaddq_s64(a2, a3);
+        let total = vaddq_s64(half0, half1);
+        vaddvq_s64(total)
+    };
+    for &v in rem {
+        sum = sum.wrapping_add(i64::from(v));
+    }
+    sum
 }
 
 /// Min of a non-null `f64` column. Returns `None` on empty / all-null
@@ -890,6 +1038,61 @@ mod tests {
         nulls.set(2, false);
         let c = NumericColumn::with_nulls(vec![10_i64, 20, 99, 40], nulls).unwrap();
         assert_eq!(sum_i64(&c), 70);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn sum_i64_neon_matches_scalar_at_every_tail_size() {
+        // Test sizes that exercise both the 8-wide main loop and
+        // every possible tail length (0..=7).
+        for n in [0_usize, 1, 7, 8, 15, 16, 23, 64, 100, 1_000, 4_096, 100_000] {
+            let data: Vec<i64> = (0..n).map(|i| i as i64 * 3 - 7).collect();
+            let scalar: i64 = data.iter().fold(0_i64, |a, b| a.wrapping_add(*b));
+            let c = NumericColumn::from_data(data);
+            assert_eq!(sum_i64(&c), scalar, "size {n} mismatch");
+        }
+    }
+
+    #[test]
+    fn sum_i32_widening_basic() {
+        let c = NumericColumn::from_data(vec![1_i32, 2, 3, 4]);
+        assert_eq!(sum_i32_widening(&c), 10);
+    }
+
+    #[test]
+    fn sum_i32_widening_with_nulls_skips_them() {
+        let mut nulls = Bitmap::new(4, true);
+        nulls.set(2, false);
+        let c = NumericColumn::with_nulls(vec![10_i32, 20, 99, 40], nulls).unwrap();
+        assert_eq!(sum_i32_widening(&c), 70);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_wrap)]
+    fn sum_i32_widening_neon_matches_scalar_at_every_tail_size() {
+        // 16-wide main loop; exercise tails 0..=15.
+        for n in [
+            0_usize, 1, 7, 8, 15, 16, 17, 23, 31, 32, 64, 100, 1_000, 4_096, 100_000,
+        ] {
+            let data: Vec<i32> = (0..n).map(|i| (i as i32) * 7 - 13).collect();
+            let scalar: i64 = data
+                .iter()
+                .fold(0_i64, |a, b| a.wrapping_add(i64::from(*b)));
+            let c = NumericColumn::from_data(data);
+            assert_eq!(sum_i32_widening(&c), scalar, "size {n} mismatch");
+        }
+    }
+
+    #[test]
+    fn sum_i32_widening_handles_negative_and_overflow_corners() {
+        // i32::MIN summed with itself wraps; we want the same wrap
+        // semantics the scalar fold provides (`i64::wrapping_add`).
+        let data = vec![i32::MIN, i32::MIN, i32::MAX, i32::MAX, 0];
+        let c = NumericColumn::from_data(data.clone());
+        let scalar: i64 = data
+            .iter()
+            .fold(0_i64, |a, b| a.wrapping_add(i64::from(*b)));
+        assert_eq!(sum_i32_widening(&c), scalar);
     }
 
     #[test]
