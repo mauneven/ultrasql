@@ -360,10 +360,11 @@ fn render_md(by_workload: &HashMap<String, Vec<EngineResult>>) -> String {
          SQL pipeline. Competitor rows come from each engine's native client \
          (`sqlite3`, `psql`/libpq for PostgreSQL 17, `duckdb`); UltraSQL rows \
          are measured via `tokio-postgres` against an in-process `ultrasqld` \
-         (see `cross_compare_sql`). Workloads that do not yet have an \
-         UltraSQL row are still in the v0.5 wire pipeline (UPDATE / DELETE / \
-         mixed OLTP land in Wave 2 follow-ups). See \
-         [`../../BENCHMARKS.md`](../../BENCHMARKS.md) for the methodology gate.\n\n",
+         (see `cross_compare_sql`). Every benchmark shape — INSERT, SELECT \
+         scan, SUM / AVG / Filter+SUM, UPDATE, DELETE, mixed OLTP — now \
+         travels the wire path end-to-end through `ultrasqld`. See \
+         [`../../BENCHMARKS.md`](../../BENCHMARKS.md) for the methodology \
+         gate.\n\n",
     );
     out.push_str(
         "Tables are ordered fastest → slowest. The `Relative` column shows \

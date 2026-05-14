@@ -99,12 +99,18 @@ impl Workload {
 }
 
 /// Render a row count using `10k` / `1m` notation matching the
-/// existing competitor workload ids (`insert_throughput_10k`).
+/// existing competitor workload ids (`insert_throughput_10k`,
+/// `select_sum_65k_i64`).
 fn k_or_raw(n: usize) -> String {
     if n >= 1_000_000 && n % 1_000_000 == 0 {
         format!("{}m", n / 1_000_000)
     } else if n >= 1_000 && n % 1_000 == 0 {
         format!("{}k", n / 1_000)
+    } else if n == 65_536 {
+        // The competitor scripts label `2^16` rows as `65k` even
+        // though the exact count is 65 536. Match their workload-id
+        // string so the `results-render` table groups them.
+        "65k".to_string()
     } else {
         n.to_string()
     }
