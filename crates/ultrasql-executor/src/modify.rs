@@ -28,7 +28,7 @@
 use std::sync::Arc;
 
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Value, Xid};
-use ultrasql_planner::ScalarExpr;
+use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, InsertOptions, UpdateOptions};
 use ultrasql_storage::wal_sink::WalSink;
@@ -39,6 +39,27 @@ use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::row_codec::RowCodec;
 use crate::{ExecError, Operator};
+
+/// Columnar UPDATE fast-path descriptor for the
+/// `UPDATE t SET col_i = col_i + literal` shape over an `(Int32, Int32)`
+/// relation schema.
+///
+/// Detected at [`ModifyTable::new`] from the bound assignment list.
+/// When `Some(_)`, [`ModifyTable::next_batch`]'s UPDATE arm bypasses
+/// `batch_to_rows` + per-row `Eval` + per-row `RowCodec::encode`
+/// entirely: the new column is computed by a single
+/// `i32::wrapping_add(literal)` per lane and each tuple's 9-byte
+/// payload is built inline from the (`id`, `new_val`) column pair.
+#[derive(Clone, Copy, Debug)]
+struct UpdateFastPathInt32Pair {
+    /// 0-based index of the target column in the relation schema
+    /// (also the column index in the eval expression's row). For
+    /// `(id, val)` UPDATEs of `val`, this is `1`.
+    target_col_in_relation: usize,
+    /// Constant added to the target column on every row. For
+    /// `val = val + 1` this is `1`; for `val = val - 5` this is `-5`.
+    delta: i32,
+}
 
 // ---------------------------------------------------------------------------
 // ModifyKind
@@ -105,6 +126,12 @@ pub struct ModifyTable<L: PageLoader> {
     ///
     /// Empty for INSERT and DELETE.
     update_evaluators: Vec<(usize, Eval)>,
+    /// Cached descriptor for the columnar UPDATE fast path. `Some`
+    /// when (a) the kind is UPDATE, (b) the relation schema is
+    /// exactly `(Int32, Int32)`, (c) there is one assignment whose
+    /// expression matches `col + lit` / `col - lit` / `lit + col`
+    /// with an `Int32` literal.
+    update_fast_path: Option<UpdateFastPathInt32Pair>,
     insert_xmin: Xid,
     insert_command_id: CommandId,
     delete_xmax: Xid,
@@ -175,6 +202,12 @@ impl<L: PageLoader> ModifyTable<L> {
                 .collect(),
             ModifyKind::Insert | ModifyKind::Delete => Vec::new(),
         };
+        let update_fast_path = match &kind {
+            ModifyKind::Update { assignments } => {
+                detect_update_int32_pair_fast_path(assignments, &relation_schema)
+            }
+            _ => None,
+        };
         Self {
             heap,
             relation,
@@ -182,6 +215,7 @@ impl<L: PageLoader> ModifyTable<L> {
             codec: RowCodec::new(relation_schema),
             kind,
             update_evaluators,
+            update_fast_path,
             insert_xmin,
             insert_command_id,
             delete_xmax,
@@ -192,6 +226,91 @@ impl<L: PageLoader> ModifyTable<L> {
             affected: 0,
         }
     }
+}
+
+/// Inspect a bound UPDATE assignment list against the target
+/// relation schema and return a [`UpdateFastPathInt32Pair`] descriptor
+/// when the columnar fast path applies.
+///
+/// Conditions:
+///
+/// - Relation schema is exactly two non-nullable `Int32` columns
+///   (matches the bench tables `(id INT, val INT)`).
+/// - Exactly one assignment targets one of those two columns.
+/// - The assignment expression is either `col + lit`, `lit + col`,
+///   `col - lit`, where `col` references the **target** column and
+///   `lit` is an `Int32` literal. `lit - col` is rejected because the
+///   transformation collapses into a single add only when the column
+///   is the *left* operand of a subtract.
+fn detect_update_int32_pair_fast_path(
+    assignments: &[(usize, ScalarExpr)],
+    relation_schema: &Schema,
+) -> Option<UpdateFastPathInt32Pair> {
+    if relation_schema.len() != 2 {
+        return None;
+    }
+    let fields = relation_schema.fields();
+    if !matches!(fields[0].data_type, DataType::Int32)
+        || !matches!(fields[1].data_type, DataType::Int32)
+    {
+        return None;
+    }
+    if assignments.len() != 1 {
+        return None;
+    }
+    let (target_col, expr) = &assignments[0];
+    let target_col = *target_col;
+    if target_col > 1 {
+        return None;
+    }
+    let (op, left, right) = match expr {
+        ScalarExpr::Binary {
+            op,
+            left,
+            right,
+            data_type: DataType::Int32,
+        } => (op, left.as_ref(), right.as_ref()),
+        _ => return None,
+    };
+    let column_ref_idx = |e: &ScalarExpr| match e {
+        ScalarExpr::Column {
+            index,
+            data_type: DataType::Int32,
+            ..
+        } => Some(*index),
+        _ => None,
+    };
+    let literal_i32 = |e: &ScalarExpr| match e {
+        ScalarExpr::Literal {
+            value: Value::Int32(v),
+            ..
+        } => Some(*v),
+        _ => None,
+    };
+    let delta = match op {
+        BinaryOp::Add => {
+            if column_ref_idx(left) == Some(target_col) {
+                literal_i32(right)?
+            } else if column_ref_idx(right) == Some(target_col) {
+                literal_i32(left)?
+            } else {
+                return None;
+            }
+        }
+        BinaryOp::Sub => {
+            // Only `col - lit` collapses to a single signed add.
+            if column_ref_idx(left) != Some(target_col) {
+                return None;
+            }
+            let lit = literal_i32(right)?;
+            lit.checked_neg()?
+        }
+        _ => return None,
+    };
+    Some(UpdateFastPathInt32Pair {
+        target_col_in_relation: target_col,
+        delta,
+    })
 }
 
 impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for ModifyTable<L> {
@@ -238,20 +357,27 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     self.affected = self.affected.saturating_add(n_u64);
                 }
                 ModifyKind::Update { .. } => {
-                    // Decode batch into rows so we can operate per-row.
-                    let child_schema = self.child.schema().clone();
-                    let rows = batch_to_rows(&batch, &child_schema)
-                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-                    // Bulk path: evaluate assignments for every row,
-                    // collect `(TupleId, new_payload_bytes)` pairs,
-                    // then hand the whole batch to
-                    // `heap.update_many`. Per-page pin + write-lock
-                    // are amortised across all updates on the page.
-                    let mut edits: Vec<(TupleId, Vec<u8>)> = Vec::with_capacity(rows.len());
-                    for row in &rows {
-                        let edit = self.compute_update_edit(row)?;
-                        edits.push(edit);
-                    }
+                    // Columnar fast path: `UPDATE t SET col_i = col_i ± lit`
+                    // over an `(Int32, Int32)` relation. Builds every
+                    // tuple's 9-byte payload inline from the batch's
+                    // column arrays — no `batch_to_rows`, no per-row
+                    // `Eval`, no per-row `RowCodec::encode` tree walk.
+                    let edits = if let Some(spec) = self.update_fast_path {
+                        build_update_edits_int32_pair(&batch, self.relation, spec)?
+                    } else {
+                        // Slow path: batch_to_rows + per-row eval +
+                        // per-row codec.encode. Covers every UPDATE
+                        // shape not matched by the fast-path detector.
+                        let child_schema = self.child.schema().clone();
+                        let rows = batch_to_rows(&batch, &child_schema)
+                            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                        let mut edits: Vec<(TupleId, Vec<u8>)> = Vec::with_capacity(rows.len());
+                        for row in &rows {
+                            let edit = self.compute_update_edit(row)?;
+                            edits.push(edit);
+                        }
+                        edits
+                    };
                     let n = edits.len();
                     let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
                     self.heap
@@ -360,6 +486,86 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
         Ok((tid, new_payload))
     }
+}
+
+/// Build the `(TupleId, new_payload_bytes)` edit list for the
+/// `UPDATE t SET col_i = col_i ± lit` columnar fast path over a
+/// `(Int32, Int32)` relation.
+///
+/// The input batch carries `[tid_block, tid_slot, id, val]` columns.
+/// The output payload is 9 bytes wide:
+///
+/// ```text
+///     byte 0    null bitmap        always 0 (both cols non-NULL)
+///     bytes 1..5  id  LE i32       unchanged unless target_col == 0
+///     bytes 5..9  val LE i32       unchanged unless target_col == 1
+/// ```
+///
+/// The new value of the target column is `old + spec.delta`
+/// (`wrapping_add`, matching the slow-path `int32_arith(Add)` semantics
+/// the binder validated). No `batch_to_rows`, no `Eval`, no
+/// `RowCodec::encode` tree walk.
+fn build_update_edits_int32_pair(
+    batch: &Batch,
+    relation: RelationId,
+    spec: UpdateFastPathInt32Pair,
+) -> Result<Vec<(TupleId, Vec<u8>)>, ExecError> {
+    let cols = batch.columns();
+    if cols.len() < 4 {
+        return Err(ExecError::TypeMismatch(
+            "UPDATE batch must carry [tid_block, tid_slot, id, val]".to_owned(),
+        ));
+    }
+    let (
+        Column::Int32(block_col),
+        Column::Int32(slot_col),
+        Column::Int32(id_col),
+        Column::Int32(val_col),
+    ) = (&cols[0], &cols[1], &cols[2], &cols[3])
+    else {
+        return Err(ExecError::TypeMismatch(
+            "UPDATE fast path requires all four leading columns to be Int32".to_owned(),
+        ));
+    };
+    let block_data = block_col.data();
+    let slot_data = slot_col.data();
+    let id_data = id_col.data();
+    let val_data = val_col.data();
+    let n = batch.rows();
+    if block_data.len() < n || slot_data.len() < n || id_data.len() < n || val_data.len() < n {
+        return Err(ExecError::TypeMismatch(
+            "UPDATE column length shorter than batch rows".to_owned(),
+        ));
+    }
+    let mut out: Vec<(TupleId, Vec<u8>)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let block_u32 = u32::try_from(block_data[i]).map_err(|_| {
+            ExecError::TypeMismatch(format!(
+                "TID block value {} out of u32 range",
+                block_data[i]
+            ))
+        })?;
+        let slot_u16 = u16::try_from(slot_data[i]).map_err(|_| {
+            ExecError::TypeMismatch(format!("TID slot value {} out of u16 range", slot_data[i]))
+        })?;
+        let id_v = id_data[i];
+        let val_v = val_data[i];
+        // Apply the assignment to the targeted column.
+        let (new_id, new_val) = if spec.target_col_in_relation == 0 {
+            (id_v.wrapping_add(spec.delta), val_v)
+        } else {
+            (id_v, val_v.wrapping_add(spec.delta))
+        };
+        // Inline 9-byte payload encode.
+        let mut payload = Vec::with_capacity(9);
+        payload.push(0_u8); // null bitmap: both non-NULL.
+        payload.extend_from_slice(&new_id.to_le_bytes());
+        payload.extend_from_slice(&new_val.to_le_bytes());
+        let page_id =
+            ultrasql_core::PageId::new(relation, ultrasql_core::BlockNumber::new(block_u32));
+        out.push((TupleId::new(page_id, slot_u16), payload));
+    }
+    Ok(out)
 }
 
 /// Extract every `TupleId` from a `Batch` whose first two columns
