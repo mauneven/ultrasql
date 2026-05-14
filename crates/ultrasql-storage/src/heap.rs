@@ -1957,21 +1957,27 @@ impl<L: PageLoader> HeapAccess<L> {
 
                     // Dest-side write: only the non-zero header
                     // fields. xmin at offset 0, ctid at offset 32.
-                    dest_bytes[new_tuple_off..new_tuple_off + 8]
-                        .copy_from_slice(&xid_bytes);
-                    let ctid_rel_at = new_tuple_off + 32;
-                    dest_bytes[ctid_rel_at..ctid_rel_at + 4]
-                        .copy_from_slice(&rel_bytes);
+                    // The two 4-byte fields making up `ctid`
+                    // (relation + block-slot packing) are adjacent,
+                    // so we pack them into one u64 and emit a single
+                    // 8-byte store. Same trick for the (id, val)
+                    // payload pair: 4-byte id at offset payload+1,
+                    // 4-byte val immediately after, becomes one
+                    // u64 store at offset payload+1.
                     let block_slot_packed = (dest_pid_block & 0x00FF_FFFF)
                         | ((u32::from(dest_slot)) << 24);
-                    dest_bytes[ctid_rel_at + 4..ctid_rel_at + 8]
-                        .copy_from_slice(&block_slot_packed.to_le_bytes());
+                    let ctid_u64 =
+                        (u64::from(block_slot_packed) << 32) | u64::from(dest_pid_rel);
+                    let payload_u64 =
+                        ((u32::from_ne_bytes(new_val.to_ne_bytes()) as u64) << 32)
+                            | u32::from_ne_bytes(new_id.to_ne_bytes()) as u64;
 
-                    // Payload (null bitmap is zero — skip).
-                    dest_bytes[new_payload_off + 1..new_payload_off + 5]
-                        .copy_from_slice(&new_id.to_le_bytes());
-                    dest_bytes[new_payload_off + 5..new_payload_off + 9]
-                        .copy_from_slice(&new_val.to_le_bytes());
+                    dest_bytes[new_tuple_off..new_tuple_off + 8]
+                        .copy_from_slice(&xid_bytes);
+                    dest_bytes[new_tuple_off + 32..new_tuple_off + 40]
+                        .copy_from_slice(&ctid_u64.to_le_bytes());
+                    dest_bytes[new_payload_off + 1..new_payload_off + 9]
+                        .copy_from_slice(&payload_u64.to_le_bytes());
 
                     // ItemId.
                     let item = ItemId::new(
@@ -1985,16 +1991,18 @@ impl<L: PageLoader> HeapAccess<L> {
 
                     next_dest_slot += 1;
 
-                    // Source-side stamp: inline writes at the exact
-                    // byte offsets we captured during pass-1 ItemId
-                    // decode. Skips the `stamp_updated_old_inline`
-                    // call's `slot_window` re-decode (~10 ns / row
-                    // saved). Layout matches `TupleHeader::encode`:
-                    //   bytes  8..16  xmax
-                    //   bytes 20..24  cmax
-                    //   bytes 24..26  infomask | UPDATED
-                    //   bytes 32..36  ctid relation
-                    //   bytes 36..40  ctid block+slot packing
+                    // Source-side stamp at the exact byte offsets
+                    // captured during pass-1 ItemId decode. Layout
+                    // (mirrors `TupleHeader::encode`):
+                    //   bytes  8..16  xmax (u64)
+                    //   bytes 20..24  cmax (u32)
+                    //   bytes 24..26  infomask | UPDATED (u16)
+                    //   bytes 32..36  ctid relation (u32)
+                    //   bytes 36..40  ctid block+slot (u32)
+                    //
+                    // The (ctid relation, ctid block+slot) pair at
+                    // 32..40 is adjacent — packed into the same
+                    // `ctid_u64` we just wrote to the destination.
                     src_bytes[src_off + 8..src_off + 16].copy_from_slice(&xid_bytes);
                     src_bytes[src_off + 20..src_off + 24].copy_from_slice(&cmd_bytes);
                     let cur_infomask = u16::from_le_bytes([
@@ -2004,13 +2012,10 @@ impl<L: PageLoader> HeapAccess<L> {
                     let new_infomask = cur_infomask | InfoMask::UPDATED;
                     src_bytes[src_off + 24..src_off + 26]
                         .copy_from_slice(&new_infomask.to_le_bytes());
-                    src_bytes[src_off + 32..src_off + 36]
-                        .copy_from_slice(&dest_pid_rel.to_le_bytes());
-                    let stamp_block_slot = (dest_pid_block & 0x00FF_FFFF)
-                        | ((u32::from(dest_slot)) << 24);
-                    src_bytes[src_off + 36..src_off + 40]
-                        .copy_from_slice(&stamp_block_slot.to_le_bytes());
+                    src_bytes[src_off + 32..src_off + 40]
+                        .copy_from_slice(&ctid_u64.to_le_bytes());
                     let _ = src_slot;
+                    let _ = rel_bytes;
                 }
                 drop(dest_page);
                 // Write back the cursors we bumped inside the inner
