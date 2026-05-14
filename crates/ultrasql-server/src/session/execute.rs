@@ -372,6 +372,8 @@ where
             Ok(_) => {
                 if let Err(e) = self.state.txn_manager.commit(txn) {
                     tracing::warn!(error = %e, "autocommit failed to finalise");
+                } else {
+                    self.state.note_commit_for_gc();
                 }
             }
             Err(_) => {

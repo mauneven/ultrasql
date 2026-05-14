@@ -322,6 +322,41 @@ impl Server {
             heap,
             txn_manager,
             plan_cache,
+            vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Record a successful commit and, every
+    /// [`UNDO_GC_INTERVAL_COMMITS`] commits, fire
+    /// [`ultrasql_storage::heap::HeapAccess::vacuum_undo_log`] with
+    /// the txn manager's current `oldest_in_progress()`.
+    ///
+    /// Bump-and-check is one atomic add plus a modulo; the GC walk
+    /// happens out-of-band on the bumping thread once the threshold
+    /// fires. Errors from the GC walk are logged and swallowed so a
+    /// transient buffer-pool failure cannot mask the underlying
+    /// commit's success.
+    pub fn note_commit_for_gc(&self) {
+        use std::sync::atomic::Ordering;
+        let n = self
+            .vacuum_commit_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        if n % UNDO_GC_INTERVAL_COMMITS != 0 {
+            return;
+        }
+        let oldest = self.txn_manager.oldest_in_progress();
+        match self.heap.vacuum_undo_log(oldest) {
+            Ok(trimmed) => {
+                if trimmed > 0 {
+                    tracing::debug!(
+                        trimmed,
+                        oldest_xid = oldest.raw(),
+                        "undo-log GC trimmed entries"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "undo-log GC failed"),
         }
     }
 

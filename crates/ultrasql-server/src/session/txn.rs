@@ -120,6 +120,8 @@ where
             TxnState::InTransaction(txn) => {
                 if let Err(e) = self.state.txn_manager.commit(txn) {
                     tracing::warn!(error = %e, "explicit COMMIT failed to finalise");
+                } else {
+                    self.state.note_commit_for_gc();
                 }
                 Ok(SelectResult {
                     messages: vec![BackendMessage::CommandComplete {

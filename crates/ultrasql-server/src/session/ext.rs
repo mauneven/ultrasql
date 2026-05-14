@@ -364,6 +364,8 @@ where
                             error = %e,
                             "autocommit failed to finalise (Extended Execute)",
                         );
+                    } else {
+                        self.state.note_commit_for_gc();
                     }
                 } else if let Err(e) = self.state.txn_manager.abort(txn) {
                     tracing::warn!(
