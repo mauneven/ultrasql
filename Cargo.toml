@@ -127,29 +127,50 @@ memmap2    = "0.9"
 libc       = "0.2"
 
 [profile.dev]
-opt-level     = 0
-debug         = true
+opt-level       = 0
+debug           = "line-tables-only"
 overflow-checks = true
+incremental     = true
+split-debuginfo = "unpacked"
 
 [profile.test]
-opt-level = 1
-debug     = true
+opt-level       = 0
+debug           = "line-tables-only"
+incremental     = true
+split-debuginfo = "unpacked"
 
 [profile.bench]
 opt-level     = 3
-lto           = "fat"
-codegen-units = 1
-debug         = 1
+lto           = "thin"
+codegen-units = 16
+debug         = "line-tables-only"
+incremental   = true
 
+# Default release profile: fast compile, near-peak runtime. Used by `cargo
+# build --release` and every iteration loop (agents, bench harness).
+# `lto = "thin"` keeps ~95% of fat-LTO's runtime perf with ~3× faster
+# compile; `codegen-units = 16` costs <5% runtime for a similar compile
+# speedup; `incremental = true` saves 20-30s on rebuilds. For absolute peak
+# runtime use `--profile release-ship`.
 [profile.release]
-opt-level     = 3
+opt-level       = 3
+lto             = "thin"
+codegen-units   = 16
+strip           = "symbols"
+panic           = "abort"
+debug           = "line-tables-only"
+incremental     = true
+overflow-checks = false
+
+# Ship profile: absolute-fastest binary, paid for with slow compile. Use
+# for distribution tarballs / regression-gate baseline runs, NOT for the
+# iteration loop.
+[profile.release-ship]
+inherits      = "release"
 lto           = "fat"
 codegen-units = 1
-strip         = "symbols"
-panic         = "abort"
-debug         = 0
 incremental   = false
-overflow-checks = false
+debug         = 0
 
 # Profile for shipping with debuginfo (used by perf, flamegraph, dtrace).
 [profile.release-with-debug]
