@@ -13,11 +13,11 @@
 //!
 //! # Setup / run split
 //!
-//! [`setup`] allocates a fresh pool and inserts `n` rows; the result is
-//! kept alive in [`SetupState`] so tests can call [`HeapAccess::scan_visible`]
-//! to verify the post-state.  [`run_one_iter`] times a *fresh* pool + insert
+//! `setup` allocates a fresh pool and inserts `n` rows; the result is
+//! kept alive in `SetupState` so tests can call `HeapAccess::scan_visible`
+//! to verify the post-state.  `run_one_iter` times a *fresh* pool + insert
 //! batch per call — this matches the benchmark's "empty table" signal.
-//! [`run`] calls both in the right order.
+//! `run` calls both in the right order.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -101,7 +101,7 @@ pub(crate) fn setup(n: usize) -> SetupState {
     let payloads: Vec<[u8; 12]> = (0..n_i32)
         .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
         .collect();
-    let rows: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    let rows: Vec<&[u8]> = payloads.iter().map(<[u8; 12]>::as_slice).collect();
     heap.insert_batch(REL, &rows, opts)
         .expect("insert_batch must succeed during setup");
     SetupState {
@@ -131,7 +131,7 @@ pub(crate) fn run_one_iter(state: &SetupState) -> Duration {
     let payloads: Vec<[u8; 12]> = (0..n_i32)
         .map(|id| encode_row(id, i64::from(id).wrapping_mul(999_983)))
         .collect();
-    let rows: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    let rows: Vec<&[u8]> = payloads.iter().map(<[u8; 12]>::as_slice).collect();
     let frames = (state.rows / 100).max(1) + 128;
     let t0 = Instant::now();
     let pool = Arc::new(BufferPool::new(frames, BlankLoader));
