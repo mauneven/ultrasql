@@ -609,6 +609,7 @@ where
             oracle: Arc::clone(&self.state.txn_manager),
             xid: txn.xid,
             command_id: ultrasql_core::CommandId::FIRST,
+            cte_buffers: std::collections::HashMap::new(),
         };
 
         let result = match &plan {
@@ -1173,6 +1174,7 @@ where
             oracle: Arc::clone(&self.state.txn_manager),
             xid: txn.xid,
             command_id: ultrasql_core::CommandId::FIRST,
+            cte_buffers: std::collections::HashMap::new(),
         };
         let outcome = extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
         // Commit before sending (same ordering as `execute_query`).

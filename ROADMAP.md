@@ -110,7 +110,7 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 | `ultrasql-parser` | ✅ Full DML + DDL + CTE + Extended Protocol Parse/Bind syntax |
 | `ultrasql-planner` | ✅ Binder for SELECT/INSERT/UPDATE/DELETE, JOINs, GROUP BY, subqueries, CTEs; ⚠️ `BETWEEN` not yet bound (cross_compare_sql workaround uses `id < N`); BEGIN/COMMIT/ROLLBACK rejected |
 | `ultrasql-optimizer` | ✅ Rule-based rewrites, cost model, DPsize/GEQO join enumeration, physical selection, plan cache (~1077 LOC across `lib.rs` + `plan_cache.rs`); ⚠️ not exercised by server's inline `lower_query` (the server bypasses `physical::build_operator`) |
-| `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit; ⚠️ Sort/Join/CTE/SetOp not yet reachable from server `lower_query` |
+| `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit, CteScan; ⚠️ recursive CTE fixpoint loop deferred to v0.6 |
 | `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, dictionary encoding, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
 | `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ⚠️ bootstrap-from-heap falls back to initial snapshot (no typed tuple decoder yet) |
 | `ultrasql-protocol` | ✅ Wire codec for Simple Query + Extended Query (Parse/Bind/Describe/Execute/Sync/Close) |
@@ -142,7 +142,8 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 | Extended Query (Parse/Bind/Execute) | ✅ codec | n/a | ✅ dispatch | ✅ |
 | `EXPLAIN` / `EXPLAIN ANALYZE` | ✅ | ❌ | ❌ | ❌ |
 | `BETWEEN ... AND ...` | ✅ | ❌ | ❌ | ❌ |
-| `WITH cte AS (...)` | ✅ | ✅ | ❌ | ❌ |
+| `WITH cte AS (...)` (non-recursive) | ✅ | ✅ | ✅ | ✅ |
+| `WITH RECURSIVE cte AS (...)` | ✅ | ✅ | ❌ rejected by lowerer | ❌ |
 | `UNION / INTERSECT / EXCEPT` | ✅ | ✅ | ❌ | ❌ |
 | `CREATE INDEX` | ✅ | ✅ | ❌ | ❌ |
 | `DROP TABLE` | ✅ | ✅ | ❌ | ❌ |
@@ -403,7 +404,7 @@ driver can connect.
 - [ ] `BitmapIndexScan` + `BitmapHeapScan` (OR multiple indexes)
 - [ ] `FunctionScan` (`generate_series`, `unnest`, SRFs)
 - [x] `ValuesScan` (wired)
-- [ ] `CteScan` / `SubqueryScan` (kernel ships; lower_query CTE arm pending)
+- [x] `CteScan` reachable from `lower_query` (non-recursive); `SubqueryScan` follow-up; `WITH RECURSIVE` deferred to v0.6 fixpoint loop
 
 ### Join Operators
 - [x] `NestLoop` kernel (with inner rescan via factory closure)

@@ -24,6 +24,12 @@
 //!   (see `binder::bind_set_op`); we re-check arity at lowering time
 //!   so a hand-built plan that bypasses the binder still surfaces a
 //!   precise error rather than producing wrong rows.
+//! - [`LogicalPlan::Cte`] -> materialise the definition into
+//!   [`CteScan`]-backed batches once per query execution; the body is
+//!   lowered with the CTE name bound to the buffer via the
+//!   [`LowerCtx::cte_buffers`] overlay, so every body-side reference
+//!   reuses the same materialised rows. `WITH RECURSIVE` is rejected
+//!   in this wave; the executor's fixpoint loop is the v0.6 follow-up.
 //!
 //! ## Why an inline lowerer
 //!
@@ -49,9 +55,9 @@ use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
-    Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan, ModifyKind,
-    ModifyTable, NestedLoopJoin, Operator, Project, RightFactory, RowCodec, SeqScan, SetOp, Sort,
-    ValuesScan,
+    CteScan, Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan,
+    ModifyKind, ModifyTable, NestedLoopJoin, Operator, Project, RightFactory, RowCodec, SeqScan,
+    SetOp, Sort, ValuesScan,
 };
 use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
 use ultrasql_planner::{
@@ -484,6 +490,36 @@ pub struct LowerCtx<'a> {
     pub xid: Xid,
     /// Command id within `xid` for the current statement.
     pub command_id: CommandId,
+    /// Materialised non-recursive CTE bindings, keyed by lower-cased CTE
+    /// name. Populated by the `LogicalPlan::Cte` arm in `lower_query`
+    /// before lowering the body, then consulted by
+    /// [`lower_catalog_or_sample_scan`] so a body-side
+    /// `Scan { table: "<cte_name>" }` resolves to a [`CteScan`] over the
+    /// materialised buffer instead of a catalog or sample-table lookup.
+    ///
+    /// Default-empty so the constructors used outside the CTE path do
+    /// not need to opt in; the field flows through recursive lowering
+    /// for free.
+    pub cte_buffers: HashMap<String, CteBuffer>,
+}
+
+/// Materialised non-recursive CTE binding.
+///
+/// Owns the batches produced by running the CTE's definition plan to
+/// completion, plus the schema those batches conform to. Multiple
+/// references to the same CTE inside the body produce independent
+/// [`CteScan`] operators backed by the same `Arc`-shared buffer, so the
+/// definition is evaluated exactly once per query execution (matching
+/// PostgreSQL's CTE-materialisation semantics).
+#[derive(Clone, Debug)]
+pub struct CteBuffer {
+    /// All batches produced by the CTE definition plan.
+    pub batches: Arc<Vec<Batch>>,
+    /// Schema every batch in `batches` conforms to. This is the
+    /// definition's output schema (post column-alias rename, since the
+    /// binder records aliases on the definition's schema before exposing
+    /// the CTE to the body).
+    pub schema: Schema,
 }
 
 /// Lower a logical plan with full real-heap awareness.
@@ -505,8 +541,14 @@ pub struct LowerCtx<'a> {
 /// - `Project` accepts only bare column references (same restriction
 ///   as [`lower_plan`]); computed projections land with the general
 ///   expression evaluator follow-up.
-/// - Everything else is rejected — JOIN, GROUP BY, set ops, CTEs land
-///   in subsequent waves.
+/// - `Cte` materialises the definition once into an `Arc<Vec<Batch>>`
+///   and lowers the body with the CTE name bound to that buffer via
+///   [`LowerCtx::cte_buffers`]; see [`lower_cte`] for the rules.
+///   `WITH RECURSIVE` is rejected — the executor lacks a fixpoint
+///   loop and silently treating it as non-recursive would return
+///   wrong results for self-referential definitions.
+/// - Everything else is rejected (currently nothing — the remaining
+///   variants are DDL dispatched ahead of the lowerer).
 // One arm per `LogicalPlan` variant; the dispatcher is intentionally
 // linear so a new wave (set-ops here in A7) adds a clearly-bounded arm.
 // Each arm with non-trivial logic delegates to a helper (`lower_join`,
@@ -518,7 +560,7 @@ pub fn lower_query(
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
     match plan {
-        LogicalPlan::Scan { table, .. } => lower_catalog_or_sample_scan(table, ctx),
+        LogicalPlan::Scan { table, schema, .. } => lower_catalog_or_sample_scan(table, schema, ctx),
         LogicalPlan::Insert {
             table,
             columns,
@@ -673,8 +715,91 @@ pub fn lower_query(
             right,
             schema,
         } => lower_set_op_real(*op, *quantifier, left, right, schema.clone(), ctx),
-        LogicalPlan::Cte { .. } => Err(ServerError::Unsupported("WITH (CTE)")),
+        LogicalPlan::Cte {
+            name,
+            recursive,
+            definition,
+            body,
+            ..
+        } => lower_cte(name, *recursive, definition, body, ctx),
     }
+}
+
+/// Lower a `LogicalPlan::Cte` node.
+///
+/// Semantics:
+///
+/// - Recursive CTEs (`WITH RECURSIVE`) are out of scope for this wave;
+///   the executor lacks a fixpoint loop, so the binder accepts the
+///   keyword but the lowerer rejects the plan with a precise
+///   [`ServerError::Unsupported`] rather than silently treating it as
+///   non-recursive (which would return wrong results for a self-
+///   referential definition). The recursive fixpoint is a v0.6 follow-up.
+/// - Non-recursive CTEs are materialised *once* per query execution into
+///   a shared `Arc<Vec<Batch>>`. Every reference inside the body
+///   resolves to its own [`CteScan`] over that buffer (the
+///   [`CteScan`] operator is itself single-shot, but the underlying
+///   `Arc` is shared, so multiple references reuse the materialised
+///   rows without re-evaluating the definition). This matches
+///   PostgreSQL's default CTE-as-optimisation-barrier behaviour.
+/// - The CTE name is pushed onto a new `LowerCtx::cte_buffers` overlay
+///   before the body is lowered. Body-side `Scan { table: "<cte_name>" }`
+///   nodes are routed to the materialised buffer by
+///   [`lower_catalog_or_sample_scan`].
+///
+/// Nested CTEs (a CTE defined inside another CTE's body, or a body that
+/// itself contains a `WITH` clause) compose naturally: each recursive
+/// call into [`lower_query`] sees the cumulative overlay, and inner
+/// definitions can therefore reference outer CTEs.
+fn lower_cte(
+    name: &str,
+    recursive: bool,
+    definition: &LogicalPlan,
+    body: &LogicalPlan,
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    if recursive {
+        return Err(ServerError::Unsupported("WITH RECURSIVE"));
+    }
+
+    // Materialise the definition plan against the *current* overlay so a
+    // CTE can reference outer CTEs declared earlier in the same `WITH`
+    // chain (the binder serialises the chain into nested
+    // `LogicalPlan::Cte` nodes, so the outer ones are already on the
+    // overlay when we reach this inner one).
+    let mut def_op = lower_query(definition, ctx)?;
+    let mut batches: Vec<Batch> = Vec::new();
+    while let Some(batch) = def_op.next_batch()? {
+        batches.push(batch);
+    }
+    let def_schema = def_op.schema().clone();
+
+    // Push the materialised CTE onto a child overlay. Cloning the map is
+    // O(N) in the number of outer bindings; CTE chains are short
+    // (typically ≤ a handful per query), so we accept the copy in
+    // exchange for keeping `LowerCtx` strictly immutable per recursion
+    // level — interior mutability here would force every helper to take
+    // `&mut LowerCtx` for no clarity gain.
+    let mut child_buffers = ctx.cte_buffers.clone();
+    child_buffers.insert(
+        name.to_ascii_lowercase(),
+        CteBuffer {
+            batches: Arc::new(batches),
+            schema: def_schema,
+        },
+    );
+    let child_ctx = LowerCtx {
+        tables: ctx.tables,
+        catalog_snapshot: Arc::clone(&ctx.catalog_snapshot),
+        heap: Arc::clone(&ctx.heap),
+        snapshot: ctx.snapshot.clone(),
+        oracle: Arc::clone(&ctx.oracle),
+        xid: ctx.xid,
+        command_id: ctx.command_id,
+        cte_buffers: child_buffers,
+    };
+
+    lower_query(body, &child_ctx)
 }
 
 /// Re-check the contract `bind_set_op` enforces: both inputs must have
@@ -726,14 +851,33 @@ fn lower_set_op_real(
     )))
 }
 
-/// Lower a `Scan` node by trying the persistent catalog first; if the
-/// name is not registered there, falls back to the v0.5
-/// sample-table registry.
+/// Lower a `Scan` node by checking the CTE binding overlay first, then
+/// the persistent catalog, then falling back to the v0.5 sample-table
+/// registry.
+///
+/// The resolution order matches PostgreSQL: a CTE name shadows a
+/// same-named base table for the duration of the body (binder-enforced
+/// scope; we simply mirror the lookup order here so a stray `Scan` over
+/// the unaliased name still picks up the CTE).
+///
+/// `plan_schema` is the schema recorded on the `LogicalPlan::Scan` node
+/// itself; it carries any column aliases applied by the binder when a
+/// CTE is declared as `WITH cte(c1, c2) AS (...)`. For real heap and
+/// sample-table scans the schema comes from the table's definition, so
+/// we ignore `plan_schema` in those branches; for CTE scans we use it
+/// directly so the body sees the aliased column names.
 fn lower_catalog_or_sample_scan(
     table: &str,
+    plan_schema: &Schema,
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
     let folded = table.to_ascii_lowercase();
+    if let Some(buffer) = ctx.cte_buffers.get(&folded) {
+        return Ok(Box::new(CteScan::new(
+            Arc::clone(&buffer.batches),
+            plan_schema.clone(),
+        )));
+    }
     if let Some(entry) = ctx.catalog_snapshot.tables.get(&folded) {
         return Ok(lower_heap_scan(entry, ctx));
     }
@@ -1935,6 +2079,7 @@ mod tests {
             oracle: StdArc::clone(&txn),
             xid: Xid::new(0),
             command_id: CommandId::FIRST,
+            cte_buffers: HashMap::new(),
         };
 
         let mut op = lower_query(&sort_plan, &ctx).expect("lowers");
@@ -2053,6 +2198,7 @@ mod tests {
             oracle: StdArc::clone(&txn),
             xid: Xid::new(0),
             command_id: CommandId::FIRST,
+            cte_buffers: HashMap::new(),
         }
     }
 
@@ -2596,6 +2742,7 @@ mod tests {
                 oracle: StdArc::clone(&self.txn_manager),
                 xid: self.loader_xid,
                 command_id: CommandId::FIRST,
+                cte_buffers: HashMap::new(),
             }
         }
     }
@@ -2950,5 +3097,193 @@ mod tests {
         let (_, range) = match_simple_comparison(&lt).expect("lt matches");
         assert_eq!(range.low, None);
         assert_eq!(range.high, Some(4));
+    }
+
+    // ---------------------------------------------------------------------
+    // CTE lowering tests
+    //
+    // Three shapes covered:
+    //
+    // 1. Single CTE referenced once in the body — the materialised batches
+    //    flow through a `CteScan` and the body sees the CTE rows verbatim.
+    // 2. Multiple CTEs in a chain — both materialise; the body joins them
+    //    by referencing each CTE name as a separate scan.
+    // 3. CTE with column aliases — the binder rewrites the schema field
+    //    names on the body's `Scan`; we verify the `CteScan` reports the
+    //    aliased schema so downstream operators (and the wire encoder)
+    //    see the renamed columns.
+    //
+    // Recursion (`WITH RECURSIVE`) is rejected; we test the rejection
+    // path separately so a future executor fixpoint can flip the
+    // expectation without rediscovering the contract.
+    // ---------------------------------------------------------------------
+
+    /// Build a single-column `(v INT)` Values plan with the given rows.
+    fn int_values_plan(rows: &[i32], col_name: &str) -> LogicalPlan {
+        LogicalPlan::Values {
+            rows: rows.iter().map(|v| int_row(*v)).collect(),
+            schema: schema_int_col(col_name),
+        }
+    }
+
+    /// Build a `Scan` plan node that references a CTE by name. The
+    /// schema we attach mirrors what the binder would record on a
+    /// body-side `FROM cte` reference.
+    fn cte_scan_ref(name: &str, schema: Schema) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: name.to_string(),
+            schema,
+            projection: None,
+        }
+    }
+
+    /// `WITH a AS (VALUES (1),(2),(3)) SELECT * FROM a`
+    ///
+    /// Verifies that the CTE definition is materialised once and the
+    /// body's `Scan(a)` resolves to that buffer via [`CteScan`].
+    #[test]
+    fn lower_query_cte_single_reference_returns_definition_rows() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let def = int_values_plan(&[1, 2, 3], "v");
+        let body_schema = schema_int_col("v");
+        let body = cte_scan_ref("a", body_schema.clone());
+        let plan = LogicalPlan::Cte {
+            name: "a".into(),
+            recursive: false,
+            definition: Box::new(def),
+            body: Box::new(body),
+            schema: body_schema,
+        };
+        let mut op = lower_query(&plan, &ctx).expect("CTE lowers");
+        let mut got: Vec<i32> = Vec::new();
+        while let Some(batch) = op.next_batch().expect("ok") {
+            match &batch.columns()[0] {
+                Column::Int32(c) => got.extend_from_slice(c.data()),
+                other => panic!("unexpected column: {other:?}"),
+            }
+        }
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3]);
+    }
+
+    /// `WITH a AS (VALUES (...)), b AS (VALUES (...)) SELECT a.aid FROM a JOIN b ON a.aid = b.bid`
+    ///
+    /// Verifies that two CTE bindings survive into the body and a join
+    /// between them works through the catalog-aware lower path. Both
+    /// children of the join are body-side `Scan`s that resolve via the
+    /// CTE overlay. We use distinct column names (`aid`/`bid`) because
+    /// `Schema::new` rejects duplicate names; the binder uses the same
+    /// disambiguation when a join produces two same-named columns.
+    #[test]
+    fn lower_query_cte_multi_cte_join_returns_intersection() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let a_schema = schema_int_col("aid");
+        let b_schema = schema_int_col("bid");
+        let join_out_schema = Schema::new([
+            Field::required("aid", DataType::Int32),
+            Field::required("bid", DataType::Int32),
+        ])
+        .expect("schema ok");
+
+        // Build the inner-most plan: `SELECT * FROM a JOIN b ON a.aid = b.bid`.
+        let join = LogicalPlan::Join {
+            left: Box::new(cte_scan_ref("a", a_schema)),
+            right: Box::new(cte_scan_ref("b", b_schema)),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::On(ScalarExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(column("aid", 0, DataType::Int32)),
+                right: Box::new(column("bid", 1, DataType::Int32)),
+                data_type: DataType::Bool,
+            }),
+            schema: join_out_schema.clone(),
+        };
+
+        // Wrap in two CTE nodes: outermost is `a`, innermost wraps `b`.
+        let b_def = int_values_plan(&[2, 3, 5], "bid");
+        let with_b = LogicalPlan::Cte {
+            name: "b".into(),
+            recursive: false,
+            definition: Box::new(b_def),
+            body: Box::new(join),
+            schema: join_out_schema.clone(),
+        };
+        let a_def = int_values_plan(&[1, 2, 3, 4], "aid");
+        let plan = LogicalPlan::Cte {
+            name: "a".into(),
+            recursive: false,
+            definition: Box::new(a_def),
+            body: Box::new(with_b),
+            schema: join_out_schema,
+        };
+
+        let mut op = lower_query(&plan, &ctx).expect("CTE join lowers");
+        let mut pairs = collect_pairs(op.as_mut());
+        pairs.sort_unstable();
+        // a ∩ b on equality: 2,3 appear in both.
+        assert_eq!(pairs, vec![(2, 2), (3, 3)]);
+    }
+
+    /// `WITH a(x) AS (...) SELECT * FROM a`
+    ///
+    /// Verifies that a CTE column alias on the binding propagates to the
+    /// `CteScan`'s reported schema, so downstream consumers see the
+    /// aliased name instead of the definition's original field name.
+    #[test]
+    fn lower_query_cte_with_column_alias_reports_aliased_schema() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        // Definition emits a column named "v"; the body sees it as "x".
+        let def = int_values_plan(&[10, 20], "v");
+        let body_schema = schema_int_col("x");
+        let body = cte_scan_ref("a", body_schema.clone());
+        let plan = LogicalPlan::Cte {
+            name: "a".into(),
+            recursive: false,
+            definition: Box::new(def),
+            body: Box::new(body),
+            schema: body_schema,
+        };
+
+        let mut op = lower_query(&plan, &ctx).expect("CTE alias lowers");
+        // The schema reported by the operator must use the aliased name.
+        assert_eq!(op.schema().field_at(0).name, "x");
+        let batch = op
+            .next_batch()
+            .expect("ok")
+            .expect("at least one batch from CteScan");
+        match &batch.columns()[0] {
+            Column::Int32(c) => assert_eq!(c.data(), &[10, 20]),
+            other => panic!("unexpected column: {other:?}"),
+        }
+    }
+
+    /// `WITH RECURSIVE` must be rejected. The executor has no fixpoint
+    /// loop today; silently lowering a recursive CTE as non-recursive
+    /// would produce wrong results for any self-referential definition.
+    #[test]
+    fn lower_query_cte_rejects_recursive() {
+        let tables = SampleTables::new();
+        let ctx = synthetic_ctx(&tables);
+        let def = int_values_plan(&[1], "v");
+        let body_schema = schema_int_col("v");
+        let body = cte_scan_ref("a", body_schema.clone());
+        let plan = LogicalPlan::Cte {
+            name: "a".into(),
+            recursive: true,
+            definition: Box::new(def),
+            body: Box::new(body),
+            schema: body_schema,
+        };
+        let err = lower_query(&plan, &ctx).expect_err("recursive must be rejected");
+        match err {
+            ServerError::Unsupported(msg) => assert!(
+                msg.contains("RECURSIVE"),
+                "error must mention RECURSIVE, got: {msg}"
+            ),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }
