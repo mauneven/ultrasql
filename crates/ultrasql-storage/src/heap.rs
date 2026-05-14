@@ -812,6 +812,130 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(())
     }
 
+    /// Bulk-delete every tuple in `tids`, grouped by page so each
+    /// affected page is pinned and write-locked **exactly once**.
+    ///
+    /// [`Self::delete`] pins, write-locks, mutates and releases a
+    /// page on every row. For a bulk DELETE over `N` rows on `P`
+    /// pages that is `N` `DashMap` shard probes + `N` pin/unpin
+    /// pairs + `N` write-lock acquisitions when only `P` are
+    /// strictly necessary. `delete_many` groups the input by
+    /// `page_id`, takes **one** write guard per page, stamps every
+    /// slot on that page under that single guard, then drops the
+    /// guard before its WAL append / FSM hook batch.
+    ///
+    /// Semantics are equivalent to invoking [`Self::delete`] N
+    /// times in order: each tuple's header is stamped with
+    /// `opts.xmax` / `opts.cmax`; WAL emission, when configured,
+    /// emits one `HeapDelete` record per stamped slot (the WAL
+    /// applier replays them identically to `delete`); FSM hints
+    /// and VM clears, when `opts.fsm` / `opts.vm` are configured,
+    /// run **once per page touched** (record the final free-space
+    /// after every delete on the page lands).
+    ///
+    /// Slots within a page are stamped in ascending slot order; the
+    /// between-page order is the iteration order of the
+    /// page-grouping `AHashMap`, which is non-deterministic. Per-
+    /// tuple deletes have no ordering-dependent semantics so this is
+    /// safe.
+    ///
+    /// Returns the number of slots successfully stamped.
+    ///
+    /// # Errors
+    ///
+    /// - [`HeapError::BufferPool`] on pin failure for any affected page.
+    /// - [`HeapError::Page`] / [`HeapError::MalformedHeader`] on slot
+    ///   decode failure.
+    /// - [`HeapError::WalPayload`] on WAL encode failure (encode happens
+    ///   before the page is mutated, so the page is left untouched).
+    ///
+    /// # Concurrency
+    ///
+    /// At most one [`PageGuard`] is held at any instant. The guard is
+    /// dropped before WAL I/O begins, so a concurrent reader on
+    /// another page is never blocked by this method's pin.
+    pub fn delete_many<I>(&self, tids: I, opts: DeleteOptions<'_>) -> Result<usize, HeapError>
+    where
+        I: IntoIterator<Item = TupleId>,
+    {
+        // Group TIDs by page. `ahash::AHashMap` is the workspace
+        // default hash table; `PageId` already hashes well.
+        let mut by_page: ahash::AHashMap<PageId, Vec<u16>> = ahash::AHashMap::new();
+        for tid in tids {
+            by_page.entry(tid.page).or_default().push(tid.slot);
+        }
+        if by_page.is_empty() {
+            return Ok(0);
+        }
+
+        let mut total = 0_usize;
+        for (page_id, mut slots) in by_page {
+            // Sort within a page so the slot directory is touched in
+            // ascending order — keeps page cache lines hot.
+            slots.sort_unstable();
+
+            // Pre-encode WAL payloads BEFORE mutating the page so an
+            // encode failure aborts cleanly (the contract `delete`
+            // upholds for the single-tuple case).
+            let wal_payloads: Option<Vec<Vec<u8>>> = if let Some(sink) = opts.wal {
+                Self::maybe_emit_fpw(
+                    &self.pool,
+                    page_id,
+                    sink,
+                    &self.last_checkpoint_lsn,
+                    opts.xmax,
+                )?;
+                let mut payloads = Vec::with_capacity(slots.len());
+                for &slot in &slots {
+                    let tid = TupleId::new(page_id, slot);
+                    let bytes = HeapDeletePayload {
+                        tid,
+                        xmax: opts.xmax,
+                        cmax: opts.cmax,
+                    }
+                    .encode()?;
+                    payloads.push(bytes);
+                }
+                Some(payloads)
+            } else {
+                None
+            };
+
+            // Mutate every slot on this page under one write guard.
+            {
+                let guard = self.pool.get_page(page_id)?;
+                for &slot in &slots {
+                    let tid = TupleId::new(page_id, slot);
+                    Self::delete_in_place(&guard, tid, opts.xmax, opts.cmax)?;
+                }
+                // guard drops here — pin released before WAL append.
+            }
+
+            // Append every per-tuple WAL record outside the pin scope.
+            // The page LSN is stamped once at the final LSN of the
+            // batch (recovery replays records in append order, so the
+            // final per-slot stamp is the only state recovery needs).
+            if let (Some(sink), Some(payloads)) = (opts.wal, wal_payloads) {
+                let mut last_lsn: Lsn = Lsn::ZERO;
+                for payload in payloads {
+                    let prev_lsn = sink.last_lsn_for(opts.xmax);
+                    let record =
+                        WalRecord::new(RecordType::HeapDelete, opts.xmax, prev_lsn, 0, payload);
+                    last_lsn = sink.append(record).expect(
+                        "wal append must succeed after a committed page mutation; \
+                         failure is unrecoverable",
+                    );
+                }
+                Self::stamp_page_lsn(&self.pool, page_id, last_lsn)?;
+            }
+
+            // FSM/VM hooks fire once per page touched.
+            Self::post_delete_fsm_vm(&self.pool, page_id, opts);
+            total += slots.len();
+        }
+        Ok(total)
+    }
+
     /// Replace a tuple's payload with HOT-chain support.
     ///
     /// **Algorithm:**

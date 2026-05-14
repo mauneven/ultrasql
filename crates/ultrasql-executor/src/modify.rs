@@ -215,22 +215,52 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
             let rows = batch_to_rows(&batch, &child_schema)
                 .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
 
-            for row in rows {
-                match &self.kind {
-                    ModifyKind::Insert => {
-                        self.apply_insert(&row)?;
+            match &self.kind {
+                ModifyKind::Delete => {
+                    // Bulk path: extract every TID up front and hand
+                    // the whole batch to `heap.delete_many`, which
+                    // groups by page and acquires one write guard
+                    // per affected page (rather than per row).
+                    let mut tids: Vec<TupleId> = Vec::with_capacity(rows.len());
+                    for row in &rows {
+                        let (tid, _) = extract_tid_and_row(row, self.relation)?;
+                        tids.push(tid);
                     }
-                    ModifyKind::Update { .. } => {
-                        // Cached evaluators avoid the per-row
-                        // `ScalarExpr::clone()` + `Eval::new` allocator
-                        // hit that the old path paid on every tuple.
-                        self.apply_update(&row)?;
-                    }
-                    ModifyKind::Delete => {
-                        self.apply_delete(&row)?;
+                    let n = tids.len();
+                    let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
+                    self.heap
+                        .delete_many(
+                            tids,
+                            DeleteOptions {
+                                xmax: self.delete_xmax,
+                                cmax: self.delete_cmax,
+                                wal: wal_ref,
+                                fsm: None,
+                                vm: None,
+                            },
+                        )
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                    let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
+                    self.affected = self.affected.saturating_add(n_u64);
+                }
+                ModifyKind::Insert | ModifyKind::Update { .. } => {
+                    for row in rows {
+                        match &self.kind {
+                            ModifyKind::Insert => {
+                                self.apply_insert(&row)?;
+                            }
+                            ModifyKind::Update { .. } => {
+                                // Cached evaluators avoid the per-row
+                                // `ScalarExpr::clone()` + `Eval::new`
+                                // allocator hit that the old path paid
+                                // on every tuple.
+                                self.apply_update(&row)?;
+                            }
+                            ModifyKind::Delete => unreachable!(),
+                        }
+                        self.affected += 1;
                     }
                 }
-                self.affected += 1;
             }
         }
 
@@ -316,28 +346,6 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                     command_id: self.delete_cmax,
                     hot_eligible: true,
                     wal: wal_ref,
-                    vm: None,
-                },
-            )
-            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Apply a single DELETE row.
-    ///
-    /// The `row` slice must begin with `[tid_block: Int32, tid_slot: Int32,
-    /// ...]`. We extract the TID and call `heap.delete`.
-    fn apply_delete(&self, row: &[Value]) -> Result<(), ExecError> {
-        let (tid, _) = extract_tid_and_row(row, self.relation)?;
-        let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
-        self.heap
-            .delete(
-                tid,
-                DeleteOptions {
-                    xmax: self.delete_xmax,
-                    cmax: self.delete_cmax,
-                    wal: wal_ref,
-                    fsm: None,
                     vm: None,
                 },
             )
