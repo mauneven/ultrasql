@@ -14,6 +14,8 @@
 //! - [`LogicalPlan::Project`] over pure column references ->
 //!   [`Project`].
 //! - [`LogicalPlan::Limit`] (without offset) -> [`Limit`].
+//! - [`LogicalPlan::Sort`] -> [`Sort`] (in-memory; spill-to-disk lands
+//!   with the `work_mem` budget in v0.6).
 //!
 //! ## Why an inline lowerer
 //!
@@ -40,7 +42,7 @@ use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
     Filter, FilterEqI32, HashAggregate, Limit, MemTableScan, ModifyKind, ModifyTable, Operator,
-    Project, RowCodec, SeqScan, ValuesScan,
+    Project, RowCodec, SeqScan, Sort, ValuesScan,
 };
 use ultrasql_mvcc::Snapshot;
 use ultrasql_planner::{BinaryOp, InMemoryCatalog, LogicalPlan, ScalarExpr, TableMeta};
@@ -134,7 +136,16 @@ pub fn lower_plan(
         LogicalPlan::Limit {
             input, n, offset, ..
         } => lower_limit(input, *n, *offset, tables),
-        LogicalPlan::Sort { .. } => Err(ServerError::Unsupported("ORDER BY")),
+        LogicalPlan::Sort { input, keys } => {
+            // Sample-table lowering path. See `lower_query` for the
+            // production lowering and the in-memory / vectorised
+            // discussion. Keeping both paths in sync so a `SELECT ...
+            // ORDER BY` over the legacy `users` fixture behaves the same
+            // as one over a real heap relation.
+            let child = lower_plan(input, tables)?;
+            let schema = child.schema().clone();
+            Ok(Box::new(Sort::new(child, keys.clone(), schema)))
+        }
         LogicalPlan::Empty { .. } => Err(ServerError::Unsupported("SELECT without FROM")),
         LogicalPlan::Values { .. } => Err(ServerError::Unsupported("VALUES")),
         LogicalPlan::Insert { .. } => Err(ServerError::Unsupported("INSERT")),
@@ -474,7 +485,31 @@ pub fn lower_query(
             Ok(Box::new(Limit::new(child, n)))
         }
         LogicalPlan::Empty { .. } => Err(ServerError::Unsupported("SELECT without FROM")),
-        LogicalPlan::Sort { .. } => Err(ServerError::Unsupported("ORDER BY")),
+        LogicalPlan::Sort { input, keys } => {
+            // Lower the child first; the executor's `Sort` operator drains
+            // it on the first `next_batch()` call and emits sorted rows in
+            // 4096-row chunks thereafter, so the wire encoder treats it
+            // exactly like any other scalar source.
+            //
+            // v0.5 limitation: `Sort` materialises the entire input in
+            // memory before emitting the first row. Spill-to-disk is on
+            // the v0.6 work_mem track. Bounded by `IN_MEMORY_POOL_FRAMES *
+            // PAGE_SIZE` plus working-set headroom (see
+            // `crate::IN_MEMORY_POOL_FRAMES`); a query whose input
+            // exceeds that will OOM the connection task rather than spill.
+            //
+            // Vectorised vs scalar choice: the executor ships a
+            // `VectorizedSort` in `vec_ops::sort` that operates on the
+            // push-based pipeline driver (`VectorizedSink`/
+            // `VectorizedOperator`). The Simple Query path runs the
+            // pull-based `Operator` interface, so the drop-in is the
+            // scalar `Sort` in `ultrasql_executor::sort`. The vectorised
+            // variant would require lifting the entire pipeline to the
+            // push driver, which is a v0.7 milestone (see ROADMAP §v0.7).
+            let child = lower_query(input, ctx)?;
+            let schema = child.schema().clone();
+            Ok(Box::new(Sort::new(child, keys.clone(), schema)))
+        }
         LogicalPlan::Update {
             table,
             assignments,
@@ -908,11 +943,128 @@ mod tests {
     }
 
     #[test]
-    fn rejects_order_by() {
+    fn lowers_order_by_asc_via_sample_path() {
+        // `users` fixture has ids = [1, 2, 3]; an ASC sort by id leaves
+        // them in the same order, but the plan still routes through
+        // `Sort` — confirmed by `lower_plan` accepting the plan rather
+        // than rejecting it with `Unsupported`.
         let (catalog, tables) = fixture();
-        let p = plan("SELECT id FROM users ORDER BY id", &catalog);
-        let err = lower_plan(&p, &tables).expect_err("must reject");
-        assert!(matches!(err, ServerError::Unsupported(_)));
+        let p = plan("SELECT id FROM users ORDER BY id ASC", &catalog);
+        let mut op = lower_plan(&p, &tables).expect("lowers");
+        let mut ids: Vec<i32> = Vec::new();
+        while let Some(batch) = op.next_batch().expect("ok") {
+            if let ultrasql_vec::column::Column::Int32(col) = &batch.columns()[0] {
+                ids.extend_from_slice(col.data());
+            }
+        }
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn lowers_order_by_desc_via_sample_path() {
+        let (catalog, tables) = fixture();
+        let p = plan("SELECT id FROM users ORDER BY id DESC", &catalog);
+        let mut op = lower_plan(&p, &tables).expect("lowers");
+        let mut ids: Vec<i32> = Vec::new();
+        while let Some(batch) = op.next_batch().expect("ok") {
+            if let ultrasql_vec::column::Column::Int32(col) = &batch.columns()[0] {
+                ids.extend_from_slice(col.data());
+            }
+        }
+        assert_eq!(ids, vec![3, 2, 1]);
+    }
+
+    /// Sort wrapped over a hand-built Values-like input runs through
+    /// `lower_query` and produces ascending output.
+    ///
+    /// This is the headline contract for the wire wiring: a
+    /// `LogicalPlan::Sort` constructed in code (synthetic, no parser
+    /// involvement) lowers through `lower_query` and the resulting
+    /// operator emits a non-decreasing sequence on the sort column.
+    #[test]
+    fn lower_query_sorts_values_in_ascending_order() {
+        use std::sync::Arc as StdArc;
+        use ultrasql_catalog::PersistentCatalog;
+        use ultrasql_core::{CommandId, DataType, Field, Schema, Value, Xid};
+        use ultrasql_planner::SortKey;
+        use ultrasql_storage::buffer_pool::BufferPool;
+        use ultrasql_storage::heap::HeapAccess;
+        use ultrasql_txn::TransactionManager;
+
+        // Build a Values plan with three out-of-order rows.
+        let values_schema = Schema::new([
+            Field::nullable("a", DataType::Int32),
+            Field::nullable("b", DataType::Int32),
+        ])
+        .expect("values schema");
+        let row = |v: i32, w: i32| -> Vec<ScalarExpr> {
+            vec![
+                ScalarExpr::Literal {
+                    value: Value::Int32(v),
+                    data_type: DataType::Int32,
+                },
+                ScalarExpr::Literal {
+                    value: Value::Int32(w),
+                    data_type: DataType::Int32,
+                },
+            ]
+        };
+        let values_plan = LogicalPlan::Values {
+            rows: vec![row(3, 30), row(1, 10), row(2, 20)],
+            schema: values_schema,
+        };
+        let sort_plan = LogicalPlan::Sort {
+            input: Box::new(values_plan),
+            keys: vec![SortKey {
+                expr: ScalarExpr::Column {
+                    name: "a".into(),
+                    index: 0,
+                    data_type: DataType::Int32,
+                },
+                asc: true,
+                nulls_first: false,
+            }],
+        };
+
+        // Build a minimal `LowerCtx`. We never reference the heap because
+        // `Values` does not touch it, but the constructor still needs a
+        // valid handle. The transaction is allocated only to materialise
+        // a valid MVCC snapshot; we never commit it because the test
+        // does not write to the heap.
+        let catalog = StdArc::new(PersistentCatalog::new());
+        let pool = StdArc::new(BufferPool::new(64, BlankPageLoader));
+        let heap = StdArc::new(HeapAccess::new(pool));
+        let txn = StdArc::new(TransactionManager::new());
+        let mvcc_snapshot = txn
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted)
+            .snapshot;
+        let ctx = LowerCtx {
+            tables: &SampleTables::new(),
+            catalog_snapshot: catalog.snapshot(),
+            heap,
+            snapshot: mvcc_snapshot,
+            oracle: StdArc::clone(&txn),
+            xid: Xid::new(0),
+            command_id: CommandId::FIRST,
+        };
+
+        let mut op = lower_query(&sort_plan, &ctx).expect("lowers");
+        let mut a_col: Vec<i32> = Vec::new();
+        let mut b_col: Vec<i32> = Vec::new();
+        while let Some(batch) = op.next_batch().expect("ok") {
+            match (&batch.columns()[0], &batch.columns()[1]) {
+                (
+                    ultrasql_vec::column::Column::Int32(a),
+                    ultrasql_vec::column::Column::Int32(b),
+                ) => {
+                    a_col.extend_from_slice(a.data());
+                    b_col.extend_from_slice(b.data());
+                }
+                _ => panic!("unexpected column layout"),
+            }
+        }
+        assert_eq!(a_col, vec![1, 2, 3]);
+        assert_eq!(b_col, vec![10, 20, 30]);
     }
 
     #[test]

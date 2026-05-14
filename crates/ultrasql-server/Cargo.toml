@@ -55,6 +55,7 @@ hex                = { workspace = true }
 [dev-dependencies]
 rcgen              = { workspace = true }
 tempfile           = { workspace = true }
-# Extended Query integration tests drive a real PostgreSQL client
-# (prepare/bind/execute) against an in-process `ultrasqld`.
+# Integration tests drive a real PostgreSQL client against an
+# in-process `ultrasqld` — Extended Query (prepare/bind/execute) and
+# ORDER BY end-to-end (`SimpleQueryMessage` rows).
 tokio-postgres     = { workspace = true }
