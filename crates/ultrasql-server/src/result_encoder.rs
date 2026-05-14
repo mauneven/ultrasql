@@ -26,7 +26,7 @@ use ultrasql_protocol::{BackendMessage, FieldDescription, encode_backend};
 use ultrasql_vec::column::Column;
 
 use crate::error::ServerError;
-use crate::wire_writer::write_data_row;
+use crate::wire_writer::{write_data_row, write_int32_pair_data_rows};
 
 /// PostgreSQL type OID for `bool`. Pulled from `pg_type.dat`.
 const PG_OID_BOOL: u32 = 16;
@@ -206,6 +206,17 @@ pub fn stream_select(op: &mut dyn Operator, sink: &mut BytesMut) -> Result<u64, 
         let Some(batch) = op.next_batch()? else { break };
         let row_count = batch.rows();
         let columns = batch.columns();
+        // Fast path: when the batch is exactly two non-nullable
+        // `Int32` columns (the `select_scan_10k` shape), use the
+        // specialised bulk writer that pre-reserves the buffer once
+        // and emits every row without per-cell enum dispatch.
+        if let [Column::Int32(a), Column::Int32(b)] = columns {
+            if a.nulls().is_none() && b.nulls().is_none() {
+                write_int32_pair_data_rows(sink, a.data(), b.data());
+                rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+                continue;
+            }
+        }
         for row in 0..row_count {
             write_data_row(sink, columns, row);
         }
