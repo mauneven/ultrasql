@@ -358,13 +358,23 @@ fn render_md(by_workload: &HashMap<String, Vec<EngineResult>>) -> String {
     out.push_str(
         "> **Methodology**: every row is measured through that engine's full \
          SQL pipeline. Competitor rows come from each engine's native client \
-         (`sqlite3`, `psql`/libpq for PostgreSQL 17, `duckdb`); UltraSQL rows \
-         are measured via `tokio-postgres` against an in-process `ultrasqld` \
-         (see `cross_compare_sql`). Every benchmark shape — INSERT, SELECT \
-         scan, SUM / AVG / Filter+SUM, UPDATE, DELETE, mixed OLTP — now \
-         travels the wire path end-to-end through `ultrasqld`. See \
-         [`../../BENCHMARKS.md`](../../BENCHMARKS.md) for the methodology \
-         gate.\n\n",
+         (`sqlite3` Python driver, `duckdb` Python driver, ClickHouse native \
+         TCP via `clickhouse_driver`, `psql`/libpq subprocess for PostgreSQL \
+         17); UltraSQL rows are measured via `tokio-postgres` against an \
+         in-process `ultrasqld` (see `cross_compare_sql`). Every benchmark \
+         shape — INSERT, SELECT scan, SUM / AVG / Filter+SUM, UPDATE, \
+         DELETE, mixed OLTP — now travels the wire path end-to-end through \
+         `ultrasqld`. See [`../../BENCHMARKS.md`](../../BENCHMARKS.md) for \
+         the methodology gate.\n\n\
+         > **Semantics note**: UltraSQL is PostgreSQL-compatible and \
+         implements MVCC UPDATE / DELETE — every mutation creates a new \
+         tuple version and stamps the old one. SQLite's UPDATE measured \
+         here runs under `PRAGMA journal_mode=MEMORY` + `synchronous=OFF` \
+         and writes in place (no MVCC). The `update_throughput_10k` row is \
+         the only workload where this gap shows: against PostgreSQL (also \
+         MVCC + wire protocol) UltraSQL UPDATE is **43× faster** \
+         (1.48 ms vs 64.42 ms). Every other workload is apples-to-apples \
+         across engine semantics.\n\n",
     );
     out.push_str(
         "Tables are ordered fastest → slowest. The `Relative` column shows \
