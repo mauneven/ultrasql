@@ -775,6 +775,132 @@ pub fn cmp_gt_i64_scalar(column: &NumericColumn<i64>, scalar: i64) -> Bitmap {
     out
 }
 
+/// Fused predicate-and-sum over an `i32` column: returns
+/// `sum(data[i] for i where data[i] > threshold)`, widening to
+/// `i64`. Skips both the intermediate `Bitmap` materialisation and
+/// the per-bit iteration that `cmp_i32_scalar` + `sum_i32_widening_with_mask`
+/// pay separately — the entire `filter_sum` operator collapses to
+/// one tight SIMD loop on aarch64.
+///
+/// Equivalent to:
+///
+/// ```ignore
+/// data.iter().filter(|&&v| v > threshold).fold(0_i64, |a, &v| a.wrapping_add(i64::from(v)))
+/// ```
+///
+/// Negative values are handled correctly: the AND-with-compare-
+/// mask trick relies on `vcgtq_s32` producing `0xFFFF_FFFF` for
+/// lanes where `v > threshold` and `0` otherwise, then
+/// `vandq_s32(v, mask)` preserves two's-complement negatives
+/// inside selected lanes (`-5 & -1 == -5`) and zeros out the
+/// rest, after which `vpaddlq_s32` widens to `i64` with sign
+/// extension.
+#[must_use]
+pub fn filter_sum_i32_widening_gt(data: &[i32], threshold: i32) -> i64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return filter_sum_i32_widening_gt_neon(data, threshold);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        // Branchless multiply-by-(0 or -1)-as-mask. LLVM
+        // autovectorises this to a tight SIMD loop on x86_64-v3
+        // (AVX2: `vpcmpgtd` + `vpand` + widening). Result is
+        // bit-identical to the aarch64 hand-NEON path.
+        let mut s: i64 = 0;
+        for &v in data {
+            let m = i32::from(v > threshold).wrapping_neg();
+            s = s.wrapping_add(i64::from(v & m));
+        }
+        s
+    }
+}
+
+/// Hand-NEON `i32 > threshold ⇒ sum` over a contiguous slice.
+///
+/// Processes 16 `i32` lanes per iteration through 4 parallel
+/// `int64x2_t` accumulators. Per 4-lane group:
+///
+/// 1. `vld1q_s32` loads 4 `i32`s.
+/// 2. `vcgtq_s32(v, t)` builds a 0xFFFFFFFF / 0 lane mask.
+/// 3. `vandq_s32(v, mask)` keeps the value for set lanes, zeros
+///    the rest.
+/// 4. `vpaddlq_s32` pairwise-adds-and-widens 4 `i32` → 2 `i64`.
+/// 5. `vaddq_s64` accumulates into the running 128-bit sum.
+///
+/// Tail of fewer than 16 lanes falls back to the scalar branch.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn filter_sum_i32_widening_gt_neon(data: &[i32], threshold: i32) -> i64 {
+    use std::arch::aarch64::{
+        int64x2_t, vaddq_s64, vaddvq_s64, vandq_s32, vcgtq_s32, vdupq_n_s32, vdupq_n_s64,
+        vld1q_s32, vpaddlq_s32, vreinterpretq_s32_u32,
+    };
+
+    let mut a0: int64x2_t = unsafe { vdupq_n_s64(0) };
+    let mut a1: int64x2_t = unsafe { vdupq_n_s64(0) };
+    let mut a2: int64x2_t = unsafe { vdupq_n_s64(0) };
+    let mut a3: int64x2_t = unsafe { vdupq_n_s64(0) };
+    let t = unsafe { vdupq_n_s32(threshold) };
+
+    let chunks = data.chunks_exact(16);
+    let rem = chunks.remainder();
+    for c in chunks {
+        // SAFETY: `c` is `&[i32; 16]` (chunks_exact); every
+        // `vld1q_s32` reads 4 contiguous lanes inside the chunk.
+        // No aliasing — `c` is a unique borrow into `data`.
+        unsafe {
+            let v0 = vld1q_s32(c.as_ptr());
+            let v1 = vld1q_s32(c.as_ptr().add(4));
+            let v2 = vld1q_s32(c.as_ptr().add(8));
+            let v3 = vld1q_s32(c.as_ptr().add(12));
+            let m0 = vreinterpretq_s32_u32(vcgtq_s32(v0, t));
+            let m1 = vreinterpretq_s32_u32(vcgtq_s32(v1, t));
+            let m2 = vreinterpretq_s32_u32(vcgtq_s32(v2, t));
+            let m3 = vreinterpretq_s32_u32(vcgtq_s32(v3, t));
+            a0 = vaddq_s64(a0, vpaddlq_s32(vandq_s32(v0, m0)));
+            a1 = vaddq_s64(a1, vpaddlq_s32(vandq_s32(v1, m1)));
+            a2 = vaddq_s64(a2, vpaddlq_s32(vandq_s32(v2, m2)));
+            a3 = vaddq_s64(a3, vpaddlq_s32(vandq_s32(v3, m3)));
+        }
+    }
+    let mut sum = unsafe {
+        let half0 = vaddq_s64(a0, a1);
+        let half1 = vaddq_s64(a2, a3);
+        let total = vaddq_s64(half0, half1);
+        vaddvq_s64(total)
+    };
+    for &v in rem {
+        if v > threshold {
+            sum = sum.wrapping_add(i64::from(v));
+        }
+    }
+    sum
+}
+
+/// Sum an `i32` column widened to `i64`, masked by an external
+/// predicate bitmap. Bit `i` set ⇒ lane `i` contributes. Skips
+/// the per-lane `Vec<i32>` materialisation a `select_column` +
+/// `sum_i32_widening` pair would pay.
+///
+/// # Panics
+///
+/// Panics if `column.len() != mask.len()`.
+#[must_use]
+pub fn sum_i32_widening_with_mask(column: &NumericColumn<i32>, mask: &Bitmap) -> i64 {
+    assert_eq!(
+        column.len(),
+        mask.len(),
+        "sum_i32_widening_with_mask: length mismatch",
+    );
+    let data = column.data();
+    let mut s: i64 = 0;
+    for i in mask.iter_ones() {
+        s = s.wrapping_add(i64::from(data[i]));
+    }
+    s
+}
+
 /// Sum of an `i64` column with an external mask. Only rows whose
 /// `mask` bit is set contribute. Independent of the column's own
 /// validity bitmap — the caller is responsible for combining masks.

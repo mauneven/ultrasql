@@ -494,11 +494,20 @@ where
     L: PageLoader + Send + Sync + std::fmt::Debug + 'static,
     O: XidStatusOracle + Send + Sync + std::fmt::Debug + 'static,
 {
-    /// Slice the next BATCH_TARGET_ROWS-sized batch out of the
-    /// cached columnar projection. Replaces the heap walk + decode
-    /// loop entirely when the relation's `ColumnCache` entry is
-    /// live.
+    /// Slice the next batch out of the cached columnar projection.
+    ///
+    /// Replaces the heap walk + decode loop entirely when the
+    /// relation's `ColumnCache` entry is live. Emits wider batches
+    /// than the heap-walk path
+    /// (`CACHE_REPLAY_BATCH_ROWS`) because the cache already holds
+    /// the full columnar projection in memory: larger batches
+    /// amortise per-batch operator overhead (filter / select_column
+    /// / aggregate). Downstream operators handle variable batch
+    /// sizes — the 4096-cap is a soft target for the streaming
+    /// heap-scan path, not a hard invariant of the executor.
     fn next_batch_from_cache(&mut self) -> Result<Option<Batch>, ExecError> {
+        const CACHE_REPLAY_BATCH_ROWS: usize = 1_048_576;
+
         let Some(state) = self.cache_read.as_mut() else {
             // Should not happen: caller checked `is_some` before
             // calling, but stay defensive.
@@ -510,7 +519,7 @@ where
             self.cache_read = None;
             return Ok(None);
         }
-        let end = (state.cursor + BATCH_TARGET_ROWS).min(total_rows);
+        let end = (state.cursor + CACHE_REPLAY_BATCH_ROWS).min(total_rows);
         let mut batch_cols: Vec<Column> = Vec::with_capacity(state.columns.columns.len());
         for col in &state.columns.columns {
             batch_cols.push(slice_column(col, state.cursor, end));
