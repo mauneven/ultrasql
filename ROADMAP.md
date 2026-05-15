@@ -673,7 +673,7 @@ driver can connect.
 - [x] `Materialize` — kernel exists (`materialize.rs`); ⚠️ not yet selected by planner
 - [ ] `Gather` / `GatherMerge` (parallel query)
 - [ ] `Append` / `MergeAppend` (partition scans)
-- [ ] `Result` (constant expressions) — `SELECT 1` and similar
+- [x] `Result` (constant expressions) — `SELECT 1` and similar — `Project { input: Empty }` lowers to `ResultOp` in both `lower_query` and `lower_plan`; `select_constants_round_trip.rs` covers `SELECT 1` and `SELECT 1, 2, 3`
 
 ### Expression Evaluation
 - [x] Full general expression interpreter (Eval) — replaces hardcoded `FilterEqI32`
@@ -706,16 +706,16 @@ driver can connect.
 - [x] `BEGIN ISOLATION LEVEL ...` — parser + planner + server wired; `BEGIN ISOLATION LEVEL READ COMMITTED|REPEATABLE READ|SERIALIZABLE` dispatches to `TransactionManager::begin(IsolationLevel::...)`; READ UNCOMMITTED aliased to READ COMMITTED; wire-level round-trip tests pass
 - [x] Implicit transaction per statement (autocommit) + explicit-transaction state machine (`TxnState::Idle`/`InTransaction`/`Failed`)
 - [x] `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` round-trip (wire only — executor does not yet stamp tuples with subxid; see "Subtransactions" above)
-- [ ] `PREPARE` / `EXECUTE` / `DEALLOCATE` Simple-Query round-trip
+- [x] `PREPARE` / `EXECUTE` / `DEALLOCATE` Simple-Query round-trip — `Session::try_dispatch_meta_statement` (`session/meta_stmt.rs`) intercepts these AST shapes before binding and shares the per-session `ExtendedConnState.statements` cache with the Extended Query path; literal args are substituted via `substitute_parameters_in_plan`. `prepare_execute_round_trip.rs` covers SELECT/INSERT shapes plus DEALLOCATE name/ALL plus duplicate-PREPARE error
 
 ### Binder gaps blocking wire
 - [x] `BETWEEN ... AND ...` — `bind_between` in `binder/expr_bind.rs` rewrites to `>= AND <=`; wired through `IndexScan` range probe and `SeqScan` filter path
-- [ ] `SELECT ... FROM t WHERE col IS NULL` end-to-end verification
+- [x] `SELECT ... FROM t WHERE col IS NULL` end-to-end verification — three bugs fixed in one pass: (1) `bind_insert` now coerces value-clause `DataType::Null` columns to the target table column type; (2) `build_batch` now writes a per-column validity `Bitmap` when any cell is NULL; (3) `batch_to_rows` now emits `Value::Null` when the validity bit is unset. `select_constants_round_trip.rs` covers `IS NULL` and `IS NOT NULL`; `join_round_trip.rs` updated to assert real PostgreSQL `(Some, None)` semantics for LEFT OUTER unmatched rows
 - [x] `BEGIN / COMMIT / ROLLBACK / SAVEPOINT` (now bound to `LogicalPlan::{Begin, Commit, Rollback, Savepoint, ...}` variants)
 
 ### Authentication
 - [x] `SCRAM-SHA-256` real implementation (RFC 5802 + 7677)
-- [ ] `MD5` password auth (legacy, behind config flag)
+- [x] `MD5` password auth (legacy, behind config flag) — `Server::require_md5_password(user, password)` builder enables `AuthConfig::Md5`; `Session::startup` runs the standard PostgreSQL MD5 challenge (`AuthenticationMD5Password` + `Password` verify) when the policy is `Md5`, and closes with SQLSTATE `28P01` on any rejection. Wire round-trip tests cover happy path, wrong password, and unknown user
 - [x] `trust` auth method (via HbaMethod::Trust)
 - [x] `pg_hba.conf` equivalent — host-based auth rules
 - [x] Roles and passwords stored in `pg_authid` (in-memory; persistent in v0.8)
@@ -729,10 +729,10 @@ driver can connect.
 - [x] `COPY TO STDOUT` / `COPY FROM STDIN` — text format kernel in `copy.rs` (334 lines, both directions); ⚠️ wire dispatch to server session handler not yet wired
 - [x] `BackendKeyData` with PID + secret — `cancel.rs` implements full `CancelRegistry` + `CancelFlag`; ⚠️ `BackendKeyData` wire send needs verification
 - [x] `CancelRequest` handling — `CancelRegistry::request_cancel(pid, secret)` sets `AtomicBool` flag; ⚠️ operators not yet checking the flag during execution
-- [ ] `NoticeResponse` (warnings, hints, info messages)
+- [x] `NoticeResponse` (warnings, hints, info messages) — `notice_warning(sqlstate, msg)` helper in `server/lib.rs` wraps `BackendMessage::NoticeResponse`; emitted from txn-control paths (nested BEGIN, COMMIT/ROLLBACK outside a tx, SET TRANSACTION outside a tx) and covered by in-crate tests in `src/tests/txn.rs`
 - [x] `LISTEN/NOTIFY` kernel — `notify.rs` has full `NotificationHub` with `listen`/`unlisten`/`notify`; ⚠️ not wired to wire session or LISTEN/NOTIFY SQL statements
-- [ ] All expected `ParameterStatus` params: `TimeZone`, `DateStyle`, `IntervalStyle`, `extra_float_digits`, `standard_conforming_strings`, `integer_datetimes`, `server_encoding`
-- [ ] Per-connection slow-loris timeout
+- [x] All expected `ParameterStatus` params — `session/startup.rs` now sends the full thirteen PostgreSQL emits: `server_version`, `server_encoding`, `client_encoding`, `DateStyle`, `IntervalStyle`, `TimeZone`, `integer_datetimes`, `standard_conforming_strings`, `extra_float_digits`, `application_name`, `is_superuser`, `session_authorization`, `in_hot_standby`
+- [x] Per-connection slow-loris timeout — `handle_connection` wraps `Session::startup` in `tokio::time::timeout(30s)`. A peer that opens TCP and sits silently is dropped after 30 s without consuming a session worker indefinitely
 
 ### Wire-protocol benchmarks (`cross_compare_sql`)
 - [x] In-process `ultrasqld` driven via `tokio-postgres` for honest end-to-end measurement
@@ -741,11 +741,11 @@ driver can connect.
 - [x] Honest sort order (fastest → slowest); ≥ 2× gate currently met only on INSERT, the rest are tracked optimisations
 
 ### CLI
-- [ ] `ultrasql` REPL with history, multiline input
-- [ ] Meta-commands: `\d`, `\dt`, `\di`, `\df`, `\dv`, `\ds`, `\du`, `\dn`, `\l`, `\c`, `\q`, `\i`, `\timing`, `\x`, `\pset`
-- [ ] Connect via URL: `postgresql://user:pass@host/db`
-- [ ] `PGPASSWORD`, `PGHOST`, `.pgpass` file support
-- [ ] `--command/-c` and `--file/-f` batch mode
+- [x] `ultrasql` REPL with history, multiline input — `crates/ultrasql-cli/src/main.rs::run_repl` uses `rustyline::DefaultEditor`, persists `~/.ultrasql_history`, and accumulates lines until a trailing `;`
+- [x] Meta-commands: `\d`, `\dt`, `\di`, `\df`, `\dv`, `\ds`, `\du`, `\dn`, `\l`, `\c`, `\q`, `\i`, `\timing`, `\x`, `\pset` — full set wired in `Session::handle_meta`; `\df`/`\dv`/`\ds` query the corresponding `pg_catalog.*` views; `\x` toggles expanded output; `\pset` accepts `expanded` and `format` keys; `\c` is acknowledged with a notice (cross-session reconnect deferred)
+- [x] Connect via URL: `postgresql://user:pass@host/db` — `ConnParams::from_url`; the URL may also arrive as the first positional argument
+- [x] `PGPASSWORD`, `PGHOST`, `.pgpass` file support — `clap` `env` attributes pull `PGHOST` / `PGPORT` / `PGDATABASE` / `PGUSER` / `PGPASSWORD`; `pgpass_lookup` parses `~/.pgpass` with wildcards
+- [x] `--command/-c` and `--file/-f` batch mode — both `clap` flags routed through `exec_batch` over `split_statements`
 
 ### Milestones (must hold before v0.5 ships)
 - [x] tokio-postgres can `CREATE TABLE`, `INSERT VALUES`, `SELECT ... WHERE col op lit`, `SELECT SUM/AVG`, `UPDATE`, `DELETE` end-to-end against `ultrasqld`
