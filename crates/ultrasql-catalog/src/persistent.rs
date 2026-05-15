@@ -24,22 +24,23 @@
 //!
 //! # Bootstrap lifecycle
 //!
-//! On a fresh database the heap files for the system tables are empty.
-//! [`PersistentCatalog::bootstrap_from_heap`] detects this condition and
-//! installs the [`crate::bootstrap::initial_snapshot`] which contains the
-//! three well-known namespaces and eight system relations needed for the
-//! server to query its own catalog.  On a warm restart, the same method
-//! scans the heap pages and re-populates the in-memory maps so the
-//! snapshot reflects the durable state.
+//! On a fresh database the heap files for the system catalog tables are
+//! empty. [`PersistentCatalog::bootstrap_from_heap`] detects this
+//! condition and installs the [`crate::bootstrap::initial_snapshot`],
+//! which contains the three well-known namespaces and the system
+//! relations the server needs to query its own catalog.
 //!
-//! # Migration anchor
-//!
-//! `TODO(catalog-persistent-heap)`: the heap scan path in
-//! `bootstrap_from_heap` currently falls back to the initial snapshot
-//! because there is no typed tuple encoder/decoder for catalog rows yet.
-//! Once the executor can write typed tuples to the heap, the scan path
-//! will decode them into `ClassRow`, `AttributeRow`, etc. and build a
-//! full snapshot from persistent state.
+//! On a warm restart the heap is non-empty.
+//! [`PersistentCatalog::bootstrap_from_heap`] scans the `pg_class` and
+//! `pg_attribute` heap pages, decodes each user row via
+//! [`crate::encoding::ClassRow`] / [`crate::encoding::decode_attribute_row`]
+//! and [`crate::encoding::schema_from_attributes`], then overlays the
+//! decoded user `TableEntry` list on top of the initial system snapshot.
+//! The result is an MVCC-consistent snapshot that combines the durable
+//! system schema with the durable user schema. System relations always
+//! come from [`crate::bootstrap::initial_snapshot`]; only user rows are
+//! decoded from heap. See `persistent.rs` (the call site around the heap
+//! scan) and the round-trip test at the bottom of this file.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
