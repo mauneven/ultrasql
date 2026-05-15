@@ -30,10 +30,10 @@ use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 use crate::BlankPageLoader;
 use crate::error::ServerError;
 
+use super::LowerCtx;
 use super::agg_fuse::{extract_int32_col_op_lit, shift_column_indices};
 use super::lower_query::lower_query;
 use super::saturate_row_count;
-use super::LowerCtx;
 
 pub(super) fn lower_real_insert(
     table: &str,
@@ -522,7 +522,6 @@ pub(super) fn build_filtered_tid_scan(
         )),
     }
 }
-
 
 pub(super) fn lower_project_columns(
     child: Box<dyn Operator>,

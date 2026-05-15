@@ -31,8 +31,8 @@ use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 use crate::BlankPageLoader;
 use crate::error::ServerError;
 
-use super::scan::lower_heap_scan;
 use super::LowerCtx;
+use super::scan::lower_heap_scan;
 
 pub(super) fn shift_column_indices(expr: &ScalarExpr, by: usize) -> ScalarExpr {
     match expr {

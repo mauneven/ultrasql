@@ -129,7 +129,10 @@ pub(super) fn read_error_fields(
 // panic on bad input.
 // ---------------------------------------------------------------------------
 
-pub(super) const fn usize_from_i32(value: i32, _what: &'static str) -> Result<usize, ProtocolError> {
+pub(super) const fn usize_from_i32(
+    value: i32,
+    _what: &'static str,
+) -> Result<usize, ProtocolError> {
     if value < 0 {
         return Err(ProtocolError::Malformed("negative length"));
     }

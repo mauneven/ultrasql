@@ -8,8 +8,8 @@ use super::{
     build_int_join_plan, collect_pairs, column, equi_eq_predicate, fixture, int_row, lit_i32,
     non_equi_lt_predicate, plan, schema_int_col, synthetic_ctx,
 };
-use crate::pipeline::*;
 use crate::pipeline::index_scan::{match_indexable_predicate, match_simple_comparison};
+use crate::pipeline::*;
 use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::{
     BinaryOp, InMemoryCatalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr,

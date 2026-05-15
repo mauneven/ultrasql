@@ -208,10 +208,7 @@ fn lower_query_sorts_values_in_ascending_order() {
     let mut b_col: Vec<i32> = Vec::new();
     while let Some(batch) = op.next_batch().expect("ok") {
         match (&batch.columns()[0], &batch.columns()[1]) {
-            (
-                ultrasql_vec::column::Column::Int32(a),
-                ultrasql_vec::column::Column::Int32(b),
-            ) => {
+            (ultrasql_vec::column::Column::Int32(a), ultrasql_vec::column::Column::Int32(b)) => {
                 a_col.extend_from_slice(a.data());
                 b_col.extend_from_slice(b.data());
             }
@@ -280,10 +277,7 @@ pub(super) fn collect_pairs(op: &mut dyn Operator) -> Vec<(i32, i32)> {
     while let Some(batch) = op.next_batch().expect("operator must not error") {
         assert_eq!(batch.width(), 2, "expected two-column join output");
         match (&batch.columns()[0], &batch.columns()[1]) {
-            (
-                ultrasql_vec::column::Column::Int32(l),
-                ultrasql_vec::column::Column::Int32(r),
-            ) => {
+            (ultrasql_vec::column::Column::Int32(l), ultrasql_vec::column::Column::Int32(r)) => {
                 assert_eq!(l.data().len(), r.data().len());
                 for (a, b) in l.data().iter().zip(r.data().iter()) {
                     out.push((*a, *b));

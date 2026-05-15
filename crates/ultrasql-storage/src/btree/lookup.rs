@@ -69,11 +69,7 @@ impl<L: PageLoader> BTree<L> {
         }
     }
 
-    fn lookup_in_leaf(
-        &self,
-        leaf: BlockNumber,
-        key: i64,
-    ) -> Result<Option<TupleId>, BTreeError> {
+    fn lookup_in_leaf(&self, leaf: BlockNumber, key: i64) -> Result<Option<TupleId>, BTreeError> {
         let mut current = leaf;
         loop {
             let guard = self.pool.get_page(self.page_id(current))?;

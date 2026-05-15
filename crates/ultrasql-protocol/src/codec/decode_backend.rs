@@ -13,9 +13,7 @@ use super::util::{
     read_row_description, take_framed_message,
 };
 
-pub(super) fn decode_backend_inner(
-    bytes: &[u8],
-) -> Result<(BackendMessage, usize), ProtocolError> {
+pub(super) fn decode_backend_inner(bytes: &[u8]) -> Result<(BackendMessage, usize), ProtocolError> {
     let first = *bytes.first().ok_or(ProtocolError::Truncated)?;
     let (payload, total) = take_framed_message(bytes)?;
     let p = PayloadReader::new(payload);

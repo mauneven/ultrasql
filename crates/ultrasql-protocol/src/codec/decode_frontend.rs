@@ -9,12 +9,12 @@
 use crate::error::ProtocolError;
 use crate::messages::FrontendMessage;
 
+use super::MAX_PAYLOAD;
 use super::describe_kind_from_byte;
 use super::util::{
     PayloadReader, nonneg_usize, payload_truncated_is_malformed, take_framed_message,
     usize_from_i32,
 };
-use super::MAX_PAYLOAD;
 
 /// Decode either a startup message (no type tag) or a tagged frontend
 /// message from `bytes`. The discriminator is whether the first byte

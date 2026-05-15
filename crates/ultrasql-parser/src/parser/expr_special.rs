@@ -87,7 +87,10 @@ impl<'src> Parser<'src> {
     }
 
     /// Parse `GREATEST(…)` or `LEAST(…)`.
-    pub(super) fn parse_greatest_least_expr(&mut self, is_greatest: bool) -> Result<Expr, ParseError> {
+    pub(super) fn parse_greatest_least_expr(
+        &mut self,
+        is_greatest: bool,
+    ) -> Result<Expr, ParseError> {
         let kw = self.advance()?; // GREATEST / LEAST
         self.expect(TokenKind::LParen, "(")?;
         let args = self.parse_expr_list_inner()?;

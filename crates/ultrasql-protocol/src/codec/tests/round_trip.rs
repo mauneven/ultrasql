@@ -8,10 +8,12 @@
 
 use bytes::{BufMut, BytesMut};
 
+use super::super::{
+    MAX_MESSAGE_BYTES, decode_backend, decode_frontend, encode_backend, encode_frontend,
+};
+use super::round_trip_frontend;
 use crate::error::ProtocolError;
 use crate::messages::{BackendMessage, DescribeKind, FrontendMessage};
-use super::super::{MAX_MESSAGE_BYTES, decode_backend, decode_frontend, encode_backend, encode_frontend};
-use super::round_trip_frontend;
 
 #[test]
 fn truncated_returns_none_without_consuming() {

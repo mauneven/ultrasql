@@ -92,7 +92,6 @@ use crate::error::ServerError;
 /// produce `u64::MAX` for the `LIMIT NULL` case, and a 32-bit user
 /// asking for a literal `LIMIT 5_000_000_000` is asking for "all rows"
 /// in practice.
-
 mod agg_fuse;
 mod cte_helpers;
 mod index_scan;
@@ -247,4 +246,3 @@ pub struct CteBuffer {
     /// the CTE to the body).
     pub schema: Schema,
 }
-

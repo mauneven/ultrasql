@@ -92,13 +92,13 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+use crate::buffer_pool::{BufferPool, BufferPoolError, PageLoader};
+use crate::page::PageError;
+use crate::wal_sink::WalSinkError;
 use parking_lot::Mutex;
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::endian::{read_i64_le, write_i64_le};
 use ultrasql_core::{BlockNumber, PageId, RelationId};
-use crate::buffer_pool::{BufferPool, BufferPoolError, PageLoader};
-use crate::page::PageError;
-use crate::wal_sink::WalSinkError;
 
 mod adapters;
 mod insert;

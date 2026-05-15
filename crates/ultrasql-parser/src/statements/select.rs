@@ -1390,9 +1390,7 @@ mod tests {
                 // Right must be a leaf.
                 matches!(
                     right.as_ref(),
-                    TableRef::Named { .. }
-                        | TableRef::Subquery { .. }
-                        | TableRef::Function { .. }
+                    TableRef::Named { .. } | TableRef::Subquery { .. } | TableRef::Function { .. }
                 ) && is_left_deep(left)
             }
         }

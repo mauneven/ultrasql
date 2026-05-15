@@ -30,8 +30,8 @@ use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 use crate::BlankPageLoader;
 use crate::error::ServerError;
 
-use super::lower_query::lower_query;
 use super::LowerCtx;
+use super::lower_query::lower_query;
 
 /// Attempt to lower an `Inner`/`LeftOuter` `Join` whose children are both
 /// [`LogicalPlan::Sort`] over keys that align with the equi-key predicate

@@ -36,7 +36,11 @@ pub(super) enum DecodeError {
 /// Text-format decoding parses the UTF-8 bytes through Rust's std
 /// parsers. Binary-format decoding uses the type-specific big-endian
 /// layout from `pg_type.dat`.
-pub(super) fn decode_param(raw: Option<&[u8]>, format: i16, oid: Option<u32>) -> Result<Value, DecodeError> {
+pub(super) fn decode_param(
+    raw: Option<&[u8]>,
+    format: i16,
+    oid: Option<u32>,
+) -> Result<Value, DecodeError> {
     let Some(bytes) = raw else {
         return Ok(Value::Null);
     };
@@ -163,7 +167,10 @@ fn decode_param_binary(bytes: &[u8], oid: Option<u32>) -> Result<Value, DecodeEr
 /// well-formed `DataRow` even if the format code says binary; libpq
 /// does not validate that the wire format matches its requested
 /// format byte-for-byte.
-pub(super) fn encode_binary_value(col: &ultrasql_vec::column::Column, row: usize) -> Option<Vec<u8>> {
+pub(super) fn encode_binary_value(
+    col: &ultrasql_vec::column::Column,
+    row: usize,
+) -> Option<Vec<u8>> {
     use ultrasql_vec::column::Column;
     let nulls = match col {
         Column::Int32(c) => c.nulls(),

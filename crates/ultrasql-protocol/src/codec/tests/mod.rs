@@ -14,9 +14,9 @@
 
 use bytes::{BufMut, BytesMut};
 
+use super::{decode_backend, decode_frontend, encode_backend, encode_frontend};
 use crate::error::ProtocolError;
 use crate::messages::{BackendMessage, DescribeKind, FieldDescription, FrontendMessage};
-use super::{decode_backend, decode_frontend, encode_backend, encode_frontend};
 
 mod backend;
 mod round_trip;
@@ -371,4 +371,3 @@ fn notice_response_round_trip() {
 // -------------------------------------------------------------------
 // Truncation / error behavior
 // -------------------------------------------------------------------
-

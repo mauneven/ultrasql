@@ -192,10 +192,9 @@ where
                     .persistent_catalog
                     .alter_table_replace_schema(table_name, new_schema)
                     .map_err(ServerError::Catalog)?;
-                self.state
-                    .txn_manager
-                    .commit(txn)
-                    .map_err(|e| ServerError::ddl(format!("ALTER TABLE DROP COLUMN commit: {e}")))?;
+                self.state.txn_manager.commit(txn).map_err(|e| {
+                    ServerError::ddl(format!("ALTER TABLE DROP COLUMN commit: {e}"))
+                })?;
                 self.state.plan_cache.invalidate_all();
                 Ok(run_ddl_command(&format!(
                     "ALTER TABLE DROP COLUMN {column_name}"
@@ -260,7 +259,9 @@ where
             .alter_table_rename(old_name, new_name)
             .map_err(ServerError::Catalog)?;
         self.state.plan_cache.invalidate_all();
-        Ok(run_ddl_command(&format!("ALTER TABLE RENAME TO {new_name}")))
+        Ok(run_ddl_command(&format!(
+            "ALTER TABLE RENAME TO {new_name}"
+        )))
     }
 
     /// Execute the `ALTER TABLE t ADD COLUMN c TYPE [NULL | NOT NULL]`

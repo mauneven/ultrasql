@@ -7,8 +7,8 @@ use super::handlers::{
 use super::params::{infer_parameter_types, walk_plan_exprs};
 use super::substitute::substitute_parameters_in_plan;
 use super::{
-    ExtendedConnState, PG_OID_BOOL, PG_OID_INT2, PG_OID_INT4, PG_OID_INT8, PG_OID_FLOAT4,
-    PG_OID_FLOAT8, PG_OID_TEXT, PG_OID_VARCHAR, PG_OID_BPCHAR, PG_OID_BYTEA, PG_OID_OID,
+    ExtendedConnState, PG_OID_BOOL, PG_OID_BPCHAR, PG_OID_BYTEA, PG_OID_FLOAT4, PG_OID_FLOAT8,
+    PG_OID_INT2, PG_OID_INT4, PG_OID_INT8, PG_OID_OID, PG_OID_TEXT, PG_OID_VARCHAR,
 };
 use crate::error::ServerError;
 use crate::pipeline::LowerCtx;

@@ -88,7 +88,10 @@ pub(super) fn lower_heap_scan(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Box<dyn
 /// Lower a `LogicalPlan::FunctionScan { name, args, .. }` into the
 /// matching set-returning-function operator. v0.5 supports
 /// `generate_series(start, stop[, step])`.
-pub(super) fn lower_function_scan(name: &str, args: &[ScalarExpr]) -> Result<Box<dyn Operator>, ServerError> {
+pub(super) fn lower_function_scan(
+    name: &str,
+    args: &[ScalarExpr],
+) -> Result<Box<dyn Operator>, ServerError> {
     if name != "generate_series" {
         return Err(ServerError::Unsupported(
             "table function (only generate_series in v0.5)",

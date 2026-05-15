@@ -8,11 +8,11 @@
 //! `function_call_*` round-trips and their truncation tests, and the
 //! proptest that fuzzes `Parse` round-trips.
 
-use bytes::{BufMut, BytesMut};
+use bytes::BytesMut;
 
-use crate::messages::{BackendMessage, DescribeKind, FrontendMessage};
 use super::super::{decode_backend, decode_frontend, encode_backend, encode_frontend};
 use super::{round_trip_backend, round_trip_frontend};
+use crate::messages::{BackendMessage, DescribeKind, FrontendMessage};
 
 #[test]
 fn extended_query_pipeline_specimen() {

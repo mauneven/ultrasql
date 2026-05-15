@@ -88,7 +88,6 @@ const PG_OID_BPCHAR: u32 = 1042;
 /// PostgreSQL type OID for `oid`.
 const PG_OID_OID: u32 = 26;
 
-
 mod codec;
 mod execute;
 mod handlers;
@@ -100,7 +99,9 @@ mod tests;
 
 pub(crate) use codec::row_description_for_plan;
 pub use execute::execute_portal;
-pub use handlers::{handle_bind, handle_close, handle_describe_portal, handle_describe_statement, handle_parse};
+pub use handlers::{
+    handle_bind, handle_close, handle_describe_portal, handle_describe_statement, handle_parse,
+};
 pub(crate) use substitute::substitute_parameters_in_plan;
 
 // ---------------------------------------------------------------------------
