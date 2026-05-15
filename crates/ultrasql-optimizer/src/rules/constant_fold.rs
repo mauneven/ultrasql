@@ -398,7 +398,8 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
         | LogicalPlan::Explain { .. }
-        | LogicalPlan::Copy { .. } => Ok(None),
+        | LogicalPlan::Copy { .. }
+        | LogicalPlan::FunctionScan { .. } => Ok(None),
     }
 }
 

@@ -252,6 +252,7 @@ pub fn lower_plan(
                 "LISTEN/NOTIFY/UNLISTEN reached operator lowerer; expected pubsub dispatch path",
             ))
         }
+        LogicalPlan::FunctionScan { name, args, .. } => lower_function_scan(name, args),
         LogicalPlan::Explain { .. } => Err(ServerError::Unsupported(
             "EXPLAIN reached operator lowerer; expected session dispatch path",
         )),
@@ -742,6 +743,7 @@ pub fn lower_query(
                 "LISTEN/NOTIFY/UNLISTEN reached operator lowerer; expected pubsub dispatch path",
             ))
         }
+        LogicalPlan::FunctionScan { name, args, .. } => lower_function_scan(name, args),
         LogicalPlan::Explain { .. } => Err(ServerError::Unsupported(
             "EXPLAIN reached operator lowerer; expected session dispatch path",
         )),
@@ -1320,6 +1322,52 @@ fn lower_heap_scan(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Box<dyn Operator> 
         codec,
     );
     Box::new(scan)
+}
+
+/// Lower a `LogicalPlan::FunctionScan { name, args, .. }` into the
+/// matching set-returning-function operator. v0.5 supports
+/// `generate_series(start, stop[, step])`.
+fn lower_function_scan(name: &str, args: &[ScalarExpr]) -> Result<Box<dyn Operator>, ServerError> {
+    if name != "generate_series" {
+        return Err(ServerError::Unsupported(
+            "table function (only generate_series in v0.5)",
+        ));
+    }
+    if args.len() < 2 || args.len() > 3 {
+        return Err(ServerError::Unsupported(
+            "generate_series: expected (start, stop) or (start, stop, step)",
+        ));
+    }
+    fn to_i64(e: &ScalarExpr) -> Result<i64, ServerError> {
+        match e {
+            ScalarExpr::Literal {
+                value: Value::Int64(v),
+                ..
+            } => Ok(*v),
+            ScalarExpr::Literal {
+                value: Value::Int32(v),
+                ..
+            } => Ok(i64::from(*v)),
+            ScalarExpr::Unary {
+                op: ultrasql_planner::UnaryOp::Neg,
+                expr,
+                ..
+            } => to_i64(expr).map(i64::wrapping_neg),
+            _ => Err(ServerError::Unsupported(
+                "generate_series: arguments must be integer literals",
+            )),
+        }
+    }
+    let start = to_i64(&args[0])?;
+    let stop = to_i64(&args[1])?;
+    let step = if args.len() == 3 {
+        to_i64(&args[2])?
+    } else {
+        1
+    };
+    Ok(Box::new(ultrasql_executor::FunctionScan::generate_series(
+        start, stop, step,
+    )))
 }
 
 /// Lower an `INSERT INTO t VALUES (...)` into a [`ModifyTable`]

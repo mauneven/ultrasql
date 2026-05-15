@@ -258,7 +258,8 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
         | LogicalPlan::Explain { .. }
-        | LogicalPlan::Copy { .. } => {}
+        | LogicalPlan::Copy { .. }
+        | LogicalPlan::FunctionScan { .. } => {}
         LogicalPlan::Filter { input, predicate } => {
             walk_plan_for_max_param(input, max_idx);
             walk_expr_for_max_param(predicate, max_idx);

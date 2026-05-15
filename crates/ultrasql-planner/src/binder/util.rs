@@ -129,7 +129,8 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
-        | LogicalPlan::Unlisten { .. } => false,
+        | LogicalPlan::Unlisten { .. }
+        | LogicalPlan::FunctionScan { .. } => false,
         LogicalPlan::Filter { input, predicate } => {
             expr_contains_outer(predicate) || plan_contains_outer_column(input)
         }

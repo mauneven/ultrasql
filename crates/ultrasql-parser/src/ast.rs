@@ -1026,6 +1026,18 @@ pub enum TableRef {
         /// Source span.
         span: Span,
     },
+    /// A set-returning function in the `FROM` clause, e.g.
+    /// `generate_series(1, 10)`.
+    Function {
+        /// Function name (e.g. `generate_series`, `unnest`).
+        name: Identifier,
+        /// Argument expressions in declaration order.
+        args: Vec<Expr>,
+        /// Optional alias for the produced relation.
+        alias: Option<Identifier>,
+        /// Source span.
+        span: Span,
+    },
 }
 
 /// Join operator.

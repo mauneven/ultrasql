@@ -126,7 +126,49 @@ fn bind_table_ref(
             condition,
             ..
         } => bind_explicit_join(left, *op, right, condition, catalog, cte_catalog, scope),
+        TableRef::Function {
+            name, args, alias, ..
+        } => bind_table_function(name, args, alias.as_ref(), catalog, scope),
     }
+}
+
+fn bind_table_function(
+    name: &ultrasql_parser::ast::Identifier,
+    args: &[ultrasql_parser::ast::Expr],
+    alias: Option<&ultrasql_parser::ast::Identifier>,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
+    let func_name = name.value.to_ascii_lowercase();
+    let qualifier = alias.map_or_else(|| func_name.clone(), |a| a.value.clone());
+    let (schema, col_name) = match func_name.as_str() {
+        "generate_series" => (
+            Schema::new([Field::required("generate_series", DataType::Int64)])
+                .map_err(|e| PlanError::TypeMismatch(format!("generate_series schema: {e}")))?,
+            "generate_series".to_string(),
+        ),
+        _ => {
+            return Err(PlanError::NotSupported(
+                "table function (only generate_series supported)",
+            ));
+        }
+    };
+    let mut bound_args: Vec<ScalarExpr> = Vec::with_capacity(args.len());
+    let empty_schema = Schema::empty();
+    for a in args {
+        bound_args.push(bind_expr(a, &empty_schema, catalog, scope)?);
+    }
+    let from_scope = vec![ScopeEntry {
+        qualifier,
+        field_index: 0,
+        field: Field::required(&col_name, DataType::Int64),
+    }];
+    let plan = LogicalPlan::FunctionScan {
+        name: func_name,
+        args: bound_args,
+        schema,
+    };
+    Ok((plan, from_scope))
 }
 
 fn rebuild_subquery_plan(

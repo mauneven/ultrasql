@@ -644,7 +644,8 @@ fn infer_into(
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
-        | LogicalPlan::Copy { .. } => {}
+        | LogicalPlan::Copy { .. }
+        | LogicalPlan::FunctionScan { .. } => {}
         LogicalPlan::Explain { input, .. } => infer_into(input, catalog, out),
         LogicalPlan::Filter { input, predicate } => {
             infer_into(input, catalog, out);
@@ -939,7 +940,8 @@ fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut F) {
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
-        | LogicalPlan::Copy { .. } => {}
+        | LogicalPlan::Copy { .. }
+        | LogicalPlan::FunctionScan { .. } => {}
         LogicalPlan::Explain { input, .. } => walk_plan_exprs(input, f),
         LogicalPlan::Filter { input, predicate } => {
             walk_plan_exprs(input, f);
@@ -1309,7 +1311,8 @@ where
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
         | LogicalPlan::Copy { .. }
-        | LogicalPlan::Explain { .. } => plan.clone(),
+        | LogicalPlan::Explain { .. }
+        | LogicalPlan::FunctionScan { .. } => plan.clone(),
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(map_plan_exprs(input, f)),
             predicate: f(predicate),

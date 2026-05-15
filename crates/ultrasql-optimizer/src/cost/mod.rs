@@ -304,7 +304,8 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::Notify { .. }
             | LogicalPlan::Unlisten { .. }
             | LogicalPlan::Explain { .. }
-            | LogicalPlan::Copy { .. } => zero_estimate(),
+            | LogicalPlan::Copy { .. }
+            | LogicalPlan::FunctionScan { .. } => zero_estimate(),
         }
     }
 }

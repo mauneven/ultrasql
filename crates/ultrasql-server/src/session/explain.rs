@@ -252,6 +252,7 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Notify { .. } => "Notify",
         LogicalPlan::Unlisten { .. } => "Unlisten",
         LogicalPlan::Copy { .. } => "Copy",
+        LogicalPlan::FunctionScan { .. } => "Function Scan",
     }
 }
 

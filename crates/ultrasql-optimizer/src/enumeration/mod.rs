@@ -180,7 +180,8 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
-        | LogicalPlan::Copy { .. } => false,
+        | LogicalPlan::Copy { .. }
+        | LogicalPlan::FunctionScan { .. } => false,
 
         // DML nodes: recurse into their row-producing input.
         LogicalPlan::Insert { source, .. } => outer_join_subtree_is_barrier(source),
@@ -405,7 +406,8 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
-        | LogicalPlan::Copy { .. } => plan.clone(),
+        | LogicalPlan::Copy { .. }
+        | LogicalPlan::FunctionScan { .. } => plan.clone(),
     }
 }
 

@@ -208,6 +208,9 @@ pub fn build_operator(
         LogicalPlan::Copy { .. } => Err(BuildError::Unsupported(
             "COPY is dispatched by the server, not lowered to an executor operator",
         )),
+        LogicalPlan::FunctionScan { .. } => Err(BuildError::Unsupported(
+            "FunctionScan lowered by the server pipeline, not the executor builder",
+        )),
 
         LogicalPlan::Join {
             left,

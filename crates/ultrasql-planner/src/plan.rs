@@ -762,6 +762,19 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// Set-returning function in `FROM`, e.g. `FROM generate_series(1, 10)`.
+    ///
+    /// The lowerer dispatches on `name` to construct the matching
+    /// [`ultrasql_executor::FunctionScan`] variant.
+    FunctionScan {
+        /// Function name (case-folded). v0.5 supports `generate_series`.
+        name: String,
+        /// Bound argument expressions in declaration order.
+        args: Vec<ScalarExpr>,
+        /// Output schema for the function's rows.
+        schema: Schema,
+    },
+
     /// `EXPLAIN [ANALYZE] [(FORMAT TEXT|JSON)] stmt`.
     ///
     /// Wraps an inner logical plan. The server renders the wrapped
@@ -911,7 +924,8 @@ impl LogicalPlan {
             | Self::Notify { schema, .. }
             | Self::Unlisten { schema, .. }
             | Self::Copy { schema, .. }
-            | Self::Explain { schema, .. } => schema,
+            | Self::Explain { schema, .. }
+            | Self::FunctionScan { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
                 input.schema()
             }
@@ -1438,6 +1452,15 @@ impl LogicalPlan {
                     out,
                     format_args!("Copy: {relation} ({cols}) {dir} {src} FORMAT={fmt_label}\n"),
                 );
+            }
+            Self::FunctionScan { name, args, .. } => {
+                out.push_str(&pad);
+                let arg_list = args
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = fmt::write(out, format_args!("FunctionScan: {name}({arg_list})\n"));
             }
         }
     }

@@ -681,6 +681,43 @@ impl Parser<'_> {
     /// Parse a single named table reference after `FROM` or `JOIN`.
     pub(crate) fn parse_table_ref(&mut self) -> Result<TableRef, ParseError> {
         let name = self.parse_object_name()?;
+        // `name (` after a single-identifier name signals a table
+        // function — `generate_series(1, 10)`, `unnest(array)`, etc.
+        if name.parts.len() == 1 && self.peek()?.kind == TokenKind::LParen {
+            let func_name =
+                name.parts.into_iter().next().expect(
+                    "parse_table_ref: ObjectName::parts.len() == 1 implies a leading element",
+                );
+            self.advance()?; // (
+            let mut args = Vec::new();
+            if self.peek()?.kind != TokenKind::RParen {
+                loop {
+                    args.push(self.parse_expr()?);
+                    if self.peek()?.kind != TokenKind::Comma {
+                        break;
+                    }
+                    self.advance()?;
+                }
+            }
+            let rp = self.expect(TokenKind::RParen, ")")?;
+            let alias = if self.match_kw(TokenKind::KwAs)
+                || (matches!(
+                    self.peek()?.kind,
+                    TokenKind::Identifier | TokenKind::QuotedIdentifier
+                ) && !self.next_token_is_reserved_clause())
+            {
+                Some(self.parse_identifier()?)
+            } else {
+                None
+            };
+            let end = alias.as_ref().map_or(rp.span.end, |a| a.span.end);
+            return Ok(TableRef::Function {
+                span: Span::new(func_name.span.start, end),
+                name: func_name,
+                args,
+                alias,
+            });
+        }
         let alias = if self.match_kw(TokenKind::KwAs)
             || (matches!(
                 self.peek()?.kind,
@@ -852,9 +889,10 @@ trait TableRefSpan {
 impl TableRefSpan for TableRef {
     fn ref_span(&self) -> Span {
         match self {
-            Self::Named { span, .. } | Self::Join { span, .. } | Self::Subquery { span, .. } => {
-                *span
-            }
+            Self::Named { span, .. }
+            | Self::Join { span, .. }
+            | Self::Subquery { span, .. }
+            | Self::Function { span, .. } => *span,
         }
     }
 }
