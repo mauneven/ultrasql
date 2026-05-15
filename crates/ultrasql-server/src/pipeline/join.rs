@@ -13,8 +13,8 @@ use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
     CteScan, Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan,
-    ModifyKind, ModifyTable, NestedLoopJoin, Operator, Project, ResultOp, RightFactory, RowCodec,
-    SeqScan, SetOp, Sort, ValuesScan,
+    MergeJoin, ModifyKind, ModifyTable, NestedLoopJoin, Operator, Project, ResultOp, RightFactory,
+    RowCodec, SeqScan, SetOp, Sort, ValuesScan,
 };
 use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
 use ultrasql_planner::{
@@ -32,6 +32,89 @@ use crate::error::ServerError;
 
 use super::lower_query::lower_query;
 use super::LowerCtx;
+
+/// Attempt to lower an `Inner`/`LeftOuter` `Join` whose children are both
+/// [`LogicalPlan::Sort`] over keys that align with the equi-key predicate
+/// to a [`MergeJoin`].
+///
+/// Returns `Ok(Some(op))` when the merge-join shape is recognised — the
+/// Sort wrappers are skipped and the inner plans are lowered as the
+/// merge inputs (no re-sort). Returns `Ok(None)` when the shape does
+/// not match, leaving the caller to fall back to the hash/NL join
+/// dispatcher.
+///
+/// Match rules (all must hold):
+/// - `condition` is `On(pred)` with an equi `Column = Column` predicate
+///   extractable by [`extract_hash_friendly_equi_keys`].
+/// - `join_type` is `Inner` or `LeftOuter` (the kinds MergeJoin
+///   accepts today — `Cross` is explicitly rejected by the executor and
+///   `RightOuter`/`FullOuter`/`Semi`/`Anti` need follow-up coverage).
+/// - Both children are `LogicalPlan::Sort { input, keys }` with exactly
+///   one ascending key whose `ScalarExpr` matches the equi-key on the
+///   corresponding side (column reference equality).
+pub(super) fn try_lower_merge_join(
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    join_type: LogicalJoinType,
+    condition: &LogicalJoinCondition,
+    out_schema: &Schema,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    if !matches!(
+        join_type,
+        LogicalJoinType::Inner | LogicalJoinType::LeftOuter
+    ) {
+        return Ok(None);
+    }
+    let LogicalJoinCondition::On(pred) = condition else {
+        return Ok(None);
+    };
+    let left_schema_width = left.schema().len();
+    let Some((left_key, right_key)) = extract_hash_friendly_equi_keys(pred, left_schema_width)
+    else {
+        return Ok(None);
+    };
+
+    let LogicalPlan::Sort {
+        input: left_inner,
+        keys: left_keys,
+    } = left
+    else {
+        return Ok(None);
+    };
+    let LogicalPlan::Sort {
+        input: right_inner,
+        keys: right_keys,
+    } = right
+    else {
+        return Ok(None);
+    };
+    if left_keys.len() != 1 || right_keys.len() != 1 {
+        return Ok(None);
+    }
+    if !left_keys[0].asc || !right_keys[0].asc {
+        return Ok(None);
+    }
+    if left_keys[0].expr != left_key || right_keys[0].expr != right_key {
+        return Ok(None);
+    }
+
+    let left_inner_schema = left_inner.schema().clone();
+    let right_inner_schema = right_inner.schema().clone();
+    let left_op = lower_query(left_inner, ctx)?;
+    let right_op = lower_query(right_inner, ctx)?;
+
+    Ok(Some(Box::new(MergeJoin::new(
+        left_op,
+        right_op,
+        left_key,
+        right_key,
+        join_type,
+        out_schema.clone(),
+        left_inner_schema,
+        right_inner_schema,
+    ))))
+}
 
 pub(super) fn lower_join(
     left: Box<dyn Operator>,

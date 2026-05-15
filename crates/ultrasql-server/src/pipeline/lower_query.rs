@@ -186,6 +186,16 @@ pub fn lower_query(
             condition,
             schema,
         } => {
+            // MergeJoin fast path: both children are an explicit `Sort`
+            // over the equi-key. Skip the Sort wrappers and let the
+            // executor's merge operator consume the already-ordered
+            // streams without re-sorting.
+            if let Some(op) = super::join::try_lower_merge_join(
+                left, right, *join_type, condition, schema, ctx,
+            )? {
+                return Ok(op);
+            }
+
             // Lower the join's children first so the same real-heap path
             // (`SeqScan`-aware) feeds the operator. The selection rule
             // (HashJoin vs NestedLoopJoin) is delegated to `lower_join`
@@ -229,6 +239,30 @@ pub fn lower_query(
                 try_lower_cached_scalar_aggregate_i32(input, group_by, aggregates, ctx)?
             {
                 return Ok(direct);
+            }
+            // SortAggregate fast path: input is `LogicalPlan::Sort` whose
+            // keys exactly match the GROUP BY keys. Skip the Sort wrapper
+            // and feed the inner plan into a streaming SortAggregate that
+            // avoids the hash-table build cost.
+            if let LogicalPlan::Sort {
+                input: sort_input,
+                keys,
+            } = input.as_ref()
+                && !group_by.is_empty()
+                && keys.len() == group_by.len()
+                && keys.iter().all(|k| k.asc)
+                && keys
+                    .iter()
+                    .zip(group_by.iter())
+                    .all(|(k, g)| &k.expr == g)
+            {
+                let child = lower_query(sort_input, ctx)?;
+                return Ok(Box::new(ultrasql_executor::SortAggregate::new(
+                    child,
+                    group_by.clone(),
+                    aggregates.clone(),
+                    schema.clone(),
+                )));
             }
             // Mirror `ultrasql_executor::physical::build_operator` — default
             // to a hash-based aggregate. The child is lowered recursively
