@@ -280,8 +280,7 @@ real wire protocol.
    dispatch (`session/run.rs` has no `CopyData` flow); `LISTEN` /
    `NOTIFY` SQL surface (kernel `NotificationHub` ships, no
    statement binding or `NotificationResponse` wire send);
-   `ANALYZE` Simple-Query handler; `SELECT FOR UPDATE` / `LockRows`
-   `tokio-postgres` round-trip test; `DROP TABLE` / `ALTER TABLE`
+   `ANALYZE` Simple-Query handler; `DROP TABLE` / `ALTER TABLE`
    tokio-postgres round-trips. `CancelRequest` flow is **not**
    functional end-to-end — `BackendKeyData` is sent with
    pid/secret = 0 and the session never registers itself with the
@@ -604,7 +603,7 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] Central lock table: `DashMap<LockTag, LockEntry>` with wait-for graph
 - [x] Deadlock detector background thread (configurable interval, default 1 s)
 - [x] Tuple-level locks for concurrent updates (LockTag::Tuple supported)
-- [x] `SELECT FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` parser → planner → executor → `lower_query` arm (`pipeline.rs:271`, `pipeline.rs:798`) (`847b3de`); ⚠️ no dedicated round-trip test in `crates/ultrasql-server/tests/` — the wire path is reachable but unverified at the `tokio-postgres` boundary
+- [x] `SELECT FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` parser → planner → executor → `lower_query` arm (`pipeline.rs:275`, `pipeline.rs:806`); ✅ `tokio-postgres` round-trip in `crates/ultrasql-server/tests/lock_rows_round_trip.rs` covers FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE plus pre-image visibility on a concurrent reader
 - [x] Advisory locks: `pg_advisory_lock`, `pg_try_advisory_lock` (LockTag::Advisory; SQL surface still TODO)
 
 ### SSI (Serializable Snapshot Isolation)
@@ -686,7 +685,7 @@ driver can connect.
 - [x] `Unique` — kernel exists (`unique.rs`); ⚠️ DISTINCT wire path pending
 - [x] `SetOp` (UNION/INTERSECT/EXCEPT) — kernel + wired; `setop_round_trip.rs` covers UNION, UNION ALL, INTERSECT, INTERSECT ALL
 - [x] `RecursiveUnion` (WITH RECURSIVE) — wire path — `binder::bind_recursive_cte` splits anchor + recursive term and exposes the CTE name in scope for the recursive term; `pipeline::lower_recursive_cte` runs a fixpoint loop with row-key dedup for `UNION DISTINCT` and a 1024-iteration safety cap for `UNION ALL`. `cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint` exercises a 4-node graph with a cycle
-- [x] `LockRows` — kernel (`lock_rows.rs`) wired in `pipeline::lower_query` (`pipeline.rs:271` + `798`) `847b3de`; ⚠️ no `tokio-postgres` round-trip test yet
+- [x] `LockRows` — kernel (`lock_rows.rs`) wired in `pipeline::lower_query` (`pipeline.rs:275` + `806`); ✅ `lock_rows_round_trip.rs` covers FOR UPDATE/FOR SHARE/FOR NO KEY UPDATE + concurrent reader pre-image
 - [x] `Materialize` — kernel exists (`materialize.rs`); ⚠️ not yet selected by planner
 - [ ] `Gather` / `GatherMerge` (parallel query)
 - [ ] `Append` / `MergeAppend` (partition scans)
