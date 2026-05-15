@@ -280,8 +280,7 @@ real wire protocol.
    dispatch (`session/run.rs` has no `CopyData` flow); `LISTEN` /
    `NOTIFY` SQL surface (kernel `NotificationHub` ships, no
    statement binding or `NotificationResponse` wire send);
-   `ANALYZE` Simple-Query handler; `DROP TABLE` / `ALTER TABLE`
-   tokio-postgres round-trips. `CancelRequest` flow is **not**
+   `ANALYZE` Simple-Query handler. `CancelRequest` flow is **not**
    functional end-to-end — `BackendKeyData` is sent with
    pid/secret = 0 and the session never registers itself with the
    `CancelRegistry`. Shape specialisation (fused paths) still applies.
@@ -338,8 +337,8 @@ deployment can rely on.
 | `WITH RECURSIVE cte AS (...)` | ✅ | ✅ | ❌ rejected by lowerer | ❌ |
 | `UNION / INTERSECT / EXCEPT` | ✅ | ✅ | ✅ | ✅ |
 | `CREATE INDEX` | ✅ | ✅ | ⚠️ single-col Int32/Int64 only | ✅ |
-| `DROP TABLE` | ✅ | ✅ | ✅ | ⚠️ no dedicated round-trip test |
-| `ALTER TABLE` | ✅ | ✅ | ⚠️ ADD COLUMN only | ⚠️ no dedicated round-trip test |
+| `DROP TABLE` | ✅ | ✅ | ✅ | ✅ (`drop_table_round_trip.rs`) |
+| `ALTER TABLE` | ✅ | ✅ | ⚠️ ADD COLUMN only | ✅ (`alter_table_round_trip.rs`) |
 
 ---
 
