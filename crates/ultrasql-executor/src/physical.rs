@@ -276,6 +276,10 @@ pub fn build_operator(
                 _ => build_operator(body, data_source),
             }
         }
+
+        LogicalPlan::Explain { .. } => Err(BuildError::Unsupported(
+            "EXPLAIN is dispatched by the server, not lowered to an executor operator",
+        )),
     }
 }
 

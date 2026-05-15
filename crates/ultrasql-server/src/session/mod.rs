@@ -19,6 +19,7 @@ use crate::{READ_BUFFER_INITIAL, Server, TxnState};
 mod alter;
 mod ddl;
 mod execute;
+mod explain;
 mod ext;
 mod io;
 mod meta_stmt;

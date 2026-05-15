@@ -107,8 +107,7 @@ async fn select_distinct_two_columns_dedups_pair() {
         .iter()
         .map(|r| (r.get::<_, i32>(0), r.get::<_, i32>(1)))
         .collect();
-    let expected: HashSet<(i32, i32)> =
-        HashSet::from([(1, 10), (1, 11), (2, 20), (3, 30)]);
+    let expected: HashSet<(i32, i32)> = HashSet::from([(1, 10), (1, 11), (2, 20), (3, 30)]);
     assert_eq!(values, expected);
 
     shutdown(client, server_handle).await;

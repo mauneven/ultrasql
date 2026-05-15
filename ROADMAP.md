@@ -273,8 +273,7 @@ real wire protocol.
    `order_by_round_trip.rs`, `join_round_trip.rs`, `setop_round_trip.rs`,
    `index_scan_round_trip.rs`, `cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint`,
    and `prepare_execute_round_trip.rs`. **Remaining gaps**:
-   `EXPLAIN` / `EXPLAIN ANALYZE` (no `LogicalPlan::Explain` variant,
-   no session dispatch); `INSERT … ON CONFLICT` and `RETURNING`
+   `INSERT … ON CONFLICT` and `RETURNING`
    (`pipeline.rs:1292/1296` return `Unsupported`); `COPY` wire
    dispatch (`session/run.rs` has no `CopyData` flow); `LISTEN` /
    `NOTIFY` SQL surface (kernel `NotificationHub` ships, no
@@ -330,7 +329,7 @@ deployment can rely on.
 | `SAVEPOINT / RELEASE / ROLLBACK TO` | ✅ | ✅ | ✅ | ✅ (`txn_round_trip.rs::savepoint_rollback_to_undoes_in_savepoint_writes`) |
 | `PREPARE / EXECUTE / DEALLOCATE` (Simple Query) | ✅ | ❌ | ❌ | ❌ |
 | Extended Query (Parse/Bind/Execute) | ✅ codec | n/a | ✅ dispatch | ✅ |
-| `EXPLAIN` / `EXPLAIN ANALYZE` | ✅ | ❌ | ❌ | ❌ |
+| `EXPLAIN` / `EXPLAIN ANALYZE` | ✅ | ✅ | ✅ | ✅ (`explain_round_trip.rs`) |
 | `BETWEEN ... AND ...` | ✅ | ✅ | ✅ | ✅ |
 | `WITH cte AS (...)` (non-recursive) | ✅ | ✅ | ✅ | ✅ |
 | `WITH RECURSIVE cte AS (...)` | ✅ | ✅ | ❌ rejected by lowerer | ❌ |
@@ -820,7 +819,15 @@ driver can connect.
 - [x] DPsize (dynamic programming over subsets) for ≤ 10 relations
 - [x] Greedy/GEQO heuristic for > 10 relations
 - [x] Cascades-style memo data structures (top-down search driver v0.7)
-- [ ] Join reordering with outer join constraints
+- [x] Join reordering with outer join constraints — `reorder_inner_joins`
+      treats LEFT/RIGHT/FULL OUTER subtrees as opaque barriers; INNER chains
+      that *contain* an outer-join leaf are skipped wholesale per the brief's
+      "safest" path. See
+      `crates/ultrasql-optimizer/tests/outer_join_reorder.rs`
+      (`three_inner_joins_are_reordered`,
+      `left_outer_join_with_non_strict_predicate_blocks_reorder`,
+      `inner_join_above_left_outer_is_not_reordered`,
+      `full_outer_join_is_a_hard_barrier_everywhere`).
 
 ### Physical Operator Selection
 - [x] NestLoop vs HashJoin vs MergeJoin

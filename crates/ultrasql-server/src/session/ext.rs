@@ -306,6 +306,36 @@ where
                     }
                 }
             }
+
+            // EXPLAIN: render the wrapped plan tree into the
+            // `"QUERY PLAN"` Text column the client expects. Routed
+            // through the same `execute_explain` helper used by the
+            // Simple Query path so the two surfaces stay in lock-step.
+            // Drop the leading `RowDescription` because the Extended
+            // Query protocol delivers it via a separate `Describe`
+            // message — sending it again here would surface as an
+            // `UnexpectedMessage` on the client side.
+            if matches!(plan, LogicalPlan::Explain { .. }) {
+                let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+                match self.execute_explain(plan, &catalog_snapshot) {
+                    Ok(result) => {
+                        for m in &result.messages {
+                            if matches!(m, BackendMessage::RowDescription { .. }) {
+                                continue;
+                            }
+                            self.send(m).await?;
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if !e.is_query_scoped() {
+                            return Err(e);
+                        }
+                        self.extended.mark_failed();
+                        return self.send_error(&e.to_string(), e.sqlstate()).await;
+                    }
+                }
+            }
         }
 
         // A statement inside a failed transaction block is rejected

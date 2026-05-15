@@ -299,7 +299,8 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::PrepareTransaction { .. }
             | LogicalPlan::CommitPrepared { .. }
             | LogicalPlan::RollbackPrepared { .. }
-            | LogicalPlan::SetTransaction { .. } => zero_estimate(),
+            | LogicalPlan::SetTransaction { .. }
+            | LogicalPlan::Explain { .. } => zero_estimate(),
         }
     }
 }

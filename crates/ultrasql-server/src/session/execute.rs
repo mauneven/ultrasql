@@ -172,6 +172,9 @@ where
             LogicalPlan::Truncate { .. } => {
                 return self.execute_truncate(&plan, &catalog_snapshot);
             }
+            LogicalPlan::Explain { .. } => {
+                return self.execute_explain(&plan, &catalog_snapshot);
+            }
             _ => {}
         }
 

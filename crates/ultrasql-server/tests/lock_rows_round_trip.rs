@@ -160,7 +160,10 @@ async fn concurrent_reader_sees_pre_image_during_writer_txn() {
     // visibility regression elsewhere in the engine does not leak into
     // post-test heap state. The contract under test here is the
     // pre-commit pre-image, which we asserted above.
-    writer.batch_execute("ROLLBACK").await.expect("writer ROLLBACK");
+    writer
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("writer ROLLBACK");
 
     drop(writer);
     drop(reader);

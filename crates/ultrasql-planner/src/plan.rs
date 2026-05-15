@@ -719,6 +719,44 @@ pub enum LogicalPlan {
         /// Always [`Schema::empty`].
         schema: Schema,
     },
+
+    /// `EXPLAIN [ANALYZE] [(FORMAT TEXT|JSON)] stmt`.
+    ///
+    /// Wraps an inner logical plan. The server's session dispatcher
+    /// renders the wrapped plan's tree shape — and, when `analyze` is
+    /// `true`, also executes it and overlays per-node row counts and
+    /// timing — into the single `"QUERY PLAN"` Text column of `schema`.
+    ///
+    /// `format = ExplainFormat::Text` emits one row per plan-tree line.
+    /// `format = ExplainFormat::Json` emits a single row carrying a JSON
+    /// document with one object per node.
+    Explain {
+        /// `true` for `EXPLAIN ANALYZE` (execute the inner plan and
+        /// surface actual row counts + elapsed time alongside the
+        /// estimated rows).
+        analyze: bool,
+        /// Output format requested by the user.
+        format: ExplainFormat,
+        /// The wrapped plan to describe.
+        input: Box<Self>,
+        /// Always a single nullable `Text` column named `"QUERY PLAN"`.
+        schema: Schema,
+    },
+}
+
+/// EXPLAIN output format selector, mirrored from
+/// [`ultrasql_parser::ast::ExplainFormat`].
+///
+/// The planner keeps its own copy so downstream crates (server,
+/// executor) do not need to depend on the parser AST. Conversion is a
+/// trivial 1:1 mapping handled by [`crate::binder`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExplainFormat {
+    /// `EXPLAIN ... (FORMAT TEXT)` — indented tree, one row per node.
+    Text,
+    /// `EXPLAIN ... (FORMAT JSON)` — single row carrying the JSON
+    /// rendering of the plan tree.
+    Json,
 }
 
 /// Resolved `ALTER TABLE` action.
@@ -771,7 +809,8 @@ impl LogicalPlan {
             | Self::PrepareTransaction { schema, .. }
             | Self::CommitPrepared { schema, .. }
             | Self::RollbackPrepared { schema, .. }
-            | Self::SetTransaction { schema, .. } => schema,
+            | Self::SetTransaction { schema, .. }
+            | Self::Explain { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
                 input.schema()
             }
@@ -1220,6 +1259,21 @@ impl LogicalPlan {
             } => {
                 out.push_str(&pad);
                 let _ = fmt::write(out, format_args!("SetTransaction: {isolation_level:?}\n"));
+            }
+            Self::Explain {
+                analyze,
+                format,
+                input,
+                ..
+            } => {
+                out.push_str(&pad);
+                let mode = if *analyze { "ANALYZE " } else { "" };
+                let fmt_label = match format {
+                    ExplainFormat::Text => "TEXT",
+                    ExplainFormat::Json => "JSON",
+                };
+                let _ = fmt::write(out, format_args!("Explain {mode}({fmt_label})\n"));
+                input.display_into(indent + 2, out);
             }
         }
     }

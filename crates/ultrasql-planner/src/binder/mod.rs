@@ -49,17 +49,18 @@
 use ultrasql_core::{DataType, Field, Schema, Value};
 #[allow(unused_imports)] // BinaryOp and UnaryOp are used in binder/tests.rs via `use super::*`
 use ultrasql_parser::ast::{
-    BinaryOp, Distinct, LockStrength as AstLockStrength, LockWaitPolicy as AstLockWaitPolicy,
-    SelectStmt, SetOp, SetQuantifier, Statement, UnaryOp,
+    BinaryOp, Distinct, ExplainFormat as AstExplainFormat, ExplainStmt,
+    LockStrength as AstLockStrength, LockWaitPolicy as AstLockWaitPolicy, SelectStmt, SetOp,
+    SetQuantifier, Statement, UnaryOp,
 };
 
 use crate::catalog::Catalog;
 use crate::error::PlanError;
 use crate::expr::ScalarExpr;
 use crate::plan::{
-    AggregateFunc, ConflictTarget, LockStrength, LockWaitPolicy, LogicalAggregateExpr,
-    LogicalAlterTableAction, LogicalJoinCondition, LogicalJoinType, LogicalOnConflict, LogicalPlan,
-    LogicalSetOp, LogicalSetQuantifier, SortKey, TxnIsolationLevel,
+    AggregateFunc, ConflictTarget, ExplainFormat, LockStrength, LockWaitPolicy,
+    LogicalAggregateExpr, LogicalAlterTableAction, LogicalJoinCondition, LogicalJoinType,
+    LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, SortKey, TxnIsolationLevel,
 };
 use crate::scope::{ScopeFrame, ScopeStack};
 
@@ -112,6 +113,7 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::CreateIndex(s) => bind_create_index(s, catalog),
         Statement::DropTable(s) => bind_drop_table(s, catalog),
         Statement::AlterTable(s) => bind_alter_table(s, catalog),
+        Statement::Explain(s) => bind_explain(s, catalog, &mut scope),
         // Transaction-control statements have no catalog dependency: the
         // server inspects the per-session TxnState and dispatches
         // accordingly. The binder emits the corresponding LogicalPlan
@@ -196,6 +198,45 @@ struct ScopeEntry {
     field_index: usize,
     /// The field itself (type + name).
     field: Field,
+}
+
+/// Bind an `EXPLAIN [ANALYZE] [(FORMAT TEXT|JSON)] stmt`.
+///
+/// Recursively binds the wrapped statement, then wraps it in
+/// [`LogicalPlan::Explain`] with the single-column `QUERY PLAN`
+/// output schema PostgreSQL uses.
+fn bind_explain(
+    stmt: &ExplainStmt,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
+    let inner = match &*stmt.statement {
+        Statement::Select(s) => bind_select(s, catalog, scope)?,
+        Statement::Insert(s) => bind_insert(s, catalog, scope)?,
+        Statement::Update(s) => bind_update(s, catalog, scope)?,
+        Statement::Delete(s) => bind_delete(s, catalog, scope)?,
+        other => {
+            return Err(PlanError::NotSupported(match other {
+                Statement::Explain(_) => "EXPLAIN inside EXPLAIN",
+                _ => "EXPLAIN of this statement kind",
+            }));
+        }
+    };
+    let format = match stmt.format {
+        AstExplainFormat::Text => ExplainFormat::Text,
+        AstExplainFormat::Json => ExplainFormat::Json,
+    };
+    let schema = Schema::new([Field::nullable(
+        "QUERY PLAN",
+        DataType::Text { max_len: None },
+    )])
+    .map_err(|e| PlanError::TypeMismatch(format!("EXPLAIN schema: {e}")))?;
+    Ok(LogicalPlan::Explain {
+        analyze: stmt.analyze,
+        format,
+        input: Box::new(inner),
+        schema,
+    })
 }
 
 /// Bind a `SELECT` statement.

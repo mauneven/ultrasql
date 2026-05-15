@@ -28,7 +28,7 @@ pub use catalog::{Catalog, InMemoryCatalog, TableMeta};
 pub use error::PlanError;
 pub use expr::{BinaryOp, ScalarExpr, UnaryOp};
 pub use plan::{
-    AggregateFunc, ConflictTarget, LogicalAggregateExpr, LogicalAlterTableAction,
+    AggregateFunc, ConflictTarget, ExplainFormat, LogicalAggregateExpr, LogicalAlterTableAction,
     LogicalJoinCondition, LogicalJoinType, LogicalOnConflict, LogicalPlan, LogicalSetOp,
     LogicalSetQuantifier, SortKey, TxnIsolationLevel,
 };

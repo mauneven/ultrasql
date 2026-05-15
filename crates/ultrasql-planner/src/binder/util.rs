@@ -196,6 +196,7 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
             plan_contains_outer_column(input)
                 || returning.iter().any(|(e, _)| expr_contains_outer(e))
         }
+        LogicalPlan::Explain { input, .. } => plan_contains_outer_column(input),
     }
 }
 

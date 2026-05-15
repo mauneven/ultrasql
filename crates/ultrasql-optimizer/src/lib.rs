@@ -45,7 +45,10 @@ pub mod rules;
 pub mod stats;
 
 pub use cost::{CostEstimate, CostGucs, CostModel, NoStats, StatsSource};
-pub use enumeration::{JoinEnumerator, Memo, PhysicalOp, choose_enumerator};
+pub use enumeration::{
+    JoinEnumerator, Memo, PhysicalOp, choose_enumerator, outer_join_subtree_is_barrier,
+    reorder_inner_joins,
+};
 pub use error::OptimizeError;
 pub use plan_cache::{PlanCache, PlanCacheConfig, PlanCacheEntry, PlanCacheKey};
 pub use rules::{RewriteRule, RuleSet};

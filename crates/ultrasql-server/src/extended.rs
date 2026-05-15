@@ -641,6 +641,7 @@ fn infer_into(
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. } => {}
+        LogicalPlan::Explain { input, .. } => infer_into(input, catalog, out),
         LogicalPlan::Filter { input, predicate } => {
             infer_into(input, catalog, out);
             infer_expr_types_from_predicate(predicate, out);
@@ -931,6 +932,7 @@ fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut F) {
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. } => {}
+        LogicalPlan::Explain { input, .. } => walk_plan_exprs(input, f),
         LogicalPlan::Filter { input, predicate } => {
             walk_plan_exprs(input, f);
             walk_expr(predicate, f);
@@ -1295,6 +1297,17 @@ where
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. } => plan.clone(),
+        LogicalPlan::Explain {
+            analyze,
+            format,
+            input,
+            schema,
+        } => LogicalPlan::Explain {
+            analyze: *analyze,
+            format: *format,
+            input: Box::new(map_plan_exprs(input, f)),
+            schema: schema.clone(),
+        },
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(map_plan_exprs(input, f)),
             predicate: f(predicate),
