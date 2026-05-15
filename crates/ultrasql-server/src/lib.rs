@@ -58,7 +58,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{CatalogSnapshot, PersistentCatalog};
-use ultrasql_core::PageId;
+use ultrasql_core::{PageId, Value};
 use ultrasql_optimizer::{PlanCache, PlanCacheConfig};
 use ultrasql_planner::{Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan, TableMeta};
 use ultrasql_protocol::BackendMessage;

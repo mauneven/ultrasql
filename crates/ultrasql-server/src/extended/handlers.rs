@@ -2,8 +2,6 @@
 //! and Close. Each handler is invoked by the per-session state machine in
 //! [`crate::session`] after the wire codec decodes a frontend message.
 
-#![allow(unused_imports, dead_code)]
-
 use std::collections::HashMap;
 
 use ultrasql_core::{DataType, Value};

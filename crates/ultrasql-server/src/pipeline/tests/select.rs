@@ -1,7 +1,5 @@
 //! SELECT-shape tests.
 
-#![allow(unused_imports, dead_code)]
-
 use super::{
     build_int_join_plan, collect_pairs, column, equi_eq_predicate, fixture, int_row, lit_i32,
     non_equi_lt_predicate, plan, schema_int_col, synthetic_ctx,

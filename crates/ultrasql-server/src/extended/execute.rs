@@ -2,8 +2,6 @@
 //! a previously bound portal; [`resume_suspended_portal`] resumes a portal
 //! that was suspended by a prior `max_rows` cap.
 
-#![allow(unused_imports, dead_code)]
-
 use std::collections::HashMap;
 
 use ultrasql_core::Value;

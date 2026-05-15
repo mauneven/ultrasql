@@ -49,8 +49,6 @@
 //! after `Sync` does it emit `ReadyForQuery` and resume processing.
 //! [`ExtendedConnState::pipeline_failed`] tracks this skip state.
 
-#![allow(unused_imports, dead_code)]
-
 use std::collections::HashMap;
 
 use ultrasql_core::{DataType, Value};
@@ -181,7 +179,6 @@ impl std::fmt::Debug for ExtendedConnState {
 /// State retained across a `PortalSuspended` boundary so the next
 /// `Execute` on the same portal can resume from where the previous one
 /// stopped instead of re-running the plan from scratch.
-#[allow(missing_debug_implementations)]
 pub struct SuspendedPortal {
     /// The operator stream still hot — `next_batch` returns the rows
     /// that have not yet been emitted to the client.

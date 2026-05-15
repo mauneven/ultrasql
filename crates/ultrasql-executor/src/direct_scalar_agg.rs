@@ -357,7 +357,10 @@ mod tests {
     fn sum_int32_returns_widening_total_in_int64() {
         let scan = make_int32_scan("x", vec![1, 2, 3, 4, 5]);
         let mut agg = DirectScalarAggScan::sum_int32(Box::new(scan), 0, "sum".into());
-        let batch = agg.next_batch().expect("ok").expect("single row emitted");
+        let batch = agg
+            .next_batch()
+            .expect("ok")
+            .expect("single row emitted");
         assert_eq!(batch.rows(), 1);
         match &batch.columns()[0] {
             Column::Int64(c) => assert_eq!(c.data(), &[15]),

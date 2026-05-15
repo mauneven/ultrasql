@@ -5,8 +5,6 @@
 //! [`ScalarExpr::Parameter`] node into a [`ScalarExpr::Literal`]. The
 //! substituted plan is what [`super::execute::execute_portal`] runs.
 
-#![allow(unused_imports, dead_code)]
-
 use ultrasql_core::{DataType, Value};
 use ultrasql_planner::{
     BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalOnConflict, LogicalPlan,

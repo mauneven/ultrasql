@@ -49,8 +49,6 @@
 //! [`ultrasql_executor::physical::build_operator`]; the integration
 //! point is `lower_plan` and its `SampleTables` parameter.
 
-#![allow(unused_imports, dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -178,7 +176,8 @@ impl DataSource for SampleTables {
 }
 
 /// Lower a logical plan to a boxed [`Operator`] tree.
-#[allow(missing_debug_implementations)]
+///
+
 pub struct LowerCtx<'a> {
     /// Legacy sample-table registry; used when the catalog snapshot has
     /// no entry for a referenced table.

@@ -1,8 +1,6 @@
 //! Index-scan lowering: detect `WHERE col op lit` shapes that match an
 //! existing B-tree index and lower them to an `IndexScan`.
 
-#![allow(unused_imports, dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 

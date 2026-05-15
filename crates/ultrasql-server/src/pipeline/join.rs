@@ -1,7 +1,5 @@
 //! Join lowering: hash-join when equi-keys are discoverable, else NLJ.
 
-#![allow(unused_imports, dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 

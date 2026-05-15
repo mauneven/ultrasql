@@ -56,8 +56,6 @@
 //! representation that lets all three sites share the decision without
 //! routing a virtual-dispatch trait object through every helper.
 
-#![allow(unused_imports, dead_code)]
-
 use ultrasql_core::{DataType, Schema, Value};
 
 use crate::error::ServerError;

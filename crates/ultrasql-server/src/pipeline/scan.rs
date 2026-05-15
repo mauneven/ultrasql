@@ -1,7 +1,5 @@
 //! Scan-lowering helpers and table-function scan.
 
-#![allow(unused_imports, dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
