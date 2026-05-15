@@ -1329,12 +1329,43 @@ fn lower_real_insert(
             "INSERT with column list narrower than table; v0.5 requires every column",
         ));
     }
-    let LogicalPlan::Values { rows, schema } = source else {
-        return Err(ServerError::Unsupported(
-            "INSERT source other than VALUES (e.g. INSERT INTO t SELECT)",
-        ));
+    let child: Box<dyn Operator> = match source {
+        LogicalPlan::Values { rows, schema } => {
+            Box::new(ValuesScan::new(rows.clone(), schema.clone()))
+        }
+        // `INSERT INTO t SELECT ...` — drive the destination through the
+        // same `ModifyTable` shape we use for `VALUES`, but with a
+        // lowered query plan as the row source. The binder enforced
+        // arity, types, and named-column matching when it built the
+        // `Insert` plan; if its schema differs from the target table's
+        // declared schema, refuse here so a silent encoding mismatch
+        // never lands rows into the heap with the wrong layout.
+        other => {
+            let source_schema = other.schema();
+            if source_schema.len() != entry.schema.len() {
+                return Err(ServerError::Unsupported(
+                    "INSERT ... SELECT with arity mismatch",
+                ));
+            }
+            for (idx, (src, dst)) in source_schema
+                .fields()
+                .iter()
+                .zip(entry.schema.fields().iter())
+                .enumerate()
+            {
+                if src.data_type != dst.data_type
+                    && !matches!(src.data_type, ultrasql_core::DataType::Null)
+                {
+                    return Err(ServerError::Plan(
+                        ultrasql_planner::PlanError::TypeMismatch(format!(
+                            "INSERT ... SELECT column {idx} type mismatch: source {src} vs target {dst}",
+                        )),
+                    ));
+                }
+            }
+            lower_query(other, ctx)?
+        }
     };
-    let child: Box<dyn Operator> = Box::new(ValuesScan::new(rows.clone(), schema.clone()));
     let rel = RelationId(entry.oid);
     let modify = ModifyTable::new(
         Arc::clone(&ctx.heap),

@@ -274,8 +274,7 @@ real wire protocol.
    `index_scan_round_trip.rs`, `cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint`,
    and `prepare_execute_round_trip.rs`. **Remaining gaps**:
    `EXPLAIN` / `EXPLAIN ANALYZE` (no `LogicalPlan::Explain` variant,
-   no session dispatch); `INSERT … SELECT` (`pipeline.rs:1314`
-   returns `Unsupported`); `INSERT … ON CONFLICT` and `RETURNING`
+   no session dispatch); `INSERT … ON CONFLICT` and `RETURNING`
    (`pipeline.rs:1292/1296` return `Unsupported`); `COPY` wire
    dispatch (`session/run.rs` has no `CopyData` flow); `LISTEN` /
    `NOTIFY` SQL surface (kernel `NotificationHub` ships, no
@@ -313,7 +312,7 @@ deployment can rely on.
 |-----------|:--:|:--:|:--:|:--:|
 | `CREATE TABLE t (...)` | ✅ | ✅ | ✅ | ✅ |
 | `INSERT INTO t VALUES (...)` | ✅ | ✅ | ✅ | ✅ |
-| `INSERT INTO t SELECT ...` | ✅ | ✅ | ❌ | ❌ |
+| `INSERT INTO t SELECT ...` | ✅ | ✅ | ✅ | ✅ (`insert_select_round_trip.rs`) |
 | `INSERT ... ON CONFLICT / RETURNING` | ✅ | ✅ | ❌ | ❌ |
 | `SELECT col, ...` (no agg, no join) | ✅ | ✅ | ✅ | ✅ |
 | `SELECT col FROM t WHERE col op lit` | ✅ | ✅ | ✅ | ✅ |
