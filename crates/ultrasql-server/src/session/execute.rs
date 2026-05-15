@@ -390,7 +390,8 @@ where
                     &self.state.tables,
                     Arc::clone(&self.state.heap),
                     Arc::clone(&self.state.txn_manager),
-                );
+                Some(self.cancel_flag.clone()),
+        );
                 self.finalise_autocommit(txn, outcome)
             }
             TxnState::InTransaction(mut txn) => {
@@ -402,7 +403,8 @@ where
                     &self.state.tables,
                     Arc::clone(&self.state.heap),
                     Arc::clone(&self.state.txn_manager),
-                );
+                Some(self.cancel_flag.clone()),
+        );
                 // Transition: Ok → InTransaction; Err → Failed. The txn
                 // remains alive in the CLOG (InProgress) until the user
                 // issues COMMIT/ROLLBACK.

@@ -296,6 +296,15 @@ pub struct Server {
     /// counter is a monotonic per-server allocator rather than a real
     /// kernel PID. Starts at 1 to leave 0 reserved for "unset".
     pub next_pid: std::sync::atomic::AtomicU32,
+    /// Registry of (pid, secret) → `CancelFlag` for in-flight queries.
+    ///
+    /// Populated by each [`Session`] on construction so a peer
+    /// `CancelRequest` carrying matching `(pid, secret)` flips the
+    /// session's `CancelFlag`. Operators that loop over batches
+    /// (`SeqScan`, `HashAggregate`) poll the flag between batches and
+    /// short-circuit with [`ultrasql_executor::ExecError::Cancelled`]
+    /// → SQLSTATE `57014`.
+    pub cancel_registry: Arc<cancel::CancelRegistry>,
 }
 
 /// Authentication policy for incoming connections.
@@ -375,6 +384,7 @@ impl Server {
             two_phase,
             auth: AuthConfig::Trust,
             notify_hub: Arc::new(notify::NotifyHub::new()),
+            cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
         }
     }
@@ -515,6 +525,7 @@ impl Server {
             two_phase,
             auth: AuthConfig::Trust,
             notify_hub: Arc::new(notify::NotifyHub::new()),
+            cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
         })
     }
@@ -720,6 +731,7 @@ fn run_plan_in_txn(
     tables: &SampleTables,
     heap: Arc<HeapAccess<BlankPageLoader>>,
     oracle: Arc<TransactionManager>,
+    cancel_flag: Option<ultrasql_executor::CancelFlag>,
 ) -> Result<SelectResult, ServerError> {
     let ctx = LowerCtx {
         tables,
@@ -734,6 +746,7 @@ fn run_plan_in_txn(
         xid: txn.current_xid(),
         command_id: txn.current_command,
         cte_buffers: std::collections::HashMap::new(),
+        cancel_flag,
     };
     match plan {
         LogicalPlan::Insert { .. } => {

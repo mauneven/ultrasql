@@ -177,11 +177,15 @@ where
             })
             .await?;
         }
-        // BackendKeyData — cancellation handle. Zeroed until we wire
-        // an actual cancel-request handler.
+        // BackendKeyData — cancellation handle. The session has already
+        // registered (pid, secret) with the server's `CancelRegistry`
+        // during `Session::new`; emit those values so a peer's
+        // `CancelRequest { process_id, secret_key }` round-trips against
+        // the same entry. PostgreSQL encodes both fields as signed `i32`
+        // on the wire; cast from the registry's `u32` keyspace.
         self.send(&BackendMessage::BackendKeyData {
-            process_id: 0,
-            secret_key: 0,
+            process_id: i32::from_le_bytes(self.pid.to_le_bytes()),
+            secret_key: i32::from_le_bytes(self.secret.to_le_bytes()),
         })
         .await?;
         self.send(&BackendMessage::ReadyForQuery { status: b'I' })

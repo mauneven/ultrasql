@@ -367,6 +367,7 @@ impl IndexFixture {
             xid: self.loader_xid,
             command_id: CommandId::FIRST,
             cte_buffers: HashMap::new(),
+        cancel_flag: None,
         }
     }
 }

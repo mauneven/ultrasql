@@ -269,12 +269,16 @@ pub fn lower_query(
             // through this same real-heap-aware path so the aggregate can
             // sit on top of a `SeqScan` over a persistent relation.
             let child = lower_query(input, ctx)?;
-            Ok(Box::new(HashAggregate::new(
+            let mut agg = HashAggregate::new(
                 child,
                 group_by.clone(),
                 aggregates.clone(),
                 schema.clone(),
-            )))
+            );
+            if let Some(flag) = &ctx.cancel_flag {
+                agg = agg.with_cancel_flag(flag.clone());
+            }
+            Ok(Box::new(agg))
         }
         LogicalPlan::SetOp {
             op,
@@ -380,6 +384,7 @@ pub(super) fn lower_cte(
         xid: ctx.xid,
         command_id: ctx.command_id,
         cte_buffers: child_buffers,
+            cancel_flag: ctx.cancel_flag.clone(),
     };
 
     lower_query(body, &child_ctx)

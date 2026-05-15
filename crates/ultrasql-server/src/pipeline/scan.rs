@@ -68,7 +68,7 @@ pub(super) fn lower_heap_scan(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Box<dyn
     // the heap has actually allocated through `insert`.
     let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
     let codec = RowCodec::new(entry.schema.clone());
-    let scan = SeqScan::new(
+    let mut scan = SeqScan::new(
         Arc::clone(&ctx.heap),
         rel,
         block_count,
@@ -76,6 +76,12 @@ pub(super) fn lower_heap_scan(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Box<dyn
         Arc::clone(&ctx.oracle),
         codec,
     );
+    // Thread the session's cancel flag through so `next_batch` returns
+    // `ExecError::Cancelled` (→ SQLSTATE 57014) when a peer
+    // `CancelRequest` flips it.
+    if let Some(flag) = &ctx.cancel_flag {
+        scan = scan.with_cancel_flag(flag.clone());
+    }
     Box::new(scan)
 }
 

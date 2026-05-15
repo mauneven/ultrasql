@@ -41,9 +41,16 @@ pub(crate) struct Session<RW> {
     /// Per-connection process id allocated at session construction.
     ///
     /// Used as the `pid` field in `BackendKeyData` and as the routing
-    /// key into [`crate::notify::NotifyHub`]. Stable for the lifetime
-    /// of the session.
+    /// key into [`crate::notify::NotifyHub`] / [`crate::cancel::
+    /// CancelRegistry`]. Stable for the lifetime of the session.
     pub(super) pid: u32,
+    /// Per-connection secret echoed in `BackendKeyData` and required by
+    /// the peer's `CancelRequest`. A mismatch silently fails the cancel.
+    pub(super) secret: u32,
+    /// Cancel flag clone for this session's in-flight query. Cloned
+    /// into every [`crate::pipeline::LowerCtx`] built for an Execute /
+    /// Simple Query so the executor can poll it between batches.
+    pub(super) cancel_flag: ultrasql_executor::CancelFlag,
     /// Receiver half of the per-connection notification channel.
     ///
     /// `LISTEN` registers the session under [`Self::pid`] and the hub
@@ -58,7 +65,13 @@ where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
     pub(crate) fn new(io: RW, state: Arc<Server>) -> Self {
-        let pid = state.allocate_pid();
+        // Register with the cancel registry first: it owns the canonical
+        // per-session (pid, secret) tuple. Using the registry's pid for
+        // the NotifyHub keeps a single u32 space for both subsystems,
+        // so a peer's `(pid, secret)` cancel and a `NOTIFY` to the same
+        // pid route consistently.
+        let cancel_flag = ultrasql_executor::CancelFlag::new();
+        let (pid, secret) = state.cancel_registry.register(cancel_flag.clone());
         // Register this session with the hub up front so a `NOTIFY`
         // racing against the `LISTEN` on this connection always finds a
         // live sender. Sending happens regardless of whether anyone is
@@ -72,16 +85,19 @@ where
             extended: crate::extended::ExtendedConnState::new(),
             txn_state: TxnState::Idle,
             pid,
+            secret,
+            cancel_flag,
             notify_rx,
         }
     }
 }
 
 impl<RW> Drop for Session<RW> {
-    /// Deregister the connection from the notification hub on drop so
-    /// the per-pid sender is released and any orphaned subscriptions
-    /// are removed.
+    /// Deregister the connection from the notification hub *and* the
+    /// cancel registry on drop so the per-pid sender is released and any
+    /// orphaned subscriptions are removed.
     fn drop(&mut self) {
         self.state.notify_hub.deregister_connection(self.pid);
+        self.state.cancel_registry.deregister(self.pid);
     }
 }

@@ -119,6 +119,7 @@ where
             &self.state.tables,
             Arc::clone(&self.state.heap),
             Arc::clone(&self.state.txn_manager),
+        Some(self.cancel_flag.clone()),
         );
         // Always commit the read-only ANALYZE txn — we don't surface
         // its results, only the row count buried in the `SelectResult`.

@@ -207,6 +207,13 @@ pub struct LowerCtx<'a> {
     /// not need to opt in; the field flows through recursive lowering
     /// for free.
     pub cte_buffers: HashMap<String, CteBuffer>,
+    /// Per-statement cancel flag clone. The session's `CancelRegistry`
+    /// entry holds the canonical flag; this is a shared clone the
+    /// lowerer threads into cancellation-aware operators (`SeqScan`,
+    /// `HashAggregate`) via their `with_cancel_flag` builders. `None`
+    /// for callers that do not participate in a wire session (tests,
+    /// in-process fixtures).
+    pub cancel_flag: Option<ultrasql_executor::CancelFlag>,
 }
 
 /// Materialised non-recursive CTE binding.

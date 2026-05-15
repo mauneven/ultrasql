@@ -121,6 +121,7 @@ pub(super) fn lower_recursive_cte(
             xid: ctx.xid,
             command_id: ctx.command_id,
             cte_buffers: child_buffers,
+            cancel_flag: ctx.cancel_flag.clone(),
         };
 
         let mut term_op = lower_query(recursive_term, &child_ctx)?;
@@ -169,6 +170,7 @@ pub(super) fn lower_recursive_cte(
         xid: ctx.xid,
         command_id: ctx.command_id,
         cte_buffers: body_buffers,
+        cancel_flag: ctx.cancel_flag.clone(),
     };
     lower_query(body, &body_ctx)
 }

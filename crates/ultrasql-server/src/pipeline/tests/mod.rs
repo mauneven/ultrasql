@@ -199,6 +199,7 @@ fn lower_query_sorts_values_in_ascending_order() {
         xid: Xid::new(0),
         command_id: CommandId::FIRST,
         cte_buffers: HashMap::new(),
+        cancel_flag: None,
     };
 
     let mut op = lower_query(&sort_plan, &ctx).expect("lowers");
@@ -318,6 +319,7 @@ pub(super) fn synthetic_ctx(tables: &SampleTables) -> LowerCtx<'_> {
         xid: Xid::new(0),
         command_id: CommandId::FIRST,
         cte_buffers: HashMap::new(),
+        cancel_flag: None,
     }
 }
 

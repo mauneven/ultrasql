@@ -414,6 +414,7 @@ where
                     xid: txn.current_xid(),
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
+            cancel_flag: Some(self.cancel_flag.clone()),
                 };
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
@@ -450,6 +451,7 @@ where
                     xid: txn.current_xid(),
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
+            cancel_flag: Some(self.cancel_flag.clone()),
                 };
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
