@@ -26,7 +26,9 @@ use ultrasql_protocol::{BackendMessage, FieldDescription, encode_backend};
 use ultrasql_vec::column::Column;
 
 use crate::error::ServerError;
-use crate::wire_writer::{write_data_row, write_int32_pair_data_rows};
+use crate::wire_writer::{
+    write_data_row, write_int32_int64_pair_data_rows, write_int32_pair_data_rows,
+};
 
 /// PostgreSQL type OID for `bool`. Pulled from `pg_type.dat`.
 const PG_OID_BOOL: u32 = 16;
@@ -216,6 +218,16 @@ pub fn stream_select(op: &mut dyn Operator, sink: &mut BytesMut) -> Result<u64, 
                 rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
                 continue;
             }
+        }
+        // Fast path: `(Int32, Int64)` is the
+        // `WindowAgg::try_columnar_row_number` output shape used by
+        // `SELECT id, row_number() OVER (ORDER BY x) FROM t`. The
+        // writer accepts optional validity bitmaps so it stays
+        // correct when either side carries NULLs.
+        if let [Column::Int32(a), Column::Int64(b)] = columns {
+            write_int32_int64_pair_data_rows(sink, a.data(), a.nulls(), b.data(), b.nulls());
+            rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+            continue;
         }
         for row in 0..row_count {
             write_data_row(sink, columns, row);

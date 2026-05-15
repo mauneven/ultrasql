@@ -179,6 +179,171 @@ pub(crate) fn write_int32_pair_data_rows(sink: &mut BytesMut, a: &[i32], b: &[i3
     }
 }
 
+/// Fast bulk DataRow writer for the common `(Int32, Int64)` shape.
+///
+/// Counterpart to [`write_int32_pair_data_rows`] for the window /
+/// `row_number()` output schema: `(input INT, row_number BIGINT)`.
+/// The bench query `SELECT id, row_number() OVER (ORDER BY x) FROM t`
+/// against `(id INT, x INT)` projects to exactly this shape, so the
+/// `WindowAgg::try_columnar_row_number` columnar fast path lands here.
+///
+/// Streams every row of a two-column `(Int32, Int64)` batch into
+/// `sink` with no per-row enum dispatch and no per-cell length
+/// placeholder back-fill. Both columns' bytes share a single
+/// `BytesMut::reserve` call sized to the worst-case wire footprint
+/// (37 + 9 = 46 bytes per row: 11-byte i32 vs. 20-byte i64 maxima).
+///
+/// The hot loop uses raw pointer writes against a freshly reserved
+/// region of `sink`. Every offset is bounded above by the
+/// `n * MAX_ROW_BYTES` reserve at the top of the function, so we can
+/// safely skip the per-byte slice bounds checks the safe `[off]`
+/// indexing would emit.
+///
+/// `a_nulls` / `b_nulls` track the optional validity bitmaps from
+/// the source columns. When both are `None` the inner loop is the
+/// branch-free path; when either side carries a bitmap we fall through
+/// to a per-cell `is_null` check that mirrors the slow-path NULL
+/// encoding (`-1` length, no payload bytes).
+///
+/// Caller verifies the shape upfront (see
+/// [`crate::result_encoder::stream_select`]).
+pub(crate) fn write_int32_int64_pair_data_rows(
+    sink: &mut BytesMut,
+    a: &[i32],
+    a_nulls: Option<&Bitmap>,
+    b: &[i64],
+    b_nulls: Option<&Bitmap>,
+) {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    if n == 0 {
+        return;
+    }
+    // Worst-case wire size per row: 1 + 4 + 2 (header) + (4 + 11)
+    // (i32 cell) + (4 + 20) (i64 cell) = 46 bytes. `-2147483648` is
+    // the widest i32 text and `-9223372036854775808` the widest i64
+    // text. Reserve the worst case once to skip every mid-loop
+    // resize.
+    const MAX_ROW_BYTES: usize = 46;
+    sink.reserve(n * MAX_ROW_BYTES);
+
+    let base_len = sink.len();
+    // SAFETY: `reserve(n * MAX_ROW_BYTES)` guarantees the spare region
+    // starting at `base_len` has at least `n * MAX_ROW_BYTES`
+    // writable bytes. We write straight through a raw pointer and
+    // `set_len` once at the end — no aliased mutable borrows, every
+    // offset is bounded by `n * MAX_ROW_BYTES`.
+    let dst_base: *mut u8 = unsafe { sink.as_mut_ptr().add(base_len) };
+
+    let mut off: usize = 0;
+    let mut scratch_a = [0u8; 12];
+    let mut scratch_b = [0u8; 20];
+
+    // Fast path: no validity bitmaps anywhere. The inner loop is
+    // branch-free per cell; the optimiser can hoist the bitmap-load
+    // out of the hot loop entirely.
+    if a_nulls.is_none() && b_nulls.is_none() {
+        for row in 0..n {
+            // SAFETY: bounded by the per-row 46-byte reserve above.
+            unsafe {
+                let dst = dst_base.add(off);
+                // DataRow tag.
+                *dst = DATA_ROW_TAG;
+                // 4-byte length placeholder; back-filled below once
+                // we know the payload size.
+                let length_ptr = dst.add(1);
+                // ncols = 2 (big-endian i16).
+                *dst.add(5) = 0;
+                *dst.add(6) = 2;
+                off += 7; // tag + length placeholder + ncols
+
+                let a_text = format_i32_into(&mut scratch_a, a[row]);
+                let a_len = a_text.len();
+                let a_len_be = i32_from_usize(a_len).to_be_bytes();
+                std::ptr::copy_nonoverlapping(a_len_be.as_ptr(), dst_base.add(off), 4);
+                off += 4;
+                std::ptr::copy_nonoverlapping(a_text.as_ptr(), dst_base.add(off), a_len);
+                off += a_len;
+
+                let b_text = format_i64_into(&mut scratch_b, b[row]);
+                let b_len = b_text.len();
+                let b_len_be = i32_from_usize(b_len).to_be_bytes();
+                std::ptr::copy_nonoverlapping(b_len_be.as_ptr(), dst_base.add(off), 4);
+                off += 4;
+                std::ptr::copy_nonoverlapping(b_text.as_ptr(), dst_base.add(off), b_len);
+                off += b_len;
+
+                let row_bytes = 7 + 4 + a_len + 4 + b_len;
+                let length = i32_from_usize(row_bytes - 1).to_be_bytes();
+                std::ptr::copy_nonoverlapping(length.as_ptr(), length_ptr, 4);
+            }
+        }
+    } else {
+        // Slow path: at least one column carries a validity bitmap.
+        // Per-cell NULL check mirrors the legacy `write_cell` path.
+        // `Bitmap::get(i)` returns true for valid and false for null
+        // (matches `is_null` in the legacy path).
+        for row in 0..n {
+            let a_null = a_nulls.is_some_and(|nulls| !nulls.get(row));
+            let b_null = b_nulls.is_some_and(|nulls| !nulls.get(row));
+            // SAFETY: bounded by the per-row 46-byte reserve above.
+            unsafe {
+                let dst = dst_base.add(off);
+                *dst = DATA_ROW_TAG;
+                let length_ptr = dst.add(1);
+                *dst.add(5) = 0;
+                *dst.add(6) = 2;
+                off += 7;
+
+                let a_payload_len: usize;
+                if a_null {
+                    // -1 length, no payload bytes.
+                    let neg_one = (-1_i32).to_be_bytes();
+                    std::ptr::copy_nonoverlapping(neg_one.as_ptr(), dst_base.add(off), 4);
+                    off += 4;
+                    a_payload_len = 0;
+                } else {
+                    let a_text = format_i32_into(&mut scratch_a, a[row]);
+                    let a_len = a_text.len();
+                    let a_len_be = i32_from_usize(a_len).to_be_bytes();
+                    std::ptr::copy_nonoverlapping(a_len_be.as_ptr(), dst_base.add(off), 4);
+                    off += 4;
+                    std::ptr::copy_nonoverlapping(a_text.as_ptr(), dst_base.add(off), a_len);
+                    off += a_len;
+                    a_payload_len = a_len;
+                }
+
+                let b_payload_len: usize;
+                if b_null {
+                    let neg_one = (-1_i32).to_be_bytes();
+                    std::ptr::copy_nonoverlapping(neg_one.as_ptr(), dst_base.add(off), 4);
+                    off += 4;
+                    b_payload_len = 0;
+                } else {
+                    let b_text = format_i64_into(&mut scratch_b, b[row]);
+                    let b_len = b_text.len();
+                    let b_len_be = i32_from_usize(b_len).to_be_bytes();
+                    std::ptr::copy_nonoverlapping(b_len_be.as_ptr(), dst_base.add(off), 4);
+                    off += 4;
+                    std::ptr::copy_nonoverlapping(b_text.as_ptr(), dst_base.add(off), b_len);
+                    off += b_len;
+                    b_payload_len = b_len;
+                }
+
+                let row_bytes = 7 + 4 + a_payload_len + 4 + b_payload_len;
+                let length = i32_from_usize(row_bytes - 1).to_be_bytes();
+                std::ptr::copy_nonoverlapping(length.as_ptr(), length_ptr, 4);
+            }
+        }
+    }
+    // SAFETY: `off` ≤ `n * MAX_ROW_BYTES` because every row writes
+    // at most MAX_ROW_BYTES; `dst_base` is the spare region of
+    // `sink` we reserved above.
+    unsafe {
+        sink.set_len(base_len + off);
+    }
+}
+
 /// Emit one column cell. NULL is encoded as length `-1` with no value
 /// bytes; everything else gets a length-prefixed text-format payload.
 fn write_cell(sink: &mut BytesMut, col: &Column, row: usize) {
@@ -557,8 +722,20 @@ mod tests {
         }
         // Cover several digit counts up to i32::MAX boundary.
         for &v in &[
-            99_i32, 100, 999, 1_000, 9_999, 10_000, 99_999, 100_000, 999_999, 1_000_000,
-            i32::MAX - 1, i32::MAX, i32::MIN + 1, i32::MIN,
+            99_i32,
+            100,
+            999,
+            1_000,
+            9_999,
+            10_000,
+            99_999,
+            100_000,
+            999_999,
+            1_000_000,
+            i32::MAX - 1,
+            i32::MAX,
+            i32::MIN + 1,
+            i32::MIN,
         ] {
             let mut scratch = [0u8; 12];
             let actual = format_i32_into(&mut scratch, v);
@@ -624,6 +801,178 @@ mod tests {
     fn write_int32_pair_data_rows_empty_input_emits_nothing() {
         let mut actual = BytesMut::new();
         write_int32_pair_data_rows(&mut actual, &[], &[]);
+        assert!(actual.is_empty());
+    }
+
+    /// `write_int32_int64_pair_data_rows` must produce byte-identical
+    /// output to the canonical `encode_backend(BackendMessage::DataRow)`
+    /// for every row of the input. Mirrors the `select_scan_10k` test
+    /// against the `(Int32, Int64)` shape used by
+    /// `WindowAgg::try_columnar_row_number`.
+    #[test]
+    fn write_int32_int64_pair_data_rows_matches_canonical_encoder() {
+        let a: Vec<i32> = vec![0, 1, -1, 12345, -98765, i32::MAX, i32::MIN, 7];
+        let b: Vec<i64> = vec![
+            i64::MIN,
+            i64::MAX,
+            -1,
+            0,
+            1,
+            1_000_000_000_000,
+            -1_000_000_000_000,
+            8,
+        ];
+
+        let mut canonical = BytesMut::new();
+        for (av, bv) in a.iter().zip(b.iter()) {
+            let msg = BackendMessage::DataRow {
+                columns: vec![
+                    Some(av.to_string().into_bytes()),
+                    Some(bv.to_string().into_bytes()),
+                ],
+            };
+            encode_backend(&msg, &mut canonical);
+        }
+
+        let mut actual = BytesMut::new();
+        write_int32_int64_pair_data_rows(&mut actual, &a, None, &b, None);
+
+        assert_eq!(&actual[..], &canonical[..]);
+    }
+
+    /// Sweep the two-digit-boundary region for both columns to flush
+    /// out any off-by-one in the `idx -= 2 / idx -= 1` book-keeping
+    /// across the i32+i64 boundary.
+    #[test]
+    fn write_int32_int64_pair_data_rows_sweep_two_digit_boundary() {
+        let mut a: Vec<i32> = Vec::with_capacity(512);
+        let mut b: Vec<i64> = Vec::with_capacity(512);
+        // Cover [-128, 128] across both digit-count transitions in
+        // each column, plus a few wide values.
+        for v in -128_i32..=128_i32 {
+            a.push(v);
+            b.push(i64::from(v).wrapping_mul(1_000_000));
+        }
+        // Tack on the i32/i64 extrema so the worst-case scratch
+        // widths are exercised.
+        let extras_a: &[i32] = &[i32::MIN, i32::MAX, 0, -1, 99, 100, -99, -100];
+        let extras_b: &[i64] = &[i64::MIN, i64::MAX, 0, -1, 99, 100, -99, -100];
+        for (av, bv) in extras_a.iter().zip(extras_b.iter()) {
+            a.push(*av);
+            b.push(*bv);
+        }
+
+        let mut canonical = BytesMut::new();
+        for (av, bv) in a.iter().zip(b.iter()) {
+            let msg = BackendMessage::DataRow {
+                columns: vec![
+                    Some(av.to_string().into_bytes()),
+                    Some(bv.to_string().into_bytes()),
+                ],
+            };
+            encode_backend(&msg, &mut canonical);
+        }
+
+        let mut actual = BytesMut::new();
+        write_int32_int64_pair_data_rows(&mut actual, &a, None, &b, None);
+
+        assert_eq!(&actual[..], &canonical[..]);
+    }
+
+    /// `write_int32_int64_pair_data_rows` must still produce the
+    /// canonical bytes when either column carries a validity bitmap.
+    #[test]
+    fn write_int32_int64_pair_data_rows_handles_nulls() {
+        let a: Vec<i32> = vec![10, 20, 30, 40];
+        let b: Vec<i64> = vec![100, 200, 300, 400];
+        // a: nulls = [valid, null, valid, valid]
+        // b: nulls = [valid, valid, null, valid]
+        let mut a_nulls = Bitmap::new(4, false);
+        a_nulls.set(0, true);
+        a_nulls.set(1, false);
+        a_nulls.set(2, true);
+        a_nulls.set(3, true);
+        let mut b_nulls = Bitmap::new(4, false);
+        b_nulls.set(0, true);
+        b_nulls.set(1, true);
+        b_nulls.set(2, false);
+        b_nulls.set(3, true);
+
+        // Canonical: encode each row through the slow path.
+        let mut canonical = BytesMut::new();
+        let expected_a: &[Option<&[u8]>] = &[Some(b"10"), None, Some(b"30"), Some(b"40")];
+        let expected_b: &[Option<&[u8]>] = &[Some(b"100"), Some(b"200"), None, Some(b"400")];
+        for i in 0..4 {
+            let columns = vec![
+                expected_a[i].map(|s| s.to_vec()),
+                expected_b[i].map(|s| s.to_vec()),
+            ];
+            encode_backend(&BackendMessage::DataRow { columns }, &mut canonical);
+        }
+
+        let mut actual = BytesMut::new();
+        write_int32_int64_pair_data_rows(&mut actual, &a, Some(&a_nulls), &b, Some(&b_nulls));
+
+        assert_eq!(&actual[..], &canonical[..]);
+    }
+
+    /// Byte-equivalence with the generic `write_data_row` path on a
+    /// 2 048-row mixed sample. This is the test specified in the
+    /// task description: it exercises the same operator-level shape
+    /// (`(Int32, Int64)` non-nullable batch) that the
+    /// `WindowAgg::try_columnar_row_number` path emits.
+    #[test]
+    fn write_int32_int64_pair_data_rows_byte_equivalent_to_generic_path_2048_rows() {
+        // Mixed sample: positive, negative, zero, large magnitudes.
+        // `i32` values cycle through a 7-element pattern so each row
+        // has a different text length; `i64` values are
+        // `row_number()`-shaped (1..=N) plus the extrema.
+        let mut a: Vec<i32> = Vec::with_capacity(2048);
+        let mut b: Vec<i64> = Vec::with_capacity(2048);
+        let pattern_a: &[i32] = &[0, 1, -1, 12345, -98765, i32::MAX, i32::MIN];
+        for i in 0..2048 {
+            a.push(pattern_a[i % pattern_a.len()]);
+            // Spread `b` across small + huge so every two-digit
+            // boundary is hit at least once.
+            let n = i64::try_from(i).expect("2048 fits in i64");
+            b.push(if i % 100 == 0 {
+                i64::MAX - n
+            } else if i % 50 == 0 {
+                i64::MIN + n
+            } else {
+                n + 1
+            });
+        }
+
+        // Build the canonical bytes via the generic
+        // `write_data_row` path that the slow fallback uses.
+        use ultrasql_vec::column::NumericColumn;
+        let cols = vec![
+            Column::Int32(NumericColumn::from_data(a.clone())),
+            Column::Int64(NumericColumn::from_data(b.clone())),
+        ];
+        let mut generic = BytesMut::new();
+        for row in 0..2048 {
+            write_data_row(&mut generic, &cols, row);
+        }
+
+        // Build the fast-path bytes.
+        let mut fast = BytesMut::new();
+        write_int32_int64_pair_data_rows(&mut fast, &a, None, &b, None);
+
+        assert_eq!(
+            &fast[..],
+            &generic[..],
+            "fast-path bytes diverge from generic path"
+        );
+    }
+
+    /// Empty input must produce zero bytes — same edge-case contract
+    /// as the `(Int32, Int32)` writer.
+    #[test]
+    fn write_int32_int64_pair_data_rows_empty_input_emits_nothing() {
+        let mut actual = BytesMut::new();
+        write_int32_int64_pair_data_rows(&mut actual, &[], None, &[], None);
         assert!(actual.is_empty());
     }
 }
