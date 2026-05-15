@@ -83,26 +83,38 @@ where
         // catalog provides the legacy fallback.
         let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
 
-        // `ANALYZE [table_name [(col, ...)]]` is accepted as a wire-level
-        // no-op so PostgreSQL clients can issue it without an error. The
-        // real cost-based stats refresh runs through
-        // `ultrasql_optimizer::AnalyzeRunner` on the next DDL pass —
-        // §3.1 covers the v0.6 acceptance path; this shim keeps the
-        // wire surface PostgreSQL-compatible until then.
+        // Wire-level statement no-ops kept for PostgreSQL compatibility
+        // while the real plumbing lands behind the same names:
+        //
+        // - `ANALYZE [table]` (§3.1): the `AnalyzeRunner` kernel exists
+        //   but the `pg_statistic` writeback is a follow-up.
+        // - `CREATE STATISTICS [name] ON cols FROM t` (§3.3): the
+        //   `pg_statistic_ext` row layout exists; multi-column MCV /
+        //   dependency-coefficient population is a follow-up.
+        // - `VACUUM [table]` (§3.2-aligned): manual vacuum surface for
+        //   ORMs / migration tools; the autovacuum trigger is a
+        //   follow-up.
+        //
+        // Each shim short-circuits before the parser to avoid forcing
+        // every layer to grow new exhaustive arms today.
         let trimmed = sql.trim_start();
-        if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("analyze") {
-            // Make sure the next char is whitespace or end-of-statement so
-            // we do not eat statements that merely *contain* the word
-            // "analyze" (e.g. `SELECT analyze_helper FROM t`).
-            let rest = &trimmed[7..];
-            if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';') {
-                return Ok(result_encoder::SelectResult {
-                    messages: vec![BackendMessage::CommandComplete {
-                        tag: "ANALYZE".to_string(),
-                    }],
-                    streamed_body: None,
-                    rows: 0,
-                });
+        for (head, tag) in [
+            ("analyze", "ANALYZE"),
+            ("vacuum", "VACUUM"),
+            ("create statistics", "CREATE STATISTICS"),
+        ] {
+            let len = head.len();
+            if trimmed.len() >= len && trimmed[..len].eq_ignore_ascii_case(head) {
+                let rest = &trimmed[len..];
+                if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';') {
+                    return Ok(result_encoder::SelectResult {
+                        messages: vec![BackendMessage::CommandComplete {
+                            tag: tag.to_string(),
+                        }],
+                        streamed_body: None,
+                        rows: 0,
+                    });
+                }
             }
         }
 
