@@ -105,6 +105,18 @@ pub enum AggregateFunc {
     StringAgg,
     /// `ARRAY_AGG(expr)`.
     ArrayAgg,
+    /// `STDDEV_SAMP(expr)` / `STDDEV(expr)` — sample standard
+    /// deviation. `NULL` for fewer than two non-null inputs.
+    StddevSamp,
+    /// `STDDEV_POP(expr)` — population standard deviation. `NULL`
+    /// when no non-null input was seen.
+    StddevPop,
+    /// `VAR_SAMP(expr)` / `VARIANCE(expr)` — sample variance.
+    /// `NULL` for fewer than two non-null inputs.
+    VarSamp,
+    /// `VAR_POP(expr)` — population variance. `NULL` when no
+    /// non-null input was seen.
+    VarPop,
 }
 
 /// A single aggregate call in a `GROUP BY` / aggregation node.
@@ -1036,6 +1048,10 @@ impl LogicalPlan {
                         AggregateFunc::BoolOr => "bool_or",
                         AggregateFunc::StringAgg => "string_agg",
                         AggregateFunc::ArrayAgg => "array_agg",
+                        AggregateFunc::StddevSamp => "stddev_samp",
+                        AggregateFunc::StddevPop => "stddev_pop",
+                        AggregateFunc::VarSamp => "var_samp",
+                        AggregateFunc::VarPop => "var_pop",
                     };
                     if let Some(arg) = &agg.arg {
                         let dist = if agg.distinct { "DISTINCT " } else { "" };

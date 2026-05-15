@@ -68,7 +68,8 @@ pub(crate) enum AggState {
     PercentileDisc(Vec<f64>, f64 /* fraction */),
 }
 
-const fn init_state(agg: &LogicalAggregateExpr) -> AggState {
+#[allow(clippy::missing_const_for_fn)]
+fn init_state(agg: &LogicalAggregateExpr) -> AggState {
     match agg.func {
         AggregateFunc::CountStar => AggState::CountStar(0),
         AggregateFunc::Count => AggState::Count(0),
@@ -80,6 +81,12 @@ const fn init_state(agg: &LogicalAggregateExpr) -> AggState {
         AggregateFunc::BoolOr => AggState::BoolOr(None),
         AggregateFunc::StringAgg => AggState::StringAgg(Vec::new(), String::new()),
         AggregateFunc::ArrayAgg => AggState::ArrayAgg(Vec::new()),
+        AggregateFunc::StddevSamp | AggregateFunc::StddevPop => {
+            AggState::Stddev(0.0, 0.0, 0)
+        }
+        AggregateFunc::VarSamp | AggregateFunc::VarPop => {
+            AggState::Variance(0.0, 0.0, 0)
+        }
     }
 }
 

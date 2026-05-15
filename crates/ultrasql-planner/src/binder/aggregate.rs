@@ -42,6 +42,12 @@ pub(super) fn is_aggregate_name(name: &str) -> bool {
             | "bool_or"
             | "string_agg"
             | "array_agg"
+            | "stddev"
+            | "stddev_samp"
+            | "stddev_pop"
+            | "variance"
+            | "var_samp"
+            | "var_pop"
     )
 }
 
@@ -57,6 +63,12 @@ fn classify_aggregate(name: &str, args_empty: bool) -> Option<AggregateFunc> {
         "bool_or" => Some(AggregateFunc::BoolOr),
         "string_agg" => Some(AggregateFunc::StringAgg),
         "array_agg" => Some(AggregateFunc::ArrayAgg),
+        // PostgreSQL: STDDEV is an alias for STDDEV_SAMP, VARIANCE
+        // for VAR_SAMP. Match that.
+        "stddev" | "stddev_samp" => Some(AggregateFunc::StddevSamp),
+        "stddev_pop" => Some(AggregateFunc::StddevPop),
+        "variance" | "var_samp" => Some(AggregateFunc::VarSamp),
+        "var_pop" => Some(AggregateFunc::VarPop),
         _ => None,
     }
 }
@@ -81,6 +93,11 @@ fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> DataType {
         AggregateFunc::BoolAnd | AggregateFunc::BoolOr => DataType::Bool,
         AggregateFunc::StringAgg => DataType::Text { max_len: None },
         AggregateFunc::ArrayAgg => DataType::Array(Box::new(arg_type)),
+        // STDDEV / VARIANCE always return double precision.
+        AggregateFunc::StddevSamp
+        | AggregateFunc::StddevPop
+        | AggregateFunc::VarSamp
+        | AggregateFunc::VarPop => DataType::Float64,
     }
 }
 

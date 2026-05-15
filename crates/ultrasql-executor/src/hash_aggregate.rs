@@ -827,6 +827,20 @@ enum AggState {
     StringAgg(Vec<String>, String),
     /// `ARRAY_AGG(expr)` — accumulated non-NULL values.
     ArrayAgg(Vec<Value>),
+    /// Welford running aggregate for STDDEV / VARIANCE: `(count,
+    /// mean, M2)` where `M2` is the running sum of squared
+    /// differences from the mean. Shared between `STDDEV_SAMP`,
+    /// `STDDEV_POP`, `VAR_SAMP`, `VAR_POP`; the variant carries
+    /// the requested final shape so `finalise` knows whether to
+    /// divide by `n` or `n - 1` and whether to take the square
+    /// root.
+    Welford {
+        count: i64,
+        mean: f64,
+        m2: f64,
+        sample: bool,
+        sqrt: bool,
+    },
 }
 
 /// Initialise one [`AggState`] for the given aggregate descriptor.
@@ -843,6 +857,34 @@ fn init_state_for(agg: &LogicalAggregateExpr) -> AggState {
         AggregateFunc::BoolOr => AggState::BoolOr(None),
         AggregateFunc::StringAgg => AggState::StringAgg(Vec::new(), String::new()),
         AggregateFunc::ArrayAgg => AggState::ArrayAgg(Vec::new()),
+        AggregateFunc::StddevSamp => AggState::Welford {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            sample: true,
+            sqrt: true,
+        },
+        AggregateFunc::StddevPop => AggState::Welford {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            sample: false,
+            sqrt: true,
+        },
+        AggregateFunc::VarSamp => AggState::Welford {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            sample: true,
+            sqrt: false,
+        },
+        AggregateFunc::VarPop => AggState::Welford {
+            count: 0,
+            mean: 0.0,
+            m2: 0.0,
+            sample: false,
+            sqrt: false,
+        },
     }
 }
 
@@ -952,8 +994,35 @@ fn accumulate(
                 }
             }
         }
+        AggState::Welford { count, mean, m2, .. } => {
+            if let Some(v) = arg_val {
+                if let Some(x) = value_as_f64(&v) {
+                    // Welford's online algorithm. Numerically stable
+                    // even when `count` is large; avoids the
+                    // catastrophic cancellation of the naive
+                    // sum-of-squares minus square-of-sum recipe.
+                    *count = count.saturating_add(1);
+                    let delta = x - *mean;
+                    *mean += delta / *count as f64;
+                    let delta2 = x - *mean;
+                    *m2 += delta * delta2;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Coerce a numeric `Value` to `f64` for floating-point folds.
+fn value_as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int16(x) => Some(f64::from(*x)),
+        Value::Int32(x) => Some(f64::from(*x)),
+        Value::Int64(x) => Some(*x as f64),
+        Value::Float32(x) => Some(f64::from(*x)),
+        Value::Float64(x) => Some(*x),
+        _ => None,
+    }
 }
 
 /// Finalise an [`AggState`] into its result [`Value`].
@@ -989,6 +1058,19 @@ fn finalise(state: &AggState) -> Value {
                     .collect::<Vec<_>>()
                     .join(",")
             ))
+        }
+        AggState::Welford { count, m2, sample, sqrt, .. } => {
+            // Sample variance/stddev needs n - 1 in the denominator
+            // and is undefined for fewer than two non-NULL inputs.
+            // Population variance/stddev is defined for any non-zero
+            // count.
+            let n = *count;
+            let denom = if *sample { n - 1 } else { n };
+            if denom <= 0 {
+                return Value::Null;
+            }
+            let var = m2 / denom as f64;
+            Value::Float64(if *sqrt { var.sqrt() } else { var })
         }
     }
 }
