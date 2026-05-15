@@ -181,6 +181,9 @@ impl ServerError {
             Self::TransactionAborted => "25P02",              // in_failed_sql_transaction
             Self::Savepoint(_) => "25P01",                    // no_active_sql_transaction
             Self::SavepointNotFound(_) => "3B001",            // invalid_savepoint_specification
+            // NOT-NULL constraint violation surfaced by `ModifyTable`
+            // on INSERT. Mirrors PostgreSQL's `not_null_violation`.
+            Self::Execute(ultrasql_executor::ExecError::NotNullViolation(_)) => "23502",
             // Internal-style: Execute/IO/Protocol/UnexpectedEof and the
             // dynamic Ddl message all map to XX000.
             _ => "XX000",

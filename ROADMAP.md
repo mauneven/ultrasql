@@ -944,7 +944,7 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [ ] Auto-summarize on vacuum
 
 ### Constraints
-- [x] `NOT NULL`, `CHECK`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY` — kernel in `crates/ultrasql-storage/src/constraints.rs`: `Constraint` enum (`constraints.rs:157`) covers NotNull / Check / PrimaryKey / ForeignKey / UniqueSet; `ConstraintChecker` struct (`constraints.rs:256`) is the runtime enforcer; `ScalarExpr` (`constraints.rs:119`) is the CHECK-expr IR. ⚠️ Not yet invoked from the INSERT / UPDATE executor path — DDL parses constraints, kernel can validate, executor does not call it
+- [x] `NOT NULL`, `CHECK`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY` — kernel in `crates/ultrasql-storage/src/constraints.rs`: `Constraint` enum (`constraints.rs:157`) covers NotNull / Check / PrimaryKey / ForeignKey / UniqueSet; `ConstraintChecker` struct (`constraints.rs:256`) is the runtime enforcer; `ScalarExpr` (`constraints.rs:119`) is the CHECK-expr IR. ✅ `NOT NULL` enforced at the executor via `ModifyTable::Insert` → `ExecError::NotNullViolation` → SQLSTATE `23502` (`crates/ultrasql-server/tests/constraint_round_trip.rs`); CHECK / UNIQUE / FK enforcement at the executor remains v0.8 work because `TableEntry` does not yet carry the per-relation constraint vector
 - [ ] `DEFAULT expr` evaluated at INSERT when column omitted
 - [ ] FK referential action wiring:
   - [ ] `ON DELETE CASCADE / SET NULL / SET DEFAULT / RESTRICT / NO ACTION`

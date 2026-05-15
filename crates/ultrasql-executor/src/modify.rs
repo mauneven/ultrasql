@@ -40,6 +40,21 @@ use crate::filter_op::batch_to_rows;
 use crate::row_codec::RowCodec;
 use crate::{ExecError, Operator};
 
+/// Enforce schema-level NOT-NULL constraints over a decoded `INSERT`
+/// row before it is encoded and handed to the heap.
+///
+/// Surfaces [`ExecError::NotNullViolation`] on the first non-nullable
+/// column carrying [`Value::Null`]; the caller maps this onto
+/// PostgreSQL SQLSTATE `23502`.
+fn check_not_null_violations(row: &[Value], schema: &Schema) -> Result<(), ExecError> {
+    for (col, field) in row.iter().zip(schema.fields().iter()) {
+        if !field.nullable && matches!(col, Value::Null) {
+            return Err(ExecError::NotNullViolation(field.name.clone()));
+        }
+    }
+    Ok(())
+}
+
 /// Columnar UPDATE fast-path descriptor for the
 /// `UPDATE t SET col_i = col_i + literal` shape over an `(Int32, Int32)`
 /// relation schema.
@@ -407,8 +422,10 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     let child_schema = self.child.schema().clone();
                     let rows = batch_to_rows(&batch, &child_schema)
                         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                    let target_schema = self.codec.schema();
                     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
                     for row in &rows {
+                        check_not_null_violations(row, target_schema)?;
                         let payload = self
                             .codec
                             .encode(row)

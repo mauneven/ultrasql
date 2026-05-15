@@ -174,6 +174,12 @@ pub enum ExecError {
     /// to a stable SQLSTATE or surface a descriptive error message.
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
+
+    /// A NOT-NULL constraint was violated by an `INSERT` row payload.
+    /// The string carries the column name. Maps to PostgreSQL SQLSTATE
+    /// `23502` (`not_null_violation`).
+    #[error("null value in column \"{0}\" violates not-null constraint")]
+    NotNullViolation(String),
 }
 
 /// Physical execution operator.
