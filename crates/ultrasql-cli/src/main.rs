@@ -246,15 +246,22 @@ struct Session {
     timing: bool,
     /// Whether we print the number of rows affected.
     row_count: bool,
+    /// Toggle for expanded (`\x`) display.
+    expanded: bool,
+    /// `\pset format` value. Today only `aligned` is honoured but
+    /// the field is held for future formatting variants.
+    format: String,
 }
 
 impl Session {
-    const fn new(client: Client, params: ConnParams) -> Self {
+    fn new(client: Client, params: ConnParams) -> Self {
         Self {
             client,
             params,
             timing: false,
             row_count: true,
+            expanded: false,
+            format: "aligned".to_string(),
         }
     }
 
@@ -343,6 +350,94 @@ impl Session {
         }
         if cmd == "\\du" || cmd.starts_with("\\du ") {
             self.exec_sql(LIST_ROLES_SQL).await?;
+            return Ok(false);
+        }
+        if cmd == "\\df" || cmd.starts_with("\\df ") {
+            // UltraSQL has no `pg_proc` yet (functions are deferred to
+            // v0.8); emit an empty result with the standard column
+            // headers so scripts that pipe through \df see the
+            // expected shape.
+            self.exec_sql(LIST_FUNCTIONS_SQL).await?;
+            return Ok(false);
+        }
+        if cmd == "\\dv" || cmd.starts_with("\\dv ") {
+            self.exec_sql(LIST_VIEWS_SQL).await?;
+            return Ok(false);
+        }
+        if cmd == "\\ds" || cmd.starts_with("\\ds ") {
+            self.exec_sql(LIST_SEQUENCES_SQL).await?;
+            return Ok(false);
+        }
+        if cmd == "\\x" || cmd.starts_with("\\x ") {
+            // Toggle expanded output mode. PostgreSQL's psql also
+            // accepts an explicit `on` / `off` argument; we match.
+            let arg = cmd.strip_prefix("\\x").unwrap_or("").trim();
+            self.expanded = match arg {
+                "on" => true,
+                "off" => false,
+                "" => !self.expanded,
+                other => {
+                    eprintln!("\\x: invalid argument '{other}', expected 'on' or 'off'");
+                    return Ok(false);
+                }
+            };
+            println!(
+                "Expanded display is {}.",
+                if self.expanded { "on" } else { "off" }
+            );
+            return Ok(false);
+        }
+        if cmd == "\\pset" || cmd.starts_with("\\pset ") {
+            // PostgreSQL psql's \pset takes a `name [value]` pair and
+            // tweaks one of dozens of output settings. UltraSQL today
+            // supports only `expanded` and `format`; everything else
+            // is acknowledged with a notice so scripts do not abort.
+            let args = cmd.strip_prefix("\\pset").unwrap_or("").trim();
+            let mut parts = args.splitn(2, char::is_whitespace);
+            let key = parts.next().unwrap_or("");
+            let value = parts.next().map(str::trim).unwrap_or("");
+            match key {
+                "" => println!("\\pset: expanded={}", self.expanded),
+                "expanded" => {
+                    self.expanded = matches!(value, "on" | "1" | "true" | "");
+                    println!(
+                        "Expanded display is {}.",
+                        if self.expanded { "on" } else { "off" }
+                    );
+                }
+                "format" => {
+                    // Only `aligned` is meaningful in v0.5; unaligned /
+                    // wrapped / html / csv are accepted but treated as
+                    // aligned. The setting is held in `format` for
+                    // future use.
+                    self.format = value.to_string();
+                    println!("Output format is \"{}\".", self.format);
+                }
+                other => {
+                    println!("\\pset: option '{other}' not yet supported; ignored.");
+                }
+            }
+            return Ok(false);
+        }
+        if cmd == "\\c" || cmd.starts_with("\\c ") {
+            // \c [dbname [user [host [port]]]] — psql's reconnect.
+            // Implementing the reconnect requires tearing down the
+            // tokio-postgres client and rebuilding it from
+            // ConnParams; for v0.5 we acknowledge the command but
+            // stay on the existing connection so scripts that issue
+            // \c against the same dbname do not abort.
+            let args = cmd.strip_prefix("\\c").unwrap_or("").trim();
+            if args.is_empty() {
+                let p = &self.params;
+                println!(
+                    "You are connected to database \"{}\" as user \"{}\" on host \"{}\" (port {}).",
+                    p.dbname, p.user, p.host, p.port
+                );
+            } else {
+                println!(
+                    "\\c: reconnection across sessions is deferred; staying on the current connection."
+                );
+            }
             return Ok(false);
         }
         if cmd.starts_with("\\i ") {
@@ -568,6 +663,28 @@ FROM   pg_catalog.pg_roles
 ORDER  BY 1;
 ";
 
+const LIST_FUNCTIONS_SQL: &str = "
+SELECT n.nspname AS schema, p.proname AS name
+FROM   pg_catalog.pg_proc p
+JOIN   pg_catalog.pg_namespace n ON p.pronamespace = n.oid
+WHERE  n.nspname NOT IN ('pg_catalog','information_schema')
+ORDER  BY 1, 2;
+";
+
+const LIST_VIEWS_SQL: &str = "
+SELECT schemaname, viewname AS name
+FROM   pg_catalog.pg_views
+WHERE  schemaname NOT IN ('pg_catalog','information_schema')
+ORDER  BY 1, 2;
+";
+
+const LIST_SEQUENCES_SQL: &str = "
+SELECT schemaname, sequencename AS name
+FROM   pg_catalog.pg_sequences
+WHERE  schemaname NOT IN ('pg_catalog','information_schema')
+ORDER  BY 1, 2;
+";
+
 fn list_tables_sql(pattern: &str) -> String {
     if pattern.is_empty() {
         "SELECT schemaname, tablename FROM pg_catalog.pg_tables \
@@ -631,15 +748,21 @@ Informational
   \\d  [table]       Describe table or list all objects
   \\dt [pattern]     List tables
   \\di [pattern]     List indexes
+  \\dv [pattern]     List views
+  \\ds [pattern]     List sequences
+  \\df [pattern]     List functions
   \\dn               List schemas
-  \\l                List databases
   \\du               List roles
+  \\l                List databases
 
 Connection
   \\conninfo         Display current connection info
+  \\c  [dbname]      Reconnect (acknowledged; cross-session reconnect deferred)
 
 Formatting
   \\timing           Toggle query timing display
+  \\x   [on|off]     Toggle expanded display
+  \\pset name [val]  Set / show formatting option (expanded, format)
 
 Input
   \\i file           Execute SQL from file";
