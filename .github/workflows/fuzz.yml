@@ -41,7 +41,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-fuzz
-        run: cargo +nightly install cargo-fuzz --locked
+        run: cargo +nightly install cargo-fuzz
       - name: short fuzz session
         env:
           FUZZ_TARGET: ${{ matrix.target }}
