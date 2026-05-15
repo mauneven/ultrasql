@@ -118,6 +118,18 @@ where
             }
         }
 
+        // Parse + bind cache lookup. The cache stores fully bound
+        // [`LogicalPlan`] values keyed by the trimmed SQL text. A hit
+        // skips both `Parser::parse_statement` and `bind(...)`. The
+        // cache is flushed by every DDL hook (see
+        // [`Self::plan_cache_invalidate`]) so a catalog change cannot
+        // resurrect a stale binding.
+        let cache_key = trimmed; // already trimmed at function entry
+        let cached_plan = self.stmt_cache.borrow().get(cache_key).cloned();
+        if let Some(plan) = cached_plan {
+            return self.execute_bound_plan(plan, sql, catalog_snapshot);
+        }
+
         // Parser / binder errors inside an explicit transaction must
         // also transition us to `Failed` — PostgreSQL marks the block
         // as aborted regardless of whether the failure was at parse,
@@ -145,6 +157,34 @@ where
             Ok(p) => p,
             Err(e) => return Err(self.fail_if_in_transaction(e.into())),
         };
+
+        // Cache the bound plan for repeated identical SQL. Only the
+        // read-side / pure-read shapes benefit; DML shapes (INSERT /
+        // UPDATE / DELETE) carry literal values, side-effects, or
+        // schema-fanout closures whose `LogicalPlan::clone()` cost
+        // tends to exceed the parse + bind they skip. Empirically the
+        // bench harness shows a regression on `update_throughput_10k`
+        // when bound UPDATE plans are cached, so we narrow the cache
+        // to read shapes only. The optimizer's downstream `PlanCache`
+        // still memoises every shape it sees.
+        if matches!(
+            &plan,
+            LogicalPlan::Project { .. }
+                | LogicalPlan::Scan { .. }
+                | LogicalPlan::Filter { .. }
+                | LogicalPlan::Aggregate { .. }
+                | LogicalPlan::Sort { .. }
+                | LogicalPlan::Limit { .. }
+                | LogicalPlan::Join { .. }
+                | LogicalPlan::Window { .. }
+                | LogicalPlan::Cte { .. }
+                | LogicalPlan::SetOp { .. }
+                | LogicalPlan::Values { .. }
+        ) {
+            self.stmt_cache
+                .borrow_mut()
+                .insert(cache_key.to_string(), plan.clone());
+        }
 
         // Transaction-control statements own the session's TxnState.
         match &plan {
@@ -241,6 +281,34 @@ where
         // INSERT-only — UPDATE / DELETE need the optimizer's
         // canonicalisation passes for the lowerer's
         // `build_filtered_tid_scan` shape contract.
+        let optimised_plan =
+            if Self::is_trivial_insert_values(&plan) || Self::is_fused_update_shape(&plan) {
+                plan
+            } else {
+                match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
+                    Ok(p) => p,
+                    Err(e) => return Err(self.fail_if_in_transaction(e)),
+                }
+            };
+        self.run_dml_or_select(&optimised_plan, &catalog_snapshot)
+    }
+
+    /// Hot-path entry for a SQL string that has already been parsed +
+    /// bound by an earlier `execute_query` call. The bound plan was
+    /// cached in [`Self::stmt_cache`] so we skip the parser, binder,
+    /// and (for the DML/SELECT shapes that survive the cache filter)
+    /// the meta-statement and DDL dispatchers. The optimizer + lowerer
+    /// run as usual; the optimizer's own `PlanCache` provides the
+    /// second layer of memoisation.
+    fn execute_bound_plan(
+        &mut self,
+        plan: LogicalPlan,
+        sql: &str,
+        catalog_snapshot: Arc<CatalogSnapshot>,
+    ) -> Result<SelectResult, ServerError> {
+        if matches!(self.txn_state, TxnState::Failed(_)) {
+            return Err(ServerError::TransactionAborted);
+        }
         let optimised_plan =
             if Self::is_trivial_insert_values(&plan) || Self::is_fused_update_shape(&plan) {
                 plan
@@ -365,6 +433,7 @@ where
     /// per-relation invalidation is a v0.7 follow-up.
     pub(crate) fn plan_cache_invalidate(&self) {
         self.state.plan_cache.invalidate_all();
+        self.stmt_cache.borrow_mut().clear();
     }
 
     /// Run a DML/SELECT plan against the session's current [`TxnState`].

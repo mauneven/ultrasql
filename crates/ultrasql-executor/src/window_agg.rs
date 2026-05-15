@@ -270,32 +270,38 @@ impl WindowAgg {
             }
         }
 
-        // Stable sort by key, breaking ties on original index. The
-        // tie-break keeps the output deterministic and matches the
-        // slow-path behaviour for the bench shape.
-        let mut indices: Vec<u32> = (0..total as u32).collect();
-        indices.sort_by(|&a, &b| {
-            let ka = keys[a as usize];
-            let kb = keys[b as usize];
-            ka.cmp(&kb).then_with(|| a.cmp(&b))
-        });
+        // Build (key, original_index) pairs and sort. Sorting the
+        // pairs directly is dramatically faster than sorting an
+        // index vector with a comparator that random-accesses
+        // `keys[a]` / `keys[b]` — pairs sit in 16 contiguous bytes
+        // each, so the inner loop hits a hot L1 line per compare.
+        // `sort_unstable_by` shaves another constant factor over the
+        // stable Tim-sort default; ties are broken on the index so
+        // the output is still deterministic.
+        let mut pairs: Vec<(i64, u32)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, &k)| (k, i as u32))
+            .collect();
+        pairs.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
         // Scatter rank into a row-aligned window column.
         let mut window_col: Vec<i64> = vec![0; total];
-        for (pos, &idx) in indices.iter().enumerate() {
+        for (pos, &(_, idx)) in pairs.iter().enumerate() {
             window_col[idx as usize] = (pos + 1) as i64;
         }
 
-        // Build output batches by cloning the input column array and
-        // pushing the matching window slice. Each input batch carries
-        // up to BATCH_TARGET_ROWS so no resplit is needed.
+        // Build output batches by moving the input columns out of
+        // each `Batch` (no clone) and pushing the matching window
+        // slice. Each input batch carries up to BATCH_TARGET_ROWS so
+        // no resplit is needed.
         let mut out: Vec<Batch> = Vec::with_capacity(input_batches.len());
         for (batch, window) in input_batches
             .into_iter()
             .zip(row_offsets.windows(2).map(|w| (w[0], w[1])))
         {
             let (lo, hi) = window;
-            let mut columns: Vec<Column> = batch.columns().to_vec();
+            let mut columns = batch.into_columns();
             let window_slice: Vec<i64> = window_col[lo..hi].to_vec();
             columns.push(Column::Int64(NumericColumn::from_data(window_slice)));
             out.push(Batch::new(columns).map_err(|e| {

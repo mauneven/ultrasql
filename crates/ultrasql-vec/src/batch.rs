@@ -59,6 +59,16 @@ impl Batch {
         &self.columns
     }
 
+    /// Consume the batch and return its columns. The caller owns the
+    /// vector and can move / mutate columns without cloning. Hot paths
+    /// that wrap a child operator's output (`WindowAgg`'s columnar
+    /// fast path, future fused operators) use this to avoid an
+    /// extra-MB clone per batch.
+    #[must_use]
+    pub fn into_columns(self) -> SmallVec<[Column; 8]> {
+        self.columns
+    }
+
     /// Row count.
     #[must_use]
     pub const fn rows(&self) -> usize {

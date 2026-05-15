@@ -38,6 +38,20 @@ pub(crate) struct Session<RW> {
     pub(super) state: Arc<Server>,
     pub(super) extended: ExtendedConnState,
     pub(super) txn_state: TxnState,
+    /// Per-session parse+bind cache for Simple Query traffic.
+    ///
+    /// Key: trimmed SQL text. Value: the fully bound `LogicalPlan` —
+    /// the output of `Parser::new(sql).parse_statement()` followed by
+    /// `bind(...)`. A hit skips both passes on the hot path; a cold
+    /// SELECT/UPDATE/DELETE/INSERT still pays them once. The cache is
+    /// flushed by every DDL hook that already invalidates the
+    /// optimizer's `PlanCache` (see `plan_cache_invalidate`), so a
+    /// catalog change can never resurrect a stale plan.
+    ///
+    /// Interior mutability lets the `&self` DDL dispatchers reset the
+    /// cache without rippling `&mut self` across the session API.
+    pub(super) stmt_cache:
+        std::cell::RefCell<std::collections::HashMap<String, ultrasql_planner::LogicalPlan>>,
     /// Per-connection process id allocated at session construction.
     ///
     /// Used as the `pid` field in `BackendKeyData` and as the routing
@@ -88,6 +102,7 @@ where
             secret,
             cancel_flag,
             notify_rx,
+            stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 }

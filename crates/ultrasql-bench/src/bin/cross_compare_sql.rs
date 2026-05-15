@@ -239,22 +239,18 @@ async fn main() -> Result<()> {
             run_shared_window_row_number(bound, args.rows, args.warmup, total_iters, &mut iters_us)
                 .await?;
         }
-        Workload::UpdateBulk => {
-            run_shared_update_bulk(bound, args.rows, args.warmup, total_iters, &mut iters_us)
-                .await?;
-        }
         _ => {
             for i in 0..total_iters {
                 let micros = match args.workload {
                     Workload::InsertBulk => run_insert_iter(bound, args.rows, i).await?,
+                    Workload::UpdateBulk => run_update_iter(bound, args.rows, i).await?,
                     Workload::DeleteBulk => run_delete_iter(bound, args.rows, i).await?,
                     Workload::MixedOltp => run_mixed_oltp_iter(bound, args.rows, i).await?,
                     Workload::SelectScan
                     | Workload::SumScalar
                     | Workload::AvgScalar
                     | Workload::FilterSum
-                    | Workload::WindowRowNumber
-                    | Workload::UpdateBulk => unreachable!("handled above"),
+                    | Workload::WindowRowNumber => unreachable!("handled above"),
                 };
                 if i >= args.warmup {
                     iters_us.push(micros);
@@ -825,60 +821,6 @@ async fn run_shared_window_row_number(
                 "window_row_number row count mismatch: expected {n_rows}, observed {row_count}"
             );
         }
-        if i >= warmup {
-            iters_us.push(elapsed_us);
-        }
-    }
-
-    drop(client);
-    conn_handle.abort();
-    Ok(())
-}
-
-/// Shared-table bulk-UPDATE workload: open one connection, preload
-/// `n_rows` once, then loop `BEGIN; UPDATE ...; ROLLBACK;` while
-/// timing only the `UPDATE` call. Mirrors `run_update` in the DuckDB
-/// / SQLite scripts so the methodology is identical.
-async fn run_shared_update_bulk(
-    server: SocketAddr,
-    n_rows: usize,
-    warmup: usize,
-    total_iters: usize,
-    iters_us: &mut Vec<f64>,
-) -> Result<()> {
-    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .context("tokio-postgres connect to ultrasqld")?;
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("tokio-postgres connection error: {e}");
-        }
-    });
-
-    let table = "bench_update_shared";
-    client
-        .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, val INT)"))
-        .await
-        .with_context(|| format!("CREATE TABLE {table}"))?;
-    preload_chunked(&client, table, n_rows).await?;
-
-    let update_sql = format!("UPDATE {table} SET val = val + 1 WHERE id < {n_rows}");
-    for i in 0..total_iters {
-        client.batch_execute("BEGIN").await.context("BEGIN")?;
-        let started = Instant::now();
-        let messages = client
-            .simple_query(&update_sql)
-            .await
-            .with_context(|| format!("UPDATE {table}"))?;
-        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
-        if !messages
-            .iter()
-            .any(|m| matches!(m, tokio_postgres::SimpleQueryMessage::CommandComplete(_)))
-        {
-            anyhow::bail!("UPDATE returned no CommandComplete message");
-        }
-        client.batch_execute("ROLLBACK").await.context("ROLLBACK")?;
         if i >= warmup {
             iters_us.push(elapsed_us);
         }
