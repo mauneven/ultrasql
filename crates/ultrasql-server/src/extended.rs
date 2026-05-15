@@ -138,14 +138,48 @@ pub struct BoundPortal {
 /// Sync" rule: once any extended-protocol message produces an error,
 /// subsequent Parse/Bind/Describe/Execute/Close messages are skipped
 /// silently until a `Sync` resets the flag.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ExtendedConnState {
     /// Prepared statements, keyed by name. Empty string = unnamed.
     pub statements: HashMap<String, PreparedStatement>,
     /// Open portals, keyed by name. Empty string = unnamed.
     pub portals: HashMap<String, BoundPortal>,
+    /// Suspended portals, keyed by name. Populated on `PortalSuspended`
+    /// and consumed by the next `Execute` against the same portal — see
+    /// §1.10 portal-resumption work and `execute_portal`.
+    pub suspended: HashMap<String, SuspendedPortal>,
     /// `true` after an error in the current pipeline; cleared by `Sync`.
     pub pipeline_failed: bool,
+}
+
+impl std::fmt::Debug for ExtendedConnState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtendedConnState")
+            .field("statements", &self.statements)
+            .field("portals", &self.portals)
+            .field("suspended", &self.suspended.keys().collect::<Vec<_>>())
+            .field("pipeline_failed", &self.pipeline_failed)
+            .finish()
+    }
+}
+
+/// State retained across a `PortalSuspended` boundary so the next
+/// `Execute` on the same portal can resume from where the previous one
+/// stopped instead of re-running the plan from scratch.
+pub struct SuspendedPortal {
+    /// The operator stream still hot — `next_batch` returns the rows
+    /// that have not yet been emitted to the client.
+    pub op: Box<dyn ultrasql_executor::Operator>,
+    /// Partially-consumed batch from the last `next_batch` call, and the
+    /// index of the first row not yet emitted. `None` means the boundary
+    /// landed cleanly between batches.
+    pub leftover: Option<(ultrasql_vec::Batch, usize)>,
+    /// Total rows emitted so far across every resumption. Returned to
+    /// the client in the final `CommandComplete "SELECT n"` tag.
+    pub emitted: u64,
+    /// Per-result-column format codes carried over from the original
+    /// Bind so the resumed Execute encodes columns identically.
+    pub result_formats: Vec<i16>,
 }
 
 impl ExtendedConnState {
@@ -432,6 +466,14 @@ pub fn execute_portal(
     max_rows: i32,
     ctx: &LowerCtx<'_>,
 ) -> Result<ExecuteOutcome, ServerError> {
+    // Resume a previously-suspended portal if one exists under this
+    // name. The suspended state owns the live operator + the partially
+    // consumed batch, so the next `Execute` can pick up where the
+    // previous one stopped.
+    if let Some(sus) = state.suspended.remove(portal_name) {
+        return resume_suspended_portal(state, portal_name, max_rows, sus);
+    }
+
     let portal = state
         .portals
         .get(portal_name)
@@ -496,11 +538,16 @@ pub fn execute_portal(
     let mut emitted: u64 = 0;
     let mut suspended = false;
 
+    let mut leftover: Option<(ultrasql_vec::Batch, usize)> = None;
     'outer: loop {
         let Some(batch) = op.next_batch()? else { break };
         let n = batch.rows();
         for row in 0..n {
             if usize::try_from(emitted).unwrap_or(usize::MAX) >= row_cap {
+                // Save the remaining slice of this batch so the next
+                // resumed Execute starts at row `row` of the same
+                // batch, not at the next batch.
+                leftover = Some((batch, row));
                 suspended = true;
                 break 'outer;
             }
@@ -521,14 +568,94 @@ pub fn execute_portal(
 
     if suspended {
         messages.push(BackendMessage::PortalSuspended);
-        // v0.5: PortalSuspended leaves the portal in place but without
-        // resumable state. Subsequent Execute returns CommandComplete
-        // with zero rows (drop the portal to make this explicit so the
-        // client sees a stable shape).
-        state.portals.remove(portal_name);
+        // Retain the in-flight operator so the next `Execute` against
+        // this portal name resumes from the same row position rather
+        // than restarting from scratch. The `Close` message (or session
+        // drop) clears the entry.
+        state.suspended.insert(
+            portal_name.to_string(),
+            SuspendedPortal {
+                op,
+                leftover,
+                emitted,
+                result_formats: portal.result_formats.clone(),
+            },
+        );
     } else {
         messages.push(BackendMessage::CommandComplete {
             tag: format!("SELECT {emitted}"),
+        });
+    }
+
+    Ok(ExecuteOutcome { messages })
+}
+
+/// Resume an `Execute` on a portal that previously emitted
+/// `PortalSuspended`. Drives the retained operator forward; on
+/// re-suspension, the portal is re-inserted into the suspension map.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn resume_suspended_portal(
+    state: &mut ExtendedConnState,
+    portal_name: &str,
+    max_rows: i32,
+    mut sus: SuspendedPortal,
+) -> Result<ExecuteOutcome, ServerError> {
+    let row_cap = if max_rows <= 0 {
+        usize::MAX
+    } else {
+        usize::try_from(max_rows).unwrap_or(usize::MAX)
+    };
+
+    let mut messages: Vec<BackendMessage> = Vec::with_capacity(8);
+    let mut emitted_this_call: usize = 0;
+    let mut suspended = false;
+
+    let mut current = sus.leftover.take();
+
+    'outer: loop {
+        // Pull a fresh batch only when the leftover is exhausted.
+        let (batch, start_row) = match current.take() {
+            Some(pair) => pair,
+            None => match sus.op.next_batch()? {
+                Some(b) => (b, 0),
+                None => break 'outer,
+            },
+        };
+        let n = batch.rows();
+        for row in start_row..n {
+            if emitted_this_call >= row_cap {
+                // Hit the cap mid-batch. Save the remaining slice so
+                // the next resumption picks up at this row.
+                current = Some((batch, row));
+                suspended = true;
+                break 'outer;
+            }
+            let mut columns = Vec::with_capacity(batch.width());
+            for (col_idx, col) in batch.columns().iter().enumerate() {
+                let fmt = resolve_param_format(&sus.result_formats, col_idx);
+                let encoded = if fmt == 1 {
+                    encode_binary_value(col, row)
+                } else {
+                    encode_text_value(col, row)
+                };
+                columns.push(encoded);
+            }
+            messages.push(BackendMessage::DataRow { columns });
+            emitted_this_call = emitted_this_call.saturating_add(1);
+        }
+    }
+
+    sus.emitted = sus
+        .emitted
+        .saturating_add(u64::try_from(emitted_this_call).unwrap_or(u64::MAX));
+
+    if suspended {
+        sus.leftover = current;
+        messages.push(BackendMessage::PortalSuspended);
+        state.suspended.insert(portal_name.to_string(), sus);
+    } else {
+        messages.push(BackendMessage::CommandComplete {
+            tag: format!("SELECT {emitted}", emitted = sus.emitted),
         });
     }
 
@@ -558,6 +685,7 @@ pub fn handle_close(
         }
         DescribeKind::Portal => {
             state.portals.remove(name);
+            state.suspended.remove(name);
         }
     }
     BackendMessage::CloseComplete
