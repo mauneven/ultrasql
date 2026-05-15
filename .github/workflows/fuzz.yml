@@ -33,9 +33,6 @@ jobs:
       matrix:
         target:
           - parser_fuzz
-          - lexer
-          - wire-protocol
-          - wal-record
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

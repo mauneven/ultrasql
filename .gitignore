@@ -41,6 +41,9 @@ tarpaulin-report.html
 fuzz/artifacts/
 fuzz/coverage/
 fuzz/target/
+# Downloaded GH Actions fuzz artifacts (corpus dumps land at repo root)
+fuzz-corpus-*/
+fuzz-artifacts-*/
 
 # Local secrets / config
 .env
