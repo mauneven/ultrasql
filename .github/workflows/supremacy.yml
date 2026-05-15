@@ -71,8 +71,17 @@ jobs:
           set -euo pipefail
           sudo systemctl start postgresql || sudo service postgresql start
           pg_isready -t 30
-          # The bench harness connects as the local UNIX user; on hosted
-          # runners that is `runner`. Create a matching superuser + db.
+          # The bench harness connects via tokio-postgres over TCP; the
+          # default pg_hba on Ubuntu denies passwordless TCP. Switch the
+          # local + host rules to `trust` for the CI session so the
+          # benchmark client can connect as the local UNIX user without
+          # plumbing a password through the runner.
+          PG_HBA="$(sudo -u postgres psql -tA -c 'SHOW hba_file;')"
+          PG_CONF_DIR="$(dirname "$PG_HBA")"
+          sudo cp "$PG_HBA" "$PG_HBA.bak"
+          printf 'local all all trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust\n' | sudo tee "$PG_HBA" > /dev/null
+          sudo systemctl reload postgresql || sudo service postgresql reload
+          # Create a matching superuser + db for the runner UNIX user.
           sudo -u postgres createuser -s runner || true
           sudo -u postgres createdb runner || true
           psql -h localhost -d postgres -c 'select version();'
