@@ -655,10 +655,10 @@ driver can connect.
 
 ### Scan Operators
 - [x] `SeqScan` with predicate pushdown — streaming + TID mode wired
-- [x] `IndexScan` via B-tree (point lookup + range scan) — wired via `try_index_scan` in `pipeline.rs`; `index_scan_round_trip.rs` covers eq-lookup, BETWEEN range, and non-indexed-column SeqScan fallback; single-col Int32/Int64 keys
+- [x] `IndexScan` via B-tree (point lookup + range scan) — wired via `try_index_scan` in `pipeline.rs`; `index_scan_round_trip.rs` covers eq-lookup, BETWEEN range, and non-indexed-column SeqScan fallback. Per §1.19 the key surface now spans `Int16` / `Int32` / `Int64` / `Bool` / `Float32` / `Float64` / `Text` (prefix + heap-recheck) / `Timestamp` plus two-column integer composites — see `crates/ultrasql-server/src/index_key.rs::IndexKeyEncoding` and `crates/ultrasql-server/tests/create_index_types_round_trip.rs`.
 - [x] `IndexOnlyScan` — kernel exists in `crates/ultrasql-executor/src/bitmap_heap_scan.rs:293` (consults VM via `vacuum_set_all_visible` bit, skips heap fetch on certified pages); selected by optimizer at `physical_selection.rs:161`; ⚠️ not yet reachable from `pipeline::lower_query` (the `try_index_scan` arm only emits `IndexScan`, never `IndexOnlyScan`)
 - [x] `BitmapHeapScan` — kernel exists (`bitmap_heap_scan.rs`); ⚠️ not yet reachable from `lower_query`
-- [x] `FunctionScan` — kernel exists (`function_scan.rs`); ⚠️ not yet wired (generate_series, unnest, SRFs)
+- [x] `FunctionScan` — kernel + wire path for `generate_series(start, stop[, step])`. Parser AST `TableRef::Function`, planner `LogicalPlan::FunctionScan`, `pipeline::lower_function_scan` → executor `FunctionScan::generate_series`. `crates/ultrasql-server/tests/function_scan_round_trip.rs` covers ascending, stepped, descending, and unknown-function rejection. ⚠️ `unnest(anyarray)` deferred until the array `Value` lands.
 - [x] `ValuesScan` (wired)
 - [x] `CteScan` reachable from `lower_query` (non-recursive); `SubqueryScan` follow-up; `WITH RECURSIVE` deferred to v0.6 fixpoint loop
 
@@ -693,7 +693,7 @@ driver can connect.
 - [x] Full general expression interpreter (Eval) — replaces hardcoded `FilterEqI32`
 - [x] Vectorized Filter for col-op-literal predicates (SIMD `cmp_i32_scalar` / `cmp_i64_scalar` with mask AND validity bitmap)
 - [x] NULL propagation correctness in all operators (Kleene 3VL in Eval; SIMD path ANDs validity)
-- [ ] Vectorized expression eval over batches for all shapes (binary arith, function calls)
+- [x] Vectorized expression eval over batches for all shapes — `add/sub/mul/compare` over i32/i64/f32/f64 (column-vs-column and column-vs-literal), unary `neg_*` + `not_bool`, text helpers `len/lower/upper` in `crates/ultrasql-vec/src/kernels/`. Every kernel has a `_scalar` reference and a 1024-case proptest pinning vector == scalar. §2.1.
 - [ ] Type coercion / implicit casts at execution time
 
 ### Memory Management
@@ -712,7 +712,7 @@ driver can connect.
 - [x] Server-side statement cache (keyed by name; per-connection)
 - [x] Named portals (cursor via extended protocol)
 - [x] Per-column binary transfer format for int2/int4/int8/bool/text (float4/float8 binary v0.6)
-- [ ] Pipeline mode (server-side multi-message handling beyond the current Sync-bounded pipeline)
+- [x] Pipeline mode — `Bind`/`Execute` pairs interleave without an intervening `Sync`; only `Sync` flushes a `ReadyForQuery`. Errors mid-pipeline set `ExtendedConnState::pipeline_failed`; subsequent Parse/Bind/Describe/Execute/Close are silently dropped until the next `Sync` clears the flag. `crates/ultrasql-server/tests/pipeline_mode_round_trip.rs` pins the three-trio happy path and the error-silences-until-Sync contract. §2.3.
 - [ ] `max_rows` partial-execution + `PortalSuspended` resumption (currently sends `PortalSuspended` then drops the portal)
 
 ### Transaction Control (wire)
@@ -740,9 +740,9 @@ driver can connect.
 - [x] `ssl_cert_file`, `ssl_key_file`, `ssl_ca_file` config
 
 ### Other Protocol Features
-- [x] `COPY TO STDOUT` / `COPY FROM STDIN` — text format kernel in `crates/ultrasql-server/src/copy.rs` (334 lines, both directions, backslash-escape, NULL=`\N`); ⚠️ no wire dispatch — `session/run.rs` does not branch on `CopyInResponse` / `CopyOutResponse`, the SQL `COPY` statement returns through the generic statement path with no `CopyData` flow
-- [x] `BackendKeyData` wire send — emitted in `session/startup.rs:182` after authentication; ⚠️ pid/secret are still hard-zeroed (no per-session registration into `CancelRegistry`)
-- [x] `CancelRequest` kernel — `CancelRegistry::request_cancel(pid, secret)` in `cancel.rs` sets `CancelFlag` (AtomicBool); ⚠️ session does not yet register itself with the registry, the cancel-message dispatch is not wired in `session/run.rs`, and operators do not poll the flag — end-to-end `pg_cancel_backend` does nothing today
+- [x] `COPY TO STDOUT` / `COPY FROM STDIN` — text + CSV wire dispatch end-to-end. Parser `Statement::Copy(CopyStmt)`; binder `LogicalPlan::Copy`; `session/copy.rs` dispatches both Simple Query (`session/run.rs::handle_query`) and Extended Query (`session/ext.rs::handle_execute`). Backslash-escape + `\N` NULL for TEXT, quoted strings + `""` escape for CSV. `crates/ultrasql-server/tests/copy_round_trip.rs` covers four shapes including byte-identical round-trip. §1.11.
+- [x] `BackendKeyData` wire send — `Session::new` allocates a per-session `(pid, secret)` from `Server::allocate_pid` (monotonic `AtomicU32`) + `OsRng` non-zero secret; `Session::startup` emits the real pair to the client. §1.9.
+- [x] `CancelRequest` kernel + operator polling — `CancelRegistry::request_cancel(pid, secret)` flips a per-query `CancelFlag`; `SeqScan` and `HashAggregate` poll the flag between batches and return `ExecError::Cancelled` → SQLSTATE `57014`. Protocol `FrontendMessage::CancelRequest { process_id, secret_key }` decoded on the `1234.5678` magic. `crates/ultrasql-server/tests/cancel_request_round_trip.rs::cancel_request_with_unknown_pid_is_silent_noop` covers the silent-no-op contract. ⚠️ the timing test `cancel_request_aborts_in_flight_select_within_500ms` is `#[ignore]`d pending the session-side `cancel_flag` plumbing through `LowerCtx` (separate follow-up). §1.9.
 - [x] `NoticeResponse` (warnings, hints, info messages) — `notice_warning(sqlstate, msg)` helper in `server/lib.rs` wraps `BackendMessage::NoticeResponse`; emitted from txn-control paths (nested BEGIN, COMMIT/ROLLBACK outside a tx, SET TRANSACTION outside a tx) and covered by in-crate tests in `src/tests/txn.rs`
 - [x] `LISTEN/NOTIFY/UNLISTEN` end-to-end — `notify.rs` `NotifyHub` shared across sessions, parser/binder/planner produce `LogicalPlan::Listen/Notify/Unlisten`, server `session/notify.rs` dispatches against the hub, and the run-loop races socket reads with `mpsc::UnboundedReceiver::recv` so idle sessions surface `NotificationResponse` immediately (covered by `crates/ultrasql-server/tests/listen_notify_round_trip.rs`)
 - [x] All expected `ParameterStatus` params — `session/startup.rs` now sends the full thirteen PostgreSQL emits: `server_version`, `server_encoding`, `client_encoding`, `DateStyle`, `IntervalStyle`, `TimeZone`, `integer_datetimes`, `standard_conforming_strings`, `extra_float_digits`, `application_name`, `is_superuser`, `session_authorization`, `in_hot_standby`
@@ -1046,7 +1046,7 @@ autovacuum. UltraSQL survives production use.
 - [ ] Structured JSON logging with `log_min_duration_statement`, `log_statement`
 
 ### COPY & Bulk Operations
-- [x] `COPY t FROM STDIN` / `COPY t TO STDOUT` — text format kernel in `crates/ultrasql-server/src/copy.rs` (334 lines, both directions, backslash-escape, NULL=`\N`); ⚠️ wire dispatch (session handler + SQL statement binding) not yet wired
+- [x] `COPY t FROM STDIN` / `COPY t TO STDOUT` — text + CSV formats end-to-end. Parser, binder, `LogicalPlan::Copy`, Simple Query + Extended Query session dispatch via `crates/ultrasql-server/src/session/copy.rs`. `crates/ultrasql-server/tests/copy_round_trip.rs` covers four shapes. §1.11.
 - [ ] CSV format (`FORMAT csv`, DELIMITER, HEADER, QUOTE, ESCAPE)
 - [ ] `COPY (SELECT ...) TO STDOUT`
 - [ ] `COPY t FROM 'file'` / `COPY t TO 'file'` (server-side, superuser only)
