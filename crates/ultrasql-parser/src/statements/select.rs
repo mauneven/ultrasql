@@ -1385,12 +1385,14 @@ mod tests {
     /// is a base table (leaf), while the left children recurse.
     fn is_left_deep(t: &TableRef) -> bool {
         match t {
-            TableRef::Named { .. } | TableRef::Subquery { .. } => true,
+            TableRef::Named { .. } | TableRef::Subquery { .. } | TableRef::Function { .. } => true,
             TableRef::Join { left, right, .. } => {
                 // Right must be a leaf.
                 matches!(
                     right.as_ref(),
-                    TableRef::Named { .. } | TableRef::Subquery { .. }
+                    TableRef::Named { .. }
+                        | TableRef::Subquery { .. }
+                        | TableRef::Function { .. }
                 ) && is_left_deep(left)
             }
         }
