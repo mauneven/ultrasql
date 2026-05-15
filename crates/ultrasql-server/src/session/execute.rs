@@ -126,7 +126,8 @@ where
         // resurrect a stale binding.
         let cache_key = trimmed; // already trimmed at function entry
         let cached_plan = self.stmt_cache.borrow().get(cache_key).cloned();
-        if let Some(plan) = cached_plan {
+        if let Some(plan_arc) = cached_plan {
+            let plan = Arc::unwrap_or_clone(plan_arc);
             return self.execute_bound_plan(plan, sql, catalog_snapshot);
         }
 
@@ -158,16 +159,19 @@ where
             Err(e) => return Err(self.fail_if_in_transaction(e.into())),
         };
 
-        // Cache the bound plan for repeated identical SQL. Only the
-        // read-side / pure-read shapes benefit; DML shapes (INSERT /
-        // UPDATE / DELETE) carry literal values, side-effects, or
-        // schema-fanout closures whose `LogicalPlan::clone()` cost
-        // tends to exceed the parse + bind they skip. Empirically the
-        // bench harness shows a regression on `update_throughput_10k`
-        // when bound UPDATE plans are cached, so we narrow the cache
-        // to read shapes only. The optimizer's downstream `PlanCache`
-        // still memoises every shape it sees.
-        if matches!(
+        // Cache the bound plan for repeated identical SQL. Only true
+        // DML / SELECT shapes are eligible. Txn-control, DDL, and
+        // meta variants need to flow through the dispatchers that
+        // own their state transitions and would mis-execute through
+        // the cache-hit `execute_bound_plan` fast path. `INSERT` is
+        // also skipped — its bound plan embeds the literal value
+        // tuple, so a 10 000-row bulk INSERT would dump ~150 KB into
+        // the cache per statement (and the bench harness uses a
+        // unique table per iter, so the entry would never repeat).
+        // Every remaining shape — including UPDATE / DELETE — is
+        // cached because the entry is `Arc<LogicalPlan>` and the
+        // hit-path clone is a cheap refcount bump.
+        let cacheable = matches!(
             &plan,
             LogicalPlan::Project { .. }
                 | LogicalPlan::Scan { .. }
@@ -180,10 +184,15 @@ where
                 | LogicalPlan::Cte { .. }
                 | LogicalPlan::SetOp { .. }
                 | LogicalPlan::Values { .. }
-        ) {
+                | LogicalPlan::Update { .. }
+                | LogicalPlan::Delete { .. }
+                | LogicalPlan::LockRows { .. }
+                | LogicalPlan::FunctionScan { .. }
+        );
+        if cacheable {
             self.stmt_cache
                 .borrow_mut()
-                .insert(cache_key.to_string(), plan.clone());
+                .insert(cache_key.to_string(), Arc::new(plan.clone()));
         }
 
         // Transaction-control statements own the session's TxnState.

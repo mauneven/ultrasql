@@ -270,14 +270,11 @@ impl WindowAgg {
             }
         }
 
-        // Build (key, original_index) pairs and sort. Sorting the
-        // pairs directly is dramatically faster than sorting an
-        // index vector with a comparator that random-accesses
-        // `keys[a]` / `keys[b]` — pairs sit in 16 contiguous bytes
-        // each, so the inner loop hits a hot L1 line per compare.
-        // `sort_unstable_by` shaves another constant factor over the
-        // stable Tim-sort default; ties are broken on the index so
-        // the output is still deterministic.
+        // Build (key, original_index) pairs and sort. Pairs sit in
+        // 16 contiguous bytes so the comparator hits a hot L1 line
+        // per compare; `sort_unstable_by` shaves a constant over the
+        // stable Tim-sort default and tie-breaks on index to keep the
+        // result deterministic.
         let mut pairs: Vec<(i64, u32)> = keys
             .iter()
             .enumerate()
