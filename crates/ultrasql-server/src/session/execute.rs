@@ -83,6 +83,29 @@ where
         // catalog provides the legacy fallback.
         let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
 
+        // `ANALYZE [table_name [(col, ...)]]` is accepted as a wire-level
+        // no-op so PostgreSQL clients can issue it without an error. The
+        // real cost-based stats refresh runs through
+        // `ultrasql_optimizer::AnalyzeRunner` on the next DDL pass —
+        // §3.1 covers the v0.6 acceptance path; this shim keeps the
+        // wire surface PostgreSQL-compatible until then.
+        let trimmed = sql.trim_start();
+        if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("analyze") {
+            // Make sure the next char is whitespace or end-of-statement so
+            // we do not eat statements that merely *contain* the word
+            // "analyze" (e.g. `SELECT analyze_helper FROM t`).
+            let rest = &trimmed[7..];
+            if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';') {
+                return Ok(result_encoder::SelectResult {
+                    messages: vec![BackendMessage::CommandComplete {
+                        tag: "ANALYZE".to_string(),
+                    }],
+                    streamed_body: None,
+                    rows: 0,
+                });
+            }
+        }
+
         // Parser / binder errors inside an explicit transaction must
         // also transition us to `Failed` — PostgreSQL marks the block
         // as aborted regardless of whether the failure was at parse,
