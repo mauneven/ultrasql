@@ -175,11 +175,54 @@ pub enum ExecError {
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
 
+    /// The in-flight query was cancelled by a client `CancelRequest`.
+    ///
+    /// Operators that hold a [`CancelFlag`] check it between batches
+    /// and return this variant as soon as the flag is set. The server
+    /// maps this to PostgreSQL SQLSTATE `57014` (`query_canceled`).
+    #[error("canceling statement due to user request")]
+    Cancelled,
+
     /// A NOT-NULL constraint was violated by an `INSERT` row payload.
     /// The string carries the column name. Maps to PostgreSQL SQLSTATE
     /// `23502` (`not_null_violation`).
     #[error("null value in column \"{0}\" violates not-null constraint")]
     NotNullViolation(String),
+}
+
+/// A per-query cancel signal threaded through long-running operators.
+///
+/// The flag is cloned from the connection's cancel-registry entry when
+/// the lowering context is built; every operator that polls loops
+/// over [`CancelFlag::is_set`] inside its `next_batch` and returns
+/// [`ExecError::Cancelled`] as soon as the flag fires.
+///
+/// `Clone` is `Arc::clone` — every clone observes the same atomic.
+/// The struct lives at the crate root so executor operators and the
+/// server crate share one definition without a circular dependency
+/// back through `ultrasql-server`.
+#[derive(Clone, Debug, Default)]
+pub struct CancelFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl CancelFlag {
+    /// Construct a fresh, uncancelled flag.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read the flag. `Relaxed` is sufficient: a slightly stale read
+    /// only delays cancellation by one batch, never compromises
+    /// correctness.
+    #[must_use]
+    pub fn is_set(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the flag. Idempotent.
+    pub fn cancel(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Physical execution operator.

@@ -155,6 +155,8 @@ pub enum Statement {
         /// Source span.
         span: Span,
     },
+    /// `COPY table [(col_list)] { FROM | TO } { STDIN | STDOUT } [WITH (…)]`.
+    Copy(Box<CopyStmt>),
 }
 
 impl Statement {
@@ -195,8 +197,74 @@ impl Statement {
             | Self::Listen { span, .. }
             | Self::Notify { span, .. }
             | Self::Unlisten { span, .. } => *span,
+            Self::Copy(s) => s.span,
         }
     }
+}
+
+// ============================================================================
+// COPY statement
+// ============================================================================
+
+/// Direction of a `COPY` statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyDirection {
+    /// `COPY t FROM …` — client sends rows to the server.
+    From,
+    /// `COPY t TO …` — server sends rows to the client.
+    To,
+}
+
+/// Source / sink for a `COPY` statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopySource {
+    /// `STDIN` — the client streams `CopyData` frames to the server.
+    Stdin,
+    /// `STDOUT` — the server streams `CopyData` frames to the client.
+    Stdout,
+}
+
+/// Wire-format kind for a `COPY` statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyFormat {
+    /// PostgreSQL text format — tab-separated columns, `\N` for SQL NULL.
+    Text,
+    /// PostgreSQL CSV format — comma-separated, quoted strings.
+    Csv,
+}
+
+/// One `WITH (…)` option of a `COPY` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CopyOption {
+    /// `FORMAT { TEXT | CSV }`.
+    Format(CopyFormat),
+    /// `DELIMITER 'c'` — single-character column delimiter.
+    Delimiter(char),
+    /// `HEADER [boolean]` — whether the first row is a header.
+    Header(bool),
+    /// `NULL 'string'` — string used to represent SQL NULL.
+    Null(String),
+}
+
+/// `COPY table [(col_list)] { FROM | TO } { STDIN | STDOUT } [WITH (…)]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CopyStmt {
+    /// Target relation.
+    pub table: ObjectName,
+    /// Optional column list `(col1, col2, …)`. Empty means "every column
+    /// in natural order".
+    pub columns: Vec<Identifier>,
+    /// `FROM` or `TO`.
+    pub direction: CopyDirection,
+    /// `STDIN` or `STDOUT`.
+    pub source: CopySource,
+    /// Negotiated wire format. Defaults to [`CopyFormat::Text`] when no
+    /// `WITH (FORMAT …)` clause is present.
+    pub format: CopyFormat,
+    /// Raw `WITH (…)` options preserved for downstream consumers.
+    pub options: Vec<CopyOption>,
+    /// Source span of the entire statement.
+    pub span: Span,
 }
 
 // ============================================================================

@@ -37,7 +37,7 @@ use ultrasql_vec::{Batch, count_i64, max_i64, min_i64, sum_i64};
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
-use crate::{ExecError, Operator};
+use crate::{CancelFlag, ExecError, Operator};
 
 /// Maximum rows per emitted batch, matching the `ARCHITECTURE.md` section 9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -176,6 +176,11 @@ pub struct HashAggregate {
     output: Option<std::vec::IntoIter<Vec<Value>>>,
     /// `true` after `Ok(None)` has been returned.
     eof: bool,
+    /// Per-query cancel signal. Polled between batches in the build
+    /// phase so a long aggregation surfaces
+    /// [`ExecError::Cancelled`] mid-drain. `None` when no cancellation
+    /// is wired (tests, bench harnesses).
+    cancel_flag: Option<CancelFlag>,
     /// When `true`, the build phase skips the column-oriented fast path
     /// and uses the row-at-a-time scalar loop. Test-only knob used by
     /// the cross-validation tests; production callers leave it `false`.
@@ -207,9 +212,23 @@ impl HashAggregate {
             schema,
             output: None,
             eof: false,
+            cancel_flag: None,
             #[cfg(test)]
             force_scalar_path: false,
         }
+    }
+
+    /// Attach a [`CancelFlag`] to this aggregate.
+    ///
+    /// Once set, the build phase polls the flag at every child-batch
+    /// boundary and returns [`ExecError::Cancelled`] mid-drain. Use a
+    /// builder method (rather than an extra `new_with_cancel_flag`
+    /// constructor) so callers that do not need cancellation keep the
+    /// existing two-line construction shape.
+    #[must_use]
+    pub fn with_cancel_flag(mut self, flag: CancelFlag) -> Self {
+        self.cancel_flag = Some(flag);
+        self
     }
 
     /// Test-only: disable the vectorised fast path. Used by cross-validation
@@ -225,6 +244,13 @@ impl Operator for HashAggregate {
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
         if self.eof {
             return Ok(None);
+        }
+        // Cancellation poll at output-batch boundary. Catches a cancel
+        // that arrives during the probe phase between batches.
+        if let Some(flag) = self.cancel_flag.as_ref()
+            && flag.is_set()
+        {
+            return Err(ExecError::Cancelled);
         }
 
         if self.output.is_none() {
@@ -271,6 +297,12 @@ impl HashAggregate {
             let mut states = init_states(&self.aggregates);
             let mut saw_any_row = false;
             loop {
+                // Cancellation poll between child batches.
+                if let Some(flag) = self.cancel_flag.as_ref()
+                    && flag.is_set()
+                {
+                    return Err(ExecError::Cancelled);
+                }
                 let Some(batch) = self.child.next_batch()? else {
                     break;
                 };
@@ -299,6 +331,14 @@ impl HashAggregate {
         let mut saw_any_row = false;
 
         loop {
+            // Cancellation poll between child batches. Mirrors the
+            // vectorised fast-path loop above so neither code path can
+            // ignore an in-flight CancelRequest.
+            if let Some(flag) = self.cancel_flag.as_ref()
+                && flag.is_set()
+            {
+                return Err(ExecError::Cancelled);
+            }
             let Some(batch) = self.child.next_batch()? else {
                 break;
             };

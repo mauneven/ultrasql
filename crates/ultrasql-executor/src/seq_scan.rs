@@ -37,7 +37,7 @@ use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
 use crate::row_codec::{ColumnBuilder, RowCodec};
-use crate::{ExecError, Operator};
+use crate::{CancelFlag, ExecError, Operator};
 
 /// Maximum rows per batch, matching the `ARCHITECTURE.md` §9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -142,6 +142,12 @@ pub struct SeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'stati
     /// `true` after the iterator has been exhausted and the final
     /// (possibly partial) batch has been emitted.
     eof: bool,
+    /// Per-query cancel signal. Polled at the top of every
+    /// `next_batch`; when set, the operator returns
+    /// [`ExecError::Cancelled`] without producing further batches.
+    /// `None` for tests and bench harnesses that do not need
+    /// cancellation.
+    cancel_flag: Option<CancelFlag>,
 }
 
 /// Cache-read state: a snapshot of cached columns for a relation,
@@ -363,7 +369,24 @@ where
             with_tids,
             output_schema,
             eof: false,
+            cancel_flag: None,
         }
+    }
+
+    /// Attach a [`CancelFlag`] to this scan.
+    ///
+    /// Once set, `next_batch` polls the flag at every entry and
+    /// returns [`ExecError::Cancelled`] without producing further
+    /// batches. Returns `self` so callers can chain immediately after
+    /// construction:
+    ///
+    /// ```ignore
+    /// let scan = SeqScan::new(...).with_cancel_flag(flag);
+    /// ```
+    #[must_use]
+    pub fn with_cancel_flag(mut self, flag: CancelFlag) -> Self {
+        self.cancel_flag = Some(flag);
+        self
     }
 }
 
@@ -401,6 +424,15 @@ where
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
         if self.eof {
             return Ok(None);
+        }
+        // Cancellation poll at batch boundary. A `SeqScan` over a
+        // large heap is typically the longest-running operator in the
+        // pipeline; checking the flag here is the cheapest place to
+        // observe a CancelRequest.
+        if let Some(flag) = self.cancel_flag.as_ref()
+            && flag.is_set()
+        {
+            return Err(ExecError::Cancelled);
         }
 
         // Fast path: replay from cached columnar projection. Skips
