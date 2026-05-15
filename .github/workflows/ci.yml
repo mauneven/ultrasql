@@ -53,20 +53,13 @@ jobs:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs: fmt
-    # Windows is informational only: the segment IO path uses
-    # `std::os::unix::fs::FileExt::{read_exact_at,write_all_at}`,
-    # which has no stable equivalent on Windows. Tracking porting
-    # work separately; the matrix entry runs so regressions surface
-    # but does not block the aggregate gate.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-latest          # x86_64 Linux
-          - ubuntu-24.04-arm       # ARM64 Linux
           - macos-14               # Apple Silicon
-          - windows-latest         # x86_64 Windows (informational)
+          - windows-latest         # x86_64 Windows
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

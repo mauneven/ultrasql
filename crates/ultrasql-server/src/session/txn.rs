@@ -113,9 +113,7 @@ where
                     txn,
                     self.state.two_phase.as_ref(),
                 ) {
-                    return Err(ServerError::Ddl(format!(
-                        "prepare_transaction({gid}): {e}"
-                    )));
+                    return Err(ServerError::Ddl(format!("prepare_transaction({gid}): {e}")));
                 }
                 Ok(SelectResult {
                     messages: vec![BackendMessage::CommandComplete {

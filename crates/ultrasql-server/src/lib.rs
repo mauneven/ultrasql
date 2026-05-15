@@ -314,10 +314,8 @@ impl Server {
 
         // Per-process tempdir for the 2PC coordinator. Production
         // wiring (`Server::init`) replaces this with `<data_dir>/pg_twophase`.
-        let two_phase_dir = std::env::temp_dir().join(format!(
-            "ultrasql-twophase-{}",
-            std::process::id()
-        ));
+        let two_phase_dir =
+            std::env::temp_dir().join(format!("ultrasql-twophase-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&two_phase_dir);
         let two_phase = Arc::new(ultrasql_txn::two_phase::TwoPhaseCoordinator::new(
             two_phase_dir,

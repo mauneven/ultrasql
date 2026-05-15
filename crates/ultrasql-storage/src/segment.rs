@@ -56,7 +56,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 #[cfg(unix)]
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::FileExt as UnixFileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt as WindowsFileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -307,7 +309,7 @@ impl SegmentFile {
             dst.copy_from_slice(&map[start..end]);
             return Ok(());
         }
-        self.file.read_exact_at(dst, offset)?;
+        pread_exact(&self.file, dst, offset)?;
         Ok(())
     }
 
@@ -331,7 +333,7 @@ impl SegmentFile {
             map[start..end].copy_from_slice(src);
             return Ok(());
         }
-        self.file.write_all_at(src, offset)?;
+        pwrite_all(&self.file, src, offset)?;
         Ok(())
     }
 
@@ -345,6 +347,63 @@ impl SegmentFile {
         full_fsync(&self.file)?;
         Ok(())
     }
+}
+
+/// Cross-platform positional read that fills `dst` completely.
+///
+/// On unix targets this delegates to
+/// [`std::os::unix::fs::FileExt::read_exact_at`]; on Windows the same
+/// semantics are emulated on top of
+/// [`std::os::windows::fs::FileExt::seek_read`] with a short-read
+/// retry loop. Neither variant modifies the file's seek cursor.
+#[cfg(unix)]
+fn pread_exact(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
+    file.read_exact_at(dst, offset)
+}
+
+#[cfg(windows)]
+fn pread_exact(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
+    let mut filled = 0_usize;
+    while filled < dst.len() {
+        let cur_off = offset
+            .checked_add(filled as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+        match file.seek_read(&mut dst[filled..], cur_off)? {
+            0 => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
+            n => filled += n,
+        }
+    }
+    Ok(())
+}
+
+/// Cross-platform positional write that delivers all of `src`.
+///
+/// Unix uses [`std::os::unix::fs::FileExt::write_all_at`]; Windows
+/// loops [`std::os::windows::fs::FileExt::seek_write`] until every
+/// byte has been written. Both leave the file's seek cursor untouched.
+#[cfg(unix)]
+fn pwrite_all(file: &File, src: &[u8], offset: u64) -> io::Result<()> {
+    file.write_all_at(src, offset)
+}
+
+#[cfg(windows)]
+fn pwrite_all(file: &File, src: &[u8], offset: u64) -> io::Result<()> {
+    let mut written = 0_usize;
+    while written < src.len() {
+        let cur_off = offset
+            .checked_add(written as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+        match file.seek_write(&src[written..], cur_off)? {
+            0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "write_zero on seek_write",
+                ));
+            }
+            n => written += n,
+        }
+    }
+    Ok(())
 }
 
 /// Issue an OS-level "really flush to platter" call after the regular
