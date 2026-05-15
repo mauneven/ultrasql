@@ -209,9 +209,13 @@ pub(super) fn bind_select(
     let mut cte_catalog: Vec<(String, Schema)> = Vec::new();
     let mut cte_plans: Vec<(String, bool, LogicalPlan)> = Vec::new();
     for cte in &select.ctes {
-        let cte_plan = bind_select_with_ctes(&cte.query, catalog, &cte_catalog, scope)?;
-        let cte_schema = cte_plan.schema().clone();
         let cte_name = cte.name.value.to_ascii_lowercase();
+        let cte_plan = if cte.recursive {
+            bind_recursive_cte(&cte_name, &cte.query, &cte.column_aliases, catalog, &cte_catalog, scope)?
+        } else {
+            bind_select_with_ctes(&cte.query, catalog, &cte_catalog, scope)?
+        };
+        let cte_schema = cte_plan.schema().clone();
         let cte_schema = if cte.column_aliases.is_empty() {
             cte_schema
         } else {
@@ -266,6 +270,84 @@ pub(super) fn bind_select(
     Ok(plan)
 }
 
+/// Bind a `WITH RECURSIVE` CTE definition.
+///
+/// PostgreSQL/SQL semantics: the CTE's body must be a top-level
+/// `UNION` (or `UNION ALL`) of an *anchor* (which cannot reference
+/// the CTE itself) and a *recursive term* (which may). The binder
+/// here enforces that shape, binds the anchor first to derive a
+/// schema for the CTE, then binds the recursive term against an
+/// augmented catalog that exposes the CTE name with the anchor's
+/// schema. Both halves are joined back into a single
+/// `LogicalPlan::SetOp` so the lowerer's recursive-fixpoint code
+/// sees the same `Cte { definition: SetOp { left, right }, .. }`
+/// shape it consumes.
+pub(super) fn bind_recursive_cte(
+    cte_name: &str,
+    query: &SelectStmt,
+    column_aliases: &[ultrasql_parser::ast::Identifier],
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
+    if query.set_ops.is_empty() {
+        return Err(PlanError::TypeMismatch(format!(
+            "WITH RECURSIVE \"{cte_name}\" must be `anchor UNION [ALL] recursive_term`"
+        )));
+    }
+    let tail = &query.set_ops[0];
+    if !matches!(tail.op, ultrasql_parser::ast::SetOp::Union) {
+        return Err(PlanError::TypeMismatch(format!(
+            "WITH RECURSIVE \"{cte_name}\" requires UNION (not INTERSECT or EXCEPT)"
+        )));
+    }
+    if query.set_ops.len() != 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "WITH RECURSIVE \"{cte_name}\" must have exactly one UNION between anchor and recursive term"
+        )));
+    }
+
+    // Bind the anchor. The anchor cannot reference the CTE itself,
+    // so the catalog stays untouched.
+    let anchor_select = SelectStmt {
+        ctes: query.ctes.clone(),
+        projection: query.projection.clone(),
+        from: query.from.clone(),
+        r#where: query.r#where.clone(),
+        group_by: query.group_by.clone(),
+        having: query.having.clone(),
+        order_by: query.order_by.clone(),
+        limit: query.limit.clone(),
+        offset: query.offset.clone(),
+        distinct: query.distinct.clone(),
+        set_ops: Vec::new(),
+        locking: query.locking.clone(),
+        span: query.span,
+    };
+    let anchor_plan = bind_select_with_ctes(&anchor_select, catalog, cte_catalog, scope)?;
+    let anchor_schema = anchor_plan.schema().clone();
+
+    // Apply column aliases (if any) to the schema the recursive term
+    // will see for `cte_name`.
+    let exposed_schema = if column_aliases.is_empty() {
+        anchor_schema.clone()
+    } else {
+        apply_column_aliases(&anchor_schema, column_aliases)?
+    };
+    let mut augmented_catalog: Vec<(String, Schema)> = cte_catalog.to_vec();
+    augmented_catalog.push((cte_name.to_owned(), exposed_schema));
+
+    // Bind the recursive term against the augmented catalog.
+    let recursive_term_plan =
+        bind_select_with_ctes(&tail.right, catalog, &augmented_catalog, scope)?;
+
+    // Stitch them back into the same Cte-definition shape the
+    // non-recursive path produces: a `SetOp` of anchor + recursive
+    // term. The fixpoint loop in the lowerer pattern-matches on this
+    // shape.
+    bind_set_op(anchor_plan, tail.op, tail.quantifier, recursive_term_plan)
+}
+
 /// Bind a `SelectStmt` that may reference CTEs in `cte_catalog` plus the
 /// regular catalog.
 pub(super) fn bind_select_with_ctes(
@@ -277,9 +359,13 @@ pub(super) fn bind_select_with_ctes(
     let mut nested_cte_catalog: Vec<(String, Schema)> = cte_catalog.to_vec();
     let mut nested_cte_plans: Vec<(String, bool, LogicalPlan)> = Vec::new();
     for cte in &select.ctes {
-        let cte_plan = bind_select_with_ctes(&cte.query, catalog, &nested_cte_catalog, scope)?;
-        let cte_schema = cte_plan.schema().clone();
         let cte_name = cte.name.value.to_ascii_lowercase();
+        let cte_plan = if cte.recursive {
+            bind_recursive_cte(&cte_name, &cte.query, &cte.column_aliases, catalog, &nested_cte_catalog, scope)?
+        } else {
+            bind_select_with_ctes(&cte.query, catalog, &nested_cte_catalog, scope)?
+        };
+        let cte_schema = cte_plan.schema().clone();
         let cte_schema = if cte.column_aliases.is_empty() {
             cte_schema
         } else {

@@ -846,7 +846,7 @@ fn lower_cte(
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
     if recursive {
-        return Err(ServerError::Unsupported("WITH RECURSIVE"));
+        return lower_recursive_cte(name, definition, body, ctx);
     }
 
     // Materialise the definition plan against the *current* overlay so a
@@ -887,6 +887,285 @@ fn lower_cte(
     };
 
     lower_query(body, &child_ctx)
+}
+
+/// Lower a `WITH RECURSIVE` CTE.
+///
+/// Definition shape (binder contract): `SetOp { op: Union, quantifier,
+/// left = anchor, right = recursive_term, .. }`. Anything else is
+/// rejected — `WITH RECURSIVE` requires a `UNION` shape per SQL spec.
+///
+/// # Algorithm
+///
+/// 1. Lower the anchor; collect every batch it produces.
+/// 2. Push it as the CTE's `cte_buffers` entry.
+/// 3. Loop: lower the recursive term against the current buffer
+///    (each iteration sees only the previous iteration's rows, per
+///    SQL spec). For `UNION ALL` every batch goes into the
+///    accumulator. For `UNION` (DISTINCT), dedupe new rows against
+///    the accumulator; if no new rows survive, the fixpoint is
+///    reached and the loop terminates. A safety cap prevents
+///    runaway recursion.
+/// 4. Bind the body with the full accumulator as the CTE buffer.
+fn lower_recursive_cte(
+    name: &str,
+    definition: &LogicalPlan,
+    body: &LogicalPlan,
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    use ultrasql_planner::LogicalSetOp;
+
+    let (op, quantifier, anchor, recursive_term, schema) = match definition {
+        LogicalPlan::SetOp {
+            op, quantifier, left, right, schema,
+        } => (*op, *quantifier, left.as_ref(), right.as_ref(), schema.clone()),
+        _ => {
+            return Err(ServerError::Unsupported(
+                "WITH RECURSIVE definition must be a UNION of an anchor + recursive term",
+            ));
+        }
+    };
+    if op != LogicalSetOp::Union {
+        return Err(ServerError::Unsupported(
+            "WITH RECURSIVE supports only UNION (not INTERSECT or EXCEPT)",
+        ));
+    }
+
+    // Cap on iterations matches PostgreSQL's recommendation for
+    // non-terminating queries (`max_recursive_iterations` GUC). 1024
+    // is comfortable for graph traversals while still bounding a
+    // runaway plan.
+    const MAX_ITERATIONS: usize = 1024;
+
+    let _ = schema; // SetOp's schema is identical to the anchor's after binding.
+    let mut accumulator: Vec<Batch> = Vec::new();
+    let mut working: Vec<Batch> = Vec::new();
+
+    // Step 1 — lower and drain the anchor. Anchor sees the parent
+    // overlay (it cannot reference the CTE itself by name).
+    let mut anchor_op = lower_query(anchor, ctx)?;
+    let def_schema = anchor_op.schema().clone();
+    while let Some(b) = anchor_op.next_batch()? {
+        if b.rows() > 0 {
+            working.push(b.clone());
+            accumulator.push(b);
+        }
+    }
+
+    // Step 2 — fixpoint loop.
+    let dedup = matches!(quantifier, ultrasql_planner::LogicalSetQuantifier::Distinct);
+    let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+    if dedup {
+        for b in &accumulator {
+            for k in batch_row_keys(b) {
+                seen_keys.insert(k);
+            }
+        }
+    }
+    for _ in 0..MAX_ITERATIONS {
+        if working.is_empty() {
+            break;
+        }
+        let mut child_buffers = ctx.cte_buffers.clone();
+        child_buffers.insert(
+            name.to_ascii_lowercase(),
+            CteBuffer {
+                batches: Arc::new(std::mem::take(&mut working)),
+                schema: def_schema.clone(),
+            },
+        );
+        let child_ctx = LowerCtx {
+            tables: ctx.tables,
+            catalog_snapshot: Arc::clone(&ctx.catalog_snapshot),
+            heap: Arc::clone(&ctx.heap),
+            snapshot: ctx.snapshot.clone(),
+            oracle: Arc::clone(&ctx.oracle),
+            xid: ctx.xid,
+            command_id: ctx.command_id,
+            cte_buffers: child_buffers,
+        };
+
+        let mut term_op = lower_query(recursive_term, &child_ctx)?;
+        let mut new_batches: Vec<Batch> = Vec::new();
+        while let Some(b) = term_op.next_batch()? {
+            if b.rows() == 0 {
+                continue;
+            }
+            if dedup {
+                let kept = filter_unseen_rows(&b, &mut seen_keys)?;
+                if let Some(kept) = kept {
+                    if kept.rows() > 0 {
+                        new_batches.push(kept);
+                    }
+                }
+            } else {
+                new_batches.push(b);
+            }
+        }
+        if new_batches.is_empty() {
+            break;
+        }
+        for b in &new_batches {
+            accumulator.push(b.clone());
+        }
+        working = new_batches;
+    }
+
+    // Step 3 — bind body with the full accumulator as the CTE
+    // buffer. From the body's perspective the CTE is a single
+    // materialised relation.
+    let mut body_buffers = ctx.cte_buffers.clone();
+    body_buffers.insert(
+        name.to_ascii_lowercase(),
+        CteBuffer {
+            batches: Arc::new(accumulator),
+            schema: def_schema,
+        },
+    );
+    let body_ctx = LowerCtx {
+        tables: ctx.tables,
+        catalog_snapshot: Arc::clone(&ctx.catalog_snapshot),
+        heap: Arc::clone(&ctx.heap),
+        snapshot: ctx.snapshot.clone(),
+        oracle: Arc::clone(&ctx.oracle),
+        xid: ctx.xid,
+        command_id: ctx.command_id,
+        cte_buffers: body_buffers,
+    };
+    lower_query(body, &body_ctx)
+}
+
+/// Encode every row of `batch` into a flat byte key for set-membership
+/// dedup in the recursive UNION fixpoint. Keys must compare equal
+/// when rows are equal under SQL semantics; for the v0.5 type set
+/// (Int32, Int64, Float32, Float64, Bool, Text) the encoding is the
+/// little-endian payload prefixed by the column index.
+fn batch_row_keys(batch: &Batch) -> Vec<Vec<u8>> {
+    let n_rows = batch.rows();
+    let mut keys: Vec<Vec<u8>> = (0..n_rows).map(|_| Vec::with_capacity(64)).collect();
+    for col in batch.columns() {
+        for (row_idx, key) in keys.iter_mut().enumerate() {
+            match col {
+                Column::Int32(c) => {
+                    if c.nulls().is_some_and(|n| !n.get(row_idx)) {
+                        key.push(0xFF);
+                    } else {
+                        key.push(0x00);
+                        key.extend_from_slice(&c.data()[row_idx].to_le_bytes());
+                    }
+                }
+                Column::Int64(c) => {
+                    if c.nulls().is_some_and(|n| !n.get(row_idx)) {
+                        key.push(0xFF);
+                    } else {
+                        key.push(0x00);
+                        key.extend_from_slice(&c.data()[row_idx].to_le_bytes());
+                    }
+                }
+                Column::Utf8(c) => {
+                    if c.nulls().is_some_and(|n| !n.get(row_idx)) {
+                        key.push(0xFF);
+                    } else {
+                        key.push(0x00);
+                        let s = c.value(row_idx);
+                        key.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        key.extend_from_slice(s.as_bytes());
+                    }
+                }
+                Column::Bool(c) => {
+                    if c.nulls().is_some_and(|n| !n.get(row_idx)) {
+                        key.push(0xFF);
+                    } else {
+                        key.push(if c.value(row_idx) { 0x01 } else { 0x00 });
+                    }
+                }
+                Column::Float32(c) => {
+                    if c.nulls().is_some_and(|n| !n.get(row_idx)) {
+                        key.push(0xFF);
+                    } else {
+                        key.push(0x00);
+                        key.extend_from_slice(&c.data()[row_idx].to_le_bytes());
+                    }
+                }
+                Column::Float64(c) => {
+                    if c.nulls().is_some_and(|n| !n.get(row_idx)) {
+                        key.push(0xFF);
+                    } else {
+                        key.push(0x00);
+                        key.extend_from_slice(&c.data()[row_idx].to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// Return a sub-batch of `batch` containing only rows whose encoded
+/// key is not already in `seen`. Rows that survive get added to
+/// `seen`.
+fn filter_unseen_rows(
+    batch: &Batch,
+    seen: &mut std::collections::HashSet<Vec<u8>>,
+) -> Result<Option<Batch>, ServerError> {
+    let keys = batch_row_keys(batch);
+    let mut keep_mask = Vec::with_capacity(keys.len());
+    for k in keys {
+        if seen.insert(k) {
+            keep_mask.push(true);
+        } else {
+            keep_mask.push(false);
+        }
+    }
+    if !keep_mask.iter().any(|&b| b) {
+        return Ok(None);
+    }
+    if keep_mask.iter().all(|&b| b) {
+        return Ok(Some(batch.clone()));
+    }
+    // Rebuild the batch keeping only the marked rows.
+    let mut cols: Vec<Column> = Vec::with_capacity(batch.columns().len());
+    for col in batch.columns() {
+        let new_col = match col {
+            Column::Int32(c) => Column::Int32(filter_numeric(c, &keep_mask)),
+            Column::Int64(c) => Column::Int64(filter_numeric(c, &keep_mask)),
+            Column::Float32(c) => Column::Float32(filter_numeric(c, &keep_mask)),
+            Column::Float64(c) => Column::Float64(filter_numeric(c, &keep_mask)),
+            Column::Bool(c) => {
+                let data: Vec<bool> = c
+                    .data()
+                    .iter()
+                    .zip(keep_mask.iter())
+                    .filter_map(|(v, k)| k.then_some(*v != 0))
+                    .collect();
+                Column::Bool(ultrasql_vec::column::BoolColumn::from_data(data))
+            }
+            Column::Utf8(c) => {
+                let strings: Vec<String> = (0..keep_mask.len())
+                    .filter_map(|i| keep_mask[i].then(|| c.value(i).to_owned()))
+                    .collect();
+                Column::Utf8(StringColumn::from_data(strings))
+            }
+        };
+        cols.push(new_col);
+    }
+    Batch::new(cols)
+        .map(Some)
+        .map_err(|e| ServerError::Unsupported(Box::leak(format!("recursive CTE filter: {e}").into_boxed_str())))
+}
+
+/// Filter helper for numeric columns — drops rows whose mask bit is 0.
+fn filter_numeric<T: Copy>(
+    col: &ultrasql_vec::column::NumericColumn<T>,
+    keep_mask: &[bool],
+) -> ultrasql_vec::column::NumericColumn<T> {
+    let data: Vec<T> = col
+        .data()
+        .iter()
+        .zip(keep_mask.iter())
+        .filter_map(|(v, k)| k.then_some(*v))
+        .collect();
+    ultrasql_vec::column::NumericColumn::from_data(data)
 }
 
 /// Re-check the contract `bind_set_op` enforces: both inputs must have

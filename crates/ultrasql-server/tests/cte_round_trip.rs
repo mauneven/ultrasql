@@ -261,33 +261,35 @@ async fn cte_with_aggregate_definition_filters_by_count() {
     shutdown(client, server_handle).await;
 }
 
-/// `WITH RECURSIVE r AS (...) SELECT * FROM r`
-///
-/// Verifies that recursive CTEs are rejected with a precise, stable
-/// error rather than silently lowered as non-recursive (which would
-/// return wrong results for any self-referential definition). The
-/// executor's fixpoint loop is a v0.6 follow-up; this test captures the
-/// current contract so a future implementation can flip the expectation
-/// at the same time as the loop lands.
+/// `WITH RECURSIVE` over a graph adjacency table — discovers every
+/// node reachable from a starting set via UNION DISTINCT (which
+/// terminates naturally once no new rows are produced).
 #[tokio::test]
-async fn cte_recursive_returns_error_response() {
+async fn cte_recursive_union_distinct_reaches_fixpoint() {
     let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    let t = create_int_table(&client, "rec").await;
-    insert_int_rows(&client, &t, &[(1, 0)]).await;
+    // edges(src, dst): a small directed graph 1→2→3→4 plus a back-edge 4→2
+    // so a naive `UNION ALL` loop would not terminate but `UNION` does.
+    client
+        .batch_execute("CREATE TABLE edges (src INT NOT NULL, dst INT NOT NULL)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO edges VALUES (1,2),(2,3),(3,4),(4,2)")
+        .await
+        .expect("seed");
 
-    // PostgreSQL syntax for a recursive base case + UNION ALL recursive
-    // step. We just need any recursive CTE that the parser+binder will
-    // accept; the body is irrelevant because the lowerer rejects the
-    // CTE node itself.
-    let sql = format!(
-        "WITH RECURSIVE r(id) AS (SELECT id FROM {t} UNION ALL SELECT id FROM r) \
-         SELECT id FROM r"
-    );
-    let result = client.simple_query(&sql).await;
-    assert!(
-        result.is_err(),
-        "WITH RECURSIVE must surface an error, got: {result:?}"
-    );
+    let sql = "\
+        WITH RECURSIVE reachable(node) AS ( \
+            SELECT 1 \
+          UNION \
+            SELECT dst FROM edges, reachable WHERE src = node \
+        ) \
+        SELECT node FROM reachable";
+    let rows = client.simple_query(sql).await.expect("recursive CTE runs");
+    let mut got = rows_to_i32_col(&rows, 0);
+    got.sort_unstable();
+    assert_eq!(got, vec![1, 2, 3, 4]);
 
     shutdown(client, server_handle).await;
 }
+
