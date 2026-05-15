@@ -174,7 +174,9 @@ impl<'src> Parser<'src> {
                 if self.peek()?.kind == TokenKind::KwTransaction {
                     self.advance()?;
                 }
-                Ok(Statement::Begin { span: tok.span })
+                // Optional ISOLATION LEVEL {READ COMMITTED | REPEATABLE READ | SERIALIZABLE}
+                let isolation_level = self.parse_opt_isolation_level()?;
+                Ok(Statement::Begin { isolation_level, span: tok.span })
             }
             TokenKind::KwCommit => {
                 let tok = self.advance()?;
@@ -1170,6 +1172,55 @@ impl<'src> Parser<'src> {
         false
     }
 
+    /// Parse an optional `ISOLATION LEVEL {READ COMMITTED | REPEATABLE READ | SERIALIZABLE}`
+    /// clause. Returns `None` if the next token is not `ISOLATION`.
+    pub(crate) fn parse_opt_isolation_level(
+        &mut self,
+    ) -> Result<Option<crate::ast::AstIsolationLevel>, ParseError> {
+        if self.peek()?.kind != TokenKind::KwIsolation {
+            return Ok(None);
+        }
+        self.advance()?; // ISOLATION
+        self.expect(TokenKind::KwLevel, "LEVEL")?;
+        let tok = self.peek()?;
+        match tok.kind {
+            TokenKind::KwRead => {
+                self.advance()?; // READ
+                let next = self.peek()?;
+                match next.kind {
+                    TokenKind::KwCommitted => {
+                        self.advance()?;
+                        Ok(Some(crate::ast::AstIsolationLevel::ReadCommitted))
+                    }
+                    TokenKind::KwUncommitted => {
+                        // READ UNCOMMITTED — alias to READ COMMITTED per PostgreSQL
+                        self.advance()?;
+                        Ok(Some(crate::ast::AstIsolationLevel::ReadCommitted))
+                    }
+                    other => Err(ParseError::Expected {
+                        expected: "COMMITTED or UNCOMMITTED after READ",
+                        found: other,
+                        offset: next.span.start as usize,
+                    }),
+                }
+            }
+            TokenKind::KwRepeatable => {
+                self.advance()?; // REPEATABLE
+                self.expect(TokenKind::KwRead, "READ")?;
+                Ok(Some(crate::ast::AstIsolationLevel::RepeatableRead))
+            }
+            TokenKind::KwSerializable => {
+                self.advance()?;
+                Ok(Some(crate::ast::AstIsolationLevel::Serializable))
+            }
+            other => Err(ParseError::Expected {
+                expected: "READ COMMITTED, REPEATABLE READ, or SERIALIZABLE",
+                found: other,
+                offset: tok.span.start as usize,
+            }),
+        }
+    }
+
     pub(crate) fn next_token_is_reserved_clause(&mut self) -> bool {
         let kind = self.peek().map_or(TokenKind::Eof, |t| t.kind);
         matches!(
@@ -1332,6 +1383,30 @@ mod tests {
         ));
         assert!(matches!(parse("COMMIT"), Statement::Commit { .. }));
         assert!(matches!(parse("ROLLBACK"), Statement::Rollback { .. }));
+    }
+
+    #[test]
+    fn begin_isolation_level() {
+        use crate::ast::AstIsolationLevel;
+        let stmt = parse("BEGIN ISOLATION LEVEL READ COMMITTED");
+        let Statement::Begin { isolation_level, .. } = stmt else { panic!() };
+        assert_eq!(isolation_level, Some(AstIsolationLevel::ReadCommitted));
+
+        let stmt = parse("BEGIN ISOLATION LEVEL READ UNCOMMITTED");
+        let Statement::Begin { isolation_level, .. } = stmt else { panic!() };
+        assert_eq!(isolation_level, Some(AstIsolationLevel::ReadCommitted));
+
+        let stmt = parse("BEGIN ISOLATION LEVEL REPEATABLE READ");
+        let Statement::Begin { isolation_level, .. } = stmt else { panic!() };
+        assert_eq!(isolation_level, Some(AstIsolationLevel::RepeatableRead));
+
+        let stmt = parse("BEGIN ISOLATION LEVEL SERIALIZABLE");
+        let Statement::Begin { isolation_level, .. } = stmt else { panic!() };
+        assert_eq!(isolation_level, Some(AstIsolationLevel::Serializable));
+
+        let stmt = parse("BEGIN");
+        let Statement::Begin { isolation_level, .. } = stmt else { panic!() };
+        assert_eq!(isolation_level, None);
     }
 
     #[test]

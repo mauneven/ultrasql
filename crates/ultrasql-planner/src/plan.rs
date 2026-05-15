@@ -175,6 +175,24 @@ pub enum LogicalOnConflict {
 }
 
 // ============================================================================
+// Transaction control
+// ============================================================================
+
+/// Transaction isolation level as carried by [`LogicalPlan::Begin`].
+///
+/// Maps 1:1 onto `ultrasql_txn::IsolationLevel`; redefined here so the
+/// planner crate does not depend on the txn crate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxnIsolationLevel {
+    /// `READ COMMITTED` — per-statement snapshot.
+    ReadCommitted,
+    /// `REPEATABLE READ` — snapshot fixed at transaction start.
+    RepeatableRead,
+    /// `SERIALIZABLE` — full SSI.
+    Serializable,
+}
+
+// ============================================================================
 // Locking
 // ============================================================================
 
@@ -575,6 +593,9 @@ pub enum LogicalPlan {
     ///
     /// `schema` is always [`Schema::empty`].
     Begin {
+        /// Requested isolation level. `None` means the server's default
+        /// (`ReadCommitted` in UltraSQL, matching PostgreSQL's default).
+        isolation_level: Option<TxnIsolationLevel>,
         /// Always [`Schema::empty`].
         schema: Schema,
     },
@@ -717,7 +738,7 @@ impl LogicalPlan {
             | Self::CreateIndex { schema, .. }
             | Self::DropTable { schema, .. }
             | Self::AlterTable { schema, .. }
-            | Self::Begin { schema }
+            | Self::Begin { schema, .. }
             | Self::Commit { schema }
             | Self::Rollback { schema }
             | Self::Savepoint { schema, .. }

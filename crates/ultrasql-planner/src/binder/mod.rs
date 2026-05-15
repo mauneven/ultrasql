@@ -59,7 +59,7 @@ use crate::expr::ScalarExpr;
 use crate::plan::{
     AggregateFunc, ConflictTarget, LockStrength, LockWaitPolicy, LogicalAggregateExpr,
     LogicalAlterTableAction, LogicalJoinCondition, LogicalJoinType, LogicalOnConflict, LogicalPlan,
-    LogicalSetOp, LogicalSetQuantifier, SortKey,
+    LogicalSetOp, LogicalSetQuantifier, SortKey, TxnIsolationLevel,
 };
 use crate::scope::{ScopeFrame, ScopeStack};
 
@@ -115,9 +115,18 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         // accordingly. The binder emits the corresponding LogicalPlan
         // variants so the Simple- and Extended-Query paths share a single
         // dispatch surface.
-        Statement::Begin { .. } => Ok(LogicalPlan::Begin {
-            schema: Schema::empty(),
-        }),
+        Statement::Begin { isolation_level, .. } => {
+            use ultrasql_parser::ast::AstIsolationLevel as AL;
+            let level = isolation_level.map(|l| match l {
+                AL::ReadCommitted => TxnIsolationLevel::ReadCommitted,
+                AL::RepeatableRead => TxnIsolationLevel::RepeatableRead,
+                AL::Serializable => TxnIsolationLevel::Serializable,
+            });
+            Ok(LogicalPlan::Begin {
+                isolation_level: level,
+                schema: Schema::empty(),
+            })
+        }
         Statement::Commit { .. } => Ok(LogicalPlan::Commit {
             schema: Schema::empty(),
         }),

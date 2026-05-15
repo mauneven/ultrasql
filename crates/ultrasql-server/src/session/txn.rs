@@ -19,6 +19,7 @@ use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, Stat
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
     Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
+    TxnIsolationLevel,
     bind,
 };
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
@@ -66,7 +67,7 @@ where
         plan: &LogicalPlan,
     ) -> Result<SelectResult, ServerError> {
         match plan {
-            LogicalPlan::Begin { .. } => self.execute_begin(),
+            LogicalPlan::Begin { isolation_level, .. } => self.execute_begin(*isolation_level),
             LogicalPlan::Commit { .. } => self.execute_commit(),
             LogicalPlan::Rollback { .. } => self.execute_rollback(),
             LogicalPlan::Savepoint { name, .. } => self.execute_savepoint(name),
@@ -210,10 +211,18 @@ where
         })
     }
 
-    pub(crate) fn execute_begin(&mut self) -> Result<SelectResult, ServerError> {
+    pub(crate) fn execute_begin(
+        &mut self,
+        level: Option<TxnIsolationLevel>,
+    ) -> Result<SelectResult, ServerError> {
+        let iso = match level {
+            None | Some(TxnIsolationLevel::ReadCommitted) => IsolationLevel::ReadCommitted,
+            Some(TxnIsolationLevel::RepeatableRead) => IsolationLevel::RepeatableRead,
+            Some(TxnIsolationLevel::Serializable) => IsolationLevel::Serializable,
+        };
         let warn = match &self.txn_state {
             TxnState::Idle => {
-                let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+                let txn = self.state.txn_manager.begin(iso);
                 self.txn_state = TxnState::InTransaction(txn);
                 None
             }
