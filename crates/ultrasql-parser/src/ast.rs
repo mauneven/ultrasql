@@ -1083,6 +1083,25 @@ pub struct Cte {
     pub span: Span,
 }
 
+/// `OVER (PARTITION BY ... ORDER BY ...)` window specification riding on
+/// a function call.
+///
+/// v0.5 supports an empty / present `PARTITION BY` and an empty /
+/// present `ORDER BY`. Frame clauses (`ROWS BETWEEN ... AND ...`,
+/// `RANGE BETWEEN ... AND ...`) are recognised at the kernel but the
+/// parser does not yet emit them — the default frame is "UNBOUNDED
+/// PRECEDING to CURRENT ROW for ORDER BY, UNBOUNDED PRECEDING to
+/// UNBOUNDED FOLLOWING otherwise", matching PostgreSQL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowSpec {
+    /// `PARTITION BY` expressions.
+    pub partition_by: Vec<Expr>,
+    /// `ORDER BY` items.
+    pub order_by: Vec<OrderItem>,
+    /// Source span.
+    pub span: Span,
+}
+
 /// Order-by item.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OrderItem {
@@ -1200,6 +1219,9 @@ pub enum Expr {
         args: Vec<Self>,
         /// Whether the argument list was `DISTINCT`-prefixed.
         distinct: bool,
+        /// Optional `OVER (...)` clause turning this into a window
+        /// function call. `None` for ordinary scalar / aggregate calls.
+        over: Option<WindowSpec>,
         /// Source span.
         span: Span,
     },

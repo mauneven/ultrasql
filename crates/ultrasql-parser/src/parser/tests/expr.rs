@@ -245,3 +245,29 @@ fn row_unclosed_paren_is_error() {
         ParseError::Expected { .. } | ParseError::UnexpectedEof { .. }
     ));
 }
+
+#[test]
+fn over_clause_partition_and_order() {
+    let expr = parse_expr("row_number() OVER (PARTITION BY a ORDER BY b ASC)");
+    let Expr::Call { over, .. } = expr else { panic!() };
+    let spec = over.expect("OVER spec");
+    assert_eq!(spec.partition_by.len(), 1);
+    assert_eq!(spec.order_by.len(), 1);
+    assert_eq!(spec.order_by[0].direction, SortDirection::Asc);
+}
+
+#[test]
+fn over_clause_empty_window() {
+    let expr = parse_expr("count(*) OVER ()");
+    let Expr::Call { over, .. } = expr else { panic!() };
+    let spec = over.expect("OVER spec");
+    assert!(spec.partition_by.is_empty());
+    assert!(spec.order_by.is_empty());
+}
+
+#[test]
+fn function_call_without_over_keeps_none() {
+    let expr = parse_expr("count(*)");
+    let Expr::Call { over, .. } = expr else { panic!() };
+    assert!(over.is_none());
+}

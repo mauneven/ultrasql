@@ -362,15 +362,104 @@ impl<'src> Parser<'src> {
                 }
             }
             let rp = self.expect(TokenKind::RParen, ")")?;
+            // Optional `OVER (...)` turning this into a window function call.
+            let over = if self.peek()?.kind == TokenKind::KwOver {
+                Some(self.parse_over_clause()?)
+            } else {
+                None
+            };
+            let end = over.as_ref().map_or(rp.span.end, |s| s.span.end);
             Ok(Expr::Call {
                 args,
                 distinct,
-                span: Span::new(name.span.start, rp.span.end),
+                over,
+                span: Span::new(name.span.start, end),
                 name,
             })
         } else {
             Ok(Expr::Column { name })
         }
+    }
+
+    /// Parse `OVER ( [PARTITION BY expr (, expr)*] [ORDER BY item (, item)*] )`.
+    ///
+    /// Called immediately after the closing `)` of a function call when
+    /// the next token is `OVER`. Frame clauses (`ROWS`/`RANGE`) are
+    /// recognised at the executor but the parser does not yet emit them
+    /// — the default frame is the v0.6 follow-up.
+    fn parse_over_clause(&mut self) -> Result<crate::ast::WindowSpec, ParseError> {
+        let over_tok = self.expect(TokenKind::KwOver, "OVER")?;
+        self.expect(TokenKind::LParen, "(")?;
+        let mut partition_by: Vec<Expr> = Vec::new();
+        let mut order_by: Vec<crate::ast::OrderItem> = Vec::new();
+        if self.peek()?.kind == TokenKind::KwPartition {
+            self.advance()?; // PARTITION
+            self.expect(TokenKind::KwBy, "BY")?;
+            loop {
+                partition_by.push(self.parse_expr()?);
+                if self.peek()?.kind != TokenKind::Comma {
+                    break;
+                }
+                self.advance()?;
+            }
+        }
+        if self.peek()?.kind == TokenKind::KwOrder {
+            self.advance()?; // ORDER
+            self.expect(TokenKind::KwBy, "BY")?;
+            loop {
+                let expr = self.parse_expr()?;
+                let start = expr.span().start;
+                let direction = if self.match_kw(TokenKind::KwAsc) {
+                    crate::ast::SortDirection::Asc
+                } else if self.match_kw(TokenKind::KwDesc) {
+                    crate::ast::SortDirection::Desc
+                } else {
+                    crate::ast::SortDirection::Asc
+                };
+                let nulls = if self.match_kw(TokenKind::KwNulls) {
+                    let n = self.advance()?;
+                    if n.text(self.source)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("first"))
+                    {
+                        crate::ast::NullsOrder::First
+                    } else if n
+                        .text(self.source)
+                        .is_some_and(|t| t.eq_ignore_ascii_case("last"))
+                    {
+                        crate::ast::NullsOrder::Last
+                    } else {
+                        return Err(ParseError::Expected {
+                            expected: "FIRST or LAST after NULLS",
+                            found: n.kind,
+                            offset: n.span.start as usize,
+                        });
+                    }
+                } else {
+                    crate::ast::NullsOrder::Default
+                };
+                let end = self
+                    .peeked
+                    .as_ref()
+                    .map_or(start, |t| t.span.start)
+                    .max(start);
+                order_by.push(crate::ast::OrderItem {
+                    expr,
+                    direction,
+                    nulls,
+                    span: crate::span::Span::new(start, end),
+                });
+                if self.peek()?.kind != TokenKind::Comma {
+                    break;
+                }
+                self.advance()?;
+            }
+        }
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        Ok(crate::ast::WindowSpec {
+            partition_by,
+            order_by,
+            span: crate::span::Span::new(over_tok.span.start, rp.span.end),
+        })
     }
 
     pub(crate) fn parse_cast_expr(&mut self) -> Result<Expr, ParseError> {
