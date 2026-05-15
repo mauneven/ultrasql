@@ -9,17 +9,36 @@
 //! -----------
 //! - [`filter`]     — filter kernels: `filter_eq_i32/i64`, `filter_lt/gt_i32`, `filter_eq_f64`.
 //! - [`filter_sum`] — fused branchless filter+sum kernels.
-//! - [`arithmetic`] — arithmetic kernels: `add/sub/mul_i64`, `compare_i64`.
+//! - [`arithmetic`] — arithmetic kernels: `add/sub/mul/compare_*` for `i32`,
+//!   `i64`, `f32`, `f64`; column-vs-literal `*_scalar_lit` variants for the
+//!   same shapes; unary negation `neg_*` and boolean `not_bool`.
+//! - [`text`]       — text kernels: `len_text`, `lower_text`, `upper_text`.
 //! - [`hash`]       — hash kernels: `hash_i64`, `hash_text_bytes` (FNV-1a).
 
 pub mod arithmetic;
 pub mod filter;
 pub mod filter_sum;
 pub mod hash;
+pub mod text;
 
 pub use arithmetic::{
-    add_i64, add_i64_scalar, compare_i64, compare_i64_scalar, mul_i64, mul_i64_scalar, sub_i64,
-    sub_i64_scalar,
+    add_f32, add_f32_scalar, add_f32_scalar_lit, add_f32_scalar_lit_scalar, add_f64,
+    add_f64_scalar, add_f64_scalar_lit, add_f64_scalar_lit_scalar, add_i32, add_i32_scalar,
+    add_i32_scalar_lit, add_i32_scalar_lit_scalar, add_i64, add_i64_scalar, add_i64_scalar_lit,
+    add_i64_scalar_lit_scalar, compare_f32, compare_f32_scalar, compare_f32_scalar_lit,
+    compare_f32_scalar_lit_scalar, compare_f64, compare_f64_scalar, compare_f64_scalar_lit,
+    compare_f64_scalar_lit_scalar, compare_i32, compare_i32_scalar, compare_i32_scalar_lit,
+    compare_i32_scalar_lit_scalar, compare_i64, compare_i64_scalar, compare_i64_scalar_lit,
+    compare_i64_scalar_lit_scalar, mul_f32, mul_f32_scalar, mul_f32_scalar_lit,
+    mul_f32_scalar_lit_scalar, mul_f64, mul_f64_scalar, mul_f64_scalar_lit,
+    mul_f64_scalar_lit_scalar, mul_i32, mul_i32_scalar, mul_i32_scalar_lit,
+    mul_i32_scalar_lit_scalar, mul_i64, mul_i64_scalar, mul_i64_scalar_lit,
+    mul_i64_scalar_lit_scalar, neg_f32, neg_f32_scalar, neg_f64, neg_f64_scalar, neg_i32,
+    neg_i32_scalar, neg_i64, neg_i64_scalar, not_bool, not_bool_scalar, sub_f32, sub_f32_scalar,
+    sub_f32_scalar_lit, sub_f32_scalar_lit_scalar, sub_f64, sub_f64_scalar, sub_f64_scalar_lit,
+    sub_f64_scalar_lit_scalar, sub_i32, sub_i32_scalar, sub_i32_scalar_lit,
+    sub_i32_scalar_lit_scalar, sub_i64, sub_i64_scalar, sub_i64_scalar_lit,
+    sub_i64_scalar_lit_scalar,
 };
 pub use filter::{
     filter_eq_f64, filter_eq_f64_scalar, filter_eq_i32, filter_eq_i32_scalar, filter_eq_i64,
@@ -31,6 +50,9 @@ pub use filter_sum::{
     filter_sum_par_i64_where_gt_zero,
 };
 pub use hash::{hash_i64, hash_i64_scalar, hash_text_bytes, hash_text_bytes_scalar};
+pub use text::{
+    len_text, len_text_scalar, lower_text, lower_text_scalar, upper_text, upper_text_scalar,
+};
 
 use crate::bitmap::Bitmap;
 use crate::column::NumericColumn;

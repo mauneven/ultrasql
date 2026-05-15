@@ -692,7 +692,7 @@ driver can connect.
 - [x] Full general expression interpreter (Eval) — replaces hardcoded `FilterEqI32`
 - [x] Vectorized Filter for col-op-literal predicates (SIMD `cmp_i32_scalar` / `cmp_i64_scalar` with mask AND validity bitmap)
 - [x] NULL propagation correctness in all operators (Kleene 3VL in Eval; SIMD path ANDs validity)
-- [ ] Vectorized expression eval over batches for all shapes (binary arith, function calls)
+- [x] Vectorized expression eval over batches for all shapes — binary arithmetic (`add`/`sub`/`mul`/`compare`) over `i32`/`i64`/`f32`/`f64` with column-vs-column and column-vs-literal variants, unary `neg` + `not_bool`, and text helpers (`len`/`lower`/`upper`) in `crates/ultrasql-vec/src/kernels/arithmetic.rs` and `crates/ultrasql-vec/src/kernels/text.rs`; every kernel has a `_scalar` reference impl and a 1024-case proptest asserting vector == scalar
 - [ ] Type coercion / implicit casts at execution time
 
 ### Memory Management
