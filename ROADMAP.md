@@ -98,9 +98,14 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 
 ## Current State Snapshot
 
-<!-- reconciled 2026-05-14 against actual code (commits 800ab81..28f2e4b) -->
+<!-- reconciled 2026-05-14 against actual code (commits 800ab81..27c06d0) -->
 <!-- Wave C wire streaming + Wave D heap pin-once + bulk update_many/delete_many -->
 <!-- Wave E bulk-UPDATE overhaul + Wave F in-place UPDATE + binder/ module split -->
+<!-- 2026-05-14 audit pass: bootstrap_from_heap typed-tuple decoder lands; -->
+<!-- IndexOnlyScan kernel exists (lower_query gap remains); LockRows/FOR UPDATE -->
+<!-- wired in pipeline.rs but no tokio-postgres round-trip; CancelRequest path -->
+<!-- not functional end-to-end (BackendKeyData pid/secret = 0); WITH RECURSIVE -->
+<!-- + STDDEV/VARIANCE + Simple-Query PREPARE/EXECUTE confirmed wired with tests -->
 
 ### Wave-by-wave perf progression on `cross_compare_sql` (median µs, M4, release)
 
@@ -263,12 +268,24 @@ real wire protocol.
    generalise via codegen across `(T1, T2, ...)`; until they do,
    the matrix is a per-shape microbench, not a full-DB claim.
 3. **Wire-protocol coverage.** `ORDER BY`, `JOIN`, `UNION`/`INTERSECT`/`EXCEPT`,
-   `IndexScan`, and `BETWEEN` are now wired and covered by
+   `IndexScan`, `BETWEEN`, `WITH RECURSIVE`, and Simple-Query
+   `PREPARE`/`EXECUTE`/`DEALLOCATE` are now wired and covered by
    `order_by_round_trip.rs`, `join_round_trip.rs`, `setop_round_trip.rs`,
-   and `index_scan_round_trip.rs`. Remaining gaps: `WITH RECURSIVE`,
-   `EXPLAIN`, `PREPARE`/`EXECUTE`/`DEALLOCATE` (Simple Query),
-   `COPY` wire dispatch, `DROP TABLE`/`ALTER TABLE` tokio-postgres
-   round-trips. Shape specialisation (fused paths) still applies.
+   `index_scan_round_trip.rs`, `cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint`,
+   and `prepare_execute_round_trip.rs`. **Remaining gaps**:
+   `EXPLAIN` / `EXPLAIN ANALYZE` (no `LogicalPlan::Explain` variant,
+   no session dispatch); `INSERT … SELECT` (`pipeline.rs:1314`
+   returns `Unsupported`); `INSERT … ON CONFLICT` and `RETURNING`
+   (`pipeline.rs:1292/1296` return `Unsupported`); `COPY` wire
+   dispatch (`session/run.rs` has no `CopyData` flow); `LISTEN` /
+   `NOTIFY` SQL surface (kernel `NotificationHub` ships, no
+   statement binding or `NotificationResponse` wire send);
+   `ANALYZE` Simple-Query handler; `SELECT FOR UPDATE` / `LockRows`
+   `tokio-postgres` round-trip test; `DROP TABLE` / `ALTER TABLE`
+   tokio-postgres round-trips. `CancelRequest` flow is **not**
+   functional end-to-end — `BackendKeyData` is sent with
+   pid/secret = 0 and the session never registers itself with the
+   `CancelRegistry`. Shape specialisation (fused paths) still applies.
 
 Closing items 1–2 is the v0.5 / v0.6 work plan. Until then the bench
 numbers describe what the engine *measures*, not what a production
@@ -288,7 +305,7 @@ deployment can rely on.
 | `ultrasql-optimizer` | ✅ Rule-based rewrites, cost model, DPsize/GEQO join enumeration, physical selection, plan cache (~1077 LOC across `lib.rs` + `plan_cache.rs`); ✅ public `optimize(plan, &snapshot, &dyn StatsSource)` entry point wired into the server's DML/SELECT path (Wave B v0.6); `PlanCache` shared between Simple Query and Extended Query Parse keyed on SQL text; every DDL clears the cache |
 | `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit, CteScan, SetOp, IndexScan, BitmapHeapScan; ⚠️ kernel-only (not yet wired): MergeJoin, SortAggregate, WindowAgg (ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD), FunctionScan, LockRows, Materialize, Unique; ⚠️ recursive CTE fixpoint loop deferred to v0.6 |
 | `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, dictionary encoding, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
-| `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ⚠️ bootstrap-from-heap falls back to initial snapshot (no typed tuple decoder yet) |
+| `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ✅ typed-tuple encoder/decoder in `encoding.rs` (`ClassRow`, `encode_attribute_row`/`decode_attribute_row`, `schema_from_attributes`); ✅ `bootstrap_from_heap` decodes pg_class + pg_attribute on warm restart and rebuilds user `TableEntry` list with full schema (`persistent.rs:486`) — module-level doc comment in `persistent.rs:34-42` is stale and still says "falls back" but the code path overlays decoded user tables on the initial snapshot |
 | `ultrasql-protocol` | ✅ Wire codec for Simple Query + Extended Query (Parse/Bind/Describe/Execute/Sync/Close) |
 | `ultrasql-server` | ✅ SCRAM-SHA-256 + TLS, Simple Query end-to-end for `CREATE TABLE`, `INSERT VALUES`, `SELECT`/`SELECT SUM`/`SELECT AVG`/`SELECT WHERE`, `UPDATE`, `DELETE` through real heap; ✅ Extended Query dispatch (Parse/Bind/Describe/Execute/Sync/Close/Flush) with parameter substitution through the same path; ✅ explicit transaction blocks (`BEGIN`/`COMMIT`/`ROLLBACK`) via both Simple and Extended Query, with PostgreSQL-faithful `ReadyForQuery` status bytes, `25P02` failed-block rejection, and COMMIT-as-ROLLBACK semantics |
 
@@ -587,7 +604,7 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] Central lock table: `DashMap<LockTag, LockEntry>` with wait-for graph
 - [x] Deadlock detector background thread (configurable interval, default 1 s)
 - [x] Tuple-level locks for concurrent updates (LockTag::Tuple supported)
-- [x] `SELECT FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` end-to-end (executor wiring + lower_query arm) (parser → planner → executor → server `847b3de`)
+- [x] `SELECT FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` parser → planner → executor → `lower_query` arm (`pipeline.rs:271`, `pipeline.rs:798`) (`847b3de`); ⚠️ no dedicated round-trip test in `crates/ultrasql-server/tests/` — the wire path is reachable but unverified at the `tokio-postgres` boundary
 - [x] Advisory locks: `pg_advisory_lock`, `pg_try_advisory_lock` (LockTag::Advisory; SQL surface still TODO)
 
 ### SSI (Serializable Snapshot Isolation)
@@ -642,7 +659,7 @@ driver can connect.
 ### Scan Operators
 - [x] `SeqScan` with predicate pushdown — streaming + TID mode wired
 - [x] `IndexScan` via B-tree (point lookup + range scan) — wired via `try_index_scan` in `pipeline.rs`; `index_scan_round_trip.rs` covers eq-lookup, BETWEEN range, and non-indexed-column SeqScan fallback; single-col Int32/Int64 keys
-- [ ] `IndexOnlyScan` (skip heap fetch when VM bit is set)
+- [x] `IndexOnlyScan` — kernel exists in `crates/ultrasql-executor/src/bitmap_heap_scan.rs:293` (consults VM via `vacuum_set_all_visible` bit, skips heap fetch on certified pages); selected by optimizer at `physical_selection.rs:161`; ⚠️ not yet reachable from `pipeline::lower_query` (the `try_index_scan` arm only emits `IndexScan`, never `IndexOnlyScan`)
 - [x] `BitmapHeapScan` — kernel exists (`bitmap_heap_scan.rs`); ⚠️ not yet reachable from `lower_query`
 - [x] `FunctionScan` — kernel exists (`function_scan.rs`); ⚠️ not yet wired (generate_series, unnest, SRFs)
 - [x] `ValuesScan` (wired)
@@ -669,7 +686,7 @@ driver can connect.
 - [x] `Unique` — kernel exists (`unique.rs`); ⚠️ DISTINCT wire path pending
 - [x] `SetOp` (UNION/INTERSECT/EXCEPT) — kernel + wired; `setop_round_trip.rs` covers UNION, UNION ALL, INTERSECT, INTERSECT ALL
 - [x] `RecursiveUnion` (WITH RECURSIVE) — wire path — `binder::bind_recursive_cte` splits anchor + recursive term and exposes the CTE name in scope for the recursive term; `pipeline::lower_recursive_cte` runs a fixpoint loop with row-key dedup for `UNION DISTINCT` and a 1024-iteration safety cap for `UNION ALL`. `cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint` exercises a 4-node graph with a cycle
-- [x] `LockRows` — kernel exists (`lock_rows.rs`); wire path complete `847b3de`
+- [x] `LockRows` — kernel (`lock_rows.rs`) wired in `pipeline::lower_query` (`pipeline.rs:271` + `798`) `847b3de`; ⚠️ no `tokio-postgres` round-trip test yet
 - [x] `Materialize` — kernel exists (`materialize.rs`); ⚠️ not yet selected by planner
 - [ ] `Gather` / `GatherMerge` (parallel query)
 - [ ] `Append` / `MergeAppend` (partition scans)
@@ -726,9 +743,9 @@ driver can connect.
 - [x] `ssl_cert_file`, `ssl_key_file`, `ssl_ca_file` config
 
 ### Other Protocol Features
-- [x] `COPY TO STDOUT` / `COPY FROM STDIN` — text format kernel in `copy.rs` (334 lines, both directions); ⚠️ wire dispatch to server session handler not yet wired
-- [x] `BackendKeyData` with PID + secret — `cancel.rs` implements full `CancelRegistry` + `CancelFlag`; ⚠️ `BackendKeyData` wire send needs verification
-- [x] `CancelRequest` handling — `CancelRegistry::request_cancel(pid, secret)` sets `AtomicBool` flag; ⚠️ operators not yet checking the flag during execution
+- [x] `COPY TO STDOUT` / `COPY FROM STDIN` — text format kernel in `crates/ultrasql-server/src/copy.rs` (334 lines, both directions, backslash-escape, NULL=`\N`); ⚠️ no wire dispatch — `session/run.rs` does not branch on `CopyInResponse` / `CopyOutResponse`, the SQL `COPY` statement returns through the generic statement path with no `CopyData` flow
+- [x] `BackendKeyData` wire send — emitted in `session/startup.rs:182` after authentication; ⚠️ pid/secret are still hard-zeroed (no per-session registration into `CancelRegistry`)
+- [x] `CancelRequest` kernel — `CancelRegistry::request_cancel(pid, secret)` in `cancel.rs` sets `CancelFlag` (AtomicBool); ⚠️ session does not yet register itself with the registry, the cancel-message dispatch is not wired in `session/run.rs`, and operators do not poll the flag — end-to-end `pg_cancel_backend` does nothing today
 - [x] `NoticeResponse` (warnings, hints, info messages) — `notice_warning(sqlstate, msg)` helper in `server/lib.rs` wraps `BackendMessage::NoticeResponse`; emitted from txn-control paths (nested BEGIN, COMMIT/ROLLBACK outside a tx, SET TRANSACTION outside a tx) and covered by in-crate tests in `src/tests/txn.rs`
 - [x] `LISTEN/NOTIFY` kernel — `notify.rs` has full `NotificationHub` with `listen`/`unlisten`/`notify`; ⚠️ not wired to wire session or LISTEN/NOTIFY SQL statements
 - [x] All expected `ParameterStatus` params — `session/startup.rs` now sends the full thirteen PostgreSQL emits: `server_version`, `server_encoding`, `client_encoding`, `DateStyle`, `IntervalStyle`, `TimeZone`, `integer_datetimes`, `standard_conforming_strings`, `extra_float_digits`, `application_name`, `is_superuser`, `session_authorization`, `in_hot_standby`
@@ -892,7 +909,7 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [ ] Concurrent splits with right-link pointer (no reader blocking)
 - [ ] WAL logging of all index operations
 - [ ] Backward index scan
-- [ ] Index-only scan (skip heap fetch when VM bit is set)
+- [x] Index-only scan — `IndexOnlyScan` kernel ships (`crates/ultrasql-executor/src/bitmap_heap_scan.rs:293`); ⚠️ optimizer selects it (`physical_selection.rs:161`) but `pipeline::lower_query` does not emit it yet
 - [ ] Multi-column B-tree
 - [ ] Expression indexes: `CREATE INDEX ON t (lower(name))`
 - [ ] Partial indexes: `CREATE INDEX ON t (col) WHERE status = 'active'`
@@ -923,7 +940,7 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [ ] Auto-summarize on vacuum
 
 ### Constraints
-- [x] `NOT NULL`, `CHECK`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY` — kernel structs exist in `constraints.rs` (`ConstraintSet`, `Constraint` enum with NotNull/Check/PrimaryKey/ForeignKey/UniqueSet variants); ⚠️ not yet enforced at INSERT/UPDATE in executor
+- [x] `NOT NULL`, `CHECK`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY` — kernel in `crates/ultrasql-storage/src/constraints.rs`: `Constraint` enum (`constraints.rs:157`) covers NotNull / Check / PrimaryKey / ForeignKey / UniqueSet; `ConstraintChecker` struct (`constraints.rs:256`) is the runtime enforcer; `ScalarExpr` (`constraints.rs:119`) is the CHECK-expr IR. ⚠️ Not yet invoked from the INSERT / UPDATE executor path — DDL parses constraints, kernel can validate, executor does not call it
 - [ ] `DEFAULT expr` evaluated at INSERT when column omitted
 - [ ] FK referential action wiring:
   - [ ] `ON DELETE CASCADE / SET NULL / SET DEFAULT / RESTRICT / NO ACTION`
@@ -946,7 +963,7 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [x] `pg_index`, `pg_constraint`, `pg_sequence` (row shapes)
 - [x] Catalog cache with `arc-swap` for wait-free reads
 - [x] Catalog snapshot for safe concurrent DDL
-- [ ] Typed tuple decoder for bootstrap-from-heap (current path falls back to initial snapshot)
+- [x] Typed tuple decoder for bootstrap-from-heap — `crates/ultrasql-catalog/src/encoding.rs` + `PersistentCatalog::bootstrap_from_heap` (`persistent.rs:486`) decode `pg_class` + `pg_attribute` rows and rebuild user `TableEntry` list with full schema on warm restart
 - [ ] `pg_depend` (required for CASCADE DROP)
 - [ ] `pg_description` (COMMENT ON)
 - [ ] `pg_statistic`, `pg_statistic_ext` (persistent — row shape ships, adapter pending)
@@ -1032,7 +1049,7 @@ autovacuum. UltraSQL survives production use.
 - [ ] Structured JSON logging with `log_min_duration_statement`, `log_statement`
 
 ### COPY & Bulk Operations
-- [x] `COPY t FROM STDIN` / `COPY t TO STDOUT` — text format kernel in `copy.rs` (334 lines, both directions, backslash-escape, NULL=`\N`); ⚠️ wire dispatch (session handler + SQL statement binding) not yet wired
+- [x] `COPY t FROM STDIN` / `COPY t TO STDOUT` — text format kernel in `crates/ultrasql-server/src/copy.rs` (334 lines, both directions, backslash-escape, NULL=`\N`); ⚠️ wire dispatch (session handler + SQL statement binding) not yet wired
 - [ ] CSV format (`FORMAT csv`, DELIMITER, HEADER, QUOTE, ESCAPE)
 - [ ] `COPY (SELECT ...) TO STDOUT`
 - [ ] `COPY t FROM 'file'` / `COPY t TO 'file'` (server-side, superuser only)
