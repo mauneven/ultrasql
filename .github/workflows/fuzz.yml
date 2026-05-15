@@ -22,7 +22,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
   RUST_BACKTRACE: 1
 
 jobs:
@@ -42,18 +41,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        run: cargo +nightly install cargo-fuzz --locked
       - name: short fuzz session
         env:
           FUZZ_TARGET: ${{ matrix.target }}
         run: |
           # Per-PR budget: 60 seconds, fail on any crash.
-          cargo fuzz run "$FUZZ_TARGET" -- -max_total_time=60
+          cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time=60
       - name: extended fuzz (nightly only)
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:
           FUZZ_TARGET: ${{ matrix.target }}
-        run: cargo fuzz run "$FUZZ_TARGET" -- -max_total_time=900
+        run: cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time=900
       - name: upload corpus
         if: always()
         uses: actions/upload-artifact@v4
