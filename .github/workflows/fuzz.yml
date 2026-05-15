@@ -43,16 +43,29 @@ jobs:
         env:
           FUZZ_TARGET: ${{ matrix.target }}
         run: |
-          # Per-PR budget: 60 seconds, fail on any crash.
-          cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time=60
+          # Per-PR budget: 60 s. -rss_limit_mb=4096 leaves headroom for
+          # AddressSanitizer overhead (~2× the parser's native ~1 GB).
+          # -max_len=1024 caps input size so worst-case AST allocation
+          # stays bounded; the seed corpus is well under 1 KB per file.
+          cargo +nightly fuzz run "$FUZZ_TARGET" -- \
+            -max_total_time=60 -rss_limit_mb=4096 -max_len=1024
       - name: extended fuzz (nightly only)
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         env:
           FUZZ_TARGET: ${{ matrix.target }}
-        run: cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time=900
+        run: |
+          cargo +nightly fuzz run "$FUZZ_TARGET" -- \
+            -max_total_time=900 -rss_limit_mb=4096 -max_len=1024
       - name: upload corpus
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}
+      - name: upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
