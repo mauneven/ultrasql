@@ -1,1 +1,1 @@
-{"engine":"ultrasql","iterations_us":[99.083,101.75,102.042,102.625,107.083,110.333,110.833,113.417],"median_us":107.083,"min_us":99.083,"n_rows":1000000,"samples":8,"workload":"filter_sum_1m_i64"}
+{"engine":"ultrasql","iterations_us":[93.792,101.042,101.125,105.709,109.375,109.416,111.917,121.08300000000001],"median_us":109.375,"min_us":93.792,"n_rows":1000000,"samples":8,"workload":"filter_sum_1m_i64"}
