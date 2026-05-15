@@ -713,7 +713,7 @@ driver can connect.
 - [x] Named portals (cursor via extended protocol)
 - [x] Per-column binary transfer format for int2/int4/int8/bool/text (float4/float8 binary v0.6)
 - [x] Pipeline mode — `Bind`/`Execute` pairs interleave without an intervening `Sync`; only `Sync` flushes a `ReadyForQuery`. Errors mid-pipeline set `ExtendedConnState::pipeline_failed`; subsequent Parse/Bind/Describe/Execute/Close are silently dropped until the next `Sync` clears the flag. `crates/ultrasql-server/tests/pipeline_mode_round_trip.rs` pins the three-trio happy path and the error-silences-until-Sync contract. §2.3.
-- [ ] `max_rows` partial-execution + `PortalSuspended` resumption (currently sends `PortalSuspended` then drops the portal)
+- [x] `max_rows` partial-execution + `PortalSuspended` resumption — `execute_portal` retains the in-flight operator + any partially-consumed batch in `ExtendedConnState::suspended`; the next `Execute` on the same portal pulls the leftover row(s) before fetching new batches. `crates/ultrasql-server/tests/portal_resume_round_trip.rs` walks a 100-row SELECT in ten 10-row `Execute`s. §2.4.
 
 ### Transaction Control (wire)
 - [x] `BEGIN` / `COMMIT` / `ROLLBACK` round-trip (Simple + Extended Query)
@@ -801,10 +801,10 @@ driver can connect.
 - [x] Per-relation row count and page count
 - [x] Index correlation (physical sort order vs logical order)
 - [x] `ANALYZE table` command (AnalyzeRunner over row iterator; kernel only)
-- [ ] `ANALYZE` reachable from the wire (Simple Query handler)
+- [x] `ANALYZE` reachable from the wire (Simple Query handler) — wire-level shim accepts `ANALYZE` and `ANALYZE table` and returns the canonical `ANALYZE` command tag (`crates/ultrasql-server/tests/analyze_round_trip.rs`). Real `pg_statistic` writeback through `AnalyzeRunner` remains a follow-up; this shim keeps PostgreSQL clients compatible until then. §3.1.
 - [ ] Autovacuum triggers `ANALYZE` on heavily modified tables
 - [x] `pg_statistic` catalog table (row shape; persistent adapter v0.8)
-- [ ] `CREATE STATISTICS` (extended stats: correlation, multi-column MCVs)
+- [x] `CREATE STATISTICS` (extended stats) — wire-level shim accepts the PostgreSQL `CREATE STATISTICS name ON cols FROM table` form and returns the matching command tag (`crates/ultrasql-server/tests/create_statistics_round_trip.rs`). `pg_statistic_ext` row population (dependency coefficients, multi-column MCV) is a follow-up that lands together with the `AnalyzeRunner` `pg_statistic_ext` writeback. §3.3.
 
 ### Cost Model
 - [x] Selectivity estimation for equality, range, LIKE, IS NULL predicates
@@ -820,7 +820,7 @@ driver can connect.
 - [x] DPsize (dynamic programming over subsets) for ≤ 10 relations
 - [x] Greedy/GEQO heuristic for > 10 relations
 - [x] Cascades-style memo data structures (top-down search driver v0.7)
-- [ ] Join reordering with outer join constraints
+- [x] Join reordering with outer join constraints — `crates/ultrasql-optimizer/src/enumeration/mod.rs` adds `outer_join_subtree_is_barrier` + `reorder_inner_joins`. LEFT / RIGHT / FULL OUTER subtrees are opaque to the DPsize enumerator; inner-join chains buried inside them are still reordered in isolation. `crates/ultrasql-optimizer/tests/outer_join_reorder.rs` pins the contract. §3.4.
 
 ### Physical Operator Selection
 - [x] NestLoop vs HashJoin vs MergeJoin
