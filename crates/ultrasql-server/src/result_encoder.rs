@@ -228,6 +228,81 @@ pub fn stream_select(op: &mut dyn Operator, sink: &mut BytesMut) -> Result<u64, 
     Ok(rows)
 }
 
+// Thread-local wire-buffer pool. SELECT streaming allocates the
+// `BytesMut` that holds RowDescription + N DataRow + CommandComplete;
+// for a 10 000-row narrow-int scan that buffer is ~250 KiB. Without
+// reuse, every `simple_query` round-trip pays a fresh allocator round
+// (under macOS libmalloc that lands the chunk in the "small" tcache
+// region; under jemalloc it walks the size-class free-list). Either
+// way it is a measurable per-query cost on the `select_scan_10k`
+// bench.
+//
+// The pool keeps one buffer per worker thread. `take_pooled_sink`
+// reuses whatever capacity the buffer accumulated last call;
+// `return_pooled_sink` parks the buffer back. The buffer is always
+// returned: the session writes the streamed body to the wire and
+// then drops the `SelectResult`. A custom drop on `SelectResult`
+// would close the loop automatically, but the explicit
+// take/return calls keep the lifetime invariant local to this
+// module and avoid surprising the session code.
+//
+// Cancel-safety: `run_select_streamed` is synchronous. The session
+// holds the resulting `SelectResult`, including the
+// `streamed_body`, until after `io.write_all` returns; nothing
+// touches the thread-local cell during the await window.
+thread_local! {
+    static POOLED_WIRE_BUF: std::cell::RefCell<Option<BytesMut>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Pull a fresh `BytesMut` from the per-thread pool, falling back to a
+/// new allocation when the pool is empty. The buffer is cleared (the
+/// underlying capacity survives) so the caller starts with a
+/// zero-length view.
+fn take_pooled_sink(initial_cap: usize) -> BytesMut {
+    let cached = POOLED_WIRE_BUF.with(|cell| cell.borrow_mut().take());
+    match cached {
+        Some(mut buf) => {
+            buf.clear();
+            if buf.capacity() < initial_cap {
+                buf.reserve(initial_cap - buf.capacity());
+            }
+            buf
+        }
+        None => BytesMut::with_capacity(initial_cap),
+    }
+}
+
+/// Park `buf` back in the per-thread pool after the caller is done
+/// writing into it. Called from [`return_streamed_sink`] once the
+/// session has drained the buffer to the socket.
+///
+/// The pool retains exactly one buffer per thread. The call sequence
+/// on the SELECT-streaming hot path is `take → write → return`, so
+/// the slot is empty at the time of this call and the
+/// always-overwrite branch is the only one that fires. We still
+/// guard against a future caller that re-enters the pool by
+/// retaining whichever buffer has more capacity — discarding the
+/// smaller one prevents the pool from "shrinking" under a workload
+/// that mixes large and small reply shapes.
+fn park_pooled_sink(buf: BytesMut) {
+    POOLED_WIRE_BUF.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let keep_existing = slot
+            .as_ref()
+            .is_some_and(|existing| existing.capacity() > buf.capacity());
+        if !keep_existing {
+            *slot = Some(buf);
+        }
+    });
+}
+
+/// Hand the streamed-body buffer back to the wire-buffer pool. The
+/// session calls this after `io.write_all` drains the bytes.
+pub fn return_streamed_sink(buf: BytesMut) {
+    park_pooled_sink(buf);
+}
+
 /// Convenience wrapper around [`stream_select`] that returns a
 /// [`SelectResult`] whose `streamed_body` field carries the encoded
 /// wire bytes. Drop-in replacement for [`run_select`] at the SELECT
@@ -269,7 +344,7 @@ pub fn run_select_streamed(op: &mut dyn Operator) -> Result<SelectResult, Server
         }
         None => 32 * 1024,
     };
-    let mut sink = BytesMut::with_capacity(initial_cap);
+    let mut sink = take_pooled_sink(initial_cap);
     let rows = stream_select(op, &mut sink)?;
     Ok(SelectResult {
         messages: Vec::new(),

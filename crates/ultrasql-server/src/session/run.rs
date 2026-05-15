@@ -254,10 +254,19 @@ where
         // of the whole response on every query. Appending the trailer
         // bytes to the tail keeps the wire reply on a single
         // `write_all` + `flush` and saves the per-byte copy.
+        //
+        // After the write completes the buffer is parked back in the
+        // per-thread `result_encoder` pool so the next SELECT in this
+        // task reuses the same `BytesMut` allocation. Without the
+        // park, every iteration of `cross_compare_sql --workload
+        // select-scan` paid a fresh allocator round for the ~250 KiB
+        // reply buffer.
         if let Some(mut body) = result.streamed_body.take() {
             self.drain_pending_notifications_into(&mut body);
             encode_backend(&ready, &mut body);
-            self.io.write_all(&body).await?;
+            let res = self.io.write_all(&body).await;
+            crate::result_encoder::return_streamed_sink(body);
+            res?;
             self.io.flush().await?;
             return Ok(());
         }

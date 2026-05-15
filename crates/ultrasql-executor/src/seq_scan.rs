@@ -286,11 +286,6 @@ where
         with_tids: bool,
         output_schema: Schema,
     ) -> Self {
-        // Build typed builders sized for one full batch. The
-        // TID-emitting variant prepends two `Int32` builders for
-        // `tid_block` / `tid_slot`.
-        let builders = build_initial_builders(&codec, with_tids);
-
         // Heap-allocate the snapshot so its address is stable across
         // moves of `Self`.
         let snapshot_box: Box<Snapshot> = Box::new(snapshot);
@@ -312,31 +307,57 @@ where
         } else {
             None
         };
+        let cache_hit = cache_read.is_some();
 
-        // SAFETY: `heap`, `snapshot_box`, and `oracle` keep their
-        // referents at stable heap addresses for the lifetime of the
-        // `SeqScan`. The iterator is declared as the first field and
-        // therefore dropped first, before the borrows go away. See
-        // the type-level `# Safety` doc for the full argument.
+        // Build typed builders sized for one full batch only when
+        // we are going to walk the heap. The cache-read path never
+        // touches `self.builders`, so allocating a fresh per-column
+        // `Vec<T>` with `BATCH_TARGET_ROWS` capacity is pure
+        // overhead — on the `select_scan_10k` hot path the relation
+        // schema is `(Int32, Int32)` and each call to
+        // `SeqScan::new` would otherwise spend ~32 KiB on builders
+        // that are dropped unused.
         //
-        // We construct the walker even when reading from the cache
-        // because `Operator::next_batch` does not currently know
-        // about `cache_read` at this layer — we drop the walker
-        // unused below when `cache_read.is_some()`.
-        let iter: VisibleHeapWalker<'static, L, O> = unsafe {
-            let heap_ref: &'static HeapAccess<L> =
-                std::mem::transmute::<&HeapAccess<L>, &'static HeapAccess<L>>(&*heap);
-            let snap_ref: &'static Snapshot =
-                std::mem::transmute::<&Snapshot, &'static Snapshot>(&*snapshot_box);
-            let oracle_ref: &'static O = std::mem::transmute::<&O, &'static O>(&*oracle);
-            heap_ref.scan_visible_walker(relation, block_count, snap_ref, oracle_ref)
+        // The TID-prefixed scan keeps its builders unconditionally:
+        // `with_tids` is incompatible with cache reads (it is
+        // explicitly excluded from `cache_eligible`).
+        let builders = if cache_hit {
+            Vec::new()
+        } else {
+            build_initial_builders(&codec, with_tids)
+        };
+
+        // Defer the walker construction past the cache decision: on
+        // a cache hit the walker is built and immediately dropped,
+        // pinning a buffer-pool frame for no reason. The walker
+        // also lifetime-erases borrows of `heap`/`snapshot_box`/`oracle`,
+        // so skipping it leaves those pins acquired only when the
+        // scan actually walks the heap.
+        let iter = if cache_hit {
+            None
+        } else {
+            // SAFETY: `heap`, `snapshot_box`, and `oracle` keep
+            // their referents at stable heap addresses for the
+            // lifetime of the `SeqScan`. The iterator is declared
+            // as the first field and therefore dropped first,
+            // before the borrows go away. See the type-level
+            // `# Safety` doc for the full argument.
+            let walker: VisibleHeapWalker<'static, L, O> = unsafe {
+                let heap_ref: &'static HeapAccess<L> =
+                    std::mem::transmute::<&HeapAccess<L>, &'static HeapAccess<L>>(&*heap);
+                let snap_ref: &'static Snapshot =
+                    std::mem::transmute::<&Snapshot, &'static Snapshot>(&*snapshot_box);
+                let oracle_ref: &'static O = std::mem::transmute::<&O, &'static O>(&*oracle);
+                heap_ref.scan_visible_walker(relation, block_count, snap_ref, oracle_ref)
+            };
+            Some(walker)
         };
 
         // Decide whether this scan should populate the cache as a
         // side effect. Skip the build when (a) the scan is reading
         // from the cache already, (b) the scan is TID-augmented, or
         // (c) the relation is empty (no point caching nothing).
-        let cache_build = if cache_eligible && cache_read.is_none() && block_count > 0 {
+        let cache_build = if cache_eligible && !cache_hit && block_count > 0 {
             let target_version = heap.column_cache.relation_version(relation);
             Some(CacheBuildState {
                 builders: build_initial_builders(&codec, false),
@@ -346,19 +367,10 @@ where
             None
         };
 
-        let (iter, cache_read_final) = if cache_read.is_some() {
-            // Reading from cache: drop the walker so its
-            // buffer-pool pin is released immediately.
-            drop(iter);
-            (None, cache_read)
-        } else {
-            (Some(iter), None)
-        };
-
         Self {
             iter,
             builders,
-            cache_read: cache_read_final,
+            cache_read,
             cache_build,
             heap,
             snapshot: snapshot_box,

@@ -59,6 +59,14 @@ impl Operator for Project {
     fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    /// Projection preserves the child's row cardinality one-for-one
+    /// (it only narrows the column set), so forward the child's hint
+    /// unchanged. Lets `run_select_streamed` size the wire buffer
+    /// exactly when the underlying scan replay knows its row count.
+    fn estimated_row_count(&self) -> Option<usize> {
+        self.child.estimated_row_count()
+    }
 }
 
 #[cfg(test)]

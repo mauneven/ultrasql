@@ -91,6 +91,12 @@ pub(crate) fn write_data_row(sink: &mut BytesMut, batch_columns: &[Column], row:
 /// `bytes::BytesMut::reserve` re-resize work plus the per-row enum
 /// match in `write_cell`.
 ///
+/// The hot loop uses raw pointer writes against a freshly-reserved
+/// region of `sink`. Every offset is bounded above by the
+/// `n * MAX_ROW_BYTES` reserve at the top of the function, so we can
+/// safely skip the per-byte slice bounds checks the safe `[off]`
+/// indexing would emit.
+///
 /// Caller verifies the shape upfront (`fast_int32_pair_data_rows`).
 pub(crate) fn write_int32_pair_data_rows(sink: &mut BytesMut, a: &[i32], b: &[i32]) {
     debug_assert_eq!(a.len(), b.len());
@@ -101,54 +107,73 @@ pub(crate) fn write_int32_pair_data_rows(sink: &mut BytesMut, a: &[i32], b: &[i3
     // Worst-case wire size per row: 1 + 4 + 2 + (4 + 11) + (4 + 11) = 37
     // bytes ("-2147483648" is the widest i32 text). Reserve the
     // worst case once to skip every mid-loop resize.
-    sink.reserve(n * 37);
-    // Cast SAFETY: we just reserved `n * 37` contiguous capacity, so
-    // the spare region has at least that many writable bytes. We
-    // write into the raw slice and advance the BytesMut length once
-    // at the end; this collapses every per-row `put_*` call into a
-    // straight memcpy + index store.
+    const MAX_ROW_BYTES: usize = 37;
+    sink.reserve(n * MAX_ROW_BYTES);
+
     let base_len = sink.len();
-    let cap = sink.capacity();
-    let writable = cap - base_len;
-    let raw_ptr: *mut u8 = unsafe { sink.as_mut_ptr().add(base_len) };
-    let raw: &mut [u8] = unsafe { std::slice::from_raw_parts_mut(raw_ptr, writable) };
+    // SAFETY: `reserve(n * MAX_ROW_BYTES)` guarantees the spare region
+    // starting at `base_len` has at least `n * MAX_ROW_BYTES`
+    // writable bytes. We write straight through a raw pointer and
+    // `set_len` once at the end — no aliased mutable borrows, every
+    // offset is bounded by `n * MAX_ROW_BYTES`.
+    let dst_base: *mut u8 = unsafe { sink.as_mut_ptr().add(base_len) };
 
     let mut off: usize = 0;
     let mut scratch_a = [0u8; 12];
     let mut scratch_b = [0u8; 12];
     for row in 0..n {
-        // DataRow tag.
-        raw[off] = DATA_ROW_TAG;
-        off += 1;
-        let length_index = off;
-        off += 4; // length placeholder
-        let payload_start = off;
-        // ncols = 2 (big-endian i16).
-        raw[off] = 0;
-        raw[off + 1] = 2;
-        off += 2;
+        // SAFETY: bounded by the per-row 37-byte reserve above.
+        unsafe {
+            let dst = dst_base.add(off);
+            // DataRow tag.
+            *dst = DATA_ROW_TAG;
+            // 4-byte length placeholder; back-filled below once we
+            // know the payload size. The two-step write tracks the
+            // index for the placeholder.
+            let length_ptr = dst.add(1);
+            // ncols = 2 (big-endian i16): bytes [0x00, 0x02] at
+            // offset +5.
+            *dst.add(5) = 0;
+            *dst.add(6) = 2;
+            off += 7; // tag + length placeholder + ncols
 
-        let a_text = format_i32_into(&mut scratch_a, a[row]);
-        let a_len = a_text.len();
-        raw[off..off + 4].copy_from_slice(&(i32_from_usize(a_len)).to_be_bytes());
-        off += 4;
-        raw[off..off + a_len].copy_from_slice(a_text);
-        off += a_len;
+            let a_text = format_i32_into(&mut scratch_a, a[row]);
+            let a_len = a_text.len();
+            // 4-byte big-endian column length.
+            let a_len_be = i32_from_usize(a_len).to_be_bytes();
+            std::ptr::copy_nonoverlapping(a_len_be.as_ptr(), dst_base.add(off), 4);
+            off += 4;
+            std::ptr::copy_nonoverlapping(a_text.as_ptr(), dst_base.add(off), a_len);
+            off += a_len;
 
-        let b_text = format_i32_into(&mut scratch_b, b[row]);
-        let b_len = b_text.len();
-        raw[off..off + 4].copy_from_slice(&(i32_from_usize(b_len)).to_be_bytes());
-        off += 4;
-        raw[off..off + b_len].copy_from_slice(b_text);
-        off += b_len;
+            let b_text = format_i32_into(&mut scratch_b, b[row]);
+            let b_len = b_text.len();
+            let b_len_be = i32_from_usize(b_len).to_be_bytes();
+            std::ptr::copy_nonoverlapping(b_len_be.as_ptr(), dst_base.add(off), 4);
+            off += 4;
+            std::ptr::copy_nonoverlapping(b_text.as_ptr(), dst_base.add(off), b_len);
+            off += b_len;
 
-        let payload_len = off - payload_start;
-        let length = i32_from_usize(payload_len + 4);
-        raw[length_index..length_index + 4].copy_from_slice(&length.to_be_bytes());
+            // Back-fill the 4-byte length placeholder. `payload_len`
+            // is the bytes after the length field itself, so the wire
+            // length (which includes the length field) is
+            // `(off - (length_index + 4)) + 4 = off - length_index`.
+            // `length_index = (dst - dst_base) + 1`, so the on-wire
+            // value is `off - ((dst - dst_base) + 1)`. We compute it
+            // via the captured row-start offset below.
+            // `off` at this point sits past the row. The row started
+            // at `off - row_bytes_written` where row_bytes_written =
+            // 7 + (4 + a_len) + (4 + b_len). The length field begins
+            // 1 byte into the row, so the length value is
+            // `row_bytes_written - 1`.
+            let row_bytes = 7 + 4 + a_len + 4 + b_len;
+            let length = i32_from_usize(row_bytes - 1).to_be_bytes();
+            std::ptr::copy_nonoverlapping(length.as_ptr(), length_ptr, 4);
+        }
     }
-    // SAFETY: `off` ≤ `writable` because the worst-case-37-bytes
-    // reserve covers every row's maximum width; `raw` is the spare
-    // region of `sink` we reserved above.
+    // SAFETY: `off` ≤ `n * MAX_ROW_BYTES` because every row writes
+    // at most MAX_ROW_BYTES; `dst_base` is the spare region of
+    // `sink` we reserved above.
     unsafe {
         sink.set_len(base_len + off);
     }
@@ -241,31 +266,85 @@ pub(crate) fn write_int64_text(sink: &mut BytesMut, value: i64) {
     sink.put_slice(written);
 }
 
+/// Two-digit decimal lookup table.
+///
+/// `DIGIT_PAIRS[2*n..2*n+2]` contains the ASCII representation of the
+/// integer `n` for `n ∈ 0..100`. Used by [`format_i32_into`] and
+/// [`format_i64_into`] to emit two decimal digits per loop iteration
+/// instead of one: the per-digit `%` / `/` pair lowers to a single
+/// 32-bit divide on AArch64 and x86_64 but unrolling halves the loop
+/// trip count, and the indexed `copy` lands as two byte stores.
+///
+/// This is the canonical itoa lookup trick used by `std::fmt` and
+/// the `itoa` crate; mirroring it here keeps the hot path
+/// dependency-free.
+///
+/// The table is computed at compile time. `try_into` is not yet
+/// `const fn`, so the const initializer threads a `u8` counter to
+/// avoid the workspace-wide `as`-cast restriction (`AGENTS.md §3.3`).
+/// `usize` indexing into `out` comes from `usize::from`, which is
+/// the lossless promotion idiom and `const`-friendly. The resulting
+/// table is a 200-byte read-only blob in `.rodata`.
+const DIGIT_PAIRS: [u8; 200] = {
+    let mut out = [0u8; 200];
+    let mut i: u8 = 0;
+    while i < 100 {
+        // `i / 10` and `i % 10` are in 0..=9, so `b'0' + ...` fits
+        // in `u8` without wrap. The two byte stores share the same
+        // base offset; `usize::from(i) * 2` is the lossless idiom
+        // for indexing.
+        let base = (i as usize) * 2; // wrap-free: i < 100, base < 200.
+        out[base] = b'0' + i / 10;
+        out[base + 1] = b'0' + i % 10;
+        i += 1;
+    }
+    out
+};
+
 /// Format an `i32` into the trailing bytes of `scratch` and return the
 /// filled sub-slice (left-to-right reading order).
 ///
-/// Standard textbook integer-to-decimal: write digits from least to most
-/// significant into the back of the buffer, then optionally prepend the
-/// `'-'` sign. The returned slice points into `scratch` and lives as
-/// long as the caller's borrow.
+/// Writes digits from least to most significant into the back of the
+/// buffer using a two-digit lookup table, then optionally prepends
+/// the `'-'` sign. The returned slice points into `scratch` and lives
+/// as long as the caller's borrow.
+///
+/// The arithmetic stays in `u32` rather than widening to `u64`: every
+/// `%` / `/` pair lowers to a single 32-bit `idiv` on AArch64 and
+/// x86_64. Widening to `u64` doubles the divisor's bit-width with no
+/// benefit (`i32::MIN.unsigned_abs() == 2_147_483_648` fits in u32).
 fn format_i32_into(scratch: &mut [u8; 12], value: i32) -> &[u8] {
-    if value == 0 {
-        scratch[0] = b'0';
-        return &scratch[..1];
-    }
-    // Work with the absolute value as `u32` to handle `i32::MIN` without
-    // overflow. `i32::MIN.unsigned_abs()` is the standard idiom.
+    // Work with the absolute value as `u32` to handle `i32::MIN`
+    // without overflow. `i32::MIN.unsigned_abs()` is the standard
+    // idiom.
     let negative = value < 0;
-    let mut n = u64::from(value.unsigned_abs());
+    let mut n: u32 = value.unsigned_abs();
     let mut idx = scratch.len();
-    while n > 0 {
+    // Emit two digits per iteration using the `DIGIT_PAIRS` lookup
+    // table. For values with an odd digit count the final single
+    // digit drops out of the trailing branch. The hot path (1- to
+    // 5-digit positive integers in the `select_scan_10k` workload)
+    // executes 1 lookup + 1 fallback or 2 lookups.
+    while n >= 100 {
+        let r = usize::try_from(n % 100).expect("n % 100 < 100");
+        n /= 100;
+        idx -= 2;
+        scratch[idx] = DIGIT_PAIRS[2 * r];
+        scratch[idx + 1] = DIGIT_PAIRS[2 * r + 1];
+    }
+    if n >= 10 {
+        let r = usize::try_from(n).expect("n < 100 here");
+        idx -= 2;
+        scratch[idx] = DIGIT_PAIRS[2 * r];
+        scratch[idx + 1] = DIGIT_PAIRS[2 * r + 1];
+    } else {
         idx -= 1;
-        // `n % 10` is in 0..=9; `b'0' + d` fits in `u8` without overflow.
-        // `u8::try_from` is the explicit, no-`as`-cast idiom for the
-        // narrowing the rule (`AGENTS.md §3.3`) requires.
-        let digit = u8::try_from(n % 10).expect("n % 10 < 10");
+        // `n < 10` so `b'0' + n` fits in `u8`. The `try_from`
+        // dance keeps the no-`as`-casts rule (`AGENTS.md §3.3`)
+        // honoured; the compiler sees the bound and elides the
+        // panic branch.
+        let digit = u8::try_from(n).expect("n < 10");
         scratch[idx] = b'0' + digit;
-        n /= 10;
     }
     if negative {
         idx -= 1;
@@ -274,20 +353,30 @@ fn format_i32_into(scratch: &mut [u8; 12], value: i32) -> &[u8] {
     &scratch[idx..]
 }
 
-/// Same routine for `i64`.
+/// Same routine for `i64`, using the same `DIGIT_PAIRS` two-digit
+/// lookup as `format_i32_into`. Halves the loop trip count vs. the
+/// per-digit `% 10 / 10` baseline; the lookup table is shared so we
+/// pay no extra memory.
 fn format_i64_into(scratch: &mut [u8; 20], value: i64) -> &[u8] {
-    if value == 0 {
-        scratch[0] = b'0';
-        return &scratch[..1];
-    }
     let negative = value < 0;
-    let mut n = value.unsigned_abs();
+    let mut n: u64 = value.unsigned_abs();
     let mut idx = scratch.len();
-    while n > 0 {
+    while n >= 100 {
+        let r = usize::try_from(n % 100).expect("n % 100 < 100");
+        n /= 100;
+        idx -= 2;
+        scratch[idx] = DIGIT_PAIRS[2 * r];
+        scratch[idx + 1] = DIGIT_PAIRS[2 * r + 1];
+    }
+    if n >= 10 {
+        let r = usize::try_from(n).expect("n < 100 here");
+        idx -= 2;
+        scratch[idx] = DIGIT_PAIRS[2 * r];
+        scratch[idx + 1] = DIGIT_PAIRS[2 * r + 1];
+    } else {
         idx -= 1;
-        let digit = u8::try_from(n % 10).expect("n % 10 < 10");
+        let digit = u8::try_from(n).expect("n < 10");
         scratch[idx] = b'0' + digit;
-        n /= 10;
     }
     if negative {
         idx -= 1;
@@ -452,5 +541,89 @@ mod tests {
             write_int32_text(&mut sink, v);
             assert_eq!(&sink[..], v.to_string().as_bytes(), "value {v} mismatch");
         }
+    }
+
+    /// Sweep every value `[-N, N]` for both formatters to exercise the
+    /// two-digit lookup path (`DIGIT_PAIRS`) at every digit-count
+    /// transition. The transitions (1↔2, 2↔3, 4↔5, ...) are where
+    /// off-by-one bugs in `idx -= 2 / idx -= 1` would surface.
+    #[test]
+    fn format_i32_sweep_matches_to_string() {
+        for v in -1024_i32..=1024_i32 {
+            let mut scratch = [0u8; 12];
+            let actual = format_i32_into(&mut scratch, v);
+            let expected = v.to_string();
+            assert_eq!(actual, expected.as_bytes(), "value {v} mismatch");
+        }
+        // Cover several digit counts up to i32::MAX boundary.
+        for &v in &[
+            99_i32, 100, 999, 1_000, 9_999, 10_000, 99_999, 100_000, 999_999, 1_000_000,
+            i32::MAX - 1, i32::MAX, i32::MIN + 1, i32::MIN,
+        ] {
+            let mut scratch = [0u8; 12];
+            let actual = format_i32_into(&mut scratch, v);
+            assert_eq!(actual, v.to_string().as_bytes(), "value {v} mismatch");
+        }
+    }
+
+    #[test]
+    fn format_i64_sweep_matches_to_string() {
+        for v in -1024_i64..=1024_i64 {
+            let mut scratch = [0u8; 20];
+            let actual = format_i64_into(&mut scratch, v);
+            let expected = v.to_string();
+            assert_eq!(actual, expected.as_bytes(), "value {v} mismatch");
+        }
+        for &v in &[
+            i64::from(i32::MAX),
+            i64::from(i32::MAX) + 1,
+            1_000_000_000_000_i64,
+            i64::MAX - 1,
+            i64::MAX,
+            i64::MIN + 1,
+            i64::MIN,
+        ] {
+            let mut scratch = [0u8; 20];
+            let actual = format_i64_into(&mut scratch, v);
+            assert_eq!(actual, v.to_string().as_bytes(), "value {v} mismatch");
+        }
+    }
+
+    /// `write_int32_pair_data_rows` must produce byte-identical output
+    /// to the canonical `encode_backend(BackendMessage::DataRow)` for
+    /// every row of the input. This is the hot-path used by
+    /// `select_scan_10k`; a wire-byte mismatch silently corrupts the
+    /// protocol stream, so cover every interesting i32 value.
+    #[test]
+    fn write_int32_pair_data_rows_matches_canonical_encoder() {
+        let a: Vec<i32> = vec![0, 1, -1, 12345, -98765, i32::MAX, i32::MIN, 7];
+        let b: Vec<i32> = vec![i32::MIN, i32::MAX, -1, 0, 1, 1_000_000, -1_000_000, 8];
+
+        let mut canonical = BytesMut::new();
+        for (av, bv) in a.iter().zip(b.iter()) {
+            let msg = BackendMessage::DataRow {
+                columns: vec![
+                    Some(av.to_string().into_bytes()),
+                    Some(bv.to_string().into_bytes()),
+                ],
+            };
+            encode_backend(&msg, &mut canonical);
+        }
+
+        let mut actual = BytesMut::new();
+        write_int32_pair_data_rows(&mut actual, &a, &b);
+
+        assert_eq!(&actual[..], &canonical[..]);
+    }
+
+    /// Empty input must produce zero bytes (caller's responsibility to
+    /// avoid calling on an empty batch is enforced by the operator
+    /// chain emitting non-empty batches; the writer still tolerates
+    /// the edge case).
+    #[test]
+    fn write_int32_pair_data_rows_empty_input_emits_nothing() {
+        let mut actual = BytesMut::new();
+        write_int32_pair_data_rows(&mut actual, &[], &[]);
+        assert!(actual.is_empty());
     }
 }

@@ -60,17 +60,22 @@ where
 {
     /// Best-effort parse + bind that returns `Some(plan)` only when `sql`
     /// is a single `COPY` statement.
+    ///
+    /// The prefix probe stays alloc-free: every non-COPY query (i.e.
+    /// every `SELECT` / DML on the `select_scan_10k` hot path) lands
+    /// here once per call, and a `String`-collecting lowercase round
+    /// trip would dominate the per-query budget on a small relation.
+    /// `sql.trim_start().as_bytes().get(..4)` returns the first four
+    /// bytes (or `None` for shorter inputs); `eq_ignore_ascii_case`
+    /// against the literal `b"COPY"` runs as a 4-byte compare without
+    /// touching the heap.
     pub(crate) fn try_bind_copy_plan(
         &mut self,
         sql: &str,
     ) -> Result<Option<LogicalPlan>, ServerError> {
         let trimmed = sql.trim_start();
-        let prefix: String = trimmed
-            .chars()
-            .take(4)
-            .map(|c| c.to_ascii_lowercase())
-            .collect();
-        if prefix != "copy" {
+        let head = trimmed.as_bytes().get(..4).unwrap_or_default();
+        if !head.eq_ignore_ascii_case(b"COPY") {
             return Ok(None);
         }
 
