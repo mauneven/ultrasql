@@ -155,6 +155,25 @@ pub struct Transaction {
     pub subtxn_stack: SubtxnManager,
 }
 
+impl Transaction {
+    /// Return the XID writes performed *right now* should carry in
+    /// their tuple header `xmin`/`xmax`.
+    ///
+    /// When no savepoint is active this is the parent
+    /// [`Self::xid`]. When a savepoint is active the top of the
+    /// subtxn stack returns the inner subtxn's XID, so a subsequent
+    /// `ROLLBACK TO` that aborts only that subxid hides exactly the
+    /// rows written under that savepoint via the standard MVCC
+    /// visibility rules.
+    #[must_use]
+    pub fn current_xid(&self) -> Xid {
+        self.subtxn_stack
+            .stack_snapshot()
+            .last()
+            .map_or(self.xid, |sp| sp.xid)
+    }
+}
+
 /// The transaction manager.
 ///
 /// Owns the XID counter and the in-memory CLOG. One instance per server;

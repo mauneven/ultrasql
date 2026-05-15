@@ -356,7 +356,7 @@ where
                     heap: Arc::clone(&self.state.heap),
                     snapshot: txn.snapshot.clone(),
                     oracle: Arc::clone(&self.state.txn_manager),
-                    xid: txn.xid,
+                    xid: txn.current_xid(),
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
                 };
@@ -388,7 +388,11 @@ where
                     heap: Arc::clone(&self.state.heap),
                     snapshot: txn.snapshot.clone(),
                     oracle: Arc::clone(&self.state.txn_manager),
-                    xid: txn.xid,
+                    // Stamp writes with the *current* effective xid so
+                    // SAVEPOINT-scoped INSERT/UPDATE/DELETE carry the
+                    // subxact xid in xmin/xmax. ROLLBACK TO can then
+                    // hide them by aborting that subxid in the CLOG.
+                    xid: txn.current_xid(),
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
                 };

@@ -636,7 +636,11 @@ fn run_plan_in_txn(
         heap,
         snapshot: txn.snapshot.clone(),
         oracle,
-        xid: txn.xid,
+        // Use the *current* effective xid so writes performed inside an
+        // active SAVEPOINT carry the subxact xid in their tuple header
+        // rather than the parent xid; ROLLBACK TO can then hide them
+        // via the standard MVCC visibility rules.
+        xid: txn.current_xid(),
         command_id: txn.current_command,
         cte_buffers: std::collections::HashMap::new(),
     };
