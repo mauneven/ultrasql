@@ -126,7 +126,10 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         | LogicalPlan::PrepareTransaction { .. }
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
-        | LogicalPlan::SetTransaction { .. } => false,
+        | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::Listen { .. }
+        | LogicalPlan::Notify { .. }
+        | LogicalPlan::Unlisten { .. } => false,
         LogicalPlan::Filter { input, predicate } => {
             expr_contains_outer(predicate) || plan_contains_outer_column(input)
         }
@@ -197,6 +200,7 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
                 || returning.iter().any(|(e, _)| expr_contains_outer(e))
         }
         LogicalPlan::Explain { input, .. } => plan_contains_outer_column(input),
+        LogicalPlan::Copy { .. } => false,
     }
 }
 

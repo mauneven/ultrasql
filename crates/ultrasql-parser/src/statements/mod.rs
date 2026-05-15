@@ -14,6 +14,7 @@ pub(crate) mod drop_index;
 pub(crate) mod drop_table;
 pub(crate) mod explain;
 pub(crate) mod insert;
+pub(crate) mod listen;
 pub(crate) mod prepare;
 pub(crate) mod savepoint;
 pub(crate) mod select;

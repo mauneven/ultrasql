@@ -253,7 +253,12 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
         | LogicalPlan::PrepareTransaction { .. }
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
-        | LogicalPlan::SetTransaction { .. } => {}
+        | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::Listen { .. }
+        | LogicalPlan::Notify { .. }
+        | LogicalPlan::Unlisten { .. }
+        | LogicalPlan::Explain { .. }
+        | LogicalPlan::Copy { .. } => {}
         LogicalPlan::Filter { input, predicate } => {
             walk_plan_for_max_param(input, max_idx);
             walk_expr_for_max_param(predicate, max_idx);
@@ -328,7 +333,6 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
             }
         }
         LogicalPlan::Delete { input, .. } => walk_plan_for_max_param(input, max_idx),
-        LogicalPlan::Explain { input, .. } => walk_plan_for_max_param(input, max_idx),
     }
 }
 

@@ -29,6 +29,7 @@ use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
 use super::Session;
+use super::notify::ReadOrNotify;
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
@@ -57,10 +58,34 @@ where
     ///   server emits `ReadyForQuery`.
     pub(crate) async fn run(&mut self) -> Result<(), ServerError> {
         loop {
-            let msg = match self.read_frontend().await {
-                Ok(m) => m,
-                Err(ServerError::UnexpectedEof) => return Ok(()),
-                Err(other) => return Err(other),
+            // Race the socket read against the notification receiver so
+            // an idle session can push a `NotificationResponse` the
+            // moment it arrives, rather than waiting for the next
+            // client-initiated `Sync`. We poll the two halves
+            // explicitly via a manually-constructed future so neither
+            // branch needs to share a borrow of `self` with the other.
+            //
+            // Cancel-safety:
+            // - `tokio::io::AsyncReadExt::read_buf` is cancel-safe; the
+            //   bytes already accumulated in `self.read_buf` survive a
+            //   dropped read future.
+            // - `mpsc::UnboundedReceiver::poll_recv` only consumes a
+            //   record when it returns `Poll::Ready(Some(_))`.
+            let msg = match self.read_frontend_or_notify().await? {
+                ReadOrNotify::Frontend(m) => m,
+                ReadOrNotify::Eof => return Ok(()),
+                ReadOrNotify::Notification(record) => {
+                    // Idle-path delivery. Encode and flush immediately —
+                    // there is no in-flight pipeline to wait on.
+                    let process_id = i32::from_le_bytes(record.notifier_pid.to_le_bytes());
+                    self.send(&BackendMessage::NotificationResponse {
+                        process_id,
+                        channel: record.channel,
+                        payload: record.payload,
+                    })
+                    .await?;
+                    continue;
+                }
             };
             match msg {
                 FrontendMessage::Query { sql } => {
@@ -146,20 +171,39 @@ where
     pub(crate) async fn handle_query(&mut self, sql: &str) -> Result<(), ServerError> {
         let trimmed = sql.trim();
         if trimmed.is_empty() || trimmed == ";" {
-            // Coalesce `EmptyQueryResponse` + `ReadyForQuery` into one
-            // `write_all` so the empty-query reply stays a single
-            // syscall round-trip.
-            self.write_buf.clear();
-            encode_backend(&BackendMessage::EmptyQueryResponse, &mut self.write_buf);
+            // Coalesce `EmptyQueryResponse` + any pending notifications
+            // + `ReadyForQuery` into one `write_all` so the empty-query
+            // reply stays a single syscall round-trip.
+            let mut scratch = std::mem::take(&mut self.write_buf);
+            scratch.clear();
+            encode_backend(&BackendMessage::EmptyQueryResponse, &mut scratch);
+            self.drain_pending_notifications_into(&mut scratch);
             encode_backend(
                 &BackendMessage::ReadyForQuery {
                     status: self.txn_state.ready_for_query_status(),
                 },
-                &mut self.write_buf,
+                &mut scratch,
             );
-            self.io.write_all(&self.write_buf).await?;
+            let res = self.io.write_all(&scratch).await;
+            scratch.clear();
+            self.write_buf = scratch;
+            res?;
             self.io.flush().await?;
             return Ok(());
+        }
+
+        // COPY needs the async wire flow.
+        match self.try_bind_copy_plan(trimmed) {
+            Ok(Some(plan)) => return self.handle_copy_statement(&plan).await,
+            Ok(None) => {}
+            Err(err) => {
+                if !err.is_query_scoped() {
+                    return Err(err);
+                }
+                return self
+                    .send_error_with_ready(&err.to_string(), err.sqlstate())
+                    .await;
+            }
         }
 
         match self.execute_query(trimmed) {
@@ -188,6 +232,12 @@ where
 
     /// Send the query result and the trailing `ReadyForQuery` in one
     /// `write_all`. See `handle_query` for motivation.
+    ///
+    /// Any pending `LISTEN` notifications are appended *between* the
+    /// result body and `ReadyForQuery` so libpq routes them via the
+    /// async-message callback before the next query begins. The drain
+    /// is non-blocking (`try_recv`) — only records the hub has already
+    /// delivered participate.
     #[inline]
     pub(crate) async fn send_query_result_with_ready(
         &mut self,
@@ -196,32 +246,38 @@ where
         let ready = BackendMessage::ReadyForQuery {
             status: self.txn_state.ready_for_query_status(),
         };
-        // Streamed-body path: append `ReadyForQuery` directly to the
-        // result's existing `BytesMut` and write it out without an
-        // extra round through `self.write_buf`. For a 10 000-row
-        // `select_scan_10k` response that streamed body is ~250 KB;
-        // copying it into a second buffer used to add a memcpy of
-        // the whole response on every query. Appending `ready` (5
-        // bytes) to the tail keeps the wire reply on a single
+        // Streamed-body path: append notifications + `ReadyForQuery`
+        // directly to the result's existing `BytesMut` and write it out
+        // without an extra round through `self.write_buf`. For a
+        // 10 000-row `select_scan_10k` response that streamed body is
+        // ~250 KB; copying it into a second buffer used to add a memcpy
+        // of the whole response on every query. Appending the trailer
+        // bytes to the tail keeps the wire reply on a single
         // `write_all` + `flush` and saves the per-byte copy.
-        if let Some(body) = result.streamed_body.as_mut() {
-            encode_backend(&ready, body);
-            self.io.write_all(body).await?;
+        if let Some(mut body) = result.streamed_body.take() {
+            self.drain_pending_notifications_into(&mut body);
+            encode_backend(&ready, &mut body);
+            self.io.write_all(&body).await?;
             self.io.flush().await?;
             return Ok(());
         }
-        self.write_buf.clear();
+        let mut scratch = std::mem::take(&mut self.write_buf);
+        scratch.clear();
         for msg in &result.messages {
-            encode_backend(msg, &mut self.write_buf);
+            encode_backend(msg, &mut scratch);
         }
-        encode_backend(&ready, &mut self.write_buf);
-        self.io.write_all(&self.write_buf).await?;
+        self.drain_pending_notifications_into(&mut scratch);
+        encode_backend(&ready, &mut scratch);
+        let res = self.io.write_all(&scratch).await;
+        scratch.clear();
+        self.write_buf = scratch;
+        res?;
         self.io.flush().await?;
         Ok(())
     }
 
-    /// Send an `ErrorResponse` immediately followed by `ReadyForQuery`
-    /// in one `write_all`.
+    /// Send an `ErrorResponse` immediately followed by any pending
+    /// notifications and `ReadyForQuery` in one `write_all`.
     pub(crate) async fn send_error_with_ready(
         &mut self,
         message: &str,
@@ -237,10 +293,15 @@ where
         let ready = BackendMessage::ReadyForQuery {
             status: self.txn_state.ready_for_query_status(),
         };
-        self.write_buf.clear();
-        encode_backend(&err, &mut self.write_buf);
-        encode_backend(&ready, &mut self.write_buf);
-        self.io.write_all(&self.write_buf).await?;
+        let mut scratch = std::mem::take(&mut self.write_buf);
+        scratch.clear();
+        encode_backend(&err, &mut scratch);
+        self.drain_pending_notifications_into(&mut scratch);
+        encode_backend(&ready, &mut scratch);
+        let res = self.io.write_all(&scratch).await;
+        scratch.clear();
+        self.write_buf = scratch;
+        res?;
         self.io.flush().await?;
         Ok(())
     }

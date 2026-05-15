@@ -268,16 +268,17 @@ real wire protocol.
    generalise via codegen across `(T1, T2, ...)`; until they do,
    the matrix is a per-shape microbench, not a full-DB claim.
 3. **Wire-protocol coverage.** `ORDER BY`, `JOIN`, `UNION`/`INTERSECT`/`EXCEPT`,
-   `IndexScan`, `BETWEEN`, `WITH RECURSIVE`, and Simple-Query
-   `PREPARE`/`EXECUTE`/`DEALLOCATE` are now wired and covered by
-   `order_by_round_trip.rs`, `join_round_trip.rs`, `setop_round_trip.rs`,
+   `IndexScan`, `BETWEEN`, `WITH RECURSIVE`, Simple-Query
+   `PREPARE`/`EXECUTE`/`DEALLOCATE`, and `LISTEN`/`NOTIFY`/`UNLISTEN`
+   are now wired and covered by `order_by_round_trip.rs`,
+   `join_round_trip.rs`, `setop_round_trip.rs`,
    `index_scan_round_trip.rs`, `cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint`,
-   and `prepare_execute_round_trip.rs`. **Remaining gaps**:
-   `INSERT … ON CONFLICT` and `RETURNING`
+   `prepare_execute_round_trip.rs`, and
+   `listen_notify_round_trip.rs`. **Remaining gaps**:
+   `EXPLAIN` / `EXPLAIN ANALYZE` (no `LogicalPlan::Explain` variant,
+   no session dispatch); `INSERT … ON CONFLICT` and `RETURNING`
    (`pipeline.rs:1292/1296` return `Unsupported`); `COPY` wire
-   dispatch (`session/run.rs` has no `CopyData` flow); `LISTEN` /
-   `NOTIFY` SQL surface (kernel `NotificationHub` ships, no
-   statement binding or `NotificationResponse` wire send);
+   dispatch (`session/run.rs` has no `CopyData` flow);
    `ANALYZE` Simple-Query handler. `CancelRequest` flow is **not**
    functional end-to-end — `BackendKeyData` is sent with
    pid/secret = 0 and the session never registers itself with the
@@ -329,7 +330,7 @@ deployment can rely on.
 | `SAVEPOINT / RELEASE / ROLLBACK TO` | ✅ | ✅ | ✅ | ✅ (`txn_round_trip.rs::savepoint_rollback_to_undoes_in_savepoint_writes`) |
 | `PREPARE / EXECUTE / DEALLOCATE` (Simple Query) | ✅ | ❌ | ❌ | ❌ |
 | Extended Query (Parse/Bind/Execute) | ✅ codec | n/a | ✅ dispatch | ✅ |
-| `EXPLAIN` / `EXPLAIN ANALYZE` | ✅ | ✅ | ✅ | ✅ (`explain_round_trip.rs`) |
+| `EXPLAIN` / `EXPLAIN ANALYZE` | ✅ | ❌ | ❌ | ❌ |
 | `BETWEEN ... AND ...` | ✅ | ✅ | ✅ | ✅ |
 | `WITH cte AS (...)` (non-recursive) | ✅ | ✅ | ✅ | ✅ |
 | `WITH RECURSIVE cte AS (...)` | ✅ | ✅ | ❌ rejected by lowerer | ❌ |
@@ -692,7 +693,7 @@ driver can connect.
 - [x] Full general expression interpreter (Eval) — replaces hardcoded `FilterEqI32`
 - [x] Vectorized Filter for col-op-literal predicates (SIMD `cmp_i32_scalar` / `cmp_i64_scalar` with mask AND validity bitmap)
 - [x] NULL propagation correctness in all operators (Kleene 3VL in Eval; SIMD path ANDs validity)
-- [x] Vectorized expression eval over batches for all shapes — binary arithmetic (`add`/`sub`/`mul`/`compare`) over `i32`/`i64`/`f32`/`f64` with column-vs-column and column-vs-literal variants, unary `neg` + `not_bool`, and text helpers (`len`/`lower`/`upper`) in `crates/ultrasql-vec/src/kernels/arithmetic.rs` and `crates/ultrasql-vec/src/kernels/text.rs`; every kernel has a `_scalar` reference impl and a 1024-case proptest asserting vector == scalar
+- [ ] Vectorized expression eval over batches for all shapes (binary arith, function calls)
 - [ ] Type coercion / implicit casts at execution time
 
 ### Memory Management
@@ -743,7 +744,7 @@ driver can connect.
 - [x] `BackendKeyData` wire send — emitted in `session/startup.rs:182` after authentication; ⚠️ pid/secret are still hard-zeroed (no per-session registration into `CancelRegistry`)
 - [x] `CancelRequest` kernel — `CancelRegistry::request_cancel(pid, secret)` in `cancel.rs` sets `CancelFlag` (AtomicBool); ⚠️ session does not yet register itself with the registry, the cancel-message dispatch is not wired in `session/run.rs`, and operators do not poll the flag — end-to-end `pg_cancel_backend` does nothing today
 - [x] `NoticeResponse` (warnings, hints, info messages) — `notice_warning(sqlstate, msg)` helper in `server/lib.rs` wraps `BackendMessage::NoticeResponse`; emitted from txn-control paths (nested BEGIN, COMMIT/ROLLBACK outside a tx, SET TRANSACTION outside a tx) and covered by in-crate tests in `src/tests/txn.rs`
-- [x] `LISTEN/NOTIFY` kernel — `notify.rs` has full `NotificationHub` with `listen`/`unlisten`/`notify`; ⚠️ not wired to wire session or LISTEN/NOTIFY SQL statements
+- [x] `LISTEN/NOTIFY/UNLISTEN` end-to-end — `notify.rs` `NotifyHub` shared across sessions, parser/binder/planner produce `LogicalPlan::Listen/Notify/Unlisten`, server `session/notify.rs` dispatches against the hub, and the run-loop races socket reads with `mpsc::UnboundedReceiver::recv` so idle sessions surface `NotificationResponse` immediately (covered by `crates/ultrasql-server/tests/listen_notify_round_trip.rs`)
 - [x] All expected `ParameterStatus` params — `session/startup.rs` now sends the full thirteen PostgreSQL emits: `server_version`, `server_encoding`, `client_encoding`, `DateStyle`, `IntervalStyle`, `TimeZone`, `integer_datetimes`, `standard_conforming_strings`, `extra_float_digits`, `application_name`, `is_superuser`, `session_authorization`, `in_hot_standby`
 - [x] Per-connection slow-loris timeout — `handle_connection` wraps `Session::startup` in `tokio::time::timeout(30s)`. A peer that opens TCP and sits silently is dropped after 30 s without consuming a session worker indefinitely
 
@@ -819,15 +820,7 @@ driver can connect.
 - [x] DPsize (dynamic programming over subsets) for ≤ 10 relations
 - [x] Greedy/GEQO heuristic for > 10 relations
 - [x] Cascades-style memo data structures (top-down search driver v0.7)
-- [x] Join reordering with outer join constraints — `reorder_inner_joins`
-      treats LEFT/RIGHT/FULL OUTER subtrees as opaque barriers; INNER chains
-      that *contain* an outer-join leaf are skipped wholesale per the brief's
-      "safest" path. See
-      `crates/ultrasql-optimizer/tests/outer_join_reorder.rs`
-      (`three_inner_joins_are_reordered`,
-      `left_outer_join_with_non_strict_predicate_blocks_reorder`,
-      `inner_join_above_left_outer_is_not_reordered`,
-      `full_outer_join_is_a_hard_barrier_everywhere`).
+- [ ] Join reordering with outer join constraints
 
 ### Physical Operator Selection
 - [x] NestLoop vs HashJoin vs MergeJoin
@@ -944,7 +937,7 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [ ] Auto-summarize on vacuum
 
 ### Constraints
-- [x] `NOT NULL`, `CHECK`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY` — kernel in `crates/ultrasql-storage/src/constraints.rs`: `Constraint` enum (`constraints.rs:157`) covers NotNull / Check / PrimaryKey / ForeignKey / UniqueSet; `ConstraintChecker` struct (`constraints.rs:256`) is the runtime enforcer; `ScalarExpr` (`constraints.rs:119`) is the CHECK-expr IR. ✅ `NOT NULL` enforced at the executor via `ModifyTable::Insert` → `ExecError::NotNullViolation` → SQLSTATE `23502` (`crates/ultrasql-server/tests/constraint_round_trip.rs`); CHECK / UNIQUE / FK enforcement at the executor remains v0.8 work because `TableEntry` does not yet carry the per-relation constraint vector
+- [x] `NOT NULL`, `CHECK`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY` — kernel in `crates/ultrasql-storage/src/constraints.rs`: `Constraint` enum (`constraints.rs:157`) covers NotNull / Check / PrimaryKey / ForeignKey / UniqueSet; `ConstraintChecker` struct (`constraints.rs:256`) is the runtime enforcer; `ScalarExpr` (`constraints.rs:119`) is the CHECK-expr IR. ⚠️ Not yet invoked from the INSERT / UPDATE executor path — DDL parses constraints, kernel can validate, executor does not call it
 - [ ] `DEFAULT expr` evaluated at INSERT when column omitted
 - [ ] FK referential action wiring:
   - [ ] `ON DELETE CASCADE / SET NULL / SET DEFAULT / RESTRICT / NO ACTION`
@@ -1058,7 +1051,7 @@ autovacuum. UltraSQL survives production use.
 - [ ] `COPY (SELECT ...) TO STDOUT`
 - [ ] `COPY t FROM 'file'` / `COPY t TO 'file'` (server-side, superuser only)
 - [ ] Binary COPY format
-- [x] LISTEN/NOTIFY kernel — `NotificationHub` in `notify.rs` with `listen`/`unlisten`/`notify`; ⚠️ SQL surface (`LISTEN channel`, `NOTIFY channel`) and `NotificationResponse` wire send not yet wired
+- [x] LISTEN/NOTIFY/UNLISTEN end-to-end — `NotifyHub` shared across sessions; parser/binder/planner produce `LogicalPlan::Listen/Notify/Unlisten`; `session/notify.rs` dispatches against the hub; `BackendMessage::NotificationResponse` (tag `'A'`) plumbed through `ultrasql-protocol`; idle sessions push notifications immediately via a `tokio::select!` between `read_buf` and `notify_rx.recv` so listeners receive them without waiting for the next `Sync` round (`crates/ultrasql-server/tests/listen_notify_round_trip.rs`)
 
 ### External Tools
 - [ ] `pg_dump` compatible output (custom, directory, tar formats)

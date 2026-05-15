@@ -306,21 +306,39 @@ where
                     }
                 }
             }
-
-            // EXPLAIN: render the wrapped plan tree into the
-            // `"QUERY PLAN"` Text column the client expects. Routed
-            // through the same `execute_explain` helper used by the
-            // Simple Query path so the two surfaces stay in lock-step.
-            // Drop the leading `RowDescription` because the Extended
-            // Query protocol delivers it via a separate `Describe`
-            // message — sending it again here would surface as an
-            // `UnexpectedMessage` on the client side.
+            // Pub-sub plans bypass the transaction system entirely.
+            if matches!(
+                plan,
+                LogicalPlan::Listen { .. }
+                    | LogicalPlan::Notify { .. }
+                    | LogicalPlan::Unlisten { .. }
+            ) {
+                match self.execute_pubsub(plan) {
+                    Ok(result) => {
+                        for m in &result.messages {
+                            self.send(m).await?;
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if !e.is_query_scoped() {
+                            return Err(e);
+                        }
+                        self.extended.mark_failed();
+                        return self.send_error(&e.to_string(), e.sqlstate()).await;
+                    }
+                }
+            }
+            // EXPLAIN: render the wrapped plan tree. Drop the leading
+            // RowDescription because Extended Query delivers it via a
+            // separate Describe message.
             if matches!(plan, LogicalPlan::Explain { .. }) {
-                let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+                let catalog_snapshot = self.state.catalog_snapshot();
                 match self.execute_explain(plan, &catalog_snapshot) {
                     Ok(result) => {
                         for m in &result.messages {
-                            if matches!(m, BackendMessage::RowDescription { .. }) {
+                            if matches!(m, ultrasql_protocol::BackendMessage::RowDescription { .. })
+                            {
                                 continue;
                             }
                             self.send(m).await?;
@@ -442,15 +460,36 @@ where
         }
     }
 
-    /// Handle `Sync`. Emits a `ReadyForQuery` carrying the session's
+    /// Handle `Sync`. Drains any queued `LISTEN` notifications onto the
+    /// wire and emits a `ReadyForQuery` carrying the session's
     /// current transaction state byte (`'I'` idle, `'T'` in a
     /// transaction block, `'E'` in a failed transaction block).
     pub(crate) async fn handle_sync(&mut self) -> Result<(), ServerError> {
         self.extended.reset_on_sync();
-        self.send(&BackendMessage::ReadyForQuery {
-            status: self.txn_state.ready_for_query_status(),
-        })
-        .await
+        // Compose the wire payload in a scratch buffer borrowed from the
+        // session: notifications first, then `ReadyForQuery`, then a
+        // single `write_all` + `flush`. Taking the buffer breaks the
+        // mutable-borrow conflict between `self.write_buf` and the
+        // `self.notify_rx.try_recv()` calls below.
+        let mut scratch = std::mem::take(&mut self.write_buf);
+        scratch.clear();
+        // Notifications that arrived while the session was mid-pipeline
+        // precede `ReadyForQuery` per the PostgreSQL convention so
+        // libpq-style drivers route them via the async notification
+        // callback before the next query is dispatched.
+        self.drain_pending_notifications_into(&mut scratch);
+        ultrasql_protocol::encode_backend(
+            &BackendMessage::ReadyForQuery {
+                status: self.txn_state.ready_for_query_status(),
+            },
+            &mut scratch,
+        );
+        let res = self.io.write_all(&scratch).await;
+        scratch.clear();
+        self.write_buf = scratch;
+        res?;
+        self.io.flush().await?;
+        Ok(())
     }
 
     /// Handle `Close(kind, name)`. Always emits `CloseComplete` even

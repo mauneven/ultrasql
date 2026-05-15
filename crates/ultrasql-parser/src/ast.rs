@@ -127,6 +127,34 @@ pub enum Statement {
         /// Source span.
         span: Span,
     },
+    /// `LISTEN channel` — subscribe this session to async notifications on
+    /// `channel`. The channel name is taken verbatim from the identifier
+    /// (case-folded for unquoted names, source-case for quoted names).
+    Listen {
+        /// Target channel identifier.
+        channel: Identifier,
+        /// Source span.
+        span: Span,
+    },
+    /// `NOTIFY channel [, 'payload']` — deliver `payload` (the empty string
+    /// if omitted) to every session currently listening on `channel`.
+    Notify {
+        /// Target channel identifier.
+        channel: Identifier,
+        /// Optional payload string literal. `None` when omitted; a present
+        /// `Some(String)` carries the literal's unquoted content.
+        payload: Option<String>,
+        /// Source span.
+        span: Span,
+    },
+    /// `UNLISTEN { channel | * }` — drop one or all of this session's
+    /// channel subscriptions. `None` means `UNLISTEN *` (drop all).
+    Unlisten {
+        /// Target channel identifier, or `None` for the `*` form.
+        channel: Option<Identifier>,
+        /// Source span.
+        span: Span,
+    },
 }
 
 impl Statement {
@@ -163,7 +191,10 @@ impl Statement {
             Self::PrepareTransaction { span, .. }
             | Self::CommitPrepared { span, .. }
             | Self::RollbackPrepared { span, .. }
-            | Self::SetTransaction { span, .. } => *span,
+            | Self::SetTransaction { span, .. }
+            | Self::Listen { span, .. }
+            | Self::Notify { span, .. }
+            | Self::Unlisten { span, .. } => *span,
         }
     }
 }

@@ -640,7 +640,11 @@ fn infer_into(
         | LogicalPlan::PrepareTransaction { .. }
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
-        | LogicalPlan::SetTransaction { .. } => {}
+        | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::Listen { .. }
+        | LogicalPlan::Notify { .. }
+        | LogicalPlan::Unlisten { .. }
+        | LogicalPlan::Copy { .. } => {}
         LogicalPlan::Explain { input, .. } => infer_into(input, catalog, out),
         LogicalPlan::Filter { input, predicate } => {
             infer_into(input, catalog, out);
@@ -931,7 +935,11 @@ fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut F) {
         | LogicalPlan::PrepareTransaction { .. }
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
-        | LogicalPlan::SetTransaction { .. } => {}
+        | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::Listen { .. }
+        | LogicalPlan::Notify { .. }
+        | LogicalPlan::Unlisten { .. }
+        | LogicalPlan::Copy { .. } => {}
         LogicalPlan::Explain { input, .. } => walk_plan_exprs(input, f),
         LogicalPlan::Filter { input, predicate } => {
             walk_plan_exprs(input, f);
@@ -1296,18 +1304,12 @@ where
         | LogicalPlan::PrepareTransaction { .. }
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
-        | LogicalPlan::SetTransaction { .. } => plan.clone(),
-        LogicalPlan::Explain {
-            analyze,
-            format,
-            input,
-            schema,
-        } => LogicalPlan::Explain {
-            analyze: *analyze,
-            format: *format,
-            input: Box::new(map_plan_exprs(input, f)),
-            schema: schema.clone(),
-        },
+        | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::Listen { .. }
+        | LogicalPlan::Notify { .. }
+        | LogicalPlan::Unlisten { .. }
+        | LogicalPlan::Copy { .. }
+        | LogicalPlan::Explain { .. } => plan.clone(),
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(map_plan_exprs(input, f)),
             predicate: f(predicate),
@@ -1735,6 +1737,10 @@ fn row_description_for_plan(plan: &LogicalPlan) -> BackendMessage {
             | LogicalPlan::PrepareTransaction { .. }
             | LogicalPlan::CommitPrepared { .. }
             | LogicalPlan::RollbackPrepared { .. }
+            | LogicalPlan::SetTransaction { .. }
+            | LogicalPlan::Listen { .. }
+            | LogicalPlan::Notify { .. }
+            | LogicalPlan::Unlisten { .. }
     ) || matches!(plan, LogicalPlan::Insert { returning, .. } if returning.is_empty())
         || matches!(plan, LogicalPlan::Update { returning, .. } if returning.is_empty())
         || matches!(plan, LogicalPlan::Delete { returning, .. } if returning.is_empty());

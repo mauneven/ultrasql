@@ -387,6 +387,13 @@ pub enum TokenKind {
     KwRepeatable,
     /// `UNCOMMITTED` — `READ UNCOMMITTED` (aliased to READ COMMITTED).
     KwUncommitted,
+    // ---- LISTEN/NOTIFY/UNLISTEN keywords (v0.9 pub-sub surface) -------------
+    /// `LISTEN` — `LISTEN channel`.
+    KwListen,
+    /// `NOTIFY` — `NOTIFY channel [, payload]`.
+    KwNotify,
+    /// `UNLISTEN` — `UNLISTEN { channel | * }`.
+    KwUnlisten,
 }
 
 impl TokenKind {

@@ -177,8 +177,56 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
                 schema: Schema::empty(),
             })
         }
+        Statement::Listen { channel, .. } => Ok(LogicalPlan::Listen {
+            // Unquoted identifiers are case-folded at parse time, so the
+            // value already lower-cases. Quoted identifiers retain their
+            // source case; we trust the parser's policy.
+            channel: channel.value.clone(),
+            schema: Schema::empty(),
+        }),
+        Statement::Notify {
+            channel, payload, ..
+        } => Ok(LogicalPlan::Notify {
+            channel: channel.value.clone(),
+            payload: payload.clone(),
+            schema: Schema::empty(),
+        }),
+        Statement::Unlisten { channel, .. } => Ok(LogicalPlan::Unlisten {
+            channel: channel.as_ref().map(|id| id.value.clone()),
+            schema: Schema::empty(),
+        }),
         _ => Err(PlanError::NotSupported("statement variant")),
     }
+}
+
+/// Bind an `EXPLAIN [ANALYZE] [(FORMAT TEXT|JSON)] stmt`.
+fn bind_explain(
+    stmt: &ExplainStmt,
+    catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
+    let inner = match &*stmt.statement {
+        Statement::Select(s) => bind_select(s, catalog, scope)?,
+        Statement::Insert(s) => bind_insert(s, catalog, scope)?,
+        Statement::Update(s) => bind_update(s, catalog, scope)?,
+        Statement::Delete(s) => bind_delete(s, catalog, scope)?,
+        _ => return Err(PlanError::NotSupported("EXPLAIN of this statement kind")),
+    };
+    let format = match stmt.format {
+        AstExplainFormat::Text => ExplainFormat::Text,
+        AstExplainFormat::Json => ExplainFormat::Json,
+    };
+    let schema = Schema::new([Field::nullable(
+        "QUERY PLAN",
+        DataType::Text { max_len: None },
+    )])
+    .map_err(|e| PlanError::TypeMismatch(format!("EXPLAIN schema: {e}")))?;
+    Ok(LogicalPlan::Explain {
+        analyze: stmt.analyze,
+        format,
+        input: Box::new(inner),
+        schema,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -198,45 +246,6 @@ struct ScopeEntry {
     field_index: usize,
     /// The field itself (type + name).
     field: Field,
-}
-
-/// Bind an `EXPLAIN [ANALYZE] [(FORMAT TEXT|JSON)] stmt`.
-///
-/// Recursively binds the wrapped statement, then wraps it in
-/// [`LogicalPlan::Explain`] with the single-column `QUERY PLAN`
-/// output schema PostgreSQL uses.
-fn bind_explain(
-    stmt: &ExplainStmt,
-    catalog: &dyn Catalog,
-    scope: &mut ScopeStack,
-) -> Result<LogicalPlan, PlanError> {
-    let inner = match &*stmt.statement {
-        Statement::Select(s) => bind_select(s, catalog, scope)?,
-        Statement::Insert(s) => bind_insert(s, catalog, scope)?,
-        Statement::Update(s) => bind_update(s, catalog, scope)?,
-        Statement::Delete(s) => bind_delete(s, catalog, scope)?,
-        other => {
-            return Err(PlanError::NotSupported(match other {
-                Statement::Explain(_) => "EXPLAIN inside EXPLAIN",
-                _ => "EXPLAIN of this statement kind",
-            }));
-        }
-    };
-    let format = match stmt.format {
-        AstExplainFormat::Text => ExplainFormat::Text,
-        AstExplainFormat::Json => ExplainFormat::Json,
-    };
-    let schema = Schema::new([Field::nullable(
-        "QUERY PLAN",
-        DataType::Text { max_len: None },
-    )])
-    .map_err(|e| PlanError::TypeMismatch(format!("EXPLAIN schema: {e}")))?;
-    Ok(LogicalPlan::Explain {
-        analyze: stmt.analyze,
-        format,
-        input: Box::new(inner),
-        schema,
-    })
 }
 
 /// Bind a `SELECT` statement.

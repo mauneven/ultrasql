@@ -360,6 +360,19 @@ pub fn encode_backend(msg: &BackendMessage, buf: &mut BytesMut) {
             });
         }
         BackendMessage::CopyDone => write_tagged(buf, b'c', |_| {}),
+        BackendMessage::NotificationResponse {
+            process_id,
+            channel,
+            payload,
+        } => {
+            // Spec §55.7: NotificationResponse (B), Byte1('A'),
+            // Int32 len, Int32 pid, String channel, String payload.
+            write_tagged(buf, b'A', |out| {
+                out.put_i32(*process_id);
+                write_cstring(out, channel);
+                write_cstring(out, payload);
+            });
+        }
     }
 }
 
@@ -815,6 +828,19 @@ fn decode_backend_payload(
             // Spec §55.7: CopyDone (F&B). No payload.
             p.ensure_drained()?;
             BackendMessage::CopyDone
+        }
+        b'A' => {
+            // Spec §55.7: NotificationResponse (B), Int32 pid,
+            // String channel, String payload.
+            let process_id = p.read_i32()?;
+            let channel = p.read_cstring()?;
+            let payload = p.read_cstring()?;
+            p.ensure_drained()?;
+            BackendMessage::NotificationResponse {
+                process_id,
+                channel,
+                payload,
+            }
         }
         other => return Err(ProtocolError::UnknownMessageType(other)),
     };

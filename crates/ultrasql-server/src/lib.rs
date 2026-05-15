@@ -38,8 +38,10 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod auth;
+pub mod copy;
 pub mod error;
 pub mod extended;
+pub mod notify;
 pub mod pipeline;
 pub mod result_encoder;
 pub mod tls;
@@ -278,6 +280,20 @@ pub struct Server {
     /// `Trust` accepts any startup, `Md5` runs a real password
     /// challenge with [`crate::auth::md5`].
     pub auth: AuthConfig,
+    /// Async pub-sub hub backing `LISTEN` / `NOTIFY` / `UNLISTEN`.
+    ///
+    /// Shared across every connection task: a `NOTIFY` issued on one
+    /// session dispatches a [`notify::NotificationRecord`] into the
+    /// `mpsc::UnboundedSender` registered by each listening session.
+    pub notify_hub: Arc<notify::NotifyHub>,
+    /// Process-id allocator for new connections.
+    ///
+    /// The PostgreSQL wire layer identifies each backend by a 32-bit
+    /// process id used for `BackendKeyData`, `CancelRequest`, and
+    /// `NotificationResponse`. UltraSQL is single-process so the
+    /// counter is a monotonic per-server allocator rather than a real
+    /// kernel PID. Starts at 1 to leave 0 reserved for "unset".
+    pub next_pid: std::sync::atomic::AtomicU32,
 }
 
 /// Authentication policy for incoming connections.
@@ -356,6 +372,8 @@ impl Server {
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
             two_phase,
             auth: AuthConfig::Trust,
+            notify_hub: Arc::new(notify::NotifyHub::new()),
+            next_pid: std::sync::atomic::AtomicU32::new(1),
         }
     }
 
@@ -494,7 +512,18 @@ impl Server {
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
             two_phase,
             auth: AuthConfig::Trust,
+            notify_hub: Arc::new(notify::NotifyHub::new()),
+            next_pid: std::sync::atomic::AtomicU32::new(1),
         })
+    }
+
+    /// Allocate the next per-connection process id.
+    ///
+    /// Counter is monotonic; wraps after 2^32 connections. The PostgreSQL
+    /// wire layer treats the value opaquely.
+    pub fn allocate_pid(&self) -> u32 {
+        self.next_pid
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Acquire a per-statement catalog snapshot.

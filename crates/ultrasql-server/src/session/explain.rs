@@ -248,6 +248,10 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::RollbackPrepared { .. } => "RollbackPrepared",
         LogicalPlan::SetTransaction { .. } => "SetTransaction",
         LogicalPlan::Explain { .. } => "Explain",
+        LogicalPlan::Listen { .. } => "Listen",
+        LogicalPlan::Notify { .. } => "Notify",
+        LogicalPlan::Unlisten { .. } => "Unlisten",
+        LogicalPlan::Copy { .. } => "Copy",
     }
 }
 

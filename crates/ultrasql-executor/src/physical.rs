@@ -197,6 +197,17 @@ pub fn build_operator(
         | LogicalPlan::SetTransaction { .. } => Err(BuildError::Unsupported(
             "transaction-control statements are dispatched outside the operator pipeline",
         )),
+        LogicalPlan::Listen { .. } | LogicalPlan::Notify { .. } | LogicalPlan::Unlisten { .. } => {
+            Err(BuildError::Unsupported(
+                "LISTEN/NOTIFY/UNLISTEN are dispatched outside the operator pipeline",
+            ))
+        }
+        LogicalPlan::Explain { .. } => Err(BuildError::Unsupported(
+            "EXPLAIN is dispatched by the server, not lowered to an executor operator",
+        )),
+        LogicalPlan::Copy { .. } => Err(BuildError::Unsupported(
+            "COPY is dispatched by the server, not lowered to an executor operator",
+        )),
 
         LogicalPlan::Join {
             left,
@@ -276,10 +287,6 @@ pub fn build_operator(
                 _ => build_operator(body, data_source),
             }
         }
-
-        LogicalPlan::Explain { .. } => Err(BuildError::Unsupported(
-            "EXPLAIN is dispatched by the server, not lowered to an executor operator",
-        )),
     }
 }
 

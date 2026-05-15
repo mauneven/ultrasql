@@ -42,6 +42,9 @@ use crate::error::ServerError;
 pub enum CopyFormat {
     /// PostgreSQL text format: tab-separated columns, newline rows.
     Text,
+    /// PostgreSQL CSV format: comma-separated, double-quoted strings,
+    /// configurable NULL marker (empty string by default).
+    Csv,
 }
 
 /// Options parsed from a `COPY … WITH (…)` clause.
@@ -79,10 +82,7 @@ impl Default for CopyOptions {
 ///
 /// Backslash, tab, newline, and carriage-return characters in string
 /// values are backslash-escaped so they are not confused with delimiters.
-pub fn encode_text_row(
-    columns: &[Option<Vec<u8>>],
-    opts: &CopyOptions,
-) -> Vec<u8> {
+pub fn encode_text_row(columns: &[Option<Vec<u8>>], opts: &CopyOptions) -> Vec<u8> {
     let mut out = Vec::new();
     for (i, col) in columns.iter().enumerate() {
         if i > 0 {
@@ -181,6 +181,138 @@ fn decode_null(bytes: &[u8], opts: &CopyOptions) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// CSV-format helpers
+// ---------------------------------------------------------------------------
+
+/// Encode a row as a PostgreSQL CSV-format COPY line.
+///
+/// Fields are separated by `opts.delimiter` (default `,`). A value
+/// containing the delimiter, double-quote, CR, or LF is wrapped in
+/// double-quotes; embedded double-quotes are doubled (`""`). NULL
+/// columns are rendered as `opts.null_str` *unquoted* — matching
+/// PostgreSQL's CSV semantics.
+#[must_use]
+pub fn encode_csv_row(columns: &[Option<Vec<u8>>], opts: &CopyOptions) -> Vec<u8> {
+    let mut out = Vec::new();
+    let delim_bytes = {
+        let mut b = [0u8; 4];
+        let s = opts.delimiter.encode_utf8(&mut b);
+        s.as_bytes().to_vec()
+    };
+    for (i, col) in columns.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(&delim_bytes);
+        }
+        match col {
+            None => out.extend_from_slice(opts.null_str.as_bytes()),
+            Some(bytes) => {
+                let needs_quote = bytes
+                    .iter()
+                    .any(|&b| b == b'"' || b == b'\n' || b == b'\r' || delim_bytes.contains(&b));
+                if needs_quote {
+                    out.push(b'"');
+                    for &b in bytes {
+                        if b == b'"' {
+                            out.extend_from_slice(b"\"\"");
+                        } else {
+                            out.push(b);
+                        }
+                    }
+                    out.push(b'"');
+                } else {
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
+    }
+    out.push(b'\n');
+    out
+}
+
+/// Parse a CSV-format COPY line into column byte-strings.
+///
+/// Handles double-quoted fields with embedded delimiters, newlines, and
+/// escaped double-quotes (`""` → `"`). The trailing newline is stripped
+/// if present. A bare (unquoted) column equal to `opts.null_str` is
+/// returned as `None` (SQL NULL); a *quoted* empty string is always a
+/// real empty string. This matches PostgreSQL's CSV semantics.
+///
+/// # Errors
+///
+/// Returns [`ServerError::CopyFormat`] if a quoted field is never closed.
+pub fn parse_csv_row(line: &[u8], opts: &CopyOptions) -> Result<Vec<Option<Vec<u8>>>, ServerError> {
+    let line = if line.ends_with(b"\n") {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    let line = if line.ends_with(b"\r") {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    let delim_byte = {
+        let mut b = [0u8; 4];
+        opts.delimiter.encode_utf8(&mut b);
+        b[0]
+    };
+    let mut columns: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut quoted_field = false;
+    let mut field_was_quoted = false;
+    let mut i = 0;
+    while i < line.len() {
+        let b = line[i];
+        if quoted_field {
+            if b == b'"' {
+                if i + 1 < line.len() && line[i + 1] == b'"' {
+                    current.push(b'"');
+                    i += 2;
+                    continue;
+                }
+                quoted_field = false;
+                i += 1;
+                continue;
+            }
+            current.push(b);
+            i += 1;
+        } else if b == b'"' && current.is_empty() {
+            quoted_field = true;
+            field_was_quoted = true;
+            i += 1;
+        } else if b == delim_byte {
+            columns.push(finalise_csv_column(&current, field_was_quoted, opts));
+            current.clear();
+            field_was_quoted = false;
+            i += 1;
+        } else {
+            current.push(b);
+            i += 1;
+        }
+    }
+    if quoted_field {
+        return Err(ServerError::CopyFormat(
+            "unterminated quoted field in CSV input".into(),
+        ));
+    }
+    columns.push(finalise_csv_column(&current, field_was_quoted, opts));
+    Ok(columns)
+}
+
+/// Decide whether a finished CSV column is SQL NULL or a real value.
+fn finalise_csv_column(
+    bytes: &[u8],
+    field_was_quoted: bool,
+    opts: &CopyOptions,
+) -> Option<Vec<u8>> {
+    if !field_was_quoted && bytes == opts.null_str.as_bytes() {
+        None
+    } else {
+        Some(bytes.to_vec())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Protocol message builders
 // ---------------------------------------------------------------------------
 
@@ -270,10 +402,7 @@ mod tests {
     fn parse_text_row_null() {
         let opts = default_opts();
         let cols = parse_text_row(b"x\t\\N\ty\n", &opts).expect("parse ok");
-        assert_eq!(
-            cols,
-            vec![Some(b"x".to_vec()), None, Some(b"y".to_vec())]
-        );
+        assert_eq!(cols, vec![Some(b"x".to_vec()), None, Some(b"y".to_vec())]);
     }
 
     #[test]

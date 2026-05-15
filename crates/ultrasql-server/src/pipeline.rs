@@ -247,8 +247,16 @@ pub fn lower_plan(
         | LogicalPlan::SetTransaction { .. } => Err(ServerError::Unsupported(
             "transaction control reached operator lowerer; expected txn dispatch path",
         )),
+        LogicalPlan::Listen { .. } | LogicalPlan::Notify { .. } | LogicalPlan::Unlisten { .. } => {
+            Err(ServerError::Unsupported(
+                "LISTEN/NOTIFY/UNLISTEN reached operator lowerer; expected pubsub dispatch path",
+            ))
+        }
         LogicalPlan::Explain { .. } => Err(ServerError::Unsupported(
             "EXPLAIN reached operator lowerer; expected session dispatch path",
+        )),
+        LogicalPlan::Copy { .. } => Err(ServerError::Unsupported(
+            "COPY reached operator lowerer; expected session dispatch path",
         )),
         LogicalPlan::Aggregate { .. } => Err(ServerError::Unsupported("GROUP BY / aggregate")),
         LogicalPlan::SetOp {
@@ -729,8 +737,16 @@ pub fn lower_query(
         | LogicalPlan::SetTransaction { .. } => Err(ServerError::Unsupported(
             "transaction control reached operator lowerer; expected txn dispatch path",
         )),
+        LogicalPlan::Listen { .. } | LogicalPlan::Notify { .. } | LogicalPlan::Unlisten { .. } => {
+            Err(ServerError::Unsupported(
+                "LISTEN/NOTIFY/UNLISTEN reached operator lowerer; expected pubsub dispatch path",
+            ))
+        }
         LogicalPlan::Explain { .. } => Err(ServerError::Unsupported(
             "EXPLAIN reached operator lowerer; expected session dispatch path",
+        )),
+        LogicalPlan::Copy { .. } => Err(ServerError::Unsupported(
+            "COPY reached operator lowerer; expected session dispatch path",
         )),
         LogicalPlan::Join {
             left,
@@ -1166,7 +1182,8 @@ fn filter_unseen_rows(
             }
             Column::Utf8(c) => {
                 let strings: Vec<String> = (0..keep_mask.len())
-                    .filter_map(|i| keep_mask[i].then(|| c.value(i).to_owned()))
+                    .filter(|&i| keep_mask[i])
+                    .map(|i| c.value(i).to_owned())
                     .collect();
                 Column::Utf8(StringColumn::from_data(strings))
             }

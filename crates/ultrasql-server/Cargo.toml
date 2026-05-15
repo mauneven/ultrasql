@@ -59,3 +59,7 @@ tempfile           = { workspace = true }
 # in-process `ultrasqld` — Extended Query (prepare/bind/execute) and
 # ORDER BY end-to-end (`SimpleQueryMessage` rows).
 tokio-postgres     = { workspace = true }
+# `listen_notify_round_trip.rs` drives `Connection::poll_message`
+# through `futures::stream::poll_fn` to observe `AsyncMessage::Notification`s;
+# the default `Future` impl of `Connection` swallows them.
+futures            = { workspace = true }

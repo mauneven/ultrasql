@@ -381,4 +381,21 @@ pub enum BackendMessage {
     /// `CopyDone` (`'c'`): signals the end of a COPY stream from the
     /// server to the client.
     CopyDone,
+
+    /// `NotificationResponse` (`'A'`): async pub-sub message delivered
+    /// to every connection that has subscribed to `channel` via
+    /// `LISTEN`. The wire layout is `Int32 process_id`, `CString channel`,
+    /// `CString payload`; an empty payload is a valid PostgreSQL value
+    /// and round-trips as an empty string.
+    NotificationResponse {
+        /// Process identifier of the backend that emitted the `NOTIFY`.
+        process_id: i32,
+        /// Channel name as provided to `LISTEN` / `NOTIFY`.
+        channel: String,
+        /// Payload string. The empty string is a valid payload and is
+        /// distinguishable on the wire only by the absence of an
+        /// explicit literal in the original `NOTIFY` — both surfaces
+        /// share the same empty-string representation here.
+        payload: String,
+    },
 }

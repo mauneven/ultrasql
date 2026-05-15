@@ -2692,6 +2692,7 @@ dependencies = [
  "clap",
  "config",
  "dashmap",
+ "futures",
  "hex",
  "hmac 0.12.1",
  "ipnet",

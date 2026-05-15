@@ -176,7 +176,11 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::PrepareTransaction { .. }
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
-        | LogicalPlan::SetTransaction { .. } => false,
+        | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::Listen { .. }
+        | LogicalPlan::Notify { .. }
+        | LogicalPlan::Unlisten { .. }
+        | LogicalPlan::Copy { .. } => false,
 
         // DML nodes: recurse into their row-producing input.
         LogicalPlan::Insert { source, .. } => outer_join_subtree_is_barrier(source),
@@ -397,7 +401,11 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         | LogicalPlan::PrepareTransaction { .. }
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
-        | LogicalPlan::SetTransaction { .. } => plan.clone(),
+        | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::Listen { .. }
+        | LogicalPlan::Notify { .. }
+        | LogicalPlan::Unlisten { .. }
+        | LogicalPlan::Copy { .. } => plan.clone(),
     }
 }
 

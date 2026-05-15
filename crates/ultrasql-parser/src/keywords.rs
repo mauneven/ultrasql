@@ -221,6 +221,10 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("read", TokenKind::KwRead),
         ("repeatable", TokenKind::KwRepeatable),
         ("uncommitted", TokenKind::KwUncommitted),
+        // LISTEN/NOTIFY/UNLISTEN — pub-sub surface (v0.9 wire-up).
+        ("listen", TokenKind::KwListen),
+        ("notify", TokenKind::KwNotify),
+        ("unlisten", TokenKind::KwUnlisten),
     ];
 
     entries.iter().copied().collect()

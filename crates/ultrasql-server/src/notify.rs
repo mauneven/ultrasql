@@ -57,10 +57,7 @@ impl NotifyHub {
     /// Must be called once when the connection is established, before any
     /// `LISTEN` calls. The returned `Receiver` is owned by the connection
     /// session loop.
-    pub fn register_connection(
-        &self,
-        pid: u32,
-    ) -> mpsc::UnboundedReceiver<NotificationRecord> {
+    pub fn register_connection(&self, pid: u32) -> mpsc::UnboundedReceiver<NotificationRecord> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.senders.insert(pid, tx);
         rx
@@ -127,6 +124,8 @@ impl NotifyHub {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[tokio::test]

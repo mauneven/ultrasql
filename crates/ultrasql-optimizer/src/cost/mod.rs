@@ -300,7 +300,11 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::CommitPrepared { .. }
             | LogicalPlan::RollbackPrepared { .. }
             | LogicalPlan::SetTransaction { .. }
-            | LogicalPlan::Explain { .. } => zero_estimate(),
+            | LogicalPlan::Listen { .. }
+            | LogicalPlan::Notify { .. }
+            | LogicalPlan::Unlisten { .. }
+            | LogicalPlan::Explain { .. }
+            | LogicalPlan::Copy { .. } => zero_estimate(),
         }
     }
 }

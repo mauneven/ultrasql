@@ -720,36 +720,103 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// `LISTEN channel` — subscribe the session to async notifications
+    /// delivered on `channel`. The server keeps the subscription in its
+    /// per-process `NotifyHub` for the lifetime of the connection;
+    /// `UNLISTEN` and connection close drop it.
+    ///
+    /// `schema` is always [`Schema::empty`].
+    Listen {
+        /// Channel name as it should reach the hub. The binder
+        /// lower-cases unquoted identifiers to match PostgreSQL's
+        /// case-folding rules; quoted names round-trip verbatim.
+        channel: String,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `NOTIFY channel [, payload]` — publish `payload` on `channel`
+    /// to every session currently listening.
+    ///
+    /// `schema` is always [`Schema::empty`].
+    Notify {
+        /// Channel name to publish on.
+        channel: String,
+        /// Optional payload. PostgreSQL allows omitting the payload
+        /// (defaults to the empty string on the wire); we keep the
+        /// `Option` so the wire layer can mirror that distinction.
+        payload: Option<String>,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `UNLISTEN { channel | * }` — drop one or all of this session's
+    /// channel subscriptions.
+    ///
+    /// `schema` is always [`Schema::empty`].
+    Unlisten {
+        /// Channel name to drop. `None` means `UNLISTEN *` — drop every
+        /// subscription owned by this session.
+        channel: Option<String>,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
     /// `EXPLAIN [ANALYZE] [(FORMAT TEXT|JSON)] stmt`.
     ///
-    /// Wraps an inner logical plan. The server's session dispatcher
-    /// renders the wrapped plan's tree shape — and, when `analyze` is
-    /// `true`, also executes it and overlays per-node row counts and
-    /// timing — into the single `"QUERY PLAN"` Text column of `schema`.
-    ///
-    /// `format = ExplainFormat::Text` emits one row per plan-tree line.
-    /// `format = ExplainFormat::Json` emits a single row carrying a JSON
-    /// document with one object per node.
+    /// Wraps an inner logical plan. The server renders the wrapped
+    /// plan's tree into the single `"QUERY PLAN"` Text column of
+    /// `schema`; when `analyze` is true, it executes the inner plan
+    /// and surfaces row count + wall time alongside the rendered
+    /// tree.
     Explain {
-        /// `true` for `EXPLAIN ANALYZE` (execute the inner plan and
-        /// surface actual row counts + elapsed time alongside the
-        /// estimated rows).
+        /// `true` for `EXPLAIN ANALYZE` — executes the inner plan.
         analyze: bool,
-        /// Output format requested by the user.
+        /// Output format selector.
         format: ExplainFormat,
         /// The wrapped plan to describe.
         input: Box<Self>,
         /// Always a single nullable `Text` column named `"QUERY PLAN"`.
         schema: Schema,
     },
+
+    /// `COPY table [(col_list)] { FROM | TO } { STDIN | STDOUT }
+    ///     [WITH (FORMAT { TEXT | CSV }, …)]`.
+    ///
+    /// `relation` is the bound, lowercase target table name. `columns`
+    /// is the 0-based index list into the table's full schema; an
+    /// empty `columns` vector means "every column in natural order".
+    /// `schema` is the row shape of the data stream the COPY transfers
+    /// — the server's session dispatcher uses it to size the
+    /// `CopyInResponse` / `CopyOutResponse` column-format vector and
+    /// to drive per-column text encoding.
+    Copy {
+        /// Case-folded target table name.
+        relation: String,
+        /// 0-based indices into the target table's schema. Empty means
+        /// "all columns in natural order".
+        columns: Vec<usize>,
+        /// Whether rows flow client → server or server → client.
+        direction: CopyDirection,
+        /// Wire endpoint — `STDIN` or `STDOUT`.
+        source: CopySource,
+        /// Wire format negotiated by the parser.
+        format: CopyFormat,
+        /// Single-character column delimiter. Defaults match the format
+        /// (`\t` for TEXT, `,` for CSV).
+        delimiter: char,
+        /// String used to represent SQL NULL on the wire.
+        null_str: String,
+        /// Whether the data stream contains a header row.
+        header: bool,
+        /// Row shape of the data stream — derived from `columns` and
+        /// the target table's schema.
+        schema: Schema,
+    },
 }
 
 /// EXPLAIN output format selector, mirrored from
 /// [`ultrasql_parser::ast::ExplainFormat`].
-///
-/// The planner keeps its own copy so downstream crates (server,
-/// executor) do not need to depend on the parser AST. Conversion is a
-/// trivial 1:1 mapping handled by [`crate::binder`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExplainFormat {
     /// `EXPLAIN ... (FORMAT TEXT)` — indented tree, one row per node.
@@ -757,6 +824,36 @@ pub enum ExplainFormat {
     /// `EXPLAIN ... (FORMAT JSON)` — single row carrying the JSON
     /// rendering of the plan tree.
     Json,
+}
+
+/// COPY direction, mirrored from
+/// [`ultrasql_parser::ast::CopyDirection`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyDirection {
+    /// `COPY t FROM …` — client streams rows in.
+    From,
+    /// `COPY t TO …` — server streams rows out.
+    To,
+}
+
+/// COPY source / sink, mirrored from
+/// [`ultrasql_parser::ast::CopySource`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopySource {
+    /// `STDIN` — client streams `CopyData` frames in.
+    Stdin,
+    /// `STDOUT` — server streams `CopyData` frames out.
+    Stdout,
+}
+
+/// COPY wire format, mirrored from
+/// [`ultrasql_parser::ast::CopyFormat`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CopyFormat {
+    /// PostgreSQL `TEXT` format — tab-separated, escape-encoded.
+    Text,
+    /// PostgreSQL `CSV` format.
+    Csv,
 }
 
 /// Resolved `ALTER TABLE` action.
@@ -810,6 +907,10 @@ impl LogicalPlan {
             | Self::CommitPrepared { schema, .. }
             | Self::RollbackPrepared { schema, .. }
             | Self::SetTransaction { schema, .. }
+            | Self::Listen { schema, .. }
+            | Self::Notify { schema, .. }
+            | Self::Unlisten { schema, .. }
+            | Self::Copy { schema, .. }
             | Self::Explain { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
                 input.schema()
@@ -1260,6 +1361,34 @@ impl LogicalPlan {
                 out.push_str(&pad);
                 let _ = fmt::write(out, format_args!("SetTransaction: {isolation_level:?}\n"));
             }
+            Self::Listen { channel, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("Listen: {channel}\n"));
+            }
+            Self::Notify {
+                channel, payload, ..
+            } => {
+                out.push_str(&pad);
+                match payload {
+                    Some(p) => {
+                        let _ = fmt::write(out, format_args!("Notify: {channel} '{p}'\n"));
+                    }
+                    None => {
+                        let _ = fmt::write(out, format_args!("Notify: {channel}\n"));
+                    }
+                }
+            }
+            Self::Unlisten { channel, .. } => {
+                out.push_str(&pad);
+                match channel {
+                    Some(c) => {
+                        let _ = fmt::write(out, format_args!("Unlisten: {c}\n"));
+                    }
+                    None => {
+                        out.push_str("Unlisten: *\n");
+                    }
+                }
+            }
             Self::Explain {
                 analyze,
                 format,
@@ -1274,6 +1403,41 @@ impl LogicalPlan {
                 };
                 let _ = fmt::write(out, format_args!("Explain {mode}({fmt_label})\n"));
                 input.display_into(indent + 2, out);
+            }
+            Self::Copy {
+                relation,
+                columns,
+                direction,
+                source,
+                format,
+                ..
+            } => {
+                out.push_str(&pad);
+                let dir = match direction {
+                    CopyDirection::From => "FROM",
+                    CopyDirection::To => "TO",
+                };
+                let src = match source {
+                    CopySource::Stdin => "STDIN",
+                    CopySource::Stdout => "STDOUT",
+                };
+                let fmt_label = match format {
+                    CopyFormat::Text => "TEXT",
+                    CopyFormat::Csv => "CSV",
+                };
+                let cols = if columns.is_empty() {
+                    String::from("*")
+                } else {
+                    columns
+                        .iter()
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                let _ = fmt::write(
+                    out,
+                    format_args!("Copy: {relation} ({cols}) {dir} {src} FORMAT={fmt_label}\n"),
+                );
             }
         }
     }

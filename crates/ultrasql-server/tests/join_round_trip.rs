@@ -102,8 +102,8 @@ fn rows_to_i32_pairs(
         .filter_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(row) => {
                 // `row.get` returns `None` on a NULL cell.
-                let l = row.get(left_col).map(|s| s.parse::<i32>().ok()).flatten();
-                let r = row.get(right_col).map(|s| s.parse::<i32>().ok()).flatten();
+                let l = row.get(left_col).and_then(|s| s.parse::<i32>().ok());
+                let r = row.get(right_col).and_then(|s| s.parse::<i32>().ok());
                 Some((l, r))
             }
             _ => None,

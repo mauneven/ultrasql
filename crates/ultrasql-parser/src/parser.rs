@@ -261,10 +261,24 @@ impl<'src> Parser<'src> {
                 let tok = self.advance()?;
                 self.parse_deallocate(tok.span.start)
             }
+            // ---- LISTEN / NOTIFY / UNLISTEN --------------------------------
+            TokenKind::KwListen => {
+                let tok = self.advance()?;
+                self.parse_listen(tok.span.start)
+            }
+            TokenKind::KwNotify => {
+                let tok = self.advance()?;
+                self.parse_notify(tok.span.start)
+            }
+            TokenKind::KwUnlisten => {
+                let tok = self.advance()?;
+                self.parse_unlisten(tok.span.start)
+            }
             other => Err(ParseError::Expected {
                 expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, ALTER, \
                            REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \
-                           RELEASE, EXPLAIN, PREPARE, EXECUTE, or DEALLOCATE",
+                           RELEASE, EXPLAIN, PREPARE, EXECUTE, DEALLOCATE, LISTEN, NOTIFY, \
+                           or UNLISTEN",
                 found: other,
                 offset: head.span.start as usize,
             }),

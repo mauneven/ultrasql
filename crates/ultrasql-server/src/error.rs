@@ -119,6 +119,19 @@ pub enum ServerError {
     /// this error is returned.
     #[error("password authentication failed")]
     AuthFailed,
+
+    /// COPY stream contained a malformed row (wrong column count,
+    /// unterminated quoted field, non-decodable cell). Maps to PostgreSQL
+    /// SQLSTATE `22P04` (`bad_copy_file_format`). Query-scoped: the
+    /// session is preserved and a fresh `ReadyForQuery` is emitted.
+    #[error("COPY format: {0}")]
+    CopyFormat(String),
+
+    /// The client cancelled a `COPY FROM STDIN` by sending `CopyFail`.
+    /// Carries the human-readable reason supplied by the client. Maps to
+    /// PostgreSQL SQLSTATE `57014` (`query_canceled`).
+    #[error("COPY from stdin failed: {0}")]
+    CopyAborted(String),
 }
 
 impl ServerError {
@@ -157,6 +170,8 @@ impl ServerError {
                 | Self::TransactionAborted
                 | Self::Savepoint(_)
                 | Self::SavepointNotFound(_)
+                | Self::CopyFormat(_)
+                | Self::CopyAborted(_)
         )
     }
 
@@ -184,6 +199,11 @@ impl ServerError {
             // NOT-NULL constraint violation surfaced by `ModifyTable`
             // on INSERT. Mirrors PostgreSQL's `not_null_violation`.
             Self::Execute(ultrasql_executor::ExecError::NotNullViolation(_)) => "23502",
+            // bad_copy_file_format — surfaced when a COPY FROM stream
+            // delivers a malformed row.
+            Self::CopyFormat(_) => "22P04",
+            // query_canceled — client requested `CopyFail`.
+            Self::CopyAborted(_) => "57014",
             // Internal-style: Execute/IO/Protocol/UnexpectedEof and the
             // dynamic Ddl message all map to XX000.
             _ => "XX000",

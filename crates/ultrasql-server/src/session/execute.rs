@@ -125,6 +125,14 @@ where
             | LogicalPlan::SetTransaction { .. } => {
                 return self.execute_txn_control(&plan);
             }
+            // LISTEN / NOTIFY / UNLISTEN are dispatched against the
+            // shared `NotifyHub`; they do not touch the transaction
+            // system. See `session/notify.rs`.
+            LogicalPlan::Listen { .. }
+            | LogicalPlan::Notify { .. }
+            | LogicalPlan::Unlisten { .. } => {
+                return self.execute_pubsub(&plan);
+            }
             _ => {}
         }
 
