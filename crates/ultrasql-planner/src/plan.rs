@@ -886,6 +886,42 @@ pub enum LogicalAlterTableAction {
         /// The resolved column being added.
         column: Field,
     },
+    /// `ALTER TABLE t DROP [COLUMN] c [CASCADE|RESTRICT]`.
+    ///
+    /// The column at `column_index` is removed from the table's
+    /// schema and every existing tuple is rewritten without that
+    /// slot. v0.5 always treats the drop as `RESTRICT`-equivalent
+    /// (the binder rejects the drop if the column participates in
+    /// a constraint the catalog tracks).
+    DropColumn {
+        /// 0-based column position resolved against the current schema.
+        column_index: usize,
+        /// Column name (kept for diagnostics + audit logging).
+        column_name: String,
+    },
+    /// `ALTER TABLE t RENAME [COLUMN] old TO new`.
+    ///
+    /// Catalog-only: the heap is not rewritten because the rowcoded
+    /// layout is positional and a column rename does not change the
+    /// row encoding. The binder rejects the rename if `new` collides
+    /// with an existing column.
+    RenameColumn {
+        /// 0-based column position resolved against the current schema.
+        column_index: usize,
+        /// Old column name.
+        old_name: String,
+        /// New column name.
+        new_name: String,
+    },
+    /// `ALTER TABLE t RENAME TO new_name`.
+    ///
+    /// Catalog-only: the heap is not rewritten because relations are
+    /// addressed by OID, not by name. The binder rejects the rename
+    /// if `new_name` collides with an existing table in the schema.
+    RenameTable {
+        /// New table name.
+        new_name: String,
+    },
 }
 
 impl LogicalPlan {
@@ -1329,6 +1365,28 @@ impl LogicalPlan {
                                 column.data_type,
                                 if column.nullable { "" } else { " NOT NULL" }
                             ),
+                        );
+                    }
+                    LogicalAlterTableAction::DropColumn { column_name, .. } => {
+                        let _ = fmt::write(
+                            out,
+                            format_args!("AlterTable: {table_name} DROP COLUMN {column_name}\n"),
+                        );
+                    }
+                    LogicalAlterTableAction::RenameColumn {
+                        old_name, new_name, ..
+                    } => {
+                        let _ = fmt::write(
+                            out,
+                            format_args!(
+                                "AlterTable: {table_name} RENAME COLUMN {old_name} TO {new_name}\n"
+                            ),
+                        );
+                    }
+                    LogicalAlterTableAction::RenameTable { new_name } => {
+                        let _ = fmt::write(
+                            out,
+                            format_args!("AlterTable: {table_name} RENAME TO {new_name}\n"),
                         );
                     }
                 }

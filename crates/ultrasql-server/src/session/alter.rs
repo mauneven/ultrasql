@@ -94,7 +94,173 @@ where
             LogicalAlterTableAction::AddColumn { column } => {
                 self.execute_alter_add_column(table_name, column.clone(), snapshot)
             }
+            LogicalAlterTableAction::DropColumn {
+                column_index,
+                column_name,
+            } => self.execute_alter_drop_column(table_name, *column_index, column_name, snapshot),
+            LogicalAlterTableAction::RenameColumn {
+                column_index,
+                new_name,
+                ..
+            } => self.execute_alter_rename_column(table_name, *column_index, new_name, snapshot),
+            LogicalAlterTableAction::RenameTable { new_name } => {
+                self.execute_alter_rename_table(table_name, new_name)
+            }
         }
+    }
+
+    /// Execute `ALTER TABLE t DROP COLUMN c`: rewrite every visible
+    /// tuple without that slot, then publish the narrower schema.
+    pub(crate) fn execute_alter_drop_column(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        column_name: &str,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let entry = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        let mut new_fields: Vec<ultrasql_core::Field> = entry.schema.fields().to_vec();
+        if column_index >= new_fields.len() {
+            return Err(ServerError::ddl(format!(
+                "ALTER TABLE DROP COLUMN: index {column_index} out of bounds for {table_name}"
+            )));
+        }
+        new_fields.remove(column_index);
+        let new_schema = ultrasql_core::Schema::new(new_fields).map_err(|e| {
+            ServerError::Catalog(ultrasql_catalog::CatalogError::schema_conflict(format!(
+                "ALTER TABLE DROP COLUMN: {e}"
+            )))
+        })?;
+
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let rel = RelationId(entry.oid);
+        let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
+        let old_codec = ultrasql_executor::RowCodec::new(entry.schema.clone());
+        let new_codec = ultrasql_executor::RowCodec::new(new_schema.clone());
+
+        let rewrite_result: Result<(), ServerError> = (|| {
+            let mut to_rewrite: Vec<(ultrasql_core::TupleId, Vec<Value>)> = Vec::new();
+            {
+                let scan = self.state.heap.scan_visible(
+                    rel,
+                    block_count,
+                    &txn.snapshot,
+                    self.state.txn_manager.as_ref(),
+                );
+                for result in scan {
+                    let tup = result.map_err(|e| {
+                        ServerError::ddl(format!("ALTER TABLE DROP COLUMN scan: {e}"))
+                    })?;
+                    let row = old_codec.decode(&tup.data).map_err(|e| {
+                        ServerError::ddl(format!("ALTER TABLE DROP COLUMN decode: {e}"))
+                    })?;
+                    to_rewrite.push((tup.tid, row));
+                }
+            }
+            for (tid, mut old_row) in to_rewrite {
+                old_row.remove(column_index);
+                let new_payload = new_codec.encode(&old_row).map_err(|e| {
+                    ServerError::ddl(format!("ALTER TABLE DROP COLUMN encode: {e}"))
+                })?;
+                self.state
+                    .heap
+                    .update(
+                        tid,
+                        &new_payload,
+                        UpdateOptions {
+                            xid: txn.xid,
+                            command_id: ultrasql_core::CommandId::FIRST,
+                            wal: None,
+                            vm: None,
+                            hot_eligible: true,
+                        },
+                    )
+                    .map_err(|e| {
+                        ServerError::ddl(format!("ALTER TABLE DROP COLUMN heap update: {e}"))
+                    })?;
+            }
+            Ok(())
+        })();
+
+        match rewrite_result {
+            Ok(()) => {
+                self.state
+                    .persistent_catalog
+                    .alter_table_replace_schema(table_name, new_schema)
+                    .map_err(ServerError::Catalog)?;
+                self.state
+                    .txn_manager
+                    .commit(txn)
+                    .map_err(|e| ServerError::ddl(format!("ALTER TABLE DROP COLUMN commit: {e}")))?;
+                self.state.plan_cache.invalidate_all();
+                Ok(run_ddl_command(&format!(
+                    "ALTER TABLE DROP COLUMN {column_name}"
+                )))
+            }
+            Err(e) => {
+                let _ = self.state.txn_manager.abort(txn);
+                Err(e)
+            }
+        }
+    }
+
+    /// Execute `ALTER TABLE t RENAME COLUMN old TO new`: catalog-only
+    /// (the heap's row codec is positional so no rewrite is needed).
+    pub(crate) fn execute_alter_rename_column(
+        &self,
+        table_name: &str,
+        column_index: usize,
+        new_name: &str,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let entry = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        let mut new_fields: Vec<ultrasql_core::Field> = entry.schema.fields().to_vec();
+        if column_index >= new_fields.len() {
+            return Err(ServerError::ddl(format!(
+                "ALTER TABLE RENAME COLUMN: index {column_index} out of bounds for {table_name}"
+            )));
+        }
+        let renamed = ultrasql_core::Field {
+            name: new_name.to_string(),
+            ..new_fields[column_index].clone()
+        };
+        new_fields[column_index] = renamed;
+        let new_schema = ultrasql_core::Schema::new(new_fields).map_err(|e| {
+            ServerError::Catalog(ultrasql_catalog::CatalogError::schema_conflict(format!(
+                "ALTER TABLE RENAME COLUMN: {e}"
+            )))
+        })?;
+        self.state
+            .persistent_catalog
+            .alter_table_replace_schema(table_name, new_schema)
+            .map_err(ServerError::Catalog)?;
+        self.state.plan_cache.invalidate_all();
+        Ok(run_ddl_command(&format!(
+            "ALTER TABLE RENAME COLUMN TO {new_name}"
+        )))
+    }
+
+    /// Execute `ALTER TABLE t RENAME TO new`: catalog-only (relations
+    /// are OID-addressed; the rename only updates the by-name index).
+    pub(crate) fn execute_alter_rename_table(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<SelectResult, ServerError> {
+        self.state
+            .persistent_catalog
+            .alter_table_rename(old_name, new_name)
+            .map_err(ServerError::Catalog)?;
+        self.state.plan_cache.invalidate_all();
+        Ok(run_ddl_command(&format!("ALTER TABLE RENAME TO {new_name}")))
     }
 
     /// Execute the `ALTER TABLE t ADD COLUMN c TYPE [NULL | NOT NULL]`

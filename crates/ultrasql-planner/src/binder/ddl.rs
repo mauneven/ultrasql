@@ -302,20 +302,42 @@ pub(super) fn bind_alter_table(
             };
             LogicalAlterTableAction::AddColumn { column: field }
         }
-        AlterTableAction::DropColumn { .. } => {
-            return Err(PlanError::NotSupported(
-                "ALTER TABLE: DROP COLUMN not yet supported",
-            ));
+        AlterTableAction::DropColumn { name, .. } => {
+            let raw = name.value.to_ascii_lowercase();
+            let (idx, _) = table_schema
+                .find(&raw)
+                .ok_or_else(|| PlanError::ColumnNotFound(name.value.clone()))?;
+            if table_schema.len() == 1 {
+                return Err(PlanError::NotSupported(
+                    "ALTER TABLE: cannot drop the last column of a table",
+                ));
+            }
+            LogicalAlterTableAction::DropColumn {
+                column_index: idx,
+                column_name: name.value.clone(),
+            }
         }
-        AlterTableAction::RenameColumn { .. } => {
-            return Err(PlanError::NotSupported(
-                "ALTER TABLE: RENAME COLUMN not yet supported",
-            ));
+        AlterTableAction::RenameColumn { old, new, .. } => {
+            let old_raw = old.value.to_ascii_lowercase();
+            let new_raw = new.value.to_ascii_lowercase();
+            let (idx, _) = table_schema
+                .find(&old_raw)
+                .ok_or_else(|| PlanError::ColumnNotFound(old.value.clone()))?;
+            if table_schema.find(&new_raw).is_some() {
+                return Err(PlanError::DuplicateColumn(new.value.clone()));
+            }
+            LogicalAlterTableAction::RenameColumn {
+                column_index: idx,
+                old_name: old.value.clone(),
+                new_name: new.value.clone(),
+            }
         }
-        AlterTableAction::RenameTable { .. } => {
-            return Err(PlanError::NotSupported(
-                "ALTER TABLE: RENAME TO not yet supported",
-            ));
+        AlterTableAction::RenameTable { new_name, .. } => {
+            let new = new_name.value.clone();
+            if catalog.lookup_table(&new.to_ascii_lowercase()).is_some() {
+                return Err(PlanError::DuplicateTable(new));
+            }
+            LogicalAlterTableAction::RenameTable { new_name: new }
         }
         AlterTableAction::AddConstraint { .. } => {
             return Err(PlanError::NotSupported(

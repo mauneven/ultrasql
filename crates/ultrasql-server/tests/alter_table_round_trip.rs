@@ -169,3 +169,119 @@ async fn alter_table_on_undefined_relation_fails_with_42p01() {
 
     shutdown(client, server_handle).await;
 }
+
+/// `ALTER TABLE t DROP COLUMN c`: tuples are rewritten without the
+/// dropped slot; subsequent SELECTs return the narrower row.
+#[tokio::test]
+async fn alter_table_drop_column_rewrites_existing_rows() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, val INT NOT NULL, note INT NOT NULL)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 10, 100), (2, 20, 200)")
+        .await
+        .expect("seed");
+
+    client
+        .batch_execute("ALTER TABLE t DROP COLUMN val")
+        .await
+        .expect("drop column");
+
+    let rows = client
+        .query("SELECT id, note FROM t ORDER BY id", &[])
+        .await
+        .expect("select after drop");
+    assert_eq!(rows.len(), 2);
+    let r0_id: i32 = rows[0].get(0);
+    let r0_note: i32 = rows[0].get(1);
+    let r1_id: i32 = rows[1].get(0);
+    let r1_note: i32 = rows[1].get(1);
+    assert_eq!((r0_id, r0_note), (1, 100));
+    assert_eq!((r1_id, r1_note), (2, 200));
+
+    // Referencing the dropped column now errors at bind time.
+    let err = client
+        .query("SELECT val FROM t", &[])
+        .await
+        .expect_err("dropped column is unreachable");
+    let sqlstate = err.code().expect("sqlstate present");
+    assert!(
+        matches!(sqlstate.code(), "42703" | "42000"),
+        "expected undefined_column, got {err:?}"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+/// `ALTER TABLE t RENAME COLUMN old TO new`: the new name resolves
+/// to the same data; the old name is gone.
+#[tokio::test]
+async fn alter_table_rename_column_preserves_data() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, val INT NOT NULL)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 99)")
+        .await
+        .expect("seed");
+
+    client
+        .batch_execute("ALTER TABLE t RENAME COLUMN val TO score")
+        .await
+        .expect("rename column");
+
+    let rows = client
+        .query("SELECT id, score FROM t", &[])
+        .await
+        .expect("select via new name");
+    assert_eq!(rows.len(), 1);
+    let id: i32 = rows[0].get(0);
+    let score: i32 = rows[0].get(1);
+    assert_eq!((id, score), (1, 99));
+
+    shutdown(client, server_handle).await;
+}
+
+/// `ALTER TABLE t RENAME TO new_name`: the table is reachable under
+/// the new name and gone under the old name.
+#[tokio::test]
+async fn alter_table_rename_table_swaps_name() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO t VALUES (42)")
+        .await
+        .expect("seed");
+
+    client
+        .batch_execute("ALTER TABLE t RENAME TO t_new")
+        .await
+        .expect("rename table");
+
+    let rows = client
+        .query("SELECT id FROM t_new", &[])
+        .await
+        .expect("select from new name");
+    assert_eq!(rows.len(), 1);
+    let id: i32 = rows[0].get(0);
+    assert_eq!(id, 42);
+
+    let err = client
+        .query("SELECT id FROM t", &[])
+        .await
+        .expect_err("old name no longer resolves");
+    let sqlstate = err.code().expect("sqlstate present");
+    assert_eq!(sqlstate.code(), "42P01");
+
+    shutdown(client, server_handle).await;
+}

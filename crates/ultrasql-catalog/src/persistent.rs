@@ -894,6 +894,57 @@ impl MutableCatalog for PersistentCatalog {
         self.rebuild_snapshot();
         Ok(updated)
     }
+
+    fn alter_table_replace_schema(
+        &self,
+        name: &str,
+        new_schema: Schema,
+    ) -> Result<TableEntry, CatalogError> {
+        let key = fold_name(name);
+        let _guard = self.write_lock.lock();
+        let existing = self
+            .tables_by_name
+            .get(&key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .value()
+            .clone();
+        let mut updated = existing.clone();
+        updated.schema = new_schema;
+        if let Some(mut entry) = self.tables_by_name.get_mut(&key) {
+            *entry = updated.clone();
+        }
+        if let Some(mut entry) = self.tables_by_oid.get_mut(&existing.oid) {
+            *entry = updated.clone();
+        }
+        self.rebuild_snapshot();
+        Ok(updated)
+    }
+
+    fn alter_table_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<TableEntry, CatalogError> {
+        let old_key = fold_name(old_name);
+        let new_key = fold_name(new_name);
+        let _guard = self.write_lock.lock();
+        if self.tables_by_name.contains_key(&new_key) {
+            return Err(CatalogError::already_exists(new_name.to_owned()));
+        }
+        let existing = self
+            .tables_by_name
+            .remove(&old_key)
+            .ok_or_else(|| CatalogError::not_found(old_name.to_owned()))?
+            .1;
+        let mut updated = existing.clone();
+        updated.name = new_name.to_string();
+        self.tables_by_name.insert(new_key, updated.clone());
+        if let Some(mut entry) = self.tables_by_oid.get_mut(&existing.oid) {
+            *entry = updated.clone();
+        }
+        self.rebuild_snapshot();
+        Ok(updated)
+    }
 }
 
 // ---------------------------------------------------------------------------

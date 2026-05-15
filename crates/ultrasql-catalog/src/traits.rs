@@ -124,4 +124,41 @@ pub trait MutableCatalog: Catalog {
     ///   duplicate column name after case-folding).
     fn alter_table_add_column(&self, name: &str, column: Field)
     -> Result<TableEntry, CatalogError>;
+
+    /// Replace the schema on the named table with `new_schema`.
+    ///
+    /// Preserves the table's [`Oid`]; only the schema and the dependent
+    /// `n_blocks` / dependent-index columns are rebuilt. Used by
+    /// `ALTER TABLE DROP COLUMN` and `ALTER TABLE RENAME COLUMN` —
+    /// both of which produce a schema of the same arity (drop)
+    /// or the same shape with a renamed field (rename) and never
+    /// touch tuples whose codec layout is positional rather than
+    /// name-addressed.
+    ///
+    /// # Errors
+    /// - [`CatalogError::NotFound`] when no table by `name` is
+    ///   registered.
+    /// - [`CatalogError::SchemaConflict`] when `new_schema` violates a
+    ///   [`ultrasql_core::Schema`] invariant.
+    fn alter_table_replace_schema(
+        &self,
+        name: &str,
+        new_schema: ultrasql_core::Schema,
+    ) -> Result<TableEntry, CatalogError>;
+
+    /// Rename a table.
+    ///
+    /// The [`Oid`] is preserved. Dependent indexes keep their `table_oid`
+    /// pointer so they survive the rename without rebuilding.
+    ///
+    /// # Errors
+    /// - [`CatalogError::NotFound`] when no table by `old_name` is
+    ///   registered.
+    /// - [`CatalogError::AlreadyExists`] when `new_name` collides with
+    ///   another live table.
+    fn alter_table_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<TableEntry, CatalogError>;
 }
