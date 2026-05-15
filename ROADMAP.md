@@ -625,7 +625,7 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 
 ### Tests
 - [ ] Loom-based concurrency model tests for lock manager
-- [ ] Isolation level tests (READ COMMITTED, REPEATABLE READ, SERIALIZABLE) via real `BEGIN ... SET ISOLATION ... COMMIT`
+- [x] Isolation level tests (READ COMMITTED, REPEATABLE READ, SERIALIZABLE) via real `BEGIN ISOLATION LEVEL ... COMMIT` wire-level tests in `txn_round_trip.rs` (4 new tests); `TransactionManager`-level contracts in `ultrasql-txn/tests/isolation.rs`
 - [ ] Serializability checker (Hermitage test suite)
 
 ---
@@ -700,7 +700,7 @@ driver can connect.
 
 ### Transaction Control (wire)
 - [x] `BEGIN` / `COMMIT` / `ROLLBACK` round-trip (Simple + Extended Query)
-- [ ] `BEGIN ISOLATION LEVEL ...`
+- [x] `BEGIN ISOLATION LEVEL ...` — parser + planner + server wired; `BEGIN ISOLATION LEVEL READ COMMITTED|REPEATABLE READ|SERIALIZABLE` dispatches to `TransactionManager::begin(IsolationLevel::...)`; READ UNCOMMITTED aliased to READ COMMITTED; wire-level round-trip tests pass
 - [x] Implicit transaction per statement (autocommit) + explicit-transaction state machine (`TxnState::Idle`/`InTransaction`/`Failed`)
 - [x] `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` round-trip (wire only — executor does not yet stamp tuples with subxid; see "Subtransactions" above)
 - [ ] `PREPARE` / `EXECUTE` / `DEALLOCATE` Simple-Query round-trip

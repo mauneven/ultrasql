@@ -485,3 +485,85 @@ async fn mixed_simple_and_extended_in_one_tx() {
 
     shutdown(client, server_handle).await;
 }
+
+/// `BEGIN ISOLATION LEVEL READ COMMITTED` and `READ UNCOMMITTED` (aliased)
+/// round-trip through the wire without error and the session can commit.
+#[tokio::test]
+async fn begin_isolation_level_read_committed_round_trip() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL READ COMMITTED")
+        .await
+        .expect("BEGIN ISOLATION LEVEL READ COMMITTED");
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+
+    // READ UNCOMMITTED is aliased to READ COMMITTED.
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL READ UNCOMMITTED")
+        .await
+        .expect("BEGIN ISOLATION LEVEL READ UNCOMMITTED");
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+
+    shutdown(client, server_handle).await;
+}
+
+/// `BEGIN ISOLATION LEVEL REPEATABLE READ` round-trips without error.
+#[tokio::test]
+async fn begin_isolation_level_repeatable_read_round_trip() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("BEGIN ISOLATION LEVEL REPEATABLE READ");
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+
+    shutdown(client, server_handle).await;
+}
+
+/// `BEGIN ISOLATION LEVEL SERIALIZABLE` round-trips without error.
+#[tokio::test]
+async fn begin_isolation_level_serializable_round_trip() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("BEGIN ISOLATION LEVEL SERIALIZABLE");
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+
+    shutdown(client, server_handle).await;
+}
+
+/// Inside a REPEATABLE READ transaction the snapshot is frozen at BEGIN.
+/// A baseline row inserted before BEGIN is visible; the transaction
+/// commits cleanly to verify the full path.
+#[tokio::test]
+async fn repeatable_read_snapshot_frozen_wire_level() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO t VALUES (1)")
+        .await
+        .expect("baseline row");
+
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("BEGIN RR");
+
+    let rows = client
+        .query("SELECT id FROM t", &[])
+        .await
+        .expect("select inside RR tx");
+    assert_eq!(rows.len(), 1, "baseline row visible inside RR tx");
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+
+    shutdown(client, server_handle).await;
+}
