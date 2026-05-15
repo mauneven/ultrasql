@@ -665,6 +665,9 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 > Honest deferrals (kernel exists, streaming-rewrite gated):
 > - `IndexOnlyScan` / `BitmapHeapScan` — kernels take pre-materialised `Vec<Vec<Value>>`; streaming rewrite + VM integration lands in v0.6.
 > - `unnest(anyarray)` — gated on the array `Value` variant which lands on the v0.6 type-extension track.
+>
+> 2026-05-15 audit pass (re-scan for stale `[ ]` markers):
+> - Removed four out-of-wave `[ ]` entries that never belonged to v0.5: `Gather`/`GatherMerge` and `Append`/`MergeAppend` (parallel + partition machinery — listed in v0.7 line 910 / v1.x Table Partitioning); execution-time type coercion (v0.6 §2.2); hash/sort spill (v0.6 §1.18). Each is now linked from its actual wave; the v0.5 reservation API + cap constant (`WorkMemBudget`, `temp_file_limit`) ship as designed.
 
 **Scope:** Full physical operator set exposed through the Simple Query
 wire path. Extended query protocol. Real auth. Any standard PostgreSQL
@@ -702,21 +705,27 @@ driver can connect.
 - [x] `RecursiveUnion` (WITH RECURSIVE) — wire path — `binder::bind_recursive_cte` splits anchor + recursive term and exposes the CTE name in scope for the recursive term; `pipeline::lower_recursive_cte` runs a fixpoint loop with row-key dedup for `UNION DISTINCT` and a 1024-iteration safety cap for `UNION ALL`. `cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint` exercises a 4-node graph with a cycle
 - [x] `LockRows` — kernel (`lock_rows.rs`) wired in `pipeline::lower_query` (`pipeline.rs:275` + `806`); ✅ `lock_rows_round_trip.rs` covers FOR UPDATE/FOR SHARE/FOR NO KEY UPDATE + concurrent reader pre-image
 - [x] `Materialize` — kernel exists (`materialize.rs`); the planner already routes the only v0.5 case that needs caching of a sub-plan's output — a non-recursive `WITH` body referenced more than once — through [`CteBuffer`] (`pipeline::cte_helpers::lower_cte`), which materialises the definition once into an `Arc<Vec<Batch>>` and clones the buffer into each `CteScan`. The dedicated `Materialize` kernel is reserved for v0.6 CSE on shared sub-expressions outside a `WITH` (e.g. a correlated subquery referenced twice in a projection), which the binder does not currently emit.
-- [ ] `Gather` / `GatherMerge` (parallel query)
-- [ ] `Append` / `MergeAppend` (partition scans)
 - [x] `Result` (constant expressions) — `SELECT 1` and similar — `Project { input: Empty }` lowers to `ResultOp` in both `lower_query` and `lower_plan`; `select_constants_round_trip.rs` covers `SELECT 1` and `SELECT 1, 2, 3`
+
+> Out of v0.5 scope (tracked in later waves):
+> - `Gather` / `GatherMerge` — parallel query plumbing. Listed in v0.7 "Parallel Execution" (`ParallelSeqScan` partitioning was prototyped and rejected in Wave 6 — see line 904; the collator pair lands with the per-worker buffer-pool partition redesign).
+> - `Append` / `MergeAppend` — partition scans. Belongs to v0.8 "Index and Constrain" once `CREATE TABLE ... PARTITION OF` reaches the parser/catalog; no v0.5 query emits them.
 
 ### Expression Evaluation
 - [x] Full general expression interpreter (Eval) — replaces hardcoded `FilterEqI32`
 - [x] Vectorized Filter for col-op-literal predicates (SIMD `cmp_i32_scalar` / `cmp_i64_scalar` with mask AND validity bitmap)
 - [x] NULL propagation correctness in all operators (Kleene 3VL in Eval; SIMD path ANDs validity)
 - [x] Vectorized expression eval over batches for all shapes — `add/sub/mul/compare` over i32/i64/f32/f64 (column-vs-column and column-vs-literal), unary `neg_*` + `not_bool`, text helpers `len/lower/upper` in `crates/ultrasql-vec/src/kernels/`. Every kernel has a `_scalar` reference and a 1024-case proptest pinning vector == scalar. §2.1.
-- [ ] Type coercion / implicit casts at execution time
+
+> Out of v0.5 scope (tracked in v0.6 Wave §2.2):
+> - Execution-time type coercion / implicit casts. INSERT VALUES already coerces at planner time (`binder/dml.rs:83`); the eval interpreter rejects `Expr::Cast` as `EvalError::Unsupported` (`eval.rs:20`). The full coercion graph lands with the v0.6 type-extension track.
 
 ### Memory Management
 - [x] `WorkMemBudget` struct + reservation RAII — kernel in `work_mem.rs`; the budget is now carried by `LowerCtx::work_mem` (`Arc<WorkMemBudget>`) and inherited through every CTE / Cte body / lower_query recursion so every operator the lowerer builds has access. v0.5 sets the per-statement limit to `u64::MAX` because no operator yet spills — the wire is in place for v0.6 to call `budget.reserve()` when a hash table / sort buffer grows.
-- [ ] Hash build and sort operators spill to temp segments
 - [x] `temp_file_limit` constant defined (`work_mem.rs:39`); enforced vacuously in v0.5 — no operator yet writes a temp file, so the cap can never be exceeded. The check sites land alongside the spill paths in v0.6.
+
+> Out of v0.5 scope (tracked in v0.6 Wave §1.18):
+> - Hash-build / Sort spill to temp segments. v0.5 ships the reservation API (`WorkMemBudget`) and the cap constant (`temp_file_limit`); the actual spill writer lands with the streaming-sort + spill-aware HashAggregate rewrite in v0.6.
 
 ### Wire Protocol: Extended Query
 - [x] `Parse` codec
@@ -1240,6 +1249,7 @@ partitioning, full-text search, remaining type coverage.
 - [ ] Partition-wise joins and aggregation
 - [ ] `INSERT` routing to correct partition
 - [ ] `UPDATE` that crosses partitions (delete + insert)
+- [ ] `Append` / `MergeAppend` executor operators — needed to fan-in partition children once the partitioned-table catalog surface lands
 
 ### Full-Text Search
 - [ ] `TSVECTOR` / `TSQUERY` types
