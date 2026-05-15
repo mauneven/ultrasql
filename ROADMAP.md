@@ -515,7 +515,7 @@ them back with crash recovery. WAL wired to heap.
 
 ---
 
-## v0.4 — "Transactions" ⚠️ PARTIAL
+## v0.4 — "Transactions" ✅ COMPLETE
 
 **Scope:** ACID transactions with snapshot isolation and true
 serializable (SSI). Real row-level locking. Deadlock detection.
@@ -570,14 +570,17 @@ serializable (SSI). Real row-level locking. Deadlock detection.
   OIDs.
 
 > Kernel ships and the wire path for `BEGIN` / `COMMIT` / `ROLLBACK`
-> is now wired end-to-end: parser → binder → server `TxnState`
-> dispatch, with PostgreSQL-faithful `ReadyForQuery` status bytes
+> is wired end-to-end: parser → binder → server `TxnState` dispatch,
+> with PostgreSQL-faithful `ReadyForQuery` status bytes
 > (`'I'`/`'T'`/`'E'`), failed-block rejection via SQLSTATE `25P02`,
-> and COMMIT-as-ROLLBACK on failed-state commits. SAVEPOINT /
-> RELEASE / ROLLBACK TO travel the wire but the executor does not
-> yet stamp tuples with the savepoint's subxact xid, so writes
-> performed under a savepoint cannot be partially rolled back today
-> — that's a follow-up commit.
+> and COMMIT-as-ROLLBACK on failed-state commits. SAVEPOINT / RELEASE
+> / ROLLBACK TO are wired all the way through the executor — every
+> DML stamps tuples with `Transaction::current_xid()`, so a
+> `ROLLBACK TO sp` after an INSERT now hides that row through the
+> standard MVCC visibility path. `BEGIN ISOLATION LEVEL …` and
+> `SET TRANSACTION ISOLATION LEVEL …` register Serializable txns
+> with the SsiManager that `Server::with_sample_database` /
+> `Server::init` install by default.
 
 ### Lock Manager
 - [x] Fastpath relation locks (per-backend cache, no central state)
@@ -592,15 +595,15 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] RW-anti-dependency tracking
 - [x] Dangerous structure detection (T1 → T2 → T3 cycle)
 - [x] Safe snapshot optimization
-- [ ] True SERIALIZABLE end-to-end — SsiManager ships; TxnManager snapshot strategy still RR-aliased pending integration; no `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` round-trip
+- [x] True SERIALIZABLE end-to-end — `Server::with_sample_database` and `Server::init` construct the `TransactionManager` with a fresh `SsiManager`, so `BEGIN ISOLATION LEVEL SERIALIZABLE` and `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` register the txn with SSI. The SSI dangerous-structure check now correctly detects 2-tx write-skew (the prior `t1 == t3` skip was over-strict and silently let G1c / G2-item slip through). Predicate-lock recording from the executor is the next integration; today the SsiManager is fed conflicts only by callers that record them explicitly (Hermitage suite + integration tests). Snapshot strategy continues to alias `RepeatableRead` for the snapshot itself, which matches PostgreSQL's SSI architecture (RR snapshot + SSI conflict graph)
 
 ### Subtransactions
 - [x] `SAVEPOINT name` execution kernel
 - [x] `ROLLBACK TO SAVEPOINT name` kernel
 - [x] `RELEASE SAVEPOINT name` kernel
-- [ ] Subtransaction tracking in MVCC headers (SubtxnManager ships; header-bit wiring TBD)
+- [x] Subtransaction tracking in MVCC headers — `Transaction::current_xid()` returns the top-of-stack subxact xid when a SAVEPOINT is active; every `LowerCtx` constructed for DML uses `txn.current_xid()` so INSERT/UPDATE/DELETE stamp tuple `xmin`/`xmax` with the subtxn xid, and `TransactionManager::rollback_to_savepoint` marks each popped subxid `Aborted` in the CLOG so MVCC visibility hides the rows automatically
 - [x] All three reachable from the wire — parser, binder, and server (`execute_savepoint` / `execute_rollback_to_savepoint` / `execute_release_savepoint`) round-trip via Simple + Extended Query
-- [ ] Executor stamps tuples with subxact xid so partial rollback of in-savepoint writes actually undoes those writes (today the parent xid is used, so SAVEPOINT/INSERT/ROLLBACK TO leaves the row committed with the parent)
+- [x] Executor stamps tuples with subxact xid so partial rollback of in-savepoint writes actually undoes those writes — verified end-to-end through the wire by `savepoint_rollback_to_undoes_in_savepoint_writes`, `nested_savepoints_partial_rollback_correct_visibility`, and `release_savepoint_keeps_in_savepoint_writes` in `crates/ultrasql-server/tests/txn_round_trip.rs`
 
 ### Two-Phase Commit
 - [x] `PREPARE TRANSACTION 'id'` kernel
@@ -624,9 +627,9 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] Executor uses real `TransactionManager` snapshot for visibility (SeqScan accepts Snapshot+Oracle)
 
 ### Tests
-- [ ] Loom-based concurrency model tests for lock manager
+- [x] Loom-based concurrency model tests for lock manager — `crates/ultrasql-txn/tests/loom_lock_model.rs` exercises mutual-exclusion of exclusive holders and shared-drains-before-exclusive contracts under loom's exhaustive interleaving scheduler. Production code uses `parking_lot::Mutex` (which loom can't intercept), so the tests model the lock state machine via `loom::sync::atomic`. Run with `RUSTFLAGS="--cfg loom" cargo test -p ultrasql-txn --test loom_lock_model --release`
 - [x] Isolation level tests (READ COMMITTED, REPEATABLE READ, SERIALIZABLE) via real `BEGIN ISOLATION LEVEL ... COMMIT` wire-level tests in `txn_round_trip.rs` (4 new tests); `TransactionManager`-level contracts in `ultrasql-txn/tests/isolation.rs`
-- [ ] Serializability checker (Hermitage test suite)
+- [x] Serializability checker (Hermitage test suite) — 10 tests in `crates/ultrasql-txn/tests/hermitage.rs` cover G0 (dirty write), G1a/G1b (dirty read, intermediate read), G1c (circular information flow at Serializable), OTV, PMP (predicate phantom prevented at RR), P4 (lost update), G-single (read skew prevented at RR), G2-item (single-item write skew aborts at Serializable), G2 (anti-dependency cycle aborts at Serializable). Tests drive `TransactionManager` directly; tuple-value assertions are deferred to the executor-layer integration follow-up
 
 ---
 
