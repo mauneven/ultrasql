@@ -376,6 +376,17 @@ pub enum TokenKind {
     KwShare,
     /// `SKIP` — `SKIP LOCKED` wait policy.
     KwSkip,
+    // ---- Isolation level keywords added for v0.4 ----------------------------
+    /// `COMMITTED` — `READ COMMITTED`.
+    KwCommitted,
+    /// `LEVEL` — `ISOLATION LEVEL`.
+    KwLevel,
+    /// `READ` — `READ COMMITTED / READ UNCOMMITTED`.
+    KwRead,
+    /// `REPEATABLE` — `REPEATABLE READ`.
+    KwRepeatable,
+    /// `UNCOMMITTED` — `READ UNCOMMITTED` (aliased to READ COMMITTED).
+    KwUncommitted,
 }
 
 impl TokenKind {

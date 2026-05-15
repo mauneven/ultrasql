@@ -41,6 +41,8 @@ tarpaulin-report.html
 fuzz/artifacts/
 fuzz/coverage/
 fuzz/target/
+fuzz/Cargo.lock
+fuzz/corpus/parser_fuzz/
 # Downloaded GH Actions fuzz artifacts (corpus dumps land at repo root)
 fuzz-corpus-*/
 fuzz-artifacts-*/

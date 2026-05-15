@@ -121,7 +121,8 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         | LogicalPlan::ReleaseSavepoint { .. }
         | LogicalPlan::PrepareTransaction { .. }
         | LogicalPlan::CommitPrepared { .. }
-        | LogicalPlan::RollbackPrepared { .. } => false,
+        | LogicalPlan::RollbackPrepared { .. }
+        | LogicalPlan::SetTransaction { .. } => false,
         LogicalPlan::Filter { input, predicate } => {
             expr_contains_outer(predicate) || plan_contains_outer_column(input)
         }

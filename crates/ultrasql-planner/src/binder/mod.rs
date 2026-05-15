@@ -157,6 +157,18 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
             gid: gid.clone(),
             schema: Schema::empty(),
         }),
+        Statement::SetTransaction { isolation_level, .. } => {
+            use ultrasql_parser::ast::AstIsolationLevel as AL;
+            let level = match isolation_level {
+                AL::ReadCommitted => TxnIsolationLevel::ReadCommitted,
+                AL::RepeatableRead => TxnIsolationLevel::RepeatableRead,
+                AL::Serializable => TxnIsolationLevel::Serializable,
+            };
+            Ok(LogicalPlan::SetTransaction {
+                isolation_level: level,
+                schema: Schema::empty(),
+            })
+        }
         _ => Err(PlanError::NotSupported("statement variant")),
     }
 }

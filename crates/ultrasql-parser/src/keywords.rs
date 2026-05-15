@@ -215,6 +215,12 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("nowait", TokenKind::KwNowait),
         ("share", TokenKind::KwShare),
         ("skip", TokenKind::KwSkip),
+        // Isolation level keywords added for v0.4
+        ("committed", TokenKind::KwCommitted),
+        ("level", TokenKind::KwLevel),
+        ("read", TokenKind::KwRead),
+        ("repeatable", TokenKind::KwRepeatable),
+        ("uncommitted", TokenKind::KwUncommitted),
     ];
 
     entries.iter().copied().collect()

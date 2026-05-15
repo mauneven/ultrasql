@@ -110,7 +110,8 @@ where
             | LogicalPlan::ReleaseSavepoint { .. }
             | LogicalPlan::PrepareTransaction { .. }
             | LogicalPlan::CommitPrepared { .. }
-            | LogicalPlan::RollbackPrepared { .. } => {
+            | LogicalPlan::RollbackPrepared { .. }
+            | LogicalPlan::SetTransaction { .. } => {
                 return self.execute_txn_control(&plan);
             }
             _ => {}

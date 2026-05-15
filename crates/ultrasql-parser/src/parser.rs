@@ -210,7 +210,25 @@ impl<'src> Parser<'src> {
             TokenKind::KwAlter => self.parse_alter(),
             TokenKind::KwReindex => self.parse_reindex().map(Statement::Reindex),
             TokenKind::KwSet | TokenKind::KwShow | TokenKind::KwReset => {
-                self.parse_set_stmt().map(Statement::SetVar)
+                let head_kind = head.kind;
+                let next_kind = self.lookahead_at(1).map(|t| t.kind).ok();
+                if head_kind == TokenKind::KwSet && next_kind == Some(TokenKind::KwTransaction) {
+                    let set_tok = self.advance()?; // SET
+                    self.advance()?; // TRANSACTION
+                    let next_tok = *self.peek()?;
+                    let isolation_level =
+                        self.parse_opt_isolation_level()?.ok_or(ParseError::Expected {
+                            expected: "ISOLATION LEVEL after SET TRANSACTION",
+                            found: next_tok.kind,
+                            offset: next_tok.span.start as usize,
+                        })?;
+                    Ok(Statement::SetTransaction {
+                        isolation_level,
+                        span: set_tok.span,
+                    })
+                } else {
+                    self.parse_set_stmt().map(Statement::SetVar)
+                }
             }
             // ---- Savepoints -------------------------------------------------
             TokenKind::KwSavepoint => {
@@ -1383,6 +1401,26 @@ mod tests {
         ));
         assert!(matches!(parse("COMMIT"), Statement::Commit { .. }));
         assert!(matches!(parse("ROLLBACK"), Statement::Rollback { .. }));
+    }
+
+    #[test]
+    fn set_transaction_isolation_level() {
+        use crate::ast::AstIsolationLevel;
+        let stmt = parse("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+        let Statement::SetTransaction { isolation_level, .. } = stmt else { panic!() };
+        assert_eq!(isolation_level, AstIsolationLevel::ReadCommitted);
+
+        let stmt = parse("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+        let Statement::SetTransaction { isolation_level, .. } = stmt else { panic!() };
+        assert_eq!(isolation_level, AstIsolationLevel::RepeatableRead);
+
+        let stmt = parse("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+        let Statement::SetTransaction { isolation_level, .. } = stmt else { panic!() };
+        assert_eq!(isolation_level, AstIsolationLevel::Serializable);
+
+        // SET <var> = … must still parse as SetVar (not SetTransaction).
+        let stmt = parse("SET search_path TO public");
+        assert!(matches!(stmt, Statement::SetVar(_)));
     }
 
     #[test]

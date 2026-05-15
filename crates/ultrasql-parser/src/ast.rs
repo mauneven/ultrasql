@@ -9,6 +9,18 @@ use std::fmt;
 
 use crate::span::Span;
 
+/// Transaction isolation level as specified in a `BEGIN` or `SET TRANSACTION`
+/// statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AstIsolationLevel {
+    /// `READ COMMITTED` — each statement sees the latest committed data.
+    ReadCommitted,
+    /// `REPEATABLE READ` — the transaction sees a snapshot fixed at `BEGIN`.
+    RepeatableRead,
+    /// `SERIALIZABLE` — full serializable snapshot isolation.
+    Serializable,
+}
+
 /// Top-level SQL statement.
 ///
 /// `SelectStmt` and the DML statement types are comparatively large, so
@@ -27,8 +39,10 @@ pub enum Statement {
     Delete(Box<DeleteStmt>),
     /// `TRUNCATE TABLE ...`.
     Truncate(TruncateStmt),
-    /// `BEGIN [TRANSACTION]`.
+    /// `BEGIN [TRANSACTION] [ISOLATION LEVEL …]`.
     Begin {
+        /// Optional isolation level requested by the client.
+        isolation_level: Option<AstIsolationLevel>,
         /// Source span.
         span: Span,
     },
@@ -103,6 +117,16 @@ pub enum Statement {
         /// Source span.
         span: Span,
     },
+    /// `SET TRANSACTION ISOLATION LEVEL …` — change the *current* transaction's
+    /// isolation level. Must be issued inside a transaction block before any
+    /// data has been read or written; PostgreSQL rejects late changes with
+    /// SQLSTATE `25001`.
+    SetTransaction {
+        /// Isolation level requested by the client.
+        isolation_level: AstIsolationLevel,
+        /// Source span.
+        span: Span,
+    },
 }
 
 impl Statement {
@@ -115,7 +139,7 @@ impl Statement {
             Self::Update(s) => s.span,
             Self::Delete(s) => s.span,
             Self::Truncate(s) => s.span,
-            Self::Begin { span } | Self::Commit { span } | Self::Rollback { span } => *span,
+            Self::Begin { span, .. } | Self::Commit { span } | Self::Rollback { span } => *span,
             Self::CreateTable(s) => s.span,
             Self::CreateTableAs(s) => s.span,
             Self::DropTable(s) => s.span,
@@ -138,7 +162,8 @@ impl Statement {
             Self::Deallocate(s) => s.span,
             Self::PrepareTransaction { span, .. }
             | Self::CommitPrepared { span, .. }
-            | Self::RollbackPrepared { span, .. } => *span,
+            | Self::RollbackPrepared { span, .. }
+            | Self::SetTransaction { span, .. } => *span,
         }
     }
 }

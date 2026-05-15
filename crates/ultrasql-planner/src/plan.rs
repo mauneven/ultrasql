@@ -695,6 +695,18 @@ pub enum LogicalPlan {
         /// Always [`Schema::empty`].
         schema: Schema,
     },
+
+    /// `SET TRANSACTION ISOLATION LEVEL …` — change the *current*
+    /// transaction's isolation level. The server requires an active
+    /// transaction (SQLSTATE `25P01` outside one).
+    ///
+    /// `schema` is always [`Schema::empty`].
+    SetTransaction {
+        /// Requested isolation level.
+        isolation_level: TxnIsolationLevel,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
 }
 
 /// Resolved `ALTER TABLE` action.
@@ -746,7 +758,8 @@ impl LogicalPlan {
             | Self::ReleaseSavepoint { schema, .. }
             | Self::PrepareTransaction { schema, .. }
             | Self::CommitPrepared { schema, .. }
-            | Self::RollbackPrepared { schema, .. } => schema,
+            | Self::RollbackPrepared { schema, .. }
+            | Self::SetTransaction { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
                 input.schema()
             }
@@ -1185,6 +1198,10 @@ impl LogicalPlan {
             Self::RollbackPrepared { gid, .. } => {
                 out.push_str(&pad);
                 let _ = fmt::write(out, format_args!("RollbackPrepared: {gid}\n"));
+            }
+            Self::SetTransaction { isolation_level, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("SetTransaction: {isolation_level:?}\n"));
             }
         }
     }

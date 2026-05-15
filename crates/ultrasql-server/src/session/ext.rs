@@ -288,6 +288,7 @@ where
                     | LogicalPlan::PrepareTransaction { .. }
                     | LogicalPlan::CommitPrepared { .. }
                     | LogicalPlan::RollbackPrepared { .. }
+                    | LogicalPlan::SetTransaction { .. }
             ) {
                 match self.execute_txn_control(plan) {
                     Ok(result) => {

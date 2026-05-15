@@ -78,6 +78,9 @@ where
             LogicalPlan::PrepareTransaction { gid, .. } => self.execute_prepare_transaction(gid),
             LogicalPlan::CommitPrepared { gid, .. } => self.execute_commit_prepared(gid),
             LogicalPlan::RollbackPrepared { gid, .. } => self.execute_rollback_prepared(gid),
+            LogicalPlan::SetTransaction { isolation_level, .. } => {
+                self.execute_set_transaction(*isolation_level)
+            }
             _ => Err(ServerError::Unsupported(
                 "execute_txn_control called with non-txn-control plan",
             )),
@@ -236,6 +239,57 @@ where
         }
         messages.push(BackendMessage::CommandComplete {
             tag: "BEGIN".to_string(),
+        });
+        Ok(SelectResult {
+            messages,
+            streamed_body: None,
+            rows: 0,
+        })
+    }
+
+    /// `SET TRANSACTION ISOLATION LEVEL …` — change the *current*
+    /// transaction's isolation level.
+    ///
+    /// PostgreSQL semantics:
+    /// - Outside a transaction: SQLSTATE `25P01`
+    ///   (`no_active_sql_transaction`).
+    /// - In a failed block: rejected with the standard `25P02`
+    ///   (handled by the failed-block guard upstream of this method).
+    /// - Inside a healthy transaction: updates `Transaction::isolation`
+    ///   in place. If the new level is `Serializable` and an
+    ///   [`SsiManager`] is installed, the txn is registered for
+    ///   conflict tracking.
+    pub(crate) fn execute_set_transaction(
+        &mut self,
+        level: TxnIsolationLevel,
+    ) -> Result<SelectResult, ServerError> {
+        let iso = match level {
+            TxnIsolationLevel::ReadCommitted => IsolationLevel::ReadCommitted,
+            TxnIsolationLevel::RepeatableRead => IsolationLevel::RepeatableRead,
+            TxnIsolationLevel::Serializable => IsolationLevel::Serializable,
+        };
+        let mut messages: Vec<BackendMessage> = Vec::with_capacity(2);
+        match &mut self.txn_state {
+            TxnState::Idle => {
+                messages.push(notice_warning(
+                    "25P01",
+                    "SET TRANSACTION ISOLATION LEVEL outside a transaction",
+                ));
+            }
+            TxnState::InTransaction(txn) => {
+                txn.isolation = iso;
+                if iso == IsolationLevel::Serializable {
+                    self.state.txn_manager.register_serializable(txn.xid);
+                }
+            }
+            TxnState::Failed(_) => {
+                // The failed-block 25P02 path is handled at the dispatch
+                // layer; if we somehow reach here just leave the txn
+                // alone and emit nothing extra.
+            }
+        }
+        messages.push(BackendMessage::CommandComplete {
+            tag: "SET".to_string(),
         });
         Ok(SelectResult {
             messages,

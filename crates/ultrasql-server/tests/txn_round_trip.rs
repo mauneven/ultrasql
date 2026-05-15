@@ -536,6 +536,39 @@ async fn begin_isolation_level_serializable_round_trip() {
     shutdown(client, server_handle).await;
 }
 
+/// `SET TRANSACTION ISOLATION LEVEL …` round-trips inside an active
+/// transaction. Outside a transaction the server emits a `25P01`
+/// warning and proceeds (PostgreSQL semantics: the SET is a no-op,
+/// the connection stays usable).
+#[tokio::test]
+async fn set_transaction_isolation_level_round_trip() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client.batch_execute("BEGIN").await.expect("BEGIN");
+    client
+        .batch_execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+    client
+        .batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+    client
+        .batch_execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .await
+        .expect("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+
+    // Outside a transaction is allowed to round-trip with a warning;
+    // tokio-postgres surfaces the CommandComplete tag, not the notice.
+    client
+        .batch_execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("SET TRANSACTION outside tx round-trips with a notice");
+
+    shutdown(client, server_handle).await;
+}
+
 /// Inside a REPEATABLE READ transaction the snapshot is frozen at BEGIN.
 /// A baseline row inserted before BEGIN is visible; the transaction
 /// commits cleanly to verify the full path.

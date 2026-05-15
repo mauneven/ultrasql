@@ -298,7 +298,8 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::ReleaseSavepoint { .. }
             | LogicalPlan::PrepareTransaction { .. }
             | LogicalPlan::CommitPrepared { .. }
-            | LogicalPlan::RollbackPrepared { .. } => zero_estimate(),
+            | LogicalPlan::RollbackPrepared { .. }
+            | LogicalPlan::SetTransaction { .. } => zero_estimate(),
         }
     }
 }
