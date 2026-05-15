@@ -230,7 +230,10 @@ pub fn lower_plan(
         | LogicalPlan::Rollback { .. }
         | LogicalPlan::Savepoint { .. }
         | LogicalPlan::RollbackToSavepoint { .. }
-        | LogicalPlan::ReleaseSavepoint { .. } => Err(ServerError::Unsupported(
+        | LogicalPlan::ReleaseSavepoint { .. }
+        | LogicalPlan::PrepareTransaction { .. }
+        | LogicalPlan::CommitPrepared { .. }
+        | LogicalPlan::RollbackPrepared { .. } => Err(ServerError::Unsupported(
             "transaction control reached operator lowerer; expected txn dispatch path",
         )),
         LogicalPlan::Aggregate { .. } => Err(ServerError::Unsupported("GROUP BY / aggregate")),
@@ -683,7 +686,10 @@ pub fn lower_query(
         | LogicalPlan::Rollback { .. }
         | LogicalPlan::Savepoint { .. }
         | LogicalPlan::RollbackToSavepoint { .. }
-        | LogicalPlan::ReleaseSavepoint { .. } => Err(ServerError::Unsupported(
+        | LogicalPlan::ReleaseSavepoint { .. }
+        | LogicalPlan::PrepareTransaction { .. }
+        | LogicalPlan::CommitPrepared { .. }
+        | LogicalPlan::RollbackPrepared { .. } => Err(ServerError::Unsupported(
             "transaction control reached operator lowerer; expected txn dispatch path",
         )),
         LogicalPlan::Join {

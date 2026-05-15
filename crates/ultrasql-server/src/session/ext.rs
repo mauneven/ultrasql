@@ -285,6 +285,9 @@ where
                     | LogicalPlan::Savepoint { .. }
                     | LogicalPlan::RollbackToSavepoint { .. }
                     | LogicalPlan::ReleaseSavepoint { .. }
+                    | LogicalPlan::PrepareTransaction { .. }
+                    | LogicalPlan::CommitPrepared { .. }
+                    | LogicalPlan::RollbackPrepared { .. }
             ) {
                 match self.execute_txn_control(plan) {
                     Ok(result) => {

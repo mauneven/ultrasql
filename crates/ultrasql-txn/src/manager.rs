@@ -605,6 +605,28 @@ impl TransactionManager {
         }
     }
 
+    /// Finalise a previously-prepared transaction by stamping its
+    /// CLOG entry with `final_status` (must be
+    /// [`XidStatus::Committed`] or [`XidStatus::Aborted`]).
+    ///
+    /// Used by the 2PC phase-2 path
+    /// (`COMMIT PREPARED 'gid'` / `ROLLBACK PREPARED 'gid'`) after
+    /// the [`crate::two_phase::TwoPhaseCoordinator`] has already
+    /// removed the on-disk state file and returned the prepared
+    /// `xid`. The transaction has remained `InProgress` in the
+    /// CLOG since [`Self::prepare_transaction`] consumed the
+    /// `Transaction` handle without flipping status; this method
+    /// closes the loop.
+    pub fn finalise_prepared(&self, xid: Xid, final_status: XidStatus) -> Result<(), TxnError> {
+        debug_assert!(matches!(
+            final_status,
+            XidStatus::Committed | XidStatus::Aborted
+        ));
+        self.terminate(xid, final_status)?;
+        self.lock_manager.release_all(xid);
+        Ok(())
+    }
+
     // ── SSI pass-through methods ─────────────────────────────────────────────
 
     /// Record a predicate lock for a serializable transaction.

@@ -181,12 +181,20 @@ impl<'src> Parser<'src> {
                 if self.peek()?.kind == TokenKind::KwTransaction {
                     self.advance()?;
                 }
+                // COMMIT PREPARED 'gid' — phase 2 of 2PC.
+                if self.peek()?.kind == TokenKind::KwPrepared {
+                    return self.parse_commit_prepared(tok.span.start);
+                }
                 Ok(Statement::Commit { span: tok.span })
             }
             TokenKind::KwRollback => {
                 let tok = self.advance()?;
                 if self.peek()?.kind == TokenKind::KwTransaction {
                     self.advance()?;
+                }
+                // ROLLBACK PREPARED 'gid' — phase 2 abort of 2PC.
+                if self.peek()?.kind == TokenKind::KwPrepared {
+                    return self.parse_rollback_prepared(tok.span.start);
                 }
                 // ROLLBACK TO [SAVEPOINT] name
                 if self.peek()?.kind == TokenKind::KwTo {

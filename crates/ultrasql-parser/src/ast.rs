@@ -82,6 +82,27 @@ pub enum Statement {
     Execute(ExecuteStmt),
     /// `DEALLOCATE [ALL | name]`.
     Deallocate(DeallocateStmt),
+    /// `PREPARE TRANSACTION 'gid'` — phase 1 of two-phase commit.
+    PrepareTransaction {
+        /// Global transaction identifier supplied by the coordinator.
+        gid: String,
+        /// Source span.
+        span: Span,
+    },
+    /// `COMMIT PREPARED 'gid'` — phase 2 commit of a prepared txn.
+    CommitPrepared {
+        /// Global transaction identifier to commit.
+        gid: String,
+        /// Source span.
+        span: Span,
+    },
+    /// `ROLLBACK PREPARED 'gid'` — phase 2 abort of a prepared txn.
+    RollbackPrepared {
+        /// Global transaction identifier to roll back.
+        gid: String,
+        /// Source span.
+        span: Span,
+    },
 }
 
 impl Statement {
@@ -115,6 +136,9 @@ impl Statement {
             Self::Prepare(s) => s.span,
             Self::Execute(s) => s.span,
             Self::Deallocate(s) => s.span,
+            Self::PrepareTransaction { span, .. }
+            | Self::CommitPrepared { span, .. }
+            | Self::RollbackPrepared { span, .. } => *span,
         }
     }
 }

@@ -268,6 +268,11 @@ pub struct Server {
     /// commit keeps the hot path cheap (one atomic add) and amortises
     /// the GC walk across many small transactions.
     pub vacuum_commit_counter: std::sync::atomic::AtomicU64,
+    /// Two-phase commit coordinator. Owns the on-disk state directory
+    /// for prepared transactions; consulted by
+    /// `PREPARE TRANSACTION 'gid'`, `COMMIT PREPARED 'gid'`, and
+    /// `ROLLBACK PREPARED 'gid'`.
+    pub two_phase: Arc<ultrasql_txn::two_phase::TwoPhaseCoordinator>,
 }
 
 /// Run undo-log GC every `UNDO_GC_INTERVAL_COMMITS` successful
@@ -307,6 +312,16 @@ impl Server {
         let txn_manager = Arc::new(TransactionManager::new());
         let plan_cache = Arc::new(PlanCache::new(PlanCacheConfig::default()));
 
+        // Per-process tempdir for the 2PC coordinator. Production
+        // wiring (`Server::init`) replaces this with `<data_dir>/pg_twophase`.
+        let two_phase_dir = std::env::temp_dir().join(format!(
+            "ultrasql-twophase-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&two_phase_dir);
+        let two_phase = Arc::new(ultrasql_txn::two_phase::TwoPhaseCoordinator::new(
+            two_phase_dir,
+        ));
         Self {
             catalog,
             tables,
@@ -315,6 +330,7 @@ impl Server {
             txn_manager,
             plan_cache,
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
+            two_phase,
         }
     }
 

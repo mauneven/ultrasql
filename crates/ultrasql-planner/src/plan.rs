@@ -597,6 +597,30 @@ pub enum LogicalPlan {
         /// Always [`Schema::empty`].
         schema: Schema,
     },
+
+    /// `PREPARE TRANSACTION 'gid'` — phase 1 of two-phase commit.
+    PrepareTransaction {
+        /// Global transaction identifier.
+        gid: String,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `COMMIT PREPARED 'gid'` — phase 2 commit.
+    CommitPrepared {
+        /// Global transaction identifier to resolve.
+        gid: String,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `ROLLBACK PREPARED 'gid'` — phase 2 abort.
+    RollbackPrepared {
+        /// Global transaction identifier to resolve.
+        gid: String,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
 }
 
 /// Resolved `ALTER TABLE` action.
@@ -644,7 +668,10 @@ impl LogicalPlan {
             | Self::Rollback { schema }
             | Self::Savepoint { schema, .. }
             | Self::RollbackToSavepoint { schema, .. }
-            | Self::ReleaseSavepoint { schema, .. } => schema,
+            | Self::ReleaseSavepoint { schema, .. }
+            | Self::PrepareTransaction { schema, .. }
+            | Self::CommitPrepared { schema, .. }
+            | Self::RollbackPrepared { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
                 input.schema()
             }
@@ -1050,6 +1077,18 @@ impl LogicalPlan {
             Self::ReleaseSavepoint { name, .. } => {
                 out.push_str(&pad);
                 let _ = fmt::write(out, format_args!("ReleaseSavepoint: {name}\n"));
+            }
+            Self::PrepareTransaction { gid, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("PrepareTransaction: {gid}\n"));
+            }
+            Self::CommitPrepared { gid, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("CommitPrepared: {gid}\n"));
+            }
+            Self::RollbackPrepared { gid, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("RollbackPrepared: {gid}\n"));
             }
         }
     }

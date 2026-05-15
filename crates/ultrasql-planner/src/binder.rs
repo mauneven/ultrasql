@@ -117,6 +117,18 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
             name: s.name.value.to_ascii_lowercase(),
             schema: Schema::empty(),
         }),
+        Statement::PrepareTransaction { gid, .. } => Ok(LogicalPlan::PrepareTransaction {
+            gid: gid.clone(),
+            schema: Schema::empty(),
+        }),
+        Statement::CommitPrepared { gid, .. } => Ok(LogicalPlan::CommitPrepared {
+            gid: gid.clone(),
+            schema: Schema::empty(),
+        }),
+        Statement::RollbackPrepared { gid, .. } => Ok(LogicalPlan::RollbackPrepared {
+            gid: gid.clone(),
+            schema: Schema::empty(),
+        }),
         _ => Err(PlanError::NotSupported("statement variant")),
     }
 }
@@ -2190,7 +2202,10 @@ fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Rollback { .. }
         | LogicalPlan::Savepoint { .. }
         | LogicalPlan::RollbackToSavepoint { .. }
-        | LogicalPlan::ReleaseSavepoint { .. } => false,
+        | LogicalPlan::ReleaseSavepoint { .. }
+        | LogicalPlan::PrepareTransaction { .. }
+        | LogicalPlan::CommitPrepared { .. }
+        | LogicalPlan::RollbackPrepared { .. } => false,
         LogicalPlan::Filter { input, predicate } => {
             expr_contains_outer(predicate) || plan_contains_outer_column(input)
         }

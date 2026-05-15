@@ -373,7 +373,10 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
         | LogicalPlan::Rollback { .. }
         | LogicalPlan::Savepoint { .. }
         | LogicalPlan::RollbackToSavepoint { .. }
-        | LogicalPlan::ReleaseSavepoint { .. } => Ok(None),
+        | LogicalPlan::ReleaseSavepoint { .. }
+        | LogicalPlan::PrepareTransaction { .. }
+        | LogicalPlan::CommitPrepared { .. }
+        | LogicalPlan::RollbackPrepared { .. } => Ok(None),
     }
 }
 

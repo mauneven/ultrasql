@@ -19,6 +19,29 @@ impl Parser<'_> {
     /// Assumes the `PREPARE` keyword has already been consumed. `start` is
     /// its byte offset.
     pub(crate) fn parse_prepare(&mut self, start: u32) -> Result<Statement, ParseError> {
+        // `PREPARE TRANSACTION 'gid'` — phase 1 of two-phase commit.
+        // Disambiguate from `PREPARE name [(types)] AS stmt` on the
+        // next token.
+        if self.peek()?.kind == TokenKind::KwTransaction {
+            self.advance()?; // TRANSACTION
+            let gid_tok = self.advance()?;
+            let gid = match gid_tok.kind {
+                TokenKind::String => gid_tok
+                    .text(self.source)
+                    .unwrap_or("")
+                    .trim_matches('\'')
+                    .to_owned(),
+                other => {
+                    return Err(ParseError::Expected {
+                        expected: "string literal containing the global transaction id",
+                        found: other,
+                        offset: gid_tok.span.start as usize,
+                    });
+                }
+            };
+            let span = Span::new(start, gid_tok.span.end);
+            return Ok(Statement::PrepareTransaction { gid, span });
+        }
         let name = self.parse_identifier()?;
 
         // Optional parameter-type list.
@@ -48,6 +71,56 @@ impl Parser<'_> {
             statement: Box::new(statement),
             span: Span::new(start, end),
         })))
+    }
+
+    /// Parse `COMMIT PREPARED 'gid'` — phase 2 of two-phase commit.
+    ///
+    /// Assumes `COMMIT` has been consumed and the next token is
+    /// `PREPARED`. `start` is the byte offset of `COMMIT`.
+    pub(crate) fn parse_commit_prepared(&mut self, start: u32) -> Result<Statement, ParseError> {
+        let _ = self.advance()?; // PREPARED
+        let gid_tok = self.advance()?;
+        let gid = match gid_tok.kind {
+            TokenKind::String => gid_tok
+                .text(self.source)
+                .unwrap_or("")
+                .trim_matches('\'')
+                .to_owned(),
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "string literal containing the global transaction id",
+                    found: other,
+                    offset: gid_tok.span.start as usize,
+                });
+            }
+        };
+        let span = Span::new(start, gid_tok.span.end);
+        Ok(Statement::CommitPrepared { gid, span })
+    }
+
+    /// Parse `ROLLBACK PREPARED 'gid'` — phase 2 abort of 2PC.
+    ///
+    /// Assumes `ROLLBACK` has been consumed and the next token is
+    /// `PREPARED`. `start` is the byte offset of `ROLLBACK`.
+    pub(crate) fn parse_rollback_prepared(&mut self, start: u32) -> Result<Statement, ParseError> {
+        let _ = self.advance()?; // PREPARED
+        let gid_tok = self.advance()?;
+        let gid = match gid_tok.kind {
+            TokenKind::String => gid_tok
+                .text(self.source)
+                .unwrap_or("")
+                .trim_matches('\'')
+                .to_owned(),
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "string literal containing the global transaction id",
+                    found: other,
+                    offset: gid_tok.span.start as usize,
+                });
+            }
+        };
+        let span = Span::new(start, gid_tok.span.end);
+        Ok(Statement::RollbackPrepared { gid, span })
     }
 
     /// Parse `EXECUTE name [(arg, …)]`.

@@ -74,10 +74,142 @@ where
                 self.execute_rollback_to_savepoint(name)
             }
             LogicalPlan::ReleaseSavepoint { name, .. } => self.execute_release_savepoint(name),
+            LogicalPlan::PrepareTransaction { gid, .. } => self.execute_prepare_transaction(gid),
+            LogicalPlan::CommitPrepared { gid, .. } => self.execute_commit_prepared(gid),
+            LogicalPlan::RollbackPrepared { gid, .. } => self.execute_rollback_prepared(gid),
             _ => Err(ServerError::Unsupported(
                 "execute_txn_control called with non-txn-control plan",
             )),
         }
+    }
+
+    /// `PREPARE TRANSACTION 'gid'` — phase 1 of two-phase commit.
+    ///
+    /// Disassociates the current transaction from the session and
+    /// hands its `xid` to the [`TwoPhaseCoordinator`] under `gid`.
+    /// The CLOG entry stays `InProgress` until phase 2 finalises it.
+    /// PostgreSQL rules:
+    /// - Outside a transaction: error `25P01`.
+    /// - Inside a failed block: phase-1 prepare aborts the txn and
+    ///   returns a rollback tag, mirroring failed-block COMMIT.
+    pub(crate) fn execute_prepare_transaction(
+        &mut self,
+        gid: &str,
+    ) -> Result<SelectResult, ServerError> {
+        match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
+            TxnState::Idle => Ok(SelectResult {
+                messages: vec![
+                    notice_warning("25P01", "PREPARE TRANSACTION outside a transaction"),
+                    BackendMessage::CommandComplete {
+                        tag: "PREPARE TRANSACTION".to_string(),
+                    },
+                ],
+                streamed_body: None,
+                rows: 0,
+            }),
+            TxnState::InTransaction(txn) => {
+                if let Err(e) = self.state.txn_manager.prepare_transaction(
+                    gid,
+                    txn,
+                    self.state.two_phase.as_ref(),
+                ) {
+                    return Err(ServerError::Ddl(format!(
+                        "prepare_transaction({gid}): {e}"
+                    )));
+                }
+                Ok(SelectResult {
+                    messages: vec![BackendMessage::CommandComplete {
+                        tag: "PREPARE TRANSACTION".to_string(),
+                    }],
+                    streamed_body: None,
+                    rows: 0,
+                })
+            }
+            TxnState::Failed(txn) => {
+                let xid = txn.xid;
+                if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
+                    tracing::warn!(error = %e, "in-place update rollback failed");
+                }
+                if let Err(e) = self.state.txn_manager.abort(txn) {
+                    tracing::warn!(error = %e, "PREPARE TRANSACTION on failed block — abort failed");
+                }
+                Ok(SelectResult {
+                    messages: vec![BackendMessage::CommandComplete {
+                        tag: "ROLLBACK".to_string(),
+                    }],
+                    streamed_body: None,
+                    rows: 0,
+                })
+            }
+        }
+    }
+
+    /// `COMMIT PREPARED 'gid'` — phase 2 commit of a prepared txn.
+    ///
+    /// Resolves the gid via the coordinator, finalises the CLOG
+    /// entry as Committed, and returns the standard
+    /// `COMMIT PREPARED` command tag. A missing gid surfaces as
+    /// `ServerError::Internal` carrying the coordinator's error
+    /// message.
+    pub(crate) fn execute_commit_prepared(
+        &mut self,
+        gid: &str,
+    ) -> Result<SelectResult, ServerError> {
+        let xid = self
+            .state
+            .two_phase
+            .commit_prepared(gid)
+            .map_err(|e| ServerError::Ddl(format!("commit_prepared({gid}): {e}")))?;
+        if let Err(e) = self
+            .state
+            .txn_manager
+            .finalise_prepared(xid, ultrasql_mvcc::XidStatus::Committed)
+        {
+            tracing::warn!(error = %e, "finalise_prepared (committed) failed");
+        } else {
+            self.state.note_commit_for_gc();
+        }
+        Ok(SelectResult {
+            messages: vec![BackendMessage::CommandComplete {
+                tag: "COMMIT PREPARED".to_string(),
+            }],
+            streamed_body: None,
+            rows: 0,
+        })
+    }
+
+    /// `ROLLBACK PREPARED 'gid'` — phase 2 abort of a prepared txn.
+    ///
+    /// Symmetric counterpart to [`Self::execute_commit_prepared`].
+    /// Drains any pending in-place undo for the prepared xid before
+    /// terminating the CLOG entry so a concurrent reader observes
+    /// the right post-rollback state.
+    pub(crate) fn execute_rollback_prepared(
+        &mut self,
+        gid: &str,
+    ) -> Result<SelectResult, ServerError> {
+        let xid = self
+            .state
+            .two_phase
+            .rollback_prepared(gid)
+            .map_err(|e| ServerError::Ddl(format!("rollback_prepared({gid}): {e}")))?;
+        if let Err(e) = self.state.heap.rollback_in_place_updates(xid) {
+            tracing::warn!(error = %e, "in-place update rollback failed for prepared txn");
+        }
+        if let Err(e) = self
+            .state
+            .txn_manager
+            .finalise_prepared(xid, ultrasql_mvcc::XidStatus::Aborted)
+        {
+            tracing::warn!(error = %e, "finalise_prepared (aborted) failed");
+        }
+        Ok(SelectResult {
+            messages: vec![BackendMessage::CommandComplete {
+                tag: "ROLLBACK PREPARED".to_string(),
+            }],
+            streamed_body: None,
+            rows: 0,
+        })
     }
 
     pub(crate) fn execute_begin(&mut self) -> Result<SelectResult, ServerError> {

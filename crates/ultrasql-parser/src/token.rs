@@ -279,6 +279,8 @@ pub enum TokenKind {
     KwTimestamp,
     KwTrailing,
     KwTransaction,
+    /// `PREPARED` — used in `COMMIT PREPARED` / `ROLLBACK PREPARED` / `PREPARE TRANSACTION`.
+    KwPrepared,
     KwTrue,
     KwTruncate,
     KwUnion,

@@ -198,6 +198,7 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("format", TokenKind::KwFormat),
         ("json", TokenKind::KwJson),
         ("prepare", TokenKind::KwPrepare),
+        ("prepared", TokenKind::KwPrepared),
         ("recursive", TokenKind::KwRecursive),
         ("release", TokenKind::KwRelease),
         ("verbose", TokenKind::KwVerbose),

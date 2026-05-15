@@ -636,7 +636,10 @@ fn infer_into(
         | LogicalPlan::Rollback { .. }
         | LogicalPlan::Savepoint { .. }
         | LogicalPlan::RollbackToSavepoint { .. }
-        | LogicalPlan::ReleaseSavepoint { .. } => {}
+        | LogicalPlan::ReleaseSavepoint { .. }
+        | LogicalPlan::PrepareTransaction { .. }
+        | LogicalPlan::CommitPrepared { .. }
+        | LogicalPlan::RollbackPrepared { .. } => {}
         LogicalPlan::Filter { input, predicate } => {
             infer_into(input, catalog, out);
             infer_expr_types_from_predicate(predicate, out);
@@ -919,7 +922,10 @@ fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut F) {
         | LogicalPlan::Rollback { .. }
         | LogicalPlan::Savepoint { .. }
         | LogicalPlan::RollbackToSavepoint { .. }
-        | LogicalPlan::ReleaseSavepoint { .. } => {}
+        | LogicalPlan::ReleaseSavepoint { .. }
+        | LogicalPlan::PrepareTransaction { .. }
+        | LogicalPlan::CommitPrepared { .. }
+        | LogicalPlan::RollbackPrepared { .. } => {}
         LogicalPlan::Filter { input, predicate } => {
             walk_plan_exprs(input, f);
             walk_expr(predicate, f);
@@ -1276,7 +1282,10 @@ where
         | LogicalPlan::Rollback { .. }
         | LogicalPlan::Savepoint { .. }
         | LogicalPlan::RollbackToSavepoint { .. }
-        | LogicalPlan::ReleaseSavepoint { .. } => plan.clone(),
+        | LogicalPlan::ReleaseSavepoint { .. }
+        | LogicalPlan::PrepareTransaction { .. }
+        | LogicalPlan::CommitPrepared { .. }
+        | LogicalPlan::RollbackPrepared { .. } => plan.clone(),
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(map_plan_exprs(input, f)),
             predicate: f(predicate),
@@ -1690,6 +1699,9 @@ fn row_description_for_plan(plan: &LogicalPlan) -> BackendMessage {
             | LogicalPlan::Savepoint { .. }
             | LogicalPlan::RollbackToSavepoint { .. }
             | LogicalPlan::ReleaseSavepoint { .. }
+            | LogicalPlan::PrepareTransaction { .. }
+            | LogicalPlan::CommitPrepared { .. }
+            | LogicalPlan::RollbackPrepared { .. }
     ) || matches!(plan, LogicalPlan::Insert { returning, .. } if returning.is_empty())
         || matches!(plan, LogicalPlan::Update { returning, .. } if returning.is_empty())
         || matches!(plan, LogicalPlan::Delete { returning, .. } if returning.is_empty());

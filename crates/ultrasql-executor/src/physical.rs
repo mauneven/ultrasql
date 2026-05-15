@@ -189,7 +189,10 @@ pub fn build_operator(
         | LogicalPlan::Rollback { .. }
         | LogicalPlan::Savepoint { .. }
         | LogicalPlan::RollbackToSavepoint { .. }
-        | LogicalPlan::ReleaseSavepoint { .. } => Err(BuildError::Unsupported(
+        | LogicalPlan::ReleaseSavepoint { .. }
+        | LogicalPlan::PrepareTransaction { .. }
+        | LogicalPlan::CommitPrepared { .. }
+        | LogicalPlan::RollbackPrepared { .. } => Err(BuildError::Unsupported(
             "transaction-control statements are dispatched outside the operator pipeline",
         )),
 

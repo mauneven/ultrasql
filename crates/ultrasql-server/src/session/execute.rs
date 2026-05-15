@@ -107,7 +107,10 @@ where
             | LogicalPlan::Rollback { .. }
             | LogicalPlan::Savepoint { .. }
             | LogicalPlan::RollbackToSavepoint { .. }
-            | LogicalPlan::ReleaseSavepoint { .. } => {
+            | LogicalPlan::ReleaseSavepoint { .. }
+            | LogicalPlan::PrepareTransaction { .. }
+            | LogicalPlan::CommitPrepared { .. }
+            | LogicalPlan::RollbackPrepared { .. } => {
                 return self.execute_txn_control(&plan);
             }
             _ => {}
