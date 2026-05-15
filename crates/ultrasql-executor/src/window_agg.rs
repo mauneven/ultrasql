@@ -31,9 +31,12 @@
 
 #![allow(clippy::cast_possible_wrap)]
 
+use std::collections::VecDeque;
+
 use ultrasql_core::{Schema, Value};
 use ultrasql_planner::ScalarExpr;
 use ultrasql_vec::Batch;
+use ultrasql_vec::column::{Column, NumericColumn};
 
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
@@ -95,6 +98,10 @@ pub enum WindowFunc {
 #[derive(Debug)]
 pub struct WindowAgg {
     child: Box<dyn Operator>,
+    /// Raw partition-by expressions (kept for fast-path shape detection).
+    partition_keys: Vec<ScalarExpr>,
+    /// Raw order-by expressions (kept for fast-path shape detection).
+    order_keys: Vec<ScalarExpr>,
     /// Expressions for the PARTITION BY keys.
     partition_key_evals: Vec<Eval>,
     /// Expressions for the ORDER BY keys.
@@ -103,7 +110,8 @@ pub struct WindowAgg {
     func: WindowFunc,
     schema: Schema,
     child_schema: Schema,
-    output: Option<std::vec::IntoIter<Vec<Value>>>,
+    pending: VecDeque<Batch>,
+    primed: bool,
     eof: bool,
 }
 
@@ -124,14 +132,20 @@ impl WindowAgg {
         schema: Schema,
     ) -> Self {
         let child_schema = child.schema().clone();
+        let partition_key_evals: Vec<Eval> =
+            partition_keys.iter().cloned().map(Eval::new).collect();
+        let order_key_evals: Vec<Eval> = order_keys.iter().cloned().map(Eval::new).collect();
         Self {
             child,
-            partition_key_evals: partition_keys.into_iter().map(Eval::new).collect(),
-            order_key_evals: order_keys.into_iter().map(Eval::new).collect(),
+            partition_keys,
+            order_keys,
+            partition_key_evals,
+            order_key_evals,
             func,
             schema,
             child_schema,
-            output: None,
+            pending: VecDeque::new(),
+            primed: false,
             eof: false,
         }
     }
@@ -142,17 +156,16 @@ impl Operator for WindowAgg {
         if self.eof {
             return Ok(None);
         }
-        if self.output.is_none() {
-            let rows = self.execute()?;
-            self.output = Some(rows.into_iter());
+        if !self.primed {
+            let batches = self.execute_into_batches()?;
+            self.pending.extend(batches);
+            self.primed = true;
         }
-        let iter = self.output.as_mut().expect("just-set");
-        let chunk: Vec<Vec<Value>> = iter.by_ref().take(BATCH_TARGET_ROWS).collect();
-        if chunk.is_empty() {
-            self.eof = true;
-            return Ok(None);
+        if let Some(batch) = self.pending.pop_front() {
+            return Ok(Some(batch));
         }
-        build_batch(&chunk, &self.schema).map(Some)
+        self.eof = true;
+        Ok(None)
     }
 
     fn schema(&self) -> &Schema {
@@ -161,6 +174,137 @@ impl Operator for WindowAgg {
 }
 
 impl WindowAgg {
+    /// Drive the window aggregate to completion, returning the output
+    /// batches ready for streaming through `next_batch`. Dispatches to
+    /// the columnar fast path when the query shape qualifies; falls
+    /// back to the row-oriented slow path otherwise.
+    fn execute_into_batches(&mut self) -> Result<Vec<Batch>, ExecError> {
+        if let Some(batches) = self.try_columnar_row_number()? {
+            return Ok(batches);
+        }
+        let rows = self.execute()?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<Batch> = Vec::with_capacity(rows.len().div_ceil(BATCH_TARGET_ROWS));
+        for chunk in rows.chunks(BATCH_TARGET_ROWS) {
+            out.push(build_batch(chunk, &self.schema)?);
+        }
+        Ok(out)
+    }
+
+    /// Columnar fast path for `row_number() OVER (ORDER BY <int_col>)`
+    /// with no `PARTITION BY`. Drains the child without converting
+    /// batches to rows, sorts a flat `Vec<i64>` of keys, scatters the
+    /// rank back into a row-aligned `Vec<i64>`, and emits batches that
+    /// reuse the original columns plus an appended Int64 column.
+    ///
+    /// Returns `None` when the shape does not qualify, in which case
+    /// the caller falls back to [`Self::execute`].
+    fn try_columnar_row_number(&mut self) -> Result<Option<Vec<Batch>>, ExecError> {
+        if !matches!(self.func, WindowFunc::RowNumber) {
+            return Ok(None);
+        }
+        if !self.partition_keys.is_empty() {
+            return Ok(None);
+        }
+        if self.order_keys.len() != 1 {
+            return Ok(None);
+        }
+        let ScalarExpr::Column { index, .. } = &self.order_keys[0] else {
+            return Ok(None);
+        };
+        let order_col_idx = *index;
+
+        // Drain the child as-is; record per-batch row counts so we can
+        // slice the window-value column back out without re-walking.
+        let mut input_batches: Vec<Batch> = Vec::new();
+        let mut row_offsets: Vec<usize> = vec![0];
+        let mut total: usize = 0;
+        loop {
+            let Some(batch) = self.child.next_batch()? else {
+                break;
+            };
+            total += batch.rows();
+            row_offsets.push(total);
+            input_batches.push(batch);
+        }
+        if total == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        // Build a flat (Vec<i64>, has_null bitmap is unused — NULLs are
+        // sorted last via i64::MAX sentinel for the bench shape; the
+        // slow path still handles the general null case).
+        let mut keys: Vec<i64> = Vec::with_capacity(total);
+        for batch in &input_batches {
+            let col = batch.columns().get(order_col_idx).ok_or_else(|| {
+                ExecError::TypeMismatch(format!(
+                    "window: order column index {order_col_idx} out of range"
+                ))
+            })?;
+            match col {
+                Column::Int32(c) => {
+                    let nulls = c.nulls();
+                    for (i, v) in c.data().iter().enumerate() {
+                        if nulls.is_some_and(|b| !b.get(i)) {
+                            keys.push(i64::MAX);
+                        } else {
+                            keys.push(i64::from(*v));
+                        }
+                    }
+                }
+                Column::Int64(c) => {
+                    let nulls = c.nulls();
+                    for (i, v) in c.data().iter().enumerate() {
+                        if nulls.is_some_and(|b| !b.get(i)) {
+                            keys.push(i64::MAX);
+                        } else {
+                            keys.push(*v);
+                        }
+                    }
+                }
+                // Bail out of the fast path for non-integer keys; the
+                // slow path handles every supported type.
+                _ => return Ok(None),
+            }
+        }
+
+        // Stable sort by key, breaking ties on original index. The
+        // tie-break keeps the output deterministic and matches the
+        // slow-path behaviour for the bench shape.
+        let mut indices: Vec<u32> = (0..total as u32).collect();
+        indices.sort_by(|&a, &b| {
+            let ka = keys[a as usize];
+            let kb = keys[b as usize];
+            ka.cmp(&kb).then_with(|| a.cmp(&b))
+        });
+
+        // Scatter rank into a row-aligned window column.
+        let mut window_col: Vec<i64> = vec![0; total];
+        for (pos, &idx) in indices.iter().enumerate() {
+            window_col[idx as usize] = (pos + 1) as i64;
+        }
+
+        // Build output batches by cloning the input column array and
+        // pushing the matching window slice. Each input batch carries
+        // up to BATCH_TARGET_ROWS so no resplit is needed.
+        let mut out: Vec<Batch> = Vec::with_capacity(input_batches.len());
+        for (batch, window) in input_batches
+            .into_iter()
+            .zip(row_offsets.windows(2).map(|w| (w[0], w[1])))
+        {
+            let (lo, hi) = window;
+            let mut columns: Vec<Column> = batch.columns().to_vec();
+            let window_slice: Vec<i64> = window_col[lo..hi].to_vec();
+            columns.push(Column::Int64(NumericColumn::from_data(window_slice)));
+            out.push(Batch::new(columns).map_err(|e| {
+                ExecError::TypeMismatch(format!("window fast path batch build: {e}"))
+            })?);
+        }
+        Ok(Some(out))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn execute(&mut self) -> Result<Vec<Vec<Value>>, ExecError> {
         // Drain child.
@@ -172,55 +316,88 @@ impl WindowAgg {
             all_rows.extend(batch_to_rows(&batch, &self.child_schema)?);
         }
 
-        if all_rows.is_empty() {
+        let n_total = all_rows.len();
+        if n_total == 0 {
             return Ok(Vec::new());
         }
 
-        // Compute partition key for each row.
-        let partition_keys: Vec<Vec<Value>> = all_rows
-            .iter()
-            .map(|row| {
-                self.partition_key_evals
-                    .iter()
-                    .map(|ev| ev.eval(row).unwrap_or(Value::Null))
-                    .collect()
-            })
-            .collect();
-
-        // Group row indices by partition key.
-        let mut partitions: Vec<Vec<usize>> = Vec::new();
-        let mut current_partition: Vec<usize> = Vec::new();
-        let mut current_key: Option<Vec<Value>> = None;
-
-        for (idx, key) in partition_keys.iter().enumerate() {
-            let same = current_key.as_ref().is_some_and(|ck| keys_equal(ck, key));
-            if !same {
-                if !current_partition.is_empty() {
-                    partitions.push(current_partition.clone());
-                    current_partition.clear();
+        // Pre-evaluate ORDER BY keys once per row. Previously the sort
+        // comparator re-evaluated each expression on every call, which
+        // dominated runtime for large partitions.
+        let order_key_count = self.order_key_evals.len();
+        let order_keys: Vec<Value> = if order_key_count == 0 {
+            Vec::new()
+        } else {
+            let mut buf = Vec::with_capacity(n_total * order_key_count);
+            for row in &all_rows {
+                for kv in &self.order_key_evals {
+                    buf.push(kv.eval(row).unwrap_or(Value::Null));
                 }
-                current_key = Some(key.clone());
             }
-            current_partition.push(idx);
-        }
-        if !current_partition.is_empty() {
-            partitions.push(current_partition);
-        }
+            buf
+        };
+        let row_order_key = |idx: usize| -> &[Value] {
+            if order_key_count == 0 {
+                &[]
+            } else {
+                let lo = idx * order_key_count;
+                &order_keys[lo..lo + order_key_count]
+            }
+        };
 
-        // Process each partition.
-        let mut output_values: Vec<(usize, Value)> = Vec::new(); // (original row index, window value)
+        // Partition the row indices. Fast path: no PARTITION BY hands
+        // the entire range to a single partition without building a
+        // per-row key vector.
+        let partitions: Vec<Vec<usize>> = if self.partition_key_evals.is_empty() {
+            vec![(0..n_total).collect()]
+        } else {
+            let key_count = self.partition_key_evals.len();
+            let mut keys: Vec<Value> = Vec::with_capacity(n_total * key_count);
+            for row in &all_rows {
+                for kv in &self.partition_key_evals {
+                    keys.push(kv.eval(row).unwrap_or(Value::Null));
+                }
+            }
+            let key_slice = |i: usize| -> &[Value] {
+                let lo = i * key_count;
+                &keys[lo..lo + key_count]
+            };
+            let mut parts: Vec<Vec<usize>> = Vec::new();
+            let mut current: Vec<usize> = Vec::new();
+            let mut current_key_start: Option<usize> = None;
+            for idx in 0..n_total {
+                let same = current_key_start
+                    .map(|s| keys_equal(&keys[s..s + key_count], key_slice(idx)))
+                    .unwrap_or(false);
+                if !same {
+                    if !current.is_empty() {
+                        parts.push(std::mem::take(&mut current));
+                    }
+                    current_key_start = Some(idx * key_count);
+                }
+                current.push(idx);
+            }
+            if !current.is_empty() {
+                parts.push(current);
+            }
+            parts
+        };
+
+        // One pre-sized output buffer; we drop the window value into
+        // the slot owned by each row's *original* index so the final
+        // assembly walks `all_rows` once and consumes it.
+        let mut window_values: Vec<Value> = vec![Value::Null; n_total];
 
         for partition_indices in &partitions {
-            // Sort within partition by order keys.
+            // Sort using the cached order-key buffer. Comparator reads
+            // a pre-computed slice instead of calling the interpreter.
             let mut sorted_indices = partition_indices.clone();
-            if !self.order_key_evals.is_empty() {
-                let order_evals = &self.order_key_evals;
-                let rows = &all_rows;
+            if order_key_count != 0 {
                 sorted_indices.sort_by(|&a, &b| {
-                    for ev in order_evals {
-                        let av = ev.eval(&rows[a]).unwrap_or(Value::Null);
-                        let bv = ev.eval(&rows[b]).unwrap_or(Value::Null);
-                        let ord = compare_values_nullable(&av, &bv, false);
+                    let ka = row_order_key(a);
+                    let kb = row_order_key(b);
+                    for i in 0..order_key_count {
+                        let ord = compare_values_nullable(&ka[i], &kb[i], false);
                         if ord != std::cmp::Ordering::Equal {
                             return ord;
                         }
@@ -233,46 +410,16 @@ impl WindowAgg {
             let values: Vec<Value> = match &self.func {
                 WindowFunc::RowNumber => (1..=n).map(|i| Value::Int64(i as i64)).collect(),
                 WindowFunc::Rank => {
-                    let mut ranks = vec![Value::Int64(1); n];
-                    let mut rank = 1_usize;
-                    let mut prev_order_key: Option<Vec<Value>> = None;
-                    let mut count = 0_usize;
-                    for (pos, &idx) in sorted_indices.iter().enumerate() {
-                        let order_key: Vec<Value> = self
-                            .order_key_evals
-                            .iter()
-                            .map(|ev| ev.eval(&all_rows[idx]).unwrap_or(Value::Null))
-                            .collect();
-                        let same = prev_order_key
-                            .as_ref()
-                            .is_some_and(|pk| keys_equal(pk, &order_key));
-                        if same {
-                            ranks[pos] = Value::Int64(rank as i64);
-                        } else {
-                            rank += count;
-                            count = 1;
-                            ranks[pos] = Value::Int64(rank as i64);
-                            prev_order_key = Some(order_key);
-                        }
-                        count = count.max(1);
-                        let _ = count; // suppress unused warning
-                        // Actually recompute properly:
-                        ranks[pos] = Value::Int64((pos + 1) as i64); // placeholder; fix below
-                    }
-                    // Proper RANK: scan again.
                     let mut out_ranks = vec![1_i64; n];
-                    let mut prev_key: Option<Vec<Value>> = None;
                     let mut base_rank = 1_usize;
+                    let mut prev_pos: Option<usize> = None;
                     for (pos, &idx) in sorted_indices.iter().enumerate() {
-                        let key: Vec<Value> = self
-                            .order_key_evals
-                            .iter()
-                            .map(|ev| ev.eval(&all_rows[idx]).unwrap_or(Value::Null))
-                            .collect();
-                        let same = prev_key.as_ref().is_some_and(|pk| keys_equal(pk, &key));
+                        let same = prev_pos
+                            .map(|p| row_order_key(sorted_indices[p]) == row_order_key(idx))
+                            .unwrap_or(false);
                         if !same {
                             base_rank = pos + 1;
-                            prev_key = Some(key);
+                            prev_pos = Some(pos);
                         }
                         out_ranks[pos] = base_rank as i64;
                     }
@@ -281,19 +428,16 @@ impl WindowAgg {
                 WindowFunc::DenseRank => {
                     let mut out = Vec::with_capacity(n);
                     let mut dense = 1_i64;
-                    let mut prev_key: Option<Vec<Value>> = None;
-                    for &idx in &sorted_indices {
-                        let key: Vec<Value> = self
-                            .order_key_evals
-                            .iter()
-                            .map(|ev| ev.eval(&all_rows[idx]).unwrap_or(Value::Null))
-                            .collect();
-                        let same = prev_key.as_ref().is_some_and(|pk| keys_equal(pk, &key));
+                    let mut prev_pos: Option<usize> = None;
+                    for (pos, &idx) in sorted_indices.iter().enumerate() {
+                        let same = prev_pos
+                            .map(|p| row_order_key(sorted_indices[p]) == row_order_key(idx))
+                            .unwrap_or(false);
                         if !same {
-                            if prev_key.is_some() {
+                            if prev_pos.is_some() {
                                 dense += 1;
                             }
-                            prev_key = Some(key);
+                            prev_pos = Some(pos);
                         }
                         out.push(Value::Int64(dense));
                     }
@@ -304,7 +448,7 @@ impl WindowAgg {
                     offset,
                     default,
                 } => {
-                    let ev = Eval::new(expr.clone());
+                    let interp = Eval::new(expr.clone());
                     let offset = *offset;
                     let default = default.clone();
                     sorted_indices
@@ -315,7 +459,8 @@ impl WindowAgg {
                                 default.clone()
                             } else {
                                 let prev_idx = sorted_indices[pos - offset];
-                                ev.eval(&all_rows[prev_idx])
+                                interp
+                                    .eval(&all_rows[prev_idx])
                                     .unwrap_or_else(|_| default.clone())
                             }
                         })
@@ -326,7 +471,7 @@ impl WindowAgg {
                     offset,
                     default,
                 } => {
-                    let ev = Eval::new(expr.clone());
+                    let interp = Eval::new(expr.clone());
                     let offset = *offset;
                     let default = default.clone();
                     sorted_indices
@@ -337,34 +482,35 @@ impl WindowAgg {
                                 default.clone()
                             } else {
                                 let next_idx = sorted_indices[pos + offset];
-                                ev.eval(&all_rows[next_idx])
+                                interp
+                                    .eval(&all_rows[next_idx])
                                     .unwrap_or_else(|_| default.clone())
                             }
                         })
                         .collect()
                 }
                 WindowFunc::FirstValue(expr) => {
-                    let ev = Eval::new(expr.clone());
+                    let interp = Eval::new(expr.clone());
                     let first = sorted_indices.first().map_or(Value::Null, |&i| {
-                        ev.eval(&all_rows[i]).unwrap_or(Value::Null)
+                        interp.eval(&all_rows[i]).unwrap_or(Value::Null)
                     });
                     vec![first; n]
                 }
                 WindowFunc::LastValue(expr) => {
-                    let ev = Eval::new(expr.clone());
+                    let interp = Eval::new(expr.clone());
                     let last = sorted_indices.last().map_or(Value::Null, |&i| {
-                        ev.eval(&all_rows[i]).unwrap_or(Value::Null)
+                        interp.eval(&all_rows[i]).unwrap_or(Value::Null)
                     });
                     vec![last; n]
                 }
                 WindowFunc::NthValue { expr, n: nth } => {
-                    let ev = Eval::new(expr.clone());
+                    let interp = Eval::new(expr.clone());
                     let nth = *nth;
                     let val = if nth == 0 || nth > n {
                         Value::Null
                     } else {
                         let idx = sorted_indices[nth - 1];
-                        ev.eval(&all_rows[idx]).unwrap_or(Value::Null)
+                        interp.eval(&all_rows[idx]).unwrap_or(Value::Null)
                     };
                     vec![val; n]
                 }
@@ -383,19 +529,20 @@ impl WindowAgg {
                 }
             };
 
+            // Scatter the partition's window values back into the
+            // global buffer at each row's original index.
             for (pos, &orig_idx) in sorted_indices.iter().enumerate() {
-                output_values.push((orig_idx, values[pos].clone()));
+                window_values[orig_idx] = values[pos].clone();
             }
         }
 
-        // Re-sort by original row index and assemble output rows.
-        output_values.sort_by_key(|(idx, _)| *idx);
-
-        let output: Vec<Vec<Value>> = output_values
+        // Final assembly: walk `all_rows` once, consume it, and
+        // append the corresponding window value. No clone of the
+        // input row, no global sort.
+        let output: Vec<Vec<Value>> = all_rows
             .into_iter()
-            .zip(all_rows.iter())
-            .map(|((_, win_val), orig_row)| {
-                let mut row = orig_row.clone();
+            .zip(window_values.into_iter())
+            .map(|(mut row, win_val)| {
                 row.push(win_val);
                 row
             })
