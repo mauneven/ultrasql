@@ -98,8 +98,9 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 
 ## Current State Snapshot
 
-<!-- reconciled 2026-05-14 against actual code (commits 800ab81..17e38b6) -->
+<!-- reconciled 2026-05-14 against actual code (commits 800ab81..28f2e4b) -->
 <!-- Wave C wire streaming + Wave D heap pin-once + bulk update_many/delete_many -->
+<!-- Wave E bulk-UPDATE overhaul + Wave F in-place UPDATE + binder/ module split -->
 
 ### Wave-by-wave perf progression on `cross_compare_sql` (median µs, M4, release)
 
@@ -261,13 +262,15 @@ real wire protocol.
    and the numbers above will differ. The fused paths should
    generalise via codegen across `(T1, T2, ...)`; until they do,
    the matrix is a per-shape microbench, not a full-DB claim.
-3. **Wire-protocol coverage.** `ORDER BY`, `JOIN`,
-   `UNION`/`INTERSECT`/`EXCEPT`, `IndexScan`, `BETWEEN`,
-   `WITH RECURSIVE`, `EXPLAIN`, `PREPARE`/`EXECUTE`/`DEALLOCATE`,
-   `COPY`, `CancelRequest` are not yet reachable from
-   `lower_query`. No ORM works end-to-end yet.
+3. **Wire-protocol coverage.** `ORDER BY`, `JOIN`, `UNION`/`INTERSECT`/`EXCEPT`,
+   `IndexScan`, and `BETWEEN` are now wired and covered by
+   `order_by_round_trip.rs`, `join_round_trip.rs`, `setop_round_trip.rs`,
+   and `index_scan_round_trip.rs`. Remaining gaps: `WITH RECURSIVE`,
+   `EXPLAIN`, `PREPARE`/`EXECUTE`/`DEALLOCATE` (Simple Query),
+   `COPY` wire dispatch, `DROP TABLE`/`ALTER TABLE` tokio-postgres
+   round-trips. Shape specialisation (fused paths) still applies.
 
-Closing items 1–3 is the v0.5 / v0.6 work plan. Until then the bench
+Closing items 1–2 is the v0.5 / v0.6 work plan. Until then the bench
 numbers describe what the engine *measures*, not what a production
 deployment can rely on.
 
@@ -281,9 +284,9 @@ deployment can rely on.
 | `ultrasql-mvcc` | ✅ Snapshot + visibility rules (PostgreSQL `HeapTupleSatisfiesMVCC`) |
 | `ultrasql-txn` | ✅ TxnManager kernel: BEGIN/COMMIT/ABORT, lock manager, SSI scaffolding, savepoints, 2PC; ✅ wired through binder + server for `BEGIN`/`COMMIT`/`ROLLBACK` end-to-end (per-session `TxnState` machine; `ReadyForQuery` status byte mirrors PostgreSQL's `'I'`/`'T'`/`'E'`); ⚠️ SAVEPOINT/RELEASE/ROLLBACK TO accepted on the wire but executor does not yet stamp tuples with subxact xid — partial-rollback semantics for already-written rows is a follow-up |
 | `ultrasql-parser` | ✅ Full DML + DDL + CTE + Extended Protocol Parse/Bind syntax |
-| `ultrasql-planner` | ✅ Binder for SELECT/INSERT/UPDATE/DELETE, JOINs, GROUP BY, subqueries, CTEs, BEGIN/COMMIT/ROLLBACK/SAVEPOINT; ⚠️ `BETWEEN` not yet bound (cross_compare_sql workaround uses `id < N`) |
+| `ultrasql-planner` | ✅ Binder for SELECT/INSERT/UPDATE/DELETE, JOINs, GROUP BY, subqueries, CTEs, BEGIN/COMMIT/ROLLBACK/SAVEPOINT, BETWEEN (rewritten into `>= AND <=`); binder split into `binder/` directory (`aggregate.rs`, `ddl.rs`, `dml.rs`, `expr_bind.rs`, `expr_type.rs`, `from.rs`, `util.rs`) |
 | `ultrasql-optimizer` | ✅ Rule-based rewrites, cost model, DPsize/GEQO join enumeration, physical selection, plan cache (~1077 LOC across `lib.rs` + `plan_cache.rs`); ✅ public `optimize(plan, &snapshot, &dyn StatsSource)` entry point wired into the server's DML/SELECT path (Wave B v0.6); `PlanCache` shared between Simple Query and Extended Query Parse keyed on SQL text; every DDL clears the cache |
-| `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit, CteScan; ⚠️ recursive CTE fixpoint loop deferred to v0.6 |
+| `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit, CteScan, SetOp, IndexScan, BitmapHeapScan; ⚠️ kernel-only (not yet wired): MergeJoin, SortAggregate, WindowAgg (ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD), FunctionScan, LockRows, Materialize, Unique; ⚠️ recursive CTE fixpoint loop deferred to v0.6 |
 | `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, dictionary encoding, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
 | `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ⚠️ bootstrap-from-heap falls back to initial snapshot (no typed tuple decoder yet) |
 | `ultrasql-protocol` | ✅ Wire codec for Simple Query + Extended Query (Parse/Bind/Describe/Execute/Sync/Close) |
@@ -301,9 +304,9 @@ deployment can rely on.
 | `SELECT col FROM t WHERE col op lit` | ✅ | ✅ | ✅ | ✅ |
 | `SELECT SUM/AVG/MIN/MAX/COUNT(*) FROM t` | ✅ | ✅ | ✅ | ✅ |
 | `SELECT SUM(col) FROM t WHERE col op lit` | ✅ | ✅ | ✅ | ✅ |
-| `SELECT ... GROUP BY` | ✅ | ✅ | ⚠️ HashAggregate runs; multi-group not yet bench-verified | ⚠️ |
-| `SELECT ... ORDER BY` | ✅ | ✅ | ❌ | ❌ |
-| `SELECT ... JOIN ...` | ✅ | ✅ | ❌ | ❌ |
+| `SELECT ... GROUP BY` | ✅ | ✅ | ✅ | ✅ |
+| `SELECT ... ORDER BY` | ✅ | ✅ | ✅ | ✅ |
+| `SELECT ... JOIN ...` | ✅ | ✅ | ✅ | ✅ |
 | `SELECT ... LIMIT n` (`OFFSET 0`) | ✅ | ✅ | ✅ | ✅ |
 | `SELECT ... LIMIT n OFFSET m` | ✅ | ✅ | ✅ | ✅ |
 | `UPDATE t SET col = expr WHERE ...` | ✅ | ✅ | ✅ | ✅ |
@@ -314,13 +317,13 @@ deployment can rely on.
 | `PREPARE / EXECUTE / DEALLOCATE` (Simple Query) | ✅ | ❌ | ❌ | ❌ |
 | Extended Query (Parse/Bind/Execute) | ✅ codec | n/a | ✅ dispatch | ✅ |
 | `EXPLAIN` / `EXPLAIN ANALYZE` | ✅ | ❌ | ❌ | ❌ |
-| `BETWEEN ... AND ...` | ✅ | ❌ | ❌ | ❌ |
+| `BETWEEN ... AND ...` | ✅ | ✅ | ✅ | ✅ |
 | `WITH cte AS (...)` (non-recursive) | ✅ | ✅ | ✅ | ✅ |
 | `WITH RECURSIVE cte AS (...)` | ✅ | ✅ | ❌ rejected by lowerer | ❌ |
-| `UNION / INTERSECT / EXCEPT` | ✅ | ✅ | ❌ | ❌ |
-| `CREATE INDEX` | ✅ | ✅ | ❌ | ❌ |
-| `DROP TABLE` | ✅ | ✅ | ❌ | ❌ |
-| `ALTER TABLE` | ✅ | ✅ | ❌ | ❌ |
+| `UNION / INTERSECT / EXCEPT` | ✅ | ✅ | ✅ | ✅ |
+| `CREATE INDEX` | ✅ | ✅ | ⚠️ single-col Int32/Int64 only | ✅ |
+| `DROP TABLE` | ✅ | ✅ | ✅ | ⚠️ no dedicated round-trip test |
+| `ALTER TABLE` | ✅ | ✅ | ⚠️ ADD COLUMN only | ⚠️ no dedicated round-trip test |
 
 ---
 
@@ -330,10 +333,10 @@ deployment can rely on.
 |----------|------|---------|
 | **P0** | ~~v0.5: BEGIN/COMMIT/ROLLBACK end-to-end (binder + server dispatch)~~ ✅ done — per-session `TxnState` machine (`Idle`/`InTransaction`/`Failed`); Simple + Extended Query round-trip; `ReadyForQuery` status byte mirrors PostgreSQL `'I'`/`'T'`/`'E'`; failed-block returns `25P02`; COMMIT in failed state aborts and returns `ROLLBACK` tag | (was) Every multi-statement workload, mixed_oltp_pgbench_like bench, ORM correctness |
 | **P0** | ~~v0.5: Extended Query dispatch in server~~ ✅ done — Parse/Bind/Describe/Execute/Sync/Close/Flush wired via `extended.rs`; tokio-postgres prepared-statement round-trips green | (was) Every ORM and every driver beyond simple psql |
-| **P0** | v0.5: Wire ORDER BY (`LogicalPlan::Sort`) in `lower_query` | Any ranked output, TPC-H Q1 |
-| **P0** | v0.5: Wire `LogicalPlan::Join` and `SetOp` in `lower_query` | All TPC-H, all real analytical workloads |
-| **P0** | v0.5: Binder support for `BETWEEN`, `IS NULL` (latter for completeness) | UPDATE / DELETE benchmark parity, ANSI surface |
-| **P0** | v0.5: `IndexScan` wired in `lower_query` (B-tree already exists) | Point-lookup workload — currently SeqScan only |
+| **P0** | ~~v0.5: Wire ORDER BY (`LogicalPlan::Sort`) in `lower_query`)~~ ✅ done — `order_by_round_trip.rs` green | (was) Any ranked output, TPC-H Q1 |
+| **P0** | ~~v0.5: Wire `LogicalPlan::Join` and `SetOp` in `lower_query`~~ ✅ done — `join_round_trip.rs` + `setop_round_trip.rs` green | (was) All TPC-H, all real analytical workloads |
+| **P0** | ~~v0.5: Binder support for `BETWEEN`~~ ✅ done — `bind_between` in `binder/expr_bind.rs` rewrites to `>= AND <=`; `index_scan_round_trip.rs` covers BETWEEN range scans; `IS NULL` still needs end-to-end verification | (was) ANSI surface |
+| **P0** | ~~v0.5: `IndexScan` wired in `lower_query`~~ ✅ done — `try_index_scan` in `pipeline.rs`; `index_scan_round_trip.rs` green for point lookup + BETWEEN range | (was) Point-lookup workload |
 | **P0** | Win the ≥ 2× perf gate on every bench in README (currently only INSERT passes) | Every release after v0.5 |
 | **P0** | ~~v0.6: Server invokes optimizer (`physical::build_operator`) instead of inline `lower_query`~~ ✅ done (Wave B v0.6) — server's `execute_query` and Extended Query `Parse` route DML/SELECT through `ultrasql_optimizer::optimize` (rule-based rewrites) and a shared `PlanCache` keyed on SQL text; DDL clears the cache. Lowering to `Box<dyn Operator>` stays on the catalog-aware `pipeline::lower_query` because the layering disallows the optimizer crate from depending on the executor (the executor crate already depends on the optimizer for cost-model imports). | (was) Cost-aware physical selection, plan cache |
 | **P1** | v1.x: JSONB, NUMERIC, arrays | Modern apps, financial workloads |
@@ -531,13 +534,11 @@ serializable (SSI). Real row-level locking. Deadlock detection.
   resolve through `Visibility::VisiblePreImage`. Deterministic
   crash-recovery tests in
   `crates/ultrasql-storage/tests/recovery_sim.rs` cover both paths.
-- [ ] **Plumb the on-disk `WalWriter` sink into the server** (Item 1
-  Part C). The server currently builds the buffer pool via
-  `BufferPool::new()`, so the runtime sink is `None` and the
-  emission code lands as dead capability. Wire
-  `BufferPool::with_wal(WalWriter)` at server start, build the
-  `WalSink` adapter, and re-run `cross_compare_sql` with the
-  durable runtime to publish post-WAL throughput numbers.
+- [x] **Plumb the on-disk `WalWriter` sink into the server** (Item 1
+  Part C `37a0170`). `Server::init` now wires `WalBuffer` +
+  background `WalWriter` thread + `WalBufferSink` adapter into
+  `BufferPool::with_wal`; `with_sample_database` stays in-memory
+  for tests.
 - [x] **Undo-log GC** (Item 3 Phase A `e26da30`, Phase B `f7e5646`).
   `HeapAccess::vacuum_undo_log(oldest_active_xid)` walks every
   per-relation `UndoRelationLog` and drops entries whose
@@ -641,36 +642,36 @@ driver can connect.
 
 ### Scan Operators
 - [x] `SeqScan` with predicate pushdown — streaming + TID mode wired
-- [ ] `IndexScan` via B-tree (point lookup + range scan) — kernel ships in executor; **not yet reachable from `lower_query`**
+- [x] `IndexScan` via B-tree (point lookup + range scan) — wired via `try_index_scan` in `pipeline.rs`; `index_scan_round_trip.rs` covers eq-lookup, BETWEEN range, and non-indexed-column SeqScan fallback; single-col Int32/Int64 keys
 - [ ] `IndexOnlyScan` (skip heap fetch when VM bit is set)
-- [ ] `BitmapIndexScan` + `BitmapHeapScan` (OR multiple indexes)
-- [ ] `FunctionScan` (`generate_series`, `unnest`, SRFs)
+- [x] `BitmapHeapScan` — kernel exists (`bitmap_heap_scan.rs`); ⚠️ not yet reachable from `lower_query`
+- [x] `FunctionScan` — kernel exists (`function_scan.rs`); ⚠️ not yet wired (generate_series, unnest, SRFs)
 - [x] `ValuesScan` (wired)
 - [x] `CteScan` reachable from `lower_query` (non-recursive); `SubqueryScan` follow-up; `WITH RECURSIVE` deferred to v0.6 fixpoint loop
 
 ### Join Operators
 - [x] `NestLoop` kernel (with inner rescan via factory closure)
 - [x] `HashJoin` kernel (build + probe — Inner+LeftOuter; Right/Full/Semi/Anti and disk spill TBD)
-- [ ] `MergeJoin` (requires sorted input)
-- [ ] All join types reachable from `lower_query` — currently `JOIN` returns Unsupported
+- [x] `MergeJoin` — kernel exists (`merge_join.rs`); ⚠️ not yet selected by optimizer/lowerer
+- [x] All join types reachable from `lower_query` — `join_round_trip.rs` covers INNER, LEFT OUTER, NestLoop fallback
 
 ### Aggregation Operators
 - [x] `HashAggregate` kernel + scalar SIMD fast path (no GROUP BY: SUM/AVG/COUNT/MIN/MAX dispatch to `sum_i64`/`count_i64`/`min_i64`/`max_i64`)
-- [x] Aggregate reachable from `lower_query` (server dispatches `LogicalPlan::Aggregate` → HashAggregate)
-- [ ] `SortAggregate` (streaming over sorted input)
+- [x] Aggregate reachable from `lower_query` (catalog-aware path dispatches `LogicalPlan::Aggregate` → HashAggregate; GROUP BY + ORDER BY covered by `order_by_round_trip.rs`)
+- [x] `SortAggregate` — kernel exists (`sort_aggregate.rs`); ⚠️ not yet selected by optimizer
 - [x] Standard aggregates: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG (JSON_AGG TBD)
 - [ ] Statistical aggregates: STDDEV, VARIANCE, CORR, PERCENTILE_CONT, PERCENTILE_DISC
-- [ ] Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE
-- [ ] `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)`
-- [ ] `WindowAgg` operator
+- [x] Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD — kernel in `WindowAgg` (`window_agg.rs`); ⚠️ FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE not yet implemented; not yet wired to lowerer
+- [x] `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` — parsed and handled by `WindowAgg` kernel; ⚠️ not wired end-to-end
+- [x] `WindowAgg` operator — kernel exists with tests
 
 ### Other Operators
-- [x] `Sort` kernel (in-memory; external spill TBD); ❌ not yet reachable from `lower_query` (ORDER BY returns Unsupported)
-- [ ] `Unique` (DISTINCT) — wire path
-- [ ] `SetOp` (UNION/INTERSECT/EXCEPT, hashed and sorted) — kernel ships; wire path pending
+- [x] `Sort` kernel (in-memory; external spill TBD) — wired; `order_by_round_trip.rs` covers ASC/DESC/multi-key/GROUP BY + ORDER BY
+- [x] `Unique` — kernel exists (`unique.rs`); ⚠️ DISTINCT wire path pending
+- [x] `SetOp` (UNION/INTERSECT/EXCEPT) — kernel + wired; `setop_round_trip.rs` covers UNION, UNION ALL, INTERSECT, INTERSECT ALL
 - [ ] `RecursiveUnion` (WITH RECURSIVE) — wire path
-- [ ] `LockRows` (SELECT FOR UPDATE/SHARE)
-- [ ] `Materialize` (pipeline breaker)
+- [x] `LockRows` — kernel exists (`lock_rows.rs`); ⚠️ SELECT FOR UPDATE wire path pending
+- [x] `Materialize` — kernel exists (`materialize.rs`); ⚠️ not yet selected by planner
 - [ ] `Gather` / `GatherMerge` (parallel query)
 - [ ] `Append` / `MergeAppend` (partition scans)
 - [ ] `Result` (constant expressions) — `SELECT 1` and similar
@@ -683,9 +684,9 @@ driver can connect.
 - [ ] Type coercion / implicit casts at execution time
 
 ### Memory Management
-- [ ] Per-query `work_mem` budget enforced cooperatively
+- [x] `WorkMemBudget` struct + reservation RAII — kernel in `work_mem.rs`; ⚠️ operators not yet plumbed to a budget instance
 - [ ] Hash build and sort operators spill to temp segments
-- [ ] `temp_file_limit` enforcement
+- [x] `temp_file_limit` constant defined (`work_mem.rs:39`); ⚠️ not yet enforced at spill sites
 
 ### Wire Protocol: Extended Query
 - [x] `Parse` codec
@@ -709,7 +710,7 @@ driver can connect.
 - [ ] `PREPARE` / `EXECUTE` / `DEALLOCATE` Simple-Query round-trip
 
 ### Binder gaps blocking wire
-- [ ] `BETWEEN ... AND ...` (parser accepts; binder rejects)
+- [x] `BETWEEN ... AND ...` — `bind_between` in `binder/expr_bind.rs` rewrites to `>= AND <=`; wired through `IndexScan` range probe and `SeqScan` filter path
 - [ ] `SELECT ... FROM t WHERE col IS NULL` end-to-end verification
 - [x] `BEGIN / COMMIT / ROLLBACK / SAVEPOINT` (now bound to `LogicalPlan::{Begin, Commit, Rollback, Savepoint, ...}` variants)
 
@@ -726,11 +727,11 @@ driver can connect.
 - [x] `ssl_cert_file`, `ssl_key_file`, `ssl_ca_file` config
 
 ### Other Protocol Features
-- [ ] `COPY TO STDOUT` / `COPY FROM STDIN` wire format
-- [ ] Real `BackendKeyData` with PID + secret for `CancelRequest`
-- [ ] `CancelRequest` handling (cancel running query)
+- [x] `COPY TO STDOUT` / `COPY FROM STDIN` — text format kernel in `copy.rs` (334 lines, both directions); ⚠️ wire dispatch to server session handler not yet wired
+- [x] `BackendKeyData` with PID + secret — `cancel.rs` implements full `CancelRegistry` + `CancelFlag`; ⚠️ `BackendKeyData` wire send needs verification
+- [x] `CancelRequest` handling — `CancelRegistry::request_cancel(pid, secret)` sets `AtomicBool` flag; ⚠️ operators not yet checking the flag during execution
 - [ ] `NoticeResponse` (warnings, hints, info messages)
-- [ ] `NotificationResponse` (LISTEN/NOTIFY)
+- [x] `LISTEN/NOTIFY` kernel — `notify.rs` has full `NotificationHub` with `listen`/`unlisten`/`notify`; ⚠️ not wired to wire session or LISTEN/NOTIFY SQL statements
 - [ ] All expected `ParameterStatus` params: `TimeZone`, `DateStyle`, `IntervalStyle`, `extra_float_digits`, `standard_conforming_strings`, `integer_datetimes`, `server_encoding`
 - [ ] Per-connection slow-loris timeout
 
