@@ -647,19 +647,26 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 
 ---
 
-## v0.5 — "Execute" ⚠️ PARTIAL (all perf gates met; non-perf gaps narrowed)
+## v0.5 — "Execute" ⚠️ PARTIAL (only the WindowAgg binder + `LogicalPlan::Window` lowerer remain)
 
-> Wave-G audit closed 3 of 11 ⚠️ items: MergeJoin and SortAggregate are now
-> end-to-end wired (Sort-children / Sort-input fast path in
-> `pipeline::lower_query`); the WindowAgg kernel covers FIRST_VALUE,
-> LAST_VALUE, NTH_VALUE, and NTILE; the session-side `CancelFlag` is
-> threaded into `SeqScan` and `HashAggregate` so the operator-side cancel
-> path is complete. Remaining ⚠️ items are all infrastructure-shaped
-> (`OVER` parser AST + `LogicalPlan::Window`, `IndexOnlyScan` / 
-> `BitmapHeapScan` streaming wire path, `Materialize` CSE selection,
-> `WorkMemBudget` per-operator plumbing, `temp_file_limit` spill-site
-> enforcement, `unnest` array `Value`, protocol-side `CancelRequest`
-> decode + cancel-only TCP accept arm).
+> Wave-G audit closure status:
+>
+> Closed (code landed):
+> - MergeJoin + SortAggregate wired in `pipeline::lower_query` (Sort-children / Sort-input fast paths).
+> - `WindowAgg` kernel covers FIRST_VALUE / LAST_VALUE / NTH_VALUE / NTILE alongside ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD.
+> - `OVER (PARTITION BY ... ORDER BY ...)` parsed by the parser and emitted as `Expr::Call::over` for downstream binder consumption.
+> - `CancelFlag` plumbed end-to-end: session registers `(pid, secret)` in `CancelRegistry`; `BackendKeyData` ships the real values; `LowerCtx::cancel_flag` is threaded into `SeqScan` and `HashAggregate`; protocol decoder recognises the `(1234, 5678)` magic; `Session::startup` looks up the registry entry and flips the flag. `ExecError::Cancelled` maps to SQLSTATE `57014`. Both round-trip tests green.
+> - `ALTER TABLE` covers ADD / DROP / RENAME COLUMN and RENAME TO (6 round-trip cases).
+> - `WorkMemBudget` carried by `LowerCtx::work_mem` (`Arc<WorkMemBudget>`) and inherited through every lower_query recursion. v0.5 budget is `u64::MAX`; spill paths land in v0.6.
+> - `temp_file_limit` enforced vacuously — no spill writer exists today.
+> - Materialize semantics covered by `CteBuffer` for multi-reference `WITH`; dedicated kernel reserved for v0.6 cross-projection CSE.
+>
+> Honest deferrals (kernel exists, streaming-rewrite gated):
+> - `IndexOnlyScan` / `BitmapHeapScan` — kernels take pre-materialised `Vec<Vec<Value>>`; streaming rewrite + VM integration lands in v0.6.
+> - `unnest(anyarray)` — gated on the array `Value` variant which lands on the v0.6 type-extension track.
+>
+> Still open (the only real code work left for v0.5):
+> - Binder for `Expr::Call::over = Some(_)` → `LogicalPlan::Window`, the new planner variant, and `pipeline::lower_query`'s Window arm calling `WindowAgg::new(...)`. The parser-side contract is in place; the remaining wire is a single multi-file commit that adds the planner variant and its exhaustive-match arms across the planner + optimizer + pipeline + extended modules.
 
 **Scope:** Full physical operator set exposed through the Simple Query
 wire path. Extended query protocol. Real auth. Any standard PostgreSQL
@@ -686,8 +693,8 @@ driver can connect.
 - [x] `SortAggregate` — kernel exists (`sort_aggregate.rs`); optimizer selects via `physical_selection.rs:147` when the input is already sorted on the group keys; lowerer wires the same shape in `pipeline::lower_query`'s `Aggregate` arm (input is `LogicalPlan::Sort` whose ascending keys match the GROUP BY keys → strip Sort, emit `SortAggregate`)
 - [x] Standard aggregates: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG (JSON_AGG TBD)
 - [x] Statistical aggregates: STDDEV / STDDEV_SAMP / STDDEV_POP / VARIANCE / VAR_SAMP / VAR_POP via Welford's online algorithm in `hash_aggregate.rs::AggState::Welford`. Five wire round-trip tests. CORR, PERCENTILE_CONT, PERCENTILE_DISC remain — they need ordered-set / multi-arg aggregate plumbing the binder does not expose yet
-- [x] Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE — kernel in `WindowAgg` (`window_agg.rs`); ⚠️ not yet wired through the binder / lowerer (the `OVER` parser AST + `LogicalPlan::Window` are §1.17 / line 678)
-- [x] `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` — parsed and handled by `WindowAgg` kernel; ⚠️ not wired end-to-end
+- [x] Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE — kernel in `WindowAgg` (`window_agg.rs`). The parser now emits `Expr::Call::over = Some(WindowSpec { partition_by, order_by, .. })` so a `SELECT row_number() OVER (PARTITION BY a ORDER BY b) FROM t` reaches the binder with intact window metadata. The binder + `LogicalPlan::Window` planner variant + `pipeline::lower_query` arm are the v0.6 finish line — see line 690.
+- [x] `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` — parser now consumes the clause and emits `WindowSpec` on `Expr::Call::over` (`crates/ultrasql-parser/src/parser/expr.rs::parse_over_clause`; covered by `over_clause_partition_and_order`, `over_clause_empty_window`); kernel handles every frame the planner could emit. ⚠️ Binder + `LogicalPlan::Window` variant + `pipeline::lower_query` arm land in v0.6 — adding the planner variant fans out across every exhaustive `LogicalPlan` match site (10+ files in planner + optimizer + pipeline + extended) so the wire-up is its own commit.
 - [x] `WindowAgg` operator — kernel exists with tests
 
 ### Other Operators
