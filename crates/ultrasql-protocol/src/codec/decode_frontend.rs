@@ -234,6 +234,20 @@ fn decode_startup_payload(payload: &[u8]) -> Result<FrontendMessage, ProtocolErr
     let protocol_major = p.read_u16()?;
     let protocol_minor = p.read_u16()?;
 
+    // Magic code 80877102 = (1234, 5678) signals a `CancelRequest` riding
+    // on the startup-packet framing instead of a real protocol version.
+    // The remaining 8 bytes are `(pid, secret)` as `i32` big-endian per
+    // the PostgreSQL spec.
+    if protocol_major == 1234 && protocol_minor == 5678 {
+        let process_id = p.read_i32()?;
+        let secret_key = p.read_i32()?;
+        p.ensure_drained()?;
+        return Ok(FrontendMessage::CancelRequest {
+            process_id,
+            secret_key,
+        });
+    }
+
     let mut params = Vec::new();
     loop {
         if p.is_empty() {

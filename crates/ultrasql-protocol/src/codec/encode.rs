@@ -30,6 +30,10 @@ pub fn encode_frontend(msg: &FrontendMessage, buf: &mut BytesMut) {
             protocol_minor,
             params,
         } => encode_startup(*protocol_major, *protocol_minor, params, buf),
+        FrontendMessage::CancelRequest {
+            process_id,
+            secret_key,
+        } => encode_cancel_request(*process_id, *secret_key, buf),
         FrontendMessage::Query { sql } => {
             write_tagged(buf, b'Q', |payload| {
                 write_cstring(payload, sql);
@@ -330,6 +334,16 @@ fn encode_startup(
     // Total message length includes the 4 length bytes.
     let total = i32_from_usize(payload_end - payload_start + 4);
     buf[length_index..length_index + 4].copy_from_slice(&total.to_be_bytes());
+}
+
+fn encode_cancel_request(process_id: i32, secret_key: i32, buf: &mut BytesMut) {
+    // Wire layout: i32 length=16, i32 code=80877102, i32 pid, i32 secret.
+    // No type tag — same framing convention as the startup packet.
+    buf.put_i32(16);
+    buf.put_u16(1234);
+    buf.put_u16(5678);
+    buf.put_i32(process_id);
+    buf.put_i32(secret_key);
 }
 
 fn write_cstring(buf: &mut BytesMut, s: &str) {

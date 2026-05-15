@@ -159,6 +159,26 @@ pub enum FrontendMessage {
         max_rows: i32,
     },
 
+    /// Cancel request: an out-of-band connection that asks the server
+    /// to flag a sibling session for cancellation.
+    ///
+    /// On the wire this looks like a startup packet — there is no type
+    /// tag — but the first four bytes of the payload are the magic
+    /// code `80877102` (`(1234 << 16) | 5678`) instead of a protocol
+    /// version. The remaining 8 bytes are the target session's
+    /// `(process_id, secret_key)` as reported earlier in its
+    /// [`BackendMessage::BackendKeyData`]. The server uses the
+    /// `(process_id, secret_key)` pair to look up the target session
+    /// in its `CancelRegistry` and flip the per-query `CancelFlag`;
+    /// the cancel-bearing connection is closed without further
+    /// dialogue.
+    CancelRequest {
+        /// Target session's process id.
+        process_id: i32,
+        /// Target session's secret key.
+        secret_key: i32,
+    },
+
     /// Sync (`'S'`): close the current pipeline, causing the server to
     /// flush any pending [`BackendMessage::ReadyForQuery`].
     Sync,

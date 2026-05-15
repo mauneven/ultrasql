@@ -53,6 +53,23 @@ where
                 protocol_minor,
                 params,
             } => (protocol_major, protocol_minor, params),
+            // A `CancelRequest` rides on the startup-packet framing and
+            // is the only legitimate non-`StartupMessage` first message.
+            // Look up `(pid, secret)` in the server's registry, flip the
+            // target session's `CancelFlag` on match, and close this
+            // connection without further dialogue (PostgreSQL behaviour:
+            // never reply, never error — a mismatched secret silently
+            // fails so a probe cannot distinguish "unknown pid" from
+            // "wrong secret").
+            FrontendMessage::CancelRequest {
+                process_id,
+                secret_key,
+            } => {
+                let pid = u32::from_le_bytes(process_id.to_le_bytes());
+                let secret = u32::from_le_bytes(secret_key.to_le_bytes());
+                let _ = self.state.cancel_registry.request_cancel(pid, secret);
+                return Ok(());
+            }
             // The spec allows an SSLRequest as the very first message
             // (which decodes to a startup-shaped payload); v0.5 does
             // not negotiate TLS yet. We treat anything else as a

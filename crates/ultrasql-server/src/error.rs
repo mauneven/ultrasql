@@ -199,6 +199,10 @@ impl ServerError {
             // NOT-NULL constraint violation surfaced by `ModifyTable`
             // on INSERT. Mirrors PostgreSQL's `not_null_violation`.
             Self::Execute(ultrasql_executor::ExecError::NotNullViolation(_)) => "23502",
+            // query_canceled — operator polled the `CancelFlag` between
+            // batches and short-circuited after a peer `CancelRequest`
+            // flipped it. Mirrors PostgreSQL's `query_canceled`.
+            Self::Execute(ultrasql_executor::ExecError::Cancelled) => "57014",
             // bad_copy_file_format — surfaced when a COPY FROM stream
             // delivers a malformed row.
             Self::CopyFormat(_) => "22P04",

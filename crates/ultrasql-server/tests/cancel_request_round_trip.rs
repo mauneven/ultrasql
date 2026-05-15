@@ -140,7 +140,7 @@ const LONG_RUNNING_SQL: &str = "SELECT id, COUNT(*) FROM t GROUP BY id";
 // reference threaded through `LowerCtx` for in-flight operators —
 // landed in a separate worktree that did not reach `main` cleanly in
 // this session. Re-enable once that wiring lands.
-#[ignore]
+// Cancel test now runs end-to-end after the protocol-side decode landed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cancel_request_aborts_in_flight_select_within_500ms() {
     let (client_a, _conn_a, server_handle, server_addr) = start_server_and_connect().await;
