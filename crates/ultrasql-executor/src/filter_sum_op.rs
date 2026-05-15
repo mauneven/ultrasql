@@ -209,6 +209,12 @@ impl Operator for CachedFilterSumI32Scan {
     fn schema(&self) -> &Schema {
         &self.output_schema
     }
+
+    fn estimated_row_count(&self) -> Option<usize> {
+        // Scalar aggregate emits exactly one row; see the matching
+        // override on [`CachedSumI32Scan::estimated_row_count`].
+        Some(1)
+    }
 }
 
 /// Direct-from-cache pure SUM operator (no filter).
@@ -278,6 +284,14 @@ impl Operator for CachedSumI32Scan {
 
     fn schema(&self) -> &Schema {
         &self.output_schema
+    }
+
+    fn estimated_row_count(&self) -> Option<usize> {
+        // Scalar aggregate: exactly one row in one batch.
+        // The wire encoder uses this to size its output BytesMut
+        // tight (~96 bytes for a single Int64 row) instead of the
+        // 32 KiB default that pre-touches eight memory pages.
+        Some(1)
     }
 }
 
@@ -365,6 +379,12 @@ impl Operator for CachedAvgI32Scan {
     fn schema(&self) -> &Schema {
         &self.output_schema
     }
+
+    fn estimated_row_count(&self) -> Option<usize> {
+        // Scalar aggregate emits exactly one row; see the matching
+        // override on [`CachedSumI32Scan::estimated_row_count`].
+        Some(1)
+    }
 }
 
 impl Operator for FilterSumI32Scan {
@@ -432,5 +452,11 @@ impl Operator for FilterSumI32Scan {
 
     fn schema(&self) -> &Schema {
         &self.output_schema
+    }
+
+    fn estimated_row_count(&self) -> Option<usize> {
+        // Filtered scalar aggregate emits exactly one row; see the
+        // matching override on [`CachedSumI32Scan::estimated_row_count`].
+        Some(1)
     }
 }

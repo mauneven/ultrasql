@@ -290,15 +290,27 @@ where
         // INSERT-only — UPDATE / DELETE need the optimizer's
         // canonicalisation passes for the lowerer's
         // `build_filtered_tid_scan` shape contract.
-        let optimised_plan =
-            if Self::is_trivial_insert_values(&plan) || Self::is_fused_update_shape(&plan) {
-                plan
-            } else {
-                match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
-                    Ok(p) => p,
-                    Err(e) => return Err(self.fail_if_in_transaction(e)),
-                }
-            };
+        //
+        // The `is_scalar_aggregate_shape` bypass mirrors the same
+        // reasoning for `SELECT SUM/AVG/COUNT(*) FROM t [WHERE ...]`:
+        // the optimizer's rewrite set has no rule that improves a leaf
+        // scalar-aggregate plan, and the lowerer's
+        // `try_lower_cached_scalar_aggregate_i32` / `try_lower_fused_filter_sum_i32`
+        // fast paths run directly against the bound shape. Bypassing
+        // the optimizer drops the DashMap lookup + `LogicalPlan::clone`
+        // pair from every iteration of `cross_compare_sql --workload
+        // sum-scalar/avg-scalar/filter-sum`.
+        let optimised_plan = if Self::is_trivial_insert_values(&plan)
+            || Self::is_fused_update_shape(&plan)
+            || Self::is_scalar_aggregate_shape(&plan)
+        {
+            plan
+        } else {
+            match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
+                Ok(p) => p,
+                Err(e) => return Err(self.fail_if_in_transaction(e)),
+            }
+        };
         self.run_dml_or_select(&optimised_plan, &catalog_snapshot)
     }
 
@@ -318,15 +330,17 @@ where
         if matches!(self.txn_state, TxnState::Failed(_)) {
             return Err(ServerError::TransactionAborted);
         }
-        let optimised_plan =
-            if Self::is_trivial_insert_values(&plan) || Self::is_fused_update_shape(&plan) {
-                plan
-            } else {
-                match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
-                    Ok(p) => p,
-                    Err(e) => return Err(self.fail_if_in_transaction(e)),
-                }
-            };
+        let optimised_plan = if Self::is_trivial_insert_values(&plan)
+            || Self::is_fused_update_shape(&plan)
+            || Self::is_scalar_aggregate_shape(&plan)
+        {
+            plan
+        } else {
+            match self.optimize_dml_plan(sql, plan, &catalog_snapshot) {
+                Ok(p) => p,
+                Err(e) => return Err(self.fail_if_in_transaction(e)),
+            }
+        };
         self.run_dml_or_select(&optimised_plan, &catalog_snapshot)
     }
 
@@ -367,6 +381,72 @@ where
                     predicate: _,
                 }
         )
+    }
+
+    /// `true` iff `plan` is a trivial scalar aggregate over a bare
+    /// `Scan` or `Filter(Scan)` shape — exactly the shapes that the
+    /// pipeline lowerer routes through the column-cache fast path
+    /// (`try_lower_cached_scalar_aggregate_i32` for pure SUM/AVG over
+    /// an `Int32` column, `try_lower_fused_filter_sum_i32` for the
+    /// filtered SUM variant). The cost-based optimizer has no rule
+    /// that rewrites a leaf scalar-aggregate plan into a cheaper
+    /// equivalent, so the per-iter optimizer pass + plan-cache lookup
+    /// pair is pure overhead on the
+    /// `cross_compare_sql --workload sum-scalar/avg-scalar/filter-sum`
+    /// hot path. The lowerer re-validates every fine-grained
+    /// precondition before producing the fused operator; the
+    /// predicate here only checks the outer envelope so we can bypass
+    /// the optimizer cleanly.
+    ///
+    /// The binder wraps the aggregate node in an outer
+    /// `LogicalPlan::Project` whose expressions are pure column
+    /// references into the aggregate's output (one per aggregate output
+    /// column — see `bind_select_body`). We accept that envelope so the
+    /// fast path catches the `SELECT SUM(x) FROM t` plan as written.
+    pub(crate) fn is_scalar_aggregate_shape(plan: &LogicalPlan) -> bool {
+        // Strip an outer pass-through `Project` whose expressions are
+        // column references into the aggregate's output. The binder
+        // emits this envelope for every aggregate query (see
+        // `bind_select_body`); peeling it lets the predicate match the
+        // canonical bound shape directly.
+        let agg_plan = match plan {
+            LogicalPlan::Project { input, exprs, .. } => {
+                let all_columns = exprs
+                    .iter()
+                    .all(|(e, _)| matches!(e, ultrasql_planner::ScalarExpr::Column { .. }));
+                if !all_columns {
+                    return false;
+                }
+                input.as_ref()
+            }
+            other => other,
+        };
+
+        let LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+            ..
+        } = agg_plan
+        else {
+            return false;
+        };
+        if !group_by.is_empty() || aggregates.len() != 1 {
+            return false;
+        }
+        let agg = &aggregates[0];
+        if agg.distinct {
+            return false;
+        }
+        // Outer shape: bare Scan or Filter(Scan).
+        match input.as_ref() {
+            LogicalPlan::Scan { .. } => true,
+            LogicalPlan::Filter {
+                input: filter_input,
+                ..
+            } => matches!(filter_input.as_ref(), LogicalPlan::Scan { .. }),
+            _ => false,
+        }
     }
 
     /// `true` iff `plan` is `Insert { source: Values { .. }, .. }`

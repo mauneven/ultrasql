@@ -178,6 +178,144 @@ pub(super) fn try_lower_cached_scalar_aggregate_i32(
 /// Try to lower
 ///
 /// ```text
+///     Aggregate { group_by: [], aggregates: [Sum|Avg|CountStar] }
+///       └── Scan { table }
+/// ```
+///
+/// into a [`DirectScalarAggScan`] wrapping a [`SeqScan`].
+///
+/// Matched shapes:
+///
+/// * `SUM(col)` over a non-NULL `Int32` or `Int64` column.
+/// * `AVG(col)` over a non-NULL `Int32` or `Int64` column.
+/// * `COUNT(*)` over any relation.
+///
+/// Returns `Ok(None)` when:
+///
+/// * the plan envelope is not a bare scalar aggregate over a bare scan,
+/// * the aggregate function is anything other than `Sum`, `Avg`, or
+///   `CountStar`,
+/// * `DISTINCT` was requested (the kernels do not deduplicate),
+/// * the aggregate argument is anything other than a direct column
+///   reference (e.g. `SUM(x + 1)` or `SUM(2 * x)`),
+/// * the targeted column is not `Int32` or `Int64`,
+/// * the table is not registered in the catalog snapshot (sample-
+///   table-only scans miss the fast path; that branch is the
+///   in-memory legacy path documented in
+///   [`crate::pipeline::scan::lower_catalog_or_sample_scan`]).
+///
+/// The caller falls through to the generic `HashAggregate(SeqScan)`
+/// chain on `Ok(None)`. Errors propagate; today the only error path
+/// would be the (unreachable) failure of [`super::scan::lower_heap_scan`]
+/// itself.
+///
+/// NULL fallback: the constructed [`DirectScalarAggScan`] returns
+/// [`ultrasql_executor::ExecError::Unsupported`] when an upstream batch
+/// carries a column with a validity bitmap. This is a runtime guard;
+/// the bench data is non-null so the runtime path stays on the SIMD
+/// kernel.
+
+pub(super) fn try_lower_direct_scalar_aggregate(
+    input: &LogicalPlan,
+    group_by: &[ScalarExpr],
+    aggregates: &[ultrasql_planner::LogicalAggregateExpr],
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    use ultrasql_executor::DirectScalarAggScan;
+    use ultrasql_planner::AggregateFunc;
+
+    if !group_by.is_empty() || aggregates.len() != 1 {
+        return Ok(None);
+    }
+    let agg = &aggregates[0];
+    if agg.distinct {
+        return Ok(None);
+    }
+
+    // Outer shape must be a bare `Scan` over a real heap relation. The
+    // catalog snapshot is consulted to confirm the relation is
+    // persistent — sample/CTE/memtable sources fall through to the
+    // generic lowerer (the in-memory data path has no
+    // `Int32`/`Int64`-specialised heap walk to optimise).
+    let LogicalPlan::Scan { table, .. } = input else {
+        return Ok(None);
+    };
+    let folded = table.to_ascii_lowercase();
+    let entry = match ctx.catalog_snapshot.tables.get(&folded) {
+        Some(entry) => entry,
+        None => return Ok(None),
+    };
+    let schema = &entry.schema;
+
+    // Aggregate-function dispatch. `CountStar` has no column argument
+    // and never inspects a column type; `Sum`/`Avg` require a direct
+    // column reference with `Int32` or `Int64` data type.
+    let op: Box<dyn Operator> = match agg.func {
+        AggregateFunc::CountStar => {
+            let child = super::scan::lower_heap_scan(entry, ctx);
+            Box::new(DirectScalarAggScan::count_star(
+                child,
+                agg.output_name.clone(),
+            ))
+        }
+        AggregateFunc::Sum => {
+            let (col_idx, data_type) = match &agg.arg {
+                Some(ScalarExpr::Column {
+                    index, data_type, ..
+                }) => (*index, data_type.clone()),
+                _ => return Ok(None),
+            };
+            if col_idx >= schema.len() {
+                return Ok(None);
+            }
+            let child = super::scan::lower_heap_scan(entry, ctx);
+            match data_type {
+                ultrasql_core::DataType::Int32 => Box::new(DirectScalarAggScan::sum_int32(
+                    child,
+                    col_idx,
+                    agg.output_name.clone(),
+                )),
+                ultrasql_core::DataType::Int64 => Box::new(DirectScalarAggScan::sum_int64(
+                    child,
+                    col_idx,
+                    agg.output_name.clone(),
+                )),
+                _ => return Ok(None),
+            }
+        }
+        AggregateFunc::Avg => {
+            let (col_idx, data_type) = match &agg.arg {
+                Some(ScalarExpr::Column {
+                    index, data_type, ..
+                }) => (*index, data_type.clone()),
+                _ => return Ok(None),
+            };
+            if col_idx >= schema.len() {
+                return Ok(None);
+            }
+            let child = super::scan::lower_heap_scan(entry, ctx);
+            match data_type {
+                ultrasql_core::DataType::Int32 => Box::new(DirectScalarAggScan::avg_int32(
+                    child,
+                    col_idx,
+                    agg.output_name.clone(),
+                )),
+                ultrasql_core::DataType::Int64 => Box::new(DirectScalarAggScan::avg_int64(
+                    child,
+                    col_idx,
+                    agg.output_name.clone(),
+                )),
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(op))
+}
+
+/// Try to lower
+///
+/// ```text
 ///     Aggregate { group_by: [], aggregates: [Sum(Column { col_sum, Int32 })] }
 ///       └── Filter { predicate: Column { col_pred, Int32 } op Literal(Int32) }
 ///             └── Scan { table }

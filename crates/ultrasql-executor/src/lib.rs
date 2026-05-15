@@ -55,6 +55,7 @@
 
 pub mod bitmap_heap_scan;
 pub mod cte_scan;
+pub mod direct_scalar_agg;
 pub mod eval;
 mod filter;
 pub(crate) mod filter_op;
@@ -94,6 +95,7 @@ use ultrasql_core::Schema;
 use ultrasql_vec::Batch;
 
 pub use cte_scan::CteScan;
+pub use direct_scalar_agg::{DirectScalarAggKind, DirectScalarAggScan};
 pub use eval::{Eval, EvalError};
 pub use filter::FilterEqI32;
 pub use filter_op::Filter;

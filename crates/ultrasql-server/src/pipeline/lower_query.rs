@@ -32,7 +32,8 @@ use crate::BlankPageLoader;
 use crate::error::ServerError;
 
 use super::agg_fuse::{
-    extract_int32_col_op_lit, try_lower_cached_scalar_aggregate_i32, try_lower_fused_filter_sum_i32,
+    extract_int32_col_op_lit, try_lower_cached_scalar_aggregate_i32, try_lower_direct_scalar_aggregate,
+    try_lower_fused_filter_sum_i32,
 };
 use super::cte_helpers::{check_set_op_schemas, lower_recursive_cte, lower_set_op_real};
 use super::index_scan::try_index_scan;
@@ -241,6 +242,24 @@ pub fn lower_query(
             // the hand-NEON kernel — no SeqScan batch slicing.
             if let Some(direct) =
                 try_lower_cached_scalar_aggregate_i32(input, group_by, aggregates, ctx)?
+            {
+                return Ok(direct);
+            }
+            // Direct columnar fast path: pure
+            // `SELECT SUM/AVG/COUNT(*) FROM t` (no `WHERE`, no
+            // `GROUP BY`) over an `Int32` or `Int64` column. Lowers
+            // to `DirectScalarAggScan` over a bare `SeqScan` — one
+            // SIMD kernel call per child batch, no HashAggregate
+            // state machine. Fires on cache miss (the first scan
+            // over a freshly-loaded relation), where the cached-
+            // scalar fast path above returns `None` because the
+            // column cache has not been populated yet. The second
+            // and subsequent iterations of the
+            // `cross_compare_sql --workload sum-scalar/avg-scalar`
+            // bench take the cached path above; the first iter
+            // and any cache-invalidated reload take this path.
+            if let Some(direct) =
+                try_lower_direct_scalar_aggregate(input, group_by, aggregates, ctx)?
             {
                 return Ok(direct);
             }
