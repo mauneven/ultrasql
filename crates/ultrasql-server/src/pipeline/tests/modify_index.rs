@@ -1,5 +1,7 @@
 //! Modify + index-scan pipeline tests.
 
+#![allow(unused_imports, dead_code)]
+
 use super::select::{
     IndexFixture, between_id_literal, build_filter_scan_plan, build_index_fixture, drain_id_val,
     eq_id_literal,

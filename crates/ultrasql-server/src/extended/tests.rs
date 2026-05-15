@@ -1,5 +1,7 @@
 //! Unit tests for the Extended Query module.
 
+#![allow(unused_imports, dead_code)]
+
 use super::codec::{DecodeError, decode_param};
 use super::handlers::{
     handle_bind, handle_close, handle_describe_portal, handle_describe_statement, handle_parse,

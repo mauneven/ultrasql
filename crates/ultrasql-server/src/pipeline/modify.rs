@@ -1,5 +1,7 @@
 //! INSERT/UPDATE/DELETE lowering plus the fused-kernel fast paths.
 
+#![allow(unused_imports, dead_code)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -556,12 +558,13 @@ pub(super) fn lower_project_columns(
     // projection to carry the alias.
     let child_schema = child.schema();
     let child_width = child_schema.len();
-    let is_identity_indices = indices.len() == child_width
-        && indices.iter().enumerate().all(|(i, &idx)| i == idx);
+    let is_identity_indices =
+        indices.len() == child_width && indices.iter().enumerate().all(|(i, &idx)| i == idx);
     let names_match = is_identity_indices
-        && exprs.iter().enumerate().all(|(i, (_, name))| {
-            child_schema.field_at(i).name == *name
-        });
+        && exprs
+            .iter()
+            .enumerate()
+            .all(|(i, (_, name))| child_schema.field_at(i).name == *name);
     if names_match {
         return Ok(child);
     }

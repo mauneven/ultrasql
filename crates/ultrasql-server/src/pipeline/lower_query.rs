@@ -1,6 +1,8 @@
 //! Main query lowerer — turns a [`LogicalPlan`] into an [`Operator`]
 //! tree. Includes the `WITH` dispatch (regular and recursive CTEs).
 
+#![allow(unused_imports, dead_code)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -32,8 +34,8 @@ use crate::BlankPageLoader;
 use crate::error::ServerError;
 
 use super::agg_fuse::{
-    extract_int32_col_op_lit, try_lower_cached_scalar_aggregate_i32, try_lower_direct_scalar_aggregate,
-    try_lower_fused_filter_sum_i32,
+    extract_int32_col_op_lit, try_lower_cached_scalar_aggregate_i32,
+    try_lower_direct_scalar_aggregate, try_lower_fused_filter_sum_i32,
 };
 use super::cte_helpers::{check_set_op_schemas, lower_recursive_cte, lower_set_op_real};
 use super::index_scan::try_index_scan;

@@ -1,5 +1,7 @@
 //! Unit tests for the pipeline lowerer.
 
+#![allow(unused_imports, dead_code)]
+
 use super::*;
 use ultrasql_core::{DataType, Value};
 use ultrasql_parser::Parser;

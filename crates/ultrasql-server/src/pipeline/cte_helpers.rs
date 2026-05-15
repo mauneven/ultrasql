@@ -1,5 +1,7 @@
 //! Helpers for recursive CTEs and `UNION`/`INTERSECT`/`EXCEPT` lowering.
 
+#![allow(unused_imports, dead_code)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

@@ -3,6 +3,8 @@
 //! `RowDescription` synthesis from a logical plan, and the SELECT/INSERT/
 //! UPDATE/DELETE command-complete tag formatter.
 
+#![allow(unused_imports, dead_code)]
+
 use ultrasql_core::{DataType, Value};
 use ultrasql_planner::LogicalPlan;
 use ultrasql_protocol::{BackendMessage, FieldDescription};

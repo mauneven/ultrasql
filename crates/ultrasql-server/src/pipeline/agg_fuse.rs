@@ -1,6 +1,8 @@
 //! Fused-kernel lowerers — `SUM(c) WHERE c <op> lit` and the cached
 //! scalar-aggregate fast path.
 
+#![allow(unused_imports, dead_code)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

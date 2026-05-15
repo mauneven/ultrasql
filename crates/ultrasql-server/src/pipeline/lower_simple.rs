@@ -1,6 +1,8 @@
 //! Simple per-variant lowerers used by the top-level [`super::lower_plan`]
 //! dispatcher, plus the sample-database loader.
 
+#![allow(unused_imports, dead_code)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

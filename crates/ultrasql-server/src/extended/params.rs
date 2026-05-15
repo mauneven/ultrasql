@@ -5,6 +5,8 @@
 //! mapping for each parameter slot. Used by [`super::handlers::handle_parse`]
 //! to populate `ParameterDescription` before binding.
 
+#![allow(unused_imports, dead_code)]
+
 use ultrasql_core::DataType;
 use ultrasql_planner::{
     BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalOnConflict, LogicalPlan,
