@@ -681,7 +681,7 @@ driver can connect.
 
 ### Other Operators
 - [x] `Sort` kernel (in-memory; external spill TBD) — wired; `order_by_round_trip.rs` covers ASC/DESC/multi-key/GROUP BY + ORDER BY
-- [x] `Unique` — kernel exists (`unique.rs`); ⚠️ DISTINCT wire path pending
+- [x] `Unique` — kernel exists (`unique.rs`); ✅ DISTINCT wire path: binder lowers `SELECT DISTINCT` into `Aggregate` with the projected columns as group keys and an empty aggregate list, `HashAggregate` deduplicates; `crates/ultrasql-server/tests/distinct_round_trip.rs` covers single-column, multi-column, and DISTINCT ON rejection
 - [x] `SetOp` (UNION/INTERSECT/EXCEPT) — kernel + wired; `setop_round_trip.rs` covers UNION, UNION ALL, INTERSECT, INTERSECT ALL
 - [x] `RecursiveUnion` (WITH RECURSIVE) — wire path — `binder::bind_recursive_cte` splits anchor + recursive term and exposes the CTE name in scope for the recursive term; `pipeline::lower_recursive_cte` runs a fixpoint loop with row-key dedup for `UNION DISTINCT` and a 1024-iteration safety cap for `UNION ALL`. `cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint` exercises a 4-node graph with a cycle
 - [x] `LockRows` — kernel (`lock_rows.rs`) wired in `pipeline::lower_query` (`pipeline.rs:275` + `806`); ✅ `lock_rows_round_trip.rs` covers FOR UPDATE/FOR SHARE/FOR NO KEY UPDATE + concurrent reader pre-image
@@ -829,7 +829,7 @@ driver can connect.
 - [x] IndexOnlyScan when VM bit is set
 - [x] BitmapHeapScan when selectivity ∈ [0.5%, 10%] or ≥2 indexes apply
 - [x] HashAggregate vs SortAggregate (StreamAggregate v0.7)
-- [ ] Hash-based DISTINCT vs Sort-based DISTINCT
+- [x] DISTINCT lowered to `HashAggregate(group_by = projection, aggregates = [])`; Sort-based DISTINCT is a follow-up once the optimizer learns `pick_distinct` on interesting orders
 - [x] Parallel plan cost annotation (divide by N workers, add parallel_setup_cost)
 
 ### Plan Cache

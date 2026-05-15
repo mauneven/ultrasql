@@ -208,8 +208,8 @@ pub(super) fn bind_select(
     catalog: &dyn Catalog,
     scope: &mut ScopeStack,
 ) -> Result<LogicalPlan, PlanError> {
-    if !matches!(select.distinct, Distinct::None | Distinct::All) {
-        return Err(PlanError::NotSupported("SELECT DISTINCT"));
+    if matches!(select.distinct, Distinct::DistinctOn(_)) {
+        return Err(PlanError::NotSupported("SELECT DISTINCT ON (...)"));
     }
 
     let mut cte_catalog: Vec<(String, Schema)> = Vec::new();
@@ -507,9 +507,10 @@ fn bind_select_body(
     cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<LogicalPlan, PlanError> {
-    if !matches!(select.distinct, Distinct::None | Distinct::All) {
-        return Err(PlanError::NotSupported("SELECT DISTINCT"));
+    if matches!(select.distinct, Distinct::DistinctOn(_)) {
+        return Err(PlanError::NotSupported("SELECT DISTINCT ON (...)"));
     }
+    let is_distinct = matches!(select.distinct, Distinct::Distinct);
 
     let (mut plan, from_scope) = bind_from(&select.from, catalog, cte_catalog, scope)?;
 
@@ -593,6 +594,26 @@ fn bind_select_body(
         plan = LogicalPlan::Project {
             input: Box::new(plan),
             exprs: projected,
+            schema: proj_schema,
+        };
+    }
+
+    if is_distinct {
+        let proj_schema = plan.schema().clone();
+        let group_by: Vec<ScalarExpr> = proj_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(idx, field)| ScalarExpr::Column {
+                name: field.name.clone(),
+                index: idx,
+                data_type: field.data_type.clone(),
+            })
+            .collect();
+        plan = LogicalPlan::Aggregate {
+            input: Box::new(plan),
+            group_by,
+            aggregates: Vec::new(),
             schema: proj_schema,
         };
     }
