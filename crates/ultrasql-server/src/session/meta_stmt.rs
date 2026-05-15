@@ -334,6 +334,31 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
             }
         }
         LogicalPlan::Delete { input, .. } => walk_plan_for_max_param(input, max_idx),
+        LogicalPlan::Window {
+            input,
+            partition_by,
+            order_by,
+            func,
+            ..
+        } => {
+            walk_plan_for_max_param(input, max_idx);
+            for e in partition_by {
+                walk_expr_for_max_param(e, max_idx);
+            }
+            for k in order_by {
+                walk_expr_for_max_param(&k.expr, max_idx);
+            }
+            match func {
+                ultrasql_planner::LogicalWindowFunc::Lag { expr, .. }
+                | ultrasql_planner::LogicalWindowFunc::Lead { expr, .. }
+                | ultrasql_planner::LogicalWindowFunc::FirstValue(expr)
+                | ultrasql_planner::LogicalWindowFunc::LastValue(expr)
+                | ultrasql_planner::LogicalWindowFunc::NthValue { expr, .. } => {
+                    walk_expr_for_max_param(expr, max_idx);
+                }
+                _ => {}
+            }
+        }
     }
 }
 

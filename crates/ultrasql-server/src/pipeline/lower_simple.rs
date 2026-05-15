@@ -32,11 +32,11 @@ use crate::BlankPageLoader;
 use crate::error::ServerError;
 
 use super::agg_fuse::extract_int32_col_op_lit;
+use super::cte_helpers::check_set_op_schemas;
+use super::join::lower_join;
 use super::modify::lower_project_columns;
 use super::saturate_row_count;
 use super::scan::lower_function_scan;
-use super::cte_helpers::check_set_op_schemas;
-use super::join::lower_join;
 use super::{LowerCtx, SampleTables};
 
 pub fn lower_plan(
@@ -170,6 +170,9 @@ pub fn lower_plan(
                 Box::new(|_, _| Ok(())),
             )))
         }
+        LogicalPlan::Window { .. } => Err(ServerError::Unsupported(
+            "window functions only supported on the catalog-aware path",
+        )),
     }
 }
 

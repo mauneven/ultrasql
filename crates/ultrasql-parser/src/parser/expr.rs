@@ -18,10 +18,7 @@ impl<'src> Parser<'src> {
         self.parse_expr_with_precedence(0)
     }
 
-    pub(super) fn parse_expr_with_precedence(
-        &mut self,
-        min_prec: u8,
-    ) -> Result<Expr, ParseError> {
+    pub(super) fn parse_expr_with_precedence(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         self.enter_depth()?;
         let result = self.parse_expr_with_precedence_inner(min_prec);
         self.leave_depth();

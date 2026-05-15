@@ -7,7 +7,8 @@
 
 use ultrasql_core::DataType;
 use ultrasql_planner::{
-    BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalOnConflict, LogicalPlan, ScalarExpr, SortKey,
+    BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalOnConflict, LogicalPlan,
+    ScalarExpr, SortKey,
 };
 
 // ---------------------------------------------------------------------------
@@ -237,6 +238,9 @@ fn infer_into(
             infer_into(body, catalog, out);
         }
         LogicalPlan::LockRows { input, .. } => {
+            infer_into(input, catalog, out);
+        }
+        LogicalPlan::Window { input, .. } => {
             infer_into(input, catalog, out);
         }
     }
@@ -492,6 +496,29 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
         LogicalPlan::LockRows { input, .. } => {
             walk_plan_exprs(input, f);
         }
+        LogicalPlan::Window {
+            input,
+            partition_by,
+            order_by,
+            func,
+            ..
+        } => {
+            walk_plan_exprs(input, f);
+            for e in partition_by {
+                walk_expr(e, f);
+            }
+            for k in order_by {
+                walk_expr(&k.expr, f);
+            }
+            match func {
+                ultrasql_planner::LogicalWindowFunc::Lag { expr, .. }
+                | ultrasql_planner::LogicalWindowFunc::Lead { expr, .. }
+                | ultrasql_planner::LogicalWindowFunc::FirstValue(expr)
+                | ultrasql_planner::LogicalWindowFunc::LastValue(expr)
+                | ultrasql_planner::LogicalWindowFunc::NthValue { expr, .. } => walk_expr(expr, f),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -538,4 +565,3 @@ fn walk_on_conflict<F: FnMut(&ScalarExpr)>(oc: &LogicalOnConflict, f: &mut F) {
         }
     }
 }
-

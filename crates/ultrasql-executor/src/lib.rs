@@ -117,7 +117,7 @@ pub use sort::Sort;
 pub use sort_aggregate::SortAggregate;
 pub use unique::Unique;
 pub use values_scan::ValuesScan;
-pub use window_agg::WindowAgg;
+pub use window_agg::{WindowAgg, WindowFunc};
 pub use work_mem::WorkMemBudget;
 
 pub use push_pipeline::{CollectSink, VectorizedPipeline, VectorizedPipelineBuilder};

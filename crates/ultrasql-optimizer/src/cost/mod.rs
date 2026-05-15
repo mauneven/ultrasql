@@ -277,6 +277,12 @@ impl<'s> CostModel<'s> {
 
             LogicalPlan::Cte { body, .. } => self.estimate(body),
             LogicalPlan::LockRows { input, .. } => self.estimate(input),
+            LogicalPlan::Window { input, .. } => {
+                // Window is one full pass over the child + a partition
+                // sort. Approximate as the child's cost plus a sort cost.
+                let input_est = self.estimate(input);
+                cost_sort(input_est, &self.gucs)
+            }
 
             // DML / DDL / source / transaction-control nodes: neutral
             // estimate (rows and cost = 0).

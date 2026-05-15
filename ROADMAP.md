@@ -300,7 +300,7 @@ deployment can rely on.
 | `ultrasql-parser` | ✅ Full DML + DDL + CTE + Extended Protocol Parse/Bind syntax |
 | `ultrasql-planner` | ✅ Binder for SELECT/INSERT/UPDATE/DELETE, JOINs, GROUP BY, subqueries, CTEs, BEGIN/COMMIT/ROLLBACK/SAVEPOINT, BETWEEN (rewritten into `>= AND <=`); binder split into `binder/` directory (`aggregate.rs`, `ddl.rs`, `dml.rs`, `expr_bind.rs`, `expr_type.rs`, `from.rs`, `util.rs`) |
 | `ultrasql-optimizer` | ✅ Rule-based rewrites, cost model, DPsize/GEQO join enumeration, physical selection, plan cache (~1077 LOC across `lib.rs` + `plan_cache.rs`); ✅ public `optimize(plan, &snapshot, &dyn StatsSource)` entry point wired into the server's DML/SELECT path (Wave B v0.6); `PlanCache` shared between Simple Query and Extended Query Parse keyed on SQL text; every DDL clears the cache |
-| `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), MergeJoin (Sort-children fast path in `pipeline::join::try_lower_merge_join`), SortAggregate (Sort-input fast path in `pipeline::lower_query`'s Aggregate arm), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit, CteScan, SetOp, IndexScan, BitmapHeapScan, FunctionScan (`generate_series`), LockRows; ⚠️ kernel-only (not yet wired): WindowAgg (`OVER` parser AST + `LogicalPlan::Window` pending), Materialize (planner-level CSE selection pending), Unique (DISTINCT uses HashAggregate dedup instead); ✅ recursive CTE fixpoint loop landed in v0.5 (`pipeline::lower_recursive_cte`) |
+| `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), MergeJoin (Sort-children fast path in `pipeline::join::try_lower_merge_join`), SortAggregate (Sort-input fast path in `pipeline::lower_query`'s Aggregate arm), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit, CteScan, SetOp, IndexScan, BitmapHeapScan, FunctionScan (`generate_series`), LockRows, WindowAgg (parser → `LogicalPlan::Window` → `pipeline::lower_query` Window arm wired in v0.5; ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE / NTILE); ⚠️ kernel-only (not yet wired): Materialize (planner-level CSE selection pending), Unique (DISTINCT uses HashAggregate dedup instead); ✅ recursive CTE fixpoint loop landed in v0.5 (`pipeline::lower_recursive_cte`) |
 | `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, dictionary encoding, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
 | `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ✅ typed-tuple encoder/decoder in `encoding.rs` (`ClassRow`, `encode_attribute_row`/`decode_attribute_row`, `schema_from_attributes`); ✅ `bootstrap_from_heap` decodes pg_class + pg_attribute on warm restart and rebuilds user `TableEntry` list with full schema (`persistent.rs:486`); module-level doc comment in `persistent.rs:25-41` reflects this overlay behaviour |
 | `ultrasql-protocol` | ✅ Wire codec for Simple Query + Extended Query (Parse/Bind/Describe/Execute/Sync/Close) |
@@ -647,7 +647,7 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 
 ---
 
-## v0.5 — "Execute" ⚠️ PARTIAL (only the WindowAgg binder + `LogicalPlan::Window` lowerer remain)
+## v0.5 — "Execute" ✅ DONE
 
 > Wave-G audit closure status:
 >
@@ -660,13 +660,11 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 > - `WorkMemBudget` carried by `LowerCtx::work_mem` (`Arc<WorkMemBudget>`) and inherited through every lower_query recursion. v0.5 budget is `u64::MAX`; spill paths land in v0.6.
 > - `temp_file_limit` enforced vacuously — no spill writer exists today.
 > - Materialize semantics covered by `CteBuffer` for multi-reference `WITH`; dedicated kernel reserved for v0.6 cross-projection CSE.
+> - WindowAgg end-to-end wire: `LogicalPlan::Window` planner variant, `binder::window` lift-and-wrap pass that rewrites projection-level window calls into synthetic `$wn_N` references, exhaustive match-arm fanout across planner / optimizer / pipeline / extended / session modules, and `pipeline::lower_query::lower_window_func` translating `LogicalWindowFunc` → `ultrasql_executor::WindowFunc`. `crates/ultrasql-server/tests/window_round_trip.rs` covers ROW_NUMBER, RANK / DENSE_RANK, LAG / LEAD with default, FIRST_VALUE / LAST_VALUE, NTH_VALUE, NTILE (six tests).
 >
 > Honest deferrals (kernel exists, streaming-rewrite gated):
 > - `IndexOnlyScan` / `BitmapHeapScan` — kernels take pre-materialised `Vec<Vec<Value>>`; streaming rewrite + VM integration lands in v0.6.
 > - `unnest(anyarray)` — gated on the array `Value` variant which lands on the v0.6 type-extension track.
->
-> Still open (the only real code work left for v0.5):
-> - Binder for `Expr::Call::over = Some(_)` → `LogicalPlan::Window`, the new planner variant, and `pipeline::lower_query`'s Window arm calling `WindowAgg::new(...)`. The parser-side contract is in place; the remaining wire is a single multi-file commit that adds the planner variant and its exhaustive-match arms across the planner + optimizer + pipeline + extended modules.
 
 **Scope:** Full physical operator set exposed through the Simple Query
 wire path. Extended query protocol. Real auth. Any standard PostgreSQL
@@ -693,8 +691,8 @@ driver can connect.
 - [x] `SortAggregate` — kernel exists (`sort_aggregate.rs`); optimizer selects via `physical_selection.rs:147` when the input is already sorted on the group keys; lowerer wires the same shape in `pipeline::lower_query`'s `Aggregate` arm (input is `LogicalPlan::Sort` whose ascending keys match the GROUP BY keys → strip Sort, emit `SortAggregate`)
 - [x] Standard aggregates: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG (JSON_AGG TBD)
 - [x] Statistical aggregates: STDDEV / STDDEV_SAMP / STDDEV_POP / VARIANCE / VAR_SAMP / VAR_POP via Welford's online algorithm in `hash_aggregate.rs::AggState::Welford`. Five wire round-trip tests. CORR, PERCENTILE_CONT, PERCENTILE_DISC remain — they need ordered-set / multi-arg aggregate plumbing the binder does not expose yet
-- [x] Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE — kernel in `WindowAgg` (`window_agg.rs`). The parser now emits `Expr::Call::over = Some(WindowSpec { partition_by, order_by, .. })` so a `SELECT row_number() OVER (PARTITION BY a ORDER BY b) FROM t` reaches the binder with intact window metadata. The binder + `LogicalPlan::Window` planner variant + `pipeline::lower_query` arm are the v0.6 finish line — see line 690.
-- [x] `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` — parser now consumes the clause and emits `WindowSpec` on `Expr::Call::over` (`crates/ultrasql-parser/src/parser/expr.rs::parse_over_clause`; covered by `over_clause_partition_and_order`, `over_clause_empty_window`); kernel handles every frame the planner could emit. ⚠️ Binder + `LogicalPlan::Window` variant + `pipeline::lower_query` arm land in v0.6 — adding the planner variant fans out across every exhaustive `LogicalPlan` match site (10+ files in planner + optimizer + pipeline + extended) so the wire-up is its own commit.
+- [x] Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE — kernel in `WindowAgg` (`window_agg.rs`); parser emits `Expr::Call::over = Some(WindowSpec { partition_by, order_by, .. })` (`crates/ultrasql-parser/src/parser/expr.rs::parse_over_clause`); binder lifts each top-level window call out of the projection and wraps the plan in `LogicalPlan::Window` (`crates/ultrasql-planner/src/binder/window.rs::extract_window_calls` + `apply_window_extractions`), exposing each result as a synthetic `$wn_N` column; `pipeline::lower_query`'s `Window` arm builds the matching `ultrasql_executor::WindowAgg` via `lower_window_func` (`crates/ultrasql-server/src/pipeline/lower_query.rs`); end-to-end coverage in `crates/ultrasql-server/tests/window_round_trip.rs`.
+- [x] `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` — parser consumes the clause and emits `WindowSpec` on `Expr::Call::over` (covered by `over_clause_partition_and_order`, `over_clause_empty_window`); binder + `LogicalPlan::Window` variant + `pipeline::lower_query` arm live in tree; the kernel handles every frame the planner can emit today (whole partition for value-style; current-row-relative for LAG/LEAD/ROW_NUMBER/RANK/DENSE_RANK).
 - [x] `WindowAgg` operator — kernel exists with tests
 
 ### Other Operators

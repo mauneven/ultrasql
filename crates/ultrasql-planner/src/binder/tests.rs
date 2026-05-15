@@ -1602,7 +1602,9 @@ fn binds_alter_table_add_column_resolves_field() {
         panic!("expected AlterTable plan");
     };
     assert_eq!(table_name, "users");
-    let LogicalAlterTableAction::AddColumn { column } = action;
+    let LogicalAlterTableAction::AddColumn { column } = action else {
+        panic!("expected AddColumn action");
+    };
     assert_eq!(column.name, "extra");
     assert_eq!(column.data_type, DataType::Int32);
     assert!(column.nullable, "ADD COLUMN defaults to nullable");
@@ -1614,7 +1616,9 @@ fn binds_alter_table_add_column_not_null() {
     let LogicalPlan::AlterTable { action, .. } = plan else {
         panic!("expected AlterTable plan");
     };
-    let LogicalAlterTableAction::AddColumn { column } = action;
+    let LogicalAlterTableAction::AddColumn { column } = action else {
+        panic!("expected AddColumn action");
+    };
     assert_eq!(column.data_type, DataType::Bool);
     assert!(!column.nullable);
 }
@@ -1630,15 +1634,32 @@ fn alter_table_add_column_rejects_duplicate_name() {
 }
 
 #[test]
-fn alter_table_drop_column_returns_not_supported() {
+fn binds_alter_table_drop_column_resolves_index() {
     let cat = users_catalog();
-    let err = parse_and_bind("ALTER TABLE users DROP COLUMN score", &cat).unwrap_err();
-    assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+    let plan = parse_and_bind("ALTER TABLE users DROP COLUMN score", &cat).unwrap();
+    let LogicalPlan::AlterTable { action, .. } = plan else {
+        panic!("expected AlterTable plan");
+    };
+    let LogicalAlterTableAction::DropColumn {
+        column_index,
+        column_name,
+    } = action
+    else {
+        panic!("expected DropColumn action");
+    };
+    assert_eq!(column_name, "score");
+    assert_eq!(column_index, 2);
 }
 
 #[test]
-fn alter_table_rename_returns_not_supported() {
+fn binds_alter_table_rename_to_new_name() {
     let cat = users_catalog();
-    let err = parse_and_bind("ALTER TABLE users RENAME TO subscribers", &cat).unwrap_err();
-    assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+    let plan = parse_and_bind("ALTER TABLE users RENAME TO subscribers", &cat).unwrap();
+    let LogicalPlan::AlterTable { action, .. } = plan else {
+        panic!("expected AlterTable plan");
+    };
+    let LogicalAlterTableAction::RenameTable { new_name } = action else {
+        panic!("expected RenameTable action");
+    };
+    assert_eq!(new_name, "subscribers");
 }

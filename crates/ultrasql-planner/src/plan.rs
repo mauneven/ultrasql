@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-use ultrasql_core::{DataType, Field, Schema};
+use ultrasql_core::{DataType, Field, Schema, Value};
 
 use crate::expr::ScalarExpr;
 
@@ -293,6 +293,28 @@ pub enum LogicalPlan {
         input: Box<Self>,
         /// Sort keys, evaluated left-to-right.
         keys: Vec<SortKey>,
+    },
+
+    /// Window-function application. Wraps a child plan and appends one
+    /// column carrying the per-row window result. The executor's
+    /// `WindowAgg` operator consumes this shape directly.
+    Window {
+        /// Input plan (typically a `Filter`/`Scan` chain).
+        input: Box<Self>,
+        /// `PARTITION BY` keys; empty means a single partition over
+        /// the whole input.
+        partition_by: Vec<ScalarExpr>,
+        /// `ORDER BY` keys; empty means the partition is unsorted (the
+        /// kernel still emits ranks but in row-arrival order).
+        order_by: Vec<SortKey>,
+        /// Which window function to compute.
+        func: LogicalWindowFunc,
+        /// Display name for the appended output column. Borrowed by
+        /// the binder when it re-references the window result from
+        /// the outer projection.
+        output_name: String,
+        /// Output schema (`input.schema()` + one window-result column).
+        schema: Schema,
     },
 
     /// A no-row source. Used for queries with constant-false predicates
@@ -869,11 +891,53 @@ pub enum CopyFormat {
     Csv,
 }
 
-/// Resolved `ALTER TABLE` action.
+/// Resolved window function applied by a [`LogicalPlan::Window`] node.
 ///
-/// The binder pre-resolves every reference (column types,
-/// nullability) so the executor can apply the change without touching
-/// the parser again.
+/// Each variant maps 1-to-1 to an [`ultrasql_executor::WindowFunc`]
+/// variant; the pipeline lowerer performs the trivial conversion at
+/// operator-construction time.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LogicalWindowFunc {
+    /// `ROW_NUMBER()` — 1-based row number within the partition.
+    RowNumber,
+    /// `RANK()` — rank with gaps.
+    Rank,
+    /// `DENSE_RANK()` — rank without gaps.
+    DenseRank,
+    /// `LAG(expr [, offset [, default]])`.
+    Lag {
+        /// The value expression.
+        expr: ScalarExpr,
+        /// Number of rows back (default 1).
+        offset: usize,
+        /// Default value when out of partition bounds.
+        default: Value,
+    },
+    /// `LEAD(expr [, offset [, default]])`.
+    Lead {
+        /// The value expression.
+        expr: ScalarExpr,
+        /// Number of rows ahead (default 1).
+        offset: usize,
+        /// Default value when out of partition bounds.
+        default: Value,
+    },
+    /// `FIRST_VALUE(expr)`.
+    FirstValue(ScalarExpr),
+    /// `LAST_VALUE(expr)`.
+    LastValue(ScalarExpr),
+    /// `NTH_VALUE(expr, n)`.
+    NthValue {
+        /// The value expression.
+        expr: ScalarExpr,
+        /// 1-based position.
+        n: usize,
+    },
+    /// `NTILE(n)`.
+    Ntile(usize),
+}
+
+/// One action clause of an [`LogicalPlan::AlterTable`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogicalAlterTableAction {
     /// `ALTER TABLE t ADD [COLUMN] c TYPE [NULL | NOT NULL]`.
@@ -961,7 +1025,8 @@ impl LogicalPlan {
             | Self::Unlisten { schema, .. }
             | Self::Copy { schema, .. }
             | Self::Explain { schema, .. }
-            | Self::FunctionScan { schema, .. } => schema,
+            | Self::FunctionScan { schema, .. }
+            | Self::Window { schema, .. } => schema,
             Self::Filter { input, .. } | Self::Limit { input, .. } | Self::Sort { input, .. } => {
                 input.schema()
             }
@@ -1027,6 +1092,40 @@ impl LogicalPlan {
                         "NULLS LAST"
                     };
                     let _ = fmt::write(out, format_args!("{} {dir} {nulls}", k.expr));
+                }
+                out.push('\n');
+                input.display_into(indent + 2, out);
+            }
+            Self::Window {
+                input,
+                partition_by,
+                order_by,
+                func,
+                output_name,
+                ..
+            } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("Window: {output_name} = {func:?}"));
+                if !partition_by.is_empty() {
+                    out.push_str(" PARTITION BY [");
+                    for (i, e) in partition_by.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        let _ = fmt::write(out, format_args!("{e}"));
+                    }
+                    out.push(']');
+                }
+                if !order_by.is_empty() {
+                    out.push_str(" ORDER BY [");
+                    for (i, k) in order_by.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        let dir = if k.asc { "ASC" } else { "DESC" };
+                        let _ = fmt::write(out, format_args!("{} {dir}", k.expr));
+                    }
+                    out.push(']');
                 }
                 out.push('\n');
                 input.display_into(indent + 2, out);

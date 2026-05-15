@@ -290,6 +290,61 @@ pub fn build_operator(
                 _ => build_operator(body, data_source),
             }
         }
+
+        LogicalPlan::Window {
+            input,
+            partition_by,
+            order_by,
+            func,
+            schema,
+            ..
+        } => {
+            let child = build_operator(input, data_source)?;
+            let order_exprs: Vec<ScalarExpr> = order_by.iter().map(|k| k.expr.clone()).collect();
+            let kernel_func = match func {
+                ultrasql_planner::LogicalWindowFunc::RowNumber => crate::WindowFunc::RowNumber,
+                ultrasql_planner::LogicalWindowFunc::Rank => crate::WindowFunc::Rank,
+                ultrasql_planner::LogicalWindowFunc::DenseRank => crate::WindowFunc::DenseRank,
+                ultrasql_planner::LogicalWindowFunc::Lag {
+                    expr,
+                    offset,
+                    default,
+                } => crate::WindowFunc::Lag {
+                    expr: expr.clone(),
+                    offset: *offset,
+                    default: default.clone(),
+                },
+                ultrasql_planner::LogicalWindowFunc::Lead {
+                    expr,
+                    offset,
+                    default,
+                } => crate::WindowFunc::Lead {
+                    expr: expr.clone(),
+                    offset: *offset,
+                    default: default.clone(),
+                },
+                ultrasql_planner::LogicalWindowFunc::FirstValue(e) => {
+                    crate::WindowFunc::FirstValue(e.clone())
+                }
+                ultrasql_planner::LogicalWindowFunc::LastValue(e) => {
+                    crate::WindowFunc::LastValue(e.clone())
+                }
+                ultrasql_planner::LogicalWindowFunc::NthValue { expr, n } => {
+                    crate::WindowFunc::NthValue {
+                        expr: expr.clone(),
+                        n: *n,
+                    }
+                }
+                ultrasql_planner::LogicalWindowFunc::Ntile(n) => crate::WindowFunc::Ntile(*n),
+            };
+            Ok(Box::new(crate::WindowAgg::new(
+                child,
+                partition_by.clone(),
+                order_exprs,
+                kernel_func,
+                schema.clone(),
+            )))
+        }
     }
 }
 

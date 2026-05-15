@@ -202,6 +202,25 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         }
         LogicalPlan::Explain { input, .. } => plan_contains_outer_column(input),
         LogicalPlan::Copy { .. } => false,
+        LogicalPlan::Window {
+            input,
+            partition_by,
+            order_by,
+            func,
+            ..
+        } => {
+            partition_by.iter().any(expr_contains_outer)
+                || order_by.iter().any(|k| expr_contains_outer(&k.expr))
+                || match func {
+                    crate::LogicalWindowFunc::Lag { expr, .. }
+                    | crate::LogicalWindowFunc::Lead { expr, .. }
+                    | crate::LogicalWindowFunc::FirstValue(expr)
+                    | crate::LogicalWindowFunc::LastValue(expr)
+                    | crate::LogicalWindowFunc::NthValue { expr, .. } => expr_contains_outer(expr),
+                    _ => false,
+                }
+                || plan_contains_outer_column(input)
+        }
     }
 }
 

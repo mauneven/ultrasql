@@ -394,6 +394,60 @@ where
             wait_policy: *wait_policy,
             schema: schema.clone(),
         },
+        LogicalPlan::Window {
+            input,
+            partition_by,
+            order_by,
+            func,
+            output_name,
+            schema,
+        } => LogicalPlan::Window {
+            input: Box::new(map_plan_exprs(input, f)),
+            partition_by: partition_by.iter().map(f).collect(),
+            order_by: order_by
+                .iter()
+                .map(|k| ultrasql_planner::SortKey {
+                    expr: f(&k.expr),
+                    asc: k.asc,
+                    nulls_first: k.nulls_first,
+                })
+                .collect(),
+            func: match func {
+                ultrasql_planner::LogicalWindowFunc::Lag {
+                    expr,
+                    offset,
+                    default,
+                } => ultrasql_planner::LogicalWindowFunc::Lag {
+                    expr: f(expr),
+                    offset: *offset,
+                    default: default.clone(),
+                },
+                ultrasql_planner::LogicalWindowFunc::Lead {
+                    expr,
+                    offset,
+                    default,
+                } => ultrasql_planner::LogicalWindowFunc::Lead {
+                    expr: f(expr),
+                    offset: *offset,
+                    default: default.clone(),
+                },
+                ultrasql_planner::LogicalWindowFunc::FirstValue(e) => {
+                    ultrasql_planner::LogicalWindowFunc::FirstValue(f(e))
+                }
+                ultrasql_planner::LogicalWindowFunc::LastValue(e) => {
+                    ultrasql_planner::LogicalWindowFunc::LastValue(f(e))
+                }
+                ultrasql_planner::LogicalWindowFunc::NthValue { expr, n } => {
+                    ultrasql_planner::LogicalWindowFunc::NthValue {
+                        expr: f(expr),
+                        n: *n,
+                    }
+                }
+                other => other.clone(),
+            },
+            output_name: output_name.clone(),
+            schema: schema.clone(),
+        },
     }
 }
 

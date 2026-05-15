@@ -119,7 +119,7 @@ where
             &self.state.tables,
             Arc::clone(&self.state.heap),
             Arc::clone(&self.state.txn_manager),
-        Some(self.cancel_flag.clone()),
+            Some(self.cancel_flag.clone()),
         );
         // Always commit the read-only ANALYZE txn — we don't surface
         // its results, only the row count buried in the `SelectResult`.
@@ -254,6 +254,7 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Unlisten { .. } => "Unlisten",
         LogicalPlan::Copy { .. } => "Copy",
         LogicalPlan::FunctionScan { .. } => "Function Scan",
+        LogicalPlan::Window { .. } => "WindowAgg",
     }
 }
 
@@ -268,6 +269,7 @@ fn plan_children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
         | LogicalPlan::LockRows { input, .. }
         | LogicalPlan::Explain { input, .. }
         | LogicalPlan::Update { input, .. }
+        | LogicalPlan::Window { input, .. }
         | LogicalPlan::Delete { input, .. } => vec![input],
         LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
             vec![left, right]

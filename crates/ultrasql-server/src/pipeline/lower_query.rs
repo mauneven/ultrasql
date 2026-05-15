@@ -31,13 +31,17 @@ use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 use crate::BlankPageLoader;
 use crate::error::ServerError;
 
-use super::agg_fuse::{extract_int32_col_op_lit, try_lower_cached_scalar_aggregate_i32, try_lower_fused_filter_sum_i32};
+use super::agg_fuse::{
+    extract_int32_col_op_lit, try_lower_cached_scalar_aggregate_i32, try_lower_fused_filter_sum_i32,
+};
 use super::cte_helpers::{check_set_op_schemas, lower_recursive_cte, lower_set_op_real};
 use super::index_scan::try_index_scan;
 use super::join::lower_join;
-use super::modify::{lower_project_columns, lower_real_delete, lower_real_insert, lower_real_update};
-use super::scan::{lower_catalog_or_sample_scan, lower_function_scan, lower_heap_scan};
+use super::modify::{
+    lower_project_columns, lower_real_delete, lower_real_insert, lower_real_update,
+};
 use super::saturate_row_count;
+use super::scan::{lower_catalog_or_sample_scan, lower_function_scan, lower_heap_scan};
 use super::{CteBuffer, LowerCtx};
 
 pub fn lower_query(
@@ -190,9 +194,9 @@ pub fn lower_query(
             // over the equi-key. Skip the Sort wrappers and let the
             // executor's merge operator consume the already-ordered
             // streams without re-sorting.
-            if let Some(op) = super::join::try_lower_merge_join(
-                left, right, *join_type, condition, schema, ctx,
-            )? {
+            if let Some(op) =
+                super::join::try_lower_merge_join(left, right, *join_type, condition, schema, ctx)?
+            {
                 return Ok(op);
             }
 
@@ -251,10 +255,7 @@ pub fn lower_query(
                 && !group_by.is_empty()
                 && keys.len() == group_by.len()
                 && keys.iter().all(|k| k.asc)
-                && keys
-                    .iter()
-                    .zip(group_by.iter())
-                    .all(|(k, g)| &k.expr == g)
+                && keys.iter().zip(group_by.iter()).all(|(k, g)| &k.expr == g)
             {
                 let child = lower_query(sort_input, ctx)?;
                 return Ok(Box::new(ultrasql_executor::SortAggregate::new(
@@ -269,12 +270,8 @@ pub fn lower_query(
             // through this same real-heap-aware path so the aggregate can
             // sit on top of a `SeqScan` over a persistent relation.
             let child = lower_query(input, ctx)?;
-            let mut agg = HashAggregate::new(
-                child,
-                group_by.clone(),
-                aggregates.clone(),
-                schema.clone(),
-            );
+            let mut agg =
+                HashAggregate::new(child, group_by.clone(), aggregates.clone(), schema.clone());
             if let Some(flag) = &ctx.cancel_flag {
                 agg = agg.with_cancel_flag(flag.clone());
             }
@@ -308,6 +305,64 @@ pub fn lower_query(
                 Box::new(|_, _| Ok(())),
             )))
         }
+        LogicalPlan::Window {
+            input,
+            partition_by,
+            order_by,
+            func,
+            schema,
+            ..
+        } => {
+            let child = lower_query(input, ctx)?;
+            let order_exprs: Vec<ScalarExpr> = order_by.iter().map(|k| k.expr.clone()).collect();
+            let kernel_func = lower_window_func(func);
+            Ok(Box::new(ultrasql_executor::WindowAgg::new(
+                child,
+                partition_by.clone(),
+                order_exprs,
+                kernel_func,
+                schema.clone(),
+            )))
+        }
+    }
+}
+
+fn lower_window_func(func: &ultrasql_planner::LogicalWindowFunc) -> ultrasql_executor::WindowFunc {
+    match func {
+        ultrasql_planner::LogicalWindowFunc::RowNumber => ultrasql_executor::WindowFunc::RowNumber,
+        ultrasql_planner::LogicalWindowFunc::Rank => ultrasql_executor::WindowFunc::Rank,
+        ultrasql_planner::LogicalWindowFunc::DenseRank => ultrasql_executor::WindowFunc::DenseRank,
+        ultrasql_planner::LogicalWindowFunc::Lag {
+            expr,
+            offset,
+            default,
+        } => ultrasql_executor::WindowFunc::Lag {
+            expr: expr.clone(),
+            offset: *offset,
+            default: default.clone(),
+        },
+        ultrasql_planner::LogicalWindowFunc::Lead {
+            expr,
+            offset,
+            default,
+        } => ultrasql_executor::WindowFunc::Lead {
+            expr: expr.clone(),
+            offset: *offset,
+            default: default.clone(),
+        },
+        ultrasql_planner::LogicalWindowFunc::FirstValue(e) => {
+            ultrasql_executor::WindowFunc::FirstValue(e.clone())
+        }
+        ultrasql_planner::LogicalWindowFunc::LastValue(e) => {
+            ultrasql_executor::WindowFunc::LastValue(e.clone())
+        }
+        ultrasql_planner::LogicalWindowFunc::NthValue { expr, n } => {
+            ultrasql_executor::WindowFunc::NthValue {
+                expr: expr.clone(),
+                n: *n,
+            }
+        }
+        ultrasql_planner::LogicalWindowFunc::Ntile(n) => ultrasql_executor::WindowFunc::Ntile(*n),
     }
 }
 
@@ -384,8 +439,8 @@ pub(super) fn lower_cte(
         xid: ctx.xid,
         command_id: ctx.command_id,
         cte_buffers: child_buffers,
-            cancel_flag: ctx.cancel_flag.clone(),
-            work_mem: std::sync::Arc::clone(&ctx.work_mem),
+        cancel_flag: ctx.cancel_flag.clone(),
+        work_mem: std::sync::Arc::clone(&ctx.work_mem),
     };
 
     lower_query(body, &child_ctx)

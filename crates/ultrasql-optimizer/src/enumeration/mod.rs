@@ -144,6 +144,7 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::LockRows { input, .. }
+        | LogicalPlan::Window { input, .. }
         | LogicalPlan::Explain { input, .. } => outer_join_subtree_is_barrier(input),
 
         // Two-input plan nodes that are not joins (set ops, CTEs).
@@ -276,6 +277,21 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
             input: Box::new(reorder_inner_joins(input)),
             keys: keys.clone(),
+        },
+        LogicalPlan::Window {
+            input,
+            partition_by,
+            order_by,
+            func,
+            output_name,
+            schema,
+        } => LogicalPlan::Window {
+            input: Box::new(reorder_inner_joins(input)),
+            partition_by: partition_by.clone(),
+            order_by: order_by.clone(),
+            func: func.clone(),
+            output_name: output_name.clone(),
+            schema: schema.clone(),
         },
         LogicalPlan::Aggregate {
             input,

@@ -193,6 +193,31 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
             }))
         }
 
+        LogicalPlan::Window {
+            input,
+            partition_by,
+            order_by,
+            func,
+            output_name,
+            schema,
+        } => {
+            // Window: fold the partition-by exprs, the order-by exprs,
+            // and the function-internal exprs. The output column shape
+            // is fixed by the binder so the schema never changes.
+            let new_input = fold_plan(input)?;
+            if new_input.is_none() {
+                return Ok(None);
+            }
+            Ok(Some(LogicalPlan::Window {
+                input: Box::new(new_input.unwrap_or_else(|| *input.clone())),
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+                func: func.clone(),
+                output_name: output_name.clone(),
+                schema: schema.clone(),
+            }))
+        }
+
         LogicalPlan::Join {
             left,
             right,

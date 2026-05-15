@@ -72,6 +72,7 @@ mod expr_bind;
 mod expr_type;
 mod from;
 mod util;
+mod window;
 
 use self::aggregate::{
     bind_aggregate, bind_projection_agg, bind_projection_with_scope, derive_agg_output_name,
@@ -579,6 +580,25 @@ fn bind_select_body(
             predicate: pred,
         };
     }
+
+    // Window-function lift: pull every `Expr::Call { over: Some(_) }`
+    // out of the projection, wrap the FROM/WHERE plan in one
+    // [`LogicalPlan::Window`] per call, and rewrite the projection so
+    // each call site becomes a [`Expr::Column`] reference to the
+    // synthetic `"$wn_N"` column. Pre-aggregate / pre-projection so
+    // the existing aggregate detection and projection binding paths
+    // see a normal scalar projection.
+    let (projection_after_window, window_extractions) =
+        window::extract_window_calls(&select.projection);
+    let select_for_binding = if window_extractions.is_empty() {
+        select.clone()
+    } else {
+        let mut cloned = select.clone();
+        cloned.projection = projection_after_window;
+        plan = window::apply_window_extractions(plan, window_extractions, catalog, scope)?;
+        cloned
+    };
+    let select = &select_for_binding;
 
     let has_group_by = !select.group_by.is_empty();
     let has_aggregates = select.projection.iter().any(projection_item_has_aggregate);
