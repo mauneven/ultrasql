@@ -112,6 +112,13 @@ pub enum ServerError {
     /// missing savepoint.
     #[error("savepoint '{0}' does not exist")]
     SavepointNotFound(String),
+
+    /// Authentication challenge rejected (wrong password, wrong user
+    /// name, missing Password message). Maps to PostgreSQL SQLSTATE
+    /// `28P01` (`invalid_password`). The connection is closed after
+    /// this error is returned.
+    #[error("password authentication failed")]
+    AuthFailed,
 }
 
 impl ServerError {

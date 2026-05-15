@@ -274,6 +274,30 @@ pub struct Server {
     /// `PREPARE TRANSACTION 'gid'`, `COMMIT PREPARED 'gid'`, and
     /// `ROLLBACK PREPARED 'gid'`.
     pub two_phase: Arc<ultrasql_txn::two_phase::TwoPhaseCoordinator>,
+    /// Auth method this server requires from incoming connections.
+    /// `Trust` accepts any startup, `Md5` runs a real password
+    /// challenge with [`crate::auth::md5`].
+    pub auth: AuthConfig,
+}
+
+/// Authentication policy for incoming connections.
+#[derive(Clone, Debug)]
+pub enum AuthConfig {
+    /// Accept every connection without challenge. Used by the
+    /// in-process tests and the v0.5 default REPL.
+    Trust,
+    /// Require an MD5 password matching the stored
+    /// `(username, password)` pair. The password is held in plain
+    /// text inside the server because MD5 is a per-challenge hash —
+    /// PostgreSQL stores the same way (or the equivalent
+    /// `md5(password+username)` digest).
+    Md5 {
+        /// Required role name presented in `StartupMessage.user`.
+        username: String,
+        /// Plain-text password used to recompute the expected MD5
+        /// hash on every challenge.
+        password: String,
+    },
 }
 
 /// Run undo-log GC every `UNDO_GC_INTERVAL_COMMITS` successful
@@ -331,7 +355,24 @@ impl Server {
             plan_cache,
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
             two_phase,
+            auth: AuthConfig::Trust,
         }
+    }
+
+    /// Builder: switch the server to MD5 password auth.
+    ///
+    /// Every incoming connection must present a `Password` response
+    /// matching `MD5(MD5(password + username) || salt)`. Used by
+    /// integration tests and as the configuration entry point for
+    /// production deployments that wire MD5 in front of the real
+    /// `pg_authid` table.
+    #[must_use]
+    pub fn require_md5_password(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.auth = AuthConfig::Md5 {
+            username: username.into(),
+            password: password.into(),
+        };
+        self
     }
 
     /// Record a successful commit and, every
@@ -449,6 +490,7 @@ impl Server {
             plan_cache,
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
             two_phase,
+            auth: AuthConfig::Trust,
         })
     }
 
@@ -561,7 +603,22 @@ where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
     let mut session = Session::new(io, state);
-    session.startup().await?;
+    // Slow-loris guard. A peer that opens the TCP connection and then
+    // sits silently must not keep the session task alive forever — the
+    // accept loop also stops accepting new connections beyond the
+    // listen backlog if every worker task is parked here. The 30-s
+    // budget covers the StartupMessage exchange plus the
+    // authentication handshake; legitimate clients finish in < 100 ms
+    // even on slow links. The error path drops the socket without
+    // sending a reply because the client never advanced past startup.
+    const STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    match tokio::time::timeout(STARTUP_TIMEOUT, session.startup()).await {
+        Ok(res) => res?,
+        Err(_) => {
+            tracing::warn!("dropping connection: startup handshake exceeded 30 s");
+            return Ok(());
+        }
+    }
     session.run().await
 }
 

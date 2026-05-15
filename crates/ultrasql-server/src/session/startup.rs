@@ -47,12 +47,12 @@ where
     /// Read the startup message and emit the canonical handshake.
     pub(crate) async fn startup(&mut self) -> Result<(), ServerError> {
         let msg = self.read_frontend().await?;
-        let (major, minor) = match msg {
+        let (major, minor, params) = match msg {
             FrontendMessage::StartupMessage {
                 protocol_major,
                 protocol_minor,
-                ..
-            } => (protocol_major, protocol_minor),
+                params,
+            } => (protocol_major, protocol_minor, params),
             // The spec allows an SSLRequest as the very first message
             // (which decodes to a startup-shaped payload); v0.5 does
             // not negotiate TLS yet. We treat anything else as a
@@ -87,7 +87,67 @@ where
             return Err(ServerError::UnsupportedProtocol { major, minor });
         }
 
-        // AuthenticationOk — v0.5 has no real auth.
+        // Authentication. The default `Trust` policy short-circuits to
+        // `AuthenticationOk`. The `Md5` policy runs the standard
+        // PostgreSQL MD5 challenge: send `AuthenticationMD5Password`
+        // with a random 4-byte salt, read the client's `Password`
+        // message, then verify with `auth::md5::verify_md5_response`.
+        // Any failure responds with an `ErrorResponse` and closes.
+        match &self.state.auth.clone() {
+            crate::AuthConfig::Trust => {}
+            crate::AuthConfig::Md5 { username, password } => {
+                let presented_user = params
+                    .iter()
+                    .find(|(k, _)| k == "user")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("");
+                if presented_user != username {
+                    let _ = self
+                        .send(&BackendMessage::ErrorResponse {
+                            fields: vec![
+                                (b'S', "FATAL".to_string()),
+                                (b'C', "28P01".to_string()),
+                                (b'M', "password authentication failed".to_string()),
+                            ],
+                        })
+                        .await;
+                    return Err(ServerError::AuthFailed);
+                }
+                let salt = crate::auth::md5::random_salt();
+                self.send(&BackendMessage::AuthenticationMD5Password { salt })
+                    .await?;
+                let reply = self.read_frontend().await?;
+                let supplied = match reply {
+                    FrontendMessage::Password { password: p } => p,
+                    other => {
+                        debug!(target: "ultrasqld", ?other, "expected Password message");
+                        let _ = self
+                            .send(&BackendMessage::ErrorResponse {
+                                fields: vec![
+                                    (b'S', "FATAL".to_string()),
+                                    (b'C', "08P01".to_string()),
+                                    (b'M', "expected Password message".to_string()),
+                                ],
+                            })
+                            .await;
+                        return Err(ServerError::AuthFailed);
+                    }
+                };
+                let expected = crate::auth::md5::compute_md5_response(password, username, &salt);
+                if !crate::auth::md5::verify_md5_response(&expected, &supplied) {
+                    let _ = self
+                        .send(&BackendMessage::ErrorResponse {
+                            fields: vec![
+                                (b'S', "FATAL".to_string()),
+                                (b'C', "28P01".to_string()),
+                                (b'M', "password authentication failed".to_string()),
+                            ],
+                        })
+                        .await;
+                    return Err(ServerError::AuthFailed);
+                }
+            }
+        }
         self.send(&BackendMessage::AuthenticationOk).await?;
         // Send the full set of `ParameterStatus` messages that
         // PostgreSQL emits at startup. Several PostgreSQL drivers

@@ -21,6 +21,7 @@
 //! and access-control logic unit-testable without a runtime.
 
 pub mod hba;
+pub mod md5;
 pub mod pg_authid;
 pub mod scram;
 
