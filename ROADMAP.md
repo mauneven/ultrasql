@@ -447,7 +447,7 @@ dispatch lands in v0.5; this section is parser + binder only.)
 - [x] `CASE WHEN ... THEN ... ELSE ... END`
 - [x] `COALESCE(a, b, ...)` / `NULLIF(a, b)`
 - [x] `GREATEST(...)` / `LEAST(...)`
-- [x] `BETWEEN ... AND ...` (parser only — ⚠️ binder rejection, see v0.5)
+- [x] `BETWEEN ... AND ...` (parser + binder — `bind_between` rewrites to `>= AND <=`; wired through IndexScan range probe and SeqScan filter)
 - [x] `LIKE` / `ILIKE` / `NOT LIKE`
 - [x] `IS NULL` / `IS NOT NULL`
 - [x] `IS DISTINCT FROM` / `IS NOT DISTINCT FROM`
@@ -549,15 +549,11 @@ serializable (SSI). Real row-level locking. Deadlock detection.
   commits across autocommit / explicit COMMIT / Extended-Query
   Execute. Tests in
   `crates/ultrasql-storage/tests/vacuum.rs`.
-- [ ] **Heap dead-slot reclamation (full VACUUM)** (Item 3 Phase C).
-  The trim above frees undo memory but does not compact dead heap
-  slots — a long DELETE-heavy workload still grows the heap. Phase
-  C builds a page-level compactor that walks the heap, identifies
-  slots whose `xmax` is committed below the oldest-active-xid, and
-  marks the item-id dead so future inserts can recycle the space.
-  Index dead-entry reclamation already lives in
-  `BTree::vacuum(is_dead)`; the missing piece is the heap-side
-  driver and the autovacuum cadence that runs both together.
+- [x] **Heap dead-slot reclamation (full VACUUM)** (Item 3 Phase C
+  `e5c9a7a`). `HeapAccess::vacuum_heap` walks every page of a relation,
+  identifies slots whose `xmax` is committed below `oldest_active_xid`,
+  marks them dead, and calls `Page::compact` to reclaim the space.
+  Returns `VacuumStats { pages_compacted, tuples_reclaimed }`.
 - [x] **Persistent catalog typed-tuple decoder** (Item 4 Phase A
   `c1e1a0d`, Phase B `81f4001`). The catalog row encoders
   (`ClassRow::encode/decode`, `encode_attribute_row` /
@@ -750,9 +746,9 @@ driver can connect.
 
 ### Milestones (must hold before v0.5 ships)
 - [x] tokio-postgres can `CREATE TABLE`, `INSERT VALUES`, `SELECT ... WHERE col op lit`, `SELECT SUM/AVG`, `UPDATE`, `DELETE` end-to-end against `ultrasqld`
-- [ ] `BEGIN`/`COMMIT` round-trip from any standard driver
+- [x] `BEGIN`/`COMMIT` round-trip from any standard driver — `txn_round_trip.rs` covers commit, rollback, failed-block, Extended Query path
 - [x] Extended Query Parse/Bind/Execute round-trip from any standard driver — tokio-postgres prepared statements green (see `crates/ultrasql-server/tests/extended_query_round_trip.rs`)
-- [ ] `ORDER BY` reachable from the wire
+- [x] `ORDER BY` reachable from the wire — `order_by_round_trip.rs` green
 - [x] **INSERT 10 k ≥ 2× every competitor** — 3.30 ms vs SQLite 20.2 ms (**6.13×**), PG 48.4 ms (14.6×), DuckDB 63.2 ms (19.1×), ClickHouse 62.8 ms (19.0×).
 - [x] **SELECT scan 10 k #1 on every competitor** — 759 µs vs DuckDB 897 µs (1.18×), SQLite 1.81 ms (2.39×), ClickHouse 1.17 ms (1.54×), PG 28.6 ms (37.7×). Gate met on SQLite/PG; DuckDB+CH within the 2× band but UltraSQL is consistently ahead.
 - [x] **SELECT SUM 65 k ≥ 2× every competitor** — 38.6 µs vs DuckDB 111 µs (**2.89×**), SQLite 938 µs (24.3×), CH 675 µs (17.5×), PG 33.3 ms (862×). Strict 2× of DuckDB **met**.
@@ -768,9 +764,7 @@ driver can connect.
 
 **Scope:** Cost-based optimizer built from scratch.
 
-> Kernel ships and is fully tested in-crate. ⚠️ The server's inline
-> `lower_query` does NOT consult the optimizer — `physical::build_operator`
-> is bypassed. Reconciling the two dispatch paths is a v0.6 P0.
+> Optimizer kernel ships. ✅ Server `execute_query` routes through `ultrasql_optimizer::optimize` + `PlanCache` (Wave B). Lowering to `Box<dyn Operator>` remains on `pipeline::lower_query` due to crate layering (executor → optimizer edge exists; optimizer cannot depend back on executor).
 
 ### Rule-Based Rewrites
 - [x] Constant folding and constant propagation
@@ -886,7 +880,7 @@ The main OLAP performance differentiator over PostgreSQL.
 
 ---
 
-## v0.8 — "Index and Constrain" ❌
+## v0.8 — "Index and Constrain" ⚠️ PARTIAL (constraint + CREATE INDEX kernels landed early)
 
 **Scope:** Full index types. Constraints enforced. Sequences.
 Persistent catalog. pg_catalog views sufficient for psql `\d`.
@@ -902,7 +896,7 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [ ] Covering indexes: `INCLUDE (col1, col2)`
 - [ ] `CREATE INDEX CONCURRENTLY` (online build without lock)
 - [ ] `VACUUM` reclaims dead index entries
-- [ ] `CREATE INDEX` reachable from the wire (parser+binder done; `lower_query` arm missing)
+- [x] `CREATE INDEX` reachable from the wire — `execute_create_index` in `session/ddl.rs`; ⚠️ single-column Int32/Int64 keys only; multi-column, expression, partial, covering indexes pending
 
 ### Hash Index
 - [ ] Static hashing with overflow pages
@@ -926,15 +920,12 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [ ] Auto-summarize on vacuum
 
 ### Constraints
-- [ ] `NOT NULL` enforcement at INSERT/UPDATE
+- [x] `NOT NULL`, `CHECK`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY` — kernel structs exist in `constraints.rs` (`ConstraintSet`, `Constraint` enum with NotNull/Check/PrimaryKey/ForeignKey/UniqueSet variants); ⚠️ not yet enforced at INSERT/UPDATE in executor
 - [ ] `DEFAULT expr` evaluated at INSERT when column omitted
-- [ ] `CHECK (expr)` validated before INSERT/UPDATE
-- [ ] `UNIQUE` constraint (backed by unique index)
-- [ ] `PRIMARY KEY` (NOT NULL + UNIQUE)
-- [ ] `FOREIGN KEY ... REFERENCES t(col)` referential integrity
+- [ ] FK referential action wiring:
   - [ ] `ON DELETE CASCADE / SET NULL / SET DEFAULT / RESTRICT / NO ACTION`
   - [ ] `ON UPDATE CASCADE / SET NULL / SET DEFAULT / RESTRICT / NO ACTION`
-  - [ ] `DEFERRABLE INITIALLY DEFERRED / IMMEDIATE`
+  - [ ] `DEFERRABLE INITIALLY DEFERRED / IMMEDIATE` (plumbing note in `constraints.rs`)
 - [ ] `GENERATED ALWAYS / BY DEFAULT AS IDENTITY`
 - [ ] `GENERATED ALWAYS AS (expr) STORED` (computed columns)
 - [ ] `EXCLUDE USING gist (...)` exclusion constraints
@@ -982,7 +973,7 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 
 ---
 
-## v0.9 — "Operate" ❌
+## v0.9 — "Operate" ⚠️ PARTIAL (COPY text format + LISTEN/NOTIFY + CancelRequest kernels landed early)
 
 **Scope:** Replication, backup/PITR, observability, COPY,
 autovacuum. UltraSQL survives production use.
@@ -1038,12 +1029,12 @@ autovacuum. UltraSQL survives production use.
 - [ ] Structured JSON logging with `log_min_duration_statement`, `log_statement`
 
 ### COPY & Bulk Operations
-- [ ] `COPY t FROM STDIN [WITH (FORMAT csv, DELIMITER ',', HEADER, NULL, QUOTE)]`
-- [ ] `COPY t TO STDOUT [WITH ...]`
+- [x] `COPY t FROM STDIN` / `COPY t TO STDOUT` — text format kernel in `copy.rs` (334 lines, both directions, backslash-escape, NULL=`\N`); ⚠️ wire dispatch (session handler + SQL statement binding) not yet wired
+- [ ] CSV format (`FORMAT csv`, DELIMITER, HEADER, QUOTE, ESCAPE)
 - [ ] `COPY (SELECT ...) TO STDOUT`
 - [ ] `COPY t FROM 'file'` / `COPY t TO 'file'` (server-side, superuser only)
 - [ ] Binary COPY format
-- [ ] LISTEN/NOTIFY: `LISTEN channel`, `NOTIFY channel [, payload]`, `UNLISTEN`
+- [x] LISTEN/NOTIFY kernel — `NotificationHub` in `notify.rs` with `listen`/`unlisten`/`notify`; ⚠️ SQL surface (`LISTEN channel`, `NOTIFY channel`) and `NotificationResponse` wire send not yet wired
 
 ### External Tools
 - [ ] `pg_dump` compatible output (custom, directory, tar formats)
