@@ -35,9 +35,9 @@ use ultrasql_parser::ast::{DeallocateStmt, ExecuteStmt, Expr, Literal, PrepareSt
 use ultrasql_planner::{LogicalPlan, ScalarExpr, bind};
 use ultrasql_protocol::BackendMessage;
 
+use crate::CombinedCatalog;
 use crate::error::ServerError;
 use crate::extended::{PreparedStatement, substitute_parameters_in_plan};
-use crate::CombinedCatalog;
 use crate::result_encoder::SelectResult;
 
 use super::Session;
@@ -57,7 +57,9 @@ where
         catalog_snapshot: Arc<CatalogSnapshot>,
     ) -> Result<Option<SelectResult>, ServerError> {
         match stmt {
-            Statement::Prepare(p) => Ok(Some(self.execute_prepare_statement(p, &catalog_snapshot)?)),
+            Statement::Prepare(p) => {
+                Ok(Some(self.execute_prepare_statement(p, &catalog_snapshot)?))
+            }
             Statement::Execute(e) => Ok(Some(self.execute_execute_statement(e)?)),
             Statement::Deallocate(d) => Ok(Some(self.execute_deallocate_statement(d))),
             _ => Ok(None),
@@ -71,9 +73,11 @@ where
     ) -> Result<SelectResult, ServerError> {
         let name = stmt.name.value.clone();
         if self.extended.statements.contains_key(&name) {
-            return Err(ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(
-                format!("prepared statement \"{name}\" already exists"),
-            )));
+            return Err(ServerError::Plan(
+                ultrasql_planner::PlanError::TypeMismatch(format!(
+                    "prepared statement \"{name}\" already exists"
+                )),
+            ));
         }
         let combined = CombinedCatalog {
             snapshot: catalog_snapshot,
@@ -114,12 +118,12 @@ where
 
         let expected = prepared.n_params as usize;
         if stmt.args.len() != expected {
-            return Err(ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(
-                format!(
-                    "EXECUTE \"{name}\": wrong number of arguments ({} given, {expected} expected)"
-                    , stmt.args.len()
-                ),
-            )));
+            return Err(ServerError::Plan(
+                ultrasql_planner::PlanError::TypeMismatch(format!(
+                    "EXECUTE \"{name}\": wrong number of arguments ({} given, {expected} expected)",
+                    stmt.args.len()
+                )),
+            ));
         }
 
         let mut values: Vec<Value> = Vec::with_capacity(expected);
@@ -260,8 +264,9 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
                 walk_expr_for_max_param(e, max_idx);
             }
         }
-        LogicalPlan::Limit { input, .. }
-        | LogicalPlan::LockRows { input, .. } => walk_plan_for_max_param(input, max_idx),
+        LogicalPlan::Limit { input, .. } | LogicalPlan::LockRows { input, .. } => {
+            walk_plan_for_max_param(input, max_idx)
+        }
         LogicalPlan::Sort { input, keys } => {
             walk_plan_for_max_param(input, max_idx);
             for k in keys {
@@ -269,7 +274,10 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
             }
         }
         LogicalPlan::Aggregate {
-            input, group_by, aggregates, ..
+            input,
+            group_by,
+            aggregates,
+            ..
         } => {
             walk_plan_for_max_param(input, max_idx);
             for g in group_by {
@@ -282,7 +290,10 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
             }
         }
         LogicalPlan::Join {
-            left, right, condition, ..
+            left,
+            right,
+            condition,
+            ..
         } => {
             walk_plan_for_max_param(left, max_idx);
             walk_plan_for_max_param(right, max_idx);
@@ -294,7 +305,9 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
             walk_plan_for_max_param(left, max_idx);
             walk_plan_for_max_param(right, max_idx);
         }
-        LogicalPlan::Cte { definition, body, .. } => {
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => {
             walk_plan_for_max_param(definition, max_idx);
             walk_plan_for_max_param(body, max_idx);
         }
@@ -306,7 +319,9 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
             }
         }
         LogicalPlan::Insert { source, .. } => walk_plan_for_max_param(source, max_idx),
-        LogicalPlan::Update { input, assignments, .. } => {
+        LogicalPlan::Update {
+            input, assignments, ..
+        } => {
             walk_plan_for_max_param(input, max_idx);
             for (_idx, expr) in assignments {
                 walk_expr_for_max_param(expr, max_idx);
@@ -323,9 +338,8 @@ fn walk_expr_for_max_param(expr: &ScalarExpr, max_idx: &mut u32) {
                 *max_idx = *index;
             }
         }
-        ScalarExpr::Column { .. }
-        | ScalarExpr::Literal { .. }
-        | ScalarExpr::OuterColumn { .. } => {}
+        ScalarExpr::Column { .. } | ScalarExpr::Literal { .. } | ScalarExpr::OuterColumn { .. } => {
+        }
         ScalarExpr::Unary { expr, .. } => walk_expr_for_max_param(expr, max_idx),
         ScalarExpr::Binary { left, right, .. } => {
             walk_expr_for_max_param(left, max_idx);

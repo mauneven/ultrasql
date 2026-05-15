@@ -2,14 +2,18 @@
 //! Split out of `binder/mod.rs` to keep each file under the 600-line ceiling.
 
 use ultrasql_core::{Field, Schema};
-use ultrasql_parser::ast::{Expr, Literal, NullsOrder, ObjectName, OrderItem, SelectItem, SortDirection};
+use ultrasql_parser::ast::{
+    Expr, Literal, NullsOrder, ObjectName, OrderItem, SelectItem, SortDirection,
+};
 
 use super::{
     Catalog, LogicalOnConflict, LogicalPlan, PlanError, ScalarExpr, ScopeStack, SortKey, bind_expr,
 };
 
 /// Build the `RETURNING` schema from the resolved `(expr, name)` pairs.
-pub(super) fn build_returning_schema(returning: &[(ScalarExpr, String)]) -> Result<Schema, PlanError> {
+pub(super) fn build_returning_schema(
+    returning: &[(ScalarExpr, String)],
+) -> Result<Schema, PlanError> {
     if returning.is_empty() {
         return Ok(Schema::empty());
     }

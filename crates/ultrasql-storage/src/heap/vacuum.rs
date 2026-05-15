@@ -5,8 +5,8 @@
 //! block here adds methods to the type defined in `heap/mod.rs`.
 
 use ultrasql_core::{BlockNumber, PageId, RelationId, Xid};
-use ultrasql_mvcc::{TupleHeader, XidStatusOracle};
 use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
+use ultrasql_mvcc::{TupleHeader, XidStatusOracle};
 
 use crate::buffer_pool::PageLoader;
 
@@ -121,8 +121,7 @@ impl<L: PageLoader> HeapAccess<L> {
                     // xmax < oldest_active_xid and committed above; this
                     // decode also handles the is_alive() check for the
                     // infomask bits that mark HOT chains.
-                    let Some((hdr, _)) =
-                        TupleHeader::decode(&slot_bytes[..TUPLE_HEADER_SIZE])
+                    let Some((hdr, _)) = TupleHeader::decode(&slot_bytes[..TUPLE_HEADER_SIZE])
                     else {
                         // Malformed header — skip conservatively.
                         continue;

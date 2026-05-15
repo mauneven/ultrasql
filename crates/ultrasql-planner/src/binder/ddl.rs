@@ -15,7 +15,10 @@ use ultrasql_parser::ast::{
 
 use super::{Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, object_name_simple};
 
-pub(super) fn bind_create_table(s: &CreateTableStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+pub(super) fn bind_create_table(
+    s: &CreateTableStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
     if !s.table_constraints.is_empty() {
         return Err(PlanError::NotSupported(
             "CREATE TABLE: table-level constraints",
@@ -142,7 +145,10 @@ fn resolve_column_nullability(constraints: &[ColumnConstraint]) -> Result<bool, 
 /// The binder synthesises a default index name `"{table}_{c1}_{c2}_..._idx"`
 /// when one was not supplied so the executor always has a stable
 /// catalog key to write.
-pub(super) fn bind_create_index(s: &CreateIndexStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+pub(super) fn bind_create_index(
+    s: &CreateIndexStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
     // Resolve the target table.
     let table_name = object_name_simple(&s.table);
     let meta = catalog
@@ -231,7 +237,10 @@ fn synthesise_index_name(table: &str, columns: &[String]) -> String {
 /// [`PlanError::TableNotFound`]; with `IF EXISTS`, missing relations
 /// are silently dropped from the resulting plan so the executor never
 /// has to re-check the catalog.
-pub(super) fn bind_drop_table(s: &DropTableStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+pub(super) fn bind_drop_table(
+    s: &DropTableStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
     let mut tables: Vec<String> = Vec::with_capacity(s.names.len());
     for obj in &s.names {
         let name = object_name_simple(obj);
@@ -266,7 +275,10 @@ pub(super) fn bind_drop_table(s: &DropTableStmt, catalog: &dyn Catalog) -> Resul
 /// nullability against the same v0.5 column-constraint matrix used by
 /// `CREATE TABLE` and rejects duplicate column names up front
 /// ([`PlanError::DuplicateColumn`]).
-pub(super) fn bind_alter_table(s: &AlterTableStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+pub(super) fn bind_alter_table(
+    s: &AlterTableStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
     let table_name = object_name_simple(&s.name);
     let meta = catalog
         .lookup_table(&table_name)
@@ -330,7 +342,10 @@ pub(super) fn bind_alter_table(s: &AlterTableStmt, catalog: &dyn Catalog) -> Res
 ///
 /// Validates every table name against the catalog; returns
 /// [`PlanError::TableNotFound`] on the first missing name.
-pub(super) fn bind_truncate(s: &TruncateStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+pub(super) fn bind_truncate(
+    s: &TruncateStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
     let mut table_names: Vec<String> = Vec::with_capacity(s.tables.len());
     for obj in &s.tables {
         let name = object_name_simple(obj);

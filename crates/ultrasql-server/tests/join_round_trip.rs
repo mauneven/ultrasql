@@ -199,11 +199,7 @@ async fn left_outer_equi_join_emits_null_padded_unmatched_rows() {
     // PostgreSQL semantics: unmatched left rows get NULL on the right.
     assert_eq!(
         pairs,
-        vec![
-            (Some(1), None),
-            (Some(2), Some(200)),
-            (Some(3), None),
-        ]
+        vec![(Some(1), None), (Some(2), Some(200)), (Some(3), None),]
     );
 
     shutdown(client, server_handle).await;

@@ -1322,7 +1322,10 @@ mod wal_emission {
         // oldest_active_xid > 30, so XID 30 is eligible for vacuum.
         let stats = heap.vacuum_heap(r, Xid::new(100), &oracle).unwrap();
         assert_eq!(stats.tuples_reclaimed, 1, "one dead tuple expected");
-        assert_eq!(stats.pages_compacted, 1, "one page should have been compacted");
+        assert_eq!(
+            stats.pages_compacted, 1,
+            "one page should have been compacted"
+        );
 
         // t1 must still be fetchable; t2 must be gone (slot is now dead/unused).
         let live = heap.fetch(t1).unwrap();
@@ -1343,7 +1346,10 @@ mod wal_emission {
 
         // oldest_active_xid = 40 < 50, so XID 50 is still "in progress".
         let stats = heap.vacuum_heap(r, Xid::new(40), &oracle).unwrap();
-        assert_eq!(stats.tuples_reclaimed, 0, "in-progress delete must not be vacuumed");
+        assert_eq!(
+            stats.tuples_reclaimed, 0,
+            "in-progress delete must not be vacuumed"
+        );
     }
 
     #[test]
@@ -1357,7 +1363,10 @@ mod wal_emission {
         oracle.set_committed(Xid::new(10));
 
         let stats = heap.vacuum_heap(r, Xid::new(100), &oracle).unwrap();
-        assert_eq!(stats.tuples_reclaimed, 0, "alive tuple must not be reclaimed");
+        assert_eq!(
+            stats.tuples_reclaimed, 0,
+            "alive tuple must not be reclaimed"
+        );
         assert_eq!(stats.pages_compacted, 0);
     }
 }

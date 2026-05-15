@@ -367,7 +367,11 @@ impl Server {
     /// production deployments that wire MD5 in front of the real
     /// `pg_authid` table.
     #[must_use]
-    pub fn require_md5_password(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+    pub fn require_md5_password(
+        mut self,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Self {
         self.auth = AuthConfig::Md5 {
             username: username.into(),
             password: password.into(),
@@ -475,8 +479,7 @@ impl Server {
         let txn_manager = Arc::new(TransactionManager::new_with_ssi(ssi));
         let plan_cache = Arc::new(PlanCache::new(PlanCacheConfig::default()));
         let two_phase_dir = data_dir.join("pg_twophase");
-        std::fs::create_dir_all(&two_phase_dir)
-            .map_err(ServerError::Io)?;
+        std::fs::create_dir_all(&two_phase_dir).map_err(ServerError::Io)?;
         let two_phase = Arc::new(ultrasql_txn::two_phase::TwoPhaseCoordinator::new(
             two_phase_dir,
         ));

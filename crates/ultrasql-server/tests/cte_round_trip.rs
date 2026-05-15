@@ -292,4 +292,3 @@ async fn cte_recursive_union_distinct_reaches_fixpoint() {
 
     shutdown(client, server_handle).await;
 }
-

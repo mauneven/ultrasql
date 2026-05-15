@@ -19,8 +19,7 @@ use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, Stat
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
     Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
-    TxnIsolationLevel,
-    bind,
+    TxnIsolationLevel, bind,
 };
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
 use ultrasql_storage::btree::BTree;
@@ -67,7 +66,9 @@ where
         plan: &LogicalPlan,
     ) -> Result<SelectResult, ServerError> {
         match plan {
-            LogicalPlan::Begin { isolation_level, .. } => self.execute_begin(*isolation_level),
+            LogicalPlan::Begin {
+                isolation_level, ..
+            } => self.execute_begin(*isolation_level),
             LogicalPlan::Commit { .. } => self.execute_commit(),
             LogicalPlan::Rollback { .. } => self.execute_rollback(),
             LogicalPlan::Savepoint { name, .. } => self.execute_savepoint(name),
@@ -78,9 +79,9 @@ where
             LogicalPlan::PrepareTransaction { gid, .. } => self.execute_prepare_transaction(gid),
             LogicalPlan::CommitPrepared { gid, .. } => self.execute_commit_prepared(gid),
             LogicalPlan::RollbackPrepared { gid, .. } => self.execute_rollback_prepared(gid),
-            LogicalPlan::SetTransaction { isolation_level, .. } => {
-                self.execute_set_transaction(*isolation_level)
-            }
+            LogicalPlan::SetTransaction {
+                isolation_level, ..
+            } => self.execute_set_transaction(*isolation_level),
             _ => Err(ServerError::Unsupported(
                 "execute_txn_control called with non-txn-control plan",
             )),

@@ -17,9 +17,7 @@ use ultrasql_server::{Server, bind_listener, serve_listener};
 async fn md5_handshake_succeeds_with_correct_password() {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(
-        Server::with_sample_database().require_md5_password("alice", "s3cr3t"),
-    );
+    let server = Arc::new(Server::with_sample_database().require_md5_password("alice", "s3cr3t"));
     let server_handle = tokio::spawn(serve_listener(listener, server));
 
     let conn_str = format!(
@@ -35,7 +33,10 @@ async fn md5_handshake_succeeds_with_correct_password() {
     });
 
     // Confirm the session is fully usable post-auth.
-    let rows = client.query("SELECT 1", &[]).await.expect("post-auth query");
+    let rows = client
+        .query("SELECT 1", &[])
+        .await
+        .expect("post-auth query");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>(0), 1);
 
@@ -51,9 +52,7 @@ async fn md5_handshake_succeeds_with_correct_password() {
 async fn md5_handshake_rejects_wrong_password() {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(
-        Server::with_sample_database().require_md5_password("alice", "correct"),
-    );
+    let server = Arc::new(Server::with_sample_database().require_md5_password("alice", "correct"));
     let server_handle = tokio::spawn(serve_listener(listener, server));
 
     let conn_str = format!(
@@ -84,9 +83,7 @@ async fn md5_handshake_rejects_wrong_password() {
 async fn md5_handshake_rejects_unknown_user() {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(
-        Server::with_sample_database().require_md5_password("alice", "s3cr3t"),
-    );
+    let server = Arc::new(Server::with_sample_database().require_md5_password("alice", "s3cr3t"));
     let server_handle = tokio::spawn(serve_listener(listener, server));
 
     let conn_str = format!(

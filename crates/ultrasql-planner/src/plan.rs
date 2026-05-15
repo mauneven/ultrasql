@@ -1215,7 +1215,9 @@ impl LogicalPlan {
                 out.push_str(&pad);
                 let _ = fmt::write(out, format_args!("RollbackPrepared: {gid}\n"));
             }
-            Self::SetTransaction { isolation_level, .. } => {
+            Self::SetTransaction {
+                isolation_level, ..
+            } => {
                 out.push_str(&pad);
                 let _ = fmt::write(out, format_args!("SetTransaction: {isolation_level:?}\n"));
             }

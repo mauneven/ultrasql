@@ -176,7 +176,10 @@ impl<'src> Parser<'src> {
                 }
                 // Optional ISOLATION LEVEL {READ COMMITTED | REPEATABLE READ | SERIALIZABLE}
                 let isolation_level = self.parse_opt_isolation_level()?;
-                Ok(Statement::Begin { isolation_level, span: tok.span })
+                Ok(Statement::Begin {
+                    isolation_level,
+                    span: tok.span,
+                })
             }
             TokenKind::KwCommit => {
                 let tok = self.advance()?;
@@ -217,11 +220,12 @@ impl<'src> Parser<'src> {
                     self.advance()?; // TRANSACTION
                     let next_tok = *self.peek()?;
                     let isolation_level =
-                        self.parse_opt_isolation_level()?.ok_or(ParseError::Expected {
-                            expected: "ISOLATION LEVEL after SET TRANSACTION",
-                            found: next_tok.kind,
-                            offset: next_tok.span.start as usize,
-                        })?;
+                        self.parse_opt_isolation_level()?
+                            .ok_or(ParseError::Expected {
+                                expected: "ISOLATION LEVEL after SET TRANSACTION",
+                                found: next_tok.kind,
+                                offset: next_tok.span.start as usize,
+                            })?;
                     Ok(Statement::SetTransaction {
                         isolation_level,
                         span: set_tok.span,
@@ -1407,15 +1411,30 @@ mod tests {
     fn set_transaction_isolation_level() {
         use crate::ast::AstIsolationLevel;
         let stmt = parse("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
-        let Statement::SetTransaction { isolation_level, .. } = stmt else { panic!() };
+        let Statement::SetTransaction {
+            isolation_level, ..
+        } = stmt
+        else {
+            panic!()
+        };
         assert_eq!(isolation_level, AstIsolationLevel::ReadCommitted);
 
         let stmt = parse("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
-        let Statement::SetTransaction { isolation_level, .. } = stmt else { panic!() };
+        let Statement::SetTransaction {
+            isolation_level, ..
+        } = stmt
+        else {
+            panic!()
+        };
         assert_eq!(isolation_level, AstIsolationLevel::RepeatableRead);
 
         let stmt = parse("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
-        let Statement::SetTransaction { isolation_level, .. } = stmt else { panic!() };
+        let Statement::SetTransaction {
+            isolation_level, ..
+        } = stmt
+        else {
+            panic!()
+        };
         assert_eq!(isolation_level, AstIsolationLevel::Serializable);
 
         // SET <var> = … must still parse as SetVar (not SetTransaction).
@@ -1427,23 +1446,48 @@ mod tests {
     fn begin_isolation_level() {
         use crate::ast::AstIsolationLevel;
         let stmt = parse("BEGIN ISOLATION LEVEL READ COMMITTED");
-        let Statement::Begin { isolation_level, .. } = stmt else { panic!() };
+        let Statement::Begin {
+            isolation_level, ..
+        } = stmt
+        else {
+            panic!()
+        };
         assert_eq!(isolation_level, Some(AstIsolationLevel::ReadCommitted));
 
         let stmt = parse("BEGIN ISOLATION LEVEL READ UNCOMMITTED");
-        let Statement::Begin { isolation_level, .. } = stmt else { panic!() };
+        let Statement::Begin {
+            isolation_level, ..
+        } = stmt
+        else {
+            panic!()
+        };
         assert_eq!(isolation_level, Some(AstIsolationLevel::ReadCommitted));
 
         let stmt = parse("BEGIN ISOLATION LEVEL REPEATABLE READ");
-        let Statement::Begin { isolation_level, .. } = stmt else { panic!() };
+        let Statement::Begin {
+            isolation_level, ..
+        } = stmt
+        else {
+            panic!()
+        };
         assert_eq!(isolation_level, Some(AstIsolationLevel::RepeatableRead));
 
         let stmt = parse("BEGIN ISOLATION LEVEL SERIALIZABLE");
-        let Statement::Begin { isolation_level, .. } = stmt else { panic!() };
+        let Statement::Begin {
+            isolation_level, ..
+        } = stmt
+        else {
+            panic!()
+        };
         assert_eq!(isolation_level, Some(AstIsolationLevel::Serializable));
 
         let stmt = parse("BEGIN");
-        let Statement::Begin { isolation_level, .. } = stmt else { panic!() };
+        let Statement::Begin {
+            isolation_level, ..
+        } = stmt
+        else {
+            panic!()
+        };
         assert_eq!(isolation_level, None);
     }
 

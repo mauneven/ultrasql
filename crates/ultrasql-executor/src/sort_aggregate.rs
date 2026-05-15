@@ -81,12 +81,8 @@ fn init_state(agg: &LogicalAggregateExpr) -> AggState {
         AggregateFunc::BoolOr => AggState::BoolOr(None),
         AggregateFunc::StringAgg => AggState::StringAgg(Vec::new(), String::new()),
         AggregateFunc::ArrayAgg => AggState::ArrayAgg(Vec::new()),
-        AggregateFunc::StddevSamp | AggregateFunc::StddevPop => {
-            AggState::Stddev(0.0, 0.0, 0)
-        }
-        AggregateFunc::VarSamp | AggregateFunc::VarPop => {
-            AggState::Variance(0.0, 0.0, 0)
-        }
+        AggregateFunc::StddevSamp | AggregateFunc::StddevPop => AggState::Stddev(0.0, 0.0, 0),
+        AggregateFunc::VarSamp | AggregateFunc::VarPop => AggState::Variance(0.0, 0.0, 0),
     }
 }
 

@@ -43,9 +43,10 @@ impl WalBufferSink {
 impl WalSink for WalBufferSink {
     fn append(&self, record: WalRecord) -> Result<Lsn, WalSinkError> {
         let xid = record.header.xid;
-        let lsn = self.buffer.append(&record).map_err(|e| {
-            WalSinkError::Rejected(format!("WalBuffer rejected record: {e}"))
-        })?;
+        let lsn = self
+            .buffer
+            .append(&record)
+            .map_err(|e| WalSinkError::Rejected(format!("WalBuffer rejected record: {e}")))?;
         self.last_lsn.insert(xid.raw(), lsn);
         Ok(lsn)
     }

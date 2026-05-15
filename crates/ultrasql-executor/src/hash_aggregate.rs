@@ -994,7 +994,9 @@ fn accumulate(
                 }
             }
         }
-        AggState::Welford { count, mean, m2, .. } => {
+        AggState::Welford {
+            count, mean, m2, ..
+        } => {
             if let Some(v) = arg_val {
                 if let Some(x) = value_as_f64(&v) {
                     // Welford's online algorithm. Numerically stable
@@ -1059,7 +1061,13 @@ fn finalise(state: &AggState) -> Value {
                     .join(",")
             ))
         }
-        AggState::Welford { count, m2, sample, sqrt, .. } => {
+        AggState::Welford {
+            count,
+            m2,
+            sample,
+            sqrt,
+            ..
+        } => {
             // Sample variance/stddev needs n - 1 in the denominator
             // and is undefined for fewer than two non-NULL inputs.
             // Population variance/stddev is defined for any non-zero

@@ -76,7 +76,9 @@ use self::aggregate::{
     bind_aggregate, bind_projection_agg, bind_projection_with_scope, derive_agg_output_name,
     expr_has_aggregate, is_aggregate_name, projection_item_has_aggregate,
 };
-use self::ddl::{bind_alter_table, bind_create_index, bind_create_table, bind_drop_table, bind_truncate};
+use self::ddl::{
+    bind_alter_table, bind_create_index, bind_create_table, bind_drop_table, bind_truncate,
+};
 use self::dml::{bind_delete, bind_insert, bind_update};
 use self::expr_bind::bind_expr;
 use self::from::bind_from;
@@ -115,7 +117,9 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         // accordingly. The binder emits the corresponding LogicalPlan
         // variants so the Simple- and Extended-Query paths share a single
         // dispatch surface.
-        Statement::Begin { isolation_level, .. } => {
+        Statement::Begin {
+            isolation_level, ..
+        } => {
             use ultrasql_parser::ast::AstIsolationLevel as AL;
             let level = isolation_level.map(|l| match l {
                 AL::ReadCommitted => TxnIsolationLevel::ReadCommitted,
@@ -157,7 +161,9 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
             gid: gid.clone(),
             schema: Schema::empty(),
         }),
-        Statement::SetTransaction { isolation_level, .. } => {
+        Statement::SetTransaction {
+            isolation_level, ..
+        } => {
             use ultrasql_parser::ast::AstIsolationLevel as AL;
             let level = match isolation_level {
                 AL::ReadCommitted => TxnIsolationLevel::ReadCommitted,
@@ -211,7 +217,14 @@ pub(super) fn bind_select(
     for cte in &select.ctes {
         let cte_name = cte.name.value.to_ascii_lowercase();
         let cte_plan = if cte.recursive {
-            bind_recursive_cte(&cte_name, &cte.query, &cte.column_aliases, catalog, &cte_catalog, scope)?
+            bind_recursive_cte(
+                &cte_name,
+                &cte.query,
+                &cte.column_aliases,
+                catalog,
+                &cte_catalog,
+                scope,
+            )?
         } else {
             bind_select_with_ctes(&cte.query, catalog, &cte_catalog, scope)?
         };
@@ -361,7 +374,14 @@ pub(super) fn bind_select_with_ctes(
     for cte in &select.ctes {
         let cte_name = cte.name.value.to_ascii_lowercase();
         let cte_plan = if cte.recursive {
-            bind_recursive_cte(&cte_name, &cte.query, &cte.column_aliases, catalog, &nested_cte_catalog, scope)?
+            bind_recursive_cte(
+                &cte_name,
+                &cte.query,
+                &cte.column_aliases,
+                catalog,
+                &nested_cte_catalog,
+                scope,
+            )?
         } else {
             bind_select_with_ctes(&cte.query, catalog, &nested_cte_catalog, scope)?
         };

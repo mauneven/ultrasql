@@ -170,7 +170,11 @@ pub fn lower_plan(
     match plan {
         LogicalPlan::Scan { table, .. } => lower_scan(table, None, tables),
         LogicalPlan::Filter { input, predicate } => lower_filter(input, predicate, tables),
-        LogicalPlan::Project { input, exprs, schema } => {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            schema,
+        } => {
             if matches!(input.as_ref(), LogicalPlan::Empty { .. }) {
                 let scalars: Vec<ScalarExpr> = exprs.iter().map(|(e, _)| e.clone()).collect();
                 return Ok(Box::new(ResultOp::new(scalars, schema.clone())));
@@ -612,7 +616,11 @@ pub fn lower_query(
         LogicalPlan::Values { rows, schema } => {
             Ok(Box::new(ValuesScan::new(rows.clone(), schema.clone())))
         }
-        LogicalPlan::Project { input, exprs, schema } => {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            schema,
+        } => {
             // `SELECT <const>` (no FROM) lowers Project(Empty) → ResultOp,
             // a single-row constant emitter. The general path below would
             // try to lower Empty into a scan, which has no meaning when
@@ -917,8 +925,18 @@ fn lower_recursive_cte(
 
     let (op, quantifier, anchor, recursive_term, schema) = match definition {
         LogicalPlan::SetOp {
-            op, quantifier, left, right, schema,
-        } => (*op, *quantifier, left.as_ref(), right.as_ref(), schema.clone()),
+            op,
+            quantifier,
+            left,
+            right,
+            schema,
+        } => (
+            *op,
+            *quantifier,
+            left.as_ref(),
+            right.as_ref(),
+            schema.clone(),
+        ),
         _ => {
             return Err(ServerError::Unsupported(
                 "WITH RECURSIVE definition must be a UNION of an anchor + recursive term",
@@ -1149,9 +1167,11 @@ fn filter_unseen_rows(
         };
         cols.push(new_col);
     }
-    Batch::new(cols)
-        .map(Some)
-        .map_err(|e| ServerError::Unsupported(Box::leak(format!("recursive CTE filter: {e}").into_boxed_str())))
+    Batch::new(cols).map(Some).map_err(|e| {
+        ServerError::Unsupported(Box::leak(
+            format!("recursive CTE filter: {e}").into_boxed_str(),
+        ))
+    })
 }
 
 /// Filter helper for numeric columns — drops rows whose mask bit is 0.

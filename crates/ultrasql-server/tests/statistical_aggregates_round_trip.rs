@@ -47,7 +47,8 @@ async fn shutdown(
     server_handle.abort();
 }
 
-const SEED_SQL: &str = "INSERT INTO t VALUES (1, 2), (2, 4), (3, 4), (4, 4), (5, 5), (6, 5), (7, 7), (8, 9)";
+const SEED_SQL: &str =
+    "INSERT INTO t VALUES (1, 2), (2, 4), (3, 4), (4, 4), (5, 5), (6, 5), (7, 7), (8, 9)";
 
 async fn seed(client: &tokio_postgres::Client) {
     client
@@ -58,10 +59,7 @@ async fn seed(client: &tokio_postgres::Client) {
 }
 
 fn approx_eq(a: f64, b: f64, eps: f64) {
-    assert!(
-        (a - b).abs() < eps,
-        "expected {b} ± {eps}, got {a}"
-    );
+    assert!((a - b).abs() < eps, "expected {b} ± {eps}, got {a}");
 }
 
 /// `STDDEV(val)` and `STDDEV_SAMP(val)` are aliases and yield the
