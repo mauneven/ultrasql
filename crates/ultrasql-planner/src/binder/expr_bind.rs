@@ -18,7 +18,7 @@ use super::{
     Catalog, PlanError, ScalarExpr, Schema, ScopeFrame, ScopeStack, bind_select_with_ctes,
     derive_agg_output_name, is_aggregate_name, plan_contains_outer_column,
 };
-use super::expr_type::{binary_result_type, comparable, display_binary, display_unary};
+use super::expr_type::{binary_result_type, comparable, display_unary};
 
 pub(super) fn bind_expr(
     expr: &Expr,

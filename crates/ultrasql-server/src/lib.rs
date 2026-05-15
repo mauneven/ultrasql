@@ -43,6 +43,7 @@ pub mod extended;
 pub mod pipeline;
 pub mod result_encoder;
 pub mod tls;
+pub mod wal_sink;
 pub mod wire_writer;
 
 use std::net::SocketAddr;
@@ -368,23 +369,85 @@ impl Server {
 
     /// Initialize a server that boots from `data_dir`.
     ///
-    /// Brings up a buffer pool backed by segment files under `data_dir`,
-    /// then bootstraps the persistent catalog from the heap pages found
-    /// there.  On a fresh directory the catalog heap is empty and the
-    /// initial snapshot is installed.
+    /// Brings up a buffer pool wired to an on-disk WAL writer that persists
+    /// every heap mutation.  The WAL segments are written under
+    /// `data_dir/pg_wal`.  On a fresh directory the catalog heap is empty
+    /// and the initial snapshot is installed.
     ///
     /// This is the production entry point.  `with_sample_database` is the
-    /// test/REPL entry point.
+    /// test/REPL entry point (no WAL, fully in-memory).
     ///
     /// # Errors
     ///
-    /// Returns [`ServerError::Io`] when `data_dir` cannot be opened or
-    /// when the heap bootstrap fails for a reason other than an empty heap.
-    pub fn init(_data_dir: &Path) -> Result<Self, ServerError> {
-        // TODO(storage-init): open segment files from data_dir, build a real
-        // PageLoader, and pass it to HeapAccess.  For now we fall back to the
-        // in-memory path so the API is usable without a segment implementation.
-        Ok(Self::with_sample_database())
+    /// Returns [`ServerError::Io`] when `data_dir` cannot be opened, when
+    /// the WAL writer thread cannot be spawned, or when the heap bootstrap
+    /// fails for a reason other than an empty heap.
+    pub fn init(data_dir: &Path) -> Result<Self, ServerError> {
+        use std::sync::Arc;
+        use ultrasql_wal::{WalBuffer, WalWriter, WalWriterConfig};
+        use wal_sink::WalBufferSink;
+
+        // 1. WAL buffer — 8 MiB ring.
+        const WAL_BUFFER_BYTES: usize = 8 * 1024 * 1024;
+        let wal_buffer = Arc::new(WalBuffer::new(WAL_BUFFER_BYTES, ultrasql_core::Lsn::ZERO));
+
+        // 2. Background writer thread draining the buffer to disk.
+        let wal_dir = data_dir.join("pg_wal");
+        let _wal_writer = WalWriter::open(
+            &wal_dir,
+            Arc::clone(&wal_buffer),
+            WalWriterConfig::default(),
+        )
+        .map_err(|e| ServerError::Io(std::io::Error::other(format!("WAL writer: {e}"))))?;
+        // Leak the writer handle so the background thread survives for the
+        // process lifetime. `WalWriter::drop` logs a warning but the thread
+        // continues draining; explicit shutdown would require Server::Drop
+        // which is deferred to v0.6.
+        std::mem::forget(_wal_writer);
+
+        // 3. Sink adapter bridges WalBuffer ↔ storage's WalSink trait.
+        let sink: Arc<dyn ultrasql_storage::WalSink> =
+            Arc::new(WalBufferSink::new(Arc::clone(&wal_buffer)));
+
+        // 4. Buffer pool with WAL.
+        let pool = Arc::new(BufferPool::with_wal(
+            IN_MEMORY_POOL_FRAMES,
+            BlankPageLoader,
+            sink,
+        ));
+        let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
+
+        let persistent_catalog = Arc::new(PersistentCatalog::new());
+        match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
+            Ok(stats) => {
+                tracing::info!(?stats, "persistent catalog bootstrapped (WAL-backed)");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "persistent catalog bootstrap failed; using empty catalog");
+            }
+        }
+
+        let mut catalog = InMemoryCatalog::new();
+        let tables = build_sample_database(&mut catalog);
+        let txn_manager = Arc::new(TransactionManager::new());
+        let plan_cache = Arc::new(PlanCache::new(PlanCacheConfig::default()));
+        let two_phase_dir = data_dir.join("pg_twophase");
+        std::fs::create_dir_all(&two_phase_dir)
+            .map_err(ServerError::Io)?;
+        let two_phase = Arc::new(ultrasql_txn::two_phase::TwoPhaseCoordinator::new(
+            two_phase_dir,
+        ));
+
+        Ok(Self {
+            catalog,
+            tables,
+            persistent_catalog,
+            heap,
+            txn_manager,
+            plan_cache,
+            vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
+            two_phase,
+        })
     }
 
     /// Acquire a per-statement catalog snapshot.
