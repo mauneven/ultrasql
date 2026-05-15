@@ -45,7 +45,7 @@ PGUSER="${PGUSER:-$(id -un)}"
 
 if ! command -v psql >/dev/null 2>&1; then
     echo "run_postgres_writes.sh: WARNING: psql not found — skipping postgres17 benchmarks" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64; do
+    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
     done
@@ -54,7 +54,7 @@ fi
 
 if ! pg_isready -q 2>/dev/null; then
     echo "run_postgres_writes.sh: WARNING: PostgreSQL not accepting connections — skipping" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64; do
+    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
     done
@@ -64,7 +64,7 @@ fi
 # Validate connection.
 if ! psql -U "$PGUSER" -d postgres -c "SELECT 1" -q --no-align -t >/dev/null 2>&1; then
     echo "run_postgres_writes.sh: WARNING: cannot connect to PostgreSQL as $PGUSER — skipping" >&2
-    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64; do
+    for wl in insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64; do
         echo "{\"engine\":\"${ENGINE}\",\"status\":\"not_available\",\"workload\":\"${wl}\"}" \
             > "${RAW_DIR}/${wl}-${ENGINE}.json"
     done
@@ -468,6 +468,16 @@ run_filter_sum() {
 }
 
 # ---------------------------------------------------------------------------
+# Workload: window_row_number_65k_i64 — covers the v0.5 WindowAgg wire
+# (`SELECT id, row_number() OVER (ORDER BY x) FROM t`). Same preload
+# fixture as the SUM/AVG/FilterSum benches.
+# ---------------------------------------------------------------------------
+run_window_row_number() {
+    run_analytical "window_row_number_65k_i64" 65536 \
+        "SELECT id, row_number() OVER (ORDER BY x) FROM bench_analytical;"
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 WORKLOAD="${1:-all}"
@@ -480,6 +490,7 @@ case "$WORKLOAD" in
     select_sum_65k_i64)      run_sum_scalar ;;
     select_avg_1m_i64)       run_avg_scalar ;;
     filter_sum_1m_i64)       run_filter_sum ;;
+    window_row_number_65k_i64) run_window_row_number ;;
     all)
         run_insert
         run_update
@@ -489,6 +500,7 @@ case "$WORKLOAD" in
         run_sum_scalar
         run_avg_scalar
         run_filter_sum
+        run_window_row_number
         ;;
     *)
         echo "run_postgres_writes.sh: unknown workload '$WORKLOAD'" >&2

@@ -247,6 +247,15 @@ static STATIC_DEFAULTS: &[StaticTable] = &[
         ],
     },
     StaticTable {
+        id: "window_row_number_65k_i64",
+        heading: "Window — row_number() OVER (ORDER BY x) over 65 536 i32 rows (full wire round-trip)",
+        // Empty: every engine row comes from the latest wire-measured run in
+        // benchmarks/results/latest/raw/. Mirrors the SUM/AVG/FilterSum
+        // methodology — competitor numbers via native CLI, UltraSQL via
+        // tokio-postgres → ultrasqld → SeqScan → WindowAgg.
+        rows: &[],
+    },
+    StaticTable {
         id: "mixed_oltp_pgbench_like",
         heading: "Mixed OLTP (pgbench-like)",
         rows: &[
@@ -565,6 +574,7 @@ fn merge_latest_results(
         "update_throughput_10k",
         "delete_throughput_10k",
         "mixed_oltp_pgbench_like",
+        "window_row_number_65k_i64",
     ];
 
     let Some(workloads) = doc.get("workloads").and_then(|v| v.as_object()) else {

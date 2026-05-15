@@ -88,6 +88,13 @@ enum Workload {
     /// microseconds per operation (elapsed / op_count) — matches the
     /// shape of `benchmarks/scripts/run_*_writes.sh::run_mixed`.
     MixedOltp,
+    /// Whole-relation `SELECT id, row_number() OVER (ORDER BY x) FROM
+    /// t` over a preloaded `(id INT, x INT)` table. Exercises the
+    /// `LogicalPlan::Window` → `WindowAgg` wire end-to-end against the
+    /// equivalent built-in on every competitor (PostgreSQL 17 native
+    /// `row_number()`, DuckDB native, SQLite 3.25+ native, ClickHouse
+    /// `rowNumberInAllBlocks()`). Drains every row through the wire.
+    WindowRowNumber,
 }
 
 impl Workload {
@@ -104,6 +111,7 @@ impl Workload {
             // count suffix; matching ID keeps results-render's grouping
             // happy.
             Self::MixedOltp => "mixed_oltp_pgbench_like".to_string(),
+            Self::WindowRowNumber => format!("window_row_number_{}_i64", k_or_raw(n_rows)),
         }
     }
 }
@@ -227,6 +235,10 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Workload::WindowRowNumber => {
+            run_shared_window_row_number(bound, args.rows, args.warmup, total_iters, &mut iters_us)
+                .await?;
+        }
         _ => {
             for i in 0..total_iters {
                 let micros = match args.workload {
@@ -237,7 +249,8 @@ async fn main() -> Result<()> {
                     Workload::SelectScan
                     | Workload::SumScalar
                     | Workload::AvgScalar
-                    | Workload::FilterSum => unreachable!("handled above"),
+                    | Workload::FilterSum
+                    | Workload::WindowRowNumber => unreachable!("handled above"),
                 };
                 if i >= args.warmup {
                     iters_us.push(micros);
@@ -747,6 +760,66 @@ where
             .count();
         if row_count != 1 {
             anyhow::bail!("aggregate row count mismatch: expected 1, observed {row_count}");
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+        }
+    }
+
+    drop(client);
+    conn_handle.abort();
+    Ok(())
+}
+
+/// Shared-table window-function workload: preload `n_rows` once,
+/// then drain `SELECT id, row_number() OVER (ORDER BY x) FROM t` N
+/// times against the same `(id INT, x INT)` relation under a single
+/// `tokio-postgres` connection.
+///
+/// Mirrors every competitor script's `run_window_row_number`. The
+/// query covers the new v0.5 `LogicalPlan::Window` + `WindowAgg` wire
+/// path end-to-end; each iteration drains every row through the
+/// wire as `tokio_postgres::SimpleQueryMessage::Row`.
+async fn run_shared_window_row_number(
+    server: SocketAddr,
+    n_rows: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<()> {
+    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .context("tokio-postgres connect to ultrasqld")?;
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("tokio-postgres connection error: {e}");
+        }
+    });
+
+    let table = "bench_window_row_number_shared";
+    client
+        .batch_execute(&format!("CREATE TABLE {table} (id INT NOT NULL, x INT)"))
+        .await
+        .with_context(|| format!("CREATE TABLE {table}"))?;
+    preload_chunked(&client, table, n_rows).await?;
+
+    let query = format!("SELECT id, row_number() OVER (ORDER BY x) FROM {table}");
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(&query)
+            .await
+            .with_context(|| format!("window row_number on {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let row_count = messages
+            .iter()
+            .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+            .count();
+        if row_count != n_rows {
+            anyhow::bail!(
+                "window_row_number row count mismatch: expected {n_rows}, observed {row_count}"
+            );
         }
         if i >= warmup {
             iters_us.push(elapsed_us);

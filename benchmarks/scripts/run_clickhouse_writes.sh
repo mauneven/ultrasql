@@ -58,7 +58,7 @@ CH_TCP_PORT="${CH_TCP_PORT:-19000}"
 CH_HTTP_PORT="${CH_HTTP_PORT:-18123}"
 CH_DATA_DIR="${CH_DATA_DIR:-/tmp/ch_bench}"
 
-WORKLOADS=(insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64)
+WORKLOADS=(insert_throughput_10k update_throughput_10k delete_throughput_10k mixed_oltp_pgbench_like select_scan_10k select_sum_65k_i64 select_avg_1m_i64 filter_sum_1m_i64 window_row_number_65k_i64)
 
 mark_unavailable() {
     local reason="$1"
@@ -478,6 +478,7 @@ PYEOF
 run_sum_scalar()  { run_analytical "select_sum_65k_i64"  65536    "SELECT SUM(x) FROM bench_analytical"; }
 run_avg_scalar()  { run_analytical "select_avg_1m_i64"  1000000   "SELECT AVG(x) FROM bench_analytical"; }
 run_filter_sum()  { run_analytical "filter_sum_1m_i64"  1000000   "SELECT SUM(x) FROM bench_analytical WHERE x > 5000000"; }
+run_window_row_number() { run_analytical "window_row_number_65k_i64" 65536 "SELECT id, row_number() OVER (ORDER BY x) FROM bench_analytical"; }
 
 # ---------------------------------------------------------------------------
 # Main
@@ -492,6 +493,7 @@ case "$WORKLOAD" in
     select_sum_65k_i64)      run_sum_scalar ;;
     select_avg_1m_i64)       run_avg_scalar ;;
     filter_sum_1m_i64)       run_filter_sum ;;
+    window_row_number_65k_i64) run_window_row_number ;;
     all)
         run_insert
         run_update
@@ -501,6 +503,7 @@ case "$WORKLOAD" in
         run_sum_scalar
         run_avg_scalar
         run_filter_sum
+        run_window_row_number
         ;;
     *)
         echo "run_clickhouse_writes.sh: unknown workload '$WORKLOAD'" >&2
