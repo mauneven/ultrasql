@@ -93,12 +93,34 @@ where
         Ok(Some(plan))
     }
 
-    /// Dispatch a bound [`LogicalPlan::Copy`] end-to-end on the wire.
+    /// Dispatch a bound [`LogicalPlan::Copy`] end-to-end on the wire from
+    /// the Simple Query path. Emits a trailing `ReadyForQuery` after the
+    /// COPY completes (success or query-scoped error).
     pub(crate) async fn handle_copy_statement(
         &mut self,
         plan: &LogicalPlan,
     ) -> Result<(), ServerError> {
-        let outcome = self.run_copy_inner(plan).await;
+        self.handle_copy_statement_inner(plan, true).await
+    }
+
+    /// Dispatch a bound [`LogicalPlan::Copy`] from the Extended Query
+    /// path. The Extended Query state machine emits its own
+    /// `ReadyForQuery` from `handle_sync`; sending one here would
+    /// duplicate it and confuse libpq clients that depend on a single
+    /// RFQ per Sync.
+    pub(crate) async fn handle_copy_statement_extended(
+        &mut self,
+        plan: &LogicalPlan,
+    ) -> Result<(), ServerError> {
+        self.handle_copy_statement_inner(plan, false).await
+    }
+
+    async fn handle_copy_statement_inner(
+        &mut self,
+        plan: &LogicalPlan,
+        emit_ready_for_query: bool,
+    ) -> Result<(), ServerError> {
+        let outcome = self.run_copy_inner(plan, emit_ready_for_query).await;
         match outcome {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -106,13 +128,21 @@ where
                     return Err(err);
                 }
                 let err = self.fail_if_in_transaction(err);
-                self.send_error_with_ready(&err.to_string(), err.sqlstate())
-                    .await
+                if emit_ready_for_query {
+                    self.send_error_with_ready(&err.to_string(), err.sqlstate())
+                        .await
+                } else {
+                    self.send_error(&err.to_string(), err.sqlstate()).await
+                }
             }
         }
     }
 
-    async fn run_copy_inner(&mut self, plan: &LogicalPlan) -> Result<(), ServerError> {
+    async fn run_copy_inner(
+        &mut self,
+        plan: &LogicalPlan,
+        emit_ready_for_query: bool,
+    ) -> Result<(), ServerError> {
         let LogicalPlan::Copy {
             relation,
             columns,
@@ -159,8 +189,14 @@ where
         };
 
         match direction {
-            CopyDirection::To => self.copy_to_stdout(&entry, columns, schema, &opts).await,
-            CopyDirection::From => self.copy_from_stdin(&entry, columns, schema, &opts).await,
+            CopyDirection::To => {
+                self.copy_to_stdout(&entry, columns, schema, &opts, emit_ready_for_query)
+                    .await
+            }
+            CopyDirection::From => {
+                self.copy_from_stdin(&entry, columns, schema, &opts, emit_ready_for_query)
+                    .await
+            }
         }
     }
 
@@ -170,6 +206,7 @@ where
         columns: &[usize],
         schema: &Schema,
         opts: &CopyOptions,
+        emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
         let n_columns = schema.len();
         self.write_buf.clear();
@@ -261,12 +298,14 @@ where
             },
             &mut wire_buf,
         );
-        encode_backend(
-            &BackendMessage::ReadyForQuery {
-                status: self.txn_state.ready_for_query_status(),
-            },
-            &mut wire_buf,
-        );
+        if emit_ready_for_query {
+            encode_backend(
+                &BackendMessage::ReadyForQuery {
+                    status: self.txn_state.ready_for_query_status(),
+                },
+                &mut wire_buf,
+            );
+        }
         self.io.write_all(&wire_buf).await?;
         self.io.flush().await?;
         Ok(())
@@ -278,6 +317,7 @@ where
         columns: &[usize],
         schema: &Schema,
         opts: &CopyOptions,
+        emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
         let n_columns = schema.len();
         self.send(&copy_in_response(n_columns)).await?;
@@ -321,6 +361,14 @@ where
                     client_fail_message = Some(reason);
                     break;
                 }
+                // tokio-postgres pipelines `Bind+Execute+Sync+Flush` ahead
+                // of the COPY data stream, so a `Sync` (or `Flush`) frame
+                // can arrive *before* the first `CopyData`. The PG protocol
+                // allows these as no-ops during a COPY-in phase — the
+                // server simply waits for the next `CopyData` / `CopyDone`
+                // / `CopyFail`. Ignoring them keeps the libpq pipeline
+                // semantics intact.
+                FrontendMessage::Sync | FrontendMessage::Flush => continue,
                 FrontendMessage::Terminate => {
                     if let Err(abort_err) = self.state.txn_manager.abort(txn) {
                         warn!(error = %abort_err, "COPY FROM abort on terminate failed");
@@ -375,17 +423,26 @@ where
             },
             &mut wire_buf,
         );
-        encode_backend(
-            &BackendMessage::ReadyForQuery {
-                status: self.txn_state.ready_for_query_status(),
-            },
-            &mut wire_buf,
-        );
+        if emit_ready_for_query {
+            encode_backend(
+                &BackendMessage::ReadyForQuery {
+                    status: self.txn_state.ready_for_query_status(),
+                },
+                &mut wire_buf,
+            );
+        }
         self.io.write_all(&wire_buf).await?;
         self.io.flush().await?;
         Ok(())
     }
 
+    /// Decode one CopyData line into a `Vec<Value>` and write it to
+    /// the heap. The argument list is wide because every step needs a
+    /// piece of state the dispatcher already has on hand — packing them
+    /// into a struct would just push the indirection through every call
+    /// site without changing the cost. The local `#[allow]` keeps clippy
+    /// quiet without raising the workspace-wide threshold.
+    #[allow(clippy::too_many_arguments)]
     fn insert_one_copy_row(
         &self,
         line: &[u8],

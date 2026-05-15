@@ -9,11 +9,13 @@
 
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::ast::{
-    AlterTableAction, AlterTableStmt, ColumnConstraint, CreateIndexStmt, CreateTableStmt,
-    DropTableStmt, Expr, ObjectName, TruncateStmt, TypeName,
+    AlterTableAction, AlterTableStmt, ColumnConstraint, CopyDirection as AstCopyDirection,
+    CopyFormat as AstCopyFormat, CopyOption, CopySource as AstCopySource, CopyStmt,
+    CreateIndexStmt, CreateTableStmt, DropTableStmt, Expr, ObjectName, TruncateStmt, TypeName,
 };
 
 use super::{Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, object_name_simple};
+use crate::plan::{CopyDirection, CopyFormat, CopySource};
 
 pub(super) fn bind_create_table(
     s: &CreateTableStmt,
@@ -359,5 +361,92 @@ pub(super) fn bind_truncate(
         restart_identity: s.restart_identity,
         cascade: s.cascade,
         schema: Schema::empty(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// COPY
+// ---------------------------------------------------------------------------
+
+/// Bind a `COPY` statement.
+///
+/// Validates the target table, resolves every column name in the optional
+/// `(col_list)` against the table's schema, and folds the parsed
+/// `WITH (…)` options into the format-appropriate defaults (`\t` delimiter
+/// + `\N` NULL marker for TEXT; `,` delimiter + empty-string NULL marker
+/// for CSV). The produced [`LogicalPlan::Copy`] carries the row-shape
+/// schema the server's session dispatcher needs to encode `CopyOutResponse`
+/// / `CopyInResponse` frames.
+pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
+    let relation = object_name_simple(&s.table);
+    let table_meta = catalog
+        .lookup_table(&relation)
+        .ok_or_else(|| PlanError::TableNotFound(relation.clone()))?;
+
+    let columns: Vec<usize> = if s.columns.is_empty() {
+        Vec::new()
+    } else {
+        let mut indices = Vec::with_capacity(s.columns.len());
+        for ident in &s.columns {
+            let folded = ident.value.to_ascii_lowercase();
+            let idx = table_meta
+                .schema
+                .fields()
+                .iter()
+                .position(|f| f.name.eq_ignore_ascii_case(&folded))
+                .ok_or_else(|| PlanError::ColumnNotFound(ident.value.clone()))?;
+            indices.push(idx);
+        }
+        indices
+    };
+
+    let stream_schema = if columns.is_empty() {
+        table_meta.schema.clone()
+    } else {
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|&i| table_meta.schema.fields()[i].clone())
+            .collect();
+        Schema::new(fields)
+            .map_err(|e| PlanError::TypeMismatch(format!("COPY column projection: {e}")))?
+    };
+
+    let direction = match s.direction {
+        AstCopyDirection::From => CopyDirection::From,
+        AstCopyDirection::To => CopyDirection::To,
+    };
+    let source = match s.source {
+        AstCopySource::Stdin => CopySource::Stdin,
+        AstCopySource::Stdout => CopySource::Stdout,
+    };
+    let format = match s.format {
+        AstCopyFormat::Text => CopyFormat::Text,
+        AstCopyFormat::Csv => CopyFormat::Csv,
+    };
+
+    let (mut delimiter, mut null_str) = match format {
+        CopyFormat::Text => ('\t', String::from(r"\N")),
+        CopyFormat::Csv => (',', String::new()),
+    };
+    let mut header = false;
+    for opt in &s.options {
+        match opt {
+            CopyOption::Format(_) => { /* applied above */ }
+            CopyOption::Delimiter(c) => delimiter = *c,
+            CopyOption::Header(v) => header = *v,
+            CopyOption::Null(v) => null_str.clone_from(v),
+        }
+    }
+
+    Ok(LogicalPlan::Copy {
+        relation,
+        columns,
+        direction,
+        source,
+        format,
+        delimiter,
+        null_str,
+        header,
+        schema: stream_schema,
     })
 }

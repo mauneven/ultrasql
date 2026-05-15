@@ -394,6 +394,19 @@ pub enum TokenKind {
     KwNotify,
     /// `UNLISTEN` — `UNLISTEN { channel | * }`.
     KwUnlisten,
+    // ---- COPY keywords (§1.11 wire surface) ---------------------------------
+    /// `COPY` — `COPY table { FROM | TO } { STDIN | STDOUT } [WITH (...)]`.
+    KwCopy,
+    /// `STDIN` — source of `COPY ... FROM STDIN`.
+    KwStdin,
+    /// `STDOUT` — sink of `COPY ... TO STDOUT`.
+    KwStdout,
+    /// `CSV` — format keyword inside `WITH (FORMAT CSV)`.
+    KwCsv,
+    /// `HEADER` — `HEADER [true|false]` option for `COPY`.
+    KwHeader,
+    /// `DELIMITER` — delimiter option for `COPY`.
+    KwDelimiter,
 }
 
 impl TokenKind {

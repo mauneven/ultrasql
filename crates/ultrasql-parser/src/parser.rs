@@ -274,11 +274,12 @@ impl<'src> Parser<'src> {
                 let tok = self.advance()?;
                 self.parse_unlisten(tok.span.start)
             }
+            TokenKind::KwCopy => self.parse_copy().map(|s| Statement::Copy(Box::new(s))),
             other => Err(ParseError::Expected {
                 expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, ALTER, \
                            REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \
                            RELEASE, EXPLAIN, PREPARE, EXECUTE, DEALLOCATE, LISTEN, NOTIFY, \
-                           or UNLISTEN",
+                           UNLISTEN, or COPY",
                 found: other,
                 offset: head.span.start as usize,
             }),

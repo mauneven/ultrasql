@@ -225,6 +225,13 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("listen", TokenKind::KwListen),
         ("notify", TokenKind::KwNotify),
         ("unlisten", TokenKind::KwUnlisten),
+        // COPY — §1.11 wire surface.
+        ("copy", TokenKind::KwCopy),
+        ("stdin", TokenKind::KwStdin),
+        ("stdout", TokenKind::KwStdout),
+        ("csv", TokenKind::KwCsv),
+        ("header", TokenKind::KwHeader),
+        ("delimiter", TokenKind::KwDelimiter),
     ];
 
     entries.iter().copied().collect()

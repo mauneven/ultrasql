@@ -78,7 +78,8 @@ use self::aggregate::{
     expr_has_aggregate, is_aggregate_name, projection_item_has_aggregate,
 };
 use self::ddl::{
-    bind_alter_table, bind_create_index, bind_create_table, bind_drop_table, bind_truncate,
+    bind_alter_table, bind_copy, bind_create_index, bind_create_table, bind_drop_table,
+    bind_truncate,
 };
 use self::dml::{bind_delete, bind_insert, bind_update};
 use self::expr_bind::bind_expr;
@@ -113,6 +114,7 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::CreateIndex(s) => bind_create_index(s, catalog),
         Statement::DropTable(s) => bind_drop_table(s, catalog),
         Statement::AlterTable(s) => bind_alter_table(s, catalog),
+        Statement::Copy(s) => bind_copy(s, catalog),
         Statement::Explain(s) => bind_explain(s, catalog, &mut scope),
         // Transaction-control statements have no catalog dependency: the
         // server inspects the per-session TxnState and dispatches

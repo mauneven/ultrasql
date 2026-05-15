@@ -354,6 +354,13 @@ where
                     }
                 }
             }
+            // COPY needs the async wire flow (CopyData stream + CopyDone /
+            // CopyFail). Route through the dedicated Extended dispatcher
+            // which suppresses the trailing `ReadyForQuery` — the pipeline's
+            // own `Sync` will emit one.
+            if matches!(plan, LogicalPlan::Copy { .. }) {
+                return self.handle_copy_statement_extended(plan).await;
+            }
         }
 
         // A statement inside a failed transaction block is rejected
