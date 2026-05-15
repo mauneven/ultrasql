@@ -82,10 +82,6 @@ where
         // (a runtime CREATE TABLE never landed it), the in-memory sample
         // catalog provides the legacy fallback.
         let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
-        let combined = CombinedCatalog {
-            snapshot: &catalog_snapshot,
-            fallback: &self.state.catalog,
-        };
 
         // Parser / binder errors inside an explicit transaction must
         // also transition us to `Failed` — PostgreSQL marks the block
@@ -94,6 +90,21 @@ where
         let stmt = match Parser::new(sql).parse_statement() {
             Ok(s) => s,
             Err(e) => return Err(self.fail_if_in_transaction(e.into())),
+        };
+
+        // PREPARE / EXECUTE / DEALLOCATE manipulate the per-session
+        // prepared-statement cache (the same `ExtendedConnState` the
+        // Extended Query path owns). Dispatched here so the bind step
+        // never sees them; the binder rejects these AST variants.
+        if let Some(result) =
+            self.try_dispatch_meta_statement(&stmt, Arc::clone(&catalog_snapshot))?
+        {
+            return Ok(result);
+        }
+
+        let combined = CombinedCatalog {
+            snapshot: &catalog_snapshot,
+            fallback: &self.state.catalog,
         };
         let plan = match bind(&stmt, &combined) {
             Ok(p) => p,

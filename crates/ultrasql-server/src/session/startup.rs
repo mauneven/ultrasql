@@ -89,18 +89,34 @@ where
 
         // AuthenticationOk — v0.5 has no real auth.
         self.send(&BackendMessage::AuthenticationOk).await?;
-        // Server-version & client_encoding are the two parameters
-        // libpq actually reads back during connection setup.
-        self.send(&BackendMessage::ParameterStatus {
-            name: "server_version".to_string(),
-            value: format!("ultrasql-{}", env!("CARGO_PKG_VERSION")),
-        })
-        .await?;
-        self.send(&BackendMessage::ParameterStatus {
-            name: "client_encoding".to_string(),
-            value: "UTF8".to_string(),
-        })
-        .await?;
+        // Send the full set of `ParameterStatus` messages that
+        // PostgreSQL emits at startup. Several PostgreSQL drivers
+        // (psycopg2, JDBC) cache or branch on these values and behave
+        // unpredictably if any standard one is missing. The values
+        // chosen are PostgreSQL's defaults.
+        let server_version = format!("ultrasql-{}", env!("CARGO_PKG_VERSION"));
+        let params: [(&str, &str); 13] = [
+            ("server_version", &server_version),
+            ("server_encoding", "UTF8"),
+            ("client_encoding", "UTF8"),
+            ("DateStyle", "ISO, MDY"),
+            ("IntervalStyle", "postgres"),
+            ("TimeZone", "UTC"),
+            ("integer_datetimes", "on"),
+            ("standard_conforming_strings", "on"),
+            ("extra_float_digits", "1"),
+            ("application_name", ""),
+            ("is_superuser", "off"),
+            ("session_authorization", "tester"),
+            ("in_hot_standby", "off"),
+        ];
+        for (name, value) in params {
+            self.send(&BackendMessage::ParameterStatus {
+                name: name.to_string(),
+                value: value.to_string(),
+            })
+            .await?;
+        }
         // BackendKeyData — cancellation handle. Zeroed until we wire
         // an actual cancel-request handler.
         self.send(&BackendMessage::BackendKeyData {

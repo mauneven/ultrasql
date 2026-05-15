@@ -1095,7 +1095,7 @@ fn walk_on_conflict<F: FnMut(&ScalarExpr)>(oc: &LogicalOnConflict, f: &mut F) {
 /// The walker constructs a fresh plan; the input is unchanged. This
 /// makes the function suitable for use against a `&PreparedStatement`
 /// shared across multiple `Bind` calls.
-fn substitute_parameters_in_plan(plan: &LogicalPlan, values: &[Value]) -> LogicalPlan {
+pub(crate) fn substitute_parameters_in_plan(plan: &LogicalPlan, values: &[Value]) -> LogicalPlan {
     map_plan_exprs(plan, &|e| substitute_parameter_in_expr(e, values))
 }
 

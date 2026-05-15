@@ -21,6 +21,7 @@ mod ddl;
 mod execute;
 mod ext;
 mod io;
+mod meta_stmt;
 mod run;
 mod startup;
 mod txn;
