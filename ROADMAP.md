@@ -300,7 +300,7 @@ deployment can rely on.
 | `ultrasql-parser` | ✅ Full DML + DDL + CTE + Extended Protocol Parse/Bind syntax |
 | `ultrasql-planner` | ✅ Binder for SELECT/INSERT/UPDATE/DELETE, JOINs, GROUP BY, subqueries, CTEs, BEGIN/COMMIT/ROLLBACK/SAVEPOINT, BETWEEN (rewritten into `>= AND <=`); binder split into `binder/` directory (`aggregate.rs`, `ddl.rs`, `dml.rs`, `expr_bind.rs`, `expr_type.rs`, `from.rs`, `util.rs`) |
 | `ultrasql-optimizer` | ✅ Rule-based rewrites, cost model, DPsize/GEQO join enumeration, physical selection, plan cache (~1077 LOC across `lib.rs` + `plan_cache.rs`); ✅ public `optimize(plan, &snapshot, &dyn StatsSource)` entry point wired into the server's DML/SELECT path (Wave B v0.6); `PlanCache` shared between Simple Query and Extended Query Parse keyed on SQL text; every DDL clears the cache |
-| `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit, CteScan, SetOp, IndexScan, BitmapHeapScan; ⚠️ kernel-only (not yet wired): MergeJoin, SortAggregate, WindowAgg (ROW_NUMBER/RANK/DENSE_RANK/LAG/LEAD), FunctionScan, LockRows, Materialize, Unique; ⚠️ recursive CTE fixpoint loop deferred to v0.6 |
+| `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), MergeJoin (Sort-children fast path in `pipeline::join::try_lower_merge_join`), SortAggregate (Sort-input fast path in `pipeline::lower_query`'s Aggregate arm), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit, CteScan, SetOp, IndexScan, BitmapHeapScan, FunctionScan (`generate_series`), LockRows; ⚠️ kernel-only (not yet wired): WindowAgg (`OVER` parser AST + `LogicalPlan::Window` pending), Materialize (planner-level CSE selection pending), Unique (DISTINCT uses HashAggregate dedup instead); ✅ recursive CTE fixpoint loop landed in v0.5 (`pipeline::lower_recursive_cte`) |
 | `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, dictionary encoding, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
 | `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ✅ typed-tuple encoder/decoder in `encoding.rs` (`ClassRow`, `encode_attribute_row`/`decode_attribute_row`, `schema_from_attributes`); ✅ `bootstrap_from_heap` decodes pg_class + pg_attribute on warm restart and rebuilds user `TableEntry` list with full schema (`persistent.rs:486`); module-level doc comment in `persistent.rs:25-41` reflects this overlay behaviour |
 | `ultrasql-protocol` | ✅ Wire codec for Simple Query + Extended Query (Parse/Bind/Describe/Execute/Sync/Close) |
@@ -647,7 +647,19 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 
 ---
 
-## v0.5 — "Execute" ⚠️ PARTIAL (all perf gates met; non-perf gaps tracked)
+## v0.5 — "Execute" ⚠️ PARTIAL (all perf gates met; non-perf gaps narrowed)
+
+> Wave-G audit closed 3 of 11 ⚠️ items: MergeJoin and SortAggregate are now
+> end-to-end wired (Sort-children / Sort-input fast path in
+> `pipeline::lower_query`); the WindowAgg kernel covers FIRST_VALUE,
+> LAST_VALUE, NTH_VALUE, and NTILE; the session-side `CancelFlag` is
+> threaded into `SeqScan` and `HashAggregate` so the operator-side cancel
+> path is complete. Remaining ⚠️ items are all infrastructure-shaped
+> (`OVER` parser AST + `LogicalPlan::Window`, `IndexOnlyScan` / 
+> `BitmapHeapScan` streaming wire path, `Materialize` CSE selection,
+> `WorkMemBudget` per-operator plumbing, `temp_file_limit` spill-site
+> enforcement, `unnest` array `Value`, protocol-side `CancelRequest`
+> decode + cancel-only TCP accept arm).
 
 **Scope:** Full physical operator set exposed through the Simple Query
 wire path. Extended query protocol. Real auth. Any standard PostgreSQL
@@ -665,16 +677,16 @@ driver can connect.
 ### Join Operators
 - [x] `NestLoop` kernel (with inner rescan via factory closure)
 - [x] `HashJoin` kernel (build + probe — Inner+LeftOuter; Right/Full/Semi/Anti and disk spill TBD)
-- [x] `MergeJoin` — kernel exists (`merge_join.rs`); ⚠️ not yet selected by optimizer/lowerer
+- [x] `MergeJoin` — kernel exists (`merge_join.rs`); optimizer selects via `physical_selection.rs:118` (both inputs sorted on the equi-key); lowerer wires via `pipeline::join::try_lower_merge_join`, which strips an explicit `Sort` wrapper from both join children and emits `MergeJoin` without re-sorting
 - [x] All join types reachable from `lower_query` — `join_round_trip.rs` covers INNER, LEFT OUTER, NestLoop fallback
 
 ### Aggregation Operators
 - [x] `HashAggregate` kernel + scalar SIMD fast path (no GROUP BY: SUM/AVG/COUNT/MIN/MAX dispatch to `sum_i64`/`count_i64`/`min_i64`/`max_i64`)
 - [x] Aggregate reachable from `lower_query` (catalog-aware path dispatches `LogicalPlan::Aggregate` → HashAggregate; GROUP BY + ORDER BY covered by `order_by_round_trip.rs`)
-- [x] `SortAggregate` — kernel exists (`sort_aggregate.rs`); ⚠️ not yet selected by optimizer
+- [x] `SortAggregate` — kernel exists (`sort_aggregate.rs`); optimizer selects via `physical_selection.rs:147` when the input is already sorted on the group keys; lowerer wires the same shape in `pipeline::lower_query`'s `Aggregate` arm (input is `LogicalPlan::Sort` whose ascending keys match the GROUP BY keys → strip Sort, emit `SortAggregate`)
 - [x] Standard aggregates: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG (JSON_AGG TBD)
 - [x] Statistical aggregates: STDDEV / STDDEV_SAMP / STDDEV_POP / VARIANCE / VAR_SAMP / VAR_POP via Welford's online algorithm in `hash_aggregate.rs::AggState::Welford`. Five wire round-trip tests. CORR, PERCENTILE_CONT, PERCENTILE_DISC remain — they need ordered-set / multi-arg aggregate plumbing the binder does not expose yet
-- [x] Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD — kernel in `WindowAgg` (`window_agg.rs`); ⚠️ FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE not yet implemented; not yet wired to lowerer
+- [x] Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE — kernel in `WindowAgg` (`window_agg.rs`); ⚠️ not yet wired through the binder / lowerer (the `OVER` parser AST + `LogicalPlan::Window` are §1.17 / line 678)
 - [x] `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` — parsed and handled by `WindowAgg` kernel; ⚠️ not wired end-to-end
 - [x] `WindowAgg` operator — kernel exists with tests
 
@@ -741,8 +753,8 @@ driver can connect.
 
 ### Other Protocol Features
 - [x] `COPY TO STDOUT` / `COPY FROM STDIN` — text + CSV wire dispatch end-to-end. Parser `Statement::Copy(CopyStmt)`; binder `LogicalPlan::Copy`; `session/copy.rs` dispatches both Simple Query (`session/run.rs::handle_query`) and Extended Query (`session/ext.rs::handle_execute`). Backslash-escape + `\N` NULL for TEXT, quoted strings + `""` escape for CSV. `crates/ultrasql-server/tests/copy_round_trip.rs` covers four shapes including byte-identical round-trip. §1.11.
-- [x] `BackendKeyData` wire send — `Session::new` allocates a per-session `(pid, secret)` from `Server::allocate_pid` (monotonic `AtomicU32`) + `OsRng` non-zero secret; `Session::startup` emits the real pair to the client. §1.9.
-- [x] `CancelRequest` kernel + operator polling — `CancelRegistry::request_cancel(pid, secret)` flips a per-query `CancelFlag`; `SeqScan` and `HashAggregate` poll the flag between batches and return `ExecError::Cancelled` → SQLSTATE `57014`. Protocol `FrontendMessage::CancelRequest { process_id, secret_key }` decoded on the `1234.5678` magic. `crates/ultrasql-server/tests/cancel_request_round_trip.rs::cancel_request_with_unknown_pid_is_silent_noop` covers the silent-no-op contract. ⚠️ the timing test `cancel_request_aborts_in_flight_select_within_500ms` is `#[ignore]`d pending the session-side `cancel_flag` plumbing through `LowerCtx` (separate follow-up). §1.9.
+- [x] `BackendKeyData` wire send — `Session::new` registers a `CancelFlag` with the server's `Arc<CancelRegistry>`, which returns the canonical `(pid, secret)` pair (registry's monotonic `AtomicU32` pid + `OsRng` non-zero secret); `Session::startup` emits the real pair to the client. The same pid keys the notify hub. §1.9.
+- [x] `CancelRequest` kernel + operator polling — `CancelRegistry::request_cancel(pid, secret)` flips a per-query `CancelFlag`; the session-side `cancel_flag` is threaded into every `LowerCtx` built for Simple Query / Extended Query / EXPLAIN, and the lowerer calls `with_cancel_flag(flag.clone())` on `SeqScan` (`pipeline::scan::lower_heap_scan`) and `HashAggregate` (`pipeline::lower_query`'s Aggregate arm); operators poll the flag between batches and return `ExecError::Cancelled` → SQLSTATE `57014`. `crates/ultrasql-server/tests/cancel_request_round_trip.rs::cancel_request_with_unknown_pid_is_silent_noop` covers the silent-no-op contract. ⚠️ the timing test `cancel_request_aborts_in_flight_select_within_500ms` is `#[ignore]`d pending the protocol-side work: `FrontendMessage::CancelRequest { process_id, secret_key }` decode on the `1234.5678` magic + the cancel-only TCP accept arm that looks up the entry in the registry without running a full startup handshake. §1.9.
 - [x] `NoticeResponse` (warnings, hints, info messages) — `notice_warning(sqlstate, msg)` helper in `server/lib.rs` wraps `BackendMessage::NoticeResponse`; emitted from txn-control paths (nested BEGIN, COMMIT/ROLLBACK outside a tx, SET TRANSACTION outside a tx) and covered by in-crate tests in `src/tests/txn.rs`
 - [x] `LISTEN/NOTIFY/UNLISTEN` end-to-end — `notify.rs` `NotifyHub` shared across sessions, parser/binder/planner produce `LogicalPlan::Listen/Notify/Unlisten`, server `session/notify.rs` dispatches against the hub, and the run-loop races socket reads with `mpsc::UnboundedReceiver::recv` so idle sessions surface `NotificationResponse` immediately (covered by `crates/ultrasql-server/tests/listen_notify_round_trip.rs`)
 - [x] All expected `ParameterStatus` params — `session/startup.rs` now sends the full thirteen PostgreSQL emits: `server_version`, `server_encoding`, `client_encoding`, `DateStyle`, `IntervalStyle`, `TimeZone`, `integer_datetimes`, `standard_conforming_strings`, `extra_float_digits`, `application_name`, `is_superuser`, `session_authorization`, `in_hot_standby`
