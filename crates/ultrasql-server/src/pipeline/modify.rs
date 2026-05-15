@@ -1,39 +1,25 @@
 //! INSERT/UPDATE/DELETE lowering plus the fused-kernel fast paths.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
-use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
-use ultrasql_executor::filter_sum_op::{
-    CachedAvgI32Scan, CachedFilterSumI32Scan, CachedSumI32Scan, FilterSumI32Scan,
-};
+use ultrasql_catalog::TableEntry;
+use ultrasql_core::{CommandId, DataType, RelationId, Value, Xid};
 use ultrasql_executor::fused_delete::FusedDeleteInt32Pair;
 use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
-use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
-    CteScan, Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan,
-    ModifyKind, ModifyTable, NestedLoopJoin, Operator, Project, ResultOp, RightFactory, RowCodec,
-    SeqScan, SetOp, Sort, ValuesScan,
+    Filter,
+    ModifyKind, ModifyTable, Operator, Project, RowCodec,
+    SeqScan, ValuesScan,
 };
-use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
 use ultrasql_planner::{
-    BinaryOp, InMemoryCatalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr,
-    TableMeta,
+    BinaryOp, LogicalPlan, ScalarExpr,
 };
-use ultrasql_storage::btree::BTree;
-use ultrasql_storage::heap::HeapAccess;
-use ultrasql_txn::TransactionManager;
-use ultrasql_vec::Batch;
-use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 
-use crate::BlankPageLoader;
 use crate::error::ServerError;
 
 use super::LowerCtx;
 use super::agg_fuse::{extract_int32_col_op_lit, shift_column_indices};
 use super::lower_query::lower_query;
-use super::saturate_row_count;
 
 pub(super) fn lower_real_insert(
     table: &str,

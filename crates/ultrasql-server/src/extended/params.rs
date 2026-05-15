@@ -7,8 +7,8 @@
 
 use ultrasql_core::DataType;
 use ultrasql_planner::{
-    BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalOnConflict, LogicalPlan,
-    ScalarExpr, SortKey,
+    BinaryOp, LogicalJoinCondition, LogicalOnConflict, LogicalPlan,
+    ScalarExpr,
 };
 
 // ---------------------------------------------------------------------------

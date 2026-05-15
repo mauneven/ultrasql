@@ -248,6 +248,7 @@ impl IndexKeyEncoding {
     /// equality on every component; the recheck guarantees we do not
     /// surface rows whose underlying composite differs). `false` for
     /// every fixed-width single-column encoding.
+    #[cfg(test)]
     pub(crate) const fn needs_heap_recheck(&self) -> bool {
         matches!(self, Self::TextPrefix8 | Self::CompositeTwoInts { .. })
     }
@@ -332,47 +333,6 @@ impl IndexKeyEncoding {
         ))
     }
 
-    /// Encode a literal value extracted from a WHERE predicate into an
-    /// `i64` probe key, for the single-column encodings the probe path
-    /// supports.
-    ///
-    /// Used by `pipeline::literal_as_i64` to decode the right-hand side
-    /// of `col op literal`. Composite encodings cannot be probed
-    /// through a single literal — the caller falls back to `SeqScan`.
-    pub(crate) fn encode_literal(&self, value: &Value) -> Option<i64> {
-        match (self, value) {
-            (Self::Int16, Value::Int16(v)) => Some(i64::from(*v)),
-            (Self::Int16, Value::Int32(v)) => i16::try_from(*v).ok().map(i64::from),
-            (Self::Int16, Value::Int64(v)) => i16::try_from(*v).ok().map(i64::from),
-            (Self::Int32, Value::Int32(v)) => Some(i64::from(*v)),
-            (Self::Int32, Value::Int64(v)) => i32::try_from(*v).ok().map(i64::from),
-            (Self::Int32, Value::Int16(v)) => Some(i64::from(*v)),
-            (Self::Int64, Value::Int64(v)) => Some(*v),
-            (Self::Int64, Value::Int32(v)) => Some(i64::from(*v)),
-            (Self::Int64, Value::Int16(v)) => Some(i64::from(*v)),
-            (Self::Bool, Value::Bool(b)) => Some(i64::from(*b)),
-            (Self::Timestamp, Value::Timestamp(us)) => Some(*us),
-            (Self::TimestampTz, Value::TimestampTz(us)) => Some(*us),
-            (Self::Float32, Value::Float32(v)) => Some(encode_f32_orderly(*v)),
-            (Self::Float32, Value::Float64(v)) => {
-                // Widen-narrow round-trip is fine for the probe key —
-                // the heap recheck is *not* enabled for Float32 so we
-                // require an exact match on the encoded i64. Reject
-                // literals that would lose precision in the narrowing.
-                #[allow(clippy::cast_possible_truncation)]
-                let narrowed = *v as f32;
-                if f64::from(narrowed) == *v {
-                    Some(encode_f32_orderly(narrowed))
-                } else {
-                    None
-                }
-            }
-            (Self::Float64, Value::Float64(v)) => Some(encode_f64_orderly(*v)),
-            (Self::Float64, Value::Float32(v)) => Some(encode_f64_orderly(f64::from(*v))),
-            (Self::TextPrefix8, Value::Text(s)) => Some(encode_text_prefix8(s.as_bytes())),
-            _ => None,
-        }
-    }
 }
 
 /// Order-preserving `f32` → `i64` encoding.

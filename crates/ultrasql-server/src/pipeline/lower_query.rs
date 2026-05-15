@@ -1,48 +1,30 @@
 //! Main query lowerer — turns a [`LogicalPlan`] into an [`Operator`]
 //! tree. Includes the `WITH` dispatch (regular and recursive CTEs).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
-use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
-use ultrasql_executor::filter_sum_op::{
-    CachedAvgI32Scan, CachedFilterSumI32Scan, CachedSumI32Scan, FilterSumI32Scan,
-};
-use ultrasql_executor::fused_delete::FusedDeleteInt32Pair;
-use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
-use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
-    CteScan, Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan,
-    ModifyKind, ModifyTable, NestedLoopJoin, Operator, Project, ResultOp, RightFactory, RowCodec,
-    SeqScan, SetOp, Sort, ValuesScan,
+    Filter, HashAggregate, Limit, Operator, ResultOp, Sort, ValuesScan,
 };
-use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
 use ultrasql_planner::{
-    BinaryOp, InMemoryCatalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr,
-    TableMeta,
+    LogicalPlan, ScalarExpr,
 };
-use ultrasql_storage::btree::BTree;
-use ultrasql_storage::heap::HeapAccess;
-use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
-use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 
-use crate::BlankPageLoader;
 use crate::error::ServerError;
 
 use super::agg_fuse::{
-    extract_int32_col_op_lit, try_lower_cached_scalar_aggregate_i32, try_lower_direct_scalar_aggregate,
+    try_lower_cached_scalar_aggregate_i32, try_lower_direct_scalar_aggregate,
     try_lower_fused_filter_sum_i32,
 };
-use super::cte_helpers::{check_set_op_schemas, lower_recursive_cte, lower_set_op_real};
+use super::cte_helpers::{lower_recursive_cte, lower_set_op_real};
 use super::index_scan::try_index_scan;
 use super::join::lower_join;
 use super::modify::{
     lower_project_columns, lower_real_delete, lower_real_insert, lower_real_update,
 };
 use super::saturate_row_count;
-use super::scan::{lower_catalog_or_sample_scan, lower_function_scan, lower_heap_scan};
+use super::scan::{lower_catalog_or_sample_scan, lower_function_scan};
 use super::{CteBuffer, LowerCtx};
 
 pub fn lower_query(

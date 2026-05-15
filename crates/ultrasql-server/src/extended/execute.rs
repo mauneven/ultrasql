@@ -2,9 +2,7 @@
 //! a previously bound portal; [`resume_suspended_portal`] resumes a portal
 //! that was suspended by a prior `max_rows` cap.
 
-use std::collections::HashMap;
 
-use ultrasql_core::Value;
 use ultrasql_planner::LogicalPlan;
 use ultrasql_protocol::BackendMessage;
 
@@ -12,9 +10,9 @@ use crate::error::ServerError;
 use crate::pipeline::{LowerCtx, lower_query};
 use crate::result_encoder::{encode_text_value, run_modify_command};
 
-use super::codec::{encode_binary_value, select_tag};
+use super::codec::encode_binary_value;
 use super::handlers::resolve_param_format;
-use super::{BoundPortal, ExecuteOutcome, ExtendedConnState, SuspendedPortal};
+use super::{ExecuteOutcome, ExtendedConnState, SuspendedPortal};
 
 /// Execute the named portal and produce the message sequence.
 ///

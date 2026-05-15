@@ -52,32 +52,30 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
-use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
-use ultrasql_executor::filter_sum_op::{
-    CachedAvgI32Scan, CachedFilterSumI32Scan, CachedSumI32Scan, FilterSumI32Scan,
-};
-use ultrasql_executor::fused_delete::FusedDeleteInt32Pair;
-use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
+use ultrasql_catalog::CatalogSnapshot;
+use ultrasql_core::{CommandId, Schema, Xid};
 use ultrasql_executor::physical::{BuildError, DataSource};
-use ultrasql_executor::{
-    CteScan, Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan,
-    ModifyKind, ModifyTable, NestedLoopJoin, Operator, Project, ResultOp, RightFactory, RowCodec,
-    SeqScan, SetOp, Sort, ValuesScan,
-};
-use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
+use ultrasql_mvcc::Snapshot;
 use ultrasql_planner::{
-    BinaryOp, InMemoryCatalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr,
+    InMemoryCatalog,
     TableMeta,
 };
-use ultrasql_storage::btree::BTree;
+
+#[cfg(test)]
+use ultrasql_core::{Field, RelationId};
+#[cfg(test)]
+use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType};
+#[cfg(test)]
+use ultrasql_vec::column::Column;
+#[cfg(test)]
+use crate::error::ServerError;
+#[cfg(test)]
+use ultrasql_executor::{Operator, RowCodec};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
-use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 
 use crate::BlankPageLoader;
-use crate::error::ServerError;
 
 /// Saturate a `u64` row count from the binder into the executor's
 /// `usize` row-count space.
@@ -176,8 +174,7 @@ impl DataSource for SampleTables {
 }
 
 /// Lower a logical plan to a boxed [`Operator`] tree.
-///
-
+#[derive(Debug)]
 pub struct LowerCtx<'a> {
     /// Legacy sample-table registry; used when the catalog snapshot has
     /// no entry for a referenced table.

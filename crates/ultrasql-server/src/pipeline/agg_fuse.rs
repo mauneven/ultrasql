@@ -1,34 +1,16 @@
 //! Fused-kernel lowerers — `SUM(c) WHERE c <op> lit` and the cached
 //! scalar-aggregate fast path.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 
-use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
-use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Value, Xid};
+use ultrasql_core::RelationId;
 use ultrasql_executor::filter_sum_op::{
     CachedAvgI32Scan, CachedFilterSumI32Scan, CachedSumI32Scan, FilterSumI32Scan,
 };
-use ultrasql_executor::fused_delete::FusedDeleteInt32Pair;
-use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
-use ultrasql_executor::physical::{BuildError, DataSource};
-use ultrasql_executor::{
-    CteScan, Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan,
-    ModifyKind, ModifyTable, NestedLoopJoin, Operator, Project, ResultOp, RightFactory, RowCodec,
-    SeqScan, SetOp, Sort, ValuesScan,
-};
-use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
+use ultrasql_executor::Operator;
 use ultrasql_planner::{
-    BinaryOp, InMemoryCatalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr,
-    TableMeta,
+    BinaryOp, LogicalPlan, ScalarExpr,
 };
-use ultrasql_storage::btree::BTree;
-use ultrasql_storage::heap::HeapAccess;
-use ultrasql_txn::TransactionManager;
-use ultrasql_vec::Batch;
-use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 
-use crate::BlankPageLoader;
 use crate::error::ServerError;
 
 use super::LowerCtx;

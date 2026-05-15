@@ -4,16 +4,14 @@ use super::codec::{DecodeError, decode_param};
 use super::handlers::{
     handle_bind, handle_close, handle_describe_portal, handle_describe_statement, handle_parse,
 };
-use super::params::{infer_parameter_types, walk_plan_exprs};
+use super::params::walk_plan_exprs;
 use super::substitute::substitute_parameters_in_plan;
 use super::{
-    ExtendedConnState, PG_OID_BOOL, PG_OID_BPCHAR, PG_OID_BYTEA, PG_OID_FLOAT4, PG_OID_FLOAT8,
-    PG_OID_INT2, PG_OID_INT4, PG_OID_INT8, PG_OID_OID, PG_OID_TEXT, PG_OID_VARCHAR,
+    ExtendedConnState, PG_OID_BOOL, PG_OID_INT4, PG_OID_INT8, PG_OID_TEXT,
 };
 use crate::error::ServerError;
-use crate::pipeline::LowerCtx;
-use ultrasql_core::{DataType, Value};
-use ultrasql_planner::{BinaryOp, InMemoryCatalog, LogicalPlan, ScalarExpr};
+use ultrasql_core::Value;
+use ultrasql_planner::{BinaryOp, InMemoryCatalog, ScalarExpr};
 use ultrasql_protocol::{BackendMessage, DescribeKind};
 
 fn fixture_catalog() -> InMemoryCatalog {

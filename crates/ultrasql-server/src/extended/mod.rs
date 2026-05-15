@@ -51,14 +51,9 @@
 
 use std::collections::HashMap;
 
-use ultrasql_core::{DataType, Value};
-use ultrasql_parser::Parser;
 use ultrasql_planner::LogicalPlan;
-use ultrasql_protocol::{BackendMessage, DescribeKind, FieldDescription};
+use ultrasql_protocol::BackendMessage;
 
-use crate::error::ServerError;
-use crate::pipeline::{LowerCtx, lower_query};
-use crate::result_encoder::{encode_text_value, run_modify_command};
 
 // ---------------------------------------------------------------------------
 // Type-OID constants. Duplicated narrowly with `result_encoder.rs` so this
@@ -97,7 +92,6 @@ mod substitute;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use codec::row_description_for_plan;
 pub use execute::execute_portal;
 pub use handlers::{
     handle_bind, handle_close, handle_describe_portal, handle_describe_statement, handle_parse,
@@ -179,6 +173,7 @@ impl std::fmt::Debug for ExtendedConnState {
 /// State retained across a `PortalSuspended` boundary so the next
 /// `Execute` on the same portal can resume from where the previous one
 /// stopped instead of re-running the plan from scratch.
+#[derive(Debug)]
 pub struct SuspendedPortal {
     /// The operator stream still hot — `next_batch` returns the rows
     /// that have not yet been emitted to the client.

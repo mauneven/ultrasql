@@ -2,15 +2,13 @@
 //! and Close. Each handler is invoked by the per-session state machine in
 //! [`crate::session`] after the wire codec decodes a frontend message.
 
-use std::collections::HashMap;
 
 use ultrasql_core::{DataType, Value};
 use ultrasql_parser::Parser;
-use ultrasql_planner::{LogicalPlan, ScalarExpr, bind};
-use ultrasql_protocol::{BackendMessage, DescribeKind, FieldDescription};
+use ultrasql_planner::bind;
+use ultrasql_protocol::{BackendMessage, DescribeKind};
 
 use crate::error::ServerError;
-use crate::pipeline::{LowerCtx, lower_query};
 
 use super::codec::{DecodeError, decode_param, pg_type_oid, row_description_for_plan};
 use super::params::{count_parameters_in_plan, infer_parameter_types};
