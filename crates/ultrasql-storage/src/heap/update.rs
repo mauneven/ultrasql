@@ -266,6 +266,11 @@ impl<L: PageLoader> HeapAccess<L> {
         // `old_tid.page`, which the post-`insert_batch` stamp loop
         // exploits with another run-length walk.
         let mut fallback: Vec<(TupleId, UpdatePayload)> = Vec::new();
+        // Single column-cache invalidation per call rather than per
+        // page-run. The cache is keyed by relation; one bump after
+        // every HOT outcome on the relation is equivalent to bumping
+        // once per page-run for the same relation.
+        let mut hot_touched_relation: Option<RelationId> = None;
 
         // Linear walk: identify each maximal run of entries sharing a
         // `PageId` and process them under a single per-page guard.
@@ -290,59 +295,51 @@ impl<L: PageLoader> HeapAccess<L> {
                     )?;
                 }
 
-                // Pre-check: if the page has insufficient free space
-                // for **any** entry's new HOT version, skip the
-                // per-row `try_hot_update` loop entirely. Each
-                // `try_hot_update` call pays a `page.write()` +
-                // header decode + free-space check; on a page that
-                // cannot fit even one new tuple this is ~200 ns of
-                // wasted work per row. The bench's preload fills
-                // pages to ~99 %, so every page in the UPDATE input
-                // hits this skip and saves ~10 000 `try_hot_update`
-                // attempts.
-                let first_size = TUPLE_HEADER_SIZE
-                    .checked_add(edits_vec[i].1.len())
-                    .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
-                let min_needed = first_size + crate::page::ITEMID_SIZE;
-                let guard = self.pool.get_page(page_id)?;
-                let page_free = guard.read().header().free_space();
-                drop(guard);
-                if page_free < min_needed {
-                    // Move every entry in the run straight to fallback.
-                    fallback.reserve(group_len);
-                    for k in i..j {
-                        let (tid, payload) = std::mem::replace(
-                            &mut edits_vec[k],
-                            (TupleId::new(page_id, 0), UpdatePayload::new()),
-                        );
-                        fallback.push((tid, payload));
-                    }
-                    i = j;
-                    continue;
-                }
-
-                // Page has room for at least one new version.
-                // Take ONE PageGuard for the per-row HOT batch.
-                // Each `try_hot_update` acquires `guard.write()`
-                // internally — uncontended because the prior call
-                // released.
-                let mut hot_outcomes: Vec<(TupleId, TupleId)> = Vec::with_capacity(group_len);
+                // Single pin + single write lock for the entire
+                // page-run. Each row in the run is dispatched through
+                // [`Self::try_hot_update_inplace`] which writes directly
+                // into the held `PageWrite` — eliminating the per-row
+                // `parking_lot::RwLock::write` acquire/release the
+                // legacy `try_hot_update` paid (~30-50 ns × N rows
+                // uncontended), and the duplicate `get_page` the
+                // free-space precheck used to need.
+                //
+                // When `opts.wal.is_none() && opts.vm.is_none()` the
+                // post-write outcome loop has nothing to do per tuple
+                // beyond incrementing `total`; we skip building
+                // `hot_outcomes` entirely on that path (the bulk-DML
+                // executor exercises this branch).
+                let collect_outcomes = opts.wal.is_some() || opts.vm.is_some();
+                let mut hot_outcomes: Vec<(TupleId, TupleId)> = if collect_outcomes {
+                    Vec::with_capacity(group_len)
+                } else {
+                    Vec::new()
+                };
+                let mut hot_count: usize = 0;
+                let mut scratch: Vec<u8> = Vec::with_capacity(64);
                 {
                     let guard = self.pool.get_page(page_id)?;
+                    let mut page = guard.write();
                     for k in i..j {
                         let new_tuple_size = TUPLE_HEADER_SIZE
                             .checked_add(edits_vec[k].1.len())
                             .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
                         let old_tid = edits_vec[k].0;
-                        match Self::try_hot_update(
-                            &guard,
+                        match Self::try_hot_update_inplace(
+                            &mut page,
                             old_tid,
                             &edits_vec[k].1,
                             opts,
                             0,
                             new_tuple_size,
+                            &mut scratch,
                         )? {
-                            Some(new_tid) => hot_outcomes.push((old_tid, new_tid)),
+                            Some(new_tid) => {
+                                if collect_outcomes {
+                                    hot_outcomes.push((old_tid, new_tid));
+                                }
+                                hot_count += 1;
+                            }
                             None => {
                                 let (tid, payload) = std::mem::replace(
                                     &mut edits_vec[k],
@@ -352,13 +349,15 @@ impl<L: PageLoader> HeapAccess<L> {
                             }
                         }
                     }
-                    // guard drops here — pin released before WAL I/O
+                    // page + guard drop here — pin and write lock
+                    // released before WAL I/O.
                 }
 
                 // Per-HOT-success: emit WAL, clear VM. When
                 // `opts.wal` is `None` this is a no-op (the bulk DML
                 // path on cross_compare_sql).
-                let mut had_hot_outcome = false;
+                let mut had_hot_outcome = hot_count > 0;
+                total = total.saturating_add(hot_count);
                 for (old_tid, new_tid) in hot_outcomes {
                     let outcome = UpdateOutcome {
                         old_tid,
@@ -369,12 +368,10 @@ impl<L: PageLoader> HeapAccess<L> {
                     if let Some(vm) = opts.vm {
                         vm.clear(new_tid.page.relation, new_tid.page.block);
                     }
-                    total += 1;
                     had_hot_outcome = true;
                 }
                 if had_hot_outcome {
-                    // Invalidate the column cache for this relation.
-                    self.column_cache.bump_version(page_id.relation);
+                    hot_touched_relation = Some(page_id.relation);
                 }
             } else {
                 // Caller disabled HOT for every entry in the run —
@@ -390,6 +387,12 @@ impl<L: PageLoader> HeapAccess<L> {
             }
 
             i = j;
+        }
+
+        // One column-cache bump per relation, covering every HOT
+        // outcome across every page-run.
+        if let Some(rel) = hot_touched_relation {
+            self.column_cache.bump_version(rel);
         }
 
         // Non-HOT fallback — bulk path.

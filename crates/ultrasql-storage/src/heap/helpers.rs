@@ -20,7 +20,7 @@ use ultrasql_wal::payload::{
 };
 use ultrasql_wal::record::RecordType;
 
-use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
+use crate::buffer_pool::{BufferPool, PageGuard, PageLoader, PageWrite};
 use crate::page::PageError;
 use crate::wal_sink::WalSink;
 
@@ -180,6 +180,111 @@ impl<L: PageLoader> HeapAccess<L> {
         old_hdr.ctid = new_tid;
         let old_hdr_bytes = Self::collect_header_bytes(&old_hdr);
         page_bytes[old_off..old_off + TUPLE_HEADER_SIZE].copy_from_slice(&old_hdr_bytes);
+
+        Ok(Some(new_tid))
+    }
+
+    /// HOT-update variant that operates on an already-held [`PageWrite`].
+    ///
+    /// Caller owns the page write guard for the duration of an entire
+    /// page-run (the bulk-UPDATE `update_many` path acquires the write
+    /// lock once per source page and drives every row on that page
+    /// through this helper before releasing). This drops the
+    /// per-row `PageGuard::write()` acquire/release pair the
+    /// per-row `try_hot_update` used to pay (~50 ns × N rows on
+    /// `parking_lot::RwLock`).
+    ///
+    /// The new tuple bytes (40-byte header + caller payload) are
+    /// assembled into `scratch` which the caller reuses across rows —
+    /// one heap allocation per page-run instead of one per row.
+    ///
+    /// Old + new headers are stamped via direct byte writes at known
+    /// field offsets (mirroring [`Self::stamp_updated_old_inline`]);
+    /// no `TupleHeader::decode` / `encode` round trip on the per-row
+    /// path.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    pub(super) fn try_hot_update_inplace(
+        page: &mut PageWrite<'_>,
+        old_tid: TupleId,
+        new_payload: &[u8],
+        opts: UpdateOptions<'_>,
+        n_atts: u16,
+        new_tuple_size: usize,
+        scratch: &mut Vec<u8>,
+    ) -> Result<Option<TupleId>, HeapError> {
+        // Free-space precheck — avoid building the new tuple and
+        // entering `insert_tuple_appended` only to bounce back.
+        let free = page.header().free_space();
+        if free < new_tuple_size + crate::page::ITEMID_SIZE {
+            return Ok(None);
+        }
+
+        // Verify old tuple alive by reading xmax (bytes 8..16) directly.
+        let (old_off, old_len) = Self::slot_window(page.as_bytes_mut(), old_tid.slot)?;
+        if old_len < TUPLE_HEADER_SIZE {
+            return Err(HeapError::MalformedHeader("old slot shorter than header"));
+        }
+        {
+            let bytes = page.as_bytes_mut();
+            let xmax_at = old_off + 8;
+            let existing_xmax = u64::from_le_bytes(
+                bytes[xmax_at..xmax_at + 8]
+                    .try_into()
+                    .expect("8-byte slice"),
+            );
+            if existing_xmax != 0 {
+                return Err(HeapError::MalformedHeader("update on deleted tuple"));
+            }
+        }
+
+        // Build the new tuple bytes into the caller-provided scratch.
+        // `Vec::clear` keeps the existing allocation so subsequent rows
+        // in the page-run pay no allocator traffic.
+        let tentative_tid = TupleId::new(old_tid.page, 0);
+        let mut new_hdr = TupleHeader::fresh(opts.xid, opts.command_id, tentative_tid, n_atts);
+        new_hdr
+            .infomask
+            .set(InfoMask::HOT_UPDATED | InfoMask::UPDATED);
+        scratch.clear();
+        scratch.resize(TUPLE_HEADER_SIZE, 0);
+        new_hdr.encode(&mut scratch[..TUPLE_HEADER_SIZE]);
+        scratch.extend_from_slice(new_payload);
+
+        // Insert the new tuple at the appended slot.
+        let new_slot = page.insert_tuple_appended(scratch)?;
+        let new_tid = TupleId::new(old_tid.page, new_slot);
+
+        // Patch the new tuple's ctid (self-reference) and the old
+        // tuple's header in place. Both writes hit known byte offsets
+        // — no `TupleHeader::decode` + `encode` round trip.
+        let page_bytes = page.as_bytes_mut();
+        let (new_off, _) = Self::slot_window(page_bytes, new_slot)?;
+
+        // New tuple ctid (bytes 32..40 relative to slot).
+        let ctid_rel_at = new_off + 32;
+        page_bytes[ctid_rel_at..ctid_rel_at + 4]
+            .copy_from_slice(&new_tid.page.relation.0.raw().to_le_bytes());
+        let block_slot_packed =
+            (new_tid.page.block.raw() & 0x00FF_FFFF) | ((u32::from(new_tid.slot)) << 24);
+        page_bytes[ctid_rel_at + 4..ctid_rel_at + 8]
+            .copy_from_slice(&block_slot_packed.to_le_bytes());
+
+        // Old tuple stamps: xmax | cmax | infomask |= HOT_UPDATED | ctid.
+        let xmax_at = old_off + 8;
+        page_bytes[xmax_at..xmax_at + 8].copy_from_slice(&opts.xid.raw().to_le_bytes());
+        let cmax_at = old_off + 20;
+        page_bytes[cmax_at..cmax_at + 4].copy_from_slice(&opts.command_id.raw().to_le_bytes());
+        let infomask_at = old_off + 24;
+        let cur_infomask =
+            u16::from_le_bytes([page_bytes[infomask_at], page_bytes[infomask_at + 1]]);
+        let new_infomask = cur_infomask | InfoMask::HOT_UPDATED;
+        page_bytes[infomask_at..infomask_at + 2].copy_from_slice(&new_infomask.to_le_bytes());
+        let old_ctid_at = old_off + 32;
+        page_bytes[old_ctid_at..old_ctid_at + 4]
+            .copy_from_slice(&new_tid.page.relation.0.raw().to_le_bytes());
+        page_bytes[old_ctid_at + 4..old_ctid_at + 8]
+            .copy_from_slice(&block_slot_packed.to_le_bytes());
 
         Ok(Some(new_tid))
     }

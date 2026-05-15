@@ -127,6 +127,23 @@ where
         let cache_key = trimmed; // already trimmed at function entry
         let cached_plan = self.stmt_cache.borrow().get(cache_key).cloned();
         if let Some(plan_arc) = cached_plan {
+            if matches!(self.txn_state, TxnState::Failed(_)) {
+                return Err(ServerError::TransactionAborted);
+            }
+            // Fast path: plans that bypass the optimizer never mutate
+            // the bound plan, so we can run them straight from the
+            // shared `Arc<LogicalPlan>` without paying
+            // `Arc::unwrap_or_clone`'s deep clone. The shared-OLAP
+            // workloads on `cross_compare_sql` hit this branch every
+            // iteration (the SQL key repeats and the lowered shape is
+            // always `is_scalar_aggregate_shape`); the legacy clone
+            // walked the entire `LogicalPlan` tree once per query.
+            if Self::is_trivial_insert_values(&plan_arc)
+                || Self::is_fused_update_shape(&plan_arc)
+                || Self::is_scalar_aggregate_shape(&plan_arc)
+            {
+                return self.run_dml_or_select(&plan_arc, &catalog_snapshot);
+            }
             let plan = Arc::unwrap_or_clone(plan_arc);
             return self.execute_bound_plan(plan, sql, catalog_snapshot);
         }
