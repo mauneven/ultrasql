@@ -49,16 +49,17 @@
 use ultrasql_core::{DataType, Field, Schema, Value};
 #[allow(unused_imports)] // BinaryOp and UnaryOp are used in binder/tests.rs via `use super::*`
 use ultrasql_parser::ast::{
-    BinaryOp, Distinct, SelectStmt, SetOp, SetQuantifier, Statement, UnaryOp,
+    BinaryOp, Distinct, LockStrength as AstLockStrength, LockWaitPolicy as AstLockWaitPolicy,
+    SelectStmt, SetOp, SetQuantifier, Statement, UnaryOp,
 };
 
 use crate::catalog::Catalog;
 use crate::error::PlanError;
 use crate::expr::ScalarExpr;
 use crate::plan::{
-    AggregateFunc, ConflictTarget, LogicalAggregateExpr, LogicalAlterTableAction,
-    LogicalJoinCondition, LogicalJoinType, LogicalOnConflict, LogicalPlan, LogicalSetOp,
-    LogicalSetQuantifier, SortKey,
+    AggregateFunc, ConflictTarget, LockStrength, LockWaitPolicy, LogicalAggregateExpr,
+    LogicalAlterTableAction, LogicalJoinCondition, LogicalJoinType, LogicalOnConflict, LogicalPlan,
+    LogicalSetOp, LogicalSetQuantifier, SortKey,
 };
 use crate::scope::{ScopeFrame, ScopeStack};
 
@@ -214,6 +215,30 @@ pub(super) fn bind_select(
             definition: Box::new(def_plan),
             body: Box::new(plan),
             schema: body_schema,
+        };
+    }
+
+    // FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE / FOR KEY SHARE
+    // When multiple locking clauses are present, only the first is used
+    // (PostgreSQL applies the strongest one; for v0.4 we take the first).
+    if let Some(locking) = select.locking.first() {
+        let strength = match locking.strength {
+            AstLockStrength::Update => LockStrength::Update,
+            AstLockStrength::NoKeyUpdate => LockStrength::NoKeyUpdate,
+            AstLockStrength::Share => LockStrength::Share,
+            AstLockStrength::KeyShare => LockStrength::KeyShare,
+        };
+        let wait_policy = match locking.wait_policy {
+            AstLockWaitPolicy::Wait => LockWaitPolicy::Wait,
+            AstLockWaitPolicy::NoWait => LockWaitPolicy::NoWait,
+            AstLockWaitPolicy::SkipLocked => LockWaitPolicy::SkipLocked,
+        };
+        let schema = plan.schema().clone();
+        plan = LogicalPlan::LockRows {
+            input: Box::new(plan),
+            strength,
+            wait_policy,
+            schema,
         };
     }
 

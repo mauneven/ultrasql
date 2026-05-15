@@ -175,6 +175,39 @@ pub enum LogicalOnConflict {
 }
 
 // ============================================================================
+// Locking
+// ============================================================================
+
+/// Row-level lock strength for `SELECT FOR UPDATE / FOR SHARE` variants.
+///
+/// Matches PostgreSQL's `LockClauseStrength` enum. Weaker modes block fewer
+/// concurrent operations; see the PostgreSQL manual §13.3.2 for the full
+/// compatibility matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockStrength {
+    /// `FOR UPDATE` — exclusive row lock.
+    Update,
+    /// `FOR NO KEY UPDATE` — like Update but does not conflict with KeyShare.
+    NoKeyUpdate,
+    /// `FOR SHARE` — shared lock; blocks concurrent writes.
+    Share,
+    /// `FOR KEY SHARE` — weakest shared; only blocks FOR UPDATE.
+    KeyShare,
+}
+
+/// Wait policy for a `FOR UPDATE / FOR SHARE` clause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LockWaitPolicy {
+    /// Block until lock available (default).
+    #[default]
+    Wait,
+    /// Raise an error immediately if any row is locked.
+    NoWait,
+    /// Silently skip rows that cannot be locked immediately.
+    SkipLocked,
+}
+
+// ============================================================================
 // LogicalPlan
 // ============================================================================
 
@@ -441,6 +474,26 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// Apply row-level locks to every row emitted by the input plan.
+    ///
+    /// This is the physical counterpart of `SELECT FOR UPDATE / FOR SHARE`
+    /// variants. The optimizer leaves the node in place; the executor wraps
+    /// the child operator with a [`ultrasql_executor::LockRows`] callback
+    /// that acquires the requested lock on each row's `TupleId` before
+    /// yielding the row to the caller.
+    ///
+    /// The `schema` flows through from `input` unchanged.
+    LockRows {
+        /// Child plan whose output rows will be locked.
+        input: Box<Self>,
+        /// Lock strength requested by the query.
+        strength: LockStrength,
+        /// What to do when a row cannot be locked immediately.
+        wait_policy: LockWaitPolicy,
+        /// Output schema (identical to `input.schema()`).
+        schema: Schema,
+    },
+
     /// Create a B+ tree index on one or more columns of a base table.
     ///
     /// The binder validates that `table_name` resolves in the catalog
@@ -660,6 +713,7 @@ impl LogicalPlan {
             | Self::Aggregate { schema, .. }
             | Self::SetOp { schema, .. }
             | Self::Cte { schema, .. }
+            | Self::LockRows { schema, .. }
             | Self::CreateIndex { schema, .. }
             | Self::DropTable { schema, .. }
             | Self::AlterTable { schema, .. }
@@ -995,6 +1049,27 @@ impl LogicalPlan {
                 let _ = fmt::write(out, format_args!("Cte{rec}: {name}\n"));
                 definition.display_into(indent + 2, out);
                 body.display_into(indent + 2, out);
+            }
+            Self::LockRows {
+                input,
+                strength,
+                wait_policy,
+                ..
+            } => {
+                out.push_str(&pad);
+                let s = match strength {
+                    LockStrength::Update => "UPDATE",
+                    LockStrength::NoKeyUpdate => "NO KEY UPDATE",
+                    LockStrength::Share => "SHARE",
+                    LockStrength::KeyShare => "KEY SHARE",
+                };
+                let w = match wait_policy {
+                    LockWaitPolicy::Wait => "",
+                    LockWaitPolicy::NoWait => " NOWAIT",
+                    LockWaitPolicy::SkipLocked => " SKIP LOCKED",
+                };
+                let _ = fmt::write(out, format_args!("LockRows: FOR {s}{w}\n"));
+                input.display_into(indent + 2, out);
             }
             Self::CreateIndex {
                 index_name,

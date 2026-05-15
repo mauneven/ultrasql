@@ -276,6 +276,7 @@ impl<'s> CostModel<'s> {
             }
 
             LogicalPlan::Cte { body, .. } => self.estimate(body),
+            LogicalPlan::LockRows { input, .. } => self.estimate(input),
 
             // DML / DDL / source / transaction-control nodes: neutral
             // estimate (rows and cost = 0).

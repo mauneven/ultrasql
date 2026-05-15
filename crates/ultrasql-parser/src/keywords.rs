@@ -210,6 +210,11 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("nullif", TokenKind::KwNullif),
         ("overlaps", TokenKind::KwOverlaps),
         ("zone", TokenKind::KwZone),
+        // SELECT locking keywords added for v0.4
+        ("locked", TokenKind::KwLocked),
+        ("nowait", TokenKind::KwNowait),
+        ("share", TokenKind::KwShare),
+        ("skip", TokenKind::KwSkip),
     ];
 
     entries.iter().copied().collect()

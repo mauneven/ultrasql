@@ -367,6 +367,15 @@ pub enum TokenKind {
     KwOverlaps,
     /// `ZONE` — used in `AT TIME ZONE`.
     KwZone,
+    // ---- SELECT locking keywords added for v0.4 ----------------------------
+    /// `LOCKED` — `SKIP LOCKED` wait policy.
+    KwLocked,
+    /// `NOWAIT` — `FOR UPDATE NOWAIT` wait policy.
+    KwNowait,
+    /// `SHARE` — `FOR SHARE` lock strength.
+    KwShare,
+    /// `SKIP` — `SKIP LOCKED` wait policy.
+    KwSkip,
 }
 
 impl TokenKind {

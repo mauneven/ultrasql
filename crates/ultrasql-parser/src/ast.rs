@@ -737,8 +737,50 @@ pub struct SelectStmt {
     pub set_ops: Vec<SetOpTail>,
     /// Leading `WITH [RECURSIVE]` CTEs.
     pub ctes: Vec<Cte>,
+    /// `FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY SHARE`
+    /// locking clauses. Multiple clauses are permitted by PostgreSQL when
+    /// different `OF table` targets are given; we collect all of them.
+    pub locking: Vec<LockingClause>,
     /// Source span.
     pub span: Span,
+}
+
+/// `FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` / `FOR KEY SHARE`.
+///
+/// Describes the row-level lock strength requested by a `SELECT` statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockStrength {
+    /// `FOR UPDATE` — exclusive row lock; blocks concurrent writers.
+    Update,
+    /// `FOR NO KEY UPDATE` — like Update but does not block `KeyShare` locks.
+    NoKeyUpdate,
+    /// `FOR SHARE` — shared lock; blocks concurrent writes, not other reads.
+    Share,
+    /// `FOR KEY SHARE` — weakest; only blocks `FOR UPDATE`.
+    KeyShare,
+}
+
+/// What to do when a requested lock is unavailable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum LockWaitPolicy {
+    /// Block until the lock can be acquired (default).
+    #[default]
+    Wait,
+    /// Raise an error immediately if any row is locked.
+    NoWait,
+    /// Silently skip rows that are currently locked.
+    SkipLocked,
+}
+
+/// One `FOR …` locking clause in a `SELECT` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockingClause {
+    /// Lock strength requested.
+    pub strength: LockStrength,
+    /// Wait policy when a lock cannot be acquired immediately.
+    pub wait_policy: LockWaitPolicy,
+    /// Optional `OF table [, …]` targets; empty means all relations in `FROM`.
+    pub of_tables: Vec<ObjectName>,
 }
 
 /// DISTINCT / DISTINCT ON / ALL / (implicit none).

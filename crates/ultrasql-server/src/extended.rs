@@ -782,6 +782,9 @@ fn infer_into(
             infer_into(definition, catalog, out);
             infer_into(body, catalog, out);
         }
+        LogicalPlan::LockRows { input, .. } => {
+            infer_into(input, catalog, out);
+        }
     }
 }
 
@@ -1024,6 +1027,9 @@ fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut F) {
         } => {
             walk_plan_exprs(definition, f);
             walk_plan_exprs(body, f);
+        }
+        LogicalPlan::LockRows { input, .. } => {
+            walk_plan_exprs(input, f);
         }
     }
 }
@@ -1436,6 +1442,17 @@ where
             recursive: *recursive,
             definition: Box::new(map_plan_exprs(definition, f)),
             body: Box::new(map_plan_exprs(body, f)),
+            schema: schema.clone(),
+        },
+        LogicalPlan::LockRows {
+            input,
+            strength,
+            wait_policy,
+            schema,
+        } => LogicalPlan::LockRows {
+            input: Box::new(map_plan_exprs(input, f)),
+            strength: *strength,
+            wait_policy: *wait_policy,
             schema: schema.clone(),
         },
     }

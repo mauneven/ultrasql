@@ -359,6 +359,23 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
             }))
         }
 
+        LogicalPlan::LockRows {
+            input,
+            strength,
+            wait_policy,
+            schema,
+        } => {
+            fold_plan(input)?.map(|i| {
+                Ok(Some(LogicalPlan::LockRows {
+                    input: Box::new(i),
+                    strength: *strength,
+                    wait_policy: *wait_policy,
+                    schema: schema.clone(),
+                }))
+            })
+            .unwrap_or(Ok(None))
+        }
+
         // Leaf nodes with no reachable expressions to fold.
         LogicalPlan::Scan { .. }
         | LogicalPlan::Empty { .. }

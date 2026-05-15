@@ -21,8 +21,9 @@
 //! optimizer in a later wave. Do not remove this comment until that work lands.
 
 use crate::ast::{
-    Cte, Distinct, Expr, Identifier, JoinCondition, JoinOp, NullsOrder, ObjectName, OrderItem,
-    SelectItem, SelectStmt, SetOp, SetOpTail, SetQuantifier, SortDirection, TableRef,
+    Cte, Distinct, Expr, Identifier, JoinCondition, JoinOp, LockStrength, LockWaitPolicy,
+    LockingClause, NullsOrder, ObjectName, OrderItem, SelectItem, SelectStmt, SetOp, SetOpTail,
+    SetQuantifier, SortDirection, TableRef,
 };
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
@@ -116,6 +117,9 @@ impl Parser<'_> {
         // chain. The binder will enforce proper precedence.
         let set_ops = self.parse_set_op_tails(recursive)?;
 
+        // FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE / FOR KEY SHARE
+        let locking = self.parse_locking_clauses()?;
+
         let end = self.peek()?.span.start;
         let span = Span::new(stmt_start, end);
 
@@ -131,6 +135,7 @@ impl Parser<'_> {
             offset,
             set_ops,
             ctes,
+            locking,
             span,
         })
     }
@@ -458,6 +463,87 @@ impl Parser<'_> {
         Ok(tails)
     }
 
+    /// Parse zero or more `FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE /
+    /// FOR KEY SHARE` locking clauses.
+    ///
+    /// Grammar per PostgreSQL:
+    /// ```text
+    /// FOR { UPDATE | NO KEY UPDATE | SHARE | KEY SHARE }
+    ///   [ OF table [, …] ]
+    ///   [ NOWAIT | SKIP LOCKED ]
+    /// ```
+    fn parse_locking_clauses(&mut self) -> Result<Vec<LockingClause>, ParseError> {
+        let mut clauses = Vec::new();
+        while self.peek()?.kind == TokenKind::KwFor {
+            self.advance()?; // consume FOR
+            let strength = match self.peek()?.kind {
+                TokenKind::KwUpdate => {
+                    self.advance()?;
+                    LockStrength::Update
+                }
+                TokenKind::KwShare => {
+                    self.advance()?;
+                    LockStrength::Share
+                }
+                TokenKind::KwNo => {
+                    // FOR NO KEY UPDATE
+                    self.advance()?; // NO
+                    self.expect(TokenKind::KwKey, "KEY")?;
+                    self.expect(TokenKind::KwUpdate, "UPDATE")?;
+                    LockStrength::NoKeyUpdate
+                }
+                TokenKind::KwKey => {
+                    // FOR KEY SHARE
+                    self.advance()?; // KEY
+                    self.expect(TokenKind::KwShare, "SHARE")?;
+                    LockStrength::KeyShare
+                }
+                other => {
+                    let tok = self.advance()?;
+                    return Err(ParseError::Expected {
+                        expected: "UPDATE, SHARE, NO KEY UPDATE, or KEY SHARE after FOR",
+                        found: other,
+                        offset: tok.span.start as usize,
+                    });
+                }
+            };
+
+            // Optional OF table [, …]
+            let of_tables = if self.peek()?.kind == TokenKind::KwOf {
+                self.advance()?; // OF
+                let mut tables = vec![self.parse_object_name()?];
+                while self.peek()?.kind == TokenKind::Comma {
+                    self.advance()?;
+                    tables.push(self.parse_object_name()?);
+                }
+                tables
+            } else {
+                Vec::new()
+            };
+
+            // Optional NOWAIT or SKIP LOCKED
+            let wait_policy = match self.peek()?.kind {
+                TokenKind::KwNowait => {
+                    self.advance()?;
+                    LockWaitPolicy::NoWait
+                }
+                TokenKind::KwSkip => {
+                    self.advance()?; // SKIP
+                    self.expect(TokenKind::KwLocked, "LOCKED")?;
+                    LockWaitPolicy::SkipLocked
+                }
+                _ => LockWaitPolicy::Wait,
+            };
+
+            clauses.push(LockingClause {
+                strength,
+                wait_policy,
+                of_tables,
+            });
+        }
+        Ok(clauses)
+    }
+
     /// Parse just the SELECT body (no WITH clause) for the RHS of a set op.
     fn parse_select_body(&mut self, _recursive: bool) -> Result<SelectStmt, ParseError> {
         let start_tok = self.expect(TokenKind::KwSelect, "SELECT")?;
@@ -523,6 +609,7 @@ impl Parser<'_> {
             offset,
             set_ops: Vec::new(),
             ctes: Vec::new(),
+            locking: Vec::new(),
             span,
         })
     }
@@ -1294,5 +1381,62 @@ mod tests {
 
             prop_assert!(is_left_deep(&s.from[0]), "join tree is not left-deep");
         }
+    }
+
+    // -------- FOR UPDATE / FOR SHARE locking clauses ---------------------- //
+
+    #[test]
+    fn select_for_update() {
+        use crate::ast::{LockStrength, LockWaitPolicy};
+        let stmt = parse("SELECT id FROM users FOR UPDATE");
+        let Statement::Select(s) = stmt else { panic!() };
+        assert_eq!(s.locking.len(), 1);
+        assert_eq!(s.locking[0].strength, LockStrength::Update);
+        assert_eq!(s.locking[0].wait_policy, LockWaitPolicy::Wait);
+        assert!(s.locking[0].of_tables.is_empty());
+    }
+
+    #[test]
+    fn select_for_share_nowait() {
+        use crate::ast::{LockStrength, LockWaitPolicy};
+        let stmt = parse("SELECT id FROM users FOR SHARE NOWAIT");
+        let Statement::Select(s) = stmt else { panic!() };
+        assert_eq!(s.locking.len(), 1);
+        assert_eq!(s.locking[0].strength, LockStrength::Share);
+        assert_eq!(s.locking[0].wait_policy, LockWaitPolicy::NoWait);
+    }
+
+    #[test]
+    fn select_for_no_key_update_skip_locked() {
+        use crate::ast::{LockStrength, LockWaitPolicy};
+        let stmt = parse("SELECT id FROM t FOR NO KEY UPDATE SKIP LOCKED");
+        let Statement::Select(s) = stmt else { panic!() };
+        assert_eq!(s.locking[0].strength, LockStrength::NoKeyUpdate);
+        assert_eq!(s.locking[0].wait_policy, LockWaitPolicy::SkipLocked);
+    }
+
+    #[test]
+    fn select_for_key_share() {
+        use crate::ast::{LockStrength, LockWaitPolicy};
+        let stmt = parse("SELECT id FROM t FOR KEY SHARE");
+        let Statement::Select(s) = stmt else { panic!() };
+        assert_eq!(s.locking[0].strength, LockStrength::KeyShare);
+        assert_eq!(s.locking[0].wait_policy, LockWaitPolicy::Wait);
+    }
+
+    #[test]
+    fn select_for_update_of_table() {
+        use crate::ast::LockStrength;
+        let stmt = parse("SELECT * FROM t FOR UPDATE OF t");
+        let Statement::Select(s) = stmt else { panic!() };
+        assert_eq!(s.locking[0].strength, LockStrength::Update);
+        assert_eq!(s.locking[0].of_tables.len(), 1);
+    }
+
+    #[test]
+    fn select_without_locking_has_empty_vec() {
+        let stmt = parse("SELECT 1");
+        let Statement::Select(s) = stmt else { panic!() };
+        assert!(s.locking.is_empty());
     }
 }

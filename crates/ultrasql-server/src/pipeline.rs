@@ -261,6 +261,16 @@ pub fn lower_plan(
             )))
         }
         LogicalPlan::Cte { .. } => Err(ServerError::Unsupported("WITH (CTE)")),
+        LogicalPlan::LockRows { input, .. } => {
+            // Sample-table path: no live transaction manager, so the
+            // lock callback is a no-op. The operator still passes rows
+            // through, which lets tests exercise the pipeline.
+            let child = lower_plan(input, tables)?;
+            Ok(Box::new(ultrasql_executor::LockRows::new(
+                child,
+                Box::new(|_, _| Ok(())),
+            )))
+        }
     }
 }
 
@@ -769,6 +779,20 @@ pub fn lower_query(
             body,
             ..
         } => lower_cte(name, *recursive, definition, body, ctx),
+        LogicalPlan::LockRows { input, .. } => {
+            // Production path: lower the child through the real-heap-aware
+            // path, then wrap with LockRows. The lock-acquisition callback
+            // is a no-op here; the server's session layer is responsible
+            // for replacing it with a live TxnManager callback before
+            // executing a genuine `SELECT FOR UPDATE` over a persistent
+            // relation. For the in-memory fixture path the no-op is correct
+            // (no concurrent writers, no need to acquire row locks).
+            let child = lower_query(input, ctx)?;
+            Ok(Box::new(ultrasql_executor::LockRows::new(
+                child,
+                Box::new(|_, _| Ok(())),
+            )))
+        }
     }
 }
 

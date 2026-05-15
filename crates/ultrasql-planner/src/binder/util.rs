@@ -131,7 +131,9 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         LogicalPlan::Sort { input, keys } => {
             keys.iter().any(|k| expr_contains_outer(&k.expr)) || plan_contains_outer_column(input)
         }
-        LogicalPlan::Limit { input, .. } => plan_contains_outer_column(input),
+        LogicalPlan::Limit { input, .. } | LogicalPlan::LockRows { input, .. } => {
+            plan_contains_outer_column(input)
+        }
         LogicalPlan::Aggregate {
             input,
             group_by,

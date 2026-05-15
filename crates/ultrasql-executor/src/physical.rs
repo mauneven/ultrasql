@@ -34,6 +34,7 @@ use crate::cte_scan::CteScan;
 use crate::filter_op::Filter;
 use crate::hash_aggregate::HashAggregate;
 use crate::hash_join::HashJoin;
+use crate::lock_rows::LockRows;
 use crate::merge_join::MergeJoin;
 use crate::nested_loop_join::{NestedLoopJoin, RightFactory};
 use crate::set_op::SetOp;
@@ -238,6 +239,16 @@ pub fn build_operator(
                 *quantifier,
                 schema.clone(),
             )))
+        }
+
+        LogicalPlan::LockRows { input, .. } => {
+            // Build the child operator. The lock-acquisition callback is
+            // wired by the server layer (which has access to the TxnManager)
+            // after construction; here we emit a no-op callback so the
+            // operator pipeline is complete and testable without a live
+            // transaction manager.
+            let child = build_operator(input, data_source)?;
+            Ok(Box::new(LockRows::new(child, Box::new(|_, _| Ok(())))))
         }
 
         LogicalPlan::Cte {
