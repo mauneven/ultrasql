@@ -204,11 +204,16 @@ impl SsiManager {
         }
 
         // For each (T1, T3) pair check whether the structure is dangerous.
+        //
+        // T1 and T3 may be the *same* other transaction: a 2-tx write-skew
+        // shows up as `pivot.in_set = pivot.out_set = {Tx}`, which the
+        // Cahill SSI paper and PostgreSQL's `predicate.c` both treat as a
+        // dangerous structure (the cycle is `pivot ↔ Tx`). The pivot
+        // itself is excluded because a self-conflict cannot exist (MVCC
+        // never sees its own writes).
         for t1 in &in_set {
             for t3 in &out_set {
-                // A transaction cannot be both T1 and T3 in the same structure
-                // (that would require a self-conflict which MVCC prevents).
-                if t1 == t3 {
+                if *t1 == xid || *t3 == xid {
                     continue;
                 }
 

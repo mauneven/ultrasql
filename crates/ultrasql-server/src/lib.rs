@@ -61,7 +61,7 @@ use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::page::Page;
-use ultrasql_txn::{Transaction, TransactionManager};
+use ultrasql_txn::{SsiManager, Transaction, TransactionManager};
 
 pub use error::ServerError;
 pub use pipeline::{LowerCtx, SampleTables, build_sample_database};
@@ -310,7 +310,8 @@ impl Server {
             }
         }
 
-        let txn_manager = Arc::new(TransactionManager::new());
+        let ssi = Arc::new(SsiManager::new());
+        let txn_manager = Arc::new(TransactionManager::new_with_ssi(ssi));
         let plan_cache = Arc::new(PlanCache::new(PlanCacheConfig::default()));
 
         // Per-process tempdir for the 2PC coordinator. Production
@@ -429,7 +430,8 @@ impl Server {
 
         let mut catalog = InMemoryCatalog::new();
         let tables = build_sample_database(&mut catalog);
-        let txn_manager = Arc::new(TransactionManager::new());
+        let ssi = Arc::new(SsiManager::new());
+        let txn_manager = Arc::new(TransactionManager::new_with_ssi(ssi));
         let plan_cache = Arc::new(PlanCache::new(PlanCacheConfig::default()));
         let two_phase_dir = data_dir.join("pg_twophase");
         std::fs::create_dir_all(&two_phase_dir)

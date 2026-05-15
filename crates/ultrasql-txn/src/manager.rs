@@ -279,6 +279,20 @@ impl TransactionManager {
         }
     }
 
+    /// Register an existing in-flight transaction as serializable.
+    ///
+    /// Invoked by `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` on a
+    /// transaction that began at a weaker level. No-op when no
+    /// [`SsiManager`] is installed; otherwise inserts `xid` into the
+    /// SSI conflict graph so subsequent rw-conflicts are tracked.
+    /// Idempotent — re-registering a known xid is a no-op inside the
+    /// SSI manager.
+    pub fn register_serializable(&self, xid: Xid) {
+        if let Some(ssi) = &self.ssi {
+            ssi.register_xid(xid);
+        }
+    }
+
     /// Refresh `txn`'s snapshot.
     ///
     /// The behaviour depends on `txn.isolation`:

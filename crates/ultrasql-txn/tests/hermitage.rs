@@ -16,17 +16,14 @@
 //! | G2-item | Write skew on item            | Prevented at Serializable|
 //! | G2      | Anti-dependency cycle         | Prevented at Serializable|
 //!
-//! Each test is marked `#[ignore]` so the suite acts as a gate:
-//! - `cargo test --package ultrasql-txn -- hermitage` runs nothing (skeleton).
-//! - `cargo test --package ultrasql-txn -- hermitage --include-ignored` runs
-//!   all anomaly tests when the full execution engine is ready.
-//!
 //! Each test drives [`TransactionManager`] directly. The "tuple visibility"
 //! assertions are proxied through the [`XidStatusOracle`] and snapshot
-//! visibility predicates until the executor layer is wired. The canonical
-//! Hermitage assertions (read value X, see Y) require a real heap; until
-//! then the tests assert the *transactional outcome* (commit / abort)
-//! rather than the data values.
+//! visibility predicates rather than reading from a real heap. The
+//! canonical Hermitage assertions (read value X, see Y) need a real heap;
+//! until the executor-layer round-trip lands, these tests assert the
+//! *transactional outcome* (commit / abort, snapshot frozen / refreshed)
+//! rather than the data values, which is sufficient to detect every
+//! anomaly listed above except those that depend on observed read values.
 
 use std::sync::Arc;
 
@@ -56,7 +53,6 @@ fn mgr_ser() -> Arc<TransactionManager> {
 /// At the `TxnManager` level we assert that both T1 and T2 can begin and
 /// terminate without corrupting the CLOG (no double-commit).
 #[test]
-#[ignore = "full Hermitage gate — enable when executor layer is wired"]
 fn g0_dirty_write_prevented() {
     let mgr = mgr_rr();
 
@@ -79,7 +75,6 @@ fn g0_dirty_write_prevented() {
 /// `abort(t1)`, so any snapshot-based visibility check will exclude T1's
 /// writes.
 #[test]
-#[ignore = "full Hermitage gate — enable when executor layer is wired"]
 fn g1a_dirty_read_prevented() {
     let mgr = mgr_rr();
 
@@ -118,7 +113,6 @@ fn g1a_dirty_read_prevented() {
 /// until T1 commits. All of T1's writes share T1's XID in xmin; the
 /// snapshot sees them all or none.
 #[test]
-#[ignore = "full Hermitage gate — enable when executor layer is wired"]
 fn g1b_intermediate_read_prevented() {
     let mgr = mgr_rr();
 
@@ -151,7 +145,6 @@ fn g1b_intermediate_read_prevented() {
 /// With SSI the cycle is detected as a dangerous structure and at least
 /// one transaction is aborted.
 #[test]
-#[ignore = "full Hermitage gate — enable when executor layer is wired"]
 fn g1c_circular_information_flow_prevented_at_serializable() {
     use ultrasql_core::RelationId;
     use ultrasql_txn::PredicateLockTag;
@@ -188,7 +181,6 @@ fn g1c_circular_information_flow_prevented_at_serializable() {
 /// Under MVCC this is guaranteed: T2's snapshot cannot see T1's writes
 /// until T1 commits.
 #[test]
-#[ignore = "full Hermitage gate — enable when executor layer is wired"]
 fn otv_observed_transaction_vanishes_prevented() {
     let mgr = mgr_rr();
 
@@ -224,7 +216,6 @@ fn otv_observed_transaction_vanishes_prevented() {
 /// Under RR, T1's snapshot is frozen: T2's XID is above T1's xmax or in
 /// T1's xip, so T2's tuples are invisible.
 #[test]
-#[ignore = "full Hermitage gate — enable when executor layer is wired"]
 fn pmp_predicate_many_preceders_prevented_at_rr() {
     let mgr = mgr_rr();
 
@@ -261,7 +252,6 @@ fn pmp_predicate_many_preceders_prevented_at_rr() {
 /// At the `TxnManager` level we verify that both transactions can be
 /// properly sequenced without CLOG corruption.
 #[test]
-#[ignore = "full Hermitage gate — enable when executor layer is wired"]
 fn p4_lost_update_prevented_at_rr() {
     let mgr = mgr_rr();
 
@@ -283,22 +273,32 @@ fn p4_lost_update_prevented_at_rr() {
 /// Under RR, T1's snapshot is frozen at begin so it always sees the
 /// pre-T2 state of both A and B.
 #[test]
-#[ignore = "full Hermitage gate — enable when executor layer is wired"]
 fn g_single_read_skew_prevented_at_rr() {
     let mgr = mgr_rr();
 
     // T1 begins with a frozen snapshot.
     let t1 = mgr.begin(IsolationLevel::RepeatableRead);
+    let t1_xmax = t1.snapshot.xmax;
+
+    // T2 begins *after* T1, so T2.xid is past T1's xmax — invisible
+    // by the snapshot xmax cutoff (not by being listed in xip).
     let t2 = mgr.begin(IsolationLevel::RepeatableRead);
     let t2_xid = t2.xid;
+    assert!(
+        t2_xid >= t1_xmax,
+        "T2 began after T1's snapshot — its xid must be past T1's xmax"
+    );
 
     // T2 commits (updating A and B atomically from T1's perspective).
     mgr.commit(t2).unwrap();
 
-    // T1's frozen snapshot still lists T2 as in-progress.
-    assert!(
-        t1.snapshot.xip.contains(&t2_xid),
-        "T1 must still see T2 as in-progress (frozen snapshot)"
+    // T1's frozen snapshot under RR must not advance. Refresh is a no-op
+    // for xmax — T2 stays invisible to T1.
+    let mut t1 = t1;
+    mgr.refresh_snapshot(&mut t1);
+    assert_eq!(
+        t1.snapshot.xmax, t1_xmax,
+        "RR snapshot xmax must not advance on refresh — T2 stays invisible"
     );
 
     mgr.commit(t1).unwrap();
@@ -312,7 +312,6 @@ fn g_single_read_skew_prevented_at_rr() {
 ///
 /// Under Serializable SSI must detect and abort one transaction.
 #[test]
-#[ignore = "full Hermitage gate — enable when executor layer is wired"]
 fn g2_item_write_skew_on_item_prevented_at_serializable() {
     use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
     use ultrasql_txn::PredicateLockTag;
@@ -350,7 +349,6 @@ fn g2_item_write_skew_on_item_prevented_at_serializable() {
 /// This three-transaction version (T1 → T2 → T3 → T1) is the canonical
 /// SSI dangerous structure test.
 #[test]
-#[ignore = "full Hermitage gate — enable when executor layer is wired"]
 fn g2_anti_dependency_cycle_prevented_at_serializable() {
     use ultrasql_core::RelationId;
     use ultrasql_txn::PredicateLockTag;
