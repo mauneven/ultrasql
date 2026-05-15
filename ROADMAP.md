@@ -584,7 +584,7 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] Central lock table: `DashMap<LockTag, LockEntry>` with wait-for graph
 - [x] Deadlock detector background thread (configurable interval, default 1 s)
 - [x] Tuple-level locks for concurrent updates (LockTag::Tuple supported)
-- [ ] `SELECT FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` end-to-end (executor wiring + lower_query arm)
+- [x] `SELECT FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` end-to-end (executor wiring + lower_query arm) (parser → planner → executor → server `847b3de`)
 - [x] Advisory locks: `pg_advisory_lock`, `pg_try_advisory_lock` (LockTag::Advisory; SQL surface still TODO)
 
 ### SSI (Serializable Snapshot Isolation)
@@ -666,7 +666,7 @@ driver can connect.
 - [x] `Unique` — kernel exists (`unique.rs`); ⚠️ DISTINCT wire path pending
 - [x] `SetOp` (UNION/INTERSECT/EXCEPT) — kernel + wired; `setop_round_trip.rs` covers UNION, UNION ALL, INTERSECT, INTERSECT ALL
 - [ ] `RecursiveUnion` (WITH RECURSIVE) — wire path
-- [x] `LockRows` — kernel exists (`lock_rows.rs`); ⚠️ SELECT FOR UPDATE wire path pending
+- [x] `LockRows` — kernel exists (`lock_rows.rs`); wire path complete `847b3de`
 - [x] `Materialize` — kernel exists (`materialize.rs`); ⚠️ not yet selected by planner
 - [ ] `Gather` / `GatherMerge` (parallel query)
 - [ ] `Append` / `MergeAppend` (partition scans)

@@ -33,6 +33,7 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          - parser_fuzz
           - lexer
           - wire-protocol
           - wal-record
