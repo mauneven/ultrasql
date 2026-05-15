@@ -168,7 +168,10 @@ mod tests {
     fn registry_register_returns_nonzero_secret() {
         let reg = CancelRegistry::new();
         let (_, secret) = reg.register(CancelFlag::new());
-        assert_ne!(secret, 0, "secret must never be the trivially-forgeable zero");
+        assert_ne!(
+            secret, 0,
+            "secret must never be the trivially-forgeable zero"
+        );
     }
 
     #[test]

@@ -137,39 +137,48 @@ where
     /// The kernel work is split into four steps:
     ///
     /// 1. Validate the request against the current catalog snapshot —
-    ///    `IF NOT EXISTS`, presence of the parent table, key-column
-    ///    type compatibility with the B-tree (currently only fixed-size
-    ///    8-byte keys are stored, so `Int64` is the natural domain;
-    ///    `Int32` keys are widened to `i64` before insertion).
+    ///    `IF NOT EXISTS`, presence of the parent table, and key-column
+    ///    type compatibility with the B-tree (the v0.5 tree stores
+    ///    fixed-size 8-byte keys, so every supported column type is
+    ///    mapped into an `i64` by the
+    ///    [`crate::index_key::IndexKeyEncoding`] this method picks).
     /// 2. Allocate a fresh OID for the index and instantiate a new
     ///    [`BTree`] over a relation id derived from that OID. The
     ///    buffer pool's blank-page loader hands out empty heap pages
     ///    which `BTree::create` then initialises as B-tree leaves.
     /// 3. Scan every visible row of the parent table under an
-    ///    autocommit snapshot, decode the key column, and call
+    ///    autocommit snapshot, decode the key column(s), and call
     ///    [`BTree::insert`] with the row's [`ultrasql_core::TupleId`].
     /// 4. Build an [`IndexEntry`] carrying the root block plus the
     ///    requested attnums, register it with the persistent catalog,
     ///    and let the catalog's snapshot rotation publish the entry to
     ///    subsequent statements.
     ///
-    /// # Sub-shape gaps documented for reviewers
+    /// # Supported key shapes
     ///
-    /// - Only single-column indexes are built today. The binder
-    ///   accepts multi-column lists for completeness (so a follow-up
-    ///   can flip the kernel restriction without re-binding) but the
-    ///   server rejects them here.
-    /// - Only `Int32` / `Int64` key types are supported. Other types
-    ///   (text, float, bool) would require a richer [`BTree`] key
-    ///   trait; the build returns
-    ///   [`ServerError::Unsupported`] for them.
+    /// - Single column of `Int16`, `Int32`, `Int64`, `Bool`,
+    ///   `Timestamp`, `TimestampTz`, `Float32`, `Float64`, or `Text`.
+    ///   See [`crate::index_key::IndexKeyEncoding`] for the per-type
+    ///   mapping. `Text` columns are truncated to their first 8 UTF-8
+    ///   bytes; collisions are resolved by a heap-side recheck during
+    ///   index probes.
+    /// - Two columns of `Bool` / `Int16` / `Int32` packed into a single
+    ///   `i64` (`hi << 32 | lo`). Composite probes are recheck-filtered
+    ///   to drop bit-pattern collisions.
+    /// - Indexes over three or more columns, over wider integer halves,
+    ///   and over float / text composites still return
+    ///   [`ServerError::Unsupported`] — they require a `Vec<u8>`-keyed
+    ///   B-tree, scheduled for the v0.7 wave.
+    ///
+    /// # Other gaps
+    ///
     /// - `UNIQUE` is honoured at the catalog level — the
     ///   [`IndexEntry::is_unique`] flag is propagated — but the
     ///   B-tree's existing duplicate-key rejection is the only
     ///   enforcement. Non-unique indexes that happen to have unique
     ///   data still build correctly; non-unique indexes with
-    ///   duplicates would error here, which is a known limitation
-    ///   we accept until the B-tree gains a non-unique mode.
+    ///   duplicates would error here, which is a known limitation we
+    ///   accept until the B-tree gains a non-unique mode.
     pub(crate) fn execute_create_index(
         &self,
         plan: &LogicalPlan,
@@ -206,28 +215,13 @@ where
             ))
         })?;
 
-        // 1c. Validate the key columns. Only one column, only Int32 /
-        //     Int64 — see the doc comment for the rationale.
-        if columns.len() != 1 {
-            return Err(ServerError::Unsupported(
-                "CREATE INDEX: only single-column indexes are supported in this wave",
-            ));
-        }
+        // 1c. Pick an i64 encoding for the requested key shape. The
+        //     encoding is shared with the IndexScan probe path via
+        //     `pipeline::key_encoding_for_btree` — keep the two
+        //     resolutions consistent or a freshly built index will be
+        //     unprobe-able.
+        let encoding = crate::index_key::IndexKeyEncoding::for_columns(&table.schema, columns)?;
         let key_col_idx = columns[0];
-        let key_field = table.schema.field(key_col_idx).ok_or_else(|| {
-            ServerError::Plan(ultrasql_planner::PlanError::ColumnNotFound(format!(
-                "column index {key_col_idx} in table {table_name}"
-            )))
-        })?;
-        let widen_i32 = match key_field.data_type {
-            DataType::Int32 => true,
-            DataType::Int64 => false,
-            _ => {
-                return Err(ServerError::Unsupported(
-                    "CREATE INDEX: only Int32 / Int64 key columns are supported in this wave",
-                ));
-            }
-        };
 
         // 2. Allocate an OID and instantiate the B-tree.
         let index_oid = self.state.persistent_catalog.next_oid();
@@ -238,9 +232,15 @@ where
         let root_block = btree.root_block();
 
         // 3. Scan the heap and populate the tree.
-        let key_attnum = u16::try_from(key_col_idx).map_err(|_| {
-            ServerError::Unsupported("CREATE INDEX: column index does not fit in u16 attnum field")
-        })?;
+        let mut attnums: Vec<u16> = Vec::with_capacity(columns.len());
+        for &col in columns {
+            let attnum = u16::try_from(col).map_err(|_| {
+                ServerError::Unsupported(
+                    "CREATE INDEX: column index does not fit in u16 attnum field",
+                )
+            })?;
+            attnums.push(attnum);
+        }
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let table_rel = RelationId(table.oid);
         let block_count = self.state.heap.block_count(table_rel).max(table.n_blocks);
@@ -255,7 +255,7 @@ where
             for result in scan {
                 let tup =
                     result.map_err(|e| ServerError::ddl(format!("CREATE INDEX heap scan: {e}")))?;
-                let row = decode_key_column(&tup.data, &table.schema, key_col_idx, widen_i32)?;
+                let row = decode_key_column(&tup.data, &table.schema, key_col_idx, &encoding)?;
                 if let Some(key) = row {
                     btree
                         .insert(key, tup.tid, txn.xid, None)
@@ -281,7 +281,6 @@ where
         //    `IndexEntry` stores 0-based positions internally, so the
         //    cast is direct. We override `root_block` to match the
         //    freshly built tree.
-        let attnums: Vec<u16> = vec![key_attnum];
         let mut entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, *unique);
         entry.root_block = root_block;
         self.state.persistent_catalog.create_index(entry)?;

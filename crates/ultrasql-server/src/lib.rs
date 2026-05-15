@@ -38,9 +38,11 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod auth;
+pub mod cancel;
 pub mod copy;
 pub mod error;
 pub mod extended;
+pub mod index_key;
 pub mod notify;
 pub mod pipeline;
 pub mod result_encoder;
@@ -763,26 +765,25 @@ fn decode_key_column(
     bytes: &[u8],
     schema: &ultrasql_core::Schema,
     col_idx: usize,
-    widen_i32: bool,
+    encoding: &index_key::IndexKeyEncoding,
 ) -> Result<Option<i64>, ServerError> {
     let codec = ultrasql_executor::RowCodec::new(schema.clone());
     let row = codec
         .decode(bytes)
         .map_err(|e| ServerError::ddl(format!("CREATE INDEX key decode: {e}")))?;
+    if matches!(
+        encoding,
+        index_key::IndexKeyEncoding::CompositeTwoInts { .. }
+    ) {
+        return encoding.encode_row(&row);
+    }
     let value = row.get(col_idx).ok_or_else(|| {
         ServerError::ddl(format!(
             "CREATE INDEX key column {col_idx} missing from decoded row of arity {}",
             row.len()
         ))
     })?;
-    match (value, widen_i32) {
-        (Value::Null, _) => Ok(None),
-        (Value::Int32(v), true) => Ok(Some(i64::from(*v))),
-        (Value::Int64(v), false) => Ok(Some(*v)),
-        _ => Err(ServerError::ddl(format!(
-            "CREATE INDEX key column {col_idx} has unexpected runtime type"
-        ))),
-    }
+    encoding.encode_value(value)
 }
 
 #[cfg(test)]
