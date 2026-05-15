@@ -385,6 +385,7 @@ pub(super) fn lower_cte(
         command_id: ctx.command_id,
         cte_buffers: child_buffers,
             cancel_flag: ctx.cancel_flag.clone(),
+            work_mem: std::sync::Arc::clone(&ctx.work_mem),
     };
 
     lower_query(body, &child_ctx)

@@ -747,6 +747,7 @@ fn run_plan_in_txn(
         command_id: txn.current_command,
         cte_buffers: std::collections::HashMap::new(),
         cancel_flag,
+        work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
     };
     match plan {
         LogicalPlan::Insert { .. } => {

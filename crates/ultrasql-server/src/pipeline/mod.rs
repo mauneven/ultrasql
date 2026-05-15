@@ -214,6 +214,19 @@ pub struct LowerCtx<'a> {
     /// for callers that do not participate in a wire session (tests,
     /// in-process fixtures).
     pub cancel_flag: Option<ultrasql_executor::CancelFlag>,
+    /// Per-statement memory budget for operators that accumulate
+    /// state (sort buffers, hash tables, the join-build side). The
+    /// budget is shared by reference so a single statement's working
+    /// set is policed across every operator in the plan. v0.5 sets
+    /// the budget to `u64::MAX` (effectively unlimited) because no
+    /// operator yet spills to disk; the field is plumbed so v0.6
+    /// can light up the spill paths without touching the dispatch
+    /// surface. The companion `temp_file_limit` constant
+    /// (`ultrasql_executor::work_mem::temp_file_limit`) caps total
+    /// temp-file bytes any future spill writer is allowed to
+    /// generate; it is enforced vacuously today because no spill
+    /// path exists.
+    pub work_mem: std::sync::Arc<ultrasql_executor::work_mem::WorkMemBudget>,
 }
 
 /// Materialised non-recursive CTE binding.

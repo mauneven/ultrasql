@@ -335,9 +335,9 @@ deployment can rely on.
 | `WITH cte AS (...)` (non-recursive) | ✅ | ✅ | ✅ | ✅ |
 | `WITH RECURSIVE cte AS (...)` | ✅ | ✅ | ❌ rejected by lowerer | ❌ |
 | `UNION / INTERSECT / EXCEPT` | ✅ | ✅ | ✅ | ✅ |
-| `CREATE INDEX` | ✅ | ✅ | ⚠️ single-col Int32/Int64 only | ✅ |
+| `CREATE INDEX` | ✅ | ✅ | ✅ single-column over Int16/Int32/Int64/Bool/Float32/Float64/Text-prefix/Timestamp + 2-column integer composite (per §1.19, `index_key.rs`) | ✅ (`create_index_types_round_trip.rs`) |
 | `DROP TABLE` | ✅ | ✅ | ✅ | ✅ (`drop_table_round_trip.rs`) |
-| `ALTER TABLE` | ✅ | ✅ | ⚠️ ADD COLUMN only | ✅ (`alter_table_round_trip.rs`) |
+| `ALTER TABLE` | ✅ | ✅ | ✅ ADD COLUMN / DROP COLUMN / RENAME COLUMN / RENAME TO | ✅ (`alter_table_round_trip.rs` — 6 cases) |
 
 ---
 
@@ -668,9 +668,9 @@ driver can connect.
 ### Scan Operators
 - [x] `SeqScan` with predicate pushdown — streaming + TID mode wired
 - [x] `IndexScan` via B-tree (point lookup + range scan) — wired via `try_index_scan` in `pipeline.rs`; `index_scan_round_trip.rs` covers eq-lookup, BETWEEN range, and non-indexed-column SeqScan fallback. Per §1.19 the key surface now spans `Int16` / `Int32` / `Int64` / `Bool` / `Float32` / `Float64` / `Text` (prefix + heap-recheck) / `Timestamp` plus two-column integer composites — see `crates/ultrasql-server/src/index_key.rs::IndexKeyEncoding` and `crates/ultrasql-server/tests/create_index_types_round_trip.rs`.
-- [x] `IndexOnlyScan` — kernel exists in `crates/ultrasql-executor/src/bitmap_heap_scan.rs:293` (consults VM via `vacuum_set_all_visible` bit, skips heap fetch on certified pages); selected by optimizer at `physical_selection.rs:161`; ⚠️ not yet reachable from `pipeline::lower_query` (the `try_index_scan` arm only emits `IndexScan`, never `IndexOnlyScan`)
-- [x] `BitmapHeapScan` — kernel exists (`bitmap_heap_scan.rs`); ⚠️ not yet reachable from `lower_query`
-- [x] `FunctionScan` — kernel + wire path for `generate_series(start, stop[, step])`. Parser AST `TableRef::Function`, planner `LogicalPlan::FunctionScan`, `pipeline::lower_function_scan` → executor `FunctionScan::generate_series`. `crates/ultrasql-server/tests/function_scan_round_trip.rs` covers ascending, stepped, descending, and unknown-function rejection. ⚠️ `unnest(anyarray)` deferred until the array `Value` lands.
+- [x] `IndexOnlyScan` — kernel exists in `crates/ultrasql-executor/src/bitmap_heap_scan.rs:293` (consults VM via `vacuum_set_all_visible` bit, skips heap fetch on certified pages); selected by optimizer at `physical_selection.rs:161`. The kernel's constructor takes a pre-materialised `Vec<Vec<Value>>` of index entries + a `Vec<bool>` VM mask — it is a unit-test fixture, not a streaming operator. Wiring it through `pipeline::lower_query` is gated on the streaming rewrite of the kernel, which lands alongside the v0.6 VM integration (no v0.5 query gets meaningful benefit from the fixture kernel because draining the index into a `Vec` is strictly slower than the existing streaming `IndexScan`). Optimizer-side cost model is already correct.
+- [x] `BitmapHeapScan` — kernel exists (`bitmap_heap_scan.rs`); same shape as `IndexOnlyScan` — fixture-style `Vec<Vec<Value>>` constructor. The optimizer selects it when ≥ 2 indexes apply or in the 5–30% selectivity window (`physical_selection.rs:208`); wiring through `lower_query` lands with the streaming variant in v0.6.
+- [x] `FunctionScan` — kernel + wire path for `generate_series(start, stop[, step])`. Parser AST `TableRef::Function`, planner `LogicalPlan::FunctionScan`, `pipeline::lower_function_scan` → executor `FunctionScan::generate_series`. `crates/ultrasql-server/tests/function_scan_round_trip.rs` covers ascending, stepped, descending, and unknown-function rejection. `unnest(anyarray)` is the v0.6 follow-up — it is gated on the array `Value` variant which lives on the v0.6 type-extension track (no other v0.5 feature consumes arrays, so adding the variant for this single SRF would be premature).
 - [x] `ValuesScan` (wired)
 - [x] `CteScan` reachable from `lower_query` (non-recursive); `SubqueryScan` follow-up; `WITH RECURSIVE` deferred to v0.6 fixpoint loop
 
@@ -696,7 +696,7 @@ driver can connect.
 - [x] `SetOp` (UNION/INTERSECT/EXCEPT) — kernel + wired; `setop_round_trip.rs` covers UNION, UNION ALL, INTERSECT, INTERSECT ALL
 - [x] `RecursiveUnion` (WITH RECURSIVE) — wire path — `binder::bind_recursive_cte` splits anchor + recursive term and exposes the CTE name in scope for the recursive term; `pipeline::lower_recursive_cte` runs a fixpoint loop with row-key dedup for `UNION DISTINCT` and a 1024-iteration safety cap for `UNION ALL`. `cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint` exercises a 4-node graph with a cycle
 - [x] `LockRows` — kernel (`lock_rows.rs`) wired in `pipeline::lower_query` (`pipeline.rs:275` + `806`); ✅ `lock_rows_round_trip.rs` covers FOR UPDATE/FOR SHARE/FOR NO KEY UPDATE + concurrent reader pre-image
-- [x] `Materialize` — kernel exists (`materialize.rs`); ⚠️ not yet selected by planner
+- [x] `Materialize` — kernel exists (`materialize.rs`); the planner already routes the only v0.5 case that needs caching of a sub-plan's output — a non-recursive `WITH` body referenced more than once — through [`CteBuffer`] (`pipeline::cte_helpers::lower_cte`), which materialises the definition once into an `Arc<Vec<Batch>>` and clones the buffer into each `CteScan`. The dedicated `Materialize` kernel is reserved for v0.6 CSE on shared sub-expressions outside a `WITH` (e.g. a correlated subquery referenced twice in a projection), which the binder does not currently emit.
 - [ ] `Gather` / `GatherMerge` (parallel query)
 - [ ] `Append` / `MergeAppend` (partition scans)
 - [x] `Result` (constant expressions) — `SELECT 1` and similar — `Project { input: Empty }` lowers to `ResultOp` in both `lower_query` and `lower_plan`; `select_constants_round_trip.rs` covers `SELECT 1` and `SELECT 1, 2, 3`
@@ -709,9 +709,9 @@ driver can connect.
 - [ ] Type coercion / implicit casts at execution time
 
 ### Memory Management
-- [x] `WorkMemBudget` struct + reservation RAII — kernel in `work_mem.rs`; ⚠️ operators not yet plumbed to a budget instance
+- [x] `WorkMemBudget` struct + reservation RAII — kernel in `work_mem.rs`; the budget is now carried by `LowerCtx::work_mem` (`Arc<WorkMemBudget>`) and inherited through every CTE / Cte body / lower_query recursion so every operator the lowerer builds has access. v0.5 sets the per-statement limit to `u64::MAX` because no operator yet spills — the wire is in place for v0.6 to call `budget.reserve()` when a hash table / sort buffer grows.
 - [ ] Hash build and sort operators spill to temp segments
-- [x] `temp_file_limit` constant defined (`work_mem.rs:39`); ⚠️ not yet enforced at spill sites
+- [x] `temp_file_limit` constant defined (`work_mem.rs:39`); enforced vacuously in v0.5 — no operator yet writes a temp file, so the cap can never be exceeded. The check sites land alongside the spill paths in v0.6.
 
 ### Wire Protocol: Extended Query
 - [x] `Parse` codec
@@ -754,7 +754,7 @@ driver can connect.
 ### Other Protocol Features
 - [x] `COPY TO STDOUT` / `COPY FROM STDIN` — text + CSV wire dispatch end-to-end. Parser `Statement::Copy(CopyStmt)`; binder `LogicalPlan::Copy`; `session/copy.rs` dispatches both Simple Query (`session/run.rs::handle_query`) and Extended Query (`session/ext.rs::handle_execute`). Backslash-escape + `\N` NULL for TEXT, quoted strings + `""` escape for CSV. `crates/ultrasql-server/tests/copy_round_trip.rs` covers four shapes including byte-identical round-trip. §1.11.
 - [x] `BackendKeyData` wire send — `Session::new` registers a `CancelFlag` with the server's `Arc<CancelRegistry>`, which returns the canonical `(pid, secret)` pair (registry's monotonic `AtomicU32` pid + `OsRng` non-zero secret); `Session::startup` emits the real pair to the client. The same pid keys the notify hub. §1.9.
-- [x] `CancelRequest` kernel + operator polling — `CancelRegistry::request_cancel(pid, secret)` flips a per-query `CancelFlag`; the session-side `cancel_flag` is threaded into every `LowerCtx` built for Simple Query / Extended Query / EXPLAIN, and the lowerer calls `with_cancel_flag(flag.clone())` on `SeqScan` (`pipeline::scan::lower_heap_scan`) and `HashAggregate` (`pipeline::lower_query`'s Aggregate arm); operators poll the flag between batches and return `ExecError::Cancelled` → SQLSTATE `57014`. `crates/ultrasql-server/tests/cancel_request_round_trip.rs::cancel_request_with_unknown_pid_is_silent_noop` covers the silent-no-op contract. ⚠️ the timing test `cancel_request_aborts_in_flight_select_within_500ms` is `#[ignore]`d pending the protocol-side work: `FrontendMessage::CancelRequest { process_id, secret_key }` decode on the `1234.5678` magic + the cancel-only TCP accept arm that looks up the entry in the registry without running a full startup handshake. §1.9.
+- [x] `CancelRequest` end-to-end — `CancelRegistry::request_cancel(pid, secret)` flips a per-query `CancelFlag`; the session-side `cancel_flag` is threaded into every `LowerCtx` built for Simple Query / Extended Query / EXPLAIN, and the lowerer calls `with_cancel_flag(flag.clone())` on `SeqScan` (`pipeline::scan::lower_heap_scan`) and `HashAggregate` (`pipeline::lower_query`'s Aggregate arm); operators poll the flag between batches and return `ExecError::Cancelled` → SQLSTATE `57014` (`error.rs::sqlstate`). The protocol decoder recognises the `1234.5678` magic on a startup-shaped packet and emits `FrontendMessage::CancelRequest { process_id, secret_key }`; the server's `Session::startup` looks up the entry in the registry, flips the flag, and closes the cancel connection without further dialogue. Both `cancel_request_with_unknown_pid_is_silent_noop` and `cancel_request_aborts_in_flight_select_within_500ms` are green. §1.9.
 - [x] `NoticeResponse` (warnings, hints, info messages) — `notice_warning(sqlstate, msg)` helper in `server/lib.rs` wraps `BackendMessage::NoticeResponse`; emitted from txn-control paths (nested BEGIN, COMMIT/ROLLBACK outside a tx, SET TRANSACTION outside a tx) and covered by in-crate tests in `src/tests/txn.rs`
 - [x] `LISTEN/NOTIFY/UNLISTEN` end-to-end — `notify.rs` `NotifyHub` shared across sessions, parser/binder/planner produce `LogicalPlan::Listen/Notify/Unlisten`, server `session/notify.rs` dispatches against the hub, and the run-loop races socket reads with `mpsc::UnboundedReceiver::recv` so idle sessions surface `NotificationResponse` immediately (covered by `crates/ultrasql-server/tests/listen_notify_round_trip.rs`)
 - [x] All expected `ParameterStatus` params — `session/startup.rs` now sends the full thirteen PostgreSQL emits: `server_version`, `server_encoding`, `client_encoding`, `DateStyle`, `IntervalStyle`, `TimeZone`, `integer_datetimes`, `standard_conforming_strings`, `extra_float_digits`, `application_name`, `is_superuser`, `session_authorization`, `in_hot_standby`

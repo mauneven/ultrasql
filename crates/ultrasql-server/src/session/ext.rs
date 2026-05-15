@@ -415,6 +415,7 @@ where
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
             cancel_flag: Some(self.cancel_flag.clone()),
+            work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
                 };
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
@@ -452,6 +453,7 @@ where
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
             cancel_flag: Some(self.cancel_flag.clone()),
+            work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
                 };
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);

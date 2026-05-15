@@ -368,6 +368,7 @@ impl IndexFixture {
             command_id: CommandId::FIRST,
             cte_buffers: HashMap::new(),
         cancel_flag: None,
+        work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
         }
     }
 }
