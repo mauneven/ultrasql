@@ -180,6 +180,23 @@ impl BoolColumn {
         }
     }
 
+    /// Build a nullable boolean column.
+    ///
+    /// `nulls.len()` must equal `data.len()`. Same convention as
+    /// [`NumericColumn::with_nulls`]: 1 = valid, 0 = null.
+    pub fn with_nulls(data: Vec<bool>, nulls: Bitmap) -> Result<Self, ColumnError> {
+        if nulls.len() != data.len() {
+            return Err(ColumnError::LengthMismatch {
+                bitmap: nulls.len(),
+                column: data.len(),
+            });
+        }
+        Ok(Self {
+            data: data.into_iter().map(u8::from).collect(),
+            nulls: Some(nulls),
+        })
+    }
+
     /// Borrow the underlying bytes (1 = true, 0 = false).
     #[must_use]
     pub fn data(&self) -> &[u8] {
@@ -237,6 +254,35 @@ impl StringColumn {
             values,
             nulls: None,
         }
+    }
+
+    /// Build a nullable UTF-8 string column.
+    ///
+    /// `nulls.len()` must equal the number of rows in `data`. Same
+    /// convention as [`NumericColumn::with_nulls`]: 1 = valid, 0 = null.
+    pub fn with_nulls<I>(rows: I, nulls: Bitmap) -> Result<Self, ColumnError>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut offsets: Vec<u32> = vec![0];
+        let mut values: Vec<u8> = Vec::new();
+        let mut row_count = 0usize;
+        for s in rows {
+            values.extend_from_slice(s.as_bytes());
+            offsets.push(values.len() as u32);
+            row_count += 1;
+        }
+        if nulls.len() != row_count {
+            return Err(ColumnError::LengthMismatch {
+                bitmap: nulls.len(),
+                column: row_count,
+            });
+        }
+        Ok(Self {
+            offsets,
+            values,
+            nulls: Some(nulls),
+        })
     }
 
     /// Borrow the offsets slice.

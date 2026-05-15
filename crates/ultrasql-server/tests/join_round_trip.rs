@@ -97,12 +97,13 @@ fn rows_to_i32_pairs(
     rows: &[tokio_postgres::SimpleQueryMessage],
     left_col: usize,
     right_col: usize,
-) -> Vec<(i32, i32)> {
+) -> Vec<(Option<i32>, Option<i32>)> {
     rows.iter()
         .filter_map(|m| match m {
             tokio_postgres::SimpleQueryMessage::Row(row) => {
-                let l = row.get(left_col)?.parse::<i32>().ok()?;
-                let r = row.get(right_col)?.parse::<i32>().ok()?;
+                // `row.get` returns `None` on a NULL cell.
+                let l = row.get(left_col).map(|s| s.parse::<i32>().ok()).flatten();
+                let r = row.get(right_col).map(|s| s.parse::<i32>().ok()).flatten();
                 Some((l, r))
             }
             _ => None,
@@ -149,7 +150,7 @@ async fn inner_equi_join_matches_postgres_semantics() {
         .expect("query succeeds");
     let mut pairs = rows_to_i32_pairs(&rows, 0, 1);
     pairs.sort_unstable();
-    assert_eq!(pairs, vec![(2, 200), (3, 300)]);
+    assert_eq!(pairs, vec![(Some(2), Some(200)), (Some(3), Some(300))]);
 
     shutdown(client, server_handle).await;
 }
@@ -195,10 +196,15 @@ async fn left_outer_equi_join_emits_null_padded_unmatched_rows() {
 
     let mut pairs = rows_to_i32_pairs(&rows, 0, 1);
     pairs.sort_unstable();
-    // PostgreSQL would emit (1, NULL), (2, 200), (3, NULL). UltraSQL's
-    // v0.5 build_batch encodes NULL as 0 (see seq_scan.rs); the binary
-    // shape is "left.lid, encoded-null-or-real-rval".
-    assert_eq!(pairs, vec![(1, 0), (2, 200), (3, 0)]);
+    // PostgreSQL semantics: unmatched left rows get NULL on the right.
+    assert_eq!(
+        pairs,
+        vec![
+            (Some(1), None),
+            (Some(2), Some(200)),
+            (Some(3), None),
+        ]
+    );
 
     shutdown(client, server_handle).await;
 }
@@ -245,7 +251,13 @@ async fn inner_non_equi_join_falls_back_to_nested_loop() {
     // Pairs where lid < rid: (1,3) (1,6) (2,3) (2,6) (5,6).
     assert_eq!(
         pairs,
-        vec![(1, 3), (1, 6), (2, 3), (2, 6), (5, 6)],
+        vec![
+            (Some(1), Some(3)),
+            (Some(1), Some(6)),
+            (Some(2), Some(3)),
+            (Some(2), Some(6)),
+            (Some(5), Some(6)),
+        ],
         "non-equi NLJ output"
     );
 
@@ -300,7 +312,7 @@ async fn join_with_where_filter_returns_filtered_rows() {
     let mut pairs = rows_to_i32_pairs(&rows, 0, 1);
     pairs.sort_unstable();
     // Left rows with lval=5 are lid∈{1,3}; both have a matching right row.
-    assert_eq!(pairs, vec![(1, 100), (3, 300)]);
+    assert_eq!(pairs, vec![(Some(1), Some(100)), (Some(3), Some(300))]);
 
     shutdown(client, server_handle).await;
 }

@@ -431,35 +431,70 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
     let mut rows: Vec<Vec<Value>> = (0..n_rows).map(|_| Vec::with_capacity(n_cols)).collect();
 
     for (col_idx, (col, field)) in cols.iter().zip(schema.fields().iter()).enumerate() {
+        // Validity convention: 1 = valid, 0 = null. `is_null(i)` returns
+        // `true` when the bitmap exists and the bit is unset.
+        let is_null = |nulls: Option<&ultrasql_vec::bitmap::Bitmap>, i: usize| -> bool {
+            nulls.is_some_and(|b| !b.get(i))
+        };
         match (col, &field.data_type) {
             (Column::Int32(c), DataType::Int32) => {
+                let nulls = c.nulls();
                 for (row_idx, row) in rows.iter_mut().enumerate() {
-                    row.push(Value::Int32(c.data()[row_idx]));
+                    if is_null(nulls, row_idx) {
+                        row.push(Value::Null);
+                    } else {
+                        row.push(Value::Int32(c.data()[row_idx]));
+                    }
                 }
             }
             (Column::Int64(c), DataType::Int64) => {
+                let nulls = c.nulls();
                 for (row_idx, row) in rows.iter_mut().enumerate() {
-                    row.push(Value::Int64(c.data()[row_idx]));
+                    if is_null(nulls, row_idx) {
+                        row.push(Value::Null);
+                    } else {
+                        row.push(Value::Int64(c.data()[row_idx]));
+                    }
                 }
             }
             (Column::Float32(c), DataType::Float32) => {
+                let nulls = c.nulls();
                 for (row_idx, row) in rows.iter_mut().enumerate() {
-                    row.push(Value::Float32(c.data()[row_idx]));
+                    if is_null(nulls, row_idx) {
+                        row.push(Value::Null);
+                    } else {
+                        row.push(Value::Float32(c.data()[row_idx]));
+                    }
                 }
             }
             (Column::Float64(c), DataType::Float64) => {
+                let nulls = c.nulls();
                 for (row_idx, row) in rows.iter_mut().enumerate() {
-                    row.push(Value::Float64(c.data()[row_idx]));
+                    if is_null(nulls, row_idx) {
+                        row.push(Value::Null);
+                    } else {
+                        row.push(Value::Float64(c.data()[row_idx]));
+                    }
                 }
             }
             (Column::Bool(c), DataType::Bool) => {
+                let nulls = c.nulls();
                 for (row_idx, row) in rows.iter_mut().enumerate() {
-                    row.push(Value::Bool(c.value(row_idx)));
+                    if is_null(nulls, row_idx) {
+                        row.push(Value::Null);
+                    } else {
+                        row.push(Value::Bool(c.value(row_idx)));
+                    }
                 }
             }
             (Column::Utf8(c), DataType::Text { .. }) => {
+                let nulls = c.nulls();
                 for (row_idx, row) in rows.iter_mut().enumerate() {
-                    row.push(Value::Text(c.value(row_idx).to_owned()));
+                    if is_null(nulls, row_idx) {
+                        row.push(Value::Null);
+                    } else {
+                        row.push(Value::Text(c.value(row_idx).to_owned()));
+                    }
                 }
             }
             (col_var, expected_type) => {

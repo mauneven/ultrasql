@@ -351,14 +351,18 @@ mod tests {
         while let Some(b) = op.next_batch().expect("no error") {
             let rows = crate::filter_op::batch_to_rows(&b, &schema).expect("decode ok");
             for row in rows {
-                // batch_to_rows decodes Int32 columns to Value::Int32; NULLs
-                // are stored as 0 by build_batch (v0.5 no-null-bitmap format).
+                // batch_to_rows now reports `Value::Null` for the
+                // padded-null right side of LEFT OUTER unmatched rows
+                // (the NumericColumn validity bitmap distinguishes them
+                // from real zeros). Map back to 0 here.
                 let l = match &row[0] {
                     Value::Int32(v) => *v,
+                    Value::Null => 0,
                     _ => panic!("unexpected left value: {:?}", row[0]),
                 };
                 let r = match &row[1] {
                     Value::Int32(v) => *v,
+                    Value::Null => 0,
                     _ => panic!("unexpected right value: {:?}", row[1]),
                 };
                 out.push((l, r));

@@ -60,7 +60,31 @@ pub(super) fn bind_insert(
                 schema: empty_schema,
             }
         }
-        InsertSource::Values(rows) => bind_values_rows(rows, expected_arity, catalog, scope)?,
+        InsertSource::Values(rows) => {
+            let mut plan = bind_values_rows(rows, expected_arity, catalog, scope)?;
+            // Coerce Null-typed value columns to the target table column
+            // type. `bind_values_rows` defaults a column to `DataType::Null`
+            // when every cell across every row is a NULL literal; left
+            // unchanged the executor's `build_batch` rejects the schema.
+            // The target type is unambiguous here because the INSERT
+            // already pinned `columns[i]` to a concrete table field.
+            if let LogicalPlan::Values { schema, .. } = &mut plan {
+                let mut new_fields: Vec<Field> = Vec::with_capacity(schema.len());
+                for (i, field) in schema.fields().iter().enumerate() {
+                    let resolved = if matches!(field.data_type, DataType::Null) {
+                        let target = &table_schema.field_at(columns[i]).data_type;
+                        target.clone()
+                    } else {
+                        field.data_type.clone()
+                    };
+                    new_fields.push(Field::nullable(field.name.clone(), resolved));
+                }
+                *schema = Schema::new(new_fields).map_err(|e| {
+                    PlanError::TypeMismatch(format!("INSERT VALUES schema coercion: {e}"))
+                })?;
+            }
+            plan
+        }
         InsertSource::Select(sel) => {
             let plan = bind_select(sel, catalog, scope)?;
             // Arity check.

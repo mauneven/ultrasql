@@ -33,6 +33,7 @@ use ultrasql_mvcc::{Snapshot, XidStatusOracle};
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::heap::{HeapAccess, VisibleHeapWalker};
 use ultrasql_vec::Batch;
+use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
 use crate::row_codec::{ColumnBuilder, RowCodec};
@@ -676,6 +677,22 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
     let n_cols = schema.len();
     let n_rows = rows.len();
 
+    // Helper closure: scan column `col_idx` once and build a validity
+    // bitmap (1 = valid, 0 = null per Arrow convention). Returns
+    // `None` when no row in this column is null — the column is
+    // emitted without a bitmap so kernels keep their fast path.
+    let build_validity = |col_idx: usize| -> Option<Bitmap> {
+        let mut any_null = false;
+        let mut bitmap = Bitmap::new(n_rows, true);
+        for (row_idx, row) in rows.iter().enumerate() {
+            if matches!(row[col_idx], Value::Null) {
+                bitmap.set(row_idx, false);
+                any_null = true;
+            }
+        }
+        any_null.then_some(bitmap)
+    };
+
     let mut columns: Vec<Column> = Vec::with_capacity(n_cols);
 
     for col_idx in 0..n_cols {
@@ -686,7 +703,7 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 for (row_idx, row) in rows.iter().enumerate() {
                     match &row[col_idx] {
                         Value::Bool(v) => data.push(*v),
-                        Value::Null => data.push(false), // placeholder for null
+                        Value::Null => data.push(false),
                         other => {
                             return Err(ExecError::TypeMismatch(format!(
                                 "expected Bool at row {row_idx} col {col_idx}, got {:?}",
@@ -695,14 +712,20 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                         }
                     }
                 }
-                Column::Bool(BoolColumn::from_data(data))
+                let col = if let Some(nulls) = build_validity(col_idx) {
+                    BoolColumn::with_nulls(data, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                } else {
+                    BoolColumn::from_data(data)
+                };
+                Column::Bool(col)
             }
             DataType::Int32 => {
                 let mut data: Vec<i32> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
                     match &row[col_idx] {
                         Value::Int32(v) => data.push(*v),
-                        Value::Null => data.push(0), // placeholder for null
+                        Value::Null => data.push(0),
                         other => {
                             return Err(ExecError::TypeMismatch(format!(
                                 "expected Int32 at row {row_idx} col {col_idx}, got {:?}",
@@ -711,14 +734,20 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                         }
                     }
                 }
-                Column::Int32(NumericColumn::from_data(data))
+                let col = if let Some(nulls) = build_validity(col_idx) {
+                    NumericColumn::with_nulls(data, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                } else {
+                    NumericColumn::from_data(data)
+                };
+                Column::Int32(col)
             }
             DataType::Int64 => {
                 let mut data: Vec<i64> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
                     match &row[col_idx] {
                         Value::Int64(v) => data.push(*v),
-                        Value::Null => data.push(0), // placeholder for null
+                        Value::Null => data.push(0),
                         other => {
                             return Err(ExecError::TypeMismatch(format!(
                                 "expected Int64 at row {row_idx} col {col_idx}, got {:?}",
@@ -727,14 +756,20 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                         }
                     }
                 }
-                Column::Int64(NumericColumn::from_data(data))
+                let col = if let Some(nulls) = build_validity(col_idx) {
+                    NumericColumn::with_nulls(data, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                } else {
+                    NumericColumn::from_data(data)
+                };
+                Column::Int64(col)
             }
             DataType::Float32 => {
                 let mut data: Vec<f32> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
                     match &row[col_idx] {
                         Value::Float32(v) => data.push(*v),
-                        Value::Null => data.push(0.0), // placeholder for null
+                        Value::Null => data.push(0.0),
                         other => {
                             return Err(ExecError::TypeMismatch(format!(
                                 "expected Float32 at row {row_idx} col {col_idx}, got {:?}",
@@ -743,14 +778,20 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                         }
                     }
                 }
-                Column::Float32(NumericColumn::from_data(data))
+                let col = if let Some(nulls) = build_validity(col_idx) {
+                    NumericColumn::with_nulls(data, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                } else {
+                    NumericColumn::from_data(data)
+                };
+                Column::Float32(col)
             }
             DataType::Float64 => {
                 let mut data: Vec<f64> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
                     match &row[col_idx] {
                         Value::Float64(v) => data.push(*v),
-                        Value::Null => data.push(0.0), // placeholder for null
+                        Value::Null => data.push(0.0),
                         other => {
                             return Err(ExecError::TypeMismatch(format!(
                                 "expected Float64 at row {row_idx} col {col_idx}, got {:?}",
@@ -759,14 +800,20 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                         }
                     }
                 }
-                Column::Float64(NumericColumn::from_data(data))
+                let col = if let Some(nulls) = build_validity(col_idx) {
+                    NumericColumn::with_nulls(data, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                } else {
+                    NumericColumn::from_data(data)
+                };
+                Column::Float64(col)
             }
             DataType::Text { .. } => {
                 let mut strings: Vec<String> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
                     match &row[col_idx] {
                         Value::Text(s) => strings.push(s.clone()),
-                        Value::Null => strings.push(String::new()), // placeholder for null
+                        Value::Null => strings.push(String::new()),
                         other => {
                             return Err(ExecError::TypeMismatch(format!(
                                 "expected Text at row {row_idx} col {col_idx}, got {:?}",
@@ -775,7 +822,13 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                         }
                     }
                 }
-                Column::Utf8(StringColumn::from_data(strings))
+                let col = if let Some(nulls) = build_validity(col_idx) {
+                    StringColumn::with_nulls(strings, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                } else {
+                    StringColumn::from_data(strings)
+                };
+                Column::Utf8(col)
             }
             other => {
                 return Err(ExecError::TypeMismatch(format!(

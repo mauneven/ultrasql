@@ -62,8 +62,8 @@ use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_executor::{
     CteScan, Filter, FilterEqI32, HashAggregate, HashJoin, IndexScan, Limit, MemTableScan,
-    ModifyKind, ModifyTable, NestedLoopJoin, Operator, Project, RightFactory, RowCodec, SeqScan,
-    SetOp, Sort, ValuesScan,
+    ModifyKind, ModifyTable, NestedLoopJoin, Operator, Project, ResultOp, RightFactory, RowCodec,
+    SeqScan, SetOp, Sort, ValuesScan,
 };
 use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
 use ultrasql_planner::{
@@ -170,7 +170,13 @@ pub fn lower_plan(
     match plan {
         LogicalPlan::Scan { table, .. } => lower_scan(table, None, tables),
         LogicalPlan::Filter { input, predicate } => lower_filter(input, predicate, tables),
-        LogicalPlan::Project { input, exprs, .. } => lower_project(input, exprs, tables),
+        LogicalPlan::Project { input, exprs, schema } => {
+            if matches!(input.as_ref(), LogicalPlan::Empty { .. }) {
+                let scalars: Vec<ScalarExpr> = exprs.iter().map(|(e, _)| e.clone()).collect();
+                return Ok(Box::new(ResultOp::new(scalars, schema.clone())));
+            }
+            lower_project(input, exprs, tables)
+        }
         LogicalPlan::Limit {
             input, n, offset, ..
         } => lower_limit(input, *n, *offset, tables),
@@ -606,7 +612,15 @@ pub fn lower_query(
         LogicalPlan::Values { rows, schema } => {
             Ok(Box::new(ValuesScan::new(rows.clone(), schema.clone())))
         }
-        LogicalPlan::Project { input, exprs, .. } => {
+        LogicalPlan::Project { input, exprs, schema } => {
+            // `SELECT <const>` (no FROM) lowers Project(Empty) → ResultOp,
+            // a single-row constant emitter. The general path below would
+            // try to lower Empty into a scan, which has no meaning when
+            // the projection is purely constant.
+            if matches!(input.as_ref(), LogicalPlan::Empty { .. }) {
+                let scalars: Vec<ScalarExpr> = exprs.iter().map(|(e, _)| e.clone()).collect();
+                return Ok(Box::new(ResultOp::new(scalars, schema.clone())));
+            }
             let child = lower_query(input, ctx)?;
             lower_project_columns(child, exprs)
         }
