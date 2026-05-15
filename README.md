@@ -72,37 +72,37 @@ after re-running `cross_compare_sql`.
 <!-- BEGIN AUTO: BENCH:select_sum_65k_i64 -->
 ### SELECT SUM(x) FROM t — 65 536 i32 rows (full wire round-trip)
 
-| Engine | Median | Relative |
-| --- | ---: | --- |
-| **UltraSQL** | 38.58 µs | `█                                   ` |
-| DuckDB | 111.42 µs | `█                                   ` |
-| ClickHouse | 674.67 µs | `█                                   ` |
-| SQLite | 938.88 µs | `█                                   ` |
-| PostgreSQL | 33.28 ms | `████████████████████████████████████` |
+| Engine | Median | vs fastest |
+| --- | ---: | ---: |
+| **UltraSQL** | 38.58 µs | — |
+| DuckDB | 111.42 µs | 188.8% slower |
+| ClickHouse | 674.67 µs | 1,649% slower |
+| SQLite | 938.88 µs | 2,333% slower |
+| PostgreSQL | 33.28 ms | 86,147% slower |
 <!-- END AUTO: BENCH:select_sum_65k_i64 -->
 
 <!-- BEGIN AUTO: BENCH:filter_sum_1m_i64 -->
 ### Filter + SUM — 1 000 000 i32 rows (full wire round-trip)
 
-| Engine | Median | Relative |
-| --- | ---: | --- |
-| **UltraSQL** | 112.71 µs | `█                                   ` |
-| DuckDB | 216.46 µs | `█                                   ` |
-| ClickHouse | 1.66 ms | `██                                  ` |
-| SQLite | 16.20 ms | `███████████████                     ` |
-| PostgreSQL | 39.32 ms | `████████████████████████████████████` |
+| Engine | Median | vs fastest |
+| --- | ---: | ---: |
+| **UltraSQL** | 112.71 µs | — |
+| DuckDB | 216.46 µs | 92.1% slower |
+| ClickHouse | 1.66 ms | 1,374% slower |
+| SQLite | 16.20 ms | 14,273% slower |
+| PostgreSQL | 39.32 ms | 34,787% slower |
 <!-- END AUTO: BENCH:filter_sum_1m_i64 -->
 
 <!-- BEGIN AUTO: BENCH:select_avg_1m_i64 -->
 ### SELECT AVG(x) FROM t — 1 000 000 i32 rows (full wire round-trip)
 
-| Engine | Median | Relative |
-| --- | ---: | --- |
-| **UltraSQL** | 101.17 µs | `█                                   ` |
-| DuckDB | 283.85 µs | `█                                   ` |
-| ClickHouse | 2.05 ms | `██                                  ` |
-| SQLite | 14.61 ms | `█████████████                       ` |
-| PostgreSQL | 40.09 ms | `████████████████████████████████████` |
+| Engine | Median | vs fastest |
+| --- | ---: | ---: |
+| **UltraSQL** | 101.17 µs | — |
+| DuckDB | 283.85 µs | 180.6% slower |
+| ClickHouse | 2.05 ms | 1,924% slower |
+| SQLite | 14.61 ms | 14,337% slower |
+| PostgreSQL | 40.09 ms | 39,528% slower |
 <!-- END AUTO: BENCH:select_avg_1m_i64 -->
 
 Write-side benchmarks land when the storage engine is wired (v0.3+):
@@ -110,61 +110,61 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 <!-- BEGIN AUTO: BENCH:insert_throughput_10k -->
 ### INSERT throughput — 10 000 rows
 
-| Engine | Median | Relative |
-| --- | ---: | --- |
-| **UltraSQL** | 3.30 ms | `██                                  ` |
-| SQLite | 20.23 ms | `████████████                        ` |
-| PostgreSQL | 48.38 ms | `████████████████████████████        ` |
-| ClickHouse | 62.83 ms | `████████████████████████████████████` |
-| DuckDB | 63.18 ms | `████████████████████████████████████` |
+| Engine | Median | vs fastest |
+| --- | ---: | ---: |
+| **UltraSQL** | 3.30 ms | — |
+| SQLite | 20.23 ms | 512.0% slower |
+| PostgreSQL | 48.38 ms | 1,364% slower |
+| ClickHouse | 62.83 ms | 1,801% slower |
+| DuckDB | 63.18 ms | 1,812% slower |
 <!-- END AUTO: BENCH:insert_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:select_scan_10k -->
 ### SELECT scan — 10 000 rows (full wire round-trip)
 
-| Engine | Median | Relative |
-| --- | ---: | --- |
-| **UltraSQL** | 759.42 µs | `█                                   ` |
-| DuckDB | 897.42 µs | `█                                   ` |
-| ClickHouse | 1.17 ms | `█                                   ` |
-| SQLite | 1.81 ms | `██                                  ` |
-| PostgreSQL | 28.60 ms | `████████████████████████████████████` |
+| Engine | Median | vs fastest |
+| --- | ---: | ---: |
+| **UltraSQL** | 759.42 µs | — |
+| DuckDB | 897.42 µs | 18.2% slower |
+| ClickHouse | 1.17 ms | 54.4% slower |
+| SQLite | 1.81 ms | 138.4% slower |
+| PostgreSQL | 28.60 ms | 3,666% slower |
 <!-- END AUTO: BENCH:select_scan_10k -->
 
 <!-- BEGIN AUTO: BENCH:update_throughput_10k -->
 ### UPDATE throughput — 10 000 rows
 
-| Engine | Median | Relative |
-| --- | ---: | --- |
-| **UltraSQL** | 149.38 µs | `█                                   ` |
-| DuckDB | 176.25 µs | `█                                   ` |
-| SQLite | 451.08 µs | `█                                   ` |
-| ClickHouse | 3.50 ms | `██                                  ` |
-| PostgreSQL | 64.42 ms | `████████████████████████████████████` |
+| Engine | Median | vs fastest |
+| --- | ---: | ---: |
+| **UltraSQL** | 149.38 µs | — |
+| DuckDB | 176.25 µs | 18.0% slower |
+| SQLite | 451.08 µs | 202.0% slower |
+| ClickHouse | 3.50 ms | 2,243% slower |
+| PostgreSQL | 64.42 ms | 43,026% slower |
 <!-- END AUTO: BENCH:update_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:delete_throughput_10k -->
 ### DELETE throughput — 10 000 rows
 
-| Engine | Median | Relative |
-| --- | ---: | --- |
-| **UltraSQL** | 127.75 µs | `█                                   ` |
-| SQLite | 512.33 µs | `█                                   ` |
-| DuckDB | 1.99 ms | `███                                 ` |
-| ClickHouse | 3.37 ms | `█████                               ` |
-| PostgreSQL | 23.27 ms | `████████████████████████████████████` |
+| Engine | Median | vs fastest |
+| --- | ---: | ---: |
+| **UltraSQL** | 127.75 µs | — |
+| SQLite | 512.33 µs | 301.0% slower |
+| DuckDB | 1.99 ms | 1,461% slower |
+| ClickHouse | 3.37 ms | 2,536% slower |
+| PostgreSQL | 23.27 ms | 18,118% slower |
 <!-- END AUTO: BENCH:delete_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:mixed_oltp_pgbench_like -->
 ### Mixed OLTP (pgbench-like)
 
-| Engine | Median | Relative |
-| --- | ---: | --- |
-| **UltraSQL** | 116.30 µs | `█                                   ` |
-| SQLite | 357.35 µs | `█                                   ` |
-| DuckDB | 1.25 ms | `██                                  ` |
-| PostgreSQL | 11.63 ms | `███████████████████                 ` |
-| ClickHouse | 22.53 ms | `████████████████████████████████████` |
+| Engine | Median | vs fastest |
+| --- | ---: | ---: |
+| **UltraSQL** | 116.30 µs | — |
+| SQLite | 357.35 µs | 207.3% slower |
+| DuckDB | 1.25 ms | 977% slower |
+| PostgreSQL | 11.63 ms | 9,898% slower |
+| ClickHouse | 22.53 ms | 19,270% slower |
 <!-- END AUTO: BENCH:mixed_oltp_pgbench_like -->
 
 Per-kernel microbenchmarks (in-process, no SQL surface) are kept under

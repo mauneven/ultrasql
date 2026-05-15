@@ -317,14 +317,20 @@ fn render_table(heading: &str, rows: &[(String, f64)]) -> String {
         return out;
     }
 
-    // Scale the ASCII bar to the slowest row (max_us across all rows).
-    let max_us = rows.iter().map(|(_, us)| *us).fold(0.0_f64, f64::max);
+    // Baseline = fastest row (rows are sorted ascending by median, so
+    // index 0 is the winner). Every other row reports how much slower
+    // it is, expressed as a percent.
+    let baseline_us = rows[0].1;
 
-    out.push_str("| Engine | Median | Relative |\n");
-    out.push_str("| --- | ---: | --- |\n");
-    for (engine, us) in rows {
-        let bar = render_bar(*us, max_us);
-        let _ = writeln!(out, "| {} | {} | `{bar}` |", engine, format_duration(*us));
+    out.push_str("| Engine | Median | vs fastest |\n");
+    out.push_str("| --- | ---: | ---: |\n");
+    for (i, (engine, us)) in rows.iter().enumerate() {
+        let rel = if i == 0 || baseline_us <= 0.0 || !us.is_finite() {
+            "—".to_string()
+        } else {
+            format_pct_slower(*us, baseline_us)
+        };
+        let _ = writeln!(out, "| {} | {} | {} |", engine, format_duration(*us), rel);
     }
     out
 }
@@ -345,24 +351,38 @@ fn display_engine_name(raw: &str) -> String {
     }
 }
 
-/// Render a fixed-width ASCII bar proportional to `value / max`. The
-/// bar uses block characters so it lines up monospace; an empty bar
-/// (one cell) is reserved for genuine zero values so the column never
-/// looks broken in Markdown.
-fn render_bar(value: f64, max: f64) -> String {
-    const WIDTH: usize = 36;
-    if max <= 0.0 || !value.is_finite() {
-        return " ".repeat(WIDTH);
+/// Format the slowdown of `this_us` relative to `baseline_us` as a
+/// percentage string suffixed with " slower". For ratios under 10×
+/// (i.e. < 900% slower) the result has one decimal place; beyond that
+/// the fractional digit becomes noise so the integer percent is
+/// thousand-separated for readability.
+///
+/// Examples:
+/// - 38.58 µs → 111.42 µs: `188.8% slower`
+/// - 38.58 µs → 33.28 ms:  `86,162% slower`
+fn format_pct_slower(this_us: f64, baseline_us: f64) -> String {
+    let pct = (this_us / baseline_us - 1.0) * 100.0;
+    if pct < 900.0 {
+        format!("{pct:.1}% slower")
+    } else {
+        let pct_int = pct.round() as u64;
+        format!("{}% slower", thousands(pct_int))
     }
-    let ratio = (value / max).clamp(0.0, 1.0);
-    let cells = (ratio * WIDTH as f64).round() as usize;
-    let cells = cells.clamp(1, WIDTH);
-    let mut out = String::with_capacity(WIDTH);
-    for _ in 0..cells {
-        out.push('█');
-    }
-    for _ in cells..WIDTH {
-        out.push(' ');
+}
+
+/// Render a non-negative integer with `,` as the thousands separator.
+/// Pure formatting helper used by [`format_pct_slower`] when the
+/// slowdown is large enough that an integer percent reads more cleanly
+/// than a decimal one.
+fn thousands(n: u64) -> String {
+    let raw = n.to_string();
+    let len = raw.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, c) in raw.chars().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
     }
     out
 }
@@ -952,15 +972,41 @@ rest\n";
             "table must have median column header"
         );
         assert!(
-            table.contains("| Relative |"),
-            "table must have relative-time column header"
+            table.contains("| vs fastest |"),
+            "table must have slowdown column header"
         );
         assert!(table.contains("4.70 µs"));
         assert!(table.contains("216.33 µs"));
         assert!(
-            table.contains('█'),
-            "ASCII bar block character must appear in every row"
+            table.contains("% slower"),
+            "non-baseline rows must report percent slowdown: {table}"
         );
+        assert!(
+            table.contains("| — |"),
+            "baseline row must render '—' in the vs-fastest column: {table}"
+        );
+    }
+
+    /// `format_pct_slower` reports one decimal place under 10× and a
+    /// thousand-separated integer percent beyond that.
+    #[test]
+    fn format_pct_slower_picks_format_by_magnitude() {
+        // 111.42 / 38.58 - 1 = 1.888… → 188.8%
+        assert_eq!(format_pct_slower(111.42, 38.58), "188.8% slower");
+        // Exactly 10× should already use the integer form: 900.0% → "900% slower"
+        assert_eq!(format_pct_slower(386.0, 38.6), "900% slower");
+        // 33_280 / 38.58 - 1 ≈ 861.62 → 86,162% slower
+        assert_eq!(format_pct_slower(33_280.0, 38.58), "86,162% slower");
+    }
+
+    /// `thousands` inserts `,` every three digits from the right.
+    #[test]
+    fn thousands_inserts_separators() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000), "1,000");
+        assert_eq!(thousands(86_156), "86,156");
+        assert_eq!(thousands(1_234_567), "1,234,567");
     }
 
     // -----------------------------------------------------------------------
