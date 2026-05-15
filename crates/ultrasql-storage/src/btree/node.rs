@@ -1,0 +1,310 @@
+//! On-page B-tree node layout: metadata header, packed leaf and internal
+//! entries, page initialisation, and the descent / right-link helpers
+//! that route through the sibling chain on Lehman-Yao reads.
+
+use ultrasql_core::endian::{
+    read_i64_le, read_u16_le, read_u32_le, write_i64_le, write_u16_le, write_u32_le,
+};
+use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
+
+use crate::buffer_pool::{PageGuard, PageLoader};
+use crate::page::{PAGE_HEADER_SIZE, Page, PageHeader, PageKind};
+
+use super::{
+    BTreeError, FLAG_HAS_HIGH_KEY, FLAG_LEAF, INTERNAL_ENTRY_SIZE, LEAF_ENTRY_SIZE, NO_SIBLING,
+    NODE_SPECIAL_OFFSET,
+};
+
+// --- node metadata ---------------------------------------------------------
+
+/// Per-page B-tree metadata stored in the page's special area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NodeMeta {
+    /// Block number of the right sibling, or [`NO_SIBLING`] if none.
+    pub(super) right_link: u32,
+    /// The split key for this page: any search key `>= high_key` lives
+    /// in the right sibling (or further). Only valid when
+    /// [`FLAG_HAS_HIGH_KEY`] is set in `flags`.
+    pub(super) high_key: i64,
+    /// Tree depth from this node down to a leaf (0 for leaves).
+    pub(super) level: u16,
+    /// Number of entries currently on the page.
+    pub(super) n_keys: u16,
+    /// Flag bits — see [`FLAG_LEAF`], [`FLAG_HAS_HIGH_KEY`].
+    pub(super) flags: u16,
+}
+
+impl NodeMeta {
+    pub(super) const fn fresh_leaf() -> Self {
+        Self {
+            right_link: NO_SIBLING,
+            high_key: 0,
+            level: 0,
+            n_keys: 0,
+            flags: FLAG_LEAF,
+        }
+    }
+
+    pub(super) const fn fresh_internal(level: u16) -> Self {
+        Self {
+            right_link: NO_SIBLING,
+            high_key: 0,
+            level,
+            n_keys: 0,
+            flags: 0,
+        }
+    }
+
+    #[inline]
+    pub(super) const fn is_leaf(self) -> bool {
+        self.flags & FLAG_LEAF != 0
+    }
+
+    #[inline]
+    pub(super) const fn has_high_key(self) -> bool {
+        self.flags & FLAG_HAS_HIGH_KEY != 0
+    }
+
+    pub(super) fn read_from(page: &Page) -> Result<Self, BTreeError> {
+        let bytes = page.as_bytes();
+        let off = NODE_SPECIAL_OFFSET;
+        let right_link = read_u32_le(&bytes[off..off + 4])
+            .map_err(|_| BTreeError::MalformedNode("right_link"))?;
+        let high_key = read_i64_le(&bytes[off + 4..off + 12])
+            .map_err(|_| BTreeError::MalformedNode("high_key"))?;
+        let level = read_u16_le(&bytes[off + 12..off + 14])
+            .map_err(|_| BTreeError::MalformedNode("level"))?;
+        let n_keys = read_u16_le(&bytes[off + 14..off + 16])
+            .map_err(|_| BTreeError::MalformedNode("n_keys"))?;
+        let flags = read_u16_le(&bytes[off + 16..off + 18])
+            .map_err(|_| BTreeError::MalformedNode("flags"))?;
+        Ok(Self {
+            right_link,
+            high_key,
+            level,
+            n_keys,
+            flags,
+        })
+    }
+
+    pub(super) fn write_into(self, page: &mut Page) {
+        let bytes = page.as_bytes_mut();
+        let off = NODE_SPECIAL_OFFSET;
+        write_u32_le(&mut bytes[off..off + 4], self.right_link);
+        write_i64_le(&mut bytes[off + 4..off + 12], self.high_key);
+        write_u16_le(&mut bytes[off + 12..off + 14], self.level);
+        write_u16_le(&mut bytes[off + 14..off + 16], self.n_keys);
+        write_u16_le(&mut bytes[off + 16..off + 18], self.flags);
+        // Reserved bytes (6) at offsets 18..24 are deliberately left
+        // zero so future format extensions can repurpose them.
+    }
+}
+
+// --- internal helper enums -------------------------------------------------
+
+#[derive(Debug)]
+pub(super) enum DescendStep {
+    ChaseRight(BlockNumber),
+    ReachedLeaf,
+    Descend(BlockNumber),
+}
+
+#[derive(Debug)]
+pub(super) enum LeafInsertOutcome {
+    /// The leaf had been split underneath us; the inserter must follow
+    /// the right link to retry on the new sibling.
+    ChaseRight(BlockNumber),
+    /// The entry was placed without splitting.
+    Inserted,
+    /// The leaf split; the caller propagates the new separator up to
+    /// the parent.
+    Split {
+        sep_key: i64,
+        new_block: BlockNumber,
+    },
+}
+
+#[derive(Debug)]
+pub(super) enum LeafProbe {
+    ChaseRight(BlockNumber),
+    Found(TupleId),
+    Missing,
+}
+
+// --- pure helper functions (no &self) --------------------------------------
+
+pub(super) fn step_descend<L: PageLoader>(
+    guard: &PageGuard<L>,
+    key: i64,
+) -> Result<DescendStep, BTreeError> {
+    let r = guard.read();
+    let meta = NodeMeta::read_from(&r)?;
+    if let Some(next) = should_chase_right(meta, key) {
+        drop(r);
+        return Ok(DescendStep::ChaseRight(BlockNumber::new(next)));
+    }
+    if meta.is_leaf() {
+        drop(r);
+        return Ok(DescendStep::ReachedLeaf);
+    }
+    let child = find_child_internal(&r, meta, key)?;
+    drop(r);
+    Ok(DescendStep::Descend(child))
+}
+
+pub(super) fn probe_leaf<L: PageLoader>(
+    guard: &PageGuard<L>,
+    key: i64,
+) -> Result<LeafProbe, BTreeError> {
+    let entries;
+    {
+        let r = guard.read();
+        let meta = NodeMeta::read_from(&r)?;
+        if let Some(next) = should_chase_right(meta, key) {
+            drop(r);
+            return Ok(LeafProbe::ChaseRight(BlockNumber::new(next)));
+        }
+        entries = read_leaf_entries(&r, meta.n_keys)?;
+        drop(r);
+    }
+    Ok(entries
+        .binary_search_by_key(&key, |e| e.key)
+        .map_or(LeafProbe::Missing, |i| LeafProbe::Found(entries[i].value)))
+}
+
+// --- packed entries --------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LeafEntry {
+    pub(super) key: i64,
+    pub(super) value: TupleId,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct InternalEntry {
+    pub(super) key: i64,
+    pub(super) child: u32,
+}
+
+pub(super) fn read_leaf_entries(page: &Page, count: u16) -> Result<Vec<LeafEntry>, BTreeError> {
+    let bytes = page.as_bytes();
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..(count as usize) {
+        let off = PAGE_HEADER_SIZE + i * LEAF_ENTRY_SIZE;
+        if off + LEAF_ENTRY_SIZE > NODE_SPECIAL_OFFSET {
+            return Err(BTreeError::MalformedNode("leaf entry out of range"));
+        }
+        let key =
+            read_i64_le(&bytes[off..off + 8]).map_err(|_| BTreeError::MalformedNode("leaf key"))?;
+        let rel =
+            read_u32_le(&bytes[off + 8..off + 12]).map_err(|_| BTreeError::MalformedNode("rel"))?;
+        let block = read_u32_le(&bytes[off + 12..off + 16])
+            .map_err(|_| BTreeError::MalformedNode("block"))?;
+        let slot = read_u16_le(&bytes[off + 16..off + 18])
+            .map_err(|_| BTreeError::MalformedNode("slot"))?;
+        let value = TupleId::new(
+            PageId::new(RelationId::new(rel), BlockNumber::new(block)),
+            slot,
+        );
+        out.push(LeafEntry { key, value });
+    }
+    Ok(out)
+}
+
+pub(super) fn write_leaf_entries(page: &mut Page, entries: &[LeafEntry]) {
+    let bytes = page.as_bytes_mut();
+    for (i, e) in entries.iter().enumerate() {
+        let off = PAGE_HEADER_SIZE + i * LEAF_ENTRY_SIZE;
+        write_i64_le(&mut bytes[off..off + 8], e.key);
+        write_u32_le(&mut bytes[off + 8..off + 12], e.value.page.relation.0.raw());
+        write_u32_le(&mut bytes[off + 12..off + 16], e.value.page.block.raw());
+        write_u16_le(&mut bytes[off + 16..off + 18], e.value.slot);
+        // Pad bytes 18..20 set to zero; readers ignore.
+        bytes[off + 18] = 0;
+        bytes[off + 19] = 0;
+    }
+}
+
+pub(super) fn read_internal_entries(
+    page: &Page,
+    count: u16,
+) -> Result<Vec<InternalEntry>, BTreeError> {
+    let bytes = page.as_bytes();
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..(count as usize) {
+        let off = PAGE_HEADER_SIZE + i * INTERNAL_ENTRY_SIZE;
+        if off + INTERNAL_ENTRY_SIZE > NODE_SPECIAL_OFFSET {
+            return Err(BTreeError::MalformedNode("internal entry out of range"));
+        }
+        let key = read_i64_le(&bytes[off..off + 8])
+            .map_err(|_| BTreeError::MalformedNode("internal key"))?;
+        let child = read_u32_le(&bytes[off + 8..off + 12])
+            .map_err(|_| BTreeError::MalformedNode("child"))?;
+        out.push(InternalEntry { key, child });
+    }
+    Ok(out)
+}
+
+pub(super) fn write_internal_entries(page: &mut Page, entries: &[InternalEntry]) {
+    let bytes = page.as_bytes_mut();
+    for (i, e) in entries.iter().enumerate() {
+        let off = PAGE_HEADER_SIZE + i * INTERNAL_ENTRY_SIZE;
+        write_i64_le(&mut bytes[off..off + 8], e.key);
+        write_u32_le(&mut bytes[off + 8..off + 12], e.child);
+        bytes[off + 12..off + 16].fill(0);
+    }
+}
+
+// --- helpers ---------------------------------------------------------------
+
+pub(super) fn init_btree_page(page: &mut Page, meta: NodeMeta) -> Result<(), BTreeError> {
+    // Reinitialise the page header so it represents a B-tree page
+    // with the special area carved out at the tail.
+    let new_header = PageHeader {
+        lsn: 0,
+        checksum: 0,
+        flags: 0,
+        kind: PageKind::BTreeIndex,
+        lower: PAGE_HEADER_SIZE as u16,
+        upper: NODE_SPECIAL_OFFSET as u16,
+        special: NODE_SPECIAL_OFFSET as u16,
+        version: page.header().version,
+    };
+    page.write_header(&new_header)?;
+    meta.write_into(page);
+    Ok(())
+}
+
+/// Lehman-Yao right-link chase decision.
+///
+/// Returns `Some(right_link_block)` if the node has been split since
+/// our parent pointed at it and the search key now belongs to a sibling
+/// further right.
+pub(super) const fn should_chase_right(meta: NodeMeta, key: i64) -> Option<u32> {
+    if !meta.has_high_key() {
+        return None;
+    }
+    if key >= meta.high_key && meta.right_link != NO_SIBLING {
+        Some(meta.right_link)
+    } else {
+        None
+    }
+}
+
+pub(super) fn find_child_internal(
+    page: &Page,
+    meta: NodeMeta,
+    key: i64,
+) -> Result<BlockNumber, BTreeError> {
+    let entries = read_internal_entries(page, meta.n_keys)?;
+    if entries.is_empty() {
+        return Err(BTreeError::MalformedNode("empty internal node"));
+    }
+    // Find the rightmost entry whose key is <= our search key.
+    // Entry 0 always has key = i64::MIN by construction.
+    let idx = match entries.binary_search_by_key(&key, |e| e.key) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    };
+    Ok(BlockNumber::new(entries[idx].child))
+}
