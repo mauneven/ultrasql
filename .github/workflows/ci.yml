@@ -58,6 +58,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest          # x86_64 Linux
+          - ubuntu-24.04-arm       # ARM64 Linux
           - macos-14               # Apple Silicon
           - windows-latest         # x86_64 Windows
     steps:
