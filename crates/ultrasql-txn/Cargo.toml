@@ -28,6 +28,14 @@ proptest  = { workspace = true }
 tempfile  = { workspace = true }
 criterion = { workspace = true }
 
+# `loom` is only compiled when the `--cfg loom` flag is set. Standard
+# cargo runs do not pull it in. Loom-mode tests are gated with
+# `#[cfg(loom)]` and execute under loom's exhaustive interleaving
+# scheduler. Run them with:
+#   RUSTFLAGS="--cfg loom" cargo test -p ultrasql-txn --test loom_lock_model --release
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
+
 [[bench]]
 name    = "txn_advanced"
 harness = false
