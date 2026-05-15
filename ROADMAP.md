@@ -610,7 +610,16 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] `COMMIT PREPARED 'id'` / `ROLLBACK PREPARED 'id'` kernel
 - [x] Persistence across restarts
 - [x] `pg_prepared_xacts` view (list_prepared API)
-- [ ] All four reachable from the wire
+- [x] All four reachable from the wire (`58af917`).
+  Parser: `KwPrepared` keyword + `Statement::PrepareTransaction`
+  / `CommitPrepared` / `RollbackPrepared` arms.
+  Binder + planner: matching `LogicalPlan` variants threaded
+  through the optimizer/executor fall-through arms. Server:
+  per-process `TwoPhaseCoordinator` on the `Server` struct +
+  `execute_prepare_transaction` / `execute_commit_prepared` /
+  `execute_rollback_prepared` reachable from both Simple
+  Query and Extended Query. `TransactionManager::finalise_prepared`
+  closes the CLOG entry on phase 2.
 
 ### Executor ↔ Storage wiring
 - [x] `SeqScan` operator reading real heap pages (replacing `MemTableScan`) — streaming, page-by-page typed decode
