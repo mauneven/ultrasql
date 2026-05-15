@@ -659,7 +659,7 @@ driver can connect.
 - [x] Aggregate reachable from `lower_query` (catalog-aware path dispatches `LogicalPlan::Aggregate` → HashAggregate; GROUP BY + ORDER BY covered by `order_by_round_trip.rs`)
 - [x] `SortAggregate` — kernel exists (`sort_aggregate.rs`); ⚠️ not yet selected by optimizer
 - [x] Standard aggregates: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG (JSON_AGG TBD)
-- [ ] Statistical aggregates: STDDEV, VARIANCE, CORR, PERCENTILE_CONT, PERCENTILE_DISC
+- [x] Statistical aggregates: STDDEV / STDDEV_SAMP / STDDEV_POP / VARIANCE / VAR_SAMP / VAR_POP via Welford's online algorithm in `hash_aggregate.rs::AggState::Welford`. Five wire round-trip tests. CORR, PERCENTILE_CONT, PERCENTILE_DISC remain — they need ordered-set / multi-arg aggregate plumbing the binder does not expose yet
 - [x] Window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD — kernel in `WindowAgg` (`window_agg.rs`); ⚠️ FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE not yet implemented; not yet wired to lowerer
 - [x] `OVER (PARTITION BY ... ORDER BY ... ROWS/RANGE ...)` — parsed and handled by `WindowAgg` kernel; ⚠️ not wired end-to-end
 - [x] `WindowAgg` operator — kernel exists with tests
@@ -668,7 +668,7 @@ driver can connect.
 - [x] `Sort` kernel (in-memory; external spill TBD) — wired; `order_by_round_trip.rs` covers ASC/DESC/multi-key/GROUP BY + ORDER BY
 - [x] `Unique` — kernel exists (`unique.rs`); ⚠️ DISTINCT wire path pending
 - [x] `SetOp` (UNION/INTERSECT/EXCEPT) — kernel + wired; `setop_round_trip.rs` covers UNION, UNION ALL, INTERSECT, INTERSECT ALL
-- [ ] `RecursiveUnion` (WITH RECURSIVE) — wire path
+- [x] `RecursiveUnion` (WITH RECURSIVE) — wire path — `binder::bind_recursive_cte` splits anchor + recursive term and exposes the CTE name in scope for the recursive term; `pipeline::lower_recursive_cte` runs a fixpoint loop with row-key dedup for `UNION DISTINCT` and a 1024-iteration safety cap for `UNION ALL`. `cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint` exercises a 4-node graph with a cycle
 - [x] `LockRows` — kernel exists (`lock_rows.rs`); wire path complete `847b3de`
 - [x] `Materialize` — kernel exists (`materialize.rs`); ⚠️ not yet selected by planner
 - [ ] `Gather` / `GatherMerge` (parallel query)
