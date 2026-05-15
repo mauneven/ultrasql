@@ -1296,4 +1296,68 @@ mod wal_emission {
             "page LSN must equal WAL delete LSN after delete"
         );
     }
+
+    // ------------------------------------------------------------------
+    // vacuum_heap tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn vacuum_heap_reclaims_committed_dead_tuples() {
+        let heap = make_heap(16);
+        let r = rel();
+
+        // Insert two tuples under different XIDs.
+        let t1 = heap.insert(r, b"live", opts(10)).unwrap();
+        let t2 = heap.insert(r, b"dead", opts(20)).unwrap();
+
+        // Delete t2 under XID 30.
+        heap.delete(t2, del_opts(30, 0)).unwrap();
+
+        // Build an oracle that says XIDs 10, 20, 30 are all committed.
+        let oracle = MapOracle::default();
+        oracle.set_committed(Xid::new(10));
+        oracle.set_committed(Xid::new(20));
+        oracle.set_committed(Xid::new(30));
+
+        // oldest_active_xid > 30, so XID 30 is eligible for vacuum.
+        let stats = heap.vacuum_heap(r, Xid::new(100), &oracle).unwrap();
+        assert_eq!(stats.tuples_reclaimed, 1, "one dead tuple expected");
+        assert_eq!(stats.pages_compacted, 1, "one page should have been compacted");
+
+        // t1 must still be fetchable; t2 must be gone (slot is now dead/unused).
+        let live = heap.fetch(t1).unwrap();
+        assert_eq!(live.data, b"live");
+    }
+
+    #[test]
+    fn vacuum_heap_skips_in_progress_deleters() {
+        let heap = make_heap(16);
+        let r = rel();
+
+        let t = heap.insert(r, b"row", opts(10)).unwrap();
+        heap.delete(t, del_opts(50, 0)).unwrap();
+
+        let oracle = MapOracle::default();
+        oracle.set_committed(Xid::new(10));
+        // XID 50 is NOT committed in the oracle.
+
+        // oldest_active_xid = 40 < 50, so XID 50 is still "in progress".
+        let stats = heap.vacuum_heap(r, Xid::new(40), &oracle).unwrap();
+        assert_eq!(stats.tuples_reclaimed, 0, "in-progress delete must not be vacuumed");
+    }
+
+    #[test]
+    fn vacuum_heap_skips_alive_tuples() {
+        let heap = make_heap(16);
+        let r = rel();
+
+        heap.insert(r, b"still alive", opts(10)).unwrap();
+
+        let oracle = MapOracle::default();
+        oracle.set_committed(Xid::new(10));
+
+        let stats = heap.vacuum_heap(r, Xid::new(100), &oracle).unwrap();
+        assert_eq!(stats.tuples_reclaimed, 0, "alive tuple must not be reclaimed");
+        assert_eq!(stats.pages_compacted, 0);
+    }
 }

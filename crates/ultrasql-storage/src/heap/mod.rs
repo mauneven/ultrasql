@@ -461,4 +461,5 @@ impl<L: PageLoader> HeapAccess<L> {
 }
 
 pub use scan::{HeapScan, VisibleHeapScan};
+pub use vacuum::VacuumStats;
 pub use walker::VisibleHeapWalker;
