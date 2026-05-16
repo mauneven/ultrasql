@@ -1546,6 +1546,24 @@ pub enum Literal {
         /// Source span.
         span: Span,
     },
+    /// Typed string constant. SQL syntax: `TYPENAME 'literal-body'`.
+    /// Covers `DATE 'YYYY-MM-DD'`, `TIMESTAMP '…'`, `TIME '…'`, and
+    /// `INTERVAL '…' [unit]`. The body is the decoded string content;
+    /// the binder is responsible for parsing it into the appropriate
+    /// `Value` variant.
+    Typed {
+        /// Lowercase type-name keyword (`"date"`, `"timestamp"`,
+        /// `"timestamptz"`, `"time"`, `"interval"`).
+        type_name: String,
+        /// Decoded string body (no surrounding quotes).
+        value: String,
+        /// Optional trailing interval unit (`"year"`, `"month"`, …)
+        /// for `INTERVAL '…' unit`. Empty for non-interval typed
+        /// literals.
+        unit: Option<String>,
+        /// Source span covering the whole `TYPENAME '…'` construct.
+        span: Span,
+    },
 }
 
 impl Literal {
@@ -1557,7 +1575,8 @@ impl Literal {
             | Self::Bool { span, .. }
             | Self::Integer { span, .. }
             | Self::Float { span, .. }
-            | Self::String { span, .. } => *span,
+            | Self::String { span, .. }
+            | Self::Typed { span, .. } => *span,
         }
     }
 }

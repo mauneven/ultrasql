@@ -60,6 +60,28 @@ pub enum Value {
     Time(i64),
     /// UUID — raw 16 bytes.
     Uuid([u8; 16]),
+    /// Decimal/Numeric — scaled integer representation. The runtime
+    /// value is `value * 10^-scale`. Storage shape is `i64` to keep
+    /// the eval path numeric-fast; `DECIMAL(p, s)` columns whose
+    /// product or sum overflows i64 must be widened by the planner
+    /// before the operation lands here.
+    Decimal {
+        /// Scaled integer payload.
+        value: i64,
+        /// Number of digits after the decimal point.
+        scale: i32,
+    },
+    /// Interval — separate month / day / microsecond components, matching
+    /// the PostgreSQL `INTERVAL` value shape so that `DATE + INTERVAL`
+    /// month-aware arithmetic gives the same result.
+    Interval {
+        /// Whole months.
+        months: i32,
+        /// Whole days.
+        days: i32,
+        /// Sub-day microseconds.
+        microseconds: i64,
+    },
 }
 
 /// `Eq` is satisfied because `PartialEq` is reflexive on the bit-pattern
@@ -96,6 +118,19 @@ impl Hash for Value {
             Self::Timestamp(v) | Self::TimestampTz(v) | Self::Time(v) => v.hash(state),
             Self::Date(v) => v.hash(state),
             Self::Uuid(v) => v.hash(state),
+            Self::Decimal { value, scale } => {
+                value.hash(state);
+                scale.hash(state);
+            }
+            Self::Interval {
+                months,
+                days,
+                microseconds,
+            } => {
+                months.hash(state);
+                days.hash(state);
+                microseconds.hash(state);
+            }
         }
     }
 }
@@ -122,6 +157,11 @@ impl Value {
             Self::Date(_) => DataType::Date,
             Self::Time(_) => DataType::Time,
             Self::Uuid(_) => DataType::Uuid,
+            Self::Decimal { scale, .. } => DataType::Decimal {
+                precision: None,
+                scale: Some(*scale),
+            },
+            Self::Interval { .. } => DataType::Interval,
         }
     }
 
@@ -220,6 +260,33 @@ impl fmt::Display for Value {
             Self::Timestamp(us) | Self::TimestampTz(us) => write!(f, "{us}us"),
             Self::Date(d) => write!(f, "{d}d"),
             Self::Time(t) => write!(f, "{t}us"),
+            Self::Decimal { value, scale } => {
+                // PostgreSQL-style fixed-point text. `value` is the
+                // scaled integer; insert the decimal point `scale`
+                // digits from the right. Negative scale (allowed by
+                // the type) appends trailing zeros instead.
+                let sign = if *value < 0 { "-" } else { "" };
+                let mag = value.unsigned_abs();
+                if *scale <= 0 {
+                    let pow = u64::checked_pow(10, scale.unsigned_abs()).unwrap_or(1);
+                    write!(f, "{sign}{}", mag.saturating_mul(pow))
+                } else {
+                    let scale_u = u32::try_from(*scale).unwrap_or(0);
+                    let divisor = u64::checked_pow(10, scale_u).unwrap_or(1);
+                    let whole = mag / divisor;
+                    let frac = mag % divisor;
+                    write!(
+                        f,
+                        "{sign}{whole}.{frac:0width$}",
+                        width = scale_u as usize
+                    )
+                }
+            }
+            Self::Interval {
+                months,
+                days,
+                microseconds,
+            } => write!(f, "{months}mon {days}d {microseconds}us"),
             Self::Uuid(u) => {
                 write!(
                     f,

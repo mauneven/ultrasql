@@ -95,6 +95,28 @@ fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
             max_len: max_len_modifier(),
         }),
         "bytea" => Ok(DataType::Bytea),
+        // `DATE` columns are encoded by the row codec as 4-byte
+        // little-endian i32 days since 2000-01-01 (see
+        // `crates/ultrasql-executor/src/row_codec.rs`); the SQL
+        // surface is enabled.
+        "date" => Ok(DataType::Date),
+        // `DECIMAL(p, s)` / `NUMERIC(p, s)` columns store a scaled
+        // i64 payload at the row codec; the per-column scale lives
+        // in the schema entry. TPC-H `DECIMAL(15, 2)` fits in i64
+        // by a comfortable margin (max 10^17 vs i64::MAX ≈ 9.2×10^18).
+        "decimal" | "numeric" => {
+            let precision = t.type_modifiers.first().copied();
+            let scale = t
+                .type_modifiers
+                .get(1)
+                .copied()
+                .and_then(|s| i32::try_from(s).ok())
+                .or(Some(0));
+            Ok(DataType::Decimal { precision, scale })
+        }
+        "time" => Ok(DataType::Time),
+        "timestamp" => Ok(DataType::Timestamp),
+        "timestamptz" | "timestamp with time zone" => Ok(DataType::TimestampTz),
         _ => Err(PlanError::NotSupported(
             "CREATE TABLE: column type not implemented in v0.5",
         )),

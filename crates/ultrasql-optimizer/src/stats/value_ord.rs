@@ -143,6 +143,23 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             out.extend_from_slice(u);
             out
         }
+        Value::Decimal { value, scale } => {
+            let mut out = vec![14];
+            out.extend_from_slice(&value.to_be_bytes());
+            out.extend_from_slice(&scale.to_be_bytes());
+            out
+        }
+        Value::Interval {
+            months,
+            days,
+            microseconds,
+        } => {
+            let mut out = vec![15];
+            out.extend_from_slice(&months.to_be_bytes());
+            out.extend_from_slice(&days.to_be_bytes());
+            out.extend_from_slice(&microseconds.to_be_bytes());
+            out
+        }
     }
 }
 
@@ -188,6 +205,8 @@ const fn discriminant(v: &Value) -> u8 {
         Value::Date(_) => 11,
         Value::Time(_) => 12,
         Value::Uuid(_) => 13,
+        Value::Decimal { .. } => 14,
+        Value::Interval { .. } => 15,
     }
 }
 

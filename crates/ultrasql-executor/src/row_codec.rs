@@ -351,6 +351,28 @@ impl RowCodec {
                 (DataType::Float64, Value::Float64(v)) => {
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
+                (DataType::Date, Value::Date(v)) => {
+                    // `Date` stores days since 2000-01-01 in an `i32`.
+                    // Same wire shape as `Int32`; the column-builder
+                    // path reuses the `Int32` arm for storage. Schema
+                    // type tags carry the date semantics for the
+                    // surrounding executor.
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                (DataType::Decimal { .. }, Value::Decimal { value, .. }) => {
+                    // Decimal storage: scaled i64 value, 8 bytes LE.
+                    // Per-column scale lives in the schema; the value
+                    // payload is the scaled integer.
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
+                (DataType::Timestamp, Value::Timestamp(v))
+                | (DataType::TimestampTz, Value::TimestampTz(v))
+                | (DataType::Time, Value::Time(v)) => {
+                    // Microsecond-precision temporal: 8 bytes LE i64
+                    // (microseconds since 2000-01-01 for Timestamp/Tz,
+                    // microseconds since midnight for Time).
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
                 (DataType::Text { .. }, Value::Text(s)) => {
                     let bytes = s.as_bytes();
                     let len =
@@ -513,6 +535,72 @@ impl RowCodec {
                     })?;
                     cursor += 8;
                     Value::Float64(f64::from_le_bytes(raw))
+                }
+                DataType::Date => {
+                    // `Date` storage: 4-byte little-endian i32 days
+                    // since 2000-01-01 (same wire shape as Int32).
+                    let needed = cursor + 4;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 4] = bytes[cursor..cursor + 4].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 4;
+                    Value::Date(i32::from_le_bytes(raw))
+                }
+                DataType::Decimal { scale, .. } => {
+                    // Decimal storage: 8-byte little-endian scaled
+                    // i64 payload. Per-column scale lives in the
+                    // schema field; the codec reads it back here.
+                    let needed = cursor + 8;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 8] = bytes[cursor..cursor + 8].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 8;
+                    Value::Decimal {
+                        value: i64::from_le_bytes(raw),
+                        scale: scale.unwrap_or(0),
+                    }
+                }
+                DataType::Timestamp | DataType::TimestampTz | DataType::Time => {
+                    // Microsecond temporal: 8-byte little-endian i64.
+                    let needed = cursor + 8;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 8] = bytes[cursor..cursor + 8].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 8;
+                    let v = i64::from_le_bytes(raw);
+                    match field.data_type {
+                        DataType::Timestamp => Value::Timestamp(v),
+                        DataType::TimestampTz => Value::TimestampTz(v),
+                        DataType::Time => Value::Time(v),
+                        _ => unreachable!(),
+                    }
                 }
                 DataType::Text { .. } => {
                     let len_end = cursor + 4;
@@ -721,6 +809,52 @@ impl RowCodec {
                     })?;
                     cursor += 8;
                     data.push(f64::from_le_bytes(raw));
+                    nulls.push_valid();
+                }
+                (DataType::Date, ColumnBuilder::Int32 { data, nulls }) => {
+                    // Date values share the Int32 builder; the column
+                    // is reported as Int32-typed to downstream batches
+                    // and the schema carries the date semantics.
+                    let needed = cursor + 4;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 4] = bytes[cursor..cursor + 4].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 4;
+                    data.push(i32::from_le_bytes(raw));
+                    nulls.push_valid();
+                }
+                (DataType::Decimal { .. }, ColumnBuilder::Int64 { data, nulls })
+                | (DataType::Timestamp, ColumnBuilder::Int64 { data, nulls })
+                | (DataType::TimestampTz, ColumnBuilder::Int64 { data, nulls })
+                | (DataType::Time, ColumnBuilder::Int64 { data, nulls }) => {
+                    // Decimal / Timestamp / Time share the Int64
+                    // builder; the schema carries the scale (for
+                    // Decimal) and the semantic tag for the
+                    // surrounding executor.
+                    let needed = cursor + 8;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 8] = bytes[cursor..cursor + 8].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 8;
+                    data.push(i64::from_le_bytes(raw));
                     nulls.push_valid();
                 }
                 (
@@ -939,6 +1073,25 @@ impl ColumnBuilder {
                 data: Vec::with_capacity(capacity),
                 nulls: NullTracker::default(),
             },
+            DataType::Date => Self::Int32 {
+                // `Date` storage shares the `Int32` builder: days
+                // since 2000-01-01 are i32 by definition. Schema
+                // tags carry the date semantics so downstream
+                // operators that care about date comparisons (range
+                // filters, sort) still see a `DataType::Date` field.
+                data: Vec::with_capacity(capacity),
+                nulls: NullTracker::default(),
+            },
+            DataType::Decimal { .. }
+            | DataType::Timestamp
+            | DataType::TimestampTz
+            | DataType::Time => Self::Int64 {
+                // `Decimal` / `Timestamp` / `Time` storage shares the
+                // `Int64` builder; the schema field carries the
+                // semantic tag and (for Decimal) the scale.
+                data: Vec::with_capacity(capacity),
+                nulls: NullTracker::default(),
+            },
             DataType::Text { .. } => Self::Utf8 {
                 offsets: {
                     let mut o = Vec::with_capacity(capacity + 1);
@@ -1075,6 +1228,11 @@ const fn is_supported_type(ty: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
             | DataType::Text { .. }
+            | DataType::Date
+            | DataType::Time
+            | DataType::Timestamp
+            | DataType::TimestampTz
+            | DataType::Decimal { .. }
             | DataType::Null
     )
 }

@@ -295,6 +295,21 @@ impl std::hash::Hash for OrderedValue {
                 state.write_u8(11);
                 u.hash(state);
             }
+            Value::Decimal { value, scale } => {
+                state.write_u8(12);
+                value.hash(state);
+                scale.hash(state);
+            }
+            Value::Interval {
+                months,
+                days,
+                microseconds,
+            } => {
+                state.write_u8(13);
+                months.hash(state);
+                days.hash(state);
+                microseconds.hash(state);
+            }
         }
     }
 }

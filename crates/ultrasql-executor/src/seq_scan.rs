@@ -874,6 +874,68 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 };
                 Column::Utf8(col)
             }
+            DataType::Date => {
+                // Date values share the Int32 batch column: the
+                // storage is the same 4-byte little-endian payload
+                // (days since 2000-01-01). The schema field still
+                // reports `DataType::Date` so downstream operators
+                // that care about date semantics keep the type tag.
+                let mut data: Vec<i32> = Vec::with_capacity(n_rows);
+                for (row_idx, row) in rows.iter().enumerate() {
+                    match &row[col_idx] {
+                        Value::Date(v) => data.push(*v),
+                        Value::Null => data.push(0),
+                        other => {
+                            return Err(ExecError::TypeMismatch(format!(
+                                "expected Date at row {row_idx} col {col_idx}, got {:?}",
+                                other.data_type()
+                            )));
+                        }
+                    }
+                }
+                let col = if let Some(nulls) = build_validity(col_idx) {
+                    NumericColumn::with_nulls(data, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                } else {
+                    NumericColumn::from_data(data)
+                };
+                Column::Int32(col)
+            }
+            DataType::Decimal { .. }
+            | DataType::Timestamp
+            | DataType::TimestampTz
+            | DataType::Time => {
+                // Decimal / Timestamp / Time values share the Int64
+                // batch column. Schema field carries the semantic
+                // tag (and scale, for Decimal).
+                let mut data: Vec<i64> = Vec::with_capacity(n_rows);
+                for (row_idx, row) in rows.iter().enumerate() {
+                    let v_i64 = match &row[col_idx] {
+                        Value::Decimal { value, .. } => *value,
+                        Value::Timestamp(v)
+                        | Value::TimestampTz(v)
+                        | Value::Time(v) => *v,
+                        Value::Int16(v) => i64::from(*v),
+                        Value::Int32(v) => i64::from(*v),
+                        Value::Int64(v) => *v,
+                        Value::Null => 0,
+                        other => {
+                            return Err(ExecError::TypeMismatch(format!(
+                                "expected Decimal/Timestamp/Time at row {row_idx} col {col_idx}, got {:?}",
+                                other.data_type()
+                            )));
+                        }
+                    };
+                    data.push(v_i64);
+                }
+                let col = if let Some(nulls) = build_validity(col_idx) {
+                    NumericColumn::with_nulls(data, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                } else {
+                    NumericColumn::from_data(data)
+                };
+                Column::Int64(col)
+            }
             other => {
                 return Err(ExecError::TypeMismatch(format!(
                     "SeqScan: unsupported column type {other} for batch building"

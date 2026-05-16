@@ -31,6 +31,12 @@
 
 #![allow(clippy::print_stdout)]
 #![allow(clippy::print_stderr)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
+)]
 // Legacy per-iter OLAP helpers `run_select_iter` / `run_sum_iter` /
 // `run_avg_iter` / `run_filter_sum_iter` are retained for the
 // historical "fresh table per iter" measurement mode. The current

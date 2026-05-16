@@ -380,6 +380,12 @@ pub(super) fn bind_literal(lit: &Literal) -> ScalarExpr {
             value: Value::Text(value.clone()),
             data_type: DataType::Text { max_len: None },
         },
+        Literal::Typed {
+            type_name,
+            value,
+            unit: _,
+            ..
+        } => bind_typed_literal(type_name, value),
         // `Literal::Null` and any future non-exhaustive variant both
         // bind to a NULL placeholder; later passes specialize.
         _ => ScalarExpr::Literal {
@@ -387,6 +393,81 @@ pub(super) fn bind_literal(lit: &Literal) -> ScalarExpr {
             data_type: DataType::Null,
         },
     }
+}
+
+/// Convert a `TYPENAME 'literal'` AST node into the matching
+/// [`ScalarExpr::Literal`].
+///
+/// Supported today:
+/// - `DATE 'YYYY-MM-DD'` → `Value::Date(days_since_2000_01_01)`.
+///
+/// Unsupported variants (TIME, TIMESTAMP, TIMESTAMPTZ, INTERVAL) bind
+/// to NULL today so the binder does not reject queries upstream of the
+/// executor. Adding full support is a tracked v0.6 follow-up; the
+/// upstream executor will surface a clearer message when those values
+/// flow into a comparison.
+fn bind_typed_literal(type_name: &str, value: &str) -> ScalarExpr {
+    match type_name {
+        "date" => match parse_date_literal(value) {
+            Some(days) => ScalarExpr::Literal {
+                value: Value::Date(days),
+                data_type: DataType::Date,
+            },
+            None => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::Date,
+            },
+        },
+        _ => ScalarExpr::Literal {
+            value: Value::Null,
+            data_type: DataType::Null,
+        },
+    }
+}
+
+/// Parse `YYYY-MM-DD` into days since 2000-01-01.
+///
+/// Uses the Howard Hinnant `civil_from_days` inverse, valid for any
+/// Gregorian date the engine cares about. Returns `None` on
+/// malformed input; the binder maps that to a typed NULL so the
+/// downstream comparator still sees a `Date` typed expression.
+fn parse_date_literal(text: &str) -> Option<i32> {
+    let trimmed = text.trim();
+    if trimmed.len() < 10 {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let year: i32 = std::str::from_utf8(&bytes[..4]).ok()?.parse().ok()?;
+    let month: u32 = std::str::from_utf8(&bytes[5..7]).ok()?.parse().ok()?;
+    let day: u32 = std::str::from_utf8(&bytes[8..10]).ok()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_since_epoch(year, month, day))
+}
+
+/// Days from the 2000-01-01 epoch to (year, month, day), positive or
+/// negative. The algorithm is Howard Hinnant's `days_from_civil`,
+/// rebased on 2000-03-01 internally then offset back to 2000-01-01.
+/// Source: <https://howardhinnant.github.io/date_algorithms.html>.
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Howard Hinnant civil_from_days algorithm: y - era*400 is provably in [0, 399], so the i32 → u32 cast cannot lose information; doe < 146_097 always fits in i32"
+)]
+fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as u32; // [0, 399]
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    let days_from_1970_03_01 = era * 146_097 + doe as i32 - 719_468;
+    // Rebase from 1970-01-01 to 2000-01-01 (10_957 days).
+    days_from_1970_03_01 - 10_957
 }
 
 /// Pick the narrowest signed integer type that fits a decimal literal.
@@ -517,4 +598,50 @@ pub(super) fn bind_binary(
         right: Box::new(r),
         data_type,
     })
+}
+
+#[cfg(test)]
+mod typed_literal_tests {
+    use super::{days_since_epoch, parse_date_literal};
+
+    #[test]
+    fn epoch_day_is_zero() {
+        assert_eq!(parse_date_literal("2000-01-01"), Some(0));
+    }
+
+    #[test]
+    fn one_day_after_epoch() {
+        assert_eq!(parse_date_literal("2000-01-02"), Some(1));
+    }
+
+    #[test]
+    fn pre_epoch_six_years_back() {
+        // 1994-01-01: six 365-day years back plus one leap (1996),
+        // so 6*365 + 1 = 2191 days before the epoch.
+        assert_eq!(parse_date_literal("1994-01-01"), Some(-2191));
+    }
+
+    #[test]
+    fn one_year_forward_is_365_or_366() {
+        let y2000 = parse_date_literal("2000-01-01").unwrap();
+        let y2001 = parse_date_literal("2001-01-01").unwrap();
+        assert_eq!(y2001 - y2000, 366, "2000 was a leap year");
+        let y2002 = parse_date_literal("2002-01-01").unwrap();
+        assert_eq!(y2002 - y2001, 365);
+    }
+
+    #[test]
+    fn rejects_malformed() {
+        assert!(parse_date_literal("not-a-date").is_none());
+        assert!(parse_date_literal("2000/01/01").is_none());
+        assert!(parse_date_literal("2000-13-01").is_none());
+        assert!(parse_date_literal("2000-01-32").is_none());
+    }
+
+    #[test]
+    fn algorithm_handles_leap_year_february() {
+        let feb29 = days_since_epoch(2000, 2, 29);
+        let mar01 = days_since_epoch(2000, 3, 1);
+        assert_eq!(mar01 - feb29, 1, "2000-02-29 → 2000-03-01 is one day");
+    }
 }

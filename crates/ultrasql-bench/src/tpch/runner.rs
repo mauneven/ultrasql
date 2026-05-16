@@ -7,7 +7,9 @@
 //! The Postgres execution path is gated behind the `pg-runner` Cargo feature.
 //! Without the feature, [`run_postgres`] returns an error.
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+#[cfg(not(feature = "sql-bench"))]
+use anyhow::bail;
 
 #[cfg(feature = "pg-runner")]
 use anyhow::Context;
@@ -89,14 +91,150 @@ pub fn run_postgres(_warmup: usize, _runs: usize) -> Result<RunResult> {
     bail!("NotYetWired: pg-runner feature is not enabled; rebuild with --features pg-runner")
 }
 
-/// Runs all 22 TPC-H queries against UltraSQL.
+/// Runs all 22 TPC-H queries against an in-process UltraSQL server.
 ///
-/// Currently returns `Error::NotYetWired` because the executor's datasource
-/// lowering path is not yet available (targeted for v0.6+ executor refactor).
+/// Spawns a fresh `ultrasqld` on an ephemeral port, runs the eight TPC-H
+/// `CREATE TABLE` statements, then runs each query for `warmup + runs`
+/// iterations and records the measured timings. Queries that fail on the
+/// current SQL surface are recorded with `f64::NAN` medians so the caller
+/// can see exactly which TPC-H shape is unsupported.
+///
+/// The data side (loading `.tbl` files into UltraSQL) is owned by
+/// [`crate::tpch::load`] — this function does not insert rows. Run after
+/// loading data into the same in-process server is a follow-up wiring item
+/// once the loader's UltraSQL path lands.
+#[cfg(feature = "sql-bench")]
+pub fn run_ultrasql(warmup: usize, runs: usize) -> Result<RunResult> {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use anyhow::Context;
+    use tokio_postgres::NoTls;
+    use ultrasql_server::{Server, bind_listener, serve_listener};
+
+    use crate::tpch::baseline::{median, p95};
+    use crate::tpch::{queries, schema};
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+
+    let (timings, errors) = runtime.block_on(async move {
+        let bind_addr: SocketAddr = "127.0.0.1:0"
+            .parse()
+            .context("parse 127.0.0.1:0")?;
+        let (listener, bound) =
+            bind_listener(bind_addr).await.context("bind ultrasqld")?;
+        let state = Arc::new(Server::with_sample_database());
+        let server_task = tokio::spawn(async move {
+            if let Err(e) = serve_listener(listener, state).await {
+                eprintln!("ultrasqld task exited: {e}");
+            }
+        });
+
+        let conn_str =
+            format!("host=127.0.0.1 port={} user=ultrasql_bench", bound.port());
+        let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+            .await
+            .context("tokio-postgres connect to ultrasqld")?;
+        let conn_handle = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("tokio-postgres connection error: {e}");
+            }
+        });
+
+        let mut schema_errors: Vec<String> = Vec::new();
+        for stmt in schema::ddl_for_engine(schema::Engine::Ultrasql) {
+            if let Err(e) = client.batch_execute(stmt).await {
+                let detail = e
+                    .as_db_error()
+                    .map(|d| d.message().to_owned())
+                    .unwrap_or_else(|| e.to_string());
+                schema_errors.push(format!(
+                    "DDL: {detail}\n    SQL: {head}",
+                    head = stmt.lines().next().unwrap_or("").trim()
+                ));
+            }
+        }
+
+        let mut timings: Vec<(String, QueryTimings)> = Vec::new();
+        for n in 1_u8..=22 {
+            let sql = queries::query(n).expect("queries 1..=22 always present");
+            let label = format!("q{n}");
+            let mut measured: Vec<f64> = Vec::with_capacity(runs);
+            let mut first_error: Option<String> = None;
+
+            let fmt_err = |e: &tokio_postgres::Error| -> String {
+                e.as_db_error()
+                    .map(|d| d.message().to_owned())
+                    .unwrap_or_else(|| e.to_string())
+            };
+
+            for _ in 0..warmup {
+                if let Err(e) = client.batch_execute(sql).await {
+                    first_error.get_or_insert(format!("warmup: {}", fmt_err(&e)));
+                    break;
+                }
+            }
+            if first_error.is_none() {
+                for _ in 0..runs {
+                    let t0 = Instant::now();
+                    if let Err(e) = client.batch_execute(sql).await {
+                        first_error.get_or_insert(format!("run: {}", fmt_err(&e)));
+                        break;
+                    }
+                    measured.push(t0.elapsed().as_secs_f64() * 1_000.0);
+                }
+            }
+
+            let (median_ms, p95_ms) = if measured.is_empty() {
+                (f64::NAN, f64::NAN)
+            } else {
+                (median(&measured), p95(&measured))
+            };
+            if let Some(msg) = first_error {
+                eprintln!("ultrasql {label}: {msg}");
+            }
+            timings.push((
+                label,
+                QueryTimings {
+                    median_ms,
+                    p95_ms,
+                    runs: measured,
+                },
+            ));
+        }
+
+        drop(client);
+        conn_handle.abort();
+        server_task.abort();
+
+        Ok::<_, anyhow::Error>((timings, schema_errors))
+    })?;
+
+    if !errors.is_empty() {
+        eprintln!(
+            "ultrasql TPC-H run: {} DDL statement(s) failed; the dependent \
+             queries will report NaN medians:",
+            errors.len()
+        );
+        for e in &errors {
+            eprintln!("  - {e}");
+        }
+    }
+
+    Ok(RunResult { timings })
+}
+
+/// Stub: returns an error when the `sql-bench` feature is not active.
+#[cfg(not(feature = "sql-bench"))]
 pub fn run_ultrasql(_warmup: usize, _runs: usize) -> Result<RunResult> {
     bail!(
-        "NotYetWired: UltraSQL query runner is pending the executor datasource \
-         refactor (v0.6+)"
+        "NotYetWired: rebuild ultrasql-bench with --features sql-bench to \
+         enable the in-process TPC-H runner"
     )
 }
 

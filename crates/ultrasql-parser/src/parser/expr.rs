@@ -83,16 +83,24 @@ impl<'src> Parser<'src> {
             }
 
             // `expr [NOT] IN (…)` — consumed here rather than the binary loop.
+            // The earlier implementation `return`ed straight out of the
+            // Pratt loop, which dropped every binary operator chained
+            // after the IN clause (e.g. the trailing `AND foo > bar`
+            // inside a WHERE block). We feed the IN/NOT-IN result back
+            // through the loop so the standard Pratt walk keeps
+            // composing the remaining boolean chain.
             if self.peek()?.kind == TokenKind::KwIn {
                 self.advance()?; // IN
-                return self.parse_in_expr(left, false);
+                left = self.parse_in_expr(left, false)?;
+                continue 'outer;
             }
             if self.peek()?.kind == TokenKind::KwNot
                 && self.lookahead_at(1)?.kind == TokenKind::KwIn
             {
                 self.advance()?; // NOT
                 self.advance()?; // IN
-                return self.parse_in_expr(left, true);
+                left = self.parse_in_expr(left, true)?;
+                continue 'outer;
             }
 
             // ----------------------------------------------------------------
@@ -135,7 +143,9 @@ impl<'src> Parser<'src> {
     #[allow(clippy::too_many_lines)]
     fn parse_prefix(&mut self) -> Result<Expr, ParseError> {
         let tok = self.peek()?;
-        match tok.kind {
+        let tok_kind = tok.kind;
+        let tok_span = tok.span;
+        match tok_kind {
             TokenKind::Plus | TokenKind::Minus | TokenKind::KwNot | TokenKind::Tilde => {
                 let op_tok = self.advance()?;
                 let op = match op_tok.kind {
@@ -187,6 +197,65 @@ impl<'src> Parser<'src> {
                 Ok(Expr::Literal(Literal::String {
                     value,
                     span: t.span,
+                }))
+            }
+
+            // `DATE 'YYYY-MM-DD'`, `TIMESTAMP 'YYYY-MM-DD …'`,
+            // `TIME 'HH:MM:SS'`, `INTERVAL '…' [UNIT]` — typed string
+            // constants. The opening token is a type-name keyword; the
+            // next token must be a string literal. The lookahead check
+            // is done inside the arm body (rather than as a match guard)
+            // because the borrow checker rejects the second mutable
+            // borrow of `self` a guard expression introduces.
+            TokenKind::KwDate
+            | TokenKind::KwTime
+            | TokenKind::KwTimestamp
+            | TokenKind::KwInterval => {
+                let next_is_string = matches!(
+                    self.lookahead_at(1).map(|t| t.kind),
+                    Ok(TokenKind::String | TokenKind::EscapedString)
+                );
+                if !next_is_string {
+                    return Err(ParseError::Expected {
+                        expected: "expression",
+                        found: tok_kind,
+                        offset: tok_span.start as usize,
+                    });
+                }
+                let kw_tok = self.advance()?;
+                let str_tok = self.advance()?;
+                let type_name = match kw_tok.kind {
+                    TokenKind::KwDate => "date",
+                    TokenKind::KwTime => "time",
+                    TokenKind::KwTimestamp => "timestamp",
+                    TokenKind::KwInterval => "interval",
+                    _ => unreachable!(),
+                };
+                let raw = str_tok.text(self.source).unwrap_or("");
+                let value = if matches!(str_tok.kind, TokenKind::String) {
+                    raw[1..raw.len() - 1].replace("''", "'")
+                } else {
+                    raw.to_owned()
+                };
+                let mut span_end = str_tok.span.end;
+                let unit = if kw_tok.kind == TokenKind::KwInterval {
+                    let next_kind = self.peek().map(|t| t.kind).unwrap_or(TokenKind::Eof);
+                    if matches!(next_kind, TokenKind::Identifier) {
+                        let id_tok = self.advance()?;
+                        let id_text = id_tok.text(self.source).unwrap_or("").to_lowercase();
+                        span_end = id_tok.span.end;
+                        Some(id_text)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Ok(Expr::Literal(Literal::Typed {
+                    type_name: type_name.to_owned(),
+                    value,
+                    unit,
+                    span: Span::new(kw_tok.span.start, span_end),
                 }))
             }
             TokenKind::KwNull => {
@@ -328,6 +397,96 @@ impl<'src> Parser<'src> {
         let name = self.parse_object_name()?;
         if self.peek()?.kind == TokenKind::LParen {
             self.advance()?;
+
+            // Special non-standard call shape: `EXTRACT(unit FROM expr)`.
+            // The PostgreSQL / SQL-standard `extract` function uses the
+            // keyword `FROM` instead of a comma between the unit and
+            // the source expression. We desugar to the canonical
+            // `extract(unit_text, expr)` call shape so the binder can
+            // dispatch through its usual function-resolution path.
+            let is_extract = name.parts.len() == 1
+                && name.parts[0].value.eq_ignore_ascii_case("extract");
+            if is_extract && self.peek()?.kind != TokenKind::RParen {
+                let unit_tok = self.advance()?;
+                // Allow an identifier or any keyword token as the unit;
+                // PostgreSQL accepts a quoted string here too. The
+                // binder normalises the spelling to lowercase.
+                let unit_text = unit_tok
+                    .text(self.source)
+                    .unwrap_or("")
+                    .trim_matches(|c| c == '"' || c == '\'')
+                    .to_ascii_lowercase();
+                self.expect(TokenKind::KwFrom, "FROM")?;
+                let target = self.parse_expr()?;
+                let rp = self.expect(TokenKind::RParen, ")")?;
+                return Ok(Expr::Call {
+                    args: vec![
+                        Expr::Literal(crate::ast::Literal::String {
+                            value: unit_text,
+                            span: unit_tok.span,
+                        }),
+                        target,
+                    ],
+                    distinct: false,
+                    over: None,
+                    span: Span::new(name.span.start, rp.span.end),
+                    name,
+                });
+            }
+
+            // Special non-standard call shape: `SUBSTRING(s FROM n [FOR k])`.
+            // The SQL-standard `substring` accepts `FROM` and `FOR`
+            // keyword separators instead of commas. We desugar to the
+            // canonical `substring(s, n)` or `substring(s, n, k)` call
+            // so the binder's function-resolution path stays uniform.
+            // The comma form `substring(s, n, k)` is parsed by the
+            // normal argument loop below; we only intercept the
+            // keyword form.
+            let is_substring = name.parts.len() == 1
+                && name.parts[0].value.eq_ignore_ascii_case("substring");
+            if is_substring && self.peek()?.kind != TokenKind::RParen {
+                // Peek 2 ahead to decide whether keyword form is in
+                // use. The keyword form puts `FROM` after the first
+                // expression; the comma form puts a comma. We commit
+                // to keyword form once we have parsed the first arg
+                // and seen `FROM` next.
+                let first_arg = self.parse_expr()?;
+                if self.peek()?.kind == TokenKind::KwFrom {
+                    self.advance()?; // FROM
+                    let from_expr = self.parse_expr()?;
+                    let mut args = vec![first_arg, from_expr];
+                    // Optional `FOR length`. `KwFor` is the standard
+                    // FOR keyword (seen in `FOR UPDATE`, etc.).
+                    if self.peek()?.kind == TokenKind::KwFor {
+                        self.advance()?; // FOR
+                        args.push(self.parse_expr()?);
+                    }
+                    let rp = self.expect(TokenKind::RParen, ")")?;
+                    return Ok(Expr::Call {
+                        args,
+                        distinct: false,
+                        over: None,
+                        span: Span::new(name.span.start, rp.span.end),
+                        name,
+                    });
+                }
+                // Comma form: feed the first arg back into the normal
+                // loop by initialising the argument vector.
+                let mut args = vec![first_arg];
+                while self.peek()?.kind == TokenKind::Comma {
+                    self.advance()?;
+                    args.push(self.parse_expr()?);
+                }
+                let rp = self.expect(TokenKind::RParen, ")")?;
+                return Ok(Expr::Call {
+                    args,
+                    distinct: false,
+                    over: None,
+                    span: Span::new(name.span.start, rp.span.end),
+                    name,
+                });
+            }
+
             // Optional DISTINCT.
             let distinct = self.match_kw(TokenKind::KwDistinct);
             let mut args = Vec::new();

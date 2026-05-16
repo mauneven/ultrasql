@@ -546,6 +546,9 @@ fn value_to_copy_cell(value: &Value) -> Option<Vec<u8>> {
         }
         Value::Date(v) => Some(v.to_string().into_bytes()),
         Value::Uuid(bytes) => Some(format!("{bytes:x?}").into_bytes()),
+        Value::Decimal { .. } | Value::Interval { .. } => {
+            Some(value.to_string().into_bytes())
+        }
     }
 }
 

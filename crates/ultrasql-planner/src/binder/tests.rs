@@ -427,8 +427,11 @@ fn binds_create_table_rejects_unsupported_constraints() {
 
 #[test]
 fn binds_create_table_rejects_unsupported_column_type() {
+    // `JSONB` is still unsupported. The fixed-width numeric / text /
+    // temporal / decimal types have all moved to the supported set
+    // as of the v0.6 TPC-H milestone landing.
     let cat = InMemoryCatalog::new();
-    let err = parse_and_bind("CREATE TABLE t (id NUMERIC(10, 2))", &cat).unwrap_err();
+    let err = parse_and_bind("CREATE TABLE t (id JSONB)", &cat).unwrap_err();
     assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
 }
 

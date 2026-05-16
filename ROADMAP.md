@@ -870,6 +870,38 @@ driver can connect.
 ### Milestone
 - [ ] TPC-H scale 1 runs to completion on every query with correct results
 
+### TPC-H Harness Surface (v0.6 milestone work)
+Harness wired end-to-end. All 22 queries parse and reach the planner.
+All 8 TPC-H tables create cleanly. 4/22 queries execute against the
+empty schema (Q2 / Q11 / Q18 / Q20) — verified via
+`target/release/tpch run-queries ultrasql --runs 1 --warmup 0`. The
+remaining 18 queries error inside the binder / planner with the
+shapes catalogued below.
+
+#### Done
+
+- [x] `run_ultrasql` in [`crates/ultrasql-bench/src/tpch/runner.rs`](crates/ultrasql-bench/src/tpch/runner.rs) — in-process `ultrasqld` on an ephemeral port; runs the 22-query suite through `tokio-postgres`. Failures surface the real PostgreSQL `ErrorResponse` message via `as_db_error().message()`. Gated behind `--features sql-bench`.
+- [x] Engine-aware DDL split in [`crates/ultrasql-bench/src/tpch/schema.rs`](crates/ultrasql-bench/src/tpch/schema.rs) — eight TPC-H table DDLs ship in a `REGION` / `..._ULTRASQL` pair. The UltraSQL variant drops the table-level `PRIMARY KEY` clauses.
+- [x] Parser: `DATE 'YYYY-MM-DD'`, `TIMESTAMP '…'`, `TIME '…'`, `INTERVAL '…' UNIT` typed-string literals via new `Literal::Typed` AST variant.
+- [x] Parser: `EXTRACT(unit FROM expr)` keyword form desugared to `extract(unit_text, expr)`.
+- [x] Parser: `SUBSTRING(s FROM n [FOR k])` keyword form desugared to `substring(s, n[, k])`.
+- [x] Parser: `expr [NOT] IN (SELECT …) AND …` — IN result feeds back into the Pratt loop instead of returning early; trailing booleans no longer dropped. Unblocks Q20 at parse stage.
+- [x] Binder: `DATE 'YYYY-MM-DD'` → `Value::Date(days)` via self-contained Howard-Hinnant `civil_from_days` (no chrono dep). 6-test suite in `binder::expr_bind::typed_literal_tests`.
+- [x] `Value::Decimal { value: i64, scale: i32 }` + `Value::Interval { months, days, microseconds }` added to [`ultrasql-core/src/value.rs`](crates/ultrasql-core/src/value.rs). All exhaustive match sites updated (value_ord, hash_aggregate, hash_join, set_op, unique, copy).
+- [x] Row codec ([`crates/ultrasql-executor/src/row_codec.rs`](crates/ultrasql-executor/src/row_codec.rs)) encodes/decodes `DataType::Date` (4-byte i32 LE), `DataType::Decimal { .. }` (8-byte scaled i64 LE), `DataType::Timestamp` / `DataType::TimestampTz` / `DataType::Time` (8-byte i64 micros LE). Decimal scale is read from the schema field.
+- [x] `SeqScan::rows_to_columns` + `filter_op::batch_to_rows` handle Date / Decimal / Timestamp / TimestampTz / Time columns end-to-end. Column-builder pool uses Int32 backing for Date and Int64 backing for the wider temporal/decimal types; row materialiser re-tags the value with the correct `Value` variant on extraction.
+- [x] `CREATE TABLE` accepts `DATE` / `TIME` / `TIMESTAMP` / `TIMESTAMPTZ` / `DECIMAL(p, s)` / `NUMERIC(p, s)` columns. All eight TPC-H DDLs succeed. End-to-end coverage: [`crates/ultrasql-server/tests/date_column_round_trip.rs`](crates/ultrasql-server/tests/date_column_round_trip.rs) (4 tests: `create_table_with_date_column`, `insert_date_literal_and_scan`, `accepts_decimal_column`, `accepts_timestamp_column`).
+
+#### Remaining for milestone (18 queries blocked)
+
+- [ ] Aggregate binding under `GROUP BY` (Q1, Q3, Q4, Q5, Q6, Q10, Q13, Q15, Q21) — the binder hits `aggregate call outside aggregate context` even when the query has a `GROUP BY`. Repro: `target/release/tpch run-queries ultrasql --runs 1 --warmup 0`. Root cause: `binder/expr_bind.rs:55` resolves aggregate calls by looking up the derived output name in the input schema; the aggregate-context wiring that sets that schema is the open work.
+- [ ] Non-aggregate function dispatch (Q7, Q8, Q9, Q22) — `extract(year, …)`, `substring(s, n, k)`, and friends fail at `binder/expr_bind.rs:77` with `non-aggregate function calls`. The parser desugaring now produces canonical `Expr::Call`; the binder needs the matching function-resolution arm.
+- [ ] Expression variant not yet wired (Q12, Q14, Q16, Q19, Q22) — `CASE WHEN … THEN … END`, `IS NOT NULL` over expressions, and a few `expr LIKE pattern` shapes return `expression variant`. Each is a binder match-arm landing.
+- [ ] `Value::Interval` arithmetic (`DATE + INTERVAL`) — currently no constant-folder, so `DATE '…' + INTERVAL '1' YEAR` plans to NULL. Needed by Q1, Q4, Q5, Q6, Q10, Q12, Q14, Q15, Q20.
+- [ ] Decimal literal coercion — number literals are bound as `Float64`; comparing a `Decimal` column to `0.06` needs the binder to coerce `0.06 → Decimal { value: 6, scale: 2 }` based on the column's declared scale.
+- [ ] SELECT expression form (Q17) — `unsupported in v0.5: SELECT expression; v0.5 only supports bare column references`. Scalar subquery in projection.
+- [ ] UltraSQL `.tbl` loader — `crates/ultrasql-bench/src/tpch/load.rs` ships the Postgres COPY path; the UltraSQL equivalent (column-aware INSERT batches, schema-typed value parsing) is the data side of the milestone.
+
 ---
 
 ## v0.7 — "Vectorize" 🔄 IN PROGRESS
