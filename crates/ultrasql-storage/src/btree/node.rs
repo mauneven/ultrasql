@@ -2,6 +2,14 @@
 //! entries, page initialisation, and the descent / right-link helpers
 //! that route through the sibling chain on Lehman-Yao reads.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
+)]
+
 use ultrasql_core::endian::{
     read_i64_le, read_u16_le, read_u32_le, write_i64_le, write_u16_le, write_u32_le,
 };

@@ -20,6 +20,14 @@
 //!   executor can reference the concrete types. Full implementations are
 //!   deferred to v1.x; stub bodies are tagged `TODO(<index>-complete)`.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
+)]
+
 #![allow(clippy::significant_drop_tightening)]
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::type_complexity)]

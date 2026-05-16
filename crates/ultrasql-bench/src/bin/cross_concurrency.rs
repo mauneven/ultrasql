@@ -52,7 +52,11 @@
 #![allow(
     clippy::print_stdout,
     clippy::enum_variant_names,
-    clippy::unnecessary_lazy_evaluations
+    clippy::unnecessary_lazy_evaluations,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
 )]
 
 use std::io::BufRead;

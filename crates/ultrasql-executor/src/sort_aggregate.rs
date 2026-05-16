@@ -292,12 +292,37 @@ fn finalise(state: &AggState) -> Value {
             let mut sorted = vals.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let n = sorted.len();
-            let row_number = frac * (n as f64 - 1.0);
+            // Cast sample count to f64 for the percentile arithmetic.
+            // The aggregate state is `Vec<f64>`; sample counts above
+            // `2^53` are not representable so we accept the precision
+            // loss — the percentile is a statistic, not an index.
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "percentile arithmetic; sample count rarely above 2^53"
+            )]
+            let n_f64 = n as f64;
+            let row_number = frac * (n_f64 - 1.0);
+            // Truncate to usize index; row_number is non-negative and
+            // bounded by n - 1 above, so the cast cannot wrap.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "row_number bounded by [0, n - 1]"
+            )]
             let lo = row_number.floor() as usize;
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "row_number bounded by [0, n - 1]"
+            )]
             let hi = row_number.ceil() as usize;
             if lo == hi {
                 Value::Float64(sorted[lo])
             } else {
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "lo is < 2^53 in practice; percentile interpolation"
+                )]
                 let frac_part = row_number - lo as f64;
                 Value::Float64(sorted[hi].mul_add(frac_part, sorted[lo] * (1.0 - frac_part)))
             }
@@ -308,6 +333,12 @@ fn finalise(state: &AggState) -> Value {
             }
             let mut sorted = vals.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "percentile_disc arithmetic; idx bounded by ceil(frac * len) ≤ len"
+            )]
             let idx = (frac * sorted.len() as f64).ceil() as usize;
             let idx = idx.saturating_sub(1).min(sorted.len() - 1);
             Value::Float64(sorted[idx])

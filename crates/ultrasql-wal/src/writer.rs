@@ -349,7 +349,9 @@ impl WriterDriver {
                 self.rotate_segment()?;
                 continue;
             }
-            let chunk = &bytes[cursor..cursor + (record_len as usize)];
+            let record_len_usize = usize::try_from(record_len)
+                .map_err(|_| WalWriterError::Io(std::io::Error::other("record length exceeds usize")))?;
+            let chunk = &bytes[cursor..cursor + record_len_usize];
             let file = self.current_file.as_mut().ok_or_else(|| {
                 WalWriterError::Io(std::io::Error::other("segment file unexpectedly closed"))
             })?;
@@ -426,7 +428,9 @@ fn peek_record_length(bytes: &[u8]) -> Result<u64, WalWriterError> {
         )));
     }
     let total = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-    if total < crate::record::RECORD_HEADER_SIZE as u32 {
+    let header_size_u32 = u32::try_from(crate::record::RECORD_HEADER_SIZE)
+        .expect("RECORD_HEADER_SIZE is a compile-time-known constant well below u32::MAX");
+    if total < header_size_u32 {
         return Err(WalWriterError::Encode(WalRecordError::Malformed(
             "total_length too small",
         )));

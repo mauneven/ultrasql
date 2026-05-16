@@ -1225,7 +1225,12 @@ mod tests {
         for n in [
             0_usize, 1, 7, 8, 15, 16, 17, 23, 31, 32, 64, 100, 1_000, 4_096, 100_000,
         ] {
-            let data: Vec<i32> = (0..n).map(|i| (i as i32) * 7 - 13).collect();
+            let data: Vec<i32> = (0..n)
+                .map(|i| {
+                    let v = i32::try_from(i).expect("test sizes bounded under i32::MAX");
+                    v * 7 - 13
+                })
+                .collect();
             let scalar: i64 = data
                 .iter()
                 .fold(0_i64, |a, b| a.wrapping_add(i64::from(*b)));

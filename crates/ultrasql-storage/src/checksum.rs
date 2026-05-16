@@ -9,6 +9,14 @@
 //! check is self-consistent. Callers should use [`compute_page_checksum`],
 //! which handles the zero-field convention.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
+)]
+
 use xxhash_rust::xxh3::xxh3_64;
 
 use ultrasql_core::constants::PAGE_SIZE;

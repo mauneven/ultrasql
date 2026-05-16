@@ -129,6 +129,10 @@ pub(super) fn read_error_fields(
 // panic on bad input.
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "non-negative guard above proves the cast cannot lose the sign"
+)]
 pub(super) const fn usize_from_i32(
     value: i32,
     _what: &'static str,
@@ -139,6 +143,10 @@ pub(super) const fn usize_from_i32(
     Ok(value as usize)
 }
 
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "non-negative guard above proves the cast cannot lose the sign"
+)]
 pub(super) const fn nonneg_usize(value: i16, _what: &'static str) -> Result<usize, ProtocolError> {
     if value < 0 {
         return Err(ProtocolError::Malformed("negative count"));
@@ -264,7 +272,10 @@ impl<'a> PayloadReader<'a> {
         if len < 0 {
             return Err(ProtocolError::Malformed("negative value length"));
         }
-        let len = len as usize;
+        // Guard above proves `len >= 0`; the `try_from` then can only
+        // fail on a 16-bit `usize` target, which we do not support.
+        let len = usize::try_from(len)
+            .map_err(|_| ProtocolError::Malformed("value length exceeds usize"))?;
         if len > MAX_PAYLOAD {
             return Err(ProtocolError::Malformed("value length too large"));
         }

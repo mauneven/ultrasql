@@ -5,6 +5,14 @@
 //! `heap/mod.rs`. Splitting across files keeps each unit under the
 //! 600-line ceiling without changing semantics.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
+)]
+
 #![allow(unused_imports)]
 
 use std::sync::Arc;

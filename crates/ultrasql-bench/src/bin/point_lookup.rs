@@ -42,7 +42,14 @@
 //! that by reporting only `ns_per_probe` and `total_wall_ns`, with the
 //! probe count explicit in the JSON output.
 
-#![allow(clippy::print_stdout, clippy::unnecessary_lazy_evaluations)]
+#![allow(
+    clippy::print_stdout,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -10,6 +10,17 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// AGENTS.md §3.3: deny `as` integer-width casts at the crate boundary.
+// Use `try_from` + propagate, `From::from` for lossless widening, or a
+// `#[allow(...)]` with a justification comment. This crate is at the
+// foot of the dependency graph so the surface here is the easiest to
+// keep clean.
+#![deny(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap
+)]
 
 pub mod cache;
 pub mod constants;

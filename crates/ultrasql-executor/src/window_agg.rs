@@ -626,6 +626,10 @@ fn is_non_decreasing(keys: &[i64]) -> bool {
 /// branch-free conversion stays out of the hot inner loops where
 /// `as u32` would otherwise need a `try_into()` + panic propagation.
 #[inline]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "clamped above to u32::MAX before narrowing; documented in the doc comment"
+)]
 const fn u32_from_usize_clamped(v: usize) -> u32 {
     if v > u32::MAX as usize {
         u32::MAX
@@ -641,6 +645,12 @@ const fn u32_from_usize_clamped(v: usize) -> u32 {
 /// >2³¹-row scan (impossible under our current memory layout). The
 /// conversion folds away on 64-bit hosts.
 #[inline]
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "i64::MAX-as-usize comparison guards the v-as-i64 narrowing below"
+)]
 const fn i64_from_usize_clamped(v: usize) -> i64 {
     if v > i64::MAX as usize {
         i64::MAX
@@ -840,6 +850,12 @@ fn merge_into(left: &[(i64, u32)], right: &[(i64, u32)], out: &mut [(i64, u32)])
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "tests: ad-hoc index arithmetic against compile-time-known loop bounds"
+)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
     use ultrasql_planner::ScalarExpr;

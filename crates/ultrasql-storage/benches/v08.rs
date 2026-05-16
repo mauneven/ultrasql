@@ -5,7 +5,12 @@
 //!   cargo bench --bench v08 -p ultrasql-storage
 
 #![allow(clippy::items_after_statements)]
-#![allow(clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
+)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};

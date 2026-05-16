@@ -27,8 +27,16 @@ impl Span {
     /// Construct a span from `usize` offsets, truncating to `u32`. The
     /// truncation is fine because SQL statements are bounded to a few
     /// megabytes; spans never need 64-bit precision.
+    ///
+    /// `const fn` cannot call `u32::try_from`, hence the explicit `as`
+    /// casts gated by `#[allow]`. The truncation contract is documented
+    /// above and exercised by callers that cap input size upstream.
     #[inline]
     #[must_use]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "SQL statement size bounded upstream; truncating offsets to u32 is the documented contract"
+    )]
     pub const fn from_usize(start: usize, end: usize) -> Self {
         Self::new(start as u32, end as u32)
     }

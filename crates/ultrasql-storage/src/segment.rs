@@ -53,6 +53,14 @@
 //!   crash durability; `F_FULLFSYNC` flushes the platter / NAND. The
 //!   call is a no-op on Linux.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
+)]
+
 use std::fs::{self, File, OpenOptions};
 use std::io;
 #[cfg(unix)]

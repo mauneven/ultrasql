@@ -191,7 +191,11 @@ pub(super) fn batch_row_keys(batch: &Batch) -> Vec<Vec<u8>> {
                     } else {
                         key.push(0x00);
                         let s = c.value(row_idx);
-                        key.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                        key.extend_from_slice(
+                            &u32::try_from(s.len())
+                                .expect("CTE distinct key string length under u32::MAX")
+                                .to_le_bytes(),
+                        );
                         key.extend_from_slice(s.as_bytes());
                     }
                 }

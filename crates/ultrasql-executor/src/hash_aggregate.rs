@@ -1183,6 +1183,12 @@ fn value_lt(a: &Value, b: &Value) -> bool {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "tests: index arithmetic against compile-time-known loop bounds"
+)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
     use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};

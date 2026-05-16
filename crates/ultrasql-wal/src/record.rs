@@ -181,7 +181,8 @@ impl WalRecord {
         flags: u8,
         payload: Vec<u8>,
     ) -> Self {
-        let total = (RECORD_HEADER_SIZE + payload.len()) as u32;
+        let total = u32::try_from(RECORD_HEADER_SIZE + payload.len())
+            .expect("WAL record under u32::MAX bytes — payload length validated upstream");
         let mut header = WalRecordHeader {
             total_length: total,
             crc: 0,
@@ -382,7 +383,9 @@ mod tests {
     #[test]
     fn many_payload_sizes_round_trip() {
         for &n in &[0_usize, 1, 7, 64, 256, 1024, 4096, 17_000] {
-            let payload = (0..n).map(|i| (i & 0xFF) as u8).collect::<Vec<_>>();
+            let payload = (0..n)
+                .map(|i| u8::try_from(i & 0xFF).expect("masked to 8 bits"))
+                .collect::<Vec<_>>();
             let record = rec(RecordType::HeapInsert, &payload);
             let bytes = record.encode();
             let (decoded, used) = WalRecord::decode(&bytes).unwrap();

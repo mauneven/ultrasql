@@ -37,6 +37,21 @@
 //!   `[offset, offset+length)` with `offset >= pd_upper` and
 //!   `offset + length <= pd_special`.
 
+// AGENTS.md §3.3 boundary: this module implements the on-disk page
+// layout. Header / ItemId fields are explicit fixed-width (`u8`, `u16`,
+// `u32`) bit-packed values; the casts that narrow `usize` / `u32` here
+// are documented format invariants, not silent truncation. Per-call
+// `try_from` would introduce a panic path on every page mutation in
+// the hot path with no behavioural change (every callsite's input is
+// bounded by `PAGE_SIZE = 8192`). The allows are scoped to this file.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "on-disk page format: fields are fixed-width by design, every narrowing is bounded by PAGE_SIZE"
+)]
+
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::endian::{
     read_u16_le, read_u32_le, read_u64_le, write_u16_le, write_u32_le, write_u64_le,

@@ -175,8 +175,8 @@ pub fn select_scan_physical(
     stats: &dyn StatsSource,
     _gucs: &CostGucs,
 ) -> PhysicalOp {
-    let total_rows = stats.row_count(table) as f64;
-    if total_rows == 0.0 {
+    let total_rows = stats.row_count(table);
+    if total_rows == 0 {
         return PhysicalOp::SeqScan;
     }
 
@@ -190,7 +190,7 @@ pub fn select_scan_physical(
         for pred in predicates {
             if predicate_references_column(pred, leading_col) {
                 let sel =
-                    crate::cost::selectivity::selectivity(pred, stats, table, total_rows as u64);
+                    crate::cost::selectivity::selectivity(pred, stats, table, total_rows);
                 matches.push((hint, sel));
                 break; // one predicate per index is enough
             }

@@ -38,6 +38,14 @@
 //! `VisibilityMap` is `Send + Sync` through its `DashMap` sharding and
 //! per-relation `RwLock`.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
+)]
+
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use ultrasql_core::{BlockNumber, RelationId};

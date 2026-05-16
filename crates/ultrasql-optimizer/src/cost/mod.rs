@@ -218,7 +218,18 @@ impl<'s> CostModel<'s> {
                     self.stats,
                     table.as_deref().unwrap_or(""),
                     // Use rows from input estimate; fall back to raw row_count.
-                    input_est.rows as u64,
+                    // `rows` is a non-negative f64 cardinality estimate; the
+                    // clamp keeps the conversion deterministic on any input.
+                    {
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "clamped to [0.0, u64::MAX-as-f64] before narrowing"
+                        )]
+                        {
+                            input_est.rows.clamp(0.0, 1.844_674_407_370_955_2e19) as u64
+                        }
+                    },
                 );
                 cost_filter(input_est, sel, &self.gucs)
             }

@@ -52,6 +52,12 @@
 //! - [`CteScan`] — replay a materialised CTE buffer.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
+#![deny(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::cast_possible_wrap
+)]
 
 pub mod bitmap_heap_scan;
 pub mod cte_scan;

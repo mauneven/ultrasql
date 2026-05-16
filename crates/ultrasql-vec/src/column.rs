@@ -247,7 +247,10 @@ impl StringColumn {
         let mut values: Vec<u8> = Vec::new();
         for s in rows {
             values.extend_from_slice(s.as_bytes());
-            offsets.push(values.len() as u32);
+            offsets.push(
+                u32::try_from(values.len())
+                    .expect("Utf8Column offsets bounded to u32; data above 4 GiB rejected upstream"),
+            );
         }
         Self {
             offsets,
@@ -269,7 +272,10 @@ impl StringColumn {
         let mut row_count = 0usize;
         for s in rows {
             values.extend_from_slice(s.as_bytes());
-            offsets.push(values.len() as u32);
+            offsets.push(
+                u32::try_from(values.len())
+                    .expect("Utf8Column offsets bounded to u32; data above 4 GiB rejected upstream"),
+            );
             row_count += 1;
         }
         if nulls.len() != row_count {

@@ -45,6 +45,14 @@
 //! guard is released before any further I/O so lock hold times are
 //! bounded to a single byte manipulation.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
+)]
+
 use std::sync::Arc;
 
 use ultrasql_core::constants::PAGE_SIZE;

@@ -22,6 +22,14 @@
 //! writers take an exclusive lock. The lock is held for at most one slice
 //! operation, so contention is negligible.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
+)]
+
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use ultrasql_core::constants::PAGE_SIZE;

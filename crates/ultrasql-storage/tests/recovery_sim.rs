@@ -12,6 +12,14 @@
 //! in a plain `HashSet` and filtered during the "expected state"
 //! computation.
 
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "integration test: index arithmetic against compile-time loop bounds"
+)]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 

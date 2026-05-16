@@ -5,6 +5,12 @@
 //!   `cargo bench --package ultrasql-txn --bench txn_v04`
 
 #![allow(clippy::missing_docs_in_private_items)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    reason = "criterion benches use ad-hoc index math against compile-time-known small N constants; the cast costs aren't carried into production code"
+)]
 
 use std::sync::Arc;
 

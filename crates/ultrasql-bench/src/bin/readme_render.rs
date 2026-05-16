@@ -39,7 +39,11 @@
     clippy::uninlined_format_args,
     clippy::items_after_statements,
     clippy::similar_names,
-    clippy::redundant_closure_for_method_calls
+    clippy::redundant_closure_for_method_calls,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless
 )]
 
 use std::collections::HashMap;

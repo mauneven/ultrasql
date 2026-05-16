@@ -99,8 +99,18 @@ impl PgStatisticRow {
             starelid,
             staattnum,
             stainherit: false,
+            // Precision-loss casts (f64 → f32) are accepted: pg_statistic
+            // stores stanullfrac / stadistinct as `f32` by design.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "pg_statistic stanullfrac is f32 in the catalog row schema"
+            )]
             stanullfrac: stats.null_frac as f32,
             stawidth: i32::try_from(stats.avg_width_bytes).unwrap_or(i32::MAX),
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "pg_statistic stadistinct is f32 in the catalog row schema"
+            )]
             stadistinct: stats.n_distinct as f32,
             stakind1,
             stakind2,
@@ -140,7 +150,19 @@ impl PgStatisticRow {
         let histogram = if self.stakind2 == 2 {
             match (&self.stavalues2, &self.stanumbers2) {
                 (Some(bounds), Some(numbers)) => {
-                    let samples_per_bucket = numbers.first().copied().map_or(0, |n| n as u64);
+                    let samples_per_bucket = numbers.first().copied().map_or(0, |n| {
+                        // Histogram bucket counts are non-negative and well
+                        // within u64; saturate negative or overflowing
+                        // inputs rather than panicking.
+                        #[allow(
+                            clippy::cast_possible_truncation,
+                            clippy::cast_sign_loss,
+                            reason = "histogram sample counts are non-negative, bounded by row_count"
+                        )]
+                        {
+                            n.max(0.0) as u64
+                        }
+                    });
                     let bucket_count =
                         u16::try_from(bounds.len().saturating_sub(1)).unwrap_or(u16::MAX);
                     if bucket_count == 0 {

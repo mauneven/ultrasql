@@ -643,17 +643,18 @@ mod tests {
             Column::Int32(NumericColumn::from_data(vec![0, 10, 20])),
         ];
 
-        for row in 0..3 {
-            let id_text = (row as i32).to_string().into_bytes();
-            let val_text = ((row as i32) * 10).to_string().into_bytes();
+        for row_usize in 0_usize..3 {
+            let row_i32 = i32::try_from(row_usize).expect("loop bound 3 fits in i32");
+            let id_text = row_i32.to_string().into_bytes();
+            let val_text = (row_i32 * 10).to_string().into_bytes();
             let canonical_msg = BackendMessage::DataRow {
                 columns: vec![Some(id_text), Some(val_text)],
             };
             let mut canonical = BytesMut::new();
             encode_backend(&canonical_msg, &mut canonical);
             let mut actual = BytesMut::new();
-            write_data_row(&mut actual, &cols, row);
-            assert_eq!(&actual[..], &canonical[..], "row {row} mismatch");
+            write_data_row(&mut actual, &cols, row_usize);
+            assert_eq!(&actual[..], &canonical[..], "row {row_usize} mismatch");
         }
     }
 

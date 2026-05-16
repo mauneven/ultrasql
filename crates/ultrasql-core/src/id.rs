@@ -232,13 +232,16 @@ impl Lsn {
 impl fmt::Debug for Lsn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // PostgreSQL prints LSNs as `HHHHHHHH/LLLLLLLL`. Match that.
-        write!(f, "Lsn({:X}/{:08X})", self.0 >> 32, self.0 as u32)
+        // The low 32 bits are extracted by masking, not by narrowing —
+        // `0xFFFF_FFFF` is the documented low-half projection, not a
+        // bit-width violation.
+        write!(f, "Lsn({:X}/{:08X})", self.0 >> 32, self.0 & 0xFFFF_FFFF)
     }
 }
 
 impl fmt::Display for Lsn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:X}/{:08X}", self.0 >> 32, self.0 as u32)
+        write!(f, "{:X}/{:08X}", self.0 >> 32, self.0 & 0xFFFF_FFFF)
     }
 }
 
