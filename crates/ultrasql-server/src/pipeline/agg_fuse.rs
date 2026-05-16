@@ -59,6 +59,18 @@ pub(super) fn shift_column_indices(expr: &ScalarExpr, by: usize) -> ScalarExpr {
             expr: Box::new(shift_column_indices(expr, by)),
             negated: *negated,
         },
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => ScalarExpr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| shift_column_indices(a, by))
+                .collect(),
+            data_type: data_type.clone(),
+        },
         // Subquery-bearing and outer-frame variants are returned
         // unchanged. They cannot appear in a v0.5 UPDATE / DELETE
         // predicate (the binder produces them only for SELECTs), so we

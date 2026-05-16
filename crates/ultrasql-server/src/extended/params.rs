@@ -360,6 +360,11 @@ fn infer_in_expr(expr: &ScalarExpr, target_type: Option<DataType>, out: &mut [Da
             infer_in_expr(expr, None, out);
             infer_into(subplan, None, out);
         }
+        ScalarExpr::FunctionCall { args, .. } => {
+            for a in args {
+                infer_in_expr(a, None, out);
+            }
+        }
     }
 }
 
@@ -545,6 +550,11 @@ fn walk_expr<F: FnMut(&ScalarExpr)>(expr: &ScalarExpr, f: &mut F) {
         ScalarExpr::InSubquery { expr, subplan, .. } => {
             walk_expr(expr, f);
             walk_plan_exprs(subplan, f);
+        }
+        ScalarExpr::FunctionCall { args, .. } => {
+            for a in args {
+                walk_expr(a, f);
+            }
         }
     }
 }

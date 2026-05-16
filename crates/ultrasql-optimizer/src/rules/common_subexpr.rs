@@ -299,6 +299,9 @@ fn expr_size(expr: &ScalarExpr) -> usize {
             1 + expr_size(inner)
         }
         ScalarExpr::Binary { left, right, .. } => 1 + expr_size(left) + expr_size(right),
+        ScalarExpr::FunctionCall { args, .. } => {
+            1 + args.iter().map(expr_size).sum::<usize>()
+        }
         // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
         ScalarExpr::OuterColumn { .. }
         | ScalarExpr::ScalarSubquery { .. }
@@ -346,6 +349,11 @@ fn collect_subtrees(expr: &ScalarExpr, freq: &mut HashMap<ExprKey, (usize, Scala
             collect_subtrees(inner, freq);
         }
         ScalarExpr::Column { .. } | ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {}
+        ScalarExpr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_subtrees(arg, freq);
+            }
+        }
         // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
         ScalarExpr::OuterColumn { .. }
         | ScalarExpr::ScalarSubquery { .. }
@@ -405,6 +413,18 @@ fn substitute(
         ScalarExpr::Column { .. } | ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {
             expr.clone()
         }
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => ScalarExpr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| substitute(a, key, col_idx, col_name, dt))
+                .collect(),
+            data_type: data_type.clone(),
+        },
         // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
         ScalarExpr::OuterColumn { .. }
         | ScalarExpr::ScalarSubquery { .. }

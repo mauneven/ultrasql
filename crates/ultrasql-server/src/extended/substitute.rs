@@ -139,6 +139,18 @@ fn substitute_parameter_in_expr(expr: &ScalarExpr, values: &[Value]) -> ScalarEx
             correlated: *correlated,
             data_type: data_type.clone(),
         },
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => ScalarExpr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| substitute_parameter_in_expr(a, values))
+                .collect(),
+            data_type: data_type.clone(),
+        },
     }
 }
 

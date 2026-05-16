@@ -217,6 +217,11 @@ fn collect_refs(expr: &ScalarExpr, out: &mut HashSet<usize>) {
         ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => {
             collect_refs(expr, out);
         }
+        ScalarExpr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_refs(a, out);
+            }
+        }
         ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {}
         // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
         ScalarExpr::OuterColumn { .. }
@@ -267,6 +272,15 @@ fn reindex_expr(expr: &ScalarExpr, remap: &[usize]) -> ScalarExpr {
             negated: *negated,
         },
         ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => expr.clone(),
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => ScalarExpr::FunctionCall {
+            name: name.clone(),
+            args: args.iter().map(|a| reindex_expr(a, remap)).collect(),
+            data_type: data_type.clone(),
+        },
         // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
         ScalarExpr::OuterColumn { .. }
         | ScalarExpr::ScalarSubquery { .. }

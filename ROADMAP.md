@@ -872,11 +872,11 @@ driver can connect.
 
 ### TPC-H Harness Surface (v0.6 milestone work)
 Harness wired end-to-end. All 22 queries parse and reach the planner.
-All 8 TPC-H tables create cleanly. 4/22 queries execute against the
-empty schema (Q2 / Q11 / Q18 / Q20) — verified via
-`target/release/tpch run-queries ultrasql --runs 1 --warmup 0`. The
-remaining 18 queries error inside the binder / planner with the
-shapes catalogued below.
+All 8 TPC-H tables create cleanly. **21/22 queries execute** against
+the empty schema — verified via
+`target/release/tpch run-queries ultrasql --runs 1 --warmup 0`. Only
+Q15 still fails at the planner stage, on the WITH-CTE name resolution
+(reference to the CTE alias `revenue` from the outer SELECT).
 
 #### Done
 
@@ -892,14 +892,20 @@ shapes catalogued below.
 - [x] `SeqScan::rows_to_columns` + `filter_op::batch_to_rows` handle Date / Decimal / Timestamp / TimestampTz / Time columns end-to-end. Column-builder pool uses Int32 backing for Date and Int64 backing for the wider temporal/decimal types; row materialiser re-tags the value with the correct `Value` variant on extraction.
 - [x] `CREATE TABLE` accepts `DATE` / `TIME` / `TIMESTAMP` / `TIMESTAMPTZ` / `DECIMAL(p, s)` / `NUMERIC(p, s)` columns. All eight TPC-H DDLs succeed. End-to-end coverage: [`crates/ultrasql-server/tests/date_column_round_trip.rs`](crates/ultrasql-server/tests/date_column_round_trip.rs) (4 tests: `create_table_with_date_column`, `insert_date_literal_and_scan`, `accepts_decimal_column`, `accepts_timestamp_column`).
 
-#### Remaining for milestone (18 queries blocked)
+#### Landed in this v0.6 work cycle
 
-- [ ] Aggregate binding under `GROUP BY` (Q1, Q3, Q4, Q5, Q6, Q10, Q13, Q15, Q21) — the binder hits `aggregate call outside aggregate context` even when the query has a `GROUP BY`. Repro: `target/release/tpch run-queries ultrasql --runs 1 --warmup 0`. Root cause: `binder/expr_bind.rs:55` resolves aggregate calls by looking up the derived output name in the input schema; the aggregate-context wiring that sets that schema is the open work.
-- [ ] Non-aggregate function dispatch (Q7, Q8, Q9, Q22) — `extract(year, …)`, `substring(s, n, k)`, and friends fail at `binder/expr_bind.rs:77` with `non-aggregate function calls`. The parser desugaring now produces canonical `Expr::Call`; the binder needs the matching function-resolution arm.
-- [ ] Expression variant not yet wired (Q12, Q14, Q16, Q19, Q22) — `CASE WHEN … THEN … END`, `IS NOT NULL` over expressions, and a few `expr LIKE pattern` shapes return `expression variant`. Each is a binder match-arm landing.
-- [ ] `Value::Interval` arithmetic (`DATE + INTERVAL`) — currently no constant-folder, so `DATE '…' + INTERVAL '1' YEAR` plans to NULL. Needed by Q1, Q4, Q5, Q6, Q10, Q12, Q14, Q15, Q20.
-- [ ] Decimal literal coercion — number literals are bound as `Float64`; comparing a `Decimal` column to `0.06` needs the binder to coerce `0.06 → Decimal { value: 6, scale: 2 }` based on the column's declared scale.
-- [ ] SELECT expression form (Q17) — `unsupported in v0.5: SELECT expression; v0.5 only supports bare column references`. Scalar subquery in projection.
+- [x] Aggregate binding under `GROUP BY` — `bind_expr_or_agg_ref` now resolves aliased aggregate columns (`SUM(x) AS sum_qty` → reference to `sum_qty` in the agg schema) and recurses through composite expressions so a top-level `100 * SUM(…) / SUM(…)` no longer trips the rejector. Unblocks Q1, Q3, Q4, Q5, Q6, Q10, Q13, Q21.
+- [x] `ScalarExpr::FunctionCall` + executor `eval_function_call` dispatch — supports `extract(unit, source)`, `substring(text, from[, for])`, `coalesce(...)`, `case_searched`, `case_simple`. Year/Month/Day/Quarter extraction uses inline civil-from-days arithmetic. Unblocks Q7, Q8, Q9, Q22.
+- [x] CASE / COALESCE binder lowering — both kinds (simple / searched) emit `FunctionCall` payloads keyed by branch position; the executor walks the pair list. Unblocks Q12, Q14, Q16, Q19.
+- [x] `expr [NOT] IN (val, …)` binder lowering — chain of `OR`-joined equality comparisons (`AND`-joined `<>` for `NOT IN`). Unblocks Q12, Q22.
+- [x] `ProjectExprs` executor (`crates/ultrasql-executor/src/project_expr.rs`) — general expression-projection operator. Evaluates each `ScalarExpr` per child row, rebuilds the columnar batch through the supported value-type set. The lower_query path routes through it when any projection item is non-bare. Unblocks Q7, Q8, Q9, Q14, Q17.
+
+#### Remaining for milestone
+
+- [ ] Q15: WITH-CTE name resolution from the outer SELECT — `WITH revenue AS (…) SELECT … FROM supplier, revenue WHERE …` fails with `table not found: 'revenue'`. The binder needs to expose CTE aliases to outer FROM-clause resolution.
+- [ ] `Value::Interval` arithmetic (`DATE + INTERVAL`) — the parser builds `Value::Interval { months, days, microseconds }` payloads but no constant-folder lowers `DATE '…' + INTERVAL '1' YEAR` to a precomputed `Value::Date`. Currently the eval interpreter returns NULL on those binary expressions.
+- [ ] Decimal literal coercion — number literals are bound as `Float64`; comparing a `Decimal` column to `0.06` needs the binder to coerce `0.06 → Decimal { value: 6, scale: 2 }` based on the column's declared scale. Today the queries execute but the comparison yields no rows when data is loaded.
+- [ ] `LIKE` operator — parser already builds `Expr::Binary { op: Like }`; the executor's `apply_binary` does not yet match it.
 - [ ] UltraSQL `.tbl` loader — `crates/ultrasql-bench/src/tpch/load.rs` ships the Postgres COPY path; the UltraSQL equivalent (column-aware INSERT batches, schema-typed value parsing) is the data side of the milestone.
 
 ---

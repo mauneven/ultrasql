@@ -367,6 +367,11 @@ fn collect_cols(expr: &ScalarExpr, out: &mut HashSet<usize>) {
         ScalarExpr::Unary { expr: inner, .. } | ScalarExpr::IsNull { expr: inner, .. } => {
             collect_cols(inner, out);
         }
+        ScalarExpr::FunctionCall { args, .. } => {
+            for a in args {
+                collect_cols(a, out);
+            }
+        }
         ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => {}
         // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
         ScalarExpr::OuterColumn { .. }
@@ -386,6 +391,7 @@ fn predicate_has_parameter(expr: &ScalarExpr) -> bool {
         ScalarExpr::Unary { expr: inner, .. } | ScalarExpr::IsNull { expr: inner, .. } => {
             predicate_has_parameter(inner)
         }
+        ScalarExpr::FunctionCall { args, .. } => args.iter().any(predicate_has_parameter),
         ScalarExpr::Column { .. } | ScalarExpr::Literal { .. } => false,
         // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
         ScalarExpr::OuterColumn { .. }
@@ -435,6 +441,18 @@ fn remap_through_project(predicate: &ScalarExpr, exprs: &[(ScalarExpr, String)])
             negated: *negated,
         },
         ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => predicate.clone(),
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => ScalarExpr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| remap_through_project(a, exprs))
+                .collect(),
+            data_type: data_type.clone(),
+        },
         // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
         ScalarExpr::OuterColumn { .. }
         | ScalarExpr::ScalarSubquery { .. }

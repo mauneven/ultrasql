@@ -70,12 +70,28 @@ pub(super) fn bind_expr(
                         data_type: f.data_type.clone(),
                     });
                 }
-                Err(PlanError::NotSupported(
+                return Err(PlanError::NotSupported(
                     "aggregate call outside aggregate context",
-                ))
-            } else {
-                Err(PlanError::NotSupported("non-aggregate function calls"))
+                ));
             }
+            // Scalar builtin dispatch — bind every argument then emit
+            // a `ScalarExpr::FunctionCall` the executor knows how to
+            // evaluate. The v0.6 milestone covers the set TPC-H asks
+            // for: `extract(unit, source)` (year/month/day/quarter),
+            // `substring(text, from[, for])`. Unknown function names
+            // surface the standard `non-aggregate function calls`
+            // error so the binder stays strict.
+            let bound_args: Result<Vec<ScalarExpr>, PlanError> = args
+                .iter()
+                .map(|a| bind_expr(a, input, catalog, scope))
+                .collect();
+            let bound_args = bound_args?;
+            let return_type = builtin_return_type(&func_name)?;
+            Ok(ScalarExpr::FunctionCall {
+                name: func_name,
+                args: bound_args,
+                data_type: return_type,
+            })
         }
         Expr::Cast { .. } => Err(PlanError::NotSupported("CAST expressions")),
 
@@ -236,6 +252,118 @@ pub(super) fn bind_expr(
         } => bind_between(
             subject, low, high, *negated, *symmetric, input, catalog, scope,
         ),
+
+        // `CASE [operand] WHEN c THEN v … ELSE e END` lowers to a
+        // `case` builtin so the executor's function dispatcher can
+        // evaluate it row-at-a-time. The argument layout is:
+        //
+        // - searched CASE: `[cond1, then1, cond2, then2, …, else]`
+        // - simple CASE:   `[operand, when1, then1, when2, then2, …, else]`
+        //
+        // The else slot is always present; an absent SQL ELSE is
+        // encoded as a `NULL` literal so the dispatcher does not need
+        // to special-case the missing-tail shape.
+        Expr::Case {
+            operand,
+            branches,
+            else_expr,
+            ..
+        } => {
+            let mut bound_args: Vec<ScalarExpr> = Vec::with_capacity(branches.len() * 2 + 2);
+            let case_kind = if let Some(op_expr) = operand {
+                bound_args.push(bind_expr(op_expr, input, catalog, scope)?);
+                "case_simple"
+            } else {
+                "case_searched"
+            };
+            let mut result_type = DataType::Null;
+            for (when_e, then_e) in branches {
+                bound_args.push(bind_expr(when_e, input, catalog, scope)?);
+                let then_bound = bind_expr(then_e, input, catalog, scope)?;
+                if matches!(result_type, DataType::Null) {
+                    result_type = then_bound.data_type();
+                }
+                bound_args.push(then_bound);
+            }
+            if let Some(else_e) = else_expr {
+                let bound = bind_expr(else_e, input, catalog, scope)?;
+                if matches!(result_type, DataType::Null) {
+                    result_type = bound.data_type();
+                }
+                bound_args.push(bound);
+            } else {
+                bound_args.push(ScalarExpr::Literal {
+                    value: Value::Null,
+                    data_type: DataType::Null,
+                });
+            }
+            Ok(ScalarExpr::FunctionCall {
+                name: case_kind.to_owned(),
+                args: bound_args,
+                data_type: result_type,
+            })
+        }
+
+        // `expr [NOT] IN (val, …)` → chain of `OR`-joined equality
+        // comparisons. NOT IN flips to `AND`-joined `<>`.
+        Expr::InList {
+            expr: subject,
+            items,
+            negated,
+            ..
+        } => {
+            let bound_subject = bind_expr(subject, input, catalog, scope)?;
+            let mut acc: Option<ScalarExpr> = None;
+            for item in items {
+                let bound_item = bind_expr(item, input, catalog, scope)?;
+                let cmp = ScalarExpr::Binary {
+                    op: if *negated {
+                        ultrasql_parser::ast::BinaryOp::NotEq
+                    } else {
+                        ultrasql_parser::ast::BinaryOp::Eq
+                    },
+                    left: Box::new(bound_subject.clone()),
+                    right: Box::new(bound_item),
+                    data_type: DataType::Bool,
+                };
+                acc = Some(match acc {
+                    None => cmp,
+                    Some(prev) => ScalarExpr::Binary {
+                        op: if *negated {
+                            ultrasql_parser::ast::BinaryOp::And
+                        } else {
+                            ultrasql_parser::ast::BinaryOp::Or
+                        },
+                        left: Box::new(prev),
+                        right: Box::new(cmp),
+                        data_type: DataType::Bool,
+                    },
+                });
+            }
+            Ok(acc.unwrap_or(ScalarExpr::Literal {
+                value: Value::Bool(*negated),
+                data_type: DataType::Bool,
+            }))
+        }
+
+        // `COALESCE(a, b, …)` → `coalesce(args...)` builtin: return
+        // the first non-NULL argument.
+        Expr::Coalesce { args, .. } => {
+            let bound_args: Result<Vec<_>, PlanError> = args
+                .iter()
+                .map(|a| bind_expr(a, input, catalog, scope))
+                .collect();
+            let bound_args = bound_args?;
+            let return_type = bound_args
+                .first()
+                .map(ScalarExpr::data_type)
+                .unwrap_or(DataType::Null);
+            Ok(ScalarExpr::FunctionCall {
+                name: "coalesce".to_owned(),
+                args: bound_args,
+                data_type: return_type,
+            })
+        }
 
         _ => Err(PlanError::NotSupported("expression variant")),
     }
@@ -447,6 +575,26 @@ fn parse_date_literal(text: &str) -> Option<i32> {
         return None;
     }
     Some(days_since_epoch(year, month, day))
+}
+
+/// Statically infer the return type of a builtin scalar function.
+/// The set must stay in sync with the executor's `eval_function_call`
+/// dispatcher in [`crates/ultrasql-executor/src/eval.rs`].
+fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
+    match func_name {
+        "extract" => Ok(DataType::Int64),
+        "substring" => Ok(DataType::Text { max_len: None }),
+        _ => Err(PlanError::NotSupported("non-aggregate function calls")),
+    }
+}
+
+/// True when the binder accepts the function name as a v0.6 builtin.
+/// Used by the `_` fallback in the expression-variant path to keep
+/// the diagnostic precise: unknown function names still report
+/// `non-aggregate function calls`.
+#[allow(dead_code)]
+fn is_supported_builtin(func_name: &str) -> bool {
+    matches!(func_name, "extract" | "substring")
 }
 
 /// Days from the 2000-01-01 epoch to (year, month, day), positive or

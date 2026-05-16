@@ -383,5 +383,10 @@ fn walk_expr_for_max_param(expr: &ScalarExpr, max_idx: &mut u32) {
             walk_expr_for_max_param(expr, max_idx);
             walk_plan_for_max_param(subplan, max_idx);
         }
+        ScalarExpr::FunctionCall { args, .. } => {
+            for a in args {
+                walk_expr_for_max_param(a, max_idx);
+            }
+        }
     }
 }

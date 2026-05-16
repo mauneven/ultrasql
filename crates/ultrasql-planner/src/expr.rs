@@ -170,6 +170,19 @@ pub enum ScalarExpr {
         /// checking when building the join condition.
         data_type: DataType,
     },
+
+    /// Builtin scalar function call: `extract(unit, date)`,
+    /// `substring(text, from, for)`, etc. The binder resolves the
+    /// function name to one of the variants the executor knows
+    /// about; unknown names fail at bind time.
+    FunctionCall {
+        /// Normalised lower-case function name.
+        name: String,
+        /// Bound argument list.
+        args: Vec<Self>,
+        /// Statically inferred return type.
+        data_type: DataType,
+    },
 }
 
 impl ScalarExpr {
@@ -187,7 +200,8 @@ impl ScalarExpr {
             | Self::Unary { data_type, .. }
             | Self::Binary { data_type, .. }
             | Self::OuterColumn { data_type, .. }
-            | Self::ScalarSubquery { data_type, .. } => data_type.clone(),
+            | Self::ScalarSubquery { data_type, .. }
+            | Self::FunctionCall { data_type, .. } => data_type.clone(),
             // IN/EXISTS/IS NULL always produce Bool.
             Self::IsNull { .. } | Self::Exists { .. } | Self::InSubquery { .. } => DataType::Bool,
         }
@@ -213,6 +227,7 @@ impl ScalarExpr {
             Self::Binary { left, right, .. } => {
                 left.contains_outer_column() || right.contains_outer_column()
             }
+            Self::FunctionCall { args, .. } => args.iter().any(Self::contains_outer_column),
         }
     }
 }
@@ -264,6 +279,16 @@ impl fmt::Display for ScalarExpr {
                     "uncorrelated"
                 };
                 write!(f, "({expr}{not} IN SUBQUERY[{tag}])")
+            }
+            Self::FunctionCall { name, args, .. } => {
+                write!(f, "{name}(")?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")")
             }
         }
     }

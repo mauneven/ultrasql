@@ -132,7 +132,7 @@ impl Eval {
 // Core recursive evaluator
 // ---------------------------------------------------------------------------
 
-fn eval_expr(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Value, EvalError> {
+pub(crate) fn eval_expr(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Value, EvalError> {
     match expr {
         ScalarExpr::Column { index, .. } => {
             row.get(*index).cloned().ok_or(EvalError::ColumnIndex {
@@ -201,7 +201,230 @@ fn eval_expr(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Value
         ScalarExpr::InSubquery { .. } => Err(EvalError::Unsupported(
             "IN subquery reached the executor; decorrelation rule should have removed it",
         )),
+
+        ScalarExpr::FunctionCall { name, args, .. } => {
+            let evaluated: Result<Vec<Value>, EvalError> = args
+                .iter()
+                .map(|a| eval_expr(a, row, params))
+                .collect();
+            let vals = evaluated?;
+            eval_function_call(name, &vals)
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in function dispatch
+// ---------------------------------------------------------------------------
+
+/// Dispatch the binder-resolved builtin scalar function calls.
+///
+/// Today's support set is the slice needed for TPC-H lift-off:
+/// - `extract(unit, date)` — date-part extraction. Returns `i64`.
+/// - `substring(text, from[, for])` — 1-based string slicing.
+///
+/// Unknown function names return [`EvalError::Unsupported`] so the
+/// binder upgrade lands ahead of executor coverage without crashing.
+fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+    match name {
+        "extract" => eval_extract(args),
+        "substring" => eval_substring(args),
+        "coalesce" => Ok(args
+            .iter()
+            .find(|v| !matches!(v, Value::Null))
+            .cloned()
+            .unwrap_or(Value::Null)),
+        "case_searched" => eval_case_searched(args),
+        "case_simple" => eval_case_simple(args),
+        other => Err(EvalError::Unsupported(Box::leak(
+            format!("function `{other}` not implemented").into_boxed_str(),
+        ))),
+    }
+}
+
+/// `CASE WHEN c1 THEN v1 … ELSE e END` — args layout:
+/// `[c1, v1, c2, v2, …, else]`.
+fn eval_case_searched(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() < 3 || args.len() % 2 == 0 {
+        return Err(EvalError::Type(
+            "case_searched: expected odd arg count (cond, then pairs + else)".into(),
+        ));
+    }
+    let else_val = args.last().cloned().unwrap_or(Value::Null);
+    let mut i = 0;
+    while i + 1 < args.len() - 1 {
+        match &args[i] {
+            Value::Bool(true) => return Ok(args[i + 1].clone()),
+            Value::Bool(false) | Value::Null => {}
+            other => {
+                return Err(EvalError::Type(format!(
+                    "case_searched: WHEN clause must yield bool, got {:?}",
+                    other.data_type()
+                )));
+            }
+        }
+        i += 2;
+    }
+    Ok(else_val)
+}
+
+/// `CASE op WHEN w1 THEN v1 … ELSE e END` — args layout:
+/// `[op, w1, v1, w2, v2, …, else]`.
+fn eval_case_simple(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() < 4 || args.len() % 2 != 0 {
+        return Err(EvalError::Type(
+            "case_simple: expected even arg count ≥ 4 (operand + pairs + else)".into(),
+        ));
+    }
+    let op = &args[0];
+    let else_val = args.last().cloned().unwrap_or(Value::Null);
+    let mut i = 1;
+    while i + 1 < args.len() - 1 {
+        if values_equal_for_case(op, &args[i]) {
+            return Ok(args[i + 1].clone());
+        }
+        i += 2;
+    }
+    Ok(else_val)
+}
+
+fn values_equal_for_case(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => false,
+        _ => a == b,
+    }
+}
+
+fn eval_extract(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "extract: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let unit = match &args[0] {
+        Value::Text(s) => s.as_str(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::Type(format!(
+                "extract: unit must be text, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    let (year, month, day) = match &args[1] {
+        Value::Date(d) => civil_from_days(*d),
+        Value::Timestamp(us) | Value::TimestampTz(us) => {
+            let days = (*us).div_euclid(86_400_000_000);
+            let days_i32 = i32::try_from(days).unwrap_or(i32::MAX);
+            civil_from_days(days_i32)
+        }
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::Type(format!(
+                "extract: source must be date/timestamp, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    let unit_norm = unit.to_ascii_lowercase();
+    let out_i64 = match unit_norm.as_str() {
+        "year" => i64::from(year),
+        "month" => i64::from(month),
+        "day" => i64::from(day),
+        "quarter" => i64::from((month - 1) / 3 + 1),
+        other => {
+            return Err(EvalError::Type(format!(
+                "extract: unit `{other}` not implemented"
+            )));
+        }
+    };
+    Ok(Value::Int64(out_i64))
+}
+
+/// Inverse of the Howard-Hinnant `days_from_civil` algorithm, rebased
+/// on the 2000-01-01 epoch the engine uses. Returns `(year, month, day)`
+/// in the standard 1-based calendar.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "civil-from-days arithmetic; doe / yoe fit in i32 by construction"
+)]
+fn civil_from_days(days_since_2000_01_01: i32) -> (i32, i32, i32) {
+    let z = days_since_2000_01_01 + 10_957; // rebase to 1970-01-01
+    let z = z + 719_468; // shift to year 0
+    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let doe = (z - era * 146_097) as u32; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = (yoe as i32) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as i32; // [1, 31]
+    let m = if mp < 10 { mp as i32 + 3 } else { mp as i32 - 9 }; // [1, 12]
+    let final_y = if m <= 2 { y + 1 } else { y };
+    (final_y, m, d)
+}
+
+fn eval_substring(args: &[Value]) -> Result<Value, EvalError> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(EvalError::Type(format!(
+            "substring: expected 2 or 3 args, got {}",
+            args.len()
+        )));
+    }
+    let s = match &args[0] {
+        Value::Text(s) => s.clone(),
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::Type(format!(
+                "substring: source must be text, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    let from = match args[1].as_i64() {
+        Some(v) => v,
+        None if matches!(args[1], Value::Null) => return Ok(Value::Null),
+        _ => {
+            return Err(EvalError::Type("substring: `from` must be integer".into()));
+        }
+    };
+    // SQL substring is 1-based and clamps to the string's character
+    // range. We operate on bytes for the v0.6 milestone; ASCII-only
+    // TPC-H comments / phone numbers / type strings make this safe.
+    let bytes = s.as_bytes();
+    let start_byte_signed = from.saturating_sub(1);
+    let start = if start_byte_signed < 0 {
+        0
+    } else {
+        usize::try_from(start_byte_signed).unwrap_or(bytes.len()).min(bytes.len())
+    };
+    let end = if args.len() == 3 {
+        let len = match args[2].as_i64() {
+            Some(v) => v,
+            None if matches!(args[2], Value::Null) => return Ok(Value::Null),
+            _ => {
+                return Err(EvalError::Type(
+                    "substring: `for` length must be integer".into(),
+                ));
+            }
+        };
+        let len = len.max(0);
+        let mut effective = usize::try_from(len).unwrap_or(0);
+        if start_byte_signed < 0 {
+            let abs_back = usize::try_from(start_byte_signed.unsigned_abs())
+                .unwrap_or(usize::MAX);
+            effective = effective.saturating_sub(abs_back);
+        }
+        (start + effective).min(bytes.len())
+    } else {
+        bytes.len()
+    };
+    let slice = &bytes[start..end];
+    let out = std::str::from_utf8(slice)
+        .map_err(|_| EvalError::Type("substring: utf-8 boundary mid-character".into()))?;
+    Ok(Value::Text(out.to_owned()))
 }
 
 // ---------------------------------------------------------------------------

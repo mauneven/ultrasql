@@ -513,15 +513,40 @@ pub(super) fn lower_project_columns(
     child: Box<dyn Operator>,
     exprs: &[(ScalarExpr, String)],
 ) -> Result<Box<dyn Operator>, ServerError> {
+    // Fast path: every projection item is a bare column reference.
+    // The downstream pipeline can then short-circuit through the
+    // index-only `Project` operator and (when the indices match the
+    // child schema) skip the projection wrapper entirely.
+    //
+    // When any item carries an expression (function call, arithmetic,
+    // CASE, …) we route through the general `ProjectExprs` operator
+    // that evaluates each `ScalarExpr` per row.
+    let all_bare_columns = exprs
+        .iter()
+        .all(|(e, _)| matches!(e, ScalarExpr::Column { .. }));
+    if !all_bare_columns {
+        // Build the output schema before handing to the operator;
+        // each projection's output type is the bound expression's
+        // declared type, named after the alias / derived label.
+        let mut fields: Vec<ultrasql_core::Field> = Vec::with_capacity(exprs.len());
+        for (e, name) in exprs {
+            fields.push(ultrasql_core::Field::nullable(name.clone(), e.data_type()));
+        }
+        let output_schema = ultrasql_core::Schema::new(fields)
+            .map_err(|e| ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
+                "projection schema: {e}"
+            ))))?;
+        return ultrasql_executor::ProjectExprs::new(child, exprs, output_schema)
+            .map(|op| Box::new(op) as Box<dyn Operator>)
+            .map_err(|e| ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
+                "projection: {e}"
+            ))));
+    }
     let mut indices: Vec<usize> = Vec::with_capacity(exprs.len());
     for (expr, _name) in exprs {
         match expr {
             ScalarExpr::Column { index, .. } => indices.push(*index),
-            _ => {
-                return Err(ServerError::Unsupported(
-                    "SELECT expression; v0.5 only supports bare column references",
-                ));
-            }
+            _ => unreachable!("filtered to bare columns above"),
         }
     }
     // Identity-projection elision: if the requested indices exactly

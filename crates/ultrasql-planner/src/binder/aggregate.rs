@@ -263,7 +263,8 @@ pub(super) fn bind_projection_agg(
                 }
             }
             SelectItem::Expr { expr, alias, .. } => {
-                let bound = bind_expr_or_agg_ref(expr, agg_schema, catalog, scope)?;
+                let alias_name = alias.as_ref().map(|a| a.value.as_str());
+                let bound = bind_expr_or_agg_ref(expr, alias_name, agg_schema, catalog, scope)?;
                 let name = alias
                     .as_ref()
                     .map_or_else(|| derive_output_name(expr, &bound), |a| a.value.clone());
@@ -274,8 +275,18 @@ pub(super) fn bind_projection_agg(
     Ok(out)
 }
 
+/// Rebind a projection expression under an aggregation context.
+///
+/// `alias_name` is the projection's `AS alias` if any; it lets us
+/// resolve an aggregate call whose materialised column in
+/// `agg_schema` was named after that alias (the path
+/// `collect_aggregates` takes when the SELECT item carries an alias).
+/// Without this hint, `SUM(l_quantity) AS sum_qty` would fail to
+/// resolve because the binder would look up the generic `"sum"`
+/// derived name while the agg schema holds `"sum_qty"`.
 fn bind_expr_or_agg_ref(
     expr: &Expr,
+    alias_name: Option<&str>,
     agg_schema: &Schema,
     catalog: &dyn Catalog,
     scope: &mut ScopeStack,
@@ -288,6 +299,19 @@ fn bind_expr_or_agg_ref(
                 .map_or("", |p| p.value.as_str())
                 .to_ascii_lowercase();
             if is_aggregate_name(&func_name) {
+                // 1. Alias-named column in agg_schema (the standard
+                //    case for `SUM(x) AS sum_qty`).
+                if let Some(alias) = alias_name {
+                    if let Some((i, f)) = agg_schema.find(alias) {
+                        return Ok(ScalarExpr::Column {
+                            name: f.name.clone(),
+                            index: i,
+                            data_type: f.data_type.clone(),
+                        });
+                    }
+                }
+                // 2. Derived `<func>` name (e.g. `SUM(x)` with no
+                //    alias collapses to a column named `"sum"`).
                 let agg_name = derive_agg_output_name(&func_name, args);
                 if let Some((i, f)) = agg_schema.find(&agg_name) {
                     return Ok(ScalarExpr::Column {
@@ -298,6 +322,44 @@ fn bind_expr_or_agg_ref(
                 }
             }
             bind_expr(expr, agg_schema, catalog, scope)
+        }
+        // Composite expressions: walk into binary / unary / paren so
+        // nested aggregate calls (`100.00 * SUM(l_extendedprice * …)
+        // / SUM(l_quantity)`, etc.) re-bind via the column-reference
+        // path rather than re-entering the standalone-aggregate
+        // rejector in `bind_expr`.
+        Expr::Binary {
+            op, left, right, ..
+        } => {
+            let l = bind_expr_or_agg_ref(left, None, agg_schema, catalog, scope)?;
+            let r = bind_expr_or_agg_ref(right, None, agg_schema, catalog, scope)?;
+            let data_type = if matches!(
+                op,
+                ultrasql_parser::ast::BinaryOp::And | ultrasql_parser::ast::BinaryOp::Or
+            ) || op.is_comparison()
+            {
+                ultrasql_core::DataType::Bool
+            } else {
+                l.data_type()
+            };
+            Ok(ScalarExpr::Binary {
+                op: *op,
+                left: Box::new(l),
+                right: Box::new(r),
+                data_type,
+            })
+        }
+        Expr::Unary { op, expr: inner, .. } => {
+            let bound = bind_expr_or_agg_ref(inner, None, agg_schema, catalog, scope)?;
+            let data_type = bound.data_type();
+            Ok(ScalarExpr::Unary {
+                op: *op,
+                expr: Box::new(bound),
+                data_type,
+            })
+        }
+        Expr::Paren { expr: inner, .. } => {
+            bind_expr_or_agg_ref(inner, alias_name, agg_schema, catalog, scope)
         }
         _ => bind_expr(expr, agg_schema, catalog, scope),
     }
