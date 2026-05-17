@@ -879,8 +879,11 @@ same data and SQL text.
 Validated on 2026-05-17 with:
 
 ```text
+scripts/setup-tpch-dbgen.sh
+ULTRASQL_TPCH_DBGEN="$(pwd)/target/tools/tpch-dbgen/dbgen" \
+cargo run --release -p ultrasql-bench --features sql-bench --bin tpch -- \
+  gen-data 1 target/tpch-scale1-real
 CARGO_INCREMENTAL=0 ULTRASQL_TPCH_POOL_FRAMES=262144 ULTRASQL_TPCH_PROGRESS=1 \
-PATH="$REPO/tpch-dbgen:$PATH" \
 cargo run --release -p ultrasql-bench --features sql-bench --bin tpch -- \
   validate-results --data-dir target/tpch-scale1-real --duckdb /opt/homebrew/bin/duckdb
 ```
@@ -896,6 +899,13 @@ have been reduced: Q4 now uses `EXISTS`, Q11 uses the scalar threshold
 subquery over comma joins, Q16 uses `NOT IN (SELECT ...)`, Q18 uses
 `IN (SELECT ... GROUP BY ... HAVING ...)`, and Q9 uses the native
 composite-key join predicate instead of a synthetic key.
+
+TPC-H `dbgen` / `qgen` remain external benchmark tools. Install them
+locally with [`scripts/setup-tpch-dbgen.sh`](scripts/setup-tpch-dbgen.sh)
+into `target/tools/tpch-dbgen`, or supply `ULTRASQL_TPCH_DBGEN` directly.
+The generator source tree, compiled binaries, `dists.dss`, and generated
+`.tbl` data are not UltraSQL source files and should not live in the
+tracked repository root.
 
 #### Done
 

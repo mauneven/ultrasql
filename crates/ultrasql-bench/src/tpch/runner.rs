@@ -16,11 +16,9 @@ use anyhow::bail;
 #[cfg(feature = "pg-runner")]
 use anyhow::Context;
 
-use crate::tpch::{baseline::QueryTimings, queries};
 #[cfg(feature = "pg-runner")]
 use crate::tpch::baseline::{median, p95};
-#[cfg(any(feature = "pg-runner", feature = "sql-bench"))]
-use crate::tpch::queries;
+use crate::tpch::{baseline::QueryTimings, queries};
 #[cfg(feature = "pg-runner")]
 use std::time::Instant;
 

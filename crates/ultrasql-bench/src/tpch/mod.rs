@@ -10,7 +10,7 @@
 //! | Module | Responsibility |
 //! |--------|---------------|
 //! | [`schema`]   | DDL constants for the 8 TPC-H tables |
-//! | [`data_gen`] | `dbgen` wrapper + deterministic synthetic fallback |
+//! | [`data_gen`] | external `dbgen` wrapper + deterministic synthetic fallback |
 //! | [`load`]     | `.tbl` → engine bulk loader |
 //! | [`queries`]  | All 22 TPC-H query SQL strings |
 //! | [`runner`]   | Timing harness; per-query median + p95 |

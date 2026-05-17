@@ -55,3 +55,9 @@ local.toml
 # Benchmark artifacts (intermediate; committed results live in benchmarks/results)
 target/criterion/
 .automation/
+
+# TPC-H local tooling and generated data. dbgen/qgen are external benchmark
+# dependencies, not UltraSQL source.
+/tpch-dbgen/
+/dists.dss
+/tpch-data/

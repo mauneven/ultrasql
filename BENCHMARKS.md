@@ -132,6 +132,19 @@ The comparison must:
 
 A comparison that violates any of these is invalid.
 
+### TPC-H Data Generation
+
+TPC-H data must come from an external `dbgen` / `qgen` checkout, not a
+vendored source tree in the UltraSQL repository root. Use
+`scripts/setup-tpch-dbgen.sh` to install the pinned checkout under
+`target/tools/tpch-dbgen`, or point `ULTRASQL_TPCH_DBGEN` at another
+local binary. Generated `.tbl` files belong under `target/` or another
+ignored local directory.
+
+The synthetic fallback in `ultrasql-bench tpch gen-data` exists only for
+CI and smoke tests. Results produced from synthetic data are not TPC-H
+numbers and are not publishable.
+
 ---
 
 ## Two-Tier Benchmark Policy

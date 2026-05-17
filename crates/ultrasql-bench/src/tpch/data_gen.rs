@@ -1,10 +1,12 @@
-//! TPC-H data generation: `dbgen` wrapper with a deterministic synthetic fallback.
+//! TPC-H data generation: external `dbgen` wrapper with a deterministic
+//! synthetic fallback.
 //!
-//! When `dbgen` is available on `$PATH`, [`generate`] shells out to it at the
-//! requested scale factor and writes `.tbl` files to `out_dir`. When `dbgen`
-//! is unavailable, a minimal synthetic dataset is written instead — sufficient
-//! to load the schema and exercise the query harness, but **not** a valid TPC-H
-//! result and **not** suitable for published benchmark numbers.
+//! When `dbgen` is available through `ULTRASQL_TPCH_DBGEN`, `target/tools`,
+//! or `$PATH`, [`generate`] shells out to it at the requested scale factor and
+//! writes `.tbl` files to `out_dir`. When `dbgen` is unavailable, a minimal
+//! synthetic dataset is written instead — sufficient to load the schema and
+//! exercise the query harness, but **not** a valid TPC-H result and **not**
+//! suitable for published benchmark numbers.
 //!
 //! The synthetic generator is deterministic: given the same scale factor it
 //! always produces the same output.
@@ -30,12 +32,14 @@ pub struct GenResult {
 
 /// Generates TPC-H `.tbl` files for the given scale factor.
 ///
-/// If `dbgen` is found on `$PATH` it is invoked with `-s <scale>`. Otherwise
-/// the synthetic fallback writes skeletal `.tbl` files into `out_dir`. The
-/// caller is responsible for creating `out_dir` before calling this function.
+/// If `dbgen` is found through `ULTRASQL_TPCH_DBGEN`, the repository-local
+/// `target/tools/tpch-dbgen/dbgen`, or `$PATH`, it is invoked with
+/// `-s <scale>`. Otherwise the synthetic fallback writes skeletal `.tbl` files
+/// into `out_dir`. The caller is responsible for creating `out_dir` before
+/// calling this function.
 pub fn generate(scale: u32, out_dir: &Path) -> Result<GenResult> {
-    if which_dbgen().is_some() {
-        run_dbgen(scale, out_dir)?;
+    if let Some(dbgen) = find_dbgen() {
+        run_dbgen(&dbgen, scale, out_dir)?;
         Ok(GenResult {
             out_dir: out_dir.to_owned(),
             used_dbgen: true,
@@ -49,8 +53,21 @@ pub fn generate(scale: u32, out_dir: &Path) -> Result<GenResult> {
     }
 }
 
-/// Returns the path to `dbgen` if it exists on `$PATH`, otherwise `None`.
-fn which_dbgen() -> Option<PathBuf> {
+/// Returns the path to an external `dbgen` binary if one is configured.
+fn find_dbgen() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("ULTRASQL_TPCH_DBGEN") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    let target_tool =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tools/tpch-dbgen/dbgen");
+    if target_tool.exists() {
+        return Some(target_tool);
+    }
+
     std::env::var_os("PATH")
         .unwrap_or_default()
         .to_string_lossy()
@@ -69,15 +86,14 @@ fn which_dbgen() -> Option<PathBuf> {
 }
 
 /// Shells out to `dbgen -vf -s <scale>` in `out_dir`.
-fn run_dbgen(scale: u32, out_dir: &Path) -> Result<()> {
-    let dbgen = which_dbgen().expect("dbgen must exist — caller checked");
+fn run_dbgen(dbgen: &Path, scale: u32, out_dir: &Path) -> Result<()> {
     let dbgen_dir = dbgen
         .parent()
         .context("dbgen path must have a parent directory")?;
     let out_dir = out_dir
         .canonicalize()
         .with_context(|| format!("canonicalize {}", out_dir.display()))?;
-    let status = std::process::Command::new(&dbgen)
+    let status = std::process::Command::new(dbgen)
         .args(["-vf", "-s", &scale.to_string()])
         .env("DSS_CONFIG", dbgen_dir)
         .env("DSS_PATH", &out_dir)
@@ -462,7 +478,7 @@ mod tests {
     #[test]
     fn synthetic_generates_all_tbl_files() {
         let dir = tempfile::tempdir().expect("tempdir");
-        generate(1, dir.path()).expect("generate");
+        write_synthetic(1, dir.path()).expect("generate");
         for name in TABLE_NAMES {
             let path = dir.path().join(format!("{name}.tbl"));
             assert!(path.exists(), "{name}.tbl not created");

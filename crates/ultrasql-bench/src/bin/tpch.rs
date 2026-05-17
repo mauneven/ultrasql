@@ -47,8 +47,8 @@ enum Cmd {
 
     /// Generate TPC-H `.tbl` files.
     ///
-    /// Uses `dbgen` if available on `$PATH`; falls back to a deterministic
-    /// synthetic generator otherwise.
+    /// Uses external `dbgen` from `ULTRASQL_TPCH_DBGEN`, `target/tools`, or
+    /// `$PATH`; falls back to a deterministic synthetic generator otherwise.
     GenData {
         /// TPC-H scale factor (positive integer; 1 = ~1 GB raw data).
         #[arg(default_value_t = 1)]
