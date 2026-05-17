@@ -17,11 +17,13 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::BTreeMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use sha2::{Digest, Sha256};
 
 use ultrasql_bench::tpch::{baseline, data_gen, load, queries, runner, schema};
 
@@ -96,6 +98,10 @@ enum Cmd {
         /// PostgreSQL connection string (required when `engine = postgres`).
         #[arg(long, default_value = "host=localhost user=postgres dbname=tpch")]
         pg_dsn: String,
+
+        /// Query selector: `all`, `N`, `A-B`, or comma/space separated list.
+        #[arg(long, value_name = "LIST")]
+        queries: Option<String>,
     },
 
     /// Compare UltraSQL TPC-H query results against a local DuckDB reference.
@@ -107,6 +113,18 @@ enum Cmd {
         /// Path to `duckdb` CLI binary.
         #[arg(long, default_value = "duckdb")]
         duckdb: PathBuf,
+
+        /// Query selector: `all`, `N`, `A-B`, or comma/space separated list.
+        #[arg(long, value_name = "LIST")]
+        queries: Option<String>,
+
+        /// Directory for cached DuckDB expected rows.
+        #[arg(long, default_value = "target/tpch-cache")]
+        duckdb_cache_dir: PathBuf,
+
+        /// Rebuild cached DuckDB expected rows even if a cache entry exists.
+        #[arg(long)]
+        refresh_duckdb_cache: bool,
     },
 
     /// Compare a new run against a recorded baseline; exit non-zero on >5% regression.
@@ -129,6 +147,10 @@ enum Cmd {
         /// Number of warmup runs discarded before measurement.
         #[arg(long, default_value_t = 1)]
         warmup: usize,
+
+        /// Query selector: `all`, `N`, `A-B`, or comma/space separated list.
+        #[arg(long, value_name = "LIST")]
+        queries: Option<String>,
     },
 }
 
@@ -184,15 +206,44 @@ fn run() -> Result<()> {
             warmup,
             out,
             pg_dsn,
-        } => cmd_run_queries(engine, &data_dir, runs, warmup, out.as_deref(), &pg_dsn),
-        Cmd::ValidateResults { data_dir, duckdb } => cmd_validate_results(&data_dir, &duckdb),
+            queries,
+        } => cmd_run_queries(
+            engine,
+            &data_dir,
+            runs,
+            warmup,
+            out.as_deref(),
+            &pg_dsn,
+            queries.as_deref(),
+        ),
+        Cmd::ValidateResults {
+            data_dir,
+            duckdb,
+            queries,
+            duckdb_cache_dir,
+            refresh_duckdb_cache,
+        } => cmd_validate_results(
+            &data_dir,
+            &duckdb,
+            queries.as_deref(),
+            &duckdb_cache_dir,
+            refresh_duckdb_cache,
+        ),
         Cmd::Compare {
             baseline,
             data_dir,
             runs,
             warmup,
             pg_dsn,
-        } => cmd_compare(&baseline, &data_dir, runs, warmup, &pg_dsn),
+            queries,
+        } => cmd_compare(
+            &baseline,
+            &data_dir,
+            runs,
+            warmup,
+            &pg_dsn,
+            queries.as_deref(),
+        ),
     }
 }
 
@@ -285,10 +336,12 @@ fn cmd_run_queries(
     warmup: usize,
     out: Option<&std::path::Path>,
     pg_dsn: &str,
+    query_selector: Option<&str>,
 ) -> Result<()> {
+    let queries = runner::selected_queries(query_selector)?;
     let run_result = match engine {
-        EngineArg::Postgres => run_queries_postgres(warmup, runs, pg_dsn)?,
-        EngineArg::Ultrasql => runner::run_ultrasql(data_dir, warmup, runs)?,
+        EngineArg::Postgres => run_queries_postgres(warmup, runs, pg_dsn, &queries)?,
+        EngineArg::Ultrasql => runner::run_ultrasql(data_dir, warmup, runs, &queries)?,
     };
 
     // Print per-query summary.
@@ -311,9 +364,24 @@ fn cmd_run_queries(
     Ok(())
 }
 
-fn cmd_validate_results(data_dir: &Path, duckdb_bin: &Path) -> Result<()> {
-    let expected = run_duckdb_results(data_dir, duckdb_bin).context("run DuckDB reference")?;
-    let actual = runner::run_ultrasql_results(data_dir).context("run UltraSQL results")?;
+fn cmd_validate_results(
+    data_dir: &Path,
+    duckdb_bin: &Path,
+    query_selector: Option<&str>,
+    duckdb_cache_dir: &Path,
+    refresh_duckdb_cache: bool,
+) -> Result<()> {
+    let queries = runner::selected_queries(query_selector)?;
+    let expected = run_duckdb_results_cached(
+        data_dir,
+        duckdb_bin,
+        &queries,
+        duckdb_cache_dir,
+        refresh_duckdb_cache,
+    )
+    .context("run DuckDB reference")?;
+    let actual =
+        runner::run_ultrasql_results(data_dir, &queries).context("run UltraSQL results")?;
     compare_result_sets(&expected, &actual)?;
     println!(
         "validated {} TPC-H query result set(s) against DuckDB",
@@ -328,12 +396,14 @@ fn cmd_compare(
     runs: usize,
     warmup: usize,
     pg_dsn: &str,
+    query_selector: Option<&str>,
 ) -> Result<()> {
     let recorded = baseline::Baseline::read(baseline_path)?;
     let engine = parse_engine_from_baseline(&recorded.engine)?;
+    let queries = runner::selected_queries(query_selector)?;
     let current_run = match engine {
-        EngineArg::Postgres => run_queries_postgres(warmup, runs, pg_dsn)?,
-        EngineArg::Ultrasql => runner::run_ultrasql(data_dir, warmup, runs)?,
+        EngineArg::Postgres => run_queries_postgres(warmup, runs, pg_dsn, &queries)?,
+        EngineArg::Ultrasql => runner::run_ultrasql(data_dir, warmup, runs, &queries)?,
     };
     let current = build_baseline(engine, &current_run);
     baseline::compare(&recorded, &current)
@@ -344,7 +414,12 @@ fn cmd_compare(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "pg-runner")]
-fn run_queries_postgres(warmup: usize, runs: usize, pg_dsn: &str) -> Result<runner::RunResult> {
+fn run_queries_postgres(
+    warmup: usize,
+    runs: usize,
+    pg_dsn: &str,
+    queries: &[u8],
+) -> Result<runner::RunResult> {
     let rt = tokio::runtime::Runtime::new().context("tokio runtime")?;
     let mut client = rt
         .block_on(async {
@@ -355,11 +430,16 @@ fn run_queries_postgres(warmup: usize, runs: usize, pg_dsn: &str) -> Result<runn
             Ok::<_, anyhow::Error>(client)
         })
         .context("pg connect")?;
-    runner::run_postgres(&mut client, warmup, runs, &rt)
+    runner::run_postgres(&mut client, warmup, runs, &rt, queries)
 }
 
 #[cfg(not(feature = "pg-runner"))]
-fn run_queries_postgres(_warmup: usize, _runs: usize, _pg_dsn: &str) -> Result<runner::RunResult> {
+fn run_queries_postgres(
+    _warmup: usize,
+    _runs: usize,
+    _pg_dsn: &str,
+    _queries: &[u8],
+) -> Result<runner::RunResult> {
     bail!(
         "NotYetWired: pg-runner feature is not enabled; \
          rebuild with --features pg-runner"
@@ -481,14 +561,121 @@ fn parse_engine_from_baseline(engine_str: &str) -> Result<EngineArg> {
     }
 }
 
-fn run_duckdb_results(data_dir: &Path, duckdb_bin: &Path) -> Result<Vec<runner::QueryRows>> {
+#[derive(serde::Deserialize, serde::Serialize)]
+struct DuckDbResultCache {
+    version: u32,
+    fingerprint: String,
+    queries: Vec<u8>,
+    rows: Vec<runner::QueryRows>,
+}
+
+fn run_duckdb_results_cached(
+    data_dir: &Path,
+    duckdb_bin: &Path,
+    queries: &[u8],
+    cache_dir: &Path,
+    refresh: bool,
+) -> Result<Vec<runner::QueryRows>> {
+    const CACHE_VERSION: u32 = 1;
+
+    let fingerprint = duckdb_cache_fingerprint(data_dir, duckdb_bin, queries)?;
+    let cache_path = cache_dir.join(format!("duckdb-results-{fingerprint}.json"));
+    if !refresh && cache_path.exists() {
+        let raw = std::fs::read_to_string(&cache_path)
+            .with_context(|| format!("read {}", cache_path.display()))?;
+        let cache: DuckDbResultCache = serde_json::from_str(&raw)
+            .with_context(|| format!("parse {}", cache_path.display()))?;
+        if cache.version == CACHE_VERSION
+            && cache.fingerprint == fingerprint
+            && cache.queries == queries
+        {
+            if progress_enabled() {
+                eprintln!("duckdb tpch validate: cache hit {}", cache_path.display());
+            }
+            return Ok(cache.rows);
+        }
+    }
+
+    let rows = run_duckdb_results(data_dir, duckdb_bin, queries)?;
+    std::fs::create_dir_all(cache_dir)
+        .with_context(|| format!("create {}", cache_dir.display()))?;
+    let cache = DuckDbResultCache {
+        version: CACHE_VERSION,
+        fingerprint,
+        queries: queries.to_vec(),
+        rows: rows.clone(),
+    };
+    let json = serde_json::to_string_pretty(&cache).context("serialize DuckDB result cache")?;
+    std::fs::write(&cache_path, json).with_context(|| format!("write {}", cache_path.display()))?;
+    if progress_enabled() {
+        eprintln!("duckdb tpch validate: cache write {}", cache_path.display());
+    }
+    Ok(rows)
+}
+
+fn duckdb_cache_fingerprint(data_dir: &Path, duckdb_bin: &Path, queries: &[u8]) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"ultrasql-tpch-duckdb-cache-v1");
+    hasher.update(duckdb_bin.display().to_string().as_bytes());
+    for table in data_gen::TABLE_NAMES {
+        hasher.update(table.as_bytes());
+        fingerprint_tbl_file(&data_dir.join(format!("{table}.tbl")), &mut hasher)?;
+    }
+    for &query in queries {
+        hasher.update([query]);
+        let sql = runner::query_sql(query)?;
+        hasher.update(sql.as_ref().as_bytes());
+    }
+    Ok(hex_encode(&hasher.finalize()))
+}
+
+fn fingerprint_tbl_file(path: &Path, hasher: &mut Sha256) -> Result<()> {
+    const SAMPLE_BYTES: usize = 64 * 1024;
+    const SAMPLE_BYTES_I64: i64 = 64 * 1024;
+    const SAMPLE_BYTES_U64: u64 = 64 * 1024;
+
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("metadata {}", path.display()))?;
+    hasher.update(path.display().to_string().as_bytes());
+    hasher.update(metadata.len().to_le_bytes());
+    if let Ok(modified) = metadata.modified() {
+        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
+            hasher.update(duration.as_secs().to_le_bytes());
+            hasher.update(duration.subsec_nanos().to_le_bytes());
+        }
+    }
+
+    let mut buf = vec![0_u8; SAMPLE_BYTES];
+    let front = file
+        .read(&mut buf)
+        .with_context(|| format!("read head {}", path.display()))?;
+    hasher.update(&buf[..front]);
+
+    if metadata.len() > SAMPLE_BYTES_U64 {
+        file.seek(SeekFrom::End(-SAMPLE_BYTES_I64))
+            .with_context(|| format!("seek tail {}", path.display()))?;
+        let tail = file
+            .read(&mut buf)
+            .with_context(|| format!("read tail {}", path.display()))?;
+        hasher.update(&buf[..tail]);
+    }
+    Ok(())
+}
+
+fn run_duckdb_results(
+    data_dir: &Path,
+    duckdb_bin: &Path,
+    queries: &[u8],
+) -> Result<Vec<runner::QueryRows>> {
     let tmp = tempfile::tempdir().context("create temporary DuckDB directory")?;
     let db_path = tmp.path().join("tpch.duckdb");
     let setup_sql = duckdb_setup_sql(data_dir)?;
     run_duckdb_sql(duckdb_bin, &db_path, &setup_sql).context("initialize DuckDB reference")?;
 
     let mut results = Vec::new();
-    for n in runner::selected_queries()? {
+    for &n in queries {
         let label = format!("q{n}");
         let sql = runner::query_sql(n)?;
         let stdout =

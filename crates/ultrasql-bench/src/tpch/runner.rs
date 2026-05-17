@@ -8,6 +8,7 @@
 //! Without the feature, [`run_postgres`] returns an error.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 use anyhow::Result;
 #[cfg(not(feature = "sql-bench"))]
@@ -30,7 +31,7 @@ pub struct RunResult {
 }
 
 /// Materialized rows for one TPC-H query result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct QueryRows {
     /// Query label, e.g. `"q1"`.
     pub label: String,
@@ -39,23 +40,53 @@ pub struct QueryRows {
     pub rows: Vec<Vec<String>>,
 }
 
-/// Return query numbers selected by `ULTRASQL_TPCH_QUERY`, or all 22.
-pub fn selected_queries() -> Result<Vec<u8>> {
+/// Return query numbers selected by CLI, `ULTRASQL_TPCH_QUERY`, or all 22.
+pub fn selected_queries(cli_selector: Option<&str>) -> Result<Vec<u8>> {
+    if let Some(raw) = cli_selector {
+        return parse_query_selector(raw);
+    }
     match std::env::var("ULTRASQL_TPCH_QUERY") {
-        Ok(raw) => {
-            let query = raw.parse::<u8>().map_err(|_| {
-                anyhow::anyhow!(
-                    "ULTRASQL_TPCH_QUERY must be an integer between 1 and 22, got `{raw}`"
-                )
-            })?;
-            if !(1..=22).contains(&query) {
-                anyhow::bail!("ULTRASQL_TPCH_QUERY must be between 1 and 22, got `{query}`");
-            }
-            Ok(vec![query])
-        }
+        Ok(raw) => parse_query_selector(&raw),
         Err(std::env::VarError::NotPresent) => Ok((1_u8..=22).collect()),
         Err(error) => Err(anyhow::anyhow!("read ULTRASQL_TPCH_QUERY: {error}")),
     }
+}
+
+/// Parse `all`, `N`, `A-B`, or comma/whitespace separated combinations.
+pub fn parse_query_selector(raw: &str) -> Result<Vec<u8>> {
+    let raw = raw.trim();
+    if raw.eq_ignore_ascii_case("all") {
+        return Ok((1_u8..=22).collect());
+    }
+    if raw.is_empty() {
+        anyhow::bail!("query selector must not be empty");
+    }
+
+    let mut queries = BTreeSet::new();
+    for token in raw.split([',', ' ', '\t', '\n']).filter(|s| !s.is_empty()) {
+        if let Some((start, end)) = token.split_once('-') {
+            let start = parse_query_number(start)?;
+            let end = parse_query_number(end)?;
+            if start > end {
+                anyhow::bail!("query range `{token}` is descending");
+            }
+            queries.extend(start..=end);
+        } else {
+            queries.insert(parse_query_number(token)?);
+        }
+    }
+
+    Ok(queries.into_iter().collect())
+}
+
+fn parse_query_number(raw: &str) -> Result<u8> {
+    let query = raw
+        .parse::<u8>()
+        .map_err(|_| anyhow::anyhow!("query selector must use integers 1..=22, got `{raw}`"))?;
+    if !(1..=22).contains(&query) {
+        anyhow::bail!("query selector must be between 1 and 22, got `{query}`");
+    }
+    Ok(query)
 }
 
 /// Return SQL text for a TPC-H query number, honoring `ULTRASQL_TPCH_SQL_FILE`.
@@ -91,10 +122,11 @@ pub fn run_postgres(
     warmup: usize,
     runs: usize,
     runtime: &tokio::runtime::Runtime,
+    queries: &[u8],
 ) -> Result<RunResult> {
     let mut timings: Vec<(String, QueryTimings)> = Vec::new();
 
-    for n in selected_queries()? {
+    for &n in queries {
         let sql = query_sql(n)?;
         let label = format!("q{n}");
 
@@ -137,7 +169,7 @@ pub fn run_postgres(
 
 /// Stub: returns an error when the `pg-runner` feature is not active.
 #[cfg(not(feature = "pg-runner"))]
-pub fn run_postgres(_warmup: usize, _runs: usize) -> Result<RunResult> {
+pub fn run_postgres(_warmup: usize, _runs: usize, _queries: &[u8]) -> Result<RunResult> {
     bail!("NotYetWired: pg-runner feature is not enabled; rebuild with --features pg-runner")
 }
 
@@ -150,7 +182,12 @@ pub fn run_postgres(_warmup: usize, _runs: usize) -> Result<RunResult> {
 /// current SQL surface are recorded with `f64::NAN` medians so the caller
 /// can see exactly which TPC-H shape is unsupported.
 #[cfg(feature = "sql-bench")]
-pub fn run_ultrasql(data_dir: &std::path::Path, warmup: usize, runs: usize) -> Result<RunResult> {
+pub fn run_ultrasql(
+    data_dir: &std::path::Path,
+    warmup: usize,
+    runs: usize,
+    queries: &[u8],
+) -> Result<RunResult> {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Instant;
@@ -213,7 +250,7 @@ pub fn run_ultrasql(data_dir: &std::path::Path, warmup: usize, runs: usize) -> R
         }
 
         let mut timings: Vec<(String, QueryTimings)> = Vec::new();
-        for n in selected_queries()? {
+        for &n in queries {
             let sql = query_sql(n)?;
             let label = format!("q{n}");
             let mut measured: Vec<f64> = Vec::with_capacity(runs);
@@ -293,7 +330,7 @@ pub fn run_ultrasql(data_dir: &std::path::Path, warmup: usize, runs: usize) -> R
 /// loader, server path, and query texts, but it collects `simple_query`
 /// result rows instead of discarding them for timing.
 #[cfg(feature = "sql-bench")]
-pub fn run_ultrasql_results(data_dir: &std::path::Path) -> Result<Vec<QueryRows>> {
+pub fn run_ultrasql_results(data_dir: &std::path::Path, queries: &[u8]) -> Result<Vec<QueryRows>> {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -365,7 +402,7 @@ pub fn run_ultrasql_results(data_dir: &std::path::Path) -> Result<Vec<QueryRows>
         }
 
         let mut results = Vec::new();
-        for n in selected_queries()? {
+        for &n in queries {
             let label = format!("q{n}");
             let sql = query_sql(n)?;
             if progress_enabled() {
@@ -394,7 +431,10 @@ pub fn run_ultrasql_results(data_dir: &std::path::Path) -> Result<Vec<QueryRows>
 
 /// Stub: returns an error when the `sql-bench` feature is not active.
 #[cfg(not(feature = "sql-bench"))]
-pub fn run_ultrasql_results(_data_dir: &std::path::Path) -> Result<Vec<QueryRows>> {
+pub fn run_ultrasql_results(
+    _data_dir: &std::path::Path,
+    _queries: &[u8],
+) -> Result<Vec<QueryRows>> {
     bail!(
         "NotYetWired: rebuild ultrasql-bench with --features sql-bench to \
          enable the in-process TPC-H validator"
@@ -407,6 +447,7 @@ pub fn run_ultrasql(
     _data_dir: &std::path::Path,
     _warmup: usize,
     _runs: usize,
+    _queries: &[u8],
 ) -> Result<RunResult> {
     bail!(
         "NotYetWired: rebuild ultrasql-bench with --features sql-bench to \
@@ -456,6 +497,35 @@ mod tests {
             })
             .collect();
         RunResult { timings }
+    }
+
+    #[test]
+    fn query_selector_accepts_list_and_range() {
+        assert_eq!(
+            parse_query_selector("4,11,16,18").unwrap(),
+            vec![4, 11, 16, 18]
+        );
+        assert_eq!(
+            parse_query_selector("14-16 18").unwrap(),
+            vec![14, 15, 16, 18]
+        );
+    }
+
+    #[test]
+    fn query_selector_deduplicates_and_accepts_all() {
+        assert_eq!(parse_query_selector("1,1,2").unwrap(), vec![1, 2]);
+        assert_eq!(
+            parse_query_selector("all").unwrap(),
+            (1_u8..=22).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn query_selector_rejects_invalid_values() {
+        assert!(parse_query_selector("0").is_err());
+        assert!(parse_query_selector("23").is_err());
+        assert!(parse_query_selector("9-4").is_err());
+        assert!(parse_query_selector("").is_err());
     }
 
     #[test]

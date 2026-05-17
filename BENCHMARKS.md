@@ -145,6 +145,21 @@ The synthetic fallback in `ultrasql-bench tpch gen-data` exists only for
 CI and smoke tests. Results produced from synthetic data are not TPC-H
 numbers and are not publishable.
 
+For optimizer/debug work, run selected queries in one process so SF1
+loads only once:
+
+```text
+ULTRASQL_TPCH_PROGRESS=1 cargo run --release -p ultrasql-bench \
+  --features sql-bench --bin tpch -- validate-results \
+  --data-dir target/tpch-scale1-real \
+  --duckdb /opt/homebrew/bin/duckdb \
+  --queries 4,11,16,18
+```
+
+DuckDB reference rows are cached under `target/tpch-cache` by dataset
+fingerprint and SQL text. Use `--refresh-duckdb-cache` when deliberately
+checking a changed reference engine or cache behavior.
+
 ---
 
 ## Two-Tier Benchmark Policy
