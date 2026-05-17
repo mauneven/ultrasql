@@ -880,11 +880,13 @@ fn run_plan_in_txn(
     heap: Arc<HeapAccess<BlankPageLoader>>,
     oracle: Arc<TransactionManager>,
     cancel_flag: Option<ultrasql_executor::CancelFlag>,
+    stream_buf: &mut bytes::BytesMut,
 ) -> Result<SelectResult, ServerError> {
     if let Some(result) = try_run_cached_int32_pair_select(
         plan,
         &catalog_snapshot,
         heap.as_ref(),
+        stream_buf,
     ) {
         return Ok(result);
     }
@@ -926,7 +928,7 @@ fn run_plan_in_txn(
             // directly into a single `BytesMut`. The session dispatches
             // the body in one `write_all` + `flush` rather than the
             // per-message loop the legacy `run_select` requires.
-            run_select_streamed(op.as_mut())
+            run_select_streamed(op.as_mut(), stream_buf)
         }
     }
 }
@@ -935,6 +937,7 @@ pub(crate) fn try_run_cached_int32_pair_select(
     plan: &LogicalPlan,
     catalog_snapshot: &Arc<CatalogSnapshot>,
     heap: &HeapAccess<BlankPageLoader>,
+    stream_buf: &mut bytes::BytesMut,
 ) -> Option<SelectResult> {
     let (table, output_schema) = match plan {
         LogicalPlan::Scan { table, schema, .. } => (table.as_str(), schema),
@@ -973,12 +976,32 @@ pub(crate) fn try_run_cached_int32_pair_select(
     if left.nulls().is_some() || right.nulls().is_some() {
         return None;
     }
+    let rows = u64::try_from(left.len()).unwrap_or(u64::MAX);
 
-    Some(result_encoder::run_cached_int32_pair_select_streamed(
+    if output_schema == &cached.schema
+        && let Some(encoded) = cached.cached_int32_pair_select_wire.read().clone()
+    {
+        return Some(result_encoder::run_shared_preencoded_select_streamed(
+            encoded,
+            rows,
+        ));
+    }
+
+    let result = result_encoder::run_cached_int32_pair_select_streamed(
         output_schema,
         left.data(),
         right.data(),
-    ))
+        stream_buf,
+    );
+    if output_schema == &cached.schema
+        && let Some(body) = result.streamed_body.as_ref()
+    {
+        let mut slot = cached.cached_int32_pair_select_wire.write();
+        if slot.is_none() {
+            *slot = Some(Arc::<[u8]>::from(body.as_ref()));
+        }
+    }
+    Some(result)
 }
 
 fn decode_key_column(

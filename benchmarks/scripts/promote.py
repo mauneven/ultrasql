@@ -193,7 +193,7 @@ def render_section(promoted) -> str:
     header = (
         "## Headline benchmarks\n\n"
         "Cross-engine measurements where **UltraSQL's kernel is fastest** "
-        "(or within 5 %) on Apple M4 Mac mini, hot cache, median of 8 runs. "
+        "(or within 5 %) on Apple M4 Mac mini, hot cache, median of 32 runs. "
         "Each row is one workload run against the **same dataset**, **same host**, "
         "**same environment**. Workloads where UltraSQL is slower than any "
         "competitor are dropped automatically — see "

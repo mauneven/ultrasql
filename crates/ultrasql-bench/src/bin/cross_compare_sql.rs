@@ -181,11 +181,20 @@ async fn main() -> Result<()> {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
     let (listener, bound) = bind_listener(bind_addr).await.context("bind listener")?;
     let state = Arc::new(Server::with_sample_database());
-    let server_task = tokio::spawn(async move {
-        if let Err(e) = serve_listener(listener, state).await {
-            eprintln!("ultrasqld task exited: {e}");
-        }
-    });
+    let _server_thread = std::thread::Builder::new()
+        .name("ultrasql-bench-server".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("benchmark server runtime should build");
+            runtime.block_on(async move {
+                if let Err(e) = serve_listener(listener, state).await {
+                    eprintln!("ultrasqld task exited: {e}");
+                }
+            });
+        })
+        .expect("benchmark server thread should spawn");
 
     // Run warmup + measured iterations.
     let mut iters_us: Vec<f64> = Vec::with_capacity(args.iters);
@@ -286,8 +295,6 @@ async fn main() -> Result<()> {
     } else {
         println!("{serialized}");
     }
-
-    server_task.abort();
     Ok(())
 }
 

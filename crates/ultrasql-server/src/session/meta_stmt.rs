@@ -158,6 +158,7 @@ fn simple_tag(tag: &str) -> SelectResult {
             tag: tag.to_string(),
         }],
         streamed_body: None,
+        shared_streamed_body: None,
         rows: 0,
     }
 }

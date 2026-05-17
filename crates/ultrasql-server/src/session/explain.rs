@@ -96,6 +96,7 @@ where
         Ok(SelectResult {
             messages,
             streamed_body: None,
+            shared_streamed_body: None,
             rows,
         })
     }
@@ -112,6 +113,7 @@ where
             .state
             .txn_manager
             .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let mut stream_buf = bytes::BytesMut::new();
         let outcome = run_plan_in_txn(
             inner,
             &txn,
@@ -120,6 +122,7 @@ where
             Arc::clone(&self.state.heap),
             Arc::clone(&self.state.txn_manager),
             Some(self.cancel_flag.clone()),
+            &mut stream_buf,
         );
         // Always commit the read-only ANALYZE txn — we don't surface
         // its results, only the row count buried in the `SelectResult`.

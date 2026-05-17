@@ -61,6 +61,24 @@ pub struct CachedColumns {
     /// cache-building scan. `columns[i]` has the same length for
     /// every `i` and equals the row count of the cached projection.
     pub columns: Vec<Column>,
+    /// Lazily-populated pre-encoded wire body for the exact
+    /// `(Int32, Int32)` identity full-scan shape over this schema
+    /// and relation version. Kept separate from `columns` so other
+    /// scan shapes pay no extra work.
+    pub cached_int32_pair_select_wire: RwLock<Option<Arc<[u8]>>>,
+}
+
+impl CachedColumns {
+    /// Build a cached column projection with an empty lazy wire-body cache.
+    #[must_use]
+    pub fn new(version: u64, schema: Schema, columns: Vec<Column>) -> Self {
+        Self {
+            version,
+            schema,
+            columns,
+            cached_int32_pair_select_wire: RwLock::new(None),
+        }
+    }
 }
 
 /// Per-`HeapAccess` columnar cache.

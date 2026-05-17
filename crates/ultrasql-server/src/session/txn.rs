@@ -110,6 +110,7 @@ where
                     },
                 ],
                 streamed_body: None,
+                shared_streamed_body: None,
                 rows: 0,
             }),
             TxnState::InTransaction(txn) => {
@@ -129,6 +130,7 @@ where
                         tag: "PREPARE TRANSACTION".to_string(),
                     }],
                     streamed_body: None,
+                    shared_streamed_body: None,
                     rows: 0,
                 })
             }
@@ -146,6 +148,7 @@ where
                         tag: "ROLLBACK".to_string(),
                     }],
                     streamed_body: None,
+                    shared_streamed_body: None,
                     rows: 0,
                 })
             }
@@ -182,6 +185,7 @@ where
                 tag: "COMMIT PREPARED".to_string(),
             }],
             streamed_body: None,
+            shared_streamed_body: None,
             rows: 0,
         })
     }
@@ -216,6 +220,7 @@ where
                 tag: "ROLLBACK PREPARED".to_string(),
             }],
             streamed_body: None,
+            shared_streamed_body: None,
             rows: 0,
         })
     }
@@ -249,6 +254,7 @@ where
         Ok(SelectResult {
             messages,
             streamed_body: None,
+            shared_streamed_body: None,
             rows: 0,
         })
     }
@@ -300,6 +306,7 @@ where
         Ok(SelectResult {
             messages,
             streamed_body: None,
+            shared_streamed_body: None,
             rows: 0,
         })
     }
@@ -314,6 +321,7 @@ where
                     },
                 ],
                 streamed_body: None,
+                shared_streamed_body: None,
                 rows: 0,
             }),
             TxnState::InTransaction(txn) => {
@@ -328,6 +336,7 @@ where
                         tag: "COMMIT".to_string(),
                     }],
                     streamed_body: None,
+                    shared_streamed_body: None,
                     rows: 0,
                 })
             }
@@ -346,6 +355,7 @@ where
                         tag: "ROLLBACK".to_string(),
                     }],
                     streamed_body: None,
+                    shared_streamed_body: None,
                     rows: 0,
                 })
             }
@@ -362,6 +372,7 @@ where
                     },
                 ],
                 streamed_body: None,
+                shared_streamed_body: None,
                 rows: 0,
             }),
             TxnState::InTransaction(txn) | TxnState::Failed(txn) => {
@@ -378,6 +389,7 @@ where
                         tag: "ROLLBACK".to_string(),
                     }],
                     streamed_body: None,
+                    shared_streamed_body: None,
                     rows: 0,
                 })
             }
@@ -400,6 +412,7 @@ where
                         tag: "SAVEPOINT".to_string(),
                     }],
                     streamed_body: None,
+                    shared_streamed_body: None,
                     rows: 0,
                 })
             }
@@ -449,6 +462,7 @@ where
                             tag: "ROLLBACK".to_string(),
                         }],
                         streamed_body: None,
+                        shared_streamed_body: None,
                         rows: 0,
                     })
                 } else {
@@ -494,6 +508,7 @@ where
                     tag: "RELEASE".to_string(),
                 }],
                 streamed_body: None,
+                shared_streamed_body: None,
                 rows: 0,
             })
         } else {

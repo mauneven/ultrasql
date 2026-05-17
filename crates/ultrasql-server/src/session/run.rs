@@ -268,7 +268,21 @@ where
             self.drain_pending_notifications_into(&mut body);
             encode_backend(&ready, &mut body);
             let res = self.io.write_all(&body).await;
-            crate::result_encoder::return_streamed_sink(body);
+            body.clear();
+            self.write_buf = body;
+            res?;
+            self.io.flush().await?;
+            return Ok(());
+        }
+        if let Some(body) = result.shared_streamed_body.take() {
+            self.io.write_all(body.as_ref()).await?;
+            let mut scratch = std::mem::take(&mut self.write_buf);
+            scratch.clear();
+            self.drain_pending_notifications_into(&mut scratch);
+            encode_backend(&ready, &mut scratch);
+            let res = self.io.write_all(&scratch).await;
+            scratch.clear();
+            self.write_buf = scratch;
             res?;
             self.io.flush().await?;
             return Ok(());

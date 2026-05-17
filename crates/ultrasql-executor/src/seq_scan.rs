@@ -605,11 +605,11 @@ where
             Err(_) => return,
         };
         let columns: Vec<Column> = finished_batch.columns().to_vec();
-        let entry = ultrasql_storage::column_cache::CachedColumns {
-            version: build.target_version,
-            schema: self.codec.schema().clone(),
+        let entry = ultrasql_storage::column_cache::CachedColumns::new(
+            build.target_version,
+            self.codec.schema().clone(),
             columns,
-        };
+        );
         self.heap.column_cache.put(self.relation, entry);
     }
 }

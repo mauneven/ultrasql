@@ -110,6 +110,7 @@ where
                             tag: tag.to_string(),
                         }],
                         streamed_body: None,
+                        shared_streamed_body: None,
                         rows: 0,
                     });
                 }
@@ -566,7 +567,12 @@ where
         // progression stay unchanged there.
         if matches!(self.txn_state, TxnState::Idle)
             && let Some(result) =
-                try_run_cached_int32_pair_select(plan, catalog_snapshot, self.state.heap.as_ref())
+                try_run_cached_int32_pair_select(
+                    plan,
+                    catalog_snapshot,
+                    self.state.heap.as_ref(),
+                    &mut self.write_buf,
+                )
         {
             return Ok(result);
         }
@@ -582,6 +588,7 @@ where
                     Arc::clone(&self.state.heap),
                     Arc::clone(&self.state.txn_manager),
                     Some(self.cancel_flag.clone()),
+                    &mut self.write_buf,
                 );
                 self.finalise_autocommit(plan, txn, outcome)
             }
@@ -595,6 +602,7 @@ where
                     Arc::clone(&self.state.heap),
                     Arc::clone(&self.state.txn_manager),
                     Some(self.cancel_flag.clone()),
+                    &mut self.write_buf,
                 );
                 if let Ok(result) = &outcome {
                     self.note_dml_effect(plan, result.rows);
@@ -697,6 +705,7 @@ where
                 tag: "ANALYZE".to_string(),
             }],
             streamed_body: None,
+            shared_streamed_body: None,
             rows: 0,
         })
     }

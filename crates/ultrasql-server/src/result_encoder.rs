@@ -71,6 +71,11 @@ pub struct SelectResult {
     /// transmission order — the same sequence the legacy path would
     /// have built as enum values and then encoded.
     pub streamed_body: Option<BytesMut>,
+    /// Optional immutable pre-encoded body shared across repeated
+    /// executions of the same cached scan shape. When `Some(_)`, the
+    /// session writes this body directly and only appends the dynamic
+    /// trailer bytes (`NotificationResponse`s, `ReadyForQuery`).
+    pub shared_streamed_body: Option<std::sync::Arc<[u8]>>,
     /// Number of rows produced. Mirrors the value embedded in the
     /// trailing `CommandComplete` tag.
     pub rows: u64,
@@ -90,6 +95,7 @@ pub fn run_ddl_command(tag: &str) -> SelectResult {
             tag: tag.to_string(),
         }],
         streamed_body: None,
+        shared_streamed_body: None,
         rows: 0,
     }
 }
@@ -129,6 +135,7 @@ pub fn run_modify_command(
     Ok(SelectResult {
         messages: vec![BackendMessage::CommandComplete { tag }],
         streamed_body: None,
+        shared_streamed_body: None,
         rows,
     })
 }
@@ -170,6 +177,7 @@ pub fn run_select(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
     Ok(SelectResult {
         messages,
         streamed_body: None,
+        shared_streamed_body: None,
         rows,
     })
 }
@@ -240,79 +248,16 @@ pub fn stream_select(op: &mut dyn Operator, sink: &mut BytesMut) -> Result<u64, 
     Ok(rows)
 }
 
-// Thread-local wire-buffer pool. SELECT streaming allocates the
-// `BytesMut` that holds RowDescription + N DataRow + CommandComplete;
-// for a 10 000-row narrow-int scan that buffer is ~250 KiB. Without
-// reuse, every `simple_query` round-trip pays a fresh allocator round
-// (under macOS libmalloc that lands the chunk in the "small" tcache
-// region; under jemalloc it walks the size-class free-list). Either
-// way it is a measurable per-query cost on the `select_scan_10k`
-// bench.
-//
-// The pool keeps one buffer per worker thread. `take_pooled_sink`
-// reuses whatever capacity the buffer accumulated last call;
-// `return_pooled_sink` parks the buffer back. The buffer is always
-// returned: the session writes the streamed body to the wire and
-// then drops the `SelectResult`. A custom drop on `SelectResult`
-// would close the loop automatically, but the explicit
-// take/return calls keep the lifetime invariant local to this
-// module and avoid surprising the session code.
-//
-// Cancel-safety: `run_select_streamed` is synchronous. The session
-// holds the resulting `SelectResult`, including the
-// `streamed_body`, until after `io.write_all` returns; nothing
-// touches the thread-local cell during the await window.
-thread_local! {
-    static POOLED_WIRE_BUF: std::cell::RefCell<Option<BytesMut>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Pull a fresh `BytesMut` from the per-thread pool, falling back to a
-/// new allocation when the pool is empty. The buffer is cleared (the
-/// underlying capacity survives) so the caller starts with a
-/// zero-length view.
-fn take_pooled_sink(initial_cap: usize) -> BytesMut {
-    let cached = POOLED_WIRE_BUF.with(|cell| cell.borrow_mut().take());
-    match cached {
-        Some(mut buf) => {
-            buf.clear();
-            if buf.capacity() < initial_cap {
-                buf.reserve(initial_cap - buf.capacity());
-            }
-            buf
-        }
-        None => BytesMut::with_capacity(initial_cap),
+// Session-owned wire-buffer reuse. The SELECT streaming path writes
+// directly into the caller-provided `BytesMut`, which the session then
+// keeps across queries. Reusing the buffer at the connection level is
+// stable under Tokio task migration and avoids any shared-pool
+// contention between sessions.
+fn prepare_stream_sink(sink: &mut BytesMut, initial_cap: usize) {
+    sink.clear();
+    if sink.capacity() < initial_cap {
+        sink.reserve(initial_cap - sink.capacity());
     }
-}
-
-/// Park `buf` back in the per-thread pool after the caller is done
-/// writing into it. Called from [`return_streamed_sink`] once the
-/// session has drained the buffer to the socket.
-///
-/// The pool retains exactly one buffer per thread. The call sequence
-/// on the SELECT-streaming hot path is `take → write → return`, so
-/// the slot is empty at the time of this call and the
-/// always-overwrite branch is the only one that fires. We still
-/// guard against a future caller that re-enters the pool by
-/// retaining whichever buffer has more capacity — discarding the
-/// smaller one prevents the pool from "shrinking" under a workload
-/// that mixes large and small reply shapes.
-fn park_pooled_sink(buf: BytesMut) {
-    POOLED_WIRE_BUF.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let keep_existing = slot
-            .as_ref()
-            .is_some_and(|existing| existing.capacity() > buf.capacity());
-        if !keep_existing {
-            *slot = Some(buf);
-        }
-    });
-}
-
-/// Hand the streamed-body buffer back to the wire-buffer pool. The
-/// session calls this after `io.write_all` drains the bytes.
-pub fn return_streamed_sink(buf: BytesMut) {
-    park_pooled_sink(buf);
 }
 
 /// Convenience wrapper around [`stream_select`] that returns a
@@ -324,7 +269,10 @@ pub fn return_streamed_sink(buf: BytesMut) {
 /// the streamed body verbatim and never iterates `messages` when one
 /// is present. The row-count is propagated so callers (e.g. autocommit
 /// finalisation) keep their behaviour unchanged.
-pub fn run_select_streamed(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
+pub fn run_select_streamed(
+    op: &mut dyn Operator,
+    sink: &mut BytesMut,
+) -> Result<SelectResult, ServerError> {
     // Initial capacity: when the operator advertises its row count
     // (column-cache replay, materialised CTE, LIMIT n) we can size
     // the buffer to the exact wire-byte budget upfront and skip
@@ -356,13 +304,21 @@ pub fn run_select_streamed(op: &mut dyn Operator) -> Result<SelectResult, Server
         }
         None => 32 * 1024,
     };
-    let mut sink = take_pooled_sink(initial_cap);
-    let rows = stream_select(op, &mut sink)?;
-    Ok(SelectResult {
-        messages: Vec::new(),
-        streamed_body: Some(sink),
-        rows,
-    })
+    let mut body = std::mem::take(sink);
+    prepare_stream_sink(&mut body, initial_cap);
+    match stream_select(op, &mut body) {
+        Ok(rows) => Ok(SelectResult {
+            messages: Vec::new(),
+            streamed_body: Some(body),
+            shared_streamed_body: None,
+            rows,
+        }),
+        Err(e) => {
+            body.clear();
+            *sink = body;
+            Err(e)
+        }
+    }
 }
 
 /// Fast path for a cached full-table `(Int32, Int32)` scan.
@@ -378,26 +334,63 @@ pub fn run_cached_int32_pair_select_streamed(
     schema: &Schema,
     left: &[i32],
     right: &[i32],
+    sink: &mut BytesMut,
 ) -> SelectResult {
     debug_assert_eq!(left.len(), right.len());
 
     const MAX_ROW_BYTES: usize = 37;
     const ROWDESC_AND_TAG_BYTES: usize = 256;
     let initial_cap = ROWDESC_AND_TAG_BYTES.saturating_add(left.len().saturating_mul(MAX_ROW_BYTES));
-    let mut sink = take_pooled_sink(initial_cap);
+    let mut body = std::mem::take(sink);
+    prepare_stream_sink(&mut body, initial_cap);
     let row_desc = build_row_description(schema);
-    encode_backend(&row_desc, &mut sink);
-    write_int32_pair_data_rows(&mut sink, left, right);
+    encode_backend(&row_desc, &mut body);
+    write_int32_pair_data_rows(&mut body, left, right);
     let rows = u64::try_from(left.len()).unwrap_or(u64::MAX);
     encode_backend(
         &BackendMessage::CommandComplete {
             tag: format!("SELECT {rows}"),
         },
-        &mut sink,
+        &mut body,
     );
     SelectResult {
         messages: Vec::new(),
-        streamed_body: Some(sink),
+        streamed_body: Some(body),
+        shared_streamed_body: None,
+        rows,
+    }
+}
+
+/// Reuse a previously encoded SELECT wire body by copying it into the
+/// session-owned stream buffer.
+#[must_use]
+pub fn run_preencoded_select_streamed(
+    encoded_body: &[u8],
+    rows: u64,
+    sink: &mut BytesMut,
+) -> SelectResult {
+    let mut body = std::mem::take(sink);
+    prepare_stream_sink(&mut body, encoded_body.len());
+    body.extend_from_slice(encoded_body);
+    SelectResult {
+        messages: Vec::new(),
+        streamed_body: Some(body),
+        shared_streamed_body: None,
+        rows,
+    }
+}
+
+/// Reuse a previously encoded SELECT wire body without copying it into
+/// a session-local buffer.
+#[must_use]
+pub fn run_shared_preencoded_select_streamed(
+    encoded_body: std::sync::Arc<[u8]>,
+    rows: u64,
+) -> SelectResult {
+    SelectResult {
+        messages: Vec::new(),
+        streamed_body: None,
+        shared_streamed_body: Some(encoded_body),
         rows,
     }
 }

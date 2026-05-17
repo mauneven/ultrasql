@@ -17,7 +17,7 @@
 #
 # Environment overrides:
 #   CH_BIN     path to clickhouse binary (default /tmp/ultracmp/clickhouse)
-#   N_ITERS    sample count for competitor scripts (default 8)
+#   N_ITERS    sample count for competitor scripts (default 32 in full mode)
 
 set -euo pipefail
 
@@ -26,7 +26,7 @@ cd "$REPO_ROOT"
 
 mode="${1:-full}"
 case "$mode" in
-    full)  ITERS=8;  WARMUP=2 ;;
+    full)  ITERS=32; WARMUP=2 ;;
     quick) ITERS=4;  WARMUP=1 ;;
     *) echo "unknown mode '$mode' (full|quick)" >&2; exit 2 ;;
 esac
