@@ -535,15 +535,7 @@ pub(super) fn bind_literal(lit: &Literal) -> ScalarExpr {
             let (value, data_type) = parse_integer_literal(text);
             ScalarExpr::Literal { value, data_type }
         }
-        Literal::Float { text, .. } => {
-            // Float literals default to `double precision`. A future
-            // pass can recognise an `f` suffix and pick `Float32`.
-            let parsed = text.parse::<f64>().unwrap_or(f64::NAN);
-            ScalarExpr::Literal {
-                value: Value::Float64(parsed),
-                data_type: DataType::Float64,
-            }
-        }
+        Literal::Float { text, .. } => bind_numeric_literal(text),
         Literal::String { value, .. } => ScalarExpr::Literal {
             value: Value::Text(value.clone()),
             data_type: DataType::Text { max_len: None },
@@ -820,10 +812,7 @@ fn try_fold_literal_binary(
 }
 
 fn is_float_like_literal(value: &Value) -> bool {
-    matches!(
-        value,
-        Value::Float32(_) | Value::Float64(_) | Value::Decimal { .. }
-    )
+    matches!(value, Value::Float32(_) | Value::Float64(_))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -905,6 +894,44 @@ fn parse_integer_literal(text: &str) -> (Value, DataType) {
     )
 }
 
+fn bind_numeric_literal(text: &str) -> ScalarExpr {
+    if let Some((value, scale)) = parse_decimal_literal(text) {
+        return ScalarExpr::Literal {
+            value: Value::Decimal { value, scale },
+            data_type: DataType::Decimal {
+                precision: None,
+                scale: Some(scale),
+            },
+        };
+    }
+
+    // Exponent notation is approximate in the current literal model.
+    let parsed = text.parse::<f64>().unwrap_or(f64::NAN);
+    ScalarExpr::Literal {
+        value: Value::Float64(parsed),
+        data_type: DataType::Float64,
+    }
+}
+
+fn parse_decimal_literal(text: &str) -> Option<(i64, i32)> {
+    if text.contains('e') || text.contains('E') {
+        return None;
+    }
+    let (negative, unsigned) = text
+        .strip_prefix('-')
+        .map_or((false, text), |stripped| (true, stripped));
+    let (whole, frac) = unsigned.split_once('.')?;
+    let scale = i32::try_from(frac.len()).ok()?;
+    let mut digits = String::with_capacity(whole.len() + frac.len());
+    digits.push_str(if whole.is_empty() { "0" } else { whole });
+    digits.push_str(frac);
+    let mut value = digits.parse::<i64>().ok()?;
+    if negative {
+        value = value.checked_neg()?;
+    }
+    Some((value, scale))
+}
+
 fn pow10_i64(exp: u32) -> Option<i64> {
     (0..exp).try_fold(1_i64, |acc, _| acc.checked_mul(10))
 }
@@ -926,7 +953,13 @@ fn infer_decimal_scale_from_text(text: &str) -> Option<i32> {
 }
 
 fn decimal_from_numeric_value(value: &Value, target_scale: Option<i32>) -> Option<(i64, i32)> {
-    let scale = target_scale.or_else(|| infer_decimal_scale(value))?;
+    let inferred_scale = infer_decimal_scale(value);
+    let scale = match (target_scale, inferred_scale) {
+        (Some(target), Some(inferred)) => target.max(inferred),
+        (Some(target), None) => target,
+        (None, Some(inferred)) => inferred,
+        (None, None) => return None,
+    };
     if scale < 0 {
         return None;
     }
@@ -1100,15 +1133,46 @@ pub(super) fn bind_column(
         .parts
         .last()
         .map_or_else(String::new, |p| p.value.clone());
-    // We do not yet have multi-relation scopes, so we ignore any
-    // qualifier and resolve unambiguously by column name in the input
-    // schema.
+
+    if let Some(qualified_name) = qualified_column_name(name) {
+        if let Some((index, field)) = input.find(&qualified_name) {
+            return Ok(ScalarExpr::Column {
+                name: field.name.clone(),
+                index,
+                data_type: field.data_type.clone(),
+            });
+        }
+        if input.fields().iter().any(|f| {
+            f.name
+                .rsplit_once('.')
+                .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case(&col_name))
+        }) {
+            return Err(PlanError::ColumnNotFound(qualified_name));
+        }
+    }
+
     let mut hits = input
         .fields()
         .iter()
         .enumerate()
         .filter(|(_, f)| f.name.eq_ignore_ascii_case(&col_name));
-    let Some((index, field)) = hits.next() else {
+    if let Some((index, field)) = hits.next() {
+        if hits.next().is_some() {
+            return Err(PlanError::Ambiguous(col_name));
+        }
+        return Ok(ScalarExpr::Column {
+            name: field.name.clone(),
+            index,
+            data_type: field.data_type.clone(),
+        });
+    }
+
+    let mut suffix_hits = input.fields().iter().enumerate().filter(|(_, f)| {
+        f.name
+            .rsplit_once('.')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case(&col_name))
+    });
+    let Some((index, field)) = suffix_hits.next() else {
         // Column not found in the inner scope — try outer scopes.  This
         // produces an OuterColumn when we are inside a subquery.
         if let Some(outer_ref) = scope.resolve(&col_name) {
@@ -1121,7 +1185,7 @@ pub(super) fn bind_column(
         }
         return Err(PlanError::ColumnNotFound(col_name));
     };
-    if hits.next().is_some() {
+    if suffix_hits.next().is_some() {
         return Err(PlanError::Ambiguous(col_name));
     }
     Ok(ScalarExpr::Column {
@@ -1129,6 +1193,12 @@ pub(super) fn bind_column(
         index,
         data_type: field.data_type.clone(),
     })
+}
+
+fn qualified_column_name(name: &ultrasql_parser::ast::ObjectName) -> Option<String> {
+    let col = name.parts.last()?;
+    let qualifier = name.parts.iter().rev().nth(1)?;
+    Some(format!("{}.{}", qualifier.value, col.value))
 }
 
 pub(super) fn bind_unary(
@@ -1208,10 +1278,12 @@ pub(super) fn bind_binary(
 #[cfg(test)]
 mod typed_literal_tests {
     use ultrasql_core::{DataType, Value};
+    use ultrasql_parser::Span;
+    use ultrasql_parser::ast::Literal;
 
     use super::{
-        BinaryOp, ScalarExpr, days_since_epoch, fold_date_interval, parse_date_literal,
-        parse_interval_literal, try_fold_literal_binary,
+        BinaryOp, ScalarExpr, bind_literal, coerce_literal_to_type, days_since_epoch,
+        fold_date_interval, parse_date_literal, parse_interval_literal, try_fold_literal_binary,
     };
 
     #[test]
@@ -1260,6 +1332,72 @@ mod typed_literal_tests {
         assert_eq!(parse_interval_literal("1", Some("year")), Some((12, 0, 0)));
         assert_eq!(parse_interval_literal("3", Some("month")), Some((3, 0, 0)));
         assert_eq!(parse_interval_literal("90", Some("day")), Some((0, 90, 0)));
+    }
+
+    #[test]
+    fn decimal_coercion_preserves_literal_fractional_precision() {
+        let mut expr = ScalarExpr::Literal {
+            value: Value::Float64(0.0001),
+            data_type: DataType::Float64,
+        };
+        coerce_literal_to_type(
+            &mut expr,
+            &DataType::Decimal {
+                precision: Some(15),
+                scale: Some(2),
+            },
+        );
+        let ScalarExpr::Literal { value, data_type } = expr else {
+            panic!("expected literal");
+        };
+        assert_eq!(value, Value::Decimal { value: 1, scale: 4 });
+        assert_eq!(
+            data_type,
+            DataType::Decimal {
+                precision: None,
+                scale: Some(4)
+            }
+        );
+    }
+
+    #[test]
+    fn dotted_numeric_literal_binds_as_exact_decimal() {
+        let expr = bind_literal(&Literal::Float {
+            text: "0.0001".to_owned(),
+            span: Span::default(),
+        });
+        let ScalarExpr::Literal { value, data_type } = expr else {
+            panic!("expected literal");
+        };
+        assert_eq!(value, Value::Decimal { value: 1, scale: 4 });
+        assert_eq!(
+            data_type,
+            DataType::Decimal {
+                precision: None,
+                scale: Some(4)
+            }
+        );
+    }
+
+    #[test]
+    fn decimal_literal_arithmetic_is_not_folded_through_float() {
+        let left = ScalarExpr::Literal {
+            value: Value::Decimal { value: 6, scale: 2 },
+            data_type: DataType::Decimal {
+                precision: None,
+                scale: Some(2),
+            },
+        };
+        let right = ScalarExpr::Literal {
+            value: Value::Decimal { value: 1, scale: 2 },
+            data_type: DataType::Decimal {
+                precision: None,
+                scale: Some(2),
+            },
+        };
+        let folded = try_fold_literal_binary(BinaryOp::Sub, &left, &right)
+            .expect("fold attempt should not error");
+        assert!(folded.is_none(), "decimal arithmetic must stay exact");
     }
 
     #[test]

@@ -32,6 +32,29 @@ impl Project {
     /// the error surfaces from [`Schema::project`].
     pub fn new(child: Box<dyn Operator>, indices: Vec<usize>) -> Result<Self, ExecError> {
         let schema = child.schema().project(&indices)?;
+        Self::with_schema(child, indices, schema)
+    }
+
+    /// Construct a projection with caller-supplied output schema.
+    ///
+    /// Use this when a lowerer reorders physical columns but must preserve a
+    /// planner-owned schema (for example, swapped hash-join lowering).
+    pub fn with_schema(
+        child: Box<dyn Operator>,
+        indices: Vec<usize>,
+        schema: Schema,
+    ) -> Result<Self, ExecError> {
+        let child_width = child.schema().len();
+        if schema.len() != indices.len() {
+            return Err(ExecError::TypeMismatch(format!(
+                "projection schema width {} does not match {} indices",
+                schema.len(),
+                indices.len()
+            )));
+        }
+        if indices.iter().any(|idx| *idx >= child_width) {
+            return Err(ExecError::Internal("projection index out of bounds"));
+        }
         Ok(Self {
             child,
             schema,

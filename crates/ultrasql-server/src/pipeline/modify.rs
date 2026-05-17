@@ -576,5 +576,18 @@ pub(super) fn lower_project_columns(
     if names_match {
         return Ok(child);
     }
-    Ok(Box::new(Project::new(child, indices)?))
+    let fields: Vec<ultrasql_core::Field> = exprs
+        .iter()
+        .map(|(expr, name)| ultrasql_core::Field::nullable(name.clone(), expr.data_type()))
+        .collect();
+    let output_schema = ultrasql_core::Schema::new(fields).map_err(|e| {
+        ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
+            "projection schema: {e}"
+        )))
+    })?;
+    Ok(Box::new(Project::with_schema(
+        child,
+        indices,
+        output_schema,
+    )?))
 }

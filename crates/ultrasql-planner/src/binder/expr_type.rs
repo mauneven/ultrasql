@@ -131,6 +131,9 @@ fn decimal_arithmetic_type(op: BinaryOp, lt: &DataType, rt: &DataType) -> Option
     if !lt.is_numeric() || !rt.is_numeric() {
         return None;
     }
+    if lt.is_float() || rt.is_float() {
+        return Some(DataType::Float64);
+    }
     let scale = match op {
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mod => {
             max_optional_scale(decimal_operand_scale(lt), decimal_operand_scale(rt))

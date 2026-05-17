@@ -31,7 +31,18 @@ pub struct RunResult {
     pub timings: Vec<(String, QueryTimings)>,
 }
 
-fn selected_queries() -> Result<Vec<u8>> {
+/// Materialized rows for one TPC-H query result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryRows {
+    /// Query label, e.g. `"q1"`.
+    pub label: String,
+    /// Text cells per row. SQL NULL is represented as `"\\N"` to match the
+    /// DuckDB CLI reference path.
+    pub rows: Vec<Vec<String>>,
+}
+
+/// Return query numbers selected by `ULTRASQL_TPCH_QUERY`, or all 22.
+pub fn selected_queries() -> Result<Vec<u8>> {
     match std::env::var("ULTRASQL_TPCH_QUERY") {
         Ok(raw) => {
             let query = raw.parse::<u8>().map_err(|_| {
@@ -49,7 +60,8 @@ fn selected_queries() -> Result<Vec<u8>> {
     }
 }
 
-fn query_sql(n: u8) -> Result<Cow<'static, str>> {
+/// Return SQL text for a TPC-H query number, honoring `ULTRASQL_TPCH_SQL_FILE`.
+pub fn query_sql(n: u8) -> Result<Cow<'static, str>> {
     match std::env::var("ULTRASQL_TPCH_SQL_FILE") {
         Ok(path) => Ok(Cow::Owned(std::fs::read_to_string(&path).map_err(
             |error| anyhow::anyhow!("read ULTRASQL_TPCH_SQL_FILE `{path}`: {error}"),
@@ -275,6 +287,120 @@ pub fn run_ultrasql(data_dir: &std::path::Path, warmup: usize, runs: usize) -> R
     }
 
     Ok(RunResult { timings })
+}
+
+/// Runs selected TPC-H queries against in-process UltraSQL and returns rows.
+///
+/// This is the correctness gate companion to [`run_ultrasql`]: same schema,
+/// loader, server path, and query texts, but it collects `simple_query`
+/// result rows instead of discarding them for timing.
+#[cfg(feature = "sql-bench")]
+pub fn run_ultrasql_results(data_dir: &std::path::Path) -> Result<Vec<QueryRows>> {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use anyhow::Context;
+    use tokio_postgres::{NoTls, SimpleQueryMessage};
+    use ultrasql_server::{Server, bind_listener, serve_listener};
+
+    use crate::tpch::{load, schema};
+
+    fn collect_rows(messages: &[SimpleQueryMessage]) -> Result<Vec<Vec<String>>> {
+        let mut rows = Vec::new();
+        for message in messages {
+            let SimpleQueryMessage::Row(row) = message else {
+                continue;
+            };
+            let mut out = Vec::with_capacity(row.len());
+            for idx in 0..row.len() {
+                let cell = row
+                    .try_get(idx)
+                    .with_context(|| format!("read result column {idx}"))?
+                    .unwrap_or("\\N")
+                    .to_owned();
+                out.push(cell);
+            }
+            rows.push(out);
+        }
+        Ok(rows)
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+
+    runtime.block_on(async move {
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().context("parse 127.0.0.1:0")?;
+        let (listener, bound) = bind_listener(bind_addr).await.context("bind ultrasqld")?;
+        let state = Arc::new(Server::with_sample_database_pool_frames(
+            load::ultrasql_tpch_pool_frames(),
+        ));
+        let server_task = tokio::spawn(async move {
+            if let Err(e) = serve_listener(listener, state).await {
+                eprintln!("ultrasqld task exited: {e}");
+            }
+        });
+
+        let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", bound.port());
+        let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+            .await
+            .context("tokio-postgres connect to ultrasqld")?;
+        let conn_handle = tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("tokio-postgres connection error: {e}");
+            }
+        });
+
+        for stmt in schema::ddl_for_engine(schema::Engine::Ultrasql) {
+            client
+                .batch_execute(stmt)
+                .await
+                .with_context(|| format!("DDL: {}", stmt.lines().next().unwrap_or("").trim()))?;
+        }
+        load::load_ultrasql_into_client(&client, data_dir)
+            .await
+            .context("load TPC-H data into UltraSQL")?;
+        if progress_enabled() {
+            eprintln!("ultrasql tpch validate: load complete");
+        }
+
+        let mut results = Vec::new();
+        for n in selected_queries()? {
+            let label = format!("q{n}");
+            let sql = query_sql(n)?;
+            if progress_enabled() {
+                eprintln!("ultrasql tpch validate: starting {label}");
+            }
+            let messages = client
+                .simple_query(sql.as_ref())
+                .await
+                .with_context(|| format!("run {label}"))?;
+            let rows = collect_rows(&messages).with_context(|| format!("collect {label} rows"))?;
+            if progress_enabled() {
+                eprintln!(
+                    "ultrasql tpch validate: finished {label} ({} rows)",
+                    rows.len()
+                );
+            }
+            results.push(QueryRows { label, rows });
+        }
+
+        drop(client);
+        conn_handle.abort();
+        server_task.abort();
+        Ok(results)
+    })
+}
+
+/// Stub: returns an error when the `sql-bench` feature is not active.
+#[cfg(not(feature = "sql-bench"))]
+pub fn run_ultrasql_results(_data_dir: &std::path::Path) -> Result<Vec<QueryRows>> {
+    bail!(
+        "NotYetWired: rebuild ultrasql-bench with --features sql-bench to \
+         enable the in-process TPC-H validator"
+    )
 }
 
 /// Stub: returns an error when the `sql-bench` feature is not active.

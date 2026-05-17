@@ -20,14 +20,14 @@
 //! [`Batch`]: ultrasql_vec::Batch
 
 use bytes::BytesMut;
-use ultrasql_core::{DataType, Schema};
+use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_executor::Operator;
 use ultrasql_protocol::{BackendMessage, FieldDescription, encode_backend};
 use ultrasql_vec::column::Column;
 
 use crate::error::ServerError;
 use crate::wire_writer::{
-    write_data_row, write_int32_int64_pair_data_rows, write_int32_pair_data_rows,
+    write_data_row_typed, write_int32_int64_pair_data_rows, write_int32_pair_data_rows,
 };
 
 /// PostgreSQL type OID for `bool`. Pulled from `pg_type.dat`.
@@ -153,7 +153,8 @@ pub fn run_modify_command(
 /// and the txn-error / fallback paths in `lib.rs`). The hot path for
 /// Simple Query SELECT now goes through [`stream_select`].
 pub fn run_select(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
-    let row_desc = build_row_description(op.schema());
+    let schema = op.schema().clone();
+    let row_desc = build_row_description(&schema);
     let mut messages = Vec::with_capacity(8);
     messages.push(row_desc);
 
@@ -163,8 +164,12 @@ pub fn run_select(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
         let row_count = batch.rows();
         for row in 0..row_count {
             let mut columns = Vec::with_capacity(batch.width());
-            for col in batch.columns() {
-                columns.push(encode_text_value(col, row));
+            for (idx, col) in batch.columns().iter().enumerate() {
+                columns.push(encode_text_value_typed(
+                    col,
+                    row,
+                    &schema.field_at(idx).data_type,
+                ));
             }
             messages.push(BackendMessage::DataRow { columns });
         }
@@ -208,7 +213,8 @@ pub fn run_select(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
 /// the same count is embedded in the `CommandComplete` tag that this
 /// function already wrote into `sink`.
 pub fn stream_select(op: &mut dyn Operator, sink: &mut BytesMut) -> Result<u64, ServerError> {
-    let row_desc = build_row_description(op.schema());
+    let schema = op.schema().clone();
+    let row_desc = build_row_description(&schema);
     encode_backend(&row_desc, sink);
 
     let mut rows: u64 = 0;
@@ -220,25 +226,29 @@ pub fn stream_select(op: &mut dyn Operator, sink: &mut BytesMut) -> Result<u64, 
         // `Int32` columns (the `select_scan_10k` shape), use the
         // specialised bulk writer that pre-reserves the buffer once
         // and emits every row without per-cell enum dispatch.
-        if let [Column::Int32(a), Column::Int32(b)] = columns {
-            if a.nulls().is_none() && b.nulls().is_none() {
-                write_int32_pair_data_rows(sink, a.data(), b.data());
-                rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
-                continue;
-            }
+        if schema_is_int32_pair(&schema)
+            && let [Column::Int32(a), Column::Int32(b)] = columns
+            && a.nulls().is_none()
+            && b.nulls().is_none()
+        {
+            write_int32_pair_data_rows(sink, a.data(), b.data());
+            rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
+            continue;
         }
         // Fast path: `(Int32, Int64)` is the
         // `WindowAgg::try_columnar_row_number` output shape used by
         // `SELECT id, row_number() OVER (ORDER BY x) FROM t`. The
         // writer accepts optional validity bitmaps so it stays
         // correct when either side carries NULLs.
-        if let [Column::Int32(a), Column::Int64(b)] = columns {
+        if schema_is_int32_int64_pair(&schema)
+            && let [Column::Int32(a), Column::Int64(b)] = columns
+        {
             write_int32_int64_pair_data_rows(sink, a.data(), a.nulls(), b.data(), b.nulls());
             rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
             continue;
         }
         for row in 0..row_count {
-            write_data_row(sink, columns, row);
+            write_data_row_typed(sink, columns, &schema, row);
         }
         rows = rows.saturating_add(u64::try_from(row_count).unwrap_or(u64::MAX));
     }
@@ -444,6 +454,47 @@ pub(crate) fn encode_text_value(col: &Column, row: usize) -> Option<Vec<u8>> {
     }
 }
 
+/// Encode a physical column cell using the logical schema type.
+///
+/// Batch columns use compact physical layouts: `DATE` shares `Int32`,
+/// `DECIMAL` shares `Int64`. Wire text must expose SQL values, not storage
+/// integers.
+pub(crate) fn encode_text_value_typed(
+    col: &Column,
+    row: usize,
+    logical_type: &DataType,
+) -> Option<Vec<u8>> {
+    if let Some(nulls) = column_nulls(col) {
+        if !nulls.get(row) {
+            return None;
+        }
+    }
+    match (logical_type, col) {
+        (DataType::Date, Column::Int32(c)) => Some(Value::Date(c.data()[row]).to_string().into()),
+        (DataType::Decimal { scale, .. }, Column::Int64(c)) => Some(
+            Value::Decimal {
+                value: c.data()[row],
+                scale: scale.unwrap_or(0),
+            }
+            .to_string()
+            .into(),
+        ),
+        _ => encode_text_value(col, row),
+    }
+}
+
+fn schema_is_int32_pair(schema: &Schema) -> bool {
+    schema.len() == 2
+        && matches!(&schema.field_at(0).data_type, DataType::Int32)
+        && matches!(&schema.field_at(1).data_type, DataType::Int32)
+}
+
+fn schema_is_int32_int64_pair(schema: &Schema) -> bool {
+    schema.len() == 2
+        && matches!(&schema.field_at(0).data_type, DataType::Int32)
+        && matches!(&schema.field_at(1).data_type, DataType::Int64)
+}
+
 const fn column_nulls(col: &Column) -> Option<&ultrasql_vec::Bitmap> {
     match col {
         Column::Int32(c) => c.nulls(),
@@ -563,5 +614,35 @@ mod tests {
         assert_eq!(pg_type_oid(&DataType::Float64), 701);
         assert_eq!(pg_type_oid(&DataType::Bool), 16);
         assert_eq!(pg_type_oid(&DataType::Text { max_len: None }), 25);
+    }
+
+    #[test]
+    fn run_select_encodes_logical_date_and_decimal_text() {
+        let schema = Schema::new([
+            Field::required("d", DataType::Date),
+            Field::required(
+                "price",
+                DataType::Decimal {
+                    precision: Some(15),
+                    scale: Some(2),
+                },
+            ),
+        ])
+        .unwrap();
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![0])),
+            Column::Int64(NumericColumn::from_data(vec![17_366_547])),
+        ])
+        .unwrap();
+        let mut scan = MemTableScan::new(schema, vec![batch]);
+        let result = run_select(&mut scan).expect("ok");
+
+        match &result.messages[1] {
+            BackendMessage::DataRow { columns } => {
+                assert_eq!(columns[0], Some(b"2000-01-01".to_vec()));
+                assert_eq!(columns[1], Some(b"173665.47".to_vec()));
+            }
+            other => panic!("expected DataRow, got {other:?}"),
+        }
     }
 }

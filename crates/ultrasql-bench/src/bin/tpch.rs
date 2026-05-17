@@ -11,12 +11,14 @@
 //! | `gen-data <scale> <out-dir>` | Generate `.tbl` files (default scale 1) |
 //! | `load <engine> <data-dir>` | Load `.tbl` files into the target engine |
 //! | `run-queries <engine>` | Run all 22 queries; optionally write baseline |
+//! | `validate-results` | Compare UltraSQL query rows against DuckDB |
 //! | `compare <baseline.json>` | Re-run queries; fail on >5% regression |
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -96,6 +98,17 @@ enum Cmd {
         pg_dsn: String,
     },
 
+    /// Compare UltraSQL TPC-H query results against a local DuckDB reference.
+    ValidateResults {
+        /// Directory containing the `.tbl` files.
+        #[arg(long, default_value = "tpch-data")]
+        data_dir: PathBuf,
+
+        /// Path to `duckdb` CLI binary.
+        #[arg(long, default_value = "duckdb")]
+        duckdb: PathBuf,
+    },
+
     /// Compare a new run against a recorded baseline; exit non-zero on >5% regression.
     Compare {
         /// Path to the existing baseline JSON.
@@ -172,6 +185,7 @@ fn run() -> Result<()> {
             out,
             pg_dsn,
         } => cmd_run_queries(engine, &data_dir, runs, warmup, out.as_deref(), &pg_dsn),
+        Cmd::ValidateResults { data_dir, duckdb } => cmd_validate_results(&data_dir, &duckdb),
         Cmd::Compare {
             baseline,
             data_dir,
@@ -294,6 +308,17 @@ fn cmd_run_queries(
             .with_context(|| format!("write baseline to {}", path.display()))?;
         println!("Baseline written to {}", path.display());
     }
+    Ok(())
+}
+
+fn cmd_validate_results(data_dir: &Path, duckdb_bin: &Path) -> Result<()> {
+    let expected = run_duckdb_results(data_dir, duckdb_bin).context("run DuckDB reference")?;
+    let actual = runner::run_ultrasql_results(data_dir).context("run UltraSQL results")?;
+    compare_result_sets(&expected, &actual)?;
+    println!(
+        "validated {} TPC-H query result set(s) against DuckDB",
+        actual.len()
+    );
     Ok(())
 }
 
@@ -454,6 +479,258 @@ fn parse_engine_from_baseline(engine_str: &str) -> Result<EngineArg> {
     } else {
         bail!("unknown engine in baseline: {engine_str}")
     }
+}
+
+fn run_duckdb_results(data_dir: &Path, duckdb_bin: &Path) -> Result<Vec<runner::QueryRows>> {
+    let tmp = tempfile::tempdir().context("create temporary DuckDB directory")?;
+    let db_path = tmp.path().join("tpch.duckdb");
+    let setup_sql = duckdb_setup_sql(data_dir)?;
+    run_duckdb_sql(duckdb_bin, &db_path, &setup_sql).context("initialize DuckDB reference")?;
+
+    let mut results = Vec::new();
+    for n in runner::selected_queries()? {
+        let label = format!("q{n}");
+        let sql = runner::query_sql(n)?;
+        let stdout =
+            run_duckdb_query(duckdb_bin, &db_path, sql.as_ref()).with_context(|| label.clone())?;
+        let rows = parse_csv_rows(&stdout).with_context(|| format!("parse {label} CSV"))?;
+        if progress_enabled() {
+            eprintln!(
+                "duckdb tpch validate: finished {label} ({} rows)",
+                rows.len()
+            );
+        }
+        results.push(runner::QueryRows { label, rows });
+    }
+    Ok(results)
+}
+
+fn duckdb_setup_sql(data_dir: &Path) -> Result<String> {
+    let mut sql = String::new();
+    for ddl in schema::ddl_for_engine(schema::Engine::Postgres) {
+        sql.push_str(ddl);
+        sql.push('\n');
+    }
+    for table in data_gen::TABLE_NAMES {
+        let tbl = data_dir.join(format!("{table}.tbl"));
+        let path = sql_path_literal(&tbl)?;
+        sql.push_str(&format!(
+            "COPY {table} FROM {path} (DELIMITER '|', HEADER false);\n"
+        ));
+    }
+    Ok(sql)
+}
+
+fn sql_path_literal(path: &Path) -> Result<String> {
+    let absolute =
+        std::fs::canonicalize(path).with_context(|| format!("canonicalize {}", path.display()))?;
+    let escaped = absolute.display().to_string().replace('\'', "''");
+    Ok(format!("'{escaped}'"))
+}
+
+fn run_duckdb_sql(duckdb_bin: &Path, db_path: &Path, sql: &str) -> Result<()> {
+    let output = Command::new(duckdb_bin)
+        .arg(db_path)
+        .arg("-c")
+        .arg(sql)
+        .output()
+        .with_context(|| format!("spawn {}", duckdb_bin.display()))?;
+    if !output.status.success() {
+        bail!(
+            "DuckDB failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn run_duckdb_query(duckdb_bin: &Path, db_path: &Path, sql: &str) -> Result<String> {
+    let output = Command::new(duckdb_bin)
+        .arg(db_path)
+        .arg("-csv")
+        .arg("-noheader")
+        .arg("-nullvalue")
+        .arg("\\N")
+        .arg("-c")
+        .arg(sql)
+        .output()
+        .with_context(|| format!("spawn {}", duckdb_bin.display()))?;
+    if !output.status.success() {
+        bail!(
+            "DuckDB query failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).context("DuckDB emitted non-UTF8 CSV")
+}
+
+fn parse_csv_rows(csv: &str) -> Result<Vec<Vec<String>>> {
+    let trimmed = csv.strip_suffix('\n').unwrap_or(csv);
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    trimmed
+        .split('\n')
+        .map(|line| parse_csv_line(line.strip_suffix('\r').unwrap_or(line)))
+        .collect()
+}
+
+fn parse_csv_line(line: &str) -> Result<Vec<String>> {
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = line.chars().peekable();
+    let mut quoted = false;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                cell.push('"');
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => cells.push(std::mem::take(&mut cell)),
+            _ => cell.push(ch),
+        }
+    }
+    if quoted {
+        bail!("unterminated quoted CSV field");
+    }
+    cells.push(cell);
+    Ok(cells)
+}
+
+fn compare_result_sets(expected: &[runner::QueryRows], actual: &[runner::QueryRows]) -> Result<()> {
+    if expected.len() != actual.len() {
+        bail!(
+            "query count mismatch: DuckDB={} UltraSQL={}",
+            expected.len(),
+            actual.len()
+        );
+    }
+    for (expected_query, actual_query) in expected.iter().zip(actual) {
+        if expected_query.label != actual_query.label {
+            bail!(
+                "query label mismatch: DuckDB={} UltraSQL={}",
+                expected_query.label,
+                actual_query.label
+            );
+        }
+        compare_query_rows(expected_query, actual_query)?;
+        println!(
+            "{} ok ({} rows)",
+            actual_query.label,
+            actual_query.rows.len()
+        );
+    }
+    Ok(())
+}
+
+fn compare_query_rows(expected: &runner::QueryRows, actual: &runner::QueryRows) -> Result<()> {
+    if expected.rows.len() != actual.rows.len() {
+        bail!(
+            "{} row count mismatch: DuckDB={} UltraSQL={}\n  DuckDB head: {:?}\n  UltraSQL head: {:?}",
+            expected.label,
+            expected.rows.len(),
+            actual.rows.len(),
+            row_context(&expected.rows, 0),
+            row_context(&actual.rows, 0)
+        );
+    }
+    for (row_idx, (expected_row, actual_row)) in expected.rows.iter().zip(&actual.rows).enumerate()
+    {
+        if expected_row.len() != actual_row.len() {
+            bail!(
+                "{} row {} column count mismatch: DuckDB={} UltraSQL={}",
+                expected.label,
+                row_idx + 1,
+                expected_row.len(),
+                actual_row.len()
+            );
+        }
+        for (col_idx, (expected_cell, actual_cell)) in
+            expected_row.iter().zip(actual_row).enumerate()
+        {
+            if !cells_match(expected_cell, actual_cell) {
+                let expected_row_in_actual = actual
+                    .rows
+                    .iter()
+                    .position(|row| rows_match(expected_row, row))
+                    .map(|idx| idx + 1);
+                let actual_row_in_expected = expected
+                    .rows
+                    .iter()
+                    .position(|row| rows_match(row, actual_row))
+                    .map(|idx| idx + 1);
+                let expected_context = row_context(&expected.rows, row_idx);
+                let actual_context = row_context(&actual.rows, row_idx);
+                bail!(
+                    "{} row {} col {} mismatch: DuckDB=`{}` UltraSQL=`{}`\n  DuckDB row: {:?}\n  UltraSQL row: {:?}\n  DuckDB row appears in UltraSQL at: {:?}\n  UltraSQL row appears in DuckDB at: {:?}\n  DuckDB context: {:?}\n  UltraSQL context: {:?}",
+                    expected.label,
+                    row_idx + 1,
+                    col_idx + 1,
+                    expected_cell,
+                    actual_cell,
+                    expected_row,
+                    actual_row,
+                    expected_row_in_actual,
+                    actual_row_in_expected,
+                    expected_context,
+                    actual_context
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn row_context(rows: &[Vec<String>], row_idx: usize) -> Vec<(usize, Vec<String>)> {
+    let start = row_idx.saturating_sub(2);
+    let end = rows.len().min(row_idx + 3);
+    rows[start..end]
+        .iter()
+        .enumerate()
+        .map(|(offset, row)| (start + offset + 1, row.clone()))
+        .collect()
+}
+
+fn rows_match(expected: &[String], actual: &[String]) -> bool {
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual)
+            .all(|(expected_cell, actual_cell)| cells_match(expected_cell, actual_cell))
+}
+
+fn cells_match(expected: &str, actual: &str) -> bool {
+    let expected = expected.trim_end();
+    let actual = actual.trim_end();
+    if expected == actual {
+        return true;
+    }
+    if matches!((expected, actual), ("true", "t") | ("false", "f")) {
+        return true;
+    }
+    let (Some(expected_number), Some(actual_number)) =
+        (parse_finite_number(expected), parse_finite_number(actual))
+    else {
+        return false;
+    };
+    let diff = (expected_number - actual_number).abs();
+    let scale = expected_number.abs().max(actual_number.abs()).max(1.0);
+    diff <= 1e-4 || diff <= scale * 1e-9
+}
+
+fn parse_finite_number(cell: &str) -> Option<f64> {
+    if cell == "\\N" {
+        return None;
+    }
+    cell.parse::<f64>().ok().filter(|value| value.is_finite())
+}
+
+fn progress_enabled() -> bool {
+    matches!(
+        std::env::var("ULTRASQL_TPCH_PROGRESS").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
 }
 
 /// Ensure all 22 query texts can be fetched; used in integration testing.

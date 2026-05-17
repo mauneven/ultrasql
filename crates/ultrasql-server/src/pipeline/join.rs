@@ -124,6 +124,7 @@ pub(super) fn lower_join(
                             right,
                             left_keys,
                             right_keys,
+                            out_schema,
                             left_schema,
                             right_schema,
                         );
@@ -191,6 +192,7 @@ fn build_swapped_inner_hash_join(
     right: Box<dyn Operator>,
     left_keys: Vec<ScalarExpr>,
     right_keys: Vec<ScalarExpr>,
+    out_schema: Schema,
     left_schema: Schema,
     right_schema: Schema,
 ) -> Result<Box<dyn Operator>, ServerError> {
@@ -212,16 +214,31 @@ fn build_swapped_inner_hash_join(
     indices.extend(right_width..(right_width + left_width));
     indices.extend(0..right_width);
 
-    Ok(Box::new(Project::new(join, indices)?))
+    Ok(Box::new(Project::with_schema(join, indices, out_schema)?))
 }
 
 fn concat_schemas(left: &Schema, right: &Schema) -> Schema {
     let mut fields = Vec::with_capacity(left.len() + right.len());
+    let left_names: std::collections::HashSet<String> = left
+        .fields()
+        .iter()
+        .map(|field| field.name.to_ascii_lowercase())
+        .collect();
     for idx in 0..left.len() {
         fields.push(left.field_at(idx).clone());
     }
     for idx in 0..right.len() {
-        fields.push(right.field_at(idx).clone());
+        let field = right.field_at(idx);
+        let name = if left_names.contains(&field.name.to_ascii_lowercase()) {
+            format!("{}_1", field.name)
+        } else {
+            field.name.clone()
+        };
+        fields.push(ultrasql_core::Field {
+            name,
+            data_type: field.data_type.clone(),
+            nullable: field.nullable,
+        });
     }
     Schema::new(fields).expect("join schema concatenation must stay valid")
 }

@@ -705,6 +705,10 @@ enum ArithOp {
 /// [`EvalError::Type`]. Floating-point overflow produces `f64::INFINITY`
 /// (IEEE 754 semantics, consistent with PostgreSQL).
 fn numeric_arith(lv: Value, rv: Value, op: ArithOp) -> Result<Value, EvalError> {
+    if let Some((left, right)) = decimal_float_operands(&lv, &rv) {
+        return float64_arith(left, right, op);
+    }
+
     if matches!(
         (&lv, &rv),
         (Value::Decimal { .. }, _) | (_, Value::Decimal { .. })
@@ -744,6 +748,30 @@ fn numeric_arith(lv: Value, rv: Value, op: ArithOp) -> Result<Value, EvalError> 
             "arithmetic type mismatch: {l:?} and {r:?}"
         ))),
     }
+}
+
+fn decimal_float_operands(left: &Value, right: &Value) -> Option<(f64, f64)> {
+    match (left, right) {
+        (Value::Decimal { value, scale }, Value::Float32(r)) => {
+            Some((decimal_value_to_f64(*value, *scale), f64::from(*r)))
+        }
+        (Value::Decimal { value, scale }, Value::Float64(r)) => {
+            Some((decimal_value_to_f64(*value, *scale), *r))
+        }
+        (Value::Float32(l), Value::Decimal { value, scale }) => {
+            Some((f64::from(*l), decimal_value_to_f64(*value, *scale)))
+        }
+        (Value::Float64(l), Value::Decimal { value, scale }) => {
+            Some((*l, decimal_value_to_f64(*value, *scale)))
+        }
+        _ => None,
+    }
+}
+
+fn decimal_value_to_f64(value: i64, scale: i32) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let raw = value as f64;
+    raw / 10_f64.powi(scale)
 }
 
 fn numeric_to_decimal(value: &Value) -> Result<Option<(i64, i32)>, EvalError> {
@@ -1470,15 +1498,18 @@ mod tests {
     }
 
     #[test]
+    fn decimal_mixed_with_float_returns_float64() {
+        let ev = Eval::new(binop(BinaryOp::Mul, lit_decimal(2, 1), lit_f64(18.0)));
+        assert_eq!(ev.eval(&[]).unwrap(), Value::Float64(3.6));
+    }
+
+    #[test]
     fn decimal_divides_float_literal() {
         let ev = Eval::new(binop(BinaryOp::Div, lit_decimal(12345, 2), lit_f64(7.0)));
-        assert_eq!(
-            ev.eval(&[]).unwrap(),
-            Value::Decimal {
-                value: 17635714,
-                scale: 6
-            }
-        );
+        let Value::Float64(v) = ev.eval(&[]).unwrap() else {
+            panic!("expected Float64");
+        };
+        assert!((v - 17.635_714_285_714_286).abs() < f64::EPSILON);
     }
 
     #[test]

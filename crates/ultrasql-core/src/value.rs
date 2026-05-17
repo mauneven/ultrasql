@@ -258,7 +258,7 @@ impl fmt::Display for Value {
                 Ok(())
             }
             Self::Timestamp(us) | Self::TimestampTz(us) => write!(f, "{us}us"),
-            Self::Date(d) => write!(f, "{d}d"),
+            Self::Date(d) => write!(f, "{}", format_date(*d)),
             Self::Time(t) => write!(f, "{t}us"),
             Self::Decimal { value, scale } => {
                 // PostgreSQL-style fixed-point text. `value` is the
@@ -307,6 +307,42 @@ impl fmt::Display for Value {
             }
         }
     }
+}
+
+fn format_date(days_since_2000_01_01: i32) -> String {
+    let (year, month, day) = civil_from_days(days_since_2000_01_01);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Inverse of Howard Hinnant's `days_from_civil`, rebased on UltraSQL's
+/// 2000-01-01 date epoch.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "civil-from-days arithmetic; doe / yoe fit in i32 by construction"
+)]
+fn civil_from_days(days_since_2000_01_01: i32) -> (i32, i32, i32) {
+    let z = days_since_2000_01_01 + 10_957;
+    let z = z + 719_468;
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i32) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as i32;
+    let month = if mp < 10 {
+        mp as i32 + 3
+    } else {
+        mp as i32 - 9
+    };
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
 }
 
 impl From<bool> for Value {
@@ -358,6 +394,13 @@ impl From<Vec<u8>> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn date_display_uses_iso_calendar_text() {
+        assert_eq!(Value::Date(0).to_string(), "2000-01-01");
+        assert_eq!(Value::Date(-1).to_string(), "1999-12-31");
+        assert_eq!(Value::Date(8_766).to_string(), "2024-01-01");
+    }
 
     #[test]
     fn null_is_null() {

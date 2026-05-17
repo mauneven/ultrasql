@@ -251,6 +251,39 @@ struct ScopeEntry {
     field: Field,
 }
 
+fn schema_for_qualified_binding(
+    input: &Schema,
+    from_scope: &[ScopeEntry],
+) -> Result<Schema, PlanError> {
+    if from_scope.is_empty() {
+        return Ok(input.clone());
+    }
+
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for entry in from_scope {
+        *counts
+            .entry(entry.field.name.to_ascii_lowercase())
+            .or_default() += 1;
+    }
+
+    let mut fields = input.fields().to_vec();
+    for entry in from_scope {
+        let Some(count) = counts.get(&entry.field.name.to_ascii_lowercase()) else {
+            continue;
+        };
+        if *count <= 1 || entry.qualifier.is_empty() {
+            continue;
+        }
+        let Some(field) = fields.get_mut(entry.field_index) else {
+            continue;
+        };
+        field.name = format!("{}.{}", entry.qualifier, entry.field.name);
+    }
+
+    Schema::new(fields)
+        .map_err(|e| PlanError::TypeMismatch(format!("qualified binding schema: {e}")))
+}
+
 /// Bind a `SELECT` statement.
 ///
 /// Handles: CTEs, FROM clause (single tables, explicit joins, subqueries),
@@ -568,7 +601,8 @@ fn bind_select_body(
     let (mut plan, from_scope) = bind_from(&select.from, catalog, cte_catalog, scope)?;
 
     if let Some(pred_ast) = &select.r#where {
-        let pred = bind_expr_with_ctes(pred_ast, plan.schema(), catalog, cte_catalog, scope)?;
+        let binding_schema = schema_for_qualified_binding(plan.schema(), &from_scope)?;
+        let pred = bind_expr_with_ctes(pred_ast, &binding_schema, catalog, cte_catalog, scope)?;
         let pred_ty = pred.data_type();
         if pred_ty != DataType::Bool && pred_ty != DataType::Null {
             return Err(PlanError::TypeMismatch(format!(
@@ -669,8 +703,9 @@ fn bind_select_body(
         let proj_schema = Schema::new(proj_fields)
             .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
 
+        let order_schema = schema_for_qualified_binding(plan.schema(), &from_scope)?;
         let sort_keys =
-            bind_order_by(&select.order_by, plan.schema(), catalog, cte_catalog, scope)?;
+            bind_order_by(&select.order_by, &order_schema, catalog, cte_catalog, scope)?;
         if !sort_keys.is_empty() {
             plan = LogicalPlan::Sort {
                 input: Box::new(plan),

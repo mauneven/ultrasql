@@ -26,7 +26,7 @@
 //! = NULL, etc.). This matches `SELECT COUNT(*) FROM empty_table = 0`.
 //! If the input is empty and there **are** group keys, no rows are emitted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use ultrasql_core::{DataType, Schema, Value};
@@ -876,6 +876,12 @@ fn extremum_f32(c: &NumericColumn<f32>, take_min: bool) -> Option<f32> {
 /// Per-row accumulator for a single aggregate function instance.
 #[derive(Debug)]
 enum AggState {
+    /// DISTINCT wrapper: filters duplicate non-NULL aggregate inputs before
+    /// forwarding them into the wrapped aggregate state.
+    Distinct {
+        inner: Box<AggState>,
+        seen: HashSet<KeyValue>,
+    },
     /// `COUNT(*)` — counts all rows regardless of NULLs.
     CountStar(i64),
     /// `COUNT(expr)` — counts non-NULL values.
@@ -915,7 +921,18 @@ enum AggState {
 /// Initialise one [`AggState`] for the given aggregate descriptor.
 #[allow(clippy::missing_const_for_fn)] // not const due to Vec::new() in variants
 fn init_state_for(agg: &LogicalAggregateExpr) -> AggState {
-    match agg.func {
+    if agg.distinct {
+        return AggState::Distinct {
+            inner: Box::new(init_state_for_func(agg.func)),
+            seen: HashSet::new(),
+        };
+    }
+    init_state_for_func(agg.func)
+}
+
+#[allow(clippy::missing_const_for_fn)] // not const due to Vec::new() in variants
+fn init_state_for_func(func: AggregateFunc) -> AggState {
+    match func {
         AggregateFunc::CountStar => AggState::CountStar(0),
         AggregateFunc::Count => AggState::Count(0),
         AggregateFunc::Sum => AggState::Sum(None),
@@ -974,7 +991,22 @@ fn accumulate(
         .as_ref()
         .map(|expr| Eval::new(expr.clone()).eval(row).unwrap_or(Value::Null));
 
+    if let AggState::Distinct { inner, seen } = state {
+        let Some(v) = arg_val else {
+            return Ok(());
+        };
+        if v.is_null() || !seen.insert(KeyValue(v.clone())) {
+            return Ok(());
+        }
+        return accumulate_value(inner, Some(v));
+    }
+
+    accumulate_value(state, arg_val)
+}
+
+fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), ExecError> {
     match state {
+        AggState::Distinct { .. } => unreachable!("distinct wrapper handled before dispatch"),
         AggState::CountStar(n) => {
             *n = n.saturating_add(1);
         }
@@ -1099,6 +1131,7 @@ fn value_as_f64(v: &Value) -> Option<f64> {
 /// Finalise an [`AggState`] into its result [`Value`].
 fn finalise(state: &AggState) -> Value {
     match state {
+        AggState::Distinct { inner, .. } => finalise(inner),
         AggState::CountStar(n) | AggState::Count(n) => Value::Int64(*n),
         AggState::Sum(acc) | AggState::Min(acc) | AggState::Max(acc) => {
             acc.clone().unwrap_or(Value::Null)
@@ -1324,6 +1357,16 @@ mod tests {
         }
     }
 
+    fn count_distinct_agg(name: &str, index: usize, data_type: DataType) -> LogicalAggregateExpr {
+        LogicalAggregateExpr {
+            func: AggregateFunc::Count,
+            arg: Some(col(name, index, data_type)),
+            distinct: true,
+            output_name: "distinct_count".into(),
+            data_type: DataType::Int64,
+        }
+    }
+
     fn min_agg(name: &str, index: usize) -> LogicalAggregateExpr {
         LogicalAggregateExpr {
             func: AggregateFunc::Min,
@@ -1471,6 +1514,39 @@ mod tests {
         // group=2: sum=20, min=20, max=20
         assert_eq!(rows[1][0], Value::Int32(2));
         assert_eq!(rows[1][1], Value::Int64(20));
+    }
+
+    #[test]
+    fn hash_agg_count_distinct_per_group() {
+        let schema = schema_group_val();
+        let scan = MemTableScan::new(
+            schema,
+            vec![make_batch_i32_i64(&[
+                (1, 10),
+                (1, 10),
+                (1, 20),
+                (2, 30),
+                (2, 30),
+            ])],
+        );
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::required("distinct_count", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let mut op = HashAggregate::new(
+            Box::new(scan),
+            vec![col("group", 0, DataType::Int32)],
+            vec![count_distinct_agg("val", 1, DataType::Int64)],
+            out_schema,
+        );
+        let mut rows = drain_all(&mut op);
+        rows.sort_by_key(|r| match &r[0] {
+            Value::Int32(v) => *v,
+            _ => i32::MAX,
+        });
+        assert_eq!(rows[0], vec![Value::Int32(1), Value::Int64(2)]);
+        assert_eq!(rows[1], vec![Value::Int32(2), Value::Int64(1)]);
     }
 
     // -------------------------------------------------------------------------

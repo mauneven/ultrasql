@@ -219,10 +219,52 @@ pub fn compare_values_nullable(a: &Value, b: &Value, nulls_first: bool) -> Order
         (Value::Float32(l), Value::Float32(r)) => l.partial_cmp(r).unwrap_or(Ordering::Equal),
         (Value::Float64(l), Value::Float64(r)) => l.partial_cmp(r).unwrap_or(Ordering::Equal),
         (Value::Text(l), Value::Text(r)) => l.cmp(r),
+        (Value::Timestamp(l), Value::Timestamp(r))
+        | (Value::TimestampTz(l), Value::TimestampTz(r))
+        | (Value::Time(l), Value::Time(r)) => l.cmp(r),
+        (Value::Date(l), Value::Date(r)) => l.cmp(r),
+        (
+            Value::Decimal {
+                value: l,
+                scale: l_scale,
+            },
+            Value::Decimal {
+                value: r,
+                scale: r_scale,
+            },
+        ) => compare_decimals(*l, *l_scale, *r, *r_scale),
         // Mixed types or unsupported types: treat as equal to avoid panics.
         // The planner/binder is responsible for preventing mixed-type keys.
         _ => Ordering::Equal,
     }
+}
+
+fn compare_decimals(l: i64, l_scale: i32, r: i64, r_scale: i32) -> Ordering {
+    if l_scale == r_scale {
+        return l.cmp(&r);
+    }
+    let common_scale = l_scale.max(r_scale);
+    let Some(l_scaled) = scale_decimal_to(l, l_scale, common_scale) else {
+        return Ordering::Equal;
+    };
+    let Some(r_scaled) = scale_decimal_to(r, r_scale, common_scale) else {
+        return Ordering::Equal;
+    };
+    l_scaled.cmp(&r_scaled)
+}
+
+fn scale_decimal_to(value: i64, from_scale: i32, to_scale: i32) -> Option<i128> {
+    let diff = u32::try_from(to_scale - from_scale).ok()?;
+    let multiplier = checked_pow10_i128(diff)?;
+    i128::from(value).checked_mul(multiplier)
+}
+
+fn checked_pow10_i128(exp: u32) -> Option<i128> {
+    let mut out = 1_i128;
+    for _ in 0..exp {
+        out = out.checked_mul(10)?;
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +282,9 @@ mod tests {
 
     use super::{Sort, compare_values_nullable};
     use crate::Operator;
+    use crate::filter_op::batch_to_rows;
     use crate::mem_table_scan::MemTableScan;
+    use crate::seq_scan::build_batch;
 
     // -------------------------------------------------------------------------
     // Test helpers
@@ -358,6 +402,114 @@ mod tests {
             Ordering::Less,
             "nulls_first=false: non-NULL < NULL"
         );
+    }
+
+    #[test]
+    fn sort_compares_date_and_decimal_values() {
+        assert_eq!(
+            compare_values_nullable(&Value::Date(0), &Value::Date(1), false),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values_nullable(
+                &Value::Decimal {
+                    value: 100,
+                    scale: 1,
+                },
+                &Value::Decimal {
+                    value: 999,
+                    scale: 2,
+                },
+                false,
+            ),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn sort_mixed_q2_style_keys() {
+        let schema = Schema::new([
+            Field::required(
+                "acctbal",
+                DataType::Decimal {
+                    precision: Some(15),
+                    scale: Some(2),
+                },
+            ),
+            Field::required("nation", DataType::Text { max_len: None }),
+            Field::required("supplier", DataType::Text { max_len: None }),
+            Field::required("partkey", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let rows = vec![
+            vec![
+                Value::Decimal {
+                    value: 931_297,
+                    scale: 2,
+                },
+                Value::Text("RUSSIA".into()),
+                Value::Text("Supplier#000007807".into()),
+                Value::Int32(100_276),
+            ],
+            vec![
+                Value::Decimal {
+                    value: 931_297,
+                    scale: 2,
+                },
+                Value::Text("RUSSIA".into()),
+                Value::Text("Supplier#000007807".into()),
+                Value::Int32(90_279),
+            ],
+        ];
+        let batch = build_batch(&rows, &schema).expect("batch ok");
+        let scan = MemTableScan::new(schema.clone(), vec![batch]);
+        let keys = vec![
+            SortKey {
+                expr: ScalarExpr::Column {
+                    name: "acctbal".into(),
+                    index: 0,
+                    data_type: schema.field_at(0).data_type.clone(),
+                },
+                asc: false,
+                nulls_first: true,
+            },
+            SortKey {
+                expr: ScalarExpr::Column {
+                    name: "nation".into(),
+                    index: 1,
+                    data_type: schema.field_at(1).data_type.clone(),
+                },
+                asc: true,
+                nulls_first: false,
+            },
+            SortKey {
+                expr: ScalarExpr::Column {
+                    name: "supplier".into(),
+                    index: 2,
+                    data_type: schema.field_at(2).data_type.clone(),
+                },
+                asc: true,
+                nulls_first: false,
+            },
+            SortKey {
+                expr: ScalarExpr::Column {
+                    name: "partkey".into(),
+                    index: 3,
+                    data_type: DataType::Int32,
+                },
+                asc: true,
+                nulls_first: false,
+            },
+        ];
+        let mut sort = Sort::new(Box::new(scan), keys, schema);
+        let batch = sort
+            .next_batch()
+            .expect("sort ok")
+            .expect("one output batch");
+        let rows = batch_to_rows(&batch, sort.schema()).expect("decode rows");
+
+        assert_eq!(rows[0][3], Value::Int32(90_279));
+        assert_eq!(rows[1][3], Value::Int32(100_276));
     }
 
     // -------------------------------------------------------------------------

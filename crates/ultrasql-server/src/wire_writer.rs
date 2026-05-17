@@ -31,10 +31,11 @@
 //! encoder.
 
 use bytes::{BufMut, BytesMut};
+use ultrasql_core::{DataType, Schema};
 use ultrasql_vec::Bitmap;
 use ultrasql_vec::column::Column;
 
-use crate::result_encoder::encode_text_value;
+use crate::result_encoder::{encode_text_value, encode_text_value_typed};
 
 /// PostgreSQL `DataRow` message type tag (`'D'`).
 const DATA_ROW_TAG: u8 = b'D';
@@ -66,6 +67,7 @@ fn i16_from_usize(value: usize) -> i16 {
 ///
 /// The length placeholder is back-filled after the payload is fully
 /// written so the writer does not need to know value widths up front.
+#[cfg(test)]
 pub(crate) fn write_data_row(sink: &mut BytesMut, batch_columns: &[Column], row: usize) {
     sink.put_u8(DATA_ROW_TAG);
     let length_index = sink.len();
@@ -74,6 +76,32 @@ pub(crate) fn write_data_row(sink: &mut BytesMut, batch_columns: &[Column], row:
     sink.put_i16(i16_from_usize(batch_columns.len()));
     for col in batch_columns {
         write_cell(sink, col, row);
+    }
+    let payload_end = sink.len();
+    let payload_len = payload_end - payload_start;
+    let length = i32_from_usize(payload_len + 4);
+    sink[length_index..length_index + 4].copy_from_slice(&length.to_be_bytes());
+}
+
+/// Emit one `DataRow` using logical schema types for physical-layout columns.
+///
+/// `DATE` and `DECIMAL` are stored as integer batch columns, so this path keeps
+/// their PostgreSQL text output semantic while preserving the integer fast paths
+/// for true integer schemas.
+pub(crate) fn write_data_row_typed(
+    sink: &mut BytesMut,
+    batch_columns: &[Column],
+    schema: &Schema,
+    row: usize,
+) {
+    sink.put_u8(DATA_ROW_TAG);
+    let length_index = sink.len();
+    sink.put_i32(0);
+    let payload_start = sink.len();
+    sink.put_i16(i16_from_usize(batch_columns.len()));
+    for (idx, col) in batch_columns.iter().enumerate() {
+        let logical_type = &schema.field_at(idx).data_type;
+        write_cell_typed(sink, col, row, logical_type);
     }
     let payload_end = sink.len();
     let payload_len = payload_end - payload_start;
@@ -369,6 +397,24 @@ fn write_cell(sink: &mut BytesMut, col: &Column, row: usize) {
             sink.put_i32(i32_from_usize(bytes.len()));
             sink.put_slice(&bytes);
         }
+    }
+}
+
+/// Emit one typed column cell. Most columns still use the allocation-free
+/// physical writer; logical wrappers call the typed encoder.
+fn write_cell_typed(sink: &mut BytesMut, col: &Column, row: usize, logical_type: &DataType) {
+    if is_null(col, row) {
+        sink.put_i32(-1);
+        return;
+    }
+    match (logical_type, col) {
+        (DataType::Date | DataType::Decimal { .. }, _) => {
+            let bytes = encode_text_value_typed(col, row, logical_type)
+                .expect("non-null typed cell must encode to Some(bytes)");
+            sink.put_i32(i32_from_usize(bytes.len()));
+            sink.put_slice(&bytes);
+        }
+        _ => write_cell(sink, col, row),
     }
 }
 

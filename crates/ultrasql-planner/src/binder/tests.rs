@@ -490,6 +490,23 @@ fn two_table_catalog() -> InMemoryCatalog {
     cat
 }
 
+fn duplicate_id_catalog() -> InMemoryCatalog {
+    let schema_a = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::required("marker", DataType::Int32),
+    ])
+    .expect("schema ok");
+    let schema_b = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::required("marker", DataType::Int32),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("a", TableMeta::new(schema_a));
+    cat.register("b", TableMeta::new(schema_b));
+    cat
+}
+
 #[test]
 fn binds_inner_join_with_on_predicate() {
     let cat = two_table_catalog();
@@ -526,6 +543,65 @@ fn binds_inner_join_with_on_predicate() {
     );
     // Schema is concatenation: users(id, name) + orders(oid, user_id) = 4
     assert_eq!(schema.len(), 4, "join schema width should be 4");
+}
+
+#[test]
+fn qualified_join_predicate_resolves_duplicate_right_column() {
+    let cat = duplicate_id_catalog();
+    let plan = parse_and_bind(
+        "SELECT a.id AS aid, b.id AS bid \
+         FROM a JOIN b ON a.id = b.id \
+         ORDER BY b.id",
+        &cat,
+    )
+    .expect("bind ok");
+
+    let LogicalPlan::Project { input, exprs, .. } = &plan else {
+        panic!("expected top Project, got {plan:?}");
+    };
+    assert!(matches!(&exprs[0].0, ScalarExpr::Column { index: 0, .. }));
+    assert!(matches!(&exprs[1].0, ScalarExpr::Column { index: 2, .. }));
+
+    let LogicalPlan::Sort { input, keys } = input.as_ref() else {
+        panic!("expected Sort under Project");
+    };
+    assert!(matches!(&keys[0].expr, ScalarExpr::Column { index: 2, .. }));
+
+    let LogicalPlan::Join { condition, .. } = input.as_ref() else {
+        panic!("expected Join under Sort");
+    };
+    let LogicalJoinCondition::On(ScalarExpr::Binary { left, right, .. }) = condition else {
+        panic!("expected binary ON predicate, got {condition:?}");
+    };
+    assert!(matches!(left.as_ref(), ScalarExpr::Column { index: 0, .. }));
+    assert!(matches!(
+        right.as_ref(),
+        ScalarExpr::Column { index: 2, .. }
+    ));
+}
+
+#[test]
+fn qualified_where_predicate_resolves_duplicate_right_column() {
+    let cat = duplicate_id_catalog();
+    let plan = parse_and_bind("SELECT b.id FROM a, b WHERE a.id = b.id", &cat).expect("bind ok");
+
+    let LogicalPlan::Project { input, exprs, .. } = &plan else {
+        panic!("expected top Project, got {plan:?}");
+    };
+    assert!(matches!(&exprs[0].0, ScalarExpr::Column { index: 2, .. }));
+
+    let LogicalPlan::Filter { input, predicate } = input.as_ref() else {
+        panic!("expected Filter under Project");
+    };
+    let ScalarExpr::Binary { left, right, .. } = predicate else {
+        panic!("expected binary WHERE predicate, got {predicate:?}");
+    };
+    assert!(matches!(left.as_ref(), ScalarExpr::Column { index: 0, .. }));
+    assert!(matches!(
+        right.as_ref(),
+        ScalarExpr::Column { index: 2, .. }
+    ));
+    assert!(matches!(input.as_ref(), LogicalPlan::Join { .. }));
 }
 
 #[test]
@@ -850,6 +926,43 @@ fn binds_decimal_arithmetic_around_aggregate_with_decimal_type() {
             scale: Some(8)
         }
     );
+}
+
+#[test]
+fn binds_distinct_sum_arguments_to_distinct_aggregate_columns() {
+    let schema = Schema::new([
+        Field::required("volume", DataType::Float64),
+        Field::required("nation", DataType::Text { max_len: None }),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("lineitem", TableMeta::new(schema));
+
+    let plan = parse_and_bind(
+        "SELECT \
+             SUM(CASE WHEN nation = 'BRAZIL' THEN volume ELSE volume - volume END) / SUM(volume) \
+             AS mkt_share \
+         FROM lineitem",
+        &cat,
+    )
+    .expect("bind ok");
+
+    let LogicalPlan::Project { input, exprs, .. } = &plan else {
+        panic!("expected top-level Project, got {plan:?}");
+    };
+    let ScalarExpr::Binary { left, right, .. } = &exprs[0].0 else {
+        panic!("expected ratio expression, got {:?}", exprs[0].0);
+    };
+    assert!(matches!(left.as_ref(), ScalarExpr::Column { index: 0, .. }));
+    assert!(matches!(
+        right.as_ref(),
+        ScalarExpr::Column { index: 1, .. }
+    ));
+
+    let LogicalPlan::Aggregate { aggregates, .. } = input.as_ref() else {
+        panic!("expected Aggregate under Project");
+    };
+    assert_eq!(aggregates.len(), 2, "SUM calls have different arguments");
 }
 
 // -----------------------------------------------------------------------

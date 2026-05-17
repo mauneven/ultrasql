@@ -90,24 +90,24 @@ min_supplycost AS (
         p_partkey
 )
 SELECT
-    s_acctbal,
-    s_name,
-    n_name,
-    p_partkey,
-    p_mfgr,
-    s_address,
-    s_phone,
-    s_comment
+    cp.s_acctbal,
+    cp.s_name,
+    cp.n_name,
+    cp.p_partkey,
+    cp.p_mfgr,
+    cp.s_address,
+    cp.s_phone,
+    cp.s_comment
 FROM
     candidate_partsupp cp
     INNER JOIN min_supplycost ms
         ON cp.p_partkey = ms.p_partkey
         AND cp.ps_supplycost = ms.min_supplycost
 ORDER BY
-    s_acctbal DESC,
-    n_name,
-    s_name,
-    p_partkey
+    cp.s_acctbal DESC,
+    cp.n_name,
+    cp.s_name,
+    cp.p_partkey
 LIMIT 100;
 ";
 

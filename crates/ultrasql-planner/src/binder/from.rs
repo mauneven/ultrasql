@@ -7,6 +7,7 @@ use ultrasql_parser::ast::{JoinCondition, JoinOp, TableRef};
 use super::{
     Catalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, PlanError, ScalarExpr, ScopeEntry,
     ScopeStack, apply_column_aliases, bind_expr_with_ctes, bind_select_with_ctes,
+    schema_for_qualified_binding,
 };
 
 pub(super) fn bind_from(
@@ -244,15 +245,16 @@ fn bind_explicit_join(
         JoinCondition::On(pred_ast) => {
             let concat_schema =
                 concat_schemas_for_join(left_plan.schema(), right_plan.schema(), join_type)?;
-            let pred = bind_expr_with_ctes(pred_ast, &concat_schema, catalog, cte_catalog, scope)?;
+            let left_len = left_scope.len();
+            let out_scope = merge_scopes(left_scope, right_scope, left_len);
+            let binding_schema = schema_for_qualified_binding(&concat_schema, &out_scope)?;
+            let pred = bind_expr_with_ctes(pred_ast, &binding_schema, catalog, cte_catalog, scope)?;
             if pred.data_type() != DataType::Bool && pred.data_type() != DataType::Null {
                 return Err(PlanError::TypeMismatch(format!(
                     "JOIN ON predicate must be boolean, got {}",
                     pred.data_type()
                 )));
             }
-            let left_len = left_scope.len();
-            let out_scope = merge_scopes(left_scope, right_scope, left_len);
             Ok((
                 LogicalPlan::Join {
                     left: Box::new(left_plan),
