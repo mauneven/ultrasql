@@ -8,6 +8,7 @@ use ultrasql_parser::ast::{
 
 use super::{
     Catalog, LogicalOnConflict, LogicalPlan, PlanError, ScalarExpr, ScopeStack, SortKey, bind_expr,
+    bind_expr_with_ctes,
 };
 
 /// Build the `RETURNING` schema from the resolved `(expr, name)` pairs.
@@ -72,11 +73,12 @@ pub(super) fn bind_order_by(
     items: &[OrderItem],
     input: &Schema,
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<Vec<SortKey>, PlanError> {
     let mut keys = Vec::with_capacity(items.len());
     for item in items {
-        let expr = bind_expr(&item.expr, input, catalog, scope)?;
+        let expr = bind_expr_with_ctes(&item.expr, input, catalog, cte_catalog, scope)?;
         let asc = matches!(item.direction, SortDirection::Asc);
         let nulls_first = match item.nulls {
             NullsOrder::First => true,

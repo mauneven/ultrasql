@@ -12,7 +12,6 @@
     clippy::cast_lossless,
     reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
 )]
-
 #![allow(unused_imports)]
 
 use std::sync::Arc;

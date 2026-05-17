@@ -299,9 +299,7 @@ fn expr_size(expr: &ScalarExpr) -> usize {
             1 + expr_size(inner)
         }
         ScalarExpr::Binary { left, right, .. } => 1 + expr_size(left) + expr_size(right),
-        ScalarExpr::FunctionCall { args, .. } => {
-            1 + args.iter().map(expr_size).sum::<usize>()
-        }
+        ScalarExpr::FunctionCall { args, .. } => 1 + args.iter().map(expr_size).sum::<usize>(),
         // Subquery variants treated as opaque leaves; full descent is a v0.7 follow-up.
         ScalarExpr::OuterColumn { .. }
         | ScalarExpr::ScalarSubquery { .. }

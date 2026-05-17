@@ -4,12 +4,9 @@ use std::sync::Arc;
 
 use ultrasql_core::{DataType, Schema};
 use ultrasql_executor::{
-    HashJoin, MemTableScan,
-    MergeJoin, NestedLoopJoin, Operator, RightFactory,
+    HashJoin, MemTableScan, MergeJoin, NestedLoopJoin, Operator, Project, RightFactory,
 };
-use ultrasql_planner::{
-    BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr,
-};
+use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
 
 use crate::error::ServerError;
@@ -115,16 +112,29 @@ pub(super) fn lower_join(
                 join_type,
                 LogicalJoinType::Inner | LogicalJoinType::LeftOuter
             ) {
-                if let Some((left_key, right_key)) =
-                    extract_hash_friendly_equi_keys(pred, left_schema.len())
+                if let Some(key_pairs) =
+                    extract_hash_friendly_equi_key_pairs(pred, left_schema.len())
                 {
+                    let (left_keys, right_keys): (Vec<_>, Vec<_>) = key_pairs.into_iter().unzip();
+                    if join_type == LogicalJoinType::Inner
+                        && should_build_inner_hash_join_on_right(&*left, &*right)
+                    {
+                        return build_swapped_inner_hash_join(
+                            left,
+                            right,
+                            left_keys,
+                            right_keys,
+                            left_schema,
+                            right_schema,
+                        );
+                    }
                     // HashJoin: left = build, right = probe. See the
                     // function docs for the rationale.
-                    return Ok(Box::new(HashJoin::new(
+                    return Ok(Box::new(HashJoin::new_multi(
                         left,
                         right,
-                        left_key,
-                        right_key,
+                        left_keys,
+                        right_keys,
                         join_type,
                         out_schema,
                         left_schema,
@@ -166,6 +176,54 @@ pub(super) fn lower_join(
             right_schema,
         ),
     }
+}
+
+fn should_build_inner_hash_join_on_right(left: &dyn Operator, right: &dyn Operator) -> bool {
+    match (left.estimated_row_count(), right.estimated_row_count()) {
+        (Some(left_rows), Some(right_rows)) => right_rows < left_rows,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+fn build_swapped_inner_hash_join(
+    left: Box<dyn Operator>,
+    right: Box<dyn Operator>,
+    left_keys: Vec<ScalarExpr>,
+    right_keys: Vec<ScalarExpr>,
+    left_schema: Schema,
+    right_schema: Schema,
+) -> Result<Box<dyn Operator>, ServerError> {
+    let left_width = left_schema.len();
+    let right_width = right_schema.len();
+    let swapped_schema = concat_schemas(&right_schema, &left_schema);
+    let join = Box::new(HashJoin::new_multi(
+        right,
+        left,
+        right_keys,
+        left_keys,
+        LogicalJoinType::Inner,
+        swapped_schema,
+        right_schema,
+        left_schema,
+    ));
+
+    let mut indices = Vec::with_capacity(left_width + right_width);
+    indices.extend(right_width..(right_width + left_width));
+    indices.extend(0..right_width);
+
+    Ok(Box::new(Project::new(join, indices)?))
+}
+
+fn concat_schemas(left: &Schema, right: &Schema) -> Schema {
+    let mut fields = Vec::with_capacity(left.len() + right.len());
+    for idx in 0..left.len() {
+        fields.push(left.field_at(idx).clone());
+    }
+    for idx in 0..right.len() {
+        fields.push(right.field_at(idx).clone());
+    }
+    Schema::new(fields).expect("join schema concatenation must stay valid")
 }
 
 /// Drain `right` into a memory-resident batch list, then wrap the
@@ -339,6 +397,49 @@ pub(super) fn extract_hash_friendly_equi_keys(
         _ => return None,
     };
     Some((l_col, r_col))
+}
+
+/// Recognise a conjunction made entirely of hash-friendly equi-key
+/// predicates.
+///
+/// Returns one `(left_key, right_key)` pair for each equality. A single
+/// equality returns a one-element vector; `a=b AND c=d` returns two.
+/// If any conjunct is not a supported equality, returns `None` so the
+/// caller can preserve the full predicate through the nested-loop path
+/// rather than silently dropping a residual filter.
+pub(super) fn extract_hash_friendly_equi_key_pairs(
+    pred: &ScalarExpr,
+    left_width: usize,
+) -> Option<Vec<(ScalarExpr, ScalarExpr)>> {
+    let mut pairs = Vec::new();
+    if collect_hash_friendly_equi_key_pairs(pred, left_width, &mut pairs) {
+        Some(pairs)
+    } else {
+        None
+    }
+}
+
+fn collect_hash_friendly_equi_key_pairs(
+    pred: &ScalarExpr,
+    left_width: usize,
+    pairs: &mut Vec<(ScalarExpr, ScalarExpr)>,
+) -> bool {
+    if let ScalarExpr::Binary {
+        op: BinaryOp::And,
+        left,
+        right,
+        ..
+    } = pred
+    {
+        return collect_hash_friendly_equi_key_pairs(left, left_width, pairs)
+            && collect_hash_friendly_equi_key_pairs(right, left_width, pairs);
+    }
+
+    let Some(pair) = extract_hash_friendly_equi_keys(pred, left_width) else {
+        return false;
+    };
+    pairs.push(pair);
+    true
 }
 
 /// Build a composite equality predicate from `USING (left_idx, right_idx)`

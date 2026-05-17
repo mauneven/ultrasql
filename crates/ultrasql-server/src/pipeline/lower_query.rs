@@ -3,12 +3,8 @@
 
 use std::sync::Arc;
 
-use ultrasql_executor::{
-    Filter, HashAggregate, Limit, Operator, ResultOp, Sort, ValuesScan,
-};
-use ultrasql_planner::{
-    LogicalPlan, ScalarExpr,
-};
+use ultrasql_executor::{Filter, HashAggregate, Limit, Operator, ResultOp, Sort, ValuesScan};
+use ultrasql_planner::{LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
 
 use crate::error::ServerError;
@@ -32,7 +28,9 @@ pub fn lower_query(
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
     match plan {
-        LogicalPlan::Scan { table, schema, .. } => lower_catalog_or_sample_scan(table, schema, ctx),
+        LogicalPlan::Scan {
+            table, projection, ..
+        } => lower_catalog_or_sample_scan(table, projection.as_deref(), ctx),
         LogicalPlan::Insert {
             table,
             columns,

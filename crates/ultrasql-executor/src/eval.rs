@@ -22,6 +22,8 @@
 use ultrasql_core::Value;
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp};
 
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -132,7 +134,11 @@ impl Eval {
 // Core recursive evaluator
 // ---------------------------------------------------------------------------
 
-pub(crate) fn eval_expr(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> Result<Value, EvalError> {
+pub(crate) fn eval_expr(
+    expr: &ScalarExpr,
+    row: &[Value],
+    params: &[Value],
+) -> Result<Value, EvalError> {
     match expr {
         ScalarExpr::Column { index, .. } => {
             row.get(*index).cloned().ok_or(EvalError::ColumnIndex {
@@ -203,10 +209,8 @@ pub(crate) fn eval_expr(expr: &ScalarExpr, row: &[Value], params: &[Value]) -> R
         )),
 
         ScalarExpr::FunctionCall { name, args, .. } => {
-            let evaluated: Result<Vec<Value>, EvalError> = args
-                .iter()
-                .map(|a| eval_expr(a, row, params))
-                .collect();
+            let evaluated: Result<Vec<Value>, EvalError> =
+                args.iter().map(|a| eval_expr(a, row, params)).collect();
             let vals = evaluated?;
             eval_function_call(name, &vals)
         }
@@ -354,14 +358,22 @@ fn eval_extract(args: &[Value]) -> Result<Value, EvalError> {
 fn civil_from_days(days_since_2000_01_01: i32) -> (i32, i32, i32) {
     let z = days_since_2000_01_01 + 10_957; // rebase to 1970-01-01
     let z = z + 719_468; // shift to year 0
-    let era = if z >= 0 { z / 146_097 } else { (z - 146_096) / 146_097 };
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
     let doe = (z - era * 146_097) as u32; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
     let y = (yoe as i32) + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
     let d = (doy - (153 * mp + 2) / 5 + 1) as i32; // [1, 31]
-    let m = if mp < 10 { mp as i32 + 3 } else { mp as i32 - 9 }; // [1, 12]
+    let m = if mp < 10 {
+        mp as i32 + 3
+    } else {
+        mp as i32 - 9
+    }; // [1, 12]
     let final_y = if m <= 2 { y + 1 } else { y };
     (final_y, m, d)
 }
@@ -398,7 +410,9 @@ fn eval_substring(args: &[Value]) -> Result<Value, EvalError> {
     let start = if start_byte_signed < 0 {
         0
     } else {
-        usize::try_from(start_byte_signed).unwrap_or(bytes.len()).min(bytes.len())
+        usize::try_from(start_byte_signed)
+            .unwrap_or(bytes.len())
+            .min(bytes.len())
     };
     let end = if args.len() == 3 {
         let len = match args[2].as_i64() {
@@ -413,8 +427,7 @@ fn eval_substring(args: &[Value]) -> Result<Value, EvalError> {
         let len = len.max(0);
         let mut effective = usize::try_from(len).unwrap_or(0);
         if start_byte_signed < 0 {
-            let abs_back = usize::try_from(start_byte_signed.unsigned_abs())
-                .unwrap_or(usize::MAX);
+            let abs_back = usize::try_from(start_byte_signed.unsigned_abs()).unwrap_or(usize::MAX);
             effective = effective.saturating_sub(abs_back);
         }
         (start + effective).min(bytes.len())
@@ -692,16 +705,87 @@ enum ArithOp {
 /// [`EvalError::Type`]. Floating-point overflow produces `f64::INFINITY`
 /// (IEEE 754 semantics, consistent with PostgreSQL).
 fn numeric_arith(lv: Value, rv: Value, op: ArithOp) -> Result<Value, EvalError> {
+    if matches!(
+        (&lv, &rv),
+        (Value::Decimal { .. }, _) | (_, Value::Decimal { .. })
+    ) {
+        let Some((left_value, left_scale)) = numeric_to_decimal(&lv)? else {
+            return Err(EvalError::Type(format!(
+                "arithmetic type mismatch: {lv:?} and {rv:?}"
+            )));
+        };
+        let Some((right_value, right_scale)) = numeric_to_decimal(&rv)? else {
+            return Err(EvalError::Type(format!(
+                "arithmetic type mismatch: {lv:?} and {rv:?}"
+            )));
+        };
+        return decimal_arith(left_value, left_scale, right_value, right_scale, op);
+    }
+
     match (lv, rv) {
         (Value::Int16(l), Value::Int16(r)) => int16_arith(l, r, op),
         (Value::Int32(l), Value::Int32(r)) => int32_arith(l, r, op),
         (Value::Int64(l), Value::Int64(r)) => int64_arith(l, r, op),
+        (Value::Int16(l), Value::Int32(r)) => int32_arith(i32::from(l), r, op),
+        (Value::Int32(l), Value::Int16(r)) => int32_arith(l, i32::from(r), op),
+        (Value::Int16(l), Value::Int64(r)) => int64_arith(i64::from(l), r, op),
+        (Value::Int64(l), Value::Int16(r)) => int64_arith(l, i64::from(r), op),
+        (Value::Int32(l), Value::Int64(r)) => int64_arith(i64::from(l), r, op),
+        (Value::Int64(l), Value::Int32(r)) => int64_arith(l, i64::from(r), op),
         (Value::Float32(l), Value::Float32(r)) => float32_arith(l, r, op),
         (Value::Float64(l), Value::Float64(r)) => float64_arith(l, r, op),
+        (Value::Float64(l), Value::Float32(r)) => float64_arith(l, f64::from(r), op),
+        (Value::Float32(l), Value::Float64(r)) => float64_arith(f64::from(l), r, op),
+        (Value::Float64(l), Value::Int16(r)) => float64_arith(l, f64::from(r), op),
+        (Value::Int16(l), Value::Float64(r)) => float64_arith(f64::from(l), r, op),
+        (Value::Float64(l), Value::Int32(r)) => float64_arith(l, f64::from(r), op),
+        (Value::Int32(l), Value::Float64(r)) => float64_arith(f64::from(l), r, op),
         (l, r) => Err(EvalError::Type(format!(
             "arithmetic type mismatch: {l:?} and {r:?}"
         ))),
     }
+}
+
+fn numeric_to_decimal(value: &Value) -> Result<Option<(i64, i32)>, EvalError> {
+    match value {
+        Value::Decimal { value, scale } => Ok(Some((*value, *scale))),
+        Value::Int16(v) => Ok(Some((i64::from(*v), 0))),
+        Value::Int32(v) => Ok(Some((i64::from(*v), 0))),
+        Value::Int64(v) => Ok(Some((*v, 0))),
+        Value::Float32(v) => decimal_from_f64(f64::from(*v)).map(Some),
+        Value::Float64(v) => decimal_from_f64(*v).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn decimal_from_f64(value: f64) -> Result<(i64, i32), EvalError> {
+    if !value.is_finite() {
+        return Err(EvalError::Type(
+            "cannot coerce non-finite float to decimal".to_owned(),
+        ));
+    }
+    let text = value.to_string();
+    decimal_from_text(&text)
+        .ok_or_else(|| EvalError::Type(format!("cannot coerce float literal `{text}` to decimal")))
+}
+
+fn decimal_from_text(text: &str) -> Option<(i64, i32)> {
+    if text.contains('e') || text.contains('E') {
+        return None;
+    }
+    let (negative, unsigned) = text
+        .strip_prefix('-')
+        .map_or((false, text), |stripped| (true, stripped));
+    let (whole, frac) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let scale = i32::try_from(frac.len()).ok()?;
+    let mut digits = String::with_capacity(whole.len() + frac.len());
+    digits.push_str(if whole.is_empty() { "0" } else { whole });
+    digits.push_str(frac);
+    let mut value = digits.parse::<i64>().ok()?;
+    if negative {
+        value = value.checked_neg()?;
+    }
+    Some((value, scale))
 }
 
 fn int16_arith(l: i16, r: i16, op: ArithOp) -> Result<Value, EvalError> {
@@ -805,6 +889,72 @@ fn int64_arith(l: i64, r: i64, op: ArithOp) -> Result<Value, EvalError> {
     result.map(Value::Int64).ok_or(EvalError::Overflow)
 }
 
+fn decimal_arith(
+    left_value: i64,
+    left_scale: i32,
+    right_value: i64,
+    right_scale: i32,
+    op: ArithOp,
+) -> Result<Value, EvalError> {
+    match op {
+        ArithOp::Add | ArithOp::Sub | ArithOp::Mod => {
+            let common_scale = left_scale.max(right_scale);
+            let left = rescale_decimal_value(left_value, left_scale, common_scale)?;
+            let right = rescale_decimal_value(right_value, right_scale, common_scale)?;
+            let result = match op {
+                ArithOp::Add => left.checked_add(right).ok_or(EvalError::Overflow)?,
+                ArithOp::Sub => left.checked_sub(right).ok_or(EvalError::Overflow)?,
+                ArithOp::Mod => {
+                    if right == 0 {
+                        return Err(EvalError::DivByZero);
+                    }
+                    left % right
+                }
+                _ => unreachable!(),
+            };
+            let value = i64::try_from(result).map_err(|_| EvalError::Overflow)?;
+            Ok(Value::Decimal {
+                value,
+                scale: common_scale,
+            })
+        }
+        ArithOp::Mul => {
+            let scale = left_scale
+                .checked_add(right_scale)
+                .ok_or(EvalError::Overflow)?;
+            let result = i128::from(left_value)
+                .checked_mul(i128::from(right_value))
+                .ok_or(EvalError::Overflow)?;
+            let value = i64::try_from(result).map_err(|_| EvalError::Overflow)?;
+            Ok(Value::Decimal { value, scale })
+        }
+        ArithOp::Div => {
+            if right_value == 0 {
+                return Err(EvalError::DivByZero);
+            }
+            let result_scale = left_scale.max(right_scale).max(6);
+            let exponent = right_scale
+                .checked_add(result_scale)
+                .and_then(|v| v.checked_sub(left_scale))
+                .ok_or(EvalError::Overflow)?;
+            let factor = pow10_i128(u32::try_from(exponent).map_err(|_| EvalError::Overflow)?)
+                .ok_or(EvalError::Overflow)?;
+            let numerator = i128::from(left_value)
+                .checked_mul(factor)
+                .ok_or(EvalError::Overflow)?;
+            let quotient = numerator / i128::from(right_value);
+            let value = i64::try_from(quotient).map_err(|_| EvalError::Overflow)?;
+            Ok(Value::Decimal {
+                value,
+                scale: result_scale,
+            })
+        }
+        ArithOp::Pow => Err(EvalError::Type(
+            "decimal exponentiation not supported".to_owned(),
+        )),
+    }
+}
+
 fn float32_arith(l: f32, r: f32, op: ArithOp) -> Result<Value, EvalError> {
     let result = match op {
         ArithOp::Add => l + r,
@@ -900,6 +1050,23 @@ fn value_compare(
 /// Only types that have a natural total order are supported. Mismatched
 /// types return [`EvalError::Type`].
 fn compare_values(lv: &Value, rv: &Value) -> Result<std::cmp::Ordering, EvalError> {
+    if matches!(
+        (lv, rv),
+        (Value::Decimal { .. }, _) | (_, Value::Decimal { .. })
+    ) {
+        let Some((left_value, left_scale)) = numeric_to_decimal(lv)? else {
+            return Err(EvalError::Type(format!(
+                "comparison type mismatch: {lv:?} and {rv:?}"
+            )));
+        };
+        let Some((right_value, right_scale)) = numeric_to_decimal(rv)? else {
+            return Err(EvalError::Type(format!(
+                "comparison type mismatch: {lv:?} and {rv:?}"
+            )));
+        };
+        return compare_decimal_values(left_value, left_scale, right_value, right_scale);
+    }
+
     match (lv, rv) {
         (Value::Int16(l), Value::Int16(r)) => Ok(l.cmp(r)),
         (Value::Int32(l), Value::Int32(r)) => Ok(l.cmp(r)),
@@ -912,10 +1079,106 @@ fn compare_values(lv: &Value, rv: &Value) -> Result<std::cmp::Ordering, EvalErro
             .ok_or_else(|| EvalError::Type("comparison of NaN is undefined".to_owned())),
         (Value::Text(l), Value::Text(r)) => Ok(l.cmp(r)),
         (Value::Bool(l), Value::Bool(r)) => Ok(l.cmp(r)),
+        (
+            Value::Decimal {
+                value: lv,
+                scale: ls,
+            },
+            Value::Decimal {
+                value: rv,
+                scale: rs,
+            },
+        ) => compare_decimal_values(*lv, *ls, *rv, *rs),
+        (Value::Date(l), Value::Date(r)) => Ok(l.cmp(r)),
+        (Value::Time(l), Value::Time(r)) => Ok(l.cmp(r)),
+        (Value::Timestamp(l), Value::Timestamp(r))
+        | (Value::TimestampTz(l), Value::TimestampTz(r))
+        | (Value::Timestamp(l), Value::TimestampTz(r))
+        | (Value::TimestampTz(l), Value::Timestamp(r)) => Ok(l.cmp(r)),
+        (Value::Date(l), Value::Timestamp(r)) | (Value::Date(l), Value::TimestampTz(r)) => {
+            Ok(date_as_timestamp(*l)?.cmp(r))
+        }
+        (Value::Timestamp(l), Value::Date(r)) | (Value::TimestampTz(l), Value::Date(r)) => {
+            Ok(l.cmp(&date_as_timestamp(*r)?))
+        }
+        (
+            Value::Interval {
+                months: lm,
+                days: ld,
+                microseconds: lus,
+            },
+            Value::Interval {
+                months: rm,
+                days: rd,
+                microseconds: rus,
+            },
+        ) => Ok((lm, ld, lus).cmp(&(rm, rd, rus))),
         (l, r) => Err(EvalError::Type(format!(
             "comparison type mismatch: {l:?} and {r:?}"
         ))),
     }
+}
+
+fn date_as_timestamp(days_since_2000_01_01: i32) -> Result<i64, EvalError> {
+    i64::from(days_since_2000_01_01)
+        .checked_mul(MICROS_PER_DAY)
+        .ok_or_else(|| EvalError::Type("date timestamp overflow".to_owned()))
+}
+
+fn rescale_decimal_value(
+    value: i64,
+    current_scale: i32,
+    target_scale: i32,
+) -> Result<i128, EvalError> {
+    let scale_delta = target_scale - current_scale;
+    if scale_delta < 0 {
+        return Err(EvalError::Type("decimal rescale underflow".to_owned()));
+    }
+    let factor = pow10_i128(u32::try_from(scale_delta).map_err(|_| EvalError::Overflow)?)
+        .ok_or(EvalError::Overflow)?;
+    i128::from(value)
+        .checked_mul(factor)
+        .ok_or(EvalError::Overflow)
+}
+
+fn compare_decimal_values(
+    left_value: i64,
+    left_scale: i32,
+    right_value: i64,
+    right_scale: i32,
+) -> Result<std::cmp::Ordering, EvalError> {
+    if left_scale == right_scale {
+        return Ok(left_value.cmp(&right_value));
+    }
+    let common_scale = left_scale.max(right_scale);
+    let left = rescale_decimal_for_compare(left_value, left_scale, common_scale)?;
+    let right = rescale_decimal_for_compare(right_value, right_scale, common_scale)?;
+    Ok(left.cmp(&right))
+}
+
+fn rescale_decimal_for_compare(
+    value: i64,
+    current_scale: i32,
+    target_scale: i32,
+) -> Result<i128, EvalError> {
+    let scale_delta = target_scale - current_scale;
+    if scale_delta < 0 {
+        return Err(EvalError::Type(
+            "decimal comparison scale underflow".to_owned(),
+        ));
+    }
+    let factor = pow10_i128(
+        u32::try_from(scale_delta)
+            .map_err(|_| EvalError::Type("decimal comparison scale overflow".to_owned()))?,
+    )
+    .ok_or_else(|| EvalError::Type("decimal comparison scale overflow".to_owned()))?;
+    i128::from(value)
+        .checked_mul(factor)
+        .ok_or_else(|| EvalError::Type("decimal comparison overflow".to_owned()))
+}
+
+fn pow10_i128(exp: u32) -> Option<i128> {
+    (0..exp).try_fold(1_i128, |acc, _| acc.checked_mul(10))
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,6 +1286,16 @@ mod tests {
         ScalarExpr::Literal {
             value: Value::Float64(v),
             data_type: DataType::Float64,
+        }
+    }
+
+    fn lit_decimal(value: i64, scale: i32) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Decimal { value, scale },
+            data_type: DataType::Decimal {
+                precision: None,
+                scale: Some(scale),
+            },
         }
     }
 
@@ -1182,6 +1455,36 @@ mod tests {
     fn float64_div_by_zero_returns_error() {
         let ev = Eval::new(binop(BinaryOp::Div, lit_f64(5.0), lit_f64(0.0)));
         assert!(matches!(ev.eval(&[]).unwrap_err(), EvalError::DivByZero));
+    }
+
+    #[test]
+    fn decimal_multiplies_integer_literal() {
+        let ev = Eval::new(binop(BinaryOp::Mul, lit_i32(100), lit_decimal(1234, 2)));
+        assert_eq!(
+            ev.eval(&[]).unwrap(),
+            Value::Decimal {
+                value: 123400,
+                scale: 2
+            }
+        );
+    }
+
+    #[test]
+    fn decimal_divides_float_literal() {
+        let ev = Eval::new(binop(BinaryOp::Div, lit_decimal(12345, 2), lit_f64(7.0)));
+        assert_eq!(
+            ev.eval(&[]).unwrap(),
+            Value::Decimal {
+                value: 17635714,
+                scale: 6
+            }
+        );
+    }
+
+    #[test]
+    fn decimal_compares_float_literal() {
+        let ev = Eval::new(binop(BinaryOp::Lt, lit_decimal(123, 2), lit_f64(2.0)));
+        assert_eq!(ev.eval(&[]).unwrap(), Value::Bool(true));
     }
 
     // -----------------------------------------------------------------------

@@ -75,6 +75,10 @@ enum Cmd {
         /// Target engine: `ultrasql` or `postgres`.
         engine: EngineArg,
 
+        /// Directory containing the `.tbl` files for UltraSQL runs.
+        #[arg(long, default_value = "tpch-data")]
+        data_dir: PathBuf,
+
         /// Number of measured runs per query (after warmup).
         #[arg(long, default_value_t = 5)]
         runs: usize,
@@ -97,6 +101,10 @@ enum Cmd {
         /// Path to the existing baseline JSON.
         baseline: PathBuf,
 
+        /// Directory containing the `.tbl` files for UltraSQL runs.
+        #[arg(long, default_value = "tpch-data")]
+        data_dir: PathBuf,
+
         /// PostgreSQL connection string (required when running against postgres).
         #[arg(long, default_value = "host=localhost user=postgres dbname=tpch")]
         pg_dsn: String,
@@ -114,7 +122,7 @@ enum Cmd {
 /// Engine selection for CLI arguments.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum EngineArg {
-    /// UltraSQL (executor wiring pending — most operations return `NotYetWired`).
+    /// UltraSQL.
     Ultrasql,
     /// PostgreSQL.
     Postgres,
@@ -158,17 +166,19 @@ fn run() -> Result<()> {
         } => cmd_load(engine, &data_dir, &pg_dsn),
         Cmd::RunQueries {
             engine,
+            data_dir,
             runs,
             warmup,
             out,
             pg_dsn,
-        } => cmd_run_queries(engine, runs, warmup, out.as_deref(), &pg_dsn),
+        } => cmd_run_queries(engine, &data_dir, runs, warmup, out.as_deref(), &pg_dsn),
         Cmd::Compare {
             baseline,
+            data_dir,
             runs,
             warmup,
             pg_dsn,
-        } => cmd_compare(&baseline, runs, warmup, &pg_dsn),
+        } => cmd_compare(&baseline, &data_dir, runs, warmup, &pg_dsn),
     }
 }
 
@@ -212,7 +222,12 @@ fn cmd_load(engine: EngineArg, data_dir: &std::path::Path, pg_dsn: &str) -> Resu
     match engine {
         EngineArg::Postgres => cmd_load_postgres(data_dir, pg_dsn),
         EngineArg::Ultrasql => {
-            load::load_ultrasql(data_dir)?;
+            for stats in load::load_ultrasql(data_dir)? {
+                println!(
+                    "  loaded {:>12} rows into {:>12} ({:.0} rows/s)",
+                    stats.row_count, stats.table, stats.rows_per_sec
+                );
+            }
             Ok(())
         }
     }
@@ -251,6 +266,7 @@ fn cmd_load_postgres(_data_dir: &std::path::Path, _pg_dsn: &str) -> Result<()> {
 
 fn cmd_run_queries(
     engine: EngineArg,
+    data_dir: &std::path::Path,
     runs: usize,
     warmup: usize,
     out: Option<&std::path::Path>,
@@ -258,7 +274,7 @@ fn cmd_run_queries(
 ) -> Result<()> {
     let run_result = match engine {
         EngineArg::Postgres => run_queries_postgres(warmup, runs, pg_dsn)?,
-        EngineArg::Ultrasql => runner::run_ultrasql(warmup, runs)?,
+        EngineArg::Ultrasql => runner::run_ultrasql(data_dir, warmup, runs)?,
     };
 
     // Print per-query summary.
@@ -283,6 +299,7 @@ fn cmd_run_queries(
 
 fn cmd_compare(
     baseline_path: &std::path::Path,
+    data_dir: &std::path::Path,
     runs: usize,
     warmup: usize,
     pg_dsn: &str,
@@ -291,7 +308,7 @@ fn cmd_compare(
     let engine = parse_engine_from_baseline(&recorded.engine)?;
     let current_run = match engine {
         EngineArg::Postgres => run_queries_postgres(warmup, runs, pg_dsn)?,
-        EngineArg::Ultrasql => runner::run_ultrasql(warmup, runs)?,
+        EngineArg::Ultrasql => runner::run_ultrasql(data_dir, warmup, runs)?,
     };
     let current = build_baseline(engine, &current_run);
     baseline::compare(&recorded, &current)

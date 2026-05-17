@@ -24,6 +24,8 @@ pub(super) fn binary_result_type(
                 Ok(rt)
             } else if matches!(rt, DataType::Null) {
                 Ok(lt)
+            } else if let Some(decimal_type) = decimal_arithmetic_type(op, &lt, &rt) {
+                Ok(decimal_type)
             } else {
                 lt.numeric_join(&rt).map_err(|_| {
                     PlanError::TypeMismatch(format!(
@@ -119,6 +121,53 @@ pub(super) fn binary_result_type(
         | BinaryOp::JsonHasKey
         | BinaryOp::JsonHasAnyKey
         | BinaryOp::JsonHasAllKeys => Ok(DataType::Bool),
+    }
+}
+
+fn decimal_arithmetic_type(op: BinaryOp, lt: &DataType, rt: &DataType) -> Option<DataType> {
+    if !matches!(lt, DataType::Decimal { .. }) && !matches!(rt, DataType::Decimal { .. }) {
+        return None;
+    }
+    if !lt.is_numeric() || !rt.is_numeric() {
+        return None;
+    }
+    let scale = match op {
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mod => {
+            max_optional_scale(decimal_operand_scale(lt), decimal_operand_scale(rt))
+        }
+        BinaryOp::Mul => add_optional_scale(decimal_operand_scale(lt), decimal_operand_scale(rt)),
+        BinaryOp::Div => max_optional_scale(
+            max_optional_scale(decimal_operand_scale(lt), decimal_operand_scale(rt)),
+            Some(6),
+        ),
+        BinaryOp::Pow => None,
+        _ => None,
+    };
+    Some(DataType::Decimal {
+        precision: None,
+        scale,
+    })
+}
+
+fn decimal_operand_scale(data_type: &DataType) -> Option<i32> {
+    match data_type {
+        DataType::Decimal { scale, .. } => *scale,
+        ty if ty.is_integer() => Some(0),
+        _ => None,
+    }
+}
+
+fn max_optional_scale(left: Option<i32>, right: Option<i32>) -> Option<i32> {
+    match (left, right) {
+        (Some(l), Some(r)) => Some(l.max(r)),
+        _ => None,
+    }
+}
+
+fn add_optional_scale(left: Option<i32>, right: Option<i32>) -> Option<i32> {
+    match (left, right) {
+        (Some(l), Some(r)) => l.checked_add(r),
+        _ => None,
     }
 }
 

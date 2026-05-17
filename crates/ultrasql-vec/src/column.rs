@@ -248,8 +248,9 @@ impl StringColumn {
         for s in rows {
             values.extend_from_slice(s.as_bytes());
             offsets.push(
-                u32::try_from(values.len())
-                    .expect("Utf8Column offsets bounded to u32; data above 4 GiB rejected upstream"),
+                u32::try_from(values.len()).expect(
+                    "Utf8Column offsets bounded to u32; data above 4 GiB rejected upstream",
+                ),
             );
         }
         Self {
@@ -273,8 +274,9 @@ impl StringColumn {
         for s in rows {
             values.extend_from_slice(s.as_bytes());
             offsets.push(
-                u32::try_from(values.len())
-                    .expect("Utf8Column offsets bounded to u32; data above 4 GiB rejected upstream"),
+                u32::try_from(values.len()).expect(
+                    "Utf8Column offsets bounded to u32; data above 4 GiB rejected upstream",
+                ),
             );
             row_count += 1;
         }

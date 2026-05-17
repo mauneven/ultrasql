@@ -7,13 +7,9 @@ use ultrasql_core::{CommandId, DataType, RelationId, Value, Xid};
 use ultrasql_executor::fused_delete::FusedDeleteInt32Pair;
 use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
 use ultrasql_executor::{
-    Filter,
-    ModifyKind, ModifyTable, Operator, Project, RowCodec,
-    SeqScan, ValuesScan,
+    Filter, ModifyKind, ModifyTable, Operator, Project, RowCodec, SeqScan, ValuesScan,
 };
-use ultrasql_planner::{
-    BinaryOp, LogicalPlan, ScalarExpr,
-};
+use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
 
 use crate::error::ServerError;
 
@@ -532,15 +528,18 @@ pub(super) fn lower_project_columns(
         for (e, name) in exprs {
             fields.push(ultrasql_core::Field::nullable(name.clone(), e.data_type()));
         }
-        let output_schema = ultrasql_core::Schema::new(fields)
-            .map_err(|e| ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
+        let output_schema = ultrasql_core::Schema::new(fields).map_err(|e| {
+            ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
                 "projection schema: {e}"
-            ))))?;
+            )))
+        })?;
         return ultrasql_executor::ProjectExprs::new(child, exprs, output_schema)
             .map(|op| Box::new(op) as Box<dyn Operator>)
-            .map_err(|e| ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
-                "projection: {e}"
-            ))));
+            .map_err(|e| {
+                ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
+                    "projection: {e}"
+                )))
+            });
     }
     let mut indices: Vec<usize> = Vec::with_capacity(exprs.len());
     for (expr, _name) in exprs {
@@ -567,12 +566,13 @@ pub(super) fn lower_project_columns(
     // projection to carry the alias.
     let child_schema = child.schema();
     let child_width = child_schema.len();
-    let is_identity_indices = indices.len() == child_width
-        && indices.iter().enumerate().all(|(i, &idx)| i == idx);
+    let is_identity_indices =
+        indices.len() == child_width && indices.iter().enumerate().all(|(i, &idx)| i == idx);
     let names_match = is_identity_indices
-        && exprs.iter().enumerate().all(|(i, (_, name))| {
-            child_schema.field_at(i).name == *name
-        });
+        && exprs
+            .iter()
+            .enumerate()
+            .all(|(i, (_, name))| child_schema.field_at(i).name == *name);
     if names_match {
         return Ok(child);
     }

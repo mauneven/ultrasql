@@ -404,8 +404,8 @@ impl<'src> Parser<'src> {
             // the source expression. We desugar to the canonical
             // `extract(unit_text, expr)` call shape so the binder can
             // dispatch through its usual function-resolution path.
-            let is_extract = name.parts.len() == 1
-                && name.parts[0].value.eq_ignore_ascii_case("extract");
+            let is_extract =
+                name.parts.len() == 1 && name.parts[0].value.eq_ignore_ascii_case("extract");
             if is_extract && self.peek()?.kind != TokenKind::RParen {
                 let unit_tok = self.advance()?;
                 // Allow an identifier or any keyword token as the unit;
@@ -442,8 +442,8 @@ impl<'src> Parser<'src> {
             // The comma form `substring(s, n, k)` is parsed by the
             // normal argument loop below; we only intercept the
             // keyword form.
-            let is_substring = name.parts.len() == 1
-                && name.parts[0].value.eq_ignore_ascii_case("substring");
+            let is_substring =
+                name.parts.len() == 1 && name.parts[0].value.eq_ignore_ascii_case("substring");
             if is_substring && self.peek()?.kind != TokenKind::RParen {
                 // Peek 2 ahead to decide whether keyword form is in
                 // use. The keyword form puts `FROM` after the first

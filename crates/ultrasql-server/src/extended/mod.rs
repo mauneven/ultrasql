@@ -54,7 +54,6 @@ use std::collections::HashMap;
 use ultrasql_planner::LogicalPlan;
 use ultrasql_protocol::BackendMessage;
 
-
 // ---------------------------------------------------------------------------
 // Type-OID constants. Duplicated narrowly with `result_encoder.rs` so this
 // module is self-contained for the binary-format param decoder.

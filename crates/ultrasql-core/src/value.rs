@@ -275,11 +275,7 @@ impl fmt::Display for Value {
                     let divisor = u64::checked_pow(10, scale_u).unwrap_or(1);
                     let whole = mag / divisor;
                     let frac = mag % divisor;
-                    write!(
-                        f,
-                        "{sign}{whole}.{frac:0width$}",
-                        width = scale_u as usize
-                    )
+                    write!(f, "{sign}{whole}.{frac:0width$}", width = scale_u as usize)
                 }
             }
             Self::Interval {

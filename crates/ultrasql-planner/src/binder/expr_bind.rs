@@ -20,10 +20,22 @@ use super::{
     derive_agg_output_name, is_aggregate_name, plan_contains_outer_column,
 };
 
+const MICROS_PER_DAY: i64 = 86_400_000_000;
+
 pub(super) fn bind_expr(
     expr: &Expr,
     input: &Schema,
     catalog: &dyn Catalog,
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    bind_expr_with_ctes(expr, input, catalog, &[], scope)
+}
+
+pub(super) fn bind_expr_with_ctes(
+    expr: &Expr,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
     match expr {
@@ -33,15 +45,21 @@ pub(super) fn bind_expr(
             index: *index,
             data_type: DataType::Null,
         }),
-        Expr::Paren { expr, .. } => bind_expr(expr, input, catalog, scope),
+        Expr::Paren { expr, .. } => bind_expr_with_ctes(expr, input, catalog, cte_catalog, scope),
         Expr::Unary {
             op, expr: inner, ..
-        } => bind_unary(*op, inner, input, catalog, scope),
+        } => bind_unary(*op, inner, input, catalog, cte_catalog, scope),
         Expr::Binary {
             op, left, right, ..
-        } => bind_binary(*op, left, right, input, catalog, scope),
+        } => bind_binary(*op, left, right, input, catalog, cte_catalog, scope),
         Expr::IsNull { expr, negated, .. } => Ok(ScalarExpr::IsNull {
-            expr: Box::new(bind_expr(expr, input, catalog, scope)?),
+            expr: Box::new(bind_expr_with_ctes(
+                expr,
+                input,
+                catalog,
+                cte_catalog,
+                scope,
+            )?),
             negated: *negated,
         }),
         Expr::Call { name, args, .. } => {
@@ -83,7 +101,7 @@ pub(super) fn bind_expr(
             // error so the binder stays strict.
             let bound_args: Result<Vec<ScalarExpr>, PlanError> = args
                 .iter()
-                .map(|a| bind_expr(a, input, catalog, scope))
+                .map(|a| bind_expr_with_ctes(a, input, catalog, cte_catalog, scope))
                 .collect();
             let bound_args = bound_args?;
             let return_type = builtin_return_type(&func_name)?;
@@ -115,7 +133,7 @@ pub(super) fn bind_expr(
                 schema: input.clone(),
                 qualifier: None,
             });
-            let inner_result = bind_select_with_ctes(inner_select, catalog, &[], scope);
+            let inner_result = bind_select_with_ctes(inner_select, catalog, cte_catalog, scope);
             scope.pop();
             let inner_plan = inner_result?;
             if inner_plan.schema().len() != 1 {
@@ -143,7 +161,7 @@ pub(super) fn bind_expr(
                 schema: input.clone(),
                 qualifier: None,
             });
-            let inner_result = bind_select_with_ctes(inner_select, catalog, &[], scope);
+            let inner_result = bind_select_with_ctes(inner_select, catalog, cte_catalog, scope);
             scope.pop();
             let inner_plan = inner_result?;
             let correlated = plan_contains_outer_column(&inner_plan);
@@ -161,12 +179,12 @@ pub(super) fn bind_expr(
             negated,
             ..
         } => {
-            let lhs = bind_expr(lhs_ast, input, catalog, scope)?;
+            let lhs = bind_expr_with_ctes(lhs_ast, input, catalog, cte_catalog, scope)?;
             scope.push(ScopeFrame {
                 schema: input.clone(),
                 qualifier: None,
             });
-            let inner_result = bind_select_with_ctes(inner_select, catalog, &[], scope);
+            let inner_result = bind_select_with_ctes(inner_select, catalog, cte_catalog, scope);
             scope.pop();
             let inner_plan = inner_result?;
             if inner_plan.schema().len() != 1 {
@@ -208,12 +226,12 @@ pub(super) fn bind_expr(
                     "ANY with non-equality operator (only `= ANY` is supported)",
                 ));
             }
-            let lhs = bind_expr(lhs_ast, input, catalog, scope)?;
+            let lhs = bind_expr_with_ctes(lhs_ast, input, catalog, cte_catalog, scope)?;
             scope.push(ScopeFrame {
                 schema: input.clone(),
                 qualifier: None,
             });
-            let inner_result = bind_select_with_ctes(inner_select, catalog, &[], scope);
+            let inner_result = bind_select_with_ctes(inner_select, catalog, cte_catalog, scope);
             scope.pop();
             let inner_plan = inner_result?;
             if inner_plan.schema().len() != 1 {
@@ -250,7 +268,15 @@ pub(super) fn bind_expr(
             symmetric,
             ..
         } => bind_between(
-            subject, low, high, *negated, *symmetric, input, catalog, scope,
+            subject,
+            low,
+            high,
+            *negated,
+            *symmetric,
+            input,
+            catalog,
+            cte_catalog,
+            scope,
         ),
 
         // `CASE [operand] WHEN c THEN v … ELSE e END` lowers to a
@@ -271,22 +297,34 @@ pub(super) fn bind_expr(
         } => {
             let mut bound_args: Vec<ScalarExpr> = Vec::with_capacity(branches.len() * 2 + 2);
             let case_kind = if let Some(op_expr) = operand {
-                bound_args.push(bind_expr(op_expr, input, catalog, scope)?);
+                bound_args.push(bind_expr_with_ctes(
+                    op_expr,
+                    input,
+                    catalog,
+                    cte_catalog,
+                    scope,
+                )?);
                 "case_simple"
             } else {
                 "case_searched"
             };
             let mut result_type = DataType::Null;
             for (when_e, then_e) in branches {
-                bound_args.push(bind_expr(when_e, input, catalog, scope)?);
-                let then_bound = bind_expr(then_e, input, catalog, scope)?;
+                bound_args.push(bind_expr_with_ctes(
+                    when_e,
+                    input,
+                    catalog,
+                    cte_catalog,
+                    scope,
+                )?);
+                let then_bound = bind_expr_with_ctes(then_e, input, catalog, cte_catalog, scope)?;
                 if matches!(result_type, DataType::Null) {
                     result_type = then_bound.data_type();
                 }
                 bound_args.push(then_bound);
             }
             if let Some(else_e) = else_expr {
-                let bound = bind_expr(else_e, input, catalog, scope)?;
+                let bound = bind_expr_with_ctes(else_e, input, catalog, cte_catalog, scope)?;
                 if matches!(result_type, DataType::Null) {
                     result_type = bound.data_type();
                 }
@@ -312,10 +350,10 @@ pub(super) fn bind_expr(
             negated,
             ..
         } => {
-            let bound_subject = bind_expr(subject, input, catalog, scope)?;
+            let bound_subject = bind_expr_with_ctes(subject, input, catalog, cte_catalog, scope)?;
             let mut acc: Option<ScalarExpr> = None;
             for item in items {
-                let bound_item = bind_expr(item, input, catalog, scope)?;
+                let bound_item = bind_expr_with_ctes(item, input, catalog, cte_catalog, scope)?;
                 let cmp = ScalarExpr::Binary {
                     op: if *negated {
                         ultrasql_parser::ast::BinaryOp::NotEq
@@ -351,7 +389,7 @@ pub(super) fn bind_expr(
         Expr::Coalesce { args, .. } => {
             let bound_args: Result<Vec<_>, PlanError> = args
                 .iter()
-                .map(|a| bind_expr(a, input, catalog, scope))
+                .map(|a| bind_expr_with_ctes(a, input, catalog, cte_catalog, scope))
                 .collect();
             let bound_args = bound_args?;
             let return_type = bound_args
@@ -401,11 +439,12 @@ pub(super) fn bind_between(
     symmetric: bool,
     input: &Schema,
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
-    let bound_expr = bind_expr(subject, input, catalog, scope)?;
-    let bound_low = bind_expr(low, input, catalog, scope)?;
-    let bound_high = bind_expr(high, input, catalog, scope)?;
+    let bound_expr = bind_expr_with_ctes(subject, input, catalog, cte_catalog, scope)?;
+    let bound_low = bind_expr_with_ctes(low, input, catalog, cte_catalog, scope)?;
+    let bound_high = bind_expr_with_ctes(high, input, catalog, cte_catalog, scope)?;
 
     // The forward range test: `expr >= low AND expr <= high`.
     let forward = make_range_test(
@@ -471,9 +510,10 @@ pub(super) fn make_range_test(
 /// callers would see from the explicit `>=` / `<=` / `<` / `>` form.
 pub(super) fn make_binary(
     op: BinaryOp,
-    left: ScalarExpr,
-    right: ScalarExpr,
+    mut left: ScalarExpr,
+    mut right: ScalarExpr,
 ) -> Result<ScalarExpr, PlanError> {
+    coerce_literal_to_match(&mut left, &mut right);
     let data_type = binary_result_type(op, left.data_type(), right.data_type())?;
     Ok(ScalarExpr::Binary {
         op,
@@ -511,9 +551,9 @@ pub(super) fn bind_literal(lit: &Literal) -> ScalarExpr {
         Literal::Typed {
             type_name,
             value,
-            unit: _,
+            unit,
             ..
-        } => bind_typed_literal(type_name, value),
+        } => bind_typed_literal(type_name, value, unit.as_deref()),
         // `Literal::Null` and any future non-exhaustive variant both
         // bind to a NULL placeholder; later passes specialize.
         _ => ScalarExpr::Literal {
@@ -528,13 +568,13 @@ pub(super) fn bind_literal(lit: &Literal) -> ScalarExpr {
 ///
 /// Supported today:
 /// - `DATE 'YYYY-MM-DD'` → `Value::Date(days_since_2000_01_01)`.
+/// - `INTERVAL 'n' YEAR|MONTH|DAY|HOUR|MINUTE|SECOND` →
+///   `Value::Interval { months, days, microseconds }`.
 ///
-/// Unsupported variants (TIME, TIMESTAMP, TIMESTAMPTZ, INTERVAL) bind
-/// to NULL today so the binder does not reject queries upstream of the
-/// executor. Adding full support is a tracked v0.6 follow-up; the
-/// upstream executor will surface a clearer message when those values
-/// flow into a comparison.
-fn bind_typed_literal(type_name: &str, value: &str) -> ScalarExpr {
+/// Unsupported variants (TIME, TIMESTAMP, TIMESTAMPTZ, complex
+/// interval syntaxes) bind to NULL today so the binder does not reject
+/// queries upstream of the executor.
+fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> ScalarExpr {
     match type_name {
         "date" => match parse_date_literal(value) {
             Some(days) => ScalarExpr::Literal {
@@ -546,10 +586,56 @@ fn bind_typed_literal(type_name: &str, value: &str) -> ScalarExpr {
                 data_type: DataType::Date,
             },
         },
+        "interval" => match parse_interval_literal(value, unit) {
+            Some((months, days, microseconds)) => ScalarExpr::Literal {
+                value: Value::Interval {
+                    months,
+                    days,
+                    microseconds,
+                },
+                data_type: DataType::Interval,
+            },
+            None => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::Interval,
+            },
+        },
         _ => ScalarExpr::Literal {
             value: Value::Null,
             data_type: DataType::Null,
         },
+    }
+}
+
+fn parse_interval_literal(text: &str, unit: Option<&str>) -> Option<(i32, i32, i64)> {
+    let magnitude = text.trim();
+    let unit = unit?.to_ascii_lowercase();
+    match unit.as_str() {
+        "year" | "years" => {
+            let years: i32 = magnitude.parse().ok()?;
+            Some((years.checked_mul(12)?, 0, 0))
+        }
+        "month" | "months" => {
+            let months: i32 = magnitude.parse().ok()?;
+            Some((months, 0, 0))
+        }
+        "day" | "days" => {
+            let days: i32 = magnitude.parse().ok()?;
+            Some((0, days, 0))
+        }
+        "hour" | "hours" => {
+            let hours: i64 = magnitude.parse().ok()?;
+            Some((0, 0, hours.checked_mul(3_600_000_000)?))
+        }
+        "minute" | "minutes" => {
+            let minutes: i64 = magnitude.parse().ok()?;
+            Some((0, 0, minutes.checked_mul(60_000_000)?))
+        }
+        "second" | "seconds" => {
+            let seconds: i64 = magnitude.parse().ok()?;
+            Some((0, 0, seconds.checked_mul(1_000_000)?))
+        }
+        _ => None,
     }
 }
 
@@ -575,6 +661,185 @@ fn parse_date_literal(text: &str) -> Option<i32> {
         return None;
     }
     Some(days_since_epoch(year, month, day))
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    reason = "civil-from-days arithmetic; doe / yoe fit in i32 by construction"
+)]
+fn civil_from_days(days_since_2000_01_01: i32) -> (i32, u32, u32) {
+    let z = days_since_2000_01_01 + 10_957;
+    let z = z + 719_468;
+    let era = if z >= 0 {
+        z / 146_097
+    } else {
+        (z - 146_096) / 146_097
+    };
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i32) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month_i32 = if mp < 10 {
+        mp as i32 + 3
+    } else {
+        mp as i32 - 9
+    };
+    let year = if month_i32 <= 2 { y + 1 } else { y };
+    let month =
+        u32::try_from(month_i32).expect("civil_from_days month stays in 1..=12 by construction");
+    (year, month, day)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 31,
+    }
+}
+
+fn add_months_to_date(date_days: i32, month_delta: i32) -> Result<i32, PlanError> {
+    let (year, month, day) = civil_from_days(date_days);
+    let total_months = year
+        .checked_mul(12)
+        .and_then(|v| v.checked_add(i32::try_from(month).ok()? - 1))
+        .and_then(|v| v.checked_add(month_delta))
+        .ok_or_else(|| PlanError::TypeMismatch("date interval month overflow".to_owned()))?;
+    let new_year = total_months.div_euclid(12);
+    let new_month = u32::try_from(total_months.rem_euclid(12) + 1)
+        .map_err(|_| PlanError::TypeMismatch("date interval month overflow".to_owned()))?;
+    let new_day = day.min(days_in_month(new_year, new_month));
+    Ok(days_since_epoch(new_year, new_month, new_day))
+}
+
+fn fold_date_interval(
+    date_days: i32,
+    month_delta: i32,
+    day_delta: i32,
+    microsecond_delta: i64,
+) -> Result<ScalarExpr, PlanError> {
+    let shifted_days = add_months_to_date(date_days, month_delta)?;
+    let shifted_days = shifted_days
+        .checked_add(day_delta)
+        .ok_or_else(|| PlanError::TypeMismatch("date interval day overflow".to_owned()))?;
+    if microsecond_delta == 0 {
+        return Ok(ScalarExpr::Literal {
+            value: Value::Date(shifted_days),
+            data_type: DataType::Date,
+        });
+    }
+    let timestamp = i64::from(shifted_days)
+        .checked_mul(MICROS_PER_DAY)
+        .and_then(|base| base.checked_add(microsecond_delta))
+        .ok_or_else(|| PlanError::TypeMismatch("date interval timestamp overflow".to_owned()))?;
+    Ok(ScalarExpr::Literal {
+        value: Value::Timestamp(timestamp),
+        data_type: DataType::Timestamp,
+    })
+}
+
+fn try_fold_literal_binary(
+    op: BinaryOp,
+    left: &ScalarExpr,
+    right: &ScalarExpr,
+) -> Result<Option<ScalarExpr>, PlanError> {
+    let (lv, rv) = match (left, right) {
+        (ScalarExpr::Literal { value: lv, .. }, ScalarExpr::Literal { value: rv, .. }) => (lv, rv),
+        _ => return Ok(None),
+    };
+    match (op, lv, rv) {
+        (
+            BinaryOp::Add,
+            Value::Date(date_days),
+            Value::Interval {
+                months,
+                days,
+                microseconds,
+            },
+        )
+        | (
+            BinaryOp::Add,
+            Value::Interval {
+                months,
+                days,
+                microseconds,
+            },
+            Value::Date(date_days),
+        ) => fold_date_interval(*date_days, *months, *days, *microseconds).map(Some),
+        (
+            BinaryOp::Sub,
+            Value::Date(date_days),
+            Value::Interval {
+                months,
+                days,
+                microseconds,
+            },
+        ) => {
+            let neg_months = months.checked_neg().ok_or_else(|| {
+                PlanError::TypeMismatch("date interval month overflow".to_owned())
+            })?;
+            let neg_days = days
+                .checked_neg()
+                .ok_or_else(|| PlanError::TypeMismatch("date interval day overflow".to_owned()))?;
+            let neg_micros = microseconds.checked_neg().ok_or_else(|| {
+                PlanError::TypeMismatch("date interval microsecond overflow".to_owned())
+            })?;
+            fold_date_interval(*date_days, neg_months, neg_days, neg_micros).map(Some)
+        }
+        _ if is_float_like_literal(lv) || is_float_like_literal(rv) => {
+            let Some(left_value) = literal_numeric_as_f64(lv) else {
+                return Ok(None);
+            };
+            let Some(right_value) = literal_numeric_as_f64(rv) else {
+                return Ok(None);
+            };
+            let folded = match op {
+                BinaryOp::Add => Some(left_value + right_value),
+                BinaryOp::Sub => Some(left_value - right_value),
+                BinaryOp::Mul => Some(left_value * right_value),
+                BinaryOp::Div if right_value != 0.0 => Some(left_value / right_value),
+                _ => None,
+            };
+            Ok(folded.map(|value| ScalarExpr::Literal {
+                value: Value::Float64(value),
+                data_type: DataType::Float64,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_float_like_literal(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Float32(_) | Value::Float64(_) | Value::Decimal { .. }
+    )
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn literal_numeric_as_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Int16(v) => Some(f64::from(*v)),
+        Value::Int32(v) => Some(f64::from(*v)),
+        Value::Int64(v) => Some(*v as f64),
+        Value::Float32(v) => Some(f64::from(*v)),
+        Value::Float64(v) => Some(*v),
+        Value::Decimal {
+            value: decimal_value,
+            scale,
+        } => Some((*decimal_value as f64) / 10_f64.powi(*scale)),
+        _ => None,
+    }
 }
 
 /// Statically infer the return type of a builtin scalar function.
@@ -640,6 +905,192 @@ fn parse_integer_literal(text: &str) -> (Value, DataType) {
     )
 }
 
+fn pow10_i64(exp: u32) -> Option<i64> {
+    (0..exp).try_fold(1_i64, |acc, _| acc.checked_mul(10))
+}
+
+fn infer_decimal_scale(value: &Value) -> Option<i32> {
+    match value {
+        Value::Int16(_) | Value::Int32(_) | Value::Int64(_) => Some(0),
+        Value::Float32(v) => infer_decimal_scale_from_text(&v.to_string()),
+        Value::Float64(v) => infer_decimal_scale_from_text(&v.to_string()),
+        Value::Decimal { scale, .. } => Some(*scale),
+        _ => None,
+    }
+}
+
+fn infer_decimal_scale_from_text(text: &str) -> Option<i32> {
+    let trimmed = text.trim();
+    let dot = trimmed.find('.')?;
+    i32::try_from(trimmed[dot + 1..].trim_end_matches('0').len()).ok()
+}
+
+fn decimal_from_numeric_value(value: &Value, target_scale: Option<i32>) -> Option<(i64, i32)> {
+    let scale = target_scale.or_else(|| infer_decimal_scale(value))?;
+    if scale < 0 {
+        return None;
+    }
+    let factor = pow10_i64(u32::try_from(scale).ok()?)?;
+    match value {
+        Value::Int16(v) => i64::from(*v)
+            .checked_mul(factor)
+            .map(|scaled| (scaled, scale)),
+        Value::Int32(v) => i64::from(*v)
+            .checked_mul(factor)
+            .map(|scaled| (scaled, scale)),
+        Value::Int64(v) => v.checked_mul(factor).map(|scaled| (scaled, scale)),
+        Value::Float32(v) => decimal_from_f64(f64::from(*v), scale).map(|scaled| (scaled, scale)),
+        Value::Float64(v) => decimal_from_f64(*v, scale).map(|scaled| (scaled, scale)),
+        Value::Decimal {
+            value: decimal_value,
+            scale: decimal_scale,
+        } if *decimal_scale == scale => Some((*decimal_value, scale)),
+        _ => None,
+    }
+}
+
+fn decimal_from_f64(value: f64, scale: i32) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let scale_usize = usize::try_from(scale).ok()?;
+    let rendered = format!("{value:.scale_usize$}");
+    scaled_decimal_text_to_i64(&rendered)
+}
+
+fn scaled_decimal_text_to_i64(text: &str) -> Option<i64> {
+    let (negative, unsigned) = text
+        .strip_prefix('-')
+        .map_or((false, text), |stripped| (true, stripped));
+    let (whole, frac) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let mut digits = String::with_capacity(whole.len() + frac.len());
+    digits.push_str(if whole.is_empty() { "0" } else { whole });
+    digits.push_str(frac);
+    let mut value = digits.parse::<i64>().ok()?;
+    if negative {
+        value = value.checked_neg()?;
+    }
+    Some(value)
+}
+
+fn fold_signed_literal(expr: &mut ScalarExpr) {
+    let ScalarExpr::Unary {
+        op,
+        expr: inner,
+        data_type: _,
+    } = expr
+    else {
+        return;
+    };
+    if !matches!(op, UnaryOp::Neg | UnaryOp::Pos) {
+        return;
+    }
+
+    let ScalarExpr::Literal { value, data_type } = inner.as_ref() else {
+        return;
+    };
+
+    let folded = match (op, value) {
+        (UnaryOp::Pos, value) => Some((value.clone(), data_type.clone())),
+        (UnaryOp::Neg, Value::Int16(v)) => v
+            .checked_neg()
+            .map(|neg| (Value::Int16(neg), data_type.clone())),
+        (UnaryOp::Neg, Value::Int32(v)) => v
+            .checked_neg()
+            .map(|neg| (Value::Int32(neg), data_type.clone())),
+        (UnaryOp::Neg, Value::Int64(v)) => v
+            .checked_neg()
+            .map(|neg| (Value::Int64(neg), data_type.clone())),
+        (UnaryOp::Neg, Value::Float32(v)) => Some((Value::Float32(-v), data_type.clone())),
+        (UnaryOp::Neg, Value::Float64(v)) => Some((Value::Float64(-v), data_type.clone())),
+        (UnaryOp::Neg, Value::Decimal { value, scale }) => value.checked_neg().map(|neg| {
+            (
+                Value::Decimal {
+                    value: neg,
+                    scale: *scale,
+                },
+                data_type.clone(),
+            )
+        }),
+        _ => None,
+    };
+
+    if let Some((value, data_type)) = folded {
+        *expr = ScalarExpr::Literal { value, data_type };
+    }
+}
+
+pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
+    fold_signed_literal(expr);
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        return;
+    };
+    if matches!(target, DataType::Null) || data_type == target {
+        return;
+    }
+    match (target, &*value) {
+        (DataType::Int32, Value::Int64(v)) => {
+            if let Ok(narrow) = i32::try_from(*v) {
+                *value = Value::Int32(narrow);
+                *data_type = DataType::Int32;
+            }
+        }
+        (DataType::Int64, Value::Int16(v)) => {
+            *value = Value::Int64(i64::from(*v));
+            *data_type = DataType::Int64;
+        }
+        (DataType::Int64, Value::Int32(v)) => {
+            *value = Value::Int64(i64::from(*v));
+            *data_type = DataType::Int64;
+        }
+        (DataType::Float64, Value::Float32(v)) => {
+            *value = Value::Float64(f64::from(*v));
+            *data_type = DataType::Float64;
+        }
+        (DataType::Float64, Value::Int16(v)) => {
+            *value = Value::Float64(f64::from(*v));
+            *data_type = DataType::Float64;
+        }
+        (DataType::Float64, Value::Int32(v)) => {
+            *value = Value::Float64(f64::from(*v));
+            *data_type = DataType::Float64;
+        }
+        (DataType::Float64, Value::Int64(v)) => {
+            #[allow(clippy::cast_precision_loss)]
+            let widened = *v as f64;
+            *value = Value::Float64(widened);
+            *data_type = DataType::Float64;
+        }
+        (DataType::Float32, Value::Float64(v)) => {
+            #[allow(clippy::cast_possible_truncation)]
+            let narrow = *v as f32;
+            *value = Value::Float32(narrow);
+            *data_type = DataType::Float32;
+        }
+        (DataType::Decimal { scale, .. }, _) => {
+            if let Some((decimal_value, decimal_scale)) = decimal_from_numeric_value(value, *scale)
+            {
+                *value = Value::Decimal {
+                    value: decimal_value,
+                    scale: decimal_scale,
+                };
+                *data_type = DataType::Decimal {
+                    precision: None,
+                    scale: Some(decimal_scale),
+                };
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn coerce_literal_to_match(left: &mut ScalarExpr, right: &mut ScalarExpr) {
+    let right_target = right.data_type();
+    let left_target = left.data_type();
+    coerce_literal_to_type(left, &right_target);
+    coerce_literal_to_type(right, &left_target);
+}
+
 pub(super) fn bind_column(
     name: &ultrasql_parser::ast::ObjectName,
     input: &Schema,
@@ -685,9 +1136,10 @@ pub(super) fn bind_unary(
     inner: &Expr,
     input: &Schema,
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
-    let bound = bind_expr(inner, input, catalog, scope)?;
+    let bound = bind_expr_with_ctes(inner, input, catalog, cte_catalog, scope)?;
     let inner_ty = bound.data_type();
     let data_type = match op {
         UnaryOp::Neg | UnaryOp::Pos => {
@@ -735,10 +1187,15 @@ pub(super) fn bind_binary(
     right: &Expr,
     input: &Schema,
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
-    let l = bind_expr(left, input, catalog, scope)?;
-    let r = bind_expr(right, input, catalog, scope)?;
+    let mut l = bind_expr_with_ctes(left, input, catalog, cte_catalog, scope)?;
+    let mut r = bind_expr_with_ctes(right, input, catalog, cte_catalog, scope)?;
+    coerce_literal_to_match(&mut l, &mut r);
+    if let Some(folded) = try_fold_literal_binary(op, &l, &r)? {
+        return Ok(folded);
+    }
     let data_type = binary_result_type(op, l.data_type(), r.data_type())?;
     Ok(ScalarExpr::Binary {
         op,
@@ -750,7 +1207,12 @@ pub(super) fn bind_binary(
 
 #[cfg(test)]
 mod typed_literal_tests {
-    use super::{days_since_epoch, parse_date_literal};
+    use ultrasql_core::{DataType, Value};
+
+    use super::{
+        BinaryOp, ScalarExpr, days_since_epoch, fold_date_interval, parse_date_literal,
+        parse_interval_literal, try_fold_literal_binary,
+    };
 
     #[test]
     fn epoch_day_is_zero() {
@@ -791,5 +1253,47 @@ mod typed_literal_tests {
         let feb29 = days_since_epoch(2000, 2, 29);
         let mar01 = days_since_epoch(2000, 3, 1);
         assert_eq!(mar01 - feb29, 1, "2000-02-29 → 2000-03-01 is one day");
+    }
+
+    #[test]
+    fn parses_interval_year_unit_into_months() {
+        assert_eq!(parse_interval_literal("1", Some("year")), Some((12, 0, 0)));
+        assert_eq!(parse_interval_literal("3", Some("month")), Some((3, 0, 0)));
+        assert_eq!(parse_interval_literal("90", Some("day")), Some((0, 90, 0)));
+    }
+
+    #[test]
+    fn fold_date_interval_keeps_calendar_month_semantics() {
+        let folded = fold_date_interval(days_since_epoch(2000, 1, 31), 1, 0, 0).unwrap();
+        let super::ScalarExpr::Literal { value, data_type } = folded else {
+            panic!("expected folded literal");
+        };
+        assert_eq!(data_type, DataType::Date);
+        assert_eq!(value, Value::Date(days_since_epoch(2000, 2, 29)));
+    }
+
+    #[test]
+    fn folds_float_literal_subtraction() {
+        let left = ScalarExpr::Literal {
+            value: Value::Float64(0.06),
+            data_type: DataType::Float64,
+        };
+        let right = ScalarExpr::Literal {
+            value: Value::Float64(0.01),
+            data_type: DataType::Float64,
+        };
+
+        let folded = try_fold_literal_binary(BinaryOp::Sub, &left, &right)
+            .expect("fold succeeds")
+            .expect("float literals should fold");
+        let ScalarExpr::Literal {
+            value: Value::Float64(value),
+            data_type,
+        } = folded
+        else {
+            panic!("expected float literal");
+        };
+        assert_eq!(data_type, DataType::Float64);
+        assert!((value - 0.05).abs() < 1.0e-12, "expected 0.05, got {value}");
     }
 }

@@ -136,7 +136,12 @@ impl InMemoryStatsCatalog {
     ///
     /// This method triggers the AnalyzeRunner to compute statistics for the
     /// specified table and registers the resulting RelationStats in the catalog.
-    pub fn analyze_and_register(&mut self, table: &str, schema: &Schema, rows: impl Iterator<Item = Vec<Value>>) {
+    pub fn analyze_and_register(
+        &mut self,
+        table: &str,
+        schema: &Schema,
+        rows: impl Iterator<Item = Vec<Value>>,
+    ) {
         let runner = AnalyzeRunner::new(AnalyzeOptions::default());
         if let Ok(stats) = runner.run(table, schema, rows) {
             self.register(stats);

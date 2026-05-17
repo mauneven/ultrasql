@@ -4,9 +4,11 @@
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::ast::{Expr, SelectItem};
 
+use super::expr_bind::coerce_literal_to_match;
+use super::expr_type::binary_result_type;
 use super::{
     AggregateFunc, Catalog, LogicalAggregateExpr, LogicalPlan, PlanError, ScalarExpr, ScopeEntry,
-    ScopeStack, bind_expr, derive_output_name,
+    ScopeStack, bind_expr_with_ctes, derive_output_name,
 };
 
 pub(super) fn projection_item_has_aggregate(item: &SelectItem) -> bool {
@@ -106,13 +108,20 @@ pub(super) fn bind_aggregate(
     select: &ultrasql_parser::ast::SelectStmt,
     _from_scope: &[ScopeEntry],
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<LogicalPlan, PlanError> {
     let input_schema = input.schema().clone();
 
     let mut group_by: Vec<ScalarExpr> = Vec::with_capacity(select.group_by.len());
     for e in &select.group_by {
-        group_by.push(bind_expr(e, &input_schema, catalog, scope)?);
+        group_by.push(bind_expr_with_ctes(
+            e,
+            &input_schema,
+            catalog,
+            cte_catalog,
+            scope,
+        )?);
     }
 
     let mut aggregates: Vec<LogicalAggregateExpr> = Vec::new();
@@ -124,12 +133,21 @@ pub(super) fn bind_aggregate(
                 &input_schema,
                 &mut aggregates,
                 catalog,
+                cte_catalog,
                 scope,
             )?;
         }
     }
     if let Some(having) = &select.having {
-        collect_aggregates(having, None, &input_schema, &mut aggregates, catalog, scope)?;
+        collect_aggregates(
+            having,
+            None,
+            &input_schema,
+            &mut aggregates,
+            catalog,
+            cte_catalog,
+            scope,
+        )?;
     }
 
     let mut out_fields: Vec<Field> = Vec::new();
@@ -175,6 +193,7 @@ fn collect_aggregates(
     input_schema: &Schema,
     out: &mut Vec<LogicalAggregateExpr>,
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<(), PlanError> {
     match expr {
@@ -197,7 +216,8 @@ fn collect_aggregates(
                 let (arg_expr, arg_ty) = if args_empty_or_star {
                     (None, DataType::Null)
                 } else {
-                    let bound = bind_expr(&args[0], input_schema, catalog, scope)?;
+                    let bound =
+                        bind_expr_with_ctes(&args[0], input_schema, catalog, cte_catalog, scope)?;
                     let ty = bound.data_type();
                     (Some(bound), ty)
                 };
@@ -227,11 +247,11 @@ fn collect_aggregates(
             }
         }
         Expr::Paren { expr: inner, .. } | Expr::Unary { expr: inner, .. } => {
-            collect_aggregates(inner, alias, input_schema, out, catalog, scope)
+            collect_aggregates(inner, alias, input_schema, out, catalog, cte_catalog, scope)
         }
         Expr::Binary { left, right, .. } => {
-            collect_aggregates(left, None, input_schema, out, catalog, scope)?;
-            collect_aggregates(right, None, input_schema, out, catalog, scope)
+            collect_aggregates(left, None, input_schema, out, catalog, cte_catalog, scope)?;
+            collect_aggregates(right, None, input_schema, out, catalog, cte_catalog, scope)
         }
         _ => Ok(()),
     }
@@ -245,6 +265,7 @@ pub(super) fn bind_projection_agg(
     items: &[SelectItem],
     agg_schema: &Schema,
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<Vec<(ScalarExpr, String)>, PlanError> {
     let mut out = Vec::with_capacity(items.len());
@@ -264,7 +285,14 @@ pub(super) fn bind_projection_agg(
             }
             SelectItem::Expr { expr, alias, .. } => {
                 let alias_name = alias.as_ref().map(|a| a.value.as_str());
-                let bound = bind_expr_or_agg_ref(expr, alias_name, agg_schema, catalog, scope)?;
+                let bound = bind_expr_or_agg_ref(
+                    expr,
+                    alias_name,
+                    agg_schema,
+                    catalog,
+                    cte_catalog,
+                    scope,
+                )?;
                 let name = alias
                     .as_ref()
                     .map_or_else(|| derive_output_name(expr, &bound), |a| a.value.clone());
@@ -289,6 +317,7 @@ fn bind_expr_or_agg_ref(
     alias_name: Option<&str>,
     agg_schema: &Schema,
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
     match expr {
@@ -321,7 +350,7 @@ fn bind_expr_or_agg_ref(
                     });
                 }
             }
-            bind_expr(expr, agg_schema, catalog, scope)
+            bind_expr_with_ctes(expr, agg_schema, catalog, cte_catalog, scope)
         }
         // Composite expressions: walk into binary / unary / paren so
         // nested aggregate calls (`100.00 * SUM(l_extendedprice * …)
@@ -331,17 +360,10 @@ fn bind_expr_or_agg_ref(
         Expr::Binary {
             op, left, right, ..
         } => {
-            let l = bind_expr_or_agg_ref(left, None, agg_schema, catalog, scope)?;
-            let r = bind_expr_or_agg_ref(right, None, agg_schema, catalog, scope)?;
-            let data_type = if matches!(
-                op,
-                ultrasql_parser::ast::BinaryOp::And | ultrasql_parser::ast::BinaryOp::Or
-            ) || op.is_comparison()
-            {
-                ultrasql_core::DataType::Bool
-            } else {
-                l.data_type()
-            };
+            let mut l = bind_expr_or_agg_ref(left, None, agg_schema, catalog, cte_catalog, scope)?;
+            let mut r = bind_expr_or_agg_ref(right, None, agg_schema, catalog, cte_catalog, scope)?;
+            coerce_literal_to_match(&mut l, &mut r);
+            let data_type = binary_result_type(*op, l.data_type(), r.data_type())?;
             Ok(ScalarExpr::Binary {
                 op: *op,
                 left: Box::new(l),
@@ -349,8 +371,10 @@ fn bind_expr_or_agg_ref(
                 data_type,
             })
         }
-        Expr::Unary { op, expr: inner, .. } => {
-            let bound = bind_expr_or_agg_ref(inner, None, agg_schema, catalog, scope)?;
+        Expr::Unary {
+            op, expr: inner, ..
+        } => {
+            let bound = bind_expr_or_agg_ref(inner, None, agg_schema, catalog, cte_catalog, scope)?;
             let data_type = bound.data_type();
             Ok(ScalarExpr::Unary {
                 op: *op,
@@ -359,9 +383,9 @@ fn bind_expr_or_agg_ref(
             })
         }
         Expr::Paren { expr: inner, .. } => {
-            bind_expr_or_agg_ref(inner, alias_name, agg_schema, catalog, scope)
+            bind_expr_or_agg_ref(inner, alias_name, agg_schema, catalog, cte_catalog, scope)
         }
-        _ => bind_expr(expr, agg_schema, catalog, scope),
+        _ => bind_expr_with_ctes(expr, agg_schema, catalog, cte_catalog, scope),
     }
 }
 
@@ -370,6 +394,7 @@ pub(super) fn bind_projection_with_scope(
     input: &Schema,
     from_scope: &[ScopeEntry],
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     outer_scope: &mut ScopeStack,
 ) -> Result<Vec<(ScalarExpr, String)>, PlanError> {
     let mut out = Vec::new();
@@ -421,7 +446,7 @@ pub(super) fn bind_projection_with_scope(
                 }
             }
             SelectItem::Expr { expr, alias, .. } => {
-                let bound = bind_expr(expr, input, catalog, outer_scope)?;
+                let bound = bind_expr_with_ctes(expr, input, catalog, cte_catalog, outer_scope)?;
                 let name = alias
                     .as_ref()
                     .map_or_else(|| derive_output_name(expr, &bound), |a| a.value.clone());

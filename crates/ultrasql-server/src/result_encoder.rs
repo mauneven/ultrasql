@@ -340,7 +340,8 @@ pub fn run_cached_int32_pair_select_streamed(
 
     const MAX_ROW_BYTES: usize = 37;
     const ROWDESC_AND_TAG_BYTES: usize = 256;
-    let initial_cap = ROWDESC_AND_TAG_BYTES.saturating_add(left.len().saturating_mul(MAX_ROW_BYTES));
+    let initial_cap =
+        ROWDESC_AND_TAG_BYTES.saturating_add(left.len().saturating_mul(MAX_ROW_BYTES));
     let mut body = std::mem::take(sink);
     prepare_stream_sink(&mut body, initial_cap);
     let row_desc = build_row_description(schema);

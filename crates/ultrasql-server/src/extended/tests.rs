@@ -6,9 +6,7 @@ use super::handlers::{
 };
 use super::params::walk_plan_exprs;
 use super::substitute::substitute_parameters_in_plan;
-use super::{
-    ExtendedConnState, PG_OID_BOOL, PG_OID_INT4, PG_OID_INT8, PG_OID_TEXT,
-};
+use super::{ExtendedConnState, PG_OID_BOOL, PG_OID_INT4, PG_OID_INT8, PG_OID_TEXT};
 use crate::error::ServerError;
 use ultrasql_core::Value;
 use ultrasql_planner::{BinaryOp, InMemoryCatalog, ScalarExpr};

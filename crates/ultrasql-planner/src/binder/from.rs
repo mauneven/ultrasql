@@ -6,7 +6,7 @@ use ultrasql_parser::ast::{JoinCondition, JoinOp, TableRef};
 
 use super::{
     Catalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, PlanError, ScalarExpr, ScopeEntry,
-    ScopeStack, apply_column_aliases, bind_expr, bind_select_with_ctes,
+    ScopeStack, apply_column_aliases, bind_expr_with_ctes, bind_select_with_ctes,
 };
 
 pub(super) fn bind_from(
@@ -128,7 +128,7 @@ fn bind_table_ref(
         } => bind_explicit_join(left, *op, right, condition, catalog, cte_catalog, scope),
         TableRef::Function {
             name, args, alias, ..
-        } => bind_table_function(name, args, alias.as_ref(), catalog, scope),
+        } => bind_table_function(name, args, alias.as_ref(), catalog, cte_catalog, scope),
     }
 }
 
@@ -137,6 +137,7 @@ fn bind_table_function(
     args: &[ultrasql_parser::ast::Expr],
     alias: Option<&ultrasql_parser::ast::Identifier>,
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
     let func_name = name.value.to_ascii_lowercase();
@@ -156,7 +157,13 @@ fn bind_table_function(
     let mut bound_args: Vec<ScalarExpr> = Vec::with_capacity(args.len());
     let empty_schema = Schema::empty();
     for a in args {
-        bound_args.push(bind_expr(a, &empty_schema, catalog, scope)?);
+        bound_args.push(bind_expr_with_ctes(
+            a,
+            &empty_schema,
+            catalog,
+            cte_catalog,
+            scope,
+        )?);
     }
     let from_scope = vec![ScopeEntry {
         qualifier,
@@ -237,7 +244,7 @@ fn bind_explicit_join(
         JoinCondition::On(pred_ast) => {
             let concat_schema =
                 concat_schemas_for_join(left_plan.schema(), right_plan.schema(), join_type)?;
-            let pred = bind_expr(pred_ast, &concat_schema, catalog, scope)?;
+            let pred = bind_expr_with_ctes(pred_ast, &concat_schema, catalog, cte_catalog, scope)?;
             if pred.data_type() != DataType::Bool && pred.data_type() != DataType::Null {
                 return Err(PlanError::TypeMismatch(format!(
                     "JOIN ON predicate must be boolean, got {}",

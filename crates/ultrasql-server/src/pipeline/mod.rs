@@ -56,24 +56,21 @@ use ultrasql_catalog::CatalogSnapshot;
 use ultrasql_core::{CommandId, Schema, Xid};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_mvcc::Snapshot;
-use ultrasql_planner::{
-    InMemoryCatalog,
-    TableMeta,
-};
+use ultrasql_planner::{InMemoryCatalog, TableMeta};
 
-#[cfg(test)]
-use ultrasql_core::{Field, RelationId};
-#[cfg(test)]
-use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType};
-#[cfg(test)]
-use ultrasql_vec::column::Column;
 #[cfg(test)]
 use crate::error::ServerError;
 #[cfg(test)]
+use ultrasql_core::{Field, RelationId};
+#[cfg(test)]
 use ultrasql_executor::{Operator, RowCodec};
+#[cfg(test)]
+use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
+#[cfg(test)]
+use ultrasql_vec::column::Column;
 
 use crate::BlankPageLoader;
 

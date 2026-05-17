@@ -2,7 +2,6 @@
 //! a previously bound portal; [`resume_suspended_portal`] resumes a portal
 //! that was suspended by a prior `max_rows` cap.
 
-
 use ultrasql_planner::LogicalPlan;
 use ultrasql_protocol::BackendMessage;
 

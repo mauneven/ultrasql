@@ -2,7 +2,6 @@
 //! and Close. Each handler is invoked by the per-session state machine in
 //! [`crate::session`] after the wire codec decodes a frontend message.
 
-
 use ultrasql_core::{DataType, Value};
 use ultrasql_parser::Parser;
 use ultrasql_planner::bind;

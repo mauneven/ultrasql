@@ -189,8 +189,7 @@ pub fn select_scan_physical(
         let leading_col = hint.columns[0];
         for pred in predicates {
             if predicate_references_column(pred, leading_col) {
-                let sel =
-                    crate::cost::selectivity::selectivity(pred, stats, table, total_rows);
+                let sel = crate::cost::selectivity::selectivity(pred, stats, table, total_rows);
                 matches.push((hint, sel));
                 break; // one predicate per index is enough
             }

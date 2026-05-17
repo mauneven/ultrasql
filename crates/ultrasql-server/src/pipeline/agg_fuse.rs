@@ -1,15 +1,12 @@
 //! Fused-kernel lowerers — `SUM(c) WHERE c <op> lit` and the cached
 //! scalar-aggregate fast path.
 
-
 use ultrasql_core::RelationId;
+use ultrasql_executor::Operator;
 use ultrasql_executor::filter_sum_op::{
     CachedAvgI32Scan, CachedFilterSumI32Scan, CachedSumI32Scan, FilterSumI32Scan,
 };
-use ultrasql_executor::Operator;
-use ultrasql_planner::{
-    BinaryOp, LogicalPlan, ScalarExpr,
-};
+use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
 
 use crate::error::ServerError;
 
@@ -65,10 +62,7 @@ pub(super) fn shift_column_indices(expr: &ScalarExpr, by: usize) -> ScalarExpr {
             data_type,
         } => ScalarExpr::FunctionCall {
             name: name.clone(),
-            args: args
-                .iter()
-                .map(|a| shift_column_indices(a, by))
-                .collect(),
+            args: args.iter().map(|a| shift_column_indices(a, by)).collect(),
             data_type: data_type.clone(),
         },
         // Subquery-bearing and outer-frame variants are returned
@@ -246,7 +240,7 @@ pub(super) fn try_lower_direct_scalar_aggregate(
     // column reference with `Int32` or `Int64` data type.
     let op: Box<dyn Operator> = match agg.func {
         AggregateFunc::CountStar => {
-            let child = super::scan::lower_heap_scan(entry, ctx);
+            let child = super::scan::lower_heap_scan(entry, None, ctx)?;
             Box::new(DirectScalarAggScan::count_star(
                 child,
                 agg.output_name.clone(),
@@ -262,7 +256,7 @@ pub(super) fn try_lower_direct_scalar_aggregate(
             if col_idx >= schema.len() {
                 return Ok(None);
             }
-            let child = super::scan::lower_heap_scan(entry, ctx);
+            let child = super::scan::lower_heap_scan(entry, None, ctx)?;
             match data_type {
                 ultrasql_core::DataType::Int32 => Box::new(DirectScalarAggScan::sum_int32(
                     child,
@@ -287,7 +281,7 @@ pub(super) fn try_lower_direct_scalar_aggregate(
             if col_idx >= schema.len() {
                 return Ok(None);
             }
-            let child = super::scan::lower_heap_scan(entry, ctx);
+            let child = super::scan::lower_heap_scan(entry, None, ctx)?;
             match data_type {
                 ultrasql_core::DataType::Int32 => Box::new(DirectScalarAggScan::avg_int32(
                     child,
@@ -414,7 +408,7 @@ pub(super) fn try_lower_fused_filter_sum_i32(
     // SeqScan over a relation populates the column cache as a
     // side effect of its walk, so subsequent queries hit the
     // direct-from-cache branch above.
-    let scan = lower_heap_scan(entry, ctx);
+    let scan = lower_heap_scan(entry, None, ctx)?;
     let fused = FilterSumI32Scan::new(
         scan,
         pred_col,

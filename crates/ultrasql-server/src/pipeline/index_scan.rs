@@ -5,13 +5,9 @@ use std::sync::Arc;
 
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
 use ultrasql_core::{DataType, RelationId, Value};
-use ultrasql_executor::{
-    IndexScan, Operator, RowCodec,
-};
+use ultrasql_executor::{IndexScan, Operator, RowCodec};
 use ultrasql_mvcc::{Visibility, is_visible};
-use ultrasql_planner::{
-    BinaryOp, LogicalPlan, ScalarExpr,
-};
+use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
 use ultrasql_storage::btree::BTree;
 
 use crate::BlankPageLoader;

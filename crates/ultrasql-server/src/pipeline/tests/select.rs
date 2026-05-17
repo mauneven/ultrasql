@@ -1,14 +1,13 @@
 //! SELECT-shape tests.
 
 use super::{
-    build_int_join_plan, collect_pairs, equi_eq_predicate, fixture, int_row, lit_i32, plan, schema_int_col, synthetic_ctx,
+    build_int_join_plan, collect_pairs, equi_eq_predicate, fixture, int_row, lit_i32, plan,
+    schema_int_col, synthetic_ctx,
 };
 use crate::pipeline::*;
 use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_executor::Operator;
-use ultrasql_planner::{
-    BinaryOp, LogicalJoinType, LogicalPlan, ScalarExpr,
-};
+use ultrasql_planner::{BinaryOp, LogicalJoinType, LogicalPlan, ScalarExpr};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions};
 
 #[test]

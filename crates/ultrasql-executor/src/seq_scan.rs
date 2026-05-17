@@ -912,9 +912,7 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 for (row_idx, row) in rows.iter().enumerate() {
                     let v_i64 = match &row[col_idx] {
                         Value::Decimal { value, .. } => *value,
-                        Value::Timestamp(v)
-                        | Value::TimestampTz(v)
-                        | Value::Time(v) => *v,
+                        Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) => *v,
                         Value::Int16(v) => i64::from(*v),
                         Value::Int32(v) => i64::from(*v),
                         Value::Int64(v) => *v,

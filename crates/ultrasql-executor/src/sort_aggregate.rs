@@ -357,12 +357,23 @@ fn to_f64(v: &Value) -> Option<f64> {
         Value::Int64(x) => Some(*x as f64),
         Value::Float32(x) => Some(f64::from(*x)),
         Value::Float64(x) => Some(*x),
+        Value::Decimal { value, scale } => Some(decimal_to_f64(*value, *scale)),
         _ => None,
     }
 }
 
 fn add_values(a: Value, b: Value) -> Result<Value, ExecError> {
     match (a, b) {
+        (
+            Value::Decimal {
+                value: x,
+                scale: xs,
+            },
+            Value::Decimal {
+                value: y,
+                scale: ys,
+            },
+        ) => add_decimal_values(x, xs, y, ys),
         (Value::Int16(x), Value::Int16(y)) => Ok(Value::Int64(i64::from(x) + i64::from(y))),
         (Value::Int32(x), Value::Int32(y)) => Ok(Value::Int64(i64::from(x) + i64::from(y))),
         (Value::Int64(x), Value::Int64(y)) => Ok(Value::Int64(x.wrapping_add(y))),
@@ -378,8 +389,62 @@ fn divide_value(sum: Value, count: i64) -> Value {
     match sum {
         Value::Int64(s) => Value::Float64(s as f64 / count as f64),
         Value::Float64(s) => Value::Float64(s / count as f64),
+        Value::Decimal { value, scale } => {
+            Value::Float64(decimal_to_f64(value, scale) / count as f64)
+        }
         other => other,
     }
+}
+
+fn add_decimal_values(
+    left_value: i64,
+    left_scale: i32,
+    right_value: i64,
+    right_scale: i32,
+) -> Result<Value, ExecError> {
+    let common_scale = left_scale.max(right_scale);
+    let left = rescale_decimal_value(left_value, left_scale, common_scale)?;
+    let right = rescale_decimal_value(right_value, right_scale, common_scale)?;
+    let sum = left
+        .checked_add(right)
+        .ok_or_else(|| ExecError::TypeMismatch("decimal sum overflow".to_owned()))?;
+    let value = i64::try_from(sum)
+        .map_err(|_| ExecError::TypeMismatch("decimal sum overflow".to_owned()))?;
+    Ok(Value::Decimal {
+        value,
+        scale: common_scale,
+    })
+}
+
+fn rescale_decimal_value(
+    value: i64,
+    current_scale: i32,
+    target_scale: i32,
+) -> Result<i128, ExecError> {
+    let scale_delta = target_scale - current_scale;
+    if scale_delta < 0 {
+        return Err(ExecError::TypeMismatch(
+            "decimal rescale underflow".to_owned(),
+        ));
+    }
+    let factor = pow10_i128(
+        u32::try_from(scale_delta)
+            .map_err(|_| ExecError::TypeMismatch("decimal rescale overflow".to_owned()))?,
+    )
+    .ok_or_else(|| ExecError::TypeMismatch("decimal rescale overflow".to_owned()))?;
+    i128::from(value)
+        .checked_mul(factor)
+        .ok_or_else(|| ExecError::TypeMismatch("decimal rescale overflow".to_owned()))
+}
+
+fn pow10_i128(exp: u32) -> Option<i128> {
+    (0..exp).try_fold(1_i128, |acc, _| acc.checked_mul(10))
+}
+
+fn decimal_to_f64(value: i64, scale: i32) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let raw = value as f64;
+    raw / 10_f64.powi(scale)
 }
 
 fn value_lt(a: &Value, b: &Value) -> bool {
@@ -491,7 +556,13 @@ impl SortAggregate {
             let Some(batch) = self.child.next_batch()? else {
                 break;
             };
-            let rows = batch_to_rows(&batch, &self.child_schema)?;
+            let rows = batch_to_rows(&batch, &self.child_schema).map_err(|error| {
+                ExecError::TypeMismatch(format!(
+                    "SortAggregate child decode failed (rows={}, width={}): {error}",
+                    batch.rows(),
+                    batch.width()
+                ))
+            })?;
             for row in &rows {
                 saw_any_row = true;
                 let key: Vec<Value> = self

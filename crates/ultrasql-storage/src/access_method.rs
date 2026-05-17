@@ -27,7 +27,6 @@
     clippy::cast_lossless,
     reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
 )]
-
 #![allow(clippy::significant_drop_tightening)]
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::type_complexity)]

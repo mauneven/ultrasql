@@ -1,24 +1,21 @@
 //! Simple per-variant lowerers used by the top-level [`super::lower_plan`]
 //! dispatcher, plus the sample-database loader.
 
-
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_executor::{
     FilterEqI32, Limit, MemTableScan, Operator, Project, ResultOp, SetOp, Sort,
 };
-use ultrasql_planner::{
-    BinaryOp, InMemoryCatalog, LogicalPlan, ScalarExpr,
-};
+use ultrasql_planner::{BinaryOp, InMemoryCatalog, LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 
 use crate::error::ServerError;
 
+use super::SampleTables;
 use super::cte_helpers::check_set_op_schemas;
 use super::join::lower_join;
 use super::saturate_row_count;
 use super::scan::lower_function_scan;
-use super::SampleTables;
 
 pub fn lower_plan(
     plan: &LogicalPlan,

@@ -67,7 +67,9 @@ use ultrasql_catalog::{CatalogSnapshot, MutableCatalog, PersistentCatalog};
 use ultrasql_core::{PageId, RelationId};
 use ultrasql_executor::RowCodec;
 use ultrasql_optimizer::{InMemoryStatsCatalog, PlanCache, PlanCacheConfig, StatsCatalog};
-use ultrasql_planner::{Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan, ScalarExpr, TableMeta};
+use ultrasql_planner::{
+    Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan, ScalarExpr, TableMeta,
+};
 use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::HeapAccess;
@@ -364,13 +366,23 @@ impl Server {
     /// empty heap and installs the hard-coded initial snapshot.
     #[must_use]
     pub fn with_sample_database() -> Self {
+        Self::with_sample_database_pool_frames(IN_MEMORY_POOL_FRAMES)
+    }
+
+    /// Build a server pre-loaded with the canonical sample database and a
+    /// caller-provided in-memory buffer-pool size.
+    ///
+    /// Intended for large in-process benchmarks such as TPC-H, where the
+    /// default development pool can be too small for the loaded dataset.
+    #[must_use]
+    pub fn with_sample_database_pool_frames(pool_frames: usize) -> Self {
         let mut catalog = InMemoryCatalog::new();
         let tables = build_sample_database(&mut catalog);
 
         let persistent_catalog = Arc::new(PersistentCatalog::new());
         // One in-memory buffer pool for both catalog bootstrap and
         // user-table DML so every connection observes the same heap.
-        let pool = Arc::new(BufferPool::new(IN_MEMORY_POOL_FRAMES, BlankPageLoader));
+        let pool = Arc::new(BufferPool::new(pool_frames, BlankPageLoader));
         let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
         match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
             Ok(stats) => {
@@ -872,6 +884,7 @@ fn notice_warning(sqlstate: &str, message: &str) -> BackendMessage {
 /// `command_id` is taken from `txn.current_command` so each statement
 /// inside an explicit transaction sees its own writes via the MVCC
 /// `cmin < current_command` rule.
+#[allow(clippy::too_many_arguments)]
 fn run_plan_in_txn(
     plan: &LogicalPlan,
     txn: &Transaction,
@@ -882,12 +895,9 @@ fn run_plan_in_txn(
     cancel_flag: Option<ultrasql_executor::CancelFlag>,
     stream_buf: &mut bytes::BytesMut,
 ) -> Result<SelectResult, ServerError> {
-    if let Some(result) = try_run_cached_int32_pair_select(
-        plan,
-        &catalog_snapshot,
-        heap.as_ref(),
-        stream_buf,
-    ) {
+    if let Some(result) =
+        try_run_cached_int32_pair_select(plan, &catalog_snapshot, heap.as_ref(), stream_buf)
+    {
         return Ok(result);
     }
 
@@ -941,7 +951,11 @@ pub(crate) fn try_run_cached_int32_pair_select(
 ) -> Option<SelectResult> {
     let (table, output_schema) = match plan {
         LogicalPlan::Scan { table, schema, .. } => (table.as_str(), schema),
-        LogicalPlan::Project { input, exprs, schema } => {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            schema,
+        } => {
             let LogicalPlan::Scan { table, .. } = input.as_ref() else {
                 return None;
             };
@@ -982,8 +996,7 @@ pub(crate) fn try_run_cached_int32_pair_select(
         && let Some(encoded) = cached.cached_int32_pair_select_wire.read().clone()
     {
         return Some(result_encoder::run_shared_preencoded_select_streamed(
-            encoded,
-            rows,
+            encoded, rows,
         ));
     }
 

@@ -295,13 +295,12 @@ pub(crate) fn write_int32_int64_pair_data_rows(
                 *dst.add(6) = 2;
                 off += 7;
 
-                let a_payload_len: usize;
-                if a_null {
+                let a_payload_len = if a_null {
                     // -1 length, no payload bytes.
                     let neg_one = (-1_i32).to_be_bytes();
                     std::ptr::copy_nonoverlapping(neg_one.as_ptr(), dst_base.add(off), 4);
                     off += 4;
-                    a_payload_len = 0;
+                    0
                 } else {
                     let a_text = format_i32_into(&mut scratch_a, a[row]);
                     let a_len = a_text.len();
@@ -310,15 +309,14 @@ pub(crate) fn write_int32_int64_pair_data_rows(
                     off += 4;
                     std::ptr::copy_nonoverlapping(a_text.as_ptr(), dst_base.add(off), a_len);
                     off += a_len;
-                    a_payload_len = a_len;
-                }
+                    a_len
+                };
 
-                let b_payload_len: usize;
-                if b_null {
+                let b_payload_len = if b_null {
                     let neg_one = (-1_i32).to_be_bytes();
                     std::ptr::copy_nonoverlapping(neg_one.as_ptr(), dst_base.add(off), 4);
                     off += 4;
-                    b_payload_len = 0;
+                    0
                 } else {
                     let b_text = format_i64_into(&mut scratch_b, b[row]);
                     let b_len = b_text.len();
@@ -327,8 +325,8 @@ pub(crate) fn write_int32_int64_pair_data_rows(
                     off += 4;
                     std::ptr::copy_nonoverlapping(b_text.as_ptr(), dst_base.add(off), b_len);
                     off += b_len;
-                    b_payload_len = b_len;
-                }
+                    b_len
+                };
 
                 let row_bytes = 7 + 4 + a_payload_len + 4 + b_payload_len;
                 let length = i32_from_usize(row_bytes - 1).to_be_bytes();

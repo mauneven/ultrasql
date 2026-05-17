@@ -332,7 +332,6 @@ impl IndexKeyEncoding {
             "encode_row called on a single-column encoding without a column index",
         ))
     }
-
 }
 
 /// Order-preserving `f32` → `i64` encoding.

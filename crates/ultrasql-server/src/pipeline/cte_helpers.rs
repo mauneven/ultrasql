@@ -3,15 +3,12 @@
 use std::sync::Arc;
 
 use ultrasql_core::Schema;
-use ultrasql_executor::{
-    Operator, SetOp,
-};
+use ultrasql_executor::{Operator, SetOp};
 use ultrasql_planner::LogicalPlan;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, StringColumn};
 
 use crate::error::ServerError;
-
 
 use super::lower_query::lower_query;
 use super::{CteBuffer, LowerCtx};

@@ -83,7 +83,7 @@ use self::ddl::{
     bind_truncate,
 };
 use self::dml::{bind_delete, bind_insert, bind_update};
-use self::expr_bind::bind_expr;
+use self::expr_bind::{bind_expr, bind_expr_with_ctes};
 use self::from::bind_from;
 use self::util::{
     bind_order_by, bind_returning, bind_unsigned_literal, build_returning_schema,
@@ -568,7 +568,7 @@ fn bind_select_body(
     let (mut plan, from_scope) = bind_from(&select.from, catalog, cte_catalog, scope)?;
 
     if let Some(pred_ast) = &select.r#where {
-        let pred = bind_expr(pred_ast, plan.schema(), catalog, scope)?;
+        let pred = bind_expr_with_ctes(pred_ast, plan.schema(), catalog, cte_catalog, scope)?;
         let pred_ty = pred.data_type();
         if pred_ty != DataType::Bool && pred_ty != DataType::Null {
             return Err(PlanError::TypeMismatch(format!(
@@ -595,7 +595,13 @@ fn bind_select_body(
     } else {
         let mut cloned = select.clone();
         cloned.projection = projection_after_window;
-        plan = window::apply_window_extractions(plan, window_extractions, catalog, scope)?;
+        plan = window::apply_window_extractions(
+            plan,
+            window_extractions,
+            catalog,
+            cte_catalog,
+            scope,
+        )?;
         cloned
     };
     let select = &select_for_binding;
@@ -605,9 +611,9 @@ fn bind_select_body(
     let having_has_agg = select.having.as_ref().is_some_and(expr_has_aggregate);
 
     if has_group_by || has_aggregates || having_has_agg {
-        plan = bind_aggregate(plan, select, &from_scope, catalog, scope)?;
+        plan = bind_aggregate(plan, select, &from_scope, catalog, cte_catalog, scope)?;
         if let Some(having_ast) = &select.having {
-            let pred = bind_expr(having_ast, plan.schema(), catalog, scope)?;
+            let pred = bind_expr_with_ctes(having_ast, plan.schema(), catalog, cte_catalog, scope)?;
             let pred_ty = pred.data_type();
             if pred_ty != DataType::Bool && pred_ty != DataType::Null {
                 return Err(PlanError::TypeMismatch(format!(
@@ -619,7 +625,13 @@ fn bind_select_body(
                 predicate: pred,
             };
         }
-        let projected = bind_projection_agg(&select.projection, plan.schema(), catalog, scope)?;
+        let projected = bind_projection_agg(
+            &select.projection,
+            plan.schema(),
+            catalog,
+            cte_catalog,
+            scope,
+        )?;
         let proj_fields: Vec<Field> = projected
             .iter()
             .map(|(e, name)| Field::nullable(name, e.data_type()))
@@ -627,7 +639,8 @@ fn bind_select_body(
         let proj_schema = Schema::new(proj_fields)
             .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
 
-        let sort_keys = bind_order_by(&select.order_by, plan.schema(), catalog, scope)?;
+        let sort_keys =
+            bind_order_by(&select.order_by, plan.schema(), catalog, cte_catalog, scope)?;
         if !sort_keys.is_empty() {
             plan = LogicalPlan::Sort {
                 input: Box::new(plan),
@@ -646,6 +659,7 @@ fn bind_select_body(
             plan.schema(),
             &from_scope,
             catalog,
+            cte_catalog,
             scope,
         )?;
         let proj_fields: Vec<Field> = projected
@@ -655,7 +669,8 @@ fn bind_select_body(
         let proj_schema = Schema::new(proj_fields)
             .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
 
-        let sort_keys = bind_order_by(&select.order_by, plan.schema(), catalog, scope)?;
+        let sort_keys =
+            bind_order_by(&select.order_by, plan.schema(), catalog, cte_catalog, scope)?;
         if !sort_keys.is_empty() {
             plan = LogicalPlan::Sort {
                 input: Box::new(plan),

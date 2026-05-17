@@ -71,9 +71,17 @@ fn which_dbgen() -> Option<PathBuf> {
 /// Shells out to `dbgen -vf -s <scale>` in `out_dir`.
 fn run_dbgen(scale: u32, out_dir: &Path) -> Result<()> {
     let dbgen = which_dbgen().expect("dbgen must exist — caller checked");
+    let dbgen_dir = dbgen
+        .parent()
+        .context("dbgen path must have a parent directory")?;
+    let out_dir = out_dir
+        .canonicalize()
+        .with_context(|| format!("canonicalize {}", out_dir.display()))?;
     let status = std::process::Command::new(&dbgen)
         .args(["-vf", "-s", &scale.to_string()])
-        .current_dir(out_dir)
+        .env("DSS_CONFIG", dbgen_dir)
+        .env("DSS_PATH", &out_dir)
+        .current_dir(&out_dir)
         .status()
         .with_context(|| format!("spawn dbgen at {}", dbgen.display()))?;
     if !status.success() {

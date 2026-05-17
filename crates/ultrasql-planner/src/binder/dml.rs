@@ -8,6 +8,7 @@ use ultrasql_parser::ast::{
     OnConflict, UpdateStmt,
 };
 
+use super::expr_bind::coerce_literal_to_type;
 use super::{
     Catalog, ConflictTarget, LogicalOnConflict, LogicalPlan, PlanError, ScalarExpr, ScopeStack,
     bind_expr, bind_returning, bind_select, build_returning_schema, object_name_simple,
@@ -62,21 +63,20 @@ pub(super) fn bind_insert(
         }
         InsertSource::Values(rows) => {
             let mut plan = bind_values_rows(rows, expected_arity, catalog, scope)?;
-            // Coerce Null-typed value columns to the target table column
-            // type. `bind_values_rows` defaults a column to `DataType::Null`
-            // when every cell across every row is a NULL literal; left
-            // unchanged the executor's `build_batch` rejects the schema.
-            // The target type is unambiguous here because the INSERT
-            // already pinned `columns[i]` to a concrete table field.
-            if let LogicalPlan::Values { schema, .. } = &mut plan {
+            // Coerce literal VALUES cells to the target table column type.
+            // This covers NULL-only columns and concrete numeric literals
+            // like `0.06` flowing into `DECIMAL(15,2)`.
+            if let LogicalPlan::Values { rows, schema } = &mut plan {
+                for row in rows.iter_mut() {
+                    for (i, cell) in row.iter_mut().enumerate() {
+                        let target = &table_schema.field_at(columns[i]).data_type;
+                        coerce_literal_to_type(cell, target);
+                    }
+                }
                 let mut new_fields: Vec<Field> = Vec::with_capacity(schema.len());
                 for (i, field) in schema.fields().iter().enumerate() {
-                    let resolved = if matches!(field.data_type, DataType::Null) {
-                        let target = &table_schema.field_at(columns[i]).data_type;
-                        target.clone()
-                    } else {
-                        field.data_type.clone()
-                    };
+                    let target = &table_schema.field_at(columns[i]).data_type;
+                    let resolved = target.clone();
                     new_fields.push(Field::nullable(field.name.clone(), resolved));
                 }
                 *schema = Schema::new(new_fields).map_err(|e| {
@@ -283,7 +283,9 @@ fn bind_assignments(
         if !seen.insert(idx) {
             return Err(PlanError::DuplicateColumn(a.target.value.clone()));
         }
-        let expr = bind_expr(&a.value, table_schema, catalog, scope)?;
+        let mut expr = bind_expr(&a.value, table_schema, catalog, scope)?;
+        let target = &table_schema.field_at(idx).data_type;
+        coerce_literal_to_type(&mut expr, target);
         out.push((idx, expr));
     }
     Ok(out)

@@ -39,8 +39,7 @@ impl ProjectExprs {
     ) -> Result<Self, ExecError> {
         let child_schema = child.schema().clone();
         let scalars: Vec<ScalarExpr> = exprs.iter().map(|(e, _)| e.clone()).collect();
-        let output_types: Vec<DataType> =
-            exprs.iter().map(|(e, _)| e.data_type()).collect();
+        let output_types: Vec<DataType> = exprs.iter().map(|(e, _)| e.data_type()).collect();
         Ok(Self {
             child,
             schema,
@@ -64,9 +63,8 @@ impl Operator for ProjectExprs {
         let rows = batch_to_rows(&batch, &self.child_schema)?;
         let n_rows = rows.len();
         let n_cols = self.exprs.len();
-        let mut out_values: Vec<Vec<Value>> = (0..n_cols)
-            .map(|_| Vec::with_capacity(n_rows))
-            .collect();
+        let mut out_values: Vec<Vec<Value>> =
+            (0..n_cols).map(|_| Vec::with_capacity(n_rows)).collect();
         let no_params: &[Value] = &[];
         for row in &rows {
             for (col_idx, expr) in self.exprs.iter().enumerate() {

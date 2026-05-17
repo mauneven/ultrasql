@@ -805,6 +805,53 @@ fn binds_having_filters_post_aggregate() {
     );
 }
 
+#[test]
+fn binds_decimal_arithmetic_around_aggregate_with_decimal_type() {
+    let schema = Schema::new([
+        Field::required(
+            "price",
+            DataType::Decimal {
+                precision: Some(15),
+                scale: Some(2),
+            },
+        ),
+        Field::required(
+            "discount",
+            DataType::Decimal {
+                precision: Some(15),
+                scale: Some(2),
+            },
+        ),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("lineitem", TableMeta::new(schema));
+
+    let plan = parse_and_bind(
+        "SELECT 100 * SUM(price * (1 - discount)) / SUM(price * (1 - discount)) AS ratio FROM lineitem",
+        &cat,
+    )
+    .expect("bind ok");
+
+    let LogicalPlan::Project { schema, exprs, .. } = &plan else {
+        panic!("expected top-level Project, got {plan:?}");
+    };
+    assert_eq!(
+        schema.field_at(0).data_type,
+        DataType::Decimal {
+            precision: None,
+            scale: Some(8)
+        }
+    );
+    assert_eq!(
+        exprs[0].0.data_type(),
+        DataType::Decimal {
+            precision: None,
+            scale: Some(8)
+        }
+    );
+}
+
 // -----------------------------------------------------------------------
 // Set operations tests
 // -----------------------------------------------------------------------
@@ -883,6 +930,45 @@ fn binds_cte_then_references_it_in_body() {
     };
     assert_eq!(name, "active");
     assert!(!recursive, "non-recursive CTE should have recursive=false");
+}
+
+#[test]
+fn binds_scalar_subquery_that_references_outer_cte() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "WITH revenue AS (SELECT id, score FROM users) SELECT id FROM revenue WHERE score = (SELECT MAX(score) FROM revenue)",
+        &cat,
+    )
+    .expect("bind ok");
+
+    let LogicalPlan::Cte { body, .. } = &plan else {
+        panic!("expected Cte at top, got {plan:?}");
+    };
+
+    fn find_filter(plan: &LogicalPlan) -> Option<&LogicalPlan> {
+        match plan {
+            LogicalPlan::Filter { .. } => Some(plan),
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Sort { input, .. } => find_filter(input),
+            _ => None,
+        }
+    }
+
+    let filter = find_filter(body).expect("should have Filter");
+    let LogicalPlan::Filter { predicate, .. } = filter else {
+        panic!("expected Filter");
+    };
+    let ScalarExpr::Binary { right, .. } = predicate else {
+        panic!("expected binary predicate, got {predicate:?}");
+    };
+    assert!(matches!(
+        right.as_ref(),
+        ScalarExpr::ScalarSubquery {
+            correlated: false,
+            ..
+        }
+    ));
 }
 
 // -----------------------------------------------------------------------

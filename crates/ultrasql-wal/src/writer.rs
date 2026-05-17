@@ -349,8 +349,9 @@ impl WriterDriver {
                 self.rotate_segment()?;
                 continue;
             }
-            let record_len_usize = usize::try_from(record_len)
-                .map_err(|_| WalWriterError::Io(std::io::Error::other("record length exceeds usize")))?;
+            let record_len_usize = usize::try_from(record_len).map_err(|_| {
+                WalWriterError::Io(std::io::Error::other("record length exceeds usize"))
+            })?;
             let chunk = &bytes[cursor..cursor + record_len_usize];
             let file = self.current_file.as_mut().ok_or_else(|| {
                 WalWriterError::Io(std::io::Error::other("segment file unexpectedly closed"))

@@ -15,7 +15,9 @@ use ultrasql_catalog::{
     CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
 };
 use ultrasql_core::{DataType, PageId, RelationId, Value};
-use ultrasql_optimizer::{InMemoryStatsCatalog, PlanCache, PlanCacheConfig, PlanCacheKey, StatsCatalog, StatsSource};
+use ultrasql_optimizer::{
+    InMemoryStatsCatalog, PlanCache, PlanCacheConfig, PlanCacheKey, StatsCatalog, StatsSource,
+};
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
     Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
@@ -100,7 +102,10 @@ where
             return self.execute_analyze(table.as_deref());
         }
 
-        for (head, tag) in [("vacuum", "VACUUM"), ("create statistics", "CREATE STATISTICS")] {
+        for (head, tag) in [
+            ("vacuum", "VACUUM"),
+            ("create statistics", "CREATE STATISTICS"),
+        ] {
             let len = head.len();
             if trimmed.len() >= len && trimmed[..len].eq_ignore_ascii_case(head) {
                 let rest = &trimmed[len..];
@@ -566,13 +571,12 @@ where
         // the normal machinery so `ReadyForQuery` state and command-id
         // progression stay unchanged there.
         if matches!(self.txn_state, TxnState::Idle)
-            && let Some(result) =
-                try_run_cached_int32_pair_select(
-                    plan,
-                    catalog_snapshot,
-                    self.state.heap.as_ref(),
-                    &mut self.write_buf,
-                )
+            && let Some(result) = try_run_cached_int32_pair_select(
+                plan,
+                catalog_snapshot,
+                self.state.heap.as_ref(),
+                &mut self.write_buf,
+            )
         {
             return Ok(result);
         }
@@ -661,7 +665,8 @@ where
     }
 
     fn try_parse_analyze_target(&self, trimmed_sql: &str) -> Option<Option<String>> {
-        if trimmed_sql.len() < "analyze".len() || !trimmed_sql[..7].eq_ignore_ascii_case("analyze") {
+        if trimmed_sql.len() < "analyze".len() || !trimmed_sql[..7].eq_ignore_ascii_case("analyze")
+        {
             return None;
         }
         let rest = trimmed_sql[7..].trim();
@@ -690,11 +695,7 @@ where
             }
             None => {
                 let snapshot = self.state.catalog_snapshot();
-                let tables: Vec<String> = snapshot
-                    .tables
-                    .keys()
-                    .map(|k| k.to_string())
-                    .collect();
+                let tables: Vec<String> = snapshot.tables.keys().map(|k| k.to_string()).collect();
                 for name in tables {
                     let _ = self.state.analyze_table(&name);
                 }

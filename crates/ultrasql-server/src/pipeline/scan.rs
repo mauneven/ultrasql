@@ -3,11 +3,8 @@
 use std::sync::Arc;
 
 use ultrasql_catalog::TableEntry;
-use ultrasql_core::{RelationId, Schema, Value};
-use ultrasql_executor::{
-    CteScan, MemTableScan, Operator, RowCodec,
-    SeqScan,
-};
+use ultrasql_core::{RelationId, Value};
+use ultrasql_executor::{CteScan, MemTableScan, Operator, Project, RowCodec, SeqScan};
 use ultrasql_planner::ScalarExpr;
 
 use crate::error::ServerError;
@@ -16,18 +13,19 @@ use super::LowerCtx;
 
 pub(super) fn lower_catalog_or_sample_scan(
     table: &str,
-    plan_schema: &Schema,
+    projection: Option<&[usize]>,
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
     let folded = table.to_ascii_lowercase();
     if let Some(buffer) = ctx.cte_buffers.get(&folded) {
-        return Ok(Box::new(CteScan::new(
+        let scan: Box<dyn Operator> = Box::new(CteScan::new(
             Arc::clone(&buffer.batches),
-            plan_schema.clone(),
-        )));
+            buffer.schema.clone(),
+        ));
+        return apply_projection(scan, projection);
     }
     if let Some(entry) = ctx.catalog_snapshot.tables.get(&folded) {
-        return Ok(lower_heap_scan(entry, ctx));
+        return lower_heap_scan(entry, projection, ctx);
     }
     // Legacy path: sample tables.
     let sample = ctx.tables.lookup(table).ok_or_else(|| {
@@ -35,14 +33,19 @@ pub(super) fn lower_catalog_or_sample_scan(
             table.to_string(),
         ))
     })?;
-    Ok(Box::new(MemTableScan::new(
+    let scan: Box<dyn Operator> = Box::new(MemTableScan::new(
         sample.schema.clone(),
         sample.batches.clone(),
-    )))
+    ));
+    apply_projection(scan, projection)
 }
 
 /// Construct a [`SeqScan`] for a real persistent relation.
-pub(super) fn lower_heap_scan(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Box<dyn Operator> {
+pub(super) fn lower_heap_scan(
+    entry: &TableEntry,
+    projection: Option<&[usize]>,
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
     let rel = RelationId(entry.oid);
     // The catalog's `n_blocks` stat is an estimate; the heap's
     // counter is the truth. Take the larger of the two so a freshly
@@ -64,7 +67,19 @@ pub(super) fn lower_heap_scan(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Box<dyn
     if let Some(flag) = &ctx.cancel_flag {
         scan = scan.with_cancel_flag(flag.clone());
     }
-    Box::new(scan)
+    let scan: Box<dyn Operator> = Box::new(scan);
+    apply_projection(scan, projection)
+}
+
+fn apply_projection(
+    scan: Box<dyn Operator>,
+    projection: Option<&[usize]>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    if let Some(indices) = projection {
+        Ok(Box::new(Project::new(scan, indices.to_vec())?))
+    } else {
+        Ok(scan)
+    }
 }
 
 /// Lower a `LogicalPlan::FunctionScan { name, args, .. }` into the

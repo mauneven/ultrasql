@@ -1,18 +1,13 @@
 //! Modify + index-scan pipeline tests.
 
 use super::select::{
-    between_id_literal, build_filter_scan_plan, build_index_fixture, drain_id_val,
-    eq_id_literal,
+    between_id_literal, build_filter_scan_plan, build_index_fixture, drain_id_val, eq_id_literal,
 };
-use super::{
-    collect_pairs, column, int_row, schema_int_col, synthetic_ctx,
-};
+use super::{collect_pairs, column, int_row, schema_int_col, synthetic_ctx};
 use crate::pipeline::index_scan::{match_indexable_predicate, match_simple_comparison};
 use crate::pipeline::*;
 use ultrasql_core::{DataType, Schema, Value};
-use ultrasql_planner::{
-    BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr,
-};
+use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr};
 use ultrasql_storage::heap::InsertOptions;
 
 #[test]

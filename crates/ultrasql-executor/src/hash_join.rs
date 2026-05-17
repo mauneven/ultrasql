@@ -25,7 +25,7 @@
 //! Multiple left rows with the same (non-NULL) key are all stored; the probe
 //! emits one output row per (right, left) pair.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use ultrasql_core::{Schema, Value};
 use ultrasql_planner::{LogicalJoinType, ScalarExpr};
@@ -57,14 +57,24 @@ const BATCH_TARGET_ROWS: usize = 4096;
 pub struct HashJoin {
     left: Box<dyn Operator>,
     right: Box<dyn Operator>,
-    left_key_eval: Eval,
-    right_key_eval: Eval,
+    left_key_evals: Vec<Eval>,
+    right_key_evals: Vec<Eval>,
     join_type: LogicalJoinType,
     schema: Schema,
     left_schema: Schema,
     right_schema: Schema,
-    /// Output row buffer. `None` until the build+probe phases complete.
-    output: Option<std::vec::IntoIter<Vec<Value>>>,
+    /// Build-side rows retained for hash lookup and output assembly.
+    left_rows: Vec<Vec<Value>>,
+    /// Hash table built from the left side on first execution.
+    hash_table: Option<HashMap<JoinKey, Vec<usize>>>,
+    /// Whether each left row matched at least one probe row.
+    left_matched: Vec<bool>,
+    /// Joined rows produced from probe batches but not yet emitted.
+    pending_output: VecDeque<Vec<Value>>,
+    /// `true` once the right/probe side has been fully consumed.
+    probe_finished: bool,
+    /// Cursor for emitting unmatched left rows in `LeftOuter` mode.
+    next_unmatched_left: usize,
     /// `true` after the final `Ok(None)` is returned.
     eof: bool,
 }
@@ -93,16 +103,57 @@ impl HashJoin {
         left_schema: Schema,
         right_schema: Schema,
     ) -> Self {
-        Self {
+        Self::new_multi(
             left,
             right,
-            left_key_eval: Eval::new(left_key),
-            right_key_eval: Eval::new(right_key),
+            vec![left_key],
+            vec![right_key],
             join_type,
             schema,
             left_schema,
             right_schema,
-            output: None,
+        )
+    }
+
+    /// Construct a hash join with one or more equality keys.
+    ///
+    /// The key vectors must be non-empty and have matching lengths. Each
+    /// key at position `i` forms one equality predicate:
+    /// `left_keys[i] = right_keys[i]`. Rows with NULL in any key component
+    /// do not match, preserving SQL equality semantics.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // all 8 parameters are distinct logical inputs
+    pub fn new_multi(
+        left: Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        left_keys: Vec<ScalarExpr>,
+        right_keys: Vec<ScalarExpr>,
+        join_type: LogicalJoinType,
+        schema: Schema,
+        left_schema: Schema,
+        right_schema: Schema,
+    ) -> Self {
+        debug_assert!(!left_keys.is_empty(), "hash join requires at least one key");
+        debug_assert_eq!(
+            left_keys.len(),
+            right_keys.len(),
+            "hash join key vectors must align"
+        );
+        Self {
+            left,
+            right,
+            left_key_evals: left_keys.into_iter().map(Eval::new).collect(),
+            right_key_evals: right_keys.into_iter().map(Eval::new).collect(),
+            join_type,
+            schema,
+            left_schema,
+            right_schema,
+            left_rows: Vec::new(),
+            hash_table: None,
+            left_matched: Vec::new(),
+            pending_output: VecDeque::new(),
+            probe_finished: false,
+            next_unmatched_left: 0,
             eof: false,
         }
     }
@@ -114,13 +165,44 @@ impl Operator for HashJoin {
             return Ok(None);
         }
 
-        if self.output.is_none() {
-            let rows = self.execute()?;
-            self.output = Some(rows.into_iter());
+        if self.hash_table.is_none() {
+            self.build_phase()?;
         }
 
-        let iter = self.output.as_mut().expect("just-set");
-        let chunk: Vec<Vec<Value>> = iter.by_ref().take(BATCH_TARGET_ROWS).collect();
+        let null_right = vec![Value::Null; self.right_schema.len()];
+        let mut chunk: Vec<Vec<Value>> = Vec::with_capacity(BATCH_TARGET_ROWS);
+
+        while chunk.len() < BATCH_TARGET_ROWS {
+            if let Some(row) = self.pending_output.pop_front() {
+                chunk.push(row);
+                continue;
+            }
+
+            if !self.probe_finished {
+                if self.probe_once()? {
+                    continue;
+                }
+                self.probe_finished = true;
+                continue;
+            }
+
+            if self.join_type == LogicalJoinType::LeftOuter {
+                while self.next_unmatched_left < self.left_rows.len()
+                    && chunk.len() < BATCH_TARGET_ROWS
+                {
+                    if !self.left_matched[self.next_unmatched_left] {
+                        chunk.push(concat_rows(
+                            &self.left_rows[self.next_unmatched_left],
+                            &null_right,
+                        ));
+                    }
+                    self.next_unmatched_left += 1;
+                }
+            }
+
+            break;
+        }
+
         if chunk.is_empty() {
             self.eof = true;
             return Ok(None);
@@ -134,8 +216,7 @@ impl Operator for HashJoin {
 }
 
 impl HashJoin {
-    /// Execute the full build+probe and return all output rows.
-    fn execute(&mut self) -> Result<Vec<Vec<Value>>, ExecError> {
+    fn build_phase(&mut self) -> Result<(), ExecError> {
         // Validate join type early so the error surfaces before doing any work.
         match self.join_type {
             LogicalJoinType::Inner | LogicalJoinType::LeftOuter => {}
@@ -157,10 +238,10 @@ impl HashJoin {
         }
 
         // ----- Build phase -----
-        // Key: left key value. Value: (row_index, row_data).
-        // We use a multi-map: HashMap<Value, Vec<usize>> + a row array.
-        let mut left_rows: Vec<Vec<Value>> = Vec::new();
-        let mut hash_table: HashMap<OrderedValue, Vec<usize>> = HashMap::new();
+        // Key: one or more left key values. Value: row indices into
+        // `left_rows`. The row array keeps output assembly contiguous
+        // while the hash table stays compact.
+        let mut hash_table: HashMap<JoinKey, Vec<usize>> = HashMap::new();
 
         loop {
             let Some(batch) = self.left.next_batch()? else {
@@ -168,55 +249,45 @@ impl HashJoin {
             };
             let rows = batch_to_rows(&batch, &self.left_schema)?;
             for row in rows {
-                let key = self.left_key_eval.eval(&row).unwrap_or(Value::Null);
-                if !key.is_null() {
+                if let Some(key) = build_join_key(&self.left_key_evals, &row) {
                     hash_table
-                        .entry(OrderedValue(key))
+                        .entry(key)
                         .or_default()
-                        .push(left_rows.len());
+                        .push(self.left_rows.len());
                 }
-                left_rows.push(row);
+                self.left_rows.push(row);
             }
         }
 
-        // ----- Probe phase -----
-        let null_right = vec![Value::Null; self.right_schema.len()];
-        // Track which left rows were matched (for LeftOuter).
-        let mut left_matched = vec![false; left_rows.len()];
+        self.left_matched = vec![false; self.left_rows.len()];
+        self.hash_table = Some(hash_table);
+        Ok(())
+    }
 
-        let mut output: Vec<Vec<Value>> = Vec::new();
-
-        loop {
-            let Some(batch) = self.right.next_batch()? else {
-                break;
+    fn probe_once(&mut self) -> Result<bool, ExecError> {
+        let Some(batch) = self.right.next_batch()? else {
+            return Ok(false);
+        };
+        let rows = batch_to_rows(&batch, &self.right_schema)?;
+        for right_row in rows {
+            let Some(probe_key) = build_join_key(&self.right_key_evals, &right_row) else {
+                continue;
             };
-            let rows = batch_to_rows(&batch, &self.right_schema)?;
-            for right_row in &rows {
-                let probe_key = self.right_key_eval.eval(right_row).unwrap_or(Value::Null);
-                if probe_key.is_null() {
-                    // NULL keys never match.
-                    continue;
-                }
-                if let Some(indices) = hash_table.get(&OrderedValue(probe_key)) {
-                    for &li in indices {
-                        left_matched[li] = true;
-                        let joined = concat_rows(&left_rows[li], right_row);
-                        output.push(joined);
+            let indices = self
+                .hash_table
+                .as_ref()
+                .and_then(|table| table.get(&probe_key).cloned());
+            if let Some(indices) = indices {
+                for li in indices {
+                    if self.join_type == LogicalJoinType::LeftOuter {
+                        self.left_matched[li] = true;
                     }
+                    self.pending_output
+                        .push_back(concat_rows(&self.left_rows[li], &right_row));
                 }
             }
         }
-
-        // LeftOuter: emit unmatched left rows with NULL right padding.
-        if self.join_type == LogicalJoinType::LeftOuter {
-            for (li, matched) in left_matched.iter().enumerate() {
-                if !matched {
-                    output.push(concat_rows(&left_rows[li], &null_right));
-                }
-            }
-        }
-
-        Ok(output)
+        Ok(true)
     }
 }
 
@@ -224,13 +295,28 @@ impl HashJoin {
 // Hash-map key wrapper
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Eq, PartialEq, Hash)]
+struct JoinKey(Vec<OrderedValue>);
+
+fn build_join_key(evals: &[Eval], row: &[Value]) -> Option<JoinKey> {
+    let mut values = Vec::with_capacity(evals.len());
+    for eval in evals {
+        let value = eval.eval(row).unwrap_or(Value::Null);
+        if value.is_null() {
+            return None;
+        }
+        values.push(OrderedValue(value));
+    }
+    Some(JoinKey(values))
+}
+
 /// A wrapper around [`Value`] that implements `Hash + Eq` so it can serve
 /// as a `HashMap` key.
 ///
 /// `Value` itself does not implement `Hash` because `f32`/`f64` are not
 /// `Hash` (NaN != NaN). We implement an approximate hash that is consistent
 /// with the join semantics: NaN values compare equal to themselves here.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct OrderedValue(Value);
 
 impl PartialEq for OrderedValue {
@@ -360,14 +446,46 @@ mod tests {
         .expect("schema ok")
     }
 
+    fn schema_pair(prefix: &str) -> Schema {
+        Schema::new([
+            Field::required(format!("{prefix}_part"), DataType::Int32),
+            Field::required(format!("{prefix}_supp"), DataType::Int32),
+        ])
+        .expect("schema ok")
+    }
+
+    fn schema_joined_pair() -> Schema {
+        Schema::new([
+            Field::required("left_part", DataType::Int32),
+            Field::required("left_supp", DataType::Int32),
+            Field::required("right_part", DataType::Int32),
+            Field::required("right_supp", DataType::Int32),
+        ])
+        .expect("schema ok")
+    }
+
     fn i32_batch(rows: &[i32]) -> Batch {
         Batch::new([Column::Int32(NumericColumn::from_data(rows.to_vec()))]).expect("batch ok")
     }
 
+    fn i32_pair_batch(rows: &[(i32, i32)]) -> Batch {
+        let first = rows.iter().map(|(a, _)| *a).collect::<Vec<_>>();
+        let second = rows.iter().map(|(_, b)| *b).collect::<Vec<_>>();
+        Batch::new([
+            Column::Int32(NumericColumn::from_data(first)),
+            Column::Int32(NumericColumn::from_data(second)),
+        ])
+        .expect("batch ok")
+    }
+
     fn col_idx0_i32(name: &str) -> ScalarExpr {
+        col_i32(name, 0)
+    }
+
+    fn col_i32(name: &str, index: usize) -> ScalarExpr {
         ScalarExpr::Column {
             name: name.into(),
-            index: 0,
+            index,
             data_type: DataType::Int32,
         }
     }
@@ -422,6 +540,71 @@ mod tests {
         let mut rows = drain_rows(&mut op);
         rows.sort_unstable();
         assert_eq!(rows, vec![(2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn hash_join_inner_composite_key() {
+        let left_schema = schema_pair("left");
+        let right_schema = schema_pair("right");
+        let left = MemTableScan::new(
+            left_schema.clone(),
+            vec![i32_pair_batch(&[(1, 10), (1, 20), (2, 10)])],
+        );
+        let right = MemTableScan::new(
+            right_schema.clone(),
+            vec![i32_pair_batch(&[(1, 10), (1, 30), (2, 10)])],
+        );
+        let mut op = HashJoin::new_multi(
+            Box::new(left),
+            Box::new(right),
+            vec![col_i32("left_part", 0), col_i32("left_supp", 1)],
+            vec![col_i32("right_part", 0), col_i32("right_supp", 1)],
+            LogicalJoinType::Inner,
+            schema_joined_pair(),
+            left_schema,
+            right_schema,
+        );
+
+        let schema = op.schema().clone();
+        let mut rows = Vec::new();
+        while let Some(batch) = op.next_batch().expect("no error") {
+            for row in crate::filter_op::batch_to_rows(&batch, &schema).expect("decode ok") {
+                let values = row
+                    .into_iter()
+                    .map(|value| match value {
+                        Value::Int32(v) => v,
+                        other => panic!("unexpected value: {other:?}"),
+                    })
+                    .collect::<Vec<_>>();
+                rows.push((values[0], values[1], values[2], values[3]));
+            }
+        }
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(1, 10, 1, 10), (2, 10, 2, 10)]);
+    }
+
+    #[test]
+    fn hash_join_streams_large_output_across_batches() {
+        let left = MemTableScan::new(schema_id(), vec![i32_batch(&(0..5000).collect::<Vec<_>>())]);
+        let right = MemTableScan::new(
+            schema_val(),
+            vec![i32_batch(&(0..5000).collect::<Vec<_>>())],
+        );
+        let mut op = HashJoin::new(
+            Box::new(left),
+            Box::new(right),
+            col_idx0_i32("id"),
+            col_idx0_i32("val"),
+            LogicalJoinType::Inner,
+            schema_id_val(),
+            schema_id(),
+            schema_val(),
+        );
+
+        let rows = drain_rows(&mut op);
+        assert_eq!(rows.len(), 5000);
+        assert_eq!(rows.first(), Some(&(0, 0)));
+        assert_eq!(rows.last(), Some(&(4999, 4999)));
     }
 
     // -------------------------------------------------------------------------

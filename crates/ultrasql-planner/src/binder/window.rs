@@ -24,7 +24,7 @@ use crate::expr::ScalarExpr;
 use crate::plan::{LogicalPlan, LogicalWindowFunc, SortKey};
 
 use super::ScopeStack;
-use super::expr_bind::bind_expr;
+use super::expr_bind::bind_expr_with_ctes;
 
 /// Walk `projection` and pull out every top-level `Expr::Call { over:
 /// Some(_), .. }` into a parallel `Vec<WindowExtraction>`; replace the
@@ -130,6 +130,7 @@ pub(super) fn apply_window_extractions(
     mut plan: LogicalPlan,
     extractions: Vec<WindowExtraction>,
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<LogicalPlan, PlanError> {
     for ex in extractions {
@@ -139,20 +140,28 @@ pub(super) fn apply_window_extractions(
             .last()
             .map_or(String::new(), |p| p.value.to_ascii_lowercase());
 
-        let func = resolve_window_func(&func_name, &ex.args, plan.schema(), catalog, scope)?;
+        let func = resolve_window_func(
+            &func_name,
+            &ex.args,
+            plan.schema(),
+            catalog,
+            cte_catalog,
+            scope,
+        )?;
 
         let partition_by: Vec<ScalarExpr> = ex
             .spec
             .partition_by
             .iter()
-            .map(|e| bind_expr(e, plan.schema(), catalog, scope))
+            .map(|e| bind_expr_with_ctes(e, plan.schema(), catalog, cte_catalog, scope))
             .collect::<Result<_, _>>()?;
         let order_by: Vec<SortKey> = ex
             .spec
             .order_by
             .iter()
             .map(|item| -> Result<SortKey, PlanError> {
-                let bound = bind_expr(&item.expr, plan.schema(), catalog, scope)?;
+                let bound =
+                    bind_expr_with_ctes(&item.expr, plan.schema(), catalog, cte_catalog, scope)?;
                 Ok(SortKey {
                     expr: bound,
                     asc: matches!(item.direction, SortDirection::Asc),
@@ -185,6 +194,7 @@ fn resolve_window_func(
     args: &[Expr],
     input_schema: &Schema,
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<LogicalWindowFunc, PlanError> {
     match func_name {
@@ -219,14 +229,23 @@ fn resolve_window_func(
                     args.len()
                 )));
             }
-            let expr = bind_expr(&args[0], input_schema, catalog, scope)?;
+            let expr = bind_expr_with_ctes(&args[0], input_schema, catalog, cte_catalog, scope)?;
             let offset = if args.len() >= 2 {
-                bind_usize_literal(&args[1], func_name, 1, input_schema, catalog, scope)?
+                bind_usize_literal(
+                    &args[1],
+                    func_name,
+                    1,
+                    input_schema,
+                    catalog,
+                    cte_catalog,
+                    scope,
+                )?
             } else {
                 1
             };
             let default = if args.len() == 3 {
-                let bound = bind_expr(&args[2], input_schema, catalog, scope)?;
+                let bound =
+                    bind_expr_with_ctes(&args[2], input_schema, catalog, cte_catalog, scope)?;
                 extract_literal_value(&bound).ok_or_else(|| {
                     PlanError::TypeMismatch(format!(
                         "{func_name}: default argument must be a literal"
@@ -256,10 +275,11 @@ fn resolve_window_func(
                     args.len()
                 )));
             }
-            Ok(LogicalWindowFunc::FirstValue(bind_expr(
+            Ok(LogicalWindowFunc::FirstValue(bind_expr_with_ctes(
                 &args[0],
                 input_schema,
                 catalog,
+                cte_catalog,
                 scope,
             )?))
         }
@@ -270,10 +290,11 @@ fn resolve_window_func(
                     args.len()
                 )));
             }
-            Ok(LogicalWindowFunc::LastValue(bind_expr(
+            Ok(LogicalWindowFunc::LastValue(bind_expr_with_ctes(
                 &args[0],
                 input_schema,
                 catalog,
+                cte_catalog,
                 scope,
             )?))
         }
@@ -284,8 +305,16 @@ fn resolve_window_func(
                     args.len()
                 )));
             }
-            let expr = bind_expr(&args[0], input_schema, catalog, scope)?;
-            let n = bind_usize_literal(&args[1], "nth_value", 1, input_schema, catalog, scope)?;
+            let expr = bind_expr_with_ctes(&args[0], input_schema, catalog, cte_catalog, scope)?;
+            let n = bind_usize_literal(
+                &args[1],
+                "nth_value",
+                1,
+                input_schema,
+                catalog,
+                cte_catalog,
+                scope,
+            )?;
             if n == 0 {
                 return Err(PlanError::TypeMismatch(
                     "nth_value: n must be ≥ 1".to_string(),
@@ -300,7 +329,15 @@ fn resolve_window_func(
                     args.len()
                 )));
             }
-            let n = bind_usize_literal(&args[0], "ntile", 0, input_schema, catalog, scope)?;
+            let n = bind_usize_literal(
+                &args[0],
+                "ntile",
+                0,
+                input_schema,
+                catalog,
+                cte_catalog,
+                scope,
+            )?;
             if n == 0 {
                 return Err(PlanError::TypeMismatch(
                     "ntile: bucket count must be ≥ 1".to_string(),
@@ -350,13 +387,16 @@ fn bind_usize_literal(
     arg_index: usize,
     schema: &Schema,
     catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<usize, PlanError> {
-    match bind_expr(expr, schema, catalog, scope)? {
+    match bind_expr_with_ctes(expr, schema, catalog, cte_catalog, scope)? {
         ScalarExpr::Literal {
             value: Value::Int32(v),
             ..
-        } if v >= 0 => Ok(usize::try_from(v).expect("non-negative i32 fits in usize on all supported targets")),
+        } if v >= 0 => Ok(
+            usize::try_from(v).expect("non-negative i32 fits in usize on all supported targets")
+        ),
         ScalarExpr::Literal {
             value: Value::Int64(v),
             ..

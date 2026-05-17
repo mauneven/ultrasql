@@ -7,6 +7,8 @@
 //! The Postgres execution path is gated behind the `pg-runner` Cargo feature.
 //! Without the feature, [`run_postgres`] returns an error.
 
+use std::borrow::Cow;
+
 use anyhow::Result;
 #[cfg(not(feature = "sql-bench"))]
 use anyhow::bail;
@@ -29,6 +31,44 @@ pub struct RunResult {
     pub timings: Vec<(String, QueryTimings)>,
 }
 
+fn selected_queries() -> Result<Vec<u8>> {
+    match std::env::var("ULTRASQL_TPCH_QUERY") {
+        Ok(raw) => {
+            let query = raw.parse::<u8>().map_err(|_| {
+                anyhow::anyhow!(
+                    "ULTRASQL_TPCH_QUERY must be an integer between 1 and 22, got `{raw}`"
+                )
+            })?;
+            if !(1..=22).contains(&query) {
+                anyhow::bail!("ULTRASQL_TPCH_QUERY must be between 1 and 22, got `{query}`");
+            }
+            Ok(vec![query])
+        }
+        Err(std::env::VarError::NotPresent) => Ok((1_u8..=22).collect()),
+        Err(error) => Err(anyhow::anyhow!("read ULTRASQL_TPCH_QUERY: {error}")),
+    }
+}
+
+fn query_sql(n: u8) -> Result<Cow<'static, str>> {
+    match std::env::var("ULTRASQL_TPCH_SQL_FILE") {
+        Ok(path) => Ok(Cow::Owned(std::fs::read_to_string(&path).map_err(
+            |error| anyhow::anyhow!("read ULTRASQL_TPCH_SQL_FILE `{path}`: {error}"),
+        )?)),
+        Err(std::env::VarError::NotPresent) => Ok(Cow::Borrowed(
+            queries::query(n).expect("queries 1..=22 always present"),
+        )),
+        Err(error) => Err(anyhow::anyhow!("read ULTRASQL_TPCH_SQL_FILE: {error}")),
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn progress_enabled() -> bool {
+    matches!(
+        std::env::var("ULTRASQL_TPCH_PROGRESS").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
 /// Runs all 22 TPC-H queries against PostgreSQL.
 ///
 /// - `warmup` iterations are discarded.
@@ -44,15 +84,15 @@ pub fn run_postgres(
 ) -> Result<RunResult> {
     let mut timings: Vec<(String, QueryTimings)> = Vec::new();
 
-    for n in 1u8..=22 {
-        let sql = queries::query(n).expect("queries 1-22 always present");
+    for n in selected_queries()? {
+        let sql = query_sql(n)?;
         let label = format!("q{n}");
 
         // Warmup passes (discarded).
         for _ in 0..warmup {
             runtime.block_on(async {
                 client
-                    .simple_query(sql)
+                    .simple_query(sql.as_ref())
                     .await
                     .with_context(|| format!("warmup {label}"))
             })?;
@@ -64,7 +104,7 @@ pub fn run_postgres(
             let t0 = Instant::now();
             runtime.block_on(async {
                 client
-                    .simple_query(sql)
+                    .simple_query(sql.as_ref())
                     .await
                     .with_context(|| format!("run {label}"))
             })?;
@@ -94,17 +134,13 @@ pub fn run_postgres(_warmup: usize, _runs: usize) -> Result<RunResult> {
 /// Runs all 22 TPC-H queries against an in-process UltraSQL server.
 ///
 /// Spawns a fresh `ultrasqld` on an ephemeral port, runs the eight TPC-H
-/// `CREATE TABLE` statements, then runs each query for `warmup + runs`
-/// iterations and records the measured timings. Queries that fail on the
+/// `CREATE TABLE` statements, loads the `.tbl` data from `data_dir`, then
+/// runs each query for `warmup + runs` iterations and records the measured
+/// timings. Queries that fail on the
 /// current SQL surface are recorded with `f64::NAN` medians so the caller
 /// can see exactly which TPC-H shape is unsupported.
-///
-/// The data side (loading `.tbl` files into UltraSQL) is owned by
-/// [`crate::tpch::load`] — this function does not insert rows. Run after
-/// loading data into the same in-process server is a follow-up wiring item
-/// once the loader's UltraSQL path lands.
 #[cfg(feature = "sql-bench")]
-pub fn run_ultrasql(warmup: usize, runs: usize) -> Result<RunResult> {
+pub fn run_ultrasql(data_dir: &std::path::Path, warmup: usize, runs: usize) -> Result<RunResult> {
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Instant;
@@ -114,7 +150,7 @@ pub fn run_ultrasql(warmup: usize, runs: usize) -> Result<RunResult> {
     use ultrasql_server::{Server, bind_listener, serve_listener};
 
     use crate::tpch::baseline::{median, p95};
-    use crate::tpch::{queries, schema};
+    use crate::tpch::{load, schema};
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -123,20 +159,18 @@ pub fn run_ultrasql(warmup: usize, runs: usize) -> Result<RunResult> {
         .context("build tokio runtime")?;
 
     let (timings, errors) = runtime.block_on(async move {
-        let bind_addr: SocketAddr = "127.0.0.1:0"
-            .parse()
-            .context("parse 127.0.0.1:0")?;
-        let (listener, bound) =
-            bind_listener(bind_addr).await.context("bind ultrasqld")?;
-        let state = Arc::new(Server::with_sample_database());
+        let bind_addr: SocketAddr = "127.0.0.1:0".parse().context("parse 127.0.0.1:0")?;
+        let (listener, bound) = bind_listener(bind_addr).await.context("bind ultrasqld")?;
+        let state = Arc::new(Server::with_sample_database_pool_frames(
+            load::ultrasql_tpch_pool_frames(),
+        ));
         let server_task = tokio::spawn(async move {
             if let Err(e) = serve_listener(listener, state).await {
                 eprintln!("ultrasqld task exited: {e}");
             }
         });
 
-        let conn_str =
-            format!("host=127.0.0.1 port={} user=ultrasql_bench", bound.port());
+        let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", bound.port());
         let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
             .await
             .context("tokio-postgres connect to ultrasqld")?;
@@ -159,13 +193,25 @@ pub fn run_ultrasql(warmup: usize, runs: usize) -> Result<RunResult> {
                 ));
             }
         }
+        if schema_errors.is_empty() {
+            load::load_ultrasql_into_client(&client, data_dir)
+                .await
+                .context("load TPC-H data into UltraSQL")?;
+            if progress_enabled() {
+                eprintln!("ultrasql tpch: load complete");
+            }
+        }
 
         let mut timings: Vec<(String, QueryTimings)> = Vec::new();
-        for n in 1_u8..=22 {
-            let sql = queries::query(n).expect("queries 1..=22 always present");
+        for n in selected_queries()? {
+            let sql = query_sql(n)?;
             let label = format!("q{n}");
             let mut measured: Vec<f64> = Vec::with_capacity(runs);
             let mut first_error: Option<String> = None;
+
+            if progress_enabled() {
+                eprintln!("ultrasql tpch: starting {label}");
+            }
 
             let fmt_err = |e: &tokio_postgres::Error| -> String {
                 e.as_db_error()
@@ -174,7 +220,7 @@ pub fn run_ultrasql(warmup: usize, runs: usize) -> Result<RunResult> {
             };
 
             for _ in 0..warmup {
-                if let Err(e) = client.batch_execute(sql).await {
+                if let Err(e) = client.batch_execute(sql.as_ref()).await {
                     first_error.get_or_insert(format!("warmup: {}", fmt_err(&e)));
                     break;
                 }
@@ -182,7 +228,7 @@ pub fn run_ultrasql(warmup: usize, runs: usize) -> Result<RunResult> {
             if first_error.is_none() {
                 for _ in 0..runs {
                     let t0 = Instant::now();
-                    if let Err(e) = client.batch_execute(sql).await {
+                    if let Err(e) = client.batch_execute(sql.as_ref()).await {
                         first_error.get_or_insert(format!("run: {}", fmt_err(&e)));
                         break;
                     }
@@ -197,6 +243,8 @@ pub fn run_ultrasql(warmup: usize, runs: usize) -> Result<RunResult> {
             };
             if let Some(msg) = first_error {
                 eprintln!("ultrasql {label}: {msg}");
+            } else if progress_enabled() {
+                eprintln!("ultrasql tpch: finished {label}");
             }
             timings.push((
                 label,
@@ -231,7 +279,11 @@ pub fn run_ultrasql(warmup: usize, runs: usize) -> Result<RunResult> {
 
 /// Stub: returns an error when the `sql-bench` feature is not active.
 #[cfg(not(feature = "sql-bench"))]
-pub fn run_ultrasql(_warmup: usize, _runs: usize) -> Result<RunResult> {
+pub fn run_ultrasql(
+    _data_dir: &std::path::Path,
+    _warmup: usize,
+    _runs: usize,
+) -> Result<RunResult> {
     bail!(
         "NotYetWired: rebuild ultrasql-bench with --features sql-bench to \
          enable the in-process TPC-H runner"

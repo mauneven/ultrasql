@@ -85,6 +85,10 @@ impl Operator for CteScan {
     fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    fn estimated_row_count(&self) -> Option<usize> {
+        Some(self.batches.iter().map(Batch::rows).sum())
+    }
 }
 
 #[cfg(test)]
@@ -135,5 +139,12 @@ mod tests {
             .expect("no error")
             .expect("replayed batch");
         assert_eq!(b.rows(), 2);
+    }
+
+    #[test]
+    fn cte_scan_reports_materialized_row_count_hint() {
+        let batches = Arc::new(vec![i32_batch(&[1, 2]), i32_batch(&[3, 4, 5])]);
+        let scan = CteScan::new(batches, schema_i32());
+        assert_eq!(scan.estimated_row_count(), Some(5));
     }
 }
