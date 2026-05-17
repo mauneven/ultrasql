@@ -18,7 +18,7 @@
 
 use std::collections::HashSet;
 
-use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalPlan, ScalarExpr};
+use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr};
 
 use crate::error::OptimizeError;
 use crate::rules::RewriteRule;
@@ -128,6 +128,24 @@ fn push_down(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
                 unreachable!()
             };
 
+            if !matches!(join_type, LogicalJoinType::Inner | LogicalJoinType::Cross) {
+                let new_left = push_down(left)?;
+                let new_right = push_down(right)?;
+                if new_left.is_none() && new_right.is_none() {
+                    return Ok(None);
+                }
+                return Ok(Some(LogicalPlan::Filter {
+                    input: Box::new(LogicalPlan::Join {
+                        left: Box::new(new_left.unwrap_or_else(|| *left.clone())),
+                        right: Box::new(new_right.unwrap_or_else(|| *right.clone())),
+                        join_type: *join_type,
+                        condition: condition.clone(),
+                        schema: schema.clone(),
+                    }),
+                    predicate: predicate.clone(),
+                }));
+            }
+
             let left_width = left.schema().len();
 
             // Split the predicate into top-level AND conjuncts.
@@ -136,8 +154,13 @@ fn push_down(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
             let mut left_preds: Vec<ScalarExpr> = Vec::new();
             let mut right_preds: Vec<ScalarExpr> = Vec::new();
             let mut join_preds: Vec<ScalarExpr> = Vec::new();
+            let mut residual_preds: Vec<ScalarExpr> = Vec::new();
 
             for c in conjuncts {
+                if contains_subquery(&c) {
+                    residual_preds.push(c);
+                    continue;
+                }
                 let refs = referenced_columns(&c);
                 let touches_left = refs.iter().any(|&i| i < left_width);
                 let touches_right = refs.iter().any(|&i| i >= left_width);
@@ -149,15 +172,12 @@ fn push_down(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
                         let remapped = remap_right_indices(&c, left_width);
                         right_preds.push(remapped);
                     }
-                    _ => join_preds.push(c),
+                    (true, true) if is_equi_join_predicate(&c, left_width) => join_preds.push(c),
+                    _ => residual_preds.push(c),
                 }
             }
 
-            let made_progress =
-                !left_preds.is_empty() || !right_preds.is_empty() || !join_preds.is_empty();
-            // If everything ended up in join_preds with no pushdown, recurse
-            // into children only.
-            if !left_preds.is_empty() || !right_preds.is_empty() {
+            if !left_preds.is_empty() || !right_preds.is_empty() || !join_preds.is_empty() {
                 let new_left = if left_preds.is_empty() {
                     *left.clone()
                 } else {
@@ -177,6 +197,7 @@ fn push_down(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
                 };
 
                 // Merge join_preds into the existing join condition.
+                let has_join_predicate = !join_preds.is_empty();
                 let new_condition = if join_preds.is_empty() {
                     condition.clone()
                 } else {
@@ -195,18 +216,23 @@ fn push_down(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
                         }
                     }
                 };
+                let new_join_type = if *join_type == LogicalJoinType::Cross && has_join_predicate {
+                    LogicalJoinType::Inner
+                } else {
+                    *join_type
+                };
 
-                return Ok(Some(LogicalPlan::Join {
+                let new_join = LogicalPlan::Join {
                     left: Box::new(new_left),
                     right: Box::new(new_right),
-                    join_type: *join_type,
+                    join_type: new_join_type,
                     condition: new_condition,
                     schema: schema.clone(),
-                }));
+                };
+                return Ok(Some(filter_with_residuals(new_join, residual_preds)));
             }
 
             // Nothing pushed — recurse into the join children.
-            let _ = made_progress; // used only for the branch above
             let new_left = push_down(left)?;
             let new_right = push_down(right)?;
             if new_left.is_none() && new_right.is_none() {
@@ -340,6 +366,52 @@ fn collect_cols(expr: &ScalarExpr, out: &mut HashSet<usize>) {
         | ScalarExpr::ScalarSubquery { .. }
         | ScalarExpr::Exists { .. }
         | ScalarExpr::InSubquery { .. } => {}
+    }
+}
+
+fn contains_subquery(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => true,
+        ScalarExpr::Binary { left, right, .. } => {
+            contains_subquery(left) || contains_subquery(right)
+        }
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => contains_subquery(expr),
+        ScalarExpr::FunctionCall { args, .. } => args.iter().any(contains_subquery),
+        ScalarExpr::Column { .. }
+        | ScalarExpr::Literal { .. }
+        | ScalarExpr::Parameter { .. }
+        | ScalarExpr::OuterColumn { .. } => false,
+    }
+}
+
+fn is_equi_join_predicate(expr: &ScalarExpr, left_width: usize) -> bool {
+    let ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = expr
+    else {
+        return false;
+    };
+    let (ScalarExpr::Column { index: li, .. }, ScalarExpr::Column { index: ri, .. }) =
+        (left.as_ref(), right.as_ref())
+    else {
+        return false;
+    };
+    (*li < left_width && *ri >= left_width) || (*li >= left_width && *ri < left_width)
+}
+
+fn filter_with_residuals(input: LogicalPlan, residuals: Vec<ScalarExpr>) -> LogicalPlan {
+    if residuals.is_empty() {
+        input
+    } else {
+        LogicalPlan::Filter {
+            input: Box::new(input),
+            predicate: conjuncts_to_and(residuals),
+        }
     }
 }
 
@@ -635,6 +707,100 @@ mod tests {
         assert!(
             matches!(result.unwrap(), LogicalPlan::Join { .. }),
             "result should be Join with filter pushed in"
+        );
+    }
+
+    #[test]
+    fn normalizes_cross_join_filter_to_inner_join_condition() {
+        let u_scan = LogicalPlan::Scan {
+            table: "users".into(),
+            schema: users_schema(),
+            projection: None,
+        };
+        let o_scan = LogicalPlan::Scan {
+            table: "orders".into(),
+            schema: orders_schema(),
+            projection: None,
+        };
+        let join_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("name", DataType::Text { max_len: None }),
+            Field::required("order_id", DataType::Int32),
+            Field::required("user_id", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let join = LogicalPlan::Join {
+            left: Box::new(u_scan),
+            right: Box::new(o_scan),
+            join_type: LogicalJoinType::Cross,
+            condition: LogicalJoinCondition::None,
+            schema: join_schema,
+        };
+        let filter = LogicalPlan::Filter {
+            input: Box::new(join),
+            predicate: eq(col("id", 0), col("user_id", 3)),
+        };
+
+        let result = PredicatePushdown
+            .apply(&filter)
+            .expect("no error")
+            .expect("rewrite");
+        let LogicalPlan::Join {
+            join_type,
+            condition,
+            ..
+        } = result
+        else {
+            panic!("expected Join, got {result:?}");
+        };
+        assert_eq!(join_type, LogicalJoinType::Inner);
+        assert!(
+            matches!(condition, LogicalJoinCondition::On(_)),
+            "cross join filter must become ON predicate"
+        );
+    }
+
+    #[test]
+    fn keeps_non_equi_two_sided_predicate_as_residual_filter() {
+        let u_scan = LogicalPlan::Scan {
+            table: "users".into(),
+            schema: users_schema(),
+            projection: None,
+        };
+        let o_scan = LogicalPlan::Scan {
+            table: "orders".into(),
+            schema: orders_schema(),
+            projection: None,
+        };
+        let join_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("name", DataType::Text { max_len: None }),
+            Field::required("order_id", DataType::Int32),
+            Field::required("user_id", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let join = LogicalPlan::Join {
+            left: Box::new(u_scan),
+            right: Box::new(o_scan),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::On(eq(col("id", 0), col("user_id", 3))),
+            schema: join_schema,
+        };
+        let two_sided_or = ScalarExpr::Binary {
+            op: BinaryOp::Or,
+            left: Box::new(eq(col("id", 0), lit_i32(1))),
+            right: Box::new(eq(col("order_id", 2), lit_i32(10))),
+            data_type: DataType::Bool,
+        };
+        let filter = LogicalPlan::Filter {
+            input: Box::new(join),
+            predicate: two_sided_or,
+        };
+
+        let result = PredicatePushdown.apply(&filter).expect("no error");
+        assert!(
+            result.is_none(),
+            "non-equi two-sided filters should stay above hashable join"
         );
     }
 

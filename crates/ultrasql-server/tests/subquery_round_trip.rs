@@ -1,0 +1,159 @@
+//! End-to-end subquery decorrelation checks.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio_postgres::NoTls;
+use ultrasql_server::{Server, bind_listener, serve_listener};
+
+async fn start_server_and_connect() -> (
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+) {
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
+    let (listener, bound) = bind_listener(addr).await.expect("bind");
+    let server = Arc::new(Server::with_sample_database());
+    let server_handle = tokio::spawn(serve_listener(listener, server));
+
+    let conn_str = format!(
+        "host={host} port={port} user=tester application_name=subquery_test",
+        host = bound.ip(),
+        port = bound.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("tokio-postgres connect");
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+    (client, conn_handle, server_handle)
+}
+
+async fn shutdown(
+    client: tokio_postgres::Client,
+    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+) {
+    drop(client);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    server_handle.abort();
+}
+
+#[tokio::test]
+async fn correlated_exists_returns_each_outer_row_once() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE sq_orders (o_orderkey INT NOT NULL)")
+        .await
+        .expect("create orders");
+    client
+        .batch_execute(
+            "CREATE TABLE sq_lineitem (
+                 l_orderkey INT NOT NULL,
+                 l_commit INT NOT NULL,
+                 l_receipt INT NOT NULL
+             )",
+        )
+        .await
+        .expect("create lineitem");
+    client
+        .batch_execute("INSERT INTO sq_orders VALUES (1), (2), (3)")
+        .await
+        .expect("insert orders");
+    client
+        .batch_execute(
+            "INSERT INTO sq_lineitem VALUES
+                 (1, 1, 2),
+                 (1, 1, 3),
+                 (2, 3, 2)",
+        )
+        .await
+        .expect("insert lineitems");
+
+    let rows = client
+        .simple_query(
+            "SELECT o_orderkey
+             FROM sq_orders
+             WHERE EXISTS (
+                 SELECT *
+                 FROM sq_lineitem
+                 WHERE l_orderkey = o_orderkey
+                   AND l_commit < l_receipt
+             )
+             ORDER BY o_orderkey",
+        )
+        .await
+        .expect("query succeeds");
+    let keys: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, vec![1]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn uncorrelated_in_and_scalar_subqueries_lower_before_execution() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE sq_supplier (s_suppkey INT NOT NULL)")
+        .await
+        .expect("create supplier");
+    client
+        .batch_execute("CREATE TABLE sq_blocked (b_suppkey INT NOT NULL)")
+        .await
+        .expect("create blocked");
+    client
+        .batch_execute("INSERT INTO sq_supplier VALUES (1), (2), (3)")
+        .await
+        .expect("insert suppliers");
+    client
+        .batch_execute("INSERT INTO sq_blocked VALUES (2)")
+        .await
+        .expect("insert blocked");
+
+    let rows = client
+        .simple_query(
+            "SELECT s_suppkey
+             FROM sq_supplier
+             WHERE s_suppkey NOT IN (SELECT b_suppkey FROM sq_blocked)
+             ORDER BY s_suppkey",
+        )
+        .await
+        .expect("NOT IN query succeeds");
+    let not_in_keys: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(not_in_keys, vec![1, 3]);
+
+    let rows = client
+        .simple_query(
+            "SELECT s_suppkey
+             FROM sq_supplier
+             WHERE s_suppkey > (SELECT b_suppkey FROM sq_blocked)
+             ORDER BY s_suppkey",
+        )
+        .await
+        .expect("scalar subquery succeeds");
+    let scalar_keys: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(scalar_keys, vec![3]);
+
+    shutdown(client, server_handle).await;
+}

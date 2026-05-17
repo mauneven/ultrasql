@@ -78,7 +78,6 @@ pub fn read_tbl(path: &Path) -> Result<Vec<Vec<String>>> {
     Ok(rows)
 }
 
-#[cfg(any(feature = "pg-runner", feature = "sql-bench", test))]
 fn parse_tbl_line(line: &str) -> Option<Vec<String>> {
     let line = line.trim_end_matches('|');
     if line.is_empty() {

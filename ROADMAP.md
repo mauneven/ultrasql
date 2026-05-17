@@ -890,10 +890,12 @@ Result: `validated 22 TPC-H query result set(s) against DuckDB`.
 Correctness boundary: this validates UltraSQL against DuckDB for the
 current harness SQL in
 [`crates/ultrasql-bench/src/tpch/queries.rs`](crates/ultrasql-bench/src/tpch/queries.rs).
-The harness still contains equivalent SQL rewrites for unsupported or
-pathological source forms. These are acceptable for the v0.6 SF1
-correctness milestone, but they are not a substitute for the engine
-work tracked below.
+The harness still contains equivalent SQL rewrites for harder correlated
+subquery forms, but the earlier comma-join / simple subquery crutches
+have been reduced: Q4 now uses `EXISTS`, Q11 uses the scalar threshold
+subquery over comma joins, Q16 uses `NOT IN (SELECT ...)`, Q18 uses
+`IN (SELECT ... GROUP BY ... HAVING ...)`, and Q9 uses the native
+composite-key join predicate instead of a synthetic key.
 
 #### Done
 
@@ -938,15 +940,37 @@ work tracked below.
 - [x] `COUNT(DISTINCT expr)` in `HashAggregate` — distinct aggregate state
   tracks per-group seen values before updating the wrapped aggregate. This
   fixed Q16.
+- [x] Comma-join normalization — predicate pushdown now converts
+  hashable equality predicates from `FROM a, b WHERE a.k = b.k` into
+  inner join conditions while leaving complex residual filters above the
+  join so they do not disable hash-join selection. This restores
+  canonical comma-join forms in Q11, Q16, and Q18.
+- [x] Alias-aware projected `ORDER BY` — the binder falls back to sorting
+  over projected output columns when an `ORDER BY` item names a select-list
+  alias. This supports canonical `ORDER BY value` / `ORDER BY revenue`
+  shapes without pre-projection alias hacks.
+- [x] Native multi-column hash join keys — the server lowerer extracts
+  conjunctions of equality predicates into aligned key vectors and the
+  executor hashes composite `JoinKey` values. Q9 and Q20-style
+  `(partkey, suppkey)` joins no longer need synthetic arithmetic keys.
+- [x] Subquery decorrelation, first production slice — optimizer rewrites
+  equality-correlated `EXISTS`/`NOT EXISTS`, uncorrelated `IN`/`NOT IN`,
+  and uncorrelated scalar subqueries in predicates into join/filter
+  plans before execution. End-to-end coverage lives in
+  [`crates/ultrasql-server/tests/subquery_round_trip.rs`](crates/ultrasql-server/tests/subquery_round_trip.rs).
 
 #### Follow-up Engine Debt
 
-- [ ] Original TPC-H SQL forms: remove harness rewrites by landing
-  comma-join normalization, robust subquery decorrelation for EXISTS /
-  scalar / IN forms, and alias-aware ORDER BY-after-projection handling.
-- [ ] Multi-column hash joins: replace synthetic single-key workarounds
-  for composite join shapes (notably Q9-style `partkey, suppkey`) with a
-  native multi-column hash-key path in the join lowerer/executor.
+- [ ] Remaining original TPC-H SQL forms: replace the staged harness
+  rewrites for correlated scalar aggregate subqueries (notably Q2, Q17,
+  and Q20) and Q21's mixed `EXISTS` / `NOT EXISTS` predicates with
+  engine-side decorrelation. Current support intentionally handles only
+  equality-correlation and uncorrelated scalar / IN forms.
+- [ ] Physical semi/anti joins: current `IN` / `EXISTS` lowering uses
+  inner or left-outer join plus projection/filter. It is correct for the
+  validated TPC-H forms, but Q4/Q11/Q16/Q18 are slower than the staged
+  CTE versions and need native semi/anti operators plus cost-aware
+  build-side selection.
 - [ ] Performance certification: run the reproducible PostgreSQL 17
   comparison required by the standing benchmark gate before claiming the
   v0.6 `≥ 2× PostgreSQL 17` TPC-H performance target.

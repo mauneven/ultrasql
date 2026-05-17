@@ -673,20 +673,14 @@ fn bind_select_body(
         let proj_schema = Schema::new(proj_fields)
             .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
 
-        let sort_keys =
-            bind_order_by(&select.order_by, plan.schema(), catalog, cte_catalog, scope)?;
-        if !sort_keys.is_empty() {
-            plan = LogicalPlan::Sort {
-                input: Box::new(plan),
-                keys: sort_keys,
-            };
-        }
-
         plan = LogicalPlan::Project {
             input: Box::new(plan),
             exprs: projected,
             schema: proj_schema,
         };
+
+        plan =
+            bind_order_by_around_projection(plan, &select.order_by, catalog, cte_catalog, scope)?;
     } else {
         let projected = bind_projection_with_scope(
             &select.projection,
@@ -703,21 +697,27 @@ fn bind_select_body(
         let proj_schema = Schema::new(proj_fields)
             .map_err(|e| PlanError::TypeMismatch(format!("projection: {e}")))?;
 
-        let order_schema = schema_for_qualified_binding(plan.schema(), &from_scope)?;
-        let sort_keys =
-            bind_order_by(&select.order_by, &order_schema, catalog, cte_catalog, scope)?;
-        if !sort_keys.is_empty() {
-            plan = LogicalPlan::Sort {
-                input: Box::new(plan),
-                keys: sort_keys,
-            };
-        }
-
         plan = LogicalPlan::Project {
             input: Box::new(plan),
             exprs: projected,
             schema: proj_schema,
         };
+
+        let order_input_schema = schema_for_qualified_binding(
+            match &plan {
+                LogicalPlan::Project { input, .. } => input.schema(),
+                _ => plan.schema(),
+            },
+            &from_scope,
+        )?;
+        plan = bind_order_by_around_projection_with_input_schema(
+            plan,
+            &select.order_by,
+            &order_input_schema,
+            catalog,
+            cte_catalog,
+            scope,
+        )?;
     }
 
     if is_distinct {
@@ -763,4 +763,81 @@ fn bind_select_body(
     }
 
     Ok(plan)
+}
+
+fn bind_order_by_around_projection(
+    plan: LogicalPlan,
+    order_by: &[ultrasql_parser::ast::OrderItem],
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
+    let input_schema = match &plan {
+        LogicalPlan::Project { input, .. } => input.schema().clone(),
+        _ => plan.schema().clone(),
+    };
+    bind_order_by_around_projection_with_input_schema(
+        plan,
+        order_by,
+        &input_schema,
+        catalog,
+        cte_catalog,
+        scope,
+    )
+}
+
+fn bind_order_by_around_projection_with_input_schema(
+    plan: LogicalPlan,
+    order_by: &[ultrasql_parser::ast::OrderItem],
+    input_schema: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<LogicalPlan, PlanError> {
+    if order_by.is_empty() {
+        return Ok(plan);
+    }
+    let LogicalPlan::Project {
+        input,
+        exprs,
+        schema,
+    } = plan
+    else {
+        let sort_keys = bind_order_by(order_by, input_schema, catalog, cte_catalog, scope)?;
+        return Ok(LogicalPlan::Sort {
+            input: Box::new(plan),
+            keys: sort_keys,
+        });
+    };
+
+    match bind_order_by(order_by, input_schema, catalog, cte_catalog, scope) {
+        Ok(sort_keys) => {
+            let sorted_input = if sort_keys.is_empty() {
+                input
+            } else {
+                Box::new(LogicalPlan::Sort {
+                    input,
+                    keys: sort_keys,
+                })
+            };
+            Ok(LogicalPlan::Project {
+                input: sorted_input,
+                exprs,
+                schema,
+            })
+        }
+        Err(PlanError::ColumnNotFound(_) | PlanError::Ambiguous(_)) => {
+            let projected = LogicalPlan::Project {
+                input,
+                exprs,
+                schema: schema.clone(),
+            };
+            let sort_keys = bind_order_by(order_by, &schema, catalog, cte_catalog, scope)?;
+            Ok(LogicalPlan::Sort {
+                input: Box::new(projected),
+                keys: sort_keys,
+            })
+        }
+        Err(error) => Err(error),
+    }
 }

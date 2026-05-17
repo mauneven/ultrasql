@@ -581,6 +581,27 @@ fn qualified_join_predicate_resolves_duplicate_right_column() {
 }
 
 #[test]
+fn order_by_can_reference_projection_alias() {
+    let cat = users_catalog();
+    let plan =
+        parse_and_bind("SELECT id AS ident FROM users ORDER BY ident DESC", &cat).expect("bind ok");
+
+    let LogicalPlan::Sort { input, keys } = &plan else {
+        panic!("expected top Sort over projected alias, got {plan:?}");
+    };
+    assert_eq!(keys.len(), 1);
+    assert!(!keys[0].asc);
+    assert!(matches!(
+        &keys[0].expr,
+        ScalarExpr::Column { index: 0, name, .. } if name == "ident"
+    ));
+    assert!(
+        matches!(input.as_ref(), LogicalPlan::Project { .. }),
+        "alias ORDER BY should sort projected rows"
+    );
+}
+
+#[test]
 fn qualified_where_predicate_resolves_duplicate_right_column() {
     let cat = duplicate_id_catalog();
     let plan = parse_and_bind("SELECT b.id FROM a, b WHERE a.id = b.id", &cat).expect("bind ok");

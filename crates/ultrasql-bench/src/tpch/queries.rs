@@ -140,24 +140,23 @@ LIMIT 10;
 
 /// TPC-H Q4 — Order Priority Checking. DATE = '1993-07-01'.
 pub const Q4: &str = "
-WITH late_orders AS (
-    SELECT DISTINCT
-        l_orderkey
-    FROM
-        lineitem
-    WHERE
-        l_commitdate < l_receiptdate
-)
 SELECT
     o_orderpriority,
     COUNT(*) AS order_count
 FROM
     orders
-    INNER JOIN late_orders
-        ON o_orderkey = late_orders.l_orderkey
 WHERE
     o_orderdate >= DATE '1993-07-01'
     AND o_orderdate < DATE '1993-07-01' + INTERVAL '3' MONTH
+    AND EXISTS (
+        SELECT
+            *
+        FROM
+            lineitem
+        WHERE
+            l_orderkey = o_orderkey
+            AND l_commitdate < l_receiptdate
+    )
 GROUP BY
     o_orderpriority
 ORDER BY
@@ -458,37 +457,32 @@ LIMIT 20;
 
 /// TPC-H Q11 — Important Stock Identification. NATION = 'GERMANY', FRACTION = 0.0001.
 pub const Q11: &str = "
-WITH german_partsupp AS (
-    SELECT
-        ps_partkey AS german_partkey,
-        ps_supplycost AS german_supplycost,
-        ps_availqty AS german_availqty
-    FROM
-        partsupp
-        INNER JOIN supplier
-            ON ps_suppkey = s_suppkey
-        INNER JOIN nation
-            ON s_nationkey = n_nationkey
-    WHERE
-        n_name = 'GERMANY'
-),
-germany_threshold AS (
-    SELECT
-        SUM(german_supplycost * german_availqty) * 0.0001 AS min_value
-    FROM
-        german_partsupp
-)
 SELECT
-    german_partkey AS ps_partkey,
-    SUM(german_supplycost * german_availqty) AS value
+    ps_partkey,
+    SUM(ps_supplycost * ps_availqty) AS value
 FROM
-    german_partsupp,
-    germany_threshold
+    partsupp,
+    supplier,
+    nation
+WHERE
+    ps_suppkey = s_suppkey
+    AND s_nationkey = n_nationkey
+    AND n_name = 'GERMANY'
 GROUP BY
-    german_partkey,
-    min_value
+    ps_partkey
 HAVING
-    SUM(german_supplycost * german_availqty) > min_value
+    SUM(ps_supplycost * ps_availqty) > (
+        SELECT
+            SUM(ps_supplycost * ps_availqty) * 0.0001
+        FROM
+            partsupp,
+            supplier,
+            nation
+        WHERE
+            ps_suppkey = s_suppkey
+            AND s_nationkey = n_nationkey
+            AND n_name = 'GERMANY'
+    )
 ORDER BY
     value DESC;
 ";
@@ -620,30 +614,28 @@ ORDER BY
 
 /// TPC-H Q16 — Parts/Supplier Relationship. BRAND = 'Brand#45', TYPE = 'MEDIUM POLISHED', SIZE list = 49,14,23,45,19,3,36,9.
 pub const Q16: &str = "
-WITH complaint_suppliers AS (
-    SELECT
-        s_suppkey AS complaint_suppkey
-    FROM
-        supplier
-    WHERE
-        s_comment LIKE '%Customer%Complaints%'
-)
 SELECT
     p_brand,
     p_type,
     p_size,
     COUNT(DISTINCT ps_suppkey) AS supplier_cnt
 FROM
+    partsupp,
     part
-    INNER JOIN partsupp
-        ON p_partkey = ps_partkey
-    LEFT OUTER JOIN complaint_suppliers
-        ON ps_suppkey = complaint_suppkey
 WHERE
+    p_partkey = ps_partkey
+    AND
     p_brand <> 'Brand#45'
     AND p_type NOT LIKE 'MEDIUM POLISHED%'
     AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)
-    AND complaint_suppkey IS NULL
+    AND ps_suppkey NOT IN (
+        SELECT
+            s_suppkey
+        FROM
+            supplier
+        WHERE
+            s_comment LIKE '%Customer%Complaints%'
+    )
 GROUP BY
     p_brand, p_type, p_size
 ORDER BY
@@ -692,29 +684,36 @@ FROM
 
 /// TPC-H Q18 — Large Volume Customer. QUANTITY = 300.
 pub const Q18: &str = "
-WITH large_orders AS (
-    SELECT
-        l_orderkey,
-        SUM(l_quantity) AS total_quantity
-    FROM
-        lineitem
-    GROUP BY
-        l_orderkey
-    HAVING SUM(l_quantity) > 300
-)
 SELECT
     c_name,
     c_custkey,
     o_orderkey,
     o_orderdate,
     o_totalprice,
-    total_quantity
+    SUM(l_quantity)
 FROM
-    large_orders
-    INNER JOIN orders
-        ON o_orderkey = large_orders.l_orderkey
-    INNER JOIN customer
-        ON c_custkey = o_custkey
+    customer,
+    orders,
+    lineitem
+WHERE
+    o_orderkey IN (
+        SELECT
+            l_orderkey
+        FROM
+            lineitem
+        GROUP BY
+            l_orderkey
+        HAVING
+            SUM(l_quantity) > 300
+    )
+    AND c_custkey = o_custkey
+    AND o_orderkey = l_orderkey
+GROUP BY
+    c_name,
+    c_custkey,
+    o_orderkey,
+    o_orderdate,
+    o_totalprice
 ORDER BY
     o_totalprice DESC,
     o_orderdate
