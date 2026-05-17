@@ -96,6 +96,29 @@ async fn correlated_exists_returns_each_outer_row_once() {
         .collect();
     assert_eq!(keys, vec![1]);
 
+    let rows = client
+        .simple_query(
+            "SELECT o_orderkey
+             FROM sq_orders
+             WHERE NOT EXISTS (
+                 SELECT *
+                 FROM sq_lineitem
+                 WHERE l_orderkey = o_orderkey
+                   AND l_commit < l_receipt
+             )
+             ORDER BY o_orderkey",
+        )
+        .await
+        .expect("NOT EXISTS query succeeds");
+    let keys: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, vec![2, 3]);
+
     shutdown(client, server_handle).await;
 }
 

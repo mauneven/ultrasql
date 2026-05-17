@@ -6,18 +6,17 @@
 //!
 //! ## Lowering convention
 //!
-//! Because `LogicalPlan` does not carry `Semi` or `Anti` join variants, this
-//! rule lowers supported subquery patterns to ordinary joins plus projection /
-//! filter nodes:
+//! This rule lowers supported subquery patterns to logical `Semi` / `Anti`
+//! joins where possible:
 //!
 //! - equality-correlated `EXISTS(sub)` → distinct correlated keys from `sub`,
-//!   inner join against outer, then project outer columns.
-//! - equality-correlated `NOT EXISTS(sub)` → distinct correlated keys,
-//!   left-outer join, `rhs_key IS NULL`, then project outer columns.
+//!   logical `Semi` join against outer.
+//! - equality-correlated `NOT EXISTS(sub)` → distinct correlated keys from
+//!   `sub`, logical `Anti` join against outer.
 //! - uncorrelated `expr IN (SELECT col FROM sub)` → distinct subquery values,
-//!   inner join, then project outer columns.
+//!   logical `Semi` join.
 //! - uncorrelated `expr NOT IN (SELECT col FROM sub)` → distinct subquery
-//!   values, left-outer join, `rhs_col IS NULL`, then project outer columns.
+//!   values, logical `Anti` join.
 //! - uncorrelated scalar subquery in a predicate → cross join the scalar
 //!   subplan, replace the subquery expression with its joined column, filter,
 //!   then project outer columns.
@@ -53,7 +52,7 @@ use crate::error::OptimizeError;
 use crate::rules::RewriteRule;
 
 /// Subquery decorrelation: transforms correlated subqueries in `Filter`
-/// predicates into `LeftOuter` joins followed by `IS [NOT] NULL` filters.
+/// predicates into `Semi` / `Anti` joins.
 ///
 /// See the module-level documentation for the lowering convention and
 /// current limitations.
@@ -275,34 +274,18 @@ fn rewrite_exists_filter_expr(outer: &LogicalPlan, predicate: &ScalarExpr) -> Op
     }
     let right = distinct_correlation_keys(clean_subplan, &corr_pairs)?;
     let join_condition = build_correlation_condition(&corr_pairs, outer.schema().len());
-    let join_schema = concat_schemas(outer.schema(), right.schema());
     let join = LogicalPlan::Join {
         left: Box::new(outer.clone()),
         right: Box::new(right),
         join_type: if *negated {
-            LogicalJoinType::LeftOuter
+            LogicalJoinType::Anti
         } else {
-            LogicalJoinType::Inner
+            LogicalJoinType::Semi
         },
         condition: LogicalJoinCondition::On(join_condition),
-        schema: join_schema,
+        schema: outer.schema().clone(),
     };
-    let semi = if *negated {
-        LogicalPlan::Filter {
-            input: Box::new(join),
-            predicate: ScalarExpr::IsNull {
-                expr: Box::new(ScalarExpr::Column {
-                    name: "__corr_0".to_owned(),
-                    index: outer.schema().len(),
-                    data_type: corr_pairs[0].inner_type.clone(),
-                }),
-                negated: false,
-            },
-        }
-    } else {
-        join
-    };
-    Some(project_left(semi, outer.schema()))
+    Some(join)
 }
 
 fn rewrite_in_subquery_filter_expr(
@@ -351,30 +334,18 @@ fn rewrite_in_subquery_filter_expr(
         right: Box::new(right_col.clone()),
         data_type: DataType::Bool,
     };
-    let join_schema = concat_schemas(outer.schema(), right.schema());
     let join = LogicalPlan::Join {
         left: Box::new(outer.clone()),
         right: Box::new(right),
         join_type: if *negated {
-            LogicalJoinType::LeftOuter
+            LogicalJoinType::Anti
         } else {
-            LogicalJoinType::Inner
+            LogicalJoinType::Semi
         },
         condition: LogicalJoinCondition::On(join_condition),
-        schema: join_schema,
+        schema: outer.schema().clone(),
     };
-    let semi = if *negated {
-        LogicalPlan::Filter {
-            input: Box::new(join),
-            predicate: ScalarExpr::IsNull {
-                expr: Box::new(right_col),
-                negated: false,
-            },
-        }
-    } else {
-        join
-    };
-    Some(project_left(semi, outer.schema()))
+    Some(join)
 }
 
 fn strip_exists_projection(plan: LogicalPlan) -> LogicalPlan {
@@ -1080,7 +1051,7 @@ mod tests {
     }
 
     #[test]
-    fn real_correlated_exists_rewrites_to_inner_join_projecting_outer() {
+    fn real_correlated_exists_rewrites_to_semi_join() {
         let sub = LogicalPlan::Filter {
             input: Box::new(sub_scan()),
             predicate: ScalarExpr::Binary {
@@ -1103,25 +1074,60 @@ mod tests {
             .apply(&plan)
             .expect("no error")
             .expect("rewrite");
-        let LogicalPlan::Project { input, schema, .. } = &result else {
-            panic!("expected Project, got {result:?}");
-        };
-        assert_eq!(schema.len(), 2);
+        assert_eq!(result.schema().len(), 2);
         assert!(
             matches!(
-                input.as_ref(),
+                result,
                 LogicalPlan::Join {
-                    join_type: LogicalJoinType::Inner,
+                    join_type: LogicalJoinType::Semi,
                     condition: LogicalJoinCondition::On(_),
                     ..
                 }
             ),
-            "EXISTS should become inner semi-join shape, got {input:?}"
+            "EXISTS should become Semi join, got {result:?}"
         );
     }
 
     #[test]
-    fn real_uncorrelated_in_rewrites_to_inner_join_projecting_outer() {
+    fn real_correlated_not_exists_rewrites_to_anti_join() {
+        let sub = LogicalPlan::Filter {
+            input: Box::new(sub_scan()),
+            predicate: ScalarExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(col("key", 0, DataType::Int32)),
+                right: Box::new(outer_col("id", 0, DataType::Int32)),
+                data_type: DataType::Bool,
+            },
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(outer_scan()),
+            predicate: ScalarExpr::Exists {
+                subplan: Box::new(sub),
+                negated: true,
+                correlated: true,
+            },
+        };
+
+        let result = SubqueryDecorrelation
+            .apply(&plan)
+            .expect("no error")
+            .expect("rewrite");
+        assert_eq!(result.schema().len(), 2);
+        assert!(
+            matches!(
+                result,
+                LogicalPlan::Join {
+                    join_type: LogicalJoinType::Anti,
+                    condition: LogicalJoinCondition::On(_),
+                    ..
+                }
+            ),
+            "NOT EXISTS should become Anti join, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn real_uncorrelated_in_rewrites_to_semi_join() {
         let plan = LogicalPlan::Filter {
             input: Box::new(outer_scan()),
             predicate: ScalarExpr::InSubquery {
@@ -1137,14 +1143,38 @@ mod tests {
             .apply(&plan)
             .expect("no error")
             .expect("rewrite");
-        let LogicalPlan::Project { input, schema, .. } = &result else {
-            panic!("expected Project, got {result:?}");
-        };
-        assert_eq!(schema.len(), 2);
+        assert_eq!(result.schema().len(), 2);
         assert!(matches!(
-            input.as_ref(),
+            result,
             LogicalPlan::Join {
-                join_type: LogicalJoinType::Inner,
+                join_type: LogicalJoinType::Semi,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn real_uncorrelated_not_in_rewrites_to_anti_join() {
+        let plan = LogicalPlan::Filter {
+            input: Box::new(outer_scan()),
+            predicate: ScalarExpr::InSubquery {
+                expr: Box::new(col("id", 0, DataType::Int32)),
+                subplan: Box::new(sub_key_project()),
+                negated: true,
+                correlated: false,
+                data_type: DataType::Int32,
+            },
+        };
+
+        let result = SubqueryDecorrelation
+            .apply(&plan)
+            .expect("no error")
+            .expect("rewrite");
+        assert_eq!(result.schema().len(), 2);
+        assert!(matches!(
+            result,
+            LogicalPlan::Join {
+                join_type: LogicalJoinType::Anti,
                 ..
             }
         ));

@@ -18,8 +18,8 @@ use crate::expr::ScalarExpr;
 
 /// Logical join type.
 ///
-/// These match the SQL standard join modifiers: `INNER`, `LEFT OUTER`,
-/// `RIGHT OUTER`, `FULL OUTER`, and `CROSS`.
+/// These match the SQL standard join modifiers plus logical semi/anti joins
+/// introduced by subquery decorrelation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogicalJoinType {
     /// `[INNER] JOIN` — only rows with matches on both sides.
@@ -32,6 +32,10 @@ pub enum LogicalJoinType {
     FullOuter,
     /// `CROSS JOIN` or comma-separated table factor — Cartesian product.
     Cross,
+    /// Semi join — emit each left row that has at least one right match.
+    Semi,
+    /// Anti join — emit each left row that has no right match.
+    Anti,
 }
 
 /// Resolved join condition.
@@ -452,7 +456,8 @@ pub enum LogicalPlan {
     ///
     /// The `schema` is the concatenation of the left and right schemas
     /// under the appropriate outer-join nullability rules, except for
-    /// `USING` joins where the joined column appears only once.
+    /// `USING` joins where the joined column appears only once. Logical
+    /// `Semi` and `Anti` joins expose only the left schema.
     Join {
         /// Left input plan.
         left: Box<Self>,
@@ -1281,6 +1286,8 @@ impl LogicalPlan {
                     LogicalJoinType::RightOuter => "RightOuter",
                     LogicalJoinType::FullOuter => "FullOuter",
                     LogicalJoinType::Cross => "Cross",
+                    LogicalJoinType::Semi => "Semi",
+                    LogicalJoinType::Anti => "Anti",
                 };
                 out.push_str("Join[");
                 out.push_str(jt);

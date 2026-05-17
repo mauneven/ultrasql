@@ -1,6 +1,6 @@
 //! Hash equi-join operator.
 //!
-//! Implements Inner and Left Outer equi-joins using a classical build+probe
+//! Implements Inner, Left Outer, Semi, and Anti equi-joins using a classical build+probe
 //! hash table. The left (build) side is drained first and hashed by the
 //! build key expression; the right (probe) side is then streamed, and each
 //! right row's probe key is looked up in the hash table.
@@ -11,6 +11,8 @@
 //! |-------------|--------|
 //! | `Inner`     | Supported. |
 //! | `LeftOuter` | Supported: unmatched left rows are emitted with NULL right columns at the end of the probe phase. |
+//! | `Semi`     | Supported: matched left rows are emitted once, right columns suppressed. |
+//! | `Anti`     | Supported: unmatched left rows are emitted, right columns suppressed. |
 //! | `RightOuter`, `FullOuter`, `Cross` | Return [`ExecError::Unsupported`] — pending wave 6. |
 //!
 //! # NULL key semantics
@@ -73,7 +75,7 @@ pub struct HashJoin {
     pending_output: VecDeque<Vec<Value>>,
     /// `true` once the right/probe side has been fully consumed.
     probe_finished: bool,
-    /// Cursor for emitting unmatched left rows in `LeftOuter` mode.
+    /// Cursor for emitting deferred left rows in `LeftOuter`, `Semi`, or `Anti` mode.
     next_unmatched_left: usize,
     /// `true` after the final `Ok(None)` is returned.
     eof: bool,
@@ -86,8 +88,8 @@ impl HashJoin {
     /// - `right` — the probe side.
     /// - `left_key` — expression evaluated over left rows to produce the build key.
     /// - `right_key` — expression evaluated over right rows to produce the probe key.
-    /// - `join_type` — must be `Inner` or `LeftOuter`; other variants return
-    ///   `ExecError::Unsupported` at runtime.
+    /// - `join_type` — must be `Inner`, `LeftOuter`, `Semi`, or `Anti`;
+    ///   other variants return `ExecError::Unsupported` at runtime.
     /// - `schema` — output schema (left columns followed by right columns).
     /// - `left_schema` — schema of the left child's output.
     /// - `right_schema` — schema of the right child's output.
@@ -186,18 +188,35 @@ impl Operator for HashJoin {
                 continue;
             }
 
-            if self.join_type == LogicalJoinType::LeftOuter {
-                while self.next_unmatched_left < self.left_rows.len()
-                    && chunk.len() < BATCH_TARGET_ROWS
-                {
-                    if !self.left_matched[self.next_unmatched_left] {
-                        chunk.push(concat_rows(
-                            &self.left_rows[self.next_unmatched_left],
-                            &null_right,
-                        ));
+            match self.join_type {
+                LogicalJoinType::LeftOuter => {
+                    while self.next_unmatched_left < self.left_rows.len()
+                        && chunk.len() < BATCH_TARGET_ROWS
+                    {
+                        if !self.left_matched[self.next_unmatched_left] {
+                            chunk.push(concat_rows(
+                                &self.left_rows[self.next_unmatched_left],
+                                &null_right,
+                            ));
+                        }
+                        self.next_unmatched_left += 1;
                     }
-                    self.next_unmatched_left += 1;
                 }
+                LogicalJoinType::Semi | LogicalJoinType::Anti => {
+                    let want_matched = self.join_type == LogicalJoinType::Semi;
+                    while self.next_unmatched_left < self.left_rows.len()
+                        && chunk.len() < BATCH_TARGET_ROWS
+                    {
+                        if self.left_matched[self.next_unmatched_left] == want_matched {
+                            chunk.push(self.left_rows[self.next_unmatched_left].clone());
+                        }
+                        self.next_unmatched_left += 1;
+                    }
+                }
+                LogicalJoinType::Inner
+                | LogicalJoinType::RightOuter
+                | LogicalJoinType::FullOuter
+                | LogicalJoinType::Cross => {}
             }
 
             break;
@@ -219,7 +238,10 @@ impl HashJoin {
     fn build_phase(&mut self) -> Result<(), ExecError> {
         // Validate join type early so the error surfaces before doing any work.
         match self.join_type {
-            LogicalJoinType::Inner | LogicalJoinType::LeftOuter => {}
+            LogicalJoinType::Inner
+            | LogicalJoinType::LeftOuter
+            | LogicalJoinType::Semi
+            | LogicalJoinType::Anti => {}
             LogicalJoinType::RightOuter => {
                 return Err(ExecError::Unsupported(
                     "hash join outer variant pending: RightOuter",
@@ -279,11 +301,23 @@ impl HashJoin {
                 .and_then(|table| table.get(&probe_key).cloned());
             if let Some(indices) = indices {
                 for li in indices {
-                    if self.join_type == LogicalJoinType::LeftOuter {
-                        self.left_matched[li] = true;
+                    match self.join_type {
+                        LogicalJoinType::Inner => {
+                            self.pending_output
+                                .push_back(concat_rows(&self.left_rows[li], &right_row));
+                        }
+                        LogicalJoinType::LeftOuter => {
+                            self.left_matched[li] = true;
+                            self.pending_output
+                                .push_back(concat_rows(&self.left_rows[li], &right_row));
+                        }
+                        LogicalJoinType::Semi | LogicalJoinType::Anti => {
+                            self.left_matched[li] = true;
+                        }
+                        LogicalJoinType::RightOuter
+                        | LogicalJoinType::FullOuter
+                        | LogicalJoinType::Cross => {}
                     }
-                    self.pending_output
-                        .push_back(concat_rows(&self.left_rows[li], &right_row));
                 }
             }
         }
@@ -517,6 +551,21 @@ mod tests {
         out
     }
 
+    fn drain_single_i32(op: &mut dyn Operator) -> Vec<i32> {
+        let schema = op.schema().clone();
+        let mut out = Vec::new();
+        while let Some(b) = op.next_batch().expect("no error") {
+            let rows = crate::filter_op::batch_to_rows(&b, &schema).expect("decode ok");
+            for row in rows {
+                match &row[0] {
+                    Value::Int32(v) => out.push(*v),
+                    other => panic!("unexpected value: {other:?}"),
+                }
+            }
+        }
+        out
+    }
+
     // -------------------------------------------------------------------------
     // Test 1: INNER hash join happy path
     // -------------------------------------------------------------------------
@@ -657,6 +706,44 @@ mod tests {
             rows.contains(&(1, 0)),
             "unmatched left row with NULL right (encoded as 0)"
         );
+    }
+
+    #[test]
+    fn hash_join_semi_emits_each_matching_left_row_once() {
+        let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1, 2, 2, 3])]);
+        let right = MemTableScan::new(schema_val(), vec![i32_batch(&[2, 2, 4])]);
+        let mut op = HashJoin::new(
+            Box::new(left),
+            Box::new(right),
+            col_idx0_i32("id"),
+            col_idx0_i32("val"),
+            LogicalJoinType::Semi,
+            schema_id(),
+            schema_id(),
+            schema_val(),
+        );
+        let mut rows = drain_single_i32(&mut op);
+        rows.sort_unstable();
+        assert_eq!(rows, vec![2, 2]);
+    }
+
+    #[test]
+    fn hash_join_anti_emits_unmatched_left_rows() {
+        let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1, 2, 3])]);
+        let right = MemTableScan::new(schema_val(), vec![i32_batch(&[2, 4])]);
+        let mut op = HashJoin::new(
+            Box::new(left),
+            Box::new(right),
+            col_idx0_i32("id"),
+            col_idx0_i32("val"),
+            LogicalJoinType::Anti,
+            schema_id(),
+            schema_id(),
+            schema_val(),
+        );
+        let mut rows = drain_single_i32(&mut op);
+        rows.sort_unstable();
+        assert_eq!(rows, vec![1, 3]);
     }
 
     // -------------------------------------------------------------------------

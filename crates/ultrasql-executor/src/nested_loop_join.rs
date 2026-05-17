@@ -13,9 +13,8 @@
 //! | `RightOuter` | Re-scan right at the end to emit unmatched right rows padded with left NULLs. |
 //! | `FullOuter` | Combination of `LeftOuter` and `RightOuter`. |
 //! | `Cross`   | Ignore condition; Cartesian product. |
-//!
-//! Semi and Anti join types are not needed here because `LogicalJoinType`
-//! does not have those variants in the current planner.
+//! | `Semi`    | Emit each left row once when at least one right row matches. |
+//! | `Anti`    | Emit each left row once when no right row matches. |
 //!
 //! # Right rescan
 //!
@@ -217,10 +216,19 @@ impl NestedLoopJoin {
                 for right_row in &right_rows {
                     let joined = concat_rows(left_row, right_row);
                     if self.passes_condition(&joined)? {
-                        output.push(joined);
                         left_matched = true;
+                        match self.join_type {
+                            LogicalJoinType::Semi | LogicalJoinType::Anti => break,
+                            _ => output.push(joined),
+                        }
                     }
                 }
+            }
+
+            match self.join_type {
+                LogicalJoinType::Semi if left_matched => output.push(left_row.clone()),
+                LogicalJoinType::Anti if !left_matched => output.push(left_row.clone()),
+                _ => {}
             }
 
             // Left/Full outer: emit left ++ NULLs when no match.
@@ -371,6 +379,21 @@ mod tests {
         out
     }
 
+    fn drain_rows_i32(op: &mut dyn Operator) -> Vec<i32> {
+        let schema = op.schema().clone();
+        let mut out = Vec::new();
+        while let Some(b) = op.next_batch().expect("no error") {
+            let rows = crate::filter_op::batch_to_rows(&b, &schema).expect("decode ok");
+            for row in rows {
+                match &row[0] {
+                    Value::Int32(v) => out.push(*v),
+                    other => panic!("unexpected value: {other:?}"),
+                }
+            }
+        }
+        out
+    }
+
     /// Predicate: left.id == right.val  (column 0 = column 1 in joined schema)
     fn pred_col0_eq_col1() -> ScalarExpr {
         ScalarExpr::Binary {
@@ -490,5 +513,41 @@ mod tests {
         let rows = drain_rows_i32_i32(&mut op);
         // 2 left * 3 right = 6 rows
         assert_eq!(rows.len(), 6);
+    }
+
+    #[test]
+    fn nlj_semi_join_emits_each_matching_left_row_once() {
+        let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1, 2, 2, 3])]);
+        let factory = make_right_factory(schema_val(), vec![i32_batch(&[2, 2, 4])]);
+        let mut op = NestedLoopJoin::new(
+            Box::new(left),
+            factory,
+            LogicalJoinType::Semi,
+            Some(pred_col0_eq_col1()),
+            schema_id(),
+            schema_id(),
+            schema_val(),
+        );
+        let mut rows = drain_rows_i32(&mut op);
+        rows.sort_unstable();
+        assert_eq!(rows, vec![2, 2]);
+    }
+
+    #[test]
+    fn nlj_anti_join_emits_unmatched_left_rows() {
+        let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1, 2, 3])]);
+        let factory = make_right_factory(schema_val(), vec![i32_batch(&[2, 4])]);
+        let mut op = NestedLoopJoin::new(
+            Box::new(left),
+            factory,
+            LogicalJoinType::Anti,
+            Some(pred_col0_eq_col1()),
+            schema_id(),
+            schema_id(),
+            schema_val(),
+        );
+        let mut rows = drain_rows_i32(&mut op);
+        rows.sort_unstable();
+        assert_eq!(rows, vec![1, 3]);
     }
 }

@@ -351,7 +351,7 @@ pub fn build_operator(
 /// Lower a [`LogicalPlan::Join`] node to the best available physical join.
 ///
 /// Selection rules (v0.5):
-/// - `On` condition, `Inner` or `LeftOuter`: [`HashJoin`].
+/// - `On` condition, `Inner`, `LeftOuter`, `Semi`, or `Anti`: [`HashJoin`].
 /// - `On` condition, any other type: [`MergeJoin`] (assumes pre-sorted input).
 /// - `Using` pairs or `None` (CROSS): [`NestedLoopJoin`].
 #[allow(clippy::too_many_arguments)]
@@ -374,7 +374,10 @@ fn build_join(
             // binary Eq with Column on both sides.
             if let Some((left_key, right_key)) = extract_equi_keys(pred, left_schema.len()) {
                 match join_type {
-                    LogicalJoinType::Inner | LogicalJoinType::LeftOuter => {
+                    LogicalJoinType::Inner
+                    | LogicalJoinType::LeftOuter
+                    | LogicalJoinType::Semi
+                    | LogicalJoinType::Anti => {
                         return Ok(Box::new(HashJoin::new(
                             left_op,
                             right_op,

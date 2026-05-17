@@ -23,12 +23,12 @@
 //! > variant yet, the rule stores the collapsed list back as an OR-tree. A
 //! > future RFC that adds `ScalarExpr::InList` will change the lowering here.
 //!
-//! ## IN-subquery to semi-join (stub)
+//! ## IN-subquery to semi-join
 //!
-//! Rewriting `IN (subquery)` to a `SemiJoin` requires a `LogicalPlan::Join`
-//! semi-join variant that does not yet exist. This path emits
-//! [`OptimizeError::NotApplicable`] and is never triggered by the v0.6
-//! binder.
+//! `IN (subquery)` lowering now lives in [`super::SubqueryDecorrelation`],
+//! which emits logical `Semi` / `Anti` joins once the binder has produced an
+//! explicit subquery expression. This rule remains focused on literal OR-list
+//! membership shapes.
 
 use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
 
@@ -36,7 +36,7 @@ use crate::error::OptimizeError;
 use crate::rules::RewriteRule;
 
 /// Collapses OR-trees of equality comparisons on the same column when there
-/// are at least 3 disjuncts. Stub for IN-subquery → semi-join conversion.
+/// are at least 3 disjuncts.
 #[derive(Debug)]
 pub struct InListToSemi;
 

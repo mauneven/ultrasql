@@ -131,6 +131,8 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
                 LogicalJoinType::LeftOuter
                     | LogicalJoinType::RightOuter
                     | LogicalJoinType::FullOuter
+                    | LogicalJoinType::Semi
+                    | LogicalJoinType::Anti
             ) {
                 return true;
             }
@@ -236,7 +238,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         } => reorder_inner_join_chain(plan),
 
         // ---------------------------------------------------------------
-        // Outer join: a hard reorder barrier. The brief explicitly endorses
+        // Outer/semi/anti join: a hard reorder barrier. The brief explicitly endorses
         // "skip enumeration entirely for that subtree (safest)", so the
         // outer-join subtree is returned verbatim — including its inner
         // children. Without a strictness analysis on the join predicate,
@@ -249,7 +251,11 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         // ---------------------------------------------------------------
         LogicalPlan::Join {
             join_type:
-                LogicalJoinType::LeftOuter | LogicalJoinType::RightOuter | LogicalJoinType::FullOuter,
+                LogicalJoinType::LeftOuter
+                | LogicalJoinType::RightOuter
+                | LogicalJoinType::FullOuter
+                | LogicalJoinType::Semi
+                | LogicalJoinType::Anti,
             ..
         } => plan.clone(),
 

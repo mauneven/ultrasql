@@ -28,8 +28,8 @@ use super::lower_query::lower_query;
 /// - `condition` is `On(pred)` with an equi `Column = Column` predicate
 ///   extractable by [`extract_hash_friendly_equi_keys`].
 /// - `join_type` is `Inner` or `LeftOuter` (the kinds MergeJoin
-///   accepts today — `Cross` is explicitly rejected by the executor and
-///   `RightOuter`/`FullOuter`/`Semi`/`Anti` need follow-up coverage).
+///   accepts today — `Cross`, `Semi`, and `Anti` are handled by
+///   hash/NL lowering; `RightOuter`/`FullOuter` need follow-up coverage).
 /// - Both children are `LogicalPlan::Sort { input, keys }` with exactly
 ///   one ascending key whose `ScalarExpr` matches the equi-key on the
 ///   corresponding side (column reference equality).
@@ -110,7 +110,10 @@ pub(super) fn lower_join(
         LogicalJoinCondition::On(pred) => {
             if matches!(
                 join_type,
-                LogicalJoinType::Inner | LogicalJoinType::LeftOuter
+                LogicalJoinType::Inner
+                    | LogicalJoinType::LeftOuter
+                    | LogicalJoinType::Semi
+                    | LogicalJoinType::Anti
             ) {
                 if let Some(key_pairs) =
                     extract_hash_friendly_equi_key_pairs(pred, left_schema.len())
