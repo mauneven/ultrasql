@@ -379,6 +379,9 @@ where
                 for m in &out.messages {
                     self.send(m).await?;
                 }
+                if matches!(self.txn_state, TxnState::Idle) {
+                    self.run_post_response_maintenance();
+                }
                 Ok(())
             }
             Err(e) => {
@@ -402,6 +405,11 @@ where
         max_rows: i32,
     ) -> Result<crate::extended::ExecuteOutcome, ServerError> {
         let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
+        let portal_plan = self
+            .extended
+            .portals
+            .get(portal)
+            .and_then(|p| p.plan.clone());
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => {
                 let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
@@ -429,6 +437,10 @@ where
                         );
                     } else {
                         self.state.note_commit_for_gc();
+                        if let (Some(plan), Ok(outcome)) = (portal_plan.as_ref(), res.as_ref()) {
+                            let rows = Self::parse_affected_rows_tag(&outcome.messages);
+                            self.note_committed_dml_effect(plan, rows);
+                        }
                     }
                 } else if let Err(e) = self.state.txn_manager.abort(txn) {
                     tracing::warn!(
@@ -461,6 +473,10 @@ where
                 };
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
+                if let (Some(plan), Ok(outcome)) = (portal_plan.as_ref(), res.as_ref()) {
+                    let rows = Self::parse_affected_rows_tag(&outcome.messages);
+                    self.note_dml_effect(plan, rows);
+                }
                 self.txn_state = if res.is_ok() {
                     TxnState::InTransaction(txn)
                 } else {

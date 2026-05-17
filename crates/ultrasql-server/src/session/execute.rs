@@ -15,7 +15,7 @@ use ultrasql_catalog::{
     CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
 };
 use ultrasql_core::{DataType, PageId, RelationId, Value};
-use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, StatsSource};
+use ultrasql_optimizer::{InMemoryStatsCatalog, PlanCache, PlanCacheConfig, PlanCacheKey, StatsCatalog, StatsSource};
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
     Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
@@ -37,7 +37,7 @@ use crate::result_encoder::{
 };
 use crate::{
     BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
-    run_plan_in_txn,
+    run_plan_in_txn, try_run_cached_int32_pair_select,
 };
 
 impl<RW> Session<RW>
@@ -86,8 +86,6 @@ where
         // Wire-level statement no-ops kept for PostgreSQL compatibility
         // while the real plumbing lands behind the same names:
         //
-        // - `ANALYZE [table]` (§3.1): the `AnalyzeRunner` kernel exists
-        //   but the `pg_statistic` writeback is a follow-up.
         // - `CREATE STATISTICS [name] ON cols FROM t` (§3.3): the
         //   `pg_statistic_ext` row layout exists; multi-column MCV /
         //   dependency-coefficient population is a follow-up.
@@ -98,11 +96,11 @@ where
         // Each shim short-circuits before the parser to avoid forcing
         // every layer to grow new exhaustive arms today.
         let trimmed = sql.trim_start();
-        for (head, tag) in [
-            ("analyze", "ANALYZE"),
-            ("vacuum", "VACUUM"),
-            ("create statistics", "CREATE STATISTICS"),
-        ] {
+        if let Some(table) = self.try_parse_analyze_target(trimmed) {
+            return self.execute_analyze(table.as_deref());
+        }
+
+        for (head, tag) in [("vacuum", "VACUUM"), ("create statistics", "CREATE STATISTICS")] {
             let len = head.len();
             if trimmed.len() >= len && trimmed[..len].eq_ignore_ascii_case(head) {
                 let rest = &trimmed[len..];
@@ -511,7 +509,9 @@ where
         catalog_snapshot: &Arc<CatalogSnapshot>,
     ) -> Result<LogicalPlan, ServerError> {
         let key = PlanCacheKey::named(sql.to_owned());
-        let stats: NoStats = NoStats;
+        let stats = ServerStatsSource {
+            stats_catalog: &self.state.stats_catalog,
+        };
         let snapshot = Arc::clone(catalog_snapshot);
         // The closure is invoked only on cache miss; on a hit the cached
         // plan is returned and the plan we received here is dropped.
@@ -555,6 +555,22 @@ where
         plan: &LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
     ) -> Result<SelectResult, ServerError> {
+        // The cached `(Int32, Int32)` full-scan fast path is already
+        // answered from the version-stamped column cache and does not
+        // consult txn-local visibility state. In autocommit `Idle`
+        // mode there is therefore no user-visible work for `begin()` /
+        // `commit()` to do; skipping them avoids one XID allocation,
+        // one snapshot build, and one CLOG transition on the
+        // `select_scan_10k` hot path. Explicit transaction blocks keep
+        // the normal machinery so `ReadyForQuery` state and command-id
+        // progression stay unchanged there.
+        if matches!(self.txn_state, TxnState::Idle)
+            && let Some(result) =
+                try_run_cached_int32_pair_select(plan, catalog_snapshot, self.state.heap.as_ref())
+        {
+            return Ok(result);
+        }
+
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => {
                 let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
@@ -567,7 +583,7 @@ where
                     Arc::clone(&self.state.txn_manager),
                     Some(self.cancel_flag.clone()),
                 );
-                self.finalise_autocommit(txn, outcome)
+                self.finalise_autocommit(plan, txn, outcome)
             }
             TxnState::InTransaction(mut txn) => {
                 self.state.txn_manager.refresh_snapshot(&mut txn);
@@ -580,6 +596,9 @@ where
                     Arc::clone(&self.state.txn_manager),
                     Some(self.cancel_flag.clone()),
                 );
+                if let Ok(result) = &outcome {
+                    self.note_dml_effect(plan, result.rows);
+                }
                 // Transition: Ok → InTransaction; Err → Failed. The txn
                 // remains alive in the CLOG (InProgress) until the user
                 // issues COMMIT/ROLLBACK.
@@ -602,7 +621,8 @@ where
     /// Logs (does not surface) txn manager errors so the original
     /// outcome reaches the client.
     pub(crate) fn finalise_autocommit(
-        &self,
+        &mut self,
+        plan: &LogicalPlan,
         txn: Transaction,
         outcome: Result<SelectResult, ServerError>,
     ) -> Result<SelectResult, ServerError> {
@@ -611,7 +631,9 @@ where
                 if let Err(e) = self.state.txn_manager.commit(txn) {
                     tracing::warn!(error = %e, "autocommit failed to finalise");
                 } else {
-                    self.state.note_commit_for_gc();
+                    self.pending_post_commit_maintenance = true;
+                    let rows = outcome.as_ref().map_or(0, |r| r.rows);
+                    self.note_dml_effect(plan, rows);
                 }
             }
             Err(_) => {
@@ -628,6 +650,127 @@ where
             }
         }
         outcome
+    }
+
+    fn try_parse_analyze_target(&self, trimmed_sql: &str) -> Option<Option<String>> {
+        if trimmed_sql.len() < "analyze".len() || !trimmed_sql[..7].eq_ignore_ascii_case("analyze") {
+            return None;
+        }
+        let rest = trimmed_sql[7..].trim();
+        if rest.is_empty() || rest == ";" {
+            return Some(None);
+        }
+        let ident = rest.trim_end_matches(';').trim();
+        if ident.is_empty() {
+            return Some(None);
+        }
+        // v0.6: support `ANALYZE` and `ANALYZE table_name`.
+        if ident.split_whitespace().count() == 1 {
+            return Some(Some(ident.trim_matches('"').to_ascii_lowercase()));
+        }
+        None
+    }
+
+    fn execute_analyze(&mut self, table: Option<&str>) -> Result<SelectResult, ServerError> {
+        match table {
+            Some(t) => {
+                if !self.state.analyze_table(t)? {
+                    return Err(self.fail_if_in_transaction(ServerError::Plan(
+                        ultrasql_planner::PlanError::TableNotFound(t.to_string()),
+                    )));
+                }
+            }
+            None => {
+                let snapshot = self.state.catalog_snapshot();
+                let tables: Vec<String> = snapshot
+                    .tables
+                    .keys()
+                    .map(|k| k.to_string())
+                    .collect();
+                for name in tables {
+                    let _ = self.state.analyze_table(&name);
+                }
+            }
+        }
+        Ok(result_encoder::SelectResult {
+            messages: vec![BackendMessage::CommandComplete {
+                tag: "ANALYZE".to_string(),
+            }],
+            streamed_body: None,
+            rows: 0,
+        })
+    }
+
+    pub(crate) fn note_dml_effect(&mut self, plan: &LogicalPlan, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        let Some(table) = Self::dml_target_table(plan) else {
+            return;
+        };
+        let entry = self
+            .pending_table_modifications
+            .entry(table.to_ascii_lowercase())
+            .or_insert(0);
+        *entry = entry.saturating_add(rows);
+    }
+
+    pub(crate) fn parse_affected_rows_tag(messages: &[BackendMessage]) -> u64 {
+        let Some(BackendMessage::CommandComplete { tag }) = messages
+            .iter()
+            .find(|m| matches!(m, BackendMessage::CommandComplete { .. }))
+        else {
+            return 0;
+        };
+        let mut parts = tag.split_whitespace();
+        let Some(cmd) = parts.next() else {
+            return 0;
+        };
+        if !matches!(cmd, "INSERT" | "UPDATE" | "DELETE") {
+            return 0;
+        }
+        // INSERT tag shape is `INSERT 0 <rows>`, UPDATE/DELETE is
+        // `<CMD> <rows>`.
+        let last = parts.next_back().unwrap_or_default();
+        last.parse::<u64>().unwrap_or(0)
+    }
+
+    pub(crate) fn note_committed_dml_effect(&self, plan: &LogicalPlan, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        let Some(table) = Self::dml_target_table(plan) else {
+            return;
+        };
+        self.state.note_table_modifications(table, rows);
+    }
+
+    pub(crate) fn flush_pending_dml_effects(&mut self) {
+        let drained = std::mem::take(&mut self.pending_table_modifications);
+        for (table, rows) in drained {
+            self.state.note_table_modifications(&table, rows);
+        }
+    }
+
+    pub(crate) fn run_post_response_maintenance(&mut self) {
+        if self.pending_post_commit_maintenance {
+            self.pending_post_commit_maintenance = false;
+            self.state.note_commit_for_gc();
+        }
+        self.flush_pending_dml_effects();
+    }
+
+    pub(crate) fn clear_pending_dml_effects(&mut self) {
+        self.pending_table_modifications.clear();
+    }
+
+    fn dml_target_table(plan: &LogicalPlan) -> Option<&str> {
+        match plan {
+            LogicalPlan::Insert { table, .. }
+            | LogicalPlan::Update { table, .. }
+            | LogicalPlan::Delete { table, .. } => Some(table.as_str()),
+            _ => None,
+        }
     }
 
     /// If the session is currently `InTransaction`, transition to
@@ -652,5 +795,41 @@ where
             }
         }
         err
+    }
+}
+
+struct ServerStatsSource<'a> {
+    stats_catalog: &'a parking_lot::RwLock<InMemoryStatsCatalog>,
+}
+
+impl StatsSource for ServerStatsSource<'_> {
+    fn row_count(&self, table: &str) -> u64 {
+        self.stats_catalog
+            .read()
+            .lookup_relation(table)
+            .map_or(0, |s| s.row_count)
+    }
+
+    fn page_count(&self, table: &str) -> u64 {
+        self.stats_catalog
+            .read()
+            .lookup_relation(table)
+            .map_or(0, |s| s.page_count)
+    }
+
+    fn null_frac(&self, table: &str, column: usize) -> f64 {
+        self.stats_catalog
+            .read()
+            .lookup_relation(table)
+            .and_then(|s| s.columns.get(column).map(|c| c.null_frac))
+            .unwrap_or(0.0)
+    }
+
+    fn n_distinct(&self, table: &str, column: usize) -> f64 {
+        self.stats_catalog
+            .read()
+            .lookup_relation(table)
+            .and_then(|s| s.columns.get(column).map(|c| c.n_distinct))
+            .unwrap_or(0.0)
     }
 }

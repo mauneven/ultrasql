@@ -356,10 +356,10 @@ pub struct UndoEntry {
     /// update — if not, the pre-image stored in this entry is what
     /// they should observe.
     pub writer_xid: Xid,
-    /// The pre-update payload bytes (no tuple header). Kept inline up
-    /// to 16 bytes via [`UpdatePayload`]; wider rows spill to the
-    /// heap.
-    pub old_payload: UpdatePayload,
+    /// The pre-update payload bytes (no tuple header). The current
+    /// in-place fast path stores exactly the 9-byte `(null, id, val)`
+    /// body for `(Int32, Int32)` rows.
+    pub old_payload: [u8; 9],
 }
 
 impl<L: PageLoader> std::fmt::Debug for HeapAccess<L> {

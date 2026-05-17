@@ -63,15 +63,17 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
-use ultrasql_catalog::{CatalogSnapshot, PersistentCatalog};
-use ultrasql_core::PageId;
-use ultrasql_optimizer::{PlanCache, PlanCacheConfig};
-use ultrasql_planner::{Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan, TableMeta};
+use ultrasql_catalog::{CatalogSnapshot, MutableCatalog, PersistentCatalog};
+use ultrasql_core::{PageId, RelationId};
+use ultrasql_executor::RowCodec;
+use ultrasql_optimizer::{InMemoryStatsCatalog, PlanCache, PlanCacheConfig, StatsCatalog};
+use ultrasql_planner::{Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan, ScalarExpr, TableMeta};
 use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::page::Page;
-use ultrasql_txn::{SsiManager, Transaction, TransactionManager};
+use ultrasql_txn::{IsolationLevel, SsiManager, Transaction, TransactionManager};
+use ultrasql_vec::column::Column;
 
 pub use error::ServerError;
 pub use pipeline::{LowerCtx, SampleTables, build_sample_database};
@@ -279,6 +281,15 @@ pub struct Server {
     /// commit keeps the hot path cheap (one atomic add) and amortises
     /// the GC walk across many small transactions.
     pub vacuum_commit_counter: std::sync::atomic::AtomicU64,
+    /// In-memory relation statistics populated by manual `ANALYZE`
+    /// and by autovacuum-triggered analyze runs.
+    pub stats_catalog: parking_lot::RwLock<InMemoryStatsCatalog>,
+    /// Accumulated tuple modifications since the last analyze pass,
+    /// keyed by folded table name.
+    pub table_modifications: dashmap::DashMap<String, u64>,
+    /// Tables that crossed the autovacuum ANALYZE threshold and are
+    /// waiting for the next maintenance pass.
+    pub pending_analyze_tables: dashmap::DashMap<String, ()>,
     /// Two-phase commit coordinator. Owns the on-disk state directory
     /// for prepared transactions; consulted by
     /// `PREPARE TRANSACTION 'gid'`, `COMMIT PREPARED 'gid'`, and
@@ -338,6 +349,13 @@ pub enum AuthConfig {
 /// keep it out of the per-commit critical path.
 pub const UNDO_GC_INTERVAL_COMMITS: u64 = 64;
 
+/// Minimum number of modified tuples before autovacuum triggers ANALYZE.
+pub const AUTO_ANALYZE_BASE_THRESHOLD: u64 = 64;
+
+/// Scale factor for autovacuum analyze threshold:
+/// `threshold = base + estimated_rows / AUTO_ANALYZE_SCALE_DIVISOR`.
+pub const AUTO_ANALYZE_SCALE_DIVISOR: u64 = 5;
+
 impl Server {
     /// Build a server pre-loaded with the canonical sample database.
     ///
@@ -387,6 +405,9 @@ impl Server {
             txn_manager,
             plan_cache,
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
+            stats_catalog: parking_lot::RwLock::new(InMemoryStatsCatalog::new()),
+            table_modifications: dashmap::DashMap::new(),
+            pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,
             auth: AuthConfig::Trust,
             notify_hub: Arc::new(notify::NotifyHub::new()),
@@ -416,15 +437,13 @@ impl Server {
     }
 
     /// Record a successful commit and, every
-    /// [`UNDO_GC_INTERVAL_COMMITS`] commits, fire
-    /// [`ultrasql_storage::heap::HeapAccess::vacuum_undo_log`] with
-    /// the txn manager's current `oldest_in_progress()`.
+    /// [`UNDO_GC_INTERVAL_COMMITS`] commits, run maintenance:
+    /// undo-log GC plus one pending auto-analyze task.
     ///
-    /// Bump-and-check is one atomic add plus a modulo; the GC walk
-    /// happens out-of-band on the bumping thread once the threshold
-    /// fires. Errors from the GC walk are logged and swallowed so a
-    /// transient buffer-pool failure cannot mask the underlying
-    /// commit's success.
+    /// Bump-and-check is one atomic add plus a modulo; the heavier
+    /// maintenance work is deferred out of the per-commit fast path.
+    /// Errors from the maintenance pass are logged and swallowed so a
+    /// transient failure cannot mask the underlying commit's success.
     pub fn note_commit_for_gc(&self) {
         use std::sync::atomic::Ordering;
         let n = self
@@ -447,6 +466,7 @@ impl Server {
             }
             Err(e) => tracing::warn!(error = %e, "undo-log GC failed"),
         }
+        self.run_one_pending_analyze();
     }
 
     /// Initialize a server that boots from `data_dir`.
@@ -528,6 +548,9 @@ impl Server {
             txn_manager,
             plan_cache,
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
+            stats_catalog: parking_lot::RwLock::new(InMemoryStatsCatalog::new()),
+            table_modifications: dashmap::DashMap::new(),
+            pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,
             auth: AuthConfig::Trust,
             notify_hub: Arc::new(notify::NotifyHub::new()),
@@ -556,6 +579,125 @@ impl Server {
     #[must_use]
     pub fn catalog_snapshot(&self) -> Arc<CatalogSnapshot> {
         self.persistent_catalog.snapshot()
+    }
+
+    /// Lookup optimizer statistics for `table` from the in-memory
+    /// stats catalog.
+    #[must_use]
+    pub fn lookup_relation_stats(&self, table: &str) -> Option<ultrasql_optimizer::RelationStats> {
+        self.stats_catalog.read().lookup_relation(table)
+    }
+
+    /// Record committed tuple modifications for `table` and trigger
+    /// autovacuum ANALYZE when the threshold is crossed.
+    pub fn note_table_modifications(&self, table: &str, modified_rows: u64) {
+        if modified_rows == 0 {
+            return;
+        }
+
+        let folded = table.to_ascii_lowercase();
+        let current = {
+            let mut entry = self.table_modifications.entry(folded.clone()).or_insert(0);
+            *entry = entry.saturating_add(modified_rows);
+            *entry
+        };
+        let threshold = self.auto_analyze_threshold(&folded);
+        if current < threshold {
+            return;
+        }
+
+        // Reset counter first so concurrent DML can accumulate for the
+        // next cycle while the maintenance pass drains this table.
+        self.table_modifications.insert(folded.clone(), 0);
+        self.pending_analyze_tables.insert(folded, ());
+    }
+
+    /// Run `ANALYZE` for one table: refresh block-count hint and
+    /// rebuild relation stats from MVCC-visible rows.
+    pub fn analyze_table(&self, table: &str) -> Result<bool, ServerError> {
+        let folded = table.to_ascii_lowercase();
+        self.pending_analyze_tables.remove(&folded);
+        let snapshot = self.catalog_snapshot();
+        let Some(entry) = snapshot.tables.get(&folded) else {
+            return Ok(false);
+        };
+        let entry = entry.clone();
+        drop(snapshot);
+
+        let rel = RelationId(entry.oid);
+        let block_count = self.heap.block_count(rel).max(entry.n_blocks);
+        self.persistent_catalog
+            .update_table_size(entry.oid, block_count)
+            .map_err(ServerError::Catalog)?;
+
+        let scan_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let scan_snapshot = scan_txn.snapshot.clone();
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        self.heap
+            .for_each_visible(
+                rel,
+                block_count,
+                &scan_snapshot,
+                self.txn_manager.as_ref(),
+                |_tid, _hdr, payload| {
+                    payloads.push(payload.to_vec());
+                    Ok(())
+                },
+            )
+            .map_err(|e| ServerError::Ddl(format!("ANALYZE scan failed: {e}")))?;
+        if let Err(e) = self.txn_manager.abort(scan_txn) {
+            tracing::warn!(error = %e, "ANALYZE scan transaction abort failed");
+        }
+
+        let codec = RowCodec::new(entry.schema.clone());
+        let mut rows: Vec<Vec<ultrasql_core::Value>> = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            match codec.decode(&payload) {
+                Ok(row) => rows.push(row),
+                Err(e) => {
+                    tracing::warn!(table = %folded, error = %e, "ANALYZE skipped malformed tuple");
+                }
+            }
+        }
+        self.stats_catalog
+            .write()
+            .analyze_and_register(&folded, &entry.schema, rows.into_iter());
+        self.plan_cache.invalidate_all();
+        Ok(true)
+    }
+
+    fn auto_analyze_threshold(&self, table: &str) -> u64 {
+        let snapshot = self.catalog_snapshot();
+        let Some(entry) = snapshot.tables.get(table) else {
+            return AUTO_ANALYZE_BASE_THRESHOLD;
+        };
+        let rel = RelationId(entry.oid);
+        let blocks = u64::from(self.heap.block_count(rel).max(entry.n_blocks));
+        let estimated_rows = blocks.saturating_mul(64);
+        AUTO_ANALYZE_BASE_THRESHOLD.saturating_add(estimated_rows / AUTO_ANALYZE_SCALE_DIVISOR)
+    }
+
+    fn run_one_pending_analyze(&self) {
+        let Some(table) = self
+            .pending_analyze_tables
+            .iter()
+            .next()
+            .map(|entry| entry.key().clone())
+        else {
+            return;
+        };
+
+        match self.analyze_table(&table) {
+            Ok(true) => {
+                tracing::debug!(table = %table, "autovacuum analyze completed");
+            }
+            Ok(false) => {
+                tracing::debug!(table = %table, "autovacuum analyze skipped missing table");
+            }
+            Err(e) => {
+                tracing::warn!(table = %table, error = %e, "autovacuum analyze failed");
+            }
+        }
     }
 }
 
@@ -739,6 +881,14 @@ fn run_plan_in_txn(
     oracle: Arc<TransactionManager>,
     cancel_flag: Option<ultrasql_executor::CancelFlag>,
 ) -> Result<SelectResult, ServerError> {
+    if let Some(result) = try_run_cached_int32_pair_select(
+        plan,
+        &catalog_snapshot,
+        heap.as_ref(),
+    ) {
+        return Ok(result);
+    }
+
     let ctx = LowerCtx {
         tables,
         catalog_snapshot,
@@ -779,6 +929,56 @@ fn run_plan_in_txn(
             run_select_streamed(op.as_mut())
         }
     }
+}
+
+pub(crate) fn try_run_cached_int32_pair_select(
+    plan: &LogicalPlan,
+    catalog_snapshot: &Arc<CatalogSnapshot>,
+    heap: &HeapAccess<BlankPageLoader>,
+) -> Option<SelectResult> {
+    let (table, output_schema) = match plan {
+        LogicalPlan::Scan { table, schema, .. } => (table.as_str(), schema),
+        LogicalPlan::Project { input, exprs, schema } => {
+            let LogicalPlan::Scan { table, .. } = input.as_ref() else {
+                return None;
+            };
+            if exprs.len() != 2 {
+                return None;
+            }
+            let is_identity_pair = exprs.iter().enumerate().all(|(idx, (expr, _name))| {
+                matches!(expr, ScalarExpr::Column { index, .. } if *index == idx)
+            });
+            if !is_identity_pair {
+                return None;
+            }
+            (table.as_str(), schema)
+        }
+        _ => return None,
+    };
+
+    if output_schema.len() != 2
+        || output_schema.field_at(0).data_type != ultrasql_core::DataType::Int32
+        || output_schema.field_at(1).data_type != ultrasql_core::DataType::Int32
+    {
+        return None;
+    }
+
+    let folded = table.to_ascii_lowercase();
+    let entry = catalog_snapshot.tables.get(&folded)?;
+    let rel = RelationId(entry.oid);
+    let cached = heap.column_cache.get(rel)?;
+    let [Column::Int32(left), Column::Int32(right)] = cached.columns.as_slice() else {
+        return None;
+    };
+    if left.nulls().is_some() || right.nulls().is_some() {
+        return None;
+    }
+
+    Some(result_encoder::run_cached_int32_pair_select_streamed(
+        output_schema,
+        left.data(),
+        right.data(),
+    ))
 }
 
 fn decode_key_column(

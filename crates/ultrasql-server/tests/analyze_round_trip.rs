@@ -1,13 +1,7 @@
-//! `ANALYZE` Simple-Query handler test (§3.1, stub variant).
+//! `ANALYZE` Simple-Query handler tests.
 //!
-//! The wire surface accepts `ANALYZE` and `ANALYZE table_name` and
-//! returns the canonical `ANALYZE` command tag without raising an
-//! error, so ORMs and migration tools can issue the statement without
-//! a special case. The real stats refresh — population of
-//! `pg_statistic`, plan-cache invalidation per the v0.6 brief — lives
-//! behind the `AnalyzeRunner` kernel and lands as a follow-up commit
-//! that threads the runner into `Server::analyze_table`. The wire
-//! stub keeps PostgreSQL compatibility until then.
+//! Verifies that the wire surface accepts `ANALYZE` and that the
+//! server refreshes relation statistics in the in-memory stats catalog.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,13 +12,15 @@ use ultrasql_server::{Server, bind_listener, serve_listener};
 
 async fn start_server_and_connect() -> (
     tokio_postgres::Client,
+    Arc<Server>,
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
 ) {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
     let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
+    let server_for_task = Arc::clone(&server);
+    let server_handle = tokio::spawn(serve_listener(listener, server_for_task));
     let conn_str = format!(
         "host={host} port={port} user=tester application_name=analyze_test",
         host = bound.ip(),
@@ -38,7 +34,7 @@ async fn start_server_and_connect() -> (
             eprintln!("connection error: {e}");
         }
     });
-    (client, conn_handle, server_handle)
+    (client, server, conn_handle, server_handle)
 }
 
 async fn shutdown(
@@ -52,14 +48,14 @@ async fn shutdown(
 
 #[tokio::test]
 async fn analyze_bare_returns_command_tag() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let (client, _server, _conn, server_handle) = start_server_and_connect().await;
     client.batch_execute("ANALYZE").await.expect("ANALYZE");
     shutdown(client, server_handle).await;
 }
 
 #[tokio::test]
 async fn analyze_table_returns_command_tag() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let (client, server, _conn, server_handle) = start_server_and_connect().await;
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL)")
         .await
@@ -69,6 +65,10 @@ async fn analyze_table_returns_command_tag() {
         .await
         .expect("seed");
     client.batch_execute("ANALYZE t").await.expect("ANALYZE t");
+    let stats = server
+        .lookup_relation_stats("t")
+        .expect("ANALYZE should register relation stats");
+    assert_eq!(stats.row_count, 3, "ANALYZE should see all inserted rows");
     // Session survives — subsequent statements work.
     let rows = client
         .query("SELECT id FROM t", &[])

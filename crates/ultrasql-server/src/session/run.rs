@@ -218,6 +218,9 @@ where
                 // statement per wire roundtrip (UPDATE / DELETE /
                 // INSERT / mixed-oltp).
                 self.send_query_result_with_ready(result).await?;
+                if matches!(self.txn_state, TxnState::Idle) {
+                    self.run_post_response_maintenance();
+                }
             }
             Err(err) => {
                 if !err.is_query_scoped() {

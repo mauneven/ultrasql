@@ -120,6 +120,10 @@ where
                 ) {
                     return Err(ServerError::Ddl(format!("prepare_transaction({gid}): {e}")));
                 }
+                // Prepared transactions leave this session's state.
+                // Keep local modification counters from leaking into
+                // subsequent unrelated transactions on this connection.
+                self.clear_pending_dml_effects();
                 Ok(SelectResult {
                     messages: vec![BackendMessage::CommandComplete {
                         tag: "PREPARE TRANSACTION".to_string(),
@@ -136,6 +140,7 @@ where
                 if let Err(e) = self.state.txn_manager.abort(txn) {
                     tracing::warn!(error = %e, "PREPARE TRANSACTION on failed block — abort failed");
                 }
+                self.clear_pending_dml_effects();
                 Ok(SelectResult {
                     messages: vec![BackendMessage::CommandComplete {
                         tag: "ROLLBACK".to_string(),
@@ -316,6 +321,7 @@ where
                     tracing::warn!(error = %e, "explicit COMMIT failed to finalise");
                 } else {
                     self.state.note_commit_for_gc();
+                    self.flush_pending_dml_effects();
                 }
                 Ok(SelectResult {
                     messages: vec![BackendMessage::CommandComplete {
@@ -333,6 +339,7 @@ where
                 if let Err(e) = self.state.txn_manager.abort(txn) {
                     tracing::warn!(error = %e, "explicit COMMIT (treated as rollback) failed");
                 }
+                self.clear_pending_dml_effects();
                 // PostgreSQL emits the ROLLBACK tag here, not COMMIT.
                 Ok(SelectResult {
                     messages: vec![BackendMessage::CommandComplete {
@@ -365,6 +372,7 @@ where
                 if let Err(e) = self.state.txn_manager.abort(txn) {
                     tracing::warn!(error = %e, "explicit ROLLBACK failed");
                 }
+                self.clear_pending_dml_effects();
                 Ok(SelectResult {
                     messages: vec![BackendMessage::CommandComplete {
                         tag: "ROLLBACK".to_string(),

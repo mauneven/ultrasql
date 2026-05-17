@@ -38,7 +38,7 @@ use ultrasql_wal::payload::{
 };
 
 use crate::buffer_pool::PageLoader;
-use crate::heap::{HeapAccess, UndoEntry, UndoRelationLog, UpdatePayload};
+use crate::heap::{HeapAccess, UndoEntry, UndoRelationLog};
 use crate::page::PageError;
 
 impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
@@ -370,8 +370,17 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 && e.old_payload.as_slice() == payload.pre_image_bytes.as_slice()
         });
         if !already {
-            let mut pre = UpdatePayload::new();
-            pre.extend_from_slice(&payload.pre_image_bytes);
+            if payload.pre_image_bytes.len() != 9 {
+                return Err(ApplyError::Refused {
+                    operation: "heap_update_in_place",
+                    detail: format!(
+                        "invalid pre-image width: expected 9 bytes, got {}",
+                        payload.pre_image_bytes.len()
+                    ),
+                });
+            }
+            let mut pre = [0_u8; 9];
+            pre.copy_from_slice(&payload.pre_image_bytes);
             log.entries.push(UndoEntry {
                 tid: payload.tid,
                 writer_xid: payload.writer_xid,

@@ -77,6 +77,14 @@ pub(crate) struct Session<RW> {
     /// the channel between `Sync` boundaries and writes each pending
     /// `NotificationResponse` before the trailing `ReadyForQuery`.
     pub(super) notify_rx: mpsc::UnboundedReceiver<NotificationRecord>,
+    /// Per-table modified-row counters accumulated inside an explicit
+    /// transaction block. Flushed to server-level maintenance hooks on
+    /// COMMIT, cleared on ROLLBACK.
+    pub(super) pending_table_modifications: std::collections::HashMap<String, u64>,
+    /// `true` when an autocommit statement committed successfully and
+    /// its background-ish maintenance hook should run after the reply
+    /// bytes are already on the wire.
+    pub(super) pending_post_commit_maintenance: bool,
 }
 
 impl<RW> Session<RW>
@@ -108,6 +116,8 @@ where
             cancel_flag,
             notify_rx,
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            pending_table_modifications: std::collections::HashMap::new(),
+            pending_post_commit_maintenance: false,
         }
     }
 }

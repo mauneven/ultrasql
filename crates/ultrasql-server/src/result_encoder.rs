@@ -365,6 +365,43 @@ pub fn run_select_streamed(op: &mut dyn Operator) -> Result<SelectResult, Server
     })
 }
 
+/// Fast path for a cached full-table `(Int32, Int32)` scan.
+///
+/// Unlike [`run_select_streamed`], this helper skips operator batch
+/// materialisation entirely: callers provide the cached column slices
+/// directly and the wire encoder writes `RowDescription`, every
+/// `DataRow`, and the trailing `CommandComplete` into one pooled
+/// buffer. Used by the `select_scan_10k` hot path once the relation's
+/// column cache is warm.
+#[must_use]
+pub fn run_cached_int32_pair_select_streamed(
+    schema: &Schema,
+    left: &[i32],
+    right: &[i32],
+) -> SelectResult {
+    debug_assert_eq!(left.len(), right.len());
+
+    const MAX_ROW_BYTES: usize = 37;
+    const ROWDESC_AND_TAG_BYTES: usize = 256;
+    let initial_cap = ROWDESC_AND_TAG_BYTES.saturating_add(left.len().saturating_mul(MAX_ROW_BYTES));
+    let mut sink = take_pooled_sink(initial_cap);
+    let row_desc = build_row_description(schema);
+    encode_backend(&row_desc, &mut sink);
+    write_int32_pair_data_rows(&mut sink, left, right);
+    let rows = u64::try_from(left.len()).unwrap_or(u64::MAX);
+    encode_backend(
+        &BackendMessage::CommandComplete {
+            tag: format!("SELECT {rows}"),
+        },
+        &mut sink,
+    );
+    SelectResult {
+        messages: Vec::new(),
+        streamed_body: Some(sink),
+        rows,
+    }
+}
+
 /// Translate a [`Schema`] into a [`BackendMessage::RowDescription`].
 fn build_row_description(schema: &Schema) -> BackendMessage {
     let fields = schema

@@ -346,7 +346,7 @@ deployment can rely on.
 | Priority | Area | Blocking |
 |----------|------|---------|
 | **P0** | ~~v0.5: BEGIN/COMMIT/ROLLBACK end-to-end (binder + server dispatch)~~ ✅ done — per-session `TxnState` machine (`Idle`/`InTransaction`/`Failed`); Simple + Extended Query round-trip; `ReadyForQuery` status byte mirrors PostgreSQL `'I'`/`'T'`/`'E'`; failed-block returns `25P02`; COMMIT in failed state aborts and returns `ROLLBACK` tag | (was) Every multi-statement workload, mixed_oltp_pgbench_like bench, ORM correctness |
-| **P0** | ~~v0.5: Extended Query dispatch in server~~ ✅ done — Parse/Bind/Describe/Execute/Sync/Close/Flush wired via `extended.rs`; tokio-postgres prepared-statement round-trips green | (was) Every ORM and every driver beyond simple psql |
+| **P0** | ~~v0.5: Extended Query dispatch in server~~ ✅ done — Parse/Bind/Describe/Execute/Sync/Close/Flush wired via `extended.rs`; tokio-postgres prepared-statement round-trip green | (was) Every ORM and every driver beyond simple psql |
 | **P0** | ~~v0.5: Wire ORDER BY (`LogicalPlan::Sort`) in `lower_query`)~~ ✅ done — `order_by_round_trip.rs` green | (was) Any ranked output, TPC-H Q1 |
 | **P0** | ~~v0.5: Wire `LogicalPlan::Join` and `SetOp` in `lower_query`~~ ✅ done — `join_round_trip.rs` + `setop_round_trip.rs` green | (was) All TPC-H, all real analytical workloads |
 | **P0** | ~~v0.5: Binder support for `BETWEEN`~~ ✅ done — `bind_between` in `binder/expr_bind.rs` rewrites to `>= AND <=`; `index_scan_round_trip.rs` covers BETWEEN range scans; `IS NULL` still needs end-to-end verification | (was) ANSI surface |
@@ -828,7 +828,7 @@ driver can connect.
 - [x] Index correlation (physical sort order vs logical order)
 - [x] `ANALYZE table` command (AnalyzeRunner over row iterator; kernel only)
 - [x] `ANALYZE` reachable from the wire (Simple Query handler) — wire-level shim accepts `ANALYZE` and `ANALYZE table` and returns the canonical `ANALYZE` command tag (`crates/ultrasql-server/tests/analyze_round_trip.rs`). Real `pg_statistic` writeback through `AnalyzeRunner` remains a follow-up; this shim keeps PostgreSQL clients compatible until then. §3.1.
-- [ ] Autovacuum triggers `ANALYZE` on heavily modified tables
+- [x] Autovacuum triggers `ANALYZE` on heavily modified tables
 - [x] `pg_statistic` catalog table (row shape; persistent adapter v0.8)
 - [x] `CREATE STATISTICS` (extended stats) — wire-level shim accepts the PostgreSQL `CREATE STATISTICS name ON cols FROM table` form and returns the matching command tag (`crates/ultrasql-server/tests/create_statistics_round_trip.rs`). `pg_statistic_ext` row population (dependency coefficients, multi-column MCV) is a follow-up that lands together with the `AnalyzeRunner` `pg_statistic_ext` writeback. §3.3.
 

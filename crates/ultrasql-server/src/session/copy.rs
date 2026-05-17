@@ -419,6 +419,8 @@ where
             warn!(error = %e, "COPY FROM autocommit commit failed");
         }
         self.state.note_commit_for_gc();
+        self.state
+            .note_table_modifications(&entry.name, rows_inserted);
         self.plan_cache_invalidate();
 
         let mut wire_buf = BytesMut::with_capacity(64);

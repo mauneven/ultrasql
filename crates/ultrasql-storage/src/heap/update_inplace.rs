@@ -390,8 +390,8 @@ impl<L: PageLoader> HeapAccess<L> {
 
                 // Capture pre-image (9 bytes: 0 + id + val) directly
                 // from the slot bytes — no decode + re-encode pair.
-                let mut pre_image = UpdatePayload::new();
-                pre_image.extend_from_slice(&src_bytes[payload_off..payload_off + 9]);
+                let mut pre_image = [0_u8; 9];
+                pre_image.copy_from_slice(&src_bytes[payload_off..payload_off + 9]);
                 let tup_id = TupleId::new(src_page_id, src_slot);
                 if wal.is_some() {
                     let mut pre_bytes = [0u8; 9];
