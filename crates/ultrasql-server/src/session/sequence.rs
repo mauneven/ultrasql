@@ -3,12 +3,14 @@
 use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncWrite};
+use ultrasql_core::{RelationId, Xid};
 use ultrasql_parser::ast::{
     Expr as AstExpr, Literal as AstLiteral, SelectItem, Statement, UnaryOp,
 };
 use ultrasql_planner::{LogicalPlan, LogicalSequenceChange, LogicalSequenceOptions};
 use ultrasql_protocol::{BackendMessage, FieldDescription};
 use ultrasql_storage::sequence::{Sequence, SequenceOptions};
+use ultrasql_wal::payload::SequenceOpKind;
 
 use super::Session;
 use crate::TxnState;
@@ -46,6 +48,14 @@ where
         }
         let seq = Sequence::new(to_storage_options(*options))
             .map_err(|e| ServerError::ddl(format!("CREATE SEQUENCE: {e}")))?;
+        seq.emit_wal(
+            SequenceOpKind::Create,
+            sequence_name,
+            RelationId::INVALID,
+            self.sequence_xid(),
+            self.sequence_wal_sink(),
+        )
+        .map_err(|e| ServerError::ddl(format!("CREATE SEQUENCE WAL: {e}")))?;
         self.state
             .sequences
             .insert(sequence_name.clone(), Arc::new(seq));
@@ -78,8 +88,15 @@ where
             })?
             .clone();
         let (storage, restart_value) = apply_sequence_change(seq.options_snapshot(), *options);
-        seq.alter_options(storage, restart_value)
-            .map_err(|e| ServerError::ddl(format!("ALTER SEQUENCE: {e}")))?;
+        seq.alter_options_logged(
+            storage,
+            restart_value,
+            sequence_name,
+            RelationId::INVALID,
+            self.sequence_xid(),
+            self.sequence_wal_sink(),
+        )
+        .map_err(|e| ServerError::ddl(format!("ALTER SEQUENCE: {e}")))?;
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("ALTER SEQUENCE"))
     }
@@ -99,6 +116,17 @@ where
             ));
         };
         for name in sequences {
+            let existing = self.state.sequences.get(name).map(|seq| seq.clone());
+            if let Some(seq) = existing {
+                seq.emit_wal(
+                    SequenceOpKind::Drop,
+                    name,
+                    RelationId::INVALID,
+                    self.sequence_xid(),
+                    self.sequence_wal_sink(),
+                )
+                .map_err(|e| ServerError::ddl(format!("DROP SEQUENCE WAL: {e}")))?;
+            }
             if self.state.sequences.remove(name).is_none() && !*if_exists {
                 return Err(ServerError::Catalog(
                     ultrasql_catalog::CatalogError::not_found(name.clone()),
@@ -135,7 +163,12 @@ where
         let seq_name = expect_sequence_name(&args[0])?;
         let seq = self.sequence_by_name(&seq_name)?;
         let value = seq
-            .nextval()
+            .nextval_logged(
+                &seq_name,
+                RelationId::INVALID,
+                self.sequence_xid(),
+                self.sequence_wal_sink(),
+            )
             .map_err(|e| ServerError::ddl(format!("nextval: {e}")))?;
         self.sequence_state.record_nextval(&seq_name, value);
         Ok(value)
@@ -177,8 +210,15 @@ where
             true
         };
         let seq = self.sequence_by_name(&seq_name)?;
-        seq.setval(value, is_called)
-            .map_err(|e| ServerError::ddl(format!("setval: {e}")))?;
+        seq.setval_logged(
+            value,
+            is_called,
+            &seq_name,
+            RelationId::INVALID,
+            self.sequence_xid(),
+            self.sequence_wal_sink(),
+        )
+        .map_err(|e| ServerError::ddl(format!("setval: {e}")))?;
         if is_called {
             self.sequence_state.record_nextval(&seq_name, value);
         }
@@ -193,6 +233,17 @@ where
             .ok_or_else(|| {
                 ServerError::Catalog(ultrasql_catalog::CatalogError::not_found(name.to_owned()))
             })
+    }
+
+    fn sequence_xid(&self) -> Xid {
+        match &self.txn_state {
+            TxnState::InTransaction(txn) | TxnState::Failed(txn) => txn.current_xid(),
+            TxnState::Idle => Xid::INVALID,
+        }
+    }
+
+    fn sequence_wal_sink(&self) -> Option<&dyn ultrasql_storage::WalSink> {
+        self.state.heap.wal_sink().map(|sink| sink.as_ref())
     }
 }
 

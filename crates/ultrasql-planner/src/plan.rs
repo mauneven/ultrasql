@@ -79,6 +79,17 @@ pub enum LogicalSetQuantifier {
     All,
 }
 
+/// Index access method requested by `CREATE INDEX ... USING`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LogicalIndexMethod {
+    /// PostgreSQL-compatible B-tree method.
+    #[default]
+    Btree,
+    /// Equality-only hash method. UltraSQL stores hash buckets in the
+    /// existing page-backed index substrate in this wave.
+    Hash,
+}
+
 // ============================================================================
 // Aggregate types
 // ============================================================================
@@ -601,11 +612,12 @@ pub enum LogicalPlan {
     /// short-circuits without an error when the index name already
     /// exists.
     ///
-    /// `USING method`, `INCLUDE`, `WHERE` partial-index predicates,
-    /// and expression keys (anything other than a bare column
-    /// reference) return [`crate::error::PlanError::NotSupported`]
-    /// in this wave; the binder rejects them up front so the executor
-    /// arm stays minimal.
+    /// Expression keys, `INCLUDE` covering columns, and partial-index
+    /// predicates are bound into runtime metadata so the server can
+    /// build and maintain the index under DML. Expression and partial
+    /// indexes use conservative scan selection; correctness is provided
+    /// by the sequential-scan fallback whenever a predicate cannot be
+    /// proven indexable.
     CreateIndex {
         /// Index name (caller-supplied or binder-synthesised). Always
         /// lowercase.
@@ -613,10 +625,23 @@ pub enum LogicalPlan {
         /// Target table (lowercase).
         table_name: String,
         /// 0-based column indices into the table schema, in index key
-        /// order.
+        /// order. Expression-key indexes carry an empty vector because
+        /// there is no single attnum to store in `pg_index.indkey`.
         columns: Vec<usize>,
+        /// Bound key expressions. Bare-column indexes carry the same
+        /// columns as [`Self::CreateIndex::columns`] in expression
+        /// form; expression indexes carry the actual key expression.
+        key_exprs: Vec<ScalarExpr>,
+        /// 0-based table columns listed in `INCLUDE (...)`.
+        include_columns: Vec<usize>,
+        /// Bound partial-index predicate, if any.
+        predicate: Option<ScalarExpr>,
+        /// Access method requested by `USING`.
+        method: LogicalIndexMethod,
         /// Whether `UNIQUE` was specified.
         unique: bool,
+        /// Whether `CONCURRENTLY` was specified.
+        concurrently: bool,
         /// Whether `IF NOT EXISTS` was specified.
         if_not_exists: bool,
         /// Always [`Schema::empty`]; DDL emits no rows.
@@ -969,7 +994,7 @@ pub struct LogicalUniqueConstraint {
     pub primary_key: bool,
 }
 
-/// A bound non-deferrable FOREIGN KEY constraint carried by `CREATE TABLE`.
+/// A bound FOREIGN KEY constraint carried by `CREATE TABLE`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalForeignKeyConstraint {
     /// Constraint name, explicit or binder-synthesised.
@@ -984,6 +1009,10 @@ pub struct LogicalForeignKeyConstraint {
     pub on_delete: LogicalReferentialAction,
     /// Action when a referenced key is updated.
     pub on_update: LogicalReferentialAction,
+    /// Whether this constraint may be checked at transaction commit.
+    pub deferrable: bool,
+    /// Whether this deferrable constraint starts in deferred mode.
+    pub initially_deferred: bool,
 }
 
 /// Bound referential action for a foreign key.
@@ -1666,22 +1695,38 @@ impl LogicalPlan {
                 index_name,
                 table_name,
                 columns,
+                key_exprs,
+                method,
                 unique,
+                concurrently,
                 if_not_exists,
                 ..
             } => {
                 out.push_str(&pad);
                 let u = if *unique { "Unique" } else { "" };
+                let c = if *concurrently { " Concurrently" } else { "" };
                 let inx = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+                let method = match method {
+                    LogicalIndexMethod::Btree => "btree",
+                    LogicalIndexMethod::Hash => "hash",
+                };
                 let _ = fmt::write(
                     out,
                     format_args!(
-                        "Create{u}Index{inx}: {index_name} ON {table_name} (cols=[{cols}])\n",
-                        cols = columns
-                            .iter()
-                            .map(usize::to_string)
-                            .collect::<Vec<_>>()
-                            .join(",")
+                        "Create{u}Index{c}{inx}: {index_name} ON {table_name} USING {method} (keys=[{keys}])\n",
+                        keys = if columns.is_empty() {
+                            key_exprs
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        } else {
+                            columns
+                                .iter()
+                                .map(usize::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        }
                     ),
                 );
             }

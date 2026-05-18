@@ -86,6 +86,27 @@ impl WalBuffer {
         Lsn::new(self.durable_lsn.load(Ordering::Acquire))
     }
 
+    /// Advance the buffer's next assigned LSN to at least `lsn`.
+    ///
+    /// Startup recovery uses this after replaying existing WAL segments and
+    /// before accepting new appends, so freshly-written records cannot reuse
+    /// byte positions that already exist on disk. The method is monotonic and
+    /// does not truncate or drain buffered bytes.
+    pub fn advance_to_lsn(&self, lsn: Lsn) {
+        let raw = lsn.raw();
+        {
+            let mut inner = self.inner.lock();
+            if inner.next_lsn < raw {
+                inner.next_lsn = raw;
+            }
+        }
+        let _ = self
+            .durable_lsn
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < raw).then_some(raw)
+            });
+    }
+
     /// Append a record. Returns the LSN at which it was placed.
     ///
     /// The LSN is assigned monotonically inside the lock; callers
@@ -191,6 +212,20 @@ mod tests {
         assert_eq!(a, Lsn::new(1000));
         assert!(b > a);
         assert!(c > b);
+    }
+
+    #[test]
+    fn advance_to_lsn_moves_next_and_durable_lsn_forward() {
+        let buf = WalBuffer::new(64 * 1024, Lsn::ZERO);
+        buf.advance_to_lsn(Lsn::new(4096));
+        assert_eq!(buf.next_lsn(), Lsn::new(4096));
+        assert_eq!(buf.durable_lsn(), Lsn::new(4096));
+        let assigned = buf
+            .append(&rec(RecordType::HeapInsert, b"a", Lsn::ZERO))
+            .unwrap();
+        assert_eq!(assigned, Lsn::new(4096));
+        buf.advance_to_lsn(Lsn::new(1));
+        assert!(buf.next_lsn() > Lsn::new(4096));
     }
 
     #[test]

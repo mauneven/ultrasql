@@ -452,6 +452,30 @@ where
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
                 if res.is_ok() {
+                    if portal_plan
+                        .as_ref()
+                        .and_then(|plan| Self::dml_target_table(plan))
+                        .is_some()
+                    {
+                        if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
+                            let xid = txn.xid;
+                            if let Err(rollback_err) =
+                                self.state.heap.rollback_in_place_updates(xid)
+                            {
+                                tracing::warn!(
+                                    error = %rollback_err,
+                                    "in-place update rollback failed after deferred FK violation",
+                                );
+                            }
+                            if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                                tracing::warn!(
+                                    error = %abort_err,
+                                    "autocommit rollback failed after deferred FK violation (Extended Execute)",
+                                );
+                            }
+                            return Err(e);
+                        }
+                    }
                     if let Err(e) = self.state.txn_manager.commit(txn) {
                         tracing::warn!(
                             error = %e,

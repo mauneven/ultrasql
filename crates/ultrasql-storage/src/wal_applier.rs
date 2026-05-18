@@ -28,15 +28,17 @@
 
 use std::sync::atomic::Ordering;
 
-use ultrasql_core::BlockNumber;
+use ultrasql_core::endian::{read_i64_le, read_u16_le, read_u32_le};
+use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_mvcc::TupleHeader;
 use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_wal::applier::{ApplyError, HeapTarget};
 use ultrasql_wal::payload::{
-    FullPageWritePayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
-    HeapUpdateInPlacePayload, HeapUpdatePayload,
+    BTreeOpKind, BTreeOpPayload, FullPageWritePayload, HeapDeleteInPlacePayload, HeapDeletePayload,
+    HeapInsertPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
 };
 
+use crate::btree::{BTree, BTreeError};
 use crate::buffer_pool::PageLoader;
 use crate::heap::{HeapAccess, UndoEntry, UndoRelationLog};
 use crate::page::PageError;
@@ -494,6 +496,104 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             .copy_from_slice(&payload.page_bytes[..PAGE_SIZE]);
         Ok(())
     }
+
+    /// Replay one B-tree operation into the shared buffer pool.
+    ///
+    /// Insert/delete records carry the logical key and heap TID, so redo can
+    /// rebuild the leaf entry through the normal B-tree API. Split records are
+    /// redundant in this replay model: the preceding insert redo will split
+    /// deterministically when the leaf is full, and full-page writes restore
+    /// any already-flushed split pages before logical redo continues.
+    fn apply_btree_op(&self, payload: &BTreeOpPayload) -> Result<(), ApplyError> {
+        match payload.op {
+            BTreeOpKind::Insert => {
+                let key = decode_btree_key(payload)?;
+                let tid = decode_btree_tid(payload)?;
+                let mut tree = open_or_create_btree(self, payload.index_rel)?;
+                match tree.insert_non_unique::<i64>(key, tid, Xid::INVALID, None) {
+                    Ok(()) | Err(BTreeError::DuplicateKey) => Ok(()),
+                    Err(e) => Err(ApplyError::Refused {
+                        operation: "btree_insert",
+                        detail: e.to_string(),
+                    }),
+                }
+            }
+            BTreeOpKind::Delete => {
+                let key = decode_btree_key(payload)?;
+                let tid = decode_btree_tid(payload)?;
+                let mut tree = open_or_create_btree(self, payload.index_rel)?;
+                tree.delete::<i64>(key, tid)
+                    .map(|_| ())
+                    .map_err(|e| ApplyError::Refused {
+                        operation: "btree_delete",
+                        detail: e.to_string(),
+                    })
+            }
+            BTreeOpKind::Split => Ok(()),
+        }
+    }
+}
+
+fn open_or_create_btree<L: PageLoader + 'static>(
+    heap: &HeapAccess<L>,
+    rel: RelationId,
+) -> Result<BTree<L>, ApplyError> {
+    let tree = BTree::open(std::sync::Arc::clone(&heap.pool), rel, BlockNumber::new(0));
+    match tree.lookup::<i64>(i64::MIN) {
+        Ok(_) => Ok(tree),
+        Err(BTreeError::MalformedNode(_)) | Err(BTreeError::Page(_)) => {
+            BTree::create(std::sync::Arc::clone(&heap.pool), rel).map_err(|e| ApplyError::Refused {
+                operation: "btree_create",
+                detail: e.to_string(),
+            })
+        }
+        Err(e) => Err(ApplyError::Refused {
+            operation: "btree_open",
+            detail: e.to_string(),
+        }),
+    }
+}
+
+fn decode_btree_key(payload: &BTreeOpPayload) -> Result<i64, ApplyError> {
+    if payload.key_bytes.len() != 8 {
+        return Err(ApplyError::Refused {
+            operation: "btree_decode_key",
+            detail: format!("expected 8 key bytes, got {}", payload.key_bytes.len()),
+        });
+    }
+    read_i64_le(&payload.key_bytes).map_err(|e| ApplyError::Refused {
+        operation: "btree_decode_key",
+        detail: e.to_string(),
+    })
+}
+
+fn decode_btree_tid(payload: &BTreeOpPayload) -> Result<TupleId, ApplyError> {
+    if payload.child_or_value.len() != 12 {
+        return Err(ApplyError::Refused {
+            operation: "btree_decode_tid",
+            detail: format!(
+                "expected 12 child/value bytes, got {}",
+                payload.child_or_value.len()
+            ),
+        });
+    }
+    let rel = RelationId::new(read_u32_le(&payload.child_or_value[0..4]).map_err(|e| {
+        ApplyError::Refused {
+            operation: "btree_decode_tid",
+            detail: e.to_string(),
+        }
+    })?);
+    let block = BlockNumber::new(read_u32_le(&payload.child_or_value[4..8]).map_err(|e| {
+        ApplyError::Refused {
+            operation: "btree_decode_tid",
+            detail: e.to_string(),
+        }
+    })?);
+    let slot = read_u16_le(&payload.child_or_value[8..10]).map_err(|e| ApplyError::Refused {
+        operation: "btree_decode_tid",
+        detail: e.to_string(),
+    })?;
+    Ok(TupleId::new(PageId::new(rel, block), slot))
 }
 
 impl<L: PageLoader> HeapAccess<L> {
@@ -535,8 +635,11 @@ mod tests {
     use ultrasql_mvcc::TupleHeader;
     use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
     use ultrasql_wal::applier::HeapTarget;
-    use ultrasql_wal::payload::{HeapDeletePayload, HeapInsertPayload};
+    use ultrasql_wal::payload::{
+        BTreeOpKind, BTreeOpPayload, HeapDeletePayload, HeapInsertPayload,
+    };
 
+    use crate::btree::BTree;
     use crate::buffer_pool::{BufferPool, PageLoader};
     use crate::heap::{HeapAccess, InsertOptions};
     use crate::page::Page;
@@ -592,6 +695,14 @@ mod tests {
 
     fn tuple_id(block: u32, slot: u16) -> TupleId {
         TupleId::new(page_id(block), slot)
+    }
+
+    fn btree_tid_bytes(tid: TupleId) -> Vec<u8> {
+        let mut out = vec![0_u8; 12];
+        out[0..4].copy_from_slice(&tid.page.relation.oid().raw().to_le_bytes());
+        out[4..8].copy_from_slice(&tid.page.block.raw().to_le_bytes());
+        out[8..10].copy_from_slice(&tid.slot.to_le_bytes());
+        out
     }
 
     /// Build a minimal tuple byte vector: a fresh header with no payload.
@@ -701,6 +812,42 @@ mod tests {
         let guard = heap.pool.get_page(pid).unwrap();
         let actual = guard.read().as_bytes().to_vec();
         assert_eq!(actual, page_bytes, "FPW should restore page verbatim");
+    }
+
+    #[test]
+    fn apply_btree_op_replays_insert_and_delete() {
+        let heap = make_heap();
+        let index_rel = RelationId::new(88);
+        let tid = tuple_id(3, 2);
+        let insert = BTreeOpPayload {
+            op: BTreeOpKind::Insert,
+            index_rel,
+            page: PageId::new(index_rel, BlockNumber::new(0)),
+            key_bytes: 42_i64.to_le_bytes().to_vec(),
+            child_or_value: btree_tid_bytes(tid),
+        };
+
+        heap.apply_btree_op(&insert).unwrap();
+        heap.apply_btree_op(&insert).unwrap();
+
+        let tree = BTree::open(
+            Arc::clone(heap.buffer_pool()),
+            index_rel,
+            BlockNumber::new(0),
+        );
+        assert_eq!(tree.lookup_all::<i64>(42).unwrap(), vec![tid]);
+
+        let delete = BTreeOpPayload {
+            op: BTreeOpKind::Delete,
+            ..insert
+        };
+        heap.apply_btree_op(&delete).unwrap();
+        let tree = BTree::open(
+            Arc::clone(heap.buffer_pool()),
+            index_rel,
+            BlockNumber::new(0),
+        );
+        assert!(tree.lookup_all::<i64>(42).unwrap().is_empty());
     }
 
     #[test]

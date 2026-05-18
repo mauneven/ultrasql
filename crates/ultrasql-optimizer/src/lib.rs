@@ -53,7 +53,7 @@ pub mod stats;
 pub use cost::{CostEstimate, CostGucs, CostModel, NoStats, StatsSource};
 pub use enumeration::{
     JoinEnumerator, Memo, PhysicalOp, choose_enumerator, outer_join_subtree_is_barrier,
-    reorder_inner_joins,
+    reorder_inner_joins, reorder_inner_joins_with_stats,
 };
 pub use error::OptimizeError;
 pub use plan_cache::{PlanCache, PlanCacheConfig, PlanCacheEntry, PlanCacheKey};
@@ -97,10 +97,10 @@ use ultrasql_planner::LogicalPlan;
 pub fn optimize(
     plan: LogicalPlan,
     _catalog_snapshot: &Arc<CatalogSnapshot>,
-    _stats: &dyn StatsSource,
+    stats: &dyn StatsSource,
 ) -> Result<LogicalPlan, OptimizeError> {
     let rewritten = Optimizer::new().optimize(plan)?;
-    Ok(reorder_inner_joins(&rewritten))
+    Ok(reorder_inner_joins_with_stats(&rewritten, stats))
 }
 
 // ============================================================================

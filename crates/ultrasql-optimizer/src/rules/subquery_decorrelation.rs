@@ -744,20 +744,15 @@ fn rewrite_in_subquery_filter_expr(
     predicate: &ScalarExpr,
 ) -> Option<LogicalPlan> {
     let conjuncts = split_and(predicate);
-    let (idx, in_expr) = conjuncts.iter().enumerate().find(|(_, c)| {
-        matches!(
-            c,
-            ScalarExpr::InSubquery {
-                correlated: false,
-                ..
-            }
-        )
-    })?;
+    let (idx, in_expr) = conjuncts
+        .iter()
+        .enumerate()
+        .find(|(_, c)| matches!(c, ScalarExpr::InSubquery { .. }))?;
     let ScalarExpr::InSubquery {
         expr,
         subplan,
         negated,
-        correlated: false,
+        correlated,
         data_type,
     } = in_expr
     else {
@@ -769,6 +764,9 @@ fn rewrite_in_subquery_filter_expr(
         .filter_map(|(i, c)| if i == idx { None } else { Some(c.clone()) })
         .collect::<Vec<_>>();
     let outer = filter_with_conjuncts(outer.clone(), rest);
+    if *correlated {
+        return rewrite_correlated_in_subquery(&outer, expr, *subplan.clone(), *negated, data_type);
+    }
     if subplan.schema().len() != 1 {
         return None;
     }
@@ -797,6 +795,109 @@ fn rewrite_in_subquery_filter_expr(
         schema: outer.schema().clone(),
     };
     Some(join)
+}
+
+fn rewrite_correlated_in_subquery(
+    outer: &LogicalPlan,
+    outer_expr: &ScalarExpr,
+    subplan: LogicalPlan,
+    negated: bool,
+    data_type: &DataType,
+) -> Option<LogicalPlan> {
+    let (right, corr_pairs, value_index, value_name) =
+        build_correlated_in_right(subplan, data_type)?;
+    let outer_width = outer.schema().len();
+    let mut predicates = vec![build_correlation_condition_against_right_schema(
+        &corr_pairs,
+        outer_width,
+    )];
+    predicates.push(ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(outer_expr.clone()),
+        right: Box::new(ScalarExpr::Column {
+            name: value_name,
+            index: outer_width + value_index,
+            data_type: data_type.clone(),
+        }),
+        data_type: DataType::Bool,
+    });
+    Some(LogicalPlan::Join {
+        left: Box::new(outer.clone()),
+        right: Box::new(right),
+        join_type: if negated {
+            LogicalJoinType::Anti
+        } else {
+            LogicalJoinType::Semi
+        },
+        condition: LogicalJoinCondition::On(conjuncts_to_and(predicates)),
+        schema: outer.schema().clone(),
+    })
+}
+
+fn build_correlated_in_right(
+    plan: LogicalPlan,
+    data_type: &DataType,
+) -> Option<(LogicalPlan, Vec<CorrPair>, usize, String)> {
+    let LogicalPlan::Project {
+        input,
+        exprs,
+        schema,
+    } = plan
+    else {
+        return None;
+    };
+    if schema.len() != 1 || exprs.len() != 1 || exprs[0].0.contains_outer_column() {
+        return None;
+    }
+    let (clean_input, corr_pairs) = extract_correlated_scalar_input(*input)?;
+    if corr_pairs.is_empty() {
+        return None;
+    }
+
+    let value_name = "__in_subquery".to_owned();
+    let mut fields = corr_fields(&corr_pairs);
+    fields.push(Field::nullable(value_name.clone(), data_type.clone()));
+    let project_schema = Schema::new(fields).ok()?;
+
+    let mut project_exprs = Vec::with_capacity(corr_pairs.len() + 1);
+    let mut projected_pairs = Vec::with_capacity(corr_pairs.len());
+    for (idx, pair) in corr_pairs.iter().enumerate() {
+        project_exprs.push((
+            ScalarExpr::Column {
+                name: pair.inner_name.clone(),
+                index: pair.inner_index,
+                data_type: pair.inner_type.clone(),
+            },
+            format!("__corr_{idx}"),
+        ));
+        let mut projected_pair = pair.clone();
+        projected_pair.inner_index = idx;
+        projected_pairs.push(projected_pair);
+    }
+    project_exprs.push((exprs[0].0.clone(), value_name.clone()));
+    let project = LogicalPlan::Project {
+        input: Box::new(clean_input),
+        exprs: project_exprs,
+        schema: project_schema.clone(),
+    };
+    let group_by = project_schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(idx, field)| ScalarExpr::Column {
+            name: field.name.clone(),
+            index: idx,
+            data_type: field.data_type.clone(),
+        })
+        .collect::<Vec<_>>();
+    let right = LogicalPlan::Aggregate {
+        input: Box::new(project),
+        group_by,
+        aggregates: Vec::new(),
+        schema: project_schema,
+    };
+    let value_index = projected_pairs.len();
+    Some((right, projected_pairs, value_index, value_name))
 }
 
 fn strip_exists_projection(plan: LogicalPlan) -> LogicalPlan {
@@ -1971,6 +2072,96 @@ mod tests {
             .expect("no error")
             .expect("rewrite");
         assert_eq!(result.schema().len(), 2);
+        assert!(matches!(
+            result,
+            LogicalPlan::Join {
+                join_type: LogicalJoinType::Anti,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn real_correlated_in_rewrites_to_semi_join() {
+        let sub = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(sub_scan()),
+                predicate: ScalarExpr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(col("data", 1, DataType::Int32)),
+                    right: Box::new(outer_col("val", 1, DataType::Int32)),
+                    data_type: DataType::Bool,
+                },
+            }),
+            exprs: vec![(col("key", 0, DataType::Int32), "key".into())],
+            schema: Schema::new([Field::required("key", DataType::Int32)]).expect("schema ok"),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(outer_scan()),
+            predicate: ScalarExpr::InSubquery {
+                expr: Box::new(col("id", 0, DataType::Int32)),
+                subplan: Box::new(sub),
+                negated: false,
+                correlated: true,
+                data_type: DataType::Int32,
+            },
+        };
+
+        let result = SubqueryDecorrelation
+            .apply(&plan)
+            .expect("no error")
+            .expect("rewrite");
+        let LogicalPlan::Join {
+            right,
+            join_type,
+            condition,
+            ..
+        } = result
+        else {
+            panic!("correlated IN should become join");
+        };
+        assert_eq!(join_type, LogicalJoinType::Semi);
+        assert!(matches!(right.as_ref(), LogicalPlan::Aggregate { .. }));
+        let LogicalJoinCondition::On(predicate) = condition else {
+            panic!("expected ON predicate");
+        };
+        let dump = predicate.to_string();
+        assert!(
+            dump.contains("val") && dump.contains("__in_subquery"),
+            "correlated IN predicate should match both correlation key and projected value, got {dump}"
+        );
+    }
+
+    #[test]
+    fn real_correlated_not_in_rewrites_to_anti_join() {
+        let sub = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(sub_scan()),
+                predicate: ScalarExpr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(col("data", 1, DataType::Int32)),
+                    right: Box::new(outer_col("val", 1, DataType::Int32)),
+                    data_type: DataType::Bool,
+                },
+            }),
+            exprs: vec![(col("key", 0, DataType::Int32), "key".into())],
+            schema: Schema::new([Field::required("key", DataType::Int32)]).expect("schema ok"),
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(outer_scan()),
+            predicate: ScalarExpr::InSubquery {
+                expr: Box::new(col("id", 0, DataType::Int32)),
+                subplan: Box::new(sub),
+                negated: true,
+                correlated: true,
+                data_type: DataType::Int32,
+            },
+        };
+
+        let result = SubqueryDecorrelation
+            .apply(&plan)
+            .expect("no error")
+            .expect("rewrite");
         assert!(matches!(
             result,
             LogicalPlan::Join {

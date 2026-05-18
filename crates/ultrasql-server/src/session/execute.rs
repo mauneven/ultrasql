@@ -42,8 +42,7 @@ use crate::result_encoder::{
 };
 use crate::{
     BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
-    run_plan_in_txn, try_run_cached_int32_pair_select,
-    try_run_cached_scalar_aggregate_select,
+    run_plan_in_txn, try_run_cached_int32_pair_select, try_run_cached_scalar_aggregate_select,
 };
 
 #[derive(Debug)]
@@ -702,8 +701,7 @@ where
         // `select_scan_10k` hot path. Explicit transaction blocks keep
         // the normal machinery so `ReadyForQuery` state and command-id
         // progression stay unchanged there.
-        if matches!(self.txn_state, TxnState::Idle)
-        {
+        if matches!(self.txn_state, TxnState::Idle) {
             if let Some(result) = try_run_cached_int32_pair_select(
                 plan,
                 catalog_snapshot,
@@ -789,17 +787,36 @@ where
         txn: Transaction,
         outcome: Result<SelectResult, ServerError>,
     ) -> Result<SelectResult, ServerError> {
-        match &outcome {
-            Ok(_) => {
+        match outcome {
+            Ok(result) => {
+                if Self::dml_target_table(plan).is_some() {
+                    if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
+                        let xid = txn.xid;
+                        if let Err(rollback_err) = self.state.heap.rollback_in_place_updates(xid) {
+                            tracing::warn!(
+                                error = %rollback_err,
+                                "in-place update rollback failed after deferred FK violation",
+                            );
+                        }
+                        if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                            tracing::warn!(
+                                error = %abort_err,
+                                "autocommit rollback failed after deferred FK violation",
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
                 if let Err(e) = self.state.txn_manager.commit(txn) {
                     tracing::warn!(error = %e, "autocommit failed to finalise");
                 } else {
                     self.pending_post_commit_maintenance = true;
-                    let rows = outcome.as_ref().map_or(0, |r| r.rows);
+                    let rows = result.rows;
                     self.note_dml_effect(plan, rows);
                 }
+                Ok(result)
             }
-            Err(_) => {
+            Err(e) => {
                 // Roll back any in-place UPDATE writes by this txn
                 // *before* terminating the CLOG entry, so the undo
                 // log walker still sees the writer's XID.
@@ -810,9 +827,9 @@ where
                 if let Err(abort_err) = self.state.txn_manager.abort(txn) {
                     tracing::warn!(error = %abort_err, "autocommit rollback failed");
                 }
+                Err(e)
             }
         }
-        outcome
     }
 
     fn try_parse_analyze_target(&self, trimmed_sql: &str) -> Option<Option<String>> {
@@ -878,7 +895,9 @@ where
             }
             idx += 1;
         }
-        if columns.is_empty() || idx + 2 != tokens.len() || !tokens[idx].eq_ignore_ascii_case("from")
+        if columns.is_empty()
+            || idx + 2 != tokens.len()
+            || !tokens[idx].eq_ignore_ascii_case("from")
         {
             return Err(ServerError::ddl("malformed CREATE STATISTICS"));
         }
@@ -916,8 +935,9 @@ where
                     ))
                 })?;
             stxkeys.push(
-                i16::try_from(position.saturating_add(1))
-                    .map_err(|_| ServerError::ddl("CREATE STATISTICS table has too many columns"))?,
+                i16::try_from(position.saturating_add(1)).map_err(|_| {
+                    ServerError::ddl("CREATE STATISTICS table has too many columns")
+                })?,
             );
         }
         let row = StatisticExtRow {
@@ -929,8 +949,32 @@ where
         };
         self.state
             .persistent_catalog
-            .create_statistic_ext(row)
+            .create_statistic_ext(row.clone())
             .map_err(ServerError::Catalog)?;
+        let catalog_txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        if let Err(e) = self.state.persistent_catalog.persist_statistic_ext_row(
+            &row,
+            self.state.heap.as_ref(),
+            catalog_txn.xid,
+            catalog_txn.current_command,
+        ) {
+            if let Err(abort_err) = self.state.txn_manager.abort(catalog_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "CREATE STATISTICS catalog transaction abort failed",
+                );
+            }
+            return Err(ServerError::Catalog(e));
+        }
+        if let Err(e) = self.state.txn_manager.commit(catalog_txn) {
+            tracing::warn!(
+                error = %e,
+                "CREATE STATISTICS catalog transaction commit failed",
+            );
+        }
         self.plan_cache_invalidate();
         Ok(result_encoder::SelectResult {
             messages: vec![BackendMessage::CommandComplete {
@@ -1090,7 +1134,7 @@ where
         self.pending_table_modifications.clear();
     }
 
-    fn dml_target_table(plan: &LogicalPlan) -> Option<&str> {
+    pub(crate) fn dml_target_table(plan: &LogicalPlan) -> Option<&str> {
         match plan {
             LogicalPlan::Insert { table, .. }
             | LogicalPlan::Update { table, .. }

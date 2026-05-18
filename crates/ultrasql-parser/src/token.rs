@@ -184,6 +184,8 @@ pub enum TokenKind {
     KwComment,
     /// `CONFLICT` — used in `ON CONFLICT`.
     KwConflict,
+    /// `CONCURRENTLY` — used in `CREATE INDEX CONCURRENTLY`.
+    KwConcurrently,
     KwConstraint,
     KwCreate,
     KwCross,
@@ -308,12 +310,20 @@ pub enum TokenKind {
     KwCache,
     /// `CYCLE` — used in `CREATE SEQUENCE … CYCLE / NO CYCLE`.
     KwCycle,
+    /// `DEFERRABLE` — used in foreign-key constraints.
+    KwDeferrable,
+    /// `DEFERRED` — used in deferrable constraints.
+    KwDeferred,
     /// `IF` — used in `CREATE TABLE IF NOT EXISTS` / `DROP TABLE IF EXISTS`.
     KwIf,
     /// `INCLUDE` — used in `CREATE INDEX … INCLUDE (col, …)`.
     KwInclude,
     /// `INCREMENT` — used in `CREATE SEQUENCE … INCREMENT BY n`.
     KwIncrement,
+    /// `INITIALLY` — used in deferrable constraints.
+    KwInitially,
+    /// `IMMEDIATE` — used in deferrable constraints.
+    KwImmediate,
     /// `LOCAL` — used in `SET LOCAL …`.
     KwLocal,
     /// `MAXVALUE` — used in `CREATE SEQUENCE … MAXVALUE n`.

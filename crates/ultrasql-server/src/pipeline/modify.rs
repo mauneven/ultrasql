@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ultrasql_catalog::{IndexEntry, TableEntry};
-use ultrasql_core::{CommandId, DataType, RelationId, TupleId, Value, Xid};
+use ultrasql_core::{CommandId, DataType, RelationId, Schema, TupleId, Value, Xid};
 use ultrasql_executor::fused_delete::FusedDeleteInt32Pair;
 use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
 use ultrasql_executor::{
@@ -12,7 +12,9 @@ use ultrasql_executor::{
     Project, RowCodec, RowConstraintCheck, RowUpdateConstraintCheck, SeqScan, SequenceDefault,
     ValuesScan,
 };
-use ultrasql_planner::{BinaryOp, LogicalPlan, LogicalReferentialAction, ScalarExpr};
+use ultrasql_planner::{
+    BinaryOp, LogicalIndexMethod, LogicalPlan, LogicalReferentialAction, ScalarExpr,
+};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::heap::{DeleteOptions, UpdateOptions, UpdatePayload};
 
@@ -43,13 +45,11 @@ pub(super) fn lower_real_insert(
     source: &LogicalPlan,
     on_conflict: Option<&ultrasql_planner::LogicalOnConflict>,
     returning: &[(ScalarExpr, String)],
+    returning_schema: &Schema,
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
     if on_conflict.is_some() {
         return Err(ServerError::Unsupported("INSERT ... ON CONFLICT"));
-    }
-    if !returning.is_empty() {
-        return Err(ServerError::Unsupported("INSERT ... RETURNING"));
     }
     let entry = ctx
         .catalog_snapshot
@@ -138,6 +138,14 @@ pub(super) fn lower_real_insert(
     } else {
         modify
     };
+    let modify = if returning.is_empty() {
+        modify
+    } else {
+        modify.with_returning(
+            returning.iter().map(|(expr, _name)| expr.clone()).collect(),
+            returning_schema.clone(),
+        )
+    };
     Ok(Box::new(modify))
 }
 
@@ -185,6 +193,7 @@ fn build_sequence_defaults(
         Arc::new(move |name: &str, value: i64| state.record_nextval(name, value))
             as Arc<dyn Fn(&str, i64) + Send + Sync>
     });
+    let wal = ctx.heap.wal_sink().cloned();
     defaults
         .iter()
         .map(|name| {
@@ -199,6 +208,7 @@ fn build_sequence_defaults(
                     ServerError::Catalog(ultrasql_catalog::CatalogError::not_found(name.clone()))
                 })?;
             let mut default = SequenceDefault::new(name.clone(), sequence);
+            default = default.with_wal(wal.clone(), ctx.xid, ultrasql_core::RelationId::INVALID);
             if let Some(observer) = &observer {
                 default = default.with_observer(Arc::clone(observer));
             }
@@ -213,6 +223,9 @@ fn build_foreign_key_checks(
 ) -> Result<Vec<RowConstraintCheck>, ServerError> {
     let mut out = Vec::with_capacity(foreign_keys.len());
     for fk in foreign_keys {
+        if fk.deferrable && fk.initially_deferred {
+            continue;
+        }
         let parent = ctx
             .catalog_snapshot
             .tables
@@ -255,6 +268,12 @@ fn build_referenced_by_delete_checks(
         let child = table_entry_by_oid(ctx, child_oid)?;
         for fk in &item.value().foreign_keys {
             if fk.target_oid != parent_oid {
+                continue;
+            }
+            if fk.deferrable
+                && fk.initially_deferred
+                && fk.on_delete == LogicalReferentialAction::NoAction
+            {
                 continue;
             }
             let heap = Arc::clone(&ctx.heap);
@@ -335,6 +354,12 @@ fn build_referenced_by_update_checks(
         let child = table_entry_by_oid(ctx, child_oid)?;
         for fk in &item.value().foreign_keys {
             if fk.target_oid != parent_oid {
+                continue;
+            }
+            if fk.deferrable
+                && fk.initially_deferred
+                && fk.on_update == LogicalReferentialAction::NoAction
+            {
                 continue;
             }
             let heap = Arc::clone(&ctx.heap);
@@ -576,6 +601,8 @@ fn update_child_rows_for_delete_action(
     let codec = RowCodec::new(child.schema.clone());
     let mut edits: Vec<(TupleId, UpdatePayload)> = Vec::with_capacity(rows.len());
     let mut index_updates = build_referential_index_updates(heap, child, indexes, rows)?;
+    let wal = heap.wal_sink().cloned();
+    let wal_ref = wal.as_deref();
 
     for (row_idx, (tid, old_row)) in rows.iter().enumerate() {
         let mut new_row = old_row.clone();
@@ -588,9 +615,15 @@ fn update_child_rows_for_delete_action(
             }
             new_row[col] = match action {
                 LogicalReferentialAction::SetNull => Value::Null,
-                LogicalReferentialAction::SetDefault => {
-                    referential_default_value(child, col, constraints, sequences, sequence_state)?
-                }
+                LogicalReferentialAction::SetDefault => referential_default_value(
+                    child,
+                    col,
+                    constraints,
+                    sequences,
+                    sequence_state,
+                    wal_ref,
+                    xid,
+                )?,
                 LogicalReferentialAction::Cascade
                 | LogicalReferentialAction::NoAction
                 | LogicalReferentialAction::Restrict => {
@@ -609,8 +642,6 @@ fn update_child_rows_for_delete_action(
     }
 
     precheck_referential_index_updates(&index_updates)?;
-    let wal = heap.wal_sink().cloned();
-    let wal_ref = wal.as_deref();
     let outcomes = heap
         .update_many_with_outcomes(
             edits,
@@ -693,6 +724,8 @@ fn referential_default_value(
     constraints: &crate::TableRuntimeConstraints,
     sequences: &dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>,
     sequence_state: Option<&crate::SequenceSessionState>,
+    wal: Option<&dyn ultrasql_storage::WalSink>,
+    xid: Xid,
 ) -> Result<Value, ultrasql_executor::ExecError> {
     let field = child.schema.field_at(col);
     if let Some(seq_name) = constraints
@@ -705,9 +738,13 @@ fn referential_default_value(
                 "sequence default {seq_name} not found"
             ))
         })?;
-        let raw = sequence.nextval().map_err(|e| {
-            ultrasql_executor::ExecError::TypeMismatch(format!("sequence default {seq_name}: {e}"))
-        })?;
+        let raw = sequence
+            .nextval_logged(seq_name, ultrasql_core::RelationId::INVALID, xid, wal)
+            .map_err(|e| {
+                ultrasql_executor::ExecError::TypeMismatch(format!(
+                    "sequence default {seq_name}: {e}"
+                ))
+            })?;
         if let Some(state) = sequence_state {
             state.record_nextval(seq_name, raw);
         }
@@ -937,7 +974,32 @@ fn build_one_insert_index_maintainer(
         .iter()
         .map(|attnum| usize::from(*attnum))
         .collect();
-    let encoding = crate::index_key::IndexKeyEncoding::for_columns(&entry.schema, &columns)?;
+    let runtime = ctx
+        .table_constraints
+        .get(&entry.oid)
+        .and_then(|constraints| constraints.indexes.get(&index.oid).cloned());
+    let key_exprs = runtime
+        .as_ref()
+        .map(|metadata| metadata.key_exprs.clone())
+        .unwrap_or_default();
+    let predicate = runtime
+        .as_ref()
+        .and_then(|metadata| metadata.predicate.clone());
+    let method = runtime
+        .as_ref()
+        .map_or(LogicalIndexMethod::Btree, |metadata| metadata.method);
+    let encoding = if method == LogicalIndexMethod::Hash {
+        crate::index_key::IndexKeyEncoding::Int64
+    } else if key_exprs.is_empty() {
+        crate::index_key::IndexKeyEncoding::for_columns(&entry.schema, &columns)?
+    } else {
+        let [expr] = key_exprs.as_slice() else {
+            return Err(ServerError::Unsupported(
+                "CREATE INDEX: expression indexes support exactly one key in this wave",
+            ));
+        };
+        crate::index_key::IndexKeyEncoding::for_data_type(&expr.data_type())?
+    };
     let index_rel = RelationId::new(index.oid.raw());
     let tree = BTree::open(
         Arc::clone(ctx.heap.buffer_pool()),
@@ -946,6 +1008,35 @@ fn build_one_insert_index_maintainer(
     );
     let index_name = index.name.clone();
     let encoder: InsertIndexEncoder = Arc::new(move |row: &[Value]| {
+        if let Some(predicate) = &predicate {
+            match Eval::new(predicate.clone()).eval(row).map_err(|e| {
+                ultrasql_executor::ExecError::TypeMismatch(format!(
+                    "index {index_name} partial predicate: {e}"
+                ))
+            })? {
+                Value::Bool(true) => {}
+                Value::Bool(false) | Value::Null => return Ok(None),
+                other => {
+                    return Err(ultrasql_executor::ExecError::TypeMismatch(format!(
+                        "index {index_name} partial predicate returned {:?}, expected bool",
+                        other.data_type()
+                    )));
+                }
+            }
+        }
+        if !key_exprs.is_empty() {
+            let value = Eval::new(key_exprs[0].clone()).eval(row).map_err(|e| {
+                ultrasql_executor::ExecError::TypeMismatch(format!(
+                    "index {index_name} expression key: {e}"
+                ))
+            })?;
+            if method == LogicalIndexMethod::Hash {
+                return Ok(crate::hash_index_value(&value));
+            }
+            return encoding.encode_value(&value).map_err(|e| {
+                ultrasql_executor::ExecError::TypeMismatch(format!("index {index_name}: {e}"))
+            });
+        }
         let encoded = match columns.as_slice() {
             [col] => {
                 let value = row.get(*col).ok_or_else(|| {
@@ -953,6 +1044,9 @@ fn build_one_insert_index_maintainer(
                         "index {index_name}: row missing key column {col}"
                     ))
                 })?;
+                if method == LogicalIndexMethod::Hash {
+                    return Ok(crate::hash_index_value(value));
+                }
                 encoding.encode_value(value).map_err(|e| {
                     ultrasql_executor::ExecError::TypeMismatch(format!("index {index_name}: {e}"))
                 })?
@@ -1160,11 +1254,9 @@ pub(super) fn lower_real_update(
     assignments: &[(usize, ScalarExpr)],
     input: &LogicalPlan,
     returning: &[(ScalarExpr, String)],
+    returning_schema: &Schema,
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
-    if !returning.is_empty() {
-        return Err(ServerError::Unsupported("UPDATE ... RETURNING"));
-    }
     let entry = ctx
         .catalog_snapshot
         .tables
@@ -1192,7 +1284,7 @@ pub(super) fn lower_real_update(
     // chain entirely and lower to the single `FusedUpdateInt32Add`
     // operator. Saves ~150 µs / 10 000-row UPDATE on the bench shape
     // — see the operator's module header for the full motivation.
-    if !has_indexes && !has_child_constraints && !has_parent_constraints {
+    if returning.is_empty() && !has_indexes && !has_child_constraints && !has_parent_constraints {
         if let Some(fused) = try_build_fused_update(table, entry, assignments, input, ctx)? {
             return Ok(fused);
         }
@@ -1242,6 +1334,14 @@ pub(super) fn lower_real_update(
         modify.with_update_indexes(build_insert_index_maintainers(entry, ctx)?)
     } else {
         modify
+    };
+    let modify = if returning.is_empty() {
+        modify
+    } else {
+        modify.with_returning(
+            returning.iter().map(|(expr, _name)| expr.clone()).collect(),
+            returning_schema.clone(),
+        )
     };
     Ok(Box::new(modify))
 }
@@ -1326,11 +1426,9 @@ pub(super) fn lower_real_delete(
     table: &str,
     input: &LogicalPlan,
     returning: &[(ScalarExpr, String)],
+    returning_schema: &Schema,
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
-    if !returning.is_empty() {
-        return Err(ServerError::Unsupported("DELETE ... RETURNING"));
-    }
     let entry = ctx
         .catalog_snapshot
         .tables
@@ -1350,7 +1448,10 @@ pub(super) fn lower_real_delete(
     // and the optional filter is `Int32 col cmp Int32 lit`, bypass
     // the SeqScan + Filter + ModifyTable chain and lower to the
     // single-pass `FusedDeleteInt32Pair` operator.
-    if !has_indexes && build_referenced_by_delete_checks(entry.oid, ctx)?.is_empty() {
+    if returning.is_empty()
+        && !has_indexes
+        && build_referenced_by_delete_checks(entry.oid, ctx)?.is_empty()
+    {
         if let Some(fused) = try_build_fused_delete(table, entry, input, ctx)? {
             return Ok(fused);
         }
@@ -1379,6 +1480,14 @@ pub(super) fn lower_real_delete(
     };
     let modify =
         modify.with_referenced_by_delete_checks(build_referenced_by_delete_checks(entry.oid, ctx)?);
+    let modify = if returning.is_empty() {
+        modify
+    } else {
+        modify.with_returning(
+            returning.iter().map(|(expr, _name)| expr.clone()).collect(),
+            returning_schema.clone(),
+        )
+    };
     Ok(Box::new(modify))
 }
 

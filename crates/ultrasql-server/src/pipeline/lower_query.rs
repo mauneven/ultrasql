@@ -4,7 +4,10 @@
 use std::sync::Arc;
 
 use ultrasql_core::Schema;
-use ultrasql_executor::{Filter, HashAggregate, Limit, Operator, ResultOp, Sort, ValuesScan};
+use ultrasql_executor::unique::UniqueMode;
+use ultrasql_executor::{
+    Filter, HashAggregate, Limit, Operator, ResultOp, Sort, Unique, ValuesScan,
+};
 use ultrasql_planner::{LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
 
@@ -16,7 +19,7 @@ use super::agg_fuse::{
 };
 use super::cte_helpers::{lower_recursive_cte, lower_set_op_real};
 use super::index_scan::{try_index_only_scan, try_index_scan, try_ordered_index_scan};
-use super::join::lower_join;
+use super::join::{LowerJoinArgs, lower_join};
 use super::modify::{
     lower_project_columns, lower_real_delete, lower_real_insert, lower_real_update,
 };
@@ -38,8 +41,17 @@ pub fn lower_query(
             source,
             on_conflict,
             returning,
+            schema,
             ..
-        } => lower_real_insert(table, columns, source, on_conflict.as_ref(), returning, ctx),
+        } => lower_real_insert(
+            table,
+            columns,
+            source,
+            on_conflict.as_ref(),
+            returning,
+            schema,
+            ctx,
+        ),
         LogicalPlan::Values { rows, schema } => {
             Ok(Box::new(ValuesScan::new(rows.clone(), schema.clone())))
         }
@@ -132,14 +144,16 @@ pub fn lower_query(
             assignments,
             input,
             returning,
+            schema,
             ..
-        } => lower_real_update(table, assignments, input, returning, ctx),
+        } => lower_real_update(table, assignments, input, returning, schema, ctx),
         LogicalPlan::Delete {
             table,
             input,
             returning,
+            schema,
             ..
-        } => lower_real_delete(table, input, returning, ctx),
+        } => lower_real_delete(table, input, returning, schema, ctx),
         LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
@@ -203,15 +217,17 @@ pub fn lower_query(
             let right_schema = right.schema().clone();
             let left_op = lower_query(left, ctx)?;
             let right_op = lower_query(right, ctx)?;
-            lower_join(
-                left_op,
-                right_op,
+            lower_join(LowerJoinArgs {
+                left_plan: left,
+                right_plan: right,
+                left: left_op,
+                right: right_op,
                 left_schema,
                 right_schema,
-                *join_type,
+                join_type: *join_type,
                 condition,
-                schema.clone(),
-            )
+                out_schema: schema.clone(),
+            })
         }
         LogicalPlan::Aggregate {
             input,
@@ -219,6 +235,21 @@ pub fn lower_query(
             aggregates,
             schema,
         } => {
+            if aggregates.is_empty() && !group_by.is_empty() {
+                if let LogicalPlan::Sort {
+                    input: sort_input,
+                    keys,
+                } = input.as_ref()
+                    && keys.len() == group_by.len()
+                    && keys.iter().all(|k| k.asc)
+                    && keys.iter().zip(group_by.iter()).all(|(k, g)| &k.expr == g)
+                {
+                    let child = lower_query(sort_input, ctx)?;
+                    return Ok(Box::new(Unique::new(child, UniqueMode::Sort)));
+                }
+                let child = lower_query(input, ctx)?;
+                return Ok(Box::new(Unique::new(child, UniqueMode::Hash)));
+            }
             // Fast path: `SELECT SUM(int_col) FROM t WHERE int_col op lit`
             // collapses to one fused operator that runs SIMD
             // compare → mask → sum in a single

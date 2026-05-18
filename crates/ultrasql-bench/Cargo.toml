@@ -16,7 +16,7 @@ autobins = false
 # Enables the PostgreSQL execution path in tpch::runner and tpch::load,
 # pulling in tokio-postgres. Off by default so the crate builds cleanly
 # without a running Postgres instance.
-pg-runner = ["dep:tokio-postgres", "dep:chrono"]
+pg-runner = ["dep:tokio-postgres", "dep:chrono", "dep:bytes", "dep:futures"]
 # Enables the wire-protocol cross-engine benchmark driver
 # (`cross_compare_sql`): spawns an in-process `ultrasqld` and connects
 # via `tokio-postgres` so UltraSQL is measured through the same SQL

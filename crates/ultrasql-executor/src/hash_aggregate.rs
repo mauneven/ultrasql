@@ -181,6 +181,9 @@ impl GroupKey {
 #[derive(Debug)]
 pub struct HashAggregate {
     child: Box<dyn Operator>,
+    /// Original GROUP BY expressions. Retained alongside the compiled
+    /// evaluators so the build phase can detect columnar fast paths.
+    group_keys: Vec<ScalarExpr>,
     /// Compiled evaluators for the GROUP BY expressions.
     group_key_evals: Vec<Eval>,
     /// Aggregate function descriptors.
@@ -219,9 +222,10 @@ impl HashAggregate {
         aggregates: Vec<LogicalAggregateExpr>,
         schema: Schema,
     ) -> Self {
-        let group_key_evals = group_keys.into_iter().map(Eval::new).collect();
+        let group_key_evals = group_keys.iter().cloned().map(Eval::new).collect();
         Self {
             child,
+            group_keys,
             group_key_evals,
             aggregates,
             schema,
@@ -340,6 +344,17 @@ impl HashAggregate {
             return Ok(vec![row]);
         }
 
+        if allow_vectorized
+            && has_group_keys
+            && let Some(plan) = build_grouped_vectorized_plan(
+                &self.group_keys,
+                &self.aggregates,
+                self.child.schema(),
+            )
+        {
+            return self.build_grouped_vectorized(plan);
+        }
+
         // General path: row-at-a-time evaluation against a `HashMap<GroupKey, …>`.
         let mut table: HashMap<GroupKey, Vec<AggState>> = HashMap::new();
         let child_schema = self.child.schema().clone();
@@ -407,15 +422,75 @@ impl HashAggregate {
         }
         Ok(output)
     }
+
+    fn build_grouped_vectorized(
+        &mut self,
+        plan: GroupedVecPlan,
+    ) -> Result<Vec<Vec<Value>>, ExecError> {
+        let mut table: HashMap<Option<i64>, i64> = HashMap::new();
+        loop {
+            if let Some(flag) = self.cancel_flag.as_ref()
+                && flag.is_set()
+            {
+                return Err(ExecError::Cancelled);
+            }
+            let Some(batch) = self.child.next_batch()? else {
+                break;
+            };
+            grouped_vectorized_step(&plan, &batch, &mut table)?;
+        }
+
+        let mut output = Vec::with_capacity(table.len());
+        for (key, sum) in table {
+            let key_value = match (plan.key, key) {
+                (_, None) => Value::Null,
+                (GroupedKey::Int32, Some(v)) => Value::Int32(
+                    i32::try_from(v)
+                        .map_err(|_| ExecError::TypeMismatch("group key overflow".to_owned()))?,
+                ),
+                (GroupedKey::Int64, Some(v)) => Value::Int64(v),
+            };
+            output.push(vec![
+                key_value,
+                finalize_grouped_sum(sum, &plan.result_type),
+            ]);
+        }
+        Ok(output)
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Vectorised scalar-aggregate fast path
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug)]
+enum GroupedKey {
+    Int32,
+    Int64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum GroupedAgg {
+    SumColumn {
+        index: usize,
+    },
+    SumMul {
+        left_index: usize,
+        right_index: usize,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct GroupedVecPlan {
+    key: GroupedKey,
+    key_index: usize,
+    agg: GroupedAgg,
+    result_type: DataType,
+}
+
 /// One slot of the vectorised plan: which kernel to run and which column it
 /// reads. `CountStar` is the only slot without a column reference.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum VecAggSlot {
     CountStar,
     Count(usize),
@@ -447,19 +522,46 @@ fn build_vectorized_plan(aggregates: &[LogicalAggregateExpr]) -> Option<Vec<VecA
             | AggregateFunc::Avg
             | AggregateFunc::Min
             | AggregateFunc::Max => {
-                let (idx, data_type) = column_ref(agg.arg.as_ref()?)?;
-                if !matches!(
-                    data_type,
-                    DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
-                ) {
-                    return None;
-                }
+                let arg = agg.arg.as_ref()?;
                 plan.push(match agg.func {
-                    AggregateFunc::Count => VecAggSlot::Count(idx),
-                    AggregateFunc::Sum => VecAggSlot::Sum(idx),
-                    AggregateFunc::Avg => VecAggSlot::Avg(idx),
-                    AggregateFunc::Min => VecAggSlot::Min(idx),
-                    AggregateFunc::Max => VecAggSlot::Max(idx),
+                    AggregateFunc::Count
+                    | AggregateFunc::Avg
+                    | AggregateFunc::Min
+                    | AggregateFunc::Max => {
+                        let (idx, data_type) = column_ref(arg)?;
+                        if !matches!(
+                            data_type,
+                            DataType::Int32
+                                | DataType::Int64
+                                | DataType::Float32
+                                | DataType::Float64
+                        ) {
+                            return None;
+                        }
+                        match agg.func {
+                            AggregateFunc::Count => VecAggSlot::Count(idx),
+                            AggregateFunc::Avg => VecAggSlot::Avg(idx),
+                            AggregateFunc::Min => VecAggSlot::Min(idx),
+                            AggregateFunc::Max => VecAggSlot::Max(idx),
+                            _ => unreachable!(),
+                        }
+                    }
+                    AggregateFunc::Sum => {
+                        if let Some((idx, data_type)) = column_ref(arg) {
+                            if !matches!(
+                                data_type,
+                                DataType::Int32
+                                    | DataType::Int64
+                                    | DataType::Float32
+                                    | DataType::Float64
+                            ) {
+                                return None;
+                            }
+                            VecAggSlot::Sum(idx)
+                        } else {
+                            return None;
+                        }
+                    }
                     _ => unreachable!(),
                 });
             }
@@ -467,6 +569,210 @@ fn build_vectorized_plan(aggregates: &[LogicalAggregateExpr]) -> Option<Vec<VecA
         }
     }
     Some(plan)
+}
+
+fn build_grouped_vectorized_plan(
+    group_keys: &[ScalarExpr],
+    aggregates: &[LogicalAggregateExpr],
+    child_schema: &Schema,
+) -> Option<GroupedVecPlan> {
+    if group_keys.len() != 1 || aggregates.len() != 1 {
+        return None;
+    }
+    let (key_index, key) = match &group_keys[0] {
+        ScalarExpr::Column {
+            index,
+            data_type: DataType::Int32,
+            ..
+        }
+        | ScalarExpr::Column {
+            index,
+            data_type: DataType::Date,
+            ..
+        } => (*index, GroupedKey::Int32),
+        ScalarExpr::Column {
+            index,
+            data_type: DataType::Int64,
+            ..
+        } => (*index, GroupedKey::Int64),
+        _ => return None,
+    };
+    let agg = aggregates.first()?;
+    if agg.distinct || agg.func != AggregateFunc::Sum {
+        return None;
+    }
+    let arg = agg.arg.as_ref()?;
+    let grouped_agg = match arg {
+        ScalarExpr::Column { index, .. }
+            if numeric_storage_kind(&child_schema.field_at(*index).data_type) =>
+        {
+            GroupedAgg::SumColumn { index: *index }
+        }
+        ScalarExpr::Binary {
+            op: ultrasql_planner::BinaryOp::Mul,
+            left,
+            right,
+            ..
+        } => {
+            let (left_index, right_index) = match (&**left, &**right) {
+                (
+                    ScalarExpr::Column {
+                        index: left_index, ..
+                    },
+                    ScalarExpr::Column {
+                        index: right_index, ..
+                    },
+                ) => (*left_index, *right_index),
+                _ => return None,
+            };
+            if !numeric_storage_kind(&child_schema.field_at(left_index).data_type)
+                || !numeric_storage_kind(&child_schema.field_at(right_index).data_type)
+            {
+                return None;
+            }
+            GroupedAgg::SumMul {
+                left_index,
+                right_index,
+            }
+        }
+        _ => return None,
+    };
+    Some(GroupedVecPlan {
+        key,
+        key_index,
+        agg: grouped_agg,
+        result_type: agg.data_type.clone(),
+    })
+}
+
+fn numeric_storage_kind(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int32
+            | DataType::Int64
+            | DataType::Decimal { .. }
+            | DataType::Date
+            | DataType::Timestamp
+            | DataType::TimestampTz
+            | DataType::Time
+    )
+}
+
+fn grouped_vectorized_step(
+    plan: &GroupedVecPlan,
+    batch: &Batch,
+    table: &mut HashMap<Option<i64>, i64>,
+) -> Result<(), ExecError> {
+    let cols = batch.columns();
+    for row in 0..batch.rows() {
+        let key = match plan.key {
+            GroupedKey::Int32 => read_i32_key(cols.get(plan.key_index), row)?,
+            GroupedKey::Int64 => read_i64_key(cols.get(plan.key_index), row)?,
+        };
+        let Some(delta) = (match plan.agg {
+            GroupedAgg::SumColumn { index } => read_numeric_value(cols.get(index), row)?,
+            GroupedAgg::SumMul {
+                left_index,
+                right_index,
+            } => {
+                let left = read_numeric_value(cols.get(left_index), row)?;
+                let right = read_numeric_value(cols.get(right_index), row)?;
+                match (left, right) {
+                    (Some(left), Some(right)) => {
+                        Some(left.checked_mul(right).ok_or_else(|| {
+                            ExecError::TypeMismatch(
+                                "grouped aggregate multiply overflow".to_owned(),
+                            )
+                        })?)
+                    }
+                    _ => None,
+                }
+            }
+        }) else {
+            continue;
+        };
+        let entry = table.entry(key).or_insert(0);
+        *entry = entry
+            .checked_add(delta)
+            .ok_or_else(|| ExecError::TypeMismatch("grouped aggregate sum overflow".to_owned()))?;
+    }
+    Ok(())
+}
+
+fn read_i32_key(column: Option<&Column>, row: usize) -> Result<Option<i64>, ExecError> {
+    match column {
+        Some(Column::Int32(c)) => {
+            if c.nulls().is_some_and(|nulls| !nulls.get(row)) {
+                Ok(None)
+            } else {
+                Ok(Some(i64::from(c.data()[row])))
+            }
+        }
+        Some(other) => Err(ExecError::TypeMismatch(format!(
+            "grouped aggregate Int32 key requires Int32 column, got {:?}",
+            other.data_type()
+        ))),
+        None => Err(ExecError::Internal(
+            "grouped aggregate key column out of range",
+        )),
+    }
+}
+
+fn read_i64_key(column: Option<&Column>, row: usize) -> Result<Option<i64>, ExecError> {
+    match column {
+        Some(Column::Int64(c)) => {
+            if c.nulls().is_some_and(|nulls| !nulls.get(row)) {
+                Ok(None)
+            } else {
+                Ok(Some(c.data()[row]))
+            }
+        }
+        Some(other) => Err(ExecError::TypeMismatch(format!(
+            "grouped aggregate Int64 key requires Int64 column, got {:?}",
+            other.data_type()
+        ))),
+        None => Err(ExecError::Internal(
+            "grouped aggregate key column out of range",
+        )),
+    }
+}
+
+fn read_numeric_value(column: Option<&Column>, row: usize) -> Result<Option<i64>, ExecError> {
+    match column {
+        Some(Column::Int32(c)) => {
+            if c.nulls().is_some_and(|nulls| !nulls.get(row)) {
+                Ok(None)
+            } else {
+                Ok(Some(i64::from(c.data()[row])))
+            }
+        }
+        Some(Column::Int64(c)) => {
+            if c.nulls().is_some_and(|nulls| !nulls.get(row)) {
+                Ok(None)
+            } else {
+                Ok(Some(c.data()[row]))
+            }
+        }
+        Some(other) => Err(ExecError::TypeMismatch(format!(
+            "grouped aggregate numeric input requires Int32/Int64 column, got {:?}",
+            other.data_type()
+        ))),
+        None => Err(ExecError::Internal(
+            "grouped aggregate numeric column out of range",
+        )),
+    }
+}
+
+fn finalize_grouped_sum(sum: i64, data_type: &DataType) -> Value {
+    match data_type {
+        DataType::Decimal { scale, .. } => Value::Decimal {
+            value: sum,
+            scale: scale.unwrap_or(0),
+        },
+        DataType::Int64 => Value::Int64(sum),
+        DataType::Int32 => Value::Int32(i32::try_from(sum).unwrap_or(i32::MAX)),
+        _ => Value::Int64(sum),
+    }
 }
 
 /// Extract the column index and type from a `ScalarExpr::Column`. Returns
@@ -503,25 +809,25 @@ fn vectorized_step(
     let cols = batch.columns();
     let n = batch.rows();
     for (slot, state) in plan.iter().zip(states.iter_mut()) {
-        match (*slot, state) {
+        match (slot, state) {
             (VecAggSlot::CountStar, AggState::CountStar(acc)) => {
                 *acc = acc.saturating_add(i64::try_from(n).unwrap_or(i64::MAX));
             }
             (VecAggSlot::Count(ci), AggState::Count(acc)) => {
-                *acc = acc.saturating_add(column_non_null_count(&cols[ci]));
+                *acc = acc.saturating_add(column_non_null_count(&cols[*ci]));
             }
             (VecAggSlot::Sum(ci), AggState::Sum(acc)) => {
-                accumulate_sum(acc, &cols[ci])?;
+                accumulate_sum(acc, &cols[*ci])?;
             }
             (VecAggSlot::Avg(ci), AggState::Avg(acc, cnt)) => {
-                accumulate_sum(acc, &cols[ci])?;
-                *cnt = cnt.saturating_add(column_non_null_count(&cols[ci]));
+                accumulate_sum(acc, &cols[*ci])?;
+                *cnt = cnt.saturating_add(column_non_null_count(&cols[*ci]));
             }
             (VecAggSlot::Min(ci), AggState::Min(acc)) => {
-                update_extremum(acc, &cols[ci], /* take_min = */ true)?;
+                update_extremum(acc, &cols[*ci], /* take_min = */ true)?;
             }
             (VecAggSlot::Max(ci), AggState::Max(acc)) => {
-                update_extremum(acc, &cols[ci], /* take_min = */ false)?;
+                update_extremum(acc, &cols[*ci], /* take_min = */ false)?;
             }
             // The plan and the states are zipped in the same order and
             // `build_vectorized_plan` only emits slots that correspond to
@@ -1412,6 +1718,34 @@ mod tests {
         .expect("batch ok")
     }
 
+    fn sum_decimal_mul_i32_agg() -> LogicalAggregateExpr {
+        LogicalAggregateExpr {
+            func: AggregateFunc::Sum,
+            arg: Some(ScalarExpr::Binary {
+                op: ultrasql_planner::BinaryOp::Mul,
+                left: Box::new(col(
+                    "cost",
+                    1,
+                    DataType::Decimal {
+                        precision: Some(15),
+                        scale: Some(2),
+                    },
+                )),
+                right: Box::new(col("qty", 2, DataType::Int32)),
+                data_type: DataType::Decimal {
+                    precision: Some(15),
+                    scale: Some(2),
+                },
+            }),
+            distinct: false,
+            output_name: "value".into(),
+            data_type: DataType::Decimal {
+                precision: Some(15),
+                scale: Some(2),
+            },
+        }
+    }
+
     fn drain_all(op: &mut dyn Operator) -> Vec<Vec<Value>> {
         let schema = op.schema().clone();
         let mut out = Vec::new();
@@ -1825,6 +2159,108 @@ mod tests {
             }
             other => panic!("expected Float64 results, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn grouped_vectorized_sum_i64_matches_scalar() {
+        let schema = schema_group_val();
+        let batch = make_batch_i32_i64(&[(1, 10), (2, 20), (1, 7), (2, 3), (3, 9)]);
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::nullable("total", DataType::Int64),
+        ])
+        .expect("schema ok");
+
+        let scan_vec = MemTableScan::new(schema.clone(), vec![batch.clone()]);
+        let mut op_vec = HashAggregate::new(
+            Box::new(scan_vec),
+            vec![col("group", 0, DataType::Int32)],
+            vec![sum_agg("val", 1)],
+            out_schema.clone(),
+        );
+        let mut rows_vec = drain_all(&mut op_vec);
+
+        let scan_sca = MemTableScan::new(schema, vec![batch]);
+        let mut op_sca = HashAggregate::new(
+            Box::new(scan_sca),
+            vec![col("group", 0, DataType::Int32)],
+            vec![sum_agg("val", 1)],
+            out_schema,
+        );
+        op_sca.force_scalar_path();
+        let mut rows_sca = drain_all(&mut op_sca);
+
+        rows_vec.sort_by_key(|row| match row[0] {
+            Value::Int32(v) => v,
+            ref other => panic!("expected Int32 group key, got {other:?}"),
+        });
+        rows_sca.sort_by_key(|row| match row[0] {
+            Value::Int32(v) => v,
+            ref other => panic!("expected Int32 group key, got {other:?}"),
+        });
+        assert_eq!(rows_vec, rows_sca);
+    }
+
+    #[test]
+    fn grouped_vectorized_sum_mul_matches_scalar() {
+        let schema = Schema::new([
+            Field::required("partkey", DataType::Int32),
+            Field::required(
+                "cost",
+                DataType::Decimal {
+                    precision: Some(15),
+                    scale: Some(2),
+                },
+            ),
+            Field::required("qty", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(vec![1_i32, 2, 1, 3])),
+            Column::Int64(NumericColumn::from_data(vec![150_i64, 200, 25, 400])),
+            Column::Int32(NumericColumn::from_data(vec![2_i32, 5, 4, 1])),
+        ])
+        .expect("batch ok");
+        let out_schema = Schema::new([
+            Field::required("partkey", DataType::Int32),
+            Field::nullable(
+                "value",
+                DataType::Decimal {
+                    precision: Some(15),
+                    scale: Some(2),
+                },
+            ),
+        ])
+        .expect("schema ok");
+
+        let scan_vec = MemTableScan::new(schema.clone(), vec![batch.clone()]);
+        let mut op_vec = HashAggregate::new(
+            Box::new(scan_vec),
+            vec![col("partkey", 0, DataType::Int32)],
+            vec![sum_decimal_mul_i32_agg()],
+            out_schema.clone(),
+        );
+        let mut rows_vec = drain_all(&mut op_vec);
+
+        let scan_sca = MemTableScan::new(schema, vec![batch]);
+        let mut op_sca = HashAggregate::new(
+            Box::new(scan_sca),
+            vec![col("partkey", 0, DataType::Int32)],
+            vec![sum_decimal_mul_i32_agg()],
+            out_schema,
+        );
+        op_sca.force_scalar_path();
+        let mut rows_sca = drain_all(&mut op_sca);
+
+        rows_vec.sort_by_key(|row| match row[0] {
+            Value::Int32(v) => v,
+            ref other => panic!("expected Int32 group key, got {other:?}"),
+        });
+        rows_sca.sort_by_key(|row| match row[0] {
+            Value::Int32(v) => v,
+            ref other => panic!("expected Int32 group key, got {other:?}"),
+        });
+        assert_eq!(rows_vec, rows_sca);
     }
 
     /// Test 3: COUNT(*) over a 100-row batch returns exactly 100 via the

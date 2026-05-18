@@ -13,7 +13,7 @@ use crate::error::ServerError;
 
 use super::SampleTables;
 use super::cte_helpers::check_set_op_schemas;
-use super::join::lower_join;
+use super::join::{LowerJoinArgs, lower_join};
 use super::saturate_row_count;
 use super::scan::lower_function_scan;
 
@@ -63,15 +63,17 @@ pub fn lower_plan(
             let right_schema = right.schema().clone();
             let left_op = lower_plan(left, tables)?;
             let right_op = lower_plan(right, tables)?;
-            lower_join(
-                left_op,
-                right_op,
+            lower_join(LowerJoinArgs {
+                left_plan: left,
+                right_plan: right,
+                left: left_op,
+                right: right_op,
                 left_schema,
                 right_schema,
-                *join_type,
+                join_type: *join_type,
                 condition,
-                schema.clone(),
-            )
+                out_schema: schema.clone(),
+            })
         }
         LogicalPlan::Empty { .. } => Err(ServerError::Unsupported("SELECT without FROM")),
         LogicalPlan::Values { .. } => Err(ServerError::Unsupported("VALUES")),

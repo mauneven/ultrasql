@@ -1,9 +1,13 @@
 //! Hash equi-join operator.
 //!
-//! Implements Inner, Left Outer, Semi, and Anti equi-joins using a classical build+probe
-//! hash table. The left (build) side is drained first and hashed by the
-//! build key expression; the right (probe) side is then streamed, and each
-//! right row's probe key is looked up in the hash table.
+//! Implements Inner, Left Outer, Semi, and Anti equi-joins using a classical
+//! build+probe hash table.
+//!
+//! The default path drains the left child first and hashes it by the left key,
+//! then streams the right child as the probe side. Semi/anti joins can also
+//! flip that orientation and build the right/subquery side instead, which lets
+//! the server avoid hashing a large left relation just to test membership
+//! against a compact `IN` / `NOT IN` subquery result.
 //!
 //! # Join type support
 //!
@@ -74,8 +78,11 @@ pub struct HashJoin {
     schema: Schema,
     left_schema: Schema,
     right_schema: Schema,
+    build_side: BuildSide,
     /// Build-side rows retained for hash lookup and output assembly.
     left_rows: Vec<Vec<Value>>,
+    /// Build-side rows retained when a semi/anti join hashes the right child.
+    right_rows: Vec<Vec<Value>>,
     /// Hash table built from the left side on first execution.
     hash_table: Option<HashMap<JoinKey, Vec<usize>>>,
     /// Whether each left row matched at least one probe row.
@@ -90,6 +97,12 @@ pub struct HashJoin {
     next_unmatched_left: usize,
     /// `true` after the final `Ok(None)` is returned.
     eof: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuildSide {
+    Left,
+    RightForSemiAnti,
 }
 
 impl HashJoin {
@@ -193,7 +206,9 @@ impl HashJoin {
             schema,
             left_schema,
             right_schema,
+            build_side: BuildSide::Left,
             left_rows: Vec::new(),
+            right_rows: Vec::new(),
             hash_table: None,
             left_matched: Vec::new(),
             matched_left_count: 0,
@@ -202,6 +217,40 @@ impl HashJoin {
             next_unmatched_left: 0,
             eof: false,
         }
+    }
+
+    /// Construct a semi/anti hash join that builds the right side and streams
+    /// the left/output side as the probe.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // all 9 parameters are distinct logical inputs
+    pub fn new_multi_with_residual_build_right(
+        left: Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        left_keys: Vec<ScalarExpr>,
+        right_keys: Vec<ScalarExpr>,
+        residual: Option<ScalarExpr>,
+        join_type: LogicalJoinType,
+        schema: Schema,
+        left_schema: Schema,
+        right_schema: Schema,
+    ) -> Self {
+        debug_assert!(
+            matches!(join_type, LogicalJoinType::Semi | LogicalJoinType::Anti),
+            "right-build hash join is only valid for semi/anti joins"
+        );
+        let mut join = Self::new_multi_with_residual(
+            left,
+            right,
+            left_keys,
+            right_keys,
+            residual,
+            join_type,
+            schema,
+            left_schema,
+            right_schema,
+        );
+        join.build_side = BuildSide::RightForSemiAnti;
+        join
     }
 }
 
@@ -213,6 +262,10 @@ impl Operator for HashJoin {
 
         if self.hash_table.is_none() {
             self.build_phase()?;
+        }
+
+        if self.build_side == BuildSide::RightForSemiAnti {
+            return self.next_batch_build_right_semi_anti();
         }
 
         let null_right = vec![Value::Null; self.right_schema.len()];
@@ -279,7 +332,63 @@ impl Operator for HashJoin {
 }
 
 impl HashJoin {
+    fn next_batch_build_right_semi_anti(&mut self) -> Result<Option<Batch>, ExecError> {
+        debug_assert!(
+            matches!(
+                self.join_type,
+                LogicalJoinType::Semi | LogicalJoinType::Anti
+            ),
+            "right-build path only supports semi/anti joins"
+        );
+
+        let mut chunk: Vec<Vec<Value>> = Vec::with_capacity(BATCH_TARGET_ROWS);
+
+        while chunk.len() < BATCH_TARGET_ROWS {
+            if let Some(row) = self.pending_output.pop_front() {
+                chunk.push(row);
+                continue;
+            }
+
+            let Some(batch) = self.left.next_batch()? else {
+                break;
+            };
+            let rows = batch_to_rows(&batch, &self.left_schema)?;
+            for left_row in rows {
+                let matched = self.right_build_matches_left_row(&left_row)?;
+                match self.join_type {
+                    LogicalJoinType::Semi if matched => self.pending_output.push_back(left_row),
+                    LogicalJoinType::Anti if !matched => self.pending_output.push_back(left_row),
+                    LogicalJoinType::Semi | LogicalJoinType::Anti => {}
+                    LogicalJoinType::Inner
+                    | LogicalJoinType::LeftOuter
+                    | LogicalJoinType::RightOuter
+                    | LogicalJoinType::FullOuter
+                    | LogicalJoinType::Cross => unreachable!(
+                        "right-build semi/anti path reached with non semi/anti join type"
+                    ),
+                }
+            }
+        }
+
+        while chunk.len() < BATCH_TARGET_ROWS {
+            let Some(row) = self.pending_output.pop_front() else {
+                break;
+            };
+            chunk.push(row);
+        }
+
+        if chunk.is_empty() {
+            self.eof = true;
+            return Ok(None);
+        }
+        build_batch(&chunk, &self.schema).map(Some)
+    }
+
     fn build_phase(&mut self) -> Result<(), ExecError> {
+        if self.build_side == BuildSide::RightForSemiAnti {
+            return self.build_right_phase();
+        }
+
         // Validate join type early so the error surfaces before doing any work.
         match self.join_type {
             LogicalJoinType::Inner
@@ -331,6 +440,42 @@ impl HashJoin {
         Ok(())
     }
 
+    fn build_right_phase(&mut self) -> Result<(), ExecError> {
+        match self.join_type {
+            LogicalJoinType::Semi | LogicalJoinType::Anti => {}
+            LogicalJoinType::Inner
+            | LogicalJoinType::LeftOuter
+            | LogicalJoinType::RightOuter
+            | LogicalJoinType::FullOuter
+            | LogicalJoinType::Cross => {
+                return Err(ExecError::Unsupported(
+                    "right-build hash join is only implemented for semi/anti joins",
+                ));
+            }
+        }
+
+        let mut hash_table: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+
+        loop {
+            let Some(batch) = self.right.next_batch()? else {
+                break;
+            };
+            let rows = batch_to_rows(&batch, &self.right_schema)?;
+            for row in rows {
+                if let Some(key) = build_join_key(&self.right_key_evals, &row) {
+                    hash_table
+                        .entry(key)
+                        .or_default()
+                        .push(self.right_rows.len());
+                }
+                self.right_rows.push(row);
+            }
+        }
+
+        self.hash_table = Some(hash_table);
+        Ok(())
+    }
+
     fn probe_once(&mut self) -> Result<bool, ExecError> {
         if matches!(
             self.join_type,
@@ -377,7 +522,9 @@ impl HashJoin {
                             self.pending_output.push_back(joined);
                         }
                         LogicalJoinType::Semi | LogicalJoinType::Anti => {
-                            if !self.passes_semi_anti_residual(li, &right_row)? {
+                            if !self
+                                .passes_semi_anti_residual_rows(&self.left_rows[li], &right_row)?
+                            {
                                 continue;
                             }
                             self.mark_left_matched(li);
@@ -390,6 +537,25 @@ impl HashJoin {
             }
         }
         Ok(true)
+    }
+
+    fn right_build_matches_left_row(&self, left_row: &[Value]) -> Result<bool, ExecError> {
+        let Some(probe_key) = build_join_key(&self.left_key_evals, left_row) else {
+            return Ok(false);
+        };
+        let Some(indices) = self
+            .hash_table
+            .as_ref()
+            .and_then(|table| table.get(&probe_key))
+        else {
+            return Ok(false);
+        };
+        for &ri in indices {
+            if self.passes_semi_anti_residual_rows(left_row, &self.right_rows[ri])? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn mark_left_matched(&mut self, idx: usize) {
@@ -414,15 +580,14 @@ impl HashJoin {
         }
     }
 
-    fn passes_semi_anti_residual(
+    fn passes_semi_anti_residual_rows(
         &self,
-        left_idx: usize,
+        left_row: &[Value],
         right_row: &[Value],
     ) -> Result<bool, ExecError> {
         let Some(eval) = &self.residual_eval else {
             return Ok(true);
         };
-        let left_row = &self.left_rows[left_idx];
         if let Some(fast) = &self.residual_fast {
             if let Some(result) = fast.eval(left_row, right_row) {
                 return Ok(result);
@@ -1060,6 +1225,59 @@ mod tests {
             data_type: DataType::Bool,
         };
         let mut op = HashJoin::new_multi_with_residual(
+            Box::new(left),
+            Box::new(right),
+            vec![col_i32("left_part", 0)],
+            vec![col_i32("right_part", 0)],
+            Some(residual),
+            LogicalJoinType::Anti,
+            left_schema.clone(),
+            left_schema,
+            right_schema,
+        );
+
+        assert_eq!(drain_pair_i32(&mut op), vec![(2, 30)]);
+    }
+
+    #[test]
+    fn hash_join_right_build_semi_emits_each_matching_left_row_once() {
+        let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1, 2, 2, 3])]);
+        let right = MemTableScan::new(schema_val(), vec![i32_batch(&[2, 2, 4])]);
+        let mut op = HashJoin::new_multi_with_residual_build_right(
+            Box::new(left),
+            Box::new(right),
+            vec![col_idx0_i32("id")],
+            vec![col_idx0_i32("val")],
+            None,
+            LogicalJoinType::Semi,
+            schema_id(),
+            schema_id(),
+            schema_val(),
+        );
+        let mut rows = drain_single_i32(&mut op);
+        rows.sort_unstable();
+        assert_eq!(rows, vec![2, 2]);
+    }
+
+    #[test]
+    fn hash_join_right_build_anti_residual_keeps_rows_without_match() {
+        let left_schema = schema_pair("left");
+        let right_schema = schema_pair("right");
+        let left = MemTableScan::new(
+            left_schema.clone(),
+            vec![i32_pair_batch(&[(1, 10), (2, 30)])],
+        );
+        let right = MemTableScan::new(
+            right_schema.clone(),
+            vec![i32_pair_batch(&[(1, 10), (1, 20), (2, 30)])],
+        );
+        let residual = ScalarExpr::Binary {
+            op: BinaryOp::NotEq,
+            left: Box::new(col_i32("left_supp", 1)),
+            right: Box::new(col_i32("right_supp", 3)),
+            data_type: DataType::Bool,
+        };
+        let mut op = HashJoin::new_multi_with_residual_build_right(
             Box::new(left),
             Box::new(right),
             vec![col_i32("left_part", 0)],

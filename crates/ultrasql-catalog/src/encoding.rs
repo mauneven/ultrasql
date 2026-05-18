@@ -24,7 +24,7 @@
 
 use ultrasql_core::{DataType, Error as CoreError, Field, Oid, Schema};
 
-use crate::persistent::{AttributeRow, ClassRow, RelKind};
+use crate::persistent::{AttributeRow, ClassRow, IndexRow, RelKind, StatisticExtRow, StatisticRow};
 
 /// Errors raised while writing a row to bytes.
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +84,9 @@ impl Writer<'_> {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn f32(&mut self, v: f32) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn f64(&mut self, v: f64) {
@@ -148,6 +151,9 @@ impl<'a> Reader<'a> {
     }
     fn i32(&mut self) -> Result<i32, DecodeError> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn f32(&mut self) -> Result<f32, DecodeError> {
+        Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
     fn f64(&mut self) -> Result<f64, DecodeError> {
         Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
@@ -476,6 +482,121 @@ pub fn schema_from_attributes(
     Schema::new(fields).map_err(DecodeError::from)
 }
 
+// ---------------------------------------------------------------------------
+// IndexRow
+// ---------------------------------------------------------------------------
+
+/// Encode a `pg_index` row into the catalog's internal binary format.
+#[must_use]
+pub fn encode_index_row(row: &IndexRow) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + row.indkey.len() * 2);
+    let mut w = Writer(&mut out);
+    w.u32(row.indexrelid.raw());
+    w.u32(row.indrelid.raw());
+    w.u32(u32::from(row.indnatts));
+    w.bool(row.indisunique);
+    w.bool(row.indisprimary);
+    w.bool(row.indisvalid);
+    w.u32(u32::try_from(row.indkey.len()).expect("indkey length fits in u32"));
+    for attnum in &row.indkey {
+        w.i16(*attnum);
+    }
+    out
+}
+
+/// Decode a row produced by [`encode_index_row`].
+pub fn decode_index_row(bytes: &[u8]) -> Result<IndexRow, DecodeError> {
+    let mut r = Reader::new(bytes);
+    let indexrelid = Oid::new(r.u32()?);
+    let indrelid = Oid::new(r.u32()?);
+    let indnatts = u16::try_from(r.u32()?).map_err(|_| DecodeError::InvalidTag {
+        tag: 0,
+        offset: r.pos.saturating_sub(4),
+    })?;
+    let indisunique = r.bool()?;
+    let indisprimary = r.bool()?;
+    let indisvalid = r.bool()?;
+    let key_len = usize::try_from(r.u32()?).expect("u32 length fits usize on supported targets");
+    let mut indkey = Vec::with_capacity(key_len);
+    for _ in 0..key_len {
+        indkey.push(r.i16()?);
+    }
+    Ok(IndexRow {
+        indexrelid,
+        indrelid,
+        indnatts,
+        indisunique,
+        indisprimary,
+        indisvalid,
+        indkey,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// StatisticRow
+// ---------------------------------------------------------------------------
+
+/// Encode a `pg_statistic` row into the catalog's internal binary format.
+#[must_use]
+pub fn encode_statistic_row(row: &StatisticRow) -> Vec<u8> {
+    let mut out = Vec::with_capacity(18);
+    let mut w = Writer(&mut out);
+    w.u32(row.starelid.raw());
+    w.i16(row.staattnum);
+    w.f32(row.stanullfrac);
+    w.f32(row.stadistinct);
+    out
+}
+
+/// Decode a row produced by [`encode_statistic_row`].
+pub fn decode_statistic_row(bytes: &[u8]) -> Result<StatisticRow, DecodeError> {
+    let mut r = Reader::new(bytes);
+    Ok(StatisticRow {
+        starelid: Oid::new(r.u32()?),
+        staattnum: r.i16()?,
+        stanullfrac: r.f32()?,
+        stadistinct: r.f32()?,
+    })
+}
+
+/// Encode a `pg_statistic_ext` row into the catalog's internal binary format.
+#[must_use]
+pub fn encode_statistic_ext_row(row: &StatisticExtRow) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + row.stxname.len());
+    let mut w = Writer(&mut out);
+    w.u32(row.oid.raw());
+    w.str(&row.stxname);
+    w.u32(row.stxrelid.raw());
+    w.u32(u32::try_from(row.stxkeys.len()).expect("stxkeys length fits in u32"));
+    for key in &row.stxkeys {
+        w.i16(*key);
+    }
+    let stxkind: String = row.stxkind.iter().collect();
+    w.str(&stxkind);
+    out
+}
+
+/// Decode a row produced by [`encode_statistic_ext_row`].
+pub fn decode_statistic_ext_row(bytes: &[u8]) -> Result<StatisticExtRow, DecodeError> {
+    let mut r = Reader::new(bytes);
+    let oid = Oid::new(r.u32()?);
+    let stxname = r.str()?;
+    let stxrelid = Oid::new(r.u32()?);
+    let key_len = usize::try_from(r.u32()?).expect("u32 length fits usize on supported targets");
+    let mut stxkeys = Vec::with_capacity(key_len);
+    for _ in 0..key_len {
+        stxkeys.push(r.i16()?);
+    }
+    let stxkind = r.str()?.chars().collect();
+    Ok(StatisticExtRow {
+        oid,
+        stxname,
+        stxrelid,
+        stxkeys,
+        stxkind,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema};
@@ -712,5 +833,48 @@ mod tests {
             .collect();
         let rebuilt = schema_from_attributes(rows).expect("rebuild");
         assert_eq!(rebuilt, original);
+    }
+
+    #[test]
+    fn statistic_row_round_trip() {
+        let row = StatisticRow {
+            starelid: Oid::new(42_000),
+            staattnum: 2,
+            stanullfrac: 0.125,
+            stadistinct: -0.75,
+        };
+        let bytes = encode_statistic_row(&row);
+        let decoded = decode_statistic_row(&bytes).expect("decode");
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn index_row_round_trip() {
+        let row = IndexRow {
+            indexrelid: Oid::new(42_100),
+            indrelid: Oid::new(42_000),
+            indnatts: 2,
+            indisunique: true,
+            indisprimary: false,
+            indisvalid: true,
+            indkey: vec![0, 1],
+        };
+        let bytes = encode_index_row(&row);
+        let decoded = decode_index_row(&bytes).expect("decode");
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn statistic_ext_row_round_trip() {
+        let row = StatisticExtRow {
+            oid: Oid::new(42_010),
+            stxname: "s_ab".to_owned(),
+            stxrelid: Oid::new(42_000),
+            stxkeys: vec![1, 2],
+            stxkind: vec!['d', 'f', 'm'],
+        };
+        let bytes = encode_statistic_ext_row(&row);
+        let decoded = decode_statistic_ext_row(&bytes).expect("decode");
+        assert_eq!(decoded, row);
     }
 }

@@ -351,10 +351,7 @@ mod tests {
             snap.tables_by_oid
                 .contains_key(&Oid::new(PG_DESCRIPTION_OID))
         );
-        assert!(
-            snap.tables_by_oid
-                .contains_key(&Oid::new(PG_STATISTIC_OID))
-        );
+        assert!(snap.tables_by_oid.contains_key(&Oid::new(PG_STATISTIC_OID)));
         assert!(
             snap.tables_by_oid
                 .contains_key(&Oid::new(PG_STATISTIC_EXT_OID))

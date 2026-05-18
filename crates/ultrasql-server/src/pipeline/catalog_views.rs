@@ -105,7 +105,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_statistic" => Some((schema_pg_statistic(), rows_pg_statistic(ctx))),
         "pg_catalog.pg_statistic_ext" => {
             Some((schema_pg_statistic_ext(), rows_pg_statistic_ext(ctx)))
-        },
+        }
         "pg_catalog.pg_tables" => Some((schema_pg_tables(), rows_pg_tables(ctx))),
         "pg_catalog.pg_indexes" => Some((schema_pg_indexes(), rows_pg_indexes(ctx))),
         "pg_catalog.pg_views" => Some((schema_pg_views(), Vec::new())),
@@ -401,6 +401,8 @@ struct VirtualConstraint {
     foreign_columns: Vec<usize>,
     on_delete: LogicalReferentialAction,
     on_update: LogicalReferentialAction,
+    deferrable: bool,
+    initially_deferred: bool,
     check_clause: Option<String>,
 }
 
@@ -431,6 +433,8 @@ fn virtual_constraints(ctx: &LowerCtx<'_>) -> Vec<VirtualConstraint> {
             foreign_columns: Vec::new(),
             on_delete: LogicalReferentialAction::NoAction,
             on_update: LogicalReferentialAction::NoAction,
+            deferrable: false,
+            initially_deferred: false,
             check_clause: None,
         });
     }
@@ -460,6 +464,8 @@ fn virtual_constraints(ctx: &LowerCtx<'_>) -> Vec<VirtualConstraint> {
                 foreign_columns: Vec::new(),
                 on_delete: LogicalReferentialAction::NoAction,
                 on_update: LogicalReferentialAction::NoAction,
+                deferrable: false,
+                initially_deferred: false,
                 check_clause: Some(check.expr.to_string()),
             });
         }
@@ -478,6 +484,8 @@ fn virtual_constraints(ctx: &LowerCtx<'_>) -> Vec<VirtualConstraint> {
                 foreign_columns: fk.target_columns.clone(),
                 on_delete: fk.on_delete,
                 on_update: fk.on_update,
+                deferrable: fk.deferrable,
+                initially_deferred: fk.initially_deferred,
                 check_clause: None,
             });
         }
@@ -541,8 +549,8 @@ fn rows_pg_constraint(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 attnums_text(&c.columns),
                 attnums_text(&c.foreign_columns),
                 Value::Bool(true),
-                Value::Bool(false),
-                Value::Bool(false),
+                Value::Bool(c.deferrable),
+                Value::Bool(c.initially_deferred),
             ]
         })
         .collect()
@@ -1156,8 +1164,8 @@ fn rows_information_schema_table_constraints(ctx: &LowerCtx<'_>) -> Vec<Vec<Valu
                 v_text(c.table_schema),
                 v_text(c.table_name),
                 v_text(constraint_type_name(c.kind)),
-                v_text("NO"),
-                v_text("NO"),
+                v_text(if c.deferrable { "YES" } else { "NO" }),
+                v_text(if c.initially_deferred { "YES" } else { "NO" }),
                 v_text("YES"),
                 v_text("YES"),
             ]

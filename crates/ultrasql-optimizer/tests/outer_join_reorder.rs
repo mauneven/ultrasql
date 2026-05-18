@@ -163,6 +163,10 @@ fn three_inner_joins_are_reordered() {
     );
 
     let result = reorder_inner_joins(&input);
+    let reordered_body = match &result {
+        LogicalPlan::Project { input, .. } => input.as_ref(),
+        other => other,
+    };
 
     // The output must still be a left-deep inner-join tree of three
     // relations…
@@ -171,7 +175,7 @@ fn three_inner_joins_are_reordered() {
         right: _,
         join_type,
         ..
-    } = &result
+    } = reordered_body
     else {
         panic!("expected a Join at the root, got: {result:?}");
     };
@@ -184,7 +188,7 @@ fn three_inner_joins_are_reordered() {
     // …but the *order* of leaves must have changed: the leftmost leaf
     // of the produced tree is no longer the input's leftmost leaf
     // (`a`).
-    let new_leftmost = leftmost_scan_table(&result).expect("leftmost scan present");
+    let new_leftmost = leftmost_scan_table(reordered_body).expect("leftmost scan present");
     assert_ne!(
         new_leftmost, "a",
         "the optimizer must have reordered the chain — leftmost leaf is still `a`: {result:?}"

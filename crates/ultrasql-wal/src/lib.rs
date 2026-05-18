@@ -26,7 +26,7 @@ pub use buffer::{WalBuffer, WalBufferError};
 pub use payload::{
     AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload,
     FullPageWritePayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
-    HeapUpdateInPlacePayload, HeapUpdatePayload, PayloadError,
+    HeapUpdateInPlacePayload, HeapUpdatePayload, PayloadError, SequenceOpKind, SequenceOpPayload,
 };
 pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};
 pub use recovery::{RecoveryError, recover};

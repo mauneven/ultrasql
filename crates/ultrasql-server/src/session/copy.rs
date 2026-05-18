@@ -465,6 +465,24 @@ where
             rows_inserted = rows_inserted.saturating_add(batch_len);
         }
 
+        if rows_inserted > 0 {
+            if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
+                let xid = txn.xid;
+                if let Err(rollback_err) = self.state.heap.rollback_in_place_updates(xid) {
+                    warn!(
+                        error = %rollback_err,
+                        "COPY FROM rollback of in-place updates failed after deferred FK violation",
+                    );
+                }
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    warn!(
+                        error = %abort_err,
+                        "COPY FROM abort failed after deferred FK violation",
+                    );
+                }
+                return Err(e);
+            }
+        }
         if let Err(e) = self.state.txn_manager.commit(txn) {
             warn!(error = %e, "COPY FROM autocommit commit failed");
         }

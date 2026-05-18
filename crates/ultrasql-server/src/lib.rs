@@ -63,21 +63,24 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
-use ultrasql_catalog::{CatalogSnapshot, MutableCatalog, PersistentCatalog, StatisticRow};
+use ultrasql_catalog::{
+    CatalogSnapshot, MutableCatalog, PersistentCatalog, StatisticRow, TableEntry,
+};
 use ultrasql_core::{PageId, RelationId, Value};
-use ultrasql_executor::{MemTableScan, RowCodec};
+use ultrasql_executor::{Eval, MemTableScan, RowCodec};
 use ultrasql_optimizer::{
     AnalyzeOptions, AnalyzeRunner, InMemoryStatsCatalog, PgStatisticRow, PlanCache,
     PlanCacheConfig, StatsCatalog,
 };
 use ultrasql_planner::{
-    AggregateFunc, BinaryOp, Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan,
-    ScalarExpr, TableMeta,
+    AggregateFunc, BinaryOp, Catalog as PlannerCatalog, InMemoryCatalog, LogicalIndexMethod,
+    LogicalPlan, ScalarExpr, TableMeta,
 };
 use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::page::Page;
+use ultrasql_storage::sequence::{Sequence, SequenceSnapshot};
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::{IsolationLevel, SsiManager, Transaction, TransactionManager};
 use ultrasql_vec::Batch;
@@ -87,11 +90,18 @@ use ultrasql_vec::kernels::{
     CmpOp, cmp_i32_scalar, cmp_i64_scalar, filter_sum_i32_widening_gt, filter_sum_i64_gt,
     sum_i32_widening, sum_i32_widening_with_mask, sum_i64, sum_i64_with_mask,
 };
+use ultrasql_wal::applier::{ApplyError, HeapTarget};
+use ultrasql_wal::payload::{
+    AbortPayload, BTreeOpPayload, CheckpointPayload, CommitPayload, FullPageWritePayload,
+    HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlacePayload,
+    HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
+};
 
 pub use error::ServerError;
 pub use pipeline::{LowerCtx, SampleTables, build_sample_database};
 pub use result_encoder::{
-    SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
+    SelectResult, run_ddl_command, run_modify_command, run_modify_returning, run_select,
+    run_select_streamed,
 };
 
 /// Per-session transaction-block state.
@@ -164,6 +174,25 @@ pub struct TableRuntimeConstraints {
     pub checks: Vec<RuntimeCheckConstraint>,
     /// Non-deferrable FOREIGN KEY constraints evaluated by DML.
     pub foreign_keys: Vec<RuntimeForeignKeyConstraint>,
+    /// Runtime metadata for expression, partial, and covering indexes.
+    ///
+    /// Persistent `pg_index` rows still store only the portable column
+    /// slice; this side map lets same-process DML maintain indexes whose
+    /// key is an expression or whose row membership is partial.
+    pub indexes: std::collections::HashMap<ultrasql_core::Oid, RuntimeIndexMetadata>,
+}
+
+/// Runtime metadata for one index beyond plain attnum keys.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeIndexMetadata {
+    /// Bound key expressions. Empty means use the catalog entry's key columns.
+    pub key_exprs: Vec<ScalarExpr>,
+    /// Bound partial-index predicate, if any.
+    pub predicate: Option<ScalarExpr>,
+    /// 0-based table columns listed in `INCLUDE (...)`.
+    pub include_columns: Vec<usize>,
+    /// Access method requested by `USING`.
+    pub method: LogicalIndexMethod,
 }
 
 /// One runtime CHECK constraint.
@@ -192,6 +221,22 @@ pub struct RuntimeForeignKeyConstraint {
     pub on_delete: ultrasql_planner::LogicalReferentialAction,
     /// Action when a referenced key is updated.
     pub on_update: ultrasql_planner::LogicalReferentialAction,
+    /// Whether this constraint may be checked at transaction commit.
+    pub deferrable: bool,
+    /// Whether this deferrable constraint starts in deferred mode.
+    pub initially_deferred: bool,
+}
+
+fn deferred_fk_key(row: &[Value], columns: &[usize]) -> Option<Vec<Value>> {
+    let mut key = Vec::with_capacity(columns.len());
+    for &idx in columns {
+        let value = row.get(idx)?;
+        if matches!(value, Value::Null) {
+            return None;
+        }
+        key.push(value.clone());
+    }
+    Some(key)
 }
 
 /// Session-local sequence state shared with sequence-backed defaults.
@@ -231,6 +276,92 @@ impl SequenceSessionState {
         let name = self.last_sequence.lock().clone()?;
         let value = self.currvals.lock().get(&name).copied()?;
         Some((name, value))
+    }
+}
+
+struct ServerRecoveryTarget {
+    heap: Arc<HeapAccess<BlankPageLoader>>,
+    sequences: Arc<dashmap::DashMap<String, Arc<Sequence>>>,
+}
+
+impl ServerRecoveryTarget {
+    fn sequence_snapshot(payload: &SequenceOpPayload) -> SequenceSnapshot {
+        SequenceSnapshot {
+            start_value: payload.start_value,
+            last_value: payload.last_value,
+            is_called: payload.is_called,
+            min_value: payload.min_value,
+            max_value: payload.max_value,
+            increment: payload.increment,
+            cycle: payload.cycle,
+            cache_size: payload.cache_size,
+        }
+    }
+}
+
+impl HeapTarget for ServerRecoveryTarget {
+    fn apply_insert(&self, payload: &HeapInsertPayload) -> Result<(), ApplyError> {
+        HeapTarget::apply_insert(self.heap.as_ref(), payload)
+    }
+
+    fn apply_update(&self, payload: &HeapUpdatePayload) -> Result<(), ApplyError> {
+        HeapTarget::apply_update(self.heap.as_ref(), payload)
+    }
+
+    fn apply_delete(&self, payload: &HeapDeletePayload) -> Result<(), ApplyError> {
+        HeapTarget::apply_delete(self.heap.as_ref(), payload)
+    }
+
+    fn apply_update_in_place(&self, payload: &HeapUpdateInPlacePayload) -> Result<(), ApplyError> {
+        HeapTarget::apply_update_in_place(self.heap.as_ref(), payload)
+    }
+
+    fn apply_delete_in_place(&self, payload: &HeapDeleteInPlacePayload) -> Result<(), ApplyError> {
+        HeapTarget::apply_delete_in_place(self.heap.as_ref(), payload)
+    }
+
+    fn apply_full_page_write(&self, payload: &FullPageWritePayload) -> Result<(), ApplyError> {
+        HeapTarget::apply_full_page_write(self.heap.as_ref(), payload)
+    }
+
+    fn apply_btree_op(&self, payload: &BTreeOpPayload) -> Result<(), ApplyError> {
+        HeapTarget::apply_btree_op(self.heap.as_ref(), payload)
+    }
+
+    fn apply_sequence_op(&self, payload: &SequenceOpPayload) -> Result<(), ApplyError> {
+        let name = payload.name.to_ascii_lowercase();
+        if payload.op == SequenceOpKind::Drop {
+            self.sequences.remove(&name);
+            return Ok(());
+        }
+        let snapshot = Self::sequence_snapshot(payload);
+        if let Some(existing) = self.sequences.get(&name) {
+            existing
+                .apply_snapshot(snapshot)
+                .map_err(|e| ApplyError::Refused {
+                    operation: "sequence_replay",
+                    detail: e.to_string(),
+                })?;
+            return Ok(());
+        }
+        let seq = Sequence::from_snapshot(snapshot).map_err(|e| ApplyError::Refused {
+            operation: "sequence_replay",
+            detail: e.to_string(),
+        })?;
+        self.sequences.insert(name, Arc::new(seq));
+        Ok(())
+    }
+
+    fn observe_commit(&self, payload: &CommitPayload) -> Result<(), ApplyError> {
+        HeapTarget::observe_commit(self.heap.as_ref(), payload)
+    }
+
+    fn observe_abort(&self, payload: &AbortPayload) -> Result<(), ApplyError> {
+        HeapTarget::observe_abort(self.heap.as_ref(), payload)
+    }
+
+    fn observe_checkpoint(&self, payload: &CheckpointPayload) -> Result<(), ApplyError> {
+        HeapTarget::observe_checkpoint(self.heap.as_ref(), payload)
     }
 }
 
@@ -657,9 +788,35 @@ impl Server {
         // 1. WAL buffer — 8 MiB ring.
         const WAL_BUFFER_BYTES: usize = 8 * 1024 * 1024;
         let wal_buffer = Arc::new(WalBuffer::new(WAL_BUFFER_BYTES, ultrasql_core::Lsn::ZERO));
-
-        // 2. Background writer thread draining the buffer to disk.
         let wal_dir = data_dir.join("pg_wal");
+
+        // 2. Sink adapter bridges WalBuffer ↔ storage's WalSink trait.
+        let sink: Arc<dyn ultrasql_storage::WalSink> =
+            Arc::new(WalBufferSink::new(Arc::clone(&wal_buffer)));
+
+        // 3. Buffer pool with WAL.
+        let pool = Arc::new(BufferPool::with_wal(
+            IN_MEMORY_POOL_FRAMES,
+            BlankPageLoader,
+            sink,
+        ));
+        let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
+        let vm = Arc::new(VisibilityMap::new());
+        let sequences = Arc::new(dashmap::DashMap::new());
+
+        // 4. Replay existing WAL before accepting new appends. The recovery
+        // target restores heap/index pages through `HeapAccess` and sequence
+        // state through the shared registry.
+        let recovery_target = ServerRecoveryTarget {
+            heap: Arc::clone(&heap),
+            sequences: Arc::clone(&sequences),
+        };
+        let recovered_lsn = ultrasql_wal::replay_into(&wal_dir, &recovery_target)
+            .map_err(|e| ServerError::Ddl(format!("WAL recovery: {e}")))?;
+        wal_buffer.advance_to_lsn(recovered_lsn);
+        tracing::info!(lsn = recovered_lsn.raw(), "WAL recovery complete");
+
+        // 5. Background writer thread draining the buffer to disk.
         let _wal_writer = WalWriter::open(
             &wal_dir,
             Arc::clone(&wal_buffer),
@@ -671,19 +828,6 @@ impl Server {
         // continues draining; explicit shutdown would require Server::Drop
         // which is deferred to v0.6.
         std::mem::forget(_wal_writer);
-
-        // 3. Sink adapter bridges WalBuffer ↔ storage's WalSink trait.
-        let sink: Arc<dyn ultrasql_storage::WalSink> =
-            Arc::new(WalBufferSink::new(Arc::clone(&wal_buffer)));
-
-        // 4. Buffer pool with WAL.
-        let pool = Arc::new(BufferPool::with_wal(
-            IN_MEMORY_POOL_FRAMES,
-            BlankPageLoader,
-            sink,
-        ));
-        let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
-        let vm = Arc::new(VisibilityMap::new());
 
         let persistent_catalog = Arc::new(PersistentCatalog::new());
         match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
@@ -717,7 +861,7 @@ impl Server {
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
             stats_catalog: parking_lot::RwLock::new(InMemoryStatsCatalog::new()),
             table_constraints: Arc::new(dashmap::DashMap::new()),
-            sequences: Arc::new(dashmap::DashMap::new()),
+            sequences,
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,
@@ -748,6 +892,103 @@ impl Server {
     #[must_use]
     pub fn catalog_snapshot(&self) -> Arc<CatalogSnapshot> {
         self.persistent_catalog.snapshot()
+    }
+
+    /// Validate foreign keys that were declared `DEFERRABLE INITIALLY DEFERRED`.
+    ///
+    /// The check is deliberately table-scanning: v0.8 favours correctness over
+    /// an incremental deferred-trigger queue. Immediate checks still run in the
+    /// executor for non-deferred constraints.
+    pub(crate) fn validate_deferred_foreign_keys(
+        &self,
+        txn: &Transaction,
+    ) -> Result<(), ServerError> {
+        let catalog = self.catalog_snapshot();
+        for item in self.table_constraints.iter() {
+            let child_oid = *item.key();
+            let constraints = item.value();
+            if !constraints
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.deferrable && fk.initially_deferred)
+            {
+                continue;
+            }
+            let Some(child) = catalog.tables_by_oid.get(&child_oid).cloned() else {
+                continue;
+            };
+            let child_rel = RelationId(child.oid);
+            let child_blocks = self.heap.block_count(child_rel).max(child.n_blocks);
+            if child_blocks == 0 {
+                continue;
+            }
+            let child_codec = RowCodec::new(child.schema.clone());
+            for fk in constraints
+                .foreign_keys
+                .iter()
+                .filter(|fk| fk.deferrable && fk.initially_deferred)
+            {
+                let parent = catalog
+                    .tables_by_oid
+                    .get(&fk.target_oid)
+                    .or_else(|| catalog.tables.get(&fk.target_table))
+                    .ok_or_else(|| {
+                        ServerError::Catalog(ultrasql_catalog::CatalogError::not_found(
+                            fk.target_table.clone(),
+                        ))
+                    })?;
+                for tuple in self.heap.scan_visible(
+                    child_rel,
+                    child_blocks,
+                    &txn.snapshot,
+                    self.txn_manager.as_ref(),
+                ) {
+                    let tuple = tuple
+                        .map_err(|e| ServerError::Ddl(format!("deferred FK scan failed: {e}")))?;
+                    let row = child_codec.decode(&tuple.data).map_err(|e| {
+                        ServerError::Ddl(format!("deferred FK row decode failed: {e}"))
+                    })?;
+                    let Some(key) = deferred_fk_key(&row, &fk.columns) else {
+                        continue;
+                    };
+                    if !self.deferred_relation_has_key(parent, &fk.target_columns, &key, txn)? {
+                        return Err(ultrasql_executor::ExecError::ForeignKeyViolation(
+                            fk.name.clone(),
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn deferred_relation_has_key(
+        &self,
+        table: &TableEntry,
+        columns: &[usize],
+        key: &[Value],
+        txn: &Transaction,
+    ) -> Result<bool, ServerError> {
+        let relation = RelationId(table.oid);
+        let block_count = self.heap.block_count(relation).max(table.n_blocks);
+        let codec = RowCodec::new(table.schema.clone());
+        for tuple in self.heap.scan_visible(
+            relation,
+            block_count,
+            &txn.snapshot,
+            self.txn_manager.as_ref(),
+        ) {
+            let tuple = tuple
+                .map_err(|e| ServerError::Ddl(format!("deferred FK parent scan failed: {e}")))?;
+            let row = codec.decode(&tuple.data).map_err(|e| {
+                ServerError::Ddl(format!("deferred FK parent row decode failed: {e}"))
+            })?;
+            if deferred_fk_key(&row, columns).as_deref() == Some(key) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Lookup optimizer statistics for `table` from the in-memory
@@ -847,6 +1088,27 @@ impl Server {
                 stanullfrac: pg_row.stanullfrac,
                 stadistinct: pg_row.stadistinct,
             });
+        }
+        let catalog_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
+        if let Err(e) = self.persistent_catalog.persist_statistic_rows(
+            &stat_rows,
+            self.heap.as_ref(),
+            catalog_txn.xid,
+            catalog_txn.current_command,
+        ) {
+            if let Err(abort_err) = self.txn_manager.abort(catalog_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "ANALYZE catalog statistics transaction abort failed",
+                );
+            }
+            return Err(ServerError::Catalog(e));
+        }
+        if let Err(e) = self.txn_manager.commit(catalog_txn) {
+            tracing::warn!(
+                error = %e,
+                "ANALYZE catalog statistics transaction commit failed",
+            );
         }
         self.stats_catalog.write().register(stats);
         self.persistent_catalog
@@ -1105,17 +1367,29 @@ fn run_plan_in_txn(
         work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
     };
     match plan {
-        LogicalPlan::Insert { .. } => {
+        LogicalPlan::Insert { returning, .. } => {
             let mut op = pipeline::lower_query(plan, &ctx)?;
-            run_modify_command(op.as_mut(), "INSERT")
+            if returning.is_empty() {
+                run_modify_command(op.as_mut(), "INSERT")
+            } else {
+                run_modify_returning(op.as_mut(), "INSERT")
+            }
         }
-        LogicalPlan::Update { .. } => {
+        LogicalPlan::Update { returning, .. } => {
             let mut op = pipeline::lower_query(plan, &ctx)?;
-            run_modify_command(op.as_mut(), "UPDATE")
+            if returning.is_empty() {
+                run_modify_command(op.as_mut(), "UPDATE")
+            } else {
+                run_modify_returning(op.as_mut(), "UPDATE")
+            }
         }
-        LogicalPlan::Delete { .. } => {
+        LogicalPlan::Delete { returning, .. } => {
             let mut op = pipeline::lower_query(plan, &ctx)?;
-            run_modify_command(op.as_mut(), "DELETE")
+            if returning.is_empty() {
+                run_modify_command(op.as_mut(), "DELETE")
+            } else {
+                run_modify_returning(op.as_mut(), "DELETE")
+            }
         }
         _ => {
             let mut op = pipeline::lower_query(plan, &ctx)?;
@@ -1231,14 +1505,24 @@ pub(crate) fn try_run_cached_scalar_aggregate_select(
             else {
                 return None;
             };
-            (input.as_ref(), group_by.as_slice(), aggregates.as_slice(), schema)
+            (
+                input.as_ref(),
+                group_by.as_slice(),
+                aggregates.as_slice(),
+                schema,
+            )
         }
         LogicalPlan::Aggregate {
             input,
             group_by,
             aggregates,
             schema,
-        } => (input.as_ref(), group_by.as_slice(), aggregates.as_slice(), schema),
+        } => (
+            input.as_ref(),
+            group_by.as_slice(),
+            aggregates.as_slice(),
+            schema,
+        ),
         _ => return None,
     };
 
@@ -1268,22 +1552,37 @@ pub(crate) fn try_run_cached_scalar_aggregate_select(
     let cached = heap.column_cache.get(rel)?;
 
     let cache_key = build_cached_scalar_wire_key(agg, output_schema, predicate)?;
-    if let Some(encoded) = cached.cached_scalar_aggregate_wire.read().get(&cache_key).cloned() {
+    if let Some(encoded) = cached
+        .cached_scalar_aggregate_wire
+        .read()
+        .get(&cache_key)
+        .cloned()
+    {
         return Some(result_encoder::run_shared_preencoded_select_streamed(
             encoded, 1,
         ));
     }
 
     let result_col = match (agg.func, &agg.arg, predicate) {
-        (AggregateFunc::Sum, Some(ScalarExpr::Column { index, data_type, .. }), None) => {
-            build_cached_sum_column(*index, data_type, &cached.columns)?
-        }
-        (AggregateFunc::Avg, Some(ScalarExpr::Column { index, data_type, .. }), None) => {
-            build_cached_avg_column(*index, data_type, &cached.columns)?
-        }
         (
             AggregateFunc::Sum,
-            Some(ScalarExpr::Column { index, data_type, .. }),
+            Some(ScalarExpr::Column {
+                index, data_type, ..
+            }),
+            None,
+        ) => build_cached_sum_column(*index, data_type, &cached.columns)?,
+        (
+            AggregateFunc::Avg,
+            Some(ScalarExpr::Column {
+                index, data_type, ..
+            }),
+            None,
+        ) => build_cached_avg_column(*index, data_type, &cached.columns)?,
+        (
+            AggregateFunc::Sum,
+            Some(ScalarExpr::Column {
+                index, data_type, ..
+            }),
             Some(predicate),
         ) => build_cached_filter_sum_column(*index, data_type, predicate, &cached.columns)?,
         _ => return None,
@@ -1307,23 +1606,37 @@ fn build_cached_scalar_wire_key(
 ) -> Option<ultrasql_storage::column_cache::CachedScalarAggregateWireKey> {
     let output_name = output_schema.field_at(0).name.clone();
     match (agg.func, &agg.arg, predicate) {
-        (AggregateFunc::Sum, Some(ScalarExpr::Column { index, data_type, .. }), None) => {
-            Some(ultrasql_storage::column_cache::CachedScalarAggregateWireKey::Sum {
-                output_name,
-                input_type_tag: scalar_input_type_tag(data_type)?,
-                sum_col: *index,
-            })
-        }
-        (AggregateFunc::Avg, Some(ScalarExpr::Column { index, data_type, .. }), None) => {
-            Some(ultrasql_storage::column_cache::CachedScalarAggregateWireKey::Avg {
-                output_name,
-                input_type_tag: scalar_input_type_tag(data_type)?,
-                sum_col: *index,
-            })
-        }
         (
             AggregateFunc::Sum,
-            Some(ScalarExpr::Column { index, data_type, .. }),
+            Some(ScalarExpr::Column {
+                index, data_type, ..
+            }),
+            None,
+        ) => Some(
+            ultrasql_storage::column_cache::CachedScalarAggregateWireKey::Sum {
+                output_name,
+                input_type_tag: scalar_input_type_tag(data_type)?,
+                sum_col: *index,
+            },
+        ),
+        (
+            AggregateFunc::Avg,
+            Some(ScalarExpr::Column {
+                index, data_type, ..
+            }),
+            None,
+        ) => Some(
+            ultrasql_storage::column_cache::CachedScalarAggregateWireKey::Avg {
+                output_name,
+                input_type_tag: scalar_input_type_tag(data_type)?,
+                sum_col: *index,
+            },
+        ),
+        (
+            AggregateFunc::Sum,
+            Some(ScalarExpr::Column {
+                index, data_type, ..
+            }),
             Some(expr),
         ) => match data_type {
             ultrasql_core::DataType::Int32 => {
@@ -1390,12 +1703,12 @@ fn build_cached_sum_column(
             if col.nulls().is_some() {
                 return None;
             }
-            if col.len() == 0 {
+            if col.is_empty() {
                 Some(null_int64_column())
             } else {
-                Some(Column::Int64(NumericColumn::from_data(vec![sum_i32_widening(
-                    col,
-                )])))
+                Some(Column::Int64(NumericColumn::from_data(vec![
+                    sum_i32_widening(col),
+                ])))
             }
         }
         ultrasql_core::DataType::Int64 => {
@@ -1405,7 +1718,7 @@ fn build_cached_sum_column(
             if col.nulls().is_some() {
                 return None;
             }
-            if col.len() == 0 {
+            if col.is_empty() {
                 Some(null_int64_column())
             } else {
                 Some(Column::Int64(NumericColumn::from_data(vec![sum_i64(col)])))
@@ -1428,7 +1741,7 @@ fn build_cached_avg_column(
             if col.nulls().is_some() {
                 return None;
             }
-            if col.len() == 0 {
+            if col.is_empty() {
                 Some(null_float64_column())
             } else {
                 let avg = (sum_i32_widening(col) as f64) / (col.len() as f64);
@@ -1442,7 +1755,7 @@ fn build_cached_avg_column(
             if col.nulls().is_some() {
                 return None;
             }
-            if col.len() == 0 {
+            if col.is_empty() {
                 Some(null_float64_column())
             } else {
                 let avg = (sum_i64(col) as f64) / (col.len() as f64);
@@ -1470,7 +1783,7 @@ fn build_cached_filter_sum_column(
             if pred.nulls().is_some() || sum.nulls().is_some() {
                 return None;
             }
-            if sum.len() == 0 {
+            if sum.is_empty() {
                 return Some(null_int64_column());
             }
             let total = if pred_col == sum_col && matches!(pred_op, CmpOp::Gt) {
@@ -1491,7 +1804,7 @@ fn build_cached_filter_sum_column(
             if pred.nulls().is_some() || sum.nulls().is_some() {
                 return None;
             }
-            if sum.len() == 0 {
+            if sum.is_empty() {
                 return Some(null_int64_column());
             }
             let total = if pred_col == sum_col && matches!(pred_op, CmpOp::Gt) {
@@ -1613,26 +1926,75 @@ fn null_float64_column() -> Column {
 fn decode_key_column(
     bytes: &[u8],
     schema: &ultrasql_core::Schema,
-    col_idx: usize,
+    col_idx: Option<usize>,
+    key_exprs: &[ScalarExpr],
+    predicate: Option<&ScalarExpr>,
+    method: LogicalIndexMethod,
     encoding: &index_key::IndexKeyEncoding,
 ) -> Result<Option<i64>, ServerError> {
     let codec = ultrasql_executor::RowCodec::new(schema.clone());
     let row = codec
         .decode(bytes)
         .map_err(|e| ServerError::ddl(format!("CREATE INDEX key decode: {e}")))?;
+    if let Some(predicate) = predicate {
+        match Eval::new(predicate.clone())
+            .eval(&row)
+            .map_err(|e| ServerError::ddl(format!("CREATE INDEX partial predicate: {e}")))?
+        {
+            Value::Bool(true) => {}
+            Value::Bool(false) | Value::Null => return Ok(None),
+            other => {
+                return Err(ServerError::ddl(format!(
+                    "CREATE INDEX partial predicate returned {:?}, expected bool",
+                    other.data_type()
+                )));
+            }
+        }
+    }
+    if !key_exprs.is_empty() {
+        let [expr] = key_exprs else {
+            return Err(ServerError::Unsupported(
+                "CREATE INDEX: expression indexes support exactly one key in this wave",
+            ));
+        };
+        let value = Eval::new(expr.clone())
+            .eval(&row)
+            .map_err(|e| ServerError::ddl(format!("CREATE INDEX expression key: {e}")))?;
+        if method == LogicalIndexMethod::Hash {
+            return Ok(hash_index_value(&value));
+        }
+        return encoding.encode_value(&value);
+    }
     if matches!(
         encoding,
         index_key::IndexKeyEncoding::CompositeTwoInts { .. }
     ) {
         return encoding.encode_row(&row);
     }
+    let col_idx = col_idx.ok_or_else(|| {
+        ServerError::ddl("CREATE INDEX key column missing for plain column index")
+    })?;
     let value = row.get(col_idx).ok_or_else(|| {
         ServerError::ddl(format!(
             "CREATE INDEX key column {col_idx} missing from decoded row of arity {}",
             row.len()
         ))
     })?;
+    if method == LogicalIndexMethod::Hash {
+        return Ok(hash_index_value(value));
+    }
     encoding.encode_value(value)
+}
+
+pub(crate) fn hash_index_value(value: &Value) -> Option<i64> {
+    if matches!(value, Value::Null) {
+        return None;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(value, &mut hasher);
+    Some(i64::from_ne_bytes(
+        std::hash::Hasher::finish(&hasher).to_ne_bytes(),
+    ))
 }
 
 #[cfg(test)]

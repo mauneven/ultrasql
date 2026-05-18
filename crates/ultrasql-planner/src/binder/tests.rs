@@ -3,6 +3,7 @@ use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::Parser;
 
 use super::*;
+use crate::LogicalIndexMethod;
 use crate::catalog::{InMemoryCatalog, TableMeta};
 
 /// Catalog with a single `users` table: id INT, name TEXT, score FLOAT8.
@@ -525,6 +526,22 @@ fn binds_create_table_foreign_key_constraints() {
     assert_eq!(foreign_keys[0].target_table, "users");
     assert_eq!(foreign_keys[0].target_columns, vec![0]);
     assert_eq!(foreign_keys[1].name, "child_user_fk");
+}
+
+#[test]
+fn binds_deferrable_foreign_key_flags() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "CREATE TABLE child (user_id INT REFERENCES users(id) DEFERRABLE INITIALLY DEFERRED)",
+        &cat,
+    )
+    .expect("foreign key binds");
+    let LogicalPlan::CreateTable { foreign_keys, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(foreign_keys.len(), 1);
+    assert!(foreign_keys[0].deferrable);
+    assert!(foreign_keys[0].initially_deferred);
 }
 
 #[test]
@@ -2010,6 +2027,63 @@ fn binds_create_unique_index_honours_unique_flag_and_explicit_name() {
     assert!(unique);
     assert!(if_not_exists);
     assert_eq!(index_name, "users_pk");
+}
+
+#[test]
+fn binds_create_index_concurrently_flag() {
+    let plan = parse_bind_ok("CREATE INDEX CONCURRENTLY users_id_idx ON users (id)");
+    let LogicalPlan::CreateIndex { concurrently, .. } = plan else {
+        panic!("expected CreateIndex plan");
+    };
+    assert!(concurrently);
+}
+
+#[test]
+fn binds_create_hash_index_method() {
+    let plan = parse_bind_ok("CREATE INDEX users_id_hash_idx ON users USING hash (id)");
+    let LogicalPlan::CreateIndex { method, .. } = plan else {
+        panic!("expected CreateIndex plan");
+    };
+    assert_eq!(method, LogicalIndexMethod::Hash);
+}
+
+#[test]
+fn binds_create_expression_index_key() {
+    let plan = parse_bind_ok("CREATE INDEX users_lower_name_idx ON users (lower(name))");
+    let LogicalPlan::CreateIndex {
+        columns, key_exprs, ..
+    } = plan
+    else {
+        panic!("expected CreateIndex plan");
+    };
+    assert!(columns.is_empty());
+    assert_eq!(key_exprs.len(), 1);
+    assert!(matches!(
+        &key_exprs[0],
+        ScalarExpr::FunctionCall { name, .. } if name == "lower"
+    ));
+}
+
+#[test]
+fn binds_create_partial_and_include_index_metadata() {
+    let plan = parse_bind_ok(
+        "CREATE INDEX users_name_active_idx ON users (name) INCLUDE (score) WHERE name IS NOT NULL",
+    );
+    let LogicalPlan::CreateIndex {
+        columns,
+        include_columns,
+        predicate,
+        ..
+    } = plan
+    else {
+        panic!("expected CreateIndex plan");
+    };
+    assert_eq!(columns, vec![1]);
+    assert_eq!(include_columns, vec![2]);
+    assert!(matches!(
+        predicate,
+        Some(ScalarExpr::IsNull { negated: true, .. })
+    ));
 }
 
 #[test]

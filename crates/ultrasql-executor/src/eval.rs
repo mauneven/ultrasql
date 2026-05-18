@@ -225,6 +225,8 @@ pub(crate) fn eval_expr(
 ///
 /// Today's support set is the slice needed for TPC-H lift-off:
 /// - `extract(unit, date)` — date-part extraction. Returns `i64`.
+/// - `lower(text)` / `upper(text)` — case folding for expression indexes
+///   and simple scalar projections.
 /// - `pg_get_userbyid(oid)` — compatibility helper for psql catalog meta SQL.
 /// - `substring(text, from[, for])` — 1-based string slicing.
 ///
@@ -233,6 +235,8 @@ pub(crate) fn eval_expr(
 fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match name {
         "extract" => eval_extract(args),
+        "lower" => eval_text_case(args, TextCase::Lower),
+        "upper" => eval_text_case(args, TextCase::Upper),
         "pg_get_userbyid" => eval_pg_get_userbyid(args),
         "substring" => eval_substring(args),
         "coalesce" => Ok(args
@@ -246,6 +250,36 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             format!("function `{other}` not implemented").into_boxed_str(),
         ))),
     }
+}
+
+#[derive(Clone, Copy)]
+enum TextCase {
+    Lower,
+    Upper,
+}
+
+fn eval_text_case(args: &[Value], mode: TextCase) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "text case function: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Value::Text(s) = &args[0] else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "text case function: argument must be text, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let out = match mode {
+        TextCase::Lower => s.to_lowercase(),
+        TextCase::Upper => s.to_uppercase(),
+    };
+    Ok(Value::Text(out))
 }
 
 fn eval_pg_get_userbyid(args: &[Value]) -> Result<Value, EvalError> {

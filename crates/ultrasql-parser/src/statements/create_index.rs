@@ -24,6 +24,7 @@ impl Parser<'_> {
         unique: bool,
     ) -> Result<CreateIndexStmt, ParseError> {
         self.expect(TokenKind::KwIndex, "INDEX")?;
+        let concurrently = self.match_kw(TokenKind::KwConcurrently);
         let if_not_exists = self.parse_if_not_exists()?;
 
         // Optional index name — if the next token is `ON` there is no name.
@@ -65,6 +66,7 @@ impl Parser<'_> {
         let end = self.peek()?.span.start;
         Ok(CreateIndexStmt {
             unique,
+            concurrently,
             if_not_exists,
             name,
             table,
@@ -172,8 +174,16 @@ mod tests {
         let stmt =
             parse_create_index("CREATE UNIQUE INDEX IF NOT EXISTS ux_email ON users (email ASC)");
         assert!(stmt.unique);
+        assert!(!stmt.concurrently);
         assert!(stmt.if_not_exists);
         assert_eq!(stmt.columns[0].direction, SortDirection::Asc);
+    }
+
+    #[test]
+    fn create_index_concurrently() {
+        let stmt = parse_create_index("CREATE INDEX CONCURRENTLY idx ON users (email)");
+        assert!(stmt.concurrently);
+        assert_eq!(stmt.name.as_ref().unwrap().value, "idx");
     }
 
     #[test]

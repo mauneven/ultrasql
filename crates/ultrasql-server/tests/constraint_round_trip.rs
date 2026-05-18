@@ -817,3 +817,81 @@ async fn foreign_key_on_update_set_default_updates_child_rows() {
 
     shutdown(client, server_handle).await;
 }
+
+/// `DEFERRABLE INITIALLY DEFERRED` foreign keys are checked at COMMIT,
+/// so child-before-parent writes inside one transaction can succeed.
+#[tokio::test]
+async fn deferrable_foreign_key_allows_child_before_parent_until_commit() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
+        .await
+        .expect("create parent");
+    client
+        .batch_execute(
+            "CREATE TABLE child (\
+             parent_id INT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED, \
+             v INT)",
+        )
+        .await
+        .expect("create child");
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("INSERT INTO child VALUES (42, 1)")
+        .await
+        .expect("deferred child insert");
+    client
+        .batch_execute("INSERT INTO parent VALUES (42)")
+        .await
+        .expect("parent insert");
+    client.batch_execute("COMMIT").await.expect("commit");
+
+    let rows = client
+        .query("SELECT v FROM child WHERE parent_id = 42", &[])
+        .await
+        .expect("select child");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+
+    shutdown(client, server_handle).await;
+}
+
+/// A deferred FK violation surfaces at COMMIT with SQLSTATE `23503`.
+#[tokio::test]
+async fn deferrable_foreign_key_violation_fails_at_commit() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
+        .await
+        .expect("create parent");
+    client
+        .batch_execute(
+            "CREATE TABLE child (\
+             parent_id INT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED, \
+             v INT)",
+        )
+        .await
+        .expect("create child");
+
+    client.batch_execute("BEGIN").await.expect("begin");
+    client
+        .batch_execute("INSERT INTO child VALUES (99, 1)")
+        .await
+        .expect("deferred child insert");
+    let err = client
+        .batch_execute("COMMIT")
+        .await
+        .expect_err("COMMIT must reject missing parent");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23503");
+
+    let rows = client
+        .query("SELECT v FROM child", &[])
+        .await
+        .expect("select child after failed commit");
+    assert!(rows.is_empty());
+
+    shutdown(client, server_handle).await;
+}

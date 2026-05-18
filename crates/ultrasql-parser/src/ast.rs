@@ -378,6 +378,10 @@ pub enum ColumnConstraint {
         on_delete: ReferentialAction,
         /// Action when a referenced key is updated.
         on_update: ReferentialAction,
+        /// Whether this constraint is deferrable.
+        deferrable: bool,
+        /// Whether this deferrable constraint starts deferred.
+        initially_deferred: bool,
         /// Source span.
         span: Span,
     },
@@ -455,6 +459,10 @@ pub enum TableConstraint {
         on_delete: ReferentialAction,
         /// Action when a referenced key is updated.
         on_update: ReferentialAction,
+        /// Whether this constraint is deferrable.
+        deferrable: bool,
+        /// Whether this deferrable constraint starts deferred.
+        initially_deferred: bool,
         /// Source span.
         span: Span,
     },
@@ -629,6 +637,8 @@ pub enum SetValue {
 pub struct CreateIndexStmt {
     /// Whether `UNIQUE` was specified.
     pub unique: bool,
+    /// Whether `CONCURRENTLY` was specified.
+    pub concurrently: bool,
     /// Whether `IF NOT EXISTS` was specified.
     pub if_not_exists: bool,
     /// Optional explicit index name.

@@ -34,6 +34,8 @@ pub use physical_selection::IndexHint;
 
 use ultrasql_planner::{LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr};
 
+use crate::cost::{CostEstimate, CostModel, NoStats, StatsSource};
+
 // ============================================================================
 // JoinEnumerator trait
 // ============================================================================
@@ -233,6 +235,17 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
 ///   input subtrees.
 #[must_use]
 pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
+    reorder_inner_joins_with_stats(plan, &NoStats)
+}
+
+/// Rewrite the join order in `plan` using the provided statistics source.
+///
+/// This is the same transformation as [`reorder_inner_joins`], but callers
+/// that have real `ANALYZE` data can feed it through `stats` so the left-deep
+/// search compares candidate orders by estimated cost instead of leaf shape
+/// alone.
+#[must_use]
+pub fn reorder_inner_joins_with_stats(plan: &LogicalPlan, stats: &dyn StatsSource) -> LogicalPlan {
     match plan {
         // ---------------------------------------------------------------
         // Inner join (or Cross): possibly reorderable.
@@ -240,7 +253,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         LogicalPlan::Join {
             join_type: LogicalJoinType::Inner | LogicalJoinType::Cross,
             ..
-        } => reorder_inner_join_chain(plan),
+        } => reorder_inner_join_chain(plan, stats),
 
         // ---------------------------------------------------------------
         // Outer/semi/anti join: a hard reorder barrier. The brief explicitly endorses
@@ -268,7 +281,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         // Non-join wrappers: recurse into the relevant child(ren).
         // ---------------------------------------------------------------
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
-            input: Box::new(reorder_inner_joins(input)),
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             predicate: predicate.clone(),
         },
         LogicalPlan::Project {
@@ -276,17 +289,17 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
             exprs,
             schema,
         } => LogicalPlan::Project {
-            input: Box::new(reorder_inner_joins(input)),
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             exprs: exprs.clone(),
             schema: schema.clone(),
         },
         LogicalPlan::Limit { input, n, offset } => LogicalPlan::Limit {
-            input: Box::new(reorder_inner_joins(input)),
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             n: *n,
             offset: *offset,
         },
         LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
-            input: Box::new(reorder_inner_joins(input)),
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             keys: keys.clone(),
         },
         LogicalPlan::Window {
@@ -297,7 +310,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
             output_name,
             schema,
         } => LogicalPlan::Window {
-            input: Box::new(reorder_inner_joins(input)),
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             partition_by: partition_by.clone(),
             order_by: order_by.clone(),
             func: func.clone(),
@@ -310,7 +323,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
             aggregates,
             schema,
         } => LogicalPlan::Aggregate {
-            input: Box::new(reorder_inner_joins(input)),
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             group_by: group_by.clone(),
             aggregates: aggregates.clone(),
             schema: schema.clone(),
@@ -324,8 +337,8 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         } => LogicalPlan::SetOp {
             op: *op,
             quantifier: *quantifier,
-            left: Box::new(reorder_inner_joins(left)),
-            right: Box::new(reorder_inner_joins(right)),
+            left: Box::new(reorder_inner_joins_with_stats(left, stats)),
+            right: Box::new(reorder_inner_joins_with_stats(right, stats)),
             schema: schema.clone(),
         },
 
@@ -340,8 +353,8 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         } => LogicalPlan::Cte {
             name: name.clone(),
             recursive: *recursive,
-            definition: Box::new(reorder_inner_joins(definition)),
-            body: Box::new(reorder_inner_joins(body)),
+            definition: Box::new(reorder_inner_joins_with_stats(definition, stats)),
+            body: Box::new(reorder_inner_joins_with_stats(body, stats)),
             schema: schema.clone(),
         },
         LogicalPlan::LockRows {
@@ -350,7 +363,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
             wait_policy,
             schema,
         } => LogicalPlan::LockRows {
-            input: Box::new(reorder_inner_joins(input)),
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             strength: *strength,
             wait_policy: *wait_policy,
             schema: schema.clone(),
@@ -366,7 +379,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         } => LogicalPlan::Explain {
             analyze: *analyze,
             format: *format,
-            input: Box::new(reorder_inner_joins(input)),
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             schema: schema.clone(),
         },
 
@@ -381,7 +394,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         } => LogicalPlan::Insert {
             table: table.clone(),
             columns: columns.clone(),
-            source: Box::new(reorder_inner_joins(source)),
+            source: Box::new(reorder_inner_joins_with_stats(source, stats)),
             on_conflict: on_conflict.clone(),
             returning: returning.clone(),
             schema: schema.clone(),
@@ -395,7 +408,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         } => LogicalPlan::Update {
             table: table.clone(),
             assignments: assignments.clone(),
-            input: Box::new(reorder_inner_joins(input)),
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             returning: returning.clone(),
             schema: schema.clone(),
         },
@@ -406,7 +419,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
             schema,
         } => LogicalPlan::Delete {
             table: table.clone(),
-            input: Box::new(reorder_inner_joins(input)),
+            input: Box::new(reorder_inner_joins_with_stats(input, stats)),
             returning: returning.clone(),
             schema: schema.clone(),
         },
@@ -460,7 +473,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
 /// PostgreSQL only allows it when the inner-join predicate is provably
 /// strict on the outer side, an analysis the v0.6 optimizer does not yet
 /// perform. The conservative answer is "no reorder anywhere in the chain".
-fn reorder_inner_join_chain(plan: &LogicalPlan) -> LogicalPlan {
+fn reorder_inner_join_chain(plan: &LogicalPlan, stats: &dyn StatsSource) -> LogicalPlan {
     if !leftmost_inner_join_is_cross(plan) {
         return plan.clone();
     }
@@ -491,7 +504,7 @@ fn reorder_inner_join_chain(plan: &LogicalPlan) -> LogicalPlan {
             .unwrap_or_else(|| plan.clone());
     }
 
-    let order = greedy_connected_order(&leaves, &conditions);
+    let order = choose_costed_order(&leaves, &conditions, stats);
     if order == (0..leaves.len()).collect::<Vec<_>>() {
         return plan.clone();
     }
@@ -528,6 +541,21 @@ struct JoinLeaf {
     plan: LogicalPlan,
     start: usize,
     width: usize,
+}
+
+#[derive(Clone)]
+struct ConditionInfo {
+    expr: ScalarExpr,
+    mask: u64,
+}
+
+#[derive(Clone)]
+struct JoinSearchState {
+    order: Vec<usize>,
+    plan: LogicalPlan,
+    estimate: CostEstimate,
+    applied_conditions: usize,
+    cross_steps: usize,
 }
 
 /// Recursive walker that flattens an inner-join spine into `(leaves,
@@ -569,52 +597,250 @@ fn collect_inner_join_leaves(
     *next_start += width;
 }
 
-fn greedy_connected_order(leaves: &[JoinLeaf], conditions: &[ScalarExpr]) -> Vec<usize> {
-    let mut order = Vec::with_capacity(leaves.len());
-    let mut used = vec![false; leaves.len()];
+fn choose_costed_order(
+    leaves: &[JoinLeaf],
+    conditions: &[ScalarExpr],
+    stats: &dyn StatsSource,
+) -> Vec<usize> {
+    let infos = conditions
+        .iter()
+        .filter_map(|expr| {
+            condition_leaf_mask(expr, leaves).map(|mask| ConditionInfo {
+                expr: expr.clone(),
+                mask,
+            })
+        })
+        .collect::<Vec<_>>();
+    if infos.is_empty() {
+        return cross_only_order(leaves, stats);
+    }
+    if leaves.len() <= 10 {
+        choose_costed_order_dp(leaves, &infos, stats)
+    } else {
+        choose_costed_order_greedy(leaves, &infos, stats)
+    }
+}
+
+fn cross_only_order(leaves: &[JoinLeaf], stats: &dyn StatsSource) -> Vec<usize> {
+    let model = CostModel::new(stats);
+    let mut order = (0..leaves.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        let left_est = model.estimate(&leaves[left].plan);
+        let right_est = model.estimate(&leaves[right].plan);
+        left_est
+            .total_cost
+            .total_cmp(&right_est.total_cost)
+            .then_with(|| leaf_rank(&leaves[left].plan).cmp(&leaf_rank(&leaves[right].plan)))
+            .then_with(|| left.cmp(&right))
+    });
+    if order == (0..leaves.len()).collect::<Vec<_>>() && order.len() > 1 {
+        order.rotate_left(1);
+    }
+    order
+}
+
+fn choose_costed_order_dp(
+    leaves: &[JoinLeaf],
+    conditions: &[ConditionInfo],
+    stats: &dyn StatsSource,
+) -> Vec<usize> {
+    use std::collections::HashMap;
+
+    let model = CostModel::new(stats);
+    let mut states = HashMap::<u64, JoinSearchState>::new();
+    for (idx, leaf) in leaves.iter().enumerate() {
+        let mask = 1_u64 << idx;
+        states.insert(
+            mask,
+            JoinSearchState {
+                order: vec![idx],
+                plan: leaf.plan.clone(),
+                estimate: model.estimate(&leaf.plan),
+                applied_conditions: 0,
+                cross_steps: 0,
+            },
+        );
+    }
+
+    for size in 1..leaves.len() {
+        let masks = states
+            .keys()
+            .copied()
+            .filter(|mask| mask.count_ones() as usize == size)
+            .collect::<Vec<_>>();
+        for mask in masks {
+            let Some(state) = states.get(&mask).cloned() else {
+                continue;
+            };
+            for idx in 0..leaves.len() {
+                if mask & (1_u64 << idx) != 0 {
+                    continue;
+                }
+                let Some((plan, applied_here)) =
+                    build_join_extension(&state.plan, &state.order, idx, conditions, leaves)
+                else {
+                    continue;
+                };
+                let next_mask = mask | (1_u64 << idx);
+                let candidate = JoinSearchState {
+                    order: extend_order(&state.order, idx),
+                    estimate: model.estimate(&plan),
+                    plan,
+                    applied_conditions: state.applied_conditions + applied_here,
+                    cross_steps: state.cross_steps + usize::from(applied_here == 0),
+                };
+                if states
+                    .get(&next_mask)
+                    .is_none_or(|current| search_state_better(&candidate, current))
+                {
+                    states.insert(next_mask, candidate);
+                }
+            }
+        }
+    }
+
+    let full_mask = (1_u64 << leaves.len()) - 1;
+    states
+        .remove(&full_mask)
+        .map_or_else(|| (0..leaves.len()).collect(), |state| state.order)
+}
+
+fn choose_costed_order_greedy(
+    leaves: &[JoinLeaf],
+    conditions: &[ConditionInfo],
+    stats: &dyn StatsSource,
+) -> Vec<usize> {
+    let model = CostModel::new(stats);
     let first = (0..leaves.len())
-        .min_by_key(|&idx| leaf_rank(&leaves[idx].plan))
+        .min_by(|&left, &right| {
+            let left_est = model.estimate(&leaves[left].plan);
+            let right_est = model.estimate(&leaves[right].plan);
+            left_est
+                .total_cost
+                .total_cmp(&right_est.total_cost)
+                .then_with(|| leaf_rank(&leaves[left].plan).cmp(&leaf_rank(&leaves[right].plan)))
+        })
         .unwrap_or(0);
-    order.push(first);
+    let mut state = JoinSearchState {
+        order: vec![first],
+        plan: leaves[first].plan.clone(),
+        estimate: model.estimate(&leaves[first].plan),
+        applied_conditions: 0,
+        cross_steps: 0,
+    };
+    let mut used = vec![false; leaves.len()];
     used[first] = true;
 
-    while order.len() < leaves.len() {
-        let current_mask = mask_for_order(&order);
-        let mut best: Option<(usize, usize, (u8, usize))> = None;
+    while state.order.len() < leaves.len() {
+        let mut best: Option<(JoinSearchState, usize)> = None;
         for idx in 0..leaves.len() {
             if used[idx] {
                 continue;
             }
-            let candidate_mask = current_mask | (1_u64 << idx);
-            let edge_count = conditions
-                .iter()
-                .filter_map(|condition| condition_leaf_mask(condition, leaves))
-                .filter(|&mask| {
-                    mask & (1_u64 << idx) != 0
-                        && mask & current_mask != 0
-                        && mask & !candidate_mask == 0
-                })
-                .count();
-            let rank = leaf_rank(&leaves[idx].plan);
-            if best.as_ref().is_none_or(|(_, best_edges, best_rank)| {
-                edge_count > *best_edges || (edge_count == *best_edges && rank < *best_rank)
+            let Some((plan, applied_here)) =
+                build_join_extension(&state.plan, &state.order, idx, conditions, leaves)
+            else {
+                continue;
+            };
+            let candidate = JoinSearchState {
+                order: extend_order(&state.order, idx),
+                estimate: model.estimate(&plan),
+                plan,
+                applied_conditions: state.applied_conditions + applied_here,
+                cross_steps: state.cross_steps + usize::from(applied_here == 0),
+            };
+            if best.as_ref().is_none_or(|(current, current_idx)| {
+                search_state_better(&candidate, current)
+                    || (!search_state_better(current, &candidate)
+                        && leaf_rank(&leaves[idx].plan) < leaf_rank(&leaves[*current_idx].plan))
             }) {
-                best = Some((idx, edge_count, rank));
+                best = Some((candidate, idx));
             }
         }
-        let next = best.map_or_else(
-            || {
-                (0..leaves.len())
-                    .filter(|&idx| !used[idx])
-                    .min_by_key(|&idx| leaf_rank(&leaves[idx].plan))
-                    .unwrap_or(0)
-            },
-            |(idx, _, _)| idx,
-        );
-        order.push(next);
-        used[next] = true;
+        let Some((next_state, next_idx)) = best else {
+            break;
+        };
+        used[next_idx] = true;
+        state = next_state;
     }
-    order
+
+    state.order
+}
+
+fn build_join_extension(
+    current: &LogicalPlan,
+    current_order: &[usize],
+    right_idx: usize,
+    conditions: &[ConditionInfo],
+    leaves: &[JoinLeaf],
+) -> Option<(LogicalPlan, usize)> {
+    let join_conditions =
+        join_conditions_for_extension(current_order, right_idx, conditions, leaves)?;
+    let applied_here = join_conditions.len();
+    let right = leaves[right_idx].plan.clone();
+    let schema = concat_schemas(current.schema(), right.schema());
+    Some((
+        LogicalPlan::Join {
+            left: Box::new(current.clone()),
+            right: Box::new(right),
+            join_type: LogicalJoinType::Inner,
+            condition: conjuncts_to_join_condition(join_conditions),
+            schema,
+        },
+        applied_here,
+    ))
+}
+
+fn join_conditions_for_extension(
+    current_order: &[usize],
+    right_idx: usize,
+    conditions: &[ConditionInfo],
+    leaves: &[JoinLeaf],
+) -> Option<Vec<ScalarExpr>> {
+    let current_mask = mask_for_order(current_order);
+    let candidate_mask = current_mask | (1_u64 << right_idx);
+    let mut join_conditions = Vec::new();
+    for condition in conditions {
+        if condition.mask & (1_u64 << right_idx) == 0
+            || condition.mask & current_mask == 0
+            || condition.mask & !candidate_mask != 0
+        {
+            continue;
+        }
+        join_conditions.push(remap_condition_for_join(
+            &condition.expr,
+            current_order,
+            right_idx,
+            leaves,
+        )?);
+    }
+    Some(join_conditions)
+}
+
+fn extend_order(order: &[usize], next: usize) -> Vec<usize> {
+    let mut extended = Vec::with_capacity(order.len() + 1);
+    extended.extend_from_slice(order);
+    extended.push(next);
+    extended
+}
+
+fn search_state_better(candidate: &JoinSearchState, current: &JoinSearchState) -> bool {
+    candidate
+        .estimate
+        .total_cost
+        .total_cmp(&current.estimate.total_cost)
+        .is_lt()
+        || (candidate
+            .estimate
+            .total_cost
+            .total_cmp(&current.estimate.total_cost)
+            .is_eq()
+            && (candidate.cross_steps < current.cross_steps
+                || (candidate.cross_steps == current.cross_steps
+                    && candidate.applied_conditions > current.applied_conditions)
+                || (candidate.cross_steps == current.cross_steps
+                    && candidate.applied_conditions == current.applied_conditions
+                    && candidate.order < current.order)))
 }
 
 fn leaf_rank(plan: &LogicalPlan) -> (u8, usize) {
@@ -1088,6 +1314,65 @@ mod tests {
 
         let reordered = reorder_inner_joins(&plan);
         assert_eq!(reordered, plan);
+    }
+
+    #[test]
+    fn reorder_inner_joins_with_stats_accounts_for_hash_build_side() {
+        struct RowStats;
+
+        impl StatsSource for RowStats {
+            fn row_count(&self, table: &str) -> u64 {
+                match table {
+                    "a" => 100_000,
+                    "b" => 10,
+                    "c" => 100,
+                    _ => 0,
+                }
+            }
+
+            fn page_count(&self, table: &str) -> u64 {
+                self.row_count(table).div_ceil(100)
+            }
+
+            fn null_frac(&self, _table: &str, _column: usize) -> f64 {
+                0.0
+            }
+
+            fn n_distinct(&self, _table: &str, _column: usize) -> f64 {
+                100.0
+            }
+        }
+
+        let a = scan("a");
+        let b = scan("b");
+        let c = scan("c");
+        let ab_schema = concat_schemas(a.schema(), b.schema());
+        let ab = LogicalPlan::Join {
+            left: Box::new(a),
+            right: Box::new(b),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::None,
+            schema: ab_schema,
+        };
+        let abc_schema = concat_schemas(ab.schema(), c.schema());
+        let plan = LogicalPlan::Join {
+            left: Box::new(ab),
+            right: Box::new(c),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::On(and(
+                eq(col("a", 0), col("c", 2)),
+                eq(col("b", 1), col("c", 2)),
+            )),
+            schema: abc_schema,
+        };
+
+        let reordered = reorder_inner_joins_with_stats(&plan, &RowStats);
+        let LogicalPlan::Project { exprs, .. } = reordered else {
+            panic!("reorder should restore original output through Project");
+        };
+        assert!(matches!(&exprs[0].0, ScalarExpr::Column { index: 2, .. }));
+        assert!(matches!(&exprs[1].0, ScalarExpr::Column { index: 1, .. }));
+        assert!(matches!(&exprs[2].0, ScalarExpr::Column { index: 0, .. }));
     }
 
     #[test]

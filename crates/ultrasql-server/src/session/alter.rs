@@ -462,7 +462,7 @@ where
                                         "TRUNCATE RESTART IDENTITY: missing owned sequence {seq_name}",
                                     ))
                                 })?;
-                            owned_sequences_to_restart.push(seq);
+                            owned_sequences_to_restart.push((seq_name.clone(), seq));
                         }
                     }
                 }
@@ -509,11 +509,18 @@ where
                         .map_err(|e| ServerError::ddl(format!("TRUNCATE heap delete: {e}")))?;
                 }
             }
-            for seq in owned_sequences_to_restart {
+            let sequence_wal = self.state.heap.wal_sink().cloned();
+            for (seq_name, seq) in owned_sequences_to_restart {
                 let options = seq.options_snapshot();
-                seq.alter_options(options, Some(options.start)).map_err(|e| {
-                    ServerError::ddl(format!("TRUNCATE RESTART IDENTITY: {e}"))
-                })?;
+                seq.alter_options_logged(
+                    options,
+                    Some(options.start),
+                    &seq_name,
+                    RelationId::INVALID,
+                    txn.xid,
+                    sequence_wal.as_deref(),
+                )
+                .map_err(|e| ServerError::ddl(format!("TRUNCATE RESTART IDENTITY: {e}")))?;
             }
             Ok(())
         })();

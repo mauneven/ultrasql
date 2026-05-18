@@ -187,6 +187,41 @@ impl Parser<'_> {
         Ok((on_delete, on_update))
     }
 
+    fn parse_constraint_timing(&mut self) -> Result<(bool, bool), ParseError> {
+        let mut deferrable = false;
+        let mut initially_deferred = false;
+        if self.peek()?.kind == TokenKind::KwDeferrable {
+            self.advance()?;
+            deferrable = true;
+        } else if self.peek()?.kind == TokenKind::KwNot
+            && self.lookahead_at(1)?.kind == TokenKind::KwDeferrable
+        {
+            self.advance()?;
+            self.expect(TokenKind::KwDeferrable, "DEFERRABLE")?;
+        }
+        if self.peek()?.kind == TokenKind::KwInitially {
+            self.advance()?;
+            match self.peek()?.kind {
+                TokenKind::KwDeferred => {
+                    self.advance()?;
+                    initially_deferred = true;
+                    deferrable = true;
+                }
+                TokenKind::KwImmediate => {
+                    self.advance()?;
+                }
+                found => {
+                    return Err(ParseError::Expected {
+                        expected: "DEFERRED or IMMEDIATE after INITIALLY",
+                        found,
+                        offset: self.peek()?.span.start as usize,
+                    });
+                }
+            }
+        }
+        Ok((deferrable, initially_deferred))
+    }
+
     /// Parse the body of a `CREATE TABLE` column list: zero or more
     /// column definitions and table constraints, separated by commas.
     fn parse_column_and_constraint_list(
@@ -302,6 +337,7 @@ impl Parser<'_> {
                         Vec::new()
                     };
                     let (on_delete, on_update) = self.parse_referential_actions()?;
+                    let (deferrable, initially_deferred) = self.parse_constraint_timing()?;
                     let end = self.peek()?.span.start;
                     constraint_list.push(ColumnConstraint::References {
                         name: constraint_name,
@@ -309,6 +345,8 @@ impl Parser<'_> {
                         target_columns,
                         on_delete,
                         on_update,
+                        deferrable,
+                        initially_deferred,
                         span: Span::new(ref_tok.span.start, end),
                     });
                 }
@@ -443,6 +481,7 @@ impl Parser<'_> {
                     Vec::new()
                 };
                 let (on_delete, on_update) = self.parse_referential_actions()?;
+                let (deferrable, initially_deferred) = self.parse_constraint_timing()?;
                 let end = self.peek()?.span.start;
                 Ok(TableConstraint::ForeignKey {
                     name: constraint_name,
@@ -451,6 +490,8 @@ impl Parser<'_> {
                     target_columns,
                     on_delete,
                     on_update,
+                    deferrable,
+                    initially_deferred,
                     span: Span::new(start, end),
                 })
             }
@@ -768,6 +809,36 @@ mod tests {
             panic!("expected ForeignKey");
         };
         assert_eq!(on_delete, ReferentialAction::SetNull);
+    }
+
+    #[test]
+    fn parses_deferrable_foreign_keys() {
+        let stmt = parse_create_table(
+            "CREATE TABLE child (\
+             parent_id integer REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED, \
+             FOREIGN KEY (parent_id) REFERENCES parent(id) NOT DEFERRABLE INITIALLY IMMEDIATE)",
+        );
+        let ColumnConstraint::References {
+            deferrable,
+            initially_deferred,
+            ..
+        } = stmt.columns[0].constraints[0]
+        else {
+            panic!("expected References");
+        };
+        assert!(deferrable);
+        assert!(initially_deferred);
+
+        let TableConstraint::ForeignKey {
+            deferrable,
+            initially_deferred,
+            ..
+        } = stmt.table_constraints[0]
+        else {
+            panic!("expected ForeignKey");
+        };
+        assert!(!deferrable);
+        assert!(!initially_deferred);
     }
 
     #[test]

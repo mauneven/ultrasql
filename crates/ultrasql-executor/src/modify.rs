@@ -42,6 +42,7 @@ use ultrasql_vec::column::{Column, NumericColumn};
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::row_codec::RowCodec;
+use crate::seq_scan::build_batch;
 use crate::{ExecError, Operator};
 
 /// Enforce schema-level NOT-NULL constraints over a decoded `INSERT`
@@ -186,6 +187,7 @@ struct ComputedUpdate {
     tid: TupleId,
     payload: UpdatePayload,
     index_change: Option<UpdateIndexChange>,
+    returning_row: Option<Vec<Value>>,
 }
 
 struct UpdateIndexChange {
@@ -199,6 +201,8 @@ struct DeleteIndexChange {
     keys: Vec<Option<i64>>,
 }
 
+type DeleteExtraction = (Vec<TupleId>, Vec<DeleteIndexChange>, Vec<Vec<Value>>);
+
 #[derive(Clone, Debug)]
 struct CheckEvaluator {
     name: String,
@@ -211,6 +215,9 @@ pub struct SequenceDefault {
     name: String,
     sequence: Arc<Sequence>,
     on_nextval: Option<SequenceNextvalObserver>,
+    wal: Option<Arc<dyn WalSink>>,
+    xid: Xid,
+    seqrelid: RelationId,
 }
 
 impl std::fmt::Debug for SequenceDefault {
@@ -230,6 +237,9 @@ impl SequenceDefault {
             name: name.into(),
             sequence,
             on_nextval: None,
+            wal: None,
+            xid: Xid::INVALID,
+            seqrelid: RelationId::INVALID,
         }
     }
 
@@ -237,6 +247,20 @@ impl SequenceDefault {
     #[must_use]
     pub fn with_observer(mut self, on_nextval: SequenceNextvalObserver) -> Self {
         self.on_nextval = Some(on_nextval);
+        self
+    }
+
+    /// Attach WAL context used when this default advances the sequence.
+    #[must_use]
+    pub fn with_wal(
+        mut self,
+        wal: Option<Arc<dyn WalSink>>,
+        xid: Xid,
+        seqrelid: RelationId,
+    ) -> Self {
+        self.wal = wal;
+        self.xid = xid;
+        self.seqrelid = seqrelid;
         self
     }
 }
@@ -292,7 +316,8 @@ pub enum ModifyKind {
 pub struct ModifyTable<L: PageLoader> {
     heap: Arc<HeapAccess<L>>,
     relation: RelationId,
-    /// Schema of the output: `[("affected_rows", Int64)]`.
+    /// Output schema: either `[("affected_rows", Int64)]` for plain
+    /// DML or the bound `RETURNING` schema when present.
     schema: Schema,
     /// Row codec for INSERT and UPDATE payload encoding. Carries a
     /// cached `fixed_width_lower_bound` so per-row `encode` calls do
@@ -330,6 +355,7 @@ pub struct ModifyTable<L: PageLoader> {
     foreign_key_checks: Vec<RowConstraintCheck>,
     referenced_by_delete_checks: Vec<RowConstraintCheck>,
     referenced_by_update_checks: Vec<RowUpdateConstraintCheck>,
+    returning_evaluators: Vec<Eval>,
     child: Box<dyn Operator>,
     done: bool,
     affected: u64,
@@ -427,6 +453,7 @@ impl<L: PageLoader> ModifyTable<L> {
             foreign_key_checks: Vec::new(),
             referenced_by_delete_checks: Vec::new(),
             referenced_by_update_checks: Vec::new(),
+            returning_evaluators: Vec::new(),
             child,
             done: false,
             affected: 0,
@@ -548,6 +575,17 @@ impl<L: PageLoader> ModifyTable<L> {
         self.referenced_by_update_checks = checks;
         self
     }
+
+    /// Replace the default affected-row output with a `RETURNING`
+    /// projection evaluated over the row image the mutation exposes:
+    /// inserted row for INSERT, updated row for UPDATE, old row for
+    /// DELETE.
+    #[must_use]
+    pub fn with_returning(mut self, exprs: Vec<ScalarExpr>, schema: Schema) -> Self {
+        self.returning_evaluators = exprs.into_iter().map(Eval::new).collect();
+        self.schema = schema;
+        self
+    }
 }
 
 /// Inspect a bound UPDATE assignment list against the target
@@ -652,6 +690,8 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
         // per-row cost identical.
         let mut all_update_edits: Vec<(TupleId, UpdatePayload)> = Vec::new();
         let mut all_update_index_changes: Vec<UpdateIndexChange> = Vec::new();
+        let mut returning_rows: Vec<Vec<Value>> = Vec::new();
+        let returning_active = !self.returning_evaluators.is_empty();
 
         // Drain the entire child input.
         loop {
@@ -671,12 +711,17 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     // `heap.delete_many`. No `batch_to_rows`
                     // materialisation, no per-row `Vec<Value>`
                     // intermediate.
-                    let (tids, delete_index_changes) = if self.delete_indexes.is_empty()
+                    let (tids, delete_index_changes, deleted_rows) = if !returning_active
+                        && self.delete_indexes.is_empty()
                         && self.referenced_by_delete_checks.is_empty()
                     {
-                        (extract_tids_from_batch(&batch, self.relation)?, Vec::new())
+                        (
+                            extract_tids_from_batch(&batch, self.relation)?,
+                            Vec::new(),
+                            Vec::new(),
+                        )
                     } else {
-                        self.extract_delete_tids_and_index_changes(&batch)?
+                        self.extract_delete_tids_and_index_changes(&batch, returning_active)?
                     };
                     let n = tids.len();
                     let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
@@ -693,6 +738,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         )
                         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
                     self.apply_delete_index_changes(&delete_index_changes)?;
+                    if returning_active {
+                        for row in deleted_rows {
+                            returning_rows.push(self.evaluate_returning_row(&row)?);
+                        }
+                    }
                     let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
                     self.affected = self.affected.saturating_add(n_u64);
                 }
@@ -703,7 +753,8 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     // column arrays — no `batch_to_rows`, no per-row
                     // `Eval`, no per-row `RowCodec::encode` tree walk.
                     let edits = if let Some(spec) = self.update_fast_path.filter(|_| {
-                        self.check_constraints.is_empty()
+                        !returning_active
+                            && self.check_constraints.is_empty()
                             && self.foreign_key_checks.is_empty()
                             && self.referenced_by_update_checks.is_empty()
                     }) {
@@ -718,9 +769,12 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         let mut edits: Vec<(TupleId, UpdatePayload)> =
                             Vec::with_capacity(rows.len());
                         for row in &rows {
-                            let computed = self.compute_update_edit(row)?;
+                            let computed = self.compute_update_edit(row, returning_active)?;
                             if let Some(index_change) = computed.index_change {
                                 all_update_index_changes.push(index_change);
+                            }
+                            if let Some(returning_row) = computed.returning_row {
+                                returning_rows.push(self.evaluate_returning_row(&returning_row)?);
                             }
                             edits.push((computed.tid, computed.payload));
                         }
@@ -753,6 +807,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         .collect();
                     let mut seen_keys: Vec<HashSet<i64>> =
                         self.insert_indexes.iter().map(|_| HashSet::new()).collect();
+                    let mut inserted_rows: Vec<Vec<Value>> = if returning_active {
+                        Vec::with_capacity(rows.len())
+                    } else {
+                        Vec::new()
+                    };
                     for row in &rows {
                         let mut expanded_row;
                         let omitted;
@@ -807,6 +866,9 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             .codec
                             .encode(target_row)
                             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                        if returning_active {
+                            inserted_rows.push(target_row.to_vec());
+                        }
                         payloads.push(payload);
                     }
                     let n = payloads.len();
@@ -837,6 +899,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                                 };
                                 index.insert_key(*k, tid, self.insert_xmin, wal_ref)?;
                             }
+                        }
+                    }
+                    if returning_active {
+                        for row in inserted_rows {
+                            returning_rows.push(self.evaluate_returning_row(&row)?);
                         }
                     }
                     let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
@@ -872,6 +939,10 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
             }
             let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
             self.affected = self.affected.saturating_add(n_u64);
+        }
+
+        if returning_active {
+            return build_batch(&returning_rows, &self.schema).map(Some);
         }
 
         // Emit the affected-row-count batch.
@@ -938,7 +1009,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
     /// `fixed_width_lower_bound`-sized initial capacity so the first
     /// push does not reallocate). The encoded payload is handed to
     /// [`HeapAccess::update_many`] by the bulk caller.
-    fn compute_update_edit(&self, row: &[Value]) -> Result<ComputedUpdate, ExecError> {
+    fn compute_update_edit(
+        &self,
+        row: &[Value],
+        capture_returning_row: bool,
+    ) -> Result<ComputedUpdate, ExecError> {
         let (tid, orig_row) = extract_tid_and_row(row, self.relation)?;
 
         // Build the new row from the original, applying assignments.
@@ -1001,7 +1076,18 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             tid,
             payload,
             index_change,
+            returning_row: capture_returning_row.then_some(new_row),
         })
+    }
+
+    fn evaluate_returning_row(&self, row: &[Value]) -> Result<Vec<Value>, ExecError> {
+        self.returning_evaluators
+            .iter()
+            .map(|eval| {
+                eval.eval(row)
+                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))
+            })
+            .collect()
     }
 
     fn apply_insert_defaults(&self, row: &mut [Value], omitted: &[bool]) -> Result<(), ExecError> {
@@ -1124,9 +1210,17 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         idx: usize,
         default: &SequenceDefault,
     ) -> Result<Value, ExecError> {
-        let raw = default.sequence.nextval().map_err(|e| {
-            ExecError::TypeMismatch(format!("sequence default {}: {e}", default.name))
-        })?;
+        let raw = if let Some(wal) = &default.wal {
+            default.sequence.nextval_logged(
+                &default.name,
+                default.seqrelid,
+                default.xid,
+                Some(wal.as_ref()),
+            )
+        } else {
+            default.sequence.nextval()
+        }
+        .map_err(|e| ExecError::TypeMismatch(format!("sequence default {}: {e}", default.name)))?;
         if let Some(on_nextval) = &default.on_nextval {
             on_nextval(&default.name, raw);
         }
@@ -1261,12 +1355,18 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
     fn extract_delete_tids_and_index_changes(
         &self,
         batch: &Batch,
-    ) -> Result<(Vec<TupleId>, Vec<DeleteIndexChange>), ExecError> {
+        capture_deleted_rows: bool,
+    ) -> Result<DeleteExtraction, ExecError> {
         let child_schema = self.child.schema().clone();
         let rows = batch_to_rows(batch, &child_schema)
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
         let mut tids: Vec<TupleId> = Vec::with_capacity(rows.len());
         let mut changes: Vec<DeleteIndexChange> = Vec::with_capacity(rows.len());
+        let mut deleted_rows: Vec<Vec<Value>> = if capture_deleted_rows {
+            Vec::with_capacity(rows.len())
+        } else {
+            Vec::new()
+        };
         for row in &rows {
             let (tid, orig_row) = extract_tid_and_row(row, self.relation)?;
             self.check_referenced_by_delete(orig_row)?;
@@ -1277,8 +1377,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                 .collect::<Result<Vec<_>, _>>()?;
             tids.push(tid);
             changes.push(DeleteIndexChange { tid, keys });
+            if capture_deleted_rows {
+                deleted_rows.push(orig_row.to_vec());
+            }
         }
-        Ok((tids, changes))
+        Ok((tids, changes, deleted_rows))
     }
 
     fn apply_delete_index_changes(

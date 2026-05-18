@@ -24,8 +24,8 @@ use super::{
 };
 use crate::plan::{
     CopyDirection, CopyFormat, CopySource, LogicalCheckConstraint, LogicalCommentTarget,
-    LogicalForeignKeyConstraint, LogicalReferentialAction, LogicalSequenceChange,
-    LogicalSequenceOptions, LogicalUniqueConstraint,
+    LogicalForeignKeyConstraint, LogicalIndexMethod, LogicalReferentialAction,
+    LogicalSequenceChange, LogicalSequenceOptions, LogicalUniqueConstraint,
 };
 
 struct RawUniqueConstraint {
@@ -46,6 +46,8 @@ struct RawForeignKeyConstraint {
     target_columns: Vec<String>,
     on_delete: LogicalReferentialAction,
     on_update: LogicalReferentialAction,
+    deferrable: bool,
+    initially_deferred: bool,
 }
 
 pub(super) fn bind_create_table(
@@ -361,6 +363,8 @@ fn collect_column_constraints<'a>(
                 target_columns,
                 on_delete,
                 on_update,
+                deferrable,
+                initially_deferred,
                 ..
             } => {
                 if target_columns.is_empty() {
@@ -378,6 +382,8 @@ fn collect_column_constraints<'a>(
                         .collect(),
                     on_delete: bind_referential_action(*on_delete),
                     on_update: bind_referential_action(*on_update),
+                    deferrable: *deferrable,
+                    initially_deferred: *initially_deferred,
                 });
             }
             ColumnConstraint::NotNull { .. }
@@ -443,6 +449,8 @@ fn collect_table_constraints<'a>(
                 target_columns,
                 on_delete,
                 on_update,
+                deferrable,
+                initially_deferred,
                 ..
             } => {
                 if target_columns.is_empty() {
@@ -464,6 +472,8 @@ fn collect_table_constraints<'a>(
                         .collect(),
                     on_delete: bind_referential_action(*on_delete),
                     on_update: bind_referential_action(*on_update),
+                    deferrable: *deferrable,
+                    initially_deferred: *initially_deferred,
                 });
             }
         }
@@ -546,6 +556,8 @@ fn bind_foreign_key_constraints(
             target_columns,
             on_delete: raw.on_delete,
             on_update: raw.on_update,
+            deferrable: raw.deferrable,
+            initially_deferred: raw.initially_deferred,
         });
     }
     Ok(out)
@@ -937,13 +949,13 @@ fn default_sequence_start(options: LogicalSequenceOptions) -> i64 {
 ///
 /// Accepted shapes for this wave:
 ///
-/// - bare column-reference keys only (`(col1, col2, ...)`); expression
-///   keys and `USING method` other than `btree` (or no method, which
-///   defaults to btree) return [`PlanError::NotSupported`].
-/// - no `INCLUDE` covering list, no partial-index `WHERE` predicate,
-///   no per-key direction / nulls ordering (sort options on the index
-///   key are parsed but not actionable until [`crate::plan::LogicalPlan`]
-///   carries them through).
+/// - bare column-reference keys (`(col1, col2, ...)`) and single
+///   expression keys (`(lower(col))`) for B-tree storage.
+/// - `INCLUDE` covering columns and `WHERE` partial-index predicates
+///   are bound into runtime metadata; they do not change the key
+///   encoding.
+/// - per-key direction / nulls ordering is parsed but not actionable
+///   until [`crate::plan::LogicalPlan`] carries order metadata through.
 ///
 /// The binder synthesises a default index name `"{table}_{c1}_{c2}_..._idx"`
 /// when one was not supplied so the executor always has a stable
@@ -959,45 +971,80 @@ pub(super) fn bind_create_index(
         .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
     let table_schema = &meta.schema;
 
-    if s.r#where.is_some() {
-        return Err(PlanError::NotSupported(
-            "CREATE INDEX: WHERE (partial index)",
-        ));
-    }
-    if !s.include.is_empty() {
-        return Err(PlanError::NotSupported(
-            "CREATE INDEX: INCLUDE (covering columns)",
-        ));
-    }
-    if let Some(method) = &s.method {
-        if !method.value.eq_ignore_ascii_case("btree") {
+    let method = match s.method.as_ref().map(|m| m.value.to_ascii_lowercase()) {
+        None => LogicalIndexMethod::Btree,
+        Some(method) if method == "btree" => LogicalIndexMethod::Btree,
+        Some(method) if method == "hash" => LogicalIndexMethod::Hash,
+        Some(_) => {
             return Err(PlanError::NotSupported(
-                "CREATE INDEX: only btree method is supported",
+                "CREATE INDEX: only btree and hash methods are supported",
             ));
         }
-    }
+    };
 
     if s.columns.is_empty() {
         return Err(PlanError::NotSupported("CREATE INDEX: zero key columns"));
     }
+    if method == LogicalIndexMethod::Hash && s.columns.len() != 1 {
+        return Err(PlanError::NotSupported(
+            "CREATE INDEX USING hash: exactly one key is supported in this wave",
+        ));
+    }
+    if method == LogicalIndexMethod::Hash && s.unique {
+        return Err(PlanError::NotSupported(
+            "CREATE UNIQUE INDEX USING hash: hash indexes do not enforce uniqueness",
+        ));
+    }
     let mut col_indices: Vec<usize> = Vec::with_capacity(s.columns.len());
     let mut col_names: Vec<String> = Vec::with_capacity(s.columns.len());
+    let mut key_exprs: Vec<ScalarExpr> = Vec::with_capacity(s.columns.len());
+    let mut saw_expression_key = false;
     for key in &s.columns {
-        let col_name = match &key.expr {
-            Expr::Column { name } if name.parts.len() == 1 => name.parts[0].value.clone(),
-            _ => {
-                return Err(PlanError::NotSupported(
-                    "CREATE INDEX: only bare column-reference keys are supported",
-                ));
+        let mut scope = ScopeStack::new();
+        let bound = bind_expr(&key.expr, table_schema, catalog, &mut scope)?;
+        match &bound {
+            ScalarExpr::Column { name, index, .. } => {
+                col_indices.push(*index);
+                col_names.push(name.to_ascii_lowercase());
             }
-        };
-        let folded = col_name.to_ascii_lowercase();
+            _ => {
+                saw_expression_key = true;
+                col_names.push(index_expr_name_part(&bound));
+            }
+        }
+        key_exprs.push(bound);
+    }
+    if saw_expression_key {
+        if s.columns.len() != 1 {
+            return Err(PlanError::NotSupported(
+                "CREATE INDEX: expression indexes support exactly one key in this wave",
+            ));
+        }
+        col_indices.clear();
+    }
+
+    let mut include_columns = Vec::with_capacity(s.include.len());
+    for ident in &s.include {
+        let folded = ident.value.to_ascii_lowercase();
         let (idx, _) = table_schema
             .find(&folded)
-            .ok_or_else(|| PlanError::ColumnNotFound(col_name.clone()))?;
-        col_indices.push(idx);
-        col_names.push(folded);
+            .ok_or_else(|| PlanError::ColumnNotFound(ident.value.clone()))?;
+        include_columns.push(idx);
     }
+
+    let predicate = if let Some(pred_ast) = &s.r#where {
+        let mut scope = ScopeStack::new();
+        let pred = bind_expr(pred_ast, table_schema, catalog, &mut scope)?;
+        let pred_ty = pred.data_type();
+        if pred_ty != DataType::Bool {
+            return Err(PlanError::TypeMismatch(format!(
+                "CREATE INDEX WHERE predicate must be boolean, got {pred_ty}"
+            )));
+        }
+        Some(pred)
+    } else {
+        None
+    };
 
     let index_name = s.name.as_ref().map_or_else(
         || synthesise_index_name(&table_name, &col_names),
@@ -1008,10 +1055,30 @@ pub(super) fn bind_create_index(
         index_name,
         table_name,
         columns: col_indices,
+        key_exprs,
+        include_columns,
+        predicate,
+        method,
         unique: s.unique,
+        concurrently: s.concurrently,
         if_not_exists: s.if_not_exists,
         schema: Schema::empty(),
     })
+}
+
+fn index_expr_name_part(expr: &ScalarExpr) -> String {
+    expr.to_string()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_owned()
 }
 
 /// Build a stable default index name when the user did not supply one:

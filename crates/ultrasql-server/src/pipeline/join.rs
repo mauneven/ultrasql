@@ -6,7 +6,9 @@ use ultrasql_core::{DataType, Schema};
 use ultrasql_executor::{
     HashJoin, MemTableScan, MergeJoin, NestedLoopJoin, Operator, Project, RightFactory,
 };
-use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr};
+use ultrasql_planner::{
+    BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, LogicalSetQuantifier, ScalarExpr,
+};
 use ultrasql_vec::Batch;
 
 use crate::error::ServerError;
@@ -100,15 +102,30 @@ pub(super) fn try_lower_merge_join(
     ))))
 }
 
-pub(super) fn lower_join(
-    left: Box<dyn Operator>,
-    right: Box<dyn Operator>,
-    left_schema: Schema,
-    right_schema: Schema,
-    join_type: LogicalJoinType,
-    condition: &LogicalJoinCondition,
-    out_schema: Schema,
-) -> Result<Box<dyn Operator>, ServerError> {
+pub(super) struct LowerJoinArgs<'a> {
+    pub(super) left_plan: &'a LogicalPlan,
+    pub(super) right_plan: &'a LogicalPlan,
+    pub(super) left: Box<dyn Operator>,
+    pub(super) right: Box<dyn Operator>,
+    pub(super) left_schema: Schema,
+    pub(super) right_schema: Schema,
+    pub(super) join_type: LogicalJoinType,
+    pub(super) condition: &'a LogicalJoinCondition,
+    pub(super) out_schema: Schema,
+}
+
+pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, ServerError> {
+    let LowerJoinArgs {
+        left_plan,
+        right_plan,
+        left,
+        right,
+        left_schema,
+        right_schema,
+        join_type,
+        condition,
+        out_schema,
+    } = args;
     match condition {
         LogicalJoinCondition::On(pred) => {
             if matches!(
@@ -135,6 +152,23 @@ pub(super) fn lower_join(
                             left_schema,
                             right_schema,
                         );
+                    }
+                    if matches!(join_type, LogicalJoinType::Semi | LogicalJoinType::Anti)
+                        && should_build_semi_anti_hash_join_on_right(
+                            left_plan, right_plan, &*left, &*right,
+                        )
+                    {
+                        return Ok(Box::new(HashJoin::new_multi_with_residual_build_right(
+                            left,
+                            right,
+                            left_keys,
+                            right_keys,
+                            residual,
+                            join_type,
+                            out_schema,
+                            left_schema,
+                            right_schema,
+                        )));
                     }
                     // HashJoin: left = build, right = probe. See the
                     // function docs for the rationale.
@@ -191,6 +225,38 @@ fn should_build_inner_hash_join_on_right(left: &dyn Operator, right: &dyn Operat
     match (left.estimated_row_count(), right.estimated_row_count()) {
         (Some(left_rows), Some(right_rows)) => right_rows < left_rows,
         (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
+fn should_build_semi_anti_hash_join_on_right(
+    left_plan: &LogicalPlan,
+    right_plan: &LogicalPlan,
+    left: &dyn Operator,
+    right: &dyn Operator,
+) -> bool {
+    match (left.estimated_row_count(), right.estimated_row_count()) {
+        (Some(left_rows), Some(right_rows)) => right_rows < left_rows,
+        (None, Some(_)) => true,
+        (Some(_), None) | (None, None) => {
+            logical_plan_looks_compact_for_semi_anti_build(right_plan)
+                && !logical_plan_looks_compact_for_semi_anti_build(left_plan)
+        }
+    }
+}
+
+fn logical_plan_looks_compact_for_semi_anti_build(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::LockRows { input, .. } => {
+            logical_plan_looks_compact_for_semi_anti_build(input)
+        }
+        LogicalPlan::Aggregate { group_by, .. } => !group_by.is_empty(),
+        LogicalPlan::SetOp { quantifier, .. } => *quantifier == LogicalSetQuantifier::Distinct,
+        LogicalPlan::Values { .. } | LogicalPlan::Empty { .. } => true,
         _ => false,
     }
 }

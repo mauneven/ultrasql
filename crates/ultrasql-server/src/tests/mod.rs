@@ -99,4 +99,5 @@ mod ddl_alter;
 mod ddl_create;
 mod extended;
 mod plan_cache;
+mod recovery;
 mod txn;

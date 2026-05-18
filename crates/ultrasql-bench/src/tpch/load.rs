@@ -12,9 +12,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-#[cfg(feature = "sql-bench")]
+#[cfg(any(feature = "pg-runner", feature = "sql-bench"))]
 use bytes::Bytes;
-#[cfg(feature = "sql-bench")]
+#[cfg(any(feature = "pg-runner", feature = "sql-bench"))]
 use futures::SinkExt;
 
 #[cfg(any(feature = "pg-runner", feature = "sql-bench"))]
@@ -36,7 +36,7 @@ pub const BATCH_SIZE: usize = 10_000;
 const DEFAULT_ULTRASQL_BATCH_SIZE: usize = 256;
 
 /// COPY chunk target for the UltraSQL TPC-H loader.
-#[cfg(feature = "sql-bench")]
+#[cfg(any(feature = "pg-runner", feature = "sql-bench"))]
 const ULTRASQL_COPY_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 #[cfg(feature = "sql-bench")]
@@ -140,69 +140,68 @@ pub fn load_postgres(
     let file = std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
     let reader = BufReader::new(file);
     let t0 = std::time::Instant::now();
+    let copy_sql = format!("COPY {table} FROM STDIN WITH (DELIMITER '|')");
+    let inserted = runtime.block_on(async {
+        let sink = client
+            .copy_in::<_, Bytes>(&copy_sql)
+            .await
+            .with_context(|| format!("start COPY into {table}"))?;
+        futures::pin_mut!(sink);
 
-    // Build the parameterised INSERT outside the batch loop to reuse the
-    // string allocations.
-    let col_count = column_count(table);
-    let placeholders: Vec<String> = (1..=col_count).map(|i| format!("${i}")).collect();
-    let insert_sql = format!("INSERT INTO {table} VALUES ({})", placeholders.join(", "));
-
-    let mut rows: Vec<Vec<String>> = Vec::with_capacity(BATCH_SIZE);
-    let mut total: u64 = 0;
-    let mut inserted: u64 = 0;
-    for line in reader.lines() {
-        let line = line.with_context(|| format!("read {}", path.display()))?;
-        if let Some(fields) = parse_tbl_line(&line) {
-            rows.push(fields);
-            total += 1;
-        }
-        if rows.len() == BATCH_SIZE {
-            runtime.block_on(async {
-                let txn = client.transaction().await.context("begin transaction")?;
-                for row in &rows {
-                    let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = row
-                        .iter()
-                        .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
-                        .collect();
-                    txn.execute(&insert_sql, &params)
-                        .await
-                        .with_context(|| format!("insert into {table}"))?;
-                }
-                txn.commit().await.context("commit transaction")?;
-                Ok::<(), anyhow::Error>(())
-            })?;
-            inserted += u64::try_from(rows.len()).context("chunk len overflow")?;
-            rows.clear();
-        }
-    }
-    if !rows.is_empty() {
-        runtime.block_on(async {
-            let txn = client.transaction().await.context("begin transaction")?;
-            for row in &rows {
-                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = row
-                    .iter()
-                    .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
-                    .collect();
-                txn.execute(&insert_sql, &params)
-                    .await
-                    .with_context(|| format!("insert into {table}"))?;
+        let mut buffer: Vec<u8> = Vec::with_capacity(ULTRASQL_COPY_CHUNK_BYTES);
+        let mut total: u64 = 0;
+        for line in reader.lines() {
+            let line = line.with_context(|| format!("read {}", path.display()))?;
+            let line = line.trim_end_matches('|');
+            if line.is_empty() {
+                continue;
             }
-            txn.commit().await.context("commit transaction")?;
-            Ok::<(), anyhow::Error>(())
-        })?;
-        inserted += u64::try_from(rows.len()).context("chunk len overflow")?;
-    }
+            let needed = line.len().saturating_add(1);
+            if !buffer.is_empty() && buffer.len().saturating_add(needed) > ULTRASQL_COPY_CHUNK_BYTES
+            {
+                let chunk = std::mem::take(&mut buffer);
+                sink.as_mut()
+                    .send(Bytes::from(chunk))
+                    .await
+                    .with_context(|| format!("COPY chunk into {table}"))?;
+                buffer = Vec::with_capacity(ULTRASQL_COPY_CHUNK_BYTES);
+            }
+            buffer.extend_from_slice(line.as_bytes());
+            buffer.push(b'\n');
+            total = total.saturating_add(1);
+        }
+        if !buffer.is_empty() {
+            sink.as_mut()
+                .send(Bytes::from(buffer))
+                .await
+                .with_context(|| format!("COPY final chunk into {table}"))?;
+        }
+        let inserted = sink
+            .finish()
+            .await
+            .with_context(|| format!("finish COPY into {table}"))?;
+        if inserted != total {
+            bail!("COPY {table}: server reported {inserted} rows, expected {total}");
+        }
+        Ok::<u64, anyhow::Error>(inserted)
+    })?;
 
     let elapsed = t0.elapsed().as_secs_f64();
     let rows_per_sec = if elapsed > 0.0 {
-        f64::from(u32::try_from(inserted).unwrap_or(u32::MAX)) / elapsed
+        inserted as f64 / elapsed
     } else {
         0.0
     };
+    runtime.block_on(async {
+        client
+            .batch_execute(&format!("ANALYZE {table}"))
+            .await
+            .with_context(|| format!("ANALYZE {table} after load"))
+    })?;
 
     Ok(LoadStats {
         table: table.to_owned(),
-        row_count: total,
+        row_count: inserted,
         rows_per_sec,
     })
 }
@@ -286,6 +285,10 @@ pub(crate) async fn load_ultrasql_into_client(
     let mut stats = Vec::with_capacity(data_gen::TABLE_NAMES.len());
     for table in data_gen::TABLE_NAMES {
         let table_stats = load_ultrasql_table(client, table, data_dir).await?;
+        client
+            .batch_execute(&format!("ANALYZE {table}"))
+            .await
+            .with_context(|| format!("ANALYZE {table} after load"))?;
         if tpch_progress_enabled() {
             eprintln!(
                 "ultrasql tpch load: loaded {} ({} rows, {:.0} rows/s)",

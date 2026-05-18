@@ -837,6 +837,7 @@ fn literal_numeric_as_f64(value: &Value) -> Option<f64> {
 fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
     match func_name {
         "extract" => Ok(DataType::Int64),
+        "lower" | "upper" => Ok(DataType::Text { max_len: None }),
         "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
         "substring" => Ok(DataType::Text { max_len: None }),
         _ => Err(PlanError::NotSupported("non-aggregate function calls")),
@@ -849,7 +850,10 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
 /// `non-aggregate function calls`.
 #[allow(dead_code)]
 pub(super) fn is_supported_builtin(func_name: &str) -> bool {
-    matches!(func_name, "extract" | "pg_get_userbyid" | "substring")
+    matches!(
+        func_name,
+        "extract" | "lower" | "upper" | "pg_get_userbyid" | "substring"
+    )
 }
 
 /// Days from the 2000-01-01 epoch to (year, month, day), positive or

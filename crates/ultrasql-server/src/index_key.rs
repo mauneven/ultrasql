@@ -183,6 +183,28 @@ impl IndexKeyEncoding {
         }
     }
 
+    /// Pick an encoding for a single expression result type.
+    ///
+    /// Expression indexes do not have a physical column attnum, but
+    /// their evaluated result must still fit the B-tree's `i64` key
+    /// space. This uses the same type support as a single-column key.
+    pub(crate) fn for_data_type(data_type: &DataType) -> Result<Self, ServerError> {
+        match data_type {
+            DataType::Int16 => Ok(Self::Int16),
+            DataType::Int32 => Ok(Self::Int32),
+            DataType::Int64 => Ok(Self::Int64),
+            DataType::Bool => Ok(Self::Bool),
+            DataType::Timestamp => Ok(Self::Timestamp),
+            DataType::TimestampTz => Ok(Self::TimestampTz),
+            DataType::Float32 => Ok(Self::Float32),
+            DataType::Float64 => Ok(Self::Float64),
+            DataType::Text { .. } => Ok(Self::TextPrefix8),
+            _ => Err(ServerError::Unsupported(
+                "CREATE INDEX: expression result type is not supported by the v0.5 B-tree",
+            )),
+        }
+    }
+
     /// Pick an encoding for a single-column index over `col_idx`.
     fn pick_single(schema: &Schema, col_idx: usize) -> Result<Self, ServerError> {
         let field = schema.field(col_idx).ok_or_else(|| {

@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
 use ultrasql_core::{DataType, Field, RelationId, TupleId, Value};
-use ultrasql_executor::{IndexOnlyScan, IndexScan, Operator, RowCodec};
+use ultrasql_executor::{Filter, IndexOnlyScan, IndexScan, Operator, RowCodec};
 use ultrasql_mvcc::{Visibility, is_visible};
-use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, SortKey};
+use ultrasql_planner::{BinaryOp, LogicalIndexMethod, LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_storage::btree::BTree;
 
 use crate::BlankPageLoader;
@@ -107,9 +107,10 @@ pub(super) fn try_index_scan(
     // satisfy a point lookup, but the storage layer only supports
     // 8-byte keys today, so we conservatively require a single-column
     // match.
-    let Some(index_entry) = find_single_column_index(&ctx.catalog_snapshot, table_entry, col_idx)
+    let Some(index_entry) =
+        find_single_column_index(&ctx.catalog_snapshot, table_entry, col_idx, ctx)
     else {
-        return Ok(None);
+        return try_hash_index_scan(table_entry, predicate, ctx);
     };
 
     // Step 4: confirm the indexed column's type is one the B-tree can
@@ -124,6 +125,28 @@ pub(super) fn try_index_scan(
     let payloads = probe_index(index_entry, range, ctx)?;
     let codec = RowCodec::new(table_entry.schema.clone());
     Ok(Some(Box::new(IndexScan::new(payloads, codec))))
+}
+
+fn try_hash_index_scan(
+    table_entry: &TableEntry,
+    predicate: &ScalarExpr,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let Some((col_idx, value)) = match_hash_equality_predicate(predicate) else {
+        return Ok(None);
+    };
+    let Some(index_entry) =
+        find_single_column_hash_index(&ctx.catalog_snapshot, table_entry, col_idx, ctx)
+    else {
+        return Ok(None);
+    };
+    let Some(hash_key) = crate::hash_index_value(&value) else {
+        return Ok(None);
+    };
+    let payloads = probe_index(index_entry, IndexKeyRange::point(hash_key), ctx)?;
+    let codec = RowCodec::new(table_entry.schema.clone());
+    let scan = Box::new(IndexScan::new(payloads, codec));
+    Ok(Some(Box::new(Filter::new(scan, predicate.clone()))))
 }
 
 /// Try to lower `ORDER BY indexed_col [ASC|DESC]` over a bare table scan into
@@ -156,7 +179,8 @@ pub(super) fn try_ordered_index_scan(
     let Some(col_idx) = column_idx_for_int_key(&key.expr) else {
         return Ok(None);
     };
-    let Some(index_entry) = find_single_column_index(&ctx.catalog_snapshot, table_entry, col_idx)
+    let Some(index_entry) =
+        find_single_column_index(&ctx.catalog_snapshot, table_entry, col_idx, ctx)
     else {
         return Ok(None);
     };
@@ -212,7 +236,7 @@ pub(super) fn try_index_only_scan(
         return Ok(None);
     };
     let Some(index_entry) =
-        find_single_column_index(&ctx.catalog_snapshot, table_entry, predicate_col_idx)
+        find_single_column_index(&ctx.catalog_snapshot, table_entry, predicate_col_idx, ctx)
     else {
         return Ok(None);
     };
@@ -373,6 +397,25 @@ pub(crate) fn match_simple_comparison(expr: &ScalarExpr) -> Option<(usize, Index
     Some((col_idx, range))
 }
 
+fn match_hash_equality_predicate(expr: &ScalarExpr) -> Option<(usize, Value)> {
+    let ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (ScalarExpr::Column { index, .. }, ScalarExpr::Literal { value, .. })
+        | (ScalarExpr::Literal { value, .. }, ScalarExpr::Column { index, .. }) => {
+            Some((*index, value.clone()))
+        }
+        _ => None,
+    }
+}
+
 /// Read the column index from a [`ScalarExpr::Column`] whose data type
 /// is a `B-tree-supported` integer (`Int32` or `Int64`). Returns
 /// `None` for non-column expressions, NULL columns, or non-integer
@@ -430,12 +473,45 @@ pub(super) fn find_single_column_index<'a>(
     snapshot: &'a CatalogSnapshot,
     table_entry: &TableEntry,
     col_idx: usize,
+    ctx: &LowerCtx<'_>,
 ) -> Option<&'a IndexEntry> {
     let attnum = u16::try_from(col_idx).ok()?;
     let indexes = snapshot.indexes_by_table.get(&table_entry.oid)?;
-    indexes
-        .iter()
-        .find(|e| e.columns.len() == 1 && e.columns[0] == attnum)
+    indexes.iter().find(|e| {
+        e.columns.len() == 1
+            && e.columns[0] == attnum
+            && index_method(ctx, table_entry.oid, e.oid) == LogicalIndexMethod::Btree
+    })
+}
+
+fn find_single_column_hash_index<'a>(
+    snapshot: &'a CatalogSnapshot,
+    table_entry: &TableEntry,
+    col_idx: usize,
+    ctx: &LowerCtx<'_>,
+) -> Option<&'a IndexEntry> {
+    let attnum = u16::try_from(col_idx).ok()?;
+    let indexes = snapshot.indexes_by_table.get(&table_entry.oid)?;
+    indexes.iter().find(|e| {
+        e.columns.len() == 1
+            && e.columns[0] == attnum
+            && index_method(ctx, table_entry.oid, e.oid) == LogicalIndexMethod::Hash
+    })
+}
+
+fn index_method(
+    ctx: &LowerCtx<'_>,
+    table_oid: ultrasql_core::Oid,
+    index_oid: ultrasql_core::Oid,
+) -> LogicalIndexMethod {
+    ctx.table_constraints
+        .get(&table_oid)
+        .map_or(LogicalIndexMethod::Btree, |constraints| {
+            constraints
+                .indexes
+                .get(&index_oid)
+                .map_or(LogicalIndexMethod::Btree, |metadata| metadata.method)
+        })
 }
 
 /// Confirm the keyed column has a type the B-tree can store. Returns

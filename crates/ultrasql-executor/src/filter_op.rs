@@ -26,6 +26,7 @@
 //! construction and sufficient for OLTP-sized batches; the OLAP-shape
 //! workloads land on the fast path.
 
+use num_traits::ToPrimitive;
 use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_vec::bitmap::Bitmap;
@@ -54,12 +55,18 @@ pub struct Filter {
     /// shape; `None` otherwise. Cached at construction so we pay the
     /// shape-matching cost once.
     fast: Option<FastPredicate>,
+    /// Heuristic selectivity hint derived from the predicate shape.
+    selectivity_hint: f64,
     schema: Schema,
 }
 
 /// Cached, parsed comparison predicate.
 #[derive(Debug, Clone)]
 enum FastPredicate {
+    /// `left AND right`.
+    And(Box<FastPredicate>, Box<FastPredicate>),
+    /// `left OR right`.
+    Or(Box<FastPredicate>, Box<FastPredicate>),
     /// `column <op> literal`, with mirrored `literal <op> column`
     /// canonicalised by flipping `op`.
     ColumnLiteral {
@@ -87,10 +94,12 @@ impl Filter {
     pub fn new(child: Box<dyn Operator>, predicate: ScalarExpr) -> Self {
         let schema = child.schema().clone();
         let fast = match_fast_predicate(&predicate);
+        let selectivity_hint = estimate_predicate_selectivity(&predicate);
         Self {
             child,
             predicate: Eval::new(predicate),
             fast,
+            selectivity_hint,
             schema,
         }
     }
@@ -111,48 +120,7 @@ impl Filter {
             return Ok(TryFastPath::Unhandled(input));
         };
         let cols = input.columns();
-        let mask = match fp {
-            FastPredicate::ColumnLiteral { index, op, literal } => {
-                let key_col = cols
-                    .get(*index)
-                    .ok_or(ExecError::Internal("filter column index out of bounds"))?;
-                match (key_col, literal) {
-                    (Column::Int32(c), Value::Int32(v)) => Some(cmp_i32_scalar(c, *v, *op)),
-                    // For an Int32 column compared against an Int64 literal,
-                    // narrow the literal where it fits. When it overflows the
-                    // i32 range every row gives the same answer, so build a
-                    // constant mask (NULL rows still get a 0 bit).
-                    (Column::Int32(c), Value::Int64(v)) => Some(i32::try_from(*v).map_or_else(
-                        |_| const_mask_i32(c, *v, *op),
-                        |narrow| cmp_i32_scalar(c, narrow, *op),
-                    )),
-                    (Column::Int64(c), Value::Int64(v)) => Some(cmp_i64_scalar(c, *v, *op)),
-                    (Column::Int64(c), Value::Int32(v)) => {
-                        Some(cmp_i64_scalar(c, i64::from(*v), *op))
-                    }
-                    // Type combinations outside the i32/i64 happy path fall back
-                    // to the scalar interpreter — correctness over coverage.
-                    _ => None,
-                }
-            }
-            FastPredicate::ColumnColumn {
-                left_index,
-                right_index,
-                op,
-            } => {
-                let left_col = cols.get(*left_index).ok_or(ExecError::Internal(
-                    "filter left column index out of bounds",
-                ))?;
-                let right_col = cols.get(*right_index).ok_or(ExecError::Internal(
-                    "filter right column index out of bounds",
-                ))?;
-                let left_type = &self.schema.field_at(*left_index).data_type;
-                let right_type = &self.schema.field_at(*right_index).data_type;
-                cmp_columns_to_mask(left_col, right_col, left_type, right_type, *op)
-            }
-        };
-
-        let Some(mask) = mask else {
+        let Some(mask) = self.mask_for_fast_predicate(fp, cols) else {
             return Ok(TryFastPath::Unhandled(input));
         };
 
@@ -183,6 +151,57 @@ impl Filter {
             out_cols.push(select_column(col, &mask, selected));
         }
         Ok(TryFastPath::Handled(Batch::new(out_cols)?))
+    }
+
+    fn mask_for_fast_predicate(&self, fp: &FastPredicate, cols: &[Column]) -> Option<Bitmap> {
+        match fp {
+            FastPredicate::And(left, right) => {
+                let left = self.mask_for_fast_predicate(left, cols)?;
+                let right = self.mask_for_fast_predicate(right, cols)?;
+                Some(combine_masks(&left, &right, MaskCombine::And))
+            }
+            FastPredicate::Or(left, right) => {
+                let left = self.mask_for_fast_predicate(left, cols)?;
+                let right = self.mask_for_fast_predicate(right, cols)?;
+                Some(combine_masks(&left, &right, MaskCombine::Or))
+            }
+            FastPredicate::ColumnLiteral { index, op, literal } => {
+                let key_col = cols.get(*index)?;
+                match (key_col, literal) {
+                    (Column::Int32(c), Value::Int32(v)) => Some(cmp_i32_scalar(c, *v, *op)),
+                    (Column::Int32(c), Value::Date(v)) => Some(cmp_i32_scalar(c, *v, *op)),
+                    // For an Int32 column compared against an Int64 literal,
+                    // narrow the literal where it fits. When it overflows the
+                    // i32 range every row gives the same answer, so build a
+                    // constant mask (NULL rows still get a 0 bit).
+                    (Column::Int32(c), Value::Int64(v)) => Some(i32::try_from(*v).map_or_else(
+                        |_| const_mask_i32(c, *v, *op),
+                        |narrow| cmp_i32_scalar(c, narrow, *op),
+                    )),
+                    (Column::Int64(c), Value::Int64(v)) => Some(cmp_i64_scalar(c, *v, *op)),
+                    (Column::Int64(c), Value::Time(v))
+                    | (Column::Int64(c), Value::Timestamp(v))
+                    | (Column::Int64(c), Value::TimestampTz(v)) => Some(cmp_i64_scalar(c, *v, *op)),
+                    (Column::Int64(c), Value::Int32(v)) => {
+                        Some(cmp_i64_scalar(c, i64::from(*v), *op))
+                    }
+                    // Type combinations outside the i32/i64 happy path fall back
+                    // to the scalar interpreter — correctness over coverage.
+                    _ => None,
+                }
+            }
+            FastPredicate::ColumnColumn {
+                left_index,
+                right_index,
+                op,
+            } => {
+                let left_col = cols.get(*left_index)?;
+                let right_col = cols.get(*right_index)?;
+                let left_type = &self.schema.field_at(*left_index).data_type;
+                let right_type = &self.schema.field_at(*right_index).data_type;
+                cmp_columns_to_mask(left_col, right_col, left_type, right_type, *op)
+            }
+        }
     }
 }
 
@@ -243,8 +262,58 @@ impl Operator for Filter {
     }
 
     fn estimated_row_count(&self) -> Option<usize> {
-        self.child.estimated_row_count()
+        let child_rows = self.child.estimated_row_count()?;
+        if child_rows == 0 {
+            return Some(0);
+        }
+        let estimated = (child_rows as f64 * self.selectivity_hint)
+            .ceil()
+            .clamp(1.0, child_rows as f64);
+        Some(estimated.to_usize().unwrap_or(child_rows))
     }
+}
+
+fn estimate_predicate_selectivity(expr: &ScalarExpr) -> f64 {
+    let selectivity = match expr {
+        ScalarExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => estimate_predicate_selectivity(left) * estimate_predicate_selectivity(right),
+        ScalarExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            let left_sel = estimate_predicate_selectivity(left);
+            let right_sel = estimate_predicate_selectivity(right);
+            left_sel + right_sel - (left_sel * right_sel)
+        }
+        ScalarExpr::Binary { op, .. } => match op {
+            BinaryOp::Eq => 0.1,
+            BinaryOp::NotEq => 0.9,
+            BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq => 0.33,
+            _ => 0.5,
+        },
+        ScalarExpr::IsNull { negated, .. } => {
+            if *negated {
+                0.95
+            } else {
+                0.05
+            }
+        }
+        ScalarExpr::Unary { .. } | ScalarExpr::FunctionCall { .. } => 0.5,
+        ScalarExpr::Literal { .. }
+        | ScalarExpr::Parameter { .. }
+        | ScalarExpr::Column { .. }
+        | ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => 0.5,
+    };
+    selectivity.clamp(0.0, 1.0)
 }
 
 /// Match a simple comparison shape and produce a cached descriptor for
@@ -256,6 +325,30 @@ impl Operator for Filter {
 /// - NULL literals — `WHERE col = NULL` always evaluates to NULL/false
 ///   in SQL but the existing scalar path already handles that.
 fn match_fast_predicate(expr: &ScalarExpr) -> Option<FastPredicate> {
+    if let ScalarExpr::Binary {
+        op: BinaryOp::And,
+        left,
+        right,
+        ..
+    } = expr
+    {
+        return Some(FastPredicate::And(
+            Box::new(match_fast_predicate(left)?),
+            Box::new(match_fast_predicate(right)?),
+        ));
+    }
+    if let ScalarExpr::Binary {
+        op: BinaryOp::Or,
+        left,
+        right,
+        ..
+    } = expr
+    {
+        return Some(FastPredicate::Or(
+            Box::new(match_fast_predicate(left)?),
+            Box::new(match_fast_predicate(right)?),
+        ));
+    }
     let ScalarExpr::Binary {
         op, left, right, ..
     } = expr
@@ -307,6 +400,26 @@ fn match_fast_predicate(expr: &ScalarExpr) -> Option<FastPredicate> {
         });
     }
     None
+}
+
+#[derive(Clone, Copy)]
+enum MaskCombine {
+    And,
+    Or,
+}
+
+fn combine_masks(left: &Bitmap, right: &Bitmap, combine: MaskCombine) -> Bitmap {
+    debug_assert_eq!(left.len(), right.len(), "mask lengths must align");
+    let words = left
+        .words()
+        .iter()
+        .zip(right.words().iter())
+        .map(|(left_word, right_word)| match combine {
+            MaskCombine::And => left_word & right_word,
+            MaskCombine::Or => left_word | right_word,
+        })
+        .collect();
+    Bitmap::from_words(words, left.len())
 }
 
 const fn binary_op_to_cmp(op: BinaryOp) -> Option<CmpOp> {
@@ -836,13 +949,13 @@ mod tests {
     }
 
     #[test]
-    fn filter_forwards_child_row_count_hint() {
+    fn filter_scales_child_row_count_hint_by_selectivity() {
         let child = HintOnlyOp {
             schema: schema_id_val(),
             hint: Some(123),
         };
         let filter = Filter::new(Box::new(child), pred_id_eq_7());
-        assert_eq!(filter.estimated_row_count(), Some(123));
+        assert_eq!(filter.estimated_row_count(), Some(13));
     }
 
     #[test]
@@ -998,6 +1111,130 @@ mod tests {
             other => panic!("unexpected column types: {other:?}"),
         };
         assert_eq!(got, vec![(10, 11), (40, 99), (60, 61)]);
+        assert!(filter.next_batch().unwrap().is_none());
+    }
+
+    /// Date literals use the same raw Int32 ordering as stored date
+    /// columns, so `col >= DATE '...'` should stay on the vectorized
+    /// column-vs-literal path.
+    #[test]
+    fn vectorized_date_literal_i32_matches_scalar() {
+        let data = vec![10_i32, 20, 30, 40, 50, 60];
+        let batch =
+            Batch::new([Column::Int32(NumericColumn::from_data(data.clone()))]).expect("batch ok");
+        let schema =
+            Schema::new([Field::required("o_orderdate", DataType::Date)]).expect("schema ok");
+        let threshold = 40_i32;
+        let pred = ScalarExpr::Binary {
+            op: BinaryOp::GtEq,
+            left: Box::new(ScalarExpr::Column {
+                name: "o_orderdate".into(),
+                index: 0,
+                data_type: DataType::Date,
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Date(threshold),
+                data_type: DataType::Date,
+            }),
+            data_type: DataType::Bool,
+        };
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut filter = Filter::new(Box::new(scan), pred);
+
+        let out = filter.next_batch().unwrap().unwrap();
+        let got: Vec<i32> = match &out.columns()[0] {
+            Column::Int32(c) => c.data().to_vec(),
+            other => panic!("unexpected column type: {other:?}"),
+        };
+        assert_eq!(got, vec![40, 50, 60]);
+        assert!(filter.next_batch().unwrap().is_none());
+    }
+
+    /// Timestamp literals use the raw Int64 ordering of timestamp
+    /// columns, so simple range predicates stay on the vectorized fast
+    /// path.
+    #[test]
+    fn vectorized_timestamp_literal_i64_matches_scalar() {
+        let data = vec![10_i64, 20, 30, 40, 50, 60];
+        let batch =
+            Batch::new([Column::Int64(NumericColumn::from_data(data.clone()))]).expect("batch ok");
+        let schema = Schema::new([Field::required("ts", DataType::Timestamp)]).expect("schema ok");
+        let threshold = 25_i64;
+        let pred = ScalarExpr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(ScalarExpr::Column {
+                name: "ts".into(),
+                index: 0,
+                data_type: DataType::Timestamp,
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Timestamp(threshold),
+                data_type: DataType::Timestamp,
+            }),
+            data_type: DataType::Bool,
+        };
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut filter = Filter::new(Box::new(scan), pred);
+
+        let out = filter.next_batch().unwrap().unwrap();
+        let got: Vec<i64> = match &out.columns()[0] {
+            Column::Int64(c) => c.data().to_vec(),
+            other => panic!("unexpected column type: {other:?}"),
+        };
+        assert_eq!(got, vec![30, 40, 50, 60]);
+        assert!(filter.next_batch().unwrap().is_none());
+    }
+
+    /// A conjunction of simple date comparisons should stay on the
+    /// vectorized path instead of forcing a full scalar fallback.
+    #[test]
+    fn vectorized_and_of_date_range_predicates_matches_scalar() {
+        let data = vec![10_i32, 20, 30, 40, 50, 60];
+        let batch =
+            Batch::new([Column::Int32(NumericColumn::from_data(data.clone()))]).expect("batch ok");
+        let schema =
+            Schema::new([Field::required("o_orderdate", DataType::Date)]).expect("schema ok");
+        let lower = ScalarExpr::Binary {
+            op: BinaryOp::GtEq,
+            left: Box::new(ScalarExpr::Column {
+                name: "o_orderdate".into(),
+                index: 0,
+                data_type: DataType::Date,
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Date(20),
+                data_type: DataType::Date,
+            }),
+            data_type: DataType::Bool,
+        };
+        let upper = ScalarExpr::Binary {
+            op: BinaryOp::Lt,
+            left: Box::new(ScalarExpr::Column {
+                name: "o_orderdate".into(),
+                index: 0,
+                data_type: DataType::Date,
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Date(50),
+                data_type: DataType::Date,
+            }),
+            data_type: DataType::Bool,
+        };
+        let pred = ScalarExpr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(lower),
+            right: Box::new(upper),
+            data_type: DataType::Bool,
+        };
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut filter = Filter::new(Box::new(scan), pred);
+
+        let out = filter.next_batch().unwrap().unwrap();
+        let got: Vec<i32> = match &out.columns()[0] {
+            Column::Int32(c) => c.data().to_vec(),
+            other => panic!("unexpected column type: {other:?}"),
+        };
+        assert_eq!(got, vec![20, 30, 40]);
         assert!(filter.next_batch().unwrap().is_none());
     }
 

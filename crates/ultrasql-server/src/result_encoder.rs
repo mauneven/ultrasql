@@ -126,11 +126,7 @@ pub fn run_modify_command(
             }
         }
     }
-    let tag = if command.eq_ignore_ascii_case("INSERT") {
-        format!("INSERT 0 {affected}")
-    } else {
-        format!("{} {affected}", command.to_uppercase())
-    };
+    let tag = modify_command_tag(command, u64::try_from(affected.max(0)).unwrap_or(0));
     let rows = u64::try_from(affected.max(0)).unwrap_or(0);
     Ok(SelectResult {
         messages: vec![BackendMessage::CommandComplete { tag }],
@@ -138,6 +134,25 @@ pub fn run_modify_command(
         shared_streamed_body: None,
         rows,
     })
+}
+
+/// Drive a DML operator that emits `RETURNING` rows and rewrite the
+/// trailing `CommandComplete` tag from `SELECT n` to the PostgreSQL DML
+/// tag shape (`INSERT 0 n`, `UPDATE n`, `DELETE n`).
+pub fn run_modify_returning(
+    op: &mut dyn Operator,
+    command: &str,
+) -> Result<SelectResult, ServerError> {
+    let mut result = run_select(op)?;
+    let tag = modify_command_tag(command, result.rows);
+    let Some(BackendMessage::CommandComplete { tag: current_tag }) = result.messages.last_mut()
+    else {
+        return Err(ServerError::Unsupported(
+            "RETURNING result missing trailing CommandComplete",
+        ));
+    };
+    *current_tag = tag;
+    Ok(result)
 }
 
 /// Drive `op` to completion and produce the corresponding wire
@@ -185,6 +200,14 @@ pub fn run_select(op: &mut dyn Operator) -> Result<SelectResult, ServerError> {
         shared_streamed_body: None,
         rows,
     })
+}
+
+fn modify_command_tag(command: &str, affected: u64) -> String {
+    if command.eq_ignore_ascii_case("INSERT") {
+        format!("INSERT 0 {affected}")
+    } else {
+        format!("{} {affected}", command.to_uppercase())
+    }
 }
 
 /// Drain `op` to completion, encoding every wire byte (`RowDescription`

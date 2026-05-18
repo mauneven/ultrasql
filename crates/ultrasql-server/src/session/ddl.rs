@@ -28,6 +28,7 @@ use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
+use ultrasql_wal::payload::SequenceOpKind;
 
 use super::Session;
 use crate::error::ServerError;
@@ -120,6 +121,14 @@ where
                 super::sequence::to_storage_options(*options),
             )
             .map_err(|e| ServerError::ddl(format!("CREATE TABLE serial sequence: {e}")))?;
+            seq.emit_wal(
+                SequenceOpKind::Create,
+                seq_name,
+                RelationId::INVALID,
+                ultrasql_core::Xid::INVALID,
+                self.state.heap.wal_sink().map(|sink| sink.as_ref()),
+            )
+            .map_err(|e| ServerError::ddl(format!("CREATE TABLE serial sequence WAL: {e}")))?;
             self.state.sequences.insert(seq_name.clone(), Arc::new(seq));
         }
         let runtime_foreign_keys = foreign_keys
@@ -138,6 +147,8 @@ where
                     target_columns: fk.target_columns.clone(),
                     on_delete: fk.on_delete,
                     on_update: fk.on_update,
+                    deferrable: fk.deferrable,
+                    initially_deferred: fk.initially_deferred,
                 })
             })
             .collect::<Result<Vec<_>, ServerError>>()?;
@@ -163,17 +174,22 @@ where
                         })
                         .collect(),
                     foreign_keys: runtime_foreign_keys,
+                    indexes: std::collections::HashMap::new(),
                 }),
             );
         }
-        if let Err(e) = self.create_table_unique_indexes(&entry, unique_constraints) {
-            let _ = self.state.persistent_catalog.drop_table(table_name);
-            self.state.table_constraints.remove(&oid);
-            for (seq_name, _) in &serial_sequences {
-                self.state.sequences.remove(seq_name);
-            }
-            return Err(e);
-        }
+        let created_unique_indexes =
+            match self.create_table_unique_indexes(&entry, unique_constraints) {
+                Ok(indexes) => indexes,
+                Err(e) => {
+                    let _ = self.state.persistent_catalog.drop_table(table_name);
+                    self.state.table_constraints.remove(&oid);
+                    for (seq_name, _) in &serial_sequences {
+                        self.state.sequences.remove(seq_name);
+                    }
+                    return Err(e);
+                }
+            };
         // Persist the typed pg_class + pg_attribute rows so a restart
         // can rebuild this `TableEntry` via
         // `PersistentCatalog::bootstrap_from_heap`. The DDL runs in an
@@ -186,12 +202,24 @@ where
             .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
         let ddl_xid = ddl_txn.xid;
         let ddl_command_id = ddl_txn.current_command;
-        if let Err(e) = self.state.persistent_catalog.persist_table_rows(
-            &entry,
-            self.state.heap.as_ref(),
-            ddl_xid,
-            ddl_command_id,
-        ) {
+        let persist_result = (|| -> Result<(), ultrasql_catalog::CatalogError> {
+            self.state.persistent_catalog.persist_table_rows(
+                &entry,
+                self.state.heap.as_ref(),
+                ddl_xid,
+                ddl_command_id,
+            )?;
+            for index in &created_unique_indexes {
+                self.state.persistent_catalog.persist_index_rows(
+                    index,
+                    self.state.heap.as_ref(),
+                    ddl_xid,
+                    ddl_command_id,
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = persist_result {
             // Abort the catalog-write txn before surfacing the error so
             // the CLOG entry is closed and the rollback path cleans
             // any partial in-place undo entries (there are none for
@@ -227,7 +255,8 @@ where
         &self,
         table: &TableEntry,
         unique_constraints: &[ultrasql_planner::LogicalUniqueConstraint],
-    ) -> Result<(), ServerError> {
+    ) -> Result<Vec<IndexEntry>, ServerError> {
+        let mut created = Vec::with_capacity(unique_constraints.len());
         for unique in unique_constraints {
             crate::index_key::IndexKeyEncoding::for_columns(&table.schema, &unique.columns)?;
             let index_oid = self.state.persistent_catalog.next_oid();
@@ -250,9 +279,10 @@ where
                 IndexEntry::new(index_oid, unique.name.clone(), table.oid, attnums, true);
             entry.root_block = root_block;
             // Empty table, so there are no existing heap rows to populate.
-            self.state.persistent_catalog.create_index(entry)?;
+            self.state.persistent_catalog.create_index(entry.clone())?;
+            created.push(entry);
         }
-        Ok(())
+        Ok(created)
     }
 
     /// Build a B+ tree index over the supplied table and register it
@@ -312,6 +342,10 @@ where
             index_name,
             table_name,
             columns,
+            key_exprs,
+            include_columns,
+            predicate,
+            method,
             unique,
             if_not_exists,
             ..
@@ -344,8 +378,25 @@ where
         //     `pipeline::key_encoding_for_btree` — keep the two
         //     resolutions consistent or a freshly built index will be
         //     unprobe-able.
-        let encoding = crate::index_key::IndexKeyEncoding::for_columns(&table.schema, columns)?;
-        let key_col_idx = columns[0];
+        let expression_key_exprs = if columns.is_empty() {
+            let [expr] = key_exprs.as_slice() else {
+                return Err(ServerError::Unsupported(
+                    "CREATE INDEX: expression indexes support exactly one key in this wave",
+                ));
+            };
+            let _ = expr;
+            key_exprs.clone()
+        } else {
+            Vec::new()
+        };
+        let encoding = if *method == ultrasql_planner::LogicalIndexMethod::Hash {
+            crate::index_key::IndexKeyEncoding::Int64
+        } else if expression_key_exprs.is_empty() {
+            crate::index_key::IndexKeyEncoding::for_columns(&table.schema, columns)?
+        } else {
+            crate::index_key::IndexKeyEncoding::for_data_type(&expression_key_exprs[0].data_type())?
+        };
+        let key_col_idx = columns.first().copied();
 
         // 2. Allocate an OID and instantiate the B-tree.
         let index_oid = self.state.persistent_catalog.next_oid();
@@ -379,7 +430,15 @@ where
             for result in scan {
                 let tup =
                     result.map_err(|e| ServerError::ddl(format!("CREATE INDEX heap scan: {e}")))?;
-                let row = decode_key_column(&tup.data, &table.schema, key_col_idx, &encoding)?;
+                let row = decode_key_column(
+                    &tup.data,
+                    &table.schema,
+                    key_col_idx,
+                    &expression_key_exprs,
+                    predicate.as_ref(),
+                    *method,
+                    &encoding,
+                )?;
                 if let Some(key) = row {
                     if *unique {
                         btree.insert(key, tup.tid, txn.xid, None).map_err(|e| {
@@ -415,7 +474,56 @@ where
         //    freshly built tree.
         let mut entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, *unique);
         entry.root_block = root_block;
-        self.state.persistent_catalog.create_index(entry)?;
+        self.state.persistent_catalog.create_index(entry.clone())?;
+        let ddl_txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        if let Err(e) = self.state.persistent_catalog.persist_index_rows(
+            &entry,
+            self.state.heap.as_ref(),
+            ddl_txn.xid,
+            ddl_txn.current_command,
+        ) {
+            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "abort of catalog-write txn failed after persist_index_rows error",
+                );
+            }
+            let _ = self.state.persistent_catalog.drop_index(index_name);
+            return Err(e.into());
+        }
+        if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
+            tracing::warn!(
+                error = %commit_err,
+                "catalog-write txn failed to commit; restart visibility may differ",
+            );
+        }
+        if !expression_key_exprs.is_empty()
+            || predicate.is_some()
+            || !include_columns.is_empty()
+            || *method == ultrasql_planner::LogicalIndexMethod::Hash
+        {
+            let mut constraints = self
+                .state
+                .table_constraints
+                .get(&table.oid)
+                .map(|entry| entry.value().as_ref().clone())
+                .unwrap_or_default();
+            constraints.indexes.insert(
+                index_oid,
+                crate::RuntimeIndexMetadata {
+                    key_exprs: expression_key_exprs,
+                    predicate: predicate.clone(),
+                    include_columns: include_columns.clone(),
+                    method: *method,
+                },
+            );
+            self.state
+                .table_constraints
+                .insert(table.oid, Arc::new(constraints));
+        }
         // A new index can flip an existing cached plan from
         // `Filter(SeqScan)` to `IndexScan`; clear the cache so the next
         // statement re-plans against the post-CREATE INDEX catalog.

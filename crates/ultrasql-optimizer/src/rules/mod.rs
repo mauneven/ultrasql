@@ -40,6 +40,7 @@ pub mod outer_join_elimination;
 pub mod predicate_pushdown;
 pub mod predicate_pushdown_subquery;
 pub mod projection_pushdown;
+pub mod semi_join_pushdown;
 pub mod sort_elimination;
 pub mod subquery_decorrelation;
 
@@ -51,6 +52,7 @@ pub use outer_join_elimination::OuterJoinElimination;
 pub use predicate_pushdown::PredicatePushdown;
 pub use predicate_pushdown_subquery::PredicatePushdownSubquery;
 pub use projection_pushdown::ProjectionPushdown;
+pub use semi_join_pushdown::SemiJoinPushdown;
 pub use sort_elimination::SortElimination;
 pub use subquery_decorrelation::SubqueryDecorrelation;
 
@@ -141,6 +143,7 @@ impl RuleSet {
         rs.add(Box::new(LimitPushdown));
         rs.add(Box::new(InListToSemi));
         rs.add(Box::new(SubqueryDecorrelation));
+        rs.add(Box::new(SemiJoinPushdown));
         rs.add(Box::new(CommonSubExprElimination));
         rs.add(Box::new(PredicatePushdownSubquery));
         rs

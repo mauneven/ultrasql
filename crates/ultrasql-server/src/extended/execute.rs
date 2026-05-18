@@ -2,14 +2,15 @@
 //! a previously bound portal; [`resume_suspended_portal`] resumes a portal
 //! that was suspended by a prior `max_rows` cap.
 
+use ultrasql_executor::Operator;
 use ultrasql_planner::LogicalPlan;
 use ultrasql_protocol::BackendMessage;
 
 use crate::error::ServerError;
 use crate::pipeline::{LowerCtx, lower_query};
-use crate::result_encoder::{encode_text_value, run_modify_command};
+use crate::result_encoder::{encode_text_value_typed, run_modify_command};
 
-use super::codec::encode_binary_value;
+use super::codec::encode_binary_value_typed;
 use super::handlers::resolve_param_format;
 use super::{ExecuteOutcome, ExtendedConnState, SuspendedPortal};
 
@@ -79,24 +80,37 @@ pub fn execute_portal(
     // Build the operator tree.
     let mut op = lower_query(&plan, ctx)?;
 
-    // INSERT/UPDATE/DELETE produce a row count message, not data rows.
-    if let LogicalPlan::Insert { .. } = &plan {
-        let sel = run_modify_command(op.as_mut(), "INSERT")?;
-        return Ok(ExecuteOutcome {
-            messages: sel.messages,
-        });
+    // INSERT/UPDATE/DELETE either produce a row count tag or, when
+    // `RETURNING` is present, a row stream plus the DML-specific
+    // `CommandComplete` tag. Like the pre-existing DML path, we drain
+    // the full operator here rather than supporting portal suspension
+    // for mutation statements.
+    if let LogicalPlan::Insert { returning, .. } = &plan {
+        if returning.is_empty() {
+            let sel = run_modify_command(op.as_mut(), "INSERT")?;
+            return Ok(ExecuteOutcome {
+                messages: sel.messages,
+            });
+        }
+        return execute_modify_returning(op.as_mut(), &portal.result_formats, "INSERT");
     }
-    if let LogicalPlan::Update { .. } = &plan {
-        let sel = run_modify_command(op.as_mut(), "UPDATE")?;
-        return Ok(ExecuteOutcome {
-            messages: sel.messages,
-        });
+    if let LogicalPlan::Update { returning, .. } = &plan {
+        if returning.is_empty() {
+            let sel = run_modify_command(op.as_mut(), "UPDATE")?;
+            return Ok(ExecuteOutcome {
+                messages: sel.messages,
+            });
+        }
+        return execute_modify_returning(op.as_mut(), &portal.result_formats, "UPDATE");
     }
-    if let LogicalPlan::Delete { .. } = &plan {
-        let sel = run_modify_command(op.as_mut(), "DELETE")?;
-        return Ok(ExecuteOutcome {
-            messages: sel.messages,
-        });
+    if let LogicalPlan::Delete { returning, .. } = &plan {
+        if returning.is_empty() {
+            let sel = run_modify_command(op.as_mut(), "DELETE")?;
+            return Ok(ExecuteOutcome {
+                messages: sel.messages,
+            });
+        }
+        return execute_modify_returning(op.as_mut(), &portal.result_formats, "DELETE");
     }
 
     // SELECT-like path. Drain row by row. Honor `result_formats` per
@@ -108,6 +122,7 @@ pub fn execute_portal(
         usize::try_from(max_rows).unwrap_or(usize::MAX)
     };
 
+    let output_schema = op.schema().clone();
     let mut messages: Vec<BackendMessage> = Vec::with_capacity(8);
     let mut emitted: u64 = 0;
     let mut suspended = false;
@@ -128,11 +143,8 @@ pub fn execute_portal(
             let mut columns = Vec::with_capacity(batch.width());
             for (col_idx, col) in batch.columns().iter().enumerate() {
                 let fmt = resolve_param_format(&portal.result_formats, col_idx);
-                let encoded = if fmt == 1 {
-                    encode_binary_value(col, row)
-                } else {
-                    encode_text_value(col, row)
-                };
+                let logical_type = &output_schema.field_at(col_idx).data_type;
+                let encoded = encode_result_value(col, row, logical_type, fmt);
                 columns.push(encoded);
             }
             messages.push(BackendMessage::DataRow { columns });
@@ -164,6 +176,56 @@ pub fn execute_portal(
     Ok(ExecuteOutcome { messages })
 }
 
+fn execute_modify_returning(
+    op: &mut dyn Operator,
+    result_formats: &[i16],
+    command: &str,
+) -> Result<ExecuteOutcome, ServerError> {
+    let output_schema = op.schema().clone();
+    let mut messages: Vec<BackendMessage> = Vec::with_capacity(8);
+    let mut emitted: u64 = 0;
+    loop {
+        let Some(batch) = op.next_batch()? else { break };
+        let n = batch.rows();
+        for row in 0..n {
+            let mut columns = Vec::with_capacity(batch.width());
+            for (col_idx, col) in batch.columns().iter().enumerate() {
+                let fmt = resolve_param_format(result_formats, col_idx);
+                let logical_type = &output_schema.field_at(col_idx).data_type;
+                let encoded = encode_result_value(col, row, logical_type, fmt);
+                columns.push(encoded);
+            }
+            messages.push(BackendMessage::DataRow { columns });
+            emitted = emitted.saturating_add(1);
+        }
+    }
+    messages.push(BackendMessage::CommandComplete {
+        tag: modify_command_tag(command, emitted),
+    });
+    Ok(ExecuteOutcome { messages })
+}
+
+fn encode_result_value(
+    col: &ultrasql_vec::column::Column,
+    row: usize,
+    logical_type: &ultrasql_core::DataType,
+    format: i16,
+) -> Option<Vec<u8>> {
+    if format == 1 {
+        encode_binary_value_typed(col, row, logical_type)
+    } else {
+        encode_text_value_typed(col, row, logical_type)
+    }
+}
+
+fn modify_command_tag(command: &str, affected: u64) -> String {
+    if command.eq_ignore_ascii_case("INSERT") {
+        format!("INSERT 0 {affected}")
+    } else {
+        format!("{} {affected}", command.to_uppercase())
+    }
+}
+
 /// Resume an `Execute` on a portal that previously emitted
 /// `PortalSuspended`. Drives the retained operator forward; on
 /// re-suspension, the portal is re-inserted into the suspension map.
@@ -180,6 +242,7 @@ fn resume_suspended_portal(
         usize::try_from(max_rows).unwrap_or(usize::MAX)
     };
 
+    let output_schema = sus.op.schema().clone();
     let mut messages: Vec<BackendMessage> = Vec::with_capacity(8);
     let mut emitted_this_call: usize = 0;
     let mut suspended = false;
@@ -207,11 +270,8 @@ fn resume_suspended_portal(
             let mut columns = Vec::with_capacity(batch.width());
             for (col_idx, col) in batch.columns().iter().enumerate() {
                 let fmt = resolve_param_format(&sus.result_formats, col_idx);
-                let encoded = if fmt == 1 {
-                    encode_binary_value(col, row)
-                } else {
-                    encode_text_value(col, row)
-                };
+                let logical_type = &output_schema.field_at(col_idx).data_type;
+                let encoded = encode_result_value(col, row, logical_type, fmt);
                 columns.push(encoded);
             }
             messages.push(BackendMessage::DataRow { columns });

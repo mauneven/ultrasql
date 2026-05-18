@@ -2845,6 +2845,7 @@ dependencies = [
  "ahash",
  "criterion",
  "crossbeam",
+ "num-traits",
  "parking_lot",
  "proptest",
  "smallvec",

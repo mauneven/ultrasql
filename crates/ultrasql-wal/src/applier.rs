@@ -13,9 +13,9 @@
 //! [`ApplyError::UnknownPayload`].
 
 use crate::payload::{
-    AbortPayload, CheckpointPayload, CommitPayload, FullPageWritePayload, HeapDeleteInPlacePayload,
-    HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlacePayload, HeapUpdatePayload,
-    PayloadError,
+    AbortPayload, BTreeOpPayload, CheckpointPayload, CommitPayload, FullPageWritePayload,
+    HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlacePayload,
+    HeapUpdatePayload, PayloadError, SequenceOpPayload,
 };
 use crate::record::{RecordType, WalRecord};
 use crate::recovery::RecoveryError;
@@ -128,6 +128,25 @@ pub trait HeapTarget: Send + Sync {
         })
     }
 
+    /// Apply a B-tree mutation record.
+    ///
+    /// Heap-only recovery targets may ignore these records, so the default is
+    /// a no-op. Storage targets that own index pages override this method.
+    fn apply_btree_op(&self, payload: &BTreeOpPayload) -> Result<(), ApplyError> {
+        let _ = payload;
+        Ok(())
+    }
+
+    /// Apply a sequence state change record.
+    ///
+    /// Heap-only recovery targets may ignore these records. A server-level
+    /// recovery target that owns the sequence registry should override this
+    /// hook and install the state carried by the payload.
+    fn apply_sequence_op(&self, payload: &SequenceOpPayload) -> Result<(), ApplyError> {
+        let _ = payload;
+        Ok(())
+    }
+
     /// Observe a commit record. The default implementation is a no-op.
     ///
     /// Implementors that maintain a CLOG or a transaction state table should
@@ -158,8 +177,8 @@ pub trait HeapTarget: Send + Sync {
 
 /// Dispatch one [`WalRecord`] into the appropriate [`HeapTarget`] method.
 ///
-/// `BTreeOp` and `Nop` records are silently ignored; a future `BTreeTarget`
-/// trait will handle index changes in a later wave.
+/// `BTreeOp` records are routed to [`HeapTarget::apply_btree_op`]. `Nop`
+/// records are ignored by definition.
 ///
 /// # Errors
 ///
@@ -184,9 +203,9 @@ pub fn dispatch_record(target: &dyn HeapTarget, record: &WalRecord) -> Result<()
         RecordType::Commit => target.observe_commit(&CommitPayload::decode(bytes)?),
         RecordType::Abort => target.observe_abort(&AbortPayload::decode(bytes)?),
         RecordType::Checkpoint => target.observe_checkpoint(&CheckpointPayload::decode(bytes)?),
-        // B-tree index changes are dispatched into a future BTreeTarget; Nop markers are
-        // ignored on replay by definition. Both produce no side-effects.
-        RecordType::BTreeOp | RecordType::Nop => Ok(()),
+        RecordType::BTreeOp => target.apply_btree_op(&BTreeOpPayload::decode(bytes)?),
+        RecordType::SequenceOp => target.apply_sequence_op(&SequenceOpPayload::decode(bytes)?),
+        RecordType::Nop => Ok(()),
     }
 }
 
@@ -228,7 +247,10 @@ mod tests {
 
     use super::*;
     use crate::buffer::WalBuffer;
-    use crate::payload::{AbortPayload, CheckpointPayload, CommitPayload, HeapUpdatePayload};
+    use crate::payload::{
+        AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload,
+        HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
+    };
     use crate::record::{RecordType, WalRecord};
     use crate::writer::{WalWriter, WalWriterConfig};
 
@@ -241,6 +263,8 @@ mod tests {
         inserts: Mutex<Vec<HeapInsertPayload>>,
         updates: Mutex<Vec<HeapUpdatePayload>>,
         deletes: Mutex<Vec<HeapDeletePayload>>,
+        btree_ops: Mutex<Vec<BTreeOpPayload>>,
+        sequence_ops: Mutex<Vec<SequenceOpPayload>>,
         fpws: Mutex<Vec<FullPageWritePayload>>,
         commits: Mutex<Vec<CommitPayload>>,
         aborts: Mutex<Vec<AbortPayload>>,
@@ -265,6 +289,16 @@ mod tests {
 
         fn apply_full_page_write(&self, p: &FullPageWritePayload) -> Result<(), ApplyError> {
             self.fpws.lock().push(p.clone());
+            Ok(())
+        }
+
+        fn apply_btree_op(&self, p: &BTreeOpPayload) -> Result<(), ApplyError> {
+            self.btree_ops.lock().push(p.clone());
+            Ok(())
+        }
+
+        fn apply_sequence_op(&self, p: &SequenceOpPayload) -> Result<(), ApplyError> {
+            self.sequence_ops.lock().push(p.clone());
             Ok(())
         }
 
@@ -391,8 +425,32 @@ mod tests {
         let rec = make_record(RecordType::Checkpoint, checkpoint_payload.encode());
         dispatch_record(&mock, &rec).unwrap();
 
-        // BTreeOp — silently ignored
-        let rec = make_record(RecordType::BTreeOp, vec![]);
+        // BTreeOp
+        let btree_payload = BTreeOpPayload {
+            op: BTreeOpKind::Insert,
+            index_rel: RelationId::new(44),
+            page: PageId::new(RelationId::new(44), BlockNumber::new(0)),
+            key_bytes: 7_i64.to_le_bytes().to_vec(),
+            child_or_value: vec![0_u8; 12],
+        };
+        let rec = make_record(RecordType::BTreeOp, btree_payload.encode().unwrap());
+        dispatch_record(&mock, &rec).unwrap();
+
+        // SequenceOp
+        let sequence_payload = SequenceOpPayload {
+            op: SequenceOpKind::Advance,
+            seqrelid: RelationId::new(55),
+            name: "orders_id_seq".to_owned(),
+            start_value: 1,
+            last_value: 2,
+            min_value: 1,
+            max_value: i64::MAX,
+            increment: 1,
+            cache_size: 1,
+            is_called: true,
+            cycle: false,
+        };
+        let rec = make_record(RecordType::SequenceOp, sequence_payload.encode().unwrap());
         dispatch_record(&mock, &rec).unwrap();
 
         // Nop — silently ignored
@@ -402,6 +460,8 @@ mod tests {
         assert_eq!(mock.inserts.lock().len(), 1);
         assert_eq!(mock.updates.lock().len(), 1);
         assert_eq!(mock.deletes.lock().len(), 1);
+        assert_eq!(mock.btree_ops.lock().len(), 1);
+        assert_eq!(mock.sequence_ops.lock().len(), 1);
         assert_eq!(mock.fpws.lock().len(), 1);
         assert_eq!(mock.commits.lock().len(), 1);
         assert_eq!(mock.aborts.lock().len(), 1);

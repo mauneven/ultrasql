@@ -115,6 +115,8 @@ pub enum RecordType {
     /// recovery to stamp the source slot's `xmax`/`cmax` and clear
     /// the `UPDATED_IN_PLACE` bit if previously set.
     HeapDeleteInPlace = 10,
+    /// A sequence's durable state changed.
+    SequenceOp = 11,
     /// A no-op marker (used to round records up to alignment
     /// boundaries; ignored on replay).
     Nop = 255,
@@ -134,6 +136,7 @@ impl RecordType {
             8 => Self::BTreeOp,
             9 => Self::HeapUpdateInPlace,
             10 => Self::HeapDeleteInPlace,
+            11 => Self::SequenceOp,
             255 => Self::Nop,
             other => return Err(WalRecordError::UnknownType(other)),
         })
@@ -372,6 +375,9 @@ mod tests {
             RecordType::Abort,
             RecordType::Checkpoint,
             RecordType::BTreeOp,
+            RecordType::SequenceOp,
+            RecordType::HeapUpdateInPlace,
+            RecordType::HeapDeleteInPlace,
             RecordType::Nop,
         ] {
             let raw = rt as u8;

@@ -27,6 +27,11 @@
 
 use parking_lot::Mutex;
 use thiserror::Error;
+use ultrasql_core::{RelationId, Xid};
+use ultrasql_wal::payload::{SequenceOpKind, SequenceOpPayload};
+use ultrasql_wal::{RecordType, WalRecord};
+
+use crate::wal_sink::WalSink;
 
 // ---------------------------------------------------------------------------
 // Error
@@ -57,6 +62,10 @@ pub enum SequenceError {
     /// Attempt to configure a sequence with invalid options.
     #[error("invalid sequence options: {0}")]
     InvalidOptions(String),
+
+    /// WAL sink rejected a sequence record.
+    #[error("sequence WAL append failed: {0}")]
+    Wal(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +142,27 @@ struct SequenceState {
     cache_size: u32,
 }
 
+/// Durable sequence state carried by `SequenceOp` WAL records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceSnapshot {
+    /// Configured restart value.
+    pub start_value: i64,
+    /// Last value returned, or next value when `is_called` is false.
+    pub last_value: i64,
+    /// PostgreSQL `is_called` state.
+    pub is_called: bool,
+    /// Lower bound.
+    pub min_value: i64,
+    /// Upper bound.
+    pub max_value: i64,
+    /// Step.
+    pub increment: i64,
+    /// Whether CYCLE is enabled.
+    pub cycle: bool,
+    /// Configured cache size.
+    pub cache_size: u32,
+}
+
 impl SequenceState {
     fn from_opts(opts: &SequenceOptions) -> Result<Self, SequenceError> {
         if opts.increment == 0 {
@@ -165,6 +195,56 @@ impl SequenceState {
             cycle: opts.cycle,
             cache_size,
         })
+    }
+
+    fn from_snapshot(snapshot: SequenceSnapshot) -> Result<Self, SequenceError> {
+        if snapshot.increment == 0 {
+            return Err(SequenceError::InvalidOptions(
+                "INCREMENT must not be zero".into(),
+            ));
+        }
+        if snapshot.min_value >= snapshot.max_value {
+            return Err(SequenceError::InvalidOptions(format!(
+                "MINVALUE {} must be less than MAXVALUE {}",
+                snapshot.min_value, snapshot.max_value,
+            )));
+        }
+        if snapshot.start_value < snapshot.min_value || snapshot.start_value > snapshot.max_value {
+            return Err(SequenceError::InvalidOptions(format!(
+                "START {} is out of range [{}, {}]",
+                snapshot.start_value, snapshot.min_value, snapshot.max_value,
+            )));
+        }
+        if snapshot.last_value < snapshot.min_value || snapshot.last_value > snapshot.max_value {
+            return Err(SequenceError::OutOfRange {
+                value: snapshot.last_value,
+                min: snapshot.min_value,
+                max: snapshot.max_value,
+            });
+        }
+        Ok(Self {
+            start_value: snapshot.start_value,
+            last_value: snapshot.last_value,
+            is_called: snapshot.is_called,
+            min_value: snapshot.min_value,
+            max_value: snapshot.max_value,
+            increment: snapshot.increment,
+            cycle: snapshot.cycle,
+            cache_size: snapshot.cache_size.max(1),
+        })
+    }
+
+    fn snapshot(&self) -> SequenceSnapshot {
+        SequenceSnapshot {
+            start_value: self.start_value,
+            last_value: self.last_value,
+            is_called: self.is_called,
+            min_value: self.min_value,
+            max_value: self.max_value,
+            increment: self.increment,
+            cycle: self.cycle,
+            cache_size: self.cache_size,
+        }
     }
 
     /// Advance the sequence and return the next value.
@@ -239,6 +319,15 @@ impl Sequence {
         })
     }
 
+    /// Rebuild a sequence from a durable WAL/catalog snapshot.
+    pub fn from_snapshot(snapshot: SequenceSnapshot) -> Result<Self, SequenceError> {
+        let state = SequenceState::from_snapshot(snapshot)?;
+        Ok(Self {
+            state: Mutex::new(state),
+            currval: Mutex::new(None),
+        })
+    }
+
     /// Advance the sequence and return the next value.
     ///
     /// This is the only operation that modifies persistent state. In
@@ -251,6 +340,20 @@ impl Sequence {
     pub fn nextval(&self) -> Result<i64, SequenceError> {
         let value = self.state.lock().advance()?;
         *self.currval.lock() = Some(value);
+        Ok(value)
+    }
+
+    /// Advance the sequence and emit a `SequenceOp` WAL record carrying the
+    /// post-advance state when `wal` is configured.
+    pub fn nextval_logged(
+        &self,
+        name: &str,
+        seqrelid: RelationId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<i64, SequenceError> {
+        let value = self.nextval()?;
+        self.emit_wal(SequenceOpKind::Advance, name, seqrelid, xid, wal)?;
         Ok(value)
     }
 
@@ -297,6 +400,34 @@ impl Sequence {
         if is_called {
             *self.currval.lock() = Some(value);
         }
+        Ok(())
+    }
+
+    /// Set the sequence value and emit a `SequenceOp` WAL record carrying the
+    /// post-set state when `wal` is configured.
+    pub fn setval_logged(
+        &self,
+        value: i64,
+        is_called: bool,
+        name: &str,
+        seqrelid: RelationId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), SequenceError> {
+        self.setval(value, is_called)?;
+        self.emit_wal(SequenceOpKind::Set, name, seqrelid, xid, wal)
+    }
+
+    /// Return the full durable state snapshot.
+    pub fn state_snapshot(&self) -> SequenceSnapshot {
+        self.state.lock().snapshot()
+    }
+
+    /// Replace the durable state from recovery.
+    pub fn apply_snapshot(&self, snapshot: SequenceSnapshot) -> Result<(), SequenceError> {
+        let next = SequenceState::from_snapshot(snapshot)?;
+        *self.state.lock() = next;
+        *self.currval.lock() = None;
         Ok(())
     }
 
@@ -352,6 +483,21 @@ impl Sequence {
         Ok(())
     }
 
+    /// Alter options and emit a `SequenceOp` WAL record carrying the
+    /// post-alter state when `wal` is configured.
+    pub fn alter_options_logged(
+        &self,
+        opts: SequenceOptions,
+        restart: Option<i64>,
+        name: &str,
+        seqrelid: RelationId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), SequenceError> {
+        self.alter_options(opts, restart)?;
+        self.emit_wal(SequenceOpKind::Alter, name, seqrelid, xid, wal)
+    }
+
     /// Return the configured minimum value.
     pub fn min_value(&self) -> i64 {
         self.state.lock().min_value
@@ -371,6 +517,41 @@ impl Sequence {
     pub fn is_cycle(&self) -> bool {
         self.state.lock().cycle
     }
+
+    /// Emit the current state as a sequence WAL record.
+    pub fn emit_wal(
+        &self,
+        op: SequenceOpKind,
+        name: &str,
+        seqrelid: RelationId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), SequenceError> {
+        let Some(wal) = wal else {
+            return Ok(());
+        };
+        let snapshot = self.state_snapshot();
+        let payload = SequenceOpPayload {
+            op,
+            seqrelid,
+            name: name.to_ascii_lowercase(),
+            start_value: snapshot.start_value,
+            last_value: snapshot.last_value,
+            min_value: snapshot.min_value,
+            max_value: snapshot.max_value,
+            increment: snapshot.increment,
+            cache_size: snapshot.cache_size,
+            is_called: snapshot.is_called,
+            cycle: snapshot.cycle,
+        }
+        .encode()
+        .map_err(|e| SequenceError::Wal(e.to_string()))?;
+        let prev_lsn = wal.last_lsn_for(xid);
+        let record = WalRecord::new(RecordType::SequenceOp, xid, prev_lsn, 0, payload);
+        wal.append(record)
+            .map(|_| ())
+            .map_err(|e| SequenceError::Wal(e.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -381,6 +562,11 @@ impl Sequence {
 mod tests {
     use std::sync::Arc;
     use std::thread;
+
+    use ultrasql_wal::RecordType;
+    use ultrasql_wal::payload::{SequenceOpKind, SequenceOpPayload};
+
+    use crate::wal_sink::test_support::InMemoryWalSink;
 
     use super::*;
 
@@ -416,6 +602,46 @@ mod tests {
         assert_eq!(seq.nextval().unwrap(), 1);
         assert_eq!(seq.nextval().unwrap(), 2);
         assert_eq!(seq.nextval().unwrap(), 3);
+    }
+
+    #[test]
+    fn logged_nextval_emits_sequence_op_payload() {
+        let seq = ascending();
+        let sink = InMemoryWalSink::new();
+        let value = seq
+            .nextval_logged(
+                "orders_id_seq",
+                RelationId::new(42),
+                Xid::new(7),
+                Some(&sink),
+            )
+            .unwrap();
+        assert_eq!(value, 1);
+        let records = sink.records();
+        assert_eq!(records.len(), 1);
+        let record = &records[0].1;
+        assert_eq!(record.header.record_type, RecordType::SequenceOp);
+        let payload = SequenceOpPayload::decode(&record.payload).unwrap();
+        assert_eq!(payload.op, SequenceOpKind::Advance);
+        assert_eq!(payload.seqrelid, RelationId::new(42));
+        assert_eq!(payload.name, "orders_id_seq");
+        assert_eq!(payload.last_value, 1);
+        assert!(payload.is_called);
+    }
+
+    #[test]
+    fn snapshot_rebuild_and_apply_restore_state() {
+        let seq = ascending();
+        assert_eq!(seq.nextval().unwrap(), 1);
+        assert_eq!(seq.nextval().unwrap(), 2);
+        let snapshot = seq.state_snapshot();
+
+        let rebuilt = Sequence::from_snapshot(snapshot.clone()).unwrap();
+        assert_eq!(rebuilt.nextval().unwrap(), 3);
+
+        let target = ascending();
+        target.apply_snapshot(snapshot).unwrap();
+        assert_eq!(target.nextval().unwrap(), 3);
     }
 
     #[test]

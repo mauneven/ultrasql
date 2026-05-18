@@ -182,6 +182,83 @@ async fn uncorrelated_in_and_scalar_subqueries_lower_before_execution() {
 }
 
 #[tokio::test]
+async fn correlated_in_and_not_in_lower_before_execution() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute(
+            "CREATE TABLE sq_outer_pair (
+                 outer_id INT NOT NULL,
+                 outer_group INT NOT NULL
+             )",
+        )
+        .await
+        .expect("create outer pair");
+    client
+        .batch_execute(
+            "CREATE TABLE sq_inner_pair (
+                 inner_id INT NOT NULL,
+                 inner_group INT NOT NULL
+             )",
+        )
+        .await
+        .expect("create inner pair");
+    client
+        .batch_execute("INSERT INTO sq_outer_pair VALUES (1, 10), (2, 10), (3, 20), (4, 30)")
+        .await
+        .expect("insert outer rows");
+    client
+        .batch_execute("INSERT INTO sq_inner_pair VALUES (1, 10), (3, 20), (5, 10)")
+        .await
+        .expect("insert inner rows");
+
+    let rows = client
+        .simple_query(
+            "SELECT outer_id
+             FROM sq_outer_pair o
+             WHERE outer_id IN (
+                 SELECT inner_id
+                 FROM sq_inner_pair i
+                 WHERE i.inner_group = o.outer_group
+             )
+             ORDER BY outer_id",
+        )
+        .await
+        .expect("correlated IN query succeeds");
+    let in_keys: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(in_keys, vec![1, 3]);
+
+    let rows = client
+        .simple_query(
+            "SELECT outer_id
+             FROM sq_outer_pair o
+             WHERE outer_id NOT IN (
+                 SELECT inner_id
+                 FROM sq_inner_pair i
+                 WHERE i.inner_group = o.outer_group
+             )
+             ORDER BY outer_id",
+        )
+        .await
+        .expect("correlated NOT IN query succeeds");
+    let not_in_keys: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(not_in_keys, vec![2, 4]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn correlated_scalar_aggregate_subquery_lowers_before_execution() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
     client

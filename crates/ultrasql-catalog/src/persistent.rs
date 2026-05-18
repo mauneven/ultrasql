@@ -31,11 +31,14 @@
 //! relations the server needs to query its own catalog.
 //!
 //! On a warm restart the heap is non-empty.
-//! [`PersistentCatalog::bootstrap_from_heap`] scans the `pg_class` and
-//! `pg_attribute` heap pages, decodes each user row via
-//! [`crate::encoding::ClassRow`] / [`crate::encoding::decode_attribute_row`]
-//! and [`crate::encoding::schema_from_attributes`], then overlays the
-//! decoded user `TableEntry` list on top of the initial system snapshot.
+//! [`PersistentCatalog::bootstrap_from_heap`] scans the `pg_class`,
+//! `pg_attribute`, and `pg_index` heap pages, decodes each user row via
+//! [`crate::encoding::ClassRow`] / [`crate::encoding::decode_attribute_row`] /
+//! [`crate::encoding::decode_index_row`] and
+//! [`crate::encoding::schema_from_attributes`], decodes durable
+//! `pg_statistic` / `pg_statistic_ext` rows, then overlays the decoded user
+//! `TableEntry` / `IndexEntry` lists and statistics on top of the initial
+//! system snapshot.
 //! The result is an MVCC-consistent snapshot that combines the durable
 //! system schema with the durable user schema. System relations always
 //! come from [`crate::bootstrap::initial_snapshot`]; only user rows are
@@ -148,7 +151,11 @@ pub struct IndexRow {
     pub indisprimary: bool,
     /// `indisvalid` — false while a CONCURRENT build is in progress.
     pub indisvalid: bool,
-    /// `indkey` — 1-based column attnums.
+    /// `indkey` — 0-based column positions matching [`IndexEntry::columns`].
+    ///
+    /// PostgreSQL exposes 1-based attnums here. UltraSQL stores the
+    /// planner-facing internal form durably and adds 1 only at SQL view
+    /// boundaries that need PostgreSQL parity.
     pub indkey: Vec<i16>,
 }
 
@@ -289,6 +296,10 @@ pub struct CatalogStats {
     pub indexes: u32,
     /// Number of constraints loaded.
     pub constraints: u32,
+    /// Number of `pg_statistic` rows loaded.
+    pub statistics: u32,
+    /// Number of `pg_statistic_ext` rows loaded.
+    pub statistic_ext: u32,
 }
 
 impl CatalogStats {
@@ -305,6 +316,8 @@ impl CatalogStats {
             attributes: 0,
             indexes: 0,
             constraints: 0,
+            statistics: 0,
+            statistic_ext: 0,
         }
     }
 }
@@ -482,8 +495,9 @@ impl PersistentCatalog {
     /// Bootstrap the catalog from on-disk system catalog heap pages.
     ///
     /// Reads `pg_namespace`, `pg_class`, `pg_attribute`, `pg_index`,
-    /// `pg_constraint`, `pg_sequence`, `pg_depend`, `pg_description` from
-    /// heap pages via the supplied [`HeapAccess`].  Builds a
+    /// `pg_constraint`, `pg_sequence`, `pg_depend`, `pg_description`,
+    /// `pg_statistic`, and `pg_statistic_ext` from heap pages via the supplied
+    /// [`HeapAccess`]. Builds a
     /// [`CatalogSnapshot`] and atomically swaps it into the in-memory
     /// `ArcSwap` cache.
     ///
@@ -509,10 +523,16 @@ impl PersistentCatalog {
         &self,
         heap: &HeapAccess<L>,
     ) -> Result<CatalogStats, CatalogError> {
-        use crate::encoding::{decode_attribute_row, schema_from_attributes};
+        use crate::encoding::{
+            decode_attribute_row, decode_index_row, decode_statistic_ext_row, decode_statistic_row,
+            schema_from_attributes,
+        };
 
         let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
         let pg_attribute_rel = RelationId::new(bootstrap::PG_ATTRIBUTE_OID);
+        let pg_index_rel = RelationId::new(bootstrap::PG_INDEX_OID);
+        let pg_statistic_rel = RelationId::new(bootstrap::PG_STATISTIC_OID);
+        let pg_statistic_ext_rel = RelationId::new(bootstrap::PG_STATISTIC_EXT_OID);
         let class_blocks = heap.block_count(pg_class_rel);
 
         if class_blocks == 0 {
@@ -534,6 +554,9 @@ impl PersistentCatalog {
         let mut tables: std::collections::HashMap<String, TableEntry> = initial.tables.clone();
         let mut tables_by_oid: std::collections::HashMap<Oid, TableEntry> =
             initial.tables_by_oid.clone();
+        let mut indexes: std::collections::HashMap<String, IndexEntry> = initial.indexes.clone();
+        let mut indexes_by_table: std::collections::HashMap<Oid, Vec<IndexEntry>> =
+            initial.indexes_by_table.clone();
 
         // Group attribute rows by `attrelid` so the per-relation schema
         // can be rebuilt in one pass.
@@ -564,10 +587,31 @@ impl PersistentCatalog {
             }
         }
 
+        let index_blocks = heap.block_count(pg_index_rel);
+        let mut index_rows_by_oid: std::collections::HashMap<Oid, IndexRow> =
+            std::collections::HashMap::new();
+        let mut total_index_rows: u32 = 0;
+        if index_blocks > 0 {
+            let index_scan = heap.scan(pg_index_rel, index_blocks);
+            for result in index_scan {
+                let tuple = result.map_err(|e| {
+                    CatalogError::schema_conflict(format!("heap scan error on pg_index: {e}"))
+                })?;
+                let row = decode_index_row(&tuple.data).map_err(|e| {
+                    CatalogError::schema_conflict(format!("decode pg_index row: {e}"))
+                })?;
+                if row.indexrelid.raw() >= crate::memory::FIRST_USER_OID {
+                    index_rows_by_oid.insert(row.indexrelid, row);
+                }
+                total_index_rows = total_index_rows.saturating_add(1);
+            }
+        }
+
         // Decode pg_class rows. Each user table maps to one TableEntry
         // whose schema is rebuilt from the matching attribute rows.
         let class_scan = heap.scan(pg_class_rel, class_blocks);
         let mut user_relations: u32 = 0;
+        let mut user_index_classes: Vec<ClassRow> = Vec::new();
         let mut highest_oid: u32 = self.next_oid.load(Ordering::Acquire);
         for result in class_scan {
             let tuple = result.map_err(|e| {
@@ -579,57 +623,239 @@ impl PersistentCatalog {
             if class_row.oid.raw() < crate::memory::FIRST_USER_OID {
                 continue;
             }
-            let attrs = attrs_by_relation.remove(&class_row.oid).unwrap_or_default();
-            let schema = schema_from_attributes(attrs).map_err(|e| {
-                CatalogError::schema_conflict(format!(
-                    "rebuild schema for oid {}: {e}",
-                    class_row.oid.raw(),
-                ))
-            })?;
-            let schema_name = if class_row.relnamespace.raw() == bootstrap::PG_CATALOG_OID {
-                "pg_catalog".to_owned()
-            } else {
-                "public".to_owned()
-            };
-            let entry = TableEntry {
-                oid: class_row.oid,
-                name: class_row.relname.clone(),
-                schema_name,
-                schema,
-                created_at_lsn: ultrasql_core::Lsn::ZERO,
-                n_blocks: class_row.relpages,
-                root_block: ultrasql_core::BlockNumber::new(class_row.relfilenode),
-            };
-            let key = class_row.relname.to_ascii_lowercase();
-            tables.insert(key, entry.clone());
-            tables_by_oid.insert(entry.oid, entry);
             user_relations = user_relations.saturating_add(1);
             highest_oid = highest_oid.max(class_row.oid.raw().saturating_add(1));
+            match class_row.relkind {
+                RelKind::Table => {
+                    let attrs = attrs_by_relation.remove(&class_row.oid).unwrap_or_default();
+                    let schema = schema_from_attributes(attrs).map_err(|e| {
+                        CatalogError::schema_conflict(format!(
+                            "rebuild schema for oid {}: {e}",
+                            class_row.oid.raw(),
+                        ))
+                    })?;
+                    let schema_name = if class_row.relnamespace.raw() == bootstrap::PG_CATALOG_OID {
+                        "pg_catalog".to_owned()
+                    } else {
+                        "public".to_owned()
+                    };
+                    let entry = TableEntry {
+                        oid: class_row.oid,
+                        name: class_row.relname.clone(),
+                        schema_name,
+                        schema,
+                        created_at_lsn: ultrasql_core::Lsn::ZERO,
+                        n_blocks: class_row.relpages,
+                        root_block: ultrasql_core::BlockNumber::new(class_row.relfilenode),
+                    };
+                    let key = class_row.relname.to_ascii_lowercase();
+                    tables.insert(key, entry.clone());
+                    tables_by_oid.insert(entry.oid, entry);
+                }
+                RelKind::Index => {
+                    user_index_classes.push(class_row);
+                }
+                _ => {}
+            }
+        }
+
+        let mut loaded_indexes: u32 = 0;
+        for class_row in user_index_classes {
+            let index_row = index_rows_by_oid.get(&class_row.oid).ok_or_else(|| {
+                CatalogError::schema_conflict(format!(
+                    "pg_class index '{}' oid {} has no pg_index row",
+                    class_row.relname,
+                    class_row.oid.raw()
+                ))
+            })?;
+            if !index_row.indisvalid {
+                continue;
+            }
+            if usize::from(index_row.indnatts) != index_row.indkey.len() {
+                return Err(CatalogError::schema_conflict(format!(
+                    "pg_index row {} indnatts {} does not match indkey length {}",
+                    index_row.indexrelid.raw(),
+                    index_row.indnatts,
+                    index_row.indkey.len()
+                )));
+            }
+            if !tables_by_oid.contains_key(&index_row.indrelid) {
+                return Err(CatalogError::schema_conflict(format!(
+                    "pg_index row {} references unknown table oid {}",
+                    index_row.indexrelid.raw(),
+                    index_row.indrelid.raw()
+                )));
+            }
+            let mut columns = Vec::with_capacity(index_row.indkey.len());
+            for &attnum in &index_row.indkey {
+                let column = u16::try_from(attnum).map_err(|_| {
+                    CatalogError::schema_conflict(format!(
+                        "pg_index row {} has negative column position {}",
+                        index_row.indexrelid.raw(),
+                        attnum
+                    ))
+                })?;
+                columns.push(column);
+            }
+            let mut entry = IndexEntry::new(
+                class_row.oid,
+                class_row.relname.clone(),
+                index_row.indrelid,
+                columns,
+                index_row.indisunique,
+            );
+            entry.root_block = ultrasql_core::BlockNumber::new(class_row.relfilenode);
+            indexes.insert(class_row.relname.to_ascii_lowercase(), entry.clone());
+            indexes_by_table
+                .entry(index_row.indrelid)
+                .or_default()
+                .push(entry);
+            loaded_indexes = loaded_indexes.saturating_add(1);
         }
         // Bump the OID allocator past every observed OID so a
         // subsequent `next_oid` call cannot collide with a restored
         // relation.
         self.next_oid.store(highest_oid, Ordering::Release);
 
+        let statistic_blocks = heap.block_count(pg_statistic_rel);
+        let mut statistics = initial.statistics;
+        let mut total_statistics: u32 = 0;
+        if statistic_blocks > 0 {
+            let statistic_scan = heap.scan(pg_statistic_rel, statistic_blocks);
+            for result in statistic_scan {
+                let tuple = result.map_err(|e| {
+                    CatalogError::schema_conflict(format!("heap scan error on pg_statistic: {e}"))
+                })?;
+                let row = decode_statistic_row(&tuple.data).map_err(|e| {
+                    CatalogError::schema_conflict(format!("decode pg_statistic row: {e}"))
+                })?;
+                statistics.insert((row.starelid, row.staattnum), row);
+                total_statistics = total_statistics.saturating_add(1);
+            }
+        }
+
+        let statistic_ext_blocks = heap.block_count(pg_statistic_ext_rel);
+        let mut statistic_ext = initial.statistic_ext;
+        let mut total_statistic_ext: u32 = 0;
+        if statistic_ext_blocks > 0 {
+            let statistic_ext_scan = heap.scan(pg_statistic_ext_rel, statistic_ext_blocks);
+            for result in statistic_ext_scan {
+                let tuple = result.map_err(|e| {
+                    CatalogError::schema_conflict(format!(
+                        "heap scan error on pg_statistic_ext: {e}"
+                    ))
+                })?;
+                let row = decode_statistic_ext_row(&tuple.data).map_err(|e| {
+                    CatalogError::schema_conflict(format!("decode pg_statistic_ext row: {e}"))
+                })?;
+                statistic_ext.insert(row.oid, row);
+                total_statistic_ext = total_statistic_ext.saturating_add(1);
+            }
+        }
+
         let snap = CatalogSnapshot {
             tables,
             tables_by_oid,
-            indexes: initial.indexes,
-            indexes_by_table: initial.indexes_by_table,
+            indexes,
+            indexes_by_table,
             descriptions: initial.descriptions,
-            statistics: initial.statistics,
-            statistic_ext: initial.statistic_ext,
+            statistics,
+            statistic_ext,
         };
         let stats = CatalogStats {
             namespaces: CatalogStats::initial().namespaces,
             relations: CatalogStats::initial().relations + user_relations,
             attributes: total_attrs,
-            indexes: 0,
+            indexes: loaded_indexes.max(total_index_rows),
             constraints: 0,
+            statistics: total_statistics,
+            statistic_ext: total_statistic_ext,
         };
         self.install_snapshot(snap);
         tracing::debug!(?stats, "catalog bootstrapped from heap");
         Ok(stats)
+    }
+
+    /// Encode and write `entry` into persistent `pg_class` / `pg_index` rows.
+    ///
+    /// This is the durable counterpart to [`Self::create_index`], which only
+    /// publishes the in-memory catalog snapshot. DDL callers invoke both so a
+    /// warm restart can rebuild index metadata and keep choosing `IndexScan`
+    /// plans.
+    pub fn persist_index_rows<L: PageLoader>(
+        &self,
+        entry: &IndexEntry,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::encode_index_row;
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
+        let pg_index_rel = RelationId::new(bootstrap::PG_INDEX_OID);
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+
+        let class_row = ClassRow {
+            oid: entry.oid,
+            relname: entry.name.clone(),
+            relnamespace: Oid::new(bootstrap::PUBLIC_OID),
+            relkind: RelKind::Index,
+            relpages: 0,
+            reltuples: 0.0,
+            relfilenode: entry.root_block.raw(),
+            relhasindex: false,
+        };
+        heap.insert(
+            pg_class_rel,
+            &class_row.encode(),
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_class index insert: {e}")))?;
+
+        let mut indkey = Vec::with_capacity(entry.columns.len());
+        for &column in &entry.columns {
+            indkey.push(i16::try_from(column).map_err(|_| {
+                CatalogError::schema_conflict(format!(
+                    "index '{}' column position {} does not fit i16",
+                    entry.name, column
+                ))
+            })?);
+        }
+        let index_row = IndexRow {
+            indexrelid: entry.oid,
+            indrelid: entry.table_oid,
+            indnatts: u16::try_from(entry.columns.len()).map_err(|_| {
+                CatalogError::schema_conflict(format!(
+                    "index '{}' has too many key columns",
+                    entry.name
+                ))
+            })?,
+            indisunique: entry.is_unique,
+            indisprimary: entry.name.ends_with("_pkey"),
+            indisvalid: true,
+            indkey,
+        };
+        let bytes = encode_index_row(&index_row);
+        heap.insert(
+            pg_index_rel,
+            &bytes,
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_index insert: {e}")))?;
+        Ok(())
     }
 
     /// Encode and write `entry` into the persistent `pg_class` /
@@ -683,10 +909,11 @@ impl PersistentCatalog {
             relhasindex: false,
         };
         let class_bytes = class_row.encode();
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
         let class_opts = InsertOptions {
             xmin,
             command_id,
-            wal: None,
+            wal,
             fsm: None,
             vm: None,
         };
@@ -708,13 +935,75 @@ impl PersistentCatalog {
             let attr_opts = InsertOptions {
                 xmin,
                 command_id,
-                wal: None,
+                wal,
                 fsm: None,
                 vm: None,
             };
             heap.insert(pg_attribute_rel, &bytes, attr_opts)
                 .map_err(|e| CatalogError::schema_conflict(format!("pg_attribute insert: {e}")))?;
         }
+        Ok(())
+    }
+
+    /// Append `pg_statistic` rows to the persistent catalog heap.
+    ///
+    /// `replace_statistics` updates the wait-free in-memory snapshot. This
+    /// method writes the durable row stream consumed by
+    /// [`Self::bootstrap_from_heap`]. Rows are append-only; bootstrap keeps the
+    /// last row for each `(starelid, staattnum)` key.
+    pub fn persist_statistic_rows<L: PageLoader>(
+        &self,
+        rows: &[StatisticRow],
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::encode_statistic_row;
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_statistic_rel = RelationId::new(bootstrap::PG_STATISTIC_OID);
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+        for row in rows {
+            let bytes = encode_statistic_row(row);
+            let opts = InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            };
+            heap.insert(pg_statistic_rel, &bytes, opts)
+                .map_err(|e| CatalogError::schema_conflict(format!("pg_statistic insert: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Append one `pg_statistic_ext` row to the persistent catalog heap.
+    pub fn persist_statistic_ext_row<L: PageLoader>(
+        &self,
+        row: &StatisticExtRow,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::encode_statistic_ext_row;
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_statistic_ext_rel = RelationId::new(bootstrap::PG_STATISTIC_EXT_OID);
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+        let bytes = encode_statistic_ext_row(row);
+        heap.insert(
+            pg_statistic_ext_rel,
+            &bytes,
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_statistic_ext insert: {e}")))?;
         Ok(())
     }
 
@@ -823,8 +1112,7 @@ impl PersistentCatalog {
             self.pg_statistic.remove(&key);
         }
         for row in rows {
-            self.pg_statistic
-                .insert((row.starelid, row.staattnum), row);
+            self.pg_statistic.insert((row.starelid, row.staattnum), row);
         }
         self.rebuild_snapshot();
     }
@@ -1495,5 +1783,172 @@ mod tests {
         assert_eq!(restored.schema.fields()[1].name, "amount");
         assert_eq!(restored.schema.fields()[1].data_type, DataType::Int64);
         assert!(restored.schema.fields()[1].nullable);
+    }
+
+    #[test]
+    fn bootstrap_round_trip_preserves_index_entry() {
+        use std::sync::Arc;
+        use ultrasql_core::{CommandId, DataType, Field, PageId, Schema, Xid};
+        use ultrasql_storage::buffer_pool::BufferPool;
+        use ultrasql_storage::heap::HeapAccess;
+        use ultrasql_storage::page::Page;
+
+        let pool = Arc::new(BufferPool::new(64, |_: PageId| Ok(Page::new_heap())));
+        let heap = HeapAccess::new(pool);
+
+        let cat = PersistentCatalog::new();
+        let table_oid = cat.next_oid();
+        let table = TableEntry::new(
+            table_oid,
+            "orders".to_owned(),
+            "public".to_owned(),
+            Schema::new(vec![
+                Field::required("id", DataType::Int64),
+                Field::nullable("note", DataType::Text { max_len: None }),
+            ])
+            .expect("schema"),
+        );
+        cat.persist_table_rows(&table, &heap, Xid::new(1), CommandId::new(0))
+            .expect("persist table");
+
+        let mut index = IndexEntry::new(cat.next_oid(), "orders_id_idx", table_oid, vec![0], false);
+        index.root_block = BlockNumber::new(7);
+        cat.persist_index_rows(&index, &heap, Xid::new(2), CommandId::new(0))
+            .expect("persist index");
+
+        let cat2 = PersistentCatalog::new();
+        let stats = cat2.bootstrap_from_heap(&heap).expect("bootstrap");
+        assert_eq!(stats.indexes, 1);
+
+        let snap = cat2.snapshot();
+        let restored = snap.indexes.get("orders_id_idx").expect("index restored");
+        assert_eq!(restored.oid, index.oid);
+        assert_eq!(restored.table_oid, table_oid);
+        assert_eq!(restored.columns, vec![0]);
+        assert_eq!(restored.root_block, BlockNumber::new(7));
+        assert!(!restored.is_unique);
+        assert_eq!(snap.indexes_by_table[&table_oid], vec![restored.clone()]);
+    }
+
+    #[test]
+    fn bootstrap_round_trip_preserves_pg_statistic_rows() {
+        use std::sync::Arc;
+        use ultrasql_core::{CommandId, DataType, Field, PageId, Schema, Xid};
+        use ultrasql_storage::buffer_pool::BufferPool;
+        use ultrasql_storage::heap::HeapAccess;
+        use ultrasql_storage::page::Page;
+
+        let pool = Arc::new(BufferPool::new(64, |_: PageId| Ok(Page::new_heap())));
+        let heap = HeapAccess::new(pool);
+
+        let cat = PersistentCatalog::new();
+        let oid = cat.next_oid();
+        let entry = TableEntry::new(
+            oid,
+            "orders".to_owned(),
+            "public".to_owned(),
+            Schema::new(vec![
+                Field::required("id", DataType::Int32),
+                Field::nullable("note", DataType::Text { max_len: None }),
+            ])
+            .expect("schema"),
+        );
+        cat.persist_table_rows(&entry, &heap, Xid::new(1), CommandId::new(0))
+            .expect("persist table");
+        cat.persist_statistic_rows(
+            &[
+                StatisticRow {
+                    starelid: oid,
+                    staattnum: 1,
+                    stanullfrac: 0.5,
+                    stadistinct: -0.25,
+                },
+                StatisticRow {
+                    starelid: oid,
+                    staattnum: 1,
+                    stanullfrac: 0.0,
+                    stadistinct: 10.0,
+                },
+                StatisticRow {
+                    starelid: oid,
+                    staattnum: 2,
+                    stanullfrac: 0.75,
+                    stadistinct: 2.0,
+                },
+            ],
+            &heap,
+            Xid::new(2),
+            CommandId::new(0),
+        )
+        .expect("persist statistics");
+
+        let cat2 = PersistentCatalog::new();
+        let stats = cat2.bootstrap_from_heap(&heap).expect("bootstrap");
+        assert_eq!(stats.statistics, 3);
+
+        let snap = cat2.snapshot();
+        assert_eq!(snap.statistics.len(), 2);
+        assert_eq!(
+            snap.statistics
+                .get(&(oid, 1))
+                .expect("latest att1 row")
+                .stadistinct,
+            10.0
+        );
+        assert_eq!(
+            snap.statistics
+                .get(&(oid, 2))
+                .expect("att2 row")
+                .stanullfrac,
+            0.75
+        );
+    }
+
+    #[test]
+    fn bootstrap_round_trip_preserves_pg_statistic_ext_rows() {
+        use std::sync::Arc;
+        use ultrasql_core::{CommandId, DataType, Field, PageId, Schema, Xid};
+        use ultrasql_storage::buffer_pool::BufferPool;
+        use ultrasql_storage::heap::HeapAccess;
+        use ultrasql_storage::page::Page;
+
+        let pool = Arc::new(BufferPool::new(64, |_: PageId| Ok(Page::new_heap())));
+        let heap = HeapAccess::new(pool);
+
+        let cat = PersistentCatalog::new();
+        let table_oid = cat.next_oid();
+        let entry = TableEntry::new(
+            table_oid,
+            "orders".to_owned(),
+            "public".to_owned(),
+            Schema::new(vec![
+                Field::required("id", DataType::Int32),
+                Field::required("region", DataType::Int32),
+            ])
+            .expect("schema"),
+        );
+        cat.persist_table_rows(&entry, &heap, Xid::new(1), CommandId::new(0))
+            .expect("persist table");
+
+        let row = StatisticExtRow {
+            oid: cat.next_oid(),
+            stxname: "orders_stats".to_owned(),
+            stxrelid: table_oid,
+            stxkeys: vec![1, 2],
+            stxkind: vec!['d', 'f', 'm'],
+        };
+        cat.persist_statistic_ext_row(&row, &heap, Xid::new(2), CommandId::new(0))
+            .expect("persist statistic ext");
+
+        let cat2 = PersistentCatalog::new();
+        let stats = cat2.bootstrap_from_heap(&heap).expect("bootstrap");
+        assert_eq!(stats.statistic_ext, 1);
+        assert_eq!(
+            cat2.snapshot()
+                .statistic_ext
+                .get(&row.oid)
+                .expect("statistic ext row"),
+            &row
+        );
     }
 }

@@ -346,6 +346,129 @@ async fn create_composite_index_over_two_int_columns_builds_and_does_not_corrupt
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test]
+async fn create_unique_expression_index_enforces_lower_key_on_insert() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE t_expr_idx (name TEXT NOT NULL, payload INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO t_expr_idx VALUES ('Alice', 1)")
+        .await
+        .expect("insert initial row");
+    client
+        .batch_execute("CREATE UNIQUE INDEX ux_t_expr_lower_name ON t_expr_idx (lower(name))")
+        .await
+        .expect("create expression index");
+
+    let err = client
+        .batch_execute("INSERT INTO t_expr_idx VALUES ('alice', 2)")
+        .await
+        .expect_err("lower(name) duplicate must be rejected");
+    let db_err = err.as_db_error().expect("DB error");
+    assert_eq!(db_err.code().code(), "23505");
+
+    let rows = client
+        .simple_query("SELECT payload FROM t_expr_idx WHERE name = 'Alice'")
+        .await
+        .expect("query");
+    assert_eq!(rows_first_col(&rows), vec!["1".to_string()]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn create_unique_partial_index_enforces_only_matching_rows() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute(
+            "CREATE TABLE t_partial_idx (email TEXT NOT NULL, active BOOLEAN NOT NULL, payload INT NOT NULL)",
+        )
+        .await
+        .expect("create table");
+    client
+        .batch_execute(
+            "CREATE UNIQUE INDEX ux_t_partial_active_email ON t_partial_idx (email) WHERE active = TRUE",
+        )
+        .await
+        .expect("create partial index");
+    client
+        .batch_execute(
+            "INSERT INTO t_partial_idx VALUES ('a@example.com', FALSE, 1), ('a@example.com', FALSE, 2)",
+        )
+        .await
+        .expect("inactive duplicates are outside the partial index");
+    client
+        .batch_execute("INSERT INTO t_partial_idx VALUES ('a@example.com', TRUE, 3)")
+        .await
+        .expect("first active row enters partial index");
+
+    let err = client
+        .batch_execute("INSERT INTO t_partial_idx VALUES ('a@example.com', TRUE, 4)")
+        .await
+        .expect_err("active duplicate must be rejected");
+    let db_err = err.as_db_error().expect("DB error");
+    assert_eq!(db_err.code().code(), "23505");
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn create_unique_covering_index_keeps_include_columns_out_of_key() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE t_cover_idx (id INT NOT NULL, payload INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("CREATE UNIQUE INDEX ux_t_cover_id ON t_cover_idx (id) INCLUDE (payload)")
+        .await
+        .expect("create covering index");
+    client
+        .batch_execute("INSERT INTO t_cover_idx VALUES (1, 10)")
+        .await
+        .expect("insert first row");
+
+    let err = client
+        .batch_execute("INSERT INTO t_cover_idx VALUES (1, 20)")
+        .await
+        .expect_err("duplicate key must ignore differing INCLUDE payload");
+    let db_err = err.as_db_error().expect("DB error");
+    assert_eq!(db_err.code().code(), "23505");
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn create_hash_index_supports_equality_queries_and_dml_maintenance() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE t_hash_idx (id INT NOT NULL, payload INT NOT NULL)")
+        .await
+        .expect("create table");
+    client
+        .batch_execute("INSERT INTO t_hash_idx VALUES (1, 10), (2, 20)")
+        .await
+        .expect("insert initial rows");
+    client
+        .batch_execute("CREATE INDEX ix_t_hash_id ON t_hash_idx USING hash (id)")
+        .await
+        .expect("create hash index");
+    client
+        .batch_execute("INSERT INTO t_hash_idx VALUES (3, 30)")
+        .await
+        .expect("insert after index build");
+
+    let rows = client
+        .simple_query("SELECT payload FROM t_hash_idx WHERE id = 3")
+        .await
+        .expect("hash equality query");
+    assert_eq!(rows_first_col(&rows), vec!["30".to_string()]);
+
+    shutdown(client, server_handle).await;
+}
+
 /// A `CREATE INDEX` over a `BYTEA` column is rejected. The encoding
 /// kernel returns `ServerError::Unsupported`, which the wire layer
 /// reports as an `ErrorResponse`. This keeps the rejection surface

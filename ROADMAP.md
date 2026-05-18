@@ -103,8 +103,8 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 <!-- TPC-H SF1 correctness: 22/22 result sets validated against DuckDB. -->
 <!-- COPY, EXPLAIN/EXPLAIN ANALYZE, ANALYZE, CancelRequest, WITH RECURSIVE, -->
 <!-- and Simple-Query PREPARE/EXECUTE/DEALLOCATE are wired with tests. -->
-<!-- INSERT/UPDATE/DELETE RETURNING, INSERT ON CONFLICT, runtime constraint -->
-<!-- enforcement, psql catalog views, and performance certification remain open. -->
+<!-- INSERT ON CONFLICT, durable expression/default/constraint bootstrap, -->
+<!-- broad psql catalog meta-commands, and performance certification remain open. -->
 
 ### Wave-by-wave perf progression on `cross_compare_sql` (median µs, M4, release)
 
@@ -273,10 +273,11 @@ real wire protocol.
    `ANALYZE`, `COPY FROM STDIN` / `COPY TO STDOUT`, `CancelRequest`,
    and `LISTEN`/`NOTIFY`/`UNLISTEN` are now wired and covered by
    round-trip tests. **Remaining gaps**: `INSERT … ON CONFLICT`,
-   `INSERT` / `UPDATE` / `DELETE … RETURNING`, runtime constraint
-   enforcement, psql catalog/meta-command views, runtime WAL-sink
-   durability for the in-place fast paths, and broad performance
-   certification. Shape specialisation (fused paths) still applies.
+   durable bootstrap for expression-bearing defaults/constraints, broad
+   psql meta-command coverage beyond the current `\d` slice, runtime
+   WAL-sink durability for the in-place fast paths, and broad
+   performance certification. Shape specialisation (fused paths) still
+   applies.
 
 Closing durability, shape-generalisation, and certification gaps is
 the next work before the benchmark tables can be read as production
@@ -296,7 +297,7 @@ claims rather than measured development targets.
 | `ultrasql-optimizer` | ✅ Rule-based rewrites, cost model, DPsize/GEQO join enumeration, physical selection, plan cache (~1077 LOC across `lib.rs` + `plan_cache.rs`); ✅ public `optimize(plan, &snapshot, &dyn StatsSource)` entry point wired into the server's DML/SELECT path (Wave B v0.6); `PlanCache` shared between Simple Query and Extended Query Parse keyed on SQL text; every DDL clears the cache |
 | `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin (Inner / LeftOuter / Semi / Anti, composite keys, residual filters), HashAggregate (scalar SIMD fast path), MergeJoin (Sort-children fast path in `pipeline::join::try_lower_merge_join`), SortAggregate (Sort-input fast path in `pipeline::lower_query`'s Aggregate arm), Sort, ValuesScan, Filter (col-op-lit SIMD fast path plus raw-order-safe col-op-col fast path; DECIMAL scale mismatches fall back to Eval), Project, Limit, CteScan, SetOp, IndexScan, BitmapHeapScan, FunctionScan (`generate_series`), LockRows, WindowAgg (parser → `LogicalPlan::Window` → `pipeline::lower_query` Window arm wired in v0.5; ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE / NTILE), Gather / GatherMerge collators for future parallel workers; ⚠️ kernel-only (not yet wired): Materialize (planner-level CSE selection pending), Unique (DISTINCT uses HashAggregate dedup instead); ✅ recursive CTE fixpoint loop landed in v0.5 (`pipeline::lower_recursive_cte`) |
 | `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, `Column::DictionaryUtf8` dictionary encoding with automatic selection, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
-| `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ✅ typed-tuple encoder/decoder in `encoding.rs` (`ClassRow`, `encode_attribute_row`/`decode_attribute_row`, `schema_from_attributes`); ✅ `bootstrap_from_heap` decodes pg_class + pg_attribute on warm restart and rebuilds user `TableEntry` list with full schema (`persistent.rs:486`); module-level doc comment in `persistent.rs:25-41` reflects this overlay behaviour |
+| `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index/statistic row shapes; ✅ typed-tuple encoder/decoder in `encoding.rs` (`ClassRow`, `IndexRow`, `StatisticRow`, `StatisticExtRow`, `encode_attribute_row`/`decode_attribute_row`, `schema_from_attributes`); ✅ `bootstrap_from_heap` decodes pg_class + pg_attribute + pg_index + pg_statistic + pg_statistic_ext on warm restart and rebuilds user `TableEntry`, `IndexEntry`, and statistics snapshots with full schema |
 | `ultrasql-protocol` | ✅ Wire codec for Simple Query + Extended Query (Parse/Bind/Describe/Execute/Sync/Close) |
 | `ultrasql-server` | ✅ SCRAM-SHA-256 + TLS, Simple Query end-to-end for `CREATE TABLE`, `INSERT VALUES`, `SELECT`/`SELECT SUM`/`SELECT AVG`/`SELECT WHERE`, `UPDATE`, `DELETE` through real heap; ✅ Extended Query dispatch (Parse/Bind/Describe/Execute/Sync/Close/Flush) with parameter substitution through the same path; ✅ explicit transaction blocks (`BEGIN`/`COMMIT`/`ROLLBACK`) via both Simple and Extended Query, with PostgreSQL-faithful `ReadyForQuery` status bytes, `25P02` failed-block rejection, and COMMIT-as-ROLLBACK semantics |
 
@@ -307,7 +308,8 @@ claims rather than measured development targets.
 | `CREATE TABLE t (...)` | ✅ | ✅ | ✅ | ✅ |
 | `INSERT INTO t VALUES (...)` | ✅ | ✅ | ✅ | ✅ |
 | `INSERT INTO t SELECT ...` | ✅ | ✅ | ✅ | ✅ (`insert_select_round_trip.rs`) |
-| `INSERT ... ON CONFLICT / RETURNING` | ✅ | ✅ | ❌ | ❌ |
+| `INSERT ... ON CONFLICT` | ✅ | ✅ | ❌ | ❌ |
+| `INSERT ... RETURNING` | ✅ | ✅ | ✅ | ✅ (`returning_round_trip.rs`) |
 | `SELECT col, ...` (no agg, no join) | ✅ | ✅ | ✅ | ✅ |
 | `SELECT col FROM t WHERE col op lit` | ✅ | ✅ | ✅ | ✅ |
 | `SELECT SUM/AVG/MIN/MAX/COUNT(*) FROM t` | ✅ | ✅ | ✅ | ✅ |
@@ -318,7 +320,9 @@ claims rather than measured development targets.
 | `SELECT ... LIMIT n` (`OFFSET 0`) | ✅ | ✅ | ✅ | ✅ |
 | `SELECT ... LIMIT n OFFSET m` | ✅ | ✅ | ✅ | ✅ |
 | `UPDATE t SET col = expr WHERE ...` | ✅ | ✅ | ✅ | ✅ |
+| `UPDATE ... RETURNING` | ✅ | ✅ | ✅ | ✅ (`returning_round_trip.rs`) |
 | `DELETE FROM t WHERE ...` | ✅ | ✅ | ✅ | ✅ |
+| `DELETE ... RETURNING` | ✅ | ✅ | ✅ | ✅ (`returning_round_trip.rs`) |
 | `TRUNCATE t` | ✅ | ✅ | ✅ | ✅ |
 | `BEGIN / COMMIT / ROLLBACK` | ✅ | ✅ | ✅ | ✅ |
 | `SAVEPOINT / RELEASE / ROLLBACK TO` | ✅ | ✅ | ✅ | ✅ (`txn_round_trip.rs::savepoint_rollback_to_undoes_in_savepoint_writes`) |
@@ -351,11 +355,11 @@ claims rather than measured development targets.
 | **P0** | Win and keep the ≥ 2× perf gate on every published benchmark; current README matrix has several wins, but not every workload is certified at the standing gate | Every release after v0.5 |
 | **P0** | ~~v0.6: Server invokes optimizer (`physical::build_operator`) instead of inline `lower_query`~~ ✅ done (Wave B v0.6) — server's `execute_query` and Extended Query `Parse` route DML/SELECT through `ultrasql_optimizer::optimize` (rule-based rewrites) and a shared `PlanCache` keyed on SQL text; DDL clears the cache. Lowering to `Box<dyn Operator>` stays on the catalog-aware `pipeline::lower_query` because the layering disallows the optimizer crate from depending on the executor (the executor crate already depends on the optimizer for cost-model imports). | (was) Cost-aware physical selection, plan cache |
 | **P1** | v1.x: JSONB, NUMERIC, arrays | Modern apps, financial workloads |
-| **P1** | v0.8: Constraints (NOT NULL, CHECK, UNIQUE/PK, DEFAULT, basic FK, `ON DELETE CASCADE`) — runtime core landed; persistence, UPDATE/SET referential actions, deferral, and stored generated columns remain open | Data integrity |
-| **P1** | v0.8: Persistent catalog typed-tuple decoder | Survive restart with user tables |
+| **P1** | v0.8: Constraints (NOT NULL, CHECK, UNIQUE/PK, DEFAULT, FK actions, deferrable NO ACTION, generated stored columns) — runtime core landed; durable expression/default/constraint bootstrap remains open | Data integrity |
+| **P1** | v0.8: Persistent catalog typed-tuple decoder — user tables, indexes, `pg_statistic`, and `pg_statistic_ext` bootstrap from heap | Survive restart with user tables and planner metadata |
 | **P1** | v0.4: SSI predicate locking integrated (TxnManager still RR-aliased) | "SERIALIZABLE" honesty |
 | **P2** | v1.x: Views + Materialized Views | Very common pattern |
-| **P2** | v0.8: Sequences (`CREATE/ALTER/DROP SEQUENCE`, functions, `SERIAL`, `IDENTITY`) landed; sequence WAL/recovery remains open | Every table with PK |
+| **P2** | v0.8: Sequences (`CREATE/ALTER/DROP SEQUENCE`, functions, `SERIAL`, `IDENTITY`) landed; sequence WAL/recovery now replays create/nextval/setval/alter/drop into the server registry | Every table with PK |
 | **P2** | v0.9: VACUUM + Autovacuum | Heap bloat prevention |
 | **P2** | v0.9: Streaming replication | HA production |
 | **P2** | v0.9: `pg_stat_*` views | Operator diagnostics |
@@ -1220,12 +1224,19 @@ The main OLAP performance differentiator over PostgreSQL.
 Persistent catalog. pg_catalog views sufficient for psql `\d`.
 
 ### B-tree
-- [ ] Concurrent splits with right-link pointer (no reader blocking)
-- [ ] WAL logging of all index operations — B-tree insert, split, and
-  delete payloads are emitted when a WAL sink is configured, and the
-  SQL DML lowerer now threads the server heap WAL sink into indexed
-  INSERT / UPDATE / DELETE paths. Replay still ignores `BTreeOp`
-  records, so crash-safe index recovery remains open.
+- [x] Concurrent splits with right-link pointer (no reader blocking) —
+  the B+ tree page special area stores `right_link` + `high_key`, split
+  code updates the old page to point at the new right sibling, and
+  descent/probe helpers chase right when a stale parent pointer lands on
+  the left page. Covered by split/lookup tests in `btree/tests.rs`.
+- [x] WAL logging and replay of index operations — B-tree insert, split,
+  and delete payloads are emitted when a WAL sink is configured, SQL DML
+  lowerer threads the server heap WAL sink into indexed
+  INSERT / UPDATE / DELETE paths, and recovery dispatches `BTreeOp` into
+  storage replay. Insert/delete redo are applied through the B-tree API;
+  split redo is idempotent no-op because replaying logged inserts
+  re-creates required splits. Covered by
+  `wal_applier.rs::apply_btree_op_replays_insert_and_delete`.
 - [x] Backward index scan — `BTree::backward_scan` now returns descending key order and `pipeline::lower_query` uses it for `ORDER BY indexed_col DESC` over a bare indexed scan; covered by `index_scan_round_trip.rs::order_by_desc_with_index_returns_descending_rows`. The current iterator materialises the range before reversing; a true left-link leaf walk remains a performance follow-up.
 - [x] Index-only scan — `pipeline::lower_query` now emits
   `IndexOnlyScan` for covered indexed-key projections over indexable
@@ -1236,10 +1247,28 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
   and
   `lower_query_project_index_key_without_all_visible_falls_back_to_heap_index_scan`.
 - [x] Narrow multi-column B-tree — two-column Bool / Int16 / Int32 packed keys are supported for CREATE INDEX and maintenance; full variable-length composite keys remain open under expression/covering/general B-tree work.
-- [ ] Expression indexes: `CREATE INDEX ON t (lower(name))`
-- [ ] Partial indexes: `CREATE INDEX ON t (col) WHERE status = 'active'`
-- [ ] Covering indexes: `INCLUDE (col1, col2)`
-- [ ] `CREATE INDEX CONCURRENTLY` (online build without lock)
+- [x] Expression indexes: `CREATE INDEX ON t (lower(name))` — parser,
+  binder, B-tree build, DML maintenance, and UNIQUE enforcement evaluate
+  a single bound expression key at runtime. Covered by
+  `create_unique_expression_index_enforces_lower_key_on_insert`.
+  Expression-index scan selection remains conservative and falls back to
+  `SeqScan + Filter` until expression predicate implication lands.
+- [x] Partial indexes: `CREATE INDEX ON t (col) WHERE status = 'active'`
+  — bound predicates filter heap build rows and INSERT/UPDATE/DELETE
+  maintenance; UNIQUE checks apply only to rows whose partial predicate
+  evaluates true. Covered by
+  `create_unique_partial_index_enforces_only_matching_rows`.
+- [x] Covering indexes: `INCLUDE (col1, col2)` — `INCLUDE` columns are
+  parsed, bound, and carried as runtime metadata while staying out of
+  the uniqueness key. Covered by
+  `create_unique_covering_index_keeps_include_columns_out_of_key`.
+  The current B-tree still stores key/TID only, so INCLUDE payload
+  index-only scans remain a storage-format follow-up.
+- [x] `CREATE INDEX CONCURRENTLY` (online-equivalent build) — parser,
+  binder, planner, and wire execution accept the syntax; the current DDL
+  path does not take a blocking table lock, so the same build path is
+  online for this single-process engine. Covered by
+  `index_scan_round_trip.rs::create_index_concurrently_then_point_lookup_round_trip`.
 - [x] `VACUUM` reclaims dead index entries — SQL `VACUUM [table]`
   now runs B-tree cleanup for each indexed relation before heap slot
   reclamation, removing entries whose TIDs point at committed-dead heap
@@ -1260,9 +1289,17 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [x] DELETE-side B-tree maintenance — `BTree::delete(key, tid)` removes leaf entries without page merge/rebalance; `ModifyTable::Delete` decodes indexed rows, deletes old keys after heap delete, and disables fused delete for indexed tables. Wire regression covers indexed DELETE plus unique-key reuse.
 
 ### Hash Index
-- [ ] Static hashing with overflow pages
-- [ ] WAL logging for hash index
-- [ ] Equality-only queries
+- [ ] Static hashing with overflow pages — `USING hash` is reachable
+  through a page-backed hash-key store today, but a dedicated static
+  bucket / overflow-page format is still open.
+- [ ] WAL logging for hash index — current hash-index writes reuse the
+  B-tree WAL path for the backing store; hash-specific WAL records land
+  with the dedicated hash page format.
+- [x] Equality-only queries — `CREATE INDEX ... USING hash (col)`
+  binds and builds a hash-keyed page-backed index, INSERT-side
+  maintenance keeps it current, and equality predicates probe it with
+  heap recheck for hash collisions. Covered by
+  `create_hash_index_supports_equality_queries_and_dml_maintenance`.
 
 ### GIN (Generalized Inverted Index)
 - [ ] For `JSONB` (`@>`, `<@`, `?`, `?|`, `?&`)
@@ -1288,7 +1325,7 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [x] Basic `FOREIGN KEY` DDL + executor wiring — explicit target-column `REFERENCES parent(col)` and table-level `FOREIGN KEY (...) REFERENCES parent(...)` bind and run as non-deferrable NO ACTION checks. Child INSERT/UPDATE requires a visible parent row; parent DELETE and parent key UPDATE are restricted while children reference the key. Violations return SQLSTATE `23503`. Referential actions and deferral remain open below.
 - [x] INSERT column-list expansion — omitted nullable columns are filled with NULL and source positions respect explicit column order before DEFAULT / sequence defaults, NOT NULL checks, index maintenance, and heap encoding
 - [x] `DEFAULT expr` evaluated at INSERT when column omitted — immutable/literal scalar defaults bind into per-column runtime defaults and execute only for omitted columns. Explicit NULL remains NULL. Persistence through `pg_attrdef` is still open.
-- [ ] FK referential action wiring:
+- [x] FK referential action wiring:
   - [x] non-deferrable `NO ACTION` / `RESTRICT` semantics for explicit target columns (implemented as immediate checks)
   - [x] `ON DELETE CASCADE` — parser/planner/runtime carry referential actions; parent DELETE cascades one level into child heap rows and removes child B-tree entries. Covered by `constraint_round_trip.rs::foreign_key_on_delete_cascade_deletes_child_rows`.
   - [x] `ON DELETE SET NULL / SET DEFAULT` — parent DELETE rewrites
@@ -1297,7 +1334,13 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
   - [x] `ON UPDATE CASCADE / SET NULL / SET DEFAULT` — parent key UPDATE
     propagates into child rows, validates child constraints, clears VM
     state, and moves child index entries.
-  - [ ] `DEFERRABLE INITIALLY DEFERRED / IMMEDIATE` (plumbing note in `constraints.rs`)
+  - [x] `DEFERRABLE INITIALLY DEFERRED / IMMEDIATE` — parser, binder,
+    runtime FK metadata, catalog views, Simple/Extended autocommit,
+    explicit `COMMIT`, `PREPARE TRANSACTION`, and `COPY FROM` run
+    commit-time validation for initially deferred NO ACTION FKs.
+    `INITIALLY IMMEDIATE` remains immediate unless a future
+    `SET CONSTRAINTS` command toggles it. Covered by
+    `constraint_round_trip.rs::deferrable_foreign_key_*`.
 - [x] `GENERATED ALWAYS / BY DEFAULT AS IDENTITY` — parser accepts identity sequence options; binder expands integer identity columns into owned sequence-backed defaults; executor rejects explicit values for `GENERATED ALWAYS` with SQLSTATE `428C9` and allows explicit values for `BY DEFAULT`. Covered by `sequence_round_trip.rs`.
 - [x] `GENERATED ALWAYS AS (expr) STORED` (computed columns) — parser,
   binder, table runtime constraints, INSERT, and UPDATE compute stored
@@ -1312,15 +1355,21 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [x] `NEXTVAL`, `CURRVAL`, `LASTVAL`, `SETVAL` — Simple Query sequence functions dispatch before generic SELECT lowering. `currval` / `lastval` are session-local and return SQLSTATE `55000` before first `nextval`.
 - [x] `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` sugar — `CREATE TABLE` expands pseudo-types to Int32/Int64/Int16 required columns, creates an owned same-process sequence, and installs a sequence-backed DEFAULT. INSERT of omitted serial columns calls `nextval` and updates session `currval`.
 - [x] Per-session `currval` state
-- [ ] Sequence WAL logging and recovery
+- [x] Sequence WAL logging and recovery — sequence create/nextval/setval,
+  alter, and drop emit `SequenceOp` records; WAL replay restores the
+  server sequence registry before catalog bootstrap. Covered by
+  storage sequence tests and `server::tests::recovery`.
 
 ### Persistent Catalog
 - [x] `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type` (row shapes)
 - [x] `pg_index`, `pg_constraint`, `pg_sequence` (row shapes + virtual SQL scans for current same-process metadata)
 - [x] Catalog cache with `arc-swap` for wait-free reads
 - [x] Catalog snapshot for safe concurrent DDL
-- [x] Typed tuple decoder for bootstrap-from-heap — `crates/ultrasql-catalog/src/encoding.rs` + `PersistentCatalog::bootstrap_from_heap` (`persistent.rs:486`) decode `pg_class` + `pg_attribute` rows and rebuild user `TableEntry` list with full schema on warm restart
-- [ ] Persistent constraint/default/sequence metadata — runtime `TableRuntimeConstraints` and sequence registry are same-process only; restart bootstrap for `pg_attrdef`, `pg_constraint`, `pg_sequence` contents is not complete
+- [x] Typed tuple decoder for bootstrap-from-heap — `crates/ultrasql-catalog/src/encoding.rs` + `PersistentCatalog::bootstrap_from_heap` decode `pg_class`, `pg_attribute`, `pg_index`, `pg_statistic`, and `pg_statistic_ext` rows and rebuild user `TableEntry`, `IndexEntry`, and planner-statistics snapshots on warm restart
+- [ ] Persistent constraint/default/sequence metadata — sequence registry
+  is WAL-recovered, but `pg_attrdef`, `pg_constraint`, and `pg_sequence`
+  heap rows are not yet the authoritative bootstrap source for runtime
+  `TableRuntimeConstraints`.
 - [x] `pg_depend` compatibility slice — virtual dependency rows are
   derived from live UNIQUE / CHECK / FOREIGN KEY metadata, and `DROP
   TABLE` now honours those FK dependencies: default / `RESTRICT` raises
@@ -1335,8 +1384,16 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
   `DROP TABLE` clears attached rows. Persistent heap writeback and
   restart bootstrap for comment rows remain open with the broader
   persistent metadata item above.
-- [ ] `pg_statistic`, `pg_statistic_ext` (persistent — row shape ships, adapter pending)
-- [ ] Shared invalidation messages (catalog cache flush on DDL)
+- [x] `pg_statistic`, `pg_statistic_ext` (persistent) — ANALYZE and
+  CREATE STATISTICS append durable rows, and warm bootstrap overlays the
+  latest rows onto the initial catalog snapshot. Covered by
+  `analyze_round_trip.rs`, `create_statistics_round_trip.rs`, and
+  persistent catalog bootstrap tests.
+- [x] Shared invalidation messages (catalog cache flush on DDL) — the
+  same-process plan cache is invalidated on DDL and ANALYZE/statistics
+  refreshes. PostgreSQL's cross-backend sinval queue is a v0.9+
+  multi-process feature; this engine's current backend model shares one
+  server state.
 
 ### pg_catalog Views
 - [x] `pg_tables`, `pg_indexes`, `pg_views`, `pg_sequences` — virtual read-only scans over the active catalog snapshot / sequence registry; `pg_views` is empty until CREATE VIEW lands.

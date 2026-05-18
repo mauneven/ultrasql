@@ -23,8 +23,9 @@
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
-use ultrasql_core::{Schema, Value};
+use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_vec::Batch;
+use ultrasql_vec::column::Column;
 
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
@@ -205,26 +206,35 @@ impl Operator for Unique {
     fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    fn estimated_row_count(&self) -> Option<usize> {
+        self.child.estimated_row_count()
+    }
 }
 
 impl Unique {
     fn next_batch_hash(&mut self) -> Result<Option<Batch>, ExecError> {
         // Build phase: drain child, deduplicate.
         if self.output.is_none() {
-            let mut seen: HashSet<RowKey> = HashSet::new();
-            let mut unique_rows: Vec<Vec<Value>> = Vec::new();
-            loop {
-                let Some(batch) = self.child.next_batch()? else {
-                    break;
-                };
-                let rows = batch_to_rows(&batch, &self.schema)?;
-                for row in rows {
-                    let key = RowKey::from_row(&row);
-                    if seen.insert(key) {
-                        unique_rows.push(row);
+            let unique_rows = if let Some(unique_rows) = self.build_single_numeric_hash()? {
+                unique_rows
+            } else {
+                let mut seen: HashSet<RowKey> = HashSet::new();
+                let mut unique_rows: Vec<Vec<Value>> = Vec::new();
+                loop {
+                    let Some(batch) = self.child.next_batch()? else {
+                        break;
+                    };
+                    let rows = batch_to_rows(&batch, &self.schema)?;
+                    for row in rows {
+                        let key = RowKey::from_row(&row);
+                        if seen.insert(key) {
+                            unique_rows.push(row);
+                        }
                     }
                 }
-            }
+                unique_rows
+            };
             self.output = Some(unique_rows.into_iter());
         }
 
@@ -235,6 +245,69 @@ impl Unique {
             return Ok(None);
         }
         build_batch(&chunk, &self.schema).map(Some)
+    }
+
+    fn build_single_numeric_hash(&mut self) -> Result<Option<Vec<Vec<Value>>>, ExecError> {
+        if self.schema.len() != 1 {
+            return Ok(None);
+        }
+        match self.schema.field_at(0).data_type {
+            DataType::Int32 => self.build_single_i32_hash().map(Some),
+            DataType::Int64 => self.build_single_i64_hash().map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    fn build_single_i32_hash(&mut self) -> Result<Vec<Vec<Value>>, ExecError> {
+        let mut seen: HashSet<Option<i32>> = HashSet::new();
+        let mut unique_rows = Vec::new();
+        loop {
+            let Some(batch) = self.child.next_batch()? else {
+                break;
+            };
+            let Some(Column::Int32(column)) = batch.columns().first() else {
+                return Err(ExecError::TypeMismatch(
+                    "unique input column type does not match Int32 schema".to_owned(),
+                ));
+            };
+            for (row, &value) in column.data().iter().enumerate() {
+                let key = if column.nulls().is_some_and(|nulls| !nulls.get(row)) {
+                    None
+                } else {
+                    Some(value)
+                };
+                if seen.insert(key) {
+                    unique_rows.push(vec![key.map_or(Value::Null, Value::Int32)]);
+                }
+            }
+        }
+        Ok(unique_rows)
+    }
+
+    fn build_single_i64_hash(&mut self) -> Result<Vec<Vec<Value>>, ExecError> {
+        let mut seen: HashSet<Option<i64>> = HashSet::new();
+        let mut unique_rows = Vec::new();
+        loop {
+            let Some(batch) = self.child.next_batch()? else {
+                break;
+            };
+            let Some(Column::Int64(column)) = batch.columns().first() else {
+                return Err(ExecError::TypeMismatch(
+                    "unique input column type does not match Int64 schema".to_owned(),
+                ));
+            };
+            for (row, &value) in column.data().iter().enumerate() {
+                let key = if column.nulls().is_some_and(|nulls| !nulls.get(row)) {
+                    None
+                } else {
+                    Some(value)
+                };
+                if seen.insert(key) {
+                    unique_rows.push(vec![key.map_or(Value::Null, Value::Int64)]);
+                }
+            }
+        }
+        Ok(unique_rows)
     }
 
     fn next_batch_sort(&mut self) -> Result<Option<Batch>, ExecError> {

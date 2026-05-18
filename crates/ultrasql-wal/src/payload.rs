@@ -28,7 +28,8 @@
 
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::endian::{
-    read_u16_le, read_u32_le, read_u64_le, write_u16_le, write_u32_le, write_u64_le,
+    read_i64_le, read_u16_le, read_u32_le, read_u64_le, write_i64_le, write_u16_le, write_u32_le,
+    write_u64_le,
 };
 use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, TupleId, Xid};
 
@@ -1027,6 +1028,212 @@ impl BTreeOpPayload {
 }
 
 // ---------------------------------------------------------------------------
+// SequenceOpPayload
+// ---------------------------------------------------------------------------
+
+/// Kind of sequence operation recorded in a [`SequenceOpPayload`].
+///
+/// Each WAL record carries the complete sequence state after the operation, so
+/// redo is idempotent and can restore the state without replaying arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SequenceOpKind {
+    /// `CREATE SEQUENCE` installed the initial state.
+    Create = 1,
+    /// `nextval` advanced the sequence.
+    Advance = 2,
+    /// `setval` replaced `last_value` / `is_called`.
+    Set = 3,
+    /// `ALTER SEQUENCE` replaced options and maybe restarted the sequence.
+    Alter = 4,
+    /// `DROP SEQUENCE` removed the sequence. State fields contain the last
+    /// known state before removal.
+    Drop = 5,
+}
+
+impl SequenceOpKind {
+    /// Parse a `SequenceOpKind` from its on-disk byte representation.
+    pub const fn from_u8(v: u8) -> Result<Self, PayloadError> {
+        match v {
+            1 => Ok(Self::Create),
+            2 => Ok(Self::Advance),
+            3 => Ok(Self::Set),
+            4 => Ok(Self::Alter),
+            5 => Ok(Self::Drop),
+            _ => Err(PayloadError::Malformed("sequence_op kind unknown")),
+        }
+    }
+}
+
+/// Payload for a `RecordType::SequenceOp` WAL record.
+///
+/// Wire layout (little-endian, no implicit padding):
+/// ```text
+///  0   1   op (u8) — SequenceOpKind discriminant
+///  1   3   reserved (zero)
+///  4   4   seqrelid (RelationId/OID, u32; may be INVALID during bootstrap)
+///  8   4   name_len (u32)
+/// 12  ..   UTF-8 sequence name bytes
+///  +   8   start_value (i64)
+///  +   8   last_value (i64)
+///  +   8   min_value (i64)
+///  +   8   max_value (i64)
+///  +   8   increment (i64)
+///  +   4   cache_size (u32)
+///  +   1   is_called (bool as u8)
+///  +   1   cycle (bool as u8)
+///  +   2   reserved (zero)
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceOpPayload {
+    /// Operation that produced this state.
+    pub op: SequenceOpKind,
+    /// Sequence relation OID when available.
+    pub seqrelid: RelationId,
+    /// Folded sequence name.
+    pub name: String,
+    /// Configured restart value.
+    pub start_value: i64,
+    /// Last value returned, or next value when `is_called` is false.
+    pub last_value: i64,
+    /// Lower bound.
+    pub min_value: i64,
+    /// Upper bound.
+    pub max_value: i64,
+    /// Step.
+    pub increment: i64,
+    /// Configured cache size.
+    pub cache_size: u32,
+    /// PostgreSQL `is_called` state.
+    pub is_called: bool,
+    /// Whether CYCLE is enabled.
+    pub cycle: bool,
+}
+
+impl SequenceOpPayload {
+    /// Encode this payload into a freshly allocated byte vector.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        let name_bytes = self.name.as_bytes();
+        let name_len = u32::try_from(name_bytes.len())
+            .map_err(|_| PayloadError::Malformed("sequence_op name_len overflow"))?;
+        if name_bytes.len() > MAX_VARIABLE_PAYLOAD_BYTES {
+            return Err(PayloadError::Malformed(
+                "sequence_op name_len exceeds ceiling",
+            ));
+        }
+        let total = 12 + name_bytes.len() + 48;
+        let mut out = vec![0_u8; total];
+        out[0] = self.op as u8;
+        write_u32_le(&mut out[4..8], self.seqrelid.oid().raw());
+        write_u32_le(&mut out[8..12], name_len);
+        out[12..12 + name_bytes.len()].copy_from_slice(name_bytes);
+        let mut off = 12 + name_bytes.len();
+        write_i64_le(&mut out[off..off + 8], self.start_value);
+        off += 8;
+        write_i64_le(&mut out[off..off + 8], self.last_value);
+        off += 8;
+        write_i64_le(&mut out[off..off + 8], self.min_value);
+        off += 8;
+        write_i64_le(&mut out[off..off + 8], self.max_value);
+        off += 8;
+        write_i64_le(&mut out[off..off + 8], self.increment);
+        off += 8;
+        write_u32_le(&mut out[off..off + 4], self.cache_size);
+        off += 4;
+        out[off] = u8::from(self.is_called);
+        out[off + 1] = u8::from(self.cycle);
+        Ok(out)
+    }
+
+    /// Decode a `SequenceOpPayload` from a byte slice.
+    pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
+        const FIXED_PREFIX: usize = 12;
+        const FIXED_SUFFIX: usize = 48;
+        if bytes.len() < FIXED_PREFIX {
+            return Err(PayloadError::Truncated {
+                needed: FIXED_PREFIX,
+                have: bytes.len(),
+            });
+        }
+        let op = SequenceOpKind::from_u8(bytes[0])?;
+        if bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 0 {
+            return Err(PayloadError::Malformed(
+                "sequence_op reserved prefix bytes must be zero",
+            ));
+        }
+        let seqrelid = RelationId::new(
+            read_u32_le(&bytes[4..8]).map_err(|_| PayloadError::Malformed("seqrelid"))?,
+        );
+        let name_len = usize::try_from(
+            read_u32_le(&bytes[8..12]).map_err(|_| PayloadError::Malformed("name_len"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("sequence_op name_len usize overflow"))?;
+        if name_len > MAX_VARIABLE_PAYLOAD_BYTES {
+            return Err(PayloadError::Malformed(
+                "sequence_op name_len exceeds ceiling",
+            ));
+        }
+        let needed = FIXED_PREFIX + name_len + FIXED_SUFFIX;
+        if bytes.len() < needed {
+            return Err(PayloadError::Truncated {
+                needed,
+                have: bytes.len(),
+            });
+        }
+        let name = std::str::from_utf8(&bytes[12..12 + name_len])
+            .map_err(|_| PayloadError::Malformed("sequence_op name utf8"))?
+            .to_owned();
+        let mut off = 12 + name_len;
+        let start_value = read_i64_le(&bytes[off..off + 8])
+            .map_err(|_| PayloadError::Malformed("sequence_op start_value"))?;
+        off += 8;
+        let last_value = read_i64_le(&bytes[off..off + 8])
+            .map_err(|_| PayloadError::Malformed("sequence_op last_value"))?;
+        off += 8;
+        let min_value = read_i64_le(&bytes[off..off + 8])
+            .map_err(|_| PayloadError::Malformed("sequence_op min_value"))?;
+        off += 8;
+        let max_value = read_i64_le(&bytes[off..off + 8])
+            .map_err(|_| PayloadError::Malformed("sequence_op max_value"))?;
+        off += 8;
+        let increment = read_i64_le(&bytes[off..off + 8])
+            .map_err(|_| PayloadError::Malformed("sequence_op increment"))?;
+        off += 8;
+        let cache_size = read_u32_le(&bytes[off..off + 4])
+            .map_err(|_| PayloadError::Malformed("sequence_op cache_size"))?;
+        off += 4;
+        let is_called = decode_bool_byte(bytes[off], "sequence_op is_called")?;
+        let cycle = decode_bool_byte(bytes[off + 1], "sequence_op cycle")?;
+        if bytes[off + 2] != 0 || bytes[off + 3] != 0 {
+            return Err(PayloadError::Malformed(
+                "sequence_op reserved suffix bytes must be zero",
+            ));
+        }
+        Ok(Self {
+            op,
+            seqrelid,
+            name,
+            start_value,
+            last_value,
+            min_value,
+            max_value,
+            increment,
+            cache_size,
+            is_called,
+            cycle,
+        })
+    }
+}
+
+fn decode_bool_byte(value: u8, field: &'static str) -> Result<bool, PayloadError> {
+    match value {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(PayloadError::Malformed(field)),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1513,5 +1720,67 @@ mod tests {
             };
             prop_assert_eq!(BTreeOpPayload::decode(&p.encode().unwrap()).unwrap(), p);
         }
+    }
+
+    // ── SequenceOpPayload ─────────────────────────────────────────────────
+
+    #[test]
+    fn sequence_op_advance_round_trip() {
+        let p = SequenceOpPayload {
+            op: SequenceOpKind::Advance,
+            seqrelid: RelationId::new(42),
+            name: "orders_id_seq".to_owned(),
+            start_value: 1,
+            last_value: 7,
+            min_value: 1,
+            max_value: i64::MAX,
+            increment: 1,
+            cache_size: 1,
+            is_called: true,
+            cycle: false,
+        };
+        assert_eq!(SequenceOpPayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn sequence_op_unknown_kind_rejected() {
+        let p = SequenceOpPayload {
+            op: SequenceOpKind::Set,
+            seqrelid: RelationId::new(9),
+            name: "s".to_owned(),
+            start_value: 10,
+            last_value: 10,
+            min_value: 1,
+            max_value: 100,
+            increment: 5,
+            cache_size: 32,
+            is_called: false,
+            cycle: true,
+        };
+        let mut raw = p.encode().unwrap();
+        raw[0] = 99;
+        let err = SequenceOpPayload::decode(&raw).unwrap_err();
+        assert!(matches!(err, PayloadError::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn sequence_op_truncated_rejected() {
+        let p = SequenceOpPayload {
+            op: SequenceOpKind::Alter,
+            seqrelid: RelationId::new(9),
+            name: "s".to_owned(),
+            start_value: 10,
+            last_value: 10,
+            min_value: 1,
+            max_value: 100,
+            increment: 5,
+            cache_size: 32,
+            is_called: false,
+            cycle: true,
+        };
+        let mut raw = p.encode().unwrap();
+        raw.truncate(raw.len() - 1);
+        let err = SequenceOpPayload::decode(&raw).unwrap_err();
+        assert!(matches!(err, PayloadError::Truncated { .. }), "got {err:?}");
     }
 }

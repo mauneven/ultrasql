@@ -170,6 +170,27 @@ async fn point_lookup_with_index_returns_one_row() {
     shutdown(client, server_handle).await;
 }
 
+/// `CREATE INDEX CONCURRENTLY` is accepted on the wire and produces the same
+/// visible index state as the current non-blocking build path.
+#[tokio::test]
+async fn create_index_concurrently_then_point_lookup_round_trip() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    preload(&client, "t_cic", 100).await;
+
+    client
+        .batch_execute("CREATE INDEX CONCURRENTLY ix_t_cic_id ON t_cic(id)")
+        .await
+        .expect("create index concurrently");
+
+    let rows = client
+        .simple_query("SELECT val FROM t_cic WHERE id = 42")
+        .await
+        .expect("query through concurrent index");
+    assert_eq!(rows_first_col(&rows), vec!["420".to_string()]);
+
+    shutdown(client, server_handle).await;
+}
+
 /// Rows inserted after `CREATE INDEX` must be visible through the
 /// index path. This catches stale-index builds where `CREATE INDEX`
 /// populated the B-tree once but later INSERTs only touched the heap.
