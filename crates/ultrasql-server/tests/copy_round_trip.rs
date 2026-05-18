@@ -189,6 +189,35 @@ async fn copy_round_trip_text_is_byte_identical() {
     shutdown(client, server_handle).await;
 }
 
+/// Low-cardinality text columns cross the automatic dictionary
+/// threshold, so this exercises dictionary-backed heap decode plus
+/// wire/COPY output decoding.
+#[tokio::test]
+async fn copy_round_trip_low_cardinality_text_stays_wire_correct() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE copy_dict_text (id INT, label TEXT)")
+        .await
+        .expect("create table");
+
+    let mut payload = Vec::new();
+    for i in 0..2048 {
+        let line = format!("{i}\tlabel{}\n", i % 4);
+        payload.extend_from_slice(line.as_bytes());
+    }
+    copy_in_payload(&client, "COPY copy_dict_text FROM STDIN", &payload).await;
+
+    let stream = client
+        .copy_out("COPY copy_dict_text TO STDOUT")
+        .await
+        .expect("copy_out");
+    let echoed = collect_copy_out(stream).await;
+    assert_eq!(echoed, payload);
+
+    shutdown(client, server_handle).await;
+}
+
 /// `COPY t FROM STDIN WITH (FORMAT CSV)` ingests CSV rows correctly.
 #[tokio::test]
 async fn copy_from_stdin_csv_lands_rows() {

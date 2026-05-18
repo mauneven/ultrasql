@@ -137,10 +137,10 @@ mod tests {
         let batch = scan.next_batch().unwrap().unwrap();
         assert_eq!(batch.rows(), 2);
         match (&batch.columns()[0], &batch.columns()[1]) {
-            (Column::Int32(ids), Column::Utf8(names)) => {
+            (Column::Int32(ids), names @ (Column::Utf8(_) | Column::DictionaryUtf8(_))) => {
                 assert_eq!(ids.data(), &[1, 2]);
-                assert_eq!(names.value(0), "alice");
-                assert_eq!(names.value(1), "bob");
+                assert_eq!(names.text_value(0), Some("alice"));
+                assert_eq!(names.text_value(1), Some("bob"));
             }
             other => panic!("unexpected column types: {other:?}"),
         }

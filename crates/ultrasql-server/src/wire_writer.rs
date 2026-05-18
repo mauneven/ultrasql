@@ -389,7 +389,7 @@ fn write_cell(sink: &mut BytesMut, col: &Column, row: usize) {
         // path), and the `Utf8` case copies an existing `&str` into a
         // fresh `Vec<u8>` — the allocator can be removed in a follow-up
         // but is not on the `select_scan_10k` critical path.
-        Column::Float32(_) | Column::Float64(_) | Column::Utf8(_) => {
+        Column::Float32(_) | Column::Float64(_) | Column::Utf8(_) | Column::DictionaryUtf8(_) => {
             // Safe to expect-unwrap: the null branch above already
             // handled the `None` case.
             let bytes =
@@ -432,6 +432,7 @@ const fn column_nulls(col: &Column) -> Option<&Bitmap> {
         Column::Float64(c) => c.nulls(),
         Column::Bool(c) => c.nulls(),
         Column::Utf8(c) => c.nulls(),
+        Column::DictionaryUtf8(c) => c.codes.nulls(),
     }
 }
 

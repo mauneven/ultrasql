@@ -11,7 +11,10 @@
 use ultrasql_core::{Schema, Value};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_vec::column::{Column, NumericColumn};
-use ultrasql_vec::{Batch, Bitmap, filter_eq_i32, filter_eq_i64};
+use ultrasql_vec::{
+    Batch, Bitmap, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto, filter_eq_i32,
+    filter_eq_i64,
+};
 
 use crate::ExecError;
 use crate::eval::Eval;
@@ -172,11 +175,18 @@ fn materialise_selection(batch: &Batch, mask: &Bitmap) -> Result<Batch, ExecErro
                     mask.iter_ones().map(|i| c.value(i)).collect(),
                 ))
             }
-            Column::Utf8(c) => {
-                use ultrasql_vec::column::StringColumn;
-                Column::Utf8(StringColumn::from_data(
-                    mask.iter_ones().map(|i| c.value(i).to_owned()),
-                ))
+            Column::Utf8(_) | Column::DictionaryUtf8(_) => {
+                let rows: Vec<Option<String>> = mask
+                    .iter_ones()
+                    .map(|i| col.text_value(i).map(str::to_owned))
+                    .collect();
+                match encode_strings_auto(
+                    rows.iter().map(|v| v.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                }
             }
         };
         out_cols.push(selected);

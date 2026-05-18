@@ -80,7 +80,8 @@ are grounds for revert.
 | v0.5 | SELECT SUM(x) over 65 k rows | ≥ 2× every competitor — DuckDB ~tied (97 µs vs 111 µs = 1.15×) ⚠️ | latency (µs) |
 | v0.5 | UPDATE 10 k rows in single statement | ≥ 2× SQLite + PG + ClickHouse ✅; DuckDB 1.72× faster ⚠️ | latency (µs) |
 | v0.5 | DELETE 10 k rows in single statement | ≥ 2× every competitor ✅ | latency (µs) |
-| v0.6 | TPC-H scale 1 (all 22 queries) | ≥ 2× PostgreSQL 17 | geometric mean query time |
+| v0.6 | TPC-H scale 1 correctness (all 22 queries) | result-equal to DuckDB ✅ | `validate-results` result comparison |
+| v0.6+ | TPC-H scale 1 performance certification | ≥ 2× PostgreSQL 17 ⚠️ pending | geometric mean query time |
 | v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB | geometric mean query time |
 | v0.7 | ClickBench (`hits.parquet` analytical queries) | ≥ 5× faster than PostgreSQL 17 | geometric mean query time |
 | v0.9 | TPC-B (OLTP, 32 connections) | ≥ 2× PostgreSQL 17, p99 < 5 ms | throughput + latency |
@@ -98,14 +99,12 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 
 ## Current State Snapshot
 
-<!-- reconciled 2026-05-14 against actual code (commits 800ab81..27c06d0) -->
-<!-- Wave C wire streaming + Wave D heap pin-once + bulk update_many/delete_many -->
-<!-- Wave E bulk-UPDATE overhaul + Wave F in-place UPDATE + binder/ module split -->
-<!-- 2026-05-14 audit pass: bootstrap_from_heap typed-tuple decoder lands; -->
-<!-- IndexOnlyScan kernel exists (lower_query gap remains); LockRows/FOR UPDATE -->
-<!-- wired in pipeline.rs but no tokio-postgres round-trip; CancelRequest path -->
-<!-- not functional end-to-end (BackendKeyData pid/secret = 0); WITH RECURSIVE -->
-<!-- + STDDEV/VARIANCE + Simple-Query PREPARE/EXECUTE confirmed wired with tests -->
+<!-- reconciled 2026-05-18 against current main -->
+<!-- TPC-H SF1 correctness: 22/22 result sets validated against DuckDB. -->
+<!-- COPY, EXPLAIN/EXPLAIN ANALYZE, ANALYZE, CancelRequest, WITH RECURSIVE, -->
+<!-- and Simple-Query PREPARE/EXECUTE/DEALLOCATE are wired with tests. -->
+<!-- INSERT/UPDATE/DELETE RETURNING, INSERT ON CONFLICT, runtime constraint -->
+<!-- enforcement, psql catalog views, and performance certification remain open. -->
 
 ### Wave-by-wave perf progression on `cross_compare_sql` (median µs, M4, release)
 
@@ -267,26 +266,21 @@ real wire protocol.
    and the numbers above will differ. The fused paths should
    generalise via codegen across `(T1, T2, ...)`; until they do,
    the matrix is a per-shape microbench, not a full-DB claim.
-3. **Wire-protocol coverage.** `ORDER BY`, `JOIN`, `UNION`/`INTERSECT`/`EXCEPT`,
-   `IndexScan`, `BETWEEN`, `WITH RECURSIVE`, Simple-Query
-   `PREPARE`/`EXECUTE`/`DEALLOCATE`, and `LISTEN`/`NOTIFY`/`UNLISTEN`
-   are now wired and covered by `order_by_round_trip.rs`,
-   `join_round_trip.rs`, `setop_round_trip.rs`,
-   `index_scan_round_trip.rs`, `cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint`,
-   `prepare_execute_round_trip.rs`, and
-   `listen_notify_round_trip.rs`. **Remaining gaps**:
-   `EXPLAIN` / `EXPLAIN ANALYZE` (no `LogicalPlan::Explain` variant,
-   no session dispatch); `INSERT … ON CONFLICT` and `RETURNING`
-   (`pipeline.rs:1292/1296` return `Unsupported`); `COPY` wire
-   dispatch (`session/run.rs` has no `CopyData` flow);
-   `ANALYZE` Simple-Query handler. `CancelRequest` flow is **not**
-   functional end-to-end — `BackendKeyData` is sent with
-   pid/secret = 0 and the session never registers itself with the
-   `CancelRegistry`. Shape specialisation (fused paths) still applies.
+3. **Wire-protocol coverage.** `ORDER BY`, `JOIN`,
+   `UNION`/`INTERSECT`/`EXCEPT`, `IndexScan`, `BETWEEN`, `WITH
+   RECURSIVE`, Simple-Query `PREPARE`/`EXECUTE`/`DEALLOCATE`,
+   `EXPLAIN` / `EXPLAIN ANALYZE` / `EXPLAIN (FORMAT JSON)`, manual
+   `ANALYZE`, `COPY FROM STDIN` / `COPY TO STDOUT`, `CancelRequest`,
+   and `LISTEN`/`NOTIFY`/`UNLISTEN` are now wired and covered by
+   round-trip tests. **Remaining gaps**: `INSERT … ON CONFLICT`,
+   `INSERT` / `UPDATE` / `DELETE … RETURNING`, runtime constraint
+   enforcement, psql catalog/meta-command views, runtime WAL-sink
+   durability for the in-place fast paths, and broad performance
+   certification. Shape specialisation (fused paths) still applies.
 
-Closing items 1–2 is the v0.5 / v0.6 work plan. Until then the bench
-numbers describe what the engine *measures*, not what a production
-deployment can rely on.
+Closing durability, shape-generalisation, and certification gaps is
+the next work before the benchmark tables can be read as production
+claims rather than measured development targets.
 
 
 
@@ -300,8 +294,8 @@ deployment can rely on.
 | `ultrasql-parser` | ✅ Full DML + DDL + CTE + Extended Protocol Parse/Bind syntax |
 | `ultrasql-planner` | ✅ Binder for SELECT/INSERT/UPDATE/DELETE, JOINs, GROUP BY, subqueries, CTEs, BEGIN/COMMIT/ROLLBACK/SAVEPOINT, BETWEEN (rewritten into `>= AND <=`); binder split into `binder/` directory (`aggregate.rs`, `ddl.rs`, `dml.rs`, `expr_bind.rs`, `expr_type.rs`, `from.rs`, `util.rs`) |
 | `ultrasql-optimizer` | ✅ Rule-based rewrites, cost model, DPsize/GEQO join enumeration, physical selection, plan cache (~1077 LOC across `lib.rs` + `plan_cache.rs`); ✅ public `optimize(plan, &snapshot, &dyn StatsSource)` entry point wired into the server's DML/SELECT path (Wave B v0.6); `PlanCache` shared between Simple Query and Extended Query Parse keyed on SQL text; every DDL clears the cache |
-| `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin, HashAggregate (scalar SIMD fast path), MergeJoin (Sort-children fast path in `pipeline::join::try_lower_merge_join`), SortAggregate (Sort-input fast path in `pipeline::lower_query`'s Aggregate arm), Sort, ValuesScan, Filter (col-op-lit SIMD fast path), Project, Limit, CteScan, SetOp, IndexScan, BitmapHeapScan, FunctionScan (`generate_series`), LockRows, WindowAgg (parser → `LogicalPlan::Window` → `pipeline::lower_query` Window arm wired in v0.5; ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE / NTILE); ⚠️ kernel-only (not yet wired): Materialize (planner-level CSE selection pending), Unique (DISTINCT uses HashAggregate dedup instead); ✅ recursive CTE fixpoint loop landed in v0.5 (`pipeline::lower_recursive_cte`) |
-| `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, dictionary encoding, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
+| `ultrasql-executor` | ✅ SeqScan (streaming + TID mode), ModifyTable, NestLoop, HashJoin (Inner / LeftOuter / Semi / Anti, composite keys, residual filters), HashAggregate (scalar SIMD fast path), MergeJoin (Sort-children fast path in `pipeline::join::try_lower_merge_join`), SortAggregate (Sort-input fast path in `pipeline::lower_query`'s Aggregate arm), Sort, ValuesScan, Filter (col-op-lit SIMD fast path plus raw-order-safe col-op-col fast path; DECIMAL scale mismatches fall back to Eval), Project, Limit, CteScan, SetOp, IndexScan, BitmapHeapScan, FunctionScan (`generate_series`), LockRows, WindowAgg (parser → `LogicalPlan::Window` → `pipeline::lower_query` Window arm wired in v0.5; ROW_NUMBER / RANK / DENSE_RANK / LAG / LEAD / FIRST_VALUE / LAST_VALUE / NTH_VALUE / NTILE), Gather / GatherMerge collators for future parallel workers; ⚠️ kernel-only (not yet wired): Materialize (planner-level CSE selection pending), Unique (DISTINCT uses HashAggregate dedup instead); ✅ recursive CTE fixpoint loop landed in v0.5 (`pipeline::lower_recursive_cte`) |
+| `ultrasql-vec` | ✅ Push pipeline driver, SIMD kernels (filter/arith/hash/cmp/sum/min/max with mask-aware paths), Bitmap, `Column::DictionaryUtf8` dictionary encoding with automatic selection, ColumnBuilder, vectorized sort/HashJoin/HashAggregate |
 | `ultrasql-catalog` | ✅ PersistentCatalog with arc-swap snapshots, MutableCatalog DDL surface, pg_class/pg_attribute/pg_index row shapes; ✅ typed-tuple encoder/decoder in `encoding.rs` (`ClassRow`, `encode_attribute_row`/`decode_attribute_row`, `schema_from_attributes`); ✅ `bootstrap_from_heap` decodes pg_class + pg_attribute on warm restart and rebuilds user `TableEntry` list with full schema (`persistent.rs:486`); module-level doc comment in `persistent.rs:25-41` reflects this overlay behaviour |
 | `ultrasql-protocol` | ✅ Wire codec for Simple Query + Extended Query (Parse/Bind/Describe/Execute/Sync/Close) |
 | `ultrasql-server` | ✅ SCRAM-SHA-256 + TLS, Simple Query end-to-end for `CREATE TABLE`, `INSERT VALUES`, `SELECT`/`SELECT SUM`/`SELECT AVG`/`SELECT WHERE`, `UPDATE`, `DELETE` through real heap; ✅ Extended Query dispatch (Parse/Bind/Describe/Execute/Sync/Close/Flush) with parameter substitution through the same path; ✅ explicit transaction blocks (`BEGIN`/`COMMIT`/`ROLLBACK`) via both Simple and Extended Query, with PostgreSQL-faithful `ReadyForQuery` status bytes, `25P02` failed-block rejection, and COMMIT-as-ROLLBACK semantics |
@@ -328,16 +322,19 @@ deployment can rely on.
 | `TRUNCATE t` | ✅ | ✅ | ✅ | ✅ |
 | `BEGIN / COMMIT / ROLLBACK` | ✅ | ✅ | ✅ | ✅ |
 | `SAVEPOINT / RELEASE / ROLLBACK TO` | ✅ | ✅ | ✅ | ✅ (`txn_round_trip.rs::savepoint_rollback_to_undoes_in_savepoint_writes`) |
-| `PREPARE / EXECUTE / DEALLOCATE` (Simple Query) | ✅ | ❌ | ❌ | ❌ |
+| `PREPARE / EXECUTE / DEALLOCATE` (Simple Query) | ✅ | n/a (session meta-stmt) | ✅ | ✅ (`prepare_execute_round_trip.rs`) |
 | Extended Query (Parse/Bind/Execute) | ✅ codec | n/a | ✅ dispatch | ✅ |
-| `EXPLAIN` / `EXPLAIN ANALYZE` | ✅ | ❌ | ❌ | ❌ |
+| `EXPLAIN` / `EXPLAIN ANALYZE` / `EXPLAIN (FORMAT JSON)` | ✅ | ✅ | ✅ | ✅ (`explain_round_trip.rs`) |
 | `BETWEEN ... AND ...` | ✅ | ✅ | ✅ | ✅ |
 | `WITH cte AS (...)` (non-recursive) | ✅ | ✅ | ✅ | ✅ |
-| `WITH RECURSIVE cte AS (...)` | ✅ | ✅ | ❌ rejected by lowerer | ❌ |
+| `WITH RECURSIVE cte AS (...)` | ✅ | ✅ | ✅ fixpoint loop | ✅ (`cte_round_trip.rs::cte_recursive_union_distinct_reaches_fixpoint`) |
 | `UNION / INTERSECT / EXCEPT` | ✅ | ✅ | ✅ | ✅ |
 | `CREATE INDEX` | ✅ | ✅ | ✅ single-column over Int16/Int32/Int64/Bool/Float32/Float64/Text-prefix/Timestamp + 2-column integer composite (per §1.19, `index_key.rs`) | ✅ (`create_index_types_round_trip.rs`) |
 | `DROP TABLE` | ✅ | ✅ | ✅ | ✅ (`drop_table_round_trip.rs`) |
 | `ALTER TABLE` | ✅ | ✅ | ✅ ADD COLUMN / DROP COLUMN / RENAME COLUMN / RENAME TO | ✅ (`alter_table_round_trip.rs` — 6 cases) |
+| `COPY FROM STDIN` / `COPY TO STDOUT` | ✅ | ✅ | ✅ session dispatch | ✅ (`copy_round_trip.rs`) |
+| `ANALYZE [table]` | simple parser probe | n/a (session handler) | ✅ stats refresh | ✅ (`analyze_round_trip.rs`) |
+| `CancelRequest` | ✅ protocol frame | n/a | ✅ registry + cancel flag | ✅ (`cancel_request_round_trip.rs`) |
 
 ---
 
@@ -351,7 +348,7 @@ deployment can rely on.
 | **P0** | ~~v0.5: Wire `LogicalPlan::Join` and `SetOp` in `lower_query`~~ ✅ done — `join_round_trip.rs` + `setop_round_trip.rs` green | (was) All TPC-H, all real analytical workloads |
 | **P0** | ~~v0.5: Binder support for `BETWEEN`~~ ✅ done — `bind_between` in `binder/expr_bind.rs` rewrites to `>= AND <=`; `index_scan_round_trip.rs` covers BETWEEN range scans; `IS NULL` still needs end-to-end verification | (was) ANSI surface |
 | **P0** | ~~v0.5: `IndexScan` wired in `lower_query`~~ ✅ done — `try_index_scan` in `pipeline.rs`; `index_scan_round_trip.rs` green for point lookup + BETWEEN range | (was) Point-lookup workload |
-| **P0** | Win the ≥ 2× perf gate on every bench in README (currently only INSERT passes) | Every release after v0.5 |
+| **P0** | Win and keep the ≥ 2× perf gate on every published benchmark; current README matrix has several wins, but not every workload is certified at the standing gate | Every release after v0.5 |
 | **P0** | ~~v0.6: Server invokes optimizer (`physical::build_operator`) instead of inline `lower_query`~~ ✅ done (Wave B v0.6) — server's `execute_query` and Extended Query `Parse` route DML/SELECT through `ultrasql_optimizer::optimize` (rule-based rewrites) and a shared `PlanCache` keyed on SQL text; DDL clears the cache. Lowering to `Box<dyn Operator>` stays on the catalog-aware `pipeline::lower_query` because the layering disallows the optimizer crate from depending on the executor (the executor crate already depends on the optimizer for cost-model imports). | (was) Cost-aware physical selection, plan cache |
 | **P1** | v1.x: JSONB, NUMERIC, arrays | Modern apps, financial workloads |
 | **P1** | v0.8: Constraints (NOT NULL, FK, CHECK, DEFAULT) | Data integrity |
@@ -684,9 +681,9 @@ driver can connect.
 
 ### Join Operators
 - [x] `NestLoop` kernel (with inner rescan via factory closure)
-- [x] `HashJoin` kernel (build + probe — Inner+LeftOuter; Right/Full/Semi/Anti and disk spill TBD)
+- [x] `HashJoin` kernel (build + probe — Inner / LeftOuter / Semi / Anti with composite keys and residual predicates; Right/Full and disk spill TBD)
 - [x] `MergeJoin` — kernel exists (`merge_join.rs`); optimizer selects via `physical_selection.rs:118` (both inputs sorted on the equi-key); lowerer wires via `pipeline::join::try_lower_merge_join`, which strips an explicit `Sort` wrapper from both join children and emits `MergeJoin` without re-sorting
-- [x] All join types reachable from `lower_query` — `join_round_trip.rs` covers INNER, LEFT OUTER, NestLoop fallback
+- [x] Core join shapes reachable from `lower_query` — `join_round_trip.rs` covers INNER, LEFT OUTER, and NestLoop fallback; `subquery_round_trip.rs` covers Semi / Anti via `EXISTS` / `NOT EXISTS`. RIGHT / FULL parse and bind, but full round-trip coverage and tuned physical selection remain future work.
 
 ### Aggregation Operators
 - [x] `HashAggregate` kernel + scalar SIMD fast path (no GROUP BY: SUM/AVG/COUNT/MIN/MAX dispatch to `sum_i64`/`count_i64`/`min_i64`/`max_i64`)
@@ -803,11 +800,14 @@ driver can connect.
 
 ---
 
-## v0.6 — "Optimize" ✅ DONE
+## v0.6 — "Optimize" ✅ DONE (correctness scope)
 
 **Scope:** Cost-based optimizer built from scratch.
 
 > Optimizer kernel ships. ✅ Server `execute_query` routes through `ultrasql_optimizer::optimize` + `PlanCache` (Wave B). Lowering to `Box<dyn Operator>` remains on `pipeline::lower_query` due to crate layering (executor → optimizer edge exists; optimizer cannot depend back on executor).
+> "DONE" here means the optimizer integration and TPC-H SF1 correctness
+> gate are complete. The `≥ 2× PostgreSQL 17` TPC-H performance claim
+> remains unchecked until the reproducible PostgreSQL comparison passes.
 
 ### Rule-Based Rewrites
 - [x] Constant folding and constant propagation
@@ -879,16 +879,10 @@ The in-process validator loads UltraSQL with `COPY FROM STDIN` by
 default and keeps the previous VALUES path behind
 `ULTRASQL_TPCH_LOAD_METHOD=insert` for targeted regressions.
 
-Validated on 2026-05-17 with:
+Validated again on 2026-05-18 with:
 
 ```text
-scripts/setup-tpch-dbgen.sh
-ULTRASQL_TPCH_DBGEN="$(pwd)/target/tools/tpch-dbgen/dbgen" \
-cargo run --release -p ultrasql-bench --features sql-bench --bin tpch -- \
-  gen-data 1 target/tpch-scale1-real
-CARGO_INCREMENTAL=0 ULTRASQL_TPCH_POOL_FRAMES=262144 ULTRASQL_TPCH_PROGRESS=1 \
-cargo run --release -p ultrasql-bench --features sql-bench --bin tpch -- \
-  validate-results --data-dir target/tpch-scale1-real --duckdb /opt/homebrew/bin/duckdb
+make tpch-validate TPCH_DUCKDB=/opt/homebrew/bin/duckdb TPCH_QUERIES=all
 ```
 
 Result: `validated 22 TPC-H query result set(s) against DuckDB`.
@@ -1053,7 +1047,7 @@ The main OLAP performance differentiator over PostgreSQL.
 - [ ] Planner tags pipelines as vectorized (OLAP) vs scalar (OLTP)
 - [x] Push-based pipeline driver (`VectorizedSink` / `VectorizedOperator` / `SinkVerdict`)
 - [x] Vectorized SeqScan emitting 4096-row batches via streaming `VisibleHeapScan` (page-by-page typed decode, no `Vec<Vec<Value>>` materialisation)
-- [x] Vectorized filter operator (SIMD fast path for col CMP scalar and col CMP col, Eval fallback)
+- [x] Vectorized filter operator (SIMD fast path for col CMP scalar and raw-order-safe col CMP col; DECIMAL scale mismatches fall back to Eval)
 - [x] Vectorized projection operator
 - [x] Vectorized hash join (build pull + probe push, FNV-1a hash)
 - [x] Vectorized hash aggregate — scalar fast path (no GROUP BY) dispatches to SIMD kernels; multi-group via HashAggregate
@@ -1066,14 +1060,20 @@ The main OLAP performance differentiator over PostgreSQL.
 - [x] Filter kernels: `cmp_i32_scalar` (all 6 ops), `cmp_i64_scalar`, `cmp_gt_i64`, `eq_i32`, `range_mask_i64`, `select_i32`
 - [x] Arithmetic kernels: `sum_i64`, `sum_i64_with_mask`, `count_i64`, `min_i64`, `max_i64`, `min_f64`
 - [x] Hash kernels: `hash_i64` (FNV-1a), `hash_text_bytes` (Arrow offset buffer)
-- [ ] Hand-written ARM64 NEON intrinsics for the hottest kernels (where LLVM auto-vec misses)
-- [ ] Hand-written AVX2 / AVX-512 intrinsics (gated on CPUID)
+- [x] Hand-written ARM64 NEON intrinsics for first hot kernels
+  (`pack_eq_64`, dense integer sums, filter-sum, dictionary filter-sum);
+  broader per-kernel NEON coverage remains open.
+- [ ] Expanded AVX2 / AVX-512 intrinsics; current AVX2 coverage is
+  runtime-CPUID-dispatched dense filter-sum only.
 
 ### Dictionary Encoding
 - [x] Dictionary encoding for low-cardinality string columns (DictionaryColumn)
 - [x] Dictionary-aware filter (compare dict codes, not strings)
 - [x] Dictionary-aware GROUP BY (group_by_dict returns per-code row indices)
-- [ ] Automatic encoding selection based on cardinality
+- [x] Automatic encoding selection based on cardinality
+  (`DictionaryEncodingPolicy` + `encode_strings_auto`) wired into real
+  batch construction paths for storage decode, `build_batch`,
+  projection, filter, limit, and wire output.
 
 ### JIT Compilation
 - [ ] LLVM IR generation for hot expression trees (via `inkwell`)
@@ -1083,7 +1083,10 @@ The main OLAP performance differentiator over PostgreSQL.
 
 ### Parallel Execution
 - [ ] `ParallelSeqScan` partitioning heap blocks across rayon workers (rejected in Wave 6 due to single-worker memory-bandwidth bound; revisit with per-worker buffer-pool partition)
-- [ ] `Gather` / `GatherMerge` collators
+- [x] `Gather` / `GatherMerge` collators — executor fan-in primitives
+  landed in `crates/ultrasql-executor/src/gather.rs`; `Gather` rotates
+  whole unordered worker batches round-robin, `GatherMerge` performs
+  streaming k-way ordered fan-in over sorted workers.
 - [ ] Cost-based parallel-plan selection
 
 ### MVCC Read Fast Path
@@ -1104,6 +1107,50 @@ The main OLAP performance differentiator over PostgreSQL.
   against DuckDB. This is progress, not closure: Q21 remains dominated
   by full lineitem semi/anti probes and needs a physical semi/anti join
   specialization or stronger decorrelation.
+- [x] DECIMAL-safe column-vs-column filter fast path — the vectorized
+  filter now uses raw column comparison only when physical ordering
+  matches logical SQL ordering. Different DECIMAL scales fall back to
+  row Eval, preventing Q11/HAVING-style wrong results while preserving
+  fast paths for integers and same-scale DECIMAL columns. Covered by
+  `decimal_column_column_different_scales_falls_back` and the
+  `having_round_trip` scalar-subquery regression.
+- [x] Automatic dictionary selection — `ultrasql-vec` now exposes
+  `DictionaryEncodingPolicy`, `StringEncoding`, and `encode_strings_auto`
+  so string-column builders can choose raw UTF-8 vs dictionary storage by
+  row count, max distinct values, and distinct/non-null percentage while
+  preserving SQL NULLs. `Column::DictionaryUtf8` now flows through
+  storage decode, row materialization, projection, filter/limit trimming,
+  recursive CTE distinct keys, and text/binary wire result encoding.
+  Covered by `dict::tests::auto_encoding_*` and
+  `row_codec::tests::finish_batch_*dictionary*`; server wire/COPY
+  coverage in
+  `copy_round_trip_low_cardinality_text_stays_wire_correct`.
+- [x] Parallel fan-in collators — `Gather` and `GatherMerge` now exist
+  as executor operators with schema validation, row-count hint
+  propagation, round-robin unordered fan-in, and streaming k-way sorted
+  fan-in. Covered by `gather::tests::{gather_round_robins_worker_batches,
+  gather_merge_preserves_global_order,gather_merge_handles_descending_inputs}`.
+
+### v0.7 Validation Snapshot
+
+- [x] TPC-H SF1 correctness remains the regression floor: all 22 current
+  harness queries validated against DuckDB on 2026-05-18 after the
+  status audit (`make tpch-validate TPCH_DUCKDB=/opt/homebrew/bin/duckdb
+  TPCH_QUERIES=all`).
+- [ ] TPC-H SF10 has not been run to completion or compared with DuckDB.
+- [ ] ClickBench has not been run or certified against PostgreSQL.
+- [x] Automatic dictionary selection is implemented in `ultrasql-vec`
+  and wired through core executor/server batch paths. Remaining work is
+  specialized dictionary-native text predicates and GROUP BY lowering
+  beyond decode/preserve/re-encode flow.
+- [ ] SIMD coverage remains partial: ARM64 NEON exists for selected hot
+  kernels and AVX2 runtime dispatch exists for dense filter-sum, but
+  broad AVX2 / AVX-512 coverage remains open.
+- [ ] Parallel execution remains partial: fan-in collators exist, but
+  `ParallelSeqScan` worker partitioning and cost-based parallel-plan
+  selection are still open.
+- [ ] JIT and the page-level all-visible MVCC fast path remain open
+  checklist items.
 
 ### Milestone
 - [ ] TPC-H scale 10 runs to completion, throughput within 2× of DuckDB
@@ -1204,7 +1251,7 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 
 ---
 
-## v0.9 — "Operate" ⚠️ PARTIAL (COPY text format + LISTEN/NOTIFY + CancelRequest kernels landed early)
+## v0.9 — "Operate" ⚠️ PARTIAL (COPY text/CSV + LISTEN/NOTIFY + CancelRequest landed early)
 
 **Scope:** Replication, backup/PITR, observability, COPY,
 autovacuum. UltraSQL survives production use.
@@ -1255,13 +1302,13 @@ autovacuum. UltraSQL survives production use.
 - [ ] `pg_stat_progress_analyze`, `pg_stat_progress_create_index`
 - [ ] Prometheus `/metrics` HTTP endpoint
 - [ ] OpenTelemetry tracing with spans per query and per operator
-- [ ] `EXPLAIN ANALYZE` with actual rows, actual time, buffers, WAL stats
-- [ ] `EXPLAIN (FORMAT JSON)` for tooling integration
+- [x] `EXPLAIN ANALYZE` with actual rows and actual time — buffers and WAL stats pending
+- [x] `EXPLAIN (FORMAT JSON)` for basic tooling integration — richer PostgreSQL-compatible fields pending
 - [ ] Structured JSON logging with `log_min_duration_statement`, `log_statement`
 
 ### COPY & Bulk Operations
-- [x] `COPY t FROM STDIN` / `COPY t TO STDOUT` — text + CSV formats end-to-end. Parser, binder, `LogicalPlan::Copy`, Simple Query + Extended Query session dispatch via `crates/ultrasql-server/src/session/copy.rs`. `crates/ultrasql-server/tests/copy_round_trip.rs` covers four shapes. §1.11.
-- [ ] CSV format (`FORMAT csv`, DELIMITER, HEADER, QUOTE, ESCAPE)
+- [x] `COPY t FROM STDIN` / `COPY t TO STDOUT` — text + CSV formats end-to-end. Parser, binder, `LogicalPlan::Copy`, Simple Query + Extended Query session dispatch via `crates/ultrasql-server/src/session/copy.rs`. `crates/ultrasql-server/tests/copy_round_trip.rs` covers five shapes. §1.11.
+- [x] CSV format (`FORMAT csv`, `DELIMITER`, `HEADER`, `NULL`) — custom `QUOTE` / `ESCAPE` options pending
 - [ ] `COPY (SELECT ...) TO STDOUT`
 - [ ] `COPY t FROM 'file'` / `COPY t TO 'file'` (server-side, superuser only)
 - [ ] Binary COPY format

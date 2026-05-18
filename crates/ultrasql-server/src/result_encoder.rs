@@ -451,6 +451,7 @@ pub(crate) fn encode_text_value(col: &Column, row: usize) -> Option<Vec<u8>> {
             b"f".to_vec()
         }),
         Column::Utf8(c) => Some(c.value(row).as_bytes().to_vec()),
+        Column::DictionaryUtf8(c) => Some(c.decode_at(row).as_bytes().to_vec()),
     }
 }
 
@@ -503,6 +504,7 @@ const fn column_nulls(col: &Column) -> Option<&ultrasql_vec::Bitmap> {
         Column::Float64(c) => c.nulls(),
         Column::Bool(c) => c.nulls(),
         Column::Utf8(c) => c.nulls(),
+        Column::DictionaryUtf8(c) => c.codes.nulls(),
     }
 }
 

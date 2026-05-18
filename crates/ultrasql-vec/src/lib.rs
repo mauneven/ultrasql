@@ -2,8 +2,8 @@
 //!
 //! Column-oriented in-memory format with explicit null bitmaps,
 //! length-prefixed varbinary buffers, and aligned numeric storage.
-//! Kernels are auto-vectorized; hot paths have hand-written NEON
-//! intrinsics for ARM64 and AVX2 / AVX-512 for `x86_64`.
+//! Kernels are auto-vectorized; selected hot paths have hand-written
+//! NEON intrinsics for ARM64 and AVX2 intrinsics for `x86_64`.
 //!
 //! Crate layout
 //! ------------
@@ -37,6 +37,10 @@ pub mod kernels;
 pub use batch::{Batch, BatchError};
 pub use bitmap::Bitmap;
 pub use column::{Column, ColumnError};
+pub use dict::{
+    DictionaryColumn, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto,
+    filter_eq_dict_code, group_by_dict,
+};
 pub use kernels::{
     CmpOp, cmp_gt_i64, cmp_gt_i64_scalar, cmp_i32_scalar, cmp_i64_scalar, count_i64, eq_i32,
     max_i64, min_f64, min_i64, range_mask_i64, select_i32, sum_i64, sum_i64_with_mask,

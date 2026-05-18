@@ -28,10 +28,10 @@
 
 use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
-use ultrasql_vec::Batch;
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 use ultrasql_vec::kernels::{CmpOp, cmp_i32_scalar, cmp_i64_scalar, compare_i32, compare_i64};
+use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
 
 use crate::eval::Eval;
 use crate::seq_scan::build_batch;
@@ -477,12 +477,18 @@ fn select_column(column: &Column, mask: &Bitmap, selected: usize) -> Column {
             }
             Column::Bool(BoolColumn::from_data(out))
         }
-        Column::Utf8(c) => {
-            let mut out: Vec<String> = Vec::with_capacity(selected);
+        Column::Utf8(_) | Column::DictionaryUtf8(_) => {
+            let mut out: Vec<Option<String>> = Vec::with_capacity(selected);
             for i in mask.iter_ones() {
-                out.push(c.value(i).to_owned());
+                out.push(column.text_value(i).map(str::to_owned));
             }
-            Column::Utf8(StringColumn::from_data(out))
+            match encode_strings_auto(
+                out.iter().map(|v| v.as_deref()),
+                DictionaryEncodingPolicy::default(),
+            ) {
+                StringEncoding::Raw(c) => Column::Utf8(c),
+                StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+            }
         }
     }
 }
@@ -604,13 +610,11 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                     }
                 }
             }
-            (Column::Utf8(c), DataType::Text { .. }) => {
-                let nulls = c.nulls();
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Text { .. }) => {
                 for (row_idx, row) in rows.iter_mut().enumerate() {
-                    if is_null(nulls, row_idx) {
-                        row.push(Value::Null);
-                    } else {
-                        row.push(Value::Text(c.value(row_idx).to_owned()));
+                    match col.text_value(row_idx) {
+                        Some(v) => row.push(Value::Text(v.to_owned())),
+                        None => row.push(Value::Null),
                     }
                 }
             }

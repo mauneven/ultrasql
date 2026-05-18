@@ -179,6 +179,7 @@ pub(super) fn encode_binary_value(
         Column::Float64(c) => c.nulls(),
         Column::Bool(c) => c.nulls(),
         Column::Utf8(c) => c.nulls(),
+        Column::DictionaryUtf8(c) => c.codes.nulls(),
     };
     if let Some(b) = nulls {
         if !b.get(row) {
@@ -192,6 +193,7 @@ pub(super) fn encode_binary_value(
         Column::Float32(c) => Some(c.data()[row].to_be_bytes().to_vec()),
         Column::Float64(c) => Some(c.data()[row].to_be_bytes().to_vec()),
         Column::Utf8(c) => Some(c.value(row).as_bytes().to_vec()),
+        Column::DictionaryUtf8(c) => Some(c.decode_at(row).as_bytes().to_vec()),
     }
 }
 

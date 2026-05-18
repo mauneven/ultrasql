@@ -850,6 +850,7 @@ fn binds_group_by_emits_aggregate_node() {
     // Schema: [id, count]
     assert_eq!(schema.len(), 2);
     assert_eq!(schema.field_at(0).name, "id");
+    assert_eq!(schema.field_at(1).name, "count");
 }
 
 #[test]

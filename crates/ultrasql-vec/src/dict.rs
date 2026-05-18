@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use crate::bitmap::Bitmap;
-use crate::column::NumericColumn;
+use crate::column::{NumericColumn, StringColumn};
 
 // ============================================================================
 // DictionaryColumn
@@ -37,7 +37,7 @@ use crate::column::NumericColumn;
 /// - `codes.len()` rows, each in `0..dict.len()` for non-null rows.
 /// - For null rows the code is `u32::MAX` and the validity bitmap bit is 0.
 /// - `dict` contains no duplicate strings.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DictionaryColumn {
     /// Unique values in insertion order. Index `i` corresponds to code `i`.
     pub dict: Vec<String>,
@@ -129,6 +129,134 @@ impl DictionaryColumn {
             .position(|s| s == value)
             .map(|i| i.try_into().expect("dict position fits u32"))
     }
+}
+
+// ============================================================================
+// Automatic dictionary selection
+// ============================================================================
+
+/// Cardinality policy for automatic dictionary encoding.
+///
+/// The policy intentionally uses integer thresholds so the choice is stable
+/// across platforms and does not depend on floating-point rounding. A column
+/// is dictionary-encoded when it has enough rows, its non-null distinct count
+/// fits under `max_distinct_values`, and its distinct/non-null ratio is at or
+/// below `max_cardinality_percent`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DictionaryEncodingPolicy {
+    /// Minimum row count before dictionary encoding is considered.
+    pub min_rows: usize,
+    /// Maximum non-null distinct values allowed for dictionary encoding.
+    pub max_distinct_values: usize,
+    /// Maximum `distinct * 100 / non_null` percentage.
+    pub max_cardinality_percent: u8,
+}
+
+impl Default for DictionaryEncodingPolicy {
+    fn default() -> Self {
+        Self {
+            min_rows: 1024,
+            max_distinct_values: 4096,
+            max_cardinality_percent: 20,
+        }
+    }
+}
+
+impl DictionaryEncodingPolicy {
+    /// Decide whether a string column should use dictionary encoding.
+    #[must_use]
+    pub fn should_dictionary_encode(
+        self,
+        rows: usize,
+        non_null_rows: usize,
+        distinct_values: usize,
+    ) -> bool {
+        if rows < self.min_rows || non_null_rows == 0 || distinct_values == 0 {
+            return false;
+        }
+        if distinct_values > self.max_distinct_values {
+            return false;
+        }
+        distinct_values.saturating_mul(100)
+            <= non_null_rows.saturating_mul(usize::from(self.max_cardinality_percent))
+    }
+}
+
+/// Physical string encoding selected by [`encode_strings_auto`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StringEncoding {
+    /// Arrow-style UTF-8 offsets + value bytes.
+    Raw(StringColumn),
+    /// Dictionary-encoded UTF-8 values.
+    Dictionary(DictionaryColumn),
+}
+
+impl StringEncoding {
+    /// Number of rows.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Raw(c) => c.len(),
+            Self::Dictionary(c) => c.len(),
+        }
+    }
+
+    /// Whether the encoded column has zero rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// `true` iff this encoding stores dictionary codes.
+    #[must_use]
+    pub const fn is_dictionary(&self) -> bool {
+        matches!(self, Self::Dictionary(_))
+    }
+}
+
+/// Automatically choose raw UTF-8 or dictionary encoding for a string column.
+///
+/// This helper is the policy-level entry point used by vectorized operators
+/// that can exploit code comparisons. It preserves SQL NULLs in both returned
+/// encodings and keeps first-seen dictionary order when dictionary encoding is
+/// selected.
+#[must_use]
+pub fn encode_strings_auto<'a, I>(iter: I, policy: DictionaryEncodingPolicy) -> StringEncoding
+where
+    I: IntoIterator<Item = Option<&'a str>>,
+{
+    let rows: Vec<Option<String>> = iter.into_iter().map(|v| v.map(str::to_owned)).collect();
+    let dict = DictionaryColumn::from_strings(rows.iter().map(|v| v.as_deref()));
+    let non_null_rows = rows.iter().filter(|v| v.is_some()).count();
+
+    if policy.should_dictionary_encode(rows.len(), non_null_rows, dict.dict.len()) {
+        StringEncoding::Dictionary(dict)
+    } else {
+        StringEncoding::Raw(raw_string_column_from_rows(&rows))
+    }
+}
+
+fn raw_string_column_from_rows(rows: &[Option<String>]) -> StringColumn {
+    if rows.iter().all(Option::is_some) {
+        return StringColumn::from_data(rows.iter().map(|v| {
+            v.as_ref()
+                .expect("all rows are Some after all(Option::is_some)")
+                .clone()
+        }));
+    }
+
+    let mut nulls = Bitmap::new(rows.len(), true);
+    let mut values = Vec::with_capacity(rows.len());
+    for (i, v) in rows.iter().enumerate() {
+        match v {
+            Some(s) => values.push(s.clone()),
+            None => {
+                nulls.set(i, false);
+                values.push(String::new());
+            }
+        }
+    }
+    StringColumn::with_nulls(values, nulls).expect("null bitmap length equals row count")
 }
 
 // ============================================================================
@@ -320,5 +448,66 @@ mod tests {
         assert!(col.is_empty());
         assert!(col.dict.is_empty());
         assert_eq!(group_by_dict(&col).len(), 0);
+    }
+
+    #[test]
+    fn auto_encoding_chooses_dictionary_for_low_cardinality() {
+        let values: Vec<String> = (0..2048).map(|i| format!("code{}", i % 8)).collect();
+        let encoded = encode_strings_auto(
+            values.iter().map(|s| Some(s.as_str())),
+            DictionaryEncodingPolicy::default(),
+        );
+        let StringEncoding::Dictionary(col) = encoded else {
+            panic!("low-cardinality column should use dictionary encoding");
+        };
+        assert_eq!(col.len(), 2048);
+        assert_eq!(col.dict.len(), 8);
+        assert_eq!(col.decode_at(0), "code0");
+        assert_eq!(col.decode_at(9), "code1");
+    }
+
+    #[test]
+    fn auto_encoding_keeps_raw_for_high_cardinality() {
+        let values: Vec<String> = (0..2048).map(|i| format!("v{i}")).collect();
+        let encoded = encode_strings_auto(
+            values.iter().map(|s| Some(s.as_str())),
+            DictionaryEncodingPolicy::default(),
+        );
+        let StringEncoding::Raw(col) = encoded else {
+            panic!("high-cardinality column should stay raw");
+        };
+        assert_eq!(col.len(), 2048);
+        assert_eq!(col.value(17), "v17");
+        assert!(col.nulls().is_none());
+    }
+
+    #[test]
+    fn auto_encoding_keeps_raw_below_min_rows() {
+        let values = ["x", "y", "x", "z"];
+        let encoded = encode_strings_auto(
+            values.iter().map(|s| Some(*s)),
+            DictionaryEncodingPolicy::default(),
+        );
+        assert!(!encoded.is_dictionary());
+    }
+
+    #[test]
+    fn auto_encoding_preserves_nulls_in_raw_and_dictionary() {
+        let small_policy = DictionaryEncodingPolicy {
+            min_rows: 1,
+            max_distinct_values: 8,
+            max_cardinality_percent: 67,
+        };
+        let dict = encode_strings_auto([Some("a"), None, Some("a"), Some("b")], small_policy);
+        let StringEncoding::Dictionary(dict) = dict else {
+            panic!("2 distinct / 3 non-null should dictionary-encode under test policy");
+        };
+        assert!(!dict.codes.nulls().expect("nullable dict").get(1));
+
+        let raw = encode_strings_auto([Some("a"), None, Some("b"), Some("c")], small_policy);
+        let StringEncoding::Raw(raw) = raw else {
+            panic!("3 distinct / 3 non-null should stay raw under test policy");
+        };
+        assert!(!raw.nulls().expect("nullable raw").get(1));
     }
 }

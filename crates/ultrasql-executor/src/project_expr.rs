@@ -9,9 +9,9 @@
 
 use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::ScalarExpr;
-use ultrasql_vec::Batch;
 use ultrasql_vec::bitmap::Bitmap;
-use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
+use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
+use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
 
 use crate::eval::eval_expr;
 use crate::filter_op::batch_to_rows;
@@ -202,15 +202,11 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
             Int64
         ),
         DataType::Text { .. } => {
-            let mut strings: Vec<String> = Vec::with_capacity(n);
+            let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
             for (i, v) in values.iter().enumerate() {
                 match v {
-                    Value::Null => {
-                        nulls.set(i, false);
-                        any_null = true;
-                        strings.push(String::new());
-                    }
-                    Value::Text(s) => strings.push(s.clone()),
+                    Value::Null => strings.push(None),
+                    Value::Text(s) => strings.push(Some(s.clone())),
                     other => {
                         return Err(ExecError::TypeMismatch(format!(
                             "projection: expected Text at row {i}, got {:?}",
@@ -219,14 +215,15 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
                     }
                 }
             }
-            if any_null {
-                Ok(Column::Utf8(
-                    StringColumn::with_nulls(strings, nulls)
-                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?,
-                ))
-            } else {
-                Ok(Column::Utf8(StringColumn::from_data(strings)))
-            }
+            Ok(
+                match encode_strings_auto(
+                    strings.iter().map(|v| v.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                },
+            )
         }
         DataType::Null => {
             // All-NULL output column. Carry an Int32 storage; the

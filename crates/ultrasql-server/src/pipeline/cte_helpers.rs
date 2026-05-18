@@ -5,8 +5,8 @@ use std::sync::Arc;
 use ultrasql_core::Schema;
 use ultrasql_executor::{Operator, SetOp};
 use ultrasql_planner::LogicalPlan;
-use ultrasql_vec::Batch;
-use ultrasql_vec::column::{Column, StringColumn};
+use ultrasql_vec::column::Column;
+use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
 
 use crate::error::ServerError;
 
@@ -196,6 +196,20 @@ pub(super) fn batch_row_keys(batch: &Batch) -> Vec<Vec<u8>> {
                         key.extend_from_slice(s.as_bytes());
                     }
                 }
+                Column::DictionaryUtf8(c) => {
+                    if c.codes.nulls().is_some_and(|n| !n.get(row_idx)) {
+                        key.push(0xFF);
+                    } else {
+                        key.push(0x00);
+                        let s = c.decode_at(row_idx);
+                        key.extend_from_slice(
+                            &u32::try_from(s.len())
+                                .expect("CTE distinct key string length under u32::MAX")
+                                .to_le_bytes(),
+                        );
+                        key.extend_from_slice(s.as_bytes());
+                    }
+                }
                 Column::Bool(c) => {
                     if c.nulls().is_some_and(|n| !n.get(row_idx)) {
                         key.push(0xFF);
@@ -264,12 +278,18 @@ pub(super) fn filter_unseen_rows(
                     .collect();
                 Column::Bool(ultrasql_vec::column::BoolColumn::from_data(data))
             }
-            Column::Utf8(c) => {
-                let strings: Vec<String> = (0..keep_mask.len())
+            Column::Utf8(_) | Column::DictionaryUtf8(_) => {
+                let strings: Vec<Option<String>> = (0..keep_mask.len())
                     .filter(|&i| keep_mask[i])
-                    .map(|i| c.value(i).to_owned())
+                    .map(|i| col.text_value(i).map(str::to_owned))
                     .collect();
-                Column::Utf8(StringColumn::from_data(strings))
+                match encode_strings_auto(
+                    strings.iter().map(|v| v.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                }
             }
         };
         cols.push(new_col);

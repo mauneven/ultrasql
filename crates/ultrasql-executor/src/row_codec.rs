@@ -12,9 +12,9 @@
 //! `Vec<Value>` row intermediate.
 
 use ultrasql_core::{DataType, Schema, Value};
-use ultrasql_vec::Batch;
 use ultrasql_vec::bitmap::Bitmap;
-use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
+use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
+use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
 
 /// Binary codec bound to a fixed [`Schema`].
 ///
@@ -1197,25 +1197,35 @@ fn finish_builders(builders: Vec<ColumnBuilder>) -> Vec<Column> {
             ColumnBuilder::Utf8 {
                 offsets,
                 values,
-                nulls: _,
-            } => Column::Utf8(string_column_from_parts(&offsets, &values)),
+                nulls,
+            } => text_column_from_parts(&offsets, &values, nulls.finish()),
         };
         out.push(col);
     }
     out
 }
 
-fn string_column_from_parts(offsets: &[u32], values: &[u8]) -> StringColumn {
+fn text_column_from_parts(offsets: &[u32], values: &[u8], nulls: Option<Bitmap>) -> Column {
     let n = offsets.len().saturating_sub(1);
-    let mut rows: Vec<String> = Vec::with_capacity(n);
+    let mut rows: Vec<Option<String>> = Vec::with_capacity(n);
     for i in 0..n {
-        let start = offsets[i] as usize;
-        let end = offsets[i + 1] as usize;
-        let s = String::from_utf8(values[start..end].to_vec())
-            .expect("StringColumn builder invariant: values are validated UTF-8");
-        rows.push(s);
+        if nulls.as_ref().is_some_and(|bm| !bm.get(i)) {
+            rows.push(None);
+        } else {
+            let start = offsets[i] as usize;
+            let end = offsets[i + 1] as usize;
+            let s = String::from_utf8(values[start..end].to_vec())
+                .expect("StringColumn builder invariant: values are validated UTF-8");
+            rows.push(Some(s));
+        }
     }
-    StringColumn::from_data(rows)
+    match encode_strings_auto(
+        rows.iter().map(|v| v.as_deref()),
+        DictionaryEncodingPolicy::default(),
+    ) {
+        StringEncoding::Raw(c) => Column::Utf8(c),
+        StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+    }
 }
 
 const fn is_supported_type(ty: &DataType) -> bool {
@@ -1284,7 +1294,8 @@ mod tests {
     use proptest::prelude::*;
     use ultrasql_core::{DataType, Field, Schema, Value};
 
-    use super::{RowCodec, RowCodecError};
+    use super::{ColumnBuilder, RowCodec, RowCodecError};
+    use ultrasql_vec::column::Column;
 
     fn schema_bool() -> Schema {
         Schema::new([Field::required("b", DataType::Bool)]).unwrap()
@@ -1407,6 +1418,60 @@ mod tests {
         ];
         assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
     }
+
+    #[test]
+    fn finish_batch_auto_dictionary_encodes_low_cardinality_text() {
+        let schema = schema_text();
+        let codec = RowCodec::new(schema.clone());
+        let mut builders =
+            vec![ColumnBuilder::new(&schema.field_at(0).data_type, 2048, 0).unwrap()];
+
+        for i in 0..2048 {
+            let row = vec![Value::Text(format!("region{}", i % 4))];
+            let bytes = codec.encode(&row).unwrap();
+            codec.decode_into_builders(&bytes, &mut builders).unwrap();
+        }
+
+        let batch = RowCodec::finish_batch(builders).unwrap();
+        match &batch.columns()[0] {
+            Column::DictionaryUtf8(c) => {
+                assert_eq!(c.len(), 2048);
+                assert_eq!(c.dict.len(), 4);
+                assert_eq!(c.decode_at(5), "region1");
+            }
+            other => panic!("expected dictionary text column, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finish_batch_dictionary_text_preserves_nulls() {
+        let schema = Schema::new([Field::nullable("s", DataType::Text { max_len: None })]).unwrap();
+        let codec = RowCodec::new(schema.clone());
+        let mut builders =
+            vec![ColumnBuilder::new(&schema.field_at(0).data_type, 2048, 0).unwrap()];
+
+        for i in 0..2048 {
+            let row = if i % 8 == 0 {
+                vec![Value::Null]
+            } else {
+                vec![Value::Text(format!("code{}", i % 3))]
+            };
+            let bytes = codec.encode(&row).unwrap();
+            codec.decode_into_builders(&bytes, &mut builders).unwrap();
+        }
+
+        let batch = RowCodec::finish_batch(builders).unwrap();
+        match &batch.columns()[0] {
+            Column::DictionaryUtf8(c) => {
+                let nulls = c.codes.nulls().expect("dictionary text should be nullable");
+                assert!(!nulls.get(0));
+                assert!(nulls.get(1));
+                assert_eq!(c.decode_at(1), "code1");
+            }
+            other => panic!("expected nullable dictionary text column, got {other:?}"),
+        }
+    }
+
     #[test]
     fn arity_mismatch_on_encode_returns_arity_error() {
         let codec = RowCodec::new(schema_i32());

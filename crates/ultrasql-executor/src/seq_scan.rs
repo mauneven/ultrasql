@@ -32,9 +32,9 @@ use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
 use ultrasql_mvcc::{Snapshot, XidStatusOracle};
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::heap::{HeapAccess, VisibleHeapWalker};
-use ultrasql_vec::Batch;
 use ultrasql_vec::bitmap::Bitmap;
-use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
+use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
+use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
 
 use crate::row_codec::{ColumnBuilder, RowCodec};
 use crate::{CancelFlag, ExecError, Operator};
@@ -682,7 +682,7 @@ fn slice_column(col: &Column, start: usize, end: usize) -> Column {
         // practice. Surfacing it as a panic catches a future
         // regression where the eligibility check is loosened
         // without finishing the slice paths.
-        Column::Bool(_) | Column::Utf8(_) => {
+        Column::Bool(_) | Column::Utf8(_) | Column::DictionaryUtf8(_) => {
             unreachable!(
                 "column cache does not yet support Bool / Utf8 — gated by schema_all_fixed_numeric"
             )
@@ -853,11 +853,11 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 Column::Float64(col)
             }
             DataType::Text { .. } => {
-                let mut strings: Vec<String> = Vec::with_capacity(n_rows);
+                let mut strings: Vec<Option<String>> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
                     match &row[col_idx] {
-                        Value::Text(s) => strings.push(s.clone()),
-                        Value::Null => strings.push(String::new()),
+                        Value::Text(s) => strings.push(Some(s.clone())),
+                        Value::Null => strings.push(None),
                         other => {
                             return Err(ExecError::TypeMismatch(format!(
                                 "expected Text at row {row_idx} col {col_idx}, got {:?}",
@@ -866,13 +866,13 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                         }
                     }
                 }
-                let col = if let Some(nulls) = build_validity(col_idx) {
-                    StringColumn::with_nulls(strings, nulls)
-                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
-                } else {
-                    StringColumn::from_data(strings)
-                };
-                Column::Utf8(col)
+                match encode_strings_auto(
+                    strings.iter().map(|v| v.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                }
             }
             DataType::Date => {
                 // Date values share the Int32 batch column: the
@@ -1073,7 +1073,13 @@ mod tests {
                 other => panic!("expected Int32, got {other:?}"),
             };
             let names: Vec<String> = match &cols[1] {
-                Column::Utf8(c) => (0..c.len()).map(|i| c.value(i).to_owned()).collect(),
+                col @ (Column::Utf8(_) | Column::DictionaryUtf8(_)) => (0..col.len())
+                    .map(|i| {
+                        col.text_value(i)
+                            .expect("test scan text column should be non-null")
+                            .to_owned()
+                    })
+                    .collect(),
                 other => panic!("expected Utf8, got {other:?}"),
             };
             assert_eq!(ids.len(), names.len());

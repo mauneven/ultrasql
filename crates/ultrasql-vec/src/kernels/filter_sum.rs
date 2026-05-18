@@ -14,7 +14,7 @@
 //!    accumulator lanes to break the add-latency dependency chain.
 //! 2. **`x86_64` AVX2** using 256-bit `__m256i` lanes, four vectors
 //!    unrolled per iteration (16 i64 elements per loop trip), and two
-//!    independent accumulators. Gated on `target_feature = "avx2"`.
+//!    independent accumulators. Gated by runtime CPUID detection.
 //! 3. **Portable scalar** with an auto-vectorization-friendly inner loop
 //!    that LLVM lowers to a native vectorized form on every supported
 //!    target.
@@ -380,11 +380,13 @@ fn filter_sum_dispatch(xs: &[i64], ys: &[i64]) -> i64 {
         return unsafe { filter_sum_neon(xs, ys) };
     }
 
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: gated on the compile-time `target_feature = "avx2"`,
-        // so executing the AVX2 intrinsics is sound on this build.
-        return unsafe { filter_sum_avx2(xs, ys) };
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime CPUID detection proved AVX2 support for
+            // this process before entering the target-feature function.
+            return unsafe { filter_sum_avx2(xs, ys) };
+        }
     }
 
     #[allow(unreachable_code)]
@@ -675,10 +677,10 @@ unsafe fn filter_sum_neon(xs: &[i64], ys: &[i64]) -> i64 {
 ///
 /// # Safety
 ///
-/// Gated on `target_feature = "avx2"`. All loads are unaligned
-/// (`_mm256_loadu_si256`). Pointer arithmetic is bounded by the loop
-/// count; the tail goes through the scalar path.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+/// Gated by runtime CPUID detection before call. All loads are
+/// unaligned (`_mm256_loadu_si256`). Pointer arithmetic is bounded by
+/// the loop count; the tail goes through the scalar path.
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn filter_sum_avx2(xs: &[i64], ys: &[i64]) -> i64 {
     use core::arch::x86_64::{

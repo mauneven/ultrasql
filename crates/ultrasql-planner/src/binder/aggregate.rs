@@ -308,7 +308,10 @@ fn collect_aggregates(
 }
 
 pub(super) fn derive_agg_output_name(func_name: &str, args: &[Expr]) -> String {
-    if args.is_empty() {
+    let is_star_arg = args.len() == 1
+        && matches!(&args[0], Expr::Column { name }
+            if name.parts.len() == 1 && name.parts[0].value == "*");
+    if args.is_empty() || is_star_arg {
         return func_name.to_string();
     }
     let arg_key = args

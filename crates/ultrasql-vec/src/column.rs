@@ -9,6 +9,7 @@ use std::fmt;
 use ultrasql_core::DataType;
 
 use crate::bitmap::Bitmap;
+use crate::dict::DictionaryColumn;
 
 /// Errors specific to column construction.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -40,6 +41,8 @@ pub enum Column {
     Bool(BoolColumn),
     /// UTF-8 strings, length-prefixed offsets layout.
     Utf8(StringColumn),
+    /// UTF-8 strings, dictionary-encoded for low-cardinality data.
+    DictionaryUtf8(DictionaryColumn),
 }
 
 impl Column {
@@ -53,6 +56,7 @@ impl Column {
             Self::Float64(c) => c.len(),
             Self::Bool(c) => c.len(),
             Self::Utf8(c) => c.len(),
+            Self::DictionaryUtf8(c) => c.len(),
         }
     }
 
@@ -71,7 +75,7 @@ impl Column {
             Self::Float32(_) => DataType::Float32,
             Self::Float64(_) => DataType::Float64,
             Self::Bool(_) => DataType::Bool,
-            Self::Utf8(_) => DataType::Text { max_len: None },
+            Self::Utf8(_) | Self::DictionaryUtf8(_) => DataType::Text { max_len: None },
         }
     }
 
@@ -85,6 +89,30 @@ impl Column {
             Self::Float64(c) => c.nulls.is_some(),
             Self::Bool(c) => c.nulls.is_some(),
             Self::Utf8(c) => c.nulls.is_some(),
+            Self::DictionaryUtf8(c) => c.codes.nulls().is_some(),
+        }
+    }
+
+    /// Borrow the text value at `row` for either raw or dictionary
+    /// UTF-8 columns. Returns `None` for non-text columns and SQL NULLs.
+    #[must_use]
+    pub fn text_value(&self, row: usize) -> Option<&str> {
+        match self {
+            Self::Utf8(c) => {
+                if c.nulls().is_some_and(|n| !n.get(row)) {
+                    None
+                } else {
+                    Some(c.value(row))
+                }
+            }
+            Self::DictionaryUtf8(c) => {
+                if c.codes.nulls().is_some_and(|n| !n.get(row)) {
+                    None
+                } else {
+                    Some(c.decode_at(row))
+                }
+            }
+            _ => None,
         }
     }
 }

@@ -41,6 +41,7 @@
 //! - [`HashAggregate`] — hash-based GROUP BY / aggregate.
 //! - [`SortAggregate`] — streaming aggregate over sorted input.
 //! - [`WindowAgg`] — window function evaluation.
+//! - [`Gather`] / [`GatherMerge`] — fan-in collators for parallel workers.
 //! - [`Unique`] — DISTINCT deduplication (hash or sort mode).
 //! - [`SetOp`] — UNION / INTERSECT / EXCEPT.
 //! - [`ResultOp`] — single-row constant projection.
@@ -69,6 +70,7 @@ pub mod filter_sum_op;
 pub mod function_scan;
 pub mod fused_delete;
 pub mod fused_update;
+pub mod gather;
 mod hash_aggregate;
 mod hash_join;
 pub mod index_scan;
@@ -107,6 +109,7 @@ pub use eval::{Eval, EvalError};
 pub use filter::FilterEqI32;
 pub use filter_op::Filter;
 pub use function_scan::FunctionScan;
+pub use gather::{Gather, GatherMerge};
 pub use hash_aggregate::HashAggregate;
 pub use hash_join::HashJoin;
 pub use index_scan::IndexScan;

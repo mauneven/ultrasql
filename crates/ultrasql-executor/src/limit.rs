@@ -6,8 +6,8 @@
 //! intermediate batches pass through unchanged.
 
 use ultrasql_core::Schema;
-use ultrasql_vec::Batch;
-use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
+use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
+use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
 
 use crate::{ExecError, Operator};
 
@@ -149,7 +149,7 @@ fn slice_column_range(col: &Column, start: usize, end: usize) -> Column {
         Column::Float32(c) => Column::Float32(slice_numeric_range(c, start, end)),
         Column::Float64(c) => Column::Float64(slice_numeric_range(c, start, end)),
         Column::Bool(c) => Column::Bool(slice_bool_range(c, start, end)),
-        Column::Utf8(c) => Column::Utf8(slice_utf8_range(c, start, end)),
+        Column::Utf8(_) | Column::DictionaryUtf8(_) => slice_text_column_range(col, start, end),
     }
 }
 
@@ -166,9 +166,17 @@ fn slice_bool_range(col: &BoolColumn, start: usize, end: usize) -> BoolColumn {
     BoolColumn::from_data(rows)
 }
 
-fn slice_utf8_range(col: &StringColumn, start: usize, end: usize) -> StringColumn {
-    let rows: Vec<String> = (start..end).map(|i| col.value(i).to_owned()).collect();
-    StringColumn::from_data(rows)
+fn slice_text_column_range(col: &Column, start: usize, end: usize) -> Column {
+    let rows: Vec<Option<String>> = (start..end)
+        .map(|i| col.text_value(i).map(str::to_owned))
+        .collect();
+    match encode_strings_auto(
+        rows.iter().map(|v| v.as_deref()),
+        DictionaryEncodingPolicy::default(),
+    ) {
+        StringEncoding::Raw(c) => Column::Utf8(c),
+        StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+    }
 }
 
 #[cfg(test)]

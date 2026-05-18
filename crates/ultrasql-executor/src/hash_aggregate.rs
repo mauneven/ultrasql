@@ -546,6 +546,10 @@ fn column_non_null_count(col: &Column) -> i64 {
         Column::Float64(c) => c.nulls().map_or(total, ultrasql_vec::Bitmap::count_ones),
         Column::Bool(c) => c.nulls().map_or(total, ultrasql_vec::Bitmap::count_ones),
         Column::Utf8(c) => c.nulls().map_or(total, ultrasql_vec::Bitmap::count_ones),
+        Column::DictionaryUtf8(c) => c
+            .codes
+            .nulls()
+            .map_or(total, ultrasql_vec::Bitmap::count_ones),
     };
     i64::try_from(valid).unwrap_or(i64::MAX)
 }
