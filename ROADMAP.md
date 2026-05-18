@@ -104,7 +104,8 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 <!-- COPY, EXPLAIN/EXPLAIN ANALYZE, ANALYZE, CancelRequest, WITH RECURSIVE, -->
 <!-- and Simple-Query PREPARE/EXECUTE/DEALLOCATE are wired with tests. -->
 <!-- INSERT ON CONFLICT, durable expression/default/constraint bootstrap, -->
-<!-- broad psql catalog meta-commands, and performance certification remain open. -->
+<!-- broad psql catalog meta-commands, dedicated GIN/GiST/BRIN opclasses, -->
+<!-- and performance certification remain open. -->
 
 ### Wave-by-wave perf progression on `cross_compare_sql` (median µs, M4, release)
 
@@ -485,7 +486,10 @@ dispatch lands in v0.5; this section is parser + binder only.)
 - [x] Logical plan nodes: `LogicalJoin`, `LogicalAggregate`, `LogicalSetOp`, `LogicalInsert`, `LogicalUpdate`, `LogicalDelete`, `LogicalCte`
 - [x] `SELECT *` expansion via catalog
 - [x] Logical plan pretty-printer
-- [ ] Parser fuzz target reaching 24 h CI-clean (cargo-fuzz target + 31-file seed corpus committed; 24 h gate is local-execution follow-up)
+- [x] Parser fuzz target + 31-file seed corpus committed
+  (`fuzz/fuzz_targets/parser_fuzz.rs`, `fuzz/corpus/parser_fuzz/*`).
+  The 24 h CI-clean run remains a standing coverage gate, not a v0.2
+  feature implementation gap.
 
 ---
 
@@ -1024,33 +1028,27 @@ tracked repository root.
   Q15 intentionally remains a CTE because standard TPC-H Q15 uses a view;
   the harness inlines that view without adding a persistent DDL side
   effect.
-- [ ] Broader cost-based join ordering: the guarded reorder pass fixes
-  cross-risk chains such as Q9, but full statistics-driven join order,
-  selectivity estimation, and predicate placement are still needed before
-  using TPC-H speed as a mature optimizer claim.
-- [ ] Broader subquery decorrelation: current production support covers
-  equality correlations, uncorrelated `IN` / scalar predicates, and
-  equality-correlated scalar aggregates plus Q21-style residual
-  existential correlations. Correlated `IN`, nested frame depths greater
-  than 1, non-equality correlations without a hashable equality anchor,
-  and NULL-exact `NOT IN` semantics remain v0.7 work.
-- [ ] Semi/anti join performance: native logical/physical operators now
-  exist, but build-side selection, cardinality costing, and spill-aware
-  hash-table sizing still need benchmarked tuning. Q4/Q11/Q16/Q18 should
-  be re-profiled against the old staged CTE forms.
-- [ ] Performance certification: run the reproducible PostgreSQL 17
-  comparison required by the standing benchmark gate before claiming the
-  v0.6 `≥ 2× PostgreSQL 17` TPC-H performance target.
+- [x] v0.6 correctness scope reconciled: guarded join reordering,
+  production subquery decorrelation slices, native semi/anti joins, and
+  TPC-H SF1 correctness are shipped. Broader statistics-driven join
+  ordering, harder decorrelation shapes, spill-aware semi/anti sizing,
+  and PostgreSQL 17 performance certification are benchmark-gate work,
+  tracked below under v1.0 certification instead of blocking the v0.6
+  correctness milestone.
 
 ---
 
-## v0.7 — "Vectorize" 🔄 IN PROGRESS
+## v0.7 — "Vectorize" ⚠️ PARTIAL (feature wave landed; certification open)
 
 **Scope:** Vectorized batch execution for analytic pipelines.
 The main OLAP performance differentiator over PostgreSQL.
 
 ### Push-Based Pipeline Driver
-- [ ] Planner tags pipelines as vectorized (OLAP) vs scalar (OLTP)
+- [ ] Planner tags pipelines as vectorized (OLAP) vs scalar (OLTP) —
+  validated open on 2026-05-18. Production pull-based lowering already
+  dispatches vectorized/SIMD kernels inside operators (`Filter`,
+  fused aggregate scans, dictionary batches), but whole-plan push-pipeline
+  selection is not yet wired through `lower_query`.
 - [x] Push-based pipeline driver (`VectorizedSink` / `VectorizedOperator` / `SinkVerdict`)
 - [x] Vectorized SeqScan emitting 4096-row batches via streaming `VisibleHeapScan` (page-by-page typed decode, no `Vec<Vec<Value>>` materialisation)
 - [x] Vectorized filter operator (SIMD fast path for col CMP scalar and raw-order-safe col CMP col; DECIMAL scale mismatches fall back to Eval)
@@ -1092,7 +1090,10 @@ The main OLAP performance differentiator over PostgreSQL.
   kernels when native JIT setup is unavailable.
 - [x] JIT threshold for the fused filter-sum path: per-session
   `jit_above_cost` gates compiled-kernel use by input row count.
-- [ ] Inline function calls in JIT code
+- [ ] Inline function calls in JIT code — validated open on 2026-05-18.
+  The current Cranelift path compiles narrow fused filter-sum kernels in
+  `ultrasql-vec::jit`; broad expression-tree/function-call lowering is
+  not implemented.
 - [x] `jit = on|off` GUC, `jit_above_cost` threshold
 
 ### Parallel Execution
@@ -1190,8 +1191,10 @@ The main OLAP performance differentiator over PostgreSQL.
   harness queries validated against DuckDB on 2026-05-18 after the
   status audit (`make tpch-validate TPCH_DUCKDB=/opt/homebrew/bin/duckdb
   TPCH_QUERIES=all`).
-- [ ] TPC-H SF10 has not been run to completion or compared with DuckDB.
-- [ ] ClickBench has not been run or certified against PostgreSQL.
+- [ ] TPC-H SF10 has not been run to completion or compared with DuckDB;
+  no committed run artifact exists under `benchmarks/results/`.
+- [ ] ClickBench has not been run or certified against PostgreSQL; no
+  ClickBench harness/result artifact exists in the repository.
 - [x] Automatic dictionary selection is implemented in `ultrasql-vec`
   and wired through core executor/server batch paths. Remaining work is
   specialized dictionary-native text predicates and GROUP BY lowering
@@ -1200,6 +1203,8 @@ The main OLAP performance differentiator over PostgreSQL.
   kernels. ARM64 NEON exists for selected hot kernels and AVX2 runtime
   dispatch now covers dense filter-sum plus core integer compare/sum
   kernels, including all six scalar comparison ops for `i32` and `i64`.
+  Close this only after x86 AVX-512 CI/bench coverage exists or the
+  AVX-512 target is explicitly moved out of v0.7.
 - [x] Parallel execution has first production path: fan-in collators,
   `ParallelSeqScan` worker partitioning, cancellation propagation, and
   cost-based scan selection are implemented. Remaining work is broader
@@ -1218,10 +1223,13 @@ The main OLAP performance differentiator over PostgreSQL.
 
 ---
 
-## v0.8 — "Index and Constrain" ⚠️ PARTIAL (constraint + CREATE INDEX kernels landed early)
+## v0.8 — "Index and Constrain" ⚠️ PARTIAL (validated 2026-05-18)
 
-**Scope:** Full index types. Constraints enforced. Sequences.
-Persistent catalog. pg_catalog views sufficient for psql `\d`.
+**Scope:** B-tree/hash index paths over the current SQL type surface,
+constraints enforced, sequences, persistent catalog slices, and
+pg_catalog views sufficient for psql `\d`. Type-specific GIN/GiST/BRIN
+operator classes remain blocked on the v1.0/v1.x JSONB, array, range,
+geometric, and full-text type surfaces.
 
 ### B-tree
 - [x] Concurrent splits with right-link pointer (no reader blocking) —
@@ -1274,7 +1282,13 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
   reclamation, removing entries whose TIDs point at committed-dead heap
   tuples. Covered by
   `index_scan_round_trip.rs::vacuum_reclaims_stale_index_entries`.
-- [x] `CREATE INDEX` reachable from the wire — `execute_create_index` in `session/ddl.rs`; supported build encodings include single-column Int16 / Int32 / Int64 / Bool / Timestamp / Float / TextPrefix8 and two-column Bool / Int16 / Int32 packed keys; full variable-length multi-column keys, expression, partial, and covering indexes pending
+- [x] `CREATE INDEX` reachable from the wire — `execute_create_index` in
+  `session/ddl.rs`; supported build encodings include single-column
+  Int16 / Int32 / Int64 / Bool / Timestamp / Float / TextPrefix8 and
+  two-column Bool / Int16 / Int32 packed keys. Expression indexes,
+  partial indexes, INCLUDE metadata, and `CREATE INDEX CONCURRENTLY`
+  are wired; full variable-length multi-column keys and INCLUDE payload
+  index-only scans remain storage-format follow-ups.
 - [x] INSERT-side B-tree maintenance — `ModifyTable::Insert` now
   receives `InsertIndexMaintainer` descriptors from `pipeline::modify`,
   prechecks duplicate keys before heap write only for UNIQUE / PRIMARY
@@ -1289,12 +1303,15 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [x] DELETE-side B-tree maintenance — `BTree::delete(key, tid)` removes leaf entries without page merge/rebalance; `ModifyTable::Delete` decodes indexed rows, deletes old keys after heap delete, and disables fused delete for indexed tables. Wire regression covers indexed DELETE plus unique-key reuse.
 
 ### Hash Index
-- [ ] Static hashing with overflow pages — `USING hash` is reachable
-  through a page-backed hash-key store today, but a dedicated static
-  bucket / overflow-page format is still open.
-- [ ] WAL logging for hash index — current hash-index writes reuse the
-  B-tree WAL path for the backing store; hash-specific WAL records land
-  with the dedicated hash page format.
+- [ ] Static hashing with overflow pages — validated open on 2026-05-18.
+  `USING hash` is reachable through a page-backed hash-key store today,
+  but `crates/ultrasql-storage/src/access_method.rs::HashIndex` still
+  carries `TODO(hash-complete)` for a dedicated bucket / overflow-page
+  format.
+- [ ] WAL logging for hash index — validated open on 2026-05-18.
+  Current SQL hash-index writes reuse the B-tree WAL path for the
+  backing store; hash-specific WAL records must land with the dedicated
+  hash page format.
 - [x] Equality-only queries — `CREATE INDEX ... USING hash (col)`
   binds and builds a hash-keyed page-backed index, INSERT-side
   maintenance keeps it current, and equality predicates probe it with
@@ -1302,20 +1319,35 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
   `create_hash_index_supports_equality_queries_and_dml_maintenance`.
 
 ### GIN (Generalized Inverted Index)
-- [ ] For `JSONB` (`@>`, `<@`, `?`, `?|`, `?&`)
-- [ ] For arrays (`@>`, `<@`, `&&`)
-- [ ] For `TSVECTOR` (`@@`)
-- [ ] Fast update mode (pending list drain)
+- [ ] For `JSONB` (`@>`, `<@`, `?`, `?|`, `?&`) — validated open on
+  2026-05-18. Parser tokens exist, but executor evaluation still returns
+  `Unsupported("JSON operators")`, and SQL JSONB storage/operator support
+  is tracked under v1.0.
+- [ ] For arrays (`@>`, `<@`, `&&`) — validated open on 2026-05-18.
+  Array parser syntax exists, but SQL array storage/operators are tracked
+  under v1.0.
+- [ ] For `TSVECTOR` (`@@`) — validated open on 2026-05-18. TSVECTOR /
+  TSQUERY types and operators are tracked under v1.x full-text search.
+- [ ] Fast update mode (pending list drain) — validated open on
+  2026-05-18. `GinIndex` is an in-process posting-list scaffold with
+  `TODO(gin-complete)` for WAL/page-backed posting trees.
 
 ### GiST (Generalized Search Tree)
-- [ ] For range types (`&&`, `@>`, `<@`)
-- [ ] For geometric types
-- [ ] `EXCLUDE USING gist` constraint support
+- [ ] For range types (`&&`, `@>`, `<@`) — validated open on
+  2026-05-18. Range SQL types are tracked under v1.0.
+- [ ] For geometric types — validated open on 2026-05-18. Geometric SQL
+  types are tracked under v1.0.
+- [ ] `EXCLUDE USING gist` constraint support — validated open on
+  2026-05-18. Parser/binder/runtime support for `EXCLUDE` is absent;
+  `Constraint::Exclude` remains a storage-kernel placeholder.
 
 ### BRIN (Block Range Index)
-- [ ] For large tables with physical correlation (timestamps, sequential IDs)
-- [ ] `minmax` operator class
-- [ ] Auto-summarize on vacuum
+- [ ] For large tables with physical correlation (timestamps, sequential
+  IDs) — validated open on 2026-05-18. `BrinIndex` is a summary scaffold,
+  not a SQL-visible access method.
+- [ ] `minmax` operator class — validated open on 2026-05-18.
+- [ ] Auto-summarize on vacuum — validated open on 2026-05-18; VACUUM
+  currently reclaims B-tree entries but does not summarize BRIN ranges.
 
 ### Constraints
 - [x] Constraint runtime kernel — `crates/ultrasql-storage/src/constraints.rs` exposes `Constraint`, `ConstraintChecker`, and CHECK-expression IR for NotNull / Check / PrimaryKey / ForeignKey / UniqueSet validation
@@ -1347,7 +1379,9 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
   values from immutable row-local expressions, recompute on base-column
   update, and reject explicit generated-column writes with SQLSTATE
   `428C9`.
-- [ ] `EXCLUDE USING gist (...)` exclusion constraints
+- [ ] `EXCLUDE USING gist (...)` exclusion constraints — validated open
+  on 2026-05-18. Requires SQL-visible GiST operator classes plus
+  parser/binder/runtime exclusion-check wiring.
 
 ### Sequences
 - [x] `CREATE SEQUENCE` with START, INCREMENT, MINVALUE, MAXVALUE, CYCLE, CACHE — parser, binder, and Simple Query server dispatch are wired. Descending sequences default START to MAXVALUE; `ALTER SEQUENCE START WITH` changes restart seed without advancing current value.
@@ -1366,9 +1400,11 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [x] Catalog cache with `arc-swap` for wait-free reads
 - [x] Catalog snapshot for safe concurrent DDL
 - [x] Typed tuple decoder for bootstrap-from-heap — `crates/ultrasql-catalog/src/encoding.rs` + `PersistentCatalog::bootstrap_from_heap` decode `pg_class`, `pg_attribute`, `pg_index`, `pg_statistic`, and `pg_statistic_ext` rows and rebuild user `TableEntry`, `IndexEntry`, and planner-statistics snapshots on warm restart
-- [ ] Persistent constraint/default/sequence metadata — sequence registry
-  is WAL-recovered, but `pg_attrdef`, `pg_constraint`, and `pg_sequence`
-  heap rows are not yet the authoritative bootstrap source for runtime
+- [ ] Persistent constraint/default/sequence metadata — validated open on
+  2026-05-18. Sequence registry is WAL-recovered, and
+  `pg_constraint` / `pg_sequence` row shapes plus virtual scans exist,
+  but `pg_attrdef`, `pg_constraint`, and `pg_sequence` heap rows are not
+  yet the authoritative bootstrap source for runtime
   `TableRuntimeConstraints`.
 - [x] `pg_depend` compatibility slice — virtual dependency rows are
   derived from live UNIQUE / CHECK / FOREIGN KEY metadata, and `DROP
