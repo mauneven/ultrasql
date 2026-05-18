@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use tokio_postgres::NoTls;
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_server::{Server, bind_listener, serve_listener};
+use ultrasql_storage::access_method::BrinIndex;
 use ultrasql_storage::btree::BTree;
 
 /// Spin up an in-process server on an ephemeral TCP port and return a
@@ -223,6 +224,83 @@ async fn insert_after_create_index_updates_btree() {
         })
         .collect();
     assert_eq!(pairs, vec![(999, 9990)]);
+
+    shutdown(client, server_handle).await;
+}
+
+/// BRIN indexes keep min/max block-range summaries, use those ranges
+/// for heap scan pruning, and update summaries for post-index INSERTs.
+#[tokio::test]
+async fn brin_index_range_scan_and_insert_maintenance_round_trip() {
+    let (server, client, _conn_handle, server_handle) =
+        start_server_and_connect_with_server().await;
+    preload(&client, "t_brin_idx", 30_000).await;
+    client
+        .batch_execute("CREATE INDEX ix_t_brin_idx_id ON t_brin_idx USING brin (id)")
+        .await
+        .expect("create brin index");
+
+    let brin = {
+        let snapshot = server.persistent_catalog.snapshot();
+        let table = snapshot.tables.get("t_brin_idx").expect("table exists");
+        let constraints = server
+            .table_constraints
+            .get(&table.oid)
+            .expect("runtime index metadata exists");
+        constraints
+            .indexes
+            .values()
+            .find_map(|metadata| metadata.brin.clone())
+            .expect("brin summary stored")
+    };
+    assert!(
+        brin.summary_count() >= 2,
+        "fixture should span multiple BRIN ranges"
+    );
+
+    let rows = client
+        .simple_query("SELECT id FROM t_brin_idx WHERE id BETWEEN 29000 AND 29005 ORDER BY id")
+        .await
+        .expect("query through brin");
+    assert_eq!(
+        rows_first_col(&rows),
+        vec![
+            "29000".to_string(),
+            "29001".to_string(),
+            "29002".to_string(),
+            "29003".to_string(),
+            "29004".to_string(),
+            "29005".to_string()
+        ]
+    );
+
+    client
+        .batch_execute("INSERT INTO t_brin_idx VALUES (35000, 350000)")
+        .await
+        .expect("insert after brin index");
+    assert!(
+        !brin
+            .candidate_ranges_for_key(&BrinIndex::encode_i64_key(35_000))
+            .is_empty()
+    );
+    let rows = client
+        .simple_query("SELECT val FROM t_brin_idx WHERE id = 35000")
+        .await
+        .expect("query inserted row through brin");
+    assert_eq!(rows_first_col(&rows), vec!["350000".to_string()]);
+
+    client
+        .batch_execute("DELETE FROM t_brin_idx WHERE id = 35000")
+        .await
+        .expect("delete brin-covered row");
+    client
+        .batch_execute("VACUUM t_brin_idx")
+        .await
+        .expect("vacuum brin table");
+    assert!(
+        brin.candidate_ranges_for_key(&BrinIndex::encode_i64_key(35_000))
+            .is_empty()
+    );
 
     shutdown(client, server_handle).await;
 }

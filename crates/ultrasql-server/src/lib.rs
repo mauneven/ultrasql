@@ -193,6 +193,8 @@ pub struct RuntimeIndexMetadata {
     pub include_columns: Vec<usize>,
     /// Access method requested by `USING`.
     pub method: LogicalIndexMethod,
+    /// In-memory BRIN min/max summaries for block-range pruning.
+    pub brin: Option<Arc<ultrasql_storage::access_method::BrinIndex>>,
 }
 
 /// One runtime CHECK constraint.

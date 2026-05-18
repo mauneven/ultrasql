@@ -27,6 +27,7 @@ use ultrasql_planner::{
 use ultrasql_protocol::{
     BackendMessage, FieldDescription, FrontendMessage, decode_frontend, encode_backend,
 };
+use ultrasql_storage::access_method::{AccessMethod, BrinIndex};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
@@ -1005,6 +1006,7 @@ where
                 .vacuum_heap(rel, oldest, self.state.txn_manager.as_ref())
                 .map_err(|e| ServerError::ddl(format!("VACUUM heap: {e}")))?;
             self.state.vacuum_mark_visible_pages(oldest);
+            self.resummarize_brin_indexes(&snapshot, &entry)?;
         }
         Ok(result_encoder::SelectResult {
             messages: vec![BackendMessage::CommandComplete {
@@ -1042,6 +1044,98 @@ where
                 .map_err(|e| ServerError::ddl(format!("VACUUM index {}: {e}", index.name)))?;
         }
         Ok(())
+    }
+
+    fn resummarize_brin_indexes(
+        &self,
+        snapshot: &CatalogSnapshot,
+        entry: &TableEntry,
+    ) -> Result<(), ServerError> {
+        let Some(indexes) = snapshot.indexes_by_table.get(&entry.oid) else {
+            return Ok(());
+        };
+        let Some(constraints) = self.state.table_constraints.get(&entry.oid) else {
+            return Ok(());
+        };
+        let brin_indexes: Vec<_> = indexes
+            .iter()
+            .filter_map(|index| {
+                let metadata = constraints.indexes.get(&index.oid)?;
+                if metadata.method != ultrasql_planner::LogicalIndexMethod::Brin {
+                    return None;
+                }
+                let brin = metadata.brin.clone()?;
+                Some((index.clone(), metadata.clone(), brin))
+            })
+            .collect();
+        drop(constraints);
+        if brin_indexes.is_empty() {
+            return Ok(());
+        }
+
+        let rel = RelationId(entry.oid);
+        let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
+        if block_count == 0 {
+            for (_, _, brin) in brin_indexes {
+                brin.clear_summaries();
+            }
+            return Ok(());
+        }
+
+        let txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let result = (|| -> Result<(), ServerError> {
+            for (index, metadata, brin) in &brin_indexes {
+                let columns: Vec<usize> = index
+                    .columns
+                    .iter()
+                    .map(|attnum| usize::from(*attnum))
+                    .collect();
+                let encoding = if metadata.key_exprs.is_empty() {
+                    crate::index_key::IndexKeyEncoding::for_columns(&entry.schema, &columns)?
+                } else {
+                    let [expr] = metadata.key_exprs.as_slice() else {
+                        return Err(ServerError::Unsupported(
+                            "CREATE INDEX: expression indexes support exactly one key in this wave",
+                        ));
+                    };
+                    crate::index_key::IndexKeyEncoding::for_data_type(&expr.data_type())?
+                };
+                brin.clear_summaries();
+                let scan = self.state.heap.scan_visible(
+                    rel,
+                    block_count,
+                    &txn.snapshot,
+                    self.state.txn_manager.as_ref(),
+                );
+                for tuple in scan {
+                    let tuple = tuple
+                        .map_err(|e| ServerError::ddl(format!("VACUUM BRIN heap scan: {e}")))?;
+                    let key = crate::decode_key_column(
+                        &tuple.data,
+                        &entry.schema,
+                        columns.first().copied(),
+                        &metadata.key_exprs,
+                        metadata.predicate.as_ref(),
+                        metadata.method,
+                        &encoding,
+                    )?;
+                    if let Some(key) = key {
+                        let brin_key = BrinIndex::encode_i64_key(key);
+                        brin.insert(&brin_key, tuple.tid).map_err(|e| {
+                            ServerError::ddl(format!("VACUUM BRIN summarize {}: {e}", index.name))
+                        })?;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(e) = self.state.txn_manager.commit(txn) {
+            tracing::warn!(error = %e, "autocommit (VACUUM BRIN summarize) failed to finalise");
+        }
+        result
     }
 
     fn execute_analyze(&mut self, table: Option<&str>) -> Result<SelectResult, ServerError> {

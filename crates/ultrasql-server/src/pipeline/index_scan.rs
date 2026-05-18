@@ -8,6 +8,7 @@ use ultrasql_core::{DataType, Field, RelationId, TupleId, Value};
 use ultrasql_executor::{Filter, IndexOnlyScan, IndexScan, Operator, RowCodec};
 use ultrasql_mvcc::{Visibility, is_visible};
 use ultrasql_planner::{BinaryOp, LogicalIndexMethod, LogicalPlan, ScalarExpr, SortKey};
+use ultrasql_storage::access_method::BrinIndex;
 use ultrasql_storage::btree::BTree;
 
 use crate::BlankPageLoader;
@@ -15,6 +16,7 @@ use crate::error::ServerError;
 
 use super::LowerCtx;
 
+#[derive(Clone, Copy, Debug)]
 pub(super) struct IndexKeyRange {
     /// Inclusive lower bound, or `None` for unbounded below.
     pub(super) low: Option<i64>,
@@ -107,24 +109,28 @@ pub(super) fn try_index_scan(
     // satisfy a point lookup, but the storage layer only supports
     // 8-byte keys today, so we conservatively require a single-column
     // match.
-    let Some(index_entry) =
+    if let Some(index_entry) =
         find_single_column_index(&ctx.catalog_snapshot, table_entry, col_idx, ctx)
-    else {
-        return try_hash_index_scan(table_entry, predicate, ctx);
-    };
+    {
+        // Step 4: confirm the indexed column's type is one the B-tree
+        // can store. A10 only widens Int32 / Int64 into the i64 key
+        // space; other types (text, float, bool) fall back to SeqScan.
+        let Some(_widen) = key_type_for_btree(table_entry, col_idx) else {
+            return Ok(None);
+        };
 
-    // Step 4: confirm the indexed column's type is one the B-tree can
-    // store. A10 only widens Int32 / Int64 into the i64 key space;
-    // other types (text, float, bool) fall back to SeqScan.
-    let Some(_widen) = key_type_for_btree(table_entry, col_idx) else {
-        return Ok(None);
-    };
+        // Step 5: probe the B-tree, fetch matching tuples from the heap
+        // with MVCC visibility applied, and wrap them in an IndexScan.
+        let payloads = probe_index(index_entry, range, ctx)?;
+        let codec = RowCodec::new(table_entry.schema.clone());
+        return Ok(Some(Box::new(IndexScan::new(payloads, codec))));
+    }
 
-    // Step 5: probe the B-tree, fetch matching tuples from the heap
-    // with MVCC visibility applied, and wrap them in an IndexScan.
-    let payloads = probe_index(index_entry, range, ctx)?;
-    let codec = RowCodec::new(table_entry.schema.clone());
-    Ok(Some(Box::new(IndexScan::new(payloads, codec))))
+    if let Some(op) = try_hash_index_scan(table_entry, predicate, ctx)? {
+        return Ok(Some(op));
+    }
+
+    try_brin_index_scan(table_entry, col_idx, range, predicate, ctx)
 }
 
 fn try_hash_index_scan(
@@ -144,6 +150,41 @@ fn try_hash_index_scan(
         return Ok(None);
     };
     let payloads = probe_index(index_entry, IndexKeyRange::point(hash_key), ctx)?;
+    let codec = RowCodec::new(table_entry.schema.clone());
+    let scan = Box::new(IndexScan::new(payloads, codec));
+    Ok(Some(Box::new(Filter::new(scan, predicate.clone()))))
+}
+
+fn try_brin_index_scan(
+    table_entry: &TableEntry,
+    col_idx: usize,
+    range: IndexKeyRange,
+    predicate: &ScalarExpr,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let Some(index_entry) =
+        find_single_column_brin_index(&ctx.catalog_snapshot, table_entry, col_idx, ctx)
+    else {
+        return Ok(None);
+    };
+    let Some(_widen) = key_type_for_btree(table_entry, col_idx) else {
+        return Ok(None);
+    };
+    if range.low.zip(range.high).is_some_and(|(lo, hi)| lo > hi) {
+        let codec = RowCodec::new(table_entry.schema.clone());
+        let scan = Box::new(IndexScan::new(Vec::new(), codec));
+        return Ok(Some(Box::new(Filter::new(scan, predicate.clone()))));
+    }
+    let Some(brin) = brin_summary(ctx, table_entry.oid, index_entry.oid) else {
+        return Ok(None);
+    };
+    let low_key = range.low.map(BrinIndex::encode_i64_key);
+    let high_key = range.high.map(BrinIndex::encode_i64_key);
+    let candidate_ranges = brin.candidate_ranges_for_bounds(
+        low_key.as_ref().map(|k| k.as_slice()),
+        high_key.as_ref().map(|k| k.as_slice()),
+    );
+    let payloads = scan_brin_candidate_ranges(table_entry, &candidate_ranges, ctx)?;
     let codec = RowCodec::new(table_entry.schema.clone());
     let scan = Box::new(IndexScan::new(payloads, codec));
     Ok(Some(Box::new(Filter::new(scan, predicate.clone()))))
@@ -417,9 +458,7 @@ fn match_hash_equality_predicate(expr: &ScalarExpr) -> Option<(usize, Value)> {
 }
 
 /// Read the column index from a [`ScalarExpr::Column`] whose data type
-/// is a `B-tree-supported` integer (`Int32` or `Int64`). Returns
-/// `None` for non-column expressions, NULL columns, or non-integer
-/// types.
+/// is represented directly in the index `i64` key space.
 const fn column_idx_for_int_key(expr: &ScalarExpr) -> Option<usize> {
     let ScalarExpr::Column {
         index, data_type, ..
@@ -428,7 +467,12 @@ const fn column_idx_for_int_key(expr: &ScalarExpr) -> Option<usize> {
         return None;
     };
     match data_type {
-        DataType::Int32 | DataType::Int64 => Some(*index),
+        DataType::Bool
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Timestamp
+        | DataType::TimestampTz => Some(*index),
         _ => None,
     }
 }
@@ -441,8 +485,11 @@ pub(super) fn literal_as_i64(expr: &ScalarExpr) -> Option<i64> {
         return None;
     };
     match value {
+        Value::Bool(v) => Some(i64::from(*v)),
+        Value::Int16(v) => Some(i64::from(*v)),
         Value::Int32(v) => Some(i64::from(*v)),
         Value::Int64(v) => Some(*v),
+        Value::Timestamp(v) | Value::TimestampTz(v) => Some(*v),
         _ => None,
     }
 }
@@ -499,6 +546,30 @@ fn find_single_column_hash_index<'a>(
     })
 }
 
+fn find_single_column_brin_index<'a>(
+    snapshot: &'a CatalogSnapshot,
+    table_entry: &TableEntry,
+    col_idx: usize,
+    ctx: &LowerCtx<'_>,
+) -> Option<&'a IndexEntry> {
+    let attnum = u16::try_from(col_idx).ok()?;
+    let indexes = snapshot.indexes_by_table.get(&table_entry.oid)?;
+    indexes.iter().find(|e| {
+        e.columns.len() == 1
+            && e.columns[0] == attnum
+            && index_method(ctx, table_entry.oid, e.oid) == LogicalIndexMethod::Brin
+    })
+}
+
+fn brin_summary(
+    ctx: &LowerCtx<'_>,
+    table_oid: ultrasql_core::Oid,
+    index_oid: ultrasql_core::Oid,
+) -> Option<Arc<BrinIndex>> {
+    let constraints = ctx.table_constraints.get(&table_oid)?;
+    constraints.indexes.get(&index_oid)?.brin.clone()
+}
+
 fn index_method(
     ctx: &LowerCtx<'_>,
     table_oid: ultrasql_core::Oid,
@@ -514,10 +585,9 @@ fn index_method(
         })
 }
 
-/// Confirm the keyed column has a type the B-tree can store. Returns
-/// `Some(widen)` where `widen == true` for Int32 (key is sign-extended
-/// to `i64`) and `false` for Int64 (key is stored directly). Returns
-/// `None` for any other type so the caller falls back to `SeqScan`.
+/// Confirm the keyed column has a type stored directly in the `i64`
+/// key space. Returns `None` for types whose index encoding needs a
+/// transform not represented by [`literal_as_i64`].
 ///
 /// Mirrors the check in `Server::execute_create_index` — keep the two
 /// in sync, or a `CREATE INDEX` that succeeds will produce an index a
@@ -525,6 +595,9 @@ fn index_method(
 pub(super) fn key_type_for_btree(table_entry: &TableEntry, col_idx: usize) -> Option<bool> {
     let field = table_entry.schema.field(col_idx)?;
     match field.data_type {
+        DataType::Bool | DataType::Int16 | DataType::Timestamp | DataType::TimestampTz => {
+            Some(true)
+        }
         DataType::Int32 => Some(true),
         DataType::Int64 => Some(false),
         _ => None,
@@ -659,6 +732,67 @@ where
         }
     }
     Ok(payloads)
+}
+
+fn scan_brin_candidate_ranges(
+    table_entry: &TableEntry,
+    ranges: &[(u32, u32)],
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<Vec<u8>>, ServerError> {
+    let table_rel = RelationId(table_entry.oid);
+    let block_count = ctx.heap.block_count(table_rel).max(table_entry.n_blocks);
+    let ranges = normalize_brin_ranges(ranges, block_count);
+    let mut payloads = Vec::new();
+    for (start_block, end_block_inclusive) in ranges {
+        let end_exclusive = end_block_inclusive.saturating_add(1);
+        let mut walker = ctx.heap.scan_visible_walker_range_with_vm(
+            table_rel,
+            start_block,
+            end_exclusive,
+            &ctx.snapshot,
+            ctx.oracle.as_ref(),
+            ctx.vm.as_ref(),
+        );
+        while let Some((_tid, _header, payload)) = walker
+            .try_next()
+            .map_err(|e| ServerError::ddl(format!("BRIN heap range scan: {e}")))?
+        {
+            payloads.push(payload.to_vec());
+        }
+    }
+    Ok(payloads)
+}
+
+fn normalize_brin_ranges(ranges: &[(u32, u32)], block_count: u32) -> Vec<(u32, u32)> {
+    if block_count == 0 {
+        return Vec::new();
+    }
+    let last_block = block_count - 1;
+    let mut ranges: Vec<(u32, u32)> = ranges
+        .iter()
+        .filter_map(|(start, end)| {
+            if *start > last_block {
+                return None;
+            }
+            let end = (*end).min(last_block);
+            if *start > end {
+                return None;
+            }
+            Some((*start, end))
+        })
+        .collect();
+    ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        if let Some((_, current_end)) = merged.last_mut()
+            && start <= current_end.saturating_add(1)
+        {
+            *current_end = (*current_end).max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+    merged
 }
 
 fn key_value_for_expr(key: i64, expr: &ScalarExpr) -> Option<Value> {

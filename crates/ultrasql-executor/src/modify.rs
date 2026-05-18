@@ -31,6 +31,7 @@ use std::sync::Arc;
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Value, Xid};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_storage::PageLoader;
+use ultrasql_storage::access_method::{AccessMethod, BrinIndex};
 use ultrasql_storage::btree::{BTree, BTreeError};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions, UpdatePayload};
 use ultrasql_storage::sequence::Sequence;
@@ -110,6 +111,7 @@ pub struct InsertIndexMaintainer<L: PageLoader> {
     tree: BTree<L>,
     encode: InsertIndexEncoder,
     unique: bool,
+    brin: Option<Arc<BrinIndex>>,
 }
 
 impl<L: PageLoader> std::fmt::Debug for InsertIndexMaintainer<L> {
@@ -134,7 +136,15 @@ impl<L: PageLoader> InsertIndexMaintainer<L> {
             tree,
             encode,
             unique,
+            brin: None,
         }
+    }
+
+    /// Attach the in-memory BRIN summary maintained beside this index.
+    #[must_use]
+    pub fn with_brin(mut self, brin: Option<Arc<BrinIndex>>) -> Self {
+        self.brin = brin;
+        self
     }
 
     fn encode_key(&self, row: &[Value]) -> Result<Option<i64>, ExecError> {
@@ -167,7 +177,14 @@ impl<L: PageLoader> InsertIndexMaintainer<L> {
         result.map_err(|e| match e {
             BTreeError::DuplicateKey => ExecError::UniqueViolation(self.name.clone()),
             other => ExecError::TypeMismatch(format!("index insert {}: {other}", self.name)),
-        })
+        })?;
+        if let Some(brin) = &self.brin {
+            let brin_key = BrinIndex::encode_i64_key(key);
+            brin.insert(&brin_key, tid).map_err(|e| {
+                ExecError::TypeMismatch(format!("brin summary insert {}: {e}", self.name))
+            })?;
+        }
+        Ok(())
     }
 
     fn delete_key(

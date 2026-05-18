@@ -561,7 +561,7 @@ impl AccessMethod for GistIndex {
 }
 
 // ---------------------------------------------------------------------------
-// BRIN (Block Range Index) scaffold
+// BRIN (Block Range Index) min/max summaries
 // ---------------------------------------------------------------------------
 
 /// Summary entry for one page range.
@@ -581,24 +581,31 @@ struct BrinSummary {
     max_key: Vec<u8>,
 }
 
-/// BRIN (Block Range `INdex`) scaffold.
+/// BRIN (Block Range `INdex`) min/max index.
 ///
 /// BRIN stores per-page-range min/max summaries rather than per-tuple
 /// entries, making it highly space-efficient for naturally ordered data
 /// (timestamps, sequential IDs). The trade-off is that a lookup must
 /// scan all ranges whose `[min, max]` interval overlaps the query key.
 ///
+/// # Key contract
+///
+/// Keys compare lexicographically. Integer callers should use
+/// [`Self::encode_i64_key`] so signed `i64` order is preserved in the
+/// byte domain.
+///
 /// # Status
 ///
-/// `TODO(brin-complete)`: implement page-backed summary storage; add
-/// auto-summarise via the vacuum path; add the `BrinOpclass` strategy
-/// interface for non-integer types; add inclusion operator classes.
+/// Summaries are maintained in memory by the SQL runtime and consulted
+/// by the heap-scan lowerer for block-range pruning. Page-backed,
+/// WAL-recovered summary storage and non-integer operator classes remain
+/// future work.
 #[derive(Debug)]
 pub struct BrinIndex {
     /// Summaries keyed by page range start.
     ///
-    /// TODO(brin-complete): replace with WAL-logged summary pages
-    /// in the buffer pool.
+    /// Future page-backed BRIN storage replaces this with WAL-logged
+    /// summary pages in the buffer pool.
     summaries: Mutex<Vec<BrinSummary>>,
     /// Number of heap blocks per summary range.
     pages_per_range: u32,
@@ -631,7 +638,6 @@ impl BrinIndex {
         min_key: Vec<u8>,
         max_key: Vec<u8>,
     ) {
-        // TODO(brin-complete): scan heap pages and compute min/max.
         let mut summaries = self.summaries.lock();
         // Remove any existing summary for this range.
         summaries.retain(|s| s.first_block != first_block);
@@ -643,6 +649,57 @@ impl BrinIndex {
         });
         summaries.sort_by_key(|s| s.first_block);
     }
+
+    /// Encode a signed integer key so lexicographic byte order matches
+    /// normal signed integer order.
+    #[must_use]
+    pub fn encode_i64_key(key: i64) -> [u8; 8] {
+        (u64::from_ne_bytes(key.to_ne_bytes()) ^ (1_u64 << 63)).to_be_bytes()
+    }
+
+    /// Number of summary ranges currently stored.
+    #[must_use]
+    pub fn summary_count(&self) -> usize {
+        self.summaries.lock().len()
+    }
+
+    /// Drop all current summaries before a full VACUUM re-summarize pass.
+    pub fn clear_summaries(&self) {
+        self.summaries.lock().clear();
+    }
+
+    /// Candidate page ranges for a point probe.
+    ///
+    /// Returned ranges are inclusive `(first_block, last_block)` pairs.
+    /// The executor must still recheck the SQL predicate against every
+    /// visible tuple in those ranges because BRIN summaries can include
+    /// false positives by design.
+    #[must_use]
+    pub fn candidate_ranges_for_key(&self, key: &[u8]) -> Vec<(u32, u32)> {
+        self.candidate_ranges_for_bounds(Some(key), Some(key))
+    }
+
+    /// Candidate page ranges for an inclusive key interval.
+    ///
+    /// `None` on either side means unbounded. A summary overlaps the
+    /// query interval when `summary.max >= low && summary.min <= high`.
+    #[must_use]
+    pub fn candidate_ranges_for_bounds(
+        &self,
+        low: Option<&[u8]>,
+        high: Option<&[u8]>,
+    ) -> Vec<(u32, u32)> {
+        let summaries = self.summaries.lock();
+        summaries
+            .iter()
+            .filter(|s| {
+                let above_low = low.is_none_or(|lo| s.max_key.as_slice() >= lo);
+                let below_high = high.is_none_or(|hi| s.min_key.as_slice() <= hi);
+                above_low && below_high
+            })
+            .map(|s| (s.first_block, s.last_block))
+            .collect()
+    }
 }
 
 impl AccessMethod for BrinIndex {
@@ -651,8 +708,6 @@ impl AccessMethod for BrinIndex {
     }
 
     fn insert(&self, key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
-        // TODO(brin-complete): update the page-range summary that covers
-        // tid.page.block; if none exists, defer to auto-summarize.
         let block = tid.page.block.raw();
         let range_start = (block / self.pages_per_range) * self.pages_per_range;
         let range_end = range_start + self.pages_per_range - 1;
@@ -677,26 +732,19 @@ impl AccessMethod for BrinIndex {
     }
 
     fn lookup(&self, key: &[u8]) -> Result<Vec<TupleId>, AccessMethodError> {
-        // TODO(brin-complete): return candidate block ranges, not TupleIds.
-        // For now, return an empty vec; the caller falls back to a heap
-        // scan filtered by BRIN's block-range pruning.
-        let summaries = self.summaries.lock();
-        // A range is a candidate when key is within [min_key, max_key].
-        let _candidates: Vec<(u32, u32)> = summaries
-            .iter()
-            .filter(|s| key >= s.min_key.as_slice() && key <= s.max_key.as_slice())
-            .map(|s| (s.first_block, s.last_block))
-            .collect();
-        // BRIN lookup yields candidate page ranges, not exact TupleIds.
-        // Returning empty is correct for this scaffold — callers must
-        // integrate with the heap scanner.
+        let _ = self.candidate_ranges_for_key(key);
+        // BRIN lookup yields candidate page ranges, not exact TupleIds;
+        // SQL execution calls `candidate_ranges_*` directly and scans
+        // those heap ranges with predicate recheck.
         Ok(Vec::new())
     }
 
     fn delete(&self, _key: &[u8], _tid: TupleId) -> Result<(), AccessMethodError> {
-        // TODO(brin-complete): BRIN does not track individual TupleIds.
-        // Deletion marks the range as "needs re-summarize" and vacuum
-        // triggers a re-summarize pass.
+        // BRIN does not track individual TupleIds. Stale min/max
+        // summaries over-include after deletes or shrinking updates,
+        // which is correct because heap predicate recheck filters
+        // false positives. Future page-backed summaries can recompute
+        // exact ranges during VACUUM.
         Ok(())
     }
 }
@@ -872,7 +920,10 @@ mod tests {
         let am = BrinIndex::new(128);
         // Insert a tuple in block 0 with key [42].
         am.insert(b"\x2a", tid(0, 0)).expect("brin insert");
-        // BRIN lookup returns empty (callers integrate with heap scanner).
+        assert_eq!(am.summary_count(), 1);
+        assert_eq!(am.candidate_ranges_for_key(b"\x2a"), vec![(0, 127)]);
+        assert!(am.candidate_ranges_for_key(b"\x2b").is_empty());
+        // Trait lookup still returns empty because callers need ranges.
         let _ = am.lookup(b"\x2a").expect("brin lookup");
     }
 
@@ -880,8 +931,27 @@ mod tests {
     fn brin_summarize_range_stores_minmax() {
         let am = BrinIndex::new(128);
         am.summarize_range(0, 127, b"\x01".to_vec(), b"\xff".to_vec());
-        // Lookup within range returns empty (scaffold behaviour).
+        assert_eq!(
+            am.candidate_ranges_for_bounds(Some(b"\x80"), Some(b"\x90")),
+            vec![(0, 127)]
+        );
+        assert!(
+            am.candidate_ranges_for_bounds(Some(b"\xff\x00"), None)
+                .is_empty()
+        );
         let _ = am.lookup(b"\x80").expect("lookup in range");
+    }
+
+    #[test]
+    fn brin_i64_encoding_preserves_signed_order() {
+        let keys = [
+            BrinIndex::encode_i64_key(i64::MIN),
+            BrinIndex::encode_i64_key(-1),
+            BrinIndex::encode_i64_key(0),
+            BrinIndex::encode_i64_key(1),
+            BrinIndex::encode_i64_key(i64::MAX),
+        ];
+        assert!(keys.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]

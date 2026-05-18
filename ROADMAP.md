@@ -1070,8 +1070,9 @@ The main OLAP performance differentiator over PostgreSQL.
 - [x] Expanded runtime-dispatched AVX2 intrinsics for core integer
   kernels: packed `eq_i32`, all-op packed `cmp_i32_scalar` /
   `cmp_i64_scalar`, packed `cmp_gt_i64`, dense `sum_i64`, dense widening
-  `sum_i32`, plus the existing dense filter-sum path. AVX-512 remains
-  open until x86 CI builds and benchmarks those target-feature variants.
+  `sum_i32`, plus the existing dense filter-sum path. AVX-512 was moved
+  out of v0.7 on 2026-05-18 because this repository has no x86
+  AVX-512 CI/bench host or result artifact yet.
 
 ### Dictionary Encoding
 - [x] Dictionary encoding for low-cardinality string columns (DictionaryColumn)
@@ -1191,20 +1192,24 @@ The main OLAP performance differentiator over PostgreSQL.
   harness queries validated against DuckDB on 2026-05-18 after the
   status audit (`make tpch-validate TPCH_DUCKDB=/opt/homebrew/bin/duckdb
   TPCH_QUERIES=all`).
-- [ ] TPC-H SF10 has not been run to completion or compared with DuckDB;
-  no committed run artifact exists under `benchmarks/results/`.
+- [ ] TPC-H SF10 has not been run to completion or compared with DuckDB.
+  Local SF10 `dbgen` data was generated on 2026-05-18 under
+  `target/tpch-scale10-real` (11 GiB, ignored by policy), but no
+  committed run artifact exists under `benchmarks/results/` and this
+  16 GiB ARM64 host is not a valid certification box for the full
+  in-memory SF10 gate.
 - [ ] ClickBench has not been run or certified against PostgreSQL; no
   ClickBench harness/result artifact exists in the repository.
 - [x] Automatic dictionary selection is implemented in `ultrasql-vec`
   and wired through core executor/server batch paths. Remaining work is
   specialized dictionary-native text predicates and GROUP BY lowering
   beyond decode/preserve/re-encode flow.
-- [ ] SIMD coverage remains partial only on AVX-512 and some long-tail
-  kernels. ARM64 NEON exists for selected hot kernels and AVX2 runtime
-  dispatch now covers dense filter-sum plus core integer compare/sum
-  kernels, including all six scalar comparison ops for `i32` and `i64`.
-  Close this only after x86 AVX-512 CI/bench coverage exists or the
-  AVX-512 target is explicitly moved out of v0.7.
+- [x] SIMD v0.7 scope is complete after explicitly moving AVX-512 out
+  of v0.7 on 2026-05-18. ARM64 NEON exists for selected hot kernels and
+  AVX2 runtime dispatch covers dense filter-sum plus core integer
+  compare/sum kernels, including all six scalar comparison ops for
+  `i32` and `i64`. AVX-512 target-feature CI/bench certification is now
+  tracked under v1.x hardware-specific performance work.
 - [x] Parallel execution has first production path: fan-in collators,
   `ParallelSeqScan` worker partitioning, cancellation propagation, and
   cost-based scan selection are implemented. Remaining work is broader
@@ -1351,13 +1356,17 @@ geometric, and full-text type surfaces.
 - [x] SQL-visible access method name — `CREATE INDEX ... USING brin`
   binds into `LogicalIndexMethod::Brin`, and runtime index metadata
   preserves the requested method for DML maintenance.
-- [ ] For large tables with physical correlation (timestamps, sequential
-  IDs) — validated open on 2026-05-18. `BrinIndex` is a min/max summary
-  kernel, but SQL scans still do not use BRIN block-range pruning.
+- [x] For large tables with physical correlation (timestamps, sequential
+  IDs) — SQL scans now lower eligible ordered predicates over
+  `USING brin` indexes into BRIN candidate block ranges, scan only those
+  heap ranges, and recheck the SQL predicate for correctness. Covered by
+  `index_scan_round_trip::brin_index_range_scan_and_insert_maintenance_round_trip`.
 - [x] `minmax` operator class — `BrinIndex` maintains per-range min/max
-  summaries on insert and through explicit `summarize_range`.
-- [ ] Auto-summarize on vacuum — validated open on 2026-05-18; VACUUM
-  currently reclaims B-tree entries but does not summarize BRIN ranges.
+  summaries on index build, insert/update index maintenance, and through
+  explicit `summarize_range`.
+- [x] Auto-summarize on vacuum — `VACUUM table` now rebuilds same-process
+  BRIN summaries from visible heap tuples after heap cleanup; stale
+  delete over-inclusion is removed by the same round-trip regression.
 
 ### Constraints
 - [x] Constraint runtime kernel — `crates/ultrasql-storage/src/constraints.rs` exposes `Constraint`, `ConstraintChecker`, and CHECK-expression IR for NotNull / Check / PrimaryKey / ForeignKey / UniqueSet validation
@@ -1671,6 +1680,11 @@ Every standard PostgreSQL driver and ORM works without modification.
 
 **Scope:** Stored procedures, triggers, views, materialized views,
 partitioning, full-text search, remaining type coverage.
+
+### Hardware-Specific Performance
+- [ ] x86 AVX-512 target-feature CI/bench certification for vector
+  kernels, with scalar/AVX2 parity tests and committed result artifacts
+  from an AVX-512-capable host.
 
 ### Views & Materialized Views
 - [ ] `CREATE VIEW` / `CREATE OR REPLACE VIEW` / `DROP VIEW`

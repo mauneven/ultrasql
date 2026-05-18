@@ -23,6 +23,7 @@ use ultrasql_planner::{
     LogicalPlan, TableMeta, bind,
 };
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
+use ultrasql_storage::access_method::{AccessMethod, BrinIndex};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
@@ -487,6 +488,11 @@ where
         let mut btree = BTree::create(Arc::clone(pool), index_rel)
             .map_err(|e| ServerError::ddl(format!("BTree::create failed: {e}")))?;
         let root_block = btree.root_block();
+        let brin_summary = if *method == ultrasql_planner::LogicalIndexMethod::Brin {
+            Some(Arc::new(BrinIndex::new(128)))
+        } else {
+            None
+        };
 
         // 3. Scan the heap and populate the tree.
         let mut attnums: Vec<u16> = Vec::with_capacity(columns.len());
@@ -532,6 +538,12 @@ where
                             .map_err(|e| {
                                 ServerError::ddl(format!("CREATE INDEX btree insert: {e}"))
                             })?;
+                    }
+                    if let Some(brin) = &brin_summary {
+                        let brin_key = BrinIndex::encode_i64_key(key);
+                        brin.insert(&brin_key, tup.tid).map_err(|e| {
+                            ServerError::ddl(format!("CREATE INDEX brin summarize: {e}"))
+                        })?;
                     }
                     inserted += 1;
                 }
@@ -600,6 +612,7 @@ where
                     predicate: predicate.clone(),
                     include_columns: include_columns.clone(),
                     method: *method,
+                    brin: brin_summary.clone(),
                 },
             );
             self.state

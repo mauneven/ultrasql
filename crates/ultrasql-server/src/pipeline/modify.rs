@@ -988,6 +988,7 @@ fn build_one_insert_index_maintainer(
     let method = runtime
         .as_ref()
         .map_or(LogicalIndexMethod::Btree, |metadata| metadata.method);
+    let brin = runtime.as_ref().and_then(|metadata| metadata.brin.clone());
     let encoding = if method == LogicalIndexMethod::Hash {
         crate::index_key::IndexKeyEncoding::Int64
     } else if key_exprs.is_empty() {
@@ -1057,12 +1058,10 @@ fn build_one_insert_index_maintainer(
         };
         Ok(encoded)
     });
-    Ok(InsertIndexMaintainer::new(
-        index.name.clone(),
-        tree,
-        encoder,
-        index.is_unique,
-    ))
+    Ok(
+        InsertIndexMaintainer::new(index.name.clone(), tree, encoder, index.is_unique)
+            .with_brin(brin),
+    )
 }
 
 /// Build a TID-emitting [`SeqScan`] over a persistent relation.
