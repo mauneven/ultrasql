@@ -11,7 +11,7 @@
 //! builds) preserves the perf characteristics the original
 //! single-file layout had.
 
-use ultrasql_core::{DataType, Value};
+use ultrasql_core::{DataType, GeometryType, GeometryValue, RangeType, RangeValue, Value};
 use ultrasql_parser::ast::{BinaryOp, Expr, Literal, UnaryOp};
 
 use super::expr_type::{binary_result_type, comparable, display_unary};
@@ -111,7 +111,16 @@ pub(super) fn bind_expr_with_ctes(
                 data_type: return_type,
             })
         }
-        Expr::Cast { .. } => Err(PlanError::NotSupported("CAST expressions")),
+        Expr::Cast {
+            expr: inner,
+            target,
+            ..
+        }
+        | Expr::PostfixCast {
+            expr: inner,
+            target,
+            ..
+        } => bind_cast_expr(inner, target, input, catalog, cte_catalog, scope),
 
         // ------------------------------------------------------------------
         // Subquery variants
@@ -405,6 +414,27 @@ pub(super) fn bind_expr_with_ctes(
 
         _ => Err(PlanError::NotSupported("expression variant")),
     }
+}
+
+fn bind_cast_expr(
+    inner: &Expr,
+    target: &ultrasql_parser::ast::Identifier,
+    input: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let target_type = resolve_cast_type(&target.value).ok_or(PlanError::NotSupported(
+        "CAST target type is not implemented",
+    ))?;
+    let mut bound = bind_expr_with_ctes(inner, input, catalog, cte_catalog, scope)?;
+    coerce_literal_to_type(&mut bound, &target_type);
+    if bound.data_type() == target_type || matches!(bound.data_type(), DataType::Null) {
+        return Ok(bound);
+    }
+    Err(PlanError::NotSupported(
+        "non-literal CAST expressions are not implemented",
+    ))
 }
 
 /// Bind `expr [NOT] BETWEEN [SYMMETRIC] low AND high` into an equivalent
@@ -1142,7 +1172,53 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                 };
             }
         }
+        (DataType::Range(range_type), Value::Text(text)) => {
+            if let Some(range) = RangeValue::parse(*range_type, text) {
+                *value = Value::Range(range);
+                *data_type = DataType::Range(*range_type);
+            }
+        }
+        (DataType::Geometry(geometry_type), Value::Text(text)) => {
+            if let Some(geometry) = GeometryValue::parse(*geometry_type, text) {
+                *value = Value::Geometry(geometry);
+                *data_type = DataType::Geometry(*geometry_type);
+            }
+        }
         _ => {}
+    }
+}
+
+fn resolve_cast_type(type_name: &str) -> Option<DataType> {
+    match type_name.to_ascii_lowercase().as_str() {
+        "int" | "integer" | "int4" => Some(DataType::Int32),
+        "bigint" | "int8" => Some(DataType::Int64),
+        "smallint" | "int2" => Some(DataType::Int16),
+        "bool" | "boolean" => Some(DataType::Bool),
+        "real" | "float4" => Some(DataType::Float32),
+        "double" | "float" | "float8" => Some(DataType::Float64),
+        "text" | "varchar" | "char" | "character" => Some(DataType::Text { max_len: None }),
+        "date" => Some(DataType::Date),
+        "time" => Some(DataType::Time),
+        "timestamp" => Some(DataType::Timestamp),
+        "timestamptz" => Some(DataType::TimestampTz),
+        "numeric" | "decimal" => Some(DataType::Decimal {
+            precision: None,
+            scale: Some(0),
+        }),
+        "int4range" => Some(DataType::Range(RangeType::Int4)),
+        "int8range" => Some(DataType::Range(RangeType::Int8)),
+        "numrange" => Some(DataType::Range(RangeType::Num)),
+        "daterange" => Some(DataType::Range(RangeType::Date)),
+        "tsrange" => Some(DataType::Range(RangeType::Timestamp)),
+        "tstzrange" => Some(DataType::Range(RangeType::TimestampTz)),
+        "point" => Some(DataType::Geometry(GeometryType::Point)),
+        "box" => Some(DataType::Geometry(GeometryType::Box)),
+        "circle" => Some(DataType::Geometry(GeometryType::Circle)),
+        "line" => Some(DataType::Geometry(GeometryType::Line)),
+        "lseg" => Some(DataType::Geometry(GeometryType::Lseg)),
+        "path" => Some(DataType::Geometry(GeometryType::Path)),
+        "polygon" => Some(DataType::Geometry(GeometryType::Polygon)),
+        _ => None,
     }
 }
 

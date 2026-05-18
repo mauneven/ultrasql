@@ -895,3 +895,76 @@ async fn deferrable_foreign_key_violation_fails_at_commit() {
 
     shutdown(client, server_handle).await;
 }
+
+/// `EXCLUDE USING gist` rejects overlapping range keys and reports
+/// PostgreSQL's `exclusion_violation` SQLSTATE.
+#[tokio::test]
+async fn exclusion_constraint_rejects_overlapping_int4range() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE bookings (\
+             room INT NOT NULL, \
+             during INT4RANGE NOT NULL, \
+             EXCLUDE USING gist (room WITH =, during WITH &&))",
+        )
+        .await
+        .expect("create bookings");
+
+    client
+        .batch_execute(
+            "INSERT INTO bookings VALUES \
+             (101, '[1,10)'::int4range), \
+             (101, '[10,20)'::int4range), \
+             (102, '[5,15)'::int4range)",
+        )
+        .await
+        .expect("non-overlapping ranges insert");
+
+    let err = client
+        .batch_execute("INSERT INTO bookings VALUES (101, '[5,6)'::int4range)")
+        .await
+        .expect_err("overlapping range should violate exclusion constraint");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23P01");
+
+    let rows = client
+        .query(
+            "SELECT room FROM bookings WHERE during && '[6,7)'::int4range",
+            &[],
+        )
+        .await
+        .expect("range overlap query");
+    let rooms: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(rooms, vec![101, 102]);
+
+    shutdown(client, server_handle).await;
+}
+
+/// Geometric `&&` uses GiST-style bounding-box overlap semantics.
+#[tokio::test]
+async fn geometric_overlap_predicate_filters_boxes() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE shapes (id INT NOT NULL, b BOX NOT NULL)")
+        .await
+        .expect("create shapes");
+    client
+        .batch_execute(
+            "INSERT INTO shapes VALUES \
+             (1, '((0,0),(10,10))'::box), \
+             (2, '((20,20),(30,30))'::box)",
+        )
+        .await
+        .expect("insert boxes");
+
+    let rows = client
+        .query("SELECT id FROM shapes WHERE b && '((5,5),(6,6))'::box", &[])
+        .await
+        .expect("geometry overlap query");
+    let ids: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(ids, vec![1]);
+
+    shutdown(client, server_handle).await;
+}

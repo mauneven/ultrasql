@@ -1344,13 +1344,22 @@ geometric, and full-text type surfaces.
 - [x] SQL-visible access method name — `CREATE INDEX ... USING gist`
   binds into `LogicalIndexMethod::Gist`, and runtime index metadata
   preserves the requested method for DML maintenance.
-- [ ] For range types (`&&`, `@>`, `<@`) — validated open on
-  2026-05-18. Range SQL types are tracked under v1.0.
-- [ ] For geometric types — validated open on 2026-05-18. Geometric SQL
-  types are tracked under v1.0.
-- [ ] `EXCLUDE USING gist` constraint support — validated open on
-  2026-05-18. Parser/binder/runtime support for `EXCLUDE` is absent;
-  `Constraint::Exclude` remains a storage-kernel placeholder.
+- [x] For range types (`&&`, `@>`, `<@`) — SQL-visible range data types
+  (`int4range`, `int8range`, `numrange`, `daterange`, `tsrange`,
+  `tstzrange`) bind through DDL/casts, persist through row/catalog
+  codecs, and execute overlap / contains predicates. Covered by
+  `constraint_round_trip.rs::exclusion_constraint_rejects_overlapping_int4range`.
+- [x] For geometric types — SQL-visible geometric data types (`point`,
+  `box`, `circle`, `line`, `lseg`, `path`, `polygon`) bind through DDL /
+  casts, persist through row/catalog codecs, and execute bbox-backed
+  overlap / contains predicates. Covered by
+  `constraint_round_trip.rs::geometric_overlap_predicate_filters_boxes`.
+- [x] `EXCLUDE USING gist` constraint support — parser/binder/runtime
+  carry GiST exclusion constraints, persist `pg_constraint` rows, and
+  enforce non-deferrable insert/update conflicts with SQLSTATE `23P01`.
+  Current enforcement uses visible-row scans plus same-statement pending
+  rows; physical GiST index-assisted probing remains a future
+  optimization, not a correctness dependency.
 
 ### BRIN (Block Range Index)
 - [x] SQL-visible access method name — `CREATE INDEX ... USING brin`
@@ -1398,9 +1407,12 @@ geometric, and full-text type surfaces.
   values from immutable row-local expressions, recompute on base-column
   update, and reject explicit generated-column writes with SQLSTATE
   `428C9`.
-- [ ] `EXCLUDE USING gist (...)` exclusion constraints — validated open
-  on 2026-05-18. Requires SQL-visible GiST operator classes plus
-  parser/binder/runtime exclusion-check wiring.
+- [x] `EXCLUDE USING gist (...)` exclusion constraints — parser accepts
+  `EXCLUDE USING gist (col WITH op, ...)`, binder validates supported
+  operators against range/geometric/equality columns, runtime DML checks
+  visible and same-statement rows, and violations return SQLSTATE
+  `23P01`. Physical GiST index-assisted probing remains a future
+  optimization.
 
 ### Sequences
 - [x] `CREATE SEQUENCE` with START, INCREMENT, MINVALUE, MAXVALUE, CYCLE, CACHE — parser, binder, and Simple Query server dispatch are wired. Descending sequences default START to MAXVALUE; `ALTER SEQUENCE START WITH` changes restart seed without advancing current value.

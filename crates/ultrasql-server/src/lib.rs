@@ -174,6 +174,8 @@ pub struct TableRuntimeConstraints {
     pub checks: Vec<RuntimeCheckConstraint>,
     /// Non-deferrable FOREIGN KEY constraints evaluated by DML.
     pub foreign_keys: Vec<RuntimeForeignKeyConstraint>,
+    /// EXCLUDE constraints evaluated by DML.
+    pub exclusion_constraints: Vec<RuntimeExclusionConstraint>,
     /// Runtime metadata for expression, partial, and covering indexes.
     ///
     /// Persistent `pg_index` rows still store only the portable column
@@ -227,6 +229,26 @@ pub struct RuntimeForeignKeyConstraint {
     pub deferrable: bool,
     /// Whether this deferrable constraint starts in deferred mode.
     pub initially_deferred: bool,
+}
+
+/// One runtime EXCLUDE constraint.
+#[derive(Clone, Debug)]
+pub struct RuntimeExclusionConstraint {
+    /// Constraint name reported on violation.
+    pub name: String,
+    /// Access method requested by `USING`.
+    pub method: LogicalIndexMethod,
+    /// 0-based table column indices plus operators.
+    pub elements: Vec<RuntimeExclusionElement>,
+}
+
+/// One runtime EXCLUDE element.
+#[derive(Clone, Debug)]
+pub struct RuntimeExclusionElement {
+    /// Table column index.
+    pub column: usize,
+    /// Operator applied to `(new_value, existing_value)`.
+    pub op: BinaryOp,
 }
 
 fn deferred_fk_key(row: &[Value], columns: &[usize]) -> Option<Vec<Value>> {

@@ -1,6 +1,7 @@
 use proptest::prelude::*;
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::Parser;
+use ultrasql_parser::ast::BinaryOp;
 
 use super::*;
 use crate::LogicalIndexMethod;
@@ -542,6 +543,35 @@ fn binds_deferrable_foreign_key_flags() {
     assert_eq!(foreign_keys.len(), 1);
     assert!(foreign_keys[0].deferrable);
     assert!(foreign_keys[0].initially_deferred);
+}
+
+#[test]
+fn binds_create_table_exclusion_constraints() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "CREATE TABLE bookings (room INT, during INT4RANGE, \
+         EXCLUDE USING gist (room WITH =, during WITH &&))",
+        &cat,
+    )
+    .expect("exclusion constraint binds");
+    let LogicalPlan::CreateTable {
+        columns,
+        exclusion_constraints,
+        ..
+    } = plan
+    else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(
+        columns.field_at(1).data_type,
+        DataType::Range(ultrasql_core::RangeType::Int4)
+    );
+    assert_eq!(exclusion_constraints.len(), 1);
+    assert_eq!(exclusion_constraints[0].method, LogicalIndexMethod::Gist);
+    assert_eq!(exclusion_constraints[0].elements[0].column, 0);
+    assert_eq!(exclusion_constraints[0].elements[0].op, BinaryOp::Eq);
+    assert_eq!(exclusion_constraints[0].elements[1].column, 1);
+    assert_eq!(exclusion_constraints[0].elements[1].op, BinaryOp::Overlap);
 }
 
 #[test]

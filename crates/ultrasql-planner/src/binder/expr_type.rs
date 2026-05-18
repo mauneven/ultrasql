@@ -118,6 +118,7 @@ pub(super) fn binary_result_type(
         BinaryOp::JsonGetText | BinaryOp::JsonGetPathText => Ok(DataType::Text { max_len: None }),
         BinaryOp::JsonContains
         | BinaryOp::JsonContained
+        | BinaryOp::Overlap
         | BinaryOp::JsonHasKey
         | BinaryOp::JsonHasAnyKey
         | BinaryOp::JsonHasAllKeys => Ok(DataType::Bool),
@@ -238,6 +239,7 @@ pub(super) const fn display_binary(op: BinaryOp) -> &'static str {
         BinaryOp::JsonGetPathText => "#>>",
         BinaryOp::JsonContains => "@>",
         BinaryOp::JsonContained => "<@",
+        BinaryOp::Overlap => "&&",
         BinaryOp::JsonHasKey => "?",
         BinaryOp::JsonHasAnyKey => "?|",
         BinaryOp::JsonHasAllKeys => "?&",

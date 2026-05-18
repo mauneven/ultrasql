@@ -130,6 +130,11 @@ pub(super) fn lower_real_insert(
                     .collect(),
             )
             .with_foreign_key_checks(build_foreign_key_checks(&constraints.foreign_keys, ctx)?)
+            .with_exclusion_checks(build_exclusion_insert_checks(
+                entry,
+                &constraints.exclusion_constraints,
+                ctx,
+            )?)
     } else {
         modify
     };
@@ -258,6 +263,85 @@ fn build_foreign_key_checks(
     Ok(out)
 }
 
+fn build_exclusion_insert_checks(
+    table: &TableEntry,
+    exclusions: &[crate::RuntimeExclusionConstraint],
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<RowConstraintCheck>, ServerError> {
+    let mut out = Vec::with_capacity(exclusions.len());
+    for exclusion in exclusions {
+        let heap = Arc::clone(&ctx.heap);
+        let snapshot = ctx.snapshot.clone();
+        let oracle = Arc::clone(&ctx.oracle);
+        let table = table.clone();
+        let constraint = exclusion.clone();
+        let pending = Arc::new(parking_lot::Mutex::new(Vec::<Vec<Value>>::new()));
+        out.push(Arc::new(move |row: &[Value]| {
+            {
+                let pending_rows = pending.lock();
+                for existing in pending_rows.iter() {
+                    if exclusion_rows_conflict(&constraint, row, existing)? {
+                        return Err(ultrasql_executor::ExecError::ExclusionViolation(
+                            constraint.name.clone(),
+                        ));
+                    }
+                }
+            }
+            if relation_has_exclusion_conflict(
+                &heap,
+                &table,
+                &constraint,
+                row,
+                None,
+                &snapshot,
+                &oracle,
+            )? {
+                return Err(ultrasql_executor::ExecError::ExclusionViolation(
+                    constraint.name.clone(),
+                ));
+            }
+            pending.lock().push(row.to_vec());
+            Ok(())
+        }) as RowConstraintCheck);
+    }
+    Ok(out)
+}
+
+fn build_exclusion_update_checks(
+    table: &TableEntry,
+    exclusions: &[crate::RuntimeExclusionConstraint],
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<RowUpdateConstraintCheck>, ServerError> {
+    let mut out = Vec::with_capacity(exclusions.len());
+    for exclusion in exclusions {
+        let heap = Arc::clone(&ctx.heap);
+        let snapshot = ctx.snapshot.clone();
+        let oracle = Arc::clone(&ctx.oracle);
+        let table = table.clone();
+        let constraint = exclusion.clone();
+        out.push(Arc::new(move |old_row: &[Value], new_row: &[Value]| {
+            if exclusion_key_unchanged(&constraint, old_row, new_row) {
+                return Ok(());
+            }
+            if relation_has_exclusion_conflict(
+                &heap,
+                &table,
+                &constraint,
+                new_row,
+                Some(old_row),
+                &snapshot,
+                &oracle,
+            )? {
+                return Err(ultrasql_executor::ExecError::ExclusionViolation(
+                    constraint.name.clone(),
+                ));
+            }
+            Ok(())
+        }) as RowUpdateConstraintCheck);
+    }
+    Ok(out)
+}
+
 fn build_referenced_by_delete_checks(
     parent_oid: ultrasql_core::Oid,
     ctx: &LowerCtx<'_>,
@@ -342,6 +426,103 @@ fn build_referenced_by_delete_checks(
         }
     }
     Ok(out)
+}
+
+fn relation_has_exclusion_conflict(
+    heap: &ultrasql_storage::heap::HeapAccess<crate::BlankPageLoader>,
+    table: &TableEntry,
+    constraint: &crate::RuntimeExclusionConstraint,
+    row: &[Value],
+    skip_row: Option<&[Value]>,
+    snapshot: &ultrasql_mvcc::Snapshot,
+    oracle: &ultrasql_txn::TransactionManager,
+) -> Result<bool, ultrasql_executor::ExecError> {
+    let relation = RelationId(table.oid);
+    let block_count = heap.block_count(relation).max(table.n_blocks);
+    let codec = RowCodec::new(table.schema.clone());
+    for tuple in heap.scan_visible(relation, block_count, snapshot, oracle) {
+        let tuple = tuple.map_err(|e| ultrasql_executor::ExecError::TypeMismatch(e.to_string()))?;
+        let existing = codec
+            .decode(&tuple.data)
+            .map_err(|e| ultrasql_executor::ExecError::TypeMismatch(e.to_string()))?;
+        if skip_row.is_some_and(|skip| skip == existing.as_slice()) {
+            continue;
+        }
+        if exclusion_rows_conflict(constraint, row, &existing)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn exclusion_key_unchanged(
+    constraint: &crate::RuntimeExclusionConstraint,
+    old_row: &[Value],
+    new_row: &[Value],
+) -> bool {
+    constraint
+        .elements
+        .iter()
+        .all(|element| old_row.get(element.column) == new_row.get(element.column))
+}
+
+fn exclusion_rows_conflict(
+    constraint: &crate::RuntimeExclusionConstraint,
+    left: &[Value],
+    right: &[Value],
+) -> Result<bool, ultrasql_executor::ExecError> {
+    for element in &constraint.elements {
+        let Some(left_value) = left.get(element.column) else {
+            return Err(ultrasql_executor::ExecError::TypeMismatch(format!(
+                "exclusion constraint {} references missing column {}",
+                constraint.name, element.column
+            )));
+        };
+        let Some(right_value) = right.get(element.column) else {
+            return Err(ultrasql_executor::ExecError::TypeMismatch(format!(
+                "exclusion constraint {} references missing column {}",
+                constraint.name, element.column
+            )));
+        };
+        if matches!(
+            (left_value, right_value),
+            (Value::Null, _) | (_, Value::Null)
+        ) {
+            return Ok(false);
+        }
+        if !exclusion_operator_matches(element.op, left_value, right_value)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn exclusion_operator_matches(
+    op: BinaryOp,
+    left: &Value,
+    right: &Value,
+) -> Result<bool, ultrasql_executor::ExecError> {
+    match op {
+        BinaryOp::Eq => Ok(left == right),
+        BinaryOp::Overlap => match (left, right) {
+            (Value::Range(l), Value::Range(r)) => Ok(l.overlaps(r)),
+            (Value::Geometry(l), Value::Geometry(r)) => Ok(l.overlaps(r)),
+            _ => Ok(false),
+        },
+        BinaryOp::JsonContains => match (left, right) {
+            (Value::Range(l), Value::Range(r)) => Ok(l.contains_range(r)),
+            (Value::Geometry(l), Value::Geometry(r)) => Ok(l.contains_geometry(r)),
+            _ => Ok(false),
+        },
+        BinaryOp::JsonContained => match (left, right) {
+            (Value::Range(l), Value::Range(r)) => Ok(r.contains_range(l)),
+            (Value::Geometry(l), Value::Geometry(r)) => Ok(r.contains_geometry(l)),
+            _ => Ok(false),
+        },
+        other => Err(ultrasql_executor::ExecError::TypeMismatch(format!(
+            "unsupported exclusion operator {other:?}"
+        ))),
+    }
 }
 
 fn build_referenced_by_update_checks(
@@ -1274,6 +1455,7 @@ pub(super) fn lower_real_update(
         c.generated_stored.iter().any(Option::is_some)
             || !c.checks.is_empty()
             || !c.foreign_keys.is_empty()
+            || !c.exclusion_constraints.is_empty()
     });
     let has_parent_constraints = !build_referenced_by_update_checks(entry.oid, ctx)?.is_empty();
 
@@ -1324,6 +1506,11 @@ pub(super) fn lower_real_update(
                     .collect(),
             )
             .with_foreign_key_checks(build_foreign_key_checks(&constraints.foreign_keys, ctx)?)
+            .with_exclusion_update_checks(build_exclusion_update_checks(
+                entry,
+                &constraints.exclusion_constraints,
+                ctx,
+            )?)
     } else {
         modify
     };

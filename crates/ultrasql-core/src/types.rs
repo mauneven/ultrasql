@@ -13,6 +13,71 @@ use std::fmt;
 
 use crate::error::{Error, Result};
 
+/// PostgreSQL range type families supported by the v0.8 GiST operator
+/// surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RangeType {
+    /// `int4range`.
+    Int4,
+    /// `int8range`.
+    Int8,
+    /// `numrange`.
+    Num,
+    /// `daterange`.
+    Date,
+    /// `tsrange`.
+    Timestamp,
+    /// `tstzrange`.
+    TimestampTz,
+}
+
+impl fmt::Display for RangeType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Int4 => "int4range",
+            Self::Int8 => "int8range",
+            Self::Num => "numrange",
+            Self::Date => "daterange",
+            Self::Timestamp => "tsrange",
+            Self::TimestampTz => "tstzrange",
+        })
+    }
+}
+
+/// PostgreSQL geometric type families supported by the v0.8 GiST
+/// operator surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GeometryType {
+    /// `point`.
+    Point,
+    /// `box`.
+    Box,
+    /// `circle`.
+    Circle,
+    /// `line`.
+    Line,
+    /// `lseg`.
+    Lseg,
+    /// `path`.
+    Path,
+    /// `polygon`.
+    Polygon,
+}
+
+impl fmt::Display for GeometryType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Point => "point",
+            Self::Box => "box",
+            Self::Circle => "circle",
+            Self::Line => "line",
+            Self::Lseg => "lseg",
+            Self::Path => "path",
+            Self::Polygon => "polygon",
+        })
+    }
+}
+
 /// Logical SQL type.
 ///
 /// Mirrors the PostgreSQL type family hierarchy in shape, but is
@@ -77,6 +142,12 @@ pub enum DataType {
 
     /// JSON-binary (JSONB-compatible).
     Jsonb,
+
+    /// PostgreSQL range value family.
+    Range(RangeType),
+
+    /// PostgreSQL geometric value family.
+    Geometry(GeometryType),
 
     /// A fixed-length array of any [`DataType`].
     Array(Box<Self>),
@@ -230,6 +301,8 @@ impl fmt::Display for DataType {
             Self::Interval => f.write_str("interval"),
             Self::Uuid => f.write_str("uuid"),
             Self::Jsonb => f.write_str("jsonb"),
+            Self::Range(range_type) => write!(f, "{range_type}"),
+            Self::Geometry(geometry_type) => write!(f, "{geometry_type}"),
             Self::Array(inner) => write!(f, "{inner}[]"),
             Self::Record(fields) => {
                 f.write_str("record(")?;

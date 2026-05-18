@@ -233,6 +233,13 @@ pub enum ExecError {
     #[error("foreign key constraint \"{0}\" would be violated")]
     ForeignKeyViolation(String),
 
+    /// An EXCLUDE constraint found a conflicting existing row.
+    ///
+    /// The string carries the constraint name. The server maps this to
+    /// PostgreSQL SQLSTATE `23P01` (`exclusion_violation`).
+    #[error("conflicting key value violates exclusion constraint \"{0}\"")]
+    ExclusionViolation(String),
+
     /// An INSERT supplied an explicit value for a `GENERATED ALWAYS AS
     /// IDENTITY` column. The server maps this to PostgreSQL SQLSTATE
     /// `428C9` (`generated_always`).

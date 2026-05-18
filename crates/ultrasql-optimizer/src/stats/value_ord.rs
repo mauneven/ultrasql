@@ -55,6 +55,12 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Ordering {
         | (Value::Timestamp(la), Value::Timestamp(lb))
         | (Value::TimestampTz(la), Value::TimestampTz(lb)) => la.cmp(lb),
         (Value::Uuid(la), Value::Uuid(lb)) => la.cmp(lb),
+        (Value::Range(la), Value::Range(lb)) if la.range_type == lb.range_type => {
+            la.to_string().cmp(&lb.to_string())
+        }
+        (Value::Geometry(la), Value::Geometry(lb)) if la.geometry_type == lb.geometry_type => {
+            la.to_string().cmp(&lb.to_string())
+        }
 
         // Cross-type fallback: order by discriminant.
         _ => discriminant(a).cmp(&discriminant(b)),
@@ -160,6 +166,16 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             out.extend_from_slice(&microseconds.to_be_bytes());
             out
         }
+        Value::Range(v) => {
+            let mut out = vec![16];
+            out.extend_from_slice(v.to_string().as_bytes());
+            out
+        }
+        Value::Geometry(v) => {
+            let mut out = vec![17];
+            out.extend_from_slice(v.to_string().as_bytes());
+            out
+        }
     }
 }
 
@@ -207,6 +223,8 @@ const fn discriminant(v: &Value) -> u8 {
         Value::Uuid(_) => 13,
         Value::Decimal { .. } => 14,
         Value::Interval { .. } => 15,
+        Value::Range(_) => 16,
+        Value::Geometry(_) => 17,
     }
 }
 

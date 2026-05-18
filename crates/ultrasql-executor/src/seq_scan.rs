@@ -1001,15 +1001,26 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 };
                 Column::Float64(col)
             }
-            DataType::Text { .. } => {
+            DataType::Text { .. } | DataType::Range(_) | DataType::Geometry(_) => {
                 let mut strings: Vec<Option<String>> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
-                    match &row[col_idx] {
-                        Value::Text(s) => strings.push(Some(s.clone())),
-                        Value::Null => strings.push(None),
-                        other => {
+                    match (&field.data_type, &row[col_idx]) {
+                        (DataType::Text { .. }, Value::Text(s)) => strings.push(Some(s.clone())),
+                        (DataType::Range(expected), Value::Range(v))
+                            if expected == &v.range_type =>
+                        {
+                            strings.push(Some(v.to_string()));
+                        }
+                        (DataType::Geometry(expected), Value::Geometry(v))
+                            if expected == &v.geometry_type =>
+                        {
+                            strings.push(Some(v.to_string()));
+                        }
+                        (_, Value::Null) => strings.push(None),
+                        (_, other) => {
                             return Err(ExecError::TypeMismatch(format!(
-                                "expected Text at row {row_idx} col {col_idx}, got {:?}",
+                                "expected {} at row {row_idx} col {col_idx}, got {:?}",
+                                field.data_type,
                                 other.data_type()
                             )));
                         }

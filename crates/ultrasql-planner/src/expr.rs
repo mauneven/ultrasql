@@ -340,6 +340,7 @@ const fn display_binary(op: BinaryOp) -> &'static str {
         BinaryOp::JsonGetPathText => "#>>",
         BinaryOp::JsonContains => "@>",
         BinaryOp::JsonContained => "<@",
+        BinaryOp::Overlap => "&&",
         BinaryOp::JsonHasKey => "?",
         BinaryOp::JsonHasAnyKey => "?|",
         BinaryOp::JsonHasAllKeys => "?&",

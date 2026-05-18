@@ -221,6 +221,8 @@ impl ServerError {
             Self::Execute(ultrasql_executor::ExecError::UniqueViolation(_)) => "23505",
             // FOREIGN KEY violation surfaced by DML constraint checks.
             Self::Execute(ultrasql_executor::ExecError::ForeignKeyViolation(_)) => "23503",
+            // EXCLUDE constraint violation surfaced by DML constraint checks.
+            Self::Execute(ultrasql_executor::ExecError::ExclusionViolation(_)) => "23P01",
             // generated_always — explicit INSERT value for a GENERATED
             // ALWAYS identity column.
             Self::Execute(ultrasql_executor::ExecError::GeneratedAlwaysViolation(_)) => "428C9",

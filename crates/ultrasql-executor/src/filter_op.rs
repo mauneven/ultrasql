@@ -27,7 +27,7 @@
 //! workloads land on the fast path.
 
 use num_traits::ToPrimitive;
-use ultrasql_core::{DataType, Schema, Value};
+use ultrasql_core::{DataType, GeometryValue, RangeValue, Schema, Value};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
@@ -628,7 +628,9 @@ fn build_empty_batch(schema: &Schema) -> Result<Batch, ExecError> {
             | DataType::TimestampTz => Column::Int64(NumericColumn::from_data(vec![])),
             DataType::Float32 => Column::Float32(NumericColumn::from_data(vec![])),
             DataType::Float64 => Column::Float64(NumericColumn::from_data(vec![])),
-            DataType::Text { .. } => Column::Utf8(StringColumn::from_data(vec![])),
+            DataType::Text { .. } | DataType::Range(_) | DataType::Geometry(_) => {
+                Column::Utf8(StringColumn::from_data(vec![]))
+            }
             // For Int32 and any other type, fall back to an Int32 column.
             // In practice the binder only produces the above types at v0.5.
             _ => Column::Int32(NumericColumn::from_data(vec![])),
@@ -743,6 +745,41 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                 for (row_idx, row) in rows.iter_mut().enumerate() {
                     match col.text_value(row_idx) {
                         Some(v) => row.push(Value::Text(v.to_owned())),
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Range(range_type)) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => {
+                            let range = RangeValue::parse(*range_type, v).ok_or_else(|| {
+                                ExecError::TypeMismatch(format!(
+                                    "column {col_idx} ({name}): invalid {expected_type} literal",
+                                    name = field.name,
+                                    expected_type = field.data_type,
+                                ))
+                            })?;
+                            row.push(Value::Range(range));
+                        }
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Geometry(geometry_type)) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => {
+                            let geometry =
+                                GeometryValue::parse(*geometry_type, v).ok_or_else(|| {
+                                    ExecError::TypeMismatch(format!(
+                                        "column {col_idx} ({name}): invalid {expected_type} literal",
+                                        name = field.name,
+                                        expected_type = field.data_type,
+                                    ))
+                                })?;
+                            row.push(Value::Geometry(geometry));
+                        }
                         None => row.push(Value::Null),
                     }
                 }

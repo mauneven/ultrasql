@@ -11,7 +11,7 @@
 //! directly into a parallel slice of [`ColumnBuilder`]s, skipping the
 //! `Vec<Value>` row intermediate.
 
-use ultrasql_core::{DataType, Schema, Value};
+use ultrasql_core::{DataType, GeometryValue, RangeValue, Schema, Value};
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
 use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
@@ -383,6 +383,14 @@ impl RowCodec {
                     payload.extend_from_slice(&len.to_le_bytes());
                     payload.extend_from_slice(bytes);
                 }
+                (DataType::Range(expected), Value::Range(v)) if expected == &v.range_type => {
+                    encode_varlena_text(&mut payload, &v.to_string(), col_idx, &field.data_type)?;
+                }
+                (DataType::Geometry(expected), Value::Geometry(v))
+                    if expected == &v.geometry_type =>
+                {
+                    encode_varlena_text(&mut payload, &v.to_string(), col_idx, &field.data_type)?;
+                }
                 (DataType::Null, _) => {
                     return Err(RowCodecError::Type {
                         column: col_idx,
@@ -631,6 +639,26 @@ impl RowCodec {
                     cursor += str_len;
                     Value::Text(s)
                 }
+                DataType::Range(range_type) => {
+                    let s = decode_varlena_text(bytes, &mut cursor, "range column")?;
+                    Value::Range(RangeValue::parse(*range_type, &s).ok_or_else(|| {
+                        RowCodecError::Type {
+                            column: col_idx,
+                            expected: field.data_type.clone(),
+                            got: "invalid range literal".to_owned(),
+                        }
+                    })?)
+                }
+                DataType::Geometry(geometry_type) => {
+                    let s = decode_varlena_text(bytes, &mut cursor, "geometry column")?;
+                    Value::Geometry(GeometryValue::parse(*geometry_type, &s).ok_or_else(|| {
+                        RowCodecError::Type {
+                            column: col_idx,
+                            expected: field.data_type.clone(),
+                            got: "invalid geometry literal".to_owned(),
+                        }
+                    })?)
+                }
                 DataType::Null => {
                     return Err(RowCodecError::UnsupportedType {
                         column: col_idx,
@@ -858,7 +886,7 @@ impl RowCodec {
                     nulls.push_valid();
                 }
                 (
-                    DataType::Text { .. },
+                    DataType::Text { .. } | DataType::Range(_) | DataType::Geometry(_),
                     ColumnBuilder::Utf8 {
                         offsets,
                         values,
@@ -1092,7 +1120,7 @@ impl ColumnBuilder {
                 data: Vec::with_capacity(capacity),
                 nulls: NullTracker::default(),
             },
-            DataType::Text { .. } => Self::Utf8 {
+            DataType::Text { .. } | DataType::Range(_) | DataType::Geometry(_) => Self::Utf8 {
                 offsets: {
                     let mut o = Vec::with_capacity(capacity + 1);
                     o.push(0);
@@ -1243,8 +1271,61 @@ const fn is_supported_type(ty: &DataType) -> bool {
             | DataType::Timestamp
             | DataType::TimestampTz
             | DataType::Decimal { .. }
+            | DataType::Range(_)
+            | DataType::Geometry(_)
             | DataType::Null
     )
+}
+
+fn encode_varlena_text(
+    payload: &mut Vec<u8>,
+    text: &str,
+    column: usize,
+    ty: &DataType,
+) -> Result<(), RowCodecError> {
+    let bytes = text.as_bytes();
+    let len = u32::try_from(bytes.len()).map_err(|_| RowCodecError::UnsupportedType {
+        column,
+        ty: ty.clone(),
+    })?;
+    payload.extend_from_slice(&len.to_le_bytes());
+    payload.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn decode_varlena_text(
+    bytes: &[u8],
+    cursor: &mut usize,
+    context: &'static str,
+) -> Result<String, RowCodecError> {
+    let len_end = *cursor + 4;
+    if bytes.len() < len_end {
+        return Err(RowCodecError::Truncated {
+            needed: len_end,
+            have: bytes.len(),
+        });
+    }
+    let len_raw: [u8; 4] =
+        bytes[*cursor..*cursor + 4]
+            .try_into()
+            .map_err(|_| RowCodecError::Truncated {
+                needed: len_end,
+                have: bytes.len(),
+            })?;
+    let str_len =
+        usize::try_from(u32::from_le_bytes(len_raw)).expect("u32 fits in usize on all targets");
+    *cursor += 4;
+    let str_end = *cursor + str_len;
+    if bytes.len() < str_end {
+        return Err(RowCodecError::Truncated {
+            needed: str_end,
+            have: bytes.len(),
+        });
+    }
+    let s = String::from_utf8(bytes[*cursor..str_end].to_vec())
+        .map_err(|e| RowCodecError::InvalidUtf8(e, context))?;
+    *cursor = str_end;
+    Ok(s)
 }
 
 /// Errors raised by [`RowCodec`].

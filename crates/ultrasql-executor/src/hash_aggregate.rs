@@ -137,6 +137,14 @@ fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
             days.hash(state);
             microseconds.hash(state);
         }
+        Value::Range(v) => {
+            state.write_u8(14);
+            v.hash(state);
+        }
+        Value::Geometry(v) => {
+            state.write_u8(15);
+            v.hash(state);
+        }
     }
 }
 

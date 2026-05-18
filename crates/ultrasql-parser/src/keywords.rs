@@ -85,6 +85,7 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("escape", TokenKind::KwEscape),
         ("except", TokenKind::KwExcept),
         ("exists", TokenKind::KwExists),
+        ("exclude", TokenKind::KwExclude),
         ("explain", TokenKind::KwExplain),
         ("false", TokenKind::KwFalse),
         ("fetch", TokenKind::KwFetch),

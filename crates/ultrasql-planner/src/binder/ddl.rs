@@ -7,7 +7,7 @@
 //! `resolve_column_nullability`, `synthesise_index_name`) stay
 //! private to this module.
 
-use ultrasql_core::{DataType, Field, Schema};
+use ultrasql_core::{DataType, Field, GeometryType, RangeType, Schema};
 use ultrasql_parser::ast::{
     AlterSequenceStmt, AlterTableAction, AlterTableStmt, ColumnConstraint, CommentStmt,
     CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat, CopyOption,
@@ -24,8 +24,9 @@ use super::{
 };
 use crate::plan::{
     CopyDirection, CopyFormat, CopySource, LogicalCheckConstraint, LogicalCommentTarget,
-    LogicalForeignKeyConstraint, LogicalIndexMethod, LogicalReferentialAction,
-    LogicalSequenceChange, LogicalSequenceOptions, LogicalUniqueConstraint,
+    LogicalExclusionConstraint, LogicalExclusionElement, LogicalForeignKeyConstraint,
+    LogicalIndexMethod, LogicalReferentialAction, LogicalSequenceChange, LogicalSequenceOptions,
+    LogicalUniqueConstraint,
 };
 
 struct RawUniqueConstraint {
@@ -50,6 +51,17 @@ struct RawForeignKeyConstraint {
     initially_deferred: bool,
 }
 
+struct RawExclusionConstraint {
+    name: String,
+    method: LogicalIndexMethod,
+    elements: Vec<RawExclusionElement>,
+}
+
+struct RawExclusionElement {
+    column: String,
+    op: ultrasql_parser::ast::BinaryOp,
+}
+
 pub(super) fn bind_create_table(
     s: &CreateTableStmt,
     catalog: &dyn Catalog,
@@ -72,6 +84,7 @@ pub(super) fn bind_create_table(
     let mut raw_checks: Vec<RawCheckConstraint<'_>> = Vec::new();
     let mut raw_uniques: Vec<RawUniqueConstraint> = Vec::new();
     let mut raw_foreign_keys: Vec<RawForeignKeyConstraint> = Vec::new();
+    let mut raw_exclusions: Vec<RawExclusionConstraint> = Vec::new();
     let mut primary_key_seen = false;
     for col in &s.columns {
         let name = col.name.value.clone();
@@ -163,6 +176,7 @@ pub(super) fn bind_create_table(
         &mut raw_checks,
         &mut raw_uniques,
         &mut raw_foreign_keys,
+        &mut raw_exclusions,
         &mut primary_key_seen,
     )?;
     for raw in &raw_uniques {
@@ -256,6 +270,7 @@ pub(super) fn bind_create_table(
     }
     let unique_constraints = bind_unique_constraints(&columns, raw_uniques)?;
     let foreign_keys = bind_foreign_key_constraints(&columns, raw_foreign_keys, catalog)?;
+    let exclusion_constraints = bind_exclusion_constraints(&columns, raw_exclusions)?;
     Ok(LogicalPlan::CreateTable {
         table_name,
         namespace,
@@ -268,6 +283,7 @@ pub(super) fn bind_create_table(
         checks,
         unique_constraints,
         foreign_keys,
+        exclusion_constraints,
         if_not_exists: s.if_not_exists,
         schema: Schema::empty(),
     })
@@ -402,6 +418,7 @@ fn collect_table_constraints<'a>(
     checks: &mut Vec<RawCheckConstraint<'a>>,
     uniques: &mut Vec<RawUniqueConstraint>,
     foreign_keys: &mut Vec<RawForeignKeyConstraint>,
+    exclusions: &mut Vec<RawExclusionConstraint>,
     primary_key_seen: &mut bool,
 ) -> Result<(), PlanError> {
     let mut check_ordinal = checks.len();
@@ -476,9 +493,105 @@ fn collect_table_constraints<'a>(
                     initially_deferred: *initially_deferred,
                 });
             }
+            TableConstraint::Exclude {
+                name,
+                method,
+                elements,
+                ..
+            } => {
+                let method = bind_index_method(&method.value)?;
+                if method != LogicalIndexMethod::Gist {
+                    return Err(PlanError::NotSupported(
+                        "EXCLUDE constraints currently require USING gist",
+                    ));
+                }
+                let exclusion_ordinal = exclusions.len() + 1;
+                exclusions.push(RawExclusionConstraint {
+                    name: named_or(name.as_ref(), || {
+                        format!("{table}_excl_{exclusion_ordinal}")
+                    }),
+                    method,
+                    elements: elements
+                        .iter()
+                        .map(|element| RawExclusionElement {
+                            column: element.column.value.to_ascii_lowercase(),
+                            op: element.op,
+                        })
+                        .collect(),
+                });
+            }
         }
     }
     Ok(())
+}
+
+fn bind_exclusion_constraints(
+    schema: &Schema,
+    raw_exclusions: Vec<RawExclusionConstraint>,
+) -> Result<Vec<LogicalExclusionConstraint>, PlanError> {
+    let mut out = Vec::with_capacity(raw_exclusions.len());
+    for raw in raw_exclusions {
+        if raw.elements.is_empty() {
+            return Err(PlanError::NotSupported(
+                "CREATE TABLE: empty EXCLUDE element list",
+            ));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(raw.elements.len());
+        let mut elements = Vec::with_capacity(raw.elements.len());
+        for element in raw.elements {
+            if !seen.insert(element.column.clone()) {
+                return Err(PlanError::DuplicateColumn(element.column));
+            }
+            let (idx, field) = schema
+                .find(&element.column)
+                .ok_or_else(|| PlanError::ColumnNotFound(element.column.clone()))?;
+            validate_exclusion_operator(&raw.name, &field.data_type, element.op)?;
+            elements.push(LogicalExclusionElement {
+                column: idx,
+                op: element.op,
+            });
+        }
+        out.push(LogicalExclusionConstraint {
+            name: raw.name,
+            method: raw.method,
+            elements,
+        });
+    }
+    Ok(out)
+}
+
+fn validate_exclusion_operator(
+    name: &str,
+    data_type: &DataType,
+    op: ultrasql_parser::ast::BinaryOp,
+) -> Result<(), PlanError> {
+    match op {
+        ultrasql_parser::ast::BinaryOp::Eq => Ok(()),
+        ultrasql_parser::ast::BinaryOp::Overlap
+        | ultrasql_parser::ast::BinaryOp::JsonContains
+        | ultrasql_parser::ast::BinaryOp::JsonContained
+            if matches!(data_type, DataType::Range(_) | DataType::Geometry(_)) =>
+        {
+            Ok(())
+        }
+        _ => Err(PlanError::TypeMismatch(format!(
+            "EXCLUDE constraint '{name}' operator {} is not supported for {data_type}",
+            super::expr_type::display_binary(op),
+        ))),
+    }
+}
+
+fn bind_index_method(method: &str) -> Result<LogicalIndexMethod, PlanError> {
+    match method.to_ascii_lowercase().as_str() {
+        "btree" => Ok(LogicalIndexMethod::Btree),
+        "hash" => Ok(LogicalIndexMethod::Hash),
+        "gin" => Ok(LogicalIndexMethod::Gin),
+        "gist" => Ok(LogicalIndexMethod::Gist),
+        "brin" => Ok(LogicalIndexMethod::Brin),
+        _ => Err(PlanError::NotSupported(
+            "only btree, hash, gin, gist, and brin methods are supported",
+        )),
+    }
 }
 
 fn bind_unique_constraints(
@@ -703,6 +816,19 @@ fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
         "time" => Ok(DataType::Time),
         "timestamp" => Ok(DataType::Timestamp),
         "timestamptz" | "timestamp with time zone" => Ok(DataType::TimestampTz),
+        "int4range" => Ok(DataType::Range(RangeType::Int4)),
+        "int8range" => Ok(DataType::Range(RangeType::Int8)),
+        "numrange" => Ok(DataType::Range(RangeType::Num)),
+        "daterange" => Ok(DataType::Range(RangeType::Date)),
+        "tsrange" => Ok(DataType::Range(RangeType::Timestamp)),
+        "tstzrange" => Ok(DataType::Range(RangeType::TimestampTz)),
+        "point" => Ok(DataType::Geometry(GeometryType::Point)),
+        "box" => Ok(DataType::Geometry(GeometryType::Box)),
+        "circle" => Ok(DataType::Geometry(GeometryType::Circle)),
+        "line" => Ok(DataType::Geometry(GeometryType::Line)),
+        "lseg" => Ok(DataType::Geometry(GeometryType::Lseg)),
+        "path" => Ok(DataType::Geometry(GeometryType::Path)),
+        "polygon" => Ok(DataType::Geometry(GeometryType::Polygon)),
         _ => Err(PlanError::NotSupported(
             "CREATE TABLE: column type not implemented in v0.5",
         )),

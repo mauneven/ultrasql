@@ -647,6 +647,7 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
             | BinaryOp::JsonGetPathText
             | BinaryOp::JsonContains
             | BinaryOp::JsonContained
+            | BinaryOp::Overlap
             | BinaryOp::JsonHasKey
             | BinaryOp::JsonHasAnyKey
             | BinaryOp::JsonHasAllKeys => return Ok(Value::Null),
@@ -734,16 +735,40 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
         | BinaryOp::JsonGetText
         | BinaryOp::JsonGetPath
         | BinaryOp::JsonGetPathText
-        | BinaryOp::JsonContains
-        | BinaryOp::JsonContained
         | BinaryOp::JsonHasKey
         | BinaryOp::JsonHasAnyKey
         | BinaryOp::JsonHasAllKeys => Err(EvalError::Unsupported("JSON operators")),
+
+        BinaryOp::JsonContains => contains_values(&lv, &rv)
+            .map(Value::Bool)
+            .ok_or(EvalError::Unsupported("JSON operators")),
+        BinaryOp::JsonContained => contains_values(&rv, &lv)
+            .map(Value::Bool)
+            .ok_or(EvalError::Unsupported("JSON operators")),
+        BinaryOp::Overlap => overlaps_values(&lv, &rv)
+            .map(Value::Bool)
+            .ok_or_else(|| EvalError::Type(format!("&& not defined for {lv:?} and {rv:?}"))),
 
         // AND / OR are handled above; unreachable here.
         BinaryOp::And | BinaryOp::Or => {
             unreachable!("AND/OR handled in short-circuit paths")
         }
+    }
+}
+
+fn overlaps_values(left: &Value, right: &Value) -> Option<bool> {
+    match (left, right) {
+        (Value::Range(l), Value::Range(r)) => Some(l.overlaps(r)),
+        (Value::Geometry(l), Value::Geometry(r)) => Some(l.overlaps(r)),
+        _ => None,
+    }
+}
+
+fn contains_values(left: &Value, right: &Value) -> Option<bool> {
+    match (left, right) {
+        (Value::Range(l), Value::Range(r)) => Some(l.contains_range(r)),
+        (Value::Geometry(l), Value::Geometry(r)) => Some(l.contains_geometry(r)),
+        _ => None,
     }
 }
 
@@ -1170,6 +1195,20 @@ fn compare_values(lv: &Value, rv: &Value) -> Result<std::cmp::Ordering, EvalErro
             .ok_or_else(|| EvalError::Type("comparison of NaN is undefined".to_owned())),
         (Value::Text(l), Value::Text(r)) => Ok(l.cmp(r)),
         (Value::Bool(l), Value::Bool(r)) => Ok(l.cmp(r)),
+        (Value::Range(l), Value::Range(r)) if l.range_type == r.range_type => {
+            if l == r {
+                Ok(std::cmp::Ordering::Equal)
+            } else {
+                Ok(l.to_string().cmp(&r.to_string()))
+            }
+        }
+        (Value::Geometry(l), Value::Geometry(r)) if l.geometry_type == r.geometry_type => {
+            if l == r {
+                Ok(std::cmp::Ordering::Equal)
+            } else {
+                Ok(l.to_string().cmp(&r.to_string()))
+            }
+        }
         (
             Value::Decimal {
                 value: lv,

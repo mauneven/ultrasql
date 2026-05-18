@@ -492,6 +492,8 @@ pub enum LogicalPlan {
         unique_constraints: Vec<LogicalUniqueConstraint>,
         /// FOREIGN KEY constraints that should be enforced by DML.
         foreign_keys: Vec<LogicalForeignKeyConstraint>,
+        /// EXCLUDE constraints that should be enforced by DML.
+        exclusion_constraints: Vec<LogicalExclusionConstraint>,
         /// Whether `IF NOT EXISTS` was specified. When true the
         /// executor short-circuits if the relation already exists.
         if_not_exists: bool,
@@ -1021,6 +1023,26 @@ pub struct LogicalForeignKeyConstraint {
     pub initially_deferred: bool,
 }
 
+/// A bound `EXCLUDE USING gist` constraint carried by `CREATE TABLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalExclusionConstraint {
+    /// Constraint name, explicit or binder-synthesised.
+    pub name: String,
+    /// Access method requested by `USING`.
+    pub method: LogicalIndexMethod,
+    /// Column/operator pairs evaluated pairwise against existing rows.
+    pub elements: Vec<LogicalExclusionElement>,
+}
+
+/// One column/operator pair in a bound exclusion constraint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalExclusionElement {
+    /// 0-based table column index.
+    pub column: usize,
+    /// Operator used for pairwise comparison.
+    pub op: ultrasql_parser::ast::BinaryOp,
+}
+
 /// Bound referential action for a foreign key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogicalReferentialAction {
@@ -1513,6 +1535,7 @@ impl LogicalPlan {
                 if_not_exists,
                 checks,
                 unique_constraints,
+                exclusion_constraints,
                 ..
             } => {
                 out.push_str(&pad);
@@ -1549,6 +1572,15 @@ impl LogicalPlan {
                     let _ = fmt::write(
                         out,
                         format_args!("{pad}  {kind}: {} {:?}\n", unique.name, unique.columns),
+                    );
+                }
+                for exclusion in exclusion_constraints {
+                    let _ = fmt::write(
+                        out,
+                        format_args!(
+                            "{pad}  Exclude {:?}: {} {:?}\n",
+                            exclusion.method, exclusion.name, exclusion.elements
+                        ),
                     );
                 }
             }

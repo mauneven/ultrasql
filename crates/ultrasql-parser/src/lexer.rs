@@ -28,7 +28,7 @@
 //!   empty (`$$ ... $$`).
 //! - **Parameters**: `$1`, `$2`, ..., decimal digits only.
 //! - **Operators**: standard arithmetic, comparison, logical, plus
-//!   PostgreSQL idioms (`||`, `->`, `->>`, `#>`, `#>>`, `@>`, `<@`,
+//!   PostgreSQL idioms (`||`, `->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `&&`,
 //!   `~`, `~*`, `!~`, `!~*`).
 
 use crate::keywords;
@@ -622,6 +622,7 @@ impl<'src> Lexer<'src> {
             (b'#', Some(b'>'), _) => two(self, TokenKind::HashArrow),
             (b'@', Some(b'>'), _) => two(self, TokenKind::AtArrow),
             (b'<', Some(b'@'), _) => two(self, TokenKind::ArrowAt),
+            (b'&', Some(b'&'), _) => two(self, TokenKind::Overlap),
             (b':', Some(b':'), _) => two(self, TokenKind::ColonColon),
             (b'?', Some(b'|'), _) => two(self, TokenKind::QuestionPipe),
             (b'?', Some(b'&'), _) => two(self, TokenKind::QuestionAmpersand),

@@ -79,6 +79,7 @@ where
             checks,
             unique_constraints,
             foreign_keys,
+            exclusion_constraints,
             if_not_exists,
             ..
         } = plan
@@ -172,8 +173,26 @@ where
                 })
             })
             .collect::<Result<Vec<_>, ServerError>>()?;
+        let runtime_exclusion_constraints = exclusion_constraints
+            .iter()
+            .map(|constraint| crate::RuntimeExclusionConstraint {
+                name: constraint.name.clone(),
+                method: constraint.method,
+                elements: constraint
+                    .elements
+                    .iter()
+                    .map(|element| crate::RuntimeExclusionElement {
+                        column: element.column,
+                        op: element.op,
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
         let mut persistent_constraint_rows = Vec::with_capacity(
-            unique_constraints.len() + checks.len() + runtime_foreign_keys.len(),
+            unique_constraints.len()
+                + checks.len()
+                + runtime_foreign_keys.len()
+                + runtime_exclusion_constraints.len(),
         );
         for unique in unique_constraints {
             persistent_constraint_rows.push(ultrasql_catalog::persistent::ConstraintRow {
@@ -218,12 +237,31 @@ where
                 confkey: constraint_attnums(&fk.target_columns, &fk.name)?,
             });
         }
+        for exclusion in &runtime_exclusion_constraints {
+            let columns = exclusion
+                .elements
+                .iter()
+                .map(|element| element.column)
+                .collect::<Vec<_>>();
+            persistent_constraint_rows.push(ultrasql_catalog::persistent::ConstraintRow {
+                oid: self.state.persistent_catalog.next_oid(),
+                conname: exclusion.name.clone(),
+                conrelid: oid,
+                contype: ultrasql_catalog::persistent::ConType::Exclusion,
+                condeferrable: false,
+                condeferred: false,
+                conkey: constraint_attnums(&columns, &exclusion.name)?,
+                confrelid: ultrasql_core::Oid::INVALID,
+                confkey: Vec::new(),
+            });
+        }
         if defaults.iter().any(Option::is_some)
             || sequence_defaults.iter().any(Option::is_some)
             || identity_always.iter().any(|v| *v)
             || generated_stored.iter().any(Option::is_some)
             || !checks.is_empty()
             || !runtime_foreign_keys.is_empty()
+            || !runtime_exclusion_constraints.is_empty()
         {
             self.state.table_constraints.insert(
                 oid,
@@ -240,6 +278,7 @@ where
                         })
                         .collect(),
                     foreign_keys: runtime_foreign_keys.clone(),
+                    exclusion_constraints: runtime_exclusion_constraints.clone(),
                     indexes: std::collections::HashMap::new(),
                 }),
             );

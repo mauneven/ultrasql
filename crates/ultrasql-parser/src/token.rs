@@ -129,6 +129,8 @@ pub enum TokenKind {
     AtArrow,
     /// `<@` — `contained by`.
     ArrowAt,
+    /// `&&` — overlap.
+    Overlap,
     /// `~`  — POSIX regex match (also unary bitwise NOT in prefix position).
     Tilde,
     /// `!~` — POSIX regex non-match.
@@ -207,6 +209,8 @@ pub enum TokenKind {
     KwExcept,
     KwExists,
     KwExplain,
+    /// `EXCLUDE` — table exclusion constraint.
+    KwExclude,
     KwFalse,
     KwFetch,
     KwFilter,

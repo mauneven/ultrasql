@@ -475,6 +475,28 @@ pub enum TableConstraint {
         /// Source span.
         span: Span,
     },
+    /// `EXCLUDE USING method (col WITH op, ...)`.
+    Exclude {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
+        /// Access method name, normally `gist`.
+        method: Identifier,
+        /// Exclusion elements.
+        elements: Vec<ExclusionElement>,
+        /// Source span.
+        span: Span,
+    },
+}
+
+/// One `column WITH operator` element inside an exclusion constraint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExclusionElement {
+    /// Column participating in exclusion.
+    pub column: Identifier,
+    /// Operator used to compare this column against existing rows.
+    pub op: BinaryOp,
+    /// Source span.
+    pub span: Span,
 }
 
 /// Parsed SQL type name, including optional type modifiers and array suffix.
@@ -1756,6 +1778,8 @@ pub enum BinaryOp {
     JsonHasAnyKey,
     /// `?&` — JSONB has all of the given keys.
     JsonHasAllKeys,
+    /// `&&` — range/geometric overlap.
+    Overlap,
 }
 
 impl BinaryOp {
@@ -1804,6 +1828,7 @@ impl BinaryOp {
             | Self::JsonGetPathText
             | Self::JsonContains
             | Self::JsonContained
+            | Self::Overlap
             | Self::JsonHasKey
             | Self::JsonHasAnyKey
             | Self::JsonHasAllKeys

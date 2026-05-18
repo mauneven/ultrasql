@@ -12,8 +12,8 @@
 //! - [`Parser::parse_ddl_type_name`] — a typed `TypeName` with modifiers
 
 use crate::ast::{
-    ColumnConstraint, ColumnDef, CreateTableAsStmt, CreateTableStmt, Identifier, ObjectName,
-    ReferentialAction, TableConstraint, TypeName,
+    BinaryOp, ColumnConstraint, ColumnDef, CreateTableAsStmt, CreateTableStmt, ExclusionElement,
+    Identifier, ObjectName, ReferentialAction, TableConstraint, TypeName,
 };
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
@@ -244,6 +244,7 @@ impl Parser<'_> {
                     | TokenKind::KwUnique
                     | TokenKind::KwForeign
                     | TokenKind::KwCheck
+                    | TokenKind::KwExclude
             ) {
                 constraints.push(self.parse_table_constraint()?);
             } else {
@@ -506,12 +507,71 @@ impl Parser<'_> {
                     span: Span::new(start, rp.span.end),
                 })
             }
+            TokenKind::KwExclude => {
+                self.advance()?; // EXCLUDE
+                self.expect(TokenKind::KwUsing, "USING")?;
+                let method = self.parse_identifier()?;
+                self.expect(TokenKind::LParen, "(")?;
+                let mut elements = Vec::new();
+                loop {
+                    let col_start = self.peek()?.span.start;
+                    let column = self.parse_identifier()?;
+                    self.expect(TokenKind::KwWith, "WITH")?;
+                    let op = self.parse_exclusion_operator()?;
+                    let end = self.peek()?.span.start;
+                    elements.push(ExclusionElement {
+                        column,
+                        op,
+                        span: Span::new(col_start, end),
+                    });
+                    match self.peek()?.kind {
+                        TokenKind::Comma => {
+                            self.advance()?;
+                        }
+                        TokenKind::RParen => {
+                            let rp = self.advance()?;
+                            return Ok(TableConstraint::Exclude {
+                                name: constraint_name,
+                                method,
+                                elements,
+                                span: Span::new(start, rp.span.end),
+                            });
+                        }
+                        other => {
+                            return Err(ParseError::Expected {
+                                expected: "',' or ')' in EXCLUDE element list",
+                                found: other,
+                                offset: self.peek()?.span.start as usize,
+                            });
+                        }
+                    }
+                }
+            }
             other => Err(ParseError::Expected {
-                expected: "PRIMARY KEY, UNIQUE, FOREIGN KEY, or CHECK",
+                expected: "PRIMARY KEY, UNIQUE, FOREIGN KEY, CHECK, or EXCLUDE",
                 found: other,
                 offset: self.peek()?.span.start as usize,
             }),
         }
+    }
+
+    fn parse_exclusion_operator(&mut self) -> Result<BinaryOp, ParseError> {
+        let tok = self.peek()?;
+        let op = match tok.kind {
+            TokenKind::Eq => BinaryOp::Eq,
+            TokenKind::Overlap => BinaryOp::Overlap,
+            TokenKind::AtArrow => BinaryOp::JsonContains,
+            TokenKind::ArrowAt => BinaryOp::JsonContained,
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "=, &&, @>, or <@",
+                    found: other,
+                    offset: tok.span.start as usize,
+                });
+            }
+        };
+        self.advance()?;
+        Ok(op)
     }
 
     /// Parse a DDL type name: identifier + optional `(modifiers)` +
@@ -724,6 +784,27 @@ mod tests {
             stmt.table_constraints[1],
             TableConstraint::ForeignKey { name: None, .. }
         ));
+    }
+
+    #[test]
+    fn create_table_parses_exclude_using_gist() {
+        let stmt = parse_create_table(
+            "CREATE TABLE bookings (room int, during int4range, \
+             EXCLUDE USING gist (room WITH =, during WITH &&))",
+        );
+        assert_eq!(stmt.table_constraints.len(), 1);
+        let TableConstraint::Exclude {
+            method, elements, ..
+        } = &stmt.table_constraints[0]
+        else {
+            panic!("expected Exclude, got {:?}", stmt.table_constraints[0]);
+        };
+        assert_eq!(method.value, "gist");
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[0].column.value, "room");
+        assert_eq!(elements[0].op, BinaryOp::Eq);
+        assert_eq!(elements[1].column.value, "during");
+        assert_eq!(elements[1].op, BinaryOp::Overlap);
     }
 
     #[test]

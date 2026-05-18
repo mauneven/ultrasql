@@ -633,7 +633,9 @@ fn value_to_copy_cell_by_value(value: &Value) -> Option<Vec<u8>> {
         }
         Value::Date(v) => Some(v.to_string().into_bytes()),
         Value::Uuid(bytes) => Some(format!("{bytes:x?}").into_bytes()),
-        Value::Decimal { .. } | Value::Interval { .. } => Some(value.to_string().into_bytes()),
+        Value::Decimal { .. } | Value::Interval { .. } | Value::Range(_) | Value::Geometry(_) => {
+            Some(value.to_string().into_bytes())
+        }
     }
 }
 
@@ -676,6 +678,16 @@ fn decode_copy_cell(
         DataType::Date => parse_copy_date(s, column_idx).map(Value::Date),
         DataType::Text { .. } => Ok(Value::Text(s.to_string())),
         DataType::Bytea => Ok(Value::Bytea(bytes.to_vec())),
+        DataType::Range(range_type) => ultrasql_core::RangeValue::parse(*range_type, s)
+            .map(Value::Range)
+            .ok_or_else(|| {
+                ServerError::CopyFormat(format!("column {column_idx}: invalid {dtype} literal"))
+            }),
+        DataType::Geometry(geometry_type) => ultrasql_core::GeometryValue::parse(*geometry_type, s)
+            .map(Value::Geometry)
+            .ok_or_else(|| {
+                ServerError::CopyFormat(format!("column {column_idx}: invalid {dtype} literal"))
+            }),
         other => Err(ServerError::CopyFormat(format!(
             "column {column_idx}: unsupported COPY target type {other}"
         ))),

@@ -22,7 +22,7 @@
 //! followed by zero or more parameter bytes — see
 //! `encode_data_type`.
 
-use ultrasql_core::{DataType, Error as CoreError, Field, Oid, Schema};
+use ultrasql_core::{DataType, Error as CoreError, Field, GeometryType, Oid, RangeType, Schema};
 
 use crate::persistent::{
     AttributeRow, ClassRow, ConType, ConstraintRow, IndexRow, RelKind, SequenceRow,
@@ -227,6 +227,8 @@ const DT_INTERVAL: u8 = 0x0e;
 const DT_UUID: u8 = 0x0f;
 const DT_JSONB: u8 = 0x10;
 const DT_NULL: u8 = 0x11;
+const DT_RANGE: u8 = 0x12;
+const DT_GEOMETRY: u8 = 0x13;
 
 fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError> {
     match ty {
@@ -254,6 +256,14 @@ fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError
         DataType::Uuid => w.u8(DT_UUID),
         DataType::Jsonb => w.u8(DT_JSONB),
         DataType::Null => w.u8(DT_NULL),
+        DataType::Range(range_type) => {
+            w.u8(DT_RANGE);
+            w.u8(encode_range_type(*range_type));
+        }
+        DataType::Geometry(geometry_type) => {
+            w.u8(DT_GEOMETRY);
+            w.u8(encode_geometry_type(*geometry_type));
+        }
         DataType::Array(_) | DataType::Record(_) => {
             return Err(EncodeError::UnsupportedType(ty.clone()));
         }
@@ -290,6 +300,8 @@ fn decode_data_type(r: &mut Reader<'_>) -> Result<DataType, DecodeError> {
         DT_UUID => DataType::Uuid,
         DT_JSONB => DataType::Jsonb,
         DT_NULL => DataType::Null,
+        DT_RANGE => DataType::Range(decode_range_type(r.u8()?)?),
+        DT_GEOMETRY => DataType::Geometry(decode_geometry_type(r.u8()?)?),
         other => {
             return Err(DecodeError::InvalidTag {
                 tag: other,
@@ -297,6 +309,60 @@ fn decode_data_type(r: &mut Reader<'_>) -> Result<DataType, DecodeError> {
             });
         }
     })
+}
+
+const fn encode_range_type(range_type: RangeType) -> u8 {
+    match range_type {
+        RangeType::Int4 => 1,
+        RangeType::Int8 => 2,
+        RangeType::Num => 3,
+        RangeType::Date => 4,
+        RangeType::Timestamp => 5,
+        RangeType::TimestampTz => 6,
+    }
+}
+
+fn decode_range_type(tag: u8) -> Result<RangeType, DecodeError> {
+    match tag {
+        1 => Ok(RangeType::Int4),
+        2 => Ok(RangeType::Int8),
+        3 => Ok(RangeType::Num),
+        4 => Ok(RangeType::Date),
+        5 => Ok(RangeType::Timestamp),
+        6 => Ok(RangeType::TimestampTz),
+        other => Err(DecodeError::InvalidTag {
+            tag: other,
+            offset: 0,
+        }),
+    }
+}
+
+const fn encode_geometry_type(geometry_type: GeometryType) -> u8 {
+    match geometry_type {
+        GeometryType::Point => 1,
+        GeometryType::Box => 2,
+        GeometryType::Circle => 3,
+        GeometryType::Line => 4,
+        GeometryType::Lseg => 5,
+        GeometryType::Path => 6,
+        GeometryType::Polygon => 7,
+    }
+}
+
+fn decode_geometry_type(tag: u8) -> Result<GeometryType, DecodeError> {
+    match tag {
+        1 => Ok(GeometryType::Point),
+        2 => Ok(GeometryType::Box),
+        3 => Ok(GeometryType::Circle),
+        4 => Ok(GeometryType::Line),
+        5 => Ok(GeometryType::Lseg),
+        6 => Ok(GeometryType::Path),
+        7 => Ok(GeometryType::Polygon),
+        other => Err(DecodeError::InvalidTag {
+            tag: other,
+            offset: 0,
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------

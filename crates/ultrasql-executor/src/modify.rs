@@ -370,6 +370,8 @@ pub struct ModifyTable<L: PageLoader> {
     generated_stored: Vec<Option<Eval>>,
     check_constraints: Vec<CheckEvaluator>,
     foreign_key_checks: Vec<RowConstraintCheck>,
+    exclusion_checks: Vec<RowConstraintCheck>,
+    exclusion_update_checks: Vec<RowUpdateConstraintCheck>,
     referenced_by_delete_checks: Vec<RowConstraintCheck>,
     referenced_by_update_checks: Vec<RowUpdateConstraintCheck>,
     returning_evaluators: Vec<Eval>,
@@ -468,6 +470,8 @@ impl<L: PageLoader> ModifyTable<L> {
             generated_stored: Vec::new(),
             check_constraints: Vec::new(),
             foreign_key_checks: Vec::new(),
+            exclusion_checks: Vec::new(),
+            exclusion_update_checks: Vec::new(),
             referenced_by_delete_checks: Vec::new(),
             referenced_by_update_checks: Vec::new(),
             returning_evaluators: Vec::new(),
@@ -573,6 +577,20 @@ impl<L: PageLoader> ModifyTable<L> {
     #[must_use]
     pub fn with_foreign_key_checks(mut self, checks: Vec<RowConstraintCheck>) -> Self {
         self.foreign_key_checks = checks;
+        self
+    }
+
+    /// Attach EXCLUDE checks for rows written by INSERT.
+    #[must_use]
+    pub fn with_exclusion_checks(mut self, checks: Vec<RowConstraintCheck>) -> Self {
+        self.exclusion_checks = checks;
+        self
+    }
+
+    /// Attach EXCLUDE checks for rows written by UPDATE.
+    #[must_use]
+    pub fn with_exclusion_update_checks(mut self, checks: Vec<RowUpdateConstraintCheck>) -> Self {
+        self.exclusion_update_checks = checks;
         self
     }
 
@@ -773,6 +791,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         !returning_active
                             && self.check_constraints.is_empty()
                             && self.foreign_key_checks.is_empty()
+                            && self.exclusion_update_checks.is_empty()
                             && self.referenced_by_update_checks.is_empty()
                     }) {
                         build_update_edits_int32_pair(&batch, self.relation, spec)?
@@ -838,6 +857,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             || !self.identity_always.is_empty()
                             || !self.generated_stored.is_empty()
                             || !self.check_constraints.is_empty()
+                            || !self.exclusion_checks.is_empty()
                         {
                             if let Some(column_map) = &self.insert_column_map {
                                 let expanded =
@@ -854,6 +874,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             self.apply_generated_stored(&mut expanded_row)?;
                             self.check_row_constraints(&expanded_row)?;
                             self.check_foreign_keys(&expanded_row)?;
+                            self.check_exclusions(&expanded_row)?;
                             expanded_row.as_slice()
                         } else {
                             row.as_slice()
@@ -864,6 +885,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             && self.identity_always.is_empty()
                             && self.generated_stored.is_empty()
                             && self.check_constraints.is_empty()
+                            && self.exclusion_checks.is_empty()
                         {
                             self.check_foreign_keys(target_row)?;
                         }
@@ -1069,6 +1091,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         check_not_null_violations(&new_row, self.codec.schema())?;
         self.check_row_constraints(&new_row)?;
         self.check_foreign_keys(&new_row)?;
+        self.check_exclusion_update(orig_row, &new_row)?;
         self.check_referenced_by_update(orig_row, &new_row)?;
         let new_keys = self.encode_update_index_keys(&new_row)?;
 
@@ -1200,6 +1223,24 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
     fn check_foreign_keys(&self, row: &[Value]) -> Result<(), ExecError> {
         for check in &self.foreign_key_checks {
             check(row)?;
+        }
+        Ok(())
+    }
+
+    fn check_exclusions(&self, row: &[Value]) -> Result<(), ExecError> {
+        for check in &self.exclusion_checks {
+            check(row)?;
+        }
+        Ok(())
+    }
+
+    fn check_exclusion_update(
+        &self,
+        old_row: &[Value],
+        new_row: &[Value],
+    ) -> Result<(), ExecError> {
+        for check in &self.exclusion_update_checks {
+            check(old_row, new_row)?;
         }
         Ok(())
     }
