@@ -31,9 +31,9 @@ use ultrasql_bench::tpch::{baseline, data_gen, load, queries, runner, schema};
 // CLI
 // ---------------------------------------------------------------------------
 
-/// TPC-H scale-1 benchmark harness for UltraSQL.
+/// TPC-H benchmark harness for UltraSQL.
 #[derive(Parser, Debug)]
-#[command(name = "tpch", about = "TPC-H scale-1 benchmark harness")]
+#[command(name = "tpch", about = "TPC-H benchmark harness")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -43,7 +43,7 @@ struct Cli {
 enum Cmd {
     /// Print DDL for all 8 TPC-H tables targeting the specified engine.
     InitSchema {
-        /// Target engine: `ultrasql` or `postgres`.
+        /// Target engine: `ultrasql`, `postgres`, or `duckdb`.
         engine: EngineArg,
     },
 
@@ -76,7 +76,7 @@ enum Cmd {
 
     /// Run all 22 TPC-H queries and optionally write a baseline JSON file.
     RunQueries {
-        /// Target engine: `ultrasql` or `postgres`.
+        /// Target engine: `ultrasql`, `postgres`, or `duckdb`.
         engine: EngineArg,
 
         /// Directory containing the `.tbl` files for UltraSQL runs.
@@ -98,6 +98,14 @@ enum Cmd {
         /// PostgreSQL connection string (required when `engine = postgres`).
         #[arg(long, default_value = "host=localhost user=postgres dbname=tpch")]
         pg_dsn: String,
+
+        /// Path to `duckdb` CLI binary (required when `engine = duckdb`).
+        #[arg(long, default_value = "duckdb")]
+        duckdb: PathBuf,
+
+        /// TPC-H scale factor recorded in the output baseline.
+        #[arg(long, default_value_t = 1)]
+        scale: u32,
 
         /// Query selector: `all`, `N`, `A-B`, or comma/space separated list.
         #[arg(long, value_name = "LIST")]
@@ -165,13 +173,27 @@ enum EngineArg {
     Ultrasql,
     /// PostgreSQL.
     Postgres,
+    /// DuckDB.
+    Duckdb,
+}
+
+struct RunQueryOptions<'a> {
+    engine: EngineArg,
+    data_dir: &'a Path,
+    runs: usize,
+    warmup: usize,
+    out: Option<&'a Path>,
+    pg_dsn: &'a str,
+    duckdb_bin: &'a Path,
+    scale: u32,
+    query_selector: Option<&'a str>,
 }
 
 impl EngineArg {
     const fn to_schema_engine(self) -> schema::Engine {
         match self {
             Self::Ultrasql => schema::Engine::Ultrasql,
-            Self::Postgres => schema::Engine::Postgres,
+            Self::Postgres | Self::Duckdb => schema::Engine::Postgres,
         }
     }
 }
@@ -210,16 +232,20 @@ fn run() -> Result<()> {
             warmup,
             out,
             pg_dsn,
+            duckdb,
+            scale,
             queries,
-        } => cmd_run_queries(
+        } => cmd_run_queries(RunQueryOptions {
             engine,
-            &data_dir,
+            data_dir: &data_dir,
             runs,
             warmup,
-            out.as_deref(),
-            &pg_dsn,
-            queries.as_deref(),
-        ),
+            out: out.as_deref(),
+            pg_dsn: &pg_dsn,
+            duckdb_bin: &duckdb,
+            scale,
+            query_selector: queries.as_deref(),
+        }),
         Cmd::ValidateResults {
             data_dir,
             duckdb,
@@ -292,6 +318,7 @@ fn cmd_gen_data(scale: u32, out_dir: &std::path::Path) -> Result<()> {
 fn cmd_load(engine: EngineArg, data_dir: &std::path::Path, pg_dsn: &str) -> Result<()> {
     match engine {
         EngineArg::Postgres => cmd_load_postgres(data_dir, pg_dsn),
+        EngineArg::Duckdb => bail!("DuckDB load is folded into `run-queries duckdb`"),
         EngineArg::Ultrasql => {
             for stats in load::load_ultrasql(data_dir)? {
                 println!(
@@ -335,19 +362,20 @@ fn cmd_load_postgres(_data_dir: &std::path::Path, _pg_dsn: &str) -> Result<()> {
     )
 }
 
-fn cmd_run_queries(
-    engine: EngineArg,
-    data_dir: &std::path::Path,
-    runs: usize,
-    warmup: usize,
-    out: Option<&std::path::Path>,
-    pg_dsn: &str,
-    query_selector: Option<&str>,
-) -> Result<()> {
-    let queries = runner::selected_queries(query_selector)?;
-    let run_result = match engine {
-        EngineArg::Postgres => run_queries_postgres(warmup, runs, pg_dsn, &queries)?,
-        EngineArg::Ultrasql => runner::run_ultrasql(data_dir, warmup, runs, &queries)?,
+fn cmd_run_queries(opts: RunQueryOptions<'_>) -> Result<()> {
+    let queries = runner::selected_queries(opts.query_selector)?;
+    let run_result = match opts.engine {
+        EngineArg::Postgres => run_queries_postgres(opts.warmup, opts.runs, opts.pg_dsn, &queries)?,
+        EngineArg::Duckdb => run_queries_duckdb(
+            opts.data_dir,
+            opts.duckdb_bin,
+            opts.warmup,
+            opts.runs,
+            &queries,
+        )?,
+        EngineArg::Ultrasql => {
+            runner::run_ultrasql(opts.data_dir, opts.warmup, opts.runs, &queries)?
+        }
     };
 
     // Print per-query summary.
@@ -361,8 +389,8 @@ fn cmd_run_queries(
     println!("{:<6}  {:>10.1}  (geometric mean)", "gm", gm);
 
     // Write baseline if requested.
-    if let Some(path) = out {
-        let b = build_baseline(engine, &run_result);
+    if let Some(path) = opts.out {
+        let b = build_baseline(opts.engine, &run_result, opts.scale, Some(opts.duckdb_bin));
         b.write(path)
             .with_context(|| format!("write baseline to {}", path.display()))?;
         println!("Baseline written to {}", path.display());
@@ -420,9 +448,10 @@ fn cmd_compare(
     let queries = runner::selected_queries(query_selector)?;
     let current_run = match engine {
         EngineArg::Postgres => run_queries_postgres(warmup, runs, pg_dsn, &queries)?,
+        EngineArg::Duckdb => bail!("compare against DuckDB baselines via `run-queries duckdb`"),
         EngineArg::Ultrasql => runner::run_ultrasql(data_dir, warmup, runs, &queries)?,
     };
-    let current = build_baseline(engine, &current_run);
+    let current = build_baseline(engine, &current_run, recorded.scale_factor, None);
     baseline::compare(&recorded, &current)
 }
 
@@ -450,6 +479,50 @@ fn run_queries_postgres(
     runner::run_postgres(&mut client, warmup, runs, &rt, queries)
 }
 
+fn run_queries_duckdb(
+    data_dir: &Path,
+    duckdb_bin: &Path,
+    warmup: usize,
+    runs: usize,
+    queries: &[u8],
+) -> Result<runner::RunResult> {
+    use std::time::Instant;
+
+    let tmp = tempfile::tempdir().context("create temporary DuckDB directory")?;
+    let db_path = tmp.path().join("tpch.duckdb");
+    let setup_sql = duckdb_setup_sql(data_dir)?;
+    run_duckdb_sql(duckdb_bin, &db_path, &setup_sql).context("initialize DuckDB timing DB")?;
+
+    let mut timings = Vec::with_capacity(queries.len());
+    for &n in queries {
+        let label = format!("q{n}");
+        let sql = runner::query_sql(n)?;
+        for _ in 0..warmup {
+            run_duckdb_query(duckdb_bin, &db_path, sql.as_ref())
+                .with_context(|| format!("warmup {label}"))?;
+        }
+
+        let mut elapsed_ms = Vec::with_capacity(runs);
+        for _ in 0..runs {
+            let t0 = Instant::now();
+            run_duckdb_query(duckdb_bin, &db_path, sql.as_ref())
+                .with_context(|| format!("run {label}"))?;
+            elapsed_ms.push(t0.elapsed().as_secs_f64() * 1_000.0);
+        }
+
+        timings.push((
+            label,
+            baseline::QueryTimings {
+                median_ms: baseline::median(&elapsed_ms),
+                p95_ms: baseline::p95(&elapsed_ms),
+                runs: elapsed_ms,
+            },
+        ));
+    }
+
+    Ok(runner::RunResult { timings })
+}
+
 #[cfg(not(feature = "pg-runner"))]
 fn run_queries_postgres(
     _warmup: usize,
@@ -465,10 +538,18 @@ fn run_queries_postgres(
 
 /// Builds a [`baseline::Baseline`] from a run result, collecting host info
 /// from `std::env::consts` as a fallback when `sysinfo` is unavailable.
-fn build_baseline(engine: EngineArg, result: &runner::RunResult) -> baseline::Baseline {
+fn build_baseline(
+    engine: EngineArg,
+    result: &runner::RunResult,
+    scale: u32,
+    duckdb_bin: Option<&Path>,
+) -> baseline::Baseline {
     let host = collect_host_descriptor();
     let engine_str = match engine {
         EngineArg::Postgres => "postgres".to_string(),
+        EngineArg::Duckdb => {
+            duckdb_engine_string(duckdb_bin.unwrap_or_else(|| Path::new("duckdb")))
+        }
         EngineArg::Ultrasql => format!("ultrasql@{}", env!("CARGO_PKG_VERSION")),
     };
     let git_commit = option_env!("GIT_COMMIT").unwrap_or("unknown").to_string();
@@ -483,7 +564,7 @@ fn build_baseline(engine: EngineArg, result: &runner::RunResult) -> baseline::Ba
 
     baseline::Baseline {
         schema_version: baseline::SCHEMA_VERSION,
-        scale_factor: 1,
+        scale_factor: scale,
         engine: engine_str,
         host,
         git_commit,
@@ -491,6 +572,22 @@ fn build_baseline(engine: EngineArg, result: &runner::RunResult) -> baseline::Ba
         recorded_at,
         queries: queries_map,
     }
+}
+
+fn duckdb_engine_string(duckdb_bin: &Path) -> String {
+    std::process::Command::new(duckdb_bin)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|output| {
+            if output.status.success() {
+                String::from_utf8(output.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .map(|version| format!("duckdb@{}", version.trim()))
+        .unwrap_or_else(|| "duckdb".to_string())
 }
 
 /// Collects a host descriptor using `std::env::consts` when `sysinfo` is
@@ -573,6 +670,8 @@ fn parse_engine_from_baseline(engine_str: &str) -> Result<EngineArg> {
         Ok(EngineArg::Postgres)
     } else if engine_str.starts_with("ultrasql") {
         Ok(EngineArg::Ultrasql)
+    } else if engine_str.starts_with("duckdb") {
+        Ok(EngineArg::Duckdb)
     } else {
         bail!("unknown engine in baseline: {engine_str}")
     }
@@ -711,7 +810,7 @@ fn run_duckdb_results(
 
 fn duckdb_setup_sql(data_dir: &Path) -> Result<String> {
     let mut sql = String::new();
-    for ddl in schema::ddl_for_engine(schema::Engine::Postgres) {
+    for ddl in schema::ddl_for_engine(schema::Engine::Ultrasql) {
         sql.push_str(ddl);
         sql.push('\n');
     }

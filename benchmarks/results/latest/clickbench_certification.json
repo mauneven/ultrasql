@@ -1,0 +1,9 @@
+{
+  "workload": "clickbench",
+  "upstream_ref": "c5eb5d8e9c10fbef5ce16e8750f3e67de24cef0a",
+  "target": "UltraSQL geometric mean at least 5x faster than PostgreSQL",
+  "passed": false,
+  "reason": "dataset missing",
+  "dataset": "target/clickbench/hits.tsv",
+  "next_step": "Set CLICKBENCH_DOWNLOAD=1 or CLICKBENCH_TSV=/path/to/hits.tsv, then rerun benchmarks/clickbench_certify.sh"
+}

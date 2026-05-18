@@ -162,6 +162,51 @@ behavior, not millions of VALUES parses. Set
 `ULTRASQL_TPCH_LOAD_METHOD=insert` only when bisecting the older
 INSERT-based path.
 
+### TPC-H SF10 Certification
+
+TPC-H SF10 must be certified by the committed runner, not by manual
+timing:
+
+```text
+TPCH_DATA_DIR=target/tpch-scale10-real \
+TPCH_DUCKDB=/opt/homebrew/bin/duckdb \
+TPCH_RUNS=5 \
+TPCH_WARMUP=1 \
+benchmarks/tpch_sf10_certify.sh
+```
+
+The script runs DuckDB and UltraSQL on the same `.tbl` data, writes
+per-query baselines under `benchmarks/results/latest/raw/`, and writes
+`benchmarks/results/latest/tpch_sf10_certification.json` with geometric
+mean timings and the pass/fail decision. The v0.7 milestone is complete
+only when that summary reports `passed: true` for all 22 queries.
+
+Because the current in-process UltraSQL benchmark server is
+memory-backed, SF10 needs a host with enough RAM for the loaded heap
+pages plus query working memory, or a future disk-backed benchmark server
+path. A failed or partial run is a valid diagnostic artifact but not a
+certification.
+
+### ClickBench Certification
+
+ClickBench uses the upstream PostgreSQL-compatible schema and 43-query
+set from ClickHouse/ClickBench at a pinned commit, downloaded at runtime
+to avoid vendoring benchmark files:
+
+```text
+CLICKBENCH_TSV=target/clickbench/hits.tsv \
+POSTGRES_DSN="host=localhost user=postgres dbname=clickbench_pg" \
+ULTRASQL_DSN="host=127.0.0.1 port=5432 user=ultrasql dbname=clickbench_ultra" \
+benchmarks/clickbench_certify.sh
+```
+
+Set `CLICKBENCH_DOWNLOAD=1` to fetch
+`https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz` into
+`target/clickbench/hits.tsv`. The script writes
+`benchmarks/results/latest/clickbench_certification.json`, including
+per-query runtimes, unsupported-query errors as `null`, geometric means,
+and the `≥ 5× PostgreSQL` pass/fail decision.
+
 ---
 
 ## Two-Tier Benchmark Policy

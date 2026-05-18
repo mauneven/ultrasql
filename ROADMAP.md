@@ -1194,12 +1194,20 @@ The main OLAP performance differentiator over PostgreSQL.
   TPCH_QUERIES=all`).
 - [ ] TPC-H SF10 has not been run to completion or compared with DuckDB.
   Local SF10 `dbgen` data was generated on 2026-05-18 under
-  `target/tpch-scale10-real` (11 GiB, ignored by policy), but no
-  committed run artifact exists under `benchmarks/results/` and this
-  16 GiB ARM64 host is not a valid certification box for the full
-  in-memory SF10 gate.
-- [ ] ClickBench has not been run or certified against PostgreSQL; no
-  ClickBench harness/result artifact exists in the repository.
+  `target/tpch-scale10-real` (10 GiB, ignored by policy). The committed
+  `benchmarks/tpch_sf10_certify.sh` runner now records DuckDB and
+  UltraSQL per-query timings plus
+  `benchmarks/results/latest/tpch_sf10_certification.json`, but the
+  2026-05-18 16 GiB M4 probe was terminated after more than 35 minutes
+  before Q1 started: it completed through `orders` and remained in the
+  `lineitem` load. No SF10 throughput comparison is certified.
+- [ ] ClickBench has not been run or certified against PostgreSQL.
+  `benchmarks/clickbench_certify.sh` now downloads the pinned upstream
+  PostgreSQL schema/query set at runtime and records
+  `benchmarks/results/latest/clickbench_certification.json`, but the
+  2026-05-18 local run stopped honestly at missing
+  `target/clickbench/hits.tsv`; no PostgreSQL/UltraSQL comparison has
+  been measured.
 - [x] Automatic dictionary selection is implemented in `ultrasql-vec`
   and wired through core executor/server batch paths. Remaining work is
   specialized dictionary-native text predicates and GROUP BY lowering
@@ -1224,7 +1232,11 @@ The main OLAP performance differentiator over PostgreSQL.
 
 ### Milestone
 - [ ] TPC-H scale 10 runs to completion, throughput within 2× of DuckDB
-- [ ] ClickBench: at least 5× faster than PostgreSQL on analytical queries
+  — certification runner exists, but the 2026-05-18 probe did not reach
+  the first query on this host.
+- [ ] ClickBench: at least 5× faster than PostgreSQL on analytical
+  queries — certification runner exists, but no dataset-backed
+  PostgreSQL/UltraSQL run has completed.
 
 ---
 
