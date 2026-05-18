@@ -452,6 +452,29 @@ pub enum LogicalPlan {
         /// Resolved column metadata — the row shape of the relation
         /// being created.
         columns: Schema,
+        /// Per-column default expressions. Same length as `columns`;
+        /// `None` means omitted INSERT values become SQL NULL.
+        defaults: Vec<Option<ScalarExpr>>,
+        /// Per-column sequence default names produced by SERIAL-like
+        /// pseudo-types. Same length as `columns`.
+        sequence_defaults: Vec<Option<String>>,
+        /// Per-column sequence options for sequence-backed defaults.
+        /// Same length as `columns`; `None` means the column has no
+        /// sequence default.
+        sequence_options: Vec<Option<LogicalSequenceOptions>>,
+        /// Per-column `GENERATED ALWAYS AS IDENTITY` flags. Same length as
+        /// `columns`; `false` includes non-identity and BY DEFAULT identity.
+        identity_always: Vec<bool>,
+        /// Per-column stored generated expressions. Same length as `columns`;
+        /// `None` means the column is not computed.
+        generated_stored: Vec<Option<ScalarExpr>>,
+        /// Row-level CHECK constraints bound against `columns`.
+        checks: Vec<LogicalCheckConstraint>,
+        /// UNIQUE / PRIMARY KEY constraints that should build unique
+        /// B-tree indexes after the table entry is created.
+        unique_constraints: Vec<LogicalUniqueConstraint>,
+        /// FOREIGN KEY constraints that should be enforced by DML.
+        foreign_keys: Vec<LogicalForeignKeyConstraint>,
         /// Whether `IF NOT EXISTS` was specified. When true the
         /// executor short-circuits if the relation already exists.
         if_not_exists: bool,
@@ -631,6 +654,52 @@ pub enum LogicalPlan {
         table_name: String,
         /// Resolved, type-checked action.
         action: LogicalAlterTableAction,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `CREATE SEQUENCE [IF NOT EXISTS] name ...`.
+    CreateSequence {
+        /// Case-folded sequence name.
+        sequence_name: String,
+        /// SQL namespace, usually `"public"`.
+        namespace: String,
+        /// Resolved sequence options.
+        options: LogicalSequenceOptions,
+        /// Whether `IF NOT EXISTS` was specified.
+        if_not_exists: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `ALTER SEQUENCE name ...`.
+    AlterSequence {
+        /// Case-folded sequence name.
+        sequence_name: String,
+        /// Partial option changes.
+        options: LogicalSequenceChange,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `DROP SEQUENCE [IF EXISTS] name [, ...]`.
+    DropSequence {
+        /// Case-folded sequence names.
+        sequences: Vec<String>,
+        /// Whether `IF EXISTS` was specified.
+        if_exists: bool,
+        /// Whether `CASCADE` was specified.
+        cascade: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `COMMENT ON TABLE/COLUMN ... IS ...`.
+    Comment {
+        /// Object being commented.
+        target: LogicalCommentTarget,
+        /// Comment text. `None` deletes the existing comment.
+        comment: Option<String>,
         /// Always [`Schema::empty`].
         schema: Schema,
     },
@@ -880,6 +949,133 @@ pub enum LogicalPlan {
     },
 }
 
+/// A bound `CHECK (...)` constraint carried by `CREATE TABLE`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogicalCheckConstraint {
+    /// Constraint name, explicit or binder-synthesised.
+    pub name: String,
+    /// Boolean expression evaluated against each new row.
+    pub expr: ScalarExpr,
+}
+
+/// A bound UNIQUE or PRIMARY KEY constraint carried by `CREATE TABLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalUniqueConstraint {
+    /// Constraint name, explicit or binder-synthesised.
+    pub name: String,
+    /// 0-based key column indices.
+    pub columns: Vec<usize>,
+    /// Whether this constraint is a PRIMARY KEY.
+    pub primary_key: bool,
+}
+
+/// A bound non-deferrable FOREIGN KEY constraint carried by `CREATE TABLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalForeignKeyConstraint {
+    /// Constraint name, explicit or binder-synthesised.
+    pub name: String,
+    /// 0-based key column indices on the referencing table.
+    pub columns: Vec<usize>,
+    /// Case-folded referenced table name.
+    pub target_table: String,
+    /// 0-based key column indices on the referenced table.
+    pub target_columns: Vec<usize>,
+    /// Action when a referenced row is deleted.
+    pub on_delete: LogicalReferentialAction,
+    /// Action when a referenced key is updated.
+    pub on_update: LogicalReferentialAction,
+}
+
+/// Bound referential action for a foreign key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalReferentialAction {
+    /// `NO ACTION`.
+    NoAction,
+    /// `RESTRICT`.
+    Restrict,
+    /// `CASCADE`.
+    Cascade,
+    /// `SET NULL`.
+    SetNull,
+    /// `SET DEFAULT`.
+    SetDefault,
+}
+
+/// Bound target of a `COMMENT ON` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogicalCommentTarget {
+    /// `COMMENT ON TABLE table`.
+    Table {
+        /// Folded table name.
+        table: String,
+    },
+    /// `COMMENT ON INDEX index`.
+    Index {
+        /// Folded index name.
+        index: String,
+    },
+    /// `COMMENT ON COLUMN table.column`.
+    Column {
+        /// Folded table name.
+        table: String,
+        /// Folded column name.
+        column: String,
+        /// 1-based attribute number.
+        attnum: i32,
+    },
+}
+
+/// Resolved `CREATE SEQUENCE` options.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogicalSequenceOptions {
+    /// `START WITH`.
+    pub start: i64,
+    /// `INCREMENT BY`.
+    pub increment: i64,
+    /// `MINVALUE`; `None` means engine default.
+    pub min: Option<i64>,
+    /// `MAXVALUE`; `None` means engine default.
+    pub max: Option<i64>,
+    /// `CACHE`.
+    pub cache: u32,
+    /// `CYCLE`.
+    pub cycle: bool,
+}
+
+impl Default for LogicalSequenceOptions {
+    fn default() -> Self {
+        Self {
+            start: 1,
+            increment: 1,
+            min: None,
+            max: None,
+            cache: 1,
+            cycle: false,
+        }
+    }
+}
+
+/// Partial `ALTER SEQUENCE` option change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogicalSequenceChange {
+    /// New start value.
+    pub start: Option<i64>,
+    /// Restart current value. `Some(None)` means `RESTART` without an
+    /// explicit value, so the executor restarts at the configured start
+    /// value after applying any `START WITH` change.
+    pub restart: Option<Option<i64>>,
+    /// New increment.
+    pub increment: Option<i64>,
+    /// New minimum. `Some(None)` means `NO MINVALUE`.
+    pub min: Option<Option<i64>>,
+    /// New maximum. `Some(None)` means `NO MAXVALUE`.
+    pub max: Option<Option<i64>>,
+    /// New cache size.
+    pub cache: Option<u32>,
+    /// New cycle flag.
+    pub cycle: Option<bool>,
+}
+
 /// EXPLAIN output format selector, mirrored from
 /// [`ultrasql_parser::ast::ExplainFormat`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1040,6 +1236,10 @@ impl LogicalPlan {
             | Self::CreateIndex { schema, .. }
             | Self::DropTable { schema, .. }
             | Self::AlterTable { schema, .. }
+            | Self::CreateSequence { schema, .. }
+            | Self::AlterSequence { schema, .. }
+            | Self::DropSequence { schema, .. }
+            | Self::Comment { schema, .. }
             | Self::Begin { schema, .. }
             | Self::Commit { schema }
             | Self::Rollback { schema }
@@ -1276,6 +1476,8 @@ impl LogicalPlan {
                 namespace,
                 columns,
                 if_not_exists,
+                checks,
+                unique_constraints,
                 ..
             } => {
                 out.push_str(&pad);
@@ -1297,6 +1499,23 @@ impl LogicalPlan {
                     }
                 }
                 out.push_str(")\n");
+                for check in checks {
+                    let _ = fmt::write(
+                        out,
+                        format_args!("{pad}  Check: {} = {}\n", check.name, check.expr),
+                    );
+                }
+                for unique in unique_constraints {
+                    let kind = if unique.primary_key {
+                        "PrimaryKey"
+                    } else {
+                        "Unique"
+                    };
+                    let _ = fmt::write(
+                        out,
+                        format_args!("{pad}  {kind}: {} {:?}\n", unique.name, unique.columns),
+                    );
+                }
             }
             Self::Join {
                 left,
@@ -1519,6 +1738,62 @@ impl LogicalPlan {
                         let _ = fmt::write(
                             out,
                             format_args!("AlterTable: {table_name} RENAME TO {new_name}\n"),
+                        );
+                    }
+                }
+            }
+            Self::CreateSequence {
+                sequence_name,
+                namespace,
+                if_not_exists,
+                ..
+            } => {
+                out.push_str(&pad);
+                let ine = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+                let _ = fmt::write(
+                    out,
+                    format_args!("CreateSequence{ine}: {namespace}.{sequence_name}\n"),
+                );
+            }
+            Self::AlterSequence { sequence_name, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(out, format_args!("AlterSequence: {sequence_name}\n"));
+            }
+            Self::DropSequence {
+                sequences,
+                if_exists,
+                cascade,
+                ..
+            } => {
+                out.push_str(&pad);
+                let ie = if *if_exists { " IF EXISTS" } else { "" };
+                let csc = if *cascade { " CASCADE" } else { "" };
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "DropSequence{ie}: sequences=[{}]{csc}\n",
+                        sequences.join(", ")
+                    ),
+                );
+            }
+            Self::Comment {
+                target, comment, ..
+            } => {
+                out.push_str(&pad);
+                match target {
+                    LogicalCommentTarget::Table { table } => {
+                        let action = if comment.is_some() { "SET" } else { "CLEAR" };
+                        let _ = fmt::write(out, format_args!("Comment: TABLE {table} {action}\n"));
+                    }
+                    LogicalCommentTarget::Index { index } => {
+                        let action = if comment.is_some() { "SET" } else { "CLEAR" };
+                        let _ = fmt::write(out, format_args!("Comment: INDEX {index} {action}\n"));
+                    }
+                    LogicalCommentTarget::Column { table, column, .. } => {
+                        let action = if comment.is_some() { "SET" } else { "CLEAR" };
+                        let _ = fmt::write(
+                            out,
+                            format_args!("Comment: COLUMN {table}.{column} {action}\n"),
                         );
                     }
                 }

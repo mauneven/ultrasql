@@ -351,11 +351,11 @@ claims rather than measured development targets.
 | **P0** | Win and keep the ≥ 2× perf gate on every published benchmark; current README matrix has several wins, but not every workload is certified at the standing gate | Every release after v0.5 |
 | **P0** | ~~v0.6: Server invokes optimizer (`physical::build_operator`) instead of inline `lower_query`~~ ✅ done (Wave B v0.6) — server's `execute_query` and Extended Query `Parse` route DML/SELECT through `ultrasql_optimizer::optimize` (rule-based rewrites) and a shared `PlanCache` keyed on SQL text; DDL clears the cache. Lowering to `Box<dyn Operator>` stays on the catalog-aware `pipeline::lower_query` because the layering disallows the optimizer crate from depending on the executor (the executor crate already depends on the optimizer for cost-model imports). | (was) Cost-aware physical selection, plan cache |
 | **P1** | v1.x: JSONB, NUMERIC, arrays | Modern apps, financial workloads |
-| **P1** | v0.8: Constraints (NOT NULL, FK, CHECK, DEFAULT) | Data integrity |
+| **P1** | v0.8: Constraints (NOT NULL, CHECK, UNIQUE/PK, DEFAULT, basic FK, `ON DELETE CASCADE`) — runtime core landed; persistence, UPDATE/SET referential actions, deferral, and stored generated columns remain open | Data integrity |
 | **P1** | v0.8: Persistent catalog typed-tuple decoder | Survive restart with user tables |
 | **P1** | v0.4: SSI predicate locking integrated (TxnManager still RR-aliased) | "SERIALIZABLE" honesty |
 | **P2** | v1.x: Views + Materialized Views | Very common pattern |
-| **P2** | v0.8: Sequences (`SERIAL`/`IDENTITY`) end-to-end | Every table with PK |
+| **P2** | v0.8: Sequences (`CREATE/ALTER/DROP SEQUENCE`, functions, `SERIAL`, `IDENTITY`) landed; sequence WAL/recovery remains open | Every table with PK |
 | **P2** | v0.9: VACUUM + Autovacuum | Heap bloat prevention |
 | **P2** | v0.9: Streaming replication | HA production |
 | **P2** | v0.9: `pg_stat_*` views | Operator diagnostics |
@@ -1219,18 +1219,45 @@ The main OLAP performance differentiator over PostgreSQL.
 **Scope:** Full index types. Constraints enforced. Sequences.
 Persistent catalog. pg_catalog views sufficient for psql `\d`.
 
-### B-tree (complete)
+### B-tree
 - [ ] Concurrent splits with right-link pointer (no reader blocking)
-- [ ] WAL logging of all index operations
-- [ ] Backward index scan
-- [x] Index-only scan — `IndexOnlyScan` kernel ships (`crates/ultrasql-executor/src/bitmap_heap_scan.rs:293`); ⚠️ optimizer selects it (`physical_selection.rs:161`) but `pipeline::lower_query` does not emit it yet
-- [ ] Multi-column B-tree
+- [ ] WAL logging of all index operations — B-tree insert, split, and
+  delete payloads are emitted when a WAL sink is configured, and the
+  SQL DML lowerer now threads the server heap WAL sink into indexed
+  INSERT / UPDATE / DELETE paths. Replay still ignores `BTreeOp`
+  records, so crash-safe index recovery remains open.
+- [x] Backward index scan — `BTree::backward_scan` now returns descending key order and `pipeline::lower_query` uses it for `ORDER BY indexed_col DESC` over a bare indexed scan; covered by `index_scan_round_trip.rs::order_by_desc_with_index_returns_descending_rows`. The current iterator materialises the range before reversing; a true left-link leaf walk remains a performance follow-up.
+- [x] Index-only scan — `pipeline::lower_query` now emits
+  `IndexOnlyScan` for covered indexed-key projections over indexable
+  predicates when every candidate heap page is VM all-visible, and falls
+  back to the heap-validating `IndexScan` path when any VM bit is absent.
+  Covered by
+  `lower_query_project_index_key_on_all_visible_pages_picks_index_only_scan`
+  and
+  `lower_query_project_index_key_without_all_visible_falls_back_to_heap_index_scan`.
+- [x] Narrow multi-column B-tree — two-column Bool / Int16 / Int32 packed keys are supported for CREATE INDEX and maintenance; full variable-length composite keys remain open under expression/covering/general B-tree work.
 - [ ] Expression indexes: `CREATE INDEX ON t (lower(name))`
 - [ ] Partial indexes: `CREATE INDEX ON t (col) WHERE status = 'active'`
 - [ ] Covering indexes: `INCLUDE (col1, col2)`
 - [ ] `CREATE INDEX CONCURRENTLY` (online build without lock)
-- [ ] `VACUUM` reclaims dead index entries
-- [x] `CREATE INDEX` reachable from the wire — `execute_create_index` in `session/ddl.rs`; ⚠️ single-column Int32/Int64 keys only; multi-column, expression, partial, covering indexes pending
+- [x] `VACUUM` reclaims dead index entries — SQL `VACUUM [table]`
+  now runs B-tree cleanup for each indexed relation before heap slot
+  reclamation, removing entries whose TIDs point at committed-dead heap
+  tuples. Covered by
+  `index_scan_round_trip.rs::vacuum_reclaims_stale_index_entries`.
+- [x] `CREATE INDEX` reachable from the wire — `execute_create_index` in `session/ddl.rs`; supported build encodings include single-column Int16 / Int32 / Int64 / Bool / Timestamp / Float / TextPrefix8 and two-column Bool / Int16 / Int32 packed keys; full variable-length multi-column keys, expression, partial, and covering indexes pending
+- [x] INSERT-side B-tree maintenance — `ModifyTable::Insert` now
+  receives `InsertIndexMaintainer` descriptors from `pipeline::modify`,
+  prechecks duplicate keys before heap write only for UNIQUE / PRIMARY
+  KEY indexes, calls `HeapAccess::insert_batch`, then inserts returned
+  TIDs into every covering B-tree. Plain non-unique indexes now store
+  duplicate `(key, TupleId)` chains and point probes return every
+  matching visible row. Wire regressions cover post-`CREATE INDEX`
+  inserts being visible through index scans, non-unique duplicate-key
+  scans, and `CREATE UNIQUE INDEX` duplicate inserts returning SQLSTATE
+  `23505`.
+- [x] UPDATE-side B-tree maintenance — `HeapAccess::update_many_with_outcomes` returns old/new TIDs; `ModifyTable::Update` precomputes old/new keys, rejects duplicate target keys before heap write, updates B-tree entries after the heap write, and disables the fused update path for indexed tables. Wire regressions cover non-key updates, indexed-key moves, and duplicate-key rejection.
+- [x] DELETE-side B-tree maintenance — `BTree::delete(key, tid)` removes leaf entries without page merge/rebalance; `ModifyTable::Delete` decodes indexed rows, deletes old keys after heap delete, and disables fused delete for indexed tables. Wire regression covers indexed DELETE plus unique-key reuse.
 
 ### Hash Index
 - [ ] Static hashing with overflow pages
@@ -1254,56 +1281,91 @@ Persistent catalog. pg_catalog views sufficient for psql `\d`.
 - [ ] Auto-summarize on vacuum
 
 ### Constraints
-- [x] `NOT NULL`, `CHECK`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY` — kernel in `crates/ultrasql-storage/src/constraints.rs`: `Constraint` enum (`constraints.rs:157`) covers NotNull / Check / PrimaryKey / ForeignKey / UniqueSet; `ConstraintChecker` struct (`constraints.rs:256`) is the runtime enforcer; `ScalarExpr` (`constraints.rs:119`) is the CHECK-expr IR. ⚠️ Not yet invoked from the INSERT / UPDATE executor path — DDL parses constraints, kernel can validate, executor does not call it
-- [ ] `DEFAULT expr` evaluated at INSERT when column omitted
+- [x] Constraint runtime kernel — `crates/ultrasql-storage/src/constraints.rs` exposes `Constraint`, `ConstraintChecker`, and CHECK-expression IR for NotNull / Check / PrimaryKey / ForeignKey / UniqueSet validation
+- [x] `NOT NULL` DML enforcement — `ModifyTable::Insert` and `ModifyTable::Update` check schema `Field::nullable` before heap writes; wire regressions cover INSERT and UPDATE failures returning SQLSTATE `23502` without leaking partial rows
+- [x] `CHECK` DDL + executor wiring — column/table `CHECK` constraints bind into `LogicalCheckConstraint`, are stored in the server's same-process `TableRuntimeConstraints`, and are evaluated on INSERT/UPDATE before heap writes. Violations return SQLSTATE `23514`; `constraint_round_trip.rs` covers insert/update rejection.
+- [x] `UNIQUE` / `PRIMARY KEY` DDL + executor wiring — column/table constraints create unique B-tree indexes during `CREATE TABLE`; `PRIMARY KEY` also marks columns NOT NULL. INSERT/UPDATE index maintenance returns SQLSTATE `23505` on duplicates. Supported key encodings match current B-tree support: single fixed/text-prefix keys and narrow two-column packed keys.
+- [x] Basic `FOREIGN KEY` DDL + executor wiring — explicit target-column `REFERENCES parent(col)` and table-level `FOREIGN KEY (...) REFERENCES parent(...)` bind and run as non-deferrable NO ACTION checks. Child INSERT/UPDATE requires a visible parent row; parent DELETE and parent key UPDATE are restricted while children reference the key. Violations return SQLSTATE `23503`. Referential actions and deferral remain open below.
+- [x] INSERT column-list expansion — omitted nullable columns are filled with NULL and source positions respect explicit column order before DEFAULT / sequence defaults, NOT NULL checks, index maintenance, and heap encoding
+- [x] `DEFAULT expr` evaluated at INSERT when column omitted — immutable/literal scalar defaults bind into per-column runtime defaults and execute only for omitted columns. Explicit NULL remains NULL. Persistence through `pg_attrdef` is still open.
 - [ ] FK referential action wiring:
-  - [ ] `ON DELETE CASCADE / SET NULL / SET DEFAULT / RESTRICT / NO ACTION`
-  - [ ] `ON UPDATE CASCADE / SET NULL / SET DEFAULT / RESTRICT / NO ACTION`
+  - [x] non-deferrable `NO ACTION` / `RESTRICT` semantics for explicit target columns (implemented as immediate checks)
+  - [x] `ON DELETE CASCADE` — parser/planner/runtime carry referential actions; parent DELETE cascades one level into child heap rows and removes child B-tree entries. Covered by `constraint_round_trip.rs::foreign_key_on_delete_cascade_deletes_child_rows`.
+  - [x] `ON DELETE SET NULL / SET DEFAULT` — parent DELETE rewrites
+    matching child rows, validates child NOT NULL / CHECK constraints,
+    clears VM state, and maintains child B-tree entries.
+  - [x] `ON UPDATE CASCADE / SET NULL / SET DEFAULT` — parent key UPDATE
+    propagates into child rows, validates child constraints, clears VM
+    state, and moves child index entries.
   - [ ] `DEFERRABLE INITIALLY DEFERRED / IMMEDIATE` (plumbing note in `constraints.rs`)
-- [ ] `GENERATED ALWAYS / BY DEFAULT AS IDENTITY`
-- [ ] `GENERATED ALWAYS AS (expr) STORED` (computed columns)
+- [x] `GENERATED ALWAYS / BY DEFAULT AS IDENTITY` — parser accepts identity sequence options; binder expands integer identity columns into owned sequence-backed defaults; executor rejects explicit values for `GENERATED ALWAYS` with SQLSTATE `428C9` and allows explicit values for `BY DEFAULT`. Covered by `sequence_round_trip.rs`.
+- [x] `GENERATED ALWAYS AS (expr) STORED` (computed columns) — parser,
+  binder, table runtime constraints, INSERT, and UPDATE compute stored
+  values from immutable row-local expressions, recompute on base-column
+  update, and reject explicit generated-column writes with SQLSTATE
+  `428C9`.
 - [ ] `EXCLUDE USING gist (...)` exclusion constraints
 
 ### Sequences
-- [ ] `CREATE SEQUENCE` with START, INCREMENT, MINVALUE, MAXVALUE, CYCLE, CACHE
-- [ ] `ALTER SEQUENCE` / `DROP SEQUENCE`
-- [ ] `NEXTVAL`, `CURRVAL`, `LASTVAL`, `SETVAL`
-- [ ] `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` sugar
-- [ ] Per-session `currval` state
+- [x] `CREATE SEQUENCE` with START, INCREMENT, MINVALUE, MAXVALUE, CYCLE, CACHE — parser, binder, and Simple Query server dispatch are wired. Descending sequences default START to MAXVALUE; `ALTER SEQUENCE START WITH` changes restart seed without advancing current value.
+- [x] `ALTER SEQUENCE` / `DROP SEQUENCE` — in-memory registry updates and command tags are wired; `ALTER SEQUENCE RESTART [WITH n]` follows PostgreSQL's current-value semantics.
+- [x] `NEXTVAL`, `CURRVAL`, `LASTVAL`, `SETVAL` — Simple Query sequence functions dispatch before generic SELECT lowering. `currval` / `lastval` are session-local and return SQLSTATE `55000` before first `nextval`.
+- [x] `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` sugar — `CREATE TABLE` expands pseudo-types to Int32/Int64/Int16 required columns, creates an owned same-process sequence, and installs a sequence-backed DEFAULT. INSERT of omitted serial columns calls `nextval` and updates session `currval`.
+- [x] Per-session `currval` state
 - [ ] Sequence WAL logging and recovery
 
 ### Persistent Catalog
 - [x] `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type` (row shapes)
-- [x] `pg_index`, `pg_constraint`, `pg_sequence` (row shapes)
+- [x] `pg_index`, `pg_constraint`, `pg_sequence` (row shapes + virtual SQL scans for current same-process metadata)
 - [x] Catalog cache with `arc-swap` for wait-free reads
 - [x] Catalog snapshot for safe concurrent DDL
 - [x] Typed tuple decoder for bootstrap-from-heap — `crates/ultrasql-catalog/src/encoding.rs` + `PersistentCatalog::bootstrap_from_heap` (`persistent.rs:486`) decode `pg_class` + `pg_attribute` rows and rebuild user `TableEntry` list with full schema on warm restart
-- [ ] `pg_depend` (required for CASCADE DROP)
-- [ ] `pg_description` (COMMENT ON)
+- [ ] Persistent constraint/default/sequence metadata — runtime `TableRuntimeConstraints` and sequence registry are same-process only; restart bootstrap for `pg_attrdef`, `pg_constraint`, `pg_sequence` contents is not complete
+- [x] `pg_depend` compatibility slice — virtual dependency rows are
+  derived from live UNIQUE / CHECK / FOREIGN KEY metadata, and `DROP
+  TABLE` now honours those FK dependencies: default / `RESTRICT` raises
+  SQLSTATE `2BP01`, while `CASCADE` removes the child-side FK dependency
+  and leaves the child table intact. Persistent `pg_depend` heap rows
+  and full dependency coverage for every object kind remain open.
+- [x] `pg_description` / `COMMENT ON` compatibility slice —
+  `COMMENT ON TABLE`, `COMMENT ON INDEX`, and `COMMENT ON COLUMN` parse,
+  bind, dispatch over
+  Simple Query, update the active `PersistentCatalog` snapshot, and
+  appear in `pg_catalog.pg_description`; `IS NULL` clears comments and
+  `DROP TABLE` clears attached rows. Persistent heap writeback and
+  restart bootstrap for comment rows remain open with the broader
+  persistent metadata item above.
 - [ ] `pg_statistic`, `pg_statistic_ext` (persistent — row shape ships, adapter pending)
 - [ ] Shared invalidation messages (catalog cache flush on DDL)
 
 ### pg_catalog Views
-- [ ] `pg_tables`, `pg_indexes`, `pg_views`, `pg_sequences`
-- [ ] `pg_roles`, `pg_user`
-- [ ] `pg_settings` (all GUC parameters)
-- [ ] `pg_locks`
-- [ ] `pg_stat_activity`
+- [x] `pg_tables`, `pg_indexes`, `pg_views`, `pg_sequences` — virtual read-only scans over the active catalog snapshot / sequence registry; `pg_views` is empty until CREATE VIEW lands.
+- [x] `pg_roles`, `pg_user`
+- [x] `pg_settings` compatibility slice — core settings (`server_version`, encodings, `search_path`, `work_mem`) are exposed; full GUC catalogue remains v0.9+.
+- [x] `pg_locks` row shape — currently empty until lock-manager telemetry is wired.
+- [x] `pg_stat_activity` compatibility row shape — currently exposes a minimal active backend row; real per-session activity stats remain v0.9+.
 
 ### information_schema
-- [ ] `information_schema.tables`
-- [ ] `information_schema.columns`
-- [ ] `information_schema.table_constraints`
-- [ ] `information_schema.key_column_usage`
-- [ ] `information_schema.referential_constraints`
-- [ ] `information_schema.check_constraints`
-- [ ] `information_schema.routines`
-- [ ] `information_schema.triggers`
-- [ ] `information_schema.schemata`
-- [ ] `information_schema.sequences`
+- [x] `information_schema.tables`
+- [x] `information_schema.columns`
+- [x] `information_schema.table_constraints`
+- [x] `information_schema.key_column_usage`
+- [x] `information_schema.referential_constraints`
+- [x] `information_schema.check_constraints`
+- [x] `information_schema.routines` — compatibility row shape exposed;
+  currently empty because UltraSQL does not support CREATE FUNCTION /
+  CREATE PROCEDURE yet.
+- [x] `information_schema.triggers` — compatibility row shape exposed;
+  currently empty because UltraSQL does not support CREATE TRIGGER yet.
+- [x] `information_schema.schemata`
+- [x] `information_schema.sequences`
 
 ### Milestone
-- [ ] `psql \d`, `\dt`, `\di`, `\df` work correctly
+- [x] `psql \d`, `\dt`, `\di`, `\df` work correctly for the current
+  UltraSQL metadata surface — the CLI meta-query SQL is backed by
+  virtual `pg_catalog` / `information_schema` scans and validated through
+  `catalog_views_round_trip.rs`; unsupported object kinds correctly
+  return empty metadata rows instead of parser/binder failures.
 
 ---
 
@@ -1421,7 +1483,7 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [ ] JSON: row_to_json, json_build_object, json_each, jsonb_set, jsonb_path_query
 - [ ] Array: array_length, array_cat, unnest, array_agg, array_to_string, string_to_array
 - [ ] System: version(), current_database(), current_user, pg_typeof(), pg_relation_size(), pg_size_pretty()
-- [ ] Sequence: nextval(), currval(), lastval(), setval()
+- [x] Sequence: nextval(), currval(), lastval(), setval() (Simple Query path; Extended Query expression-function dispatch remains broader function-work)
 
 ### Security
 - [ ] `CREATE ROLE / USER`, `ALTER ROLE`, `DROP ROLE`

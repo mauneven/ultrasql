@@ -9,23 +9,49 @@
 
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::ast::{
-    AlterTableAction, AlterTableStmt, ColumnConstraint, CopyDirection as AstCopyDirection,
-    CopyFormat as AstCopyFormat, CopyOption, CopySource as AstCopySource, CopyStmt,
-    CreateIndexStmt, CreateTableStmt, DropTableStmt, Expr, ObjectName, TruncateStmt, TypeName,
+    AlterSequenceStmt, AlterTableAction, AlterTableStmt, ColumnConstraint, CommentStmt,
+    CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat, CopyOption,
+    CopySource as AstCopySource, CopyStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
+    DropSequenceStmt, DropTableStmt, Expr, Identifier, ObjectName,
+    ReferentialAction as AstReferentialAction, SequenceOption, TableConstraint, TruncateStmt,
+    TypeName,
 };
 
-use super::{Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, object_name_simple};
-use crate::plan::{CopyDirection, CopyFormat, CopySource};
+use super::expr_bind::coerce_literal_to_type;
+use super::{
+    Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, ScalarExpr, ScopeStack, bind_expr,
+    object_name_simple,
+};
+use crate::plan::{
+    CopyDirection, CopyFormat, CopySource, LogicalCheckConstraint, LogicalCommentTarget,
+    LogicalForeignKeyConstraint, LogicalReferentialAction, LogicalSequenceChange,
+    LogicalSequenceOptions, LogicalUniqueConstraint,
+};
+
+struct RawUniqueConstraint {
+    name: String,
+    columns: Vec<String>,
+    primary_key: bool,
+}
+
+struct RawCheckConstraint<'a> {
+    name: String,
+    expr: &'a Expr,
+}
+
+struct RawForeignKeyConstraint {
+    name: String,
+    columns: Vec<String>,
+    target_table: String,
+    target_columns: Vec<String>,
+    on_delete: LogicalReferentialAction,
+    on_update: LogicalReferentialAction,
+}
 
 pub(super) fn bind_create_table(
     s: &CreateTableStmt,
     catalog: &dyn Catalog,
 ) -> Result<LogicalPlan, PlanError> {
-    if !s.table_constraints.is_empty() {
-        return Err(PlanError::NotSupported(
-            "CREATE TABLE: table-level constraints",
-        ));
-    }
     let table_name = object_name_simple(&s.name);
     let namespace = object_name_namespace(&s.name);
     if !s.if_not_exists && catalog.lookup_table(&table_name).is_some() {
@@ -35,30 +61,578 @@ pub(super) fn bind_create_table(
         return Err(PlanError::NotSupported("CREATE TABLE: zero columns"));
     }
     let mut fields: Vec<Field> = Vec::with_capacity(s.columns.len());
+    let mut defaults: Vec<Option<&Expr>> = Vec::with_capacity(s.columns.len());
+    let mut sequence_defaults: Vec<Option<String>> = Vec::with_capacity(s.columns.len());
+    let mut sequence_options: Vec<Option<LogicalSequenceOptions>> =
+        Vec::with_capacity(s.columns.len());
+    let mut identity_always: Vec<bool> = Vec::with_capacity(s.columns.len());
+    let mut generated_stored_raw: Vec<Option<&Expr>> = Vec::with_capacity(s.columns.len());
+    let mut raw_checks: Vec<RawCheckConstraint<'_>> = Vec::new();
+    let mut raw_uniques: Vec<RawUniqueConstraint> = Vec::new();
+    let mut raw_foreign_keys: Vec<RawForeignKeyConstraint> = Vec::new();
+    let mut primary_key_seen = false;
     for col in &s.columns {
         let name = col.name.value.clone();
         let folded = name.to_ascii_lowercase();
         if fields.iter().any(|f| f.name.to_ascii_lowercase() == folded) {
             return Err(PlanError::DuplicateColumn(name));
         }
-        let dtype = resolve_type_name(&col.data_type)?;
+        let (dtype, serial_default) = resolve_column_type(&table_name, &name, &col.data_type)?;
+        let identity = column_identity(&col.constraints)?;
+        let generated_stored = column_generated_stored(&col.constraints)?;
+        if identity.is_some() && serial_default.is_some() {
+            return Err(PlanError::NotSupported(
+                "CREATE TABLE: SERIAL column may not also declare IDENTITY",
+            ));
+        }
+        if generated_stored.is_some() && (identity.is_some() || serial_default.is_some()) {
+            return Err(PlanError::NotSupported(
+                "CREATE TABLE: generated stored column may not also declare SERIAL or IDENTITY",
+            ));
+        }
+        if identity.is_some()
+            && !matches!(dtype, DataType::Int16 | DataType::Int32 | DataType::Int64)
+        {
+            return Err(PlanError::TypeMismatch(format!(
+                "IDENTITY column '{name}' must be SMALLINT, INTEGER, or BIGINT"
+            )));
+        }
+        let (sequence_default, sequence_option, identity_is_always) =
+            if let Some((always, options)) = identity {
+                (
+                    Some(format!(
+                        "{}_{}_seq",
+                        table_name.to_ascii_lowercase(),
+                        name.to_ascii_lowercase()
+                    )),
+                    Some(options),
+                    always,
+                )
+            } else {
+                (
+                    serial_default.clone(),
+                    serial_default
+                        .as_ref()
+                        .map(|_| LogicalSequenceOptions::default()),
+                    false,
+                )
+            };
         let nullable = resolve_column_nullability(&col.constraints)?;
+        let nullable = if sequence_default.is_some() {
+            false
+        } else {
+            nullable
+        };
         let field = if nullable {
             Field::nullable(name, dtype)
         } else {
             Field::required(name, dtype)
         };
+        let default = column_default(&col.constraints)?;
+        if generated_stored.is_some() && default.is_some() {
+            return Err(PlanError::NotSupported(
+                "CREATE TABLE: generated stored column may not also declare DEFAULT",
+            ));
+        }
+        if sequence_default.is_some() && default.is_some() {
+            return Err(PlanError::NotSupported(
+                "CREATE TABLE: sequence-backed column may not also declare DEFAULT",
+            ));
+        }
+        defaults.push(default);
+        sequence_defaults.push(sequence_default);
+        sequence_options.push(sequence_option);
+        identity_always.push(identity_is_always);
+        generated_stored_raw.push(generated_stored);
+        collect_column_constraints(
+            &table_name,
+            &col.name,
+            &col.constraints,
+            &mut raw_checks,
+            &mut raw_uniques,
+            &mut raw_foreign_keys,
+            &mut primary_key_seen,
+        )?;
         fields.push(field);
+    }
+    collect_table_constraints(
+        &table_name,
+        &s.table_constraints,
+        &mut raw_checks,
+        &mut raw_uniques,
+        &mut raw_foreign_keys,
+        &mut primary_key_seen,
+    )?;
+    for raw in &raw_uniques {
+        if raw.primary_key {
+            for col_name in &raw.columns {
+                let Some(field) = fields
+                    .iter_mut()
+                    .find(|f| f.name.eq_ignore_ascii_case(col_name))
+                else {
+                    return Err(PlanError::ColumnNotFound(col_name.clone()));
+                };
+                field.nullable = false;
+            }
+        }
     }
     let columns =
         Schema::new(fields).expect("column dedup precheck guarantees Schema::new cannot fail");
+    let mut bound_defaults = Vec::with_capacity(defaults.len());
+    for (idx, default) in defaults.into_iter().enumerate() {
+        let Some(expr) = default else {
+            bound_defaults.push(None);
+            continue;
+        };
+        let mut scope = ScopeStack::new();
+        let mut bound = bind_expr(expr, &Schema::empty(), catalog, &mut scope)?;
+        if !is_default_safe(&bound) {
+            return Err(PlanError::NotSupported(
+                "CREATE TABLE: DEFAULT may not reference rows, parameters, or subqueries",
+            ));
+        }
+        coerce_literal_to_type(&mut bound, &columns.field_at(idx).data_type);
+        let target = &columns.field_at(idx).data_type;
+        let actual = bound.data_type();
+        if actual != target.clone() && actual != DataType::Null {
+            return Err(PlanError::TypeMismatch(format!(
+                "DEFAULT for column '{}' has type {:?}, expected {:?}",
+                columns.field_at(idx).name,
+                actual,
+                target,
+            )));
+        }
+        bound_defaults.push(Some(bound));
+    }
+    let mut generated_stored = Vec::with_capacity(generated_stored_raw.len());
+    let generated_columns: Vec<bool> = generated_stored_raw.iter().map(Option::is_some).collect();
+    for (idx, generated) in generated_stored_raw.into_iter().enumerate() {
+        let Some(expr) = generated else {
+            generated_stored.push(None);
+            continue;
+        };
+        let mut scope = ScopeStack::new();
+        let mut bound = bind_expr(expr, &columns, catalog, &mut scope)?;
+        if !is_generated_stored_safe(&bound) {
+            return Err(PlanError::NotSupported(
+                "CREATE TABLE: generated stored expression may not contain parameters or subqueries",
+            ));
+        }
+        if expr_references_generated_column(&bound, &generated_columns) {
+            return Err(PlanError::NotSupported(
+                "CREATE TABLE: generated stored expression may not reference generated columns",
+            ));
+        }
+        coerce_literal_to_type(&mut bound, &columns.field_at(idx).data_type);
+        let target = &columns.field_at(idx).data_type;
+        let actual = bound.data_type();
+        if actual != target.clone() && actual != DataType::Null {
+            return Err(PlanError::TypeMismatch(format!(
+                "generated expression for column '{}' has type {:?}, expected {:?}",
+                columns.field_at(idx).name,
+                actual,
+                target,
+            )));
+        }
+        generated_stored.push(Some(bound));
+    }
+    let mut checks = Vec::with_capacity(raw_checks.len());
+    for raw in raw_checks {
+        let mut scope = ScopeStack::new();
+        let bound = bind_expr(raw.expr, &columns, catalog, &mut scope)?;
+        let ty = bound.data_type();
+        if ty != DataType::Bool && ty != DataType::Null {
+            return Err(PlanError::TypeMismatch(format!(
+                "CHECK constraint '{}' has type {:?}, expected Bool",
+                raw.name, ty,
+            )));
+        }
+        checks.push(LogicalCheckConstraint {
+            name: raw.name,
+            expr: bound,
+        });
+    }
+    let unique_constraints = bind_unique_constraints(&columns, raw_uniques)?;
+    let foreign_keys = bind_foreign_key_constraints(&columns, raw_foreign_keys, catalog)?;
     Ok(LogicalPlan::CreateTable {
         table_name,
         namespace,
         columns,
+        defaults: bound_defaults,
+        sequence_defaults,
+        sequence_options,
+        identity_always,
+        generated_stored,
+        checks,
+        unique_constraints,
+        foreign_keys,
         if_not_exists: s.if_not_exists,
         schema: Schema::empty(),
     })
+}
+
+fn column_default(constraints: &[ColumnConstraint]) -> Result<Option<&Expr>, PlanError> {
+    let mut out = None;
+    for c in constraints {
+        if let ColumnConstraint::Default { expr, .. } = c {
+            if out.is_some() {
+                return Err(PlanError::NotSupported(
+                    "CREATE TABLE: multiple DEFAULT clauses on one column",
+                ));
+            }
+            out = Some(expr);
+        }
+    }
+    Ok(out)
+}
+
+fn column_identity(
+    constraints: &[ColumnConstraint],
+) -> Result<Option<(bool, LogicalSequenceOptions)>, PlanError> {
+    let mut out = None;
+    for c in constraints {
+        if let ColumnConstraint::GeneratedIdentity {
+            always, options, ..
+        } = c
+        {
+            if out.is_some() {
+                return Err(PlanError::NotSupported(
+                    "CREATE TABLE: multiple IDENTITY clauses on one column",
+                ));
+            }
+            out = Some((*always, bind_sequence_options(options)?));
+        }
+    }
+    Ok(out)
+}
+
+fn column_generated_stored(constraints: &[ColumnConstraint]) -> Result<Option<&Expr>, PlanError> {
+    let mut out = None;
+    for c in constraints {
+        if let ColumnConstraint::GeneratedStored { expr, .. } = c {
+            if out.is_some() {
+                return Err(PlanError::NotSupported(
+                    "CREATE TABLE: multiple generated stored clauses on one column",
+                ));
+            }
+            out = Some(expr);
+        }
+    }
+    Ok(out)
+}
+
+fn collect_column_constraints<'a>(
+    table: &str,
+    column: &Identifier,
+    constraints: &'a [ColumnConstraint],
+    checks: &mut Vec<RawCheckConstraint<'a>>,
+    uniques: &mut Vec<RawUniqueConstraint>,
+    foreign_keys: &mut Vec<RawForeignKeyConstraint>,
+    primary_key_seen: &mut bool,
+) -> Result<(), PlanError> {
+    let col = column.value.to_ascii_lowercase();
+    for c in constraints {
+        match c {
+            ColumnConstraint::Check { name, expr, .. } => checks.push(RawCheckConstraint {
+                name: named_or(name.as_ref(), || format!("{table}_{col}_check")),
+                expr,
+            }),
+            ColumnConstraint::Unique { name, .. } => uniques.push(RawUniqueConstraint {
+                name: named_or(name.as_ref(), || format!("{table}_{col}_key")),
+                columns: vec![col.clone()],
+                primary_key: false,
+            }),
+            ColumnConstraint::PrimaryKey { name, .. } => {
+                if *primary_key_seen {
+                    return Err(PlanError::NotSupported(
+                        "CREATE TABLE: multiple PRIMARY KEY constraints",
+                    ));
+                }
+                *primary_key_seen = true;
+                uniques.push(RawUniqueConstraint {
+                    name: named_or(name.as_ref(), || format!("{table}_pkey")),
+                    columns: vec![col.clone()],
+                    primary_key: true,
+                });
+            }
+            ColumnConstraint::References {
+                name,
+                target_table,
+                target_columns,
+                on_delete,
+                on_update,
+                ..
+            } => {
+                if target_columns.is_empty() {
+                    return Err(PlanError::NotSupported(
+                        "CREATE TABLE: REFERENCES without target columns",
+                    ));
+                }
+                foreign_keys.push(RawForeignKeyConstraint {
+                    name: named_or(name.as_ref(), || format!("{table}_{col}_fkey")),
+                    columns: vec![col.clone()],
+                    target_table: object_name_simple(target_table),
+                    target_columns: target_columns
+                        .iter()
+                        .map(|c| c.value.to_ascii_lowercase())
+                        .collect(),
+                    on_delete: bind_referential_action(*on_delete),
+                    on_update: bind_referential_action(*on_update),
+                });
+            }
+            ColumnConstraint::NotNull { .. }
+            | ColumnConstraint::Null { .. }
+            | ColumnConstraint::Default { .. }
+            | ColumnConstraint::GeneratedIdentity { .. }
+            | ColumnConstraint::GeneratedStored { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn collect_table_constraints<'a>(
+    table: &str,
+    constraints: &'a [TableConstraint],
+    checks: &mut Vec<RawCheckConstraint<'a>>,
+    uniques: &mut Vec<RawUniqueConstraint>,
+    foreign_keys: &mut Vec<RawForeignKeyConstraint>,
+    primary_key_seen: &mut bool,
+) -> Result<(), PlanError> {
+    let mut check_ordinal = checks.len();
+    for c in constraints {
+        match c {
+            TableConstraint::Check { name, expr, .. } => {
+                check_ordinal += 1;
+                checks.push(RawCheckConstraint {
+                    name: named_or(name.as_ref(), || format!("{table}_check_{check_ordinal}")),
+                    expr,
+                });
+            }
+            TableConstraint::Unique { name, columns, .. } => {
+                let cols = columns
+                    .iter()
+                    .map(|c| c.value.to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                uniques.push(RawUniqueConstraint {
+                    name: named_or(name.as_ref(), || unique_name(table, &cols, false)),
+                    columns: cols,
+                    primary_key: false,
+                });
+            }
+            TableConstraint::PrimaryKey { name, columns, .. } => {
+                if *primary_key_seen {
+                    return Err(PlanError::NotSupported(
+                        "CREATE TABLE: multiple PRIMARY KEY constraints",
+                    ));
+                }
+                *primary_key_seen = true;
+                let cols = columns
+                    .iter()
+                    .map(|c| c.value.to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                uniques.push(RawUniqueConstraint {
+                    name: named_or(name.as_ref(), || unique_name(table, &cols, true)),
+                    columns: cols,
+                    primary_key: true,
+                });
+            }
+            TableConstraint::ForeignKey {
+                name,
+                columns,
+                target_table,
+                target_columns,
+                on_delete,
+                on_update,
+                ..
+            } => {
+                if target_columns.is_empty() {
+                    return Err(PlanError::NotSupported(
+                        "CREATE TABLE: REFERENCES without target columns",
+                    ));
+                }
+                let cols = columns
+                    .iter()
+                    .map(|c| c.value.to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                foreign_keys.push(RawForeignKeyConstraint {
+                    name: named_or(name.as_ref(), || format!("{}_fkey", cols.join("_"))),
+                    columns: cols,
+                    target_table: object_name_simple(target_table),
+                    target_columns: target_columns
+                        .iter()
+                        .map(|c| c.value.to_ascii_lowercase())
+                        .collect(),
+                    on_delete: bind_referential_action(*on_delete),
+                    on_update: bind_referential_action(*on_update),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn bind_unique_constraints(
+    schema: &Schema,
+    raw_uniques: Vec<RawUniqueConstraint>,
+) -> Result<Vec<LogicalUniqueConstraint>, PlanError> {
+    let mut out = Vec::with_capacity(raw_uniques.len());
+    for raw in raw_uniques {
+        if raw.columns.is_empty() {
+            return Err(PlanError::NotSupported(
+                "CREATE TABLE: empty UNIQUE / PRIMARY KEY column list",
+            ));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(raw.columns.len());
+        let mut cols = Vec::with_capacity(raw.columns.len());
+        for col in raw.columns {
+            if !seen.insert(col.clone()) {
+                return Err(PlanError::DuplicateColumn(col));
+            }
+            let (idx, _) = schema
+                .find(&col)
+                .ok_or_else(|| PlanError::ColumnNotFound(col.clone()))?;
+            cols.push(idx);
+        }
+        out.push(LogicalUniqueConstraint {
+            name: raw.name,
+            columns: cols,
+            primary_key: raw.primary_key,
+        });
+    }
+    Ok(out)
+}
+
+fn bind_foreign_key_constraints(
+    schema: &Schema,
+    raw_foreign_keys: Vec<RawForeignKeyConstraint>,
+    catalog: &dyn Catalog,
+) -> Result<Vec<LogicalForeignKeyConstraint>, PlanError> {
+    let mut out = Vec::with_capacity(raw_foreign_keys.len());
+    for raw in raw_foreign_keys {
+        if raw.columns.len() != raw.target_columns.len() {
+            return Err(PlanError::TypeMismatch(format!(
+                "FOREIGN KEY '{}' has {} referencing columns but {} referenced columns",
+                raw.name,
+                raw.columns.len(),
+                raw.target_columns.len()
+            )));
+        }
+        let target = catalog
+            .lookup_table(&raw.target_table)
+            .ok_or_else(|| PlanError::TableNotFound(raw.target_table.clone()))?;
+        let mut columns = Vec::with_capacity(raw.columns.len());
+        let mut target_columns = Vec::with_capacity(raw.target_columns.len());
+        for (src, dst) in raw.columns.iter().zip(raw.target_columns.iter()) {
+            let (src_idx, src_field) = schema
+                .find(src)
+                .ok_or_else(|| PlanError::ColumnNotFound(src.clone()))?;
+            let (dst_idx, dst_field) = target
+                .schema
+                .find(dst)
+                .ok_or_else(|| PlanError::ColumnNotFound(dst.clone()))?;
+            if src_field.data_type != dst_field.data_type {
+                return Err(PlanError::TypeMismatch(format!(
+                    "FOREIGN KEY '{}' type mismatch: {} {:?} references {} {:?}",
+                    raw.name, src, src_field.data_type, dst, dst_field.data_type
+                )));
+            }
+            columns.push(src_idx);
+            target_columns.push(dst_idx);
+        }
+        out.push(LogicalForeignKeyConstraint {
+            name: raw.name,
+            columns,
+            target_table: raw.target_table,
+            target_columns,
+            on_delete: raw.on_delete,
+            on_update: raw.on_update,
+        });
+    }
+    Ok(out)
+}
+
+const fn bind_referential_action(action: AstReferentialAction) -> LogicalReferentialAction {
+    match action {
+        AstReferentialAction::NoAction => LogicalReferentialAction::NoAction,
+        AstReferentialAction::Restrict => LogicalReferentialAction::Restrict,
+        AstReferentialAction::Cascade => LogicalReferentialAction::Cascade,
+        AstReferentialAction::SetNull => LogicalReferentialAction::SetNull,
+        AstReferentialAction::SetDefault => LogicalReferentialAction::SetDefault,
+    }
+}
+
+fn named_or<F>(name: Option<&Identifier>, fallback: F) -> String
+where
+    F: FnOnce() -> String,
+{
+    name.map_or_else(fallback, |n| n.value.to_ascii_lowercase())
+}
+
+fn unique_name(table: &str, columns: &[String], primary_key: bool) -> String {
+    if primary_key {
+        return format!("{table}_pkey");
+    }
+    let mut s = String::from(table);
+    for col in columns {
+        s.push('_');
+        s.push_str(col);
+    }
+    s.push_str("_key");
+    s
+}
+
+fn is_default_safe(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::Literal { .. } => true,
+        ScalarExpr::Column { .. }
+        | ScalarExpr::Parameter { .. }
+        | ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => false,
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => is_default_safe(expr),
+        ScalarExpr::Binary { left, right, .. } => is_default_safe(left) && is_default_safe(right),
+        ScalarExpr::FunctionCall { args, .. } => args.iter().all(is_default_safe),
+    }
+}
+
+fn is_generated_stored_safe(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::Literal { .. } | ScalarExpr::Column { .. } => true,
+        ScalarExpr::Parameter { .. }
+        | ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => false,
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => {
+            is_generated_stored_safe(expr)
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            is_generated_stored_safe(left) && is_generated_stored_safe(right)
+        }
+        ScalarExpr::FunctionCall { args, .. } => args.iter().all(is_generated_stored_safe),
+    }
+}
+
+fn expr_references_generated_column(expr: &ScalarExpr, generated_columns: &[bool]) -> bool {
+    match expr {
+        ScalarExpr::Column { index, .. } => generated_columns.get(*index).copied().unwrap_or(false),
+        ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => false,
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => {
+            expr_references_generated_column(expr, generated_columns)
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            expr_references_generated_column(left, generated_columns)
+                || expr_references_generated_column(right, generated_columns)
+        }
+        ScalarExpr::OuterColumn { .. } => false,
+        ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => false,
+        ScalarExpr::FunctionCall { args, .. } => args
+            .iter()
+            .any(|arg| expr_references_generated_column(arg, generated_columns)),
+    }
 }
 
 /// Pull the namespace component out of a possibly-qualified relation
@@ -140,14 +714,219 @@ fn resolve_column_nullability(constraints: &[ColumnConstraint]) -> Result<bool, 
             ColumnConstraint::Default { .. }
             | ColumnConstraint::Unique { .. }
             | ColumnConstraint::Check { .. }
-            | ColumnConstraint::References { .. } => {
-                return Err(PlanError::NotSupported(
-                    "CREATE TABLE: only NULL / NOT NULL / PRIMARY KEY column constraints in v0.5",
-                ));
-            }
+            | ColumnConstraint::References { .. }
+            | ColumnConstraint::GeneratedIdentity { .. }
+            | ColumnConstraint::GeneratedStored { .. } => {}
         }
     }
     Ok(nullable)
+}
+
+fn resolve_column_type(
+    table_name: &str,
+    column_name: &str,
+    t: &TypeName,
+) -> Result<(DataType, Option<String>), PlanError> {
+    if t.is_array {
+        return Err(PlanError::NotSupported("CREATE TABLE: ARRAY column types"));
+    }
+    if !t.type_modifiers.is_empty() {
+        match t.name.value.as_str() {
+            "serial" | "serial4" | "bigserial" | "serial8" | "smallserial" | "serial2" => {
+                return Err(PlanError::NotSupported(
+                    "CREATE TABLE: SERIAL type modifiers",
+                ));
+            }
+            _ => {}
+        }
+    }
+    let dtype = match t.name.value.as_str() {
+        "serial" | "serial4" => DataType::Int32,
+        "bigserial" | "serial8" => DataType::Int64,
+        "smallserial" | "serial2" => DataType::Int16,
+        _ => return resolve_type_name(t).map(|dtype| (dtype, None)),
+    };
+    Ok((
+        dtype,
+        Some(format!(
+            "{}_{}_seq",
+            table_name.to_ascii_lowercase(),
+            column_name.to_ascii_lowercase()
+        )),
+    ))
+}
+
+pub(super) fn bind_create_sequence(s: &CreateSequenceStmt) -> Result<LogicalPlan, PlanError> {
+    let sequence_name = object_name_simple(&s.name);
+    let namespace = object_name_namespace(&s.name);
+    let options = bind_sequence_options(&s.options)?;
+    Ok(LogicalPlan::CreateSequence {
+        sequence_name,
+        namespace,
+        options,
+        if_not_exists: s.if_not_exists,
+        schema: Schema::empty(),
+    })
+}
+
+pub(super) fn bind_alter_sequence(s: &AlterSequenceStmt) -> Result<LogicalPlan, PlanError> {
+    let sequence_name = object_name_simple(&s.name);
+    let options = bind_sequence_change(&s.options)?;
+    Ok(LogicalPlan::AlterSequence {
+        sequence_name,
+        options,
+        schema: Schema::empty(),
+    })
+}
+
+pub(super) fn bind_drop_sequence(s: &DropSequenceStmt) -> Result<LogicalPlan, PlanError> {
+    let sequences = s.names.iter().map(object_name_simple).collect();
+    Ok(LogicalPlan::DropSequence {
+        sequences,
+        if_exists: s.if_exists,
+        cascade: s.cascade,
+        schema: Schema::empty(),
+    })
+}
+
+pub(super) fn bind_comment(
+    s: &CommentStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
+    let target = match &s.target {
+        CommentTarget::Table(name) => {
+            let table = object_name_simple(name);
+            if catalog.lookup_table(&table).is_none() {
+                return Err(PlanError::TableNotFound(table));
+            }
+            LogicalCommentTarget::Table { table }
+        }
+        CommentTarget::Index(name) => LogicalCommentTarget::Index {
+            index: object_name_simple(name),
+        },
+        CommentTarget::Column(name) => bind_comment_column_target(name, catalog)?,
+    };
+    Ok(LogicalPlan::Comment {
+        target,
+        comment: s.comment.clone(),
+        schema: Schema::empty(),
+    })
+}
+
+fn bind_comment_column_target(
+    name: &ObjectName,
+    catalog: &dyn Catalog,
+) -> Result<LogicalCommentTarget, PlanError> {
+    if name.parts.len() < 2 {
+        return Err(PlanError::NotSupported(
+            "COMMENT ON COLUMN requires table.column",
+        ));
+    }
+    let column = name
+        .parts
+        .last()
+        .map_or_else(String::new, |p| p.value.to_ascii_lowercase());
+    let table = name.parts[name.parts.len() - 2].value.to_ascii_lowercase();
+    let meta = catalog
+        .lookup_table(&table)
+        .ok_or_else(|| PlanError::TableNotFound(table.clone()))?;
+    let Some(idx) = meta
+        .schema
+        .fields()
+        .iter()
+        .position(|f| f.name.eq_ignore_ascii_case(&column))
+    else {
+        return Err(PlanError::ColumnNotFound(column));
+    };
+    let attnum = i32::try_from(idx + 1)
+        .map_err(|_| PlanError::NotSupported("COMMENT ON COLUMN attnum overflow"))?;
+    Ok(LogicalCommentTarget::Column {
+        table,
+        column,
+        attnum,
+    })
+}
+
+fn bind_sequence_options(options: &[SequenceOption]) -> Result<LogicalSequenceOptions, PlanError> {
+    let mut out = LogicalSequenceOptions::default();
+    let mut explicit_start = None;
+    for option in options {
+        match *option {
+            SequenceOption::Start(v) => explicit_start = Some(v),
+            SequenceOption::Restart(_) => {
+                return Err(PlanError::NotSupported(
+                    "CREATE SEQUENCE: RESTART is only valid in ALTER SEQUENCE",
+                ));
+            }
+            SequenceOption::Increment(v) => out.increment = v,
+            SequenceOption::MinValue(v) => out.min = v,
+            SequenceOption::MaxValue(v) => out.max = v,
+            SequenceOption::Cache(v) => {
+                out.cache = u32::try_from(v).map_err(|_| {
+                    PlanError::TypeMismatch("sequence CACHE does not fit u32".to_owned())
+                })?;
+            }
+            SequenceOption::Cycle(v) => out.cycle = v,
+        }
+    }
+    out.start = explicit_start.unwrap_or_else(|| default_sequence_start(out));
+    validate_sequence_options(out)?;
+    Ok(out)
+}
+
+fn bind_sequence_change(options: &[SequenceOption]) -> Result<LogicalSequenceChange, PlanError> {
+    let mut out = LogicalSequenceChange::default();
+    for option in options {
+        match *option {
+            SequenceOption::Start(v) => out.start = Some(v),
+            SequenceOption::Restart(v) => out.restart = Some(v),
+            SequenceOption::Increment(v) => out.increment = Some(v),
+            SequenceOption::MinValue(v) => out.min = Some(v),
+            SequenceOption::MaxValue(v) => out.max = Some(v),
+            SequenceOption::Cache(v) => {
+                out.cache = Some(u32::try_from(v).map_err(|_| {
+                    PlanError::TypeMismatch("sequence CACHE does not fit u32".to_owned())
+                })?);
+            }
+            SequenceOption::Cycle(v) => out.cycle = Some(v),
+        }
+    }
+    Ok(out)
+}
+
+fn validate_sequence_options(options: LogicalSequenceOptions) -> Result<(), PlanError> {
+    if options.increment == 0 {
+        return Err(PlanError::TypeMismatch(
+            "sequence INCREMENT must not be zero".to_owned(),
+        ));
+    }
+    if options.cache == 0 {
+        return Err(PlanError::TypeMismatch(
+            "sequence CACHE must be greater than zero".to_owned(),
+        ));
+    }
+    let ascending = options.increment > 0;
+    let min = options.min.unwrap_or(if ascending { 1 } else { i64::MIN });
+    let max = options.max.unwrap_or(if ascending { i64::MAX } else { -1 });
+    if min >= max {
+        return Err(PlanError::TypeMismatch(
+            "sequence MINVALUE must be less than MAXVALUE".to_owned(),
+        ));
+    }
+    if options.start < min || options.start > max {
+        return Err(PlanError::TypeMismatch(
+            "sequence START is outside MINVALUE/MAXVALUE".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn default_sequence_start(options: LogicalSequenceOptions) -> i64 {
+    if options.increment > 0 {
+        options.min.unwrap_or(1)
+    } else {
+        options.max.unwrap_or(-1)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -182,7 +182,11 @@ pub fn build_operator(
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
-        | LogicalPlan::AlterTable { .. } => Err(BuildError::Unsupported(
+        | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::CreateSequence { .. }
+        | LogicalPlan::AlterSequence { .. }
+        | LogicalPlan::DropSequence { .. }
+        | LogicalPlan::Comment { .. } => Err(BuildError::Unsupported(
             "DDL is dispatched outside the operator pipeline",
         )),
         LogicalPlan::Begin { .. }

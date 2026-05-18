@@ -181,6 +181,56 @@ fn duplicate_insert_returns_duplicate_key_error() {
 }
 
 #[test]
+fn non_unique_insert_allows_duplicate_keys_and_lookup_all_returns_every_tid() {
+    let mut tree = make_tree();
+    for block in 1_u32..=40 {
+        tree.insert_non_unique::<i64>(7, tid(block, 0), Xid::new(1), None)
+            .unwrap();
+    }
+
+    let found = tree.lookup_all::<i64>(7).unwrap();
+    let expected: Vec<_> = (1_u32..=40).map(|block| tid(block, 0)).collect();
+    assert_eq!(found, expected);
+
+    let range_found: Vec<_> = tree
+        .range_scan::<i64>(7, Some(8))
+        .map(|entry| entry.unwrap().1)
+        .collect();
+    assert_eq!(range_found, expected);
+}
+
+#[test]
+fn delete_removes_key_and_allows_reinsert() {
+    let mut tree = make_tree();
+    tree.insert::<i64>(7, tid(1, 0), Xid::new(1), None).unwrap();
+
+    assert!(tree.delete::<i64>(7, tid(1, 0)).unwrap());
+    assert!(tree.lookup::<i64>(7).unwrap().is_none());
+    assert!(!tree.delete::<i64>(7, tid(1, 0)).unwrap());
+
+    tree.insert::<i64>(7, tid(2, 0), Xid::new(2), None).unwrap();
+    assert_eq!(tree.lookup::<i64>(7).unwrap(), Some(tid(2, 0)));
+}
+
+#[test]
+fn delete_logged_emits_btree_delete_record() {
+    use crate::wal_sink::test_support::InMemoryWalSink;
+    use ultrasql_wal::record::RecordType;
+
+    let mut tree = make_tree();
+    let sink = InMemoryWalSink::new();
+    tree.insert::<i64>(7, tid(1, 0), Xid::new(1), None).unwrap();
+
+    assert!(
+        tree.delete_logged::<i64>(7, tid(1, 0), Xid::new(2), Some(&sink))
+            .unwrap()
+    );
+    let records = sink.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].1.header.record_type, RecordType::BTreeOp);
+}
+
+#[test]
 fn one_split_keeps_root_lookup_correct() {
     // MAX_LEAF_ENTRIES = 32; inserting 33+ keys forces a split.
     let mut tree = make_tree();

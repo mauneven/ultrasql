@@ -13,6 +13,7 @@ use ultrasql_planner::ScalarExpr;
 use crate::error::ServerError;
 
 use super::LowerCtx;
+use super::catalog_views::try_virtual_catalog_scan;
 
 pub(super) fn lower_catalog_or_sample_scan(
     table: &str,
@@ -25,6 +26,9 @@ pub(super) fn lower_catalog_or_sample_scan(
             Arc::clone(&buffer.batches),
             buffer.schema.clone(),
         ));
+        return apply_projection(scan, projection);
+    }
+    if let Some(scan) = try_virtual_catalog_scan(table, ctx)? {
         return apply_projection(scan, projection);
     }
     if let Some(entry) = ctx.catalog_snapshot.tables.get(&folded) {

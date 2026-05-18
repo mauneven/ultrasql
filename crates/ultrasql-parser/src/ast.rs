@@ -82,6 +82,8 @@ pub enum Statement {
     AlterSequence(Box<AlterSequenceStmt>),
     /// `DROP SEQUENCE …`.
     DropSequence(DropSequenceStmt),
+    /// `COMMENT ON TABLE/COLUMN ... IS ...`.
+    Comment(CommentStmt),
     /// `SAVEPOINT name`.
     Savepoint(SavepointStmt),
     /// `ROLLBACK TO [SAVEPOINT] name`.
@@ -183,6 +185,7 @@ impl Statement {
             Self::CreateSequence(s) => s.span,
             Self::AlterSequence(s) => s.span,
             Self::DropSequence(s) => s.span,
+            Self::Comment(s) => s.span,
             Self::Savepoint(s) => s.span,
             Self::RollbackToSavepoint(s) => s.span,
             Self::ReleaseSavepoint(s) => s.span,
@@ -371,9 +374,48 @@ pub enum ColumnConstraint {
         target_table: ObjectName,
         /// Referenced columns (may be empty if targeting the primary key).
         target_columns: Vec<Identifier>,
+        /// Action when a referenced row is deleted.
+        on_delete: ReferentialAction,
+        /// Action when a referenced key is updated.
+        on_update: ReferentialAction,
         /// Source span.
         span: Span,
     },
+    /// `GENERATED ALWAYS | BY DEFAULT AS IDENTITY [(sequence_options)]`.
+    GeneratedIdentity {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
+        /// `true` for `ALWAYS`; `false` for `BY DEFAULT`.
+        always: bool,
+        /// Sequence options inside the optional identity option list.
+        options: Vec<SequenceOption>,
+        /// Source span.
+        span: Span,
+    },
+    /// `GENERATED ALWAYS AS (expr) STORED`.
+    GeneratedStored {
+        /// Optional `CONSTRAINT name` label. `None` when no name was given.
+        name: Option<Identifier>,
+        /// Stored generated expression.
+        expr: Expr,
+        /// Source span.
+        span: Span,
+    },
+}
+
+/// Referential action attached to a foreign key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReferentialAction {
+    /// `NO ACTION`.
+    NoAction,
+    /// `RESTRICT`.
+    Restrict,
+    /// `CASCADE`.
+    Cascade,
+    /// `SET NULL`.
+    SetNull,
+    /// `SET DEFAULT`.
+    SetDefault,
 }
 
 /// Table-level constraint inside `CREATE TABLE` or `ALTER TABLE ADD CONSTRAINT`.
@@ -409,6 +451,10 @@ pub enum TableConstraint {
         target_table: ObjectName,
         /// Referenced columns (may be empty).
         target_columns: Vec<Identifier>,
+        /// Action when a referenced row is deleted.
+        on_delete: ReferentialAction,
+        /// Action when a referenced key is updated.
+        on_update: ReferentialAction,
         /// Source span.
         span: Span,
     },
@@ -684,11 +730,35 @@ pub struct DropSequenceStmt {
     pub span: Span,
 }
 
+/// `COMMENT ON ... IS ...`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommentStmt {
+    /// Commented object.
+    pub target: CommentTarget,
+    /// Comment body. `None` represents `IS NULL`, which removes a comment.
+    pub comment: Option<String>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Object kind accepted by `COMMENT ON`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommentTarget {
+    /// `COMMENT ON TABLE rel IS ...`.
+    Table(ObjectName),
+    /// `COMMENT ON INDEX idx IS ...`.
+    Index(ObjectName),
+    /// `COMMENT ON COLUMN rel.col IS ...`.
+    Column(ObjectName),
+}
+
 /// One option clause in `CREATE SEQUENCE` or `ALTER SEQUENCE`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SequenceOption {
     /// `START [WITH] n`.
     Start(i64),
+    /// `RESTART [[WITH] n]`.
+    Restart(Option<i64>),
     /// `INCREMENT [BY] n`.
     Increment(i64),
     /// `MINVALUE n` or `NO MINVALUE`.

@@ -107,6 +107,9 @@ impl Default for SequenceOptions {
 /// The durable state of a sequence (persisted to the heap page).
 #[derive(Clone, Debug)]
 struct SequenceState {
+    /// Configured restart value from `CREATE SEQUENCE START WITH` or
+    /// `ALTER SEQUENCE START WITH`.
+    start_value: i64,
     /// The next value to be returned by `nextval` (or the last value
     /// returned when `is_called` is false — see `setval`).
     last_value: i64,
@@ -153,6 +156,7 @@ impl SequenceState {
         }
         let cache_size = opts.cache.max(1);
         Ok(Self {
+            start_value: start,
             last_value: start,
             is_called: false,
             min_value,
@@ -296,6 +300,58 @@ impl Sequence {
         Ok(())
     }
 
+    /// Return a snapshot of the current sequence configuration.
+    pub fn options_snapshot(&self) -> SequenceOptions {
+        let state = self.state.lock();
+        SequenceOptions {
+            start: state.start_value,
+            increment: state.increment,
+            min: Some(state.min_value),
+            max: Some(state.max_value),
+            cache: state.cache_size,
+            cycle: state.cycle,
+        }
+    }
+
+    /// Replace sequence options, optionally restarting current value.
+    ///
+    /// When `restart` is `None`, the current `last_value`/`is_called`
+    /// state is preserved after validating it fits inside the new
+    /// bounds. `ALTER SEQUENCE ... START WITH` changes only the
+    /// configured restart value; `ALTER SEQUENCE ... RESTART [WITH n]`
+    /// passes `Some(n)` and makes the next [`Self::nextval`] return `n`.
+    pub fn alter_options(
+        &self,
+        opts: SequenceOptions,
+        restart: Option<i64>,
+    ) -> Result<(), SequenceError> {
+        let mut next_state = SequenceState::from_opts(&opts)?;
+        let mut state = self.state.lock();
+        if let Some(value) = restart {
+            if value < next_state.min_value || value > next_state.max_value {
+                return Err(SequenceError::OutOfRange {
+                    value,
+                    min: next_state.min_value,
+                    max: next_state.max_value,
+                });
+            }
+            next_state.last_value = value;
+            next_state.is_called = false;
+        } else {
+            if state.last_value < next_state.min_value || state.last_value > next_state.max_value {
+                return Err(SequenceError::OutOfRange {
+                    value: state.last_value,
+                    min: next_state.min_value,
+                    max: next_state.max_value,
+                });
+            }
+            next_state.last_value = state.last_value;
+            next_state.is_called = state.is_called;
+        }
+        *state = next_state;
+        Ok(())
+    }
+
     /// Return the configured minimum value.
     pub fn min_value(&self) -> i64 {
         self.state.lock().min_value
@@ -406,6 +462,33 @@ mod tests {
                 max: 10
             }
         ));
+    }
+
+    #[test]
+    fn alter_start_preserves_current_value_until_restart() {
+        let seq = ascending();
+        assert_eq!(seq.nextval().unwrap(), 1);
+        assert_eq!(seq.nextval().unwrap(), 2);
+
+        let mut opts = seq.options_snapshot();
+        opts.start = 50;
+        seq.alter_options(opts, None).unwrap();
+        assert_eq!(seq.nextval().unwrap(), 3);
+
+        let opts = seq.options_snapshot();
+        seq.alter_options(opts, Some(opts.start)).unwrap();
+        assert_eq!(seq.nextval().unwrap(), 50);
+    }
+
+    #[test]
+    fn alter_increment_preserves_current_last_value() {
+        let seq = ascending();
+        assert_eq!(seq.nextval().unwrap(), 1);
+
+        let mut opts = seq.options_snapshot();
+        opts.increment = 10;
+        seq.alter_options(opts, None).unwrap();
+        assert_eq!(seq.nextval().unwrap(), 11);
     }
 
     // --- Exhaustion and CYCLE ---

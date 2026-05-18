@@ -560,6 +560,22 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
             nulls.is_some_and(|b| !b.get(i))
         };
         match (col, &field.data_type) {
+            (Column::Int32(c), DataType::Int16) => {
+                let nulls = c.nulls();
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    if is_null(nulls, row_idx) {
+                        row.push(Value::Null);
+                    } else {
+                        let v = i16::try_from(c.data()[row_idx]).map_err(|_| {
+                            ExecError::TypeMismatch(format!(
+                                "column {col_idx} ({name}): Int16 value out of range",
+                                name = field.name,
+                            ))
+                        })?;
+                        row.push(Value::Int16(v));
+                    }
+                }
+            }
             (Column::Int32(c), DataType::Int32) => {
                 let nulls = c.nulls();
                 for (row_idx, row) in rows.iter_mut().enumerate() {

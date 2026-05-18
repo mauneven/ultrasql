@@ -25,12 +25,15 @@
 //! whenever `L: PageLoader + Send + Sync` and the WAL sink (when present)
 //! implements `Send + Sync`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Value, Xid};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_storage::PageLoader;
+use ultrasql_storage::btree::{BTree, BTreeError};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions, UpdatePayload};
+use ultrasql_storage::sequence::Sequence;
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_storage::wal_sink::WalSink;
 use ultrasql_vec::Batch;
@@ -75,6 +78,167 @@ struct UpdateFastPathInt32Pair {
     /// Constant added to the target column on every row. For
     /// `val = val + 1` this is `1`; for `val = val - 5` this is `-5`.
     delta: i32,
+}
+
+/// Shared callback type used by insert-side index maintenance.
+///
+/// The callback receives the decoded target-table row and returns the
+/// `i64` B-tree key for that index, or `None` when the key is SQL NULL
+/// and should be omitted from the index.
+pub type InsertIndexEncoder = Arc<dyn Fn(&[Value]) -> Result<Option<i64>, ExecError> + Send + Sync>;
+
+/// Row-level DML constraint callback.
+pub type RowConstraintCheck = Arc<dyn Fn(&[Value]) -> Result<(), ExecError> + Send + Sync>;
+
+/// Row-level UPDATE constraint callback over `(old_row, new_row)`.
+pub type RowUpdateConstraintCheck =
+    Arc<dyn Fn(&[Value], &[Value]) -> Result<(), ExecError> + Send + Sync>;
+
+/// Observer called after a sequence-backed default generates a value.
+pub type SequenceNextvalObserver = Arc<dyn Fn(&str, i64) + Send + Sync>;
+
+/// Runtime descriptor for maintaining one B-tree during
+/// [`ModifyKind::Insert`].
+///
+/// `ModifyTable` owns the opened tree handle and calls `encode` for
+/// each decoded insert row before the heap write. Duplicate keys are
+/// detected before `HeapAccess::insert_batch`, so a rejected batch does
+/// not leak rows into the heap.
+pub struct InsertIndexMaintainer<L: PageLoader> {
+    name: String,
+    tree: BTree<L>,
+    encode: InsertIndexEncoder,
+    unique: bool,
+}
+
+impl<L: PageLoader> std::fmt::Debug for InsertIndexMaintainer<L> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InsertIndexMaintainer")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<L: PageLoader> InsertIndexMaintainer<L> {
+    /// Construct a maintainer for one already-created B-tree index.
+    #[must_use]
+    pub fn new<N: Into<String>>(
+        name: N,
+        tree: BTree<L>,
+        encode: InsertIndexEncoder,
+        unique: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            tree,
+            encode,
+            unique,
+        }
+    }
+
+    fn encode_key(&self, row: &[Value]) -> Result<Option<i64>, ExecError> {
+        (self.encode)(row)
+    }
+
+    fn contains_key(&self, key: i64) -> Result<bool, ExecError> {
+        self.tree
+            .lookup::<i64>(key)
+            .map(|tid| tid.is_some())
+            .map_err(|e| ExecError::TypeMismatch(format!("index lookup {}: {e}", self.name)))
+    }
+
+    const fn is_unique(&self) -> bool {
+        self.unique
+    }
+
+    fn insert_key(
+        &mut self,
+        key: i64,
+        tid: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), ExecError> {
+        let result = if self.unique {
+            self.tree.insert(key, tid, xid, wal)
+        } else {
+            self.tree.insert_non_unique(key, tid, xid, wal)
+        };
+        result.map_err(|e| match e {
+            BTreeError::DuplicateKey => ExecError::UniqueViolation(self.name.clone()),
+            other => ExecError::TypeMismatch(format!("index insert {}: {other}", self.name)),
+        })
+    }
+
+    fn delete_key(
+        &mut self,
+        key: i64,
+        tid: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<bool, ExecError> {
+        self.tree
+            .delete_logged::<i64>(key, tid, xid, wal)
+            .map_err(|e| ExecError::TypeMismatch(format!("index delete {}: {e}", self.name)))
+    }
+}
+
+struct ComputedUpdate {
+    tid: TupleId,
+    payload: UpdatePayload,
+    index_change: Option<UpdateIndexChange>,
+}
+
+struct UpdateIndexChange {
+    old_tid: TupleId,
+    old_keys: Vec<Option<i64>>,
+    new_keys: Vec<Option<i64>>,
+}
+
+struct DeleteIndexChange {
+    tid: TupleId,
+    keys: Vec<Option<i64>>,
+}
+
+#[derive(Clone, Debug)]
+struct CheckEvaluator {
+    name: String,
+    evaluator: Eval,
+}
+
+/// Runtime descriptor for a sequence-backed column default.
+#[derive(Clone)]
+pub struct SequenceDefault {
+    name: String,
+    sequence: Arc<Sequence>,
+    on_nextval: Option<SequenceNextvalObserver>,
+}
+
+impl std::fmt::Debug for SequenceDefault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SequenceDefault")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SequenceDefault {
+    /// Build a sequence default that advances `sequence` when the
+    /// corresponding INSERT column is omitted.
+    #[must_use]
+    pub fn new<N: Into<String>>(name: N, sequence: Arc<Sequence>) -> Self {
+        Self {
+            name: name.into(),
+            sequence,
+            on_nextval: None,
+        }
+    }
+
+    /// Attach a session-local observer called with every generated value.
+    #[must_use]
+    pub fn with_observer(mut self, on_nextval: SequenceNextvalObserver) -> Self {
+        self.on_nextval = Some(on_nextval);
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +318,18 @@ pub struct ModifyTable<L: PageLoader> {
     delete_cmax: CommandId,
     wal: Option<Arc<dyn WalSink>>,
     vm: Option<Arc<VisibilityMap>>,
+    insert_indexes: Vec<InsertIndexMaintainer<L>>,
+    update_indexes: Vec<InsertIndexMaintainer<L>>,
+    delete_indexes: Vec<InsertIndexMaintainer<L>>,
+    insert_column_map: Option<Vec<usize>>,
+    column_defaults: Vec<Option<Eval>>,
+    sequence_defaults: Vec<Option<SequenceDefault>>,
+    identity_always: Vec<bool>,
+    generated_stored: Vec<Option<Eval>>,
+    check_constraints: Vec<CheckEvaluator>,
+    foreign_key_checks: Vec<RowConstraintCheck>,
+    referenced_by_delete_checks: Vec<RowConstraintCheck>,
+    referenced_by_update_checks: Vec<RowUpdateConstraintCheck>,
     child: Box<dyn Operator>,
     done: bool,
     affected: u64,
@@ -239,6 +415,18 @@ impl<L: PageLoader> ModifyTable<L> {
             delete_cmax,
             wal,
             vm: None,
+            insert_indexes: Vec::new(),
+            update_indexes: Vec::new(),
+            delete_indexes: Vec::new(),
+            insert_column_map: None,
+            column_defaults: Vec::new(),
+            sequence_defaults: Vec::new(),
+            identity_always: Vec::new(),
+            generated_stored: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_key_checks: Vec::new(),
+            referenced_by_delete_checks: Vec::new(),
+            referenced_by_update_checks: Vec::new(),
             child,
             done: false,
             affected: 0,
@@ -250,6 +438,114 @@ impl<L: PageLoader> ModifyTable<L> {
     #[must_use]
     pub fn with_visibility_map(mut self, vm: Arc<VisibilityMap>) -> Self {
         self.vm = Some(vm);
+        self
+    }
+
+    /// Attach B-tree index maintainers used by the INSERT arm.
+    ///
+    /// The operator updates these indexes after the heap batch returns
+    /// the inserted tuple IDs. Duplicate key checks run before the heap
+    /// write so statement-level rejection remains atomic for this path.
+    #[must_use]
+    pub fn with_insert_indexes(mut self, indexes: Vec<InsertIndexMaintainer<L>>) -> Self {
+        self.insert_indexes = indexes;
+        self
+    }
+
+    /// Attach B-tree index maintainers used by the UPDATE arm.
+    #[must_use]
+    pub fn with_update_indexes(mut self, indexes: Vec<InsertIndexMaintainer<L>>) -> Self {
+        self.update_indexes = indexes;
+        self
+    }
+
+    /// Attach B-tree index maintainers used by the DELETE arm.
+    #[must_use]
+    pub fn with_delete_indexes(mut self, indexes: Vec<InsertIndexMaintainer<L>>) -> Self {
+        self.delete_indexes = indexes;
+        self
+    }
+
+    /// Attach a source-to-target column map for INSERT.
+    ///
+    /// `map[src_idx] = target_idx`. Target columns omitted by `map`
+    /// are filled with [`Value::Null`] before NOT NULL checks, index
+    /// key encoding, and heap row encoding run.
+    #[must_use]
+    pub fn with_insert_column_map(mut self, map: Vec<usize>) -> Self {
+        self.insert_column_map = Some(map);
+        self
+    }
+
+    /// Attach per-column DEFAULT expressions evaluated for omitted
+    /// INSERT columns.
+    #[must_use]
+    pub fn with_column_defaults(mut self, defaults: Vec<Option<ScalarExpr>>) -> Self {
+        self.column_defaults = defaults
+            .into_iter()
+            .map(|expr| expr.map(Eval::new))
+            .collect();
+        self
+    }
+
+    /// Attach per-column sequence-backed defaults.
+    #[must_use]
+    pub fn with_sequence_defaults(mut self, defaults: Vec<Option<SequenceDefault>>) -> Self {
+        self.sequence_defaults = defaults;
+        self
+    }
+
+    /// Attach per-column `GENERATED ALWAYS AS IDENTITY` flags.
+    #[must_use]
+    pub fn with_identity_always(mut self, identity_always: Vec<bool>) -> Self {
+        self.identity_always = identity_always;
+        self
+    }
+
+    /// Attach per-column stored generated expressions.
+    #[must_use]
+    pub fn with_generated_stored(mut self, generated: Vec<Option<ScalarExpr>>) -> Self {
+        self.generated_stored = generated
+            .into_iter()
+            .map(|expr| expr.map(Eval::new))
+            .collect();
+        self
+    }
+
+    /// Attach row-level CHECK constraints evaluated for INSERT/UPDATE.
+    #[must_use]
+    pub fn with_check_constraints(mut self, checks: Vec<(String, ScalarExpr)>) -> Self {
+        self.check_constraints = checks
+            .into_iter()
+            .map(|(name, expr)| CheckEvaluator {
+                name,
+                evaluator: Eval::new(expr),
+            })
+            .collect();
+        self
+    }
+
+    /// Attach FOREIGN KEY checks for rows written by INSERT/UPDATE.
+    #[must_use]
+    pub fn with_foreign_key_checks(mut self, checks: Vec<RowConstraintCheck>) -> Self {
+        self.foreign_key_checks = checks;
+        self
+    }
+
+    /// Attach RESTRICT/NO ACTION checks for parent rows deleted by this operator.
+    #[must_use]
+    pub fn with_referenced_by_delete_checks(mut self, checks: Vec<RowConstraintCheck>) -> Self {
+        self.referenced_by_delete_checks = checks;
+        self
+    }
+
+    /// Attach RESTRICT/NO ACTION checks for parent key UPDATEs.
+    #[must_use]
+    pub fn with_referenced_by_update_checks(
+        mut self,
+        checks: Vec<RowUpdateConstraintCheck>,
+    ) -> Self {
+        self.referenced_by_update_checks = checks;
         self
     }
 }
@@ -355,6 +651,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
         // that overhead from `O(n_batches)` to `O(1)` while keeping the
         // per-row cost identical.
         let mut all_update_edits: Vec<(TupleId, UpdatePayload)> = Vec::new();
+        let mut all_update_index_changes: Vec<UpdateIndexChange> = Vec::new();
 
         // Drain the entire child input.
         loop {
@@ -374,7 +671,13 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     // `heap.delete_many`. No `batch_to_rows`
                     // materialisation, no per-row `Vec<Value>`
                     // intermediate.
-                    let tids = extract_tids_from_batch(&batch, self.relation)?;
+                    let (tids, delete_index_changes) = if self.delete_indexes.is_empty()
+                        && self.referenced_by_delete_checks.is_empty()
+                    {
+                        (extract_tids_from_batch(&batch, self.relation)?, Vec::new())
+                    } else {
+                        self.extract_delete_tids_and_index_changes(&batch)?
+                    };
                     let n = tids.len();
                     let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
                     self.heap
@@ -389,6 +692,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             },
                         )
                         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                    self.apply_delete_index_changes(&delete_index_changes)?;
                     let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
                     self.affected = self.affected.saturating_add(n_u64);
                 }
@@ -398,7 +702,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     // tuple's 9-byte payload inline from the batch's
                     // column arrays — no `batch_to_rows`, no per-row
                     // `Eval`, no per-row `RowCodec::encode` tree walk.
-                    let edits = if let Some(spec) = self.update_fast_path {
+                    let edits = if let Some(spec) = self.update_fast_path.filter(|_| {
+                        self.check_constraints.is_empty()
+                            && self.foreign_key_checks.is_empty()
+                            && self.referenced_by_update_checks.is_empty()
+                    }) {
                         build_update_edits_int32_pair(&batch, self.relation, spec)?
                     } else {
                         // Slow path: batch_to_rows + per-row eval +
@@ -410,8 +718,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         let mut edits: Vec<(TupleId, UpdatePayload)> =
                             Vec::with_capacity(rows.len());
                         for row in &rows {
-                            let edit = self.compute_update_edit(row)?;
-                            edits.push(edit);
+                            let computed = self.compute_update_edit(row)?;
+                            if let Some(index_change) = computed.index_change {
+                                all_update_index_changes.push(index_change);
+                            }
+                            edits.push((computed.tid, computed.payload));
                         }
                         edits
                     };
@@ -435,18 +746,74 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
                     let target_schema = self.codec.schema();
                     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
+                    let mut index_keys: Vec<Vec<Option<i64>>> = self
+                        .insert_indexes
+                        .iter()
+                        .map(|_| Vec::with_capacity(rows.len()))
+                        .collect();
+                    let mut seen_keys: Vec<HashSet<i64>> =
+                        self.insert_indexes.iter().map(|_| HashSet::new()).collect();
                     for row in &rows {
-                        check_not_null_violations(row, target_schema)?;
+                        let mut expanded_row;
+                        let omitted;
+                        let target_row = if self.insert_column_map.is_some()
+                            || !self.column_defaults.is_empty()
+                            || !self.sequence_defaults.is_empty()
+                            || !self.identity_always.is_empty()
+                            || !self.generated_stored.is_empty()
+                            || !self.check_constraints.is_empty()
+                        {
+                            if let Some(column_map) = &self.insert_column_map {
+                                let expanded =
+                                    expand_insert_row(row, target_schema.len(), column_map)?;
+                                expanded_row = expanded.values;
+                                omitted = expanded.omitted;
+                            } else {
+                                expanded_row = row.clone();
+                                omitted = vec![false; target_schema.len()];
+                            }
+                            self.check_identity_explicit_values(&omitted)?;
+                            self.apply_insert_defaults(&mut expanded_row, &omitted)?;
+                            self.check_generated_stored_explicit_values(&omitted)?;
+                            self.apply_generated_stored(&mut expanded_row)?;
+                            self.check_row_constraints(&expanded_row)?;
+                            self.check_foreign_keys(&expanded_row)?;
+                            expanded_row.as_slice()
+                        } else {
+                            row.as_slice()
+                        };
+                        if self.insert_column_map.is_none()
+                            && self.column_defaults.is_empty()
+                            && self.sequence_defaults.is_empty()
+                            && self.identity_always.is_empty()
+                            && self.generated_stored.is_empty()
+                            && self.check_constraints.is_empty()
+                        {
+                            self.check_foreign_keys(target_row)?;
+                        }
+                        check_not_null_violations(target_row, target_schema)?;
+                        for (idx, index) in self.insert_indexes.iter_mut().enumerate() {
+                            let key = index.encode_key(target_row)?;
+                            if let Some(k) = key {
+                                if index.is_unique()
+                                    && (!seen_keys[idx].insert(k) || index.contains_key(k)?)
+                                {
+                                    return Err(ExecError::UniqueViolation(index.name.clone()));
+                                }
+                            }
+                            index_keys[idx].push(key);
+                        }
                         let payload = self
                             .codec
-                            .encode(row)
+                            .encode(target_row)
                             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
                         payloads.push(payload);
                     }
                     let n = payloads.len();
                     let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
                     let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
-                    self.heap
+                    let tids = self
+                        .heap
                         .insert_batch(
                             self.relation,
                             &payload_refs,
@@ -459,7 +826,21 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             },
                         )
                         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
-                    self.affected = self.affected.saturating_add(n as u64);
+                    debug_assert_eq!(tids.len(), payloads.len());
+                    for (idx, index) in self.insert_indexes.iter_mut().enumerate() {
+                        for (row_idx, key) in index_keys[idx].iter().enumerate() {
+                            if let Some(k) = key {
+                                let Some(tid) = tids.get(row_idx).copied() else {
+                                    return Err(ExecError::Internal(
+                                        "heap insert_batch returned fewer TIDs than payloads",
+                                    ));
+                                };
+                                index.insert_key(*k, tid, self.insert_xmin, wal_ref)?;
+                            }
+                        }
+                    }
+                    let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
+                    self.affected = self.affected.saturating_add(n_u64);
                 }
             }
         }
@@ -468,19 +849,27 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
         // accumulated. See the `all_update_edits` comment above.
         if matches!(self.kind, ModifyKind::Update { .. }) && !all_update_edits.is_empty() {
             let n = all_update_edits.len();
-            let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
-            self.heap
-                .update_many(
-                    all_update_edits,
-                    UpdateOptions {
-                        xid: self.delete_xmax,
-                        command_id: self.delete_cmax,
-                        hot_eligible: true,
-                        wal: wal_ref,
-                        vm: self.vm.as_deref(),
-                    },
-                )
-                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+            let wal = self.wal.clone();
+            let wal_ref: Option<&dyn WalSink> = wal.as_deref();
+            let update_opts = UpdateOptions {
+                xid: self.delete_xmax,
+                command_id: self.delete_cmax,
+                hot_eligible: self.update_indexes.is_empty(),
+                wal: wal_ref,
+                vm: self.vm.as_deref(),
+            };
+            if self.update_indexes.is_empty() {
+                self.heap
+                    .update_many(all_update_edits, update_opts)
+                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+            } else {
+                self.precheck_update_index_changes(&all_update_index_changes)?;
+                let outcomes = self
+                    .heap
+                    .update_many_with_outcomes(all_update_edits, update_opts)
+                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                self.apply_update_index_changes(&all_update_index_changes, &outcomes, wal_ref)?;
+            }
             let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
             self.affected = self.affected.saturating_add(n_u64);
         }
@@ -497,6 +886,46 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
     }
 }
 
+fn expand_insert_row(
+    row: &[Value],
+    target_width: usize,
+    column_map: &[usize],
+) -> Result<ExpandedInsertRow, ExecError> {
+    if row.len() != column_map.len() {
+        return Err(ExecError::TypeMismatch(format!(
+            "INSERT source row has {} columns, but column map has {} entries",
+            row.len(),
+            column_map.len()
+        )));
+    }
+    let mut out = vec![Value::Null; target_width];
+    let mut seen = vec![false; target_width];
+    for (src_idx, target_idx) in column_map.iter().copied().enumerate() {
+        if target_idx >= target_width {
+            return Err(ExecError::TypeMismatch(format!(
+                "INSERT target column index {target_idx} out of range (relation has {target_width} columns)"
+            )));
+        }
+        if seen[target_idx] {
+            return Err(ExecError::TypeMismatch(format!(
+                "INSERT target column index {target_idx} appears more than once"
+            )));
+        }
+        seen[target_idx] = true;
+        out[target_idx] = row[src_idx].clone();
+    }
+    let omitted = seen.into_iter().map(|present| !present).collect();
+    Ok(ExpandedInsertRow {
+        values: out,
+        omitted,
+    })
+}
+
+struct ExpandedInsertRow {
+    values: Vec<Value>,
+    omitted: Vec<bool>,
+}
+
 impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
     /// Compute the `(old_tid, new_payload_bytes)` edit for a single
     /// UPDATE input row.
@@ -509,7 +938,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
     /// `fixed_width_lower_bound`-sized initial capacity so the first
     /// push does not reallocate). The encoded payload is handed to
     /// [`HeapAccess::update_many`] by the bulk caller.
-    fn compute_update_edit(&self, row: &[Value]) -> Result<(TupleId, UpdatePayload), ExecError> {
+    fn compute_update_edit(&self, row: &[Value]) -> Result<ComputedUpdate, ExecError> {
         let (tid, orig_row) = extract_tid_and_row(row, self.relation)?;
 
         // Build the new row from the original, applying assignments.
@@ -522,8 +951,18 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                 relation_cols,
             )));
         }
+        let old_keys = self.encode_update_index_keys(orig_row)?;
 
         for (col_idx, evaluator) in &self.update_evaluators {
+            if self
+                .generated_stored
+                .get(*col_idx)
+                .is_some_and(Option::is_some)
+            {
+                return Err(ExecError::GeneratedAlwaysViolation(
+                    self.codec.schema().field_at(*col_idx).name.clone(),
+                ));
+            }
             let val = evaluator
                 .eval(orig_row)
                 .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
@@ -534,6 +973,12 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             }
             new_row[*col_idx] = val;
         }
+        self.apply_generated_stored(&mut new_row)?;
+        check_not_null_violations(&new_row, self.codec.schema())?;
+        self.check_row_constraints(&new_row)?;
+        self.check_foreign_keys(&new_row)?;
+        self.check_referenced_by_update(orig_row, &new_row)?;
+        let new_keys = self.encode_update_index_keys(&new_row)?;
 
         let new_payload = self
             .codec
@@ -543,7 +988,318 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         // ≤ 16 bytes stay inline. `SmallVec::from_vec` reuses the
         // existing heap buffer when the row spills.
         let payload = UpdatePayload::from_vec(new_payload);
-        Ok((tid, payload))
+        let index_change = if self.update_indexes.is_empty() {
+            None
+        } else {
+            Some(UpdateIndexChange {
+                old_tid: tid,
+                old_keys,
+                new_keys,
+            })
+        };
+        Ok(ComputedUpdate {
+            tid,
+            payload,
+            index_change,
+        })
+    }
+
+    fn apply_insert_defaults(&self, row: &mut [Value], omitted: &[bool]) -> Result<(), ExecError> {
+        if self.column_defaults.is_empty() && self.sequence_defaults.is_empty() {
+            return Ok(());
+        }
+        if (!self.column_defaults.is_empty() && self.column_defaults.len() != row.len())
+            || (!self.sequence_defaults.is_empty() && self.sequence_defaults.len() != row.len())
+            || omitted.len() != row.len()
+        {
+            return Err(ExecError::TypeMismatch(
+                "INSERT default metadata width does not match target row".to_owned(),
+            ));
+        }
+        for idx in 0..row.len() {
+            if !omitted[idx] {
+                continue;
+            }
+            if let Some(default) = self.sequence_defaults.get(idx).and_then(Option::as_ref) {
+                row[idx] = self.next_sequence_default_value(idx, default)?;
+                continue;
+            }
+            let Some(default) = self.column_defaults.get(idx) else {
+                continue;
+            };
+            if let Some(evaluator) = default {
+                row[idx] = evaluator
+                    .eval(&[])
+                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_identity_explicit_values(&self, omitted: &[bool]) -> Result<(), ExecError> {
+        if self.identity_always.is_empty() {
+            return Ok(());
+        }
+        if self.identity_always.len() != omitted.len() {
+            return Err(ExecError::TypeMismatch(
+                "INSERT identity metadata width does not match target row".to_owned(),
+            ));
+        }
+        for (idx, always) in self.identity_always.iter().copied().enumerate() {
+            if always && !omitted[idx] {
+                return Err(ExecError::GeneratedAlwaysViolation(
+                    self.codec.schema().field_at(idx).name.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_generated_stored_explicit_values(&self, omitted: &[bool]) -> Result<(), ExecError> {
+        if self.generated_stored.is_empty() {
+            return Ok(());
+        }
+        if self.generated_stored.len() != omitted.len() {
+            return Err(ExecError::TypeMismatch(
+                "INSERT generated-column metadata width does not match target row".to_owned(),
+            ));
+        }
+        for (idx, generated) in self.generated_stored.iter().enumerate() {
+            if generated.is_some() && !omitted[idx] {
+                return Err(ExecError::GeneratedAlwaysViolation(
+                    self.codec.schema().field_at(idx).name.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_generated_stored(&self, row: &mut [Value]) -> Result<(), ExecError> {
+        if self.generated_stored.is_empty() {
+            return Ok(());
+        }
+        if self.generated_stored.len() != row.len() {
+            return Err(ExecError::TypeMismatch(
+                "generated-column metadata width does not match target row".to_owned(),
+            ));
+        }
+        for idx in 0..row.len() {
+            let Some(evaluator) = self.generated_stored.get(idx).and_then(Option::as_ref) else {
+                continue;
+            };
+            row[idx] = evaluator
+                .eval(row)
+                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn check_foreign_keys(&self, row: &[Value]) -> Result<(), ExecError> {
+        for check in &self.foreign_key_checks {
+            check(row)?;
+        }
+        Ok(())
+    }
+
+    fn check_referenced_by_delete(&self, row: &[Value]) -> Result<(), ExecError> {
+        for check in &self.referenced_by_delete_checks {
+            check(row)?;
+        }
+        Ok(())
+    }
+
+    fn check_referenced_by_update(
+        &self,
+        old_row: &[Value],
+        new_row: &[Value],
+    ) -> Result<(), ExecError> {
+        for check in &self.referenced_by_update_checks {
+            check(old_row, new_row)?;
+        }
+        Ok(())
+    }
+
+    fn next_sequence_default_value(
+        &self,
+        idx: usize,
+        default: &SequenceDefault,
+    ) -> Result<Value, ExecError> {
+        let raw = default.sequence.nextval().map_err(|e| {
+            ExecError::TypeMismatch(format!("sequence default {}: {e}", default.name))
+        })?;
+        if let Some(on_nextval) = &default.on_nextval {
+            on_nextval(&default.name, raw);
+        }
+        let field = self.codec.schema().field_at(idx);
+        match field.data_type {
+            DataType::Int16 => i16::try_from(raw).map(Value::Int16).map_err(|_| {
+                ExecError::TypeMismatch(format!(
+                    "sequence default {} value {raw} out of range for Int16",
+                    default.name
+                ))
+            }),
+            DataType::Int32 => i32::try_from(raw).map(Value::Int32).map_err(|_| {
+                ExecError::TypeMismatch(format!(
+                    "sequence default {} value {raw} out of range for Int32",
+                    default.name
+                ))
+            }),
+            DataType::Int64 => Ok(Value::Int64(raw)),
+            ref other => Err(ExecError::TypeMismatch(format!(
+                "sequence default {} cannot populate {:?}",
+                default.name, other
+            ))),
+        }
+    }
+
+    fn check_row_constraints(&self, row: &[Value]) -> Result<(), ExecError> {
+        for check in &self.check_constraints {
+            match check
+                .evaluator
+                .eval(row)
+                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+            {
+                Value::Bool(true) | Value::Null => {}
+                Value::Bool(false) => return Err(ExecError::CheckViolation(check.name.clone())),
+                other => {
+                    return Err(ExecError::TypeMismatch(format!(
+                        "CHECK constraint {} returned {:?}, expected Bool",
+                        check.name,
+                        other.data_type()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_update_index_keys(&self, row: &[Value]) -> Result<Vec<Option<i64>>, ExecError> {
+        self.update_indexes
+            .iter()
+            .map(|index| index.encode_key(row))
+            .collect()
+    }
+
+    fn apply_update_index_changes(
+        &mut self,
+        changes: &[UpdateIndexChange],
+        outcomes: &[ultrasql_storage::heap::UpdateOutcome],
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), ExecError> {
+        let new_tid_by_old: std::collections::HashMap<TupleId, TupleId> = outcomes
+            .iter()
+            .map(|outcome| (outcome.old_tid, outcome.new_tid))
+            .collect();
+        for change in changes {
+            let Some(new_tid) = new_tid_by_old.get(&change.old_tid).copied() else {
+                return Err(ExecError::Internal(
+                    "heap update_many_with_outcomes omitted an updated TID",
+                ));
+            };
+            for idx in 0..self.update_indexes.len() {
+                let old_key = change.old_keys[idx];
+                let new_key = change.new_keys[idx];
+                if old_key == new_key {
+                    if let Some(key) = old_key {
+                        let _ = self.update_indexes[idx].delete_key(
+                            key,
+                            change.old_tid,
+                            self.delete_xmax,
+                            wal,
+                        )?;
+                        self.update_indexes[idx].insert_key(key, new_tid, self.delete_xmax, wal)?;
+                    }
+                    continue;
+                }
+                if let Some(key) = old_key {
+                    let _ = self.update_indexes[idx].delete_key(
+                        key,
+                        change.old_tid,
+                        self.delete_xmax,
+                        wal,
+                    )?;
+                }
+                if let Some(key) = new_key {
+                    if self.update_indexes[idx].is_unique()
+                        && self.update_indexes[idx].contains_key(key)?
+                    {
+                        return Err(ExecError::UniqueViolation(
+                            self.update_indexes[idx].name.clone(),
+                        ));
+                    }
+                    self.update_indexes[idx].insert_key(key, new_tid, self.delete_xmax, wal)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn precheck_update_index_changes(
+        &self,
+        changes: &[UpdateIndexChange],
+    ) -> Result<(), ExecError> {
+        for change in changes {
+            for idx in 0..self.update_indexes.len() {
+                let Some(new_key) = change.new_keys[idx] else {
+                    continue;
+                };
+                if change.old_keys[idx] == Some(new_key) {
+                    continue;
+                }
+                if self.update_indexes[idx].is_unique()
+                    && self.update_indexes[idx].contains_key(new_key)?
+                {
+                    return Err(ExecError::UniqueViolation(
+                        self.update_indexes[idx].name.clone(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn extract_delete_tids_and_index_changes(
+        &self,
+        batch: &Batch,
+    ) -> Result<(Vec<TupleId>, Vec<DeleteIndexChange>), ExecError> {
+        let child_schema = self.child.schema().clone();
+        let rows = batch_to_rows(batch, &child_schema)
+            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+        let mut tids: Vec<TupleId> = Vec::with_capacity(rows.len());
+        let mut changes: Vec<DeleteIndexChange> = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let (tid, orig_row) = extract_tid_and_row(row, self.relation)?;
+            self.check_referenced_by_delete(orig_row)?;
+            let keys = self
+                .delete_indexes
+                .iter()
+                .map(|index| index.encode_key(orig_row))
+                .collect::<Result<Vec<_>, _>>()?;
+            tids.push(tid);
+            changes.push(DeleteIndexChange { tid, keys });
+        }
+        Ok((tids, changes))
+    }
+
+    fn apply_delete_index_changes(
+        &mut self,
+        changes: &[DeleteIndexChange],
+    ) -> Result<(), ExecError> {
+        let wal = self.wal.clone();
+        let wal_ref = wal.as_deref();
+        for change in changes {
+            for idx in 0..self.delete_indexes.len() {
+                if let Some(key) = change.keys[idx] {
+                    let _ = self.delete_indexes[idx].delete_key(
+                        key,
+                        change.tid,
+                        self.delete_xmax,
+                        wal_ref,
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

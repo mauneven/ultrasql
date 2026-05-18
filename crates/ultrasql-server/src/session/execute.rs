@@ -12,9 +12,10 @@ use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{
-    CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
+    CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, StatisticExtRow, TableEntry,
 };
-use ultrasql_core::{DataType, PageId, RelationId, Value};
+use ultrasql_core::{DataType, PageId, RelationId, Value, Xid};
+use ultrasql_mvcc::XidStatusOracle;
 use ultrasql_optimizer::{
     InMemoryStatsCatalog, PlanCache, PlanCacheConfig, PlanCacheKey, StatsCatalog, StatsSource,
 };
@@ -43,6 +44,13 @@ use crate::{
     BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
     run_plan_in_txn, try_run_cached_int32_pair_select,
 };
+
+#[derive(Debug)]
+struct CreateStatisticsSpec {
+    name: String,
+    table: String,
+    columns: Vec<String>,
+}
 
 fn parse_bool_guc(value: &str) -> Result<bool, ServerError> {
     match value.to_ascii_lowercase().as_str() {
@@ -100,9 +108,6 @@ where
         // Wire-level statement no-ops kept for PostgreSQL compatibility
         // while the real plumbing lands behind the same names:
         //
-        // - `CREATE STATISTICS [name] ON cols FROM t` (§3.3): the
-        //   `pg_statistic_ext` row layout exists; multi-column MCV /
-        //   dependency-coefficient population is a follow-up.
         // - `VACUUM [table]` (§3.2-aligned): manual vacuum surface for
         //   ORMs / migration tools; the autovacuum trigger is a
         //   follow-up.
@@ -113,25 +118,12 @@ where
         if let Some(table) = self.try_parse_analyze_target(trimmed) {
             return self.execute_analyze(table.as_deref());
         }
+        if let Some(table) = self.try_parse_vacuum_target(trimmed) {
+            return self.execute_vacuum(table.as_deref());
+        }
 
-        for (head, tag) in [
-            ("vacuum", "VACUUM"),
-            ("create statistics", "CREATE STATISTICS"),
-        ] {
-            let len = head.len();
-            if trimmed.len() >= len && trimmed[..len].eq_ignore_ascii_case(head) {
-                let rest = &trimmed[len..];
-                if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ';') {
-                    return Ok(result_encoder::SelectResult {
-                        messages: vec![BackendMessage::CommandComplete {
-                            tag: tag.to_string(),
-                        }],
-                        streamed_body: None,
-                        shared_streamed_body: None,
-                        rows: 0,
-                    });
-                }
-            }
+        if let Some(spec) = Self::try_parse_create_statistics(trimmed)? {
+            return self.execute_create_statistics(&catalog_snapshot, spec);
         }
 
         // Parse + bind cache lookup. The cache stores fully bound
@@ -180,6 +172,9 @@ where
         if let Some(result) =
             self.try_dispatch_meta_statement(&stmt, Arc::clone(&catalog_snapshot))?
         {
+            return Ok(result);
+        }
+        if let Some(result) = self.try_dispatch_sequence_select(&stmt)? {
             return Ok(result);
         }
 
@@ -276,6 +271,10 @@ where
             &plan,
             LogicalPlan::CreateTable { .. }
                 | LogicalPlan::CreateIndex { .. }
+                | LogicalPlan::CreateSequence { .. }
+                | LogicalPlan::AlterSequence { .. }
+                | LogicalPlan::DropSequence { .. }
+                | LogicalPlan::Comment { .. }
                 | LogicalPlan::DropTable { .. }
                 | LogicalPlan::AlterTable { .. }
                 | LogicalPlan::Truncate { .. }
@@ -291,6 +290,18 @@ where
             }
             LogicalPlan::CreateIndex { .. } => {
                 return self.execute_create_index(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::CreateSequence { .. } => {
+                return self.execute_create_sequence(&plan);
+            }
+            LogicalPlan::AlterSequence { .. } => {
+                return self.execute_alter_sequence(&plan);
+            }
+            LogicalPlan::DropSequence { .. } => {
+                return self.execute_drop_sequence(&plan);
+            }
+            LogicalPlan::Comment { .. } => {
+                return self.execute_comment(&plan, &catalog_snapshot);
             }
             LogicalPlan::DropTable { .. } => {
                 return self.execute_drop_table(&plan);
@@ -708,6 +719,9 @@ where
                     plan,
                     &txn,
                     Arc::clone(catalog_snapshot),
+                    Arc::clone(&self.state.table_constraints),
+                    Arc::clone(&self.state.sequences),
+                    Some(self.sequence_state.clone()),
                     &self.state.tables,
                     Arc::clone(&self.state.heap),
                     Arc::clone(&self.state.vm),
@@ -724,6 +738,9 @@ where
                     plan,
                     &txn,
                     Arc::clone(catalog_snapshot),
+                    Arc::clone(&self.state.table_constraints),
+                    Arc::clone(&self.state.sequences),
+                    Some(self.sequence_state.clone()),
                     &self.state.tables,
                     Arc::clone(&self.state.heap),
                     Arc::clone(&self.state.vm),
@@ -806,6 +823,171 @@ where
             return Some(Some(ident.trim_matches('"').to_ascii_lowercase()));
         }
         None
+    }
+
+    fn try_parse_vacuum_target(&self, trimmed_sql: &str) -> Option<Option<String>> {
+        if trimmed_sql.len() < "vacuum".len() || !trimmed_sql[..6].eq_ignore_ascii_case("vacuum") {
+            return None;
+        }
+        let rest = trimmed_sql[6..].trim();
+        if rest.is_empty() || rest == ";" {
+            return Some(None);
+        }
+        let ident = rest.trim_end_matches(';').trim();
+        if ident.is_empty() {
+            return Some(None);
+        }
+        if ident.split_whitespace().count() == 1 {
+            return Some(Some(ident.trim_matches('"').to_ascii_lowercase()));
+        }
+        None
+    }
+
+    fn try_parse_create_statistics(
+        trimmed_sql: &str,
+    ) -> Result<Option<CreateStatisticsSpec>, ServerError> {
+        let head = "create statistics";
+        if trimmed_sql.len() < head.len() || !trimmed_sql[..head.len()].eq_ignore_ascii_case(head) {
+            return Ok(None);
+        }
+        let rest = trimmed_sql[head.len()..].trim();
+        let rest = rest.strip_suffix(';').unwrap_or(rest).trim();
+        if rest.is_empty() {
+            return Err(ServerError::ddl("malformed CREATE STATISTICS"));
+        }
+        let normalized = rest.replace(',', " , ");
+        let tokens: Vec<&str> = normalized.split_whitespace().collect();
+        if tokens.len() < 5 || !tokens[1].eq_ignore_ascii_case("on") {
+            return Err(ServerError::ddl("malformed CREATE STATISTICS"));
+        }
+        let mut columns = Vec::new();
+        let mut idx = 2;
+        while idx < tokens.len() && !tokens[idx].eq_ignore_ascii_case("from") {
+            if tokens[idx] != "," {
+                columns.push(Self::fold_statistics_identifier(tokens[idx]));
+            }
+            idx += 1;
+        }
+        if columns.is_empty() || idx + 2 != tokens.len() || !tokens[idx].eq_ignore_ascii_case("from")
+        {
+            return Err(ServerError::ddl("malformed CREATE STATISTICS"));
+        }
+        Ok(Some(CreateStatisticsSpec {
+            name: Self::fold_statistics_identifier(tokens[0]),
+            table: Self::fold_statistics_identifier(tokens[idx + 1]),
+            columns,
+        }))
+    }
+
+    fn fold_statistics_identifier(ident: &str) -> String {
+        ident.trim_matches('"').to_ascii_lowercase()
+    }
+
+    fn execute_create_statistics(
+        &mut self,
+        snapshot: &CatalogSnapshot,
+        spec: CreateStatisticsSpec,
+    ) -> Result<SelectResult, ServerError> {
+        let table = snapshot.tables.get(&spec.table).ok_or_else(|| {
+            self.fail_if_in_transaction(ServerError::Plan(
+                ultrasql_planner::PlanError::TableNotFound(spec.table.clone()),
+            ))
+        })?;
+        let mut stxkeys = Vec::with_capacity(spec.columns.len());
+        for column in &spec.columns {
+            let position = table
+                .schema
+                .fields()
+                .iter()
+                .position(|field| field.name.eq_ignore_ascii_case(column))
+                .ok_or_else(|| {
+                    self.fail_if_in_transaction(ServerError::Plan(
+                        ultrasql_planner::PlanError::ColumnNotFound(column.clone()),
+                    ))
+                })?;
+            stxkeys.push(
+                i16::try_from(position.saturating_add(1))
+                    .map_err(|_| ServerError::ddl("CREATE STATISTICS table has too many columns"))?,
+            );
+        }
+        let row = StatisticExtRow {
+            oid: self.state.persistent_catalog.next_oid(),
+            stxname: spec.name,
+            stxrelid: table.oid,
+            stxkeys,
+            stxkind: vec!['d', 'f', 'm'],
+        };
+        self.state
+            .persistent_catalog
+            .create_statistic_ext(row)
+            .map_err(ServerError::Catalog)?;
+        self.plan_cache_invalidate();
+        Ok(result_encoder::SelectResult {
+            messages: vec![BackendMessage::CommandComplete {
+                tag: "CREATE STATISTICS".to_string(),
+            }],
+            streamed_body: None,
+            shared_streamed_body: None,
+            rows: 0,
+        })
+    }
+
+    fn execute_vacuum(&mut self, table: Option<&str>) -> Result<SelectResult, ServerError> {
+        let snapshot = self.state.catalog_snapshot();
+        let tables: Vec<TableEntry> = match table {
+            Some(name) => vec![snapshot.tables.get(name).cloned().ok_or_else(|| {
+                self.fail_if_in_transaction(ServerError::Plan(
+                    ultrasql_planner::PlanError::TableNotFound(name.to_string()),
+                ))
+            })?],
+            None => snapshot.tables.values().cloned().collect(),
+        };
+        let oldest = self.state.txn_manager.oldest_in_progress();
+        for entry in tables {
+            self.vacuum_one_table_indexes(&snapshot, &entry, oldest)?;
+            let rel = RelationId(entry.oid);
+            self.state
+                .heap
+                .vacuum_heap(rel, oldest, self.state.txn_manager.as_ref())
+                .map_err(|e| ServerError::ddl(format!("VACUUM heap: {e}")))?;
+            self.state.vacuum_mark_visible_pages(oldest);
+        }
+        Ok(result_encoder::SelectResult {
+            messages: vec![BackendMessage::CommandComplete {
+                tag: "VACUUM".to_string(),
+            }],
+            streamed_body: None,
+            shared_streamed_body: None,
+            rows: 0,
+        })
+    }
+
+    fn vacuum_one_table_indexes(
+        &self,
+        snapshot: &CatalogSnapshot,
+        entry: &TableEntry,
+        oldest: Xid,
+    ) -> Result<(), ServerError> {
+        let Some(indexes) = snapshot.indexes_by_table.get(&entry.oid) else {
+            return Ok(());
+        };
+        for index in indexes {
+            let btree = BTree::open(
+                Arc::clone(self.state.heap.buffer_pool()),
+                RelationId::new(index.oid.raw()),
+                index.root_block,
+            );
+            btree
+                .vacuum(|tid| {
+                    let Ok(tuple) = self.state.heap.fetch(tid) else {
+                        return true;
+                    };
+                    let xmax = tuple.header.xmax;
+                    !xmax.is_invalid() && xmax < oldest && self.state.txn_manager.is_committed(xmax)
+                })
+                .map_err(|e| ServerError::ddl(format!("VACUUM index {}: {e}", index.name)))?;
+        }
+        Ok(())
     }
 
     fn execute_analyze(&mut self, table: Option<&str>) -> Result<SelectResult, ServerError> {

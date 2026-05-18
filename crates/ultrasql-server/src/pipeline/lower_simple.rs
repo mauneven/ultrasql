@@ -86,7 +86,11 @@ pub fn lower_plan(
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
-        | LogicalPlan::AlterTable { .. } => Err(ServerError::Unsupported(
+        | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::CreateSequence { .. }
+        | LogicalPlan::AlterSequence { .. }
+        | LogicalPlan::DropSequence { .. }
+        | LogicalPlan::Comment { .. } => Err(ServerError::Unsupported(
             "DDL reached operator lowerer; expected DDL dispatch path",
         )),
         LogicalPlan::Begin { .. }

@@ -317,6 +317,7 @@ fn binds_create_table_resolves_basic_column_types() {
         columns,
         if_not_exists,
         schema,
+        ..
     } = plan
     else {
         panic!("expected CreateTable, got other plan");
@@ -358,6 +359,27 @@ fn binds_create_table_primary_key_implies_not_null() {
         panic!("expected CreateTable");
     };
     assert!(!columns.fields()[0].nullable);
+}
+
+#[test]
+fn binds_create_table_generated_stored_expression() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a + 1) STORED)",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateTable {
+        generated_stored, ..
+    } = plan
+    else {
+        panic!("expected CreateTable");
+    };
+    assert!(generated_stored[0].is_none());
+    assert!(matches!(
+        generated_stored[1],
+        Some(ScalarExpr::Binary { .. })
+    ));
 }
 
 #[test]
@@ -413,15 +435,151 @@ fn binds_create_table_with_qualified_namespace() {
 }
 
 #[test]
-fn binds_create_table_rejects_unsupported_constraints() {
+fn binds_create_table_defaults_checks_and_unique_constraints() {
     let cat = InMemoryCatalog::new();
-    let err = parse_and_bind("CREATE TABLE t (id INT UNIQUE)", &cat).unwrap_err();
-    assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+    let plan = parse_and_bind(
+        "CREATE TABLE t (id INT DEFAULT 7 CHECK (id > 0), v INT, UNIQUE (id))",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateTable {
+        defaults,
+        checks,
+        unique_constraints,
+        ..
+    } = plan
+    else {
+        panic!("expected CreateTable");
+    };
+    assert!(defaults[0].is_some());
+    assert_eq!(checks.len(), 1);
+    assert_eq!(unique_constraints.len(), 1);
+    assert_eq!(unique_constraints[0].columns, vec![0]);
+}
 
-    let err = parse_and_bind("CREATE TABLE t (id INT DEFAULT 7)", &cat).unwrap_err();
-    assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+#[test]
+fn binds_serial_column_as_required_with_sequence_default() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "CREATE TABLE t (id SERIAL, v BIGSERIAL, s SMALLSERIAL)",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateTable {
+        columns,
+        sequence_defaults,
+        ..
+    } = plan
+    else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(columns.field_at(0).data_type, DataType::Int32);
+    assert_eq!(columns.field_at(1).data_type, DataType::Int64);
+    assert_eq!(columns.field_at(2).data_type, DataType::Int16);
+    assert!(!columns.field_at(0).nullable);
+    assert_eq!(sequence_defaults[0].as_deref(), Some("t_id_seq"));
+    assert_eq!(sequence_defaults[1].as_deref(), Some("t_v_seq"));
+    assert_eq!(sequence_defaults[2].as_deref(), Some("t_s_seq"));
+}
 
-    let err = parse_and_bind("CREATE TABLE t (id INT CHECK (id > 0))", &cat).unwrap_err();
+#[test]
+fn binds_identity_column_as_sequence_backed_required_column() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "CREATE TABLE t (id BIGINT GENERATED ALWAYS AS IDENTITY (START WITH 10 INCREMENT BY 5))",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateTable {
+        columns,
+        sequence_defaults,
+        sequence_options,
+        identity_always,
+        ..
+    } = plan
+    else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(columns.field_at(0).data_type, DataType::Int64);
+    assert!(!columns.field_at(0).nullable);
+    assert_eq!(sequence_defaults[0].as_deref(), Some("t_id_seq"));
+    assert!(identity_always[0]);
+    let opts = sequence_options[0].expect("identity sequence options");
+    assert_eq!(opts.start, 10);
+    assert_eq!(opts.increment, 5);
+}
+
+#[test]
+fn binds_create_table_foreign_key_constraints() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "CREATE TABLE child (user_id INT REFERENCES users(id), CONSTRAINT child_user_fk FOREIGN KEY (user_id) REFERENCES users(id))",
+        &cat,
+    )
+    .expect("foreign keys bind");
+    let LogicalPlan::CreateTable { foreign_keys, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(foreign_keys.len(), 2);
+    assert_eq!(foreign_keys[0].columns, vec![0]);
+    assert_eq!(foreign_keys[0].target_table, "users");
+    assert_eq!(foreign_keys[0].target_columns, vec![0]);
+    assert_eq!(foreign_keys[1].name, "child_user_fk");
+}
+
+#[test]
+fn binds_sequence_ddl_options() {
+    let cat = InMemoryCatalog::new();
+    let create = parse_and_bind(
+        "CREATE SEQUENCE IF NOT EXISTS s START WITH 10 INCREMENT BY 5 MINVALUE 1 MAXVALUE 100 CACHE 4 CYCLE",
+        &cat,
+    )
+    .expect("create sequence binds");
+    let LogicalPlan::CreateSequence {
+        sequence_name,
+        namespace,
+        options,
+        if_not_exists,
+        ..
+    } = create
+    else {
+        panic!("expected CreateSequence");
+    };
+    assert_eq!(sequence_name, "s");
+    assert_eq!(namespace, "public");
+    assert!(if_not_exists);
+    assert_eq!(options.start, 10);
+    assert_eq!(options.increment, 5);
+    assert_eq!(options.min, Some(1));
+    assert_eq!(options.max, Some(100));
+    assert_eq!(options.cache, 4);
+    assert!(options.cycle);
+
+    let alter = parse_and_bind("ALTER SEQUENCE s START WITH 50 RESTART WITH 7", &cat)
+        .expect("alter sequence binds");
+    let LogicalPlan::AlterSequence { options, .. } = alter else {
+        panic!("expected AlterSequence");
+    };
+    assert_eq!(options.start, Some(50));
+    assert_eq!(options.restart, Some(Some(7)));
+}
+
+#[test]
+fn binds_descending_sequence_default_start_to_maxvalue() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("CREATE SEQUENCE s INCREMENT BY -1", &cat)
+        .expect("descending sequence binds");
+    let LogicalPlan::CreateSequence { options, .. } = plan else {
+        panic!("expected CreateSequence");
+    };
+    assert_eq!(options.start, -1);
+    assert_eq!(options.increment, -1);
+}
+
+#[test]
+fn binds_create_sequence_rejects_restart() {
+    let cat = InMemoryCatalog::new();
+    let err = parse_and_bind("CREATE SEQUENCE s RESTART", &cat).unwrap_err();
     assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
 }
 
@@ -454,6 +612,9 @@ fn binds_create_table_persistent_catalog_via_snapshot_adapter() {
         tables_by_oid: std::collections::HashMap::new(),
         indexes: std::collections::HashMap::new(),
         indexes_by_table: std::collections::HashMap::new(),
+        descriptions: std::collections::HashMap::new(),
+        statistics: std::collections::HashMap::new(),
+        statistic_ext: std::collections::HashMap::new(),
     };
     // Creating an already-existing relation through the snapshot
     // adapter surfaces DuplicateTable, proving the binder reaches
@@ -465,6 +626,55 @@ fn binds_create_table_persistent_catalog_via_snapshot_adapter() {
     assert!(
         matches!(err, PlanError::DuplicateTable(ref t) if t == "products"),
         "got {err:?}"
+    );
+}
+
+#[test]
+fn binds_comment_on_table_and_column() {
+    let cat = users_catalog();
+    let table = parse_and_bind("COMMENT ON TABLE users IS 'hello'", &cat).expect("table comment");
+    let LogicalPlan::Comment {
+        target, comment, ..
+    } = table
+    else {
+        panic!("expected comment plan");
+    };
+    assert_eq!(comment.as_deref(), Some("hello"));
+    assert_eq!(
+        target,
+        crate::plan::LogicalCommentTarget::Table {
+            table: "users".to_owned()
+        }
+    );
+
+    let column =
+        parse_and_bind("COMMENT ON COLUMN users.name IS NULL", &cat).expect("column comment");
+    let LogicalPlan::Comment {
+        target, comment, ..
+    } = column
+    else {
+        panic!("expected comment plan");
+    };
+    assert!(comment.is_none());
+    assert_eq!(
+        target,
+        crate::plan::LogicalCommentTarget::Column {
+            table: "users".to_owned(),
+            column: "name".to_owned(),
+            attnum: 2,
+        }
+    );
+
+    let index =
+        parse_and_bind("COMMENT ON INDEX users_name_idx IS 'idx'", &cat).expect("index comment");
+    let LogicalPlan::Comment { target, .. } = index else {
+        panic!("expected comment plan");
+    };
+    assert_eq!(
+        target,
+        crate::plan::LogicalCommentTarget::Index {
+            index: "users_name_idx".to_owned()
+        }
     );
 }
 

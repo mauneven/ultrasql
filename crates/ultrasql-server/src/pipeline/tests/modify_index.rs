@@ -6,8 +6,10 @@ use super::select::{
 use super::{collect_pairs, column, int_row, schema_int_col, synthetic_ctx};
 use crate::pipeline::index_scan::{match_indexable_predicate, match_simple_comparison};
 use crate::pipeline::*;
-use ultrasql_core::{DataType, Schema, Value};
-use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr};
+use ultrasql_core::{DataType, Field, Schema, Value};
+use ultrasql_planner::{
+    BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr, SortKey,
+};
 use ultrasql_storage::heap::InsertOptions;
 
 #[test]
@@ -131,6 +133,121 @@ fn lower_query_gt_indexed_column_picks_index_scan() {
     let pairs = drain_id_val(op.as_mut()).expect("drain");
     let expected: Vec<(i32, i32)> = (96..=100).map(|i| (i, i * 10)).collect();
     assert_eq!(pairs, expected);
+}
+
+#[test]
+fn lower_query_order_by_desc_indexed_column_picks_backward_index_scan() {
+    let rows: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
+    let (fix, _entry, _) = build_index_fixture("t_order_desc_indexed", &rows, true);
+    let tables = SampleTables::new();
+    let ctx = fix.ctx(&tables);
+    let schema = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::required("val", DataType::Int32),
+    ])
+    .expect("schema");
+    let plan = LogicalPlan::Sort {
+        input: Box::new(LogicalPlan::Scan {
+            table: "t_order_desc_indexed".into(),
+            schema: schema.clone(),
+            projection: None,
+        }),
+        keys: vec![SortKey {
+            expr: ScalarExpr::Column {
+                name: "id".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            },
+            asc: false,
+            nulls_first: false,
+        }],
+    };
+    let mut op = lower_query(&plan, &ctx).expect("lowers");
+    let debug = format!("{op:?}");
+    assert!(
+        debug.starts_with("IndexScan"),
+        "expected IndexScan for ORDER BY DESC, got: {debug}"
+    );
+    let pairs = drain_id_val(op.as_mut()).expect("drain");
+    let expected: Vec<(i32, i32)> = (1..=8).rev().map(|i| (i, i * 10)).collect();
+    assert_eq!(pairs, expected);
+}
+
+#[test]
+fn lower_query_project_index_key_on_all_visible_pages_picks_index_only_scan() {
+    let rows: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
+    let (fix, entry, tids) = build_index_fixture("t_index_only", &rows, true);
+    fix.mark_all_visible(&entry, &tids);
+    let tables = SampleTables::new();
+    let ctx = fix.ctx(&tables);
+    let schema = Schema::new([Field::nullable("id", DataType::Int32)]).expect("schema");
+    let plan = LogicalPlan::Project {
+        input: Box::new(build_filter_scan_plan(
+            "t_index_only",
+            between_id_literal(3, 5),
+        )),
+        exprs: vec![(
+            ScalarExpr::Column {
+                name: "id".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            },
+            "id".into(),
+        )],
+        schema,
+    };
+    let mut op = lower_query(&plan, &ctx).expect("lowers");
+    let debug = format!("{op:?}");
+    assert!(
+        debug.starts_with("IndexOnlyScan"),
+        "expected IndexOnlyScan, got: {debug}"
+    );
+    let ids = drain_single_i32(op.as_mut());
+    assert_eq!(ids, vec![3, 4, 5]);
+}
+
+#[test]
+fn lower_query_project_index_key_without_all_visible_falls_back_to_heap_index_scan() {
+    let rows: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
+    let (fix, _entry, _tids) = build_index_fixture("t_index_only_no_vm", &rows, true);
+    let tables = SampleTables::new();
+    let ctx = fix.ctx(&tables);
+    let schema = Schema::new([Field::nullable("id", DataType::Int32)]).expect("schema");
+    let plan = LogicalPlan::Project {
+        input: Box::new(build_filter_scan_plan(
+            "t_index_only_no_vm",
+            between_id_literal(3, 5),
+        )),
+        exprs: vec![(
+            ScalarExpr::Column {
+                name: "id".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            },
+            "id".into(),
+        )],
+        schema,
+    };
+    let mut op = lower_query(&plan, &ctx).expect("lowers");
+    let debug = format!("{op:?}");
+    assert!(
+        !debug.starts_with("IndexOnlyScan"),
+        "VM-clean proof is required before IndexOnlyScan; got: {debug}"
+    );
+    let ids = drain_single_i32(op.as_mut());
+    assert_eq!(ids, vec![3, 4, 5]);
+}
+
+fn drain_single_i32(op: &mut dyn Operator) -> Vec<i32> {
+    let mut out = Vec::new();
+    while let Some(batch) = op.next_batch().expect("drain") {
+        assert_eq!(batch.width(), 1);
+        let ultrasql_vec::column::Column::Int32(col) = &batch.columns()[0] else {
+            panic!("unexpected index-only batch column");
+        };
+        out.extend_from_slice(col.data());
+    }
+    out
 }
 
 /// MVCC visibility: a row inserted after the reader's snapshot must

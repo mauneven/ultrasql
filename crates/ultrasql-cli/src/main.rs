@@ -664,7 +664,7 @@ ORDER  BY 1;
 ";
 
 const LIST_FUNCTIONS_SQL: &str = "
-SELECT n.nspname AS schema, p.proname AS name
+SELECT n.nspname AS schemaname, p.proname AS name
 FROM   pg_catalog.pg_proc p
 JOIN   pg_catalog.pg_namespace n ON p.pronamespace = n.oid
 WHERE  n.nspname NOT IN ('pg_catalog','information_schema')

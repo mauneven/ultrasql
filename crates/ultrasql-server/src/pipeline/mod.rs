@@ -89,6 +89,7 @@ use crate::BlankPageLoader;
 /// asking for a literal `LIMIT 5_000_000_000` is asking for "all rows"
 /// in practice.
 mod agg_fuse;
+pub(crate) mod catalog_views;
 mod cte_helpers;
 mod index_scan;
 mod join;
@@ -179,6 +180,13 @@ pub struct LowerCtx<'a> {
     pub tables: &'a SampleTables,
     /// Per-statement immutable catalog snapshot.
     pub catalog_snapshot: Arc<CatalogSnapshot>,
+    /// Runtime defaults/CHECK constraints keyed by table OID.
+    pub table_constraints:
+        Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<crate::TableRuntimeConstraints>>>,
+    /// Runtime sequence registry keyed by folded sequence name.
+    pub sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
+    /// Session-local sequence observer for defaults that call `nextval`.
+    pub sequence_state: Option<crate::SequenceSessionState>,
     /// Shared heap access handle.
     pub heap: Arc<HeapAccess<BlankPageLoader>>,
     /// Shared visibility map for persistent heap relations.

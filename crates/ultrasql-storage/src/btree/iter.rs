@@ -59,7 +59,7 @@ impl<L: PageLoader, K: Key> Iterator for RangeIter<'_, L, K> {
                 return Some(Err(BTreeError::MalformedNode("range start")));
             };
             let root = *self.tree.root_block.lock();
-            match self.tree.descend_to_leaf_readonly(root, raw) {
+            match super::lookup::leftmost_leaf(self.tree, root) {
                 Ok(leaf) => self.current_leaf = Some(leaf),
                 Err(e) => return Some(Err(e)),
             }
@@ -97,6 +97,14 @@ impl<L: PageLoader, K: Key> Iterator for RangeIter<'_, L, K> {
             if self.current_slot < entries.len() {
                 let e = entries[self.current_slot];
                 self.current_slot += 1;
+                let mut start_buf = [0_u8; 8];
+                self.start.encode(&mut start_buf);
+                let Ok(raw_start) = read_i64_le(&start_buf) else {
+                    return Some(Err(BTreeError::MalformedNode("range start")));
+                };
+                if e.key < raw_start {
+                    continue;
+                }
                 if let Some(end_key) = self.end {
                     let mut end_buf = [0_u8; 8];
                     end_key.encode(&mut end_buf);
@@ -136,9 +144,7 @@ impl<L: PageLoader, K: Key> RangeIter<'_, L, K> {
             drop(r);
         }
         drop(guard);
-        Ok(match entries.binary_search_by_key(&raw_start, |e| e.key) {
-            Ok(i) | Err(i) => i,
-        })
+        Ok(entries.partition_point(|entry| entry.key < raw_start))
     }
 }
 
@@ -212,15 +218,45 @@ impl<L: PageLoader> BTree<L> {
         start: K,
         end: Option<K>,
     ) -> Result<BackwardRangeIter<'_, L, K>, BTreeError> {
-        // Collect forward scan.
-        let items: Vec<(K, TupleId)> = self
-            .range_scan::<K>(end.unwrap_or(start), None)
-            .filter_map(std::result::Result::ok)
-            .filter(|(k, _)| end.is_none_or(|e| *k >= e) && *k <= start)
-            .collect();
-        // range_scan walks ascending; reverse in memory.
-        let mut items = items;
-        items.reverse();
+        if K::SIZE != 8 {
+            return Err(BTreeError::KeyTooLarge);
+        }
+        let mut start_buf = [0_u8; 8];
+        start.encode(&mut start_buf);
+        let raw_start =
+            read_i64_le(&start_buf).map_err(|_| BTreeError::MalformedNode("backward start"))?;
+        let raw_end = if let Some(end_key) = end {
+            let mut end_buf = [0_u8; 8];
+            end_key.encode(&mut end_buf);
+            Some(read_i64_le(&end_buf).map_err(|_| BTreeError::MalformedNode("backward end"))?)
+        } else {
+            None
+        };
+
+        let root = *self.root_block.lock();
+        let mut current_leaf = Some(self.descend_to_leaf_readonly(root, i64::MIN)?);
+        let mut items: Vec<(K, TupleId)> = Vec::new();
+        while let Some(leaf) = current_leaf {
+            let guard = self.pool.get_page(self.page_id(leaf))?;
+            let (entries, right_link) = {
+                let r = guard.read();
+                let meta = NodeMeta::read_from(&r)?;
+                (read_leaf_entries(&r, meta.n_keys)?, meta.right_link)
+            };
+            drop(guard);
+            for entry in entries {
+                if entry.key <= raw_start && raw_end.is_none_or(|end| entry.key >= end) {
+                    let mut key_buf = [0_u8; 8];
+                    write_i64_le(&mut key_buf, entry.key);
+                    items.push((K::decode(&key_buf), entry.value));
+                }
+            }
+            current_leaf = if right_link == NO_SIBLING {
+                None
+            } else {
+                Some(BlockNumber::new(right_link))
+            };
+        }
         let pos = items.len();
         Ok(BackwardRangeIter {
             items,

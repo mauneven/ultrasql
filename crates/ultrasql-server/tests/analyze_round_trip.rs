@@ -69,6 +69,28 @@ async fn analyze_table_returns_command_tag() {
         .lookup_relation_stats("t")
         .expect("ANALYZE should register relation stats");
     assert_eq!(stats.row_count, 3, "ANALYZE should see all inserted rows");
+    let class_rows = client
+        .query(
+            "SELECT oid FROM pg_catalog.pg_class WHERE relname = 't'",
+            &[],
+        )
+        .await
+        .expect("pg_class query");
+    assert_eq!(class_rows.len(), 1);
+    let table_oid: i64 = class_rows[0].get(0);
+    let stat_sql = format!(
+        "SELECT staattnum, stanullfrac, stadistinct \
+             FROM pg_catalog.pg_statistic \
+             WHERE starelid = {table_oid} \
+             ORDER BY staattnum"
+    );
+    let stat_rows = client
+        .query(&stat_sql, &[])
+        .await
+        .expect("pg_statistic query");
+    assert_eq!(stat_rows.len(), 1);
+    assert_eq!(stat_rows[0].get::<_, i16>(0), 1);
+    assert_eq!(stat_rows[0].get::<_, f32>(1), 0.0);
     // Session survives — subsequent statements work.
     let rows = client
         .query("SELECT id FROM t", &[])

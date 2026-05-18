@@ -90,6 +90,11 @@ pub enum ServerError {
     #[error("catalog error: {0}")]
     Catalog(#[from] ultrasql_catalog::CatalogError),
 
+    /// An object cannot be dropped because another object depends on it.
+    /// Maps to PostgreSQL SQLSTATE `2BP01`.
+    #[error("{0}")]
+    DependentObjectsStillExist(String),
+
     /// A statement was issued while the current explicit transaction
     /// was already aborted by a prior error. Maps to PostgreSQL
     /// SQLSTATE `25P02` (`in_failed_sql_transaction`); the user must
@@ -132,6 +137,12 @@ pub enum ServerError {
     /// PostgreSQL SQLSTATE `57014` (`query_canceled`).
     #[error("COPY from stdin failed: {0}")]
     CopyAborted(String),
+
+    /// Object exists, but not in the right session-local state for the
+    /// requested operation. Used for `currval` / `lastval` before a
+    /// session has called `nextval`. Maps to SQLSTATE `55000`.
+    #[error("{0}")]
+    ObjectNotInPrerequisiteState(String),
 }
 
 impl ServerError {
@@ -167,11 +178,13 @@ impl ServerError {
                 | Self::Unsupported(_)
                 | Self::Ddl(_)
                 | Self::Catalog(_)
+                | Self::DependentObjectsStillExist(_)
                 | Self::TransactionAborted
                 | Self::Savepoint(_)
                 | Self::SavepointNotFound(_)
                 | Self::CopyFormat(_)
                 | Self::CopyAborted(_)
+                | Self::ObjectNotInPrerequisiteState(_)
         )
     }
 
@@ -192,13 +205,25 @@ impl ServerError {
             Self::Plan(_) | Self::Catalog(ultrasql_catalog::CatalogError::NotFound(_)) => "42P01",
             Self::Build(_) | Self::Unsupported(_) => "0A000", // feature_not_supported
             Self::UnsupportedProtocol { .. } => "08P01",      // protocol_violation
+            Self::DependentObjectsStillExist(_) => "2BP01",   // dependent_objects_still_exist
             Self::Catalog(_) => "42000",                      // generic catalog failure
             Self::TransactionAborted => "25P02",              // in_failed_sql_transaction
             Self::Savepoint(_) => "25P01",                    // no_active_sql_transaction
             Self::SavepointNotFound(_) => "3B001",            // invalid_savepoint_specification
             // NOT-NULL constraint violation surfaced by `ModifyTable`
-            // on INSERT. Mirrors PostgreSQL's `not_null_violation`.
+            // on INSERT / UPDATE. Mirrors PostgreSQL's
+            // `not_null_violation`.
             Self::Execute(ultrasql_executor::ExecError::NotNullViolation(_)) => "23502",
+            // CHECK constraint violation surfaced by `ModifyTable`.
+            Self::Execute(ultrasql_executor::ExecError::CheckViolation(_)) => "23514",
+            // Duplicate key surfaced by insert-side B-tree index
+            // maintenance. Mirrors PostgreSQL's `unique_violation`.
+            Self::Execute(ultrasql_executor::ExecError::UniqueViolation(_)) => "23505",
+            // FOREIGN KEY violation surfaced by DML constraint checks.
+            Self::Execute(ultrasql_executor::ExecError::ForeignKeyViolation(_)) => "23503",
+            // generated_always — explicit INSERT value for a GENERATED
+            // ALWAYS identity column.
+            Self::Execute(ultrasql_executor::ExecError::GeneratedAlwaysViolation(_)) => "428C9",
             // query_canceled — operator polled the `CancelFlag` between
             // batches and short-circuited after a peer `CancelRequest`
             // flipped it. Mirrors PostgreSQL's `query_canceled`.
@@ -208,6 +233,9 @@ impl ServerError {
             Self::CopyFormat(_) => "22P04",
             // query_canceled — client requested `CopyFail`.
             Self::CopyAborted(_) => "57014",
+            // object_not_in_prerequisite_state — sequence exists but
+            // currval/lastval has no session-local value yet.
+            Self::ObjectNotInPrerequisiteState(_) => "55000",
             // Internal-style: Execute/IO/Protocol/UnexpectedEof and the
             // dynamic Ddl message all map to XX000.
             _ => "XX000",

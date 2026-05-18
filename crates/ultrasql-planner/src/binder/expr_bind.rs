@@ -837,6 +837,7 @@ fn literal_numeric_as_f64(value: &Value) -> Option<f64> {
 fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
     match func_name {
         "extract" => Ok(DataType::Int64),
+        "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
         "substring" => Ok(DataType::Text { max_len: None }),
         _ => Err(PlanError::NotSupported("non-aggregate function calls")),
     }
@@ -848,7 +849,7 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
 /// `non-aggregate function calls`.
 #[allow(dead_code)]
 pub(super) fn is_supported_builtin(func_name: &str) -> bool {
-    matches!(func_name, "extract" | "substring")
+    matches!(func_name, "extract" | "pg_get_userbyid" | "substring")
 }
 
 /// Days from the 2000-01-01 epoch to (year, month, day), positive or
@@ -1094,9 +1095,33 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
             *value = Value::Float64(widened);
             *data_type = DataType::Float64;
         }
+        (
+            DataType::Float64,
+            Value::Decimal {
+                value: decimal_value,
+                scale,
+            },
+        ) => {
+            #[allow(clippy::cast_precision_loss)]
+            let widened = (*decimal_value as f64) / 10_f64.powi(*scale);
+            *value = Value::Float64(widened);
+            *data_type = DataType::Float64;
+        }
         (DataType::Float32, Value::Float64(v)) => {
             #[allow(clippy::cast_possible_truncation)]
             let narrow = *v as f32;
+            *value = Value::Float32(narrow);
+            *data_type = DataType::Float32;
+        }
+        (
+            DataType::Float32,
+            Value::Decimal {
+                value: decimal_value,
+                scale,
+            },
+        ) => {
+            #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+            let narrow = ((*decimal_value as f64) / 10_f64.powi(*scale)) as f32;
             *value = Value::Float32(narrow);
             *data_type = DataType::Float32;
         }
@@ -1406,6 +1431,23 @@ mod typed_literal_tests {
         let folded = try_fold_literal_binary(BinaryOp::Sub, &left, &right)
             .expect("fold attempt should not error");
         assert!(folded.is_none(), "decimal arithmetic must stay exact");
+    }
+
+    #[test]
+    fn decimal_literal_coerces_to_float64_target() {
+        let mut expr = bind_literal(&Literal::Float {
+            text: "1.5".to_owned(),
+            span: Span::default(),
+        });
+        coerce_literal_to_type(&mut expr, &DataType::Float64);
+        let ScalarExpr::Literal { value, data_type } = expr else {
+            panic!("expected literal");
+        };
+        assert_eq!(data_type, DataType::Float64);
+        let Value::Float64(v) = value else {
+            panic!("expected float64");
+        };
+        assert!((v - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]

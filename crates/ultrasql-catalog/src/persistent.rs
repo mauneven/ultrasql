@@ -292,7 +292,7 @@ pub struct CatalogStats {
 }
 
 impl CatalogStats {
-    /// Stats for a fresh-database initial snapshot: 3 namespaces, 8 relations,
+    /// Stats for a fresh-database initial snapshot: 3 namespaces, 10 relations,
     /// no attributes, indexes, or constraints yet decoded from the heap.
     ///
     /// Used when `bootstrap_from_heap` detects an empty heap and installs the
@@ -301,7 +301,7 @@ impl CatalogStats {
     pub const fn initial() -> Self {
         Self {
             namespaces: 3,
-            relations: 8,
+            relations: 10,
             attributes: 0,
             indexes: 0,
             constraints: 0,
@@ -327,6 +327,12 @@ pub struct CatalogSnapshot {
     pub indexes: std::collections::HashMap<String, IndexEntry>,
     /// Indexes keyed by table OID.
     pub indexes_by_table: std::collections::HashMap<Oid, Vec<IndexEntry>>,
+    /// Comments keyed by `(objoid, classoid, objsubid)`.
+    pub descriptions: std::collections::HashMap<(Oid, Oid, i32), DescriptionRow>,
+    /// `pg_statistic` rows keyed by `(starelid, staattnum)`.
+    pub statistics: std::collections::HashMap<(Oid, i16), StatisticRow>,
+    /// `pg_statistic_ext` rows keyed by statistic object OID.
+    pub statistic_ext: std::collections::HashMap<Oid, StatisticExtRow>,
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +394,9 @@ impl PersistentCatalog {
             tables_by_oid: std::collections::HashMap::new(),
             indexes: std::collections::HashMap::new(),
             indexes_by_table: std::collections::HashMap::new(),
+            descriptions: std::collections::HashMap::new(),
+            statistics: std::collections::HashMap::new(),
+            statistic_ext: std::collections::HashMap::new(),
         });
         Self {
             pg_namespace: DashMap::new(),
@@ -444,6 +453,9 @@ impl PersistentCatalog {
         self.tables_by_oid.clear();
         self.indexes_by_name.clear();
         self.indexes_by_table.clear();
+        self.pg_description.clear();
+        self.pg_statistic.clear();
+        self.pg_statistic_ext.clear();
 
         for (name, entry) in &snap.tables {
             self.tables_by_name.insert(name.clone(), entry.clone());
@@ -454,6 +466,15 @@ impl PersistentCatalog {
         }
         for (oid, entries) in &snap.indexes_by_table {
             self.indexes_by_table.insert(*oid, entries.clone());
+        }
+        for (key, row) in &snap.descriptions {
+            self.pg_description.insert(*key, row.clone());
+        }
+        for (key, row) in &snap.statistics {
+            self.pg_statistic.insert(*key, row.clone());
+        }
+        for (oid, row) in &snap.statistic_ext {
+            self.pg_statistic_ext.insert(*oid, row.clone());
         }
         self.snapshot.store(Arc::new(snap));
     }
@@ -471,7 +492,7 @@ impl PersistentCatalog {
     /// When all system catalog heap pages are empty (i.e. the database was
     /// just initialized) this method detects the empty heap and installs the
     /// hard-coded [`initial_snapshot`] that contains the three well-known
-    /// namespaces and the eight system relations.  The returned
+    /// namespaces and the ten system relations.  The returned
     /// [`CatalogStats`] in this case reflects the initial snapshot counts.
     ///
     /// # Idempotent
@@ -595,6 +616,9 @@ impl PersistentCatalog {
             tables_by_oid,
             indexes: initial.indexes,
             indexes_by_table: initial.indexes_by_table,
+            descriptions: initial.descriptions,
+            statistics: initial.statistics,
+            statistic_ext: initial.statistic_ext,
         };
         let stats = CatalogStats {
             namespaces: CatalogStats::initial().namespaces,
@@ -718,13 +742,112 @@ impl PersistentCatalog {
             .iter()
             .map(|r| (*r.key(), r.value().clone()))
             .collect();
+        let descriptions: std::collections::HashMap<(Oid, Oid, i32), DescriptionRow> = self
+            .pg_description
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
+        let statistics: std::collections::HashMap<(Oid, i16), StatisticRow> = self
+            .pg_statistic
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
+        let statistic_ext: std::collections::HashMap<Oid, StatisticExtRow> = self
+            .pg_statistic_ext
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
         let snap = Arc::new(CatalogSnapshot {
             tables,
             tables_by_oid,
             indexes,
             indexes_by_table,
+            descriptions,
+            statistics,
+            statistic_ext,
         });
         self.snapshot.store(snap);
+    }
+
+    /// Set or clear an object comment in `pg_description`.
+    pub fn set_description(
+        &self,
+        objoid: Oid,
+        classoid: Oid,
+        objsubid: i32,
+        description: Option<String>,
+    ) {
+        let _guard = self.write_lock.lock();
+        let key = (objoid, classoid, objsubid);
+        if let Some(description) = description {
+            self.pg_description.insert(
+                key,
+                DescriptionRow {
+                    objoid,
+                    classoid,
+                    objsubid,
+                    description,
+                },
+            );
+        } else {
+            self.pg_description.remove(&key);
+        }
+        self.rebuild_snapshot();
+    }
+
+    /// Clear every comment attached to one object OID.
+    pub fn clear_descriptions_for_object(&self, objoid: Oid) {
+        let _guard = self.write_lock.lock();
+        let keys: Vec<_> = self
+            .pg_description
+            .iter()
+            .filter(|entry| entry.key().0 == objoid)
+            .map(|entry| *entry.key())
+            .collect();
+        for key in keys {
+            self.pg_description.remove(&key);
+        }
+        self.rebuild_snapshot();
+    }
+
+    /// Replace every `pg_statistic` row for one relation.
+    pub fn replace_statistics(&self, starelid: Oid, rows: impl IntoIterator<Item = StatisticRow>) {
+        let _guard = self.write_lock.lock();
+        let keys: Vec<_> = self
+            .pg_statistic
+            .iter()
+            .filter(|entry| entry.key().0 == starelid)
+            .map(|entry| *entry.key())
+            .collect();
+        for key in keys {
+            self.pg_statistic.remove(&key);
+        }
+        for row in rows {
+            self.pg_statistic
+                .insert((row.starelid, row.staattnum), row);
+        }
+        self.rebuild_snapshot();
+    }
+
+    /// Insert one `pg_statistic_ext` row and publish a new snapshot.
+    pub fn create_statistic_ext(&self, row: StatisticExtRow) -> Result<(), CatalogError> {
+        let _guard = self.write_lock.lock();
+        if self.pg_statistic_ext.contains_key(&row.oid) {
+            return Err(CatalogError::already_exists(format!(
+                "oid {}",
+                row.oid.raw()
+            )));
+        }
+        if self
+            .pg_statistic_ext
+            .iter()
+            .any(|entry| entry.value().stxname.eq_ignore_ascii_case(&row.stxname))
+        {
+            return Err(CatalogError::already_exists(row.stxname));
+        }
+        self.pg_statistic_ext.insert(row.oid, row);
+        self.rebuild_snapshot();
+        Ok(())
     }
 }
 
@@ -1089,7 +1212,7 @@ mod tests {
     }
 
     /// `bootstrap_from_heap` on a fresh database (empty heap) installs the
-    /// initial snapshot that contains the 8 system relations.
+    /// initial snapshot that contains the 10 system relations.
     #[test]
     fn bootstrap_from_empty_heap_installs_initial_snapshot() {
         let cat = PersistentCatalog::new();
@@ -1100,11 +1223,11 @@ mod tests {
 
         // Stats reflect the initial snapshot counts.
         assert_eq!(stats.namespaces, 3);
-        assert_eq!(stats.relations, 8);
+        assert_eq!(stats.relations, 10);
 
-        // The snapshot contains all 8 system relations.
+        // The snapshot contains all 10 system relations.
         let snap = cat.snapshot();
-        assert_eq!(snap.tables.len(), 8);
+        assert_eq!(snap.tables.len(), 10);
         assert!(snap.tables.contains_key("pg_class"));
         assert!(snap.tables.contains_key("pg_attribute"));
         assert!(snap.tables.contains_key("pg_namespace"));
@@ -1121,18 +1244,18 @@ mod tests {
 
         // Capture snapshot before any mutation.
         let snap_before = cat.snapshot();
-        assert_eq!(snap_before.tables.len(), 8);
+        assert_eq!(snap_before.tables.len(), 10);
 
         // Add a table — this swaps in a new snapshot.
         cat.create_table(make_table(&cat, "user_orders"))
             .expect("create");
 
         // The old snapshot reference is still valid and unchanged.
-        assert_eq!(snap_before.tables.len(), 8);
+        assert_eq!(snap_before.tables.len(), 10);
 
         // A fresh snapshot call reflects the new state.
         let snap_after = cat.snapshot();
-        assert_eq!(snap_after.tables.len(), 9);
+        assert_eq!(snap_after.tables.len(), 11);
     }
 
     /// N threads each take a snapshot concurrently; all must see the same
@@ -1162,7 +1285,7 @@ mod tests {
         // Every thread must see the same count.
         let first = counts[0];
         assert!(counts.iter().all(|&c| c == first));
-        assert_eq!(first, 8);
+        assert_eq!(first, 10);
     }
 
     /// After installing a new snapshot via `install_snapshot`, the very next
@@ -1173,9 +1296,9 @@ mod tests {
         let heap = blank_heap();
         cat.bootstrap_from_heap(&heap).expect("bootstrap");
 
-        // Snapshot A: 8 system tables.
+        // Snapshot A: 10 system tables.
         let snap_a = cat.snapshot();
-        assert_eq!(snap_a.tables.len(), 8);
+        assert_eq!(snap_a.tables.len(), 10);
 
         // Build a richer snapshot with an additional table.
         let mut tables = snap_a.tables.clone();
@@ -1188,13 +1311,99 @@ mod tests {
             tables_by_oid,
             indexes: snap_a.indexes.clone(),
             indexes_by_table: snap_a.indexes_by_table.clone(),
+            descriptions: snap_a.descriptions.clone(),
+            statistics: snap_a.statistics.clone(),
+            statistic_ext: snap_a.statistic_ext.clone(),
         };
         cat.install_snapshot(snap_b);
 
         // Snapshot B must be visible immediately.
         let snap_after = cat.snapshot();
-        assert_eq!(snap_after.tables.len(), 9);
+        assert_eq!(snap_after.tables.len(), 11);
         assert!(snap_after.tables.contains_key("extra_table"));
+    }
+
+    #[test]
+    fn set_description_updates_snapshot_and_clear_removes_rows() {
+        let cat = PersistentCatalog::new();
+        let heap = blank_heap();
+        cat.bootstrap_from_heap(&heap).expect("bootstrap");
+
+        let objoid = Oid::new(42_000);
+        let classoid = Oid::new(crate::bootstrap::PG_CLASS_OID);
+        cat.set_description(objoid, classoid, 0, Some("table docs".to_owned()));
+        let snap = cat.snapshot();
+        let row = snap
+            .descriptions
+            .get(&(objoid, classoid, 0))
+            .expect("description row present");
+        assert_eq!(row.description, "table docs");
+
+        cat.set_description(objoid, classoid, 1, Some("column docs".to_owned()));
+        assert_eq!(cat.snapshot().descriptions.len(), 2);
+
+        cat.clear_descriptions_for_object(objoid);
+        assert!(cat.snapshot().descriptions.is_empty());
+    }
+
+    #[test]
+    fn statistics_updates_publish_snapshot_rows() {
+        let cat = PersistentCatalog::new();
+        let table_oid = Oid::new(42_001);
+        cat.replace_statistics(
+            table_oid,
+            [
+                StatisticRow {
+                    starelid: table_oid,
+                    staattnum: 1,
+                    stanullfrac: 0.25,
+                    stadistinct: -0.75,
+                },
+                StatisticRow {
+                    starelid: table_oid,
+                    staattnum: 2,
+                    stanullfrac: 0.0,
+                    stadistinct: 3.0,
+                },
+            ],
+        );
+        assert_eq!(cat.snapshot().statistics.len(), 2);
+        cat.replace_statistics(
+            table_oid,
+            [StatisticRow {
+                starelid: table_oid,
+                staattnum: 1,
+                stanullfrac: 0.0,
+                stadistinct: 1.0,
+            }],
+        );
+        let snap = cat.snapshot();
+        assert_eq!(snap.statistics.len(), 1);
+        assert_eq!(
+            snap.statistics
+                .get(&(table_oid, 1))
+                .expect("stat row")
+                .stadistinct,
+            1.0
+        );
+    }
+
+    #[test]
+    fn statistic_ext_create_publishes_snapshot_row() {
+        let cat = PersistentCatalog::new();
+        let oid = Oid::new(42_002);
+        cat.create_statistic_ext(StatisticExtRow {
+            oid,
+            stxname: "s_ab".to_owned(),
+            stxrelid: Oid::new(42_001),
+            stxkeys: vec![1, 2],
+            stxkind: vec!['d', 'f', 'm'],
+        })
+        .expect("create statistic ext");
+        let snap = cat.snapshot();
+        let row = snap.statistic_ext.get(&oid).expect("statistic ext row");
+        assert_eq!(row.stxname, "s_ab");
+        assert_eq!(row.stxkeys, vec![1, 2]);
     }
 
     /// `alter_table_add_column` on the persistent catalog extends the
@@ -1270,7 +1479,7 @@ mod tests {
             .bootstrap_from_heap(&heap)
             .expect("bootstrap must succeed");
         // Initial system relations plus the one user table.
-        assert!(stats.relations >= 9);
+        assert!(stats.relations >= 11);
         assert_eq!(stats.attributes, 2);
 
         let snap = cat2.snapshot();

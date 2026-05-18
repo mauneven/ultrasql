@@ -5,6 +5,7 @@
 //! to these methods based on the leading keyword.
 
 pub(crate) mod alter_table;
+pub(crate) mod comment;
 pub(crate) mod copy;
 pub(crate) mod create_index;
 pub(crate) mod create_schema;

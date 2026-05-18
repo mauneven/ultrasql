@@ -28,6 +28,7 @@ mod io;
 mod meta_stmt;
 mod notify;
 mod run;
+mod sequence;
 mod startup;
 mod txn;
 
@@ -85,6 +86,8 @@ pub(crate) struct Session<RW> {
     /// transaction block. Flushed to server-level maintenance hooks on
     /// COMMIT, cleared on ROLLBACK.
     pub(super) pending_table_modifications: std::collections::HashMap<String, u64>,
+    /// Per-session sequence state used by `currval` / `lastval`.
+    pub(super) sequence_state: crate::SequenceSessionState,
     /// `true` when an autocommit statement committed successfully and
     /// its background-ish maintenance hook should run after the reply
     /// bytes are already on the wire.
@@ -123,6 +126,7 @@ where
             notify_rx,
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_table_modifications: std::collections::HashMap::new(),
+            sequence_state: crate::SequenceSessionState::default(),
             pending_post_commit_maintenance: false,
         }
     }

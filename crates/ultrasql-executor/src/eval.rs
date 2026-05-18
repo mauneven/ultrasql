@@ -225,6 +225,7 @@ pub(crate) fn eval_expr(
 ///
 /// Today's support set is the slice needed for TPC-H lift-off:
 /// - `extract(unit, date)` — date-part extraction. Returns `i64`.
+/// - `pg_get_userbyid(oid)` — compatibility helper for psql catalog meta SQL.
 /// - `substring(text, from[, for])` — 1-based string slicing.
 ///
 /// Unknown function names return [`EvalError::Unsupported`] so the
@@ -232,6 +233,7 @@ pub(crate) fn eval_expr(
 fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match name {
         "extract" => eval_extract(args),
+        "pg_get_userbyid" => eval_pg_get_userbyid(args),
         "substring" => eval_substring(args),
         "coalesce" => Ok(args
             .iter()
@@ -244,6 +246,33 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             format!("function `{other}` not implemented").into_boxed_str(),
         ))),
     }
+}
+
+fn eval_pg_get_userbyid(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "pg_get_userbyid: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let oid = match &args[0] {
+        Value::Int16(v) => i64::from(*v),
+        Value::Int32(v) => i64::from(*v),
+        Value::Int64(v) => *v,
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::Type(format!(
+                "pg_get_userbyid: oid must be integer, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    let name = if oid == 10 {
+        "ultrasql".to_owned()
+    } else {
+        format!("unknown (OID={oid})")
+    };
+    Ok(Value::Text(name))
 }
 
 /// `CASE WHEN c1 THEN v1 … ELSE e END` — args layout:

@@ -93,6 +93,9 @@ pub(super) fn lower_recursive_cte(
         let child_ctx = LowerCtx {
             tables: ctx.tables,
             catalog_snapshot: Arc::clone(&ctx.catalog_snapshot),
+            table_constraints: Arc::clone(&ctx.table_constraints),
+            sequences: Arc::clone(&ctx.sequences),
+            sequence_state: ctx.sequence_state.clone(),
             heap: Arc::clone(&ctx.heap),
             vm: Arc::clone(&ctx.vm),
             snapshot: ctx.snapshot.clone(),
@@ -145,6 +148,9 @@ pub(super) fn lower_recursive_cte(
     let body_ctx = LowerCtx {
         tables: ctx.tables,
         catalog_snapshot: Arc::clone(&ctx.catalog_snapshot),
+        table_constraints: Arc::clone(&ctx.table_constraints),
+        sequences: Arc::clone(&ctx.sequences),
+        sequence_state: ctx.sequence_state.clone(),
         heap: Arc::clone(&ctx.heap),
         vm: Arc::clone(&ctx.vm),
         snapshot: ctx.snapshot.clone(),

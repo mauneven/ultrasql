@@ -4,10 +4,10 @@
 use std::sync::Arc;
 
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
-use ultrasql_core::{DataType, RelationId, Value};
-use ultrasql_executor::{IndexScan, Operator, RowCodec};
+use ultrasql_core::{DataType, Field, RelationId, TupleId, Value};
+use ultrasql_executor::{IndexOnlyScan, IndexScan, Operator, RowCodec};
 use ultrasql_mvcc::{Visibility, is_visible};
-use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
+use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_storage::btree::BTree;
 
 use crate::BlankPageLoader;
@@ -124,6 +124,152 @@ pub(super) fn try_index_scan(
     let payloads = probe_index(index_entry, range, ctx)?;
     let codec = RowCodec::new(table_entry.schema.clone());
     Ok(Some(Box::new(IndexScan::new(payloads, codec))))
+}
+
+/// Try to lower `ORDER BY indexed_col [ASC|DESC]` over a bare table scan into
+/// a directed B-tree scan.
+///
+/// This is intentionally narrow: one integer sort key, one base table, no
+/// scan-level projection. Broader interesting-order planning belongs in the
+/// optimizer, but this path makes backward index scan reachable through the
+/// real wire lowerer today.
+pub(super) fn try_ordered_index_scan(
+    input: &LogicalPlan,
+    keys: &[SortKey],
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let [key] = keys else {
+        return Ok(None);
+    };
+    let LogicalPlan::Scan {
+        table, projection, ..
+    } = input
+    else {
+        return Ok(None);
+    };
+    if projection.is_some() {
+        return Ok(None);
+    }
+    let Some(table_entry) = ctx.catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    let Some(col_idx) = column_idx_for_int_key(&key.expr) else {
+        return Ok(None);
+    };
+    let Some(index_entry) = find_single_column_index(&ctx.catalog_snapshot, table_entry, col_idx)
+    else {
+        return Ok(None);
+    };
+    let Some(_widen) = key_type_for_btree(table_entry, col_idx) else {
+        return Ok(None);
+    };
+    let payloads = probe_index_ordered(
+        index_entry,
+        IndexKeyRange {
+            low: None,
+            high: None,
+        },
+        key.asc,
+        ctx,
+    )?;
+    let codec = RowCodec::new(table_entry.schema.clone());
+    Ok(Some(Box::new(IndexScan::new(payloads, codec))))
+}
+
+/// Try to lower `Project(Filter(Scan), key_column)` into an index-only scan.
+///
+/// This path is intentionally narrow and correctness-first:
+/// - one indexed Int32/Int64 key column,
+/// - projected columns must all be that same covered key,
+/// - predicate must be a normal indexable B-tree range,
+/// - every candidate tuple's heap page must be marked all-visible in VM.
+///
+/// If any condition misses, caller falls back to the existing
+/// `Project(IndexScan)` or `Project(Filter(SeqScan))` path. We do not fetch
+/// heap rows inside this operator; VM proof is required before choosing it.
+pub(super) fn try_index_only_scan(
+    input: &LogicalPlan,
+    exprs: &[(ScalarExpr, String)],
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    if exprs.is_empty() {
+        return Ok(None);
+    }
+    let LogicalPlan::Filter {
+        input: filter_input,
+        predicate,
+    } = input
+    else {
+        return Ok(None);
+    };
+    let LogicalPlan::Scan { table, .. } = filter_input.as_ref() else {
+        return Ok(None);
+    };
+    let Some(table_entry) = ctx.catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    let Some((predicate_col_idx, range)) = match_indexable_predicate(predicate) else {
+        return Ok(None);
+    };
+    let Some(index_entry) =
+        find_single_column_index(&ctx.catalog_snapshot, table_entry, predicate_col_idx)
+    else {
+        return Ok(None);
+    };
+    let Some(_widen) = key_type_for_btree(table_entry, predicate_col_idx) else {
+        return Ok(None);
+    };
+
+    let mut output_fields: Vec<Field> = Vec::with_capacity(exprs.len());
+    for (expr, name) in exprs {
+        let ScalarExpr::Column {
+            index, data_type, ..
+        } = expr
+        else {
+            return Ok(None);
+        };
+        if *index != predicate_col_idx {
+            return Ok(None);
+        }
+        if !matches!(data_type, DataType::Int32 | DataType::Int64) {
+            return Ok(None);
+        }
+        output_fields.push(Field::nullable(name.clone(), data_type.clone()));
+    }
+    let output_schema = ultrasql_core::Schema::new(output_fields).map_err(|e| {
+        ServerError::Plan(ultrasql_planner::PlanError::TypeMismatch(format!(
+            "index-only projection schema: {e}"
+        )))
+    })?;
+
+    let entries = probe_index_entries_ordered(index_entry, range, true, ctx)?;
+    let table_rel = RelationId(table_entry.oid);
+    if entries
+        .iter()
+        .any(|(_, tid)| !ctx.vm.is_all_visible(table_rel, tid.page.block))
+    {
+        return Ok(None);
+    }
+
+    let projected_rows: Option<Vec<Vec<Value>>> = entries
+        .into_iter()
+        .map(|(key, _tid)| {
+            exprs
+                .iter()
+                .map(|(expr, _)| key_value_for_expr(key, expr))
+                .collect()
+        })
+        .collect();
+    let Some(projected_rows) = projected_rows else {
+        return Ok(None);
+    };
+    let vm = vec![true; projected_rows.len()];
+    Ok(Some(Box::new(IndexOnlyScan::new(
+        projected_rows,
+        vm,
+        Vec::new(),
+        output_schema,
+    ))))
 }
 
 /// Decode a `WHERE` predicate into an `(column_index, IndexKeyRange)`
@@ -331,6 +477,25 @@ pub(super) fn probe_index(
     range: IndexKeyRange,
     ctx: &LowerCtx<'_>,
 ) -> Result<Vec<Vec<u8>>, ServerError> {
+    probe_index_ordered(index_entry, range, true, ctx)
+}
+
+fn probe_index_ordered(
+    index_entry: &IndexEntry,
+    range: IndexKeyRange,
+    ascending: bool,
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<Vec<u8>>, ServerError> {
+    let entries = probe_index_entries_ordered(index_entry, range, ascending, ctx)?;
+    fetch_visible_index_payloads(entries.into_iter().map(|(_, tid)| tid), ctx)
+}
+
+fn probe_index_entries_ordered(
+    index_entry: &IndexEntry,
+    range: IndexKeyRange,
+    ascending: bool,
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<(i64, TupleId)>, ServerError> {
     let index_rel = RelationId::new(index_entry.oid.raw());
     let pool = ctx.heap.buffer_pool();
     let btree: BTree<BlankPageLoader> =
@@ -342,17 +507,26 @@ pub(super) fn probe_index(
     // upper bound is exclusive, so we add 1 to `high` to keep the
     // inclusive contract — overflowing to `None` (i.e., scan to the
     // end of the leaf chain) when `high == i64::MAX`.
-    let mut tids: Vec<ultrasql_core::TupleId> = Vec::new();
-    match (range.low, range.high) {
-        (Some(lo), Some(hi)) if lo == hi => {
-            if let Some(tid) = btree
-                .lookup::<i64>(lo)
-                .map_err(|e| ServerError::ddl(format!("IndexScan btree lookup: {e}")))?
-            {
-                tids.push(tid);
+    let mut entries_out: Vec<(i64, TupleId)> = Vec::new();
+    match (range.low, range.high, ascending) {
+        (Some(lo), Some(hi), true) if lo == hi => {
+            if index_entry.is_unique {
+                if let Some(tid) = btree
+                    .lookup::<i64>(lo)
+                    .map_err(|e| ServerError::ddl(format!("IndexScan btree lookup: {e}")))?
+                {
+                    entries_out.push((lo, tid));
+                }
+            } else {
+                for tid in btree
+                    .lookup_all::<i64>(lo)
+                    .map_err(|e| ServerError::ddl(format!("IndexScan btree lookup: {e}")))?
+                {
+                    entries_out.push((lo, tid));
+                }
             }
         }
-        (low, high) => {
+        (low, high, true) => {
             // Walk the half-open `[start, end_exclusive)`. `start =
             // low.unwrap_or(i64::MIN)` and `end_exclusive =
             // high.map(|h| h.checked_add(1))` — when the +1 overflows we
@@ -362,13 +536,31 @@ pub(super) fn probe_index(
             // treats as "unbounded above" — exactly the contract we want.
             let end_exclusive: Option<i64> = high.and_then(|h| h.checked_add(1));
             for entry in btree.range_scan::<i64>(start, end_exclusive) {
-                let (_key, tid) =
+                let (key, tid) =
                     entry.map_err(|e| ServerError::ddl(format!("IndexScan btree scan: {e}")))?;
-                tids.push(tid);
+                entries_out.push((key, tid));
+            }
+        }
+        (low, high, false) => {
+            let start = high.unwrap_or(i64::MAX);
+            let end = low;
+            for entry in btree
+                .backward_scan::<i64>(start, end)
+                .map_err(|e| ServerError::ddl(format!("IndexScan btree backward scan: {e}")))?
+            {
+                let (key, tid) = entry
+                    .map_err(|e| ServerError::ddl(format!("IndexScan btree backward scan: {e}")))?;
+                entries_out.push((key, tid));
             }
         }
     }
+    Ok(entries_out)
+}
 
+fn fetch_visible_index_payloads<I>(tids: I, ctx: &LowerCtx<'_>) -> Result<Vec<Vec<u8>>, ServerError>
+where
+    I: IntoIterator<Item = TupleId>,
+{
     // Fetch the heap tuples in B-tree order and apply MVCC visibility
     // inline. An index entry whose heap tuple is invisible to the
     // statement's snapshot is silently dropped — the same outcome a
@@ -377,8 +569,10 @@ pub(super) fn probe_index(
     // chaining through `scan_visible` because the latter walks a
     // block-by-block iterator we cannot project onto an arbitrary
     // TupleId list.
-    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(tids.len());
-    for tid in tids {
+    let iter = tids.into_iter();
+    let (lower, _) = iter.size_hint();
+    let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(lower);
+    for tid in iter {
         let tuple = ctx
             .heap
             .fetch(tid)
@@ -389,4 +583,15 @@ pub(super) fn probe_index(
         }
     }
     Ok(payloads)
+}
+
+fn key_value_for_expr(key: i64, expr: &ScalarExpr) -> Option<Value> {
+    let ScalarExpr::Column { data_type, .. } = expr else {
+        return None;
+    };
+    match data_type {
+        DataType::Int32 => i32::try_from(key).ok().map(Value::Int32),
+        DataType::Int64 => Some(Value::Int64(key)),
+        _ => None,
+    }
 }

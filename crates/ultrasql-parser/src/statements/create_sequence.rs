@@ -8,7 +8,7 @@
 //!
 //! Sequence options: `START [WITH] n`, `INCREMENT [BY] n`,
 //! `MINVALUE n | NO MINVALUE`, `MAXVALUE n | NO MAXVALUE`,
-//! `CACHE n`, `CYCLE | NO CYCLE`.
+//! `RESTART [[WITH] n]`, `CACHE n`, `CYCLE | NO CYCLE`.
 
 use crate::ast::{AlterSequenceStmt, CreateSequenceStmt, DropSequenceStmt, SequenceOption};
 use crate::parser::{ParseError, Parser};
@@ -83,6 +83,18 @@ impl Parser<'_> {
                     self.advance()?; // START
                     self.match_kw(TokenKind::KwWith); // optional WITH
                     opts.push(SequenceOption::Start(self.parse_signed_integer()?));
+                }
+                TokenKind::KwRestart => {
+                    self.advance()?; // RESTART
+                    let had_with = self.match_kw(TokenKind::KwWith);
+                    let value = if had_with
+                        || matches!(self.peek()?.kind, TokenKind::Integer | TokenKind::Minus)
+                    {
+                        Some(self.parse_signed_integer()?)
+                    } else {
+                        None
+                    };
+                    opts.push(SequenceOption::Restart(value));
                 }
                 TokenKind::KwIncrement => {
                     self.advance()?; // INCREMENT
@@ -252,9 +264,17 @@ mod tests {
 
     #[test]
     fn alter_sequence_restart() {
-        let stmt = parse_alter_seq("ALTER SEQUENCE myseq START WITH 1 INCREMENT BY 1");
+        let stmt = parse_alter_seq("ALTER SEQUENCE myseq RESTART WITH 1 INCREMENT BY 1");
         assert_eq!(stmt.name.to_string(), "myseq");
         assert_eq!(stmt.options.len(), 2);
+        assert!(matches!(stmt.options[0], SequenceOption::Restart(Some(1))));
+    }
+
+    #[test]
+    fn alter_sequence_restart_without_value() {
+        let stmt = parse_alter_seq("ALTER SEQUENCE myseq RESTART");
+        assert_eq!(stmt.options.len(), 1);
+        assert!(matches!(stmt.options[0], SequenceOption::Restart(None)));
     }
 
     #[test]

@@ -63,9 +63,16 @@ pub fn execute_portal(
 
     // DDL is dispatched ahead of operator lowering, matching the Simple
     // Query path in `Session::execute_query`.
-    if let LogicalPlan::CreateTable { .. } = &plan {
+    if matches!(
+        &plan,
+        LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateSequence { .. }
+            | LogicalPlan::AlterSequence { .. }
+            | LogicalPlan::DropSequence { .. }
+            | LogicalPlan::Comment { .. }
+    ) {
         return Err(ServerError::Unsupported(
-            "CREATE TABLE via Extended Query is not yet wired; use Simple Query",
+            "DDL via Extended Query is not yet wired; use Simple Query",
         ));
     }
 

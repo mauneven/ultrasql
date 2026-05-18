@@ -78,6 +78,10 @@ fn infer_into(
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::CreateSequence { .. }
+        | LogicalPlan::AlterSequence { .. }
+        | LogicalPlan::DropSequence { .. }
+        | LogicalPlan::Comment { .. }
         | LogicalPlan::Begin { .. }
         | LogicalPlan::Commit { .. }
         | LogicalPlan::Rollback { .. }
@@ -383,6 +387,10 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::CreateSequence { .. }
+        | LogicalPlan::AlterSequence { .. }
+        | LogicalPlan::DropSequence { .. }
+        | LogicalPlan::Comment { .. }
         | LogicalPlan::Begin { .. }
         | LogicalPlan::Commit { .. }
         | LogicalPlan::Rollback { .. }

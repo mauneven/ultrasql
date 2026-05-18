@@ -16,7 +16,7 @@
 //!
 //! # System relations baked in
 //!
-//! The eight core system tables that exist in every PostgreSQL-compatible
+//! The ten core system tables that exist in every PostgreSQL-compatible
 //! database.  Their OIDs are well-known constants used throughout the
 //! rest of the system.
 //!
@@ -30,6 +30,8 @@
 //! | 1505 | `pg_sequence`       |
 //! | 2608 | `pg_depend`         |
 //! | 2609 | `pg_description`    |
+//! | 2619 | `pg_statistic`      |
+//! | 3381 | `pg_statistic_ext`  |
 //!
 //! The attribute lists for each relation are deliberately minimal — only
 //! the columns modelled by the v0.8 row types in `persistent.rs` are
@@ -73,6 +75,10 @@ pub const PG_SEQUENCE_OID: u32 = 1505;
 pub const PG_DEPEND_OID: u32 = 2608;
 /// OID of `pg_description`.
 pub const PG_DESCRIPTION_OID: u32 = 2609;
+/// OID of `pg_statistic`.
+pub const PG_STATISTIC_OID: u32 = 2619;
+/// OID of `pg_statistic_ext`.
+pub const PG_STATISTIC_EXT_OID: u32 = 3381;
 
 // ---------------------------------------------------------------------------
 // Schema builders
@@ -182,6 +188,29 @@ fn pg_description_schema() -> Schema {
     .expect("pg_description schema invariants hold")
 }
 
+/// Schema for `pg_statistic` (abridged to v0.8 column set).
+fn pg_statistic_schema() -> Schema {
+    Schema::new([
+        Field::required("starelid", DataType::Int64),
+        Field::required("staattnum", DataType::Int16),
+        Field::required("stanullfrac", DataType::Float32),
+        Field::required("stadistinct", DataType::Float32),
+    ])
+    .expect("pg_statistic schema invariants hold")
+}
+
+/// Schema for `pg_statistic_ext` (abridged to v0.8 column set).
+fn pg_statistic_ext_schema() -> Schema {
+    Schema::new([
+        Field::required("oid", DataType::Int64),
+        Field::required("stxname", DataType::Text { max_len: None }),
+        Field::required("stxrelid", DataType::Int64),
+        Field::required("stxkeys", DataType::Text { max_len: None }),
+        Field::required("stxkind", DataType::Text { max_len: None }),
+    ])
+    .expect("pg_statistic_ext schema invariants hold")
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -191,7 +220,7 @@ fn pg_description_schema() -> Schema {
 /// Pre-populates:
 /// - 3 namespaces: `pg_catalog` (OID 11), `information_schema` (OID 12),
 ///   `public` (OID 2200).
-/// - 8 system relations in `pg_catalog`: `pg_namespace`, `pg_class`,
+/// - 10 system relations in `pg_catalog`: `pg_namespace`, `pg_class`,
 ///   `pg_attribute`, `pg_index`, `pg_constraint`, `pg_sequence`,
 ///   `pg_depend`, `pg_description`.
 ///
@@ -215,10 +244,13 @@ pub fn initial_snapshot() -> CatalogSnapshot {
         tables_by_oid,
         indexes: HashMap::new(),
         indexes_by_table: HashMap::new(),
+        descriptions: HashMap::new(),
+        statistics: HashMap::new(),
+        statistic_ext: HashMap::new(),
     }
 }
 
-/// Enumerate the eight system [`TableEntry`] values that exist in every
+/// Enumerate the ten system [`TableEntry`] values that exist in every
 /// fresh database.
 ///
 /// Used by both [`initial_snapshot`] and
@@ -250,6 +282,12 @@ pub fn system_table_entries() -> Vec<TableEntry> {
         sys_table!(PG_SEQUENCE_OID, "pg_sequence", pg_sequence_schema),
         sys_table!(PG_DEPEND_OID, "pg_depend", pg_depend_schema),
         sys_table!(PG_DESCRIPTION_OID, "pg_description", pg_description_schema),
+        sys_table!(PG_STATISTIC_OID, "pg_statistic", pg_statistic_schema),
+        sys_table!(
+            PG_STATISTIC_EXT_OID,
+            "pg_statistic_ext",
+            pg_statistic_ext_schema
+        ),
     ]
 }
 
@@ -263,12 +301,12 @@ mod tests {
 
     #[test]
     fn initial_snapshot_has_three_namespaces_worth_of_relations() {
-        // All eight system tables live in pg_catalog.
+        // All ten system tables live in pg_catalog.
         let snap = initial_snapshot();
         assert_eq!(
             snap.tables.len(),
-            8,
-            "expected 8 system tables, got {}",
+            10,
+            "expected 10 system tables, got {}",
             snap.tables.len()
         );
     }
@@ -285,6 +323,8 @@ mod tests {
             "pg_sequence",
             "pg_depend",
             "pg_description",
+            "pg_statistic",
+            "pg_statistic_ext",
         ];
         for name in names {
             assert!(
@@ -310,6 +350,14 @@ mod tests {
         assert!(
             snap.tables_by_oid
                 .contains_key(&Oid::new(PG_DESCRIPTION_OID))
+        );
+        assert!(
+            snap.tables_by_oid
+                .contains_key(&Oid::new(PG_STATISTIC_OID))
+        );
+        assert!(
+            snap.tables_by_oid
+                .contains_key(&Oid::new(PG_STATISTIC_EXT_OID))
         );
     }
 

@@ -13,7 +13,7 @@
 
 use crate::ast::{
     ColumnConstraint, ColumnDef, CreateTableAsStmt, CreateTableStmt, Identifier, ObjectName,
-    TableConstraint, TypeName,
+    ReferentialAction, TableConstraint, TypeName,
 };
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
@@ -116,6 +116,75 @@ impl Parser<'_> {
             }
             _ => false,
         }
+    }
+
+    fn parse_referential_action(&mut self) -> Result<ReferentialAction, ParseError> {
+        match self.peek()?.kind {
+            TokenKind::KwCascade => {
+                self.advance()?;
+                Ok(ReferentialAction::Cascade)
+            }
+            TokenKind::KwRestrict => {
+                self.advance()?;
+                Ok(ReferentialAction::Restrict)
+            }
+            TokenKind::KwSet => {
+                self.advance()?;
+                match self.peek()?.kind {
+                    TokenKind::KwNull => {
+                        self.advance()?;
+                        Ok(ReferentialAction::SetNull)
+                    }
+                    TokenKind::KwDefault => {
+                        self.advance()?;
+                        Ok(ReferentialAction::SetDefault)
+                    }
+                    found => Err(ParseError::Expected {
+                        expected: "NULL or DEFAULT after SET",
+                        found,
+                        offset: self.peek()?.span.start as usize,
+                    }),
+                }
+            }
+            TokenKind::KwNo => {
+                self.advance()?;
+                self.expect(TokenKind::KwAction, "ACTION")?;
+                Ok(ReferentialAction::NoAction)
+            }
+            found => Err(ParseError::Expected {
+                expected: "CASCADE, RESTRICT, SET NULL, SET DEFAULT, or NO ACTION",
+                found,
+                offset: self.peek()?.span.start as usize,
+            }),
+        }
+    }
+
+    fn parse_referential_actions(
+        &mut self,
+    ) -> Result<(ReferentialAction, ReferentialAction), ParseError> {
+        let mut on_delete = ReferentialAction::NoAction;
+        let mut on_update = ReferentialAction::NoAction;
+        while self.peek()?.kind == TokenKind::KwOn {
+            self.advance()?;
+            match self.peek()?.kind {
+                TokenKind::KwDelete => {
+                    self.advance()?;
+                    on_delete = self.parse_referential_action()?;
+                }
+                TokenKind::KwUpdate => {
+                    self.advance()?;
+                    on_update = self.parse_referential_action()?;
+                }
+                found => {
+                    return Err(ParseError::Expected {
+                        expected: "DELETE or UPDATE after ON",
+                        found,
+                        offset: self.peek()?.span.start as usize,
+                    });
+                }
+            }
+        }
+        Ok((on_delete, on_update))
     }
 
     /// Parse the body of a `CREATE TABLE` column list: zero or more
@@ -232,13 +301,72 @@ impl Parser<'_> {
                     } else {
                         Vec::new()
                     };
+                    let (on_delete, on_update) = self.parse_referential_actions()?;
                     let end = self.peek()?.span.start;
                     constraint_list.push(ColumnConstraint::References {
                         name: constraint_name,
                         target_table,
                         target_columns,
+                        on_delete,
+                        on_update,
                         span: Span::new(ref_tok.span.start, end),
                     });
+                }
+                TokenKind::KwGenerated => {
+                    let gen_tok = self.advance()?;
+                    let always = match self.peek()?.kind {
+                        TokenKind::KwAlways => {
+                            self.advance()?;
+                            true
+                        }
+                        TokenKind::KwBy => {
+                            self.advance()?;
+                            self.expect(TokenKind::KwDefault, "DEFAULT")?;
+                            false
+                        }
+                        found => {
+                            return Err(ParseError::Expected {
+                                expected: "ALWAYS or BY DEFAULT",
+                                found,
+                                offset: self.peek()?.span.start as usize,
+                            });
+                        }
+                    };
+                    self.expect(TokenKind::KwAs, "AS")?;
+                    if self.peek()?.kind == TokenKind::KwIdentity {
+                        self.advance()?;
+                        let (options, end) = if self.peek()?.kind == TokenKind::LParen {
+                            self.advance()?;
+                            let options = self.parse_sequence_options()?;
+                            let rp = self.expect(TokenKind::RParen, ")")?;
+                            (options, rp.span.end)
+                        } else {
+                            (Vec::new(), self.peek()?.span.start)
+                        };
+                        constraint_list.push(ColumnConstraint::GeneratedIdentity {
+                            name: constraint_name,
+                            always,
+                            options,
+                            span: Span::new(gen_tok.span.start, end),
+                        });
+                    } else if always && self.peek()?.kind == TokenKind::LParen {
+                        self.advance()?;
+                        let expr = self.parse_expr()?;
+                        self.expect(TokenKind::RParen, ")")?;
+                        let stored = self.expect(TokenKind::KwStored, "STORED")?;
+                        constraint_list.push(ColumnConstraint::GeneratedStored {
+                            name: constraint_name,
+                            expr,
+                            span: Span::new(gen_tok.span.start, stored.span.end),
+                        });
+                    } else {
+                        let tok = self.peek()?;
+                        return Err(ParseError::Expected {
+                            expected: "IDENTITY or (expr) STORED",
+                            found: tok.kind,
+                            offset: tok.span.start as usize,
+                        });
+                    }
                 }
                 _ => {
                     // If we consumed a CONSTRAINT keyword but found no
@@ -246,7 +374,7 @@ impl Parser<'_> {
                     if constraint_name.is_some() {
                         let tok = self.peek()?;
                         return Err(ParseError::Expected {
-                            expected: "NOT NULL, NULL, DEFAULT, PRIMARY KEY, UNIQUE, CHECK, or REFERENCES after CONSTRAINT name",
+                            expected: "NOT NULL, NULL, DEFAULT, PRIMARY KEY, UNIQUE, CHECK, REFERENCES, or GENERATED after CONSTRAINT name",
                             found: tok.kind,
                             offset: tok.span.start as usize,
                         });
@@ -314,12 +442,15 @@ impl Parser<'_> {
                 } else {
                     Vec::new()
                 };
+                let (on_delete, on_update) = self.parse_referential_actions()?;
                 let end = self.peek()?.span.start;
                 Ok(TableConstraint::ForeignKey {
                     name: constraint_name,
                     columns: cols,
                     target_table,
                     target_columns,
+                    on_delete,
+                    on_update,
                     span: Span::new(start, end),
                 })
             }
@@ -613,6 +744,61 @@ mod tests {
             panic!("expected Check, got {:?}", stmt.columns[1].constraints[0]);
         };
         assert_eq!(name.as_ref().map(|n| n.value.as_str()), Some("chk_score"));
+    }
+
+    #[test]
+    fn parses_foreign_key_referential_actions() {
+        let stmt = parse_create_table(
+            "CREATE TABLE child (\
+             parent_id integer REFERENCES parent(id) ON DELETE CASCADE ON UPDATE RESTRICT, \
+             FOREIGN KEY (parent_id) REFERENCES parent(id) ON DELETE SET NULL)",
+        );
+        let ColumnConstraint::References {
+            on_delete,
+            on_update,
+            ..
+        } = stmt.columns[0].constraints[0]
+        else {
+            panic!("expected References");
+        };
+        assert_eq!(on_delete, ReferentialAction::Cascade);
+        assert_eq!(on_update, ReferentialAction::Restrict);
+
+        let TableConstraint::ForeignKey { on_delete, .. } = stmt.table_constraints[0] else {
+            panic!("expected ForeignKey");
+        };
+        assert_eq!(on_delete, ReferentialAction::SetNull);
+    }
+
+    #[test]
+    fn parses_generated_identity_column_constraint() {
+        let stmt = parse_create_table(
+            "CREATE TABLE t (id bigint GENERATED ALWAYS AS IDENTITY (START WITH 10 INCREMENT BY 5))",
+        );
+        let ColumnConstraint::GeneratedIdentity {
+            always, options, ..
+        } = &stmt.columns[0].constraints[0]
+        else {
+            panic!(
+                "expected GeneratedIdentity, got {:?}",
+                stmt.columns[0].constraints[0]
+            );
+        };
+        assert!(*always);
+        assert_eq!(options.len(), 2);
+    }
+
+    #[test]
+    fn parses_generated_stored_column_constraint() {
+        let stmt =
+            parse_create_table("CREATE TABLE t (a int, b int GENERATED ALWAYS AS (a + 1) STORED)");
+        let ColumnConstraint::GeneratedStored { expr, .. } = &stmt.columns[1].constraints[0] else {
+            panic!(
+                "expected GeneratedStored, got {:?}",
+                stmt.columns[1].constraints[0]
+            );
+        };
+        assert!(matches!(expr, crate::ast::Expr::Binary { .. }));
     }
 
     #[test]

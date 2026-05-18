@@ -119,6 +119,10 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::CreateSequence { .. }
+        | LogicalPlan::AlterSequence { .. }
+        | LogicalPlan::DropSequence { .. }
+        | LogicalPlan::Comment { .. }
         | LogicalPlan::Begin { .. }
         | LogicalPlan::Commit { .. }
         | LogicalPlan::Rollback { .. }

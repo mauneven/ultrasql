@@ -13,6 +13,8 @@
 //!   filtered, full copy of the matching rows.
 //! - `INSERT INTO dst SELECT a, b FROM src` — no predicate, full
 //!   copy.
+//! - `INSERT INTO dst (b, a) SELECT a, b FROM src` — explicit target
+//!   column order maps source positions correctly.
 //! - Idempotence: two `INSERT … SELECT` statements double the row
 //!   count.
 //! - Schema arity mismatch is rejected before any heap write.
@@ -171,6 +173,41 @@ async fn insert_select_runs_idempotently_twice() {
         .await
         .expect("select dst");
     assert_eq!(rows.len(), 4, "two SELECTs land 2 + 2 = 4 rows");
+
+    shutdown(client, server_handle).await;
+}
+
+/// Explicit destination columns map source positions to target
+/// columns, just like VALUES inserts.
+#[tokio::test]
+async fn insert_select_respects_target_column_order() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE src (x INT NOT NULL, y INT NOT NULL)")
+        .await
+        .expect("create src");
+    client
+        .batch_execute("CREATE TABLE dst (a INT NOT NULL, b INT NOT NULL)")
+        .await
+        .expect("create dst");
+    client
+        .batch_execute("INSERT INTO src VALUES (7, 70)")
+        .await
+        .expect("seed src");
+
+    client
+        .batch_execute("INSERT INTO dst (b, a) SELECT x, y FROM src")
+        .await
+        .expect("INSERT SELECT with target column order");
+
+    let rows = client
+        .query("SELECT a, b FROM dst", &[])
+        .await
+        .expect("select dst");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 70);
+    assert_eq!(rows[0].get::<_, i32>(1), 7);
 
     shutdown(client, server_handle).await;
 }

@@ -236,6 +236,7 @@ impl<'src> Parser<'src> {
             TokenKind::KwCreate => self.parse_create(),
             TokenKind::KwDrop => self.parse_drop(),
             TokenKind::KwAlter => self.parse_alter(),
+            TokenKind::KwComment => self.parse_comment(),
             TokenKind::KwReindex => self.parse_reindex().map(Statement::Reindex),
             TokenKind::KwSet | TokenKind::KwShow | TokenKind::KwReset => {
                 let head_kind = head.kind;
@@ -302,7 +303,7 @@ impl<'src> Parser<'src> {
             TokenKind::KwCopy => self.parse_copy().map(|s| Statement::Copy(Box::new(s))),
             other => Err(ParseError::Expected {
                 expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, ALTER, \
-                           REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \
+                           COMMENT, REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \
                            RELEASE, EXPLAIN, PREPARE, EXECUTE, DEALLOCATE, LISTEN, NOTIFY, \
                            UNLISTEN, or COPY",
                 found: other,

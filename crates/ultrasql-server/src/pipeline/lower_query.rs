@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use ultrasql_core::Schema;
 use ultrasql_executor::{Filter, HashAggregate, Limit, Operator, ResultOp, Sort, ValuesScan};
 use ultrasql_planner::{LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
@@ -14,7 +15,7 @@ use super::agg_fuse::{
     try_lower_fused_filter_sum_int,
 };
 use super::cte_helpers::{lower_recursive_cte, lower_set_op_real};
-use super::index_scan::try_index_scan;
+use super::index_scan::{try_index_only_scan, try_index_scan, try_ordered_index_scan};
 use super::join::lower_join;
 use super::modify::{
     lower_project_columns, lower_real_delete, lower_real_insert, lower_real_update,
@@ -54,6 +55,9 @@ pub fn lower_query(
             if matches!(input.as_ref(), LogicalPlan::Empty { .. }) {
                 let scalars: Vec<ScalarExpr> = exprs.iter().map(|(e, _)| e.clone()).collect();
                 return Ok(Box::new(ResultOp::new(scalars, schema.clone())));
+            }
+            if let Some(op) = try_index_only_scan(input, exprs, ctx)? {
+                return Ok(op);
             }
             let child = lower_query(input, ctx)?;
             lower_project_columns(child, exprs)
@@ -96,6 +100,9 @@ pub fn lower_query(
         }
         LogicalPlan::Empty { .. } => Err(ServerError::Unsupported("SELECT without FROM")),
         LogicalPlan::Sort { input, keys } => {
+            if let Some(op) = try_ordered_index_scan(input, keys, ctx)? {
+                return Ok(op);
+            }
             // Lower the child first; the executor's `Sort` operator drains
             // it on the first `next_batch()` call and emits sorted rows in
             // 4096-row chunks thereafter, so the wire encoder treats it
@@ -137,7 +144,11 @@ pub fn lower_query(
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
-        | LogicalPlan::AlterTable { .. } => Err(ServerError::Unsupported(
+        | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::CreateSequence { .. }
+        | LogicalPlan::AlterSequence { .. }
+        | LogicalPlan::DropSequence { .. }
+        | LogicalPlan::Comment { .. } => Err(ServerError::Unsupported(
             "DDL reached operator lowerer; expected DDL dispatch path",
         )),
         LogicalPlan::Begin { .. }
@@ -423,16 +434,20 @@ pub(super) fn lower_cte(
     // level — interior mutability here would force every helper to take
     // `&mut LowerCtx` for no clarity gain.
     let mut child_buffers = ctx.cte_buffers.clone();
+    let cte_schema = cte_reference_schema(body, name).unwrap_or_else(|| def_schema.clone());
     child_buffers.insert(
         name.to_ascii_lowercase(),
         CteBuffer {
             batches: Arc::new(batches),
-            schema: def_schema,
+            schema: cte_schema,
         },
     );
     let child_ctx = LowerCtx {
         tables: ctx.tables,
         catalog_snapshot: Arc::clone(&ctx.catalog_snapshot),
+        table_constraints: Arc::clone(&ctx.table_constraints),
+        sequences: Arc::clone(&ctx.sequences),
+        sequence_state: ctx.sequence_state.clone(),
         heap: Arc::clone(&ctx.heap),
         vm: Arc::clone(&ctx.vm),
         snapshot: ctx.snapshot.clone(),
@@ -446,4 +461,29 @@ pub(super) fn lower_cte(
     };
 
     lower_query(body, &child_ctx)
+}
+
+fn cte_reference_schema(plan: &LogicalPlan, name: &str) -> Option<Schema> {
+    match plan {
+        LogicalPlan::Scan { table, schema, .. } if table.eq_ignore_ascii_case(name) => {
+            Some(schema.clone())
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::LockRows { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Delete { input, .. }
+        | LogicalPlan::Update { input, .. } => cte_reference_schema(input, name),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            cte_reference_schema(left, name).or_else(|| cte_reference_schema(right, name))
+        }
+        LogicalPlan::Insert { source, .. } => cte_reference_schema(source, name),
+        LogicalPlan::Cte { body, .. } | LogicalPlan::Explain { input: body, .. } => {
+            cte_reference_schema(body, name)
+        }
+        _ => None,
+    }
 }

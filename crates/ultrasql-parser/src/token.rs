@@ -154,8 +154,10 @@ pub enum TokenKind {
 
     // ---- keywords (sorted alphabetically for sanity) --------------------
     KwAbort,
+    KwAction,
     KwAll,
     KwAlter,
+    KwAlways,
     KwAnalyze,
     KwAnd,
     KwAny,
@@ -178,6 +180,8 @@ pub enum TokenKind {
     KwCollate,
     KwColumn,
     KwCommit,
+    /// `COMMENT` — `COMMENT ON TABLE/COLUMN ... IS ...`.
+    KwComment,
     /// `CONFLICT` — used in `ON CONFLICT`.
     KwConflict,
     KwConstraint,
@@ -208,6 +212,7 @@ pub enum TokenKind {
     KwFor,
     KwForeign,
     KwFrom,
+    KwGenerated,
     KwFull,
     KwGroup,
     KwGrouping,
@@ -333,6 +338,8 @@ pub enum TokenKind {
     KwSession,
     /// `START` — used in `CREATE SEQUENCE … START WITH n`.
     KwStart,
+    /// `STORED` — used in `GENERATED ALWAYS AS (expr) STORED`.
+    KwStored,
     /// `TO` — used in `SET search_path TO …` and `RENAME … TO`.
     KwTo,
     // ---- SELECT completeness keywords added for v0.2 ---------------------

@@ -433,6 +433,9 @@ where
                 let ctx = pipeline::LowerCtx {
                     tables: &self.state.tables,
                     catalog_snapshot: Arc::clone(&catalog_snapshot),
+                    table_constraints: Arc::clone(&self.state.table_constraints),
+                    sequences: Arc::clone(&self.state.sequences),
+                    sequence_state: Some(self.sequence_state.clone()),
                     heap: Arc::clone(&self.state.heap),
                     vm: Arc::clone(&self.state.vm),
                     snapshot: txn.snapshot.clone(),
@@ -475,6 +478,9 @@ where
                 let ctx = pipeline::LowerCtx {
                     tables: &self.state.tables,
                     catalog_snapshot: Arc::clone(&catalog_snapshot),
+                    table_constraints: Arc::clone(&self.state.table_constraints),
+                    sequences: Arc::clone(&self.state.sequences),
+                    sequence_state: Some(self.sequence_state.clone()),
                     heap: Arc::clone(&self.state.heap),
                     vm: Arc::clone(&self.state.vm),
                     snapshot: txn.snapshot.clone(),

@@ -63,10 +63,13 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
-use ultrasql_catalog::{CatalogSnapshot, MutableCatalog, PersistentCatalog};
+use ultrasql_catalog::{CatalogSnapshot, MutableCatalog, PersistentCatalog, StatisticRow};
 use ultrasql_core::{PageId, RelationId};
 use ultrasql_executor::RowCodec;
-use ultrasql_optimizer::{InMemoryStatsCatalog, PlanCache, PlanCacheConfig, StatsCatalog};
+use ultrasql_optimizer::{
+    AnalyzeOptions, AnalyzeRunner, InMemoryStatsCatalog, PgStatisticRow, PlanCache,
+    PlanCacheConfig, StatsCatalog,
+};
 use ultrasql_planner::{
     Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan, ScalarExpr, TableMeta,
 };
@@ -134,6 +137,96 @@ pub enum TxnState {
     Failed(Transaction),
 }
 
+/// Runtime table constraints that are not yet persisted in catalog heap rows.
+///
+/// `TableEntry` deliberately lives below the planner crate, so it cannot carry
+/// bound [`ScalarExpr`] values. The server keeps this side map keyed by table
+/// OID and threads it into DML lowering until `pg_attrdef` / `pg_constraint`
+/// persistence grows a typed expression codec.
+#[derive(Clone, Debug, Default)]
+pub struct TableRuntimeConstraints {
+    /// Per-column default expressions; same order as the table schema.
+    pub defaults: Vec<Option<ScalarExpr>>,
+    /// Per-column sequence names used by SERIAL-like defaults.
+    pub sequence_defaults: Vec<Option<String>>,
+    /// Per-column `GENERATED ALWAYS AS IDENTITY` flags.
+    pub identity_always: Vec<bool>,
+    /// Per-column `GENERATED ALWAYS AS (expr) STORED` expressions.
+    pub generated_stored: Vec<Option<ScalarExpr>>,
+    /// Bound CHECK predicates evaluated against each inserted/updated row.
+    pub checks: Vec<RuntimeCheckConstraint>,
+    /// Non-deferrable FOREIGN KEY constraints evaluated by DML.
+    pub foreign_keys: Vec<RuntimeForeignKeyConstraint>,
+}
+
+/// One runtime CHECK constraint.
+#[derive(Clone, Debug)]
+pub struct RuntimeCheckConstraint {
+    /// Constraint name reported on violation.
+    pub name: String,
+    /// Boolean expression bound against the table row schema.
+    pub expr: ScalarExpr,
+}
+
+/// One runtime FOREIGN KEY constraint.
+#[derive(Clone, Debug)]
+pub struct RuntimeForeignKeyConstraint {
+    /// Constraint name reported on violation.
+    pub name: String,
+    /// Referencing table column indices.
+    pub columns: Vec<usize>,
+    /// Referenced table name.
+    pub target_table: String,
+    /// Referenced table OID.
+    pub target_oid: ultrasql_core::Oid,
+    /// Referenced table column indices.
+    pub target_columns: Vec<usize>,
+    /// Action when a referenced row is deleted.
+    pub on_delete: ultrasql_planner::LogicalReferentialAction,
+    /// Action when a referenced key is updated.
+    pub on_update: ultrasql_planner::LogicalReferentialAction,
+}
+
+/// Session-local sequence state shared with sequence-backed defaults.
+#[derive(Clone, Debug, Default)]
+pub struct SequenceSessionState {
+    currvals: Arc<parking_lot::Mutex<std::collections::HashMap<String, i64>>>,
+    last_sequence: Arc<parking_lot::Mutex<Option<String>>>,
+}
+
+impl SequenceSessionState {
+    /// Record a generated value for `currval` / `lastval`.
+    pub fn record_nextval(&self, name: &str, value: i64) {
+        let folded = name.to_ascii_lowercase();
+        self.currvals.lock().insert(folded.clone(), value);
+        *self.last_sequence.lock() = Some(folded);
+    }
+
+    /// Drop session-local state for a removed sequence.
+    pub fn forget(&self, name: &str) {
+        let folded = name.to_ascii_lowercase();
+        self.currvals.lock().remove(&folded);
+        if self.last_sequence.lock().as_deref() == Some(folded.as_str()) {
+            *self.last_sequence.lock() = None;
+        }
+    }
+
+    /// Return the session-local value for a named sequence.
+    pub fn currval(&self, name: &str) -> Option<i64> {
+        self.currvals
+            .lock()
+            .get(&name.to_ascii_lowercase())
+            .copied()
+    }
+
+    /// Return the most recent sequence/value pair in this session.
+    pub fn lastval(&self) -> Option<(String, i64)> {
+        let name = self.last_sequence.lock().clone()?;
+        let value = self.currvals.lock().get(&name).copied()?;
+        Some((name, value))
+    }
+}
+
 impl TxnState {
     /// The PostgreSQL `ReadyForQuery` status byte for this state.
     #[must_use]
@@ -187,6 +280,9 @@ struct CombinedCatalog<'a> {
 
 impl PlannerCatalog for CombinedCatalog<'_> {
     fn lookup_table(&self, name: &str) -> Option<TableMeta> {
+        if let Some(schema) = pipeline::catalog_views::virtual_catalog_schema(name) {
+            return Some(TableMeta::new(schema));
+        }
         if let Some(meta) = PlannerCatalog::lookup_table(self.snapshot, name) {
             return Some(meta);
         }
@@ -290,6 +386,14 @@ pub struct Server {
     /// In-memory relation statistics populated by manual `ANALYZE`
     /// and by autovacuum-triggered analyze runs.
     pub stats_catalog: parking_lot::RwLock<InMemoryStatsCatalog>,
+    /// Same-process runtime defaults/CHECK constraints keyed by table OID.
+    ///
+    /// The v0.8 runtime enforces these for INSERT/UPDATE. Persistence and
+    /// restart bootstrap are tracked separately because the catalog heap does
+    /// not yet encode bound expressions.
+    pub table_constraints: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
+    /// Same-process sequence registry keyed by folded sequence name.
+    pub sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
     /// Accumulated tuple modifications since the last analyze pass,
     /// keyed by folded table name.
     pub table_modifications: dashmap::DashMap<String, u64>,
@@ -424,6 +528,8 @@ impl Server {
             plan_cache,
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
             stats_catalog: parking_lot::RwLock::new(InMemoryStatsCatalog::new()),
+            table_constraints: Arc::new(dashmap::DashMap::new()),
+            sequences: Arc::new(dashmap::DashMap::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,
@@ -603,6 +709,8 @@ impl Server {
             plan_cache,
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
             stats_catalog: parking_lot::RwLock::new(InMemoryStatsCatalog::new()),
+            table_constraints: Arc::new(dashmap::DashMap::new()),
+            sequences: Arc::new(dashmap::DashMap::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,
@@ -713,9 +821,29 @@ impl Server {
                 }
             }
         }
-        self.stats_catalog
-            .write()
-            .analyze_and_register(&folded, &entry.schema, rows.into_iter());
+        let stats = AnalyzeRunner::new(AnalyzeOptions::default())
+            .run(&folded, &entry.schema, rows.into_iter())
+            .map_err(|e| ServerError::Ddl(format!("ANALYZE statistics failed: {e}")))?;
+        let mut stat_rows = Vec::with_capacity(stats.columns.len());
+        for col in &stats.columns {
+            let staattnum = i16::try_from(col.column_index.saturating_add(1))
+                .map_err(|_| ServerError::Ddl("ANALYZE table has too many columns".to_owned()))?;
+            let pg_row = PgStatisticRow::from_column_stats(
+                entry.oid.raw(),
+                u16::try_from(staattnum)
+                    .map_err(|_| ServerError::Ddl("ANALYZE invalid attribute number".to_owned()))?,
+                col,
+            );
+            stat_rows.push(StatisticRow {
+                starelid: entry.oid,
+                staattnum,
+                stanullfrac: pg_row.stanullfrac,
+                stadistinct: pg_row.stadistinct,
+            });
+        }
+        self.stats_catalog.write().register(stats);
+        self.persistent_catalog
+            .replace_statistics(entry.oid, stat_rows);
         self.plan_cache.invalidate_all();
         Ok(true)
     }
@@ -931,6 +1059,9 @@ fn run_plan_in_txn(
     plan: &LogicalPlan,
     txn: &Transaction,
     catalog_snapshot: Arc<CatalogSnapshot>,
+    table_constraints: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
+    sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
+    sequence_state: Option<SequenceSessionState>,
     tables: &SampleTables,
     heap: Arc<HeapAccess<BlankPageLoader>>,
     vm: Arc<VisibilityMap>,
@@ -948,6 +1079,9 @@ fn run_plan_in_txn(
     let ctx = LowerCtx {
         tables,
         catalog_snapshot,
+        table_constraints,
+        sequences,
+        sequence_state,
         heap,
         vm,
         snapshot: txn.snapshot.clone(),

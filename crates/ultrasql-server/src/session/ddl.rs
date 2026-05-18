@@ -6,20 +6,21 @@
 
 #![allow(unused_imports)]
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{
-    CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
+    Catalog, CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
 };
 use ultrasql_core::{DataType, PageId, RelationId, Value};
 use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, StatsSource};
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
-    Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
-    bind,
+    Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalCommentTarget,
+    LogicalPlan, TableMeta, bind,
 };
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
 use ultrasql_storage::btree::BTree;
@@ -66,6 +67,14 @@ where
             table_name,
             namespace,
             columns,
+            defaults,
+            sequence_defaults,
+            sequence_options,
+            identity_always,
+            generated_stored,
+            checks,
+            unique_constraints,
+            foreign_keys,
             if_not_exists,
             ..
         } = plan
@@ -86,7 +95,85 @@ where
         }
         let oid = self.state.persistent_catalog.next_oid();
         let entry = TableEntry::new(oid, table_name.clone(), namespace.clone(), columns.clone());
+        for unique in unique_constraints {
+            crate::index_key::IndexKeyEncoding::for_columns(&entry.schema, &unique.columns)?;
+        }
+        let serial_sequences: Vec<(String, ultrasql_planner::LogicalSequenceOptions)> =
+            sequence_defaults
+                .iter()
+                .zip(sequence_options)
+                .filter_map(|(name, options)| {
+                    name.as_ref()
+                        .map(|name| (name.clone(), options.unwrap_or_default()))
+                })
+                .collect();
+        for (seq_name, _) in &serial_sequences {
+            if self.state.sequences.contains_key(seq_name) {
+                return Err(ServerError::Catalog(
+                    ultrasql_catalog::CatalogError::already_exists(seq_name.clone()),
+                ));
+            }
+        }
         self.state.persistent_catalog.create_table(entry.clone())?;
+        for (seq_name, options) in &serial_sequences {
+            let seq = ultrasql_storage::sequence::Sequence::new(
+                super::sequence::to_storage_options(*options),
+            )
+            .map_err(|e| ServerError::ddl(format!("CREATE TABLE serial sequence: {e}")))?;
+            self.state.sequences.insert(seq_name.clone(), Arc::new(seq));
+        }
+        let runtime_foreign_keys = foreign_keys
+            .iter()
+            .map(|fk| {
+                let target = snapshot.tables.get(&fk.target_table).ok_or_else(|| {
+                    ServerError::Catalog(ultrasql_catalog::CatalogError::not_found(
+                        fk.target_table.clone(),
+                    ))
+                })?;
+                Ok(crate::RuntimeForeignKeyConstraint {
+                    name: fk.name.clone(),
+                    columns: fk.columns.clone(),
+                    target_table: fk.target_table.clone(),
+                    target_oid: target.oid,
+                    target_columns: fk.target_columns.clone(),
+                    on_delete: fk.on_delete,
+                    on_update: fk.on_update,
+                })
+            })
+            .collect::<Result<Vec<_>, ServerError>>()?;
+        if defaults.iter().any(Option::is_some)
+            || sequence_defaults.iter().any(Option::is_some)
+            || identity_always.iter().any(|v| *v)
+            || generated_stored.iter().any(Option::is_some)
+            || !checks.is_empty()
+            || !runtime_foreign_keys.is_empty()
+        {
+            self.state.table_constraints.insert(
+                oid,
+                Arc::new(crate::TableRuntimeConstraints {
+                    defaults: defaults.clone(),
+                    sequence_defaults: sequence_defaults.clone(),
+                    identity_always: identity_always.clone(),
+                    generated_stored: generated_stored.clone(),
+                    checks: checks
+                        .iter()
+                        .map(|check| crate::RuntimeCheckConstraint {
+                            name: check.name.clone(),
+                            expr: check.expr.clone(),
+                        })
+                        .collect(),
+                    foreign_keys: runtime_foreign_keys,
+                }),
+            );
+        }
+        if let Err(e) = self.create_table_unique_indexes(&entry, unique_constraints) {
+            let _ = self.state.persistent_catalog.drop_table(table_name);
+            self.state.table_constraints.remove(&oid);
+            for (seq_name, _) in &serial_sequences {
+                self.state.sequences.remove(seq_name);
+            }
+            return Err(e);
+        }
         // Persist the typed pg_class + pg_attribute rows so a restart
         // can rebuild this `TableEntry` via
         // `PersistentCatalog::bootstrap_from_heap`. The DDL runs in an
@@ -116,6 +203,11 @@ where
                     "abort of catalog-write txn failed after persist_table_rows error",
                 );
             }
+            let _ = self.state.persistent_catalog.drop_table(table_name);
+            self.state.table_constraints.remove(&oid);
+            for (seq_name, _) in &serial_sequences {
+                self.state.sequences.remove(seq_name);
+            }
             return Err(e.into());
         }
         if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
@@ -129,6 +221,38 @@ where
         // re-plans.
         self.plan_cache_invalidate();
         Ok(run_ddl_command("CREATE TABLE"))
+    }
+
+    fn create_table_unique_indexes(
+        &self,
+        table: &TableEntry,
+        unique_constraints: &[ultrasql_planner::LogicalUniqueConstraint],
+    ) -> Result<(), ServerError> {
+        for unique in unique_constraints {
+            crate::index_key::IndexKeyEncoding::for_columns(&table.schema, &unique.columns)?;
+            let index_oid = self.state.persistent_catalog.next_oid();
+            let index_rel = RelationId::new(index_oid.raw());
+            let btree = BTree::create(Arc::clone(self.state.heap.buffer_pool()), index_rel)
+                .map_err(|e| {
+                    ServerError::ddl(format!("CREATE TABLE constraint index create: {e}"))
+                })?;
+            let root_block = btree.root_block();
+            let mut attnums = Vec::with_capacity(unique.columns.len());
+            for &col in &unique.columns {
+                let attnum = u16::try_from(col).map_err(|_| {
+                    ServerError::Unsupported(
+                        "CREATE TABLE: constraint column index does not fit u16",
+                    )
+                })?;
+                attnums.push(attnum);
+            }
+            let mut entry =
+                IndexEntry::new(index_oid, unique.name.clone(), table.oid, attnums, true);
+            entry.root_block = root_block;
+            // Empty table, so there are no existing heap rows to populate.
+            self.state.persistent_catalog.create_index(entry)?;
+        }
+        Ok(())
     }
 
     /// Build a B+ tree index over the supplied table and register it
@@ -257,9 +381,17 @@ where
                     result.map_err(|e| ServerError::ddl(format!("CREATE INDEX heap scan: {e}")))?;
                 let row = decode_key_column(&tup.data, &table.schema, key_col_idx, &encoding)?;
                 if let Some(key) = row {
-                    btree
-                        .insert(key, tup.tid, txn.xid, None)
-                        .map_err(|e| ServerError::ddl(format!("CREATE INDEX btree insert: {e}")))?;
+                    if *unique {
+                        btree.insert(key, tup.tid, txn.xid, None).map_err(|e| {
+                            ServerError::ddl(format!("CREATE INDEX btree insert: {e}"))
+                        })?;
+                    } else {
+                        btree
+                            .insert_non_unique(key, tup.tid, txn.xid, None)
+                            .map_err(|e| {
+                                ServerError::ddl(format!("CREATE INDEX btree insert: {e}"))
+                            })?;
+                    }
                     inserted += 1;
                 }
                 // NULL key — skip; PostgreSQL's btree omits NULL keys
@@ -312,17 +444,153 @@ where
         &self,
         plan: &LogicalPlan,
     ) -> Result<SelectResult, ServerError> {
-        let LogicalPlan::DropTable { tables, .. } = plan else {
+        let LogicalPlan::DropTable {
+            tables, cascade, ..
+        } = plan
+        else {
             return Err(ServerError::Unsupported(
                 "execute_drop_table called with non-DropTable plan",
             ));
         };
+        let drop_set: HashSet<String> = tables
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
         for name in tables {
+            let Some(entry) = self.state.persistent_catalog.lookup_table(name) else {
+                continue;
+            };
+            let dependents = self.foreign_key_dependents(entry.oid, &drop_set);
+            if !dependents.is_empty() && !*cascade {
+                return Err(ServerError::DependentObjectsStillExist(format!(
+                    "cannot drop table {name} because other objects depend on it: {}",
+                    dependents.join(", ")
+                )));
+            }
+        }
+        for name in tables {
+            if let Some(entry) = self.state.persistent_catalog.lookup_table(name) {
+                if *cascade {
+                    self.drop_foreign_key_dependencies(entry.oid, &drop_set);
+                }
+                if let Some((_, constraints)) = self.state.table_constraints.remove(&entry.oid) {
+                    for seq_name in constraints.sequence_defaults.iter().flatten() {
+                        self.state.sequences.remove(seq_name);
+                    }
+                }
+                self.state
+                    .persistent_catalog
+                    .clear_descriptions_for_object(entry.oid);
+            }
             self.state.persistent_catalog.drop_table(name)?;
         }
         // Any cached plan that referenced this name is now invalid;
         // clear the cache so subsequent statements re-plan.
         self.plan_cache_invalidate();
         Ok(run_ddl_command("DROP TABLE"))
+    }
+
+    fn foreign_key_dependents(
+        &self,
+        target_oid: ultrasql_core::Oid,
+        drop_set: &HashSet<String>,
+    ) -> Vec<String> {
+        let snapshot = self.state.catalog_snapshot();
+        let mut out = Vec::new();
+        for item in self.state.table_constraints.iter() {
+            let table_oid = *item.key();
+            let Some(table) = snapshot.tables_by_oid.get(&table_oid) else {
+                continue;
+            };
+            if drop_set.contains(&table.name.to_ascii_lowercase()) {
+                continue;
+            }
+            for fk in &item.value().foreign_keys {
+                if fk.target_oid == target_oid {
+                    out.push(format!("{}.{}", table.name, fk.name));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    fn drop_foreign_key_dependencies(
+        &self,
+        target_oid: ultrasql_core::Oid,
+        drop_set: &HashSet<String>,
+    ) {
+        let snapshot = self.state.catalog_snapshot();
+        let mut updates = Vec::new();
+        for item in self.state.table_constraints.iter() {
+            let table_oid = *item.key();
+            let Some(table) = snapshot.tables_by_oid.get(&table_oid) else {
+                continue;
+            };
+            if drop_set.contains(&table.name.to_ascii_lowercase()) {
+                continue;
+            }
+            if item
+                .value()
+                .foreign_keys
+                .iter()
+                .any(|fk| fk.target_oid == target_oid)
+            {
+                let mut next = item.value().as_ref().clone();
+                next.foreign_keys.retain(|fk| fk.target_oid != target_oid);
+                updates.push((table_oid, next));
+            }
+        }
+        for (table_oid, constraints) in updates {
+            self.state
+                .table_constraints
+                .insert(table_oid, Arc::new(constraints));
+        }
+    }
+
+    pub(crate) fn execute_comment(
+        &self,
+        plan: &LogicalPlan,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::Comment {
+            target, comment, ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_comment called with non-Comment plan",
+            ));
+        };
+        let (objoid, objsubid) = match target {
+            LogicalCommentTarget::Table { table } => {
+                let entry = snapshot
+                    .tables
+                    .get(table)
+                    .ok_or_else(|| ultrasql_catalog::CatalogError::not_found(table.clone()))?;
+                (entry.oid, 0)
+            }
+            LogicalCommentTarget::Index { index } => {
+                let entry = snapshot
+                    .indexes
+                    .get(index)
+                    .ok_or_else(|| ultrasql_catalog::CatalogError::not_found(index.clone()))?;
+                (entry.oid, 0)
+            }
+            LogicalCommentTarget::Column { table, attnum, .. } => {
+                let entry = snapshot
+                    .tables
+                    .get(table)
+                    .ok_or_else(|| ultrasql_catalog::CatalogError::not_found(table.clone()))?;
+                (entry.oid, *attnum)
+            }
+        };
+        self.state.persistent_catalog.set_description(
+            objoid,
+            ultrasql_core::Oid::new(ultrasql_catalog::bootstrap::PG_CLASS_OID),
+            objsubid,
+            comment.clone(),
+        );
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("COMMENT"))
     }
 }

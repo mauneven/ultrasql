@@ -227,6 +227,10 @@ where
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
+        | LogicalPlan::CreateSequence { .. }
+        | LogicalPlan::AlterSequence { .. }
+        | LogicalPlan::DropSequence { .. }
+        | LogicalPlan::Comment { .. }
         | LogicalPlan::Begin { .. }
         | LogicalPlan::Commit { .. }
         | LogicalPlan::Rollback { .. }

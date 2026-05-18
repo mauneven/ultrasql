@@ -44,6 +44,33 @@ impl<L: PageLoader> BTree<L> {
         xid: Xid,
         wal: Option<&dyn WalSink>,
     ) -> Result<(), BTreeError> {
+        self.insert_inner(key, value, xid, wal, false)
+    }
+
+    /// Insert `(key, value)` into a non-unique tree.
+    ///
+    /// Duplicate keys are stored as adjacent leaf entries ordered by
+    /// `(key, TupleId)`. Callers that enforce UNIQUE / PRIMARY KEY must use
+    /// [`Self::insert`] instead, or pre-check the key before calling this
+    /// method.
+    pub fn insert_non_unique<K: Key>(
+        &mut self,
+        key: K,
+        value: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), BTreeError> {
+        self.insert_inner(key, value, xid, wal, true)
+    }
+
+    fn insert_inner<K: Key>(
+        &mut self,
+        key: K,
+        value: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+        allow_duplicates: bool,
+    ) -> Result<(), BTreeError> {
         // v0.5 only supports 8-byte keys (i64-shaped). The trait is
         // generic so callers can plug a custom Key type later; we
         // decode keys as i64 internally.
@@ -61,7 +88,7 @@ impl<L: PageLoader> BTree<L> {
         let leaf_block = self.descend_to_leaf(root, raw_key, &mut path)?;
 
         // Try to insert into the leaf, splitting if necessary.
-        let split_result = self.insert_into_leaf(leaf_block, raw_key, value)?;
+        let split_result = self.insert_into_leaf(leaf_block, raw_key, value, allow_duplicates)?;
 
         // Emit WAL record for the leaf insert (always, even when a split occurred).
         if let Some(sink) = wal {
@@ -116,7 +143,7 @@ impl<L: PageLoader> BTree<L> {
     ///
     /// Called after a successful WAL append so the page's LSN is never
     /// ahead of the WAL.
-    fn stamp_page_lsn(
+    pub(super) fn stamp_page_lsn(
         pool: &std::sync::Arc<BufferPool<L>>,
         page_id: PageId,
         lsn: Lsn,
@@ -135,13 +162,14 @@ impl<L: PageLoader> BTree<L> {
         leaf: BlockNumber,
         key: i64,
         value: TupleId,
+        allow_duplicates: bool,
     ) -> Result<Option<(i64, BlockNumber)>, BTreeError> {
         // Right-link chase if a concurrent writer (or our own past-self
         // in a stale path) has split this leaf out from under us.
         let mut current = leaf;
         loop {
             let guard = self.pool.get_page(self.page_id(current))?;
-            let outcome = self.try_leaf_insert(&guard, key, value)?;
+            let outcome = self.try_leaf_insert(&guard, key, value, allow_duplicates)?;
             drop(guard);
             match outcome {
                 LeafInsertOutcome::ChaseRight(next) => current = next,
@@ -158,6 +186,7 @@ impl<L: PageLoader> BTree<L> {
         guard: &PageGuard<L>,
         key: i64,
         value: TupleId,
+        allow_duplicates: bool,
     ) -> Result<LeafInsertOutcome, BTreeError> {
         let mut w = guard.write();
         let meta = NodeMeta::read_from(&w)?;
@@ -167,13 +196,26 @@ impl<L: PageLoader> BTree<L> {
             return Ok(LeafInsertOutcome::ChaseRight(BlockNumber::new(next)));
         }
 
-        // Search for the insertion position; reject duplicates.
+        // Search for the insertion position. Unique indexes reject any
+        // existing key; non-unique indexes keep same-key entries ordered by
+        // TupleId so duplicate probes are deterministic.
         let entries = read_leaf_entries(&w, meta.n_keys)?;
-        let pos_result = entries.binary_search_by_key(&key, |e| e.key);
-        if pos_result.is_ok() {
-            return Err(BTreeError::DuplicateKey);
-        }
-        let pos = pos_result.unwrap_or_else(|i| i);
+        let pos = if allow_duplicates {
+            let pos = entries.partition_point(|entry| (entry.key, entry.value) < (key, value));
+            if entries
+                .get(pos)
+                .is_some_and(|entry| entry.key == key && entry.value == value)
+            {
+                return Err(BTreeError::DuplicateKey);
+            }
+            pos
+        } else {
+            let pos_result = entries.binary_search_by_key(&key, |e| e.key);
+            if pos_result.is_ok() {
+                return Err(BTreeError::DuplicateKey);
+            }
+            pos_result.unwrap_or_else(|i| i)
+        };
 
         if (meta.n_keys as usize) < MAX_LEAF_ENTRIES {
             let mut new_entries = entries;
@@ -329,14 +371,7 @@ impl<L: PageLoader> BTree<L> {
         // Find insertion position. The first entry's key is i64::MIN
         // (leftmost child placeholder); subsequent entries are real
         // separators in ascending order.
-        let pos_result = entries.binary_search_by_key(&sep_key, |e| e.key);
-        if pos_result.is_ok() {
-            // A separator equal to an existing one is impossible in a
-            // unique-key tree because we'd have caught the duplicate
-            // at the leaf. Treat it as corruption.
-            return Err(BTreeError::MalformedNode("duplicate internal separator"));
-        }
-        let pos = pos_result.unwrap_or_else(|i| i);
+        let pos = entries.partition_point(|entry| entry.key <= sep_key);
 
         if (meta.n_keys as usize) < MAX_INTERNAL_ENTRIES {
             let mut new_entries = entries;

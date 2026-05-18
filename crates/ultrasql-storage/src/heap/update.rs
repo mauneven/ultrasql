@@ -225,6 +225,36 @@ impl<L: PageLoader> HeapAccess<L> {
     where
         I: IntoIterator<Item = (TupleId, UpdatePayload)>,
     {
+        let (count, _) = self.update_many_inner(edits, opts, false)?;
+        Ok(count)
+    }
+
+    /// Bulk-UPDATE and return each `(old_tid, new_tid)` outcome.
+    ///
+    /// This is the same physical update path as [`Self::update_many`],
+    /// but callers that maintain secondary indexes need the new TID
+    /// for each old tuple after the heap write succeeds.
+    pub fn update_many_with_outcomes<I>(
+        &self,
+        edits: I,
+        opts: UpdateOptions<'_>,
+    ) -> Result<Vec<UpdateOutcome>, HeapError>
+    where
+        I: IntoIterator<Item = (TupleId, UpdatePayload)>,
+    {
+        let (_, outcomes) = self.update_many_inner(edits, opts, true)?;
+        Ok(outcomes)
+    }
+
+    fn update_many_inner<I>(
+        &self,
+        edits: I,
+        opts: UpdateOptions<'_>,
+        collect_update_outcomes: bool,
+    ) -> Result<(usize, Vec<UpdateOutcome>), HeapError>
+    where
+        I: IntoIterator<Item = (TupleId, UpdatePayload)>,
+    {
         // Materialise the edits up front. The previous implementation
         // built an `AHashMap<PageId, Vec<(slot, payload)>>` to group
         // entries by source page; the hash inserts plus per-page Vec
@@ -237,7 +267,7 @@ impl<L: PageLoader> HeapAccess<L> {
         // the HashMap entirely.
         let mut edits_vec: Vec<(TupleId, UpdatePayload)> = edits.into_iter().collect();
         if edits_vec.is_empty() {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
         // Caller contract: `edits` arrives in `(page, slot)` ascending
         // order. The two in-tree callers
@@ -260,6 +290,11 @@ impl<L: PageLoader> HeapAccess<L> {
         );
 
         let mut total = 0_usize;
+        let mut outcomes: Vec<UpdateOutcome> = if collect_update_outcomes {
+            Vec::with_capacity(edits_vec.len())
+        } else {
+            Vec::new()
+        };
         // HOT-failed entries fall back to the bulk-non-HOT path. We
         // build the fallback Vec by appending in the same page-major
         // order we walk; `fallback` is therefore implicitly sorted by
@@ -309,8 +344,9 @@ impl<L: PageLoader> HeapAccess<L> {
                 // beyond incrementing `total`; we skip building
                 // `hot_outcomes` entirely on that path (the bulk-DML
                 // executor exercises this branch).
-                let collect_outcomes = opts.wal.is_some() || opts.vm.is_some();
-                let mut hot_outcomes: Vec<(TupleId, TupleId)> = if collect_outcomes {
+                let collect_hot_outcomes =
+                    collect_update_outcomes || opts.wal.is_some() || opts.vm.is_some();
+                let mut hot_outcomes: Vec<(TupleId, TupleId)> = if collect_hot_outcomes {
                     Vec::with_capacity(group_len)
                 } else {
                     Vec::new()
@@ -335,7 +371,7 @@ impl<L: PageLoader> HeapAccess<L> {
                             &mut scratch,
                         )? {
                             Some(new_tid) => {
-                                if collect_outcomes {
+                                if collect_hot_outcomes {
                                     hot_outcomes.push((old_tid, new_tid));
                                 }
                                 hot_count += 1;
@@ -367,6 +403,9 @@ impl<L: PageLoader> HeapAccess<L> {
                     Self::emit_update_wal(&self.pool, outcome, &opts, || self.fetch(new_tid))?;
                     if let Some(vm) = opts.vm {
                         vm.clear(new_tid.page.relation, new_tid.page.block);
+                    }
+                    if collect_update_outcomes {
+                        outcomes.push(outcome);
                     }
                     had_hot_outcome = true;
                 }
@@ -468,11 +507,20 @@ impl<L: PageLoader> HeapAccess<L> {
                 }
                 k = m;
             }
+            if collect_update_outcomes {
+                outcomes.extend(fallback.iter().zip(new_tids.iter()).map(
+                    |((old_tid, _), new_tid)| UpdateOutcome {
+                        old_tid: *old_tid,
+                        new_tid: *new_tid,
+                        hot: false,
+                    },
+                ));
+            }
             total = total.saturating_add(fallback.len());
             self.column_cache.bump_version(rel);
         }
 
-        Ok(total)
+        Ok((total, outcomes))
     }
 
     /// Sequential scan over `rel`'s pages. The first version starts at

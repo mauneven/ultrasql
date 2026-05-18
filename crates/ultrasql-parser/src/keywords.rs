@@ -37,8 +37,10 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
     // appear, not by the lexer.
     let entries: &[(&'static str, TokenKind)] = &[
         ("abort", TokenKind::KwAbort),
+        ("action", TokenKind::KwAction),
         ("all", TokenKind::KwAll),
         ("alter", TokenKind::KwAlter),
+        ("always", TokenKind::KwAlways),
         ("analyze", TokenKind::KwAnalyze),
         ("and", TokenKind::KwAnd),
         ("any", TokenKind::KwAny),
@@ -60,6 +62,7 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("collate", TokenKind::KwCollate),
         ("column", TokenKind::KwColumn),
         ("commit", TokenKind::KwCommit),
+        ("comment", TokenKind::KwComment),
         ("conflict", TokenKind::KwConflict),
         ("constraint", TokenKind::KwConstraint),
         ("create", TokenKind::KwCreate),
@@ -89,6 +92,7 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("for", TokenKind::KwFor),
         ("foreign", TokenKind::KwForeign),
         ("from", TokenKind::KwFrom),
+        ("generated", TokenKind::KwGenerated),
         ("full", TokenKind::KwFull),
         ("group", TokenKind::KwGroup),
         ("grouping", TokenKind::KwGrouping),
@@ -191,6 +195,7 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("sequence", TokenKind::KwSequence),
         ("session", TokenKind::KwSession),
         ("start", TokenKind::KwStart),
+        ("stored", TokenKind::KwStored),
         ("to", TokenKind::KwTo),
         // SELECT completeness keywords added for v0.2
         ("deallocate", TokenKind::KwDeallocate),

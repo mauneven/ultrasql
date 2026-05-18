@@ -54,5 +54,7 @@ pub use encoding::{
 pub use entry::{IndexEntry, TableEntry};
 pub use error::CatalogError;
 pub use memory::{FIRST_USER_OID, InMemoryCatalog};
-pub use persistent::{CatalogSnapshot, CatalogStats, PersistentCatalog};
+pub use persistent::{
+    CatalogSnapshot, CatalogStats, PersistentCatalog, StatisticExtRow, StatisticRow,
+};
 pub use traits::{Catalog, MutableCatalog};

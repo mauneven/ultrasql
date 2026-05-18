@@ -5,7 +5,7 @@ use super::{
     schema_int_col, synthetic_ctx,
 };
 use crate::pipeline::*;
-use ultrasql_core::{DataType, Schema, Value};
+use ultrasql_core::{DataType, RelationId, Schema, TupleId, Value};
 use ultrasql_executor::Operator;
 use ultrasql_planner::{BinaryOp, LogicalJoinType, LogicalPlan, ScalarExpr};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions};
@@ -248,7 +248,6 @@ fn lower_plan_union_all_via_sample_path() {
 use std::sync::Arc as StdArc;
 
 use ultrasql_catalog::{MutableCatalog, PersistentCatalog};
-use ultrasql_core::TupleId;
 use ultrasql_executor::{ExecError, RowCodec};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::BufferPool;
@@ -358,10 +357,21 @@ pub(super) fn build_index_fixture(
 }
 
 impl IndexFixture {
+    pub(super) fn mark_all_visible(&self, table: &ultrasql_catalog::TableEntry, tids: &[TupleId]) {
+        let rel = RelationId(table.oid);
+        for tid in tids {
+            self.heap
+                .vacuum_set_all_visible(rel, tid.page.block, &self.vm);
+        }
+    }
+
     pub(super) fn ctx<'a>(&'a self, tables: &'a SampleTables) -> LowerCtx<'a> {
         LowerCtx {
             tables,
             catalog_snapshot: self.catalog.snapshot(),
+            table_constraints: StdArc::new(dashmap::DashMap::new()),
+            sequences: StdArc::new(dashmap::DashMap::new()),
+            sequence_state: None,
             heap: StdArc::clone(&self.heap),
             vm: StdArc::clone(&self.vm),
             snapshot: self.reader_snapshot.clone(),

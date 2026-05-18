@@ -891,6 +891,28 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 };
                 Column::Bool(col)
             }
+            DataType::Int16 => {
+                let mut data: Vec<i32> = Vec::with_capacity(n_rows);
+                for (row_idx, row) in rows.iter().enumerate() {
+                    match &row[col_idx] {
+                        Value::Int16(v) => data.push(i32::from(*v)),
+                        Value::Null => data.push(0),
+                        other => {
+                            return Err(ExecError::TypeMismatch(format!(
+                                "expected Int16 at row {row_idx} col {col_idx}, got {:?}",
+                                other.data_type()
+                            )));
+                        }
+                    }
+                }
+                let col = if let Some(nulls) = build_validity(col_idx) {
+                    NumericColumn::with_nulls(data, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                } else {
+                    NumericColumn::from_data(data)
+                };
+                Column::Int32(col)
+            }
             DataType::Int32 => {
                 let mut data: Vec<i32> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {

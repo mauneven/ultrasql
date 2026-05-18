@@ -194,6 +194,9 @@ fn lower_query_sorts_values_in_ascending_order() {
     let ctx = LowerCtx {
         tables: &SampleTables::new(),
         catalog_snapshot: catalog.snapshot(),
+        table_constraints: StdArc::new(dashmap::DashMap::new()),
+        sequences: StdArc::new(dashmap::DashMap::new()),
+        sequence_state: None,
         heap,
         vm,
         snapshot: mvcc_snapshot,
@@ -312,6 +315,9 @@ pub(super) fn synthetic_ctx(tables: &SampleTables) -> LowerCtx<'_> {
     LowerCtx {
         tables,
         catalog_snapshot: catalog.snapshot(),
+        table_constraints: StdArc::new(dashmap::DashMap::new()),
+        sequences: StdArc::new(dashmap::DashMap::new()),
+        sequence_state: None,
         heap,
         vm,
         snapshot: mvcc_snapshot,

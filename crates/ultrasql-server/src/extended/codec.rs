@@ -197,6 +197,39 @@ pub(super) fn encode_binary_value(
     }
 }
 
+/// Encode one result column in binary format using the logical schema type.
+///
+/// Some physical vectors are widened (`Int16` is stored as `Int32`), so
+/// extended-query binary output must narrow to the PostgreSQL type OID
+/// advertised in `RowDescription`.
+pub(super) fn encode_binary_value_typed(
+    col: &ultrasql_vec::column::Column,
+    row: usize,
+    logical_type: &DataType,
+) -> Option<Vec<u8>> {
+    use ultrasql_vec::column::Column;
+    let nulls = match col {
+        Column::Int32(c) => c.nulls(),
+        Column::Int64(c) => c.nulls(),
+        Column::Float32(c) => c.nulls(),
+        Column::Float64(c) => c.nulls(),
+        Column::Bool(c) => c.nulls(),
+        Column::Utf8(c) => c.nulls(),
+        Column::DictionaryUtf8(c) => c.codes.nulls(),
+    };
+    if let Some(b) = nulls
+        && !b.get(row)
+    {
+        return None;
+    }
+    match (logical_type, col) {
+        (DataType::Int16, Column::Int32(c)) => i16::try_from(c.data()[row])
+            .ok()
+            .map(|v| v.to_be_bytes().to_vec()),
+        _ => encode_binary_value(col, row),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RowDescription builder.
 // ---------------------------------------------------------------------------
@@ -211,6 +244,10 @@ pub(crate) fn row_description_for_plan(plan: &LogicalPlan) -> BackendMessage {
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }
+            | LogicalPlan::CreateSequence { .. }
+            | LogicalPlan::AlterSequence { .. }
+            | LogicalPlan::DropSequence { .. }
+            | LogicalPlan::Comment { .. }
             | LogicalPlan::Truncate { .. }
             | LogicalPlan::Begin { .. }
             | LogicalPlan::Commit { .. }

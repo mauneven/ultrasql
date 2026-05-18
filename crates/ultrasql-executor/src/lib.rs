@@ -49,6 +49,8 @@
 //! - [`LockRows`] — per-row lock callback pass-through.
 //! - [`WorkMemBudget`] — per-query work-memory budget.
 //! - [`IndexScan`] — B-tree index scan (point + range) over pre-probed payloads.
+//! - [`IndexOnlyScan`] — B-tree-covered projection that can skip heap fetches
+//!   when the visibility map proves every candidate page all-visible.
 //! - [`FunctionScan`] — set-returning function scan (`generate_series`).
 //! - [`CteScan`] — replay a materialised CTE buffer.
 
@@ -104,6 +106,7 @@ use std::fmt::Debug;
 use ultrasql_core::Schema;
 use ultrasql_vec::Batch;
 
+pub use bitmap_heap_scan::IndexOnlyScan;
 pub use cte_scan::CteScan;
 pub use direct_scalar_agg::{DirectScalarAggKind, DirectScalarAggScan};
 pub use eval::{Eval, EvalError};
@@ -119,7 +122,10 @@ pub use lock_rows::LockRows;
 pub use materialize::Materialize;
 pub use mem_table_scan::MemTableScan;
 pub use merge_join::MergeJoin;
-pub use modify::{ModifyKind, ModifyTable};
+pub use modify::{
+    InsertIndexEncoder, InsertIndexMaintainer, ModifyKind, ModifyTable, RowConstraintCheck,
+    RowUpdateConstraintCheck, SequenceDefault, SequenceNextvalObserver,
+};
 pub use nested_loop_join::{NestedLoopJoin, RightFactory};
 pub use parallel_seq_scan::{ParallelSeqScan, choose_parallel_seq_scan_workers};
 pub use project::Project;
@@ -203,6 +209,35 @@ pub enum ExecError {
     /// `23502` (`not_null_violation`).
     #[error("null value in column \"{0}\" violates not-null constraint")]
     NotNullViolation(String),
+
+    /// A CHECK constraint evaluated to FALSE.
+    ///
+    /// The string carries the constraint name. The server maps this to
+    /// PostgreSQL SQLSTATE `23514` (`check_violation`).
+    #[error("new row violates check constraint \"{0}\"")]
+    CheckViolation(String),
+
+    /// An index insert found a duplicate key.
+    ///
+    /// The string carries the index name. The server maps this to
+    /// PostgreSQL SQLSTATE `23505` (`unique_violation`). Until the
+    /// B-tree grows duplicate TID chains, non-unique indexes share this
+    /// duplicate-key surface.
+    #[error("duplicate key value violates index \"{0}\"")]
+    UniqueViolation(String),
+
+    /// A FOREIGN KEY relationship would be violated.
+    ///
+    /// The string carries the constraint name. The server maps this to
+    /// PostgreSQL SQLSTATE `23503` (`foreign_key_violation`).
+    #[error("foreign key constraint \"{0}\" would be violated")]
+    ForeignKeyViolation(String),
+
+    /// An INSERT supplied an explicit value for a `GENERATED ALWAYS AS
+    /// IDENTITY` column. The server maps this to PostgreSQL SQLSTATE
+    /// `428C9` (`generated_always`).
+    #[error("cannot insert explicit value for identity column \"{0}\"")]
+    GeneratedAlwaysViolation(String),
 }
 
 /// A per-query cancel signal threaded through long-running operators.

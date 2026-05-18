@@ -308,11 +308,13 @@ pub(super) fn find_child_internal(
     if entries.is_empty() {
         return Err(BTreeError::MalformedNode("empty internal node"));
     }
-    // Find the rightmost entry whose key is <= our search key.
+    // Find the rightmost entry whose key is <= our search key. Duplicate
+    // separators are legal for non-unique indexes whose same-key posting
+    // chain crosses leaf splits, so use `partition_point` instead of
+    // `binary_search_by_key`'s arbitrary duplicate hit.
     // Entry 0 always has key = i64::MIN by construction.
-    let idx = match entries.binary_search_by_key(&key, |e| e.key) {
-        Ok(i) => i,
-        Err(i) => i.saturating_sub(1),
-    };
+    let idx = entries
+        .partition_point(|entry| entry.key <= key)
+        .saturating_sub(1);
     Ok(BlockNumber::new(entries[idx].child))
 }

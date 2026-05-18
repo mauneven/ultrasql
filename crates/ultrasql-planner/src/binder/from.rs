@@ -55,13 +55,14 @@ fn bind_table_ref(
 ) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
     match table_ref {
         TableRef::Named { name, alias, .. } => {
-            let table_name = name
+            let raw_table_name = name
                 .parts
                 .last()
                 .map_or_else(String::new, |p| p.value.to_ascii_lowercase());
+            let table_name = qualified_system_name(name).unwrap_or_else(|| raw_table_name.clone());
             let qualifier = alias
                 .as_ref()
-                .map_or_else(|| table_name.clone(), |a| a.value.clone());
+                .map_or_else(|| raw_table_name.clone(), |a| a.value.clone());
 
             let schema = if let Some((_, s)) = cte_catalog
                 .iter()
@@ -131,6 +132,18 @@ fn bind_table_ref(
             name, args, alias, ..
         } => bind_table_function(name, args, alias.as_ref(), catalog, cte_catalog, scope),
     }
+}
+
+fn qualified_system_name(name: &ultrasql_parser::ast::ObjectName) -> Option<String> {
+    if name.parts.len() != 2 {
+        return None;
+    }
+    let namespace = name.parts[0].value.to_ascii_lowercase();
+    if !matches!(namespace.as_str(), "pg_catalog" | "information_schema") {
+        return None;
+    }
+    let relation = name.parts[1].value.to_ascii_lowercase();
+    Some(format!("{namespace}.{relation}"))
 }
 
 fn bind_table_function(

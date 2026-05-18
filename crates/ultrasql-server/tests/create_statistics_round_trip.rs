@@ -1,14 +1,7 @@
-//! `CREATE STATISTICS` Simple-Query handler test (§3.3, stub
-//! variant).
+//! `CREATE STATISTICS` Simple-Query handler test (§3.3).
 //!
 //! Accepts the canonical PostgreSQL `CREATE STATISTICS name ON c1, c2
-//! FROM table` form and returns the matching command tag without
-//! raising an error, so ORMs and migration tools can issue the
-//! statement without a special case. The optimizer-side
-//! `pg_statistic_ext` row population — dependency coefficients,
-//! multi-column MCV — is a follow-up that lands once the
-//! `AnalyzeRunner` writes through to `pg_statistic_ext` rows. The
-//! wire stub keeps PostgreSQL compatibility until then.
+//! FROM table` form and exposes a `pg_statistic_ext` compatibility row.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -62,6 +55,19 @@ async fn create_statistics_returns_command_tag() {
         .batch_execute("CREATE STATISTICS s_ab ON a, b FROM t")
         .await
         .expect("CREATE STATISTICS");
+    let rows = client
+        .query(
+            "SELECT stxname, stxkeys, stxkind \
+             FROM pg_catalog.pg_statistic_ext \
+             WHERE stxname = 's_ab'",
+            &[],
+        )
+        .await
+        .expect("pg_statistic_ext query");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, String>(0), "s_ab");
+    assert_eq!(rows[0].get::<_, String>(1), "1 2");
+    assert_eq!(rows[0].get::<_, String>(2), "dfm");
     shutdown(client, server_handle).await;
 }
 
