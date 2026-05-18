@@ -467,6 +467,8 @@ impl PersistentCatalog {
         self.indexes_by_name.clear();
         self.indexes_by_table.clear();
         self.pg_description.clear();
+        self.pg_constraint.clear();
+        self.pg_sequence.clear();
         self.pg_statistic.clear();
         self.pg_statistic_ext.clear();
 
@@ -524,13 +526,15 @@ impl PersistentCatalog {
         heap: &HeapAccess<L>,
     ) -> Result<CatalogStats, CatalogError> {
         use crate::encoding::{
-            decode_attribute_row, decode_index_row, decode_statistic_ext_row, decode_statistic_row,
-            schema_from_attributes,
+            decode_attribute_row, decode_constraint_row, decode_index_row, decode_sequence_row,
+            decode_statistic_ext_row, decode_statistic_row, schema_from_attributes,
         };
 
         let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
         let pg_attribute_rel = RelationId::new(bootstrap::PG_ATTRIBUTE_OID);
         let pg_index_rel = RelationId::new(bootstrap::PG_INDEX_OID);
+        let pg_constraint_rel = RelationId::new(bootstrap::PG_CONSTRAINT_OID);
+        let pg_sequence_rel = RelationId::new(bootstrap::PG_SEQUENCE_OID);
         let pg_statistic_rel = RelationId::new(bootstrap::PG_STATISTIC_OID);
         let pg_statistic_ext_rel = RelationId::new(bootstrap::PG_STATISTIC_EXT_OID);
         let class_blocks = heap.block_count(pg_class_rel);
@@ -607,6 +611,40 @@ impl PersistentCatalog {
             }
         }
 
+        let constraint_blocks = heap.block_count(pg_constraint_rel);
+        let mut constraint_rows: std::collections::HashMap<Oid, ConstraintRow> =
+            std::collections::HashMap::new();
+        let mut total_constraint_rows: u32 = 0;
+        if constraint_blocks > 0 {
+            let constraint_scan = heap.scan(pg_constraint_rel, constraint_blocks);
+            for result in constraint_scan {
+                let tuple = result.map_err(|e| {
+                    CatalogError::schema_conflict(format!("heap scan error on pg_constraint: {e}"))
+                })?;
+                let row = decode_constraint_row(&tuple.data).map_err(|e| {
+                    CatalogError::schema_conflict(format!("decode pg_constraint row: {e}"))
+                })?;
+                constraint_rows.insert(row.oid, row);
+                total_constraint_rows = total_constraint_rows.saturating_add(1);
+            }
+        }
+
+        let sequence_blocks = heap.block_count(pg_sequence_rel);
+        let mut sequence_rows: std::collections::HashMap<Oid, SequenceRow> =
+            std::collections::HashMap::new();
+        if sequence_blocks > 0 {
+            let sequence_scan = heap.scan(pg_sequence_rel, sequence_blocks);
+            for result in sequence_scan {
+                let tuple = result.map_err(|e| {
+                    CatalogError::schema_conflict(format!("heap scan error on pg_sequence: {e}"))
+                })?;
+                let row = decode_sequence_row(&tuple.data).map_err(|e| {
+                    CatalogError::schema_conflict(format!("decode pg_sequence row: {e}"))
+                })?;
+                sequence_rows.insert(row.seqrelid, row);
+            }
+        }
+
         // Decode pg_class rows. Each user table maps to one TableEntry
         // whose schema is rebuilt from the matching attribute rows.
         let class_scan = heap.scan(pg_class_rel, class_blocks);
@@ -657,6 +695,12 @@ impl PersistentCatalog {
                 }
                 _ => {}
             }
+        }
+        for oid in constraint_rows.keys() {
+            highest_oid = highest_oid.max(oid.raw().saturating_add(1));
+        }
+        for oid in sequence_rows.keys() {
+            highest_oid = highest_oid.max(oid.raw().saturating_add(1));
         }
 
         let mut loaded_indexes: u32 = 0;
@@ -767,11 +811,19 @@ impl PersistentCatalog {
             relations: CatalogStats::initial().relations + user_relations,
             attributes: total_attrs,
             indexes: loaded_indexes.max(total_index_rows),
-            constraints: 0,
+            constraints: total_constraint_rows,
             statistics: total_statistics,
             statistic_ext: total_statistic_ext,
         };
         self.install_snapshot(snap);
+        self.pg_constraint.clear();
+        for (oid, row) in constraint_rows {
+            self.pg_constraint.insert(oid, row);
+        }
+        self.pg_sequence.clear();
+        for (oid, row) in sequence_rows {
+            self.pg_sequence.insert(oid, row);
+        }
         tracing::debug!(?stats, "catalog bootstrapped from heap");
         Ok(stats)
     }
@@ -855,6 +907,89 @@ impl PersistentCatalog {
             },
         )
         .map_err(|e| CatalogError::schema_conflict(format!("pg_index insert: {e}")))?;
+        Ok(())
+    }
+
+    /// Append one `pg_constraint` row to the persistent catalog heap.
+    pub fn persist_constraint_row<L: PageLoader>(
+        &self,
+        row: &ConstraintRow,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::encode_constraint_row;
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_constraint_rel = RelationId::new(bootstrap::PG_CONSTRAINT_OID);
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+        let bytes = encode_constraint_row(row);
+        heap.insert(
+            pg_constraint_rel,
+            &bytes,
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_constraint insert: {e}")))?;
+        Ok(())
+    }
+
+    /// Append `pg_class` / `pg_sequence` rows for one sequence.
+    pub fn persist_sequence_rows<L: PageLoader>(
+        &self,
+        sequence_name: &str,
+        row: &SequenceRow,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::encode_sequence_row;
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
+        let pg_sequence_rel = RelationId::new(bootstrap::PG_SEQUENCE_OID);
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+        let class_row = ClassRow {
+            oid: row.seqrelid,
+            relname: sequence_name.to_owned(),
+            relnamespace: Oid::new(bootstrap::PUBLIC_OID),
+            relkind: RelKind::Sequence,
+            relpages: 0,
+            reltuples: 0.0,
+            relfilenode: 0,
+            relhasindex: false,
+        };
+        heap.insert(
+            pg_class_rel,
+            &class_row.encode(),
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_class sequence insert: {e}")))?;
+
+        let bytes = encode_sequence_row(row);
+        heap.insert(
+            pg_sequence_rel,
+            &bytes,
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_sequence insert: {e}")))?;
         Ok(())
     }
 

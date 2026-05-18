@@ -2048,6 +2048,42 @@ fn binds_create_hash_index_method() {
 }
 
 #[test]
+fn binds_create_inverted_search_and_brin_index_methods() {
+    for (sql, expected) in [
+        (
+            "CREATE INDEX users_name_gin_idx ON users USING gin (name)",
+            LogicalIndexMethod::Gin,
+        ),
+        (
+            "CREATE INDEX users_score_gist_idx ON users USING gist (score)",
+            LogicalIndexMethod::Gist,
+        ),
+        (
+            "CREATE INDEX users_id_brin_idx ON users USING brin (id)",
+            LogicalIndexMethod::Brin,
+        ),
+    ] {
+        let LogicalPlan::CreateIndex { method, .. } = parse_bind_ok(sql) else {
+            panic!("expected CreateIndex plan");
+        };
+        assert_eq!(method, expected);
+    }
+}
+
+#[test]
+fn rejects_unique_inverted_search_and_brin_index_methods() {
+    let cat = users_catalog();
+    for sql in [
+        "CREATE UNIQUE INDEX users_name_gin_idx ON users USING gin (name)",
+        "CREATE UNIQUE INDEX users_score_gist_idx ON users USING gist (score)",
+        "CREATE UNIQUE INDEX users_id_brin_idx ON users USING brin (id)",
+    ] {
+        let err = parse_and_bind(sql, &cat).unwrap_err();
+        assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+    }
+}
+
+#[test]
 fn binds_create_expression_index_key() {
     let plan = parse_bind_ok("CREATE INDEX users_lower_name_idx ON users (lower(name))");
     let LogicalPlan::CreateIndex {

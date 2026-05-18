@@ -88,6 +88,12 @@ pub enum LogicalIndexMethod {
     /// Equality-only hash method. UltraSQL stores hash buckets in the
     /// existing page-backed index substrate in this wave.
     Hash,
+    /// Generalized inverted index method.
+    Gin,
+    /// Generalized search tree method.
+    Gist,
+    /// Block range index method.
+    Brin,
 }
 
 // ============================================================================
@@ -1709,6 +1715,9 @@ impl LogicalPlan {
                 let method = match method {
                     LogicalIndexMethod::Btree => "btree",
                     LogicalIndexMethod::Hash => "hash",
+                    LogicalIndexMethod::Gin => "gin",
+                    LogicalIndexMethod::Gist => "gist",
+                    LogicalIndexMethod::Brin => "brin",
                 };
                 let _ = fmt::write(
                     out,

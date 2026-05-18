@@ -117,6 +117,8 @@ pub enum RecordType {
     HeapDeleteInPlace = 10,
     /// A sequence's durable state changed.
     SequenceOp = 11,
+    /// A hash-index bucket or overflow page was modified.
+    HashOp = 12,
     /// A no-op marker (used to round records up to alignment
     /// boundaries; ignored on replay).
     Nop = 255,
@@ -137,6 +139,7 @@ impl RecordType {
             9 => Self::HeapUpdateInPlace,
             10 => Self::HeapDeleteInPlace,
             11 => Self::SequenceOp,
+            12 => Self::HashOp,
             255 => Self::Nop,
             other => return Err(WalRecordError::UnknownType(other)),
         })
@@ -378,6 +381,7 @@ mod tests {
             RecordType::SequenceOp,
             RecordType::HeapUpdateInPlace,
             RecordType::HeapDeleteInPlace,
+            RecordType::HashOp,
             RecordType::Nop,
         ] {
             let raw = rt as u8;

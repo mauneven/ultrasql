@@ -24,7 +24,10 @@
 
 use ultrasql_core::{DataType, Error as CoreError, Field, Oid, Schema};
 
-use crate::persistent::{AttributeRow, ClassRow, IndexRow, RelKind, StatisticExtRow, StatisticRow};
+use crate::persistent::{
+    AttributeRow, ClassRow, ConType, ConstraintRow, IndexRow, RelKind, SequenceRow,
+    StatisticExtRow, StatisticRow,
+};
 
 /// Errors raised while writing a row to bytes.
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +87,9 @@ impl Writer<'_> {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn u32(&mut self, v: u32) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn i64(&mut self, v: i64) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn f32(&mut self, v: f32) {
@@ -148,6 +154,9 @@ impl<'a> Reader<'a> {
     }
     fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn i64(&mut self) -> Result<i64, DecodeError> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn i32(&mut self) -> Result<i32, DecodeError> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
@@ -533,6 +542,127 @@ pub fn decode_index_row(bytes: &[u8]) -> Result<IndexRow, DecodeError> {
 }
 
 // ---------------------------------------------------------------------------
+// ConstraintRow
+// ---------------------------------------------------------------------------
+
+fn encode_con_type(contype: ConType) -> u8 {
+    match contype {
+        ConType::Check => b'c',
+        ConType::ForeignKey => b'f',
+        ConType::PrimaryKey => b'p',
+        ConType::Unique => b'u',
+        ConType::Trigger => b't',
+        ConType::Exclusion => b'x',
+    }
+}
+
+fn decode_con_type(tag: u8, offset: usize) -> Result<ConType, DecodeError> {
+    match tag {
+        b'c' => Ok(ConType::Check),
+        b'f' => Ok(ConType::ForeignKey),
+        b'p' => Ok(ConType::PrimaryKey),
+        b'u' => Ok(ConType::Unique),
+        b't' => Ok(ConType::Trigger),
+        b'x' => Ok(ConType::Exclusion),
+        _ => Err(DecodeError::InvalidTag { tag, offset }),
+    }
+}
+
+fn write_i16_vec(w: &mut Writer<'_>, values: &[i16]) {
+    w.u32(u32::try_from(values.len()).expect("i16 vec length fits in u32"));
+    for value in values {
+        w.i16(*value);
+    }
+}
+
+fn read_i16_vec(r: &mut Reader<'_>) -> Result<Vec<i16>, DecodeError> {
+    let len = usize::try_from(r.u32()?).expect("u32 length fits usize on supported targets");
+    let mut values = Vec::with_capacity(len);
+    for _ in 0..len {
+        values.push(r.i16()?);
+    }
+    Ok(values)
+}
+
+/// Encode a `pg_constraint` row into the catalog's internal binary format.
+#[must_use]
+pub fn encode_constraint_row(row: &ConstraintRow) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut w = Writer(&mut out);
+    w.u32(row.oid.raw());
+    w.str(&row.conname);
+    w.u32(row.conrelid.raw());
+    w.u8(encode_con_type(row.contype));
+    w.bool(row.condeferrable);
+    w.bool(row.condeferred);
+    write_i16_vec(&mut w, &row.conkey);
+    w.u32(row.confrelid.raw());
+    write_i16_vec(&mut w, &row.confkey);
+    out
+}
+
+/// Decode a row produced by [`encode_constraint_row`].
+pub fn decode_constraint_row(bytes: &[u8]) -> Result<ConstraintRow, DecodeError> {
+    let mut r = Reader::new(bytes);
+    let oid = Oid::new(r.u32()?);
+    let conname = r.str()?;
+    let conrelid = Oid::new(r.u32()?);
+    let contype_offset = r.pos;
+    let contype = decode_con_type(r.u8()?, contype_offset)?;
+    let condeferrable = r.bool()?;
+    let condeferred = r.bool()?;
+    let conkey = read_i16_vec(&mut r)?;
+    let confrelid = Oid::new(r.u32()?);
+    let confkey = read_i16_vec(&mut r)?;
+    Ok(ConstraintRow {
+        oid,
+        conname,
+        conrelid,
+        contype,
+        condeferrable,
+        condeferred,
+        conkey,
+        confrelid,
+        confkey,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// SequenceRow
+// ---------------------------------------------------------------------------
+
+/// Encode a `pg_sequence` row into the catalog's internal binary format.
+#[must_use]
+pub fn encode_sequence_row(row: &SequenceRow) -> Vec<u8> {
+    let mut out = Vec::with_capacity(49);
+    let mut w = Writer(&mut out);
+    w.u32(row.seqrelid.raw());
+    w.u32(row.seqtypid);
+    w.i64(row.seqstart);
+    w.i64(row.seqincrement);
+    w.i64(row.seqmax);
+    w.i64(row.seqmin);
+    w.i64(row.seqcache);
+    w.bool(row.seqcycle);
+    out
+}
+
+/// Decode a row produced by [`encode_sequence_row`].
+pub fn decode_sequence_row(bytes: &[u8]) -> Result<SequenceRow, DecodeError> {
+    let mut r = Reader::new(bytes);
+    Ok(SequenceRow {
+        seqrelid: Oid::new(r.u32()?),
+        seqtypid: r.u32()?,
+        seqstart: r.i64()?,
+        seqincrement: r.i64()?,
+        seqmax: r.i64()?,
+        seqmin: r.i64()?,
+        seqcache: r.i64()?,
+        seqcycle: r.bool()?,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // StatisticRow
 // ---------------------------------------------------------------------------
 
@@ -861,6 +991,41 @@ mod tests {
         };
         let bytes = encode_index_row(&row);
         let decoded = decode_index_row(&bytes).expect("decode");
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn constraint_row_round_trip() {
+        let row = ConstraintRow {
+            oid: Oid::new(42_200),
+            conname: "orders_customer_fk".to_owned(),
+            conrelid: Oid::new(42_000),
+            contype: ConType::ForeignKey,
+            condeferrable: true,
+            condeferred: false,
+            conkey: vec![2],
+            confrelid: Oid::new(42_001),
+            confkey: vec![0],
+        };
+        let bytes = encode_constraint_row(&row);
+        let decoded = decode_constraint_row(&bytes).expect("decode");
+        assert_eq!(decoded, row);
+    }
+
+    #[test]
+    fn sequence_row_round_trip() {
+        let row = SequenceRow {
+            seqrelid: Oid::new(42_300),
+            seqtypid: 20,
+            seqstart: 1,
+            seqincrement: 5,
+            seqmax: i64::MAX,
+            seqmin: 1,
+            seqcache: 32,
+            seqcycle: true,
+        };
+        let bytes = encode_sequence_row(&row);
+        let decoded = decode_sequence_row(&bytes).expect("decode");
         assert_eq!(decoded, row);
     }
 

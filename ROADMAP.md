@@ -1303,15 +1303,14 @@ geometric, and full-text type surfaces.
 - [x] DELETE-side B-tree maintenance — `BTree::delete(key, tid)` removes leaf entries without page merge/rebalance; `ModifyTable::Delete` decodes indexed rows, deletes old keys after heap delete, and disables fused delete for indexed tables. Wire regression covers indexed DELETE plus unique-key reuse.
 
 ### Hash Index
-- [ ] Static hashing with overflow pages — validated open on 2026-05-18.
-  `USING hash` is reachable through a page-backed hash-key store today,
-  but `crates/ultrasql-storage/src/access_method.rs::HashIndex` still
-  carries `TODO(hash-complete)` for a dedicated bucket / overflow-page
-  format.
+- [x] Static hashing with overflow pages —
+  `crates/ultrasql-storage/src/access_method.rs::HashIndex` now owns a
+  dedicated static primary-bucket format plus linked overflow pages, with
+  regression coverage for forced overflow allocation and lookup.
 - [ ] WAL logging for hash index — validated open on 2026-05-18.
-  Current SQL hash-index writes reuse the B-tree WAL path for the
-  backing store; hash-specific WAL records must land with the dedicated
-  hash page format.
+  `RecordType::HashOp` / `HashOpPayload` now provide hash-specific WAL
+  record shape and dispatch hooks, but current SQL hash-index writes
+  still reuse the B-tree WAL path for the backing store.
 - [x] Equality-only queries — `CREATE INDEX ... USING hash (col)`
   binds and builds a hash-keyed page-backed index, INSERT-side
   maintenance keeps it current, and equality predicates probe it with
@@ -1319,6 +1318,9 @@ geometric, and full-text type surfaces.
   `create_hash_index_supports_equality_queries_and_dml_maintenance`.
 
 ### GIN (Generalized Inverted Index)
+- [x] SQL-visible access method name — `CREATE INDEX ... USING gin`
+  binds into `LogicalIndexMethod::Gin`, and runtime index metadata
+  preserves the requested method for DML maintenance.
 - [ ] For `JSONB` (`@>`, `<@`, `?`, `?|`, `?&`) — validated open on
   2026-05-18. Parser tokens exist, but executor evaluation still returns
   `Unsupported("JSON operators")`, and SQL JSONB storage/operator support
@@ -1328,11 +1330,15 @@ geometric, and full-text type surfaces.
   under v1.0.
 - [ ] For `TSVECTOR` (`@@`) — validated open on 2026-05-18. TSVECTOR /
   TSQUERY types and operators are tracked under v1.x full-text search.
-- [ ] Fast update mode (pending list drain) — validated open on
-  2026-05-18. `GinIndex` is an in-process posting-list scaffold with
-  `TODO(gin-complete)` for WAL/page-backed posting trees.
+- [x] Fast update mode (pending list drain) — `GinIndex` now buffers
+  inserts in a pending list by default and drains them into posting lists
+  through `drain_pending_list`; lookup/delete drain pending entries
+  before consulting postings.
 
 ### GiST (Generalized Search Tree)
+- [x] SQL-visible access method name — `CREATE INDEX ... USING gist`
+  binds into `LogicalIndexMethod::Gist`, and runtime index metadata
+  preserves the requested method for DML maintenance.
 - [ ] For range types (`&&`, `@>`, `<@`) — validated open on
   2026-05-18. Range SQL types are tracked under v1.0.
 - [ ] For geometric types — validated open on 2026-05-18. Geometric SQL
@@ -1342,10 +1348,14 @@ geometric, and full-text type surfaces.
   `Constraint::Exclude` remains a storage-kernel placeholder.
 
 ### BRIN (Block Range Index)
+- [x] SQL-visible access method name — `CREATE INDEX ... USING brin`
+  binds into `LogicalIndexMethod::Brin`, and runtime index metadata
+  preserves the requested method for DML maintenance.
 - [ ] For large tables with physical correlation (timestamps, sequential
-  IDs) — validated open on 2026-05-18. `BrinIndex` is a summary scaffold,
-  not a SQL-visible access method.
-- [ ] `minmax` operator class — validated open on 2026-05-18.
+  IDs) — validated open on 2026-05-18. `BrinIndex` is a min/max summary
+  kernel, but SQL scans still do not use BRIN block-range pruning.
+- [x] `minmax` operator class — `BrinIndex` maintains per-range min/max
+  summaries on insert and through explicit `summarize_range`.
 - [ ] Auto-summarize on vacuum — validated open on 2026-05-18; VACUUM
   currently reclaims B-tree entries but does not summarize BRIN ranges.
 
@@ -1399,13 +1409,19 @@ geometric, and full-text type surfaces.
 - [x] `pg_index`, `pg_constraint`, `pg_sequence` (row shapes + virtual SQL scans for current same-process metadata)
 - [x] Catalog cache with `arc-swap` for wait-free reads
 - [x] Catalog snapshot for safe concurrent DDL
-- [x] Typed tuple decoder for bootstrap-from-heap — `crates/ultrasql-catalog/src/encoding.rs` + `PersistentCatalog::bootstrap_from_heap` decode `pg_class`, `pg_attribute`, `pg_index`, `pg_statistic`, and `pg_statistic_ext` rows and rebuild user `TableEntry`, `IndexEntry`, and planner-statistics snapshots on warm restart
+- [x] Typed tuple decoder for bootstrap-from-heap —
+  `crates/ultrasql-catalog/src/encoding.rs` +
+  `PersistentCatalog::bootstrap_from_heap` decode `pg_class`,
+  `pg_attribute`, `pg_index`, `pg_constraint`, `pg_sequence`,
+  `pg_statistic`, and `pg_statistic_ext` rows and rebuild user
+  `TableEntry`, `IndexEntry`, catalog constraint/sequence maps, and
+  planner-statistics snapshots on warm restart
 - [ ] Persistent constraint/default/sequence metadata — validated open on
-  2026-05-18. Sequence registry is WAL-recovered, and
-  `pg_constraint` / `pg_sequence` row shapes plus virtual scans exist,
-  but `pg_attrdef`, `pg_constraint`, and `pg_sequence` heap rows are not
-  yet the authoritative bootstrap source for runtime
-  `TableRuntimeConstraints`.
+  2026-05-18. `pg_constraint` / `pg_sequence` heap codecs, bootstrap
+  loading, and CREATE TABLE / CREATE SEQUENCE writeback now exist, but
+  `pg_attrdef` rows and expression-codec bootstrap are still needed
+  before `TableRuntimeConstraints` can be rebuilt authoritatively from
+  catalog heaps instead of same-process side maps.
 - [x] `pg_depend` compatibility slice — virtual dependency rows are
   derived from live UNIQUE / CHECK / FOREIGN KEY metadata, and `DROP
   TABLE` now honours those FK dependencies: default / `RESTRICT` raises

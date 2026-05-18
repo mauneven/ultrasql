@@ -951,6 +951,9 @@ fn default_sequence_start(options: LogicalSequenceOptions) -> i64 {
 ///
 /// - bare column-reference keys (`(col1, col2, ...)`) and single
 ///   expression keys (`(lower(col))`) for B-tree storage.
+/// - `USING hash`, `USING gin`, `USING gist`, and `USING brin` are preserved
+///   in the logical plan so catalog/runtime metadata can route maintenance to
+///   the requested access method.
 /// - `INCLUDE` covering columns and `WHERE` partial-index predicates
 ///   are bound into runtime metadata; they do not change the key
 ///   encoding.
@@ -975,9 +978,12 @@ pub(super) fn bind_create_index(
         None => LogicalIndexMethod::Btree,
         Some(method) if method == "btree" => LogicalIndexMethod::Btree,
         Some(method) if method == "hash" => LogicalIndexMethod::Hash,
+        Some(method) if method == "gin" => LogicalIndexMethod::Gin,
+        Some(method) if method == "gist" => LogicalIndexMethod::Gist,
+        Some(method) if method == "brin" => LogicalIndexMethod::Brin,
         Some(_) => {
             return Err(PlanError::NotSupported(
-                "CREATE INDEX: only btree and hash methods are supported",
+                "CREATE INDEX: only btree, hash, gin, gist, and brin methods are supported",
             ));
         }
     };
@@ -993,6 +999,15 @@ pub(super) fn bind_create_index(
     if method == LogicalIndexMethod::Hash && s.unique {
         return Err(PlanError::NotSupported(
             "CREATE UNIQUE INDEX USING hash: hash indexes do not enforce uniqueness",
+        ));
+    }
+    if matches!(
+        method,
+        LogicalIndexMethod::Gin | LogicalIndexMethod::Gist | LogicalIndexMethod::Brin
+    ) && s.unique
+    {
+        return Err(PlanError::NotSupported(
+            "CREATE UNIQUE INDEX: gin, gist, and brin indexes do not enforce uniqueness",
         ));
     }
     let mut col_indices: Vec<usize> = Vec::with_capacity(s.columns.len());

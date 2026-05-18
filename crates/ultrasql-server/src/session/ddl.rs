@@ -42,6 +42,8 @@ use crate::{
     run_plan_in_txn,
 };
 
+const PG_OID_INT8: u32 = 20;
+
 impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
@@ -116,15 +118,32 @@ where
             }
         }
         self.state.persistent_catalog.create_table(entry.clone())?;
+        let mut serial_sequence_rows = Vec::with_capacity(serial_sequences.len());
         for (seq_name, options) in &serial_sequences {
             let seq = ultrasql_storage::sequence::Sequence::new(
                 super::sequence::to_storage_options(*options),
             )
             .map_err(|e| ServerError::ddl(format!("CREATE TABLE serial sequence: {e}")))?;
+            let seq_oid = self.state.persistent_catalog.next_oid();
+            let seq_rel = RelationId::new(seq_oid.raw());
+            let seq_opts = seq.options_snapshot();
+            serial_sequence_rows.push((
+                seq_name.clone(),
+                ultrasql_catalog::persistent::SequenceRow {
+                    seqrelid: seq_oid,
+                    seqtypid: PG_OID_INT8,
+                    seqstart: seq_opts.start,
+                    seqincrement: seq_opts.increment,
+                    seqmax: seq_opts.max.unwrap_or(i64::MAX),
+                    seqmin: seq_opts.min.unwrap_or(1),
+                    seqcache: i64::from(seq_opts.cache),
+                    seqcycle: seq_opts.cycle,
+                },
+            ));
             seq.emit_wal(
                 SequenceOpKind::Create,
                 seq_name,
-                RelationId::INVALID,
+                seq_rel,
                 ultrasql_core::Xid::INVALID,
                 self.state.heap.wal_sink().map(|sink| sink.as_ref()),
             )
@@ -152,6 +171,52 @@ where
                 })
             })
             .collect::<Result<Vec<_>, ServerError>>()?;
+        let mut persistent_constraint_rows = Vec::with_capacity(
+            unique_constraints.len() + checks.len() + runtime_foreign_keys.len(),
+        );
+        for unique in unique_constraints {
+            persistent_constraint_rows.push(ultrasql_catalog::persistent::ConstraintRow {
+                oid: self.state.persistent_catalog.next_oid(),
+                conname: unique.name.clone(),
+                conrelid: oid,
+                contype: if unique.primary_key {
+                    ultrasql_catalog::persistent::ConType::PrimaryKey
+                } else {
+                    ultrasql_catalog::persistent::ConType::Unique
+                },
+                condeferrable: false,
+                condeferred: false,
+                conkey: constraint_attnums(&unique.columns, &unique.name)?,
+                confrelid: ultrasql_core::Oid::INVALID,
+                confkey: Vec::new(),
+            });
+        }
+        for check in checks {
+            persistent_constraint_rows.push(ultrasql_catalog::persistent::ConstraintRow {
+                oid: self.state.persistent_catalog.next_oid(),
+                conname: check.name.clone(),
+                conrelid: oid,
+                contype: ultrasql_catalog::persistent::ConType::Check,
+                condeferrable: false,
+                condeferred: false,
+                conkey: Vec::new(),
+                confrelid: ultrasql_core::Oid::INVALID,
+                confkey: Vec::new(),
+            });
+        }
+        for fk in &runtime_foreign_keys {
+            persistent_constraint_rows.push(ultrasql_catalog::persistent::ConstraintRow {
+                oid: self.state.persistent_catalog.next_oid(),
+                conname: fk.name.clone(),
+                conrelid: oid,
+                contype: ultrasql_catalog::persistent::ConType::ForeignKey,
+                condeferrable: fk.deferrable,
+                condeferred: fk.initially_deferred,
+                conkey: constraint_attnums(&fk.columns, &fk.name)?,
+                confrelid: fk.target_oid,
+                confkey: constraint_attnums(&fk.target_columns, &fk.name)?,
+            });
+        }
         if defaults.iter().any(Option::is_some)
             || sequence_defaults.iter().any(Option::is_some)
             || identity_always.iter().any(|v| *v)
@@ -173,7 +238,7 @@ where
                             expr: check.expr.clone(),
                         })
                         .collect(),
-                    foreign_keys: runtime_foreign_keys,
+                    foreign_keys: runtime_foreign_keys.clone(),
                     indexes: std::collections::HashMap::new(),
                 }),
             );
@@ -212,6 +277,23 @@ where
             for index in &created_unique_indexes {
                 self.state.persistent_catalog.persist_index_rows(
                     index,
+                    self.state.heap.as_ref(),
+                    ddl_xid,
+                    ddl_command_id,
+                )?;
+            }
+            for row in &persistent_constraint_rows {
+                self.state.persistent_catalog.persist_constraint_row(
+                    row,
+                    self.state.heap.as_ref(),
+                    ddl_xid,
+                    ddl_command_id,
+                )?;
+            }
+            for (seq_name, row) in &serial_sequence_rows {
+                self.state.persistent_catalog.persist_sequence_rows(
+                    seq_name,
+                    row,
                     self.state.heap.as_ref(),
                     ddl_xid,
                     ddl_command_id,
@@ -503,7 +585,7 @@ where
         if !expression_key_exprs.is_empty()
             || predicate.is_some()
             || !include_columns.is_empty()
-            || *method == ultrasql_planner::LogicalIndexMethod::Hash
+            || *method != ultrasql_planner::LogicalIndexMethod::Btree
         {
             let mut constraints = self
                 .state
@@ -701,4 +783,20 @@ where
         self.plan_cache_invalidate();
         Ok(run_ddl_command("COMMENT"))
     }
+}
+
+fn constraint_attnums(columns: &[usize], name: &str) -> Result<Vec<i16>, ServerError> {
+    columns
+        .iter()
+        .map(|col| {
+            let attnum = col.checked_add(1).ok_or(ServerError::Unsupported(
+                "CREATE TABLE: constraint attnum overflow",
+            ))?;
+            i16::try_from(attnum).map_err(|_| {
+                ServerError::ddl(format!(
+                    "CREATE TABLE: constraint {name} column position {attnum} does not fit i16"
+                ))
+            })
+        })
+        .collect()
 }

@@ -14,8 +14,8 @@
 
 use crate::payload::{
     AbortPayload, BTreeOpPayload, CheckpointPayload, CommitPayload, FullPageWritePayload,
-    HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlacePayload,
-    HeapUpdatePayload, PayloadError, SequenceOpPayload,
+    HashOpPayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
+    HeapUpdateInPlacePayload, HeapUpdatePayload, PayloadError, SequenceOpPayload,
 };
 use crate::record::{RecordType, WalRecord};
 use crate::recovery::RecoveryError;
@@ -137,6 +137,15 @@ pub trait HeapTarget: Send + Sync {
         Ok(())
     }
 
+    /// Apply a hash-index mutation record.
+    ///
+    /// Heap-only recovery targets may ignore these records, so the default is
+    /// a no-op. Storage targets that own hash pages override this method.
+    fn apply_hash_op(&self, payload: &HashOpPayload) -> Result<(), ApplyError> {
+        let _ = payload;
+        Ok(())
+    }
+
     /// Apply a sequence state change record.
     ///
     /// Heap-only recovery targets may ignore these records. A server-level
@@ -205,6 +214,7 @@ pub fn dispatch_record(target: &dyn HeapTarget, record: &WalRecord) -> Result<()
         RecordType::Checkpoint => target.observe_checkpoint(&CheckpointPayload::decode(bytes)?),
         RecordType::BTreeOp => target.apply_btree_op(&BTreeOpPayload::decode(bytes)?),
         RecordType::SequenceOp => target.apply_sequence_op(&SequenceOpPayload::decode(bytes)?),
+        RecordType::HashOp => target.apply_hash_op(&HashOpPayload::decode(bytes)?),
         RecordType::Nop => Ok(()),
     }
 }
@@ -248,8 +258,8 @@ mod tests {
     use super::*;
     use crate::buffer::WalBuffer;
     use crate::payload::{
-        AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload,
-        HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
+        AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload, HashOpKind,
+        HashOpPayload, HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
     };
     use crate::record::{RecordType, WalRecord};
     use crate::writer::{WalWriter, WalWriterConfig};
@@ -264,6 +274,7 @@ mod tests {
         updates: Mutex<Vec<HeapUpdatePayload>>,
         deletes: Mutex<Vec<HeapDeletePayload>>,
         btree_ops: Mutex<Vec<BTreeOpPayload>>,
+        hash_ops: Mutex<Vec<HashOpPayload>>,
         sequence_ops: Mutex<Vec<SequenceOpPayload>>,
         fpws: Mutex<Vec<FullPageWritePayload>>,
         commits: Mutex<Vec<CommitPayload>>,
@@ -294,6 +305,11 @@ mod tests {
 
         fn apply_btree_op(&self, p: &BTreeOpPayload) -> Result<(), ApplyError> {
             self.btree_ops.lock().push(p.clone());
+            Ok(())
+        }
+
+        fn apply_hash_op(&self, p: &HashOpPayload) -> Result<(), ApplyError> {
+            self.hash_ops.lock().push(p.clone());
             Ok(())
         }
 
@@ -436,6 +452,19 @@ mod tests {
         let rec = make_record(RecordType::BTreeOp, btree_payload.encode().unwrap());
         dispatch_record(&mock, &rec).unwrap();
 
+        // HashOp
+        let hash_payload = HashOpPayload {
+            op: HashOpKind::Insert,
+            index_rel: RelationId::new(77),
+            bucket: 3,
+            page: PageId::new(RelationId::new(77), BlockNumber::new(1)),
+            key_hash: 0xABCD,
+            key_bytes: 7_i64.to_le_bytes().to_vec(),
+            value_bytes: vec![0_u8; 12],
+        };
+        let rec = make_record(RecordType::HashOp, hash_payload.encode().unwrap());
+        dispatch_record(&mock, &rec).unwrap();
+
         // SequenceOp
         let sequence_payload = SequenceOpPayload {
             op: SequenceOpKind::Advance,
@@ -461,6 +490,7 @@ mod tests {
         assert_eq!(mock.updates.lock().len(), 1);
         assert_eq!(mock.deletes.lock().len(), 1);
         assert_eq!(mock.btree_ops.lock().len(), 1);
+        assert_eq!(mock.hash_ops.lock().len(), 1);
         assert_eq!(mock.sequence_ops.lock().len(), 1);
         assert_eq!(mock.fpws.lock().len(), 1);
         assert_eq!(mock.commits.lock().len(), 1);

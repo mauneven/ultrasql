@@ -48,10 +48,48 @@ where
         }
         let seq = Sequence::new(to_storage_options(*options))
             .map_err(|e| ServerError::ddl(format!("CREATE SEQUENCE: {e}")))?;
+        let seq_oid = self.state.persistent_catalog.next_oid();
+        let seq_rel = RelationId::new(seq_oid.raw());
+        let seq_opts = seq.options_snapshot();
+        let ddl_txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let seq_row = ultrasql_catalog::persistent::SequenceRow {
+            seqrelid: seq_oid,
+            seqtypid: PG_OID_INT8,
+            seqstart: seq_opts.start,
+            seqincrement: seq_opts.increment,
+            seqmax: seq_opts.max.unwrap_or(i64::MAX),
+            seqmin: seq_opts.min.unwrap_or(1),
+            seqcache: i64::from(seq_opts.cache),
+            seqcycle: seq_opts.cycle,
+        };
+        if let Err(e) = self.state.persistent_catalog.persist_sequence_rows(
+            sequence_name,
+            &seq_row,
+            self.state.heap.as_ref(),
+            ddl_txn.xid,
+            ddl_txn.current_command,
+        ) {
+            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "abort of catalog-write txn failed after persist_sequence_rows error",
+                );
+            }
+            return Err(e.into());
+        }
+        if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
+            tracing::warn!(
+                error = %commit_err,
+                "catalog-write txn failed to commit; restart visibility may differ",
+            );
+        }
         seq.emit_wal(
             SequenceOpKind::Create,
             sequence_name,
-            RelationId::INVALID,
+            seq_rel,
             self.sequence_xid(),
             self.sequence_wal_sink(),
         )

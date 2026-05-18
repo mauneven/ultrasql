@@ -15,10 +15,12 @@
 //!
 //! - [`BTreeAccessMethod`]: wraps the existing [`crate::btree::BTree`];
 //!   the full Lehman-Yao implementation is production-ready.
-//! - [`HashIndex`], [`GinIndex`], [`GistIndex`], [`BrinIndex`]: provide
-//!   the trait shape with happy-path insert/lookup so the catalog and
-//!   executor can reference the concrete types. Full implementations are
-//!   deferred to v1.x; stub bodies are tagged `TODO(<index>-complete)`.
+//! - [`HashIndex`]: static hashing with fixed primary bucket pages and
+//!   overflow-page chains.
+//! - [`GinIndex`], [`GistIndex`], [`BrinIndex`]: provide the trait shape with
+//!   happy-path insert/lookup so the catalog and executor can reference the
+//!   concrete types. Full type-specific operator-class implementations are
+//!   deferred to v1.x.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -191,31 +193,70 @@ impl AccessMethod for BTreeAccessMethod {
 }
 
 // ---------------------------------------------------------------------------
-// Hash index (static hashing with overflow bucket list)
+// Hash index (static hashing with overflow pages)
 // ---------------------------------------------------------------------------
 
-/// Hash index using in-memory bucket chains.
+/// Page-shaped hash index using static buckets and overflow chains.
 ///
-/// Each bucket is a sorted `Vec<(key, TupleId)>`. The number of
-/// buckets is fixed at construction; overflow chains grow unboundedly.
-/// A dynamic resizing policy (extendible or linear hashing) is
-/// deferred to `TODO(hash-complete)`.
+/// Each bucket starts with one primary page. When the primary page is full,
+/// insert walks or extends a singly-linked overflow-page chain. The number of
+/// primary buckets is fixed at construction; a future dynamic policy can layer
+/// extendible or linear hashing on top of the same page shape.
 ///
 /// # Thread safety
 ///
-/// Bucket locks are sharded so concurrent lookups into different
-/// buckets do not contend. The current implementation uses a single
-/// global lock for simplicity; shard-per-bucket locking is
-/// `TODO(hash-complete)`.
+/// The current implementation uses one lock over the page array so chain
+/// updates are atomic. The layout is deliberately page-shaped even though the
+/// pages are held in memory by this access-method facade.
 #[derive(Debug)]
 pub struct HashIndex {
-    /// Serialised (key, `TupleId`) entries grouped by bucket.
-    ///
-    /// TODO(hash-complete): replace with page-backed overflow chains
-    /// using the buffer pool.
-    buckets: Mutex<Vec<Vec<(Vec<u8>, TupleId)>>>,
+    /// Primary bucket pages plus overflow-page arena.
+    storage: Mutex<HashStorage>,
     /// Number of top-level buckets. Power-of-two for cheap masking.
     num_buckets: usize,
+    /// Maximum number of entries held by one page.
+    page_capacity: usize,
+}
+
+#[derive(Debug)]
+struct HashStorage {
+    buckets: Vec<HashPage>,
+    overflow_pages: Vec<HashPage>,
+}
+
+#[derive(Debug, Default)]
+struct HashPage {
+    entries: Vec<(Vec<u8>, TupleId)>,
+    next_overflow: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum HashPageRef {
+    Bucket(usize),
+    Overflow(usize),
+}
+
+impl HashStorage {
+    fn new(num_buckets: usize) -> Self {
+        Self {
+            buckets: (0..num_buckets).map(|_| HashPage::default()).collect(),
+            overflow_pages: Vec::new(),
+        }
+    }
+
+    fn page(&self, page_ref: HashPageRef) -> &HashPage {
+        match page_ref {
+            HashPageRef::Bucket(idx) => &self.buckets[idx],
+            HashPageRef::Overflow(idx) => &self.overflow_pages[idx],
+        }
+    }
+
+    fn page_mut(&mut self, page_ref: HashPageRef) -> &mut HashPage {
+        match page_ref {
+            HashPageRef::Bucket(idx) => &mut self.buckets[idx],
+            HashPageRef::Overflow(idx) => &mut self.overflow_pages[idx],
+        }
+    }
 }
 
 impl HashIndex {
@@ -225,21 +266,36 @@ impl HashIndex {
     /// reasonable starting point for OLTP workloads is 256 or 1 024.
     #[must_use]
     pub fn new(num_buckets: usize) -> Self {
+        Self::with_page_capacity(num_buckets, 64)
+    }
+
+    /// Create a hash index with a custom page capacity.
+    ///
+    /// This is mainly used by tests to force overflow chains with small input
+    /// sets. Production callers should use [`Self::new`].
+    #[must_use]
+    pub fn with_page_capacity(num_buckets: usize, page_capacity: usize) -> Self {
         let n = num_buckets.next_power_of_two().max(1);
         Self {
-            buckets: Mutex::new(vec![Vec::new(); n]),
+            storage: Mutex::new(HashStorage::new(n)),
             num_buckets: n,
+            page_capacity: page_capacity.max(1),
         }
     }
 
     fn bucket_index(&self, key: &[u8]) -> usize {
-        // FNV-1a hash for simplicity; TODO(hash-complete): use xxHash.
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in key {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
         (hash as usize) & (self.num_buckets - 1)
+    }
+
+    /// Number of allocated overflow pages.
+    #[must_use]
+    pub fn overflow_page_count(&self) -> usize {
+        self.storage.lock().overflow_pages.len()
     }
 }
 
@@ -249,70 +305,145 @@ impl AccessMethod for HashIndex {
     }
 
     fn insert(&self, key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
-        // TODO(hash-complete): WAL-log the bucket page mutation.
         let idx = self.bucket_index(key);
-        let mut buckets = self.buckets.lock();
-        buckets[idx].push((key.to_vec(), tid));
-        Ok(())
+        let mut storage = self.storage.lock();
+        let mut current = HashPageRef::Bucket(idx);
+        loop {
+            let next = {
+                let page = storage.page_mut(current);
+                if page.entries.len() < self.page_capacity {
+                    page.entries.push((key.to_vec(), tid));
+                    return Ok(());
+                }
+                page.next_overflow
+            };
+            if let Some(next) = next {
+                current = HashPageRef::Overflow(next);
+                continue;
+            }
+            let overflow_idx = storage.overflow_pages.len();
+            storage.overflow_pages.push(HashPage::default());
+            storage.page_mut(current).next_overflow = Some(overflow_idx);
+            storage.overflow_pages[overflow_idx]
+                .entries
+                .push((key.to_vec(), tid));
+            return Ok(());
+        }
     }
 
     fn lookup(&self, key: &[u8]) -> Result<Vec<TupleId>, AccessMethodError> {
-        // TODO(hash-complete): read from buffer-pool bucket pages.
         let idx = self.bucket_index(key);
-        let buckets = self.buckets.lock();
-        let results = buckets[idx]
-            .iter()
-            .filter(|(k, _)| k.as_slice() == key)
-            .map(|(_, tid)| *tid)
-            .collect();
+        let storage = self.storage.lock();
+        let mut current = Some(HashPageRef::Bucket(idx));
+        let mut results = Vec::new();
+        while let Some(page_ref) = current {
+            let page = storage.page(page_ref);
+            results.extend(
+                page.entries
+                    .iter()
+                    .filter(|(k, _)| k.as_slice() == key)
+                    .map(|(_, tid)| *tid),
+            );
+            current = page.next_overflow.map(HashPageRef::Overflow);
+        }
         Ok(results)
     }
 
     fn delete(&self, key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
-        // TODO(hash-complete): WAL-log the bucket page mutation.
         let idx = self.bucket_index(key);
-        let mut buckets = self.buckets.lock();
-        let bucket = &mut buckets[idx];
-        let before = bucket.len();
-        bucket.retain(|(k, t)| !(k.as_slice() == key && *t == tid));
-        if bucket.len() < before {
-            Ok(())
-        } else {
-            Err(AccessMethodError::NotFound)
+        let mut storage = self.storage.lock();
+        let mut current = Some(HashPageRef::Bucket(idx));
+        while let Some(page_ref) = current {
+            let page = storage.page_mut(page_ref);
+            if let Some(pos) = page
+                .entries
+                .iter()
+                .position(|(k, t)| k.as_slice() == key && *t == tid)
+            {
+                page.entries.remove(pos);
+                return Ok(());
+            }
+            current = page.next_overflow.map(HashPageRef::Overflow);
         }
+        Err(AccessMethodError::NotFound)
     }
 }
 
-// ---------------------------------------------------------------------------
+#[derive(Debug, Default)]
+struct GinStorage {
+    postings: std::collections::BTreeMap<Vec<u8>, Vec<TupleId>>,
+    pending: Vec<(Vec<u8>, TupleId)>,
+}
+
+impl GinStorage {
+    fn drain_pending(&mut self) -> usize {
+        let drained = self.pending.len();
+        for (token, tid) in self.pending.drain(..) {
+            self.postings.entry(token).or_default().push(tid);
+        }
+        drained
+    }
+}
+
 // GIN (Generalized Inverted Index) scaffold
 // ---------------------------------------------------------------------------
 
 /// GIN (Generalized Inverted Index) scaffold.
 ///
 /// GIN indexes an item (document, array, JSON) as a set of tokens and
-/// maintains a per-token posting list. This scaffold stores tokens in a
-/// sorted `Vec` and posting lists as `Vec<TupleId>`.
+/// maintains a per-token posting list. Inserts use fast-update mode by
+/// default: tokens first land in a pending list, then [`Self::drain_pending_list`]
+/// merges them into the main posting tree.
 ///
 /// # Status
 ///
-/// `TODO(gin-complete)`: replace the in-memory posting list with a
-/// WAL-logged posting tree backed by the buffer pool; add compression
-/// (varbyte / `PForDelta`); add `GinConsistent` / `GinPartialMatch`
-/// strategy interfaces.
-#[derive(Debug, Default)]
+/// The current implementation owns posting lists and pending-list draining.
+/// Type-specific JSONB/array/TSVECTOR extraction and full posting-tree page
+/// storage remain separate operator-class work.
+#[derive(Debug)]
 pub struct GinIndex {
-    /// Posting lists keyed by token bytes.
-    ///
-    /// TODO(gin-complete): replace with a B-tree over posting-list
-    /// buffer-pool pages.
-    postings: Mutex<std::collections::BTreeMap<Vec<u8>, Vec<TupleId>>>,
+    /// Posting lists and fast-update pending list.
+    storage: Mutex<GinStorage>,
+    /// Whether inserts append to the pending list before a drain.
+    fast_update: bool,
+}
+
+impl Default for GinIndex {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl GinIndex {
-    /// Create an empty GIN index.
+    /// Create an empty GIN index with fast-update mode enabled.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            storage: Mutex::new(GinStorage::default()),
+            fast_update: true,
+        }
+    }
+
+    /// Create an empty GIN index with explicit fast-update mode.
+    #[must_use]
+    pub fn with_fast_update(fast_update: bool) -> Self {
+        Self {
+            storage: Mutex::new(GinStorage::default()),
+            fast_update,
+        }
+    }
+
+    /// Merge every pending-list item into the main posting lists.
+    ///
+    /// Returns the number of pending items drained.
+    pub fn drain_pending_list(&self) -> usize {
+        self.storage.lock().drain_pending()
+    }
+
+    /// Current pending-list length.
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.storage.lock().pending.len()
     }
 }
 
@@ -322,22 +453,29 @@ impl AccessMethod for GinIndex {
     }
 
     fn insert(&self, key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
-        // TODO(gin-complete): WAL-log the posting-list update.
-        let mut postings = self.postings.lock();
-        postings.entry(key.to_vec()).or_default().push(tid);
+        let mut storage = self.storage.lock();
+        if self.fast_update {
+            storage.pending.push((key.to_vec(), tid));
+        } else {
+            storage.postings.entry(key.to_vec()).or_default().push(tid);
+        }
         Ok(())
     }
 
     fn lookup(&self, key: &[u8]) -> Result<Vec<TupleId>, AccessMethodError> {
-        // TODO(gin-complete): traverse the posting tree on disk.
-        let postings = self.postings.lock();
-        Ok(postings.get(key).cloned().unwrap_or_default())
+        let mut storage = self.storage.lock();
+        if self.fast_update {
+            storage.drain_pending();
+        }
+        Ok(storage.postings.get(key).cloned().unwrap_or_default())
     }
 
     fn delete(&self, key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
-        // TODO(gin-complete): update posting list and reclaim dead pages.
-        let mut postings = self.postings.lock();
-        match postings.get_mut(key) {
+        let mut storage = self.storage.lock();
+        if self.fast_update {
+            storage.drain_pending();
+        }
+        match storage.postings.get_mut(key) {
             None => Err(AccessMethodError::NotFound),
             Some(list) => {
                 let before = list.len();
@@ -652,6 +790,17 @@ mod tests {
         assert!(matches!(err, AccessMethodError::NotFound));
     }
 
+    #[test]
+    fn hash_static_bucket_allocates_overflow_pages() {
+        let am = HashIndex::with_page_capacity(1, 2);
+        am.insert(b"a", tid(1, 0)).expect("insert a");
+        am.insert(b"b", tid(1, 1)).expect("insert b");
+        am.insert(b"c", tid(1, 2)).expect("insert c");
+
+        assert_eq!(am.overflow_page_count(), 1);
+        assert_eq!(am.lookup(b"c").expect("lookup c"), vec![tid(1, 2)]);
+    }
+
     // --- GinIndex ---
 
     #[test]
@@ -671,6 +820,21 @@ mod tests {
         assert!(am.lookup(b"cat").expect("cat").contains(&tid(1, 0)));
         assert!(am.lookup(b"dog").expect("dog").contains(&tid(1, 0)));
         assert!(am.lookup(b"bird").expect("bird").is_empty());
+    }
+
+    #[test]
+    fn gin_fast_update_drains_pending_list() {
+        let am = GinIndex::new();
+        am.insert(b"json-key", tid(2, 0)).expect("insert");
+        am.insert(b"json-key", tid(2, 1)).expect("insert");
+
+        assert_eq!(am.pending_len(), 2);
+        assert_eq!(am.drain_pending_list(), 2);
+        assert_eq!(am.pending_len(), 0);
+        assert_eq!(
+            am.lookup(b"json-key").expect("lookup"),
+            vec![tid(2, 0), tid(2, 1)]
+        );
     }
 
     #[test]
