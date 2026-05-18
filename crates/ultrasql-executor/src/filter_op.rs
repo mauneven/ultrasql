@@ -146,7 +146,9 @@ impl Filter {
                 let right_col = cols.get(*right_index).ok_or(ExecError::Internal(
                     "filter right column index out of bounds",
                 ))?;
-                cmp_columns_to_mask(left_col, right_col, *op)
+                let left_type = &self.schema.field_at(*left_index).data_type;
+                let right_type = &self.schema.field_at(*right_index).data_type;
+                cmp_columns_to_mask(left_col, right_col, left_type, right_type, *op)
             }
         };
 
@@ -362,7 +364,16 @@ fn const_mask_i32(column: &NumericColumn<i32>, literal_i64: i64, op: CmpOp) -> B
 /// Vectorised `left_column <op> right_column` comparison for the
 /// physical integer families used by dates, timestamps, decimals, and
 /// regular integer columns.
-fn cmp_columns_to_mask(left: &Column, right: &Column, op: CmpOp) -> Option<Bitmap> {
+fn cmp_columns_to_mask(
+    left: &Column,
+    right: &Column,
+    left_type: &DataType,
+    right_type: &DataType,
+    op: CmpOp,
+) -> Option<Bitmap> {
+    if !raw_ordering_matches_logical_ordering(left_type, right_type) {
+        return None;
+    }
     match (left, right) {
         (Column::Int32(l), Column::Int32(r)) => {
             let validity = merge_numeric_validity(l, r);
@@ -375,6 +386,29 @@ fn cmp_columns_to_mask(left: &Column, right: &Column, op: CmpOp) -> Option<Bitma
             Some(cmp_i64_scalar(&cmp, 0, op))
         }
         _ => None,
+    }
+}
+
+fn raw_ordering_matches_logical_ordering(left: &DataType, right: &DataType) -> bool {
+    match (left, right) {
+        (DataType::Int16, DataType::Int16)
+        | (DataType::Int32, DataType::Int32)
+        | (DataType::Int64, DataType::Int64)
+        | (DataType::Date, DataType::Date)
+        | (DataType::Time, DataType::Time)
+        | (DataType::Timestamp, DataType::Timestamp)
+        | (DataType::TimestampTz, DataType::TimestampTz)
+        | (DataType::Timestamp, DataType::TimestampTz)
+        | (DataType::TimestampTz, DataType::Timestamp) => true,
+        (
+            DataType::Decimal {
+                scale: left_scale, ..
+            },
+            DataType::Decimal {
+                scale: right_scale, ..
+            },
+        ) => left_scale.unwrap_or(0) == right_scale.unwrap_or(0),
+        _ => false,
     }
 }
 
@@ -993,6 +1027,59 @@ mod tests {
         // Rows 0 and 4 pass. Row 1 has NULL left, row 2 NULL right,
         // row 3 is 11 > 20 false.
         assert_eq!(got, vec![5, 13]);
+    }
+
+    /// Decimal columns store as Int64, but different scales do not
+    /// share raw integer ordering. The column-vs-column fast path must
+    /// decline so Eval can rescale before compare.
+    #[test]
+    fn decimal_column_column_different_scales_falls_back() {
+        let left_values = vec![10_000_i64, 1_000, 500];
+        let right_values = vec![200_000_i64, 2_000, 600];
+        let batch = Batch::new([
+            Column::Int64(NumericColumn::from_data(left_values)),
+            Column::Int64(NumericColumn::from_data(right_values)),
+        ])
+        .expect("batch ok");
+        let left_type = DataType::Decimal {
+            precision: Some(12),
+            scale: Some(2),
+        };
+        let right_type = DataType::Decimal {
+            precision: Some(12),
+            scale: Some(4),
+        };
+        let schema = Schema::new([
+            Field::required("left_dec", left_type.clone()),
+            Field::required("right_dec", right_type.clone()),
+        ])
+        .expect("schema ok");
+        let pred = ScalarExpr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(ScalarExpr::Column {
+                name: "left_dec".into(),
+                index: 0,
+                data_type: left_type,
+            }),
+            right: Box::new(ScalarExpr::Column {
+                name: "right_dec".into(),
+                index: 1,
+                data_type: right_type,
+            }),
+            data_type: DataType::Bool,
+        };
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut filter = Filter::new(Box::new(scan), pred);
+
+        let out = filter.next_batch().unwrap().unwrap();
+        let got: Vec<i64> = match &out.columns()[0] {
+            Column::Int64(c) => c.data().to_vec(),
+            other => panic!("unexpected column type: {other:?}"),
+        };
+        // Logical values: 100.00 > 20.0000, 10.00 > 0.2000,
+        // 5.00 > 0.0600. Raw Int64 ordering would incorrectly drop
+        // row 0 (10000 < 200000).
+        assert_eq!(got, vec![10_000, 1_000, 500]);
     }
 
     /// `col + 1 > 5` does not match the col-op-literal shape (LHS is a

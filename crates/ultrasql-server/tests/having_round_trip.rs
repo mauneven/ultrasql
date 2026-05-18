@@ -104,3 +104,52 @@ async fn having_filters_against_cte_threshold() {
 
     shutdown(client, server_handle).await;
 }
+
+#[tokio::test]
+async fn having_filters_against_scalar_subquery_threshold() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute(
+            "CREATE TABLE ps (part INT NOT NULL, cost DECIMAL(15, 2) NOT NULL, qty INT NOT NULL)",
+        )
+        .await
+        .expect("create table");
+    client
+        .batch_execute(
+            "INSERT INTO ps VALUES \
+             (1, 100.00, 10), \
+             (1,  50.00, 10), \
+             (2,   5.00, 10), \
+             (3, 10000000.00, 10000)",
+        )
+        .await
+        .expect("insert rows");
+
+    let rows = client
+        .simple_query(
+            "SELECT part, SUM(cost * qty) AS value
+             FROM ps
+             GROUP BY part
+             HAVING SUM(cost * qty) > (
+                 SELECT SUM(cost * qty) * 0.0001
+                 FROM ps
+             )
+             ORDER BY part",
+        )
+        .await
+        .expect("query succeeds");
+
+    let got: Vec<(i32, String)> = rows
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some((
+                row.get("part")?.parse::<i32>().ok()?,
+                row.get("value")?.to_owned(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(got, vec![(3, "100000000000.00".to_owned())]);
+
+    shutdown(client, server_handle).await;
+}
