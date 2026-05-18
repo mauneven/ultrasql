@@ -1,1 +1,1 @@
-{"engine":"sqlite3","workload":"select_scan_10k","n_rows":10000,"samples":4,"median_us":1943.667,"min_us":1889.542,"iterations_us":[2430.916007142514, 1944.4170175120234, 1942.9170060902834, 1889.5419780164957]}
+{"engine":"sqlite3","workload":"select_scan_10k","n_rows":10000,"samples":4,"median_us":1921.771,"min_us":1825.458,"iterations_us":[2082.7080006711185, 2010.5000003241003, 1825.4579626955092, 1833.0419552512467]}

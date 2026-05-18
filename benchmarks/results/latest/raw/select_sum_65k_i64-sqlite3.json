@@ -1,1 +1,1 @@
-{"engine":"sqlite3","workload":"select_sum_65k_i64","n_rows":65536,"samples":4,"median_us":964.667,"min_us":935.709,"iterations_us":[953.4170385450125, 975.9169770404696, 1107.7920207753778, 935.7089875265956]}
+{"engine":"sqlite3","workload":"select_sum_65k_i64","n_rows":65536,"samples":4,"median_us":889.583,"min_us":869.667,"iterations_us":[869.6669829078019, 880.9169521555305, 898.2500294223428, 902.0420257002115]}

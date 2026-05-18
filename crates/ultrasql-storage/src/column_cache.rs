@@ -47,6 +47,32 @@ use parking_lot::RwLock;
 use ultrasql_core::{RelationId, Schema};
 use ultrasql_vec::column::Column;
 
+/// Version-scoped key for cached scalar aggregate wire bodies.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CachedScalarAggregateWireKey {
+    /// `SELECT SUM(col)` over an unchanged cached relation.
+    Sum {
+        output_name: String,
+        input_type_tag: u8,
+        sum_col: usize,
+    },
+    /// `SELECT AVG(col)` over an unchanged cached relation.
+    Avg {
+        output_name: String,
+        input_type_tag: u8,
+        sum_col: usize,
+    },
+    /// `SELECT SUM(sum_col) FROM t WHERE pred_col op lit`.
+    FilterSum {
+        output_name: String,
+        input_type_tag: u8,
+        sum_col: usize,
+        predicate_col: usize,
+        predicate_op_tag: u8,
+        predicate_lit: i64,
+    },
+}
+
 /// Cached column projection for a relation at a specific version.
 #[derive(Debug)]
 pub struct CachedColumns {
@@ -66,6 +92,12 @@ pub struct CachedColumns {
     /// and relation version. Kept separate from `columns` so other
     /// scan shapes pay no extra work.
     pub cached_int32_pair_select_wire: RwLock<Option<Arc<[u8]>>>,
+    /// Lazily-populated pre-encoded wire bodies for scalar aggregate
+    /// queries answered directly from these cached columns. Keyed by
+    /// output shape + predicate so repeated Simple Query executions on
+    /// an unchanged relation can skip both heap access and aggregate
+    /// recomputation.
+    pub cached_scalar_aggregate_wire: RwLock<AHashMap<CachedScalarAggregateWireKey, Arc<[u8]>>>,
 }
 
 impl CachedColumns {
@@ -77,6 +109,7 @@ impl CachedColumns {
             schema,
             columns,
             cached_int32_pair_select_wire: RwLock::new(None),
+            cached_scalar_aggregate_wire: RwLock::new(AHashMap::new()),
         }
     }
 }

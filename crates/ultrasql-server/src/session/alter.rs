@@ -407,17 +407,11 @@ where
     ///   replace this body with the proper fast-path without touching
     ///   any caller.
     ///
-    /// `RESTART IDENTITY` and `CASCADE` are accepted by the parser and
-    /// the binder but currently have no effect at execution time:
-    ///
-    /// - `RESTART IDENTITY` reseeds owned sequences. UltraSQL does not
-    ///   yet implement `SERIAL` / sequence catalogs (see ROADMAP P1
-    ///   v0.6), so there are no sequences to reseed. The keyword is
-    ///   accept-and-ignore until that lands.
-    /// - `CASCADE` truncates dependent foreign-key children. UltraSQL
-    ///   does not yet enforce foreign keys at the catalog level, so
-    ///   there are no dependent relations to find. The keyword is
-    ///   accept-and-ignore until the foreign-key wave lands.
+    /// `CASCADE` walks the in-memory runtime foreign-key graph built by
+    /// `CREATE TABLE`. Referencing child tables are added recursively;
+    /// omitting `CASCADE` raises `2BP01` when such dependencies exist.
+    /// Warm-restart reconstruction of those runtime constraints is still
+    /// open, so the dependency walk is limited to the current process.
     ///
     /// Multi-table `TRUNCATE` truncates every table inside a single
     /// autocommit transaction so the operation is atomic — either all
@@ -427,11 +421,18 @@ where
         plan: &LogicalPlan,
         snapshot: &CatalogSnapshot,
     ) -> Result<SelectResult, ServerError> {
-        let LogicalPlan::Truncate { tables, .. } = plan else {
+        let LogicalPlan::Truncate {
+            tables,
+            restart_identity,
+            cascade,
+            ..
+        } = plan
+        else {
             return Err(ServerError::Unsupported(
                 "execute_truncate called with non-Truncate plan",
             ));
         };
+        let tables = self.collect_truncate_tables(tables, *cascade, snapshot)?;
 
         // Single autocommit txn so the multi-table case is atomic. A
         // partial failure aborts the txn and every delete it stamped
@@ -439,10 +440,32 @@ where
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
 
         let truncate_result: Result<(), ServerError> = (|| {
-            for name in tables {
+            let mut owned_sequences_to_restart = Vec::new();
+            let mut seen_owned_sequences = std::collections::HashSet::new();
+            for name in &tables {
                 let entry = snapshot.tables.get(name).ok_or_else(|| {
                     ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(name.clone()))
                 })?;
+                if *restart_identity {
+                    if let Some(constraints) = self.state.table_constraints.get(&entry.oid) {
+                        for seq_name in constraints.sequence_defaults.iter().flatten() {
+                            if !seen_owned_sequences.insert(seq_name.clone()) {
+                                continue;
+                            }
+                            let seq = self
+                                .state
+                                .sequences
+                                .get(seq_name)
+                                .map(|entry| entry.clone())
+                                .ok_or_else(|| {
+                                    ServerError::ddl(format!(
+                                        "TRUNCATE RESTART IDENTITY: missing owned sequence {seq_name}",
+                                    ))
+                                })?;
+                            owned_sequences_to_restart.push(seq);
+                        }
+                    }
+                }
                 let rel = RelationId(entry.oid);
                 // The heap's resident block count is the source of
                 // truth for "how many blocks must I scan." We OR with
@@ -486,6 +509,12 @@ where
                         .map_err(|e| ServerError::ddl(format!("TRUNCATE heap delete: {e}")))?;
                 }
             }
+            for seq in owned_sequences_to_restart {
+                let options = seq.options_snapshot();
+                seq.alter_options(options, Some(options.start)).map_err(|e| {
+                    ServerError::ddl(format!("TRUNCATE RESTART IDENTITY: {e}"))
+                })?;
+            }
             Ok(())
         })();
 
@@ -507,6 +536,69 @@ where
                     );
                 }
                 Err(e)
+            }
+        }
+    }
+
+    fn collect_truncate_tables(
+        &self,
+        requested_tables: &[String],
+        cascade: bool,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<Vec<String>, ServerError> {
+        let mut truncate_tables = requested_tables.to_vec();
+        let mut truncate_set: std::collections::HashSet<String> =
+            truncate_tables.iter().cloned().collect();
+
+        loop {
+            let target_oids: std::collections::HashSet<ultrasql_core::Oid> = truncate_tables
+                .iter()
+                .filter_map(|name| snapshot.tables.get(name).map(|entry| entry.oid))
+                .collect();
+            let mut dependent_constraints = Vec::new();
+            let mut dependent_tables = Vec::new();
+
+            for item in self.state.table_constraints.iter() {
+                let table_oid = *item.key();
+                let Some(table) = snapshot.tables_by_oid.get(&table_oid) else {
+                    continue;
+                };
+                let table_name = table.name.to_ascii_lowercase();
+                if truncate_set.contains(&table_name) {
+                    continue;
+                }
+                for fk in &item.value().foreign_keys {
+                    if !target_oids.contains(&fk.target_oid) {
+                        continue;
+                    }
+                    if cascade {
+                        dependent_tables.push(table_name.clone());
+                    } else {
+                        dependent_constraints.push(format!("{}.{}", table.name, fk.name));
+                    }
+                }
+            }
+
+            if !dependent_constraints.is_empty() {
+                dependent_constraints.sort();
+                dependent_constraints.dedup();
+                return Err(ServerError::DependentObjectsStillExist(format!(
+                    "cannot truncate table because other objects depend on it: {}",
+                    dependent_constraints.join(", ")
+                )));
+            }
+
+            dependent_tables.sort();
+            dependent_tables.dedup();
+            let mut changed = false;
+            for table_name in dependent_tables {
+                if truncate_set.insert(table_name.clone()) {
+                    truncate_tables.push(table_name);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(truncate_tables);
             }
         }
     }

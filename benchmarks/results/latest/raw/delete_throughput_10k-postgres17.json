@@ -1,1 +1,1 @@
-{"engine":"postgres17","workload":"delete_throughput_10k","n_rows":10000,"samples":4,"median_us":25635.146,"min_us":25297.333,"iterations_us":[27123.084000777453, 25742.167024873197, 25528.124999254942, 25297.332962509245]}
+{"engine":"postgres17","workload":"delete_throughput_10k","n_rows":10000,"samples":4,"median_us":24446.167,"min_us":23708.541,"iterations_us":[25353.709002956748, 24199.33397322893, 24693.000013940036, 23708.540946245193]}

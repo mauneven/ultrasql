@@ -12,7 +12,7 @@ use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
 use crate::error::ServerError;
 
 use super::LowerCtx;
-use super::scan::lower_heap_scan;
+use super::scan::lower_heap_seq_scan;
 
 pub(super) fn shift_column_indices(expr: &ScalarExpr, by: usize) -> ScalarExpr {
     match expr {
@@ -241,7 +241,7 @@ pub(super) fn try_lower_direct_scalar_aggregate(
     // column reference with `Int32` or `Int64` data type.
     let op: Box<dyn Operator> = match agg.func {
         AggregateFunc::CountStar => {
-            let child = super::scan::lower_heap_scan(entry, None, ctx)?;
+            let child = lower_heap_seq_scan(entry, ctx)?;
             Box::new(DirectScalarAggScan::count_star(
                 child,
                 agg.output_name.clone(),
@@ -257,7 +257,7 @@ pub(super) fn try_lower_direct_scalar_aggregate(
             if col_idx >= schema.len() {
                 return Ok(None);
             }
-            let child = super::scan::lower_heap_scan(entry, None, ctx)?;
+            let child = lower_heap_seq_scan(entry, ctx)?;
             match data_type {
                 ultrasql_core::DataType::Int32 => Box::new(DirectScalarAggScan::sum_int32(
                     child,
@@ -282,7 +282,7 @@ pub(super) fn try_lower_direct_scalar_aggregate(
             if col_idx >= schema.len() {
                 return Ok(None);
             }
-            let child = super::scan::lower_heap_scan(entry, None, ctx)?;
+            let child = lower_heap_seq_scan(entry, ctx)?;
             match data_type {
                 ultrasql_core::DataType::Int32 => Box::new(DirectScalarAggScan::avg_int32(
                     child,
@@ -408,7 +408,7 @@ pub(super) fn try_lower_fused_filter_sum_int(
                 .with_jit(ctx.jit);
                 return Ok(Some(Box::new(fused)));
             }
-            let scan = lower_heap_scan(entry, None, ctx)?;
+            let scan = lower_heap_seq_scan(entry, ctx)?;
             let fused = FilterSumI32Scan::new(
                 scan,
                 pred_col,
@@ -449,7 +449,7 @@ pub(super) fn try_lower_fused_filter_sum_int(
                 .with_jit(ctx.jit);
                 return Ok(Some(Box::new(fused)));
             }
-            let scan = lower_heap_scan(entry, None, ctx)?;
+            let scan = lower_heap_seq_scan(entry, ctx)?;
             let fused = FilterSumI64Scan::new(
                 scan,
                 pred_col,

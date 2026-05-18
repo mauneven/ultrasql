@@ -5,9 +5,11 @@ use super::{
     schema_int_col, synthetic_ctx,
 };
 use crate::pipeline::*;
-use ultrasql_core::{DataType, RelationId, Schema, TupleId, Value};
+use ultrasql_core::{DataType, Field, RelationId, Schema, TupleId, Value};
 use ultrasql_executor::Operator;
-use ultrasql_planner::{BinaryOp, LogicalJoinType, LogicalPlan, ScalarExpr};
+use ultrasql_planner::{
+    AggregateFunc, BinaryOp, LogicalAggregateExpr, LogicalJoinType, LogicalPlan, ScalarExpr,
+};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions};
 
 #[test]
@@ -30,6 +32,115 @@ fn lower_query_right_outer_equi_join_uses_nlj_not_hash_join() {
     let mut pairs = collect_pairs(op.as_mut());
     pairs.sort_unstable();
     assert_eq!(pairs, vec![(0, 1), (0, 3), (2, 2)]);
+}
+
+#[test]
+fn direct_scalar_avg_miss_populates_column_cache_and_next_lowering_uses_cached_avg() {
+    let tables = SampleTables::new();
+    let rows: Vec<(i32, i32)> = (0..2048_i32).map(|i| (i, i)).collect();
+    let (fixture, entry, _tids) = build_index_fixture("bench_avg_cache", &rows, false);
+    let ctx = fixture.ctx(&tables);
+
+    let plan = LogicalPlan::Aggregate {
+        input: Box::new(LogicalPlan::Scan {
+            table: "bench_avg_cache".into(),
+            schema: entry.schema.clone(),
+            projection: None,
+        }),
+        group_by: Vec::new(),
+        aggregates: vec![LogicalAggregateExpr {
+            func: AggregateFunc::Avg,
+            arg: Some(ScalarExpr::Column {
+                name: "val".into(),
+                index: 1,
+                data_type: DataType::Int32,
+            }),
+            distinct: false,
+            output_name: "avg".into(),
+            data_type: DataType::Float64,
+        }],
+        schema: Schema::new([Field::required("avg", DataType::Float64)]).expect("schema ok"),
+    };
+
+    let mut first = lower_query(&plan, &ctx).expect("first lowering");
+    assert!(first.next_batch().expect("first batch").is_some());
+    assert!(first.next_batch().expect("eof").is_none());
+
+    let rel = RelationId(entry.oid);
+    assert!(
+        fixture.heap.column_cache.get(rel).is_some(),
+        "first scalar aggregate should populate column cache"
+    );
+
+    let second = lower_query(&plan, &ctx).expect("second lowering");
+    let debug = format!("{second:?}");
+    assert!(
+        debug.starts_with("CachedAvgI32Scan"),
+        "expected cached avg path on second lowering, got: {debug}"
+    );
+}
+
+#[test]
+fn fused_filter_sum_miss_populates_column_cache_and_next_lowering_uses_cached_filter_sum() {
+    let tables = SampleTables::new();
+    let rows: Vec<(i32, i32)> = (0..2048_i32).map(|i| (i, i)).collect();
+    let (fixture, entry, _tids) = build_index_fixture("bench_filter_sum_cache", &rows, false);
+    let ctx = fixture.ctx(&tables);
+
+    let scan = LogicalPlan::Scan {
+        table: "bench_filter_sum_cache".into(),
+        schema: entry.schema.clone(),
+        projection: None,
+    };
+    let filter = LogicalPlan::Filter {
+        input: Box::new(scan),
+        predicate: ScalarExpr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(ScalarExpr::Column {
+                name: "val".into(),
+                index: 1,
+                data_type: DataType::Int32,
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Int32(1024),
+                data_type: DataType::Int32,
+            }),
+            data_type: DataType::Bool,
+        },
+    };
+    let plan = LogicalPlan::Aggregate {
+        input: Box::new(filter),
+        group_by: Vec::new(),
+        aggregates: vec![LogicalAggregateExpr {
+            func: AggregateFunc::Sum,
+            arg: Some(ScalarExpr::Column {
+                name: "val".into(),
+                index: 1,
+                data_type: DataType::Int32,
+            }),
+            distinct: false,
+            output_name: "sum".into(),
+            data_type: DataType::Int64,
+        }],
+        schema: Schema::new([Field::required("sum", DataType::Int64)]).expect("schema ok"),
+    };
+
+    let mut first = lower_query(&plan, &ctx).expect("first lowering");
+    assert!(first.next_batch().expect("first batch").is_some());
+    assert!(first.next_batch().expect("eof").is_none());
+
+    let rel = RelationId(entry.oid);
+    assert!(
+        fixture.heap.column_cache.get(rel).is_some(),
+        "first filter-sum should populate column cache"
+    );
+
+    let second = lower_query(&plan, &ctx).expect("second lowering");
+    let debug = format!("{second:?}");
+    assert!(
+        debug.starts_with("CachedFilterSumI32Scan"),
+        "expected cached filter-sum path on second lowering, got: {debug}"
+    );
 }
 
 // ----------------------------------------------------------------

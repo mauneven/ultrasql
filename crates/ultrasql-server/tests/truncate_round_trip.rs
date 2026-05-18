@@ -7,10 +7,12 @@
 //! - `TRUNCATE TABLE t` over a populated relation empties it, and a
 //!   subsequent `SELECT COUNT(*) FROM t` returns 0.
 //! - `TRUNCATE TABLE t1, t2` empties both relations atomically.
-//! - `TRUNCATE TABLE t RESTART IDENTITY` accepts the keyword. UltraSQL
-//!   does not yet implement `SERIAL` / sequence catalogs (ROADMAP P1
-//!   v0.6) so there is nothing to reseed; the test only confirms the
-//!   keyword does not produce an error and that the rows are gone.
+//! - `TRUNCATE TABLE t RESTART IDENTITY` reseeds owned `SERIAL` /
+//!   `IDENTITY` sequences so the next insert starts again from the
+//!   configured start value.
+//! - `TRUNCATE TABLE parent` rejects live runtime FK dependents with
+//!   SQLSTATE `2BP01`, while `TRUNCATE TABLE parent CASCADE` includes
+//!   those child tables in the truncate set.
 //!
 //! Implementation notes (server side):
 //!
@@ -184,22 +186,21 @@ async fn truncate_multi_table_empties_each_listed_relation() {
     shutdown(client, server_handle).await;
 }
 
-/// `TRUNCATE TABLE t RESTART IDENTITY` is accepted by the parser, the
-/// binder, and the wire path. UltraSQL has no sequence catalog today
-/// (ROADMAP P1 v0.6) so `RESTART IDENTITY` is accept-and-ignore; this
-/// test verifies the keyword does not produce an error and that the
-/// rows are still cleared.
+/// `TRUNCATE TABLE t RESTART IDENTITY` reseeds owned serial sequences.
+/// After truncating a table whose `id` column is `SERIAL`, the next
+/// insert must start back at 1 rather than continuing from the pre-
+/// truncate high-water mark.
 #[tokio::test]
-async fn truncate_restart_identity_accepts_keyword() {
+async fn truncate_restart_identity_resets_owned_serial_sequence() {
     let (client, _conn_handle, server_handle) = start_server_and_connect().await;
 
     client
-        .batch_execute("CREATE TABLE trunc_restart (id INT NOT NULL)")
+        .batch_execute("CREATE TABLE trunc_restart (id SERIAL, v INT)")
         .await
         .expect("create table");
-    for id in 1..=4 {
+    for value in 1..=4 {
         client
-            .batch_execute(&format!("INSERT INTO trunc_restart VALUES ({id})"))
+            .batch_execute(&format!("INSERT INTO trunc_restart (v) VALUES ({value})"))
             .await
             .expect("insert");
     }
@@ -210,6 +211,91 @@ async fn truncate_restart_identity_accepts_keyword() {
         .await
         .expect("truncate restart identity succeeds");
     assert_eq!(select_count(&client, "trunc_restart").await, 0);
+
+    client
+        .batch_execute("INSERT INTO trunc_restart (v) VALUES (10), (20)")
+        .await
+        .expect("insert after restart identity");
+    let rows = client
+        .query("SELECT id, v FROM trunc_restart ORDER BY id", &[])
+        .await
+        .expect("select restarted rows");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(rows[0].get::<_, i32>(1), 10);
+    assert_eq!(rows[1].get::<_, i32>(0), 2);
+    assert_eq!(rows[1].get::<_, i32>(1), 20);
+
+    shutdown(client, server_handle).await;
+}
+
+/// `TRUNCATE TABLE parent` must reject when a child table still has a
+/// live runtime FOREIGN KEY reference to the parent.
+#[tokio::test]
+async fn truncate_referenced_parent_without_cascade_returns_2bp01() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE trunc_parent (id INT PRIMARY KEY)")
+        .await
+        .expect("create parent");
+    client
+        .batch_execute(
+            "CREATE TABLE trunc_child (parent_id INT REFERENCES trunc_parent(id), v INT)",
+        )
+        .await
+        .expect("create child");
+    client
+        .batch_execute("INSERT INTO trunc_parent VALUES (1)")
+        .await
+        .expect("insert parent");
+    client
+        .batch_execute("INSERT INTO trunc_child VALUES (1, 10)")
+        .await
+        .expect("insert child");
+
+    let err = client
+        .batch_execute("TRUNCATE TABLE trunc_parent")
+        .await
+        .expect_err("truncate without cascade rejected");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "2BP01");
+    assert_eq!(select_count(&client, "trunc_parent").await, 1);
+    assert_eq!(select_count(&client, "trunc_child").await, 1);
+
+    shutdown(client, server_handle).await;
+}
+
+/// `TRUNCATE TABLE parent CASCADE` recursively includes runtime FK
+/// child tables so both relations become empty in one statement.
+#[tokio::test]
+async fn truncate_cascade_empties_runtime_foreign_key_children() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE trunc_parent_c (id INT PRIMARY KEY)")
+        .await
+        .expect("create parent");
+    client
+        .batch_execute(
+            "CREATE TABLE trunc_child_c (parent_id INT REFERENCES trunc_parent_c(id), v INT)",
+        )
+        .await
+        .expect("create child");
+    client
+        .batch_execute("INSERT INTO trunc_parent_c VALUES (1), (2)")
+        .await
+        .expect("insert parents");
+    client
+        .batch_execute("INSERT INTO trunc_child_c VALUES (1, 10), (2, 20)")
+        .await
+        .expect("insert children");
+
+    client
+        .batch_execute("TRUNCATE TABLE trunc_parent_c CASCADE")
+        .await
+        .expect("truncate cascade succeeds");
+    assert_eq!(select_count(&client, "trunc_parent_c").await, 0);
+    assert_eq!(select_count(&client, "trunc_child_c").await, 0);
 
     shutdown(client, server_handle).await;
 }

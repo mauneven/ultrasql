@@ -136,11 +136,11 @@ after re-running `cross_compare_sql`.
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 61.29 µs | — |
-| DuckDB | 104.08 µs | 69.8% slower |
-| SQLite | 964.67 µs | 1,474% slower |
-| ClickHouse | 3.16 ms | 5,060% slower |
-| PostgreSQL | 31.83 ms | 51,840% slower |
+| **UltraSQL** | 70.50 µs | — |
+| DuckDB | 97.33 µs | 38.1% slower |
+| SQLite | 889.58 µs | 1,162% slower |
+| ClickHouse | 2.32 ms | 3,192% slower |
+| PostgreSQL | 30.98 ms | 43,842% slower |
 <!-- END AUTO: BENCH:select_sum_65k_i64 -->
 
 <!-- BEGIN AUTO: BENCH:filter_sum_1m_i64 -->
@@ -148,11 +148,11 @@ after re-running `cross_compare_sql`.
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| DuckDB | 196.50 µs | — |
-| **UltraSQL** | 2.76 ms | 1,305% slower |
-| ClickHouse | 3.32 ms | 1,588% slower |
-| SQLite | 15.92 ms | 8,004% slower |
-| PostgreSQL | 39.38 ms | 19,940% slower |
+| **UltraSQL** | 101.67 µs | — |
+| DuckDB | 235.48 µs | 131.6% slower |
+| ClickHouse | 3.15 ms | 2,999% slower |
+| SQLite | 15.74 ms | 15,385% slower |
+| PostgreSQL | 36.90 ms | 36,199% slower |
 <!-- END AUTO: BENCH:filter_sum_1m_i64 -->
 
 <!-- BEGIN AUTO: BENCH:select_avg_1m_i64 -->
@@ -160,11 +160,11 @@ after re-running `cross_compare_sql`.
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| DuckDB | 265.33 µs | — |
-| ClickHouse | 2.70 ms | 916% slower |
-| **UltraSQL** | 2.79 ms | 950% slower |
-| SQLite | 14.57 ms | 5,392% slower |
-| PostgreSQL | 37.90 ms | 14,185% slower |
+| **UltraSQL** | 87.71 µs | — |
+| DuckDB | 280.38 µs | 219.7% slower |
+| ClickHouse | 3.93 ms | 4,379% slower |
+| SQLite | 13.99 ms | 15,851% slower |
+| PostgreSQL | 37.94 ms | 43,154% slower |
 <!-- END AUTO: BENCH:select_avg_1m_i64 -->
 
 Write-side benchmarks land when the storage engine is wired (v0.3+):
@@ -174,11 +174,11 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 5.17 ms | — |
-| SQLite | 20.86 ms | 303.5% slower |
-| ClickHouse | 56.86 ms | 1,000% slower |
-| DuckDB | 67.03 ms | 1,196% slower |
-| PostgreSQL | 68.51 ms | 1,225% slower |
+| **UltraSQL** | 4.53 ms | — |
+| SQLite | 19.66 ms | 334.0% slower |
+| PostgreSQL | 55.08 ms | 1,116% slower |
+| DuckDB | 63.20 ms | 1,295% slower |
+| ClickHouse | 67.01 ms | 1,379% slower |
 <!-- END AUTO: BENCH:insert_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:select_scan_10k -->
@@ -186,11 +186,11 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 712.96 µs | — |
-| DuckDB | 868.46 µs | 21.8% slower |
-| SQLite | 1.94 ms | 172.6% slower |
-| ClickHouse | 2.59 ms | 263.5% slower |
-| PostgreSQL | 30.71 ms | 4,207% slower |
+| **UltraSQL** | 631.50 µs | — |
+| DuckDB | 850.00 µs | 34.6% slower |
+| SQLite | 1.92 ms | 204.3% slower |
+| ClickHouse | 2.89 ms | 357.8% slower |
+| PostgreSQL | 28.89 ms | 4,475% slower |
 <!-- END AUTO: BENCH:select_scan_10k -->
 
 <!-- BEGIN AUTO: BENCH:update_throughput_10k -->
@@ -198,11 +198,11 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 179.54 µs | — |
-| DuckDB | 185.52 µs | 3.3% slower |
-| SQLite | 453.02 µs | 152.3% slower |
-| ClickHouse | 19.80 ms | 10,926% slower |
-| PostgreSQL | 58.61 ms | 32,544% slower |
+| **UltraSQL** | 144.75 µs | — |
+| DuckDB | 186.29 µs | 28.7% slower |
+| SQLite | 465.92 µs | 221.9% slower |
+| ClickHouse | 7.60 ms | 5,148% slower |
+| PostgreSQL | 45.92 ms | 31,624% slower |
 <!-- END AUTO: BENCH:update_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:delete_throughput_10k -->
@@ -210,11 +210,11 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 165.29 µs | — |
-| SQLite | 549.17 µs | 232.2% slower |
-| DuckDB | 2.06 ms | 1,144% slower |
-| ClickHouse | 19.85 ms | 11,911% slower |
-| PostgreSQL | 25.64 ms | 15,409% slower |
+| **UltraSQL** | 151.54 µs | — |
+| SQLite | 545.23 µs | 259.8% slower |
+| DuckDB | 1.98 ms | 1,208% slower |
+| ClickHouse | 9.60 ms | 6,235% slower |
+| PostgreSQL | 24.45 ms | 16,032% slower |
 <!-- END AUTO: BENCH:delete_throughput_10k -->
 
 <!-- BEGIN AUTO: BENCH:mixed_oltp_pgbench_like -->
@@ -222,11 +222,11 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 129.67 µs | — |
-| SQLite | 384.95 µs | 196.9% slower |
-| DuckDB | 1.31 ms | 907% slower |
-| PostgreSQL | 12.35 ms | 9,421% slower |
-| ClickHouse | 27.37 ms | 21,006% slower |
+| **UltraSQL** | 122.49 µs | — |
+| SQLite | 347.37 µs | 183.6% slower |
+| DuckDB | 1.25 ms | 918% slower |
+| PostgreSQL | 11.98 ms | 9,677% slower |
+| ClickHouse | 25.00 ms | 20,306% slower |
 <!-- END AUTO: BENCH:mixed_oltp_pgbench_like -->
 
 <!-- BEGIN AUTO: BENCH:window_row_number_65k_i64 -->
@@ -234,11 +234,11 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 
 | Engine | Median | vs fastest |
 | --- | ---: | ---: |
-| **UltraSQL** | 4.52 ms | — |
-| DuckDB | 7.79 ms | 72.2% slower |
-| ClickHouse | 11.57 ms | 155.8% slower |
-| SQLite | 30.35 ms | 571.2% slower |
-| PostgreSQL | 51.47 ms | 1,038% slower |
+| **UltraSQL** | 4.59 ms | — |
+| DuckDB | 7.22 ms | 57.3% slower |
+| ClickHouse | 12.39 ms | 170.0% slower |
+| SQLite | 29.86 ms | 550.6% slower |
+| PostgreSQL | 46.30 ms | 909% slower |
 <!-- END AUTO: BENCH:window_row_number_65k_i64 -->
 
 Per-kernel microbenchmarks (in-process, no SQL surface) are kept under

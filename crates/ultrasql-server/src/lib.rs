@@ -64,14 +64,15 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{CatalogSnapshot, MutableCatalog, PersistentCatalog, StatisticRow};
-use ultrasql_core::{PageId, RelationId};
-use ultrasql_executor::RowCodec;
+use ultrasql_core::{PageId, RelationId, Value};
+use ultrasql_executor::{MemTableScan, RowCodec};
 use ultrasql_optimizer::{
     AnalyzeOptions, AnalyzeRunner, InMemoryStatsCatalog, PgStatisticRow, PlanCache,
     PlanCacheConfig, StatsCatalog,
 };
 use ultrasql_planner::{
-    Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan, ScalarExpr, TableMeta,
+    AggregateFunc, BinaryOp, Catalog as PlannerCatalog, InMemoryCatalog, LogicalPlan,
+    ScalarExpr, TableMeta,
 };
 use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
@@ -79,7 +80,13 @@ use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::page::Page;
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::{IsolationLevel, SsiManager, Transaction, TransactionManager};
+use ultrasql_vec::Batch;
 use ultrasql_vec::column::Column;
+use ultrasql_vec::column::NumericColumn;
+use ultrasql_vec::kernels::{
+    CmpOp, cmp_i32_scalar, cmp_i64_scalar, filter_sum_i32_widening_gt, filter_sum_i64_gt,
+    sum_i32_widening, sum_i32_widening_with_mask, sum_i64, sum_i64_with_mask,
+};
 
 pub use error::ServerError;
 pub use pipeline::{LowerCtx, SampleTables, build_sample_database};
@@ -1195,6 +1202,412 @@ pub(crate) fn try_run_cached_int32_pair_select(
         }
     }
     Some(result)
+}
+
+pub(crate) fn try_run_cached_scalar_aggregate_select(
+    plan: &LogicalPlan,
+    catalog_snapshot: &Arc<CatalogSnapshot>,
+    heap: &HeapAccess<BlankPageLoader>,
+    stream_buf: &mut bytes::BytesMut,
+) -> Option<SelectResult> {
+    let (aggregate_input, group_by, aggregates, output_schema) = match plan {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            schema,
+        } => {
+            let passthrough = exprs.iter().enumerate().all(|(idx, (expr, _name))| {
+                matches!(expr, ScalarExpr::Column { index, .. } if *index == idx)
+            });
+            if !passthrough {
+                return None;
+            }
+            let LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggregates,
+                ..
+            } = input.as_ref()
+            else {
+                return None;
+            };
+            (input.as_ref(), group_by.as_slice(), aggregates.as_slice(), schema)
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggregates,
+            schema,
+        } => (input.as_ref(), group_by.as_slice(), aggregates.as_slice(), schema),
+        _ => return None,
+    };
+
+    if !group_by.is_empty() || aggregates.len() != 1 || output_schema.len() != 1 {
+        return None;
+    }
+
+    let agg = &aggregates[0];
+    if agg.distinct {
+        return None;
+    }
+
+    let (table, predicate) = match aggregate_input {
+        LogicalPlan::Scan { table, .. } => (table.as_str(), None),
+        LogicalPlan::Filter { input, predicate } => {
+            let LogicalPlan::Scan { table, .. } = input.as_ref() else {
+                return None;
+            };
+            (table.as_str(), Some(predicate))
+        }
+        _ => return None,
+    };
+
+    let folded = table.to_ascii_lowercase();
+    let entry = catalog_snapshot.tables.get(&folded)?;
+    let rel = RelationId(entry.oid);
+    let cached = heap.column_cache.get(rel)?;
+
+    let cache_key = build_cached_scalar_wire_key(agg, output_schema, predicate)?;
+    if let Some(encoded) = cached.cached_scalar_aggregate_wire.read().get(&cache_key).cloned() {
+        return Some(result_encoder::run_shared_preencoded_select_streamed(
+            encoded, 1,
+        ));
+    }
+
+    let result_col = match (agg.func, &agg.arg, predicate) {
+        (AggregateFunc::Sum, Some(ScalarExpr::Column { index, data_type, .. }), None) => {
+            build_cached_sum_column(*index, data_type, &cached.columns)?
+        }
+        (AggregateFunc::Avg, Some(ScalarExpr::Column { index, data_type, .. }), None) => {
+            build_cached_avg_column(*index, data_type, &cached.columns)?
+        }
+        (
+            AggregateFunc::Sum,
+            Some(ScalarExpr::Column { index, data_type, .. }),
+            Some(predicate),
+        ) => build_cached_filter_sum_column(*index, data_type, predicate, &cached.columns)?,
+        _ => return None,
+    };
+
+    let batch = Batch::new([result_col]).ok()?;
+    let mut op = MemTableScan::new(output_schema.clone(), vec![batch]);
+    let result = result_encoder::run_select_streamed(&mut op, stream_buf).ok()?;
+    if let Some(body) = result.streamed_body.as_ref() {
+        let mut slot = cached.cached_scalar_aggregate_wire.write();
+        slot.entry(cache_key)
+            .or_insert_with(|| Arc::<[u8]>::from(body.as_ref()));
+    }
+    Some(result)
+}
+
+fn build_cached_scalar_wire_key(
+    agg: &ultrasql_planner::LogicalAggregateExpr,
+    output_schema: &ultrasql_core::Schema,
+    predicate: Option<&ScalarExpr>,
+) -> Option<ultrasql_storage::column_cache::CachedScalarAggregateWireKey> {
+    let output_name = output_schema.field_at(0).name.clone();
+    match (agg.func, &agg.arg, predicate) {
+        (AggregateFunc::Sum, Some(ScalarExpr::Column { index, data_type, .. }), None) => {
+            Some(ultrasql_storage::column_cache::CachedScalarAggregateWireKey::Sum {
+                output_name,
+                input_type_tag: scalar_input_type_tag(data_type)?,
+                sum_col: *index,
+            })
+        }
+        (AggregateFunc::Avg, Some(ScalarExpr::Column { index, data_type, .. }), None) => {
+            Some(ultrasql_storage::column_cache::CachedScalarAggregateWireKey::Avg {
+                output_name,
+                input_type_tag: scalar_input_type_tag(data_type)?,
+                sum_col: *index,
+            })
+        }
+        (
+            AggregateFunc::Sum,
+            Some(ScalarExpr::Column { index, data_type, .. }),
+            Some(expr),
+        ) => match data_type {
+            ultrasql_core::DataType::Int32 => {
+                let (predicate_col, predicate_op, predicate_lit) = extract_int32_col_op_lit(expr)?;
+                Some(
+                    ultrasql_storage::column_cache::CachedScalarAggregateWireKey::FilterSum {
+                        output_name,
+                        input_type_tag: 0,
+                        sum_col: *index,
+                        predicate_col,
+                        predicate_op_tag: cmp_op_tag(predicate_op),
+                        predicate_lit: i64::from(predicate_lit),
+                    },
+                )
+            }
+            ultrasql_core::DataType::Int64 => {
+                let (predicate_col, predicate_op, predicate_lit) = extract_int64_col_op_lit(expr)?;
+                Some(
+                    ultrasql_storage::column_cache::CachedScalarAggregateWireKey::FilterSum {
+                        output_name,
+                        input_type_tag: 1,
+                        sum_col: *index,
+                        predicate_col,
+                        predicate_op_tag: cmp_op_tag(predicate_op),
+                        predicate_lit,
+                    },
+                )
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn scalar_input_type_tag(data_type: &ultrasql_core::DataType) -> Option<u8> {
+    match data_type {
+        ultrasql_core::DataType::Int32 => Some(0),
+        ultrasql_core::DataType::Int64 => Some(1),
+        _ => None,
+    }
+}
+
+const fn cmp_op_tag(op: CmpOp) -> u8 {
+    match op {
+        CmpOp::Eq => 0,
+        CmpOp::Ne => 1,
+        CmpOp::Lt => 2,
+        CmpOp::Le => 3,
+        CmpOp::Gt => 4,
+        CmpOp::Ge => 5,
+    }
+}
+
+fn build_cached_sum_column(
+    sum_col: usize,
+    data_type: &ultrasql_core::DataType,
+    columns: &[Column],
+) -> Option<Column> {
+    match data_type {
+        ultrasql_core::DataType::Int32 => {
+            let Column::Int32(col) = columns.get(sum_col)? else {
+                return None;
+            };
+            if col.nulls().is_some() {
+                return None;
+            }
+            if col.len() == 0 {
+                Some(null_int64_column())
+            } else {
+                Some(Column::Int64(NumericColumn::from_data(vec![sum_i32_widening(
+                    col,
+                )])))
+            }
+        }
+        ultrasql_core::DataType::Int64 => {
+            let Column::Int64(col) = columns.get(sum_col)? else {
+                return None;
+            };
+            if col.nulls().is_some() {
+                return None;
+            }
+            if col.len() == 0 {
+                Some(null_int64_column())
+            } else {
+                Some(Column::Int64(NumericColumn::from_data(vec![sum_i64(col)])))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn build_cached_avg_column(
+    sum_col: usize,
+    data_type: &ultrasql_core::DataType,
+    columns: &[Column],
+) -> Option<Column> {
+    match data_type {
+        ultrasql_core::DataType::Int32 => {
+            let Column::Int32(col) = columns.get(sum_col)? else {
+                return None;
+            };
+            if col.nulls().is_some() {
+                return None;
+            }
+            if col.len() == 0 {
+                Some(null_float64_column())
+            } else {
+                let avg = (sum_i32_widening(col) as f64) / (col.len() as f64);
+                Some(Column::Float64(NumericColumn::from_data(vec![avg])))
+            }
+        }
+        ultrasql_core::DataType::Int64 => {
+            let Column::Int64(col) = columns.get(sum_col)? else {
+                return None;
+            };
+            if col.nulls().is_some() {
+                return None;
+            }
+            if col.len() == 0 {
+                Some(null_float64_column())
+            } else {
+                let avg = (sum_i64(col) as f64) / (col.len() as f64);
+                Some(Column::Float64(NumericColumn::from_data(vec![avg])))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn build_cached_filter_sum_column(
+    sum_col: usize,
+    data_type: &ultrasql_core::DataType,
+    predicate: &ScalarExpr,
+    columns: &[Column],
+) -> Option<Column> {
+    match data_type {
+        ultrasql_core::DataType::Int32 => {
+            let (pred_col, pred_op, pred_lit) = extract_int32_col_op_lit(predicate)?;
+            let (Column::Int32(pred), Column::Int32(sum)) =
+                (columns.get(pred_col)?, columns.get(sum_col)?)
+            else {
+                return None;
+            };
+            if pred.nulls().is_some() || sum.nulls().is_some() {
+                return None;
+            }
+            if sum.len() == 0 {
+                return Some(null_int64_column());
+            }
+            let total = if pred_col == sum_col && matches!(pred_op, CmpOp::Gt) {
+                filter_sum_i32_widening_gt(sum.data(), pred_lit)
+            } else {
+                let mask = cmp_i32_scalar(pred, pred_lit, pred_op);
+                sum_i32_widening_with_mask(sum, &mask)
+            };
+            Some(Column::Int64(NumericColumn::from_data(vec![total])))
+        }
+        ultrasql_core::DataType::Int64 => {
+            let (pred_col, pred_op, pred_lit) = extract_int64_col_op_lit(predicate)?;
+            let (Column::Int64(pred), Column::Int64(sum)) =
+                (columns.get(pred_col)?, columns.get(sum_col)?)
+            else {
+                return None;
+            };
+            if pred.nulls().is_some() || sum.nulls().is_some() {
+                return None;
+            }
+            if sum.len() == 0 {
+                return Some(null_int64_column());
+            }
+            let total = if pred_col == sum_col && matches!(pred_op, CmpOp::Gt) {
+                filter_sum_i64_gt(sum.data(), pred_lit)
+            } else {
+                let mask = cmp_i64_scalar(pred, pred_lit, pred_op);
+                sum_i64_with_mask(sum, &mask)
+            };
+            Some(Column::Int64(NumericColumn::from_data(vec![total])))
+        }
+        _ => None,
+    }
+}
+
+fn extract_int32_col_op_lit(expr: &ScalarExpr) -> Option<(usize, CmpOp, i32)> {
+    let ScalarExpr::Binary {
+        op, left, right, ..
+    } = expr
+    else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (
+            ScalarExpr::Column {
+                index,
+                data_type: ultrasql_core::DataType::Int32,
+                ..
+            },
+            ScalarExpr::Literal {
+                value: Value::Int32(lit),
+                ..
+            },
+        ) => Some((*index, binary_op_to_cmp(*op)?, *lit)),
+        (
+            ScalarExpr::Literal {
+                value: Value::Int32(lit),
+                ..
+            },
+            ScalarExpr::Column {
+                index,
+                data_type: ultrasql_core::DataType::Int32,
+                ..
+            },
+        ) => Some((*index, reverse_binary_op_to_cmp(*op)?, *lit)),
+        _ => None,
+    }
+}
+
+fn extract_int64_col_op_lit(expr: &ScalarExpr) -> Option<(usize, CmpOp, i64)> {
+    let ScalarExpr::Binary {
+        op, left, right, ..
+    } = expr
+    else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (
+            ScalarExpr::Column {
+                index,
+                data_type: ultrasql_core::DataType::Int64,
+                ..
+            },
+            ScalarExpr::Literal {
+                value: Value::Int64(lit),
+                ..
+            },
+        ) => Some((*index, binary_op_to_cmp(*op)?, *lit)),
+        (
+            ScalarExpr::Literal {
+                value: Value::Int64(lit),
+                ..
+            },
+            ScalarExpr::Column {
+                index,
+                data_type: ultrasql_core::DataType::Int64,
+                ..
+            },
+        ) => Some((*index, reverse_binary_op_to_cmp(*op)?, *lit)),
+        _ => None,
+    }
+}
+
+fn binary_op_to_cmp(op: BinaryOp) -> Option<CmpOp> {
+    match op {
+        BinaryOp::Eq => Some(CmpOp::Eq),
+        BinaryOp::NotEq => Some(CmpOp::Ne),
+        BinaryOp::Lt => Some(CmpOp::Lt),
+        BinaryOp::LtEq => Some(CmpOp::Le),
+        BinaryOp::Gt => Some(CmpOp::Gt),
+        BinaryOp::GtEq => Some(CmpOp::Ge),
+        _ => None,
+    }
+}
+
+fn reverse_binary_op_to_cmp(op: BinaryOp) -> Option<CmpOp> {
+    match op {
+        BinaryOp::Eq => Some(CmpOp::Eq),
+        BinaryOp::NotEq => Some(CmpOp::Ne),
+        BinaryOp::Lt => Some(CmpOp::Gt),
+        BinaryOp::LtEq => Some(CmpOp::Ge),
+        BinaryOp::Gt => Some(CmpOp::Lt),
+        BinaryOp::GtEq => Some(CmpOp::Le),
+        _ => None,
+    }
+}
+
+fn null_int64_column() -> Column {
+    let mut nulls = ultrasql_vec::Bitmap::new(1, false);
+    nulls.set(0, false);
+    Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+}
+
+fn null_float64_column() -> Column {
+    let mut nulls = ultrasql_vec::Bitmap::new(1, false);
+    nulls.set(0, false);
+    Column::Float64(NumericColumn::with_nulls(vec![0.0_f64], nulls).expect("matching lengths"))
 }
 
 fn decode_key_column(

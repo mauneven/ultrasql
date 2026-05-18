@@ -1,1 +1,1 @@
-{"engine":"duckdb","workload":"window_row_number_65k_i64","n_rows":65536,"samples":4,"median_us":7785.812,"min_us":6596.666,"iterations_us":[6596.6660040430725, 7596.332987304777, 7975.2909950912, 8169.082982931286]}
+{"engine":"duckdb","workload":"window_row_number_65k_i64","n_rows":65536,"samples":4,"median_us":7217.542,"min_us":6465.000,"iterations_us":[6465.0000422261655, 7331.541972234845, 7226.624991744757, 7208.458031527698]}

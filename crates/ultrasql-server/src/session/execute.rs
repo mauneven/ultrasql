@@ -43,6 +43,7 @@ use crate::result_encoder::{
 use crate::{
     BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
     run_plan_in_txn, try_run_cached_int32_pair_select,
+    try_run_cached_scalar_aggregate_select,
 };
 
 #[derive(Debug)]
@@ -702,14 +703,23 @@ where
         // the normal machinery so `ReadyForQuery` state and command-id
         // progression stay unchanged there.
         if matches!(self.txn_state, TxnState::Idle)
-            && let Some(result) = try_run_cached_int32_pair_select(
+        {
+            if let Some(result) = try_run_cached_int32_pair_select(
                 plan,
                 catalog_snapshot,
                 self.state.heap.as_ref(),
                 &mut self.write_buf,
-            )
-        {
-            return Ok(result);
+            ) {
+                return Ok(result);
+            }
+            if let Some(result) = try_run_cached_scalar_aggregate_select(
+                plan,
+                catalog_snapshot,
+                self.state.heap.as_ref(),
+                &mut self.write_buf,
+            ) {
+                return Ok(result);
+            }
         }
 
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {

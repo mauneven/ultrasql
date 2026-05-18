@@ -1,1 +1,1 @@
-{"engine":"postgres17","workload":"select_avg_1m_i64","n_rows":1000000,"samples":4,"median_us":37903.521,"min_us":37270.875,"iterations_us":[47378.66600044072, 37996.41702789813, 37810.62504276633, 37270.8750073798]}
+{"engine":"postgres17","workload":"select_avg_1m_i64","n_rows":1000000,"samples":4,"median_us":37937.188,"min_us":37301.167,"iterations_us":[43691.58303597942, 37301.1669726111, 38089.375011622906, 37784.99999316409]}

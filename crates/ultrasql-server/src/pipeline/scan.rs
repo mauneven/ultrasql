@@ -94,6 +94,35 @@ pub(super) fn lower_heap_scan(
     apply_projection(scan, projection)
 }
 
+/// Construct a cache-building single-threaded [`SeqScan`] for a real
+/// persistent relation.
+///
+/// Used by scalar aggregate miss paths where paying one serial scan to
+/// populate the relation's `ColumnCache` is cheaper over repeated
+/// executions than repeatedly choosing `ParallelSeqScan`, which does
+/// not publish cache entries.
+pub(super) fn lower_heap_seq_scan(
+    entry: &TableEntry,
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    let rel = RelationId(entry.oid);
+    let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
+    let codec = RowCodec::new(entry.schema.clone());
+    let mut scan = SeqScan::new_with_vm(
+        Arc::clone(&ctx.heap),
+        rel,
+        block_count,
+        ctx.snapshot.clone(),
+        Arc::clone(&ctx.oracle),
+        Arc::clone(&ctx.vm),
+        codec,
+    );
+    if let Some(flag) = &ctx.cancel_flag {
+        scan = scan.with_cancel_flag(flag.clone());
+    }
+    Ok(Box::new(scan))
+}
+
 fn apply_projection(
     scan: Box<dyn Operator>,
     projection: Option<&[usize]>,

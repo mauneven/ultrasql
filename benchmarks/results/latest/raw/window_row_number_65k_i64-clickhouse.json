@@ -1,1 +1,1 @@
-{"engine":"clickhouse","workload":"window_row_number_65k_i64","n_rows":65536,"samples":4,"median_us":11569.396,"min_us":10143.624967895448,"iterations_us":[10143.624967895448, 11724.999989382923, 11413.792031817138, 12720.500002615154]}
+{"engine":"clickhouse","workload":"window_row_number_65k_i64","n_rows":65536,"samples":4,"median_us":12391.146,"min_us":11992.333980742842,"iterations_us":[12949.125026352704, 12689.833994954824, 12092.458957340568, 11992.333980742842]}

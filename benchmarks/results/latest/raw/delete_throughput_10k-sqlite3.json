@@ -1,1 +1,1 @@
-{"engine":"sqlite3","workload":"delete_throughput_10k","n_rows":10000,"samples":4,"median_us":549.167,"min_us":533.042,"iterations_us":[623.3339663594961, 554.5419990085065, 543.7919753603637, 533.0420099198818]}
+{"engine":"sqlite3","workload":"delete_throughput_10k","n_rows":10000,"samples":4,"median_us":545.230,"min_us":542.584,"iterations_us":[545.6249928101897, 544.8340089060366, 542.5839917734265, 682.6670141890645]}
