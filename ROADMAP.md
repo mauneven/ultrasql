@@ -1090,7 +1090,16 @@ The main OLAP performance differentiator over PostgreSQL.
 - [ ] Cost-based parallel-plan selection
 
 ### MVCC Read Fast Path
-- [ ] Page-level `PD_ALL_VISIBLE` flag — skip per-tuple `oracle.status` on certified pages (Wave 6 prototype reverted due to DELETE-correctness regression; redesign needed)
+- [x] Storage-level all-visible walker fast path —
+  `HeapAccess::scan_visible_walker_with_vm` checks the visibility map at
+  block boundaries and skips per-tuple `is_visible` / `oracle.status`
+  calls on VM-certified pages. Heap insert/update/delete paths already
+  clear VM bits when callers pass the same map; regression coverage
+  verifies both the no-oracle fast path and DELETE clearing.
+- [ ] Server-owned VM plumbing and vacuum certification — production
+  `SeqScan` still needs a shared relation VM, a vacuum pass that marks
+  pages all-visible only after validating oldest-snapshot visibility,
+  and cost/plan hooks that choose the VM-aware walker.
 
 ### v0.7 Performance Wave Notes
 
@@ -1130,6 +1139,11 @@ The main OLAP performance differentiator over PostgreSQL.
   propagation, round-robin unordered fan-in, and streaming k-way sorted
   fan-in. Covered by `gather::tests::{gather_round_robins_worker_batches,
   gather_merge_preserves_global_order,gather_merge_handles_descending_inputs}`.
+- [x] Storage MVCC all-visible scan fast path —
+  `scan_visible_walker_with_vm` trusts VM-certified pages and bypasses
+  per-tuple visibility/oracle probes while preserving DELETE correctness
+  through mandatory VM clearing on mutation paths. This is a real storage
+  primitive, not yet a production server scan path.
 
 ### v0.7 Validation Snapshot
 
@@ -1149,8 +1163,9 @@ The main OLAP performance differentiator over PostgreSQL.
 - [ ] Parallel execution remains partial: fan-in collators exist, but
   `ParallelSeqScan` worker partitioning and cost-based parallel-plan
   selection are still open.
-- [ ] JIT and the page-level all-visible MVCC fast path remain open
-  checklist items.
+- [ ] JIT remains open. MVCC all-visible work is partial: storage-level
+  VM-aware walking is implemented, while server-owned VM/vacuum wiring
+  and planner selection remain open.
 
 ### Milestone
 - [ ] TPC-H scale 10 runs to completion, throughput within 2× of DuckDB

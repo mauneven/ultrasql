@@ -23,6 +23,7 @@ use ultrasql_wal::record::RecordType;
 
 use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
 use crate::page::PageError;
+use crate::vm::VisibilityMap;
 use crate::wal_sink::WalSink;
 
 use super::walker::VisibleHeapWalker;
@@ -269,6 +270,35 @@ impl<L: PageLoader> HeapAccess<L> {
         snapshot: &'a Snapshot,
         oracle: &'a O,
     ) -> VisibleHeapWalker<'a, L, O> {
+        self.scan_visible_walker_inner(rel, block_count, snapshot, oracle, None)
+    }
+
+    /// Visibility-filtered sequential scan with a visibility-map fast path.
+    ///
+    /// For pages whose VM bit is all-visible, the walker yields normal
+    /// tuples without per-tuple `is_visible` / transaction-status checks.
+    /// The caller must only pass a VM maintained by the same heap mutation
+    /// path: inserts, updates, and deletes must clear touched pages before
+    /// vacuum marks them visible again.
+    pub fn scan_visible_walker_with_vm<'a, O: XidStatusOracle + ?Sized>(
+        &'a self,
+        rel: RelationId,
+        block_count: u32,
+        snapshot: &'a Snapshot,
+        oracle: &'a O,
+        vm: &'a VisibilityMap,
+    ) -> VisibleHeapWalker<'a, L, O> {
+        self.scan_visible_walker_inner(rel, block_count, snapshot, oracle, Some(vm))
+    }
+
+    fn scan_visible_walker_inner<'a, O: XidStatusOracle + ?Sized>(
+        &'a self,
+        rel: RelationId,
+        block_count: u32,
+        snapshot: &'a Snapshot,
+        oracle: &'a O,
+        vm: Option<&'a VisibilityMap>,
+    ) -> VisibleHeapWalker<'a, L, O> {
         VisibleHeapWalker {
             pool: &self.pool,
             rel,
@@ -276,6 +306,8 @@ impl<L: PageLoader> HeapAccess<L> {
             current_block: 0,
             current_slot: 0,
             slot_count: 0,
+            vm,
+            current_block_all_visible: false,
             // Per-block bulk page copy: PAGE_SIZE bytes preallocated
             // once so the per-block `extend_from_slice(page_bytes)`
             // never reallocates. The previous per-slot read-lock /

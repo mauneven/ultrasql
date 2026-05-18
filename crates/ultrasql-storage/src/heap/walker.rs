@@ -23,6 +23,7 @@ use ultrasql_wal::record::RecordType;
 
 use crate::buffer_pool::{BufferPool, PageGuard, PageLoader};
 use crate::page::PageError;
+use crate::vm::VisibilityMap;
 use crate::wal_sink::WalSink;
 
 use super::{
@@ -48,6 +49,12 @@ pub struct VisibleHeapWalker<'a, L: PageLoader, O: XidStatusOracle + ?Sized> {
     pub(super) current_block: u32,
     pub(super) current_slot: u16,
     pub(super) slot_count: u16,
+    /// Optional VM consulted at block boundaries. When the current
+    /// page is certified all-visible, every normal tuple can skip
+    /// `is_visible` / CLOG probes because heap mutations clear this
+    /// bit before the page can be trusted again.
+    pub(super) vm: Option<&'a VisibilityMap>,
+    pub(super) current_block_all_visible: bool,
     /// `PAGE_SIZE` (8 KiB) buffer holding the most-recent **whole**
     /// block's bytes. On block transition the walker pins the page
     /// once, acquires the per-frame read lock once, memcpys the 8 KiB
@@ -128,6 +135,9 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
                         .extend_from_slice(page.as_bytes().as_slice());
                 }
                 self.current_slot = 0;
+                self.current_block_all_visible = self
+                    .vm
+                    .is_some_and(|vm| vm.is_all_visible(self.rel, page_id.block));
                 drop(guard);
             }
 
@@ -174,6 +184,12 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
             let slot_bytes = &self.page_scratch[offset..offset + length];
             let (header, _) = TupleHeader::decode(&slot_bytes[..TUPLE_HEADER_SIZE])
                 .ok_or(HeapError::MalformedHeader("header decode failed"))?;
+
+            if self.current_block_all_visible {
+                let tid = TupleId::new(page_id, slot);
+                let payload = &self.page_scratch[offset + TUPLE_HEADER_SIZE..offset + length];
+                return Ok(Some((tid, header, payload)));
+            }
 
             // Run the full visibility predicate. The cache below
             // only short-circuits the `Visible` ⇄ `Invisible` axis

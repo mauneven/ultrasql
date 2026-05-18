@@ -8,12 +8,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
 
 use parking_lot::Mutex;
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{BlockNumber, CommandId, PageId, Result, Xid};
 use ultrasql_mvcc::status::test_support::MapOracle;
+use ultrasql_mvcc::status::{XidStatus, XidStatusOracle};
 use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_mvcc::{Snapshot, Visibility, is_visible};
 
@@ -95,6 +97,33 @@ fn del_opts(xmax: u64, cmax: u32) -> DeleteOptions<'static> {
 fn make_heap(capacity: usize) -> HeapAccess<MapLoader> {
     let pool = Arc::new(BufferPool::new(capacity, MapLoader::new()));
     HeapAccess::new(pool)
+}
+
+#[derive(Debug, Default)]
+struct CountingOracle {
+    inner: MapOracle,
+    calls: AtomicUsize,
+}
+
+impl CountingOracle {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn set_committed(&self, xid: Xid) {
+        self.inner.set_committed(xid);
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(AtomicOrdering::Relaxed)
+    }
+}
+
+impl XidStatusOracle for CountingOracle {
+    fn status(&self, xid: Xid) -> XidStatus {
+        self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+        self.inner.status(xid)
+    }
 }
 
 #[test]
@@ -585,6 +614,70 @@ fn visibility_scan_includes_own_uncommitted_writes() {
 
     assert_eq!(visible.len(), 1);
     assert_eq!(visible[0].tid, own_tid);
+}
+
+#[test]
+fn visible_walker_vm_all_visible_skips_oracle_status() {
+    let heap = make_heap(16);
+    let first_tid = heap.insert(rel(), b"first", opts(100)).unwrap();
+    let second_tid = heap.insert(rel(), b"second", opts(100)).unwrap();
+
+    let vm = crate::vm::VisibilityMap::new();
+    heap.vacuum_set_all_visible(rel(), first_tid.page.block, &vm);
+
+    let oracle = CountingOracle::new();
+    oracle.set_committed(Xid::new(100));
+    let snap = committed_snap(999);
+    let blocks = heap.block_count(rel());
+    let mut walker = heap.scan_visible_walker_with_vm(rel(), blocks, &snap, &oracle, &vm);
+
+    let mut got = Vec::new();
+    while let Some((tid, _header, payload)) = walker.try_next().unwrap() {
+        got.push((tid, payload.to_vec()));
+    }
+
+    assert_eq!(
+        got,
+        vec![
+            (first_tid, b"first".to_vec()),
+            (second_tid, b"second".to_vec())
+        ]
+    );
+    assert_eq!(oracle.calls(), 0);
+}
+
+#[test]
+fn visible_walker_vm_clear_after_delete_restores_visibility_checks() {
+    let heap = make_heap(16);
+    let tid = heap.insert(rel(), b"gone", opts(100)).unwrap();
+
+    let vm = crate::vm::VisibilityMap::new();
+    heap.vacuum_set_all_visible(rel(), tid.page.block, &vm);
+    assert!(vm.is_all_visible(rel(), tid.page.block));
+
+    heap.delete(
+        tid,
+        DeleteOptions {
+            xmax: Xid::new(200),
+            cmax: CommandId::FIRST,
+            wal: None,
+            fsm: None,
+            vm: Some(&vm),
+        },
+    )
+    .unwrap();
+
+    assert!(!vm.is_all_visible(rel(), tid.page.block));
+
+    let oracle = CountingOracle::new();
+    oracle.set_committed(Xid::new(100));
+    oracle.set_committed(Xid::new(200));
+    let snap = committed_snap(999);
+    let blocks = heap.block_count(rel());
+    let mut walker = heap.scan_visible_walker_with_vm(rel(), blocks, &snap, &oracle, &vm);
+
+    assert!(walker.try_next().unwrap().is_none());
+    assert!(oracle.calls() > 0);
 }
 
 // Property test: for any set of inserts + random deletes, the
