@@ -847,7 +847,7 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
 /// the diagnostic precise: unknown function names still report
 /// `non-aggregate function calls`.
 #[allow(dead_code)]
-fn is_supported_builtin(func_name: &str) -> bool {
+pub(super) fn is_supported_builtin(func_name: &str) -> bool {
     matches!(func_name, "extract" | "substring")
 }
 

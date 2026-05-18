@@ -451,13 +451,21 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
 /// strict on the outer side, an analysis the v0.6 optimizer does not yet
 /// perform. The conservative answer is "no reorder anywhere in the chain".
 fn reorder_inner_join_chain(plan: &LogicalPlan) -> LogicalPlan {
-    let mut leaves: Vec<LogicalPlan> = Vec::new();
+    if !leftmost_inner_join_is_cross(plan) {
+        return plan.clone();
+    }
+
+    let mut leaves: Vec<JoinLeaf> = Vec::new();
     let mut conditions: Vec<ScalarExpr> = Vec::new();
-    collect_inner_join_leaves(plan, &mut leaves, &mut conditions);
+    let mut next_start = 0;
+    collect_inner_join_leaves(plan, &mut leaves, &mut conditions, &mut next_start);
 
     // If any leaf carries an outer-join barrier, the brief's "skip
     // enumeration entirely for that subtree (safest)" rule kicks in.
-    if leaves.iter().any(outer_join_subtree_is_barrier) {
+    if leaves
+        .iter()
+        .any(|leaf| outer_join_subtree_is_barrier(&leaf.plan))
+    {
         return plan.clone();
     }
 
@@ -466,16 +474,54 @@ fn reorder_inner_join_chain(plan: &LogicalPlan) -> LogicalPlan {
         return plan.clone();
     }
     if leaves.len() == 1 {
-        return leaves.into_iter().next().unwrap_or_else(|| plan.clone());
+        return leaves
+            .into_iter()
+            .map(|leaf| leaf.plan)
+            .next()
+            .unwrap_or_else(|| plan.clone());
     }
 
-    let enumerator = choose_enumerator(leaves.len());
-    let mut produced = enumerator.enumerate(&leaves, &conditions);
-    produced.pop().unwrap_or_else(|| plan.clone())
+    let order = greedy_connected_order(&leaves, &conditions);
+    if order == (0..leaves.len()).collect::<Vec<_>>() {
+        return plan.clone();
+    }
+    let Some(reordered) = build_ordered_join_tree(&leaves, &conditions, &order) else {
+        return plan.clone();
+    };
+    restore_original_join_schema(reordered, &leaves, &order, plan.schema())
+}
+
+fn leftmost_inner_join_is_cross(plan: &LogicalPlan) -> bool {
+    let LogicalPlan::Join {
+        left,
+        join_type: LogicalJoinType::Inner | LogicalJoinType::Cross,
+        condition,
+        ..
+    } = plan
+    else {
+        return false;
+    };
+    if matches!(
+        left.as_ref(),
+        LogicalPlan::Join {
+            join_type: LogicalJoinType::Inner | LogicalJoinType::Cross,
+            ..
+        }
+    ) {
+        return leftmost_inner_join_is_cross(left);
+    }
+    matches!(condition, LogicalJoinCondition::None)
+}
+
+#[derive(Clone)]
+struct JoinLeaf {
+    plan: LogicalPlan,
+    start: usize,
+    width: usize,
 }
 
 /// Recursive walker that flattens an inner-join spine into `(leaves,
-/// conditions)`.
+/// conditions)` and records each leaf's column range in original output order.
 ///
 /// - `LogicalPlan::Join { join_type: Inner | Cross, .. }` → descend into
 ///   both children (continue flattening the spine).
@@ -484,8 +530,9 @@ fn reorder_inner_join_chain(plan: &LogicalPlan) -> LogicalPlan {
 ///   an outer-join barrier ended up under an inner-join spine and abort.
 fn collect_inner_join_leaves(
     plan: &LogicalPlan,
-    leaves: &mut Vec<LogicalPlan>,
+    leaves: &mut Vec<JoinLeaf>,
     conditions: &mut Vec<ScalarExpr>,
+    next_start: &mut usize,
 ) {
     if let LogicalPlan::Join {
         left,
@@ -495,15 +542,340 @@ fn collect_inner_join_leaves(
         ..
     } = plan
     {
-        collect_inner_join_leaves(left, leaves, conditions);
-        collect_inner_join_leaves(right, leaves, conditions);
+        collect_inner_join_leaves(left, leaves, conditions, next_start);
+        collect_inner_join_leaves(right, leaves, conditions, next_start);
         if let LogicalJoinCondition::On(pred) = condition {
-            conditions.push(pred.clone());
+            conditions.extend(split_and(pred));
         }
         return;
     }
 
-    leaves.push(plan.clone());
+    let width = plan.schema().len();
+    leaves.push(JoinLeaf {
+        plan: plan.clone(),
+        start: *next_start,
+        width,
+    });
+    *next_start += width;
+}
+
+fn greedy_connected_order(leaves: &[JoinLeaf], conditions: &[ScalarExpr]) -> Vec<usize> {
+    let mut order = Vec::with_capacity(leaves.len());
+    let mut used = vec![false; leaves.len()];
+    let first = (0..leaves.len())
+        .min_by_key(|&idx| leaf_rank(&leaves[idx].plan))
+        .unwrap_or(0);
+    order.push(first);
+    used[first] = true;
+
+    while order.len() < leaves.len() {
+        let current_mask = mask_for_order(&order);
+        let mut best: Option<(usize, usize, (u8, usize))> = None;
+        for idx in 0..leaves.len() {
+            if used[idx] {
+                continue;
+            }
+            let candidate_mask = current_mask | (1_u64 << idx);
+            let edge_count = conditions
+                .iter()
+                .filter_map(|condition| condition_leaf_mask(condition, leaves))
+                .filter(|&mask| {
+                    mask & (1_u64 << idx) != 0
+                        && mask & current_mask != 0
+                        && mask & !candidate_mask == 0
+                })
+                .count();
+            let rank = leaf_rank(&leaves[idx].plan);
+            if best.as_ref().is_none_or(|(_, best_edges, best_rank)| {
+                edge_count > *best_edges || (edge_count == *best_edges && rank < *best_rank)
+            }) {
+                best = Some((idx, edge_count, rank));
+            }
+        }
+        let next = best.map_or_else(
+            || {
+                (0..leaves.len())
+                    .filter(|&idx| !used[idx])
+                    .min_by_key(|&idx| leaf_rank(&leaves[idx].plan))
+                    .unwrap_or(0)
+            },
+            |(idx, _, _)| idx,
+        );
+        order.push(next);
+        used[next] = true;
+    }
+    order
+}
+
+fn leaf_rank(plan: &LogicalPlan) -> (u8, usize) {
+    match plan {
+        LogicalPlan::Filter { input, .. } => (0, input.schema().len()),
+        _ => (1, plan.schema().len()),
+    }
+}
+
+fn mask_for_order(order: &[usize]) -> u64 {
+    order.iter().fold(0_u64, |mask, idx| mask | (1_u64 << idx))
+}
+
+fn condition_leaf_mask(condition: &ScalarExpr, leaves: &[JoinLeaf]) -> Option<u64> {
+    let mut mask = 0_u64;
+    collect_condition_leaf_mask(condition, leaves, &mut mask)?;
+    Some(mask)
+}
+
+fn collect_condition_leaf_mask(
+    expr: &ScalarExpr,
+    leaves: &[JoinLeaf],
+    mask: &mut u64,
+) -> Option<()> {
+    match expr {
+        ScalarExpr::Column { index, .. } => {
+            let leaf_idx = leaf_for_column(*index, leaves)?;
+            *mask |= 1_u64 << leaf_idx;
+            Some(())
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            collect_condition_leaf_mask(left, leaves, mask)?;
+            collect_condition_leaf_mask(right, leaves, mask)
+        }
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => {
+            collect_condition_leaf_mask(expr, leaves, mask)
+        }
+        ScalarExpr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_condition_leaf_mask(arg, leaves, mask)?;
+            }
+            Some(())
+        }
+        ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => Some(()),
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => None,
+    }
+}
+
+fn leaf_for_column(index: usize, leaves: &[JoinLeaf]) -> Option<usize> {
+    leaves
+        .iter()
+        .position(|leaf| index >= leaf.start && index < leaf.start + leaf.width)
+}
+
+fn build_ordered_join_tree(
+    leaves: &[JoinLeaf],
+    conditions: &[ScalarExpr],
+    order: &[usize],
+) -> Option<LogicalPlan> {
+    let first = *order.first()?;
+    let mut current = leaves[first].plan.clone();
+    let mut current_order = vec![first];
+    let mut used_conditions = vec![false; conditions.len()];
+
+    for &right_idx in &order[1..] {
+        let current_mask = mask_for_order(&current_order);
+        let candidate_mask = current_mask | (1_u64 << right_idx);
+        let mut join_conditions = Vec::new();
+        for (condition_idx, condition) in conditions.iter().enumerate() {
+            if used_conditions[condition_idx] {
+                continue;
+            }
+            let Some(mask) = condition_leaf_mask(condition, leaves) else {
+                continue;
+            };
+            if mask & (1_u64 << right_idx) != 0
+                && mask & current_mask != 0
+                && mask & !candidate_mask == 0
+            {
+                let remapped =
+                    remap_condition_for_join(condition, &current_order, right_idx, leaves)?;
+                join_conditions.push(remapped);
+                used_conditions[condition_idx] = true;
+            }
+        }
+
+        let right = leaves[right_idx].plan.clone();
+        let schema = concat_schemas(current.schema(), right.schema());
+        current = LogicalPlan::Join {
+            left: Box::new(current),
+            right: Box::new(right),
+            join_type: LogicalJoinType::Inner,
+            condition: conjuncts_to_join_condition(join_conditions),
+            schema,
+        };
+        current_order.push(right_idx);
+    }
+
+    Some(current)
+}
+
+fn remap_condition_for_join(
+    expr: &ScalarExpr,
+    left_order: &[usize],
+    right_idx: usize,
+    leaves: &[JoinLeaf],
+) -> Option<ScalarExpr> {
+    match expr {
+        ScalarExpr::Column {
+            name,
+            index,
+            data_type,
+        } => {
+            let leaf_idx = leaf_for_column(*index, leaves)?;
+            let offset = index.checked_sub(leaves[leaf_idx].start)?;
+            let left_width = output_width(left_order, leaves);
+            let remapped = if leaf_idx == right_idx {
+                left_width + offset
+            } else {
+                output_offset(left_order, leaf_idx, leaves)? + offset
+            };
+            Some(ScalarExpr::Column {
+                name: name.clone(),
+                index: remapped,
+                data_type: data_type.clone(),
+            })
+        }
+        ScalarExpr::Binary {
+            op,
+            left,
+            right,
+            data_type,
+        } => Some(ScalarExpr::Binary {
+            op: *op,
+            left: Box::new(remap_condition_for_join(
+                left, left_order, right_idx, leaves,
+            )?),
+            right: Box::new(remap_condition_for_join(
+                right, left_order, right_idx, leaves,
+            )?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Unary {
+            op,
+            expr,
+            data_type,
+        } => Some(ScalarExpr::Unary {
+            op: *op,
+            expr: Box::new(remap_condition_for_join(
+                expr, left_order, right_idx, leaves,
+            )?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::IsNull { expr, negated } => Some(ScalarExpr::IsNull {
+            expr: Box::new(remap_condition_for_join(
+                expr, left_order, right_idx, leaves,
+            )?),
+            negated: *negated,
+        }),
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => Some(ScalarExpr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| remap_condition_for_join(arg, left_order, right_idx, leaves))
+                .collect::<Option<Vec<_>>>()?,
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. } => Some(expr.clone()),
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => None,
+    }
+}
+
+fn output_width(order: &[usize], leaves: &[JoinLeaf]) -> usize {
+    order.iter().map(|&idx| leaves[idx].width).sum()
+}
+
+fn output_offset(order: &[usize], leaf_idx: usize, leaves: &[JoinLeaf]) -> Option<usize> {
+    let mut offset = 0;
+    for &idx in order {
+        if idx == leaf_idx {
+            return Some(offset);
+        }
+        offset += leaves[idx].width;
+    }
+    None
+}
+
+fn conjuncts_to_join_condition(mut conditions: Vec<ScalarExpr>) -> LogicalJoinCondition {
+    if conditions.is_empty() {
+        return LogicalJoinCondition::None;
+    }
+    let mut result = conditions.remove(0);
+    for condition in conditions {
+        result = ScalarExpr::Binary {
+            op: ultrasql_planner::BinaryOp::And,
+            left: Box::new(result),
+            right: Box::new(condition),
+            data_type: ultrasql_core::DataType::Bool,
+        };
+    }
+    LogicalJoinCondition::On(result)
+}
+
+fn concat_schemas(
+    left: &ultrasql_core::Schema,
+    right: &ultrasql_core::Schema,
+) -> ultrasql_core::Schema {
+    let mut fields = Vec::with_capacity(left.len() + right.len());
+    for idx in 0..left.len() {
+        fields.push(left.field_at(idx).clone());
+    }
+    for idx in 0..right.len() {
+        fields.push(right.field_at(idx).clone());
+    }
+    ultrasql_core::Schema::new(fields).unwrap_or_else(|_| ultrasql_core::Schema::empty())
+}
+
+fn restore_original_join_schema(
+    input: LogicalPlan,
+    leaves: &[JoinLeaf],
+    physical_order: &[usize],
+    original_schema: &ultrasql_core::Schema,
+) -> LogicalPlan {
+    let mut exprs = Vec::with_capacity(original_schema.len());
+    for (leaf_idx, leaf) in leaves.iter().enumerate() {
+        let Some(base) = output_offset(physical_order, leaf_idx, leaves) else {
+            return input;
+        };
+        for col_offset in 0..leaf.width {
+            let field = leaf.plan.schema().field_at(col_offset);
+            exprs.push((
+                ScalarExpr::Column {
+                    name: field.name.clone(),
+                    index: base + col_offset,
+                    data_type: field.data_type.clone(),
+                },
+                field.name.clone(),
+            ));
+        }
+    }
+    LogicalPlan::Project {
+        input: Box::new(input),
+        exprs,
+        schema: original_schema.clone(),
+    }
+}
+
+fn split_and(expr: &ScalarExpr) -> Vec<ScalarExpr> {
+    match expr {
+        ScalarExpr::Binary {
+            op: ultrasql_planner::BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            let mut out = split_and(left);
+            out.extend(split_and(right));
+            out
+        }
+        other => vec![other.clone()],
+    }
 }
 
 // ============================================================================
@@ -573,6 +945,42 @@ mod tests {
         }
     }
 
+    fn filter(plan: LogicalPlan) -> LogicalPlan {
+        LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: ScalarExpr::Literal {
+                value: ultrasql_core::Value::Bool(true),
+                data_type: DataType::Bool,
+            },
+        }
+    }
+
+    fn col(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.to_owned(),
+            index,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn eq(left: ScalarExpr, right: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: ultrasql_planner::BinaryOp::Eq,
+            left: Box::new(left),
+            right: Box::new(right),
+            data_type: DataType::Bool,
+        }
+    }
+
+    fn and(left: ScalarExpr, right: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: ultrasql_planner::BinaryOp::And,
+            left: Box::new(left),
+            right: Box::new(right),
+            data_type: DataType::Bool,
+        }
+    }
+
     fn concat_schemas(left: &Schema, right: &Schema) -> Schema {
         let mut fields = Vec::with_capacity(left.len() + right.len());
         for i in 0..left.len() {
@@ -607,6 +1015,69 @@ mod tests {
         // join, so the whole subtree must report as a barrier.
         let plan = inner(scan("a"), left_outer(scan("b"), scan("c")));
         assert!(outer_join_subtree_is_barrier(&plan));
+    }
+
+    #[test]
+    fn reorder_inner_joins_avoids_initial_cross_and_restores_schema() {
+        let a = filter(scan("a"));
+        let b = scan("b");
+        let c = scan("c");
+        let ab_schema = concat_schemas(a.schema(), b.schema());
+        let ab = LogicalPlan::Join {
+            left: Box::new(a),
+            right: Box::new(b),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::None,
+            schema: ab_schema,
+        };
+        let abc_schema = concat_schemas(ab.schema(), c.schema());
+        let plan = LogicalPlan::Join {
+            left: Box::new(ab),
+            right: Box::new(c),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::On(and(
+                eq(col("a", 0), col("c", 2)),
+                eq(col("b", 1), col("c", 2)),
+            )),
+            schema: abc_schema,
+        };
+
+        let reordered = reorder_inner_joins(&plan);
+        let LogicalPlan::Project { exprs, schema, .. } = reordered else {
+            panic!("reorder should restore original output through Project");
+        };
+        assert_eq!(schema.field_at(0).name, "a");
+        assert_eq!(schema.field_at(1).name, "b");
+        assert_eq!(schema.field_at(2).name, "c");
+        assert!(matches!(&exprs[0].0, ScalarExpr::Column { index: 0, .. }));
+        assert!(matches!(&exprs[1].0, ScalarExpr::Column { index: 2, .. }));
+        assert!(matches!(&exprs[2].0, ScalarExpr::Column { index: 1, .. }));
+    }
+
+    #[test]
+    fn reorder_inner_joins_leaves_connected_leftmost_pair_unchanged() {
+        let a = filter(scan("a"));
+        let b = scan("b");
+        let c = scan("c");
+        let ab_schema = concat_schemas(a.schema(), b.schema());
+        let ab = LogicalPlan::Join {
+            left: Box::new(a),
+            right: Box::new(b),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::On(eq(col("a", 0), col("b", 1))),
+            schema: ab_schema,
+        };
+        let abc_schema = concat_schemas(ab.schema(), c.schema());
+        let plan = LogicalPlan::Join {
+            left: Box::new(ab),
+            right: Box::new(c),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::On(eq(col("b", 1), col("c", 2))),
+            schema: abc_schema,
+        };
+
+        let reordered = reorder_inner_joins(&plan);
+        assert_eq!(reordered, plan);
     }
 
     #[test]

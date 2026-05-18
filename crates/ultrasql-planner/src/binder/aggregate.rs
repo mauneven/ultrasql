@@ -4,7 +4,7 @@
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_parser::ast::{Expr, SelectItem};
 
-use super::expr_bind::coerce_literal_to_match;
+use super::expr_bind::{coerce_literal_to_match, is_supported_builtin};
 use super::expr_type::binary_result_type;
 use super::{
     AggregateFunc, Catalog, LogicalAggregateExpr, LogicalPlan, PlanError, ScalarExpr, ScopeEntry,
@@ -151,12 +151,21 @@ pub(super) fn bind_aggregate(
         )?;
     }
 
+    let group_aliases = group_projection_aliases(
+        &group_by,
+        select,
+        &binding_schema,
+        catalog,
+        cte_catalog,
+        scope,
+    )?;
+
     let mut out_fields: Vec<Field> = Vec::new();
     for (i, g) in group_by.iter().enumerate() {
-        let name = match g {
+        let name = group_aliases[i].clone().unwrap_or_else(|| match g {
             ScalarExpr::Column { name, .. } => name.clone(),
             _ => format!("group{i}"),
-        };
+        });
         out_fields.push(Field::nullable(name, g.data_type()));
     }
     for agg in &aggregates {
@@ -173,6 +182,40 @@ pub(super) fn bind_aggregate(
         aggregates,
         schema: agg_schema,
     })
+}
+
+fn group_projection_aliases(
+    group_by: &[ScalarExpr],
+    select: &ultrasql_parser::ast::SelectStmt,
+    binding_schema: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<Vec<Option<String>>, PlanError> {
+    let mut aliases = vec![None; group_by.len()];
+    for item in &select.projection {
+        let SelectItem::Expr {
+            expr,
+            alias: Some(alias),
+            ..
+        } = item
+        else {
+            continue;
+        };
+        if expr_has_aggregate(expr) {
+            continue;
+        }
+        let bound = bind_expr_with_ctes(expr, binding_schema, catalog, cte_catalog, scope)?;
+        for (idx, group_expr) in group_by.iter().enumerate() {
+            if matches!(group_expr, ScalarExpr::Column { .. }) {
+                continue;
+            }
+            if aliases[idx].is_none() && &bound == group_expr {
+                aliases[idx] = Some(alias.value.clone());
+            }
+        }
+    }
+    Ok(aliases)
 }
 
 fn build_unique_schema(mut fields: Vec<Field>) -> Result<Schema, PlanError> {
@@ -242,9 +285,15 @@ fn collect_aggregates(
                 }
                 Ok(())
             } else {
-                Err(PlanError::NotSupported(
-                    "non-aggregate function calls in aggregation context",
-                ))
+                if !is_supported_builtin(&func_name) {
+                    return Err(PlanError::NotSupported(
+                        "non-aggregate function calls in aggregation context",
+                    ));
+                }
+                for arg in args {
+                    collect_aggregates(arg, None, input_schema, out, catalog, cte_catalog, scope)?;
+                }
+                Ok(())
             }
         }
         Expr::Paren { expr: inner, .. } | Expr::Unary { expr: inner, .. } => {
@@ -331,25 +380,21 @@ fn bind_expr_or_agg_ref(
 ) -> Result<ScalarExpr, PlanError> {
     match expr {
         Expr::Call { name, args, .. } => {
+            if let Some(alias) = alias_name {
+                if let Some((i, f)) = agg_schema.find(alias) {
+                    return Ok(ScalarExpr::Column {
+                        name: f.name.clone(),
+                        index: i,
+                        data_type: f.data_type.clone(),
+                    });
+                }
+            }
             let func_name = name
                 .parts
                 .last()
                 .map_or("", |p| p.value.as_str())
                 .to_ascii_lowercase();
             if is_aggregate_name(&func_name) {
-                // 1. Alias-named column in agg_schema (the standard
-                //    case for `SUM(x) AS sum_qty`).
-                if let Some(alias) = alias_name {
-                    if let Some((i, f)) = agg_schema.find(alias) {
-                        return Ok(ScalarExpr::Column {
-                            name: f.name.clone(),
-                            index: i,
-                            data_type: f.data_type.clone(),
-                        });
-                    }
-                }
-                // 2. Derived `<func>` name (e.g. `SUM(x)` with no
-                //    alias collapses to a column named `"sum"`).
                 let agg_name = derive_agg_output_name(&func_name, args);
                 if let Some((i, f)) = agg_schema.find(&agg_name) {
                     return Ok(ScalarExpr::Column {

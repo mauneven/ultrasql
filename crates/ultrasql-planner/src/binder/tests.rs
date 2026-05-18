@@ -853,6 +853,40 @@ fn binds_group_by_emits_aggregate_node() {
 }
 
 #[test]
+fn binds_group_by_scalar_function_projection_alias() {
+    let schema = Schema::new([
+        Field::required("order_date", DataType::Date),
+        Field::required("amount", DataType::Int32),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("sales", TableMeta::new(schema));
+
+    let plan = parse_and_bind(
+        "SELECT EXTRACT(YEAR FROM order_date) AS o_year, SUM(amount) AS revenue \
+         FROM sales GROUP BY EXTRACT(YEAR FROM order_date) ORDER BY o_year",
+        &cat,
+    )
+    .expect("bind ok");
+
+    assert_eq!(plan.schema().field_at(0).name, "o_year");
+    assert_eq!(plan.schema().field_at(1).name, "revenue");
+}
+
+#[test]
+fn binds_group_by_column_projection_alias() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "SELECT id AS ident, COUNT(*) AS row_count FROM users GROUP BY id ORDER BY ident",
+        &cat,
+    )
+    .expect("bind ok");
+
+    assert_eq!(plan.schema().field_at(0).name, "ident");
+    assert_eq!(plan.schema().field_at(1).name, "row_count");
+}
+
+#[test]
 fn binds_count_star() {
     let cat = users_catalog();
     let plan = parse_and_bind("SELECT count(*) FROM users", &cat).expect("bind ok");

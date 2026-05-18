@@ -530,12 +530,17 @@ fn rewrite_exists_filter_expr(outer: &LogicalPlan, predicate: &ScalarExpr) -> Op
         return Some(join);
     }
 
-    let right = exists_input.clean_subplan;
-    let mut join_predicates = vec![build_correlation_condition_against_right_schema(
+    let (right, corr_pairs, residual_predicates) = project_exists_right_for_residual(
+        exists_input.clean_subplan,
         &exists_input.corr_pairs,
+        &exists_input.residual_predicates,
+        outer_width,
+    )?;
+    let mut join_predicates = vec![build_correlation_condition_against_right_schema(
+        &corr_pairs,
         outer_width,
     )];
-    join_predicates.extend(exists_input.residual_predicates);
+    join_predicates.extend(residual_predicates);
     let join_condition = conjuncts_to_and(join_predicates);
     let join = LogicalPlan::Join {
         left: Box::new(outer.clone()),
@@ -549,6 +554,189 @@ fn rewrite_exists_filter_expr(outer: &LogicalPlan, predicate: &ScalarExpr) -> Op
         schema: outer.schema().clone(),
     };
     Some(join)
+}
+
+fn project_exists_right_for_residual(
+    input: LogicalPlan,
+    corr_pairs: &[CorrPair],
+    residual_predicates: &[ScalarExpr],
+    outer_width: usize,
+) -> Option<(LogicalPlan, Vec<CorrPair>, Vec<ScalarExpr>)> {
+    let mut needed = Vec::with_capacity(corr_pairs.len() + residual_predicates.len());
+    for pair in corr_pairs {
+        push_unique_index(&mut needed, pair.inner_index);
+    }
+    for predicate in residual_predicates {
+        collect_join_right_column_indices(predicate, outer_width, &mut needed);
+    }
+    if needed.is_empty() {
+        return Some((input, corr_pairs.to_vec(), residual_predicates.to_vec()));
+    }
+
+    let input_schema = input.schema().clone();
+    let mut fields = Vec::with_capacity(needed.len());
+    let mut exprs = Vec::with_capacity(needed.len());
+    for &idx in &needed {
+        let field = input_schema.fields().get(idx)?;
+        fields.push(field.clone());
+        exprs.push((
+            ScalarExpr::Column {
+                name: field.name.clone(),
+                index: idx,
+                data_type: field.data_type.clone(),
+            },
+            field.name.clone(),
+        ));
+    }
+    let projected_schema = Schema::new(fields).ok()?;
+    let projected = LogicalPlan::Project {
+        input: Box::new(input),
+        exprs,
+        schema: projected_schema,
+    };
+
+    let mut projected_pairs = Vec::with_capacity(corr_pairs.len());
+    for pair in corr_pairs {
+        let projected_idx = needed.iter().position(|&idx| idx == pair.inner_index)?;
+        let mut projected_pair = pair.clone();
+        projected_pair.inner_index = projected_idx;
+        projected_pairs.push(projected_pair);
+    }
+    let projected_residuals = residual_predicates
+        .iter()
+        .map(|predicate| rebase_projected_exists_residual(predicate, outer_width, &needed))
+        .collect::<Option<Vec<_>>>()?;
+
+    Some((projected, projected_pairs, projected_residuals))
+}
+
+fn push_unique_index(indices: &mut Vec<usize>, index: usize) {
+    if !indices.contains(&index) {
+        indices.push(index);
+    }
+}
+
+fn collect_join_right_column_indices(expr: &ScalarExpr, outer_width: usize, out: &mut Vec<usize>) {
+    match expr {
+        ScalarExpr::Column { index, .. } => {
+            if *index >= outer_width {
+                push_unique_index(out, *index - outer_width);
+            }
+        }
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => {
+            collect_join_right_column_indices(expr, outer_width, out);
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            collect_join_right_column_indices(left, outer_width, out);
+            collect_join_right_column_indices(right, outer_width, out);
+        }
+        ScalarExpr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_join_right_column_indices(arg, outer_width, out);
+            }
+        }
+        ScalarExpr::Literal { .. }
+        | ScalarExpr::Parameter { .. }
+        | ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => {}
+    }
+}
+
+fn rebase_projected_exists_residual(
+    expr: &ScalarExpr,
+    outer_width: usize,
+    projected_indices: &[usize],
+) -> Option<ScalarExpr> {
+    match expr {
+        ScalarExpr::Column {
+            name,
+            index,
+            data_type,
+        } => {
+            if *index < outer_width {
+                return Some(ScalarExpr::Column {
+                    name: name.clone(),
+                    index: *index,
+                    data_type: data_type.clone(),
+                });
+            }
+            let original_inner_idx = *index - outer_width;
+            let projected_idx = projected_indices
+                .iter()
+                .position(|&idx| idx == original_inner_idx)?;
+            Some(ScalarExpr::Column {
+                name: name.clone(),
+                index: outer_width + projected_idx,
+                data_type: data_type.clone(),
+            })
+        }
+        ScalarExpr::OuterColumn { .. } => None,
+        ScalarExpr::Literal { value, data_type } => Some(ScalarExpr::Literal {
+            value: value.clone(),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Parameter { index, data_type } => Some(ScalarExpr::Parameter {
+            index: *index,
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Unary {
+            op,
+            expr: inner,
+            data_type,
+        } => Some(ScalarExpr::Unary {
+            op: *op,
+            expr: Box::new(rebase_projected_exists_residual(
+                inner,
+                outer_width,
+                projected_indices,
+            )?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Binary {
+            op,
+            left,
+            right,
+            data_type,
+        } => Some(ScalarExpr::Binary {
+            op: *op,
+            left: Box::new(rebase_projected_exists_residual(
+                left,
+                outer_width,
+                projected_indices,
+            )?),
+            right: Box::new(rebase_projected_exists_residual(
+                right,
+                outer_width,
+                projected_indices,
+            )?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::IsNull { expr, negated } => Some(ScalarExpr::IsNull {
+            expr: Box::new(rebase_projected_exists_residual(
+                expr,
+                outer_width,
+                projected_indices,
+            )?),
+            negated: *negated,
+        }),
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => Some(ScalarExpr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| rebase_projected_exists_residual(arg, outer_width, projected_indices))
+                .collect::<Option<Vec<_>>>()?,
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => None,
+    }
 }
 
 fn rewrite_in_subquery_filter_expr(
@@ -1677,6 +1865,64 @@ mod tests {
                 }
             ),
             "NOT EXISTS should become Anti join, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn real_correlated_exists_with_residual_projects_inner_columns() {
+        let corr = ScalarExpr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(col("key", 0, DataType::Int32)),
+            right: Box::new(outer_col("id", 0, DataType::Int32)),
+            data_type: DataType::Bool,
+        };
+        let residual = ScalarExpr::Binary {
+            op: BinaryOp::NotEq,
+            left: Box::new(col("data", 1, DataType::Int32)),
+            right: Box::new(outer_col("val", 1, DataType::Int32)),
+            data_type: DataType::Bool,
+        };
+        let sub = LogicalPlan::Filter {
+            input: Box::new(sub_scan()),
+            predicate: ScalarExpr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(corr),
+                right: Box::new(residual),
+                data_type: DataType::Bool,
+            },
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(outer_scan()),
+            predicate: ScalarExpr::Exists {
+                subplan: Box::new(sub),
+                negated: false,
+                correlated: true,
+            },
+        };
+
+        let result = SubqueryDecorrelation
+            .apply(&plan)
+            .expect("no error")
+            .expect("rewrite");
+        let LogicalPlan::Join {
+            right,
+            join_type,
+            condition,
+            ..
+        } = result
+        else {
+            panic!("EXISTS should become join");
+        };
+        assert_eq!(join_type, LogicalJoinType::Semi);
+        assert_eq!(right.schema().len(), 2);
+        assert!(matches!(right.as_ref(), LogicalPlan::Project { .. },));
+        let LogicalJoinCondition::On(predicate) = condition else {
+            panic!("expected ON predicate");
+        };
+        let dump = predicate.to_string();
+        assert!(
+            dump.contains("data") && dump.contains("val"),
+            "residual should survive after right projection, got {dump}"
         );
     }
 

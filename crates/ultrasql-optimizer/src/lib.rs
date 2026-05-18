@@ -99,7 +99,8 @@ pub fn optimize(
     _catalog_snapshot: &Arc<CatalogSnapshot>,
     _stats: &dyn StatsSource,
 ) -> Result<LogicalPlan, OptimizeError> {
-    Optimizer::new().optimize(plan)
+    let rewritten = Optimizer::new().optimize(plan)?;
+    Ok(reorder_inner_joins(&rewritten))
 }
 
 // ============================================================================

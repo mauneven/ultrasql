@@ -12,6 +12,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+#[cfg(feature = "sql-bench")]
+use bytes::Bytes;
+#[cfg(feature = "sql-bench")]
+use futures::SinkExt;
+
 #[cfg(any(feature = "pg-runner", feature = "sql-bench"))]
 use std::io::{BufRead, BufReader};
 
@@ -29,6 +34,32 @@ pub const BATCH_SIZE: usize = 10_000;
 /// Number of rows per UltraSQL VALUES batch.
 #[cfg(feature = "sql-bench")]
 const DEFAULT_ULTRASQL_BATCH_SIZE: usize = 256;
+
+/// COPY chunk target for the UltraSQL TPC-H loader.
+#[cfg(feature = "sql-bench")]
+const ULTRASQL_COPY_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UltrasqlLoadMethod {
+    Copy,
+    Insert,
+}
+
+#[cfg(feature = "sql-bench")]
+fn ultrasql_load_method() -> Result<UltrasqlLoadMethod> {
+    match std::env::var("ULTRASQL_TPCH_LOAD_METHOD") {
+        Ok(raw) => match raw.to_ascii_lowercase().as_str() {
+            "copy" => Ok(UltrasqlLoadMethod::Copy),
+            "insert" | "values" => Ok(UltrasqlLoadMethod::Insert),
+            other => {
+                bail!("unsupported ULTRASQL_TPCH_LOAD_METHOD={other:?}; use `copy` or `insert`")
+            }
+        },
+        Err(std::env::VarError::NotPresent) => Ok(UltrasqlLoadMethod::Copy),
+        Err(e) => Err(e).context("read ULTRASQL_TPCH_LOAD_METHOD"),
+    }
+}
 
 #[cfg(feature = "sql-bench")]
 fn ultrasql_batch_size() -> usize {
@@ -50,6 +81,14 @@ pub(crate) fn ultrasql_tpch_pool_frames() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|frames| *frames > 0)
         .unwrap_or(DEFAULT_ULTRASQL_TPCH_POOL_FRAMES)
+}
+
+#[cfg(feature = "sql-bench")]
+fn tpch_progress_enabled() -> bool {
+    matches!(
+        std::env::var("ULTRASQL_TPCH_PROGRESS").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
 }
 
 /// Row-count summary returned after a successful load.
@@ -246,7 +285,14 @@ pub(crate) async fn load_ultrasql_into_client(
 ) -> Result<Vec<LoadStats>> {
     let mut stats = Vec::with_capacity(data_gen::TABLE_NAMES.len());
     for table in data_gen::TABLE_NAMES {
-        stats.push(load_ultrasql_table(client, table, data_dir).await?);
+        let table_stats = load_ultrasql_table(client, table, data_dir).await?;
+        if tpch_progress_enabled() {
+            eprintln!(
+                "ultrasql tpch load: loaded {} ({} rows, {:.0} rows/s)",
+                table_stats.table, table_stats.row_count, table_stats.rows_per_sec
+            );
+        }
+        stats.push(table_stats);
     }
     Ok(stats)
 }
@@ -357,6 +403,83 @@ fn build_ultrasql_insert_sql(table: &str, rows: &[Vec<String>]) -> Result<String
 
 #[cfg(feature = "sql-bench")]
 async fn load_ultrasql_table(
+    client: &tokio_postgres::Client,
+    table: &str,
+    data_dir: &Path,
+) -> Result<LoadStats> {
+    match ultrasql_load_method()? {
+        UltrasqlLoadMethod::Copy => load_ultrasql_table_copy(client, table, data_dir).await,
+        UltrasqlLoadMethod::Insert => load_ultrasql_table_insert(client, table, data_dir).await,
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+async fn load_ultrasql_table_copy(
+    client: &tokio_postgres::Client,
+    table: &str,
+    data_dir: &Path,
+) -> Result<LoadStats> {
+    let path = data_dir.join(format!("{table}.tbl"));
+    let file = std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let t0 = std::time::Instant::now();
+    let copy_sql = format!("COPY {table} FROM STDIN WITH (DELIMITER '|')");
+    let sink = client
+        .copy_in::<_, Bytes>(&copy_sql)
+        .await
+        .with_context(|| format!("start COPY into {table}"))?;
+    futures::pin_mut!(sink);
+
+    let mut buffer: Vec<u8> = Vec::with_capacity(ULTRASQL_COPY_CHUNK_BYTES);
+    let mut total: u64 = 0;
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        let line = line.trim_end_matches('|');
+        if line.is_empty() {
+            continue;
+        }
+        let needed = line.len().saturating_add(1);
+        if !buffer.is_empty() && buffer.len().saturating_add(needed) > ULTRASQL_COPY_CHUNK_BYTES {
+            let chunk = std::mem::take(&mut buffer);
+            sink.as_mut()
+                .send(Bytes::from(chunk))
+                .await
+                .with_context(|| format!("COPY chunk into {table}"))?;
+            buffer = Vec::with_capacity(ULTRASQL_COPY_CHUNK_BYTES);
+        }
+        buffer.extend_from_slice(line.as_bytes());
+        buffer.push(b'\n');
+        total = total.saturating_add(1);
+    }
+    if !buffer.is_empty() {
+        sink.as_mut()
+            .send(Bytes::from(buffer))
+            .await
+            .with_context(|| format!("COPY final chunk into {table}"))?;
+    }
+    let inserted = sink
+        .finish()
+        .await
+        .with_context(|| format!("finish COPY into {table}"))?;
+    if inserted != total {
+        bail!("COPY {table}: server reported {inserted} rows, expected {total}");
+    }
+
+    let elapsed = t0.elapsed().as_secs_f64();
+    let rows_per_sec = if elapsed > 0.0 {
+        inserted as f64 / elapsed
+    } else {
+        0.0
+    };
+    Ok(LoadStats {
+        table: table.to_owned(),
+        row_count: total,
+        rows_per_sec,
+    })
+}
+
+#[cfg(feature = "sql-bench")]
+async fn load_ultrasql_table_insert(
     client: &tokio_postgres::Client,
     table: &str,
     data_dir: &Path,

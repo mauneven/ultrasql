@@ -875,6 +875,9 @@ Harness wired end-to-end. All 8 TPC-H tables create cleanly and real
 scale-1 `.tbl` data loads through the UltraSQL path. All 22 harness
 queries run to completion and return result sets matching DuckDB on the
 same data and SQL text.
+The in-process validator loads UltraSQL with `COPY FROM STDIN` by
+default and keeps the previous VALUES path behind
+`ULTRASQL_TPCH_LOAD_METHOD=insert` for targeted regressions.
 
 Validated on 2026-05-17 with:
 
@@ -895,11 +898,14 @@ current harness SQL in
 [`crates/ultrasql-bench/src/tpch/queries.rs`](crates/ultrasql-bench/src/tpch/queries.rs).
 The harness no longer uses the earlier subquery/composite-key crutches:
 Q2, Q17, and Q20 use correlated scalar aggregate subqueries; Q4 uses
-`EXISTS`; Q11 uses the scalar threshold subquery over comma joins; Q16
-uses `NOT IN (SELECT ...)`; Q18 uses `IN (SELECT ... GROUP BY ...
-HAVING ...)`; Q21 uses the mixed `EXISTS` / `NOT EXISTS` form with
-residual correlation predicates; and Q9 uses the native composite-key
-join predicate instead of a synthetic key.
+`EXISTS`; Q5, Q9, Q13, and Q22 use their canonical non-staged query
+forms; Q11 uses the scalar threshold subquery over comma joins; Q16 uses
+`NOT IN (SELECT ...)`; Q18 uses `IN (SELECT ... GROUP BY ... HAVING
+...)`; Q21 uses the mixed `EXISTS` / `NOT EXISTS` form with residual
+correlation predicates; and Q9 uses the native composite-key join
+predicate instead of a synthetic key. Q15 remains a CTE because standard
+TPC-H defines it through a temporary view; the CTE is the side-effect-free
+inline form of that view.
 
 TPC-H `dbgen` / `qgen` remain external benchmark tools. Install them
 locally with [`scripts/setup-tpch-dbgen.sh`](scripts/setup-tpch-dbgen.sh)
@@ -911,6 +917,7 @@ tracked repository root.
 #### Done
 
 - [x] `run_ultrasql` in [`crates/ultrasql-bench/src/tpch/runner.rs`](crates/ultrasql-bench/src/tpch/runner.rs) — in-process `ultrasqld` on an ephemeral port; runs the 22-query suite through `tokio-postgres`. Failures surface the real PostgreSQL `ErrorResponse` message via `as_db_error().message()`. Gated behind `--features sql-bench`.
+- [x] Fast TPC-H UltraSQL load path — [`crates/ultrasql-bench/src/tpch/load.rs`](crates/ultrasql-bench/src/tpch/load.rs) streams `.tbl` data through `COPY FROM STDIN`; [`crates/ultrasql-server/src/session/copy.rs`](crates/ultrasql-server/src/session/copy.rs) batches COPY heap inserts and decodes Date/Decimal cells directly.
 - [x] Engine-aware DDL split in [`crates/ultrasql-bench/src/tpch/schema.rs`](crates/ultrasql-bench/src/tpch/schema.rs) — eight TPC-H table DDLs ship in a `REGION` / `..._ULTRASQL` pair. The UltraSQL variant drops the table-level `PRIMARY KEY` clauses.
 - [x] Parser: `DATE 'YYYY-MM-DD'`, `TIMESTAMP '…'`, `TIME '…'`, `INTERVAL '…' UNIT` typed-string literals via new `Literal::Typed` AST variant.
 - [x] Parser: `EXTRACT(unit FROM expr)` keyword form desugared to `extract(unit_text, expr)`.
@@ -970,10 +977,21 @@ tracked repository root.
   over projected output columns when an `ORDER BY` item names a select-list
   alias. This supports canonical `ORDER BY value` / `ORDER BY revenue`
   shapes without pre-projection alias hacks.
+- [x] GROUP BY scalar expression binding — aggregate binding now permits
+  non-aggregate scalar functions in grouped projections and resolves
+  aliases for materialised group keys. Canonical Q9 can project and group
+  by `EXTRACT(YEAR FROM o_orderdate)` without a precomputed CTE column.
 - [x] Native multi-column hash join keys — the server lowerer extracts
   conjunctions of equality predicates into aligned key vectors and the
   executor hashes composite `JoinKey` values. Q9 and Q20-style
   `(partkey, suppkey)` joins no longer need synthetic arithmetic keys.
+- [x] Cross-risk inner join reordering — the optimizer now runs a guarded
+  inner-join reorder pass after rule rewrites. It only fires when the
+  leftmost pair in an inner-join chain is still a true cross product,
+  builds a connected order from available join predicates, and restores
+  the original logical output schema through a projection. This lets
+  canonical Q9 avoid the initial `part × supplier` blow-up while leaving
+  already-connected chains such as Q5 unchanged.
 - [x] Subquery decorrelation, first production slice — optimizer rewrites
   equality-correlated `EXISTS`/`NOT EXISTS`, uncorrelated `IN`/`NOT IN`,
   and uncorrelated scalar subqueries in predicates into join/filter
@@ -1002,11 +1020,14 @@ tracked repository root.
 
 #### Follow-up Engine Debt
 
-- [ ] Remaining harness SQL staging: some queries still use equivalent
-  CTE staging for join-order and selectivity reasons rather than because
-  the SQL surface is missing. Replace those with canonical text only
-  after cost-based join ordering and predicate placement can recover the
-  same plan without manual staging.
+- [x] Remaining harness SQL staging removed for TPC-H SF1 correctness.
+  Q15 intentionally remains a CTE because standard TPC-H Q15 uses a view;
+  the harness inlines that view without adding a persistent DDL side
+  effect.
+- [ ] Broader cost-based join ordering: the guarded reorder pass fixes
+  cross-risk chains such as Q9, but full statistics-driven join order,
+  selectivity estimation, and predicate placement are still needed before
+  using TPC-H speed as a mature optimizer claim.
 - [ ] Broader subquery decorrelation: current production support covers
   equality correlations, uncorrelated `IN` / scalar predicates, and
   equality-correlated scalar aggregates plus Q21-style residual
@@ -1032,7 +1053,7 @@ The main OLAP performance differentiator over PostgreSQL.
 - [ ] Planner tags pipelines as vectorized (OLAP) vs scalar (OLTP)
 - [x] Push-based pipeline driver (`VectorizedSink` / `VectorizedOperator` / `SinkVerdict`)
 - [x] Vectorized SeqScan emitting 4096-row batches via streaming `VisibleHeapScan` (page-by-page typed decode, no `Vec<Vec<Value>>` materialisation)
-- [x] Vectorized filter operator (SIMD fast path for col CMP scalar, Eval fallback)
+- [x] Vectorized filter operator (SIMD fast path for col CMP scalar and col CMP col, Eval fallback)
 - [x] Vectorized projection operator
 - [x] Vectorized hash join (build pull + probe push, FNV-1a hash)
 - [x] Vectorized hash aggregate — scalar fast path (no GROUP BY) dispatches to SIMD kernels; multi-group via HashAggregate
@@ -1067,6 +1088,22 @@ The main OLAP performance differentiator over PostgreSQL.
 
 ### MVCC Read Fast Path
 - [ ] Page-level `PD_ALL_VISIBLE` flag — skip per-tuple `oracle.status` on certified pages (Wave 6 prototype reverted due to DELETE-correctness regression; redesign needed)
+
+### v0.7 Performance Wave Notes
+
+- [x] TPC-H Q19 OR factoring before join pushdown — common lineitem
+  predicates inside OR arms are hoisted so scan/filter pushdown can see
+  them. Local SF1 timing on 2026-05-17: Q19 improved from 22.05 s to
+  3.99 s and still validates against DuckDB.
+- [x] TPC-H Q21 vector/residual cleanup — `Filter` now vectorizes
+  column-vs-column integer/date comparisons, correlated EXISTS residual
+  decorrelation projects inner inputs down to the needed columns, and
+  `HashJoin` avoids avoidable row concatenation for semi/anti residuals
+  plus single-column key Vec allocation. Local SF1 timing on
+  2026-05-17: Q21 improved from 26.94 s to 19.04 s and still validates
+  against DuckDB. This is progress, not closure: Q21 remains dominated
+  by full lineitem semi/anti probes and needs a physical semi/anti join
+  specialization or stronger decorrelation.
 
 ### Milestone
 - [ ] TPC-H scale 10 runs to completion, throughput within 2× of DuckDB

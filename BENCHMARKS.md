@@ -156,6 +156,12 @@ DuckDB reference rows are cached under `target/tpch-cache` by dataset
 fingerprint and SQL text. Use `--refresh-duckdb-cache` when deliberately
 checking a changed reference engine or cache behavior.
 
+UltraSQL's in-process TPC-H loader streams `.tbl` files through
+`COPY FROM STDIN` by default so validator runs spend time on query
+behavior, not millions of VALUES parses. Set
+`ULTRASQL_TPCH_LOAD_METHOD=insert` only when bisecting the older
+INSERT-based path.
+
 ---
 
 ## Two-Tier Benchmark Policy

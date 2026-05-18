@@ -134,76 +134,28 @@ ORDER BY
 
 /// TPC-H Q5 — Local Supplier Volume. REGION = 'ASIA', DATE = '1994-01-01'.
 pub const Q5: &str = "
-WITH asia_nations AS (
-    SELECT
-        n_nationkey AS asia_nationkey,
-        n_name AS asia_n_name
-    FROM
-        nation
-        INNER JOIN region
-            ON n_regionkey = r_regionkey
-    WHERE
-        r_name = 'ASIA'
-),
-asia_customers AS (
-    SELECT
-        c_custkey AS asia_custkey,
-        c_nationkey AS asia_customer_nationkey
-    FROM
-        customer
-        INNER JOIN asia_nations
-            ON c_nationkey = asia_nationkey
-),
-dated_orders AS (
-    SELECT
-        o_orderkey AS filtered_orderkey,
-        o_custkey AS filtered_custkey
-    FROM
-        orders
-    WHERE
-        o_orderdate >= DATE '1994-01-01'
-        AND o_orderdate <  DATE '1994-01-01' + INTERVAL '1' YEAR
-),
-customer_orders AS (
-    SELECT
-        o.filtered_orderkey AS customer_orderkey,
-        ac.asia_customer_nationkey AS customer_order_nationkey
-    FROM
-        dated_orders o
-        INNER JOIN asia_customers ac
-            ON ac.asia_custkey = o.filtered_custkey
-),
-asia_suppliers AS (
-    SELECT
-        s_suppkey AS asia_supplier_key,
-        s_nationkey AS asia_supplier_nationkey
-    FROM
-        supplier
-        INNER JOIN asia_nations
-            ON s_nationkey = asia_nationkey
-),
-matched_lineitems AS (
-    SELECT
-        co.customer_order_nationkey AS revenue_nationkey,
-        l.l_extendedprice AS revenue_extendedprice,
-        l.l_discount AS revenue_discount
-    FROM
-        customer_orders co
-        INNER JOIN lineitem l
-            ON l.l_orderkey = co.customer_orderkey
-        INNER JOIN asia_suppliers s
-            ON l.l_suppkey = s.asia_supplier_key
-            AND co.customer_order_nationkey = s.asia_supplier_nationkey
-)
 SELECT
-    an.asia_n_name AS n_name,
-    SUM(revenue_extendedprice * (1 - revenue_discount)) AS revenue
+    n_name,
+    SUM(l_extendedprice * (1 - l_discount)) AS revenue
 FROM
-    matched_lineitems ml
-    INNER JOIN asia_nations an
-        ON ml.revenue_nationkey = an.asia_nationkey
+    customer,
+    orders,
+    lineitem,
+    supplier,
+    nation,
+    region
+WHERE
+    c_custkey = o_custkey
+    AND l_orderkey = o_orderkey
+    AND l_suppkey = s_suppkey
+    AND c_nationkey = s_nationkey
+    AND s_nationkey = n_nationkey
+    AND n_regionkey = r_regionkey
+    AND r_name = 'ASIA'
+    AND o_orderdate >= DATE '1994-01-01'
+    AND o_orderdate <  DATE '1994-01-01' + INTERVAL '1' YEAR
 GROUP BY
-    an.asia_n_name
+    n_name
 ORDER BY
     revenue DESC;
 ";
@@ -298,94 +250,31 @@ ORDER BY
 
 /// TPC-H Q9 — Product Type Profit Measure. COLOR = 'green'.
 pub const Q9: &str = "
-WITH green_parts AS (
-    SELECT
-        p_partkey AS green_partkey
-    FROM
-        part
-    WHERE
-        p_name LIKE '%green%'
-),
-green_lineitems AS (
-    SELECT
-        l_partkey AS profit_partkey,
-        l_suppkey AS profit_suppkey,
-        l_orderkey AS profit_orderkey,
-        l_extendedprice AS profit_extendedprice,
-        l_discount AS profit_discount,
-        l_quantity AS profit_quantity
-    FROM
-        lineitem
-        INNER JOIN green_parts
-            ON l_partkey = green_partkey
-),
-partsupp_costs AS (
-    SELECT
-        ps_partkey AS cost_partkey,
-        ps_suppkey AS cost_suppkey,
-        ps_supplycost AS cost_supplycost
-    FROM
-        partsupp
-),
-supplier_nations AS (
-    SELECT
-        s_suppkey AS supplier_nation_suppkey,
-        n_name AS supplier_nation_name
-    FROM
-        supplier
-        INNER JOIN nation
-            ON s_nationkey = n_nationkey
-),
-lineitem_costs AS (
-    SELECT
-        profit_orderkey,
-        profit_suppkey,
-        profit_extendedprice,
-        profit_discount,
-        profit_quantity,
-        cost_supplycost
-    FROM
-        green_lineitems
-        INNER JOIN partsupp_costs
-            ON cost_partkey = profit_partkey
-            AND cost_suppkey = profit_suppkey
-),
-order_profit_rows AS (
-    SELECT
-        EXTRACT(YEAR FROM o_orderdate) AS profit_year,
-        profit_suppkey,
-        profit_extendedprice,
-        profit_discount,
-        profit_quantity,
-        cost_supplycost
-    FROM
-        lineitem_costs
-        INNER JOIN orders
-            ON o_orderkey = profit_orderkey
-),
-supplier_year_profit AS (
-    SELECT
-        profit_suppkey,
-        profit_year,
-        SUM(profit_extendedprice * (1 - profit_discount) - cost_supplycost * profit_quantity) AS supplier_profit
-    FROM
-        order_profit_rows
-    GROUP BY
-        profit_suppkey,
-        profit_year
-)
 SELECT
-    supplier_nation_name AS nation,
-    profit_year AS o_year,
-    SUM(supplier_profit) AS sum_profit
+    n_name AS nation,
+    EXTRACT(YEAR FROM o_orderdate) AS o_year,
+    SUM(l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity) AS sum_profit
 FROM
-    supplier_year_profit
-    INNER JOIN supplier_nations
-        ON supplier_nation_suppkey = profit_suppkey
+    part,
+    supplier,
+    lineitem,
+    partsupp,
+    orders,
+    nation
+WHERE
+    s_suppkey = l_suppkey
+    AND ps_suppkey = l_suppkey
+    AND ps_partkey = l_partkey
+    AND p_partkey = l_partkey
+    AND o_orderkey = l_orderkey
+    AND s_nationkey = n_nationkey
+    AND p_name LIKE '%green%'
 GROUP BY
-    supplier_nation_name, profit_year
+    n_name,
+    EXTRACT(YEAR FROM o_orderdate)
 ORDER BY
-    supplier_nation_name, profit_year DESC;
+    nation,
+    o_year DESC;
 ";
 
 /// TPC-H Q10 — Returned Item Reporting. DATE = '1993-10-01'.
@@ -482,45 +371,21 @@ ORDER BY
 
 /// TPC-H Q13 — Customer Distribution. WORD1 = 'special', WORD2 = 'requests'.
 pub const Q13: &str = "
-WITH customer_order_counts AS (
-    SELECT
-        o_custkey AS counted_custkey,
-        COUNT(o_orderkey) AS counted_orders
-    FROM
-        orders
-    WHERE
-        o_comment NOT LIKE '%special%requests%'
-    GROUP BY
-        o_custkey
-),
-customer_order_totals AS (
-    SELECT
-        c_custkey,
-        counted_orders AS c_count
-    FROM
-        customer
-        INNER JOIN customer_order_counts
-            ON c_custkey = counted_custkey
-
-    UNION ALL
-
-    SELECT
-        c_custkey,
-        COUNT(*) - COUNT(*) AS c_count
-    FROM
-        customer
-        LEFT OUTER JOIN customer_order_counts
-            ON c_custkey = counted_custkey
-    WHERE
-        counted_custkey IS NULL
-    GROUP BY
-        c_custkey
-)
 SELECT
     c_count,
     COUNT(*) AS custdist
-FROM
-    customer_order_totals
+FROM (
+    SELECT
+        c_custkey,
+        COUNT(o_orderkey) AS c_count
+    FROM
+        customer
+        LEFT OUTER JOIN orders
+            ON c_custkey = o_custkey
+            AND o_comment NOT LIKE '%special%requests%'
+    GROUP BY
+        c_custkey
+) AS customer_order_counts
 GROUP BY
     c_count
 ORDER BY
@@ -790,42 +655,36 @@ LIMIT 100;
 
 /// TPC-H Q22 — Global Sales Opportunity. Country codes: 13,31,23,29,30,18,17.
 pub const Q22: &str = "
-WITH avg_balance AS (
-    SELECT
-        AVG(c_acctbal) AS avg_acctbal
-    FROM
-        customer
-    WHERE
-        c_acctbal > 0.00
-        AND SUBSTRING(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')
-),
-customers_without_orders AS (
-    SELECT
-        c.c_custkey,
-        c.c_phone,
-        c.c_acctbal
-    FROM
-        customer c LEFT JOIN orders o ON o.o_custkey = c.c_custkey
-    WHERE
-        o.o_custkey IS NULL
-),
-custsale AS (
-    SELECT
-        SUBSTRING(c_phone FROM 1 FOR 2) AS cntrycode,
-        c_acctbal
-    FROM
-        customers_without_orders,
-        avg_balance
-    WHERE
-        SUBSTRING(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')
-        AND c_acctbal > avg_acctbal
-)
 SELECT
     cntrycode,
     COUNT(*)       AS numcust,
     SUM(c_acctbal) AS totacctbal
-FROM
-    custsale
+FROM (
+    SELECT
+        SUBSTRING(c_phone FROM 1 FOR 2) AS cntrycode,
+        c_acctbal
+    FROM
+        customer
+    WHERE
+        SUBSTRING(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')
+        AND c_acctbal > (
+            SELECT
+                AVG(c_acctbal)
+            FROM
+                customer
+            WHERE
+                c_acctbal > 0.00
+                AND SUBSTRING(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')
+        )
+        AND NOT EXISTS (
+            SELECT
+                *
+            FROM
+                orders
+            WHERE
+                o_custkey = c_custkey
+        )
+) AS custsale
 GROUP BY
     cntrycode
 ORDER BY

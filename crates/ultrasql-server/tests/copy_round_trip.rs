@@ -213,3 +213,28 @@ async fn copy_from_stdin_csv_lands_rows() {
 
     shutdown(client, server_handle).await;
 }
+
+/// `COPY t FROM STDIN` handles typed Date and Decimal payloads without
+/// leaking their physical int storage representation back to clients.
+#[tokio::test]
+async fn copy_from_stdin_text_lands_date_and_decimal() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE copy_typed (id INT, d DATE, amount DECIMAL(15,2))")
+        .await
+        .expect("create table");
+
+    let payload = b"1\t1994-01-01\t123.45\n2\t2000-02-29\t-0.50\n".to_vec();
+    let rows_inserted = copy_in_payload(&client, "COPY copy_typed FROM STDIN", &payload).await;
+    assert_eq!(rows_inserted, 2);
+
+    let stream = client
+        .copy_out("COPY copy_typed TO STDOUT")
+        .await
+        .expect("copy_out");
+    let echoed = collect_copy_out(stream).await;
+    assert_eq!(echoed, payload);
+
+    shutdown(client, server_handle).await;
+}

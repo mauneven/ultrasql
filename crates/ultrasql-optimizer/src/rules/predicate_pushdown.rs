@@ -128,10 +128,13 @@ fn push_down(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
                 unreachable!()
             };
 
+            let factored_predicate = factor_common_or_conjuncts(predicate);
+            let effective_predicate = factored_predicate.as_ref().unwrap_or(predicate);
+
             if !matches!(join_type, LogicalJoinType::Inner | LogicalJoinType::Cross) {
                 let new_left = push_down(left)?;
                 let new_right = push_down(right)?;
-                if new_left.is_none() && new_right.is_none() {
+                if new_left.is_none() && new_right.is_none() && factored_predicate.is_none() {
                     return Ok(None);
                 }
                 return Ok(Some(LogicalPlan::Filter {
@@ -142,14 +145,14 @@ fn push_down(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
                         condition: condition.clone(),
                         schema: schema.clone(),
                     }),
-                    predicate: predicate.clone(),
+                    predicate: effective_predicate.clone(),
                 }));
             }
 
             let left_width = left.schema().len();
 
             // Split the predicate into top-level AND conjuncts.
-            let conjuncts = split_and(predicate);
+            let conjuncts = split_and(effective_predicate);
 
             let mut left_preds: Vec<ScalarExpr> = Vec::new();
             let mut right_preds: Vec<ScalarExpr> = Vec::new();
@@ -235,7 +238,7 @@ fn push_down(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
             // Nothing pushed — recurse into the join children.
             let new_left = push_down(left)?;
             let new_right = push_down(right)?;
-            if new_left.is_none() && new_right.is_none() {
+            if new_left.is_none() && new_right.is_none() && factored_predicate.is_none() {
                 return Ok(None);
             }
             Ok(Some(LogicalPlan::Filter {
@@ -246,7 +249,7 @@ fn push_down(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
                     condition: condition.clone(),
                     schema: schema.clone(),
                 }),
-                predicate: predicate.clone(),
+                predicate: effective_predicate.clone(),
             }))
         }
 
@@ -556,6 +559,22 @@ fn split_and(expr: &ScalarExpr) -> Vec<ScalarExpr> {
     }
 }
 
+fn split_or(expr: &ScalarExpr) -> Vec<ScalarExpr> {
+    match expr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+            ..
+        } => {
+            let mut v = split_or(left);
+            v.extend(split_or(right));
+            v
+        }
+        other => vec![other.clone()],
+    }
+}
+
 /// Fold a slice of conjuncts back into a left-deep AND tree.
 ///
 /// Panics if the slice is empty (the rule never produces an empty list).
@@ -571,6 +590,62 @@ fn conjuncts_to_and(mut preds: Vec<ScalarExpr>) -> ScalarExpr {
         };
     }
     result
+}
+
+fn disjuncts_to_or(mut preds: Vec<ScalarExpr>) -> ScalarExpr {
+    assert!(!preds.is_empty(), "disjuncts_to_or called with empty list");
+    let mut result = preds.remove(0);
+    for p in preds {
+        result = ScalarExpr::Binary {
+            op: BinaryOp::Or,
+            left: Box::new(result),
+            right: Box::new(p),
+            data_type: ultrasql_core::DataType::Bool,
+        };
+    }
+    result
+}
+
+fn factor_common_or_conjuncts(expr: &ScalarExpr) -> Option<ScalarExpr> {
+    let arms = split_or(expr);
+    if arms.len() < 2 {
+        return None;
+    }
+    let arm_conjuncts: Vec<Vec<ScalarExpr>> = arms.iter().map(split_and).collect();
+    let first = arm_conjuncts.first()?;
+    let mut common: Vec<ScalarExpr> = Vec::new();
+    for candidate in first {
+        if common.contains(candidate) {
+            continue;
+        }
+        if arm_conjuncts
+            .iter()
+            .skip(1)
+            .all(|arm| arm.iter().any(|expr| expr == candidate))
+        {
+            common.push(candidate.clone());
+        }
+    }
+    if common.is_empty() {
+        return None;
+    }
+
+    let residual_arms: Vec<Vec<ScalarExpr>> = arm_conjuncts
+        .into_iter()
+        .map(|arm| {
+            arm.into_iter()
+                .filter(|expr| !common.contains(expr))
+                .collect()
+        })
+        .collect();
+    if residual_arms.iter().any(Vec::is_empty) {
+        return Some(conjuncts_to_and(common));
+    }
+
+    let residual_or = disjuncts_to_or(residual_arms.into_iter().map(conjuncts_to_and).collect());
+    let mut factored = common;
+    factored.push(residual_or);
+    Some(conjuncts_to_and(factored))
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +680,24 @@ mod tests {
     fn eq(l: ScalarExpr, r: ScalarExpr) -> ScalarExpr {
         ScalarExpr::Binary {
             op: BinaryOp::Eq,
+            left: Box::new(l),
+            right: Box::new(r),
+            data_type: DataType::Bool,
+        }
+    }
+
+    fn and(l: ScalarExpr, r: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(l),
+            right: Box::new(r),
+            data_type: DataType::Bool,
+        }
+    }
+
+    fn or(l: ScalarExpr, r: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Or,
             left: Box::new(l),
             right: Box::new(r),
             data_type: DataType::Bool,
@@ -801,6 +894,61 @@ mod tests {
         assert!(
             result.is_none(),
             "non-equi two-sided filters should stay above hashable join"
+        );
+    }
+
+    #[test]
+    fn factors_common_or_conjuncts_before_join_pushdown() {
+        let u_scan = LogicalPlan::Scan {
+            table: "users".into(),
+            schema: users_schema(),
+            projection: None,
+        };
+        let o_scan = LogicalPlan::Scan {
+            table: "orders".into(),
+            schema: orders_schema(),
+            projection: None,
+        };
+        let join_schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::nullable("name", DataType::Text { max_len: None }),
+            Field::required("order_id", DataType::Int32),
+            Field::required("user_id", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let join = LogicalPlan::Join {
+            left: Box::new(u_scan),
+            right: Box::new(o_scan),
+            join_type: LogicalJoinType::Inner,
+            condition: LogicalJoinCondition::On(eq(col("id", 0), col("user_id", 3))),
+            schema: join_schema,
+        };
+        let common_left = eq(col("id", 0), lit_i32(5));
+        let right_ten = eq(col("order_id", 2), lit_i32(10));
+        let right_twenty = eq(col("order_id", 2), lit_i32(20));
+        let predicate = or(
+            and(common_left.clone(), right_ten),
+            and(common_left, right_twenty),
+        );
+        let filter = LogicalPlan::Filter {
+            input: Box::new(join),
+            predicate,
+        };
+
+        let result = PredicatePushdown
+            .apply(&filter)
+            .expect("no error")
+            .expect("rewrite");
+        let LogicalPlan::Join { left, right, .. } = result else {
+            panic!("expected Join after factoring pushdown");
+        };
+        assert!(
+            matches!(left.as_ref(), LogicalPlan::Filter { .. }),
+            "factored left predicate should push below join"
+        );
+        assert!(
+            matches!(right.as_ref(), LogicalPlan::Filter { .. }),
+            "right-only disjunction should push below join after factoring"
         );
     }
 

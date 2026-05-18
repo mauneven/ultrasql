@@ -5,15 +5,16 @@
 //! [`FilterEqI32`](crate::FilterEqI32) for all predicate shapes except
 //! those where the specialised SIMD path is wired in.
 //!
-//! # Fast-path: column-op-literal
+//! # Fast-path: simple comparisons
 //!
 //! When the predicate matches the shape `column <cmp> literal` (or the
-//! mirrored `literal <cmp> column` with the operator flipped), the
-//! filter dispatches to a vectorised kernel from `ultrasql-vec` that
-//! produces a `Bitmap` mask in one pass over the column, then uses the
-//! mask to materialise the surviving rows for every column of the
-//! input batch. The path avoids per-row `Value`-decoding entirely
-//! and is dramatically faster than the scalar path on i32/i64 columns.
+//! mirrored `literal <cmp> column` with the operator flipped), or
+//! `left_column <cmp> right_column`, the filter dispatches to
+//! vectorised kernels from `ultrasql-vec` that produce a `Bitmap` mask
+//! in one pass over the input columns, then uses the mask to
+//! materialise the surviving rows for every column of the input batch.
+//! The path avoids per-row `Value`-decoding entirely and is
+//! dramatically faster than the scalar path on i32/i64 columns.
 //!
 //! # Row-at-a-time evaluation (fallback)
 //!
@@ -30,7 +31,7 @@ use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_vec::Batch;
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
-use ultrasql_vec::kernels::{CmpOp, cmp_i32_scalar, cmp_i64_scalar};
+use ultrasql_vec::kernels::{CmpOp, cmp_i32_scalar, cmp_i64_scalar, compare_i32, compare_i64};
 
 use crate::eval::Eval;
 use crate::seq_scan::build_batch;
@@ -49,26 +50,29 @@ pub struct Filter {
     child: Box<dyn Operator>,
     /// Compiled scalar interpreter used by the row-at-a-time fallback.
     predicate: Eval,
-    /// `Some(_)` if the predicate matches `column <cmp> literal` (or the
-    /// swapped variant); `None` otherwise. Cached at construction so we
-    /// pay the shape-matching cost once.
+    /// `Some(_)` if the predicate matches a vectorised comparison
+    /// shape; `None` otherwise. Cached at construction so we pay the
+    /// shape-matching cost once.
     fast: Option<FastPredicate>,
     schema: Schema,
 }
 
-/// Cached, parsed column-op-literal predicate.
-///
-/// `index` is the 0-based column index in the input schema. `op` is the
-/// (already-canonicalised) comparison operator; if the original predicate
-/// was `literal <op> column`, `op` here has been flipped so that the
-/// kernel always sees the column on the left. `literal` is the right-hand
-/// constant — typed loosely so the per-batch dispatch can downcast it
-/// against the actual column variant.
+/// Cached, parsed comparison predicate.
 #[derive(Debug, Clone)]
-struct FastPredicate {
-    index: usize,
-    op: CmpOp,
-    literal: Value,
+enum FastPredicate {
+    /// `column <op> literal`, with mirrored `literal <op> column`
+    /// canonicalised by flipping `op`.
+    ColumnLiteral {
+        index: usize,
+        op: CmpOp,
+        literal: Value,
+    },
+    /// `left_column <op> right_column`.
+    ColumnColumn {
+        left_index: usize,
+        right_index: usize,
+        op: CmpOp,
+    },
 }
 
 impl Filter {
@@ -107,25 +111,43 @@ impl Filter {
             return Ok(TryFastPath::Unhandled(input));
         };
         let cols = input.columns();
-        let key_col = cols
-            .get(fp.index)
-            .ok_or(ExecError::Internal("filter column index out of bounds"))?;
-
-        let mask = match (key_col, &fp.literal) {
-            (Column::Int32(c), Value::Int32(v)) => Some(cmp_i32_scalar(c, *v, fp.op)),
-            // For an Int32 column compared against an Int64 literal,
-            // narrow the literal where it fits. When it overflows the
-            // i32 range every row gives the same answer, so build a
-            // constant mask (NULL rows still get a 0 bit).
-            (Column::Int32(c), Value::Int64(v)) => Some(i32::try_from(*v).map_or_else(
-                |_| const_mask_i32(c, *v, fp.op),
-                |narrow| cmp_i32_scalar(c, narrow, fp.op),
-            )),
-            (Column::Int64(c), Value::Int64(v)) => Some(cmp_i64_scalar(c, *v, fp.op)),
-            (Column::Int64(c), Value::Int32(v)) => Some(cmp_i64_scalar(c, i64::from(*v), fp.op)),
-            // Type combinations outside the i32/i64 happy path fall back
-            // to the scalar interpreter — correctness over coverage.
-            _ => None,
+        let mask = match fp {
+            FastPredicate::ColumnLiteral { index, op, literal } => {
+                let key_col = cols
+                    .get(*index)
+                    .ok_or(ExecError::Internal("filter column index out of bounds"))?;
+                match (key_col, literal) {
+                    (Column::Int32(c), Value::Int32(v)) => Some(cmp_i32_scalar(c, *v, *op)),
+                    // For an Int32 column compared against an Int64 literal,
+                    // narrow the literal where it fits. When it overflows the
+                    // i32 range every row gives the same answer, so build a
+                    // constant mask (NULL rows still get a 0 bit).
+                    (Column::Int32(c), Value::Int64(v)) => Some(i32::try_from(*v).map_or_else(
+                        |_| const_mask_i32(c, *v, *op),
+                        |narrow| cmp_i32_scalar(c, narrow, *op),
+                    )),
+                    (Column::Int64(c), Value::Int64(v)) => Some(cmp_i64_scalar(c, *v, *op)),
+                    (Column::Int64(c), Value::Int32(v)) => {
+                        Some(cmp_i64_scalar(c, i64::from(*v), *op))
+                    }
+                    // Type combinations outside the i32/i64 happy path fall back
+                    // to the scalar interpreter — correctness over coverage.
+                    _ => None,
+                }
+            }
+            FastPredicate::ColumnColumn {
+                left_index,
+                right_index,
+                op,
+            } => {
+                let left_col = cols.get(*left_index).ok_or(ExecError::Internal(
+                    "filter left column index out of bounds",
+                ))?;
+                let right_col = cols.get(*right_index).ok_or(ExecError::Internal(
+                    "filter right column index out of bounds",
+                ))?;
+                cmp_columns_to_mask(left_col, right_col, *op)
+            }
         };
 
         let Some(mask) = mask else {
@@ -223,13 +245,12 @@ impl Operator for Filter {
     }
 }
 
-/// Match the shape `column <cmp> literal` (or its mirror) and produce a
-/// cached descriptor for the vectorised path.
+/// Match a simple comparison shape and produce a cached descriptor for
+/// the vectorised path.
 ///
 /// Returns `None` for any other predicate shape, including:
 /// - Nested expressions (`col + 1 > 5`).
 /// - Logical conjunctions (`a > 5 AND b < 10`).
-/// - Column-to-column comparisons.
 /// - NULL literals — `WHERE col = NULL` always evaluates to NULL/false
 ///   in SQL but the existing scalar path already handles that.
 fn match_fast_predicate(expr: &ScalarExpr) -> Option<FastPredicate> {
@@ -247,7 +268,7 @@ fn match_fast_predicate(expr: &ScalarExpr) -> Option<FastPredicate> {
         if matches!(value, Value::Null) {
             return None;
         }
-        return Some(FastPredicate {
+        return Some(FastPredicate::ColumnLiteral {
             index: *index,
             op: cmp,
             literal: value.clone(),
@@ -261,10 +282,26 @@ fn match_fast_predicate(expr: &ScalarExpr) -> Option<FastPredicate> {
         if matches!(value, Value::Null) {
             return None;
         }
-        return Some(FastPredicate {
+        return Some(FastPredicate::ColumnLiteral {
             index: *index,
             op: flip_cmp(cmp),
             literal: value.clone(),
+        });
+    }
+    // Case 3: `left_column <op> right_column`.
+    if let (
+        ScalarExpr::Column {
+            index: left_index, ..
+        },
+        ScalarExpr::Column {
+            index: right_index, ..
+        },
+    ) = (left.as_ref(), right.as_ref())
+    {
+        return Some(FastPredicate::ColumnColumn {
+            left_index: *left_index,
+            right_index: *right_index,
+            op: cmp,
         });
     }
     None
@@ -320,6 +357,41 @@ fn const_mask_i32(column: &NumericColumn<i32>, literal_i64: i64, op: CmpOp) -> B
         }
     }
     bm
+}
+
+/// Vectorised `left_column <op> right_column` comparison for the
+/// physical integer families used by dates, timestamps, decimals, and
+/// regular integer columns.
+fn cmp_columns_to_mask(left: &Column, right: &Column, op: CmpOp) -> Option<Bitmap> {
+    match (left, right) {
+        (Column::Int32(l), Column::Int32(r)) => {
+            let validity = merge_numeric_validity(l, r);
+            let cmp = compare_i32(l, r, validity.as_ref());
+            Some(cmp_i32_scalar(&cmp, 0, op))
+        }
+        (Column::Int64(l), Column::Int64(r)) => {
+            let validity = merge_numeric_validity(l, r);
+            let cmp = compare_i64(l, r, validity.as_ref());
+            Some(cmp_i64_scalar(&cmp, 0, op))
+        }
+        _ => None,
+    }
+}
+
+/// Merge two numeric validity masks. `None` means all rows valid.
+fn merge_numeric_validity<T>(left: &NumericColumn<T>, right: &NumericColumn<T>) -> Option<Bitmap> {
+    match (left.nulls(), right.nulls()) {
+        (None, None) => None,
+        (Some(l), None) => Some(l.clone()),
+        (None, Some(r)) => Some(r.clone()),
+        (Some(l), Some(r)) => {
+            let mut merged = l.clone();
+            for (word, &right_word) in merged.words_mut().iter_mut().zip(r.words().iter()) {
+                *word &= right_word;
+            }
+            Some(merged)
+        }
+    }
 }
 
 /// Materialise the rows of `column` selected by `mask`. The output
@@ -825,6 +897,102 @@ mod tests {
         // Rows {0, 2, 4, 6}: value 42, non-null. Rows 1/3/5: value 999
         // and NULL (validity = 0) — must be dropped. Row 7: 7.
         assert_eq!(got, vec![42, 42, 42, 42]);
+    }
+
+    /// TPC-H Q21 style predicate: `l_receiptdate > l_commitdate`.
+    /// Date columns are stored as Int32 day offsets, so this must use
+    /// the vectorised column-vs-column path instead of row decoding.
+    #[test]
+    fn vectorized_column_column_i32_date_gt() {
+        let commit_dates = vec![10_i32, 20, 30, 40, 50, 60];
+        let receipt_dates = vec![11_i32, 19, 30, 99, 49, 61];
+        let batch = Batch::new([
+            Column::Int32(NumericColumn::from_data(commit_dates)),
+            Column::Int32(NumericColumn::from_data(receipt_dates)),
+        ])
+        .expect("batch ok");
+        let schema = Schema::new([
+            Field::required("l_commitdate", DataType::Date),
+            Field::required("l_receiptdate", DataType::Date),
+        ])
+        .expect("schema ok");
+        let pred = ScalarExpr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(ScalarExpr::Column {
+                name: "l_receiptdate".into(),
+                index: 1,
+                data_type: DataType::Date,
+            }),
+            right: Box::new(ScalarExpr::Column {
+                name: "l_commitdate".into(),
+                index: 0,
+                data_type: DataType::Date,
+            }),
+            data_type: DataType::Bool,
+        };
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut filter = Filter::new(Box::new(scan), pred);
+
+        let out = filter.next_batch().unwrap().unwrap();
+        let got: Vec<(i32, i32)> = match (&out.columns()[0], &out.columns()[1]) {
+            (Column::Int32(commit), Column::Int32(receipt)) => commit
+                .data()
+                .iter()
+                .copied()
+                .zip(receipt.data().iter().copied())
+                .collect(),
+            other => panic!("unexpected column types: {other:?}"),
+        };
+        assert_eq!(got, vec![(10, 11), (40, 99), (60, 61)]);
+        assert!(filter.next_batch().unwrap().is_none());
+    }
+
+    /// Column-vs-column comparison must apply SQL NULL semantics:
+    /// NULL on either side means UNKNOWN and does not pass WHERE.
+    #[test]
+    fn vectorized_column_column_i32_merges_nulls() {
+        let len = 5_usize;
+        let left_values = vec![5_i32, 7, 9, 11, 13];
+        let right_values = vec![1_i32, 2, 3, 20, 4];
+        let mut left_validity = Bitmap::new(len, true);
+        let mut right_validity = Bitmap::new(len, true);
+        left_validity.set(1, false);
+        right_validity.set(2, false);
+        let left =
+            NumericColumn::with_nulls(left_values, left_validity).expect("valid left column");
+        let right =
+            NumericColumn::with_nulls(right_values, right_validity).expect("valid right column");
+        let batch = Batch::new([Column::Int32(left), Column::Int32(right)]).expect("batch ok");
+        let schema = Schema::new([
+            Field::required("left", DataType::Int32),
+            Field::required("right", DataType::Int32),
+        ])
+        .expect("schema ok");
+        let pred = ScalarExpr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(ScalarExpr::Column {
+                name: "left".into(),
+                index: 0,
+                data_type: DataType::Int32,
+            }),
+            right: Box::new(ScalarExpr::Column {
+                name: "right".into(),
+                index: 1,
+                data_type: DataType::Int32,
+            }),
+            data_type: DataType::Bool,
+        };
+        let scan = MemTableScan::new(schema, vec![batch]);
+        let mut filter = Filter::new(Box::new(scan), pred);
+
+        let out = filter.next_batch().unwrap().unwrap();
+        let got: Vec<i32> = match &out.columns()[0] {
+            Column::Int32(c) => c.data().to_vec(),
+            other => panic!("unexpected column type: {other:?}"),
+        };
+        // Rows 0 and 4 pass. Row 1 has NULL left, row 2 NULL right,
+        // row 3 is 11 > 20 false.
+        assert_eq!(got, vec![5, 13]);
     }
 
     /// `col + 1 > 5` does not match the col-op-literal shape (LHS is a

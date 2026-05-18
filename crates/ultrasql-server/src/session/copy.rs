@@ -54,6 +54,8 @@ use crate::copy::{
 };
 use crate::error::ServerError;
 
+const COPY_INSERT_BATCH_ROWS: usize = 4096;
+
 impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
@@ -265,11 +267,18 @@ where
                     }
                 };
                 let cells: Vec<Option<Vec<u8>>> = if columns.is_empty() {
-                    row.iter().map(value_to_copy_cell).collect()
+                    row.iter()
+                        .zip(entry.schema.fields())
+                        .map(|(value, field)| value_to_copy_cell(value, &field.data_type))
+                        .collect()
                 } else {
                     columns
                         .iter()
-                        .map(|&i| row.get(i).and_then(value_to_copy_cell))
+                        .map(|&i| {
+                            let field = entry.schema.field_at(i);
+                            row.get(i)
+                                .and_then(|value| value_to_copy_cell(value, &field.data_type))
+                        })
                         .collect()
                 };
                 let bytes = match opts.format {
@@ -328,6 +337,7 @@ where
         self.send(&copy_in_response(n_columns)).await?;
 
         let mut buffer: Vec<u8> = Vec::new();
+        let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(COPY_INSERT_BATCH_ROWS);
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let codec = RowCodec::new(entry.schema.clone());
 
@@ -341,21 +351,50 @@ where
             match msg {
                 FrontendMessage::CopyData(chunk) => {
                     buffer.extend_from_slice(&chunk);
-                    while let Some(line) = take_line(&mut buffer) {
+                    let mut start = 0;
+                    while let Some(rel_nl) = buffer[start..].iter().position(|&b| b == b'\n') {
+                        let end = start + rel_nl + 1;
                         if !header_skipped {
                             header_skipped = true;
+                            start = end;
                             continue;
                         }
-                        if let Err(e) = self
-                            .insert_one_copy_row(&line, entry, columns, schema, &codec, opts, &txn)
-                        {
-                            if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                                warn!(error = %abort_err, "COPY FROM autocommit abort failed");
+                        let decoded = decode_one_copy_row(
+                            &buffer[start..end],
+                            entry,
+                            columns,
+                            schema,
+                            &codec,
+                            opts,
+                        );
+                        start = end;
+                        match decoded {
+                            Ok(payload) => payload_batch.push(payload),
+                            Err(e) => {
+                                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                                    warn!(error = %abort_err, "COPY FROM autocommit abort failed");
+                                }
+                                self.drain_copy_remainder().await?;
+                                return Err(e);
                             }
-                            self.drain_copy_remainder().await?;
-                            return Err(e);
                         }
-                        rows_inserted = rows_inserted.saturating_add(1);
+                        if payload_batch.len() == COPY_INSERT_BATCH_ROWS {
+                            let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+                            if let Err(e) =
+                                self.flush_copy_insert_batch(entry, &payload_batch, &txn)
+                            {
+                                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                                    warn!(error = %abort_err, "COPY FROM autocommit abort failed");
+                                }
+                                self.drain_copy_remainder().await?;
+                                return Err(e);
+                            }
+                            rows_inserted = rows_inserted.saturating_add(batch_len);
+                            payload_batch.clear();
+                        }
+                    }
+                    if start > 0 {
+                        buffer.drain(..start);
                     }
                 }
                 FrontendMessage::CopyDone => {
@@ -394,15 +433,15 @@ where
         if received_done && !buffer.is_empty() {
             if header_skipped {
                 let line = std::mem::take(&mut buffer);
-                if let Err(e) =
-                    self.insert_one_copy_row(&line, entry, columns, schema, &codec, opts, &txn)
-                {
-                    if let Err(abort_err) = self.state.txn_manager.abort(txn) {
-                        warn!(error = %abort_err, "COPY FROM autocommit abort failed");
+                match decode_one_copy_row(&line, entry, columns, schema, &codec, opts) {
+                    Ok(payload) => payload_batch.push(payload),
+                    Err(e) => {
+                        if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                            warn!(error = %abort_err, "COPY FROM autocommit abort failed");
+                        }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
-                rows_inserted = rows_inserted.saturating_add(1);
             } else {
                 buffer.clear();
             }
@@ -413,6 +452,17 @@ where
                 warn!(error = %abort_err, "COPY FROM abort on CopyFail failed");
             }
             return Err(ServerError::CopyAborted(reason));
+        }
+
+        if !payload_batch.is_empty() {
+            let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+            if let Err(e) = self.flush_copy_insert_batch(entry, &payload_batch, &txn) {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    warn!(error = %abort_err, "COPY FROM autocommit abort failed");
+                }
+                return Err(e);
+            }
+            rows_inserted = rows_inserted.saturating_add(batch_len);
         }
 
         if let Err(e) = self.state.txn_manager.commit(txn) {
@@ -443,64 +493,16 @@ where
         Ok(())
     }
 
-    /// Decode one CopyData line into a `Vec<Value>` and write it to
-    /// the heap. The argument list is wide because every step needs a
-    /// piece of state the dispatcher already has on hand — packing them
-    /// into a struct would just push the indirection through every call
-    /// site without changing the cost. The local `#[allow]` keeps clippy
-    /// quiet without raising the workspace-wide threshold.
-    #[allow(clippy::too_many_arguments)]
-    fn insert_one_copy_row(
+    fn flush_copy_insert_batch(
         &self,
-        line: &[u8],
         entry: &TableEntry,
-        columns: &[usize],
-        schema: &Schema,
-        codec: &RowCodec,
-        opts: &CopyOptions,
+        payloads: &[Vec<u8>],
         txn: &Transaction,
     ) -> Result<(), ServerError> {
-        let raw_cells = match opts.format {
-            ServerCopyFormat::Text => parse_text_row(line, opts)?,
-            ServerCopyFormat::Csv => parse_csv_row(line, opts)?,
-        };
-        if raw_cells.len() != schema.len() {
-            return Err(ServerError::CopyFormat(format!(
-                "COPY row has {} columns; expected {}",
-                raw_cells.len(),
-                schema.len()
-            )));
+        if payloads.is_empty() {
+            return Ok(());
         }
-
-        let table_arity = entry.schema.len();
-        let mut row: Vec<Value> = vec![Value::Null; table_arity];
-        if columns.is_empty() {
-            for (i, cell) in raw_cells.iter().enumerate() {
-                let dtype = &entry.schema.fields()[i].data_type;
-                row[i] = decode_copy_cell(cell.as_deref(), dtype, i)?;
-            }
-        } else {
-            for (cell_idx, cell) in raw_cells.iter().enumerate() {
-                let table_idx = columns[cell_idx];
-                let dtype = &entry.schema.fields()[table_idx].data_type;
-                row[table_idx] = decode_copy_cell(cell.as_deref(), dtype, table_idx)?;
-            }
-        }
-        for (idx, (value, field)) in row.iter().zip(entry.schema.fields().iter()).enumerate() {
-            if matches!(value, Value::Null) && !field.nullable {
-                let name = if field.name.is_empty() {
-                    format!("#{idx}")
-                } else {
-                    field.name.clone()
-                };
-                return Err(ServerError::CopyFormat(format!(
-                    "NOT NULL constraint violated for column {name} in COPY row",
-                )));
-            }
-        }
-        let payload = codec
-            .encode(&row)
-            .map_err(|e| ServerError::CopyFormat(format!("COPY encode: {e}")))?;
+        let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         let insert_opts = InsertOptions {
             xmin: txn.current_xid(),
             command_id: txn.current_command,
@@ -510,8 +512,8 @@ where
         };
         self.state
             .heap
-            .insert(RelationId(entry.oid), &payload, insert_opts)
-            .map_err(|e| ServerError::ddl(format!("COPY FROM heap insert: {e}")))?;
+            .insert_batch(RelationId(entry.oid), &payload_refs, insert_opts)
+            .map_err(|e| ServerError::ddl(format!("COPY FROM heap insert batch: {e}")))?;
         Ok(())
     }
 
@@ -531,8 +533,73 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn decode_one_copy_row(
+    line: &[u8],
+    entry: &TableEntry,
+    columns: &[usize],
+    schema: &Schema,
+    codec: &RowCodec,
+    opts: &CopyOptions,
+) -> Result<Vec<u8>, ServerError> {
+    let raw_cells = match opts.format {
+        ServerCopyFormat::Text => parse_text_row(line, opts)?,
+        ServerCopyFormat::Csv => parse_csv_row(line, opts)?,
+    };
+    if raw_cells.len() != schema.len() {
+        return Err(ServerError::CopyFormat(format!(
+            "COPY FROM expected {} columns, got {}",
+            schema.len(),
+            raw_cells.len()
+        )));
+    }
+
+    let mut row = vec![Value::Null; entry.schema.len()];
+    if columns.is_empty() {
+        for (col_idx, raw) in raw_cells.iter().enumerate() {
+            let field = entry.schema.field_at(col_idx);
+            row[col_idx] = decode_copy_cell(raw.as_deref(), &field.data_type, col_idx)?;
+        }
+    } else {
+        for (stream_idx, (table_col_idx, raw)) in columns.iter().zip(raw_cells.iter()).enumerate() {
+            let field = entry.schema.field_at(*table_col_idx);
+            row[*table_col_idx] = decode_copy_cell(raw.as_deref(), &field.data_type, stream_idx)?;
+        }
+    }
+
+    for (col_idx, (value, field)) in row.iter().zip(entry.schema.fields()).enumerate() {
+        if matches!(value, Value::Null) && !field.nullable {
+            return Err(ServerError::CopyFormat(format!(
+                "column {col_idx}: NULL violates not-null constraint"
+            )));
+        }
+    }
+
+    codec
+        .encode(&row)
+        .map_err(|e| ServerError::CopyFormat(format!("COPY FROM row encode: {e}")))
+}
+
 /// Encode a runtime [`Value`] as a `CopyData` cell (`None` is SQL NULL).
-fn value_to_copy_cell(value: &Value) -> Option<Vec<u8>> {
+fn value_to_copy_cell(value: &Value, dtype: &DataType) -> Option<Vec<u8>> {
+    match (dtype, value) {
+        (_, Value::Null) => None,
+        (DataType::Date, Value::Int32(v) | Value::Date(v)) => {
+            Some(Value::Date(*v).to_string().into_bytes())
+        }
+        (DataType::Decimal { scale, .. }, Value::Int64(v)) => Some(
+            Value::Decimal {
+                value: *v,
+                scale: scale.unwrap_or(0),
+            }
+            .to_string()
+            .into_bytes(),
+        ),
+        (_, value) => value_to_copy_cell_by_value(value),
+    }
+}
+
+fn value_to_copy_cell_by_value(value: &Value) -> Option<Vec<u8>> {
     match value {
         Value::Null => None,
         Value::Bool(b) => Some(if *b { b"t".to_vec() } else { b"f".to_vec() }),
@@ -587,6 +654,8 @@ fn decode_copy_cell(
             .parse::<f64>()
             .map(Value::Float64)
             .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}"))),
+        DataType::Decimal { scale, .. } => parse_copy_decimal(s, scale.unwrap_or(0), column_idx),
+        DataType::Date => parse_copy_date(s, column_idx).map(Value::Date),
         DataType::Text { .. } => Ok(Value::Text(s.to_string())),
         DataType::Bytea => Ok(Value::Bytea(bytes.to_vec())),
         other => Err(ServerError::CopyFormat(format!(
@@ -604,6 +673,129 @@ fn parse_copy_bool(s: &str, column_idx: usize) -> Result<bool, ServerError> {
             "column {column_idx}: not a boolean ({other:?})"
         ))),
     }
+}
+
+fn parse_copy_decimal(s: &str, scale: i32, column_idx: usize) -> Result<Value, ServerError> {
+    let raw = s.trim();
+    let scale_usize = usize::try_from(scale).map_err(|_| {
+        ServerError::CopyFormat(format!(
+            "column {column_idx}: negative decimal scale {scale} not supported by COPY"
+        ))
+    })?;
+    let (negative, digits) = match raw.as_bytes().first() {
+        Some(b'-') => (true, &raw[1..]),
+        Some(b'+') => (false, &raw[1..]),
+        _ => (false, raw),
+    };
+    let mut parts = digits.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let frac = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || (whole.is_empty() && frac.is_empty())
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !frac.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid decimal literal {raw:?}"
+        )));
+    }
+    if frac.len() > scale_usize && frac.as_bytes()[scale_usize..].iter().any(|&b| b != b'0') {
+        return Err(ServerError::CopyFormat(format!(
+            "column {column_idx}: decimal literal {raw:?} has scale greater than {scale}"
+        )));
+    }
+
+    let mut value: i128 = 0;
+    for digit in whole.bytes() {
+        value = value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(i128::from(digit - b'0')))
+            .ok_or_else(|| {
+                ServerError::CopyFormat(format!("column {column_idx}: decimal overflow"))
+            })?;
+    }
+    for digit in frac.bytes().take(scale_usize) {
+        value = value
+            .checked_mul(10)
+            .and_then(|v| v.checked_add(i128::from(digit - b'0')))
+            .ok_or_else(|| {
+                ServerError::CopyFormat(format!("column {column_idx}: decimal overflow"))
+            })?;
+    }
+    let missing_frac_digits = scale_usize.saturating_sub(frac.len().min(scale_usize));
+    for _ in 0..missing_frac_digits {
+        value = value.checked_mul(10).ok_or_else(|| {
+            ServerError::CopyFormat(format!("column {column_idx}: decimal overflow"))
+        })?;
+    }
+    if negative {
+        value = value.checked_neg().ok_or_else(|| {
+            ServerError::CopyFormat(format!("column {column_idx}: decimal overflow"))
+        })?;
+    }
+    let value = i64::try_from(value)
+        .map_err(|_| ServerError::CopyFormat(format!("column {column_idx}: decimal overflow")))?;
+    Ok(Value::Decimal { value, scale })
+}
+
+fn parse_copy_date(s: &str, column_idx: usize) -> Result<i32, ServerError> {
+    let raw = s.trim();
+    if raw.len() != 10 {
+        return Err(ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid date literal {raw:?}"
+        )));
+    }
+    let bytes = raw.as_bytes();
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return Err(ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid date literal {raw:?}"
+        )));
+    }
+    let year = raw[..4].parse::<i32>().map_err(|e| {
+        ServerError::CopyFormat(format!("column {column_idx}: invalid date year: {e}"))
+    })?;
+    let month = raw[5..7].parse::<u32>().map_err(|e| {
+        ServerError::CopyFormat(format!("column {column_idx}: invalid date month: {e}"))
+    })?;
+    let day = raw[8..10].parse::<u32>().map_err(|e| {
+        ServerError::CopyFormat(format!("column {column_idx}: invalid date day: {e}"))
+    })?;
+    if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+        return Err(ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid date literal {raw:?}"
+        )));
+    }
+    Ok(days_since_epoch(year, month, day))
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+#[allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Howard Hinnant days_from_civil algorithm bounds yoe/doe before casts"
+)]
+fn days_since_epoch(year: i32, month: u32, day: u32) -> i32 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days_from_1970_03_01 = era * 146_097 + doe as i32 - 719_468;
+    days_from_1970_03_01 - 10_957
 }
 
 fn format_float_f32(v: f32) -> Vec<u8> {
@@ -632,14 +824,4 @@ fn format_float_f64(v: f64) -> Vec<u8> {
     } else {
         format!("{v}").into_bytes()
     }
-}
-
-/// Take the next `\n`-terminated line out of `buffer`, returning it as
-/// a fresh `Vec<u8>` (with the newline included) and leaving the
-/// remainder in `buffer`. Returns `None` when no full line is available.
-fn take_line(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let nl = buffer.iter().position(|&b| b == b'\n')?;
-    let mut line = buffer.split_off(nl + 1);
-    std::mem::swap(buffer, &mut line);
-    Some(line)
 }

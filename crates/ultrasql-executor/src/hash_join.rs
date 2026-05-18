@@ -37,7 +37,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use ultrasql_core::{Schema, Value};
-use ultrasql_planner::{LogicalJoinType, ScalarExpr};
+use ultrasql_planner::{BinaryOp, LogicalJoinType, ScalarExpr};
 use ultrasql_vec::Batch;
 
 use crate::eval::Eval;
@@ -69,6 +69,7 @@ pub struct HashJoin {
     left_key_evals: Vec<Eval>,
     right_key_evals: Vec<Eval>,
     residual_eval: Option<Eval>,
+    residual_fast: Option<FastResidual>,
     join_type: LogicalJoinType,
     schema: Schema,
     left_schema: Schema,
@@ -79,6 +80,8 @@ pub struct HashJoin {
     hash_table: Option<HashMap<JoinKey, Vec<usize>>>,
     /// Whether each left row matched at least one probe row.
     left_matched: Vec<bool>,
+    /// Number of build-side rows whose match bit is set.
+    matched_left_count: usize,
     /// Joined rows produced from probe batches but not yet emitted.
     pending_output: VecDeque<Vec<Value>>,
     /// `true` once the right/probe side has been fully consumed.
@@ -182,6 +185,9 @@ impl HashJoin {
             right,
             left_key_evals: left_keys.into_iter().map(Eval::new).collect(),
             right_key_evals: right_keys.into_iter().map(Eval::new).collect(),
+            residual_fast: residual
+                .as_ref()
+                .and_then(|expr| match_fast_residual(expr, left_schema.len())),
             residual_eval: residual.map(Eval::new),
             join_type,
             schema,
@@ -190,6 +196,7 @@ impl HashJoin {
             left_rows: Vec::new(),
             hash_table: None,
             left_matched: Vec::new(),
+            matched_left_count: 0,
             pending_output: VecDeque::new(),
             probe_finished: false,
             next_unmatched_left: 0,
@@ -319,11 +326,19 @@ impl HashJoin {
         }
 
         self.left_matched = vec![false; self.left_rows.len()];
+        self.matched_left_count = 0;
         self.hash_table = Some(hash_table);
         Ok(())
     }
 
     fn probe_once(&mut self) -> Result<bool, ExecError> {
+        if matches!(
+            self.join_type,
+            LogicalJoinType::Semi | LogicalJoinType::Anti
+        ) && self.matched_left_count == self.left_rows.len()
+        {
+            return Ok(false);
+        }
         let Some(batch) = self.right.next_batch()? else {
             return Ok(false);
         };
@@ -338,20 +353,34 @@ impl HashJoin {
                 .and_then(|table| table.get(&probe_key).cloned());
             if let Some(indices) = indices {
                 for li in indices {
-                    let joined = concat_rows(&self.left_rows[li], &right_row);
-                    if !self.passes_residual(&joined)? {
+                    if matches!(
+                        self.join_type,
+                        LogicalJoinType::Semi | LogicalJoinType::Anti
+                    ) && self.left_matched[li]
+                    {
                         continue;
                     }
                     match self.join_type {
                         LogicalJoinType::Inner => {
+                            let joined = concat_rows(&self.left_rows[li], &right_row);
+                            if !self.passes_residual(&joined)? {
+                                continue;
+                            }
                             self.pending_output.push_back(joined);
                         }
                         LogicalJoinType::LeftOuter => {
-                            self.left_matched[li] = true;
+                            let joined = concat_rows(&self.left_rows[li], &right_row);
+                            if !self.passes_residual(&joined)? {
+                                continue;
+                            }
+                            self.mark_left_matched(li);
                             self.pending_output.push_back(joined);
                         }
                         LogicalJoinType::Semi | LogicalJoinType::Anti => {
-                            self.left_matched[li] = true;
+                            if !self.passes_semi_anti_residual(li, &right_row)? {
+                                continue;
+                            }
+                            self.mark_left_matched(li);
                         }
                         LogicalJoinType::RightOuter
                         | LogicalJoinType::FullOuter
@@ -361,6 +390,13 @@ impl HashJoin {
             }
         }
         Ok(true)
+    }
+
+    fn mark_left_matched(&mut self, idx: usize) {
+        if !self.left_matched[idx] {
+            self.left_matched[idx] = true;
+            self.matched_left_count = self.matched_left_count.saturating_add(1);
+        }
     }
 
     fn passes_residual(&self, joined: &[Value]) -> Result<bool, ExecError> {
@@ -377,6 +413,147 @@ impl HashJoin {
             Err(error) => Err(ExecError::TypeMismatch(error.to_string())),
         }
     }
+
+    fn passes_semi_anti_residual(
+        &self,
+        left_idx: usize,
+        right_row: &[Value],
+    ) -> Result<bool, ExecError> {
+        let Some(eval) = &self.residual_eval else {
+            return Ok(true);
+        };
+        let left_row = &self.left_rows[left_idx];
+        if let Some(fast) = &self.residual_fast {
+            if let Some(result) = fast.eval(left_row, right_row) {
+                return Ok(result);
+            }
+        }
+        let joined = concat_rows(left_row, right_row);
+        match eval.eval(&joined) {
+            Ok(Value::Bool(true)) => Ok(true),
+            Ok(Value::Bool(false) | Value::Null) => Ok(false),
+            Ok(other) => Err(ExecError::TypeMismatch(format!(
+                "hash join residual must evaluate to Bool or Null, got {:?}",
+                other.data_type()
+            ))),
+            Err(error) => Err(ExecError::TypeMismatch(error.to_string())),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fast residual predicates
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+struct FastResidual {
+    left_index: usize,
+    right_index: usize,
+    op: BinaryOp,
+}
+
+impl FastResidual {
+    fn eval(&self, left_row: &[Value], right_row: &[Value]) -> Option<bool> {
+        let left = left_row.get(self.left_index)?;
+        let right = right_row.get(self.right_index)?;
+        compare_fast_values(left, right, self.op)
+    }
+}
+
+fn match_fast_residual(expr: &ScalarExpr, left_width: usize) -> Option<FastResidual> {
+    let ScalarExpr::Binary {
+        op, left, right, ..
+    } = expr
+    else {
+        return None;
+    };
+    if !matches!(
+        op,
+        BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+    ) {
+        return None;
+    }
+    let (
+        ScalarExpr::Column {
+            index: left_index, ..
+        },
+        ScalarExpr::Column {
+            index: right_index, ..
+        },
+    ) = (left.as_ref(), right.as_ref())
+    else {
+        return None;
+    };
+
+    match (*left_index < left_width, *right_index < left_width) {
+        (true, false) => Some(FastResidual {
+            left_index: *left_index,
+            right_index: *right_index - left_width,
+            op: *op,
+        }),
+        (false, true) => Some(FastResidual {
+            left_index: *right_index,
+            right_index: *left_index - left_width,
+            op: flip_binary_cmp(*op)?,
+        }),
+        _ => None,
+    }
+}
+
+const fn flip_binary_cmp(op: BinaryOp) -> Option<BinaryOp> {
+    match op {
+        BinaryOp::Eq => Some(BinaryOp::Eq),
+        BinaryOp::NotEq => Some(BinaryOp::NotEq),
+        BinaryOp::Lt => Some(BinaryOp::Gt),
+        BinaryOp::LtEq => Some(BinaryOp::GtEq),
+        BinaryOp::Gt => Some(BinaryOp::Lt),
+        BinaryOp::GtEq => Some(BinaryOp::LtEq),
+        _ => None,
+    }
+}
+
+fn compare_fast_values(left: &Value, right: &Value, op: BinaryOp) -> Option<bool> {
+    if left.is_null() || right.is_null() {
+        return Some(false);
+    }
+    let ordering = match (left, right) {
+        (Value::Int16(l), Value::Int16(r)) => l.cmp(r),
+        (Value::Int32(l), Value::Int32(r)) => l.cmp(r),
+        (Value::Int64(l), Value::Int64(r)) => l.cmp(r),
+        (Value::Date(l), Value::Date(r)) => l.cmp(r),
+        (Value::Time(l), Value::Time(r)) => l.cmp(r),
+        (Value::Timestamp(l), Value::Timestamp(r))
+        | (Value::TimestampTz(l), Value::TimestampTz(r))
+        | (Value::Timestamp(l), Value::TimestampTz(r))
+        | (Value::TimestampTz(l), Value::Timestamp(r)) => l.cmp(r),
+        (Value::Text(l), Value::Text(r)) => l.cmp(r),
+        (Value::Bool(l), Value::Bool(r)) => l.cmp(r),
+        (
+            Value::Decimal {
+                value: left_value,
+                scale: left_scale,
+            },
+            Value::Decimal {
+                value: right_value,
+                scale: right_scale,
+            },
+        ) if left_scale == right_scale => left_value.cmp(right_value),
+        _ => return None,
+    };
+    Some(match op {
+        BinaryOp::Eq => ordering == std::cmp::Ordering::Equal,
+        BinaryOp::NotEq => ordering != std::cmp::Ordering::Equal,
+        BinaryOp::Lt => ordering == std::cmp::Ordering::Less,
+        BinaryOp::LtEq => ordering != std::cmp::Ordering::Greater,
+        BinaryOp::Gt => ordering == std::cmp::Ordering::Greater,
+        BinaryOp::GtEq => ordering != std::cmp::Ordering::Less,
+        _ => return None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -384,9 +561,20 @@ impl HashJoin {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Eq, PartialEq, Hash)]
-struct JoinKey(Vec<OrderedValue>);
+enum JoinKey {
+    Single(OrderedValue),
+    Multi(Vec<OrderedValue>),
+}
 
 fn build_join_key(evals: &[Eval], row: &[Value]) -> Option<JoinKey> {
+    if let [eval] = evals {
+        let value = eval.eval(row).unwrap_or(Value::Null);
+        if value.is_null() {
+            return None;
+        }
+        return Some(JoinKey::Single(OrderedValue(value)));
+    }
+
     let mut values = Vec::with_capacity(evals.len());
     for eval in evals {
         let value = eval.eval(row).unwrap_or(Value::Null);
@@ -395,7 +583,7 @@ fn build_join_key(evals: &[Eval], row: &[Value]) -> Option<JoinKey> {
         }
         values.push(OrderedValue(value));
     }
-    Some(JoinKey(values))
+    Some(JoinKey::Multi(values))
 }
 
 /// A wrapper around [`Value`] that implements `Hash + Eq` so it can serve
