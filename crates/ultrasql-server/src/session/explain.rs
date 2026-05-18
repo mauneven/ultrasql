@@ -120,7 +120,9 @@ where
             Arc::clone(catalog_snapshot),
             &self.state.tables,
             Arc::clone(&self.state.heap),
+            Arc::clone(&self.state.vm),
             Arc::clone(&self.state.txn_manager),
+            self.jit_config(),
             Some(self.cancel_flag.clone()),
             &mut stream_buf,
         );
@@ -251,6 +253,7 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::CommitPrepared { .. } => "CommitPrepared",
         LogicalPlan::RollbackPrepared { .. } => "RollbackPrepared",
         LogicalPlan::SetTransaction { .. } => "SetTransaction",
+        LogicalPlan::SetVariable { .. } => "SetVariable",
         LogicalPlan::Explain { .. } => "Explain",
         LogicalPlan::Listen { .. } => "Listen",
         LogicalPlan::Notify { .. } => "Notify",

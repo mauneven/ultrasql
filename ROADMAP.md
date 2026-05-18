@@ -705,7 +705,9 @@ driver can connect.
 - [x] `Result` (constant expressions) — `SELECT 1` and similar — `Project { input: Empty }` lowers to `ResultOp` in both `lower_query` and `lower_plan`; `select_constants_round_trip.rs` covers `SELECT 1` and `SELECT 1, 2, 3`
 
 > Out of v0.5 scope (tracked in later waves):
-> - `Gather` / `GatherMerge` — parallel query plumbing. Listed in v0.7 "Parallel Execution" (`ParallelSeqScan` partitioning was prototyped and rejected in Wave 6 — see line 904; the collator pair lands with the per-worker buffer-pool partition redesign).
+> - `Gather` / `GatherMerge` and `ParallelSeqScan` — parallel query
+>   plumbing. These now live in v0.7 "Parallel Execution"; v0.5 only
+>   reserved the operator names.
 > - `Append` / `MergeAppend` — partition scans. Belongs to v0.8 "Index and Constrain" once `CREATE TABLE ... PARTITION OF` reaches the parser/catalog; no v0.5 query emits them.
 
 ### Expression Evaluation
@@ -1063,8 +1065,11 @@ The main OLAP performance differentiator over PostgreSQL.
 - [x] Hand-written ARM64 NEON intrinsics for first hot kernels
   (`pack_eq_64`, dense integer sums, filter-sum, dictionary filter-sum);
   broader per-kernel NEON coverage remains open.
-- [ ] Expanded AVX2 / AVX-512 intrinsics; current AVX2 coverage is
-  runtime-CPUID-dispatched dense filter-sum only.
+- [x] Expanded runtime-dispatched AVX2 intrinsics for core integer
+  kernels: packed `eq_i32`, all-op packed `cmp_i32_scalar` /
+  `cmp_i64_scalar`, packed `cmp_gt_i64`, dense `sum_i64`, dense widening
+  `sum_i32`, plus the existing dense filter-sum path. AVX-512 remains
+  open until x86 CI builds and benchmarks those target-feature variants.
 
 ### Dictionary Encoding
 - [x] Dictionary encoding for low-cardinality string columns (DictionaryColumn)
@@ -1076,18 +1081,30 @@ The main OLAP performance differentiator over PostgreSQL.
   projection, filter, limit, and wire output.
 
 ### JIT Compilation
-- [ ] LLVM IR generation for hot expression trees (via `inkwell`)
-- [ ] JIT threshold: queries above N rows trigger compilation
+- [x] Cranelift JIT generation for fused integer filter-sum kernels:
+  `SUM(int_col) WHERE int_col > literal` and
+  `SUM(bigint_col) WHERE bigint_col > literal` compile to
+  process-lifetime cached native code and fall back to the SIMD/scalar
+  kernels when native JIT setup is unavailable.
+- [x] JIT threshold for the fused filter-sum path: per-session
+  `jit_above_cost` gates compiled-kernel use by input row count.
 - [ ] Inline function calls in JIT code
-- [ ] `jit = on|off` GUC, `jit_above_cost` threshold
+- [x] `jit = on|off` GUC, `jit_above_cost` threshold
 
 ### Parallel Execution
-- [ ] `ParallelSeqScan` partitioning heap blocks across rayon workers (rejected in Wave 6 due to single-worker memory-bandwidth bound; revisit with per-worker buffer-pool partition)
+- [x] `ParallelSeqScan` partitioning heap blocks across worker threads —
+  executor operator splits a relation into disjoint block ranges, starts
+  worker `SeqScan::new_range_with_vm` streams, and returns worker batches
+  through a coordinator channel. Output order is intentionally unspecified
+  unless a later `ORDER BY` / `GatherMerge` imposes order.
 - [x] `Gather` / `GatherMerge` collators — executor fan-in primitives
   landed in `crates/ultrasql-executor/src/gather.rs`; `Gather` rotates
   whole unordered worker batches round-robin, `GatherMerge` performs
   streaming k-way ordered fan-in over sorted workers.
-- [ ] Cost-based parallel-plan selection
+- [x] Cost-based parallel-plan selection — `lower_heap_scan` calls
+  `choose_parallel_seq_scan_workers`, comparing sequential page/tuple cost
+  against worker-divided cost plus setup overhead, and chooses
+  `ParallelSeqScan` for large plain heap scans.
 
 ### MVCC Read Fast Path
 - [x] Storage-level all-visible walker fast path —
@@ -1096,10 +1113,11 @@ The main OLAP performance differentiator over PostgreSQL.
   calls on VM-certified pages. Heap insert/update/delete paths already
   clear VM bits when callers pass the same map; regression coverage
   verifies both the no-oracle fast path and DELETE clearing.
-- [ ] Server-owned VM plumbing and vacuum certification — production
-  `SeqScan` still needs a shared relation VM, a vacuum pass that marks
-  pages all-visible only after validating oldest-snapshot visibility,
-  and cost/plan hooks that choose the VM-aware walker.
+- [x] Server-owned VM plumbing and vacuum certification — `Server` owns a
+  shared `VisibilityMap`; COPY, generic DML, fused UPDATE/DELETE, and
+  ALTER/TRUNCATE mutation paths clear touched pages; periodic maintenance
+  certifies pages with `vacuum_mark_all_visible`; production `SeqScan`
+  uses the VM-aware walker.
 
 ### v0.7 Performance Wave Notes
 
@@ -1139,11 +1157,28 @@ The main OLAP performance differentiator over PostgreSQL.
   propagation, round-robin unordered fan-in, and streaming k-way sorted
   fan-in. Covered by `gather::tests::{gather_round_robins_worker_batches,
   gather_merge_preserves_global_order,gather_merge_handles_descending_inputs}`.
-- [x] Storage MVCC all-visible scan fast path —
+- [x] Parallel heap scan worker partitioning — `ParallelSeqScan` is now a
+  real executor operator with block-range workers, channel fan-in,
+  cancellation propagation, and a lowerer cost gate. Covered by
+  `parallel_seq_scan::tests::parallel_seq_scan_reads_disjoint_ranges`.
+- [x] Production MVCC all-visible scan fast path —
   `scan_visible_walker_with_vm` trusts VM-certified pages and bypasses
   per-tuple visibility/oracle probes while preserving DELETE correctness
-  through mandatory VM clearing on mutation paths. This is a real storage
-  primitive, not yet a production server scan path.
+  through mandatory VM clearing on mutation paths. The server now owns
+  the shared VM and certifies pages during maintenance. Covered by
+  `mvcc_vm_round_trip::server_vm_certifies_scan_and_mutation_clears`.
+- [x] Broader AVX2 dispatch — core integer compare/sum kernels now have
+  runtime CPUID-dispatched AVX2 paths in addition to ARM64 NEON paths;
+  this now includes all-op scalar comparisons for `i32` and `i64`, not
+  just equality/greater-than narrow cases.
+- [x] First production JIT path — `ultrasql-vec::jit` uses Cranelift
+  0.120.x (MSRV-compatible) to compile fused `SUM(INT) WHERE INT > lit`
+  and `SUM(BIGINT) WHERE BIGINT > lit` kernels; cached and streaming
+  fused filter-sum scans use it when session `jit` is on and the row
+  threshold is met. Covered by
+  `jit::{jit_filter_sum_i32_gt_matches_scalar,jit_filter_sum_i64_gt_matches_scalar}`,
+  `filter_sum_op::{cached_filter_sum_uses_jit_when_enabled,cached_filter_sum_i64_uses_jit_when_enabled}`,
+  and `jit_round_trip::jit_gucs_drive_fused_filter_sum`.
 
 ### v0.7 Validation Snapshot
 
@@ -1157,15 +1192,21 @@ The main OLAP performance differentiator over PostgreSQL.
   and wired through core executor/server batch paths. Remaining work is
   specialized dictionary-native text predicates and GROUP BY lowering
   beyond decode/preserve/re-encode flow.
-- [ ] SIMD coverage remains partial: ARM64 NEON exists for selected hot
-  kernels and AVX2 runtime dispatch exists for dense filter-sum, but
-  broad AVX2 / AVX-512 coverage remains open.
-- [ ] Parallel execution remains partial: fan-in collators exist, but
-  `ParallelSeqScan` worker partitioning and cost-based parallel-plan
-  selection are still open.
-- [ ] JIT remains open. MVCC all-visible work is partial: storage-level
-  VM-aware walking is implemented, while server-owned VM/vacuum wiring
-  and planner selection remain open.
+- [ ] SIMD coverage remains partial only on AVX-512 and some long-tail
+  kernels. ARM64 NEON exists for selected hot kernels and AVX2 runtime
+  dispatch now covers dense filter-sum plus core integer compare/sum
+  kernels, including all six scalar comparison ops for `i32` and `i64`.
+- [x] Parallel execution has first production path: fan-in collators,
+  `ParallelSeqScan` worker partitioning, cancellation propagation, and
+  cost-based scan selection are implemented. Remaining work is broader
+  parallel operator coverage beyond base heap scans.
+- [x] JIT has first production integer paths: Cranelift-compiled fused
+  `INT` and `BIGINT` filter-sum plus session GUCs. Remaining work is
+  broad expression-tree compilation, inline function calls, and cost
+  calibration across non-benchmark workloads.
+- [x] MVCC all-visible read path is production-wired: storage walker,
+  server-owned VM, mutation clearing, vacuum certification, and scan
+  selection are implemented.
 
 ### Milestone
 - [ ] TPC-H scale 10 runs to completion, throughput within 2× of DuckDB

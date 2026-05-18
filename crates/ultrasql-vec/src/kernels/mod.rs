@@ -179,6 +179,14 @@ fn pack_eq_64(a: &[i32; 64], b: &[i32; 64]) -> u64 {
 #[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn pack_eq_64(a: &[i32; 64], b: &[i32; 64]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime CPUID confirmed AVX2 support; the
+            // function reads only inside the borrowed 64-lane arrays.
+            return unsafe { pack_eq_64_avx2(a, b) };
+        }
+    }
     let mut mask: u64 = 0;
     // 8 chunks × 8 lanes per chunk = 64 lanes / word.
     for chunk in 0..8_usize {
@@ -193,6 +201,27 @@ fn pack_eq_64(a: &[i32; 64], b: &[i32; 64]) -> u64 {
         byte |= u64::from(a[off + 6] == b[off + 6]) << 6;
         byte |= u64::from(a[off + 7] == b[off + 7]) << 7;
         mask |= byte << (chunk * 8);
+    }
+    mask
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pack_eq_64_avx2(a: &[i32; 64], b: &[i32; 64]) -> u64 {
+    use std::arch::x86_64::{
+        __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
+    };
+
+    let mut mask: u64 = 0;
+    for chunk in 0..8_usize {
+        let off = chunk * 8;
+        // SAFETY: off <= 56; each load reads 8 i32 lanes inside the
+        // 64-lane arrays. AVX2 is guaranteed by target_feature.
+        let av = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
+        let bv = unsafe { _mm256_loadu_si256(b.as_ptr().add(off).cast::<__m256i>()) };
+        let cmp = _mm256_cmpeq_epi32(av, bv);
+        let bits = _mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u32;
+        mask |= u64::from(bits) << (chunk * 8);
     }
     mask
 }
@@ -314,10 +343,47 @@ fn sum_i64_dense(data: &[i64]) -> i64 {
     {
         sum_i64_dense_neon(data)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime CPUID confirmed AVX2 support.
+            return unsafe { sum_i64_dense_avx2(data) };
+        }
+        data.iter().fold(0_i64, |a, b| a.wrapping_add(*b))
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         data.iter().fold(0_i64, |a, b| a.wrapping_add(*b))
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sum_i64_dense_avx2(data: &[i64]) -> i64 {
+    use std::arch::x86_64::{
+        __m256i, _mm256_add_epi64, _mm256_loadu_si256, _mm256_setzero_si256, _mm256_storeu_si256,
+    };
+
+    let mut acc0 = _mm256_setzero_si256();
+    let mut acc1 = _mm256_setzero_si256();
+    let mut chunks = data.chunks_exact(8);
+    for chunk in &mut chunks {
+        // SAFETY: chunks_exact(8) gives 8 i64 lanes; each AVX2 load
+        // reads 4 lanes in-bounds.
+        let v0 = unsafe { _mm256_loadu_si256(chunk.as_ptr().cast::<__m256i>()) };
+        let v1 = unsafe { _mm256_loadu_si256(chunk.as_ptr().add(4).cast::<__m256i>()) };
+        acc0 = _mm256_add_epi64(acc0, v0);
+        acc1 = _mm256_add_epi64(acc1, v1);
+    }
+    let total = _mm256_add_epi64(acc0, acc1);
+    let mut lanes = [0_i64; 4];
+    // SAFETY: lanes has 32 bytes, exactly one __m256i store.
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), total) };
+    let mut sum = lanes.into_iter().fold(0_i64, i64::wrapping_add);
+    for &v in chunks.remainder() {
+        sum = sum.wrapping_add(v);
+    }
+    sum
 }
 
 /// Hand-rolled aarch64 NEON kernel for `sum(i64 slice)`.
@@ -398,11 +464,50 @@ fn sum_i32_widening_dense(data: &[i32]) -> i64 {
     {
         sum_i32_widening_dense_neon(data)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime CPUID confirmed AVX2 support.
+            return unsafe { sum_i32_widening_dense_avx2(data) };
+        }
+        data.iter()
+            .fold(0_i64, |a, b| a.wrapping_add(i64::from(*b)))
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         data.iter()
             .fold(0_i64, |a, b| a.wrapping_add(i64::from(*b)))
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sum_i32_widening_dense_avx2(data: &[i32]) -> i64 {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm_loadu_si128, _mm256_add_epi64, _mm256_cvtepi32_epi64,
+        _mm256_setzero_si256, _mm256_storeu_si256,
+    };
+
+    let mut acc0 = _mm256_setzero_si256();
+    let mut acc1 = _mm256_setzero_si256();
+    let mut chunks = data.chunks_exact(8);
+    for chunk in &mut chunks {
+        // SAFETY: chunks_exact(8) gives 8 i32 lanes; each 128-bit load
+        // reads 4 lanes in-bounds, then widens to four i64 lanes.
+        let lo = unsafe { _mm_loadu_si128(chunk.as_ptr().cast::<__m128i>()) };
+        let hi = unsafe { _mm_loadu_si128(chunk.as_ptr().add(4).cast::<__m128i>()) };
+        acc0 = _mm256_add_epi64(acc0, _mm256_cvtepi32_epi64(lo));
+        acc1 = _mm256_add_epi64(acc1, _mm256_cvtepi32_epi64(hi));
+    }
+    let total = _mm256_add_epi64(acc0, acc1);
+    let mut lanes = [0_i64; 4];
+    // SAFETY: lanes has 32 bytes, exactly one __m256i store.
+    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), total) };
+    let mut sum = lanes.into_iter().fold(0_i64, i64::wrapping_add);
+    for &v in chunks.remainder() {
+        sum = sum.wrapping_add(i64::from(v));
+    }
+    sum
 }
 
 /// Hand-rolled aarch64 NEON kernel for `sum(i32 slice)` widened to
@@ -757,6 +862,14 @@ fn cmp_gt_i64_pack_into(a: &[i64], scalar: i64, words: &mut [u64]) {
 /// fallback in the hot region.
 #[inline]
 fn pack_cmp_gt_64(a: &[i64; 64], scalar: i64) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime CPUID confirmed AVX2 support; the
+            // function reads only inside the borrowed 64-lane array.
+            return unsafe { pack_cmp_gt_64_avx2(a, scalar) };
+        }
+    }
     let mut mask: u64 = 0;
     // 8 chunks × 8 lanes per chunk = 64 lanes per word.
     for chunk in 0..8_usize {
@@ -771,6 +884,27 @@ fn pack_cmp_gt_64(a: &[i64; 64], scalar: i64) -> u64 {
         byte |= u64::from(a[off + 6] > scalar) << 6;
         byte |= u64::from(a[off + 7] > scalar) << 7;
         mask |= byte << (chunk * 8);
+    }
+    mask
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pack_cmp_gt_64_avx2(a: &[i64; 64], scalar: i64) -> u64 {
+    use std::arch::x86_64::{
+        __m256i, _mm256_castsi256_pd, _mm256_cmpgt_epi64, _mm256_loadu_si256, _mm256_movemask_pd,
+        _mm256_set1_epi64x,
+    };
+
+    let needle = _mm256_set1_epi64x(scalar);
+    let mut mask: u64 = 0;
+    for chunk in 0..16_usize {
+        let off = chunk * 4;
+        // SAFETY: off <= 60; load reads 4 i64 lanes inside the array.
+        let v = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
+        let cmp = _mm256_cmpgt_epi64(v, needle);
+        let bits = _mm256_movemask_pd(_mm256_castsi256_pd(cmp)) as u32;
+        mask |= u64::from(bits) << (chunk * 4);
     }
     mask
 }
@@ -837,6 +971,22 @@ pub fn filter_sum_i32_widening_gt(data: &[i32], threshold: i32) -> i64 {
         }
         s
     }
+}
+
+/// Fused predicate-and-sum over an `i64` column.
+///
+/// Returns `sum(data[i] for i where data[i] > threshold)`. This is the
+/// `BIGINT` sibling of [`filter_sum_i32_widening_gt`], used by the
+/// executor when `SUM(bigint_col) WHERE bigint_col > literal` matches a
+/// fused scalar-aggregate shape.
+#[must_use]
+pub fn filter_sum_i64_gt(data: &[i64], threshold: i64) -> i64 {
+    let mut s: i64 = 0;
+    for &v in data {
+        let m = i64::from(v > threshold).wrapping_neg();
+        s = s.wrapping_add(v & m);
+    }
+    s
 }
 
 /// Hand-NEON `i32 > threshold ⇒ sum` over a contiguous slice.
@@ -1030,6 +1180,14 @@ const fn cmp_i64_lane(op: CmpOp, a: i64, b: i64) -> bool {
 
 #[inline]
 fn pack_cmp_i32_64(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime CPUID confirmed AVX2 support; the
+            // function reads only inside the borrowed 64-lane array.
+            return unsafe { pack_cmp_i32_64_avx2(a, scalar, op) };
+        }
+    }
     let mut mask: u64 = 0;
     for chunk in 0..8_usize {
         let off = chunk * 8;
@@ -1043,6 +1201,36 @@ fn pack_cmp_i32_64(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
         byte |= u64::from(cmp_i32_lane(op, a[off + 6], scalar)) << 6;
         byte |= u64::from(cmp_i32_lane(op, a[off + 7], scalar)) << 7;
         mask |= byte << (chunk * 8);
+    }
+    mask
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pack_cmp_i32_64_avx2(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
+    use std::arch::x86_64::{
+        __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_cmpgt_epi32, _mm256_loadu_si256,
+        _mm256_movemask_ps, _mm256_set1_epi32,
+    };
+
+    let needle = _mm256_set1_epi32(scalar);
+    let mut mask: u64 = 0;
+    for chunk in 0..8_usize {
+        let off = chunk * 8;
+        // SAFETY: off <= 56; load reads 8 i32 lanes inside the array.
+        let v = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
+        let eq = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, needle))) as u32;
+        let gt = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, needle))) as u32;
+        let lt = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(needle, v))) as u32;
+        let bits = match op {
+            CmpOp::Eq => eq,
+            CmpOp::Ne => eq ^ 0xFF,
+            CmpOp::Lt => lt,
+            CmpOp::Le => lt | eq,
+            CmpOp::Gt => gt,
+            CmpOp::Ge => gt | eq,
+        } & 0xFF;
+        mask |= u64::from(bits) << (chunk * 8);
     }
     mask
 }
@@ -1070,6 +1258,14 @@ fn cmp_i32_pack_into(a: &[i32], scalar: i32, op: CmpOp, words: &mut [u64]) {
 
 #[inline]
 fn pack_cmp_i64_64(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: runtime CPUID confirmed AVX2 support; the
+            // function reads only inside the borrowed 64-lane array.
+            return unsafe { pack_cmp_i64_64_avx2(a, scalar, op) };
+        }
+    }
     let mut mask: u64 = 0;
     for chunk in 0..8_usize {
         let off = chunk * 8;
@@ -1083,6 +1279,36 @@ fn pack_cmp_i64_64(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
         byte |= u64::from(cmp_i64_lane(op, a[off + 6], scalar)) << 6;
         byte |= u64::from(cmp_i64_lane(op, a[off + 7], scalar)) << 7;
         mask |= byte << (chunk * 8);
+    }
+    mask
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn pack_cmp_i64_64_avx2(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
+    use std::arch::x86_64::{
+        __m256i, _mm256_castsi256_pd, _mm256_cmpeq_epi64, _mm256_cmpgt_epi64, _mm256_loadu_si256,
+        _mm256_movemask_pd, _mm256_set1_epi64x,
+    };
+
+    let needle = _mm256_set1_epi64x(scalar);
+    let mut mask: u64 = 0;
+    for chunk in 0..16_usize {
+        let off = chunk * 4;
+        // SAFETY: off <= 60; load reads 4 i64 lanes inside the array.
+        let v = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
+        let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, needle))) as u32;
+        let gt = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(v, needle))) as u32;
+        let lt = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(needle, v))) as u32;
+        let bits = match op {
+            CmpOp::Eq => eq,
+            CmpOp::Ne => eq ^ 0xF,
+            CmpOp::Lt => lt,
+            CmpOp::Le => lt | eq,
+            CmpOp::Gt => gt,
+            CmpOp::Ge => gt | eq,
+        } & 0xF;
+        mask |= u64::from(bits) << (chunk * 4);
     }
     mask
 }
@@ -1420,6 +1646,27 @@ mod tests {
         let got = sum_i64_with_mask(&c, &mask);
         let want: i64 = data.iter().filter(|&&v| v > 0).copied().sum();
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn filter_sum_i64_gt_matches_naive() {
+        let data: Vec<i64> = (-2048_i64..4096)
+            .map(|v| {
+                if v % 31 == 0 {
+                    v.wrapping_mul(-17)
+                } else {
+                    v.wrapping_mul(11)
+                }
+            })
+            .collect();
+        for threshold in [-10_000_i64, -1, 0, 999, 44_000] {
+            let got = filter_sum_i64_gt(&data, threshold);
+            let want = data
+                .iter()
+                .filter(|&&v| v > threshold)
+                .fold(0_i64, |acc, &v| acc.wrapping_add(v));
+            assert_eq!(got, want, "threshold {threshold}");
+        }
     }
 
     #[test]

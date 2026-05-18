@@ -49,9 +49,9 @@
 use ultrasql_core::{DataType, Field, Schema, Value};
 #[allow(unused_imports)] // BinaryOp and UnaryOp are used in binder/tests.rs via `use super::*`
 use ultrasql_parser::ast::{
-    BinaryOp, Distinct, ExplainFormat as AstExplainFormat, ExplainStmt,
+    BinaryOp, Distinct, ExplainFormat as AstExplainFormat, ExplainStmt, Expr as AstExpr, Literal,
     LockStrength as AstLockStrength, LockWaitPolicy as AstLockWaitPolicy, SelectStmt, SetOp,
-    SetQuantifier, Statement, UnaryOp,
+    SetQuantifier, SetScope, SetValue, SetVarStmt, Statement, UnaryOp,
 };
 
 use crate::catalog::Catalog;
@@ -60,7 +60,8 @@ use crate::expr::ScalarExpr;
 use crate::plan::{
     AggregateFunc, ConflictTarget, ExplainFormat, LockStrength, LockWaitPolicy,
     LogicalAggregateExpr, LogicalAlterTableAction, LogicalJoinCondition, LogicalJoinType,
-    LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, SortKey, TxnIsolationLevel,
+    LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction,
+    SortKey, TxnIsolationLevel,
 };
 use crate::scope::{ScopeFrame, ScopeStack};
 
@@ -180,6 +181,7 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
                 schema: Schema::empty(),
             })
         }
+        Statement::SetVar(s) => bind_set_var(s),
         Statement::Listen { channel, .. } => Ok(LogicalPlan::Listen {
             // Unquoted identifiers are case-folded at parse time, so the
             // value already lower-cases. Quoted identifiers retain their
@@ -199,6 +201,59 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
             schema: Schema::empty(),
         }),
         _ => Err(PlanError::NotSupported("statement variant")),
+    }
+}
+
+fn bind_set_var(stmt: &SetVarStmt) -> Result<LogicalPlan, PlanError> {
+    let name = stmt.name.value.to_ascii_lowercase();
+    let action = match stmt.scope {
+        SetScope::Session => LogicalSetVariableAction::Set,
+        SetScope::Local => LogicalSetVariableAction::SetLocal,
+        SetScope::Show => LogicalSetVariableAction::Show,
+        SetScope::Reset => LogicalSetVariableAction::Reset,
+    };
+    let value = match (&action, &stmt.value) {
+        (LogicalSetVariableAction::Set | LogicalSetVariableAction::SetLocal, SetValue::Default)
+        | (LogicalSetVariableAction::Reset, _) => None,
+        (LogicalSetVariableAction::Show, _) => None,
+        (
+            LogicalSetVariableAction::Set | LogicalSetVariableAction::SetLocal,
+            SetValue::Values(v),
+        ) => {
+            if v.len() != 1 {
+                return Err(PlanError::NotSupported("SET with multiple values"));
+            }
+            Some(set_value_to_string(&v[0])?)
+        }
+    };
+    let schema = if action == LogicalSetVariableAction::Show {
+        Schema::new([Field::required(
+            name.clone(),
+            DataType::Text { max_len: None },
+        )])
+        .expect("SHOW schema is well-formed")
+    } else {
+        Schema::empty()
+    };
+    Ok(LogicalPlan::SetVariable {
+        name,
+        action,
+        value,
+        schema,
+    })
+}
+
+fn set_value_to_string(expr: &AstExpr) -> Result<String, PlanError> {
+    match expr {
+        AstExpr::Literal(Literal::Bool { value, .. }) => {
+            Ok(if *value { "on" } else { "off" }.to_owned())
+        }
+        AstExpr::Literal(Literal::Integer { text, .. })
+        | AstExpr::Literal(Literal::Float { text, .. }) => Ok(text.clone()),
+        AstExpr::Literal(Literal::String { value, .. })
+        | AstExpr::Literal(Literal::Typed { value, .. }) => Ok(value.clone()),
+        AstExpr::Column { name } if name.parts.len() == 1 => Ok(name.parts[0].value.clone()),
+        _ => Err(PlanError::NotSupported("SET value expression")),
     }
 }
 

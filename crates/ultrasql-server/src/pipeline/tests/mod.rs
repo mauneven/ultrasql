@@ -186,6 +186,7 @@ fn lower_query_sorts_values_in_ascending_order() {
     let catalog = StdArc::new(PersistentCatalog::new());
     let pool = StdArc::new(BufferPool::new(64, BlankPageLoader));
     let heap = StdArc::new(HeapAccess::new(pool));
+    let vm = StdArc::new(ultrasql_storage::vm::VisibilityMap::new());
     let txn = StdArc::new(TransactionManager::new());
     let mvcc_snapshot = txn
         .begin(ultrasql_txn::IsolationLevel::ReadCommitted)
@@ -194,11 +195,13 @@ fn lower_query_sorts_values_in_ascending_order() {
         tables: &SampleTables::new(),
         catalog_snapshot: catalog.snapshot(),
         heap,
+        vm,
         snapshot: mvcc_snapshot,
         oracle: StdArc::clone(&txn),
         xid: Xid::new(0),
         command_id: CommandId::FIRST,
         cte_buffers: HashMap::new(),
+        jit: ultrasql_vec::jit::JitConfig::OFF,
         cancel_flag: None,
         work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
     };
@@ -301,6 +304,7 @@ pub(super) fn synthetic_ctx(tables: &SampleTables) -> LowerCtx<'_> {
     let catalog = StdArc::new(PersistentCatalog::new());
     let pool = StdArc::new(BufferPool::new(64, BlankPageLoader));
     let heap = StdArc::new(HeapAccess::new(pool));
+    let vm = StdArc::new(ultrasql_storage::vm::VisibilityMap::new());
     let txn = StdArc::new(TransactionManager::new());
     let mvcc_snapshot = txn
         .begin(ultrasql_txn::IsolationLevel::ReadCommitted)
@@ -309,11 +313,13 @@ pub(super) fn synthetic_ctx(tables: &SampleTables) -> LowerCtx<'_> {
         tables,
         catalog_snapshot: catalog.snapshot(),
         heap,
+        vm,
         snapshot: mvcc_snapshot,
         oracle: StdArc::clone(&txn),
         xid: Xid::new(0),
         command_id: CommandId::FIRST,
         cte_buffers: HashMap::new(),
+        jit: ultrasql_vec::jit::JitConfig::OFF,
         cancel_flag: None,
         work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
     }

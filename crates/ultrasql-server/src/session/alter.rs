@@ -175,7 +175,7 @@ where
                             xid: txn.xid,
                             command_id: ultrasql_core::CommandId::FIRST,
                             wal: None,
-                            vm: None,
+                            vm: Some(self.state.vm.as_ref()),
                             hot_eligible: true,
                         },
                     )
@@ -339,7 +339,7 @@ where
                             xid: txn.xid,
                             command_id: ultrasql_core::CommandId::FIRST,
                             wal: None,
-                            vm: None,
+                            vm: Some(self.state.vm.as_ref()),
                             hot_eligible: true,
                         },
                     )
@@ -480,7 +480,7 @@ where
                                 cmax: ultrasql_core::CommandId::FIRST,
                                 wal: None,
                                 fsm: None,
-                                vm: None,
+                                vm: Some(self.state.vm.as_ref()),
                             },
                         )
                         .map_err(|e| ServerError::ddl(format!("TRUNCATE heap delete: {e}")))?;

@@ -208,6 +208,19 @@ pub enum TxnIsolationLevel {
     Serializable,
 }
 
+/// Session-setting action carried by [`LogicalPlan::SetVariable`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalSetVariableAction {
+    /// `SET [SESSION] name = value`.
+    Set,
+    /// `SET LOCAL name = value`.
+    SetLocal,
+    /// `SHOW name`.
+    Show,
+    /// `RESET name`.
+    Reset,
+}
+
 // ============================================================================
 // Locking
 // ============================================================================
@@ -747,6 +760,18 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// `SET` / `SHOW` / `RESET` for supported runtime variables.
+    SetVariable {
+        /// Lower-cased variable name.
+        name: String,
+        /// Action to perform.
+        action: LogicalSetVariableAction,
+        /// Optional value string for `SET`.
+        value: Option<String>,
+        /// Empty for `SET` / `RESET`; one text column for `SHOW`.
+        schema: Schema,
+    },
+
     /// `LISTEN channel` — subscribe the session to async notifications
     /// delivered on `channel`. The server keeps the subscription in its
     /// per-process `NotifyHub` for the lifetime of the connection;
@@ -1025,6 +1050,7 @@ impl LogicalPlan {
             | Self::CommitPrepared { schema, .. }
             | Self::RollbackPrepared { schema, .. }
             | Self::SetTransaction { schema, .. }
+            | Self::SetVariable { schema, .. }
             | Self::Listen { schema, .. }
             | Self::Notify { schema, .. }
             | Self::Unlisten { schema, .. }
@@ -1538,6 +1564,23 @@ impl LogicalPlan {
             } => {
                 out.push_str(&pad);
                 let _ = fmt::write(out, format_args!("SetTransaction: {isolation_level:?}\n"));
+            }
+            Self::SetVariable {
+                name,
+                action,
+                value,
+                ..
+            } => {
+                out.push_str(&pad);
+                match value {
+                    Some(v) => {
+                        let _ =
+                            fmt::write(out, format_args!("SetVariable: {action:?} {name}={v}\n"));
+                    }
+                    None => {
+                        let _ = fmt::write(out, format_args!("SetVariable: {action:?} {name}\n"));
+                    }
+                }
             }
             Self::Listen { channel, .. } => {
                 out.push_str(&pad);

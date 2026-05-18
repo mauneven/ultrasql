@@ -17,6 +17,11 @@ thiserror     = { workspace = true }
 smallvec      = { workspace = true }
 ahash         = { workspace = true }
 bytes         = { workspace = true }
+cranelift-codegen  = { workspace = true }
+cranelift-frontend = { workspace = true }
+cranelift-jit      = { workspace = true }
+cranelift-module   = { workspace = true }
+cranelift-native   = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

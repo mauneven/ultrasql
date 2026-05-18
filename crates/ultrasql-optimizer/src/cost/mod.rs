@@ -317,6 +317,7 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::CommitPrepared { .. }
             | LogicalPlan::RollbackPrepared { .. }
             | LogicalPlan::SetTransaction { .. }
+            | LogicalPlan::SetVariable { .. }
             | LogicalPlan::Listen { .. }
             | LogicalPlan::Notify { .. }
             | LogicalPlan::Unlisten { .. }

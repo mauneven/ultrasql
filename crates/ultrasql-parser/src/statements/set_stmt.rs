@@ -8,7 +8,7 @@
 //! - `SHOW var`
 //! - `RESET var`
 
-use crate::ast::{SetScope, SetValue, SetVarStmt};
+use crate::ast::{Expr, Identifier, ObjectName, SetScope, SetValue, SetVarStmt};
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
 use crate::token::TokenKind;
@@ -80,7 +80,21 @@ impl Parser<'_> {
         } else {
             let mut exprs = Vec::new();
             loop {
-                exprs.push(self.parse_expr()?);
+                if self.peek()?.kind == TokenKind::KwOn {
+                    let tok = self.advance()?;
+                    exprs.push(Expr::Column {
+                        name: ObjectName {
+                            parts: vec![Identifier {
+                                value: "on".to_owned(),
+                                quoted: false,
+                                span: tok.span,
+                            }],
+                            span: tok.span,
+                        },
+                    });
+                } else {
+                    exprs.push(self.parse_expr()?);
+                }
                 if self.peek()?.kind == TokenKind::Comma {
                     self.advance()?;
                 } else {
@@ -161,6 +175,16 @@ mod tests {
     fn set_default() {
         let stmt = parse_set("SET work_mem = DEFAULT");
         assert!(matches!(stmt.value, SetValue::Default));
+    }
+
+    #[test]
+    fn set_keyword_on_value() {
+        let stmt = parse_set("SET jit = on");
+        let SetValue::Values(vals) = &stmt.value else {
+            panic!("expected Values")
+        };
+        assert_eq!(vals.len(), 1);
+        assert!(matches!(&vals[0], Expr::Column { name } if name.to_string() == "on"));
     }
 
     // ---- negative case ----------------------------------------------------

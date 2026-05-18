@@ -98,8 +98,9 @@ pub fn lower_plan(
         | LogicalPlan::PrepareTransaction { .. }
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
-        | LogicalPlan::SetTransaction { .. } => Err(ServerError::Unsupported(
-            "transaction control reached operator lowerer; expected txn dispatch path",
+        | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::SetVariable { .. } => Err(ServerError::Unsupported(
+            "session control reached operator lowerer; expected direct dispatch path",
         )),
         LogicalPlan::Listen { .. } | LogicalPlan::Notify { .. } | LogicalPlan::Unlisten { .. } => {
             Err(ServerError::Unsupported(

@@ -32,6 +32,7 @@ pub mod bitmap;
 pub mod column;
 pub mod dict;
 pub mod dict_i64;
+pub mod jit;
 pub mod kernels;
 
 pub use batch::{Batch, BatchError};
@@ -40,6 +41,9 @@ pub use column::{Column, ColumnError};
 pub use dict::{
     DictionaryColumn, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto,
     filter_eq_dict_code, group_by_dict,
+};
+pub use jit::{
+    DEFAULT_JIT_ABOVE_ROWS, JitConfig, filter_sum_i32_widening_gt_jit, filter_sum_i64_gt_jit,
 };
 pub use kernels::{
     CmpOp, cmp_gt_i64, cmp_gt_i64_scalar, cmp_i32_scalar, cmp_i64_scalar, count_i64, eq_i32,
@@ -69,7 +73,7 @@ pub use kernels::{
     filter_eq_i64_scalar, filter_gt_i32, filter_gt_i32_scalar, filter_lt_i32, filter_lt_i32_scalar,
 };
 pub use kernels::{
-    filter_sum_i64_where_gt_zero, filter_sum_i64_where_gt_zero_scalar,
+    filter_sum_i64_gt, filter_sum_i64_where_gt_zero, filter_sum_i64_where_gt_zero_scalar,
     filter_sum_i64_where_gt_zero_with_validity, filter_sum_par_auto_i64_where_gt_zero,
     filter_sum_par_i64_where_gt_zero,
 };

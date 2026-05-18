@@ -329,6 +329,23 @@ where
                     }
                 }
             }
+            if matches!(plan, LogicalPlan::SetVariable { .. }) {
+                match self.execute_set_variable(plan, false) {
+                    Ok(result) => {
+                        for m in &result.messages {
+                            self.send(m).await?;
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if !e.is_query_scoped() {
+                            return Err(e);
+                        }
+                        self.extended.mark_failed();
+                        return self.send_error(&e.to_string(), e.sqlstate()).await;
+                    }
+                }
+            }
             // EXPLAIN: render the wrapped plan tree. Drop the leading
             // RowDescription because Extended Query delivers it via a
             // separate Describe message.
@@ -417,11 +434,13 @@ where
                     tables: &self.state.tables,
                     catalog_snapshot: Arc::clone(&catalog_snapshot),
                     heap: Arc::clone(&self.state.heap),
+                    vm: Arc::clone(&self.state.vm),
                     snapshot: txn.snapshot.clone(),
                     oracle: Arc::clone(&self.state.txn_manager),
                     xid: txn.current_xid(),
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
+                    jit: self.jit_config(),
                     cancel_flag: Some(self.cancel_flag.clone()),
                     work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(
                         u64::MAX,
@@ -457,6 +476,7 @@ where
                     tables: &self.state.tables,
                     catalog_snapshot: Arc::clone(&catalog_snapshot),
                     heap: Arc::clone(&self.state.heap),
+                    vm: Arc::clone(&self.state.vm),
                     snapshot: txn.snapshot.clone(),
                     oracle: Arc::clone(&self.state.txn_manager),
                     // Stamp writes with the *current* effective xid so
@@ -466,6 +486,7 @@ where
                     xid: txn.current_xid(),
                     command_id: txn.current_command,
                     cte_buffers: std::collections::HashMap::new(),
+                    jit: self.jit_config(),
                     cancel_flag: Some(self.cancel_flag.clone()),
                     work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(
                         u64::MAX,

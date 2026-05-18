@@ -32,6 +32,7 @@ use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
 use ultrasql_mvcc::{Snapshot, XidStatusOracle};
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::heap::{HeapAccess, VisibleHeapWalker};
+use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
 use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
@@ -125,6 +126,11 @@ pub struct SeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'stati
     /// `snapshot`.
     #[allow(dead_code)]
     oracle: Arc<O>,
+    /// Optional server-owned visibility map. When present and the
+    /// relation has VM-certified pages, the heap walker skips per-tuple
+    /// transaction-status probes on those pages.
+    #[allow(dead_code)]
+    vm: Option<Arc<VisibilityMap>>,
     /// Static metadata captured at construction.
     relation: RelationId,
     /// Number of allocated blocks at scan-open time.
@@ -228,11 +234,41 @@ where
         Self::build(
             heap,
             relation,
+            0,
             block_count,
             snapshot,
             oracle,
+            None,
             codec,
             false,
+            true,
+            output_schema,
+        )
+    }
+
+    /// Construct a `SeqScan` that uses a server-owned visibility map.
+    #[must_use]
+    pub fn new_with_vm(
+        heap: Arc<HeapAccess<L>>,
+        relation: RelationId,
+        block_count: u32,
+        snapshot: Snapshot,
+        oracle: Arc<O>,
+        vm: Arc<VisibilityMap>,
+        codec: RowCodec,
+    ) -> Self {
+        let output_schema = codec.schema().clone();
+        Self::build(
+            heap,
+            relation,
+            0,
+            block_count,
+            snapshot,
+            oracle,
+            Some(vm),
+            codec,
+            false,
+            true,
             output_schema,
         )
     }
@@ -263,11 +299,76 @@ where
         Self::build(
             heap,
             relation,
+            0,
             block_count,
             snapshot,
             oracle,
+            None,
             codec,
             true,
+            true,
+            output_schema,
+        )
+    }
+
+    /// Construct a TID-prefixed `SeqScan` that uses a visibility map.
+    #[must_use]
+    pub fn new_with_tids_and_vm(
+        heap: Arc<HeapAccess<L>>,
+        relation: RelationId,
+        block_count: u32,
+        snapshot: Snapshot,
+        oracle: Arc<O>,
+        vm: Arc<VisibilityMap>,
+        codec: RowCodec,
+    ) -> Self {
+        let mut fields: Vec<Field> = Vec::with_capacity(codec.schema().len() + 2);
+        fields.push(Field::required("tid_block", DataType::Int32));
+        fields.push(Field::required("tid_slot", DataType::Int32));
+        for i in 0..codec.schema().len() {
+            fields.push(codec.schema().field_at(i).clone());
+        }
+        let output_schema = Schema::new(fields).expect("TID-prefixed schema is well-formed");
+        Self::build(
+            heap,
+            relation,
+            0,
+            block_count,
+            snapshot,
+            oracle,
+            Some(vm),
+            codec,
+            true,
+            true,
+            output_schema,
+        )
+    }
+
+    /// Construct a non-TID range scan for one parallel worker.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_range_with_vm(
+        heap: Arc<HeapAccess<L>>,
+        relation: RelationId,
+        start_block: u32,
+        end_block: u32,
+        snapshot: Snapshot,
+        oracle: Arc<O>,
+        vm: Arc<VisibilityMap>,
+        codec: RowCodec,
+    ) -> Self {
+        let output_schema = codec.schema().clone();
+        Self::build(
+            heap,
+            relation,
+            start_block,
+            end_block,
+            snapshot,
+            oracle,
+            Some(vm),
+            codec,
+            false,
+            false,
             output_schema,
         )
     }
@@ -279,11 +380,14 @@ where
     fn build(
         heap: Arc<HeapAccess<L>>,
         relation: RelationId,
+        start_block: u32,
         block_count: u32,
         snapshot: Snapshot,
         oracle: Arc<O>,
+        vm: Option<Arc<VisibilityMap>>,
         codec: RowCodec,
         with_tids: bool,
+        allow_cache: bool,
         output_schema: Schema,
     ) -> Self {
         // Heap-allocate the snapshot so its address is stable across
@@ -299,7 +403,10 @@ where
         //   Utf8 columns lack the `with_nulls` / `from_parts`
         //   constructors `slice_column` would need, and the bench
         //   workloads never hit them on a cached path anyway.
-        let cache_eligible = !with_tids && schema_all_fixed_numeric(codec.schema());
+        let cache_eligible = allow_cache
+            && start_block == 0
+            && !with_tids
+            && schema_all_fixed_numeric(codec.schema());
         let cache_read = if cache_eligible {
             heap.column_cache
                 .get(relation)
@@ -348,7 +455,26 @@ where
                 let snap_ref: &'static Snapshot =
                     std::mem::transmute::<&Snapshot, &'static Snapshot>(&*snapshot_box);
                 let oracle_ref: &'static O = std::mem::transmute::<&O, &'static O>(&*oracle);
-                heap_ref.scan_visible_walker(relation, block_count, snap_ref, oracle_ref)
+                if let Some(vm) = vm.as_deref() {
+                    let vm_ref: &'static VisibilityMap =
+                        std::mem::transmute::<&VisibilityMap, &'static VisibilityMap>(vm);
+                    heap_ref.scan_visible_walker_range_with_vm(
+                        relation,
+                        start_block,
+                        block_count,
+                        snap_ref,
+                        oracle_ref,
+                        vm_ref,
+                    )
+                } else {
+                    heap_ref.scan_visible_walker_range(
+                        relation,
+                        start_block,
+                        block_count,
+                        snap_ref,
+                        oracle_ref,
+                    )
+                }
             };
             Some(walker)
         };
@@ -375,6 +501,7 @@ where
             heap,
             snapshot: snapshot_box,
             oracle,
+            vm,
             relation,
             block_count,
             codec,

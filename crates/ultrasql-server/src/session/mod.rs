@@ -70,6 +70,10 @@ pub(crate) struct Session<RW> {
     /// into every [`crate::pipeline::LowerCtx`] built for an Execute /
     /// Simple Query so the executor can poll it between batches.
     pub(super) cancel_flag: ultrasql_executor::CancelFlag,
+    /// Session-local JIT enable flag, controlled by `SET jit`.
+    pub(super) jit_enabled: bool,
+    /// Session-local row threshold, controlled by `SET jit_above_cost`.
+    pub(super) jit_above_rows: usize,
     /// Receiver half of the per-connection notification channel.
     ///
     /// `LISTEN` registers the session under [`Self::pid`] and the hub
@@ -114,10 +118,19 @@ where
             pid,
             secret,
             cancel_flag,
+            jit_enabled: false,
+            jit_above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
             notify_rx,
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             pending_table_modifications: std::collections::HashMap::new(),
             pending_post_commit_maintenance: false,
+        }
+    }
+
+    pub(super) fn jit_config(&self) -> ultrasql_vec::jit::JitConfig {
+        ultrasql_vec::jit::JitConfig {
+            enabled: self.jit_enabled,
+            above_rows: self.jit_above_rows,
         }
     }
 }

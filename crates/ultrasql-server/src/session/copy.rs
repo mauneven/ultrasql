@@ -508,7 +508,7 @@ where
             command_id: txn.current_command,
             wal: None,
             fsm: None,
-            vm: None,
+            vm: Some(self.state.vm.as_ref()),
         };
         self.state
             .heap

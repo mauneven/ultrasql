@@ -231,6 +231,7 @@ impl<L: PageLoader> HeapAccess<L> {
         xid: Xid,
         command_id: CommandId,
         wal: Option<&dyn WalSink>,
+        vm: Option<&crate::vm::VisibilityMap>,
     ) -> Result<usize, HeapError>
     where
         O: XidStatusOracle + ?Sized,
@@ -267,6 +268,7 @@ impl<L: PageLoader> HeapAccess<L> {
 
         for src_block in 0..block_count {
             let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
+            let mut page_updated = false;
 
             // FPW: if the page has not been mutated since the last
             // checkpoint, emit a full-page-write record first so
@@ -428,6 +430,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 }
 
                 total_updated += 1;
+                page_updated = true;
             }
 
             // Drop the source-page write guard before touching the
@@ -451,6 +454,9 @@ impl<L: PageLoader> HeapAccess<L> {
                     Self::stamp_page_lsn(&self.pool, src_page_id, last_lsn)?;
                 }
                 wal_scratch.clear();
+            }
+            if page_updated && let Some(vm) = vm {
+                vm.clear(src_page_id.relation, src_page_id.block);
             }
 
             // Defer per-page undo append: keep accumulating into the

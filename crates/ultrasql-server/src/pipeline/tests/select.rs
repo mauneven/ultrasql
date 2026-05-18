@@ -262,6 +262,7 @@ use ultrasql_txn::TransactionManager;
 pub(super) struct IndexFixture {
     pub(super) catalog: StdArc<PersistentCatalog>,
     pub(super) heap: StdArc<HeapAccess<BlankPageLoader>>,
+    vm: StdArc<ultrasql_storage::vm::VisibilityMap>,
     pub(super) txn_manager: StdArc<TransactionManager>,
     /// XID under which the rows were inserted (committed before the
     /// fixture is handed out).
@@ -282,6 +283,7 @@ pub(super) fn build_index_fixture(
     let catalog = StdArc::new(PersistentCatalog::new());
     let pool = StdArc::new(BufferPool::new(64, BlankPageLoader));
     let heap = StdArc::new(HeapAccess::new(StdArc::clone(&pool)));
+    let vm = StdArc::new(ultrasql_storage::vm::VisibilityMap::new());
     let txn_manager = StdArc::new(TransactionManager::new());
 
     // Create the table in the catalog under a fresh OID.
@@ -345,6 +347,7 @@ pub(super) fn build_index_fixture(
         IndexFixture {
             catalog,
             heap,
+            vm,
             txn_manager,
             loader_xid,
             reader_snapshot,
@@ -360,11 +363,13 @@ impl IndexFixture {
             tables,
             catalog_snapshot: self.catalog.snapshot(),
             heap: StdArc::clone(&self.heap),
+            vm: StdArc::clone(&self.vm),
             snapshot: self.reader_snapshot.clone(),
             oracle: StdArc::clone(&self.txn_manager),
             xid: self.loader_xid,
             command_id: CommandId::FIRST,
             cte_buffers: HashMap::new(),
+            jit: ultrasql_vec::jit::JitConfig::OFF,
             cancel_flag: None,
             work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(
                 u64::MAX,

@@ -9,6 +9,7 @@ use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
 use ultrasql_mvcc::{TupleHeader, XidStatusOracle};
 
 use crate::buffer_pool::PageLoader;
+use crate::vm::VisibilityMap;
 
 use super::{HeapAccess, HeapError};
 
@@ -156,6 +157,92 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(stats)
     }
 
+    /// Certify all-visible pages and update `vm` for `rel`.
+    ///
+    /// A page is marked all-visible only when every normal tuple slot is
+    /// visible to every active snapshot:
+    ///
+    /// - its inserter `xmin` is committed/frozen and older than
+    ///   `oldest_active_xid`;
+    /// - it has no live committed deleter/updater `xmax`; aborted old
+    ///   deleters are safe because they can never hide the tuple again.
+    ///
+    /// Pages that fail certification have their VM bits cleared so a stale
+    /// VM entry cannot make future scans skip MVCC checks incorrectly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HeapError`] when a page cannot be pinned.
+    pub fn vacuum_mark_all_visible<O>(
+        &self,
+        rel: RelationId,
+        block_count: u32,
+        oldest_active_xid: Xid,
+        oracle: &O,
+        vm: &VisibilityMap,
+    ) -> Result<u32, HeapError>
+    where
+        O: XidStatusOracle + ?Sized,
+    {
+        let mut marked: u32 = 0;
+        for block in 0..block_count {
+            let block_number = BlockNumber::new(block);
+            let page_id = PageId::new(rel, block_number);
+            let guard = self.pool.get_page(page_id)?;
+            let all_visible = {
+                let page = guard.read();
+                let page_bytes = page.as_bytes();
+                let slot_count = page.header().slot_count();
+                let mut ok = true;
+                for slot in 0..slot_count {
+                    let item_id_off = crate::page::PAGE_HEADER_SIZE
+                        + usize::from(slot) * crate::page::ITEMID_SIZE;
+                    let raw = u32::from_le_bytes([
+                        page_bytes[item_id_off],
+                        page_bytes[item_id_off + 1],
+                        page_bytes[item_id_off + 2],
+                        page_bytes[item_id_off + 3],
+                    ]);
+                    if raw & 0b11 != 1 {
+                        continue;
+                    }
+                    let length = ((raw >> 2) & 0x7FFF) as usize;
+                    let offset = ((raw >> 17) & 0x7FFF) as usize;
+                    if length < TUPLE_HEADER_SIZE
+                        || offset
+                            .checked_add(length)
+                            .is_none_or(|end| end > page_bytes.len())
+                    {
+                        ok = false;
+                        break;
+                    }
+                    let slot_bytes = &page_bytes[offset..offset + length];
+                    let Some((header, _)) = TupleHeader::decode(&slot_bytes[..TUPLE_HEADER_SIZE])
+                    else {
+                        ok = false;
+                        break;
+                    };
+                    if !xmin_all_visible(header.xmin, oldest_active_xid, oracle)
+                        || !xmax_all_visible(header.xmax, oldest_active_xid, oracle)
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                ok
+            };
+            drop(guard);
+
+            if all_visible {
+                vm.mark_all_visible(rel, block_number);
+                marked = marked.saturating_add(1);
+            } else {
+                vm.clear(rel, block_number);
+            }
+        }
+        Ok(marked)
+    }
+
     /// Drop every per-relation undo-log entry whose `writer_xid` is
     /// strictly less than `oldest_active_xid`.
     ///
@@ -211,4 +298,18 @@ impl<L: PageLoader> HeapAccess<L> {
             .get(&rel)
             .map_or(0, |h| h.read().entries.len())
     }
+}
+
+fn xmin_all_visible<O>(xmin: Xid, oldest_active_xid: Xid, oracle: &O) -> bool
+where
+    O: XidStatusOracle + ?Sized,
+{
+    xmin == Xid::FROZEN || (xmin < oldest_active_xid && oracle.is_committed(xmin))
+}
+
+fn xmax_all_visible<O>(xmax: Xid, oldest_active_xid: Xid, oracle: &O) -> bool
+where
+    O: XidStatusOracle + ?Sized,
+{
+    xmax.is_invalid() || (xmax < oldest_active_xid && oracle.is_aborted(xmax))
 }

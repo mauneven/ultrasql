@@ -680,6 +680,32 @@ fn visible_walker_vm_clear_after_delete_restores_visibility_checks() {
     assert!(oracle.calls() > 0);
 }
 
+#[test]
+fn vacuum_mark_all_visible_certifies_only_old_committed_pages() {
+    let heap = make_heap(16);
+    let committed_tid = heap.insert(rel(), b"committed", opts(100)).unwrap();
+    let _young_tid = heap.insert(rel(), b"young", opts(300)).unwrap();
+
+    let vm = crate::vm::VisibilityMap::new();
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(100));
+    oracle.set_committed(Xid::new(300));
+
+    let marked = heap
+        .vacuum_mark_all_visible(rel(), heap.block_count(rel()), Xid::new(200), &oracle, &vm)
+        .unwrap();
+
+    assert_eq!(marked, 0);
+    assert!(!vm.is_all_visible(rel(), committed_tid.page.block));
+
+    let marked = heap
+        .vacuum_mark_all_visible(rel(), heap.block_count(rel()), Xid::new(400), &oracle, &vm)
+        .unwrap();
+
+    assert_eq!(marked, 1);
+    assert!(vm.is_all_visible(rel(), committed_tid.page.block));
+}
+
 // Property test: for any set of inserts + random deletes, the
 // visibility-aware scan returns exactly the non-deleted tuples when
 // all xids are committed.

@@ -74,6 +74,7 @@ use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::page::Page;
+use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::{IsolationLevel, SsiManager, Transaction, TransactionManager};
 use ultrasql_vec::column::Column;
 
@@ -245,6 +246,9 @@ pub struct Server {
     /// row inserted on one session is visible to the next snapshot
     /// on another session.
     pub heap: Arc<HeapAccess<BlankPageLoader>>,
+    /// Shared visibility map for heap relations. Mutations clear touched
+    /// pages; maintenance marks pages all-visible after certification.
+    pub vm: Arc<VisibilityMap>,
     /// Transaction manager. Owns the XID allocator, the CLOG, and the
     /// lock manager; every Simple Query in v0.5 runs as an autocommit
     /// transaction allocated from this manager.
@@ -384,6 +388,7 @@ impl Server {
         // user-table DML so every connection observes the same heap.
         let pool = Arc::new(BufferPool::new(pool_frames, BlankPageLoader));
         let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
+        let vm = Arc::new(VisibilityMap::new());
         match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
             Ok(stats) => {
                 tracing::info!(?stats, "persistent catalog bootstrapped");
@@ -414,6 +419,7 @@ impl Server {
             tables,
             persistent_catalog,
             heap,
+            vm,
             txn_manager,
             plan_cache,
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
@@ -478,7 +484,41 @@ impl Server {
             }
             Err(e) => tracing::warn!(error = %e, "undo-log GC failed"),
         }
+        self.vacuum_mark_visible_pages(oldest);
         self.run_one_pending_analyze();
+    }
+
+    fn vacuum_mark_visible_pages(&self, oldest: ultrasql_core::Xid) {
+        let snapshot = self.catalog_snapshot();
+        for entry in snapshot.tables.values() {
+            let rel = RelationId(entry.oid);
+            let block_count = self.heap.block_count(rel).max(entry.n_blocks);
+            if block_count == 0 {
+                continue;
+            }
+            match self.heap.vacuum_mark_all_visible(
+                rel,
+                block_count,
+                oldest,
+                self.txn_manager.as_ref(),
+                self.vm.as_ref(),
+            ) {
+                Ok(marked) => {
+                    if marked > 0 {
+                        tracing::debug!(
+                            table = %entry.name,
+                            marked,
+                            "vacuum marked pages all-visible"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    table = %entry.name,
+                    error = %e,
+                    "vacuum all-visible certification failed"
+                ),
+            }
+        }
     }
 
     /// Initialize a server that boots from `data_dir`.
@@ -530,6 +570,7 @@ impl Server {
             sink,
         ));
         let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
+        let vm = Arc::new(VisibilityMap::new());
 
         let persistent_catalog = Arc::new(PersistentCatalog::new());
         match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
@@ -557,6 +598,7 @@ impl Server {
             tables,
             persistent_catalog,
             heap,
+            vm,
             txn_manager,
             plan_cache,
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
@@ -891,7 +933,9 @@ fn run_plan_in_txn(
     catalog_snapshot: Arc<CatalogSnapshot>,
     tables: &SampleTables,
     heap: Arc<HeapAccess<BlankPageLoader>>,
+    vm: Arc<VisibilityMap>,
     oracle: Arc<TransactionManager>,
+    jit: ultrasql_vec::jit::JitConfig,
     cancel_flag: Option<ultrasql_executor::CancelFlag>,
     stream_buf: &mut bytes::BytesMut,
 ) -> Result<SelectResult, ServerError> {
@@ -905,6 +949,7 @@ fn run_plan_in_txn(
         tables,
         catalog_snapshot,
         heap,
+        vm,
         snapshot: txn.snapshot.clone(),
         oracle,
         // Use the *current* effective xid so writes performed inside an
@@ -914,6 +959,7 @@ fn run_plan_in_txn(
         xid: txn.current_xid(),
         command_id: txn.current_command,
         cte_buffers: std::collections::HashMap::new(),
+        jit,
         cancel_flag,
         work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
     };

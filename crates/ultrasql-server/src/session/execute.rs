@@ -20,10 +20,12 @@ use ultrasql_optimizer::{
 };
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
-    Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan, TableMeta,
-    bind,
+    Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalPlan,
+    LogicalSetVariableAction, TableMeta, bind,
 };
-use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
+use ultrasql_protocol::{
+    BackendMessage, FieldDescription, FrontendMessage, decode_frontend, encode_backend,
+};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
@@ -41,6 +43,16 @@ use crate::{
     BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
     run_plan_in_txn, try_run_cached_int32_pair_select,
 };
+
+fn parse_bool_guc(value: &str) -> Result<bool, ServerError> {
+    match value.to_ascii_lowercase().as_str() {
+        "on" | "true" | "1" | "yes" => Ok(true),
+        "off" | "false" | "0" | "no" => Ok(false),
+        _ => Err(ServerError::Unsupported(
+            "invalid boolean runtime parameter",
+        )),
+    }
+}
 
 impl<RW> Session<RW>
 where
@@ -248,6 +260,10 @@ where
             return Err(ServerError::TransactionAborted);
         }
 
+        if matches!(&plan, LogicalPlan::SetVariable { .. }) {
+            return self.execute_set_variable(&plan, true);
+        }
+
         // DDL is dispatched ahead of operator lowering: it never produces
         // rows, so the lowerer would only round-trip it through an
         // unreachable arm. DDL inside an explicit transaction is
@@ -316,7 +332,7 @@ where
         // reasoning for `SELECT SUM/AVG/COUNT(*) FROM t [WHERE ...]`:
         // the optimizer's rewrite set has no rule that improves a leaf
         // scalar-aggregate plan, and the lowerer's
-        // `try_lower_cached_scalar_aggregate_i32` / `try_lower_fused_filter_sum_i32`
+        // `try_lower_cached_scalar_aggregate_i32` / `try_lower_fused_filter_sum_int`
         // fast paths run directly against the bound shape. Bypassing
         // the optimizer drops the DashMap lookup + `LogicalPlan::clone`
         // pair from every iteration of `cross_compare_sql --workload
@@ -333,6 +349,110 @@ where
             }
         };
         self.run_dml_or_select(&optimised_plan, &catalog_snapshot)
+    }
+
+    pub(crate) fn execute_set_variable(
+        &mut self,
+        plan: &LogicalPlan,
+        include_row_description: bool,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::SetVariable {
+            name,
+            action,
+            value,
+            ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported("execute_set_variable: wrong plan"));
+        };
+        match action {
+            LogicalSetVariableAction::Set | LogicalSetVariableAction::SetLocal => {
+                let Some(v) = value.as_deref() else {
+                    return self.execute_set_variable_reset(name);
+                };
+                self.apply_session_variable(name, v)?;
+                Ok(result_encoder::run_ddl_command("SET"))
+            }
+            LogicalSetVariableAction::Reset => self.execute_set_variable_reset(name),
+            LogicalSetVariableAction::Show => {
+                Ok(self.show_session_variable(name, include_row_description)?)
+            }
+        }
+    }
+
+    fn execute_set_variable_reset(&mut self, name: &str) -> Result<SelectResult, ServerError> {
+        match name {
+            "jit" => {
+                self.jit_enabled = false;
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
+            "jit_above_cost" => {
+                self.jit_above_rows = ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS;
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
+            _ => Err(ServerError::Unsupported("unsupported runtime parameter")),
+        }
+    }
+
+    fn apply_session_variable(&mut self, name: &str, value: &str) -> Result<(), ServerError> {
+        match name {
+            "jit" => {
+                self.jit_enabled = parse_bool_guc(value)?;
+                Ok(())
+            }
+            "jit_above_cost" => {
+                let parsed = value
+                    .parse::<usize>()
+                    .map_err(|_| ServerError::Unsupported("invalid jit_above_cost"))?;
+                self.jit_above_rows = parsed;
+                Ok(())
+            }
+            _ => Err(ServerError::Unsupported("unsupported runtime parameter")),
+        }
+    }
+
+    fn show_session_variable(
+        &self,
+        name: &str,
+        include_row_description: bool,
+    ) -> Result<SelectResult, ServerError> {
+        let shown = match name {
+            "jit" => {
+                if self.jit_enabled {
+                    "on".to_owned()
+                } else {
+                    "off".to_owned()
+                }
+            }
+            "jit_above_cost" => self.jit_above_rows.to_string(),
+            _ => return Err(ServerError::Unsupported("unsupported runtime parameter")),
+        };
+        let mut messages = Vec::with_capacity(3);
+        if include_row_description {
+            messages.push(BackendMessage::RowDescription {
+                fields: vec![FieldDescription {
+                    name: name.to_owned(),
+                    table_oid: 0,
+                    col_attnum: 0,
+                    type_oid: 25,
+                    type_size: -1,
+                    type_modifier: -1,
+                    format_code: 0,
+                }],
+            });
+        }
+        messages.push(BackendMessage::DataRow {
+            columns: vec![Some(shown.into_bytes())],
+        });
+        messages.push(BackendMessage::CommandComplete {
+            tag: "SHOW".to_owned(),
+        });
+        Ok(SelectResult {
+            messages,
+            streamed_body: None,
+            shared_streamed_body: None,
+            rows: 1,
+        })
     }
 
     /// Hot-path entry for a SQL string that has already been parsed +
@@ -408,7 +528,7 @@ where
     /// `Scan` or `Filter(Scan)` shape — exactly the shapes that the
     /// pipeline lowerer routes through the column-cache fast path
     /// (`try_lower_cached_scalar_aggregate_i32` for pure SUM/AVG over
-    /// an `Int32` column, `try_lower_fused_filter_sum_i32` for the
+    /// an `Int32` column, `try_lower_fused_filter_sum_int` for the
     /// filtered SUM variant). The cost-based optimizer has no rule
     /// that rewrites a leaf scalar-aggregate plan into a cheaper
     /// equivalent, so the per-iter optimizer pass + plan-cache lookup
@@ -590,7 +710,9 @@ where
                     Arc::clone(catalog_snapshot),
                     &self.state.tables,
                     Arc::clone(&self.state.heap),
+                    Arc::clone(&self.state.vm),
                     Arc::clone(&self.state.txn_manager),
+                    self.jit_config(),
                     Some(self.cancel_flag.clone()),
                     &mut self.write_buf,
                 );
@@ -604,7 +726,9 @@ where
                     Arc::clone(catalog_snapshot),
                     &self.state.tables,
                     Arc::clone(&self.state.heap),
+                    Arc::clone(&self.state.vm),
                     Arc::clone(&self.state.txn_manager),
+                    self.jit_config(),
                     Some(self.cancel_flag.clone()),
                     &mut self.write_buf,
                 );

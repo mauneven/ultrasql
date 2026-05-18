@@ -194,8 +194,9 @@ pub fn build_operator(
         | LogicalPlan::PrepareTransaction { .. }
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
-        | LogicalPlan::SetTransaction { .. } => Err(BuildError::Unsupported(
-            "transaction-control statements are dispatched outside the operator pipeline",
+        | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::SetVariable { .. } => Err(BuildError::Unsupported(
+            "session-control statements are dispatched outside the operator pipeline",
         )),
         LogicalPlan::Listen { .. } | LogicalPlan::Notify { .. } | LogicalPlan::Unlisten { .. } => {
             Err(BuildError::Unsupported(

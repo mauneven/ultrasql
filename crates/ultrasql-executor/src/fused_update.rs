@@ -40,6 +40,7 @@ use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, Xid};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::heap::HeapAccess;
+use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
@@ -106,6 +107,7 @@ pub struct FusedUpdateInt32Add<L: PageLoader> {
     delta: i32,
     xid: Xid,
     command_id: CommandId,
+    vm: Option<Arc<VisibilityMap>>,
     schema: Schema,
     done: bool,
 }
@@ -151,9 +153,16 @@ impl<L: PageLoader> FusedUpdateInt32Add<L> {
             delta,
             xid,
             command_id,
+            vm: None,
             schema,
             done: false,
         }
+    }
+
+    #[must_use]
+    pub fn with_visibility_map(mut self, vm: Arc<VisibilityMap>) -> Self {
+        self.vm = Some(vm);
+        self
     }
 }
 
@@ -209,6 +218,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Fused
                 self.xid,
                 self.command_id,
                 wal_sink,
+                self.vm.as_deref(),
             )
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
 

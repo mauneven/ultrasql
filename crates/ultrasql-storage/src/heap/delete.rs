@@ -282,6 +282,7 @@ impl<L: PageLoader> HeapAccess<L> {
         xid: Xid,
         command_id: CommandId,
         wal: Option<&dyn WalSink>,
+        vm: Option<&crate::vm::VisibilityMap>,
     ) -> Result<usize, HeapError>
     where
         O: XidStatusOracle + ?Sized,
@@ -306,6 +307,7 @@ impl<L: PageLoader> HeapAccess<L> {
 
         for src_block in 0..block_count {
             let src_page_id = PageId::new(rel, BlockNumber::new(src_block));
+            let mut page_deleted = false;
 
             // FPW: emit the canonical page image first if this is
             // the first mutation since the last checkpoint. Matches
@@ -417,6 +419,7 @@ impl<L: PageLoader> HeapAccess<L> {
                 }
 
                 total_deleted += 1;
+                page_deleted = true;
             }
 
             drop(src_page);
@@ -436,6 +439,9 @@ impl<L: PageLoader> HeapAccess<L> {
                     Self::stamp_page_lsn(&self.pool, src_page_id, last_lsn)?;
                 }
                 wal_scratch.clear();
+            }
+            if page_deleted && let Some(vm) = vm {
+                vm.clear(src_page_id.relation, src_page_id.block);
             }
         }
 

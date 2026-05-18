@@ -4,7 +4,8 @@
 use ultrasql_core::RelationId;
 use ultrasql_executor::Operator;
 use ultrasql_executor::filter_sum_op::{
-    CachedAvgI32Scan, CachedFilterSumI32Scan, CachedSumI32Scan, FilterSumI32Scan,
+    CachedAvgI32Scan, CachedFilterSumI32Scan, CachedFilterSumI64Scan, CachedSumI32Scan,
+    FilterSumI32Scan, FilterSumI64Scan,
 };
 use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
 
@@ -315,7 +316,7 @@ pub(super) fn try_lower_direct_scalar_aggregate(
 /// plan tree does not match the fused shape (caller falls through
 /// to `HashAggregate`), and `Err(_)` on a lowering failure of the
 
-pub(super) fn try_lower_fused_filter_sum_i32(
+pub(super) fn try_lower_fused_filter_sum_int(
     input: &LogicalPlan,
     group_by: &[ScalarExpr],
     aggregates: &[ultrasql_planner::LogicalAggregateExpr],
@@ -324,7 +325,7 @@ pub(super) fn try_lower_fused_filter_sum_i32(
     use ultrasql_planner::AggregateFunc;
 
     // Shape: scalar SUM aggregate (no GROUP BY, one Sum entry,
-    // non-DISTINCT, Int32 column argument).
+    // non-DISTINCT, Int32 or Int64 column argument).
     if !group_by.is_empty() || aggregates.len() != 1 {
         return Ok(None);
     }
@@ -332,16 +333,21 @@ pub(super) fn try_lower_fused_filter_sum_i32(
     if agg.func != AggregateFunc::Sum || agg.distinct {
         return Ok(None);
     }
-    let sum_col = match &agg.arg {
+    let (sum_col, sum_type) = match &agg.arg {
         Some(ScalarExpr::Column {
             index,
             data_type: ultrasql_core::DataType::Int32,
             ..
-        }) => *index,
+        }) => (*index, ultrasql_core::DataType::Int32),
+        Some(ScalarExpr::Column {
+            index,
+            data_type: ultrasql_core::DataType::Int64,
+            ..
+        }) => (*index, ultrasql_core::DataType::Int64),
         _ => return Ok(None),
     };
 
-    // Shape: Filter over Scan with Int32 predicate `col op lit`.
+    // Shape: Filter over Scan with integer predicate `col op lit`.
     let LogicalPlan::Filter {
         input: filter_input,
         predicate,
@@ -351,10 +357,6 @@ pub(super) fn try_lower_fused_filter_sum_i32(
     };
     let LogicalPlan::Scan { table, .. } = filter_input.as_ref() else {
         return Ok(None);
-    };
-    let (pred_col, pred_op, pred_lit) = match extract_int32_col_op_lit(predicate) {
-        Some(x) => x,
-        None => return Ok(None),
     };
 
     // The scan target must be a real heap relation (we only built
@@ -371,53 +373,96 @@ pub(super) fn try_lower_fused_filter_sum_i32(
     // Schema validation: both `pred_col` and `sum_col` must be
     // Int32 in the relation's catalog schema.
     let schema = &entry.schema;
-    if pred_col >= schema.len() || sum_col >= schema.len() {
+    if sum_col >= schema.len() {
         return Ok(None);
     }
-    if !matches!(
-        schema.field_at(pred_col).data_type,
-        ultrasql_core::DataType::Int32
-    ) || !matches!(
-        schema.field_at(sum_col).data_type,
-        ultrasql_core::DataType::Int32
-    ) {
-        return Ok(None);
-    }
-
-    // Cache-driven fast path: when the relation already has a
-    // live column-cache entry, skip the SeqScan layer entirely
-    // and run the fused SIMD kernel directly over the cached
-    // `Arc<CachedColumns>`. The cache-driving `SeqScan` would
-    // otherwise copy each column out via `slice_column` (one
-    // ~4 MB memcpy per 1 M-row Int32 column) before passing the
-    // batch through the operator pipeline.
     let rel_id = RelationId(entry.oid);
-    if let Some(columns) = ctx.heap.column_cache.get(rel_id) {
-        let fused = CachedFilterSumI32Scan::new(
-            columns,
-            pred_col,
-            pred_lit,
-            pred_op,
-            sum_col,
-            agg.output_name.clone(),
-        );
-        return Ok(Some(Box::new(fused)));
-    }
 
-    // Cache miss — drive the regular SeqScan path. The first
-    // SeqScan over a relation populates the column cache as a
-    // side effect of its walk, so subsequent queries hit the
-    // direct-from-cache branch above.
-    let scan = lower_heap_scan(entry, None, ctx)?;
-    let fused = FilterSumI32Scan::new(
-        scan,
-        pred_col,
-        pred_lit,
-        pred_op,
-        sum_col,
-        agg.output_name.clone(),
-    );
-    Ok(Some(Box::new(fused)))
+    match sum_type {
+        ultrasql_core::DataType::Int32 => {
+            let (pred_col, pred_op, pred_lit) = match extract_int32_col_op_lit(predicate) {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            if pred_col >= schema.len()
+                || !matches!(
+                    schema.field_at(pred_col).data_type,
+                    ultrasql_core::DataType::Int32
+                )
+                || !matches!(
+                    schema.field_at(sum_col).data_type,
+                    ultrasql_core::DataType::Int32
+                )
+            {
+                return Ok(None);
+            }
+            if let Some(columns) = ctx.heap.column_cache.get(rel_id) {
+                let fused = CachedFilterSumI32Scan::new(
+                    columns,
+                    pred_col,
+                    pred_lit,
+                    pred_op,
+                    sum_col,
+                    agg.output_name.clone(),
+                )
+                .with_jit(ctx.jit);
+                return Ok(Some(Box::new(fused)));
+            }
+            let scan = lower_heap_scan(entry, None, ctx)?;
+            let fused = FilterSumI32Scan::new(
+                scan,
+                pred_col,
+                pred_lit,
+                pred_op,
+                sum_col,
+                agg.output_name.clone(),
+            )
+            .with_jit(ctx.jit);
+            Ok(Some(Box::new(fused)))
+        }
+        ultrasql_core::DataType::Int64 => {
+            let (pred_col, pred_op, pred_lit) = match extract_int64_col_op_lit(predicate) {
+                Some(x) => x,
+                None => return Ok(None),
+            };
+            if pred_col >= schema.len()
+                || !matches!(
+                    schema.field_at(pred_col).data_type,
+                    ultrasql_core::DataType::Int64
+                )
+                || !matches!(
+                    schema.field_at(sum_col).data_type,
+                    ultrasql_core::DataType::Int64
+                )
+            {
+                return Ok(None);
+            }
+            if let Some(columns) = ctx.heap.column_cache.get(rel_id) {
+                let fused = CachedFilterSumI64Scan::new(
+                    columns,
+                    pred_col,
+                    pred_lit,
+                    pred_op,
+                    sum_col,
+                    agg.output_name.clone(),
+                )
+                .with_jit(ctx.jit);
+                return Ok(Some(Box::new(fused)));
+            }
+            let scan = lower_heap_scan(entry, None, ctx)?;
+            let fused = FilterSumI64Scan::new(
+                scan,
+                pred_col,
+                pred_lit,
+                pred_op,
+                sum_col,
+                agg.output_name.clone(),
+            )
+            .with_jit(ctx.jit);
+            Ok(Some(Box::new(fused)))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Match a predicate of shape `Column { Int32 } op Literal(Int32)`
@@ -467,6 +512,63 @@ pub(super) fn extract_int32_col_op_lit(
         Some((col, cmp_op, lit))
     } else if let (Some(lit), Some(col)) = (lit_from(left), col_idx_from(right)) {
         // Mirror: swap op so `lit op col` becomes `col mirror_op lit`.
+        let mirrored = match cmp_op {
+            CmpOp::Lt => CmpOp::Gt,
+            CmpOp::Le => CmpOp::Ge,
+            CmpOp::Gt => CmpOp::Lt,
+            CmpOp::Ge => CmpOp::Le,
+            CmpOp::Eq => CmpOp::Eq,
+            CmpOp::Ne => CmpOp::Ne,
+        };
+        Some((col, mirrored, lit))
+    } else {
+        None
+    }
+}
+
+/// Match a predicate of shape `Column { Int64 } op Literal(Int64)` and
+/// return the `(col_index, cmp_op, threshold)` tuple.
+pub(super) fn extract_int64_col_op_lit(
+    expr: &ScalarExpr,
+) -> Option<(usize, ultrasql_vec::kernels::CmpOp, i64)> {
+    use ultrasql_core::Value;
+    use ultrasql_vec::kernels::CmpOp;
+
+    let ScalarExpr::Binary {
+        op, left, right, ..
+    } = expr
+    else {
+        return None;
+    };
+    let cmp_op = match op {
+        BinaryOp::Lt => CmpOp::Lt,
+        BinaryOp::LtEq => CmpOp::Le,
+        BinaryOp::Gt => CmpOp::Gt,
+        BinaryOp::GtEq => CmpOp::Ge,
+        BinaryOp::Eq => CmpOp::Eq,
+        BinaryOp::NotEq => CmpOp::Ne,
+        _ => return None,
+    };
+
+    let col_idx_from = |e: &ScalarExpr| match e {
+        ScalarExpr::Column {
+            index,
+            data_type: ultrasql_core::DataType::Int64,
+            ..
+        } => Some(*index),
+        _ => None,
+    };
+    let lit_from = |e: &ScalarExpr| match e {
+        ScalarExpr::Literal {
+            value: Value::Int64(v),
+            ..
+        } => Some(*v),
+        _ => None,
+    };
+
+    if let (Some(col), Some(lit)) = (col_idx_from(left), lit_from(right)) {
+        Some((col, cmp_op, lit))
+    } else if let (Some(lit), Some(col)) = (lit_from(left), col_idx_from(right)) {
         let mirrored = match cmp_op {
             CmpOp::Lt => CmpOp::Gt,
             CmpOp::Le => CmpOp::Ge,

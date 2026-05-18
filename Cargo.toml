@@ -96,6 +96,13 @@ config = "0.14"
 num-traits = "0.2"
 chrono     = "0.4"
 
+# JIT
+cranelift-codegen  = "0.120.0"
+cranelift-frontend = "0.120.0"
+cranelift-jit      = "0.120.0"
+cranelift-module   = "0.120.0"
+cranelift-native   = "0.120.0"
+
 # Auth / crypto
 hmac       = "0.12"
 sha2       = "0.10"

@@ -67,6 +67,7 @@ use ultrasql_executor::{Operator, RowCodec};
 #[cfg(test)]
 use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType};
 use ultrasql_storage::heap::HeapAccess;
+use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::TransactionManager;
 use ultrasql_vec::Batch;
 #[cfg(test)]
@@ -180,6 +181,8 @@ pub struct LowerCtx<'a> {
     pub catalog_snapshot: Arc<CatalogSnapshot>,
     /// Shared heap access handle.
     pub heap: Arc<HeapAccess<BlankPageLoader>>,
+    /// Shared visibility map for persistent heap relations.
+    pub vm: Arc<VisibilityMap>,
     /// MVCC snapshot taken at statement start.
     pub snapshot: Snapshot,
     /// Transaction manager (also serves as `XidStatusOracle` for
@@ -200,6 +203,9 @@ pub struct LowerCtx<'a> {
     /// not need to opt in; the field flows through recursive lowering
     /// for free.
     pub cte_buffers: HashMap<String, CteBuffer>,
+    /// Per-statement JIT policy. Lowerers pass this into narrow
+    /// compiled-kernel operators; generic plans ignore it.
+    pub jit: ultrasql_vec::jit::JitConfig,
     /// Per-statement cancel flag clone. The session's `CancelRegistry`
     /// entry holds the canonical flag; this is a shared clone the
     /// lowerer threads into cancellation-aware operators (`SeqScan`,

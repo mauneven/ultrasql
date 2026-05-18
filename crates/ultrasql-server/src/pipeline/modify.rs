@@ -94,7 +94,8 @@ pub(super) fn lower_real_insert(
         CommandId::FIRST,
         None,
         child,
-    );
+    )
+    .with_visibility_map(Arc::clone(&ctx.vm));
     Ok(Box::new(modify))
 }
 
@@ -107,12 +108,13 @@ pub(super) fn build_tid_seq_scan(entry: &TableEntry, ctx: &LowerCtx<'_>) -> Box<
     let rel = RelationId(entry.oid);
     let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
     let codec = RowCodec::new(entry.schema.clone());
-    let scan = SeqScan::new_with_tids(
+    let scan = SeqScan::new_with_tids_and_vm(
         Arc::clone(&ctx.heap),
         rel,
         block_count,
         ctx.snapshot.clone(),
         Arc::clone(&ctx.oracle),
+        Arc::clone(&ctx.vm),
         codec,
     );
     Box::new(scan)
@@ -276,7 +278,8 @@ pub(super) fn try_build_fused_update(
         delta,
         ctx.xid,
         ctx.command_id,
-    );
+    )
+    .with_visibility_map(Arc::clone(&ctx.vm));
     Ok(Some(Box::new(op)))
 }
 
@@ -331,7 +334,8 @@ pub(super) fn lower_real_update(
         ctx.command_id,
         None,
         child,
-    );
+    )
+    .with_visibility_map(Arc::clone(&ctx.vm));
     Ok(Box::new(modify))
 }
 
@@ -403,7 +407,8 @@ pub(super) fn try_build_fused_delete(
         predicate,
         ctx.xid,
         ctx.command_id,
-    );
+    )
+    .with_visibility_map(Arc::clone(&ctx.vm));
     Ok(Some(Box::new(op)))
 }
 
@@ -451,7 +456,8 @@ pub(super) fn lower_real_delete(
         ctx.command_id,
         None,
         child,
-    );
+    )
+    .with_visibility_map(Arc::clone(&ctx.vm));
     Ok(Box::new(modify))
 }
 

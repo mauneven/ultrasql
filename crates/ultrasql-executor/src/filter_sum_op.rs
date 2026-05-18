@@ -37,8 +37,10 @@ use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_storage::column_cache::CachedColumns;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
+use ultrasql_vec::jit::{JitConfig, filter_sum_i32_widening_gt_jit, filter_sum_i64_gt_jit};
 use ultrasql_vec::kernels::{
-    CmpOp, cmp_i32_scalar, filter_sum_i32_widening_gt, sum_i32_widening, sum_i32_widening_with_mask,
+    CmpOp, cmp_i32_scalar, cmp_i64_scalar, filter_sum_i32_widening_gt, filter_sum_i64_gt,
+    sum_i32_widening, sum_i32_widening_with_mask, sum_i64_with_mask,
 };
 
 use crate::{ExecError, Operator};
@@ -66,6 +68,21 @@ pub struct FilterSumI32Scan {
     /// `true` after the operator has emitted its single-row
     /// result batch. Subsequent calls return `Ok(None)`.
     done: bool,
+    /// Per-statement JIT policy inherited from the lowerer.
+    jit: JitConfig,
+}
+
+/// Fused filter + SUM operator over an `Int64` predicate and `Int64`
+/// sum column. This is the `BIGINT` sibling of [`FilterSumI32Scan`].
+pub struct FilterSumI64Scan {
+    inner: Box<dyn Operator>,
+    predicate_col: usize,
+    predicate_threshold: i64,
+    predicate_op: CmpOp,
+    sum_col: usize,
+    output_schema: Schema,
+    done: bool,
+    jit: JitConfig,
 }
 
 impl std::fmt::Debug for FilterSumI32Scan {
@@ -105,7 +122,60 @@ impl FilterSumI32Scan {
             sum_col,
             output_schema,
             done: false,
+            jit: JitConfig::OFF,
         }
+    }
+
+    /// Enable runtime-compiled kernels for this operator.
+    #[must_use]
+    pub fn with_jit(mut self, jit: JitConfig) -> Self {
+        self.jit = jit;
+        self
+    }
+}
+
+impl std::fmt::Debug for FilterSumI64Scan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilterSumI64Scan")
+            .field("predicate_col", &self.predicate_col)
+            .field("predicate_threshold", &self.predicate_threshold)
+            .field("predicate_op", &self.predicate_op)
+            .field("sum_col", &self.sum_col)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FilterSumI64Scan {
+    /// Build the fused `Int64` filter-sum operator.
+    #[must_use]
+    pub fn new(
+        inner: Box<dyn Operator>,
+        predicate_col: usize,
+        predicate_threshold: i64,
+        predicate_op: CmpOp,
+        sum_col: usize,
+        output_name: String,
+    ) -> Self {
+        let output_schema = Schema::new([Field::required(output_name, DataType::Int64)])
+            .expect("output schema is trivially well-formed");
+        Self {
+            inner,
+            predicate_col,
+            predicate_threshold,
+            predicate_op,
+            sum_col,
+            output_schema,
+            done: false,
+            jit: JitConfig::OFF,
+        }
+    }
+
+    /// Enable runtime-compiled kernels for this operator.
+    #[must_use]
+    pub fn with_jit(mut self, jit: JitConfig) -> Self {
+        self.jit = jit;
+        self
     }
 }
 
@@ -128,6 +198,19 @@ pub struct CachedFilterSumI32Scan {
     sum_col: usize,
     output_schema: Schema,
     done: bool,
+    jit: JitConfig,
+}
+
+/// Direct-from-cache variant of [`FilterSumI64Scan`].
+pub struct CachedFilterSumI64Scan {
+    columns: Arc<CachedColumns>,
+    predicate_col: usize,
+    predicate_threshold: i64,
+    predicate_op: CmpOp,
+    sum_col: usize,
+    output_schema: Schema,
+    done: bool,
+    jit: JitConfig,
 }
 
 impl std::fmt::Debug for CachedFilterSumI32Scan {
@@ -165,7 +248,60 @@ impl CachedFilterSumI32Scan {
             sum_col,
             output_schema,
             done: false,
+            jit: JitConfig::OFF,
         }
+    }
+
+    /// Enable runtime-compiled kernels for this operator.
+    #[must_use]
+    pub fn with_jit(mut self, jit: JitConfig) -> Self {
+        self.jit = jit;
+        self
+    }
+}
+
+impl std::fmt::Debug for CachedFilterSumI64Scan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedFilterSumI64Scan")
+            .field("predicate_col", &self.predicate_col)
+            .field("predicate_threshold", &self.predicate_threshold)
+            .field("predicate_op", &self.predicate_op)
+            .field("sum_col", &self.sum_col)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CachedFilterSumI64Scan {
+    /// Build the cached-input fused `Int64` operator.
+    #[must_use]
+    pub fn new(
+        columns: Arc<CachedColumns>,
+        predicate_col: usize,
+        predicate_threshold: i64,
+        predicate_op: CmpOp,
+        sum_col: usize,
+        output_name: String,
+    ) -> Self {
+        let output_schema = Schema::new([Field::required(output_name, DataType::Int64)])
+            .expect("output schema is trivially well-formed");
+        Self {
+            columns,
+            predicate_col,
+            predicate_threshold,
+            predicate_op,
+            sum_col,
+            output_schema,
+            done: false,
+            jit: JitConfig::OFF,
+        }
+    }
+
+    /// Enable runtime-compiled kernels for this operator.
+    #[must_use]
+    pub fn with_jit(mut self, jit: JitConfig) -> Self {
+        self.jit = jit;
+        self
     }
 }
 
@@ -189,7 +325,14 @@ impl Operator for CachedFilterSumI32Scan {
         let n_rows = pred_col.len();
         let total = if self.predicate_col == self.sum_col && matches!(self.predicate_op, CmpOp::Gt)
         {
-            filter_sum_i32_widening_gt(sum_col.data(), self.predicate_threshold)
+            if self.jit.should_jit(n_rows) {
+                filter_sum_i32_widening_gt_jit(sum_col.data(), self.predicate_threshold)
+                    .unwrap_or_else(|| {
+                        filter_sum_i32_widening_gt(sum_col.data(), self.predicate_threshold)
+                    })
+            } else {
+                filter_sum_i32_widening_gt(sum_col.data(), self.predicate_threshold)
+            }
         } else {
             let mask = cmp_i32_scalar(pred_col, self.predicate_threshold, self.predicate_op);
             sum_i32_widening_with_mask(sum_col, &mask)
@@ -213,6 +356,57 @@ impl Operator for CachedFilterSumI32Scan {
     fn estimated_row_count(&self) -> Option<usize> {
         // Scalar aggregate emits exactly one row; see the matching
         // override on [`CachedSumI32Scan::estimated_row_count`].
+        Some(1)
+    }
+}
+
+impl Operator for CachedFilterSumI64Scan {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+
+        let cols = &self.columns.columns;
+        let (pred_col, sum_col) = match (&cols[self.predicate_col], &cols[self.sum_col]) {
+            (Column::Int64(p), Column::Int64(s)) => (p, s),
+            _ => {
+                return Err(ExecError::TypeMismatch(
+                    "CachedFilterSumI64Scan: predicate and sum columns must both be Int64"
+                        .to_owned(),
+                ));
+            }
+        };
+        let n_rows = pred_col.len();
+        let total = if self.predicate_col == self.sum_col && matches!(self.predicate_op, CmpOp::Gt)
+        {
+            if self.jit.should_jit(n_rows) {
+                filter_sum_i64_gt_jit(sum_col.data(), self.predicate_threshold)
+                    .unwrap_or_else(|| filter_sum_i64_gt(sum_col.data(), self.predicate_threshold))
+            } else {
+                filter_sum_i64_gt(sum_col.data(), self.predicate_threshold)
+            }
+        } else {
+            let mask = cmp_i64_scalar(pred_col, self.predicate_threshold, self.predicate_op);
+            sum_i64_with_mask(sum_col, &mask)
+        };
+
+        let result_col = if n_rows == 0 {
+            let mut nulls = ultrasql_vec::Bitmap::new(1, false);
+            nulls.set(0, false);
+            Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+        } else {
+            Column::Int64(NumericColumn::from_data(vec![total]))
+        };
+        let batch = Batch::new([result_col]).map_err(ExecError::from)?;
+        Ok(Some(batch))
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.output_schema
+    }
+
+    fn estimated_row_count(&self) -> Option<usize> {
         Some(1)
     }
 }
@@ -416,10 +610,15 @@ impl Operator for FilterSumI32Scan {
                 }
             };
             if fused_self {
-                total = total.wrapping_add(filter_sum_i32_widening_gt(
-                    sum_col.data(),
-                    self.predicate_threshold,
-                ));
+                let delta = if self.jit.should_jit(sum_col.len()) {
+                    filter_sum_i32_widening_gt_jit(sum_col.data(), self.predicate_threshold)
+                        .unwrap_or_else(|| {
+                            filter_sum_i32_widening_gt(sum_col.data(), self.predicate_threshold)
+                        })
+                } else {
+                    filter_sum_i32_widening_gt(sum_col.data(), self.predicate_threshold)
+                };
+                total = total.wrapping_add(delta);
             } else {
                 let mask = cmp_i32_scalar(pred_col, self.predicate_threshold, self.predicate_op);
                 total = total.wrapping_add(sum_i32_widening_with_mask(sum_col, &mask));
@@ -458,5 +657,119 @@ impl Operator for FilterSumI32Scan {
         // Filtered scalar aggregate emits exactly one row; see the
         // matching override on [`CachedSumI32Scan::estimated_row_count`].
         Some(1)
+    }
+}
+
+impl Operator for FilterSumI64Scan {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+        if self.done {
+            return Ok(None);
+        }
+        let mut total: i64 = 0;
+        let mut saw_any = false;
+        let fused_self =
+            self.predicate_col == self.sum_col && matches!(self.predicate_op, CmpOp::Gt);
+        while let Some(batch) = self.inner.next_batch()? {
+            if batch.rows() == 0 {
+                continue;
+            }
+            let cols = batch.columns();
+            let (pred_col, sum_col) = match (&cols[self.predicate_col], &cols[self.sum_col]) {
+                (Column::Int64(p), Column::Int64(s)) => (p, s),
+                _ => {
+                    return Err(ExecError::TypeMismatch(
+                        "FilterSumI64Scan: predicate and sum columns must both be Int64".to_owned(),
+                    ));
+                }
+            };
+            if fused_self {
+                let delta = if self.jit.should_jit(sum_col.len()) {
+                    filter_sum_i64_gt_jit(sum_col.data(), self.predicate_threshold).unwrap_or_else(
+                        || filter_sum_i64_gt(sum_col.data(), self.predicate_threshold),
+                    )
+                } else {
+                    filter_sum_i64_gt(sum_col.data(), self.predicate_threshold)
+                };
+                total = total.wrapping_add(delta);
+            } else {
+                let mask = cmp_i64_scalar(pred_col, self.predicate_threshold, self.predicate_op);
+                total = total.wrapping_add(sum_i64_with_mask(sum_col, &mask));
+            }
+            saw_any |= true;
+        }
+        self.done = true;
+
+        let result_col = if saw_any {
+            Column::Int64(NumericColumn::from_data(vec![total]))
+        } else {
+            let mut nulls = ultrasql_vec::Bitmap::new(1, false);
+            nulls.set(0, false);
+            Column::Int64(NumericColumn::with_nulls(vec![0_i64], nulls).expect("matching lengths"))
+        };
+        let batch = Batch::new([result_col]).map_err(ExecError::from)?;
+        Ok(Some(batch))
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.output_schema
+    }
+
+    fn estimated_row_count(&self) -> Option<usize> {
+        Some(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ultrasql_core::{DataType, Field};
+
+    fn output_i64(batch: &Batch) -> i64 {
+        let Column::Int64(col) = &batch.columns()[0] else {
+            panic!("expected int64 output")
+        };
+        col.data()[0]
+    }
+
+    #[test]
+    fn cached_filter_sum_uses_jit_when_enabled() {
+        let schema = Schema::new([Field::required("x", DataType::Int32)]).expect("schema");
+        let columns = CachedColumns::new(
+            0,
+            schema,
+            vec![Column::Int32(NumericColumn::from_data(vec![
+                -3, 0, 1, 2, 9, -11,
+            ]))],
+        );
+        let mut op =
+            CachedFilterSumI32Scan::new(Arc::new(columns), 0, 0, CmpOp::Gt, 0, "sum".to_owned())
+                .with_jit(JitConfig {
+                    enabled: true,
+                    above_rows: 0,
+                });
+        let batch = op.next_batch().expect("ok").expect("row");
+        assert_eq!(output_i64(&batch), 12);
+        assert!(op.next_batch().expect("ok").is_none());
+    }
+
+    #[test]
+    fn cached_filter_sum_i64_uses_jit_when_enabled() {
+        let schema = Schema::new([Field::required("x", DataType::Int64)]).expect("schema");
+        let columns = CachedColumns::new(
+            0,
+            schema,
+            vec![Column::Int64(NumericColumn::from_data(vec![
+                -30_i64, 0, 1, 2, 90, -110,
+            ]))],
+        );
+        let mut op =
+            CachedFilterSumI64Scan::new(Arc::new(columns), 0, 0, CmpOp::Gt, 0, "sum".to_owned())
+                .with_jit(JitConfig {
+                    enabled: true,
+                    above_rows: 0,
+                });
+        let batch = op.next_batch().expect("ok").expect("row");
+        assert_eq!(output_i64(&batch), 93);
+        assert!(op.next_batch().expect("ok").is_none());
     }
 }

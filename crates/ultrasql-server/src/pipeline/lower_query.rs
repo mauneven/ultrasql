@@ -11,7 +11,7 @@ use crate::error::ServerError;
 
 use super::agg_fuse::{
     try_lower_cached_scalar_aggregate_i32, try_lower_direct_scalar_aggregate,
-    try_lower_fused_filter_sum_i32,
+    try_lower_fused_filter_sum_int,
 };
 use super::cte_helpers::{lower_recursive_cte, lower_set_op_real};
 use super::index_scan::try_index_scan;
@@ -149,8 +149,9 @@ pub fn lower_query(
         | LogicalPlan::PrepareTransaction { .. }
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
-        | LogicalPlan::SetTransaction { .. } => Err(ServerError::Unsupported(
-            "transaction control reached operator lowerer; expected txn dispatch path",
+        | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::SetVariable { .. } => Err(ServerError::Unsupported(
+            "session control reached operator lowerer; expected direct dispatch path",
         )),
         LogicalPlan::Listen { .. } | LogicalPlan::Notify { .. } | LogicalPlan::Unlisten { .. } => {
             Err(ServerError::Unsupported(
@@ -207,13 +208,13 @@ pub fn lower_query(
             aggregates,
             schema,
         } => {
-            // Fast path: `SELECT SUM(col_i32) FROM t WHERE col_i32 op lit`
+            // Fast path: `SELECT SUM(int_col) FROM t WHERE int_col op lit`
             // collapses to one fused operator that runs SIMD
-            // cmp_i32 → mask → sum_i32_widening_with_mask in a single
+            // compare → mask → sum in a single
             // pass. Skips the per-batch `select_column` (per-row
             // scalar pushes) the generic Filter → HashAggregate
             // chain pays.
-            if let Some(fused) = try_lower_fused_filter_sum_i32(input, group_by, aggregates, ctx)? {
+            if let Some(fused) = try_lower_fused_filter_sum_int(input, group_by, aggregates, ctx)? {
                 return Ok(fused);
             }
             // Fast path: pure `SELECT SUM(col_i32) FROM t` /
@@ -433,11 +434,13 @@ pub(super) fn lower_cte(
         tables: ctx.tables,
         catalog_snapshot: Arc::clone(&ctx.catalog_snapshot),
         heap: Arc::clone(&ctx.heap),
+        vm: Arc::clone(&ctx.vm),
         snapshot: ctx.snapshot.clone(),
         oracle: Arc::clone(&ctx.oracle),
         xid: ctx.xid,
         command_id: ctx.command_id,
         cte_buffers: child_buffers,
+        jit: ctx.jit,
         cancel_flag: ctx.cancel_flag.clone(),
         work_mem: std::sync::Arc::clone(&ctx.work_mem),
     };

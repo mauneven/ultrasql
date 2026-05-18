@@ -31,6 +31,7 @@ use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Val
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions, UpdatePayload};
+use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_storage::wal_sink::WalSink;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
@@ -152,6 +153,7 @@ pub struct ModifyTable<L: PageLoader> {
     delete_xmax: Xid,
     delete_cmax: CommandId,
     wal: Option<Arc<dyn WalSink>>,
+    vm: Option<Arc<VisibilityMap>>,
     child: Box<dyn Operator>,
     done: bool,
     affected: u64,
@@ -236,10 +238,19 @@ impl<L: PageLoader> ModifyTable<L> {
             delete_xmax,
             delete_cmax,
             wal,
+            vm: None,
             child,
             done: false,
             affected: 0,
         }
+    }
+
+    /// Attach the server-owned visibility map so heap mutations clear
+    /// all-visible bits for touched pages.
+    #[must_use]
+    pub fn with_visibility_map(mut self, vm: Arc<VisibilityMap>) -> Self {
+        self.vm = Some(vm);
+        self
     }
 }
 
@@ -374,7 +385,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                                 cmax: self.delete_cmax,
                                 wal: wal_ref,
                                 fsm: None,
-                                vm: None,
+                                vm: self.vm.as_deref(),
                             },
                         )
                         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
@@ -444,7 +455,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                                 command_id: self.insert_command_id,
                                 wal: wal_ref,
                                 fsm: None,
-                                vm: None,
+                                vm: self.vm.as_deref(),
                             },
                         )
                         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
@@ -466,7 +477,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         command_id: self.delete_cmax,
                         hot_eligible: true,
                         wal: wal_ref,
-                        vm: None,
+                        vm: self.vm.as_deref(),
                     },
                 )
                 .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;

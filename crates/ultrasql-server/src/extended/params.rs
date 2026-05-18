@@ -88,6 +88,7 @@ fn infer_into(
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
@@ -392,6 +393,7 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }

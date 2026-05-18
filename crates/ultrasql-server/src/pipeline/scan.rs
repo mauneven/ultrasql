@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use ultrasql_catalog::TableEntry;
 use ultrasql_core::{RelationId, Value};
-use ultrasql_executor::{CteScan, MemTableScan, Operator, Project, RowCodec, SeqScan};
+use ultrasql_executor::{
+    CteScan, MemTableScan, Operator, ParallelSeqScan, Project, RowCodec, SeqScan,
+    choose_parallel_seq_scan_workers,
+};
 use ultrasql_planner::ScalarExpr;
 
 use crate::error::ServerError;
@@ -53,12 +56,28 @@ pub(super) fn lower_heap_scan(
     // the heap has actually allocated through `insert`.
     let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
     let codec = RowCodec::new(entry.schema.clone());
-    let mut scan = SeqScan::new(
+    let workers = choose_parallel_seq_scan_workers(block_count, entry.schema.len());
+    if workers > 1 && projection.is_none() {
+        let scan = ParallelSeqScan::new_with_cancel(
+            Arc::clone(&ctx.heap),
+            rel,
+            block_count,
+            ctx.snapshot.clone(),
+            Arc::clone(&ctx.oracle),
+            Arc::clone(&ctx.vm),
+            codec,
+            ctx.cancel_flag.clone(),
+            workers,
+        );
+        return Ok(Box::new(scan));
+    }
+    let mut scan = SeqScan::new_with_vm(
         Arc::clone(&ctx.heap),
         rel,
         block_count,
         ctx.snapshot.clone(),
         Arc::clone(&ctx.oracle),
+        Arc::clone(&ctx.vm),
         codec,
     );
     // Thread the session's cancel flag through so `next_batch` returns

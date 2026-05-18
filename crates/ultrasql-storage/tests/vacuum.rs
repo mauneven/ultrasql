@@ -124,6 +124,7 @@ fn vacuum_undo_log_drops_only_below_threshold() {
             Xid::new(xid_raw),
             CommandId::FIRST,
             None,
+            None,
         )
         .expect("update");
     }
@@ -191,6 +192,7 @@ fn vacuum_undo_log_no_op_when_threshold_below_every_writer() {
         7,
         Xid::new(20),
         CommandId::FIRST,
+        None,
         None,
     )
     .expect("update");

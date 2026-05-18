@@ -406,6 +406,7 @@ fn crash_recovery_in_place_update_restores_post_image_and_undo_log() {
                 Xid::new(2),
                 CommandId::FIRST,
                 Some(sink_ref),
+                None,
             )
             .expect("in-place update");
         assert_eq!(updated, ROWS, "every row should match the predicate");
@@ -518,6 +519,7 @@ fn crash_recovery_in_place_delete_stamps_xmax() {
                 Xid::new(2),
                 CommandId::FIRST,
                 Some(sink_ref),
+                None,
             )
             .expect("in-place delete");
         assert_eq!(deleted, ROWS);

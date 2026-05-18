@@ -270,7 +270,22 @@ impl<L: PageLoader> HeapAccess<L> {
         snapshot: &'a Snapshot,
         oracle: &'a O,
     ) -> VisibleHeapWalker<'a, L, O> {
-        self.scan_visible_walker_inner(rel, block_count, snapshot, oracle, None)
+        self.scan_visible_walker_inner(rel, 0, block_count, snapshot, oracle, None)
+    }
+
+    /// Visibility-filtered scan over a half-open block range.
+    ///
+    /// Used by parallel scan workers. `start_block` is inclusive and
+    /// `end_block` is exclusive.
+    pub fn scan_visible_walker_range<'a, O: XidStatusOracle + ?Sized>(
+        &'a self,
+        rel: RelationId,
+        start_block: u32,
+        end_block: u32,
+        snapshot: &'a Snapshot,
+        oracle: &'a O,
+    ) -> VisibleHeapWalker<'a, L, O> {
+        self.scan_visible_walker_inner(rel, start_block, end_block, snapshot, oracle, None)
     }
 
     /// Visibility-filtered sequential scan with a visibility-map fast path.
@@ -288,13 +303,27 @@ impl<L: PageLoader> HeapAccess<L> {
         oracle: &'a O,
         vm: &'a VisibilityMap,
     ) -> VisibleHeapWalker<'a, L, O> {
-        self.scan_visible_walker_inner(rel, block_count, snapshot, oracle, Some(vm))
+        self.scan_visible_walker_inner(rel, 0, block_count, snapshot, oracle, Some(vm))
+    }
+
+    /// Visibility-map fast path over a half-open block range.
+    pub fn scan_visible_walker_range_with_vm<'a, O: XidStatusOracle + ?Sized>(
+        &'a self,
+        rel: RelationId,
+        start_block: u32,
+        end_block: u32,
+        snapshot: &'a Snapshot,
+        oracle: &'a O,
+        vm: &'a VisibilityMap,
+    ) -> VisibleHeapWalker<'a, L, O> {
+        self.scan_visible_walker_inner(rel, start_block, end_block, snapshot, oracle, Some(vm))
     }
 
     fn scan_visible_walker_inner<'a, O: XidStatusOracle + ?Sized>(
         &'a self,
         rel: RelationId,
-        block_count: u32,
+        start_block: u32,
+        end_block: u32,
         snapshot: &'a Snapshot,
         oracle: &'a O,
         vm: Option<&'a VisibilityMap>,
@@ -302,8 +331,8 @@ impl<L: PageLoader> HeapAccess<L> {
         VisibleHeapWalker {
             pool: &self.pool,
             rel,
-            block_count,
-            current_block: 0,
+            block_count: end_block,
+            current_block: start_block.min(end_block),
             current_slot: 0,
             slot_count: 0,
             vm,

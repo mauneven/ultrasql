@@ -419,6 +419,7 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }

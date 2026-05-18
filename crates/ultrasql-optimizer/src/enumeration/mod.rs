@@ -180,6 +180,7 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
@@ -425,6 +426,7 @@ pub fn reorder_inner_joins(plan: &LogicalPlan) -> LogicalPlan {
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }

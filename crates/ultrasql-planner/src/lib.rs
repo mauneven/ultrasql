@@ -36,8 +36,8 @@ pub use expr::{BinaryOp, ScalarExpr, UnaryOp};
 pub use plan::{
     AggregateFunc, ConflictTarget, CopyDirection, CopyFormat, CopySource, ExplainFormat,
     LogicalAggregateExpr, LogicalAlterTableAction, LogicalJoinCondition, LogicalJoinType,
-    LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, LogicalWindowFunc, SortKey,
-    TxnIsolationLevel,
+    LogicalOnConflict, LogicalPlan, LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction,
+    LogicalWindowFunc, SortKey, TxnIsolationLevel,
 };
 
 #[cfg(test)]

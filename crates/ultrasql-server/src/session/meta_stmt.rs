@@ -255,6 +255,7 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
+        | LogicalPlan::SetVariable { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
