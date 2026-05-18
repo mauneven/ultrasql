@@ -26,6 +26,13 @@
 //!
 //! Multiple left rows with the same (non-NULL) key are all stored; the probe
 //! emits one output row per (right, left) pair.
+//!
+//! # Residual predicates
+//!
+//! The operator can evaluate an optional residual predicate after hash-key
+//! equality succeeds. This lets the server lower predicates such as
+//! `a.k = b.k AND a.x <> b.x` to a hash probe on `k` plus scalar evaluation
+//! on candidate pairs, instead of falling back to a full nested-loop join.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -61,6 +68,7 @@ pub struct HashJoin {
     right: Box<dyn Operator>,
     left_key_evals: Vec<Eval>,
     right_key_evals: Vec<Eval>,
+    residual_eval: Option<Eval>,
     join_type: LogicalJoinType,
     schema: Schema,
     left_schema: Schema,
@@ -135,6 +143,34 @@ impl HashJoin {
         left_schema: Schema,
         right_schema: Schema,
     ) -> Self {
+        Self::new_multi_with_residual(
+            left,
+            right,
+            left_keys,
+            right_keys,
+            None,
+            join_type,
+            schema,
+            left_schema,
+            right_schema,
+        )
+    }
+
+    /// Construct a hash join with equality keys plus an optional residual
+    /// predicate evaluated over the joined `left ++ right` row.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // all 9 parameters are distinct logical inputs
+    pub fn new_multi_with_residual(
+        left: Box<dyn Operator>,
+        right: Box<dyn Operator>,
+        left_keys: Vec<ScalarExpr>,
+        right_keys: Vec<ScalarExpr>,
+        residual: Option<ScalarExpr>,
+        join_type: LogicalJoinType,
+        schema: Schema,
+        left_schema: Schema,
+        right_schema: Schema,
+    ) -> Self {
         debug_assert!(!left_keys.is_empty(), "hash join requires at least one key");
         debug_assert_eq!(
             left_keys.len(),
@@ -146,6 +182,7 @@ impl HashJoin {
             right,
             left_key_evals: left_keys.into_iter().map(Eval::new).collect(),
             right_key_evals: right_keys.into_iter().map(Eval::new).collect(),
+            residual_eval: residual.map(Eval::new),
             join_type,
             schema,
             left_schema,
@@ -301,15 +338,17 @@ impl HashJoin {
                 .and_then(|table| table.get(&probe_key).cloned());
             if let Some(indices) = indices {
                 for li in indices {
+                    let joined = concat_rows(&self.left_rows[li], &right_row);
+                    if !self.passes_residual(&joined)? {
+                        continue;
+                    }
                     match self.join_type {
                         LogicalJoinType::Inner => {
-                            self.pending_output
-                                .push_back(concat_rows(&self.left_rows[li], &right_row));
+                            self.pending_output.push_back(joined);
                         }
                         LogicalJoinType::LeftOuter => {
                             self.left_matched[li] = true;
-                            self.pending_output
-                                .push_back(concat_rows(&self.left_rows[li], &right_row));
+                            self.pending_output.push_back(joined);
                         }
                         LogicalJoinType::Semi | LogicalJoinType::Anti => {
                             self.left_matched[li] = true;
@@ -322,6 +361,21 @@ impl HashJoin {
             }
         }
         Ok(true)
+    }
+
+    fn passes_residual(&self, joined: &[Value]) -> Result<bool, ExecError> {
+        let Some(eval) = &self.residual_eval else {
+            return Ok(true);
+        };
+        match eval.eval(joined) {
+            Ok(Value::Bool(true)) => Ok(true),
+            Ok(Value::Bool(false) | Value::Null) => Ok(false),
+            Ok(other) => Err(ExecError::TypeMismatch(format!(
+                "hash join residual must evaluate to Bool or Null, got {:?}",
+                other.data_type()
+            ))),
+            Err(error) => Err(ExecError::TypeMismatch(error.to_string())),
+        }
     }
 }
 
@@ -452,7 +506,7 @@ fn concat_rows(left: &[Value], right: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
-    use ultrasql_planner::{LogicalJoinType, ScalarExpr};
+    use ultrasql_planner::{BinaryOp, LogicalJoinType, ScalarExpr};
     use ultrasql_vec::Batch;
     use ultrasql_vec::column::{Column, NumericColumn};
 
@@ -561,6 +615,26 @@ mod tests {
                     Value::Int32(v) => out.push(*v),
                     other => panic!("unexpected value: {other:?}"),
                 }
+            }
+        }
+        out
+    }
+
+    fn drain_pair_i32(op: &mut dyn Operator) -> Vec<(i32, i32)> {
+        let schema = op.schema().clone();
+        let mut out = Vec::new();
+        while let Some(b) = op.next_batch().expect("no error") {
+            let rows = crate::filter_op::batch_to_rows(&b, &schema).expect("decode ok");
+            for row in rows {
+                let left = match &row[0] {
+                    Value::Int32(v) => *v,
+                    other => panic!("unexpected first value: {other:?}"),
+                };
+                let right = match &row[1] {
+                    Value::Int32(v) => *v,
+                    other => panic!("unexpected second value: {other:?}"),
+                };
+                out.push((left, right));
             }
         }
         out
@@ -744,6 +818,72 @@ mod tests {
         let mut rows = drain_single_i32(&mut op);
         rows.sort_unstable();
         assert_eq!(rows, vec![1, 3]);
+    }
+
+    #[test]
+    fn hash_join_semi_residual_filters_candidate_pairs() {
+        let left_schema = schema_pair("left");
+        let right_schema = schema_pair("right");
+        let left = MemTableScan::new(
+            left_schema.clone(),
+            vec![i32_pair_batch(&[(1, 10), (2, 30)])],
+        );
+        let right = MemTableScan::new(
+            right_schema.clone(),
+            vec![i32_pair_batch(&[(1, 10), (1, 20), (2, 30)])],
+        );
+        let residual = ScalarExpr::Binary {
+            op: BinaryOp::NotEq,
+            left: Box::new(col_i32("left_supp", 1)),
+            right: Box::new(col_i32("right_supp", 3)),
+            data_type: DataType::Bool,
+        };
+        let mut op = HashJoin::new_multi_with_residual(
+            Box::new(left),
+            Box::new(right),
+            vec![col_i32("left_part", 0)],
+            vec![col_i32("right_part", 0)],
+            Some(residual),
+            LogicalJoinType::Semi,
+            left_schema.clone(),
+            left_schema,
+            right_schema,
+        );
+
+        assert_eq!(drain_pair_i32(&mut op), vec![(1, 10)]);
+    }
+
+    #[test]
+    fn hash_join_anti_residual_keeps_rows_without_residual_match() {
+        let left_schema = schema_pair("left");
+        let right_schema = schema_pair("right");
+        let left = MemTableScan::new(
+            left_schema.clone(),
+            vec![i32_pair_batch(&[(1, 10), (2, 30)])],
+        );
+        let right = MemTableScan::new(
+            right_schema.clone(),
+            vec![i32_pair_batch(&[(1, 10), (1, 20), (2, 30)])],
+        );
+        let residual = ScalarExpr::Binary {
+            op: BinaryOp::NotEq,
+            left: Box::new(col_i32("left_supp", 1)),
+            right: Box::new(col_i32("right_supp", 3)),
+            data_type: DataType::Bool,
+        };
+        let mut op = HashJoin::new_multi_with_residual(
+            Box::new(left),
+            Box::new(right),
+            vec![col_i32("left_part", 0)],
+            vec![col_i32("right_part", 0)],
+            Some(residual),
+            LogicalJoinType::Anti,
+            left_schema.clone(),
+            left_schema,
+            right_schema,
+        );
+
+        assert_eq!(drain_pair_i32(&mut op), vec![(2, 30)]);
     }
 
     // -------------------------------------------------------------------------

@@ -259,19 +259,9 @@ fn schema_for_qualified_binding(
         return Ok(input.clone());
     }
 
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for entry in from_scope {
-        *counts
-            .entry(entry.field.name.to_ascii_lowercase())
-            .or_default() += 1;
-    }
-
     let mut fields = input.fields().to_vec();
     for entry in from_scope {
-        let Some(count) = counts.get(&entry.field.name.to_ascii_lowercase()) else {
-            continue;
-        };
-        if *count <= 1 || entry.qualifier.is_empty() {
+        if entry.qualifier.is_empty() {
             continue;
         }
         let Some(field) = fields.get_mut(entry.field_index) else {

@@ -235,3 +235,65 @@ async fn correlated_scalar_aggregate_subquery_lowers_before_execution() {
 
     shutdown(client, server_handle).await;
 }
+
+#[tokio::test]
+async fn mixed_exists_not_exists_with_residual_correlation_lowers_before_execution() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute(
+            "CREATE TABLE sq_wait_lineitem (
+                 l_orderkey INT NOT NULL,
+                 l_suppkey INT NOT NULL,
+                 l_receipt INT NOT NULL,
+                 l_commit INT NOT NULL
+             )",
+        )
+        .await
+        .expect("create wait lineitem");
+    client
+        .batch_execute(
+            "INSERT INTO sq_wait_lineitem VALUES
+                 (1, 10, 5, 3),
+                 (1, 20, 2, 3),
+                 (2, 30, 6, 3),
+                 (2, 40, 7, 3),
+                 (3, 50, 9, 2)",
+        )
+        .await
+        .expect("insert wait lineitem");
+
+    let rows = client
+        .simple_query(
+            "SELECT l1.l_orderkey, l1.l_suppkey
+             FROM sq_wait_lineitem l1
+             WHERE l1.l_receipt > l1.l_commit
+               AND EXISTS (
+                   SELECT *
+                   FROM sq_wait_lineitem l2
+                   WHERE l2.l_orderkey = l1.l_orderkey
+                     AND l2.l_suppkey <> l1.l_suppkey
+               )
+               AND NOT EXISTS (
+                   SELECT *
+                   FROM sq_wait_lineitem l3
+                   WHERE l3.l_orderkey = l1.l_orderkey
+                     AND l3.l_suppkey <> l1.l_suppkey
+                     AND l3.l_receipt > l3.l_commit
+               )
+             ORDER BY l1.l_orderkey, l1.l_suppkey",
+        )
+        .await
+        .expect("mixed EXISTS/NOT EXISTS query succeeds");
+    let keys: Vec<(i32, i32)> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some((row.get(0)?.parse().ok()?, row.get(1)?.parse().ok()?))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, vec![(1, 10)]);
+
+    shutdown(client, server_handle).await;
+}

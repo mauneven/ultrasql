@@ -1142,6 +1142,14 @@ pub(super) fn bind_column(
                 data_type: field.data_type.clone(),
             });
         }
+        if let Some(outer_ref) = scope.resolve(&qualified_name) {
+            return Ok(ScalarExpr::OuterColumn {
+                name: qualified_name,
+                frame_depth: outer_ref.frame_depth,
+                column_index: outer_ref.column_index,
+                data_type: outer_ref.data_type,
+            });
+        }
         if input.fields().iter().any(|f| {
             f.name
                 .rsplit_once('.')
@@ -1189,7 +1197,7 @@ pub(super) fn bind_column(
         return Err(PlanError::Ambiguous(col_name));
     }
     Ok(ScalarExpr::Column {
-        name: field.name.clone(),
+        name: col_name,
         index,
         data_type: field.data_type.clone(),
     })

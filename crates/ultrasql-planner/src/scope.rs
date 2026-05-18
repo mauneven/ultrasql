@@ -103,6 +103,26 @@ impl ScopeStack {
                     data_type: field.data_type.clone(),
                 });
             }
+            let mut suffix_hits = frame
+                .schema
+                .fields()
+                .iter()
+                .enumerate()
+                .filter(|(_, field)| {
+                    field
+                        .name
+                        .rsplit_once('.')
+                        .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case(name))
+                });
+            if let Some((col_idx, field)) = suffix_hits.next()
+                && suffix_hits.next().is_none()
+            {
+                return Some(OuterRef {
+                    frame_depth: depth,
+                    column_index: col_idx,
+                    data_type: field.data_type.clone(),
+                });
+            }
         }
         None
     }

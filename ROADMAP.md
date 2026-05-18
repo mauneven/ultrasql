@@ -893,13 +893,13 @@ Result: `validated 22 TPC-H query result set(s) against DuckDB`.
 Correctness boundary: this validates UltraSQL against DuckDB for the
 current harness SQL in
 [`crates/ultrasql-bench/src/tpch/queries.rs`](crates/ultrasql-bench/src/tpch/queries.rs).
-The harness still contains equivalent SQL rewrites for the hardest Q21
-mixed `EXISTS` / `NOT EXISTS` shape, but the earlier comma-join and
-subquery crutches have been reduced: Q2, Q17, and Q20 now use
-correlated scalar aggregate subqueries; Q4 uses `EXISTS`; Q11 uses the
-scalar threshold subquery over comma joins; Q16 uses `NOT IN (SELECT
-...)`; Q18 uses `IN (SELECT ... GROUP BY ... HAVING ...)`; and Q9 uses
-the native composite-key join predicate instead of a synthetic key.
+The harness no longer uses the earlier subquery/composite-key crutches:
+Q2, Q17, and Q20 use correlated scalar aggregate subqueries; Q4 uses
+`EXISTS`; Q11 uses the scalar threshold subquery over comma joins; Q16
+uses `NOT IN (SELECT ...)`; Q18 uses `IN (SELECT ... GROUP BY ...
+HAVING ...)`; Q21 uses the mixed `EXISTS` / `NOT EXISTS` form with
+residual correlation predicates; and Q9 uses the native composite-key
+join predicate instead of a synthetic key.
 
 TPC-H `dbgen` / `qgen` remain external benchmark tools. Install them
 locally with [`scripts/setup-tpch-dbgen.sh`](scripts/setup-tpch-dbgen.sh)
@@ -946,6 +946,11 @@ tracked repository root.
   aggregate arguments, and ORDER BY contexts instead of silently binding
   to the first same-named field. This fixed wrong-result cases in Q2 and
   Q7.
+- [x] Qualified outer-column binding in correlated subqueries — outer
+  frames now preserve alias-qualified binding names and resolve both
+  `outer_col` and `alias.outer_col` forms. This lets canonical Q21 bind
+  `l1.l_orderkey` and `l1.l_suppkey` inside the `l2` / `l3` subqueries
+  as true `OuterColumn` references.
 - [x] Aggregate binding distinguishes same-function calls with different
   arguments. `SUM(CASE ...) / SUM(x)` no longer reuses one aggregate slot
   for both sides. This fixed Q8 and Q14-style ratios.
@@ -978,24 +983,36 @@ tracked repository root.
   `EXISTS`/`IN` to `LogicalJoinType::Semi` and `NOT EXISTS`/`NOT IN` to
   `LogicalJoinType::Anti`; `HashJoin` and `NestedLoopJoin` both execute
   those join types without materialising right-side payload columns.
+- [x] Hash-join residual predicates — the server lowerer splits
+  `a.k = b.k AND residual(a, b)` into hash keys plus an optional residual
+  expression evaluated on candidate pairs. This keeps Q21's
+  `same orderkey AND different suppkey` `EXISTS` / `NOT EXISTS` checks
+  on the hash path instead of falling back to a full nested-loop scan.
 - [x] Correlated scalar aggregate decorrelation — equality-correlated
   scalar aggregate subqueries are grouped by their correlation keys,
   left-joined to the outer input, filtered with the joined aggregate
   value, then projected back to the outer schema. Q2, Q17, and Q20 now
   run in canonical scalar-subquery form and validate against DuckDB on
   real SF1 data.
+- [x] Mixed existential decorrelation for Q21 — equality-correlated
+  `EXISTS` / `NOT EXISTS` subqueries with residual correlated predicates
+  (for example `l2.l_suppkey <> l1.l_suppkey`) lower to logical
+  semi/anti joins with hash keys plus residual filters. Canonical Q21 now
+  validates against DuckDB on real SF1 data.
 
 #### Follow-up Engine Debt
 
-- [ ] Remaining original TPC-H SQL form: replace Q21's staged CTE shape
-  with the canonical mixed `EXISTS` / `NOT EXISTS` query. This needs the
-  decorrelator to handle multiple nested correlated existential
-  predicates in one filter tree without losing residual predicates.
+- [ ] Remaining harness SQL staging: some queries still use equivalent
+  CTE staging for join-order and selectivity reasons rather than because
+  the SQL surface is missing. Replace those with canonical text only
+  after cost-based join ordering and predicate placement can recover the
+  same plan without manual staging.
 - [ ] Broader subquery decorrelation: current production support covers
   equality correlations, uncorrelated `IN` / scalar predicates, and
-  equality-correlated scalar aggregates. Non-equality correlations,
-  correlated `IN`, nested frame depths greater than 1, and NULL-exact
-  `NOT IN` semantics remain v0.7 work.
+  equality-correlated scalar aggregates plus Q21-style residual
+  existential correlations. Correlated `IN`, nested frame depths greater
+  than 1, non-equality correlations without a hashable equality anchor,
+  and NULL-exact `NOT IN` semantics remain v0.7 work.
 - [ ] Semi/anti join performance: native logical/physical operators now
   exist, but build-side selection, cardinality costing, and spill-aware
   hash-table sizing still need benchmarked tuning. Q4/Q11/Q16/Q18 should

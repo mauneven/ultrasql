@@ -746,55 +746,40 @@ ORDER BY
 
 /// TPC-H Q21 — Suppliers Who Kept Orders Waiting. NATION = 'SAUDI ARABIA'.
 pub const Q21: &str = "
-WITH late_lineitems AS (
-    SELECT
-        l_orderkey AS late_orderkey,
-        l_suppkey AS late_suppkey
-    FROM
-        lineitem
-    WHERE
-        l_receiptdate > l_commitdate
-),
-order_suppliers AS (
-    SELECT
-        l_orderkey AS supplier_orderkey,
-        COUNT(DISTINCT l_suppkey) AS supplier_count
-    FROM
-        lineitem
-    GROUP BY
-        l_orderkey
-),
-order_late_suppliers AS (
-    SELECT
-        l_orderkey AS late_supplier_orderkey,
-        COUNT(DISTINCT l_suppkey) AS late_supplier_count
-    FROM
-        lineitem
-    WHERE
-        l_receiptdate > l_commitdate
-    GROUP BY
-        l_orderkey
-)
 SELECT
     s_name,
     COUNT(*) AS numwait
 FROM
-    supplier
-    INNER JOIN late_lineitems l1
-        ON s_suppkey = l1.late_suppkey
-    INNER JOIN orders
-        ON o_orderkey = l1.late_orderkey
-    INNER JOIN nation
-        ON s_nationkey = n_nationkey
-    INNER JOIN order_suppliers
-        ON order_suppliers.supplier_orderkey = l1.late_orderkey
-    INNER JOIN order_late_suppliers
-        ON order_late_suppliers.late_supplier_orderkey = l1.late_orderkey
+    supplier,
+    lineitem l1,
+    orders,
+    nation
 WHERE
-    o_orderstatus = 'F'
-    AND n_name      = 'SAUDI ARABIA'
-    AND order_suppliers.supplier_count > 1
-    AND order_late_suppliers.late_supplier_count = 1
+    s_suppkey = l1.l_suppkey
+    AND o_orderkey = l1.l_orderkey
+    AND o_orderstatus = 'F'
+    AND l1.l_receiptdate > l1.l_commitdate
+    AND EXISTS (
+        SELECT
+            *
+        FROM
+            lineitem l2
+        WHERE
+            l2.l_orderkey = l1.l_orderkey
+            AND l2.l_suppkey <> l1.l_suppkey
+    )
+    AND NOT EXISTS (
+        SELECT
+            *
+        FROM
+            lineitem l3
+        WHERE
+            l3.l_orderkey = l1.l_orderkey
+            AND l3.l_suppkey <> l1.l_suppkey
+            AND l3.l_receiptdate > l3.l_commitdate
+    )
+    AND s_nationkey = n_nationkey
+    AND n_name = 'SAUDI ARABIA'
 GROUP BY
     s_name
 ORDER BY

@@ -14,6 +14,9 @@ use crate::error::ServerError;
 use super::LowerCtx;
 use super::lower_query::lower_query;
 
+type JoinKeyPair = (ScalarExpr, ScalarExpr);
+type HashJoinKeysWithResidual = (Vec<JoinKeyPair>, Option<ScalarExpr>);
+
 /// Attempt to lower an `Inner`/`LeftOuter` `Join` whose children are both
 /// [`LogicalPlan::Sort`] over keys that align with the equi-key predicate
 /// to a [`MergeJoin`].
@@ -115,11 +118,12 @@ pub(super) fn lower_join(
                     | LogicalJoinType::Semi
                     | LogicalJoinType::Anti
             ) {
-                if let Some(key_pairs) =
-                    extract_hash_friendly_equi_key_pairs(pred, left_schema.len())
+                if let Some((key_pairs, residual)) =
+                    extract_hash_friendly_equi_key_pairs_with_residual(pred, left_schema.len())
                 {
                     let (left_keys, right_keys): (Vec<_>, Vec<_>) = key_pairs.into_iter().unzip();
                     if join_type == LogicalJoinType::Inner
+                        && residual.is_none()
                         && should_build_inner_hash_join_on_right(&*left, &*right)
                     {
                         return build_swapped_inner_hash_join(
@@ -134,11 +138,12 @@ pub(super) fn lower_join(
                     }
                     // HashJoin: left = build, right = probe. See the
                     // function docs for the rationale.
-                    return Ok(Box::new(HashJoin::new_multi(
+                    return Ok(Box::new(HashJoin::new_multi_with_residual(
                         left,
                         right,
                         left_keys,
                         right_keys,
+                        residual,
                         join_type,
                         out_schema,
                         left_schema,
@@ -419,47 +424,58 @@ pub(super) fn extract_hash_friendly_equi_keys(
     Some((l_col, r_col))
 }
 
-/// Recognise a conjunction made entirely of hash-friendly equi-key
-/// predicates.
-///
-/// Returns one `(left_key, right_key)` pair for each equality. A single
-/// equality returns a one-element vector; `a=b AND c=d` returns two.
-/// If any conjunct is not a supported equality, returns `None` so the
-/// caller can preserve the full predicate through the nested-loop path
-/// rather than silently dropping a residual filter.
-pub(super) fn extract_hash_friendly_equi_key_pairs(
+/// Recognise hash-friendly equi-key predicates and retain any residual
+/// conjuncts that must be evaluated after hash lookup.
+pub(super) fn extract_hash_friendly_equi_key_pairs_with_residual(
     pred: &ScalarExpr,
     left_width: usize,
-) -> Option<Vec<(ScalarExpr, ScalarExpr)>> {
+) -> Option<HashJoinKeysWithResidual> {
+    let conjuncts = split_and(pred);
     let mut pairs = Vec::new();
-    if collect_hash_friendly_equi_key_pairs(pred, left_width, &mut pairs) {
-        Some(pairs)
-    } else {
+    let mut residuals = Vec::new();
+    for conjunct in conjuncts {
+        if let Some(pair) = extract_hash_friendly_equi_keys(&conjunct, left_width) {
+            pairs.push(pair);
+        } else {
+            residuals.push(conjunct);
+        }
+    }
+    if pairs.is_empty() {
         None
+    } else {
+        Some((pairs, conjuncts_to_and_opt(residuals)))
     }
 }
 
-fn collect_hash_friendly_equi_key_pairs(
-    pred: &ScalarExpr,
-    left_width: usize,
-    pairs: &mut Vec<(ScalarExpr, ScalarExpr)>,
-) -> bool {
+fn split_and(expr: &ScalarExpr) -> Vec<ScalarExpr> {
     if let ScalarExpr::Binary {
         op: BinaryOp::And,
         left,
         right,
         ..
-    } = pred
+    } = expr
     {
-        return collect_hash_friendly_equi_key_pairs(left, left_width, pairs)
-            && collect_hash_friendly_equi_key_pairs(right, left_width, pairs);
+        let mut out = split_and(left);
+        out.extend(split_and(right));
+        return out;
     }
+    vec![expr.clone()]
+}
 
-    let Some(pair) = extract_hash_friendly_equi_keys(pred, left_width) else {
-        return false;
-    };
-    pairs.push(pair);
-    true
+fn conjuncts_to_and_opt(mut predicates: Vec<ScalarExpr>) -> Option<ScalarExpr> {
+    if predicates.is_empty() {
+        return None;
+    }
+    let mut result = predicates.remove(0);
+    for predicate in predicates {
+        result = ScalarExpr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(result),
+            right: Box::new(predicate),
+            data_type: DataType::Bool,
+        };
+    }
+    Some(result)
 }
 
 /// Build a composite equality predicate from `USING (left_idx, right_idx)`

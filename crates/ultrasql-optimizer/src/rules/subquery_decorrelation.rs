@@ -218,6 +218,13 @@ struct CorrelatedScalarRight {
     scalar_name: String,
 }
 
+#[derive(Debug)]
+struct CorrelatedExistsInput {
+    clean_subplan: LogicalPlan,
+    corr_pairs: Vec<CorrPair>,
+    residual_predicates: Vec<ScalarExpr>,
+}
+
 fn rewrite_filter_with_real_subquery_expr(
     outer: &LogicalPlan,
     predicate: &ScalarExpr,
@@ -498,13 +505,38 @@ fn rewrite_exists_filter_expr(outer: &LogicalPlan, predicate: &ScalarExpr) -> Op
         .filter_map(|(i, c)| if i == idx { None } else { Some(c.clone()) })
         .collect::<Vec<_>>();
     let outer = filter_with_conjuncts(outer.clone(), rest);
+    let outer_width = outer.schema().len();
     let exists_input = strip_exists_projection(*subplan.clone());
-    let (clean_subplan, corr_pairs) = extract_correlated_exists_input(exists_input)?;
-    if corr_pairs.is_empty() {
+    let exists_input = extract_correlated_exists_input(exists_input, outer_width)?;
+    if exists_input.corr_pairs.is_empty() {
         return None;
     }
-    let right = distinct_correlation_keys(clean_subplan, &corr_pairs)?;
-    let join_condition = build_correlation_condition(&corr_pairs, outer.schema().len());
+
+    if exists_input.residual_predicates.is_empty() {
+        let right =
+            distinct_correlation_keys(exists_input.clean_subplan, &exists_input.corr_pairs)?;
+        let join_condition = build_correlation_condition(&exists_input.corr_pairs, outer_width);
+        let join = LogicalPlan::Join {
+            left: Box::new(outer.clone()),
+            right: Box::new(right),
+            join_type: if *negated {
+                LogicalJoinType::Anti
+            } else {
+                LogicalJoinType::Semi
+            },
+            condition: LogicalJoinCondition::On(join_condition),
+            schema: outer.schema().clone(),
+        };
+        return Some(join);
+    }
+
+    let right = exists_input.clean_subplan;
+    let mut join_predicates = vec![build_correlation_condition_against_right_schema(
+        &exists_input.corr_pairs,
+        outer_width,
+    )];
+    join_predicates.extend(exists_input.residual_predicates);
+    let join_condition = conjuncts_to_and(join_predicates);
     let join = LogicalPlan::Join {
         left: Box::new(outer.clone()),
         right: Box::new(right),
@@ -586,22 +618,106 @@ fn strip_exists_projection(plan: LogicalPlan) -> LogicalPlan {
     }
 }
 
-fn extract_correlated_exists_input(plan: LogicalPlan) -> Option<(LogicalPlan, Vec<CorrPair>)> {
+fn extract_correlated_exists_input(
+    plan: LogicalPlan,
+    outer_width: usize,
+) -> Option<CorrelatedExistsInput> {
     match plan {
         LogicalPlan::Filter { input, predicate } => {
             let mut local = Vec::new();
             let mut corr = Vec::new();
+            let mut residual = Vec::new();
             for conjunct in split_and(&predicate) {
                 if conjunct.contains_outer_column() {
-                    corr.push(parse_correlation_equality(&conjunct)?);
+                    if let Some(pair) = parse_correlation_equality(&conjunct) {
+                        corr.push(pair);
+                    } else {
+                        residual.push(rebase_correlated_predicate(&conjunct, outer_width)?);
+                    }
                 } else {
                     local.push(conjunct);
                 }
             }
             let clean = filter_with_conjuncts(*input, local);
-            Some((clean, corr))
+            Some(CorrelatedExistsInput {
+                clean_subplan: clean,
+                corr_pairs: corr,
+                residual_predicates: residual,
+            })
         }
         _ => None,
+    }
+}
+
+fn rebase_correlated_predicate(expr: &ScalarExpr, outer_width: usize) -> Option<ScalarExpr> {
+    match expr {
+        ScalarExpr::Column {
+            name,
+            index,
+            data_type,
+        } => Some(ScalarExpr::Column {
+            name: name.clone(),
+            index: outer_width + index,
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::OuterColumn {
+            name,
+            frame_depth: 1,
+            column_index,
+            data_type,
+        } => Some(ScalarExpr::Column {
+            name: name.clone(),
+            index: *column_index,
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::OuterColumn { .. } => None,
+        ScalarExpr::Literal { value, data_type } => Some(ScalarExpr::Literal {
+            value: value.clone(),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Parameter { index, data_type } => Some(ScalarExpr::Parameter {
+            index: *index,
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Unary {
+            op,
+            expr: inner,
+            data_type,
+        } => Some(ScalarExpr::Unary {
+            op: *op,
+            expr: Box::new(rebase_correlated_predicate(inner, outer_width)?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Binary {
+            op,
+            left,
+            right,
+            data_type,
+        } => Some(ScalarExpr::Binary {
+            op: *op,
+            left: Box::new(rebase_correlated_predicate(left, outer_width)?),
+            right: Box::new(rebase_correlated_predicate(right, outer_width)?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::IsNull { expr, negated } => Some(ScalarExpr::IsNull {
+            expr: Box::new(rebase_correlated_predicate(expr, outer_width)?),
+            negated: *negated,
+        }),
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => Some(ScalarExpr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| rebase_correlated_predicate(arg, outer_width))
+                .collect::<Option<Vec<_>>>()?,
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => None,
     }
 }
 
@@ -751,6 +867,33 @@ fn build_correlation_condition(pairs: &[CorrPair], outer_width: usize) -> Scalar
             }),
             data_type: DataType::Bool,
         });
+    let first = predicates.next().expect("at least one correlation pair");
+    predicates.fold(first, |left, right| ScalarExpr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(left),
+        right: Box::new(right),
+        data_type: DataType::Bool,
+    })
+}
+
+fn build_correlation_condition_against_right_schema(
+    pairs: &[CorrPair],
+    outer_width: usize,
+) -> ScalarExpr {
+    let mut predicates = pairs.iter().map(|pair| ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(ScalarExpr::Column {
+            name: pair.outer_name.clone(),
+            index: pair.outer_index,
+            data_type: pair.outer_type.clone(),
+        }),
+        right: Box::new(ScalarExpr::Column {
+            name: pair.inner_name.clone(),
+            index: outer_width + pair.inner_index,
+            data_type: pair.inner_type.clone(),
+        }),
+        data_type: DataType::Bool,
+    });
     let first = predicates.next().expect("at least one correlation pair");
     predicates.fold(first, |left, right| ScalarExpr::Binary {
         op: BinaryOp::And,
