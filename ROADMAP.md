@@ -893,12 +893,13 @@ Result: `validated 22 TPC-H query result set(s) against DuckDB`.
 Correctness boundary: this validates UltraSQL against DuckDB for the
 current harness SQL in
 [`crates/ultrasql-bench/src/tpch/queries.rs`](crates/ultrasql-bench/src/tpch/queries.rs).
-The harness still contains equivalent SQL rewrites for harder correlated
-subquery forms, but the earlier comma-join / simple subquery crutches
-have been reduced: Q4 now uses `EXISTS`, Q11 uses the scalar threshold
-subquery over comma joins, Q16 uses `NOT IN (SELECT ...)`, Q18 uses
-`IN (SELECT ... GROUP BY ... HAVING ...)`, and Q9 uses the native
-composite-key join predicate instead of a synthetic key.
+The harness still contains equivalent SQL rewrites for the hardest Q21
+mixed `EXISTS` / `NOT EXISTS` shape, but the earlier comma-join and
+subquery crutches have been reduced: Q2, Q17, and Q20 now use
+correlated scalar aggregate subqueries; Q4 uses `EXISTS`; Q11 uses the
+scalar threshold subquery over comma joins; Q16 uses `NOT IN (SELECT
+...)`; Q18 uses `IN (SELECT ... GROUP BY ... HAVING ...)`; and Q9 uses
+the native composite-key join predicate instead of a synthetic key.
 
 TPC-H `dbgen` / `qgen` remain external benchmark tools. Install them
 locally with [`scripts/setup-tpch-dbgen.sh`](scripts/setup-tpch-dbgen.sh)
@@ -932,6 +933,11 @@ tracked repository root.
   same `.tbl` files, executes the same selected query set, runs UltraSQL
   through the in-process PostgreSQL wire path, and compares rows with
   numeric tolerance and row-context diagnostics.
+- [x] Fast validator phase mode — `validate-results --keep-going
+  --queries ...` loads UltraSQL once, runs every selected query, records
+  all per-query execution/result failures, and still compares successful
+  queries against cached DuckDB rows. This replaces slow one-query
+  QNUMBER phases during stabilization.
 - [x] Logical result encoding — Date and Decimal values now encode using
   logical schema types, so result validation compares SQL text values
   instead of physical Int32/Int64 backing storage.
@@ -968,19 +974,32 @@ tracked repository root.
   and uncorrelated scalar subqueries in predicates into join/filter
   plans before execution. End-to-end coverage lives in
   [`crates/ultrasql-server/tests/subquery_round_trip.rs`](crates/ultrasql-server/tests/subquery_round_trip.rs).
+- [x] Physical semi/anti joins — subquery decorrelation lowers
+  `EXISTS`/`IN` to `LogicalJoinType::Semi` and `NOT EXISTS`/`NOT IN` to
+  `LogicalJoinType::Anti`; `HashJoin` and `NestedLoopJoin` both execute
+  those join types without materialising right-side payload columns.
+- [x] Correlated scalar aggregate decorrelation — equality-correlated
+  scalar aggregate subqueries are grouped by their correlation keys,
+  left-joined to the outer input, filtered with the joined aggregate
+  value, then projected back to the outer schema. Q2, Q17, and Q20 now
+  run in canonical scalar-subquery form and validate against DuckDB on
+  real SF1 data.
 
 #### Follow-up Engine Debt
 
-- [ ] Remaining original TPC-H SQL forms: replace the staged harness
-  rewrites for correlated scalar aggregate subqueries (notably Q2, Q17,
-  and Q20) and Q21's mixed `EXISTS` / `NOT EXISTS` predicates with
-  engine-side decorrelation. Current support intentionally handles only
-  equality-correlation and uncorrelated scalar / IN forms.
-- [ ] Physical semi/anti joins: current `IN` / `EXISTS` lowering uses
-  inner or left-outer join plus projection/filter. It is correct for the
-  validated TPC-H forms, but Q4/Q11/Q16/Q18 are slower than the staged
-  CTE versions and need native semi/anti operators plus cost-aware
-  build-side selection.
+- [ ] Remaining original TPC-H SQL form: replace Q21's staged CTE shape
+  with the canonical mixed `EXISTS` / `NOT EXISTS` query. This needs the
+  decorrelator to handle multiple nested correlated existential
+  predicates in one filter tree without losing residual predicates.
+- [ ] Broader subquery decorrelation: current production support covers
+  equality correlations, uncorrelated `IN` / scalar predicates, and
+  equality-correlated scalar aggregates. Non-equality correlations,
+  correlated `IN`, nested frame depths greater than 1, and NULL-exact
+  `NOT IN` semantics remain v0.7 work.
+- [ ] Semi/anti join performance: native logical/physical operators now
+  exist, but build-side selection, cardinality costing, and spill-aware
+  hash-table sizing still need benchmarked tuning. Q4/Q11/Q16/Q18 should
+  be re-profiled against the old staged CTE forms.
 - [ ] Performance certification: run the reproducible PostgreSQL 17
   comparison required by the standing benchmark gate before claiming the
   v0.6 `≥ 2× PostgreSQL 17` TPC-H performance target.

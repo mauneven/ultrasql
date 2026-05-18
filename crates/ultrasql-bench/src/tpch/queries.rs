@@ -34,80 +34,49 @@ ORDER BY
 
 /// TPC-H Q2 — Minimum Cost Supplier. SIZE = 15, TYPE = 'BRASS', REGION = 'EUROPE'.
 pub const Q2: &str = "
-WITH brass_parts AS (
-    SELECT
-        p_partkey,
-        p_mfgr
-    FROM
-        part
-    WHERE
-        p_size = 15
-        AND p_type LIKE '%BRASS'
-),
-europe_suppliers AS (
-    SELECT
-        s_suppkey,
-        s_acctbal,
-        s_name,
-        n_name,
-        s_address,
-        s_phone,
-        s_comment
-    FROM
-        supplier
-        INNER JOIN nation
-            ON s_nationkey = n_nationkey
-        INNER JOIN region
-            ON n_regionkey = r_regionkey
-    WHERE
-        r_name = 'EUROPE'
-),
-candidate_partsupp AS (
-    SELECT
-        bp.p_partkey AS p_partkey,
-        bp.p_mfgr AS p_mfgr,
-        es.s_acctbal AS s_acctbal,
-        es.s_name AS s_name,
-        es.n_name AS n_name,
-        es.s_address AS s_address,
-        es.s_phone AS s_phone,
-        es.s_comment AS s_comment,
-        ps.ps_supplycost AS ps_supplycost
-    FROM
-        brass_parts bp
-        INNER JOIN partsupp ps
-            ON bp.p_partkey = ps.ps_partkey
-        INNER JOIN europe_suppliers es
-            ON es.s_suppkey = ps.ps_suppkey
-),
-min_supplycost AS (
-    SELECT
-        p_partkey,
-        MIN(ps_supplycost) AS min_supplycost
-    FROM
-        candidate_partsupp
-    GROUP BY
-        p_partkey
-)
 SELECT
-    cp.s_acctbal,
-    cp.s_name,
-    cp.n_name,
-    cp.p_partkey,
-    cp.p_mfgr,
-    cp.s_address,
-    cp.s_phone,
-    cp.s_comment
+    s_acctbal,
+    s_name,
+    n_name,
+    p_partkey,
+    p_mfgr,
+    s_address,
+    s_phone,
+    s_comment
 FROM
-    candidate_partsupp cp
-    INNER JOIN min_supplycost ms
-        ON cp.p_partkey = ms.p_partkey
-        AND cp.ps_supplycost = ms.min_supplycost
+    part,
+    supplier,
+    partsupp,
+    nation,
+    region
+WHERE
+    p_partkey = ps_partkey
+    AND s_suppkey = ps_suppkey
+    AND p_size = 15
+    AND p_type LIKE '%BRASS'
+    AND s_nationkey = n_nationkey
+    AND n_regionkey = r_regionkey
+    AND r_name = 'EUROPE'
+    AND ps_supplycost = (
+        SELECT
+            MIN(ps_supplycost)
+        FROM
+            partsupp,
+            supplier,
+            nation,
+            region
+        WHERE
+            p_partkey = ps_partkey
+            AND s_suppkey = ps_suppkey
+            AND s_nationkey = n_nationkey
+            AND n_regionkey = r_regionkey
+            AND r_name = 'EUROPE'
+    )
 ORDER BY
-    cp.s_acctbal DESC,
-    cp.n_name,
-    cp.s_name,
-    cp.p_partkey
+    s_acctbal DESC,
+    n_name,
+    s_name,
+    p_partkey
 LIMIT 100;
 ";
 
@@ -644,42 +613,23 @@ ORDER BY
 
 /// TPC-H Q17 — Small-Quantity Order Revenue. BRAND = 'Brand#23', CONTAINER = 'MED BOX'.
 pub const Q17: &str = "
-WITH target_parts AS (
-    SELECT
-        p_partkey AS target_partkey
-    FROM
-        part
-    WHERE
-        p_brand     = 'Brand#23'
-        AND p_container = 'MED BOX'
-),
-part_avg AS (
-    SELECT
-        l_partkey AS avg_partkey,
-        0.2 * AVG(l_quantity) AS avg_quantity
-    FROM
-        lineitem
-        INNER JOIN target_parts
-            ON l_partkey = target_partkey
-    GROUP BY
-        l_partkey
-),
-qualified_lineitems AS (
-    SELECT
-        l_extendedprice AS qualified_extendedprice
-    FROM
-        lineitem
-        INNER JOIN target_parts
-            ON l_partkey = target_partkey
-        INNER JOIN part_avg
-            ON l_partkey = avg_partkey
-    WHERE
-        l_quantity < avg_quantity
-)
 SELECT
-    SUM(qualified_extendedprice) / 7.0 AS avg_yearly
+    SUM(l_extendedprice) / 7.0 AS avg_yearly
 FROM
-    qualified_lineitems;
+    lineitem,
+    part
+WHERE
+    p_partkey = l_partkey
+    AND p_brand = 'Brand#23'
+    AND p_container = 'MED BOX'
+    AND l_quantity < (
+        SELECT
+            0.2 * AVG(l_quantity)
+        FROM
+            lineitem
+        WHERE
+            l_partkey = p_partkey
+    );
 ";
 
 /// TPC-H Q18 — Large Volume Customer. QUANTITY = 300.
@@ -755,54 +705,41 @@ WHERE
 
 /// TPC-H Q20 — Potential Part Promotion. COLOR = 'forest', DATE = '1994-01-01', NATION = 'CANADA'.
 pub const Q20: &str = "
-WITH forest_parts AS (
-    SELECT
-        p_partkey
-    FROM
-        part
-    WHERE
-        p_name LIKE 'forest%'
-),
-lineitem_qty AS (
-    SELECT
-        l_partkey,
-        l_suppkey,
-        SUM(l_quantity) AS total_quantity
-    FROM
-        lineitem
-    WHERE
-        l_shipdate >= DATE '1994-01-01'
-        AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR
-    GROUP BY
-        l_partkey,
-        l_suppkey
-),
-qualified_suppliers AS (
-    SELECT
-        ps_suppkey
-    FROM
-        partsupp
-        INNER JOIN forest_parts
-            ON ps_partkey = forest_parts.p_partkey
-        INNER JOIN lineitem_qty
-            ON ps_partkey = lineitem_qty.l_partkey
-            AND ps_suppkey = lineitem_qty.l_suppkey
-    WHERE
-        ps_availqty * 2 > total_quantity
-    GROUP BY
-        ps_suppkey
-)
 SELECT
     s_name,
     s_address
 FROM
-    supplier
-    INNER JOIN qualified_suppliers
-        ON s_suppkey = qualified_suppliers.ps_suppkey
-    INNER JOIN nation
-        ON s_nationkey = n_nationkey
+    supplier,
+    nation
 WHERE
-    n_name      = 'CANADA'
+    s_suppkey IN (
+        SELECT
+            ps_suppkey
+        FROM
+            partsupp
+        WHERE
+            ps_partkey IN (
+                SELECT
+                    p_partkey
+                FROM
+                    part
+                WHERE
+                    p_name LIKE 'forest%'
+            )
+            AND ps_availqty > (
+                SELECT
+                    0.5 * SUM(l_quantity)
+                FROM
+                    lineitem
+                WHERE
+                    l_partkey = ps_partkey
+                    AND l_suppkey = ps_suppkey
+                    AND l_shipdate >= DATE '1994-01-01'
+                    AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR
+            )
+    )
+    AND s_nationkey = n_nationkey
+    AND n_name = 'CANADA'
 ORDER BY
     s_name;
 ";

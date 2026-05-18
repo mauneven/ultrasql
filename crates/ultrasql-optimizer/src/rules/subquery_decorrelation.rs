@@ -20,6 +20,10 @@
 //! - uncorrelated scalar subquery in a predicate → cross join the scalar
 //!   subplan, replace the subquery expression with its joined column, filter,
 //!   then project outer columns.
+//! - equality-correlated scalar aggregate subquery in a predicate → group the
+//!   inner aggregate by the correlated key, left-join it to the outer input,
+//!   replace the scalar subquery with the joined aggregate column, filter, then
+//!   project outer columns.
 //!
 //! NOTE: the `NOT IN` with NULL-handling caveat: SQL's `x NOT IN (SELECT y …)`
 //! returns UNKNOWN (not TRUE) when the subquery produces any NULL in `y`.
@@ -41,9 +45,8 @@
 //!
 //! ## Current limits
 //!
-//! Correlated scalar aggregate subqueries and non-equality correlations are not
-//! lowered yet. They stay as explicit roadmap debt rather than being hidden by
-//! benchmark-query rewrites.
+//! Non-equality correlations are not lowered yet. They stay as explicit
+//! roadmap debt rather than being hidden by benchmark-query rewrites.
 
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_planner::{BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr};
@@ -207,6 +210,14 @@ struct CorrPair {
     outer_type: DataType,
 }
 
+#[derive(Debug)]
+struct CorrelatedScalarRight {
+    plan: LogicalPlan,
+    corr_pairs: Vec<CorrPair>,
+    scalar_index: usize,
+    scalar_name: String,
+}
+
 fn rewrite_filter_with_real_subquery_expr(
     outer: &LogicalPlan,
     predicate: &ScalarExpr,
@@ -220,6 +231,31 @@ fn rewrite_scalar_subquery_filter(
     outer: &LogicalPlan,
     predicate: &ScalarExpr,
 ) -> Option<LogicalPlan> {
+    if let Some((subplan, data_type)) = find_first_correlated_scalar_subquery(predicate) {
+        let right = build_correlated_scalar_aggregate_right(*subplan)?;
+        let outer_width = outer.schema().len();
+        let replacement = ScalarExpr::Column {
+            name: right.scalar_name.clone(),
+            index: outer_width + right.scalar_index,
+            data_type,
+        };
+        let rewritten_predicate = replace_first_correlated_scalar_subquery(predicate, replacement)?;
+        let (outer_predicates, post_join_predicates) =
+            split_outer_only_conjuncts(&rewritten_predicate, outer_width);
+        let outer_input = filter_with_conjuncts(outer.clone(), outer_predicates);
+        let join_condition = build_correlation_condition(&right.corr_pairs, outer_width);
+        let join_schema = concat_schemas(outer_input.schema(), right.plan.schema());
+        let join = LogicalPlan::Join {
+            left: Box::new(outer_input),
+            right: Box::new(right.plan),
+            join_type: LogicalJoinType::LeftOuter,
+            condition: LogicalJoinCondition::On(join_condition),
+            schema: join_schema,
+        };
+        let filtered = filter_with_conjuncts(join, post_join_predicates);
+        return Some(project_left(filtered, outer.schema()));
+    }
+
     let outer_width = outer.schema().len();
     let (rewritten_predicate, subplan) = replace_first_uncorrelated_scalar_subquery(
         predicate,
@@ -240,6 +276,201 @@ fn rewrite_scalar_subquery_filter(
         predicate: rewritten_predicate,
     };
     Some(project_left(filtered, outer.schema()))
+}
+
+fn build_correlated_scalar_aggregate_right(plan: LogicalPlan) -> Option<CorrelatedScalarRight> {
+    match plan {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            schema,
+        } => {
+            if schema.len() != 1 || exprs.len() != 1 {
+                return None;
+            }
+            let (aggregate, corr_pairs) = build_grouped_correlated_aggregate(*input)?;
+            let corr_len = corr_pairs.len();
+            let scalar_field = schema.field_at(0);
+            let scalar_name = "__scalar_subquery".to_owned();
+            let mut fields = corr_fields(&corr_pairs);
+            fields.push(Field::nullable(
+                scalar_name.clone(),
+                scalar_field.data_type.clone(),
+            ));
+            let project_schema = Schema::new(fields).ok()?;
+
+            let mut project_exprs = Vec::with_capacity(corr_len + 1);
+            for idx in 0..corr_len {
+                let field = aggregate.schema().field_at(idx);
+                project_exprs.push((
+                    ScalarExpr::Column {
+                        name: field.name.clone(),
+                        index: idx,
+                        data_type: field.data_type.clone(),
+                    },
+                    field.name.clone(),
+                ));
+            }
+            let shifted_scalar = shift_column_indices_by(&exprs[0].0, corr_len);
+            project_exprs.push((shifted_scalar, scalar_name.clone()));
+
+            Some(CorrelatedScalarRight {
+                plan: LogicalPlan::Project {
+                    input: Box::new(aggregate),
+                    exprs: project_exprs,
+                    schema: project_schema,
+                },
+                corr_pairs,
+                scalar_index: corr_len,
+                scalar_name,
+            })
+        }
+        LogicalPlan::Aggregate { .. } => {
+            let (aggregate, corr_pairs) = build_grouped_correlated_aggregate(plan)?;
+            let scalar_index = corr_pairs.len();
+            if aggregate.schema().len() != scalar_index + 1 {
+                return None;
+            }
+            let scalar_name = aggregate.schema().field_at(scalar_index).name.clone();
+            Some(CorrelatedScalarRight {
+                plan: aggregate,
+                corr_pairs,
+                scalar_index,
+                scalar_name,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn build_grouped_correlated_aggregate(plan: LogicalPlan) -> Option<(LogicalPlan, Vec<CorrPair>)> {
+    let LogicalPlan::Aggregate {
+        input,
+        group_by,
+        aggregates,
+        schema,
+    } = plan
+    else {
+        return None;
+    };
+    if !group_by.is_empty() || aggregates.is_empty() {
+        return None;
+    }
+    let (clean_input, corr_pairs) = extract_correlated_scalar_input(*input)?;
+    if corr_pairs.is_empty() {
+        return None;
+    }
+
+    let new_group_by = corr_pairs
+        .iter()
+        .map(|pair| ScalarExpr::Column {
+            name: pair.inner_name.clone(),
+            index: pair.inner_index,
+            data_type: pair.inner_type.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut fields = corr_fields(&corr_pairs);
+    fields.extend(schema.fields().iter().cloned());
+    let grouped_schema = Schema::new(fields).ok()?;
+
+    Some((
+        LogicalPlan::Aggregate {
+            input: Box::new(clean_input),
+            group_by: new_group_by,
+            aggregates,
+            schema: grouped_schema,
+        },
+        corr_pairs,
+    ))
+}
+
+fn extract_correlated_scalar_input(plan: LogicalPlan) -> Option<(LogicalPlan, Vec<CorrPair>)> {
+    let LogicalPlan::Filter { input, predicate } = plan else {
+        return None;
+    };
+    let mut local = Vec::new();
+    let mut corr = Vec::new();
+    for conjunct in split_and(&predicate) {
+        if conjunct.contains_outer_column() {
+            corr.push(parse_correlation_equality(&conjunct)?);
+        } else {
+            local.push(conjunct);
+        }
+    }
+    let clean = filter_with_conjuncts(*input, local);
+    Some((clean, corr))
+}
+
+fn corr_fields(pairs: &[CorrPair]) -> Vec<Field> {
+    pairs
+        .iter()
+        .enumerate()
+        .map(|(idx, pair)| Field::nullable(format!("__corr_{idx}"), pair.inner_type.clone()))
+        .collect()
+}
+
+fn split_outer_only_conjuncts(
+    predicate: &ScalarExpr,
+    outer_width: usize,
+) -> (Vec<ScalarExpr>, Vec<ScalarExpr>) {
+    let mut outer_only = Vec::new();
+    let mut post_join = Vec::new();
+    for conjunct in split_and(predicate) {
+        let mut refs = Vec::new();
+        collect_column_refs(&conjunct, &mut refs);
+        if !expr_contains_subquery(&conjunct)
+            && !refs.is_empty()
+            && refs.iter().all(|idx| *idx < outer_width)
+        {
+            outer_only.push(conjunct);
+        } else {
+            post_join.push(conjunct);
+        }
+    }
+    (outer_only, post_join)
+}
+
+fn collect_column_refs(expr: &ScalarExpr, refs: &mut Vec<usize>) {
+    match expr {
+        ScalarExpr::Column { index, .. } => refs.push(*index),
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => {
+            collect_column_refs(expr, refs);
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            collect_column_refs(left, refs);
+            collect_column_refs(right, refs);
+        }
+        ScalarExpr::FunctionCall { args, .. } => {
+            for arg in args {
+                collect_column_refs(arg, refs);
+            }
+        }
+        ScalarExpr::Literal { .. }
+        | ScalarExpr::Parameter { .. }
+        | ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => {}
+    }
+}
+
+fn expr_contains_subquery(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => true,
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => {
+            expr_contains_subquery(expr)
+        }
+        ScalarExpr::Binary { left, right, .. } => {
+            expr_contains_subquery(left) || expr_contains_subquery(right)
+        }
+        ScalarExpr::FunctionCall { args, .. } => args.iter().any(expr_contains_subquery),
+        ScalarExpr::Column { .. }
+        | ScalarExpr::Literal { .. }
+        | ScalarExpr::Parameter { .. }
+        | ScalarExpr::OuterColumn { .. } => false,
+    }
 }
 
 fn rewrite_exists_filter_expr(outer: &LogicalPlan, predicate: &ScalarExpr) -> Option<LogicalPlan> {
@@ -680,6 +911,185 @@ fn replace_first_uncorrelated_scalar_subquery(
     }
 }
 
+fn find_first_correlated_scalar_subquery(
+    expr: &ScalarExpr,
+) -> Option<(Box<LogicalPlan>, DataType)> {
+    match expr {
+        ScalarExpr::ScalarSubquery {
+            subplan,
+            correlated: true,
+            data_type,
+        } => Some((subplan.clone(), data_type.clone())),
+        ScalarExpr::Binary { left, right, .. } => find_first_correlated_scalar_subquery(left)
+            .or_else(|| find_first_correlated_scalar_subquery(right)),
+        ScalarExpr::Unary { expr: inner, .. } | ScalarExpr::IsNull { expr: inner, .. } => {
+            find_first_correlated_scalar_subquery(inner)
+        }
+        ScalarExpr::FunctionCall { args, .. } => {
+            args.iter().find_map(find_first_correlated_scalar_subquery)
+        }
+        ScalarExpr::Column { .. }
+        | ScalarExpr::Literal { .. }
+        | ScalarExpr::Parameter { .. }
+        | ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery {
+            correlated: false, ..
+        }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => None,
+    }
+}
+
+fn replace_first_correlated_scalar_subquery(
+    expr: &ScalarExpr,
+    replacement: ScalarExpr,
+) -> Option<ScalarExpr> {
+    match expr {
+        ScalarExpr::ScalarSubquery {
+            correlated: true, ..
+        } => Some(replacement),
+        ScalarExpr::Binary {
+            op,
+            left,
+            right,
+            data_type,
+        } => {
+            if let Some(new_left) =
+                replace_first_correlated_scalar_subquery(left, replacement.clone())
+            {
+                return Some(ScalarExpr::Binary {
+                    op: *op,
+                    left: Box::new(new_left),
+                    right: right.clone(),
+                    data_type: data_type.clone(),
+                });
+            }
+            replace_first_correlated_scalar_subquery(right, replacement).map(|new_right| {
+                ScalarExpr::Binary {
+                    op: *op,
+                    left: left.clone(),
+                    right: Box::new(new_right),
+                    data_type: data_type.clone(),
+                }
+            })
+        }
+        ScalarExpr::Unary {
+            op,
+            expr: inner,
+            data_type,
+        } => replace_first_correlated_scalar_subquery(inner, replacement).map(|new_inner| {
+            ScalarExpr::Unary {
+                op: *op,
+                expr: Box::new(new_inner),
+                data_type: data_type.clone(),
+            }
+        }),
+        ScalarExpr::IsNull {
+            expr: inner,
+            negated,
+        } => replace_first_correlated_scalar_subquery(inner, replacement).map(|new_inner| {
+            ScalarExpr::IsNull {
+                expr: Box::new(new_inner),
+                negated: *negated,
+            }
+        }),
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => {
+            for (idx, arg) in args.iter().enumerate() {
+                if let Some(new_arg) =
+                    replace_first_correlated_scalar_subquery(arg, replacement.clone())
+                {
+                    let mut new_args = args.clone();
+                    new_args[idx] = new_arg;
+                    return Some(ScalarExpr::FunctionCall {
+                        name: name.clone(),
+                        args: new_args,
+                        data_type: data_type.clone(),
+                    });
+                }
+            }
+            None
+        }
+        ScalarExpr::Column { .. }
+        | ScalarExpr::Literal { .. }
+        | ScalarExpr::Parameter { .. }
+        | ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery {
+            correlated: false, ..
+        }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => None,
+    }
+}
+
+fn shift_column_indices_by(expr: &ScalarExpr, offset: usize) -> ScalarExpr {
+    match expr {
+        ScalarExpr::Column {
+            name,
+            index,
+            data_type,
+        } => ScalarExpr::Column {
+            name: name.clone(),
+            index: index + offset,
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Literal { value, data_type } => ScalarExpr::Literal {
+            value: value.clone(),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Parameter { index, data_type } => ScalarExpr::Parameter {
+            index: *index,
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Unary {
+            op,
+            expr: inner,
+            data_type,
+        } => ScalarExpr::Unary {
+            op: *op,
+            expr: Box::new(shift_column_indices_by(inner, offset)),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Binary {
+            op,
+            left,
+            right,
+            data_type,
+        } => ScalarExpr::Binary {
+            op: *op,
+            left: Box::new(shift_column_indices_by(left, offset)),
+            right: Box::new(shift_column_indices_by(right, offset)),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::IsNull {
+            expr: inner,
+            negated,
+        } => ScalarExpr::IsNull {
+            expr: Box::new(shift_column_indices_by(inner, offset)),
+            negated: *negated,
+        },
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => ScalarExpr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| shift_column_indices_by(arg, offset))
+                .collect(),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::OuterColumn { .. }
+        | ScalarExpr::ScalarSubquery { .. }
+        | ScalarExpr::Exists { .. }
+        | ScalarExpr::InSubquery { .. } => expr.clone(),
+    }
+}
+
 fn split_and(expr: &ScalarExpr) -> Vec<ScalarExpr> {
     match expr {
         ScalarExpr::Binary {
@@ -942,7 +1352,8 @@ pub(crate) fn make_in_subquery_filter(
 mod tests {
     use ultrasql_core::{DataType, Field, Schema, Value};
     use ultrasql_planner::{
-        BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, ScalarExpr,
+        AggregateFunc, BinaryOp, LogicalAggregateExpr, LogicalJoinCondition, LogicalJoinType,
+        LogicalPlan, ScalarExpr,
     };
 
     use super::*;
@@ -1219,6 +1630,77 @@ mod tests {
                 )
             ),
             "scalar subquery should become Cross Join + Filter, got {input:?}"
+        );
+    }
+
+    #[test]
+    fn real_correlated_scalar_aggregate_rewrites_to_left_join_filter() {
+        let sub_filter = LogicalPlan::Filter {
+            input: Box::new(sub_scan()),
+            predicate: ScalarExpr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(col("key", 0, DataType::Int32)),
+                right: Box::new(outer_col("id", 0, DataType::Int32)),
+                data_type: DataType::Bool,
+            },
+        };
+        let agg_schema =
+            Schema::new([Field::nullable("avg", DataType::Float64)]).expect("schema ok");
+        let aggregate = LogicalPlan::Aggregate {
+            input: Box::new(sub_filter),
+            group_by: Vec::new(),
+            aggregates: vec![LogicalAggregateExpr {
+                func: AggregateFunc::Avg,
+                arg: Some(col("data", 1, DataType::Int32)),
+                distinct: false,
+                output_name: "avg".to_owned(),
+                data_type: DataType::Float64,
+            }],
+            schema: agg_schema.clone(),
+        };
+        let subquery = LogicalPlan::Project {
+            input: Box::new(aggregate),
+            exprs: vec![(col("avg", 0, DataType::Float64), "avg".to_owned())],
+            schema: agg_schema,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(outer_scan()),
+            predicate: ScalarExpr::Binary {
+                op: BinaryOp::Lt,
+                left: Box::new(col("val", 1, DataType::Int32)),
+                right: Box::new(ScalarExpr::ScalarSubquery {
+                    subplan: Box::new(subquery),
+                    correlated: true,
+                    data_type: DataType::Float64,
+                }),
+                data_type: DataType::Bool,
+            },
+        };
+
+        let result = SubqueryDecorrelation
+            .apply(&plan)
+            .expect("no error")
+            .expect("rewrite");
+        let LogicalPlan::Project { input, schema, .. } = &result else {
+            panic!("expected Project, got {result:?}");
+        };
+        assert_eq!(schema.len(), 2);
+        assert!(
+            matches!(
+                input.as_ref(),
+                LogicalPlan::Filter {
+                    input,
+                    ..
+                } if matches!(
+                    input.as_ref(),
+                    LogicalPlan::Join {
+                        join_type: LogicalJoinType::LeftOuter,
+                        condition: LogicalJoinCondition::On(_),
+                        ..
+                    }
+                )
+            ),
+            "correlated scalar aggregate should become LeftOuter Join + Filter, got {input:?}"
         );
     }
 

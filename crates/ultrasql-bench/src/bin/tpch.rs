@@ -125,6 +125,10 @@ enum Cmd {
         /// Rebuild cached DuckDB expected rows even if a cache entry exists.
         #[arg(long)]
         refresh_duckdb_cache: bool,
+
+        /// Keep running selected UltraSQL queries after per-query failures.
+        #[arg(long)]
+        keep_going: bool,
     },
 
     /// Compare a new run against a recorded baseline; exit non-zero on >5% regression.
@@ -222,12 +226,14 @@ fn run() -> Result<()> {
             queries,
             duckdb_cache_dir,
             refresh_duckdb_cache,
+            keep_going,
         } => cmd_validate_results(
             &data_dir,
             &duckdb,
             queries.as_deref(),
             &duckdb_cache_dir,
             refresh_duckdb_cache,
+            keep_going,
         ),
         Cmd::Compare {
             baseline,
@@ -370,6 +376,7 @@ fn cmd_validate_results(
     query_selector: Option<&str>,
     duckdb_cache_dir: &Path,
     refresh_duckdb_cache: bool,
+    keep_going: bool,
 ) -> Result<()> {
     let queries = runner::selected_queries(query_selector)?;
     let expected = run_duckdb_results_cached(
@@ -380,6 +387,16 @@ fn cmd_validate_results(
         refresh_duckdb_cache,
     )
     .context("run DuckDB reference")?;
+    if keep_going {
+        let actual = runner::run_ultrasql_result_outcomes(data_dir, &queries, true)
+            .context("run UltraSQL results")?;
+        compare_result_outcomes(&expected, &actual)?;
+        println!(
+            "validated {} TPC-H query result set(s) against DuckDB",
+            actual.len()
+        );
+        return Ok(());
+    }
     let actual =
         runner::run_ultrasql_results(data_dir, &queries).context("run UltraSQL results")?;
     compare_result_sets(&expected, &actual)?;
@@ -809,6 +826,55 @@ fn compare_result_sets(expected: &[runner::QueryRows], actual: &[runner::QueryRo
         );
     }
     Ok(())
+}
+
+fn compare_result_outcomes(
+    expected: &[runner::QueryRows],
+    actual: &[runner::QueryRowsOutcome],
+) -> Result<()> {
+    if expected.len() != actual.len() {
+        bail!(
+            "query count mismatch: DuckDB={} UltraSQL={}",
+            expected.len(),
+            actual.len()
+        );
+    }
+
+    let mut failures = Vec::new();
+    for (expected_query, actual_query) in expected.iter().zip(actual) {
+        if expected_query.label != actual_query.label {
+            failures.push(format!(
+                "query label mismatch: DuckDB={} UltraSQL={}",
+                expected_query.label, actual_query.label
+            ));
+            continue;
+        }
+        match &actual_query.result {
+            Ok(rows) => {
+                let actual_rows = runner::QueryRows {
+                    label: actual_query.label.clone(),
+                    rows: rows.clone(),
+                };
+                match compare_query_rows(expected_query, &actual_rows) {
+                    Ok(()) => println!(
+                        "{} ok ({} rows)",
+                        actual_query.label,
+                        actual_rows.rows.len()
+                    ),
+                    Err(error) => failures.push(format!("{error:#}")),
+                }
+            }
+            Err(error) => failures.push(format!("{} failed: {error}", actual_query.label)),
+        }
+    }
+
+    if failures.is_empty() {
+        return Ok(());
+    }
+    for failure in &failures {
+        eprintln!("validation failure: {failure}");
+    }
+    bail!("{} TPC-H validation failure(s)", failures.len())
 }
 
 fn compare_query_rows(expected: &runner::QueryRows, actual: &runner::QueryRows) -> Result<()> {

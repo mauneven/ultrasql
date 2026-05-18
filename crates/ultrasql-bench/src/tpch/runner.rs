@@ -40,6 +40,15 @@ pub struct QueryRows {
     pub rows: Vec<Vec<String>>,
 }
 
+/// Per-query UltraSQL validation outcome for keep-going runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryRowsOutcome {
+    /// Query label, e.g. `"q1"`.
+    pub label: String,
+    /// Rows on success, or a concise execution/collection error.
+    pub result: std::result::Result<Vec<Vec<String>>, String>,
+}
+
 /// Return query numbers selected by CLI, `ULTRASQL_TPCH_QUERY`, or all 22.
 pub fn selected_queries(cli_selector: Option<&str>) -> Result<Vec<u8>> {
     if let Some(raw) = cli_selector {
@@ -331,6 +340,27 @@ pub fn run_ultrasql(
 /// result rows instead of discarding them for timing.
 #[cfg(feature = "sql-bench")]
 pub fn run_ultrasql_results(data_dir: &std::path::Path, queries: &[u8]) -> Result<Vec<QueryRows>> {
+    let outcomes = run_ultrasql_result_outcomes(data_dir, queries, false)?;
+    outcomes
+        .into_iter()
+        .map(|outcome| match outcome.result {
+            Ok(rows) => Ok(QueryRows {
+                label: outcome.label,
+                rows,
+            }),
+            Err(error) => anyhow::bail!("{}: {error}", outcome.label),
+        })
+        .collect()
+}
+
+/// Runs selected TPC-H queries against in-process UltraSQL and keeps per-query
+/// failures when requested.
+#[cfg(feature = "sql-bench")]
+pub fn run_ultrasql_result_outcomes(
+    data_dir: &std::path::Path,
+    queries: &[u8],
+    keep_going: bool,
+) -> Result<Vec<QueryRowsOutcome>> {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -408,18 +438,50 @@ pub fn run_ultrasql_results(data_dir: &std::path::Path, queries: &[u8]) -> Resul
             if progress_enabled() {
                 eprintln!("ultrasql tpch validate: starting {label}");
             }
-            let messages = client
-                .simple_query(sql.as_ref())
-                .await
-                .with_context(|| format!("run {label}"))?;
-            let rows = collect_rows(&messages).with_context(|| format!("collect {label} rows"))?;
-            if progress_enabled() {
-                eprintln!(
-                    "ultrasql tpch validate: finished {label} ({} rows)",
-                    rows.len()
-                );
+            match client.simple_query(sql.as_ref()).await {
+                Ok(messages) => match collect_rows(&messages) {
+                    Ok(rows) => {
+                        if progress_enabled() {
+                            eprintln!(
+                                "ultrasql tpch validate: finished {label} ({} rows)",
+                                rows.len()
+                            );
+                        }
+                        results.push(QueryRowsOutcome {
+                            label,
+                            result: Ok(rows),
+                        });
+                    }
+                    Err(error) if keep_going => {
+                        if progress_enabled() {
+                            eprintln!("ultrasql tpch validate: {label} collect failed: {error:#}");
+                        }
+                        results.push(QueryRowsOutcome {
+                            label,
+                            result: Err(format!("collect rows: {error:#}")),
+                        });
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("collect {label} rows"));
+                    }
+                },
+                Err(error) if keep_going => {
+                    let detail = error
+                        .as_db_error()
+                        .map(|db| db.message().to_owned())
+                        .unwrap_or_else(|| error.to_string());
+                    if progress_enabled() {
+                        eprintln!("ultrasql tpch validate: {label} failed: {detail}");
+                    }
+                    results.push(QueryRowsOutcome {
+                        label,
+                        result: Err(detail),
+                    });
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("run {label}"));
+                }
             }
-            results.push(QueryRows { label, rows });
         }
 
         drop(client);
@@ -435,6 +497,19 @@ pub fn run_ultrasql_results(
     _data_dir: &std::path::Path,
     _queries: &[u8],
 ) -> Result<Vec<QueryRows>> {
+    bail!(
+        "NotYetWired: rebuild ultrasql-bench with --features sql-bench to \
+         enable the in-process TPC-H validator"
+    )
+}
+
+/// Stub: returns an error when the `sql-bench` feature is not active.
+#[cfg(not(feature = "sql-bench"))]
+pub fn run_ultrasql_result_outcomes(
+    _data_dir: &std::path::Path,
+    _queries: &[u8],
+    _keep_going: bool,
+) -> Result<Vec<QueryRowsOutcome>> {
     bail!(
         "NotYetWired: rebuild ultrasql-bench with --features sql-bench to \
          enable the in-process TPC-H validator"

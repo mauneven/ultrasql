@@ -180,3 +180,58 @@ async fn uncorrelated_in_and_scalar_subqueries_lower_before_execution() {
 
     shutdown(client, server_handle).await;
 }
+
+#[tokio::test]
+async fn correlated_scalar_aggregate_subquery_lowers_before_execution() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute(
+            "CREATE TABLE sq_part_price (
+                 p_partkey INT NOT NULL,
+                 p_limit INT NOT NULL
+             )",
+        )
+        .await
+        .expect("create part price");
+    client
+        .batch_execute(
+            "CREATE TABLE sq_supply (
+                 ps_partkey INT NOT NULL,
+                 ps_cost INT NOT NULL
+             )",
+        )
+        .await
+        .expect("create supply");
+    client
+        .batch_execute("INSERT INTO sq_part_price VALUES (1, 5), (2, 7), (3, 9)")
+        .await
+        .expect("insert part price");
+    client
+        .batch_execute("INSERT INTO sq_supply VALUES (1, 5), (1, 8), (2, 6), (2, 10)")
+        .await
+        .expect("insert supply");
+
+    let rows = client
+        .simple_query(
+            "SELECT p_partkey
+             FROM sq_part_price
+             WHERE p_limit = (
+                 SELECT MIN(ps_cost)
+                 FROM sq_supply
+                 WHERE ps_partkey = p_partkey
+             )
+             ORDER BY p_partkey",
+        )
+        .await
+        .expect("correlated scalar aggregate succeeds");
+    let keys: Vec<i32> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0)?.parse().ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys, vec![1]);
+
+    shutdown(client, server_handle).await;
+}
