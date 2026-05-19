@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "suite": "sqllogictest",
+  "generated_at_unix_ms": 1779212720527,
+  "benchmark_runs": 5,
+  "case_count": 26,
+  "input_paths": ["tests/slt/portable"],
+  "winner": "ultrasql",
+  "engines": [
+    {"name": "ultrasql", "ok": true, "error": null, "statements": 15, "query_records": 11, "query_iterations": 55, "skipped": 0, "total_ns": 7075208, "avg_ns_per_query_iteration": 128640},
+    {"name": "sqlite", "ok": true, "error": null, "statements": 15, "query_records": 11, "query_iterations": 55, "skipped": 0, "total_ns": 7700541, "avg_ns_per_query_iteration": 140009},
+    {"name": "duckdb", "ok": true, "error": null, "statements": 15, "query_records": 11, "query_iterations": 55, "skipped": 0, "total_ns": 22888042, "avg_ns_per_query_iteration": 416146}
+  ]
+}

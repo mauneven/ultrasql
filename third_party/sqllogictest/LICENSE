@@ -1,0 +1,9 @@
+This directory currently contains no imported third-party SQLLogicTest corpus.
+
+UltraSQL-authored helper files in this directory follow the workspace license:
+Apache-2.0 OR MIT.
+
+Before any external SQLLogicTest files are committed, copy the upstream license
+or copyright notice into `third_party/sqllogictest/LICENSE.upstream`, record the
+source commit in `third_party/sqllogictest/upstream_commit.txt`, and preserve
+any per-file notices in the imported files.

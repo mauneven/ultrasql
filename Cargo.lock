@@ -2976,6 +2976,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ultrasql-sqllogictest-runner"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "clap",
+ "tokio",
+ "tokio-postgres",
+ "ultrasql-server",
+]
+
+[[package]]
 name = "ultrasql-storage"
 version = "0.0.1"
 dependencies = [

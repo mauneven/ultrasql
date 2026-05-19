@@ -1,0 +1,27 @@
+# UltraSQL-authored transaction smoke. Disabled unless explicitly requested.
+# ultrasql:file-require transactions
+
+statement ok
+CREATE TABLE slt_txn (id INT NOT NULL)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO slt_txn VALUES (1)
+
+query I nosort
+SELECT COUNT(*) FROM slt_txn
+----
+1
+
+statement ok
+COMMIT
+
+query I nosort
+SELECT COUNT(*) FROM slt_txn
+----
+1
+
+statement ok
+DROP TABLE slt_txn

@@ -1,0 +1,65 @@
+# UltraSQL-authored portable SQLLogicTest coverage for benchmark replay.
+
+statement ok
+CREATE TABLE slt_bench_numbers (id INT NOT NULL, grp INT NOT NULL, amount INT NOT NULL, label TEXT)
+
+statement ok
+INSERT INTO slt_bench_numbers VALUES (1, 1, 10, 'a'), (2, 1, 20, 'b'), (3, 2, 30, 'c'), (4, 2, 40, 'd'), (5, 3, 50, 'e'), (6, 3, 60, 'f'), (7, 1, 70, 'g'), (8, 2, 80, 'h')
+
+query I nosort
+SELECT COUNT(*) FROM slt_bench_numbers
+----
+8
+
+query I nosort
+SELECT SUM(amount) FROM slt_bench_numbers WHERE grp = 2
+----
+150
+
+query II nosort
+SELECT id, amount FROM slt_bench_numbers WHERE amount >= 40 ORDER BY amount DESC
+----
+8
+80
+7
+70
+6
+60
+5
+50
+4
+40
+
+query II nosort
+SELECT grp, SUM(amount) FROM slt_bench_numbers GROUP BY grp ORDER BY grp
+----
+1
+100
+2
+150
+3
+110
+
+statement ok
+CREATE TABLE slt_bench_groups (grp INT NOT NULL, name TEXT)
+
+statement ok
+INSERT INTO slt_bench_groups VALUES (1, 'low'), (2, 'mid'), (3, 'high')
+
+query IT rowsort
+SELECT slt_bench_numbers.id, slt_bench_groups.name FROM slt_bench_numbers JOIN slt_bench_groups ON slt_bench_numbers.grp = slt_bench_groups.grp WHERE slt_bench_numbers.amount >= 50
+----
+5
+high
+6
+high
+7
+low
+8
+mid
+
+statement ok
+DROP TABLE slt_bench_groups
+
+statement ok
+DROP TABLE slt_bench_numbers

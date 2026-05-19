@@ -122,8 +122,7 @@ mod tests {
 
     #[test]
     fn q19_batch_contains_discounted_revenue() {
-        let batch = build_q19_batch(&[TpchQ19ResultRow { revenue: 900_000 }])
-            .expect("q19 batch");
+        let batch = build_q19_batch(&[TpchQ19ResultRow { revenue: 900_000 }]).expect("q19 batch");
 
         let Column::Int64(revenue) = &batch.columns()[0] else {
             panic!("revenue should be Int64");

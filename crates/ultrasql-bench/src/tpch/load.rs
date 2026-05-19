@@ -884,12 +884,10 @@ impl TpchQ8BuildState {
     fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ8ResultRow> {
         self.years
             .iter()
-            .filter_map(|(&o_year, state)| {
-                (state.total_volume != 0).then(|| ultrasql_server::TpchQ8ResultRow {
-                    o_year,
-                    mkt_share: q8_i64_to_f64(state.brazil_volume)
-                        / q8_i64_to_f64(state.total_volume),
-                })
+            .filter(|(_, state)| state.total_volume != 0)
+            .map(|(&o_year, state)| ultrasql_server::TpchQ8ResultRow {
+                o_year,
+                mkt_share: q8_i64_to_f64(state.brazil_volume) / q8_i64_to_f64(state.total_volume),
             })
             .collect()
     }
@@ -2421,10 +2419,7 @@ fn q19_part_band(brand: &str, container: &str, size: i32) -> Option<TpchQ19Band>
         }
         "Brand#23"
             if (1..=10).contains(&size)
-                && matches!(
-                    container,
-                    "MED BAG" | "MED BOX" | "MED PKG" | "MED PACK"
-                ) =>
+                && matches!(container, "MED BAG" | "MED BOX" | "MED PKG" | "MED PACK") =>
         {
             Some(TpchQ19Band {
                 quantity_min: 10_00,
@@ -3634,6 +3629,10 @@ async fn load_ultrasql_table(
 }
 
 #[cfg(feature = "sql-bench")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "direct TPC-H load wires independent sidecar states without heap boxing"
+)]
 fn load_ultrasql_table_direct(
     server: &ultrasql_server::Server,
     table: &str,
@@ -5014,15 +5013,15 @@ mod tests {
                 "10|1|O|100.00|1995-01-01|1-URGENT|clerk|0|comment",
             )
             .expect("orders");
-        state.ingest_lineitem_values(10, 200_00).expect("line 1");
-        state.ingest_lineitem_values(10, 150_00).expect("line 2");
+        state.ingest_lineitem_values(10, 20_000).expect("line 1");
+        state.ingest_lineitem_values(10, 15_000).expect("line 2");
 
         let rows = state.finish_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].c_name, "Customer#1");
         assert_eq!(rows[0].o_orderkey, 10);
-        assert_eq!(rows[0].sum_quantity, 350_00);
+        assert_eq!(rows[0].sum_quantity, 35_000);
     }
 
     #[cfg(feature = "sql-bench")]
@@ -5030,10 +5029,7 @@ mod tests {
     fn tpch_q19_sidecar_sums_matching_brand_container_revenue() {
         let mut state = TpchQ19BuildState::default();
         state
-            .ingest(
-                "part",
-                "5|name|mfgr|Brand#12|TYPE|3|SM BOX|1.00|comment",
-            )
+            .ingest("part", "5|name|mfgr|Brand#12|TYPE|3|SM BOX|1.00|comment")
             .expect("part");
         state
             .ingest_lineitem_values(5, 1_00, 10_000, 10, "AIR", "DELIVER IN PERSON")
@@ -5056,7 +5052,10 @@ mod tests {
             .ingest("supplier", "7|Supplier#7|addr|3|11-111|1.00|comment")
             .expect("supplier");
         state
-            .ingest("part", "5|forest green part|mfgr|Brand#1|TYPE|3|SM BOX|1.00|comment")
+            .ingest(
+                "part",
+                "5|forest green part|mfgr|Brand#1|TYPE|3|SM BOX|1.00|comment",
+            )
             .expect("part");
         state
             .ingest("partsupp", "5|7|6|1.00|comment")
@@ -5083,7 +5082,10 @@ mod tests {
             .ingest("supplier", "7|Supplier#7|addr|4|11-111|1.00|comment")
             .expect("supplier");
         state
-            .ingest("orders", "10|1|F|1.00|1995-01-01|1-URGENT|Clerk#1|0|comment")
+            .ingest(
+                "orders",
+                "10|1|F|1.00|1995-01-01|1-URGENT|Clerk#1|0|comment",
+            )
             .expect("orders");
         state
             .ingest_lineitem_values(10, 7, 1, 2)

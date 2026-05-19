@@ -1,0 +1,8 @@
+# pattern<TAB>reason
+PRAGMA	SQLite-specific pragma syntax is not portable.
+WITHOUT ROWID	SQLite-specific storage option is not portable.
+MATCH	Full-text MATCH/TSQUERY behavior is tracked outside the portable SLT subset.
+REGEXP	Regular-expression operator semantics are not implemented in UltraSQL.
+GLOB	SQLite-specific glob operator is not PostgreSQL-compatible.
+ON CONFLICT DO	Advanced PostgreSQL upsert behavior needs dedicated compatibility tests.
+WINDOW	Window-function coverage belongs in a tagged PostgreSQL compatibility subset.

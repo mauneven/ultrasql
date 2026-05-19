@@ -132,6 +132,33 @@ The comparison must:
 
 A comparison that violates any of these is invalid.
 
+### SQLLogicTest Replay Timing
+
+SQLLogicTest replay timing is a smoke benchmark for portable SQL compatibility
+costs. It is not a substitute for OLTP/OLAP certification, because
+SQLLogicTest is designed to verify results, not performance.
+
+Run:
+
+```text
+SLT_BENCH_RUNS=25 benchmarks/slt_speed_compare.sh
+```
+
+The script validates the portable SQLLogicTest corpus, then replays executable
+records against UltraSQL and installed reference engines (`sqlite3`, `duckdb`,
+and optionally PostgreSQL via `POSTGRES_URL`). It uses Cargo's release profile
+by default; set `SLT_BENCH_PROFILE=dev` only for quick local iteration. It
+writes:
+
+```text
+benchmarks/results/latest/slt_speed_comparison.json
+benchmarks/results/latest/slt_speed_comparison.md
+```
+
+Use this artifact to catch obvious query-path regressions and to see whether
+UltraSQL is faster or slower than SQLite/DuckDB/PostgreSQL on the current
+portable suite. Do not publish it as a TPC-H, ClickBench, or OLTP result.
+
 ### TPC-H Data Generation
 
 TPC-H data must come from an external `dbgen` / `qgen` checkout, not a
