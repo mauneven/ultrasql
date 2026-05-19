@@ -16,14 +16,46 @@ CLICKBENCH_TSV="${CLICKBENCH_TSV:-$CLICKBENCH_WORK/hits.tsv}"
 POSTGRES_DSN="${POSTGRES_DSN:-}"
 ULTRASQL_DSN="${ULTRASQL_DSN:-}"
 RUNS="${CLICKBENCH_RUNS:-3}"
+ALLOW_PARTIAL="${CLICKBENCH_ALLOW_PARTIAL:-0}"
 OUT_DIR="benchmarks/results/latest"
+RAW_DIR="$OUT_DIR/raw"
 SUMMARY_OUT="$OUT_DIR/clickbench_certification.json"
 
-mkdir -p "$CLICKBENCH_WORK" "$OUT_DIR"
+mkdir -p "$CLICKBENCH_WORK" "$OUT_DIR" "$RAW_DIR"
 
 base="https://raw.githubusercontent.com/ClickHouse/ClickBench/$CLICKBENCH_REF/postgresql"
 schema="$CLICKBENCH_WORK/create.sql"
 queries="$CLICKBENCH_WORK/queries.sql"
+
+write_failure_summary() {
+    local reason="$1"
+    local detail="$2"
+    python3 - "$SUMMARY_OUT" "$reason" "$detail" "$CLICKBENCH_REF" \
+        "$CLICKBENCH_TSV" "$POSTGRES_DSN" "$ULTRASQL_DSN" <<'PY'
+import json
+import pathlib
+import sys
+
+summary, reason, detail, ref, dataset, pg_dsn, ul_dsn = sys.argv[1:]
+doc = {
+    "workload": "clickbench",
+    "upstream_ref": ref,
+    "target": "UltraSQL geometric mean at least 5x faster than PostgreSQL",
+    "passed": False,
+    "reason": reason,
+    "detail": detail,
+    "dataset": dataset,
+    "postgres_dsn_set": bool(pg_dsn),
+    "ultrasql_dsn_set": bool(ul_dsn),
+    "next_step": (
+        "Provide the dataset plus both POSTGRES_DSN and ULTRASQL_DSN, then "
+        "rerun benchmarks/clickbench_certify.sh."
+    ),
+}
+pathlib.Path(summary).write_text(json.dumps(doc, indent=2) + "\n")
+print(json.dumps(doc, indent=2))
+PY
+}
 
 curl -L --fail --silent "$base/create.sql" -o "$schema"
 curl -L --fail --silent "$base/queries.sql" -o "$queries"
@@ -33,17 +65,7 @@ if [[ ! -f "$CLICKBENCH_TSV" ]]; then
         curl -L --fail "https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz" \
             | gunzip > "$CLICKBENCH_TSV"
     else
-        cat > "$SUMMARY_OUT" <<EOF
-{
-  "workload": "clickbench",
-  "upstream_ref": "$CLICKBENCH_REF",
-  "target": "UltraSQL geometric mean at least 5x faster than PostgreSQL",
-  "passed": false,
-  "reason": "dataset missing",
-  "dataset": "$CLICKBENCH_TSV",
-  "next_step": "Set CLICKBENCH_DOWNLOAD=1 or CLICKBENCH_TSV=/path/to/hits.tsv, then rerun benchmarks/clickbench_certify.sh"
-}
-EOF
+        write_failure_summary "dataset_missing" "Set CLICKBENCH_DOWNLOAD=1 or CLICKBENCH_TSV=/path/to/hits.tsv."
         cat >&2 <<EOF
 ClickBench dataset missing: $CLICKBENCH_TSV
 Download explicitly:
@@ -55,7 +77,19 @@ EOF
     fi
 fi
 
-python3 - "$schema" "$queries" "$CLICKBENCH_TSV" "$RUNS" "$POSTGRES_DSN" "$ULTRASQL_DSN" "$SUMMARY_OUT" <<'PY'
+if ! command -v psql >/dev/null 2>&1; then
+    write_failure_summary "psql_missing" "psql must be available on PATH."
+    echo "psql missing. Install PostgreSQL client tools or add psql to PATH." >&2
+    exit 2
+fi
+
+if [[ "$ALLOW_PARTIAL" != "1" && ( -z "$POSTGRES_DSN" || -z "$ULTRASQL_DSN" ) ]]; then
+    write_failure_summary "dsn_missing" "Certification requires both POSTGRES_DSN and ULTRASQL_DSN."
+    echo "ClickBench certification requires both POSTGRES_DSN and ULTRASQL_DSN." >&2
+    exit 2
+fi
+
+python3 - "$schema" "$queries" "$CLICKBENCH_TSV" "$RUNS" "$POSTGRES_DSN" "$ULTRASQL_DSN" "$SUMMARY_OUT" "$RAW_DIR" "$CLICKBENCH_REF" <<'PY'
 import json
 import math
 import pathlib
@@ -64,12 +98,14 @@ import subprocess
 import sys
 import time
 
-schema_path, queries_path, data_path, runs_raw, pg_dsn, ul_dsn, out_path = sys.argv[1:]
+schema_path, queries_path, data_path, runs_raw, pg_dsn, ul_dsn, out_path, raw_dir, upstream_ref = sys.argv[1:]
 runs = int(runs_raw)
 queries = [q.strip() for q in pathlib.Path(queries_path).read_text().split(";") if q.strip()]
 schema = pathlib.Path(schema_path).read_text()
 data_path = pathlib.Path(data_path)
 out_path = pathlib.Path(out_path)
+raw_dir = pathlib.Path(raw_dir)
+raw_dir.mkdir(parents=True, exist_ok=True)
 
 def psql(dsn, sql, *, capture=False):
     cmd = ["psql", "-v", "ON_ERROR_STOP=1", dsn, "-q", "-c", sql]
@@ -84,19 +120,29 @@ def psql(dsn, sql, *, capture=False):
 def load_engine(name, dsn):
     psql(dsn, "DROP TABLE IF EXISTS hits")
     psql(dsn, schema)
-    copy = rf"\copy hits FROM '{data_path}'"
-    subprocess.run(
-        ["psql", "-v", "ON_ERROR_STOP=1", dsn, "-q", "-c", copy],
-        text=True,
-        check=True,
-    )
+    with data_path.open("rb") as input_file:
+        subprocess.run(
+            ["psql", "-v", "ON_ERROR_STOP=1", dsn, "-q", "-c", "COPY hits FROM STDIN"],
+            stdin=input_file,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
     try:
         psql(dsn, "VACUUM ANALYZE hits")
     except subprocess.CalledProcessError:
         pass
 
 def run_engine(name, dsn):
-    load_engine(name, dsn)
+    try:
+        load_engine(name, dsn)
+    except subprocess.CalledProcessError as exc:
+        return {
+            "engine": name,
+            "load_error": (exc.stderr or str(exc)).strip(),
+            "queries": [],
+            "geomean_ms": None,
+        }
+
     q_results = []
     for idx, query in enumerate(queries, start=1):
         samples = []
@@ -129,10 +175,24 @@ if pg_dsn:
 if ul_dsn:
     results.append(run_engine("ultrasql", ul_dsn))
 if not results:
-    raise SystemExit("set POSTGRES_DSN and/or ULTRASQL_DSN")
+    doc = {
+        "workload": "clickbench",
+        "upstream_ref": upstream_ref,
+        "target": "UltraSQL geometric mean at least 5x faster than PostgreSQL",
+        "passed": False,
+        "reason": "dsn_missing",
+        "results": [],
+    }
+    out_path.write_text(json.dumps(doc, indent=2) + "\n")
+    print(json.dumps(doc, indent=2))
+    raise SystemExit(2)
 
 for result in results:
-    result["geomean_ms"] = geomean(result)
+    if "geomean_ms" not in result:
+        result["geomean_ms"] = geomean(result)
+    (raw_dir / f"clickbench-{result['engine']}.json").write_text(
+        json.dumps(result, indent=2) + "\n"
+    )
 
 pg = next((r for r in results if r["engine"] == "postgres17"), None)
 ul = next((r for r in results if r["engine"] == "ultrasql"), None)
@@ -145,10 +205,13 @@ passed = (
 )
 doc = {
     "workload": "clickbench",
-    "upstream_ref": "c5eb5d8e9c10fbef5ce16e8750f3e67de24cef0a",
+    "upstream_ref": upstream_ref,
+    "dataset": str(data_path),
     "query_count": len(queries),
     "target": "UltraSQL geometric mean at least 5x faster than PostgreSQL",
     "passed": passed,
+    "postgres_result": str(raw_dir / "clickbench-postgres17.json"),
+    "ultrasql_result": str(raw_dir / "clickbench-ultrasql.json"),
     "results": results,
 }
 out_path.write_text(json.dumps(doc, indent=2) + "\n")

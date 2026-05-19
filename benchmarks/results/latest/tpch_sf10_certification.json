@@ -12,6 +12,7 @@
   },
   "data_dir": "target/tpch-scale10-real",
   "data_size": "10G",
+  "diagnostic_policy": "benchmarks/tpch_sf10_certify.sh now records UltraSQL run failures and stops retries before exceeding TPCH_POOL_BUDGET_PERCENT of host RAM",
   "probe": {
     "command": "ULTRASQL_TPCH_PROGRESS=1 ULTRASQL_TPCH_LOAD_METHOD=copy ULTRASQL_TPCH_POOL_FRAMES=1500000 target/release/tpch run-queries ultrasql --data-dir target/tpch-scale10-real --runs 1 --warmup 0 --queries 1 --out target/tpch-sf10-ultrasql-q1-probe-largepool.json",
     "result": "terminated after exceeding 35 minutes without completing the load or starting Q1",

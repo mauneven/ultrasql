@@ -184,7 +184,10 @@ only when that summary reports `passed: true` for all 22 queries.
 Because the current in-process UltraSQL benchmark server is
 memory-backed, SF10 needs a host with enough RAM for the loaded heap
 pages plus query working memory, or a future disk-backed benchmark server
-path. A failed or partial run is a valid diagnostic artifact but not a
+path. The runner retries `buffer pool exhausted: every frame is pinned`
+with larger `ULTRASQL_TPCH_POOL_FRAMES` values, but refuses to exceed
+`TPCH_POOL_BUDGET_PERCENT` of detected host RAM. A failed or partial run
+is written as a diagnostic artifact with `passed: false`; it is not a
 certification.
 
 ### ClickBench Certification
@@ -205,7 +208,10 @@ Set `CLICKBENCH_DOWNLOAD=1` to fetch
 `target/clickbench/hits.tsv`. The script writes
 `benchmarks/results/latest/clickbench_certification.json`, including
 per-query runtimes, unsupported-query errors as `null`, geometric means,
-and the `≥ 5× PostgreSQL` pass/fail decision.
+raw per-engine artifacts under `benchmarks/results/latest/raw/`, and the
+`≥ 5× PostgreSQL` pass/fail decision. Missing dataset, `psql`, or DSNs
+also write `passed: false` summaries so roadmap status never depends on
+an absent artifact.
 
 ---
 

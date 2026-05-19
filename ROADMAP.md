@@ -82,8 +82,8 @@ are grounds for revert.
 | v0.5 | DELETE 10 k rows in single statement | ≥ 2× every competitor ✅ | latency (µs) |
 | v0.6 | TPC-H scale 1 correctness (all 22 queries) | result-equal to DuckDB ✅ | `validate-results` result comparison |
 | v0.6+ | TPC-H scale 1 performance certification | ≥ 2× PostgreSQL 17 ⚠️ pending | geometric mean query time |
-| v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB | geometric mean query time |
-| v0.7 | ClickBench (`hits.parquet` analytical queries) | ≥ 5× faster than PostgreSQL 17 | geometric mean query time |
+| v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB ⚠️ not certified; current artifact records memory-backed SF10 load failure | geometric mean query time |
+| v0.7 | ClickBench (`hits.parquet` analytical queries) | ≥ 5× faster than PostgreSQL 17 ⚠️ not certified; runner now records missing dataset/DSN failures | geometric mean query time |
 | v0.9 | TPC-B (OLTP, 32 connections) | ≥ 2× PostgreSQL 17, p99 < 5 ms | throughput + latency |
 | v1.0 | TPC-C (all 5 tx types, 32 connections) | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
 | v1.0 | Sysbench OLTP read/write | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
