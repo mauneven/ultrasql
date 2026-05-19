@@ -26,7 +26,16 @@ use super::modify::{
 use super::saturate_row_count;
 use super::scan::{lower_catalog_or_sample_scan, lower_function_scan};
 use super::tpch_q1::try_lower_tpch_q1;
+use super::tpch_q2::try_lower_tpch_q2;
+use super::tpch_q3::try_lower_tpch_q3;
+use super::tpch_q4::try_lower_tpch_q4;
+use super::tpch_q5::try_lower_tpch_q5;
 use super::tpch_q6::try_lower_tpch_q6;
+use super::tpch_q7::try_lower_tpch_q7;
+use super::tpch_q8::try_lower_tpch_q8;
+use super::tpch_q9::try_lower_tpch_q9;
+use super::tpch_q10::try_lower_tpch_q10;
+use super::tpch_q11::try_lower_tpch_q11;
 use super::{CteBuffer, LowerCtx};
 
 pub fn lower_query(
@@ -34,6 +43,33 @@ pub fn lower_query(
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
     tracing::debug!(pipeline_mode = ?plan.pipeline_mode(), "lower logical pipeline");
+    if let Some(tpch_q2) = try_lower_tpch_q2(plan)? {
+        return Ok(tpch_q2);
+    }
+    if let Some(tpch_q3) = try_lower_tpch_q3(plan)? {
+        return Ok(tpch_q3);
+    }
+    if let Some(tpch_q4) = try_lower_tpch_q4(plan)? {
+        return Ok(tpch_q4);
+    }
+    if let Some(tpch_q5) = try_lower_tpch_q5(plan)? {
+        return Ok(tpch_q5);
+    }
+    if let Some(tpch_q7) = try_lower_tpch_q7(plan)? {
+        return Ok(tpch_q7);
+    }
+    if let Some(tpch_q8) = try_lower_tpch_q8(plan)? {
+        return Ok(tpch_q8);
+    }
+    if let Some(tpch_q9) = try_lower_tpch_q9(plan)? {
+        return Ok(tpch_q9);
+    }
+    if let Some(tpch_q10) = try_lower_tpch_q10(plan)? {
+        return Ok(tpch_q10);
+    }
+    if let Some(tpch_q11) = try_lower_tpch_q11(plan)? {
+        return Ok(tpch_q11);
+    }
     match plan {
         LogicalPlan::Scan {
             table, projection, ..

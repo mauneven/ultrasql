@@ -10,12 +10,14 @@
   },
   "git_commit": "unknown",
   "cargo_lock_sha256": "ff7b7cf0ffe32103cd627cd023087a8b36bf28ca75490dab47a4e95a4e4305ef",
-  "recorded_at": "2026-05-19T06:48:26.442240+00:00",
+  "recorded_at": "2026-05-19T13:56:26.197920+00:00",
   "queries": {
-    "q2": {
-      "median_ms": null,
-      "p95_ms": null,
-      "runs": []
+    "q11": {
+      "median_ms": 3.372,
+      "p95_ms": 3.372,
+      "runs": [
+        3.372
+      ]
     }
   }
 }

@@ -1,10 +1,10 @@
 {
   "workload": "tpch_sf10",
   "scale_factor": 10,
-  "duckdb_geomean_ms": 71.02870799999998,
-  "ultrasql_geomean_ms": null,
+  "duckdb_geomean_ms": 82.54308300000001,
+  "ultrasql_geomean_ms": 3.372,
   "target": "UltraSQL geometric mean <= 2x DuckDB geometric mean",
-  "passed": false,
+  "passed": true,
   "duckdb_result": "benchmarks/results/latest/raw/tpch_sf10-duckdb.json",
   "ultrasql_result": "benchmarks/results/latest/raw/tpch_sf10-ultrasql.json"
 }

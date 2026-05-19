@@ -98,7 +98,16 @@ mod lower_simple;
 mod modify;
 mod scan;
 mod tpch_q1;
+mod tpch_q10;
+mod tpch_q11;
+mod tpch_q2;
+mod tpch_q3;
+mod tpch_q4;
+mod tpch_q5;
 mod tpch_q6;
+mod tpch_q7;
+mod tpch_q8;
+mod tpch_q9;
 
 #[cfg(test)]
 mod tests;
