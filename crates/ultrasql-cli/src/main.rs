@@ -17,7 +17,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rustyline::DefaultEditor;
 use tokio_postgres::{Client, Column, NoTls, Row};
 use tracing_subscriber::EnvFilter;
@@ -64,9 +64,73 @@ struct Cli {
     #[arg(short = 'f', long)]
     file: Option<PathBuf>,
 
+    /// Check server readiness and exit like `pg_isready`.
+    #[arg(long)]
+    isready: bool,
+
+    /// Optional HTTP ops endpoint for readiness, e.g. `127.0.0.1:8080`.
+    #[arg(long, env = "ULTRASQL_OPS_ENDPOINT")]
+    ops_endpoint: Option<String>,
+
+    /// Dump a WAL segment or WAL file in a human-readable hex format.
+    #[arg(long, value_name = "PATH")]
+    waldump: Option<PathBuf>,
+
+    /// Lightweight `pg_ctl`-style action.
+    #[arg(long, value_enum)]
+    ctl: Option<CtlCommand>,
+
+    /// Copy a data directory into a base-backup directory and write a manifest.
+    #[arg(long, value_name = "DEST")]
+    basebackup: Option<PathBuf>,
+
+    /// Archive one WAL file into this directory.
+    #[arg(long, value_name = "WAL_PATH")]
+    archive_wal: Option<PathBuf>,
+
+    /// Restore one WAL filename from `--archive-dir` into this output path.
+    #[arg(long, value_name = "WAL_NAME")]
+    restore_wal: Option<String>,
+
+    /// WAL archive directory used by `--archive-wal` and `--restore-wal`.
+    #[arg(long, default_value = "target/ultrasql-archive")]
+    archive_dir: PathBuf,
+
+    /// Output path for `--restore-wal`.
+    #[arg(long, value_name = "PATH")]
+    restore_output: Option<PathBuf>,
+
+    /// Recovery target time written by `--ctl recovery`.
+    #[arg(long)]
+    recovery_target_time: Option<String>,
+
+    /// Recovery target LSN written by `--ctl recovery`.
+    #[arg(long)]
+    recovery_target_lsn: Option<String>,
+
+    /// Recovery target XID written by `--ctl recovery`.
+    #[arg(long)]
+    recovery_target_xid: Option<String>,
+
+    /// Data directory used by `--ctl initdb|status|promote`.
+    #[arg(long, default_value = "target/ultrasql-data")]
+    data_dir: PathBuf,
+
     /// Positional URL — postgresql:// or host shortcut.
     #[arg(hide = true)]
     positional_url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CtlCommand {
+    Initdb,
+    Start,
+    Status,
+    Reload,
+    Promote,
+    Standby,
+    Recovery,
+    Stop,
 }
 
 // ---------------------------------------------------------------------------
@@ -846,6 +910,52 @@ async fn main() -> std::process::ExitCode {
 async fn run(cli: Cli) -> Result<()> {
     let params = resolve_params(&cli)?;
 
+    if cli.isready {
+        run_isready(&params, cli.ops_endpoint.as_deref()).await?;
+        return Ok(());
+    }
+
+    if let Some(path) = &cli.waldump {
+        run_waldump(path)?;
+        return Ok(());
+    }
+
+    if let Some(cmd) = cli.ctl {
+        let targets = RecoveryTargets {
+            time: cli.recovery_target_time.clone(),
+            lsn: cli.recovery_target_lsn.clone(),
+            xid: cli.recovery_target_xid.clone(),
+        };
+        run_ctl(
+            cmd,
+            &cli.data_dir,
+            &params,
+            cli.ops_endpoint.as_deref(),
+            &targets,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if let Some(dest) = &cli.basebackup {
+        run_basebackup(&cli.data_dir, dest)?;
+        return Ok(());
+    }
+
+    if let Some(wal_path) = &cli.archive_wal {
+        run_archive_wal(wal_path, &cli.archive_dir)?;
+        return Ok(());
+    }
+
+    if let Some(wal_name) = &cli.restore_wal {
+        let output = cli
+            .restore_output
+            .as_ref()
+            .context("--restore-wal requires --restore-output PATH")?;
+        run_restore_wal(wal_name, &cli.archive_dir, output)?;
+        return Ok(());
+    }
+
     // Build connection string and connect.
     let conn_str = build_conn_string(&params);
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
@@ -960,6 +1070,222 @@ async fn run_repl(session: &mut Session) -> Result<()> {
 fn history_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".ultrasql_history"))
+}
+
+async fn run_isready(params: &ConnParams, ops_endpoint: Option<&str>) -> Result<()> {
+    if let Some(endpoint) = ops_endpoint {
+        let ready = check_http_ready(endpoint).await?;
+        if ready {
+            println!("{endpoint} - accepting connections");
+            return Ok(());
+        }
+        anyhow::bail!("{endpoint} - no response");
+    }
+
+    let addr = format!("{}:{}", params.host, params.port);
+    tokio::net::TcpStream::connect(&addr)
+        .await
+        .with_context(|| format!("{addr} - no response"))?;
+    println!("{addr} - accepting connections");
+    Ok(())
+}
+
+async fn check_http_ready(endpoint: &str) -> Result<bool> {
+    let endpoint = endpoint
+        .strip_prefix("http://")
+        .unwrap_or(endpoint)
+        .trim_end_matches('/');
+    let (host_port, path) = endpoint
+        .split_once('/')
+        .map_or((endpoint, "/ready"), |(host, path)| (host, path));
+    let path = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
+    let mut stream = tokio::net::TcpStream::connect(host_port)
+        .await
+        .with_context(|| format!("{host_port} - no response"))?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nhost: {host_port}\r\nconnection: close\r\n\r\n"
+    );
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    Ok(response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200"))
+}
+
+fn run_waldump(path: &PathBuf) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("cannot read WAL file: {}", path.display()))?;
+    println!("file: {}", path.display());
+    println!("bytes: {}", bytes.len());
+    for (offset, chunk) in bytes.chunks(32).enumerate() {
+        let absolute = offset * 32;
+        let hex = chunk
+            .iter()
+            .map(|b| format!("{:02x}", *b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{absolute:08x}: {hex}");
+    }
+    Ok(())
+}
+
+fn run_basebackup(data_dir: &PathBuf, dest: &PathBuf) -> Result<()> {
+    if dest.exists() {
+        anyhow::bail!("basebackup destination already exists: {}", dest.display());
+    }
+    fs::create_dir_all(dest)?;
+    let mut manifest = Vec::new();
+    copy_tree_with_manifest(data_dir, data_dir, dest, &mut manifest)?;
+    manifest.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut text = String::from("{\n  \"files\": [\n");
+    for (idx, (path, bytes, checksum)) in manifest.iter().enumerate() {
+        let comma = if idx + 1 == manifest.len() { "" } else { "," };
+        text.push_str(&format!(
+            "    {{\"path\":\"{}\",\"bytes\":{},\"checksum\":\"{}\"}}{}\n",
+            path.replace('\\', "\\\\").replace('"', "\\\""),
+            bytes,
+            checksum,
+            comma
+        ));
+    }
+    text.push_str("  ]\n}\n");
+    fs::write(dest.join("backup_manifest.json"), text)?;
+    println!("base backup copied {} files to {}", manifest.len(), dest.display());
+    Ok(())
+}
+
+fn copy_tree_with_manifest(
+    root: &PathBuf,
+    current: &PathBuf,
+    dest_root: &PathBuf,
+    manifest: &mut Vec<(String, u64, String)>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(root)?.to_path_buf();
+        let dest = dest_root.join(&rel);
+        if path.is_dir() {
+            fs::create_dir_all(&dest)?;
+            copy_tree_with_manifest(root, &path, dest_root, manifest)?;
+        } else if path.is_file() {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&path, &dest)?;
+            let bytes = fs::read(&path)?;
+            let checksum = checksum_hex(&bytes);
+            let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            manifest.push((rel.display().to_string(), len, checksum));
+        }
+    }
+    Ok(())
+}
+
+fn checksum_hex(bytes: &[u8]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn run_archive_wal(wal_path: &PathBuf, archive_dir: &PathBuf) -> Result<()> {
+    fs::create_dir_all(archive_dir)?;
+    let name = wal_path
+        .file_name()
+        .context("WAL path must have a filename")?;
+    let dest = archive_dir.join(name);
+    fs::copy(wal_path, &dest)?;
+    println!("archived {} to {}", wal_path.display(), dest.display());
+    Ok(())
+}
+
+fn run_restore_wal(wal_name: &str, archive_dir: &PathBuf, output: &PathBuf) -> Result<()> {
+    let source = archive_dir.join(wal_name);
+    fs::copy(&source, output)
+        .with_context(|| format!("restore WAL {} to {}", source.display(), output.display()))?;
+    println!("restored {} to {}", source.display(), output.display());
+    Ok(())
+}
+
+async fn run_ctl(
+    cmd: CtlCommand,
+    data_dir: &PathBuf,
+    params: &ConnParams,
+    ops_endpoint: Option<&str>,
+    targets: &RecoveryTargets,
+) -> Result<()> {
+    match cmd {
+        CtlCommand::Initdb => {
+            fs::create_dir_all(data_dir.join("base"))?;
+            fs::create_dir_all(data_dir.join("pg_wal"))?;
+            fs::create_dir_all(data_dir.join("global"))?;
+            fs::write(
+                data_dir.join("ultrasql.control"),
+                format!("version={}\nstate=initialized\n", env!("CARGO_PKG_VERSION")),
+            )?;
+            println!("initialized UltraSQL data directory at {}", data_dir.display());
+        }
+        CtlCommand::Start => {
+            println!(
+                "start command: ultrasqld --data-dir {} --listen {}:{}",
+                data_dir.display(),
+                params.host,
+                params.port
+            );
+        }
+        CtlCommand::Status => {
+            run_isready(params, ops_endpoint).await?;
+        }
+        CtlCommand::Reload => {
+            println!("reload requested; send SIGHUP to ultrasqld process manager");
+        }
+        CtlCommand::Promote => {
+            fs::write(data_dir.join("promote.signal"), b"promote\n")?;
+            println!("created {}", data_dir.join("promote.signal").display());
+        }
+        CtlCommand::Standby => {
+            fs::create_dir_all(data_dir)?;
+            fs::write(data_dir.join("standby.signal"), b"standby\n")?;
+            println!("created {}", data_dir.join("standby.signal").display());
+        }
+        CtlCommand::Recovery => {
+            fs::create_dir_all(data_dir)?;
+            fs::write(data_dir.join("recovery.signal"), b"recovery\n")?;
+            let mut conf = String::new();
+            if let Some(value) = &targets.time {
+                conf.push_str(&format!("recovery_target_time = '{}'\n", escape_conf(value)));
+            }
+            if let Some(value) = &targets.lsn {
+                conf.push_str(&format!("recovery_target_lsn = '{}'\n", escape_conf(value)));
+            }
+            if let Some(value) = &targets.xid {
+                conf.push_str(&format!("recovery_target_xid = '{}'\n", escape_conf(value)));
+            }
+            fs::write(data_dir.join("recovery.targets"), conf)?;
+            println!("created {}", data_dir.join("recovery.signal").display());
+        }
+        CtlCommand::Stop => {
+            println!("stop requested; send SIGTERM through service manager");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RecoveryTargets {
+    time: Option<String>,
+    lsn: Option<String>,
+    xid: Option<String>,
+}
+
+fn escape_conf(value: &str) -> String {
+    value.replace('\'', "''")
 }
 
 // ---------------------------------------------------------------------------

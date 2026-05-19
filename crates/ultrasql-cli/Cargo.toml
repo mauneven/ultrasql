@@ -18,6 +18,7 @@ path = "src/main.rs"
 [dependencies]
 ultrasql-core     = { workspace = true }
 ultrasql-protocol = { workspace = true }
+ultrasql-wal      = { workspace = true }
 thiserror         = { workspace = true }
 anyhow            = { workspace = true }
 tokio             = { workspace = true }

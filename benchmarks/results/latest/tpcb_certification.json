@@ -1,0 +1,10 @@
+{
+  "workload": "tpcb_32conn",
+  "target": "UltraSQL throughput >= 2x PostgreSQL 17 and p99 < 5 ms at 32 clients",
+  "passed": false,
+  "reason": "missing_cross_engine_results",
+  "postgres_result": null,
+  "ultrasql_result": null,
+  "kernel_smoke_result": "benchmarks/results/latest/raw/tpcb_32conn-ultrasql-kernel.json",
+  "next_step": "Capture POSTGRES_TPCB_RESULT and ULTRASQL_TPCB_RESULT from same-host 32-client PostgreSQL-wire runs, then rerun benchmarks/tpcb_certify.sh."
+}

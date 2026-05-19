@@ -53,6 +53,21 @@ pub(crate) fn virtual_catalog_schema(name: &str) -> Option<Schema> {
         "pg_catalog.pg_settings" => Some(schema_pg_settings()),
         "pg_catalog.pg_locks" => Some(schema_pg_locks()),
         "pg_catalog.pg_stat_activity" => Some(schema_pg_stat_activity()),
+        "pg_catalog.pg_stat_user_tables" => Some(schema_pg_stat_user_tables()),
+        "pg_catalog.pg_stat_user_indexes" => Some(schema_pg_stat_user_indexes()),
+        "pg_catalog.pg_statio_user_tables" => Some(schema_pg_statio_user_tables()),
+        "pg_catalog.pg_stat_database" => Some(schema_pg_stat_database()),
+        "pg_catalog.pg_stat_bgwriter" => Some(schema_pg_stat_bgwriter()),
+        "pg_catalog.pg_stat_wal" => Some(schema_pg_stat_wal()),
+        "pg_catalog.pg_stat_progress_vacuum" => Some(schema_pg_stat_progress_vacuum()),
+        "pg_catalog.pg_stat_progress_analyze" => Some(schema_pg_stat_progress_analyze()),
+        "pg_catalog.pg_stat_progress_create_index" => Some(schema_pg_stat_progress_create_index()),
+        "pg_catalog.pg_replication_slots" => Some(schema_pg_replication_slots()),
+        "pg_catalog.pg_stat_replication" => Some(schema_pg_stat_replication()),
+        "pg_catalog.pg_stat_subscription" => Some(schema_pg_stat_subscription()),
+        "pg_catalog.pg_publication" => Some(schema_pg_publication()),
+        "pg_catalog.pg_subscription" => Some(schema_pg_subscription()),
+        "pg_catalog.pg_publication_tables" => Some(schema_pg_publication_tables()),
         "pg_catalog.pg_proc" => Some(schema_pg_proc()),
         "pg_catalog.pg_database" => Some(schema_pg_database()),
         "information_schema.tables" => Some(schema_information_schema_tables()),
@@ -115,6 +130,35 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_settings" => Some((schema_pg_settings(), rows_pg_settings())),
         "pg_catalog.pg_locks" => Some((schema_pg_locks(), Vec::new())),
         "pg_catalog.pg_stat_activity" => Some((schema_pg_stat_activity(), rows_pg_stat_activity())),
+        "pg_catalog.pg_stat_user_tables" => {
+            Some((schema_pg_stat_user_tables(), rows_pg_stat_user_tables(ctx)))
+        }
+        "pg_catalog.pg_stat_user_indexes" => Some((
+            schema_pg_stat_user_indexes(),
+            rows_pg_stat_user_indexes(ctx),
+        )),
+        "pg_catalog.pg_statio_user_tables" => Some((
+            schema_pg_statio_user_tables(),
+            rows_pg_statio_user_tables(ctx),
+        )),
+        "pg_catalog.pg_stat_database" => Some((schema_pg_stat_database(), rows_pg_stat_database())),
+        "pg_catalog.pg_stat_bgwriter" => Some((schema_pg_stat_bgwriter(), rows_pg_stat_bgwriter())),
+        "pg_catalog.pg_stat_wal" => Some((schema_pg_stat_wal(), rows_pg_stat_wal())),
+        "pg_catalog.pg_stat_progress_vacuum" => {
+            Some((schema_pg_stat_progress_vacuum(), Vec::new()))
+        }
+        "pg_catalog.pg_stat_progress_analyze" => {
+            Some((schema_pg_stat_progress_analyze(), Vec::new()))
+        }
+        "pg_catalog.pg_stat_progress_create_index" => {
+            Some((schema_pg_stat_progress_create_index(), Vec::new()))
+        }
+        "pg_catalog.pg_replication_slots" => Some((schema_pg_replication_slots(), Vec::new())),
+        "pg_catalog.pg_stat_replication" => Some((schema_pg_stat_replication(), Vec::new())),
+        "pg_catalog.pg_stat_subscription" => Some((schema_pg_stat_subscription(), Vec::new())),
+        "pg_catalog.pg_publication" => Some((schema_pg_publication(), Vec::new())),
+        "pg_catalog.pg_subscription" => Some((schema_pg_subscription(), Vec::new())),
+        "pg_catalog.pg_publication_tables" => Some((schema_pg_publication_tables(), Vec::new())),
         "pg_catalog.pg_proc" => Some((schema_pg_proc(), Vec::new())),
         "pg_catalog.pg_database" => Some((schema_pg_database(), rows_pg_database())),
         "information_schema.tables" => Some((
@@ -165,7 +209,14 @@ fn normalized_name(name: &str) -> String {
         | "pg_sequence" | "pg_depend" | "pg_description" | "pg_tables" | "pg_indexes"
         | "pg_statistic" | "pg_statistic_ext" | "pg_views" | "pg_sequences" | "pg_roles"
         | "pg_user" | "pg_settings" | "pg_locks" | "pg_stat_activity" | "pg_proc"
-        | "pg_database" => format!("pg_catalog.{folded}"),
+        | "pg_stat_user_tables" | "pg_stat_user_indexes" | "pg_statio_user_tables"
+        | "pg_stat_database" | "pg_stat_bgwriter" | "pg_stat_wal"
+        | "pg_stat_progress_vacuum" | "pg_stat_progress_analyze"
+        | "pg_stat_progress_create_index" | "pg_replication_slots"
+        | "pg_stat_replication" | "pg_stat_subscription" | "pg_publication"
+        | "pg_subscription" | "pg_publication_tables" | "pg_database" => {
+            format!("pg_catalog.{folded}")
+        }
         "tables"
         | "columns"
         | "table_constraints"
@@ -976,6 +1027,96 @@ fn rows_pg_settings() -> Vec<Vec<Value>> {
             v_text("integer"),
             v_text("user"),
         ],
+        vec![
+            v_text("autovacuum"),
+            v_text("on"),
+            Value::Null,
+            v_text("Autovacuum"),
+            v_text("Starts the autovacuum launcher."),
+            v_text("bool"),
+            v_text("sighup"),
+        ],
+        vec![
+            v_text("autovacuum_vacuum_threshold"),
+            v_text("50"),
+            Value::Null,
+            v_text("Autovacuum"),
+            v_text("Minimum dead tuples before vacuum."),
+            v_text("integer"),
+            v_text("sighup"),
+        ],
+        vec![
+            v_text("autovacuum_vacuum_scale_factor"),
+            v_text("0.2"),
+            Value::Null,
+            v_text("Autovacuum"),
+            v_text("Fraction of table size before vacuum."),
+            v_text("real"),
+            v_text("sighup"),
+        ],
+        vec![
+            v_text("autovacuum_analyze_threshold"),
+            v_text("50"),
+            Value::Null,
+            v_text("Autovacuum"),
+            v_text("Minimum changed tuples before analyze."),
+            v_text("integer"),
+            v_text("sighup"),
+        ],
+        vec![
+            v_text("autovacuum_analyze_scale_factor"),
+            v_text("0.1"),
+            Value::Null,
+            v_text("Autovacuum"),
+            v_text("Fraction of table size before analyze."),
+            v_text("real"),
+            v_text("sighup"),
+        ],
+        vec![
+            v_text("synchronous_commit"),
+            v_text("on"),
+            Value::Null,
+            v_text("Write-Ahead Log / Settings"),
+            v_text("Sets the commit durability level."),
+            v_text("enum"),
+            v_text("user"),
+        ],
+        vec![
+            v_text("archive_command"),
+            v_text(""),
+            Value::Null,
+            v_text("Write-Ahead Log / Archiving"),
+            v_text("Command to archive completed WAL files."),
+            v_text("string"),
+            v_text("sighup"),
+        ],
+        vec![
+            v_text("restore_command"),
+            v_text(""),
+            Value::Null,
+            v_text("Write-Ahead Log / Recovery"),
+            v_text("Command to restore archived WAL files."),
+            v_text("string"),
+            v_text("postmaster"),
+        ],
+        vec![
+            v_text("log_min_duration_statement"),
+            v_text("-1"),
+            v_text("ms"),
+            v_text("Reporting and Logging / When to Log"),
+            v_text("Logs statements running at least this long."),
+            v_text("integer"),
+            v_text("sighup"),
+        ],
+        vec![
+            v_text("log_statement"),
+            v_text("none"),
+            Value::Null,
+            v_text("Reporting and Logging / What to Log"),
+            v_text("Sets the statements logged by class."),
+            v_text("enum"),
+            v_text("sighup"),
+        ],
     ]
 }
 
@@ -1014,6 +1155,303 @@ fn rows_pg_stat_activity() -> Vec<Vec<Value>> {
         v_text("active"),
         Value::Null,
     ]]
+}
+
+fn schema_pg_stat_user_tables() -> Schema {
+    schema([
+        Field::required("relid", DataType::Int64),
+        Field::required("schemaname", text()),
+        Field::required("relname", text()),
+        Field::required("seq_scan", DataType::Int64),
+        Field::required("idx_scan", DataType::Int64),
+        Field::required("n_live_tup", DataType::Int64),
+        Field::required("n_dead_tup", DataType::Int64),
+        Field::nullable("last_vacuum", DataType::TimestampTz),
+        Field::nullable("last_autovacuum", DataType::TimestampTz),
+        Field::nullable("last_analyze", DataType::TimestampTz),
+        Field::nullable("last_autoanalyze", DataType::TimestampTz),
+    ])
+}
+
+fn rows_pg_stat_user_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    table_entries(ctx)
+        .into_iter()
+        .filter(|entry| {
+            entry.schema_name != "pg_catalog" && entry.schema_name != "information_schema"
+        })
+        .map(|entry| {
+            vec![
+                v_i64(entry.oid.raw()),
+                v_text(entry.schema_name),
+                v_text(entry.name),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+            ]
+        })
+        .collect()
+}
+
+fn schema_pg_stat_user_indexes() -> Schema {
+    schema([
+        Field::required("relid", DataType::Int64),
+        Field::required("indexrelid", DataType::Int64),
+        Field::required("schemaname", text()),
+        Field::required("relname", text()),
+        Field::required("indexrelname", text()),
+        Field::required("idx_scan", DataType::Int64),
+        Field::required("idx_tup_read", DataType::Int64),
+        Field::required("idx_tup_fetch", DataType::Int64),
+    ])
+}
+
+fn rows_pg_stat_user_indexes(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let mut indexes: Vec<_> = ctx.catalog_snapshot.indexes.values().collect();
+    indexes.sort_by(|a, b| a.name.cmp(&b.name));
+    indexes
+        .into_iter()
+        .filter_map(|idx| {
+            let table = ctx.catalog_snapshot.tables_by_oid.get(&idx.table_oid)?;
+            Some(vec![
+                v_i64(table.oid.raw()),
+                v_i64(idx.oid.raw()),
+                v_text(table.schema_name.clone()),
+                v_text(table.name.clone()),
+                v_text(idx.name.clone()),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+            ])
+        })
+        .collect()
+}
+
+fn schema_pg_statio_user_tables() -> Schema {
+    schema([
+        Field::required("relid", DataType::Int64),
+        Field::required("schemaname", text()),
+        Field::required("relname", text()),
+        Field::required("heap_blks_read", DataType::Int64),
+        Field::required("heap_blks_hit", DataType::Int64),
+        Field::required("idx_blks_read", DataType::Int64),
+        Field::required("idx_blks_hit", DataType::Int64),
+        Field::required("toast_blks_read", DataType::Int64),
+        Field::required("toast_blks_hit", DataType::Int64),
+        Field::required("tidx_blks_read", DataType::Int64),
+        Field::required("tidx_blks_hit", DataType::Int64),
+    ])
+}
+
+fn rows_pg_statio_user_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    table_entries(ctx)
+        .into_iter()
+        .filter(|entry| {
+            entry.schema_name != "pg_catalog" && entry.schema_name != "information_schema"
+        })
+        .map(|entry| {
+            vec![
+                v_i64(entry.oid.raw()),
+                v_text(entry.schema_name),
+                v_text(entry.name),
+                Value::Int64(0),
+                Value::Int64(i64::from(entry.n_blocks)),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+                Value::Int64(0),
+            ]
+        })
+        .collect()
+}
+
+fn schema_pg_stat_database() -> Schema {
+    schema([
+        Field::required("datid", DataType::Int64),
+        Field::required("datname", text()),
+        Field::required("numbackends", DataType::Int32),
+        Field::required("xact_commit", DataType::Int64),
+        Field::required("xact_rollback", DataType::Int64),
+        Field::required("deadlocks", DataType::Int64),
+    ])
+}
+
+fn rows_pg_stat_database() -> Vec<Vec<Value>> {
+    vec![vec![
+        Value::Int64(1),
+        v_text("ultrasql"),
+        Value::Int32(1),
+        Value::Int64(0),
+        Value::Int64(0),
+        Value::Int64(0),
+    ]]
+}
+
+fn schema_pg_stat_bgwriter() -> Schema {
+    schema([
+        Field::required("checkpoints_timed", DataType::Int64),
+        Field::required("checkpoints_req", DataType::Int64),
+        Field::required("checkpoint_write_time", DataType::Float64),
+        Field::required("checkpoint_sync_time", DataType::Float64),
+        Field::required("buffers_checkpoint", DataType::Int64),
+        Field::required("buffers_clean", DataType::Int64),
+        Field::required("maxwritten_clean", DataType::Int64),
+        Field::required("buffers_backend", DataType::Int64),
+        Field::required("buffers_alloc", DataType::Int64),
+    ])
+}
+
+fn rows_pg_stat_bgwriter() -> Vec<Vec<Value>> {
+    vec![vec![
+        Value::Int64(0),
+        Value::Int64(0),
+        Value::Float64(0.0),
+        Value::Float64(0.0),
+        Value::Int64(0),
+        Value::Int64(0),
+        Value::Int64(0),
+        Value::Int64(0),
+        Value::Int64(0),
+    ]]
+}
+
+fn schema_pg_stat_wal() -> Schema {
+    schema([
+        Field::required("wal_records", DataType::Int64),
+        Field::required("wal_fpi", DataType::Int64),
+        Field::required("wal_bytes", DataType::Int64),
+        Field::required("wal_sync", DataType::Int64),
+        Field::required("wal_write", DataType::Int64),
+    ])
+}
+
+fn rows_pg_stat_wal() -> Vec<Vec<Value>> {
+    vec![vec![
+        Value::Int64(0),
+        Value::Int64(0),
+        Value::Int64(0),
+        Value::Int64(0),
+        Value::Int64(0),
+    ]]
+}
+
+fn schema_pg_stat_progress_vacuum() -> Schema {
+    schema([
+        Field::required("pid", DataType::Int32),
+        Field::required("datid", DataType::Int64),
+        Field::required("datname", text()),
+        Field::required("relid", DataType::Int64),
+        Field::required("phase", text()),
+        Field::required("heap_blks_total", DataType::Int64),
+        Field::required("heap_blks_scanned", DataType::Int64),
+        Field::required("heap_blks_vacuumed", DataType::Int64),
+    ])
+}
+
+fn schema_pg_stat_progress_analyze() -> Schema {
+    schema([
+        Field::required("pid", DataType::Int32),
+        Field::required("datid", DataType::Int64),
+        Field::required("datname", text()),
+        Field::required("relid", DataType::Int64),
+        Field::required("phase", text()),
+        Field::required("sample_blks_total", DataType::Int64),
+        Field::required("sample_blks_scanned", DataType::Int64),
+    ])
+}
+
+fn schema_pg_stat_progress_create_index() -> Schema {
+    schema([
+        Field::required("pid", DataType::Int32),
+        Field::required("datid", DataType::Int64),
+        Field::required("datname", text()),
+        Field::required("relid", DataType::Int64),
+        Field::required("index_relid", DataType::Int64),
+        Field::required("phase", text()),
+        Field::required("blocks_total", DataType::Int64),
+        Field::required("blocks_done", DataType::Int64),
+    ])
+}
+
+fn schema_pg_replication_slots() -> Schema {
+    schema([
+        Field::required("slot_name", text()),
+        Field::required("plugin", text()),
+        Field::required("slot_type", text()),
+        Field::required("datoid", DataType::Int64),
+        Field::required("database", text()),
+        Field::required("active", DataType::Bool),
+        Field::nullable("restart_lsn", text()),
+        Field::nullable("confirmed_flush_lsn", text()),
+    ])
+}
+
+fn schema_pg_stat_replication() -> Schema {
+    schema([
+        Field::required("pid", DataType::Int32),
+        Field::required("usename", text()),
+        Field::required("application_name", text()),
+        Field::required("client_addr", text()),
+        Field::required("state", text()),
+        Field::nullable("sent_lsn", text()),
+        Field::nullable("write_lsn", text()),
+        Field::nullable("flush_lsn", text()),
+        Field::nullable("replay_lsn", text()),
+        Field::required("sync_state", text()),
+    ])
+}
+
+fn schema_pg_stat_subscription() -> Schema {
+    schema([
+        Field::required("subid", DataType::Int64),
+        Field::required("subname", text()),
+        Field::required("pid", DataType::Int32),
+        Field::required("relid", DataType::Int64),
+        Field::nullable("received_lsn", text()),
+        Field::nullable("latest_end_lsn", text()),
+    ])
+}
+
+fn schema_pg_publication() -> Schema {
+    schema([
+        Field::required("oid", DataType::Int64),
+        Field::required("pubname", text()),
+        Field::required("pubowner", DataType::Int64),
+        Field::required("puballtables", DataType::Bool),
+        Field::required("pubinsert", DataType::Bool),
+        Field::required("pubupdate", DataType::Bool),
+        Field::required("pubdelete", DataType::Bool),
+        Field::required("pubtruncate", DataType::Bool),
+    ])
+}
+
+fn schema_pg_subscription() -> Schema {
+    schema([
+        Field::required("oid", DataType::Int64),
+        Field::required("subdbid", DataType::Int64),
+        Field::required("subname", text()),
+        Field::required("subowner", DataType::Int64),
+        Field::required("subenabled", DataType::Bool),
+        Field::nullable("subconninfo", text()),
+        Field::required("subslotname", text()),
+        Field::required("subpublications", text()),
+    ])
+}
+
+fn schema_pg_publication_tables() -> Schema {
+    schema([
+        Field::required("pubname", text()),
+        Field::required("schemaname", text()),
+        Field::required("tablename", text()),
+        Field::nullable("attnames", text()),
+        Field::nullable("rowfilter", text()),
+    ])
 }
 
 fn schema_pg_proc() -> Schema {

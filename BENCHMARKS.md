@@ -213,6 +213,23 @@ raw per-engine artifacts under `benchmarks/results/latest/raw/`, and the
 also write `passed: false` summaries so roadmap status never depends on
 an absent artifact.
 
+### TPC-B Certification
+
+TPC-B v0.9 certification is recorded by:
+
+```text
+POSTGRES_TPCB_RESULT=benchmarks/results/latest/raw/tpcb_32conn-postgres17.json \
+ULTRASQL_TPCB_RESULT=benchmarks/results/latest/raw/tpcb_32conn-ultrasql.json \
+benchmarks/tpcb_certify.sh
+```
+
+The script always writes
+`benchmarks/results/latest/tpcb_certification.json`. It passes only when both
+same-host 32-client PostgreSQL-wire result artifacts exist, UltraSQL
+throughput is at least 2× PostgreSQL 17, and UltraSQL p99 latency is below
+5 ms. Without those artifacts it records `passed: false`; the local kernel
+smoke is diagnostic only.
+
 ---
 
 ## Two-Tier Benchmark Policy
