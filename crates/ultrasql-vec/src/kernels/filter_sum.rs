@@ -691,9 +691,9 @@ unsafe fn filter_sum_avx2(xs: &[i64], ys: &[i64]) -> i64 {
 
     let n = xs.len().min(ys.len());
 
-    let mut acc0: __m256i = unsafe { _mm256_setzero_si256() };
-    let mut acc1: __m256i = unsafe { _mm256_setzero_si256() };
-    let zero: __m256i = unsafe { _mm256_setzero_si256() };
+    let mut acc0: __m256i = _mm256_setzero_si256();
+    let mut acc1: __m256i = _mm256_setzero_si256();
+    let zero: __m256i = _mm256_setzero_si256();
 
     let x_ptr = xs.as_ptr().cast::<__m256i>();
     let y_ptr = ys.as_ptr().cast::<__m256i>();
@@ -701,19 +701,19 @@ unsafe fn filter_sum_avx2(xs: &[i64], ys: &[i64]) -> i64 {
     // 16 i64s per iteration → 4 vectors of 4 i64s each.
     let chunks = n / 16;
     for k in 0..chunks {
-        let off = (k * 4) as isize;
+        let off = k * 4;
         // SAFETY: each iteration reads 4 × 4 = 16 lanes; bounded by
         // chunks = n / 16, so we never run past `n`.
         unsafe {
-            let xv0 = _mm256_loadu_si256(x_ptr.offset(off));
-            let xv1 = _mm256_loadu_si256(x_ptr.offset(off + 1));
-            let xv2 = _mm256_loadu_si256(x_ptr.offset(off + 2));
-            let xv3 = _mm256_loadu_si256(x_ptr.offset(off + 3));
+            let xv0 = _mm256_loadu_si256(x_ptr.add(off));
+            let xv1 = _mm256_loadu_si256(x_ptr.add(off + 1));
+            let xv2 = _mm256_loadu_si256(x_ptr.add(off + 2));
+            let xv3 = _mm256_loadu_si256(x_ptr.add(off + 3));
 
-            let yv0 = _mm256_loadu_si256(y_ptr.offset(off));
-            let yv1 = _mm256_loadu_si256(y_ptr.offset(off + 1));
-            let yv2 = _mm256_loadu_si256(y_ptr.offset(off + 2));
-            let yv3 = _mm256_loadu_si256(y_ptr.offset(off + 3));
+            let yv0 = _mm256_loadu_si256(y_ptr.add(off));
+            let yv1 = _mm256_loadu_si256(y_ptr.add(off + 1));
+            let yv2 = _mm256_loadu_si256(y_ptr.add(off + 2));
+            let yv3 = _mm256_loadu_si256(y_ptr.add(off + 3));
 
             let m0 = _mm256_cmpgt_epi64(yv0, zero);
             let m1 = _mm256_cmpgt_epi64(yv1, zero);
@@ -729,13 +729,13 @@ unsafe fn filter_sum_avx2(xs: &[i64], ys: &[i64]) -> i64 {
 
     // Horizontal reduce: combine the two accumulators, then sum the
     // four 64-bit lanes.
-    let acc = unsafe { _mm256_add_epi64(acc0, acc1) };
-    let lo = unsafe { _mm256_extracti128_si256(acc, 0) };
-    let hi = unsafe { _mm256_extracti128_si256(acc, 1) };
-    let half = unsafe { _mm_add_epi64(lo, hi) };
-    let half_hi = unsafe { _mm_unpackhi_epi64(half, half) };
-    let pair = unsafe { _mm_add_epi64(half, half_hi) };
-    let mut total: i64 = unsafe { _mm_cvtsi128_si64(pair) };
+    let acc = _mm256_add_epi64(acc0, acc1);
+    let lo = _mm256_extracti128_si256(acc, 0);
+    let hi = _mm256_extracti128_si256(acc, 1);
+    let half = _mm_add_epi64(lo, hi);
+    let half_hi = _mm_unpackhi_epi64(half, half);
+    let pair = _mm_add_epi64(half, half_hi);
+    let mut total: i64 = _mm_cvtsi128_si64(pair);
 
     let tail_start = chunks * 16;
     if tail_start < n {

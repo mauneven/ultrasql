@@ -220,10 +220,16 @@ unsafe fn pack_eq_64_avx2(a: &[i32; 64], b: &[i32; 64]) -> u64 {
         let av = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
         let bv = unsafe { _mm256_loadu_si256(b.as_ptr().add(off).cast::<__m256i>()) };
         let cmp = _mm256_cmpeq_epi32(av, bv);
-        let bits = _mm256_movemask_ps(_mm256_castsi256_ps(cmp)) as u32;
+        let bits = movemask_to_u32(_mm256_movemask_ps(_mm256_castsi256_ps(cmp)));
         mask |= u64::from(bits) << (chunk * 8);
     }
     mask
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn movemask_to_u32(mask: i32) -> u32 {
+    u32::try_from(mask).unwrap_or_else(|_| unreachable!("x86 movemask is non-negative"))
 }
 
 /// NEON specialization of [`pack_eq_64`].
@@ -903,7 +909,7 @@ unsafe fn pack_cmp_gt_64_avx2(a: &[i64; 64], scalar: i64) -> u64 {
         // SAFETY: off <= 60; load reads 4 i64 lanes inside the array.
         let v = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
         let cmp = _mm256_cmpgt_epi64(v, needle);
-        let bits = _mm256_movemask_pd(_mm256_castsi256_pd(cmp)) as u32;
+        let bits = movemask_to_u32(_mm256_movemask_pd(_mm256_castsi256_pd(cmp)));
         mask |= u64::from(bits) << (chunk * 4);
     }
     mask
@@ -1219,9 +1225,15 @@ unsafe fn pack_cmp_i32_64_avx2(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
         let off = chunk * 8;
         // SAFETY: off <= 56; load reads 8 i32 lanes inside the array.
         let v = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
-        let eq = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, needle))) as u32;
-        let gt = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, needle))) as u32;
-        let lt = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(needle, v))) as u32;
+        let eq = movemask_to_u32(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(
+            v, needle,
+        ))));
+        let gt = movemask_to_u32(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(
+            v, needle,
+        ))));
+        let lt = movemask_to_u32(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(
+            needle, v,
+        ))));
         let bits = match op {
             CmpOp::Eq => eq,
             CmpOp::Ne => eq ^ 0xFF,
@@ -1297,9 +1309,15 @@ unsafe fn pack_cmp_i64_64_avx2(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
         let off = chunk * 4;
         // SAFETY: off <= 60; load reads 4 i64 lanes inside the array.
         let v = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
-        let eq = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(v, needle))) as u32;
-        let gt = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(v, needle))) as u32;
-        let lt = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(needle, v))) as u32;
+        let eq = movemask_to_u32(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(
+            v, needle,
+        ))));
+        let gt = movemask_to_u32(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(
+            v, needle,
+        ))));
+        let lt = movemask_to_u32(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(
+            needle, v,
+        ))));
         let bits = match op {
             CmpOp::Eq => eq,
             CmpOp::Ne => eq ^ 0xF,
