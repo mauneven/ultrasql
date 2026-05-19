@@ -67,6 +67,7 @@ use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{
     CatalogSnapshot, MutableCatalog, PersistentCatalog, StatisticRow, TableEntry,
 };
+use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{PageId, RelationId, Value};
 use ultrasql_executor::{Eval, MemTableScan, RowCodec};
 use ultrasql_optimizer::{
@@ -81,6 +82,7 @@ use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::page::Page;
+use ultrasql_storage::segment::{SegmentConfig, SegmentError, SegmentFileManager};
 use ultrasql_storage::sequence::{Sequence, SequenceSnapshot};
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::{IsolationLevel, SsiManager, Transaction, TransactionManager};
@@ -402,22 +404,101 @@ impl TxnState {
     }
 }
 
-/// In-memory `PageLoader` used by the development server.
+/// Spill-capable `PageLoader` used by the development server.
 ///
-/// Always returns a freshly-initialized heap page. Suitable for tests,
-/// in-process benchmarks, and the v0.5 reference runtime where there is
-/// no on-disk segment file yet. Production builds (`Server::init`)
-/// swap this for a segment-backed loader.
+/// Unwritten pages return freshly-initialized heap pages. Dirty pages can be
+/// flushed into a per-process segment store, letting large in-process
+/// benchmarks cycle buffer frames without losing heap contents.
 ///
 /// `BufferPool` and `HeapAccess` are generic over `PageLoader`; making
 /// the type concrete here lets us name the heap (`Arc<HeapAccess<BlankPageLoader>>`)
 /// on `Server` and on the per-statement lowering context.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct BlankPageLoader;
+#[derive(Debug, Clone)]
+pub struct BlankPageLoader {
+    backing: Arc<BlankPageBacking>,
+}
+
+#[derive(Debug)]
+enum BlankPageBacking {
+    Segment(Arc<SegmentFileManager>),
+    Memory(Arc<dashmap::DashMap<PageId, Arc<[u8; PAGE_SIZE]>>>),
+}
+
+impl Default for BlankPageLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlankPageLoader {
+    /// Create a loader backed by a temporary segment directory.
+    #[must_use]
+    pub fn new() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let spill_dir =
+            std::env::temp_dir().join(format!("ultrasql-page-spill-{}-{id}", std::process::id()));
+        let config = SegmentConfig {
+            use_mmap: false,
+            verify_checksums: false,
+            ..SegmentConfig::default()
+        };
+        let backing = match SegmentFileManager::open(spill_dir, config) {
+            Ok(manager) => BlankPageBacking::Segment(Arc::new(manager)),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "page spill segment store unavailable; falling back to in-memory page store"
+                );
+                BlankPageBacking::Memory(Arc::new(dashmap::DashMap::new()))
+            }
+        };
+        Self {
+            backing: Arc::new(backing),
+        }
+    }
+
+    /// Persist a dirty page so the buffer pool may evict its frame safely.
+    pub fn store(&self, page_id: PageId, page: &Page) -> ultrasql_core::Result<()> {
+        match self.backing.as_ref() {
+            BlankPageBacking::Segment(manager) => {
+                while manager
+                    .relation_size_blocks(page_id.relation)
+                    .map_err(ultrasql_core::Error::from)?
+                    <= page_id.block.raw()
+                {
+                    manager
+                        .allocate_block(page_id.relation)
+                        .map_err(ultrasql_core::Error::from)?;
+                }
+                manager
+                    .write_page(page_id, page)
+                    .map_err(ultrasql_core::Error::from)
+            }
+            BlankPageBacking::Memory(pages) => {
+                pages.insert(page_id, Arc::new(*page.as_bytes()));
+                Ok(())
+            }
+        }
+    }
+}
 
 impl PageLoader for BlankPageLoader {
-    fn load(&self, _page_id: PageId) -> ultrasql_core::Result<Page> {
-        Ok(Page::new_heap())
+    fn load(&self, page_id: PageId) -> ultrasql_core::Result<Page> {
+        match self.backing.as_ref() {
+            BlankPageBacking::Segment(manager) => match manager.read_page(page_id) {
+                Ok(page) => Ok(page),
+                Err(SegmentError::OutOfBounds { .. }) => Ok(Page::new_heap()),
+                Err(e) => Err(e.into()),
+            },
+            BlankPageBacking::Memory(pages) => {
+                let Some(bytes) = pages.get(&page_id) else {
+                    return Ok(Page::new_heap());
+                };
+                Page::from_bytes(Box::new(**bytes))
+                    .map_err(|e| ultrasql_core::Error::Corruption(e.to_string()))
+            }
+        }
     }
 }
 
@@ -511,6 +592,8 @@ pub struct Server {
     /// row inserted on one session is visible to the next snapshot
     /// on another session.
     pub heap: Arc<HeapAccess<BlankPageLoader>>,
+    /// Backing loader used to spill dirty heap pages out of the buffer pool.
+    page_loader: BlankPageLoader,
     /// Shared visibility map for heap relations. Mutations clear touched
     /// pages; maintenance marks pages all-visible after certification.
     pub vm: Arc<VisibilityMap>,
@@ -666,7 +749,8 @@ impl Server {
         let persistent_catalog = Arc::new(PersistentCatalog::new());
         // One in-memory buffer pool for both catalog bootstrap and
         // user-table DML so every connection observes the same heap.
-        let pool = Arc::new(BufferPool::new(pool_frames, BlankPageLoader));
+        let page_loader = BlankPageLoader::new();
+        let pool = Arc::new(BufferPool::new(pool_frames, page_loader.clone()));
         let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
         let vm = Arc::new(VisibilityMap::new());
         match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
@@ -700,6 +784,7 @@ impl Server {
             data_dir: None,
             persistent_catalog,
             heap,
+            page_loader,
             vm,
             txn_manager,
             plan_cache,
@@ -728,6 +813,18 @@ impl Server {
     #[must_use]
     pub fn is_standby_mode(&self) -> bool {
         self.standby_mode.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Flush dirty heap pages into the sample server's spill store.
+    ///
+    /// COPY calls this after each inserted batch so large loads can evict clean
+    /// frames instead of pinning the whole dataset in the buffer pool.
+    pub fn flush_dirty_heap_pages(&self) -> Result<usize, ServerError> {
+        let loader = self.page_loader.clone();
+        self.heap
+            .buffer_pool()
+            .try_flush_dirty(|page_id, page| loader.store(page_id, page))
+            .map_err(|e| ServerError::ddl(format!("flush dirty heap pages: {e}")))
     }
 
     /// Record a PostgreSQL-compatible backup marker in the data directory.
@@ -823,7 +920,10 @@ impl Server {
                 .get(&table_name)
                 .map(|v| *v)
                 .unwrap_or(0);
-            let blocks = self.heap.block_count(RelationId(entry.oid)).max(entry.n_blocks);
+            let blocks = self
+                .heap
+                .block_count(RelationId(entry.oid))
+                .max(entry.n_blocks);
             let threshold = AUTO_ANALYZE_BASE_THRESHOLD
                 .saturating_add(u64::from(blocks).saturating_mul(64) / AUTO_ANALYZE_SCALE_DIVISOR);
             if modified < threshold {
@@ -914,9 +1014,10 @@ impl Server {
             Arc::new(WalBufferSink::new(Arc::clone(&wal_buffer)));
 
         // 3. Buffer pool with WAL.
+        let page_loader = BlankPageLoader::new();
         let pool = Arc::new(BufferPool::with_wal(
             IN_MEMORY_POOL_FRAMES,
-            BlankPageLoader,
+            page_loader.clone(),
             sink,
         ));
         let heap = Arc::new(HeapAccess::new(Arc::clone(&pool)));
@@ -975,6 +1076,7 @@ impl Server {
             data_dir: Some(data_dir.to_path_buf()),
             persistent_catalog,
             heap,
+            page_loader,
             vm,
             txn_manager,
             plan_cache,

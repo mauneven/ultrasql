@@ -3,24 +3,16 @@
   "scale_factor": 10,
   "target": "UltraSQL geometric mean <= 2x DuckDB geometric mean across all 22 queries",
   "passed": false,
-  "date": "2026-05-18",
-  "host": {
-    "cpu": "Apple M4",
-    "logical_cores": 10,
-    "ram_bytes": 17179869184,
-    "os": "darwin"
-  },
+  "reason": "ultrasql_run_failed",
   "data_dir": "target/tpch-scale10-real",
-  "data_size": "10G",
-  "diagnostic_policy": "benchmarks/tpch_sf10_certify.sh now records UltraSQL run failures and stops retries before exceeding TPCH_POOL_BUDGET_PERCENT of host RAM",
-  "probe": {
-    "command": "ULTRASQL_TPCH_PROGRESS=1 ULTRASQL_TPCH_LOAD_METHOD=copy ULTRASQL_TPCH_POOL_FRAMES=1500000 target/release/tpch run-queries ultrasql --data-dir target/tpch-scale10-real --runs 1 --warmup 0 --queries 1 --out target/tpch-sf10-ultrasql-q1-probe-largepool.json",
-    "result": "terminated after exceeding 35 minutes without completing the load or starting Q1",
-    "last_completed_table": "orders",
-    "uncompleted_table": "lineitem",
-    "ultrasql_geomean_ms": null,
-    "duckdb_geomean_ms": null
-  },
-  "reason": "SF10 did not run to completion on this 16 GiB memory-backed benchmark host; no throughput comparison is certified.",
-  "next_step": "Run benchmarks/tpch_sf10_certify.sh on a certification host with enough memory or after adding a disk-backed benchmark server path."
+  "ultrasql_pool_frames": 262144,
+  "ultrasql_pool_bytes": 2147483648,
+  "host_ram_bytes": 17179869184,
+  "pool_budget_percent": 75,
+  "duckdb_result": "benchmarks/results/latest/raw/tpch_sf10-duckdb.json",
+  "duckdb_result_exists": true,
+  "ultrasql_result": "benchmarks/results/latest/raw/tpch_sf10-ultrasql.json",
+  "ultrasql_result_exists": false,
+  "ultrasql_log_tail": "error: load TPC-H data into UltraSQL: finish COPY into region: db error: ERROR: DDL failed: flush dirty heap pages: invalid argument: block Block(0) out of bounds for relation RelationId(1259) (relation has 0 blocks)",
+  "next_step": "Run on a certification host with enough RAM for the memory-backed benchmark server, or add a disk-backed UltraSQL benchmark server path before claiming SF10 certification."
 }

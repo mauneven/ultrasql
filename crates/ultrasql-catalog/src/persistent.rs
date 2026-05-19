@@ -303,7 +303,7 @@ pub struct CatalogStats {
 }
 
 impl CatalogStats {
-    /// Stats for a fresh-database initial snapshot: 3 namespaces, 10 relations,
+    /// Stats for a fresh-database initial snapshot: 3 namespaces, 11 relations,
     /// no attributes, indexes, or constraints yet decoded from the heap.
     ///
     /// Used when `bootstrap_from_heap` detects an empty heap and installs the
@@ -312,7 +312,7 @@ impl CatalogStats {
     pub const fn initial() -> Self {
         Self {
             namespaces: 3,
-            relations: 10,
+            relations: 11,
             attributes: 0,
             indexes: 0,
             constraints: 0,
@@ -508,7 +508,7 @@ impl PersistentCatalog {
     /// When all system catalog heap pages are empty (i.e. the database was
     /// just initialized) this method detects the empty heap and installs the
     /// hard-coded [`initial_snapshot`] that contains the three well-known
-    /// namespaces and the ten system relations.  The returned
+    /// namespaces and the eleven system relations.  The returned
     /// [`CatalogStats`] in this case reflects the initial snapshot counts.
     ///
     /// # Idempotent
@@ -573,6 +573,8 @@ impl PersistentCatalog {
                 bool,
             )>,
         > = std::collections::HashMap::new();
+        let mut attribute_rows: std::collections::HashMap<(Oid, i16), AttributeRow> =
+            std::collections::HashMap::new();
         let mut total_attrs: u32 = 0;
         if attribute_blocks > 0 {
             let attr_scan = heap.scan(pg_attribute_rel, attribute_blocks);
@@ -583,10 +585,12 @@ impl PersistentCatalog {
                 let (row, dt, nullable) = decode_attribute_row(&tuple.data).map_err(|e| {
                     CatalogError::schema_conflict(format!("decode pg_attribute row: {e}"))
                 })?;
-                attrs_by_relation
-                    .entry(row.attrelid)
-                    .or_default()
-                    .push((row, dt, nullable));
+                attrs_by_relation.entry(row.attrelid).or_default().push((
+                    row.clone(),
+                    dt,
+                    nullable,
+                ));
+                attribute_rows.insert((row.attrelid, row.attnum), row);
                 total_attrs = total_attrs.saturating_add(1);
             }
         }
@@ -816,6 +820,10 @@ impl PersistentCatalog {
             statistic_ext: total_statistic_ext,
         };
         self.install_snapshot(snap);
+        self.pg_attribute.clear();
+        for (key, row) in attribute_rows {
+            self.pg_attribute.insert(key, row);
+        }
         self.pg_constraint.clear();
         for (oid, row) in constraint_rows {
             self.pg_constraint.insert(oid, row);
@@ -1020,6 +1028,23 @@ impl PersistentCatalog {
         xmin: ultrasql_core::Xid,
         command_id: ultrasql_core::CommandId,
     ) -> Result<(), CatalogError> {
+        self.persist_table_rows_with_defaults(entry, &[], heap, xmin, command_id)
+    }
+
+    /// Append `pg_class` / `pg_attribute` rows for one user table with
+    /// caller-supplied `atthasdef` metadata.
+    ///
+    /// `attr_has_defaults` is indexed by zero-based column position. Missing
+    /// entries are treated as `false`, preserving the legacy behavior for
+    /// callers that have no default-expression metadata.
+    pub fn persist_table_rows_with_defaults<L: PageLoader>(
+        &self,
+        entry: &TableEntry,
+        attr_has_defaults: &[bool],
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
         use crate::encoding::encode_attribute_row;
         use crate::persistent::{AttributeRow, ClassRow, RelKind};
         use ultrasql_storage::heap::InsertOptions;
@@ -1062,7 +1087,7 @@ impl PersistentCatalog {
                 atttypid: 0,
                 attnum: i16::try_from(i + 1).unwrap_or(i16::MAX),
                 attnotnull: !field.nullable,
-                atthasdef: false,
+                atthasdef: attr_has_defaults.get(i).copied().unwrap_or(false),
                 attisdropped: false,
             };
             let bytes = encode_attribute_row(&attr_row, &field.data_type, field.nullable)
@@ -1635,7 +1660,7 @@ mod tests {
     }
 
     /// `bootstrap_from_heap` on a fresh database (empty heap) installs the
-    /// initial snapshot that contains the 10 system relations.
+    /// initial snapshot that contains the 11 system relations.
     #[test]
     fn bootstrap_from_empty_heap_installs_initial_snapshot() {
         let cat = PersistentCatalog::new();
@@ -1646,13 +1671,14 @@ mod tests {
 
         // Stats reflect the initial snapshot counts.
         assert_eq!(stats.namespaces, 3);
-        assert_eq!(stats.relations, 10);
+        assert_eq!(stats.relations, 11);
 
-        // The snapshot contains all 10 system relations.
+        // The snapshot contains all 11 system relations.
         let snap = cat.snapshot();
-        assert_eq!(snap.tables.len(), 10);
+        assert_eq!(snap.tables.len(), 11);
         assert!(snap.tables.contains_key("pg_class"));
         assert!(snap.tables.contains_key("pg_attribute"));
+        assert!(snap.tables.contains_key("pg_attrdef"));
         assert!(snap.tables.contains_key("pg_namespace"));
     }
 
@@ -1667,18 +1693,18 @@ mod tests {
 
         // Capture snapshot before any mutation.
         let snap_before = cat.snapshot();
-        assert_eq!(snap_before.tables.len(), 10);
+        assert_eq!(snap_before.tables.len(), 11);
 
         // Add a table — this swaps in a new snapshot.
         cat.create_table(make_table(&cat, "user_orders"))
             .expect("create");
 
         // The old snapshot reference is still valid and unchanged.
-        assert_eq!(snap_before.tables.len(), 10);
+        assert_eq!(snap_before.tables.len(), 11);
 
         // A fresh snapshot call reflects the new state.
         let snap_after = cat.snapshot();
-        assert_eq!(snap_after.tables.len(), 11);
+        assert_eq!(snap_after.tables.len(), 12);
     }
 
     /// N threads each take a snapshot concurrently; all must see the same
@@ -1708,7 +1734,7 @@ mod tests {
         // Every thread must see the same count.
         let first = counts[0];
         assert!(counts.iter().all(|&c| c == first));
-        assert_eq!(first, 10);
+        assert_eq!(first, 11);
     }
 
     /// After installing a new snapshot via `install_snapshot`, the very next
@@ -1719,9 +1745,9 @@ mod tests {
         let heap = blank_heap();
         cat.bootstrap_from_heap(&heap).expect("bootstrap");
 
-        // Snapshot A: 10 system tables.
+        // Snapshot A: 11 system tables.
         let snap_a = cat.snapshot();
-        assert_eq!(snap_a.tables.len(), 10);
+        assert_eq!(snap_a.tables.len(), 11);
 
         // Build a richer snapshot with an additional table.
         let mut tables = snap_a.tables.clone();
@@ -1742,7 +1768,7 @@ mod tests {
 
         // Snapshot B must be visible immediately.
         let snap_after = cat.snapshot();
-        assert_eq!(snap_after.tables.len(), 11);
+        assert_eq!(snap_after.tables.len(), 12);
         assert!(snap_after.tables.contains_key("extra_table"));
     }
 
@@ -1918,6 +1944,51 @@ mod tests {
         assert_eq!(restored.schema.fields()[1].name, "amount");
         assert_eq!(restored.schema.fields()[1].data_type, DataType::Int64);
         assert!(restored.schema.fields()[1].nullable);
+    }
+
+    #[test]
+    fn bootstrap_round_trip_preserves_atthasdef_metadata() {
+        use std::sync::Arc;
+        use ultrasql_core::{CommandId, DataType, Field, PageId, Schema, Xid};
+        use ultrasql_storage::buffer_pool::BufferPool;
+        use ultrasql_storage::heap::HeapAccess;
+        use ultrasql_storage::page::Page;
+
+        let pool = Arc::new(BufferPool::new(64, |_: PageId| Ok(Page::new_heap())));
+        let heap = HeapAccess::new(pool);
+        let cat = PersistentCatalog::new();
+        let oid = cat.next_oid();
+        let entry = TableEntry::new(
+            oid,
+            "defaults_demo".to_owned(),
+            "public".to_owned(),
+            Schema::new(vec![
+                Field::required("id", DataType::Int64),
+                Field::nullable("note", DataType::Text { max_len: None }),
+            ])
+            .expect("schema"),
+        );
+
+        cat.persist_table_rows_with_defaults(
+            &entry,
+            &[true, false],
+            &heap,
+            Xid::new(1),
+            CommandId::new(0),
+        )
+        .expect("persist table rows with defaults");
+
+        let cat2 = PersistentCatalog::new();
+        cat2.bootstrap_from_heap(&heap).expect("bootstrap");
+
+        assert!(cat2.pg_attribute.get(&(oid, 1)).expect("id attr").atthasdef);
+        assert!(
+            !cat2
+                .pg_attribute
+                .get(&(oid, 2))
+                .expect("note attr")
+                .atthasdef
+        );
     }
 
     #[test]

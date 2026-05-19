@@ -43,7 +43,8 @@ pub use dict::{
     filter_eq_dict_code, group_by_dict,
 };
 pub use jit::{
-    DEFAULT_JIT_ABOVE_ROWS, JitConfig, filter_sum_i32_widening_gt_jit, filter_sum_i64_gt_jit,
+    DEFAULT_JIT_ABOVE_ROWS, JitConfig, filter_sum_abs_i64_gt_jit, filter_sum_i32_widening_gt_jit,
+    filter_sum_i64_gt_jit,
 };
 pub use kernels::{
     CmpOp, cmp_gt_i64, cmp_gt_i64_scalar, cmp_i32_scalar, cmp_i64_scalar, count_i64, eq_i32,

@@ -137,6 +137,7 @@ impl Parser<'_> {
         let end = self.peek()?.span.start;
         Ok(CopyStmt {
             table,
+            query,
             columns,
             direction,
             source,
@@ -212,7 +213,7 @@ impl Parser<'_> {
                             "binary" => CopyFormat::Binary,
                             _ => {
                                 return Err(ParseError::Expected {
-                    expected: "TEXT, CSV, or BINARY after FORMAT",
+                                    expected: "TEXT, CSV, or BINARY after FORMAT",
                                     found: fmt_tok.kind,
                                     offset: fmt_tok.span.start as usize,
                                 });

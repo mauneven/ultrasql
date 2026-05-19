@@ -11,7 +11,7 @@ use ultrasql_wal::payload::{SequenceOpKind, SequenceOpPayload};
 use super::super::{BlankPageLoader, ServerRecoveryTarget};
 
 fn recovery_target() -> ServerRecoveryTarget {
-    let pool = Arc::new(BufferPool::new(16, BlankPageLoader));
+    let pool = Arc::new(BufferPool::new(16, BlankPageLoader::new()));
     let heap = Arc::new(HeapAccess::new(pool));
     ServerRecoveryTarget {
         heap,

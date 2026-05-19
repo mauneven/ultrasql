@@ -184,7 +184,7 @@ fn lower_query_sorts_values_in_ascending_order() {
     // a valid MVCC snapshot; we never commit it because the test
     // does not write to the heap.
     let catalog = StdArc::new(PersistentCatalog::new());
-    let pool = StdArc::new(BufferPool::new(64, BlankPageLoader));
+    let pool = StdArc::new(BufferPool::new(64, BlankPageLoader::new()));
     let heap = StdArc::new(HeapAccess::new(pool));
     let vm = StdArc::new(ultrasql_storage::vm::VisibilityMap::new());
     let txn = StdArc::new(TransactionManager::new());
@@ -305,7 +305,7 @@ pub(super) fn synthetic_ctx(tables: &SampleTables) -> LowerCtx<'_> {
     use ultrasql_txn::TransactionManager;
 
     let catalog = StdArc::new(PersistentCatalog::new());
-    let pool = StdArc::new(BufferPool::new(64, BlankPageLoader));
+    let pool = StdArc::new(BufferPool::new(64, BlankPageLoader::new()));
     let heap = StdArc::new(HeapAccess::new(pool));
     let vm = StdArc::new(ultrasql_storage::vm::VisibilityMap::new());
     let txn = StdArc::new(TransactionManager::new());

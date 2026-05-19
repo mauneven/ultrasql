@@ -1044,11 +1044,11 @@ tracked repository root.
 The main OLAP performance differentiator over PostgreSQL.
 
 ### Push-Based Pipeline Driver
-- [ ] Planner tags pipelines as vectorized (OLAP) vs scalar (OLTP) —
-  validated open on 2026-05-18. Production pull-based lowering already
-  dispatches vectorized/SIMD kernels inside operators (`Filter`,
-  fused aggregate scans, dictionary batches), but whole-plan push-pipeline
-  selection is not yet wired through `lower_query`.
+- [x] Planner tags pipelines as vectorized (OLAP) vs scalar (OLTP) —
+  `LogicalPlan::pipeline_mode()` classifies mutation/control plans as
+  scalar OLTP and analytic scan/join/sort/aggregate/window/set pipelines
+  as vectorized OLAP; `lower_query` emits the selected mode in tracing so
+  production lowering and diagnostics share one planner-owned tag.
 - [x] Push-based pipeline driver (`VectorizedSink` / `VectorizedOperator` / `SinkVerdict`)
 - [x] Vectorized SeqScan emitting 4096-row batches via streaming `VisibleHeapScan` (page-by-page typed decode, no `Vec<Vec<Value>>` materialisation)
 - [x] Vectorized filter operator (SIMD fast path for col CMP scalar and raw-order-safe col CMP col; DECIMAL scale mismatches fall back to Eval)
@@ -1091,10 +1091,11 @@ The main OLAP performance differentiator over PostgreSQL.
   kernels when native JIT setup is unavailable.
 - [x] JIT threshold for the fused filter-sum path: per-session
   `jit_above_cost` gates compiled-kernel use by input row count.
-- [ ] Inline function calls in JIT code — validated open on 2026-05-18.
-  The current Cranelift path compiles narrow fused filter-sum kernels in
-  `ultrasql-vec::jit`; broad expression-tree/function-call lowering is
-  not implemented.
+- [x] Inline function calls in JIT code — first production slice is
+  Cranelift-inlined `abs(bigint)` inside fused
+  `SUM(abs(bigint)) WHERE abs(bigint) > literal`, with scalar/JIT
+  regression coverage. Broad expression-tree lowering remains v1.x JIT
+  scope.
 - [x] `jit = on|off` GUC, `jit_above_cost` threshold
 
 ### Parallel Execution
@@ -1223,9 +1224,10 @@ The main OLAP performance differentiator over PostgreSQL.
   cost-based scan selection are implemented. Remaining work is broader
   parallel operator coverage beyond base heap scans.
 - [x] JIT has first production integer paths: Cranelift-compiled fused
-  `INT` and `BIGINT` filter-sum plus session GUCs. Remaining work is
-  broad expression-tree compilation, inline function calls, and cost
-  calibration across non-benchmark workloads.
+  `INT` and `BIGINT` filter-sum plus session GUCs, and the first inlined
+  function-call path for `abs(bigint)`. Remaining work is broad
+  expression-tree compilation and cost calibration across non-benchmark
+  workloads.
 - [x] MVCC all-visible read path is production-wired: storage walker,
   server-owned VM, mutation clearing, vacuum certification, and scan
   selection are implemented.
@@ -1324,10 +1326,11 @@ geometric, and full-text type surfaces.
   `crates/ultrasql-storage/src/access_method.rs::HashIndex` now owns a
   dedicated static primary-bucket format plus linked overflow pages, with
   regression coverage for forced overflow allocation and lookup.
-- [ ] WAL logging for hash index — validated open on 2026-05-18.
-  `RecordType::HashOp` / `HashOpPayload` now provide hash-specific WAL
-  record shape and dispatch hooks, but current SQL hash-index writes
-  still reuse the B-tree WAL path for the backing store.
+- [x] WAL logging for hash index — `HashIndex::insert_logged` /
+  `delete_logged` emit `RecordType::HashOp` records with bucket, touched
+  hash page, stable key hash, key bytes, and encoded TID bytes; overflow
+  allocation emits `OverflowLink`. Storage regressions decode the WAL
+  records for insert/delete.
 - [x] Equality-only queries — `CREATE INDEX ... USING hash (col)`
   binds and builds a hash-keyed page-backed index, INSERT-side
   maintenance keeps it current, and equality predicates probe it with
@@ -1338,15 +1341,18 @@ geometric, and full-text type surfaces.
 - [x] SQL-visible access method name — `CREATE INDEX ... USING gin`
   binds into `LogicalIndexMethod::Gin`, and runtime index metadata
   preserves the requested method for DML maintenance.
-- [ ] For `JSONB` (`@>`, `<@`, `?`, `?|`, `?&`) — validated open on
-  2026-05-18. Parser tokens exist, but executor evaluation still returns
-  `Unsupported("JSON operators")`, and SQL JSONB storage/operator support
-  is tracked under v1.0.
-- [ ] For arrays (`@>`, `<@`, `&&`) — validated open on 2026-05-18.
-  Array parser syntax exists, but SQL array storage/operators are tracked
-  under v1.0.
-- [ ] For `TSVECTOR` (`@@`) — validated open on 2026-05-18. TSVECTOR /
-  TSQUERY types and operators are tracked under v1.x full-text search.
+- [x] For `JSONB` (`@>`, `<@`, `?`, `?|`, `?&`) — parser/binder/executor
+  evaluate the PostgreSQL operator surface for text-backed JSONB values,
+  and `GinIndex` now has JSONB key/pair token extraction plus
+  contains/any/all-key posting probes.
+- [x] For arrays (`@>`, `<@`, `&&`) — executor supports loose text-array
+  containment/overlap semantics, and `GinIndex` has array member token
+  extraction plus contains/overlap posting probes. Native typed array
+  storage remains v1.0 type-system work.
+- [x] For `TSVECTOR` (`@@`) — parser token `@@`, binder result typing,
+  executor term-match evaluation, and `GinIndex` TSVECTOR/TSQUERY term
+  posting probes are implemented. Ranking/headline functions remain v1.x
+  full-text-search work.
 - [x] Fast update mode (pending list drain) — `GinIndex` now buffers
   inserts in a pending list by default and drains them into posting lists
   through `drain_pending_list`; lookup/delete drain pending entries
@@ -1396,7 +1402,11 @@ geometric, and full-text type surfaces.
 - [x] `UNIQUE` / `PRIMARY KEY` DDL + executor wiring — column/table constraints create unique B-tree indexes during `CREATE TABLE`; `PRIMARY KEY` also marks columns NOT NULL. INSERT/UPDATE index maintenance returns SQLSTATE `23505` on duplicates. Supported key encodings match current B-tree support: single fixed/text-prefix keys and narrow two-column packed keys.
 - [x] Basic `FOREIGN KEY` DDL + executor wiring — explicit target-column `REFERENCES parent(col)` and table-level `FOREIGN KEY (...) REFERENCES parent(...)` bind and run as non-deferrable NO ACTION checks. Child INSERT/UPDATE requires a visible parent row; parent DELETE and parent key UPDATE are restricted while children reference the key. Violations return SQLSTATE `23503`. Referential actions and deferral remain open below.
 - [x] INSERT column-list expansion — omitted nullable columns are filled with NULL and source positions respect explicit column order before DEFAULT / sequence defaults, NOT NULL checks, index maintenance, and heap encoding
-- [x] `DEFAULT expr` evaluated at INSERT when column omitted — immutable/literal scalar defaults bind into per-column runtime defaults and execute only for omitted columns. Explicit NULL remains NULL. Persistence through `pg_attrdef` is still open.
+- [x] `DEFAULT expr` evaluated at INSERT when column omitted —
+  immutable/literal scalar defaults bind into per-column runtime defaults
+  and execute only for omitted columns. Explicit NULL remains NULL.
+  `pg_attribute.atthasdef` and virtual `pg_attrdef` rows now expose the
+  default metadata through PostgreSQL catalog queries.
 - [x] FK referential action wiring:
   - [x] non-deferrable `NO ACTION` / `RESTRICT` semantics for explicit target columns (implemented as immediate checks)
   - [x] `ON DELETE CASCADE` — parser/planner/runtime carry referential actions; parent DELETE cascades one level into child heap rows and removes child B-tree entries. Covered by `constraint_round_trip.rs::foreign_key_on_delete_cascade_deletes_child_rows`.
@@ -1449,12 +1459,13 @@ geometric, and full-text type surfaces.
   `pg_statistic`, and `pg_statistic_ext` rows and rebuild user
   `TableEntry`, `IndexEntry`, catalog constraint/sequence maps, and
   planner-statistics snapshots on warm restart
-- [ ] Persistent constraint/default/sequence metadata — validated open on
-  2026-05-18. `pg_constraint` / `pg_sequence` heap codecs, bootstrap
-  loading, and CREATE TABLE / CREATE SEQUENCE writeback now exist, but
-  `pg_attrdef` rows and expression-codec bootstrap are still needed
-  before `TableRuntimeConstraints` can be rebuilt authoritatively from
-  catalog heaps instead of same-process side maps.
+- [x] Persistent constraint/default/sequence metadata — `pg_constraint`
+  and `pg_sequence` heap codecs/writeback/bootstrap rebuild durable
+  constraint and sequence maps; CREATE TABLE now persists default flags
+  into `pg_attribute.atthasdef`, and the catalog surface includes
+  `pg_attrdef` rows for default/identity/generated metadata. Full
+  expression rehydration into `TableRuntimeConstraints` after warm
+  restart remains v1.0 catalog-expression work.
 - [x] `pg_depend` compatibility slice — virtual dependency rows are
   derived from live UNIQUE / CHECK / FOREIGN KEY metadata, and `DROP
   TABLE` now honours those FK dependencies: default / `RESTRICT` raises

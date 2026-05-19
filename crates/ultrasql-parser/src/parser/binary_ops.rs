@@ -55,6 +55,7 @@ impl<'src> Parser<'src> {
             TokenKind::HashArrow => BinaryOp::JsonGetPath,
             TokenKind::HashArrowDouble => BinaryOp::JsonGetPathText,
             TokenKind::AtArrow => BinaryOp::JsonContains,
+            TokenKind::AtAt => BinaryOp::TextSearchMatch,
             TokenKind::ArrowAt => BinaryOp::JsonContained,
             TokenKind::Overlap => BinaryOp::Overlap,
             TokenKind::QuestionMark => BinaryOp::JsonHasKey,

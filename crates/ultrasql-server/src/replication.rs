@@ -84,7 +84,10 @@ pub struct WalSender {
 
 impl WalSender {
     /// Create a WAL sender over an archive directory and slot store.
-    pub fn new(archive_dir: impl Into<PathBuf>, slots_dir: impl Into<PathBuf>) -> Result<Self, ServerError> {
+    pub fn new(
+        archive_dir: impl Into<PathBuf>,
+        slots_dir: impl Into<PathBuf>,
+    ) -> Result<Self, ServerError> {
         Ok(Self {
             archive_dir: archive_dir.into(),
             slots: ReplicationSlotStore::open(slots_dir)?,
@@ -101,7 +104,9 @@ impl WalSender {
         }
         let mut copied = 0_usize;
         for file in files {
-            let Some(name) = file.file_name() else { continue };
+            let Some(name) = file.file_name() else {
+                continue;
+            };
             fs::copy(&file, dest_dir.join(name)).map_err(ServerError::Io)?;
             slot.restart_lsn = Some(name.to_string_lossy().to_string());
             slot.confirmed_flush_lsn.clone_from(&slot.restart_lsn);
@@ -133,7 +138,9 @@ impl WalReceiver {
         let files = wal_files(&self.source_dir)?;
         let mut copied = 0_usize;
         for file in files {
-            let Some(name) = file.file_name() else { continue };
+            let Some(name) = file.file_name() else {
+                continue;
+            };
             fs::copy(&file, standby_wal_dir.join(name)).map_err(ServerError::Io)?;
             copied = copied.saturating_add(1);
         }

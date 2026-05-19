@@ -16,7 +16,7 @@
 //!
 //! # System relations baked in
 //!
-//! The ten core system tables that exist in every PostgreSQL-compatible
+//! The eleven core system tables that exist in every PostgreSQL-compatible
 //! database.  Their OIDs are well-known constants used throughout the
 //! rest of the system.
 //!
@@ -24,6 +24,7 @@
 //! |------|---------------------|
 //! | 1259 | `pg_class`          |
 //! | 1249 | `pg_attribute`      |
+//! | 2604 | `pg_attrdef`        |
 //! | 2615 | `pg_namespace`      |
 //! | 2610 | `pg_index`          |
 //! | 2606 | `pg_constraint`     |
@@ -63,6 +64,8 @@ pub const PUBLIC_OID: u32 = 2200;
 pub const PG_CLASS_OID: u32 = 1259;
 /// OID of `pg_attribute`.
 pub const PG_ATTRIBUTE_OID: u32 = 1249;
+/// OID of `pg_attrdef`.
+pub const PG_ATTRDEF_OID: u32 = 2604;
 /// OID of `pg_namespace`.
 pub const PG_NAMESPACE_OID: u32 = 2615;
 /// OID of `pg_index`.
@@ -121,6 +124,17 @@ fn pg_attribute_schema() -> Schema {
         Field::required("attisdropped", DataType::Bool),
     ])
     .expect("pg_attribute schema invariants hold")
+}
+
+/// Schema for `pg_attrdef` (abridged to v0.9 column set).
+fn pg_attrdef_schema() -> Schema {
+    Schema::new([
+        Field::required("oid", DataType::Int64),
+        Field::required("adrelid", DataType::Int64),
+        Field::required("adnum", DataType::Int16),
+        Field::required("adbin", DataType::Text { max_len: None }),
+    ])
+    .expect("pg_attrdef schema invariants hold")
 }
 
 /// Schema for `pg_index` (abridged to v0.8 column set).
@@ -220,8 +234,8 @@ fn pg_statistic_ext_schema() -> Schema {
 /// Pre-populates:
 /// - 3 namespaces: `pg_catalog` (OID 11), `information_schema` (OID 12),
 ///   `public` (OID 2200).
-/// - 10 system relations in `pg_catalog`: `pg_namespace`, `pg_class`,
-///   `pg_attribute`, `pg_index`, `pg_constraint`, `pg_sequence`,
+/// - 11 system relations in `pg_catalog`: `pg_namespace`, `pg_class`,
+///   `pg_attribute`, `pg_attrdef`, `pg_index`, `pg_constraint`, `pg_sequence`,
 ///   `pg_depend`, `pg_description`.
 ///
 /// This snapshot is installed by [`crate::PersistentCatalog::bootstrap_from_heap`]
@@ -250,7 +264,7 @@ pub fn initial_snapshot() -> CatalogSnapshot {
     }
 }
 
-/// Enumerate the ten system [`TableEntry`] values that exist in every
+/// Enumerate the eleven system [`TableEntry`] values that exist in every
 /// fresh database.
 ///
 /// Used by both [`initial_snapshot`] and
@@ -277,6 +291,7 @@ pub fn system_table_entries() -> Vec<TableEntry> {
         sys_table!(PG_NAMESPACE_OID, "pg_namespace", pg_namespace_schema),
         sys_table!(PG_CLASS_OID, "pg_class", pg_class_schema),
         sys_table!(PG_ATTRIBUTE_OID, "pg_attribute", pg_attribute_schema),
+        sys_table!(PG_ATTRDEF_OID, "pg_attrdef", pg_attrdef_schema),
         sys_table!(PG_INDEX_OID, "pg_index", pg_index_schema),
         sys_table!(PG_CONSTRAINT_OID, "pg_constraint", pg_constraint_schema),
         sys_table!(PG_SEQUENCE_OID, "pg_sequence", pg_sequence_schema),
@@ -301,12 +316,12 @@ mod tests {
 
     #[test]
     fn initial_snapshot_has_three_namespaces_worth_of_relations() {
-        // All ten system tables live in pg_catalog.
+        // All eleven system tables live in pg_catalog.
         let snap = initial_snapshot();
         assert_eq!(
             snap.tables.len(),
-            10,
-            "expected 10 system tables, got {}",
+            11,
+            "expected 11 system tables, got {}",
             snap.tables.len()
         );
     }

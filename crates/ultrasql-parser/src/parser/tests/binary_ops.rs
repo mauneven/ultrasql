@@ -268,6 +268,18 @@ fn json_has_all_keys() {
     ));
 }
 
+#[test]
+fn text_search_match() {
+    let expr = parse_expr("doc @@ query");
+    assert!(matches!(
+        expr,
+        Expr::Binary {
+            op: BinaryOp::TextSearchMatch,
+            ..
+        }
+    ));
+}
+
 /// JSON operators bind tighter than comparison: `doc -> 'k' = 'v'`
 /// parses as `(doc -> 'k') = 'v'`.
 #[test]

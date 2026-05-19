@@ -295,6 +295,14 @@ where
                     return Err(e);
                 }
             };
+        let attr_has_defaults: Vec<bool> = (0..columns.len())
+            .map(|idx| {
+                defaults.get(idx).is_some_and(Option::is_some)
+                    || sequence_defaults.get(idx).is_some_and(Option::is_some)
+                    || identity_always.get(idx).copied().unwrap_or(false)
+                    || generated_stored.get(idx).is_some_and(Option::is_some)
+            })
+            .collect();
         // Persist the typed pg_class + pg_attribute rows so a restart
         // can rebuild this `TableEntry` via
         // `PersistentCatalog::bootstrap_from_heap`. The DDL runs in an
@@ -308,12 +316,15 @@ where
         let ddl_xid = ddl_txn.xid;
         let ddl_command_id = ddl_txn.current_command;
         let persist_result = (|| -> Result<(), ultrasql_catalog::CatalogError> {
-            self.state.persistent_catalog.persist_table_rows(
-                &entry,
-                self.state.heap.as_ref(),
-                ddl_xid,
-                ddl_command_id,
-            )?;
+            self.state
+                .persistent_catalog
+                .persist_table_rows_with_defaults(
+                    &entry,
+                    &attr_has_defaults,
+                    self.state.heap.as_ref(),
+                    ddl_xid,
+                    ddl_command_id,
+                )?;
             for index in &created_unique_indexes {
                 self.state.persistent_catalog.persist_index_rows(
                     index,

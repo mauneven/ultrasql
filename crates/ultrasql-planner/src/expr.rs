@@ -344,6 +344,7 @@ const fn display_binary(op: BinaryOp) -> &'static str {
         BinaryOp::JsonHasKey => "?",
         BinaryOp::JsonHasAnyKey => "?|",
         BinaryOp::JsonHasAllKeys => "?&",
+        BinaryOp::TextSearchMatch => "@@",
     }
 }
 

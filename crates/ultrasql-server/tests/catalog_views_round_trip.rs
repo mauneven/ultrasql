@@ -49,7 +49,7 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 
     client
-        .batch_execute("CREATE TABLE meta_t (id INT NOT NULL, name TEXT)")
+        .batch_execute("CREATE TABLE meta_t (id INT NOT NULL, name TEXT DEFAULT 'anon')")
         .await
         .expect("create table");
     client
@@ -120,6 +120,21 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
     assert_eq!(columns[1].get::<_, String>(0), "name");
     assert_eq!(columns[1].get::<_, String>(1), "text");
     assert_eq!(columns[1].get::<_, String>(2), "YES");
+
+    let attrdefs = client
+        .query(
+            "SELECT a.atthasdef, d.adbin \
+             FROM pg_catalog.pg_attribute a \
+             JOIN pg_catalog.pg_attrdef d \
+               ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+             WHERE a.attname = 'name'",
+            &[],
+        )
+        .await
+        .expect("pg_attrdef query");
+    assert_eq!(attrdefs.len(), 1);
+    assert!(attrdefs[0].get::<_, bool>(0));
+    assert!(attrdefs[0].get::<_, String>(1).contains("anon"));
 
     let indexes = client
         .query(

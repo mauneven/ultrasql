@@ -37,6 +37,7 @@ pub(crate) fn virtual_catalog_schema(name: &str) -> Option<Schema> {
         "pg_catalog.pg_namespace" => Some(schema_pg_namespace()),
         "pg_catalog.pg_class" => Some(schema_pg_class()),
         "pg_catalog.pg_attribute" => Some(schema_pg_attribute()),
+        "pg_catalog.pg_attrdef" => Some(schema_pg_attrdef()),
         "pg_catalog.pg_index" => Some(schema_pg_index()),
         "pg_catalog.pg_constraint" => Some(schema_pg_constraint()),
         "pg_catalog.pg_sequence" => Some(schema_pg_sequence()),
@@ -112,6 +113,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_namespace" => Some((schema_pg_namespace(), rows_pg_namespace())),
         "pg_catalog.pg_class" => Some((schema_pg_class(), rows_pg_class(ctx))),
         "pg_catalog.pg_attribute" => Some((schema_pg_attribute(), rows_pg_attribute(ctx))),
+        "pg_catalog.pg_attrdef" => Some((schema_pg_attrdef(), rows_pg_attrdef(ctx))),
         "pg_catalog.pg_index" => Some((schema_pg_index(), rows_pg_index(ctx))),
         "pg_catalog.pg_constraint" => Some((schema_pg_constraint(), rows_pg_constraint(ctx))),
         "pg_catalog.pg_sequence" => Some((schema_pg_sequence(), rows_pg_sequence(ctx))),
@@ -205,16 +207,43 @@ fn normalized_name(name: &str) -> String {
         return folded;
     }
     match folded.as_str() {
-        "pg_namespace" | "pg_class" | "pg_attribute" | "pg_index" | "pg_constraint"
-        | "pg_sequence" | "pg_depend" | "pg_description" | "pg_tables" | "pg_indexes"
-        | "pg_statistic" | "pg_statistic_ext" | "pg_views" | "pg_sequences" | "pg_roles"
-        | "pg_user" | "pg_settings" | "pg_locks" | "pg_stat_activity" | "pg_proc"
-        | "pg_stat_user_tables" | "pg_stat_user_indexes" | "pg_statio_user_tables"
-        | "pg_stat_database" | "pg_stat_bgwriter" | "pg_stat_wal"
-        | "pg_stat_progress_vacuum" | "pg_stat_progress_analyze"
-        | "pg_stat_progress_create_index" | "pg_replication_slots"
-        | "pg_stat_replication" | "pg_stat_subscription" | "pg_publication"
-        | "pg_subscription" | "pg_publication_tables" | "pg_database" => {
+        "pg_namespace"
+        | "pg_class"
+        | "pg_attribute"
+        | "pg_attrdef"
+        | "pg_index"
+        | "pg_constraint"
+        | "pg_sequence"
+        | "pg_depend"
+        | "pg_description"
+        | "pg_tables"
+        | "pg_indexes"
+        | "pg_statistic"
+        | "pg_statistic_ext"
+        | "pg_views"
+        | "pg_sequences"
+        | "pg_roles"
+        | "pg_user"
+        | "pg_settings"
+        | "pg_locks"
+        | "pg_stat_activity"
+        | "pg_proc"
+        | "pg_stat_user_tables"
+        | "pg_stat_user_indexes"
+        | "pg_statio_user_tables"
+        | "pg_stat_database"
+        | "pg_stat_bgwriter"
+        | "pg_stat_wal"
+        | "pg_stat_progress_vacuum"
+        | "pg_stat_progress_analyze"
+        | "pg_stat_progress_create_index"
+        | "pg_replication_slots"
+        | "pg_stat_replication"
+        | "pg_stat_subscription"
+        | "pg_publication"
+        | "pg_subscription"
+        | "pg_publication_tables"
+        | "pg_database" => {
             format!("pg_catalog.{folded}")
         }
         "tables"
@@ -402,12 +431,73 @@ fn rows_pg_attribute(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Int32(type_oid(&field.data_type)),
                 Value::Int16(i16::try_from(idx + 1).unwrap_or(i16::MAX)),
                 Value::Bool(!field.nullable),
-                Value::Bool(false),
+                Value::Bool(column_default_expr(ctx, entry.oid, idx).is_some()),
                 Value::Bool(false),
             ]);
         }
     }
     rows
+}
+
+fn schema_pg_attrdef() -> Schema {
+    schema([
+        Field::required("oid", DataType::Int64),
+        Field::required("adrelid", DataType::Int64),
+        Field::required("adnum", DataType::Int16),
+        Field::required("adbin", text()),
+    ])
+}
+
+fn rows_pg_attrdef(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let mut rows = Vec::new();
+    for entry in table_entries(ctx) {
+        for idx in 0..entry.schema.fields().len() {
+            let Some(expr) = column_default_expr(ctx, entry.oid, idx) else {
+                continue;
+            };
+            let attnum = i16::try_from(idx + 1).unwrap_or(i16::MAX);
+            rows.push(vec![
+                Value::Int64(attrdef_oid(entry.oid, attnum)),
+                v_i64(entry.oid.raw()),
+                Value::Int16(attnum),
+                v_text(expr),
+            ]);
+        }
+    }
+    rows
+}
+
+fn attrdef_oid(relid: Oid, attnum: i16) -> i64 {
+    i64::from(relid.raw())
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(attnum))
+}
+
+fn column_default_expr(ctx: &LowerCtx<'_>, relid: Oid, idx: usize) -> Option<String> {
+    let constraints = ctx.table_constraints.get(&relid)?;
+    if let Some(expr) = constraints.defaults.get(idx).and_then(Option::as_ref) {
+        return Some(format!("{expr:?}"));
+    }
+    if let Some(seq_name) = constraints
+        .sequence_defaults
+        .get(idx)
+        .and_then(Option::as_ref)
+    {
+        return Some(format!("nextval('{seq_name}'::regclass)"));
+    }
+    if constraints
+        .identity_always
+        .get(idx)
+        .copied()
+        .unwrap_or(false)
+    {
+        return Some("generated always as identity".to_owned());
+    }
+    constraints
+        .generated_stored
+        .get(idx)
+        .and_then(Option::as_ref)
+        .map(|expr| format!("generated always as ({expr:?}) stored"))
 }
 
 fn schema_pg_index() -> Schema {

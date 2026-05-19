@@ -114,7 +114,8 @@ print(json.dumps(doc, indent=2))
 PY
 }
 
-cargo build --release --package ultrasql-bench --features sql-bench --bin tpch
+CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
+    cargo build --release --package ultrasql-bench --features sql-bench --bin tpch
 
 echo "Running DuckDB TPC-H SF10: queries=$QUERIES runs=$RUNS warmup=$WARMUP"
 target/release/tpch run-queries duckdb \

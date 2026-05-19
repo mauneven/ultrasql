@@ -35,7 +35,12 @@
 
 use parking_lot::Mutex;
 use thiserror::Error;
-use ultrasql_core::TupleId;
+use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
+use ultrasql_wal::WalRecord;
+use ultrasql_wal::payload::{HashOpKind, HashOpPayload};
+use ultrasql_wal::record::RecordType;
+
+use crate::wal_sink::WalSink;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -283,12 +288,17 @@ impl HashIndex {
         }
     }
 
-    fn bucket_index(&self, key: &[u8]) -> usize {
+    fn key_hash(key: &[u8]) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in key {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
+        hash
+    }
+
+    fn bucket_index(&self, key: &[u8]) -> usize {
+        let hash = Self::key_hash(key);
         (hash as usize) & (self.num_buckets - 1)
     }
 
@@ -297,14 +307,22 @@ impl HashIndex {
     pub fn overflow_page_count(&self) -> usize {
         self.storage.lock().overflow_pages.len()
     }
-}
 
-impl AccessMethod for HashIndex {
-    fn name(&self) -> &'static str {
-        "hash"
-    }
-
-    fn insert(&self, key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
+    /// Insert `(key, tid)` and emit a `HashOp` WAL record when `wal` is set.
+    ///
+    /// The WAL record carries the static bucket number, the page-shaped hash
+    /// page touched by the insert, the stable key hash, the encoded key, and
+    /// the encoded heap [`TupleId`]. When inserting into a new overflow page,
+    /// an `OverflowLink` record is emitted before the `Insert` record.
+    pub fn insert_logged(
+        &self,
+        index_rel: RelationId,
+        key: &[u8],
+        tid: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        let key_hash = Self::key_hash(key);
         let idx = self.bucket_index(key);
         let mut storage = self.storage.lock();
         let mut current = HashPageRef::Bucket(idx);
@@ -312,6 +330,16 @@ impl AccessMethod for HashIndex {
             let next = {
                 let page = storage.page_mut(current);
                 if page.entries.len() < self.page_capacity {
+                    self.emit_hash_wal(
+                        HashOpKind::Insert,
+                        index_rel,
+                        current,
+                        key_hash,
+                        key,
+                        tid,
+                        xid,
+                        wal,
+                    )?;
                     page.entries.push((key.to_vec(), tid));
                     return Ok(());
                 }
@@ -322,6 +350,27 @@ impl AccessMethod for HashIndex {
                 continue;
             }
             let overflow_idx = storage.overflow_pages.len();
+            let overflow_ref = HashPageRef::Overflow(overflow_idx);
+            self.emit_hash_wal(
+                HashOpKind::OverflowLink,
+                index_rel,
+                current,
+                key_hash,
+                key,
+                tid,
+                xid,
+                wal,
+            )?;
+            self.emit_hash_wal(
+                HashOpKind::Insert,
+                index_rel,
+                overflow_ref,
+                key_hash,
+                key,
+                tid,
+                xid,
+                wal,
+            )?;
             storage.overflow_pages.push(HashPage::default());
             storage.page_mut(current).next_overflow = Some(overflow_idx);
             storage.overflow_pages[overflow_idx]
@@ -329,6 +378,114 @@ impl AccessMethod for HashIndex {
                 .push((key.to_vec(), tid));
             return Ok(());
         }
+    }
+
+    /// Delete `(key, tid)` and emit a `HashOp` WAL record when `wal` is set.
+    pub fn delete_logged(
+        &self,
+        index_rel: RelationId,
+        key: &[u8],
+        tid: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        let key_hash = Self::key_hash(key);
+        let idx = self.bucket_index(key);
+        let mut storage = self.storage.lock();
+        let mut current = Some(HashPageRef::Bucket(idx));
+        while let Some(page_ref) = current {
+            let page = storage.page_mut(page_ref);
+            if let Some(pos) = page
+                .entries
+                .iter()
+                .position(|(k, t)| k.as_slice() == key && *t == tid)
+            {
+                self.emit_hash_wal(
+                    HashOpKind::Delete,
+                    index_rel,
+                    page_ref,
+                    key_hash,
+                    key,
+                    tid,
+                    xid,
+                    wal,
+                )?;
+                page.entries.remove(pos);
+                return Ok(());
+            }
+            current = page.next_overflow.map(HashPageRef::Overflow);
+        }
+        Err(AccessMethodError::NotFound)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_hash_wal(
+        &self,
+        op: HashOpKind,
+        index_rel: RelationId,
+        page_ref: HashPageRef,
+        key_hash: u64,
+        key: &[u8],
+        tid: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        let Some(sink) = wal else {
+            return Ok(());
+        };
+        let page = self.hash_page_id(index_rel, page_ref)?;
+        let payload = HashOpPayload {
+            op,
+            index_rel,
+            bucket: u32::try_from(self.bucket_index(key)).map_err(|_| {
+                AccessMethodError::Storage("hash bucket does not fit in u32".to_owned())
+            })?,
+            page,
+            key_hash,
+            key_bytes: key.to_vec(),
+            value_bytes: Self::tuple_id_bytes(tid),
+        }
+        .encode()
+        .map_err(|e| AccessMethodError::Storage(format!("hash WAL payload encode: {e}")))?;
+        let prev_lsn = sink.last_lsn_for(xid);
+        let record = WalRecord::new(RecordType::HashOp, xid, prev_lsn, 0, payload);
+        sink.append(record)
+            .map(|_| ())
+            .map_err(|e| AccessMethodError::Storage(format!("hash WAL append: {e}")))
+    }
+
+    fn hash_page_id(
+        &self,
+        index_rel: RelationId,
+        page_ref: HashPageRef,
+    ) -> Result<PageId, AccessMethodError> {
+        let raw_block = match page_ref {
+            HashPageRef::Bucket(idx) => idx,
+            HashPageRef::Overflow(idx) => self.num_buckets.checked_add(idx).ok_or_else(|| {
+                AccessMethodError::Storage("hash overflow page number overflow".to_owned())
+            })?,
+        };
+        let block = u32::try_from(raw_block)
+            .map_err(|_| AccessMethodError::Storage("hash page does not fit in u32".to_owned()))?;
+        Ok(PageId::new(index_rel, BlockNumber::new(block)))
+    }
+
+    fn tuple_id_bytes(tid: TupleId) -> Vec<u8> {
+        let mut out = Vec::with_capacity(10);
+        out.extend_from_slice(&tid.page.relation.oid().raw().to_le_bytes());
+        out.extend_from_slice(&tid.page.block.raw().to_le_bytes());
+        out.extend_from_slice(&tid.slot.to_le_bytes());
+        out
+    }
+}
+
+impl AccessMethod for HashIndex {
+    fn name(&self) -> &'static str {
+        "hash"
+    }
+
+    fn insert(&self, key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
+        self.insert_logged(RelationId::INVALID, key, tid, Xid::INVALID, None)
     }
 
     fn lookup(&self, key: &[u8]) -> Result<Vec<TupleId>, AccessMethodError> {
@@ -350,22 +507,7 @@ impl AccessMethod for HashIndex {
     }
 
     fn delete(&self, key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
-        let idx = self.bucket_index(key);
-        let mut storage = self.storage.lock();
-        let mut current = Some(HashPageRef::Bucket(idx));
-        while let Some(page_ref) = current {
-            let page = storage.page_mut(page_ref);
-            if let Some(pos) = page
-                .entries
-                .iter()
-                .position(|(k, t)| k.as_slice() == key && *t == tid)
-            {
-                page.entries.remove(pos);
-                return Ok(());
-            }
-            current = page.next_overflow.map(HashPageRef::Overflow);
-        }
-        Err(AccessMethodError::NotFound)
+        self.delete_logged(RelationId::INVALID, key, tid, Xid::INVALID, None)
     }
 }
 
@@ -444,6 +586,208 @@ impl GinIndex {
     #[must_use]
     pub fn pending_len(&self) -> usize {
         self.storage.lock().pending.len()
+    }
+
+    /// Tokenize and insert one JSONB document for GIN containment/key probes.
+    pub fn insert_jsonb_document(&self, json: &str, tid: TupleId) -> Result<(), AccessMethodError> {
+        for token in gin_jsonb_document_tokens(json) {
+            self.insert(&token, tid)?;
+        }
+        Ok(())
+    }
+
+    /// Probe JSONB containment (`@>`) by intersecting query tokens.
+    pub fn lookup_jsonb_contains(&self, query: &str) -> Result<Vec<TupleId>, AccessMethodError> {
+        self.lookup_all_tokens(&gin_jsonb_document_tokens(query))
+    }
+
+    /// Probe JSONB key existence (`?`).
+    pub fn lookup_jsonb_has_key(&self, key: &str) -> Result<Vec<TupleId>, AccessMethodError> {
+        self.lookup(gin_token("json:key", key).as_slice())
+    }
+
+    /// Probe JSONB any-key existence (`?|`).
+    pub fn lookup_jsonb_has_any_key(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<TupleId>, AccessMethodError> {
+        let tokens: Vec<Vec<u8>> = keys.iter().map(|key| gin_token("json:key", key)).collect();
+        self.lookup_any_token(&tokens)
+    }
+
+    /// Probe JSONB all-key existence (`?&`).
+    pub fn lookup_jsonb_has_all_keys(
+        &self,
+        keys: &[String],
+    ) -> Result<Vec<TupleId>, AccessMethodError> {
+        let tokens: Vec<Vec<u8>> = keys.iter().map(|key| gin_token("json:key", key)).collect();
+        self.lookup_all_tokens(&tokens)
+    }
+
+    /// Tokenize and insert one SQL array value for GIN array probes.
+    pub fn insert_array_value(&self, array: &str, tid: TupleId) -> Result<(), AccessMethodError> {
+        for token in gin_array_tokens(array) {
+            self.insert(&token, tid)?;
+        }
+        Ok(())
+    }
+
+    /// Probe array containment (`@>`) by intersecting member tokens.
+    pub fn lookup_array_contains(&self, query: &str) -> Result<Vec<TupleId>, AccessMethodError> {
+        self.lookup_all_tokens(&gin_array_tokens(query))
+    }
+
+    /// Probe array overlap (`&&`) by unioning member-token postings.
+    pub fn lookup_array_overlap(&self, query: &str) -> Result<Vec<TupleId>, AccessMethodError> {
+        self.lookup_any_token(&gin_array_tokens(query))
+    }
+
+    /// Tokenize and insert one `TSVECTOR` value for GIN full-text probes.
+    pub fn insert_tsvector(&self, tsvector: &str, tid: TupleId) -> Result<(), AccessMethodError> {
+        for token in gin_tsvector_tokens(tsvector) {
+            self.insert(&token, tid)?;
+        }
+        Ok(())
+    }
+
+    /// Probe `TSVECTOR @@ TSQUERY` by intersecting query term tokens.
+    pub fn lookup_tsquery_match(&self, tsquery: &str) -> Result<Vec<TupleId>, AccessMethodError> {
+        self.lookup_all_tokens(&gin_tsvector_tokens(tsquery))
+    }
+
+    fn lookup_all_tokens(&self, tokens: &[Vec<u8>]) -> Result<Vec<TupleId>, AccessMethodError> {
+        let Some((first, rest)) = tokens.split_first() else {
+            return Ok(Vec::new());
+        };
+        let mut out = self.lookup(first)?;
+        for token in rest {
+            let postings = self.lookup(token)?;
+            out.retain(|tid| postings.contains(tid));
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
+    fn lookup_any_token(&self, tokens: &[Vec<u8>]) -> Result<Vec<TupleId>, AccessMethodError> {
+        let mut out = Vec::new();
+        for token in tokens {
+            out.extend(self.lookup(token)?);
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+}
+
+fn gin_token(prefix: &str, value: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(prefix.len() + 1 + value.len());
+    out.extend_from_slice(prefix.as_bytes());
+    out.push(0);
+    out.extend_from_slice(value.as_bytes());
+    out
+}
+
+fn gin_jsonb_document_tokens(json: &str) -> Vec<Vec<u8>> {
+    let mut tokens = Vec::new();
+    for (key, value) in gin_json_object_pairs(json) {
+        tokens.push(gin_token("json:key", &key));
+        let mut pair = gin_token("json:pair", &key);
+        pair.push(0);
+        pair.extend_from_slice(value.as_bytes());
+        tokens.push(pair);
+    }
+    if tokens.is_empty() {
+        tokens.extend(
+            gin_split_loose_list(json)
+                .into_iter()
+                .map(|value| gin_token("json:elem", &value)),
+        );
+    }
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn gin_array_tokens(array: &str) -> Vec<Vec<u8>> {
+    let mut tokens: Vec<Vec<u8>> = gin_split_loose_list(array)
+        .into_iter()
+        .map(|value| gin_token("array:elem", &value))
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn gin_tsvector_tokens(text: &str) -> Vec<Vec<u8>> {
+    let mut tokens: Vec<Vec<u8>> = text
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| gin_token("ts:term", &term.to_ascii_lowercase()))
+        .collect();
+    tokens.sort();
+    tokens.dedup();
+    tokens
+}
+
+fn gin_json_object_pairs(text: &str) -> Vec<(String, String)> {
+    let trimmed = text.trim();
+    let Some(body) = trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+        return Vec::new();
+    };
+    split_top_level_commas(body)
+        .into_iter()
+        .filter_map(|part| {
+            let (key, value) = part.split_once(':')?;
+            Some((unquote_json_scalar(key), unquote_json_scalar(value)))
+        })
+        .collect()
+}
+
+fn gin_split_loose_list(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    let body = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .or_else(|| trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')))
+        .unwrap_or(trimmed);
+    split_top_level_commas(body)
+        .into_iter()
+        .map(unquote_json_scalar)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn split_top_level_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            ',' if !in_string => {
+                parts.push(text[start..idx].trim());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(text[start..].trim());
+    parts
+}
+
+fn unquote_json_scalar(text: &str) -> String {
+    let trimmed = text.trim();
+    if let Some(inner) = trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        inner.replace("\\\"", "\"").replace("\\\\", "\\")
+    } else {
+        trimmed.to_owned()
     }
 }
 
@@ -755,9 +1099,12 @@ impl AccessMethod for BrinIndex {
 
 #[cfg(test)]
 mod tests {
-    use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
+    use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
+    use ultrasql_wal::payload::{HashOpKind, HashOpPayload};
+    use ultrasql_wal::record::RecordType;
 
     use super::*;
+    use crate::wal_sink::test_support::InMemoryWalSink;
 
     fn tid(block: u32, slot: u16) -> TupleId {
         TupleId::new(
@@ -849,6 +1196,49 @@ mod tests {
         assert_eq!(am.lookup(b"c").expect("lookup c"), vec![tid(1, 2)]);
     }
 
+    #[test]
+    fn hash_insert_logged_emits_hash_wal_record() {
+        let am = HashIndex::new(64);
+        let sink = InMemoryWalSink::new();
+        let index_rel = RelationId::new(1234);
+        let key = b"logged";
+        let tuple = tid(7, 3);
+
+        am.insert_logged(index_rel, key, tuple, Xid::new(44), Some(&sink))
+            .expect("logged insert");
+
+        let records = sink.records();
+        assert_eq!(records.len(), 1);
+        let record = &records[0].1;
+        assert_eq!(record.header.record_type, RecordType::HashOp);
+        let payload = HashOpPayload::decode(&record.payload).expect("decode hash WAL");
+        assert_eq!(payload.op, HashOpKind::Insert);
+        assert_eq!(payload.index_rel, index_rel);
+        assert_eq!(payload.key_bytes, key);
+        assert_eq!(payload.value_bytes, HashIndex::tuple_id_bytes(tuple));
+    }
+
+    #[test]
+    fn hash_delete_logged_emits_hash_wal_record() {
+        let am = HashIndex::new(64);
+        let sink = InMemoryWalSink::new();
+        let index_rel = RelationId::new(4321);
+        let key = b"delete";
+        let tuple = tid(8, 4);
+
+        am.insert_logged(index_rel, key, tuple, Xid::new(55), Some(&sink))
+            .expect("logged insert");
+        am.delete_logged(index_rel, key, tuple, Xid::new(55), Some(&sink))
+            .expect("logged delete");
+
+        let records = sink.records();
+        assert_eq!(records.len(), 2);
+        let payload = HashOpPayload::decode(&records[1].1.payload).expect("decode hash WAL");
+        assert_eq!(payload.op, HashOpKind::Delete);
+        assert_eq!(payload.index_rel, index_rel);
+        assert_eq!(payload.key_bytes, key);
+    }
+
     // --- GinIndex ---
 
     #[test]
@@ -891,6 +1281,64 @@ mod tests {
         am.insert(b"tok", tid(2, 0)).expect("insert");
         am.delete(b"tok", tid(2, 0)).expect("delete");
         assert!(am.lookup(b"tok").expect("lookup").is_empty());
+    }
+
+    #[test]
+    fn gin_jsonb_operator_tokens_cover_contains_and_keys() {
+        let am = GinIndex::new();
+        am.insert_jsonb_document(r#"{"a":1,"b":"two"}"#, tid(9, 0))
+            .expect("insert jsonb");
+        am.insert_jsonb_document(r#"{"a":2,"c":3}"#, tid(9, 1))
+            .expect("insert jsonb");
+
+        assert_eq!(
+            am.lookup_jsonb_contains(r#"{"a":1}"#)
+                .expect("jsonb contains"),
+            vec![tid(9, 0)]
+        );
+        assert_eq!(
+            am.lookup_jsonb_has_any_key(&["b".to_owned(), "z".to_owned()])
+                .expect("jsonb any key"),
+            vec![tid(9, 0)]
+        );
+        assert_eq!(
+            am.lookup_jsonb_has_all_keys(&["a".to_owned(), "c".to_owned()])
+                .expect("jsonb all keys"),
+            vec![tid(9, 1)]
+        );
+    }
+
+    #[test]
+    fn gin_array_operator_tokens_cover_contains_and_overlap() {
+        let am = GinIndex::new();
+        am.insert_array_value("{red,green}", tid(10, 0))
+            .expect("insert array");
+        am.insert_array_value("{blue,green}", tid(10, 1))
+            .expect("insert array");
+
+        assert_eq!(
+            am.lookup_array_contains("{red,green}")
+                .expect("array contains"),
+            vec![tid(10, 0)]
+        );
+        assert_eq!(
+            am.lookup_array_overlap("{green}").expect("array overlap"),
+            vec![tid(10, 0), tid(10, 1)]
+        );
+    }
+
+    #[test]
+    fn gin_tsvector_operator_tokens_cover_match() {
+        let am = GinIndex::new();
+        am.insert_tsvector("quick brown fox", tid(11, 0))
+            .expect("insert tsvector");
+        am.insert_tsvector("slow green turtle", tid(11, 1))
+            .expect("insert tsvector");
+
+        assert_eq!(
+            am.lookup_tsquery_match("quick & fox").expect("tsquery"),
+            vec![tid(11, 0)]
+        );
     }
 
     // --- GistIndex ---

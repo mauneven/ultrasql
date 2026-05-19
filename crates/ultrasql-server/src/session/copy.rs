@@ -388,13 +388,7 @@ where
         if opts.format == ServerCopyFormat::Binary {
             let bytes = self.collect_copy_stdin_bytes().await?;
             return self
-                .copy_binary_bytes_into_table(
-                    entry,
-                    columns,
-                    schema,
-                    &bytes,
-                    emit_ready_for_query,
-                )
+                .copy_binary_bytes_into_table(entry, columns, schema, &bytes, emit_ready_for_query)
                 .await;
         }
 
@@ -600,8 +594,8 @@ where
         path: &str,
         emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
-        let bytes =
-            fs::read(path).map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+        let bytes = fs::read(path)
+            .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
         if opts.format == ServerCopyFormat::Binary {
             return self
                 .copy_binary_bytes_into_table(entry, columns, schema, &bytes, emit_ready_for_query)
@@ -619,7 +613,9 @@ where
             if line.is_empty() {
                 continue;
             }
-            payloads.push(decode_one_copy_row(line, entry, columns, schema, &codec, opts)?);
+            payloads.push(decode_one_copy_row(
+                line, entry, columns, schema, &codec, opts,
+            )?);
         }
         let rows = u64::try_from(payloads.len()).unwrap_or(u64::MAX);
         self.flush_copy_insert_batch(entry, &payloads, &txn)?;
@@ -774,7 +770,9 @@ where
                     .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
                 self.send_copy_complete(rows, emit_ready_for_query).await
             }
-            CopySource::Stdin => Err(ServerError::Unsupported("COPY query target cannot use STDIN")),
+            CopySource::Stdin => Err(ServerError::Unsupported(
+                "COPY query target cannot use STDIN",
+            )),
         }
     }
 
@@ -797,8 +795,12 @@ where
                 .map(|f| Some(f.name.as_bytes().to_vec()))
                 .collect();
             match opts.format {
-                ServerCopyFormat::Text => out.extend_from_slice(&encode_text_row(&header_cells, opts)),
-                ServerCopyFormat::Csv => out.extend_from_slice(&encode_csv_row(&header_cells, opts)),
+                ServerCopyFormat::Text => {
+                    out.extend_from_slice(&encode_text_row(&header_cells, opts))
+                }
+                ServerCopyFormat::Csv => {
+                    out.extend_from_slice(&encode_csv_row(&header_cells, opts))
+                }
                 ServerCopyFormat::Binary => {}
             }
         }
@@ -810,7 +812,8 @@ where
             self.state.txn_manager.as_ref(),
         );
         for tuple in scan {
-            let tuple = tuple.map_err(|e| ServerError::ddl(format!("COPY TO file heap scan: {e}")))?;
+            let tuple =
+                tuple.map_err(|e| ServerError::ddl(format!("COPY TO file heap scan: {e}")))?;
             let row = codec
                 .decode(&tuple.data)
                 .map_err(|e| ServerError::CopyFormat(format!("COPY TO file row decode: {e}")))?;
@@ -848,7 +851,8 @@ where
             self.state.txn_manager.as_ref(),
         );
         for tuple in scan {
-            let tuple = tuple.map_err(|e| ServerError::ddl(format!("binary COPY heap scan: {e}")))?;
+            let tuple =
+                tuple.map_err(|e| ServerError::ddl(format!("binary COPY heap scan: {e}")))?;
             let row = codec
                 .decode(&tuple.data)
                 .map_err(|e| ServerError::CopyFormat(format!("binary COPY row decode: {e}")))?;
@@ -883,6 +887,7 @@ where
             .heap
             .insert_batch(RelationId(entry.oid), &payload_refs, insert_opts)
             .map_err(|e| ServerError::ddl(format!("COPY FROM heap insert batch: {e}")))?;
+        self.state.flush_dirty_heap_pages()?;
         Ok(())
     }
 
@@ -902,7 +907,7 @@ where
     }
 }
 
-fn copy_format_code(format: ServerCopyFormat) -> u16 {
+fn copy_format_code(format: ServerCopyFormat) -> u8 {
     match format {
         ServerCopyFormat::Text | ServerCopyFormat::Csv => 0,
         ServerCopyFormat::Binary => 1,
@@ -1116,9 +1121,11 @@ fn decode_binary_copy_payload(
             let target_idx = columns.get(stream_idx).copied().unwrap_or(stream_idx);
             row[target_idx] = value;
         }
-        payloads.push(codec.encode(&row).map_err(|e| {
-            ServerError::CopyFormat(format!("binary COPY row encode: {e}"))
-        })?);
+        payloads.push(
+            codec
+                .encode(&row)
+                .map_err(|e| ServerError::CopyFormat(format!("binary COPY row encode: {e}")))?,
+        );
     }
     Ok(payloads)
 }
@@ -1138,7 +1145,12 @@ fn read_i32_be(bytes: &[u8], pos: &mut usize) -> Result<i32, ServerError> {
     if end > bytes.len() {
         return Err(ServerError::CopyFormat("truncated binary COPY".to_string()));
     }
-    let out = i32::from_be_bytes([bytes[*pos], bytes[*pos + 1], bytes[*pos + 2], bytes[*pos + 3]]);
+    let out = i32::from_be_bytes([
+        bytes[*pos],
+        bytes[*pos + 1],
+        bytes[*pos + 2],
+        bytes[*pos + 3],
+    ]);
     *pos = end;
     Ok(out)
 }

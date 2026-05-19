@@ -127,6 +127,8 @@ pub enum TokenKind {
     HashArrowDouble,
     /// `@>` — `contains`.
     AtArrow,
+    /// `@@` — full-text search match.
+    AtAt,
     /// `<@` — `contained by`.
     ArrowAt,
     /// `&&` — overlap.

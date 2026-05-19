@@ -224,6 +224,7 @@ pub(crate) fn eval_expr(
 /// Dispatch the binder-resolved builtin scalar function calls.
 ///
 /// Today's support set is the slice needed for TPC-H lift-off:
+/// - `abs(int)` — absolute value. Returns `i64`.
 /// - `extract(unit, date)` — date-part extraction. Returns `i64`.
 /// - `lower(text)` / `upper(text)` — case folding for expression indexes
 ///   and simple scalar projections.
@@ -234,6 +235,7 @@ pub(crate) fn eval_expr(
 /// binder upgrade lands ahead of executor coverage without crashing.
 fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match name {
+        "abs" => eval_abs(args),
         "extract" => eval_extract(args),
         "lower" => eval_text_case(args, TextCase::Lower),
         "upper" => eval_text_case(args, TextCase::Upper),
@@ -248,6 +250,25 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "case_simple" => eval_case_simple(args),
         other => Err(EvalError::Unsupported(Box::leak(
             format!("function `{other}` not implemented").into_boxed_str(),
+        ))),
+    }
+}
+
+fn eval_abs(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "abs: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Int16(v) => Ok(Value::Int64(i64::from(*v).abs())),
+        Value::Int32(v) => Ok(Value::Int64(i64::from(*v).abs())),
+        Value::Int64(v) => v.checked_abs().map(Value::Int64).ok_or(EvalError::Overflow),
+        Value::Null => Ok(Value::Null),
+        other => Err(EvalError::Type(format!(
+            "abs: integer argument required, got {:?}",
+            other.data_type()
         ))),
     }
 }
@@ -650,7 +671,8 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
             | BinaryOp::Overlap
             | BinaryOp::JsonHasKey
             | BinaryOp::JsonHasAnyKey
-            | BinaryOp::JsonHasAllKeys => return Ok(Value::Null),
+            | BinaryOp::JsonHasAllKeys
+            | BinaryOp::TextSearchMatch => return Ok(Value::Null),
             // AND/OR handled in eval_and/eval_or and never reach here.
             BinaryOp::And | BinaryOp::Or => {
                 unreachable!("AND/OR handled in short-circuit paths")
@@ -731,23 +753,22 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
         | BinaryOp::RegexNotMatch
         | BinaryOp::RegexNotIMatch => Err(EvalError::Unsupported("regex operators")),
 
-        BinaryOp::JsonGet
-        | BinaryOp::JsonGetText
-        | BinaryOp::JsonGetPath
-        | BinaryOp::JsonGetPathText
-        | BinaryOp::JsonHasKey
-        | BinaryOp::JsonHasAnyKey
-        | BinaryOp::JsonHasAllKeys => Err(EvalError::Unsupported("JSON operators")),
+        BinaryOp::JsonGet | BinaryOp::JsonGetPath => json_get(&lv, &rv, false),
+        BinaryOp::JsonGetText | BinaryOp::JsonGetPathText => json_get(&lv, &rv, true),
+        BinaryOp::JsonHasKey => json_has_key(&lv, &rv).map(Value::Bool),
+        BinaryOp::JsonHasAnyKey => json_has_key_set(&lv, &rv, false).map(Value::Bool),
+        BinaryOp::JsonHasAllKeys => json_has_key_set(&lv, &rv, true).map(Value::Bool),
 
         BinaryOp::JsonContains => contains_values(&lv, &rv)
             .map(Value::Bool)
-            .ok_or(EvalError::Unsupported("JSON operators")),
+            .ok_or_else(|| EvalError::Type(format!("@> not defined for {lv:?} and {rv:?}"))),
         BinaryOp::JsonContained => contains_values(&rv, &lv)
             .map(Value::Bool)
-            .ok_or(EvalError::Unsupported("JSON operators")),
+            .ok_or_else(|| EvalError::Type(format!("<@ not defined for {lv:?} and {rv:?}"))),
         BinaryOp::Overlap => overlaps_values(&lv, &rv)
             .map(Value::Bool)
             .ok_or_else(|| EvalError::Type(format!("&& not defined for {lv:?} and {rv:?}"))),
+        BinaryOp::TextSearchMatch => text_search_match(&lv, &rv).map(Value::Bool),
 
         // AND / OR are handled above; unreachable here.
         BinaryOp::And | BinaryOp::Or => {
@@ -756,10 +777,40 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
     }
 }
 
+fn text_search_match(left: &Value, right: &Value) -> Result<bool, EvalError> {
+    let Value::Text(document) = left else {
+        return Err(EvalError::Type(format!(
+            "@@ requires text-backed TSVECTOR, got {:?}",
+            left.data_type()
+        )));
+    };
+    let Value::Text(query) = right else {
+        return Err(EvalError::Type(format!(
+            "@@ requires text-backed TSQUERY, got {:?}",
+            right.data_type()
+        )));
+    };
+    let doc_terms = text_search_terms(document);
+    let query_terms = text_search_terms(query);
+    Ok(query_terms.iter().all(|term| doc_terms.contains(term)))
+}
+
+fn text_search_terms(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 fn overlaps_values(left: &Value, right: &Value) -> Option<bool> {
     match (left, right) {
         (Value::Range(l), Value::Range(r)) => Some(l.overlaps(r)),
         (Value::Geometry(l), Value::Geometry(r)) => Some(l.overlaps(r)),
+        (Value::Text(l), Value::Text(r)) => {
+            let left = text_collection_values(l);
+            let right = text_collection_values(r);
+            Some(left.iter().any(|v| right.contains(v)))
+        }
         _ => None,
     }
 }
@@ -768,8 +819,165 @@ fn contains_values(left: &Value, right: &Value) -> Option<bool> {
     match (left, right) {
         (Value::Range(l), Value::Range(r)) => Some(l.contains_range(r)),
         (Value::Geometry(l), Value::Geometry(r)) => Some(l.contains_geometry(r)),
+        (Value::Text(l), Value::Text(r)) => Some(text_contains(l, r)),
         _ => None,
     }
+}
+
+fn json_get(left: &Value, right: &Value, as_text: bool) -> Result<Value, EvalError> {
+    let Value::Text(json) = left else {
+        return Err(EvalError::Type(format!(
+            "JSON access requires text-backed JSONB, got {:?}",
+            left.data_type()
+        )));
+    };
+    let key = json_key_text(right)?;
+    let Some(value) = json_object_value(json, &key) else {
+        return Ok(Value::Null);
+    };
+    if as_text {
+        Ok(Value::Text(unquote_json_scalar(value).to_owned()))
+    } else {
+        Ok(Value::Text(value.to_owned()))
+    }
+}
+
+fn json_has_key(left: &Value, right: &Value) -> Result<bool, EvalError> {
+    let Value::Text(json) = left else {
+        return Err(EvalError::Type(format!(
+            "? requires text-backed JSONB, got {:?}",
+            left.data_type()
+        )));
+    };
+    let key = json_key_text(right)?;
+    Ok(json_object_value(json, &key).is_some())
+}
+
+fn json_has_key_set(left: &Value, right: &Value, require_all: bool) -> Result<bool, EvalError> {
+    let keys = match right {
+        Value::Text(text) => text_collection_values(text),
+        Value::Null => return Ok(false),
+        other => {
+            return Err(EvalError::Type(format!(
+                "?|/?& requires text array keys, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    if require_all {
+        for key in keys {
+            if !json_has_key(left, &Value::Text(key))? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    } else {
+        for key in keys {
+            if json_has_key(left, &Value::Text(key))? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+fn json_key_text(value: &Value) -> Result<String, EvalError> {
+    match value {
+        Value::Text(s) => Ok(s.clone()),
+        Value::Int16(v) => Ok(v.to_string()),
+        Value::Int32(v) => Ok(v.to_string()),
+        Value::Int64(v) => Ok(v.to_string()),
+        Value::Null => Err(EvalError::Type("JSON key cannot be NULL".to_owned())),
+        other => Err(EvalError::Type(format!(
+            "JSON key must be text or integer, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn text_contains(left: &str, right: &str) -> bool {
+    if looks_like_json_object(left) && looks_like_json_object(right) {
+        return json_object_pairs(right)
+            .iter()
+            .all(|(key, value)| json_object_value(left, key).is_some_and(|v| v == *value));
+    }
+    let left_values = text_collection_values(left);
+    let right_values = text_collection_values(right);
+    right_values.iter().all(|v| left_values.contains(v))
+}
+
+fn text_collection_values(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    let inner = if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        &trimmed[1..trimmed.len().saturating_sub(1)]
+    } else {
+        trimmed
+    };
+    split_loose_list(inner)
+        .into_iter()
+        .map(|item| unquote_json_scalar(item.trim()).to_owned())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+fn looks_like_json_object(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with('{') && trimmed.ends_with('}') && trimmed.contains(':')
+}
+
+fn json_object_pairs(text: &str) -> Vec<(String, &str)> {
+    let trimmed = text.trim();
+    if !looks_like_json_object(trimmed) {
+        return Vec::new();
+    }
+    let inner = &trimmed[1..trimmed.len().saturating_sub(1)];
+    split_loose_list(inner)
+        .into_iter()
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once(':')?;
+            Some((unquote_json_scalar(key.trim()).to_owned(), value.trim()))
+        })
+        .collect()
+}
+
+fn json_object_value<'a>(text: &'a str, wanted: &str) -> Option<&'a str> {
+    json_object_pairs(text)
+        .into_iter()
+        .find_map(|(key, value)| if key == wanted { Some(value) } else { None })
+}
+
+fn split_loose_list(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (idx, ch) in text.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escape = true,
+            '"' => in_string = !in_string,
+            ',' if !in_string => {
+                out.push(&text[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&text[start..]);
+    out
+}
+
+fn unquote_json_scalar(text: &str) -> &str {
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1503,6 +1711,54 @@ mod tests {
     fn literal_returns_its_value() {
         let ev = Eval::new(lit_i32(42));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Int32(42));
+    }
+
+    #[test]
+    fn jsonb_contains_and_key_ops_evaluate() {
+        let doc = lit_text(r#"{"a":1,"b":"two"}"#);
+        let contains = Eval::new(binop(
+            BinaryOp::JsonContains,
+            doc.clone(),
+            lit_text(r#"{"a":1}"#),
+        ));
+        assert_eq!(contains.eval(&[]).unwrap(), Value::Bool(true));
+
+        let has_key = Eval::new(binop(BinaryOp::JsonHasKey, doc.clone(), lit_text("b")));
+        assert_eq!(has_key.eval(&[]).unwrap(), Value::Bool(true));
+
+        let has_all = Eval::new(binop(
+            BinaryOp::JsonHasAllKeys,
+            doc,
+            lit_text(r#"["a","b"]"#),
+        ));
+        assert_eq!(has_all.eval(&[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn array_contains_and_overlap_evaluate() {
+        let contains = Eval::new(binop(
+            BinaryOp::JsonContains,
+            lit_text("{red,green,blue}"),
+            lit_text("{red,blue}"),
+        ));
+        assert_eq!(contains.eval(&[]).unwrap(), Value::Bool(true));
+
+        let overlaps = Eval::new(binop(
+            BinaryOp::Overlap,
+            lit_text("{red,green}"),
+            lit_text("{yellow,green}"),
+        ));
+        assert_eq!(overlaps.eval(&[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn tsvector_match_evaluates() {
+        let ev = Eval::new(binop(
+            BinaryOp::TextSearchMatch,
+            lit_text("quick brown fox"),
+            lit_text("quick & fox"),
+        ));
+        assert_eq!(ev.eval(&[]).unwrap(), Value::Bool(true));
     }
 
     // -----------------------------------------------------------------------

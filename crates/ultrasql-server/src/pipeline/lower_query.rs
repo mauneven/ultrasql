@@ -31,6 +31,7 @@ pub fn lower_query(
     plan: &LogicalPlan,
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
+    tracing::debug!(pipeline_mode = ?plan.pipeline_mode(), "lower logical pipeline");
     match plan {
         LogicalPlan::Scan {
             table, projection, ..

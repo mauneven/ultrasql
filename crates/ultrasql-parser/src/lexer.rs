@@ -621,6 +621,7 @@ impl<'src> Lexer<'src> {
             (b'-', Some(b'>'), _) => two(self, TokenKind::Arrow),
             (b'#', Some(b'>'), _) => two(self, TokenKind::HashArrow),
             (b'@', Some(b'>'), _) => two(self, TokenKind::AtArrow),
+            (b'@', Some(b'@'), _) => two(self, TokenKind::AtAt),
             (b'<', Some(b'@'), _) => two(self, TokenKind::ArrowAt),
             (b'&', Some(b'&'), _) => two(self, TokenKind::Overlap),
             (b':', Some(b':'), _) => two(self, TokenKind::ColonColon),

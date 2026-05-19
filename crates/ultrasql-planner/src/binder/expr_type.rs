@@ -121,7 +121,8 @@ pub(super) fn binary_result_type(
         | BinaryOp::Overlap
         | BinaryOp::JsonHasKey
         | BinaryOp::JsonHasAnyKey
-        | BinaryOp::JsonHasAllKeys => Ok(DataType::Bool),
+        | BinaryOp::JsonHasAllKeys
+        | BinaryOp::TextSearchMatch => Ok(DataType::Bool),
     }
 }
 
@@ -243,5 +244,6 @@ pub(super) const fn display_binary(op: BinaryOp) -> &'static str {
         BinaryOp::JsonHasKey => "?",
         BinaryOp::JsonHasAnyKey => "?|",
         BinaryOp::JsonHasAllKeys => "?&",
+        BinaryOp::TextSearchMatch => "@@",
     }
 }

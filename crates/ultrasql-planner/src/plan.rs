@@ -96,6 +96,19 @@ pub enum LogicalIndexMethod {
     Brin,
 }
 
+/// Planner-selected execution family for a logical pipeline.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PipelineMode {
+    /// Row-at-a-time OLTP path. Used for writes, session control, and
+    /// small scalar sources where vector startup would not pay.
+    #[default]
+    ScalarOltp,
+    /// Batch/vector OLAP path. Used for scan/filter/project/join/
+    /// aggregate/sort/window plans that can consume 4096-row batches and
+    /// dispatch SIMD/JIT kernels inside operators.
+    VectorizedOlap,
+}
+
 // ============================================================================
 // Aggregate types
 // ============================================================================
@@ -1158,7 +1171,7 @@ pub enum CopyDirection {
 
 /// COPY source / sink, mirrored from
 /// [`ultrasql_parser::ast::CopySource`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopySource {
     /// `STDIN` — client streams `CopyData` frames in.
     Stdin,
@@ -1278,6 +1291,103 @@ pub enum LogicalAlterTableAction {
 }
 
 impl LogicalPlan {
+    /// Return the planner's coarse execution-family tag for this plan.
+    #[must_use]
+    pub fn pipeline_mode(&self) -> PipelineMode {
+        if self.is_mutation_or_control() {
+            PipelineMode::ScalarOltp
+        } else if self.has_batch_pipeline() {
+            PipelineMode::VectorizedOlap
+        } else {
+            PipelineMode::ScalarOltp
+        }
+    }
+
+    fn is_mutation_or_control(&self) -> bool {
+        matches!(
+            self,
+            Self::Insert { .. }
+                | Self::Update { .. }
+                | Self::Delete { .. }
+                | Self::Truncate { .. }
+                | Self::CreateTable { .. }
+                | Self::CreateIndex { .. }
+                | Self::DropTable { .. }
+                | Self::AlterTable { .. }
+                | Self::CreateSequence { .. }
+                | Self::AlterSequence { .. }
+                | Self::DropSequence { .. }
+                | Self::Comment { .. }
+                | Self::Begin { .. }
+                | Self::Commit { .. }
+                | Self::Rollback { .. }
+                | Self::Savepoint { .. }
+                | Self::RollbackToSavepoint { .. }
+                | Self::ReleaseSavepoint { .. }
+                | Self::PrepareTransaction { .. }
+                | Self::CommitPrepared { .. }
+                | Self::RollbackPrepared { .. }
+                | Self::SetTransaction { .. }
+                | Self::SetVariable { .. }
+                | Self::Listen { .. }
+                | Self::Notify { .. }
+                | Self::Unlisten { .. }
+                | Self::Copy { .. }
+                | Self::Explain { .. }
+        )
+    }
+
+    fn has_batch_pipeline(&self) -> bool {
+        match self {
+            Self::Scan { .. }
+            | Self::Sort { .. }
+            | Self::Window { .. }
+            | Self::Aggregate { .. }
+            | Self::Join { .. }
+            | Self::SetOp { .. }
+            | Self::LockRows { .. } => true,
+            Self::Filter { input, .. }
+            | Self::Project { input, .. }
+            | Self::Limit { input, .. } => input.has_batch_pipeline(),
+            Self::Cte {
+                definition, body, ..
+            } => definition.has_batch_pipeline() || body.has_batch_pipeline(),
+            Self::Insert { source, .. } => source.has_batch_pipeline(),
+            Self::Update { input, .. } | Self::Delete { input, .. } => input.has_batch_pipeline(),
+            Self::Explain { input: plan, .. }
+            | Self::Copy {
+                input: Some(plan), ..
+            } => plan.has_batch_pipeline(),
+            Self::Empty { .. }
+            | Self::Values { .. }
+            | Self::FunctionScan { .. }
+            | Self::Truncate { .. }
+            | Self::CreateTable { .. }
+            | Self::CreateIndex { .. }
+            | Self::DropTable { .. }
+            | Self::AlterTable { .. }
+            | Self::CreateSequence { .. }
+            | Self::AlterSequence { .. }
+            | Self::DropSequence { .. }
+            | Self::Comment { .. }
+            | Self::Begin { .. }
+            | Self::Commit { .. }
+            | Self::Rollback { .. }
+            | Self::Savepoint { .. }
+            | Self::RollbackToSavepoint { .. }
+            | Self::ReleaseSavepoint { .. }
+            | Self::PrepareTransaction { .. }
+            | Self::CommitPrepared { .. }
+            | Self::RollbackPrepared { .. }
+            | Self::SetTransaction { .. }
+            | Self::SetVariable { .. }
+            | Self::Listen { .. }
+            | Self::Notify { .. }
+            | Self::Unlisten { .. }
+            | Self::Copy { input: None, .. } => false,
+        }
+    }
+
     /// The schema of rows produced by this plan node.
     #[must_use]
     pub fn schema(&self) -> &Schema {

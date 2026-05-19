@@ -63,6 +63,7 @@ type FilterSumI64GtFn = unsafe extern "C" fn(*const i64, usize, i64) -> i64;
 
 static FILTER_SUM_I32_GT: OnceLock<Option<FilterSumI32GtFn>> = OnceLock::new();
 static FILTER_SUM_I64_GT: OnceLock<Option<FilterSumI64GtFn>> = OnceLock::new();
+static FILTER_SUM_ABS_I64_GT: OnceLock<Option<FilterSumI64GtFn>> = OnceLock::new();
 
 /// Run the Cranelift-compiled `SUM(i32) WHERE i32 > threshold` kernel.
 ///
@@ -89,6 +90,19 @@ pub fn filter_sum_i64_gt_jit(data: &[i64], threshold: i64) -> Option<i64> {
     // `extern "C" fn(*const i64, usize, i64) -> i64`; `data.as_ptr()`
     // is valid for `data.len()` contiguous `i64` reads for the duration
     // of the call, and the JIT code never writes through the pointer.
+    Some(unsafe { func(data.as_ptr(), data.len(), threshold) })
+}
+
+/// Run the Cranelift-compiled `SUM(abs(i64)) WHERE abs(i64) > threshold` kernel.
+///
+/// This is the first JIT path that inlines a SQL builtin function body.
+/// The generated code lowers `abs()` to compare/select arithmetic in the
+/// loop instead of calling back into the interpreter.
+#[must_use]
+pub fn filter_sum_abs_i64_gt_jit(data: &[i64], threshold: i64) -> Option<i64> {
+    let func = (*FILTER_SUM_ABS_I64_GT.get_or_init(build_filter_sum_abs_i64_gt))?;
+    // SAFETY: `func` has ABI `extern "C" fn(*const i64, usize, i64) -> i64`;
+    // `data` is valid for `len` reads and the generated code never writes.
     Some(unsafe { func(data.as_ptr(), data.len(), threshold) })
 }
 
@@ -276,6 +290,100 @@ fn build_filter_sum_i64_gt() -> Option<FilterSumI64GtFn> {
     Some(unsafe { std::mem::transmute::<*const u8, FilterSumI64GtFn>(code) })
 }
 
+fn build_filter_sum_abs_i64_gt() -> Option<FilterSumI64GtFn> {
+    let mut flag_builder = settings::builder();
+    flag_builder.set("use_colocated_libcalls", "false").ok()?;
+    flag_builder.set("is_pic", "false").ok()?;
+    let isa_builder = cranelift_native::builder().ok()?;
+    let isa = isa_builder
+        .finish(settings::Flags::new(flag_builder))
+        .ok()?;
+    let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
+    let ptr_ty = module.target_config().pointer_type();
+
+    let sig = Signature {
+        params: vec![
+            AbiParam::new(ptr_ty),
+            AbiParam::new(ptr_ty),
+            AbiParam::new(types::I64),
+        ],
+        returns: vec![AbiParam::new(types::I64)],
+        call_conv: CallConv::triple_default(module.isa().triple()),
+    };
+    let func_id = module
+        .declare_function("ultrasql_filter_sum_abs_i64_gt", Linkage::Local, &sig)
+        .ok()?;
+
+    let mut ctx = Context::new();
+    ctx.func = Function::with_name_signature(UserFuncName::user(2, func_id.as_u32()), sig);
+    let mut func_ctx = FunctionBuilderContext::new();
+    {
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+        let entry = b.create_block();
+        let header = b.create_block();
+        let body = b.create_block();
+        let exit = b.create_block();
+
+        b.append_block_params_for_function_params(entry);
+        b.append_block_param(header, ptr_ty);
+        b.append_block_param(header, types::I64);
+        b.append_block_param(body, ptr_ty);
+        b.append_block_param(body, types::I64);
+        b.append_block_param(exit, types::I64);
+
+        b.switch_to_block(entry);
+        let data = b.block_params(entry)[0];
+        let len = b.block_params(entry)[1];
+        let threshold = b.block_params(entry)[2];
+        let zero_idx = b.ins().iconst(ptr_ty, 0);
+        let zero_sum = b.ins().iconst(types::I64, 0);
+        b.ins().jump(header, &[zero_idx.into(), zero_sum.into()]);
+
+        b.switch_to_block(header);
+        let idx = b.block_params(header)[0];
+        let sum = b.block_params(header)[1];
+        let in_bounds = b.ins().icmp(IntCC::UnsignedLessThan, idx, len);
+        b.ins().brif(
+            in_bounds,
+            body,
+            &[idx.into(), sum.into()],
+            exit,
+            &[sum.into()],
+        );
+
+        b.switch_to_block(body);
+        let idx = b.block_params(body)[0];
+        let sum = b.block_params(body)[1];
+        let byte_off = b.ins().imul_imm(idx, 8);
+        let addr = b.ins().iadd(data, byte_off);
+        let value = b.ins().load(types::I64, MemFlags::trusted(), addr, 0);
+        let zero = b.ins().iconst(types::I64, 0);
+        let neg = b.ins().isub(zero, value);
+        let is_neg = b.ins().icmp(IntCC::SignedLessThan, value, zero);
+        let abs_value = b.ins().select(is_neg, neg, value);
+        let pred = b.ins().icmp(IntCC::SignedGreaterThan, abs_value, threshold);
+        let added = b.ins().iadd(sum, abs_value);
+        let new_sum = b.ins().select(pred, added, sum);
+        let one = b.ins().iconst(ptr_ty, 1);
+        let next_idx = b.ins().iadd(idx, one);
+        b.ins().jump(header, &[next_idx.into(), new_sum.into()]);
+
+        b.switch_to_block(exit);
+        let final_sum = b.block_params(exit)[0];
+        b.ins().return_(&[final_sum]);
+        b.seal_all_blocks();
+        b.finalize();
+    }
+
+    module.define_function(func_id, &mut ctx).ok()?;
+    module.finalize_definitions().ok()?;
+    let code = module.get_finalized_function(func_id);
+    let _leaked = Box::leak(Box::new(module));
+    // SAFETY: Cranelift emitted code for the exact `FilterSumI64GtFn`
+    // signature declared above. The leaked module keeps the code page alive.
+    Some(unsafe { std::mem::transmute::<*const u8, FilterSumI64GtFn>(code) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +398,13 @@ mod tests {
         data.iter()
             .filter(|&&v| v > threshold)
             .fold(0_i64, |acc, &v| acc.wrapping_add(v))
+    }
+
+    fn scalar_abs_i64(data: &[i64], threshold: i64) -> i64 {
+        data.iter()
+            .map(|&v| v.checked_abs().unwrap_or(i64::MIN))
+            .filter(|&v| v > threshold)
+            .fold(0_i64, |acc, v| acc.wrapping_add(v))
     }
 
     #[test]
@@ -318,6 +433,26 @@ mod tests {
                 return;
             };
             assert_eq!(got, scalar_i64(&data, threshold), "threshold {threshold}");
+        }
+    }
+
+    #[test]
+    fn jit_filter_sum_abs_i64_gt_matches_scalar() {
+        let data: Vec<i64> = (-257..4099)
+            .map(|v| {
+                let v = i64::from(v);
+                if v % 17 == 0 { -v * 11 } else { v * 7 }
+            })
+            .collect();
+        for threshold in [0, 127, 4096, 20_000] {
+            let Some(got) = filter_sum_abs_i64_gt_jit(&data, threshold) else {
+                return;
+            };
+            assert_eq!(
+                got,
+                scalar_abs_i64(&data, threshold),
+                "threshold {threshold}"
+            );
         }
     }
 

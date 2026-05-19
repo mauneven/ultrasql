@@ -1011,7 +1011,10 @@ async fn run(cli: Cli) -> Result<()> {
         let receiver = WalReceiver::new(source);
         let copied = receiver.receive_once(&cli.data_dir.join("pg_wal"))?;
         fs::write(cli.data_dir.join("standby.signal"), b"standby\n")?;
-        println!("received {copied} WAL file(s) into {}", cli.data_dir.join("pg_wal").display());
+        println!(
+            "received {copied} WAL file(s) into {}",
+            cli.data_dir.join("pg_wal").display()
+        );
         return Ok(());
     }
 
@@ -1165,9 +1168,7 @@ async fn check_http_ready(endpoint: &str) -> Result<bool> {
     let mut stream = tokio::net::TcpStream::connect(host_port)
         .await
         .with_context(|| format!("{host_port} - no response"))?;
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nhost: {host_port}\r\nconnection: close\r\n\r\n"
-    );
+    let request = format!("GET {path} HTTP/1.1\r\nhost: {host_port}\r\nconnection: close\r\n\r\n");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     stream.write_all(request.as_bytes()).await?;
     let mut response = Vec::new();
@@ -1176,7 +1177,8 @@ async fn check_http_ready(endpoint: &str) -> Result<bool> {
 }
 
 fn run_waldump(path: &PathBuf) -> Result<()> {
-    let bytes = fs::read(path).with_context(|| format!("cannot read WAL file: {}", path.display()))?;
+    let bytes =
+        fs::read(path).with_context(|| format!("cannot read WAL file: {}", path.display()))?;
     println!("file: {}", path.display());
     println!("bytes: {}", bytes.len());
     for (offset, chunk) in bytes.chunks(32).enumerate() {
@@ -1212,7 +1214,11 @@ fn run_basebackup(data_dir: &PathBuf, dest: &PathBuf) -> Result<()> {
     }
     text.push_str("  ]\n}\n");
     fs::write(dest.join("backup_manifest.json"), text)?;
-    println!("base backup copied {} files to {}", manifest.len(), dest.display());
+    println!(
+        "base backup copied {} files to {}",
+        manifest.len(),
+        dest.display()
+    );
     Ok(())
 }
 
@@ -1231,7 +1237,10 @@ fn run_pg_dump(data_dir: &Path, dest: &Path, format: DumpFormat) -> Result<()> {
                 &mut manifest,
             )?;
             manifest.sort_by(|a, b| a.0.cmp(&b.0));
-            fs::write(dest.join("ultrasql_dump.manifest"), dump_manifest_text(&manifest))?;
+            fs::write(
+                dest.join("ultrasql_dump.manifest"),
+                dump_manifest_text(&manifest),
+            )?;
             println!(
                 "directory dump wrote {} files to {}",
                 manifest.len(),
@@ -1424,7 +1433,7 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn run_archive_wal(wal_path: &PathBuf, archive_dir: &PathBuf) -> Result<()> {
+fn run_archive_wal(wal_path: &Path, archive_dir: &Path) -> Result<()> {
     fs::create_dir_all(archive_dir)?;
     let name = wal_path
         .file_name()
@@ -1435,7 +1444,7 @@ fn run_archive_wal(wal_path: &PathBuf, archive_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_restore_wal(wal_name: &str, archive_dir: &PathBuf, output: &PathBuf) -> Result<()> {
+fn run_restore_wal(wal_name: &str, archive_dir: &Path, output: &Path) -> Result<()> {
     let source = archive_dir.join(wal_name);
     fs::copy(&source, output)
         .with_context(|| format!("restore WAL {} to {}", source.display(), output.display()))?;
@@ -1459,7 +1468,10 @@ async fn run_ctl(
                 data_dir.join("ultrasql.control"),
                 format!("version={}\nstate=initialized\n", env!("CARGO_PKG_VERSION")),
             )?;
-            println!("initialized UltraSQL data directory at {}", data_dir.display());
+            println!(
+                "initialized UltraSQL data directory at {}",
+                data_dir.display()
+            );
         }
         CtlCommand::Start => {
             println!(
@@ -1489,7 +1501,10 @@ async fn run_ctl(
             fs::write(data_dir.join("recovery.signal"), b"recovery\n")?;
             let mut conf = String::new();
             if let Some(value) = &targets.time {
-                conf.push_str(&format!("recovery_target_time = '{}'\n", escape_conf(value)));
+                conf.push_str(&format!(
+                    "recovery_target_time = '{}'\n",
+                    escape_conf(value)
+                ));
             }
             if let Some(value) = &targets.lsn {
                 conf.push_str(&format!("recovery_target_lsn = '{}'\n", escape_conf(value)));

@@ -18,7 +18,8 @@ SUMMARY_OUT="$OUT_DIR/tpcb_certification.json"
 
 mkdir -p "$RAW_DIR"
 
-cargo build --release --package ultrasql-bench --bin regression-gate >/dev/null
+CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
+    cargo build --release --package ultrasql-bench --bin regression-gate >/dev/null
 
 target/release/regression-gate --stage v0_9 --smoke \
     > "$RAW_DIR/tpcb_32conn-ultrasql-kernel.json" 2>&1 || true

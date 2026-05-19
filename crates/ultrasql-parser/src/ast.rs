@@ -219,7 +219,7 @@ pub enum CopyDirection {
 }
 
 /// Source / sink for a `COPY` statement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopySource {
     /// `STDIN` — the client streams `CopyData` frames to the server.
     Stdin,
@@ -1784,6 +1784,8 @@ pub enum BinaryOp {
     JsonHasAnyKey,
     /// `?&` — JSONB has all of the given keys.
     JsonHasAllKeys,
+    /// `@@` — TSVECTOR matches TSQUERY.
+    TextSearchMatch,
     /// `&&` — range/geometric overlap.
     Overlap,
 }
@@ -1838,6 +1840,7 @@ impl BinaryOp {
             | Self::JsonHasKey
             | Self::JsonHasAnyKey
             | Self::JsonHasAllKeys
+            | Self::TextSearchMatch
             | Self::Concat
             | Self::BitAnd
             | Self::BitOr

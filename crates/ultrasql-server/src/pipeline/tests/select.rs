@@ -391,7 +391,7 @@ pub(super) fn build_index_fixture(
     with_index: bool,
 ) -> (IndexFixture, ultrasql_catalog::TableEntry, Vec<TupleId>) {
     let catalog = StdArc::new(PersistentCatalog::new());
-    let pool = StdArc::new(BufferPool::new(64, BlankPageLoader));
+    let pool = StdArc::new(BufferPool::new(64, BlankPageLoader::new()));
     let heap = StdArc::new(HeapAccess::new(StdArc::clone(&pool)));
     let vm = StdArc::new(ultrasql_storage::vm::VisibilityMap::new());
     let txn_manager = StdArc::new(TransactionManager::new());

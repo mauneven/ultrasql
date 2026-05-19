@@ -327,10 +327,10 @@ pub fn copy_out_response(n_columns: usize) -> BackendMessage {
 }
 
 #[must_use]
-pub fn copy_out_response_with_format(n_columns: usize, format_code: u16) -> BackendMessage {
+pub fn copy_out_response_with_format(n_columns: usize, format_code: u8) -> BackendMessage {
     BackendMessage::CopyOutResponse {
         overall_format: format_code,
-        column_formats: vec![format_code; n_columns],
+        column_formats: vec![u16::from(format_code); n_columns],
     }
 }
 
@@ -343,10 +343,10 @@ pub fn copy_in_response(n_columns: usize) -> BackendMessage {
 }
 
 #[must_use]
-pub fn copy_in_response_with_format(n_columns: usize, format_code: u16) -> BackendMessage {
+pub fn copy_in_response_with_format(n_columns: usize, format_code: u8) -> BackendMessage {
     BackendMessage::CopyInResponse {
         overall_format: format_code,
-        column_formats: vec![format_code; n_columns],
+        column_formats: vec![u16::from(format_code); n_columns],
     }
 }
 

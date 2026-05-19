@@ -1420,7 +1420,9 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
         let schema = input.schema().clone();
         let direction = match s.direction {
             AstCopyDirection::From => {
-                return Err(PlanError::NotSupported("COPY (SELECT ...) supports TO only"));
+                return Err(PlanError::NotSupported(
+                    "COPY (SELECT ...) supports TO only",
+                ));
             }
             AstCopyDirection::To => CopyDirection::To,
         };
@@ -1428,7 +1430,9 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
             AstCopySource::Stdout => CopySource::Stdout,
             AstCopySource::File(path) => CopySource::File(path.clone()),
             AstCopySource::Stdin => {
-                return Err(PlanError::NotSupported("COPY query target cannot use STDIN"));
+                return Err(PlanError::NotSupported(
+                    "COPY query target cannot use STDIN",
+                ));
             }
         };
         let format = match s.format {
@@ -1463,10 +1467,9 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
         });
     }
 
-    let table_name = s
-        .table
-        .as_ref()
-        .ok_or(PlanError::NotSupported("COPY requires table or query target"))?;
+    let table_name = s.table.as_ref().ok_or(PlanError::NotSupported(
+        "COPY requires table or query target",
+    ))?;
     let relation = object_name_simple(table_name);
     let table_meta = catalog
         .lookup_table(&relation)

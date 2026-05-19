@@ -622,6 +622,14 @@ fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> Scala
                 data_type: DataType::Interval,
             },
         },
+        "json" | "jsonb" => ScalarExpr::Literal {
+            value: Value::Text(value.to_owned()),
+            data_type: DataType::Jsonb,
+        },
+        "tsvector" | "tsquery" => ScalarExpr::Literal {
+            value: Value::Text(value.to_owned()),
+            data_type: DataType::Text { max_len: None },
+        },
         _ => ScalarExpr::Literal {
             value: Value::Null,
             data_type: DataType::Null,
@@ -867,6 +875,7 @@ fn literal_numeric_as_f64(value: &Value) -> Option<f64> {
 fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
     match func_name {
         "extract" => Ok(DataType::Int64),
+        "abs" => Ok(DataType::Int64),
         "lower" | "upper" => Ok(DataType::Text { max_len: None }),
         "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
         "substring" => Ok(DataType::Text { max_len: None }),
@@ -882,7 +891,7 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
 pub(super) fn is_supported_builtin(func_name: &str) -> bool {
     matches!(
         func_name,
-        "extract" | "lower" | "upper" | "pg_get_userbyid" | "substring"
+        "abs" | "extract" | "lower" | "upper" | "pg_get_userbyid" | "substring"
     )
 }
 
@@ -1201,6 +1210,8 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "time" => Some(DataType::Time),
         "timestamp" => Some(DataType::Timestamp),
         "timestamptz" => Some(DataType::TimestampTz),
+        "json" | "jsonb" => Some(DataType::Jsonb),
+        "tsvector" | "tsquery" => Some(DataType::Text { max_len: None }),
         "numeric" | "decimal" => Some(DataType::Decimal {
             precision: None,
             scale: Some(0),

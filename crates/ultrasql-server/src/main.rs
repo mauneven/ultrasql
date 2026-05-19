@@ -16,7 +16,7 @@ use std::sync::Arc;
 use clap::{Parser, ValueEnum};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tracing::error;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use ultrasql_server::{Server, run_server};
 
@@ -148,7 +148,8 @@ fn main() -> std::process::ExitCode {
             let autovacuum_state = Arc::clone(&state);
             let interval_ms = cli.autovacuum_interval_ms;
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_millis(interval_ms));
                 loop {
                     ticker.tick().await;
                     autovacuum_state.run_autovacuum_cycle();
