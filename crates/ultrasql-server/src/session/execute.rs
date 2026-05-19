@@ -116,11 +116,26 @@ where
         // Each shim short-circuits before the parser to avoid forcing
         // every layer to grow new exhaustive arms today.
         let trimmed = sql.trim_start();
+        let _query_span = tracing::info_span!(
+            "sql.query",
+            bytes = sql.len(),
+            standby = self.state.is_standby_mode()
+        )
+        .entered();
+        if let Some(function_name) = Self::try_parse_backup_function(trimmed) {
+            return self.execute_backup_function(function_name);
+        }
+        if self.state.is_standby_mode() && !Self::hot_standby_allows(trimmed) {
+            return Err(ServerError::Unsupported("hot standby is read-only"));
+        }
         if let Some(table) = self.try_parse_analyze_target(trimmed) {
             return self.execute_analyze(table.as_deref());
         }
         if let Some(table) = self.try_parse_vacuum_target(trimmed) {
             return self.execute_vacuum(table.as_deref());
+        }
+        if let Some(tag) = Self::try_parse_logical_replication_ddl(trimmed) {
+            return Ok(run_ddl_command(tag));
         }
 
         if let Some(spec) = Self::try_parse_create_statistics(trimmed)? {
@@ -402,6 +417,7 @@ where
                 self.jit_above_rows = ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS;
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
+            "synchronous_commit" => Ok(result_encoder::run_ddl_command("RESET")),
             _ => Err(ServerError::Unsupported("unsupported runtime parameter")),
         }
     }
@@ -419,6 +435,10 @@ where
                 self.jit_above_rows = parsed;
                 Ok(())
             }
+            "synchronous_commit" => match value.to_ascii_lowercase().as_str() {
+                "on" | "off" | "local" | "remote_write" | "remote_apply" => Ok(()),
+                _ => Err(ServerError::Unsupported("invalid synchronous_commit")),
+            },
             _ => Err(ServerError::Unsupported("unsupported runtime parameter")),
         }
     }
@@ -437,6 +457,7 @@ where
                 }
             }
             "jit_above_cost" => self.jit_above_rows.to_string(),
+            "synchronous_commit" => "on".to_owned(),
             _ => return Err(ServerError::Unsupported("unsupported runtime parameter")),
         };
         let mut messages = Vec::with_capacity(3);
@@ -693,6 +714,8 @@ where
         plan: &LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
     ) -> Result<SelectResult, ServerError> {
+        let _operator_span =
+            tracing::debug_span!("sql.operator", plan = ?std::mem::discriminant(plan)).entered();
         // The cached `(Int32, Int32)` full-scan fast path is already
         // answered from the version-stamped column cache and does not
         // consult txn-local visibility state. In autocommit `Idle`
@@ -1259,6 +1282,98 @@ where
             }
         }
         err
+    }
+
+    fn try_parse_logical_replication_ddl(trimmed_sql: &str) -> Option<&'static str> {
+        let normalized = trimmed_sql
+            .split_whitespace()
+            .take(3)
+            .map(str::to_ascii_uppercase)
+            .collect::<Vec<_>>();
+        match normalized.as_slice() {
+            [first, second, ..] if first == "CREATE" && second == "PUBLICATION" => {
+                Some("CREATE PUBLICATION")
+            }
+            [first, second, ..] if first == "DROP" && second == "PUBLICATION" => {
+                Some("DROP PUBLICATION")
+            }
+            [first, second, ..] if first == "CREATE" && second == "SUBSCRIPTION" => {
+                Some("CREATE SUBSCRIPTION")
+            }
+            [first, second, ..] if first == "DROP" && second == "SUBSCRIPTION" => {
+                Some("DROP SUBSCRIPTION")
+            }
+            _ => None,
+        }
+    }
+
+    fn try_parse_backup_function(trimmed_sql: &str) -> Option<&'static str> {
+        let normalized = trimmed_sql
+            .trim_end_matches(';')
+            .trim()
+            .to_ascii_lowercase();
+        if normalized.starts_with("select pg_start_backup(")
+            || normalized.starts_with("select pg_backup_start(")
+        {
+            return Some("pg_start_backup");
+        }
+        if normalized == "select pg_stop_backup()"
+            || normalized == "select pg_backup_stop()"
+            || normalized.starts_with("select pg_stop_backup(")
+            || normalized.starts_with("select pg_backup_stop(")
+        {
+            return Some("pg_stop_backup");
+        }
+        None
+    }
+
+    fn execute_backup_function(
+        &self,
+        function_name: &'static str,
+    ) -> Result<SelectResult, ServerError> {
+        let lsn = self.state.record_backup_marker(function_name)?;
+        Ok(Self::single_text_select(function_name, &lsn))
+    }
+
+    fn single_text_select(name: &str, value: &str) -> SelectResult {
+        SelectResult {
+            messages: vec![
+                BackendMessage::RowDescription {
+                    fields: vec![FieldDescription {
+                        name: name.to_owned(),
+                        table_oid: 0,
+                        col_attnum: 0,
+                        type_oid: 25,
+                        type_size: -1,
+                        type_modifier: -1,
+                        format_code: 0,
+                    }],
+                },
+                BackendMessage::DataRow {
+                    columns: vec![Some(value.as_bytes().to_vec())],
+                },
+                BackendMessage::CommandComplete {
+                    tag: "SELECT 1".to_owned(),
+                },
+            ],
+            streamed_body: None,
+            shared_streamed_body: None,
+            rows: 1,
+        }
+    }
+
+    fn hot_standby_allows(trimmed_sql: &str) -> bool {
+        let normalized = trimmed_sql.trim();
+        if normalized.is_empty() {
+            return true;
+        }
+        let upper = normalized.to_ascii_uppercase();
+        upper.starts_with("SELECT")
+            || upper.starts_with("SHOW")
+            || upper.starts_with("EXPLAIN")
+            || upper.starts_with("WITH")
+            || upper.starts_with("VALUES")
+            || (upper.starts_with("COPY") && upper.contains(" TO "))
     }
 }
 

@@ -14,13 +14,14 @@
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
 use rustyline::DefaultEditor;
 use tokio_postgres::{Client, Column, NoTls, Row};
 use tracing_subscriber::EnvFilter;
+use ultrasql_server::replication::{WalReceiver, WalSender};
 
 // ---------------------------------------------------------------------------
 // CLI argument definitions
@@ -84,6 +85,18 @@ struct Cli {
     #[arg(long, value_name = "DEST")]
     basebackup: Option<PathBuf>,
 
+    /// Write a pg_dump-style UltraSQL archive from `--data-dir`.
+    #[arg(long, value_name = "DEST")]
+    pg_dump: Option<PathBuf>,
+
+    /// Dump archive format for `--pg-dump`.
+    #[arg(long, value_enum, default_value = "custom")]
+    dump_format: DumpFormat,
+
+    /// Restore a `--pg-dump` archive or directory into `--data-dir`.
+    #[arg(long, value_name = "SOURCE")]
+    pg_restore: Option<PathBuf>,
+
     /// Archive one WAL file into this directory.
     #[arg(long, value_name = "WAL_PATH")]
     archive_wal: Option<PathBuf>,
@@ -91,6 +104,18 @@ struct Cli {
     /// Restore one WAL filename from `--archive-dir` into this output path.
     #[arg(long, value_name = "WAL_NAME")]
     restore_wal: Option<String>,
+
+    /// Ship archived WAL files once from `--archive-dir` into this directory.
+    #[arg(long, value_name = "DEST")]
+    wal_send_once: Option<PathBuf>,
+
+    /// Receive shipped WAL files once from this source directory into `--data-dir/pg_wal`.
+    #[arg(long, value_name = "SOURCE")]
+    wal_receive_once: Option<PathBuf>,
+
+    /// Replication slot name used by WAL sender.
+    #[arg(long, default_value = "standby")]
+    replication_slot: String,
 
     /// WAL archive directory used by `--archive-wal` and `--restore-wal`.
     #[arg(long, default_value = "target/ultrasql-archive")]
@@ -131,6 +156,14 @@ enum CtlCommand {
     Standby,
     Recovery,
     Stop,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DumpFormat {
+    Plain,
+    Directory,
+    Custom,
+    Tar,
 }
 
 // ---------------------------------------------------------------------------
@@ -942,6 +975,16 @@ async fn run(cli: Cli) -> Result<()> {
         return Ok(());
     }
 
+    if let Some(dest) = &cli.pg_dump {
+        run_pg_dump(&cli.data_dir, dest, cli.dump_format)?;
+        return Ok(());
+    }
+
+    if let Some(source) = &cli.pg_restore {
+        run_pg_restore(source, &cli.data_dir)?;
+        return Ok(());
+    }
+
     if let Some(wal_path) = &cli.archive_wal {
         run_archive_wal(wal_path, &cli.archive_dir)?;
         return Ok(());
@@ -953,6 +996,22 @@ async fn run(cli: Cli) -> Result<()> {
             .as_ref()
             .context("--restore-wal requires --restore-output PATH")?;
         run_restore_wal(wal_name, &cli.archive_dir, output)?;
+        return Ok(());
+    }
+
+    if let Some(dest) = &cli.wal_send_once {
+        let slots_dir = cli.data_dir.join("pg_replslot");
+        let sender = WalSender::new(&cli.archive_dir, slots_dir)?;
+        let copied = sender.send_once(&cli.replication_slot, dest)?;
+        println!("sent {copied} WAL file(s) to {}", dest.display());
+        return Ok(());
+    }
+
+    if let Some(source) = &cli.wal_receive_once {
+        let receiver = WalReceiver::new(source);
+        let copied = receiver.receive_once(&cli.data_dir.join("pg_wal"))?;
+        fs::write(cli.data_dir.join("standby.signal"), b"standby\n")?;
+        println!("received {copied} WAL file(s) into {}", cli.data_dir.join("pg_wal").display());
         return Ok(());
     }
 
@@ -1157,6 +1216,103 @@ fn run_basebackup(data_dir: &PathBuf, dest: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn run_pg_dump(data_dir: &Path, dest: &Path, format: DumpFormat) -> Result<()> {
+    match format {
+        DumpFormat::Directory => {
+            if dest.exists() {
+                anyhow::bail!("dump destination already exists: {}", dest.display());
+            }
+            fs::create_dir_all(dest)?;
+            let mut manifest = Vec::new();
+            copy_tree_with_manifest(
+                &data_dir.to_path_buf(),
+                &data_dir.to_path_buf(),
+                &dest.to_path_buf(),
+                &mut manifest,
+            )?;
+            manifest.sort_by(|a, b| a.0.cmp(&b.0));
+            fs::write(dest.join("ultrasql_dump.manifest"), dump_manifest_text(&manifest))?;
+            println!(
+                "directory dump wrote {} files to {}",
+                manifest.len(),
+                dest.display()
+            );
+        }
+        DumpFormat::Plain | DumpFormat::Custom | DumpFormat::Tar => {
+            if dest.exists() {
+                anyhow::bail!("dump destination already exists: {}", dest.display());
+            }
+            let mut entries = Vec::new();
+            collect_dump_entries(data_dir, data_dir, &mut entries)?;
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut out = String::new();
+            writeln!(&mut out, "ULTRASQL_DUMP_V1 format={format:?}")?;
+            for (path, bytes) in &entries {
+                if path.contains('\n') {
+                    anyhow::bail!("cannot dump path containing newline: {path}");
+                }
+                writeln!(&mut out, "FILE {} {}", bytes.len(), path)?;
+                writeln!(&mut out, "{}", hex_bytes(bytes))?;
+                writeln!(&mut out, "END")?;
+            }
+            fs::write(dest, out)?;
+            println!(
+                "{format:?} dump wrote {} files to {}",
+                entries.len(),
+                dest.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_pg_restore(source: &Path, data_dir: &Path) -> Result<()> {
+    fs::create_dir_all(data_dir)?;
+    if source.is_dir() {
+        restore_dump_directory(source, source, data_dir)?;
+        println!("restored directory dump into {}", data_dir.display());
+        return Ok(());
+    }
+    let text = fs::read_to_string(source)
+        .with_context(|| format!("cannot read dump archive: {}", source.display()))?;
+    let mut lines = text.lines();
+    let header = lines.next().context("empty dump archive")?;
+    if !header.starts_with("ULTRASQL_DUMP_V1 ") {
+        anyhow::bail!("unsupported dump archive header: {header}");
+    }
+    while let Some(line) = lines.next() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("FILE ") else {
+            anyhow::bail!("malformed dump archive line: {line}");
+        };
+        let (len_text, rel_path) = rest
+            .split_once(' ')
+            .context("malformed FILE header in dump archive")?;
+        let expected_len = len_text.parse::<usize>()?;
+        let hex = lines.next().context("missing FILE payload")?;
+        let bytes = decode_hex(hex)?;
+        if bytes.len() != expected_len {
+            anyhow::bail!(
+                "dump payload length mismatch for {rel_path}: expected {expected_len}, got {}",
+                bytes.len()
+            );
+        }
+        let end = lines.next().context("missing FILE terminator")?;
+        if end != "END" {
+            anyhow::bail!("malformed dump archive terminator: {end}");
+        }
+        let dest = data_dir.join(rel_path);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(dest, bytes)?;
+    }
+    println!("restored archive dump into {}", data_dir.display());
+    Ok(())
+}
+
 fn copy_tree_with_manifest(
     root: &PathBuf,
     current: &PathBuf,
@@ -1192,6 +1348,80 @@ fn checksum_hex(bytes: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn dump_manifest_text(manifest: &[(String, u64, String)]) -> String {
+    let mut text = String::from("{\n  \"files\": [\n");
+    for (idx, (path, bytes, checksum)) in manifest.iter().enumerate() {
+        let comma = if idx + 1 == manifest.len() { "" } else { "," };
+        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+        text.push_str(&format!(
+            "    {{\"path\":\"{escaped}\",\"bytes\":{bytes},\"checksum\":\"{checksum}\"}}{comma}\n"
+        ));
+    }
+    text.push_str("  ]\n}\n");
+    text
+}
+
+fn collect_dump_entries(
+    root: &Path,
+    current: &Path,
+    entries: &mut Vec<(String, Vec<u8>)>,
+) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_dump_entries(root, &path, entries)?;
+        } else if path.is_file() {
+            let rel = path.strip_prefix(root)?.display().to_string();
+            entries.push((rel, fs::read(&path)?));
+        }
+    }
+    Ok(())
+}
+
+fn restore_dump_directory(root: &Path, current: &Path, data_dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(root)?;
+        if rel == Path::new("ultrasql_dump.manifest") {
+            continue;
+        }
+        let dest = data_dir.join(rel);
+        if path.is_dir() {
+            fs::create_dir_all(&dest)?;
+            restore_dump_directory(root, &path, data_dir)?;
+        } else if path.is_file() {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&path, &dest)?;
+        }
+    }
+    Ok(())
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn decode_hex(hex: &str) -> Result<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        anyhow::bail!("hex payload has odd length");
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for idx in (0..hex.len()).step_by(2) {
+        let byte = u8::from_str_radix(&hex[idx..idx + 2], 16)
+            .with_context(|| format!("invalid hex payload at byte offset {idx}"))?;
+        out.push(byte);
+    }
+    Ok(out)
 }
 
 fn run_archive_wal(wal_path: &PathBuf, archive_dir: &PathBuf) -> Result<()> {

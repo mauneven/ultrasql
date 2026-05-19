@@ -1,15 +1,12 @@
 //! Parser methods for `COPY` statements.
 //!
-//! Covers the v0.5 surface:
+//! Covers the v0.9 surface:
 //!
 //! ```text
-//! COPY table [(col_list)] { FROM | TO } { STDIN | STDOUT }
-//!     [WITH (FORMAT { TEXT | CSV }, DELIMITER 'c', HEADER [bool], NULL 'string')]
+//! COPY table [(col_list)] { FROM | TO } { STDIN | STDOUT | 'file' }
+//! COPY (SELECT ...) TO { STDOUT | 'file' }
+//!     [WITH (FORMAT { TEXT | CSV | BINARY }, DELIMITER 'c', HEADER [bool], NULL 'string')]
 //! ```
-//!
-//! File-path sources, the older non-`WITH` option syntax, and binary
-//! format are explicitly out of scope; the ROADMAP tracks them under
-//! `COPY & Bulk Operations`.
 
 use crate::ast::{CopyDirection, CopyFormat, CopyOption, CopySource, CopyStmt, Identifier};
 use crate::parser::{ParseError, Parser};
@@ -28,12 +25,33 @@ impl Parser<'_> {
     /// - `DELIMITER` value that is not a single character.
     pub(crate) fn parse_copy(&mut self) -> Result<CopyStmt, ParseError> {
         let start_tok = self.expect(TokenKind::KwCopy, "COPY")?;
-        let table = self.parse_object_name()?;
+        let (table, query, columns) = if self.peek()?.kind == TokenKind::LParen {
+            self.advance()?;
+            if self.peek()?.kind == TokenKind::KwSelect {
+                let query = self.parse_select()?;
+                self.expect(TokenKind::RParen, ") after COPY query")?;
+                (None, Some(Box::new(query)), Vec::new())
+            } else {
+                return Err(ParseError::Expected {
+                    expected: "SELECT inside COPY (...)",
+                    found: self.peek()?.kind,
+                    offset: self.peek()?.span.start as usize,
+                });
+            }
+        } else {
+            let table = self.parse_object_name()?;
+            let columns = if self.peek()?.kind == TokenKind::LParen {
+                self.parse_copy_column_list()?
+            } else {
+                Vec::new()
+            };
+            (Some(table), None, columns)
+        };
 
-        let columns = if self.peek()?.kind == TokenKind::LParen {
+        let columns = if table.is_some() && self.peek()?.kind == TokenKind::LParen {
             self.parse_copy_column_list()?
         } else {
-            Vec::new()
+            columns
         };
 
         let dir_tok = *self.peek()?;
@@ -65,21 +83,33 @@ impl Parser<'_> {
                 self.advance()?;
                 CopySource::Stdout
             }
+            (_, TokenKind::String) => {
+                let path = self.parse_copy_string_literal("COPY file path")?;
+                CopySource::File(path)
+            }
             (CopyDirection::From, _) => {
                 return Err(ParseError::Expected {
-                    expected: "STDIN after COPY ... FROM (v0.5 supports STDIN only)",
+                    expected: "STDIN or server-side file path after COPY ... FROM",
                     found: src_tok.kind,
                     offset: src_tok.span.start as usize,
                 });
             }
             (CopyDirection::To, _) => {
                 return Err(ParseError::Expected {
-                    expected: "STDOUT after COPY ... TO (v0.5 supports STDOUT only)",
+                    expected: "STDOUT or server-side file path after COPY ... TO",
                     found: src_tok.kind,
                     offset: src_tok.span.start as usize,
                 });
             }
         };
+
+        if query.is_some() && direction == CopyDirection::From {
+            return Err(ParseError::Expected {
+                expected: "COPY (SELECT ...) TO ...",
+                found: TokenKind::KwFrom,
+                offset: dir_tok.span.start as usize,
+            });
+        }
 
         let options = if self.peek()?.kind == TokenKind::KwWith {
             self.advance()?;
@@ -179,16 +209,10 @@ impl Parser<'_> {
                         match lower.as_str() {
                             "text" => CopyFormat::Text,
                             "csv" => CopyFormat::Csv,
-                            "binary" => {
-                                return Err(ParseError::Expected {
-                                    expected: "FORMAT TEXT or CSV (binary not supported in v0.5)",
-                                    found: fmt_tok.kind,
-                                    offset: fmt_tok.span.start as usize,
-                                });
-                            }
+                            "binary" => CopyFormat::Binary,
                             _ => {
                                 return Err(ParseError::Expected {
-                                    expected: "TEXT or CSV after FORMAT",
+                    expected: "TEXT, CSV, or BINARY after FORMAT",
                                     found: fmt_tok.kind,
                                     offset: fmt_tok.span.start as usize,
                                 });
@@ -293,7 +317,7 @@ mod tests {
     #[test]
     fn copy_from_stdin_text_default() {
         let stmt = parse_copy("COPY users FROM STDIN");
-        assert_eq!(stmt.table.to_string(), "users");
+        assert_eq!(stmt.table.as_ref().expect("table").to_string(), "users");
         assert!(stmt.columns.is_empty());
         assert_eq!(stmt.direction, CopyDirection::From);
         assert_eq!(stmt.source, CopySource::Stdin);
@@ -366,18 +390,22 @@ mod tests {
     }
 
     #[test]
-    fn copy_from_filename_is_rejected() {
-        let err = Parser::new("COPY t FROM 'file.csv'")
-            .parse_statement()
-            .unwrap_err();
-        assert!(format!("{err}").contains("STDIN"));
+    fn copy_from_filename_is_accepted() {
+        let stmt = parse_copy("COPY t FROM 'file.csv'");
+        assert_eq!(stmt.source, CopySource::File("file.csv".to_string()));
     }
 
     #[test]
-    fn copy_binary_format_is_rejected() {
-        let err = Parser::new("COPY t FROM STDIN WITH (FORMAT binary)")
-            .parse_statement()
-            .unwrap_err();
-        assert!(format!("{err}").contains("binary"));
+    fn copy_binary_format_is_accepted() {
+        let stmt = parse_copy("COPY t FROM STDIN WITH (FORMAT binary)");
+        assert_eq!(stmt.format, CopyFormat::Binary);
+    }
+
+    #[test]
+    fn copy_query_to_stdout_is_accepted() {
+        let stmt = parse_copy("COPY (SELECT id FROM users) TO STDOUT");
+        assert!(stmt.table.is_none());
+        assert!(stmt.query.is_some());
+        assert_eq!(stmt.source, CopySource::Stdout);
     }
 }

@@ -51,6 +51,7 @@ pub mod extended;
 pub mod index_key;
 pub mod notify;
 pub mod pipeline;
+pub mod replication;
 pub mod result_encoder;
 pub mod tls;
 pub mod wal_sink;
@@ -494,6 +495,12 @@ pub struct Server {
     pub catalog: InMemoryCatalog,
     /// Registry of sample tables (schema + pre-built batches).
     pub tables: SampleTables,
+    /// Optional data directory used by WAL-backed server instances.
+    ///
+    /// `None` means in-memory sample mode. When present, operational SQL
+    /// shims such as `pg_start_backup()` can leave marker files in the same
+    /// directory that CLI backup/restore commands use.
+    pub data_dir: Option<std::path::PathBuf>,
     /// Persistent system catalog backed by an arc-swap snapshot cache.
     ///
     /// Bootstrapped at startup; refreshed after DDL.  Per-statement
@@ -594,6 +601,13 @@ pub struct Server {
     /// short-circuit with [`ultrasql_executor::ExecError::Cancelled`]
     /// → SQLSTATE `57014`.
     pub cancel_registry: Arc<cancel::CancelRegistry>,
+    /// Hot-standby read-only flag.
+    ///
+    /// Set when the server boots from a data directory containing
+    /// `standby.signal` or `recovery.signal`. Sessions accept reads and
+    /// reject writes before planning so a standby can safely serve analytical
+    /// queries while WAL shipping/replay catches up.
+    pub standby_mode: std::sync::atomic::AtomicBool,
 }
 
 /// Authentication policy for incoming connections.
@@ -683,6 +697,7 @@ impl Server {
         Self {
             catalog,
             tables,
+            data_dir: None,
             persistent_catalog,
             heap,
             vm,
@@ -699,7 +714,44 @@ impl Server {
             notify_hub: Arc::new(notify::NotifyHub::new()),
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
+            standby_mode: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Enable or disable hot-standby read-only query mode.
+    pub fn set_standby_mode(&self, enabled: bool) {
+        self.standby_mode
+            .store(enabled, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Return whether hot-standby read-only mode is active.
+    #[must_use]
+    pub fn is_standby_mode(&self) -> bool {
+        self.standby_mode.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record a PostgreSQL-compatible backup marker in the data directory.
+    ///
+    /// Returns the current backup LSN surface. UltraSQL v0.9 does not expose a
+    /// stable public LSN accessor yet, so the marker records wall-clock time
+    /// and the SQL function returns the PostgreSQL-shaped zero LSN used by the
+    /// existing recovery CLI placeholders.
+    pub fn record_backup_marker(&self, function_name: &str) -> Result<String, ServerError> {
+        let Some(data_dir) = &self.data_dir else {
+            return Ok("0/0".to_owned());
+        };
+        let file_name = if function_name.eq_ignore_ascii_case("pg_start_backup") {
+            "backup_label"
+        } else {
+            "backup_stop"
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let payload = format!("function={function_name}\nlsn=0/0\nunix_seconds={now}\n");
+        std::fs::write(data_dir.join(file_name), payload).map_err(ServerError::Io)?;
+        Ok("0/0".to_owned())
     }
 
     /// Builder: switch the server to MD5 password auth.
@@ -756,7 +808,50 @@ impl Server {
         self.run_one_pending_analyze();
     }
 
-    fn vacuum_mark_visible_pages(&self, oldest: ultrasql_core::Xid) {
+    /// Run one background autovacuum cycle across tables that crossed
+    /// modification thresholds.
+    pub fn run_autovacuum_cycle(&self) {
+        let oldest = self.txn_manager.oldest_in_progress();
+        if let Err(e) = self.heap.vacuum_undo_log(oldest) {
+            tracing::warn!(error = %e, "autovacuum undo-log GC failed");
+        }
+        let snapshot = self.catalog_snapshot();
+        for entry in snapshot.tables.values() {
+            let table_name = entry.name.to_ascii_lowercase();
+            let modified = self
+                .table_modifications
+                .get(&table_name)
+                .map(|v| *v)
+                .unwrap_or(0);
+            let blocks = self.heap.block_count(RelationId(entry.oid)).max(entry.n_blocks);
+            let threshold = AUTO_ANALYZE_BASE_THRESHOLD
+                .saturating_add(u64::from(blocks).saturating_mul(64) / AUTO_ANALYZE_SCALE_DIVISOR);
+            if modified < threshold {
+                continue;
+            }
+            match self
+                .heap
+                .vacuum_heap(RelationId(entry.oid), oldest, self.txn_manager.as_ref())
+            {
+                Ok(stats) => {
+                    if stats.tuples_reclaimed > 0 {
+                        tracing::debug!(
+                            table = %entry.name,
+                            reclaimed = stats.tuples_reclaimed,
+                            "autovacuum reclaimed heap tuples",
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(table = %entry.name, error = %e, "autovacuum heap failed"),
+            }
+            self.pending_analyze_tables.insert(table_name.clone(), ());
+            self.table_modifications.insert(table_name, 0);
+        }
+        self.vacuum_mark_visible_pages(oldest);
+        self.run_one_pending_analyze();
+    }
+
+    pub(crate) fn vacuum_mark_visible_pages(&self, oldest: ultrasql_core::Xid) {
         let snapshot = self.catalog_snapshot();
         for entry in snapshot.tables.values() {
             let rel = RelationId(entry.oid);
@@ -877,6 +972,7 @@ impl Server {
         Ok(Self {
             catalog,
             tables,
+            data_dir: Some(data_dir.to_path_buf()),
             persistent_catalog,
             heap,
             vm,
@@ -893,6 +989,7 @@ impl Server {
             notify_hub: Arc::new(notify::NotifyHub::new()),
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
+            standby_mode: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

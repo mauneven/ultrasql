@@ -1,0 +1,11 @@
+{
+  "milestone": "v0.9",
+  "item": "Three independent operators run UltraSQL for 7 days and report",
+  "status": "pending_external_validation",
+  "created_date": "2026-05-19",
+  "earliest_close_date_if_started_today": "2026-05-26",
+  "required_independent_operator_reports": 3,
+  "received_independent_operator_reports": 0,
+  "runbook": "docs/OPERATOR_SOAK.md",
+  "notes": "Cannot be closed by code changes alone; requires wall-clock operator evidence."
+}

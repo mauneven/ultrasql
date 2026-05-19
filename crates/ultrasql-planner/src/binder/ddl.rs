@@ -20,7 +20,7 @@ use ultrasql_parser::ast::{
 use super::expr_bind::coerce_literal_to_type;
 use super::{
     Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, ScalarExpr, ScopeStack, bind_expr,
-    object_name_simple,
+    bind_select, object_name_simple,
 };
 use crate::plan::{
     CopyDirection, CopyFormat, CopySource, LogicalCheckConstraint, LogicalCommentTarget,
@@ -1409,7 +1409,65 @@ pub(super) fn bind_truncate(
 /// schema the server's session dispatcher needs to encode `CopyOutResponse`
 /// / `CopyInResponse` frames.
 pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
-    let relation = object_name_simple(&s.table);
+    if let Some(query) = &s.query {
+        if !s.columns.is_empty() {
+            return Err(PlanError::NotSupported(
+                "COPY query target cannot specify a column list",
+            ));
+        }
+        let mut scope = ScopeStack::new();
+        let input = bind_select(query, catalog, &mut scope)?;
+        let schema = input.schema().clone();
+        let direction = match s.direction {
+            AstCopyDirection::From => {
+                return Err(PlanError::NotSupported("COPY (SELECT ...) supports TO only"));
+            }
+            AstCopyDirection::To => CopyDirection::To,
+        };
+        let source = match &s.source {
+            AstCopySource::Stdout => CopySource::Stdout,
+            AstCopySource::File(path) => CopySource::File(path.clone()),
+            AstCopySource::Stdin => {
+                return Err(PlanError::NotSupported("COPY query target cannot use STDIN"));
+            }
+        };
+        let format = match s.format {
+            AstCopyFormat::Text => CopyFormat::Text,
+            AstCopyFormat::Csv => CopyFormat::Csv,
+            AstCopyFormat::Binary => CopyFormat::Binary,
+        };
+        let (mut delimiter, mut null_str) = match format {
+            CopyFormat::Text | CopyFormat::Binary => ('\t', String::from(r"\N")),
+            CopyFormat::Csv => (',', String::new()),
+        };
+        let mut header = false;
+        for opt in &s.options {
+            match opt {
+                CopyOption::Format(_) => {}
+                CopyOption::Delimiter(c) => delimiter = *c,
+                CopyOption::Header(v) => header = *v,
+                CopyOption::Null(v) => null_str.clone_from(v),
+            }
+        }
+        return Ok(LogicalPlan::Copy {
+            relation: None,
+            input: Some(Box::new(input)),
+            columns: Vec::new(),
+            direction,
+            source,
+            format,
+            delimiter,
+            null_str,
+            header,
+            schema,
+        });
+    }
+
+    let table_name = s
+        .table
+        .as_ref()
+        .ok_or(PlanError::NotSupported("COPY requires table or query target"))?;
+    let relation = object_name_simple(table_name);
     let table_meta = catalog
         .lookup_table(&relation)
         .ok_or_else(|| PlanError::TableNotFound(relation.clone()))?;
@@ -1446,17 +1504,19 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
         AstCopyDirection::From => CopyDirection::From,
         AstCopyDirection::To => CopyDirection::To,
     };
-    let source = match s.source {
+    let source = match &s.source {
         AstCopySource::Stdin => CopySource::Stdin,
         AstCopySource::Stdout => CopySource::Stdout,
+        AstCopySource::File(path) => CopySource::File(path.clone()),
     };
     let format = match s.format {
         AstCopyFormat::Text => CopyFormat::Text,
         AstCopyFormat::Csv => CopyFormat::Csv,
+        AstCopyFormat::Binary => CopyFormat::Binary,
     };
 
     let (mut delimiter, mut null_str) = match format {
-        CopyFormat::Text => ('\t', String::from(r"\N")),
+        CopyFormat::Text | CopyFormat::Binary => ('\t', String::from(r"\N")),
         CopyFormat::Csv => (',', String::new()),
     };
     let mut header = false;
@@ -1470,7 +1530,8 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
     }
 
     Ok(LogicalPlan::Copy {
-        relation,
+        relation: Some(relation),
+        input: None,
         columns,
         direction,
         source,

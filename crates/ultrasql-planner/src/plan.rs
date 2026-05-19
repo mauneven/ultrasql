@@ -958,8 +958,10 @@ pub enum LogicalPlan {
     /// `CopyInResponse` / `CopyOutResponse` column-format vector and
     /// to drive per-column text encoding.
     Copy {
-        /// Case-folded target table name.
-        relation: String,
+        /// Case-folded target table name. `None` for `COPY (SELECT ...)`.
+        relation: Option<String>,
+        /// Bound query input for `COPY (SELECT ...) TO ...`.
+        input: Option<Box<Self>>,
         /// 0-based indices into the target table's schema. Empty means
         /// "all columns in natural order".
         columns: Vec<usize>,
@@ -1162,6 +1164,8 @@ pub enum CopySource {
     Stdin,
     /// `STDOUT` — server streams `CopyData` frames out.
     Stdout,
+    /// Server-side file path.
+    File(String),
 }
 
 /// COPY wire format, mirrored from
@@ -1172,6 +1176,8 @@ pub enum CopyFormat {
     Text,
     /// PostgreSQL `CSV` format.
     Csv,
+    /// PostgreSQL binary COPY format.
+    Binary,
 }
 
 /// Resolved window function applied by a [`LogicalPlan::Window`] node.
@@ -2002,10 +2008,12 @@ impl LogicalPlan {
                 let src = match source {
                     CopySource::Stdin => "STDIN",
                     CopySource::Stdout => "STDOUT",
+                    CopySource::File(_) => "FILE",
                 };
                 let fmt_label = match format {
                     CopyFormat::Text => "TEXT",
                     CopyFormat::Csv => "CSV",
+                    CopyFormat::Binary => "BINARY",
                 };
                 let cols = if columns.is_empty() {
                     String::from("*")
@@ -2016,9 +2024,10 @@ impl LogicalPlan {
                         .collect::<Vec<_>>()
                         .join(",")
                 };
+                let target = relation.as_deref().unwrap_or("<query>");
                 let _ = fmt::write(
                     out,
-                    format_args!("Copy: {relation} ({cols}) {dir} {src} FORMAT={fmt_label}\n"),
+                    format_args!("Copy: {target} ({cols}) {dir} {src} FORMAT={fmt_label}\n"),
                 );
             }
             Self::FunctionScan { name, args, .. } => {

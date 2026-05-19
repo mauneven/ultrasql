@@ -30,6 +30,7 @@
 
 #![allow(unused_imports)]
 
+use std::fs;
 use std::sync::Arc;
 
 use bytes::BytesMut;
@@ -49,8 +50,8 @@ use ultrasql_txn::{IsolationLevel, Transaction};
 use super::Session;
 use crate::CombinedCatalog;
 use crate::copy::{
-    CopyFormat as ServerCopyFormat, CopyOptions, copy_in_response, copy_out_response,
-    encode_csv_row, encode_text_row, parse_csv_row, parse_text_row,
+    CopyFormat as ServerCopyFormat, CopyOptions, copy_in_response_with_format,
+    copy_out_response_with_format, encode_csv_row, encode_text_row, parse_csv_row, parse_text_row,
 };
 use crate::error::ServerError;
 
@@ -152,6 +153,7 @@ where
     ) -> Result<(), ServerError> {
         let LogicalPlan::Copy {
             relation,
+            input,
             columns,
             direction,
             source,
@@ -167,15 +169,26 @@ where
             ));
         };
 
-        match (direction, source) {
-            (CopyDirection::From, CopySource::Stdin) | (CopyDirection::To, CopySource::Stdout) => {}
-            _ => {
-                return Err(ServerError::Unsupported(
-                    "COPY direction/source mismatch (only FROM STDIN / TO STDOUT supported)",
-                ));
-            }
+        let opts = CopyOptions {
+            format: match format {
+                PlanCopyFormat::Text => ServerCopyFormat::Text,
+                PlanCopyFormat::Csv => ServerCopyFormat::Csv,
+                PlanCopyFormat::Binary => ServerCopyFormat::Binary,
+            },
+            delimiter: *delimiter,
+            null_str: null_str.clone(),
+            header: *header,
+        };
+
+        if let Some(input) = input {
+            return self
+                .copy_query_to_destination(input, source, schema, &opts, emit_ready_for_query)
+                .await;
         }
 
+        let relation = relation
+            .as_ref()
+            .ok_or(ServerError::Unsupported("COPY table target missing"))?;
         let catalog_snapshot: Arc<CatalogSnapshot> = self.state.catalog_snapshot();
         let entry = catalog_snapshot
             .tables
@@ -185,25 +198,29 @@ where
             })?
             .clone();
 
-        let opts = CopyOptions {
-            format: match format {
-                PlanCopyFormat::Text => ServerCopyFormat::Text,
-                PlanCopyFormat::Csv => ServerCopyFormat::Csv,
-            },
-            delimiter: *delimiter,
-            null_str: null_str.clone(),
-            header: *header,
-        };
-
         match direction {
-            CopyDirection::To => {
-                self.copy_to_stdout(&entry, columns, schema, &opts, emit_ready_for_query)
-                    .await
-            }
-            CopyDirection::From => {
-                self.copy_from_stdin(&entry, columns, schema, &opts, emit_ready_for_query)
-                    .await
-            }
+            CopyDirection::To => match source {
+                CopySource::Stdout => {
+                    self.copy_to_stdout(&entry, columns, schema, &opts, emit_ready_for_query)
+                        .await
+                }
+                CopySource::File(path) => {
+                    let rows = self.copy_to_file(&entry, columns, schema, &opts, path)?;
+                    self.send_copy_complete(rows, emit_ready_for_query).await
+                }
+                CopySource::Stdin => Err(ServerError::Unsupported("COPY TO STDIN is invalid")),
+            },
+            CopyDirection::From => match source {
+                CopySource::Stdin => {
+                    self.copy_from_stdin(&entry, columns, schema, &opts, emit_ready_for_query)
+                        .await
+                }
+                CopySource::File(path) => {
+                    self.copy_from_file(&entry, columns, schema, &opts, path, emit_ready_for_query)
+                        .await
+                }
+                CopySource::Stdout => Err(ServerError::Unsupported("COPY FROM STDOUT is invalid")),
+            },
         }
     }
 
@@ -217,9 +234,37 @@ where
     ) -> Result<(), ServerError> {
         let n_columns = schema.len();
         self.write_buf.clear();
-        encode_backend(&copy_out_response(n_columns), &mut self.write_buf);
+        let format_code = copy_format_code(opts.format);
+        encode_backend(
+            &copy_out_response_with_format(n_columns, format_code),
+            &mut self.write_buf,
+        );
         self.io.write_all(&self.write_buf).await?;
         self.io.flush().await?;
+
+        if opts.format == ServerCopyFormat::Binary {
+            let (payload, rows_sent) = self.encode_table_binary_copy(entry, columns, schema)?;
+            let mut wire_buf = BytesMut::with_capacity(payload.len() + 128);
+            encode_backend(&BackendMessage::CopyData(payload), &mut wire_buf);
+            encode_backend(&BackendMessage::CopyDone, &mut wire_buf);
+            encode_backend(
+                &BackendMessage::CommandComplete {
+                    tag: format!("COPY {rows_sent}"),
+                },
+                &mut wire_buf,
+            );
+            if emit_ready_for_query {
+                encode_backend(
+                    &BackendMessage::ReadyForQuery {
+                        status: self.txn_state.ready_for_query_status(),
+                    },
+                    &mut wire_buf,
+                );
+            }
+            self.io.write_all(&wire_buf).await?;
+            self.io.flush().await?;
+            return Ok(());
+        }
 
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let rel = RelationId(entry.oid);
@@ -238,6 +283,7 @@ where
             let bytes = match opts.format {
                 ServerCopyFormat::Text => encode_text_row(&header_cells, opts),
                 ServerCopyFormat::Csv => encode_csv_row(&header_cells, opts),
+                ServerCopyFormat::Binary => Vec::new(),
             };
             encode_backend(&BackendMessage::CopyData(bytes), &mut wire_buf);
         }
@@ -284,6 +330,7 @@ where
                 let bytes = match opts.format {
                     ServerCopyFormat::Text => encode_text_row(&cells, opts),
                     ServerCopyFormat::Csv => encode_csv_row(&cells, opts),
+                    ServerCopyFormat::Binary => Vec::new(),
                 };
                 encode_backend(&BackendMessage::CopyData(bytes), &mut wire_buf);
                 rows_sent = rows_sent.saturating_add(1);
@@ -334,7 +381,22 @@ where
         emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
         let n_columns = schema.len();
-        self.send(&copy_in_response(n_columns)).await?;
+        let format_code = copy_format_code(opts.format);
+        self.send(&copy_in_response_with_format(n_columns, format_code))
+            .await?;
+
+        if opts.format == ServerCopyFormat::Binary {
+            let bytes = self.collect_copy_stdin_bytes().await?;
+            return self
+                .copy_binary_bytes_into_table(
+                    entry,
+                    columns,
+                    schema,
+                    &bytes,
+                    emit_ready_for_query,
+                )
+                .await;
+        }
 
         let mut buffer: Vec<u8> = Vec::new();
         let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(COPY_INSERT_BATCH_ROWS);
@@ -511,6 +573,295 @@ where
         Ok(())
     }
 
+    async fn collect_copy_stdin_bytes(&mut self) -> Result<Vec<u8>, ServerError> {
+        let mut bytes = Vec::new();
+        loop {
+            match self.read_frontend().await? {
+                FrontendMessage::CopyData(chunk) => bytes.extend_from_slice(&chunk),
+                FrontendMessage::CopyDone => return Ok(bytes),
+                FrontendMessage::CopyFail(reason) => return Err(ServerError::CopyAborted(reason)),
+                FrontendMessage::Sync | FrontendMessage::Flush => continue,
+                FrontendMessage::Terminate => return Err(ServerError::UnexpectedEof),
+                other => {
+                    return Err(ServerError::CopyFormat(format!(
+                        "unexpected frontend message during binary COPY FROM: {other:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    async fn copy_from_file(
+        &mut self,
+        entry: &TableEntry,
+        columns: &[usize],
+        schema: &Schema,
+        opts: &CopyOptions,
+        path: &str,
+        emit_ready_for_query: bool,
+    ) -> Result<(), ServerError> {
+        let bytes =
+            fs::read(path).map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+        if opts.format == ServerCopyFormat::Binary {
+            return self
+                .copy_binary_bytes_into_table(entry, columns, schema, &bytes, emit_ready_for_query)
+                .await;
+        }
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let codec = RowCodec::new(entry.schema.clone());
+        let mut payloads = Vec::new();
+        let mut header_skipped = !opts.header;
+        for line in bytes.split_inclusive(|b| *b == b'\n') {
+            if !header_skipped {
+                header_skipped = true;
+                continue;
+            }
+            if line.is_empty() {
+                continue;
+            }
+            payloads.push(decode_one_copy_row(line, entry, columns, schema, &codec, opts)?);
+        }
+        let rows = u64::try_from(payloads.len()).unwrap_or(u64::MAX);
+        self.flush_copy_insert_batch(entry, &payloads, &txn)?;
+        if let Err(e) = self.state.txn_manager.commit(txn) {
+            warn!(error = %e, "COPY FROM file commit failed");
+        }
+        self.state.note_commit_for_gc();
+        self.state.note_table_modifications(&entry.name, rows);
+        self.send_copy_complete(rows, emit_ready_for_query).await
+    }
+
+    async fn copy_binary_bytes_into_table(
+        &mut self,
+        entry: &TableEntry,
+        columns: &[usize],
+        schema: &Schema,
+        bytes: &[u8],
+        emit_ready_for_query: bool,
+    ) -> Result<(), ServerError> {
+        let codec = RowCodec::new(entry.schema.clone());
+        let payloads = decode_binary_copy_payload(bytes, entry, columns, schema, &codec)?;
+        let rows = u64::try_from(payloads.len()).unwrap_or(u64::MAX);
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        self.flush_copy_insert_batch(entry, &payloads, &txn)?;
+        if let Err(e) = self.state.txn_manager.commit(txn) {
+            warn!(error = %e, "binary COPY FROM commit failed");
+        }
+        self.state.note_commit_for_gc();
+        self.state.note_table_modifications(&entry.name, rows);
+        self.send_copy_complete(rows, emit_ready_for_query).await
+    }
+
+    async fn send_copy_complete(
+        &mut self,
+        rows: u64,
+        emit_ready_for_query: bool,
+    ) -> Result<(), ServerError> {
+        let mut wire_buf = BytesMut::with_capacity(64);
+        encode_backend(
+            &BackendMessage::CommandComplete {
+                tag: format!("COPY {rows}"),
+            },
+            &mut wire_buf,
+        );
+        if emit_ready_for_query {
+            encode_backend(
+                &BackendMessage::ReadyForQuery {
+                    status: self.txn_state.ready_for_query_status(),
+                },
+                &mut wire_buf,
+            );
+        }
+        self.io.write_all(&wire_buf).await?;
+        self.io.flush().await?;
+        Ok(())
+    }
+
+    fn copy_to_file(
+        &mut self,
+        entry: &TableEntry,
+        columns: &[usize],
+        schema: &Schema,
+        opts: &CopyOptions,
+        path: &str,
+    ) -> Result<u64, ServerError> {
+        let (bytes, rows) = if opts.format == ServerCopyFormat::Binary {
+            self.encode_table_binary_copy(entry, columns, schema)?
+        } else {
+            self.encode_table_textual_copy(entry, columns, opts)?
+        };
+        fs::write(path, bytes)
+            .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+        Ok(rows)
+    }
+
+    async fn copy_query_to_destination(
+        &mut self,
+        input: &LogicalPlan,
+        source: &CopySource,
+        schema: &Schema,
+        opts: &CopyOptions,
+        emit_ready_for_query: bool,
+    ) -> Result<(), ServerError> {
+        if opts.format == ServerCopyFormat::Binary {
+            return Err(ServerError::Unsupported(
+                "binary COPY for query targets is not yet supported",
+            ));
+        }
+        let snapshot = self.state.catalog_snapshot();
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let ctx = crate::pipeline::LowerCtx {
+            tables: &self.state.tables,
+            catalog_snapshot: Arc::clone(&snapshot),
+            table_constraints: Arc::clone(&self.state.table_constraints),
+            sequences: Arc::clone(&self.state.sequences),
+            sequence_state: Some(self.sequence_state.clone()),
+            heap: Arc::clone(&self.state.heap),
+            vm: Arc::clone(&self.state.vm),
+            snapshot: txn.snapshot.clone(),
+            oracle: Arc::clone(&self.state.txn_manager),
+            xid: txn.current_xid(),
+            command_id: txn.current_command,
+            cte_buffers: std::collections::HashMap::new(),
+            jit: self.jit_config(),
+            cancel_flag: Some(self.cancel_flag.clone()),
+            work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+        };
+        let result = match crate::pipeline::lower_query(input, &ctx)
+            .and_then(|mut op| crate::result_encoder::run_select(op.as_mut()))
+        {
+            Ok(result) => result,
+            Err(e) => {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    warn!(error = %abort_err, "COPY query transaction abort failed");
+                }
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.state.txn_manager.commit(txn) {
+            warn!(error = %e, "COPY query transaction commit failed");
+        }
+        let (payload, rows) = copy_rows_from_select_result(&result, schema, opts)?;
+        match source {
+            CopySource::Stdout => {
+                self.write_buf.clear();
+                encode_backend(
+                    &copy_out_response_with_format(schema.len(), copy_format_code(opts.format)),
+                    &mut self.write_buf,
+                );
+                encode_backend(&BackendMessage::CopyData(payload), &mut self.write_buf);
+                encode_backend(&BackendMessage::CopyDone, &mut self.write_buf);
+                encode_backend(
+                    &BackendMessage::CommandComplete {
+                        tag: format!("COPY {rows}"),
+                    },
+                    &mut self.write_buf,
+                );
+                if emit_ready_for_query {
+                    encode_backend(
+                        &BackendMessage::ReadyForQuery {
+                            status: self.txn_state.ready_for_query_status(),
+                        },
+                        &mut self.write_buf,
+                    );
+                }
+                self.io.write_all(&self.write_buf).await?;
+                self.io.flush().await?;
+                Ok(())
+            }
+            CopySource::File(path) => {
+                fs::write(path, payload)
+                    .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+                self.send_copy_complete(rows, emit_ready_for_query).await
+            }
+            CopySource::Stdin => Err(ServerError::Unsupported("COPY query target cannot use STDIN")),
+        }
+    }
+
+    fn encode_table_textual_copy(
+        &self,
+        entry: &TableEntry,
+        columns: &[usize],
+        opts: &CopyOptions,
+    ) -> Result<(Vec<u8>, u64), ServerError> {
+        let rel = RelationId(entry.oid);
+        let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let codec = RowCodec::new(entry.schema.clone());
+        let mut out = Vec::new();
+        let stream_schema = projected_schema(entry, columns)?;
+        if opts.header {
+            let header_cells: Vec<Option<Vec<u8>>> = stream_schema
+                .fields()
+                .iter()
+                .map(|f| Some(f.name.as_bytes().to_vec()))
+                .collect();
+            match opts.format {
+                ServerCopyFormat::Text => out.extend_from_slice(&encode_text_row(&header_cells, opts)),
+                ServerCopyFormat::Csv => out.extend_from_slice(&encode_csv_row(&header_cells, opts)),
+                ServerCopyFormat::Binary => {}
+            }
+        }
+        let mut rows = 0_u64;
+        let scan = self.state.heap.scan_visible(
+            rel,
+            block_count,
+            &txn.snapshot,
+            self.state.txn_manager.as_ref(),
+        );
+        for tuple in scan {
+            let tuple = tuple.map_err(|e| ServerError::ddl(format!("COPY TO file heap scan: {e}")))?;
+            let row = codec
+                .decode(&tuple.data)
+                .map_err(|e| ServerError::CopyFormat(format!("COPY TO file row decode: {e}")))?;
+            let cells = copy_cells_from_row(&row, &entry.schema, columns);
+            match opts.format {
+                ServerCopyFormat::Text => out.extend_from_slice(&encode_text_row(&cells, opts)),
+                ServerCopyFormat::Csv => out.extend_from_slice(&encode_csv_row(&cells, opts)),
+                ServerCopyFormat::Binary => {}
+            }
+            rows = rows.saturating_add(1);
+        }
+        if let Err(e) = self.state.txn_manager.commit(txn) {
+            warn!(error = %e, "COPY TO file scan commit failed");
+        }
+        Ok((out, rows))
+    }
+
+    fn encode_table_binary_copy(
+        &self,
+        entry: &TableEntry,
+        columns: &[usize],
+        schema: &Schema,
+    ) -> Result<(Vec<u8>, u64), ServerError> {
+        let rel = RelationId(entry.oid);
+        let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let codec = RowCodec::new(entry.schema.clone());
+        let mut out = Vec::new();
+        append_binary_copy_header(&mut out);
+        let mut rows = 0_u64;
+        let scan = self.state.heap.scan_visible(
+            rel,
+            block_count,
+            &txn.snapshot,
+            self.state.txn_manager.as_ref(),
+        );
+        for tuple in scan {
+            let tuple = tuple.map_err(|e| ServerError::ddl(format!("binary COPY heap scan: {e}")))?;
+            let row = codec
+                .decode(&tuple.data)
+                .map_err(|e| ServerError::CopyFormat(format!("binary COPY row decode: {e}")))?;
+            append_binary_copy_row(&mut out, &row, &entry.schema, columns, schema)?;
+            rows = rows.saturating_add(1);
+        }
+        append_i16_be(&mut out, -1);
+        if let Err(e) = self.state.txn_manager.commit(txn) {
+            warn!(error = %e, "binary COPY scan commit failed");
+        }
+        Ok((out, rows))
+    }
+
     fn flush_copy_insert_batch(
         &self,
         entry: &TableEntry,
@@ -551,6 +902,309 @@ where
     }
 }
 
+fn copy_format_code(format: ServerCopyFormat) -> u16 {
+    match format {
+        ServerCopyFormat::Text | ServerCopyFormat::Csv => 0,
+        ServerCopyFormat::Binary => 1,
+    }
+}
+
+fn projected_schema(entry: &TableEntry, columns: &[usize]) -> Result<Schema, ServerError> {
+    if columns.is_empty() {
+        return Ok(entry.schema.clone());
+    }
+    let fields = columns
+        .iter()
+        .map(|&i| entry.schema.fields()[i].clone())
+        .collect::<Vec<_>>();
+    Schema::new(fields).map_err(|e| ServerError::CopyFormat(format!("COPY schema: {e}")))
+}
+
+fn copy_cells_from_row(row: &[Value], schema: &Schema, columns: &[usize]) -> Vec<Option<Vec<u8>>> {
+    if columns.is_empty() {
+        row.iter()
+            .zip(schema.fields())
+            .map(|(value, field)| value_to_copy_cell(value, &field.data_type))
+            .collect()
+    } else {
+        columns
+            .iter()
+            .map(|&i| {
+                let field = schema.field_at(i);
+                row.get(i)
+                    .and_then(|value| value_to_copy_cell(value, &field.data_type))
+            })
+            .collect()
+    }
+}
+
+fn copy_rows_from_select_result(
+    result: &crate::result_encoder::SelectResult,
+    schema: &Schema,
+    opts: &CopyOptions,
+) -> Result<(Vec<u8>, u64), ServerError> {
+    let mut out = Vec::new();
+    if opts.header {
+        let header_cells: Vec<Option<Vec<u8>>> = schema
+            .fields()
+            .iter()
+            .map(|f| Some(f.name.as_bytes().to_vec()))
+            .collect();
+        match opts.format {
+            ServerCopyFormat::Text => out.extend_from_slice(&encode_text_row(&header_cells, opts)),
+            ServerCopyFormat::Csv => out.extend_from_slice(&encode_csv_row(&header_cells, opts)),
+            ServerCopyFormat::Binary => {}
+        }
+    }
+    let mut rows = 0_u64;
+    for msg in &result.messages {
+        if let BackendMessage::DataRow { columns } = msg {
+            match opts.format {
+                ServerCopyFormat::Text => out.extend_from_slice(&encode_text_row(columns, opts)),
+                ServerCopyFormat::Csv => out.extend_from_slice(&encode_csv_row(columns, opts)),
+                ServerCopyFormat::Binary => {
+                    return Err(ServerError::Unsupported(
+                        "binary COPY for query targets is not yet supported",
+                    ));
+                }
+            }
+            rows = rows.saturating_add(1);
+        }
+    }
+    Ok((out, rows))
+}
+
+fn append_binary_copy_header(out: &mut Vec<u8>) {
+    out.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+    out.extend_from_slice(&0_i32.to_be_bytes());
+    out.extend_from_slice(&0_i32.to_be_bytes());
+}
+
+fn append_binary_copy_row(
+    out: &mut Vec<u8>,
+    row: &[Value],
+    table_schema: &Schema,
+    columns: &[usize],
+    stream_schema: &Schema,
+) -> Result<(), ServerError> {
+    append_i16_be(
+        out,
+        i16::try_from(stream_schema.len())
+            .map_err(|_| ServerError::CopyFormat("too many COPY columns".to_string()))?,
+    );
+    if columns.is_empty() {
+        for (idx, value) in row.iter().enumerate() {
+            append_binary_copy_cell(out, value, &table_schema.field_at(idx).data_type)?;
+        }
+    } else {
+        for &idx in columns {
+            let value = row.get(idx).unwrap_or(&Value::Null);
+            append_binary_copy_cell(out, value, &table_schema.field_at(idx).data_type)?;
+        }
+    }
+    Ok(())
+}
+
+fn append_binary_copy_cell(
+    out: &mut Vec<u8>,
+    value: &Value,
+    dtype: &DataType,
+) -> Result<(), ServerError> {
+    if matches!(value, Value::Null) {
+        out.extend_from_slice(&(-1_i32).to_be_bytes());
+        return Ok(());
+    }
+    let bytes = binary_copy_cell_bytes(value, dtype)?;
+    out.extend_from_slice(
+        &i32::try_from(bytes.len())
+            .map_err(|_| ServerError::CopyFormat("binary COPY cell too large".to_string()))?
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(&bytes);
+    Ok(())
+}
+
+fn binary_copy_cell_bytes(value: &Value, dtype: &DataType) -> Result<Vec<u8>, ServerError> {
+    let bytes = match (dtype, value) {
+        (DataType::Bool, Value::Bool(v)) => vec![u8::from(*v)],
+        (DataType::Int16, Value::Int16(v)) => v.to_be_bytes().to_vec(),
+        (DataType::Int32, Value::Int32(v)) => v.to_be_bytes().to_vec(),
+        (DataType::Int64, Value::Int64(v)) => v.to_be_bytes().to_vec(),
+        (DataType::Float32, Value::Float32(v)) => v.to_bits().to_be_bytes().to_vec(),
+        (DataType::Float64, Value::Float64(v)) => v.to_bits().to_be_bytes().to_vec(),
+        (DataType::Date, Value::Date(v) | Value::Int32(v)) => v.to_be_bytes().to_vec(),
+        (DataType::Text { .. }, Value::Text(v)) => v.as_bytes().to_vec(),
+        (DataType::Bytea, Value::Bytea(v)) => v.clone(),
+        (_, other) => other.to_string().into_bytes(),
+    };
+    Ok(bytes)
+}
+
+fn append_i16_be(out: &mut Vec<u8>, v: i16) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+fn decode_binary_copy_payload(
+    bytes: &[u8],
+    entry: &TableEntry,
+    columns: &[usize],
+    schema: &Schema,
+    codec: &RowCodec,
+) -> Result<Vec<Vec<u8>>, ServerError> {
+    const MAGIC: &[u8] = b"PGCOPY\n\xff\r\n\0";
+    if bytes.len() < MAGIC.len() + 8 || &bytes[..MAGIC.len()] != MAGIC {
+        return Err(ServerError::CopyFormat(
+            "invalid binary COPY header".to_string(),
+        ));
+    }
+    let mut pos = MAGIC.len();
+    let _flags = read_i32_be(bytes, &mut pos)?;
+    let ext_len = read_i32_be(bytes, &mut pos)?;
+    if ext_len < 0 {
+        return Err(ServerError::CopyFormat(
+            "invalid binary COPY extension length".to_string(),
+        ));
+    }
+    let ext_len = usize::try_from(ext_len)
+        .map_err(|_| ServerError::CopyFormat("invalid binary COPY extension".to_string()))?;
+    pos = pos.saturating_add(ext_len);
+    if pos > bytes.len() {
+        return Err(ServerError::CopyFormat(
+            "truncated binary COPY extension".to_string(),
+        ));
+    }
+
+    let mut payloads = Vec::new();
+    loop {
+        let field_count = read_i16_be(bytes, &mut pos)?;
+        if field_count == -1 {
+            break;
+        }
+        let expected = i16::try_from(schema.len())
+            .map_err(|_| ServerError::CopyFormat("too many COPY columns".to_string()))?;
+        if field_count != expected {
+            return Err(ServerError::CopyFormat(format!(
+                "binary COPY expected {expected} columns, got {field_count}"
+            )));
+        }
+        let mut row = vec![Value::Null; entry.schema.len()];
+        for stream_idx in 0..usize::try_from(field_count).unwrap_or(0) {
+            let len = read_i32_be(bytes, &mut pos)?;
+            let value = if len == -1 {
+                Value::Null
+            } else {
+                if len < 0 {
+                    return Err(ServerError::CopyFormat(
+                        "invalid binary COPY field length".to_string(),
+                    ));
+                }
+                let len = usize::try_from(len).map_err(|_| {
+                    ServerError::CopyFormat("invalid binary COPY field length".to_string())
+                })?;
+                let end = pos.saturating_add(len);
+                if end > bytes.len() {
+                    return Err(ServerError::CopyFormat(
+                        "truncated binary COPY field".to_string(),
+                    ));
+                }
+                let target_idx = columns.get(stream_idx).copied().unwrap_or(stream_idx);
+                let dtype = &entry.schema.field_at(target_idx).data_type;
+                let value = decode_binary_copy_cell(&bytes[pos..end], dtype, stream_idx)?;
+                pos = end;
+                value
+            };
+            let target_idx = columns.get(stream_idx).copied().unwrap_or(stream_idx);
+            row[target_idx] = value;
+        }
+        payloads.push(codec.encode(&row).map_err(|e| {
+            ServerError::CopyFormat(format!("binary COPY row encode: {e}"))
+        })?);
+    }
+    Ok(payloads)
+}
+
+fn read_i16_be(bytes: &[u8], pos: &mut usize) -> Result<i16, ServerError> {
+    let end = pos.saturating_add(2);
+    if end > bytes.len() {
+        return Err(ServerError::CopyFormat("truncated binary COPY".to_string()));
+    }
+    let out = i16::from_be_bytes([bytes[*pos], bytes[*pos + 1]]);
+    *pos = end;
+    Ok(out)
+}
+
+fn read_i32_be(bytes: &[u8], pos: &mut usize) -> Result<i32, ServerError> {
+    let end = pos.saturating_add(4);
+    if end > bytes.len() {
+        return Err(ServerError::CopyFormat("truncated binary COPY".to_string()));
+    }
+    let out = i32::from_be_bytes([bytes[*pos], bytes[*pos + 1], bytes[*pos + 2], bytes[*pos + 3]]);
+    *pos = end;
+    Ok(out)
+}
+
+fn decode_binary_copy_cell(
+    bytes: &[u8],
+    dtype: &DataType,
+    column_idx: usize,
+) -> Result<Value, ServerError> {
+    let exact = |n: usize| {
+        if bytes.len() == n {
+            Ok(())
+        } else {
+            Err(ServerError::CopyFormat(format!(
+                "column {column_idx}: binary length {}, expected {n}",
+                bytes.len()
+            )))
+        }
+    };
+    match dtype {
+        DataType::Bool => {
+            exact(1)?;
+            Ok(Value::Bool(bytes[0] != 0))
+        }
+        DataType::Int16 => {
+            exact(2)?;
+            Ok(Value::Int16(i16::from_be_bytes([bytes[0], bytes[1]])))
+        }
+        DataType::Int32 => {
+            exact(4)?;
+            Ok(Value::Int32(i32::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ])))
+        }
+        DataType::Int64 => {
+            exact(8)?;
+            Ok(Value::Int64(i64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])))
+        }
+        DataType::Float32 => {
+            exact(4)?;
+            Ok(Value::Float32(f32::from_bits(u32::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ]))))
+        }
+        DataType::Float64 => {
+            exact(8)?;
+            Ok(Value::Float64(f64::from_bits(u64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ]))))
+        }
+        DataType::Date => {
+            exact(4)?;
+            Ok(Value::Date(i32::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ])))
+        }
+        DataType::Text { .. } => std::str::from_utf8(bytes)
+            .map(|s| Value::Text(s.to_string()))
+            .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}"))),
+        DataType::Bytea => Ok(Value::Bytea(bytes.to_vec())),
+        other => decode_copy_cell(Some(bytes), other, column_idx),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_one_copy_row(
     line: &[u8],
@@ -563,6 +1217,11 @@ fn decode_one_copy_row(
     let raw_cells = match opts.format {
         ServerCopyFormat::Text => parse_text_row(line, opts)?,
         ServerCopyFormat::Csv => parse_csv_row(line, opts)?,
+        ServerCopyFormat::Binary => {
+            return Err(ServerError::CopyFormat(
+                "binary COPY rows are decoded by binary parser".to_string(),
+            ));
+        }
     };
     if raw_cells.len() != schema.len() {
         return Err(ServerError::CopyFormat(format!(

@@ -50,6 +50,8 @@ SELECT * FROM pg_stat_bgwriter;
 SELECT * FROM pg_stat_wal;
 SELECT * FROM pg_replication_slots;
 SELECT * FROM pg_stat_replication;
+SELECT pg_start_backup('operator-backup');
+SELECT pg_stop_backup();
 ```
 
 Compatibility view shapes exist so tools do not fail during introspection.
@@ -65,17 +67,27 @@ cargo run --bin ultrasql -- --ctl standby --data-dir target/standby-data
 cargo run --bin ultrasql -- --ctl recovery --data-dir target/restore-data --recovery-target-lsn 0/16B6C50
 cargo run --bin ultrasql -- --waldump path/to/wal.segment
 cargo run --bin ultrasql -- --basebackup target/backup-001 --data-dir target/ultrasql-data
+cargo run --bin ultrasql -- --pg-dump target/dump.ultra --dump-format custom --data-dir target/ultrasql-data
+cargo run --bin ultrasql -- --pg-dump target/dump-dir --dump-format directory --data-dir target/ultrasql-data
+cargo run --bin ultrasql -- --pg-restore target/dump.ultra --data-dir target/restored-data
 cargo run --bin ultrasql -- --archive-wal target/ultrasql-data/pg_wal/00000001 --archive-dir target/archive
 cargo run --bin ultrasql -- --restore-wal 00000001 --archive-dir target/archive --restore-output target/restore/00000001
+cargo run --bin ultrasql -- --wal-send-once target/ship --archive-dir target/archive --replication-slot standby1
+cargo run --bin ultrasql -- --wal-receive-once target/ship --data-dir target/standby-data
 ```
 
 `--ctl initdb` creates a local directory skeleton. `--ctl start` prints the
 server command for service managers. `--ctl status` checks readiness.
 `--ctl standby` and `--ctl recovery` create PostgreSQL-style signal
 files for orchestration. `--basebackup` copies the data directory and writes
-`backup_manifest.json` with file sizes and checksums. `--archive-wal` and
-`--restore-wal` provide shell-safe archive/restore commands. `--waldump`
-prints deterministic offsets and bytes for inspection.
+`backup_manifest.json` with file sizes and checksums. `--pg-dump` and
+`--pg-restore` provide UltraSQL archive/directory export and restore paths for
+operator drills. `--archive-wal` and `--restore-wal` provide shell-safe
+archive/restore commands. `--wal-send-once` and `--wal-receive-once` provide
+file-backed physical WAL shipping with slot state under `pg_replslot`; receiving
+WAL writes `standby.signal`, and `ultrasqld --data-dir` serves hot-standby
+read queries read-only when that signal exists. `--waldump` prints deterministic
+offsets and bytes for inspection.
 
 ## Benchmark certification
 

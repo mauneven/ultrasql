@@ -129,6 +129,12 @@ fn main() -> std::process::ExitCode {
         },
         None => Arc::new(Server::with_sample_database()),
     };
+    if let Some(path) = &cli.data_dir {
+        if path.join("standby.signal").exists() || path.join("recovery.signal").exists() {
+            state.set_standby_mode(true);
+            info!(target: "ultrasqld", data_dir = %path.display(), "hot standby read-only mode enabled");
+        }
+    }
     let outcome = runtime.block_on(async move {
         if let Some(ops_addr) = cli.ops_listen {
             let pg_addr = cli.listen;
@@ -145,7 +151,7 @@ fn main() -> std::process::ExitCode {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
                 loop {
                     ticker.tick().await;
-                    autovacuum_state.note_commit_for_gc();
+                    autovacuum_state.run_autovacuum_cycle();
                 }
             });
         }

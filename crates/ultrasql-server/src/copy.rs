@@ -45,6 +45,8 @@ pub enum CopyFormat {
     /// PostgreSQL CSV format: comma-separated, double-quoted strings,
     /// configurable NULL marker (empty string by default).
     Csv,
+    /// PostgreSQL binary COPY format.
+    Binary,
 }
 
 /// Options parsed from a `COPY … WITH (…)` clause.
@@ -318,24 +320,33 @@ fn finalise_csv_column(
 
 /// Build the `CopyOutResponse` message for a COPY TO STDOUT operation.
 ///
-/// `n_columns` is the number of output columns; all use text format (0).
+/// `n_columns` is the number of output columns; all use `format_code`.
 #[must_use]
 pub fn copy_out_response(n_columns: usize) -> BackendMessage {
+    copy_out_response_with_format(n_columns, 0)
+}
+
+#[must_use]
+pub fn copy_out_response_with_format(n_columns: usize, format_code: u16) -> BackendMessage {
     BackendMessage::CopyOutResponse {
-        overall_format: 0, // text
-        column_formats: vec![0u16; n_columns],
+        overall_format: format_code,
+        column_formats: vec![format_code; n_columns],
     }
 }
 
 /// Build the `CopyInResponse` message for a COPY FROM STDIN operation.
 ///
-/// `n_columns` is the number of expected input columns; all use text
-/// format (0).
+/// `n_columns` is the number of expected input columns; all use text format.
 #[must_use]
 pub fn copy_in_response(n_columns: usize) -> BackendMessage {
+    copy_in_response_with_format(n_columns, 0)
+}
+
+#[must_use]
+pub fn copy_in_response_with_format(n_columns: usize, format_code: u16) -> BackendMessage {
     BackendMessage::CopyInResponse {
-        overall_format: 0, // text
-        column_formats: vec![0u16; n_columns],
+        overall_format: format_code,
+        column_formats: vec![format_code; n_columns],
     }
 }
 

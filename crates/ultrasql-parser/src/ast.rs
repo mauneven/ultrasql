@@ -225,6 +225,8 @@ pub enum CopySource {
     Stdin,
     /// `STDOUT` — the server streams `CopyData` frames to the client.
     Stdout,
+    /// Server-side file path.
+    File(String),
 }
 
 /// Wire-format kind for a `COPY` statement.
@@ -234,6 +236,8 @@ pub enum CopyFormat {
     Text,
     /// PostgreSQL CSV format — comma-separated, quoted strings.
     Csv,
+    /// PostgreSQL binary COPY format.
+    Binary,
 }
 
 /// One `WITH (…)` option of a `COPY` statement.
@@ -249,11 +253,13 @@ pub enum CopyOption {
     Null(String),
 }
 
-/// `COPY table [(col_list)] { FROM | TO } { STDIN | STDOUT } [WITH (…)]`.
+/// `COPY table [(col_list)] ...` or `COPY (SELECT ...) TO ...`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CopyStmt {
-    /// Target relation.
-    pub table: ObjectName,
+    /// Target relation. `None` when copying a query result.
+    pub table: Option<ObjectName>,
+    /// Query target for `COPY (SELECT ...) TO ...`.
+    pub query: Option<Box<SelectStmt>>,
     /// Optional column list `(col1, col2, …)`. Empty means "every column
     /// in natural order".
     pub columns: Vec<Identifier>,
