@@ -123,8 +123,8 @@ pub use materialize::Materialize;
 pub use mem_table_scan::MemTableScan;
 pub use merge_join::MergeJoin;
 pub use modify::{
-    InsertIndexEncoder, InsertIndexMaintainer, ModifyKind, ModifyTable, RowConstraintCheck,
-    RowUpdateConstraintCheck, SequenceDefault, SequenceNextvalObserver,
+    InsertConflictAction, InsertIndexEncoder, InsertIndexMaintainer, ModifyKind, ModifyTable,
+    RowConstraintCheck, RowUpdateConstraintCheck, SequenceDefault, SequenceNextvalObserver,
 };
 pub use nested_loop_join::{NestedLoopJoin, RightFactory};
 pub use parallel_seq_scan::{ParallelSeqScan, choose_parallel_seq_scan_workers};

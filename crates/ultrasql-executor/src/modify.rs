@@ -111,6 +111,7 @@ pub struct InsertIndexMaintainer<L: PageLoader> {
     tree: BTree<L>,
     encode: InsertIndexEncoder,
     unique: bool,
+    key_columns: Vec<usize>,
     brin: Option<Arc<BrinIndex>>,
 }
 
@@ -136,8 +137,16 @@ impl<L: PageLoader> InsertIndexMaintainer<L> {
             tree,
             encode,
             unique,
+            key_columns: Vec::new(),
             brin: None,
         }
+    }
+
+    /// Attach target-table column indices covered by this index key.
+    #[must_use]
+    pub fn with_key_columns(mut self, columns: Vec<usize>) -> Self {
+        self.key_columns = columns;
+        self
     }
 
     /// Attach the in-memory BRIN summary maintained beside this index.
@@ -152,9 +161,12 @@ impl<L: PageLoader> InsertIndexMaintainer<L> {
     }
 
     fn contains_key(&self, key: i64) -> Result<bool, ExecError> {
+        self.lookup_tid(key).map(|tid| tid.is_some())
+    }
+
+    fn lookup_tid(&self, key: i64) -> Result<Option<TupleId>, ExecError> {
         self.tree
             .lookup::<i64>(key)
-            .map(|tid| tid.is_some())
             .map_err(|e| ExecError::TypeMismatch(format!("index lookup {}: {e}", self.name)))
     }
 
@@ -310,6 +322,31 @@ pub enum ModifyKind {
     Delete,
 }
 
+/// Runtime action for `INSERT ... ON CONFLICT`.
+#[derive(Clone, Debug)]
+pub enum InsertConflictAction {
+    /// `ON CONFLICT [target] DO NOTHING`.
+    DoNothing {
+        /// Optional conflict target column set.
+        target: Option<Vec<usize>>,
+    },
+    /// `ON CONFLICT target DO UPDATE SET ...`.
+    DoUpdate {
+        /// Conflict target column set.
+        target: Vec<usize>,
+        /// Assignment evaluators applied to the existing row.
+        assignments: Vec<(usize, Eval)>,
+        /// Optional predicate evaluated against the existing row.
+        predicate: Option<Eval>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InsertConflict {
+    Existing(TupleId),
+    InBatch,
+}
+
 // ---------------------------------------------------------------------------
 // ModifyTable
 // ---------------------------------------------------------------------------
@@ -363,6 +400,7 @@ pub struct ModifyTable<L: PageLoader> {
     insert_indexes: Vec<InsertIndexMaintainer<L>>,
     update_indexes: Vec<InsertIndexMaintainer<L>>,
     delete_indexes: Vec<InsertIndexMaintainer<L>>,
+    insert_conflict_action: Option<InsertConflictAction>,
     insert_column_map: Option<Vec<usize>>,
     column_defaults: Vec<Option<Eval>>,
     sequence_defaults: Vec<Option<SequenceDefault>>,
@@ -463,6 +501,7 @@ impl<L: PageLoader> ModifyTable<L> {
             insert_indexes: Vec::new(),
             update_indexes: Vec::new(),
             delete_indexes: Vec::new(),
+            insert_conflict_action: None,
             insert_column_map: None,
             column_defaults: Vec::new(),
             sequence_defaults: Vec::new(),
@@ -511,6 +550,13 @@ impl<L: PageLoader> ModifyTable<L> {
     #[must_use]
     pub fn with_delete_indexes(mut self, indexes: Vec<InsertIndexMaintainer<L>>) -> Self {
         self.delete_indexes = indexes;
+        self
+    }
+
+    /// Attach `INSERT ... ON CONFLICT` behavior.
+    #[must_use]
+    pub fn with_insert_conflict_action(mut self, action: InsertConflictAction) -> Self {
+        self.insert_conflict_action = Some(action);
         self
     }
 
@@ -708,6 +754,30 @@ fn detect_update_int32_pair_fast_path(
     })
 }
 
+fn conflict_target_columns(action: &InsertConflictAction) -> Option<&[usize]> {
+    match action {
+        InsertConflictAction::DoNothing { target } => target.as_deref(),
+        InsertConflictAction::DoUpdate { target, .. } => Some(target.as_slice()),
+    }
+}
+
+fn insert_conflict_uses_index<L: PageLoader>(
+    action: &InsertConflictAction,
+    index: &InsertIndexMaintainer<L>,
+) -> bool {
+    if !index.is_unique() {
+        return false;
+    }
+    match conflict_target_columns(action) {
+        Some(target) => columns_match_unordered(&index.key_columns, target),
+        None => true,
+    }
+}
+
+fn columns_match_unordered(left: &[usize], right: &[usize]) -> bool {
+    left.len() == right.len() && left.iter().all(|col| right.contains(col))
+}
+
 impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for ModifyTable<L> {
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
         if self.done {
@@ -848,6 +918,8 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     } else {
                         Vec::new()
                     };
+                    let conflict_action = self.insert_conflict_action.clone();
+                    self.validate_insert_conflict_arbiter(conflict_action.as_ref())?;
                     for row in &rows {
                         let mut expanded_row;
                         let omitted;
@@ -890,14 +962,70 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             self.check_foreign_keys(target_row)?;
                         }
                         check_not_null_violations(target_row, target_schema)?;
-                        for (idx, index) in self.insert_indexes.iter_mut().enumerate() {
-                            let key = index.encode_key(target_row)?;
-                            if let Some(k) = key {
-                                if index.is_unique()
-                                    && (!seen_keys[idx].insert(k) || index.contains_key(k)?)
-                                {
-                                    return Err(ExecError::UniqueViolation(index.name.clone()));
+                        let row_index_keys = self
+                            .insert_indexes
+                            .iter()
+                            .map(|index| index.encode_key(target_row))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if let Some(action) = &conflict_action {
+                            if let Some(conflict) =
+                                self.find_insert_conflict(action, &row_index_keys, &seen_keys)?
+                            {
+                                match action {
+                                    InsertConflictAction::DoNothing { .. } => continue,
+                                    InsertConflictAction::DoUpdate {
+                                        assignments,
+                                        predicate,
+                                        ..
+                                    } => {
+                                        let InsertConflict::Existing(tid) = conflict else {
+                                            return Err(ExecError::TypeMismatch(
+                                                "ON CONFLICT DO UPDATE cannot affect the same row twice"
+                                                    .to_owned(),
+                                            ));
+                                        };
+                                        let tuple = self.heap.fetch(tid).map_err(|e| {
+                                            ExecError::TypeMismatch(format!(
+                                                "ON CONFLICT fetch existing tuple: {e}"
+                                            ))
+                                        })?;
+                                        let old_row =
+                                            self.codec.decode(&tuple.data).map_err(|e| {
+                                                ExecError::TypeMismatch(format!(
+                                                    "ON CONFLICT decode existing tuple: {e}"
+                                                ))
+                                            })?;
+                                        if let Some(computed) = self.compute_conflict_update_edit(
+                                            tid,
+                                            &old_row,
+                                            target_row,
+                                            assignments,
+                                            predicate.as_ref(),
+                                            returning_active,
+                                        )? {
+                                            if let Some(index_change) = computed.index_change {
+                                                all_update_index_changes.push(index_change);
+                                            }
+                                            if let Some(returning_row) = computed.returning_row {
+                                                returning_rows.push(
+                                                    self.evaluate_returning_row(&returning_row)?,
+                                                );
+                                            }
+                                            all_update_edits.push((computed.tid, computed.payload));
+                                        }
+                                        continue;
+                                    }
                                 }
+                            }
+                            self.remember_insert_keys(&row_index_keys, &mut seen_keys);
+                        } else {
+                            self.reject_duplicate_insert_keys(&row_index_keys, &mut seen_keys)?;
+                        }
+                        for (idx, key) in row_index_keys.iter().copied().enumerate() {
+                            if idx >= index_keys.len() {
+                                return Err(ExecError::Internal(
+                                    "insert index key vector width mismatch",
+                                ));
                             }
                             index_keys[idx].push(key);
                         }
@@ -953,7 +1081,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
 
         // Single bulk UPDATE call after every input batch has been
         // accumulated. See the `all_update_edits` comment above.
-        if matches!(self.kind, ModifyKind::Update { .. }) && !all_update_edits.is_empty() {
+        if !all_update_edits.is_empty() {
             let n = all_update_edits.len();
             let wal = self.wal.clone();
             let wal_ref: Option<&dyn WalSink> = wal.as_deref();
@@ -1118,6 +1246,94 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             index_change,
             returning_row: capture_returning_row.then_some(new_row),
         })
+    }
+
+    fn compute_conflict_update_edit(
+        &self,
+        tid: TupleId,
+        orig_row: &[Value],
+        excluded_row: &[Value],
+        assignments: &[(usize, Eval)],
+        predicate: Option<&Eval>,
+        capture_returning_row: bool,
+    ) -> Result<Option<ComputedUpdate>, ExecError> {
+        let mut eval_row = Vec::with_capacity(orig_row.len().saturating_add(excluded_row.len()));
+        eval_row.extend_from_slice(orig_row);
+        eval_row.extend_from_slice(excluded_row);
+        if let Some(predicate) = predicate {
+            match predicate
+                .eval(&eval_row)
+                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+            {
+                Value::Bool(true) => {}
+                Value::Bool(false) | Value::Null => return Ok(None),
+                other => {
+                    return Err(ExecError::TypeMismatch(format!(
+                        "ON CONFLICT DO UPDATE WHERE returned {:?}, expected Bool",
+                        other.data_type()
+                    )));
+                }
+            }
+        }
+
+        let relation_cols = self.codec.schema().len();
+        let mut new_row: Vec<Value> = orig_row.to_vec();
+        if new_row.len() != relation_cols {
+            return Err(ExecError::TypeMismatch(format!(
+                "ON CONFLICT row has {} columns, expected {}",
+                new_row.len(),
+                relation_cols,
+            )));
+        }
+        let old_keys = self.encode_update_index_keys(orig_row)?;
+
+        for (col_idx, evaluator) in assignments {
+            if self
+                .generated_stored
+                .get(*col_idx)
+                .is_some_and(Option::is_some)
+            {
+                return Err(ExecError::GeneratedAlwaysViolation(
+                    self.codec.schema().field_at(*col_idx).name.clone(),
+                ));
+            }
+            if *col_idx >= relation_cols {
+                return Err(ExecError::TypeMismatch(format!(
+                    "ON CONFLICT assignment column index {col_idx} out of range (relation has {relation_cols} columns)"
+                )));
+            }
+            new_row[*col_idx] = evaluator
+                .eval(&eval_row)
+                .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+        }
+        self.apply_generated_stored(&mut new_row)?;
+        check_not_null_violations(&new_row, self.codec.schema())?;
+        self.check_row_constraints(&new_row)?;
+        self.check_foreign_keys(&new_row)?;
+        self.check_exclusion_update(orig_row, &new_row)?;
+        self.check_referenced_by_update(orig_row, &new_row)?;
+        let new_keys = self.encode_update_index_keys(&new_row)?;
+
+        let new_payload = self
+            .codec
+            .encode(&new_row)
+            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+        let payload = UpdatePayload::from_vec(new_payload);
+        let index_change = if self.update_indexes.is_empty() {
+            None
+        } else {
+            Some(UpdateIndexChange {
+                old_tid: tid,
+                old_keys,
+                new_keys,
+            })
+        };
+        Ok(Some(ComputedUpdate {
+            tid,
+            payload,
+            index_change,
+            returning_row: capture_returning_row.then_some(new_row),
+        }))
     }
 
     fn evaluate_returning_row(&self, row: &[Value]) -> Result<Vec<Value>, ExecError> {
@@ -1330,6 +1546,82 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             .iter()
             .map(|index| index.encode_key(row))
             .collect()
+    }
+
+    fn validate_insert_conflict_arbiter(
+        &self,
+        action: Option<&InsertConflictAction>,
+    ) -> Result<(), ExecError> {
+        let Some(action) = action else {
+            return Ok(());
+        };
+        let Some(target) = conflict_target_columns(action) else {
+            return Ok(());
+        };
+        if self
+            .insert_indexes
+            .iter()
+            .any(|index| index.is_unique() && columns_match_unordered(&index.key_columns, target))
+        {
+            return Ok(());
+        }
+        Err(ExecError::TypeMismatch(format!(
+            "ON CONFLICT target {:?} does not match a unique index",
+            target
+        )))
+    }
+
+    fn find_insert_conflict(
+        &self,
+        action: &InsertConflictAction,
+        row_keys: &[Option<i64>],
+        seen_keys: &[HashSet<i64>],
+    ) -> Result<Option<InsertConflict>, ExecError> {
+        for (idx, index) in self.insert_indexes.iter().enumerate() {
+            if !insert_conflict_uses_index(action, index) {
+                continue;
+            }
+            let Some(key) = row_keys.get(idx).copied().flatten() else {
+                continue;
+            };
+            if seen_keys.get(idx).is_some_and(|seen| seen.contains(&key)) {
+                return Ok(Some(InsertConflict::InBatch));
+            }
+            if let Some(tid) = index.lookup_tid(key)? {
+                return Ok(Some(InsertConflict::Existing(tid)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn reject_duplicate_insert_keys(
+        &self,
+        row_keys: &[Option<i64>],
+        seen_keys: &mut [HashSet<i64>],
+    ) -> Result<(), ExecError> {
+        for (idx, index) in self.insert_indexes.iter().enumerate() {
+            let Some(key) = row_keys.get(idx).copied().flatten() else {
+                continue;
+            };
+            if !index.is_unique() {
+                continue;
+            }
+            if !seen_keys[idx].insert(key) || index.contains_key(key)? {
+                return Err(ExecError::UniqueViolation(index.name.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    fn remember_insert_keys(&self, row_keys: &[Option<i64>], seen_keys: &mut [HashSet<i64>]) {
+        for (idx, index) in self.insert_indexes.iter().enumerate() {
+            let Some(key) = row_keys.get(idx).copied().flatten() else {
+                continue;
+            };
+            if index.is_unique() {
+                seen_keys[idx].insert(key);
+            }
+        }
     }
 
     fn apply_update_index_changes(

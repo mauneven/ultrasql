@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use ultrasql_core::Schema;
+use ultrasql_core::{RelationId, Schema, Value, constants::PAGE_SIZE};
 use ultrasql_executor::unique::UniqueMode;
 use ultrasql_executor::{
     Filter, HashAggregate, Limit, Operator, ResultOp, Sort, Unique, ValuesScan,
@@ -139,6 +139,7 @@ pub fn lower_query(
             exprs,
             schema,
         } => {
+            let exprs = rewrite_catalog_scalar_functions(exprs, ctx)?;
             // `SELECT <const>` (no FROM) lowers Project(Empty) → ResultOp,
             // a single-row constant emitter. The general path below would
             // try to lower Empty into a scan, which has no meaning when
@@ -147,11 +148,11 @@ pub fn lower_query(
                 let scalars: Vec<ScalarExpr> = exprs.iter().map(|(e, _)| e.clone()).collect();
                 return Ok(Box::new(ResultOp::new(scalars, schema.clone())));
             }
-            if let Some(op) = try_index_only_scan(input, exprs, ctx)? {
+            if let Some(op) = try_index_only_scan(input, &exprs, ctx)? {
                 return Ok(op);
             }
             let child = lower_query(input, ctx)?;
-            lower_project_columns(child, exprs)
+            lower_project_columns(child, &exprs)
         }
         LogicalPlan::Filter { input, predicate } => {
             // Index-aware fast path: when the filter sits directly on top
@@ -452,6 +453,135 @@ pub fn lower_query(
             )))
         }
     }
+}
+
+fn rewrite_catalog_scalar_functions(
+    exprs: &[(ScalarExpr, String)],
+    ctx: &super::LowerCtx<'_>,
+) -> Result<Vec<(ScalarExpr, String)>, ServerError> {
+    exprs
+        .iter()
+        .map(|(expr, alias)| Ok((rewrite_catalog_scalar_expr(expr, ctx)?, alias.clone())))
+        .collect()
+}
+
+fn rewrite_catalog_scalar_expr(
+    expr: &ScalarExpr,
+    ctx: &super::LowerCtx<'_>,
+) -> Result<ScalarExpr, ServerError> {
+    match expr {
+        ScalarExpr::Unary {
+            op,
+            expr: inner,
+            data_type,
+        } => Ok(ScalarExpr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_catalog_scalar_expr(inner, ctx)?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::Binary {
+            op,
+            left,
+            right,
+            data_type,
+        } => Ok(ScalarExpr::Binary {
+            op: *op,
+            left: Box::new(rewrite_catalog_scalar_expr(left, ctx)?),
+            right: Box::new(rewrite_catalog_scalar_expr(right, ctx)?),
+            data_type: data_type.clone(),
+        }),
+        ScalarExpr::IsNull {
+            expr: inner,
+            negated,
+        } => Ok(ScalarExpr::IsNull {
+            expr: Box::new(rewrite_catalog_scalar_expr(inner, ctx)?),
+            negated: *negated,
+        }),
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } if name == "pg_relation_size" => {
+            let rewritten_args: Result<Vec<_>, _> = args
+                .iter()
+                .map(|arg| rewrite_catalog_scalar_expr(arg, ctx))
+                .collect();
+            let rewritten_args = rewritten_args?;
+            Ok(ScalarExpr::Literal {
+                value: relation_size_from_literal_args(&rewritten_args, ctx)?,
+                data_type: data_type.clone(),
+            })
+        }
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => {
+            let rewritten_args: Result<Vec<_>, _> = args
+                .iter()
+                .map(|arg| rewrite_catalog_scalar_expr(arg, ctx))
+                .collect();
+            Ok(ScalarExpr::FunctionCall {
+                name: name.clone(),
+                args: rewritten_args?,
+                data_type: data_type.clone(),
+            })
+        }
+        _ => Ok(expr.clone()),
+    }
+}
+
+fn relation_size_from_literal_args(
+    args: &[ScalarExpr],
+    ctx: &super::LowerCtx<'_>,
+) -> Result<Value, ServerError> {
+    if args.len() != 1 {
+        return Err(ServerError::Unsupported(
+            "pg_relation_size expects exactly one relation argument",
+        ));
+    }
+    let ScalarExpr::Literal { value, .. } = &args[0] else {
+        return Err(ServerError::Unsupported(
+            "pg_relation_size currently requires a literal relation name",
+        ));
+    };
+    let relation_name = match value {
+        Value::Null => return Ok(Value::Null),
+        Value::Text(s) => s,
+        other => {
+            return Err(ServerError::Unsupported(Box::leak(
+                format!(
+                    "pg_relation_size expects text/regclass relation name, got {:?}",
+                    other.data_type()
+                )
+                .into_boxed_str(),
+            )));
+        }
+    };
+    let entry = resolve_relation_size_entry(relation_name, ctx).ok_or_else(|| {
+        ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+            relation_name.to_owned(),
+        ))
+    })?;
+    let blocks = ctx
+        .heap
+        .block_count(RelationId(entry.oid))
+        .max(entry.n_blocks);
+    let bytes = u64::from(blocks).saturating_mul(PAGE_SIZE as u64);
+    Ok(Value::Int64(i64::try_from(bytes).unwrap_or(i64::MAX)))
+}
+
+fn resolve_relation_size_entry<'a>(
+    relation_name: &str,
+    ctx: &'a super::LowerCtx<'_>,
+) -> Option<&'a ultrasql_catalog::TableEntry> {
+    let folded = relation_name.to_ascii_lowercase();
+    if let Some(entry) = ctx.catalog_snapshot.tables.get(&folded) {
+        return Some(entry);
+    }
+    folded
+        .rsplit_once('.')
+        .and_then(|(_, unqualified)| ctx.catalog_snapshot.tables.get(unqualified))
 }
 
 fn lower_window_func(func: &ultrasql_planner::LogicalWindowFunc) -> ultrasql_executor::WindowFunc {

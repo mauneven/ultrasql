@@ -29,6 +29,7 @@ const PG_TYPE_DATE: i32 = 1082;
 const PG_TYPE_TIMESTAMP: i32 = 1114;
 const PG_TYPE_TIMESTAMPTZ: i32 = 1184;
 const PG_TYPE_TIME: i32 = 1083;
+const PG_TYPE_UUID: i32 = 2950;
 
 /// Return the schema for a virtual catalog relation or view.
 #[must_use]
@@ -299,6 +300,7 @@ fn type_oid(dt: &DataType) -> i32 {
         DataType::Timestamp => PG_TYPE_TIMESTAMP,
         DataType::TimestampTz => PG_TYPE_TIMESTAMPTZ,
         DataType::Time => PG_TYPE_TIME,
+        DataType::Uuid => PG_TYPE_UUID,
         _ => PG_TYPE_TEXT,
     }
 }

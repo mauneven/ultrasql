@@ -19,10 +19,18 @@
 //! - `IsNull { expr, negated }` -- SQL `IS [NOT] NULL`
 //! - Other variants (`Cast`, `Subquery`, `Exists`, ...) -- [`EvalError::Unsupported`]
 
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::Read;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use ultrasql_core::Value;
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp};
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
+static UUID_FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -241,6 +249,12 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "upper" => eval_text_case(args, TextCase::Upper),
         "pg_get_userbyid" => eval_pg_get_userbyid(args),
         "substring" => eval_substring(args),
+        "gen_random_uuid" => eval_gen_random_uuid(args),
+        "version" => eval_zero_arg_text(args, "UltraSQL 0.0.1"),
+        "current_database" => eval_zero_arg_text(args, "ultrasql"),
+        "current_user" | "session_user" => eval_zero_arg_text(args, "user"),
+        "pg_typeof" => eval_pg_typeof(args),
+        "pg_size_pretty" => eval_pg_size_pretty(args),
         "coalesce" => Ok(args
             .iter()
             .find(|v| !matches!(v, Value::Null))
@@ -252,6 +266,99 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             format!("function `{other}` not implemented").into_boxed_str(),
         ))),
     }
+}
+
+fn eval_zero_arg_text(args: &[Value], value: &'static str) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::Type(format!(
+            "zero-argument system function: expected 0 args, got {}",
+            args.len()
+        )));
+    }
+    Ok(Value::Text(value.to_owned()))
+}
+
+fn eval_pg_typeof(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "pg_typeof: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    Ok(Value::Text(args[0].data_type().to_string()))
+}
+
+fn eval_pg_size_pretty(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "pg_size_pretty: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(bytes) = args[0].as_i64() else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "pg_size_pretty: integer argument required, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    Ok(Value::Text(format_size_pretty(bytes)))
+}
+
+fn format_size_pretty(bytes: i64) -> String {
+    let sign = if bytes < 0 { "-" } else { "" };
+    let mut value = bytes.unsigned_abs();
+    let units = ["bytes", "kB", "MB", "GB", "TB", "PB"];
+    let mut unit_idx = 0_usize;
+    while value >= 1024 && unit_idx + 1 < units.len() {
+        value /= 1024;
+        unit_idx += 1;
+    }
+    format!("{sign}{value} {}", units[unit_idx])
+}
+
+fn eval_gen_random_uuid(args: &[Value]) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::Type(format!(
+            "gen_random_uuid: expected 0 args, got {}",
+            args.len()
+        )));
+    }
+    let mut bytes = random_uuid_bytes();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(Value::Uuid(bytes))
+}
+
+fn random_uuid_bytes() -> [u8; 16] {
+    let mut bytes = [0_u8; 16];
+    #[cfg(unix)]
+    {
+        if let Ok(mut file) = File::open("/dev/urandom")
+            && file.read_exact(&mut bytes).is_ok()
+        {
+            return bytes;
+        }
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let low = u64::try_from(now & u128::from(u64::MAX)).unwrap_or(0);
+    let high = u64::try_from(now >> 64).unwrap_or(0);
+    let counter = UUID_FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut state = low ^ high.rotate_left(17) ^ counter.rotate_left(31);
+    for chunk in bytes.chunks_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let word = state.to_le_bytes();
+        chunk.copy_from_slice(&word[..chunk.len()]);
+    }
+    bytes
 }
 
 fn eval_abs(args: &[Value]) -> Result<Value, EvalError> {

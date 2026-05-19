@@ -252,12 +252,12 @@ real wire protocol.
    `crates/ultrasql-storage/tests/recovery_sim.rs`
    (`crash_recovery_in_place_update_restores_post_image_and_undo_log`,
    `crash_recovery_in_place_delete_stamps_xmax`) cover both
-   paths. **Remaining work** (Item 1 Part C): plumb the on-disk
-   `WalWriter` into `BufferPool::with_wal` at server start so
-   the runtime path is durable end to end. Until that ships
-   the server constructs `BufferPool::new()` and the fused
-   paths receive `None`, so the bench numbers below still
-   reflect a non-durable runtime configuration.
+   paths. `Server::init(data_dir)` now owns the on-disk
+   `WalWriter`, installs a `WalBufferSink` through
+   `BufferPool::with_wal`, and drains/fsyncs pending records when the
+   server drops. `server_init_retains_wal_writer_and_flushes_on_drop`
+   covers the runtime bridge by appending through the server-owned WAL
+   sink and recovering the flushed record from `data_dir/pg_wal`.
 2. **Shape specialisation.** `FusedUpdateInt32Add`,
    `FusedDeleteInt32Pair`, `write_int32_pair_data_rows`, and the
    in-place undo path all match exactly the `(Int32, Int32) col
@@ -273,10 +273,12 @@ real wire protocol.
    `EXPLAIN` / `EXPLAIN ANALYZE` / `EXPLAIN (FORMAT JSON)`, manual
    `ANALYZE`, `COPY FROM STDIN` / `COPY TO STDOUT`, `CancelRequest`,
    and `LISTEN`/`NOTIFY`/`UNLISTEN` are now wired and covered by
-   round-trip tests. **Remaining gaps**: `INSERT … ON CONFLICT`,
-   durable bootstrap for expression-bearing defaults/constraints, broad
-   psql meta-command coverage beyond the current `\d` slice, runtime
-   WAL-sink durability for the in-place fast paths, and broad
+   round-trip tests. `INSERT … ON CONFLICT DO NOTHING / DO UPDATE`
+   is wired through parser, binder, executor, unique-index arbitration,
+   `EXCLUDED.col` update expressions/predicates, and PostgreSQL-wire
+   tests. **Remaining gaps**: durable bootstrap for
+   expression-bearing defaults/constraints, broad
+   psql meta-command coverage beyond the current `\d` slice, and broad
    performance certification. Shape specialisation (fused paths) still
    applies.
 
@@ -1638,7 +1640,7 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [ ] `CHAR(n)`, `VARCHAR(n)`, `TEXT`, `BYTEA`
 - [ ] `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`
 - [ ] `BOOLEAN`
-- [ ] `UUID` + `gen_random_uuid()`
+- [x] `UUID` + `gen_random_uuid()`
 - [ ] `BIT(n)` / `BIT VARYING(n)`
 - [ ] `INET`, `CIDR`, `MACADDR`, `MACADDR8`
 - [ ] `POINT`, `LINE`, `LSEG`, `BOX`, `PATH`, `POLYGON`, `CIRCLE`
@@ -1660,7 +1662,9 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [ ] Window: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE
 - [ ] JSON: row_to_json, json_build_object, json_each, jsonb_set, jsonb_path_query
 - [ ] Array: array_length, array_cat, unnest, array_agg, array_to_string, string_to_array
-- [ ] System: version(), current_database(), current_user, pg_typeof(), pg_relation_size(), pg_size_pretty()
+- [x] System: version(), current_database(), current_user/session_user
+  (function-call and bare keyword forms), pg_typeof(), pg_size_pretty()
+  and catalog-backed pg_relation_size() are wired.
 - [x] Sequence: nextval(), currval(), lastval(), setval() (Simple Query path; Extended Query expression-function dispatch remains broader function-work)
 
 ### Security

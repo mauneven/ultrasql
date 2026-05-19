@@ -220,11 +220,13 @@ fn bind_on_conflict(
             ..
         } => {
             let resolved_target = bind_conflict_target(target, table_schema)?;
-            let assignments = bind_assignments(set, table_schema, catalog, scope)?;
+            let conflict_schema = conflict_update_schema(table_schema)?;
+            let assignments =
+                bind_assignments(set, table_schema, &conflict_schema, catalog, scope)?;
             let where_expr = r#where
                 .as_ref()
                 .map(|e| {
-                    let pred = bind_expr(e, table_schema, catalog, scope)?;
+                    let pred = bind_expr(e, &conflict_schema, catalog, scope)?;
                     if pred.data_type() != DataType::Bool && pred.data_type() != DataType::Null {
                         return Err(PlanError::TypeMismatch(
                             "ON CONFLICT DO UPDATE WHERE predicate must be boolean".into(),
@@ -258,10 +260,23 @@ fn bind_conflict_target(
     Ok(ConflictTarget { columns })
 }
 
+fn conflict_update_schema(table_schema: &Schema) -> Result<Schema, PlanError> {
+    let mut fields = Vec::with_capacity(table_schema.len() * 2);
+    fields.extend(table_schema.fields().iter().cloned());
+    fields.extend(table_schema.fields().iter().map(|field| Field {
+        name: format!("excluded.{}", field.name),
+        data_type: field.data_type.clone(),
+        nullable: field.nullable,
+    }));
+    Schema::new(fields).map_err(|e| PlanError::TypeMismatch(e.to_string()))
+}
+
 /// Bind a list of `col = expr` assignments into `(index, ScalarExpr)` pairs.
 ///
 /// Each target column name is resolved against `table_schema`. Expression
-/// values are bound against the same schema (the pre-update row view).
+/// values are bound against `value_schema`. For plain `UPDATE`, this is the
+/// pre-update row view. For `ON CONFLICT DO UPDATE`, it is
+/// `[target columns..., excluded.target columns...]`.
 ///
 /// PostgreSQL rejects `UPDATE t SET col=1, col=2`; this function mirrors
 /// that behaviour by returning [`PlanError::DuplicateColumn`] on the first
@@ -269,6 +284,7 @@ fn bind_conflict_target(
 fn bind_assignments(
     set: &[Assignment],
     table_schema: &Schema,
+    value_schema: &Schema,
     catalog: &dyn Catalog,
     scope: &mut ScopeStack,
 ) -> Result<Vec<(usize, ScalarExpr)>, PlanError> {
@@ -283,7 +299,7 @@ fn bind_assignments(
         if !seen.insert(idx) {
             return Err(PlanError::DuplicateColumn(a.target.value.clone()));
         }
-        let mut expr = bind_expr(&a.value, table_schema, catalog, scope)?;
+        let mut expr = bind_expr(&a.value, value_schema, catalog, scope)?;
         let target = &table_schema.field_at(idx).data_type;
         coerce_literal_to_type(&mut expr, target);
         out.push((idx, expr));
@@ -342,7 +358,7 @@ pub(super) fn bind_update(
     }
 
     // Assignments — value expressions are bound against the table schema.
-    let assignments = bind_assignments(&s.set, table_schema, catalog, scope)?;
+    let assignments = bind_assignments(&s.set, table_schema, table_schema, catalog, scope)?;
 
     // RETURNING.
     let returning = bind_returning(&s.returning, table_schema, catalog, scope)?;

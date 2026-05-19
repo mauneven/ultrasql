@@ -816,6 +816,7 @@ fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
         "time" => Ok(DataType::Time),
         "timestamp" => Ok(DataType::Timestamp),
         "timestamptz" | "timestamp with time zone" => Ok(DataType::TimestampTz),
+        "uuid" => Ok(DataType::Uuid),
         "int4range" => Ok(DataType::Range(RangeType::Int4)),
         "int8range" => Ok(DataType::Range(RangeType::Int8)),
         "numrange" => Ok(DataType::Range(RangeType::Num)),

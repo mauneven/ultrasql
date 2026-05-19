@@ -712,6 +712,12 @@ pub struct Server {
     /// reject writes before planning so a standby can safely serve analytical
     /// queries while WAL shipping/replay catches up.
     pub standby_mode: std::sync::atomic::AtomicBool,
+    /// Background WAL writer owned by WAL-backed server instances.
+    ///
+    /// `None` means in-memory sample mode. `Some` means `Server::init`
+    /// installed a [`wal_sink::WalBufferSink`] into the buffer pool and this
+    /// handle keeps the drain/fsync thread alive until the server drops.
+    wal_writer: Option<ultrasql_wal::WalWriter>,
 }
 
 /// Authentication policy for incoming connections.
@@ -1422,6 +1428,7 @@ impl Server {
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
             standby_mode: std::sync::atomic::AtomicBool::new(false),
+            wal_writer: None,
         }
     }
 
@@ -1435,6 +1442,17 @@ impl Server {
     #[must_use]
     pub fn is_standby_mode(&self) -> bool {
         self.standby_mode.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// LSN through which the runtime WAL writer has fsynced.
+    ///
+    /// Returns `None` for in-memory sample servers because those instances do
+    /// not own an on-disk WAL writer.
+    #[must_use]
+    pub fn runtime_wal_flushed_lsn(&self) -> Option<ultrasql_core::Lsn> {
+        self.wal_writer
+            .as_ref()
+            .map(ultrasql_wal::WalWriter::flushed_lsn)
     }
 
     /// Flush dirty heap pages into the sample server's spill store.
@@ -1718,17 +1736,12 @@ impl Server {
         tracing::info!(lsn = recovered_lsn.raw(), "WAL recovery complete");
 
         // 5. Background writer thread draining the buffer to disk.
-        let _wal_writer = WalWriter::open(
+        let wal_writer = WalWriter::open(
             &wal_dir,
             Arc::clone(&wal_buffer),
             WalWriterConfig::default(),
         )
         .map_err(|e| ServerError::Io(std::io::Error::other(format!("WAL writer: {e}"))))?;
-        // Leak the writer handle so the background thread survives for the
-        // process lifetime. `WalWriter::drop` logs a warning but the thread
-        // continues draining; explicit shutdown would require Server::Drop
-        // which is deferred to v0.6.
-        std::mem::forget(_wal_writer);
 
         let persistent_catalog = Arc::new(PersistentCatalog::new());
         match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
@@ -1773,6 +1786,7 @@ impl Server {
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
             standby_mode: std::sync::atomic::AtomicBool::new(false),
+            wal_writer: Some(wal_writer),
         })
     }
 

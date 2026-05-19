@@ -198,9 +198,10 @@ pub struct ConflictTarget {
 
 /// The resolved `ON CONFLICT` clause of a logical `Insert` plan node.
 ///
-/// `EXCLUDED` column references inside `DoUpdate::assignments` are not
-/// supported in v0.2; the binder rejects them with
-/// [`crate::error::PlanError::NotSupported`].
+/// `EXCLUDED` column references inside `DoUpdate::assignments` and
+/// `DoUpdate::where` bind as columns after the target-table columns in
+/// the expression input row. The executor evaluates those expressions
+/// against `[existing_row..., excluded_row...]`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LogicalOnConflict {
     /// `ON CONFLICT [target] DO NOTHING`.

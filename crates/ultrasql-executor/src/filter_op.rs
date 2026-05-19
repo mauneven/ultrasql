@@ -784,6 +784,38 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                     }
                 }
             }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Uuid) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => {
+                            let uuid = Value::parse_uuid(v).ok_or_else(|| {
+                                ExecError::TypeMismatch(format!(
+                                    "column {col_idx} ({name}): invalid uuid literal",
+                                    name = field.name,
+                                ))
+                            })?;
+                            row.push(Value::Uuid(uuid));
+                        }
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Bytea) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => {
+                            let bytes = Value::parse_bytea(v).ok_or_else(|| {
+                                ExecError::TypeMismatch(format!(
+                                    "column {col_idx} ({name}): invalid bytea literal",
+                                    name = field.name,
+                                ))
+                            })?;
+                            row.push(Value::Bytea(bytes));
+                        }
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
             (Column::Int32(c), DataType::Date) => {
                 // Date columns store as `Int32` (days since
                 // 2000-01-01). The row materialiser re-tags the value

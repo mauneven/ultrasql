@@ -879,6 +879,10 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
         "lower" | "upper" => Ok(DataType::Text { max_len: None }),
         "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
         "substring" => Ok(DataType::Text { max_len: None }),
+        "gen_random_uuid" => Ok(DataType::Uuid),
+        "pg_relation_size" => Ok(DataType::Int64),
+        "version" | "current_database" | "current_user" | "session_user" | "pg_typeof"
+        | "pg_size_pretty" => Ok(DataType::Text { max_len: None }),
         _ => Err(PlanError::NotSupported("non-aggregate function calls")),
     }
 }
@@ -891,7 +895,20 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
 pub(super) fn is_supported_builtin(func_name: &str) -> bool {
     matches!(
         func_name,
-        "abs" | "extract" | "lower" | "upper" | "pg_get_userbyid" | "substring"
+        "abs"
+            | "extract"
+            | "lower"
+            | "upper"
+            | "pg_get_userbyid"
+            | "substring"
+            | "gen_random_uuid"
+            | "version"
+            | "current_database"
+            | "current_user"
+            | "session_user"
+            | "pg_typeof"
+            | "pg_relation_size"
+            | "pg_size_pretty"
     )
 }
 
@@ -1193,6 +1210,18 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                 *data_type = DataType::Geometry(*geometry_type);
             }
         }
+        (DataType::Uuid, Value::Text(text)) => {
+            if let Some(uuid) = Value::parse_uuid(text) {
+                *value = Value::Uuid(uuid);
+                *data_type = DataType::Uuid;
+            }
+        }
+        (DataType::Bytea, Value::Text(text)) => {
+            if let Some(bytes) = Value::parse_bytea(text) {
+                *value = Value::Bytea(bytes);
+                *data_type = DataType::Bytea;
+            }
+        }
         _ => {}
     }
 }
@@ -1206,10 +1235,12 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "real" | "float4" => Some(DataType::Float32),
         "double" | "float" | "float8" => Some(DataType::Float64),
         "text" | "varchar" | "char" | "character" => Some(DataType::Text { max_len: None }),
+        "bytea" => Some(DataType::Bytea),
         "date" => Some(DataType::Date),
         "time" => Some(DataType::Time),
         "timestamp" => Some(DataType::Timestamp),
         "timestamptz" => Some(DataType::TimestampTz),
+        "uuid" => Some(DataType::Uuid),
         "json" | "jsonb" => Some(DataType::Jsonb),
         "tsvector" | "tsquery" => Some(DataType::Text { max_len: None }),
         "numeric" | "decimal" => Some(DataType::Decimal {
@@ -1305,6 +1336,16 @@ pub(super) fn bind_column(
                 frame_depth: outer_ref.frame_depth,
                 column_index: outer_ref.column_index,
                 data_type: outer_ref.data_type,
+            });
+        }
+        if input.is_empty()
+            && name.parts.len() == 1
+            && matches!(col_name.as_str(), "current_user" | "session_user")
+        {
+            return Ok(ScalarExpr::FunctionCall {
+                name: col_name,
+                args: Vec::new(),
+                data_type: DataType::Text { max_len: None },
             });
         }
         return Err(PlanError::ColumnNotFound(col_name));

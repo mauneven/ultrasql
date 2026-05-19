@@ -46,6 +46,8 @@ const PG_OID_FLOAT8: u32 = 701;
 const PG_OID_TEXT: u32 = 25;
 /// PostgreSQL type OID for `bytea`.
 const PG_OID_BYTEA: u32 = 17;
+/// PostgreSQL type OID for `uuid`.
+const PG_OID_UUID: u32 = 2950;
 /// PostgreSQL format code 0 = text.
 const FORMAT_TEXT: i16 = 0;
 
@@ -575,6 +577,7 @@ const fn pg_type_oid(ty: &DataType) -> u32 {
         DataType::Float32 => PG_OID_FLOAT4,
         DataType::Float64 => PG_OID_FLOAT8,
         DataType::Bytea => PG_OID_BYTEA,
+        DataType::Uuid => PG_OID_UUID,
         _ => PG_OID_TEXT,
     }
 }
@@ -587,6 +590,7 @@ const fn pg_type_size(ty: &DataType) -> i16 {
         DataType::Int16 => 2,
         DataType::Int32 | DataType::Float32 => 4,
         DataType::Int64 | DataType::Float64 => 8,
+        DataType::Uuid => 16,
         _ => -1,
     }
 }

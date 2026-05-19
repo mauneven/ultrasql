@@ -225,6 +225,56 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
                 },
             )
         }
+        DataType::Uuid => {
+            let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    Value::Null => strings.push(None),
+                    Value::Uuid(bytes) => strings.push(Some(Value::Uuid(*bytes).to_string())),
+                    other => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "projection: expected Uuid at row {i}, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                }
+            }
+            Ok(
+                match encode_strings_auto(
+                    strings.iter().map(|v| v.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                },
+            )
+        }
+        DataType::Bytea => {
+            let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    Value::Null => strings.push(None),
+                    Value::Bytea(bytes) => {
+                        strings.push(Some(Value::Bytea(bytes.clone()).to_string()))
+                    }
+                    other => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "projection: expected Bytea at row {i}, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                }
+            }
+            Ok(
+                match encode_strings_auto(
+                    strings.iter().map(|v| v.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                },
+            )
+        }
         DataType::Null => {
             // All-NULL output column. Carry an Int32 storage; the
             // schema field tag still reports `Null`.

@@ -1028,7 +1028,11 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 };
                 Column::Float64(col)
             }
-            DataType::Text { .. } | DataType::Range(_) | DataType::Geometry(_) => {
+            DataType::Text { .. }
+            | DataType::Range(_)
+            | DataType::Geometry(_)
+            | DataType::Uuid
+            | DataType::Bytea => {
                 let mut strings: Vec<Option<String>> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
                     match (&field.data_type, &row[col_idx]) {
@@ -1042,6 +1046,12 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                             if expected == &v.geometry_type =>
                         {
                             strings.push(Some(v.to_string()));
+                        }
+                        (DataType::Uuid, Value::Uuid(v)) => {
+                            strings.push(Some(Value::Uuid(*v).to_string()));
+                        }
+                        (DataType::Bytea, Value::Bytea(v)) => {
+                            strings.push(Some(Value::Bytea(v.clone()).to_string()));
                         }
                         (_, Value::Null) => strings.push(None),
                         (_, other) => {

@@ -456,6 +456,57 @@ impl Value {
         matches!(self, Self::Null)
     }
 
+    /// Parse a PostgreSQL UUID literal into raw 16-byte storage.
+    ///
+    /// Accepts canonical hyphenated text and compact 32-hex-digit text.
+    #[must_use]
+    pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+        let mut nibbles = [0_u8; 32];
+        let mut len = 0_usize;
+        for byte in text.bytes() {
+            if byte == b'-' {
+                continue;
+            }
+            if len >= nibbles.len() {
+                return None;
+            }
+            nibbles[len] = match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                b'A'..=b'F' => byte - b'A' + 10,
+                _ => return None,
+            };
+            len += 1;
+        }
+        if len != nibbles.len() {
+            return None;
+        }
+        let mut out = [0_u8; 16];
+        for idx in 0..out.len() {
+            out[idx] = (nibbles[idx * 2] << 4) | nibbles[idx * 2 + 1];
+        }
+        Some(out)
+    }
+
+    /// Parse PostgreSQL hex-style `bytea` text (`\xdeadbeef`).
+    #[must_use]
+    pub fn parse_bytea(text: &str) -> Option<Vec<u8>> {
+        let hex = text
+            .strip_prefix("\\x")
+            .or_else(|| text.strip_prefix("\\X"))?;
+        if hex.len() % 2 != 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(hex.len() / 2);
+        let bytes = hex.as_bytes();
+        for idx in (0..bytes.len()).step_by(2) {
+            let hi = hex_nibble(bytes[idx])?;
+            let lo = hex_nibble(bytes[idx + 1])?;
+            out.push((hi << 4) | lo);
+        }
+        Some(out)
+    }
+
     /// Borrowed `i64` view if this is an integer type, widening from
     /// narrower integers losslessly. `None` for non-integers.
     #[must_use]
@@ -504,6 +555,15 @@ impl Value {
             Self::Bool(b) => Some(*b),
             _ => None,
         }
+    }
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -849,6 +909,16 @@ mod tests {
     }
 
     #[test]
+    fn bytea_parse_accepts_hex_text() {
+        assert_eq!(
+            Value::parse_bytea("\\xdeadBEEF"),
+            Some(vec![0xde, 0xad, 0xbe, 0xef])
+        );
+        assert_eq!(Value::parse_bytea("\\xabc"), None);
+        assert_eq!(Value::parse_bytea("deadbeef"), None);
+    }
+
+    #[test]
     fn display_round_trip_for_simple_values() {
         assert_eq!(Value::Null.to_string(), "NULL");
         assert_eq!(Value::Bool(true).to_string(), "true");
@@ -867,6 +937,23 @@ mod tests {
             Value::Uuid(bytes).to_string(),
             "12345678-9abc-def0-1234-56789abcdef0"
         );
+    }
+
+    #[test]
+    fn uuid_parse_accepts_canonical_and_compact() {
+        let expected = [
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
+            0xde, 0xf0,
+        ];
+        assert_eq!(
+            Value::parse_uuid("12345678-9abc-def0-1234-56789abcdef0"),
+            Some(expected)
+        );
+        assert_eq!(
+            Value::parse_uuid("123456789ABCDEF0123456789ABCDEF0"),
+            Some(expected)
+        );
+        assert_eq!(Value::parse_uuid("not-a-uuid"), None);
     }
 
     #[test]

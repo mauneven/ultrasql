@@ -8,12 +8,13 @@ use ultrasql_core::{CommandId, DataType, RelationId, Schema, TupleId, Value, Xid
 use ultrasql_executor::fused_delete::FusedDeleteInt32Pair;
 use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
 use ultrasql_executor::{
-    Eval, Filter, InsertIndexEncoder, InsertIndexMaintainer, ModifyKind, ModifyTable, Operator,
-    Project, RowCodec, RowConstraintCheck, RowUpdateConstraintCheck, SeqScan, SequenceDefault,
-    ValuesScan,
+    Eval, Filter, InsertConflictAction, InsertIndexEncoder, InsertIndexMaintainer, ModifyKind,
+    ModifyTable, Operator, Project, RowCodec, RowConstraintCheck, RowUpdateConstraintCheck,
+    SeqScan, SequenceDefault, ValuesScan,
 };
 use ultrasql_planner::{
-    BinaryOp, LogicalIndexMethod, LogicalPlan, LogicalReferentialAction, ScalarExpr,
+    BinaryOp, LogicalIndexMethod, LogicalOnConflict, LogicalPlan, LogicalReferentialAction,
+    ScalarExpr,
 };
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::heap::{DeleteOptions, UpdateOptions, UpdatePayload};
@@ -48,9 +49,6 @@ pub(super) fn lower_real_insert(
     returning_schema: &Schema,
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
-    if on_conflict.is_some() {
-        return Err(ServerError::Unsupported("INSERT ... ON CONFLICT"));
-    }
     let entry = ctx
         .catalog_snapshot
         .tables
@@ -98,6 +96,12 @@ pub(super) fn lower_real_insert(
     };
     let rel = RelationId(entry.oid);
     let insert_indexes = build_insert_index_maintainers(entry, ctx)?;
+    let update_indexes = if matches!(on_conflict, Some(LogicalOnConflict::DoUpdate { .. })) {
+        build_insert_index_maintainers(entry, ctx)?
+    } else {
+        Vec::new()
+    };
+    let conflict_action = build_insert_conflict_action(on_conflict);
     let constraints = ctx.table_constraints.get(&entry.oid).map(|c| c.clone());
     let modify = ModifyTable::new(
         Arc::clone(&ctx.heap),
@@ -106,13 +110,19 @@ pub(super) fn lower_real_insert(
         ModifyKind::Insert,
         ctx.xid,
         ctx.command_id,
-        Xid::new(0),
-        CommandId::FIRST,
+        ctx.xid,
+        ctx.command_id,
         ctx.heap.wal_sink().cloned(),
         child,
     )
     .with_visibility_map(Arc::clone(&ctx.vm))
-    .with_insert_indexes(insert_indexes);
+    .with_insert_indexes(insert_indexes)
+    .with_update_indexes(update_indexes);
+    let modify = if let Some(action) = conflict_action {
+        modify.with_insert_conflict_action(action)
+    } else {
+        modify
+    };
     let modify = if let Some(constraints) = constraints {
         modify
             .with_column_defaults(constraints.defaults.clone())
@@ -135,9 +145,16 @@ pub(super) fn lower_real_insert(
                 &constraints.exclusion_constraints,
                 ctx,
             )?)
+            .with_exclusion_update_checks(build_exclusion_update_checks(
+                entry,
+                &constraints.exclusion_constraints,
+                ctx,
+            )?)
     } else {
         modify
     };
+    let modify =
+        modify.with_referenced_by_update_checks(build_referenced_by_update_checks(entry.oid, ctx)?);
     let modify = if insert_column_map_needed(&insert_columns, entry.schema.len()) {
         modify.with_insert_column_map(insert_columns)
     } else {
@@ -152,6 +169,28 @@ pub(super) fn lower_real_insert(
         )
     };
     Ok(Box::new(modify))
+}
+
+fn build_insert_conflict_action(
+    on_conflict: Option<&LogicalOnConflict>,
+) -> Option<InsertConflictAction> {
+    match on_conflict? {
+        LogicalOnConflict::DoNothing { target } => Some(InsertConflictAction::DoNothing {
+            target: target.as_ref().map(|target| target.columns.clone()),
+        }),
+        LogicalOnConflict::DoUpdate {
+            target,
+            assignments,
+            r#where,
+        } => Some(InsertConflictAction::DoUpdate {
+            target: target.columns.clone(),
+            assignments: assignments
+                .iter()
+                .map(|(column, expr)| (*column, Eval::new(expr.clone())))
+                .collect(),
+            predicate: r#where.clone().map(Eval::new),
+        }),
+    }
 }
 
 fn resolve_insert_columns(
@@ -1155,6 +1194,7 @@ fn build_one_insert_index_maintainer(
         .iter()
         .map(|attnum| usize::from(*attnum))
         .collect();
+    let key_columns = columns.clone();
     let runtime = ctx
         .table_constraints
         .get(&entry.oid)
@@ -1241,6 +1281,7 @@ fn build_one_insert_index_maintainer(
     });
     Ok(
         InsertIndexMaintainer::new(index.name.clone(), tree, encoder, index.is_unique)
+            .with_key_columns(key_columns)
             .with_brin(brin),
     )
 }

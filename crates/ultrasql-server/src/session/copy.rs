@@ -1213,6 +1213,13 @@ fn decode_binary_copy_cell(
             .map(|s| Value::Text(s.to_string()))
             .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}"))),
         DataType::Bytea => Ok(Value::Bytea(bytes.to_vec())),
+        DataType::Uuid => {
+            exact(16)?;
+            let raw: [u8; 16] = bytes.try_into().map_err(|_| {
+                ServerError::CopyFormat(format!("column {column_idx}: binary UUID length invalid"))
+            })?;
+            Ok(Value::Uuid(raw))
+        }
         other => decode_copy_cell(Some(bytes), other, column_idx),
     }
 }
@@ -1303,7 +1310,7 @@ fn value_to_copy_cell_by_value(value: &Value) -> Option<Vec<u8>> {
             Some(v.to_string().into_bytes())
         }
         Value::Date(v) => Some(v.to_string().into_bytes()),
-        Value::Uuid(bytes) => Some(format!("{bytes:x?}").into_bytes()),
+        Value::Uuid(bytes) => Some(Value::Uuid(*bytes).to_string().into_bytes()),
         Value::Decimal { .. } | Value::Interval { .. } | Value::Range(_) | Value::Geometry(_) => {
             Some(value.to_string().into_bytes())
         }
@@ -1349,6 +1356,9 @@ fn decode_copy_cell(
         DataType::Date => parse_copy_date(s, column_idx).map(Value::Date),
         DataType::Text { .. } => Ok(Value::Text(s.to_string())),
         DataType::Bytea => Ok(Value::Bytea(bytes.to_vec())),
+        DataType::Uuid => Value::parse_uuid(s).map(Value::Uuid).ok_or_else(|| {
+            ServerError::CopyFormat(format!("column {column_idx}: invalid uuid literal"))
+        }),
         DataType::Range(range_type) => ultrasql_core::RangeValue::parse(*range_type, s)
             .map(Value::Range)
             .ok_or_else(|| {

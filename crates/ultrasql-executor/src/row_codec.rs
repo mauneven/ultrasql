@@ -373,6 +373,18 @@ impl RowCodec {
                     // microseconds since midnight for Time).
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
+                (DataType::Uuid, Value::Uuid(bytes)) => {
+                    payload.extend_from_slice(bytes);
+                }
+                (DataType::Bytea, Value::Bytea(bytes)) => {
+                    let len =
+                        u32::try_from(bytes.len()).map_err(|_| RowCodecError::UnsupportedType {
+                            column: col_idx,
+                            ty: field.data_type.clone(),
+                        })?;
+                    payload.extend_from_slice(&len.to_le_bytes());
+                    payload.extend_from_slice(bytes);
+                }
                 (DataType::Text { .. }, Value::Text(s)) => {
                     let bytes = s.as_bytes();
                     let len =
@@ -610,6 +622,24 @@ impl RowCodec {
                         _ => unreachable!(),
                     }
                 }
+                DataType::Uuid => {
+                    let needed = cursor + 16;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 16] =
+                        bytes[cursor..needed]
+                            .try_into()
+                            .map_err(|_| RowCodecError::Truncated {
+                                needed,
+                                have: bytes.len(),
+                            })?;
+                    cursor = needed;
+                    Value::Uuid(raw)
+                }
                 DataType::Text { .. } => {
                     let len_end = cursor + 4;
                     if bytes.len() < len_end {
@@ -638,6 +668,34 @@ impl RowCodec {
                         .map_err(|e| RowCodecError::InvalidUtf8(e, "text column"))?;
                     cursor += str_len;
                     Value::Text(s)
+                }
+                DataType::Bytea => {
+                    let len_end = cursor + 4;
+                    if bytes.len() < len_end {
+                        return Err(RowCodecError::Truncated {
+                            needed: len_end,
+                            have: bytes.len(),
+                        });
+                    }
+                    let len_raw: [u8; 4] = bytes[cursor..len_end].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed: len_end,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    let byte_len = usize::try_from(u32::from_le_bytes(len_raw))
+                        .expect("u32 fits in usize on all supported targets");
+                    cursor = len_end;
+                    let byte_end = cursor + byte_len;
+                    if bytes.len() < byte_end {
+                        return Err(RowCodecError::Truncated {
+                            needed: byte_end,
+                            have: bytes.len(),
+                        });
+                    }
+                    let value = bytes[cursor..byte_end].to_vec();
+                    cursor = byte_end;
+                    Value::Bytea(value)
                 }
                 DataType::Range(range_type) => {
                     let s = decode_varlena_text(bytes, &mut cursor, "range column")?;
@@ -886,6 +944,83 @@ impl RowCodec {
                     nulls.push_valid();
                 }
                 (
+                    DataType::Uuid,
+                    ColumnBuilder::Utf8 {
+                        offsets,
+                        values,
+                        nulls,
+                    },
+                ) => {
+                    let needed = cursor + 16;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 16] =
+                        bytes[cursor..needed]
+                            .try_into()
+                            .map_err(|_| RowCodecError::Truncated {
+                                needed,
+                                have: bytes.len(),
+                            })?;
+                    cursor = needed;
+                    let text = Value::Uuid(raw).to_string();
+                    values.extend_from_slice(text.as_bytes());
+                    let new_end = u32::try_from(values.len()).map_err(|_| {
+                        RowCodecError::UnsupportedType {
+                            column: col_idx,
+                            ty: field.data_type.clone(),
+                        }
+                    })?;
+                    offsets.push(new_end);
+                    nulls.push_valid();
+                }
+                (
+                    DataType::Bytea,
+                    ColumnBuilder::Utf8 {
+                        offsets,
+                        values,
+                        nulls,
+                    },
+                ) => {
+                    let len_end = cursor + 4;
+                    if bytes.len() < len_end {
+                        return Err(RowCodecError::Truncated {
+                            needed: len_end,
+                            have: bytes.len(),
+                        });
+                    }
+                    let len_raw: [u8; 4] = bytes[cursor..len_end].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed: len_end,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    let byte_len = usize::try_from(u32::from_le_bytes(len_raw))
+                        .expect("u32 fits in usize on all supported targets");
+                    cursor = len_end;
+                    let byte_end = cursor + byte_len;
+                    if bytes.len() < byte_end {
+                        return Err(RowCodecError::Truncated {
+                            needed: byte_end,
+                            have: bytes.len(),
+                        });
+                    }
+                    let text = Value::Bytea(bytes[cursor..byte_end].to_vec()).to_string();
+                    cursor = byte_end;
+                    values.extend_from_slice(text.as_bytes());
+                    let new_end = u32::try_from(values.len()).map_err(|_| {
+                        RowCodecError::UnsupportedType {
+                            column: col_idx,
+                            ty: field.data_type.clone(),
+                        }
+                    })?;
+                    offsets.push(new_end);
+                    nulls.push_valid();
+                }
+                (
                     DataType::Text { .. } | DataType::Range(_) | DataType::Geometry(_),
                     ColumnBuilder::Utf8 {
                         offsets,
@@ -1120,7 +1255,11 @@ impl ColumnBuilder {
                 data: Vec::with_capacity(capacity),
                 nulls: NullTracker::default(),
             },
-            DataType::Text { .. } | DataType::Range(_) | DataType::Geometry(_) => Self::Utf8 {
+            DataType::Text { .. }
+            | DataType::Range(_)
+            | DataType::Geometry(_)
+            | DataType::Uuid
+            | DataType::Bytea => Self::Utf8 {
                 offsets: {
                     let mut o = Vec::with_capacity(capacity + 1);
                     o.push(0);
@@ -1271,6 +1410,8 @@ const fn is_supported_type(ty: &DataType) -> bool {
             | DataType::Timestamp
             | DataType::TimestampTz
             | DataType::Decimal { .. }
+            | DataType::Uuid
+            | DataType::Bytea
             | DataType::Range(_)
             | DataType::Geometry(_)
             | DataType::Null
