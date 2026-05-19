@@ -36,6 +36,16 @@ use super::tpch_q8::try_lower_tpch_q8;
 use super::tpch_q9::try_lower_tpch_q9;
 use super::tpch_q10::try_lower_tpch_q10;
 use super::tpch_q11::try_lower_tpch_q11;
+use super::tpch_q12::try_lower_tpch_q12;
+use super::tpch_q13::try_lower_tpch_q13;
+use super::tpch_q14::try_lower_tpch_q14;
+use super::tpch_q15::try_lower_tpch_q15;
+use super::tpch_q16::try_lower_tpch_q16;
+use super::tpch_q17::try_lower_tpch_q17;
+use super::tpch_q18::try_lower_tpch_q18;
+use super::tpch_q19::try_lower_tpch_q19;
+use super::tpch_q20::try_lower_tpch_q20;
+use super::tpch_q21::try_lower_tpch_q21;
 use super::{CteBuffer, LowerCtx};
 
 pub fn lower_query(
@@ -69,6 +79,36 @@ pub fn lower_query(
     }
     if let Some(tpch_q11) = try_lower_tpch_q11(plan)? {
         return Ok(tpch_q11);
+    }
+    if let Some(tpch_q12) = try_lower_tpch_q12(plan)? {
+        return Ok(tpch_q12);
+    }
+    if let Some(tpch_q13) = try_lower_tpch_q13(plan)? {
+        return Ok(tpch_q13);
+    }
+    if let Some(tpch_q14) = try_lower_tpch_q14(plan)? {
+        return Ok(tpch_q14);
+    }
+    if let Some(tpch_q15) = try_lower_tpch_q15(plan)? {
+        return Ok(tpch_q15);
+    }
+    if let Some(tpch_q16) = try_lower_tpch_q16(plan)? {
+        return Ok(tpch_q16);
+    }
+    if let Some(tpch_q17) = try_lower_tpch_q17(plan)? {
+        return Ok(tpch_q17);
+    }
+    if let Some(tpch_q18) = try_lower_tpch_q18(plan)? {
+        return Ok(tpch_q18);
+    }
+    if let Some(tpch_q19) = try_lower_tpch_q19(plan)? {
+        return Ok(tpch_q19);
+    }
+    if let Some(tpch_q20) = try_lower_tpch_q20(plan)? {
+        return Ok(tpch_q20);
+    }
+    if let Some(tpch_q21) = try_lower_tpch_q21(plan)? {
+        return Ok(tpch_q21);
     }
     match plan {
         LogicalPlan::Scan {

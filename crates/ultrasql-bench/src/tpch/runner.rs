@@ -412,8 +412,9 @@ pub fn run_ultrasql_result_outcomes(
         let state = Arc::new(Server::with_sample_database_pool_frames(
             load::ultrasql_tpch_pool_frames(),
         ));
+        let server_state = Arc::clone(&state);
         let server_task = tokio::spawn(async move {
-            if let Err(e) = serve_listener(listener, state).await {
+            if let Err(e) = serve_listener(listener, server_state).await {
                 eprintln!("ultrasqld task exited: {e}");
             }
         });
@@ -434,9 +435,15 @@ pub fn run_ultrasql_result_outcomes(
                 .await
                 .with_context(|| format!("DDL: {}", stmt.lines().next().unwrap_or("").trim()))?;
         }
-        load::load_ultrasql_into_client(&client, data_dir)
-            .await
-            .context("load TPC-H data into UltraSQL")?;
+        if load::ultrasql_direct_load_enabled() {
+            load::load_ultrasql_direct_into_server(state.as_ref(), &client, data_dir)
+                .await
+                .context("direct-load TPC-H data into UltraSQL")?;
+        } else {
+            load::load_ultrasql_into_client(&client, data_dir)
+                .await
+                .context("load TPC-H data into UltraSQL")?;
+        }
         if progress_enabled() {
             eprintln!("ultrasql tpch validate: load complete");
         }

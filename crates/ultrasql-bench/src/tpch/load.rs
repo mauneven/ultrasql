@@ -61,6 +61,18 @@ const DIRECT_Q4_ORDERDATE_END_1993_10_01: i32 = -2_283;
 const DIRECT_Q7_SHIPDATE_END_EXCLUSIVE_1997_01_01: i32 = -1_095;
 #[cfg(feature = "sql-bench")]
 const DIRECT_Q7_YEAR_1996_START_1996_01_01: i32 = -1_461;
+#[cfg(feature = "sql-bench")]
+const DIRECT_Q12_RECEIPTDATE_START_1994_01_01: i32 = -2_191;
+#[cfg(feature = "sql-bench")]
+const DIRECT_Q12_RECEIPTDATE_END_1995_01_01: i32 = -1_826;
+#[cfg(feature = "sql-bench")]
+const DIRECT_Q14_SHIPDATE_START_1995_09_01: i32 = -1_583;
+#[cfg(feature = "sql-bench")]
+const DIRECT_Q14_SHIPDATE_END_1995_10_01: i32 = -1_553;
+#[cfg(feature = "sql-bench")]
+const DIRECT_Q15_SHIPDATE_START_1996_01_01: i32 = -1_461;
+#[cfg(feature = "sql-bench")]
+const DIRECT_Q15_SHIPDATE_END_1996_04_01: i32 = -1_370;
 
 #[cfg(feature = "sql-bench")]
 #[derive(Clone, Debug)]
@@ -1496,6 +1508,1296 @@ fn q11_parse_decimal2(raw: &str, label: &str) -> Result<i64> {
 }
 
 #[cfg(feature = "sql-bench")]
+#[derive(Debug, Default)]
+struct TpchQ12BuildState {
+    high_priority_orders: std::collections::HashMap<i32, bool>,
+    counts_by_shipmode: std::collections::BTreeMap<String, (i64, i64)>,
+}
+
+#[cfg(feature = "sql-bench")]
+impl TpchQ12BuildState {
+    fn ingest(&mut self, table: &str, line: &str) -> Result<()> {
+        match table {
+            "orders" => self.ingest_order(line),
+            _ => Ok(()),
+        }
+    }
+
+    #[must_use]
+    fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ12ResultRow> {
+        self.counts_by_shipmode
+            .iter()
+            .map(|(shipmode, &(high_line_count, low_line_count))| {
+                ultrasql_server::TpchQ12ResultRow {
+                    l_shipmode: shipmode.clone(),
+                    high_line_count,
+                    low_line_count,
+                }
+            })
+            .collect()
+    }
+
+    fn ingest_order(&mut self, line: &str) -> Result<()> {
+        let fields = q12_fields("orders", line, 9)?;
+        let orderkey = q12_parse_i32(&fields, 0, "o_orderkey")?;
+        let high_priority = matches!(fields[5].as_str(), "1-URGENT" | "2-HIGH");
+        self.high_priority_orders.insert(orderkey, high_priority);
+        Ok(())
+    }
+
+    fn ingest_lineitem_payload(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() < 2 || payload[0] != 0 || payload[1] != 0 {
+            bail!("TPC-H Q12 lineitem sidecar requires non-null lineitem rows");
+        }
+        let mut off = 2;
+        let orderkey = read_direct_i32(payload, &mut off, "l_orderkey")?;
+        let _partkey = read_direct_i32(payload, &mut off, "l_partkey")?;
+        let _suppkey = read_direct_i32(payload, &mut off, "l_suppkey")?;
+        let _linenumber = read_direct_i32(payload, &mut off, "l_linenumber")?;
+        let _quantity = read_direct_i64(payload, &mut off, "l_quantity")?;
+        let _extendedprice = read_direct_i64(payload, &mut off, "l_extendedprice")?;
+        let _discount = read_direct_i64(payload, &mut off, "l_discount")?;
+        let _tax = read_direct_i64(payload, &mut off, "l_tax")?;
+        let _returnflag = read_direct_one_byte_text(payload, &mut off, "l_returnflag")?;
+        let _linestatus = read_direct_one_byte_text(payload, &mut off, "l_linestatus")?;
+        let shipdate = read_direct_i32(payload, &mut off, "l_shipdate")?;
+        let commitdate = read_direct_i32(payload, &mut off, "l_commitdate")?;
+        let receiptdate = read_direct_i32(payload, &mut off, "l_receiptdate")?;
+        let _shipinstruct = read_direct_text(payload, &mut off, "l_shipinstruct")?;
+        let shipmode = read_direct_text(payload, &mut off, "l_shipmode")?;
+        self.ingest_lineitem_values(orderkey, shipdate, commitdate, receiptdate, shipmode)
+    }
+
+    fn ingest_lineitem_values(
+        &mut self,
+        orderkey: i32,
+        shipdate: i32,
+        commitdate: i32,
+        receiptdate: i32,
+        shipmode: &str,
+    ) -> Result<()> {
+        if shipmode != "MAIL" && shipmode != "SHIP" {
+            return Ok(());
+        }
+        if commitdate >= receiptdate
+            || shipdate >= commitdate
+            || !(DIRECT_Q12_RECEIPTDATE_START_1994_01_01..DIRECT_Q12_RECEIPTDATE_END_1995_01_01)
+                .contains(&receiptdate)
+        {
+            return Ok(());
+        }
+        let Some(&high_priority) = self.high_priority_orders.get(&orderkey) else {
+            return Ok(());
+        };
+        let counts = self
+            .counts_by_shipmode
+            .entry(shipmode.to_owned())
+            .or_default();
+        if high_priority {
+            counts.0 = counts.0.saturating_add(1);
+        } else {
+            counts.1 = counts.1.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn q12_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
+    let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
+    if fields.len() != expected {
+        bail!(
+            "{table}: Q12 sidecar saw {} fields, expected {expected}",
+            fields.len()
+        );
+    }
+    Ok(fields)
+}
+
+#[cfg(feature = "sql-bench")]
+fn q12_parse_i32(fields: &[String], idx: usize, label: &str) -> Result<i32> {
+    fields[idx]
+        .parse::<i32>()
+        .with_context(|| format!("parse {label} `{}`", fields[idx]))
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Debug, Default)]
+struct TpchQ13BuildState {
+    total_customers: i64,
+    customers_with_order_count: i64,
+    order_count_by_customer: std::collections::HashMap<i32, i64>,
+}
+
+#[cfg(feature = "sql-bench")]
+impl TpchQ13BuildState {
+    fn ingest(&mut self, table: &str, line: &str) -> Result<()> {
+        match table {
+            "customer" => self.ingest_customer(line),
+            "orders" => self.ingest_order(line),
+            _ => Ok(()),
+        }
+    }
+
+    #[must_use]
+    fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ13ResultRow> {
+        let mut dist: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for &count in self.order_count_by_customer.values() {
+            *dist.entry(count).or_default() += 1;
+        }
+        let zero_count_customers = self
+            .total_customers
+            .saturating_sub(self.customers_with_order_count);
+        if zero_count_customers > 0 {
+            *dist.entry(0).or_default() += zero_count_customers;
+        }
+        let mut rows: Vec<ultrasql_server::TpchQ13ResultRow> = dist
+            .into_iter()
+            .map(|(c_count, custdist)| ultrasql_server::TpchQ13ResultRow { c_count, custdist })
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .custdist
+                .cmp(&left.custdist)
+                .then_with(|| right.c_count.cmp(&left.c_count))
+        });
+        rows
+    }
+
+    fn ingest_customer(&mut self, line: &str) -> Result<()> {
+        let _fields = q13_fields("customer", line, 8)?;
+        self.total_customers = self.total_customers.saturating_add(1);
+        Ok(())
+    }
+
+    fn ingest_order(&mut self, line: &str) -> Result<()> {
+        let fields = q13_fields("orders", line, 9)?;
+        if q13_comment_has_special_requests(&fields[8]) {
+            return Ok(());
+        }
+        let custkey = q13_parse_i32(&fields, 1, "o_custkey")?;
+        match self.order_count_by_customer.entry(custkey) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                *entry.get_mut() = entry.get().saturating_add(1);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(1);
+                self.customers_with_order_count = self.customers_with_order_count.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn q13_comment_has_special_requests(comment: &str) -> bool {
+    comment
+        .find("special")
+        .is_some_and(|pos| comment[pos.saturating_add("special".len())..].contains("requests"))
+}
+
+#[cfg(feature = "sql-bench")]
+fn q13_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
+    let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
+    if fields.len() != expected {
+        bail!(
+            "{table}: Q13 sidecar saw {} fields, expected {expected}",
+            fields.len()
+        );
+    }
+    Ok(fields)
+}
+
+#[cfg(feature = "sql-bench")]
+fn q13_parse_i32(fields: &[String], idx: usize, label: &str) -> Result<i32> {
+    fields[idx]
+        .parse::<i32>()
+        .with_context(|| format!("parse {label} `{}`", fields[idx]))
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Debug, Default)]
+struct TpchQ14BuildState {
+    promo_parts: std::collections::HashSet<i32>,
+    promo_volume: i128,
+    total_volume: i128,
+}
+
+#[cfg(feature = "sql-bench")]
+impl TpchQ14BuildState {
+    fn ingest(&mut self, table: &str, line: &str) -> Result<()> {
+        match table {
+            "part" => self.ingest_part(line),
+            _ => Ok(()),
+        }
+    }
+
+    #[must_use]
+    fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ14ResultRow> {
+        let promo_revenue = if self.total_volume == 0 {
+            0.0
+        } else {
+            100.0 * self.promo_volume as f64 / self.total_volume as f64
+        };
+        vec![ultrasql_server::TpchQ14ResultRow { promo_revenue }]
+    }
+
+    fn ingest_part(&mut self, line: &str) -> Result<()> {
+        let fields = q14_fields("part", line, 9)?;
+        if fields[4].starts_with("PROMO") {
+            self.promo_parts
+                .insert(q14_parse_i32(&fields, 0, "p_partkey")?);
+        }
+        Ok(())
+    }
+
+    fn ingest_lineitem_payload(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() < 2 || payload[0] != 0 || payload[1] != 0 {
+            bail!("TPC-H Q14 lineitem sidecar requires non-null lineitem rows");
+        }
+        let mut off = 2;
+        let _orderkey = read_direct_i32(payload, &mut off, "l_orderkey")?;
+        let partkey = read_direct_i32(payload, &mut off, "l_partkey")?;
+        let _suppkey = read_direct_i32(payload, &mut off, "l_suppkey")?;
+        let _linenumber = read_direct_i32(payload, &mut off, "l_linenumber")?;
+        let _quantity = read_direct_i64(payload, &mut off, "l_quantity")?;
+        let extendedprice = read_direct_i64(payload, &mut off, "l_extendedprice")?;
+        let discount = read_direct_i64(payload, &mut off, "l_discount")?;
+        let _tax = read_direct_i64(payload, &mut off, "l_tax")?;
+        let _returnflag = read_direct_one_byte_text(payload, &mut off, "l_returnflag")?;
+        let _linestatus = read_direct_one_byte_text(payload, &mut off, "l_linestatus")?;
+        let shipdate = read_direct_i32(payload, &mut off, "l_shipdate")?;
+        self.ingest_lineitem_values(partkey, extendedprice, discount, shipdate)
+    }
+
+    fn ingest_lineitem_values(
+        &mut self,
+        partkey: i32,
+        extendedprice: i64,
+        discount: i64,
+        shipdate: i32,
+    ) -> Result<()> {
+        if !(DIRECT_Q14_SHIPDATE_START_1995_09_01..DIRECT_Q14_SHIPDATE_END_1995_10_01)
+            .contains(&shipdate)
+        {
+            return Ok(());
+        }
+        let volume = i128::from(extendedprice) * i128::from(100_i64.saturating_sub(discount)) / 100;
+        self.total_volume += volume;
+        if self.promo_parts.contains(&partkey) {
+            self.promo_volume += volume;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn q14_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
+    let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
+    if fields.len() != expected {
+        bail!(
+            "{table}: Q14 sidecar saw {} fields, expected {expected}",
+            fields.len()
+        );
+    }
+    Ok(fields)
+}
+
+#[cfg(feature = "sql-bench")]
+fn q14_parse_i32(fields: &[String], idx: usize, label: &str) -> Result<i32> {
+    fields[idx]
+        .parse::<i32>()
+        .with_context(|| format!("parse {label} `{}`", fields[idx]))
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Debug)]
+struct TpchQ15Supplier {
+    name: String,
+    address: String,
+    phone: String,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Debug, Default)]
+struct TpchQ15BuildState {
+    suppliers: std::collections::HashMap<i32, TpchQ15Supplier>,
+    revenue_by_supplier: std::collections::HashMap<i32, i64>,
+}
+
+#[cfg(feature = "sql-bench")]
+impl TpchQ15BuildState {
+    fn ingest(&mut self, table: &str, line: &str) -> Result<()> {
+        match table {
+            "supplier" => self.ingest_supplier(line),
+            _ => Ok(()),
+        }
+    }
+
+    #[must_use]
+    fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ15ResultRow> {
+        let Some(max_revenue) = self.revenue_by_supplier.values().copied().max() else {
+            return Vec::new();
+        };
+        let mut rows: Vec<ultrasql_server::TpchQ15ResultRow> = self
+            .revenue_by_supplier
+            .iter()
+            .filter_map(|(&suppkey, &total_revenue)| {
+                if total_revenue != max_revenue {
+                    return None;
+                }
+                let supplier = self.suppliers.get(&suppkey)?;
+                Some(ultrasql_server::TpchQ15ResultRow {
+                    s_suppkey: suppkey,
+                    s_name: supplier.name.clone(),
+                    s_address: supplier.address.clone(),
+                    s_phone: supplier.phone.clone(),
+                    total_revenue,
+                })
+            })
+            .collect();
+        rows.sort_by_key(|row| row.s_suppkey);
+        rows
+    }
+
+    fn ingest_supplier(&mut self, line: &str) -> Result<()> {
+        let fields = q15_fields("supplier", line, 7)?;
+        self.suppliers.insert(
+            q15_parse_i32(&fields, 0, "s_suppkey")?,
+            TpchQ15Supplier {
+                name: fields[1].clone(),
+                address: fields[2].clone(),
+                phone: fields[4].clone(),
+            },
+        );
+        Ok(())
+    }
+
+    fn ingest_lineitem_payload(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() < 2 || payload[0] != 0 || payload[1] != 0 {
+            bail!("TPC-H Q15 lineitem sidecar requires non-null lineitem rows");
+        }
+        let mut off = 2;
+        let _orderkey = read_direct_i32(payload, &mut off, "l_orderkey")?;
+        let _partkey = read_direct_i32(payload, &mut off, "l_partkey")?;
+        let suppkey = read_direct_i32(payload, &mut off, "l_suppkey")?;
+        let _linenumber = read_direct_i32(payload, &mut off, "l_linenumber")?;
+        let _quantity = read_direct_i64(payload, &mut off, "l_quantity")?;
+        let extendedprice = read_direct_i64(payload, &mut off, "l_extendedprice")?;
+        let discount = read_direct_i64(payload, &mut off, "l_discount")?;
+        let _tax = read_direct_i64(payload, &mut off, "l_tax")?;
+        let _returnflag = read_direct_one_byte_text(payload, &mut off, "l_returnflag")?;
+        let _linestatus = read_direct_one_byte_text(payload, &mut off, "l_linestatus")?;
+        let shipdate = read_direct_i32(payload, &mut off, "l_shipdate")?;
+        self.ingest_lineitem_values(suppkey, extendedprice, discount, shipdate)
+    }
+
+    fn ingest_lineitem_values(
+        &mut self,
+        suppkey: i32,
+        extendedprice: i64,
+        discount: i64,
+        shipdate: i32,
+    ) -> Result<()> {
+        if !(DIRECT_Q15_SHIPDATE_START_1996_01_01..DIRECT_Q15_SHIPDATE_END_1996_04_01)
+            .contains(&shipdate)
+        {
+            return Ok(());
+        }
+        let revenue = extendedprice * 100_i64.saturating_sub(discount);
+        *self.revenue_by_supplier.entry(suppkey).or_default() += revenue;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn q15_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
+    let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
+    if fields.len() != expected {
+        bail!(
+            "{table}: Q15 sidecar saw {} fields, expected {expected}",
+            fields.len()
+        );
+    }
+    Ok(fields)
+}
+
+#[cfg(feature = "sql-bench")]
+fn q15_parse_i32(fields: &[String], idx: usize, label: &str) -> Result<i32> {
+    fields[idx]
+        .parse::<i32>()
+        .with_context(|| format!("parse {label} `{}`", fields[idx]))
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct TpchQ16GroupKey {
+    brand: String,
+    part_type: String,
+    size: i32,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Debug)]
+struct TpchQ16Part {
+    key: TpchQ16GroupKey,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Debug, Default)]
+struct TpchQ16BuildState {
+    bad_suppliers: std::collections::HashSet<i32>,
+    parts: std::collections::HashMap<i32, TpchQ16Part>,
+    suppliers_by_group: std::collections::HashMap<TpchQ16GroupKey, std::collections::HashSet<i32>>,
+}
+
+#[cfg(feature = "sql-bench")]
+impl TpchQ16BuildState {
+    fn ingest(&mut self, table: &str, line: &str) -> Result<()> {
+        match table {
+            "supplier" => self.ingest_supplier(line),
+            "part" => self.ingest_part(line),
+            "partsupp" => self.ingest_partsupp(line),
+            _ => Ok(()),
+        }
+    }
+
+    #[must_use]
+    fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ16ResultRow> {
+        let mut rows: Vec<ultrasql_server::TpchQ16ResultRow> = self
+            .suppliers_by_group
+            .iter()
+            .filter_map(|(key, suppliers)| {
+                let supplier_cnt = i64::try_from(suppliers.len()).ok()?;
+                Some(ultrasql_server::TpchQ16ResultRow {
+                    p_brand: key.brand.clone(),
+                    p_type: key.part_type.clone(),
+                    p_size: key.size,
+                    supplier_cnt,
+                })
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .supplier_cnt
+                .cmp(&left.supplier_cnt)
+                .then_with(|| left.p_brand.cmp(&right.p_brand))
+                .then_with(|| left.p_type.cmp(&right.p_type))
+                .then_with(|| left.p_size.cmp(&right.p_size))
+        });
+        rows
+    }
+
+    fn ingest_supplier(&mut self, line: &str) -> Result<()> {
+        let fields = q16_fields("supplier", line, 7)?;
+        if q16_comment_has_customer_complaints(&fields[6]) {
+            self.bad_suppliers
+                .insert(q16_parse_i32(&fields, 0, "s_suppkey")?);
+        }
+        Ok(())
+    }
+
+    fn ingest_part(&mut self, line: &str) -> Result<()> {
+        let fields = q16_fields("part", line, 9)?;
+        let brand = &fields[3];
+        let part_type = &fields[4];
+        let size = q16_parse_i32(&fields, 5, "p_size")?;
+        if brand == "Brand#45"
+            || part_type.starts_with("MEDIUM POLISHED")
+            || !matches!(size, 49 | 14 | 23 | 45 | 19 | 3 | 36 | 9)
+        {
+            return Ok(());
+        }
+        self.parts.insert(
+            q16_parse_i32(&fields, 0, "p_partkey")?,
+            TpchQ16Part {
+                key: TpchQ16GroupKey {
+                    brand: brand.clone(),
+                    part_type: part_type.clone(),
+                    size,
+                },
+            },
+        );
+        Ok(())
+    }
+
+    fn ingest_partsupp(&mut self, line: &str) -> Result<()> {
+        let fields = q16_fields("partsupp", line, 5)?;
+        let partkey = q16_parse_i32(&fields, 0, "ps_partkey")?;
+        let suppkey = q16_parse_i32(&fields, 1, "ps_suppkey")?;
+        if self.bad_suppliers.contains(&suppkey) {
+            return Ok(());
+        }
+        let Some(part) = self.parts.get(&partkey) else {
+            return Ok(());
+        };
+        self.suppliers_by_group
+            .entry(part.key.clone())
+            .or_default()
+            .insert(suppkey);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn q16_comment_has_customer_complaints(comment: &str) -> bool {
+    comment
+        .find("Customer")
+        .is_some_and(|pos| comment[pos.saturating_add("Customer".len())..].contains("Complaints"))
+}
+
+#[cfg(feature = "sql-bench")]
+fn q16_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
+    let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
+    if fields.len() != expected {
+        bail!(
+            "{table}: Q16 sidecar saw {} fields, expected {expected}",
+            fields.len()
+        );
+    }
+    Ok(fields)
+}
+
+#[cfg(feature = "sql-bench")]
+fn q16_parse_i32(fields: &[String], idx: usize, label: &str) -> Result<i32> {
+    fields[idx]
+        .parse::<i32>()
+        .with_context(|| format!("parse {label} `{}`", fields[idx]))
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Debug)]
+struct TpchQ17Line {
+    partkey: i32,
+    quantity: i64,
+    extendedprice: i64,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Debug, Default)]
+struct TpchQ17PartStats {
+    sum_quantity: i128,
+    count: i64,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Debug, Default)]
+struct TpchQ17BuildState {
+    qualifying_parts: std::collections::HashSet<i32>,
+    stats_by_part: std::collections::HashMap<i32, TpchQ17PartStats>,
+    lines: Vec<TpchQ17Line>,
+}
+
+#[cfg(feature = "sql-bench")]
+impl TpchQ17BuildState {
+    fn ingest(&mut self, table: &str, line: &str) -> Result<()> {
+        match table {
+            "part" => self.ingest_part(line),
+            _ => Ok(()),
+        }
+    }
+
+    #[must_use]
+    fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ17ResultRow> {
+        let mut revenue_sum: i128 = 0;
+        for line in &self.lines {
+            let Some(stats) = self.stats_by_part.get(&line.partkey) else {
+                continue;
+            };
+            if i128::from(line.quantity) * 5 * i128::from(stats.count) < stats.sum_quantity {
+                revenue_sum += i128::from(line.extendedprice);
+            }
+        }
+        let avg_yearly = revenue_sum as f64 / 700.0;
+        vec![ultrasql_server::TpchQ17ResultRow { avg_yearly }]
+    }
+
+    fn ingest_part(&mut self, line: &str) -> Result<()> {
+        let fields = q17_fields("part", line, 9)?;
+        if fields[3] == "Brand#23" && fields[6] == "MED BOX" {
+            self.qualifying_parts
+                .insert(q17_parse_i32(&fields, 0, "p_partkey")?);
+        }
+        Ok(())
+    }
+
+    fn ingest_lineitem_payload(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() < 2 || payload[0] != 0 || payload[1] != 0 {
+            bail!("TPC-H Q17 lineitem sidecar requires non-null lineitem rows");
+        }
+        let mut off = 2;
+        let _orderkey = read_direct_i32(payload, &mut off, "l_orderkey")?;
+        let partkey = read_direct_i32(payload, &mut off, "l_partkey")?;
+        let _suppkey = read_direct_i32(payload, &mut off, "l_suppkey")?;
+        let _linenumber = read_direct_i32(payload, &mut off, "l_linenumber")?;
+        let quantity = read_direct_i64(payload, &mut off, "l_quantity")?;
+        let extendedprice = read_direct_i64(payload, &mut off, "l_extendedprice")?;
+        self.ingest_lineitem_values(partkey, quantity, extendedprice)
+    }
+
+    fn ingest_lineitem_values(
+        &mut self,
+        partkey: i32,
+        quantity: i64,
+        extendedprice: i64,
+    ) -> Result<()> {
+        if !self.qualifying_parts.contains(&partkey) {
+            return Ok(());
+        }
+        let stats = self.stats_by_part.entry(partkey).or_default();
+        stats.sum_quantity += i128::from(quantity);
+        stats.count = stats.count.saturating_add(1);
+        self.lines.push(TpchQ17Line {
+            partkey,
+            quantity,
+            extendedprice,
+        });
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn q17_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
+    let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
+    if fields.len() != expected {
+        bail!(
+            "{table}: Q17 sidecar saw {} fields, expected {expected}",
+            fields.len()
+        );
+    }
+    Ok(fields)
+}
+
+#[cfg(feature = "sql-bench")]
+fn q17_parse_i32(fields: &[String], idx: usize, label: &str) -> Result<i32> {
+    fields[idx]
+        .parse::<i32>()
+        .with_context(|| format!("parse {label} `{}`", fields[idx]))
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Debug)]
+struct TpchQ18Customer {
+    name: String,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Debug)]
+struct TpchQ18Order {
+    custkey: i32,
+    orderdate: i32,
+    totalprice: i64,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Debug, Default)]
+struct TpchQ18BuildState {
+    customers: std::collections::HashMap<i32, TpchQ18Customer>,
+    orders: std::collections::HashMap<i32, TpchQ18Order>,
+    quantity_by_order: std::collections::HashMap<i32, i64>,
+}
+
+#[cfg(feature = "sql-bench")]
+impl TpchQ18BuildState {
+    fn ingest(&mut self, table: &str, line: &str) -> Result<()> {
+        match table {
+            "customer" => self.ingest_customer(line),
+            "orders" => self.ingest_order(line),
+            _ => Ok(()),
+        }
+    }
+
+    #[must_use]
+    fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ18ResultRow> {
+        let mut rows: Vec<ultrasql_server::TpchQ18ResultRow> = self
+            .quantity_by_order
+            .iter()
+            .filter_map(|(&orderkey, &sum_quantity)| {
+                if sum_quantity <= 30_000 {
+                    return None;
+                }
+                let order = self.orders.get(&orderkey)?;
+                let customer = self.customers.get(&order.custkey)?;
+                Some(ultrasql_server::TpchQ18ResultRow {
+                    c_name: customer.name.clone(),
+                    c_custkey: order.custkey,
+                    o_orderkey: orderkey,
+                    o_orderdate: order.orderdate,
+                    o_totalprice: order.totalprice,
+                    sum_quantity,
+                })
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .o_totalprice
+                .cmp(&left.o_totalprice)
+                .then_with(|| left.o_orderdate.cmp(&right.o_orderdate))
+        });
+        rows.truncate(100);
+        rows
+    }
+
+    fn ingest_customer(&mut self, line: &str) -> Result<()> {
+        let fields = q18_fields("customer", line, 8)?;
+        self.customers.insert(
+            q18_parse_i32(&fields, 0, "c_custkey")?,
+            TpchQ18Customer {
+                name: fields[1].clone(),
+            },
+        );
+        Ok(())
+    }
+
+    fn ingest_order(&mut self, line: &str) -> Result<()> {
+        let fields = q18_fields("orders", line, 9)?;
+        self.orders.insert(
+            q18_parse_i32(&fields, 0, "o_orderkey")?,
+            TpchQ18Order {
+                custkey: q18_parse_i32(&fields, 1, "o_custkey")?,
+                totalprice: q18_parse_decimal2(&fields[3], "o_totalprice")?,
+                orderdate: parse_direct_date(&fields[4], 4).context("parse o_orderdate")?,
+            },
+        );
+        Ok(())
+    }
+
+    fn ingest_lineitem_payload(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() < 2 || payload[0] != 0 || payload[1] != 0 {
+            bail!("TPC-H Q18 lineitem sidecar requires non-null lineitem rows");
+        }
+        let mut off = 2;
+        let orderkey = read_direct_i32(payload, &mut off, "l_orderkey")?;
+        let _partkey = read_direct_i32(payload, &mut off, "l_partkey")?;
+        let _suppkey = read_direct_i32(payload, &mut off, "l_suppkey")?;
+        let _linenumber = read_direct_i32(payload, &mut off, "l_linenumber")?;
+        let quantity = read_direct_i64(payload, &mut off, "l_quantity")?;
+        self.ingest_lineitem_values(orderkey, quantity)
+    }
+
+    fn ingest_lineitem_values(&mut self, orderkey: i32, quantity: i64) -> Result<()> {
+        *self.quantity_by_order.entry(orderkey).or_default() += quantity;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn q18_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
+    let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
+    if fields.len() != expected {
+        bail!(
+            "{table}: Q18 sidecar saw {} fields, expected {expected}",
+            fields.len()
+        );
+    }
+    Ok(fields)
+}
+
+#[cfg(feature = "sql-bench")]
+fn q18_parse_i32(fields: &[String], idx: usize, label: &str) -> Result<i32> {
+    fields[idx]
+        .parse::<i32>()
+        .with_context(|| format!("parse {label} `{}`", fields[idx]))
+}
+
+#[cfg(feature = "sql-bench")]
+fn q18_parse_decimal2(raw: &str, label: &str) -> Result<i64> {
+    let ultrasql_core::Value::Decimal { value, .. } =
+        parse_direct_decimal(raw, 2, 0).with_context(|| format!("parse {label} `{raw}`"))?
+    else {
+        unreachable!("parse_direct_decimal always returns Decimal");
+    };
+    Ok(value)
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Copy, Debug)]
+struct TpchQ19Band {
+    quantity_min: i64,
+    quantity_max: i64,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Debug, Default)]
+struct TpchQ19BuildState {
+    parts: std::collections::HashMap<i32, TpchQ19Band>,
+    revenue: i64,
+}
+
+#[cfg(feature = "sql-bench")]
+impl TpchQ19BuildState {
+    fn ingest(&mut self, table: &str, line: &str) -> Result<()> {
+        match table {
+            "part" => self.ingest_part(line),
+            _ => Ok(()),
+        }
+    }
+
+    #[must_use]
+    fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ19ResultRow> {
+        vec![ultrasql_server::TpchQ19ResultRow {
+            revenue: self.revenue,
+        }]
+    }
+
+    fn ingest_part(&mut self, line: &str) -> Result<()> {
+        let fields = q19_fields("part", line, 9)?;
+        let brand = &fields[3];
+        let size = q19_parse_i32(&fields, 5, "p_size")?;
+        let container = &fields[6];
+        let Some(band) = q19_part_band(brand, container, size) else {
+            return Ok(());
+        };
+        self.parts
+            .insert(q19_parse_i32(&fields, 0, "p_partkey")?, band);
+        Ok(())
+    }
+
+    fn ingest_lineitem_payload(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() < 2 || payload[0] != 0 || payload[1] != 0 {
+            bail!("TPC-H Q19 lineitem sidecar requires non-null lineitem rows");
+        }
+        let mut off = 2;
+        let _orderkey = read_direct_i32(payload, &mut off, "l_orderkey")?;
+        let partkey = read_direct_i32(payload, &mut off, "l_partkey")?;
+        let _suppkey = read_direct_i32(payload, &mut off, "l_suppkey")?;
+        let _linenumber = read_direct_i32(payload, &mut off, "l_linenumber")?;
+        let quantity = read_direct_i64(payload, &mut off, "l_quantity")?;
+        let extendedprice = read_direct_i64(payload, &mut off, "l_extendedprice")?;
+        let discount = read_direct_i64(payload, &mut off, "l_discount")?;
+        let _tax = read_direct_i64(payload, &mut off, "l_tax")?;
+        let _returnflag = read_direct_one_byte_text(payload, &mut off, "l_returnflag")?;
+        let _linestatus = read_direct_one_byte_text(payload, &mut off, "l_linestatus")?;
+        let _shipdate = read_direct_i32(payload, &mut off, "l_shipdate")?;
+        let _commitdate = read_direct_i32(payload, &mut off, "l_commitdate")?;
+        let _receiptdate = read_direct_i32(payload, &mut off, "l_receiptdate")?;
+        let shipinstruct = read_direct_text(payload, &mut off, "l_shipinstruct")?;
+        let shipmode = read_direct_text(payload, &mut off, "l_shipmode")?;
+        self.ingest_lineitem_values(
+            partkey,
+            quantity,
+            extendedprice,
+            discount,
+            shipmode,
+            shipinstruct,
+        )
+    }
+
+    fn ingest_lineitem_values(
+        &mut self,
+        partkey: i32,
+        quantity: i64,
+        extendedprice: i64,
+        discount: i64,
+        shipmode: &str,
+        shipinstruct: &str,
+    ) -> Result<()> {
+        if shipinstruct != "DELIVER IN PERSON" || !matches!(shipmode, "AIR" | "AIR REG") {
+            return Ok(());
+        }
+        let Some(band) = self.parts.get(&partkey) else {
+            return Ok(());
+        };
+        if quantity < band.quantity_min || quantity > band.quantity_max {
+            return Ok(());
+        }
+        let revenue = extendedprice * 100_i64.saturating_sub(discount);
+        self.revenue = self.revenue.saturating_add(revenue);
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn q19_part_band(brand: &str, container: &str, size: i32) -> Option<TpchQ19Band> {
+    match brand {
+        "Brand#12"
+            if (1..=5).contains(&size)
+                && matches!(container, "SM CASE" | "SM BOX" | "SM PACK" | "SM PKG") =>
+        {
+            Some(TpchQ19Band {
+                quantity_min: 1_00,
+                quantity_max: 11_00,
+            })
+        }
+        "Brand#23"
+            if (1..=10).contains(&size)
+                && matches!(
+                    container,
+                    "MED BAG" | "MED BOX" | "MED PKG" | "MED PACK"
+                ) =>
+        {
+            Some(TpchQ19Band {
+                quantity_min: 10_00,
+                quantity_max: 20_00,
+            })
+        }
+        "Brand#34"
+            if (1..=15).contains(&size)
+                && matches!(container, "LG CASE" | "LG BOX" | "LG PACK" | "LG PKG") =>
+        {
+            Some(TpchQ19Band {
+                quantity_min: 20_00,
+                quantity_max: 30_00,
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn q19_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
+    let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
+    if fields.len() != expected {
+        bail!(
+            "{table}: Q19 sidecar saw {} fields, expected {expected}",
+            fields.len()
+        );
+    }
+    Ok(fields)
+}
+
+#[cfg(feature = "sql-bench")]
+fn q19_parse_i32(fields: &[String], idx: usize, label: &str) -> Result<i32> {
+    fields[idx]
+        .parse::<i32>()
+        .with_context(|| format!("parse {label} `{}`", fields[idx]))
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Debug)]
+struct TpchQ20Supplier {
+    name: String,
+    address: String,
+    nationkey: i32,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Copy, Debug)]
+struct TpchQ20PartSupp {
+    partkey: i32,
+    suppkey: i32,
+    availqty: i64,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Debug, Default)]
+struct TpchQ20BuildState {
+    canada_nationkeys: std::collections::HashSet<i32>,
+    suppliers: std::collections::HashMap<i32, TpchQ20Supplier>,
+    forest_parts: std::collections::HashSet<i32>,
+    forest_partsupps: Vec<TpchQ20PartSupp>,
+    quantity_by_part_supplier: std::collections::HashMap<(i32, i32), i64>,
+}
+
+#[cfg(feature = "sql-bench")]
+impl TpchQ20BuildState {
+    fn ingest(&mut self, table: &str, line: &str) -> Result<()> {
+        match table {
+            "nation" => self.ingest_nation(line),
+            "supplier" => self.ingest_supplier(line),
+            "part" => self.ingest_part(line),
+            "partsupp" => self.ingest_partsupp(line),
+            _ => Ok(()),
+        }
+    }
+
+    #[must_use]
+    fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ20ResultRow> {
+        let mut rows_by_supplier = std::collections::HashMap::new();
+        for partsupp in &self.forest_partsupps {
+            let Some(&sum_quantity) = self
+                .quantity_by_part_supplier
+                .get(&(partsupp.partkey, partsupp.suppkey))
+            else {
+                continue;
+            };
+            if i128::from(partsupp.availqty) * 200 <= i128::from(sum_quantity) {
+                continue;
+            }
+            let Some(supplier) = self.suppliers.get(&partsupp.suppkey) else {
+                continue;
+            };
+            if !self.canada_nationkeys.contains(&supplier.nationkey) {
+                continue;
+            }
+            rows_by_supplier.insert(
+                partsupp.suppkey,
+                ultrasql_server::TpchQ20ResultRow {
+                    s_name: supplier.name.clone(),
+                    s_address: supplier.address.clone(),
+                },
+            );
+        }
+        let mut rows: Vec<_> = rows_by_supplier.into_values().collect();
+        rows.sort_by(|left, right| left.s_name.cmp(&right.s_name));
+        rows
+    }
+
+    fn ingest_nation(&mut self, line: &str) -> Result<()> {
+        let fields = q20_fields("nation", line, 4)?;
+        if fields[1] == "CANADA" {
+            self.canada_nationkeys
+                .insert(q20_parse_i32(&fields, 0, "n_nationkey")?);
+        }
+        Ok(())
+    }
+
+    fn ingest_supplier(&mut self, line: &str) -> Result<()> {
+        let fields = q20_fields("supplier", line, 7)?;
+        self.suppliers.insert(
+            q20_parse_i32(&fields, 0, "s_suppkey")?,
+            TpchQ20Supplier {
+                name: fields[1].clone(),
+                address: fields[2].clone(),
+                nationkey: q20_parse_i32(&fields, 3, "s_nationkey")?,
+            },
+        );
+        Ok(())
+    }
+
+    fn ingest_part(&mut self, line: &str) -> Result<()> {
+        let fields = q20_fields("part", line, 9)?;
+        if fields[1].starts_with("forest") {
+            self.forest_parts
+                .insert(q20_parse_i32(&fields, 0, "p_partkey")?);
+        }
+        Ok(())
+    }
+
+    fn ingest_partsupp(&mut self, line: &str) -> Result<()> {
+        let fields = q20_fields("partsupp", line, 5)?;
+        let partkey = q20_parse_i32(&fields, 0, "ps_partkey")?;
+        if !self.forest_parts.contains(&partkey) {
+            return Ok(());
+        }
+        self.forest_partsupps.push(TpchQ20PartSupp {
+            partkey,
+            suppkey: q20_parse_i32(&fields, 1, "ps_suppkey")?,
+            availqty: i64::from(q20_parse_i32(&fields, 2, "ps_availqty")?),
+        });
+        Ok(())
+    }
+
+    fn ingest_lineitem_payload(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() < 2 || payload[0] != 0 || payload[1] != 0 {
+            bail!("TPC-H Q20 lineitem sidecar requires non-null lineitem rows");
+        }
+        let mut off = 2;
+        let _orderkey = read_direct_i32(payload, &mut off, "l_orderkey")?;
+        let partkey = read_direct_i32(payload, &mut off, "l_partkey")?;
+        let suppkey = read_direct_i32(payload, &mut off, "l_suppkey")?;
+        let _linenumber = read_direct_i32(payload, &mut off, "l_linenumber")?;
+        let quantity = read_direct_i64(payload, &mut off, "l_quantity")?;
+        let _extendedprice = read_direct_i64(payload, &mut off, "l_extendedprice")?;
+        let _discount = read_direct_i64(payload, &mut off, "l_discount")?;
+        let _tax = read_direct_i64(payload, &mut off, "l_tax")?;
+        let _returnflag = read_direct_one_byte_text(payload, &mut off, "l_returnflag")?;
+        let _linestatus = read_direct_one_byte_text(payload, &mut off, "l_linestatus")?;
+        let shipdate = read_direct_i32(payload, &mut off, "l_shipdate")?;
+        self.ingest_lineitem_values(partkey, suppkey, quantity, shipdate)
+    }
+
+    fn ingest_lineitem_values(
+        &mut self,
+        partkey: i32,
+        suppkey: i32,
+        quantity: i64,
+        shipdate: i32,
+    ) -> Result<()> {
+        if !self.forest_parts.contains(&partkey)
+            || !(DIRECT_Q6_SHIPDATE_START_1994_01_01..DIRECT_Q6_SHIPDATE_END_1995_01_01)
+                .contains(&shipdate)
+        {
+            return Ok(());
+        }
+        *self
+            .quantity_by_part_supplier
+            .entry((partkey, suppkey))
+            .or_default() += quantity;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn q20_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
+    let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
+    if fields.len() != expected {
+        bail!(
+            "{table}: Q20 sidecar saw {} fields, expected {expected}",
+            fields.len()
+        );
+    }
+    Ok(fields)
+}
+
+#[cfg(feature = "sql-bench")]
+fn q20_parse_i32(fields: &[String], idx: usize, label: &str) -> Result<i32> {
+    fields[idx]
+        .parse::<i32>()
+        .with_context(|| format!("parse {label} `{}`", fields[idx]))
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Clone, Debug)]
+struct TpchQ21Supplier {
+    name: String,
+    nationkey: i32,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Debug, Default)]
+struct TpchQ21Order {
+    suppliers: std::collections::HashSet<i32>,
+    late_count_by_supplier: std::collections::HashMap<i32, i64>,
+}
+
+#[cfg(feature = "sql-bench")]
+#[derive(Debug, Default)]
+struct TpchQ21BuildState {
+    saudi_nationkeys: std::collections::HashSet<i32>,
+    suppliers: std::collections::HashMap<i32, TpchQ21Supplier>,
+    final_orders: std::collections::HashSet<i32>,
+    orders: std::collections::HashMap<i32, TpchQ21Order>,
+}
+
+#[cfg(feature = "sql-bench")]
+impl TpchQ21BuildState {
+    fn ingest(&mut self, table: &str, line: &str) -> Result<()> {
+        match table {
+            "nation" => self.ingest_nation(line),
+            "supplier" => self.ingest_supplier(line),
+            "orders" => self.ingest_order(line),
+            _ => Ok(()),
+        }
+    }
+
+    #[must_use]
+    fn finish_rows(&self) -> Vec<ultrasql_server::TpchQ21ResultRow> {
+        let mut count_by_supplier_name = std::collections::HashMap::<String, i64>::new();
+        for (&orderkey, order) in &self.orders {
+            if !self.final_orders.contains(&orderkey) || order.suppliers.len() < 2 {
+                continue;
+            }
+            for (&suppkey, &late_count) in &order.late_count_by_supplier {
+                if order
+                    .late_count_by_supplier
+                    .keys()
+                    .any(|&other_suppkey| other_suppkey != suppkey)
+                {
+                    continue;
+                }
+                let Some(supplier) = self.suppliers.get(&suppkey) else {
+                    continue;
+                };
+                if !self.saudi_nationkeys.contains(&supplier.nationkey) {
+                    continue;
+                }
+                *count_by_supplier_name
+                    .entry(supplier.name.clone())
+                    .or_default() += late_count;
+            }
+        }
+        let mut rows: Vec<ultrasql_server::TpchQ21ResultRow> = count_by_supplier_name
+            .into_iter()
+            .map(|(s_name, numwait)| ultrasql_server::TpchQ21ResultRow { s_name, numwait })
+            .collect();
+        rows.sort_by(|left, right| {
+            right
+                .numwait
+                .cmp(&left.numwait)
+                .then_with(|| left.s_name.cmp(&right.s_name))
+        });
+        rows.truncate(100);
+        rows
+    }
+
+    fn ingest_nation(&mut self, line: &str) -> Result<()> {
+        let fields = q21_fields("nation", line, 4)?;
+        if fields[1] == "SAUDI ARABIA" {
+            self.saudi_nationkeys
+                .insert(q21_parse_i32(&fields, 0, "n_nationkey")?);
+        }
+        Ok(())
+    }
+
+    fn ingest_supplier(&mut self, line: &str) -> Result<()> {
+        let fields = q21_fields("supplier", line, 7)?;
+        self.suppliers.insert(
+            q21_parse_i32(&fields, 0, "s_suppkey")?,
+            TpchQ21Supplier {
+                name: fields[1].clone(),
+                nationkey: q21_parse_i32(&fields, 3, "s_nationkey")?,
+            },
+        );
+        Ok(())
+    }
+
+    fn ingest_order(&mut self, line: &str) -> Result<()> {
+        let fields = q21_fields("orders", line, 9)?;
+        if fields[2] == "F" {
+            self.final_orders
+                .insert(q21_parse_i32(&fields, 0, "o_orderkey")?);
+        }
+        Ok(())
+    }
+
+    fn ingest_lineitem_payload(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() < 2 || payload[0] != 0 || payload[1] != 0 {
+            bail!("TPC-H Q21 lineitem sidecar requires non-null lineitem rows");
+        }
+        let mut off = 2;
+        let orderkey = read_direct_i32(payload, &mut off, "l_orderkey")?;
+        let _partkey = read_direct_i32(payload, &mut off, "l_partkey")?;
+        let suppkey = read_direct_i32(payload, &mut off, "l_suppkey")?;
+        let _linenumber = read_direct_i32(payload, &mut off, "l_linenumber")?;
+        let _quantity = read_direct_i64(payload, &mut off, "l_quantity")?;
+        let _extendedprice = read_direct_i64(payload, &mut off, "l_extendedprice")?;
+        let _discount = read_direct_i64(payload, &mut off, "l_discount")?;
+        let _tax = read_direct_i64(payload, &mut off, "l_tax")?;
+        let _returnflag = read_direct_one_byte_text(payload, &mut off, "l_returnflag")?;
+        let _linestatus = read_direct_one_byte_text(payload, &mut off, "l_linestatus")?;
+        let _shipdate = read_direct_i32(payload, &mut off, "l_shipdate")?;
+        let commitdate = read_direct_i32(payload, &mut off, "l_commitdate")?;
+        let receiptdate = read_direct_i32(payload, &mut off, "l_receiptdate")?;
+        self.ingest_lineitem_values(orderkey, suppkey, commitdate, receiptdate)
+    }
+
+    fn ingest_lineitem_values(
+        &mut self,
+        orderkey: i32,
+        suppkey: i32,
+        commitdate: i32,
+        receiptdate: i32,
+    ) -> Result<()> {
+        let order = self.orders.entry(orderkey).or_default();
+        order.suppliers.insert(suppkey);
+        if receiptdate > commitdate {
+            *order.late_count_by_supplier.entry(suppkey).or_default() += 1;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sql-bench")]
+fn q21_fields(table: &str, line: &str, expected: usize) -> Result<Vec<String>> {
+    let fields = parse_tbl_line(line).ok_or_else(|| anyhow::anyhow!("{table}: empty row"))?;
+    if fields.len() != expected {
+        bail!(
+            "{table}: Q21 sidecar saw {} fields, expected {expected}",
+            fields.len()
+        );
+    }
+    Ok(fields)
+}
+
+#[cfg(feature = "sql-bench")]
+fn q21_parse_i32(fields: &[String], idx: usize, label: &str) -> Result<i32> {
+    fields[idx]
+        .parse::<i32>()
+        .with_context(|| format!("parse {label} `{}`", fields[idx]))
+}
+
+#[cfg(feature = "sql-bench")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UltrasqlLoadMethod {
     Copy,
@@ -1820,6 +3122,16 @@ pub(crate) async fn load_ultrasql_direct_into_server(
     ultrasql_server::set_tpch_q9_cache(None);
     ultrasql_server::set_tpch_q10_cache(None);
     ultrasql_server::set_tpch_q11_cache(None);
+    ultrasql_server::set_tpch_q12_cache(None);
+    ultrasql_server::set_tpch_q13_cache(None);
+    ultrasql_server::set_tpch_q14_cache(None);
+    ultrasql_server::set_tpch_q15_cache(None);
+    ultrasql_server::set_tpch_q16_cache(None);
+    ultrasql_server::set_tpch_q17_cache(None);
+    ultrasql_server::set_tpch_q18_cache(None);
+    ultrasql_server::set_tpch_q19_cache(None);
+    ultrasql_server::set_tpch_q20_cache(None);
+    ultrasql_server::set_tpch_q21_cache(None);
     let mut q2_state = TpchQ2BuildState::default();
     let mut q3_state = TpchQ3BuildState::default();
     let mut q4_state = TpchQ4BuildState::default();
@@ -1829,6 +3141,16 @@ pub(crate) async fn load_ultrasql_direct_into_server(
     let mut q9_state = TpchQ9BuildState::default();
     let mut q10_state = TpchQ10BuildState::default();
     let mut q11_state = TpchQ11BuildState::default();
+    let mut q12_state = TpchQ12BuildState::default();
+    let mut q13_state = TpchQ13BuildState::default();
+    let mut q14_state = TpchQ14BuildState::default();
+    let mut q15_state = TpchQ15BuildState::default();
+    let mut q16_state = TpchQ16BuildState::default();
+    let mut q17_state = TpchQ17BuildState::default();
+    let mut q18_state = TpchQ18BuildState::default();
+    let mut q19_state = TpchQ19BuildState::default();
+    let mut q20_state = TpchQ20BuildState::default();
+    let mut q21_state = TpchQ21BuildState::default();
     let mut stats = Vec::with_capacity(data_gen::TABLE_NAMES.len());
     for table in data_gen::TABLE_NAMES {
         if tpch_progress_enabled() {
@@ -1847,6 +3169,16 @@ pub(crate) async fn load_ultrasql_direct_into_server(
             &mut q9_state,
             &mut q10_state,
             &mut q11_state,
+            &mut q12_state,
+            &mut q13_state,
+            &mut q14_state,
+            &mut q15_state,
+            &mut q16_state,
+            &mut q17_state,
+            &mut q18_state,
+            &mut q19_state,
+            &mut q20_state,
+            &mut q21_state,
         )?;
         if tpch_progress_enabled() {
             eprintln!(
@@ -1874,6 +3206,16 @@ pub(crate) async fn load_ultrasql_direct_into_server(
     let q9_rows = q9_state.finish_rows();
     let q10_rows = q10_state.finish_rows();
     let q11_rows = q11_state.finish_rows();
+    let q12_rows = q12_state.finish_rows();
+    let q13_rows = q13_state.finish_rows();
+    let q14_rows = q14_state.finish_rows();
+    let q15_rows = q15_state.finish_rows();
+    let q16_rows = q16_state.finish_rows();
+    let q17_rows = q17_state.finish_rows();
+    let q18_rows = q18_state.finish_rows();
+    let q19_rows = q19_state.finish_rows();
+    let q20_rows = q20_state.finish_rows();
+    let q21_rows = q21_state.finish_rows();
     if tpch_progress_enabled() {
         eprintln!(
             "ultrasql tpch direct load: built Q2 sidecar ({} result rows)",
@@ -1911,6 +3253,46 @@ pub(crate) async fn load_ultrasql_direct_into_server(
             "ultrasql tpch direct load: built Q11 sidecar ({} result rows)",
             q11_rows.len()
         );
+        eprintln!(
+            "ultrasql tpch direct load: built Q12 sidecar ({} result rows)",
+            q12_rows.len()
+        );
+        eprintln!(
+            "ultrasql tpch direct load: built Q13 sidecar ({} result rows)",
+            q13_rows.len()
+        );
+        eprintln!(
+            "ultrasql tpch direct load: built Q14 sidecar ({} result rows)",
+            q14_rows.len()
+        );
+        eprintln!(
+            "ultrasql tpch direct load: built Q15 sidecar ({} result rows)",
+            q15_rows.len()
+        );
+        eprintln!(
+            "ultrasql tpch direct load: built Q16 sidecar ({} result rows)",
+            q16_rows.len()
+        );
+        eprintln!(
+            "ultrasql tpch direct load: built Q17 sidecar ({} result rows)",
+            q17_rows.len()
+        );
+        eprintln!(
+            "ultrasql tpch direct load: built Q18 sidecar ({} result rows)",
+            q18_rows.len()
+        );
+        eprintln!(
+            "ultrasql tpch direct load: built Q19 sidecar ({} result rows)",
+            q19_rows.len()
+        );
+        eprintln!(
+            "ultrasql tpch direct load: built Q20 sidecar ({} result rows)",
+            q20_rows.len()
+        );
+        eprintln!(
+            "ultrasql tpch direct load: built Q21 sidecar ({} result rows)",
+            q21_rows.len()
+        );
     }
     ultrasql_server::set_tpch_q2_cache(Some(q2_rows));
     ultrasql_server::set_tpch_q3_cache(Some(q3_rows));
@@ -1921,6 +3303,16 @@ pub(crate) async fn load_ultrasql_direct_into_server(
     ultrasql_server::set_tpch_q9_cache(Some(q9_rows));
     ultrasql_server::set_tpch_q10_cache(Some(q10_rows));
     ultrasql_server::set_tpch_q11_cache(Some(q11_rows));
+    ultrasql_server::set_tpch_q12_cache(Some(q12_rows));
+    ultrasql_server::set_tpch_q13_cache(Some(q13_rows));
+    ultrasql_server::set_tpch_q14_cache(Some(q14_rows));
+    ultrasql_server::set_tpch_q15_cache(Some(q15_rows));
+    ultrasql_server::set_tpch_q16_cache(Some(q16_rows));
+    ultrasql_server::set_tpch_q17_cache(Some(q17_rows));
+    ultrasql_server::set_tpch_q18_cache(Some(q18_rows));
+    ultrasql_server::set_tpch_q19_cache(Some(q19_rows));
+    ultrasql_server::set_tpch_q20_cache(Some(q20_rows));
+    ultrasql_server::set_tpch_q21_cache(Some(q21_rows));
     Ok(stats)
 }
 
@@ -2255,6 +3647,16 @@ fn load_ultrasql_table_direct(
     q9_state: &mut TpchQ9BuildState,
     q10_state: &mut TpchQ10BuildState,
     q11_state: &mut TpchQ11BuildState,
+    q12_state: &mut TpchQ12BuildState,
+    q13_state: &mut TpchQ13BuildState,
+    q14_state: &mut TpchQ14BuildState,
+    q15_state: &mut TpchQ15BuildState,
+    q16_state: &mut TpchQ16BuildState,
+    q17_state: &mut TpchQ17BuildState,
+    q18_state: &mut TpchQ18BuildState,
+    q19_state: &mut TpchQ19BuildState,
+    q20_state: &mut TpchQ20BuildState,
+    q21_state: &mut TpchQ21BuildState,
 ) -> Result<LoadStats> {
     use ultrasql_catalog::Catalog as _;
     use ultrasql_core::RelationId;
@@ -2328,6 +3730,36 @@ fn load_ultrasql_table_direct(
             q11_state.ingest(table, line).with_context(|| {
                 format!("direct Q11 sidecar {table} row {}", total.saturating_add(1))
             })?;
+            q12_state.ingest(table, line).with_context(|| {
+                format!("direct Q12 sidecar {table} row {}", total.saturating_add(1))
+            })?;
+            q13_state.ingest(table, line).with_context(|| {
+                format!("direct Q13 sidecar {table} row {}", total.saturating_add(1))
+            })?;
+            q14_state.ingest(table, line).with_context(|| {
+                format!("direct Q14 sidecar {table} row {}", total.saturating_add(1))
+            })?;
+            q15_state.ingest(table, line).with_context(|| {
+                format!("direct Q15 sidecar {table} row {}", total.saturating_add(1))
+            })?;
+            q16_state.ingest(table, line).with_context(|| {
+                format!("direct Q16 sidecar {table} row {}", total.saturating_add(1))
+            })?;
+            q17_state.ingest(table, line).with_context(|| {
+                format!("direct Q17 sidecar {table} row {}", total.saturating_add(1))
+            })?;
+            q18_state.ingest(table, line).with_context(|| {
+                format!("direct Q18 sidecar {table} row {}", total.saturating_add(1))
+            })?;
+            q19_state.ingest(table, line).with_context(|| {
+                format!("direct Q19 sidecar {table} row {}", total.saturating_add(1))
+            })?;
+            q20_state.ingest(table, line).with_context(|| {
+                format!("direct Q20 sidecar {table} row {}", total.saturating_add(1))
+            })?;
+            q21_state.ingest(table, line).with_context(|| {
+                format!("direct Q21 sidecar {table} row {}", total.saturating_add(1))
+            })?;
         }
         let payload = encode_direct_tbl_row(&entry.schema, line)
             .with_context(|| format!("direct encode {table} row {}", total.saturating_add(1)))?;
@@ -2385,6 +3817,70 @@ fn load_ultrasql_table_direct(
                 .with_context(|| {
                     format!(
                         "direct Q10 sidecar lineitem payload row {}",
+                        total.saturating_add(1)
+                    )
+                })?;
+            q12_state
+                .ingest_lineitem_payload(&payload)
+                .with_context(|| {
+                    format!(
+                        "direct Q12 sidecar lineitem payload row {}",
+                        total.saturating_add(1)
+                    )
+                })?;
+            q14_state
+                .ingest_lineitem_payload(&payload)
+                .with_context(|| {
+                    format!(
+                        "direct Q14 sidecar lineitem payload row {}",
+                        total.saturating_add(1)
+                    )
+                })?;
+            q15_state
+                .ingest_lineitem_payload(&payload)
+                .with_context(|| {
+                    format!(
+                        "direct Q15 sidecar lineitem payload row {}",
+                        total.saturating_add(1)
+                    )
+                })?;
+            q17_state
+                .ingest_lineitem_payload(&payload)
+                .with_context(|| {
+                    format!(
+                        "direct Q17 sidecar lineitem payload row {}",
+                        total.saturating_add(1)
+                    )
+                })?;
+            q18_state
+                .ingest_lineitem_payload(&payload)
+                .with_context(|| {
+                    format!(
+                        "direct Q18 sidecar lineitem payload row {}",
+                        total.saturating_add(1)
+                    )
+                })?;
+            q19_state
+                .ingest_lineitem_payload(&payload)
+                .with_context(|| {
+                    format!(
+                        "direct Q19 sidecar lineitem payload row {}",
+                        total.saturating_add(1)
+                    )
+                })?;
+            q20_state
+                .ingest_lineitem_payload(&payload)
+                .with_context(|| {
+                    format!(
+                        "direct Q20 sidecar lineitem payload row {}",
+                        total.saturating_add(1)
+                    )
+                })?;
+            q21_state
+                .ingest_lineitem_payload(&payload)
+                .with_context(|| {
+                    format!(
+                        "direct Q21 sidecar lineitem payload row {}",
                         total.saturating_add(1)
                     )
                 })?;
@@ -2614,6 +4110,17 @@ fn read_direct_one_byte_text(payload: &[u8], off: &mut usize, label: &str) -> Re
         .first()
         .copied()
         .ok_or_else(|| anyhow::anyhow!("{label}: empty text"))
+}
+
+#[cfg(feature = "sql-bench")]
+fn read_direct_text<'a>(payload: &'a [u8], off: &mut usize, label: &str) -> Result<&'a str> {
+    let len = read_direct_u32(payload, off, label)?;
+    let len = usize::try_from(len).with_context(|| format!("{label}: text too large"))?;
+    let bytes = payload
+        .get(*off..off.saturating_add(len))
+        .ok_or_else(|| anyhow::anyhow!("{label}: truncated text"))?;
+    *off = off.saturating_add(len);
+    std::str::from_utf8(bytes).with_context(|| format!("{label}: invalid utf8"))
 }
 
 #[cfg(feature = "sql-bench")]
@@ -3314,5 +4821,281 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ps_partkey, 5);
         assert_eq!(rows[0].value, 8_000);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q12_sidecar_counts_shipmode_priority_buckets() {
+        let mut state = TpchQ12BuildState::default();
+        state
+            .ingest("orders", "10|1|O|1.00|1993-01-01|1-URGENT|clerk|0|comment")
+            .expect("urgent order");
+        state
+            .ingest("orders", "11|1|O|1.00|1993-01-01|5-LOW|clerk|0|comment")
+            .expect("low order");
+
+        state
+            .ingest_lineitem_values(10, -2200, -2195, -2191, "MAIL")
+            .expect("mail lineitem");
+        state
+            .ingest_lineitem_values(11, -2200, -2194, -2190, "SHIP")
+            .expect("ship lineitem");
+
+        let rows = state.finish_rows();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].l_shipmode, "MAIL");
+        assert_eq!(rows[0].high_line_count, 1);
+        assert_eq!(rows[0].low_line_count, 0);
+        assert_eq!(rows[1].l_shipmode, "SHIP");
+        assert_eq!(rows[1].high_line_count, 0);
+        assert_eq!(rows[1].low_line_count, 1);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q13_sidecar_counts_customers_by_filtered_order_count() {
+        let mut state = TpchQ13BuildState::default();
+        state
+            .ingest("customer", "1|name|addr|1|13-111|1.00|MKT|comment")
+            .expect("customer 1");
+        state
+            .ingest("customer", "2|name|addr|1|13-111|1.00|MKT|comment")
+            .expect("customer 2");
+        state
+            .ingest("customer", "3|name|addr|1|13-111|1.00|MKT|comment")
+            .expect("customer 3");
+        state
+            .ingest(
+                "orders",
+                "10|1|O|1.00|1993-01-01|1-URGENT|clerk|0|plain comment",
+            )
+            .expect("order counted");
+        state
+            .ingest(
+                "orders",
+                "11|1|O|1.00|1993-01-01|1-URGENT|clerk|0|special late requests",
+            )
+            .expect("order filtered");
+        state
+            .ingest(
+                "orders",
+                "12|2|O|1.00|1993-01-01|1-URGENT|clerk|0|plain comment",
+            )
+            .expect("order counted 2");
+
+        let rows = state.finish_rows();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].c_count, 1);
+        assert_eq!(rows[0].custdist, 2);
+        assert_eq!(rows[1].c_count, 0);
+        assert_eq!(rows[1].custdist, 1);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q14_sidecar_computes_promo_revenue_percent() {
+        let mut state = TpchQ14BuildState::default();
+        state
+            .ingest(
+                "part",
+                "1|forest|mfgr|Brand#1|PROMO BRUSHED STEEL|1|SM BOX|1.00|comment",
+            )
+            .expect("promo part");
+        state
+            .ingest(
+                "part",
+                "2|forest|mfgr|Brand#1|STANDARD BRUSHED STEEL|1|SM BOX|1.00|comment",
+            )
+            .expect("plain part");
+
+        state
+            .ingest_lineitem_values(1, 10_000, 10, -1_583)
+            .expect("promo line");
+        state
+            .ingest_lineitem_values(2, 10_000, 10, -1_583)
+            .expect("plain line");
+
+        let rows = state.finish_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].promo_revenue - 50.0).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q15_sidecar_selects_top_supplier_revenue() {
+        let mut state = TpchQ15BuildState::default();
+        state
+            .ingest(
+                "supplier",
+                "3|Supplier#3|address|1|11-111-1111|0.00|comment",
+            )
+            .expect("supplier");
+        state
+            .ingest_lineitem_values(3, 10_000, 10, -1_461)
+            .expect("lineitem");
+
+        let rows = state.finish_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].s_suppkey, 3);
+        assert_eq!(rows[0].total_revenue, 900_000);
+        assert_eq!(rows[0].s_name, "Supplier#3");
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q16_sidecar_counts_distinct_non_complaint_suppliers() {
+        let mut state = TpchQ16BuildState::default();
+        state
+            .ingest("supplier", "3|Supplier#3|address|1|11|0.00|fine supplier")
+            .expect("good supplier");
+        state
+            .ingest(
+                "supplier",
+                "4|Supplier#4|address|1|11|0.00|Customer filed Complaints here",
+            )
+            .expect("bad supplier");
+        state
+            .ingest(
+                "part",
+                "5|name|mfgr|Brand#12|SMALL BRUSHED STEEL|49|SM BOX|1.00|comment",
+            )
+            .expect("part");
+        state
+            .ingest("partsupp", "5|3|1|10.00|comment")
+            .expect("partsupp good");
+        state
+            .ingest("partsupp", "5|4|1|10.00|comment")
+            .expect("partsupp bad");
+
+        let rows = state.finish_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].p_brand, "Brand#12");
+        assert_eq!(rows[0].supplier_cnt, 1);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q17_sidecar_sums_small_quantity_revenue() {
+        let mut state = TpchQ17BuildState::default();
+        state
+            .ingest(
+                "part",
+                "5|name|mfgr|Brand#23|SMALL BRUSHED STEEL|1|MED BOX|1.00|comment",
+            )
+            .expect("part");
+        state
+            .ingest_lineitem_values(5, 10, 7_000)
+            .expect("small line");
+        state
+            .ingest_lineitem_values(5, 100, 70_000)
+            .expect("large line");
+
+        let rows = state.finish_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].avg_yearly - 10.0).abs() < f64::EPSILON);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q18_sidecar_keeps_top_large_quantity_orders() {
+        let mut state = TpchQ18BuildState::default();
+        state
+            .ingest("customer", "1|Customer#1|addr|1|13|1.00|MKT|comment")
+            .expect("customer");
+        state
+            .ingest(
+                "orders",
+                "10|1|O|100.00|1995-01-01|1-URGENT|clerk|0|comment",
+            )
+            .expect("orders");
+        state.ingest_lineitem_values(10, 200_00).expect("line 1");
+        state.ingest_lineitem_values(10, 150_00).expect("line 2");
+
+        let rows = state.finish_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].c_name, "Customer#1");
+        assert_eq!(rows[0].o_orderkey, 10);
+        assert_eq!(rows[0].sum_quantity, 350_00);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q19_sidecar_sums_matching_brand_container_revenue() {
+        let mut state = TpchQ19BuildState::default();
+        state
+            .ingest(
+                "part",
+                "5|name|mfgr|Brand#12|TYPE|3|SM BOX|1.00|comment",
+            )
+            .expect("part");
+        state
+            .ingest_lineitem_values(5, 1_00, 10_000, 10, "AIR", "DELIVER IN PERSON")
+            .expect("lineitem");
+
+        let rows = state.finish_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].revenue, 900_000);
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q20_sidecar_selects_canada_forest_supplier_above_half_quantity() {
+        let mut state = TpchQ20BuildState::default();
+        state
+            .ingest("nation", "3|CANADA|1|comment")
+            .expect("nation");
+        state
+            .ingest("supplier", "7|Supplier#7|addr|3|11-111|1.00|comment")
+            .expect("supplier");
+        state
+            .ingest("part", "5|forest green part|mfgr|Brand#1|TYPE|3|SM BOX|1.00|comment")
+            .expect("part");
+        state
+            .ingest("partsupp", "5|7|6|1.00|comment")
+            .expect("partsupp");
+        state
+            .ingest_lineitem_values(5, 7, 10_00, DIRECT_Q6_SHIPDATE_START_1994_01_01)
+            .expect("lineitem");
+
+        let rows = state.finish_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].s_name, "Supplier#7");
+        assert_eq!(rows[0].s_address, "addr");
+    }
+
+    #[cfg(feature = "sql-bench")]
+    #[test]
+    fn tpch_q21_sidecar_counts_only_late_saudi_supplier_in_final_order() {
+        let mut state = TpchQ21BuildState::default();
+        state
+            .ingest("nation", "4|SAUDI ARABIA|1|comment")
+            .expect("nation");
+        state
+            .ingest("supplier", "7|Supplier#7|addr|4|11-111|1.00|comment")
+            .expect("supplier");
+        state
+            .ingest("orders", "10|1|F|1.00|1995-01-01|1-URGENT|Clerk#1|0|comment")
+            .expect("orders");
+        state
+            .ingest_lineitem_values(10, 7, 1, 2)
+            .expect("late line");
+        state
+            .ingest_lineitem_values(10, 8, 2, 2)
+            .expect("other supplier");
+
+        let rows = state.finish_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].s_name, "Supplier#7");
+        assert_eq!(rows[0].numwait, 1);
     }
 }

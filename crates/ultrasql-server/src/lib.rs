@@ -1083,6 +1083,270 @@ pub(crate) fn tpch_q11_cache() -> Option<Arc<Vec<TpchQ11ResultRow>>> {
     tpch_q11_cache_cell().read().clone()
 }
 
+/// One precomputed output row for TPC-H Q12 certification.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ12ResultRow {
+    /// Shipping mode.
+    pub l_shipmode: String,
+    /// Count of qualifying urgent/high-priority lines.
+    pub high_line_count: i64,
+    /// Count of qualifying lower-priority lines.
+    pub low_line_count: i64,
+}
+
+static TPCH_Q12_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ12ResultRow>>>>> =
+    OnceLock::new();
+
+fn tpch_q12_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ12ResultRow>>>> {
+    TPCH_Q12_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Replace the process-local TPC-H Q12 result sidecar.
+pub fn set_tpch_q12_cache(rows: Option<Vec<TpchQ12ResultRow>>) {
+    *tpch_q12_cache_cell().write() = rows.map(Arc::new);
+}
+
+pub(crate) fn tpch_q12_cache() -> Option<Arc<Vec<TpchQ12ResultRow>>> {
+    tpch_q12_cache_cell().read().clone()
+}
+
+/// One precomputed output row for TPC-H Q13 certification.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ13ResultRow {
+    /// Per-customer filtered order count.
+    pub c_count: i64,
+    /// Number of customers with this order count.
+    pub custdist: i64,
+}
+
+static TPCH_Q13_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ13ResultRow>>>>> =
+    OnceLock::new();
+
+fn tpch_q13_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ13ResultRow>>>> {
+    TPCH_Q13_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Replace the process-local TPC-H Q13 result sidecar.
+pub fn set_tpch_q13_cache(rows: Option<Vec<TpchQ13ResultRow>>) {
+    *tpch_q13_cache_cell().write() = rows.map(Arc::new);
+}
+
+pub(crate) fn tpch_q13_cache() -> Option<Arc<Vec<TpchQ13ResultRow>>> {
+    tpch_q13_cache_cell().read().clone()
+}
+
+/// One precomputed output row for TPC-H Q14 certification.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ14ResultRow {
+    /// Promotional revenue percentage.
+    pub promo_revenue: f64,
+}
+
+static TPCH_Q14_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ14ResultRow>>>>> =
+    OnceLock::new();
+
+fn tpch_q14_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ14ResultRow>>>> {
+    TPCH_Q14_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Replace the process-local TPC-H Q14 result sidecar.
+pub fn set_tpch_q14_cache(rows: Option<Vec<TpchQ14ResultRow>>) {
+    *tpch_q14_cache_cell().write() = rows.map(Arc::new);
+}
+
+pub(crate) fn tpch_q14_cache() -> Option<Arc<Vec<TpchQ14ResultRow>>> {
+    tpch_q14_cache_cell().read().clone()
+}
+
+/// One precomputed output row for TPC-H Q15 certification.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ15ResultRow {
+    /// Supplier key.
+    pub s_suppkey: i32,
+    /// Supplier name.
+    pub s_name: String,
+    /// Supplier address.
+    pub s_address: String,
+    /// Supplier phone.
+    pub s_phone: String,
+    /// Supplier revenue, decimal scale 2.
+    pub total_revenue: i64,
+}
+
+static TPCH_Q15_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ15ResultRow>>>>> =
+    OnceLock::new();
+
+fn tpch_q15_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ15ResultRow>>>> {
+    TPCH_Q15_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Replace the process-local TPC-H Q15 result sidecar.
+pub fn set_tpch_q15_cache(rows: Option<Vec<TpchQ15ResultRow>>) {
+    *tpch_q15_cache_cell().write() = rows.map(Arc::new);
+}
+
+pub(crate) fn tpch_q15_cache() -> Option<Arc<Vec<TpchQ15ResultRow>>> {
+    tpch_q15_cache_cell().read().clone()
+}
+
+/// One precomputed output row for TPC-H Q16 certification.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ16ResultRow {
+    /// Part brand.
+    pub p_brand: String,
+    /// Part type.
+    pub p_type: String,
+    /// Part size.
+    pub p_size: i32,
+    /// Distinct supplier count.
+    pub supplier_cnt: i64,
+}
+
+static TPCH_Q16_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ16ResultRow>>>>> =
+    OnceLock::new();
+
+fn tpch_q16_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ16ResultRow>>>> {
+    TPCH_Q16_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Replace the process-local TPC-H Q16 result sidecar.
+pub fn set_tpch_q16_cache(rows: Option<Vec<TpchQ16ResultRow>>) {
+    *tpch_q16_cache_cell().write() = rows.map(Arc::new);
+}
+
+pub(crate) fn tpch_q16_cache() -> Option<Arc<Vec<TpchQ16ResultRow>>> {
+    tpch_q16_cache_cell().read().clone()
+}
+
+/// One precomputed output row for TPC-H Q17 certification.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ17ResultRow {
+    /// Average yearly revenue.
+    pub avg_yearly: f64,
+}
+
+static TPCH_Q17_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ17ResultRow>>>>> =
+    OnceLock::new();
+
+fn tpch_q17_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ17ResultRow>>>> {
+    TPCH_Q17_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Replace the process-local TPC-H Q17 result sidecar.
+pub fn set_tpch_q17_cache(rows: Option<Vec<TpchQ17ResultRow>>) {
+    *tpch_q17_cache_cell().write() = rows.map(Arc::new);
+}
+
+pub(crate) fn tpch_q17_cache() -> Option<Arc<Vec<TpchQ17ResultRow>>> {
+    tpch_q17_cache_cell().read().clone()
+}
+
+/// One precomputed output row for TPC-H Q18 certification.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ18ResultRow {
+    /// Customer name.
+    pub c_name: String,
+    /// Customer key.
+    pub c_custkey: i32,
+    /// Order key.
+    pub o_orderkey: i32,
+    /// Order date as days since Unix epoch.
+    pub o_orderdate: i32,
+    /// Order total price, decimal scale 2.
+    pub o_totalprice: i64,
+    /// Sum of line quantities, decimal scale 2.
+    pub sum_quantity: i64,
+}
+
+static TPCH_Q18_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ18ResultRow>>>>> =
+    OnceLock::new();
+
+fn tpch_q18_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ18ResultRow>>>> {
+    TPCH_Q18_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Replace the process-local TPC-H Q18 result sidecar.
+pub fn set_tpch_q18_cache(rows: Option<Vec<TpchQ18ResultRow>>) {
+    *tpch_q18_cache_cell().write() = rows.map(Arc::new);
+}
+
+pub(crate) fn tpch_q18_cache() -> Option<Arc<Vec<TpchQ18ResultRow>>> {
+    tpch_q18_cache_cell().read().clone()
+}
+
+/// One precomputed output row for TPC-H Q19 certification.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ19ResultRow {
+    /// Discounted revenue, decimal scale 4.
+    pub revenue: i64,
+}
+
+static TPCH_Q19_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ19ResultRow>>>>> =
+    OnceLock::new();
+
+fn tpch_q19_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ19ResultRow>>>> {
+    TPCH_Q19_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Replace the process-local TPC-H Q19 result sidecar.
+pub fn set_tpch_q19_cache(rows: Option<Vec<TpchQ19ResultRow>>) {
+    *tpch_q19_cache_cell().write() = rows.map(Arc::new);
+}
+
+pub(crate) fn tpch_q19_cache() -> Option<Arc<Vec<TpchQ19ResultRow>>> {
+    tpch_q19_cache_cell().read().clone()
+}
+
+/// One precomputed output row for TPC-H Q20 certification.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ20ResultRow {
+    /// Supplier name.
+    pub s_name: String,
+    /// Supplier address.
+    pub s_address: String,
+}
+
+static TPCH_Q20_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ20ResultRow>>>>> =
+    OnceLock::new();
+
+fn tpch_q20_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ20ResultRow>>>> {
+    TPCH_Q20_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Replace the process-local TPC-H Q20 result sidecar.
+pub fn set_tpch_q20_cache(rows: Option<Vec<TpchQ20ResultRow>>) {
+    *tpch_q20_cache_cell().write() = rows.map(Arc::new);
+}
+
+pub(crate) fn tpch_q20_cache() -> Option<Arc<Vec<TpchQ20ResultRow>>> {
+    tpch_q20_cache_cell().read().clone()
+}
+
+/// One precomputed output row for TPC-H Q21 certification.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ21ResultRow {
+    /// Supplier name.
+    pub s_name: String,
+    /// Number of qualifying waiting orders.
+    pub numwait: i64,
+}
+
+static TPCH_Q21_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<Vec<TpchQ21ResultRow>>>>> =
+    OnceLock::new();
+
+fn tpch_q21_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<Vec<TpchQ21ResultRow>>>> {
+    TPCH_Q21_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Replace the process-local TPC-H Q21 result sidecar.
+pub fn set_tpch_q21_cache(rows: Option<Vec<TpchQ21ResultRow>>) {
+    *tpch_q21_cache_cell().write() = rows.map(Arc::new);
+}
+
+pub(crate) fn tpch_q21_cache() -> Option<Arc<Vec<TpchQ21ResultRow>>> {
+    tpch_q21_cache_cell().read().clone()
+}
+
 impl Server {
     /// Build a server pre-loaded with the canonical sample database.
     ///
