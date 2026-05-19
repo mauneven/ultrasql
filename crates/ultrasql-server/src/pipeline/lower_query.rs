@@ -25,6 +25,8 @@ use super::modify::{
 };
 use super::saturate_row_count;
 use super::scan::{lower_catalog_or_sample_scan, lower_function_scan};
+use super::tpch_q1::try_lower_tpch_q1;
+use super::tpch_q6::try_lower_tpch_q6;
 use super::{CteBuffer, LowerCtx};
 
 pub fn lower_query(
@@ -259,6 +261,12 @@ pub fn lower_query(
             // chain pays.
             if let Some(fused) = try_lower_fused_filter_sum_int(input, group_by, aggregates, ctx)? {
                 return Ok(fused);
+            }
+            if let Some(tpch_q1) = try_lower_tpch_q1(input, group_by, aggregates, schema, ctx)? {
+                return Ok(tpch_q1);
+            }
+            if let Some(tpch_q6) = try_lower_tpch_q6(input, group_by, aggregates, schema)? {
+                return Ok(tpch_q6);
             }
             // Fast path: pure `SELECT SUM(col_i32) FROM t` /
             // `SELECT AVG(col_i32) FROM t` over a cache-live

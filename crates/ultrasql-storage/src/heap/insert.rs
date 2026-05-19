@@ -333,6 +333,74 @@ impl<L: PageLoader> HeapAccess<L> {
         Ok(out)
     }
 
+    /// Append pre-encoded tuples by packing heap pages locally and writing
+    /// full pages through `writer`.
+    ///
+    /// This is a benchmark/recovery bulk path for append-only loads. It skips
+    /// the buffer-pool page table entirely: pages become visible through the
+    /// relation block counter and are materialized later by the configured
+    /// [`PageLoader`]. The normal OLTP [`Self::insert_batch`] path remains the
+    /// concurrency-safe choice for user DML.
+    pub fn bulk_load_encoded_batch<F>(
+        &self,
+        rel: RelationId,
+        rows: &[Vec<u8>],
+        opts: InsertOptions<'_>,
+        mut writer: F,
+    ) -> Result<u64, HeapError>
+    where
+        F: FnMut(PageId, &crate::page::Page) -> ultrasql_core::Result<()>,
+    {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        if opts.wal.is_some() {
+            return Err(HeapError::MalformedHeader(
+                "bulk_load_encoded_batch does not emit WAL",
+            ));
+        }
+
+        let counter = self.counter_for(rel);
+        let insert_cursor = self.cursor_for(rel);
+        let n_atts: u16 = 0;
+        let mut row_idx = 0_usize;
+        let mut inserted = 0_u64;
+
+        while row_idx < rows.len() {
+            let block = counter.fetch_add(1, Ordering::AcqRel);
+            if block == u32::MAX {
+                counter.store(u32::MAX, Ordering::Release);
+                return Err(HeapError::OutOfBlocks);
+            }
+            let page_id = PageId::new(rel, BlockNumber::new(block));
+            let mut page = crate::page::Page::new_heap();
+            let drained =
+                Self::bulk_fill_local_page(page_id, &mut page, rows, row_idx, opts, n_atts)?;
+            if drained == 0 {
+                return Err(HeapError::Page(PageError::NoSpace {
+                    needed: rows[row_idx]
+                        .len()
+                        .saturating_add(TUPLE_HEADER_SIZE)
+                        .saturating_add(crate::page::ITEMID_SIZE),
+                    available: page.header().free_space(),
+                }));
+            }
+            writer(page_id, &page)?;
+            if let Some(vm) = opts.vm {
+                vm.mark_all_visible(page_id.relation, page_id.block);
+            }
+            row_idx += drained;
+            inserted = inserted.saturating_add(
+                u64::try_from(drained)
+                    .map_err(|_| HeapError::MalformedHeader("bulk load count overflow"))?,
+            );
+            insert_cursor.store(block, Ordering::Release);
+        }
+
+        self.column_cache.bump_version(rel);
+        Ok(inserted)
+    }
+
     /// Fill `page_id` with as many of `rows[row_idx..]` as fit under a
     /// single exclusive page guard.
     ///
@@ -426,6 +494,66 @@ impl<L: PageLoader> HeapAccess<L> {
         }
 
         // Re-encode the page header once, outside the per-tuple loop.
+        if filled > 0 {
+            header.lower = cur_lower as u16;
+            header.upper = cur_upper as u16;
+            header.encode(page.as_bytes_mut());
+        }
+
+        Ok(filled)
+    }
+
+    fn bulk_fill_local_page(
+        page_id: PageId,
+        page: &mut crate::page::Page,
+        rows: &[Vec<u8>],
+        row_idx: usize,
+        opts: InsertOptions<'_>,
+        n_atts: u16,
+    ) -> Result<usize, HeapError> {
+        use crate::page::{ITEMID_SIZE, ItemId, ItemIdFlags, Page};
+
+        let mut filled: usize = 0;
+        let mut header = page.header();
+        let mut cur_lower = header.lower as usize;
+        let mut cur_upper = header.upper as usize;
+
+        for row in &rows[row_idx..] {
+            let tuple_size = TUPLE_HEADER_SIZE
+                .checked_add(row.len())
+                .ok_or(HeapError::MalformedHeader("tuple size overflow"))?;
+            let free = cur_upper.saturating_sub(cur_lower);
+            if free < tuple_size + ITEMID_SIZE {
+                break;
+            }
+            let tuple_len_u32 = u32::try_from(tuple_size)
+                .map_err(|_| HeapError::Page(PageError::Malformed("tuple too large for page")))?;
+            if tuple_len_u32 > ItemId::MAX_LENGTH {
+                return Err(HeapError::Page(PageError::Malformed(
+                    "tuple length exceeds itemid",
+                )));
+            }
+
+            let slot_count =
+                u16::try_from((cur_lower - crate::page::PAGE_HEADER_SIZE) / ITEMID_SIZE)
+                    .map_err(|_| HeapError::MalformedHeader("slot count overflow"))?;
+            let final_tid = TupleId::new(page_id, slot_count);
+            let tuple_header = TupleHeader::fresh(opts.xmin, opts.command_id, final_tid, n_atts);
+
+            cur_upper -= tuple_size;
+            let page_bytes = page.as_bytes_mut();
+            tuple_header.encode(&mut page_bytes[cur_upper..cur_upper + TUPLE_HEADER_SIZE]);
+            page_bytes[cur_upper + TUPLE_HEADER_SIZE..cur_upper + tuple_size].copy_from_slice(row);
+
+            let item = ItemId::new(cur_upper as u32, tuple_len_u32, ItemIdFlags::Normal);
+            let id_off = Page::item_id_offset(slot_count);
+            page_bytes[id_off..id_off + ITEMID_SIZE]
+                .copy_from_slice(&item.into_raw().to_le_bytes());
+
+            cur_lower += ITEMID_SIZE;
+            filled += 1;
+        }
+
         if filled > 0 {
             header.lower = cur_lower as u16;
             header.upper = cur_upper as u16;

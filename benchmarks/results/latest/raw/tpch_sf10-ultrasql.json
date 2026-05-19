@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "scale_factor": 10,
-  "engine": "duckdb@v1.5.2 (Variegata) 8a5851971f",
+  "engine": "ultrasql@0.0.1",
   "host": {
     "cpu": "aarch64",
     "cores": 0,
@@ -10,14 +10,12 @@
   },
   "git_commit": "unknown",
   "cargo_lock_sha256": "ff7b7cf0ffe32103cd627cd023087a8b36bf28ca75490dab47a4e95a4e4305ef",
-  "recorded_at": "2026-05-19T06:50:21.405366+00:00",
+  "recorded_at": "2026-05-19T06:48:26.442240+00:00",
   "queries": {
     "q2": {
-      "median_ms": 70.973916,
-      "p95_ms": 70.973916,
-      "runs": [
-        70.973916
-      ]
+      "median_ms": null,
+      "p95_ms": null,
+      "runs": []
     }
   }
 }

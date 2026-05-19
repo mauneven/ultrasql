@@ -887,7 +887,7 @@ where
             .heap
             .insert_batch(RelationId(entry.oid), &payload_refs, insert_opts)
             .map_err(|e| ServerError::ddl(format!("COPY FROM heap insert batch: {e}")))?;
-        self.state.flush_dirty_heap_pages()?;
+        self.state.flush_dirty_heap_pages_if_needed()?;
         Ok(())
     }
 

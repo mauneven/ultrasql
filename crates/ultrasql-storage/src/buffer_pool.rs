@@ -252,6 +252,12 @@ impl<L: PageLoader> BufferPool<L> {
         self.wal_sink.as_ref()
     }
 
+    /// Return fixed frame capacity for pressure-based checkpoint decisions.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.frames.len()
+    }
+
     /// Flush dirty, unpinned frames to disk using the provided `writer`
     /// callback.
     ///
@@ -391,7 +397,15 @@ impl<L: PageLoader> BufferPool<L> {
         self.counters.misses.fetch_add(1, Ordering::Relaxed);
 
         let frame_idx = self.acquire_frame_for(page_id)?;
-        let new_page = self.loader.load(page_id).map_err(BufferPoolError::Loader)?;
+        let new_page = match self.loader.load(page_id) {
+            Ok(page) => page,
+            Err(e) => {
+                let frame = &self.frames[frame_idx];
+                *frame.page.write() = None;
+                *frame.page_id.lock() = None;
+                return Err(BufferPoolError::Loader(e));
+            }
+        };
         {
             let frame = &self.frames[frame_idx];
             // Set the page contents and metadata while the eviction
@@ -439,10 +453,15 @@ impl<L: PageLoader> BufferPool<L> {
         self.page_table.get(&page_id).map(|e| *e)
     }
 
-    fn acquire_frame_for(&self, _new_page_id: PageId) -> Result<usize, BufferPoolError> {
+    fn acquire_frame_for(&self, new_page_id: PageId) -> Result<usize, BufferPoolError> {
         // First, look for a free frame.
         for (idx, frame) in self.frames.iter().enumerate() {
-            if frame.pin_count.load(Ordering::Acquire) == 0 && frame.page_id.lock().is_none() {
+            if frame.pin_count.load(Ordering::Acquire) != 0 {
+                continue;
+            }
+            let mut page_id_slot = frame.page_id.lock();
+            if frame.pin_count.load(Ordering::Acquire) == 0 && page_id_slot.is_none() {
+                *page_id_slot = Some(new_page_id);
                 return Ok(idx);
             }
         }
@@ -481,7 +500,7 @@ impl<L: PageLoader> BufferPool<L> {
                 self.page_table.remove(&old_id);
                 self.counters.evictions.fetch_add(1, Ordering::Relaxed);
             }
-            *page_id_slot = None;
+            *page_id_slot = Some(new_page_id);
             drop(page_id_slot);
             *frame.page.write() = None;
             return Ok(hand);

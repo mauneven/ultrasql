@@ -14,6 +14,8 @@ DUCKDB_BIN="${TPCH_DUCKDB:-$(command -v duckdb || true)}"
 RUNS="${TPCH_RUNS:-5}"
 WARMUP="${TPCH_WARMUP:-1}"
 QUERIES="${TPCH_QUERIES:-all}"
+ULTRASQL_PROGRESS="${ULTRASQL_TPCH_PROGRESS:-1}"
+ULTRASQL_SPILL_BACKING="${ULTRASQL_PAGE_SPILL_BACKING:-memory}"
 AUTO_RETRY_POOL="${TPCH_AUTO_RETRY_POOL:-1}"
 POOL_RETRIES="${TPCH_POOL_RETRIES:-4}"
 PAGE_BYTES=8192
@@ -51,6 +53,13 @@ HOST_RAM_BYTES="${TPCH_HOST_RAM_BYTES:-$(host_ram_bytes)}"
 MAX_POOL_BYTES=0
 if [[ "$HOST_RAM_BYTES" =~ ^[0-9]+$ && "$HOST_RAM_BYTES" -gt 0 ]]; then
     MAX_POOL_BYTES=$((HOST_RAM_BYTES * POOL_BUDGET_PERCENT / 100))
+fi
+DEFAULT_POOL_FRAMES=262144
+if [[ "$ULTRASQL_SPILL_BACKING" != "memory" && "$HOST_RAM_BYTES" =~ ^[0-9]+$ && "$HOST_RAM_BYTES" -gt 0 ]]; then
+    DEFAULT_POOL_FRAMES=$((HOST_RAM_BYTES / 2 / PAGE_BYTES))
+    if [[ "$DEFAULT_POOL_FRAMES" -lt 262144 ]]; then
+        DEFAULT_POOL_FRAMES=262144
+    fi
 fi
 
 write_ultrasql_failure_summary() {
@@ -104,9 +113,9 @@ doc = {
     "ultrasql_result_exists": pathlib.Path(ultra_out).exists(),
     "ultrasql_log_tail": tail,
     "next_step": (
-        "Run on a certification host with enough RAM for the memory-backed "
-        "benchmark server, or add a disk-backed UltraSQL benchmark server path "
-        "before claiming SF10 certification."
+            "Inspect ultrasql_log_tail and rerun with ULTRASQL_TPCH_PROGRESS=1; "
+            "benchmark certification remains open until UltraSQL completes all "
+            "22 queries and the geometric mean is <= 2x DuckDB."
     ),
 }
 pathlib.Path(summary_path).write_text(json.dumps(doc, indent=2) + "\n")
@@ -129,7 +138,7 @@ target/release/tpch run-queries duckdb \
 
 echo "Running UltraSQL TPC-H SF10: queries=$QUERIES runs=$RUNS warmup=$WARMUP"
 run_ultrasql() {
-    local pool_frames="${ULTRASQL_TPCH_POOL_FRAMES:-262144}"
+    local pool_frames="${ULTRASQL_TPCH_POOL_FRAMES:-$DEFAULT_POOL_FRAMES}"
     local attempt=0
     local log
 
@@ -149,16 +158,17 @@ run_ultrasql() {
         fi
 
         log="$(mktemp)"
+        echo "UltraSQL SF10 attempt: pool_frames=$pool_frames progress=$ULTRASQL_PROGRESS spill_backing=$ULTRASQL_SPILL_BACKING" >&2
         if ULTRASQL_TPCH_POOL_FRAMES="$pool_frames" \
+            ULTRASQL_TPCH_PROGRESS="$ULTRASQL_PROGRESS" \
+            ULTRASQL_PAGE_SPILL_BACKING="$ULTRASQL_SPILL_BACKING" \
             target/release/tpch run-queries ultrasql \
                 --data-dir "$TPCH_DATA_DIR" \
                 --runs "$RUNS" \
                 --warmup "$WARMUP" \
                 --queries "$QUERIES" \
                 --scale 10 \
-                --out "$ULTRA_OUT" \
-                >"$log" 2>&1; then
-            cat "$log"
+                --out "$ULTRA_OUT" 2>&1 | tee "$log"; then
             rm -f "$log"
             return 0
         fi
@@ -168,7 +178,6 @@ run_ultrasql() {
             attempt=$((attempt + 1))
             pool_frames=$((pool_frames * 2))
             echo "UltraSQL SF10 load hit buffer pool exhaustion. Retrying with ULTRASQL_TPCH_POOL_FRAMES=$pool_frames (attempt $attempt/$POOL_RETRIES)." >&2
-            cat "$log" >&2
             rm -f "$log"
             continue
         fi
@@ -178,7 +187,6 @@ run_ultrasql() {
         else
             write_ultrasql_failure_summary "ultrasql_run_failed" "$pool_frames" "$log"
         fi
-        cat "$log" >&2
         rm -f "$log"
         return 1
     done

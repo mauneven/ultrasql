@@ -607,7 +607,16 @@ where
                 }
                 self.codec
                     .decode_into_builders(payload, &mut self.builders[tid_offset..])
-                    .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                    .map_err(|e| {
+                        ExecError::TypeMismatch(format!(
+                            "row decode failed: relation={:?}, schema={:?}, payload_len={}, payload_prefix={}, error={}",
+                            self.relation,
+                            self.codec.schema(),
+                            payload.len(),
+                            payload_prefix(payload),
+                            e
+                        ))
+                    })?;
                 // Mirror the decoded row into the cache-build
                 // accumulator when populating the column cache.
                 // Skipped on the TID-prefixed scan (cache_build is
@@ -615,7 +624,16 @@ where
                 if let Some(build) = self.cache_build.as_mut() {
                     self.codec
                         .decode_into_builders(payload, &mut build.builders)
-                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                        .map_err(|e| {
+                            ExecError::TypeMismatch(format!(
+                                "row cache decode failed: relation={:?}, schema={:?}, payload_len={}, payload_prefix={}, error={}",
+                                self.relation,
+                                self.codec.schema(),
+                                payload.len(),
+                                payload_prefix(payload),
+                                e
+                            ))
+                        })?;
                 }
                 rows_buffered += 1;
             }
@@ -739,6 +757,15 @@ where
         );
         self.heap.column_cache.put(self.relation, entry);
     }
+}
+
+fn payload_prefix(payload: &[u8]) -> String {
+    let mut out = String::with_capacity(payload.len().min(32) * 2);
+    for byte in payload.iter().take(32) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
 }
 
 /// Slice rows `[start, end)` out of `col` into an owned [`Column`].

@@ -1,18 +1,10 @@
 {
   "workload": "tpch_sf10",
   "scale_factor": 10,
-  "target": "UltraSQL geometric mean <= 2x DuckDB geometric mean across all 22 queries",
+  "duckdb_geomean_ms": 71.02870799999998,
+  "ultrasql_geomean_ms": null,
+  "target": "UltraSQL geometric mean <= 2x DuckDB geometric mean",
   "passed": false,
-  "reason": "ultrasql_run_failed",
-  "data_dir": "target/tpch-scale10-real",
-  "ultrasql_pool_frames": 262144,
-  "ultrasql_pool_bytes": 2147483648,
-  "host_ram_bytes": 17179869184,
-  "pool_budget_percent": 75,
   "duckdb_result": "benchmarks/results/latest/raw/tpch_sf10-duckdb.json",
-  "duckdb_result_exists": true,
-  "ultrasql_result": "benchmarks/results/latest/raw/tpch_sf10-ultrasql.json",
-  "ultrasql_result_exists": false,
-  "ultrasql_log_tail": "error: load TPC-H data into UltraSQL: finish COPY into region: db error: ERROR: DDL failed: flush dirty heap pages: invalid argument: block Block(0) out of bounds for relation RelationId(1259) (relation has 0 blocks)",
-  "next_step": "Run on a certification host with enough RAM for the memory-backed benchmark server, or add a disk-backed UltraSQL benchmark server path before claiming SF10 certification."
+  "ultrasql_result": "benchmarks/results/latest/raw/tpch_sf10-ultrasql.json"
 }

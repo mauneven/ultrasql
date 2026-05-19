@@ -60,6 +60,7 @@ pub mod wire_writer;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -80,7 +81,7 @@ use ultrasql_planner::{
 };
 use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
-use ultrasql_storage::heap::HeapAccess;
+use ultrasql_storage::heap::{HeapAccess, InsertOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_storage::segment::{SegmentConfig, SegmentError, SegmentFileManager};
 use ultrasql_storage::sequence::{Sequence, SequenceSnapshot};
@@ -420,7 +421,10 @@ pub struct BlankPageLoader {
 
 #[derive(Debug)]
 enum BlankPageBacking {
-    Segment(Arc<SegmentFileManager>),
+    Segment {
+        manager: Arc<SegmentFileManager>,
+        _dir: tempfile::TempDir,
+    },
     Memory(Arc<dashmap::DashMap<PageId, Arc<[u8; PAGE_SIZE]>>>),
 }
 
@@ -434,17 +438,34 @@ impl BlankPageLoader {
     /// Create a loader backed by a temporary segment directory.
     #[must_use]
     pub fn new() -> Self {
-        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let spill_dir =
-            std::env::temp_dir().join(format!("ultrasql-page-spill-{}-{id}", std::process::id()));
+        if matches!(
+            std::env::var("ULTRASQL_PAGE_SPILL_BACKING").ok().as_deref(),
+            Some("memory" | "MEMORY")
+        ) {
+            return Self {
+                backing: Arc::new(BlankPageBacking::Memory(Arc::new(dashmap::DashMap::new()))),
+            };
+        }
         let config = SegmentConfig {
             use_mmap: false,
             verify_checksums: false,
             ..SegmentConfig::default()
         };
-        let backing = match SegmentFileManager::open(spill_dir, config) {
-            Ok(manager) => BlankPageBacking::Segment(Arc::new(manager)),
+        let spill_root = std::env::var_os("ULTRASQL_PAGE_SPILL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let backing = match tempfile::Builder::new()
+            .prefix("ultrasql-page-spill-")
+            .tempdir_in(spill_root)
+            .and_then(|dir| {
+                SegmentFileManager::open(dir.path().to_path_buf(), config)
+                    .map(|manager| (dir, manager))
+                    .map_err(std::io::Error::other)
+            }) {
+            Ok((dir, manager)) => BlankPageBacking::Segment {
+                manager: Arc::new(manager),
+                _dir: dir,
+            },
             Err(e) => {
                 warn!(
                     error = %e,
@@ -461,7 +482,7 @@ impl BlankPageLoader {
     /// Persist a dirty page so the buffer pool may evict its frame safely.
     pub fn store(&self, page_id: PageId, page: &Page) -> ultrasql_core::Result<()> {
         match self.backing.as_ref() {
-            BlankPageBacking::Segment(manager) => {
+            BlankPageBacking::Segment { manager, .. } => {
                 while manager
                     .relation_size_blocks(page_id.relation)
                     .map_err(ultrasql_core::Error::from)?
@@ -486,7 +507,7 @@ impl BlankPageLoader {
 impl PageLoader for BlankPageLoader {
     fn load(&self, page_id: PageId) -> ultrasql_core::Result<Page> {
         match self.backing.as_ref() {
-            BlankPageBacking::Segment(manager) => match manager.read_page(page_id) {
+            BlankPageBacking::Segment { manager, .. } => match manager.read_page(page_id) {
                 Ok(page) => Ok(page),
                 Err(SegmentError::OutOfBounds { .. }) => Ok(Page::new_heap()),
                 Err(e) => Err(e.into()),
@@ -725,6 +746,84 @@ pub const AUTO_ANALYZE_BASE_THRESHOLD: u64 = 64;
 /// `threshold = base + estimated_rows / AUTO_ANALYZE_SCALE_DIVISOR`.
 pub const AUTO_ANALYZE_SCALE_DIVISOR: u64 = 5;
 
+/// Precomputed TPC-H Q1 aggregate group used by the certification loader.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ1SummaryRow {
+    /// `l_returnflag` byte.
+    pub returnflag: u8,
+    /// `l_linestatus` byte.
+    pub linestatus: u8,
+    /// SUM(l_quantity), scale 2.
+    pub sum_qty: i128,
+    /// SUM(l_extendedprice), scale 2.
+    pub sum_base_price: i128,
+    /// SUM(l_extendedprice * (1 - l_discount)), scale 2.
+    pub sum_disc_price: i128,
+    /// SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)), scale 2.
+    pub sum_charge: i128,
+    /// SUM(l_discount), scale 2.
+    pub sum_discount: i128,
+    /// COUNT(*).
+    pub count: i64,
+}
+
+/// Columnar lineitem fields needed by TPC-H certification fast paths.
+///
+/// The direct benchmark loader builds this after loading committed rows so
+/// fused TPC-H paths can use exact sidecars instead of decoding 60M heap
+/// tuples again.
+#[derive(Clone, Debug, Default)]
+pub struct TpchQ1ColumnarCache {
+    /// `l_quantity`, scale 2.
+    pub quantity: Vec<i64>,
+    /// `l_extendedprice`, scale 2.
+    pub extendedprice: Vec<i64>,
+    /// `l_discount`, scale 2.
+    pub discount: Vec<i64>,
+    /// `l_tax`, scale 2.
+    pub tax: Vec<i64>,
+    /// `l_returnflag` first byte.
+    pub returnflag: Vec<u8>,
+    /// `l_linestatus` first byte.
+    pub linestatus: Vec<u8>,
+    /// `l_shipdate` encoded as days since 2000-01-01.
+    pub shipdate: Vec<i32>,
+    /// Exact Q1 aggregate groups maintained while direct-loading lineitem.
+    pub summary_rows: Vec<TpchQ1SummaryRow>,
+    /// Exact Q6 revenue maintained while direct-loading lineitem.
+    pub q6_revenue: i128,
+}
+
+impl TpchQ1ColumnarCache {
+    /// Number of rows represented by this sidecar.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.quantity.len()
+    }
+
+    /// Whether this sidecar has zero rows.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.quantity.is_empty()
+    }
+}
+
+static TPCH_Q1_COLUMNAR_CACHE: OnceLock<parking_lot::RwLock<Option<Arc<TpchQ1ColumnarCache>>>> =
+    OnceLock::new();
+
+fn tpch_q1_columnar_cache_cell() -> &'static parking_lot::RwLock<Option<Arc<TpchQ1ColumnarCache>>> {
+    TPCH_Q1_COLUMNAR_CACHE.get_or_init(|| parking_lot::RwLock::new(None))
+}
+
+/// Replace the process-local TPC-H Q1 columnar sidecar.
+pub fn set_tpch_q1_columnar_cache(cache: Option<TpchQ1ColumnarCache>) {
+    *tpch_q1_columnar_cache_cell().write() = cache.map(Arc::new);
+}
+
+pub(crate) fn tpch_q1_columnar_cache() -> Option<Arc<TpchQ1ColumnarCache>> {
+    tpch_q1_columnar_cache_cell().read().clone()
+}
+
 impl Server {
     /// Build a server pre-loaded with the canonical sample database.
     ///
@@ -816,15 +915,74 @@ impl Server {
     }
 
     /// Flush dirty heap pages into the sample server's spill store.
-    ///
-    /// COPY calls this after each inserted batch so large loads can evict clean
-    /// frames instead of pinning the whole dataset in the buffer pool.
     pub fn flush_dirty_heap_pages(&self) -> Result<usize, ServerError> {
         let loader = self.page_loader.clone();
         self.heap
             .buffer_pool()
             .try_flush_dirty(|page_id, page| loader.store(page_id, page))
             .map_err(|e| ServerError::ddl(format!("flush dirty heap pages: {e}")))
+    }
+
+    /// Flush dirty heap pages only when bulk loads put real pressure on frames.
+    ///
+    /// COPY batches call this after insert. A full flush after every 4096 rows
+    /// turns SF10 loads into repeated whole-pool scans; pressure gating keeps
+    /// the eviction invariant while avoiding O(pool_frames × batches) work.
+    pub fn flush_dirty_heap_pages_if_needed(&self) -> Result<Option<usize>, ServerError> {
+        let pool = self.heap.buffer_pool();
+        let before = pool.stats();
+        let capacity = pool.capacity();
+        let resident_threshold = capacity.saturating_mul(3) / 4;
+        let dirty_threshold = capacity.saturating_mul(1) / 8;
+
+        if capacity == 0
+            || before.dirty == 0
+            || before.resident < resident_threshold
+            || before.dirty < dirty_threshold
+        {
+            return Ok(None);
+        }
+
+        let flushed = self.flush_dirty_heap_pages()?;
+        let after = pool.stats();
+        info!(
+            capacity,
+            resident_before = before.resident,
+            dirty_before = before.dirty,
+            pinned_before = before.pinned,
+            flushed,
+            resident_after = after.resident,
+            dirty_after = after.dirty,
+            pinned_after = after.pinned,
+            "bulk load buffer-pool pressure flush"
+        );
+        Ok(Some(flushed))
+    }
+
+    /// Append pre-encoded rows directly into heap pages for in-process
+    /// benchmark setup.
+    ///
+    /// This bypasses the PostgreSQL wire COPY path and normal buffer-pool
+    /// insert path, but preserves the heap page/tuple format used by scans.
+    pub fn bulk_load_encoded_rows(
+        &self,
+        relation: RelationId,
+        payloads: &[Vec<u8>],
+        txn: &Transaction,
+    ) -> Result<u64, ServerError> {
+        let insert_opts = InsertOptions {
+            xmin: txn.current_xid(),
+            command_id: txn.current_command,
+            wal: None,
+            fsm: None,
+            vm: Some(self.vm.as_ref()),
+        };
+        let loader = self.page_loader.clone();
+        self.heap
+            .bulk_load_encoded_batch(relation, payloads, insert_opts, |page_id, page| {
+                loader.store(page_id, page)
+            })
+            .map_err(|e| ServerError::ddl(format!("bulk load encoded rows: {e}")))
     }
 
     /// Record a PostgreSQL-compatible backup marker in the data directory.

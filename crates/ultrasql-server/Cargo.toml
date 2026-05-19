@@ -48,13 +48,13 @@ rustls             = { workspace = true }
 tokio-rustls       = { workspace = true }
 parking_lot        = { workspace = true }
 dashmap            = { workspace = true }
+tempfile           = { workspace = true }
 # MD5 legacy auth
 md5                = { workspace = true }
 hex                = { workspace = true }
 
 [dev-dependencies]
 rcgen              = { workspace = true }
-tempfile           = { workspace = true }
 # Integration tests drive a real PostgreSQL client against an
 # in-process `ultrasqld` — Extended Query (prepare/bind/execute) and
 # ORDER BY end-to-end (`SimpleQueryMessage` rows).

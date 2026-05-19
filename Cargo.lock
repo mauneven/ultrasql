@@ -2780,6 +2780,7 @@ dependencies = [
  "tokio-postgres",
  "tracing",
  "tracing-subscriber",
+ "ultrasql-catalog",
  "ultrasql-core",
  "ultrasql-executor",
  "ultrasql-mvcc",
@@ -2787,6 +2788,7 @@ dependencies = [
  "ultrasql-protocol",
  "ultrasql-server",
  "ultrasql-storage",
+ "ultrasql-txn",
  "ultrasql-vec",
  "ultrasql-wal",
 ]

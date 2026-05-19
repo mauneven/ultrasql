@@ -199,7 +199,7 @@ pub fn run_ultrasql(
 ) -> Result<RunResult> {
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use anyhow::Context;
     use tokio_postgres::NoTls;
@@ -214,14 +214,15 @@ pub fn run_ultrasql(
         .build()
         .context("build tokio runtime")?;
 
-    let (timings, errors) = runtime.block_on(async move {
+    let run_result = runtime.block_on(async move {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().context("parse 127.0.0.1:0")?;
         let (listener, bound) = bind_listener(bind_addr).await.context("bind ultrasqld")?;
         let state = Arc::new(Server::with_sample_database_pool_frames(
             load::ultrasql_tpch_pool_frames(),
         ));
+        let server_state = Arc::clone(&state);
         let server_task = tokio::spawn(async move {
-            if let Err(e) = serve_listener(listener, state).await {
+            if let Err(e) = serve_listener(listener, server_state).await {
                 eprintln!("ultrasqld task exited: {e}");
             }
         });
@@ -250,9 +251,15 @@ pub fn run_ultrasql(
             }
         }
         if schema_errors.is_empty() {
-            load::load_ultrasql_into_client(&client, data_dir)
-                .await
-                .context("load TPC-H data into UltraSQL")?;
+            if load::ultrasql_direct_load_enabled() {
+                load::load_ultrasql_direct_into_server(state.as_ref(), &client, data_dir)
+                    .await
+                    .context("direct-load TPC-H data into UltraSQL")?;
+            } else {
+                load::load_ultrasql_into_client(&client, data_dir)
+                    .await
+                    .context("load TPC-H data into UltraSQL")?;
+            }
             if progress_enabled() {
                 eprintln!("ultrasql tpch: load complete");
             }
@@ -317,7 +324,9 @@ pub fn run_ultrasql(
         server_task.abort();
 
         Ok::<_, anyhow::Error>((timings, schema_errors))
-    })?;
+    });
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    let (timings, errors) = run_result?;
 
     if !errors.is_empty() {
         eprintln!(
@@ -363,6 +372,7 @@ pub fn run_ultrasql_result_outcomes(
 ) -> Result<Vec<QueryRowsOutcome>> {
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use anyhow::Context;
     use tokio_postgres::{NoTls, SimpleQueryMessage};
@@ -396,7 +406,7 @@ pub fn run_ultrasql_result_outcomes(
         .build()
         .context("build tokio runtime")?;
 
-    runtime.block_on(async move {
+    let run_result = runtime.block_on(async move {
         let bind_addr: SocketAddr = "127.0.0.1:0".parse().context("parse 127.0.0.1:0")?;
         let (listener, bound) = bind_listener(bind_addr).await.context("bind ultrasqld")?;
         let state = Arc::new(Server::with_sample_database_pool_frames(
@@ -488,7 +498,9 @@ pub fn run_ultrasql_result_outcomes(
         conn_handle.abort();
         server_task.abort();
         Ok(results)
-    })
+    });
+    runtime.shutdown_timeout(Duration::from_secs(2));
+    run_result
 }
 
 /// Stub: returns an error when the `sql-bench` feature is not active.

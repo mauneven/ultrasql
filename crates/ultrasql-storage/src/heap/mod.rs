@@ -71,6 +71,10 @@ pub enum HeapError {
     #[error("page: {0}")]
     Page(#[from] PageError),
 
+    /// Direct page writer failed during bulk load.
+    #[error("page writer: {0}")]
+    PageWriter(#[from] ultrasql_core::Error),
+
     /// The decoded slot is too short to hold a full [`TupleHeader`], or
     /// the header bytes failed to parse.
     #[error("malformed tuple header: {0}")]

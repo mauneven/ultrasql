@@ -22,7 +22,14 @@ pg-runner = ["dep:tokio-postgres", "dep:chrono", "dep:bytes", "dep:futures"]
 # via `tokio-postgres` so UltraSQL is measured through the same SQL
 # pipeline that production clients use. Off by default because it
 # pulls the full server stack into the bench crate's dependency graph.
-sql-bench = ["pg-runner", "dep:bytes", "dep:futures", "dep:ultrasql-server"]
+sql-bench = [
+    "pg-runner",
+    "dep:bytes",
+    "dep:futures",
+    "dep:ultrasql-catalog",
+    "dep:ultrasql-server",
+    "dep:ultrasql-txn",
+]
 
 [lints]
 workspace = true
@@ -84,6 +91,8 @@ ultrasql-protocol = { workspace = true }
 ultrasql-vec      = { workspace = true }
 ultrasql-storage  = { workspace = true }
 ultrasql-wal      = { workspace = true }
+ultrasql-catalog  = { workspace = true, optional = true }
+ultrasql-txn      = { workspace = true, optional = true }
 anyhow            = { workspace = true }
 bytes             = { workspace = true, optional = true }
 clap              = { workspace = true }

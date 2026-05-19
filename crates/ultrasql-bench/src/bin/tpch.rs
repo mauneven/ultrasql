@@ -203,6 +203,7 @@ impl EngineArg {
 // ---------------------------------------------------------------------------
 
 fn main() -> std::process::ExitCode {
+    init_progress_tracing();
     match run() {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -210,6 +211,23 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+fn init_progress_tracing() {
+    let progress = matches!(
+        std::env::var("ULTRASQL_TPCH_PROGRESS").ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    );
+    if !progress {
+        return;
+    }
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("ultrasql_server=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 fn run() -> Result<()> {
