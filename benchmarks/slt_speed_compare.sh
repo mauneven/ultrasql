@@ -9,6 +9,7 @@ RUNS="${SLT_BENCH_RUNS:-25}"
 PATHS="${SLT_BENCH_PATHS:-tests/slt/portable}"
 ENGINES="${SLT_BENCH_ENGINES:-sqlite duckdb}"
 PROFILE="${SLT_BENCH_PROFILE:-release}"
+CASE_LIMIT="${SLT_BENCH_CASE_LIMIT:-50}"
 
 args=(run)
 case "$PROFILE" in
@@ -32,6 +33,10 @@ args+=(
   --benchmark-output
   "$OUT"
 )
+
+if [[ "$CASE_LIMIT" != "all" && -n "$CASE_LIMIT" ]]; then
+  args+=(--case-limit "$CASE_LIMIT")
+fi
 
 for engine in $ENGINES; do
   case "$engine" in

@@ -54,6 +54,10 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     benchmark_runs: u32,
 
+    /// Optional total case limit for smoke runs over large imported suites.
+    #[arg(long)]
+    case_limit: Option<usize>,
+
     /// Skip-filter file. Lines are `pattern<TAB>reason`; `#` starts comments.
     #[arg(
         long = "skip-filter",
@@ -120,8 +124,14 @@ enum TestKind {
         type_string: String,
         sort_mode: SortMode,
         sql: String,
-        expected: Vec<String>,
+        expected: QueryExpectation,
     },
+}
+
+#[derive(Clone, Debug)]
+enum QueryExpectation {
+    Values(Vec<String>),
+    Hash { value_count: usize, digest: String },
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +242,9 @@ async fn main() -> Result<()> {
         let cases = parse_script(file, &text)?;
         cases_by_file.push((file.clone(), cases));
     }
+    if let Some(case_limit) = cli.case_limit {
+        apply_case_limit(&mut cases_by_file, case_limit);
+    }
 
     let (client, _in_process_server) = connect_ultrasql_target(&cli).await?;
 
@@ -291,6 +304,19 @@ async fn main() -> Result<()> {
         println!("slt benchmark artifact: {}", output_path.display());
     }
     Ok(())
+}
+
+fn apply_case_limit(cases_by_file: &mut Vec<(PathBuf, Vec<TestCase>)>, limit: usize) {
+    let mut remaining = limit;
+    for (_, cases) in cases_by_file.iter_mut() {
+        if cases.len() > remaining {
+            cases.truncate(remaining);
+            remaining = 0;
+        } else {
+            remaining = remaining.saturating_sub(cases.len());
+        }
+    }
+    cases_by_file.retain(|(_, cases)| !cases.is_empty());
 }
 
 #[derive(Debug)]
@@ -1030,18 +1056,15 @@ async fn run_query_case(
     type_string: &str,
     sort_mode: SortMode,
     sql: &str,
-    expected: &[String],
+    expected: &QueryExpectation,
 ) -> CaseOutcome {
     let actual = match execute_query(client, type_string, sort_mode, sql).await {
         Ok(values) => values,
         Err(err) => return CaseOutcome::Failed(format!("query failed: {err}")),
     };
-    if actual != expected {
-        return CaseOutcome::Failed(format!(
-            "expected values:\n{}\nactual values:\n{}",
-            expected.join("\n"),
-            actual.join("\n")
-        ));
+
+    if let Err(message) = compare_query_expectation(&actual, expected) {
+        return CaseOutcome::Failed(format!("{message}\nactual values:\n{}", actual.join("\n")));
     }
 
     for reference_client in references {
@@ -1062,6 +1085,41 @@ async fn run_query_case(
     }
 
     CaseOutcome::Passed
+}
+
+fn compare_query_expectation(actual: &[String], expected: &QueryExpectation) -> Result<()> {
+    match expected {
+        QueryExpectation::Values(expected_values) => {
+            if actual == expected_values {
+                Ok(())
+            } else {
+                bail!("expected values:\n{}", expected_values.join("\n"));
+            }
+        }
+        QueryExpectation::Hash {
+            value_count,
+            digest,
+        } => {
+            if actual.len() != *value_count {
+                bail!(
+                    "expected {value_count} hashed value(s), got {}",
+                    actual.len()
+                );
+            }
+            let actual_digest = hash_query_values(actual);
+            if actual_digest == *digest {
+                Ok(())
+            } else {
+                bail!("expected hash {digest}, got {actual_digest}");
+            }
+        }
+    }
+}
+
+fn hash_query_values(values: &[String]) -> String {
+    let mut repr = values.join("\n");
+    repr.push('\n');
+    format!("{:x}", md5::compute(repr.as_bytes()))
 }
 
 async fn execute_query(
@@ -1206,6 +1264,9 @@ fn parse_script(path: &Path, text: &str) -> Result<Vec<TestCase>> {
         if line.starts_with('#') {
             continue;
         }
+        if line.starts_with("hash-threshold") {
+            continue;
+        }
 
         if let Some(rest) = line.strip_prefix("statement") {
             let expectation = parse_statement_expectation(path, line_no, rest)?;
@@ -1322,18 +1383,48 @@ fn collect_until_blank(lines: &[&str], mut idx: usize) -> (String, usize) {
     (sql.join("\n"), idx)
 }
 
-fn collect_query(lines: &[&str], mut idx: usize) -> Result<(String, Vec<String>, usize)> {
+fn collect_query(lines: &[&str], mut idx: usize) -> Result<(String, QueryExpectation, usize)> {
     let mut sql = Vec::new();
     while idx < lines.len() {
         let line = lines[idx];
         idx = idx.saturating_add(1);
         if line.trim() == "----" {
             let (expected, next_idx) = collect_expected(lines, idx);
-            return Ok((sql.join("\n"), expected, next_idx));
+            return Ok((
+                sql.join("\n"),
+                parse_query_expectation(&expected)?,
+                next_idx,
+            ));
         }
         sql.push(line);
     }
     bail!("query missing ---- separator")
+}
+
+fn parse_query_expectation(lines: &[String]) -> Result<QueryExpectation> {
+    if lines.len() == 1 {
+        let line = lines[0].trim();
+        if let Some((count, digest)) = parse_hash_expectation(line)? {
+            return Ok(QueryExpectation::Hash {
+                value_count: count,
+                digest,
+            });
+        }
+    }
+    Ok(QueryExpectation::Values(lines.to_vec()))
+}
+
+fn parse_hash_expectation(line: &str) -> Result<Option<(usize, String)>> {
+    let Some((count, digest)) = line.split_once(" values hashing to ") else {
+        return Ok(None);
+    };
+    let value_count = count
+        .parse::<usize>()
+        .with_context(|| format!("invalid hashed value count `{count}`"))?;
+    if digest.len() != 32 || !digest.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        bail!("invalid SQLLogicTest MD5 digest `{digest}`");
+    }
+    Ok(Some((value_count, digest.to_ascii_lowercase())))
 }
 
 fn collect_expected(lines: &[&str], mut idx: usize) -> (Vec<String>, usize) {

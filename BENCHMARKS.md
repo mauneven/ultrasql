@@ -147,8 +147,10 @@ SLT_BENCH_RUNS=25 benchmarks/slt_speed_compare.sh
 The script validates the portable SQLLogicTest corpus, then replays executable
 records against UltraSQL and installed reference engines (`sqlite3`, `duckdb`,
 and optionally PostgreSQL via `POSTGRES_URL`). It uses Cargo's release profile
-by default; set `SLT_BENCH_PROFILE=dev` only for quick local iteration. It
-writes:
+by default; set `SLT_BENCH_PROFILE=dev` only for quick local iteration.
+`SLT_BENCH_CASE_LIMIT` defaults to `50` so imported public suites stay usable
+as PR smoke. Set `SLT_BENCH_CASE_LIMIT=all` only for manual/nightly full-suite
+replay. It writes:
 
 ```text
 benchmarks/results/latest/slt_speed_comparison.json

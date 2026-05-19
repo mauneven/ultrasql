@@ -130,6 +130,67 @@ fn in_process_mode_writes_benchmark_artifact() {
     let _ = fs::remove_file(markdown_path);
 }
 
+#[test]
+fn in_process_mode_accepts_hash_threshold_and_hashed_results() {
+    let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
+    let suite = temp_artifact_path("ultrasql-slt-hash", "test");
+    fs::write(
+        &suite,
+        "hash-threshold 1\n\nquery I nosort\nSELECT 1\n----\n1 values hashing to b026324c6904b2a9cb4b88d6d61c81d1\n",
+    )
+    .expect("write temporary hash SLT");
+
+    let output = Command::new(bin)
+        .arg("--mode")
+        .arg("in-process")
+        .arg(&suite)
+        .output()
+        .expect("run SQLLogicTest runner");
+
+    assert!(
+        output.status.success(),
+        "runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("passed=1"), "stdout:\n{stdout}");
+    assert!(stdout.contains("failed=0"), "stdout:\n{stdout}");
+    let _ = fs::remove_file(suite);
+}
+
+#[test]
+fn in_process_mode_case_limit_bounds_suite_execution() {
+    let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
+    let suite = temp_artifact_path("ultrasql-slt-limit", "test");
+    fs::write(
+        &suite,
+        "query I nosort\nSELECT 1\n----\n1\n\nquery I nosort\nSELECT 2\n----\n999\n",
+    )
+    .expect("write temporary limited SLT");
+
+    let output = Command::new(bin)
+        .arg("--mode")
+        .arg("in-process")
+        .arg("--case-limit")
+        .arg("1")
+        .arg(&suite)
+        .output()
+        .expect("run SQLLogicTest runner");
+
+    assert!(
+        output.status.success(),
+        "runner failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cases=1"), "stdout:\n{stdout}");
+    assert!(stdout.contains("passed=1"), "stdout:\n{stdout}");
+    assert!(stdout.contains("failed=0"), "stdout:\n{stdout}");
+    let _ = fs::remove_file(suite);
+}
+
 fn run_reference_engine_smoke(engine: &str) {
     let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
     let suite = Path::new(env!("CARGO_MANIFEST_DIR"))

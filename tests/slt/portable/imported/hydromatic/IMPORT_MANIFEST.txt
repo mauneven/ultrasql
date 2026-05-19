@@ -1,0 +1,6 @@
+source=target/external-suites/hydromatic
+commit=0a809c530457bf0e56d637ef19fcaabd2964fd67
+license=LICENSE
+notice=NOTICE
+file=src/main/resources/test/index/between/1/slt_good_0.test
+file=src/main/resources/test/index/in/10/slt_good_0.test

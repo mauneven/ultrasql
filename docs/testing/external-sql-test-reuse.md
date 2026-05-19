@@ -10,6 +10,9 @@ fuzzing, WAL decoder fuzzing, or planner fuzzing.
 
 Use these sources conservatively:
 
+- Hydromatic SQL Logic Test: MIT-licensed public SQLLogicTest corpus with 7M+
+  core SQL tests. Preferred large open suite for portable correctness and
+  replay timing.
 - SQLLogicTest-style corpora: preferred for portable SQL behavior when license
   and provenance are recorded.
 - PostgreSQL regression-derived cases: useful for PostgreSQL compatibility.
@@ -132,6 +135,20 @@ cargo run -p ultrasql-sqllogictest-runner -- \
   tests/slt/portable
 ```
 
+The first committed imported shard is from Hydromatic SQL Logic Test at commit
+`0a809c530457bf0e56d637ef19fcaabd2964fd67`. License and notice files are copied
+beside the imported shard under `tests/slt/portable/imported/hydromatic/`.
+Smoke command:
+
+```sh
+cargo run -p ultrasql-sqllogictest-runner -- \
+  --mode in-process \
+  --case-limit 50 \
+  --reference-engine sqlite \
+  --reference-engine duckdb \
+  tests/slt/portable/imported/hydromatic
+```
+
 ## SQLLogicTest speed comparison
 
 SQLLogicTest is a correctness suite, not a database performance benchmark. Its
@@ -148,6 +165,9 @@ SLT_BENCH_RUNS=25 benchmarks/slt_speed_compare.sh
 The script starts UltraSQL in-process, runs the portable SLT corpus for
 correctness, then replays executable SQL records for timing. It uses Cargo's
 release profile by default; set `SLT_BENCH_PROFILE=dev` only for iteration.
+It uses `SLT_BENCH_CASE_LIMIT=50` by default so imported public suites do not
+turn PR smoke into a long-running nightly job. Set `SLT_BENCH_CASE_LIMIT=all`
+for a full replay.
 SQLite and DuckDB are included when `sqlite3` or `duckdb` are installed.
 PostgreSQL can be added with:
 

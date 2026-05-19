@@ -2981,6 +2981,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
+ "md5",
  "tokio",
  "tokio-postgres",
  "ultrasql-server",

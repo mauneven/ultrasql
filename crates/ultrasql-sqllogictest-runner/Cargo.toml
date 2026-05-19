@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
+md5 = { workspace = true }
 ultrasql-server = { workspace = true }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
