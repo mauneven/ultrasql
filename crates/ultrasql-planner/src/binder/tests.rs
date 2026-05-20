@@ -559,6 +559,9 @@ fn binds_vector_scalar_functions_with_pgvector_return_types() {
         "SELECT l2_distance(embedding, VECTOR '[1,2,4]'), \
                 cosine_distance(embedding, VECTOR '[3,-6,3]'), \
                 dot_product(embedding, VECTOR '[4,5,6]'), \
+                inner_product(embedding, VECTOR '[4,5,6]'), \
+                l1_distance(embedding, VECTOR '[3,2,-1]'), \
+                vector_norm(embedding), \
                 vector_dims(embedding) \
          FROM embeddings",
         &cat,
@@ -570,11 +573,56 @@ fn binds_vector_scalar_functions_with_pgvector_return_types() {
     assert_eq!(exprs[0].0.data_type(), DataType::Float64);
     assert_eq!(exprs[1].0.data_type(), DataType::Float64);
     assert_eq!(exprs[2].0.data_type(), DataType::Float64);
-    assert_eq!(exprs[3].0.data_type(), DataType::Int32);
+    assert_eq!(exprs[3].0.data_type(), DataType::Float64);
+    assert_eq!(exprs[4].0.data_type(), DataType::Float64);
+    assert_eq!(exprs[5].0.data_type(), DataType::Float64);
+    assert_eq!(exprs[6].0.data_type(), DataType::Int32);
     assert_eq!(schema.field_at(0).data_type, DataType::Float64);
     assert_eq!(schema.field_at(1).data_type, DataType::Float64);
     assert_eq!(schema.field_at(2).data_type, DataType::Float64);
-    assert_eq!(schema.field_at(3).data_type, DataType::Int32);
+    assert_eq!(schema.field_at(3).data_type, DataType::Float64);
+    assert_eq!(schema.field_at(4).data_type, DataType::Float64);
+    assert_eq!(schema.field_at(5).data_type, DataType::Float64);
+    assert_eq!(schema.field_at(6).data_type, DataType::Int32);
+}
+
+#[test]
+fn binds_halfvec_and_sparsevec_pgvector_metric_functions() {
+    let cat = InMemoryCatalog::new();
+    for sql in [
+        "SELECT l2_distance(HALFVEC(3) '[1,2,3]', HALFVEC(3) '[1,2,4]')",
+        "SELECT cosine_distance(SPARSEVEC(5) '{1:1,3:2}/5', SPARSEVEC(5) '{1:2,4:3}/5')",
+        "SELECT inner_product(HALFVEC(3) '[1,2,3]', HALFVEC(3) '[4,5,6]')",
+        "SELECT l1_distance(SPARSEVEC(5) '{1:1}/5', SPARSEVEC(5) '{5:2}/5')",
+        "SELECT vector_norm(HALFVEC(2) '[3,4]')",
+        "SELECT l2_norm(SPARSEVEC(4) '{1:3,4:4}/4')",
+    ] {
+        let plan = parse_and_bind(sql, &cat).expect(sql);
+        let LogicalPlan::Project { exprs, schema, .. } = &plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(exprs[0].0.data_type(), DataType::Float64, "{sql}");
+        assert_eq!(schema.field_at(0).data_type, DataType::Float64, "{sql}");
+    }
+}
+
+#[test]
+fn rejects_bitvec_float_metric_operators() {
+    let cat = InMemoryCatalog::new();
+    for sql in [
+        "SELECT BITVEC(4) '1010' <-> BITVEC(4) '0101'",
+        "SELECT l2_distance(BITVEC(4) '1010', BITVEC(4) '0101')",
+        "SELECT vector_norm(BITVEC(4) '1010')",
+    ] {
+        let err = parse_and_bind(sql, &cat).unwrap_err();
+        let PlanError::TypeMismatch(message) = err else {
+            panic!("expected TypeMismatch for {sql}, got {err:?}");
+        };
+        assert!(
+            message.contains("vector") || message.contains("metric"),
+            "diagnostic should mention vector metric, got {message}"
+        );
+    }
 }
 
 #[test]

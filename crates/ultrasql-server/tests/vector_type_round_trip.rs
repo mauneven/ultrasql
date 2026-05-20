@@ -267,6 +267,8 @@ async fn vector_distance_operators_execute_in_sql() {
                  embedding <=> '[3,-6,3]', \
                  cosine_distance(embedding, VECTOR '[3,-6,3]'), \
                  vector_dims(embedding), \
+                 vector_norm(embedding), \
+                 l1_distance(embedding, VECTOR '[3,2,-1]'), \
                  embedding <+> '[3,2,-1]' \
              FROM embeddings WHERE id = 1",
         )
@@ -284,7 +286,43 @@ async fn vector_distance_operators_execute_in_sql() {
             "1".to_owned(),
             "1".to_owned(),
             "3".to_owned(),
+            "3.7416573867739413".to_owned(),
+            "6".to_owned(),
             "6".to_owned()
+        ]]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn pgvector_metric_functions_run_on_halfvec_and_sparsevec() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    let messages = client
+        .simple_query(
+            "SELECT \
+                 HALFVEC(3) '[1,2,3]' <#> HALFVEC(3) '[4,5,6]', \
+                 inner_product(HALFVEC(3) '[1,2,3]', HALFVEC(3) '[4,5,6]'), \
+                 SPARSEVEC(5) '{1:1,3:2,5:-1}/5' <-> SPARSEVEC(5) '{1:2,4:3,5:1}/5', \
+                 SPARSEVEC(5) '{1:1,3:2,5:-1}/5' <+> SPARSEVEC(5) '{1:2,4:3,5:1}/5', \
+                 vector_norm(HALFVEC(2) '[3,4]'), \
+                 l2_norm(SPARSEVEC(4) '{1:3,4:4}/4'), \
+                 vector_dims(SPARSEVEC(5) '{1:1}/5')",
+        )
+        .await
+        .expect("select halfvec/sparsevec metrics");
+    let rows = simple_rows(&messages);
+    assert_eq!(
+        rows,
+        vec![vec![
+            "-32".to_owned(),
+            "32".to_owned(),
+            "4.242640687119285".to_owned(),
+            "8".to_owned(),
+            "5".to_owned(),
+            "5".to_owned(),
+            "5".to_owned()
         ]]
     );
 

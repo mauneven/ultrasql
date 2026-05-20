@@ -220,21 +220,28 @@ const fn is_vector_comparison_operand(left: &DataType, right: &DataType) -> bool
 
 fn vector_operands_compatible(left: &DataType, right: &DataType) -> bool {
     match (left, right) {
-        (DataType::Null, right) | (right, DataType::Null) if right.is_vector_family() => true,
-        (left, right) if left.is_vector_family() && right.is_vector_family() => {
-            vector_family_kind(left) == vector_family_kind(right)
+        (DataType::Null, right) | (right, DataType::Null)
+            if vector_metric_family_kind(right).is_some() =>
+        {
+            true
+        }
+        (left, right)
+            if vector_metric_family_kind(left).is_some()
+                && vector_metric_family_kind(right).is_some() =>
+        {
+            vector_metric_family_kind(left) == vector_metric_family_kind(right)
                 && dims_compatible(left.vector_dims().flatten(), right.vector_dims().flatten())
         }
         _ => false,
     }
 }
 
-fn vector_family_kind(data_type: &DataType) -> Option<u8> {
+fn vector_metric_family_kind(data_type: &DataType) -> Option<u8> {
     match data_type {
         DataType::Vector { .. } => Some(0),
         DataType::HalfVec { .. } => Some(1),
         DataType::SparseVec { .. } => Some(2),
-        DataType::BitVec { .. } => Some(3),
+        DataType::BitVec { .. } => None,
         _ => None,
     }
 }

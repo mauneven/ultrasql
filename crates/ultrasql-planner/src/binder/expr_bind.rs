@@ -105,7 +105,8 @@ pub(super) fn bind_expr_with_ctes(
                 .iter()
                 .map(|a| bind_expr_with_ctes(a, input, catalog, cte_catalog, scope))
                 .collect();
-            let bound_args = bound_args?;
+            let mut bound_args = bound_args?;
+            validate_builtin_args(&func_name, &mut bound_args)?;
             let return_type = builtin_return_type(&func_name)?;
             Ok(ScalarExpr::FunctionCall {
                 name: func_name,
@@ -976,9 +977,10 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
         "string_to_array" | "array_cat" => {
             Ok(DataType::Array(Box::new(DataType::Text { max_len: None })))
         }
-        "l2_distance" | "cosine_distance" | "inner_product" | "dot_product" => {
+        "l2_distance" | "cosine_distance" | "inner_product" | "dot_product" | "l1_distance" => {
             Ok(DataType::Float64)
         }
+        "vector_norm" | "l2_norm" => Ok(DataType::Float64),
         "vector_dims" => Ok(DataType::Int32),
         _ => Err(PlanError::NotSupported("non-aggregate function calls")),
     }
@@ -1014,8 +1016,105 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "cosine_distance"
             | "inner_product"
             | "dot_product"
+            | "l1_distance"
+            | "vector_norm"
+            | "l2_norm"
             | "vector_dims"
     )
+}
+
+fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(), PlanError> {
+    match func_name {
+        "l2_distance" | "cosine_distance" | "inner_product" | "dot_product" | "l1_distance" => {
+            validate_vector_metric_args(func_name, args)
+        }
+        "vector_norm" | "l2_norm" => validate_vector_norm_args(func_name, args),
+        "vector_dims" => validate_vector_dims_args(args),
+        _ => Ok(()),
+    }
+}
+
+fn validate_vector_metric_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(), PlanError> {
+    if args.len() != 2 {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    coerce_vector_metric_literals(args);
+    let left = args[0].data_type();
+    let right = args[1].data_type();
+    if matches!((&left, &right), (DataType::Null, DataType::Null)) {
+        return Ok(());
+    }
+    if matches!(left, DataType::Null) && vector_metric_family_kind(&right).is_some() {
+        return Ok(());
+    }
+    if matches!(right, DataType::Null) && vector_metric_family_kind(&left).is_some() {
+        return Ok(());
+    }
+    if vector_metric_family_kind(&left).is_some()
+        && vector_metric_family_kind(&left) == vector_metric_family_kind(&right)
+        && dims_compatible(left.vector_dims().flatten(), right.vector_dims().flatten())
+    {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: compatible vector, halfvec, or sparsevec operands required, got {left} and {right}"
+    )))
+}
+
+fn coerce_vector_metric_literals(args: &mut [ScalarExpr]) {
+    let left_type = args[0].data_type();
+    let right_type = args[1].data_type();
+    if vector_metric_family_kind(&left_type).is_some() {
+        coerce_literal_to_type(&mut args[1], &left_type);
+    }
+    if vector_metric_family_kind(&right_type).is_some() {
+        coerce_literal_to_type(&mut args[0], &right_type);
+    }
+}
+
+fn validate_vector_norm_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+    if args.len() != 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let data_type = args[0].data_type();
+    if matches!(data_type, DataType::Null) || vector_metric_family_kind(&data_type).is_some() {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{func_name}: vector, halfvec, or sparsevec argument required, got {data_type}"
+    )))
+}
+
+fn validate_vector_dims_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
+    if args.len() != 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "vector_dims: expected 1 argument, got {}",
+            args.len()
+        )));
+    }
+    let data_type = args[0].data_type();
+    if matches!(data_type, DataType::Null) || data_type.is_vector_family() {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "vector_dims: vector-family argument required, got {data_type}"
+    )))
+}
+
+fn vector_metric_family_kind(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::Vector { .. } => Some(0),
+        DataType::HalfVec { .. } => Some(1),
+        DataType::SparseVec { .. } => Some(2),
+        DataType::BitVec { .. } => None,
+        _ => None,
+    }
 }
 
 /// Days from the 2000-01-01 epoch to (year, month, day), positive or
