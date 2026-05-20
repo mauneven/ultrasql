@@ -36,6 +36,7 @@
 //! - [`Project`] — column projection.
 //! - [`Limit`] — row cap across all output batches.
 //! - [`Sort`] — in-memory sort with optional spill.
+//! - [`TopK`] — exact bounded `ORDER BY ... LIMIT k` retrieval.
 //! - [`HashJoin`] — hash equi-join (Inner, `LeftOuter`).
 //! - [`MergeJoin`] — merge equi-join over sorted inputs (all join types).
 //! - [`HashAggregate`] — hash-based GROUP BY / aggregate.
@@ -95,6 +96,7 @@ pub mod set_op;
 pub mod sinks;
 mod sort;
 pub mod sort_aggregate;
+mod top_k;
 pub mod unique;
 mod values_scan;
 pub mod vec_ops;
@@ -136,6 +138,7 @@ pub use seq_scan::{SeqScan, build_batch};
 pub use set_op::SetOp;
 pub use sort::Sort;
 pub use sort_aggregate::SortAggregate;
+pub use top_k::TopK;
 pub use unique::Unique;
 pub use values_scan::ValuesScan;
 pub use window_agg::{WindowAgg, WindowFunc};
@@ -500,5 +503,55 @@ mod tests {
         // LockRows must have called the callback once per output row.
         let locked = *locked_rows.lock().expect("mutex ok");
         assert_eq!(locked, 3, "lock callback must fire once per unique row");
+    }
+
+    #[test]
+    fn top_k_orders_vector_distance() {
+        use ultrasql_core::Value;
+        use ultrasql_planner::{BinaryOp, ScalarExpr, SortKey};
+
+        use crate::{TopK, filter_op::batch_to_rows, seq_scan::build_batch};
+
+        let schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("embedding", DataType::Vector { dims: Some(3) }),
+        ])
+        .expect("schema ok");
+        let rows = vec![
+            vec![Value::Int32(10), Value::Vector(vec![3.0, 0.0, 0.0])],
+            vec![Value::Int32(20), Value::Vector(vec![0.0, 0.0, 1.0])],
+            vec![Value::Int32(30), Value::Vector(vec![0.5, 0.0, 0.0])],
+            vec![Value::Int32(40), Value::Vector(vec![0.0, 2.0, 0.0])],
+        ];
+        let batch = build_batch(&rows, &schema).expect("batch ok");
+        let scan = MemTableScan::new(schema.clone(), vec![batch]);
+        let embedding = ScalarExpr::Column {
+            name: "embedding".into(),
+            index: 1,
+            data_type: DataType::Vector { dims: Some(3) },
+        };
+        let probe = ScalarExpr::Literal {
+            value: Value::Vector(vec![0.0, 0.0, 0.0]),
+            data_type: DataType::Vector { dims: Some(3) },
+        };
+        let key = SortKey {
+            expr: ScalarExpr::Binary {
+                op: BinaryOp::VectorL2Distance,
+                left: Box::new(embedding),
+                right: Box::new(probe),
+                data_type: DataType::Float64,
+            },
+            asc: true,
+            nulls_first: false,
+        };
+        let mut top_k = TopK::new(Box::new(scan), vec![key], schema.clone(), 2);
+        assert_eq!(top_k.estimated_row_count(), Some(2));
+
+        let mut out = Vec::new();
+        while let Some(batch) = top_k.next_batch().expect("top-k must execute") {
+            out.extend(batch_to_rows(&batch, top_k.schema()).expect("decode rows"));
+        }
+        let ids: Vec<Value> = out.into_iter().map(|row| row[0].clone()).collect();
+        assert_eq!(ids, vec![Value::Int32(30), Value::Int32(20)]);
     }
 }

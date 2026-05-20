@@ -84,6 +84,10 @@ impl Operator for ProjectExprs {
     fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    fn estimated_row_count(&self) -> Option<usize> {
+        self.child.estimated_row_count()
+    }
 }
 
 /// Assemble a column-oriented batch column from a column-major
@@ -234,6 +238,34 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
                     other => {
                         return Err(ExecError::TypeMismatch(format!(
                             "projection: expected Jsonb at row {i}, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                }
+            }
+            Ok(
+                match encode_strings_auto(
+                    strings.iter().map(|v| v.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                },
+            )
+        }
+        DataType::Vector { dims } => {
+            let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    Value::Null => strings.push(None),
+                    Value::Vector(vector)
+                        if dims.is_none() || u32::try_from(vector.len()).ok() == *dims =>
+                    {
+                        strings.push(Some(v.to_string()));
+                    }
+                    other => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "projection: expected {dt:?} at row {i}, got {:?}",
                             other.data_type()
                         )));
                     }

@@ -37,8 +37,10 @@ use crate::hash_join::HashJoin;
 use crate::lock_rows::LockRows;
 use crate::merge_join::MergeJoin;
 use crate::nested_loop_join::{NestedLoopJoin, RightFactory};
+use crate::project_expr::ProjectExprs;
 use crate::set_op::SetOp;
 use crate::sort::Sort;
+use crate::top_k::TopK;
 use crate::values_scan::ValuesScan;
 use crate::{Limit, MemTableScan, Operator, Project};
 
@@ -142,22 +144,10 @@ pub fn build_operator(
 
         LogicalPlan::Project { input, exprs, .. } => {
             let child = build_operator(input, data_source)?;
-            build_project(child, exprs)
+            build_project(child, exprs, plan.schema())
         }
 
-        LogicalPlan::Limit { input, n, offset } => {
-            let child = build_operator(input, data_source)?;
-            // Saturate both `n` and `offset` into `usize`. The binder
-            // legitimately produces `u64::MAX` for `LIMIT NULL OFFSET m`
-            // (i.e. "no upper bound"), and the executor's `Limit`
-            // treats `usize::MAX` as that same sentinel. On 32-bit
-            // targets a literal `LIMIT 5_000_000_000` saturates to
-            // "all rows," which is the only sane outcome — we have no
-            // batch big enough to hit the cap regardless.
-            let limit = usize::try_from(*n).unwrap_or(usize::MAX);
-            let offset = usize::try_from(*offset).unwrap_or(usize::MAX);
-            Ok(Box::new(Limit::with_offset(child, limit, offset)))
-        }
+        LogicalPlan::Limit { input, n, offset } => build_limit(input, *n, *offset, data_source),
 
         LogicalPlan::Sort { input, keys } => {
             let child = build_operator(input, data_source)?;
@@ -350,6 +340,84 @@ pub fn build_operator(
                 schema.clone(),
             )))
         }
+    }
+}
+
+fn build_limit(
+    input: &LogicalPlan,
+    n: u64,
+    offset: u64,
+    data_source: &dyn DataSource,
+) -> Result<Box<dyn Operator>, BuildError> {
+    // Saturate both `n` and `offset` into `usize`. The binder
+    // legitimately produces `u64::MAX` for `LIMIT NULL OFFSET m`
+    // (i.e. "no upper bound"), and the executor's `Limit` treats
+    // `usize::MAX` as that same sentinel. On 32-bit targets a literal
+    // `LIMIT 5_000_000_000` saturates to "all rows," which is the only
+    // sane outcome — we have no batch big enough to hit the cap.
+    let limit = usize::try_from(n).unwrap_or(usize::MAX);
+    let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+    if limit != usize::MAX
+        && offset != usize::MAX
+        && let Some(top_k) = try_build_top_k_limit(input, limit, offset, data_source)?
+    {
+        return Ok(top_k);
+    }
+    let child = build_operator(input, data_source)?;
+    Ok(Box::new(Limit::with_offset(child, limit, offset)))
+}
+
+fn try_build_top_k_limit(
+    input: &LogicalPlan,
+    limit: usize,
+    offset: usize,
+    data_source: &dyn DataSource,
+) -> Result<Option<Box<dyn Operator>>, BuildError> {
+    let Some(cap) = limit.checked_add(offset) else {
+        return Ok(None);
+    };
+    match input {
+        LogicalPlan::Sort {
+            input: sort_input,
+            keys,
+        } => {
+            let child = build_operator(sort_input, data_source)?;
+            let schema = child.schema().clone();
+            let top_k: Box<dyn Operator> = Box::new(TopK::new(child, keys.clone(), schema, cap));
+            Ok(Some(apply_offset_after_top_k(top_k, limit, offset)))
+        }
+        LogicalPlan::Project {
+            input: project_input,
+            exprs,
+            schema,
+        } => {
+            let LogicalPlan::Sort {
+                input: sort_input,
+                keys,
+            } = project_input.as_ref()
+            else {
+                return Ok(None);
+            };
+            let child = build_operator(sort_input, data_source)?;
+            let sort_schema = child.schema().clone();
+            let top_k: Box<dyn Operator> =
+                Box::new(TopK::new(child, keys.clone(), sort_schema, cap));
+            let projected = build_project(top_k, exprs, schema)?;
+            Ok(Some(apply_offset_after_top_k(projected, limit, offset)))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn apply_offset_after_top_k(
+    input: Box<dyn Operator>,
+    limit: usize,
+    offset: usize,
+) -> Box<dyn Operator> {
+    if offset == 0 {
+        input
+    } else {
+        Box::new(Limit::with_offset(input, limit, offset))
     }
 }
 
@@ -617,18 +685,19 @@ fn build_scan(
 fn build_project(
     child: Box<dyn Operator>,
     exprs: &[(ScalarExpr, String)],
+    schema: &Schema,
 ) -> Result<Box<dyn Operator>, BuildError> {
     let mut indices = Vec::with_capacity(exprs.len());
     for (expr, _name) in exprs {
         if let ScalarExpr::Column { index, .. } = expr {
             indices.push(*index);
         } else {
-            return Err(BuildError::Unsupported(
-                "computed projections not supported in v0.5",
-            ));
+            return ProjectExprs::new(child, exprs, schema.clone())
+                .map(|p| Box::new(p) as Box<dyn Operator>)
+                .map_err(map_exec_error);
         }
     }
-    Project::new(child, indices)
+    Project::with_schema(child, indices, schema.clone())
         .map(|p| Box::new(p) as Box<dyn Operator>)
         .map_err(map_exec_error)
 }
@@ -656,6 +725,14 @@ mod tests {
         .expect("schema is well-formed")
     }
 
+    fn items_schema() -> Schema {
+        Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("embedding", DataType::Vector { dims: Some(3) }),
+        ])
+        .expect("schema is well-formed")
+    }
+
     /// Pack `(id, val)` rows into a single batch.
     fn batch(rows: &[(i32, i64)]) -> Batch {
         let ids: Vec<i32> = rows.iter().map(|(i, _)| *i).collect();
@@ -665,6 +742,14 @@ mod tests {
             Column::Int64(NumericColumn::from_data(vals)),
         ])
         .expect("test batch is well-formed")
+    }
+
+    fn vector_batch(rows: &[(i32, Vec<f32>)]) -> Batch {
+        let decoded: Vec<Vec<Value>> = rows
+            .iter()
+            .map(|(id, embedding)| vec![Value::Int32(*id), Value::Vector(embedding.clone())])
+            .collect();
+        crate::seq_scan::build_batch(&decoded, &items_schema()).expect("vector batch ok")
     }
 
     /// In-memory [`DataSource`] that stores tables by name. Mirrors
@@ -691,6 +776,23 @@ mod tests {
                         batch(&[(1, 10), (7, 20), (3, 30)]),
                         batch(&[(7, 40), (2, 50), (7, 60)]),
                     ],
+                ),
+            );
+            s
+        }
+
+        fn with_items() -> Self {
+            let mut s = Self::new();
+            s.tables.insert(
+                "items".to_string(),
+                (
+                    items_schema(),
+                    vec![vector_batch(&[
+                        (10, vec![3.0, 0.0, 0.0]),
+                        (20, vec![0.0, 0.0, 1.0]),
+                        (30, vec![0.5, 0.0, 0.0]),
+                        (40, vec![0.0, 2.0, 0.0]),
+                    ])],
                 ),
             );
             s
@@ -741,6 +843,18 @@ mod tests {
         out
     }
 
+    fn drain_i32(op: &mut dyn Operator) -> Vec<i32> {
+        let mut out = Vec::new();
+        while let Some(b) = op.next_batch().expect("operator must not error") {
+            assert_eq!(b.width(), 1, "expected single-column output");
+            match &b.columns()[0] {
+                Column::Int32(c) => out.extend_from_slice(c.data()),
+                other => panic!("expected Int32 column, got {other:?}"),
+            }
+        }
+        out
+    }
+
     /// Helper: build a typed `Column { id }` expression against the
     /// fixture schema.
     fn col_id() -> ScalarExpr {
@@ -761,6 +875,22 @@ mod tests {
         }
     }
 
+    fn col_item_id() -> ScalarExpr {
+        ScalarExpr::Column {
+            name: "id".into(),
+            index: 0,
+            data_type: DataType::Int32,
+        }
+    }
+
+    fn col_embedding() -> ScalarExpr {
+        ScalarExpr::Column {
+            name: "embedding".into(),
+            index: 1,
+            data_type: DataType::Vector { dims: Some(3) },
+        }
+    }
+
     /// Helper: build an Int32 literal expression.
     fn lit_i32(v: i32) -> ScalarExpr {
         ScalarExpr::Literal {
@@ -769,10 +899,34 @@ mod tests {
         }
     }
 
+    fn lit_vector(values: Vec<f32>) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Vector(values),
+            data_type: DataType::Vector { dims: Some(3) },
+        }
+    }
+
+    fn l2_to_probe() -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::VectorL2Distance,
+            left: Box::new(col_embedding()),
+            right: Box::new(lit_vector(vec![0.0, 0.0, 0.0])),
+            data_type: DataType::Float64,
+        }
+    }
+
     fn scan_plan() -> LogicalPlan {
         LogicalPlan::Scan {
             table: "users".into(),
             schema: users_schema(),
+            projection: None,
+        }
+    }
+
+    fn items_scan_plan() -> LogicalPlan {
+        LogicalPlan::Scan {
+            table: "items".into(),
+            schema: items_schema(),
             projection: None,
         }
     }
@@ -1044,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    fn computed_projection_is_unsupported() {
+    fn computed_projection_evaluates_scalar_expression() {
         let src = StaticSource::with_users();
         let plan = LogicalPlan::Project {
             input: Box::new(scan_plan()),
@@ -1060,8 +1214,54 @@ mod tests {
             schema: Schema::new([Field::required("id_plus_one", DataType::Int32)])
                 .expect("schema ok"),
         };
-        let err = build_operator(&plan, &src).expect_err("computed projection must reject");
-        assert!(matches!(err, BuildError::Unsupported(_)), "got {err:?}");
+        let mut op = build_operator(&plan, &src).expect("computed projection builds");
+        let values = drain_i32(&mut *op);
+        assert_eq!(values, vec![2, 8, 4, 8, 3, 8]);
+        assert_eq!(op.schema().field_at(0).name, "id_plus_one");
+    }
+
+    #[test]
+    fn vector_distance_projection_and_ordered_limit_returns_nearest() {
+        let src = StaticSource::with_items();
+        let distance = l2_to_probe();
+        let plan = LogicalPlan::Limit {
+            input: Box::new(LogicalPlan::Project {
+                input: Box::new(LogicalPlan::Sort {
+                    input: Box::new(items_scan_plan()),
+                    keys: vec![SortKey {
+                        expr: distance.clone(),
+                        asc: true,
+                        nulls_first: false,
+                    }],
+                }),
+                exprs: vec![
+                    (col_item_id(), "id".into()),
+                    (distance, "distance".into()),
+                    (col_embedding(), "embedding".into()),
+                ],
+                schema: Schema::new([
+                    Field::required("id", DataType::Int32),
+                    Field::required("distance", DataType::Float64),
+                    Field::required("embedding", DataType::Vector { dims: Some(3) }),
+                ])
+                .expect("schema ok"),
+            }),
+            n: 2,
+            offset: 0,
+        };
+        let mut op = build_operator(&plan, &src).expect("vector top-k plan builds");
+        assert_eq!(op.estimated_row_count(), Some(2));
+        let mut rows = Vec::new();
+        while let Some(batch) = op.next_batch().expect("vector top-k executes") {
+            rows.extend(crate::filter_op::batch_to_rows(&batch, op.schema()).expect("decode"));
+        }
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], Value::Int32(30));
+        assert_eq!(rows[0][1], Value::Float64(0.5));
+        assert_eq!(rows[0][2], Value::Vector(vec![0.5, 0.0, 0.0]));
+        assert_eq!(rows[1][0], Value::Int32(20));
+        assert_eq!(rows[1][1], Value::Float64(1.0));
+        assert_eq!(rows[1][2], Value::Vector(vec![0.0, 0.0, 1.0]));
     }
 
     #[test]
