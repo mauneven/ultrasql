@@ -78,8 +78,19 @@ pub fn execute_portal(
         ));
     }
 
-    // Build the operator tree.
-    let mut op = lower_query(&plan, ctx)?;
+    // Build the operator tree. Repeated safe GROUP BY summaries can be
+    // replayed from a version-scoped physical projection cache while keeping
+    // Extended Query row-format handling in this path.
+    let mut op: Box<dyn Operator> = if let Some(scan) =
+        crate::projection_summary::try_build_cached_grouped_projection_scan(
+            &plan,
+            &ctx.catalog_snapshot,
+            ctx.heap.as_ref(),
+        ) {
+        Box::new(scan)
+    } else {
+        lower_query(&plan, ctx)?
+    };
 
     // INSERT/UPDATE/DELETE either produce a row count tag or, when
     // `RETURNING` is present, a row stream plus the DML-specific

@@ -746,6 +746,16 @@ where
             ) {
                 return Ok(result);
             }
+            if let Some(result) =
+                crate::projection_summary::try_run_cached_grouped_projection_select(
+                    plan,
+                    catalog_snapshot,
+                    self.state.heap.as_ref(),
+                    &mut self.write_buf,
+                )
+            {
+                return Ok(result);
+            }
         }
         self.reject_non_append_materialized_view_source_write(plan)?;
 

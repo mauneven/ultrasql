@@ -51,6 +51,7 @@ pub mod extended;
 pub mod index_key;
 pub mod notify;
 pub mod pipeline;
+mod projection_summary;
 pub mod replication;
 pub mod result_encoder;
 pub mod tls;

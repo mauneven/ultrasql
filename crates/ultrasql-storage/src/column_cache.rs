@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use parking_lot::RwLock;
-use ultrasql_core::{RelationId, Schema};
+use ultrasql_core::{DataType, RelationId, Schema, Value};
 use ultrasql_vec::column::Column;
 
 /// Version-scoped key for cached scalar aggregate wire bodies.
@@ -73,6 +73,74 @@ pub enum CachedScalarAggregateWireKey {
     },
 }
 
+/// Version-scoped key for cached physical projection summaries.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CachedGroupedProjectionWireKey {
+    /// Source-table column indices used as GROUP BY keys.
+    pub group_columns: Vec<usize>,
+    /// Aggregate slots computed after the group columns.
+    pub aggregates: Vec<CachedGroupedProjectionAggregateKey>,
+    /// Output schema signature. Names matter because the cached body includes
+    /// the wire RowDescription.
+    pub output_fields: Vec<CachedGroupedProjectionFieldKey>,
+    /// ORDER BY columns resolved against the projected output.
+    pub order_by: Vec<CachedGroupedProjectionOrderKey>,
+}
+
+/// Output-field identity for projection summary wire reuse.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CachedGroupedProjectionFieldKey {
+    /// Output column name.
+    pub name: String,
+    /// Output column type.
+    pub data_type: DataType,
+    /// Whether the output column is nullable.
+    pub nullable: bool,
+}
+
+/// One aggregate slot in a cached projection summary.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CachedGroupedProjectionAggregateKey {
+    /// `COUNT(*)`.
+    CountStar,
+    /// `COUNT(col)`.
+    Count {
+        /// Source column index.
+        column: usize,
+        /// Source column type.
+        data_type: DataType,
+    },
+    /// `SUM(col)`.
+    Sum {
+        /// Source column index.
+        column: usize,
+        /// Source column type.
+        data_type: DataType,
+    },
+}
+
+/// ORDER BY column in a cached projection summary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CachedGroupedProjectionOrderKey {
+    /// Output column index.
+    pub output_index: usize,
+    /// `true` for ascending order.
+    pub asc: bool,
+    /// `true` when NULL sorts first.
+    pub nulls_first: bool,
+}
+
+/// Cached rows and optional Simple Query wire body for a physical projection
+/// summary.
+#[derive(Debug)]
+pub struct CachedGroupedProjectionWire {
+    /// Grouped output rows in logical value form. Extended Query can reuse
+    /// these rows while honoring per-column text/binary format codes.
+    pub rows: Arc<[Vec<Value>]>,
+    /// RowDescription + DataRow* + CommandComplete for Simple Query reuse.
+    pub text_body: RwLock<Option<Arc<[u8]>>>,
+}
+
 /// Cached column projection for a relation at a specific version.
 #[derive(Debug)]
 pub struct CachedColumns {
@@ -98,6 +166,11 @@ pub struct CachedColumns {
     /// an unchanged relation can skip both heap access and aggregate
     /// recomputation.
     pub cached_scalar_aggregate_wire: RwLock<AHashMap<CachedScalarAggregateWireKey, Arc<[u8]>>>,
+    /// Lazily-populated pre-encoded wire bodies for grouped aggregate
+    /// summaries. Each entry is scoped by this relation's version through the
+    /// surrounding [`CachedColumns`] object.
+    pub cached_grouped_projection_wire:
+        RwLock<AHashMap<CachedGroupedProjectionWireKey, Arc<CachedGroupedProjectionWire>>>,
 }
 
 impl CachedColumns {
@@ -110,6 +183,7 @@ impl CachedColumns {
             columns,
             cached_int32_pair_select_wire: RwLock::new(None),
             cached_scalar_aggregate_wire: RwLock::new(AHashMap::new()),
+            cached_grouped_projection_wire: RwLock::new(AHashMap::new()),
         }
     }
 }
