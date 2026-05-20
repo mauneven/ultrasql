@@ -103,6 +103,7 @@ fn run_tpcb(_args: TpcbArgs) -> ExitCode {
     ExitCode::from(2)
 }
 
+#[cfg(any(test, feature = "sql-bench"))]
 fn percentile(sorted_values: &[f64], quantile: f64) -> f64 {
     if sorted_values.is_empty() {
         return 0.0;
