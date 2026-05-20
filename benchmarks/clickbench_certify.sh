@@ -17,7 +17,7 @@ POSTGRES_DSN="${POSTGRES_DSN:-}"
 ULTRASQL_DSN="${ULTRASQL_DSN:-}"
 RUNS="${CLICKBENCH_RUNS:-3}"
 ALLOW_PARTIAL="${CLICKBENCH_ALLOW_PARTIAL:-0}"
-OUT_DIR="benchmarks/results/latest"
+OUT_DIR="${BENCH_CERT_OUT_DIR:-benchmarks/results/latest}"
 RAW_DIR="$OUT_DIR/raw"
 SUMMARY_OUT="$OUT_DIR/clickbench_certification.json"
 
