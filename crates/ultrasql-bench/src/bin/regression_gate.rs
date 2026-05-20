@@ -19,7 +19,7 @@
 //! ```text
 //! regression-gate [--baseline benchmarks/baselines/<stage>.json]
 //!                 [--stage v0_6]
-//!                 [--engines postgres17,duckdb,sqlite3,clickhouse]
+//!                 [--engines postgres17,duckdb,sqlite3,clickhouse,firebolt]
 //!                 [--update-baseline]
 //!                 [--iterations N]
 //!                 [--warmup N]

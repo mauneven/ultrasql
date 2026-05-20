@@ -165,6 +165,8 @@ pub enum Engine {
     ClickHouse,
     /// CockroachDB (current stable release at measurement time).
     CockroachDb,
+    /// Firebolt (current stable release at measurement time).
+    Firebolt,
 }
 
 impl Engine {
@@ -177,6 +179,7 @@ impl Engine {
             Self::Sqlite3 => "sqlite3",
             Self::ClickHouse => "clickhouse",
             Self::CockroachDb => "cockroachdb",
+            Self::Firebolt => "firebolt",
         }
     }
 }
@@ -675,6 +678,22 @@ mod tests {
         assert_eq!(Stage::parse_str("unknown"), None);
         assert_eq!(Stage::parse_str(""), None);
         assert_eq!(Stage::parse_str("v1_1"), None);
+    }
+
+    #[test]
+    fn engine_names_include_firebolt_competitor_key() {
+        let engines = [
+            (Engine::Postgres17, "postgres17"),
+            (Engine::DuckDb, "duckdb"),
+            (Engine::Sqlite3, "sqlite3"),
+            (Engine::ClickHouse, "clickhouse"),
+            (Engine::CockroachDb, "cockroachdb"),
+            (Engine::Firebolt, "firebolt"),
+        ];
+        for (engine, expected) in engines {
+            assert_eq!(engine.as_str(), expected);
+            assert_eq!(engine.to_string(), expected);
+        }
     }
 
     #[test]
