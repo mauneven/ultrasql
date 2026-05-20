@@ -11,6 +11,14 @@ tenant isolation is expressed through `tenant_id TEXT NOT NULL`, explicit
 tenant predicates, and PostgreSQL-shaped row-policy SQL. No RAG helper hides
 authorization in opaque functions.
 
+The default table set is:
+
+- `rag_documents`
+- `rag_chunks`
+- `rag_embeddings`
+- `rag_retrieval_events`
+- `rag_answer_citations`
+
 ## Tenant Id Pattern
 
 Every RAG primitive row has a required tenant key:
@@ -87,9 +95,10 @@ WITH CHECK (tenant_id = current_setting('ultrasql.tenant_id', true));
 ```
 
 The same policy shape applies to `rag_chunks` and `rag_embeddings`.
-`USING` gates reads and deletes. `WITH CHECK` gates inserts and updates. The
-session setting is intentionally named in SQL so application code can audit the
-security boundary.
+The same policy shape also applies to `rag_retrieval_events` and
+`rag_answer_citations`. `USING` gates reads and deletes. `WITH CHECK` gates
+inserts and updates. The session setting is intentionally named in SQL so
+application code can audit the security boundary.
 
 ## Current Enforcement Boundary
 

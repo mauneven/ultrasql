@@ -2,8 +2,9 @@
 //!
 //! These primitives are ordinary SQL tables, not hidden system catalogs. They
 //! give applications a reproducible baseline for storing source documents,
-//! chunks, embeddings, metadata, recency, and version state while the SQL layer
-//! grows higher-level RAG helpers around them.
+//! chunks, embeddings, retrieval events, answer citations, metadata, recency,
+//! and version state while the SQL layer grows higher-level RAG helpers around
+//! them.
 
 use std::fmt;
 
@@ -18,7 +19,8 @@ pub const DEFAULT_RAG_TENANT_SETTING: &str = "ultrasql.tenant_id";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RagSchemaConfig {
     /// Prefix used for table names. The default creates `rag_documents`,
-    /// `rag_chunks`, and `rag_embeddings`.
+    /// `rag_chunks`, `rag_embeddings`, `rag_retrieval_events`, and
+    /// `rag_answer_citations`.
     pub prefix: String,
     /// Vector dimension for the embeddings table.
     pub embedding_dims: u32,
@@ -42,9 +44,13 @@ pub struct RagTableNames {
     pub chunks: String,
     /// Embeddings table name.
     pub embeddings: String,
+    /// Retrieval-events table name.
+    pub retrieval_events: String,
+    /// Answer-citations table name.
+    pub answer_citations: String,
 }
 
-/// Canonical schemas for the three RAG primitive tables.
+/// Canonical schemas for the five RAG primitive tables.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RagPrimitiveSchemas {
     /// Source document rows.
@@ -53,6 +59,10 @@ pub struct RagPrimitiveSchemas {
     pub chunks: Schema,
     /// Vector embedding rows belonging to chunks.
     pub embeddings: Schema,
+    /// Retrieval events for later auditing and feedback loops.
+    pub retrieval_events: Schema,
+    /// Answer citations linking generated answers to source chunks.
+    pub answer_citations: Schema,
 }
 
 /// Error returned for invalid RAG schema configuration.
@@ -86,6 +96,8 @@ impl RagSchemaConfig {
             documents: format!("{}_documents", self.prefix),
             chunks: format!("{}_chunks", self.prefix),
             embeddings: format!("{}_embeddings", self.prefix),
+            retrieval_events: format!("{}_retrieval_events", self.prefix),
+            answer_citations: format!("{}_answer_citations", self.prefix),
         })
     }
 }
@@ -98,11 +110,13 @@ impl RagPrimitiveSchemas {
             documents: documents_schema()?,
             chunks: chunks_schema()?,
             embeddings: embeddings_schema(embedding_dims)?,
+            retrieval_events: retrieval_events_schema(embedding_dims)?,
+            answer_citations: answer_citations_schema()?,
         })
     }
 }
 
-/// Return SQL that creates the three RAG primitive tables.
+/// Return SQL that creates the five RAG primitive tables.
 ///
 /// The generated DDL is deliberately plain PostgreSQL-compatible SQL so tests
 /// can execute it through the normal wire path. IDs are `TEXT` today because
@@ -174,6 +188,43 @@ is_current BOOL NOT NULL\
             embeddings = names.embeddings,
             chunks = names.chunks,
             dims = dims
+        ),
+        format!(
+            "\
+CREATE TABLE IF NOT EXISTS {retrieval_events} (\
+tenant_id TEXT NOT NULL CHECK (tenant_id <> ''), \
+retrieval_event_id TEXT PRIMARY KEY, \
+query_text TEXT NOT NULL, \
+query_embedding VECTOR({dims}), \
+retrieval_mode TEXT NOT NULL, \
+top_k INTEGER NOT NULL, \
+metadata_filter JSONB NOT NULL, \
+scoring JSONB NOT NULL, \
+latency_microseconds BIGINT NOT NULL, \
+retrieved_at TIMESTAMPTZ NOT NULL\
+)",
+            retrieval_events = names.retrieval_events,
+            dims = dims
+        ),
+        format!(
+            "\
+CREATE TABLE IF NOT EXISTS {answer_citations} (\
+tenant_id TEXT NOT NULL CHECK (tenant_id <> ''), \
+citation_id TEXT PRIMARY KEY, \
+retrieval_event_id TEXT NOT NULL REFERENCES {retrieval_events}(retrieval_event_id), \
+answer_id TEXT NOT NULL, \
+document_id TEXT NOT NULL REFERENCES {documents}(document_id), \
+chunk_id TEXT NOT NULL REFERENCES {chunks}(chunk_id), \
+citation_index INTEGER NOT NULL, \
+score FLOAT8 NOT NULL, \
+quote TEXT, \
+metadata JSONB NOT NULL, \
+created_at TIMESTAMPTZ NOT NULL\
+)",
+            answer_citations = names.answer_citations,
+            retrieval_events = names.retrieval_events,
+            documents = names.documents,
+            chunks = names.chunks
         ),
     ])
 }
@@ -253,6 +304,8 @@ pub fn create_rag_tenant_policy_statements(
         tenant_policy_statements_for(&names.documents),
         tenant_policy_statements_for(&names.chunks),
         tenant_policy_statements_for(&names.embeddings),
+        tenant_policy_statements_for(&names.retrieval_events),
+        tenant_policy_statements_for(&names.answer_citations),
     ]
     .into_iter()
     .flatten()
@@ -336,6 +389,44 @@ fn embeddings_schema(embedding_dims: u32) -> Result<Schema, RagSchemaError> {
         Field::required("is_current", DataType::Bool),
     ])
     .map_err(|err| RagSchemaError::new(format!("rag embeddings schema: {err}")))
+}
+
+fn retrieval_events_schema(embedding_dims: u32) -> Result<Schema, RagSchemaError> {
+    Schema::new([
+        Field::required("tenant_id", DataType::Text { max_len: None }),
+        Field::required("retrieval_event_id", DataType::Text { max_len: None }),
+        Field::required("query_text", DataType::Text { max_len: None }),
+        Field::nullable(
+            "query_embedding",
+            DataType::Vector {
+                dims: Some(embedding_dims),
+            },
+        ),
+        Field::required("retrieval_mode", DataType::Text { max_len: None }),
+        Field::required("top_k", DataType::Int32),
+        Field::required("metadata_filter", DataType::Jsonb),
+        Field::required("scoring", DataType::Jsonb),
+        Field::required("latency_microseconds", DataType::Int64),
+        Field::required("retrieved_at", DataType::TimestampTz),
+    ])
+    .map_err(|err| RagSchemaError::new(format!("rag retrieval events schema: {err}")))
+}
+
+fn answer_citations_schema() -> Result<Schema, RagSchemaError> {
+    Schema::new([
+        Field::required("tenant_id", DataType::Text { max_len: None }),
+        Field::required("citation_id", DataType::Text { max_len: None }),
+        Field::required("retrieval_event_id", DataType::Text { max_len: None }),
+        Field::required("answer_id", DataType::Text { max_len: None }),
+        Field::required("document_id", DataType::Text { max_len: None }),
+        Field::required("chunk_id", DataType::Text { max_len: None }),
+        Field::required("citation_index", DataType::Int32),
+        Field::required("score", DataType::Float64),
+        Field::nullable("quote", DataType::Text { max_len: None }),
+        Field::required("metadata", DataType::Jsonb),
+        Field::required("created_at", DataType::TimestampTz),
+    ])
+    .map_err(|err| RagSchemaError::new(format!("rag answer citations schema: {err}")))
 }
 
 fn tenant_policy_statements_for(table: &str) -> Vec<String> {

@@ -83,6 +83,75 @@ fn rag_schemas_include_metadata_recency_version_and_vector_embedding() {
         field(&schemas.embeddings, "version").data_type,
         DataType::Int64
     );
+
+    let retrieval_names: Vec<_> = schemas
+        .retrieval_events
+        .fields()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    assert_eq!(
+        retrieval_names,
+        vec![
+            "tenant_id",
+            "retrieval_event_id",
+            "query_text",
+            "query_embedding",
+            "retrieval_mode",
+            "top_k",
+            "metadata_filter",
+            "scoring",
+            "latency_microseconds",
+            "retrieved_at",
+        ]
+    );
+    assert_eq!(
+        field(&schemas.retrieval_events, "query_embedding").data_type,
+        DataType::Vector { dims: Some(3) }
+    );
+    assert!(
+        field(&schemas.retrieval_events, "query_embedding").nullable,
+        "text-only retrieval events may omit query embedding"
+    );
+    assert_eq!(
+        field(&schemas.retrieval_events, "metadata_filter").data_type,
+        DataType::Jsonb
+    );
+    assert_eq!(
+        field(&schemas.retrieval_events, "scoring").data_type,
+        DataType::Jsonb
+    );
+
+    let citation_names: Vec<_> = schemas
+        .answer_citations
+        .fields()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    assert_eq!(
+        citation_names,
+        vec![
+            "tenant_id",
+            "citation_id",
+            "retrieval_event_id",
+            "answer_id",
+            "document_id",
+            "chunk_id",
+            "citation_index",
+            "score",
+            "quote",
+            "metadata",
+            "created_at",
+        ]
+    );
+    assert_eq!(
+        field(&schemas.answer_citations, "score").data_type,
+        DataType::Float64
+    );
+    assert_eq!(
+        field(&schemas.answer_citations, "metadata").data_type,
+        DataType::Jsonb
+    );
 }
 
 #[test]
@@ -97,8 +166,15 @@ fn rag_table_sql_uses_prefix_and_dimension() {
     assert!(sql.contains("CREATE TABLE IF NOT EXISTS tenant_a_documents"));
     assert!(sql.contains("CREATE TABLE IF NOT EXISTS tenant_a_chunks"));
     assert!(sql.contains("CREATE TABLE IF NOT EXISTS tenant_a_embeddings"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS tenant_a_retrieval_events"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS tenant_a_answer_citations"));
     assert!(sql.contains("tenant_id TEXT NOT NULL"));
     assert!(sql.contains("embedding VECTOR(384) NOT NULL"));
+    assert!(sql.contains("query_embedding VECTOR(384)"));
+    assert!(sql.contains("score FLOAT8 NOT NULL"));
+    assert!(sql.contains(
+        "retrieval_event_id TEXT NOT NULL REFERENCES tenant_a_retrieval_events(retrieval_event_id)"
+    ));
     assert!(sql.contains("metadata JSONB NOT NULL"));
     assert!(sql.contains("updated_at TIMESTAMPTZ NOT NULL"));
     assert!(sql.contains("version BIGINT NOT NULL"));
@@ -166,6 +242,8 @@ fn rag_tenant_ids_and_policy_sql_are_safe_by_default() {
     assert!(sql.contains("WITH CHECK (tenant_id = current_setting('ultrasql.tenant_id', true))"));
     assert!(sql.contains("ALTER TABLE tenant_a_chunks ENABLE ROW LEVEL SECURITY"));
     assert!(sql.contains("ALTER TABLE tenant_a_embeddings ENABLE ROW LEVEL SECURITY"));
+    assert!(sql.contains("ALTER TABLE tenant_a_retrieval_events ENABLE ROW LEVEL SECURITY"));
+    assert!(sql.contains("ALTER TABLE tenant_a_answer_citations ENABLE ROW LEVEL SECURITY"));
 }
 
 #[test]

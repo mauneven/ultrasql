@@ -115,6 +115,31 @@ async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
         .await
         .expect("insert rag embeddings");
 
+    client
+        .batch_execute(
+            "INSERT INTO rag_retrieval_events VALUES \
+             ('tenant-a', 'retr-a-0', 'vector search', VECTOR '[1,0,0]', 'hybrid', 3, \
+              '{\"kind\":\"guide\"}', '{\"bm25\":1,\"vector\":2}', 1200, \
+              TIMESTAMP '2026-05-20 10:02:00'), \
+             ('tenant-b', 'retr-b-0', 'vector search', VECTOR '[1,0,0]', 'hybrid', 3, \
+              '{\"kind\":\"guide\"}', '{\"bm25\":1,\"vector\":2}', 1500, \
+              TIMESTAMP '2026-05-20 10:32:00')",
+        )
+        .await
+        .expect("insert retrieval events");
+    client
+        .batch_execute(
+            "INSERT INTO rag_answer_citations VALUES \
+             ('tenant-a', 'cite-a-0', 'retr-a-0', 'answer-a', 'doc-a', 'chunk-a-0', 0, 0.99, \
+              'vector search needs exact fallback', '{\"source\":\"retrieval\"}', \
+              TIMESTAMP '2026-05-20 10:03:00'), \
+             ('tenant-b', 'cite-b-0', 'retr-b-0', 'answer-b', 'doc-b', 'chunk-b-0', 0, 0.75, \
+              'other tenant content', '{\"source\":\"retrieval\"}', \
+              TIMESTAMP '2026-05-20 10:33:00')",
+        )
+        .await
+        .expect("insert answer citations");
+
     let recent = client
         .simple_query(
             "SELECT document_id, version \
@@ -156,6 +181,45 @@ async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
     assert_eq!(
         simple_rows(&nearest),
         vec![vec!["chunk-a-0".to_owned(), "2".to_owned()]]
+    );
+
+    let retrievals = client
+        .simple_query(
+            "SELECT retrieval_event_id, retrieval_mode, top_k, latency_microseconds \
+             FROM rag_retrieval_events \
+             WHERE tenant_id = 'tenant-a' \
+             ORDER BY retrieved_at DESC",
+        )
+        .await
+        .expect("query retrieval events");
+    assert_eq!(
+        simple_rows(&retrievals),
+        vec![vec![
+            "retr-a-0".to_owned(),
+            "hybrid".to_owned(),
+            "3".to_owned(),
+            "1200".to_owned()
+        ]]
+    );
+
+    let citations = client
+        .simple_query(
+            "SELECT citation_id, retrieval_event_id, answer_id, chunk_id, score \
+             FROM rag_answer_citations \
+             WHERE tenant_id = 'tenant-a' \
+             ORDER BY citation_index",
+        )
+        .await
+        .expect("query answer citations");
+    assert_eq!(
+        simple_rows(&citations),
+        vec![vec![
+            "cite-a-0".to_owned(),
+            "retr-a-0".to_owned(),
+            "answer-a".to_owned(),
+            "chunk-a-0".to_owned(),
+            "0.99".to_owned()
+        ]]
     );
 
     shutdown(client, server_handle).await;
