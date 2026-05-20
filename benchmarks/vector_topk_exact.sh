@@ -408,10 +408,14 @@ else
     exit "$clickhouse_status"
 fi
 
-echo "--- Rendering benchmark tables ---"
-target/release/results-render \
-    --raw-dir "$RAW_DIR" \
-    --output-md "$OUT_DIR/results.md" \
-    --output-json "$OUT_DIR/results.json"
+if [[ "${VECTOR_TOPK_RENDER_RESULTS:-1}" == "1" ]]; then
+    echo "--- Rendering benchmark tables ---"
+    target/release/results-render \
+        --raw-dir "$RAW_DIR" \
+        --output-md "$OUT_DIR/results.md" \
+        --output-json "$OUT_DIR/results.json"
+else
+    echo "--- Skipping benchmark table render (VECTOR_TOPK_RENDER_RESULTS=0) ---"
+fi
 
 echo "=== Done. Raw artifacts in $RAW_DIR ==="

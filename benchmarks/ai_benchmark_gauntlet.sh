@@ -130,6 +130,7 @@ run_exact_vector_scan() {
         VECTOR_TOPK_K="$top_k" \
         N_ITERS="$iters" \
         WARMUP="$warmup" \
+        VECTOR_TOPK_RENDER_RESULTS=0 \
         benchmarks/vector_topk_exact.sh
 }
 
