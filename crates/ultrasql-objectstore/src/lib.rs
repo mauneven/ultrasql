@@ -1,7 +1,7 @@
 //! Synchronous object-storage helpers for SQL file table functions.
 //!
 //! The public surface is intentionally small: parse object-store URIs,
-//! expand single-bucket wildcard patterns, and read object bytes. Query
+//! expand single-bucket wildcard patterns, and read full or ranged object bytes. Query
 //! planning uses the same helpers as execution so schema inference and row
 //! production agree on listing order and error messages.
 
@@ -26,6 +26,9 @@ pub enum ObjectStoreError {
     /// HTTP request failed.
     #[error("{0}")]
     Http(String),
+    /// Requested byte range cannot be represented.
+    #[error("{0}")]
+    InvalidRange(String),
     /// Object listing returned no matches.
     #[error("{0}")]
     NoMatches(String),
@@ -70,7 +73,27 @@ pub fn expand_object_store_specs(patterns: &[String]) -> Result<Vec<ObjectLocati
 /// Read object bytes from a concrete object location.
 pub fn read_object_bytes(location: &ObjectLocation) -> Result<Vec<u8>> {
     let request = object_request(&location.uri, Vec::new())?;
-    get_bytes(request)
+    get_bytes(request, ResponseExpectation::Success)
+}
+
+/// Read a byte range from a concrete object location.
+///
+/// `start` is zero-based and `len` is the requested byte count. Empty ranges
+/// return an empty buffer without issuing an HTTP request.
+pub fn read_object_range(location: &ObjectLocation, start: u64, len: u64) -> Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let end = start.checked_add(len - 1).ok_or_else(|| {
+        ObjectStoreError::InvalidRange(format!(
+            "object range overflows u64: start={start} len={len}"
+        ))
+    })?;
+    let mut request = object_request(&location.uri, Vec::new())?;
+    request
+        .headers
+        .push(("range", format!("bytes={start}-{end}")));
+    get_bytes(request, ResponseExpectation::PartialContent)
 }
 
 /// Expand `patterns`, read the first object, and return both location and bytes.
@@ -184,6 +207,13 @@ struct ObjectRequest {
     host: String,
     canonical_uri: String,
     canonical_query: String,
+    headers: Vec<(&'static str, String)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseExpectation {
+    Success,
+    PartialContent,
 }
 
 #[derive(Clone, Debug)]
@@ -208,9 +238,9 @@ fn expand_object_store_pattern(pattern: &str) -> Result<Vec<ObjectLocation>> {
     let mut matches = Vec::new();
     loop {
         let request = object_request(&uri.with_key(""), query.clone())?;
-        let body = String::from_utf8(get_bytes(request)?).map_err(|err| {
-            ObjectStoreError::Http(format!("object listing returned invalid UTF-8: {err}"))
-        })?;
+        let body = String::from_utf8(get_bytes(request, ResponseExpectation::Success)?).map_err(
+            |err| ObjectStoreError::Http(format!("object listing returned invalid UTF-8: {err}")),
+        )?;
         for key in parse_xml_tag_values(&body, "Key") {
             if wildcard_match(&uri.key, &key) {
                 matches.push(ObjectLocation {
@@ -287,25 +317,39 @@ fn object_request(uri: &ObjectUri, query: Vec<(String, String)>) -> Result<Objec
         host,
         canonical_uri,
         canonical_query: query,
+        headers: Vec::new(),
     })
 }
 
-fn get_bytes(request: ObjectRequest) -> Result<Vec<u8>> {
+fn get_bytes(request: ObjectRequest, expectation: ResponseExpectation) -> Result<Vec<u8>> {
     let mut builder = ureq::get(&request.url);
     if let Some(credentials) = credentials_for(request.scheme) {
         for (name, value) in signed_headers(&request, &credentials) {
             builder = builder.header(name, value);
+        }
+    } else {
+        for (name, value) in &request.headers {
+            builder = builder.header(*name, value.clone());
         }
     }
     let mut response = builder
         .call()
         .map_err(|err| ObjectStoreError::Http(format!("object GET {}: {err}", request.url)))?;
     let status = response.status();
-    if !status.is_success() {
-        return Err(ObjectStoreError::Http(format!(
-            "object GET {} returned {status}",
-            request.url
-        )));
+    match expectation {
+        ResponseExpectation::Success if !status.is_success() => {
+            return Err(ObjectStoreError::Http(format!(
+                "object GET {} returned {status}",
+                request.url
+            )));
+        }
+        ResponseExpectation::PartialContent if status.as_u16() != 206 => {
+            return Err(ObjectStoreError::Http(format!(
+                "object range GET {} returned {status}, expected 206 Partial Content",
+                request.url
+            )));
+        }
+        ResponseExpectation::Success | ResponseExpectation::PartialContent => {}
     }
     response
         .body_mut()
@@ -384,6 +428,7 @@ fn signed_headers(
         ("x-amz-content-sha256", payload_hash.to_owned()),
         ("x-amz-date", amz_date.clone()),
     ];
+    canonical_headers.extend(request.headers.iter().cloned());
     if let Some(token) = &credentials.session_token {
         canonical_headers.push(("x-amz-security-token", token.clone()));
     }
@@ -430,12 +475,13 @@ fn signed_headers(
         credentials.access_key, scope, signed_header_names, signature
     );
 
-    let mut headers = vec![
+    let mut headers = request.headers.clone();
+    headers.extend([
         ("host", request.host.clone()),
         ("x-amz-content-sha256", payload_hash.to_owned()),
         ("x-amz-date", amz_date),
         ("authorization", authorization),
-    ];
+    ]);
     if let Some(token) = &credentials.session_token {
         headers.push(("x-amz-security-token", token.clone()));
     }
@@ -581,6 +627,10 @@ fn xml_decode(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
 
     #[test]
     fn wildcard_match_supports_file_patterns() {
@@ -602,5 +652,76 @@ mod tests {
         let xml =
             "<ListBucketResult><Contents><Key>a&amp;b.csv</Key></Contents></ListBucketResult>";
         assert_eq!(parse_xml_tag_values(xml, "Key"), vec!["a&b.csv"]);
+    }
+
+    #[test]
+    fn read_object_range_requests_byte_slice() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx
+                .send(String::from_utf8(request).expect("request utf8"))
+                .expect("send request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 6\r\nContent-Range: bytes 4-9/16\r\n\r\n456789",
+                )
+                .expect("write response");
+        });
+
+        let _guard = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", endpoint);
+        let objects = expand_object_store_specs(&["s3://bucket/path/file.parquet".to_owned()])
+            .expect("expand object");
+        let bytes = read_object_range(&objects[0], 4, 6).expect("read range");
+
+        assert_eq!(bytes, b"456789");
+        let request = request_rx.recv().expect("request text");
+        assert!(request.starts_with("GET /bucket/path/file.parquet HTTP/1.1"));
+        assert!(request.contains("\r\nrange: bytes=4-9\r\n"));
+        handle.join().expect("mock server done");
+    }
+
+    struct EnvVarGuard {
+        name: &'static str,
+        old: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: String) -> Self {
+            let old = env::var(name).ok();
+            // SAFETY: this test mutates a single process environment key before
+            // starting the client request and restores it before returning.
+            unsafe {
+                env::set_var(name, value);
+            }
+            Self { name, old }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: restores the environment key owned by this guard.
+            unsafe {
+                if let Some(value) = &self.old {
+                    env::set_var(self.name, value);
+                } else {
+                    env::remove_var(self.name);
+                }
+            }
+        }
     }
 }
