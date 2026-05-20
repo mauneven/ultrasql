@@ -75,10 +75,13 @@ async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
     client
         .batch_execute(
             "INSERT INTO rag_documents VALUES \
-             ('doc-a', 's3://bucket/a.md', 'Doc A', 'hash-a', '{\"tenant\":\"a\",\"kind\":\"guide\"}', \
+             ('tenant-a', 'doc-a', 's3://bucket/a.md', 'Doc A', 'hash-a', '{\"kind\":\"guide\"}', \
               TIMESTAMP '2026-05-19 10:00:00', TIMESTAMP '2026-05-20 10:00:00', \
               TIMESTAMP '2026-05-20 10:05:00', 2, true), \
-             ('doc-old', 's3://bucket/old.md', 'Old Doc', 'hash-old', '{\"tenant\":\"a\",\"kind\":\"old\"}', \
+             ('tenant-b', 'doc-b', 's3://bucket/b.md', 'Doc B', 'hash-b', '{\"kind\":\"guide\"}', \
+              TIMESTAMP '2026-05-19 10:00:00', TIMESTAMP '2026-05-20 10:30:00', \
+              TIMESTAMP '2026-05-20 10:35:00', 3, true), \
+             ('tenant-a', 'doc-old', 's3://bucket/old.md', 'Old Doc', 'hash-old', '{\"kind\":\"old\"}', \
               TIMESTAMP '2026-05-18 10:00:00', TIMESTAMP '2026-05-18 11:00:00', \
               TIMESTAMP '2026-05-18 11:05:00', 1, false)",
         )
@@ -87,10 +90,13 @@ async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
     client
         .batch_execute(
             "INSERT INTO rag_chunks VALUES \
-             ('chunk-a-0', 'doc-a', 0, 'vector search needs exact fallback', 0, 5, \
+             ('tenant-a', 'chunk-a-0', 'doc-a', 0, 'vector search needs exact fallback', 0, 5, \
               '{\"section\":\"intro\"}', TIMESTAMP '2026-05-20 10:00:01', \
               TIMESTAMP '2026-05-20 10:00:02', 2, true), \
-             ('chunk-old-0', 'doc-old', 0, 'stale content', 0, 2, \
+             ('tenant-b', 'chunk-b-0', 'doc-b', 0, 'other tenant content', 0, 3, \
+              '{\"section\":\"intro\"}', TIMESTAMP '2026-05-20 10:30:01', \
+              TIMESTAMP '2026-05-20 10:30:02', 3, true), \
+             ('tenant-a', 'chunk-old-0', 'doc-old', 0, 'stale content', 0, 2, \
               '{\"section\":\"archive\"}', TIMESTAMP '2026-05-18 10:00:01', \
               TIMESTAMP '2026-05-18 10:00:02', 1, false)",
         )
@@ -99,9 +105,11 @@ async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
     client
         .batch_execute(
             "INSERT INTO rag_embeddings VALUES \
-             ('emb-a-0', 'chunk-a-0', VECTOR '[1,0,0]', 'test-model', 'v1', '{\"dims\":3}', \
+             ('tenant-a', 'emb-a-0', 'chunk-a-0', VECTOR '[1,0,0]', 'test-model', 'v1', '{\"dims\":3}', \
               TIMESTAMP '2026-05-20 10:01:00', 2, true), \
-             ('emb-old-0', 'chunk-old-0', VECTOR '[0,1,0]', 'test-model', 'v1', '{\"dims\":3}', \
+             ('tenant-b', 'emb-b-0', 'chunk-b-0', VECTOR '[1,0,0]', 'test-model', 'v1', '{\"dims\":3}', \
+              TIMESTAMP '2026-05-20 10:31:00', 3, true), \
+             ('tenant-a', 'emb-old-0', 'chunk-old-0', VECTOR '[0,1,0]', 'test-model', 'v1', '{\"dims\":3}', \
               TIMESTAMP '2026-05-18 10:01:00', 1, false)",
         )
         .await
@@ -111,7 +119,7 @@ async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
         .simple_query(
             "SELECT document_id, version \
              FROM rag_documents \
-             WHERE is_current = true AND metadata @> '{\"tenant\":\"a\"}'::jsonb \
+             WHERE tenant_id = 'tenant-a' AND is_current = true AND metadata @> '{\"kind\":\"guide\"}'::jsonb \
              ORDER BY updated_at DESC",
         )
         .await
@@ -125,7 +133,7 @@ async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
         .simple_query(
             "SELECT chunk_id, chunk_index, version \
              FROM rag_chunks \
-             WHERE document_id = 'doc-a' AND is_current = true \
+             WHERE tenant_id = 'tenant-a' AND document_id = 'doc-a' AND is_current = true \
              ORDER BY chunk_index",
         )
         .await
@@ -139,7 +147,7 @@ async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
         .simple_query(
             "SELECT chunk_id, version \
              FROM rag_embeddings \
-             WHERE is_current = true \
+             WHERE tenant_id = 'tenant-a' AND is_current = true \
              ORDER BY embedding <-> VECTOR '[1,0,0]' \
              LIMIT 1",
         )

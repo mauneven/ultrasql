@@ -11,6 +11,8 @@ use ultrasql_core::{DataType, Field, MAX_VECTOR_DIMS, Schema};
 
 /// Default table prefix for RAG primitive tables.
 pub const DEFAULT_RAG_PREFIX: &str = "rag";
+/// Session setting used by generated tenant row-policy SQL.
+pub const DEFAULT_RAG_TENANT_SETTING: &str = "ultrasql.tenant_id";
 
 /// Configuration for generating RAG primitive table schemas.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,6 +124,7 @@ pub fn create_rag_table_statements(
         format!(
             "\
 CREATE TABLE IF NOT EXISTS {documents} (\
+tenant_id TEXT NOT NULL CHECK (tenant_id <> ''), \
 document_id TEXT PRIMARY KEY, \
 source_uri TEXT NOT NULL, \
 title TEXT, \
@@ -138,6 +141,7 @@ is_current BOOL NOT NULL\
         format!(
             "\
 CREATE TABLE IF NOT EXISTS {chunks} (\
+tenant_id TEXT NOT NULL CHECK (tenant_id <> ''), \
 chunk_id TEXT PRIMARY KEY, \
 document_id TEXT NOT NULL REFERENCES {documents}(document_id), \
 chunk_index INTEGER NOT NULL, \
@@ -156,6 +160,7 @@ is_current BOOL NOT NULL\
         format!(
             "\
 CREATE TABLE IF NOT EXISTS {embeddings} (\
+tenant_id TEXT NOT NULL CHECK (tenant_id <> ''), \
 embedding_id TEXT PRIMARY KEY, \
 chunk_id TEXT NOT NULL REFERENCES {chunks}(chunk_id), \
 embedding VECTOR({dims}) NOT NULL, \
@@ -173,27 +178,27 @@ is_current BOOL NOT NULL\
     ])
 }
 
-/// Return plain SQL for inserting one chunk row.
+/// Return plain SQL for inserting one tenant-scoped chunk row.
 ///
 /// The statement is intentionally a visible `INSERT` over the canonical
 /// chunks table. Parameters map one-for-one to the public columns:
-/// `chunk_id`, `document_id`, `chunk_index`, `content`, `token_start`,
-/// `token_end`, `metadata`, `created_at`, `updated_at`, `version`,
-/// `is_current`.
+/// `tenant_id`, `chunk_id`, `document_id`, `chunk_index`, `content`,
+/// `token_start`, `token_end`, `metadata`, `created_at`, `updated_at`,
+/// `version`, `is_current`.
 pub fn insert_rag_chunk_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
     let names = config.table_names()?;
     Ok(format!(
         "\
 INSERT INTO {chunks} (\
-chunk_id, document_id, chunk_index, content, token_start, token_end, \
+tenant_id, chunk_id, document_id, chunk_index, content, token_start, token_end, \
 metadata, created_at, updated_at, version, is_current\
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-RETURNING chunk_id, document_id, chunk_index, version, is_current",
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+RETURNING tenant_id, chunk_id, document_id, chunk_index, version, is_current",
         chunks = names.chunks
     ))
 }
 
-/// Return plain SQL for exact current-embedding search.
+/// Return plain SQL for exact current-embedding search inside one tenant.
 ///
 /// The distance expression is selected and repeated in `ORDER BY` so callers
 /// can inspect the exact operator used for correctness checks.
@@ -201,18 +206,18 @@ pub fn search_rag_embeddings_sql(config: &RagSchemaConfig) -> Result<String, Rag
     let names = config.table_names()?;
     Ok(format!(
         "\
-SELECT embedding_id, chunk_id, version, embedding <-> $1 AS distance \
+SELECT tenant_id, embedding_id, chunk_id, version, embedding <-> $2 AS distance \
 FROM {embeddings} \
-WHERE is_current = true \
-ORDER BY embedding <-> $1 \
-LIMIT $2",
+WHERE tenant_id = $1 AND is_current = true \
+ORDER BY embedding <-> $2 \
+LIMIT $3",
         embeddings = names.embeddings
     ))
 }
 
-/// Return plain SQL for filtering current documents by JSONB metadata.
+/// Return plain SQL for filtering current documents by JSONB metadata in one tenant.
 ///
-/// The helper is a transparent `metadata @> $1` predicate over the documents
+/// The helper is a transparent `metadata @> $2` predicate over the documents
 /// table with recency ordering. It does not expand, rank, or rewrite results.
 pub fn filter_rag_documents_by_metadata_sql(
     config: &RagSchemaConfig,
@@ -220,17 +225,66 @@ pub fn filter_rag_documents_by_metadata_sql(
     let names = config.table_names()?;
     Ok(format!(
         "\
-SELECT document_id, source_uri, title, version, updated_at \
+SELECT tenant_id, document_id, source_uri, title, version, updated_at \
 FROM {documents} \
-WHERE is_current = true AND metadata @> $1 \
+WHERE tenant_id = $1 AND is_current = true AND metadata @> $2 \
 ORDER BY updated_at DESC \
-LIMIT $2",
+LIMIT $3",
         documents = names.documents
     ))
 }
 
+/// Return SQL statements for tenant row policies over the RAG tables.
+///
+/// UltraSQL does not execute `CREATE POLICY` yet. These statements document the
+/// intended PostgreSQL-compatible policy shape and can be applied once row-level
+/// security lands. Until then, use tenant-scoped helper SQL and application
+/// checks.
+pub fn create_rag_tenant_policy_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
+    Ok(create_rag_tenant_policy_statements(config)?.join(";\n") + ";")
+}
+
+/// Return individual tenant row-policy statements for RAG primitive tables.
+pub fn create_rag_tenant_policy_statements(
+    config: &RagSchemaConfig,
+) -> Result<Vec<String>, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(vec![
+        tenant_policy_statements_for(&names.documents),
+        tenant_policy_statements_for(&names.chunks),
+        tenant_policy_statements_for(&names.embeddings),
+    ]
+    .into_iter()
+    .flatten()
+    .collect())
+}
+
+/// Validate the recommended tenant id pattern for AI workload rows.
+///
+/// Tenant ids are data, not SQL identifiers, and callers must bind them as
+/// parameters. This validator keeps logs, metadata, and generated examples
+/// predictable by accepting only compact ASCII tenant keys.
+pub fn validate_rag_tenant_id(tenant_id: &str) -> Result<(), RagSchemaError> {
+    if tenant_id.is_empty() {
+        return Err(RagSchemaError::new("tenant_id must not be empty"));
+    }
+    if tenant_id.len() > 128 {
+        return Err(RagSchemaError::new("tenant_id must be at most 128 bytes"));
+    }
+    if !tenant_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | ':'))
+    {
+        return Err(RagSchemaError::new(
+            "tenant_id must contain only ascii letters, digits, _, -, ., or :",
+        ));
+    }
+    Ok(())
+}
+
 fn documents_schema() -> Result<Schema, RagSchemaError> {
     Schema::new([
+        Field::required("tenant_id", DataType::Text { max_len: None }),
         Field::required("document_id", DataType::Text { max_len: None }),
         Field::required("source_uri", DataType::Text { max_len: None }),
         Field::nullable("title", DataType::Text { max_len: None }),
@@ -247,6 +301,7 @@ fn documents_schema() -> Result<Schema, RagSchemaError> {
 
 fn chunks_schema() -> Result<Schema, RagSchemaError> {
     Schema::new([
+        Field::required("tenant_id", DataType::Text { max_len: None }),
         Field::required("chunk_id", DataType::Text { max_len: None }),
         Field::required("document_id", DataType::Text { max_len: None }),
         Field::required("chunk_index", DataType::Int32),
@@ -264,6 +319,7 @@ fn chunks_schema() -> Result<Schema, RagSchemaError> {
 
 fn embeddings_schema(embedding_dims: u32) -> Result<Schema, RagSchemaError> {
     Schema::new([
+        Field::required("tenant_id", DataType::Text { max_len: None }),
         Field::required("embedding_id", DataType::Text { max_len: None }),
         Field::required("chunk_id", DataType::Text { max_len: None }),
         Field::required(
@@ -280,6 +336,18 @@ fn embeddings_schema(embedding_dims: u32) -> Result<Schema, RagSchemaError> {
         Field::required("is_current", DataType::Bool),
     ])
     .map_err(|err| RagSchemaError::new(format!("rag embeddings schema: {err}")))
+}
+
+fn tenant_policy_statements_for(table: &str) -> Vec<String> {
+    vec![
+        format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"),
+        format!(
+            "\
+CREATE POLICY {table}_tenant_isolation ON {table} \
+USING (tenant_id = current_setting('{DEFAULT_RAG_TENANT_SETTING}', true)) \
+WITH CHECK (tenant_id = current_setting('{DEFAULT_RAG_TENANT_SETTING}', true))"
+        ),
+    ]
 }
 
 fn validate_dims(dims: u32) -> Result<(), RagSchemaError> {

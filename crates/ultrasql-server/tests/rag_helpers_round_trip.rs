@@ -85,7 +85,10 @@ async fn rag_helpers_execute_as_plain_sql() {
     client
         .batch_execute(
             "INSERT INTO rag_documents VALUES \
-             ('doc-a', 's3://bucket/a.md', 'Doc A', 'hash-a', '{\"tenant\":\"a\",\"kind\":\"guide\"}', \
+             ('tenant-a', 'doc-a', 's3://bucket/a.md', 'Doc A', 'hash-a', '{\"kind\":\"guide\"}', \
+              TIMESTAMP '2026-05-19 10:00:00', TIMESTAMP '2026-05-20 10:00:00', \
+              TIMESTAMP '2026-05-20 10:05:00', 2, true), \
+             ('tenant-b', 'doc-b', 's3://bucket/b.md', 'Doc B', 'hash-b', '{\"kind\":\"guide\"}', \
               TIMESTAMP '2026-05-19 10:00:00', TIMESTAMP '2026-05-20 10:00:00', \
               TIMESTAMP '2026-05-20 10:05:00', 2, true)",
         )
@@ -95,17 +98,18 @@ async fn rag_helpers_execute_as_plain_sql() {
     let chunk_sql = bind_sql(
         &insert_rag_chunk_sql(&config).expect("build chunk helper"),
         &[
-            ("$1", "'chunk-a-0'"),
-            ("$2", "'doc-a'"),
-            ("$3", "0"),
-            ("$4", "'normal SQL stays inspectable'"),
-            ("$5", "0"),
-            ("$6", "4"),
-            ("$7", "'{\"section\":\"body\"}'::jsonb"),
-            ("$8", "TIMESTAMP '2026-05-20 10:00:01'"),
-            ("$9", "TIMESTAMP '2026-05-20 10:00:02'"),
-            ("$10", "7"),
-            ("$11", "true"),
+            ("$1", "'tenant-a'"),
+            ("$2", "'chunk-a-0'"),
+            ("$3", "'doc-a'"),
+            ("$4", "0"),
+            ("$5", "'normal SQL stays inspectable'"),
+            ("$6", "0"),
+            ("$7", "4"),
+            ("$8", "'{\"section\":\"body\"}'::jsonb"),
+            ("$9", "TIMESTAMP '2026-05-20 10:00:01'"),
+            ("$10", "TIMESTAMP '2026-05-20 10:00:02'"),
+            ("$11", "7"),
+            ("$12", "true"),
         ],
     );
     let inserted = client
@@ -115,6 +119,7 @@ async fn rag_helpers_execute_as_plain_sql() {
     assert_eq!(
         simple_rows(&inserted),
         vec![vec![
+            "tenant-a".to_owned(),
             "chunk-a-0".to_owned(),
             "doc-a".to_owned(),
             "0".to_owned(),
@@ -125,16 +130,32 @@ async fn rag_helpers_execute_as_plain_sql() {
 
     client
         .batch_execute(
+            "INSERT INTO rag_chunks VALUES \
+             ('tenant-b', 'chunk-b-0', 'doc-b', 0, 'other tenant content', 0, 3, \
+              '{\"section\":\"body\"}', TIMESTAMP '2026-05-20 10:00:01', \
+              TIMESTAMP '2026-05-20 10:00:02', 9, true)",
+        )
+        .await
+        .expect("insert other tenant chunk");
+
+    client
+        .batch_execute(
             "INSERT INTO rag_embeddings VALUES \
-             ('emb-a-0', 'chunk-a-0', VECTOR '[1,0,0]', 'test-model', 'v1', '{\"dims\":3}', \
-              TIMESTAMP '2026-05-20 10:01:00', 7, true)",
+             ('tenant-a', 'emb-a-0', 'chunk-a-0', VECTOR '[1,0,0]', 'test-model', 'v1', '{\"dims\":3}', \
+              TIMESTAMP '2026-05-20 10:01:00', 7, true), \
+             ('tenant-b', 'emb-b-0', 'chunk-b-0', VECTOR '[1,0,0]', 'test-model', 'v1', '{\"dims\":3}', \
+              TIMESTAMP '2026-05-20 10:01:00', 9, true)",
         )
         .await
         .expect("insert embedding");
 
     let filtered_sql = bind_sql(
         &filter_rag_documents_by_metadata_sql(&config).expect("build metadata helper"),
-        &[("$1", "'{\"tenant\":\"a\"}'::jsonb"), ("$2", "10")],
+        &[
+            ("$1", "'tenant-a'"),
+            ("$2", "'{\"kind\":\"guide\"}'::jsonb"),
+            ("$3", "10"),
+        ],
     );
     let filtered = client
         .simple_query(&filtered_sql)
@@ -143,6 +164,7 @@ async fn rag_helpers_execute_as_plain_sql() {
     assert_eq!(
         simple_rows(&filtered),
         vec![vec![
+            "tenant-a".to_owned(),
             "doc-a".to_owned(),
             "s3://bucket/a.md".to_owned(),
             "Doc A".to_owned(),
@@ -153,7 +175,11 @@ async fn rag_helpers_execute_as_plain_sql() {
 
     let search_sql = bind_sql(
         &search_rag_embeddings_sql(&config).expect("build search helper"),
-        &[("$1", "VECTOR '[1,0,0]'"), ("$2", "5")],
+        &[
+            ("$1", "'tenant-a'"),
+            ("$2", "VECTOR '[1,0,0]'"),
+            ("$3", "5"),
+        ],
     );
     let nearest = client
         .simple_query(&search_sql)
@@ -162,6 +188,7 @@ async fn rag_helpers_execute_as_plain_sql() {
     assert_eq!(
         simple_rows(&nearest),
         vec![vec![
+            "tenant-a".to_owned(),
             "emb-a-0".to_owned(),
             "chunk-a-0".to_owned(),
             "7".to_owned(),
