@@ -1,0 +1,23 @@
+{
+  "engine": "ultrasql",
+  "workload": "tpcb_32conn",
+  "scale": 1,
+  "accounts": 1000,
+  "branches": 1,
+  "tellers": 10,
+  "connections": 8,
+  "warmup_secs": 1,
+  "duration_secs": 5,
+  "transactions": 4952,
+  "throughput_per_sec": 986.2021074543571,
+  "p50_latency_us": 5359.792,
+  "p99_latency_us": 39884.458,
+  "correctness": {
+    "passed": true,
+    "history_row_count": 5859,
+    "history_delta_sum": -4303,
+    "accounts_balance_sum": -4303,
+    "tellers_balance_sum": -4303,
+    "branches_balance_sum": -4303
+  }
+}

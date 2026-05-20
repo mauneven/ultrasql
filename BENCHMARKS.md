@@ -247,17 +247,24 @@ an absent artifact.
 TPC-B v0.9 certification is recorded by:
 
 ```text
-POSTGRES_TPCB_RESULT=benchmarks/results/latest/raw/tpcb_32conn-postgres17.json \
-ULTRASQL_TPCB_RESULT=benchmarks/results/latest/raw/tpcb_32conn-ultrasql.json \
+POSTGRES_DSN="host=localhost user=postgres dbname=tpcb_pg" \
 benchmarks/tpcb_certify.sh
 ```
 
 The script always writes
 `benchmarks/results/latest/tpcb_certification.json`. It passes only when both
-same-host 32-client PostgreSQL-wire result artifacts exist, UltraSQL
-throughput is at least 2× PostgreSQL 17, and UltraSQL p99 latency is below
-5 ms. Without those artifacts it records `passed: false`; the local kernel
-smoke is diagnostic only.
+same-host 32-client PostgreSQL-wire result artifacts exist, both engines pass
+the TPC-B balance-sum correctness check, UltraSQL throughput is at least 2×
+PostgreSQL 17, and UltraSQL p99 latency is below 5 ms. If `ULTRASQL_DSN` is
+not set, the script starts an in-process UltraSQL server and measures it over
+`tokio-postgres`; PostgreSQL requires `POSTGRES_DSN`. `TPCB_SCALE`,
+`TPCB_DURATION`, `TPCB_WARMUP`, `TPCB_CONNECTIONS`, and `TPCB_ACCOUNTS`
+control local smoke versus publishable runs.
+
+Current local smoke artifact (`TPCB_CONNECTIONS=8`, `TPCB_ACCOUNTS=1000`,
+`TPCB_DURATION=5`, `TPCB_WARMUP=1`) validates UltraSQL TPC-B balance
+invariants and writes an explicit failing certification summary because
+PostgreSQL 17 comparison is absent and p99 remains above the v0.9 target.
 
 ---
 
