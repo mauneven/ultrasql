@@ -92,6 +92,7 @@ mod agg_fuse;
 pub(crate) mod catalog_views;
 mod csv_scan;
 mod cte_helpers;
+mod external_scan;
 mod index_scan;
 mod join;
 mod lower_query;

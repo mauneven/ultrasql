@@ -1,18 +1,24 @@
 //! FROM clause and JOIN binding. Split out of `binder/mod.rs` to keep each
 //! file under the 600-line ceiling.
 
-use std::fs::File;
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
+use arrow_ipc::reader::FileReader as ArrowFileReader;
 use arrow_schema::DataType as ArrowDataType;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use ultrasql_core::{
     DataType, Field, Schema, Value,
     csv::{read_csv_data_from_text, read_csv_header_from_specs},
 };
 use ultrasql_iceberg::read_iceberg_schema;
-use ultrasql_objectstore::{is_object_store_uri, read_first_object_bytes};
+use ultrasql_objectstore::{
+    expand_object_store_specs, is_object_store_uri, read_first_object_bytes, read_object_bytes,
+};
 use ultrasql_parser::ast::{JoinCondition, JoinOp, TableRef};
 
 use super::{
@@ -219,11 +225,23 @@ fn bind_table_function(
         }
         "read_csv" => bind_read_csv_table_function(&bound_args, &qualifier)?,
         "read_parquet" => bind_read_parquet_table_function(&bound_args, &qualifier)?,
-        "iceberg_scan" => bind_iceberg_scan_table_function(&bound_args, &qualifier)?,
+        "read_json" => {
+            bind_json_table_function("read_json", JsonInputKind::Json, &bound_args, &qualifier)?
+        }
+        "read_ndjson" => bind_json_table_function(
+            "read_ndjson",
+            JsonInputKind::Ndjson,
+            &bound_args,
+            &qualifier,
+        )?,
+        "read_arrow" => bind_read_arrow_table_function(&bound_args, &qualifier)?,
+        "read_iceberg" | "iceberg_scan" => {
+            bind_iceberg_scan_table_function(&func_name, &bound_args, &qualifier)?
+        }
         "sniff_csv" => bind_sniff_csv_table_function(&bound_args, &qualifier)?,
         _ => {
             return Err(PlanError::NotSupported(
-                "table function (only generate_series, unnest, read_csv, read_parquet, iceberg_scan, and sniff_csv supported)",
+                "table function (only generate_series, unnest, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
             ));
         }
     };
@@ -280,23 +298,80 @@ fn bind_read_parquet_table_function(
     Ok((schema, from_scope))
 }
 
-fn bind_iceberg_scan_table_function(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonInputKind {
+    Json,
+    Ndjson,
+}
+
+fn bind_json_table_function(
+    function_name: &str,
+    kind: JsonInputKind,
+    bound_args: &[ScalarExpr],
+    qualifier: &str,
+) -> Result<(Schema, Vec<ScopeEntry>), PlanError> {
+    if bound_args.len() != 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "{function_name}: expected one path, glob, or path-list argument"
+        )));
+    }
+    let path_specs = read_file_path_specs(function_name, &bound_args[0])?;
+    let sources = read_external_sources(function_name, &path_specs)?;
+    let rows = read_json_rows(function_name, kind, &sources)?;
+    let fields = infer_json_fields(function_name, &rows)?;
+    let schema = Schema::new(fields.clone())
+        .map_err(|err| PlanError::TypeMismatch(format!("{function_name} schema: {err}")))?;
+    let from_scope = scope_entries(qualifier, fields);
+    Ok((schema, from_scope))
+}
+
+fn bind_read_arrow_table_function(
     bound_args: &[ScalarExpr],
     qualifier: &str,
 ) -> Result<(Schema, Vec<ScopeEntry>), PlanError> {
     if bound_args.len() != 1 {
         return Err(PlanError::NotSupported(
-            "iceberg_scan: expected one table root or metadata JSON path argument",
+            "read_arrow: expected one path, glob, or path-list argument",
         ));
     }
-    let path_specs = read_file_path_specs("iceberg_scan", &bound_args[0])?;
+    let path_specs = read_file_path_specs("read_arrow", &bound_args[0])?;
+    let arrow_schema = read_arrow_schema_from_path_specs(&path_specs)?;
+    let fields = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let data_type = arrow_type_to_sql("read_arrow", field.data_type())?;
+            Ok(if field.is_nullable() {
+                Field::nullable(field.name().clone(), data_type)
+            } else {
+                Field::required(field.name().clone(), data_type)
+            })
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    let schema = Schema::new(fields.clone())
+        .map_err(|err| PlanError::TypeMismatch(format!("read_arrow schema: {err}")))?;
+    let from_scope = scope_entries(qualifier, fields);
+    Ok((schema, from_scope))
+}
+
+fn bind_iceberg_scan_table_function(
+    function_name: &str,
+    bound_args: &[ScalarExpr],
+    qualifier: &str,
+) -> Result<(Schema, Vec<ScopeEntry>), PlanError> {
+    if bound_args.len() != 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "{function_name}: expected one table root or metadata JSON path argument"
+        )));
+    }
+    let path_specs = read_file_path_specs(function_name, &bound_args[0])?;
     let [path] = path_specs.as_slice() else {
-        return Err(PlanError::NotSupported(
-            "iceberg_scan: expected one table root or metadata JSON path argument",
-        ));
+        return Err(PlanError::TypeMismatch(format!(
+            "{function_name}: expected one table root or metadata JSON path argument"
+        )));
     };
     let schema = read_iceberg_schema(path)
-        .map_err(|err| PlanError::TypeMismatch(format!("iceberg_scan: {err}")))?;
+        .map_err(|err| PlanError::TypeMismatch(format!("{function_name}: {err}")))?;
     let from_scope = schema
         .fields()
         .iter()
@@ -309,6 +384,18 @@ fn bind_iceberg_scan_table_function(
         })
         .collect();
     Ok((schema, from_scope))
+}
+
+fn scope_entries(qualifier: &str, fields: Vec<Field>) -> Vec<ScopeEntry> {
+    fields
+        .into_iter()
+        .enumerate()
+        .map(|(field_index, field)| ScopeEntry {
+            qualifier: qualifier.to_owned(),
+            field_index,
+            field,
+        })
+        .collect()
 }
 
 fn read_parquet_arrow_schema(path: &Path) -> Result<arrow_schema::SchemaRef, PlanError> {
@@ -341,6 +428,13 @@ fn read_parquet_object_schema(patterns: &[String]) -> Result<arrow_schema::Schem
 }
 
 fn parquet_arrow_type_to_sql(data_type: &ArrowDataType) -> Result<DataType, PlanError> {
+    arrow_type_to_sql("read_parquet", data_type)
+}
+
+fn arrow_type_to_sql(
+    function_name: &str,
+    data_type: &ArrowDataType,
+) -> Result<DataType, PlanError> {
     match data_type {
         ArrowDataType::Boolean => Ok(DataType::Bool),
         ArrowDataType::Int32 => Ok(DataType::Int32),
@@ -349,7 +443,7 @@ fn parquet_arrow_type_to_sql(data_type: &ArrowDataType) -> Result<DataType, Plan
         ArrowDataType::Float64 => Ok(DataType::Float64),
         ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Ok(DataType::Text { max_len: None }),
         other => Err(PlanError::TypeMismatch(format!(
-            "read_parquet unsupported Arrow type: {other}"
+            "{function_name} unsupported Arrow type: {other}"
         ))),
     }
 }
@@ -418,6 +512,267 @@ fn read_file_path_specs(function_name: &str, arg: &ScalarExpr) -> Result<Vec<Str
             "{function_name}: argument must be a string literal or text array literal"
         ))),
     }
+}
+
+#[derive(Clone, Debug)]
+struct ExternalBytes {
+    display: String,
+    bytes: Vec<u8>,
+}
+
+fn read_external_sources(
+    function_name: &str,
+    path_specs: &[String],
+) -> Result<Vec<ExternalBytes>, PlanError> {
+    if path_specs_use_object_store(function_name, path_specs)? {
+        let objects = expand_object_store_specs(path_specs)
+            .map_err(|err| PlanError::TypeMismatch(format!("{function_name}: {err}")))?;
+        return objects
+            .into_iter()
+            .map(|object| {
+                let display = object.display_uri();
+                let bytes = read_object_bytes(&object)
+                    .map_err(|err| PlanError::TypeMismatch(format!("{function_name}: {err}")))?;
+                Ok(ExternalBytes { display, bytes })
+            })
+            .collect();
+    }
+
+    expand_file_path_specs(function_name, path_specs)?
+        .into_iter()
+        .map(|path| {
+            let display = path.display().to_string();
+            let bytes = fs::read(&path).map_err(|err| {
+                PlanError::TypeMismatch(format!("{function_name} cannot read {display}: {err}"))
+            })?;
+            Ok(ExternalBytes { display, bytes })
+        })
+        .collect()
+}
+
+type JsonObject = JsonMap<String, JsonValue>;
+
+fn read_json_rows(
+    function_name: &str,
+    kind: JsonInputKind,
+    sources: &[ExternalBytes],
+) -> Result<Vec<JsonObject>, PlanError> {
+    let mut rows = Vec::new();
+    for source in sources {
+        let text = String::from_utf8(source.bytes.clone()).map_err(|err| {
+            PlanError::TypeMismatch(format!(
+                "{function_name} cannot decode {} as UTF-8: {err}",
+                source.display
+            ))
+        })?;
+        match kind {
+            JsonInputKind::Json => {
+                rows.extend(parse_json_document(function_name, &source.display, &text)?);
+            }
+            JsonInputKind::Ndjson => {
+                rows.extend(parse_ndjson_document(
+                    function_name,
+                    &source.display,
+                    &text,
+                )?);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn parse_json_document(
+    function_name: &str,
+    display: &str,
+    text: &str,
+) -> Result<Vec<JsonObject>, PlanError> {
+    let value = serde_json::from_str::<JsonValue>(text).map_err(|err| {
+        PlanError::TypeMismatch(format!("{function_name} parse {display}: {err}"))
+    })?;
+    match value {
+        JsonValue::Array(values) => values
+            .into_iter()
+            .enumerate()
+            .map(|(idx, value)| json_value_to_object(function_name, display, idx + 1, value))
+            .collect(),
+        JsonValue::Object(object) => Ok(vec![object]),
+        _ => Err(PlanError::TypeMismatch(format!(
+            "{function_name} expected object or array of objects in {display}"
+        ))),
+    }
+}
+
+fn parse_ndjson_document(
+    function_name: &str,
+    display: &str,
+    text: &str,
+) -> Result<Vec<JsonObject>, PlanError> {
+    let mut rows = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<JsonValue>(line).map_err(|err| {
+            PlanError::TypeMismatch(format!(
+                "{function_name} parse {} line {}: {err}",
+                display,
+                idx + 1
+            ))
+        })?;
+        rows.push(json_value_to_object(
+            function_name,
+            display,
+            idx + 1,
+            value,
+        )?);
+    }
+    Ok(rows)
+}
+
+fn json_value_to_object(
+    function_name: &str,
+    display: &str,
+    row_number: usize,
+    value: JsonValue,
+) -> Result<JsonObject, PlanError> {
+    match value {
+        JsonValue::Object(object) => Ok(object),
+        _ => Err(PlanError::TypeMismatch(format!(
+            "{function_name} row {row_number} in {display} is not a JSON object"
+        ))),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonColumnKind {
+    Unknown,
+    Bool,
+    Int64,
+    Float64,
+    Text,
+}
+
+#[derive(Clone, Debug)]
+struct JsonFieldSpec {
+    name: String,
+    kind: JsonColumnKind,
+    nullable: bool,
+}
+
+fn infer_json_fields(function_name: &str, rows: &[JsonObject]) -> Result<Vec<Field>, PlanError> {
+    let mut columns: BTreeMap<String, JsonFieldSpec> = BTreeMap::new();
+    let mut present: BTreeMap<String, usize> = BTreeMap::new();
+    for row in rows {
+        for (name, value) in row {
+            if name.is_empty() {
+                return Err(PlanError::TypeMismatch(format!(
+                    "{function_name}: JSON object contains an empty column name"
+                )));
+            }
+            let kind = json_value_kind(value);
+            columns
+                .entry(name.clone())
+                .and_modify(|spec| {
+                    spec.kind = widen_json_kind(spec.kind, kind);
+                    spec.nullable |= value.is_null();
+                })
+                .or_insert_with(|| JsonFieldSpec {
+                    name: name.clone(),
+                    kind,
+                    nullable: value.is_null(),
+                });
+            *present.entry(name.clone()).or_insert(0) += 1;
+        }
+    }
+    for spec in columns.values_mut() {
+        if present.get(&spec.name).copied().unwrap_or(0) < rows.len() {
+            spec.nullable = true;
+        }
+    }
+    Ok(columns
+        .into_values()
+        .map(|spec| {
+            let data_type = match spec.kind {
+                JsonColumnKind::Unknown => DataType::Text { max_len: None },
+                JsonColumnKind::Bool => DataType::Bool,
+                JsonColumnKind::Int64 => DataType::Int64,
+                JsonColumnKind::Float64 => DataType::Float64,
+                JsonColumnKind::Text => DataType::Text { max_len: None },
+            };
+            if spec.nullable {
+                Field::nullable(spec.name, data_type)
+            } else {
+                Field::required(spec.name, data_type)
+            }
+        })
+        .collect())
+}
+
+fn json_value_kind(value: &JsonValue) -> JsonColumnKind {
+    match value {
+        JsonValue::Null => JsonColumnKind::Unknown,
+        JsonValue::Bool(_) => JsonColumnKind::Bool,
+        JsonValue::Number(number) => {
+            if number.as_i64().is_some()
+                || number
+                    .as_u64()
+                    .is_some_and(|value| i64::try_from(value).is_ok())
+            {
+                JsonColumnKind::Int64
+            } else if number.as_f64().is_some() {
+                JsonColumnKind::Float64
+            } else {
+                JsonColumnKind::Text
+            }
+        }
+        JsonValue::String(_) | JsonValue::Array(_) | JsonValue::Object(_) => JsonColumnKind::Text,
+    }
+}
+
+fn widen_json_kind(left: JsonColumnKind, right: JsonColumnKind) -> JsonColumnKind {
+    match (left, right) {
+        (JsonColumnKind::Unknown, kind) | (kind, JsonColumnKind::Unknown) => kind,
+        (JsonColumnKind::Text, _) | (_, JsonColumnKind::Text) => JsonColumnKind::Text,
+        (JsonColumnKind::Float64, _) | (_, JsonColumnKind::Float64) => JsonColumnKind::Float64,
+        (JsonColumnKind::Int64, JsonColumnKind::Int64) => JsonColumnKind::Int64,
+        (JsonColumnKind::Bool, JsonColumnKind::Bool) => JsonColumnKind::Bool,
+        _ => JsonColumnKind::Text,
+    }
+}
+
+fn read_arrow_schema_from_path_specs(
+    path_specs: &[String],
+) -> Result<arrow_schema::SchemaRef, PlanError> {
+    if path_specs_use_object_store("read_arrow", path_specs)? {
+        let (location, bytes) = read_first_object_bytes(path_specs)
+            .map_err(|err| PlanError::TypeMismatch(format!("read_arrow: {err}")))?;
+        let reader = ArrowFileReader::try_new(Cursor::new(bytes), None).map_err(|err| {
+            PlanError::TypeMismatch(format!(
+                "read_arrow cannot inspect {}: {err}",
+                location.display_uri()
+            ))
+        })?;
+        return Ok(reader.schema());
+    }
+
+    let first_path = expand_file_path_specs("read_arrow", path_specs)?
+        .into_iter()
+        .next()
+        .expect("path expansion returns at least one file");
+    let file = File::open(&first_path).map_err(|err| {
+        PlanError::TypeMismatch(format!(
+            "read_arrow cannot open {}: {err}",
+            first_path.display()
+        ))
+    })?;
+    let reader = ArrowFileReader::try_new(file, None).map_err(|err| {
+        PlanError::TypeMismatch(format!(
+            "read_arrow cannot inspect {}: {err}",
+            first_path.display()
+        ))
+    })?;
+    Ok(reader.schema())
 }
 
 fn read_csv_header_from_path_specs(path_specs: &[String]) -> Result<Vec<String>, PlanError> {

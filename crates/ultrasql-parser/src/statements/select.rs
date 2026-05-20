@@ -448,7 +448,7 @@ impl Parser<'_> {
             });
         };
         let function = file_table_function_name(value).ok_or(ParseError::Unsupported {
-            what: "file table literal without .csv or .parquet extension",
+            what: "file table literal without supported external file extension",
             offset: span.start as usize,
         })?;
         let alias = if self.match_kw(TokenKind::KwAs)
@@ -923,6 +923,12 @@ fn file_table_function_name(path: &str) -> Option<&'static str> {
     let lower = path.to_ascii_lowercase();
     if lower.contains(".parquet") {
         Some("read_parquet")
+    } else if lower.contains(".ndjson") {
+        Some("read_ndjson")
+    } else if lower.contains(".json") {
+        Some("read_json")
+    } else if lower.contains(".arrow") || lower.contains(".ipc") || lower.contains(".feather") {
+        Some("read_arrow")
     } else if lower.contains(".csv") {
         Some("read_csv")
     } else {
@@ -1271,6 +1277,39 @@ mod tests {
         assert_eq!(name.value, "read_parquet");
         assert_eq!(args.len(), 1);
         assert_eq!(alias.as_ref().expect("alias").value, "f");
+    }
+
+    #[test]
+    fn select_json_file_literal_in_from_lowers_to_read_json_function() {
+        let stmt = parse("SELECT * FROM 'facts/*.json'");
+        let Statement::Select(s) = stmt else { panic!() };
+        let TableRef::Function { name, args, .. } = &s.from[0] else {
+            panic!("expected file literal to parse as table function");
+        };
+        assert_eq!(name.value, "read_json");
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn select_ndjson_file_literal_in_from_lowers_to_read_ndjson_function() {
+        let stmt = parse("SELECT * FROM 'facts/*.ndjson'");
+        let Statement::Select(s) = stmt else { panic!() };
+        let TableRef::Function { name, args, .. } = &s.from[0] else {
+            panic!("expected file literal to parse as table function");
+        };
+        assert_eq!(name.value, "read_ndjson");
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn select_arrow_file_literal_in_from_lowers_to_read_arrow_function() {
+        let stmt = parse("SELECT * FROM 'facts/*.arrow'");
+        let Statement::Select(s) = stmt else { panic!() };
+        let TableRef::Function { name, args, .. } = &s.from[0] else {
+            panic!("expected file literal to parse as table function");
+        };
+        assert_eq!(name.value, "read_arrow");
+        assert_eq!(args.len(), 1);
     }
 
     // -------- GROUP BY / HAVING ------------------------------------------- //

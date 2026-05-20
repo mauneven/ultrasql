@@ -3401,10 +3401,12 @@ dependencies = [
 name = "ultrasql-planner"
 version = "0.0.1"
 dependencies = [
+ "arrow-ipc",
  "arrow-schema",
  "bytes",
  "parquet",
  "proptest",
+ "serde_json",
  "smallvec",
  "thiserror",
  "tracing",
@@ -3435,6 +3437,7 @@ dependencies = [
  "anyhow",
  "apache-avro",
  "arrow-array",
+ "arrow-ipc",
  "arrow-schema",
  "base64 0.22.1",
  "bytes",

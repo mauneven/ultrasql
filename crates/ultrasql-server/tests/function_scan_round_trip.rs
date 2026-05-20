@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use apache_avro::{Codec, Schema as AvroSchema, Writer, types::Value as AvroValue};
 use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_ipc::writer::FileWriter as ArrowFileWriter;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use parquet::arrow::ArrowWriter;
 use tokio_postgres::NoTls;
@@ -236,6 +237,21 @@ fn people_batch(schema: Arc<ArrowSchema>, rows: &[(i64, &str, i64)]) -> RecordBa
         ],
     )
     .expect("record batch")
+}
+
+fn write_people_arrow(path: &std::path::Path, rows: &[(i64, &str, i64)]) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, false),
+        ArrowField::new("name", ArrowDataType::Utf8, false),
+        ArrowField::new("score", ArrowDataType::Int64, false),
+    ]));
+    let file = fs::File::create(path).expect("create arrow ipc");
+    let mut writer =
+        ArrowFileWriter::try_new(file, schema.as_ref()).expect("create arrow ipc writer");
+    writer
+        .write(&people_batch(Arc::clone(&schema), rows))
+        .expect("write arrow ipc batch");
+    writer.finish().expect("finish arrow ipc file");
 }
 
 fn write_people_iceberg_table(table_dir: &std::path::Path) {
@@ -946,6 +962,109 @@ async fn read_parquet_rejects_mixed_local_and_object_paths() {
 }
 
 #[tokio::test]
+async fn read_json_single_file_infers_columns_and_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let json_path = dir.path().join("people.json");
+    fs::write(
+        &json_path,
+        r#"[
+            {"id": 2, "name": "Grace", "active": false, "score": 20.5, "rank": null},
+            {"id": 1, "name": "Ada", "active": true, "score": 10.0, "rank": 1}
+        ]"#,
+    )
+    .expect("write json");
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT id, name, active, rank FROM read_json({}) ORDER BY id",
+        sql_string(json_path.to_str().expect("utf8 json path")),
+    );
+
+    let rows = client.query(&sql, &[]).await.expect("read_json file");
+    let values: Vec<(i64, String, bool, Option<i64>)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, i64>(0),
+                row.get::<_, String>(1),
+                row.get::<_, bool>(2),
+                row.get::<_, Option<i64>>(3),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (1, "Ada".to_string(), true, Some(1)),
+            (2, "Grace".to_string(), false, None),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn read_ndjson_single_file_reads_line_delimited_objects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ndjson_path = dir.path().join("people.ndjson");
+    fs::write(
+        &ndjson_path,
+        "{\"id\":2,\"name\":\"Grace\",\"score\":20}\n{\"id\":1,\"name\":\"Ada\",\"score\":10}\n",
+    )
+    .expect("write ndjson");
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT id, name FROM read_ndjson({}) ORDER BY id",
+        sql_string(ndjson_path.to_str().expect("utf8 ndjson path")),
+    );
+
+    let rows = client.query(&sql, &[]).await.expect("read_ndjson file");
+    let values: Vec<(i64, String)> = rows
+        .iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
+        .collect();
+    assert_eq!(
+        values,
+        vec![(1, "Ada".to_string()), (2, "Grace".to_string())]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn read_arrow_single_file_uses_arrow_record_batches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let arrow_path = dir.path().join("people.arrow");
+    write_people_arrow(
+        &arrow_path,
+        &[(2, "Grace", 20), (1, "Ada", 10), (3, "Linus", 30)],
+    );
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT id, name FROM read_arrow({}) ORDER BY score",
+        sql_string(arrow_path.to_str().expect("utf8 arrow path")),
+    );
+
+    let rows = client.query(&sql, &[]).await.expect("read_arrow file");
+    let values: Vec<(i64, String)> = rows
+        .iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (1, "Ada".to_string()),
+            (2, "Grace".to_string()),
+            (3, "Linus".to_string()),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn iceberg_scan_reads_current_snapshot_parquet_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     let table_dir = dir.path().join("warehouse").join("people");
@@ -958,6 +1077,31 @@ async fn iceberg_scan_reads_current_snapshot_parquet_files() {
     );
 
     let rows = client.query(&sql, &[]).await.expect("iceberg_scan table");
+    let values: Vec<(i64, String)> = rows
+        .iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
+        .collect();
+    assert_eq!(
+        values,
+        vec![(2, "Grace".to_string()), (3, "Linus".to_string())]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn read_iceberg_alias_reads_current_snapshot_parquet_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let table_dir = dir.path().join("warehouse").join("people_alias");
+    write_people_iceberg_table(&table_dir);
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT id, name FROM read_iceberg({}) WHERE score >= 20 ORDER BY id",
+        sql_string(table_dir.to_str().expect("iceberg table utf8")),
+    );
+
+    let rows = client.query(&sql, &[]).await.expect("read_iceberg table");
     let values: Vec<(i64, String)> = rows
         .iter()
         .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))

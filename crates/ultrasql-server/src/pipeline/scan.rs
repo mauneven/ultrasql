@@ -3,20 +3,23 @@
 use std::sync::Arc;
 
 use ultrasql_catalog::TableEntry;
-use ultrasql_core::{DataType, RelationId, Value};
+use ultrasql_core::{RelationId, Value};
 use ultrasql_executor::{
     CteScan, Eval, MemTableScan, Operator, ParallelSeqScan, Project, RowCodec, SeqScan,
     choose_parallel_seq_scan_workers,
 };
-use ultrasql_iceberg::plan_iceberg_scan;
 use ultrasql_planner::{LogicalPlan, ScalarExpr};
 
 use crate::error::ServerError;
 
 use super::LowerCtx;
 use super::catalog_views::try_virtual_catalog_scan;
-use super::csv_scan::{CsvSniffScan, CsvTableScan};
-use super::parquet_scan::{ParquetPredicate, ParquetTableScan};
+use super::csv_scan::CsvSniffScan;
+use super::external_scan::{
+    is_external_table_function, lower_external_parquet_scan, lower_external_table_scan,
+    read_external_path_specs,
+};
+use super::parquet_scan::ParquetPredicate;
 
 pub(super) fn lower_catalog_or_sample_scan(
     table: &str,
@@ -159,48 +162,8 @@ pub(super) fn lower_function_scan(
         };
         return Ok(Box::new(CsvSniffScan::from_path(&path)?));
     }
-    if name == "read_csv" {
-        if args.len() != 1 {
-            return Err(ServerError::Unsupported(
-                "read_csv: expected one path, glob, or path-list argument",
-            ));
-        }
-        let value = Eval::new(args[0].clone())
-            .eval(&[])
-            .map_err(|e| ServerError::Ddl(format!("read_csv argument evaluation failed: {e}")))?;
-        let path_specs = read_csv_path_specs(&value)?;
-        return Ok(Box::new(CsvTableScan::from_path_specs(&path_specs)?));
-    }
-    if name == "read_parquet" {
-        if args.len() != 1 {
-            return Err(ServerError::Unsupported(
-                "read_parquet: expected one path, glob, or path-list argument",
-            ));
-        }
-        let path_specs = read_parquet_path_specs(args)?;
-        return Ok(Box::new(ParquetTableScan::from_path_specs(
-            &path_specs,
-            None,
-            None,
-        )?));
-    }
-    if name == "iceberg_scan" {
-        if args.len() != 1 {
-            return Err(ServerError::Unsupported(
-                "iceberg_scan: expected one table root or metadata JSON path argument",
-            ));
-        }
-        let path = read_iceberg_path_arg(args)?;
-        let plan = plan_iceberg_scan(&path)
-            .map_err(|err| ServerError::CopyFormat(format!("iceberg_scan: {err}")))?;
-        if plan.data_files.is_empty() {
-            return Ok(Box::new(MemTableScan::new(plan.schema, vec![])));
-        }
-        return Ok(Box::new(ParquetTableScan::from_path_specs(
-            &plan.data_files,
-            None,
-            None,
-        )?));
+    if is_external_table_function(name) {
+        return lower_external_table_scan(name, args);
     }
     if name == "unnest" {
         if args.len() != 1 {
@@ -225,7 +188,7 @@ pub(super) fn lower_function_scan(
     }
     if name != "generate_series" {
         return Err(ServerError::Unsupported(
-            "table function (only generate_series, unnest, read_csv, read_parquet, iceberg_scan, and sniff_csv supported)",
+            "table function (only generate_series, unnest, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
         ));
     }
     if args.len() < 2 || args.len() > 3 {
@@ -277,12 +240,12 @@ pub(super) fn try_lower_read_parquet_project(
     };
     match input {
         LogicalPlan::FunctionScan { name, args, .. } if name == "read_parquet" => {
-            let path_specs = read_parquet_path_specs(args)?;
-            Ok(Some(Box::new(ParquetTableScan::from_path_specs(
+            let path_specs = read_external_path_specs("read_parquet", args)?;
+            Ok(Some(lower_external_parquet_scan(
                 &path_specs,
                 Some(&projection),
                 None,
-            )?)))
+            )?))
         }
         LogicalPlan::Filter {
             input, predicate, ..
@@ -296,12 +259,12 @@ pub(super) fn try_lower_read_parquet_project(
             let Some(predicate) = ParquetPredicate::from_scalar(predicate) else {
                 return Ok(None);
             };
-            let path_specs = read_parquet_path_specs(args)?;
-            Ok(Some(Box::new(ParquetTableScan::from_path_specs(
+            let path_specs = read_external_path_specs("read_parquet", args)?;
+            Ok(Some(lower_external_parquet_scan(
                 &path_specs,
                 Some(&projection),
                 Some(&predicate),
-            )?)))
+            )?))
         }
         _ => Ok(None),
     }
@@ -322,12 +285,12 @@ pub(super) fn try_lower_read_parquet_filter(
     let Some(predicate) = ParquetPredicate::from_scalar(predicate) else {
         return Ok(None);
     };
-    let path_specs = read_parquet_path_specs(args)?;
-    Ok(Some(Box::new(ParquetTableScan::from_path_specs(
+    let path_specs = read_external_path_specs("read_parquet", args)?;
+    Ok(Some(lower_external_parquet_scan(
         &path_specs,
         None,
         Some(&predicate),
-    )?)))
+    )?))
 }
 
 fn projection_names(exprs: &[(ScalarExpr, String)]) -> Option<Vec<String>> {
@@ -338,66 +301,4 @@ fn projection_names(exprs: &[(ScalarExpr, String)]) -> Option<Vec<String>> {
             _ => None,
         })
         .collect()
-}
-
-fn read_parquet_path_specs(args: &[ScalarExpr]) -> Result<Vec<String>, ServerError> {
-    if args.len() != 1 {
-        return Err(ServerError::Unsupported(
-            "read_parquet: expected one path, glob, or path-list argument",
-        ));
-    }
-    let value = Eval::new(args[0].clone())
-        .eval(&[])
-        .map_err(|e| ServerError::Ddl(format!("read_parquet argument evaluation failed: {e}")))?;
-    match value {
-        Value::Text(pattern) => Ok(vec![pattern]),
-        Value::Array {
-            element_type: DataType::Text { max_len: None },
-            elements,
-        } => elements
-            .into_iter()
-            .map(|element| match element {
-                Value::Text(path) => Ok(path),
-                _ => Err(ServerError::Unsupported(
-                    "read_parquet: path-list elements must be string literals",
-                )),
-            })
-            .collect(),
-        _ => Err(ServerError::Unsupported(
-            "read_parquet: argument must be a string literal or text array literal",
-        )),
-    }
-}
-
-fn read_iceberg_path_arg(args: &[ScalarExpr]) -> Result<String, ServerError> {
-    let value = Eval::new(args[0].clone())
-        .eval(&[])
-        .map_err(|e| ServerError::Ddl(format!("iceberg_scan argument evaluation failed: {e}")))?;
-    match value {
-        Value::Text(path) => Ok(path),
-        _ => Err(ServerError::Unsupported(
-            "iceberg_scan: argument must be a string literal",
-        )),
-    }
-}
-
-fn read_csv_path_specs(value: &Value) -> Result<Vec<String>, ServerError> {
-    match value {
-        Value::Text(pattern) => Ok(vec![pattern.clone()]),
-        Value::Array {
-            element_type,
-            elements,
-        } if matches!(element_type, &DataType::Text { max_len: None }) => elements
-            .iter()
-            .map(|element| match element {
-                Value::Text(path) => Ok(path.clone()),
-                _ => Err(ServerError::Unsupported(
-                    "read_csv: path-list elements must be string literals",
-                )),
-            })
-            .collect(),
-        _ => Err(ServerError::Unsupported(
-            "read_csv: argument must be a string literal or text array literal",
-        )),
-    }
 }

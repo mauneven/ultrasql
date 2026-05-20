@@ -40,8 +40,10 @@ clap               = { workspace = true }
 config             = { workspace = true }
 bytes              = { workspace = true }
 arrow-array        = { workspace = true }
+arrow-ipc          = { workspace = true }
 arrow-schema       = { workspace = true }
 parquet            = { workspace = true }
+serde_json         = { workspace = true }
 # Auth / crypto
 hmac               = { workspace = true }
 sha2               = { workspace = true }
@@ -70,4 +72,3 @@ tokio-postgres     = { workspace = true }
 # the default `Future` impl of `Connection` swallows them.
 futures            = { workspace = true }
 apache-avro        = { workspace = true }
-serde_json         = { workspace = true }
