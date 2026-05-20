@@ -40,7 +40,7 @@ impl<'src> Parser<'src> {
             // postfix `::type` — may chain (e.g. `x::int::text`).
             while self.peek()?.kind == TokenKind::ColonColon {
                 self.advance()?; // ::
-                let target = self.parse_type_name()?;
+                let target = self.parse_cast_type_name()?;
                 let span = Span::new(left.span().start, target.span.end);
                 left = Expr::PostfixCast {
                     expr: Box::new(left),
@@ -369,7 +369,13 @@ impl<'src> Parser<'src> {
 
             TokenKind::KwRow => self.parse_row_expr(),
 
-            TokenKind::Identifier | TokenKind::QuotedIdentifier => self.parse_ident_or_call(),
+            TokenKind::Identifier | TokenKind::QuotedIdentifier => {
+                if self.looks_like_vector_typed_literal()? {
+                    self.parse_vector_typed_literal()
+                } else {
+                    self.parse_ident_or_call()
+                }
+            }
 
             other => Err(ParseError::Expected {
                 expected: "expression",
@@ -623,7 +629,7 @@ impl<'src> Parser<'src> {
         self.expect(TokenKind::LParen, "(")?;
         let expr = self.parse_expr()?;
         self.expect(TokenKind::KwAs, "AS")?;
-        let target = self.parse_type_name()?;
+        let target = self.parse_cast_type_name()?;
         let rp = self.expect(TokenKind::RParen, ")")?;
         Ok(Expr::Cast {
             expr: Box::new(expr),
@@ -655,5 +661,74 @@ impl<'src> Parser<'src> {
                 offset: tok.span.start as usize,
             }),
         }
+    }
+
+    fn looks_like_vector_typed_literal(&mut self) -> Result<bool, ParseError> {
+        let tok = *self.peek()?;
+        if tok.kind != TokenKind::Identifier
+            || !tok
+                .text(self.source)
+                .is_some_and(|text| text.eq_ignore_ascii_case("vector"))
+        {
+            return Ok(false);
+        }
+        match self.lookahead_at(1)?.kind {
+            TokenKind::String | TokenKind::EscapedString => Ok(true),
+            TokenKind::LParen => Ok(self.lookahead_at(2)?.kind == TokenKind::Integer
+                && self.lookahead_at(3)?.kind == TokenKind::RParen
+                && matches!(
+                    self.lookahead_at(4)?.kind,
+                    TokenKind::String | TokenKind::EscapedString
+                )),
+            _ => Ok(false),
+        }
+    }
+
+    fn parse_vector_typed_literal(&mut self) -> Result<Expr, ParseError> {
+        let vector_tok = self.advance()?;
+        let mut type_name = "vector".to_owned();
+        let mut span_end = vector_tok.span.end;
+        if self.peek()?.kind == TokenKind::LParen {
+            self.advance()?; // (
+            let dim_tok = self.expect(TokenKind::Integer, "integer vector dimension")?;
+            let dim = dim_tok.text(self.source).unwrap_or("");
+            let rp = self.expect(TokenKind::RParen, ")")?;
+            type_name = format!("vector({dim})");
+            span_end = rp.span.end;
+        }
+        let str_tok = self.advance()?;
+        if !matches!(str_tok.kind, TokenKind::String | TokenKind::EscapedString) {
+            return Err(ParseError::Expected {
+                expected: "vector literal string",
+                found: str_tok.kind,
+                offset: str_tok.span.start as usize,
+            });
+        }
+        let raw = str_tok.text(self.source).unwrap_or("");
+        let value = if matches!(str_tok.kind, TokenKind::String) {
+            raw[1..raw.len() - 1].replace("''", "'")
+        } else {
+            raw.to_owned()
+        };
+        span_end = str_tok.span.end.max(span_end);
+        Ok(Expr::Literal(Literal::Typed {
+            type_name,
+            value,
+            unit: None,
+            span: Span::new(vector_tok.span.start, span_end),
+        }))
+    }
+
+    fn parse_cast_type_name(&mut self) -> Result<Identifier, ParseError> {
+        let mut target = self.parse_type_name()?;
+        if target.value.eq_ignore_ascii_case("vector") && self.peek()?.kind == TokenKind::LParen {
+            self.advance()?; // (
+            let dim_tok = self.expect(TokenKind::Integer, "integer vector dimension")?;
+            let dim = dim_tok.text(self.source).unwrap_or("");
+            let rp = self.expect(TokenKind::RParen, ")")?;
+            target.value = format!("vector({dim})");
+            target.span = Span::new(target.span.start, rp.span.end);
+        }
+        Ok(target)
     }
 }

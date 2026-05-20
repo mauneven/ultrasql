@@ -11,7 +11,9 @@
 //! builds) preserves the perf characteristics the original
 //! single-file layout had.
 
-use ultrasql_core::{DataType, GeometryType, GeometryValue, RangeType, RangeValue, Value};
+use ultrasql_core::{
+    DataType, GeometryType, GeometryValue, MAX_VECTOR_DIMS, RangeType, RangeValue, Value,
+};
 use ultrasql_parser::ast::{BinaryOp, Expr, Literal, UnaryOp};
 
 use super::expr_type::{binary_result_type, comparable, display_unary};
@@ -429,7 +431,8 @@ fn bind_cast_expr(
     ))?;
     let mut bound = bind_expr_with_ctes(inner, input, catalog, cte_catalog, scope)?;
     coerce_literal_to_type(&mut bound, &target_type);
-    if bound.data_type() == target_type || matches!(bound.data_type(), DataType::Null) {
+    let actual_type = bound.data_type();
+    if cast_result_matches(&target_type, &actual_type) || matches!(actual_type, DataType::Null) {
         return Ok(bound);
     }
     Err(PlanError::NotSupported(
@@ -597,7 +600,11 @@ pub(super) fn bind_literal(lit: &Literal) -> ScalarExpr {
 /// interval syntaxes) bind to NULL today so the binder does not reject
 /// queries upstream of the executor.
 fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> ScalarExpr {
-    match type_name {
+    let type_name = type_name.to_ascii_lowercase();
+    if let Some(dims) = parse_vector_type_name(&type_name) {
+        return bind_vector_literal(value, dims);
+    }
+    match type_name.as_str() {
         "date" => match parse_date_literal(value) {
             Some(days) => ScalarExpr::Literal {
                 value: Value::Date(days),
@@ -634,6 +641,29 @@ fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> Scala
             value: Value::Null,
             data_type: DataType::Null,
         },
+    }
+}
+
+fn bind_vector_literal(value: &str, declared_dims: Option<u32>) -> ScalarExpr {
+    let declared_type = DataType::Vector {
+        dims: declared_dims,
+    };
+    let Some(Value::Vector(values)) = Value::parse_vector(value) else {
+        return ScalarExpr::Literal {
+            value: Value::Null,
+            data_type: declared_type,
+        };
+    };
+    let actual_dims = u32::try_from(values.len()).ok();
+    if declared_dims.is_some() && declared_dims != actual_dims {
+        return ScalarExpr::Literal {
+            value: Value::Null,
+            data_type: declared_type,
+        };
+    }
+    ScalarExpr::Literal {
+        value: Value::Vector(values),
+        data_type: DataType::Vector { dims: actual_dims },
     }
 }
 
@@ -1247,7 +1277,11 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
 }
 
 fn resolve_cast_type(type_name: &str) -> Option<DataType> {
-    match type_name.to_ascii_lowercase().as_str() {
+    let type_name = type_name.to_ascii_lowercase();
+    if let Some(dims) = parse_vector_type_name(&type_name) {
+        return Some(DataType::Vector { dims });
+    }
+    match type_name.as_str() {
         "int" | "integer" | "int4" => Some(DataType::Int32),
         "bigint" | "int8" => Some(DataType::Int64),
         "smallint" | "int2" => Some(DataType::Int16),
@@ -1262,7 +1296,6 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "timestamptz" => Some(DataType::TimestampTz),
         "uuid" => Some(DataType::Uuid),
         "json" | "jsonb" => Some(DataType::Jsonb),
-        "vector" => Some(DataType::Vector { dims: None }),
         "tsvector" | "tsquery" => Some(DataType::Text { max_len: None }),
         "numeric" | "decimal" => Some(DataType::Decimal {
             precision: None,
@@ -1283,6 +1316,31 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "polygon" => Some(DataType::Geometry(GeometryType::Polygon)),
         _ => None,
     }
+}
+
+fn parse_vector_type_name(type_name: &str) -> Option<Option<u32>> {
+    if type_name == "vector" {
+        return Some(None);
+    }
+    let dim_text = type_name
+        .strip_prefix("vector(")
+        .and_then(|rest| rest.strip_suffix(')'))?;
+    let dims: u32 = dim_text.parse().ok()?;
+    if dims == 0 || dims > MAX_VECTOR_DIMS {
+        return None;
+    }
+    Some(Some(dims))
+}
+
+fn cast_result_matches(target: &DataType, actual: &DataType) -> bool {
+    target == actual
+        || matches!(
+            (target, actual),
+            (
+                DataType::Vector { dims: None },
+                DataType::Vector { dims: Some(_) }
+            )
+        )
 }
 
 pub(super) fn coerce_literal_to_match(left: &mut ScalarExpr, right: &mut ScalarExpr) {
@@ -1601,6 +1659,51 @@ mod typed_literal_tests {
             panic!("expected float64");
         };
         assert!((v - 1.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn typed_vector_literal_binds_to_vector_value() {
+        let expr = bind_literal(&Literal::Typed {
+            type_name: "vector".to_owned(),
+            value: "[1,2,3]".to_owned(),
+            unit: None,
+            span: Span::default(),
+        });
+        let ScalarExpr::Literal { value, data_type } = expr else {
+            panic!("expected literal");
+        };
+        assert_eq!(value, Value::Vector(vec![1.0, 2.0, 3.0]));
+        assert_eq!(data_type, DataType::Vector { dims: Some(3) });
+    }
+
+    #[test]
+    fn typed_vector_literal_with_modifier_validates_dimension() {
+        let expr = bind_literal(&Literal::Typed {
+            type_name: "vector(3)".to_owned(),
+            value: "[1,2,3]".to_owned(),
+            unit: None,
+            span: Span::default(),
+        });
+        let ScalarExpr::Literal { value, data_type } = expr else {
+            panic!("expected literal");
+        };
+        assert_eq!(value, Value::Vector(vec![1.0, 2.0, 3.0]));
+        assert_eq!(data_type, DataType::Vector { dims: Some(3) });
+    }
+
+    #[test]
+    fn typed_vector_literal_rejects_dimension_mismatch() {
+        let expr = bind_literal(&Literal::Typed {
+            type_name: "vector(3)".to_owned(),
+            value: "[1,2]".to_owned(),
+            unit: None,
+            span: Span::default(),
+        });
+        let ScalarExpr::Literal { value, data_type } = expr else {
+            panic!("expected literal");
+        };
+        assert_eq!(value, Value::Null);
+        assert_eq!(data_type, DataType::Vector { dims: Some(3) });
     }
 
     #[test]

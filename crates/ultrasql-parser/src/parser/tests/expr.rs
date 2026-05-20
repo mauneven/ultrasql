@@ -6,7 +6,7 @@
 //! binary-operator coverage lives in [`super::binary_ops`].
 
 use super::*;
-use crate::ast::{BinaryOp, Expr, SelectItem, Statement};
+use crate::ast::{BinaryOp, Expr, Literal, SelectItem, Statement};
 
 #[test]
 fn expression_precedence() {
@@ -54,6 +54,45 @@ fn cast_expression() {
         panic!()
     };
     assert!(matches!(expr, Expr::Cast { .. }));
+}
+
+#[test]
+fn cast_expression_accepts_vector_type_modifier() {
+    let stmt = parse("SELECT CAST('[1,2,3]' AS VECTOR(3)) FROM t");
+    let Statement::Select(s) = stmt else { panic!() };
+    let SelectItem::Expr { expr, .. } = &s.projection[0] else {
+        panic!()
+    };
+    let Expr::Cast { target, .. } = expr else {
+        panic!("expected CAST expression");
+    };
+    assert_eq!(target.value, "vector(3)");
+}
+
+#[test]
+fn vector_typed_literal() {
+    let expr = parse_expr("VECTOR '[1,2,3]'");
+    let Expr::Literal(Literal::Typed {
+        type_name, value, ..
+    }) = expr
+    else {
+        panic!("expected typed vector literal");
+    };
+    assert_eq!(type_name, "vector");
+    assert_eq!(value, "[1,2,3]");
+}
+
+#[test]
+fn vector_typed_literal_with_modifier() {
+    let expr = parse_expr("VECTOR(3) '[1,2,3]'");
+    let Expr::Literal(Literal::Typed {
+        type_name, value, ..
+    }) = expr
+    else {
+        panic!("expected typed vector literal");
+    };
+    assert_eq!(type_name, "vector(3)");
+    assert_eq!(value, "[1,2,3]");
 }
 
 #[test]

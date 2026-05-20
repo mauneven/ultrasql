@@ -1660,8 +1660,8 @@ pub enum Literal {
     /// the binder is responsible for parsing it into the appropriate
     /// `Value` variant.
     Typed {
-        /// Lowercase type-name keyword (`"date"`, `"timestamp"`,
-        /// `"timestamptz"`, `"time"`, `"interval"`).
+        /// Lowercase type-name spelling (`"date"`, `"interval"`,
+        /// `"vector"`, `"vector(3)"`, ...).
         type_name: String,
         /// Decoded string body (no surrounding quotes).
         value: String,

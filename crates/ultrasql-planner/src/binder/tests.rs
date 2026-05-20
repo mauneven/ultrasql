@@ -440,6 +440,50 @@ fn binds_vector_distance_rejects_dimension_mismatch() {
 }
 
 #[test]
+fn binds_vector_typed_literal_projection() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("SELECT VECTOR '[1,2,3]'", &cat).expect("bind ok");
+    let LogicalPlan::Project { exprs, schema, .. } = &plan else {
+        panic!("expected Project, got {plan:?}");
+    };
+    assert_eq!(
+        schema.field_at(0).data_type,
+        DataType::Vector { dims: Some(3) }
+    );
+    let ScalarExpr::Literal { value, data_type } = &exprs[0].0 else {
+        panic!("expected vector literal");
+    };
+    assert_eq!(*value, ultrasql_core::Value::Vector(vec![1.0, 2.0, 3.0]));
+    assert_eq!(*data_type, DataType::Vector { dims: Some(3) });
+}
+
+#[test]
+fn binds_vector_cast_with_dimension_modifier() {
+    let cat = InMemoryCatalog::new();
+    for sql in [
+        "SELECT '[1,2,3]'::VECTOR(3)",
+        "SELECT CAST('[1,2,3]' AS VECTOR(3))",
+    ] {
+        let plan = parse_and_bind(sql, &cat).expect("bind ok");
+        let LogicalPlan::Project { exprs, schema, .. } = &plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(
+            schema.field_at(0).data_type,
+            DataType::Vector { dims: Some(3) },
+            "schema type for {sql}"
+        );
+        assert!(matches!(
+            &exprs[0].0,
+            ScalarExpr::Literal {
+                value: ultrasql_core::Value::Vector(values),
+                data_type: DataType::Vector { dims: Some(3) },
+            } if values == &vec![1.0, 2.0, 3.0]
+        ));
+    }
+}
+
+#[test]
 fn binds_unnest_table_function_from_text_array() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind(

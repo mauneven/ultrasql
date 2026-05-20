@@ -102,6 +102,41 @@ async fn insert_and_select_vector_column_round_trips_text_form() {
 }
 
 #[tokio::test]
+async fn vector_typed_literals_and_casts_round_trip() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE embeddings (id INT NOT NULL, embedding VECTOR(3))")
+        .await
+        .expect("create vector table");
+    client
+        .batch_execute(
+            "INSERT INTO embeddings VALUES \
+             (1, VECTOR '[1,2,3]'), \
+             (2, CAST('[4,5,6]' AS VECTOR(3))), \
+             (3, '[7,8,9]'::VECTOR(3))",
+        )
+        .await
+        .expect("insert vector rows");
+
+    let messages = client
+        .simple_query("SELECT embedding FROM embeddings ORDER BY id")
+        .await
+        .expect("select vector rows");
+    let rows = simple_rows(&messages);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["[1,2,3]".to_owned()],
+            vec!["[4,5,6]".to_owned()],
+            vec!["[7,8,9]".to_owned()],
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn vector_distance_operators_execute_in_sql() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

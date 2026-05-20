@@ -148,6 +148,15 @@ fn postfix_cast_integer() {
 }
 
 #[test]
+fn postfix_cast_vector_with_modifier() {
+    let expr = parse_expr("'[1,2,3]'::VECTOR(3)");
+    let Expr::PostfixCast { target, .. } = expr else {
+        panic!()
+    };
+    assert_eq!(target.value, "vector(3)");
+}
+
+#[test]
 fn postfix_cast_chain() {
     // x::text::varchar — two successive casts.
     let expr = parse_expr("x::text::varchar");

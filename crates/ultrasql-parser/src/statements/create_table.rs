@@ -744,6 +744,14 @@ mod tests {
     }
 
     #[test]
+    fn create_table_parses_vector_type_modifier() {
+        let stmt = parse_create_table("CREATE TABLE items (embedding VECTOR(3))");
+        assert_eq!(stmt.columns[0].data_type.name.value, "vector");
+        assert_eq!(stmt.columns[0].data_type.type_modifiers, vec![3]);
+        assert!(!stmt.columns[0].data_type.is_array);
+    }
+
+    #[test]
     fn create_table_if_not_exists() {
         let stmt = parse_create_table("CREATE TABLE IF NOT EXISTS t (x integer)");
         assert!(stmt.if_not_exists);
