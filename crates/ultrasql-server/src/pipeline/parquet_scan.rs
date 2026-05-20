@@ -9,16 +9,22 @@ use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray,
     RecordBatch, StringArray,
 };
-use arrow_schema::{ArrowError, DataType as ArrowDataType, Schema as ArrowSchema};
+use arrow_schema::{
+    ArrowError, DataType as ArrowDataType, Schema as ArrowSchema, SchemaRef as ArrowSchemaRef,
+};
 use bytes::Bytes;
 use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter};
+use parquet::arrow::arrow_reader::{
+    ArrowPredicateFn, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowFilter,
+};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::statistics::Statistics;
 use ultrasql_arrow::record_batch_to_ultrasql_batch;
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_executor::{ExecError, Operator};
-use ultrasql_objectstore::{expand_object_store_specs, is_object_store_uri, read_object_bytes};
+use ultrasql_objectstore::{
+    ObjectLocation, expand_object_store_specs, is_object_store_uri, read_object_bytes,
+};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 
 use crate::error::ServerError;
@@ -29,7 +35,11 @@ const PARQUET_BATCH_TARGET_ROWS: usize = 4096;
 #[derive(Debug)]
 pub(super) struct ParquetTableScan {
     schema: Schema,
-    batches: VecDeque<ultrasql_vec::Batch>,
+    expected_arrow_schema: ArrowSchemaRef,
+    projection: Option<Vec<String>>,
+    predicate: Option<ParquetPredicate>,
+    sources: VecDeque<ParquetScanSource>,
+    active: Option<ActiveParquetReader>,
 }
 
 impl ParquetTableScan {
@@ -65,19 +75,20 @@ impl ParquetTableScan {
             .map(|p| p.resolved_for_schema(base_arrow_schema.as_ref()))
             .transpose()?;
         let schema = parquet_schema_to_ultrasql(base_arrow_schema.as_ref(), projection.as_deref())?;
-        let mut batches = VecDeque::new();
+        let mut sources = VecDeque::new();
 
         for object in objects {
-            append_object_batches(
-                &object,
-                base_arrow_schema.as_ref(),
-                projection.as_deref(),
-                predicate.as_ref(),
-                &mut batches,
-            )?;
+            sources.push_back(ParquetScanSource::Object(object));
         }
 
-        Ok(Self { schema, batches })
+        Ok(Self {
+            schema,
+            expected_arrow_schema: base_arrow_schema,
+            projection,
+            predicate,
+            sources,
+            active: None,
+        })
     }
 
     fn from_paths(
@@ -96,30 +107,101 @@ impl ParquetTableScan {
             .map(|p| p.resolved_for_schema(base_arrow_schema.as_ref()))
             .transpose()?;
         let schema = parquet_schema_to_ultrasql(base_arrow_schema.as_ref(), projection.as_deref())?;
-        let mut batches = VecDeque::new();
+        let mut sources = VecDeque::new();
 
         for path in paths {
-            append_path_batches(
-                &path,
-                base_arrow_schema.as_ref(),
-                projection.as_deref(),
-                predicate.as_ref(),
-                &mut batches,
-            )?;
+            let arrow_schema = read_arrow_schema(&path)?;
+            if arrow_schema.as_ref() != base_arrow_schema.as_ref() {
+                return Err(ServerError::CopyFormat(format!(
+                    "read_parquet schema mismatch in {}",
+                    path.display()
+                )));
+            }
+            sources.push_back(ParquetScanSource::Path(path));
         }
 
-        Ok(Self { schema, batches })
+        Ok(Self {
+            schema,
+            expected_arrow_schema: base_arrow_schema,
+            projection,
+            predicate,
+            sources,
+            active: None,
+        })
     }
 }
 
 impl Operator for ParquetTableScan {
     fn next_batch(&mut self) -> Result<Option<ultrasql_vec::Batch>, ExecError> {
-        Ok(self.batches.pop_front())
+        loop {
+            if self.active.is_none() && !self.open_next_reader()? {
+                return Ok(None);
+            }
+            let Some(active) = &mut self.active else {
+                return Ok(None);
+            };
+            match active.reader.next() {
+                Some(Ok(batch)) if batch.num_rows() == 0 => continue,
+                Some(Ok(batch)) => {
+                    return arrow_record_batch_to_ultrasql(batch)
+                        .map(Some)
+                        .map_err(server_error_to_exec);
+                }
+                Some(Err(err)) => {
+                    return Err(ExecError::TypeMismatch(format!(
+                        "read_parquet read {}: {err}",
+                        active.display
+                    )));
+                }
+                None => {
+                    self.active = None;
+                }
+            }
+        }
     }
 
     fn schema(&self) -> &Schema {
         &self.schema
     }
+}
+
+impl ParquetTableScan {
+    fn open_next_reader(&mut self) -> Result<bool, ExecError> {
+        while let Some(source) = self.sources.pop_front() {
+            let reader = match source {
+                ParquetScanSource::Path(path) => open_path_reader(
+                    &path,
+                    self.expected_arrow_schema.as_ref(),
+                    self.projection.as_deref(),
+                    self.predicate.as_ref(),
+                ),
+                ParquetScanSource::Object(object) => open_object_reader(
+                    &object,
+                    self.expected_arrow_schema.as_ref(),
+                    self.projection.as_deref(),
+                    self.predicate.as_ref(),
+                ),
+            }
+            .map_err(server_error_to_exec)?;
+            if let Some(reader) = reader {
+                self.active = Some(reader);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+#[derive(Debug)]
+enum ParquetScanSource {
+    Path(PathBuf),
+    Object(ObjectLocation),
+}
+
+#[derive(Debug)]
+struct ActiveParquetReader {
+    display: String,
+    reader: ParquetRecordBatchReader,
 }
 
 /// Predicate shape that can be pushed into a Parquet scan.
@@ -198,13 +280,12 @@ impl ParquetPredicate {
     }
 }
 
-fn append_path_batches(
+fn open_path_reader(
     path: &Path,
     expected_schema: &ArrowSchema,
     projection: Option<&[String]>,
     predicate: Option<&ParquetPredicate>,
-    batches: &mut VecDeque<ultrasql_vec::Batch>,
-) -> Result<(), ServerError> {
+) -> Result<Option<ActiveParquetReader>, ServerError> {
     let file = File::open(path).map_err(|err| {
         ServerError::CopyFormat(format!(
             "read_parquet cannot open {}: {err}",
@@ -235,7 +316,7 @@ fn append_path_batches(
         .map(|p| select_row_groups(builder.metadata(), expected_schema, p))
         .transpose()?;
     if row_groups.as_ref().is_some_and(Vec::is_empty) {
-        return Ok(());
+        return Ok(None);
     }
     let row_filter = predicate.map(|p| p.row_filter(builder.parquet_schema()));
 
@@ -254,25 +335,18 @@ fn append_path_batches(
             path.display()
         ))
     })?;
-    for batch in reader {
-        let batch = batch.map_err(|err| {
-            ServerError::CopyFormat(format!("read_parquet read {}: {err}", path.display()))
-        })?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        batches.push_back(arrow_record_batch_to_ultrasql(batch)?);
-    }
-    Ok(())
+    Ok(Some(ActiveParquetReader {
+        display: path.display().to_string(),
+        reader,
+    }))
 }
 
-fn append_object_batches(
-    object: &ultrasql_objectstore::ObjectLocation,
+fn open_object_reader(
+    object: &ObjectLocation,
     expected_schema: &ArrowSchema,
     projection: Option<&[String]>,
     predicate: Option<&ParquetPredicate>,
-    batches: &mut VecDeque<ultrasql_vec::Batch>,
-) -> Result<(), ServerError> {
+) -> Result<Option<ActiveParquetReader>, ServerError> {
     let display = object.display_uri();
     let bytes = read_object_bytes(object)
         .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
@@ -296,7 +370,7 @@ fn append_object_batches(
         .map(|p| select_row_groups(builder.metadata(), expected_schema, p))
         .transpose()?;
     if row_groups.as_ref().is_some_and(Vec::is_empty) {
-        return Ok(());
+        return Ok(None);
     }
     let row_filter = predicate.map(|p| p.row_filter(builder.parquet_schema()));
 
@@ -312,16 +386,7 @@ fn append_object_batches(
     let reader = builder.build().map_err(|err| {
         ServerError::CopyFormat(format!("read_parquet cannot read {display}: {err}"))
     })?;
-    for batch in reader {
-        let batch = batch.map_err(|err| {
-            ServerError::CopyFormat(format!("read_parquet read {display}: {err}"))
-        })?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        batches.push_back(arrow_record_batch_to_ultrasql(batch)?);
-    }
-    Ok(())
+    Ok(Some(ActiveParquetReader { display, reader }))
 }
 
 fn read_arrow_schema(path: &Path) -> Result<arrow_schema::SchemaRef, ServerError> {
@@ -406,6 +471,10 @@ fn arrow_type_to_ultrasql(data_type: &ArrowDataType) -> Result<DataType, ServerE
 fn arrow_record_batch_to_ultrasql(batch: RecordBatch) -> Result<ultrasql_vec::Batch, ServerError> {
     record_batch_to_ultrasql_batch(batch)
         .map_err(|err| ServerError::CopyFormat(format!("read_parquet Arrow bridge: {err}")))
+}
+
+fn server_error_to_exec(err: ServerError) -> ExecError {
+    ExecError::TypeMismatch(err.to_string())
 }
 
 fn evaluate_arrow_predicate(
@@ -785,8 +854,16 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ParquetPredicate, ParquetTableScan};
+    use std::fs;
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+    use parquet::arrow::ArrowWriter;
     use ultrasql_core::{DataType, Value};
+    use ultrasql_executor::Operator;
     use ultrasql_planner::{BinaryOp, ScalarExpr};
+    use ultrasql_vec::column::Column;
 
     #[test]
     fn simple_column_literal_predicate_is_pushable() {
@@ -839,5 +916,54 @@ mod tests {
             "part-??.parquet",
             "part-001.parquet"
         ));
+    }
+
+    #[test]
+    fn parquet_scan_defers_later_file_batches_until_needed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = dir.path().join("first.parquet");
+        let second = dir.path().join("second.parquet");
+        write_i64_parquet(&first, &[1]);
+        write_i64_parquet(&second, &[2]);
+        let path_specs = vec![first.display().to_string(), second.display().to_string()];
+
+        let mut scan =
+            ParquetTableScan::from_path_specs(&path_specs, None, None).expect("construct scan");
+        fs::remove_file(&second).expect("remove second parquet");
+
+        let first_batch = scan
+            .next_batch()
+            .expect("read first file")
+            .expect("first batch");
+        let Column::Int64(values) = &first_batch.columns()[0] else {
+            panic!("expected int64 column");
+        };
+        assert_eq!(values.data(), &[1]);
+
+        let err = scan
+            .next_batch()
+            .expect_err("second file read should be lazy");
+        let message = err.to_string();
+        assert!(
+            message.contains("cannot open") && message.contains("second.parquet"),
+            "unexpected lazy read error: {message}"
+        );
+    }
+
+    fn write_i64_parquet(path: &std::path::Path, values: &[i64]) {
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(values.to_vec()))],
+        )
+        .expect("record batch");
+        let file = fs::File::create(path).expect("create parquet");
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("writer");
+        writer.write(&batch).expect("write parquet");
+        writer.close().expect("close parquet");
     }
 }
