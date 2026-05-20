@@ -323,6 +323,7 @@ fn data_type_name(dt: &DataType) -> &'static str {
         DataType::Interval => "interval",
         DataType::Uuid => "uuid",
         DataType::Jsonb => "jsonb",
+        DataType::Vector { .. } => "vector",
         DataType::Array(_) => "array",
         DataType::Record(_) => "record",
         DataType::Null => "unknown",

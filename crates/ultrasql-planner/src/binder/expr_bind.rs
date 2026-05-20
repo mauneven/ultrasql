@@ -1219,6 +1219,17 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                 *data_type = DataType::Geometry(*geometry_type);
             }
         }
+        (DataType::Vector { dims }, Value::Text(text)) => {
+            if let Some(parsed) = Value::parse_vector(text) {
+                if let Value::Vector(values) = &parsed {
+                    let actual_dims = u32::try_from(values.len()).ok();
+                    if dims.is_none() || actual_dims == *dims {
+                        *value = parsed;
+                        *data_type = DataType::Vector { dims: actual_dims };
+                    }
+                }
+            }
+        }
         (DataType::Uuid, Value::Text(text)) => {
             if let Some(uuid) = Value::parse_uuid(text) {
                 *value = Value::Uuid(uuid);
@@ -1251,6 +1262,7 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "timestamptz" => Some(DataType::TimestampTz),
         "uuid" => Some(DataType::Uuid),
         "json" | "jsonb" => Some(DataType::Jsonb),
+        "vector" => Some(DataType::Vector { dims: None }),
         "tsvector" | "tsquery" => Some(DataType::Text { max_len: None }),
         "numeric" | "decimal" => Some(DataType::Decimal {
             precision: None,

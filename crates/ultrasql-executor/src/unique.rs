@@ -55,6 +55,9 @@ impl PartialEq for KeyValue {
             (Value::Null, Value::Null) => true,
             (Value::Float32(a), Value::Float32(b)) => a.to_bits() == b.to_bits(),
             (Value::Float64(a), Value::Float64(b)) => a.to_bits() == b.to_bits(),
+            (Value::Vector(a), Value::Vector(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(l, r)| l.to_bits() == r.to_bits())
+            }
             _ => self.0 == other.0,
         }
     }
@@ -144,6 +147,12 @@ impl Hash for KeyValue {
                 state.write_u8(18);
                 element_type.hash(state);
                 elements.hash(state);
+            }
+            Value::Vector(values) => {
+                state.write_u8(19);
+                for value in values {
+                    value.to_bits().hash(state);
+                }
             }
         }
     }

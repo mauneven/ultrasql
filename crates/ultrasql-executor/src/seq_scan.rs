@@ -1030,6 +1030,7 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
             }
             DataType::Text { .. }
             | DataType::Jsonb
+            | DataType::Vector { .. }
             | DataType::Range(_)
             | DataType::Geometry(_)
             | DataType::Array(_)
@@ -1040,6 +1041,11 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                     match (&field.data_type, &row[col_idx]) {
                         (DataType::Text { .. }, Value::Text(s)) => strings.push(Some(s.clone())),
                         (DataType::Jsonb, Value::Jsonb(s)) => strings.push(Some(s.clone())),
+                        (DataType::Vector { dims }, Value::Vector(values))
+                            if dims.is_none() || u32::try_from(values.len()).ok() == *dims =>
+                        {
+                            strings.push(Some(row[col_idx].to_string()));
+                        }
                         (DataType::Range(expected), Value::Range(v))
                             if expected == &v.range_type =>
                         {

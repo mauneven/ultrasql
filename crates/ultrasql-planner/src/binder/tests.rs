@@ -381,6 +381,26 @@ fn binds_create_table_jsonb_column_type() {
 }
 
 #[test]
+fn binds_create_table_vector_column_type() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("CREATE TABLE t (embedding VECTOR(1536))", &cat).expect("bind ok");
+    let LogicalPlan::CreateTable { columns, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(
+        columns.fields()[0].data_type,
+        DataType::Vector { dims: Some(1536) }
+    );
+}
+
+#[test]
+fn binds_create_table_rejects_zero_dimensional_vector() {
+    let cat = InMemoryCatalog::new();
+    let err = parse_and_bind("CREATE TABLE t (embedding VECTOR(0))", &cat).unwrap_err();
+    assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+}
+
+#[test]
 fn binds_unnest_table_function_from_text_array() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind(

@@ -62,6 +62,7 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Ordering {
         (Value::Geometry(la), Value::Geometry(lb)) if la.geometry_type == lb.geometry_type => {
             la.to_string().cmp(&lb.to_string())
         }
+        (Value::Vector(la), Value::Vector(lb)) => compare_f32_slices(la, lb),
         (
             Value::Array {
                 element_type: l_ty,
@@ -205,6 +206,18 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             }
             out
         }
+        Value::Vector(values) => {
+            let mut out = vec![20];
+            for value in values {
+                let bits = if value.is_nan() {
+                    f32::NAN.to_bits()
+                } else {
+                    value.to_bits()
+                };
+                out.extend_from_slice(&bits.to_be_bytes());
+            }
+            out
+        }
     }
 }
 
@@ -244,6 +257,21 @@ fn compare_value_slices(a: &[Value], b: &[Value]) -> Ordering {
     a.len().cmp(&b.len())
 }
 
+fn compare_f32_slices(a: &[f32], b: &[f32]) -> Ordering {
+    for (left, right) in a.iter().zip(b) {
+        let ordering = match (left.is_nan(), right.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => left.partial_cmp(right).unwrap_or(Ordering::Equal),
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 const fn discriminant(v: &Value) -> u8 {
     match v {
         Value::Null => 0,
@@ -266,6 +294,7 @@ const fn discriminant(v: &Value) -> u8 {
         Value::Range(_) => 16,
         Value::Geometry(_) => 17,
         Value::Array { .. } => 19,
+        Value::Vector(_) => 20,
     }
 }
 

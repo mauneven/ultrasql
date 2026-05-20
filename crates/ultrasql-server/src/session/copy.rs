@@ -1316,6 +1316,7 @@ fn value_to_copy_cell_by_value(value: &Value) -> Option<Vec<u8>> {
         | Value::Range(_)
         | Value::Geometry(_)
         | Value::Jsonb(_)
+        | Value::Vector(_)
         | Value::Array { .. } => Some(value.to_string().into_bytes()),
     }
 }
@@ -1362,6 +1363,16 @@ fn decode_copy_cell(
         DataType::Uuid => Value::parse_uuid(s).map(Value::Uuid).ok_or_else(|| {
             ServerError::CopyFormat(format!("column {column_idx}: invalid uuid literal"))
         }),
+        DataType::Vector { dims } => match Value::parse_vector(s) {
+            Some(Value::Vector(values))
+                if dims.is_none() || u32::try_from(values.len()).ok() == *dims =>
+            {
+                Ok(Value::Vector(values))
+            }
+            _ => Err(ServerError::CopyFormat(format!(
+                "column {column_idx}: invalid {dtype} literal"
+            ))),
+        },
         DataType::Range(range_type) => ultrasql_core::RangeValue::parse(*range_type, s)
             .map(Value::Range)
             .ok_or_else(|| {

@@ -230,6 +230,7 @@ const DT_NULL: u8 = 0x11;
 const DT_RANGE: u8 = 0x12;
 const DT_GEOMETRY: u8 = 0x13;
 const DT_ARRAY: u8 = 0x14;
+const DT_VECTOR: u8 = 0x15;
 
 fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError> {
     match ty {
@@ -256,6 +257,10 @@ fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError
         DataType::Interval => w.u8(DT_INTERVAL),
         DataType::Uuid => w.u8(DT_UUID),
         DataType::Jsonb => w.u8(DT_JSONB),
+        DataType::Vector { dims } => {
+            w.u8(DT_VECTOR);
+            w.opt_u32(*dims);
+        }
         DataType::Null => w.u8(DT_NULL),
         DataType::Range(range_type) => {
             w.u8(DT_RANGE);
@@ -304,6 +309,7 @@ fn decode_data_type(r: &mut Reader<'_>) -> Result<DataType, DecodeError> {
         DT_INTERVAL => DataType::Interval,
         DT_UUID => DataType::Uuid,
         DT_JSONB => DataType::Jsonb,
+        DT_VECTOR => DataType::Vector { dims: r.opt_u32()? },
         DT_NULL => DataType::Null,
         DT_RANGE => DataType::Range(decode_range_type(r.u8()?)?),
         DT_GEOMETRY => DataType::Geometry(decode_geometry_type(r.u8()?)?),
@@ -891,6 +897,8 @@ mod tests {
                 precision: None,
                 scale: None,
             },
+            DataType::Vector { dims: Some(1536) },
+            DataType::Vector { dims: None },
             DataType::Text { max_len: None },
             DataType::Text {
                 max_len: Some(1024),

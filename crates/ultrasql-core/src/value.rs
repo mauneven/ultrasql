@@ -13,7 +13,7 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use crate::types::{DataType, GeometryType, RangeType};
+use crate::types::{DataType, GeometryType, MAX_VECTOR_DIMS, RangeType};
 
 /// Runtime representation for a PostgreSQL range value.
 ///
@@ -308,6 +308,8 @@ pub enum Value {
     Text(String),
     /// JSONB-compatible textual payload.
     Jsonb(String),
+    /// pgvector-compatible finite single-precision vector.
+    Vector(Vec<f32>),
     /// Binary.
     Bytea(Vec<u8>),
     /// Microsecond-precision timestamp (no zone). Microseconds since
@@ -388,6 +390,11 @@ impl Hash for Value {
             Self::Float64(v) => v.to_bits().hash(state),
             Self::Text(v) => v.hash(state),
             Self::Jsonb(v) => v.hash(state),
+            Self::Vector(v) => {
+                for element in v {
+                    element.to_bits().hash(state);
+                }
+            }
             Self::Bytea(v) => v.hash(state),
             Self::Timestamp(v) | Self::TimestampTz(v) | Self::Time(v) => v.hash(state),
             Self::Date(v) => v.hash(state),
@@ -435,6 +442,9 @@ impl Value {
             Self::Float64(_) => DataType::Float64,
             Self::Text(_) => DataType::Text { max_len: None },
             Self::Jsonb(_) => DataType::Jsonb,
+            Self::Vector(v) => DataType::Vector {
+                dims: u32::try_from(v.len()).ok(),
+            },
             Self::Bytea(_) => DataType::Bytea,
             Self::Timestamp(_) => DataType::Timestamp,
             Self::TimestampTz(_) => DataType::TimestampTz,
@@ -524,6 +534,36 @@ impl Value {
             out.push((hi << 4) | lo);
         }
         Some(out)
+    }
+
+    /// Parse a pgvector-style vector literal, such as `[1,2.5,-3]`.
+    ///
+    /// Elements are `f32` and must be finite. Empty vectors and values
+    /// above [`MAX_VECTOR_DIMS`] are rejected.
+    #[must_use]
+    pub fn parse_vector(text: &str) -> Option<Self> {
+        let trimmed = text.trim();
+        let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?.trim();
+        if inner.is_empty() {
+            return None;
+        }
+        let mut values = Vec::new();
+        for raw in inner.split(',') {
+            let element = raw.trim();
+            if element.is_empty() {
+                return None;
+            }
+            let value = element.parse::<f32>().ok()?;
+            if !value.is_finite() {
+                return None;
+            }
+            values.push(value);
+        }
+        let dims = u32::try_from(values.len()).ok()?;
+        if dims == 0 || dims > MAX_VECTOR_DIMS {
+            return None;
+        }
+        Some(Self::Vector(values))
     }
 
     /// Parse PostgreSQL's common text-array form, e.g. `{1,2,NULL}`.
@@ -671,6 +711,16 @@ impl fmt::Display for Value {
             } => write!(f, "{months}mon {days}d {microseconds}us"),
             Self::Range(v) => write!(f, "{v}"),
             Self::Geometry(v) => write!(f, "{v}"),
+            Self::Vector(values) => {
+                f.write_str("[")?;
+                for (idx, value) in values.iter().enumerate() {
+                    if idx > 0 {
+                        f.write_str(",")?;
+                    }
+                    write!(f, "{value}")?;
+                }
+                f.write_str("]")
+            }
             Self::Array { elements, .. } => {
                 f.write_str("{")?;
                 for (idx, element) in elements.iter().enumerate() {
@@ -1137,6 +1187,21 @@ mod tests {
             Value::Uuid(bytes).to_string(),
             "12345678-9abc-def0-1234-56789abcdef0"
         );
+    }
+
+    #[test]
+    fn vector_parse_rejects_non_finite_elements() {
+        assert_eq!(
+            Value::parse_vector("[1, 2.5, -3]").unwrap(),
+            Value::Vector(vec![1.0, 2.5, -3.0])
+        );
+        assert_eq!(
+            Value::Vector(vec![1.0, 2.5, -3.0]).to_string(),
+            "[1,2.5,-3]"
+        );
+        assert!(Value::parse_vector("[]").is_none());
+        assert!(Value::parse_vector("[NaN]").is_none());
+        assert!(Value::parse_vector("[Infinity]").is_none());
     }
 
     #[test]

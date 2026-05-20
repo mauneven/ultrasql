@@ -36,7 +36,7 @@ pub use id::{
     BlockNumber, CommandId, Lsn, Oid, PageId, RelationId, SegmentId, TableId, TupleId, Xid,
 };
 pub use schema::{Field, Schema};
-pub use types::{DataType, GeometryType, RangeType};
+pub use types::{DataType, GeometryType, MAX_VECTOR_DIMS, RangeType};
 pub use value::{BoundingBox, Datum, GeometryValue, RangeValue, Value};
 
 /// Version of the on-disk page format. Bumping this is an RFC-level change.

@@ -7,7 +7,7 @@
 //! `resolve_column_nullability`, `synthesise_index_name`) stay
 //! private to this module.
 
-use ultrasql_core::{DataType, Field, GeometryType, RangeType, Schema};
+use ultrasql_core::{DataType, Field, GeometryType, MAX_VECTOR_DIMS, RangeType, Schema};
 use ultrasql_parser::ast::{
     AlterSequenceStmt, AlterTableAction, AlterTableStmt, ColumnConstraint, CommentStmt,
     CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat, CopyOption,
@@ -796,6 +796,25 @@ fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
             max_len: max_len_modifier(),
         }),
         "json" | "jsonb" => Ok(DataType::Jsonb),
+        "vector" => {
+            if t.type_modifiers.len() > 1 {
+                return Err(PlanError::TypeMismatch(
+                    "VECTOR accepts at most one dimension modifier".to_owned(),
+                ));
+            }
+            let dims = t.type_modifiers.first().copied();
+            if matches!(dims, Some(0)) {
+                return Err(PlanError::TypeMismatch(
+                    "VECTOR dimension must be at least 1".to_owned(),
+                ));
+            }
+            if matches!(dims, Some(n) if n > MAX_VECTOR_DIMS) {
+                return Err(PlanError::TypeMismatch(format!(
+                    "VECTOR dimension must be at most {MAX_VECTOR_DIMS}"
+                )));
+            }
+            Ok(DataType::Vector { dims })
+        }
         "bytea" => Ok(DataType::Bytea),
         // `DATE` columns are encoded by the row codec as 4-byte
         // little-endian i32 days since 2000-01-01 (see

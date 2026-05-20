@@ -630,6 +630,7 @@ fn build_empty_batch(schema: &Schema) -> Result<Batch, ExecError> {
             DataType::Float64 => Column::Float64(NumericColumn::from_data(vec![])),
             DataType::Text { .. }
             | DataType::Jsonb
+            | DataType::Vector { .. }
             | DataType::Range(_)
             | DataType::Geometry(_)
             | DataType::Array(_) => Column::Utf8(StringColumn::from_data(vec![])),
@@ -755,6 +756,34 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                 for (row_idx, row) in rows.iter_mut().enumerate() {
                     match col.text_value(row_idx) {
                         Some(v) => row.push(Value::Jsonb(v.to_owned())),
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Vector { dims }) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => {
+                            let vector = Value::parse_vector(v).ok_or_else(|| {
+                                ExecError::TypeMismatch(format!(
+                                    "column {col_idx} ({name}): invalid {expected_type} literal",
+                                    name = field.name,
+                                    expected_type = field.data_type,
+                                ))
+                            })?;
+                            if let Value::Vector(values) = &vector
+                                && dims.is_some_and(|expected| {
+                                    u32::try_from(values.len()).ok() != Some(expected)
+                                })
+                            {
+                                return Err(ExecError::TypeMismatch(format!(
+                                    "column {col_idx} ({name}): invalid {expected_type} dimension",
+                                    name = field.name,
+                                    expected_type = field.data_type,
+                                )));
+                            }
+                            row.push(vector);
+                        }
                         None => row.push(Value::Null),
                     }
                 }

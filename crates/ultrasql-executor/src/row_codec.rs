@@ -11,7 +11,7 @@
 //! directly into a parallel slice of [`ColumnBuilder`]s, skipping the
 //! `Vec<Value>` row intermediate.
 
-use ultrasql_core::{DataType, GeometryValue, RangeValue, Schema, Value};
+use ultrasql_core::{DataType, GeometryValue, MAX_VECTOR_DIMS, RangeValue, Schema, Value};
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
 use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
@@ -398,6 +398,9 @@ impl RowCodec {
                 (DataType::Jsonb, Value::Jsonb(s)) => {
                     encode_varlena_text(&mut payload, s, col_idx, &field.data_type)?;
                 }
+                (DataType::Vector { dims }, Value::Vector(values)) => {
+                    encode_vector_payload(&mut payload, values, *dims, col_idx, &field.data_type)?;
+                }
                 (DataType::Array(expected), Value::Array { element_type, .. })
                     if expected.as_ref() == element_type =>
                 {
@@ -724,6 +727,9 @@ impl RowCodec {
                     let s = decode_varlena_text(bytes, &mut cursor, "jsonb column")?;
                     Value::Jsonb(s)
                 }
+                DataType::Vector { dims } => {
+                    decode_vector_value(bytes, &mut cursor, *dims, col_idx, &field.data_type)?
+                }
                 DataType::Array(element_type) => {
                     let s = decode_varlena_text(bytes, &mut cursor, "array column")?;
                     Value::parse_array((**element_type).clone(), &s).ok_or_else(|| {
@@ -1048,6 +1054,27 @@ impl RowCodec {
                     nulls.push_valid();
                 }
                 (
+                    DataType::Vector { dims },
+                    ColumnBuilder::Utf8 {
+                        offsets,
+                        values,
+                        nulls,
+                    },
+                ) => {
+                    let value =
+                        decode_vector_value(bytes, &mut cursor, *dims, col_idx, &field.data_type)?;
+                    let text = value.to_string();
+                    values.extend_from_slice(text.as_bytes());
+                    let new_end = u32::try_from(values.len()).map_err(|_| {
+                        RowCodecError::UnsupportedType {
+                            column: col_idx,
+                            ty: field.data_type.clone(),
+                        }
+                    })?;
+                    offsets.push(new_end);
+                    nulls.push_valid();
+                }
+                (
                     DataType::Text { .. }
                     | DataType::Jsonb
                     | DataType::Range(_)
@@ -1288,6 +1315,7 @@ impl ColumnBuilder {
             },
             DataType::Text { .. }
             | DataType::Jsonb
+            | DataType::Vector { .. }
             | DataType::Range(_)
             | DataType::Geometry(_)
             | DataType::Array(_)
@@ -1439,6 +1467,7 @@ const fn is_supported_type(ty: &DataType) -> bool {
             | DataType::Float64
             | DataType::Text { .. }
             | DataType::Jsonb
+            | DataType::Vector { .. }
             | DataType::Date
             | DataType::Time
             | DataType::Timestamp
@@ -1451,6 +1480,103 @@ const fn is_supported_type(ty: &DataType) -> bool {
             | DataType::Array(_)
             | DataType::Null
     )
+}
+
+fn encode_vector_payload(
+    payload: &mut Vec<u8>,
+    values: &[f32],
+    expected_dims: Option<u32>,
+    column: usize,
+    ty: &DataType,
+) -> Result<(), RowCodecError> {
+    let actual_dims = u32::try_from(values.len()).map_err(|_| RowCodecError::UnsupportedType {
+        column,
+        ty: ty.clone(),
+    })?;
+    if actual_dims == 0
+        || actual_dims > MAX_VECTOR_DIMS
+        || expected_dims.is_some_and(|dims| dims != actual_dims)
+        || values.iter().any(|value| !value.is_finite())
+    {
+        return Err(RowCodecError::Type {
+            column,
+            expected: ty.clone(),
+            got: format!("vector({actual_dims})"),
+        });
+    }
+    payload.extend_from_slice(&actual_dims.to_le_bytes());
+    for value in values {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn decode_vector_value(
+    bytes: &[u8],
+    cursor: &mut usize,
+    expected_dims: Option<u32>,
+    column: usize,
+    ty: &DataType,
+) -> Result<Value, RowCodecError> {
+    let dims_end = cursor.saturating_add(4);
+    if bytes.len() < dims_end {
+        return Err(RowCodecError::Truncated {
+            needed: dims_end,
+            have: bytes.len(),
+        });
+    }
+    let dims_raw: [u8; 4] =
+        bytes[*cursor..dims_end]
+            .try_into()
+            .map_err(|_| RowCodecError::Truncated {
+                needed: dims_end,
+                have: bytes.len(),
+            })?;
+    *cursor = dims_end;
+    let dims = u32::from_le_bytes(dims_raw);
+    if dims == 0 || dims > MAX_VECTOR_DIMS || expected_dims.is_some_and(|expected| expected != dims)
+    {
+        return Err(RowCodecError::Type {
+            column,
+            expected: ty.clone(),
+            got: format!("vector({dims})"),
+        });
+    }
+    let dims_usize = usize::try_from(dims).expect("u32 fits in usize on supported targets");
+    let byte_len = dims_usize
+        .checked_mul(4)
+        .ok_or_else(|| RowCodecError::UnsupportedType {
+            column,
+            ty: ty.clone(),
+        })?;
+    let values_end =
+        cursor
+            .checked_add(byte_len)
+            .ok_or_else(|| RowCodecError::UnsupportedType {
+                column,
+                ty: ty.clone(),
+            })?;
+    if bytes.len() < values_end {
+        return Err(RowCodecError::Truncated {
+            needed: values_end,
+            have: bytes.len(),
+        });
+    }
+    let mut values = Vec::with_capacity(dims_usize);
+    for chunk in bytes[*cursor..values_end].chunks_exact(4) {
+        let raw: [u8; 4] = chunk.try_into().expect("chunks_exact(4)");
+        let value = f32::from_le_bytes(raw);
+        if !value.is_finite() {
+            return Err(RowCodecError::Type {
+                column,
+                expected: ty.clone(),
+                got: "non-finite vector element".to_owned(),
+            });
+        }
+        values.push(value);
+    }
+    *cursor = values_end;
+    Ok(Value::Vector(values))
 }
 
 fn encode_varlena_text(
@@ -1676,6 +1802,19 @@ mod tests {
         let row = vec![Value::Jsonb(r#"{"a":1,"b":"x"}"#.into())];
         assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
     }
+
+    #[test]
+    fn round_trip_vector() {
+        let schema = Schema::new([Field::required(
+            "embedding",
+            DataType::Vector { dims: Some(3) },
+        )])
+        .unwrap();
+        let codec = RowCodec::new(schema);
+        let row = vec![Value::Vector(vec![1.0, 2.5, -3.0])];
+        assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
+    }
+
     #[test]
     fn all_null_row() {
         let codec = RowCodec::new(schema_all_nullable());

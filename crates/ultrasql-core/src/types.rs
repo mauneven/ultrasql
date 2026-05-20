@@ -13,6 +13,10 @@ use std::fmt;
 
 use crate::error::{Error, Result};
 
+/// Maximum number of `f32` elements in a pgvector-compatible `vector`
+/// value.
+pub const MAX_VECTOR_DIMS: u32 = 16_000;
+
 /// PostgreSQL range type families supported by the v0.8 GiST operator
 /// surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -142,6 +146,17 @@ pub enum DataType {
 
     /// JSON-binary (JSONB-compatible).
     Jsonb,
+
+    /// pgvector-compatible single-precision embedding vector.
+    ///
+    /// `None` represents the unconstrained `vector` type. `Some(n)`
+    /// represents `vector(n)` and requires values to have exactly `n`
+    /// finite `f32` elements when value storage lands.
+    Vector {
+        /// Fixed dimension for `vector(n)`, or `None` for unconstrained
+        /// `vector`.
+        dims: Option<u32>,
+    },
 
     /// PostgreSQL range value family.
     Range(RangeType),
@@ -301,6 +316,8 @@ impl fmt::Display for DataType {
             Self::Interval => f.write_str("interval"),
             Self::Uuid => f.write_str("uuid"),
             Self::Jsonb => f.write_str("jsonb"),
+            Self::Vector { dims: Some(dims) } => write!(f, "vector({dims})"),
+            Self::Vector { dims: None } => f.write_str("vector"),
             Self::Range(range_type) => write!(f, "{range_type}"),
             Self::Geometry(geometry_type) => write!(f, "{geometry_type}"),
             Self::Array(inner) => write!(f, "{inner}[]"),
@@ -330,6 +347,7 @@ mod tests {
         assert_eq!(DataType::Int64.fixed_size(), Some(8));
         assert_eq!(DataType::Timestamp.fixed_size(), Some(8));
         assert_eq!(DataType::Uuid.fixed_size(), Some(16));
+        assert_eq!(DataType::Vector { dims: Some(3) }.fixed_size(), None);
         assert_eq!(DataType::Text { max_len: None }.fixed_size(), None);
         assert_eq!(DataType::Bytea.fixed_size(), None);
     }
@@ -375,6 +393,12 @@ mod tests {
             DataType::Float32.numeric_join(&DataType::Float64).unwrap(),
             DataType::Float64
         );
+    }
+
+    #[test]
+    fn vector_display_renders_pgvector_style_type_name() {
+        assert_eq!(DataType::Vector { dims: Some(3) }.to_string(), "vector(3)");
+        assert_eq!(DataType::Vector { dims: None }.to_string(), "vector");
     }
 
     #[test]
