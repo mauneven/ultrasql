@@ -1,0 +1,112 @@
+# UltraSQL-authored portable SQLLogicTest shard for reviewed filter and set-op coverage.
+# Keep this file small; third-party corpus expansion belongs in audited imported shards.
+
+statement ok
+CREATE TABLE slt_filter_main (id INT NOT NULL, grp INT NOT NULL, amount INT, label TEXT)
+
+statement ok
+INSERT INTO slt_filter_main VALUES (1, 1, 10, 'alpha'), (2, 1, 20, 'beta'), (3, 2, 30, 'gamma'), (4, 2, NULL, NULL), (5, 3, 50, 'delta'), (6, 3, 60, 'epsilon')
+
+statement ok
+CREATE TABLE slt_filter_blocklist (grp INT NOT NULL)
+
+statement ok
+INSERT INTO slt_filter_blocklist VALUES (2), (4)
+
+query I nosort
+SELECT COUNT(*) FROM slt_filter_main
+----
+6
+
+query I rowsort
+SELECT id FROM slt_filter_main WHERE amount BETWEEN 20 AND 50
+----
+2
+3
+5
+
+query I rowsort
+SELECT id FROM slt_filter_main WHERE amount NOT BETWEEN 20 AND 50
+----
+1
+6
+
+query I rowsort
+SELECT id FROM slt_filter_main WHERE grp IN (1, 3)
+----
+1
+2
+5
+6
+
+query I rowsort
+SELECT id FROM slt_filter_main WHERE grp NOT IN (1, 3)
+----
+3
+4
+
+query I rowsort
+SELECT id FROM slt_filter_main WHERE label LIKE '%ta'
+----
+2
+5
+
+query I rowsort
+SELECT id FROM slt_filter_main WHERE label IS NULL
+----
+4
+
+query I rowsort
+SELECT slt_filter_main.id FROM slt_filter_main JOIN slt_filter_blocklist ON slt_filter_main.grp = slt_filter_blocklist.grp
+----
+3
+4
+
+query I rowsort
+SELECT id FROM slt_filter_main WHERE grp = 1
+UNION ALL
+SELECT id FROM slt_filter_main WHERE amount >= 50
+----
+1
+2
+5
+6
+
+query I rowsort
+SELECT grp FROM slt_filter_main WHERE id <= 3
+UNION
+SELECT grp FROM slt_filter_main WHERE id >= 3
+----
+1
+2
+3
+
+query I rowsort
+SELECT grp FROM slt_filter_main WHERE amount >= 20
+INTERSECT
+SELECT grp FROM slt_filter_main WHERE amount <= 50
+----
+1
+2
+3
+
+query I rowsort
+SELECT grp FROM slt_filter_main WHERE id <= 4
+EXCEPT
+SELECT grp FROM slt_filter_main WHERE id <= 2
+----
+2
+
+query IT nosort
+SELECT id, label FROM slt_filter_main WHERE label IS NOT NULL ORDER BY amount DESC LIMIT 2 OFFSET 1
+----
+5
+delta
+3
+gamma
+
+statement ok
+DROP TABLE slt_filter_blocklist
+
+statement ok
+DROP TABLE slt_filter_main

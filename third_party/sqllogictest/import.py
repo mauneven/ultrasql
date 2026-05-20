@@ -46,6 +46,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true", help="Print actions without copying")
     parser.add_argument(
+        "--max-files",
+        default=10,
+        type=int,
+        help="Maximum matched SLT files per reviewed import shard",
+    )
+    parser.add_argument(
         "--license-dest",
         default=Path("third_party/sqllogictest/LICENSE.upstream"),
         type=Path,
@@ -92,6 +98,8 @@ def included(path: Path, source: Path, patterns: list[str]) -> bool:
 
 def main() -> None:
     args = parse_args()
+    if args.max_files < 1:
+        raise SystemExit("--max-files must be at least 1")
     include_patterns = args.include or ["*.slt", "*.test"]
     source = args.source.resolve()
     if not source.is_dir():
@@ -106,6 +114,11 @@ def main() -> None:
     )
     if not files:
         raise SystemExit("no SQLLogicTest files matched include patterns")
+    if len(files) > args.max_files:
+        raise SystemExit(
+            f"refusing import: {len(files)} matched files exceeds --max-files "
+            f"{args.max_files}; add narrower --include patterns or split the import"
+        )
 
     print(f"source: {source}")
     print(f"commit: {args.commit}")

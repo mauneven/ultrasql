@@ -12,7 +12,8 @@ Buckets:
   replacement for storage/WAL/MVCC unit and integration tests.
 
 External imports must go through `third_party/sqllogictest/import.py` and keep
-license/provenance records.
+license/provenance records. Imported shards stay small and filtered; expand the
+portable corpus with reviewed slices, not broad third-party dumps.
 
 Run portable correctness plus replay timing:
 

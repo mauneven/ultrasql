@@ -95,3 +95,41 @@ class ImporterTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue((dest / "keep" / "one.test").is_file())
             self.assertFalse((dest / "skip" / "two.test").exists())
+
+    def test_importer_refuses_default_import_above_review_limit(self):
+        with tempfile.TemporaryDirectory() as source_dir, tempfile.TemporaryDirectory() as dest_dir:
+            source = Path(source_dir)
+            dest = Path(dest_dir) / "imported"
+            (source / "LICENSE").write_text("MIT license\n", encoding="utf-8")
+            (source / "slt").mkdir()
+            for idx in range(11):
+                (source / "slt" / f"case_{idx}.test").write_text(
+                    "query I nosort\nSELECT 1\n----\n1\n", encoding="utf-8"
+                )
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(IMPORTER),
+                    "--source",
+                    str(source),
+                    "--commit",
+                    "abc123",
+                    "--dest",
+                    str(dest),
+                    "--license-dest",
+                    str(dest / "LICENSE.upstream"),
+                    "--upstream-commit-file",
+                    str(dest / "upstream_commit.txt"),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "refusing import: 11 matched files exceeds --max-files 10",
+                result.stderr,
+            )
+            self.assertFalse(dest.exists())

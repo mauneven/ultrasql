@@ -22,8 +22,11 @@ Import flow:
 python3 third_party/sqllogictest/import.py \
   --source /path/to/audited/sqllogictest-checkout \
   --commit <upstream-commit-sha> \
-  --dest tests/slt/portable/imported
+  --include 'path/to/reviewed/shard/*.test' \
+  --dest tests/slt/portable/imported/<suite-name>
 ```
 
 The script refuses to import if it cannot find a license or copyright file in
-the source checkout.
+the source checkout. It also refuses more than 10 matched files by default;
+raise `--max-files` only in the same review that explains why the shard remains
+auditable.
