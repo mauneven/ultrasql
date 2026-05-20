@@ -94,6 +94,23 @@ async fn generate_series_descending_emits_descending() {
 }
 
 #[tokio::test]
+async fn unnest_string_to_array_emits_text_rows() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .query(
+            "SELECT * FROM unnest(string_to_array('red,green', ','))",
+            &[],
+        )
+        .await
+        .expect("unnest(string_to_array(...))");
+    let values: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+    assert_eq!(values, vec!["red".to_string(), "green".to_string()]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn generate_series_unknown_function_is_unsupported() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

@@ -156,18 +156,6 @@ fn bind_table_function(
 ) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
     let func_name = name.value.to_ascii_lowercase();
     let qualifier = alias.map_or_else(|| func_name.clone(), |a| a.value.clone());
-    let (schema, col_name) = match func_name.as_str() {
-        "generate_series" => (
-            Schema::new([Field::required("generate_series", DataType::Int64)])
-                .map_err(|e| PlanError::TypeMismatch(format!("generate_series schema: {e}")))?,
-            "generate_series".to_string(),
-        ),
-        _ => {
-            return Err(PlanError::NotSupported(
-                "table function (only generate_series supported)",
-            ));
-        }
-    };
     let mut bound_args: Vec<ScalarExpr> = Vec::with_capacity(args.len());
     let empty_schema = Schema::empty();
     for a in args {
@@ -179,10 +167,45 @@ fn bind_table_function(
             scope,
         )?);
     }
+    let (schema, col_name, col_type) = match func_name.as_str() {
+        "generate_series" => {
+            let col_type = DataType::Int64;
+            (
+                Schema::new([Field::required("generate_series", col_type.clone())])
+                    .map_err(|e| PlanError::TypeMismatch(format!("generate_series schema: {e}")))?,
+                "generate_series".to_string(),
+                col_type,
+            )
+        }
+        "unnest" => {
+            if bound_args.len() != 1 {
+                return Err(PlanError::NotSupported(
+                    "unnest: expected one array argument",
+                ));
+            }
+            let DataType::Array(element_type) = bound_args[0].data_type() else {
+                return Err(PlanError::TypeMismatch(
+                    "unnest: argument must be an array".to_owned(),
+                ));
+            };
+            let col_type = *element_type;
+            (
+                Schema::new([Field::required("unnest", col_type.clone())])
+                    .map_err(|e| PlanError::TypeMismatch(format!("unnest schema: {e}")))?,
+                "unnest".to_string(),
+                col_type,
+            )
+        }
+        _ => {
+            return Err(PlanError::NotSupported(
+                "table function (only generate_series and unnest supported)",
+            ));
+        }
+    };
     let from_scope = vec![ScopeEntry {
         qualifier,
         field_index: 0,
-        field: Field::required(&col_name, DataType::Int64),
+        field: Field::required(&col_name, col_type),
     }];
     let plan = LogicalPlan::FunctionScan {
         name: func_name,

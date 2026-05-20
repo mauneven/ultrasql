@@ -1,7 +1,7 @@
 //! Set-returning function (SRF) scan operator.
 //!
 //! [`FunctionScan`] evaluates a set-returning function and emits its rows
-//! as batches. For v0.5 only `generate_series` is implemented.
+//! as batches.
 //!
 //! # `generate_series`
 //!
@@ -11,15 +11,11 @@
 //!
 //! The output schema has a single `Int64` column named `generate_series`.
 //!
-//! # Future functions
-//!
-//! `unnest(array)` and other SRFs will be added in v0.6 when the array
-//! type lands.
-
-use ultrasql_core::{DataType, Field, Schema};
+use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
 
+use crate::seq_scan::build_batch;
 use crate::{ExecError, Operator};
 
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -36,6 +32,11 @@ pub enum SrfKind {
         /// Step between successive values. Zero emits nothing.
         step: i64,
     },
+    /// `unnest(anyarray)`.
+    Unnest {
+        /// Values to emit.
+        elements: Vec<Value>,
+    },
 }
 
 /// Set-returning function scan operator.
@@ -51,6 +52,8 @@ pub struct FunctionScan {
     schema: Schema,
     /// Current value for `generate_series`.
     current: i64,
+    /// Current offset for `unnest`.
+    position: usize,
     eof: bool,
 }
 
@@ -67,7 +70,25 @@ impl FunctionScan {
             kind: SrfKind::GenerateSeries { start, stop, step },
             schema,
             current: start,
+            position: 0,
             eof: step == 0, // zero step immediately exhausted
+        }
+    }
+
+    /// Construct an `unnest(array)` scan.
+    ///
+    /// The output schema has a single column named `unnest` with the
+    /// array element type.
+    #[must_use]
+    pub fn unnest(element_type: DataType, elements: Vec<Value>) -> Self {
+        let schema =
+            Schema::new([Field::required("unnest", element_type)]).expect("schema is well-formed");
+        Self {
+            kind: SrfKind::Unnest { elements },
+            schema,
+            current: 0,
+            position: 0,
+            eof: false,
         }
     }
 }
@@ -111,6 +132,26 @@ impl Operator for FunctionScan {
                     .map_err(ExecError::from)?;
                 Ok(Some(batch))
             }
+            SrfKind::Unnest { elements } => {
+                if self.position >= elements.len() {
+                    self.eof = true;
+                    return Ok(None);
+                }
+                let end = self
+                    .position
+                    .saturating_add(BATCH_TARGET_ROWS)
+                    .min(elements.len());
+                let rows: Vec<Vec<Value>> = elements[self.position..end]
+                    .iter()
+                    .cloned()
+                    .map(|value| vec![value])
+                    .collect();
+                self.position = end;
+                if self.position >= elements.len() {
+                    self.eof = true;
+                }
+                build_batch(&rows, &self.schema).map(Some)
+            }
         }
     }
 
@@ -121,7 +162,7 @@ impl Operator for FunctionScan {
 
 #[cfg(test)]
 mod tests {
-    use ultrasql_core::Value;
+    use ultrasql_core::{DataType, Value};
 
     use super::FunctionScan;
     use crate::Operator;
@@ -166,5 +207,25 @@ mod tests {
         let mut op = FunctionScan::generate_series(0, 6, 2);
         let vals = drain_i64(&mut op);
         assert_eq!(vals, vec![0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn unnest_text_array_emits_values_in_order() {
+        let mut op = FunctionScan::unnest(
+            DataType::Text { max_len: None },
+            vec![Value::Text("red".into()), Value::Text("green".into())],
+        );
+        let schema = op.schema().clone();
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch().expect("ok") {
+            out.extend(crate::filter_op::batch_to_rows(&batch, &schema).expect("decode"));
+        }
+        assert_eq!(
+            out,
+            vec![
+                vec![Value::Text("red".into())],
+                vec![Value::Text("green".into())]
+            ]
+        );
     }
 }

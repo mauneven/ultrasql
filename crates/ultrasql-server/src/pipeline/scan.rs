@@ -5,7 +5,7 @@ use std::sync::Arc;
 use ultrasql_catalog::TableEntry;
 use ultrasql_core::{RelationId, Value};
 use ultrasql_executor::{
-    CteScan, MemTableScan, Operator, ParallelSeqScan, Project, RowCodec, SeqScan,
+    CteScan, Eval, MemTableScan, Operator, ParallelSeqScan, Project, RowCodec, SeqScan,
     choose_parallel_seq_scan_workers,
 };
 use ultrasql_planner::ScalarExpr;
@@ -141,9 +141,30 @@ pub(super) fn lower_function_scan(
     name: &str,
     args: &[ScalarExpr],
 ) -> Result<Box<dyn Operator>, ServerError> {
+    if name == "unnest" {
+        if args.len() != 1 {
+            return Err(ServerError::Unsupported(
+                "unnest: expected one array argument",
+            ));
+        }
+        let value = Eval::new(args[0].clone())
+            .eval(&[])
+            .map_err(|e| ServerError::Ddl(format!("unnest argument evaluation failed: {e}")))?;
+        let Value::Array {
+            element_type,
+            elements,
+        } = value
+        else {
+            return Err(ServerError::Unsupported("unnest: argument must be array"));
+        };
+        return Ok(Box::new(ultrasql_executor::FunctionScan::unnest(
+            element_type,
+            elements,
+        )));
+    }
     if name != "generate_series" {
         return Err(ServerError::Unsupported(
-            "table function (only generate_series in v0.5)",
+            "table function (only generate_series and unnest supported)",
         ));
     }
     if args.len() < 2 || args.len() > 3 {

@@ -381,6 +381,20 @@ fn binds_create_table_jsonb_column_type() {
 }
 
 #[test]
+fn binds_unnest_table_function_from_text_array() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "SELECT * FROM unnest(string_to_array('red,green', ','))",
+        &cat,
+    )
+    .expect("bind ok");
+    assert_eq!(
+        plan.schema().fields()[0].data_type,
+        DataType::Text { max_len: None }
+    );
+}
+
+#[test]
 fn binds_create_table_primary_key_implies_not_null() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind("CREATE TABLE t (id INT PRIMARY KEY)", &cat).expect("bind ok");
