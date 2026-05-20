@@ -43,6 +43,7 @@ mod error;
 pub mod information_schema;
 mod memory;
 pub mod persistent;
+pub mod rag;
 mod traits;
 pub mod views;
 

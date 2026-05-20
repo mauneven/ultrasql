@@ -630,8 +630,18 @@ fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> Scala
             },
         },
         "json" | "jsonb" => ScalarExpr::Literal {
-            value: Value::Text(value.to_owned()),
+            value: Value::Jsonb(value.to_owned()),
             data_type: DataType::Jsonb,
+        },
+        "timestamp" => match parse_timestamp_literal(value) {
+            Some(micros) => ScalarExpr::Literal {
+                value: Value::Timestamp(micros),
+                data_type: DataType::Timestamp,
+            },
+            None => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::Timestamp,
+            },
         },
         "tsvector" | "tsquery" => ScalarExpr::Literal {
             value: Value::Text(value.to_owned()),
@@ -721,6 +731,44 @@ fn parse_date_literal(text: &str) -> Option<i32> {
         return None;
     }
     Some(days_since_epoch(year, month, day))
+}
+
+fn parse_timestamp_literal(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    let split = trimmed.find(' ').or_else(|| trimmed.find('T'))?;
+    let date = &trimmed[..split];
+    let time = &trimmed[split + 1..];
+    let days = i64::from(parse_date_literal(date)?);
+    let micros = parse_time_of_day_micros(time)?;
+    days.checked_mul(MICROS_PER_DAY)?.checked_add(micros)
+}
+
+fn parse_time_of_day_micros(text: &str) -> Option<i64> {
+    let mut parts = text.splitn(3, ':');
+    let hour: i64 = parts.next()?.parse().ok()?;
+    let minute: i64 = parts.next()?.parse().ok()?;
+    let second_text = parts.next()?;
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
+        return None;
+    }
+    let (second_part, frac_part) = second_text
+        .split_once('.')
+        .map_or((second_text, ""), |(sec, frac)| (sec, frac));
+    let second: i64 = second_part.parse().ok()?;
+    if !(0..=59).contains(&second) {
+        return None;
+    }
+    let mut frac_micros = 0_i64;
+    let mut scale = 100_000_i64;
+    for ch in frac_part.chars().take(6) {
+        let digit = i64::from(ch.to_digit(10)?);
+        frac_micros = frac_micros.checked_add(digit.checked_mul(scale)?)?;
+        scale /= 10;
+    }
+    hour.checked_mul(3_600_000_000)?
+        .checked_add(minute.checked_mul(60_000_000)?)?
+        .checked_add(second.checked_mul(1_000_000)?)?
+        .checked_add(frac_micros)
 }
 
 #[allow(
@@ -1221,6 +1269,14 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
             *value = Value::Float32(narrow);
             *data_type = DataType::Float32;
         }
+        (DataType::TimestampTz, Value::Timestamp(v)) => {
+            *value = Value::TimestampTz(*v);
+            *data_type = DataType::TimestampTz;
+        }
+        (DataType::Timestamp, Value::TimestampTz(v)) => {
+            *value = Value::Timestamp(*v);
+            *data_type = DataType::Timestamp;
+        }
         (
             DataType::Float32,
             Value::Decimal {
@@ -1280,6 +1336,10 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                 *value = Value::Bytea(bytes);
                 *data_type = DataType::Bytea;
             }
+        }
+        (DataType::Jsonb, Value::Text(text)) => {
+            *value = Value::Jsonb(text.clone());
+            *data_type = DataType::Jsonb;
         }
         _ => {}
     }
@@ -1536,7 +1596,8 @@ mod typed_literal_tests {
 
     use super::{
         BinaryOp, ScalarExpr, bind_literal, coerce_literal_to_type, days_since_epoch,
-        fold_date_interval, parse_date_literal, parse_interval_literal, try_fold_literal_binary,
+        fold_date_interval, parse_date_literal, parse_interval_literal, parse_timestamp_literal,
+        try_fold_literal_binary,
     };
 
     #[test]
@@ -1571,6 +1632,19 @@ mod typed_literal_tests {
         assert!(parse_date_literal("2000/01/01").is_none());
         assert!(parse_date_literal("2000-13-01").is_none());
         assert!(parse_date_literal("2000-01-32").is_none());
+    }
+
+    #[test]
+    fn timestamp_literal_parses_microseconds_since_epoch() {
+        assert_eq!(parse_timestamp_literal("2000-01-01 00:00:00"), Some(0));
+        assert_eq!(
+            parse_timestamp_literal("2000-01-02 00:00:00"),
+            Some(86_400_000_000)
+        );
+        assert_eq!(
+            parse_timestamp_literal("2000-01-01 01:02:03.456789"),
+            Some(3_723_456_789)
+        );
     }
 
     #[test]
