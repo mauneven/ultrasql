@@ -16,6 +16,11 @@ use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
 use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
 
+// Stable VECTOR payload layout: u32 little-endian dimension count,
+// followed by that many f32 little-endian elements.
+const VECTOR_DIMS_WIDTH: usize = std::mem::size_of::<u32>();
+const VECTOR_ELEMENT_WIDTH: usize = std::mem::size_of::<f32>();
+
 /// Binary codec bound to a fixed [`Schema`].
 ///
 /// Caches a `fixed_width_lower_bound` and a `decode_shape` tag
@@ -1518,14 +1523,14 @@ fn decode_vector_value(
     column: usize,
     ty: &DataType,
 ) -> Result<Value, RowCodecError> {
-    let dims_end = cursor.saturating_add(4);
+    let dims_end = cursor.saturating_add(VECTOR_DIMS_WIDTH);
     if bytes.len() < dims_end {
         return Err(RowCodecError::Truncated {
             needed: dims_end,
             have: bytes.len(),
         });
     }
-    let dims_raw: [u8; 4] =
+    let dims_raw: [u8; VECTOR_DIMS_WIDTH] =
         bytes[*cursor..dims_end]
             .try_into()
             .map_err(|_| RowCodecError::Truncated {
@@ -1544,7 +1549,7 @@ fn decode_vector_value(
     }
     let dims_usize = usize::try_from(dims).expect("u32 fits in usize on supported targets");
     let byte_len = dims_usize
-        .checked_mul(4)
+        .checked_mul(VECTOR_ELEMENT_WIDTH)
         .ok_or_else(|| RowCodecError::UnsupportedType {
             column,
             ty: ty.clone(),
@@ -1563,8 +1568,10 @@ fn decode_vector_value(
         });
     }
     let mut values = Vec::with_capacity(dims_usize);
-    for chunk in bytes[*cursor..values_end].chunks_exact(4) {
-        let raw: [u8; 4] = chunk.try_into().expect("chunks_exact(4)");
+    for chunk in bytes[*cursor..values_end].chunks_exact(VECTOR_ELEMENT_WIDTH) {
+        let raw: [u8; VECTOR_ELEMENT_WIDTH] = chunk
+            .try_into()
+            .expect("chunks_exact(VECTOR_ELEMENT_WIDTH)");
         let value = f32::from_le_bytes(raw);
         if !value.is_finite() {
             return Err(RowCodecError::Type {
@@ -1677,7 +1684,7 @@ mod tests {
     use proptest::prelude::*;
     use ultrasql_core::{DataType, Field, Schema, Value};
 
-    use super::{ColumnBuilder, RowCodec, RowCodecError};
+    use super::{ColumnBuilder, RowCodec, RowCodecError, VECTOR_DIMS_WIDTH, VECTOR_ELEMENT_WIDTH};
     use ultrasql_vec::column::Column;
 
     fn schema_bool() -> Schema {
@@ -1813,6 +1820,75 @@ mod tests {
         let codec = RowCodec::new(schema);
         let row = vec![Value::Vector(vec![1.0, 2.5, -3.0])];
         assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
+    }
+
+    #[test]
+    fn vector_binary_layout_is_stable() {
+        let schema = Schema::new([Field::required(
+            "embedding",
+            DataType::Vector { dims: Some(3) },
+        )])
+        .unwrap();
+        let codec = RowCodec::new(schema);
+        let encoded = codec
+            .encode(&[Value::Vector(vec![1.0, 2.5, -3.0])])
+            .unwrap();
+
+        assert_eq!(
+            encoded.len(),
+            1 + VECTOR_DIMS_WIDTH + 3 * VECTOR_ELEMENT_WIDTH
+        );
+        assert_eq!(
+            encoded,
+            vec![
+                0x00, // null bitmap: one non-null column
+                0x03, 0x00, 0x00, 0x00, // dims: u32 little-endian
+                0x00, 0x00, 0x80, 0x3f, // 1.0f32 little-endian
+                0x00, 0x00, 0x20, 0x40, // 2.5f32 little-endian
+                0x00, 0x00, 0x40, 0xc0, // -3.0f32 little-endian
+            ]
+        );
+    }
+
+    #[test]
+    fn vector_decode_rejects_truncated_payload() {
+        let schema = Schema::new([Field::required(
+            "embedding",
+            DataType::Vector { dims: Some(3) },
+        )])
+        .unwrap();
+        let codec = RowCodec::new(schema);
+        let mut encoded = vec![0x00];
+        encoded.extend_from_slice(&3_u32.to_le_bytes());
+        encoded.extend_from_slice(&1.0_f32.to_le_bytes());
+
+        let err = codec
+            .decode(&encoded)
+            .expect_err("truncated vector payload");
+        assert!(matches!(
+            err,
+            RowCodecError::Truncated { needed, have }
+                if needed == 1 + VECTOR_DIMS_WIDTH + 3 * VECTOR_ELEMENT_WIDTH
+                    && have == encoded.len()
+        ));
+    }
+
+    #[test]
+    fn vector_decode_rejects_non_finite_payload() {
+        let schema = Schema::new([Field::required(
+            "embedding",
+            DataType::Vector { dims: Some(1) },
+        )])
+        .unwrap();
+        let codec = RowCodec::new(schema);
+        let mut encoded = vec![0x00];
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
+        encoded.extend_from_slice(&f32::NAN.to_le_bytes());
+
+        let err = codec
+            .decode(&encoded)
+            .expect_err("non-finite vector payload");
+        assert!(matches!(err, RowCodecError::Type { column: 0, .. }));
     }
 
     #[test]
