@@ -125,6 +125,9 @@ pub struct BufferPool<L: PageLoader> {
     page_table: DashMap<PageId, usize>,
     loader: L,
     clock_hand: AtomicUsize,
+    /// Serializes miss installation so one `PageId` cannot be loaded
+    /// into multiple frames concurrently.
+    miss_lock: Mutex<()>,
     /// Optional WAL sink for LSN-gated dirty-page flushing.
     ///
     /// When `Some`, [`BufferPool::try_flush_dirty`] will only flush frames
@@ -206,6 +209,7 @@ impl<L: PageLoader> BufferPool<L> {
             page_table: DashMap::with_capacity(capacity),
             loader,
             clock_hand: AtomicUsize::new(0),
+            miss_lock: Mutex::new(()),
             wal_sink: None,
             counters: Counters::default(),
         }
@@ -234,6 +238,7 @@ impl<L: PageLoader> BufferPool<L> {
             page_table: DashMap::with_capacity(capacity),
             loader,
             clock_hand: AtomicUsize::new(0),
+            miss_lock: Mutex::new(()),
             wal_sink: Some(wal),
             counters: Counters::default(),
         }
@@ -384,6 +389,22 @@ impl<L: PageLoader> BufferPool<L> {
             // count above already supplies the AcqRel needed to
             // synchronize with eviction; the clock-ref store has no
             // happens-before consumers, so `Relaxed` is sufficient.
+            self.frames[frame_idx]
+                .clock_ref
+                .store(true, Ordering::Relaxed);
+            self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(PageGuard {
+                pool: Arc::clone(self),
+                frame_idx,
+            });
+        }
+
+        let _miss = self.miss_lock.lock();
+
+        if let Some(frame_idx) = self.lookup(page_id) {
+            self.frames[frame_idx]
+                .pin_count
+                .fetch_add(1, Ordering::AcqRel);
             self.frames[frame_idx]
                 .clock_ref
                 .store(true, Ordering::Relaxed);
