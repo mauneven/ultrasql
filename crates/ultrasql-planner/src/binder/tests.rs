@@ -459,6 +459,31 @@ fn binds_vector_inner_product_functions_as_float64() {
 }
 
 #[test]
+fn binds_vector_scalar_functions_with_pgvector_return_types() {
+    let cat = embeddings_catalog();
+    let plan = parse_and_bind(
+        "SELECT l2_distance(embedding, VECTOR '[1,2,4]'), \
+                cosine_distance(embedding, VECTOR '[3,-6,3]'), \
+                dot_product(embedding, VECTOR '[4,5,6]'), \
+                vector_dims(embedding) \
+         FROM embeddings",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::Project { exprs, schema, .. } = &plan else {
+        panic!("expected Project, got {plan:?}");
+    };
+    assert_eq!(exprs[0].0.data_type(), DataType::Float64);
+    assert_eq!(exprs[1].0.data_type(), DataType::Float64);
+    assert_eq!(exprs[2].0.data_type(), DataType::Float64);
+    assert_eq!(exprs[3].0.data_type(), DataType::Int32);
+    assert_eq!(schema.field_at(0).data_type, DataType::Float64);
+    assert_eq!(schema.field_at(1).data_type, DataType::Float64);
+    assert_eq!(schema.field_at(2).data_type, DataType::Float64);
+    assert_eq!(schema.field_at(3).data_type, DataType::Int32);
+}
+
+#[test]
 fn binds_vector_typed_literal_projection() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind("SELECT VECTOR '[1,2,3]'", &cat).expect("bind ok");

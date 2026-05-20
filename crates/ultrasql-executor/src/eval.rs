@@ -259,7 +259,10 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "array_to_string" => eval_array_to_string(args),
         "string_to_array" => eval_string_to_array(args),
         "array_cat" => eval_array_cat(args),
+        "l2_distance" => eval_vector_metric(args, VectorDistanceOp::L2),
+        "cosine_distance" => eval_vector_metric(args, VectorDistanceOp::Cosine),
         "inner_product" | "dot_product" => eval_vector_metric(args, VectorDistanceOp::InnerProduct),
+        "vector_dims" => eval_vector_dims(args),
         "coalesce" => Ok(args
             .iter()
             .find(|v| !matches!(v, Value::Null))
@@ -1070,6 +1073,28 @@ fn eval_vector_metric(args: &[Value], op: VectorDistanceOp) -> Result<Value, Eva
         return Ok(Value::Null);
     }
     vector_distance(args[0].clone(), args[1].clone(), op)
+}
+
+fn eval_vector_dims(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "vector_dims: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Value::Vector(vector) = &args[0] else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "vector_dims requires Vector, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let dims = i32::try_from(vector.len())
+        .map_err(|_| EvalError::Type("vector_dims: dimension count exceeds int32".to_owned()))?;
+    Ok(Value::Int32(dims))
 }
 
 fn vector_distance(left: Value, right: Value, op: VectorDistanceOp) -> Result<Value, EvalError> {
@@ -2559,6 +2584,36 @@ mod tests {
             ));
             assert_eq!(ev.eval(&[]).unwrap(), Value::Float64(32.0), "{name}");
         }
+    }
+
+    #[test]
+    fn vector_distance_functions_evaluate() {
+        let l2 = Eval::new(call(
+            "l2_distance",
+            vec![
+                lit_vector(vec![1.0, 2.0, 3.0]),
+                lit_vector(vec![1.0, 2.0, 4.0]),
+            ],
+            DataType::Float64,
+        ));
+        assert_eq!(l2.eval(&[]).unwrap(), Value::Float64(1.0));
+
+        let cosine = Eval::new(call(
+            "cosine_distance",
+            vec![lit_vector(vec![1.0, 0.0]), lit_vector(vec![0.0, 1.0])],
+            DataType::Float64,
+        ));
+        assert_eq!(cosine.eval(&[]).unwrap(), Value::Float64(1.0));
+    }
+
+    #[test]
+    fn vector_dims_function_returns_dimension() {
+        let ev = Eval::new(call(
+            "vector_dims",
+            vec![lit_vector(vec![1.0, 2.0, 3.0])],
+            DataType::Int32,
+        ));
+        assert_eq!(ev.eval(&[]).unwrap(), Value::Int32(3));
     }
 
     #[test]
