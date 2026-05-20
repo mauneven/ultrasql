@@ -1,7 +1,7 @@
 //! B+ tree index access method (Lehman-Yao B-link tree variant).
 //!
 //! The tree indexes a single-column key (any type implementing [`Key`])
-//! to a [`TupleId`]. Pages are obtained from the [`BufferPool`] and the
+//! to a [`ultrasql_core::TupleId`]. Pages are obtained from the [`BufferPool`] and the
 //! tree's per-page metadata lives in the page's *special* area, leaving
 //! the body for packed key/value entries.
 //!
@@ -35,18 +35,18 @@
 //! - This file holds the [`BTree`] struct, the [`Key`] trait, the
 //!   [`BTreeError`] type, the on-page constants, and the
 //!   `create`/`open`/`root_block` methods.
-//! - [`node`] holds the on-page layout: [`NodeMeta`], leaf/internal
+//! - `node` holds the on-page layout: `NodeMeta`, leaf/internal
 //!   entry encodings, page initialisation, and the descent /
 //!   right-link helpers.
-//! - [`insert`] holds the insertion path — leaf split, internal
+//! - `insert` holds the insertion path — leaf split, internal
 //!   split, and split propagation up to a new root.
-//! - [`lookup`] holds the point-lookup path and the descent helpers
+//! - `lookup` holds the point-lookup path and the descent helpers
 //!   that walk an existing tree to the relevant leaf.
-//! - [`iter`] holds the forward and backward range iterators.
-//! - [`adapters`] holds the expression / partial / covering index
+//! - `iter` holds the forward and backward range iterators.
+//! - `adapters` holds the expression / partial / covering index
 //!   wrappers plus the composite-key type and the concurrent-build
 //!   state machine.
-//! - [`vacuum`] holds the `VACUUM` cleanup pass.
+//! - `vacuum` holds the `VACUUM` cleanup pass.
 //!
 //! On-page layout
 //! --------------

@@ -3,8 +3,8 @@
 //! The parser consumes tokens from a [`Lexer`] and produces a
 //! [`Statement`] tree. Statement-level structure is parsed by
 //! recursive descent (one function per non-terminal); expressions go
-//! through a Pratt parser keyed off [`BinaryOp::precedence`] so adding
-//! a new operator costs one match-arm.
+//! through a Pratt parser keyed off [`crate::ast::BinaryOp::precedence`]
+//! so adding a new operator costs one match-arm.
 //!
 //! The parser keeps a one-token lookahead via a buffered next-token
 //! function. On EOF, every grammar rule that requires a terminator
@@ -14,19 +14,19 @@
 //! # Module layout
 //!
 //! - This file holds the [`Parser`] struct, its top-level statement
-//!   dispatcher [`Parser::parse_one`], the CREATE/DROP/ALTER routing,
-//!   the token buffering helpers ([`Parser::peek`], [`Parser::advance`],
+//!   dispatcher `Parser::parse_one`, the CREATE/DROP/ALTER routing,
+//!   the token buffering helpers (`Parser::peek`, `Parser::advance`,
 //!   …) and the recursion-depth guard.
-//! - [`expr`] holds the Pratt expression parser proper
+//! - `expr` holds the Pratt expression parser proper
 //!   (`parse_expr_with_precedence`, `parse_prefix`, identifier/call
 //!   parsing, `CAST`, type names).
-//! - [`expr_postfix`] holds postfix operators that decorate an already-
+//! - `expr_postfix` holds postfix operators that decorate an already-
 //!   parsed expression: `BETWEEN`, `IS`, array subscript / slice,
 //!   `AT TIME ZONE`.
-//! - [`expr_special`] holds the syntactic-shape expressions whose
+//! - `expr_special` holds the syntactic-shape expressions whose
 //!   first token is a keyword: `CASE`, `COALESCE`, `NULLIF`,
 //!   `GREATEST`/`LEAST`, `ROW`.
-//! - [`binary_ops`] holds the binary-operator detection helpers used
+//! - `binary_ops` holds the binary-operator detection helpers used
 //!   by the Pratt loop (`peek_binary_op` and `consume_binary_op`).
 
 use crate::ast::Statement;

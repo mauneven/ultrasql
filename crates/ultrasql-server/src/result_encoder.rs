@@ -56,7 +56,7 @@ const FORMAT_TEXT: i16 = 0;
 /// Outcome of draining a single `SELECT` execution: the messages to
 /// send to the client, in transmission order.
 ///
-/// The result is dispatched by [`crate::Session::send_query_result`]
+/// The result is dispatched by `Session::send_query_result`,
 /// which prefers `streamed_body` when present (the SELECT hot-path
 /// streams its own wire bytes) and otherwise coalesces every entry of
 /// `messages` into a single `write_all` + `flush`.

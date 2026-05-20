@@ -1,23 +1,23 @@
 //! Logical-plan to physical-operator conversion.
 //!
-//! The v0.5 server lowers a small subset of [`LogicalPlan`] nodes into
+//! The v0.5 server lowers a small subset of `LogicalPlan` nodes into
 //! the executor's `Operator` tree. Anything outside that subset is
-//! reported via [`ServerError::Unsupported`] so the client sees a
+//! reported via `ServerError::Unsupported` so the client sees a
 //! precise error rather than a panic.
 //!
 //! Supported lowerings:
 //!
-//! - [`LogicalPlan::Scan`] -> [`MemTableScan`] backed by per-table
+//! - `LogicalPlan::Scan` -> `MemTableScan` backed by per-table
 //!   pre-materialized batches loaded by [`SampleTables`] at startup.
-//! - [`LogicalPlan::Filter`] with predicate `col = i32_literal` ->
-//!   [`FilterEqI32`].
-//! - [`LogicalPlan::Project`] over pure column references ->
-//!   [`Project`].
-//! - [`LogicalPlan::Limit`] -> [`Limit`] (`LIMIT n OFFSET m`,
+//! - `LogicalPlan::Filter` with predicate `col = i32_literal` ->
+//!   `FilterEqI32`.
+//! - `LogicalPlan::Project` over pure column references ->
+//!   `Project`.
+//! - `LogicalPlan::Limit` -> `Limit` (`LIMIT n OFFSET m`,
 //!   `OFFSET m` with no `LIMIT`, and the common `LIMIT n OFFSET 0`).
-//! - [`LogicalPlan::Sort`] -> [`Sort`] (in-memory; spill-to-disk lands
+//! - `LogicalPlan::Sort` -> `Sort` (in-memory; spill-to-disk lands
 //!   with the `work_mem` budget in v0.6).
-//! - [`LogicalPlan::SetOp`] -> [`SetOp`] for `UNION`, `INTERSECT`, and
+//! - `LogicalPlan::SetOp` -> `SetOp` for `UNION`, `INTERSECT`, and
 //!   `EXCEPT` (each in both `ALL` and `DISTINCT` quantifier forms).
 //!   The two children are lowered recursively through the same path so
 //!   a set-op can sit on top of any other supported lowering. The
@@ -25,8 +25,8 @@
 //!   (see `binder::bind_set_op`); we re-check arity at lowering time
 //!   so a hand-built plan that bypasses the binder still surfaces a
 //!   precise error rather than producing wrong rows.
-//! - [`LogicalPlan::Cte`] -> materialise the definition into
-//!   [`CteScan`]-backed batches once per query execution; the body is
+//! - `LogicalPlan::Cte` -> materialise the definition into
+//!   `CteScan`-backed batches once per query execution; the body is
 //!   lowered with the CTE name bound to the buffer via the
 //!   [`LowerCtx::cte_buffers`] overlay, so every body-side reference
 //!   reuses the same materialised rows. `WITH RECURSIVE` is rejected
@@ -37,7 +37,7 @@
 //! The executor crate ships [`ultrasql_executor::physical::build_operator`],
 //! which performs the same lowering at a higher level. The lowerer
 //! here is intentionally separate for one reason: the v0.5
-//! [`FilterEqI32`] operator only handles numeric columns and rejects
+//! `FilterEqI32` operator only handles numeric columns and rejects
 //! a batch that contains a Utf8 column at any position. The server's
 //! sample table includes a `name TEXT` column, so we push the
 //! projection-required-for-evaluation below the filter and pass the
@@ -141,7 +141,7 @@ struct SampleTable {
 /// The server registers tables with the planner's
 /// [`InMemoryCatalog`] *and* keeps their pre-built batch contents
 /// here. When the lowerer sees a `Scan` it consults the registry to
-/// build a fresh [`MemTableScan`]; the catalog tells the planner what
+/// build a fresh `MemTableScan`; the catalog tells the planner what
 /// columns exist, the registry tells the executor what rows to emit.
 ///
 /// The registry is `Send + Sync` so a single `Arc<SampleTables>` can
@@ -193,7 +193,7 @@ impl DataSource for SampleTables {
     }
 }
 
-/// Lower a logical plan to a boxed [`Operator`] tree.
+/// Lower a logical plan to a boxed `Operator` tree.
 #[derive(Debug)]
 pub struct LowerCtx<'a> {
     /// Legacy sample-table registry; used when the catalog snapshot has
@@ -224,8 +224,8 @@ pub struct LowerCtx<'a> {
     /// Materialised non-recursive CTE bindings, keyed by lower-cased CTE
     /// name. Populated by the `LogicalPlan::Cte` arm in `lower_query`
     /// before lowering the body, then consulted by
-    /// [`lower_catalog_or_sample_scan`] so a body-side
-    /// `Scan { table: "<cte_name>" }` resolves to a [`CteScan`] over the
+    /// `lower_catalog_or_sample_scan` so a body-side
+    /// `Scan { table: "<cte_name>" }` resolves to a `CteScan` over the
     /// materialised buffer instead of a catalog or sample-table lookup.
     ///
     /// Default-empty so the constructors used outside the CTE path do
@@ -262,7 +262,7 @@ pub struct LowerCtx<'a> {
 /// Owns the batches produced by running the CTE's definition plan to
 /// completion, plus the schema those batches conform to. Multiple
 /// references to the same CTE inside the body produce independent
-/// [`CteScan`] operators backed by the same `Arc`-shared buffer, so the
+/// `CteScan` operators backed by the same `Arc`-shared buffer, so the
 /// definition is evaluated exactly once per query execution (matching
 /// PostgreSQL's CTE-materialisation semantics).
 #[derive(Clone, Debug)]

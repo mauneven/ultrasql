@@ -18,11 +18,11 @@
 //! - `Float32` and `Float64` — order-preserving sign-magnitude flip
 //!   so the `i64` key sorts identically to the source float, including
 //!   subnormals and the two signed zeros. See
-//!   [`IndexKeyEncoding::encode_value`] for the encoding contract.
+//!   `IndexKeyEncoding::encode_value` for the encoding contract.
 //! - `Text` — first 8 bytes of the UTF-8 representation, packed big-
 //!   endian into an `i64`. Strings that share the same 8-byte prefix
 //!   collide in the index; the probe path **must** consult the heap
-//!   tuple to filter false positives. See [`Self::needs_heap_recheck`].
+//!   tuple to filter false positives. See `IndexKeyEncoding::needs_heap_recheck`.
 //! - Composite (multi-column) keys — only the common shape of two
 //!   "small" integer-shaped columns (`Bool` / `Int16` / `Int32`) is
 //!   supported. The two encoded `i32` halves are packed `(hi, lo) →
@@ -43,7 +43,8 @@
 //!   value_a = value_b  iff  enc(value_a) = enc(value_b)
 //! ```
 //!
-//! For [`Self::TextPrefix8`] and [`Self::CompositeTwoInts`] the right-
+//! For `IndexKeyEncoding::TextPrefix8` and
+//! `IndexKeyEncoding::CompositeTwoInts` the right-
 //! hand `=` direction does **not** hold: distinct values may share an
 //! encoded key. The heap-side recheck in `probe_index` restores
 //! correctness.

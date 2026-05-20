@@ -630,7 +630,7 @@ pub struct Server {
     pub txn_manager: Arc<TransactionManager>,
     /// Cross-protocol optimized-plan cache.
     ///
-    /// Keyed on raw SQL text (a [`PlanCacheKey`] wraps a `String`);
+    /// Keyed on raw SQL text (a `PlanCacheKey` wraps a `String`);
     /// stores the post-optimizer [`LogicalPlan`] so a repeat Simple Query
     /// or an Extended Query Parse over the same statement skips the
     /// rule-rewrite phase.
@@ -704,7 +704,7 @@ pub struct Server {
     pub next_pid: std::sync::atomic::AtomicU32,
     /// Registry of (pid, secret) → `CancelFlag` for in-flight queries.
     ///
-    /// Populated by each [`Session`] on construction so a peer
+    /// Populated by each `Session` on construction so a peer
     /// `CancelRequest` carrying matching `(pid, secret)` flips the
     /// session's `CancelFlag`. Operators that loop over batches
     /// (`SeqScan`, `HashAggregate`) poll the flag between batches and

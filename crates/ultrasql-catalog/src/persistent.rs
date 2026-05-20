@@ -33,7 +33,7 @@
 //! On a warm restart the heap is non-empty.
 //! [`PersistentCatalog::bootstrap_from_heap`] scans the `pg_class`,
 //! `pg_attribute`, and `pg_index` heap pages, decodes each user row via
-//! [`crate::encoding::ClassRow`] / [`crate::encoding::decode_attribute_row`] /
+//! [`ClassRow`] / [`crate::encoding::decode_attribute_row`] /
 //! [`crate::encoding::decode_index_row`] and
 //! [`crate::encoding::schema_from_attributes`], decodes durable
 //! `pg_statistic` / `pg_statistic_ext` rows, then overlays the decoded user

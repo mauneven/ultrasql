@@ -2,9 +2,8 @@
 //!
 //! Every kernel pairs a vectorized implementation (the 64-lane iterator loop
 //! that LLVM autovectorizes) with a `_scalar` reference implementation that
-//! computes the same result one element at a time. The proptests in
-//! [`super::proptests`] cross-check the two implementations on 1024 random
-//! inputs.
+//! computes the same result one element at a time. The `proptests` module
+//! cross-checks the two implementations on 1024 random inputs.
 
 use super::{apply_null_numeric, cmp_to_i32, cmp_to_i64};
 use crate::bitmap::Bitmap;

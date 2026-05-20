@@ -12,7 +12,7 @@
 //!
 //! - **No per-cell allocation.** Integer cells are formatted with the
 //!   inline [`itoa`-style](https://en.wikipedia.org/wiki/Itoa) routines in
-//!   [`write_int32_text`] / [`write_int64_text`]; the bytes land straight
+//!   `write_int32_text` / `write_int64_text`; the bytes land straight
 //!   in the sink. Boolean cells write a single byte. Float and text cells
 //!   fall back to the legacy `encode_text_value` allocator — those types
 //!   are out of scope for the `select_scan_10k` workload but we keep
@@ -20,7 +20,7 @@
 //!   bench matrix does not regress.
 //!
 //! - **No `BackendMessage` materialisation.** Callers drive
-//!   [`write_data_row`] in a tight loop over the operator's batches and
+//!   `write_data_row` in a tight loop over the operator's batches and
 //!   then emit a trailing `CommandComplete` via the regular
 //!   `encode_backend` path. The session loop drains the sink with a
 //!   single `write_all` + `flush` rather than one per row.

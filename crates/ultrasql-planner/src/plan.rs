@@ -606,7 +606,7 @@ pub enum LogicalPlan {
     ///
     /// This is the physical counterpart of `SELECT FOR UPDATE / FOR SHARE`
     /// variants. The optimizer leaves the node in place; the executor wraps
-    /// the child operator with a [`ultrasql_executor::LockRows`] callback
+    /// the child operator with an `ultrasql_executor::LockRows` callback
     /// that acquires the requested lock on each row's `TupleId` before
     /// yielding the row to the caller.
     ///
@@ -935,7 +935,7 @@ pub enum LogicalPlan {
     /// Set-returning function in `FROM`, e.g. `FROM generate_series(1, 10)`.
     ///
     /// The lowerer dispatches on `name` to construct the matching
-    /// [`ultrasql_executor::FunctionScan`] variant.
+    /// `ultrasql_executor::FunctionScan` variant.
     FunctionScan {
         /// Function name (case-folded). v0.5 supports `generate_series`.
         name: String,
@@ -1198,7 +1198,7 @@ pub enum CopyFormat {
 
 /// Resolved window function applied by a [`LogicalPlan::Window`] node.
 ///
-/// Each variant maps 1-to-1 to an [`ultrasql_executor::WindowFunc`]
+/// Each variant maps 1-to-1 to an `ultrasql_executor::WindowFunc`
 /// variant; the pipeline lowerer performs the trivial conversion at
 /// operator-construction time.
 #[derive(Clone, Debug, PartialEq)]

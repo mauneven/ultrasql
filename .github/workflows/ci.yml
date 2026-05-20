@@ -80,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: fmt
     env:
-      RUSTDOCFLAGS: "-D warnings -A rustdoc::broken-intra-doc-links -A rustdoc::private-intra-doc-links -A rustdoc::redundant-explicit-links"
+      RUSTDOCFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

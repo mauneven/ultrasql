@@ -42,8 +42,8 @@
 //! - [`decode_frontend`] holds the frontend payload decoders and the
 //!   special startup-message path.
 //! - [`decode_backend`] holds the backend payload decoder.
-//! - [`encode`] holds the encoders for both directions.
-//! - [`util`] holds the framing helpers, the `PayloadReader`, and the
+//! - `encode` holds the encoders for both directions.
+//! - `util` holds the framing helpers, the `PayloadReader`, and the
 //!   small integer-conversion utilities used across the codec.
 
 use bytes::BytesMut;

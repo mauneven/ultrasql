@@ -17,7 +17,7 @@
 //! ## Per-connection state
 //!
 //! Two `HashMap`s store named statements and named portals. They are
-//! owned by the [`Session`] struct in `lib.rs` and accessed only by the
+//! owned by the `Session` struct in `lib.rs` and accessed only by the
 //! connection's own task, so no synchronisation primitive is needed
 //! (per AGENTS.md §5: "default to the simplest primitive that meets the
 //! workload" — the workload here is single-threaded). The empty string
@@ -26,9 +26,9 @@
 //! ## Parameter substitution strategy
 //!
 //! Bind decodes each parameter value (per its format code and the
-//! statement's declared type OID) into a [`Value`], then walks the
+//! statement's declared type OID) into a `Value`, then walks the
 //! prepared statement's bound [`LogicalPlan`] and rewrites every
-//! [`ScalarExpr::Parameter`] into a [`ScalarExpr::Literal`] of the
+//! `ScalarExpr::Parameter` into a `ScalarExpr::Literal` of the
 //! corresponding value. The substituted plan is stored in the portal
 //! and executed exactly the same way as Simple Query plans.
 //!
@@ -137,7 +137,7 @@ pub struct BoundPortal {
 
 /// Per-connection Extended Query state.
 ///
-/// One instance per [`Session`]. Owned by the session, accessed only by
+/// One instance per `Session`. Owned by the session, accessed only by
 /// the connection's task, so no synchronisation primitive is needed.
 ///
 /// `pipeline_failed` implements the spec's "ignore everything until
