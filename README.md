@@ -369,8 +369,7 @@ ultrasql/
 ├── PERFORMANCE.md             performance engineering rules
 ├── BENCHMARKS.md              benchmark methodology
 ├── ROADMAP.md                 shipping plan
-├── CONTRIBUTING.md            how to contribute
-├── AGENTS.md                  operating manual (AI + human contributors)
+├── CONTRIBUTING.md            maintainer and contribution guide
 ├── SECURITY.md                vulnerability disclosure
 ├── RFC_PROCESS.md             how design changes land
 ├── crates/
@@ -397,11 +396,10 @@ ultrasql/
 
 ---
 
-## Contributing
-
 [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the PR checklist, and
-the RFC process for cross-subsystem changes. PRs need tests; changes
-to benchmarked paths need before/after numbers from the same host.
+the RFC process for cross-subsystem changes. PRs from humans need tests;
+changes to benchmarked paths need before/after numbers from the same
+host.
 
 To wire the repository hooks run:
 
@@ -413,13 +411,14 @@ The pre-commit hook runs `readme-render` and re-stages README.md when
 the benchmark tables change. The pre-push hook enforces fmt, clippy, doc,
 test, and the regression gate.
 
-See [AGENTS.md](AGENTS.md) for the complete operating manual, including
-guidance for tool attributions.
+See [AGENTS.md](AGENTS.md) for the complete operating manual and AI
+with ultrasql unless a human contributor is explicitly added.
 
 ---
 
 ## License
 
 Dual-licensed under the [Apache License 2.0](LICENSE-APACHE) and the
-[MIT License](LICENSE-MIT). Contributions are accepted under both
-simultaneously, per [CONTRIBUTING.md](CONTRIBUTING.md).
+[MIT License](LICENSE-MIT). External human contributions, if accepted,
+are licensed under both simultaneously, per
+[CONTRIBUTING.md](CONTRIBUTING.md).

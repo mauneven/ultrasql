@@ -1,7 +1,9 @@
 # Contributing to UltraSQL
 
-UltraSQL is developed in the open. Pull requests are welcome; this
-document tells you how to send one that has a good chance of landing.
+Pull requests from humans
+are welcome; this document tells you how to send one that has a good
+chance of landing. automation may support a human submitter, but automation
+are not project contributors, maintainers, or co-authors.
 
 ---
 
@@ -135,6 +137,8 @@ contribution, you agree that:
   it under both licenses.
 - You license the contribution under both Apache 2.0 and MIT
   simultaneously.
+- You do not credit automation as contributors or co-authors; the human
+  submitter owns and is responsible for the contribution.
 
 We do not require a separate CLA document. The act of submitting a
 PR is the agreement.

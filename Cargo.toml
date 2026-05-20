@@ -28,7 +28,6 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
-authors = ["UltraSQL Contributors"]
 repository = "https://github.com/mauneven/ultrasql"
 homepage = "https://ultrasql.org"
 documentation = "https://docs.ultrasql.org"

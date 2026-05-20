@@ -22,8 +22,7 @@ the breakage in each release's notes.
   not landed in `pipeline.rs` / `lib.rs` dispatch are marked ⚠️ Partial
   with the gap named, not ✅.
 
-This file is the source of truth for both humans and tool attributions —
-every item is actionable without further context.
+This file is the source of truth for the project. Every item is actionable without further context.
 
 ---
 
