@@ -145,6 +145,14 @@ fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
             state.write_u8(15);
             v.hash(state);
         }
+        Value::Array {
+            element_type,
+            elements,
+        } => {
+            state.write_u8(16);
+            element_type.hash(state);
+            elements.hash(state);
+        }
     }
 }
 
@@ -1470,16 +1478,19 @@ fn finalise(state: &AggState) -> Value {
             }
         }
         AggState::ArrayAgg(items) => {
-            // Encode as a Text representation for the v0.5 row model.
-            // A native Array value type is a v1.0 task.
-            Value::Text(format!(
-                "{{{}}}",
-                items
+            if items.is_empty() {
+                Value::Null
+            } else {
+                let element_type = items
                     .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            ))
+                    .find(|v| !v.is_null())
+                    .map(Value::data_type)
+                    .unwrap_or(DataType::Null);
+                Value::Array {
+                    element_type,
+                    elements: items.clone(),
+                }
+            }
         }
         AggState::Welford {
             count,
@@ -1929,6 +1940,36 @@ mod tests {
             rows[0][0],
             Value::Int64(3),
             "COUNT(v) counts all non-null values"
+        );
+    }
+
+    #[test]
+    fn hash_agg_array_agg_returns_native_array() {
+        let schema = schema_group_val();
+        let scan = MemTableScan::new(
+            schema,
+            vec![make_batch_i32_i64(&[(1, 10), (1, 20), (1, 30)])],
+        );
+        let agg = LogicalAggregateExpr {
+            func: AggregateFunc::ArrayAgg,
+            arg: Some(col("val", 1, DataType::Int64)),
+            distinct: false,
+            output_name: "vals".into(),
+            data_type: DataType::Array(Box::new(DataType::Int64)),
+        };
+        let out_schema = Schema::new([Field::required(
+            "vals",
+            DataType::Array(Box::new(DataType::Int64)),
+        )])
+        .expect("schema ok");
+        let mut op = HashAggregate::new(Box::new(scan), vec![], vec![agg], out_schema);
+        let rows = drain_all(&mut op);
+        assert_eq!(
+            rows,
+            vec![vec![Value::Array {
+                element_type: DataType::Int64,
+                elements: vec![Value::Int64(10), Value::Int64(20), Value::Int64(30)]
+            }]]
         );
     }
 

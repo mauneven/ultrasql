@@ -1031,6 +1031,7 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
             DataType::Text { .. }
             | DataType::Range(_)
             | DataType::Geometry(_)
+            | DataType::Array(_)
             | DataType::Uuid
             | DataType::Bytea => {
                 let mut strings: Vec<Option<String>> = Vec::with_capacity(n_rows);
@@ -1046,6 +1047,11 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                             if expected == &v.geometry_type =>
                         {
                             strings.push(Some(v.to_string()));
+                        }
+                        (DataType::Array(expected), Value::Array { element_type, .. })
+                            if expected.as_ref() == element_type =>
+                        {
+                            strings.push(Some(row[col_idx].to_string()));
                         }
                         (DataType::Uuid, Value::Uuid(v)) => {
                             strings.push(Some(Value::Uuid(*v).to_string()));

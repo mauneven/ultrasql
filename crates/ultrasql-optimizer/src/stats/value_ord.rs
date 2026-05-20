@@ -61,6 +61,16 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Ordering {
         (Value::Geometry(la), Value::Geometry(lb)) if la.geometry_type == lb.geometry_type => {
             la.to_string().cmp(&lb.to_string())
         }
+        (
+            Value::Array {
+                element_type: l_ty,
+                elements: l_vals,
+            },
+            Value::Array {
+                element_type: r_ty,
+                elements: r_vals,
+            },
+        ) if l_ty == r_ty => compare_value_slices(l_vals, r_vals),
 
         // Cross-type fallback: order by discriminant.
         _ => discriminant(a).cmp(&discriminant(b)),
@@ -176,6 +186,19 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             out.extend_from_slice(v.to_string().as_bytes());
             out
         }
+        Value::Array {
+            element_type,
+            elements,
+        } => {
+            let mut out = vec![18];
+            out.extend_from_slice(element_type.to_string().as_bytes());
+            out.push(0);
+            for element in elements {
+                out.extend_from_slice(&value_key(element));
+                out.push(0);
+            }
+            out
+        }
     }
 }
 
@@ -205,6 +228,16 @@ fn to_f64(v: &Value) -> f64 {
     }
 }
 
+fn compare_value_slices(a: &[Value], b: &[Value]) -> Ordering {
+    for (left, right) in a.iter().zip(b) {
+        let ordering = compare_values(left, right);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    a.len().cmp(&b.len())
+}
+
 const fn discriminant(v: &Value) -> u8 {
     match v {
         Value::Null => 0,
@@ -225,6 +258,7 @@ const fn discriminant(v: &Value) -> u8 {
         Value::Interval { .. } => 15,
         Value::Range(_) => 16,
         Value::Geometry(_) => 17,
+        Value::Array { .. } => 18,
     }
 }
 

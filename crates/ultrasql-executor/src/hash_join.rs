@@ -845,6 +845,14 @@ impl std::hash::Hash for OrderedValue {
                 state.write_u8(15);
                 v.hash(state);
             }
+            Value::Array {
+                element_type,
+                elements,
+            } => {
+                state.write_u8(16);
+                element_type.hash(state);
+                elements.hash(state);
+            }
         }
     }
 }

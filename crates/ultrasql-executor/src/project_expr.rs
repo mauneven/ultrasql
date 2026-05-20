@@ -225,6 +225,32 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
                 },
             )
         }
+        DataType::Array(expected) => {
+            let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    Value::Null => strings.push(None),
+                    Value::Array { element_type, .. } if expected.as_ref() == element_type => {
+                        strings.push(Some(v.to_string()));
+                    }
+                    other => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "projection: expected Array at row {i}, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                }
+            }
+            Ok(
+                match encode_strings_auto(
+                    strings.iter().map(|v| v.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                },
+            )
+        }
         DataType::Uuid => {
             let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
             for (i, v) in values.iter().enumerate() {

@@ -346,6 +346,13 @@ pub enum Value {
     Range(RangeValue),
     /// PostgreSQL geometric value.
     Geometry(GeometryValue),
+    /// PostgreSQL array value with a homogeneous element type.
+    Array {
+        /// Element type shared by every non-NULL array element.
+        element_type: DataType,
+        /// Array elements in logical order.
+        elements: Vec<Value>,
+    },
 }
 
 /// `Eq` is satisfied because `PartialEq` is reflexive on the bit-pattern
@@ -397,6 +404,13 @@ impl Hash for Value {
             }
             Self::Range(v) => v.hash(state),
             Self::Geometry(v) => v.hash(state),
+            Self::Array {
+                element_type,
+                elements,
+            } => {
+                element_type.hash(state);
+                elements.hash(state);
+            }
         }
     }
 }
@@ -407,7 +421,7 @@ pub type Datum = Value;
 impl Value {
     /// The dynamic [`DataType`] of this value.
     #[must_use]
-    pub const fn data_type(&self) -> DataType {
+    pub fn data_type(&self) -> DataType {
         match self {
             Self::Null => DataType::Null,
             Self::Bool(_) => DataType::Bool,
@@ -430,6 +444,7 @@ impl Value {
             Self::Interval { .. } => DataType::Interval,
             Self::Range(v) => DataType::Range(v.range_type),
             Self::Geometry(v) => DataType::Geometry(v.geometry_type),
+            Self::Array { element_type, .. } => DataType::Array(Box::new(element_type.clone())),
         }
     }
 
@@ -507,6 +522,32 @@ impl Value {
         Some(out)
     }
 
+    /// Parse PostgreSQL's common text-array form, e.g. `{1,2,NULL}`.
+    ///
+    /// The parser is intentionally conservative: it supports the
+    /// scalar element families UltraSQL can already store in rows and
+    /// rejects malformed input instead of guessing.
+    #[must_use]
+    pub fn parse_array(element_type: DataType, text: &str) -> Option<Self> {
+        let trimmed = text.trim();
+        if !(trimmed.starts_with('{') && trimmed.ends_with('}')) {
+            return None;
+        }
+        let inner = &trimmed[1..trimmed.len().checked_sub(1)?];
+        let elements = if inner.is_empty() {
+            Vec::new()
+        } else {
+            split_array_elements(inner)
+                .into_iter()
+                .map(|part| parse_array_element(&element_type, part))
+                .collect::<Option<Vec<_>>>()?
+        };
+        Some(Self::Array {
+            element_type,
+            elements,
+        })
+    }
+
     /// Borrowed `i64` view if this is an integer type, widening from
     /// narrower integers losslessly. `None` for non-integers.
     #[must_use]
@@ -544,6 +585,18 @@ impl Value {
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Self::Bytea(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Borrowed array view. `None` for non-array values.
+    #[must_use]
+    pub fn as_array(&self) -> Option<(&DataType, &[Value])> {
+        match self {
+            Self::Array {
+                element_type,
+                elements,
+            } => Some((element_type, elements.as_slice())),
             _ => None,
         }
     }
@@ -613,6 +666,16 @@ impl fmt::Display for Value {
             } => write!(f, "{months}mon {days}d {microseconds}us"),
             Self::Range(v) => write!(f, "{v}"),
             Self::Geometry(v) => write!(f, "{v}"),
+            Self::Array { elements, .. } => {
+                f.write_str("{")?;
+                for (idx, element) in elements.iter().enumerate() {
+                    if idx > 0 {
+                        f.write_str(",")?;
+                    }
+                    write_array_element(f, element)?;
+                }
+                f.write_str("}")
+            }
             Self::Uuid(u) => {
                 write!(
                     f,
@@ -637,6 +700,108 @@ impl fmt::Display for Value {
             }
         }
     }
+}
+
+fn parse_array_element(element_type: &DataType, raw: &str) -> Option<Value> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("NULL") {
+        return Some(Value::Null);
+    }
+    let text = unescape_array_text(trimmed)?;
+    match element_type {
+        DataType::Bool => match text.to_ascii_lowercase().as_str() {
+            "t" | "true" => Some(Value::Bool(true)),
+            "f" | "false" => Some(Value::Bool(false)),
+            _ => None,
+        },
+        DataType::Int16 => text.parse::<i16>().ok().map(Value::Int16),
+        DataType::Int32 => text.parse::<i32>().ok().map(Value::Int32),
+        DataType::Int64 => text.parse::<i64>().ok().map(Value::Int64),
+        DataType::Float32 => text.parse::<f32>().ok().map(Value::Float32),
+        DataType::Float64 => text.parse::<f64>().ok().map(Value::Float64),
+        DataType::Text { .. } => Some(Value::Text(text)),
+        DataType::Bytea => Value::parse_bytea(&text).map(Value::Bytea),
+        DataType::Uuid => Value::parse_uuid(&text).map(Value::Uuid),
+        _ => None,
+    }
+}
+
+fn split_array_elements(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (idx, ch) in text.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escape = true,
+            '"' => in_string = !in_string,
+            ',' if !in_string => {
+                out.push(&text[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&text[start..]);
+    out
+}
+
+fn unescape_array_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if !(trimmed.starts_with('"') || trimmed.ends_with('"')) {
+        return Some(trimmed.to_owned());
+    }
+    if !(trimmed.starts_with('"') && trimmed.ends_with('"')) || trimmed.len() < 2 {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len().checked_sub(1)?];
+    let mut out = String::with_capacity(inner.len());
+    let mut escape = false;
+    for ch in inner.chars() {
+        if escape {
+            out.push(ch);
+            escape = false;
+        } else if ch == '\\' {
+            escape = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    if escape {
+        return None;
+    }
+    Some(out)
+}
+
+fn write_array_element(f: &mut fmt::Formatter<'_>, value: &Value) -> fmt::Result {
+    match value {
+        Value::Null => f.write_str("NULL"),
+        Value::Text(s) => write_array_text(f, s),
+        other => write!(f, "{other}"),
+    }
+}
+
+fn write_array_text(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
+    let needs_quotes = text.is_empty()
+        || text.eq_ignore_ascii_case("NULL")
+        || text
+            .chars()
+            .any(|ch| matches!(ch, ',' | '{' | '}' | '"' | '\\') || ch.is_whitespace());
+    if !needs_quotes {
+        return f.write_str(text);
+    }
+    f.write_str("\"")?;
+    for ch in text.chars() {
+        if matches!(ch, '"' | '\\') {
+            f.write_str("\\")?;
+        }
+        write!(f, "{ch}")?;
+    }
+    f.write_str("\"")
 }
 
 fn split_once_unquoted_comma(s: &str) -> Option<(&str, &str)> {
@@ -879,7 +1044,32 @@ mod tests {
             Value::Text("hi".into()).data_type(),
             DataType::Text { max_len: None }
         );
+        assert_eq!(
+            Value::Array {
+                element_type: DataType::Int32,
+                elements: vec![Value::Int32(1), Value::Int32(2)]
+            }
+            .data_type(),
+            DataType::Array(Box::new(DataType::Int32))
+        );
         assert_eq!(Value::Null.data_type(), DataType::Null);
+    }
+
+    #[test]
+    fn array_display_and_parse_round_trip() {
+        let value = Value::Array {
+            element_type: DataType::Text { max_len: None },
+            elements: vec![
+                Value::Text("red".into()),
+                Value::Text("green,blue".into()),
+                Value::Null,
+            ],
+        };
+        assert_eq!(value.to_string(), r#"{red,"green,blue",NULL}"#);
+        assert_eq!(
+            Value::parse_array(DataType::Text { max_len: None }, &value.to_string()),
+            Some(value)
+        );
     }
 
     #[test]

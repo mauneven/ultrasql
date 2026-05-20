@@ -395,6 +395,16 @@ impl RowCodec {
                     payload.extend_from_slice(&len.to_le_bytes());
                     payload.extend_from_slice(bytes);
                 }
+                (DataType::Array(expected), Value::Array { element_type, .. })
+                    if expected.as_ref() == element_type =>
+                {
+                    encode_varlena_text(
+                        &mut payload,
+                        &value.to_string(),
+                        col_idx,
+                        &field.data_type,
+                    )?;
+                }
                 (DataType::Range(expected), Value::Range(v)) if expected == &v.range_type => {
                     encode_varlena_text(&mut payload, &v.to_string(), col_idx, &field.data_type)?;
                 }
@@ -706,6 +716,16 @@ impl RowCodec {
                             got: "invalid range literal".to_owned(),
                         }
                     })?)
+                }
+                DataType::Array(element_type) => {
+                    let s = decode_varlena_text(bytes, &mut cursor, "array column")?;
+                    Value::parse_array((**element_type).clone(), &s).ok_or_else(|| {
+                        RowCodecError::Type {
+                            column: col_idx,
+                            expected: field.data_type.clone(),
+                            got: "invalid array literal".to_owned(),
+                        }
+                    })?
                 }
                 DataType::Geometry(geometry_type) => {
                     let s = decode_varlena_text(bytes, &mut cursor, "geometry column")?;
@@ -1021,7 +1041,10 @@ impl RowCodec {
                     nulls.push_valid();
                 }
                 (
-                    DataType::Text { .. } | DataType::Range(_) | DataType::Geometry(_),
+                    DataType::Text { .. }
+                    | DataType::Range(_)
+                    | DataType::Geometry(_)
+                    | DataType::Array(_),
                     ColumnBuilder::Utf8 {
                         offsets,
                         values,
@@ -1258,6 +1281,7 @@ impl ColumnBuilder {
             DataType::Text { .. }
             | DataType::Range(_)
             | DataType::Geometry(_)
+            | DataType::Array(_)
             | DataType::Uuid
             | DataType::Bytea => Self::Utf8 {
                 offsets: {
@@ -1414,6 +1438,7 @@ const fn is_supported_type(ty: &DataType) -> bool {
             | DataType::Bytea
             | DataType::Range(_)
             | DataType::Geometry(_)
+            | DataType::Array(_)
             | DataType::Null
     )
 }
@@ -1617,6 +1642,21 @@ mod tests {
             let row = vec![Value::Text(s.to_owned())];
             assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
         }
+    }
+
+    #[test]
+    fn round_trip_int_array() {
+        let schema = Schema::new([Field::required(
+            "xs",
+            DataType::Array(Box::new(DataType::Int32)),
+        )])
+        .unwrap();
+        let codec = RowCodec::new(schema);
+        let row = vec![Value::Array {
+            element_type: DataType::Int32,
+            elements: vec![Value::Int32(1), Value::Int32(2), Value::Null],
+        }];
+        assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
     }
     #[test]
     fn all_null_row() {

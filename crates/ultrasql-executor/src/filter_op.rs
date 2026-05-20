@@ -628,9 +628,10 @@ fn build_empty_batch(schema: &Schema) -> Result<Batch, ExecError> {
             | DataType::TimestampTz => Column::Int64(NumericColumn::from_data(vec![])),
             DataType::Float32 => Column::Float32(NumericColumn::from_data(vec![])),
             DataType::Float64 => Column::Float64(NumericColumn::from_data(vec![])),
-            DataType::Text { .. } | DataType::Range(_) | DataType::Geometry(_) => {
-                Column::Utf8(StringColumn::from_data(vec![]))
-            }
+            DataType::Text { .. }
+            | DataType::Range(_)
+            | DataType::Geometry(_)
+            | DataType::Array(_) => Column::Utf8(StringColumn::from_data(vec![])),
             // For Int32 and any other type, fall back to an Int32 column.
             // In practice the binder only produces the above types at v0.5.
             _ => Column::Int32(NumericColumn::from_data(vec![])),
@@ -761,6 +762,26 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                                 ))
                             })?;
                             row.push(Value::Range(range));
+                        }
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Array(element_type)) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => {
+                            let array =
+                                Value::parse_array((**element_type).clone(), v).ok_or_else(
+                                    || {
+                                        ExecError::TypeMismatch(format!(
+                                            "column {col_idx} ({name}): invalid {expected_type} literal",
+                                            name = field.name,
+                                            expected_type = field.data_type,
+                                        ))
+                                    },
+                                )?;
+                            row.push(array);
                         }
                         None => row.push(Value::Null),
                     }

@@ -26,7 +26,7 @@
 //!
 //! [`HashAggregate`]: crate::HashAggregate
 
-use ultrasql_core::{Schema, Value};
+use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
 use ultrasql_vec::Batch;
 
@@ -246,14 +246,21 @@ fn finalise(state: &AggState) -> Value {
                 Value::Text(parts.join(sep))
             }
         }
-        AggState::ArrayAgg(items) => Value::Text(format!(
-            "{{{}}}",
-            items
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(",")
-        )),
+        AggState::ArrayAgg(items) => {
+            if items.is_empty() {
+                Value::Null
+            } else {
+                let element_type = items
+                    .iter()
+                    .find(|v| !v.is_null())
+                    .map(Value::data_type)
+                    .unwrap_or(DataType::Null);
+                Value::Array {
+                    element_type,
+                    elements: items.clone(),
+                }
+            }
+        }
         AggState::Variance(sum_x, sum_x2, cnt) => {
             if *cnt < 2 {
                 return Value::Null;
