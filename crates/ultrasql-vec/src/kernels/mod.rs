@@ -581,7 +581,7 @@ fn sum_i32_widening_dense_neon(data: &[i32]) -> i64 {
 /// The non-null fast path keeps four parallel accumulators so LLVM
 /// can schedule four independent min chains, which Apple M-series
 /// can dual-issue. The accumulators are seeded with
-/// [`f64::INFINITY`]; combining through [`min_f64_value`] preserves
+/// [`f64::INFINITY`]; combining through the local min helper preserves
 /// NaN-skip semantics and deterministic signed-zero ordering. The result is
 /// `None` iff the
 /// folded `best` is still `INFINITY` AND the input had no `+INF` and
@@ -691,7 +691,7 @@ fn min_f64_nullable(data: &[f64], nulls: &Bitmap) -> Option<f64> {
 /// Scalar reference implementation of [`min_f64`].
 ///
 /// Used by property tests to cross-validate the production kernel.
-/// Uses [`min_f64_value`] so signed-zero ordering matches the fast path
+/// Uses the same local min helper so signed-zero ordering matches the fast path
 /// independent of reduction order and target-specific `fmin` lowering.
 #[must_use]
 pub fn min_f64_scalar(column: &NumericColumn<f64>) -> Option<f64> {
