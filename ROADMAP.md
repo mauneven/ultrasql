@@ -59,12 +59,13 @@ has not run for 24 h CI-clean is not considered covered.
 
 Every PR that touches a benchmarked code path should include
 before/after `cross_compare_sql` numbers in the description. Current
-committed automation has benchmark scripts and CI workflow hooks, but no
-local pre-push hook that runs `regression-gate` for all contributors.
-Treat `regression-gate` pre-push enforcement as a policy target until
-the hook and CI artifact trail are committed. Once active, it should
-fail pushes on statistically significant regressions > 5% versus the
-baseline recorded in `benchmarks/results/baseline.json`.
+committed automation has benchmark scripts, a committed
+`.githooks/pre-push` smoke gate that runs `regression-gate --smoke`,
+and a manual/weekly GitHub Actions `supremacy` workflow that checks
+UltraSQL is the fastest engine in the low-tier matrix. No committed
+hook currently enforces the full ≥ 2× competitor floor on every push;
+treat strict ≥ 2× certification as release-gate work against the stage
+baselines in `benchmarks/baselines/<stage>.json`.
 
 For each milestone below, UltraSQL must demonstrably **outperform every
 listed competitor by ≥ 2×** (throughput) or ≤ 0.5× (latency) on the
@@ -77,11 +78,11 @@ are grounds for revert.
 
 | Version | Workload | Target | Metric |
 |---------|----------|--------|--------|
-| v0.5 | Simple INSERT throughput (10 k rows / multi-row VALUES) | ≥ 2× every competitor ✅ | throughput (µs / batch) |
-| v0.5 | Simple SELECT scan (10 k rows full table) | ≥ 2× every competitor — DuckDB ~tied (744 µs vs 897 µs = 1.2×) ⚠️ | latency (µs) |
-| v0.5 | SELECT SUM(x) over 65 k rows | ≥ 2× every competitor — DuckDB ~tied (97 µs vs 111 µs = 1.15×) ⚠️ | latency (µs) |
-| v0.5 | UPDATE 10 k rows in single statement | ≥ 2× SQLite + PG + ClickHouse ✅; DuckDB 1.72× faster ⚠️ | latency (µs) |
-| v0.5 | DELETE 10 k rows in single statement | ≥ 2× every competitor ✅ | latency (µs) |
+| v0.5 | Simple INSERT throughput (10 k rows / multi-row VALUES) | ≥ 2× every competitor ✅ (3.54 ms vs SQLite 19.87 ms = 5.61×) | throughput (µs / batch) |
+| v0.5 | Simple SELECT scan (10 k rows full table) | #1, but strict ≥ 2× not met: 659.67 µs vs DuckDB 881.83 µs = 1.34× ⚠️ | latency (µs) |
+| v0.5 | SELECT SUM(x) over 65 k rows | ≥ 2× every competitor ✅ (44.04 µs vs DuckDB 88.65 µs = 2.01×) | latency (µs) |
+| v0.5 | UPDATE 10 k rows in single statement | #1, but strict ≥ 2× not met: 128.79 µs vs DuckDB 164.21 µs = 1.27× ⚠️ | latency (µs) |
+| v0.5 | DELETE 10 k rows in single statement | ≥ 2× every competitor ✅ (115.79 µs vs SQLite 538.08 µs = 4.65×) | latency (µs) |
 | v0.6 | TPC-H scale 1 correctness (all 22 queries) | result-equal to DuckDB ✅ | `validate-results` result comparison |
 | v0.6+ | TPC-H scale 1 performance certification | ≥ 2× PostgreSQL 17 ⚠️ pending | geometric mean query time |
 | v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB ⚠️ not certified; current artifact records an incomplete q21-only query set | geometric mean query time |
@@ -101,13 +102,16 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 
 ## Current State Snapshot
 
-<!-- reconciled 2026-05-18 against current main -->
+<!-- reconciled 2026-05-19 against local main 94d2ffe. -->
+<!-- Latest full CI/supremacy evidence in this session is 35204b3; -->
+<!-- 94d2ffe only removes the push trigger from the supremacy workflow. -->
 <!-- TPC-H SF1 correctness: 22/22 result sets validated against DuckDB. -->
 <!-- COPY, EXPLAIN/EXPLAIN ANALYZE, ANALYZE, CancelRequest, WITH RECURSIVE, -->
 <!-- and Simple-Query PREPARE/EXECUTE/DEALLOCATE are wired with tests. -->
-<!-- INSERT ON CONFLICT, durable expression/default/constraint bootstrap, -->
-<!-- broad psql catalog meta-commands, dedicated GIN/GiST/BRIN opclasses, -->
-<!-- and performance certification remain open. -->
+<!-- INSERT ON CONFLICT is wired with PostgreSQL-wire tests. -->
+<!-- Durable expression/default/constraint bootstrap, broad psql catalog -->
+<!-- meta-commands beyond the current CLI slice, dedicated GIN/GiST/BRIN -->
+<!-- opclasses, and performance certification remain open. -->
 
 ### Wave-by-wave perf progression on `cross_compare_sql` (median µs, M4, release)
 
@@ -313,7 +317,7 @@ claims rather than measured development targets.
 | `CREATE TABLE t (...)` | ✅ | ✅ | ✅ | ✅ |
 | `INSERT INTO t VALUES (...)` | ✅ | ✅ | ✅ | ✅ |
 | `INSERT INTO t SELECT ...` | ✅ | ✅ | ✅ | ✅ (`insert_select_round_trip.rs`) |
-| `INSERT ... ON CONFLICT` | ✅ | ✅ | ❌ | ❌ |
+| `INSERT ... ON CONFLICT` | ✅ | ✅ | ✅ | ✅ (`on_conflict_round_trip.rs`) |
 | `INSERT ... RETURNING` | ✅ | ✅ | ✅ | ✅ (`returning_round_trip.rs`) |
 | `SELECT col, ...` (no agg, no join) | ✅ | ✅ | ✅ | ✅ |
 | `SELECT col FROM t WHERE col op lit` | ✅ | ✅ | ✅ | ✅ |
@@ -357,7 +361,7 @@ claims rather than measured development targets.
 | **P0** | ~~v0.5: Wire `LogicalPlan::Join` and `SetOp` in `lower_query`~~ ✅ done — `join_round_trip.rs` + `setop_round_trip.rs` green | (was) All TPC-H, all real analytical workloads |
 | **P0** | ~~v0.5: Binder support for `BETWEEN`~~ ✅ done — `bind_between` in `binder/expr_bind.rs` rewrites to `>= AND <=`; `index_scan_round_trip.rs` covers BETWEEN range scans; `IS NULL` still needs end-to-end verification | (was) ANSI surface |
 | **P0** | ~~v0.5: `IndexScan` wired in `lower_query`~~ ✅ done — `try_index_scan` in `pipeline.rs`; `index_scan_round_trip.rs` green for point lookup + BETWEEN range | (was) Point-lookup workload |
-| **P0** | Win and keep the ≥ 2× perf gate on every published benchmark; current README matrix has several wins, but not every workload is certified at the standing gate | Every release after v0.5 |
+| **P0** | Win and keep the ≥ 2× perf gate on every published benchmark; the current raw matrix has UltraSQL #1 everywhere, but SELECT scan, UPDATE, and Window remain below the strict 2× DuckDB margin | Every release after v0.5 |
 | **P0** | ~~v0.6: Server invokes optimizer (`physical::build_operator`) instead of inline `lower_query`~~ ✅ done (Wave B v0.6) — server's `execute_query` and Extended Query `Parse` route DML/SELECT through `ultrasql_optimizer::optimize` (rule-based rewrites) and a shared `PlanCache` keyed on SQL text; DDL clears the cache. Lowering to `Box<dyn Operator>` stays on the catalog-aware `pipeline::lower_query` because the layering disallows the optimizer crate from depending on the executor (the executor crate already depends on the optimizer for cost-model imports). | (was) Cost-aware physical selection, plan cache |
 | **P1** | v1.x: JSONB, NUMERIC, arrays | Modern apps, financial workloads |
 | **P1** | v0.8: Constraints (NOT NULL, CHECK, UNIQUE/PK, DEFAULT, FK actions, deferrable NO ACTION, generated stored columns) — runtime core landed; durable expression/default/constraint bootstrap remains open | Data integrity |
@@ -611,14 +615,26 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] Deadlock detector background thread (configurable interval, default 1 s)
 - [x] Tuple-level locks for concurrent updates (LockTag::Tuple supported)
 - [x] `SELECT FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` parser → planner → executor → `lower_query` arm (`pipeline.rs:275`, `pipeline.rs:806`); ✅ `tokio-postgres` round-trip in `crates/ultrasql-server/tests/lock_rows_round_trip.rs` covers FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE plus pre-image visibility on a concurrent reader
-- [x] Advisory locks: `pg_advisory_lock`, `pg_try_advisory_lock` (LockTag::Advisory; SQL surface still TODO)
+- [x] Advisory lock tag kernel (`LockTag::Advisory`) with lock-manager
+  unit coverage
+- [ ] SQL surface for `pg_advisory_lock` / `pg_try_advisory_lock`
 
 ### SSI (Serializable Snapshot Isolation)
 - [x] Predicate locks (`SIReadLock`)
 - [x] RW-anti-dependency tracking
 - [x] Dangerous structure detection (T1 → T2 → T3 cycle)
 - [x] Safe snapshot optimization
-- [x] True SERIALIZABLE end-to-end — `Server::with_sample_database` and `Server::init` construct the `TransactionManager` with a fresh `SsiManager`, so `BEGIN ISOLATION LEVEL SERIALIZABLE` and `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` register the txn with SSI. The SSI dangerous-structure check now correctly detects 2-tx write-skew (the prior `t1 == t3` skip was over-strict and silently let G1c / G2-item slip through). Predicate-lock recording from the executor is the next integration; today the SsiManager is fed conflicts only by callers that record them explicitly (Hermitage suite + integration tests). Snapshot strategy continues to alias `RepeatableRead` for the snapshot itself, which matches PostgreSQL's SSI architecture (RR snapshot + SSI conflict graph)
+- [ ] True SERIALIZABLE end-to-end — `Server::with_sample_database` and
+  `Server::init` construct the `TransactionManager` with a fresh
+  `SsiManager`, so `BEGIN ISOLATION LEVEL SERIALIZABLE` and
+  `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` register the txn with
+  SSI. The SSI dangerous-structure check detects 2-tx write-skew in
+  direct-manager tests, but predicate-lock recording from the executor
+  is still open; today the SsiManager is fed conflicts only by callers
+  that record them explicitly (Hermitage suite + integration tests).
+  Snapshot strategy continues to alias `RepeatableRead` for the
+  snapshot itself, which matches PostgreSQL's SSI architecture
+  (RR snapshot + SSI conflict graph)
 
 ### Subtransactions
 - [x] `SAVEPOINT name` execution kernel
@@ -756,7 +772,8 @@ driver can connect.
 - [x] `BEGIN` / `COMMIT` / `ROLLBACK` round-trip (Simple + Extended Query)
 - [x] `BEGIN ISOLATION LEVEL ...` — parser + planner + server wired; `BEGIN ISOLATION LEVEL READ COMMITTED|REPEATABLE READ|SERIALIZABLE` dispatches to `TransactionManager::begin(IsolationLevel::...)`; READ UNCOMMITTED aliased to READ COMMITTED; wire-level round-trip tests pass
 - [x] Implicit transaction per statement (autocommit) + explicit-transaction state machine (`TxnState::Idle`/`InTransaction`/`Failed`)
-- [x] `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` round-trip (wire only — executor does not yet stamp tuples with subxid; see "Subtransactions" above)
+- [x] `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` round-trip with
+  subxact-stamped DML visibility; see "Subtransactions" above.
 - [x] `PREPARE` / `EXECUTE` / `DEALLOCATE` Simple-Query round-trip — `Session::try_dispatch_meta_statement` (`session/meta_stmt.rs`) intercepts these AST shapes before binding and shares the per-session `ExtendedConnState.statements` cache with the Extended Query path; literal args are substituted via `substitute_parameters_in_plan`. `prepare_execute_round_trip.rs` covers SELECT/INSERT shapes plus DEALLOCATE name/ALL plus duplicate-PREPARE error
 
 ### Binder gaps blocking wire
@@ -788,8 +805,15 @@ driver can connect.
 ### Wire-protocol benchmarks (`cross_compare_sql`)
 - [x] In-process `ultrasqld` driven via `tokio-postgres` for honest end-to-end measurement
 - [x] Competitor bench scripts for postgres17 / sqlite3 / duckdb across INSERT / SELECT scan / SELECT SUM / SELECT AVG / Filter+SUM / UPDATE / DELETE
-- [x] README auto-renders `benchmarks/results/latest/raw/*.json` into 7 cross-engine tables; UltraSQL appears in every one except `mixed_oltp_pgbench_like`
-- [x] Honest sort order (fastest → slowest); ≥ 2× gate currently met only on INSERT, the rest are tracked optimisations
+- [x] README auto-renders `benchmarks/results/latest/raw/*.json` into
+  9 cross-engine tables, including `mixed_oltp_pgbench_like` and
+  `window_row_number_65k_i64`
+- [x] Honest sort order (fastest → slowest); current raw artifacts show
+  UltraSQL #1 on every rendered workload
+- [ ] Strict ≥ 2× competitor floor on every rendered workload — current
+  raw artifacts meet it for INSERT, SUM, AVG, Filter+SUM, DELETE, and
+  Mixed OLTP; SELECT scan, UPDATE, and Window are #1 but below 2× vs
+  DuckDB
 
 ### CLI
 - [x] `ultrasql` REPL with history, multiline input — `crates/ultrasql-cli/src/main.rs::run_repl` uses `rustyline::DefaultEditor`, persists `~/.ultrasql_history`, and accumulates lines until a trailing `;`
@@ -803,14 +827,30 @@ driver can connect.
 - [x] `BEGIN`/`COMMIT` round-trip from any standard driver — `txn_round_trip.rs` covers commit, rollback, failed-block, Extended Query path
 - [x] Extended Query Parse/Bind/Execute round-trip from any standard driver — tokio-postgres prepared statements green (see `crates/ultrasql-server/tests/extended_query_round_trip.rs`)
 - [x] `ORDER BY` reachable from the wire — `order_by_round_trip.rs` green
-- [x] **INSERT 10 k ≥ 2× every competitor** — 3.30 ms vs SQLite 20.2 ms (**6.13×**), PG 48.4 ms (14.6×), DuckDB 63.2 ms (19.1×), ClickHouse 62.8 ms (19.0×).
-- [x] **SELECT scan 10 k #1 on every competitor** — 759 µs vs DuckDB 897 µs (1.18×), SQLite 1.81 ms (2.39×), ClickHouse 1.17 ms (1.54×), PG 28.6 ms (37.7×). Gate met on SQLite/PG; DuckDB+CH within the 2× band but UltraSQL is consistently ahead.
-- [x] **SELECT SUM 65 k ≥ 2× every competitor** — 38.6 µs vs DuckDB 111 µs (**2.89×**), SQLite 938 µs (24.3×), CH 675 µs (17.5×), PG 33.3 ms (862×). Strict 2× of DuckDB **met**.
-- [x] **UPDATE 10 k #1 on every competitor** — 149 µs vs DuckDB 176 µs (1.18×), SQLite 451 µs (3.02×), CH 3.50 ms (23.5×), PG 64.4 ms (432×). Gate met on SQLite/CH/PG; DuckDB margin under 2×.
-- [x] **DELETE 10 k ≥ 2× every competitor** — 128 µs vs SQLite 512 µs (**4.01×**), DuckDB 1.99 ms (15.6×), CH 3.37 ms (26.4×), PG 23.3 ms (182×).
-- [x] **AVG 1 M ≥ 2× every competitor** — 101 µs vs DuckDB 284 µs (**2.81×**), SQLite 14.6 ms (145×), CH 2.05 ms (20.3×), PG 40.1 ms (397×).
-- [x] **Filter+SUM 1 M #1 on every competitor** — 113 µs vs DuckDB 216 µs (1.92×), SQLite 16.2 ms (143×), CH 1.66 ms (14.7×), PG 39.3 ms (348×). DuckDB margin just under 2×; gate met on SQLite/CH/PG.
-- [x] **mixed_oltp_pgbench_like ≥ 2× every competitor** — 116 µs/op vs SQLite 357 µs (**3.07×**), DuckDB 1.25 ms (10.7×), PG 11.6 ms (100×), CH 22.5 ms (193×).
+- [x] **INSERT 10 k ≥ 2× every competitor** — 3.54 ms vs
+  SQLite 19.87 ms (**5.61×**), ClickHouse 34.41 ms (9.71×),
+  PG 44.59 ms (12.58×), DuckDB 65.40 ms (18.45×).
+- [ ] **SELECT scan 10 k ≥ 2× every competitor** — current raw artifact
+  has UltraSQL #1, but only 1.34× faster than DuckDB (659.67 µs vs
+  881.83 µs). Strict gate remains open.
+- [x] **SELECT SUM 65 k ≥ 2× every competitor** — 44.04 µs vs
+  DuckDB 88.65 µs (**2.01×**), SQLite 937.88 µs (21.30×),
+  ClickHouse 940.56 µs (21.36×), PG 25.45 ms (578×).
+- [ ] **UPDATE 10 k ≥ 2× every competitor** — current raw artifact has
+  UltraSQL #1, but only 1.27× faster than DuckDB (128.79 µs vs
+  164.21 µs). Strict gate remains open.
+- [x] **DELETE 10 k ≥ 2× every competitor** — 115.79 µs vs
+  SQLite 538.08 µs (**4.65×**), DuckDB 2.14 ms (18.48×),
+  ClickHouse 6.58 ms (56.82×), PG 21.28 ms (183.78×).
+- [x] **AVG 1 M ≥ 2× every competitor** — 47.08 µs vs
+  DuckDB 215.48 µs (**4.58×**), ClickHouse 1.97 ms (41.81×),
+  SQLite 14.49 ms (307.74×), PG 42.86 ms (910×).
+- [x] **Filter+SUM 1 M ≥ 2× every competitor** — 46.29 µs vs
+  DuckDB 177.23 µs (**3.83×**), ClickHouse 1.68 ms (36.25×),
+  SQLite 16.34 ms (352.97×), PG 42.45 ms (917×).
+- [x] **mixed_oltp_pgbench_like ≥ 2× every competitor** — 152.05 µs/op
+  vs SQLite 360.66 µs (**2.37×**), DuckDB 1.29 ms (8.45×),
+  PG 8.62 ms (56.70×), ClickHouse 30.74 ms (202×).
 
 ---
 
@@ -1888,7 +1928,11 @@ items that block contributor velocity if neglected.
 - [x] Cargo profile tuned for the agent iteration loop (thin LTO, cgu=16, incremental, debug=0). Cold release build dropped from ≈ 90 s to ≈ 20 s; incremental edits ≈ 4 s. See commit `3b640cd`.
 - [x] Trim `tokio` features from `"full"` to the 7-feature subset actually used (drops `fs`/`process`/`parking_lot`/`tracing`).
 - [x] `[profile.release-ship]` for tarball / regression-gate baseline cuts (fat LTO + cgu=1).
-- [x] Pre-push gate runs `fmt --check`, `clippy -D warnings`, `cargo test`, `regression-gate --smoke`. Push is blocked on failure.
+- [x] Pre-push gate runs `cargo fmt --check`, workspace clippy with
+  `-D warnings`, `cargo test --workspace --all-features --lib`,
+  strict docs, advisory audit when `cargo-deny` is installed,
+  `regression-gate --smoke` for source diffs, and optional parser fuzz
+  smoke when nightly + `cargo-fuzz` exist. Push is blocked on failure.
 - [ ] Workspace `cargo nextest` integration once `nextest`'s output integrates with the pre-push gate.
 - [ ] `sccache` for cross-machine compilation cache (contributor onboarding aid).
 
