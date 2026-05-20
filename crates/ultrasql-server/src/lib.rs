@@ -70,23 +70,27 @@ use ultrasql_catalog::{
 };
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{PageId, RelationId, Value};
-use ultrasql_executor::{Eval, MemTableScan, RowCodec};
+use ultrasql_executor::{Eval, ExecError, MemTableScan, RowCodec};
 use ultrasql_optimizer::{
     AnalyzeOptions, AnalyzeRunner, InMemoryStatsCatalog, PgStatisticRow, PlanCache,
     PlanCacheConfig, StatsCatalog,
 };
+use ultrasql_planner::plan::{LockStrength, LockWaitPolicy};
 use ultrasql_planner::{
     AggregateFunc, BinaryOp, Catalog as PlannerCatalog, InMemoryCatalog, LogicalIndexMethod,
     LogicalPlan, ScalarExpr, TableMeta,
 };
 use ultrasql_protocol::BackendMessage;
+use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_storage::segment::{SegmentConfig, SegmentError, SegmentFileManager};
 use ultrasql_storage::sequence::{Sequence, SequenceSnapshot};
 use ultrasql_storage::vm::VisibilityMap;
-use ultrasql_txn::{IsolationLevel, SsiManager, Transaction, TransactionManager};
+use ultrasql_txn::{
+    IsolationLevel, LockRequest, LockTag, RowLockMode, SsiManager, Transaction, TransactionManager,
+};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::Column;
 use ultrasql_vec::column::NumericColumn;
@@ -2262,6 +2266,14 @@ fn run_plan_in_txn(
     {
         return Ok(result);
     }
+    acquire_simple_lock_rows(
+        plan,
+        &catalog_snapshot,
+        &table_constraints,
+        heap.as_ref(),
+        oracle.as_ref(),
+        txn,
+    )?;
 
     let ctx = LowerCtx {
         tables,
@@ -2319,6 +2331,204 @@ fn run_plan_in_txn(
             // per-message loop the legacy `run_select` requires.
             run_select_streamed(op.as_mut(), stream_buf)
         }
+    }
+}
+
+fn acquire_simple_lock_rows(
+    plan: &LogicalPlan,
+    catalog_snapshot: &Arc<CatalogSnapshot>,
+    table_constraints: &dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>,
+    heap: &HeapAccess<BlankPageLoader>,
+    oracle: &TransactionManager,
+    txn: &Transaction,
+) -> Result<(), ServerError> {
+    let LogicalPlan::LockRows {
+        input,
+        strength,
+        wait_policy,
+        ..
+    } = plan
+    else {
+        return Ok(());
+    };
+    if *wait_policy != LockWaitPolicy::Wait {
+        return Ok(());
+    }
+    let Some((table, predicate)) = lock_rows_base_filter(input) else {
+        return Ok(());
+    };
+    let Some(entry) = catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
+        return Ok(());
+    };
+
+    let rel = RelationId(entry.oid);
+    let mode = row_lock_mode(*strength);
+    if let Some(tids) =
+        lock_rows_index_tids(predicate, entry, catalog_snapshot, table_constraints, heap)?
+    {
+        return lock_tuple_ids(&tids, oracle, txn, mode);
+    }
+
+    let block_count = heap.block_count(rel).max(entry.n_blocks);
+    let codec = RowCodec::new(entry.schema.clone());
+    let predicate_eval = predicate.cloned().map(Eval::new);
+
+    for tuple in heap.scan_visible(rel, block_count, &txn.snapshot, oracle) {
+        let tuple =
+            tuple.map_err(|e| ServerError::Execute(ExecError::TypeMismatch(e.to_string())))?;
+        let row = codec
+            .decode(&tuple.data)
+            .map_err(|e| ServerError::Execute(ExecError::TypeMismatch(e.to_string())))?;
+        let matched = match &predicate_eval {
+            Some(eval) => match eval
+                .eval(&row)
+                .map_err(|e| ServerError::Execute(ExecError::TypeMismatch(e.to_string())))?
+            {
+                Value::Bool(true) => true,
+                Value::Bool(false) | Value::Null => false,
+                other => {
+                    return Err(ServerError::Execute(ExecError::TypeMismatch(format!(
+                        "FOR UPDATE predicate returned non-boolean value {other:?}",
+                    ))));
+                }
+            },
+            None => true,
+        };
+        if matched {
+            lock_tuple_ids(&[tuple.tid], oracle, txn, mode)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn lock_rows_index_tids(
+    predicate: Option<&ScalarExpr>,
+    entry: &TableEntry,
+    catalog_snapshot: &Arc<CatalogSnapshot>,
+    table_constraints: &dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>,
+    heap: &HeapAccess<BlankPageLoader>,
+) -> Result<Option<Vec<ultrasql_core::TupleId>>, ServerError> {
+    let Some(predicate) = predicate else {
+        return Ok(None);
+    };
+    let Some((column, key)) = equality_i64_predicate(predicate) else {
+        return Ok(None);
+    };
+    let Some(attnum) = u16::try_from(column).ok() else {
+        return Ok(None);
+    };
+    let Some(indexes) = catalog_snapshot.indexes_by_table.get(&entry.oid) else {
+        return Ok(None);
+    };
+    let Some(index) = indexes.iter().find(|idx| {
+        idx.columns.as_slice() == [attnum]
+            && runtime_index_method(table_constraints, entry.oid, idx.oid)
+                == LogicalIndexMethod::Btree
+    }) else {
+        return Ok(None);
+    };
+    let tree: BTree<BlankPageLoader> = BTree::open(
+        Arc::clone(heap.buffer_pool()),
+        RelationId::new(index.oid.raw()),
+        index.root_block,
+    );
+    let tids = if index.is_unique {
+        tree.lookup::<i64>(key)
+            .map(|maybe| maybe.into_iter().collect::<Vec<_>>())
+    } else {
+        tree.lookup_all::<i64>(key)
+    }
+    .map_err(|e| ServerError::ddl(format!("FOR UPDATE btree lookup: {e}")))?;
+    Ok(Some(tids))
+}
+
+fn lock_tuple_ids(
+    tids: &[ultrasql_core::TupleId],
+    oracle: &TransactionManager,
+    txn: &Transaction,
+    mode: RowLockMode,
+) -> Result<(), ServerError> {
+    for tid in tids {
+        let acquired = oracle
+            .lock_manager
+            .try_acquire(LockRequest {
+                xid: txn.current_xid(),
+                tag: LockTag::Tuple(*tid),
+                mode: mode.to_lock_mode(),
+            })
+            .map_err(|e| ServerError::Execute(ExecError::TypeMismatch(e.to_string())))?;
+        if !acquired {
+            return Err(ServerError::Execute(ExecError::TypeMismatch(
+                "write conflict: row lock not available".to_string(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn equality_i64_predicate(predicate: &ScalarExpr) -> Option<(usize, i64)> {
+    let ScalarExpr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = predicate
+    else {
+        return None;
+    };
+    column_literal_i64(left, right).or_else(|| column_literal_i64(right, left))
+}
+
+fn column_literal_i64(column: &ScalarExpr, literal: &ScalarExpr) -> Option<(usize, i64)> {
+    let ScalarExpr::Column { index, .. } = column else {
+        return None;
+    };
+    let ScalarExpr::Literal { value, .. } = literal else {
+        return None;
+    };
+    value_i64(value).map(|key| (*index, key))
+}
+
+fn value_i64(value: &Value) -> Option<i64> {
+    match value {
+        Value::Bool(v) => Some(i64::from(*v)),
+        Value::Int16(v) => Some(i64::from(*v)),
+        Value::Int32(v) => Some(i64::from(*v)),
+        Value::Int64(v) => Some(*v),
+        _ => None,
+    }
+}
+
+fn runtime_index_method(
+    table_constraints: &dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>,
+    table_oid: ultrasql_core::Oid,
+    index_oid: ultrasql_core::Oid,
+) -> LogicalIndexMethod {
+    table_constraints
+        .get(&table_oid)
+        .and_then(|constraints| constraints.indexes.get(&index_oid).map(|idx| idx.method))
+        .unwrap_or(LogicalIndexMethod::Btree)
+}
+
+fn lock_rows_base_filter(plan: &LogicalPlan) -> Option<(&str, Option<&ScalarExpr>)> {
+    match plan {
+        LogicalPlan::Project { input, .. } => lock_rows_base_filter(input),
+        LogicalPlan::Filter { input, predicate } => match input.as_ref() {
+            LogicalPlan::Scan { table, .. } => Some((table.as_str(), Some(predicate))),
+            other => lock_rows_base_filter(other).map(|(table, _)| (table, Some(predicate))),
+        },
+        LogicalPlan::Scan { table, .. } => Some((table.as_str(), None)),
+        _ => None,
+    }
+}
+
+const fn row_lock_mode(strength: LockStrength) -> RowLockMode {
+    match strength {
+        LockStrength::Update => RowLockMode::ForUpdate,
+        LockStrength::NoKeyUpdate => RowLockMode::ForNoKeyUpdate,
+        LockStrength::Share => RowLockMode::ForShare,
+        LockStrength::KeyShare => RowLockMode::ForKeyShare,
     }
 }
 
