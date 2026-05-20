@@ -14,7 +14,7 @@ use crate::error::ServerError;
 
 use super::LowerCtx;
 use super::catalog_views::try_virtual_catalog_scan;
-use super::csv_scan::{CsvSniffScan, CsvTableScan};
+use super::csv_scan::{CsvPredicate, CsvSniffScan, CsvTableScan};
 use super::external_scan::{
     is_external_table_function, lower_external_parquet_scan, lower_external_table_scan,
     read_external_path_specs,
@@ -258,6 +258,28 @@ pub(super) fn try_lower_read_csv_project(
     )))
 }
 
+/// Lower `Filter(read_csv(...))` with CSV predicate pushdown when the
+/// predicate is a simple `column OP literal` comparison.
+pub(super) fn try_lower_read_csv_filter(
+    input: &LogicalPlan,
+    predicate: &ScalarExpr,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let LogicalPlan::FunctionScan { name, args, .. } = input else {
+        return Ok(None);
+    };
+    if name != "read_csv" {
+        return Ok(None);
+    }
+    let Some(predicate) = CsvPredicate::from_scalar(predicate) else {
+        return Ok(None);
+    };
+    let path_specs = read_external_path_specs("read_csv", args)?;
+    Ok(Some(Box::new(CsvTableScan::from_path_specs_with_filter(
+        &path_specs,
+        Some(&predicate),
+    )?)))
+}
+
 /// Lower `Project(read_parquet(...))` and
 /// `Project(Filter(read_parquet(...)))` with Parquet projection and
 /// predicate pushdown when the expressions have a direct Parquet shape.
@@ -339,6 +361,8 @@ mod tests {
 
     use super::*;
     use ultrasql_core::{DataType, Field, Schema, Value};
+    use ultrasql_planner::BinaryOp;
+    use ultrasql_vec::column::Column;
 
     fn text_lit(value: String) -> ScalarExpr {
         ScalarExpr::Literal {
@@ -356,6 +380,40 @@ mod tests {
             },
             name.to_owned(),
         )
+    }
+
+    fn text_column_expr(name: &str, index: usize) -> ScalarExpr {
+        ScalarExpr::Column {
+            name: name.to_owned(),
+            index,
+            data_type: DataType::Text { max_len: None },
+        }
+    }
+
+    fn binary_predicate(left: ScalarExpr, op: BinaryOp, right: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+            data_type: DataType::Bool,
+        }
+    }
+
+    fn read_csv_input(csv_path: &std::path::Path, header: &[&str]) -> LogicalPlan {
+        let mut fields = header
+            .iter()
+            .map(|name| Field::nullable(*name, DataType::Text { max_len: None }))
+            .collect::<Vec<_>>();
+        fields.push(Field::nullable(
+            "_filename",
+            DataType::Text { max_len: None },
+        ));
+        fields.push(Field::required("_row_number", DataType::Int64));
+        LogicalPlan::FunctionScan {
+            name: "read_csv".to_owned(),
+            args: vec![text_lit(csv_path.display().to_string())],
+            schema: Schema::new(fields).expect("schema"),
+        }
     }
 
     #[test]
@@ -434,5 +492,77 @@ mod tests {
             .expect("projected csv batch");
         assert_eq!(batch.width(), 2);
         assert_eq!(batch.rows(), 1);
+    }
+
+    #[test]
+    fn read_csv_filter_pushdown_applies_text_equality() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csv_path = dir.path().join("people.csv");
+        fs::write(&csv_path, "id,name\n1,Ada\n2,Bob\n3,Ada\n").expect("write csv");
+        let input = read_csv_input(&csv_path, &["id", "name"]);
+        let predicate = binary_predicate(
+            text_column_expr("name", 1),
+            BinaryOp::Eq,
+            text_lit("Ada".to_owned()),
+        );
+
+        let mut scan = try_lower_read_csv_filter(&input, &predicate)
+            .expect("lower read_csv filter")
+            .expect("read_csv filter pushdown");
+        let batch = scan
+            .next_batch()
+            .expect("read filtered csv batch")
+            .expect("filtered csv batch");
+        assert_eq!(batch.rows(), 2);
+        let Column::Utf8(ids) = &batch.columns()[0] else {
+            panic!("expected id text column");
+        };
+        assert_eq!(ids.value(0), "1");
+        assert_eq!(ids.value(1), "3");
+    }
+
+    #[test]
+    fn read_csv_filter_pushdown_applies_numeric_comparison() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csv_path = dir.path().join("people.csv");
+        fs::write(&csv_path, "id,name\n1,Ada\n2,Bob\n10,Cy\n").expect("write csv");
+        let input = read_csv_input(&csv_path, &["id", "name"]);
+        let predicate = binary_predicate(
+            text_column_expr("id", 0),
+            BinaryOp::Gt,
+            ScalarExpr::Literal {
+                value: Value::Int32(2),
+                data_type: DataType::Int32,
+            },
+        );
+
+        let mut scan = try_lower_read_csv_filter(&input, &predicate)
+            .expect("lower read_csv filter")
+            .expect("read_csv filter pushdown");
+        let batch = scan
+            .next_batch()
+            .expect("read filtered csv batch")
+            .expect("filtered csv batch");
+        assert_eq!(batch.rows(), 1);
+        let Column::Utf8(ids) = &batch.columns()[0] else {
+            panic!("expected id text column");
+        };
+        assert_eq!(ids.value(0), "10");
+    }
+
+    #[test]
+    fn read_csv_filter_pushdown_skips_text_ordering() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csv_path = dir.path().join("people.csv");
+        fs::write(&csv_path, "id,name\n1,Ada\n").expect("write csv");
+        let input = read_csv_input(&csv_path, &["id", "name"]);
+        let predicate = binary_predicate(
+            text_column_expr("name", 1),
+            BinaryOp::Gt,
+            text_lit("Ada".to_owned()),
+        );
+
+        let scan = try_lower_read_csv_filter(&input, &predicate).expect("lower read_csv filter");
+        assert!(scan.is_none());
     }
 }
