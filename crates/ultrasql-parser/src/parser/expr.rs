@@ -353,6 +353,8 @@ impl<'src> Parser<'src> {
                 })
             }
 
+            TokenKind::LBracket => self.parse_array_literal(),
+
             TokenKind::KwExists => self.parse_exists_expr(false),
 
             TokenKind::KwCast => self.parse_cast_expr(),
@@ -397,6 +399,25 @@ impl<'src> Parser<'src> {
             args.push(self.parse_expr()?);
         }
         Ok(args)
+    }
+
+    fn parse_array_literal(&mut self) -> Result<Expr, ParseError> {
+        let lb = self.expect(TokenKind::LBracket, "[")?;
+        let mut elements = Vec::new();
+        if self.peek()?.kind != TokenKind::RBracket {
+            loop {
+                elements.push(self.parse_expr()?);
+                if self.peek()?.kind != TokenKind::Comma {
+                    break;
+                }
+                self.advance()?;
+            }
+        }
+        let rb = self.expect(TokenKind::RBracket, "]")?;
+        Ok(Expr::ArrayLiteral {
+            elements,
+            span: Span::new(lb.span.start, rb.span.end),
+        })
     }
 
     fn parse_ident_or_call(&mut self) -> Result<Expr, ParseError> {

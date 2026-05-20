@@ -148,27 +148,100 @@ async fn read_csv_single_file_exposes_header_columns_and_rows() {
 #[tokio::test]
 async fn read_csv_glob_reads_matching_files_in_stable_order() {
     let dir = tempfile::tempdir().expect("tempdir");
-    fs::write(dir.path().join("b.csv"), "id,name\n2,Beta\n").expect("write b csv");
-    fs::write(dir.path().join("a.csv"), "id,name\n1,Alpha\n").expect("write a csv");
-    fs::write(dir.path().join("ignore.txt"), "id,name\n9,Nope\n").expect("write ignored file");
+    let log_dir = dir.path().join("logs");
+    fs::create_dir(&log_dir).expect("create logs dir");
+    fs::write(log_dir.join("b.csv"), "id,name\n2,Beta\n").expect("write b csv");
+    fs::write(log_dir.join("a.csv"), "id,name\n1,Alpha\n").expect("write a csv");
+    fs::write(log_dir.join("ignore.txt"), "id,name\n9,Nope\n").expect("write ignored file");
 
-    let pattern = dir.path().join("*.csv");
+    let pattern = log_dir.join("*.csv");
     let (client, _conn, server_handle) = start_server_and_connect().await;
     let sql = format!(
-        "SELECT * FROM read_csv({}) ORDER BY id",
+        "SELECT id, name, _filename, _row_number FROM read_csv({}) ORDER BY id",
         sql_string(pattern.to_str().expect("utf8 pattern"))
     );
 
     let rows = client.query(&sql, &[]).await.expect("read_csv glob");
-    let values: Vec<(String, String)> = rows
+    let values: Vec<(String, String, String, i64)> = rows
         .iter()
-        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, i64>(3),
+            )
+        })
         .collect();
     assert_eq!(
         values,
         vec![
-            ("1".to_string(), "Alpha".to_string()),
-            ("2".to_string(), "Beta".to_string()),
+            (
+                "1".to_string(),
+                "Alpha".to_string(),
+                log_dir.join("a.csv").display().to_string(),
+                1,
+            ),
+            (
+                "2".to_string(),
+                "Beta".to_string(),
+                log_dir.join("b.csv").display().to_string(),
+                1,
+            ),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn read_csv_array_reads_files_in_argument_order_with_virtual_columns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = dir.path().join("b.csv");
+    let second = dir.path().join("a.csv");
+    fs::write(&first, "id,name\n2,Beta\n3,Beta-2\n").expect("write first csv");
+    fs::write(&second, "id,name\n1,Alpha\n").expect("write second csv");
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT id, name, _filename, _row_number FROM read_csv([{}, {}])",
+        sql_string(first.to_str().expect("utf8 first")),
+        sql_string(second.to_str().expect("utf8 second")),
+    );
+
+    let rows = client.query(&sql, &[]).await.expect("read_csv array");
+    let values: Vec<(String, String, String, i64)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, i64>(3),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (
+                "2".to_string(),
+                "Beta".to_string(),
+                first.display().to_string(),
+                1,
+            ),
+            (
+                "3".to_string(),
+                "Beta-2".to_string(),
+                first.display().to_string(),
+                2,
+            ),
+            (
+                "1".to_string(),
+                "Alpha".to_string(),
+                second.display().to_string(),
+                1,
+            ),
         ]
     );
 

@@ -1366,6 +1366,13 @@ pub enum Expr {
         /// Source span.
         span: Span,
     },
+    /// Array literal, e.g. `['a', 'b']`.
+    ArrayLiteral {
+        /// Elements in source order.
+        elements: Vec<Self>,
+        /// Source span.
+        span: Span,
+    },
     /// `CAST(expr AS type)`.
     Cast {
         /// Expression to cast.
@@ -1606,6 +1613,7 @@ impl Expr {
             | Self::Call { span, .. }
             | Self::IsNull { span, .. }
             | Self::Paren { span, .. }
+            | Self::ArrayLiteral { span, .. }
             | Self::Cast { span, .. }
             | Self::Subquery { span, .. }
             | Self::Exists { span, .. }

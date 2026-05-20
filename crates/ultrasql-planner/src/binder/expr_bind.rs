@@ -48,6 +48,9 @@ pub(super) fn bind_expr_with_ctes(
             data_type: DataType::Null,
         }),
         Expr::Paren { expr, .. } => bind_expr_with_ctes(expr, input, catalog, cte_catalog, scope),
+        Expr::ArrayLiteral { elements, .. } => {
+            bind_array_literal(elements, input, catalog, cte_catalog, scope)
+        }
         Expr::Unary {
             op, expr: inner, ..
         } => bind_unary(*op, inner, input, catalog, cte_catalog, scope),
@@ -593,6 +596,45 @@ pub(super) fn bind_literal(lit: &Literal) -> ScalarExpr {
             data_type: DataType::Null,
         },
     }
+}
+
+fn bind_array_literal(
+    elements: &[Expr],
+    input: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    let mut values = Vec::with_capacity(elements.len());
+    let mut element_type: Option<DataType> = None;
+    for element in elements {
+        let bound = bind_expr_with_ctes(element, input, catalog, cte_catalog, scope)?;
+        let ScalarExpr::Literal { value, data_type } = bound else {
+            return Err(PlanError::TypeMismatch(
+                "array literal elements must be constant expressions".to_owned(),
+            ));
+        };
+        if data_type != DataType::Null {
+            if let Some(expected) = &element_type {
+                if expected != &data_type {
+                    return Err(PlanError::TypeMismatch(
+                        "array literal elements must share one type".to_owned(),
+                    ));
+                }
+            } else {
+                element_type = Some(data_type.clone());
+            }
+        }
+        values.push(value);
+    }
+    let element_type = element_type.unwrap_or(DataType::Null);
+    Ok(ScalarExpr::Literal {
+        value: Value::Array {
+            element_type: element_type.clone(),
+            elements: values,
+        },
+        data_type: DataType::Array(Box::new(element_type)),
+    })
 }
 
 /// Convert a `TYPENAME 'literal'` AST node into the matching

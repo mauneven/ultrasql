@@ -400,6 +400,26 @@ pub fn expand_csv_paths(pattern: &str) -> Result<Vec<PathBuf>, CsvError> {
     Ok(paths)
 }
 
+/// Expand one or more `read_csv` path or wildcard arguments.
+///
+/// Each argument is expanded independently. Literal paths keep their argument
+/// order; wildcard matches are sorted within that argument for stable output.
+///
+/// # Errors
+///
+/// Returns [`CsvError`] when the argument list is empty, a directory cannot be
+/// read, or any wildcard matches no files.
+pub fn expand_csv_path_specs(patterns: &[String]) -> Result<Vec<PathBuf>, CsvError> {
+    if patterns.is_empty() {
+        return Err(CsvError::new("read_csv path list cannot be empty"));
+    }
+    let mut paths = Vec::new();
+    for pattern in patterns {
+        paths.extend(expand_csv_paths(pattern)?);
+    }
+    Ok(paths)
+}
+
 /// Read data records from one UTF-8 CSV file using sniffer metadata.
 ///
 /// When a header is detected, it is excluded from the returned records.
@@ -456,10 +476,20 @@ pub fn read_csv_data_from_path(path: &Path) -> Result<CsvReadData, CsvError> {
 ///
 /// Returns [`CsvError`] when no files match or the first file has no header.
 pub fn read_csv_header(pattern: &str) -> Result<Vec<String>, CsvError> {
-    let paths = expand_csv_paths(pattern)?;
+    read_csv_header_from_specs(&[pattern.to_owned()])
+}
+
+/// Read the header row from the first file matched by one or more
+/// `read_csv` path specs.
+///
+/// # Errors
+///
+/// Returns [`CsvError`] when no files match or the first file has no header.
+pub fn read_csv_header_from_specs(patterns: &[String]) -> Result<Vec<String>, CsvError> {
+    let paths = expand_csv_path_specs(patterns)?;
     let first = paths
         .first()
-        .expect("expand_csv_paths returns non-empty paths");
+        .expect("expand_csv_path_specs returns non-empty paths");
     let data = read_csv_data_from_path(first)?;
     let header = &data.header;
     if header.is_empty() || header.iter().any(String::is_empty) {

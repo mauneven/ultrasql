@@ -1,7 +1,7 @@
 //! FROM clause and JOIN binding. Split out of `binder/mod.rs` to keep each
 //! file under the 600-line ceiling.
 
-use ultrasql_core::{DataType, Field, Schema, Value, csv::read_csv_header};
+use ultrasql_core::{DataType, Field, Schema, Value, csv::read_csv_header_from_specs};
 use ultrasql_parser::ast::{JoinCondition, JoinOp, TableRef};
 
 use super::{
@@ -228,24 +228,21 @@ fn bind_read_csv_table_function(
 ) -> Result<(Schema, Vec<ScopeEntry>), PlanError> {
     if bound_args.len() != 1 {
         return Err(PlanError::NotSupported(
-            "read_csv: expected one path or glob argument",
+            "read_csv: expected one path, glob, or path-list argument",
         ));
     }
-    let ScalarExpr::Literal {
-        value: Value::Text(pattern),
-        ..
-    } = &bound_args[0]
-    else {
-        return Err(PlanError::TypeMismatch(
-            "read_csv: path argument must be a string literal".to_owned(),
-        ));
-    };
-    let header = read_csv_header(pattern)
+    let path_specs = read_csv_path_specs(&bound_args[0])?;
+    let header = read_csv_header_from_specs(&path_specs)
         .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))?;
-    let fields = header
+    let mut fields = header
         .into_iter()
         .map(|name| Field::nullable(name, DataType::Text { max_len: None }))
         .collect::<Vec<_>>();
+    fields.push(Field::nullable(
+        "_filename",
+        DataType::Text { max_len: None },
+    ));
+    fields.push(Field::required("_row_number", DataType::Int64));
     let schema = Schema::new(fields.clone())
         .map_err(|err| PlanError::TypeMismatch(format!("read_csv schema: {err}")))?;
     let from_scope = fields
@@ -258,6 +255,34 @@ fn bind_read_csv_table_function(
         })
         .collect();
     Ok((schema, from_scope))
+}
+
+fn read_csv_path_specs(arg: &ScalarExpr) -> Result<Vec<String>, PlanError> {
+    match arg {
+        ScalarExpr::Literal {
+            value: Value::Text(pattern),
+            ..
+        } => Ok(vec![pattern.clone()]),
+        ScalarExpr::Literal {
+            value:
+                Value::Array {
+                    element_type,
+                    elements,
+                },
+            ..
+        } if matches!(element_type, &DataType::Text { max_len: None }) => elements
+            .iter()
+            .map(|value| match value {
+                Value::Text(path) => Ok(path.clone()),
+                _ => Err(PlanError::TypeMismatch(
+                    "read_csv: path-list elements must be string literals".to_owned(),
+                )),
+            })
+            .collect(),
+        _ => Err(PlanError::TypeMismatch(
+            "read_csv: argument must be a string literal or text array literal".to_owned(),
+        )),
+    }
 }
 
 fn bind_sniff_csv_table_function(

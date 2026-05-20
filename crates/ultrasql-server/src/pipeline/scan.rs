@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use ultrasql_catalog::TableEntry;
-use ultrasql_core::{RelationId, Value};
+use ultrasql_core::{DataType, RelationId, Value};
 use ultrasql_executor::{
     CteScan, Eval, MemTableScan, Operator, ParallelSeqScan, Project, RowCodec, SeqScan,
     choose_parallel_seq_scan_workers,
@@ -160,18 +160,14 @@ pub(super) fn lower_function_scan(
     if name == "read_csv" {
         if args.len() != 1 {
             return Err(ServerError::Unsupported(
-                "read_csv: expected one path or glob argument",
+                "read_csv: expected one path, glob, or path-list argument",
             ));
         }
         let value = Eval::new(args[0].clone())
             .eval(&[])
             .map_err(|e| ServerError::Ddl(format!("read_csv argument evaluation failed: {e}")))?;
-        let Value::Text(pattern) = value else {
-            return Err(ServerError::Unsupported(
-                "read_csv: path argument must be a string literal",
-            ));
-        };
-        return Ok(Box::new(CsvTableScan::from_pattern(&pattern)?));
+        let path_specs = read_csv_path_specs(&value)?;
+        return Ok(Box::new(CsvTableScan::from_path_specs(&path_specs)?));
     }
     if name == "unnest" {
         if args.len() != 1 {
@@ -234,4 +230,25 @@ pub(super) fn lower_function_scan(
     Ok(Box::new(ultrasql_executor::FunctionScan::generate_series(
         start, stop, step,
     )))
+}
+
+fn read_csv_path_specs(value: &Value) -> Result<Vec<String>, ServerError> {
+    match value {
+        Value::Text(pattern) => Ok(vec![pattern.clone()]),
+        Value::Array {
+            element_type,
+            elements,
+        } if matches!(element_type, &DataType::Text { max_len: None }) => elements
+            .iter()
+            .map(|element| match element {
+                Value::Text(path) => Ok(path.clone()),
+                _ => Err(ServerError::Unsupported(
+                    "read_csv: path-list elements must be string literals",
+                )),
+            })
+            .collect(),
+        _ => Err(ServerError::Unsupported(
+            "read_csv: argument must be a string literal or text array literal",
+        )),
+    }
 }

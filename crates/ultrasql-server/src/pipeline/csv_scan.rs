@@ -1,6 +1,8 @@
 //! Local CSV table-function scans.
 
-use ultrasql_core::csv::{CsvSniff, expand_csv_paths, read_csv_data_from_path, sniff_csv_path};
+use ultrasql_core::csv::{
+    CsvSniff, expand_csv_path_specs, expand_csv_paths, read_csv_data_from_path, sniff_csv_path,
+};
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_executor::{ExecError, Operator};
 use ultrasql_vec::Batch;
@@ -14,8 +16,15 @@ const CSV_BATCH_TARGET_ROWS: usize = 4096;
 #[derive(Debug)]
 pub(super) struct CsvTableScan {
     schema: Schema,
-    rows: Vec<Vec<String>>,
+    rows: Vec<CsvTableRow>,
     position: usize,
+}
+
+#[derive(Clone, Debug)]
+struct CsvTableRow {
+    values: Vec<String>,
+    filename: String,
+    row_number: i64,
 }
 
 impl CsvTableScan {
@@ -23,6 +32,20 @@ impl CsvTableScan {
     pub(super) fn from_pattern(pattern: &str) -> Result<Self, ServerError> {
         let paths = expand_csv_paths(pattern)
             .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
+        Self::from_paths(paths)
+    }
+
+    /// Load CSV files from one or more path/glob specs into a query-local scan.
+    pub(super) fn from_path_specs(patterns: &[String]) -> Result<Self, ServerError> {
+        if let [pattern] = patterns {
+            return Self::from_pattern(pattern);
+        }
+        let paths = expand_csv_path_specs(patterns)
+            .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
+        Self::from_paths(paths)
+    }
+
+    fn from_paths(paths: Vec<std::path::PathBuf>) -> Result<Self, ServerError> {
         let mut expected_header: Option<Vec<String>> = None;
         let mut rows = Vec::new();
 
@@ -52,11 +75,21 @@ impl CsvTableScan {
                         header.len()
                     )));
                 }
-                rows.push(record.clone());
+                let row_number = i64::try_from(row_index + 1).map_err(|_| {
+                    ServerError::CopyFormat(format!(
+                        "read_csv row number overflow in {}",
+                        path.display()
+                    ))
+                })?;
+                rows.push(CsvTableRow {
+                    values: record.clone(),
+                    filename: path.display().to_string(),
+                    row_number,
+                });
             }
         }
 
-        let header = expected_header.expect("expand_csv_paths returns at least one file");
+        let header = expected_header.expect("CSV path expansion returns at least one file");
         let schema = csv_schema(&header)?;
         Ok(Self {
             schema,
@@ -85,25 +118,36 @@ impl Operator for CsvTableScan {
     }
 }
 
-fn csv_batch(rows: &[Vec<String>]) -> Result<Batch, ExecError> {
-    let width = rows.first().map_or(0, Vec::len);
-    let mut columns = Vec::with_capacity(width);
+fn csv_batch(rows: &[CsvTableRow]) -> Result<Batch, ExecError> {
+    let width = rows.first().map_or(0, |row| row.values.len());
+    let mut columns = Vec::with_capacity(width + 2);
     for col_idx in 0..width {
         let values = rows
             .iter()
-            .map(|row| row[col_idx].clone())
+            .map(|row| row.values[col_idx].clone())
             .collect::<Vec<_>>();
         columns.push(Column::Utf8(StringColumn::from_data(values)));
     }
+    columns.push(Column::Utf8(StringColumn::from_data(
+        rows.iter().map(|row| row.filename.clone()),
+    )));
+    columns.push(Column::Int64(NumericColumn::from_data(
+        rows.iter().map(|row| row.row_number).collect(),
+    )));
     Batch::new(columns).map_err(ExecError::from)
 }
 
 fn csv_schema(header: &[String]) -> Result<Schema, ServerError> {
-    let fields = header
+    let mut fields = header
         .iter()
         .cloned()
         .map(|name| Field::nullable(name, DataType::Text { max_len: None }))
         .collect::<Vec<_>>();
+    fields.push(Field::nullable(
+        "_filename",
+        DataType::Text { max_len: None },
+    ));
+    fields.push(Field::required("_row_number", DataType::Int64));
     Schema::new(fields).map_err(|err| ServerError::CopyFormat(format!("read_csv schema: {err}")))
 }
 
