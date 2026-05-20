@@ -1541,6 +1541,46 @@ fn escape_conf(value: &str) -> String {
 mod tests {
     use super::*;
 
+    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct HomeEnvGuard {
+        old_home: Option<std::ffi::OsString>,
+    }
+
+    impl HomeEnvGuard {
+        fn set(path: &std::path::Path) -> Self {
+            let old_home = std::env::var_os("HOME");
+            // SAFETY: tests that call this helper hold HOME_ENV_LOCK, so
+            // pgpass tests do not concurrently mutate or read HOME while it
+            // points at a test fixture directory.
+            unsafe {
+                std::env::set_var("HOME", path);
+            }
+            Self { old_home }
+        }
+    }
+
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard is dropped while HOME_ENV_LOCK is still held,
+            // restoring HOME before any other pgpass test can observe it.
+            unsafe {
+                match &self.old_home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+    }
+
+    fn with_temp_home<T>(path: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _lock = HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = HomeEnvGuard::set(path);
+        f()
+    }
+
     // --- URL parsing ---
 
     #[test]
@@ -1585,24 +1625,10 @@ mod tests {
         let path = dir.path().join(".pgpass");
         fs::write(&path, "*:5432:mydb:bob:hunter2\n").expect("write");
 
-        // Point HOME at our temp dir.
-        let old_home = std::env::var("HOME");
-        // SAFETY: modifying env is not thread-safe in general, but this test
-        // is single-threaded within its own process image and the change is
-        // reverted before the function returns.
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
-
-        let pw = pgpass_lookup("anyhost", 5432, "mydb", "bob");
-        assert_eq!(pw.as_deref(), Some("hunter2"));
-
-        unsafe {
-            match old_home {
-                Ok(v) => std::env::set_var("HOME", v),
-                Err(_) => std::env::remove_var("HOME"),
-            }
-        }
+        with_temp_home(dir.path(), || {
+            let pw = pgpass_lookup("anyhost", 5432, "mydb", "bob");
+            assert_eq!(pw.as_deref(), Some("hunter2"));
+        });
     }
 
     #[test]
@@ -1611,20 +1637,10 @@ mod tests {
         let path = dir.path().join(".pgpass");
         fs::write(&path, "localhost:5432:mydb:alice:pw\n").expect("write");
 
-        let old_home = std::env::var("HOME");
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
-
-        let pw = pgpass_lookup("localhost", 5432, "mydb", "bob");
-        assert!(pw.is_none(), "wrong user must not match");
-
-        unsafe {
-            match old_home {
-                Ok(v) => std::env::set_var("HOME", v),
-                Err(_) => std::env::remove_var("HOME"),
-            }
-        }
+        with_temp_home(dir.path(), || {
+            let pw = pgpass_lookup("localhost", 5432, "mydb", "bob");
+            assert!(pw.is_none(), "wrong user must not match");
+        });
     }
 
     // --- Statement splitter ---
@@ -1678,17 +1694,9 @@ mod tests {
     fn pgpass_missing_file_returns_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         // No .pgpass file in dir.
-        let old_home = std::env::var("HOME");
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
-        let pw = pgpass_lookup("localhost", 5432, "db", "user");
-        assert!(pw.is_none());
-        unsafe {
-            match old_home {
-                Ok(v) => std::env::set_var("HOME", v),
-                Err(_) => std::env::remove_var("HOME"),
-            }
-        }
+        with_temp_home(dir.path(), || {
+            let pw = pgpass_lookup("localhost", 5432, "db", "user");
+            assert!(pw.is_none());
+        });
     }
 }
