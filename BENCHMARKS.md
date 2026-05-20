@@ -388,6 +388,14 @@ Scheduled and manual runs use `benchmarks/certify.sh full` plus full criterion
 sweeps. Do not wait for those long jobs after every task; run/check them when
 the maintainer asks or after a batch of benchmark-sensitive work.
 
+Status as of 2026-05-20: the profile split is validated at commit `5f0c49e`
+by local `benchmarks/certify.sh smoke`, `cargo fmt`, clippy, tests, rustdoc,
+and `git diff --check`; GitHub Actions ci run `26151820002`; and supremacy
+run `26151891843`. This proves runner/workflow health only. It does not
+certify TPC-H, ClickBench, TPC-B/C, Sysbench, exact vector top-k, or HNSW
+performance. Full profile results still report `unavailable` when required
+DSNs, datasets, engines, or implementations are absent.
+
 ## Pre-Push Gate vs Full Sweep
 
 The `pre-push` hook runs `regression-gate --smoke`:

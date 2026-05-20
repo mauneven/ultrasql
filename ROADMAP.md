@@ -118,9 +118,11 @@ results auto-render from `benchmarks/results/latest/raw/*.json` into
 
 ## Current State Snapshot
 
-<!-- reconciled 2026-05-19 against local main 94d2ffe. -->
-<!-- Latest full CI/supremacy evidence in this session is 35204b3; -->
-<!-- 94d2ffe only removes the push trigger from the supremacy workflow. -->
+<!-- reconciled 2026-05-20 against main 5f0c49e. -->
+<!-- Latest CI evidence for 5f0c49e: GitHub Actions ci run 26151820002 passed. -->
+<!-- Latest supremacy evidence for 5f0c49e: workflow_dispatch run 26151891843 passed. -->
+<!-- Benchmark profile split at 5f0c49e is runner/workflow ergonomics only; -->
+<!-- it adds no new performance certification claim. -->
 <!-- TPC-H SF1 correctness: 22/22 result sets validated against DuckDB. -->
 <!-- COPY, EXPLAIN/EXPLAIN ANALYZE, ANALYZE, CancelRequest, WITH RECURSIVE, -->
 <!-- and Simple-Query PREPARE/EXECUTE/DEALLOCATE are wired with tests. -->
@@ -1853,6 +1855,13 @@ HNSW/IVFFlat index methods.
 - [ ] Type-specific tests (numeric, text, date/time, json, arrays, etc.)
 
 ### Benchmark Certification
+- [x] Benchmark profile ergonomics: PR-safe smoke certification and
+  scheduled/manual full certification profiles are split and wired.
+  Evidence: commit `5f0c49e`, local smoke + fmt/clippy/test/rustdoc/diff
+  gates, GitHub Actions ci run `26151820002`, and supremacy run
+  `26151891843`. This proves runner/workflow health only; it does not
+  certify TPC-H, ClickBench, TPC-B/C, Sysbench, exact vector top-k, or
+  HNSW performance.
 - [ ] TPC-B: correctness verified, throughput ≥ 2× PostgreSQL, p99 < 5 ms at 32 connections — `benchmarks/tpcb_certify.sh` exists and the wire harness now validates UltraSQL balance invariants with indexed TPC-B tables; latest local reduced smoke is correct at 986.20 tx/s, but p99 is 39.884 ms and PostgreSQL 17 comparison is still missing, so certification remains open.
 - [ ] TPC-C: correctness verified (all 5 transaction types), throughput ≥ 2× PostgreSQL
 - [x] TPC-H scale 1: all 22 harness queries return correct results
