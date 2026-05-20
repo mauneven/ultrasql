@@ -590,6 +590,7 @@ unsafe fn cosine_distance_f32_avx2(left: &[f32], right: &[f32]) -> Option<f32> {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
 #[target_feature(enable = "avx512f")]
 unsafe fn dot_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
     use std::arch::x86_64::{_mm512_loadu_ps, _mm512_mul_ps, _mm512_storeu_ps};
@@ -621,6 +622,7 @@ unsafe fn dot_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
 #[target_feature(enable = "avx512f")]
 unsafe fn l2_distance_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
     use std::arch::x86_64::{_mm512_loadu_ps, _mm512_mul_ps, _mm512_storeu_ps, _mm512_sub_ps};
@@ -653,6 +655,7 @@ unsafe fn l2_distance_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
 #[target_feature(enable = "avx512f")]
 unsafe fn cosine_distance_f32_avx512(left: &[f32], right: &[f32]) -> Option<f32> {
     use std::arch::x86_64::{_mm512_loadu_ps, _mm512_mul_ps, _mm512_storeu_ps};
