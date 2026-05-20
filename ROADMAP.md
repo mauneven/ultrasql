@@ -31,6 +31,22 @@ This file is the source of truth for the project. Every item is actionable witho
 These apply to **every version** from v0.2 onward. A version does not
 ship if any of these gates fail. No exceptions.
 
+### Slice CI Gate: green before and after every slice
+
+Every v1.0 slice starts from a completed successful GitHub Actions
+`ci-passed` run on `origin/main`. If CI is red or still running, the
+next slice waits until the failure is fixed or the run finishes green.
+
+Every slice closes with scope-matched local validation, an atomic
+commit, a push, and a fresh successful `ci-passed` run for the pushed
+commit before the next slice starts. Documentation-only slices require
+at least `git diff --check` locally; Rust/code-path slices require the
+full relevant local gate set (`cargo fmt`, clippy with `-D warnings`,
+and tests). Performance-sensitive slices also require benchmark or
+manual/weekly `supremacy` evidence before any performance claim is made.
+Record CI run IDs and benchmark artifact paths in session notes or the
+PR description.
+
 ### Test Coverage Gate: ≥ 80% line coverage per crate
 
 Release target is at least **80% line coverage** per crate measured by
