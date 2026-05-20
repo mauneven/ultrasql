@@ -4,7 +4,7 @@
 # Usage:
 #   benchmarks/certify.sh smoke
 #   benchmarks/certify.sh full
-#   benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet
+#   benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet
 #
 # Smoke is PR-safe: tiny datasets, crash/correctness checks, no external
 # benchmark assets. Full is nightly/manual: it attempts the full certification
@@ -29,7 +29,7 @@ case "$profile" in
         suites=(regression-gate vector-ann sysbench)
         ;;
     full)
-        suites=(tpch clickbench tpcb tpcc sysbench vector-topk vector-ann ai-gauntlet)
+        suites=(tpch clickbench tpcb tpcc sysbench vector-topk vector-ann ai-gauntlet csv-gauntlet)
         ;;
     *)
         echo "certify.sh: profile must be smoke or full, got '$profile'" >&2
@@ -121,6 +121,14 @@ run_ai_gauntlet_full() {
     AI_GAUNTLET_PROFILE=full benchmarks/ai_benchmark_gauntlet.sh full
 }
 
+run_csv_gauntlet_smoke() {
+    CSV_GAUNTLET_PROFILE=smoke benchmarks/csv_benchmark_gauntlet.sh smoke
+}
+
+run_csv_gauntlet_full() {
+    CSV_GAUNTLET_PROFILE=full benchmarks/csv_benchmark_gauntlet.sh full
+}
+
 for suite in "${suites[@]}"; do
     case "$suite" in
         regression-gate)
@@ -141,6 +149,13 @@ for suite in "${suites[@]}"; do
                 run_suite "$suite" run_ai_gauntlet_smoke
             else
                 run_suite "$suite" run_ai_gauntlet_full
+            fi
+            ;;
+        csv-gauntlet)
+            if [[ "$profile" == "smoke" ]]; then
+                run_suite "$suite" run_csv_gauntlet_smoke
+            else
+                run_suite "$suite" run_csv_gauntlet_full
             fi
             ;;
         sysbench)

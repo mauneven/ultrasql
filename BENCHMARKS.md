@@ -304,6 +304,32 @@ suites whose runners are not implemented yet. The manifest is
 means at least one suite is still missing and no complete AI benchmark
 certification exists.
 
+### CSV Benchmark Gauntlet
+
+CSV workload coverage is orchestrated by:
+
+```text
+benchmarks/csv_benchmark_gauntlet.sh smoke
+benchmarks/csv_benchmark_gauntlet.sh full
+```
+
+The runner generates one deterministic CSV data set and one malformed
+CSV file, then measures UltraSQL, DuckDB, and ClickHouse when those
+engines are installed. Required workloads are cold read, warm read,
+COPY import, GROUP BY from CSV, filter from CSV, join CSV plus table,
+and malformed CSV behavior. Missing DuckDB or ClickHouse setup writes
+`status: "not_available"` raw artifacts instead of benchmark claims.
+
+Cold read means the first measured read in a fresh engine process or
+fresh UltraSQL in-process server. The runner does not force an OS page
+cache drop, so public results must describe host cache state honestly.
+The manifest is
+`benchmarks/results/latest/csv_benchmark_gauntlet_manifest.json`; raw
+artifacts land under `benchmarks/results/latest/raw/` as
+`csv_<workload>_<rows>-<engine>.json`. `CSV_GAUNTLET_ROWS`,
+`CSV_GAUNTLET_ITERS`, `CSV_GAUNTLET_WARMUP`, and
+`CSV_GAUNTLET_ENGINES` control local smoke versus full runs.
+
 ### TPC-B Certification
 
 TPC-B v0.9 certification is recorded by:
@@ -385,7 +411,7 @@ certification attempts:
 ```text
 benchmarks/certify.sh smoke
 benchmarks/certify.sh full
-benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet
+benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet
 ```
 
 Smoke profile:
@@ -396,7 +422,8 @@ Smoke profile:
 
 Full profile:
 - attempts TPC-H SF10, ClickBench, TPC-B, TPC-C, sysbench-style OLTP,
-  exact vector top-k, HNSW ANN vector search, and the AI benchmark gauntlet;
+  exact vector top-k, HNSW ANN vector search, the AI benchmark gauntlet,
+  and the CSV benchmark gauntlet;
 - writes `benchmarks/results/latest/benchmark_certification_manifest.json`;
 - treats exit code 2 from a child runner as `unavailable`, meaning a required
   dataset, DSN, engine, or implementation is missing and no benchmark claim

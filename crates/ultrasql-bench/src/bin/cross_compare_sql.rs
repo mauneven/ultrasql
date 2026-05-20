@@ -49,7 +49,7 @@
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -105,6 +105,24 @@ enum Workload {
     /// `(id INT, embedding VECTOR(d))` table:
     /// `ORDER BY embedding <-> probe, id LIMIT k`.
     VectorTopK,
+    /// First `COUNT(*)` over `read_csv(path)` in a fresh in-process
+    /// server. This is a first-touch engine measurement; it does not
+    /// forcibly evict the host OS page cache.
+    CsvColdRead,
+    /// Repeated `COUNT(*)` over `read_csv(path)` after warmup reads.
+    CsvWarmRead,
+    /// `COPY t FROM 'file.csv' WITH (FORMAT csv, HEADER true)` into a
+    /// fresh table per iteration.
+    CsvCopyImport,
+    /// `GROUP BY` directly over `read_csv(path)`.
+    CsvGroupBy,
+    /// Filter predicate directly over `read_csv(path)`.
+    CsvFilter,
+    /// Join `read_csv(path)` to a preloaded catalog table.
+    CsvJoinTable,
+    /// Malformed CSV ingestion through `COPY ... IGNORE_ERRORS` into a
+    /// reject table.
+    CsvMalformedBehavior,
 }
 
 impl Workload {
@@ -134,6 +152,13 @@ impl Workload {
                     top_k
                 )
             }
+            Self::CsvColdRead => format!("csv_cold_read_{}", k_or_raw(n_rows)),
+            Self::CsvWarmRead => format!("csv_warm_read_{}", k_or_raw(n_rows)),
+            Self::CsvCopyImport => format!("csv_copy_import_{}", k_or_raw(n_rows)),
+            Self::CsvGroupBy => format!("csv_group_by_{}", k_or_raw(n_rows)),
+            Self::CsvFilter => format!("csv_filter_{}", k_or_raw(n_rows)),
+            Self::CsvJoinTable => format!("csv_join_table_{}", k_or_raw(n_rows)),
+            Self::CsvMalformedBehavior => format!("csv_malformed_behavior_{}", k_or_raw(n_rows)),
         }
     }
 }
@@ -192,6 +217,12 @@ struct Args {
     /// Number of nearest rows returned by the `vector-top-k` workload.
     #[arg(long, default_value_t = DEFAULT_TOP_K)]
     top_k: usize,
+    /// CSV data file for `csv-*` benchmark workloads.
+    #[arg(long)]
+    csv_path: Option<PathBuf>,
+    /// Malformed CSV data file for `csv-malformed-behavior`.
+    #[arg(long)]
+    csv_bad_path: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -239,7 +270,7 @@ async fn main() -> Result<()> {
     // connection and time the query repeated N times). Anything
     // else would compare cold-cache UltraSQL against warm-cache
     // peers.
-    let mut answer = None;
+    let mut answer: Option<serde_json::Value> = None;
     match args.workload {
         Workload::SelectScan => {
             run_shared_select_scan(bound, args.rows, args.warmup, total_iters, &mut iters_us)
@@ -287,12 +318,102 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Workload::VectorTopK => {
-            answer = Some(
+            answer = Some(serde_json::json!(
                 run_shared_vector_topk(
                     bound,
                     args.rows,
                     args.vector_dims,
                     args.top_k,
+                    args.warmup,
+                    total_iters,
+                    &mut iters_us,
+                )
+                .await?
+            ));
+        }
+        Workload::CsvColdRead => {
+            let csv_path = required_csv_path(&args)?;
+            let path_sql = sql_string(csv_path);
+            answer = Some(
+                run_csv_query_workload(
+                    bound,
+                    &format!("SELECT COUNT(*) FROM read_csv({path_sql})"),
+                    args.warmup,
+                    total_iters,
+                    &mut iters_us,
+                )
+                .await?,
+            );
+        }
+        Workload::CsvWarmRead => {
+            let csv_path = required_csv_path(&args)?;
+            let path_sql = sql_string(csv_path);
+            answer = Some(
+                run_csv_query_workload(
+                    bound,
+                    &format!("SELECT COUNT(*) FROM read_csv({path_sql})"),
+                    args.warmup,
+                    total_iters,
+                    &mut iters_us,
+                )
+                .await?,
+            );
+        }
+        Workload::CsvCopyImport => {
+            let csv_path = required_csv_path(&args)?;
+            answer = Some(
+                run_csv_copy_import(bound, csv_path, args.warmup, total_iters, &mut iters_us)
+                    .await?,
+            );
+        }
+        Workload::CsvGroupBy => {
+            let csv_path = required_csv_path(&args)?;
+            let path_sql = sql_string(csv_path);
+            answer = Some(
+                run_csv_query_workload(
+                    bound,
+                    &format!(
+                        "SELECT category, COUNT(*) FROM read_csv({path_sql}) \
+                         GROUP BY category ORDER BY category"
+                    ),
+                    args.warmup,
+                    total_iters,
+                    &mut iters_us,
+                )
+                .await?,
+            );
+        }
+        Workload::CsvFilter => {
+            let csv_path = required_csv_path(&args)?;
+            let path_sql = sql_string(csv_path);
+            answer = Some(
+                run_csv_query_workload(
+                    bound,
+                    &format!("SELECT COUNT(*) FROM read_csv({path_sql}) WHERE category = 'alpha'"),
+                    args.warmup,
+                    total_iters,
+                    &mut iters_us,
+                )
+                .await?,
+            );
+        }
+        Workload::CsvJoinTable => {
+            let csv_path = required_csv_path(&args)?;
+            answer = Some(
+                run_csv_join_table(bound, csv_path, args.warmup, total_iters, &mut iters_us)
+                    .await?,
+            );
+        }
+        Workload::CsvMalformedBehavior => {
+            let csv_path = args
+                .csv_bad_path
+                .as_ref()
+                .or(args.csv_path.as_ref())
+                .context("--csv-bad-path or --csv-path is required for csv-malformed-behavior")?;
+            answer = Some(
+                run_csv_malformed_behavior(
+                    bound,
+                    csv_path,
                     args.warmup,
                     total_iters,
                     &mut iters_us,
@@ -312,7 +433,14 @@ async fn main() -> Result<()> {
                     | Workload::AvgScalar
                     | Workload::FilterSum
                     | Workload::WindowRowNumber
-                    | Workload::VectorTopK => unreachable!("handled above"),
+                    | Workload::VectorTopK
+                    | Workload::CsvColdRead
+                    | Workload::CsvWarmRead
+                    | Workload::CsvCopyImport
+                    | Workload::CsvGroupBy
+                    | Workload::CsvFilter
+                    | Workload::CsvJoinTable
+                    | Workload::CsvMalformedBehavior => unreachable!("handled above"),
                 };
                 if i >= args.warmup {
                     iters_us.push(micros);
@@ -336,7 +464,7 @@ async fn main() -> Result<()> {
         "iterations_us": iters_us,
     });
     if let Some(answer) = answer {
-        report["answer"] = serde_json::json!(answer);
+        report["answer"] = answer;
     }
     let serialized = serde_json::to_string(&report)?;
     if let Some(path) = args.output.as_ref() {
@@ -346,6 +474,240 @@ async fn main() -> Result<()> {
         println!("{serialized}");
     }
     Ok(())
+}
+
+fn required_csv_path(args: &Args) -> Result<&PathBuf> {
+    args.csv_path.as_ref().context("--csv-path is required")
+}
+
+fn sql_string(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "''"))
+}
+
+async fn connect_sql_server(
+    server: SocketAddr,
+) -> Result<(tokio_postgres::Client, tokio::task::JoinHandle<()>)> {
+    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .context("tokio-postgres connect to ultrasqld")?;
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("tokio-postgres connection error: {e}");
+        }
+    });
+    Ok((client, conn_handle))
+}
+
+fn simple_query_rows(messages: &[tokio_postgres::SimpleQueryMessage]) -> Vec<Vec<String>> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                let mut values = Vec::new();
+                for col in 0..row.columns().len() {
+                    values.push(row.get(col).unwrap_or("").to_owned());
+                }
+                Some(values)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+async fn simple_count(client: &tokio_postgres::Client, sql: &str) -> Result<i64> {
+    let messages = client
+        .simple_query(sql)
+        .await
+        .with_context(|| format!("run scalar query: {sql}"))?;
+    messages
+        .iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                row.get(0).and_then(|value| value.parse::<i64>().ok())
+            }
+            _ => None,
+        })
+        .with_context(|| format!("scalar query returned no integer row: {sql}"))
+}
+
+async fn run_csv_query_workload(
+    server: SocketAddr,
+    query: &str,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<serde_json::Value> {
+    let (client, conn_handle) = connect_sql_server(server).await?;
+    let mut answer = serde_json::Value::Null;
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(query)
+            .await
+            .with_context(|| format!("CSV query workload: {query}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let rows = simple_query_rows(&messages);
+        if rows.is_empty() {
+            anyhow::bail!("CSV query returned no rows: {query}");
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+            answer = serde_json::json!({
+                "rows": rows,
+                "cache_policy": concat!(
+                    "cold_read is first measured read in a fresh UltraSQL server; ",
+                    "host OS page cache is not forcibly dropped"
+                ),
+            });
+        }
+    }
+    drop(client);
+    conn_handle.abort();
+    Ok(answer)
+}
+
+async fn run_csv_copy_import(
+    server: SocketAddr,
+    csv_path: &Path,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<serde_json::Value> {
+    let (client, conn_handle) = connect_sql_server(server).await?;
+    let path_sql = sql_string(csv_path);
+    let mut answer = serde_json::Value::Null;
+    for i in 0..total_iters {
+        let table = format!("csv_copy_import_{i}");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {table} (id INT, category TEXT, metric INT, fact_dim TEXT)"
+            ))
+            .await
+            .with_context(|| format!("CREATE TABLE {table}"))?;
+
+        let copy_sql = format!(
+            "COPY {table} FROM {path_sql} WITH (FORMAT csv, HEADER true, AUTO_DETECT true)"
+        );
+        let started = Instant::now();
+        client
+            .simple_query(&copy_sql)
+            .await
+            .with_context(|| format!("COPY CSV into {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let imported_rows = simple_count(&client, &format!("SELECT COUNT(*) FROM {table}")).await?;
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+            answer = serde_json::json!({ "imported_rows": imported_rows });
+        }
+    }
+    drop(client);
+    conn_handle.abort();
+    Ok(answer)
+}
+
+async fn run_csv_join_table(
+    server: SocketAddr,
+    csv_path: &Path,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<serde_json::Value> {
+    let (client, conn_handle) = connect_sql_server(server).await?;
+    client
+        .batch_execute(
+            "CREATE TABLE csv_dim (dim_id TEXT, label TEXT);
+             INSERT INTO csv_dim VALUES
+             ('d0','zero'),('d1','one'),('d2','two'),('d3','three'),
+             ('d4','four'),('d5','five'),('d6','six'),('d7','seven'),
+             ('d8','eight'),('d9','nine'),('d10','ten'),('d11','eleven'),
+             ('d12','twelve'),('d13','thirteen'),('d14','fourteen'),('d15','fifteen')",
+        )
+        .await
+        .context("preload CSV join dimension table")?;
+    let path_sql = sql_string(csv_path);
+    let query =
+        format!("SELECT COUNT(*) FROM read_csv({path_sql}) JOIN csv_dim ON fact_dim = dim_id");
+    let mut answer = serde_json::Value::Null;
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(&query)
+            .await
+            .context("CSV join table workload")?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let rows = simple_query_rows(&messages);
+        if rows.is_empty() {
+            anyhow::bail!("CSV join returned no rows");
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+            answer = serde_json::json!({ "rows": rows });
+        }
+    }
+    drop(client);
+    conn_handle.abort();
+    Ok(answer)
+}
+
+async fn run_csv_malformed_behavior(
+    server: SocketAddr,
+    csv_path: &Path,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<serde_json::Value> {
+    let (client, conn_handle) = connect_sql_server(server).await?;
+    let path_sql = sql_string(csv_path);
+    let mut answer = serde_json::Value::Null;
+    for i in 0..total_iters {
+        let table = format!("csv_bad_import_{i}");
+        let rejects = format!("csv_rejects_{i}");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {table} (id INT, category TEXT, metric INT, fact_dim TEXT)"
+            ))
+            .await
+            .with_context(|| format!("create malformed CSV target table {table}"))?;
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {rejects} (
+                     filename TEXT,
+                     line_number BIGINT,
+                     raw_row TEXT,
+                     error TEXT
+                 )"
+            ))
+            .await
+            .with_context(|| format!("create malformed CSV reject table {rejects}"))?;
+
+        let copy_sql = format!(
+            "COPY {table} FROM {path_sql} WITH \
+             (FORMAT csv, HEADER true, IGNORE_ERRORS = true, MAX_ERRORS = 1000, \
+              REJECT_TABLE = '{rejects}')"
+        );
+        let started = Instant::now();
+        client
+            .simple_query(&copy_sql)
+            .await
+            .with_context(|| format!("COPY malformed CSV into {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let accepted_rows = simple_count(&client, &format!("SELECT COUNT(*) FROM {table}")).await?;
+        let rejected_rows =
+            simple_count(&client, &format!("SELECT COUNT(*) FROM {rejects}")).await?;
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+            answer = serde_json::json!({
+                "mode": "copy_ignore_errors",
+                "accepted_rows": accepted_rows,
+                "rejected_rows": rejected_rows,
+                "max_errors": 1000,
+            });
+        }
+    }
+    drop(client);
+    conn_handle.abort();
+    Ok(answer)
 }
 
 /// Run one INSERT iteration: open a fresh wire connection, CREATE a
