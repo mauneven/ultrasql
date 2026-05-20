@@ -1755,61 +1755,74 @@ Every standard PostgreSQL driver and ORM works without modification.
 
 ### Vector Search / RAG Readiness
 
-Audit status: no SQL embedding-vector type exists today. `DataType` has
-numeric, JSONB, range, geometry, array, record, and NULL variants, but no
-`Vector(n)` variant; `Value` likewise has no vector payload. Existing
-`ultrasql-vec` work is SIMD/vectorized query execution, not pgvector-style
-embedding search. `LogicalIndexMethod` accepts `btree`, `hash`, `gin`,
-`gist`, and `brin`; no `hnsw` or `ivfflat` access method exists. The
-compatibility target for this slice is the
-[pgvector](https://github.com/pgvector/pgvector) SQL surface:
-`vector(n)`, distance operators, exact `ORDER BY distance LIMIT k`, and
-HNSW/IVFFlat index methods.
+Audit status: SQL vector support exists, but production ANN durability does
+not. `DataType` and `Value` include `vector`, `halfvec`, `sparsevec`, and
+`bitvec` families with dimension metadata; parser/binder/executor tests cover
+typed literals, casts, distance operators, vector functions, dimension
+mismatch, and wire-visible round trips. Runtime HNSW and IVFFlat indexes also
+exist behind `CREATE INDEX USING hnsw` and `CREATE INDEX USING ivfflat`, with
+DML maintenance, tombstones, VACUUM compaction, and exact-rerank behavior in
+tests. These ANN structures are still in-memory runtime access methods, not
+page-backed index relations with restart/recovery guarantees.
 
-- [ ] **Vector type slice** — add `VECTOR(n)`/`vector(n)` parser and
-  binder support; add `DataType::Vector { dims }` and `Value::Vector`
-  with finite-only `f32` elements and a fixed dimension; implement text
-  casts from `[1,2,3]`, row-codec storage, WAL/recovery, COPY text/CSV
-  and binary COPY, PostgreSQL wire OID/format mapping, catalog bootstrap,
-  and round-trip/property tests for dimension mismatch, NULL, finite-only
-  rejection, persistence, and restart.
-- [ ] **Vector operators slice** — add parser/binder/eval support for
-  pgvector-style distance operators `<->` (L2), `<#>` (negative inner
-  product), `<=>` (cosine), and `<+>` (L1), plus vector arithmetic
-  `+`, `-`, `*`, and `||`; add functions `l2_distance`,
-  `inner_product`, `cosine_distance`, `l1_distance`, `l2_norm`,
-  `l2_normalize`, `subvector`, `sum(vector)`, and `avg(vector)`.
-  Tests must pin NULL semantics, dimension mismatch errors, cosine
-  zero-vector rejection, ordering stability, and scalar reference parity.
-- [ ] **Vector execution slice** — add exact nearest-neighbor lowering for
-  `ORDER BY embedding <op> $query LIMIT k` over heap scans; implement
-  SIMD kernels in `ultrasql-vec` for L2, cosine, inner product, and L1
-  over `f32` slices; add a top-k heap/select algorithm that avoids full
-  sort for small `k`; preserve metadata filters by applying scalar
-  predicates before or during distance evaluation; expose plan shape in
-  `EXPLAIN` / `EXPLAIN ANALYZE`.
-- [ ] **ANN index slice** — add planner/parser/catalog support for
-  `CREATE INDEX ... USING hnsw (embedding vector_l2_ops)` and
-  `CREATE INDEX ... USING ivfflat (embedding vector_l2_ops)` plus cosine
-  and inner-product opclasses; implement page-backed HNSW and IVFFlat
-  storage with WAL, recovery, VACUUM/delete handling, CREATE INDEX
-  CONCURRENTLY behaviour, filtered-query fallback/iterative scan policy,
-  tunables (`m`, `ef_construction`, `ef_search`, `lists`, `probes`), and
-  recall-vs-latency tests against exact scan.
-- [ ] **RAG primitives slice** — keep model execution outside the database,
-  but provide DB-native retrieval building blocks: vector + JSONB metadata
-  filtering, vector + full-text hybrid search, reciprocal-rank-fusion SQL
-  helper, chunk/document schema examples in docs, rerank-friendly CTE
-  patterns, and transactionally safe bulk embedding load through COPY.
-  This slice is blocked until vector type/operators/execution plus JSONB
-  and TSVECTOR/TSQUERY surfaces are end-to-end.
-- [ ] **Vector benchmark certification slice** — add
-  `benchmarks/vector_certify.sh` and raw JSON artifacts for exact scan,
-  filtered exact scan, HNSW, IVFFlat, bulk load, index build, update/delete
-  maintenance, WAL recovery, and hybrid RAG query shapes. Certification
-  must compare UltraSQL against PostgreSQL + pgvector on the same host and
-  report recall@k, p50/p95/p99 latency, throughput, index size, build
-  time, memory, and restart correctness. No v1.0 vector claim is allowed
+Production target remains the pgvector-shaped SQL surface plus storage-grade
+indexes: `vector(n)`, distance operators, exact `ORDER BY distance LIMIT k`,
+HNSW/IVFFlat access methods, WAL redo, recovery, deletes, VACUUM, rebuild,
+and benchmark certification against PostgreSQL + pgvector on the same host.
+
+#### Implementation Status Matrix
+
+| Feature | Parser | Binder | Executor | Storage | WAL/recovery | Wire | Tests | Benchmark artifact |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `vector(n)` / `halfvec(n)` / `sparsevec` / `bitvec` values | ✅ typed literals, casts, `CREATE TABLE` | ✅ dimension/type checks | ✅ eval + row flow | ✅ catalog + row codec | ⚠️ heap row path only; restart certification still open | ✅ text output | ✅ parser/core/server round trips | ⚠️ exact top-k smoke exists; full cert open |
+| pgvector distance ops and functions | ✅ `<->`, `<#>`, `<=>`, `<+>` | ✅ unsupported vector comparisons fail explicitly | ✅ L2, cosine, inner product/dot, L1, norm, dims | n/a | n/a | ✅ result values | ✅ scalar/runtime tests | ⚠️ exact top-k artifacts only |
+| Exact vector top-k | n/a | ⚠️ shape recognized through `ORDER BY distance LIMIT` | ⚠️ top-k path exists; full-sort avoidance hardening open | n/a | n/a | n/a | ✅ server round trips | ⚠️ `vector_topk_exact` smoke, full pgvector cert open |
+| Runtime HNSW | ✅ `CREATE INDEX USING hnsw` | ✅ vector opclasses checked | ✅ in-memory ANN scan + exact fallback path | ⚠️ runtime graph, not pages | ⚠️ mutation WAL payloads exist; redo into pages open | n/a | ✅ insert/update/delete/vacuum tests | ✅ HNSW recall/latency smoke |
+| Production HNSW | ✅ SQL surface exists | ✅ SQL surface exists | ⚠️ planner can use runtime graph | ❌ page-backed graph open | ❌ crash-safe replay/rebuild open | n/a | ❌ restart/recovery tests open | ❌ certification open |
+| Runtime IVFFlat | ✅ `CREATE INDEX USING ivfflat` | ✅ `lists`/`probes` checked | ✅ centroid/list scan + exact rerank | ⚠️ runtime lists, not pages | ❌ no page redo/recovery | n/a | ✅ DML/vacuum tests | ❌ certification open |
+| Production IVFFlat | ✅ SQL surface exists | ✅ SQL surface exists | ⚠️ runtime path exists | ❌ page-backed centroids/lists open | ❌ bulk-build/insert/tombstone replay open | n/a | ❌ restart/recovery tests open | ❌ certification open |
+| RAG primitive schemas/helpers | n/a | n/a | ⚠️ normal SQL helper patterns | ✅ ordinary user tables | ⚠️ inherits table durability; no RLS guarantee | n/a | ✅ catalog/server helper tests | ❌ RAG quality/tenant cert open |
+| CSV table functions | ✅ `read_csv`, globs, arrays, file literals | ✅ function scan | ⚠️ external wrapper streams child; CSV reader still stores rows | file/object bytes only | n/a | ✅ query results | ✅ local/object/glob tests | ⚠️ CSV gauntlet runner; latest artifacts sparse |
+| Parquet table functions | ✅ `read_parquet`, globs, file literals | ✅ projection/predicate pushdown shapes | ⚠️ external wrapper streams child; Parquet scan still buffers batches | file/object bytes only | n/a | ✅ query results | ✅ projection/filter/object tests | ⚠️ smoke artifacts sparse |
+| Object-store scans | ✅ `s3://`, `r2://`, `gs://` path specs | ✅ function scan paths | ⚠️ whole-object reads | ❌ no range reader | n/a | n/a | ✅ mocked object tests | ❌ lakehouse cert open |
+| Iceberg read scan | ✅ `read_iceberg` / `iceberg_scan` | ✅ function scan | ⚠️ metadata planner feeds Parquet scan | metadata-only planner | n/a | ✅ query results | ✅ current snapshot tests | ❌ deletes/time-travel/catalog cert open |
+| Arrow bridge | ✅ `read_arrow` | ✅ function scan | ⚠️ buffered IPC file batches | IPC bytes only | n/a | ✅ query results | ✅ basic type tests | ❌ Flight/type-coverage cert open |
+
+- [x] **Vector type slice, runtime subset** — parser, binder, core values,
+  row-codec/catalog storage, text casts, dimension validation, finite-value
+  checks, server round trips, and wire text output exist for the vector-family
+  types. Remaining work: binary COPY parity, broader PostgreSQL coercions, and
+  restart-focused certification artifacts.
+- [x] **Vector operators/functions, runtime subset** — pgvector distance
+  operators `<->`, `<#>`, `<=>`, `<+>` and functions `l2_distance`,
+  `cosine_distance`, `inner_product`, `dot_product`, `l1_distance`,
+  `vector_norm`/`l2_norm`, and `vector_dims` exist with scalar/SIMD kernels.
+  Remaining work: arithmetic operators, aggregates like `avg(vector)`, and
+  certification against pgvector.
+- [ ] **Exact vector top-k hardening** — ensure `ORDER BY embedding <op>
+  probe LIMIT k` always avoids a full sort, applies scalar filters before
+  distance work, exposes the chosen kernel/index/fallback in `EXPLAIN
+  ANALYZE`, and has raw artifacts for filtered and unfiltered exact search.
+- [x] **Runtime ANN slice** — HNSW and IVFFlat SQL surfaces, in-memory access
+  methods, DML maintenance, tombstones, VACUUM compaction, opclasses, and
+  exact rerank paths exist. This is useful as a correctness oracle and first
+  planner target, but it is not yet a production index storage layer.
+- [ ] **Production ANN slice** — implement page-backed HNSW and IVFFlat
+  relations with meta pages, graph/list pages, overflow pages, free lists,
+  redo-idempotent WAL, restart recovery, deletes, VACUUM compaction, rebuild,
+  CREATE INDEX CONCURRENTLY behavior, filtered-query fallback/iterative scan
+  policy, and recall-vs-latency tests against exact scan.
+- [ ] **RAG guarantee slice** — RAG storage primitives and helper SQL exist as
+  ordinary SQL/table patterns. Tenant-safe RAG is not a DB guarantee until
+  row-level security policy catalog/enforcement lands and tenant predicates
+  are injected for reads and writes.
+- [ ] **Vector benchmark certification slice** — expand current exact top-k
+  and HNSW smoke runners into committed certification artifacts for exact
+  scan, filtered exact scan, HNSW, IVFFlat, bulk load, index build,
+  update/delete maintenance, WAL recovery, and hybrid RAG query shapes.
+  Certification must compare UltraSQL against PostgreSQL + pgvector on the
+  same host and report recall@k, p50/p95/p99 latency, throughput, index size,
+  build time, memory, and restart correctness. No v1.0 vector claim is allowed
   without committed scripts, datasets or dataset fetch instructions, host
   descriptor, and raw artifacts.
 
