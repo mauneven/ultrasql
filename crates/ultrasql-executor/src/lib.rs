@@ -37,6 +37,8 @@
 //! - [`Limit`] — row cap across all output batches.
 //! - [`Sort`] — in-memory sort with optional spill.
 //! - [`TopK`] — exact bounded `ORDER BY ... LIMIT k` retrieval.
+//! - [`HybridSearch`] — RAG retrieval ranker combining text, vector,
+//!   metadata, recency, version, and SQL predicates.
 //! - [`HashJoin`] — hash equi-join (Inner, `LeftOuter`).
 //! - [`MergeJoin`] — merge equi-join over sorted inputs (all join types).
 //! - [`HashAggregate`] — hash-based GROUP BY / aggregate.
@@ -76,6 +78,7 @@ pub mod fused_update;
 pub mod gather;
 mod hash_aggregate;
 mod hash_join;
+pub mod hybrid_search;
 pub mod index_scan;
 mod limit;
 pub mod lock_rows;
@@ -118,6 +121,9 @@ pub use function_scan::FunctionScan;
 pub use gather::{Gather, GatherMerge};
 pub use hash_aggregate::HashAggregate;
 pub use hash_join::HashJoin;
+pub use hybrid_search::{
+    HybridSearch, HybridSearchConfig, HybridSearchWeights, HybridTextSpec, HybridVectorSpec,
+};
 pub use index_scan::IndexScan;
 pub use limit::Limit;
 pub use lock_rows::LockRows;
