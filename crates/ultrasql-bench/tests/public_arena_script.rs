@@ -4,6 +4,18 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+fn bash_command() -> Command {
+    #[cfg(windows)]
+    {
+        let git_bash = PathBuf::from(r"C:\Program Files\Git\bin\bash.exe");
+        if git_bash.exists() {
+            return Command::new(git_bash);
+        }
+    }
+
+    Command::new("bash")
+}
+
 fn repo_path(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -69,7 +81,7 @@ fn arena_script_composes_existing_runners_without_claiming_winners() {
 #[test]
 fn arena_script_has_valid_bash_syntax() {
     let script = repo_path("benchmarks/arena.sh");
-    let status = Command::new("bash")
+    let status = bash_command()
         .arg("-n")
         .arg(&script)
         .status()
