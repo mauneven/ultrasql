@@ -2146,6 +2146,19 @@ mod tests {
             joined.eval(&[]).unwrap(),
             Value::Text("red|green|blue".into())
         );
+
+        let cat = Eval::new(call(
+            "array_cat",
+            vec![lit_text_array(&["red"]), lit_text_array(&["green"])],
+            DataType::Array(Box::new(DataType::Text { max_len: None })),
+        ));
+        assert_eq!(
+            cat.eval(&[]).unwrap(),
+            Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: vec![Value::Text("red".into()), Value::Text("green".into())]
+            }
+        );
     }
 
     #[test]
