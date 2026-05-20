@@ -28,13 +28,47 @@ SUMMARY_OUT="$OUT_DIR/tpch_sf10_certification.json"
 
 mkdir -p "$RAW_DIR"
 
+write_setup_summary() {
+    local reason="$1"
+    local detail="$2"
+    python3 - "$SUMMARY_OUT" "$reason" "$detail" "$TPCH_DATA_DIR" \
+        "$DUCKDB_BIN" "$DUCKDB_OUT" "$ULTRA_OUT" <<'PY'
+import json
+import pathlib
+import sys
+
+summary_path, reason, detail, data_dir, duckdb_bin, duckdb_out, ultra_out = sys.argv[1:]
+doc = {
+    "workload": "tpch_sf10",
+    "scale_factor": 10,
+    "target": "UltraSQL geometric mean <= 2x DuckDB geometric mean across all 22 TPC-H queries",
+    "passed": False,
+    "reason": reason,
+    "detail": detail,
+    "data_dir": data_dir,
+    "duckdb_bin": duckdb_bin or None,
+    "duckdb_result": duckdb_out,
+    "ultrasql_result": ultra_out,
+    "next_step": (
+        "Provide real SF10 .tbl data and a DuckDB binary, then rerun "
+        "benchmarks/tpch_sf10_certify.sh. Synthetic data is smoke-only and "
+        "not a TPC-H certification."
+    ),
+}
+pathlib.Path(summary_path).write_text(json.dumps(doc, indent=2) + "\n")
+print(json.dumps(doc, indent=2))
+PY
+}
+
 if [[ ! -d "$TPCH_DATA_DIR" ]]; then
+    write_setup_summary "data_dir_missing" "TPC-H SF10 data directory is missing."
     echo "TPC-H data dir missing: $TPCH_DATA_DIR" >&2
     echo "Run: target/release/tpch gen-data 10 $TPCH_DATA_DIR" >&2
     exit 2
 fi
 
 if [[ -z "$DUCKDB_BIN" || ! -x "$DUCKDB_BIN" ]]; then
+    write_setup_summary "duckdb_missing" "DuckDB binary missing or not executable."
     echo "DuckDB binary missing. Set TPCH_DUCKDB=/path/to/duckdb" >&2
     exit 2
 fi

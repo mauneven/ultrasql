@@ -19,11 +19,37 @@ TPCB_ACCOUNTS="${TPCB_ACCOUNTS:-}"
 TPCB_DURATION="${TPCB_DURATION:-60}"
 TPCB_WARMUP="${TPCB_WARMUP:-30}"
 TPCB_CONNECTIONS="${TPCB_CONNECTIONS:-32}"
+ALLOW_ULTRASQL_ONLY="${TPCB_ALLOW_ULTRASQL_ONLY:-0}"
 OUT_DIR="benchmarks/results/latest"
 RAW_DIR="$OUT_DIR/raw"
 SUMMARY_OUT="$OUT_DIR/tpcb_certification.json"
 
 mkdir -p "$RAW_DIR"
+
+if [[ -z "$POSTGRES_RESULT" && -z "$POSTGRES_DSN" && "$ALLOW_ULTRASQL_ONLY" != "1" ]]; then
+    python3 - "$SUMMARY_OUT" <<'PY'
+import json
+import pathlib
+import sys
+
+summary_path = sys.argv[1]
+doc = {
+    "workload": "tpcb_32conn",
+    "target": "UltraSQL throughput >= 2x PostgreSQL 17 and p99 < 5 ms at 32 clients",
+    "passed": False,
+    "reason": "postgres_dsn_missing",
+    "postgres_result": None,
+    "ultrasql_result": None,
+    "next_step": (
+        "Set POSTGRES_DSN or POSTGRES_TPCB_RESULT for certification. "
+        "Set TPCB_ALLOW_ULTRASQL_ONLY=1 only for local UltraSQL-only smoke."
+    ),
+}
+pathlib.Path(summary_path).write_text(json.dumps(doc, indent=2) + "\n")
+print(json.dumps(doc, indent=2))
+PY
+    exit 2
+fi
 
 CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
     cargo build --release --package ultrasql-bench --features sql-bench \
@@ -138,5 +164,5 @@ doc = {
 }
 pathlib.Path(summary_path).write_text(json.dumps(doc, indent=2) + "\n")
 print(json.dumps(doc, indent=2))
-sys.exit(0 if passed else 1)
+sys.exit(2 if reason == "missing_cross_engine_results" else (0 if passed else 1))
 PY

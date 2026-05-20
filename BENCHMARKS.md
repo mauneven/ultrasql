@@ -299,14 +299,48 @@ same-host 32-client PostgreSQL-wire result artifacts exist, both engines pass
 the TPC-B balance-sum correctness check, UltraSQL throughput is at least 2×
 PostgreSQL 17, and UltraSQL p99 latency is below 5 ms. If `ULTRASQL_DSN` is
 not set, the script starts an in-process UltraSQL server and measures it over
-`tokio-postgres`; PostgreSQL requires `POSTGRES_DSN`. `TPCB_SCALE`,
-`TPCB_DURATION`, `TPCB_WARMUP`, `TPCB_CONNECTIONS`, and `TPCB_ACCOUNTS`
-control local smoke versus publishable runs.
+`tokio-postgres`; PostgreSQL requires `POSTGRES_DSN` or a pre-existing
+`POSTGRES_TPCB_RESULT`. When neither is present the script writes
+`reason: "postgres_dsn_missing"` and exits with code 2 so full certification
+manifests mark the suite unavailable instead of spending the run budget on a
+non-certifying UltraSQL-only measurement. `TPCB_SCALE`, `TPCB_DURATION`,
+`TPCB_WARMUP`, `TPCB_CONNECTIONS`, and `TPCB_ACCOUNTS` control local smoke
+versus publishable runs.
 
-Current local smoke artifact (`TPCB_CONNECTIONS=8`, `TPCB_ACCOUNTS=1000`,
-`TPCB_DURATION=5`, `TPCB_WARMUP=1`) validates UltraSQL TPC-B balance
-invariants and writes an explicit failing certification summary because
-PostgreSQL 17 comparison is absent and p99 remains above the v0.9 target.
+For local UltraSQL-only smoke, set `TPCB_ALLOW_ULTRASQL_ONLY=1` alongside
+small shape controls such as `TPCB_CONNECTIONS=8`, `TPCB_ACCOUNTS=1000`,
+`TPCB_DURATION=5`, and `TPCB_WARMUP=1`. That mode validates UltraSQL TPC-B
+balance invariants but is not certification.
+
+### TPC-C Certification
+
+TPC-C certification is tracked by:
+
+```text
+benchmarks/tpcc_certify.sh
+```
+
+Today this script writes
+`benchmarks/results/latest/tpcc_certification.json` with
+`passed: false` and `reason: "runner_not_implemented"`, then exits with
+code 2. That makes nightly/full benchmark manifests honest: TPC-C is visible
+in the certification matrix, but no TPC-C performance claim exists until the
+five transaction types and concurrent durable wire runner are implemented.
+
+### Sysbench-Style OLTP
+
+Sysbench-style OLTP smoke/full artifacts are recorded by:
+
+```text
+benchmarks/sysbench_certify.sh
+```
+
+The current runner uses UltraSQL's PostgreSQL-wire `mixed-oltp` workload as
+the committed sysbench-shaped artifact and writes
+`benchmarks/results/latest/sysbench_certification.json`. It records positive
+latency samples and a raw JSON result under `benchmarks/results/latest/raw/`;
+it does not make a competitor claim. `SYSBENCH_ROWS`, `SYSBENCH_ITERS`, and
+`SYSBENCH_WARMUP` control local smoke versus longer runs.
 
 ---
 
@@ -322,6 +356,37 @@ Every benchmark driver binary (`cross_compare`, `cross_compare_writes`,
 
 There are no intermediate tiers. The `--warmup` and `--iters` flags can
 override the tier defaults when a specific iteration count is needed.
+
+## Benchmark Profiles
+
+Use the profile runner when choosing between PR-safe smoke and longer
+certification attempts:
+
+```text
+benchmarks/certify.sh smoke
+benchmarks/certify.sh full
+benchmarks/certify.sh full tpch,clickbench,vector-ann
+```
+
+Smoke profile:
+- runs `regression-gate --stage current --smoke`;
+- runs HNSW ANN vector search at 512 rows / 4 measured queries;
+- runs sysbench-style mixed OLTP at 1 000 rows / 1 measured iteration;
+- avoids external datasets, DSNs, and competitor setup.
+
+Full profile:
+- attempts TPC-H SF10, ClickBench, TPC-B, TPC-C, sysbench-style OLTP,
+  exact vector top-k, and HNSW ANN vector search;
+- writes `benchmarks/results/latest/benchmark_certification_manifest.json`;
+- treats exit code 2 from a child runner as `unavailable`, meaning a required
+  dataset, DSN, engine, or implementation is missing and no benchmark claim
+  was produced;
+- fails when an attempted certification runs and misses its target.
+
+GitHub bench workflow uses `benchmarks/certify.sh smoke` for pull requests.
+Scheduled and manual runs use `benchmarks/certify.sh full` plus full criterion
+sweeps. Do not wait for those long jobs after every task; run/check them when
+the maintainer asks or after a batch of benchmark-sensitive work.
 
 ## Pre-Push Gate vs Full Sweep
 
@@ -346,9 +411,9 @@ baseline after a measured improvement:
 make bench-record
 ```
 
-The CI bench job also runs the full sweep on every merge; a smoke-only
-pre-push does not absolve a contributor of the obligation to show
-before/after numbers in the PR description.
+The scheduled/manual bench workflow runs the full sweep; a smoke-only
+pre-push or PR smoke job does not absolve a contributor of the obligation
+to show before/after numbers in the PR description.
 
 ## Results Directory Policy
 

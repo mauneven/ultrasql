@@ -1,8 +1,8 @@
 name: bench
 
-# Runs the criterion benchmark suite and compares against the recorded
-# baseline. Triggered on PRs that touch performance-sensitive paths and
-# nightly to maintain the baseline.
+# PRs run short benchmark smoke only. Nightly/manual runs attempt longer
+# certification suites and criterion sweeps. Missing external datasets or
+# DSNs are recorded as unavailable artifacts, not benchmark claims.
 
 on:
   pull_request:
@@ -30,13 +30,37 @@ env:
 
 jobs:
   # -------------------------------------------------------------------
-  # Microbenchmarks via criterion. Each affected crate runs its own
-  # bench and uploads results as build artifacts. A follow-up step
-  # diffs against the committed baseline.
+  # PR-safe benchmark smoke: no external benchmark assets, tiny inputs.
+  # -------------------------------------------------------------------
+  smoke:
+    name: benchmark smoke
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: run smoke certifications
+        run: benchmarks/certify.sh smoke
+      - name: upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-smoke
+          path: |
+            benchmarks/results/latest/benchmark_certification_manifest.json
+            benchmarks/results/latest/sysbench_certification.json
+            benchmarks/results/latest/raw/*sysbench*
+            benchmarks/results/latest/raw/*vector_ann*
+
+  # -------------------------------------------------------------------
+  # Full microbenchmarks via criterion. Scheduled/manual only because
+  # criterion consumes enough time/noise budget to be poor PR feedback.
   # -------------------------------------------------------------------
   micro:
-    name: criterion (${{ matrix.os }})
+    name: criterion full (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -69,33 +93,27 @@ jobs:
             bench-out
 
   # -------------------------------------------------------------------
-  # OLTP / OLAP macro-benchmarks against committed datasets.
+  # Full macro/certification sweep. Attempts TPC-H, ClickBench, TPC-B,
+  # TPC-C, Sysbench-style OLTP, and vector search. Setup-missing suites
+  # write unavailable artifacts and do not claim numbers.
   # -------------------------------------------------------------------
-  macro:
-    name: macrobench (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  certifications:
+    name: benchmark certifications
+    runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-14
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --workspace --features ultrasql-bench/sql-bench
-      - name: TPC-B 1x sanity run
-        env:
-          OS_LABEL: ${{ matrix.os }}
-        run: |
-          mkdir -p bench-out
-          ./target/release/ultrasql-bench tpcb --scale 1 --accounts 1000 \
-              --duration 5 --warmup 1 --connections 8 \
-              --output "bench-out/tpcb-${OS_LABEL}.json"
-      - name: upload macro artifacts
+      - name: run full certification matrix
+        run: benchmarks/certify.sh full
+      - name: upload certification artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: macrobench-${{ matrix.os }}
-          path: bench-out/
+          name: benchmark-certifications
+          path: |
+            benchmarks/results/latest/*certification.json
+            benchmarks/results/latest/benchmark_certification_manifest.json
+            benchmarks/results/latest/raw/
