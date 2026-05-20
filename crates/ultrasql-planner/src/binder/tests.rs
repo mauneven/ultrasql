@@ -354,6 +354,23 @@ fn binds_create_table_with_varchar_modifier() {
 }
 
 #[test]
+fn binds_create_table_array_column_types() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("CREATE TABLE t (ids INT[], tags TEXT[])", &cat).expect("bind ok");
+    let LogicalPlan::CreateTable { columns, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(
+        columns.fields()[0].data_type,
+        DataType::Array(Box::new(DataType::Int32))
+    );
+    assert_eq!(
+        columns.fields()[1].data_type,
+        DataType::Array(Box::new(DataType::Text { max_len: None }))
+    );
+}
+
+#[test]
 fn binds_create_table_primary_key_implies_not_null() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind("CREATE TABLE t (id INT PRIMARY KEY)", &cat).expect("bind ok");

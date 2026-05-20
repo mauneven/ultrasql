@@ -229,6 +229,7 @@ const DT_JSONB: u8 = 0x10;
 const DT_NULL: u8 = 0x11;
 const DT_RANGE: u8 = 0x12;
 const DT_GEOMETRY: u8 = 0x13;
+const DT_ARRAY: u8 = 0x14;
 
 fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError> {
     match ty {
@@ -264,7 +265,11 @@ fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError
             w.u8(DT_GEOMETRY);
             w.u8(encode_geometry_type(*geometry_type));
         }
-        DataType::Array(_) | DataType::Record(_) => {
+        DataType::Array(inner) => {
+            w.u8(DT_ARRAY);
+            encode_data_type(w, inner)?;
+        }
+        DataType::Record(_) => {
             return Err(EncodeError::UnsupportedType(ty.clone()));
         }
         // `DataType` is `#[non_exhaustive]`; treat any future variant
@@ -302,6 +307,7 @@ fn decode_data_type(r: &mut Reader<'_>) -> Result<DataType, DecodeError> {
         DT_NULL => DataType::Null,
         DT_RANGE => DataType::Range(decode_range_type(r.u8()?)?),
         DT_GEOMETRY => DataType::Geometry(decode_geometry_type(r.u8()?)?),
+        DT_ARRAY => DataType::Array(Box::new(decode_data_type(r)?)),
         other => {
             return Err(DecodeError::InvalidTag {
                 tag: other,
@@ -919,9 +925,27 @@ mod tests {
             atthasdef: false,
             attisdropped: false,
         };
-        let dt = DataType::Array(Box::new(DataType::Int32));
+        let dt = DataType::Record(vec![("x".to_owned(), DataType::Int32)]);
         let err = encode_attribute_row(&row, &dt, true).unwrap_err();
         assert!(matches!(err, EncodeError::UnsupportedType(_)));
+    }
+
+    #[test]
+    fn array_type_round_trip() {
+        let row = AttributeRow {
+            attrelid: Oid::new(1),
+            attname: "tags".into(),
+            atttypid: 0,
+            attnum: 1,
+            attnotnull: false,
+            atthasdef: false,
+            attisdropped: false,
+        };
+        let dt = DataType::Array(Box::new(DataType::Text { max_len: None }));
+        let bytes = encode_attribute_row(&row, &dt, true).expect("encode");
+        let (_row, got_dt, nullable) = decode_attribute_row(&bytes).expect("decode");
+        assert_eq!(got_dt, dt);
+        assert!(nullable);
     }
 
     #[test]

@@ -779,7 +779,9 @@ fn object_name_namespace(name: &ObjectName) -> String {
 /// carries a `max_len` slot.
 fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
     if t.is_array {
-        return Err(PlanError::NotSupported("CREATE TABLE: ARRAY column types"));
+        let mut inner = t.clone();
+        inner.is_array = false;
+        return resolve_type_name(&inner).map(|ty| DataType::Array(Box::new(ty)));
     }
     let max_len_modifier = || t.type_modifiers.first().copied();
     match t.name.value.as_str() {
@@ -866,9 +868,6 @@ fn resolve_column_type(
     column_name: &str,
     t: &TypeName,
 ) -> Result<(DataType, Option<String>), PlanError> {
-    if t.is_array {
-        return Err(PlanError::NotSupported("CREATE TABLE: ARRAY column types"));
-    }
     if !t.type_modifiers.is_empty() {
         match t.name.value.as_str() {
             "serial" | "serial4" | "bigserial" | "serial8" | "smallserial" | "serial2" => {
