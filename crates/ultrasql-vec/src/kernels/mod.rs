@@ -572,17 +572,18 @@ fn sum_i32_widening_dense_neon(data: &[i32]) -> i64 {
 }
 
 /// Min of a non-null `f64` column. Returns `None` on empty / all-null
-/// input. Honors IEEE-754 semantics for NaN: NaN values are skipped
-/// (Rust's [`f64::min`] returns the non-NaN argument when one is NaN).
+/// input. NaN values are skipped. Signed-zero ties use [`f64::total_cmp`],
+/// so `-0.0` is the deterministic minimum of `-0.0` and `+0.0` on every
+/// target.
 ///
 /// # Implementation notes
 ///
 /// The non-null fast path keeps four parallel accumulators so LLVM
-/// can schedule four independent `fmin` chains, which Apple M-series
+/// can schedule four independent min chains, which Apple M-series
 /// can dual-issue. The accumulators are seeded with
-/// [`f64::INFINITY`]; combining with `f64::min` is branch-free and
-/// preserves NaN-skip semantics: `min(INF, x) = x` for any non-NaN
-/// `x`, and `min(acc, NaN) = acc`. The result is `None` iff the
+/// [`f64::INFINITY`]; combining through [`min_f64_value`] preserves
+/// NaN-skip semantics and deterministic signed-zero ordering. The result is
+/// `None` iff the
 /// folded `best` is still `INFINITY` AND the input had no `+INF` and
 /// no non-NaN value — distinguished by tracking `saw_value`.
 ///
@@ -608,9 +609,7 @@ fn min_f64_dense(data: &[f64]) -> Option<f64> {
         return None;
     }
 
-    // Four-wide unrolled fold. Seeding with `INFINITY` is safe for
-    // the IEEE NaN-skip semantics that `f64::min` provides: NaN lanes
-    // pass through unchanged. We track `saw_value` separately so a
+    // Four-wide unrolled fold. We track `saw_value` separately so a
     // column of all NaNs returns `None` instead of `INFINITY`.
     let mut a0 = f64::INFINITY;
     let mut a1 = f64::INFINITY;
@@ -626,20 +625,32 @@ fn min_f64_dense(data: &[f64]) -> Option<f64> {
         // non-NaN flags into `saw_value` to know if the column has
         // any usable value at the end.
         saw_value |= !arr[0].is_nan() | !arr[1].is_nan() | !arr[2].is_nan() | !arr[3].is_nan();
-        a0 = a0.min(arr[0]);
-        a1 = a1.min(arr[1]);
-        a2 = a2.min(arr[2]);
-        a3 = a3.min(arr[3]);
+        a0 = min_f64_value(a0, arr[0]);
+        a1 = min_f64_value(a1, arr[1]);
+        a2 = min_f64_value(a2, arr[2]);
+        a3 = min_f64_value(a3, arr[3]);
     }
     for &v in rem {
         saw_value |= !v.is_nan();
-        a0 = a0.min(v);
+        a0 = min_f64_value(a0, v);
     }
 
     if !saw_value {
         return None;
     }
-    Some(a0.min(a1).min(a2.min(a3)))
+    Some(min_f64_value(min_f64_value(a0, a1), min_f64_value(a2, a3)))
+}
+
+#[inline]
+fn min_f64_value(left: f64, right: f64) -> f64 {
+    if right.is_nan() {
+        return left;
+    }
+    if left.is_nan() || right.total_cmp(&left).is_lt() {
+        right
+    } else {
+        left
+    }
 }
 
 /// Null-aware min of an `f64` slice. NULL entries (validity = 0) and
@@ -669,7 +680,7 @@ fn min_f64_nullable(data: &[f64], nulls: &Bitmap) -> Option<f64> {
             }
             let v = data[i];
             if !v.is_nan() {
-                best = Some(best.map_or(v, |b| b.min(v)));
+                best = Some(best.map_or(v, |b| min_f64_value(b, v)));
             }
             w &= w - 1;
         }
@@ -680,11 +691,8 @@ fn min_f64_nullable(data: &[f64], nulls: &Bitmap) -> Option<f64> {
 /// Scalar reference implementation of [`min_f64`].
 ///
 /// Used by property tests to cross-validate the production kernel.
-/// Uses [`f64::min`] so signed-zero ordering matches the fast path
-/// (Rust's `f64::min` follows IEEE-754 minNum: `min(-0.0, 0.0) =
-/// -0.0`). The previous `<`-based reference treated `-0.0 == 0.0`,
-/// which silently differed from the SIMD `fminnm` lowering and made
-/// proptest flag a non-bug.
+/// Uses [`min_f64_value`] so signed-zero ordering matches the fast path
+/// independent of reduction order and target-specific `fmin` lowering.
 #[must_use]
 pub fn min_f64_scalar(column: &NumericColumn<f64>) -> Option<f64> {
     let mut best: Option<f64> = None;
@@ -693,14 +701,14 @@ pub fn min_f64_scalar(column: &NumericColumn<f64>) -> Option<f64> {
             if !nulls.get(i) || v.is_nan() {
                 continue;
             }
-            best = Some(best.map_or(v, |b| b.min(v)));
+            best = Some(best.map_or(v, |b| min_f64_value(b, v)));
         }
     } else {
         for &v in column.data() {
             if v.is_nan() {
                 continue;
             }
-            best = Some(best.map_or(v, |b| b.min(v)));
+            best = Some(best.map_or(v, |b| min_f64_value(b, v)));
         }
     }
     best
@@ -1515,6 +1523,16 @@ mod tests {
         let nulls = Bitmap::new(3, false);
         let c = NumericColumn::with_nulls(vec![1.0_f64, 2.0, 3.0], nulls).unwrap();
         assert_eq!(min_f64(&c), None);
+    }
+
+    #[test]
+    fn min_f64_signed_zero_tie_is_deterministic() {
+        let c = NumericColumn::from_data(vec![f64::NAN, 0.0, -0.0, 0.0, -0.0]);
+        assert_eq!(min_f64(&c).map(f64::to_bits), Some((-0.0_f64).to_bits()));
+        assert_eq!(
+            min_f64(&c).map(f64::to_bits),
+            min_f64_scalar(&c).map(f64::to_bits)
+        );
     }
 
     #[test]
