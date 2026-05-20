@@ -530,6 +530,9 @@ where
                 if let Err(e) = self.state.txn_manager.commit(txn) {
                     tracing::warn!(error = %e, "autocommit (TRUNCATE) failed to finalise");
                 }
+                for name in &tables {
+                    self.state.columnar_storage.mark_dirty(name);
+                }
                 // Row counts changed beyond recognition; clear the cache
                 // so any cardinality-aware plan re-runs.
                 self.plan_cache_invalidate();

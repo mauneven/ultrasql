@@ -143,6 +143,16 @@ We accept this for compatibility; a future segment format may introduce
 larger physical pages with logical 8 KiB sub-pages for the analytical
 heap.
 
+**Columnar secondary layout.** The row-store heap remains the source of
+truth for OLTP, WAL, and MVCC. For OLAP scans, the server maintains a
+same-table columnar shadow in `HeapAccess::column_cache`: committed DML
+bumps the relation version, queues a background rebuild, and drops stale
+columns. Rebuild scans use an MVCC snapshot, materialize fixed-width
+numeric columns into typed buffers, and record logical segment row
+counts for future on-disk segment spill. Scan replay validates the
+relation version before reading the shadow, so stale columnar data is
+never returned.
+
 **Performance implications.** The slotted-page layout is the same hot
 path for OLTP inserts as PostgreSQL. The B-link tree variant scales
 better than the lock-coupling tree used by PostgreSQL on concurrent

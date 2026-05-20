@@ -45,6 +45,7 @@
 
 pub mod auth;
 pub mod cancel;
+pub mod columnar_storage;
 pub mod copy;
 pub mod error;
 pub mod extended;
@@ -72,7 +73,7 @@ use ultrasql_catalog::{
 };
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{BlockNumber, PageId, RelationId, Value};
-use ultrasql_executor::{Eval, ExecError, MemTableScan, RowCodec};
+use ultrasql_executor::{Eval, ExecError, MemTableScan, Operator, RowCodec, SeqScan};
 use ultrasql_optimizer::{
     AnalyzeOptions, AnalyzeRunner, InMemoryStatsCatalog, PgStatisticRow, PlanCache,
     PlanCacheConfig, StatsCatalog,
@@ -804,6 +805,8 @@ pub struct Server {
     pub sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
     /// Same-process append-only materialized-view registry keyed by view name.
     pub materialized_views: Arc<dashmap::DashMap<String, Arc<MaterializedViewRuntime>>>,
+    /// Same-process columnar secondary-storage registry.
+    pub columnar_storage: Arc<columnar_storage::ColumnarSecondaryStore>,
     /// Same-process time-range partition registry keyed by parent table name.
     pub time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
     /// Accumulated tuple modifications since the last analyze pass,
@@ -1626,6 +1629,7 @@ impl Server {
             table_constraints: Arc::new(dashmap::DashMap::new()),
             sequences: Arc::new(dashmap::DashMap::new()),
             materialized_views: Arc::new(dashmap::DashMap::new()),
+            columnar_storage: Arc::new(columnar_storage::ColumnarSecondaryStore::new()),
             time_partitions: Arc::new(dashmap::DashMap::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
@@ -1855,6 +1859,7 @@ impl Server {
         }
         self.vacuum_mark_visible_pages(oldest);
         self.run_one_pending_analyze();
+        self.run_one_pending_columnarization();
     }
 
     pub(crate) fn vacuum_mark_visible_pages(&self, oldest: ultrasql_core::Xid) {
@@ -1986,6 +1991,7 @@ impl Server {
             table_constraints: Arc::new(dashmap::DashMap::new()),
             sequences,
             materialized_views: Arc::new(dashmap::DashMap::new()),
+            columnar_storage: Arc::new(columnar_storage::ColumnarSecondaryStore::new()),
             time_partitions: Arc::new(dashmap::DashMap::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
@@ -2133,6 +2139,7 @@ impl Server {
         }
 
         let folded = table.to_ascii_lowercase();
+        self.columnar_storage.mark_dirty(&folded);
         let current = {
             let mut entry = self.table_modifications.entry(folded.clone()).or_insert(0);
             *entry = entry.saturating_add(modified_rows);
@@ -2147,6 +2154,93 @@ impl Server {
         // next cycle while the maintenance pass drains this table.
         self.table_modifications.insert(folded.clone(), 0);
         self.pending_analyze_tables.insert(folded, ());
+    }
+
+    /// Rebuild every pending same-table columnar shadow.
+    ///
+    /// The heap remains authoritative. This maintenance pass drains
+    /// queued table names and warms `HeapAccess::column_cache` from an
+    /// MVCC snapshot so subsequent OLAP scans can use the columnar
+    /// secondary layout without first paying the row-store decode cost.
+    pub fn run_columnarization_cycle(&self) {
+        while self.run_one_pending_columnarization() {}
+    }
+
+    fn run_one_pending_columnarization(&self) -> bool {
+        let Some(table) = self.columnar_storage.pop_pending() else {
+            return false;
+        };
+        match self.columnarize_table(&table) {
+            Ok(true) => {
+                tracing::debug!(table = %table, "columnar shadow rebuilt");
+            }
+            Ok(false) => {
+                tracing::debug!(table = %table, "columnar shadow skipped");
+            }
+            Err(e) => {
+                tracing::warn!(table = %table, error = %e, "columnar shadow rebuild failed");
+            }
+        }
+        true
+    }
+
+    /// Rebuild one table's columnar shadow from the row-store heap.
+    pub fn columnarize_table(&self, table: &str) -> Result<bool, ServerError> {
+        let folded = table.to_ascii_lowercase();
+        let snapshot = self.catalog_snapshot();
+        let Some(entry) = snapshot.tables.get(&folded).cloned() else {
+            self.columnar_storage.remove(&folded);
+            return Ok(false);
+        };
+        drop(snapshot);
+
+        let rel = RelationId(entry.oid);
+        if let Some(cached) = self.heap.column_cache.get(rel) {
+            self.columnar_storage.record_rebuild(
+                folded,
+                rel,
+                cached.version,
+                cached.row_count(),
+                cached.segment_count(),
+            );
+            return Ok(true);
+        }
+
+        let block_count = self.heap.block_count(rel).max(entry.n_blocks);
+        if block_count == 0 {
+            return Ok(false);
+        }
+
+        let scan_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let mut scan = SeqScan::new_with_vm(
+            Arc::clone(&self.heap),
+            rel,
+            block_count,
+            scan_txn.snapshot.clone(),
+            Arc::clone(&self.txn_manager),
+            Arc::clone(&self.vm),
+            RowCodec::new(entry.schema.clone()),
+        );
+        while scan
+            .next_batch()
+            .map_err(|e| ServerError::Ddl(format!("columnarization scan failed: {e}")))?
+            .is_some()
+        {}
+        if let Err(e) = self.txn_manager.abort(scan_txn) {
+            tracing::warn!(error = %e, "columnarization scan transaction abort failed");
+        }
+
+        let Some(cached) = self.heap.column_cache.get(rel) else {
+            return Ok(false);
+        };
+        self.columnar_storage.record_rebuild(
+            folded,
+            rel,
+            cached.version,
+            cached.row_count(),
+            cached.segment_count(),
+        );
+        Ok(true)
     }
 
     /// Run `ANALYZE` for one table: refresh block-count hint and

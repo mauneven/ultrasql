@@ -14,6 +14,8 @@
 //!   accumulates the decoded columns into an [`Arc<CachedColumns>`]
 //!   entry keyed on the relation's monotonically-increasing
 //!   relation version.
+//! - Server maintenance can also build the same entry after committed
+//!   DML, warming the columnar layout before the next OLAP query.
 //! - Subsequent `SeqScan`s over the **same** relation, **same**
 //!   version, skip the heap walk entirely and stream batches
 //!   directly from the cached columns.
@@ -46,6 +48,9 @@ use ahash::AHashMap;
 use parking_lot::RwLock;
 use ultrasql_core::{DataType, RelationId, Schema, Value};
 use ultrasql_vec::column::Column;
+
+/// Target row count per in-memory columnar segment.
+pub const DEFAULT_COLUMNAR_SEGMENT_ROWS: usize = 65_536;
 
 /// Version-scoped key for cached scalar aggregate wire bodies.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -155,6 +160,14 @@ pub struct CachedColumns {
     /// cache-building scan. `columns[i]` has the same length for
     /// every `i` and equals the row count of the cached projection.
     pub columns: Vec<Column>,
+    /// Logical row counts for each columnar segment.
+    ///
+    /// The current v1.0 slice stores each column as one contiguous
+    /// typed buffer and records segment boundaries here. Scan replay
+    /// can keep slicing from the contiguous buffers while maintenance,
+    /// stats, and future spill-to-disk code see a real segmented
+    /// layout contract.
+    pub segment_row_counts: Vec<usize>,
     /// Lazily-populated pre-encoded wire body for the exact
     /// `(Int32, Int32)` identity full-scan shape over this schema
     /// and relation version. Kept separate from `columns` so other
@@ -177,15 +190,61 @@ impl CachedColumns {
     /// Build a cached column projection with an empty lazy wire-body cache.
     #[must_use]
     pub fn new(version: u64, schema: Schema, columns: Vec<Column>) -> Self {
+        let row_count = columns.first().map(Column::len).unwrap_or(0);
+        Self::new_segmented(
+            version,
+            schema,
+            columns,
+            columnar_segment_row_counts(row_count, DEFAULT_COLUMNAR_SEGMENT_ROWS),
+        )
+    }
+
+    /// Build a cached column projection with caller-supplied segment
+    /// boundaries.
+    #[must_use]
+    pub fn new_segmented(
+        version: u64,
+        schema: Schema,
+        columns: Vec<Column>,
+        segment_row_counts: Vec<usize>,
+    ) -> Self {
         Self {
             version,
             schema,
             columns,
+            segment_row_counts,
             cached_int32_pair_select_wire: RwLock::new(None),
             cached_scalar_aggregate_wire: RwLock::new(AHashMap::new()),
             cached_grouped_projection_wire: RwLock::new(AHashMap::new()),
         }
     }
+
+    /// Return number of rows stored in this columnar projection.
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.columns.first().map(Column::len).unwrap_or(0)
+    }
+
+    /// Return number of columnar segments backing this projection.
+    #[must_use]
+    pub fn segment_count(&self) -> usize {
+        self.segment_row_counts.len()
+    }
+}
+
+fn columnar_segment_row_counts(row_count: usize, segment_rows: usize) -> Vec<usize> {
+    if row_count == 0 {
+        return Vec::new();
+    }
+    let segment_rows = segment_rows.max(1);
+    let mut out = Vec::with_capacity(row_count.div_ceil(segment_rows));
+    let mut remaining = row_count;
+    while remaining > 0 {
+        let n = remaining.min(segment_rows);
+        out.push(n);
+        remaining -= n;
+    }
+    out
 }
 
 /// Per-`HeapAccess` columnar cache.

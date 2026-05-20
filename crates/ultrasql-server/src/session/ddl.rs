@@ -1129,6 +1129,7 @@ where
                         let _ = self.state.persistent_catalog.drop_table(&chunk.table_name);
                     }
                 }
+                self.state.columnar_storage.remove(name);
                 if let Some((_, constraints)) = self.state.table_constraints.remove(&entry.oid) {
                     for seq_name in constraints.sequence_defaults.iter().flatten() {
                         self.state.sequences.remove(seq_name);
