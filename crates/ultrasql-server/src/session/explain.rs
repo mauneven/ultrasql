@@ -26,11 +26,15 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_catalog::CatalogSnapshot;
 use ultrasql_core::Field;
-use ultrasql_planner::{ExplainFormat, LogicalPlan};
+use ultrasql_executor::Operator;
+use ultrasql_planner::{BinaryOp, ExplainFormat, LogicalIndexMethod, LogicalPlan, ScalarExpr};
 use ultrasql_protocol::messages::{BackendMessage, FieldDescription};
+use ultrasql_vec::Batch;
+use ultrasql_vec::column::Column;
 
 use super::Session;
 use crate::error::ServerError;
+use crate::pipeline::LowerCtx;
 use crate::result_encoder::SelectResult;
 use crate::run_plan_in_txn;
 
@@ -101,14 +105,32 @@ where
         })
     }
 
-    /// Execute the wrapped plan to completion, counting rows and timing
-    /// wall-clock. Returns `(rows, elapsed_ms)`.
+    /// Execute the wrapped plan to completion, collecting root runtime
+    /// evidence plus planner/lowerer decision notes.
     fn run_explain_analyze(
         &self,
         inner: &LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
     ) -> Result<ExplainActuals, ServerError> {
+        let notes = self.explain_notes(inner, catalog_snapshot);
         let started = Instant::now();
+        if !matches!(
+            inner,
+            LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
+        ) {
+            let scan = self.run_explain_select_analyze(inner, catalog_snapshot)?;
+            return Ok(ExplainActuals {
+                rows: scan.rows,
+                batches: scan.batches,
+                peak_output_memory_bytes: scan.peak_output_memory_bytes,
+                disk_spill: DiskSpillSummary::none(),
+                elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+                simd_kernel: notes.simd_kernel,
+                index_decision: notes.index_decision,
+                pushdowns_applied: notes.pushdowns_applied,
+            });
+        }
+
         let txn = self
             .state
             .txn_manager
@@ -148,24 +170,213 @@ where
         }
         Ok(ExplainActuals {
             rows,
+            batches: 0,
+            peak_output_memory_bytes: 0,
+            disk_spill: DiskSpillSummary::none(),
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
+            simd_kernel: notes.simd_kernel,
+            index_decision: notes.index_decision,
+            pushdowns_applied: notes.pushdowns_applied,
         })
+    }
+
+    fn run_explain_select_analyze(
+        &self,
+        inner: &LogicalPlan,
+        catalog_snapshot: &Arc<CatalogSnapshot>,
+    ) -> Result<ExplainScanActuals, ServerError> {
+        let txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let outcome = (|| {
+            let ctx = LowerCtx {
+                tables: &self.state.tables,
+                catalog_snapshot: Arc::clone(catalog_snapshot),
+                table_constraints: Arc::clone(&self.state.table_constraints),
+                sequences: Arc::clone(&self.state.sequences),
+                persistent_catalog: Arc::clone(&self.state.persistent_catalog),
+                time_partitions: Arc::clone(&self.state.time_partitions),
+                workload_recorder: Arc::clone(&self.state.workload_recorder),
+                sequence_state: Some(self.sequence_state.clone()),
+                heap: Arc::clone(&self.state.heap),
+                vm: Arc::clone(&self.state.vm),
+                snapshot: txn.snapshot.clone(),
+                oracle: Arc::clone(&self.state.txn_manager),
+                xid: txn.current_xid(),
+                command_id: txn.current_command,
+                cte_buffers: std::collections::HashMap::new(),
+                jit: self.jit_config(),
+                cancel_flag: Some(self.cancel_flag.clone()),
+                work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+            };
+            let mut op = crate::pipeline::lower_query(inner, &ctx)?;
+            drain_explain_operator(op.as_mut())
+        })();
+
+        match outcome {
+            Ok(actuals) => {
+                if let Err(e) = self.state.txn_manager.commit(txn) {
+                    tracing::warn!(error = %e, "EXPLAIN ANALYZE commit failed");
+                }
+                Ok(actuals)
+            }
+            Err(e) => {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    tracing::warn!(error = %abort_err, "EXPLAIN ANALYZE abort failed");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn explain_notes(
+        &self,
+        plan: &LogicalPlan,
+        catalog_snapshot: &Arc<CatalogSnapshot>,
+    ) -> ExplainNotes {
+        ExplainNotes {
+            simd_kernel: simd_kernel_note(plan),
+            index_decision: self.index_decision_note(plan, catalog_snapshot),
+            pushdowns_applied: pushdown_notes(plan),
+        }
+    }
+
+    fn index_decision_note(
+        &self,
+        plan: &LogicalPlan,
+        catalog_snapshot: &Arc<CatalogSnapshot>,
+    ) -> String {
+        let Some((table, col_idx)) = first_filter_scan_column(plan) else {
+            return "not applicable (no Filter(Scan) indexable shape)".to_owned();
+        };
+        let Some(table_entry) = catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
+            return format!("skipped {table}: not a persistent catalog table");
+        };
+        let Some(field) = table_entry.schema.field(col_idx) else {
+            return format!("skipped {table}: predicate column {col_idx} out of range");
+        };
+        let Some(indexes) = catalog_snapshot.indexes_by_table.get(&table_entry.oid) else {
+            return format!("skipped {table}.{}: no indexes on table", field.name);
+        };
+        let Ok(attnum) = u16::try_from(col_idx) else {
+            return format!(
+                "skipped {table}.{}: column index exceeds attnum",
+                field.name
+            );
+        };
+        let Some(index) = indexes.iter().find(|index| {
+            index.columns.as_slice() == [attnum]
+                && self.index_method(table_entry.oid, index.oid) == LogicalIndexMethod::Btree
+        }) else {
+            return format!(
+                "skipped {table}.{}: no usable single-column btree index",
+                field.name
+            );
+        };
+        if !matches!(
+            field.data_type,
+            ultrasql_core::DataType::Bool
+                | ultrasql_core::DataType::Int16
+                | ultrasql_core::DataType::Int32
+                | ultrasql_core::DataType::Int64
+                | ultrasql_core::DataType::Timestamp
+                | ultrasql_core::DataType::TimestampTz
+        ) {
+            return format!(
+                "skipped {} on {table}.{}: key type {:?} not btree-probeable",
+                index.name, field.name, field.data_type
+            );
+        }
+        format!("selected {} on {table}.{}", index.name, field.name)
+    }
+
+    fn index_method(
+        &self,
+        table_oid: ultrasql_core::Oid,
+        index_oid: ultrasql_core::Oid,
+    ) -> LogicalIndexMethod {
+        self.state.table_constraints.get(&table_oid).map_or(
+            LogicalIndexMethod::Btree,
+            |constraints| {
+                constraints
+                    .indexes
+                    .get(&index_oid)
+                    .map_or(LogicalIndexMethod::Btree, |metadata| metadata.method)
+            },
+        )
     }
 }
 
 /// Wall-clock + row-count summary collected by `EXPLAIN ANALYZE`.
 struct ExplainActuals {
     rows: u64,
+    batches: u64,
+    peak_output_memory_bytes: u64,
+    disk_spill: DiskSpillSummary,
     elapsed_ms: f64,
+    simd_kernel: String,
+    index_decision: String,
+    pushdowns_applied: Vec<String>,
+}
+
+struct ExplainScanActuals {
+    rows: u64,
+    batches: u64,
+    peak_output_memory_bytes: u64,
+}
+
+struct ExplainNotes {
+    simd_kernel: String,
+    index_decision: String,
+    pushdowns_applied: Vec<String>,
+}
+
+struct DiskSpillSummary {
+    used: bool,
+    bytes: u64,
+    reason: &'static str,
+}
+
+impl DiskSpillSummary {
+    const fn none() -> Self {
+        Self {
+            used: false,
+            bytes: 0,
+            reason: "no executor spill path reported disk writes",
+        }
+    }
 }
 
 /// Render the plan as the PostgreSQL-style indented tree.
 fn render_text(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
     let mut body = plan.display(0);
     if let Some(a) = actuals {
+        let pushdowns = if a.pushdowns_applied.is_empty() {
+            "none".to_owned()
+        } else {
+            a.pushdowns_applied.join(", ")
+        };
         body.push_str(&format!(
-            "Planning Time: 0.000 ms\nExecution Time: {:.3} ms\nActual Rows: {}\n",
-            a.elapsed_ms, a.rows
+            "Planning Time: 0.000 ms\n\
+             Execution Time: {:.3} ms\n\
+             Actual Rows: {}\n\
+             Actual Batches: {}\n\
+             Peak Output Memory: {} bytes\n\
+             Disk Spill: {} ({} bytes; {})\n\
+             SIMD Kernel: {}\n\
+             Index Decision: {}\n\
+             Pushdowns Applied: {}\n",
+            a.elapsed_ms,
+            a.rows,
+            a.batches,
+            a.peak_output_memory_bytes,
+            if a.disk_spill.used { "yes" } else { "none" },
+            a.disk_spill.bytes,
+            a.disk_spill.reason,
+            a.simd_kernel,
+            a.index_decision,
+            pushdowns
         ));
     }
     body
@@ -182,9 +393,37 @@ fn render_json(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
     buf.push_str("[\n  {\n    \"Plan\": ");
     write_plan_json(plan, 4, &mut buf);
     if let Some(a) = actuals {
+        let pushdowns = if a.pushdowns_applied.is_empty() {
+            "[]".to_owned()
+        } else {
+            format!(
+                "[{}]",
+                a.pushdowns_applied
+                    .iter()
+                    .map(|s| format!("\"{}\"", json_escape(s)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         buf.push_str(&format!(
-            ",\n    \"Execution Time\": {:.3},\n    \"Actual Rows\": {}",
-            a.elapsed_ms, a.rows
+            ",\n    \"Execution Time\": {:.3},\
+             \n    \"Actual Rows\": {},\
+             \n    \"Actual Batches\": {},\
+             \n    \"Peak Output Memory\": {},\
+             \n    \"Disk Spill\": {{\"Used\": {}, \"Bytes\": {}, \"Reason\": \"{}\"}},\
+             \n    \"SIMD Kernel\": \"{}\",\
+             \n    \"Index Decision\": \"{}\",\
+             \n    \"Pushdowns Applied\": {}",
+            a.elapsed_ms,
+            a.rows,
+            a.batches,
+            a.peak_output_memory_bytes,
+            a.disk_spill.used,
+            a.disk_spill.bytes,
+            json_escape(a.disk_spill.reason),
+            json_escape(&a.simd_kernel),
+            json_escape(&a.index_decision),
+            pushdowns
         ));
     }
     buf.push_str("\n  }\n]");
@@ -297,6 +536,246 @@ fn plan_children(plan: &LogicalPlan) -> Vec<&LogicalPlan> {
         LogicalPlan::Insert { source, .. } => vec![source],
         _ => Vec::new(),
     }
+}
+
+fn drain_explain_operator(op: &mut dyn Operator) -> Result<ExplainScanActuals, ServerError> {
+    let mut rows = 0_u64;
+    let mut batches = 0_u64;
+    let mut peak_output_memory_bytes = 0_u64;
+    while let Some(batch) = op.next_batch()? {
+        batches = batches.saturating_add(1);
+        rows = rows.saturating_add(u64::try_from(batch.rows()).unwrap_or(u64::MAX));
+        peak_output_memory_bytes = peak_output_memory_bytes
+            .max(u64::try_from(estimate_batch_memory(&batch)).unwrap_or(u64::MAX));
+    }
+    Ok(ExplainScanActuals {
+        rows,
+        batches,
+        peak_output_memory_bytes,
+    })
+}
+
+fn estimate_batch_memory(batch: &Batch) -> usize {
+    batch.columns().iter().map(estimate_column_memory).sum()
+}
+
+fn estimate_column_memory(column: &Column) -> usize {
+    match column {
+        Column::Int32(c) => std::mem::size_of_val(c.data()) + bitmap_bytes(c.nulls()),
+        Column::Int64(c) => std::mem::size_of_val(c.data()) + bitmap_bytes(c.nulls()),
+        Column::Float32(c) => std::mem::size_of_val(c.data()) + bitmap_bytes(c.nulls()),
+        Column::Float64(c) => std::mem::size_of_val(c.data()) + bitmap_bytes(c.nulls()),
+        Column::Bool(c) => c.data().len() + bitmap_bytes(c.nulls()),
+        Column::Utf8(c) => {
+            c.values().len() + std::mem::size_of_val(c.offsets()) + bitmap_bytes(c.nulls())
+        }
+        Column::DictionaryUtf8(c) => {
+            std::mem::size_of_val(c.codes.data())
+                + c.dict.iter().map(String::len).sum::<usize>()
+                + bitmap_bytes(c.codes.nulls())
+        }
+    }
+}
+
+fn bitmap_bytes(bitmap: Option<&ultrasql_vec::Bitmap>) -> usize {
+    bitmap.map_or(0, |bits| bits.len().div_ceil(8))
+}
+
+fn first_filter_scan_column(plan: &LogicalPlan) -> Option<(&str, usize)> {
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            let LogicalPlan::Scan { table, .. } = input.as_ref() else {
+                return first_filter_scan_column(input);
+            };
+            indexable_column(predicate).map(|idx| (table.as_str(), idx))
+        }
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::LockRows { input, .. }
+        | LogicalPlan::Explain { input, .. }
+        | LogicalPlan::Update { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Delete { input, .. } => first_filter_scan_column(input),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            first_filter_scan_column(left).or_else(|| first_filter_scan_column(right))
+        }
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => first_filter_scan_column(definition).or_else(|| first_filter_scan_column(body)),
+        LogicalPlan::Insert { source, .. } => first_filter_scan_column(source),
+        _ => None,
+    }
+}
+
+fn indexable_column(predicate: &ScalarExpr) -> Option<usize> {
+    match predicate {
+        ScalarExpr::Binary {
+            op: BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
+            left,
+            right,
+            ..
+        } => column_literal_index(left, right).or_else(|| column_literal_index(right, left)),
+        ScalarExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => indexable_column(left).or_else(|| indexable_column(right)),
+        _ => None,
+    }
+}
+
+fn column_literal_index(left: &ScalarExpr, right: &ScalarExpr) -> Option<usize> {
+    let ScalarExpr::Column { index, .. } = left else {
+        return None;
+    };
+    matches!(
+        right,
+        ScalarExpr::Literal { .. } | ScalarExpr::Parameter { .. }
+    )
+    .then_some(*index)
+}
+
+fn simd_kernel_note(plan: &LogicalPlan) -> String {
+    if has_vector_distance_expr(plan) {
+        return "ultrasql-vec vector distance kernel".to_owned();
+    }
+    if has_sum_filter_shape(plan) {
+        return "ultrasql-vec filter_sum scalar/SIMD dispatch".to_owned();
+    }
+    if has_sum_or_avg_shape(plan) {
+        return "ultrasql-vec scalar aggregate scalar/SIMD dispatch".to_owned();
+    }
+    "scalar fallback (no specialized SIMD kernel selected)".to_owned()
+}
+
+fn has_vector_distance_expr(plan: &LogicalPlan) -> bool {
+    plan_exprs(plan)
+        .iter()
+        .any(|expr| expr_has_vector_distance(expr))
+        || plan_children(plan)
+            .iter()
+            .any(|child| has_vector_distance_expr(child))
+}
+
+fn has_sum_filter_shape(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate {
+            input, aggregates, ..
+        } => !aggregates.is_empty() && matches!(input.as_ref(), LogicalPlan::Filter { .. }),
+        _ => plan_children(plan)
+            .iter()
+            .any(|child| has_sum_filter_shape(child)),
+    }
+}
+
+fn has_sum_or_avg_shape(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate { aggregates, .. } => !aggregates.is_empty(),
+        _ => plan_children(plan)
+            .iter()
+            .any(|child| has_sum_or_avg_shape(child)),
+    }
+}
+
+fn expr_has_vector_distance(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::Binary {
+            op:
+                BinaryOp::VectorL2Distance
+                | BinaryOp::VectorNegativeInnerProduct
+                | BinaryOp::VectorCosineDistance
+                | BinaryOp::VectorL1Distance,
+            ..
+        } => true,
+        ScalarExpr::Binary { left, right, .. } => {
+            expr_has_vector_distance(left) || expr_has_vector_distance(right)
+        }
+        ScalarExpr::Unary { expr, .. } | ScalarExpr::IsNull { expr, .. } => {
+            expr_has_vector_distance(expr)
+        }
+        ScalarExpr::FunctionCall { args, .. } => args.iter().any(expr_has_vector_distance),
+        _ => false,
+    }
+}
+
+fn plan_exprs(plan: &LogicalPlan) -> Vec<&ScalarExpr> {
+    match plan {
+        LogicalPlan::Filter { predicate, .. } => vec![predicate],
+        LogicalPlan::Project { exprs, .. } => exprs.iter().map(|(expr, _)| expr).collect(),
+        LogicalPlan::Sort { keys, .. } => keys.iter().map(|key| &key.expr).collect(),
+        LogicalPlan::Aggregate {
+            group_by,
+            aggregates,
+            ..
+        } => group_by
+            .iter()
+            .chain(aggregates.iter().filter_map(|agg| agg.arg.as_ref()))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn pushdown_notes(plan: &LogicalPlan) -> Vec<String> {
+    let mut notes = Vec::new();
+    collect_pushdown_notes(plan, &mut notes);
+    notes.sort();
+    notes.dedup();
+    notes
+}
+
+fn collect_pushdown_notes(plan: &LogicalPlan, notes: &mut Vec<String>) {
+    match plan {
+        LogicalPlan::Project { input, exprs, .. } => {
+            if matches!(input.as_ref(), LogicalPlan::FunctionScan { name, .. } if name == "read_parquet")
+                && exprs.iter().all(|(expr, alias)| {
+                    matches!(expr, ScalarExpr::Column { name, .. } if name == alias)
+                })
+            {
+                notes.push("read_parquet projection".to_owned());
+            }
+            collect_pushdown_notes(input, notes);
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            if matches!(input.as_ref(), LogicalPlan::FunctionScan { name, .. } if name == "read_parquet")
+                && parquet_pushdown_shape(predicate)
+            {
+                notes.push("read_parquet predicate".to_owned());
+            }
+            collect_pushdown_notes(input, notes);
+        }
+        _ => {
+            for child in plan_children(plan) {
+                collect_pushdown_notes(child, notes);
+            }
+        }
+    }
+}
+
+fn parquet_pushdown_shape(expr: &ScalarExpr) -> bool {
+    matches!(
+        expr,
+        ScalarExpr::Binary {
+            op: BinaryOp::Eq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq,
+            ..
+        }
+    )
+}
+
+fn json_escape(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|ch| match ch {
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '\n' => "\\n".chars().collect::<Vec<_>>(),
+            '\r' => "\\r".chars().collect::<Vec<_>>(),
+            '\t' => "\\t".chars().collect::<Vec<_>>(),
+            c => vec![c],
+        })
+        .collect()
 }
 
 #[allow(dead_code)]

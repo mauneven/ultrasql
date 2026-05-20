@@ -131,6 +131,50 @@ async fn explain_analyze_executes_and_reports_actual_rows() {
     shutdown(client, server_handle).await;
 }
 
+/// Serious-mode `EXPLAIN ANALYZE` reports the execution evidence needed
+/// to debug performance work instead of only a root wall-clock count.
+#[tokio::test]
+async fn explain_analyze_reports_runtime_evidence() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .expect("seed");
+    client
+        .batch_execute("CREATE INDEX t_id_idx ON t (id)")
+        .await
+        .expect("create index");
+
+    let rows = client
+        .query("EXPLAIN ANALYZE SELECT id FROM t WHERE id = 2", &[])
+        .await
+        .expect("EXPLAIN ANALYZE");
+    let text = collect_plan_text(&rows);
+
+    for required in [
+        "Actual Rows: 1",
+        "Actual Batches:",
+        "Peak Output Memory:",
+        "Disk Spill:",
+        "SIMD Kernel:",
+        "Index Decision:",
+        "selected t_id_idx",
+        "Pushdowns Applied:",
+    ] {
+        assert!(
+            text.contains(required),
+            "EXPLAIN ANALYZE missing {required:?}, got: {text}"
+        );
+    }
+
+    shutdown(client, server_handle).await;
+}
+
 /// `EXPLAIN (FORMAT JSON) SELECT` returns JSON-parseable text with the
 /// `Node Type` key.
 #[tokio::test]
