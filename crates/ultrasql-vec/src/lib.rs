@@ -70,6 +70,10 @@ pub use kernels::{
     sub_i64_scalar_lit_scalar,
 };
 pub use kernels::{
+    cosine_distance_f32, cosine_distance_f32_scalar, dot_f32, dot_f32_scalar, l2_distance_f32,
+    l2_distance_f32_scalar,
+};
+pub use kernels::{
     filter_eq_f64, filter_eq_f64_scalar, filter_eq_i32, filter_eq_i32_scalar, filter_eq_i64,
     filter_eq_i64_scalar, filter_gt_i32, filter_gt_i32_scalar, filter_lt_i32, filter_lt_i32_scalar,
 };

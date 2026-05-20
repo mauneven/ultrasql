@@ -12,6 +12,7 @@
 //! - [`arithmetic`] — arithmetic kernels: `add/sub/mul/compare_*` for `i32`,
 //!   `i64`, `f32`, `f64`; column-vs-literal `*_scalar_lit` variants for the
 //!   same shapes; unary negation `neg_*` and boolean `not_bool`.
+//! - [`vector`]     — vector similarity kernels: `dot/l2/cosine` over `f32`.
 //! - [`text`]       — text kernels: `len_text`, `lower_text`, `upper_text`.
 //! - [`hash`]       — hash kernels: `hash_i64`, `hash_text_bytes` (FNV-1a).
 
@@ -20,6 +21,7 @@ pub mod filter;
 pub mod filter_sum;
 pub mod hash;
 pub mod text;
+pub mod vector;
 
 pub use arithmetic::{
     add_f32, add_f32_scalar, add_f32_scalar_lit, add_f32_scalar_lit_scalar, add_f64,
@@ -52,6 +54,10 @@ pub use filter_sum::{
 pub use hash::{hash_i64, hash_i64_scalar, hash_text_bytes, hash_text_bytes_scalar};
 pub use text::{
     len_text, len_text_scalar, lower_text, lower_text_scalar, upper_text, upper_text_scalar,
+};
+pub use vector::{
+    cosine_distance_f32, cosine_distance_f32_scalar, dot_f32, dot_f32_scalar, l2_distance_f32,
+    l2_distance_f32_scalar,
 };
 
 use crate::bitmap::Bitmap;
