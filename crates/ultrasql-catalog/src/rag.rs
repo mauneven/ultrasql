@@ -2,9 +2,9 @@
 //!
 //! These primitives are ordinary SQL tables, not hidden system catalogs. They
 //! give applications a reproducible baseline for storing source documents,
-//! chunks, embeddings, embedding jobs, retrieval events, answer citations,
-//! metadata, recency, and version state while the SQL layer grows higher-level
-//! RAG helpers around them.
+//! chunks, embeddings, embedding jobs, retrieval events, retrieved-chunk audit
+//! rows, answer citations, metadata, recency, and version state while the SQL
+//! layer grows higher-level RAG helpers around them.
 
 use std::fmt;
 
@@ -20,7 +20,8 @@ pub const DEFAULT_RAG_TENANT_SETTING: &str = "ultrasql.tenant_id";
 pub struct RagSchemaConfig {
     /// Prefix used for table names. The default creates `rag_documents`,
     /// `rag_chunks`, `rag_embeddings`, `rag_retrieval_events`, and
-    /// `rag_answer_citations`, and `rag_embedding_jobs`.
+    /// `rag_answer_citations`, `rag_embedding_jobs`, and
+    /// `rag_retrieved_chunks`.
     pub prefix: String,
     /// Vector dimension for the embeddings table.
     pub embedding_dims: u32,
@@ -50,6 +51,8 @@ pub struct RagTableNames {
     pub answer_citations: String,
     /// Background embedding-job queue table name.
     pub embedding_jobs: String,
+    /// Retrieved-chunk audit table name.
+    pub retrieved_chunks: String,
 }
 
 /// Canonical schemas for the RAG primitive tables.
@@ -67,6 +70,8 @@ pub struct RagPrimitiveSchemas {
     pub answer_citations: Schema,
     /// Tenant-scoped embedding jobs for background ingestion workers.
     pub embedding_jobs: Schema,
+    /// Per-chunk retrieval audit rows.
+    pub retrieved_chunks: Schema,
 }
 
 /// Error returned for invalid RAG schema configuration.
@@ -103,6 +108,7 @@ impl RagSchemaConfig {
             retrieval_events: format!("{}_retrieval_events", self.prefix),
             answer_citations: format!("{}_answer_citations", self.prefix),
             embedding_jobs: format!("{}_embedding_jobs", self.prefix),
+            retrieved_chunks: format!("{}_retrieved_chunks", self.prefix),
         })
     }
 }
@@ -118,6 +124,7 @@ impl RagPrimitiveSchemas {
             retrieval_events: retrieval_events_schema(embedding_dims)?,
             answer_citations: answer_citations_schema()?,
             embedding_jobs: embedding_jobs_schema()?,
+            retrieved_chunks: retrieved_chunks_schema()?,
         })
     }
 }
@@ -253,6 +260,24 @@ created_at TIMESTAMPTZ NOT NULL, \
 updated_at TIMESTAMPTZ NOT NULL\
 )",
             embedding_jobs = names.embedding_jobs,
+            chunks = names.chunks,
+            documents = names.documents
+        ),
+        format!(
+            "\
+CREATE TABLE IF NOT EXISTS {retrieved_chunks} (\
+tenant_id TEXT NOT NULL CHECK (tenant_id <> ''), \
+retrieval_event_id TEXT NOT NULL REFERENCES {retrieval_events}(retrieval_event_id), \
+chunk_id TEXT NOT NULL REFERENCES {chunks}(chunk_id), \
+document_id TEXT NOT NULL REFERENCES {documents}(document_id), \
+rank INTEGER NOT NULL, \
+score FLOAT8 NOT NULL, \
+distance FLOAT8 NOT NULL, \
+metadata JSONB NOT NULL, \
+created_at TIMESTAMPTZ NOT NULL\
+)",
+            retrieved_chunks = names.retrieved_chunks,
+            retrieval_events = names.retrieval_events,
             chunks = names.chunks,
             documents = names.documents
         ),
@@ -393,6 +418,53 @@ RETURNING tenant_id, job_id, chunk_id, status, attempt_count",
     ))
 }
 
+/// Return plain SQL for tenant-scoped answer context retrieval.
+///
+/// Tenant predicates are repeated across embeddings and chunks, and the
+/// document metadata filter is enforced through a tenant-scoped subquery.
+/// Metadata filters remain in `WHERE`, before final distance ranking, so
+/// callers cannot build answer context from rows outside the requested tenant
+/// or metadata slice.
+pub fn search_rag_answer_context_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(format!(
+        "\
+SELECT e.tenant_id, e.embedding_id, e.chunk_id, c.document_id, c.chunk_index, \
+c.content, c.version AS chunk_version, e.embedding <-> $2 AS distance \
+FROM {embeddings} e \
+JOIN {chunks} c ON c.chunk_id = e.chunk_id AND c.tenant_id = e.tenant_id \
+WHERE e.tenant_id = $1 AND c.tenant_id = $1 \
+AND e.is_current = true AND c.is_current = true \
+AND c.document_id IN (\
+SELECT document_id FROM {documents} \
+WHERE tenant_id = $1 AND is_current = true AND metadata @> $3\
+) \
+AND c.metadata @> $4 \
+ORDER BY e.embedding <-> $2 \
+LIMIT $5",
+        embeddings = names.embeddings,
+        chunks = names.chunks,
+        documents = names.documents
+    ))
+}
+
+/// Return plain SQL for auditing one retrieved chunk.
+///
+/// Applications should insert one row for every chunk included in answer
+/// context. The first four parameters bind tenant and object ids, keeping the
+/// audit row tied to the same tenant boundary as retrieval.
+pub fn audit_rag_retrieved_chunk_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(format!(
+        "\
+INSERT INTO {retrieved_chunks} (\
+tenant_id, retrieval_event_id, chunk_id, document_id, rank, score, distance, metadata, created_at\
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+RETURNING tenant_id, retrieval_event_id, chunk_id, rank",
+        retrieved_chunks = names.retrieved_chunks
+    ))
+}
+
 /// Return plain SQL for exact current-embedding search inside one tenant.
 ///
 /// The distance expression is selected and repeated in `ORDER BY` so callers
@@ -429,6 +501,55 @@ LIMIT $3",
     ))
 }
 
+/// Return SQL that creates tenant helper indexes for RAG retrieval.
+///
+/// UltraSQL's current ANN indexes are single-vector-key indexes. This helper
+/// pairs the vector index with tenant/current B-tree indexes so safe query
+/// shapes can filter by tenant and current-version state before answer context
+/// is assembled.
+pub fn create_rag_tenant_vector_index_sql(
+    config: &RagSchemaConfig,
+) -> Result<String, RagSchemaError> {
+    Ok(create_rag_tenant_vector_index_statements(config)?.join(";\n") + ";")
+}
+
+/// Return individual tenant helper index statements for RAG retrieval.
+pub fn create_rag_tenant_vector_index_statements(
+    config: &RagSchemaConfig,
+) -> Result<Vec<String>, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(vec![
+        format!(
+            "\
+CREATE INDEX IF NOT EXISTS {prefix}_embeddings_tenant_idx \
+ON {embeddings} (tenant_id, is_current)",
+            prefix = config.prefix,
+            embeddings = names.embeddings
+        ),
+        format!(
+            "\
+CREATE INDEX IF NOT EXISTS {prefix}_chunks_tenant_document_idx \
+ON {chunks} (tenant_id, document_id, is_current)",
+            prefix = config.prefix,
+            chunks = names.chunks
+        ),
+        format!(
+            "\
+CREATE INDEX IF NOT EXISTS {prefix}_documents_tenant_current_idx \
+ON {documents} (tenant_id, is_current)",
+            prefix = config.prefix,
+            documents = names.documents
+        ),
+        format!(
+            "\
+CREATE INDEX IF NOT EXISTS {prefix}_embeddings_hnsw_l2_idx \
+ON {embeddings} USING hnsw (embedding vector_l2_ops)",
+            prefix = config.prefix,
+            embeddings = names.embeddings
+        ),
+    ])
+}
+
 /// Return SQL statements for tenant row policies over the RAG tables.
 ///
 /// UltraSQL does not execute `CREATE POLICY` yet. These statements document the
@@ -451,6 +572,7 @@ pub fn create_rag_tenant_policy_statements(
         tenant_policy_statements_for(&names.retrieval_events),
         tenant_policy_statements_for(&names.answer_citations),
         tenant_policy_statements_for(&names.embedding_jobs),
+        tenant_policy_statements_for(&names.retrieved_chunks),
     ]
     .into_iter()
     .flatten()
@@ -594,6 +716,21 @@ fn embedding_jobs_schema() -> Result<Schema, RagSchemaError> {
         Field::required("updated_at", DataType::TimestampTz),
     ])
     .map_err(|err| RagSchemaError::new(format!("rag embedding jobs schema: {err}")))
+}
+
+fn retrieved_chunks_schema() -> Result<Schema, RagSchemaError> {
+    Schema::new([
+        Field::required("tenant_id", DataType::Text { max_len: None }),
+        Field::required("retrieval_event_id", DataType::Text { max_len: None }),
+        Field::required("chunk_id", DataType::Text { max_len: None }),
+        Field::required("document_id", DataType::Text { max_len: None }),
+        Field::required("rank", DataType::Int32),
+        Field::required("score", DataType::Float64),
+        Field::required("distance", DataType::Float64),
+        Field::required("metadata", DataType::Jsonb),
+        Field::required("created_at", DataType::TimestampTz),
+    ])
+    .map_err(|err| RagSchemaError::new(format!("rag retrieved chunks schema: {err}")))
 }
 
 fn tenant_policy_statements_for(table: &str) -> Vec<String> {

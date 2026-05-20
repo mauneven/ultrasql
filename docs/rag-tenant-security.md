@@ -19,6 +19,7 @@ The default table set is:
 - `rag_retrieval_events`
 - `rag_answer_citations`
 - `rag_embedding_jobs`
+- `rag_retrieved_chunks`
 
 ## Tenant Id Pattern
 
@@ -121,6 +122,60 @@ Background embedding work is modeled as ordinary rows in
 status, priority, lock, attempt, and availability columns; there is no hidden
 scheduler or privileged helper.
 
+Metadata filters run before answer context is assembled. Safe context queries
+join embeddings and chunks through tenant-matching predicates, verify documents
+through a tenant-scoped metadata subquery, require current rows, apply document
+and chunk `metadata @>` filters, and only then order by vector distance:
+
+```sql
+SELECT e.tenant_id, e.embedding_id, e.chunk_id, c.document_id, c.content
+FROM rag_embeddings e
+JOIN rag_chunks c ON c.chunk_id = e.chunk_id AND c.tenant_id = e.tenant_id
+WHERE e.tenant_id = $1
+  AND c.tenant_id = $1
+  AND e.is_current = true
+  AND c.is_current = true
+  AND c.document_id IN (
+      SELECT document_id
+      FROM rag_documents
+      WHERE tenant_id = $1
+        AND is_current = true
+        AND metadata @> $3
+  )
+  AND c.metadata @> $4
+ORDER BY e.embedding <-> $2
+LIMIT $5;
+```
+
+Every retrieved chunk must be audited. Insert one `rag_retrieved_chunks` row
+for each chunk passed into answer generation, using the same tenant id and
+retrieval event id:
+
+```sql
+INSERT INTO rag_retrieved_chunks (
+    tenant_id,
+    retrieval_event_id,
+    chunk_id,
+    document_id,
+    rank,
+    score,
+    distance,
+    metadata,
+    created_at
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9);
+```
+
+Tenant-aware vector indexing currently means pairing a single-column ANN index
+with tenant/current helper indexes:
+
+```sql
+CREATE INDEX IF NOT EXISTS rag_embeddings_tenant_idx
+ON rag_embeddings (tenant_id, is_current);
+
+CREATE INDEX IF NOT EXISTS rag_embeddings_hnsw_l2_idx
+ON rag_embeddings USING hnsw (embedding vector_l2_ops);
+```
+
 These helpers are safe default building blocks, not a substitute for database
 row-level security. Until UltraSQL enforces RLS, callers must use tenant-scoped
 queries for every RAG read and write path.
@@ -139,9 +194,10 @@ WITH CHECK (tenant_id = current_setting('ultrasql.tenant_id', true));
 
 The same policy shape applies to `rag_chunks` and `rag_embeddings`.
 The same policy shape also applies to `rag_retrieval_events` and
-`rag_answer_citations`, and `rag_embedding_jobs`. `USING` gates reads and
-deletes. `WITH CHECK` gates inserts and updates. The session setting is
-intentionally named in SQL so application code can audit the security boundary.
+`rag_answer_citations`, `rag_embedding_jobs`, and `rag_retrieved_chunks`.
+`USING` gates reads and deletes. `WITH CHECK` gates inserts and updates. The
+session setting is intentionally named in SQL so application code can audit the
+security boundary.
 
 ## Current Enforcement Boundary
 
@@ -151,6 +207,8 @@ contract and migration target. Current enforcement comes from:
 - `tenant_id TEXT NOT NULL` in every RAG primitive table.
 - Helper SQL requiring `tenant_id = $1` in read paths.
 - Insert helper SQL requiring tenant id as the first value.
+- Answer-context helper SQL applying metadata filters before distance ranking.
+- `rag_retrieved_chunks` audit rows for every chunk sent to answer generation.
 - Application/session code validating tenant ids before binding.
 
 Do not claim database-enforced tenant isolation until `CREATE POLICY` and

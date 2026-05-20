@@ -1,10 +1,11 @@
 //! Contract tests for canonical RAG storage primitive schemas.
 
 use ultrasql_catalog::rag::{
-    RagPrimitiveSchemas, RagSchemaConfig, claim_rag_embedding_jobs_sql,
-    complete_rag_embedding_job_sql, copy_rag_chunks_sql, copy_rag_documents_sql,
-    create_rag_table_sql, create_rag_tenant_policy_sql, enqueue_rag_embedding_jobs_sql,
-    fail_rag_embedding_job_sql, filter_rag_documents_by_metadata_sql, insert_rag_chunk_sql,
+    RagPrimitiveSchemas, RagSchemaConfig, audit_rag_retrieved_chunk_sql,
+    claim_rag_embedding_jobs_sql, complete_rag_embedding_job_sql, copy_rag_chunks_sql,
+    copy_rag_documents_sql, create_rag_table_sql, create_rag_tenant_policy_sql,
+    create_rag_tenant_vector_index_sql, enqueue_rag_embedding_jobs_sql, fail_rag_embedding_job_sql,
+    filter_rag_documents_by_metadata_sql, insert_rag_chunk_sql, search_rag_answer_context_sql,
     search_rag_embeddings_sql, validate_rag_tenant_id,
 };
 use ultrasql_core::{DataType, Field, Schema};
@@ -194,6 +195,35 @@ fn rag_schemas_include_metadata_recency_version_and_vector_embedding() {
         field(&schemas.embedding_jobs, "locked_by").nullable,
         "unclaimed jobs have no worker lock"
     );
+
+    let retrieved_chunk_names: Vec<_> = schemas
+        .retrieved_chunks
+        .fields()
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect();
+    assert_eq!(
+        retrieved_chunk_names,
+        vec![
+            "tenant_id",
+            "retrieval_event_id",
+            "chunk_id",
+            "document_id",
+            "rank",
+            "score",
+            "distance",
+            "metadata",
+            "created_at",
+        ]
+    );
+    assert_eq!(
+        field(&schemas.retrieved_chunks, "metadata").data_type,
+        DataType::Jsonb
+    );
+    assert_eq!(
+        field(&schemas.retrieved_chunks, "distance").data_type,
+        DataType::Float64
+    );
 }
 
 #[test]
@@ -211,6 +241,7 @@ fn rag_table_sql_uses_prefix_and_dimension() {
     assert!(sql.contains("CREATE TABLE IF NOT EXISTS tenant_a_retrieval_events"));
     assert!(sql.contains("CREATE TABLE IF NOT EXISTS tenant_a_answer_citations"));
     assert!(sql.contains("CREATE TABLE IF NOT EXISTS tenant_a_embedding_jobs"));
+    assert!(sql.contains("CREATE TABLE IF NOT EXISTS tenant_a_retrieved_chunks"));
     assert!(sql.contains("tenant_id TEXT NOT NULL"));
     assert!(sql.contains("embedding VECTOR(384) NOT NULL"));
     assert!(sql.contains("query_embedding VECTOR(384)"));
@@ -226,6 +257,8 @@ fn rag_table_sql_uses_prefix_and_dimension() {
     assert!(sql.contains("chunk_id TEXT NOT NULL REFERENCES tenant_a_chunks(chunk_id)"));
     assert!(sql.contains("status TEXT NOT NULL"));
     assert!(sql.contains("available_at TIMESTAMPTZ NOT NULL"));
+    assert!(sql.contains("rank INTEGER NOT NULL"));
+    assert!(sql.contains("distance FLOAT8 NOT NULL"));
 }
 
 #[test]
@@ -302,6 +335,39 @@ fn rag_helper_sql_is_plain_visible_sql() {
     assert!(fail_job.contains("status = CASE"));
     assert!(fail_job.contains("last_error = $3"));
 
+    let context_search = search_rag_answer_context_sql(&config).expect("build answer context SQL");
+    assert!(context_search.starts_with("SELECT e.tenant_id, e.embedding_id, e.chunk_id"));
+    assert!(context_search.contains("FROM tenant_a_embeddings e"));
+    assert!(context_search.contains("JOIN tenant_a_chunks c ON c.chunk_id = e.chunk_id"));
+    assert!(context_search.contains("WHERE e.tenant_id = $1"));
+    assert!(context_search.contains("c.tenant_id = $1"));
+    assert!(context_search.contains("SELECT document_id FROM tenant_a_documents"));
+    assert!(context_search.contains("WHERE tenant_id = $1 AND is_current = true"));
+    assert!(context_search.contains("metadata @> $3"));
+    assert!(context_search.contains("c.metadata @> $4"));
+    assert!(
+        context_search
+            .find("metadata @> $3")
+            .expect("metadata filter")
+            < context_search.find("ORDER BY").expect("order by"),
+        "metadata filters must be visible before final ranking"
+    );
+    assert!(context_search.ends_with("LIMIT $5"));
+
+    let audit_chunk =
+        audit_rag_retrieved_chunk_sql(&config).expect("build retrieved chunk audit SQL");
+    assert!(audit_chunk.starts_with("INSERT INTO tenant_a_retrieved_chunks"));
+    assert!(audit_chunk.contains("tenant_id, retrieval_event_id, chunk_id, document_id"));
+    assert!(audit_chunk.contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"));
+    assert!(audit_chunk.contains("RETURNING tenant_id, retrieval_event_id, chunk_id, rank"));
+
+    let tenant_indexes =
+        create_rag_tenant_vector_index_sql(&config).expect("build tenant vector index SQL");
+    assert!(tenant_indexes.contains("CREATE INDEX IF NOT EXISTS tenant_a_embeddings_tenant_idx"));
+    assert!(tenant_indexes.contains("ON tenant_a_embeddings (tenant_id, is_current)"));
+    assert!(tenant_indexes.contains("CREATE INDEX IF NOT EXISTS tenant_a_embeddings_hnsw_l2_idx"));
+    assert!(tenant_indexes.contains("USING hnsw (embedding vector_l2_ops)"));
+
     for sql in [
         chunk_insert,
         embedding_search,
@@ -312,6 +378,9 @@ fn rag_helper_sql_is_plain_visible_sql() {
         claim_jobs,
         complete_job,
         fail_job,
+        context_search,
+        audit_chunk,
+        tenant_indexes,
     ] {
         assert!(!sql.contains("rag_helper("));
         assert!(!sql.contains("rag_search("));
@@ -342,6 +411,7 @@ fn rag_tenant_ids_and_policy_sql_are_safe_by_default() {
     assert!(sql.contains("ALTER TABLE tenant_a_retrieval_events ENABLE ROW LEVEL SECURITY"));
     assert!(sql.contains("ALTER TABLE tenant_a_answer_citations ENABLE ROW LEVEL SECURITY"));
     assert!(sql.contains("ALTER TABLE tenant_a_embedding_jobs ENABLE ROW LEVEL SECURITY"));
+    assert!(sql.contains("ALTER TABLE tenant_a_retrieved_chunks ENABLE ROW LEVEL SECURITY"));
 }
 
 #[test]
@@ -351,5 +421,7 @@ fn rag_tenant_security_docs_state_enforcement_boundary() {
     assert!(docs.contains("tenant_id TEXT NOT NULL"));
     assert!(docs.contains("UltraSQL does not yet enforce `CREATE POLICY`"));
     assert!(docs.contains("tenant_id = $1"));
+    assert!(docs.contains("Metadata filters run before answer context"));
+    assert!(docs.contains("Every retrieved chunk must be audited"));
     assert!(docs.contains("safe default"));
 }

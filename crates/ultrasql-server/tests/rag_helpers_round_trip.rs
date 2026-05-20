@@ -8,8 +8,9 @@ use bytes::Bytes;
 use futures::SinkExt;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 use ultrasql_catalog::rag::{
-    RagSchemaConfig, copy_rag_chunks_sql, copy_rag_documents_sql, create_rag_table_statements,
-    filter_rag_documents_by_metadata_sql, insert_rag_chunk_sql, search_rag_embeddings_sql,
+    RagSchemaConfig, audit_rag_retrieved_chunk_sql, copy_rag_chunks_sql, copy_rag_documents_sql,
+    create_rag_table_statements, filter_rag_documents_by_metadata_sql, insert_rag_chunk_sql,
+    search_rag_answer_context_sql, search_rag_embeddings_sql,
 };
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
@@ -207,6 +208,84 @@ tenant-b,chunk-b-0,doc-b,0,other tenant content,0,3,\"{\"\"section\"\":\"\"body\
             "7".to_owned(),
             "0".to_owned()
         ]]
+    );
+
+    client
+        .batch_execute(
+            "INSERT INTO rag_retrieval_events VALUES \
+             ('tenant-a', 'retr-a-0', 'normal SQL', VECTOR '[1,0,0]', 'hybrid', 5, \
+              '{\"kind\":\"guide\"}', '{\"vector\":1}', 1200, TIMESTAMP '2026-05-20 10:02:00')",
+        )
+        .await
+        .expect("insert retrieval event");
+
+    let context_sql = bind_sql(
+        &search_rag_answer_context_sql(&config).expect("build answer context helper"),
+        &[
+            ("$1", "'tenant-a'"),
+            ("$2", "VECTOR '[1,0,0]'"),
+            ("$3", "'{\"kind\":\"guide\"}'::jsonb"),
+            ("$4", "'{\"section\":\"body\"}'::jsonb"),
+            ("$5", "5"),
+        ],
+    );
+    let context = client
+        .simple_query(&context_sql)
+        .await
+        .expect("answer context helper searches");
+    assert_eq!(
+        simple_rows(&context),
+        vec![vec![
+            "tenant-a".to_owned(),
+            "emb-a-0".to_owned(),
+            "chunk-a-0".to_owned(),
+            "doc-a".to_owned(),
+            "0".to_owned(),
+            "normal SQL stays inspectable".to_owned(),
+            "7".to_owned(),
+            "0".to_owned()
+        ]]
+    );
+
+    let audit_sql = bind_sql(
+        &audit_rag_retrieved_chunk_sql(&config).expect("build retrieved chunk audit helper"),
+        &[
+            ("$1", "'tenant-a'"),
+            ("$2", "'retr-a-0'"),
+            ("$3", "'chunk-a-0'"),
+            ("$4", "'doc-a'"),
+            ("$5", "0"),
+            ("$6", "1.0"),
+            ("$7", "0.0"),
+            ("$8", "'{\"source\":\"answer_context\"}'::jsonb"),
+            ("$9", "TIMESTAMP '2026-05-20 10:03:00'"),
+        ],
+    );
+    let audited = client
+        .simple_query(&audit_sql)
+        .await
+        .expect("audit helper inserts retrieved chunk");
+    assert_eq!(
+        simple_rows(&audited),
+        vec![vec![
+            "tenant-a".to_owned(),
+            "retr-a-0".to_owned(),
+            "chunk-a-0".to_owned(),
+            "0".to_owned()
+        ]]
+    );
+
+    let cross_tenant_audit = client
+        .simple_query(
+            "SELECT chunk_id \
+             FROM rag_retrieved_chunks \
+             WHERE tenant_id = 'tenant-b'",
+        )
+        .await
+        .expect("query other tenant audit rows");
+    assert!(
+        simple_rows(&cross_tenant_audit).is_empty(),
+        "tenant-a retrieval must not audit tenant-b chunks"
     );
 
     shutdown(client, server_handle).await;
