@@ -173,6 +173,62 @@ is_current BOOL NOT NULL\
     ])
 }
 
+/// Return plain SQL for inserting one chunk row.
+///
+/// The statement is intentionally a visible `INSERT` over the canonical
+/// chunks table. Parameters map one-for-one to the public columns:
+/// `chunk_id`, `document_id`, `chunk_index`, `content`, `token_start`,
+/// `token_end`, `metadata`, `created_at`, `updated_at`, `version`,
+/// `is_current`.
+pub fn insert_rag_chunk_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(format!(
+        "\
+INSERT INTO {chunks} (\
+chunk_id, document_id, chunk_index, content, token_start, token_end, \
+metadata, created_at, updated_at, version, is_current\
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+RETURNING chunk_id, document_id, chunk_index, version, is_current",
+        chunks = names.chunks
+    ))
+}
+
+/// Return plain SQL for exact current-embedding search.
+///
+/// The distance expression is selected and repeated in `ORDER BY` so callers
+/// can inspect the exact operator used for correctness checks.
+pub fn search_rag_embeddings_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(format!(
+        "\
+SELECT embedding_id, chunk_id, version, embedding <-> $1 AS distance \
+FROM {embeddings} \
+WHERE is_current = true \
+ORDER BY embedding <-> $1 \
+LIMIT $2",
+        embeddings = names.embeddings
+    ))
+}
+
+/// Return plain SQL for filtering current documents by JSONB metadata.
+///
+/// The helper is a transparent `metadata @> $1` predicate over the documents
+/// table with recency ordering. It does not expand, rank, or rewrite results.
+pub fn filter_rag_documents_by_metadata_sql(
+    config: &RagSchemaConfig,
+) -> Result<String, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(format!(
+        "\
+SELECT document_id, source_uri, title, version, updated_at \
+FROM {documents} \
+WHERE is_current = true AND metadata @> $1 \
+ORDER BY updated_at DESC \
+LIMIT $2",
+        documents = names.documents
+    ))
+}
+
 fn documents_schema() -> Result<Schema, RagSchemaError> {
     Schema::new([
         Field::required("document_id", DataType::Text { max_len: None }),
