@@ -217,18 +217,10 @@ pub fn lower_query(
             if let Some(op) = try_ordered_index_scan(input, keys, ctx)? {
                 return Ok(op);
             }
-            // Lower the child first; the executor's `Sort` operator drains
-            // it on the first `next_batch()` call and emits sorted rows in
-            // 4096-row chunks thereafter, so the wire encoder treats it
-            // exactly like any other scalar source.
-            //
-            // v0.5 limitation: `Sort` materialises the entire input in
-            // memory before emitting the first row. Spill-to-disk is on
-            // the v0.6 work_mem track. Bounded by `IN_MEMORY_POOL_FRAMES *
-            // PAGE_SIZE` plus working-set headroom (see
-            // `crate::IN_MEMORY_POOL_FRAMES`); a query whose input
-            // exceeds that will OOM the connection task rather than spill.
-            //
+            // Lower the child first; the executor's `Sort` operator uses
+            // the statement `work_mem` budget to choose in-memory sort or
+            // external sorted runs, then emits 4096-row batches through the
+            // same pull interface.
             // Vectorised vs scalar choice: the executor ships a
             // `VectorizedSort` in `vec_ops::sort` that operates on the
             // push-based pipeline driver (`VectorizedSink`/
@@ -239,7 +231,10 @@ pub fn lower_query(
             // push driver, which is a v0.7 milestone (see ROADMAP §v0.7).
             let child = lower_query(input, ctx)?;
             let schema = child.schema().clone();
-            Ok(Box::new(Sort::new(child, keys.clone(), schema)))
+            Ok(Box::new(
+                Sort::new(child, keys.clone(), schema)
+                    .with_work_mem_budget(Arc::clone(&ctx.work_mem)),
+            ))
         }
         LogicalPlan::Update {
             table,
@@ -443,7 +438,8 @@ pub fn lower_query(
             // sit on top of a `SeqScan` over a persistent relation.
             let child = lower_query(input, ctx)?;
             let mut agg =
-                HashAggregate::new(child, group_by.clone(), aggregates.clone(), schema.clone());
+                HashAggregate::new(child, group_by.clone(), aggregates.clone(), schema.clone())
+                    .with_work_mem_budget(Arc::clone(&ctx.work_mem));
             if let Some(flag) = &ctx.cancel_flag {
                 agg = agg.with_cancel_flag(flag.clone());
             }

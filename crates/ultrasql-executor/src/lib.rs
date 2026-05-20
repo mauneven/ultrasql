@@ -94,6 +94,7 @@ pub mod project_expr;
 pub mod push_pipeline;
 pub mod result_op;
 mod row_codec;
+mod row_spill;
 mod seq_scan;
 pub mod set_op;
 pub mod sinks;

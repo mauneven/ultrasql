@@ -28,6 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
@@ -36,11 +37,15 @@ use ultrasql_vec::{Batch, count_i64, max_i64, min_i64, sum_i64};
 
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
+use crate::row_codec::RowCodec;
+use crate::row_spill::RowSpillFile;
 use crate::seq_scan::build_batch;
+use crate::work_mem::WorkMemBudget;
 use crate::{CancelFlag, ExecError, Operator};
 
 /// Maximum rows per emitted batch, matching the `ARCHITECTURE.md` section 9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
+const HASH_AGG_SPILL_PARTITIONS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Hash-map key wrapper
@@ -237,6 +242,10 @@ pub struct HashAggregate {
     /// [`ExecError::Cancelled`] mid-drain. `None` when no cancellation
     /// is wired (tests, bench harnesses).
     cancel_flag: Option<CancelFlag>,
+    /// Optional per-query memory budget.
+    work_mem: Option<Arc<WorkMemBudget>>,
+    /// Whether this execution wrote input partitions to temp storage.
+    spilled_to_disk: bool,
     /// When `true`, the build phase skips the column-oriented fast path
     /// and uses the row-at-a-time scalar loop. Test-only knob used by
     /// the cross-validation tests; production callers leave it `false`.
@@ -270,6 +279,8 @@ impl HashAggregate {
             output: None,
             eof: false,
             cancel_flag: None,
+            work_mem: None,
+            spilled_to_disk: false,
             #[cfg(test)]
             force_scalar_path: false,
         }
@@ -286,6 +297,19 @@ impl HashAggregate {
     pub fn with_cancel_flag(mut self, flag: CancelFlag) -> Self {
         self.cancel_flag = Some(flag);
         self
+    }
+
+    /// Attach a per-query work-memory budget.
+    #[must_use]
+    pub fn with_work_mem_budget(mut self, budget: Arc<WorkMemBudget>) -> Self {
+        self.work_mem = Some(budget);
+        self
+    }
+
+    /// Whether this execution wrote hash aggregate partitions to disk.
+    #[must_use]
+    pub const fn spilled_to_disk(&self) -> bool {
+        self.spilled_to_disk
     }
 
     /// Test-only: disable the vectorised fast path. Used by cross-validation
@@ -333,6 +357,9 @@ impl HashAggregate {
     /// Execute the build phase: drain child, accumulate aggregates, finalise.
     fn build(&mut self) -> Result<Vec<Vec<Value>>, ExecError> {
         let has_group_keys = !self.group_key_evals.is_empty();
+        if has_group_keys && self.should_partition_spill() {
+            return self.build_spilled_partitioned();
+        }
 
         // Scalar-aggregate (no GROUP BY) vectorised fast path.
         //
@@ -495,6 +522,101 @@ impl HashAggregate {
         }
         Ok(output)
     }
+
+    fn should_partition_spill(&self) -> bool {
+        self.work_mem
+            .as_ref()
+            .is_some_and(|budget| budget.limit_bytes() != u64::MAX)
+    }
+
+    fn build_spilled_partitioned(&mut self) -> Result<Vec<Vec<Value>>, ExecError> {
+        let child_schema = self.child.schema().clone();
+        let codec = RowCodec::new(child_schema.clone());
+        let mut partitions: Vec<Option<RowSpillFile>> =
+            (0..HASH_AGG_SPILL_PARTITIONS).map(|_| None).collect();
+        let mut saw_any_row = false;
+
+        loop {
+            if let Some(flag) = self.cancel_flag.as_ref()
+                && flag.is_set()
+            {
+                return Err(ExecError::Cancelled);
+            }
+            let Some(batch) = self.child.next_batch()? else {
+                break;
+            };
+            let rows = batch_to_rows(&batch, &child_schema).map_err(|error| {
+                ExecError::TypeMismatch(format!(
+                    "HashAggregate child decode failed (rows={}, width={}): {error}",
+                    batch.rows(),
+                    batch.width()
+                ))
+            })?;
+            for row in rows {
+                saw_any_row = true;
+                let key_values: Vec<Value> = self
+                    .group_key_evals
+                    .iter()
+                    .map(|ev| ev.eval(&row).unwrap_or(Value::Null))
+                    .collect();
+                let partition = partition_for_group_key_values(&key_values)?;
+                if partitions[partition].is_none() {
+                    partitions[partition] = Some(RowSpillFile::new("hash aggregate")?);
+                }
+                partitions[partition]
+                    .as_mut()
+                    .ok_or(ExecError::Internal("hash aggregate partition missing"))?
+                    .append_row(&codec, &row)?;
+                self.spilled_to_disk = true;
+            }
+        }
+
+        if !saw_any_row {
+            return Ok(Vec::new());
+        }
+
+        let mut output = Vec::new();
+        for partition in partitions.into_iter().flatten() {
+            let mut spill = partition;
+            let mut table: HashMap<GroupKey, Vec<AggState>> = HashMap::new();
+            spill.scan_rows(&codec, |row| {
+                let key_values: Vec<Value> = self
+                    .group_key_evals
+                    .iter()
+                    .map(|ev| ev.eval(&row).unwrap_or(Value::Null))
+                    .collect();
+                let key = GroupKey::from_values(key_values);
+                let states = table
+                    .entry(key)
+                    .or_insert_with(|| init_states(&self.aggregates));
+                for (state, agg) in states.iter_mut().zip(self.aggregates.iter()) {
+                    accumulate(state, agg, &row)?;
+                }
+                Ok(())
+            })?;
+
+            for (key, states) in table {
+                let mut row = key.into_values();
+                for state in &states {
+                    row.push(finalise(state));
+                }
+                output.push(row);
+            }
+        }
+        Ok(output)
+    }
+}
+
+fn partition_for_group_key_values(values: &[Value]) -> Result<usize, ExecError> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for value in values {
+        hash_value(value, &mut hasher);
+    }
+    let partitions = u64::try_from(HASH_AGG_SPILL_PARTITIONS)
+        .map_err(|_| ExecError::Internal("hash aggregate partition count exceeds u64"))?;
+    let idx = hasher.finish() % partitions;
+    usize::try_from(idx)
+        .map_err(|_| ExecError::Internal("hash aggregate partition index exceeds usize"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1673,8 +1795,8 @@ mod tests {
     use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 
     use super::{AggState, HashAggregate, accumulate_sum, finalise};
-    use crate::Operator;
     use crate::mem_table_scan::MemTableScan;
+    use crate::{Operator, WorkMemBudget};
 
     // -------------------------------------------------------------------------
     // Helpers
@@ -1893,6 +2015,49 @@ mod tests {
         // group=2: sum=20, min=20, max=20
         assert_eq!(rows[1][0], Value::Int32(2));
         assert_eq!(rows[1][1], Value::Int64(20));
+    }
+
+    #[test]
+    fn hash_agg_spills_grouped_input_when_work_mem_is_too_small() {
+        let schema = schema_group_val();
+        let scan = MemTableScan::new(
+            schema,
+            vec![
+                make_batch_i32_i64(&[(1, 10), (2, 20), (1, 7)]),
+                make_batch_i32_i64(&[(3, 30), (2, 5), (3, 4)]),
+            ],
+        );
+        let out_schema = Schema::new([
+            Field::required("group", DataType::Int32),
+            Field::required("total", DataType::Int64),
+        ])
+        .expect("schema ok");
+        let mut op = HashAggregate::new(
+            Box::new(scan),
+            vec![col("group", 0, DataType::Int32)],
+            vec![sum_agg("val", 1)],
+            out_schema,
+        )
+        .with_work_mem_budget(std::sync::Arc::new(WorkMemBudget::new(1)));
+
+        let mut rows = drain_all(&mut op);
+        rows.sort_by_key(|row| match row[0] {
+            Value::Int32(v) => v,
+            _ => panic!("unexpected group key"),
+        });
+
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int32(1), Value::Int64(17)],
+                vec![Value::Int32(2), Value::Int64(25)],
+                vec![Value::Int32(3), Value::Int64(34)],
+            ]
+        );
+        assert!(
+            op.spilled_to_disk(),
+            "grouped hash aggregate must partition-spill"
+        );
     }
 
     #[test]

@@ -15,8 +15,8 @@
 //!   `Project`.
 //! - `LogicalPlan::Limit` -> `Limit` (`LIMIT n OFFSET m`,
 //!   `OFFSET m` with no `LIMIT`, and the common `LIMIT n OFFSET 0`).
-//! - `LogicalPlan::Sort` -> `Sort` (in-memory; spill-to-disk lands
-//!   with the `work_mem` budget in v0.6).
+//! - `LogicalPlan::Sort` -> `Sort` (in-memory or external sorted runs,
+//!   depending on the statement `work_mem` budget).
 //! - `LogicalPlan::SetOp` -> `SetOp` for `UNION`, `INTERSECT`, and
 //!   `EXCEPT` (each in both `ALL` and `DISTINCT` quantifier forms).
 //!   The two children are lowered recursively through the same path so
@@ -258,15 +258,10 @@ pub struct LowerCtx<'a> {
     /// Per-statement memory budget for operators that accumulate
     /// state (sort buffers, hash tables, the join-build side). The
     /// budget is shared by reference so a single statement's working
-    /// set is policed across every operator in the plan. v0.5 sets
-    /// the budget to `u64::MAX` (effectively unlimited) because no
-    /// operator yet spills to disk; the field is plumbed so v0.6
-    /// can light up the spill paths without touching the dispatch
-    /// surface. The companion `temp_file_limit` constant
-    /// (`ultrasql_executor::work_mem::temp_file_limit`) caps total
-    /// temp-file bytes any future spill writer is allowed to
-    /// generate; it is enforced vacuously today because no spill
-    /// path exists.
+    /// set is policed across every operator in the plan. The companion
+    /// `temp_file_limit` constant
+    /// (`ultrasql_executor::work_mem::temp_file_limit`) caps temp-file bytes
+    /// each spill writer may generate.
     pub work_mem: std::sync::Arc<ultrasql_executor::work_mem::WorkMemBudget>,
 }
 

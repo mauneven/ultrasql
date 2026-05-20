@@ -356,8 +356,9 @@ pub(super) fn check_set_op_schemas(left: &Schema, right: &Schema) -> Result<(), 
 /// hash-counting algorithm, treating two NULLs as equal (matching
 /// PostgreSQL `DISTINCT` semantics). The kernel is fully materialising:
 /// it drains both inputs before emitting its first row, so the operator
-/// is a pipeline breaker bounded by the same in-memory footprint as
-/// `HashAggregate` / `Sort` until the v0.7 `work_mem` spill lands.
+/// is a pipeline breaker with its own in-memory footprint. `Sort` and
+/// grouped `HashAggregate` now have dedicated `work_mem` spill paths;
+/// `SetOp` spill remains separate follow-up work.
 ///
 /// Schema-compatibility: the binder enforces arity and per-column
 /// `numeric_join` compatibility (see `binder::bind_set_op`). We re-check

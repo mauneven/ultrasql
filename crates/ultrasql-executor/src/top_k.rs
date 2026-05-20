@@ -5,9 +5,12 @@
 //! the order keys per row, keeps only the best `k` annotated rows, then
 //! emits those rows in sort order. This is exact retrieval: every input
 //! row is considered, but memory is bounded by `k` instead of total
-//! cardinality.
+//! cardinality. With a finite [`crate::WorkMemBudget`], it routes through
+//! the spillable [`crate::Sort`] path so large vector top-k queries can
+//! trade disk for memory instead of growing without bound.
 
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use ultrasql_core::{Schema, Value};
 use ultrasql_planner::{BinaryOp, ScalarExpr, SortKey};
@@ -17,7 +20,8 @@ use ultrasql_vec::kernels::vector::{VectorMetric, exact_top_k_f32};
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
-use crate::sort::compare_values_nullable;
+use crate::sort::{Sort, compare_values_nullable};
+use crate::work_mem::WorkMemBudget;
 use crate::{ExecError, Operator};
 
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -31,12 +35,16 @@ const BATCH_TARGET_ROWS: usize = 4096;
 #[derive(Debug)]
 pub struct TopK {
     child: Box<dyn Operator>,
+    original_keys: Vec<SortKey>,
     keys: Vec<CompiledKey>,
     exact_vector_key: Option<ExactVectorTopKKey>,
     schema: Schema,
     cap: usize,
     presorted_input: bool,
     presorted_emitted: usize,
+    work_mem: Option<Arc<WorkMemBudget>>,
+    spilled_to_disk: bool,
+    spill_delegate: Option<TopKSpillDelegate>,
     sorted: Option<std::vec::IntoIter<Vec<Value>>>,
     eof: bool,
 }
@@ -64,7 +72,8 @@ impl TopK {
     pub fn new(child: Box<dyn Operator>, keys: Vec<SortKey>, schema: Schema, cap: usize) -> Self {
         let exact_vector_key = match_exact_vector_top_k_key(&keys);
         let compiled = keys
-            .into_iter()
+            .iter()
+            .cloned()
             .map(|k| CompiledKey {
                 eval: Eval::new(k.expr),
                 asc: k.asc,
@@ -73,12 +82,16 @@ impl TopK {
             .collect();
         Self {
             child,
+            original_keys: keys,
             keys: compiled,
             exact_vector_key,
             schema,
             cap,
             presorted_input: false,
             presorted_emitted: 0,
+            work_mem: None,
+            spilled_to_disk: false,
+            spill_delegate: None,
             sorted: None,
             eof: false,
         }
@@ -95,15 +108,32 @@ impl TopK {
     pub fn new_presorted(child: Box<dyn Operator>, schema: Schema, cap: usize) -> Self {
         Self {
             child,
+            original_keys: Vec::new(),
             keys: Vec::new(),
             exact_vector_key: None,
             schema,
             cap,
             presorted_input: true,
             presorted_emitted: 0,
+            work_mem: None,
+            spilled_to_disk: false,
+            spill_delegate: None,
             sorted: None,
             eof: false,
         }
+    }
+
+    /// Attach a per-query work-memory budget.
+    #[must_use]
+    pub fn with_work_mem_budget(mut self, budget: Arc<WorkMemBudget>) -> Self {
+        self.work_mem = Some(budget);
+        self
+    }
+
+    /// Whether this execution routed through the spillable sort path.
+    #[must_use]
+    pub const fn spilled_to_disk(&self) -> bool {
+        self.spilled_to_disk
     }
 }
 
@@ -118,6 +148,13 @@ impl Operator for TopK {
         }
         if self.presorted_input {
             return self.next_presorted_batch();
+        }
+        if self.spill_delegate.is_some() {
+            return self.next_spill_delegate_batch();
+        }
+        if self.should_use_spill_delegate() {
+            self.install_spill_delegate();
+            return self.next_spill_delegate_batch();
         }
 
         if self.sorted.is_none() {
@@ -163,6 +200,55 @@ impl Operator for TopK {
 }
 
 impl TopK {
+    fn should_use_spill_delegate(&self) -> bool {
+        self.work_mem
+            .as_ref()
+            .is_some_and(|budget| budget.limit_bytes() != u64::MAX)
+    }
+
+    fn install_spill_delegate(&mut self) {
+        let child = std::mem::replace(
+            &mut self.child,
+            Box::new(EmptyTopKChild {
+                schema: self.schema.clone(),
+            }),
+        );
+        let mut sort = Sort::new(child, self.original_keys.clone(), self.schema.clone());
+        if let Some(budget) = &self.work_mem {
+            sort = sort.with_work_mem_budget(Arc::clone(budget));
+        }
+        self.spill_delegate = Some(TopKSpillDelegate {
+            sort,
+            remaining: self.cap,
+        });
+    }
+
+    fn next_spill_delegate_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+        let Some(delegate) = self.spill_delegate.as_mut() else {
+            return Err(ExecError::Internal("top-k spill delegate missing"));
+        };
+        if delegate.remaining == 0 {
+            self.spilled_to_disk |= delegate.sort.spilled_to_disk();
+            self.eof = true;
+            return Ok(None);
+        }
+        let Some(batch) = delegate.sort.next_batch()? else {
+            self.spilled_to_disk |= delegate.sort.spilled_to_disk();
+            self.eof = true;
+            return Ok(None);
+        };
+        self.spilled_to_disk |= delegate.sort.spilled_to_disk();
+        let mut rows = batch_to_rows(&batch, &self.schema)?;
+        let take = rows.len().min(delegate.remaining);
+        rows.truncate(take);
+        delegate.remaining -= take;
+        if rows.is_empty() {
+            self.eof = true;
+            return Ok(None);
+        }
+        build_batch(&rows, &self.schema).map(Some)
+    }
+
     fn next_presorted_batch(&mut self) -> Result<Option<Batch>, ExecError> {
         if self.presorted_emitted >= self.cap {
             self.eof = true;
@@ -190,6 +276,27 @@ impl TopK {
             return Ok(None);
         }
         build_batch(&chunk, &self.schema).map(Some)
+    }
+}
+
+#[derive(Debug)]
+struct EmptyTopKChild {
+    schema: Schema,
+}
+
+#[derive(Debug)]
+struct TopKSpillDelegate {
+    sort: Sort,
+    remaining: usize,
+}
+
+impl Operator for EmptyTopKChild {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+        Ok(None)
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
     }
 }
 
@@ -358,7 +465,7 @@ mod tests {
 
     use super::TopK;
     use super::match_exact_vector_top_k_key;
-    use crate::{ExecError, Operator};
+    use crate::{ExecError, Operator, WorkMemBudget};
 
     #[test]
     fn exact_vector_top_k_key_matches_single_ascending_distance_key() {
@@ -442,6 +549,59 @@ mod tests {
             pulls.load(Ordering::SeqCst),
             2,
             "presorted top-k must stop as soon as cap rows are available"
+        );
+    }
+
+    #[test]
+    fn vector_top_k_spills_to_disk_when_work_mem_is_too_small() {
+        let schema = Schema::new([
+            Field::required("id", DataType::Int32),
+            Field::required("embedding", DataType::Vector { dims: Some(2) }),
+        ])
+        .expect("schema ok");
+        let rows = vec![
+            vec![Value::Int32(10), Value::Vector(vec![3.0, 0.0])],
+            vec![Value::Int32(20), Value::Vector(vec![0.0, 1.0])],
+            vec![Value::Int32(30), Value::Vector(vec![0.2, 0.0])],
+            vec![Value::Int32(40), Value::Vector(vec![0.0, 2.0])],
+        ];
+        let batch = crate::seq_scan::build_batch(&rows, &schema).expect("batch ok");
+        let child = CountingScan {
+            schema: schema.clone(),
+            batches: vec![batch],
+            next: 0,
+            pulls: Arc::new(AtomicUsize::new(0)),
+        };
+        let key = SortKey {
+            expr: ScalarExpr::Binary {
+                op: BinaryOp::VectorL2Distance,
+                left: Box::new(ScalarExpr::Column {
+                    name: "embedding".into(),
+                    index: 1,
+                    data_type: DataType::Vector { dims: Some(2) },
+                }),
+                right: Box::new(ScalarExpr::Literal {
+                    value: Value::Vector(vec![0.0, 0.0]),
+                    data_type: DataType::Vector { dims: Some(2) },
+                }),
+                data_type: DataType::Float64,
+            },
+            asc: true,
+            nulls_first: false,
+        };
+        let mut top_k = TopK::new(Box::new(child), vec![key], schema.clone(), 2)
+            .with_work_mem_budget(std::sync::Arc::new(WorkMemBudget::new(1)));
+
+        let mut out = Vec::new();
+        while let Some(batch) = top_k.next_batch().expect("top-k ok") {
+            out.extend(crate::filter_op::batch_to_rows(&batch, top_k.schema()).expect("decode"));
+        }
+        let ids: Vec<Value> = out.into_iter().map(|row| row[0].clone()).collect();
+
+        assert_eq!(ids, vec![Value::Int32(30), Value::Int32(20)]);
+        assert!(
+            top_k.spilled_to_disk(),
+            "vector top-k must route through spillable external sort"
         );
     }
 

@@ -1,10 +1,10 @@
 //! Per-query work memory budget.
 //!
 //! [`WorkMemBudget`] tracks how many bytes of scratch memory a query is
-//! allowed to allocate inside in-memory operators (Sort, `HashAggregate`,
-//! `HashJoin`). When a reservation request would push usage above the
-//! configured limit, the caller receives [`ExecError::Unsupported`] (or
-//! triggers spill, depending on the operator).
+//! allowed to allocate inside memory-heavy operators (Sort, `TopK`,
+//! `HashAggregate`, `HashJoin`). When a reservation request would push usage
+//! above the configured limit, the caller receives [`ExecError::Unsupported`]
+//! (or triggers spill, depending on the operator).
 //!
 //! # Design
 //!
@@ -17,10 +17,11 @@
 //!
 //! # `temp_file_limit`
 //!
-//! The separate `temp_file_limit` constant caps how many bytes may be
-//! written to temp files across all spill runs in a single query. This is
-//! an advisory limit checked at spill time, not enforced with atomics.
-//! For v0.5 the limit is a constant; a configurable GUC arrives in v0.8.
+//! The separate `temp_file_limit` constant caps how many bytes one spill
+//! writer may put into its temp file. This is an advisory limit checked at
+//! spill time, not enforced with atomics.
+//! The limit is a constant today; a configurable GUC arrives in a later
+//! storage configuration slice.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,10 +44,9 @@ pub const fn temp_file_limit() -> u64 {
 /// Per-query work memory budget.
 ///
 /// Shared via `Arc<WorkMemBudget>` across operators that need scratch
-/// memory (Sort, `HashAggregate`, `HashJoin`). The budget is enforced
-/// cooperatively: each operator must call `reserve` before allocating
-/// and the returned [`WorkMemReservation`] must be kept alive for the
-/// duration of the allocation.
+/// memory (Sort, `TopK`, `HashAggregate`, `HashJoin`). The budget is enforced
+/// cooperatively: each operator must call `reserve` before allocating or use
+/// the limit to choose a spill path.
 ///
 /// # Send + Sync
 ///
