@@ -58,6 +58,22 @@ use clap::{Parser, ValueEnum};
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
+const VECTOR_CERTIFICATION_METRICS: &[&str] = &[
+    "recall_at_k",
+    "p50_latency_us",
+    "p95_latency_us",
+    "p99_latency_us",
+    "build_time_us",
+    "memory_bytes",
+    "index_size_bytes",
+];
+
+#[derive(Debug, Clone)]
+struct VectorTopKCertification {
+    answer: String,
+    build_time_us: f64,
+}
+
 /// Workload selector. New workloads will be added as the wire
 /// pipeline grows to cover more shapes.
 #[derive(Copy, Clone, Eq, PartialEq, Debug, ValueEnum)]
@@ -281,6 +297,7 @@ async fn main() -> Result<()> {
     // else would compare cold-cache UltraSQL against warm-cache
     // peers.
     let mut answer: Option<serde_json::Value> = None;
+    let mut vector_topk_certification = None;
     match args.workload {
         Workload::SelectScan => {
             run_shared_select_scan(bound, args.rows, args.warmup, total_iters, &mut iters_us)
@@ -340,18 +357,18 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Workload::VectorTopK => {
-            answer = Some(serde_json::json!(
-                run_shared_vector_topk(
-                    bound,
-                    args.rows,
-                    args.vector_dims,
-                    args.top_k,
-                    args.warmup,
-                    total_iters,
-                    &mut iters_us,
-                )
-                .await?
-            ));
+            let certification = run_shared_vector_topk(
+                bound,
+                args.rows,
+                args.vector_dims,
+                args.top_k,
+                args.warmup,
+                total_iters,
+                &mut iters_us,
+            )
+            .await?;
+            answer = Some(serde_json::json!(certification.answer.clone()));
+            vector_topk_certification = Some(certification);
         }
         Workload::CsvColdRead => {
             let csv_path = required_csv_path(&args)?;
@@ -476,6 +493,9 @@ async fn main() -> Result<()> {
     iters_us.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median_us = iters_us[iters_us.len() / 2];
     let min_us = iters_us[0];
+    let p50_latency_us = percentile_nearest_rank(&iters_us, 0.50);
+    let p95_latency_us = percentile_nearest_rank(&iters_us, 0.95);
+    let p99_latency_us = percentile_nearest_rank(&iters_us, 0.99);
 
     let mut report = serde_json::json!({
         "engine": "ultrasql",
@@ -489,6 +509,24 @@ async fn main() -> Result<()> {
     if let Some(answer) = answer {
         report["answer"] = answer;
     }
+    if let Some(certification) = vector_topk_certification {
+        report["status"] = serde_json::json!("measured");
+        report["vector_dims"] = serde_json::json!(args.vector_dims);
+        report["top_k"] = serde_json::json!(args.top_k);
+        report["exact"] = serde_json::json!(true);
+        report["metric"] = serde_json::json!("l2");
+        report["required_metrics"] = serde_json::json!(VECTOR_CERTIFICATION_METRICS);
+        report["recall_at_k"] = serde_json::json!(1.0);
+        report["p50_latency_us"] = serde_json::json!(p50_latency_us);
+        report["p95_latency_us"] = serde_json::json!(p95_latency_us);
+        report["p99_latency_us"] = serde_json::json!(p99_latency_us);
+        report["build_time_us"] = serde_json::json!(certification.build_time_us);
+        report["build_time_scope"] = serde_json::json!("table_load_before_timed_query");
+        report["memory_bytes"] = serde_json::Value::Null;
+        report["memory_status"] = serde_json::json!("not_measured");
+        report["index_size_bytes"] = serde_json::Value::Null;
+        report["index_size_status"] = serde_json::json!("not_applicable_exact_scan");
+    }
     let serialized = serde_json::to_string(&report)?;
     if let Some(path) = args.output.as_ref() {
         std::fs::write(path, &serialized).with_context(|| format!("write {}", path.display()))?;
@@ -501,6 +539,12 @@ async fn main() -> Result<()> {
 
 fn required_csv_path(args: &Args) -> Result<&PathBuf> {
     args.csv_path.as_ref().context("--csv-path is required")
+}
+
+fn percentile_nearest_rank(sorted_values: &[f64], percentile: f64) -> f64 {
+    let rank = (sorted_values.len() as f64 * percentile).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(sorted_values.len() - 1);
+    sorted_values[idx]
 }
 
 fn sql_string(path: &Path) -> String {
@@ -1498,7 +1542,7 @@ async fn run_shared_vector_topk(
     warmup: usize,
     total_iters: usize,
     iters_us: &mut Vec<f64>,
-) -> Result<String> {
+) -> Result<VectorTopKCertification> {
     let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
         .await
@@ -1510,6 +1554,7 @@ async fn run_shared_vector_topk(
     });
 
     let table = "bench_vector_topk_shared";
+    let build_started = Instant::now();
     client
         .batch_execute(&format!(
             "CREATE TABLE {table} (id INT NOT NULL, embedding VECTOR({dims}))"
@@ -1517,6 +1562,7 @@ async fn run_shared_vector_topk(
         .await
         .with_context(|| format!("CREATE TABLE {table}"))?;
     preload_vector_chunked(&client, table, n_rows, dims).await?;
+    let build_time_us = build_started.elapsed().as_secs_f64() * 1e6;
 
     let probe = vector_probe_literal(dims);
     let expected = expected_vector_topk_answer(n_rows, dims, top_k);
@@ -1551,7 +1597,10 @@ async fn run_shared_vector_topk(
 
     drop(client);
     conn_handle.abort();
-    Ok(expected)
+    Ok(VectorTopKCertification {
+        answer: expected,
+        build_time_us,
+    })
 }
 
 /// Mixed-OLTP pgbench-like 1-second-window workload.
@@ -1686,6 +1735,15 @@ mod tests {
             Workload::VectorTopK.registry_id_with_shape(10_000, 8, 10),
             "vector_topk_exact_10k_8d_k10"
         );
+    }
+
+    #[test]
+    fn vector_topk_percentiles_use_nearest_rank() {
+        let values = [10.0, 20.0, 30.0, 40.0];
+
+        assert_eq!(percentile_nearest_rank(&values, 0.50), 20.0);
+        assert_eq!(percentile_nearest_rank(&values, 0.95), 40.0);
+        assert_eq!(percentile_nearest_rank(&values, 0.99), 40.0);
     }
 
     #[test]

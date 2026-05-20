@@ -25,6 +25,7 @@ CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-localhost}"
 CLICKHOUSE_PORT="${CLICKHOUSE_PORT:-9000}"
 CLICKHOUSE_USER="${CLICKHOUSE_USER:-default}"
 CLICKHOUSE_DATABASE="${CLICKHOUSE_DATABASE:-default}"
+REQUIRED_VECTOR_METRICS="recall_at_k,p50_latency_us,p95_latency_us,p99_latency_us,build_time_us,memory_bytes,index_size_bytes"
 
 mkdir -p "$RAW_DIR"
 
@@ -53,35 +54,86 @@ emit_not_available() {
     local engine="$1"
     local reason="$2"
     local out="$RAW_DIR/${WORKLOAD}-${engine}.json"
-    printf '{"engine":"%s","status":"not_available","reason":"%s","workload":"%s","n_rows":%d,"vector_dims":%d,"top_k":%d}\n' \
-        "$engine" "$reason" "$WORKLOAD" "$ROWS" "$DIMS" "$TOP_K" > "$out"
-}
-
-emit_json() {
-    local engine="$1"
-    local out="$2"
-    local answer="$3"
-    shift 3
-    python3 - "$engine" "$WORKLOAD" "$ROWS" "$DIMS" "$TOP_K" "$answer" "$@" <<'PY' > "$out"
+    python3 - "$engine" "$reason" "$WORKLOAD" "$ROWS" "$DIMS" "$TOP_K" "$REQUIRED_VECTOR_METRICS" <<'PY' > "$out"
 import json
-import statistics
 import sys
 
-engine, workload = sys.argv[1], sys.argv[2]
-rows, dims, top_k = map(int, sys.argv[3:6])
-answer = sys.argv[6]
-samples = [float(value) for value in sys.argv[7:]]
+engine, reason, workload = sys.argv[1], sys.argv[2], sys.argv[3]
+rows, dims, top_k = map(int, sys.argv[4:7])
+required_metrics = sys.argv[7].split(",")
 doc = {
     "engine": engine,
+    "status": "not_available",
+    "reason": reason,
     "workload": workload,
     "n_rows": rows,
     "vector_dims": dims,
     "top_k": top_k,
     "exact": True,
     "metric": "l2",
+    "required_metrics": required_metrics,
+    "recall_at_k": None,
+    "p50_latency_us": None,
+    "p95_latency_us": None,
+    "p99_latency_us": None,
+    "build_time_us": None,
+    "build_time_scope": "table_load_before_timed_query",
+    "memory_bytes": None,
+    "memory_status": "not_measured",
+    "index_size_bytes": None,
+    "index_size_status": "not_applicable_exact_scan",
+}
+print(json.dumps(doc, separators=(",", ":")))
+PY
+}
+
+emit_json() {
+    local engine="$1"
+    local out="$2"
+    local answer="$3"
+    local build_time_us="$4"
+    shift 4
+    python3 - "$engine" "$WORKLOAD" "$ROWS" "$DIMS" "$TOP_K" "$answer" "$build_time_us" "$REQUIRED_VECTOR_METRICS" "$@" <<'PY' > "$out"
+import json
+import math
+import statistics
+import sys
+
+engine, workload = sys.argv[1], sys.argv[2]
+rows, dims, top_k = map(int, sys.argv[3:6])
+answer = sys.argv[6]
+build_time_us = float(sys.argv[7])
+required_metrics = sys.argv[8].split(",")
+samples = [float(value) for value in sys.argv[9:]]
+
+def percentile_nearest_rank(values, percentile):
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * percentile) - 1))
+    return ordered[index]
+
+doc = {
+    "engine": engine,
+    "status": "measured",
+    "workload": workload,
+    "n_rows": rows,
+    "vector_dims": dims,
+    "top_k": top_k,
+    "exact": True,
+    "metric": "l2",
+    "required_metrics": required_metrics,
     "samples": len(samples),
     "median_us": statistics.median(samples),
     "min_us": min(samples),
+    "recall_at_k": 1.0,
+    "p50_latency_us": percentile_nearest_rank(samples, 0.50),
+    "p95_latency_us": percentile_nearest_rank(samples, 0.95),
+    "p99_latency_us": percentile_nearest_rank(samples, 0.99),
+    "build_time_us": build_time_us,
+    "build_time_scope": "table_load_before_timed_query",
+    "memory_bytes": None,
+    "memory_status": "not_measured",
+    "index_size_bytes": None,
+    "index_size_status": "not_applicable_exact_scan",
     "iterations_us": samples,
     "answer": answer,
 }
@@ -201,7 +253,11 @@ dims = int(sys.argv[1])
 print("[" + ",".join(str(((dim * 7) + 3) % 23 - 11) for dim in range(dims)) + "]")
 PY
     )"
+    local build_t0 build_t1 build_time_us
+    build_t0="$(time_python)"
     postgres_psql -f "$setup_sql" >/dev/null
+    build_t1="$(time_python)"
+    build_time_us="$(sample_delta_us "$build_t0" "$build_t1")"
 
     query="SELECT id FROM bench_vector_topk ORDER BY embedding <-> '${probe}'::vector, id LIMIT ${TOP_K};"
     local samples=()
@@ -221,7 +277,7 @@ PY
         fi
     done
 
-    emit_json "$engine" "$RAW_DIR/${WORKLOAD}-${engine}.json" "$expected" "${samples[@]}"
+    emit_json "$engine" "$RAW_DIR/${WORKLOAD}-${engine}.json" "$expected" "$build_time_us" "${samples[@]}"
     rm -rf "$tmp_dir"
     return 0
 }
@@ -264,7 +320,11 @@ dims = int(sys.argv[1])
 print("[" + ",".join(str(((dim * 7) + 3) % 23 - 11) for dim in range(dims)) + "]")
 PY
     )"
+    local build_t0 build_t1 build_time_us
+    build_t0="$(time_python)"
     duckdb "$db_path" < "$setup_sql" >/dev/null
+    build_t1="$(time_python)"
+    build_time_us="$(sample_delta_us "$build_t0" "$build_t1")"
 
     query="SELECT id FROM bench_vector_topk ORDER BY ${distance_fn}(embedding, ${probe}::DOUBLE[]), id LIMIT ${TOP_K};"
     local samples=()
@@ -284,7 +344,7 @@ PY
         fi
     done
 
-    emit_json "$engine" "$RAW_DIR/${WORKLOAD}-${engine}.json" "$expected" "${samples[@]}"
+    emit_json "$engine" "$RAW_DIR/${WORKLOAD}-${engine}.json" "$expected" "$build_time_us" "${samples[@]}"
     rm -rf "$tmp_dir"
     return 0
 }
@@ -331,7 +391,11 @@ dims = int(sys.argv[1])
 print("[" + ",".join(str(((dim * 7) + 3) % 23 - 11) for dim in range(dims)) + "]")
 PY
     )"
+    local build_t0 build_t1 build_time_us
+    build_t0="$(time_python)"
     clickhouse_client_file "$setup_sql" >/dev/null
+    build_t1="$(time_python)"
+    build_time_us="$(sample_delta_us "$build_t0" "$build_t1")"
 
     query="SELECT id FROM bench_vector_topk ORDER BY arraySum(arrayMap((x, y) -> ((x - y) * (x - y)), embedding, ${probe})) ASC, id ASC LIMIT ${TOP_K};"
     local samples=()
@@ -351,7 +415,7 @@ PY
         fi
     done
 
-    emit_json "$engine" "$RAW_DIR/${WORKLOAD}-${engine}.json" "$expected" "${samples[@]}"
+    emit_json "$engine" "$RAW_DIR/${WORKLOAD}-${engine}.json" "$expected" "$build_time_us" "${samples[@]}"
     clickhouse_client "DROP TABLE IF EXISTS bench_vector_topk;" >/dev/null 2>&1 || true
     rm -rf "$tmp_dir"
     return 0

@@ -17,7 +17,30 @@ fn vector_topk_script_prefers_pgvector_then_duckdb_list_fallback() {
     assert!(script.contains("list_distance"));
     assert!(script.contains("array_distance"));
     assert!(script.contains("duckdb_list"));
-    assert!(script.contains("\"status\":\"not_available\""));
+    assert!(script.contains("\"status\": \"not_available\""));
+    assert!(script.contains("\"reason\": reason"));
+}
+
+#[test]
+fn vector_topk_script_certifies_recall_tail_latency_build_memory_and_index_size() {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("benchmarks/vector_topk_exact.sh");
+    let script = fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", script_path.display()));
+
+    assert!(script.contains("REQUIRED_VECTOR_METRICS"));
+    assert!(script.contains("recall_at_k"));
+    assert!(script.contains("p50_latency_us"));
+    assert!(script.contains("p95_latency_us"));
+    assert!(script.contains("p99_latency_us"));
+    assert!(script.contains("build_time_us"));
+    assert!(script.contains("build_time_scope"));
+    assert!(script.contains("memory_bytes"));
+    assert!(script.contains("memory_status"));
+    assert!(script.contains("index_size_bytes"));
+    assert!(script.contains("index_size_status"));
+    assert!(script.contains("not_applicable_exact_scan"));
 }
 
 #[test]
