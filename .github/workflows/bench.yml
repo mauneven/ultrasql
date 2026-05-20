@@ -49,7 +49,9 @@ jobs:
           name: benchmark-smoke
           path: |
             benchmarks/results/latest/benchmark_certification_manifest.json
+            benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json
             benchmarks/results/latest/sysbench_certification.json
+            benchmarks/results/latest/raw/*ai_gauntlet*
             benchmarks/results/latest/raw/*sysbench*
             benchmarks/results/latest/raw/*vector_ann*
 
@@ -115,5 +117,6 @@ jobs:
           name: benchmark-certifications
           path: |
             benchmarks/results/latest/*certification.json
+            benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json
             benchmarks/results/latest/benchmark_certification_manifest.json
             benchmarks/results/latest/raw/

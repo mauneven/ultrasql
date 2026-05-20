@@ -2,10 +2,9 @@
 # Exact vector top-k cross-engine benchmark.
 #
 # Measures UltraSQL through `cross_compare_sql --workload vector-top-k`, then
-# prefers PostgreSQL + pgvector when the extension already exists or can be
-# created in the target database. If pgvector is unavailable, falls back to
-# DuckDB only when an installed DuckDB build exposes LIST/ARRAY distance
-# functions. No proprietary tests or benchmark assets are downloaded.
+# attempts PostgreSQL + pgvector, DuckDB LIST/ARRAY distance, and ClickHouse
+# Array(Float64) exact scans when those engines are already installed and
+# reachable. No proprietary tests or benchmark assets are downloaded.
 
 set -euo pipefail
 
@@ -21,6 +20,11 @@ N_ITERS="${N_ITERS:-8}"
 WARMUP="${WARMUP:-2}"
 PGDATABASE="${PGDATABASE:-ultrasql_bench}"
 PGUSER="${PGUSER:-$(id -un)}"
+CLICKHOUSE_BIN="${CLICKHOUSE_BIN:-clickhouse}"
+CLICKHOUSE_HOST="${CLICKHOUSE_HOST:-localhost}"
+CLICKHOUSE_PORT="${CLICKHOUSE_PORT:-9000}"
+CLICKHOUSE_USER="${CLICKHOUSE_USER:-default}"
+CLICKHOUSE_DATABASE="${CLICKHOUSE_DATABASE:-default}"
 
 mkdir -p "$RAW_DIR"
 
@@ -125,13 +129,19 @@ with open(sql_out, "w", encoding="utf-8") as f:
         f.write(f"CREATE UNLOGGED TABLE bench_vector_topk (id INT NOT NULL, embedding vector({dims}));\n")
     elif dialect == "duckdb":
         f.write("CREATE OR REPLACE TABLE bench_vector_topk (id INTEGER, embedding DOUBLE[]);\n")
+    elif dialect == "clickhouse":
+        f.write("DROP TABLE IF EXISTS bench_vector_topk;\n")
+        f.write("CREATE TABLE bench_vector_topk (id UInt32, embedding Array(Float64)) ENGINE=Memory;\n")
     else:
         raise SystemExit(f"unknown dialect: {dialect}")
 
     chunk = 1000
     for start in range(0, rows, chunk):
         end = min(start + chunk, rows)
-        values = ",".join(f"({row_id},'{vector_literal(row_id)}')" for row_id in range(start, end))
+        if dialect == "clickhouse":
+            values = ",".join(f"({row_id},{vector_literal(row_id)})" for row_id in range(start, end))
+        else:
+            values = ",".join(f"({row_id},'{vector_literal(row_id)}')" for row_id in range(start, end))
         if values:
             f.write(f"INSERT INTO bench_vector_topk VALUES {values};\n")
 PY
@@ -203,7 +213,7 @@ PY
         if [[ "$observed" != "$expected" ]]; then
             echo "postgres pgvector top-k mismatch: expected $expected observed $observed" >&2
             rm -rf "$tmp_dir"
-            return 2
+            return 1
         fi
         if (( i >= WARMUP )); then
             dt="$(sample_delta_us "$t0" "$t1")"
@@ -266,7 +276,7 @@ PY
         if [[ "$observed" != "$expected" ]]; then
             echo "duckdb LIST top-k mismatch: expected $expected observed $observed" >&2
             rm -rf "$tmp_dir"
-            return 2
+            return 1
         fi
         if (( i >= WARMUP )); then
             dt="$(sample_delta_us "$t0" "$t1")"
@@ -275,6 +285,74 @@ PY
     done
 
     emit_json "$engine" "$RAW_DIR/${WORKLOAD}-${engine}.json" "$expected" "${samples[@]}"
+    rm -rf "$tmp_dir"
+    return 0
+}
+
+clickhouse_client() {
+    local query="$1"
+    local args=(client --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" --user "$CLICKHOUSE_USER" --database "$CLICKHOUSE_DATABASE")
+    if [[ -n "${CLICKHOUSE_PASSWORD:-}" ]]; then
+        args+=(--password "$CLICKHOUSE_PASSWORD")
+    fi
+    "$CLICKHOUSE_BIN" "${args[@]}" --multiquery --query "$query"
+}
+
+clickhouse_client_file() {
+    local sql_file="$1"
+    local args=(client --host "$CLICKHOUSE_HOST" --port "$CLICKHOUSE_PORT" --user "$CLICKHOUSE_USER" --database "$CLICKHOUSE_DATABASE")
+    if [[ -n "${CLICKHOUSE_PASSWORD:-}" ]]; then
+        args+=(--password "$CLICKHOUSE_PASSWORD")
+    fi
+    "$CLICKHOUSE_BIN" "${args[@]}" --multiquery < "$sql_file"
+}
+
+run_clickhouse_vector() {
+    local engine="clickhouse_vector"
+    if ! command -v "$CLICKHOUSE_BIN" >/dev/null 2>&1; then
+        emit_not_available "$engine" "clickhouse_not_found"
+        return 1
+    fi
+    if ! clickhouse_client "SELECT 1" >/dev/null 2>&1; then
+        emit_not_available "$engine" "clickhouse_connection_failed"
+        return 1
+    fi
+
+    local tmp_dir setup_sql expected_file expected probe query
+    tmp_dir="$(mktemp -d /tmp/ultrasql-vector-clickhouse-XXXXXX)"
+    setup_sql="$tmp_dir/setup.sql"
+    expected_file="$tmp_dir/expected.txt"
+    write_setup_sql clickhouse "$setup_sql" "$expected_file"
+    expected="$(cat "$expected_file")"
+    probe="$(
+        python3 - "$DIMS" <<'PY'
+import sys
+dims = int(sys.argv[1])
+print("[" + ",".join(str(((dim * 7) + 3) % 23 - 11) for dim in range(dims)) + "]")
+PY
+    )"
+    clickhouse_client_file "$setup_sql" >/dev/null
+
+    query="SELECT id FROM bench_vector_topk ORDER BY arraySum(arrayMap((x, y) -> ((x - y) * (x - y)), embedding, ${probe})) ASC, id ASC LIMIT ${TOP_K};"
+    local samples=()
+    for ((i = 0; i < WARMUP + N_ITERS; i++)); do
+        local t0 t1 observed dt
+        t0="$(time_python)"
+        observed="$(clickhouse_client "$query" | normalize_ids)"
+        t1="$(time_python)"
+        if [[ "$observed" != "$expected" ]]; then
+            echo "clickhouse vector top-k mismatch: expected $expected observed $observed" >&2
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+        if (( i >= WARMUP )); then
+            dt="$(sample_delta_us "$t0" "$t1")"
+            samples+=("$dt")
+        fi
+    done
+
+    emit_json "$engine" "$RAW_DIR/${WORKLOAD}-${engine}.json" "$expected" "${samples[@]}"
+    clickhouse_client "DROP TABLE IF EXISTS bench_vector_topk;" >/dev/null 2>&1 || true
     rm -rf "$tmp_dir"
     return 0
 }
@@ -302,22 +380,33 @@ target/release/cross_compare_sql \
 echo "--- Running competitor exact top-k ---"
 pg_status=0
 run_postgres_pgvector || pg_status=$?
-case "$pg_status" in
-    0)
-        echo "postgres17_pgvector measured"
-        ;;
-    1)
-        echo "postgres17_pgvector unavailable; trying DuckDB LIST fallback"
-        duck_status=0
-        run_duckdb_list || duck_status=$?
-        if (( duck_status == 2 )); then
-            exit 2
-        fi
-        ;;
-    *)
-        exit "$pg_status"
-        ;;
-esac
+if (( pg_status == 0 )); then
+    echo "postgres17_pgvector measured"
+elif (( pg_status == 1 )); then
+    echo "postgres17_pgvector unavailable; recorded not_available"
+else
+    exit "$pg_status"
+fi
+
+duck_status=0
+run_duckdb_list || duck_status=$?
+if (( duck_status == 0 )); then
+    echo "duckdb_list measured"
+elif (( duck_status == 1 )); then
+    echo "duckdb_list unavailable; recorded not_available"
+else
+    exit "$duck_status"
+fi
+
+clickhouse_status=0
+run_clickhouse_vector || clickhouse_status=$?
+if (( clickhouse_status == 0 )); then
+    echo "clickhouse_vector measured"
+elif (( clickhouse_status == 1 )); then
+    echo "clickhouse_vector unavailable; recorded not_available"
+else
+    exit "$clickhouse_status"
+fi
 
 echo "--- Rendering benchmark tables ---"
 target/release/results-render \

@@ -253,11 +253,12 @@ benchmarks/vector_topk_exact.sh
 
 The runner always measures UltraSQL through the PostgreSQL wire driver
 with `ORDER BY embedding <-> probe, id LIMIT k` over deterministic
-`VECTOR(d)` rows. It then tries PostgreSQL + pgvector via
-`CREATE EXTENSION IF NOT EXISTS vector`; if pgvector is unavailable, it
-falls back to an installed DuckDB build only when a LIST/ARRAY distance
-function (`list_distance` or `array_distance`) passes a capability probe.
-No extension or dataset is downloaded by the runner. `VECTOR_TOPK_ROWS`,
+`VECTOR(d)` rows. It then attempts PostgreSQL + pgvector via
+`CREATE EXTENSION IF NOT EXISTS vector`, DuckDB LIST/ARRAY distance
+functions (`list_distance` or `array_distance`), and ClickHouse
+`Array(Float64)` scans using `arrayMap`. Missing engines write
+`status: "not_available"` artifacts rather than benchmark claims. No
+extension or dataset is downloaded by the runner. `VECTOR_TOPK_ROWS`,
 `VECTOR_TOPK_DIMS`, `VECTOR_TOPK_K`, `N_ITERS`, and `WARMUP` control
 local smoke versus publishable runs. Raw artifacts land in
 `benchmarks/results/latest/raw/` with an `answer` field containing the
@@ -283,6 +284,25 @@ as `vector_ann_hnsw_<rows>_<dims>d_k<k>-ultrasql_hnsw.json`.
 These artifacts are not competitor claims. They exist to track the
 recall/latency/build/memory envelope of the first ANN implementation
 until the SQL-level pgvector certification runner covers HNSW end to end.
+
+### AI Benchmark Gauntlet
+
+AI workload coverage is orchestrated by:
+
+```text
+benchmarks/ai_benchmark_gauntlet.sh smoke
+benchmarks/ai_benchmark_gauntlet.sh full
+```
+
+The gauntlet is the committed entrypoint for exact vector scan, ANN
+recall/latency, hybrid search latency, RAG retrieval quality, filtered
+vector search, ingestion throughput, memory per million vectors, and
+cold-start index load time. Today it runs the exact vector top-k and HNSW
+ANN runners above, then writes explicit `not_available` artifacts for
+suites whose runners are not implemented yet. The manifest is
+`benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json`; `partial`
+means at least one suite is still missing and no complete AI benchmark
+certification exists.
 
 ### TPC-B Certification
 
@@ -365,7 +385,7 @@ certification attempts:
 ```text
 benchmarks/certify.sh smoke
 benchmarks/certify.sh full
-benchmarks/certify.sh full tpch,clickbench,vector-ann
+benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet
 ```
 
 Smoke profile:
@@ -376,7 +396,7 @@ Smoke profile:
 
 Full profile:
 - attempts TPC-H SF10, ClickBench, TPC-B, TPC-C, sysbench-style OLTP,
-  exact vector top-k, and HNSW ANN vector search;
+  exact vector top-k, HNSW ANN vector search, and the AI benchmark gauntlet;
 - writes `benchmarks/results/latest/benchmark_certification_manifest.json`;
 - treats exit code 2 from a child runner as `unavailable`, meaning a required
   dataset, DSN, engine, or implementation is missing and no benchmark claim
