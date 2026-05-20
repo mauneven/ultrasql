@@ -15,6 +15,10 @@ workspace = true
 name = "ultrasql"
 path = "src/main.rs"
 
+[[bin]]
+name = "ultrasql-local"
+path = "src/bin/ultrasql-local.rs"
+
 [dependencies]
 ultrasql-core     = { workspace = true }
 ultrasql-protocol = { workspace = true }

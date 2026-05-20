@@ -21,7 +21,7 @@
 //! optimizer in a later wave. Do not remove this comment until that work lands.
 
 use crate::ast::{
-    Cte, Distinct, Expr, Identifier, JoinCondition, JoinOp, LockStrength, LockWaitPolicy,
+    Cte, Distinct, Expr, Identifier, JoinCondition, JoinOp, Literal, LockStrength, LockWaitPolicy,
     LockingClause, NullsOrder, ObjectName, OrderItem, SelectItem, SelectStmt, SetOp, SetOpTail,
     SetQuantifier, SortDirection, TableRef,
 };
@@ -362,6 +362,13 @@ impl Parser<'_> {
     ///   | '(' joined_table ')'
     /// ```
     fn parse_table_factor(&mut self) -> Result<TableRef, ParseError> {
+        if matches!(
+            self.peek()?.kind,
+            TokenKind::String | TokenKind::EscapedString | TokenKind::DollarString
+        ) {
+            return self.parse_file_table_factor();
+        }
+
         if self.peek()?.kind == TokenKind::LParen {
             let lp = self.advance()?;
 
@@ -429,6 +436,42 @@ impl Parser<'_> {
 
         // Named table reference.
         self.parse_table_ref()
+    }
+
+    fn parse_file_table_factor(&mut self) -> Result<TableRef, ParseError> {
+        let arg = self.parse_expr()?;
+        let Expr::Literal(Literal::String { value, span }) = &arg else {
+            return Err(ParseError::Expected {
+                expected: "file path string literal",
+                found: self.peek()?.kind,
+                offset: arg.span().start as usize,
+            });
+        };
+        let function = file_table_function_name(value).ok_or(ParseError::Unsupported {
+            what: "file table literal without .csv or .parquet extension",
+            offset: span.start as usize,
+        })?;
+        let alias = if self.match_kw(TokenKind::KwAs)
+            || (matches!(
+                self.peek()?.kind,
+                TokenKind::Identifier | TokenKind::QuotedIdentifier
+            ) && !self.next_token_is_reserved_clause())
+        {
+            Some(self.parse_identifier()?)
+        } else {
+            None
+        };
+        let end = alias.as_ref().map_or(span.end, |a| a.span.end);
+        Ok(TableRef::Function {
+            span: Span::new(span.start, end),
+            name: Identifier {
+                value: function.to_owned(),
+                quoted: false,
+                span: *span,
+            },
+            args: vec![arg],
+            alias,
+        })
     }
 
     // ------------------------------------------------------------------ //
@@ -876,6 +919,17 @@ impl Parser<'_> {
     }
 }
 
+fn file_table_function_name(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains(".parquet") {
+        Some("read_parquet")
+    } else if lower.contains(".csv") {
+        Some("read_csv")
+    } else {
+        None
+    }
+}
+
 // ------------------------------------------------------------------ //
 // TableRef helper — span extraction                                   //
 // ------------------------------------------------------------------ //
@@ -1191,6 +1245,32 @@ mod tests {
             crate::parser::ParseError::Expected { .. }
                 | crate::parser::ParseError::UnexpectedEof { .. }
         ));
+    }
+
+    #[test]
+    fn select_csv_file_literal_in_from_lowers_to_read_csv_function() {
+        let stmt = parse("SELECT count(*) FROM 'logs/*.csv'");
+        let Statement::Select(s) = stmt else { panic!() };
+        let TableRef::Function { name, args, .. } = &s.from[0] else {
+            panic!("expected file literal to parse as table function");
+        };
+        assert_eq!(name.value, "read_csv");
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn select_parquet_file_literal_in_from_lowers_to_read_parquet_function() {
+        let stmt = parse("SELECT * FROM 'facts/*.parquet' f");
+        let Statement::Select(s) = stmt else { panic!() };
+        let TableRef::Function {
+            name, args, alias, ..
+        } = &s.from[0]
+        else {
+            panic!("expected file literal to parse as table function");
+        };
+        assert_eq!(name.value, "read_parquet");
+        assert_eq!(args.len(), 1);
+        assert_eq!(alias.as_ref().expect("alias").value, "f");
     }
 
     // -------- GROUP BY / HAVING ------------------------------------------- //

@@ -75,10 +75,11 @@ use ultrasql_optimizer::{
     AnalyzeOptions, AnalyzeRunner, InMemoryStatsCatalog, PgStatisticRow, PlanCache,
     PlanCacheConfig, StatsCatalog,
 };
+use ultrasql_parser::Parser;
 use ultrasql_planner::plan::{LockStrength, LockWaitPolicy};
 use ultrasql_planner::{
     AggregateFunc, BinaryOp, Catalog as PlannerCatalog, InMemoryCatalog, LogicalIndexMethod,
-    LogicalPlan, ScalarExpr, TableMeta,
+    LogicalPlan, ScalarExpr, TableMeta, bind,
 };
 use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::btree::BTree;
@@ -111,6 +112,36 @@ pub use result_encoder::{
     SelectResult, run_ddl_command, run_modify_command, run_modify_returning, run_select,
     run_select_streamed,
 };
+
+/// One column in an `ultrasql-local` query result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalResultColumn {
+    /// Display name returned by the planner/executor.
+    pub name: String,
+    /// PostgreSQL-compatible type OID for the text-encoded value.
+    pub type_oid: u32,
+}
+
+/// Materialised result returned by the local in-process query runner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalQueryOutput {
+    /// Result columns in output order.
+    pub columns: Vec<LocalResultColumn>,
+    /// Text-format rows. `None` represents SQL `NULL`.
+    pub rows: Vec<Vec<Option<String>>>,
+    /// PostgreSQL-style command tag, e.g. `SELECT 1`.
+    pub command_tag: String,
+}
+
+/// Execute one read-only SQL query against an in-process UltraSQL engine.
+///
+/// This is the library entry point used by `ultrasql-local`: no TCP
+/// listener, no PostgreSQL wire handshake, just parser -> binder ->
+/// executor over local files and in-memory catalogs.
+pub fn execute_local_query(sql: &str) -> Result<LocalQueryOutput, ServerError> {
+    let server = Arc::new(Server::with_sample_database());
+    server.execute_local_query(sql)
+}
 
 /// Per-session transaction-block state.
 ///
@@ -561,6 +592,73 @@ impl PlannerCatalog for CombinedCatalog<'_> {
         }
         self.fallback.lookup_table(name)
     }
+}
+
+fn is_local_read_plan(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::Empty { .. }
+        | LogicalPlan::Values { .. }
+        | LogicalPlan::FunctionScan { .. } => true,
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::LockRows { input, .. } => is_local_read_plan(input),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            is_local_read_plan(left) && is_local_read_plan(right)
+        }
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => is_local_read_plan(definition) && is_local_read_plan(body),
+        _ => false,
+    }
+}
+
+fn local_output_from_select_result(result: SelectResult) -> Result<LocalQueryOutput, ServerError> {
+    let mut columns = Vec::new();
+    let mut rows = Vec::new();
+    let mut command_tag = String::new();
+    for message in result.messages {
+        match message {
+            BackendMessage::RowDescription { fields } => {
+                columns = fields
+                    .into_iter()
+                    .map(|field| LocalResultColumn {
+                        name: field.name,
+                        type_oid: field.type_oid,
+                    })
+                    .collect();
+            }
+            BackendMessage::DataRow { columns } => {
+                let row = columns
+                    .into_iter()
+                    .map(|cell| {
+                        cell.map(|bytes| {
+                            String::from_utf8(bytes).map_err(|err| {
+                                ServerError::CopyFormat(format!(
+                                    "ultrasql-local result is not UTF-8: {err}"
+                                ))
+                            })
+                        })
+                        .transpose()
+                    })
+                    .collect::<Result<Vec<_>, ServerError>>()?;
+                rows.push(row);
+            }
+            BackendMessage::CommandComplete { tag } => {
+                command_tag = tag;
+            }
+            _ => {}
+        }
+    }
+    Ok(LocalQueryOutput {
+        columns,
+        rows,
+        command_tag,
+    })
 }
 
 /// Default initial read buffer. Picked to fit a small startup message
@@ -1362,6 +1460,70 @@ pub(crate) fn tpch_q21_cache() -> Option<Arc<Vec<TpchQ21ResultRow>>> {
 }
 
 impl Server {
+    /// Execute one read-only SQL query without opening a server socket.
+    ///
+    /// The local path deliberately reuses the normal parser, binder, and
+    /// physical lowerer so file table functions behave the same as they
+    /// do over the PostgreSQL wire protocol. It materialises text rows
+    /// for CLI-style display instead of encoding wire frames.
+    pub fn execute_local_query(
+        self: &Arc<Self>,
+        sql: &str,
+    ) -> Result<LocalQueryOutput, ServerError> {
+        let stmt = Parser::new(sql).parse_statement()?;
+        let catalog_snapshot = self.catalog_snapshot();
+        let combined = CombinedCatalog {
+            snapshot: &catalog_snapshot,
+            fallback: &self.catalog,
+        };
+        let plan = bind(&stmt, &combined)?;
+        if !is_local_read_plan(&plan) {
+            return Err(ServerError::Unsupported(
+                "ultrasql-local supports read-only SELECT queries",
+            ));
+        }
+
+        let txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let ctx = LowerCtx {
+            tables: &self.tables,
+            catalog_snapshot,
+            table_constraints: Arc::clone(&self.table_constraints),
+            sequences: Arc::clone(&self.sequences),
+            sequence_state: Some(SequenceSessionState::default()),
+            heap: Arc::clone(&self.heap),
+            vm: Arc::clone(&self.vm),
+            snapshot: txn.snapshot.clone(),
+            oracle: Arc::clone(&self.txn_manager),
+            xid: txn.current_xid(),
+            command_id: txn.current_command,
+            cte_buffers: std::collections::HashMap::new(),
+            jit: ultrasql_vec::jit::JitConfig {
+                enabled: false,
+                above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
+            },
+            cancel_flag: None,
+            work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+        };
+        let outcome = (|| {
+            let mut op = pipeline::lower_query(&plan, &ctx)?;
+            local_output_from_select_result(run_select(op.as_mut())?)
+        })();
+        match outcome {
+            Ok(output) => {
+                if let Err(err) = self.txn_manager.commit(txn) {
+                    warn!(error = %err, "ultrasql-local read transaction commit failed");
+                }
+                Ok(output)
+            }
+            Err(err) => {
+                if let Err(abort_err) = self.txn_manager.abort(txn) {
+                    warn!(error = %abort_err, "ultrasql-local read transaction abort failed");
+                }
+                Err(err)
+            }
+        }
+    }
+
     /// Build a server pre-loaded with the canonical sample database.
     ///
     /// The persistent catalog is bootstrapped from an in-memory buffer pool
