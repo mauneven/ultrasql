@@ -146,6 +146,16 @@ async fn collect_copy_out(stream: tokio_postgres::CopyOutStream) -> Vec<u8> {
 /// Returns the row count `tokio-postgres` extracts from the trailing
 /// `CommandComplete` (e.g. `"COPY N"`).
 async fn copy_in_payload(client: &tokio_postgres::Client, sql: &str, payload: &[u8]) -> u64 {
+    copy_in_payload_result(client, sql, payload)
+        .await
+        .expect("finish copy_in")
+}
+
+async fn copy_in_payload_result(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    payload: &[u8],
+) -> Result<u64, tokio_postgres::Error> {
     let sink = client
         .copy_in::<_, Bytes>(sql)
         .await
@@ -160,7 +170,53 @@ async fn copy_in_payload(client: &tokio_postgres::Client, sql: &str, payload: &[
         .send(Bytes::from(payload.to_vec()))
         .await
         .expect("send CopyData");
-    sink.finish().await.expect("finish copy_in")
+    sink.finish().await
+}
+
+fn pg_binary_copy_header(out: &mut Vec<u8>) {
+    out.extend_from_slice(b"PGCOPY\n\xff\r\n\0");
+    out.extend_from_slice(&0_i32.to_be_bytes());
+    out.extend_from_slice(&0_i32.to_be_bytes());
+}
+
+fn pg_binary_copy_i16(out: &mut Vec<u8>, value: i16) {
+    out.extend_from_slice(&value.to_be_bytes());
+}
+
+fn pg_binary_copy_field(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(
+        &i32::try_from(bytes.len())
+            .expect("test binary COPY field fits i32")
+            .to_be_bytes(),
+    );
+    out.extend_from_slice(bytes);
+}
+
+fn binary_jsonb_copy_payload() -> Vec<u8> {
+    let mut out = Vec::new();
+    pg_binary_copy_header(&mut out);
+    pg_binary_copy_i16(&mut out, 2);
+    pg_binary_copy_field(&mut out, &1_i32.to_be_bytes());
+    let mut jsonb = vec![1_u8];
+    jsonb.extend_from_slice(br#"{"b":"x","a":1}"#);
+    pg_binary_copy_field(&mut out, &jsonb);
+    pg_binary_copy_i16(&mut out, -1);
+    out
+}
+
+fn first_binary_copy_jsonb_field(bytes: &[u8]) -> &[u8] {
+    let magic = b"PGCOPY\n\xff\r\n\0";
+    let mut pos = magic.len() + 8;
+    let field_count = i16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
+    assert_eq!(field_count, 2);
+    pos += 2;
+    let id_len = i32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]);
+    pos += 4 + usize::try_from(id_len).expect("id field length");
+    let jsonb_len =
+        i32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]);
+    pos += 4;
+    let len = usize::try_from(jsonb_len).expect("jsonb field length");
+    &bytes[pos..pos + len]
 }
 
 /// `COPY t FROM STDIN` over a populated relation lands every row.
@@ -179,6 +235,75 @@ async fn copy_from_stdin_text_lands_rows() {
 
     let n = select_count(&client, "copy_from_text").await;
     assert_eq!(n, 3, "COPY FROM STDIN must land every row");
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn copy_from_stdin_jsonb_rejects_invalid_json_text() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE copy_jsonb_invalid (id INT, doc JSONB)")
+        .await
+        .expect("create table");
+
+    let err = copy_in_payload_result(
+        &client,
+        "COPY copy_jsonb_invalid FROM STDIN",
+        b"1\t{not json}\n",
+    )
+    .await
+    .expect_err("invalid JSONB COPY row is rejected");
+    let db_error = err.as_db_error().expect("server returns db error");
+    assert!(
+        db_error.message().contains("invalid jsonb"),
+        "unexpected error: {db_error}"
+    );
+    assert_eq!(select_count(&client, "copy_jsonb_invalid").await, 0);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn copy_from_stdin_binary_jsonb_uses_pg_versioned_payload() {
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE copy_binary_jsonb (id INT, doc JSONB)")
+        .await
+        .expect("create table");
+
+    let rows_inserted = copy_in_payload(
+        &client,
+        "COPY copy_binary_jsonb FROM STDIN WITH (FORMAT binary)",
+        &binary_jsonb_copy_payload(),
+    )
+    .await;
+    assert_eq!(rows_inserted, 1);
+
+    let selected = client
+        .simple_query("SELECT id, doc FROM copy_binary_jsonb ORDER BY id")
+        .await
+        .expect("select copied jsonb");
+    let row = selected
+        .into_iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .expect("selected row");
+    assert_eq!(row.get(0), Some("1"));
+    assert_eq!(row.get(1), Some(r#"{"a":1,"b":"x"}"#));
+
+    let stream = client
+        .copy_out("COPY copy_binary_jsonb TO STDOUT WITH (FORMAT binary)")
+        .await
+        .expect("binary copy out");
+    let copied_out = collect_copy_out(stream).await;
+    let jsonb_field = first_binary_copy_jsonb_field(&copied_out);
+    assert_eq!(jsonb_field.first(), Some(&1_u8));
+    assert_eq!(&jsonb_field[1..], br#"{"a":1,"b":"x"}"#);
 
     shutdown(client, server_handle).await;
 }

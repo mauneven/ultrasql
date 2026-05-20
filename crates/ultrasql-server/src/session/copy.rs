@@ -50,6 +50,7 @@ use ultrasql_storage::heap::InsertOptions;
 use ultrasql_txn::{IsolationLevel, Transaction};
 
 use super::Session;
+use super::jsonb_ingest::{JsonbShapeCache, encode_pg_binary_jsonb};
 use crate::CombinedCatalog;
 use crate::copy::{
     CopyFormat as ServerCopyFormat, CopyOptions, copy_in_response_with_format,
@@ -455,14 +456,18 @@ where
                             start = end;
                             continue;
                         }
-                        let decoded = decode_one_copy_row(
-                            &buffer[start..end],
-                            entry,
-                            columns,
-                            schema,
-                            &codec,
-                            opts,
-                        );
+                        let decoded = {
+                            let mut jsonb_shape_cache = self.jsonb_shape_cache.borrow_mut();
+                            decode_one_copy_row(
+                                &buffer[start..end],
+                                entry,
+                                columns,
+                                schema,
+                                &codec,
+                                opts,
+                                &mut jsonb_shape_cache,
+                            )
+                        };
                         start = end;
                         match decoded {
                             Ok(payload) => payload_batch.push(payload),
@@ -529,7 +534,19 @@ where
         if received_done && !buffer.is_empty() {
             if header_skipped {
                 let line = std::mem::take(&mut buffer);
-                match decode_one_copy_row(&line, entry, columns, schema, &codec, opts) {
+                let decoded = {
+                    let mut jsonb_shape_cache = self.jsonb_shape_cache.borrow_mut();
+                    decode_one_copy_row(
+                        &line,
+                        entry,
+                        columns,
+                        schema,
+                        &codec,
+                        opts,
+                        &mut jsonb_shape_cache,
+                    )
+                };
+                match decoded {
                     Ok(payload) => payload_batch.push(payload),
                     Err(e) => {
                         if let Err(abort_err) = self.state.txn_manager.abort(txn) {
@@ -841,7 +858,19 @@ where
             if record.is_empty() {
                 continue;
             }
-            let payload = match decode_one_copy_row(&record, entry, columns, schema, codec, opts) {
+            let decoded = {
+                let mut jsonb_shape_cache = self.jsonb_shape_cache.borrow_mut();
+                decode_one_copy_row(
+                    &record,
+                    entry,
+                    columns,
+                    schema,
+                    codec,
+                    opts,
+                    &mut jsonb_shape_cache,
+                )
+            };
+            let payload = match decoded {
                 Ok(payload) => payload,
                 Err(err) => {
                     if let Some(state) = reject_state.as_deref_mut() {
@@ -881,31 +910,42 @@ where
                 }
             }
             if header_skipped && !record.is_empty() {
-                let payload =
-                    match decode_one_copy_row(&record, entry, columns, schema, codec, opts) {
-                        Ok(payload) => payload,
-                        Err(err) => {
-                            if let Some(state) = reject_state.as_deref_mut() {
-                                self.record_copy_reject(
-                                    state,
-                                    path,
-                                    record_start_line,
-                                    &record,
-                                    &err,
-                                    txn,
-                                )?;
-                                record.clear();
-                                return self.finish_copy_stream_batches(
-                                    entry,
-                                    payload_batch,
-                                    txn,
-                                    rows_inserted,
-                                    reject_state,
-                                );
-                            }
-                            return Err(err);
+                let decoded = {
+                    let mut jsonb_shape_cache = self.jsonb_shape_cache.borrow_mut();
+                    decode_one_copy_row(
+                        &record,
+                        entry,
+                        columns,
+                        schema,
+                        codec,
+                        opts,
+                        &mut jsonb_shape_cache,
+                    )
+                };
+                let payload = match decoded {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        if let Some(state) = reject_state.as_deref_mut() {
+                            self.record_copy_reject(
+                                state,
+                                path,
+                                record_start_line,
+                                &record,
+                                &err,
+                                txn,
+                            )?;
+                            record.clear();
+                            return self.finish_copy_stream_batches(
+                                entry,
+                                payload_batch,
+                                txn,
+                                rows_inserted,
+                                reject_state,
+                            );
                         }
-                    };
+                        return Err(err);
+                    }
+                };
                 payload_batch.push(payload);
             }
         }
@@ -944,7 +984,17 @@ where
         emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
         let codec = RowCodec::new(entry.schema.clone());
-        let payloads = decode_binary_copy_payload(bytes, entry, columns, schema, &codec)?;
+        let payloads = {
+            let mut jsonb_shape_cache = self.jsonb_shape_cache.borrow_mut();
+            decode_binary_copy_payload(
+                bytes,
+                entry,
+                columns,
+                schema,
+                &codec,
+                &mut jsonb_shape_cache,
+            )?
+        };
         let rows = u64::try_from(payloads.len()).unwrap_or(u64::MAX);
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         self.flush_copy_insert_batch(entry, &payloads, &txn)?;
@@ -1483,6 +1533,7 @@ fn binary_copy_cell_bytes(value: &Value, dtype: &DataType) -> Result<Vec<u8>, Se
         (DataType::Float64, Value::Float64(v)) => v.to_bits().to_be_bytes().to_vec(),
         (DataType::Date, Value::Date(v) | Value::Int32(v)) => v.to_be_bytes().to_vec(),
         (DataType::Text { .. }, Value::Text(v)) => v.as_bytes().to_vec(),
+        (DataType::Jsonb, Value::Jsonb(v)) => encode_pg_binary_jsonb(v),
         (DataType::Bytea, Value::Bytea(v)) => v.clone(),
         (_, other) => other.to_string().into_bytes(),
     };
@@ -1499,6 +1550,7 @@ fn decode_binary_copy_payload(
     columns: &[usize],
     schema: &Schema,
     codec: &RowCodec,
+    jsonb_shape_cache: &mut JsonbShapeCache,
 ) -> Result<Vec<Vec<u8>>, ServerError> {
     const MAGIC: &[u8] = b"PGCOPY\n\xff\r\n\0";
     if bytes.len() < MAGIC.len() + 8 || &bytes[..MAGIC.len()] != MAGIC {
@@ -1558,7 +1610,12 @@ fn decode_binary_copy_payload(
                 }
                 let target_idx = columns.get(stream_idx).copied().unwrap_or(stream_idx);
                 let dtype = &entry.schema.field_at(target_idx).data_type;
-                let value = decode_binary_copy_cell(&bytes[pos..end], dtype, stream_idx)?;
+                let value = decode_binary_copy_cell(
+                    &bytes[pos..end],
+                    dtype,
+                    stream_idx,
+                    jsonb_shape_cache,
+                )?;
                 pos = end;
                 value
             };
@@ -1603,6 +1660,7 @@ fn decode_binary_copy_cell(
     bytes: &[u8],
     dtype: &DataType,
     column_idx: usize,
+    jsonb_shape_cache: &mut JsonbShapeCache,
 ) -> Result<Value, ServerError> {
     let exact = |n: usize| {
         if bytes.len() == n {
@@ -1656,6 +1714,9 @@ fn decode_binary_copy_cell(
         DataType::Text { .. } => std::str::from_utf8(bytes)
             .map(|s| Value::Text(s.to_string()))
             .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}"))),
+        DataType::Jsonb => jsonb_shape_cache
+            .parse_pg_binary(bytes, column_idx)
+            .map(Value::Jsonb),
         DataType::Bytea => Ok(Value::Bytea(bytes.to_vec())),
         DataType::Uuid => {
             exact(16)?;
@@ -1664,7 +1725,7 @@ fn decode_binary_copy_cell(
             })?;
             Ok(Value::Uuid(raw))
         }
-        other => decode_copy_cell(Some(bytes), other, column_idx),
+        other => decode_copy_cell(Some(bytes), other, column_idx, jsonb_shape_cache),
     }
 }
 
@@ -1676,6 +1737,7 @@ fn decode_one_copy_row(
     schema: &Schema,
     codec: &RowCodec,
     opts: &CopyOptions,
+    jsonb_shape_cache: &mut JsonbShapeCache,
 ) -> Result<Vec<u8>, ServerError> {
     let raw_cells = match opts.format {
         ServerCopyFormat::Text => parse_text_row(line, opts)?,
@@ -1698,12 +1760,18 @@ fn decode_one_copy_row(
     if columns.is_empty() {
         for (col_idx, raw) in raw_cells.iter().enumerate() {
             let field = entry.schema.field_at(col_idx);
-            row[col_idx] = decode_copy_cell(raw.as_deref(), &field.data_type, col_idx)?;
+            row[col_idx] =
+                decode_copy_cell(raw.as_deref(), &field.data_type, col_idx, jsonb_shape_cache)?;
         }
     } else {
         for (stream_idx, (table_col_idx, raw)) in columns.iter().zip(raw_cells.iter()).enumerate() {
             let field = entry.schema.field_at(*table_col_idx);
-            row[*table_col_idx] = decode_copy_cell(raw.as_deref(), &field.data_type, stream_idx)?;
+            row[*table_col_idx] = decode_copy_cell(
+                raw.as_deref(),
+                &field.data_type,
+                stream_idx,
+                jsonb_shape_cache,
+            )?;
         }
     }
 
@@ -1774,6 +1842,7 @@ fn decode_copy_cell(
     raw: Option<&[u8]>,
     dtype: &DataType,
     column_idx: usize,
+    jsonb_shape_cache: &mut JsonbShapeCache,
 ) -> Result<Value, ServerError> {
     let Some(bytes) = raw else {
         return Ok(Value::Null);
@@ -1809,7 +1878,9 @@ fn decode_copy_cell(
         DataType::Timestamp => parse_copy_timestamp(s, column_idx).map(Value::Timestamp),
         DataType::TimestampTz => parse_copy_timestamp(s, column_idx).map(Value::TimestampTz),
         DataType::Text { .. } => Ok(Value::Text(s.to_string())),
-        DataType::Jsonb => Ok(Value::Jsonb(s.to_string())),
+        DataType::Jsonb => jsonb_shape_cache
+            .parse_text(bytes, column_idx)
+            .map(Value::Jsonb),
         DataType::Bytea => Ok(Value::Bytea(bytes.to_vec())),
         DataType::Uuid => Value::parse_uuid(s).map(Value::Uuid).ok_or_else(|| {
             ServerError::CopyFormat(format!("column {column_idx}: invalid uuid literal"))

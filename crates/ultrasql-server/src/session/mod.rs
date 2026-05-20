@@ -25,6 +25,7 @@ mod execute;
 mod explain;
 mod ext;
 mod io;
+mod jsonb_ingest;
 mod meta_stmt;
 mod notify;
 mod parquet_copy;
@@ -59,6 +60,13 @@ pub(crate) struct Session<RW> {
     /// cache without rippling `&mut self` across the session API.
     pub(super) stmt_cache:
         std::cell::RefCell<std::collections::HashMap<String, Arc<ultrasql_planner::LogicalPlan>>>,
+    /// Session-local JSONB shape cache used by COPY ingest.
+    ///
+    /// Repeated AI/event rows tend to share object keys and structural
+    /// layout. The cache records those shapes while the SIMD parser
+    /// validates bytes, giving the ingest path a stable hook for
+    /// shape-specific fast paths without weakening correctness.
+    pub(in crate::session) jsonb_shape_cache: std::cell::RefCell<jsonb_ingest::JsonbShapeCache>,
     /// Per-connection process id allocated at session construction.
     ///
     /// Used as the `pid` field in `BackendKeyData` and as the routing
@@ -126,6 +134,7 @@ where
             jit_above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
             notify_rx,
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
+            jsonb_shape_cache: std::cell::RefCell::new(jsonb_ingest::JsonbShapeCache::default()),
             pending_table_modifications: std::collections::HashMap::new(),
             sequence_state: crate::SequenceSessionState::default(),
             pending_post_commit_maintenance: false,

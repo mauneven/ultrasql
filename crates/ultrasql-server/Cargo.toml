@@ -44,6 +44,7 @@ arrow-ipc          = { workspace = true }
 arrow-schema       = { workspace = true }
 parquet            = { workspace = true }
 serde_json         = { workspace = true }
+simd-json          = { workspace = true }
 # Auth / crypto
 hmac               = { workspace = true }
 sha2               = { workspace = true }
