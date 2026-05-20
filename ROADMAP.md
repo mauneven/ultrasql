@@ -1656,8 +1656,18 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [ ] `BIT(n)` / `BIT VARYING(n)`
 - [ ] `INET`, `CIDR`, `MACADDR`, `MACADDR8`
 - [ ] `POINT`, `LINE`, `LSEG`, `BOX`, `PATH`, `POLYGON`, `CIRCLE`
-- [ ] `JSON`, `JSONB` — critical for modern apps
-- [ ] `int[]`, `text[]`, any type as array
+- [ ] `JSON`, `JSONB` — critical for modern apps. Native JSONB
+  runtime values, row-codec storage, `CREATE TABLE ... JSON/JSONB`,
+  JSONB wire OID, COPY rendering, and JSONB operator evaluation are
+  implemented. Distinct JSON-vs-JSONB storage, JSON normalization, and
+  the full JSON function suite remain open.
+- [ ] `int[]`, `text[]`, any type as array. Native array runtime
+  values, catalog/row-codec storage, `CREATE TABLE ... []`, GIN-facing
+  operators, `array_agg`, `array_length`, `array_cat`,
+  `array_to_string`, `string_to_array`, and wire-visible
+  `unnest(...)` are implemented for currently supported element
+  families. Multi-dimensional arrays, full PostgreSQL coercions, and
+  every element type remain open.
 - [ ] `int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`, `daterange`
 - [ ] `CREATE TYPE ... AS ENUM (...)`
 - [ ] `CREATE TYPE ... AS (composite)`
@@ -1673,7 +1683,9 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [ ] Aggregate: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG, JSON_AGG, PERCENTILE_CONT, STDDEV, VARIANCE, CORR
 - [ ] Window: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE
 - [ ] JSON: row_to_json, json_build_object, json_each, jsonb_set, jsonb_path_query
-- [ ] Array: array_length, array_cat, unnest, array_agg, array_to_string, string_to_array
+- [x] Array: array_length, array_cat, unnest, array_agg,
+  array_to_string, string_to_array — implemented for native arrays
+  over the current supported scalar element set.
 - [x] System: version(), current_database(), current_user/session_user
   (function-call and bare keyword forms), pg_typeof(), pg_size_pretty()
   and catalog-backed pg_relation_size() are wired.
