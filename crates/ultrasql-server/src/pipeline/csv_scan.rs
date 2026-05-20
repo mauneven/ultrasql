@@ -3,12 +3,12 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use ultrasql_core::csv::{
-    CsvParseOptions, CsvSniff, expand_csv_path_specs, expand_csv_paths,
-    parse_csv_records_with_options, sniff_csv_path, sniff_csv_text,
+    CsvInferredType, CsvParseOptions, CsvSniff, CsvSniffColumn, expand_csv_path_specs,
+    expand_csv_paths, parse_csv_records_with_options, sniff_csv_path, sniff_csv_text,
 };
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_executor::{ExecError, Operator};
@@ -37,61 +37,43 @@ impl CsvTableScan {
     pub(super) fn from_pattern(pattern: &str) -> Result<Self, ServerError> {
         let paths = expand_csv_paths(pattern)
             .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
-        Self::from_paths(paths, None, None)
+        Self::from_paths(paths, None, None, None)
     }
 
-    /// Load CSV files from one or more path/glob specs into a query-local scan.
-    pub(super) fn from_path_specs(patterns: &[String]) -> Result<Self, ServerError> {
-        Self::from_path_specs_with_projection_and_filter(patterns, None, None)
-    }
-
-    /// Load CSV files and emit only the requested column names.
-    pub(super) fn from_path_specs_with_projection(
-        patterns: &[String],
-        projection: Option<&[String]>,
-    ) -> Result<Self, ServerError> {
-        Self::from_path_specs_with_projection_and_filter(patterns, projection, None)
-    }
-
-    /// Load CSV files and apply a simple predicate while streaming rows.
-    pub(super) fn from_path_specs_with_filter(
-        patterns: &[String],
-        predicate: Option<&CsvPredicate>,
-    ) -> Result<Self, ServerError> {
-        Self::from_path_specs_with_projection_and_filter(patterns, None, predicate)
-    }
-
-    fn from_path_specs_with_projection_and_filter(
+    /// Load CSV files with optional projection, predicate, and reject artifact.
+    pub(super) fn from_path_specs_with_options(
         patterns: &[String],
         projection: Option<&[String]>,
         predicate: Option<&CsvPredicate>,
+        reject_path: Option<&Path>,
     ) -> Result<Self, ServerError> {
         if path_specs_use_object_store("read_csv", patterns)? {
-            return Self::from_object_specs(patterns, projection, predicate);
+            return Self::from_object_specs(patterns, projection, predicate, reject_path);
         }
         if let [pattern] = patterns {
-            if projection.is_none() && predicate.is_none() {
+            if projection.is_none() && predicate.is_none() && reject_path.is_none() {
                 return Self::from_pattern(pattern);
             }
             let paths = expand_csv_paths(pattern)
                 .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
-            return Self::from_paths(paths, projection, predicate);
+            return Self::from_paths(paths, projection, predicate, reject_path);
         }
         let paths = expand_csv_path_specs(patterns)
             .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
-        Self::from_paths(paths, projection, predicate)
+        Self::from_paths(paths, projection, predicate, reject_path)
     }
 
     fn from_paths(
         paths: Vec<PathBuf>,
         requested: Option<&[String]>,
         predicate: Option<&CsvPredicate>,
+        reject_path: Option<&Path>,
     ) -> Result<Self, ServerError> {
         let mut expected_header: Option<Vec<String>> = None;
         let mut readers = VecDeque::new();
 
         for path in paths {
-            let (header, reader) = CsvReaderState::from_path(&path)?;
+            let (header, reader) = CsvReaderState::from_path(&path, reject_path.is_some())?;
             validate_header(&header, &path)?;
             if let Some(expected) = &expected_header {
                 if &header != expected {
@@ -120,7 +102,7 @@ impl CsvTableScan {
             schema,
             projection,
             predicate,
-            stream: CsvStream::new(readers),
+            stream: CsvStream::new(readers, reject_path)?,
         })
     }
 
@@ -128,6 +110,7 @@ impl CsvTableScan {
         patterns: &[String],
         requested: Option<&[String]>,
         predicate: Option<&CsvPredicate>,
+        reject_path: Option<&Path>,
     ) -> Result<Self, ServerError> {
         let objects = expand_object_store_specs(patterns)
             .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
@@ -141,7 +124,8 @@ impl CsvTableScan {
             let text = String::from_utf8(bytes).map_err(|err| {
                 ServerError::CopyFormat(format!("read_csv cannot decode {display}: {err}"))
             })?;
-            let (header, reader) = CsvReaderState::from_text(display.clone(), text)?;
+            let (header, reader) =
+                CsvReaderState::from_text(display.clone(), text, reject_path.is_some())?;
             validate_object_header(&header, &display)?;
             if let Some(expected) = &expected_header {
                 if &header != expected {
@@ -169,7 +153,7 @@ impl CsvTableScan {
             schema,
             projection,
             predicate,
-            stream: CsvStream::new(readers),
+            stream: CsvStream::new(readers, reject_path)?,
         })
     }
 }
@@ -201,31 +185,89 @@ impl Operator for CsvTableScan {
 #[derive(Debug)]
 struct CsvStream {
     readers: VecDeque<CsvReaderState>,
+    rejects: Option<CsvRejectSink>,
 }
 
 impl CsvStream {
-    fn new(readers: VecDeque<CsvReaderState>) -> Self {
-        Self { readers }
+    fn new(
+        readers: VecDeque<CsvReaderState>,
+        reject_path: Option<&Path>,
+    ) -> Result<Self, ServerError> {
+        Ok(Self {
+            readers,
+            rejects: reject_path.map(CsvRejectSink::create).transpose()?,
+        })
     }
 
     fn next_row(
         &mut self,
         predicate: Option<&CsvPredicateEval>,
     ) -> Result<Option<CsvOutputRow>, ExecError> {
+        let Self { readers, rejects } = self;
         loop {
-            let Some(reader) = self.readers.front_mut() else {
+            let Some(reader) = readers.front_mut() else {
                 return Ok(None);
             };
-            match reader.next_row().map_err(ExecError::TypeMismatch)? {
+            match reader
+                .next_row(rejects.as_mut())
+                .map_err(ExecError::TypeMismatch)?
+            {
                 Some(row) if predicate.is_none_or(|predicate| predicate.matches(&row)) => {
                     return Ok(Some(row));
                 }
                 Some(_) => {}
                 None => {
-                    self.readers.pop_front();
+                    readers.pop_front();
                 }
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct CsvRejectSink {
+    writer: BufWriter<File>,
+}
+
+impl CsvRejectSink {
+    fn create(path: &Path) -> Result<Self, ServerError> {
+        let file = File::create(path).map_err(|err| {
+            ServerError::CopyFormat(format!(
+                "read_csv cannot create reject artifact {}: {err}",
+                path.display()
+            ))
+        })?;
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(b"filename,row_number,error,raw_row\n")
+            .map_err(|err| {
+                ServerError::CopyFormat(format!(
+                    "read_csv cannot write reject artifact {}: {err}",
+                    path.display()
+                ))
+            })?;
+        Ok(Self { writer })
+    }
+
+    fn write_reject(
+        &mut self,
+        filename: &str,
+        row_number: i64,
+        error: &str,
+        raw_row: &str,
+    ) -> Result<(), String> {
+        let raw_row = raw_row.trim_end_matches(['\r', '\n']);
+        let line = format!(
+            "{},{},{},{}\n",
+            csv_escape_reject_field(filename),
+            row_number,
+            csv_escape_reject_field(error),
+            csv_escape_reject_field(raw_row)
+        );
+        self.writer
+            .write_all(line.as_bytes())
+            .and_then(|()| self.writer.flush())
+            .map_err(|err| format!("read_csv cannot write reject artifact: {err}"))
     }
 }
 
@@ -485,11 +527,10 @@ struct CsvReaderState {
 }
 
 impl CsvReaderState {
-    fn from_path(path: &Path) -> Result<(Vec<String>, Self), ServerError> {
+    fn from_path(path: &Path, allow_rejects: bool) -> Result<(Vec<String>, Self), ServerError> {
         let display = path.display().to_string();
         let sample = read_csv_sample_from_path(path)?;
-        let sniff = sniff_csv_text(&display, &sample)
-            .map_err(|err| ServerError::CopyFormat(format!("read_csv sniff {display}: {err}")))?;
+        let sniff = sniff_csv_text_for_read_csv(&display, &sample, allow_rejects)?;
         let header = sniff_header(&sniff);
         let file = File::open(path).map_err(|err| {
             ServerError::CopyFormat(format!("read_csv cannot open {}: {err}", path.display()))
@@ -511,10 +552,13 @@ impl CsvReaderState {
         Ok((header, state))
     }
 
-    fn from_text(display: String, text: String) -> Result<(Vec<String>, Self), ServerError> {
+    fn from_text(
+        display: String,
+        text: String,
+        allow_rejects: bool,
+    ) -> Result<(Vec<String>, Self), ServerError> {
         let sample = csv_sample_from_text(&text);
-        let sniff = sniff_csv_text(&display, sample)
-            .map_err(|err| ServerError::CopyFormat(format!("read_csv sniff {display}: {err}")))?;
+        let sniff = sniff_csv_text_for_read_csv(&display, sample, allow_rejects)?;
         let header = sniff_header(&sniff);
         let reader = CsvRecordReader::new(
             display.clone(),
@@ -534,13 +578,17 @@ impl CsvReaderState {
     }
 
     fn skip_header(&mut self, expected: &[String]) -> Result<(), ServerError> {
-        let Some(record) = self.reader.next_record().map_err(ServerError::CopyFormat)? else {
+        let Some(record) = self
+            .reader
+            .next_record()
+            .map_err(|err| ServerError::CopyFormat(err.message))?
+        else {
             return Err(ServerError::CopyFormat(format!(
                 "read_csv header missing in {}",
                 self.display
             )));
         };
-        if record != expected {
+        if record.values != expected {
             return Err(ServerError::CopyFormat(format!(
                 "read_csv header mismatch in {}",
                 self.display
@@ -549,29 +597,65 @@ impl CsvReaderState {
         Ok(())
     }
 
-    fn next_row(&mut self) -> Result<Option<CsvOutputRow>, String> {
-        let Some(values) = self.reader.next_record()? else {
-            return Ok(None);
-        };
+    fn next_row(
+        &mut self,
+        mut rejects: Option<&mut CsvRejectSink>,
+    ) -> Result<Option<CsvOutputRow>, String> {
+        loop {
+            let record = match self.reader.next_record() {
+                Ok(Some(record)) => record,
+                Ok(None) => return Ok(None),
+                Err(err) => {
+                    let row_number = self.next_physical_row_number()?;
+                    if let Some(rejects) = rejects.as_deref_mut() {
+                        rejects.write_reject(&self.display, row_number, &err.message, &err.raw)?;
+                        continue;
+                    }
+                    return Err(err.message);
+                }
+            };
+            let row_number = self.next_physical_row_number()?;
+            if record.values.len() != self.width {
+                let message = format!(
+                    "read_csv row {row_number} in {} has {} columns, expected {}",
+                    self.display,
+                    record.values.len(),
+                    self.width
+                );
+                if let Some(rejects) = rejects.as_deref_mut() {
+                    rejects.write_reject(&self.display, row_number, &message, &record.raw)?;
+                    continue;
+                }
+                return Err(message);
+            }
+            return Ok(Some(CsvOutputRow {
+                values: record.values,
+                filename: self.display.clone(),
+                row_number,
+            }));
+        }
+    }
+
+    fn next_physical_row_number(&mut self) -> Result<i64, String> {
         let row_number = self
             .row_number
             .checked_add(1)
             .ok_or_else(|| format!("read_csv row number overflow in {}", self.display))?;
-        if values.len() != self.width {
-            return Err(format!(
-                "read_csv row {row_number} in {} has {} columns, expected {}",
-                self.display,
-                values.len(),
-                self.width
-            ));
-        }
         self.row_number = row_number;
-        Ok(Some(CsvOutputRow {
-            values,
-            filename: self.display.clone(),
-            row_number,
-        }))
+        Ok(row_number)
     }
+}
+
+#[derive(Debug)]
+struct CsvRecord {
+    values: Vec<String>,
+    raw: String,
+}
+
+#[derive(Debug)]
+struct CsvRowError {
+    message: String,
+    raw: String,
 }
 
 #[derive(Debug)]
@@ -590,29 +674,56 @@ impl CsvRecordReader {
         }
     }
 
-    fn next_record(&mut self) -> Result<Option<Vec<String>>, String> {
+    fn next_record(&mut self) -> Result<Option<CsvRecord>, CsvRowError> {
         let mut buffer = String::new();
         loop {
             let mut line = String::new();
             let bytes = self
                 .source
                 .read_line(&mut line)
-                .map_err(|err| format!("read_csv cannot read {}: {err}", self.display))?;
+                .map_err(|err| CsvRowError {
+                    message: format!("read_csv cannot read {}: {err}", self.display),
+                    raw: buffer.clone(),
+                })?;
             if bytes == 0 {
                 if buffer.is_empty() {
                     return Ok(None);
                 }
-                return self.parse_complete_record(&buffer);
+                return self.parse_buffer(buffer);
             }
             buffer.push_str(&line);
             match self.parse_complete_record(&buffer) {
-                Ok(Some(record)) => return Ok(Some(record)),
+                Ok(Some(values)) => {
+                    return Ok(Some(CsvRecord {
+                        values,
+                        raw: buffer,
+                    }));
+                }
                 Ok(None) => {
                     buffer.clear();
                 }
                 Err(err) if err.contains("unterminated quoted field") => {}
-                Err(err) => return Err(err),
+                Err(message) => {
+                    return Err(CsvRowError {
+                        message,
+                        raw: buffer,
+                    });
+                }
             }
+        }
+    }
+
+    fn parse_buffer(&self, buffer: String) -> Result<Option<CsvRecord>, CsvRowError> {
+        match self.parse_complete_record(&buffer) {
+            Ok(Some(values)) => Ok(Some(CsvRecord {
+                values,
+                raw: buffer,
+            })),
+            Ok(None) => Ok(None),
+            Err(message) => Err(CsvRowError {
+                message,
+                raw: buffer,
+            }),
         }
     }
 
@@ -643,6 +754,25 @@ impl CsvRecordSource {
             Self::Memory(reader) => reader.read_line(buffer),
         }
     }
+}
+
+fn csv_escape_reject_field(value: &str) -> String {
+    if !value
+        .chars()
+        .any(|ch| matches!(ch, ',' | '"' | '\n' | '\r'))
+    {
+        return value.to_owned();
+    }
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    for ch in value.chars() {
+        if ch == '"' {
+            escaped.push('"');
+        }
+        escaped.push(ch);
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn csv_batch_from_buffers(buffers: Vec<CsvColumnBuffer>) -> Result<Batch, ExecError> {
@@ -759,6 +889,95 @@ fn sniff_header(sniff: &CsvSniff) -> Vec<String> {
         .iter()
         .map(|column| column.name.clone())
         .collect()
+}
+
+fn sniff_csv_text_for_read_csv(
+    display: &str,
+    sample: &str,
+    allow_rejects: bool,
+) -> Result<CsvSniff, ServerError> {
+    match sniff_csv_text(display, sample) {
+        Ok(sniff) => Ok(sniff),
+        Err(err) if allow_rejects => sniff_csv_header_only(display, sample).map_err(|fallback| {
+            ServerError::CopyFormat(format!(
+                "read_csv sniff {display}: {err}; header fallback failed: {fallback}"
+            ))
+        }),
+        Err(err) => Err(ServerError::CopyFormat(format!(
+            "read_csv sniff {display}: {err}"
+        ))),
+    }
+}
+
+fn sniff_csv_header_only(display: &str, sample: &str) -> Result<CsvSniff, String> {
+    let mut best: Option<(CsvParseOptions, Vec<String>)> = None;
+    let mut last_error: Option<String> = None;
+    for delimiter in [',', ';', '\t', '|'] {
+        let options = CsvParseOptions {
+            delimiter,
+            quote: Some('"'),
+            escape: Some('"'),
+        };
+        match first_csv_record_with_options(display, sample, options) {
+            Ok(record)
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, best)| record.len() > best.len()) =>
+            {
+                best = Some((options, record));
+            }
+            Ok(_) => {}
+            Err(err) => last_error = Some(err),
+        }
+    }
+    let Some((options, header)) = best else {
+        return Err(last_error.unwrap_or_else(|| "read_csv header missing".to_owned()));
+    };
+    if header.is_empty() || header.iter().any(String::is_empty) {
+        return Err("read_csv header contains an empty column name".to_owned());
+    }
+    let columns = header
+        .into_iter()
+        .map(|name| CsvSniffColumn {
+            name,
+            data_type: CsvInferredType::Text,
+        })
+        .collect();
+    Ok(CsvSniff {
+        path: display.to_owned(),
+        delimiter: options.delimiter,
+        quote: options.quote,
+        escape: options.escape,
+        newline: detect_sample_newline(sample).to_owned(),
+        has_header: true,
+        columns,
+    })
+}
+
+fn first_csv_record_with_options(
+    display: &str,
+    sample: &str,
+    options: CsvParseOptions,
+) -> Result<Vec<String>, String> {
+    let mut reader = CsvRecordReader::new(
+        display.to_owned(),
+        CsvRecordSource::Memory(BufReader::new(Cursor::new(sample.as_bytes().to_vec()))),
+        options,
+    );
+    let Some(record) = reader.next_record().map_err(|err| err.message)? else {
+        return Err("read_csv header missing".to_owned());
+    };
+    Ok(record.values)
+}
+
+fn detect_sample_newline(sample: &str) -> &'static str {
+    if sample.contains("\r\n") {
+        "\\r\\n"
+    } else if sample.contains('\r') {
+        "\\r"
+    } else {
+        "\\n"
+    }
 }
 
 fn read_csv_sample_from_path(path: &Path) -> Result<String, ServerError> {

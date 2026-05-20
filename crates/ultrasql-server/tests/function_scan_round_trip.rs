@@ -872,6 +872,57 @@ async fn read_csv_array_reads_files_in_argument_order_with_virtual_columns() {
 }
 
 #[tokio::test]
+async fn read_csv_reject_path_quarantines_bad_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv_path = dir.path().join("people.csv");
+    let rejects_path = dir.path().join("people.rejects.csv");
+    fs::write(&csv_path, "id,name\n1,Ada\n2\n3,Grace\n").expect("write csv");
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT id, name, _row_number FROM read_csv({}, {}) ORDER BY id",
+        sql_string(csv_path.to_str().expect("utf8 csv path")),
+        sql_string(rejects_path.to_str().expect("utf8 rejects path")),
+    );
+
+    let rows = client
+        .query(&sql, &[])
+        .await
+        .expect("read_csv with reject path");
+    let values: Vec<(String, String, i64)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, i64>(2),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            ("1".to_string(), "Ada".to_string(), 1),
+            ("3".to_string(), "Grace".to_string(), 3),
+        ]
+    );
+
+    let reject_csv = fs::read_to_string(&rejects_path).expect("reject artifact");
+    assert!(
+        reject_csv.contains("filename,row_number,error,raw_row"),
+        "reject artifact missing header: {reject_csv}"
+    );
+    assert!(
+        reject_csv.contains(",2,")
+            && reject_csv.contains("has 1 columns, expected 2")
+            && reject_csv.contains(",2\n"),
+        "reject artifact missing quarantined row: {reject_csv}"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn read_parquet_single_file_projects_and_filters() {
     let dir = tempfile::tempdir().expect("tempdir");
     let parquet_path = dir.path().join("people.parquet");

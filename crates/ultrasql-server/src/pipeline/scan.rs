@@ -17,7 +17,7 @@ use super::catalog_views::try_virtual_catalog_scan;
 use super::csv_scan::{CsvPredicate, CsvSniffScan, CsvTableScan};
 use super::external_scan::{
     is_external_table_function, lower_external_parquet_scan, lower_external_table_scan,
-    read_external_path_specs,
+    read_csv_external_args, read_external_path_specs,
 };
 use super::json_table_scan::lower_json_table_scan;
 use super::parquet_scan::ParquetPredicate;
@@ -252,10 +252,13 @@ pub(super) fn try_lower_read_csv_project(
     if name != "read_csv" {
         return Ok(None);
     }
-    let path_specs = read_external_path_specs("read_csv", args)?;
-    Ok(Some(Box::new(
-        CsvTableScan::from_path_specs_with_projection(&path_specs, Some(&projection))?,
-    )))
+    let csv_args = read_csv_external_args(args)?;
+    Ok(Some(Box::new(CsvTableScan::from_path_specs_with_options(
+        &csv_args.path_specs,
+        Some(&projection),
+        None,
+        csv_args.reject_path.as_deref(),
+    )?)))
 }
 
 /// Lower `Filter(read_csv(...))` with CSV predicate pushdown when the
@@ -273,10 +276,12 @@ pub(super) fn try_lower_read_csv_filter(
     let Some(predicate) = CsvPredicate::from_scalar(predicate) else {
         return Ok(None);
     };
-    let path_specs = read_external_path_specs("read_csv", args)?;
-    Ok(Some(Box::new(CsvTableScan::from_path_specs_with_filter(
-        &path_specs,
+    let csv_args = read_csv_external_args(args)?;
+    Ok(Some(Box::new(CsvTableScan::from_path_specs_with_options(
+        &csv_args.path_specs,
+        None,
         Some(&predicate),
+        csv_args.reject_path.as_deref(),
     )?)))
 }
 

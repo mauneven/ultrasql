@@ -77,7 +77,36 @@ pub(super) fn read_external_path_specs(
             "{function_name}: expected one path, glob, or path-list argument"
         )));
     }
-    let value = Eval::new(args[0].clone()).eval(&[]).map_err(|err| {
+    read_external_path_arg(function_name, &args[0])
+}
+
+#[derive(Debug)]
+pub(super) struct CsvExternalArgs {
+    pub(super) path_specs: Vec<String>,
+    pub(super) reject_path: Option<PathBuf>,
+}
+
+/// Evaluate `read_csv` arguments, including the optional reject artifact path.
+pub(super) fn read_csv_external_args(args: &[ScalarExpr]) -> Result<CsvExternalArgs, ServerError> {
+    if !matches!(args.len(), 1 | 2) {
+        return Err(ServerError::CopyFormat(
+            "read_csv: expected path, glob, or path-list argument plus optional reject path"
+                .to_owned(),
+        ));
+    }
+    let path_specs = read_external_path_arg("read_csv", &args[0])?;
+    let reject_path = args.get(1).map(read_csv_reject_path_arg).transpose()?;
+    Ok(CsvExternalArgs {
+        path_specs,
+        reject_path,
+    })
+}
+
+fn read_external_path_arg(
+    function_name: &str,
+    arg: &ScalarExpr,
+) -> Result<Vec<String>, ServerError> {
+    let value = Eval::new(arg.clone()).eval(&[]).map_err(|err| {
         ServerError::Ddl(format!("{function_name} argument evaluation failed: {err}"))
     })?;
     match value {
@@ -98,6 +127,28 @@ pub(super) fn read_external_path_specs(
             "{function_name}: argument must be a string literal or text array literal"
         ))),
     }
+}
+
+fn read_csv_reject_path_arg(arg: &ScalarExpr) -> Result<PathBuf, ServerError> {
+    let value = Eval::new(arg.clone()).eval(&[]).map_err(|err| {
+        ServerError::Ddl(format!("read_csv reject path evaluation failed: {err}"))
+    })?;
+    let Value::Text(path) = value else {
+        return Err(ServerError::CopyFormat(
+            "read_csv: reject path must be a string literal".to_owned(),
+        ));
+    };
+    if path.is_empty() {
+        return Err(ServerError::CopyFormat(
+            "read_csv: reject path must not be empty".to_owned(),
+        ));
+    }
+    if is_object_store_uri(&path) {
+        return Err(ServerError::CopyFormat(
+            "read_csv: reject path must be a local file path".to_owned(),
+        ));
+    }
+    Ok(PathBuf::from(path))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,8 +220,13 @@ impl ExternalTableScan {
     }
 
     fn from_csv(args: &[ScalarExpr]) -> Result<Self, ServerError> {
-        let path_specs = read_external_path_specs("read_csv", args)?;
-        let scan = CsvTableScan::from_path_specs(&path_specs)?;
+        let csv_args = read_csv_external_args(args)?;
+        let scan = CsvTableScan::from_path_specs_with_options(
+            &csv_args.path_specs,
+            None,
+            None,
+            csv_args.reject_path.as_deref(),
+        )?;
         Ok(Self::streaming(Box::new(scan)))
     }
 
