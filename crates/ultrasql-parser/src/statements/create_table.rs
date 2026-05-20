@@ -13,7 +13,8 @@
 
 use crate::ast::{
     BinaryOp, ColumnConstraint, ColumnDef, CreateTableAsStmt, CreateTableStmt, ExclusionElement,
-    Identifier, ObjectName, ReferentialAction, TableConstraint, TypeName,
+    Identifier, ObjectName, ReferentialAction, TableConstraint, TablePartitionKind,
+    TablePartitionSpec, TypeName,
 };
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
@@ -63,6 +64,8 @@ impl Parser<'_> {
         self.expect(TokenKind::LParen, "(")?;
         let (columns, table_constraints) = self.parse_column_and_constraint_list()?;
         let rp = self.expect(TokenKind::RParen, ")")?;
+        let partition_by = self.parse_optional_table_partition()?;
+        let end = partition_by.as_ref().map_or(rp.span.end, |p| p.span.end);
 
         Ok(crate::ast::Statement::CreateTable(Box::new(
             CreateTableStmt {
@@ -70,9 +73,35 @@ impl Parser<'_> {
                 name,
                 columns,
                 table_constraints,
-                span: Span::new(create_start, rp.span.end),
+                partition_by,
+                span: Span::new(create_start, end),
             },
         )))
+    }
+
+    fn parse_optional_table_partition(&mut self) -> Result<Option<TablePartitionSpec>, ParseError> {
+        if self.peek()?.kind != TokenKind::KwPartition {
+            return Ok(None);
+        }
+        let start = self.advance()?.span.start;
+        self.expect(TokenKind::KwBy, "BY")?;
+        let strategy = self.advance()?;
+        let strategy_text = strategy.text(self.source).unwrap_or("");
+        if !strategy_text.eq_ignore_ascii_case("range") {
+            return Err(ParseError::Expected {
+                expected: "RANGE",
+                found: strategy.kind,
+                offset: strategy.span.start as usize,
+            });
+        }
+        self.expect(TokenKind::LParen, "(")?;
+        let column = self.parse_identifier()?;
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        Ok(Some(TablePartitionSpec {
+            kind: TablePartitionKind::Range,
+            column,
+            span: Span::new(start, rp.span.end),
+        }))
     }
 
     /// Parse `IF NOT EXISTS` as three tokens.  Returns `true` if found.
@@ -749,6 +778,16 @@ mod tests {
         assert_eq!(stmt.columns[0].data_type.name.value, "vector");
         assert_eq!(stmt.columns[0].data_type.type_modifiers, vec![3]);
         assert!(!stmt.columns[0].data_type.is_array);
+    }
+
+    #[test]
+    fn create_table_parses_range_partition_clause() {
+        let stmt = parse_create_table(
+            "CREATE TABLE metrics (ts TIMESTAMP NOT NULL, v INT) PARTITION BY RANGE (ts)",
+        );
+        let partition = stmt.partition_by.expect("partition spec");
+        assert_eq!(partition.kind, TablePartitionKind::Range);
+        assert_eq!(partition.column.value, "ts");
     }
 
     #[test]

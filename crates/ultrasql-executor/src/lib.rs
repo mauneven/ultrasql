@@ -116,7 +116,7 @@ pub use cte_scan::CteScan;
 pub use direct_scalar_agg::{DirectScalarAggKind, DirectScalarAggScan};
 pub use eval::{Eval, EvalError};
 pub use filter::FilterEqI32;
-pub use filter_op::Filter;
+pub use filter_op::{Filter, batch_to_rows};
 pub use function_scan::FunctionScan;
 pub use gather::{Gather, GatherMerge};
 pub use hash_aggregate::HashAggregate;

@@ -352,6 +352,22 @@ fn binds_create_table_resolves_basic_column_types() {
 }
 
 #[test]
+fn binds_create_table_range_partition_column() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "CREATE TABLE metrics (ts TIMESTAMP NOT NULL, v INT) PARTITION BY RANGE (ts)",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateTable { partition, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    let partition = partition.expect("time partition spec");
+    assert_eq!(partition.column, "ts");
+    assert_eq!(partition.column_index, 0);
+}
+
+#[test]
 fn binds_create_table_with_varchar_modifier() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind("CREATE TABLE t (s VARCHAR(255))", &cat).expect("bind ok");

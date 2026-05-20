@@ -52,7 +52,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ultrasql_catalog::CatalogSnapshot;
+use ultrasql_catalog::{CatalogSnapshot, persistent::PersistentCatalog};
 use ultrasql_core::{CommandId, Schema, Xid};
 use ultrasql_executor::physical::{BuildError, DataSource};
 use ultrasql_mvcc::Snapshot;
@@ -101,6 +101,7 @@ mod lower_simple;
 mod modify;
 mod parquet_scan;
 mod scan;
+mod time_partition;
 mod tpch_q1;
 mod tpch_q10;
 mod tpch_q11;
@@ -210,6 +211,12 @@ pub struct LowerCtx<'a> {
         Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<crate::TableRuntimeConstraints>>>,
     /// Runtime sequence registry keyed by folded sequence name.
     pub sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
+    /// Mutable persistent catalog used by operators that auto-create
+    /// physical children, such as time-series chunks.
+    pub persistent_catalog: Arc<PersistentCatalog>,
+    /// Runtime time-range partition registry keyed by parent table name.
+    pub time_partitions:
+        Arc<dashmap::DashMap<String, Arc<crate::time_partition::TimePartitionRuntime>>>,
     /// Session-local sequence observer for defaults that call `nextval`.
     pub sequence_state: Option<crate::SequenceSessionState>,
     /// Shared heap access handle.

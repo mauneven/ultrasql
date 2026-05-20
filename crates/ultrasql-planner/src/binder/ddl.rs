@@ -26,7 +26,7 @@ use crate::plan::{
     CopyDirection, CopyFormat, CopySource, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalExclusionConstraint, LogicalExclusionElement, LogicalForeignKeyConstraint,
     LogicalIndexMethod, LogicalIndexOption, LogicalReferentialAction, LogicalSequenceChange,
-    LogicalSequenceOptions, LogicalUniqueConstraint,
+    LogicalSequenceOptions, LogicalTimePartition, LogicalUniqueConstraint,
 };
 
 struct RawUniqueConstraint {
@@ -271,6 +271,7 @@ pub(super) fn bind_create_table(
     let unique_constraints = bind_unique_constraints(&columns, raw_uniques)?;
     let foreign_keys = bind_foreign_key_constraints(&columns, raw_foreign_keys, catalog)?;
     let exclusion_constraints = bind_exclusion_constraints(&columns, raw_exclusions)?;
+    let partition = bind_time_partition(&columns, s.partition_by.as_ref())?;
     Ok(LogicalPlan::CreateTable {
         table_name,
         namespace,
@@ -284,9 +285,33 @@ pub(super) fn bind_create_table(
         unique_constraints,
         foreign_keys,
         exclusion_constraints,
+        partition,
         if_not_exists: s.if_not_exists,
         schema: Schema::empty(),
     })
+}
+
+fn bind_time_partition(
+    columns: &Schema,
+    spec: Option<&ultrasql_parser::ast::TablePartitionSpec>,
+) -> Result<Option<LogicalTimePartition>, PlanError> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let column = spec.column.value.clone();
+    let (column_index, field) = columns
+        .find(&column)
+        .ok_or_else(|| PlanError::ColumnNotFound(column.clone()))?;
+    if !matches!(field.data_type, DataType::Timestamp | DataType::TimestampTz) {
+        return Err(PlanError::TypeMismatch(format!(
+            "PARTITION BY RANGE column '{}' must be TIMESTAMP or TIMESTAMPTZ",
+            field.name
+        )));
+    }
+    Ok(Some(LogicalTimePartition {
+        column: field.name.clone(),
+        column_index,
+    }))
 }
 
 fn column_default(constraints: &[ColumnConstraint]) -> Result<Option<&Expr>, PlanError> {

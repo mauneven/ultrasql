@@ -54,6 +54,7 @@ pub mod pipeline;
 mod projection_summary;
 pub mod replication;
 pub mod result_encoder;
+pub mod time_partition;
 pub mod tls;
 pub mod wal_sink;
 pub mod wire_writer;
@@ -803,6 +804,8 @@ pub struct Server {
     pub sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
     /// Same-process append-only materialized-view registry keyed by view name.
     pub materialized_views: Arc<dashmap::DashMap<String, Arc<MaterializedViewRuntime>>>,
+    /// Same-process time-range partition registry keyed by parent table name.
+    pub time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
     /// Accumulated tuple modifications since the last analyze pass,
     /// keyed by folded table name.
     pub table_modifications: dashmap::DashMap<String, u64>,
@@ -1519,6 +1522,8 @@ impl Server {
             catalog_snapshot,
             table_constraints: Arc::clone(&self.table_constraints),
             sequences: Arc::clone(&self.sequences),
+            persistent_catalog: Arc::clone(&self.persistent_catalog),
+            time_partitions: Arc::clone(&self.time_partitions),
             sequence_state: Some(SequenceSessionState::default()),
             heap: Arc::clone(&self.heap),
             vm: Arc::clone(&self.vm),
@@ -1621,6 +1626,7 @@ impl Server {
             table_constraints: Arc::new(dashmap::DashMap::new()),
             sequences: Arc::new(dashmap::DashMap::new()),
             materialized_views: Arc::new(dashmap::DashMap::new()),
+            time_partitions: Arc::new(dashmap::DashMap::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,
@@ -1980,6 +1986,7 @@ impl Server {
             table_constraints: Arc::new(dashmap::DashMap::new()),
             sequences,
             materialized_views: Arc::new(dashmap::DashMap::new()),
+            time_partitions: Arc::new(dashmap::DashMap::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,
@@ -2450,6 +2457,8 @@ fn run_plan_in_txn(
     catalog_snapshot: Arc<CatalogSnapshot>,
     table_constraints: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
     sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
+    persistent_catalog: Arc<PersistentCatalog>,
+    time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
     sequence_state: Option<SequenceSessionState>,
     tables: &SampleTables,
     heap: Arc<HeapAccess<BlankPageLoader>>,
@@ -2478,6 +2487,8 @@ fn run_plan_in_txn(
         catalog_snapshot,
         table_constraints,
         sequences,
+        persistent_catalog,
+        time_partitions,
         sequence_state,
         heap,
         vm,

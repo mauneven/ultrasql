@@ -60,6 +60,51 @@ pub(super) fn lower_real_insert(
         })?;
     let insert_columns =
         resolve_insert_columns(columns, source.schema().len(), entry.schema.len())?;
+    if let Some(partition) = ctx.time_partitions.get(&table.to_ascii_lowercase()) {
+        if on_conflict.is_some() {
+            return Err(ServerError::Unsupported(
+                "partitioned INSERT does not yet support ON CONFLICT",
+            ));
+        }
+        if !returning.is_empty() {
+            return Err(ServerError::Unsupported(
+                "partitioned INSERT does not yet support RETURNING",
+            ));
+        }
+        if insert_column_map_needed(&insert_columns, entry.schema.len()) {
+            return Err(ServerError::Unsupported(
+                "partitioned INSERT requires full-width target columns in table order",
+            ));
+        }
+        if ctx.table_constraints.contains_key(&entry.oid)
+            || ctx
+                .catalog_snapshot
+                .indexes_by_table
+                .get(&entry.oid)
+                .is_some_and(|indexes| !indexes.is_empty())
+        {
+            return Err(ServerError::Unsupported(
+                "partitioned INSERT does not yet support defaults, CHECK, FK, UNIQUE, or indexes",
+            ));
+        }
+        let child: Box<dyn Operator> = match source {
+            LogicalPlan::Values { rows, schema } => {
+                Box::new(ValuesScan::new(rows.clone(), schema.clone()))
+            }
+            other => lower_query(other, ctx)?,
+        };
+        let insert = crate::time_partition::TimePartitionInsert::new(
+            partition.clone(),
+            Arc::clone(&ctx.persistent_catalog),
+            Arc::clone(&ctx.heap),
+            Arc::clone(&ctx.vm),
+            child,
+            ctx.xid,
+            ctx.command_id,
+        )
+        .with_wal(ctx.heap.wal_sink().cloned());
+        return Ok(Box::new(insert));
+    }
     let child: Box<dyn Operator> = match source {
         LogicalPlan::Values { rows, schema } => {
             Box::new(ValuesScan::new(rows.clone(), schema.clone()))

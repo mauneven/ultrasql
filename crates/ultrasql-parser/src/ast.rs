@@ -304,8 +304,28 @@ pub struct CreateTableStmt {
     pub columns: Vec<ColumnDef>,
     /// Table-level constraints.
     pub table_constraints: Vec<TableConstraint>,
+    /// Optional native table partitioning clause.
+    pub partition_by: Option<TablePartitionSpec>,
     /// Source span of the entire statement.
     pub span: Span,
+}
+
+/// `PARTITION BY RANGE (col)` clause on `CREATE TABLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TablePartitionSpec {
+    /// Partitioning strategy.
+    pub kind: TablePartitionKind,
+    /// Column used as the partition key.
+    pub column: Identifier,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Supported native table partitioning strategies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TablePartitionKind {
+    /// Range partitioning.
+    Range,
 }
 
 /// `CREATE TABLE t AS SELECT …`.

@@ -82,6 +82,7 @@ where
             unique_constraints,
             foreign_keys,
             exclusion_constraints,
+            partition,
             if_not_exists,
             ..
         } = plan
@@ -377,6 +378,18 @@ where
             tracing::warn!(
                 error = %commit_err,
                 "catalog-write txn failed to commit; restart visibility may differ",
+            );
+        }
+        if let Some(partition) = partition {
+            self.state.time_partitions.insert(
+                table_name.clone(),
+                Arc::new(crate::time_partition::TimePartitionRuntime::daily(
+                    table_name.clone(),
+                    oid,
+                    columns.clone(),
+                    partition.column.clone(),
+                    partition.column_index,
+                )),
             );
         }
         // A new relation can shadow names a cached plan rewrote against
@@ -1110,6 +1123,11 @@ where
             if let Some(entry) = self.state.persistent_catalog.lookup_table(name) {
                 if *cascade {
                     self.drop_foreign_key_dependencies(entry.oid, &drop_set);
+                }
+                if let Some((_, runtime)) = self.state.time_partitions.remove(name) {
+                    for chunk in runtime.chunks.iter() {
+                        let _ = self.state.persistent_catalog.drop_table(&chunk.table_name);
+                    }
                 }
                 if let Some((_, constraints)) = self.state.table_constraints.remove(&entry.oid) {
                     for seq_name in constraints.sequence_defaults.iter().flatten() {

@@ -30,6 +30,7 @@ use super::scan::{
     lower_catalog_or_sample_scan, lower_function_scan, try_lower_read_parquet_filter,
     try_lower_read_parquet_project,
 };
+use super::time_partition::try_lower_time_partition_filter_scan;
 use super::tpch_q1::try_lower_tpch_q1;
 use super::tpch_q2::try_lower_tpch_q2;
 use super::tpch_q3::try_lower_tpch_q3;
@@ -163,6 +164,9 @@ pub fn lower_query(
             lower_project_columns(child, &exprs)
         }
         LogicalPlan::Filter { input, predicate } => {
+            if let Some(op) = try_lower_time_partition_filter_scan(input, predicate, ctx)? {
+                return Ok(op);
+            }
             // Index-aware fast path: when the filter sits directly on top
             // of a catalog-resolved table scan and the predicate is one
             // of the indexable shapes recognised by `try_index_scan`, we
@@ -240,14 +244,34 @@ pub fn lower_query(
             returning,
             schema,
             ..
-        } => lower_real_update(table, assignments, input, returning, schema, ctx),
+        } => {
+            if ctx
+                .time_partitions
+                .contains_key(&table.to_ascii_lowercase())
+            {
+                return Err(ServerError::Unsupported(
+                    "UPDATE on partitioned tables is not yet routed to chunks",
+                ));
+            }
+            lower_real_update(table, assignments, input, returning, schema, ctx)
+        }
         LogicalPlan::Delete {
             table,
             input,
             returning,
             schema,
             ..
-        } => lower_real_delete(table, input, returning, schema, ctx),
+        } => {
+            if ctx
+                .time_partitions
+                .contains_key(&table.to_ascii_lowercase())
+            {
+                return Err(ServerError::Unsupported(
+                    "DELETE on partitioned tables is not yet routed to chunks",
+                ));
+            }
+            lower_real_delete(table, input, returning, schema, ctx)
+        }
         LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
@@ -708,6 +732,8 @@ pub(super) fn lower_cte(
         catalog_snapshot: Arc::clone(&ctx.catalog_snapshot),
         table_constraints: Arc::clone(&ctx.table_constraints),
         sequences: Arc::clone(&ctx.sequences),
+        persistent_catalog: Arc::clone(&ctx.persistent_catalog),
+        time_partitions: Arc::clone(&ctx.time_partitions),
         sequence_state: ctx.sequence_state.clone(),
         heap: Arc::clone(&ctx.heap),
         vm: Arc::clone(&ctx.vm),

@@ -120,6 +120,8 @@ where
             Arc::clone(catalog_snapshot),
             Arc::clone(&self.state.table_constraints),
             Arc::clone(&self.state.sequences),
+            Arc::clone(&self.state.persistent_catalog),
+            Arc::clone(&self.state.time_partitions),
             Some(self.sequence_state.clone()),
             &self.state.tables,
             Arc::clone(&self.state.heap),

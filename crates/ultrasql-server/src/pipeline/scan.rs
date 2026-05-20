@@ -38,6 +38,11 @@ pub(super) fn lower_catalog_or_sample_scan(
     if let Some(scan) = try_virtual_catalog_scan(table, ctx)? {
         return apply_projection(scan, projection);
     }
+    if let Some(scan) =
+        super::time_partition::try_lower_time_partition_scan(&folded, projection, ctx)?
+    {
+        return Ok(scan);
+    }
     if let Some(entry) = ctx.catalog_snapshot.tables.get(&folded) {
         return lower_heap_scan(entry, projection, ctx);
     }

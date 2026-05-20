@@ -482,6 +482,8 @@ impl IndexFixture {
             catalog_snapshot: self.catalog.snapshot(),
             table_constraints: StdArc::new(dashmap::DashMap::new()),
             sequences: StdArc::new(dashmap::DashMap::new()),
+            persistent_catalog: StdArc::new(ultrasql_catalog::persistent::PersistentCatalog::new()),
+            time_partitions: StdArc::new(dashmap::DashMap::new()),
             sequence_state: None,
             heap: StdArc::clone(&self.heap),
             vm: StdArc::clone(&self.vm),

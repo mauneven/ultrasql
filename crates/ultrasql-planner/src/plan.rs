@@ -521,6 +521,8 @@ pub enum LogicalPlan {
         foreign_keys: Vec<LogicalForeignKeyConstraint>,
         /// EXCLUDE constraints that should be enforced by DML.
         exclusion_constraints: Vec<LogicalExclusionConstraint>,
+        /// Optional native time-range partitioning metadata.
+        partition: Option<LogicalTimePartition>,
         /// Whether `IF NOT EXISTS` was specified. When true the
         /// executor short-circuits if the relation already exists.
         if_not_exists: bool,
@@ -1104,6 +1106,15 @@ pub struct LogicalExclusionElement {
     pub column: usize,
     /// Operator used for pairwise comparison.
     pub op: ultrasql_parser::ast::BinaryOp,
+}
+
+/// Native time-range partitioning metadata bound from `CREATE TABLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalTimePartition {
+    /// Partition key column name.
+    pub column: String,
+    /// Partition key column index in the table schema.
+    pub column_index: usize,
 }
 
 /// Bound referential action for a foreign key.
