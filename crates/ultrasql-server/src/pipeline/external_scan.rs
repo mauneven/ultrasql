@@ -143,19 +143,35 @@ impl JsonInputKind {
 #[derive(Debug)]
 pub(super) struct ExternalTableScan {
     schema: Schema,
-    batches: VecDeque<Batch>,
+    source: ExternalScanSource,
+}
+
+#[derive(Debug)]
+enum ExternalScanSource {
+    Streaming(Box<dyn Operator>),
+    Buffered(VecDeque<Batch>),
 }
 
 impl ExternalTableScan {
-    fn new(schema: Schema, batches: VecDeque<Batch>) -> Self {
-        Self { schema, batches }
+    fn streaming(source: Box<dyn Operator>) -> Self {
+        let schema = source.schema().clone();
+        Self {
+            schema,
+            source: ExternalScanSource::Streaming(source),
+        }
+    }
+
+    fn buffered(schema: Schema, batches: VecDeque<Batch>) -> Self {
+        Self {
+            schema,
+            source: ExternalScanSource::Buffered(batches),
+        }
     }
 
     fn from_csv(args: &[ScalarExpr]) -> Result<Self, ServerError> {
         let path_specs = read_external_path_specs("read_csv", args)?;
         let scan = CsvTableScan::from_path_specs(&path_specs)?;
-        let (schema, batches) = drain_operator("read_csv", scan)?;
-        Ok(Self::new(schema, batches))
+        Ok(Self::streaming(Box::new(scan)))
     }
 
     fn from_parquet(args: &[ScalarExpr]) -> Result<Self, ServerError> {
@@ -169,8 +185,7 @@ impl ExternalTableScan {
         predicate: Option<&ParquetPredicate>,
     ) -> Result<Self, ServerError> {
         let scan = ParquetTableScan::from_path_specs(path_specs, projection, predicate)?;
-        let (schema, batches) = drain_operator("read_parquet", scan)?;
-        Ok(Self::new(schema, batches))
+        Ok(Self::streaming(Box::new(scan)))
     }
 
     fn from_json(args: &[ScalarExpr], kind: JsonInputKind) -> Result<Self, ServerError> {
@@ -181,14 +196,14 @@ impl ExternalTableScan {
         let columns = infer_json_columns(function_name, &rows)?;
         let schema = json_schema(function_name, &columns)?;
         let batches = json_batches(function_name, &columns, &rows)?;
-        Ok(Self::new(schema, batches))
+        Ok(Self::buffered(schema, batches))
     }
 
     fn from_arrow(args: &[ScalarExpr]) -> Result<Self, ServerError> {
         let path_specs = read_external_path_specs("read_arrow", args)?;
         let sources = read_external_sources("read_arrow", &path_specs)?;
         let (schema, batches) = read_arrow_batches(&sources)?;
-        Ok(Self::new(schema, batches))
+        Ok(Self::buffered(schema, batches))
     }
 
     fn from_iceberg(function_name: &str, args: &[ScalarExpr]) -> Result<Self, ServerError> {
@@ -209,43 +224,21 @@ impl ExternalTableScan {
                 None,
             )?)
         };
-        let (schema, batches) = drain_boxed_operator(function_name, source)?;
-        Ok(Self::new(schema, batches))
+        Ok(Self::streaming(source))
     }
 }
 
 impl Operator for ExternalTableScan {
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
-        Ok(self.batches.pop_front())
+        match &mut self.source {
+            ExternalScanSource::Streaming(source) => source.next_batch(),
+            ExternalScanSource::Buffered(batches) => Ok(batches.pop_front()),
+        }
     }
 
     fn schema(&self) -> &Schema {
         &self.schema
     }
-}
-
-fn drain_operator<O: Operator + 'static>(
-    function_name: &str,
-    op: O,
-) -> Result<(Schema, VecDeque<Batch>), ServerError> {
-    drain_boxed_operator(function_name, Box::new(op))
-}
-
-fn drain_boxed_operator(
-    function_name: &str,
-    mut op: Box<dyn Operator>,
-) -> Result<(Schema, VecDeque<Batch>), ServerError> {
-    let schema = op.schema().clone();
-    let mut batches = VecDeque::new();
-    while let Some(batch) = op
-        .next_batch()
-        .map_err(|err| ServerError::CopyFormat(format!("{function_name}: {err}")))?
-    {
-        if !batch.is_empty() {
-            batches.push_back(batch);
-        }
-    }
-    Ok((schema, batches))
 }
 
 #[derive(Clone, Debug)]
@@ -776,4 +769,61 @@ fn read_arrow_batches(sources: &[ExternalBytes]) -> Result<(Schema, VecDeque<Bat
     let schema = schema_from_arrow(arrow_schema.as_ref())
         .map_err(|err| ServerError::CopyFormat(format!("read_arrow Arrow bridge: {err}")))?;
     Ok((schema, batches))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct CountingScan {
+        schema: Schema,
+        pulls: Arc<AtomicUsize>,
+    }
+
+    impl CountingScan {
+        fn new(pulls: Arc<AtomicUsize>) -> Self {
+            Self {
+                schema: Schema::new([Field::required("id", DataType::Int64)]).expect("test schema"),
+                pulls,
+            }
+        }
+    }
+
+    impl Operator for CountingScan {
+        fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+            let previous = self.pulls.fetch_add(1, Ordering::SeqCst);
+            if previous > 0 {
+                return Ok(None);
+            }
+            Batch::new([Column::Int64(NumericColumn::from_data(vec![1_i64, 2]))])
+                .map(Some)
+                .map_err(ExecError::from)
+        }
+
+        fn schema(&self) -> &Schema {
+            &self.schema
+        }
+    }
+
+    #[test]
+    fn streaming_source_is_not_drained_at_construction() {
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let child = CountingScan::new(Arc::clone(&pulls));
+        let mut scan = ExternalTableScan::streaming(Box::new(child));
+
+        assert_eq!(pulls.load(Ordering::SeqCst), 0);
+        let batch = scan
+            .next_batch()
+            .expect("stream next")
+            .expect("first batch");
+        assert_eq!(batch.rows(), 2);
+        assert_eq!(pulls.load(Ordering::SeqCst), 1);
+        assert!(scan.next_batch().expect("stream eof").is_none());
+    }
 }
