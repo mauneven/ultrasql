@@ -101,10 +101,18 @@ enum Workload {
     /// `row_number()`, DuckDB native, SQLite 3.25+ native, ClickHouse
     /// `rowNumberInAllBlocks()`). Drains every row through the wire.
     WindowRowNumber,
+    /// Exact vector top-k nearest-neighbor query over a preloaded
+    /// `(id INT, embedding VECTOR(d))` table:
+    /// `ORDER BY embedding <-> probe, id LIMIT k`.
+    VectorTopK,
 }
 
 impl Workload {
     fn registry_id(self, n_rows: usize) -> String {
+        self.registry_id_with_shape(n_rows, DEFAULT_VECTOR_DIMS, DEFAULT_TOP_K)
+    }
+
+    fn registry_id_with_shape(self, n_rows: usize, vector_dims: usize, top_k: usize) -> String {
         match self {
             Self::InsertBulk => format!("insert_throughput_{}", k_or_raw(n_rows)),
             Self::SelectScan => format!("select_scan_{}", k_or_raw(n_rows)),
@@ -118,9 +126,20 @@ impl Workload {
             // happy.
             Self::MixedOltp => "mixed_oltp_pgbench_like".to_string(),
             Self::WindowRowNumber => format!("window_row_number_{}_i64", k_or_raw(n_rows)),
+            Self::VectorTopK => {
+                format!(
+                    "vector_topk_exact_{}_{}d_k{}",
+                    k_or_raw(n_rows),
+                    vector_dims,
+                    top_k
+                )
+            }
         }
     }
 }
+
+const DEFAULT_VECTOR_DIMS: usize = 8;
+const DEFAULT_TOP_K: usize = 10;
 
 /// Render a row count using `10k` / `1m` notation matching the
 /// existing competitor workload ids (`insert_throughput_10k`,
@@ -167,15 +186,27 @@ struct Args {
     /// `insert_throughput_10k`.
     #[arg(long)]
     workload_id: Option<String>,
+    /// Vector dimensions for the `vector-top-k` workload.
+    #[arg(long, default_value_t = DEFAULT_VECTOR_DIMS)]
+    vector_dims: usize,
+    /// Number of nearest rows returned by the `vector-top-k` workload.
+    #[arg(long, default_value_t = DEFAULT_TOP_K)]
+    top_k: usize,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let workload_id = args
-        .workload_id
-        .clone()
-        .unwrap_or_else(|| args.workload.registry_id(args.rows));
+    if args.vector_dims == 0 {
+        anyhow::bail!("--vector-dims must be greater than zero");
+    }
+    if args.top_k == 0 {
+        anyhow::bail!("--top-k must be greater than zero");
+    }
+    let workload_id = args.workload_id.clone().unwrap_or_else(|| {
+        args.workload
+            .registry_id_with_shape(args.rows, args.vector_dims, args.top_k)
+    });
 
     // Bring up an in-process ultrasqld on an ephemeral port.
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
@@ -208,6 +239,7 @@ async fn main() -> Result<()> {
     // connection and time the query repeated N times). Anything
     // else would compare cold-cache UltraSQL against warm-cache
     // peers.
+    let mut answer = None;
     match args.workload {
         Workload::SelectScan => {
             run_shared_select_scan(bound, args.rows, args.warmup, total_iters, &mut iters_us)
@@ -254,6 +286,20 @@ async fn main() -> Result<()> {
             run_shared_window_row_number(bound, args.rows, args.warmup, total_iters, &mut iters_us)
                 .await?;
         }
+        Workload::VectorTopK => {
+            answer = Some(
+                run_shared_vector_topk(
+                    bound,
+                    args.rows,
+                    args.vector_dims,
+                    args.top_k,
+                    args.warmup,
+                    total_iters,
+                    &mut iters_us,
+                )
+                .await?,
+            );
+        }
         _ => {
             for i in 0..total_iters {
                 let micros = match args.workload {
@@ -265,7 +311,8 @@ async fn main() -> Result<()> {
                     | Workload::SumScalar
                     | Workload::AvgScalar
                     | Workload::FilterSum
-                    | Workload::WindowRowNumber => unreachable!("handled above"),
+                    | Workload::WindowRowNumber
+                    | Workload::VectorTopK => unreachable!("handled above"),
                 };
                 if i >= args.warmup {
                     iters_us.push(micros);
@@ -279,7 +326,7 @@ async fn main() -> Result<()> {
     let median_us = iters_us[iters_us.len() / 2];
     let min_us = iters_us[0];
 
-    let report = serde_json::json!({
+    let mut report = serde_json::json!({
         "engine": "ultrasql",
         "workload": workload_id,
         "n_rows": args.rows,
@@ -288,6 +335,9 @@ async fn main() -> Result<()> {
         "min_us": min_us,
         "iterations_us": iters_us,
     });
+    if let Some(answer) = answer {
+        report["answer"] = serde_json::json!(answer);
+    }
     let serialized = serde_json::to_string(&report)?;
     if let Some(path) = args.output.as_ref() {
         std::fs::write(path, &serialized).with_context(|| format!("write {}", path.display()))?;
@@ -844,6 +894,165 @@ async fn run_shared_window_row_number(
     Ok(())
 }
 
+const VECTOR_PRELOAD_CHUNK_ROWS: usize = 1_000;
+
+fn vector_component(row_id: usize, dim: usize) -> i32 {
+    let row = row_id as u128;
+    let dim = dim as u128;
+    let value = ((row * 31) + (dim * 17) + ((row % 7) * 13)) % 101;
+    i32::try_from(value).unwrap_or(0) - 50
+}
+
+fn vector_probe_component(dim: usize) -> i32 {
+    let dim = dim as u128;
+    let value = ((dim * 7) + 3) % 23;
+    i32::try_from(value).unwrap_or(0) - 11
+}
+
+fn push_vector_literal_for_row(sql: &mut String, row_id: usize, dims: usize) {
+    sql.push_str("'[");
+    for dim in 0..dims {
+        if dim > 0 {
+            sql.push(',');
+        }
+        sql.push_str(&vector_component(row_id, dim).to_string());
+    }
+    sql.push_str("]'");
+}
+
+fn vector_probe_literal(dims: usize) -> String {
+    let mut literal = String::with_capacity(dims * 4 + 2);
+    literal.push('[');
+    for dim in 0..dims {
+        if dim > 0 {
+            literal.push(',');
+        }
+        literal.push_str(&vector_probe_component(dim).to_string());
+    }
+    literal.push(']');
+    literal
+}
+
+fn vector_l2_squared(row_id: usize, dims: usize) -> i64 {
+    let mut sum = 0_i64;
+    for dim in 0..dims {
+        let delta = i64::from(vector_component(row_id, dim) - vector_probe_component(dim));
+        sum += delta * delta;
+    }
+    sum
+}
+
+fn expected_vector_topk_answer(n_rows: usize, dims: usize, top_k: usize) -> String {
+    let mut candidates = (0..n_rows)
+        .map(|row_id| (vector_l2_squared(row_id, dims), row_id))
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates
+        .into_iter()
+        .take(top_k.min(n_rows))
+        .map(|(_, row_id)| row_id.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+async fn preload_vector_chunked(
+    client: &tokio_postgres::Client,
+    table: &str,
+    n_rows: usize,
+    dims: usize,
+) -> Result<()> {
+    let mut start = 0;
+    while start < n_rows {
+        let end = (start + VECTOR_PRELOAD_CHUNK_ROWS).min(n_rows);
+        let mut sql = String::with_capacity((end - start) * (dims * 4 + 32) + 64);
+        sql.push_str("INSERT INTO ");
+        sql.push_str(table);
+        sql.push_str(" VALUES ");
+        for row_id in start..end {
+            if row_id > start {
+                sql.push(',');
+            }
+            sql.push('(');
+            sql.push_str(&row_id.to_string());
+            sql.push(',');
+            push_vector_literal_for_row(&mut sql, row_id, dims);
+            sql.push(')');
+        }
+        client
+            .batch_execute(&sql)
+            .await
+            .with_context(|| format!("preload vector chunk [{start}, {end}) into {table}"))?;
+        start = end;
+    }
+    Ok(())
+}
+
+/// Shared-table exact vector top-k workload: preload deterministic vectors
+/// once, then time exact `ORDER BY distance, id LIMIT k` scans.
+async fn run_shared_vector_topk(
+    server: SocketAddr,
+    n_rows: usize,
+    dims: usize,
+    top_k: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<String> {
+    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .context("tokio-postgres connect to ultrasqld")?;
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("tokio-postgres connection error: {e}");
+        }
+    });
+
+    let table = "bench_vector_topk_shared";
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (id INT NOT NULL, embedding VECTOR({dims}))"
+        ))
+        .await
+        .with_context(|| format!("CREATE TABLE {table}"))?;
+    preload_vector_chunked(&client, table, n_rows, dims).await?;
+
+    let probe = vector_probe_literal(dims);
+    let expected = expected_vector_topk_answer(n_rows, dims, top_k);
+    let query = format!(
+        "SELECT id, embedding <-> '{probe}' AS distance \
+         FROM {table} ORDER BY distance, id LIMIT {top_k}"
+    );
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(&query)
+            .await
+            .with_context(|| format!("vector top-k on {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let observed = messages
+            .iter()
+            .filter_map(|message| match message {
+                tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(ToOwned::to_owned),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        if observed != expected {
+            anyhow::bail!(
+                "vector top-k answer mismatch: expected ids {expected}, observed ids {observed}"
+            );
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+        }
+    }
+
+    drop(client);
+    conn_handle.abort();
+    Ok(expected)
+}
+
 /// Mixed-OLTP pgbench-like 1-second-window workload.
 ///
 /// Preloads `n_rows` of `(id INT, val INT)` outside the timed region
@@ -952,5 +1161,29 @@ impl SplitMix64 {
 
     fn next_i32(&mut self) -> i32 {
         self.next_u64() as i32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn vector_topk_cli_exposes_exact_shape_defaults() {
+        let args = Args::try_parse_from(["cross_compare_sql", "--workload", "vector-top-k"])
+            .expect("vector top-k workload parses");
+
+        assert_eq!(args.workload, Workload::VectorTopK);
+        assert_eq!(args.vector_dims, 8);
+        assert_eq!(args.top_k, 10);
+    }
+
+    #[test]
+    fn vector_topk_workload_id_includes_shape() {
+        assert_eq!(
+            Workload::VectorTopK.registry_id_with_shape(10_000, 8, 10),
+            "vector_topk_exact_10k_8d_k10"
+        );
     }
 }

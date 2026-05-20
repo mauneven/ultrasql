@@ -242,6 +242,27 @@ raw per-engine artifacts under `benchmarks/results/latest/raw/`, and the
 also write `passed: false` summaries so roadmap status never depends on
 an absent artifact.
 
+### Exact Vector Top-K
+
+Exact vector nearest-neighbor top-k is recorded by:
+
+```text
+POSTGRES_DSN="host=localhost user=postgres dbname=vector_pg" \
+benchmarks/vector_topk_exact.sh
+```
+
+The runner always measures UltraSQL through the PostgreSQL wire driver
+with `ORDER BY embedding <-> probe, id LIMIT k` over deterministic
+`VECTOR(d)` rows. It then tries PostgreSQL + pgvector via
+`CREATE EXTENSION IF NOT EXISTS vector`; if pgvector is unavailable, it
+falls back to an installed DuckDB build only when a LIST/ARRAY distance
+function (`list_distance` or `array_distance`) passes a capability probe.
+No extension or dataset is downloaded by the runner. `VECTOR_TOPK_ROWS`,
+`VECTOR_TOPK_DIMS`, `VECTOR_TOPK_K`, `N_ITERS`, and `WARMUP` control
+local smoke versus publishable runs. Raw artifacts land in
+`benchmarks/results/latest/raw/` with an `answer` field containing the
+exact top-k id checksum.
+
 ### TPC-B Certification
 
 TPC-B v0.9 certification is recorded by:
