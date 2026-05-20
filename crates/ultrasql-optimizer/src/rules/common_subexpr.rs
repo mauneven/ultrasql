@@ -69,6 +69,7 @@ impl RewriteRule for CommonSubExprElimination {
 // ============================================================================
 
 const MIN_TREE_SIZE: usize = 4;
+const MAX_CSE_TOTAL_NODES: usize = 128;
 
 // ============================================================================
 // Entry point
@@ -213,6 +214,11 @@ fn maybe_hoist(
     mut exprs: Vec<ScalarExpr>,
     input: &LogicalPlan,
 ) -> Option<(Vec<ScalarExpr>, InjectedProject)> {
+    let total_nodes = exprs.iter().map(expr_size).sum::<usize>();
+    if total_nodes > MAX_CSE_TOTAL_NODES {
+        return None;
+    }
+
     // Step 1: count all sub-tree occurrences.
     let mut freq: HashMap<ExprKey, (usize, ScalarExpr)> = HashMap::new();
     for e in &exprs {
@@ -505,6 +511,24 @@ mod tests {
         }
     }
 
+    fn gt(l: ScalarExpr, r: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(l),
+            right: Box::new(r),
+            data_type: DataType::Bool,
+        }
+    }
+
+    fn and(l: ScalarExpr, r: ScalarExpr) -> ScalarExpr {
+        ScalarExpr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(l),
+            right: Box::new(r),
+            data_type: DataType::Bool,
+        }
+    }
+
     fn neg(e: ScalarExpr) -> ScalarExpr {
         ScalarExpr::Unary {
             op: UnaryOp::Neg,
@@ -563,6 +587,28 @@ mod tests {
         assert!(
             result.is_none(),
             "filter with no duplicates should not be rewritten"
+        );
+    }
+
+    #[test]
+    fn no_op_on_large_predicate_above_cse_budget() {
+        let mut predicate = gt(col("a", 0), lit_i32(0));
+        for value in 1..40 {
+            predicate = and(predicate, gt(col("a", 0), lit_i32(value)));
+        }
+        assert!(
+            expr_size(&predicate) > MAX_CSE_TOTAL_NODES,
+            "test predicate must exceed CSE budget"
+        );
+
+        let plan = LogicalPlan::Filter {
+            input: Box::new(two_col_scan()),
+            predicate,
+        };
+        let result = CommonSubExprElimination.apply(&plan).expect("no error");
+        assert!(
+            result.is_none(),
+            "large generated predicates should skip CSE instead of formatting every subtree"
         );
     }
 

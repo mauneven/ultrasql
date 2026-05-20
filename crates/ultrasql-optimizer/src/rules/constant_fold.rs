@@ -471,11 +471,13 @@ fn fold_binary(
     right: &ScalarExpr,
     result_type: &DataType,
 ) -> Option<ScalarExpr> {
-    let left_folded = fold_expr(left).unwrap_or_else(|| left.clone());
-    let right_folded = fold_expr(right).unwrap_or_else(|| right.clone());
-
-    let left_changed = fold_expr(left).is_some();
-    let right_changed = fold_expr(right).is_some();
+    let left_folded_opt = fold_expr(left);
+    let right_folded_opt = fold_expr(right);
+    let left_changed = left_folded_opt.is_some();
+    let right_changed = right_folded_opt.is_some();
+    let children_changed = left_changed || right_changed;
+    let left_folded = left_folded_opt.unwrap_or_else(|| left.clone());
+    let right_folded = right_folded_opt.unwrap_or_else(|| right.clone());
 
     let lit_left = as_literal(&left_folded).cloned();
     let lit_right = as_literal(&right_folded).cloned();
@@ -487,6 +489,7 @@ fn fold_binary(
             lit_left.as_ref(),
             lit_right.as_ref(),
             result_type,
+            children_changed,
         ),
         BinaryOp::Or => fold_or(
             left_folded,
@@ -494,6 +497,7 @@ fn fold_binary(
             lit_left.as_ref(),
             lit_right.as_ref(),
             result_type,
+            children_changed,
         ),
         BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
             match (lit_left.as_ref(), lit_right.as_ref()) {
@@ -503,7 +507,7 @@ fn fold_binary(
                         left_folded,
                         right_folded,
                         result_type,
-                        left_changed || right_changed,
+                        children_changed,
                     )
                 }),
                 _ => rebuild_binary_if_changed(
@@ -511,7 +515,7 @@ fn fold_binary(
                     left_folded,
                     right_folded,
                     result_type,
-                    left_changed || right_changed,
+                    children_changed,
                 ),
             }
         }
@@ -527,7 +531,7 @@ fn fold_binary(
                     left_folded,
                     right_folded,
                     result_type,
-                    left_changed || right_changed,
+                    children_changed,
                 )
             }),
             _ => rebuild_binary_if_changed(
@@ -535,16 +539,12 @@ fn fold_binary(
                 left_folded,
                 right_folded,
                 result_type,
-                left_changed || right_changed,
+                children_changed,
             ),
         },
-        _ => rebuild_binary_if_changed(
-            op,
-            left_folded,
-            right_folded,
-            result_type,
-            left_changed || right_changed,
-        ),
+        _ => {
+            rebuild_binary_if_changed(op, left_folded, right_folded, result_type, children_changed)
+        }
     }
 }
 
@@ -554,20 +554,13 @@ fn fold_and(
     lit_left: Option<&Value>,
     lit_right: Option<&Value>,
     result_type: &DataType,
+    children_changed: bool,
 ) -> Option<ScalarExpr> {
-    let left_changed = fold_expr(&left).is_some();
-    let right_changed = fold_expr(&right).is_some();
     match (lit_left, lit_right) {
         (Some(Value::Bool(false)), _) | (_, Some(Value::Bool(false))) => Some(bool_literal(false)),
         (Some(Value::Bool(true)), _) => Some(right),
         (_, Some(Value::Bool(true))) => Some(left),
-        _ => rebuild_binary_if_changed(
-            BinaryOp::And,
-            left,
-            right,
-            result_type,
-            left_changed || right_changed,
-        ),
+        _ => rebuild_binary_if_changed(BinaryOp::And, left, right, result_type, children_changed),
     }
 }
 
@@ -577,20 +570,13 @@ fn fold_or(
     lit_left: Option<&Value>,
     lit_right: Option<&Value>,
     result_type: &DataType,
+    children_changed: bool,
 ) -> Option<ScalarExpr> {
-    let left_changed = fold_expr(&left).is_some();
-    let right_changed = fold_expr(&right).is_some();
     match (lit_left, lit_right) {
         (Some(Value::Bool(true)), _) | (_, Some(Value::Bool(true))) => Some(bool_literal(true)),
         (Some(Value::Bool(false)), _) => Some(right),
         (_, Some(Value::Bool(false))) => Some(left),
-        _ => rebuild_binary_if_changed(
-            BinaryOp::Or,
-            left,
-            right,
-            result_type,
-            left_changed || right_changed,
-        ),
+        _ => rebuild_binary_if_changed(BinaryOp::Or, left, right, result_type, children_changed),
     }
 }
 
@@ -614,8 +600,9 @@ fn rebuild_binary_if_changed(
 }
 
 fn fold_unary(op: UnaryOp, inner: &ScalarExpr, result_type: &DataType) -> Option<ScalarExpr> {
-    let inner_folded = fold_expr(inner).unwrap_or_else(|| inner.clone());
-    let inner_changed = fold_expr(inner).is_some();
+    let inner_folded_opt = fold_expr(inner);
+    let inner_changed = inner_folded_opt.is_some();
+    let inner_folded = inner_folded_opt.unwrap_or_else(|| inner.clone());
     if op == UnaryOp::Not {
         if let Some(Value::Bool(b)) = as_literal(&inner_folded) {
             return Some(bool_literal(!b));
@@ -633,12 +620,17 @@ fn fold_unary(op: UnaryOp, inner: &ScalarExpr, result_type: &DataType) -> Option
 }
 
 fn fold_is_null(inner: &ScalarExpr, negated: bool) -> Option<ScalarExpr> {
-    let inner_folded = fold_expr(inner).unwrap_or_else(|| inner.clone());
+    let inner_folded_opt = fold_expr(inner);
+    let inner_changed = inner_folded_opt.is_some();
+    let inner_folded = inner_folded_opt.unwrap_or_else(|| inner.clone());
     if let Some(v) = as_literal(&inner_folded) {
         let result = if v.is_null() { !negated } else { negated };
         return Some(bool_literal(result));
     }
-    None
+    inner_changed.then(|| ScalarExpr::IsNull {
+        expr: Box::new(inner_folded),
+        negated,
+    })
 }
 
 // ---------------------------------------------------------------------------

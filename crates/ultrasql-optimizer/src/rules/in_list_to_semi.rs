@@ -186,7 +186,12 @@ fn try_collapse_or_list(expr: &ScalarExpr) -> Option<ScalarExpr> {
     // canonical OR-tree. The structure is unchanged but the pattern is
     // recognised.
     // TODO(future RFC): lower to ScalarExpr::InList when that variant lands.
-    Some(rebuild_or_tree(disjuncts))
+    let rebuilt = rebuild_or_tree(disjuncts);
+    if &rebuilt == expr {
+        None
+    } else {
+        Some(rebuilt)
+    }
 }
 
 /// Split a top-level OR tree into individual disjuncts.
@@ -271,10 +276,10 @@ mod tests {
         Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok")
     }
 
-    // --- Happy-path: 3-element OR-list ---
+    // --- Current behavior: pattern is recognised but not rewritten ---
 
     #[test]
-    fn collapses_three_way_or_equality() {
+    fn three_way_or_equality_stays_no_op_without_inlist_expr() {
         let pred = or_expr(
             or_expr(eq(col("id", 0), lit_i32(1)), eq(col("id", 0), lit_i32(2))),
             eq(col("id", 0), lit_i32(3)),
@@ -289,26 +294,10 @@ mod tests {
         };
         let rule = InListToSemi;
         let result = rule.apply(&plan).expect("no error");
-        assert!(result.is_some(), "should recognise the OR-list pattern");
-        if let Some(LogicalPlan::Filter { predicate, .. }) = result {
-            // The predicate should be an OR tree (ScalarExpr::InList not yet
-            // available) — just verify it still contains BinaryOp::Or.
-            fn contains_or(e: &ScalarExpr) -> bool {
-                match e {
-                    ScalarExpr::Binary {
-                        op: BinaryOp::Or, ..
-                    } => true,
-                    ScalarExpr::Binary { left, right, .. } => {
-                        contains_or(left) || contains_or(right)
-                    }
-                    _ => false,
-                }
-            }
-            assert!(
-                contains_or(&predicate),
-                "collapsed predicate should contain OR"
-            );
-        }
+        assert!(
+            result.is_none(),
+            "without ScalarExpr::InList, rebuilding the same OR tree must be a no-op"
+        );
     }
 
     // --- Edge-case: only 2 disjuncts — below threshold ---
