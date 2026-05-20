@@ -334,10 +334,14 @@ impl<L: PageLoader> HeapAccess<L> {
                 );
                 let xmin_xid = Xid::new(xmin_raw);
 
-                let visible = if xmax_raw == 0 {
+                let visibility = if xmax_raw == 0 {
                     match xmin_cache {
                         Some((cxmin, cinfo, cv)) if cxmin == xmin_xid && cinfo == infomask_bits => {
-                            cv
+                            if cv {
+                                Visibility::Visible
+                            } else {
+                                Visibility::Invisible
+                            }
                         }
                         _ => {
                             let (h, _) =
@@ -346,19 +350,19 @@ impl<L: PageLoader> HeapAccess<L> {
                             let v =
                                 matches!(is_visible(&h, snapshot, oracle), Visibility::Visible,);
                             xmin_cache = Some((h.xmin, h.infomask.bits(), v));
-                            v
+                            if v {
+                                Visibility::Visible
+                            } else {
+                                Visibility::Invisible
+                            }
                         }
                     }
                 } else {
                     let (h, _) =
                         TupleHeader::decode(&src_bytes[offset..offset + TUPLE_HEADER_SIZE])
                             .ok_or(HeapError::MalformedHeader("header decode failed"))?;
-                    matches!(is_visible(&h, snapshot, oracle), Visibility::Visible)
+                    is_visible(&h, snapshot, oracle)
                 };
-                if !visible {
-                    continue;
-                }
-
                 // Decode (id, val) from payload [null_byte, id_le, val_le].
                 let payload_off = offset + TUPLE_HEADER_SIZE;
                 if payload_off + 9 > offset + length {
@@ -378,6 +382,19 @@ impl<L: PageLoader> HeapAccess<L> {
                     src_bytes[payload_off + 7],
                     src_bytes[payload_off + 8],
                 ]);
+
+                match visibility {
+                    Visibility::Visible => {}
+                    Visibility::VisiblePreImage => {
+                        if predicate(id, val) {
+                            return Err(HeapError::WriteConflict(
+                                "in-place tuple has an unresolved writer",
+                            ));
+                        }
+                        continue;
+                    }
+                    Visibility::Invisible | Visibility::DeletedByOwn => continue,
+                }
 
                 if !predicate(id, val) {
                     continue;

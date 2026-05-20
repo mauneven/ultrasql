@@ -80,6 +80,11 @@ pub enum HeapError {
     #[error("malformed tuple header: {0}")]
     MalformedHeader(&'static str),
 
+    /// Tuple write could not proceed because another transaction's
+    /// in-place update is still visible as a pre-image to this snapshot.
+    #[error("write conflict: {0}")]
+    WriteConflict(&'static str),
+
     /// The relation's block counter has been exhausted. A relation
     /// would have to grow past [`u32::MAX`] blocks for this to fire.
     #[error("relation is out of blocks")]

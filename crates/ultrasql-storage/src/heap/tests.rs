@@ -408,6 +408,13 @@ fn update_opts(xid: u64) -> UpdateOptions<'static> {
     }
 }
 
+fn int32_pair_payload(id: i32, val: i32) -> [u8; 9] {
+    let mut payload = [0_u8; 9];
+    payload[1..5].copy_from_slice(&id.to_le_bytes());
+    payload[5..9].copy_from_slice(&val.to_le_bytes());
+    payload
+}
+
 // -----------------------------------------------------------------------
 // Deliverable A tests
 // -----------------------------------------------------------------------
@@ -506,6 +513,132 @@ fn update_rejected_on_already_deleted_tuple() {
         matches!(err, HeapError::MalformedHeader(_)),
         "expected MalformedHeader on update of deleted tuple, got {err:?}"
     );
+}
+
+#[test]
+fn inplace_int32_update_conflicts_with_in_progress_writer() {
+    let heap = make_heap(8);
+    let _tid = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let updated = heap
+        .update_int32_pair_inplace_undo(
+            rel(),
+            heap.block_count(rel()),
+            &writer_20,
+            &oracle,
+            |id, _val| id == 1,
+            1,
+            5,
+            Xid::new(20),
+            CommandId::FIRST,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(updated, 1);
+
+    let writer_30 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(30),
+        CommandId::FIRST,
+        [Xid::new(20)],
+    );
+    let err = heap
+        .update_int32_pair_inplace_undo(
+            rel(),
+            heap.block_count(rel()),
+            &writer_30,
+            &oracle,
+            |id, _val| id == 1,
+            1,
+            7,
+            Xid::new(30),
+            CommandId::FIRST,
+            None,
+            None,
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(err, HeapError::WriteConflict(_)),
+        "expected write conflict for invisible in-place writer, got {err:?}"
+    );
+}
+
+#[test]
+fn inplace_int32_update_skips_unrelated_in_progress_writer() {
+    let heap = make_heap(8);
+    let _first = heap
+        .insert(rel(), &int32_pair_payload(1, 10), opts(10))
+        .unwrap();
+    let _second = heap
+        .insert(rel(), &int32_pair_payload(2, 20), opts(10))
+        .unwrap();
+
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(10));
+    oracle.set_in_progress(Xid::new(20));
+
+    let writer_20 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(20),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    heap.update_int32_pair_inplace_undo(
+        rel(),
+        heap.block_count(rel()),
+        &writer_20,
+        &oracle,
+        |id, _val| id == 1,
+        1,
+        5,
+        Xid::new(20),
+        CommandId::FIRST,
+        None,
+        None,
+    )
+    .unwrap();
+
+    let writer_30 = Snapshot::new(
+        Xid::new(10),
+        Xid::new(100),
+        Xid::new(30),
+        CommandId::FIRST,
+        [Xid::new(20)],
+    );
+    let updated = heap
+        .update_int32_pair_inplace_undo(
+            rel(),
+            heap.block_count(rel()),
+            &writer_30,
+            &oracle,
+            |id, _val| id == 2,
+            1,
+            7,
+            Xid::new(30),
+            CommandId::FIRST,
+            None,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(updated, 1);
 }
 
 // -----------------------------------------------------------------------
