@@ -24,6 +24,7 @@
 
 pub mod cache;
 pub mod constants;
+pub mod csv;
 pub mod endian;
 pub mod error;
 pub mod id;

@@ -14,6 +14,7 @@ use crate::error::ServerError;
 
 use super::LowerCtx;
 use super::catalog_views::try_virtual_catalog_scan;
+use super::csv_scan::CsvTableScan;
 
 pub(super) fn lower_catalog_or_sample_scan(
     table: &str,
@@ -141,6 +142,22 @@ pub(super) fn lower_function_scan(
     name: &str,
     args: &[ScalarExpr],
 ) -> Result<Box<dyn Operator>, ServerError> {
+    if name == "read_csv" {
+        if args.len() != 1 {
+            return Err(ServerError::Unsupported(
+                "read_csv: expected one path or glob argument",
+            ));
+        }
+        let value = Eval::new(args[0].clone())
+            .eval(&[])
+            .map_err(|e| ServerError::Ddl(format!("read_csv argument evaluation failed: {e}")))?;
+        let Value::Text(pattern) = value else {
+            return Err(ServerError::Unsupported(
+                "read_csv: path argument must be a string literal",
+            ));
+        };
+        return Ok(Box::new(CsvTableScan::from_pattern(&pattern)?));
+    }
     if name == "unnest" {
         if args.len() != 1 {
             return Err(ServerError::Unsupported(
@@ -164,7 +181,7 @@ pub(super) fn lower_function_scan(
     }
     if name != "generate_series" {
         return Err(ServerError::Unsupported(
-            "table function (only generate_series and unnest supported)",
+            "table function (only generate_series, unnest, and read_csv supported)",
         ));
     }
     if args.len() < 2 || args.len() > 3 {

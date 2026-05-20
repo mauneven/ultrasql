@@ -54,7 +54,7 @@
 //! - [`IndexScan`] — B-tree index scan (point + range) over pre-probed payloads.
 //! - [`IndexOnlyScan`] — B-tree-covered projection that can skip heap fetches
 //!   when the visibility map proves every candidate page all-visible.
-//! - [`FunctionScan`] — set-returning function scan (`generate_series`).
+//! - [`FunctionScan`] — in-memory set-returning function scan.
 //! - [`CteScan`] — replay a materialised CTE buffer.
 
 #![forbid(unsafe_op_in_unsafe_fn)]

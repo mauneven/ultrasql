@@ -1,7 +1,7 @@
 //! FROM clause and JOIN binding. Split out of `binder/mod.rs` to keep each
 //! file under the 600-line ceiling.
 
-use ultrasql_core::{DataType, Field, Schema};
+use ultrasql_core::{DataType, Field, Schema, Value, csv::read_csv_header};
 use ultrasql_parser::ast::{JoinCondition, JoinOp, TableRef};
 
 use super::{
@@ -167,14 +167,19 @@ fn bind_table_function(
             scope,
         )?);
     }
-    let (schema, col_name, col_type) = match func_name.as_str() {
+    let (schema, from_scope) = match func_name.as_str() {
         "generate_series" => {
             let col_type = DataType::Int64;
+            let field = Field::required("generate_series", col_type);
+            let schema = Schema::new([field.clone()])
+                .map_err(|e| PlanError::TypeMismatch(format!("generate_series schema: {e}")))?;
             (
-                Schema::new([Field::required("generate_series", col_type.clone())])
-                    .map_err(|e| PlanError::TypeMismatch(format!("generate_series schema: {e}")))?,
-                "generate_series".to_string(),
-                col_type,
+                schema,
+                vec![ScopeEntry {
+                    qualifier: qualifier.clone(),
+                    field_index: 0,
+                    field,
+                }],
             )
         }
         "unnest" => {
@@ -189,30 +194,69 @@ fn bind_table_function(
                 ));
             };
             let col_type = *element_type;
+            let field = Field::required("unnest", col_type);
+            let schema = Schema::new([field.clone()])
+                .map_err(|e| PlanError::TypeMismatch(format!("unnest schema: {e}")))?;
             (
-                Schema::new([Field::required("unnest", col_type.clone())])
-                    .map_err(|e| PlanError::TypeMismatch(format!("unnest schema: {e}")))?,
-                "unnest".to_string(),
-                col_type,
+                schema,
+                vec![ScopeEntry {
+                    qualifier: qualifier.clone(),
+                    field_index: 0,
+                    field,
+                }],
             )
         }
+        "read_csv" => bind_read_csv_table_function(&bound_args, &qualifier)?,
         _ => {
             return Err(PlanError::NotSupported(
-                "table function (only generate_series and unnest supported)",
+                "table function (only generate_series, unnest, and read_csv supported)",
             ));
         }
     };
-    let from_scope = vec![ScopeEntry {
-        qualifier,
-        field_index: 0,
-        field: Field::required(&col_name, col_type),
-    }];
     let plan = LogicalPlan::FunctionScan {
         name: func_name,
         args: bound_args,
         schema,
     };
     Ok((plan, from_scope))
+}
+
+fn bind_read_csv_table_function(
+    bound_args: &[ScalarExpr],
+    qualifier: &str,
+) -> Result<(Schema, Vec<ScopeEntry>), PlanError> {
+    if bound_args.len() != 1 {
+        return Err(PlanError::NotSupported(
+            "read_csv: expected one path or glob argument",
+        ));
+    }
+    let ScalarExpr::Literal {
+        value: Value::Text(pattern),
+        ..
+    } = &bound_args[0]
+    else {
+        return Err(PlanError::TypeMismatch(
+            "read_csv: path argument must be a string literal".to_owned(),
+        ));
+    };
+    let header = read_csv_header(pattern)
+        .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))?;
+    let fields = header
+        .into_iter()
+        .map(|name| Field::nullable(name, DataType::Text { max_len: None }))
+        .collect::<Vec<_>>();
+    let schema = Schema::new(fields.clone())
+        .map_err(|err| PlanError::TypeMismatch(format!("read_csv schema: {err}")))?;
+    let from_scope = fields
+        .into_iter()
+        .enumerate()
+        .map(|(field_index, field)| ScopeEntry {
+            qualifier: qualifier.to_owned(),
+            field_index,
+            field,
+        })
+        .collect();
+    Ok((schema, from_scope))
 }
 
 fn rebuild_subquery_plan(

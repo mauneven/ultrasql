@@ -949,10 +949,10 @@ pub enum LogicalPlan {
 
     /// Set-returning function in `FROM`, e.g. `FROM generate_series(1, 10)`.
     ///
-    /// The lowerer dispatches on `name` to construct the matching
-    /// `ultrasql_executor::FunctionScan` variant.
+    /// The lowerer dispatches on `name` to construct the matching table
+    /// function scan.
     FunctionScan {
-        /// Function name (case-folded). v0.5 supports `generate_series`.
+        /// Function name (case-folded).
         name: String,
         /// Bound argument expressions in declaration order.
         args: Vec<ScalarExpr>,

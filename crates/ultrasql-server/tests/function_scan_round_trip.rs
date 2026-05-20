@@ -6,16 +6,20 @@
 //! `TableRef::Function`; binder lowers it into
 //! `LogicalPlan::FunctionScan { name, args, schema }`; the server's
 //! `pipeline::lower_function_scan` constructs the matching executor
-//! operator. Only `generate_series(start, stop[, step])` is recognised
-//! today; other table functions surface as
-//! `ServerError::Unsupported`.
+//! operator. File-backed `read_csv(path_or_glob)` is lowered through the same
+//! table-function path without creating catalog tables.
 
+use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
+
+fn sql_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
 
 async fn start_server_and_connect() -> (
     tokio_postgres::Client,
@@ -106,6 +110,66 @@ async fn unnest_string_to_array_emits_text_rows() {
         .expect("unnest(string_to_array(...))");
     let values: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
     assert_eq!(values, vec!["red".to_string(), "green".to_string()]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn read_csv_single_file_exposes_header_columns_and_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv_path = dir.path().join("people.csv");
+    fs::write(&csv_path, "id,name\n1,Ada\n2,\"Grace Hopper\"\n").expect("write csv");
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT * FROM read_csv({}) ORDER BY id",
+        sql_string(csv_path.to_str().expect("utf8 path"))
+    );
+
+    let rows = client.query(&sql, &[]).await.expect("read_csv file");
+    assert_eq!(rows[0].columns()[0].name(), "id");
+    assert_eq!(rows[0].columns()[1].name(), "name");
+    let values: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            ("1".to_string(), "Ada".to_string()),
+            ("2".to_string(), "Grace Hopper".to_string()),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn read_csv_glob_reads_matching_files_in_stable_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    fs::write(dir.path().join("b.csv"), "id,name\n2,Beta\n").expect("write b csv");
+    fs::write(dir.path().join("a.csv"), "id,name\n1,Alpha\n").expect("write a csv");
+    fs::write(dir.path().join("ignore.txt"), "id,name\n9,Nope\n").expect("write ignored file");
+
+    let pattern = dir.path().join("*.csv");
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT * FROM read_csv({}) ORDER BY id",
+        sql_string(pattern.to_str().expect("utf8 pattern"))
+    );
+
+    let rows = client.query(&sql, &[]).await.expect("read_csv glob");
+    let values: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            ("1".to_string(), "Alpha".to_string()),
+            ("2".to_string(), "Beta".to_string()),
+        ]
+    );
 
     shutdown(client, server_handle).await;
 }
