@@ -1074,6 +1074,11 @@ fn overlaps_values(left: &Value, right: &Value) -> Option<bool> {
                 elements: r_vals,
             },
         ) if l_ty == r_ty => Some(l_vals.iter().any(|v| r_vals.contains(v))),
+        (Value::Jsonb(l), Value::Jsonb(r)) => {
+            let left = text_collection_values(l);
+            let right = text_collection_values(r);
+            Some(left.iter().any(|v| right.contains(v)))
+        }
         (Value::Text(l), Value::Text(r)) => {
             let left = text_collection_values(l);
             let right = text_collection_values(r);
@@ -1097,18 +1102,19 @@ fn contains_values(left: &Value, right: &Value) -> Option<bool> {
                 elements: r_vals,
             },
         ) if l_ty == r_ty => Some(r_vals.iter().all(|v| l_vals.contains(v))),
+        (Value::Jsonb(l), Value::Jsonb(r)) => Some(text_contains(l, r)),
         (Value::Text(l), Value::Text(r)) => Some(text_contains(l, r)),
         _ => None,
     }
 }
 
 fn json_get(left: &Value, right: &Value, as_text: bool) -> Result<Value, EvalError> {
-    let Value::Text(json) = left else {
-        return Err(EvalError::Type(format!(
-            "JSON access requires text-backed JSONB, got {:?}",
+    let json = json_text(left).ok_or_else(|| {
+        EvalError::Type(format!(
+            "JSON access requires JSONB, got {:?}",
             left.data_type()
-        )));
-    };
+        ))
+    })?;
     let key = json_key_text(right)?;
     let Some(value) = json_object_value(json, &key) else {
         return Ok(Value::Null);
@@ -1116,19 +1122,22 @@ fn json_get(left: &Value, right: &Value, as_text: bool) -> Result<Value, EvalErr
     if as_text {
         Ok(Value::Text(unquote_json_scalar(value).to_owned()))
     } else {
-        Ok(Value::Text(value.to_owned()))
+        Ok(Value::Jsonb(value.to_owned()))
     }
 }
 
 fn json_has_key(left: &Value, right: &Value) -> Result<bool, EvalError> {
-    let Value::Text(json) = left else {
-        return Err(EvalError::Type(format!(
-            "? requires text-backed JSONB, got {:?}",
-            left.data_type()
-        )));
-    };
+    let json = json_text(left)
+        .ok_or_else(|| EvalError::Type(format!("? requires JSONB, got {:?}", left.data_type())))?;
     let key = json_key_text(right)?;
     Ok(json_object_value(json, &key).is_some())
+}
+
+fn json_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::Jsonb(text) | Value::Text(text) => Some(text.as_str()),
+        _ => None,
+    }
 }
 
 fn json_has_key_set(left: &Value, right: &Value, require_all: bool) -> Result<bool, EvalError> {
@@ -1932,6 +1941,13 @@ mod tests {
         }
     }
 
+    fn lit_jsonb(s: &str) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Jsonb(s.to_owned()),
+            data_type: DataType::Jsonb,
+        }
+    }
+
     fn lit_text_array(items: &[&str]) -> ScalarExpr {
         ScalarExpr::Literal {
             value: Value::Array {
@@ -2041,6 +2057,23 @@ mod tests {
             lit_text(r#"["a","b"]"#),
         ));
         assert_eq!(has_all.eval(&[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn native_jsonb_access_contains_and_key_ops_evaluate() {
+        let doc = lit_jsonb(r#"{"a":1,"b":"x"}"#);
+        let get_text = Eval::new(binop(BinaryOp::JsonGetText, doc.clone(), lit_text("b")));
+        assert_eq!(get_text.eval(&[]).unwrap(), Value::Text("x".into()));
+
+        let contains = Eval::new(binop(
+            BinaryOp::JsonContains,
+            doc.clone(),
+            lit_jsonb(r#"{"a":1}"#),
+        ));
+        assert_eq!(contains.eval(&[]).unwrap(), Value::Bool(true));
+
+        let has_key = Eval::new(binop(BinaryOp::JsonHasKey, doc, lit_text("b")));
+        assert_eq!(has_key.eval(&[]).unwrap(), Value::Bool(true));
     }
 
     #[test]

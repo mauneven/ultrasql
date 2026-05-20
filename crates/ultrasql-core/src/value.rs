@@ -306,6 +306,8 @@ pub enum Value {
     Float64(f64),
     /// UTF-8 text.
     Text(String),
+    /// JSONB-compatible textual payload.
+    Jsonb(String),
     /// Binary.
     Bytea(Vec<u8>),
     /// Microsecond-precision timestamp (no zone). Microseconds since
@@ -385,6 +387,7 @@ impl Hash for Value {
             Self::Float32(v) => v.to_bits().hash(state),
             Self::Float64(v) => v.to_bits().hash(state),
             Self::Text(v) => v.hash(state),
+            Self::Jsonb(v) => v.hash(state),
             Self::Bytea(v) => v.hash(state),
             Self::Timestamp(v) | Self::TimestampTz(v) | Self::Time(v) => v.hash(state),
             Self::Date(v) => v.hash(state),
@@ -431,6 +434,7 @@ impl Value {
             Self::Float32(_) => DataType::Float32,
             Self::Float64(_) => DataType::Float64,
             Self::Text(_) => DataType::Text { max_len: None },
+            Self::Jsonb(_) => DataType::Jsonb,
             Self::Bytea(_) => DataType::Bytea,
             Self::Timestamp(_) => DataType::Timestamp,
             Self::TimestampTz(_) => DataType::TimestampTz,
@@ -631,6 +635,7 @@ impl fmt::Display for Value {
             Self::Float32(v) => write!(f, "{v}"),
             Self::Float64(v) => write!(f, "{v}"),
             Self::Text(s) => write!(f, "{s}"),
+            Self::Jsonb(s) => write!(f, "{s}"),
             Self::Bytea(b) => {
                 f.write_str("\\x")?;
                 for byte in b {
@@ -720,6 +725,7 @@ fn parse_array_element(element_type: &DataType, raw: &str) -> Option<Value> {
         DataType::Float32 => text.parse::<f32>().ok().map(Value::Float32),
         DataType::Float64 => text.parse::<f64>().ok().map(Value::Float64),
         DataType::Text { .. } => Some(Value::Text(text)),
+        DataType::Jsonb => Some(Value::Jsonb(text)),
         DataType::Bytea => Value::parse_bytea(&text).map(Value::Bytea),
         DataType::Uuid => Value::parse_uuid(&text).map(Value::Uuid),
         _ => None,
@@ -1051,6 +1057,10 @@ mod tests {
             }
             .data_type(),
             DataType::Array(Box::new(DataType::Int32))
+        );
+        assert_eq!(
+            Value::Jsonb(r#"{"a":1}"#.into()).data_type(),
+            DataType::Jsonb
         );
         assert_eq!(Value::Null.data_type(), DataType::Null);
     }

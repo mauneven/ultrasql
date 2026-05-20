@@ -48,6 +48,7 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Ordering {
         }
 
         (Value::Text(la), Value::Text(lb)) => la.cmp(lb),
+        (Value::Jsonb(la), Value::Jsonb(lb)) => la.cmp(lb),
         (Value::Bytea(la), Value::Bytea(lb)) => la.cmp(lb),
         (Value::Bool(la), Value::Bool(lb)) => la.cmp(lb),
         (Value::Date(la), Value::Date(lb)) => la.cmp(lb),
@@ -129,6 +130,11 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             out.extend_from_slice(s.as_bytes());
             out
         }
+        Value::Jsonb(s) => {
+            let mut out = vec![18];
+            out.extend_from_slice(s.as_bytes());
+            out
+        }
         Value::Bytea(b) => {
             let mut out = vec![8];
             out.extend_from_slice(b);
@@ -190,7 +196,7 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             element_type,
             elements,
         } => {
-            let mut out = vec![18];
+            let mut out = vec![19];
             out.extend_from_slice(element_type.to_string().as_bytes());
             out.push(0);
             for element in elements {
@@ -248,6 +254,7 @@ const fn discriminant(v: &Value) -> u8 {
         Value::Float32(_) => 5,
         Value::Float64(_) => 6,
         Value::Text(_) => 7,
+        Value::Jsonb(_) => 18,
         Value::Bytea(_) => 8,
         Value::Timestamp(_) => 9,
         Value::TimestampTz(_) => 10,
@@ -258,7 +265,7 @@ const fn discriminant(v: &Value) -> u8 {
         Value::Interval { .. } => 15,
         Value::Range(_) => 16,
         Value::Geometry(_) => 17,
-        Value::Array { .. } => 18,
+        Value::Array { .. } => 19,
     }
 }
 

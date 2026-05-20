@@ -225,6 +225,30 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
                 },
             )
         }
+        DataType::Jsonb => {
+            let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
+            for (i, v) in values.iter().enumerate() {
+                match v {
+                    Value::Null => strings.push(None),
+                    Value::Jsonb(s) => strings.push(Some(s.clone())),
+                    other => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "projection: expected Jsonb at row {i}, got {:?}",
+                            other.data_type()
+                        )));
+                    }
+                }
+            }
+            Ok(
+                match encode_strings_auto(
+                    strings.iter().map(|v| v.as_deref()),
+                    DictionaryEncodingPolicy::default(),
+                ) {
+                    StringEncoding::Raw(c) => Column::Utf8(c),
+                    StringEncoding::Dictionary(c) => Column::DictionaryUtf8(c),
+                },
+            )
+        }
         DataType::Array(expected) => {
             let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
             for (i, v) in values.iter().enumerate() {

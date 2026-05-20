@@ -629,6 +629,7 @@ fn build_empty_batch(schema: &Schema) -> Result<Batch, ExecError> {
             DataType::Float32 => Column::Float32(NumericColumn::from_data(vec![])),
             DataType::Float64 => Column::Float64(NumericColumn::from_data(vec![])),
             DataType::Text { .. }
+            | DataType::Jsonb
             | DataType::Range(_)
             | DataType::Geometry(_)
             | DataType::Array(_) => Column::Utf8(StringColumn::from_data(vec![])),
@@ -746,6 +747,14 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                 for (row_idx, row) in rows.iter_mut().enumerate() {
                     match col.text_value(row_idx) {
                         Some(v) => row.push(Value::Text(v.to_owned())),
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Jsonb) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => row.push(Value::Jsonb(v.to_owned())),
                         None => row.push(Value::Null),
                     }
                 }

@@ -395,6 +395,9 @@ impl RowCodec {
                     payload.extend_from_slice(&len.to_le_bytes());
                     payload.extend_from_slice(bytes);
                 }
+                (DataType::Jsonb, Value::Jsonb(s)) => {
+                    encode_varlena_text(&mut payload, s, col_idx, &field.data_type)?;
+                }
                 (DataType::Array(expected), Value::Array { element_type, .. })
                     if expected.as_ref() == element_type =>
                 {
@@ -716,6 +719,10 @@ impl RowCodec {
                             got: "invalid range literal".to_owned(),
                         }
                     })?)
+                }
+                DataType::Jsonb => {
+                    let s = decode_varlena_text(bytes, &mut cursor, "jsonb column")?;
+                    Value::Jsonb(s)
                 }
                 DataType::Array(element_type) => {
                     let s = decode_varlena_text(bytes, &mut cursor, "array column")?;
@@ -1042,6 +1049,7 @@ impl RowCodec {
                 }
                 (
                     DataType::Text { .. }
+                    | DataType::Jsonb
                     | DataType::Range(_)
                     | DataType::Geometry(_)
                     | DataType::Array(_),
@@ -1279,6 +1287,7 @@ impl ColumnBuilder {
                 nulls: NullTracker::default(),
             },
             DataType::Text { .. }
+            | DataType::Jsonb
             | DataType::Range(_)
             | DataType::Geometry(_)
             | DataType::Array(_)
@@ -1429,6 +1438,7 @@ const fn is_supported_type(ty: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
             | DataType::Text { .. }
+            | DataType::Jsonb
             | DataType::Date
             | DataType::Time
             | DataType::Timestamp
@@ -1656,6 +1666,14 @@ mod tests {
             element_type: DataType::Int32,
             elements: vec![Value::Int32(1), Value::Int32(2), Value::Null],
         }];
+        assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
+    }
+
+    #[test]
+    fn round_trip_jsonb() {
+        let schema = Schema::new([Field::required("doc", DataType::Jsonb)]).unwrap();
+        let codec = RowCodec::new(schema);
+        let row = vec![Value::Jsonb(r#"{"a":1,"b":"x"}"#.into())];
         assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
     }
     #[test]

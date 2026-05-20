@@ -1311,9 +1311,12 @@ fn value_to_copy_cell_by_value(value: &Value) -> Option<Vec<u8>> {
         }
         Value::Date(v) => Some(v.to_string().into_bytes()),
         Value::Uuid(bytes) => Some(Value::Uuid(*bytes).to_string().into_bytes()),
-        Value::Decimal { .. } | Value::Interval { .. } | Value::Range(_) | Value::Geometry(_) => {
-            Some(value.to_string().into_bytes())
-        }
+        Value::Decimal { .. }
+        | Value::Interval { .. }
+        | Value::Range(_)
+        | Value::Geometry(_)
+        | Value::Jsonb(_)
+        | Value::Array { .. } => Some(value.to_string().into_bytes()),
     }
 }
 

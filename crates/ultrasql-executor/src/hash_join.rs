@@ -806,6 +806,10 @@ impl std::hash::Hash for OrderedValue {
                 state.write_u8(7);
                 s.hash(state);
             }
+            Value::Jsonb(s) => {
+                state.write_u8(17);
+                s.hash(state);
+            }
             Value::Bytea(b) => {
                 state.write_u8(8);
                 b.hash(state);
@@ -849,7 +853,7 @@ impl std::hash::Hash for OrderedValue {
                 element_type,
                 elements,
             } => {
-                state.write_u8(16);
+                state.write_u8(18);
                 element_type.hash(state);
                 elements.hash(state);
             }

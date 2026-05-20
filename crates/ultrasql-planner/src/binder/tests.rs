@@ -371,6 +371,16 @@ fn binds_create_table_array_column_types() {
 }
 
 #[test]
+fn binds_create_table_jsonb_column_type() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("CREATE TABLE t (doc JSONB)", &cat).expect("bind ok");
+    let LogicalPlan::CreateTable { columns, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(columns.fields()[0].data_type, DataType::Jsonb);
+}
+
+#[test]
 fn binds_create_table_primary_key_implies_not_null() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind("CREATE TABLE t (id INT PRIMARY KEY)", &cat).expect("bind ok");
@@ -649,11 +659,9 @@ fn binds_create_sequence_rejects_restart() {
 
 #[test]
 fn binds_create_table_rejects_unsupported_column_type() {
-    // `JSONB` is still unsupported. The fixed-width numeric / text /
-    // temporal / decimal types have all moved to the supported set
-    // as of the v0.6 TPC-H milestone landing.
+    // XML remains outside the supported storage type set.
     let cat = InMemoryCatalog::new();
-    let err = parse_and_bind("CREATE TABLE t (id JSONB)", &cat).unwrap_err();
+    let err = parse_and_bind("CREATE TABLE t (id XML)", &cat).unwrap_err();
     assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
 }
 

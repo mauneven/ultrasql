@@ -110,6 +110,10 @@ impl Hash for KeyValue {
                 state.write_u8(7);
                 s.hash(state);
             }
+            Value::Jsonb(s) => {
+                state.write_u8(17);
+                s.hash(state);
+            }
             Value::Bytea(b) => {
                 state.write_u8(8);
                 b.hash(state);
@@ -153,7 +157,7 @@ impl Hash for KeyValue {
                 element_type,
                 elements,
             } => {
-                state.write_u8(16);
+                state.write_u8(18);
                 element_type.hash(state);
                 elements.hash(state);
             }

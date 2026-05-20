@@ -795,6 +795,7 @@ fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
         "varchar" | "character varying" | "char" | "character" | "bpchar" => Ok(DataType::Text {
             max_len: max_len_modifier(),
         }),
+        "json" | "jsonb" => Ok(DataType::Jsonb),
         "bytea" => Ok(DataType::Bytea),
         // `DATE` columns are encoded by the row codec as 4-byte
         // little-endian i32 days since 2000-01-01 (see
