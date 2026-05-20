@@ -58,6 +58,14 @@ struct Cli {
     #[arg(long)]
     case_limit: Option<usize>,
 
+    /// Print progress every N executed/filtered cases. Zero disables progress output.
+    #[arg(long, default_value_t = 0)]
+    progress_every: u64,
+
+    /// Warn when one case takes at least this many milliseconds.
+    #[arg(long)]
+    slow_case_ms: Option<u128>,
+
     /// Skip-filter file. Lines are `pattern<TAB>reason`; `#` starts comments.
     #[arg(
         long = "skip-filter",
@@ -246,15 +254,14 @@ async fn main() -> Result<()> {
         apply_case_limit(&mut cases_by_file, case_limit);
     }
 
-    let (client, _in_process_server) = connect_ultrasql_target(&cli).await?;
-
-    let references = connect_reference_targets(&cli).await?;
-
     let mut summary = Summary::default();
     for (_file, cases) in &cases_by_file {
+        let (client, _in_process_server) = connect_ultrasql_target(&cli).await?;
+        let references = connect_reference_targets(&cli).await?;
         summary.files = summary.files.saturating_add(1);
         for case in cases {
             summary.cases = summary.cases.saturating_add(1);
+            let case_start = Instant::now();
             match run_case(&client, &references, &filters, &enabled_features, case).await {
                 CaseOutcome::Passed => summary.passed = summary.passed.saturating_add(1),
                 CaseOutcome::Skipped(reason) => {
@@ -265,6 +272,25 @@ async fn main() -> Result<()> {
                     summary.failed = summary.failed.saturating_add(1);
                     eprintln!("fail {}:{}\n{message}", case.path.display(), case.line);
                 }
+            }
+            let elapsed_ms = case_start.elapsed().as_millis();
+            if cli
+                .slow_case_ms
+                .is_some_and(|threshold_ms| elapsed_ms >= threshold_ms)
+            {
+                eprintln!(
+                    "slow-case {}:{} elapsed_ms={} sql={}",
+                    case.path.display(),
+                    case.line,
+                    elapsed_ms,
+                    compact_sql(case.sql())
+                );
+            }
+            if cli.progress_every > 0 && summary.cases % cli.progress_every == 0 {
+                eprintln!(
+                    "slt progress: cases={} passed={} skipped={} failed={}",
+                    summary.cases, summary.passed, summary.skipped, summary.failed
+                );
             }
         }
     }
@@ -304,6 +330,16 @@ async fn main() -> Result<()> {
         println!("slt benchmark artifact: {}", output_path.display());
     }
     Ok(())
+}
+
+fn compact_sql(sql: &str) -> String {
+    let mut compact = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX_LEN: usize = 160;
+    if compact.len() > MAX_LEN {
+        compact.truncate(MAX_LEN);
+        compact.push_str("...");
+    }
+    compact
 }
 
 fn apply_case_limit(cases_by_file: &mut Vec<(PathBuf, Vec<TestCase>)>, limit: usize) {

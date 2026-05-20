@@ -10,3 +10,4 @@ CREATE INDEX idx_tab2_0 ON tab2 (col3,col1)	Hydromatic SLT uses composite float 
 CREATE UNIQUE INDEX idx_tab3_1 ON tab3 (col1,col0)	Hydromatic SLT uses composite float indexes beyond current UltraSQL index-key support; query semantics still run through scans.
 CREATE INDEX idx_tab4_0 ON tab4 (col4,col0)	Hydromatic SLT uses composite float indexes beyond current UltraSQL index-key support; query semantics still run through scans.
 CREATE INDEX idx_tab4_5 ON tab4 (col1,col4,col3)	Hydromatic SLT uses composite float indexes beyond current UltraSQL index-key support; query semantics still run through scans.
+ IN (SELECT	Hydromatic generated predicates embed IN-subqueries inside OR/AND trees; UltraSQL currently decorrelates only simpler IN-subquery filter shapes.
