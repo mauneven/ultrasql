@@ -35,7 +35,7 @@
 
 use parking_lot::Mutex;
 use thiserror::Error;
-use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
+use ultrasql_core::{BlockNumber, MAX_VECTOR_DIMS, PageId, RelationId, TupleId, Xid};
 use ultrasql_wal::WalRecord;
 use ultrasql_wal::payload::{HashOpKind, HashOpPayload};
 use ultrasql_wal::record::RecordType;
@@ -905,6 +905,442 @@ impl AccessMethod for GistIndex {
 }
 
 // ---------------------------------------------------------------------------
+// HNSW vector index
+// ---------------------------------------------------------------------------
+
+/// Distance metric attached to an HNSW vector index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HnswMetric {
+    /// Euclidean distance, matching pgvector's `<->` operator.
+    L2,
+    /// Cosine distance, matching pgvector's `<=>` operator.
+    Cosine,
+    /// Negative inner product, matching pgvector's `<#>` ordering.
+    NegativeInnerProduct,
+}
+
+impl HnswMetric {
+    fn distance(self, left: &[f32], right: &[f32]) -> f32 {
+        match self {
+            Self::L2 => ultrasql_vec::kernels::vector::l2_distance_f32(left, right),
+            Self::Cosine => ultrasql_vec::kernels::vector::cosine_distance_f32(left, right)
+                .unwrap_or(f32::INFINITY),
+            Self::NegativeInnerProduct => -ultrasql_vec::kernels::vector::dot_f32(left, right),
+        }
+    }
+}
+
+/// One result from an HNSW search.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HnswSearchResult {
+    /// Heap tuple identifier stored in the index node.
+    pub tid: TupleId,
+    /// Distance from the search probe under the index metric.
+    pub distance: f32,
+}
+
+/// First in-memory HNSW-style vector index.
+///
+/// This implementation is intentionally runtime-only. It gives the SQL layer
+/// a real ANN access-method target behind `CREATE INDEX USING hnsw`, while the
+/// page layout, WAL records, MVCC-aware deletes, and rebuild protocol from
+/// `docs/hnsw-index-design.md` remain separate storage slices. The graph uses
+/// one navigable layer: inserts connect each new vector to its nearest `m`
+/// existing live nodes, and searches perform bounded best-first traversal.
+///
+/// The `available` flag lets callers fall back to exact top-k after DML or
+/// restart invalidates the runtime graph.
+#[derive(Debug)]
+pub struct HnswIndex {
+    storage: Mutex<HnswStorage>,
+    dims: usize,
+    metric: HnswMetric,
+    m: usize,
+    ef_search: usize,
+}
+
+#[derive(Debug, Default)]
+struct HnswStorage {
+    entries: Vec<HnswEntry>,
+    entry_node: Option<usize>,
+    available: bool,
+}
+
+#[derive(Debug, Clone)]
+struct HnswEntry {
+    vector: Vec<f32>,
+    tid: TupleId,
+    neighbors: Vec<usize>,
+    deleted: bool,
+}
+
+impl HnswIndex {
+    /// Create an empty runtime HNSW graph.
+    ///
+    /// `dims` must be in `1..=MAX_VECTOR_DIMS`; `m` and `ef_search` must be
+    /// non-zero. The implementation stores vectors as finite `f32` values.
+    pub fn new(
+        dims: u32,
+        metric: HnswMetric,
+        m: usize,
+        ef_search: usize,
+    ) -> Result<Self, AccessMethodError> {
+        if dims == 0 || dims > MAX_VECTOR_DIMS {
+            return Err(AccessMethodError::Storage(
+                "hnsw dims outside supported range".to_owned(),
+            ));
+        }
+        if m == 0 {
+            return Err(AccessMethodError::Storage(
+                "hnsw m must be greater than zero".to_owned(),
+            ));
+        }
+        if ef_search == 0 {
+            return Err(AccessMethodError::Storage(
+                "hnsw ef_search must be greater than zero".to_owned(),
+            ));
+        }
+        let dims = usize::try_from(dims)
+            .map_err(|_| AccessMethodError::Storage("hnsw dims do not fit usize".to_owned()))?;
+        Ok(Self {
+            storage: Mutex::new(HnswStorage::default()),
+            dims,
+            metric,
+            m,
+            ef_search,
+        })
+    }
+
+    /// Return this index's distance metric.
+    #[must_use]
+    pub const fn metric(&self) -> HnswMetric {
+        self.metric
+    }
+
+    /// Return this index's vector dimension.
+    #[must_use]
+    pub const fn dims(&self) -> usize {
+        self.dims
+    }
+
+    /// Return whether the runtime graph can currently be used.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        self.storage.lock().available
+    }
+
+    /// Mark the runtime graph unavailable.
+    ///
+    /// The SQL layer calls this when DML touches a table whose HNSW graph is
+    /// not yet maintained online. Later queries then use exact top-k fallback.
+    pub fn invalidate(&self) {
+        self.storage.lock().available = false;
+    }
+
+    /// Insert one finite vector into the graph.
+    pub fn insert_vector(&self, vector: &[f32], tid: TupleId) -> Result<(), AccessMethodError> {
+        self.validate_vector(vector)?;
+        let mut storage = self.storage.lock();
+        let new_idx = storage.entries.len();
+        let mut neighbors: Vec<(usize, f32, TupleId)> = storage
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| !entry.deleted)
+            .map(|(idx, entry)| (idx, self.metric.distance(vector, &entry.vector), entry.tid))
+            .collect();
+        neighbors.sort_by(compare_hnsw_candidates);
+        neighbors.truncate(self.m);
+        let neighbor_ids: Vec<usize> = neighbors.iter().map(|(idx, _, _)| *idx).collect();
+
+        storage.entries.push(HnswEntry {
+            vector: vector.to_vec(),
+            tid,
+            neighbors: neighbor_ids.clone(),
+            deleted: false,
+        });
+        if storage.entry_node.is_none() {
+            storage.entry_node = Some(new_idx);
+        }
+        storage.available = true;
+
+        for neighbor in neighbor_ids {
+            if let Some(entry) = storage.entries.get_mut(neighbor)
+                && !entry.neighbors.contains(&new_idx)
+            {
+                entry.neighbors.push(new_idx);
+            }
+            self.trim_neighbors(&mut storage, neighbor);
+        }
+        Ok(())
+    }
+
+    /// Search for the nearest `k` tuple IDs.
+    ///
+    /// Returns an empty result when the runtime graph is unavailable so callers
+    /// can fall back to exact scan without treating invalidation as an error.
+    pub fn search(
+        &self,
+        probe: &[f32],
+        k: usize,
+    ) -> Result<Vec<HnswSearchResult>, AccessMethodError> {
+        self.validate_vector(probe)?;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let storage = self.storage.lock();
+        if !storage.available {
+            return Ok(Vec::new());
+        }
+        let live_count = storage
+            .entries
+            .iter()
+            .filter(|entry| !entry.deleted)
+            .count();
+        if live_count == 0 {
+            return Ok(Vec::new());
+        }
+        if live_count <= self.ef_search {
+            return Ok(self.exact_search_locked(&storage, probe, k));
+        }
+
+        let Some(mut entry_idx) = storage
+            .entry_node
+            .filter(|idx| {
+                storage
+                    .entries
+                    .get(*idx)
+                    .is_some_and(|entry| !entry.deleted)
+            })
+            .or_else(|| storage.entries.iter().position(|entry| !entry.deleted))
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut improved = true;
+        while improved {
+            improved = false;
+            let current_distance = self
+                .metric
+                .distance(probe, &storage.entries[entry_idx].vector);
+            for &neighbor in &storage.entries[entry_idx].neighbors {
+                let Some(candidate) = storage.entries.get(neighbor) else {
+                    continue;
+                };
+                if candidate.deleted {
+                    continue;
+                }
+                let distance = self.metric.distance(probe, &candidate.vector);
+                if distance < current_distance {
+                    entry_idx = neighbor;
+                    improved = true;
+                    break;
+                }
+            }
+        }
+
+        let mut visited = vec![false; storage.entries.len()];
+        let mut frontier = vec![entry_idx];
+        visited[entry_idx] = true;
+        let mut explored = Vec::with_capacity(self.ef_search.min(live_count));
+
+        while !frontier.is_empty() && explored.len() < self.ef_search {
+            let best_pos = best_frontier_position(&frontier, &storage, probe, self.metric);
+            let idx = frontier.swap_remove(best_pos);
+            let entry = &storage.entries[idx];
+            if !entry.deleted {
+                explored.push(idx);
+            }
+            for &neighbor in &entry.neighbors {
+                if neighbor >= visited.len() || visited[neighbor] {
+                    continue;
+                }
+                visited[neighbor] = true;
+                if !storage.entries[neighbor].deleted {
+                    frontier.push(neighbor);
+                }
+            }
+        }
+
+        let mut hits: Vec<HnswSearchResult> = explored
+            .into_iter()
+            .map(|idx| {
+                let entry = &storage.entries[idx];
+                HnswSearchResult {
+                    tid: entry.tid,
+                    distance: self.metric.distance(probe, &entry.vector),
+                }
+            })
+            .collect();
+        hits.sort_by(compare_hnsw_hits);
+        hits.truncate(k);
+        Ok(hits)
+    }
+
+    /// Mark an indexed tuple ID deleted.
+    pub fn mark_deleted(&self, tid: TupleId) -> Result<(), AccessMethodError> {
+        let mut storage = self.storage.lock();
+        if let Some(entry) = storage
+            .entries
+            .iter_mut()
+            .find(|entry| entry.tid == tid && !entry.deleted)
+        {
+            entry.deleted = true;
+            return Ok(());
+        }
+        Err(AccessMethodError::NotFound)
+    }
+
+    fn validate_vector(&self, vector: &[f32]) -> Result<(), AccessMethodError> {
+        if vector.len() != self.dims {
+            return Err(AccessMethodError::Storage(format!(
+                "hnsw vector dimension mismatch: expected {}, got {}",
+                self.dims,
+                vector.len()
+            )));
+        }
+        if vector.iter().any(|v| !v.is_finite()) {
+            return Err(AccessMethodError::Storage(
+                "hnsw vector elements must be finite".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn exact_search_locked(
+        &self,
+        storage: &HnswStorage,
+        probe: &[f32],
+        k: usize,
+    ) -> Vec<HnswSearchResult> {
+        let mut hits: Vec<HnswSearchResult> = storage
+            .entries
+            .iter()
+            .filter(|entry| !entry.deleted)
+            .map(|entry| HnswSearchResult {
+                tid: entry.tid,
+                distance: self.metric.distance(probe, &entry.vector),
+            })
+            .collect();
+        hits.sort_by(compare_hnsw_hits);
+        hits.truncate(k);
+        hits
+    }
+
+    fn trim_neighbors(&self, storage: &mut HnswStorage, idx: usize) {
+        if idx >= storage.entries.len() {
+            return;
+        }
+        let origin = storage.entries[idx].vector.clone();
+        let mut neighbors = std::mem::take(&mut storage.entries[idx].neighbors);
+        neighbors.retain(|neighbor| {
+            storage
+                .entries
+                .get(*neighbor)
+                .is_some_and(|entry| !entry.deleted)
+        });
+        neighbors.sort_by(|left, right| {
+            let left_entry = &storage.entries[*left];
+            let right_entry = &storage.entries[*right];
+            let left_distance = self.metric.distance(&origin, &left_entry.vector);
+            let right_distance = self.metric.distance(&origin, &right_entry.vector);
+            left_distance
+                .total_cmp(&right_distance)
+                .then_with(|| left_entry.tid.cmp(&right_entry.tid))
+        });
+        neighbors.dedup();
+        neighbors.truncate(self.m);
+        storage.entries[idx].neighbors = neighbors;
+    }
+}
+
+impl AccessMethod for HnswIndex {
+    fn name(&self) -> &'static str {
+        "hnsw"
+    }
+
+    fn insert(&self, key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
+        let vector = decode_hnsw_vector_key(key, self.dims)?;
+        self.insert_vector(&vector, tid)
+    }
+
+    fn lookup(&self, _key: &[u8]) -> Result<Vec<TupleId>, AccessMethodError> {
+        Err(AccessMethodError::NotImplemented(
+            "hnsw lookup requires vector top-k search",
+        ))
+    }
+
+    fn delete(&self, _key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
+        self.mark_deleted(tid)
+    }
+}
+
+fn decode_hnsw_vector_key(key: &[u8], dims: usize) -> Result<Vec<f32>, AccessMethodError> {
+    let expected = dims
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| AccessMethodError::Storage("hnsw key length overflow".to_owned()))?;
+    if key.len() != expected {
+        return Err(AccessMethodError::Storage(format!(
+            "hnsw key length mismatch: expected {expected}, got {}",
+            key.len()
+        )));
+    }
+    let mut vector = Vec::with_capacity(dims);
+    for chunk in key.chunks_exact(std::mem::size_of::<f32>()) {
+        let bytes: [u8; 4] = chunk
+            .try_into()
+            .map_err(|_| AccessMethodError::Storage("hnsw key chunk width".to_owned()))?;
+        let value = f32::from_le_bytes(bytes);
+        if !value.is_finite() {
+            return Err(AccessMethodError::Storage(
+                "hnsw vector elements must be finite".to_owned(),
+            ));
+        }
+        vector.push(value);
+    }
+    Ok(vector)
+}
+
+fn compare_hnsw_candidates(
+    left: &(usize, f32, TupleId),
+    right: &(usize, f32, TupleId),
+) -> std::cmp::Ordering {
+    left.1
+        .total_cmp(&right.1)
+        .then_with(|| left.2.cmp(&right.2))
+        .then_with(|| left.0.cmp(&right.0))
+}
+
+fn compare_hnsw_hits(left: &HnswSearchResult, right: &HnswSearchResult) -> std::cmp::Ordering {
+    left.distance
+        .total_cmp(&right.distance)
+        .then_with(|| left.tid.cmp(&right.tid))
+}
+
+fn best_frontier_position(
+    frontier: &[usize],
+    storage: &HnswStorage,
+    probe: &[f32],
+    metric: HnswMetric,
+) -> usize {
+    let mut best = 0usize;
+    for idx in 1..frontier.len() {
+        let current = &storage.entries[frontier[idx]];
+        let best_entry = &storage.entries[frontier[best]];
+        let current_distance = metric.distance(probe, &current.vector);
+        let best_distance = metric.distance(probe, &best_entry.vector);
+        if current_distance
+            .total_cmp(&best_distance)
+            .then_with(|| current.tid.cmp(&best_entry.tid))
+            .is_lt()
+        {
+            best = idx;
+        }
+    }
+    best
+}
+
+// ---------------------------------------------------------------------------
 // BRIN (Block Range Index) min/max summaries
 // ---------------------------------------------------------------------------
 
@@ -1408,5 +1844,34 @@ mod tests {
         am.insert(b"k", tid(0, 0)).expect("insert");
         // BRIN delete is always Ok — no per-tuple tracking.
         am.delete(b"k", tid(0, 0)).expect("brin delete no-op");
+    }
+
+    // --- HnswIndex ---
+
+    #[test]
+    fn hnsw_insert_vector_and_search_returns_nearest_tids() {
+        let am = HnswIndex::new(3, HnswMetric::L2, 4, 16).expect("hnsw config");
+        am.insert_vector(&[0.0, 0.0, 0.0], tid(1, 0))
+            .expect("insert origin");
+        am.insert_vector(&[1.0, 0.0, 0.0], tid(1, 1))
+            .expect("insert near");
+        am.insert_vector(&[10.0, 0.0, 0.0], tid(1, 2))
+            .expect("insert far");
+
+        let hits = am.search(&[0.2, 0.0, 0.0], 2).expect("search");
+        let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
+        assert_eq!(tids, vec![tid(1, 0), tid(1, 1)]);
+    }
+
+    #[test]
+    fn hnsw_invalidate_makes_index_unavailable_for_search() {
+        let am = HnswIndex::new(3, HnswMetric::L2, 4, 16).expect("hnsw config");
+        am.insert_vector(&[0.0, 0.0, 0.0], tid(1, 0))
+            .expect("insert origin");
+
+        assert!(am.is_available());
+        am.invalidate();
+        assert!(!am.is_available());
+        assert!(am.search(&[0.0, 0.0, 0.0], 1).expect("search").is_empty());
     }
 }

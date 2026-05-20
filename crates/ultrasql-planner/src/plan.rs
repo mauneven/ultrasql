@@ -94,6 +94,8 @@ pub enum LogicalIndexMethod {
     Gist,
     /// Block range index method.
     Brin,
+    /// Hierarchical navigable small world vector index method.
+    Hnsw,
 }
 
 /// Planner-selected execution family for a logical pipeline.
@@ -1867,6 +1869,7 @@ impl LogicalPlan {
                     LogicalIndexMethod::Gin => "gin",
                     LogicalIndexMethod::Gist => "gist",
                     LogicalIndexMethod::Brin => "brin",
+                    LogicalIndexMethod::Hnsw => "hnsw",
                 };
                 let _ = fmt::write(
                     out,

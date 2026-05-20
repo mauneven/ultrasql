@@ -588,8 +588,9 @@ fn bind_index_method(method: &str) -> Result<LogicalIndexMethod, PlanError> {
         "gin" => Ok(LogicalIndexMethod::Gin),
         "gist" => Ok(LogicalIndexMethod::Gist),
         "brin" => Ok(LogicalIndexMethod::Brin),
+        "hnsw" => Ok(LogicalIndexMethod::Hnsw),
         _ => Err(PlanError::NotSupported(
-            "only btree, hash, gin, gist, and brin methods are supported",
+            "only btree, hash, gin, gist, brin, and hnsw methods are supported",
         )),
     }
 }
@@ -1097,9 +1098,9 @@ fn default_sequence_start(options: LogicalSequenceOptions) -> i64 {
 ///
 /// - bare column-reference keys (`(col1, col2, ...)`) and single
 ///   expression keys (`(lower(col))`) for B-tree storage.
-/// - `USING hash`, `USING gin`, `USING gist`, and `USING brin` are preserved
-///   in the logical plan so catalog/runtime metadata can route maintenance to
-///   the requested access method.
+/// - `USING hash`, `USING gin`, `USING gist`, `USING brin`, and `USING hnsw`
+///   are preserved in the logical plan so catalog/runtime metadata can route
+///   maintenance to the requested access method.
 /// - `INCLUDE` covering columns and `WHERE` partial-index predicates
 ///   are bound into runtime metadata; they do not change the key
 ///   encoding.
@@ -1127,9 +1128,10 @@ pub(super) fn bind_create_index(
         Some(method) if method == "gin" => LogicalIndexMethod::Gin,
         Some(method) if method == "gist" => LogicalIndexMethod::Gist,
         Some(method) if method == "brin" => LogicalIndexMethod::Brin,
+        Some(method) if method == "hnsw" => LogicalIndexMethod::Hnsw,
         Some(_) => {
             return Err(PlanError::NotSupported(
-                "CREATE INDEX: only btree, hash, gin, gist, and brin methods are supported",
+                "CREATE INDEX: only btree, hash, gin, gist, brin, and hnsw methods are supported",
             ));
         }
     };
@@ -1154,6 +1156,11 @@ pub(super) fn bind_create_index(
     {
         return Err(PlanError::NotSupported(
             "CREATE UNIQUE INDEX: gin, gist, and brin indexes do not enforce uniqueness",
+        ));
+    }
+    if method == LogicalIndexMethod::Hnsw && s.unique {
+        return Err(PlanError::NotSupported(
+            "CREATE UNIQUE INDEX USING hnsw: hnsw indexes do not enforce uniqueness",
         ));
     }
     let mut col_indices: Vec<usize> = Vec::with_capacity(s.columns.len());
@@ -1182,6 +1189,33 @@ pub(super) fn bind_create_index(
             ));
         }
         col_indices.clear();
+    }
+
+    if method == LogicalIndexMethod::Hnsw {
+        if s.columns.len() != 1 || col_indices.len() != 1 {
+            return Err(PlanError::NotSupported(
+                "CREATE INDEX USING hnsw: exactly one vector column key is supported",
+            ));
+        }
+        let field = table_schema
+            .field(col_indices[0])
+            .ok_or_else(|| PlanError::ColumnNotFound(format!("column index {}", col_indices[0])))?;
+        if !matches!(field.data_type, DataType::Vector { dims: Some(_) }) {
+            return Err(PlanError::TypeMismatch(format!(
+                "CREATE INDEX USING hnsw requires a vector(n) column, got {}",
+                field.data_type
+            )));
+        }
+        if !s.include.is_empty() {
+            return Err(PlanError::NotSupported(
+                "CREATE INDEX USING hnsw: INCLUDE columns are not supported in this wave",
+            ));
+        }
+        if s.r#where.is_some() {
+            return Err(PlanError::NotSupported(
+                "CREATE INDEX USING hnsw: partial indexes are not supported in this wave",
+            ));
+        }
     }
 
     let mut include_columns = Vec::with_capacity(s.include.len());

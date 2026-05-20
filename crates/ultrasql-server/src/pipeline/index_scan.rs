@@ -4,17 +4,18 @@
 use std::sync::Arc;
 
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
-use ultrasql_core::{DataType, Field, RelationId, TupleId, Value};
+use ultrasql_core::{BlockNumber, DataType, Field, RelationId, TupleId, Value};
 use ultrasql_executor::{Filter, IndexOnlyScan, IndexScan, Operator, RowCodec};
 use ultrasql_mvcc::{Visibility, is_visible};
 use ultrasql_planner::{BinaryOp, LogicalIndexMethod, LogicalPlan, ScalarExpr, SortKey};
-use ultrasql_storage::access_method::BrinIndex;
+use ultrasql_storage::access_method::{BrinIndex, HnswIndex, HnswMetric};
 use ultrasql_storage::btree::BTree;
 
 use crate::BlankPageLoader;
 use crate::error::ServerError;
 
 use super::LowerCtx;
+use super::modify::lower_project_columns;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct IndexKeyRange {
@@ -188,6 +189,211 @@ fn try_brin_index_scan(
     let codec = RowCodec::new(table_entry.schema.clone());
     let scan = Box::new(IndexScan::new(payloads, codec));
     Ok(Some(Box::new(Filter::new(scan, predicate.clone()))))
+}
+
+/// Try to lower `ORDER BY vector_distance LIMIT k` through an available HNSW
+/// runtime graph.
+///
+/// Missing or invalid HNSW metadata returns `Ok(None)`, letting the caller use
+/// exact `Sort + Limit`. This is the correctness fallback for restarts, DML
+/// invalidation, unsupported metrics, and non-top-k shapes.
+pub(super) fn try_hnsw_top_k_limit(
+    input: &LogicalPlan,
+    limit: u64,
+    offset: u64,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    if offset != 0 || limit == 0 || limit == u64::MAX {
+        return Ok(None);
+    }
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    match input {
+        LogicalPlan::Sort {
+            input: sort_input,
+            keys,
+        } => try_hnsw_sorted_scan(sort_input, keys, limit, ctx),
+        LogicalPlan::Project {
+            input: project_input,
+            exprs,
+            ..
+        } => {
+            let LogicalPlan::Sort {
+                input: sort_input,
+                keys,
+            } = project_input.as_ref()
+            else {
+                return Ok(None);
+            };
+            let Some(scan) = try_hnsw_sorted_scan(sort_input, keys, limit, ctx)? else {
+                return Ok(None);
+            };
+            lower_project_columns(scan, exprs).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn try_hnsw_sorted_scan(
+    sort_input: &LogicalPlan,
+    keys: &[SortKey],
+    limit: usize,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let [key] = keys else {
+        return Ok(None);
+    };
+    if !key.asc {
+        return Ok(None);
+    }
+    let LogicalPlan::Scan {
+        table, projection, ..
+    } = sort_input
+    else {
+        return Ok(None);
+    };
+    if projection.is_some() {
+        return Ok(None);
+    }
+    let Some(table_entry) = ctx.catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    let Some((col_idx, metric, probe)) = match_hnsw_sort_key(&key.expr) else {
+        return Ok(None);
+    };
+    let Some(hnsw) = find_hnsw_index(ctx, table_entry, col_idx, metric) else {
+        return Ok(None);
+    };
+    let hits = hnsw
+        .search(&probe, limit)
+        .map_err(|e| ServerError::ddl(format!("HNSW search: {e}")))?;
+    if hits.is_empty() {
+        return Ok(None);
+    }
+    let payloads = fetch_hnsw_visible_payloads(&hits, table_entry, col_idx, metric, &probe, ctx)?;
+    let codec = RowCodec::new(table_entry.schema.clone());
+    Ok(Some(Box::new(IndexScan::new(payloads, codec))))
+}
+
+fn match_hnsw_sort_key(expr: &ScalarExpr) -> Option<(usize, HnswMetric, Vec<f32>)> {
+    let ScalarExpr::Binary {
+        op, left, right, ..
+    } = expr
+    else {
+        return None;
+    };
+    let metric = match op {
+        BinaryOp::VectorL2Distance => HnswMetric::L2,
+        BinaryOp::VectorCosineDistance => HnswMetric::Cosine,
+        BinaryOp::VectorNegativeInnerProduct => HnswMetric::NegativeInnerProduct,
+        BinaryOp::VectorL1Distance => return None,
+        _ => return None,
+    };
+    hnsw_column_probe(left, right, metric).or_else(|| hnsw_column_probe(right, left, metric))
+}
+
+fn hnsw_column_probe(
+    column: &ScalarExpr,
+    probe: &ScalarExpr,
+    metric: HnswMetric,
+) -> Option<(usize, HnswMetric, Vec<f32>)> {
+    let ScalarExpr::Column {
+        index,
+        data_type: DataType::Vector { .. },
+        ..
+    } = column
+    else {
+        return None;
+    };
+    let ScalarExpr::Literal {
+        value: Value::Vector(values),
+        ..
+    } = probe
+    else {
+        return None;
+    };
+    Some((*index, metric, values.clone()))
+}
+
+fn find_hnsw_index(
+    ctx: &LowerCtx<'_>,
+    table_entry: &TableEntry,
+    col_idx: usize,
+    metric: HnswMetric,
+) -> Option<Arc<HnswIndex>> {
+    let attnum = u16::try_from(col_idx).ok()?;
+    let indexes = ctx
+        .catalog_snapshot
+        .indexes_by_table
+        .get(&table_entry.oid)?;
+    let constraints = ctx.table_constraints.get(&table_entry.oid)?;
+    indexes.iter().find_map(|index| {
+        if index.columns.as_slice() != [attnum] {
+            return None;
+        }
+        let metadata = constraints.indexes.get(&index.oid)?;
+        if metadata.method != LogicalIndexMethod::Hnsw {
+            return None;
+        }
+        let hnsw = metadata.hnsw.as_ref()?;
+        if hnsw.metric() == metric && hnsw.is_available() {
+            Some(Arc::clone(hnsw))
+        } else {
+            None
+        }
+    })
+}
+
+fn fetch_hnsw_visible_payloads(
+    hits: &[ultrasql_storage::access_method::HnswSearchResult],
+    table_entry: &TableEntry,
+    col_idx: usize,
+    metric: HnswMetric,
+    probe: &[f32],
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<Vec<u8>>, ServerError> {
+    let codec = RowCodec::new(table_entry.schema.clone());
+    let mut rows: Vec<(f32, TupleId, Vec<u8>)> = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let tuple = ctx
+            .heap
+            .fetch(hit.tid)
+            .map_err(|e| ServerError::ddl(format!("HNSW heap fetch: {e}")))?;
+        let visibility = is_visible(&tuple.header, &ctx.snapshot, ctx.oracle.as_ref());
+        if !matches!(visibility, Visibility::Visible) {
+            continue;
+        }
+        let row = codec
+            .decode(&tuple.data)
+            .map_err(|e| ServerError::ddl(format!("HNSW heap decode: {e}")))?;
+        let Some(Value::Vector(vector)) = row.get(col_idx) else {
+            return Err(ServerError::ddl(
+                "HNSW heap recheck: key column did not decode as vector",
+            ));
+        };
+        if vector.len() != probe.len() {
+            return Err(ServerError::ddl(
+                "HNSW heap recheck: vector dimension mismatch",
+            ));
+        }
+        let distance = metric_distance(metric, vector, probe);
+        rows.push((distance, hit.tid, tuple.data));
+    }
+    rows.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    Ok(rows.into_iter().map(|(_, _, payload)| payload).collect())
+}
+
+fn metric_distance(metric: HnswMetric, left: &[f32], right: &[f32]) -> f32 {
+    match metric {
+        HnswMetric::L2 => ultrasql_vec::kernels::vector::l2_distance_f32(left, right),
+        HnswMetric::Cosine => {
+            ultrasql_vec::kernels::vector::cosine_distance_f32(left, right).unwrap_or(f32::INFINITY)
+        }
+        HnswMetric::NegativeInnerProduct => -ultrasql_vec::kernels::vector::dot_f32(left, right),
+    }
 }
 
 /// Try to lower `ORDER BY indexed_col [ASC|DESC]` over a bare table scan into
@@ -527,6 +733,7 @@ pub(super) fn find_single_column_index<'a>(
     indexes.iter().find(|e| {
         e.columns.len() == 1
             && e.columns[0] == attnum
+            && e.root_block != BlockNumber::INVALID
             && index_method(ctx, table_entry.oid, e.oid) == LogicalIndexMethod::Btree
     })
 }
@@ -542,6 +749,7 @@ fn find_single_column_hash_index<'a>(
     indexes.iter().find(|e| {
         e.columns.len() == 1
             && e.columns[0] == attnum
+            && e.root_block != BlockNumber::INVALID
             && index_method(ctx, table_entry.oid, e.oid) == LogicalIndexMethod::Hash
     })
 }
@@ -557,6 +765,7 @@ fn find_single_column_brin_index<'a>(
     indexes.iter().find(|e| {
         e.columns.len() == 1
             && e.columns[0] == attnum
+            && e.root_block != BlockNumber::INVALID
             && index_method(ctx, table_entry.oid, e.oid) == LogicalIndexMethod::Brin
     })
 }

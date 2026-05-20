@@ -14,7 +14,7 @@ use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{
     CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, StatisticExtRow, TableEntry,
 };
-use ultrasql_core::{DataType, PageId, RelationId, Value, Xid};
+use ultrasql_core::{BlockNumber, DataType, PageId, RelationId, Value, Xid};
 use ultrasql_mvcc::XidStatusOracle;
 use ultrasql_optimizer::{
     InMemoryStatsCatalog, PlanCache, PlanCacheConfig, PlanCacheKey, StatsCatalog, StatsSource,
@@ -1051,6 +1051,9 @@ where
             return Ok(());
         };
         for index in indexes {
+            if index.root_block == BlockNumber::INVALID {
+                continue;
+            }
             let btree = BTree::open(
                 Arc::clone(self.state.heap.buffer_pool()),
                 RelationId::new(index.oid.raw()),

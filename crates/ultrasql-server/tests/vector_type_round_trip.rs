@@ -209,6 +209,76 @@ async fn vector_distance_operators_execute_in_sql() {
 }
 
 #[tokio::test]
+async fn create_hnsw_index_on_vector_column_preserves_top_k_results() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE ann_items (id INT NOT NULL, embedding VECTOR(3))")
+        .await
+        .expect("create vector table");
+    client
+        .batch_execute(
+            "INSERT INTO ann_items VALUES \
+             (1, '[0,0,0]'), \
+             (2, '[3,0,0]'), \
+             (3, '[1,0,0]'), \
+             (4, '[9,0,0]')",
+        )
+        .await
+        .expect("insert vector rows");
+    client
+        .batch_execute("CREATE INDEX ann_items_embedding_hnsw ON ann_items USING hnsw (embedding)")
+        .await
+        .expect("create hnsw index");
+
+    let messages = client
+        .simple_query("SELECT id FROM ann_items ORDER BY embedding <-> VECTOR '[0,0,0]' LIMIT 2")
+        .await
+        .expect("top-k query");
+    let rows = simple_rows(&messages);
+    assert_eq!(rows, vec![vec!["1".to_owned()], vec!["3".to_owned()]]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn hnsw_index_invalidates_after_insert_and_top_k_falls_back_to_exact() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE ann_after_insert (id INT NOT NULL, embedding VECTOR(3))")
+        .await
+        .expect("create vector table");
+    client
+        .batch_execute("INSERT INTO ann_after_insert VALUES (1, '[10,0,0]')")
+        .await
+        .expect("insert first vector row");
+    client
+        .batch_execute(
+            "CREATE INDEX ann_after_insert_embedding_hnsw \
+             ON ann_after_insert USING hnsw (embedding)",
+        )
+        .await
+        .expect("create hnsw index");
+    client
+        .batch_execute("INSERT INTO ann_after_insert VALUES (2, '[0,0,0]')")
+        .await
+        .expect("insert row that invalidates hnsw");
+
+    let messages = client
+        .simple_query(
+            "SELECT id FROM ann_after_insert \
+             ORDER BY embedding <-> VECTOR '[0,0,0]' LIMIT 1",
+        )
+        .await
+        .expect("top-k query");
+    let rows = simple_rows(&messages);
+    assert_eq!(rows, vec![vec!["2".to_owned()]]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn insert_rejects_vector_dimension_mismatch() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

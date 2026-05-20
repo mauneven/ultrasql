@@ -2343,6 +2343,23 @@ fn binds_create_inverted_search_and_brin_index_methods() {
 }
 
 #[test]
+fn binds_create_hnsw_index_method_for_vector_column() {
+    let cat = embeddings_catalog();
+    let LogicalPlan::CreateIndex {
+        method, columns, ..
+    } = parse_and_bind(
+        "CREATE INDEX embeddings_hnsw_idx ON embeddings USING hnsw (embedding)",
+        &cat,
+    )
+    .expect("bind hnsw")
+    else {
+        panic!("expected CreateIndex plan");
+    };
+    assert_eq!(method, LogicalIndexMethod::Hnsw);
+    assert_eq!(columns, vec![1]);
+}
+
+#[test]
 fn rejects_unique_inverted_search_and_brin_index_methods() {
     let cat = users_catalog();
     for sql in [
@@ -2353,6 +2370,25 @@ fn rejects_unique_inverted_search_and_brin_index_methods() {
         let err = parse_and_bind(sql, &cat).unwrap_err();
         assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
     }
+}
+
+#[test]
+fn rejects_unique_hnsw_index() {
+    let cat = embeddings_catalog();
+    let err = parse_and_bind(
+        "CREATE UNIQUE INDEX embeddings_hnsw_idx ON embeddings USING hnsw (embedding)",
+        &cat,
+    )
+    .unwrap_err();
+    assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
+}
+
+#[test]
+fn rejects_hnsw_index_on_non_vector_column() {
+    let cat = users_catalog();
+    let err =
+        parse_and_bind("CREATE INDEX users_hnsw_idx ON users USING hnsw (id)", &cat).unwrap_err();
+    assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
 }
 
 #[test]

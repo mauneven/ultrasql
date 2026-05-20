@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ultrasql_catalog::{IndexEntry, TableEntry};
-use ultrasql_core::{CommandId, DataType, RelationId, Schema, TupleId, Value, Xid};
+use ultrasql_core::{BlockNumber, CommandId, DataType, RelationId, Schema, TupleId, Value, Xid};
 use ultrasql_executor::fused_delete::FusedDeleteInt32Pair;
 use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32Add};
 use ultrasql_executor::{
@@ -746,6 +746,9 @@ fn cascade_delete_child_rows(
     }
     let mut index_deletes: CascadeIndexDeletes = Vec::with_capacity(indexes.len());
     for index in indexes {
+        if index.root_block == BlockNumber::INVALID {
+            continue;
+        }
         let columns: Vec<usize> = index.columns.iter().map(|col| usize::from(*col)).collect();
         let encoding = IndexKeyEncoding::for_columns(&child.schema, &columns)
             .map_err(|e| ultrasql_executor::ExecError::TypeMismatch(e.to_string()))?;
@@ -1037,6 +1040,9 @@ fn build_referential_index_updates(
 ) -> Result<ReferentialIndexUpdates, ultrasql_executor::ExecError> {
     let mut out = Vec::with_capacity(indexes.len());
     for index in indexes {
+        if index.root_block == BlockNumber::INVALID {
+            continue;
+        }
         let columns: Vec<usize> = index.columns.iter().map(|col| usize::from(*col)).collect();
         let encoding = IndexKeyEncoding::for_columns(&child.schema, &columns)
             .map_err(|e| ultrasql_executor::ExecError::TypeMismatch(e.to_string()))?;
@@ -1179,7 +1185,9 @@ fn build_insert_index_maintainers(
     };
     let mut out = Vec::with_capacity(indexes.len());
     for index in indexes {
-        out.push(build_one_insert_index_maintainer(entry, index, ctx)?);
+        if let Some(maintainer) = build_one_insert_index_maintainer(entry, index, ctx)? {
+            out.push(maintainer);
+        }
     }
     Ok(out)
 }
@@ -1188,7 +1196,7 @@ fn build_one_insert_index_maintainer(
     entry: &TableEntry,
     index: &IndexEntry,
     ctx: &LowerCtx<'_>,
-) -> Result<InsertIndexMaintainer<crate::BlankPageLoader>, ServerError> {
+) -> Result<Option<InsertIndexMaintainer<crate::BlankPageLoader>>, ServerError> {
     let columns: Vec<usize> = index
         .columns
         .iter()
@@ -1209,6 +1217,15 @@ fn build_one_insert_index_maintainer(
     let method = runtime
         .as_ref()
         .map_or(LogicalIndexMethod::Btree, |metadata| metadata.method);
+    if method == LogicalIndexMethod::Hnsw {
+        if let Some(hnsw) = runtime.as_ref().and_then(|metadata| metadata.hnsw.clone()) {
+            hnsw.invalidate();
+        }
+        return Ok(None);
+    }
+    if index.root_block == BlockNumber::INVALID {
+        return Ok(None);
+    }
     let brin = runtime.as_ref().and_then(|metadata| metadata.brin.clone());
     let encoding = if method == LogicalIndexMethod::Hash {
         crate::index_key::IndexKeyEncoding::Int64
@@ -1279,11 +1296,11 @@ fn build_one_insert_index_maintainer(
         };
         Ok(encoded)
     });
-    Ok(
+    Ok(Some(
         InsertIndexMaintainer::new(index.name.clone(), tree, encoder, index.is_unique)
             .with_key_columns(key_columns)
             .with_brin(brin),
-    )
+    ))
 }
 
 /// Build a TID-emitting [`SeqScan`] over a persistent relation.

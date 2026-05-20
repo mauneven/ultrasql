@@ -69,7 +69,7 @@ use ultrasql_catalog::{
     CatalogSnapshot, MutableCatalog, PersistentCatalog, StatisticRow, TableEntry,
 };
 use ultrasql_core::constants::PAGE_SIZE;
-use ultrasql_core::{PageId, RelationId, Value};
+use ultrasql_core::{BlockNumber, PageId, RelationId, Value};
 use ultrasql_executor::{Eval, ExecError, MemTableScan, RowCodec};
 use ultrasql_optimizer::{
     AnalyzeOptions, AnalyzeRunner, InMemoryStatsCatalog, PgStatisticRow, PlanCache,
@@ -205,6 +205,8 @@ pub struct RuntimeIndexMetadata {
     pub method: LogicalIndexMethod,
     /// In-memory BRIN min/max summaries for block-range pruning.
     pub brin: Option<Arc<ultrasql_storage::access_method::BrinIndex>>,
+    /// Runtime HNSW graph for vector top-k scans.
+    pub hnsw: Option<Arc<ultrasql_storage::access_method::HnswIndex>>,
 }
 
 /// One runtime CHECK constraint.
@@ -2423,6 +2425,7 @@ fn lock_rows_index_tids(
     };
     let Some(index) = indexes.iter().find(|idx| {
         idx.columns.as_slice() == [attnum]
+            && idx.root_block != BlockNumber::INVALID
             && runtime_index_method(table_constraints, entry.oid, idx.oid)
                 == LogicalIndexMethod::Btree
     }) else {
