@@ -17,6 +17,8 @@
 //!   the full Lehman-Yao implementation is production-ready.
 //! - [`HashIndex`]: static hashing with fixed primary bucket pages and
 //!   overflow-page chains.
+//! - [`HnswIndex`]: runtime ANN graph; [`PageBackedHnswIndex`] adds the
+//!   persistent page arena, WAL replay, and VACUUM reclamation seam.
 //! - [`GinIndex`], [`GistIndex`], [`BrinIndex`]: provide the trait shape with
 //!   happy-path insert/lookup so the catalog and executor can reference the
 //!   concrete types. Full type-specific operator-class implementations are
@@ -33,8 +35,11 @@
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::type_complexity)]
 
+use std::collections::BTreeMap;
+
 use parking_lot::Mutex;
 use thiserror::Error;
+use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{BlockNumber, MAX_VECTOR_DIMS, PageId, RelationId, TupleId, Xid};
 use ultrasql_wal::WalRecord;
 use ultrasql_wal::payload::{HashOpKind, HashOpPayload, HnswOpKind, HnswOpPayload};
@@ -961,10 +966,11 @@ pub struct HnswSearchResult {
 ///
 /// This implementation is intentionally runtime-only. It gives the SQL layer
 /// a real ANN access-method target behind `CREATE INDEX USING hnsw`, while the
-/// page layout, WAL records, MVCC-aware deletes, and rebuild protocol from
-/// `docs/hnsw-index-design.md` remain separate storage slices. The graph uses
-/// one navigable layer: inserts connect each new vector to its nearest `m`
-/// existing live nodes, and searches perform bounded best-first traversal.
+/// production buffer-pool wiring, page-LSN redo checks, MVCC-aware executor
+/// path, and rebuild protocol from `docs/hnsw-index-design.md` remain separate
+/// storage slices. The graph uses one navigable layer: inserts connect each
+/// new vector to its nearest `m` existing live nodes, and searches perform
+/// bounded best-first traversal.
 ///
 /// The `available` flag lets callers fall back to exact top-k after DML or
 /// restart invalidates the runtime graph.
@@ -1449,6 +1455,884 @@ impl HnswIndex {
         neighbors.truncate(self.m);
         storage.entries[idx].neighbors = neighbors;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Page-backed HNSW storage model
+// ---------------------------------------------------------------------------
+
+const HNSW_META_BLOCK: u32 = 0;
+const HNSW_FREE_LIST_BLOCK: u32 = 1;
+const HNSW_FIRST_ALLOC_BLOCK: u32 = 2;
+const HNSW_PAGE_OVERHEAD_BYTES: usize = 64;
+const HNSW_VECTOR_VALUES_PER_OVERFLOW_PAGE: usize =
+    (PAGE_SIZE - HNSW_PAGE_OVERHEAD_BYTES) / std::mem::size_of::<f32>();
+const HNSW_NEIGHBOR_IDS_PER_OVERFLOW_PAGE: usize =
+    (PAGE_SIZE - HNSW_PAGE_OVERHEAD_BYTES) / std::mem::size_of::<u64>();
+
+type HnswNodeId = u64;
+
+/// Page counts and MVCC-visible node counts for a page-backed HNSW graph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageBackedHnswStats {
+    /// Number of HNSW meta pages. Always one for a single index relation.
+    pub meta_pages: usize,
+    /// Number of live physical node pages, including tombstoned nodes before
+    /// VACUUM compaction reclaims them.
+    pub node_pages: usize,
+    /// Number of overflow pages used for vector payloads and adjacency lists.
+    pub overflow_pages: usize,
+    /// Number of free-list pages. Always one until the relation outgrows a
+    /// single free-list page.
+    pub free_list_pages: usize,
+    /// Number of non-tombstoned nodes.
+    pub live_nodes: usize,
+    /// Number of tombstoned nodes waiting for VACUUM.
+    pub tombstones: usize,
+    /// Number of reusable blocks currently recorded by the free list.
+    pub reusable_pages: usize,
+    /// Next block number that would be allocated if the free list were empty.
+    pub next_block_number: u32,
+}
+
+/// First page-backed HNSW storage model.
+///
+/// This is deliberately narrower than the runtime [`HnswIndex`]: it stores
+/// nodes in page-sized records, spills vectors and adjacency lists into
+/// overflow-page chains, tracks a meta page and a free-list page, replays
+/// logical HNSW WAL records, and lets VACUUM reclaim tombstoned nodes. It is
+/// not a production ANN claim until the arena is wired through the buffer
+/// pool, page LSN checks, crash restart, and MVCC-visible executor paths.
+#[derive(Debug)]
+pub struct PageBackedHnswIndex {
+    storage: Mutex<PageBackedHnswStorage>,
+    index_rel: RelationId,
+    dims: usize,
+    metric: HnswMetric,
+    m: usize,
+    ef_search: usize,
+}
+
+#[derive(Debug)]
+struct PageBackedHnswStorage {
+    pages: BTreeMap<BlockNumber, HnswPersistentPage>,
+    meta: HnswMetaPage,
+    free_list: HnswFreeListPage,
+    tid_to_node: BTreeMap<TupleId, HnswNodeId>,
+    node_to_block: BTreeMap<HnswNodeId, BlockNumber>,
+}
+
+#[derive(Debug, Clone)]
+enum HnswPersistentPage {
+    Meta(HnswMetaPage),
+    Node(HnswNodePage),
+    Overflow(HnswOverflowPage),
+    FreeList(HnswFreeListPage),
+}
+
+#[derive(Debug, Clone)]
+struct HnswMetaPage {
+    page_id: PageId,
+    dims: usize,
+    metric: HnswMetric,
+    m: usize,
+    ef_search: usize,
+    entry_node: Option<HnswNodeId>,
+    next_node_id: HnswNodeId,
+    live_nodes: usize,
+    tombstones: usize,
+    next_block_number: u32,
+    free_list_page: BlockNumber,
+}
+
+#[derive(Debug, Clone)]
+struct HnswNodePage {
+    page_id: PageId,
+    node_id: HnswNodeId,
+    tid: TupleId,
+    vector_len: usize,
+    vector_head: BlockNumber,
+    neighbor_count: usize,
+    neighbor_head: Option<BlockNumber>,
+    deleted: bool,
+}
+
+#[derive(Debug, Clone)]
+struct HnswOverflowPage {
+    page_id: PageId,
+    owner_node: HnswNodeId,
+    next: Option<BlockNumber>,
+    payload: HnswOverflowPayload,
+}
+
+#[derive(Debug, Clone)]
+enum HnswOverflowPayload {
+    Vector(Vec<f32>),
+    Neighbors(Vec<HnswNodeId>),
+}
+
+#[derive(Debug, Clone)]
+struct HnswFreeListPage {
+    page_id: PageId,
+    blocks: Vec<BlockNumber>,
+}
+
+impl PageBackedHnswIndex {
+    /// Create an empty page-backed HNSW graph arena.
+    pub fn new(
+        index_rel: RelationId,
+        dims: u32,
+        metric: HnswMetric,
+        m: usize,
+        ef_search: usize,
+    ) -> Result<Self, AccessMethodError> {
+        if dims == 0 || dims > MAX_VECTOR_DIMS {
+            return Err(AccessMethodError::Storage(
+                "page-backed hnsw dims outside supported range".to_owned(),
+            ));
+        }
+        if m == 0 {
+            return Err(AccessMethodError::Storage(
+                "page-backed hnsw m must be greater than zero".to_owned(),
+            ));
+        }
+        if ef_search == 0 {
+            return Err(AccessMethodError::Storage(
+                "page-backed hnsw ef_search must be greater than zero".to_owned(),
+            ));
+        }
+        let dims = usize::try_from(dims).map_err(|_| {
+            AccessMethodError::Storage("page-backed hnsw dims do not fit usize".to_owned())
+        })?;
+        Ok(Self {
+            storage: Mutex::new(PageBackedHnswStorage::new(
+                index_rel, dims, metric, m, ef_search,
+            )),
+            index_rel,
+            dims,
+            metric,
+            m,
+            ef_search,
+        })
+    }
+
+    /// Return page and tuple counts for this page-backed graph.
+    #[must_use]
+    pub fn page_stats(&self) -> PageBackedHnswStats {
+        let storage = self.storage.lock();
+        let mut stats = PageBackedHnswStats {
+            live_nodes: storage.meta.live_nodes,
+            tombstones: storage.meta.tombstones,
+            reusable_pages: storage.free_list.blocks.len(),
+            next_block_number: storage.meta.next_block_number,
+            ..PageBackedHnswStats::default()
+        };
+        for page in storage.pages.values() {
+            match page {
+                HnswPersistentPage::Meta(meta) => {
+                    let _ = (
+                        meta.page_id,
+                        meta.dims,
+                        meta.metric,
+                        meta.m,
+                        meta.ef_search,
+                        meta.free_list_page,
+                    );
+                    stats.meta_pages += 1;
+                }
+                HnswPersistentPage::Node(node) => {
+                    let _ = (node.page_id, node.node_id);
+                    stats.node_pages += 1;
+                }
+                HnswPersistentPage::Overflow(overflow) => {
+                    let _ = (overflow.page_id, overflow.owner_node);
+                    stats.overflow_pages += 1;
+                }
+                HnswPersistentPage::FreeList(free_list) => {
+                    let _ = free_list.page_id;
+                    stats.free_list_pages += 1;
+                }
+            }
+        }
+        stats
+    }
+
+    /// Insert one finite vector into page-backed HNSW pages.
+    pub fn insert_vector(&self, vector: &[f32], tid: TupleId) -> Result<(), AccessMethodError> {
+        self.insert_vector_internal(vector, tid, false)
+    }
+
+    /// Insert one vector and emit a logical HNSW WAL record when `wal` is set.
+    pub fn insert_vector_logged(
+        &self,
+        vector: &[f32],
+        tid: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        self.validate_vector(vector)?;
+        self.emit_hnsw_wal(HnswOpKind::Insert, tid, vector, xid, wal)?;
+        self.insert_vector(vector, tid)
+    }
+
+    /// Search live nodes using exact distance over page-backed vectors.
+    ///
+    /// The page format stores graph adjacency, but this first persistent slice
+    /// keeps the query path exact so it can serve as a recovery correctness
+    /// oracle while page-backed ANN traversal is hardened separately.
+    pub fn search(
+        &self,
+        probe: &[f32],
+        k: usize,
+    ) -> Result<Vec<HnswSearchResult>, AccessMethodError> {
+        self.validate_vector(probe)?;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let storage = self.storage.lock();
+        let mut hits = Vec::with_capacity(storage.meta.live_nodes.min(k.max(self.ef_search)));
+        for node_id in storage.node_to_block.keys() {
+            let Some(node) = storage.node_page(*node_id)? else {
+                continue;
+            };
+            if node.deleted {
+                continue;
+            }
+            let vector = storage.vector_for_node(node)?;
+            hits.push(HnswSearchResult {
+                tid: node.tid,
+                distance: self.metric.distance(probe, &vector),
+            });
+        }
+        hits.sort_by(compare_hnsw_hits);
+        hits.truncate(k);
+        Ok(hits)
+    }
+
+    /// Mark a node tombstoned. VACUUM reclaims its pages later.
+    pub fn mark_deleted(&self, tid: TupleId) -> Result<(), AccessMethodError> {
+        let mut storage = self.storage.lock();
+        storage.mark_deleted(tid, false)
+    }
+
+    /// Mark a node tombstoned and emit a logical HNSW WAL record.
+    pub fn mark_deleted_logged(
+        &self,
+        tid: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        self.emit_hnsw_wal(HnswOpKind::Delete, tid, &[], xid, wal)?;
+        self.mark_deleted(tid)
+    }
+
+    /// Reclaim tombstoned node and overflow pages into the free-list page.
+    pub fn vacuum_deleted(&self) -> Result<usize, AccessMethodError> {
+        let mut storage = self.storage.lock();
+        storage.vacuum_deleted(self.metric, self.m)
+    }
+
+    /// VACUUM tombstoned pages and emit a logical compact WAL record.
+    pub fn vacuum_deleted_logged(
+        &self,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<usize, AccessMethodError> {
+        if self.page_stats().tombstones == 0 {
+            return Ok(0);
+        }
+        let tid = TupleId::new(PageId::new(self.index_rel, BlockNumber::new(0)), 0);
+        self.emit_hnsw_wal(HnswOpKind::Compact, tid, &[], xid, wal)?;
+        self.vacuum_deleted()
+    }
+
+    /// Replay one decoded logical HNSW WAL payload into this page arena.
+    pub fn apply_wal_payload(&self, payload: &HnswOpPayload) -> Result<(), AccessMethodError> {
+        if payload.index_rel != self.index_rel {
+            return Ok(());
+        }
+        match payload.op {
+            HnswOpKind::Insert => self.insert_vector_internal(&payload.vector, payload.tid, true),
+            HnswOpKind::Delete => {
+                let mut storage = self.storage.lock();
+                storage.mark_deleted(payload.tid, true)
+            }
+            HnswOpKind::Compact => self.vacuum_deleted().map(|_| ()),
+        }
+    }
+
+    /// Replay one WAL record, ignoring records that are not HNSW mutations.
+    pub fn apply_wal_record(&self, record: &WalRecord) -> Result<(), AccessMethodError> {
+        if record.header.record_type != RecordType::HnswOp {
+            return Ok(());
+        }
+        let payload = HnswOpPayload::decode(&record.payload)
+            .map_err(|e| AccessMethodError::Storage(format!("decode hnsw WAL payload: {e}")))?;
+        self.apply_wal_payload(&payload)
+    }
+
+    fn insert_vector_internal(
+        &self,
+        vector: &[f32],
+        tid: TupleId,
+        replay: bool,
+    ) -> Result<(), AccessMethodError> {
+        self.validate_vector(vector)?;
+        let mut storage = self.storage.lock();
+        if storage.tid_to_node.contains_key(&tid) {
+            if replay {
+                return Ok(());
+            }
+            return Err(AccessMethodError::DuplicateKey);
+        }
+
+        let mut neighbors: Vec<(HnswNodeId, f32, TupleId)> = storage
+            .live_node_snapshot()?
+            .into_iter()
+            .map(|(node_id, node_tid, node_vector)| {
+                (
+                    node_id,
+                    self.metric.distance(vector, &node_vector),
+                    node_tid,
+                )
+            })
+            .collect();
+        neighbors.sort_by(compare_persistent_hnsw_candidates);
+        neighbors.truncate(self.m);
+        let neighbor_ids: Vec<HnswNodeId> =
+            neighbors.iter().map(|(node_id, _, _)| *node_id).collect();
+
+        let node_id = storage.meta.next_node_id;
+        storage.meta.next_node_id = storage
+            .meta
+            .next_node_id
+            .checked_add(1)
+            .ok_or_else(|| AccessMethodError::Storage("hnsw node id overflow".to_owned()))?;
+        let vector_head = storage.allocate_vector_chain(node_id, vector)?;
+        let node_block = storage.allocate_block()?;
+        let node_page = HnswNodePage {
+            page_id: PageId::new(self.index_rel, node_block),
+            node_id,
+            tid,
+            vector_len: vector.len(),
+            vector_head,
+            neighbor_count: 0,
+            neighbor_head: None,
+            deleted: false,
+        };
+        storage
+            .pages
+            .insert(node_block, HnswPersistentPage::Node(node_page));
+        storage.node_to_block.insert(node_id, node_block);
+        storage.tid_to_node.insert(tid, node_id);
+        storage.meta.live_nodes += 1;
+        if storage.meta.entry_node.is_none() {
+            storage.meta.entry_node = Some(node_id);
+        }
+        storage.write_neighbors(node_id, &neighbor_ids)?;
+
+        for neighbor_id in neighbor_ids {
+            let mut neighbor_list = storage.neighbors_for_node(neighbor_id)?;
+            if !neighbor_list.contains(&node_id) {
+                neighbor_list.push(node_id);
+            }
+            let trimmed =
+                storage.trim_neighbor_list(neighbor_id, neighbor_list, self.m, self.metric)?;
+            storage.write_neighbors(neighbor_id, &trimmed)?;
+        }
+        storage.sync_control_pages();
+        Ok(())
+    }
+
+    fn validate_vector(&self, vector: &[f32]) -> Result<(), AccessMethodError> {
+        if vector.len() != self.dims {
+            return Err(AccessMethodError::Storage(format!(
+                "page-backed hnsw vector dimension mismatch: expected {}, got {}",
+                self.dims,
+                vector.len()
+            )));
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(AccessMethodError::Storage(
+                "page-backed hnsw vector elements must be finite".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn emit_hnsw_wal(
+        &self,
+        op: HnswOpKind,
+        tid: TupleId,
+        vector: &[f32],
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        let Some(sink) = wal else {
+            return Ok(());
+        };
+        let payload = HnswOpPayload {
+            op,
+            index_rel: self.index_rel,
+            tid,
+            vector: vector.to_vec(),
+        }
+        .encode()
+        .map_err(|e| {
+            AccessMethodError::Storage(format!("page-backed hnsw WAL payload encode: {e}"))
+        })?;
+        let prev_lsn = sink.last_lsn_for(xid);
+        let record = WalRecord::new(RecordType::HnswOp, xid, prev_lsn, 0, payload);
+        sink.append(record)
+            .map(|_| ())
+            .map_err(|e| AccessMethodError::Storage(format!("page-backed hnsw WAL append: {e}")))
+    }
+}
+
+impl PageBackedHnswStorage {
+    fn new(
+        index_rel: RelationId,
+        dims: usize,
+        metric: HnswMetric,
+        m: usize,
+        ef_search: usize,
+    ) -> Self {
+        let meta_block = BlockNumber::new(HNSW_META_BLOCK);
+        let free_block = BlockNumber::new(HNSW_FREE_LIST_BLOCK);
+        let meta = HnswMetaPage {
+            page_id: PageId::new(index_rel, meta_block),
+            dims,
+            metric,
+            m,
+            ef_search,
+            entry_node: None,
+            next_node_id: 0,
+            live_nodes: 0,
+            tombstones: 0,
+            next_block_number: HNSW_FIRST_ALLOC_BLOCK,
+            free_list_page: free_block,
+        };
+        let free_list = HnswFreeListPage {
+            page_id: PageId::new(index_rel, free_block),
+            blocks: Vec::new(),
+        };
+        let mut pages = BTreeMap::new();
+        pages.insert(meta_block, HnswPersistentPage::Meta(meta.clone()));
+        pages.insert(free_block, HnswPersistentPage::FreeList(free_list.clone()));
+        Self {
+            pages,
+            meta,
+            free_list,
+            tid_to_node: BTreeMap::new(),
+            node_to_block: BTreeMap::new(),
+        }
+    }
+
+    fn allocate_block(&mut self) -> Result<BlockNumber, AccessMethodError> {
+        if let Some(block) = self.free_list.blocks.pop() {
+            self.sync_free_list_page();
+            return Ok(block);
+        }
+        let block = BlockNumber::new(self.meta.next_block_number);
+        self.meta.next_block_number =
+            self.meta.next_block_number.checked_add(1).ok_or_else(|| {
+                AccessMethodError::Storage("hnsw block number overflow".to_owned())
+            })?;
+        self.sync_meta_page();
+        Ok(block)
+    }
+
+    fn free_page(&mut self, block: BlockNumber) -> Result<(), AccessMethodError> {
+        if block.raw() < HNSW_FIRST_ALLOC_BLOCK {
+            return Err(AccessMethodError::Storage(
+                "hnsw cannot free control page".to_owned(),
+            ));
+        }
+        self.pages.remove(&block);
+        if !self.free_list.blocks.contains(&block) {
+            self.free_list.blocks.push(block);
+        }
+        self.sync_free_list_page();
+        Ok(())
+    }
+
+    fn allocate_vector_chain(
+        &mut self,
+        node_id: HnswNodeId,
+        vector: &[f32],
+    ) -> Result<BlockNumber, AccessMethodError> {
+        let chunks = vector.chunks(HNSW_VECTOR_VALUES_PER_OVERFLOW_PAGE);
+        let mut head = None;
+        let mut previous = None;
+        for chunk in chunks {
+            let block = self.allocate_block()?;
+            let page = HnswOverflowPage {
+                page_id: PageId::new(self.meta.page_id.relation, block),
+                owner_node: node_id,
+                next: None,
+                payload: HnswOverflowPayload::Vector(chunk.to_vec()),
+            };
+            self.pages.insert(block, HnswPersistentPage::Overflow(page));
+            if let Some(prev_block) = previous {
+                self.set_overflow_next(prev_block, Some(block))?;
+            } else {
+                head = Some(block);
+            }
+            previous = Some(block);
+        }
+        head.ok_or_else(|| AccessMethodError::Storage("hnsw vector chain empty".to_owned()))
+    }
+
+    fn allocate_neighbor_chain(
+        &mut self,
+        node_id: HnswNodeId,
+        neighbors: &[HnswNodeId],
+    ) -> Result<Option<BlockNumber>, AccessMethodError> {
+        if neighbors.is_empty() {
+            return Ok(None);
+        }
+        let mut head = None;
+        let mut previous = None;
+        for chunk in neighbors.chunks(HNSW_NEIGHBOR_IDS_PER_OVERFLOW_PAGE) {
+            let block = self.allocate_block()?;
+            let page = HnswOverflowPage {
+                page_id: PageId::new(self.meta.page_id.relation, block),
+                owner_node: node_id,
+                next: None,
+                payload: HnswOverflowPayload::Neighbors(chunk.to_vec()),
+            };
+            self.pages.insert(block, HnswPersistentPage::Overflow(page));
+            if let Some(prev_block) = previous {
+                self.set_overflow_next(prev_block, Some(block))?;
+            } else {
+                head = Some(block);
+            }
+            previous = Some(block);
+        }
+        Ok(head)
+    }
+
+    fn set_overflow_next(
+        &mut self,
+        block: BlockNumber,
+        next: Option<BlockNumber>,
+    ) -> Result<(), AccessMethodError> {
+        let Some(HnswPersistentPage::Overflow(page)) = self.pages.get_mut(&block) else {
+            return Err(AccessMethodError::Storage(
+                "hnsw overflow chain points to non-overflow page".to_owned(),
+            ));
+        };
+        page.next = next;
+        Ok(())
+    }
+
+    fn node_page(&self, node_id: HnswNodeId) -> Result<Option<&HnswNodePage>, AccessMethodError> {
+        let Some(block) = self.node_to_block.get(&node_id) else {
+            return Ok(None);
+        };
+        match self.pages.get(block) {
+            Some(HnswPersistentPage::Node(node)) => Ok(Some(node)),
+            _ => Err(AccessMethodError::Storage(
+                "hnsw node map points to non-node page".to_owned(),
+            )),
+        }
+    }
+
+    fn node_page_mut(
+        &mut self,
+        node_id: HnswNodeId,
+    ) -> Result<Option<&mut HnswNodePage>, AccessMethodError> {
+        let Some(block) = self.node_to_block.get(&node_id) else {
+            return Ok(None);
+        };
+        match self.pages.get_mut(block) {
+            Some(HnswPersistentPage::Node(node)) => Ok(Some(node)),
+            _ => Err(AccessMethodError::Storage(
+                "hnsw node map points to non-node page".to_owned(),
+            )),
+        }
+    }
+
+    fn live_node_snapshot(
+        &self,
+    ) -> Result<Vec<(HnswNodeId, TupleId, Vec<f32>)>, AccessMethodError> {
+        let mut out = Vec::with_capacity(self.meta.live_nodes);
+        for node_id in self.node_to_block.keys() {
+            let Some(node) = self.node_page(*node_id)? else {
+                continue;
+            };
+            if node.deleted {
+                continue;
+            }
+            out.push((*node_id, node.tid, self.vector_for_node(node)?));
+        }
+        Ok(out)
+    }
+
+    fn vector_for_node(&self, node: &HnswNodePage) -> Result<Vec<f32>, AccessMethodError> {
+        let mut vector = Vec::with_capacity(node.vector_len);
+        let mut current = Some(node.vector_head);
+        while let Some(block) = current {
+            let Some(HnswPersistentPage::Overflow(page)) = self.pages.get(&block) else {
+                return Err(AccessMethodError::Storage(
+                    "hnsw vector chain points to non-overflow page".to_owned(),
+                ));
+            };
+            match &page.payload {
+                HnswOverflowPayload::Vector(values) => vector.extend(values),
+                HnswOverflowPayload::Neighbors(_) => {
+                    return Err(AccessMethodError::Storage(
+                        "hnsw vector chain points to neighbor payload".to_owned(),
+                    ));
+                }
+            }
+            current = page.next;
+        }
+        if vector.len() != node.vector_len {
+            return Err(AccessMethodError::Storage(
+                "hnsw vector chain length mismatch".to_owned(),
+            ));
+        }
+        Ok(vector)
+    }
+
+    fn neighbors_for_node(
+        &self,
+        node_id: HnswNodeId,
+    ) -> Result<Vec<HnswNodeId>, AccessMethodError> {
+        let Some(node) = self.node_page(node_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut neighbors = Vec::with_capacity(node.neighbor_count);
+        let mut current = node.neighbor_head;
+        while let Some(block) = current {
+            let Some(HnswPersistentPage::Overflow(page)) = self.pages.get(&block) else {
+                return Err(AccessMethodError::Storage(
+                    "hnsw neighbor chain points to non-overflow page".to_owned(),
+                ));
+            };
+            match &page.payload {
+                HnswOverflowPayload::Neighbors(ids) => neighbors.extend(ids),
+                HnswOverflowPayload::Vector(_) => {
+                    return Err(AccessMethodError::Storage(
+                        "hnsw neighbor chain points to vector payload".to_owned(),
+                    ));
+                }
+            }
+            current = page.next;
+        }
+        neighbors.truncate(node.neighbor_count);
+        Ok(neighbors)
+    }
+
+    fn write_neighbors(
+        &mut self,
+        node_id: HnswNodeId,
+        neighbors: &[HnswNodeId],
+    ) -> Result<(), AccessMethodError> {
+        let old_head = self.node_page(node_id)?.and_then(|node| node.neighbor_head);
+        self.release_overflow_chain(old_head)?;
+        let new_head = self.allocate_neighbor_chain(node_id, neighbors)?;
+        let Some(node) = self.node_page_mut(node_id)? else {
+            return Err(AccessMethodError::Storage(
+                "hnsw write neighbors missing node".to_owned(),
+            ));
+        };
+        node.neighbor_head = new_head;
+        node.neighbor_count = neighbors.len();
+        Ok(())
+    }
+
+    fn trim_neighbor_list(
+        &self,
+        node_id: HnswNodeId,
+        mut neighbors: Vec<HnswNodeId>,
+        max_neighbors: usize,
+        metric: HnswMetric,
+    ) -> Result<Vec<HnswNodeId>, AccessMethodError> {
+        neighbors.sort_unstable();
+        neighbors.dedup();
+        neighbors.retain(|neighbor| *neighbor != node_id);
+        let Some(origin_node) = self.node_page(node_id)? else {
+            return Ok(Vec::new());
+        };
+        let origin = self.vector_for_node(origin_node)?;
+        let mut candidates = Vec::with_capacity(neighbors.len());
+        for neighbor in neighbors {
+            let Some(neighbor_node) = self.node_page(neighbor)? else {
+                continue;
+            };
+            if neighbor_node.deleted {
+                continue;
+            }
+            let vector = self.vector_for_node(neighbor_node)?;
+            candidates.push((
+                neighbor,
+                metric.distance(&origin, &vector),
+                neighbor_node.tid,
+            ));
+        }
+        candidates.sort_by(compare_persistent_hnsw_candidates);
+        candidates.truncate(max_neighbors);
+        Ok(candidates
+            .into_iter()
+            .map(|(neighbor, _, _)| neighbor)
+            .collect())
+    }
+
+    fn mark_deleted(&mut self, tid: TupleId, replay: bool) -> Result<(), AccessMethodError> {
+        let Some(node_id) = self.tid_to_node.get(&tid).copied() else {
+            return if replay {
+                Ok(())
+            } else {
+                Err(AccessMethodError::NotFound)
+            };
+        };
+        let Some(node) = self.node_page_mut(node_id)? else {
+            return if replay {
+                Ok(())
+            } else {
+                Err(AccessMethodError::NotFound)
+            };
+        };
+        if node.deleted {
+            return if replay {
+                Ok(())
+            } else {
+                Err(AccessMethodError::NotFound)
+            };
+        }
+        node.deleted = true;
+        self.meta.live_nodes = self.meta.live_nodes.saturating_sub(1);
+        self.meta.tombstones += 1;
+        if self.meta.entry_node == Some(node_id) {
+            self.meta.entry_node = self.first_live_node_id()?;
+        }
+        self.sync_meta_page();
+        Ok(())
+    }
+
+    fn vacuum_deleted(
+        &mut self,
+        metric: HnswMetric,
+        max_neighbors: usize,
+    ) -> Result<usize, AccessMethodError> {
+        let deleted_nodes: Vec<HnswNodeId> = self
+            .node_to_block
+            .keys()
+            .filter_map(|node_id| {
+                self.node_page(*node_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|node| node.deleted)
+                    .then_some(*node_id)
+            })
+            .collect();
+        if deleted_nodes.is_empty() {
+            return Ok(0);
+        }
+
+        let live_nodes: Vec<HnswNodeId> = self
+            .node_to_block
+            .keys()
+            .copied()
+            .filter(|node_id| !deleted_nodes.contains(node_id))
+            .collect();
+        for node_id in live_nodes {
+            let neighbors = self
+                .neighbors_for_node(node_id)?
+                .into_iter()
+                .filter(|neighbor| !deleted_nodes.contains(neighbor))
+                .collect::<Vec<_>>();
+            let trimmed = self.trim_neighbor_list(node_id, neighbors, max_neighbors, metric)?;
+            self.write_neighbors(node_id, &trimmed)?;
+        }
+
+        for node_id in &deleted_nodes {
+            let Some(block) = self.node_to_block.remove(node_id) else {
+                continue;
+            };
+            let Some(HnswPersistentPage::Node(node)) = self.pages.get(&block).cloned() else {
+                continue;
+            };
+            self.tid_to_node.remove(&node.tid);
+            self.release_overflow_chain(Some(node.vector_head))?;
+            self.release_overflow_chain(node.neighbor_head)?;
+            self.free_page(block)?;
+        }
+        self.meta.tombstones = 0;
+        self.meta.live_nodes = self
+            .node_to_block
+            .keys()
+            .filter(|node_id| {
+                self.node_page(**node_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|node| !node.deleted)
+            })
+            .count();
+        self.meta.entry_node = self.first_live_node_id()?;
+        self.sync_control_pages();
+        Ok(deleted_nodes.len())
+    }
+
+    fn first_live_node_id(&self) -> Result<Option<HnswNodeId>, AccessMethodError> {
+        for node_id in self.node_to_block.keys() {
+            if self.node_page(*node_id)?.is_some_and(|node| !node.deleted) {
+                return Ok(Some(*node_id));
+            }
+        }
+        Ok(None)
+    }
+
+    fn release_overflow_chain(
+        &mut self,
+        head: Option<BlockNumber>,
+    ) -> Result<(), AccessMethodError> {
+        let mut current = head;
+        while let Some(block) = current {
+            let next = match self.pages.get(&block) {
+                Some(HnswPersistentPage::Overflow(page)) => page.next,
+                _ => {
+                    return Err(AccessMethodError::Storage(
+                        "hnsw release chain found non-overflow page".to_owned(),
+                    ));
+                }
+            };
+            self.free_page(block)?;
+            current = next;
+        }
+        Ok(())
+    }
+
+    fn sync_meta_page(&mut self) {
+        self.pages.insert(
+            BlockNumber::new(HNSW_META_BLOCK),
+            HnswPersistentPage::Meta(self.meta.clone()),
+        );
+    }
+
+    fn sync_free_list_page(&mut self) {
+        self.pages.insert(
+            BlockNumber::new(HNSW_FREE_LIST_BLOCK),
+            HnswPersistentPage::FreeList(self.free_list.clone()),
+        );
+    }
+
+    fn sync_control_pages(&mut self) {
+        self.sync_meta_page();
+        self.sync_free_list_page();
+    }
+}
+
+fn compare_persistent_hnsw_candidates(
+    left: &(HnswNodeId, f32, TupleId),
+    right: &(HnswNodeId, f32, TupleId),
+) -> std::cmp::Ordering {
+    left.1
+        .total_cmp(&right.1)
+        .then_with(|| left.2.cmp(&right.2))
+        .then_with(|| left.0.cmp(&right.0))
 }
 
 impl AccessMethod for HnswIndex {
@@ -2558,6 +3442,105 @@ mod tests {
         assert_eq!(delete.tid, tuple);
         let compact = HnswOpPayload::decode(&records[2].1.payload).expect("decode hnsw compact");
         assert_eq!(compact.op, HnswOpKind::Compact);
+    }
+
+    #[test]
+    fn page_backed_hnsw_allocates_meta_node_overflow_and_free_list_pages() {
+        let am = PageBackedHnswIndex::new(RelationId::new(8800), 3, HnswMetric::L2, 4, 16)
+            .expect("page-backed hnsw config");
+
+        let initial = am.page_stats();
+        assert_eq!(initial.meta_pages, 1);
+        assert_eq!(initial.free_list_pages, 1);
+        assert_eq!(initial.node_pages, 0);
+        assert_eq!(initial.overflow_pages, 0);
+
+        am.insert_vector(&[0.0, 0.0, 0.0], tid(1, 0))
+            .expect("insert origin");
+        am.insert_vector(&[1.0, 0.0, 0.0], tid(1, 1))
+            .expect("insert near");
+        am.insert_vector(&[10.0, 0.0, 0.0], tid(1, 2))
+            .expect("insert far");
+
+        let stats = am.page_stats();
+        assert_eq!(stats.live_nodes, 3);
+        assert_eq!(stats.tombstones, 0);
+        assert_eq!(stats.meta_pages, 1);
+        assert_eq!(stats.free_list_pages, 1);
+        assert_eq!(stats.node_pages, 3);
+        assert!(stats.overflow_pages >= 3);
+        assert_eq!(stats.reusable_pages, 0);
+
+        let hits = am.search(&[0.2, 0.0, 0.0], 2).expect("search");
+        let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
+        assert_eq!(tids, vec![tid(1, 0), tid(1, 1)]);
+    }
+
+    #[test]
+    fn page_backed_hnsw_vacuum_reclaims_node_and_overflow_pages() {
+        let am = PageBackedHnswIndex::new(RelationId::new(8801), 3, HnswMetric::L2, 2, 16)
+            .expect("page-backed hnsw config");
+        am.insert_vector(&[0.0, 0.0, 0.0], tid(1, 0))
+            .expect("insert deleted row");
+        am.insert_vector(&[1.0, 0.0, 0.0], tid(1, 1))
+            .expect("insert live row");
+        am.insert_vector(&[2.0, 0.0, 0.0], tid(1, 2))
+            .expect("insert second live row");
+
+        am.mark_deleted(tid(1, 0)).expect("tombstone row");
+        assert_eq!(am.page_stats().tombstones, 1);
+
+        let removed = am.vacuum_deleted().expect("vacuum hnsw pages");
+        assert_eq!(removed, 1);
+        let after_vacuum = am.page_stats();
+        assert_eq!(after_vacuum.live_nodes, 2);
+        assert_eq!(after_vacuum.tombstones, 0);
+        assert!(after_vacuum.reusable_pages > 0);
+
+        am.insert_vector(&[3.0, 0.0, 0.0], tid(1, 3))
+            .expect("insert reuses free pages");
+        let after_reuse = am.page_stats();
+        assert_eq!(after_reuse.live_nodes, 3);
+        assert!(after_reuse.next_block_number <= after_vacuum.next_block_number);
+    }
+
+    #[test]
+    fn page_backed_hnsw_replays_wal_into_recovered_pages() {
+        let index_rel = RelationId::new(8802);
+        let source =
+            PageBackedHnswIndex::new(index_rel, 3, HnswMetric::L2, 4, 16).expect("source config");
+        let sink = InMemoryWalSink::new();
+        source
+            .insert_vector_logged(&[0.0, 0.0, 0.0], tid(1, 0), Xid::new(12), Some(&sink))
+            .expect("logged insert origin");
+        source
+            .insert_vector_logged(&[1.0, 0.0, 0.0], tid(1, 1), Xid::new(12), Some(&sink))
+            .expect("logged insert live");
+        source
+            .mark_deleted_logged(tid(1, 0), Xid::new(12), Some(&sink))
+            .expect("logged delete");
+        source
+            .vacuum_deleted_logged(Xid::new(12), Some(&sink))
+            .expect("logged vacuum");
+
+        let recovered =
+            PageBackedHnswIndex::new(index_rel, 3, HnswMetric::L2, 4, 16).expect("recover config");
+        let records = sink.records();
+        for (_, record) in &records {
+            recovered.apply_wal_record(record).expect("replay hnsw WAL");
+        }
+        for (_, record) in &records {
+            recovered
+                .apply_wal_record(record)
+                .expect("replay hnsw WAL idempotently");
+        }
+
+        let stats = recovered.page_stats();
+        assert_eq!(stats.live_nodes, 1);
+        assert_eq!(stats.tombstones, 0);
+        let hits = recovered.search(&[0.0, 0.0, 0.0], 2).expect("search");
+        let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
+        assert_eq!(tids, vec![tid(1, 1)]);
     }
 
     #[test]
