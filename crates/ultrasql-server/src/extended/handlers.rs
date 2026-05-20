@@ -8,6 +8,7 @@ use ultrasql_planner::bind;
 use ultrasql_protocol::{BackendMessage, DescribeKind};
 
 use crate::error::ServerError;
+use crate::workload::plan_hash_for_plan;
 
 use super::codec::{DecodeError, decode_param, pg_type_oid, row_description_for_plan};
 use super::params::{count_parameters_in_plan, infer_parameter_types};
@@ -46,11 +47,13 @@ pub fn handle_parse(
         let n = count_parameters_in_plan(&plan);
         (Some(plan), n)
     };
+    let plan_hash = plan.as_ref().map_or(0, plan_hash_for_plan);
     state.statements.insert(
         name,
         PreparedStatement {
             sql,
             plan,
+            plan_hash,
             param_type_oids,
             n_params,
         },
@@ -162,6 +165,10 @@ pub fn handle_bind(
         portal_name,
         BoundPortal {
             plan: bound_plan,
+            sql: stmt.sql.clone(),
+            plan_hash: stmt.plan_hash,
+            bind_param_count: u32::try_from(params.len()).unwrap_or(u32::MAX),
+            bind_params_redacted: !params.is_empty(),
             result_formats,
         },
     );

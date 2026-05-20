@@ -84,12 +84,14 @@ where
             fallback: &self.state.catalog,
         };
         let plan = bind(&stmt.statement, &combined)?;
+        let plan_hash = crate::workload::plan_hash_for_plan(&plan);
         let n_params = max_param_index(&plan);
         self.extended.statements.insert(
             name,
             PreparedStatement {
                 sql: String::new(),
                 plan: Some(plan),
+                plan_hash,
                 param_type_oids: Vec::new(),
                 n_params,
             },

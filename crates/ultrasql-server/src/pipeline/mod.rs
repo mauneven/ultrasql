@@ -217,6 +217,8 @@ pub struct LowerCtx<'a> {
     /// Runtime time-range partition registry keyed by parent table name.
     pub time_partitions:
         Arc<dashmap::DashMap<String, Arc<crate::time_partition::TimePartitionRuntime>>>,
+    /// Same-process workload recorder used by virtual statistics views.
+    pub workload_recorder: Arc<crate::workload::WorkloadRecorder>,
     /// Session-local sequence observer for defaults that call `nextval`.
     pub sequence_state: Option<crate::SequenceSessionState>,
     /// Shared heap access handle.

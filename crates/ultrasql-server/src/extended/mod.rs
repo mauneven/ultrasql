@@ -114,6 +114,8 @@ pub struct PreparedStatement {
     pub sql: String,
     /// Bound logical plan. `None` for an empty statement (SQL `""`).
     pub plan: Option<LogicalPlan>,
+    /// Stable hash of the bound plan before bind-value substitution.
+    pub plan_hash: u64,
     /// Parameter type OIDs as declared by the client. May be shorter
     /// than `n_params` (the client is allowed to leave types unset).
     pub param_type_oids: Vec<u32>,
@@ -128,6 +130,14 @@ pub struct PreparedStatement {
 pub struct BoundPortal {
     /// The plan with `Parameter` nodes already replaced by `Literal`s.
     pub plan: Option<LogicalPlan>,
+    /// Raw prepared SQL text with `$N` placeholders intact.
+    pub sql: String,
+    /// Stable hash of the prepared plan before bind-value substitution.
+    pub plan_hash: u64,
+    /// Number of bind parameters supplied by the client.
+    pub bind_param_count: u32,
+    /// Whether concrete bind values are redacted from workload records.
+    pub bind_params_redacted: bool,
     /// Per-result-column format codes (`0` = text, `1` = binary).
     ///
     /// Spec conventions: empty → all text; single element → applies to

@@ -59,6 +59,7 @@ pub mod time_partition;
 pub mod tls;
 pub mod wal_sink;
 pub mod wire_writer;
+pub mod workload;
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -811,6 +812,8 @@ pub struct Server {
     pub time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
     /// Same-process logical replication publication registry and CDC stream.
     pub logical_replication: Arc<replication::LogicalReplicationRuntime>,
+    /// Same-process workload recorder for query timings and slow logs.
+    pub workload_recorder: Arc<workload::WorkloadRecorder>,
     /// Accumulated tuple modifications since the last analyze pass,
     /// keyed by folded table name.
     pub table_modifications: dashmap::DashMap<String, u64>,
@@ -1529,6 +1532,7 @@ impl Server {
             sequences: Arc::clone(&self.sequences),
             persistent_catalog: Arc::clone(&self.persistent_catalog),
             time_partitions: Arc::clone(&self.time_partitions),
+            workload_recorder: Arc::clone(&self.workload_recorder),
             sequence_state: Some(SequenceSessionState::default()),
             heap: Arc::clone(&self.heap),
             vm: Arc::clone(&self.vm),
@@ -1634,6 +1638,7 @@ impl Server {
             columnar_storage: Arc::new(columnar_storage::ColumnarSecondaryStore::new()),
             time_partitions: Arc::new(dashmap::DashMap::new()),
             logical_replication: Arc::new(replication::LogicalReplicationRuntime::new()),
+            workload_recorder: Arc::new(workload::WorkloadRecorder::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,
@@ -1997,6 +2002,7 @@ impl Server {
             columnar_storage: Arc::new(columnar_storage::ColumnarSecondaryStore::new()),
             time_partitions: Arc::new(dashmap::DashMap::new()),
             logical_replication: Arc::new(replication::LogicalReplicationRuntime::new()),
+            workload_recorder: Arc::new(workload::WorkloadRecorder::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,
@@ -2557,6 +2563,7 @@ fn run_plan_in_txn(
     sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
     persistent_catalog: Arc<PersistentCatalog>,
     time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
+    workload_recorder: Arc<workload::WorkloadRecorder>,
     sequence_state: Option<SequenceSessionState>,
     tables: &SampleTables,
     heap: Arc<HeapAccess<BlankPageLoader>>,
@@ -2587,6 +2594,7 @@ fn run_plan_in_txn(
         sequences,
         persistent_catalog,
         time_partitions,
+        workload_recorder,
         sequence_state,
         heap,
         vm,

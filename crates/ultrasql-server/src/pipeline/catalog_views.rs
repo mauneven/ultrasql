@@ -53,6 +53,7 @@ pub(crate) fn virtual_catalog_schema(name: &str) -> Option<Schema> {
         "pg_catalog.pg_roles" => Some(schema_pg_roles()),
         "pg_catalog.pg_user" => Some(schema_pg_user()),
         "pg_catalog.pg_settings" => Some(schema_pg_settings()),
+        "pg_catalog.pg_stat_statements" => Some(schema_pg_stat_statements()),
         "pg_catalog.pg_locks" => Some(schema_pg_locks()),
         "pg_catalog.pg_stat_activity" => Some(schema_pg_stat_activity()),
         "pg_catalog.pg_stat_user_tables" => Some(schema_pg_stat_user_tables()),
@@ -131,6 +132,9 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_roles" => Some((schema_pg_roles(), rows_pg_roles())),
         "pg_catalog.pg_user" => Some((schema_pg_user(), rows_pg_user())),
         "pg_catalog.pg_settings" => Some((schema_pg_settings(), rows_pg_settings())),
+        "pg_catalog.pg_stat_statements" => {
+            Some((schema_pg_stat_statements(), rows_pg_stat_statements(ctx)))
+        }
         "pg_catalog.pg_locks" => Some((schema_pg_locks(), Vec::new())),
         "pg_catalog.pg_stat_activity" => Some((schema_pg_stat_activity(), rows_pg_stat_activity())),
         "pg_catalog.pg_stat_user_tables" => {
@@ -226,6 +230,7 @@ fn normalized_name(name: &str) -> String {
         | "pg_roles"
         | "pg_user"
         | "pg_settings"
+        | "pg_stat_statements"
         | "pg_locks"
         | "pg_stat_activity"
         | "pg_proc"
@@ -1214,6 +1219,54 @@ fn rows_pg_settings() -> Vec<Vec<Value>> {
             v_text("sighup"),
         ],
     ]
+}
+
+fn schema_pg_stat_statements() -> Schema {
+    schema([
+        Field::required("queryid", DataType::Int64),
+        Field::required("query", text()),
+        Field::required("calls", DataType::Int64),
+        Field::required("total_exec_time", DataType::Float64),
+        Field::required("min_exec_time", DataType::Float64),
+        Field::required("max_exec_time", DataType::Float64),
+        Field::required("rows", DataType::Int64),
+        Field::required("errors", DataType::Int64),
+        Field::required("plan_hash", DataType::Int64),
+        Field::required("bind_param_count", DataType::Int32),
+        Field::required("bind_params_redacted", DataType::Bool),
+        Field::nullable("last_error", text()),
+    ])
+}
+
+fn rows_pg_stat_statements(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    ctx.workload_recorder
+        .snapshot()
+        .into_iter()
+        .map(|stat| {
+            vec![
+                Value::Int64(u64_to_i64_saturating(stat.query_id)),
+                v_text(stat.query),
+                Value::Int64(u64_to_i64_saturating(stat.calls)),
+                Value::Float64(duration_ms(stat.total_exec_time)),
+                Value::Float64(duration_ms(stat.min_exec_time)),
+                Value::Float64(duration_ms(stat.max_exec_time)),
+                Value::Int64(u64_to_i64_saturating(stat.rows)),
+                Value::Int64(u64_to_i64_saturating(stat.errors)),
+                Value::Int64(u64_to_i64_saturating(stat.plan_hash)),
+                Value::Int32(i32::try_from(stat.bind_param_count).unwrap_or(i32::MAX)),
+                Value::Bool(stat.bind_params_redacted),
+                stat.last_error.map_or(Value::Null, v_text),
+            ]
+        })
+        .collect()
+}
+
+fn duration_ms(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn u64_to_i64_saturating(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn schema_pg_locks() -> Schema {

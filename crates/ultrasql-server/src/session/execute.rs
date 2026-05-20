@@ -822,6 +822,7 @@ where
                     Arc::clone(&self.state.sequences),
                     Arc::clone(&self.state.persistent_catalog),
                     Arc::clone(&self.state.time_partitions),
+                    Arc::clone(&self.state.workload_recorder),
                     Some(self.sequence_state.clone()),
                     &self.state.tables,
                     Arc::clone(&self.state.heap),
@@ -843,6 +844,7 @@ where
                     Arc::clone(&self.state.sequences),
                     Arc::clone(&self.state.persistent_catalog),
                     Arc::clone(&self.state.time_partitions),
+                    Arc::clone(&self.state.workload_recorder),
                     Some(self.sequence_state.clone()),
                     &self.state.tables,
                     Arc::clone(&self.state.heap),
@@ -1463,6 +1465,7 @@ where
             Arc::clone(&self.state.sequences),
             Arc::clone(&self.state.persistent_catalog),
             Arc::clone(&self.state.time_partitions),
+            Arc::clone(&self.state.workload_recorder),
             Some(self.sequence_state.clone()),
             &self.state.tables,
             Arc::clone(&self.state.heap),
@@ -1514,6 +1517,19 @@ where
         // `<CMD> <rows>`.
         let last = parts.next_back().unwrap_or_default();
         last.parse::<u64>().unwrap_or(0)
+    }
+
+    pub(crate) fn parse_command_rows_tag(messages: &[BackendMessage]) -> u64 {
+        let Some(BackendMessage::CommandComplete { tag }) = messages
+            .iter()
+            .find(|m| matches!(m, BackendMessage::CommandComplete { .. }))
+        else {
+            return 0;
+        };
+        tag.split_whitespace()
+            .next_back()
+            .and_then(|rows| rows.parse::<u64>().ok())
+            .unwrap_or(0)
     }
 
     pub(crate) fn note_committed_dml_effect(&self, plan: &LogicalPlan, rows: u64) {

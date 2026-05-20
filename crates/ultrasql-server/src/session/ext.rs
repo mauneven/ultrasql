@@ -7,6 +7,7 @@
 #![allow(unused_imports)]
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -35,6 +36,7 @@ use crate::pipeline::{self, LowerCtx, SampleTables};
 use crate::result_encoder::{
     self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
 };
+use crate::workload::{WorkloadQueryRecord, plan_hash_for_plan};
 use crate::{
     BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
     run_plan_in_txn,
@@ -160,6 +162,7 @@ where
         }
         let optimised = self.optimize_dml_plan(sql, bound_plan, catalog_snapshot)?;
         if let Some(stmt) = self.extended.statements.get_mut(name) {
+            stmt.plan_hash = plan_hash_for_plan(&optimised);
             stmt.plan = Some(optimised);
         }
         Ok(())
@@ -274,6 +277,14 @@ where
             self.extended.mark_failed();
             return self.send_error(&err.to_string(), err.sqlstate()).await;
         };
+        let workload_meta = self.extended.portals.get(portal).map(|p| {
+            (
+                p.sql.clone(),
+                p.plan_hash,
+                p.bind_param_count,
+                p.bind_params_redacted,
+            )
+        });
 
         // Transaction-control plans take the dedicated TxnState dispatch.
         if let Some(ref plan) = plan_clone {
@@ -389,7 +400,24 @@ where
         }
 
         // Non-txn-control path: route through TxnState.
+        let started = Instant::now();
         let outcome = self.run_portal_routed(portal, max_rows);
+        let elapsed = started.elapsed();
+        if let Some((query, plan_hash, bind_param_count, bind_params_redacted)) = workload_meta {
+            let rows = outcome
+                .as_ref()
+                .map_or(0, |out| Self::parse_command_rows_tag(&out.messages));
+            let error = outcome.as_ref().err().map(ToString::to_string);
+            self.state.workload_recorder.record(WorkloadQueryRecord {
+                query,
+                plan_hash,
+                elapsed,
+                rows,
+                error,
+                bind_param_count,
+                bind_params_redacted,
+            });
+        }
 
         match outcome {
             Ok(out) => {
@@ -437,6 +465,7 @@ where
                     sequences: Arc::clone(&self.state.sequences),
                     persistent_catalog: Arc::clone(&self.state.persistent_catalog),
                     time_partitions: Arc::clone(&self.state.time_partitions),
+                    workload_recorder: Arc::clone(&self.state.workload_recorder),
                     sequence_state: Some(self.sequence_state.clone()),
                     heap: Arc::clone(&self.state.heap),
                     vm: Arc::clone(&self.state.vm),
@@ -508,6 +537,7 @@ where
                     sequences: Arc::clone(&self.state.sequences),
                     persistent_catalog: Arc::clone(&self.state.persistent_catalog),
                     time_partitions: Arc::clone(&self.state.time_partitions),
+                    workload_recorder: Arc::clone(&self.state.workload_recorder),
                     sequence_state: Some(self.sequence_state.clone()),
                     heap: Arc::clone(&self.state.heap),
                     vm: Arc::clone(&self.state.vm),

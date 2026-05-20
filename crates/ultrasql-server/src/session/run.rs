@@ -7,6 +7,7 @@
 #![allow(unused_imports)]
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -36,6 +37,7 @@ use crate::pipeline::{self, LowerCtx, SampleTables};
 use crate::result_encoder::{
     self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
 };
+use crate::workload::{self, WorkloadQueryRecord};
 use crate::{
     BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
     run_plan_in_txn,
@@ -206,7 +208,22 @@ where
             }
         }
 
-        match self.execute_query(trimmed) {
+        let started = Instant::now();
+        let outcome = self.execute_query(trimmed);
+        let elapsed = started.elapsed();
+        let rows = outcome.as_ref().map_or(0, |result| result.rows);
+        let error = outcome.as_ref().err().map(ToString::to_string);
+        self.state.workload_recorder.record(WorkloadQueryRecord {
+            query: trimmed.to_string(),
+            plan_hash: workload::plan_hash_for_sql(trimmed),
+            elapsed,
+            rows,
+            error,
+            bind_param_count: 0,
+            bind_params_redacted: false,
+        });
+
+        match outcome {
             Ok(result) => {
                 // Append the trailing `ReadyForQuery` to the same
                 // wire-buffer the query result writes so the whole

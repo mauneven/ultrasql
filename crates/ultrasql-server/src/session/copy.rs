@@ -1079,6 +1079,7 @@ where
             sequences: Arc::clone(&self.state.sequences),
             persistent_catalog: Arc::clone(&self.state.persistent_catalog),
             time_partitions: Arc::clone(&self.state.time_partitions),
+            workload_recorder: Arc::clone(&self.state.workload_recorder),
             sequence_state: Some(self.sequence_state.clone()),
             heap: Arc::clone(&self.state.heap),
             vm: Arc::clone(&self.state.vm),
