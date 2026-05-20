@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "profile": "smoke",
+  "requested_engines": [
+    "ultrasql",
+    "duckdb",
+    "clickhouse",
+    "postgres"
+  ],
+  "requested_suites": [
+    "csv",
+    "parquet",
+    "vector",
+    "jsonb"
+  ],
+  "generated_at_unix": 1779318654,
+  "status": "partial",
+  "passed": false,
+  "suites": [
+    {
+      "suite": "csv",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/csv_benchmark_gauntlet_manifest.json"
+    },
+    {
+      "suite": "csv:postgres",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_csv_smoke-postgres.json"
+    },
+    {
+      "suite": "parquet:ultrasql",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_parquet_smoke-ultrasql.json"
+    },
+    {
+      "suite": "parquet:duckdb",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_parquet_smoke-duckdb.json"
+    },
+    {
+      "suite": "parquet:clickhouse",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_parquet_smoke-clickhouse.json"
+    },
+    {
+      "suite": "parquet:postgres",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_parquet_smoke-postgres.json"
+    },
+    {
+      "suite": "vector",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json"
+    },
+    {
+      "suite": "jsonb:ultrasql",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_jsonb_smoke-ultrasql.json"
+    },
+    {
+      "suite": "jsonb:duckdb",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_jsonb_smoke-duckdb.json"
+    },
+    {
+      "suite": "jsonb:clickhouse",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_jsonb_smoke-clickhouse.json"
+    },
+    {
+      "suite": "jsonb:postgres",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_jsonb_smoke-postgres.json"
+    }
+  ],
+  "policy": "Public benchmark arena publishes artifacts only. It does not rank engines or make benchmark claims; each claim must come from the referenced raw artifact and its reproducible runner."
+}

@@ -1,0 +1,1 @@
+{"schema_version":1,"suite":"csv_benchmark_gauntlet","engine":"duckdb","workload":"csv_copy_import_1k","profile":"smoke","n_rows":1000,"samples":1,"median_us":3191.583906300366,"min_us":3191.583906300366,"iterations_us":[3191.583906300366],"answer":{"mode":"copy_import"}}

@@ -1,0 +1,1 @@
+{"schema_version":1,"suite":"csv_benchmark_gauntlet","engine":"clickhouse","workload":"csv_filter_1k","profile":"smoke","status":"not_available","reason":"clickhouse_local_not_found","policy":"No CSV benchmark claim exists for this engine/workload until this artifact records measured samples from reproducible inputs."}

@@ -1,0 +1,1 @@
+{"answer":"88,119,257,288,426","engine":"ultrasql","iterations_us":[1759.042],"median_us":1759.042,"min_us":1759.042,"n_rows":512,"samples":1,"workload":"vector_topk_exact_512_8d_k5"}

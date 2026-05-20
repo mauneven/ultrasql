@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "engine": "ultrasql_hnsw",
+  "workload": "vector_ann_hnsw_512_8d_k10",
+  "host": {
+    "cpu": "aarch64",
+    "cores": 0,
+    "ram_gb": 0,
+    "os": "macos unknown"
+  },
+  "n_rows": 512,
+  "vector_dims": 8,
+  "top_k": 10,
+  "queries": 4,
+  "warmup_queries": 0,
+  "metric": "l2",
+  "m": 16,
+  "ef_search": 64,
+  "seed": 1367265502,
+  "recall_at_k": 1.0,
+  "p50_latency_us": 215.667,
+  "p95_latency_us": 225.375,
+  "p99_latency_us": 225.375,
+  "build_time_us": 9782.959,
+  "memory_bytes": 175560,
+  "query_iterations_us": [
+    206.208,
+    215.667,
+    225.375,
+    219.791
+  ],
+  "recall_iterations": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "first_exact_answer": [
+    454,
+    420,
+    366,
+    169,
+    284,
+    367,
+    241,
+    471,
+    218,
+    161
+  ],
+  "first_ann_answer": [
+    454,
+    420,
+    366,
+    169,
+    284,
+    367,
+    241,
+    471,
+    218,
+    161
+  ]
+}

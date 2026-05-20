@@ -1,0 +1,1 @@
+{"engine":"duckdb_list","workload":"vector_topk_exact_512_8d_k5","n_rows":512,"vector_dims":8,"top_k":5,"exact":true,"metric":"l2","samples":1,"median_us":66303.3330347389,"min_us":66303.3330347389,"iterations_us":[66303.3330347389],"answer":"88,119,257,288,426"}

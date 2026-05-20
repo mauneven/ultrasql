@@ -1,0 +1,1 @@
+{"schema_version":1,"suite":"csv_benchmark_gauntlet","engine":"duckdb","workload":"csv_join_table_1k","profile":"smoke","n_rows":1000,"samples":1,"median_us":8224.16611481458,"min_us":8224.16611481458,"iterations_us":[8224.16611481458],"answer":[[1000]]}

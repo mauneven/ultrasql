@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "suite": "parquet",
+  "engine": "clickhouse",
+  "workload": "arena_parquet_smoke",
+  "profile": "smoke",
+  "status": "not_available",
+  "reason": "runner_not_implemented",
+  "generated_at_unix": 1779318633,
+  "required_metrics": [
+    "scan_us",
+    "projection_pushdown_us",
+    "predicate_pushdown_us",
+    "row_group_pruning_us"
+  ],
+  "policy": "No benchmark claim exists for this suite/engine until a committed runner emits measured samples from reproducible inputs."
+}

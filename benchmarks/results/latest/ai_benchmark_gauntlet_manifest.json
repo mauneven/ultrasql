@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "profile": "smoke",
+  "generated_at_unix": 1779318653,
+  "status": "partial",
+  "passed": false,
+  "suites": [
+    {
+      "suite": "exact_vector_scan",
+      "status": "passed",
+      "exit_code": 0,
+      "artifact": "benchmarks/results/latest/raw/vector_topk_exact_*-{ultrasql,postgres17_pgvector,duckdb_list,clickhouse_vector}.json"
+    },
+    {
+      "suite": "ann_recall_latency",
+      "status": "passed",
+      "exit_code": 0,
+      "artifact": "benchmarks/results/latest/raw/vector_ann_hnsw_*-ultrasql_hnsw.json"
+    },
+    {
+      "suite": "hybrid_search_latency",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_hybrid_search_latency_smoke-ultrasql.json"
+    },
+    {
+      "suite": "rag_retrieval_quality",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_rag_retrieval_quality_smoke-ultrasql.json"
+    },
+    {
+      "suite": "filtered_vector_search",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_filtered_vector_search_smoke-ultrasql.json"
+    },
+    {
+      "suite": "ingestion_throughput",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_ingestion_throughput_smoke-ultrasql.json"
+    },
+    {
+      "suite": "memory_per_million_vectors",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_memory_per_million_vectors_smoke-ultrasql.json"
+    },
+    {
+      "suite": "cold_start_index_load",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_cold_start_index_load_smoke-ultrasql.json"
+    }
+  ],
+  "policy": "AI benchmark gauntlet is complete only when every suite has a committed runner and emits required reproducible metrics. not_available artifacts are visible gaps, not benchmark claims."
+}

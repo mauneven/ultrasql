@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "suite": "csv_benchmark_gauntlet",
+  "profile": "smoke",
+  "generated_at_unix": 1779318633,
+  "status": "partial",
+  "passed": false,
+  "artifacts": [
+    {
+      "engine": "ultrasql",
+      "workload": "csv_cold_read",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_cold_read_1k-ultrasql.json"
+    },
+    {
+      "engine": "ultrasql",
+      "workload": "csv_warm_read",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_warm_read_1k-ultrasql.json"
+    },
+    {
+      "engine": "ultrasql",
+      "workload": "csv_copy_import",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_copy_import_1k-ultrasql.json"
+    },
+    {
+      "engine": "ultrasql",
+      "workload": "csv_group_by",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_group_by_1k-ultrasql.json"
+    },
+    {
+      "engine": "ultrasql",
+      "workload": "csv_filter",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_filter_1k-ultrasql.json"
+    },
+    {
+      "engine": "ultrasql",
+      "workload": "csv_join_table",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_join_table_1k-ultrasql.json"
+    },
+    {
+      "engine": "ultrasql",
+      "workload": "csv_malformed_behavior",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_malformed_behavior_1k-ultrasql.json"
+    },
+    {
+      "engine": "duckdb",
+      "workload": "csv_cold_read",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_cold_read_1k-duckdb.json"
+    },
+    {
+      "engine": "duckdb",
+      "workload": "csv_warm_read",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_warm_read_1k-duckdb.json"
+    },
+    {
+      "engine": "duckdb",
+      "workload": "csv_copy_import",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_copy_import_1k-duckdb.json"
+    },
+    {
+      "engine": "duckdb",
+      "workload": "csv_group_by",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_group_by_1k-duckdb.json"
+    },
+    {
+      "engine": "duckdb",
+      "workload": "csv_filter",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_filter_1k-duckdb.json"
+    },
+    {
+      "engine": "duckdb",
+      "workload": "csv_join_table",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_join_table_1k-duckdb.json"
+    },
+    {
+      "engine": "duckdb",
+      "workload": "csv_malformed_behavior",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/csv_malformed_behavior_1k-duckdb.json"
+    },
+    {
+      "engine": "clickhouse",
+      "workload": "csv_cold_read",
+      "status": "not_available",
+      "artifact": "benchmarks/results/latest/raw/csv_cold_read_1k-clickhouse.json"
+    },
+    {
+      "engine": "clickhouse",
+      "workload": "csv_warm_read",
+      "status": "not_available",
+      "artifact": "benchmarks/results/latest/raw/csv_warm_read_1k-clickhouse.json"
+    },
+    {
+      "engine": "clickhouse",
+      "workload": "csv_copy_import",
+      "status": "not_available",
+      "artifact": "benchmarks/results/latest/raw/csv_copy_import_1k-clickhouse.json"
+    },
+    {
+      "engine": "clickhouse",
+      "workload": "csv_group_by",
+      "status": "not_available",
+      "artifact": "benchmarks/results/latest/raw/csv_group_by_1k-clickhouse.json"
+    },
+    {
+      "engine": "clickhouse",
+      "workload": "csv_filter",
+      "status": "not_available",
+      "artifact": "benchmarks/results/latest/raw/csv_filter_1k-clickhouse.json"
+    },
+    {
+      "engine": "clickhouse",
+      "workload": "csv_join_table",
+      "status": "not_available",
+      "artifact": "benchmarks/results/latest/raw/csv_join_table_1k-clickhouse.json"
+    },
+    {
+      "engine": "clickhouse",
+      "workload": "csv_malformed_behavior",
+      "status": "not_available",
+      "artifact": "benchmarks/results/latest/raw/csv_malformed_behavior_1k-clickhouse.json"
+    }
+  ],
+  "policy": "CSV gauntlet is publishable only when all requested engines emit measured artifacts on the same generated inputs. not_available artifacts are setup gaps, not benchmark claims."
+}

@@ -1,0 +1,1 @@
+{"answer":{"cache_policy":"cold_read is first measured read in a fresh UltraSQL server; host OS page cache is not forcibly dropped","rows":[["1000"]]},"engine":"ultrasql","iterations_us":[1679.875],"median_us":1679.875,"min_us":1679.875,"n_rows":1000,"samples":1,"workload":"csv_warm_read_1k"}

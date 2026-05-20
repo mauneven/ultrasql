@@ -1,0 +1,1 @@
+{"engine":"postgres17_pgvector","status":"not_available","reason":"pgvector_extension_unavailable","workload":"vector_topk_exact_512_8d_k5","n_rows":512,"vector_dims":8,"top_k":5}

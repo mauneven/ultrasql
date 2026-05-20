@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "suite": "hybrid_search_latency",
+  "engine": "ultrasql",
+  "workload": "ai_gauntlet_hybrid_search_latency_smoke",
+  "profile": "smoke",
+  "status": "not_available",
+  "reason": "runner_not_implemented",
+  "generated_at_unix": 1779318653,
+  "required_metrics": [
+    "p50_latency_us",
+    "p95_latency_us",
+    "p99_latency_us",
+    "bm25_score",
+    "vector_score",
+    "filter_selectivity"
+  ],
+  "policy": "No benchmark claim exists for this suite until a committed runner emits the required metrics from reproducible inputs."
+}

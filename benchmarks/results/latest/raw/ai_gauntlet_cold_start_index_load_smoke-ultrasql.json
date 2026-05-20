@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "suite": "cold_start_index_load",
+  "engine": "ultrasql",
+  "workload": "ai_gauntlet_cold_start_index_load_smoke",
+  "profile": "smoke",
+  "status": "not_available",
+  "reason": "runner_not_implemented",
+  "generated_at_unix": 1779318653,
+  "required_metrics": [
+    "load_time_us",
+    "ready_time_us",
+    "index_bytes"
+  ],
+  "policy": "No benchmark claim exists for this suite until a committed runner emits the required metrics from reproducible inputs."
+}

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "suite": "csv",
+  "engine": "postgres",
+  "workload": "arena_csv_smoke",
+  "profile": "smoke",
+  "status": "not_available",
+  "reason": "runner_not_implemented_for_engine",
+  "generated_at_unix": 1779318633,
+  "required_metrics": [
+    "cold_read_us",
+    "warm_read_us",
+    "copy_import_us",
+    "group_by_us",
+    "filter_us",
+    "join_us",
+    "bad_row_behavior"
+  ],
+  "policy": "No benchmark claim exists for this suite/engine until a committed runner emits measured samples from reproducible inputs."
+}

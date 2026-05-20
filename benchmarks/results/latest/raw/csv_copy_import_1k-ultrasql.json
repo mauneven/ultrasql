@@ -1,0 +1,1 @@
+{"answer":{"imported_rows":1000},"engine":"ultrasql","iterations_us":[3572.708],"median_us":3572.708,"min_us":3572.708,"n_rows":1000,"samples":1,"workload":"csv_copy_import_1k"}

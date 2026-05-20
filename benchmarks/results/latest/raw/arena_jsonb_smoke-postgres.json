@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "suite": "jsonb",
+  "engine": "postgres",
+  "workload": "arena_jsonb_smoke",
+  "profile": "smoke",
+  "status": "not_available",
+  "reason": "runner_not_implemented",
+  "generated_at_unix": 1779318654,
+  "required_metrics": [
+    "ingest_rows_per_second",
+    "parse_us",
+    "query_median_us",
+    "shape_cache_hit_rate"
+  ],
+  "policy": "No benchmark claim exists for this suite/engine until a committed runner emits measured samples from reproducible inputs."
+}

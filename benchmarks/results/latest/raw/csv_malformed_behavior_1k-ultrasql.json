@@ -1,0 +1,1 @@
+{"answer":{"accepted_rows":3,"max_errors":1000,"mode":"copy_ignore_errors","rejected_rows":2},"engine":"ultrasql","iterations_us":[2385.5],"median_us":2385.5,"min_us":2385.5,"n_rows":1000,"samples":1,"workload":"csv_malformed_behavior_1k"}
