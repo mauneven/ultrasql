@@ -114,6 +114,12 @@ impl WorkMemBudget {
     pub fn used_bytes(&self) -> u64 {
         self.used.load(Ordering::Relaxed)
     }
+
+    /// Maximum bytes available to this budget.
+    #[must_use]
+    pub const fn limit_bytes(&self) -> u64 {
+        self.limit_bytes
+    }
 }
 
 /// RAII guard returned by [`WorkMemBudget::reserve`].

@@ -73,6 +73,7 @@ pub fn lower_plan(
                 join_type: *join_type,
                 condition,
                 out_schema: schema.clone(),
+                work_mem: None,
             })
         }
         LogicalPlan::Empty { .. } => Err(ServerError::Unsupported("SELECT without FROM")),

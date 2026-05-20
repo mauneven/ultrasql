@@ -5,6 +5,7 @@ use std::sync::Arc;
 use ultrasql_core::{DataType, Schema};
 use ultrasql_executor::{
     HashJoin, MemTableScan, MergeJoin, NestedLoopJoin, Operator, Project, RightFactory,
+    WorkMemBudget,
 };
 use ultrasql_planner::{
     BinaryOp, LogicalJoinCondition, LogicalJoinType, LogicalPlan, LogicalSetQuantifier, ScalarExpr,
@@ -112,6 +113,7 @@ pub(super) struct LowerJoinArgs<'a> {
     pub(super) join_type: LogicalJoinType,
     pub(super) condition: &'a LogicalJoinCondition,
     pub(super) out_schema: Schema,
+    pub(super) work_mem: Option<Arc<WorkMemBudget>>,
 }
 
 pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, ServerError> {
@@ -125,6 +127,7 @@ pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, S
         join_type,
         condition,
         out_schema,
+        work_mem,
     } = args;
     match condition {
         LogicalJoinCondition::On(pred) => {
@@ -143,7 +146,7 @@ pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, S
                         && residual.is_none()
                         && should_build_inner_hash_join_on_right(&*left, &*right)
                     {
-                        return build_swapped_inner_hash_join(
+                        return build_swapped_inner_hash_join(SwappedInnerHashJoinArgs {
                             left,
                             right,
                             left_keys,
@@ -151,14 +154,15 @@ pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, S
                             out_schema,
                             left_schema,
                             right_schema,
-                        );
+                            work_mem,
+                        });
                     }
                     if matches!(join_type, LogicalJoinType::Semi | LogicalJoinType::Anti)
                         && should_build_semi_anti_hash_join_on_right(
                             left_plan, right_plan, &*left, &*right,
                         )
                     {
-                        return Ok(Box::new(HashJoin::new_multi_with_residual_build_right(
+                        let join = HashJoin::new_multi_with_residual_build_right(
                             left,
                             right,
                             left_keys,
@@ -168,11 +172,12 @@ pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, S
                             out_schema,
                             left_schema,
                             right_schema,
-                        )));
+                        );
+                        return Ok(Box::new(attach_work_mem(join, &work_mem)));
                     }
                     // HashJoin: left = build, right = probe. See the
                     // function docs for the rationale.
-                    return Ok(Box::new(HashJoin::new_multi_with_residual(
+                    let join = HashJoin::new_multi_with_residual(
                         left,
                         right,
                         left_keys,
@@ -182,7 +187,8 @@ pub(super) fn lower_join(args: LowerJoinArgs<'_>) -> Result<Box<dyn Operator>, S
                         out_schema,
                         left_schema,
                         right_schema,
-                    )));
+                    );
+                    return Ok(Box::new(attach_work_mem(join, &work_mem)));
                 }
             }
             // Non-equi predicate, type-ineligible equi predicate, or an
@@ -261,7 +267,7 @@ fn logical_plan_looks_compact_for_semi_anti_build(plan: &LogicalPlan) -> bool {
     }
 }
 
-fn build_swapped_inner_hash_join(
+struct SwappedInnerHashJoinArgs {
     left: Box<dyn Operator>,
     right: Box<dyn Operator>,
     left_keys: Vec<ScalarExpr>,
@@ -269,11 +275,26 @@ fn build_swapped_inner_hash_join(
     out_schema: Schema,
     left_schema: Schema,
     right_schema: Schema,
+    work_mem: Option<Arc<WorkMemBudget>>,
+}
+
+fn build_swapped_inner_hash_join(
+    args: SwappedInnerHashJoinArgs,
 ) -> Result<Box<dyn Operator>, ServerError> {
+    let SwappedInnerHashJoinArgs {
+        left,
+        right,
+        left_keys,
+        right_keys,
+        out_schema,
+        left_schema,
+        right_schema,
+        work_mem,
+    } = args;
     let left_width = left_schema.len();
     let right_width = right_schema.len();
     let swapped_schema = concat_schemas(&right_schema, &left_schema);
-    let join = Box::new(HashJoin::new_multi(
+    let join = HashJoin::new_multi(
         right,
         left,
         right_keys,
@@ -282,13 +303,22 @@ fn build_swapped_inner_hash_join(
         swapped_schema,
         right_schema,
         left_schema,
-    ));
+    );
+    let join = Box::new(attach_work_mem(join, &work_mem));
 
     let mut indices = Vec::with_capacity(left_width + right_width);
     indices.extend(right_width..(right_width + left_width));
     indices.extend(0..right_width);
 
     Ok(Box::new(Project::with_schema(join, indices, out_schema)?))
+}
+
+fn attach_work_mem(join: HashJoin, work_mem: &Option<Arc<WorkMemBudget>>) -> HashJoin {
+    if let Some(budget) = work_mem {
+        join.with_work_mem_budget(Arc::clone(budget))
+    } else {
+        join
+    }
 }
 
 fn concat_schemas(left: &Schema, right: &Schema) -> Schema {

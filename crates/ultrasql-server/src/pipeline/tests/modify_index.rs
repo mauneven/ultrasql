@@ -174,6 +174,47 @@ fn lower_query_order_by_desc_indexed_column_picks_backward_index_scan() {
 }
 
 #[test]
+fn lower_query_limit_order_by_indexed_column_uses_presorted_top_k() {
+    let rows: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
+    let (fix, _entry, _) = build_index_fixture("t_order_limit_indexed", &rows, true);
+    let tables = SampleTables::new();
+    let ctx = fix.ctx(&tables);
+    let schema = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::required("val", DataType::Int32),
+    ])
+    .expect("schema");
+    let plan = LogicalPlan::Limit {
+        input: Box::new(LogicalPlan::Sort {
+            input: Box::new(LogicalPlan::Scan {
+                table: "t_order_limit_indexed".into(),
+                schema: schema.clone(),
+                projection: None,
+            }),
+            keys: vec![SortKey {
+                expr: ScalarExpr::Column {
+                    name: "id".into(),
+                    index: 0,
+                    data_type: DataType::Int32,
+                },
+                asc: true,
+                nulls_first: false,
+            }],
+        }),
+        n: 3,
+        offset: 2,
+    };
+    let mut op = lower_query(&plan, &ctx).expect("lowers");
+    let debug = format!("{op:?}");
+    assert!(
+        debug.contains("TopK") && debug.contains("IndexScan"),
+        "expected presorted TopK over IndexScan, got: {debug}"
+    );
+    let pairs = drain_id_val(op.as_mut()).expect("drain");
+    assert_eq!(pairs, vec![(3, 30), (4, 40), (5, 50)]);
+}
+
+#[test]
 fn lower_query_project_index_key_on_all_visible_pages_picks_index_only_scan() {
     let rows: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
     let (fix, entry, tids) = build_index_fixture("t_index_only", &rows, true);

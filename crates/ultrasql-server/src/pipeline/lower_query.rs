@@ -20,6 +20,7 @@ use super::agg_fuse::{
 use super::cte_helpers::{lower_recursive_cte, lower_set_op_real};
 use super::index_scan::{
     try_hnsw_top_k_limit, try_index_only_scan, try_index_scan, try_ordered_index_scan,
+    try_ordered_index_scan_limit,
 };
 use super::join::{LowerJoinArgs, lower_join};
 use super::modify::{
@@ -203,6 +204,9 @@ pub fn lower_query(
             if let Some(op) = try_hnsw_top_k_limit(input, *n, *offset, ctx)? {
                 return Ok(op);
             }
+            if let Some(op) = try_ordered_index_scan_limit(input, *n, *offset, ctx)? {
+                return Ok(op);
+            }
             let child = lower_query(input, ctx)?;
             let limit = saturate_row_count(*n);
             let offset = saturate_row_count(*offset);
@@ -346,6 +350,7 @@ pub fn lower_query(
                 join_type: *join_type,
                 condition,
                 out_schema: schema.clone(),
+                work_mem: Some(Arc::clone(&ctx.work_mem)),
             })
         }
         LogicalPlan::Aggregate {

@@ -3383,6 +3383,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "smallvec",
+ "tempfile",
  "thiserror",
  "tracing",
  "ultrasql-catalog",

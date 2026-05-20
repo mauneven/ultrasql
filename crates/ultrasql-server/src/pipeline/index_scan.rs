@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
 use ultrasql_core::{BlockNumber, DataType, Field, RelationId, TupleId, Value};
-use ultrasql_executor::{Filter, IndexOnlyScan, IndexScan, Operator, RowCodec};
+use ultrasql_executor::{Filter, IndexOnlyScan, IndexScan, Limit, Operator, RowCodec, TopK};
 use ultrasql_mvcc::{Visibility, is_visible};
 use ultrasql_planner::{BinaryOp, LogicalIndexMethod, LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_storage::access_method::{BrinIndex, HnswIndex, HnswMetric, IvfFlatIndex};
@@ -453,6 +453,66 @@ pub(super) fn try_ordered_index_scan(
     keys: &[SortKey],
     ctx: &LowerCtx<'_>,
 ) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    try_ordered_index_scan_with_cap(input, keys, None, ctx)
+}
+
+/// Try to lower `LIMIT/OFFSET` over an index-ordered scan without
+/// draining the entire index first.
+///
+/// The B-tree walk and heap fetch stop after enough MVCC-visible rows
+/// have been collected to satisfy `offset + limit`. The executor still
+/// receives a normal [`Limit`] over a presorted [`TopK`] so the row-cap
+/// contract stays centralised in executor code.
+pub(super) fn try_ordered_index_scan_limit(
+    input: &LogicalPlan,
+    limit: u64,
+    offset: u64,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    if limit == u64::MAX {
+        return Ok(None);
+    }
+    let cap = usize::try_from(limit.saturating_add(offset)).unwrap_or(usize::MAX);
+    match input {
+        LogicalPlan::Sort {
+            input: sort_input,
+            keys,
+        } => {
+            let Some(scan) = try_ordered_index_scan_with_cap(sort_input, keys, Some(cap), ctx)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(limit_presorted_scan(scan, limit, offset, cap)))
+        }
+        LogicalPlan::Project {
+            input: project_input,
+            exprs,
+            ..
+        } => {
+            let LogicalPlan::Sort {
+                input: sort_input,
+                keys,
+            } = project_input.as_ref()
+            else {
+                return Ok(None);
+            };
+            let Some(scan) = try_ordered_index_scan_with_cap(sort_input, keys, Some(cap), ctx)?
+            else {
+                return Ok(None);
+            };
+            let limited = limit_presorted_scan(scan, limit, offset, cap);
+            lower_project_columns(limited, exprs).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn try_ordered_index_scan_with_cap(
+    input: &LogicalPlan,
+    keys: &[SortKey],
+    cap: Option<usize>,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
     let [key] = keys else {
         return Ok(None);
     };
@@ -479,17 +539,30 @@ pub(super) fn try_ordered_index_scan(
     let Some(_widen) = key_type_for_btree(table_entry, col_idx) else {
         return Ok(None);
     };
-    let payloads = probe_index_ordered(
-        index_entry,
-        IndexKeyRange {
-            low: None,
-            high: None,
-        },
-        key.asc,
-        ctx,
-    )?;
+    let range = IndexKeyRange {
+        low: None,
+        high: None,
+    };
+    let payloads = if let Some(cap) = cap {
+        probe_index_ordered_limited(index_entry, range, key.asc, cap, ctx)?
+    } else {
+        probe_index_ordered(index_entry, range, key.asc, ctx)?
+    };
     let codec = RowCodec::new(table_entry.schema.clone());
     Ok(Some(Box::new(IndexScan::new(payloads, codec))))
+}
+
+fn limit_presorted_scan(
+    scan: Box<dyn Operator>,
+    limit: u64,
+    offset: u64,
+    cap: usize,
+) -> Box<dyn Operator> {
+    let schema = scan.schema().clone();
+    let top_k = Box::new(TopK::new_presorted(scan, schema, cap));
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let offset = usize::try_from(offset).unwrap_or(usize::MAX);
+    Box::new(Limit::with_offset(top_k, limit, offset))
 }
 
 /// Try to lower `Project(Filter(Scan), key_column)` into an index-only scan.
@@ -893,6 +966,71 @@ fn probe_index_ordered(
     fetch_visible_index_payloads(entries.into_iter().map(|(_, tid)| tid), ctx)
 }
 
+fn probe_index_ordered_limited(
+    index_entry: &IndexEntry,
+    range: IndexKeyRange,
+    ascending: bool,
+    limit: usize,
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<Vec<u8>>, ServerError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let index_rel = RelationId::new(index_entry.oid.raw());
+    let pool = ctx.heap.buffer_pool();
+    let btree: BTree<BlankPageLoader> =
+        BTree::open(Arc::clone(pool), index_rel, index_entry.root_block);
+    let mut payloads = Vec::new();
+
+    match (range.low, range.high, ascending) {
+        (Some(lo), Some(hi), true) if lo == hi => {
+            if index_entry.is_unique {
+                if let Some(tid) = btree
+                    .lookup::<i64>(lo)
+                    .map_err(|e| ServerError::ddl(format!("IndexScan btree lookup: {e}")))?
+                {
+                    push_visible_index_payload(&mut payloads, tid, ctx, limit)?;
+                }
+            } else {
+                for tid in btree
+                    .lookup_all::<i64>(lo)
+                    .map_err(|e| ServerError::ddl(format!("IndexScan btree lookup: {e}")))?
+                {
+                    if push_visible_index_payload(&mut payloads, tid, ctx, limit)? {
+                        break;
+                    }
+                }
+            }
+        }
+        (low, high, true) => {
+            let start = low.unwrap_or(i64::MIN);
+            let end_exclusive = high.and_then(|h| h.checked_add(1));
+            for entry in btree.range_scan::<i64>(start, end_exclusive) {
+                let (_key, tid) =
+                    entry.map_err(|e| ServerError::ddl(format!("IndexScan btree scan: {e}")))?;
+                if push_visible_index_payload(&mut payloads, tid, ctx, limit)? {
+                    break;
+                }
+            }
+        }
+        (low, high, false) => {
+            let start = high.unwrap_or(i64::MAX);
+            let end = low;
+            for entry in btree
+                .backward_scan::<i64>(start, end)
+                .map_err(|e| ServerError::ddl(format!("IndexScan btree backward scan: {e}")))?
+            {
+                let (_key, tid) = entry
+                    .map_err(|e| ServerError::ddl(format!("IndexScan btree backward scan: {e}")))?;
+                if push_visible_index_payload(&mut payloads, tid, ctx, limit)? {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(payloads)
+}
+
 fn probe_index_entries_ordered(
     index_entry: &IndexEntry,
     range: IndexKeyRange,
@@ -976,16 +1114,39 @@ where
     let (lower, _) = iter.size_hint();
     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(lower);
     for tid in iter {
-        let tuple = ctx
-            .heap
-            .fetch(tid)
-            .map_err(|e| ServerError::ddl(format!("IndexScan heap fetch: {e}")))?;
-        let visibility = is_visible(&tuple.header, &ctx.snapshot, ctx.oracle.as_ref());
-        if matches!(visibility, Visibility::Visible) {
-            payloads.push(tuple.data);
+        if let Some(payload) = fetch_visible_index_payload(tid, ctx)? {
+            payloads.push(payload);
         }
     }
     Ok(payloads)
+}
+
+fn push_visible_index_payload(
+    payloads: &mut Vec<Vec<u8>>,
+    tid: TupleId,
+    ctx: &LowerCtx<'_>,
+    limit: usize,
+) -> Result<bool, ServerError> {
+    if let Some(payload) = fetch_visible_index_payload(tid, ctx)? {
+        payloads.push(payload);
+    }
+    Ok(payloads.len() >= limit)
+}
+
+fn fetch_visible_index_payload(
+    tid: TupleId,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Vec<u8>>, ServerError> {
+    let tuple = ctx
+        .heap
+        .fetch(tid)
+        .map_err(|e| ServerError::ddl(format!("IndexScan heap fetch: {e}")))?;
+    let visibility = is_visible(&tuple.header, &ctx.snapshot, ctx.oracle.as_ref());
+    if matches!(visibility, Visibility::Visible) {
+        Ok(Some(tuple.data))
+    } else {
+        Ok(None)
+    }
 }
 
 fn scan_brin_candidate_ranges(

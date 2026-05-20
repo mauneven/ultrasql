@@ -35,6 +35,8 @@ pub struct TopK {
     exact_vector_key: Option<ExactVectorTopKKey>,
     schema: Schema,
     cap: usize,
+    presorted_input: bool,
+    presorted_emitted: usize,
     sorted: Option<std::vec::IntoIter<Vec<Value>>>,
     eof: bool,
 }
@@ -75,6 +77,30 @@ impl TopK {
             exact_vector_key,
             schema,
             cap,
+            presorted_input: false,
+            presorted_emitted: 0,
+            sorted: None,
+            eof: false,
+        }
+    }
+
+    /// Construct a top-k operator over an input that is already sorted in
+    /// the requested order.
+    ///
+    /// This is the adaptive early-stop path for plans that discover a
+    /// cheaper ordered source at execution time, such as an index scan. The
+    /// operator emits at most `cap` rows and stops pulling its child as soon
+    /// as that cap is reached.
+    #[must_use]
+    pub fn new_presorted(child: Box<dyn Operator>, schema: Schema, cap: usize) -> Self {
+        Self {
+            child,
+            keys: Vec::new(),
+            exact_vector_key: None,
+            schema,
+            cap,
+            presorted_input: true,
+            presorted_emitted: 0,
             sorted: None,
             eof: false,
         }
@@ -89,6 +115,9 @@ impl Operator for TopK {
         if self.cap == 0 {
             self.eof = true;
             return Ok(None);
+        }
+        if self.presorted_input {
+            return self.next_presorted_batch();
         }
 
         if self.sorted.is_none() {
@@ -130,6 +159,37 @@ impl Operator for TopK {
 
     fn estimated_row_count(&self) -> Option<usize> {
         Some(self.cap)
+    }
+}
+
+impl TopK {
+    fn next_presorted_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+        if self.presorted_emitted >= self.cap {
+            self.eof = true;
+            return Ok(None);
+        }
+
+        let mut chunk: Vec<Vec<Value>> = Vec::new();
+        while chunk.len() < BATCH_TARGET_ROWS && self.presorted_emitted < self.cap {
+            let Some(batch) = self.child.next_batch()? else {
+                break;
+            };
+            let remaining = self.cap - self.presorted_emitted;
+            let rows = batch_to_rows(&batch, &self.schema)?;
+            for row in rows.into_iter().take(remaining) {
+                chunk.push(row);
+                self.presorted_emitted += 1;
+                if chunk.len() == BATCH_TARGET_ROWS || self.presorted_emitted == self.cap {
+                    break;
+                }
+            }
+        }
+
+        if chunk.is_empty() {
+            self.eof = true;
+            return Ok(None);
+        }
+        build_batch(&chunk, &self.schema).map(Some)
     }
 }
 
@@ -284,11 +344,21 @@ fn vector_column_probe(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use ultrasql_core::{DataType, Value};
+    use ultrasql_core::{Field, Schema};
     use ultrasql_planner::{BinaryOp, ScalarExpr, SortKey};
+    use ultrasql_vec::Batch;
+    use ultrasql_vec::column::{Column, NumericColumn};
     use ultrasql_vec::kernels::vector::VectorMetric;
 
+    use super::TopK;
     use super::match_exact_vector_top_k_key;
+    use crate::{ExecError, Operator};
 
     #[test]
     fn exact_vector_top_k_key_matches_single_ascending_distance_key() {
@@ -345,5 +415,61 @@ mod tests {
 
         assert!(match_exact_vector_top_k_key(&[desc]).is_none());
         assert!(match_exact_vector_top_k_key(&[nulls_first]).is_none());
+    }
+
+    #[test]
+    fn presorted_top_k_stops_after_cap_without_draining_child() {
+        let schema = Schema::new([Field::required("id", DataType::Int32)]).expect("schema ok");
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let child = CountingScan {
+            schema: schema.clone(),
+            batches: vec![i32_batch(&[1, 2]), i32_batch(&[3, 4]), i32_batch(&[5, 6])],
+            next: 0,
+            pulls: Arc::clone(&pulls),
+        };
+        let mut top_k = TopK::new_presorted(Box::new(child), schema.clone(), 3);
+        let mut rows = Vec::new();
+        while let Some(batch) = top_k.next_batch().expect("top-k ok") {
+            let decoded = crate::filter_op::batch_to_rows(&batch, top_k.schema()).expect("decode");
+            rows.extend(decoded.into_iter().map(|row| row[0].clone()));
+        }
+
+        assert_eq!(
+            rows,
+            vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]
+        );
+        assert_eq!(
+            pulls.load(Ordering::SeqCst),
+            2,
+            "presorted top-k must stop as soon as cap rows are available"
+        );
+    }
+
+    #[derive(Debug)]
+    struct CountingScan {
+        schema: Schema,
+        batches: Vec<Batch>,
+        next: usize,
+        pulls: Arc<AtomicUsize>,
+    }
+
+    impl Operator for CountingScan {
+        fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+            if self.next >= self.batches.len() {
+                return Ok(None);
+            }
+            self.pulls.fetch_add(1, Ordering::SeqCst);
+            let batch = self.batches[self.next].clone();
+            self.next += 1;
+            Ok(Some(batch))
+        }
+
+        fn schema(&self) -> &Schema {
+            &self.schema
+        }
+    }
+
+    fn i32_batch(values: &[i32]) -> Batch {
+        Batch::new([Column::Int32(NumericColumn::from_data(values.to_vec()))]).expect("batch ok")
     }
 }

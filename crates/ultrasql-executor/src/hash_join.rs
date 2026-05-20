@@ -39,6 +39,8 @@
 //! on candidate pairs, instead of falling back to a full nested-loop join.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::sync::Arc;
 
 use ultrasql_core::{Schema, Value};
 use ultrasql_planner::{BinaryOp, LogicalJoinType, ScalarExpr};
@@ -46,11 +48,14 @@ use ultrasql_vec::Batch;
 
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
+use crate::row_codec::RowCodec;
 use crate::seq_scan::build_batch;
+use crate::work_mem::{WorkMemBudget, temp_file_limit};
 use crate::{ExecError, Operator};
 
 /// Maximum rows per emitted batch, matching the `ARCHITECTURE.md` section 9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
+const SPILL_ROW_LEN_BYTES: u64 = 4;
 
 /// Hash equi-join operator.
 ///
@@ -85,6 +90,15 @@ pub struct HashJoin {
     right_rows: Vec<Vec<Value>>,
     /// Hash table built from the left side on first execution.
     hash_table: Option<HashMap<JoinKey, Vec<usize>>>,
+    /// Optional work-memory budget that can trigger adaptive spill.
+    work_mem: Option<Arc<WorkMemBudget>>,
+    /// Bytes observed on the build side while constructing the join.
+    build_memory_bytes: u64,
+    /// Disk-backed build-side spill for inner joins whose build side
+    /// exceeds the configured work-memory budget.
+    spill: Option<HashJoinSpill>,
+    /// Whether this execution switched from in-memory hash join to spill.
+    spilled_to_disk: bool,
     /// Whether each left row matched at least one probe row.
     left_matched: Vec<bool>,
     /// Number of build-side rows whose match bit is set.
@@ -103,6 +117,77 @@ pub struct HashJoin {
 enum BuildSide {
     Left,
     RightForSemiAnti,
+}
+
+#[derive(Debug)]
+struct HashJoinSpill {
+    file: tempfile::NamedTempFile,
+    bytes: u64,
+}
+
+impl HashJoinSpill {
+    fn new() -> Result<Self, ExecError> {
+        let file = tempfile::NamedTempFile::new().map_err(|error| {
+            ExecError::TypeMismatch(format!("hash join spill create failed: {error}"))
+        })?;
+        Ok(Self { file, bytes: 0 })
+    }
+
+    fn append_row(&mut self, encoded: &[u8]) -> Result<(), ExecError> {
+        let len = u32::try_from(encoded.len()).map_err(|_| {
+            ExecError::TypeMismatch("hash join spill row exceeds u32 length".to_owned())
+        })?;
+        let row_bytes = u64::from(len).saturating_add(SPILL_ROW_LEN_BYTES);
+        if self.bytes.saturating_add(row_bytes) > temp_file_limit() {
+            return Err(ExecError::Unsupported(
+                "hash join spill exceeded temp_file_limit",
+            ));
+        }
+
+        let handle = self.file.as_file_mut();
+        handle
+            .write_all(&len.to_le_bytes())
+            .map_err(|error| spill_io_error("write row length", error))?;
+        handle
+            .write_all(encoded)
+            .map_err(|error| spill_io_error("write row", error))?;
+        self.bytes = self.bytes.saturating_add(row_bytes);
+        Ok(())
+    }
+
+    fn scan_rows<F>(&mut self, codec: &RowCodec, mut visit: F) -> Result<(), ExecError>
+    where
+        F: FnMut(Vec<Value>) -> Result<(), ExecError>,
+    {
+        let handle = self.file.as_file_mut();
+        handle
+            .flush()
+            .map_err(|error| spill_io_error("flush", error))?;
+        handle
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| spill_io_error("rewind", error))?;
+
+        loop {
+            let mut len_buf = [0_u8; 4];
+            match handle.read_exact(&mut len_buf) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(spill_io_error("read row length", error)),
+            }
+            let len = usize::try_from(u32::from_le_bytes(len_buf)).map_err(|_| {
+                ExecError::TypeMismatch("hash join spill row length exceeds usize".to_owned())
+            })?;
+            let mut encoded = vec![0_u8; len];
+            handle
+                .read_exact(&mut encoded)
+                .map_err(|error| spill_io_error("read row", error))?;
+            let row = codec.decode(&encoded).map_err(|error| {
+                ExecError::TypeMismatch(format!("hash join spill decode failed: {error}"))
+            })?;
+            visit(row)?;
+        }
+        Ok(())
+    }
 }
 
 impl HashJoin {
@@ -210,6 +295,10 @@ impl HashJoin {
             left_rows: Vec::new(),
             right_rows: Vec::new(),
             hash_table: None,
+            work_mem: None,
+            build_memory_bytes: 0,
+            spill: None,
+            spilled_to_disk: false,
             left_matched: Vec::new(),
             matched_left_count: 0,
             pending_output: VecDeque::new(),
@@ -251,6 +340,19 @@ impl HashJoin {
         );
         join.build_side = BuildSide::RightForSemiAnti;
         join
+    }
+
+    /// Attach a per-query work-memory budget.
+    #[must_use]
+    pub fn with_work_mem_budget(mut self, budget: Arc<WorkMemBudget>) -> Self {
+        self.work_mem = Some(budget);
+        self
+    }
+
+    /// Whether this execution switched to the disk-spill path.
+    #[must_use]
+    pub const fn spilled_to_disk(&self) -> bool {
+        self.spilled_to_disk
     }
 }
 
@@ -417,6 +519,7 @@ impl HashJoin {
         // `left_rows`. The row array keeps output assembly contiguous
         // while the hash table stays compact.
         let mut hash_table: HashMap<JoinKey, Vec<usize>> = HashMap::new();
+        let left_codec = RowCodec::new(self.left_schema.clone());
 
         loop {
             let Some(batch) = self.left.next_batch()? else {
@@ -424,6 +527,26 @@ impl HashJoin {
             };
             let rows = batch_to_rows(&batch, &self.left_schema)?;
             for row in rows {
+                if let Some(spill) = self.spill.as_mut() {
+                    let encoded = encode_spill_row(&left_codec, &row)?;
+                    spill.append_row(&encoded)?;
+                    continue;
+                }
+
+                let encoded = if self.work_mem.is_some() {
+                    Some(encode_spill_row(&left_codec, &row)?)
+                } else {
+                    None
+                };
+                if let Some(encoded) = encoded.as_ref()
+                    && self.should_switch_build_to_spill(encoded.len())?
+                {
+                    let mut spill = self.spill_existing_build_rows(&mut hash_table, &left_codec)?;
+                    spill.append_row(encoded)?;
+                    self.spill = Some(spill);
+                    continue;
+                }
+
                 if let Some(key) = build_join_key(&self.left_key_evals, &row) {
                     hash_table
                         .entry(key)
@@ -434,10 +557,47 @@ impl HashJoin {
             }
         }
 
-        self.left_matched = vec![false; self.left_rows.len()];
+        self.left_matched = if self.spill.is_some() {
+            Vec::new()
+        } else {
+            vec![false; self.left_rows.len()]
+        };
         self.matched_left_count = 0;
         self.hash_table = Some(hash_table);
         Ok(())
+    }
+
+    fn should_switch_build_to_spill(&mut self, encoded_len: usize) -> Result<bool, ExecError> {
+        if self.join_type != LogicalJoinType::Inner || self.build_side != BuildSide::Left {
+            return Ok(false);
+        }
+        let Some(budget) = &self.work_mem else {
+            return Ok(false);
+        };
+        let row_bytes = u64::try_from(encoded_len)
+            .map_err(|_| {
+                ExecError::TypeMismatch("hash join build row too large to account".to_owned())
+            })?
+            .saturating_add(SPILL_ROW_LEN_BYTES);
+        self.build_memory_bytes = self.build_memory_bytes.saturating_add(row_bytes);
+        Ok(self.build_memory_bytes > budget.limit_bytes())
+    }
+
+    fn spill_existing_build_rows(
+        &mut self,
+        hash_table: &mut HashMap<JoinKey, Vec<usize>>,
+        left_codec: &RowCodec,
+    ) -> Result<HashJoinSpill, ExecError> {
+        let mut spill = HashJoinSpill::new()?;
+        for row in self.left_rows.drain(..) {
+            let encoded = encode_spill_row(left_codec, &row)?;
+            spill.append_row(&encoded)?;
+        }
+        hash_table.clear();
+        self.left_matched.clear();
+        self.matched_left_count = 0;
+        self.spilled_to_disk = true;
+        Ok(spill)
     }
 
     fn build_right_phase(&mut self) -> Result<(), ExecError> {
@@ -477,6 +637,9 @@ impl HashJoin {
     }
 
     fn probe_once(&mut self) -> Result<bool, ExecError> {
+        if self.spill.is_some() {
+            return self.probe_once_spilled();
+        }
         if matches!(
             self.join_type,
             LogicalJoinType::Semi | LogicalJoinType::Anti
@@ -536,6 +699,39 @@ impl HashJoin {
                 }
             }
         }
+        Ok(true)
+    }
+
+    fn probe_once_spilled(&mut self) -> Result<bool, ExecError> {
+        let Some(batch) = self.right.next_batch()? else {
+            return Ok(false);
+        };
+        let right_rows = batch_to_rows(&batch, &self.right_schema)?;
+        let left_codec = RowCodec::new(self.left_schema.clone());
+        let mut spill = self
+            .spill
+            .take()
+            .ok_or(ExecError::Internal("hash join spill missing"))?;
+
+        for right_row in right_rows {
+            let Some(probe_key) = build_join_key(&self.right_key_evals, &right_row) else {
+                continue;
+            };
+            spill.scan_rows(&left_codec, |left_row| {
+                let Some(build_key) = build_join_key(&self.left_key_evals, &left_row) else {
+                    return Ok(());
+                };
+                if build_key != probe_key {
+                    return Ok(());
+                }
+                let joined = concat_rows(&left_row, &right_row);
+                if self.passes_residual(&joined)? {
+                    self.pending_output.push_back(joined);
+                }
+                Ok(())
+            })?;
+        }
+        self.spill = Some(spill);
         Ok(true)
     }
 
@@ -890,6 +1086,16 @@ fn concat_rows(left: &[Value], right: &[Value]) -> Vec<Value> {
     row
 }
 
+fn encode_spill_row(codec: &RowCodec, row: &[Value]) -> Result<Vec<u8>, ExecError> {
+    codec
+        .encode(row)
+        .map_err(|error| ExecError::TypeMismatch(format!("hash join spill encode failed: {error}")))
+}
+
+fn spill_io_error(action: &str, error: std::io::Error) -> ExecError {
+    ExecError::TypeMismatch(format!("hash join spill {action} failed: {error}"))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -903,7 +1109,7 @@ mod tests {
 
     use super::HashJoin;
     use crate::mem_table_scan::MemTableScan;
-    use crate::{ExecError, Operator};
+    use crate::{ExecError, Operator, WorkMemBudget};
 
     // -------------------------------------------------------------------------
     // Helpers
@@ -1054,6 +1260,28 @@ mod tests {
         let mut rows = drain_rows(&mut op);
         rows.sort_unstable();
         assert_eq!(rows, vec![(2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn hash_join_spills_build_side_when_work_mem_is_too_small() {
+        let left = MemTableScan::new(schema_id(), vec![i32_batch(&[1, 2, 3, 4])]);
+        let right = MemTableScan::new(schema_val(), vec![i32_batch(&[2, 4, 9])]);
+        let mut op = HashJoin::new(
+            Box::new(left),
+            Box::new(right),
+            col_idx0_i32("id"),
+            col_idx0_i32("val"),
+            LogicalJoinType::Inner,
+            schema_id_val(),
+            schema_id(),
+            schema_val(),
+        )
+        .with_work_mem_budget(std::sync::Arc::new(WorkMemBudget::new(1)));
+
+        let mut rows = drain_rows(&mut op);
+        rows.sort_unstable();
+        assert_eq!(rows, vec![(2, 2), (4, 4)]);
+        assert!(op.spilled_to_disk(), "build side must switch to spill mode");
     }
 
     #[test]
