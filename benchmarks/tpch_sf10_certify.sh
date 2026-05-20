@@ -204,14 +204,51 @@ duckdb_path, ultrasql_path, out_path = map(pathlib.Path, sys.argv[1:])
 duckdb = json.loads(duckdb_path.read_text())
 ultrasql = json.loads(ultrasql_path.read_text())
 
+expected_queries = {f"q{i}" for i in range(1, 23)}
+duckdb_queries = set(duckdb.get("queries", {}))
+ultrasql_queries = set(ultrasql.get("queries", {}))
+
+base_summary = {
+    "workload": "tpch_sf10",
+    "scale_factor": 10,
+    "target": "UltraSQL geometric mean <= 2x DuckDB geometric mean across all 22 TPC-H queries",
+    "expected_query_count": len(expected_queries),
+    "duckdb_query_count": len(duckdb_queries),
+    "ultrasql_query_count": len(ultrasql_queries),
+    "duckdb_queries": sorted(duckdb_queries, key=lambda q: int(q[1:]) if q.startswith("q") and q[1:].isdigit() else q),
+    "ultrasql_queries": sorted(ultrasql_queries, key=lambda q: int(q[1:]) if q.startswith("q") and q[1:].isdigit() else q),
+    "missing_duckdb_queries": sorted(expected_queries - duckdb_queries, key=lambda q: int(q[1:])),
+    "missing_ultrasql_queries": sorted(expected_queries - ultrasql_queries, key=lambda q: int(q[1:])),
+    "extra_duckdb_queries": sorted(duckdb_queries - expected_queries),
+    "extra_ultrasql_queries": sorted(ultrasql_queries - expected_queries),
+    "duckdb_result": str(duckdb_path),
+    "ultrasql_result": str(ultrasql_path),
+}
+
+if duckdb_queries != expected_queries or ultrasql_queries != expected_queries:
+    summary = {
+        **base_summary,
+        "duckdb_geomean_ms": None,
+        "ultrasql_geomean_ms": None,
+        "passed": False,
+        "reason": "incomplete_query_set",
+        "next_step": (
+            "Rerun benchmarks/tpch_sf10_certify.sh with TPCH_QUERIES=all; "
+            "certification remains open until both raw artifacts contain q1..q22."
+        ),
+    }
+    out_path.write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps(summary, indent=2))
+    sys.exit(1)
+
 def gm(doc):
-    vals = [
-        timing["median_ms"]
-        for timing in doc["queries"].values()
-        if timing["median_ms"] and math.isfinite(timing["median_ms"]) and timing["median_ms"] > 0
-    ]
-    if len(vals) != len(doc["queries"]):
-        return None
+    vals = []
+    for query_id in sorted(expected_queries, key=lambda q: int(q[1:])):
+        timing = doc["queries"][query_id]
+        median_ms = timing.get("median_ms")
+        if not median_ms or not math.isfinite(median_ms) or median_ms <= 0:
+            return None
+        vals.append(median_ms)
     return math.exp(sum(math.log(v) for v in vals) / len(vals))
 
 duckdb_gm = gm(duckdb)
@@ -222,14 +259,11 @@ passed = (
     and ultrasql_gm <= duckdb_gm * 2.0
 )
 summary = {
-    "workload": "tpch_sf10",
-    "scale_factor": 10,
+    **base_summary,
     "duckdb_geomean_ms": duckdb_gm,
     "ultrasql_geomean_ms": ultrasql_gm,
-    "target": "UltraSQL geometric mean <= 2x DuckDB geometric mean",
     "passed": passed,
-    "duckdb_result": str(duckdb_path),
-    "ultrasql_result": str(ultrasql_path),
+    "reason": None if passed else "performance_target_missed_or_query_failed",
 }
 out_path.write_text(json.dumps(summary, indent=2) + "\n")
 print(json.dumps(summary, indent=2))

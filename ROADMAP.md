@@ -34,13 +34,13 @@ ship if any of these gates fail. No exceptions.
 
 ### Test Coverage Gate: ≥ 80% line coverage per crate
 
-Every crate must maintain at least **80% line coverage** measured by
-`cargo llvm-cov --workspace`. Coverage is checked on every PR via the
-local pre-push gate. A PR that drops any crate below 80% is not
-mergeable until coverage is restored — either by adding tests or by
-justifying the exclusion in the PR description and annotating the code
-with `#[cfg(not(tarpaulin_include))]` or `// coverage: exclude` with a
-written reason.
+Release target is at least **80% line coverage** per crate measured by
+`cargo llvm-cov --workspace`. Current committed automation is not yet
+equivalent to this target: CI runs format, lint, tests, docs, and
+dependency audit gates, but no committed `llvm-cov` PR/pre-push
+threshold gate exists yet. A version must not claim this gate satisfied
+until coverage automation and artifacts prove every crate meets the
+threshold.
 
 Coverage layers required per subsystem:
 
@@ -58,11 +58,14 @@ has not run for 24 h CI-clean is not considered covered.
 
 ### Benchmark Gate: ≥ 2× every listed competitor on every workload
 
-Every PR that touches a benchmarked code path must include
-before/after `cross_compare_sql` numbers in the description.
-The pre-push hook runs the criterion suite and `regression-gate` and
-fails the push on any statistically significant regression > 5% versus
-the baseline recorded in `benchmarks/results/baseline.json`.
+Every PR that touches a benchmarked code path should include
+before/after `cross_compare_sql` numbers in the description. Current
+committed automation has benchmark scripts and CI workflow hooks, but no
+local pre-push hook that runs `regression-gate` for all contributors.
+Treat `regression-gate` pre-push enforcement as a policy target until
+the hook and CI artifact trail are committed. Once active, it should
+fail pushes on statistically significant regressions > 5% versus the
+baseline recorded in `benchmarks/results/baseline.json`.
 
 For each milestone below, UltraSQL must demonstrably **outperform every
 listed competitor by ≥ 2×** (throughput) or ≤ 0.5× (latency) on the
@@ -82,7 +85,7 @@ are grounds for revert.
 | v0.5 | DELETE 10 k rows in single statement | ≥ 2× every competitor ✅ | latency (µs) |
 | v0.6 | TPC-H scale 1 correctness (all 22 queries) | result-equal to DuckDB ✅ | `validate-results` result comparison |
 | v0.6+ | TPC-H scale 1 performance certification | ≥ 2× PostgreSQL 17 ⚠️ pending | geometric mean query time |
-| v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB ⚠️ not certified; current artifact records memory-backed SF10 load failure | geometric mean query time |
+| v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB ⚠️ not certified; current artifact records an incomplete q21-only query set | geometric mean query time |
 | v0.7 | ClickBench (`hits.parquet` analytical queries) | ≥ 5× faster than PostgreSQL 17 ⚠️ not certified; runner now records missing dataset/DSN failures | geometric mean query time |
 | v0.9 | TPC-B (OLTP, 32 connections) | ≥ 2× PostgreSQL 17, p99 < 5 ms | throughput + latency |
 | v1.0 | TPC-C (all 5 tx types, 32 connections) | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
@@ -1529,45 +1532,52 @@ geometric, and full-text type surfaces.
 **Scope:** Replication, backup/PITR, observability, COPY,
 autovacuum. UltraSQL survives production use.
 
+**2026-05-19 audit note:** v0.9 still contains several compatibility
+surfaces and CLI primitives whose production behavior is explicitly
+pending below. Those items remain unchecked until runtime tuning,
+continuous replication, PITR replay integration, logical decoding,
+live observability counters, and PostgreSQL-compatible external-tool
+behavior are implemented and validated.
+
 ### Autovacuum
 - [x] Background autovacuum launcher — `ultrasqld --autovacuum-interval-ms` runs existing undo-GC/all-visible/analyze pass
 - [x] Worker per table triggered by dead tuple ratio — autovacuum now
   walks catalog tables on its interval and vacuums relations whose tracked
   modification count crosses the PostgreSQL-style base/scale threshold.
-- [x] `autovacuum_vacuum_threshold`, `autovacuum_vacuum_scale_factor` — exposed in `pg_settings`; runtime tuning pending
-- [x] `autovacuum_analyze_threshold`, `autovacuum_analyze_scale_factor` — exposed in `pg_settings`; runtime tuning pending
-- [x] Per-table autovacuum settings — v0.9 supports PostgreSQL-compatible
+- [ ] `autovacuum_vacuum_threshold`, `autovacuum_vacuum_scale_factor` — exposed in `pg_settings`; runtime tuning pending
+- [ ] `autovacuum_analyze_threshold`, `autovacuum_analyze_scale_factor` — exposed in `pg_settings`; runtime tuning pending
+- [ ] Per-table autovacuum settings — v0.9 supports PostgreSQL-compatible
   global threshold knobs through `pg_settings`; per-relation storage
   overrides remain a catalog-extension item.
 - [x] Vacuum FREEZE to prevent XID age buildup — VACUUM/autovacuum now
   refresh heap visibility and reclaim dead tuples; aggressive
   wraparound-grade freezing remains tied to long-running transaction
   hardening.
-- [x] `pg_stat_progress_vacuum` view — empty compatibility view exists; live progress rows pending
+- [ ] `pg_stat_progress_vacuum` view — empty compatibility view exists; live progress rows pending
 
 ### Physical Streaming Replication
-- [x] WAL sender process — file-backed `WalSender` primitive plus `ultrasql --wal-send-once`; network process loop pending
-- [x] WAL receiver on standby — file-backed `WalReceiver` primitive plus `ultrasql --wal-receive-once`; continuous apply loop pending
+- [ ] WAL sender process — file-backed `WalSender` primitive plus `ultrasql --wal-send-once`; network process loop pending
+- [ ] WAL receiver on standby — file-backed `WalReceiver` primitive plus `ultrasql --wal-receive-once`; continuous apply loop pending
 - [x] Standby mode (`standby.signal`)
 - [x] Hot standby (read queries on standby) — `standby.signal` /
   `recovery.signal` at `ultrasqld --data-dir` startup enables read-only
   query serving and rejects writes before planning.
-- [x] Synchronous replication (`synchronous_commit = remote_apply|remote_write|on|off`) —
+- [ ] Synchronous replication (`synchronous_commit = remote_apply|remote_write|on|off`) —
   PostgreSQL-compatible GUC values are accepted and WAL shipping/slot state
   is present; remote quorum apply remains a continuous replication hardening
   item.
 - [x] Replication slots — file-backed physical slot state under `pg_replslot`
-- [x] `pg_replication_slots` view, `pg_stat_replication` view — catalog view
+- [ ] `pg_replication_slots` view, `pg_stat_replication` view — catalog view
   shapes exist for tool introspection; live replication rows await the
   network sender/receiver loop.
-- [x] Cascading replication — file-backed receiver output is valid sender input; continuous network cascade pending
+- [ ] Cascading replication — file-backed receiver output is valid sender input; continuous network cascade pending
 
 ### Backup & PITR
-- [x] WAL archiving (`archive_command`) — CLI archive utility exists via `ultrasql --archive-wal`; server-side config execution pending
-- [x] WAL restore (`restore_command`) — CLI restore utility exists via `ultrasql --restore-wal`; recovery integration pending
-- [x] Base backup (`pg_basebackup` equivalent) — `ultrasql --basebackup DEST --data-dir DIR` copies files and writes `backup_manifest.json`; online checkpoint fencing pending
-- [x] `recovery.signal` / `standby.signal` support — CLI signal-file helpers via `ultrasql --ctl recovery|standby`; server startup/replay handling pending
-- [x] `recovery_target_time`, `recovery_target_lsn`, `recovery_target_xid` — CLI writes `recovery.targets`; WAL replay targeting pending
+- [ ] WAL archiving (`archive_command`) — CLI archive utility exists via `ultrasql --archive-wal`; server-side config execution pending
+- [ ] WAL restore (`restore_command`) — CLI restore utility exists via `ultrasql --restore-wal`; recovery integration pending
+- [ ] Base backup (`pg_basebackup` equivalent) — `ultrasql --basebackup DEST --data-dir DIR` copies files and writes `backup_manifest.json`; online checkpoint fencing pending
+- [ ] `recovery.signal` / `standby.signal` support — CLI signal-file helpers via `ultrasql --ctl recovery|standby`; server startup/replay handling pending
+- [ ] `recovery_target_time`, `recovery_target_lsn`, `recovery_target_xid` — CLI writes `recovery.targets`; WAL replay targeting pending
 - [x] `pg_start_backup()` / `pg_stop_backup()` for online backup — SQL
   compatibility functions write `backup_label` / `backup_stop` marker files
   in WAL-backed data directories and return a stable LSN-shaped value;
@@ -1575,47 +1585,49 @@ autovacuum. UltraSQL survives production use.
 - [x] Backup manifest (checksums for all files) — generated by `ultrasql --basebackup`
 
 ### Logical Replication
-- [x] Logical decoding infrastructure — publication/subscription catalog surfaces and accepted DDL exist; WAL-to-change decoding pending
-- [x] `pgoutput` output plugin format — compatibility surface reserved; wire-compatible pgoutput encoder pending
-- [x] `CREATE PUBLICATION` / `CREATE SUBSCRIPTION` — accepted as logical-replication metadata DDL; persistent metadata pending
-- [x] Row filters and column lists on publications — syntax surface accepted by metadata DDL path; enforcement pending
-- [x] Initial table data sync — use basebackup/WAL shipping path for physical initial sync; logical per-table copy pending
-- [x] `pg_stat_subscription` view
+- [ ] Logical decoding infrastructure — publication/subscription catalog surfaces and accepted DDL exist; WAL-to-change decoding pending
+- [ ] `pgoutput` output plugin format — compatibility surface reserved; wire-compatible pgoutput encoder pending
+- [ ] `CREATE PUBLICATION` / `CREATE SUBSCRIPTION` — accepted as logical-replication metadata DDL; persistent metadata pending
+- [ ] Row filters and column lists on publications — syntax surface accepted by metadata DDL path; enforcement pending
+- [ ] Initial table data sync — use basebackup/WAL shipping path for physical initial sync; logical per-table copy pending
+- [ ] `pg_stat_subscription` view — compatibility shape exists; live subscription rows pending
 
 ### Observability
-- [x] `pg_stat_user_tables` — compatibility view shape exists; live counters pending
-- [x] `pg_stat_user_indexes` — compatibility view shape exists; live counters pending
-- [x] `pg_statio_user_tables` — compatibility view shape exists; live counters pending
-- [x] `pg_stat_database` — compatibility view shape exists; live counters pending
-- [x] `pg_stat_bgwriter` — compatibility view shape exists; live counters pending
-- [x] `pg_stat_wal` — compatibility view shape exists; live counters pending
-- [x] `pg_stat_progress_analyze`, `pg_stat_progress_create_index` — empty compatibility views exist
-- [x] Prometheus `/metrics` HTTP endpoint — process/build metrics exposed via `--ops-listen`; live query/WAL/buffer counters pending
+- [ ] `pg_stat_user_tables` — compatibility view shape exists; live counters pending
+- [ ] `pg_stat_user_indexes` — compatibility view shape exists; live counters pending
+- [ ] `pg_statio_user_tables` — compatibility view shape exists; live counters pending
+- [ ] `pg_stat_database` — compatibility view shape exists; live counters pending
+- [ ] `pg_stat_bgwriter` — compatibility view shape exists; live counters pending
+- [ ] `pg_stat_wal` — compatibility view shape exists; live counters pending
+- [ ] `pg_stat_progress_analyze`, `pg_stat_progress_create_index` — empty compatibility views exist
+- [ ] Prometheus `/metrics` HTTP endpoint — process/build metrics exposed via `--ops-listen`; live query/WAL/buffer counters pending
 - [x] OpenTelemetry tracing with spans per query and per operator — server
   emits structured `tracing` spans around SQL statements and logical operator
   execution; exporter wiring is deployment configuration.
 - [x] `EXPLAIN ANALYZE` with actual rows and actual time — buffers and WAL stats pending
 - [x] `EXPLAIN (FORMAT JSON)` for basic tooling integration — richer PostgreSQL-compatible fields pending
-- [x] Structured JSON logging with `log_min_duration_statement`, `log_statement` — `ultrasqld --log-format json`; GUC rows exposed, per-statement duration filtering pending
+- [ ] Structured JSON logging with `log_min_duration_statement`, `log_statement` — `ultrasqld --log-format json`; GUC rows exposed, per-statement duration filtering pending
 
 ### COPY & Bulk Operations
 - [x] `COPY t FROM STDIN` / `COPY t TO STDOUT` — text + CSV formats end-to-end. Parser, binder, `LogicalPlan::Copy`, Simple Query + Extended Query session dispatch via `crates/ultrasql-server/src/session/copy.rs`. `crates/ultrasql-server/tests/copy_round_trip.rs` covers five shapes. §1.11.
 - [x] CSV format (`FORMAT csv`, `DELIMITER`, `HEADER`, `NULL`) — custom `QUOTE` / `ESCAPE` options pending
 - [x] `COPY (SELECT ...) TO STDOUT` — parser/binder/session path copies query results to STDOUT or server-side file in text/CSV format
-- [x] `COPY t FROM 'file'` / `COPY t TO 'file'` (server-side, superuser only) — server-side file import/export supported; privilege model pending role system
+- [ ] `COPY t FROM 'file'` / `COPY t TO 'file'` (server-side, superuser only) — server-side file import/export supported; privilege model pending role system
 - [x] Binary COPY format — table COPY FROM/TO supports PostgreSQL binary header/rows/trailer for core scalar types; query-target binary copy remains pending
 - [x] LISTEN/NOTIFY/UNLISTEN end-to-end — `NotifyHub` shared across sessions; parser/binder/planner produce `LogicalPlan::Listen/Notify/Unlisten`; `session/notify.rs` dispatches against the hub; `BackendMessage::NotificationResponse` (tag `'A'`) plumbed through `ultrasql-protocol`; idle sessions push notifications immediately via a `tokio::select!` between `read_buf` and `notify_rx.recv` so listeners receive them without waiting for the next `Sync` round (`crates/ultrasql-server/tests/listen_notify_round_trip.rs`)
 
 ### External Tools
-- [x] `pg_dump` compatible output (custom, directory, tar formats) —
+- [ ] `pg_dump` compatible output (custom, directory, tar formats) —
   `ultrasql --pg-dump` writes plain/custom/tar-style UltraSQL archives or
-  directory dumps from `--data-dir`.
-- [x] `pg_restore` equivalent — `ultrasql --pg-restore` restores archive or
-  directory dumps into `--data-dir`.
+  directory dumps from `--data-dir`; wire-compatible `pg_dump` archive
+  interoperability remains pending.
+- [ ] `pg_restore` equivalent — `ultrasql --pg-restore` restores archive or
+  directory dumps into `--data-dir`; PostgreSQL `pg_restore`
+  interoperability remains pending.
 - [x] `pg_ctl` equivalent: `initdb`, `start`, `stop`, `reload`, `status`, `promote` — `ultrasql --ctl ...`; start/stop delegate to service manager instead of daemonizing
 - [x] `pg_isready` equivalent — `ultrasql --isready`
-- [x] `pgbench` compatible baseline (default TPC-B transactions) — local `tpcb_32conn` kernel stage gate + `benchmarks/tpcb_certify.sh`; same-host PostgreSQL-wire certification still open
-- [x] `pg_waldump` equivalent (WAL inspection CLI) — `ultrasql --waldump PATH` emits deterministic offset/hex dump; semantic WAL record decoding pending
+- [ ] `pgbench` compatible baseline (default TPC-B transactions) — local `tpcb_32conn` kernel stage gate + `benchmarks/tpcb_certify.sh`; same-host PostgreSQL-wire certification still open
+- [ ] `pg_waldump` equivalent (WAL inspection CLI) — `ultrasql --waldump PATH` emits deterministic offset/hex dump; semantic WAL record decoding pending
 
 ### Milestone
 - [x] First documented operations runbook — `OPERATIONS.md`
@@ -1714,7 +1726,7 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [ ] Type-specific tests (numeric, text, date/time, json, arrays, etc.)
 
 ### Benchmark Certification
-- [ ] TPC-B: correctness verified, throughput ≥ 2× PostgreSQL, p99 < 5 ms at 32 connections — `benchmarks/tpcb_certify.sh` exists; cross-engine result artifacts still required
+- [ ] TPC-B: correctness verified, throughput ≥ 2× PostgreSQL, p99 < 5 ms at 32 connections — `benchmarks/tpcb_certify.sh` exists and the wire harness now validates UltraSQL balance invariants with indexed TPC-B tables; latest local reduced smoke is correct at 986.20 tx/s, but p99 is 39.884 ms and PostgreSQL 17 comparison is still missing, so certification remains open.
 - [ ] TPC-C: correctness verified (all 5 transaction types), throughput ≥ 2× PostgreSQL
 - [x] TPC-H scale 1: all 22 harness queries return correct results
 - [ ] TPC-H scale 1: throughput ≥ 2× PostgreSQL 17
