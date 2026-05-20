@@ -34,10 +34,11 @@ use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
 use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
-use super::Session;
+use super::{PendingLogicalChange, Session};
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
+use crate::replication::LogicalChangeKind;
 use crate::result_encoder::{
     self, SelectResult, run_ddl_command, run_modify_command, run_select, run_select_streamed,
 };
@@ -53,6 +54,14 @@ struct CreateStatisticsSpec {
     columns: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LogicalReplicationDdl {
+    CreatePublication { name: String, tables: Vec<String> },
+    DropPublication { name: String, if_exists: bool },
+    CreateSubscription,
+    DropSubscription,
+}
+
 fn parse_bool_guc(value: &str) -> Result<bool, ServerError> {
     match value.to_ascii_lowercase().as_str() {
         "on" | "true" | "1" | "yes" => Ok(true),
@@ -61,6 +70,49 @@ fn parse_bool_guc(value: &str) -> Result<bool, ServerError> {
             "invalid boolean runtime parameter",
         )),
     }
+}
+
+fn starts_with_keyword_pair(sql: &str, first: &str, second: &str) -> bool {
+    let mut words = sql.split_whitespace();
+    words
+        .next()
+        .is_some_and(|word| word.eq_ignore_ascii_case(first))
+        && words
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case(second))
+}
+
+fn split_first_token(input: &str) -> Result<(&str, &str), ServerError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(ServerError::ddl("logical replication DDL requires a name"));
+    }
+    let end = input.find(char::is_whitespace).unwrap_or(input.len());
+    Ok((&input[..end], input[end..].trim()))
+}
+
+fn parse_publication_tables(input: &str) -> Result<Vec<String>, ServerError> {
+    let input = input.trim();
+    if !input
+        .get(.."FOR TABLE".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("FOR TABLE"))
+    {
+        return Err(ServerError::ddl(
+            "CREATE PUBLICATION currently supports FOR TABLE only",
+        ));
+    }
+    let table_list = input["FOR TABLE".len()..].trim();
+    let tables = table_list
+        .split(',')
+        .map(|table| table.trim().trim_matches('"').to_string())
+        .filter(|table| !table.is_empty())
+        .collect::<Vec<_>>();
+    if tables.is_empty() {
+        return Err(ServerError::ddl(
+            "CREATE PUBLICATION requires at least one table",
+        ));
+    }
+    Ok(tables)
 }
 
 impl<RW> Session<RW>
@@ -134,8 +186,8 @@ where
         if let Some(table) = self.try_parse_vacuum_target(trimmed) {
             return self.execute_vacuum(table.as_deref());
         }
-        if let Some(tag) = Self::try_parse_logical_replication_ddl(trimmed) {
-            return Ok(run_ddl_command(tag));
+        if let Some(result) = self.try_execute_logical_replication_ddl(trimmed)? {
+            return Ok(result);
         }
 
         if let Some(spec) = Self::try_parse_create_statistics(trimmed)? {
@@ -1430,6 +1482,13 @@ where
         let Some(table) = Self::dml_target_table(plan) else {
             return;
         };
+        if let Some(kind) = Self::dml_change_kind(plan) {
+            self.pending_logical_changes.push(PendingLogicalChange {
+                table: table.to_ascii_lowercase(),
+                kind,
+                rows_affected: rows,
+            });
+        }
         let entry = self
             .pending_table_modifications
             .entry(table.to_ascii_lowercase())
@@ -1464,10 +1523,23 @@ where
         let Some(table) = Self::dml_target_table(plan) else {
             return;
         };
+        if let Some(kind) = Self::dml_change_kind(plan) {
+            self.state
+                .logical_replication
+                .record_committed_dml(table, kind, rows);
+        }
         self.state.note_table_modifications(table, rows);
     }
 
     pub(crate) fn flush_pending_dml_effects(&mut self) {
+        let logical = std::mem::take(&mut self.pending_logical_changes);
+        for change in logical {
+            self.state.logical_replication.record_committed_dml(
+                &change.table,
+                change.kind,
+                change.rows_affected,
+            );
+        }
         let drained = std::mem::take(&mut self.pending_table_modifications);
         for (table, rows) in drained {
             self.state.note_table_modifications(&table, rows);
@@ -1496,6 +1568,7 @@ where
 
     pub(crate) fn clear_pending_dml_effects(&mut self) {
         self.pending_table_modifications.clear();
+        self.pending_logical_changes.clear();
         self.pending_materialized_view_rows.clear();
     }
 
@@ -1504,6 +1577,15 @@ where
             LogicalPlan::Insert { table, .. }
             | LogicalPlan::Update { table, .. }
             | LogicalPlan::Delete { table, .. } => Some(table.as_str()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn dml_change_kind(plan: &LogicalPlan) -> Option<LogicalChangeKind> {
+        match plan {
+            LogicalPlan::Insert { .. } => Some(LogicalChangeKind::Insert),
+            LogicalPlan::Update { .. } => Some(LogicalChangeKind::Update),
+            LogicalPlan::Delete { .. } => Some(LogicalChangeKind::Delete),
             _ => None,
         }
     }
@@ -1532,27 +1614,74 @@ where
         err
     }
 
-    fn try_parse_logical_replication_ddl(trimmed_sql: &str) -> Option<&'static str> {
-        let normalized = trimmed_sql
-            .split_whitespace()
-            .take(3)
-            .map(str::to_ascii_uppercase)
-            .collect::<Vec<_>>();
-        match normalized.as_slice() {
-            [first, second, ..] if first == "CREATE" && second == "PUBLICATION" => {
-                Some("CREATE PUBLICATION")
+    fn try_execute_logical_replication_ddl(
+        &self,
+        trimmed_sql: &str,
+    ) -> Result<Option<SelectResult>, ServerError> {
+        let Some(ddl) = Self::try_parse_logical_replication_ddl(trimmed_sql)? else {
+            return Ok(None);
+        };
+        match ddl {
+            LogicalReplicationDdl::CreatePublication { name, tables } => {
+                self.state
+                    .logical_replication
+                    .create_publication(&name, tables)?;
+                Ok(Some(run_ddl_command("CREATE PUBLICATION")))
             }
-            [first, second, ..] if first == "DROP" && second == "PUBLICATION" => {
-                Some("DROP PUBLICATION")
+            LogicalReplicationDdl::DropPublication { name, if_exists } => {
+                if !self.state.logical_replication.drop_publication(&name) && !if_exists {
+                    return Err(ServerError::ddl(format!(
+                        "publication \"{}\" does not exist",
+                        name.to_ascii_lowercase()
+                    )));
+                }
+                Ok(Some(run_ddl_command("DROP PUBLICATION")))
             }
-            [first, second, ..] if first == "CREATE" && second == "SUBSCRIPTION" => {
-                Some("CREATE SUBSCRIPTION")
+            LogicalReplicationDdl::CreateSubscription => {
+                Err(ServerError::Unsupported("CREATE SUBSCRIPTION"))
             }
-            [first, second, ..] if first == "DROP" && second == "SUBSCRIPTION" => {
-                Some("DROP SUBSCRIPTION")
+            LogicalReplicationDdl::DropSubscription => {
+                Err(ServerError::Unsupported("DROP SUBSCRIPTION"))
             }
-            _ => None,
         }
+    }
+
+    fn try_parse_logical_replication_ddl(
+        trimmed_sql: &str,
+    ) -> Result<Option<LogicalReplicationDdl>, ServerError> {
+        let sql = trimmed_sql.trim().trim_end_matches(';').trim();
+        if starts_with_keyword_pair(sql, "CREATE", "PUBLICATION") {
+            let rest = sql["CREATE PUBLICATION".len()..].trim();
+            let (name, after_name) = split_first_token(rest)?;
+            let tables = parse_publication_tables(after_name)?;
+            return Ok(Some(LogicalReplicationDdl::CreatePublication {
+                name: name.to_string(),
+                tables,
+            }));
+        }
+        if starts_with_keyword_pair(sql, "DROP", "PUBLICATION") {
+            let rest = sql["DROP PUBLICATION".len()..].trim();
+            let (if_exists, rest) = if rest
+                .get(.."IF EXISTS".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("IF EXISTS"))
+            {
+                (true, rest["IF EXISTS".len()..].trim())
+            } else {
+                (false, rest)
+            };
+            let (name, _) = split_first_token(rest)?;
+            return Ok(Some(LogicalReplicationDdl::DropPublication {
+                name: name.to_string(),
+                if_exists,
+            }));
+        }
+        if starts_with_keyword_pair(sql, "CREATE", "SUBSCRIPTION") {
+            return Ok(Some(LogicalReplicationDdl::CreateSubscription));
+        }
+        if starts_with_keyword_pair(sql, "DROP", "SUBSCRIPTION") {
+            return Ok(Some(LogicalReplicationDdl::DropSubscription));
+        }
+        Ok(None)
     }
 
     fn try_parse_backup_function(trimmed_sql: &str) -> Option<&'static str> {

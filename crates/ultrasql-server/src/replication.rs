@@ -1,11 +1,13 @@
-//! File-backed replication primitives for v0.9 operations.
+//! File-backed physical replication and same-process logical CDC primitives.
 //!
 //! These helpers implement deterministic WAL shipping against archived WAL
 //! files. They are intentionally small and synchronous so the CLI, tests, and
 //! future network WAL sender can share the same slot-state rules.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::ServerError;
 
@@ -30,6 +32,182 @@ impl ReplicationSlot {
             confirmed_flush_lsn: None,
         }
     }
+}
+
+/// Operation class carried by a logical CDC record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalChangeKind {
+    /// Rows inserted into a published table.
+    Insert,
+    /// Rows updated in a published table.
+    Update,
+    /// Rows deleted from a published table.
+    Delete,
+}
+
+/// `CREATE PUBLICATION` metadata kept by the in-process server runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Publication {
+    /// Case-folded publication name.
+    pub name: String,
+    tables: BTreeSet<String>,
+}
+
+impl Publication {
+    /// Return `true` when this publication includes `table`.
+    #[must_use]
+    pub fn publishes_table(&self, table: &str) -> bool {
+        self.tables.contains(&fold_identifier(table))
+    }
+
+    /// Return published table names in deterministic order.
+    pub fn tables(&self) -> impl Iterator<Item = &str> {
+        self.tables.iter().map(String::as_str)
+    }
+}
+
+/// One committed logical change emitted for a published table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalChange {
+    /// Monotonic in-process logical sequence number.
+    pub lsn: u64,
+    /// Publication that emitted this change.
+    pub publication: String,
+    /// Case-folded table name.
+    pub table: String,
+    /// DML operation class.
+    pub kind: LogicalChangeKind,
+    /// Number of committed rows affected by the statement.
+    pub rows_affected: u64,
+}
+
+/// Same-process logical replication runtime.
+///
+/// This is the first CDC layer: it records committed statement-level DML
+/// changes for tables named by `CREATE PUBLICATION ... FOR TABLE ...`.
+/// Row-image decoding and external replication slots can layer on this
+/// commit-gated stream without changing transaction semantics.
+#[derive(Debug)]
+pub struct LogicalReplicationRuntime {
+    publications: dashmap::DashMap<String, Publication>,
+    changes: parking_lot::Mutex<Vec<LogicalChange>>,
+    next_lsn: AtomicU64,
+}
+
+impl Default for LogicalReplicationRuntime {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LogicalReplicationRuntime {
+    /// Create an empty logical replication runtime.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            publications: dashmap::DashMap::new(),
+            changes: parking_lot::Mutex::new(Vec::new()),
+            next_lsn: AtomicU64::new(1),
+        }
+    }
+
+    /// Register a publication for explicit table names.
+    pub fn create_publication(
+        &self,
+        name: &str,
+        tables: Vec<String>,
+    ) -> Result<Publication, ServerError> {
+        let name = fold_identifier(name);
+        if name.is_empty() {
+            return Err(ServerError::ddl("CREATE PUBLICATION requires a name"));
+        }
+        if self.publications.contains_key(&name) {
+            return Err(ServerError::ddl(format!(
+                "publication \"{name}\" already exists"
+            )));
+        }
+        let tables = tables
+            .into_iter()
+            .map(|table| fold_identifier(&table))
+            .filter(|table| !table.is_empty())
+            .collect::<BTreeSet<_>>();
+        if tables.is_empty() {
+            return Err(ServerError::ddl(
+                "CREATE PUBLICATION requires at least one table",
+            ));
+        }
+        let publication = Publication {
+            name: name.clone(),
+            tables,
+        };
+        self.publications.insert(name, publication.clone());
+        Ok(publication)
+    }
+
+    /// Remove a publication, returning whether it existed.
+    #[must_use]
+    pub fn drop_publication(&self, name: &str) -> bool {
+        self.publications.remove(&fold_identifier(name)).is_some()
+    }
+
+    /// Look up a publication by name.
+    #[must_use]
+    pub fn publication(&self, name: &str) -> Option<Publication> {
+        self.publications
+            .get(&fold_identifier(name))
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Return committed logical changes with `lsn` greater than `after_lsn`.
+    #[must_use]
+    pub fn changes_since(&self, after_lsn: u64) -> Vec<LogicalChange> {
+        self.changes
+            .lock()
+            .iter()
+            .filter(|change| change.lsn > after_lsn)
+            .cloned()
+            .collect()
+    }
+
+    /// Emit a committed statement-level DML change for matching publications.
+    pub fn record_committed_dml(&self, table: &str, kind: LogicalChangeKind, rows_affected: u64) {
+        if rows_affected == 0 {
+            return;
+        }
+        let table = fold_identifier(table);
+        if table.is_empty() {
+            return;
+        }
+        let mut publications = self
+            .publications
+            .iter()
+            .filter(|publication| publication.value().publishes_table(&table))
+            .map(|publication| publication.key().clone())
+            .collect::<Vec<_>>();
+        if publications.is_empty() {
+            return;
+        }
+        publications.sort();
+        let mut changes = self.changes.lock();
+        for publication in publications {
+            let lsn = self.next_lsn.fetch_add(1, Ordering::AcqRel);
+            changes.push(LogicalChange {
+                lsn,
+                publication,
+                table: table.clone(),
+                kind,
+                rows_affected,
+            });
+        }
+    }
+}
+
+fn fold_identifier(ident: &str) -> String {
+    ident
+        .trim()
+        .trim_matches('"')
+        .trim_end_matches(';')
+        .to_ascii_lowercase()
 }
 
 /// File-backed replication slot store under `pg_replslot`.

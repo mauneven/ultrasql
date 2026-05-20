@@ -809,6 +809,8 @@ pub struct Server {
     pub columnar_storage: Arc<columnar_storage::ColumnarSecondaryStore>,
     /// Same-process time-range partition registry keyed by parent table name.
     pub time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
+    /// Same-process logical replication publication registry and CDC stream.
+    pub logical_replication: Arc<replication::LogicalReplicationRuntime>,
     /// Accumulated tuple modifications since the last analyze pass,
     /// keyed by folded table name.
     pub table_modifications: dashmap::DashMap<String, u64>,
@@ -1631,6 +1633,7 @@ impl Server {
             materialized_views: Arc::new(dashmap::DashMap::new()),
             columnar_storage: Arc::new(columnar_storage::ColumnarSecondaryStore::new()),
             time_partitions: Arc::new(dashmap::DashMap::new()),
+            logical_replication: Arc::new(replication::LogicalReplicationRuntime::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,
@@ -1993,6 +1996,7 @@ impl Server {
             materialized_views: Arc::new(dashmap::DashMap::new()),
             columnar_storage: Arc::new(columnar_storage::ColumnarSecondaryStore::new()),
             time_partitions: Arc::new(dashmap::DashMap::new()),
+            logical_replication: Arc::new(replication::LogicalReplicationRuntime::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,

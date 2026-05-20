@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::extended::ExtendedConnState;
 use crate::notify::NotificationRecord;
+use crate::replication::LogicalChangeKind;
 use crate::{READ_BUFFER_INITIAL, Server, TxnState};
 
 mod alter;
@@ -95,6 +96,8 @@ pub(crate) struct Session<RW> {
     /// transaction block. Flushed to server-level maintenance hooks on
     /// COMMIT, cleared on ROLLBACK.
     pub(super) pending_table_modifications: std::collections::HashMap<String, u64>,
+    /// Pending logical CDC changes emitted only after COMMIT succeeds.
+    pub(super) pending_logical_changes: Vec<PendingLogicalChange>,
     /// Materialized-view row counters accumulated inside the current
     /// transaction. Applied only after COMMIT so rollback cannot advance
     /// append offsets.
@@ -140,6 +143,7 @@ where
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             jsonb_shape_cache: std::cell::RefCell::new(jsonb_ingest::JsonbShapeCache::default()),
             pending_table_modifications: std::collections::HashMap::new(),
+            pending_logical_changes: Vec::new(),
             pending_materialized_view_rows: Vec::new(),
             sequence_state: crate::SequenceSessionState::default(),
             pending_post_commit_maintenance: false,
@@ -152,6 +156,13 @@ where
             above_rows: self.jit_above_rows,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PendingLogicalChange {
+    pub(super) table: String,
+    pub(super) kind: LogicalChangeKind,
+    pub(super) rows_affected: u64,
 }
 
 impl<RW> Drop for Session<RW> {
