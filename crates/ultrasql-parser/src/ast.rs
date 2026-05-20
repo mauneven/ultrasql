@@ -1171,6 +1171,51 @@ pub enum TableRef {
         /// Source span.
         span: Span,
     },
+    /// SQL/JSON `JSON_TABLE(...)` table function.
+    JsonTable {
+        /// Input JSON expression.
+        context: Expr,
+        /// Row-pattern SQL/JSON path expression.
+        row_path: String,
+        /// Declared output columns.
+        columns: Vec<JsonTableColumn>,
+        /// Optional alias for the produced relation.
+        alias: Option<Identifier>,
+        /// Source span.
+        span: Span,
+    },
+}
+
+/// One column declared inside a `JSON_TABLE ... COLUMNS (...)` clause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JsonTableColumn {
+    /// Output column name.
+    pub name: Identifier,
+    /// Column behavior.
+    pub kind: JsonTableColumnKind,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Supported `JSON_TABLE` column forms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JsonTableColumnKind {
+    /// `name FOR ORDINALITY`.
+    Ordinality,
+    /// `name type [PATH path_expression]`.
+    Value {
+        /// Declared SQL output type.
+        data_type: TypeName,
+        /// Optional column path. Defaults to `$.name`.
+        path: Option<String>,
+    },
+    /// `name type EXISTS [PATH path_expression]`.
+    Exists {
+        /// Declared SQL output type, normally boolean.
+        data_type: TypeName,
+        /// Optional column path. Defaults to `$.name`.
+        path: Option<String>,
+    },
 }
 
 /// Join operator.

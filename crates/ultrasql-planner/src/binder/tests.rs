@@ -740,6 +740,35 @@ fn binds_unnest_table_function_from_text_array() {
 }
 
 #[test]
+fn binds_json_table_declared_columns() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "SELECT * FROM JSON_TABLE(\
+         jsonb '[{\"id\":1,\"name\":\"Ada\"}]', \
+         '$[*]' COLUMNS (\
+             ord FOR ORDINALITY, \
+             id bigint PATH '$.id', \
+             name text, \
+             has_score boolean EXISTS PATH '$.score'\
+         )) jt",
+        &cat,
+    )
+    .expect("bind json_table");
+
+    assert_eq!(plan.schema().field_at(0).name, "ord");
+    assert_eq!(plan.schema().field_at(0).data_type, DataType::Int64);
+    assert_eq!(plan.schema().field_at(1).name, "id");
+    assert_eq!(plan.schema().field_at(1).data_type, DataType::Int64);
+    assert_eq!(plan.schema().field_at(2).name, "name");
+    assert_eq!(
+        plan.schema().field_at(2).data_type,
+        DataType::Text { max_len: None }
+    );
+    assert_eq!(plan.schema().field_at(3).name, "has_score");
+    assert_eq!(plan.schema().field_at(3).data_type, DataType::Bool);
+}
+
+#[test]
 fn binds_create_table_primary_key_implies_not_null() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind("CREATE TABLE t (id INT PRIMARY KEY)", &cat).expect("bind ok");

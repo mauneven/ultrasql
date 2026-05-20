@@ -779,7 +779,7 @@ fn object_name_namespace(name: &ObjectName) -> String {
 /// listed set return [`PlanError::NotSupported`]. Length modifiers
 /// (e.g. `VARCHAR(255)`) are honored where the target [`DataType`]
 /// carries a `max_len` slot.
-fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
+pub(super) fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
     if t.is_array {
         let mut inner = t.clone();
         inner.is_array = false;

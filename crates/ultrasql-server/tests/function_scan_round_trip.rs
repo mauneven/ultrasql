@@ -617,6 +617,50 @@ async fn unnest_string_to_array_emits_text_rows() {
 }
 
 #[tokio::test]
+async fn json_table_projects_declared_columns_from_jsonb_literal() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    let rows = client
+        .query(
+            "SELECT ord, id, name, has_score \
+             FROM JSON_TABLE(\
+                 jsonb '[{\"id\":2,\"name\":\"Grace\",\"score\":20},{\"id\":1,\"name\":\"Ada\"}]', \
+                 '$[*]' COLUMNS (\
+                     ord FOR ORDINALITY, \
+                     id bigint PATH '$.id', \
+                     name text, \
+                     has_score boolean EXISTS PATH '$.score'\
+                 )\
+             ) jt \
+             ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("JSON_TABLE over jsonb literal");
+
+    let values: Vec<(i64, i64, String, bool)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, i64>(0),
+                row.get::<_, i64>(1),
+                row.get::<_, String>(2),
+                row.get::<_, bool>(3),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (2, 1, "Ada".to_string(), false),
+            (1, 2, "Grace".to_string(), true),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn read_csv_single_file_exposes_header_columns_and_rows() {
     let dir = tempfile::tempdir().expect("tempdir");
     let csv_path = dir.path().join("people.csv");

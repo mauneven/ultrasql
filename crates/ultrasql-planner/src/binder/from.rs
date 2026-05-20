@@ -19,8 +19,9 @@ use ultrasql_iceberg::read_iceberg_schema;
 use ultrasql_objectstore::{
     expand_object_store_specs, is_object_store_uri, read_first_object_bytes, read_object_bytes,
 };
-use ultrasql_parser::ast::{JoinCondition, JoinOp, TableRef};
+use ultrasql_parser::ast::{JoinCondition, JoinOp, JsonTableColumnKind, TableRef, TypeName};
 
+use super::ddl::resolve_type_name;
 use super::{
     Catalog, LogicalJoinCondition, LogicalJoinType, LogicalPlan, PlanError, ScalarExpr, ScopeEntry,
     ScopeStack, apply_column_aliases, bind_expr_with_ctes, bind_select_with_ctes,
@@ -148,6 +149,21 @@ fn bind_table_ref(
         TableRef::Function {
             name, args, alias, ..
         } => bind_table_function(name, args, alias.as_ref(), catalog, cte_catalog, scope),
+        TableRef::JsonTable {
+            context,
+            row_path,
+            columns,
+            alias,
+            ..
+        } => bind_json_table_ref(
+            context,
+            row_path,
+            columns,
+            alias.as_ref(),
+            catalog,
+            cte_catalog,
+            scope,
+        ),
     }
 }
 
@@ -241,7 +257,7 @@ fn bind_table_function(
         "sniff_csv" => bind_sniff_csv_table_function(&bound_args, &qualifier)?,
         _ => {
             return Err(PlanError::NotSupported(
-                "table function (only generate_series, unnest, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
+                "table function (only generate_series, unnest, json_table, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
             ));
         }
     };
@@ -251,6 +267,106 @@ fn bind_table_function(
         schema,
     };
     Ok((plan, from_scope))
+}
+
+fn bind_json_table_ref(
+    context: &ultrasql_parser::ast::Expr,
+    row_path: &str,
+    columns: &[ultrasql_parser::ast::JsonTableColumn],
+    alias: Option<&ultrasql_parser::ast::Identifier>,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<(LogicalPlan, Vec<ScopeEntry>), PlanError> {
+    let empty_schema = Schema::empty();
+    let context = bind_expr_with_ctes(context, &empty_schema, catalog, cte_catalog, scope)?;
+    let qualifier = alias.map_or_else(|| "json_table".to_owned(), |a| a.value.clone());
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut spec_columns = Vec::with_capacity(columns.len());
+    for column in columns {
+        match &column.kind {
+            JsonTableColumnKind::Ordinality => {
+                fields.push(Field::required(column.name.value.clone(), DataType::Int64));
+                spec_columns.push(serde_json::json!({
+                    "name": column.name.value,
+                    "kind": "ordinality",
+                }));
+            }
+            JsonTableColumnKind::Value { data_type, path } => {
+                let data_type_resolved = resolve_type_name(data_type)?;
+                if matches!(data_type_resolved, DataType::Array(_)) {
+                    return Err(PlanError::NotSupported(
+                        "JSON_TABLE array column types are not supported in this slice",
+                    ));
+                }
+                fields.push(Field::nullable(
+                    column.name.value.clone(),
+                    data_type_resolved,
+                ));
+                spec_columns.push(serde_json::json!({
+                    "name": column.name.value,
+                    "kind": "value",
+                    "type": json_table_type_name(data_type),
+                    "path": path,
+                }));
+            }
+            JsonTableColumnKind::Exists { data_type, path } => {
+                let data_type_resolved = resolve_type_name(data_type)?;
+                if data_type_resolved != DataType::Bool {
+                    return Err(PlanError::TypeMismatch(
+                        "JSON_TABLE EXISTS columns must be boolean".to_owned(),
+                    ));
+                }
+                fields.push(Field::required(column.name.value.clone(), DataType::Bool));
+                spec_columns.push(serde_json::json!({
+                    "name": column.name.value,
+                    "kind": "exists",
+                    "type": json_table_type_name(data_type),
+                    "path": path,
+                }));
+            }
+        }
+    }
+    let schema = Schema::new(fields.clone())
+        .map_err(|err| PlanError::TypeMismatch(format!("JSON_TABLE schema: {err}")))?;
+    let from_scope = scope_entries(&qualifier, fields);
+    let spec = serde_json::json!({ "columns": spec_columns }).to_string();
+    let args = vec![
+        context,
+        ScalarExpr::Literal {
+            value: Value::Text(row_path.to_owned()),
+            data_type: DataType::Text { max_len: None },
+        },
+        ScalarExpr::Literal {
+            value: Value::Text(spec),
+            data_type: DataType::Text { max_len: None },
+        },
+    ];
+    let plan = LogicalPlan::FunctionScan {
+        name: "json_table".to_owned(),
+        args,
+        schema,
+    };
+    Ok((plan, from_scope))
+}
+
+fn json_table_type_name(data_type: &TypeName) -> String {
+    let mut out = data_type.name.value.clone();
+    if !data_type.type_modifiers.is_empty() {
+        let mods = data_type
+            .type_modifiers
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        out.push('(');
+        out.push_str(&mods);
+        out.push(')');
+    }
+    if data_type.is_array {
+        out.push_str("[]");
+    }
+    out
 }
 
 fn bind_read_parquet_table_function(

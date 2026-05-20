@@ -19,6 +19,7 @@ use super::external_scan::{
     is_external_table_function, lower_external_parquet_scan, lower_external_table_scan,
     read_external_path_specs,
 };
+use super::json_table_scan::lower_json_table_scan;
 use super::parquet_scan::ParquetPredicate;
 
 pub(super) fn lower_catalog_or_sample_scan(
@@ -165,6 +166,9 @@ pub(super) fn lower_function_scan(
     if is_external_table_function(name) {
         return lower_external_table_scan(name, args);
     }
+    if name == "json_table" {
+        return lower_json_table_scan(args);
+    }
     if name == "unnest" {
         if args.len() != 1 {
             return Err(ServerError::Unsupported(
@@ -188,7 +192,7 @@ pub(super) fn lower_function_scan(
     }
     if name != "generate_series" {
         return Err(ServerError::Unsupported(
-            "table function (only generate_series, unnest, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
+            "table function (only generate_series, unnest, json_table, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
         ));
     }
     if args.len() < 2 || args.len() > 3 {

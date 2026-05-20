@@ -95,6 +95,7 @@ mod cte_helpers;
 mod external_scan;
 mod index_scan;
 mod join;
+mod json_table_scan;
 mod lower_query;
 mod lower_simple;
 mod modify;

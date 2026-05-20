@@ -210,7 +210,8 @@ impl<'src> Parser<'src> {
             TokenKind::KwDate
             | TokenKind::KwTime
             | TokenKind::KwTimestamp
-            | TokenKind::KwInterval => {
+            | TokenKind::KwInterval
+            | TokenKind::KwJson => {
                 let next_is_string = matches!(
                     self.lookahead_at(1).map(|t| t.kind),
                     Ok(TokenKind::String | TokenKind::EscapedString)
@@ -229,6 +230,7 @@ impl<'src> Parser<'src> {
                     TokenKind::KwTime => "time",
                     TokenKind::KwTimestamp => "timestamp",
                     TokenKind::KwInterval => "interval",
+                    TokenKind::KwJson => "json",
                     _ => unreachable!(),
                 };
                 let raw = str_tok.text(self.source).unwrap_or("");
@@ -374,6 +376,8 @@ impl<'src> Parser<'src> {
             TokenKind::Identifier | TokenKind::QuotedIdentifier => {
                 if self.looks_like_vector_family_typed_literal()? {
                     self.parse_vector_family_typed_literal()
+                } else if self.looks_like_json_typed_literal()? {
+                    self.parse_json_typed_literal()
                 } else {
                     self.parse_ident_or_call()
                 }
@@ -704,6 +708,42 @@ impl<'src> Parser<'src> {
                 )),
             _ => Ok(false),
         }
+    }
+
+    fn looks_like_json_typed_literal(&mut self) -> Result<bool, ParseError> {
+        let tok = *self.peek()?;
+        if tok.kind != TokenKind::Identifier
+            || !tok.text(self.source).is_some_and(|text| {
+                text.eq_ignore_ascii_case("json") || text.eq_ignore_ascii_case("jsonb")
+            })
+        {
+            return Ok(false);
+        }
+        Ok(matches!(
+            self.lookahead_at(1)?.kind,
+            TokenKind::String | TokenKind::EscapedString
+        ))
+    }
+
+    fn parse_json_typed_literal(&mut self) -> Result<Expr, ParseError> {
+        let type_tok = self.advance()?;
+        let type_name = type_tok
+            .text(self.source)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let str_tok = self.advance()?;
+        let raw = str_tok.text(self.source).unwrap_or("");
+        let value = if matches!(str_tok.kind, TokenKind::String) {
+            raw[1..raw.len() - 1].replace("''", "'")
+        } else {
+            raw.to_owned()
+        };
+        Ok(Expr::Literal(Literal::Typed {
+            type_name,
+            value,
+            unit: None,
+            span: Span::new(type_tok.span.start, str_tok.span.end),
+        }))
     }
 
     fn parse_vector_family_typed_literal(&mut self) -> Result<Expr, ParseError> {

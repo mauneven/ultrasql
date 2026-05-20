@@ -21,9 +21,9 @@
 //! optimizer in a later wave. Do not remove this comment until that work lands.
 
 use crate::ast::{
-    Cte, Distinct, Expr, Identifier, JoinCondition, JoinOp, Literal, LockStrength, LockWaitPolicy,
-    LockingClause, NullsOrder, ObjectName, OrderItem, SelectItem, SelectStmt, SetOp, SetOpTail,
-    SetQuantifier, SortDirection, TableRef,
+    Cte, Distinct, Expr, Identifier, JoinCondition, JoinOp, JsonTableColumn, JsonTableColumnKind,
+    Literal, LockStrength, LockWaitPolicy, LockingClause, NullsOrder, ObjectName, OrderItem,
+    SelectItem, SelectStmt, SetOp, SetOpTail, SetQuantifier, SortDirection, TableRef,
 };
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
@@ -731,6 +731,9 @@ impl Parser<'_> {
                 name.parts.into_iter().next().expect(
                     "parse_table_ref: ObjectName::parts.len() == 1 implies a leading element",
                 );
+            if func_name.value.eq_ignore_ascii_case("json_table") {
+                return self.parse_json_table_ref(func_name);
+            }
             self.advance()?; // (
             let mut args = Vec::new();
             if self.peek()?.kind != TokenKind::RParen {
@@ -777,6 +780,131 @@ impl Parser<'_> {
             name,
             alias,
         })
+    }
+
+    fn parse_json_table_ref(&mut self, name: Identifier) -> Result<TableRef, ParseError> {
+        self.expect(TokenKind::LParen, "(")?;
+        let context = self.parse_expr()?;
+        self.expect(TokenKind::Comma, ",")?;
+        let row_path = self.parse_json_table_string_literal("JSON_TABLE row path")?;
+
+        if self.match_kw(TokenKind::KwAs) {
+            let _ = self.parse_identifier()?;
+        }
+        self.expect_ident_keyword("COLUMNS")?;
+        self.expect(TokenKind::LParen, "(")?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.parse_json_table_column()?);
+            if self.peek()?.kind == TokenKind::Comma {
+                self.advance()?;
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, ")")?;
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        let alias = if self.match_kw(TokenKind::KwAs)
+            || (matches!(
+                self.peek()?.kind,
+                TokenKind::Identifier | TokenKind::QuotedIdentifier
+            ) && !self.next_token_is_reserved_clause())
+        {
+            Some(self.parse_identifier()?)
+        } else {
+            None
+        };
+        let end = alias.as_ref().map_or(rp.span.end, |a| a.span.end);
+        Ok(TableRef::JsonTable {
+            context,
+            row_path,
+            columns,
+            alias,
+            span: Span::new(name.span.start, end),
+        })
+    }
+
+    fn parse_json_table_column(&mut self) -> Result<JsonTableColumn, ParseError> {
+        let name = self.parse_identifier()?;
+        if self.match_kw(TokenKind::KwFor) {
+            self.expect_ident_keyword("ORDINALITY")?;
+            let end = self.peek()?.span.start;
+            return Ok(JsonTableColumn {
+                span: Span::new(name.span.start, end),
+                name,
+                kind: JsonTableColumnKind::Ordinality,
+            });
+        }
+
+        let data_type = self.parse_ddl_type_name()?;
+        let kind = if self.match_kw(TokenKind::KwExists) {
+            JsonTableColumnKind::Exists {
+                data_type,
+                path: self.parse_optional_json_table_path()?,
+            }
+        } else {
+            JsonTableColumnKind::Value {
+                data_type,
+                path: self.parse_optional_json_table_path()?,
+            }
+        };
+        let end = self.peek()?.span.start;
+        Ok(JsonTableColumn {
+            span: Span::new(name.span.start, end),
+            name,
+            kind,
+        })
+    }
+
+    fn parse_optional_json_table_path(&mut self) -> Result<Option<String>, ParseError> {
+        if self.peek_is_ident_keyword("PATH")? {
+            self.advance()?;
+            Ok(Some(self.parse_json_table_string_literal(
+                "JSON_TABLE column path",
+            )?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn parse_json_table_string_literal(
+        &mut self,
+        expected: &'static str,
+    ) -> Result<String, ParseError> {
+        let expr = self.parse_expr()?;
+        let span = expr.span();
+        match expr {
+            Expr::Literal(Literal::String { value, .. }) => Ok(value),
+            _ => Err(ParseError::Expected {
+                expected,
+                found: self.peek()?.kind,
+                offset: span.start as usize,
+            }),
+        }
+    }
+
+    fn expect_ident_keyword(&mut self, expected: &'static str) -> Result<Span, ParseError> {
+        let tok = *self.peek()?;
+        if tok.kind == TokenKind::Identifier
+            && tok
+                .text(self.source)
+                .is_some_and(|text| text.eq_ignore_ascii_case(expected))
+        {
+            return Ok(self.advance()?.span);
+        }
+        Err(ParseError::Expected {
+            expected,
+            found: tok.kind,
+            offset: tok.span.start as usize,
+        })
+    }
+
+    fn peek_is_ident_keyword(&mut self, expected: &str) -> Result<bool, ParseError> {
+        let tok = *self.peek()?;
+        Ok(tok.kind == TokenKind::Identifier
+            && tok
+                .text(self.source)
+                .is_some_and(|text| text.eq_ignore_ascii_case(expected)))
     }
 
     // ------------------------------------------------------------------ //
@@ -952,7 +1080,8 @@ impl TableRefSpan for TableRef {
             Self::Named { span, .. }
             | Self::Join { span, .. }
             | Self::Subquery { span, .. }
-            | Self::Function { span, .. } => *span,
+            | Self::Function { span, .. }
+            | Self::JsonTable { span, .. } => *span,
         }
     }
 }
@@ -1312,6 +1441,33 @@ mod tests {
         assert_eq!(args.len(), 1);
     }
 
+    #[test]
+    fn select_json_table_in_from_parses_columns_clause() {
+        let stmt = parse(
+            "SELECT * FROM JSON_TABLE(\
+             jsonb '[{\"id\":1,\"name\":\"Ada\"}]', \
+             '$[*]' COLUMNS (\
+                 ord FOR ORDINALITY, \
+                 id bigint PATH '$.id', \
+                 name text, \
+                 has_score boolean EXISTS PATH '$.score'\
+             )) jt",
+        );
+        let Statement::Select(s) = stmt else { panic!() };
+        let TableRef::JsonTable {
+            row_path,
+            columns,
+            alias,
+            ..
+        } = &s.from[0]
+        else {
+            panic!("expected JSON_TABLE table ref");
+        };
+        assert_eq!(row_path, "$[*]");
+        assert_eq!(alias.as_ref().expect("alias").value, "jt");
+        assert_eq!(columns.len(), 4);
+    }
+
     // -------- GROUP BY / HAVING ------------------------------------------- //
 
     #[test]
@@ -1504,12 +1660,18 @@ mod tests {
     /// is a base table (leaf), while the left children recurse.
     fn is_left_deep(t: &TableRef) -> bool {
         match t {
-            TableRef::Named { .. } | TableRef::Subquery { .. } | TableRef::Function { .. } => true,
+            TableRef::Named { .. }
+            | TableRef::Subquery { .. }
+            | TableRef::Function { .. }
+            | TableRef::JsonTable { .. } => true,
             TableRef::Join { left, right, .. } => {
                 // Right must be a leaf.
                 matches!(
                     right.as_ref(),
-                    TableRef::Named { .. } | TableRef::Subquery { .. } | TableRef::Function { .. }
+                    TableRef::Named { .. }
+                        | TableRef::Subquery { .. }
+                        | TableRef::Function { .. }
+                        | TableRef::JsonTable { .. }
                 ) && is_left_deep(left)
             }
         }

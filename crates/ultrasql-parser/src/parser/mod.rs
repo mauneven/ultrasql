@@ -580,5 +580,6 @@ pub(crate) const fn is_type_name_keyword(kind: TokenKind) -> bool {
             | TokenKind::KwTime
             | TokenKind::KwTimestamp
             | TokenKind::KwInterval
+            | TokenKind::KwJson
     )
 }
