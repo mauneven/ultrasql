@@ -294,6 +294,68 @@ fn json_get_tighter_than_eq() {
     ));
 }
 
+// -- pgvector operators -----------------------------------------------------
+
+#[test]
+fn vector_l2_distance_operator() {
+    let expr = parse_expr("embedding <-> query");
+    assert!(matches!(
+        expr,
+        Expr::Binary {
+            op: BinaryOp::VectorL2Distance,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn vector_negative_inner_product_operator() {
+    let expr = parse_expr("embedding <#> query");
+    assert!(matches!(
+        expr,
+        Expr::Binary {
+            op: BinaryOp::VectorNegativeInnerProduct,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn vector_cosine_distance_operator() {
+    let expr = parse_expr("embedding <=> query");
+    assert!(matches!(
+        expr,
+        Expr::Binary {
+            op: BinaryOp::VectorCosineDistance,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn vector_l1_distance_operator() {
+    let expr = parse_expr("embedding <+> query");
+    assert!(matches!(
+        expr,
+        Expr::Binary {
+            op: BinaryOp::VectorL1Distance,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn vector_distance_tighter_than_comparison() {
+    let expr = parse_expr("embedding <-> query < 1");
+    assert!(matches!(
+        expr,
+        Expr::Binary {
+            op: BinaryOp::Lt,
+            ..
+        }
+    ));
+}
+
 // ── operator precedence property test ────────────────────────────────────
 
 /// A table-driven precedence check: build an expression `a OP1 b OP2 c`

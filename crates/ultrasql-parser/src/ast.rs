@@ -1736,6 +1736,14 @@ pub enum BinaryOp {
     Gt,
     /// `>=`
     GtEq,
+    /// `<->` — vector L2 distance.
+    VectorL2Distance,
+    /// `<#>` — vector negative inner product.
+    VectorNegativeInnerProduct,
+    /// `<=>` — vector cosine distance.
+    VectorCosineDistance,
+    /// `<+>` — vector L1 distance.
+    VectorL1Distance,
     /// `AND`
     And,
     /// `OR`
@@ -1799,7 +1807,8 @@ impl BinaryOp {
     /// Level 1 — OR
     /// Level 2 — AND
     /// Level 3 — comparison band: < > = <= >= <>, LIKE, ILIKE, regex ops (~, ~*, !~, !~*)
-    /// Level 4 — JSON ops (-> ->> #> #>> @> <@ ? ?| ?&), concat ||, bitwise & | #
+    /// Level 4 — JSON ops (-> ->> #> #>> @> <@ ? ?| ?&), concat ||, bitwise & | #,
+    ///           vector distance ops (<-> <#> <=> <+>)
     /// Level 5 — bitwise shift << >>
     /// Level 6 — addition/subtraction + -
     /// Level 7 — multiplication/division/modulo * / %
@@ -1844,7 +1853,11 @@ impl BinaryOp {
             | Self::Concat
             | Self::BitAnd
             | Self::BitOr
-            | Self::BitXor => 4,
+            | Self::BitXor
+            | Self::VectorL2Distance
+            | Self::VectorNegativeInnerProduct
+            | Self::VectorCosineDistance
+            | Self::VectorL1Distance => 4,
             // Bitwise shift (tighter than add/sub)
             Self::ShiftLeft | Self::ShiftRight => 5,
             Self::Add | Self::Sub => 6,

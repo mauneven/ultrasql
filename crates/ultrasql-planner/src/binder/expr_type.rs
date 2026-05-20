@@ -60,6 +60,19 @@ pub(super) fn binary_result_type(
                 )))
             }
         }
+        BinaryOp::VectorL2Distance
+        | BinaryOp::VectorNegativeInnerProduct
+        | BinaryOp::VectorCosineDistance
+        | BinaryOp::VectorL1Distance => {
+            if vector_operands_compatible(&lt, &rt) {
+                Ok(DataType::Float64)
+            } else {
+                Err(PlanError::TypeMismatch(format!(
+                    "vector operator {} requires compatible vector operands, got {lt} and {rt}",
+                    display_binary(op)
+                )))
+            }
+        }
         BinaryOp::And | BinaryOp::Or => {
             if matches!(lt, DataType::Bool | DataType::Null)
                 && matches!(rt, DataType::Bool | DataType::Null)
@@ -195,6 +208,18 @@ pub(super) fn comparable(a: &DataType, b: &DataType) -> bool {
     false
 }
 
+fn vector_operands_compatible(left: &DataType, right: &DataType) -> bool {
+    match (left, right) {
+        (DataType::Null, DataType::Vector { .. }) | (DataType::Vector { .. }, DataType::Null) => {
+            true
+        }
+        (DataType::Vector { dims: left_dims }, DataType::Vector { dims: right_dims }) => {
+            left_dims.is_none() || right_dims.is_none() || left_dims == right_dims
+        }
+        _ => false,
+    }
+}
+
 pub(super) const fn display_unary(op: UnaryOp) -> &'static str {
     match op {
         UnaryOp::Neg => "-",
@@ -219,6 +244,10 @@ pub(super) const fn display_binary(op: BinaryOp) -> &'static str {
         BinaryOp::LtEq => "<=",
         BinaryOp::Gt => ">",
         BinaryOp::GtEq => ">=",
+        BinaryOp::VectorL2Distance => "<->",
+        BinaryOp::VectorNegativeInnerProduct => "<#>",
+        BinaryOp::VectorCosineDistance => "<=>",
+        BinaryOp::VectorL1Distance => "<+>",
         BinaryOp::And => "AND",
         BinaryOp::Or => "OR",
         BinaryOp::Like => "LIKE",

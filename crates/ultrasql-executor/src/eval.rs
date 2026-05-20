@@ -906,6 +906,10 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
             | BinaryOp::LtEq
             | BinaryOp::Gt
             | BinaryOp::GtEq
+            | BinaryOp::VectorL2Distance
+            | BinaryOp::VectorNegativeInnerProduct
+            | BinaryOp::VectorCosineDistance
+            | BinaryOp::VectorL1Distance
             | BinaryOp::Concat
             | BinaryOp::Like
             | BinaryOp::NotLike
@@ -1004,6 +1008,16 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
         BinaryOp::ShiftRight => integer_bitwise(lv, rv, |a, b| a >> (b & 63)),
 
         // ------------------------------------------------------------------
+        // Vector distance operators
+        // ------------------------------------------------------------------
+        BinaryOp::VectorL2Distance => vector_distance(lv, rv, VectorDistanceOp::L2),
+        BinaryOp::VectorNegativeInnerProduct => {
+            vector_distance(lv, rv, VectorDistanceOp::NegativeInnerProduct)
+        }
+        BinaryOp::VectorCosineDistance => vector_distance(lv, rv, VectorDistanceOp::Cosine),
+        BinaryOp::VectorL1Distance => vector_distance(lv, rv, VectorDistanceOp::L1),
+
+        // ------------------------------------------------------------------
         // Unsupported operators (regex, JSON)
         // ------------------------------------------------------------------
         BinaryOp::RegexMatch
@@ -1033,6 +1047,84 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
             unreachable!("AND/OR handled in short-circuit paths")
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VectorDistanceOp {
+    L2,
+    NegativeInnerProduct,
+    Cosine,
+    L1,
+}
+
+fn vector_distance(left: Value, right: Value, op: VectorDistanceOp) -> Result<Value, EvalError> {
+    let (Value::Vector(left), Value::Vector(right)) = (left, right) else {
+        return Err(EvalError::Type(
+            "vector distance requires Vector operands".to_owned(),
+        ));
+    };
+    if left.len() != right.len() {
+        return Err(EvalError::Type(format!(
+            "vector dimension mismatch: {} and {}",
+            left.len(),
+            right.len()
+        )));
+    }
+    if left.is_empty() {
+        return Err(EvalError::Type(
+            "vector distance requires non-empty vectors".to_owned(),
+        ));
+    }
+    if left
+        .iter()
+        .chain(right.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(EvalError::Type(
+            "vector distance requires finite elements".to_owned(),
+        ));
+    }
+
+    let result = match op {
+        VectorDistanceOp::L2 => left
+            .iter()
+            .zip(right.iter())
+            .map(|(l, r)| {
+                let delta = f64::from(*l) - f64::from(*r);
+                delta * delta
+            })
+            .sum::<f64>()
+            .sqrt(),
+        VectorDistanceOp::NegativeInnerProduct => -left
+            .iter()
+            .zip(right.iter())
+            .map(|(l, r)| f64::from(*l) * f64::from(*r))
+            .sum::<f64>(),
+        VectorDistanceOp::Cosine => {
+            let mut dot = 0.0_f64;
+            let mut left_norm = 0.0_f64;
+            let mut right_norm = 0.0_f64;
+            for (l, r) in left.iter().zip(right.iter()) {
+                let left = f64::from(*l);
+                let right = f64::from(*r);
+                dot += left * right;
+                left_norm += left * left;
+                right_norm += right * right;
+            }
+            if left_norm == 0.0 || right_norm == 0.0 {
+                return Err(EvalError::Type(
+                    "cosine distance requires non-zero vectors".to_owned(),
+                ));
+            }
+            1.0 - (dot / (left_norm.sqrt() * right_norm.sqrt()))
+        }
+        VectorDistanceOp::L1 => left
+            .iter()
+            .zip(right.iter())
+            .map(|(l, r)| (f64::from(*l) - f64::from(*r)).abs())
+            .sum::<f64>(),
+    };
+    Ok(Value::Float64(result))
 }
 
 fn text_search_match(left: &Value, right: &Value) -> Result<bool, EvalError> {
@@ -1983,6 +2075,14 @@ mod tests {
         }
     }
 
+    fn lit_vector(values: Vec<f32>) -> ScalarExpr {
+        let dims = u32::try_from(values.len()).expect("test vector length fits u32");
+        ScalarExpr::Literal {
+            value: Value::Vector(values),
+            data_type: DataType::Vector { dims: Some(dims) },
+        }
+    }
+
     fn param(index: u32) -> ScalarExpr {
         ScalarExpr::Parameter {
             index,
@@ -2404,6 +2504,57 @@ mod tests {
     fn concat_null_propagation() {
         let ev = Eval::new(binop(BinaryOp::Concat, lit_null(), lit_text("bar")));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn vector_l2_distance_evaluates() {
+        let ev = Eval::new(binop(
+            BinaryOp::VectorL2Distance,
+            lit_vector(vec![1.0, 2.0, 3.0]),
+            lit_vector(vec![1.0, 2.0, 4.0]),
+        ));
+        assert_eq!(ev.eval(&[]).unwrap(), Value::Float64(1.0));
+    }
+
+    #[test]
+    fn vector_negative_inner_product_evaluates() {
+        let ev = Eval::new(binop(
+            BinaryOp::VectorNegativeInnerProduct,
+            lit_vector(vec![1.0, 2.0, 3.0]),
+            lit_vector(vec![4.0, 5.0, 6.0]),
+        ));
+        assert_eq!(ev.eval(&[]).unwrap(), Value::Float64(-32.0));
+    }
+
+    #[test]
+    fn vector_cosine_distance_evaluates() {
+        let ev = Eval::new(binop(
+            BinaryOp::VectorCosineDistance,
+            lit_vector(vec![1.0, 0.0]),
+            lit_vector(vec![0.0, 1.0]),
+        ));
+        assert_eq!(ev.eval(&[]).unwrap(), Value::Float64(1.0));
+    }
+
+    #[test]
+    fn vector_l1_distance_evaluates() {
+        let ev = Eval::new(binop(
+            BinaryOp::VectorL1Distance,
+            lit_vector(vec![1.0, 2.0, 3.0]),
+            lit_vector(vec![3.0, 2.0, -1.0]),
+        ));
+        assert_eq!(ev.eval(&[]).unwrap(), Value::Float64(6.0));
+    }
+
+    #[test]
+    fn vector_distance_rejects_runtime_dimension_mismatch() {
+        let ev = Eval::new(binop(
+            BinaryOp::VectorL2Distance,
+            lit_vector(vec![1.0, 2.0, 3.0]),
+            lit_vector(vec![1.0, 2.0]),
+        ));
+        let err = ev.eval(&[]).unwrap_err();
+        assert!(matches!(err, EvalError::Type(_)), "got {err:?}");
     }
 
     // -----------------------------------------------------------------------

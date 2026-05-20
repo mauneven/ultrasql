@@ -608,6 +608,10 @@ impl<'src> Lexer<'src> {
             (b'!', Some(b'~'), Some(b'*')) => three(self, TokenKind::NotTildeStar),
             (b'-', Some(b'>'), Some(b'>')) => three(self, TokenKind::ArrowDouble),
             (b'#', Some(b'>'), Some(b'>')) => three(self, TokenKind::HashArrowDouble),
+            (b'<', Some(b'-'), Some(b'>')) => three(self, TokenKind::VectorL2Distance),
+            (b'<', Some(b'#'), Some(b'>')) => three(self, TokenKind::VectorNegativeInnerProduct),
+            (b'<', Some(b'='), Some(b'>')) => three(self, TokenKind::VectorCosineDistance),
+            (b'<', Some(b'+'), Some(b'>')) => three(self, TokenKind::VectorL1Distance),
 
             // 2-byte operators.
             (b'<', Some(b'<'), _) => two(self, TokenKind::ShiftLeft),
@@ -931,6 +935,22 @@ mod tests {
                 TokenKind::TildeStar,
                 TokenKind::NotTilde,
                 TokenKind::NotTildeStar,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn pgvector_distance_operators() {
+        let src = "<-> <#> <=> <+>";
+        let k = kinds(src);
+        assert_eq!(
+            k,
+            vec![
+                TokenKind::VectorL2Distance,
+                TokenKind::VectorNegativeInnerProduct,
+                TokenKind::VectorCosineDistance,
+                TokenKind::VectorL1Distance,
                 TokenKind::Eof,
             ]
         );

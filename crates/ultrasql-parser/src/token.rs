@@ -115,6 +115,14 @@ pub enum TokenKind {
     Gt,
     /// `>=`
     GtEq,
+    /// `<->` — pgvector L2 distance.
+    VectorL2Distance,
+    /// `<#>` — pgvector negative inner product.
+    VectorNegativeInnerProduct,
+    /// `<=>` — pgvector cosine distance.
+    VectorCosineDistance,
+    /// `<+>` — pgvector L1 distance.
+    VectorL1Distance,
     /// `||` — string / array concatenation in PostgreSQL.
     Concat,
     /// `->` — JSON object access.

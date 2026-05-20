@@ -102,6 +102,44 @@ async fn insert_and_select_vector_column_round_trips_text_form() {
 }
 
 #[tokio::test]
+async fn vector_distance_operators_execute_in_sql() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE embeddings (id INT NOT NULL, embedding VECTOR(3))")
+        .await
+        .expect("create vector table");
+    client
+        .batch_execute("INSERT INTO embeddings VALUES (1, '[1, 2, 3]')")
+        .await
+        .expect("insert vector row");
+
+    let messages = client
+        .simple_query(
+            "SELECT \
+                 embedding <-> '[1,2,4]', \
+                 embedding <#> '[4,5,6]', \
+                 embedding <=> '[3,-6,3]', \
+                 embedding <+> '[3,2,-1]' \
+             FROM embeddings WHERE id = 1",
+        )
+        .await
+        .expect("select vector distances");
+    let rows = simple_rows(&messages);
+    assert_eq!(
+        rows,
+        vec![vec![
+            "1".to_owned(),
+            "-32".to_owned(),
+            "1".to_owned(),
+            "6".to_owned()
+        ]]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn insert_rejects_vector_dimension_mismatch() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

@@ -20,6 +20,17 @@ fn users_catalog() -> InMemoryCatalog {
     cat
 }
 
+fn embeddings_catalog() -> InMemoryCatalog {
+    let schema = Schema::new([
+        Field::required("id", DataType::Int32),
+        Field::nullable("embedding", DataType::Vector { dims: Some(3) }),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("embeddings", TableMeta::new(schema));
+    cat
+}
+
 fn parse_and_bind(sql: &str, cat: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
     let stmt = Parser::new(sql)
         .parse_statement()
@@ -397,6 +408,34 @@ fn binds_create_table_vector_column_type() {
 fn binds_create_table_rejects_zero_dimensional_vector() {
     let cat = InMemoryCatalog::new();
     let err = parse_and_bind("CREATE TABLE t (embedding VECTOR(0))", &cat).unwrap_err();
+    assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+}
+
+#[test]
+fn binds_vector_distance_expression_as_float64() {
+    let cat = embeddings_catalog();
+    let plan =
+        parse_and_bind("SELECT embedding <-> '[1,2,4]' FROM embeddings", &cat).expect("bind ok");
+    let LogicalPlan::Project { exprs, schema, .. } = &plan else {
+        panic!("expected Project, got {plan:?}");
+    };
+    assert_eq!(exprs[0].0.data_type(), DataType::Float64);
+    assert_eq!(schema.field_at(0).data_type, DataType::Float64);
+    let ScalarExpr::Binary { op, right, .. } = &exprs[0].0 else {
+        panic!("expected vector distance binary expression");
+    };
+    assert_eq!(*op, BinaryOp::VectorL2Distance);
+    assert_eq!(
+        right.data_type(),
+        DataType::Vector { dims: Some(3) },
+        "string literal should coerce to vector(3)"
+    );
+}
+
+#[test]
+fn binds_vector_distance_rejects_dimension_mismatch() {
+    let cat = embeddings_catalog();
+    let err = parse_and_bind("SELECT embedding <-> '[1,2]' FROM embeddings", &cat).unwrap_err();
     assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
 }
 
