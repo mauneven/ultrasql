@@ -4,6 +4,8 @@ use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::thread;
 
 use arrow_array::{
     Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, LargeStringArray,
@@ -25,11 +27,26 @@ use ultrasql_executor::{ExecError, Operator};
 use ultrasql_objectstore::{
     ObjectLocation, expand_object_store_specs, is_object_store_uri, read_object_bytes,
 };
-use ultrasql_planner::{BinaryOp, ScalarExpr};
+use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
 
 use crate::error::ServerError;
 
 const PARQUET_BATCH_TARGET_ROWS: usize = 4096;
+const PARQUET_MAX_ROW_GROUP_WORKERS: usize = 8;
+
+/// Row-group pruning evidence for `read_parquet` scans.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ParquetRowGroupSummary {
+    pub(crate) scanned: u64,
+    pub(crate) skipped: u64,
+}
+
+impl ParquetRowGroupSummary {
+    fn add(&mut self, other: Self) {
+        self.scanned = self.scanned.saturating_add(other.scanned);
+        self.skipped = self.skipped.saturating_add(other.skipped);
+    }
+}
 
 /// File-backed scan for `read_parquet(path_or_glob)`.
 #[derive(Debug)]
@@ -140,21 +157,12 @@ impl Operator for ParquetTableScan {
             let Some(active) = &mut self.active else {
                 return Ok(None);
             };
-            match active.reader.next() {
-                Some(Ok(batch)) if batch.num_rows() == 0 => continue,
-                Some(Ok(batch)) => {
-                    return arrow_record_batch_to_ultrasql(batch)
-                        .map(Some)
-                        .map_err(server_error_to_exec);
-                }
-                Some(Err(err)) => {
-                    return Err(ExecError::TypeMismatch(format!(
-                        "read_parquet read {}: {err}",
-                        active.display
-                    )));
-                }
-                None => {
+            match active.next_batch() {
+                Ok(Some(batch)) => return Ok(Some(batch)),
+                Ok(None) => self.active = None,
+                Err(err) => {
                     self.active = None;
+                    return Err(err);
                 }
             }
         }
@@ -201,7 +209,67 @@ enum ParquetScanSource {
 #[derive(Debug)]
 struct ActiveParquetReader {
     display: String,
-    reader: ParquetRecordBatchReader,
+    receiver: Option<Receiver<ParquetWorkerMessage>>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+
+impl ActiveParquetReader {
+    fn new(
+        display: String,
+        receiver: Receiver<ParquetWorkerMessage>,
+        workers: Vec<thread::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            display,
+            receiver: Some(receiver),
+            workers,
+        }
+    }
+
+    fn next_batch(&mut self) -> Result<Option<ultrasql_vec::Batch>, ExecError> {
+        let receiver = self
+            .receiver
+            .as_ref()
+            .ok_or(ExecError::Internal("parquet worker receiver missing"))?;
+        match receiver.recv() {
+            Ok(Ok(batch)) => Ok(Some(batch)),
+            Ok(Err(err)) => {
+                let _ = self.finish_workers();
+                Err(ExecError::TypeMismatch(err))
+            }
+            Err(_) => {
+                self.finish_workers()?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn finish_workers(&mut self) -> Result<(), ExecError> {
+        self.receiver.take();
+        for worker in self.workers.drain(..) {
+            if worker.join().is_err() {
+                return Err(ExecError::TypeMismatch(format!(
+                    "read_parquet worker for {} panicked",
+                    self.display
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ActiveParquetReader {
+    fn drop(&mut self) {
+        let _ = self.finish_workers();
+    }
+}
+
+type ParquetWorkerMessage = Result<ultrasql_vec::Batch, String>;
+
+#[derive(Clone, Debug)]
+enum ParquetWorkerSource {
+    Path(PathBuf),
+    Bytes(Bytes),
 }
 
 /// Predicate shape that can be pushed into a Parquet scan.
@@ -305,40 +373,19 @@ fn open_path_reader(
         )));
     }
 
-    let projection_mask = match projection {
-        Some(names) => ProjectionMask::columns(
-            builder.parquet_schema(),
-            names.iter().map(std::string::String::as_str),
-        ),
-        None => ProjectionMask::all(),
-    };
-    let row_groups = predicate
-        .map(|p| select_row_groups(builder.metadata(), expected_schema, p))
-        .transpose()?;
-    if row_groups.as_ref().is_some_and(Vec::is_empty) {
+    let row_groups = selected_row_groups(builder.metadata(), expected_schema, predicate)?;
+    if row_groups.is_empty() {
         return Ok(None);
     }
-    let row_filter = predicate.map(|p| p.row_filter(builder.parquet_schema()));
-
-    let mut builder = builder
-        .with_batch_size(PARQUET_BATCH_TARGET_ROWS)
-        .with_projection(projection_mask);
-    if let Some(row_groups) = row_groups {
-        builder = builder.with_row_groups(row_groups);
-    }
-    if let Some(row_filter) = row_filter {
-        builder = builder.with_row_filter(row_filter);
-    }
-    let reader = builder.build().map_err(|err| {
-        ServerError::CopyFormat(format!(
-            "read_parquet cannot read {}: {err}",
-            path.display()
-        ))
-    })?;
-    Ok(Some(ActiveParquetReader {
-        display: path.display().to_string(),
-        reader,
-    }))
+    let display = path.display().to_string();
+    spawn_parquet_row_group_workers(
+        display,
+        ParquetWorkerSource::Path(path.to_path_buf()),
+        projection,
+        predicate,
+        &row_groups,
+    )
+    .map(Some)
 }
 
 fn open_object_reader(
@@ -350,7 +397,8 @@ fn open_object_reader(
     let display = object.display_uri();
     let bytes = read_object_bytes(object)
         .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes)).map_err(|err| {
+    let bytes = Bytes::from(bytes);
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).map_err(|err| {
         ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
     })?;
     if builder.schema().as_ref() != expected_schema {
@@ -359,6 +407,134 @@ fn open_object_reader(
         )));
     }
 
+    let row_groups = selected_row_groups(builder.metadata(), expected_schema, predicate)?;
+    if row_groups.is_empty() {
+        return Ok(None);
+    }
+    spawn_parquet_row_group_workers(
+        display,
+        ParquetWorkerSource::Bytes(bytes),
+        projection,
+        predicate,
+        &row_groups,
+    )
+    .map(Some)
+}
+
+fn spawn_parquet_row_group_workers(
+    display: String,
+    source: ParquetWorkerSource,
+    projection: Option<&[String]>,
+    predicate: Option<&ParquetPredicate>,
+    row_groups: &[usize],
+) -> Result<ActiveParquetReader, ServerError> {
+    let chunks = split_row_groups(row_groups);
+    let channel_bound = chunks.len().saturating_mul(2).max(1);
+    let (sender, receiver) = sync_channel(channel_bound);
+    let projection = projection.map(<[String]>::to_vec);
+    let predicate = predicate.cloned();
+    let mut workers = Vec::with_capacity(chunks.len());
+    for (idx, chunk) in chunks.into_iter().enumerate() {
+        let worker_display = display.clone();
+        let worker_source = source.clone();
+        let worker_projection = projection.clone();
+        let worker_predicate = predicate.clone();
+        let worker_sender = sender.clone();
+        let worker = thread::Builder::new()
+            .name(format!("ultrasql-parquet-rg-{idx}"))
+            .spawn(move || {
+                run_parquet_worker(
+                    worker_source,
+                    worker_display,
+                    worker_projection.as_deref(),
+                    worker_predicate.as_ref(),
+                    chunk,
+                    worker_sender,
+                );
+            })
+            .map_err(|err| {
+                ServerError::CopyFormat(format!(
+                    "read_parquet cannot spawn row-group worker for {display}: {err}"
+                ))
+            })?;
+        workers.push(worker);
+    }
+    drop(sender);
+    Ok(ActiveParquetReader::new(display, receiver, workers))
+}
+
+fn run_parquet_worker(
+    source: ParquetWorkerSource,
+    display: String,
+    projection: Option<&[String]>,
+    predicate: Option<&ParquetPredicate>,
+    row_groups: Vec<usize>,
+    sender: SyncSender<ParquetWorkerMessage>,
+) {
+    if let Err(err) =
+        read_parquet_row_groups(source, &display, projection, predicate, row_groups, &sender)
+    {
+        let _ = sender.send(Err(err.to_string()));
+    }
+}
+
+fn read_parquet_row_groups(
+    source: ParquetWorkerSource,
+    display: &str,
+    projection: Option<&[String]>,
+    predicate: Option<&ParquetPredicate>,
+    row_groups: Vec<usize>,
+    sender: &SyncSender<ParquetWorkerMessage>,
+) -> Result<(), ServerError> {
+    let mut reader = build_row_group_reader(source, display, projection, predicate, row_groups)?;
+    for batch in &mut reader {
+        let batch = batch.map_err(|err| {
+            ServerError::CopyFormat(format!("read_parquet read {display}: {err}"))
+        })?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let batch = arrow_record_batch_to_ultrasql(batch)?;
+        if sender.send(Ok(batch)).is_err() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn build_row_group_reader(
+    source: ParquetWorkerSource,
+    display: &str,
+    projection: Option<&[String]>,
+    predicate: Option<&ParquetPredicate>,
+    row_groups: Vec<usize>,
+) -> Result<ParquetRecordBatchReader, ServerError> {
+    match source {
+        ParquetWorkerSource::Path(path) => {
+            let file = File::open(&path).map_err(|err| {
+                ServerError::CopyFormat(format!("read_parquet cannot open {display}: {err}"))
+            })?;
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|err| {
+                ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
+            })?;
+            build_row_group_reader_from_builder(builder, display, projection, predicate, row_groups)
+        }
+        ParquetWorkerSource::Bytes(bytes) => {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|err| {
+                ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
+            })?;
+            build_row_group_reader_from_builder(builder, display, projection, predicate, row_groups)
+        }
+    }
+}
+
+fn build_row_group_reader_from_builder<T: parquet::file::reader::ChunkReader + 'static>(
+    builder: ParquetRecordBatchReaderBuilder<T>,
+    display: &str,
+    projection: Option<&[String]>,
+    predicate: Option<&ParquetPredicate>,
+    row_groups: Vec<usize>,
+) -> Result<ParquetRecordBatchReader, ServerError> {
     let projection_mask = match projection {
         Some(names) => ProjectionMask::columns(
             builder.parquet_schema(),
@@ -366,27 +542,196 @@ fn open_object_reader(
         ),
         None => ProjectionMask::all(),
     };
-    let row_groups = predicate
-        .map(|p| select_row_groups(builder.metadata(), expected_schema, p))
-        .transpose()?;
-    if row_groups.as_ref().is_some_and(Vec::is_empty) {
-        return Ok(None);
-    }
     let row_filter = predicate.map(|p| p.row_filter(builder.parquet_schema()));
-
     let mut builder = builder
         .with_batch_size(PARQUET_BATCH_TARGET_ROWS)
-        .with_projection(projection_mask);
-    if let Some(row_groups) = row_groups {
-        builder = builder.with_row_groups(row_groups);
-    }
+        .with_projection(projection_mask)
+        .with_row_groups(row_groups);
     if let Some(row_filter) = row_filter {
         builder = builder.with_row_filter(row_filter);
     }
-    let reader = builder.build().map_err(|err| {
+    builder.build().map_err(|err| {
         ServerError::CopyFormat(format!("read_parquet cannot read {display}: {err}"))
+    })
+}
+
+fn split_row_groups(row_groups: &[usize]) -> Vec<Vec<usize>> {
+    if row_groups.is_empty() {
+        return Vec::new();
+    }
+    let workers = parquet_row_group_worker_count(row_groups.len());
+    let chunk_len = row_groups.len().div_ceil(workers);
+    row_groups
+        .chunks(chunk_len)
+        .map(<[usize]>::to_vec)
+        .collect()
+}
+
+fn parquet_row_group_worker_count(selected_row_groups: usize) -> usize {
+    if selected_row_groups <= 1 {
+        return selected_row_groups;
+    }
+    let available = thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get);
+    available
+        .clamp(2, PARQUET_MAX_ROW_GROUP_WORKERS)
+        .min(selected_row_groups)
+}
+
+fn selected_row_groups(
+    metadata: &ParquetMetaData,
+    schema: &ArrowSchema,
+    predicate: Option<&ParquetPredicate>,
+) -> Result<Vec<usize>, ServerError> {
+    if let Some(predicate) = predicate {
+        return select_row_groups(metadata, schema, predicate);
+    }
+    Ok((0..metadata.num_row_groups()).collect())
+}
+
+fn row_group_summary(
+    metadata: &ParquetMetaData,
+    schema: &ArrowSchema,
+    predicate: Option<&ParquetPredicate>,
+) -> Result<ParquetRowGroupSummary, ServerError> {
+    let total = metadata.num_row_groups();
+    let selected = selected_row_groups(metadata, schema, predicate)?.len();
+    let skipped = total.saturating_sub(selected);
+    Ok(ParquetRowGroupSummary {
+        scanned: u64::try_from(selected).unwrap_or(u64::MAX),
+        skipped: u64::try_from(skipped).unwrap_or(u64::MAX),
+    })
+}
+
+/// Summarize Parquet row groups that a lowered plan shape will scan.
+pub(crate) fn parquet_row_group_summary_for_plan(
+    plan: &LogicalPlan,
+) -> Result<Option<ParquetRowGroupSummary>, ServerError> {
+    let mut summary = None;
+    collect_parquet_row_group_summary(plan, &mut summary)?;
+    Ok(summary)
+}
+
+fn collect_parquet_row_group_summary(
+    plan: &LogicalPlan,
+    summary: &mut Option<ParquetRowGroupSummary>,
+) -> Result<(), ServerError> {
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            if let LogicalPlan::FunctionScan { name, args, .. } = input.as_ref()
+                && name == "read_parquet"
+            {
+                let pushed = ParquetPredicate::from_scalar(predicate);
+                add_parquet_function_summary(args, pushed.as_ref(), summary)?;
+                return Ok(());
+            }
+            collect_parquet_row_group_summary(input, summary)
+        }
+        LogicalPlan::FunctionScan { name, args, .. } if name == "read_parquet" => {
+            add_parquet_function_summary(args, None, summary)
+        }
+        LogicalPlan::Project { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::LockRows { input, .. }
+        | LogicalPlan::Explain { input, .. }
+        | LogicalPlan::Update { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Delete { input, .. } => collect_parquet_row_group_summary(input, summary),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            collect_parquet_row_group_summary(left, summary)?;
+            collect_parquet_row_group_summary(right, summary)
+        }
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => {
+            collect_parquet_row_group_summary(definition, summary)?;
+            collect_parquet_row_group_summary(body, summary)
+        }
+        LogicalPlan::Insert { source, .. } => collect_parquet_row_group_summary(source, summary),
+        _ => Ok(()),
+    }
+}
+
+fn add_parquet_function_summary(
+    args: &[ScalarExpr],
+    predicate: Option<&ParquetPredicate>,
+    summary: &mut Option<ParquetRowGroupSummary>,
+) -> Result<(), ServerError> {
+    let path_specs = super::external_scan::read_external_path_specs("read_parquet", args)?;
+    let next = parquet_row_group_summary_for_path_specs(&path_specs, predicate)?;
+    if let Some(summary) = summary {
+        summary.add(next);
+    } else {
+        *summary = Some(next);
+    }
+    Ok(())
+}
+
+fn parquet_row_group_summary_for_path_specs(
+    patterns: &[String],
+    predicate: Option<&ParquetPredicate>,
+) -> Result<ParquetRowGroupSummary, ServerError> {
+    if path_specs_use_object_store("read_parquet", patterns)? {
+        let objects = expand_object_store_specs(patterns)
+            .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
+        let mut summary = ParquetRowGroupSummary::default();
+        for object in objects {
+            summary.add(parquet_object_row_group_summary(&object, predicate)?);
+        }
+        return Ok(summary);
+    }
+    let mut summary = ParquetRowGroupSummary::default();
+    for path in expand_parquet_path_specs(patterns)? {
+        summary.add(parquet_path_row_group_summary(&path, predicate)?);
+    }
+    Ok(summary)
+}
+
+fn parquet_path_row_group_summary(
+    path: &Path,
+    predicate: Option<&ParquetPredicate>,
+) -> Result<ParquetRowGroupSummary, ServerError> {
+    let file = File::open(path).map_err(|err| {
+        ServerError::CopyFormat(format!(
+            "read_parquet cannot open {}: {err}",
+            path.display()
+        ))
     })?;
-    Ok(Some(ActiveParquetReader { display, reader }))
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|err| {
+        ServerError::CopyFormat(format!(
+            "read_parquet cannot inspect {}: {err}",
+            path.display()
+        ))
+    })?;
+    let predicate = predicate
+        .map(|predicate| predicate.resolved_for_schema(builder.schema().as_ref()))
+        .transpose()?;
+    row_group_summary(
+        builder.metadata(),
+        builder.schema().as_ref(),
+        predicate.as_ref(),
+    )
+}
+
+fn parquet_object_row_group_summary(
+    object: &ObjectLocation,
+    predicate: Option<&ParquetPredicate>,
+) -> Result<ParquetRowGroupSummary, ServerError> {
+    let display = object.display_uri();
+    let bytes = read_object_bytes(object)
+        .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes)).map_err(|err| {
+        ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
+    })?;
+    let predicate = predicate
+        .map(|predicate| predicate.resolved_for_schema(builder.schema().as_ref()))
+        .transpose()?;
+    row_group_summary(
+        builder.metadata(),
+        builder.schema().as_ref(),
+        predicate.as_ref(),
+    )
 }
 
 fn read_arrow_schema(path: &Path) -> Result<arrow_schema::SchemaRef, ServerError> {
@@ -950,20 +1295,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parquet_scan_splits_selected_row_groups_across_workers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("groups.parquet");
+        write_i64_parquet_groups(&path, &[&[1], &[2], &[3], &[4]]);
+        let path_specs = vec![path.display().to_string()];
+        let predicate = ParquetPredicate {
+            column: "id".to_owned(),
+            op: BinaryOp::GtEq,
+            literal: super::ParquetLiteral::Int64(2),
+        };
+
+        let mut scan = ParquetTableScan::from_path_specs(&path_specs, None, Some(&predicate))
+            .expect("construct scan");
+        let first_batch = scan
+            .next_batch()
+            .expect("read first parallel batch")
+            .expect("first batch");
+        let worker_count = scan
+            .active
+            .as_ref()
+            .map_or(0, |active| active.workers.len());
+        assert!(
+            worker_count > 1,
+            "selected row groups must split across workers, got {worker_count}"
+        );
+
+        let mut ids = collect_i64_ids(&first_batch);
+        while let Some(batch) = scan.next_batch().expect("read next parallel batch") {
+            ids.extend(collect_i64_ids(&batch));
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 3, 4]);
+    }
+
     fn write_i64_parquet(path: &std::path::Path, values: &[i64]) {
+        write_i64_parquet_groups(path, &[values]);
+    }
+
+    fn write_i64_parquet_groups(path: &std::path::Path, groups: &[&[i64]]) {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
             "id",
             ArrowDataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(values.to_vec()))],
-        )
-        .expect("record batch");
         let file = fs::File::create(path).expect("create parquet");
         let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("writer");
-        writer.write(&batch).expect("write parquet");
+        for values in groups {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(values.to_vec()))],
+            )
+            .expect("record batch");
+            writer.write(&batch).expect("write parquet row group");
+            writer.flush().expect("flush parquet row group");
+        }
         writer.close().expect("close parquet");
+    }
+
+    fn collect_i64_ids(batch: &ultrasql_vec::Batch) -> Vec<i64> {
+        let Column::Int64(values) = &batch.columns()[0] else {
+            panic!("expected int64 column");
+        };
+        values.data().to_vec()
     }
 }

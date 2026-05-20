@@ -22,6 +22,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use parquet::arrow::ArrowWriter;
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
@@ -64,6 +67,47 @@ fn collect_plan_text(rows: &[tokio_postgres::Row]) -> String {
         .map(|r| r.get::<_, String>(0))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn sql_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn write_people_parquet(
+    path: &std::path::Path,
+    first_rows: &[(i64, &str, i64)],
+    second_rows: &[(i64, &str, i64)],
+) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, false),
+        ArrowField::new("name", ArrowDataType::Utf8, false),
+        ArrowField::new("score", ArrowDataType::Int64, false),
+    ]));
+    let file = std::fs::File::create(path).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("parquet writer");
+    writer
+        .write(&people_batch(Arc::clone(&schema), first_rows))
+        .expect("write first parquet row group");
+    writer.flush().expect("flush first row group");
+    writer
+        .write(&people_batch(schema, second_rows))
+        .expect("write second parquet row group");
+    writer.close().expect("close parquet");
+}
+
+fn people_batch(schema: Arc<ArrowSchema>, rows: &[(i64, &str, i64)]) -> RecordBatch {
+    let ids = rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
+    let names = rows.iter().map(|(_, name, _)| *name).collect::<Vec<_>>();
+    let scores = rows.iter().map(|(_, _, score)| *score).collect::<Vec<_>>();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(Int64Array::from(scores)),
+        ],
+    )
+    .expect("people record batch")
 }
 
 /// Plain `EXPLAIN SELECT` returns a plan tree as one or more text rows.
@@ -171,6 +215,32 @@ async fn explain_analyze_reports_runtime_evidence() {
             "EXPLAIN ANALYZE missing {required:?}, got: {text}"
         );
     }
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn explain_analyze_reports_parquet_row_groups_scanned_and_skipped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let parquet_path = dir.path().join("people.parquet");
+    write_people_parquet(
+        &parquet_path,
+        &[(1, "Ada", 10), (2, "Linus", 20)],
+        &[(100, "Grace", 90), (101, "Katherine", 95)],
+    );
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "EXPLAIN ANALYZE SELECT id FROM read_parquet({}) WHERE id >= 100",
+        sql_string(parquet_path.to_str().expect("utf8 parquet path")),
+    );
+
+    let rows = client.query(&sql, &[]).await.expect("EXPLAIN ANALYZE");
+    let text = collect_plan_text(&rows);
+    assert!(
+        text.contains("Parquet Row Groups: scanned=1 skipped=1"),
+        "EXPLAIN ANALYZE must report parquet row groups, got: {text}"
+    );
 
     shutdown(client, server_handle).await;
 }

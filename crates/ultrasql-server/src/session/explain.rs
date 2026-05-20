@@ -128,6 +128,7 @@ where
                 simd_kernel: notes.simd_kernel,
                 index_decision: notes.index_decision,
                 pushdowns_applied: notes.pushdowns_applied,
+                parquet_row_groups: notes.parquet_row_groups,
             });
         }
 
@@ -177,6 +178,7 @@ where
             simd_kernel: notes.simd_kernel,
             index_decision: notes.index_decision,
             pushdowns_applied: notes.pushdowns_applied,
+            parquet_row_groups: notes.parquet_row_groups,
         })
     }
 
@@ -239,6 +241,7 @@ where
             simd_kernel: simd_kernel_note(plan),
             index_decision: self.index_decision_note(plan, catalog_snapshot),
             pushdowns_applied: pushdown_notes(plan),
+            parquet_row_groups: parquet_row_group_note(plan),
         }
     }
 
@@ -318,6 +321,7 @@ struct ExplainActuals {
     simd_kernel: String,
     index_decision: String,
     pushdowns_applied: Vec<String>,
+    parquet_row_groups: Option<crate::pipeline::ParquetRowGroupSummary>,
 }
 
 struct ExplainScanActuals {
@@ -330,6 +334,7 @@ struct ExplainNotes {
     simd_kernel: String,
     index_decision: String,
     pushdowns_applied: Vec<String>,
+    parquet_row_groups: Option<crate::pipeline::ParquetRowGroupSummary>,
 }
 
 struct DiskSpillSummary {
@@ -366,7 +371,8 @@ fn render_text(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
              Disk Spill: {} ({} bytes; {})\n\
              SIMD Kernel: {}\n\
              Index Decision: {}\n\
-             Pushdowns Applied: {}\n",
+             Pushdowns Applied: {}\n\
+             Parquet Row Groups: {}\n",
             a.elapsed_ms,
             a.rows,
             a.batches,
@@ -376,7 +382,8 @@ fn render_text(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
             a.disk_spill.reason,
             a.simd_kernel,
             a.index_decision,
-            pushdowns
+            pushdowns,
+            format_parquet_row_groups(a.parquet_row_groups)
         ));
     }
     body
@@ -413,7 +420,8 @@ fn render_json(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
              \n    \"Disk Spill\": {{\"Used\": {}, \"Bytes\": {}, \"Reason\": \"{}\"}},\
              \n    \"SIMD Kernel\": \"{}\",\
              \n    \"Index Decision\": \"{}\",\
-             \n    \"Pushdowns Applied\": {}",
+             \n    \"Pushdowns Applied\": {},\
+             \n    \"Parquet Row Groups\": {}",
             a.elapsed_ms,
             a.rows,
             a.batches,
@@ -423,7 +431,8 @@ fn render_json(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
             json_escape(a.disk_spill.reason),
             json_escape(&a.simd_kernel),
             json_escape(&a.index_decision),
-            pushdowns
+            pushdowns,
+            format_parquet_row_groups_json(a.parquet_row_groups)
         ));
     }
     buf.push_str("\n  }\n]");
@@ -724,6 +733,37 @@ fn pushdown_notes(plan: &LogicalPlan) -> Vec<String> {
     notes.sort();
     notes.dedup();
     notes
+}
+
+fn parquet_row_group_note(plan: &LogicalPlan) -> Option<crate::pipeline::ParquetRowGroupSummary> {
+    match crate::pipeline::parquet_row_group_summary_for_plan(plan) {
+        Ok(summary) => summary,
+        Err(err) => {
+            tracing::warn!(error = %err, "EXPLAIN ANALYZE parquet row-group summary failed");
+            None
+        }
+    }
+}
+
+fn format_parquet_row_groups(summary: Option<crate::pipeline::ParquetRowGroupSummary>) -> String {
+    summary.map_or_else(
+        || "not applicable".to_owned(),
+        |summary| format!("scanned={} skipped={}", summary.scanned, summary.skipped),
+    )
+}
+
+fn format_parquet_row_groups_json(
+    summary: Option<crate::pipeline::ParquetRowGroupSummary>,
+) -> String {
+    summary.map_or_else(
+        || "null".to_owned(),
+        |summary| {
+            format!(
+                "{{\"Scanned\": {}, \"Skipped\": {}}}",
+                summary.scanned, summary.skipped
+            )
+        },
+    )
 }
 
 fn collect_pushdown_notes(plan: &LogicalPlan, notes: &mut Vec<String>) {

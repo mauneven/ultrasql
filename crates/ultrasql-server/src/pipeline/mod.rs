@@ -100,6 +100,7 @@ mod lower_query;
 mod lower_simple;
 mod modify;
 mod parquet_scan;
+pub(crate) use parquet_scan::{ParquetRowGroupSummary, parquet_row_group_summary_for_plan};
 mod scan;
 mod time_partition;
 mod tpch_q1;
