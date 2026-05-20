@@ -6,9 +6,8 @@
 
 /// Dot product over two dense `f32` vectors.
 ///
-/// This wrapper currently delegates to [`dot_f32_scalar`]. Target-specific
-/// SIMD kernels will plug in here while keeping the scalar implementation as
-/// the correctness oracle.
+/// This wrapper dispatches to target-specific SIMD when available, while
+/// [`dot_f32_scalar`] remains the correctness oracle.
 ///
 /// # Panics
 ///
@@ -17,7 +16,24 @@
 #[inline]
 pub fn dot_f32(left: &[f32], right: &[f32]) -> f32 {
     assert_eq!(left.len(), right.len(), "dot_f32: vector length mismatch");
-    dot_f32_scalar_same_len(left, right)
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the aarch64 baseline; lengths were checked
+        // above and the helper reads only inside the borrowed slices.
+        unsafe { dot_f32_neon(left, right) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: runtime CPUID confirmed AVX2; lengths were checked
+                // above and the helper reads only inside the borrowed slices.
+                return unsafe { dot_f32_avx2(left, right) };
+            }
+        }
+        dot_f32_scalar_same_len(left, right)
+    }
 }
 
 /// Scalar reference implementation of [`dot_f32`].
@@ -51,7 +67,8 @@ fn dot_f32_scalar_same_len(left: &[f32], right: &[f32]) -> f32 {
 /// Euclidean distance over two dense `f32` vectors.
 ///
 /// This computes `sqrt(sum((left[i] - right[i])^2))` with an `f32`
-/// accumulator. The wrapper currently delegates to [`l2_distance_f32_scalar`].
+/// accumulator. The wrapper dispatches to target-specific SIMD when available,
+/// while [`l2_distance_f32_scalar`] remains the correctness oracle.
 ///
 /// # Panics
 ///
@@ -64,7 +81,24 @@ pub fn l2_distance_f32(left: &[f32], right: &[f32]) -> f32 {
         right.len(),
         "l2_distance_f32: vector length mismatch"
     );
-    l2_distance_f32_scalar_same_len(left, right)
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the aarch64 baseline; lengths were checked
+        // above and the helper reads only inside the borrowed slices.
+        unsafe { l2_distance_f32_neon(left, right) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: runtime CPUID confirmed AVX2; lengths were checked
+                // above and the helper reads only inside the borrowed slices.
+                return unsafe { l2_distance_f32_avx2(left, right) };
+            }
+        }
+        l2_distance_f32_scalar_same_len(left, right)
+    }
 }
 
 /// Scalar reference implementation of [`l2_distance_f32`].
@@ -98,8 +132,9 @@ fn l2_distance_f32_scalar_same_len(left: &[f32], right: &[f32]) -> f32 {
 ///
 /// Returns `Some(1 - cosine_similarity)`. Returns `None` when either vector
 /// has zero norm, including the empty-vector case, because cosine distance is
-/// undefined there. The wrapper currently delegates to
-/// [`cosine_distance_f32_scalar`].
+/// undefined there. The wrapper dispatches to target-specific SIMD when
+/// available, while [`cosine_distance_f32_scalar`] remains the correctness
+/// oracle.
 ///
 /// # Panics
 ///
@@ -112,7 +147,24 @@ pub fn cosine_distance_f32(left: &[f32], right: &[f32]) -> Option<f32> {
         right.len(),
         "cosine_distance_f32: vector length mismatch"
     );
-    cosine_distance_f32_scalar_same_len(left, right)
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the aarch64 baseline; lengths were checked
+        // above and the helper reads only inside the borrowed slices.
+        unsafe { cosine_distance_f32_neon(left, right) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: runtime CPUID confirmed AVX2; lengths were checked
+                // above and the helper reads only inside the borrowed slices.
+                return unsafe { cosine_distance_f32_avx2(left, right) };
+            }
+        }
+        cosine_distance_f32_scalar_same_len(left, right)
+    }
 }
 
 /// Scalar reference implementation of [`cosine_distance_f32`].
@@ -143,6 +195,264 @@ fn cosine_distance_f32_scalar_same_len(left: &[f32], right: &[f32]) -> Option<f3
         right_norm += right_value * right_value;
     }
 
+    if left_norm == 0.0 || right_norm == 0.0 {
+        return None;
+    }
+
+    Some(1.0 - (dot / (left_norm.sqrt() * right_norm.sqrt())))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn dot_f32_neon(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
+
+    debug_assert_eq!(left.len(), right.len());
+
+    let mut sum = 0.0_f32;
+    let mut lanes = [0.0_f32; 4];
+    let mut left_chunks = left.chunks_exact(4);
+    let mut right_chunks = right.chunks_exact(4);
+
+    for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
+        // SAFETY: chunks_exact(4) guarantees both loads read four contiguous
+        // `f32` lanes in-bounds. `lanes` has room for one 128-bit store.
+        unsafe {
+            let left_vec = vld1q_f32(left_chunk.as_ptr());
+            let right_vec = vld1q_f32(right_chunk.as_ptr());
+            let product = vmulq_f32(left_vec, right_vec);
+            vst1q_f32(lanes.as_mut_ptr(), product);
+        }
+        for value in lanes {
+            sum += value;
+        }
+    }
+
+    accumulate_dot_tail(left_chunks.remainder(), right_chunks.remainder(), &mut sum);
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn l2_distance_f32_neon(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32, vsubq_f32};
+
+    debug_assert_eq!(left.len(), right.len());
+
+    let mut sum = 0.0_f32;
+    let mut lanes = [0.0_f32; 4];
+    let mut left_chunks = left.chunks_exact(4);
+    let mut right_chunks = right.chunks_exact(4);
+
+    for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
+        // SAFETY: chunks_exact(4) guarantees both loads read four contiguous
+        // `f32` lanes in-bounds. `lanes` has room for one 128-bit store.
+        unsafe {
+            let left_vec = vld1q_f32(left_chunk.as_ptr());
+            let right_vec = vld1q_f32(right_chunk.as_ptr());
+            let delta = vsubq_f32(left_vec, right_vec);
+            let squared = vmulq_f32(delta, delta);
+            vst1q_f32(lanes.as_mut_ptr(), squared);
+        }
+        for value in lanes {
+            sum += value;
+        }
+    }
+
+    accumulate_l2_squared_tail(left_chunks.remainder(), right_chunks.remainder(), &mut sum);
+    sum.sqrt()
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn cosine_distance_f32_neon(left: &[f32], right: &[f32]) -> Option<f32> {
+    use std::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
+
+    debug_assert_eq!(left.len(), right.len());
+
+    let mut dot = 0.0_f32;
+    let mut left_norm = 0.0_f32;
+    let mut right_norm = 0.0_f32;
+    let mut dot_lanes = [0.0_f32; 4];
+    let mut left_norm_lanes = [0.0_f32; 4];
+    let mut right_norm_lanes = [0.0_f32; 4];
+    let mut left_chunks = left.chunks_exact(4);
+    let mut right_chunks = right.chunks_exact(4);
+
+    for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
+        // SAFETY: chunks_exact(4) guarantees both loads read four contiguous
+        // `f32` lanes in-bounds. Each lane buffer has room for one 128-bit store.
+        unsafe {
+            let left_vec = vld1q_f32(left_chunk.as_ptr());
+            let right_vec = vld1q_f32(right_chunk.as_ptr());
+            vst1q_f32(dot_lanes.as_mut_ptr(), vmulq_f32(left_vec, right_vec));
+            vst1q_f32(left_norm_lanes.as_mut_ptr(), vmulq_f32(left_vec, left_vec));
+            vst1q_f32(
+                right_norm_lanes.as_mut_ptr(),
+                vmulq_f32(right_vec, right_vec),
+            );
+        }
+        for idx in 0..4 {
+            dot += dot_lanes[idx];
+            left_norm += left_norm_lanes[idx];
+            right_norm += right_norm_lanes[idx];
+        }
+    }
+
+    accumulate_cosine_tail(
+        left_chunks.remainder(),
+        right_chunks.remainder(),
+        &mut dot,
+        &mut left_norm,
+        &mut right_norm,
+    );
+
+    finish_cosine_distance(dot, left_norm, right_norm)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps};
+
+    debug_assert_eq!(left.len(), right.len());
+
+    let mut sum = 0.0_f32;
+    let mut lanes = [0.0_f32; 8];
+    let mut left_chunks = left.chunks_exact(8);
+    let mut right_chunks = right.chunks_exact(8);
+
+    for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
+        // SAFETY: chunks_exact(8) guarantees both loads read eight contiguous
+        // `f32` lanes in-bounds. `lanes` has room for one 256-bit store.
+        unsafe {
+            let left_vec = _mm256_loadu_ps(left_chunk.as_ptr());
+            let right_vec = _mm256_loadu_ps(right_chunk.as_ptr());
+            let product = _mm256_mul_ps(left_vec, right_vec);
+            _mm256_storeu_ps(lanes.as_mut_ptr(), product);
+        }
+        for value in lanes {
+            sum += value;
+        }
+    }
+
+    accumulate_dot_tail(left_chunks.remainder(), right_chunks.remainder(), &mut sum);
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn l2_distance_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps, _mm256_sub_ps};
+
+    debug_assert_eq!(left.len(), right.len());
+
+    let mut sum = 0.0_f32;
+    let mut lanes = [0.0_f32; 8];
+    let mut left_chunks = left.chunks_exact(8);
+    let mut right_chunks = right.chunks_exact(8);
+
+    for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
+        // SAFETY: chunks_exact(8) guarantees both loads read eight contiguous
+        // `f32` lanes in-bounds. `lanes` has room for one 256-bit store.
+        unsafe {
+            let left_vec = _mm256_loadu_ps(left_chunk.as_ptr());
+            let right_vec = _mm256_loadu_ps(right_chunk.as_ptr());
+            let delta = _mm256_sub_ps(left_vec, right_vec);
+            let squared = _mm256_mul_ps(delta, delta);
+            _mm256_storeu_ps(lanes.as_mut_ptr(), squared);
+        }
+        for value in lanes {
+            sum += value;
+        }
+    }
+
+    accumulate_l2_squared_tail(left_chunks.remainder(), right_chunks.remainder(), &mut sum);
+    sum.sqrt()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn cosine_distance_f32_avx2(left: &[f32], right: &[f32]) -> Option<f32> {
+    use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps};
+
+    debug_assert_eq!(left.len(), right.len());
+
+    let mut dot = 0.0_f32;
+    let mut left_norm = 0.0_f32;
+    let mut right_norm = 0.0_f32;
+    let mut dot_lanes = [0.0_f32; 8];
+    let mut left_norm_lanes = [0.0_f32; 8];
+    let mut right_norm_lanes = [0.0_f32; 8];
+    let mut left_chunks = left.chunks_exact(8);
+    let mut right_chunks = right.chunks_exact(8);
+
+    for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
+        // SAFETY: chunks_exact(8) guarantees both loads read eight contiguous
+        // `f32` lanes in-bounds. Each lane buffer has room for one 256-bit store.
+        unsafe {
+            let left_vec = _mm256_loadu_ps(left_chunk.as_ptr());
+            let right_vec = _mm256_loadu_ps(right_chunk.as_ptr());
+            _mm256_storeu_ps(dot_lanes.as_mut_ptr(), _mm256_mul_ps(left_vec, right_vec));
+            _mm256_storeu_ps(
+                left_norm_lanes.as_mut_ptr(),
+                _mm256_mul_ps(left_vec, left_vec),
+            );
+            _mm256_storeu_ps(
+                right_norm_lanes.as_mut_ptr(),
+                _mm256_mul_ps(right_vec, right_vec),
+            );
+        }
+        for idx in 0..8 {
+            dot += dot_lanes[idx];
+            left_norm += left_norm_lanes[idx];
+            right_norm += right_norm_lanes[idx];
+        }
+    }
+
+    accumulate_cosine_tail(
+        left_chunks.remainder(),
+        right_chunks.remainder(),
+        &mut dot,
+        &mut left_norm,
+        &mut right_norm,
+    );
+
+    finish_cosine_distance(dot, left_norm, right_norm)
+}
+
+#[inline]
+fn accumulate_dot_tail(left: &[f32], right: &[f32], sum: &mut f32) {
+    for (&left_value, &right_value) in left.iter().zip(right.iter()) {
+        *sum += left_value * right_value;
+    }
+}
+
+#[inline]
+fn accumulate_l2_squared_tail(left: &[f32], right: &[f32], sum: &mut f32) {
+    for (&left_value, &right_value) in left.iter().zip(right.iter()) {
+        let delta = left_value - right_value;
+        *sum += delta * delta;
+    }
+}
+
+#[inline]
+fn accumulate_cosine_tail(
+    left: &[f32],
+    right: &[f32],
+    dot: &mut f32,
+    left_norm: &mut f32,
+    right_norm: &mut f32,
+) {
+    for (&left_value, &right_value) in left.iter().zip(right.iter()) {
+        *dot += left_value * right_value;
+        *left_norm += left_value * left_value;
+        *right_norm += right_value * right_value;
+    }
+}
+
+#[inline]
+fn finish_cosine_distance(dot: f32, left_norm: f32, right_norm: f32) -> Option<f32> {
     if left_norm == 0.0 || right_norm == 0.0 {
         return None;
     }
@@ -203,6 +513,98 @@ mod tests {
     #[should_panic(expected = "cosine_distance_f32: vector length mismatch")]
     fn cosine_distance_f32_panics_on_dimension_mismatch() {
         let _ = cosine_distance_f32(&[1.0], &[1.0, 2.0]);
+    }
+
+    fn vectors_for_tail_len(len: usize) -> (Vec<f32>, Vec<f32>) {
+        const LEFT_PATTERN: [f32; 17] = [
+            -2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25,
+            1.5, 1.75, 2.0,
+        ];
+        const RIGHT_PATTERN: [f32; 19] = [
+            -1.125, -1.0, -0.875, -0.75, -0.625, -0.5, -0.375, -0.25, -0.125, 0.0, 0.125, 0.25,
+            0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.125,
+        ];
+        let left = (0..len)
+            .map(|idx| LEFT_PATTERN[idx % LEFT_PATTERN.len()])
+            .collect::<Vec<_>>();
+        let right = (0..len)
+            .map(|idx| RIGHT_PATTERN[(idx * 7) % RIGHT_PATTERN.len()])
+            .collect::<Vec<_>>();
+        (left, right)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_kernels_match_scalar_at_tail_boundaries() {
+        for len in 0..=35 {
+            let (left, right) = vectors_for_tail_len(len);
+
+            // SAFETY: aarch64 has baseline NEON, and helper preconditions are
+            // satisfied by same-length vectors generated above.
+            assert_eq!(
+                unsafe { dot_f32_neon(&left, &right) }.to_bits(),
+                dot_f32_scalar(&left, &right).to_bits(),
+                "dot len={len}"
+            );
+            // SAFETY: aarch64 has baseline NEON, and helper preconditions are
+            // satisfied by same-length vectors generated above.
+            assert_eq!(
+                unsafe { l2_distance_f32_neon(&left, &right) }.to_bits(),
+                l2_distance_f32_scalar(&left, &right).to_bits(),
+                "l2 len={len}"
+            );
+            match (
+                // SAFETY: aarch64 has baseline NEON, and helper preconditions
+                // are satisfied by same-length vectors generated above.
+                unsafe { cosine_distance_f32_neon(&left, &right) },
+                cosine_distance_f32_scalar(&left, &right),
+            ) {
+                (Some(got), Some(want)) => {
+                    assert_eq!(got.to_bits(), want.to_bits(), "cosine len={len}");
+                }
+                (None, None) => {}
+                (got, want) => panic!("cosine len={len}: got {got:?}, want {want:?}"),
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_kernels_match_scalar_at_tail_boundaries_when_available() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        for len in 0..=35 {
+            let (left, right) = vectors_for_tail_len(len);
+
+            // SAFETY: CPUID confirmed AVX2, and helper preconditions are
+            // satisfied by same-length vectors generated above.
+            assert_eq!(
+                unsafe { dot_f32_avx2(&left, &right) }.to_bits(),
+                dot_f32_scalar(&left, &right).to_bits(),
+                "dot len={len}"
+            );
+            // SAFETY: CPUID confirmed AVX2, and helper preconditions are
+            // satisfied by same-length vectors generated above.
+            assert_eq!(
+                unsafe { l2_distance_f32_avx2(&left, &right) }.to_bits(),
+                l2_distance_f32_scalar(&left, &right).to_bits(),
+                "l2 len={len}"
+            );
+            match (
+                // SAFETY: CPUID confirmed AVX2, and helper preconditions are
+                // satisfied by same-length vectors generated above.
+                unsafe { cosine_distance_f32_avx2(&left, &right) },
+                cosine_distance_f32_scalar(&left, &right),
+            ) {
+                (Some(got), Some(want)) => {
+                    assert_eq!(got.to_bits(), want.to_bits(), "cosine len={len}");
+                }
+                (None, None) => {}
+                (got, want) => panic!("cosine len={len}: got {got:?}, want {want:?}"),
+            }
+        }
     }
 
     proptest::proptest! {
