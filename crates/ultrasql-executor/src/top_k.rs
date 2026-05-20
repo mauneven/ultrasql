@@ -10,8 +10,9 @@
 use std::cmp::Ordering;
 
 use ultrasql_core::{Schema, Value};
-use ultrasql_planner::SortKey;
+use ultrasql_planner::{BinaryOp, ScalarExpr, SortKey};
 use ultrasql_vec::Batch;
+use ultrasql_vec::kernels::vector::{VectorMetric, exact_top_k_f32};
 
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
@@ -31,6 +32,7 @@ const BATCH_TARGET_ROWS: usize = 4096;
 pub struct TopK {
     child: Box<dyn Operator>,
     keys: Vec<CompiledKey>,
+    exact_vector_key: Option<ExactVectorTopKKey>,
     schema: Schema,
     cap: usize,
     sorted: Option<std::vec::IntoIter<Vec<Value>>>,
@@ -44,6 +46,13 @@ struct CompiledKey {
     nulls_first: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ExactVectorTopKKey {
+    column_idx: usize,
+    probe: Vec<f32>,
+    metric: VectorMetric,
+}
+
 impl TopK {
     /// Construct a top-k operator.
     ///
@@ -51,6 +60,7 @@ impl TopK {
     /// A `cap` of zero returns EOF without draining the child.
     #[must_use]
     pub fn new(child: Box<dyn Operator>, keys: Vec<SortKey>, schema: Schema, cap: usize) -> Self {
+        let exact_vector_key = match_exact_vector_top_k_key(&keys);
         let compiled = keys
             .into_iter()
             .map(|k| CompiledKey {
@@ -62,6 +72,7 @@ impl TopK {
         Self {
             child,
             keys: compiled,
+            exact_vector_key,
             schema,
             cap,
             sorted: None,
@@ -87,14 +98,13 @@ impl Operator for TopK {
                     None => break,
                     Some(batch) => {
                         let rows = batch_to_rows(&batch, &self.schema)?;
-                        for row in rows {
-                            let key_vals: Vec<Value> = self
-                                .keys
-                                .iter()
-                                .map(|k| k.eval.eval(&row).unwrap_or(Value::Null))
-                                .collect();
-                            keep_if_top_k(&mut kept, row, key_vals, &self.keys, self.cap);
-                        }
+                        drain_top_k_batch(
+                            &mut kept,
+                            rows,
+                            &self.keys,
+                            self.exact_vector_key.as_ref(),
+                            self.cap,
+                        );
                     }
                 }
             }
@@ -121,6 +131,58 @@ impl Operator for TopK {
     fn estimated_row_count(&self) -> Option<usize> {
         Some(self.cap)
     }
+}
+
+fn drain_top_k_batch(
+    kept: &mut Vec<(Vec<Value>, Vec<Value>)>,
+    rows: Vec<Vec<Value>>,
+    keys: &[CompiledKey],
+    exact_vector_key: Option<&ExactVectorTopKKey>,
+    cap: usize,
+) {
+    if let Some(exact) = exact_vector_key
+        && drain_exact_vector_top_k_batch(kept, &rows, keys, exact, cap)
+    {
+        return;
+    }
+    drain_generic_top_k_batch(kept, rows, keys, cap);
+}
+
+fn drain_generic_top_k_batch(
+    kept: &mut Vec<(Vec<Value>, Vec<Value>)>,
+    rows: Vec<Vec<Value>>,
+    keys: &[CompiledKey],
+    cap: usize,
+) {
+    for row in rows {
+        let key_vals: Vec<Value> = keys
+            .iter()
+            .map(|k| k.eval.eval(&row).unwrap_or(Value::Null))
+            .collect();
+        keep_if_top_k(kept, row, key_vals, keys, cap);
+    }
+}
+
+fn drain_exact_vector_top_k_batch(
+    kept: &mut Vec<(Vec<Value>, Vec<Value>)>,
+    rows: &[Vec<Value>],
+    keys: &[CompiledKey],
+    exact: &ExactVectorTopKKey,
+    cap: usize,
+) -> bool {
+    let mut vectors: Vec<&[f32]> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(Value::Vector(vector)) = row.get(exact.column_idx) else {
+            return false;
+        };
+        vectors.push(vector);
+    }
+    for hit in exact_top_k_f32(&vectors, &exact.probe, exact.metric, cap) {
+        let row = rows[hit.row].clone();
+        let key_vals = vec![Value::Float64(f64::from(hit.distance))];
+        keep_if_top_k(kept, row, key_vals, keys, cap);
+    }
+    true
 }
 
 fn keep_if_top_k(
@@ -164,4 +226,124 @@ fn compare_key_vecs(ak: &[Value], bk: &[Value], keys: &[CompiledKey]) -> Orderin
         }
     }
     Ordering::Equal
+}
+
+fn match_exact_vector_top_k_key(keys: &[SortKey]) -> Option<ExactVectorTopKKey> {
+    let [key] = keys else {
+        return None;
+    };
+    if !key.asc || key.nulls_first {
+        return None;
+    }
+    let ScalarExpr::Binary {
+        op, left, right, ..
+    } = &key.expr
+    else {
+        return None;
+    };
+    let metric = vector_metric_for_op(*op)?;
+    vector_column_probe(left, right, metric).or_else(|| vector_column_probe(right, left, metric))
+}
+
+fn vector_metric_for_op(op: BinaryOp) -> Option<VectorMetric> {
+    match op {
+        BinaryOp::VectorL2Distance => Some(VectorMetric::L2),
+        BinaryOp::VectorCosineDistance => Some(VectorMetric::Cosine),
+        BinaryOp::VectorNegativeInnerProduct => Some(VectorMetric::NegativeInnerProduct),
+        BinaryOp::VectorL1Distance => Some(VectorMetric::L1),
+        _ => None,
+    }
+}
+
+fn vector_column_probe(
+    column: &ScalarExpr,
+    probe: &ScalarExpr,
+    metric: VectorMetric,
+) -> Option<ExactVectorTopKKey> {
+    let ScalarExpr::Column {
+        index,
+        data_type: ultrasql_core::DataType::Vector { .. },
+        ..
+    } = column
+    else {
+        return None;
+    };
+    let ScalarExpr::Literal {
+        value: Value::Vector(values),
+        ..
+    } = probe
+    else {
+        return None;
+    };
+    Some(ExactVectorTopKKey {
+        column_idx: *index,
+        probe: values.clone(),
+        metric,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use ultrasql_core::{DataType, Value};
+    use ultrasql_planner::{BinaryOp, ScalarExpr, SortKey};
+    use ultrasql_vec::kernels::vector::VectorMetric;
+
+    use super::match_exact_vector_top_k_key;
+
+    #[test]
+    fn exact_vector_top_k_key_matches_single_ascending_distance_key() {
+        let key = SortKey {
+            expr: ScalarExpr::Binary {
+                op: BinaryOp::VectorL2Distance,
+                left: Box::new(ScalarExpr::Column {
+                    name: "embedding".to_owned(),
+                    index: 2,
+                    data_type: DataType::Vector { dims: Some(3) },
+                }),
+                right: Box::new(ScalarExpr::Literal {
+                    value: Value::Vector(vec![1.0, 2.0, 3.0]),
+                    data_type: DataType::Vector { dims: Some(3) },
+                }),
+                data_type: DataType::Float64,
+            },
+            asc: true,
+            nulls_first: false,
+        };
+
+        let matched = match_exact_vector_top_k_key(&[key]).expect("fast path should match");
+        assert_eq!(matched.column_idx, 2);
+        assert_eq!(matched.probe, vec![1.0, 2.0, 3.0]);
+        assert_eq!(matched.metric, VectorMetric::L2);
+    }
+
+    #[test]
+    fn exact_vector_top_k_key_declines_descending_or_nullable_shape() {
+        let expr = ScalarExpr::Binary {
+            op: BinaryOp::VectorCosineDistance,
+            left: Box::new(ScalarExpr::Column {
+                name: "embedding".to_owned(),
+                index: 1,
+                data_type: DataType::Vector { dims: Some(2) },
+            }),
+            right: Box::new(ScalarExpr::Literal {
+                value: Value::Vector(vec![1.0, 0.0]),
+                data_type: DataType::Vector { dims: Some(2) },
+            }),
+            data_type: DataType::Float64,
+        };
+
+        let desc = SortKey {
+            expr: expr.clone(),
+            asc: false,
+            nulls_first: false,
+        };
+        let nulls_first = SortKey {
+            expr,
+            asc: true,
+            nulls_first: true,
+        };
+
+        assert!(match_exact_vector_top_k_key(&[desc]).is_none());
+        assert!(match_exact_vector_top_k_key(&[nulls_first]).is_none());
+    }
 }

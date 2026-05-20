@@ -1175,43 +1175,20 @@ fn dense_vector_distance(
         ));
     }
     let result = match op {
-        VectorDistanceOp::L2 => left
-            .iter()
-            .zip(right.iter())
-            .map(|(l, r)| {
-                let delta = f64::from(*l) - f64::from(*r);
-                delta * delta
-            })
-            .sum::<f64>()
-            .sqrt(),
-        VectorDistanceOp::InnerProduct => left
-            .iter()
-            .zip(right.iter())
-            .map(|(l, r)| f64::from(*l) * f64::from(*r))
-            .sum::<f64>(),
-        VectorDistanceOp::NegativeInnerProduct => -left
-            .iter()
-            .zip(right.iter())
-            .map(|(l, r)| f64::from(*l) * f64::from(*r))
-            .sum::<f64>(),
-        VectorDistanceOp::Cosine => {
-            let mut dot = 0.0_f64;
-            let mut left_norm = 0.0_f64;
-            let mut right_norm = 0.0_f64;
-            for (l, r) in left.iter().zip(right.iter()) {
-                let left = f64::from(*l);
-                let right = f64::from(*r);
-                dot += left * right;
-                left_norm += left * left;
-                right_norm += right * right;
-            }
-            if left_norm == 0.0 || right_norm == 0.0 {
-                return Err(EvalError::Type(
-                    "cosine distance requires non-zero vectors".to_owned(),
-                ));
-            }
-            1.0 - (dot / (left_norm.sqrt() * right_norm.sqrt()))
+        VectorDistanceOp::L2 => {
+            f64::from(ultrasql_vec::kernels::vector::l2_distance_f32(left, right))
         }
+        VectorDistanceOp::InnerProduct => {
+            f64::from(ultrasql_vec::kernels::vector::dot_f32(left, right))
+        }
+        VectorDistanceOp::NegativeInnerProduct => {
+            -f64::from(ultrasql_vec::kernels::vector::dot_f32(left, right))
+        }
+        VectorDistanceOp::Cosine => f64::from(
+            ultrasql_vec::kernels::vector::cosine_distance_f32(left, right).ok_or_else(|| {
+                EvalError::Type("cosine distance requires non-zero vectors".to_owned())
+            })?,
+        ),
         VectorDistanceOp::L1 => left
             .iter()
             .zip(right.iter())

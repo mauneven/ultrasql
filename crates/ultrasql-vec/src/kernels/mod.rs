@@ -56,8 +56,8 @@ pub use text::{
     len_text, len_text_scalar, lower_text, lower_text_scalar, upper_text, upper_text_scalar,
 };
 pub use vector::{
-    cosine_distance_f32, cosine_distance_f32_scalar, dot_f32, dot_f32_scalar, l2_distance_f32,
-    l2_distance_f32_scalar,
+    VectorMetric, VectorTopKHit, cosine_distance_f32, cosine_distance_f32_scalar, dot_f32,
+    dot_f32_scalar, exact_top_k_f32, exact_top_k_f32_flat, l2_distance_f32, l2_distance_f32_scalar,
 };
 
 use crate::bitmap::Bitmap;

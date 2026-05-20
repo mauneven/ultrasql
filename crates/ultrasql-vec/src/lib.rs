@@ -3,7 +3,7 @@
 //! Column-oriented in-memory format with explicit null bitmaps,
 //! length-prefixed varbinary buffers, and aligned numeric storage.
 //! Kernels are auto-vectorized; selected hot paths have hand-written
-//! NEON intrinsics for ARM64 and AVX2 intrinsics for `x86_64`.
+//! NEON intrinsics for ARM64 and AVX2/AVX-512 intrinsics for `x86_64`.
 //!
 //! Crate layout
 //! ------------
@@ -17,7 +17,7 @@
 //!   length. The batch is the input and output unit of every
 //!   vectorized operator.
 //! - [`kernels`] — `filter`, `compare`, `arithmetic`, `aggregate`,
-//!   plus a scaffold for SIMD specializations.
+//!   vector metrics, and exact dense-vector top-k scans.
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(
@@ -51,6 +51,10 @@ pub use kernels::{
     max_i64, min_f64, min_i64, range_mask_i64, select_i32, sum_i64, sum_i64_with_mask,
 };
 pub use kernels::{
+    VectorMetric, VectorTopKHit, cosine_distance_f32, cosine_distance_f32_scalar, dot_f32,
+    dot_f32_scalar, exact_top_k_f32, exact_top_k_f32_flat, l2_distance_f32, l2_distance_f32_scalar,
+};
+pub use kernels::{
     add_f32, add_f32_scalar, add_f32_scalar_lit, add_f32_scalar_lit_scalar, add_f64,
     add_f64_scalar, add_f64_scalar_lit, add_f64_scalar_lit_scalar, add_i32, add_i32_scalar,
     add_i32_scalar_lit, add_i32_scalar_lit_scalar, add_i64, add_i64_scalar, add_i64_scalar_lit,
@@ -68,10 +72,6 @@ pub use kernels::{
     sub_f64_scalar_lit_scalar, sub_i32, sub_i32_scalar, sub_i32_scalar_lit,
     sub_i32_scalar_lit_scalar, sub_i64, sub_i64_scalar, sub_i64_scalar_lit,
     sub_i64_scalar_lit_scalar,
-};
-pub use kernels::{
-    cosine_distance_f32, cosine_distance_f32_scalar, dot_f32, dot_f32_scalar, l2_distance_f32,
-    l2_distance_f32_scalar,
 };
 pub use kernels::{
     filter_eq_f64, filter_eq_f64_scalar, filter_eq_i32, filter_eq_i32_scalar, filter_eq_i64,
