@@ -31,7 +31,7 @@ use std::sync::Arc;
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Value, Xid};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::access_method::{AccessMethod, BrinIndex};
+use ultrasql_storage::access_method::{AccessMethod, BrinIndex, HnswIndex};
 use ultrasql_storage::btree::{BTree, BTreeError};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions, UpdatePayload};
 use ultrasql_storage::sequence::Sequence;
@@ -88,6 +88,14 @@ struct UpdateFastPathInt32Pair {
 /// `i64` B-tree key for that index, or `None` when the key is SQL NULL
 /// and should be omitted from the index.
 pub type InsertIndexEncoder = Arc<dyn Fn(&[Value]) -> Result<Option<i64>, ExecError> + Send + Sync>;
+
+/// Shared callback type used by vector-index maintenance.
+///
+/// The callback receives the decoded target-table row and returns the dense
+/// `f32` vector for that index, or `None` when the key is SQL NULL and should
+/// be omitted from the graph.
+pub type VectorIndexEncoder =
+    Arc<dyn Fn(&[Value]) -> Result<Option<Vec<f32>>, ExecError> + Send + Sync>;
 
 /// Row-level DML constraint callback.
 pub type RowConstraintCheck = Arc<dyn Fn(&[Value]) -> Result<(), ExecError> + Send + Sync>;
@@ -212,10 +220,67 @@ impl<L: PageLoader> InsertIndexMaintainer<L> {
     }
 }
 
+/// Runtime descriptor for maintaining one HNSW vector index during DML.
+pub struct VectorIndexMaintainer {
+    name: String,
+    index_rel: RelationId,
+    hnsw: Arc<HnswIndex>,
+    encode: VectorIndexEncoder,
+    xid: Xid,
+    wal: Option<Arc<dyn WalSink>>,
+}
+
+impl std::fmt::Debug for VectorIndexMaintainer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorIndexMaintainer")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VectorIndexMaintainer {
+    /// Construct a maintainer for one runtime HNSW graph.
+    #[must_use]
+    pub fn new<N: Into<String>>(
+        name: N,
+        index_rel: RelationId,
+        hnsw: Arc<HnswIndex>,
+        encode: VectorIndexEncoder,
+        xid: Xid,
+        wal: Option<Arc<dyn WalSink>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            index_rel,
+            hnsw,
+            encode,
+            xid,
+            wal,
+        }
+    }
+
+    fn encode_key(&self, row: &[Value]) -> Result<Option<Vec<f32>>, ExecError> {
+        (self.encode)(row)
+    }
+
+    fn insert_vector(&self, vector: &[f32], tid: TupleId) -> Result<(), ExecError> {
+        self.hnsw
+            .insert_vector_logged(self.index_rel, vector, tid, self.xid, self.wal.as_deref())
+            .map_err(|e| ExecError::TypeMismatch(format!("hnsw insert {}: {e}", self.name)))
+    }
+
+    fn delete_tid(&self, tid: TupleId) -> Result<(), ExecError> {
+        self.hnsw
+            .mark_deleted_logged(self.index_rel, tid, self.xid, self.wal.as_deref())
+            .map_err(|e| ExecError::TypeMismatch(format!("hnsw delete {}: {e}", self.name)))
+    }
+}
+
 struct ComputedUpdate {
     tid: TupleId,
     payload: UpdatePayload,
     index_change: Option<UpdateIndexChange>,
+    vector_index_change: Option<VectorUpdateIndexChange>,
     returning_row: Option<Vec<Value>>,
 }
 
@@ -230,7 +295,23 @@ struct DeleteIndexChange {
     keys: Vec<Option<i64>>,
 }
 
-type DeleteExtraction = (Vec<TupleId>, Vec<DeleteIndexChange>, Vec<Vec<Value>>);
+struct VectorUpdateIndexChange {
+    old_tid: TupleId,
+    old_keys: Vec<Option<Vec<f32>>>,
+    new_keys: Vec<Option<Vec<f32>>>,
+}
+
+struct VectorDeleteIndexChange {
+    tid: TupleId,
+    keys: Vec<Option<Vec<f32>>>,
+}
+
+type DeleteExtraction = (
+    Vec<TupleId>,
+    Vec<DeleteIndexChange>,
+    Vec<VectorDeleteIndexChange>,
+    Vec<Vec<Value>>,
+);
 
 #[derive(Clone, Debug)]
 struct CheckEvaluator {
@@ -400,6 +481,9 @@ pub struct ModifyTable<L: PageLoader> {
     insert_indexes: Vec<InsertIndexMaintainer<L>>,
     update_indexes: Vec<InsertIndexMaintainer<L>>,
     delete_indexes: Vec<InsertIndexMaintainer<L>>,
+    insert_vector_indexes: Vec<VectorIndexMaintainer>,
+    update_vector_indexes: Vec<VectorIndexMaintainer>,
+    delete_vector_indexes: Vec<VectorIndexMaintainer>,
     insert_conflict_action: Option<InsertConflictAction>,
     insert_column_map: Option<Vec<usize>>,
     column_defaults: Vec<Option<Eval>>,
@@ -501,6 +585,9 @@ impl<L: PageLoader> ModifyTable<L> {
             insert_indexes: Vec::new(),
             update_indexes: Vec::new(),
             delete_indexes: Vec::new(),
+            insert_vector_indexes: Vec::new(),
+            update_vector_indexes: Vec::new(),
+            delete_vector_indexes: Vec::new(),
             insert_conflict_action: None,
             insert_column_map: None,
             column_defaults: Vec::new(),
@@ -550,6 +637,27 @@ impl<L: PageLoader> ModifyTable<L> {
     #[must_use]
     pub fn with_delete_indexes(mut self, indexes: Vec<InsertIndexMaintainer<L>>) -> Self {
         self.delete_indexes = indexes;
+        self
+    }
+
+    /// Attach HNSW vector-index maintainers used by the INSERT arm.
+    #[must_use]
+    pub fn with_insert_vector_indexes(mut self, indexes: Vec<VectorIndexMaintainer>) -> Self {
+        self.insert_vector_indexes = indexes;
+        self
+    }
+
+    /// Attach HNSW vector-index maintainers used by the UPDATE arm.
+    #[must_use]
+    pub fn with_update_vector_indexes(mut self, indexes: Vec<VectorIndexMaintainer>) -> Self {
+        self.update_vector_indexes = indexes;
+        self
+    }
+
+    /// Attach HNSW vector-index maintainers used by the DELETE arm.
+    #[must_use]
+    pub fn with_delete_vector_indexes(mut self, indexes: Vec<VectorIndexMaintainer>) -> Self {
+        self.delete_vector_indexes = indexes;
         self
     }
 
@@ -795,6 +903,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
         // per-row cost identical.
         let mut all_update_edits: Vec<(TupleId, UpdatePayload)> = Vec::new();
         let mut all_update_index_changes: Vec<UpdateIndexChange> = Vec::new();
+        let mut all_update_vector_index_changes: Vec<VectorUpdateIndexChange> = Vec::new();
         let mut returning_rows: Vec<Vec<Value>> = Vec::new();
         let returning_active = !self.returning_evaluators.is_empty();
 
@@ -816,18 +925,21 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     // `heap.delete_many`. No `batch_to_rows`
                     // materialisation, no per-row `Vec<Value>`
                     // intermediate.
-                    let (tids, delete_index_changes, deleted_rows) = if !returning_active
-                        && self.delete_indexes.is_empty()
-                        && self.referenced_by_delete_checks.is_empty()
-                    {
-                        (
-                            extract_tids_from_batch(&batch, self.relation)?,
-                            Vec::new(),
-                            Vec::new(),
-                        )
-                    } else {
-                        self.extract_delete_tids_and_index_changes(&batch, returning_active)?
-                    };
+                    let (tids, delete_index_changes, delete_vector_index_changes, deleted_rows) =
+                        if !returning_active
+                            && self.delete_indexes.is_empty()
+                            && self.delete_vector_indexes.is_empty()
+                            && self.referenced_by_delete_checks.is_empty()
+                        {
+                            (
+                                extract_tids_from_batch(&batch, self.relation)?,
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                            )
+                        } else {
+                            self.extract_delete_tids_and_index_changes(&batch, returning_active)?
+                        };
                     let n = tids.len();
                     let wal_ref: Option<&dyn WalSink> = self.wal.as_deref();
                     self.heap
@@ -843,6 +955,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         )
                         .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
                     self.apply_delete_index_changes(&delete_index_changes)?;
+                    self.apply_delete_vector_index_changes(&delete_vector_index_changes)?;
                     if returning_active {
                         for row in deleted_rows {
                             returning_rows.push(self.evaluate_returning_row(&row)?);
@@ -863,6 +976,8 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             && self.foreign_key_checks.is_empty()
                             && self.exclusion_update_checks.is_empty()
                             && self.referenced_by_update_checks.is_empty()
+                            && self.update_indexes.is_empty()
+                            && self.update_vector_indexes.is_empty()
                     }) {
                         build_update_edits_int32_pair(&batch, self.relation, spec)?
                     } else {
@@ -878,6 +993,9 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             let computed = self.compute_update_edit(row, returning_active)?;
                             if let Some(index_change) = computed.index_change {
                                 all_update_index_changes.push(index_change);
+                            }
+                            if let Some(index_change) = computed.vector_index_change {
+                                all_update_vector_index_changes.push(index_change);
                             }
                             if let Some(returning_row) = computed.returning_row {
                                 returning_rows.push(self.evaluate_returning_row(&returning_row)?);
@@ -908,6 +1026,11 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     let mut payloads: Vec<Vec<u8>> = Vec::with_capacity(rows.len());
                     let mut index_keys: Vec<Vec<Option<i64>>> = self
                         .insert_indexes
+                        .iter()
+                        .map(|_| Vec::with_capacity(rows.len()))
+                        .collect();
+                    let mut vector_index_keys: Vec<Vec<Option<Vec<f32>>>> = self
+                        .insert_vector_indexes
                         .iter()
                         .map(|_| Vec::with_capacity(rows.len()))
                         .collect();
@@ -1006,6 +1129,10 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                                             if let Some(index_change) = computed.index_change {
                                                 all_update_index_changes.push(index_change);
                                             }
+                                            if let Some(index_change) = computed.vector_index_change
+                                            {
+                                                all_update_vector_index_changes.push(index_change);
+                                            }
                                             if let Some(returning_row) = computed.returning_row {
                                                 returning_rows.push(
                                                     self.evaluate_returning_row(&returning_row)?,
@@ -1028,6 +1155,19 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                                 ));
                             }
                             index_keys[idx].push(key);
+                        }
+                        let row_vector_index_keys = self
+                            .insert_vector_indexes
+                            .iter()
+                            .map(|index| index.encode_key(target_row))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        for (idx, key) in row_vector_index_keys.into_iter().enumerate() {
+                            if idx >= vector_index_keys.len() {
+                                return Err(ExecError::Internal(
+                                    "insert vector index key vector width mismatch",
+                                ));
+                            }
+                            vector_index_keys[idx].push(key);
                         }
                         let payload = self
                             .codec
@@ -1068,6 +1208,18 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                             }
                         }
                     }
+                    for (idx, index) in self.insert_vector_indexes.iter().enumerate() {
+                        for (row_idx, key) in vector_index_keys[idx].iter().enumerate() {
+                            if let Some(vector) = key {
+                                let Some(tid) = tids.get(row_idx).copied() else {
+                                    return Err(ExecError::Internal(
+                                        "heap insert_batch returned fewer TIDs than payloads",
+                                    ));
+                                };
+                                index.insert_vector(vector, tid)?;
+                            }
+                        }
+                    }
                     if returning_active {
                         for row in inserted_rows {
                             returning_rows.push(self.evaluate_returning_row(&row)?);
@@ -1092,7 +1244,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                 wal: wal_ref,
                 vm: self.vm.as_deref(),
             };
-            if self.update_indexes.is_empty() {
+            if self.update_indexes.is_empty() && self.update_vector_indexes.is_empty() {
                 self.heap
                     .update_many(all_update_edits, update_opts)
                     .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
@@ -1103,6 +1255,10 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                     .update_many_with_outcomes(all_update_edits, update_opts)
                     .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
                 self.apply_update_index_changes(&all_update_index_changes, &outcomes, wal_ref)?;
+                self.apply_update_vector_index_changes(
+                    &all_update_vector_index_changes,
+                    &outcomes,
+                )?;
             }
             let n_u64 = u64::try_from(n).unwrap_or(u64::MAX);
             self.affected = self.affected.saturating_add(n_u64);
@@ -1194,6 +1350,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             )));
         }
         let old_keys = self.encode_update_index_keys(orig_row)?;
+        let old_vector_keys = self.encode_update_vector_index_keys(orig_row)?;
 
         for (col_idx, evaluator) in &self.update_evaluators {
             if self
@@ -1222,6 +1379,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         self.check_exclusion_update(orig_row, &new_row)?;
         self.check_referenced_by_update(orig_row, &new_row)?;
         let new_keys = self.encode_update_index_keys(&new_row)?;
+        let new_vector_keys = self.encode_update_vector_index_keys(&new_row)?;
 
         let new_payload = self
             .codec
@@ -1240,10 +1398,20 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                 new_keys,
             })
         };
+        let vector_index_change = if self.update_vector_indexes.is_empty() {
+            None
+        } else {
+            Some(VectorUpdateIndexChange {
+                old_tid: tid,
+                old_keys: old_vector_keys,
+                new_keys: new_vector_keys,
+            })
+        };
         Ok(ComputedUpdate {
             tid,
             payload,
             index_change,
+            vector_index_change,
             returning_row: capture_returning_row.then_some(new_row),
         })
     }
@@ -1286,6 +1454,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             )));
         }
         let old_keys = self.encode_update_index_keys(orig_row)?;
+        let old_vector_keys = self.encode_update_vector_index_keys(orig_row)?;
 
         for (col_idx, evaluator) in assignments {
             if self
@@ -1313,6 +1482,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
         self.check_exclusion_update(orig_row, &new_row)?;
         self.check_referenced_by_update(orig_row, &new_row)?;
         let new_keys = self.encode_update_index_keys(&new_row)?;
+        let new_vector_keys = self.encode_update_vector_index_keys(&new_row)?;
 
         let new_payload = self
             .codec
@@ -1328,10 +1498,20 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                 new_keys,
             })
         };
+        let vector_index_change = if self.update_vector_indexes.is_empty() {
+            None
+        } else {
+            Some(VectorUpdateIndexChange {
+                old_tid: tid,
+                old_keys: old_vector_keys,
+                new_keys: new_vector_keys,
+            })
+        };
         Ok(Some(ComputedUpdate {
             tid,
             payload,
             index_change,
+            vector_index_change,
             returning_row: capture_returning_row.then_some(new_row),
         }))
     }
@@ -1548,6 +1728,16 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             .collect()
     }
 
+    fn encode_update_vector_index_keys(
+        &self,
+        row: &[Value],
+    ) -> Result<Vec<Option<Vec<f32>>>, ExecError> {
+        self.update_vector_indexes
+            .iter()
+            .map(|index| index.encode_key(row))
+            .collect()
+    }
+
     fn validate_insert_conflict_arbiter(
         &self,
         action: Option<&InsertConflictAction>,
@@ -1712,6 +1902,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
             .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
         let mut tids: Vec<TupleId> = Vec::with_capacity(rows.len());
         let mut changes: Vec<DeleteIndexChange> = Vec::with_capacity(rows.len());
+        let mut vector_changes: Vec<VectorDeleteIndexChange> = Vec::with_capacity(rows.len());
         let mut deleted_rows: Vec<Vec<Value>> = if capture_deleted_rows {
             Vec::with_capacity(rows.len())
         } else {
@@ -1725,13 +1916,22 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                 .iter()
                 .map(|index| index.encode_key(orig_row))
                 .collect::<Result<Vec<_>, _>>()?;
+            let vector_keys = self
+                .delete_vector_indexes
+                .iter()
+                .map(|index| index.encode_key(orig_row))
+                .collect::<Result<Vec<_>, _>>()?;
             tids.push(tid);
             changes.push(DeleteIndexChange { tid, keys });
+            vector_changes.push(VectorDeleteIndexChange {
+                tid,
+                keys: vector_keys,
+            });
             if capture_deleted_rows {
                 deleted_rows.push(orig_row.to_vec());
             }
         }
-        Ok((tids, changes, deleted_rows))
+        Ok((tids, changes, vector_changes, deleted_rows))
     }
 
     fn apply_delete_index_changes(
@@ -1749,6 +1949,47 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> ModifyTable<L> {
                         self.delete_xmax,
                         wal_ref,
                     )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_delete_vector_index_changes(
+        &self,
+        changes: &[VectorDeleteIndexChange],
+    ) -> Result<(), ExecError> {
+        for change in changes {
+            for idx in 0..self.delete_vector_indexes.len() {
+                if change.keys[idx].is_some() {
+                    self.delete_vector_indexes[idx].delete_tid(change.tid)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_update_vector_index_changes(
+        &self,
+        changes: &[VectorUpdateIndexChange],
+        outcomes: &[ultrasql_storage::heap::UpdateOutcome],
+    ) -> Result<(), ExecError> {
+        let new_tid_by_old: std::collections::HashMap<TupleId, TupleId> = outcomes
+            .iter()
+            .map(|outcome| (outcome.old_tid, outcome.new_tid))
+            .collect();
+        for change in changes {
+            let Some(new_tid) = new_tid_by_old.get(&change.old_tid).copied() else {
+                return Err(ExecError::Internal(
+                    "heap update_many_with_outcomes omitted an updated TID",
+                ));
+            };
+            for idx in 0..self.update_vector_indexes.len() {
+                if change.old_keys[idx].is_some() {
+                    self.update_vector_indexes[idx].delete_tid(change.old_tid)?;
+                }
+                if let Some(vector) = &change.new_keys[idx] {
+                    self.update_vector_indexes[idx].insert_vector(vector, new_tid)?;
                 }
             }
         }

@@ -127,6 +127,7 @@ pub use merge_join::MergeJoin;
 pub use modify::{
     InsertConflictAction, InsertIndexEncoder, InsertIndexMaintainer, ModifyKind, ModifyTable,
     RowConstraintCheck, RowUpdateConstraintCheck, SequenceDefault, SequenceNextvalObserver,
+    VectorIndexEncoder, VectorIndexMaintainer,
 };
 pub use nested_loop_join::{NestedLoopJoin, RightFactory};
 pub use parallel_seq_scan::{ParallelSeqScan, choose_parallel_seq_scan_workers};

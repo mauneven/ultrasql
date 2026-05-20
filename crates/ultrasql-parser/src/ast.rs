@@ -690,6 +690,8 @@ pub struct CreateIndexStmt {
 pub struct IndexColumn {
     /// Key expression (commonly a bare column reference).
     pub expr: Expr,
+    /// Optional operator class name (`vector_l2_ops`, `text_pattern_ops`, …).
+    pub opclass: Option<Identifier>,
     /// Sort direction.
     pub direction: SortDirection,
     /// Null ordering.

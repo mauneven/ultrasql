@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use ultrasql_core::{BlockNumber, MAX_VECTOR_DIMS, PageId, RelationId, TupleId, Xid};
 use ultrasql_wal::WalRecord;
-use ultrasql_wal::payload::{HashOpKind, HashOpPayload};
+use ultrasql_wal::payload::{HashOpKind, HashOpPayload, HnswOpKind, HnswOpPayload};
 use ultrasql_wal::record::RecordType;
 
 use crate::wal_sink::WalSink;
@@ -917,6 +917,8 @@ pub enum HnswMetric {
     Cosine,
     /// Negative inner product, matching pgvector's `<#>` ordering.
     NegativeInnerProduct,
+    /// Manhattan distance, matching pgvector's `<+>` operator.
+    L1,
 }
 
 impl HnswMetric {
@@ -926,6 +928,11 @@ impl HnswMetric {
             Self::Cosine => ultrasql_vec::kernels::vector::cosine_distance_f32(left, right)
                 .unwrap_or(f32::INFINITY),
             Self::NegativeInnerProduct => -ultrasql_vec::kernels::vector::dot_f32(left, right),
+            Self::L1 => left
+                .iter()
+                .zip(right)
+                .map(|(l, r)| (l - r).abs())
+                .sum::<f32>(),
         }
     }
 }
@@ -1029,6 +1036,28 @@ impl HnswIndex {
         self.storage.lock().available
     }
 
+    /// Return number of live, non-tombstoned nodes in the graph.
+    #[must_use]
+    pub fn live_len(&self) -> usize {
+        self.storage
+            .lock()
+            .entries
+            .iter()
+            .filter(|entry| !entry.deleted)
+            .count()
+    }
+
+    /// Return number of tombstoned nodes awaiting VACUUM compaction.
+    #[must_use]
+    pub fn tombstone_count(&self) -> usize {
+        self.storage
+            .lock()
+            .entries
+            .iter()
+            .filter(|entry| entry.deleted)
+            .count()
+    }
+
     /// Estimate heap memory currently owned by this runtime graph.
     ///
     /// The value includes the index object, storage vectors, vector payload
@@ -1090,6 +1119,20 @@ impl HnswIndex {
             self.trim_neighbors(&mut storage, neighbor);
         }
         Ok(())
+    }
+
+    /// Insert one finite vector and emit an HNSW WAL mutation record when set.
+    pub fn insert_vector_logged(
+        &self,
+        index_rel: RelationId,
+        vector: &[f32],
+        tid: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        self.validate_vector(vector)?;
+        self.emit_hnsw_wal(HnswOpKind::Insert, index_rel, tid, vector, xid, wal)?;
+        self.insert_vector(vector, tid)
     }
 
     /// Search for the nearest `k` tuple IDs.
@@ -1197,15 +1240,65 @@ impl HnswIndex {
     /// Mark an indexed tuple ID deleted.
     pub fn mark_deleted(&self, tid: TupleId) -> Result<(), AccessMethodError> {
         let mut storage = self.storage.lock();
-        if let Some(entry) = storage
+        if let Some(pos) = storage
             .entries
-            .iter_mut()
-            .find(|entry| entry.tid == tid && !entry.deleted)
+            .iter()
+            .position(|entry| entry.tid == tid && !entry.deleted)
         {
-            entry.deleted = true;
+            storage.entries[pos].deleted = true;
+            if storage.entry_node == Some(pos) {
+                storage.entry_node = storage.entries.iter().position(|entry| !entry.deleted);
+            }
             return Ok(());
         }
         Err(AccessMethodError::NotFound)
+    }
+
+    /// Mark an indexed tuple ID deleted and emit an HNSW WAL mutation record.
+    pub fn mark_deleted_logged(
+        &self,
+        index_rel: RelationId,
+        tid: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        let mut storage = self.storage.lock();
+        if let Some(pos) = storage
+            .entries
+            .iter()
+            .position(|entry| entry.tid == tid && !entry.deleted)
+        {
+            self.emit_hnsw_wal(HnswOpKind::Delete, index_rel, tid, &[], xid, wal)?;
+            storage.entries[pos].deleted = true;
+            if storage.entry_node == Some(pos) {
+                storage.entry_node = storage.entries.iter().position(|entry| !entry.deleted);
+            }
+            return Ok(());
+        }
+        Err(AccessMethodError::NotFound)
+    }
+
+    /// Compact tombstoned nodes out of the graph, preserving live reachability.
+    pub fn compact_deleted(&self) -> Result<usize, AccessMethodError> {
+        let mut storage = self.storage.lock();
+        Ok(self.compact_deleted_locked(&mut storage))
+    }
+
+    /// Compact tombstoned nodes and emit an HNSW WAL mutation record when set.
+    pub fn compact_deleted_logged(
+        &self,
+        index_rel: RelationId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<usize, AccessMethodError> {
+        let mut storage = self.storage.lock();
+        let removed = storage.entries.iter().filter(|entry| entry.deleted).count();
+        if removed == 0 {
+            return Ok(0);
+        }
+        let tid = TupleId::new(PageId::new(index_rel, BlockNumber::new(0)), 0);
+        self.emit_hnsw_wal(HnswOpKind::Compact, index_rel, tid, &[], xid, wal)?;
+        Ok(self.compact_deleted_locked(&mut storage))
     }
 
     fn validate_vector(&self, vector: &[f32]) -> Result<(), AccessMethodError> {
@@ -1222,6 +1315,82 @@ impl HnswIndex {
             ));
         }
         Ok(())
+    }
+
+    fn compact_deleted_locked(&self, storage: &mut HnswStorage) -> usize {
+        let before = storage.entries.len();
+        if before == 0 {
+            return 0;
+        }
+        let mut remap = vec![None; before];
+        let mut entries = Vec::with_capacity(before);
+        for (old_idx, entry) in storage.entries.iter().enumerate() {
+            if entry.deleted {
+                continue;
+            }
+            remap[old_idx] = Some(entries.len());
+            entries.push(HnswEntry {
+                vector: entry.vector.clone(),
+                tid: entry.tid,
+                neighbors: Vec::new(),
+                deleted: false,
+            });
+        }
+        let removed = before.saturating_sub(entries.len());
+        if removed == 0 {
+            return 0;
+        }
+        for (old_idx, old_entry) in storage.entries.iter().enumerate() {
+            let Some(new_idx) = remap[old_idx] else {
+                continue;
+            };
+            let mut neighbors: Vec<usize> = old_entry
+                .neighbors
+                .iter()
+                .filter_map(|old_neighbor| remap.get(*old_neighbor).and_then(|idx| *idx))
+                .filter(|neighbor| *neighbor != new_idx)
+                .collect();
+            neighbors.sort_unstable();
+            neighbors.dedup();
+            entries[new_idx].neighbors = neighbors;
+        }
+        storage.entry_node = storage
+            .entry_node
+            .and_then(|idx| remap.get(idx).and_then(|new_idx| *new_idx))
+            .or_else(|| (!entries.is_empty()).then_some(0));
+        storage.entries = entries;
+        storage.available = !storage.entries.is_empty();
+        for idx in 0..storage.entries.len() {
+            self.trim_neighbors(storage, idx);
+        }
+        removed
+    }
+
+    fn emit_hnsw_wal(
+        &self,
+        op: HnswOpKind,
+        index_rel: RelationId,
+        tid: TupleId,
+        vector: &[f32],
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        let Some(sink) = wal else {
+            return Ok(());
+        };
+        let payload = HnswOpPayload {
+            op,
+            index_rel,
+            tid,
+            vector: vector.to_vec(),
+        }
+        .encode()
+        .map_err(|e| AccessMethodError::Storage(format!("hnsw WAL payload encode: {e}")))?;
+        let prev_lsn = sink.last_lsn_for(xid);
+        let record = WalRecord::new(RecordType::HnswOp, xid, prev_lsn, 0, payload);
+        sink.append(record)
+            .map(|_| ())
+            .map_err(|e| AccessMethodError::Storage(format!("hnsw WAL append: {e}")))
     }
 
     fn exact_search_locked(
@@ -1553,7 +1722,7 @@ impl AccessMethod for BrinIndex {
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
-    use ultrasql_wal::payload::{HashOpKind, HashOpPayload};
+    use ultrasql_wal::payload::{HashOpKind, HashOpPayload, HnswOpKind, HnswOpPayload};
     use ultrasql_wal::record::RecordType;
 
     use super::*;
@@ -1890,5 +2059,66 @@ mod tests {
         am.invalidate();
         assert!(!am.is_available());
         assert!(am.search(&[0.0, 0.0, 0.0], 1).expect("search").is_empty());
+    }
+
+    #[test]
+    fn hnsw_delete_tombstone_and_vacuum_compaction_preserve_search() {
+        let am = HnswIndex::new(3, HnswMetric::L2, 4, 16).expect("hnsw config");
+        am.insert_vector(&[0.0, 0.0, 0.0], tid(1, 0))
+            .expect("insert deleted row");
+        am.insert_vector(&[1.0, 0.0, 0.0], tid(1, 1))
+            .expect("insert live row");
+        am.insert_vector(&[2.0, 0.0, 0.0], tid(1, 2))
+            .expect("insert second live row");
+
+        am.mark_deleted(tid(1, 0)).expect("tombstone row");
+        assert_eq!(am.tombstone_count(), 1);
+        assert_eq!(am.live_len(), 2);
+        let hits = am.search(&[0.0, 0.0, 0.0], 2).expect("search");
+        let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
+        assert_eq!(tids, vec![tid(1, 1), tid(1, 2)]);
+
+        let removed = am.compact_deleted().expect("compact tombstones");
+        assert_eq!(removed, 1);
+        assert_eq!(am.tombstone_count(), 0);
+        assert_eq!(am.live_len(), 2);
+        let hits = am.search(&[0.0, 0.0, 0.0], 2).expect("search after vacuum");
+        let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
+        assert_eq!(tids, vec![tid(1, 1), tid(1, 2)]);
+    }
+
+    #[test]
+    fn hnsw_logged_insert_delete_and_compact_emit_wal_records() {
+        let am = HnswIndex::new(3, HnswMetric::L2, 4, 16).expect("hnsw config");
+        let sink = InMemoryWalSink::new();
+        let index_rel = RelationId::new(777);
+        let tuple = tid(9, 1);
+
+        am.insert_vector_logged(
+            index_rel,
+            &[0.0, 1.0, 2.0],
+            tuple,
+            Xid::new(10),
+            Some(&sink),
+        )
+        .expect("logged insert");
+        am.mark_deleted_logged(index_rel, tuple, Xid::new(10), Some(&sink))
+            .expect("logged delete");
+        am.compact_deleted_logged(index_rel, Xid::new(10), Some(&sink))
+            .expect("logged compact");
+
+        let records = sink.records();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].1.header.record_type, RecordType::HnswOp);
+        let insert = HnswOpPayload::decode(&records[0].1.payload).expect("decode hnsw insert");
+        assert_eq!(insert.op, HnswOpKind::Insert);
+        assert_eq!(insert.index_rel, index_rel);
+        assert_eq!(insert.tid, tuple);
+        assert_eq!(insert.vector, vec![0.0, 1.0, 2.0]);
+        let delete = HnswOpPayload::decode(&records[1].1.payload).expect("decode hnsw delete");
+        assert_eq!(delete.op, HnswOpKind::Delete);
+        assert_eq!(delete.tid, tuple);
+        let compact = HnswOpPayload::decode(&records[2].1.payload).expect("decode hnsw compact");
+        assert_eq!(compact.op, HnswOpKind::Compact);
     }
 }

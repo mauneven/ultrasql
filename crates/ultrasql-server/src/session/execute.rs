@@ -1051,6 +1051,25 @@ where
             return Ok(());
         };
         for index in indexes {
+            if let Some(hnsw) =
+                self.state
+                    .table_constraints
+                    .get(&entry.oid)
+                    .and_then(|constraints| {
+                        let metadata = constraints.indexes.get(&index.oid)?;
+                        (metadata.method == ultrasql_planner::LogicalIndexMethod::Hnsw)
+                            .then(|| metadata.hnsw.clone())
+                            .flatten()
+                    })
+            {
+                hnsw.compact_deleted_logged(
+                    RelationId::new(index.oid.raw()),
+                    oldest,
+                    self.state.heap.wal_sink().map(Arc::as_ref),
+                )
+                .map_err(|e| ServerError::ddl(format!("VACUUM HNSW {}: {e}", index.name)))?;
+                continue;
+            }
             if index.root_block == BlockNumber::INVALID {
                 continue;
             }

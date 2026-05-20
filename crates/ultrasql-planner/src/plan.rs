@@ -656,6 +656,8 @@ pub enum LogicalPlan {
         /// columns as [`Self::CreateIndex::columns`] in expression
         /// form; expression indexes carry the actual key expression.
         key_exprs: Vec<ScalarExpr>,
+        /// Optional operator class per key (`vector_l2_ops`, etc.).
+        opclasses: Vec<Option<String>>,
         /// 0-based table columns listed in `INCLUDE (...)`.
         include_columns: Vec<usize>,
         /// Bound partial-index predicate, if any.

@@ -285,7 +285,7 @@ fn match_hnsw_sort_key(expr: &ScalarExpr) -> Option<(usize, HnswMetric, Vec<f32>
         BinaryOp::VectorL2Distance => HnswMetric::L2,
         BinaryOp::VectorCosineDistance => HnswMetric::Cosine,
         BinaryOp::VectorNegativeInnerProduct => HnswMetric::NegativeInnerProduct,
-        BinaryOp::VectorL1Distance => return None,
+        BinaryOp::VectorL1Distance => HnswMetric::L1,
         _ => return None,
     };
     hnsw_column_probe(left, right, metric).or_else(|| hnsw_column_probe(right, left, metric))
@@ -393,6 +393,7 @@ fn metric_distance(metric: HnswMetric, left: &[f32], right: &[f32]) -> f32 {
             ultrasql_vec::kernels::vector::cosine_distance_f32(left, right).unwrap_or(f32::INFINITY)
         }
         HnswMetric::NegativeInnerProduct => -ultrasql_vec::kernels::vector::dot_f32(left, right),
+        HnswMetric::L1 => left.iter().zip(right).map(|(l, r)| (l - r).abs()).sum(),
     }
 }
 

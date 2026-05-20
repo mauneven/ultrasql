@@ -2502,6 +2502,27 @@ fn binds_create_hnsw_index_method_for_vector_column() {
 }
 
 #[test]
+fn binds_create_hnsw_vector_opclass() {
+    let cat = embeddings_catalog();
+    let LogicalPlan::CreateIndex {
+        method,
+        columns,
+        opclasses,
+        ..
+    } = parse_and_bind(
+        "CREATE INDEX embeddings_hnsw_idx ON embeddings USING hnsw (embedding vector_l2_ops)",
+        &cat,
+    )
+    .expect("bind hnsw opclass")
+    else {
+        panic!("expected CreateIndex plan");
+    };
+    assert_eq!(method, LogicalIndexMethod::Hnsw);
+    assert_eq!(columns, vec![1]);
+    assert_eq!(opclasses, vec![Some("vector_l2_ops".to_owned())]);
+}
+
+#[test]
 fn rejects_unique_inverted_search_and_brin_index_methods() {
     let cat = users_catalog();
     for sql in [

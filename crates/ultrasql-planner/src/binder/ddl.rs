@@ -1177,10 +1177,16 @@ pub(super) fn bind_create_index(
     let mut col_indices: Vec<usize> = Vec::with_capacity(s.columns.len());
     let mut col_names: Vec<String> = Vec::with_capacity(s.columns.len());
     let mut key_exprs: Vec<ScalarExpr> = Vec::with_capacity(s.columns.len());
+    let mut opclasses: Vec<Option<String>> = Vec::with_capacity(s.columns.len());
     let mut saw_expression_key = false;
     for key in &s.columns {
         let mut scope = ScopeStack::new();
         let bound = bind_expr(&key.expr, table_schema, catalog, &mut scope)?;
+        opclasses.push(
+            key.opclass
+                .as_ref()
+                .map(|ident| ident.value.to_ascii_lowercase()),
+        );
         match &bound {
             ScalarExpr::Column { name, index, .. } => {
                 col_indices.push(*index);
@@ -1216,6 +1222,16 @@ pub(super) fn bind_create_index(
                 "CREATE INDEX USING hnsw requires a vector(n) column, got {}",
                 field.data_type
             )));
+        }
+        if let Some(opclass) = opclasses.first().and_then(Option::as_ref)
+            && !matches!(
+                opclass.as_str(),
+                "vector_l2_ops" | "vector_cosine_ops" | "vector_ip_ops" | "vector_l1_ops"
+            )
+        {
+            return Err(PlanError::NotSupported(
+                "CREATE INDEX USING hnsw: supported vector opclasses are vector_l2_ops, vector_cosine_ops, vector_ip_ops, vector_l1_ops",
+            ));
         }
         if !s.include.is_empty() {
             return Err(PlanError::NotSupported(
@@ -1262,6 +1278,7 @@ pub(super) fn bind_create_index(
         table_name,
         columns: col_indices,
         key_exprs,
+        opclasses,
         include_columns,
         predicate,
         method,

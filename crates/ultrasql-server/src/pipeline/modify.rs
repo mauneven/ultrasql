@@ -10,7 +10,7 @@ use ultrasql_executor::fused_update::{FusedCmp, FusedPredicate, FusedUpdateInt32
 use ultrasql_executor::{
     Eval, Filter, InsertConflictAction, InsertIndexEncoder, InsertIndexMaintainer, ModifyKind,
     ModifyTable, Operator, Project, RowCodec, RowConstraintCheck, RowUpdateConstraintCheck,
-    SeqScan, SequenceDefault, ValuesScan,
+    SeqScan, SequenceDefault, ValuesScan, VectorIndexEncoder, VectorIndexMaintainer,
 };
 use ultrasql_planner::{
     BinaryOp, LogicalIndexMethod, LogicalOnConflict, LogicalPlan, LogicalReferentialAction,
@@ -96,8 +96,14 @@ pub(super) fn lower_real_insert(
     };
     let rel = RelationId(entry.oid);
     let insert_indexes = build_insert_index_maintainers(entry, ctx)?;
+    let insert_vector_indexes = build_hnsw_index_maintainers(entry, ctx)?;
     let update_indexes = if matches!(on_conflict, Some(LogicalOnConflict::DoUpdate { .. })) {
         build_insert_index_maintainers(entry, ctx)?
+    } else {
+        Vec::new()
+    };
+    let update_vector_indexes = if matches!(on_conflict, Some(LogicalOnConflict::DoUpdate { .. })) {
+        build_hnsw_index_maintainers(entry, ctx)?
     } else {
         Vec::new()
     };
@@ -117,7 +123,9 @@ pub(super) fn lower_real_insert(
     )
     .with_visibility_map(Arc::clone(&ctx.vm))
     .with_insert_indexes(insert_indexes)
-    .with_update_indexes(update_indexes);
+    .with_update_indexes(update_indexes)
+    .with_insert_vector_indexes(insert_vector_indexes)
+    .with_update_vector_indexes(update_vector_indexes);
     let modify = if let Some(action) = conflict_action {
         modify.with_insert_conflict_action(action)
     } else {
@@ -1218,9 +1226,6 @@ fn build_one_insert_index_maintainer(
         .as_ref()
         .map_or(LogicalIndexMethod::Btree, |metadata| metadata.method);
     if method == LogicalIndexMethod::Hnsw {
-        if let Some(hnsw) = runtime.as_ref().and_then(|metadata| metadata.hnsw.clone()) {
-            hnsw.invalidate();
-        }
         return Ok(None);
     }
     if index.root_block == BlockNumber::INVALID {
@@ -1301,6 +1306,61 @@ fn build_one_insert_index_maintainer(
             .with_key_columns(key_columns)
             .with_brin(brin),
     ))
+}
+
+fn build_hnsw_index_maintainers(
+    entry: &TableEntry,
+    ctx: &LowerCtx<'_>,
+) -> Result<Vec<VectorIndexMaintainer>, ServerError> {
+    let Some(indexes) = ctx.catalog_snapshot.indexes_by_table.get(&entry.oid) else {
+        return Ok(Vec::new());
+    };
+    let Some(constraints) = ctx.table_constraints.get(&entry.oid) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for index in indexes {
+        let Some(metadata) = constraints.indexes.get(&index.oid) else {
+            continue;
+        };
+        if metadata.method != LogicalIndexMethod::Hnsw {
+            continue;
+        }
+        let Some(hnsw) = metadata.hnsw.clone() else {
+            continue;
+        };
+        let [attnum] = index.columns.as_slice() else {
+            return Err(ServerError::Unsupported(
+                "CREATE INDEX USING hnsw: exactly one vector column key is supported",
+            ));
+        };
+        let col = usize::from(*attnum);
+        let index_name = index.name.clone();
+        let encoder: VectorIndexEncoder = Arc::new(move |row: &[Value]| {
+            let value = row.get(col).ok_or_else(|| {
+                ultrasql_executor::ExecError::TypeMismatch(format!(
+                    "hnsw index {index_name}: row missing key column {col}"
+                ))
+            })?;
+            match value {
+                Value::Vector(vector) => Ok(Some(vector.clone())),
+                Value::Null => Ok(None),
+                other => Err(ultrasql_executor::ExecError::TypeMismatch(format!(
+                    "hnsw index {index_name}: expected vector key, got {:?}",
+                    other.data_type()
+                ))),
+            }
+        });
+        out.push(VectorIndexMaintainer::new(
+            index.name.clone(),
+            RelationId::new(index.oid.raw()),
+            hnsw,
+            encoder,
+            ctx.xid,
+            ctx.heap.wal_sink().cloned(),
+        ));
+    }
+    Ok(out)
 }
 
 /// Build a TID-emitting [`SeqScan`] over a persistent relation.
@@ -1580,7 +1640,9 @@ pub(super) fn lower_real_update(
     let modify =
         modify.with_referenced_by_update_checks(build_referenced_by_update_checks(entry.oid, ctx)?);
     let modify = if has_indexes {
-        modify.with_update_indexes(build_insert_index_maintainers(entry, ctx)?)
+        modify
+            .with_update_indexes(build_insert_index_maintainers(entry, ctx)?)
+            .with_update_vector_indexes(build_hnsw_index_maintainers(entry, ctx)?)
     } else {
         modify
     };
@@ -1754,7 +1816,9 @@ pub(super) fn lower_real_delete(
     )
     .with_visibility_map(Arc::clone(&ctx.vm));
     let modify = if has_indexes {
-        modify.with_delete_indexes(build_insert_index_maintainers(entry, ctx)?)
+        modify
+            .with_delete_indexes(build_insert_index_maintainers(entry, ctx)?)
+            .with_delete_vector_indexes(build_hnsw_index_maintainers(entry, ctx)?)
     } else {
         modify
     };

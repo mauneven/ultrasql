@@ -1,7 +1,7 @@
 //! Parser methods for `CREATE INDEX` statements.
 //!
 //! Handles:
-//! - `CREATE INDEX name ON t (col [ASC|DESC] [NULLS FIRST|LAST])`
+//! - `CREATE INDEX name ON t (col [opclass] [ASC|DESC] [NULLS FIRST|LAST])`
 //! - `CREATE UNIQUE INDEX …`
 //! - `CREATE INDEX IF NOT EXISTS …`
 //! - `CREATE INDEX … USING method`
@@ -93,10 +93,20 @@ impl Parser<'_> {
         Ok(cols)
     }
 
-    /// Parse one entry in an index column list: `expr [ASC|DESC] [NULLS FIRST|LAST]`.
+    /// Parse one entry in an index column list:
+    /// `expr [opclass] [ASC|DESC] [NULLS FIRST|LAST]`.
     pub(crate) fn parse_index_column(&mut self) -> Result<IndexColumn, ParseError> {
         let expr = self.parse_expr()?;
         let start = expr.span().start;
+
+        let opclass = if matches!(
+            self.peek()?.kind,
+            TokenKind::Identifier | TokenKind::QuotedIdentifier
+        ) {
+            Some(self.parse_identifier()?)
+        } else {
+            None
+        };
 
         let direction = if self.match_kw(TokenKind::KwAsc) {
             SortDirection::Asc
@@ -131,6 +141,7 @@ impl Parser<'_> {
         let end = self.peek()?.span.start;
         Ok(IndexColumn {
             expr,
+            opclass,
             direction,
             nulls,
             span: Span::new(start, end),
@@ -192,6 +203,17 @@ mod tests {
             parse_create_index("CREATE INDEX idx ON t USING hash (id) INCLUDE (name, status)");
         assert_eq!(stmt.method.as_ref().unwrap().value, "hash");
         assert_eq!(stmt.include.len(), 2);
+    }
+
+    #[test]
+    fn create_index_parses_vector_opclass() {
+        let stmt =
+            parse_create_index("CREATE INDEX idx ON docs USING hnsw (embedding vector_l2_ops)");
+        assert_eq!(stmt.method.as_ref().unwrap().value, "hnsw");
+        assert_eq!(
+            stmt.columns[0].opclass.as_ref().expect("opclass").value,
+            "vector_l2_ops"
+        );
     }
 
     #[test]

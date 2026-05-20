@@ -476,6 +476,7 @@ where
             table_name,
             columns,
             key_exprs,
+            opclasses,
             include_columns,
             predicate,
             method,
@@ -537,8 +538,11 @@ where
                 }
             };
 
+            let metric = hnsw_metric_for_opclass(opclasses.first().and_then(Option::as_deref))?;
+            let index_oid = self.state.persistent_catalog.next_oid();
+            let index_rel = RelationId::new(index_oid.raw());
             let hnsw = Arc::new(
-                HnswIndex::new(dims, HnswMetric::L2, 16, 64)
+                HnswIndex::new(dims, metric, 16, 64)
                     .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw init: {e}")))?,
             );
             let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
@@ -559,13 +563,23 @@ where
                     let row = codec
                         .decode(&tuple.data)
                         .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw decode: {e}")))?;
-                    let Some(Value::Vector(vector)) = row.get(vector_col) else {
-                        return Err(ServerError::ddl(
-                            "CREATE INDEX hnsw: key column did not decode as vector",
-                        ));
+                    let vector = match row.get(vector_col) {
+                        Some(Value::Vector(vector)) => vector,
+                        Some(Value::Null) => continue,
+                        _ => {
+                            return Err(ServerError::ddl(
+                                "CREATE INDEX hnsw: key column did not decode as vector",
+                            ));
+                        }
                     };
-                    hnsw.insert_vector(vector, tuple.tid)
-                        .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw insert: {e}")))?;
+                    hnsw.insert_vector_logged(
+                        index_rel,
+                        vector,
+                        tuple.tid,
+                        txn.xid,
+                        self.state.heap.wal_sink().map(Arc::as_ref),
+                    )
+                    .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw insert: {e}")))?;
                 }
                 Ok(())
             })();
@@ -573,8 +587,6 @@ where
                 tracing::warn!(error = %e, "autocommit (CREATE INDEX hnsw) failed to finalise");
             }
             build_result?;
-
-            let index_oid = self.state.persistent_catalog.next_oid();
             let attnum = u16::try_from(vector_col).map_err(|_| {
                 ServerError::Unsupported(
                     "CREATE INDEX: column index does not fit in u16 attnum field",
@@ -978,6 +990,18 @@ where
         );
         self.plan_cache_invalidate();
         Ok(run_ddl_command("COMMENT"))
+    }
+}
+
+fn hnsw_metric_for_opclass(opclass: Option<&str>) -> Result<HnswMetric, ServerError> {
+    match opclass.unwrap_or("vector_l2_ops") {
+        "vector_l2_ops" => Ok(HnswMetric::L2),
+        "vector_cosine_ops" => Ok(HnswMetric::Cosine),
+        "vector_ip_ops" => Ok(HnswMetric::NegativeInnerProduct),
+        "vector_l1_ops" => Ok(HnswMetric::L1),
+        other => Err(ServerError::ddl(format!(
+            "CREATE INDEX USING hnsw: unsupported vector opclass {other}"
+        ))),
     }
 }
 

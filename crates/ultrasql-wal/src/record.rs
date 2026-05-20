@@ -119,6 +119,8 @@ pub enum RecordType {
     SequenceOp = 11,
     /// A hash-index bucket or overflow page was modified.
     HashOp = 12,
+    /// An HNSW vector-index graph mutation was recorded.
+    HnswOp = 13,
     /// A no-op marker (used to round records up to alignment
     /// boundaries; ignored on replay).
     Nop = 255,
@@ -140,6 +142,7 @@ impl RecordType {
             10 => Self::HeapDeleteInPlace,
             11 => Self::SequenceOp,
             12 => Self::HashOp,
+            13 => Self::HnswOp,
             255 => Self::Nop,
             other => return Err(WalRecordError::UnknownType(other)),
         })
@@ -382,6 +385,7 @@ mod tests {
             RecordType::HeapUpdateInPlace,
             RecordType::HeapDeleteInPlace,
             RecordType::HashOp,
+            RecordType::HnswOp,
             RecordType::Nop,
         ] {
             let raw = rt as u8;
