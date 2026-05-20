@@ -10,6 +10,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use ultrasql_bench::ann_vector::{AnnBenchmarkConfig, run_hnsw_ann_benchmark};
+use ultrasql_bench::registry::HostInfo;
 
 #[cfg(feature = "sql-bench")]
 mod tpcb_wire;
@@ -26,8 +28,42 @@ struct Cli {
 /// Supported benchmark commands.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run deterministic runtime-HNSW ANN vector benchmark.
+    AnnVector(AnnVectorArgs),
     /// Run a PostgreSQL-wire TPC-B-shaped benchmark.
     Tpcb(TpcbArgs),
+}
+
+/// ANN vector benchmark arguments.
+#[derive(Clone, Debug, Args)]
+struct AnnVectorArgs {
+    /// Number of vectors to index.
+    #[arg(long, default_value_t = 10_000)]
+    rows: usize,
+    /// Vector dimensions.
+    #[arg(long, default_value_t = 8)]
+    dims: usize,
+    /// Nearest neighbors requested per query.
+    #[arg(long = "top-k", default_value_t = 10)]
+    top_k: usize,
+    /// Measured queries.
+    #[arg(long, default_value_t = 50)]
+    queries: usize,
+    /// Warmup queries excluded from latency percentiles.
+    #[arg(long = "warmup", default_value_t = 5)]
+    warmup_queries: usize,
+    /// HNSW neighbor cap.
+    #[arg(long, default_value_t = 16)]
+    m: usize,
+    /// HNSW search breadth.
+    #[arg(long = "ef-search", default_value_t = 64)]
+    ef_search: usize,
+    /// Deterministic data/probe seed.
+    #[arg(long, default_value_t = 0x51_7e_c0_de)]
+    seed: u64,
+    /// Output JSON path. Writes to stdout when omitted.
+    #[arg(long)]
+    output: Option<PathBuf>,
 }
 
 /// TPC-B benchmark arguments.
@@ -73,6 +109,7 @@ enum TpcbEngine {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
+        Some(Command::AnnVector(args)) => run_ann_vector(args),
         Some(Command::Tpcb(args)) => run_tpcb(args),
         None => {
             eprintln!(
@@ -80,6 +117,35 @@ fn main() -> ExitCode {
                 env!("CARGO_PKG_VERSION")
             );
             ExitCode::SUCCESS
+        }
+    }
+}
+
+fn run_ann_vector(args: AnnVectorArgs) -> ExitCode {
+    let config = AnnBenchmarkConfig {
+        rows: args.rows,
+        dims: args.dims,
+        top_k: args.top_k,
+        queries: args.queries,
+        warmup_queries: args.warmup_queries,
+        m: args.m,
+        ef_search: args.ef_search,
+        seed: args.seed,
+    };
+    match run_hnsw_ann_benchmark(&config, HostInfo::from_env()).and_then(|artifact| {
+        let serialized = serde_json::to_string_pretty(&artifact)?;
+        if let Some(path) = args.output.as_ref() {
+            std::fs::write(path, serialized)?;
+            eprintln!("ann-vector benchmark: wrote {}", path.display());
+        } else {
+            println!("{serialized}");
+        }
+        Ok(())
+    }) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("ann-vector benchmark failed: {err:#}");
+            ExitCode::from(1)
         }
     }
 }
@@ -130,7 +196,26 @@ mod tests {
                 assert_eq!(args.warmup_secs, 30);
                 assert!(args.output.is_none());
             }
-            None => panic!("tpcb subcommand should parse"),
+            _ => panic!("tpcb subcommand should parse"),
+        }
+    }
+
+    #[test]
+    fn ann_vector_cli_defaults_to_v1_artifact_shape() {
+        let cli =
+            Cli::try_parse_from(["ultrasql-bench", "ann-vector"]).expect("parse ann-vector args");
+        match cli.command {
+            Some(Command::AnnVector(args)) => {
+                assert_eq!(args.rows, 10_000);
+                assert_eq!(args.dims, 8);
+                assert_eq!(args.top_k, 10);
+                assert_eq!(args.queries, 50);
+                assert_eq!(args.warmup_queries, 5);
+                assert_eq!(args.m, 16);
+                assert_eq!(args.ef_search, 64);
+                assert!(args.output.is_none());
+            }
+            _ => panic!("ann-vector subcommand should parse"),
         }
     }
 

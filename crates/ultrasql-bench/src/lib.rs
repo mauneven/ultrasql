@@ -24,6 +24,7 @@
     reason = "bench harness: deterministic synthetic data + iteration math; no impact on engine crates"
 )]
 
+pub mod ann_vector;
 pub mod registry;
 pub mod runs;
 pub mod tpch;

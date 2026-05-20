@@ -1029,6 +1029,23 @@ impl HnswIndex {
         self.storage.lock().available
     }
 
+    /// Estimate heap memory currently owned by this runtime graph.
+    ///
+    /// The value includes the index object, storage vectors, vector payload
+    /// capacity, and neighbor-list capacity. It is an in-process accounting
+    /// artifact for benchmarks, not an on-disk size contract.
+    #[must_use]
+    pub fn estimated_memory_bytes(&self) -> usize {
+        let storage = self.storage.lock();
+        let mut bytes = std::mem::size_of::<Self>() + std::mem::size_of::<HnswStorage>();
+        bytes += storage.entries.capacity() * std::mem::size_of::<HnswEntry>();
+        for entry in &storage.entries {
+            bytes += entry.vector.capacity() * std::mem::size_of::<f32>();
+            bytes += entry.neighbors.capacity() * std::mem::size_of::<usize>();
+        }
+        bytes
+    }
+
     /// Mark the runtime graph unavailable.
     ///
     /// The SQL layer calls this when DML touches a table whose HNSW graph is

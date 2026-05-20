@@ -263,6 +263,27 @@ local smoke versus publishable runs. Raw artifacts land in
 `benchmarks/results/latest/raw/` with an `answer` field containing the
 exact top-k id checksum.
 
+### HNSW ANN Vector
+
+Runtime HNSW approximate nearest-neighbor artifacts are recorded by:
+
+```text
+benchmarks/vector_ann_hnsw.sh
+```
+
+The runner measures UltraSQL's in-process HNSW access method over
+deterministic vectors. It records recall@k against an exact L2 oracle,
+p50/p95/p99 query latency, build time, and estimated graph memory.
+`VECTOR_ANN_ROWS`, `VECTOR_ANN_DIMS`, `VECTOR_ANN_K`,
+`VECTOR_ANN_QUERIES`, `VECTOR_ANN_WARMUP`, `VECTOR_ANN_M`,
+`VECTOR_ANN_EF_SEARCH`, and `VECTOR_ANN_SEED` control smoke versus
+publishable runs. Raw artifacts land in `benchmarks/results/latest/raw/`
+as `vector_ann_hnsw_<rows>_<dims>d_k<k>-ultrasql_hnsw.json`.
+
+These artifacts are not competitor claims. They exist to track the
+recall/latency/build/memory envelope of the first ANN implementation
+until the SQL-level pgvector certification runner covers HNSW end to end.
+
 ### TPC-B Certification
 
 TPC-B v0.9 certification is recorded by:
@@ -357,6 +378,23 @@ Cross-engine comparison runs write per-engine raw JSON to
   "min_us":        <float>,
   "iterations_us": [<float>, ...],
   "answer":        "<checksum or summary string>"
+}
+```
+
+ANN vector artifacts extend the raw schema with:
+
+```json
+{
+  "engine":              "ultrasql_hnsw",
+  "workload":            "vector_ann_hnsw_10k_8d_k10",
+  "recall_at_k":         <float>,
+  "p50_latency_us":      <float>,
+  "p95_latency_us":      <float>,
+  "p99_latency_us":      <float>,
+  "build_time_us":       <float>,
+  "memory_bytes":        <integer>,
+  "query_iterations_us": [<float>, ...],
+  "recall_iterations":   [<float>, ...]
 }
 ```
 

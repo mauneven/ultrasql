@@ -19,3 +19,22 @@ fn vector_topk_script_prefers_pgvector_then_duckdb_list_fallback() {
     assert!(script.contains("duckdb_list"));
     assert!(script.contains("\"status\":\"not_available\""));
 }
+
+#[test]
+fn vector_ann_script_emits_recall_latency_build_and_memory_artifacts() {
+    let script_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("benchmarks/vector_ann_hnsw.sh");
+    let script = fs::read_to_string(&script_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", script_path.display()));
+
+    assert!(script.contains("ultrasql-bench ann-vector"));
+    assert!(script.contains("VECTOR_ANN_ROWS"));
+    assert!(script.contains("VECTOR_ANN_DIMS"));
+    assert!(script.contains("recall_at_k"));
+    assert!(script.contains("p50_latency_us"));
+    assert!(script.contains("p95_latency_us"));
+    assert!(script.contains("p99_latency_us"));
+    assert!(script.contains("build_time_us"));
+    assert!(script.contains("memory_bytes"));
+}
