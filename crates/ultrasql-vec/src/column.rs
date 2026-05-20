@@ -23,6 +23,13 @@ pub enum ColumnError {
         /// Column length in rows.
         column: usize,
     },
+    /// UTF-8 offsets are empty, non-monotonic, or do not cover the
+    /// values buffer exactly.
+    #[error("invalid UTF-8 offsets")]
+    InvalidUtf8Offsets,
+    /// UTF-8 value bytes fail string validation.
+    #[error("invalid UTF-8 value bytes")]
+    InvalidUtf8,
 }
 
 /// A column of one of UltraSQL's primitive types.
@@ -176,6 +183,15 @@ impl<T> NumericColumn<T> {
         self.nulls.as_ref()
     }
 
+    /// Consume the column and return its owned buffers.
+    ///
+    /// Bridge crates use this to hand the value buffer to Arrow
+    /// without copying.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<T>, Option<Bitmap>) {
+        (self.data, self.nulls)
+    }
+
     /// Number of rows.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -247,6 +263,12 @@ impl BoolColumn {
     #[must_use]
     pub const fn nulls(&self) -> Option<&Bitmap> {
         self.nulls.as_ref()
+    }
+
+    /// Consume the column and return the one-byte-per-value buffer.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, Option<Bitmap>) {
+        (self.data, self.nulls)
     }
 
     /// Read by index.
@@ -321,6 +343,48 @@ impl StringColumn {
         })
     }
 
+    /// Build a UTF-8 column from Arrow-style buffers.
+    ///
+    /// `offsets` must contain at least one value, start at zero, be
+    /// monotonically increasing, and end exactly at `values.len()`.
+    /// `nulls`, when present, must have `offsets.len() - 1` bits.
+    pub fn from_parts(
+        offsets: Vec<u32>,
+        values: Vec<u8>,
+        nulls: Option<Bitmap>,
+    ) -> Result<Self, ColumnError> {
+        if offsets.is_empty()
+            || offsets.first().copied() != Some(0)
+            || offsets.windows(2).any(|window| window[0] > window[1])
+            || offsets
+                .last()
+                .copied()
+                .and_then(|v| usize::try_from(v).ok())
+                != Some(values.len())
+        {
+            return Err(ColumnError::InvalidUtf8Offsets);
+        }
+        for window in offsets.windows(2) {
+            let start = usize::try_from(window[0]).map_err(|_| ColumnError::InvalidUtf8Offsets)?;
+            let end = usize::try_from(window[1]).map_err(|_| ColumnError::InvalidUtf8Offsets)?;
+            std::str::from_utf8(&values[start..end]).map_err(|_| ColumnError::InvalidUtf8)?;
+        }
+        let row_count = offsets.len() - 1;
+        if let Some(nulls) = &nulls
+            && nulls.len() != row_count
+        {
+            return Err(ColumnError::LengthMismatch {
+                bitmap: nulls.len(),
+                column: row_count,
+            });
+        }
+        Ok(Self {
+            offsets,
+            values,
+            nulls,
+        })
+    }
+
     /// Borrow the offsets slice.
     #[must_use]
     pub fn offsets(&self) -> &[u32] {
@@ -337,6 +401,16 @@ impl StringColumn {
     #[must_use]
     pub const fn nulls(&self) -> Option<&Bitmap> {
         self.nulls.as_ref()
+    }
+
+    /// Consume the column and return its owned buffers.
+    ///
+    /// The returned buffers use the same layout as Arrow UTF-8 except
+    /// offsets are `u32`; Arrow export converts them to signed `i32`
+    /// while keeping the values buffer zero-copy.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u32>, Vec<u8>, Option<Bitmap>) {
+        (self.offsets, self.values, self.nulls)
     }
 
     /// Row count.

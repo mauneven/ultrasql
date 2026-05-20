@@ -15,6 +15,7 @@ members = [
     "crates/ultrasql-protocol",
     "crates/ultrasql-objectstore",
     "crates/ultrasql-iceberg",
+    "crates/ultrasql-arrow",
     "crates/ultrasql-server",
     "crates/ultrasql-cli",
     "crates/ultrasql-bench",
@@ -53,6 +54,7 @@ ultrasql-catalog   = { path = "crates/ultrasql-catalog",   version = "0.0.1" }
 ultrasql-protocol  = { path = "crates/ultrasql-protocol",  version = "0.0.1" }
 ultrasql-objectstore = { path = "crates/ultrasql-objectstore", version = "0.0.1" }
 ultrasql-iceberg   = { path = "crates/ultrasql-iceberg",   version = "0.0.1" }
+ultrasql-arrow     = { path = "crates/ultrasql-arrow",     version = "0.0.1" }
 ultrasql-server    = { path = "crates/ultrasql-server",    version = "0.0.1" }
 
 # Error handling
@@ -81,6 +83,7 @@ bytes  = "1"
 byteorder = "1"
 bincode = "1"
 arrow-array  = "58.3.0"
+arrow-buffer = "58.3.0"
 arrow-schema = "58.3.0"
 parquet      = "58.3.0"
 apache-avro  = "0.21.0"

@@ -119,6 +119,7 @@ pub(super) fn apply_null_numeric<T: Copy>(
             Err(ColumnError::LengthMismatch { bitmap, column }) => {
                 panic!("apply_null_numeric: validity length {bitmap} != column length {column}")
             }
+            Err(err) => panic!("apply_null_numeric: unexpected column error: {err}"),
         }
     } else {
         NumericColumn::from_data(data)

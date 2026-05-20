@@ -15,12 +15,11 @@ use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::statistics::Statistics;
+use ultrasql_arrow::record_batch_to_ultrasql_batch;
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_executor::{ExecError, Operator};
 use ultrasql_objectstore::{expand_object_store_specs, is_object_store_uri, read_object_bytes};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
-use ultrasql_vec::Bitmap;
-use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
 use crate::error::ServerError;
 
@@ -262,7 +261,7 @@ fn append_path_batches(
         if batch.num_rows() == 0 {
             continue;
         }
-        batches.push_back(arrow_batch_to_ultrasql(&batch)?);
+        batches.push_back(arrow_record_batch_to_ultrasql(batch)?);
     }
     Ok(())
 }
@@ -320,7 +319,7 @@ fn append_object_batches(
         if batch.num_rows() == 0 {
             continue;
         }
-        batches.push_back(arrow_batch_to_ultrasql(&batch)?);
+        batches.push_back(arrow_record_batch_to_ultrasql(batch)?);
     }
     Ok(())
 }
@@ -404,220 +403,9 @@ fn arrow_type_to_ultrasql(data_type: &ArrowDataType) -> Result<DataType, ServerE
     }
 }
 
-fn arrow_batch_to_ultrasql(batch: &RecordBatch) -> Result<ultrasql_vec::Batch, ServerError> {
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    for (index, field) in batch.schema().fields().iter().enumerate() {
-        columns.push(arrow_array_to_column(
-            batch.column(index).as_ref(),
-            field.data_type(),
-        )?);
-    }
-    ultrasql_vec::Batch::new(columns)
-        .map_err(|err| ServerError::CopyFormat(format!("read_parquet batch: {err}")))
-}
-
-fn arrow_array_to_column(
-    array: &dyn Array,
-    data_type: &ArrowDataType,
-) -> Result<Column, ServerError> {
-    match data_type {
-        ArrowDataType::Boolean => bool_column(array),
-        ArrowDataType::Int32 => numeric_i32_column(array),
-        ArrowDataType::Int64 => numeric_i64_column(array),
-        ArrowDataType::Float32 => numeric_f32_column(array),
-        ArrowDataType::Float64 => numeric_f64_column(array),
-        ArrowDataType::Utf8 => utf8_column(array),
-        ArrowDataType::LargeUtf8 => large_utf8_column(array),
-        other => Err(ServerError::CopyFormat(format!(
-            "read_parquet unsupported Arrow type: {other}"
-        ))),
-    }
-}
-
-fn numeric_i32_column(array: &dyn Array) -> Result<Column, ServerError> {
-    let typed = array
-        .as_any()
-        .downcast_ref::<Int32Array>()
-        .ok_or_else(|| ServerError::CopyFormat("read_parquet Int32 downcast failed".to_owned()))?;
-    let values = (0..typed.len())
-        .map(|idx| {
-            if typed.is_null(idx) {
-                0
-            } else {
-                typed.value(idx)
-            }
-        })
-        .collect::<Vec<_>>();
-    let column = match validity_bitmap(typed) {
-        Some(nulls) => {
-            Column::Int32(NumericColumn::with_nulls(values, nulls).map_err(|err| {
-                ServerError::CopyFormat(format!("read_parquet Int32 nulls: {err}"))
-            })?)
-        }
-        None => Column::Int32(NumericColumn::from_data(values)),
-    };
-    Ok(column)
-}
-
-fn numeric_i64_column(array: &dyn Array) -> Result<Column, ServerError> {
-    let typed = array
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .ok_or_else(|| ServerError::CopyFormat("read_parquet Int64 downcast failed".to_owned()))?;
-    let values = (0..typed.len())
-        .map(|idx| {
-            if typed.is_null(idx) {
-                0
-            } else {
-                typed.value(idx)
-            }
-        })
-        .collect::<Vec<_>>();
-    let column = match validity_bitmap(typed) {
-        Some(nulls) => {
-            Column::Int64(NumericColumn::with_nulls(values, nulls).map_err(|err| {
-                ServerError::CopyFormat(format!("read_parquet Int64 nulls: {err}"))
-            })?)
-        }
-        None => Column::Int64(NumericColumn::from_data(values)),
-    };
-    Ok(column)
-}
-
-fn numeric_f32_column(array: &dyn Array) -> Result<Column, ServerError> {
-    let typed = array
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| {
-            ServerError::CopyFormat("read_parquet Float32 downcast failed".to_owned())
-        })?;
-    let values = (0..typed.len())
-        .map(|idx| {
-            if typed.is_null(idx) {
-                0.0
-            } else {
-                typed.value(idx)
-            }
-        })
-        .collect::<Vec<_>>();
-    let column = match validity_bitmap(typed) {
-        Some(nulls) => {
-            Column::Float32(NumericColumn::with_nulls(values, nulls).map_err(|err| {
-                ServerError::CopyFormat(format!("read_parquet Float32 nulls: {err}"))
-            })?)
-        }
-        None => Column::Float32(NumericColumn::from_data(values)),
-    };
-    Ok(column)
-}
-
-fn numeric_f64_column(array: &dyn Array) -> Result<Column, ServerError> {
-    let typed = array
-        .as_any()
-        .downcast_ref::<Float64Array>()
-        .ok_or_else(|| {
-            ServerError::CopyFormat("read_parquet Float64 downcast failed".to_owned())
-        })?;
-    let values = (0..typed.len())
-        .map(|idx| {
-            if typed.is_null(idx) {
-                0.0
-            } else {
-                typed.value(idx)
-            }
-        })
-        .collect::<Vec<_>>();
-    let column = match validity_bitmap(typed) {
-        Some(nulls) => {
-            Column::Float64(NumericColumn::with_nulls(values, nulls).map_err(|err| {
-                ServerError::CopyFormat(format!("read_parquet Float64 nulls: {err}"))
-            })?)
-        }
-        None => Column::Float64(NumericColumn::from_data(values)),
-    };
-    Ok(column)
-}
-
-fn bool_column(array: &dyn Array) -> Result<Column, ServerError> {
-    let typed = array
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| {
-            ServerError::CopyFormat("read_parquet Boolean downcast failed".to_owned())
-        })?;
-    let values = (0..typed.len())
-        .map(|idx| !typed.is_null(idx) && typed.value(idx))
-        .collect::<Vec<_>>();
-    let column = match validity_bitmap(typed) {
-        Some(nulls) => Column::Bool(BoolColumn::with_nulls(values, nulls).map_err(|err| {
-            ServerError::CopyFormat(format!("read_parquet Boolean nulls: {err}"))
-        })?),
-        None => Column::Bool(BoolColumn::from_data(values)),
-    };
-    Ok(column)
-}
-
-fn utf8_column(array: &dyn Array) -> Result<Column, ServerError> {
-    let typed = array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ServerError::CopyFormat("read_parquet Utf8 downcast failed".to_owned()))?;
-    let values = (0..typed.len())
-        .map(|idx| {
-            if typed.is_null(idx) {
-                String::new()
-            } else {
-                typed.value(idx).to_owned()
-            }
-        })
-        .collect::<Vec<_>>();
-    let column = match validity_bitmap(typed) {
-        Some(nulls) => {
-            Column::Utf8(StringColumn::with_nulls(values, nulls).map_err(|err| {
-                ServerError::CopyFormat(format!("read_parquet Utf8 nulls: {err}"))
-            })?)
-        }
-        None => Column::Utf8(StringColumn::from_data(values)),
-    };
-    Ok(column)
-}
-
-fn large_utf8_column(array: &dyn Array) -> Result<Column, ServerError> {
-    let typed = array
-        .as_any()
-        .downcast_ref::<LargeStringArray>()
-        .ok_or_else(|| {
-            ServerError::CopyFormat("read_parquet LargeUtf8 downcast failed".to_owned())
-        })?;
-    let values = (0..typed.len())
-        .map(|idx| {
-            if typed.is_null(idx) {
-                String::new()
-            } else {
-                typed.value(idx).to_owned()
-            }
-        })
-        .collect::<Vec<_>>();
-    let column = match validity_bitmap(typed) {
-        Some(nulls) => Column::Utf8(StringColumn::with_nulls(values, nulls).map_err(|err| {
-            ServerError::CopyFormat(format!("read_parquet LargeUtf8 nulls: {err}"))
-        })?),
-        None => Column::Utf8(StringColumn::from_data(values)),
-    };
-    Ok(column)
-}
-
-fn validity_bitmap(array: &dyn Array) -> Option<Bitmap> {
-    if array.null_count() == 0 {
-        return None;
-    }
-    let mut nulls = Bitmap::new(array.len(), true);
-    for idx in 0..array.len() {
-        if array.is_null(idx) {
-            nulls.set(idx, false);
-        }
-    }
-    Some(nulls)
+fn arrow_record_batch_to_ultrasql(batch: RecordBatch) -> Result<ultrasql_vec::Batch, ServerError> {
+    record_batch_to_ultrasql_batch(batch)
+        .map_err(|err| ServerError::CopyFormat(format!("read_parquet Arrow bridge: {err}")))
 }
 
 fn evaluate_arrow_predicate(

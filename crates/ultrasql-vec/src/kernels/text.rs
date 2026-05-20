@@ -199,6 +199,7 @@ fn finalize_numeric_i64(
             Err(ColumnError::LengthMismatch { bitmap, column }) => {
                 panic!("finalize_numeric_i64: validity length {bitmap} != column length {column}")
             }
+            Err(err) => panic!("finalize_numeric_i64: unexpected column error: {err}"),
         }
     } else {
         NumericColumn::from_data(data)
@@ -253,6 +254,7 @@ fn finalize_string_with(
             Err(ColumnError::LengthMismatch { bitmap, column }) => {
                 panic!("finalize_string_with: validity length {bitmap} != column length {column}")
             }
+            Err(err) => panic!("finalize_string_with: unexpected column error: {err}"),
         }
     } else {
         // No nulls — reuse the source column's offsets verbatim.
@@ -294,6 +296,7 @@ fn finalize_string_from_rows(
                     "finalize_string_from_rows: validity length {bitmap} != column length {column}"
                 )
             }
+            Err(err) => panic!("finalize_string_from_rows: unexpected column error: {err}"),
         }
     } else {
         StringColumn::from_data(rows)

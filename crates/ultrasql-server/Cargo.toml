@@ -30,6 +30,7 @@ ultrasql-catalog   = { workspace = true }
 ultrasql-protocol  = { workspace = true }
 ultrasql-objectstore = { workspace = true }
 ultrasql-iceberg   = { workspace = true }
+ultrasql-arrow     = { workspace = true }
 thiserror          = { workspace = true }
 anyhow             = { workspace = true }
 tokio              = { workspace = true }

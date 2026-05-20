@@ -117,6 +117,16 @@ impl Bitmap {
         &self.bits
     }
 
+    /// Consume the bitmap and return its packed words.
+    ///
+    /// Word bit order is Arrow-compatible: bit 0 is the least
+    /// significant bit of word 0. Bridge crates use this to transfer
+    /// validity buffers without touching each bit.
+    #[must_use]
+    pub fn into_words(self) -> Vec<u64> {
+        self.bits
+    }
+
     /// Mutably borrow the underlying u64 words.
     ///
     /// Used by SIMD kernels that emit 64 packed lanes of mask in a
