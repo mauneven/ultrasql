@@ -1,8 +1,13 @@
 //! Local CSV table-function scans.
 
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{BufRead, BufReader, Cursor, Read};
+use std::path::{Path, PathBuf};
+
 use ultrasql_core::csv::{
-    CsvSniff, expand_csv_path_specs, expand_csv_paths, read_csv_data_from_path,
-    read_csv_data_from_text, sniff_csv_path,
+    CsvParseOptions, CsvSniff, expand_csv_path_specs, expand_csv_paths,
+    parse_csv_records_with_options, sniff_csv_path, sniff_csv_text,
 };
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_executor::{ExecError, Operator};
@@ -13,20 +18,15 @@ use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 use crate::error::ServerError;
 
 const CSV_BATCH_TARGET_ROWS: usize = 4096;
+const CSV_SNIFF_SAMPLE_BYTES: usize = 64 * 1024;
+const CSV_SNIFF_SAMPLE_BYTES_U64: u64 = 64 * 1024;
 
 /// File-backed scan for `read_csv(path_or_glob)`.
 #[derive(Debug)]
 pub(super) struct CsvTableScan {
     schema: Schema,
-    rows: Vec<CsvTableRow>,
-    position: usize,
-}
-
-#[derive(Clone, Debug)]
-struct CsvTableRow {
-    values: Vec<String>,
-    filename: String,
-    row_number: i64,
+    width: usize,
+    stream: CsvStream,
 }
 
 impl CsvTableScan {
@@ -50,56 +50,37 @@ impl CsvTableScan {
         Self::from_paths(paths)
     }
 
-    fn from_paths(paths: Vec<std::path::PathBuf>) -> Result<Self, ServerError> {
+    fn from_paths(paths: Vec<PathBuf>) -> Result<Self, ServerError> {
         let mut expected_header: Option<Vec<String>> = None;
-        let mut rows = Vec::new();
+        let mut readers = VecDeque::new();
 
         for path in paths {
-            let data = read_csv_data_from_path(&path)
-                .map_err(|err| ServerError::CopyFormat(format!("{err}")))?;
-            let header = &data.header;
-            validate_header(header, &path)?;
+            let (header, reader) = CsvReaderState::from_path(&path)?;
+            validate_header(&header, &path)?;
             if let Some(expected) = &expected_header {
-                if header != expected {
+                if &header != expected {
                     return Err(ServerError::CopyFormat(format!(
                         "read_csv header mismatch in {}",
                         path.display()
                     )));
                 }
             } else {
-                expected_header = Some(header.clone());
+                expected_header = Some(header);
             }
-
-            for (row_index, record) in data.records.iter().enumerate() {
-                if record.len() != header.len() {
-                    return Err(ServerError::CopyFormat(format!(
-                        "read_csv row {} in {} has {} columns, expected {}",
-                        row_index + 1,
-                        path.display(),
-                        record.len(),
-                        header.len()
-                    )));
-                }
-                let row_number = i64::try_from(row_index + 1).map_err(|_| {
-                    ServerError::CopyFormat(format!(
-                        "read_csv row number overflow in {}",
-                        path.display()
-                    ))
-                })?;
-                rows.push(CsvTableRow {
-                    values: record.clone(),
-                    filename: path.display().to_string(),
-                    row_number,
-                });
-            }
+            readers.push_back(reader);
         }
 
-        let header = expected_header.expect("CSV path expansion returns at least one file");
+        let Some(header) = expected_header else {
+            return Err(ServerError::CopyFormat(
+                "read_csv path expansion returned no files".to_owned(),
+            ));
+        };
+        let width = header.len();
         let schema = csv_schema(&header)?;
         Ok(Self {
             schema,
-            rows,
-            position: 0,
+            width,
+            stream: CsvStream::new(readers),
         })
     }
 
@@ -107,7 +88,7 @@ impl CsvTableScan {
         let objects = expand_object_store_specs(patterns)
             .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
         let mut expected_header: Option<Vec<String>> = None;
-        let mut rows = Vec::new();
+        let mut readers = VecDeque::new();
 
         for object in objects {
             let display = object.display_uri();
@@ -116,63 +97,62 @@ impl CsvTableScan {
             let text = String::from_utf8(bytes).map_err(|err| {
                 ServerError::CopyFormat(format!("read_csv cannot decode {display}: {err}"))
             })?;
-            let data = read_csv_data_from_text(&display, &text)
-                .map_err(|err| ServerError::CopyFormat(format!("{err}")))?;
-            let header = &data.header;
-            validate_object_header(header, &display)?;
+            let (header, reader) = CsvReaderState::from_text(display.clone(), text)?;
+            validate_object_header(&header, &display)?;
             if let Some(expected) = &expected_header {
-                if header != expected {
+                if &header != expected {
                     return Err(ServerError::CopyFormat(format!(
                         "read_csv header mismatch in {display}"
                     )));
                 }
             } else {
-                expected_header = Some(header.clone());
+                expected_header = Some(header);
             }
-
-            for (row_index, record) in data.records.iter().enumerate() {
-                if record.len() != header.len() {
-                    return Err(ServerError::CopyFormat(format!(
-                        "read_csv row {} in {} has {} columns, expected {}",
-                        row_index + 1,
-                        display,
-                        record.len(),
-                        header.len()
-                    )));
-                }
-                let row_number = i64::try_from(row_index + 1).map_err(|_| {
-                    ServerError::CopyFormat(format!("read_csv row number overflow in {display}"))
-                })?;
-                rows.push(CsvTableRow {
-                    values: record.clone(),
-                    filename: display.clone(),
-                    row_number,
-                });
-            }
+            readers.push_back(reader);
         }
 
-        let header = expected_header.expect("object expansion returns at least one file");
+        let Some(header) = expected_header else {
+            return Err(ServerError::CopyFormat(
+                "read_csv object expansion returned no files".to_owned(),
+            ));
+        };
+        let width = header.len();
         let schema = csv_schema(&header)?;
         Ok(Self {
             schema,
-            rows,
-            position: 0,
+            width,
+            stream: CsvStream::new(readers),
         })
     }
 }
 
 impl Operator for CsvTableScan {
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
-        if self.position >= self.rows.len() {
+        let mut data_columns = (0..self.width)
+            .map(|_| Vec::with_capacity(CSV_BATCH_TARGET_ROWS))
+            .collect::<Vec<_>>();
+        let mut filenames = Vec::with_capacity(CSV_BATCH_TARGET_ROWS);
+        let mut row_numbers = Vec::with_capacity(CSV_BATCH_TARGET_ROWS);
+
+        for _ in 0..CSV_BATCH_TARGET_ROWS {
+            let Some(row) = self.stream.next_row()? else {
+                break;
+            };
+            for (column, value) in data_columns.iter_mut().zip(row.values) {
+                column.push(value);
+            }
+            filenames.push(row.filename);
+            row_numbers.push(row.row_number);
+        }
+
+        if row_numbers.is_empty() {
             return Ok(None);
         }
-        let end = self
-            .position
-            .saturating_add(CSV_BATCH_TARGET_ROWS)
-            .min(self.rows.len());
-        let batch = csv_batch(&self.rows[self.position..end])?;
-        self.position = end;
-        Ok(Some(batch))
+        Ok(Some(csv_batch_from_columns(
+            data_columns,
+            filenames,
+            row_numbers,
+        )?))
     }
 
     fn schema(&self) -> &Schema {
@@ -180,23 +160,286 @@ impl Operator for CsvTableScan {
     }
 }
 
-fn csv_batch(rows: &[CsvTableRow]) -> Result<Batch, ExecError> {
-    let width = rows.first().map_or(0, |row| row.values.len());
-    let mut columns = Vec::with_capacity(width + 2);
-    for col_idx in 0..width {
-        let values = rows
-            .iter()
-            .map(|row| row.values[col_idx].clone())
-            .collect::<Vec<_>>();
+#[derive(Debug)]
+struct CsvStream {
+    readers: VecDeque<CsvReaderState>,
+}
+
+impl CsvStream {
+    fn new(readers: VecDeque<CsvReaderState>) -> Self {
+        Self { readers }
+    }
+
+    fn next_row(&mut self) -> Result<Option<CsvOutputRow>, ExecError> {
+        loop {
+            let Some(reader) = self.readers.front_mut() else {
+                return Ok(None);
+            };
+            match reader.next_row().map_err(ExecError::TypeMismatch)? {
+                Some(row) => return Ok(Some(row)),
+                None => {
+                    self.readers.pop_front();
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CsvOutputRow {
+    values: Vec<String>,
+    filename: String,
+    row_number: i64,
+}
+
+#[derive(Debug)]
+struct CsvReaderState {
+    display: String,
+    width: usize,
+    reader: CsvRecordReader,
+    row_number: i64,
+}
+
+impl CsvReaderState {
+    fn from_path(path: &Path) -> Result<(Vec<String>, Self), ServerError> {
+        let display = path.display().to_string();
+        let sample = read_csv_sample_from_path(path)?;
+        let sniff = sniff_csv_text(&display, &sample)
+            .map_err(|err| ServerError::CopyFormat(format!("read_csv sniff {display}: {err}")))?;
+        let header = sniff_header(&sniff);
+        let file = File::open(path).map_err(|err| {
+            ServerError::CopyFormat(format!("read_csv cannot open {}: {err}", path.display()))
+        })?;
+        let reader = CsvRecordReader::new(
+            display.clone(),
+            CsvRecordSource::File(BufReader::new(file)),
+            sniff.parse_options(),
+        );
+        let mut state = Self {
+            display,
+            width: header.len(),
+            reader,
+            row_number: 0,
+        };
+        if sniff.has_header {
+            state.skip_header(&header)?;
+        }
+        Ok((header, state))
+    }
+
+    fn from_text(display: String, text: String) -> Result<(Vec<String>, Self), ServerError> {
+        let sample = csv_sample_from_text(&text);
+        let sniff = sniff_csv_text(&display, sample)
+            .map_err(|err| ServerError::CopyFormat(format!("read_csv sniff {display}: {err}")))?;
+        let header = sniff_header(&sniff);
+        let reader = CsvRecordReader::new(
+            display.clone(),
+            CsvRecordSource::Memory(BufReader::new(Cursor::new(text.into_bytes()))),
+            sniff.parse_options(),
+        );
+        let mut state = Self {
+            display,
+            width: header.len(),
+            reader,
+            row_number: 0,
+        };
+        if sniff.has_header {
+            state.skip_header(&header)?;
+        }
+        Ok((header, state))
+    }
+
+    fn skip_header(&mut self, expected: &[String]) -> Result<(), ServerError> {
+        let Some(record) = self.reader.next_record().map_err(ServerError::CopyFormat)? else {
+            return Err(ServerError::CopyFormat(format!(
+                "read_csv header missing in {}",
+                self.display
+            )));
+        };
+        if record != expected {
+            return Err(ServerError::CopyFormat(format!(
+                "read_csv header mismatch in {}",
+                self.display
+            )));
+        }
+        Ok(())
+    }
+
+    fn next_row(&mut self) -> Result<Option<CsvOutputRow>, String> {
+        let Some(values) = self.reader.next_record()? else {
+            return Ok(None);
+        };
+        let row_number = self
+            .row_number
+            .checked_add(1)
+            .ok_or_else(|| format!("read_csv row number overflow in {}", self.display))?;
+        if values.len() != self.width {
+            return Err(format!(
+                "read_csv row {row_number} in {} has {} columns, expected {}",
+                self.display,
+                values.len(),
+                self.width
+            ));
+        }
+        self.row_number = row_number;
+        Ok(Some(CsvOutputRow {
+            values,
+            filename: self.display.clone(),
+            row_number,
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct CsvRecordReader {
+    display: String,
+    source: CsvRecordSource,
+    options: CsvParseOptions,
+}
+
+impl CsvRecordReader {
+    fn new(display: String, source: CsvRecordSource, options: CsvParseOptions) -> Self {
+        Self {
+            display,
+            source,
+            options,
+        }
+    }
+
+    fn next_record(&mut self) -> Result<Option<Vec<String>>, String> {
+        let mut buffer = String::new();
+        loop {
+            let mut line = String::new();
+            let bytes = self
+                .source
+                .read_line(&mut line)
+                .map_err(|err| format!("read_csv cannot read {}: {err}", self.display))?;
+            if bytes == 0 {
+                if buffer.is_empty() {
+                    return Ok(None);
+                }
+                return self.parse_complete_record(&buffer);
+            }
+            buffer.push_str(&line);
+            match self.parse_complete_record(&buffer) {
+                Ok(Some(record)) => return Ok(Some(record)),
+                Ok(None) => {
+                    buffer.clear();
+                }
+                Err(err) if err.contains("unterminated quoted field") => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    fn parse_complete_record(&self, text: &str) -> Result<Option<Vec<String>>, String> {
+        let mut records = parse_csv_records_with_options(text, self.options)
+            .map_err(|err| format!("read_csv parse {}: {err}", self.display))?;
+        match records.len() {
+            0 => Ok(None),
+            1 => Ok(records.pop()),
+            _ => Err(format!(
+                "read_csv parse {}: streaming buffer produced multiple records",
+                self.display
+            )),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum CsvRecordSource {
+    File(BufReader<File>),
+    Memory(BufReader<Cursor<Vec<u8>>>),
+}
+
+impl CsvRecordSource {
+    fn read_line(&mut self, buffer: &mut String) -> std::io::Result<usize> {
+        match self {
+            Self::File(reader) => reader.read_line(buffer),
+            Self::Memory(reader) => reader.read_line(buffer),
+        }
+    }
+}
+
+fn csv_batch_from_columns(
+    data_columns: Vec<Vec<String>>,
+    filenames: Vec<String>,
+    row_numbers: Vec<i64>,
+) -> Result<Batch, ExecError> {
+    let mut columns = Vec::with_capacity(data_columns.len() + 2);
+    for values in data_columns {
         columns.push(Column::Utf8(StringColumn::from_data(values)));
     }
-    columns.push(Column::Utf8(StringColumn::from_data(
-        rows.iter().map(|row| row.filename.clone()),
-    )));
-    columns.push(Column::Int64(NumericColumn::from_data(
-        rows.iter().map(|row| row.row_number).collect(),
-    )));
+    columns.push(Column::Utf8(StringColumn::from_data(filenames)));
+    columns.push(Column::Int64(NumericColumn::from_data(row_numbers)));
     Batch::new(columns).map_err(ExecError::from)
+}
+
+fn sniff_header(sniff: &CsvSniff) -> Vec<String> {
+    sniff
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect()
+}
+
+fn read_csv_sample_from_path(path: &Path) -> Result<String, ServerError> {
+    let file = File::open(path).map_err(|err| {
+        ServerError::CopyFormat(format!("read_csv cannot open {}: {err}", path.display()))
+    })?;
+    let mut bytes = Vec::new();
+    file.take(CSV_SNIFF_SAMPLE_BYTES_U64)
+        .read_to_end(&mut bytes)
+        .map_err(|err| {
+            ServerError::CopyFormat(format!("read_csv cannot read {}: {err}", path.display()))
+        })?;
+    let valid_len = match std::str::from_utf8(&bytes) {
+        Ok(text) => {
+            return Ok(csv_sample_from_text_with_truncation(
+                text,
+                bytes.len() == CSV_SNIFF_SAMPLE_BYTES,
+            )
+            .to_owned());
+        }
+        Err(err) => err.valid_up_to(),
+    };
+    if valid_len == 0 {
+        return Err(ServerError::CopyFormat(format!(
+            "read_csv cannot decode {}: invalid UTF-8",
+            path.display()
+        )));
+    }
+    let text = std::str::from_utf8(&bytes[..valid_len]).map_err(|err| {
+        ServerError::CopyFormat(format!("read_csv cannot decode {}: {err}", path.display()))
+    })?;
+    Ok(csv_sample_from_text_with_truncation(text, true).to_owned())
+}
+
+fn csv_sample_from_text(text: &str) -> &str {
+    if text.len() <= CSV_SNIFF_SAMPLE_BYTES {
+        return text;
+    }
+    let mut end = CSV_SNIFF_SAMPLE_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    csv_sample_from_text_with_truncation(&text[..end], true)
+}
+
+fn csv_sample_from_text_with_truncation(text: &str, truncated: bool) -> &str {
+    if !truncated {
+        return text;
+    }
+    let Some((idx, ch)) = text
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| *ch == '\n' || *ch == '\r')
+    else {
+        return text;
+    };
+    let end = idx + ch.len_utf8();
+    let trimmed = &text[..end];
+    if trimmed.is_empty() { text } else { trimmed }
 }
 
 fn csv_schema(header: &[String]) -> Result<Schema, ServerError> {
@@ -315,4 +558,59 @@ fn sniff_csv_batch(sniff: &CsvSniff) -> Result<Batch, ExecError> {
         Column::Utf8(StringColumn::from_data(vec![sniff.prompt_sql()])),
     ])
     .map_err(ExecError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::io::Write as _;
+
+    use ultrasql_executor::Operator as _;
+
+    use super::{CSV_BATCH_TARGET_ROWS, CsvTableScan};
+
+    #[test]
+    fn csv_scan_construction_does_not_parse_past_first_batch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csv_path = dir.path().join("stream.csv");
+        let mut file = fs::File::create(&csv_path).expect("create csv");
+        writeln!(file, "id,payload").expect("write header");
+        for row in 0..CSV_BATCH_TARGET_ROWS {
+            writeln!(file, "{row},{}", "x".repeat(48)).expect("write row");
+        }
+        writeln!(file, "bad,\"unterminated").expect("write malformed tail");
+
+        let mut scan = CsvTableScan::from_pattern(csv_path.to_str().expect("utf8 path"))
+            .expect("constructs without reading malformed tail");
+        let first = scan
+            .next_batch()
+            .expect("first batch reads")
+            .expect("first batch exists");
+        assert_eq!(first.rows(), CSV_BATCH_TARGET_ROWS);
+    }
+
+    #[test]
+    fn csv_scan_yields_target_sized_batches_lazily() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csv_path = dir.path().join("batches.csv");
+        let mut file = fs::File::create(&csv_path).expect("create csv");
+        writeln!(file, "id,payload").expect("write header");
+        for row in 0..=CSV_BATCH_TARGET_ROWS {
+            writeln!(file, "{row},value-{row}").expect("write row");
+        }
+
+        let mut scan = CsvTableScan::from_pattern(csv_path.to_str().expect("utf8 path"))
+            .expect("construct scan");
+        let first = scan
+            .next_batch()
+            .expect("first batch reads")
+            .expect("first batch exists");
+        let second = scan
+            .next_batch()
+            .expect("second batch reads")
+            .expect("second batch exists");
+        assert_eq!(first.rows(), CSV_BATCH_TARGET_ROWS);
+        assert_eq!(second.rows(), 1);
+        assert!(scan.next_batch().expect("eof reads").is_none());
+    }
 }
