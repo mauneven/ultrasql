@@ -15,11 +15,13 @@ workspace = true
 ultrasql-core    = { workspace = true }
 ultrasql-parser  = { workspace = true }
 ultrasql-catalog = { workspace = true }
+ultrasql-objectstore = { workspace = true }
 thiserror        = { workspace = true }
 smallvec         = { workspace = true }
 tracing          = { workspace = true }
 parquet          = { workspace = true }
 arrow-schema     = { workspace = true }
+bytes            = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

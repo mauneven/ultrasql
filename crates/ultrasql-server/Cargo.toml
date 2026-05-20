@@ -28,6 +28,7 @@ ultrasql-executor  = { workspace = true }
 ultrasql-vec       = { workspace = true }
 ultrasql-catalog   = { workspace = true }
 ultrasql-protocol  = { workspace = true }
+ultrasql-objectstore = { workspace = true }
 thiserror          = { workspace = true }
 anyhow             = { workspace = true }
 tokio              = { workspace = true }

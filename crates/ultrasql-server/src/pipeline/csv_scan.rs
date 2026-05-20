@@ -1,10 +1,12 @@
 //! Local CSV table-function scans.
 
 use ultrasql_core::csv::{
-    CsvSniff, expand_csv_path_specs, expand_csv_paths, read_csv_data_from_path, sniff_csv_path,
+    CsvSniff, expand_csv_path_specs, expand_csv_paths, read_csv_data_from_path,
+    read_csv_data_from_text, sniff_csv_path,
 };
 use ultrasql_core::{DataType, Field, Schema};
 use ultrasql_executor::{ExecError, Operator};
+use ultrasql_objectstore::{expand_object_store_specs, is_object_store_uri, read_object_bytes};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
@@ -37,6 +39,9 @@ impl CsvTableScan {
 
     /// Load CSV files from one or more path/glob specs into a query-local scan.
     pub(super) fn from_path_specs(patterns: &[String]) -> Result<Self, ServerError> {
+        if path_specs_use_object_store("read_csv", patterns)? {
+            return Self::from_object_specs(patterns);
+        }
         if let [pattern] = patterns {
             return Self::from_pattern(pattern);
         }
@@ -90,6 +95,63 @@ impl CsvTableScan {
         }
 
         let header = expected_header.expect("CSV path expansion returns at least one file");
+        let schema = csv_schema(&header)?;
+        Ok(Self {
+            schema,
+            rows,
+            position: 0,
+        })
+    }
+
+    fn from_object_specs(patterns: &[String]) -> Result<Self, ServerError> {
+        let objects = expand_object_store_specs(patterns)
+            .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
+        let mut expected_header: Option<Vec<String>> = None;
+        let mut rows = Vec::new();
+
+        for object in objects {
+            let display = object.display_uri();
+            let bytes = read_object_bytes(&object)
+                .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
+            let text = String::from_utf8(bytes).map_err(|err| {
+                ServerError::CopyFormat(format!("read_csv cannot decode {display}: {err}"))
+            })?;
+            let data = read_csv_data_from_text(&display, &text)
+                .map_err(|err| ServerError::CopyFormat(format!("{err}")))?;
+            let header = &data.header;
+            validate_object_header(header, &display)?;
+            if let Some(expected) = &expected_header {
+                if header != expected {
+                    return Err(ServerError::CopyFormat(format!(
+                        "read_csv header mismatch in {display}"
+                    )));
+                }
+            } else {
+                expected_header = Some(header.clone());
+            }
+
+            for (row_index, record) in data.records.iter().enumerate() {
+                if record.len() != header.len() {
+                    return Err(ServerError::CopyFormat(format!(
+                        "read_csv row {} in {} has {} columns, expected {}",
+                        row_index + 1,
+                        display,
+                        record.len(),
+                        header.len()
+                    )));
+                }
+                let row_number = i64::try_from(row_index + 1).map_err(|_| {
+                    ServerError::CopyFormat(format!("read_csv row number overflow in {display}"))
+                })?;
+                rows.push(CsvTableRow {
+                    values: record.clone(),
+                    filename: display.clone(),
+                    row_number,
+                });
+            }
+        }
+
+        let header = expected_header.expect("object expansion returns at least one file");
         let schema = csv_schema(&header)?;
         Ok(Self {
             schema,
@@ -159,6 +221,34 @@ fn validate_header(header: &[String], path: &std::path::Path) -> Result<(), Serv
         )));
     }
     Ok(())
+}
+
+fn validate_object_header(header: &[String], display: &str) -> Result<(), ServerError> {
+    if header.is_empty() || header.iter().any(String::is_empty) {
+        return Err(ServerError::CopyFormat(format!(
+            "read_csv header contains an empty column name: {display}"
+        )));
+    }
+    Ok(())
+}
+
+fn path_specs_use_object_store(
+    function_name: &str,
+    patterns: &[String],
+) -> Result<bool, ServerError> {
+    let object_count = patterns
+        .iter()
+        .filter(|pattern| is_object_store_uri(pattern))
+        .count();
+    if object_count == 0 {
+        return Ok(false);
+    }
+    if object_count == patterns.len() {
+        return Ok(true);
+    }
+    Err(ServerError::CopyFormat(format!(
+        "{function_name}: cannot mix local and object-store paths"
+    )))
 }
 
 /// Single-row scan for `sniff_csv(path)`.

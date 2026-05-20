@@ -13,6 +13,7 @@ members = [
     "crates/ultrasql-vec",
     "crates/ultrasql-catalog",
     "crates/ultrasql-protocol",
+    "crates/ultrasql-objectstore",
     "crates/ultrasql-server",
     "crates/ultrasql-cli",
     "crates/ultrasql-bench",
@@ -49,6 +50,7 @@ ultrasql-executor  = { path = "crates/ultrasql-executor",  version = "0.0.1" }
 ultrasql-vec       = { path = "crates/ultrasql-vec",       version = "0.0.1" }
 ultrasql-catalog   = { path = "crates/ultrasql-catalog",   version = "0.0.1" }
 ultrasql-protocol  = { path = "crates/ultrasql-protocol",  version = "0.0.1" }
+ultrasql-objectstore = { path = "crates/ultrasql-objectstore", version = "0.0.1" }
 ultrasql-server    = { path = "crates/ultrasql-server",    version = "0.0.1" }
 
 # Error handling
@@ -79,6 +81,7 @@ bincode = "1"
 arrow-array  = "58.3.0"
 arrow-schema = "58.3.0"
 parquet      = "58.3.0"
+ureq         = "3"
 
 # Logging / tracing / metrics
 tracing            = "0.1"

@@ -5,8 +5,13 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use arrow_schema::DataType as ArrowDataType;
+use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use ultrasql_core::{DataType, Field, Schema, Value, csv::read_csv_header_from_specs};
+use ultrasql_core::{
+    DataType, Field, Schema, Value,
+    csv::{read_csv_data_from_text, read_csv_header_from_specs},
+};
+use ultrasql_objectstore::{is_object_store_uri, read_first_object_bytes};
 use ultrasql_parser::ast::{JoinCondition, JoinOp, TableRef};
 
 use super::{
@@ -238,11 +243,15 @@ fn bind_read_parquet_table_function(
         ));
     }
     let path_specs = read_file_path_specs("read_parquet", &bound_args[0])?;
-    let first_path = expand_file_path_specs("read_parquet", &path_specs)?
-        .into_iter()
-        .next()
-        .expect("path expansion returns at least one file");
-    let arrow_schema = read_parquet_arrow_schema(&first_path)?;
+    let arrow_schema = if path_specs_use_object_store("read_parquet", &path_specs)? {
+        read_parquet_object_schema(&path_specs)?
+    } else {
+        let first_path = expand_file_path_specs("read_parquet", &path_specs)?
+            .into_iter()
+            .next()
+            .expect("path expansion returns at least one file");
+        read_parquet_arrow_schema(&first_path)?
+    };
     let fields = arrow_schema
         .fields()
         .iter()
@@ -285,6 +294,19 @@ fn read_parquet_arrow_schema(path: &Path) -> Result<arrow_schema::SchemaRef, Pla
     Ok(builder.schema().clone())
 }
 
+fn read_parquet_object_schema(patterns: &[String]) -> Result<arrow_schema::SchemaRef, PlanError> {
+    let (location, bytes) = read_first_object_bytes(patterns)
+        .map_err(|err| PlanError::TypeMismatch(format!("read_parquet: {err}")))?;
+    let bytes = Bytes::from(bytes);
+    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|err| {
+        PlanError::TypeMismatch(format!(
+            "read_parquet cannot inspect {}: {err}",
+            location.display_uri()
+        ))
+    })?;
+    Ok(builder.schema().clone())
+}
+
 fn parquet_arrow_type_to_sql(data_type: &ArrowDataType) -> Result<DataType, PlanError> {
     match data_type {
         ArrowDataType::Boolean => Ok(DataType::Bool),
@@ -309,8 +331,7 @@ fn bind_read_csv_table_function(
         ));
     }
     let path_specs = read_csv_path_specs(&bound_args[0])?;
-    let header = read_csv_header_from_specs(&path_specs)
-        .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))?;
+    let header = read_csv_header_from_path_specs(&path_specs)?;
     let mut fields = header
         .into_iter()
         .map(|name| Field::nullable(name, DataType::Text { max_len: None }))
@@ -364,6 +385,50 @@ fn read_file_path_specs(function_name: &str, arg: &ScalarExpr) -> Result<Vec<Str
             "{function_name}: argument must be a string literal or text array literal"
         ))),
     }
+}
+
+fn read_csv_header_from_path_specs(path_specs: &[String]) -> Result<Vec<String>, PlanError> {
+    if path_specs_use_object_store("read_csv", path_specs)? {
+        let (location, bytes) = read_first_object_bytes(path_specs)
+            .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))?;
+        let text = String::from_utf8(bytes).map_err(|err| {
+            PlanError::TypeMismatch(format!(
+                "read_csv: {} is not UTF-8: {err}",
+                location.display_uri()
+            ))
+        })?;
+        let data = read_csv_data_from_text(&location.display_uri(), &text)
+            .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))?;
+        let header = data.header;
+        if header.is_empty() || header.iter().any(String::is_empty) {
+            return Err(PlanError::TypeMismatch(format!(
+                "read_csv: header contains an empty column name: {}",
+                location.display_uri()
+            )));
+        }
+        return Ok(header);
+    }
+    read_csv_header_from_specs(path_specs)
+        .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))
+}
+
+fn path_specs_use_object_store(
+    function_name: &str,
+    path_specs: &[String],
+) -> Result<bool, PlanError> {
+    let object_count = path_specs
+        .iter()
+        .filter(|spec| is_object_store_uri(spec))
+        .count();
+    if object_count == 0 {
+        return Ok(false);
+    }
+    if object_count == path_specs.len() {
+        return Ok(true);
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "{function_name}: cannot mix local and object-store paths"
+    )))
 }
 
 fn expand_file_path_specs(

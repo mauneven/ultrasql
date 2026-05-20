@@ -440,10 +440,19 @@ pub fn read_csv_records_from_path(path: &Path) -> Result<Vec<Vec<String>>, CsvEr
 pub fn read_csv_data_from_path(path: &Path) -> Result<CsvReadData, CsvError> {
     let text = fs::read_to_string(path)
         .map_err(|err| CsvError::new(format!("read_csv cannot read {}: {err}", path.display())))?;
-    let sniff = sniff_csv_text(&path.display().to_string(), &text)
-        .map_err(|err| CsvError::new(format!("read_csv sniff {}: {err}", path.display())))?;
-    let parsed = parse_csv_records_with_options(&text, sniff.parse_options())
-        .map_err(|err| CsvError::new(format!("read_csv parse {}: {err}", path.display())))?;
+    read_csv_data_from_text(&path.display().to_string(), &text)
+}
+
+/// Read one UTF-8 CSV string using sniffer-derived dialect and header metadata.
+///
+/// # Errors
+///
+/// Returns [`CsvError`] on CSV syntax or inconsistent row width.
+pub fn read_csv_data_from_text(path: &str, text: &str) -> Result<CsvReadData, CsvError> {
+    let sniff = sniff_csv_text(path, text)
+        .map_err(|err| CsvError::new(format!("read_csv sniff {path}: {err}")))?;
+    let parsed = parse_csv_records_with_options(text, sniff.parse_options())
+        .map_err(|err| CsvError::new(format!("read_csv parse {path}: {err}")))?;
     let width = sniff.columns.len();
     let data_start = usize::from(sniff.has_header);
     let mut records = Vec::new();
@@ -452,7 +461,7 @@ pub fn read_csv_data_from_path(path: &Path) -> Result<CsvReadData, CsvError> {
             return Err(CsvError::new(format!(
                 "read_csv row {} in {} has {} columns, expected {}",
                 row_index + 1,
-                path.display(),
+                path,
                 record.len(),
                 width
             )));

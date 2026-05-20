@@ -10,12 +10,14 @@ use arrow_array::{
     RecordBatch, StringArray,
 };
 use arrow_schema::{ArrowError, DataType as ArrowDataType, Schema as ArrowSchema};
+use bytes::Bytes;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowPredicateFn, ParquetRecordBatchReaderBuilder, RowFilter};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::statistics::Statistics;
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_executor::{ExecError, Operator};
+use ultrasql_objectstore::{expand_object_store_specs, is_object_store_uri, read_object_bytes};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_vec::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
@@ -39,8 +41,44 @@ impl ParquetTableScan {
         projection: Option<&[String]>,
         predicate: Option<&ParquetPredicate>,
     ) -> Result<Self, ServerError> {
+        if path_specs_use_object_store("read_parquet", patterns)? {
+            return Self::from_object_specs(patterns, projection, predicate);
+        }
         let paths = expand_parquet_path_specs(patterns)?;
         Self::from_paths(paths, projection, predicate)
+    }
+
+    fn from_object_specs(
+        patterns: &[String],
+        projection: Option<&[String]>,
+        predicate: Option<&ParquetPredicate>,
+    ) -> Result<Self, ServerError> {
+        let objects = expand_object_store_specs(patterns)
+            .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
+        let Some(first_object) = objects.first() else {
+            return Err(ServerError::CopyFormat(
+                "read_parquet path list cannot be empty".to_owned(),
+            ));
+        };
+        let base_arrow_schema = read_object_arrow_schema(first_object)?;
+        let projection = resolve_projection_names(base_arrow_schema.as_ref(), projection)?;
+        let predicate = predicate
+            .map(|p| p.resolved_for_schema(base_arrow_schema.as_ref()))
+            .transpose()?;
+        let schema = parquet_schema_to_ultrasql(base_arrow_schema.as_ref(), projection.as_deref())?;
+        let mut batches = VecDeque::new();
+
+        for object in objects {
+            append_object_batches(
+                &object,
+                base_arrow_schema.as_ref(),
+                projection.as_deref(),
+                predicate.as_ref(),
+                &mut batches,
+            )?;
+        }
+
+        Ok(Self { schema, batches })
     }
 
     fn from_paths(
@@ -229,6 +267,64 @@ fn append_path_batches(
     Ok(())
 }
 
+fn append_object_batches(
+    object: &ultrasql_objectstore::ObjectLocation,
+    expected_schema: &ArrowSchema,
+    projection: Option<&[String]>,
+    predicate: Option<&ParquetPredicate>,
+    batches: &mut VecDeque<ultrasql_vec::Batch>,
+) -> Result<(), ServerError> {
+    let display = object.display_uri();
+    let bytes = read_object_bytes(object)
+        .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes)).map_err(|err| {
+        ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
+    })?;
+    if builder.schema().as_ref() != expected_schema {
+        return Err(ServerError::CopyFormat(format!(
+            "read_parquet schema mismatch in {display}"
+        )));
+    }
+
+    let projection_mask = match projection {
+        Some(names) => ProjectionMask::columns(
+            builder.parquet_schema(),
+            names.iter().map(std::string::String::as_str),
+        ),
+        None => ProjectionMask::all(),
+    };
+    let row_groups = predicate
+        .map(|p| select_row_groups(builder.metadata(), expected_schema, p))
+        .transpose()?;
+    if row_groups.as_ref().is_some_and(Vec::is_empty) {
+        return Ok(());
+    }
+    let row_filter = predicate.map(|p| p.row_filter(builder.parquet_schema()));
+
+    let mut builder = builder
+        .with_batch_size(PARQUET_BATCH_TARGET_ROWS)
+        .with_projection(projection_mask);
+    if let Some(row_groups) = row_groups {
+        builder = builder.with_row_groups(row_groups);
+    }
+    if let Some(row_filter) = row_filter {
+        builder = builder.with_row_filter(row_filter);
+    }
+    let reader = builder.build().map_err(|err| {
+        ServerError::CopyFormat(format!("read_parquet cannot read {display}: {err}"))
+    })?;
+    for batch in reader {
+        let batch = batch.map_err(|err| {
+            ServerError::CopyFormat(format!("read_parquet read {display}: {err}"))
+        })?;
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        batches.push_back(arrow_batch_to_ultrasql(&batch)?);
+    }
+    Ok(())
+}
+
 fn read_arrow_schema(path: &Path) -> Result<arrow_schema::SchemaRef, ServerError> {
     let file = File::open(path).map_err(|err| {
         ServerError::CopyFormat(format!(
@@ -241,6 +337,18 @@ fn read_arrow_schema(path: &Path) -> Result<arrow_schema::SchemaRef, ServerError
             "read_parquet cannot inspect {}: {err}",
             path.display()
         ))
+    })?;
+    Ok(builder.schema().clone())
+}
+
+fn read_object_arrow_schema(
+    object: &ultrasql_objectstore::ObjectLocation,
+) -> Result<arrow_schema::SchemaRef, ServerError> {
+    let display = object.display_uri();
+    let bytes = read_object_bytes(object)
+        .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes)).map_err(|err| {
+        ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
     })?;
     Ok(builder.schema().clone())
 }
@@ -797,6 +905,25 @@ fn expand_parquet_path_specs(patterns: &[String]) -> Result<Vec<PathBuf>, Server
         paths.extend(expand_parquet_paths(pattern)?);
     }
     Ok(paths)
+}
+
+fn path_specs_use_object_store(
+    function_name: &str,
+    patterns: &[String],
+) -> Result<bool, ServerError> {
+    let object_count = patterns
+        .iter()
+        .filter(|pattern| is_object_store_uri(pattern))
+        .count();
+    if object_count == 0 {
+        return Ok(false);
+    }
+    if object_count == patterns.len() {
+        return Ok(true);
+    }
+    Err(ServerError::CopyFormat(format!(
+        "{function_name}: cannot mix local and object-store paths"
+    )))
 }
 
 fn expand_parquet_paths(pattern: &str) -> Result<Vec<PathBuf>, ServerError> {

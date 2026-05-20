@@ -11,8 +11,11 @@
 //! tables.
 
 use std::fs;
+use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
 use std::time::Duration;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
@@ -21,8 +24,180 @@ use parquet::arrow::ArrowWriter;
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
+static S3_ENDPOINT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 fn sql_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+struct EnvVarGuard<'a> {
+    _lock: MutexGuard<'a, ()>,
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard<'_> {
+    fn set(key: &'static str, value: &str) -> Self {
+        let guard = S3_ENDPOINT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let old = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        Self {
+            _lock: guard,
+            key,
+            old,
+        }
+    }
+}
+
+impl Drop for EnvVarGuard<'_> {
+    fn drop(&mut self) {
+        match &self.old {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+struct MockS3 {
+    endpoint: String,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl MockS3 {
+    fn new(objects: Vec<(&str, Vec<u8>)>) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock s3");
+        listener.set_nonblocking(true).expect("mock s3 nonblocking");
+        let endpoint = format!("http://{}", listener.local_addr().expect("mock addr"));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let objects = objects
+            .into_iter()
+            .map(|(path, body)| (path.to_owned(), body))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => handle_mock_s3_stream(&mut stream, &objects),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_err) => break,
+                }
+            }
+        });
+        Self {
+            endpoint,
+            shutdown,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for MockS3 {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = std::net::TcpStream::connect(
+            self.endpoint
+                .strip_prefix("http://")
+                .expect("mock endpoint prefix"),
+        );
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("mock s3 thread joins");
+        }
+    }
+}
+
+fn handle_mock_s3_stream(
+    stream: &mut std::net::TcpStream,
+    objects: &std::collections::BTreeMap<String, Vec<u8>>,
+) {
+    let mut buf = [0_u8; 4096];
+    let Ok(n) = stream.read(&mut buf) else {
+        return;
+    };
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let Some(target) = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+    else {
+        return;
+    };
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if query.contains("list-type=2") {
+        let prefix = query_param(query, "prefix").unwrap_or_default();
+        let bucket = path.trim_start_matches('/');
+        let path_prefix = format!("/{bucket}/{prefix}");
+        let mut body = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult><IsTruncated>false</IsTruncated>",
+        );
+        for key in objects.keys() {
+            if key.starts_with(&path_prefix) {
+                let object_key = key
+                    .strip_prefix(&format!("/{bucket}/"))
+                    .expect("bucket prefix");
+                body.push_str("<Contents><Key>");
+                body.push_str(object_key);
+                body.push_str("</Key></Contents>");
+            }
+        }
+        body.push_str("</ListBucketResult>");
+        write_mock_response(stream, 200, "application/xml", body.as_bytes());
+        return;
+    }
+    if let Some(body) = objects.get(path) {
+        write_mock_response(stream, 200, "application/octet-stream", body);
+    } else {
+        write_mock_response(stream, 404, "text/plain", b"not found");
+    }
+}
+
+fn query_param(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        if key == name {
+            Some(percent_decode(value))
+        } else {
+            None
+        }
+    })
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &value[i + 1..i + 3];
+            if let Ok(decoded) = u8::from_str_radix(hex, 16) {
+                out.push(decoded);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).expect("mock query utf8")
+}
+
+fn write_mock_response(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) {
+    let reason = if status == 200 { "OK" } else { "Not Found" };
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body);
 }
 
 fn write_people_parquet(
@@ -234,6 +409,84 @@ async fn read_csv_glob_reads_matching_files_in_stable_order() {
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn read_csv_s3_glob_reads_matching_objects() {
+    let mock = MockS3::new(vec![
+        ("/lake/logs/b.csv", b"id,name\n2,Beta\n".to_vec()),
+        ("/lake/logs/a.csv", b"id,name\n1,Alpha\n".to_vec()),
+        ("/lake/logs/ignore.txt", b"id,name\n9,Nope\n".to_vec()),
+    ]);
+    let _env = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", &mock.endpoint);
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let rows = client
+        .query(
+            "SELECT id, name, _filename, _row_number \
+             FROM read_csv('s3://lake/logs/*.csv') ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("read_csv s3 glob");
+    let values: Vec<(String, String, String, i64)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, i64>(3),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (
+                "1".to_string(),
+                "Alpha".to_string(),
+                "s3://lake/logs/a.csv".to_string(),
+                1,
+            ),
+            (
+                "2".to_string(),
+                "Beta".to_string(),
+                "s3://lake/logs/b.csv".to_string(),
+                1,
+            ),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn read_csv_rejects_mixed_local_and_object_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv_path = dir.path().join("people.csv");
+    fs::write(&csv_path, "id,name\n1,Ada\n").expect("write csv");
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT * FROM read_csv([{}, 's3://lake/logs/a.csv'])",
+        sql_string(csv_path.to_str().expect("utf8 csv path")),
+    );
+
+    let err = client
+        .query(&sql, &[])
+        .await
+        .expect_err("mixed read_csv paths must error");
+    let db_err = err.as_db_error().expect("server-sent ErrorResponse");
+    assert!(
+        db_err
+            .message()
+            .contains("cannot mix local and object-store paths"),
+        "unexpected mixed read_csv error: {}",
+        db_err.message()
+    );
+
+    shutdown(client, server_handle).await;
+}
+
 #[tokio::test]
 async fn read_csv_array_reads_files_in_argument_order_with_virtual_columns() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -345,6 +598,78 @@ async fn read_parquet_glob_reads_matching_files_in_stable_order() {
             (20, "Beta".to_string()),
             (21, "Beta-2".to_string()),
         ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_parquet_s3_glob_reads_matching_objects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = dir.path().join("a.parquet");
+    let second = dir.path().join("b.parquet");
+    write_people_parquet(&first, &[(10, "Alpha", 1)], &[]);
+    write_people_parquet(&second, &[(20, "Beta", 2)], &[(21, "Beta-2", 3)]);
+    let mock = MockS3::new(vec![
+        (
+            "/lake/parquet/b.parquet",
+            fs::read(&second).expect("read second parquet"),
+        ),
+        (
+            "/lake/parquet/a.parquet",
+            fs::read(&first).expect("read first parquet"),
+        ),
+        ("/lake/parquet/ignore.txt", b"not parquet".to_vec()),
+    ]);
+    let _env = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", &mock.endpoint);
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let rows = client
+        .query(
+            "SELECT id, name FROM read_parquet('s3://lake/parquet/*.parquet') ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("read_parquet s3 glob");
+    let values: Vec<(i64, String)> = rows
+        .iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (10, "Alpha".to_string()),
+            (20, "Beta".to_string()),
+            (21, "Beta-2".to_string()),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn read_parquet_rejects_mixed_local_and_object_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let parquet_path = dir.path().join("people.parquet");
+    write_people_parquet(&parquet_path, &[(1, "Ada", 1)], &[]);
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT * FROM read_parquet([{}, 's3://lake/parquet/a.parquet'])",
+        sql_string(parquet_path.to_str().expect("utf8 parquet path")),
+    );
+
+    let err = client
+        .query(&sql, &[])
+        .await
+        .expect_err("mixed read_parquet paths must error");
+    let db_err = err.as_db_error().expect("server-sent ErrorResponse");
+    assert!(
+        db_err
+            .message()
+            .contains("cannot mix local and object-store paths"),
+        "unexpected mixed read_parquet error: {}",
+        db_err.message()
     );
 
     shutdown(client, server_handle).await;
