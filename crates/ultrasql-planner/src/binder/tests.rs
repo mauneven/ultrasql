@@ -440,6 +440,25 @@ fn binds_vector_distance_rejects_dimension_mismatch() {
 }
 
 #[test]
+fn binds_vector_inner_product_functions_as_float64() {
+    let cat = embeddings_catalog();
+    let plan = parse_and_bind(
+        "SELECT inner_product(embedding, VECTOR '[4,5,6]'), \
+                dot_product(embedding, VECTOR '[4,5,6]') \
+         FROM embeddings",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::Project { exprs, schema, .. } = &plan else {
+        panic!("expected Project, got {plan:?}");
+    };
+    assert_eq!(exprs[0].0.data_type(), DataType::Float64);
+    assert_eq!(exprs[1].0.data_type(), DataType::Float64);
+    assert_eq!(schema.field_at(0).data_type, DataType::Float64);
+    assert_eq!(schema.field_at(1).data_type, DataType::Float64);
+}
+
+#[test]
 fn binds_vector_typed_literal_projection() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind("SELECT VECTOR '[1,2,3]'", &cat).expect("bind ok");

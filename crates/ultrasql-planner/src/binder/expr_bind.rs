@@ -918,6 +918,7 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
         "string_to_array" | "array_cat" => {
             Ok(DataType::Array(Box::new(DataType::Text { max_len: None })))
         }
+        "inner_product" | "dot_product" => Ok(DataType::Float64),
         _ => Err(PlanError::NotSupported("non-aggregate function calls")),
     }
 }
@@ -948,6 +949,8 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "array_to_string"
             | "string_to_array"
             | "array_cat"
+            | "inner_product"
+            | "dot_product"
     )
 }
 

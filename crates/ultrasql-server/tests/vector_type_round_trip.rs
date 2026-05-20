@@ -178,6 +178,8 @@ async fn vector_distance_operators_execute_in_sql() {
             "SELECT \
                  embedding <-> '[1,2,4]', \
                  embedding <#> '[4,5,6]', \
+                 inner_product(embedding, VECTOR '[4,5,6]'), \
+                 dot_product(embedding, VECTOR '[4,5,6]'), \
                  embedding <=> '[3,-6,3]', \
                  embedding <+> '[3,2,-1]' \
              FROM embeddings WHERE id = 1",
@@ -190,6 +192,8 @@ async fn vector_distance_operators_execute_in_sql() {
         vec![vec![
             "1".to_owned(),
             "-32".to_owned(),
+            "32".to_owned(),
+            "32".to_owned(),
             "1".to_owned(),
             "6".to_owned()
         ]]

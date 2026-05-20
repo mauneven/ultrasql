@@ -259,6 +259,7 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "array_to_string" => eval_array_to_string(args),
         "string_to_array" => eval_string_to_array(args),
         "array_cat" => eval_array_cat(args),
+        "inner_product" | "dot_product" => eval_vector_metric(args, VectorDistanceOp::InnerProduct),
         "coalesce" => Ok(args
             .iter()
             .find(|v| !matches!(v, Value::Null))
@@ -1052,9 +1053,23 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
 #[derive(Clone, Copy, Debug)]
 enum VectorDistanceOp {
     L2,
+    InnerProduct,
     NegativeInnerProduct,
     Cosine,
     L1,
+}
+
+fn eval_vector_metric(args: &[Value], op: VectorDistanceOp) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "vector metric: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    if matches!(args, [Value::Null, _] | [_, Value::Null]) {
+        return Ok(Value::Null);
+    }
+    vector_distance(args[0].clone(), args[1].clone(), op)
 }
 
 fn vector_distance(left: Value, right: Value, op: VectorDistanceOp) -> Result<Value, EvalError> {
@@ -1095,6 +1110,11 @@ fn vector_distance(left: Value, right: Value, op: VectorDistanceOp) -> Result<Va
             })
             .sum::<f64>()
             .sqrt(),
+        VectorDistanceOp::InnerProduct => left
+            .iter()
+            .zip(right.iter())
+            .map(|(l, r)| f64::from(*l) * f64::from(*r))
+            .sum::<f64>(),
         VectorDistanceOp::NegativeInnerProduct => -left
             .iter()
             .zip(right.iter())
@@ -2524,6 +2544,21 @@ mod tests {
             lit_vector(vec![4.0, 5.0, 6.0]),
         ));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Float64(-32.0));
+    }
+
+    #[test]
+    fn vector_inner_product_functions_evaluate_positive_dot() {
+        for name in ["inner_product", "dot_product"] {
+            let ev = Eval::new(call(
+                name,
+                vec![
+                    lit_vector(vec![1.0, 2.0, 3.0]),
+                    lit_vector(vec![4.0, 5.0, 6.0]),
+                ],
+                DataType::Float64,
+            ));
+            assert_eq!(ev.eval(&[]).unwrap(), Value::Float64(32.0), "{name}");
+        }
     }
 
     #[test]
