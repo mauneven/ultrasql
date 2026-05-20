@@ -61,6 +61,19 @@ const COPY_INSERT_BATCH_ROWS: usize = 4096;
 const COPY_AUTODETECT_SAMPLE_BYTES: usize = 64 * 1024;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
+struct CopyRejectTarget {
+    entry: TableEntry,
+    codec: RowCodec,
+    payload_batch: Vec<Vec<u8>>,
+    rows: u64,
+}
+
+struct CopyRejectState {
+    max_errors: u64,
+    bad_rows: u64,
+    target: Option<CopyRejectTarget>,
+}
+
 impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
@@ -166,6 +179,9 @@ where
             null_str,
             header,
             auto_detect,
+            ignore_errors,
+            max_errors,
+            reject_table,
             schema,
         } = plan
         else {
@@ -184,6 +200,13 @@ where
             null_str: null_str.clone(),
             header: *header,
             auto_detect: *auto_detect,
+            ignore_errors: *ignore_errors,
+            max_errors: if *ignore_errors && *max_errors == 0 {
+                1000
+            } else {
+                *max_errors
+            },
+            reject_table: reject_table.clone(),
         };
 
         if let Some(input) = input {
@@ -615,6 +638,7 @@ where
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let codec = RowCodec::new(entry.schema.clone());
         let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(COPY_INSERT_BATCH_ROWS);
+        let mut reject_state = self.copy_reject_state(&effective_opts)?;
 
         let stream_result = self.copy_text_file_stream_into_table(
             entry,
@@ -625,6 +649,8 @@ where
             &txn,
             &mut reader,
             &mut payload_batch,
+            reject_state.as_mut(),
+            path,
         );
         let rows = match stream_result {
             Ok(rows) => rows,
@@ -640,6 +666,12 @@ where
         }
         self.state.note_commit_for_gc();
         self.state.note_table_modifications(&entry.name, rows);
+        if let Some(reject_target) = reject_state.and_then(|state| state.target) {
+            if reject_target.rows > 0 {
+                self.state
+                    .note_table_modifications(&reject_target.entry.name, reject_target.rows);
+            }
+        }
         self.send_copy_complete(rows, emit_ready_for_query).await
     }
 
@@ -660,6 +692,92 @@ where
         Ok(detected)
     }
 
+    fn copy_reject_state(
+        &self,
+        opts: &CopyOptions,
+    ) -> Result<Option<CopyRejectState>, ServerError> {
+        if !opts.ignore_errors {
+            return Ok(None);
+        }
+        let target = if let Some(table_name) = &opts.reject_table {
+            let catalog_snapshot = self.state.catalog_snapshot();
+            let entry = catalog_snapshot
+                .tables
+                .get(&table_name.to_ascii_lowercase())
+                .ok_or_else(|| {
+                    ServerError::CopyFormat(format!("COPY reject_table not found: {table_name}"))
+                })?
+                .clone();
+            validate_copy_reject_table(&entry)?;
+            Some(CopyRejectTarget {
+                codec: RowCodec::new(entry.schema.clone()),
+                entry,
+                payload_batch: Vec::with_capacity(COPY_INSERT_BATCH_ROWS),
+                rows: 0,
+            })
+        } else {
+            None
+        };
+        Ok(Some(CopyRejectState {
+            max_errors: opts.max_errors.max(1),
+            bad_rows: 0,
+            target,
+        }))
+    }
+
+    fn record_copy_reject(
+        &self,
+        state: &mut CopyRejectState,
+        path: &str,
+        line_number: u64,
+        raw_record: &[u8],
+        err: &ServerError,
+        txn: &Transaction,
+    ) -> Result<(), ServerError> {
+        let next_bad_rows = state.bad_rows.saturating_add(1);
+        if next_bad_rows > state.max_errors {
+            return Err(ServerError::CopyFormat(format!(
+                "COPY max_errors exceeded: {next_bad_rows} bad rows (limit {})",
+                state.max_errors
+            )));
+        }
+        state.bad_rows = next_bad_rows;
+        let Some(target) = state.target.as_mut() else {
+            return Ok(());
+        };
+        let line_number = i64::try_from(line_number)
+            .map_err(|_| ServerError::CopyFormat("COPY reject line_number overflow".to_string()))?;
+        let row = vec![
+            Value::Text(path.to_owned()),
+            Value::Int64(line_number),
+            Value::Text(String::from_utf8_lossy(raw_record).into_owned()),
+            Value::Text(err.to_string()),
+        ];
+        let payload = target
+            .codec
+            .encode(&row)
+            .map_err(|e| ServerError::CopyFormat(format!("COPY reject row encode: {e}")))?;
+        target.payload_batch.push(payload);
+        target.rows = target.rows.saturating_add(1);
+        if target.payload_batch.len() == COPY_INSERT_BATCH_ROWS {
+            self.flush_copy_reject_batch(target, txn)?;
+        }
+        Ok(())
+    }
+
+    fn flush_copy_reject_batch(
+        &self,
+        target: &mut CopyRejectTarget,
+        txn: &Transaction,
+    ) -> Result<(), ServerError> {
+        if target.payload_batch.is_empty() {
+            return Ok(());
+        }
+        self.flush_copy_insert_batch(&target.entry, &target.payload_batch, txn)?;
+        target.payload_batch.clear();
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn copy_text_file_stream_into_table(
         &self,
@@ -671,11 +789,15 @@ where
         txn: &Transaction,
         reader: &mut dyn BufRead,
         payload_batch: &mut Vec<Vec<u8>>,
+        mut reject_state: Option<&mut CopyRejectState>,
+        path: &str,
     ) -> Result<u64, ServerError> {
         let mut rows_inserted = 0_u64;
         let mut header_skipped = !opts.header;
         let mut record = Vec::new();
         let mut line = Vec::new();
+        let mut physical_line_number = 0_u64;
+        let mut record_start_line = 1_u64;
 
         loop {
             line.clear();
@@ -685,6 +807,10 @@ where
             if bytes_read == 0 {
                 break;
             }
+            if record.is_empty() {
+                record_start_line = physical_line_number.saturating_add(1);
+            }
+            physical_line_number = physical_line_number.saturating_add(1);
             record.extend_from_slice(&line);
             if opts.format == ServerCopyFormat::Csv && !csv_record_complete(&record, opts)? {
                 continue;
@@ -697,7 +823,24 @@ where
             if record.is_empty() {
                 continue;
             }
-            let payload = decode_one_copy_row(&record, entry, columns, schema, codec, opts)?;
+            let payload = match decode_one_copy_row(&record, entry, columns, schema, codec, opts) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    if let Some(state) = reject_state.as_deref_mut() {
+                        self.record_copy_reject(
+                            state,
+                            path,
+                            record_start_line,
+                            &record,
+                            &err,
+                            txn,
+                        )?;
+                        record.clear();
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
             record.clear();
             payload_batch.push(payload);
             if payload_batch.len() == COPY_INSERT_BATCH_ROWS {
@@ -710,21 +853,66 @@ where
 
         if !record.is_empty() {
             if opts.format == ServerCopyFormat::Csv && !csv_record_complete(&record, opts)? {
-                return Err(ServerError::CopyFormat(
-                    "unterminated quoted field in CSV input".to_string(),
-                ));
+                let err =
+                    ServerError::CopyFormat("unterminated quoted field in CSV input".to_string());
+                if let Some(state) = reject_state.as_deref_mut() {
+                    self.record_copy_reject(state, path, record_start_line, &record, &err, txn)?;
+                    record.clear();
+                } else {
+                    return Err(err);
+                }
             }
-            if header_skipped {
-                let payload = decode_one_copy_row(&record, entry, columns, schema, codec, opts)?;
+            if header_skipped && !record.is_empty() {
+                let payload =
+                    match decode_one_copy_row(&record, entry, columns, schema, codec, opts) {
+                        Ok(payload) => payload,
+                        Err(err) => {
+                            if let Some(state) = reject_state.as_deref_mut() {
+                                self.record_copy_reject(
+                                    state,
+                                    path,
+                                    record_start_line,
+                                    &record,
+                                    &err,
+                                    txn,
+                                )?;
+                                record.clear();
+                                return self.finish_copy_stream_batches(
+                                    entry,
+                                    payload_batch,
+                                    txn,
+                                    rows_inserted,
+                                    reject_state,
+                                );
+                            }
+                            return Err(err);
+                        }
+                    };
                 payload_batch.push(payload);
             }
         }
 
+        self.finish_copy_stream_batches(entry, payload_batch, txn, rows_inserted, reject_state)
+    }
+
+    fn finish_copy_stream_batches(
+        &self,
+        entry: &TableEntry,
+        payload_batch: &mut Vec<Vec<u8>>,
+        txn: &Transaction,
+        mut rows_inserted: u64,
+        reject_state: Option<&mut CopyRejectState>,
+    ) -> Result<u64, ServerError> {
         if !payload_batch.is_empty() {
             let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
             self.flush_copy_insert_batch(entry, payload_batch, txn)?;
             rows_inserted = rows_inserted.saturating_add(batch_len);
             payload_batch.clear();
+        }
+        if let Some(state) = reject_state {
+            if let Some(target) = state.target.as_mut() {
+                self.flush_copy_reject_batch(target, txn)?;
+            }
         }
         Ok(rows_inserted)
     }
@@ -1006,6 +1194,46 @@ where
                 }
             }
         }
+    }
+}
+
+fn validate_copy_reject_table(entry: &TableEntry) -> Result<(), ServerError> {
+    let fields = entry.schema.fields();
+    if fields.len() != 4 {
+        return Err(ServerError::CopyFormat(format!(
+            "COPY reject_table {} must have columns filename TEXT, line_number BIGINT, raw_row TEXT, error TEXT",
+            entry.name
+        )));
+    }
+    let expected = [
+        ("filename", RejectColumnType::Text),
+        ("line_number", RejectColumnType::Int64),
+        ("raw_row", RejectColumnType::Text),
+        ("error", RejectColumnType::Text),
+    ];
+    for (field, (name, ty)) in fields.iter().zip(expected) {
+        if !field.name.eq_ignore_ascii_case(name)
+            || !reject_column_type_matches(&field.data_type, ty)
+        {
+            return Err(ServerError::CopyFormat(format!(
+                "COPY reject_table {} must have columns filename TEXT, line_number BIGINT, raw_row TEXT, error TEXT",
+                entry.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum RejectColumnType {
+    Text,
+    Int64,
+}
+
+fn reject_column_type_matches(data_type: &DataType, expected: RejectColumnType) -> bool {
+    match expected {
+        RejectColumnType::Text => matches!(data_type, DataType::Text { .. }),
+        RejectColumnType::Int64 => *data_type == DataType::Int64,
     }
 }
 

@@ -1576,12 +1576,18 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
         };
         let mut header = false;
         let mut auto_detect = false;
+        let mut ignore_errors = false;
+        let mut max_errors = 0_u64;
+        let mut reject_table = None;
         for opt in &s.options {
             match opt {
                 CopyOption::Format(_) => {}
                 CopyOption::Delimiter(c) => delimiter = *c,
                 CopyOption::Header(v) => header = *v,
                 CopyOption::AutoDetect(v) => auto_detect = *v,
+                CopyOption::IgnoreErrors(v) => ignore_errors = *v,
+                CopyOption::MaxErrors(v) => max_errors = *v,
+                CopyOption::RejectTable(v) => reject_table = Some(v.to_ascii_lowercase()),
                 CopyOption::Null(v) => null_str.clone_from(v),
             }
         }
@@ -1596,6 +1602,9 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
             null_str,
             header,
             auto_detect,
+            ignore_errors,
+            max_errors,
+            reject_table,
             schema,
         });
     }
@@ -1657,12 +1666,18 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
     };
     let mut header = false;
     let mut auto_detect = false;
+    let mut ignore_errors = false;
+    let mut max_errors = 0_u64;
+    let mut reject_table = None;
     for opt in &s.options {
         match opt {
             CopyOption::Format(_) => { /* applied above */ }
             CopyOption::Delimiter(c) => delimiter = *c,
             CopyOption::Header(v) => header = *v,
             CopyOption::AutoDetect(v) => auto_detect = *v,
+            CopyOption::IgnoreErrors(v) => ignore_errors = *v,
+            CopyOption::MaxErrors(v) => max_errors = *v,
+            CopyOption::RejectTable(v) => reject_table = Some(v.to_ascii_lowercase()),
             CopyOption::Null(v) => null_str.clone_from(v),
         }
     }
@@ -1678,6 +1693,9 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
         null_str,
         header,
         auto_detect,
+        ignore_errors,
+        max_errors,
+        reject_table,
         schema: stream_schema,
     })
 }

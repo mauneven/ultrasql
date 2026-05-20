@@ -6,13 +6,16 @@
 //! COPY table [(col_list)] { FROM | TO } { STDIN | STDOUT | 'file' }
 //! COPY (SELECT ...) TO { STDOUT | 'file' }
 //!     [WITH (FORMAT { TEXT | CSV | BINARY }, DELIMITER 'c',
-//!            HEADER [bool], AUTO_DETECT [bool], NULL 'string')]
+//!            HEADER [bool], AUTO_DETECT [bool], IGNORE_ERRORS [bool],
+//!            MAX_ERRORS n, REJECT_TABLE 'table', NULL 'string')]
 //! ```
 
 use crate::ast::{CopyDirection, CopyFormat, CopyOption, CopySource, CopyStmt, Identifier};
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
 use crate::token::TokenKind;
+
+const COPY_WITH_OPTION_EXPECTED: &str = "FORMAT, DELIMITER, HEADER, AUTO_DETECT, IGNORE_ERRORS, MAX_ERRORS, REJECT_TABLE, or NULL inside COPY WITH";
 
 impl Parser<'_> {
     /// Parse a complete `COPY` statement, starting from the `COPY` keyword.
@@ -203,6 +206,7 @@ impl Parser<'_> {
         match tok.kind {
             TokenKind::KwFormat => {
                 self.advance()?;
+                self.parse_copy_optional_equals()?;
                 let fmt_tok = *self.peek()?;
                 let fmt = match fmt_tok.kind {
                     TokenKind::KwText | TokenKind::Identifier => {
@@ -235,6 +239,7 @@ impl Parser<'_> {
             }
             TokenKind::KwDelimiter => {
                 self.advance()?;
+                self.parse_copy_optional_equals()?;
                 let value = self.parse_copy_string_literal("DELIMITER")?;
                 let mut chars = value.chars();
                 let first = chars.next().ok_or(ParseError::Expected {
@@ -253,33 +258,55 @@ impl Parser<'_> {
             }
             TokenKind::KwHeader => {
                 self.advance()?;
+                self.parse_copy_optional_equals()?;
                 let header_value = self.parse_copy_optional_bool()?;
                 Ok(CopyOption::Header(header_value))
             }
             TokenKind::Identifier => {
                 let raw = tok.text(self.source).unwrap_or("");
-                if !raw.eq_ignore_ascii_case("auto_detect") {
-                    return Err(ParseError::Expected {
-                        expected: "FORMAT, DELIMITER, HEADER, AUTO_DETECT, or NULL inside COPY WITH",
-                        found: tok.kind,
-                        offset: tok.span.start as usize,
-                    });
-                }
                 self.advance()?;
-                let auto_detect = self.parse_copy_optional_bool()?;
-                Ok(CopyOption::AutoDetect(auto_detect))
+                self.parse_copy_optional_equals()?;
+                if raw.eq_ignore_ascii_case("auto_detect") {
+                    let auto_detect = self.parse_copy_optional_bool()?;
+                    return Ok(CopyOption::AutoDetect(auto_detect));
+                }
+                if raw.eq_ignore_ascii_case("ignore_errors") {
+                    let ignore_errors = self.parse_copy_optional_bool()?;
+                    return Ok(CopyOption::IgnoreErrors(ignore_errors));
+                }
+                if raw.eq_ignore_ascii_case("max_errors") {
+                    let max_errors = self.parse_copy_u64_literal("MAX_ERRORS")?;
+                    return Ok(CopyOption::MaxErrors(max_errors));
+                }
+                if raw.eq_ignore_ascii_case("reject_table") {
+                    let table = self.parse_copy_string_literal("REJECT_TABLE")?;
+                    return Ok(CopyOption::RejectTable(table));
+                }
+                Err(ParseError::Expected {
+                    expected: COPY_WITH_OPTION_EXPECTED,
+                    found: tok.kind,
+                    offset: tok.span.start as usize,
+                })
             }
             TokenKind::KwNull => {
                 self.advance()?;
+                self.parse_copy_optional_equals()?;
                 let value = self.parse_copy_string_literal("NULL")?;
                 Ok(CopyOption::Null(value))
             }
             other => Err(ParseError::Expected {
-                expected: "FORMAT, DELIMITER, HEADER, AUTO_DETECT, or NULL inside COPY WITH",
+                expected: COPY_WITH_OPTION_EXPECTED,
                 found: other,
                 offset: tok.span.start as usize,
             }),
         }
+    }
+
+    fn parse_copy_optional_equals(&mut self) -> Result<(), ParseError> {
+        if self.peek()?.kind == TokenKind::Eq {
+            self.advance()?;
+        }
+        Ok(())
     }
 
     fn parse_copy_optional_bool(&mut self) -> Result<bool, ParseError> {
@@ -294,6 +321,25 @@ impl Parser<'_> {
             }
             _ => Ok(true),
         }
+    }
+
+    fn parse_copy_u64_literal(&mut self, label: &'static str) -> Result<u64, ParseError> {
+        let tok = *self.peek()?;
+        if tok.kind != TokenKind::Integer {
+            return Err(ParseError::Expected {
+                expected: "non-negative integer COPY option value",
+                found: tok.kind,
+                offset: tok.span.start as usize,
+            });
+        }
+        let raw = tok.text(self.source).unwrap_or("");
+        let value = raw.parse::<u64>().map_err(|_| ParseError::Expected {
+            expected: label,
+            found: tok.kind,
+            offset: tok.span.start as usize,
+        })?;
+        self.advance()?;
+        Ok(value)
     }
 
     fn parse_copy_string_literal(&mut self, label: &'static str) -> Result<String, ParseError> {
@@ -406,6 +452,29 @@ mod tests {
             })
             .expect("auto_detect option present");
         assert!(auto_detect);
+    }
+
+    #[test]
+    fn copy_with_quarantine_options() {
+        let stmt = parse_copy(
+            "COPY t FROM 'file.csv' WITH \
+             (FORMAT = csv, IGNORE_ERRORS = true, MAX_ERRORS = 1000, REJECT_TABLE = 'bad_rows')",
+        );
+        assert!(
+            stmt.options
+                .iter()
+                .any(|o| { matches!(o, CopyOption::IgnoreErrors(v) if *v) })
+        );
+        assert!(
+            stmt.options
+                .iter()
+                .any(|o| { matches!(o, CopyOption::MaxErrors(1000)) })
+        );
+        assert!(
+            stmt.options
+                .iter()
+                .any(|o| { matches!(o, CopyOption::RejectTable(table) if table == "bad_rows") })
+        );
     }
 
     #[test]

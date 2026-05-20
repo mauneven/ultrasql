@@ -251,6 +251,12 @@ pub enum CopyOption {
     Header(bool),
     /// `AUTO_DETECT [boolean]` — infer CSV dialect/header metadata.
     AutoDetect(bool),
+    /// `IGNORE_ERRORS [boolean]` — quarantine bad input rows instead of aborting.
+    IgnoreErrors(bool),
+    /// `MAX_ERRORS integer` — maximum bad rows tolerated during COPY FROM.
+    MaxErrors(u64),
+    /// `REJECT_TABLE 'name'` — table receiving quarantined rows.
+    RejectTable(String),
     /// `NULL 'string'` — string used to represent SQL NULL.
     Null(String),
 }

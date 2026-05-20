@@ -284,6 +284,117 @@ async fn copy_from_file_csv_autodetect_streams_batches() {
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test]
+async fn copy_from_file_csv_quarantines_bad_rows_under_error_limit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv_path = dir.path().join("bad_rows.csv");
+    std::fs::write(
+        &csv_path,
+        "id,label\n1,ok\nbad,broken\n2,good\n3,too,many\n4,last\n",
+    )
+    .expect("write csv");
+
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE copy_quarantine (id INT, label TEXT)")
+        .await
+        .expect("create target");
+    client
+        .batch_execute(
+            "CREATE TABLE csv_rejects (
+                filename TEXT,
+                line_number BIGINT,
+                raw_row TEXT,
+                error TEXT
+            )",
+        )
+        .await
+        .expect("create rejects");
+
+    let copy_sql = format!(
+        "COPY copy_quarantine FROM {} WITH \
+         (FORMAT csv, HEADER true, IGNORE_ERRORS = true, MAX_ERRORS = 1000, REJECT_TABLE = 'csv_rejects')",
+        sql_string(csv_path.to_str().expect("utf8 path"))
+    );
+    client.batch_execute(&copy_sql).await.expect("copy file");
+
+    assert_eq!(select_count(&client, "copy_quarantine").await, 3);
+    assert_eq!(select_count(&client, "csv_rejects").await, 2);
+
+    let reject_rows = client
+        .query(
+            "SELECT filename, line_number, raw_row, error FROM csv_rejects ORDER BY line_number",
+            &[],
+        )
+        .await
+        .expect("select rejects");
+    assert_eq!(
+        reject_rows[0].get::<_, String>(0),
+        csv_path.display().to_string()
+    );
+    assert_eq!(reject_rows[0].get::<_, i64>(1), 3);
+    assert_eq!(reject_rows[0].get::<_, String>(2), "bad,broken\n");
+    assert!(
+        reject_rows[0].get::<_, String>(3).contains("invalid digit"),
+        "{:?}",
+        reject_rows[0].get::<_, String>(3)
+    );
+    assert_eq!(reject_rows[1].get::<_, i64>(1), 5);
+    assert_eq!(reject_rows[1].get::<_, String>(2), "3,too,many\n");
+    assert!(
+        reject_rows[1]
+            .get::<_, String>(3)
+            .contains("expected 2 columns, got 3"),
+        "{:?}",
+        reject_rows[1].get::<_, String>(3)
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn copy_from_file_csv_stops_after_max_errors() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv_path = dir.path().join("too_many_bad_rows.csv");
+    std::fs::write(&csv_path, "id,label\nbad,first\nalso_bad,second\n").expect("write csv");
+
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE copy_quarantine_limit (id INT, label TEXT)")
+        .await
+        .expect("create target");
+    client
+        .batch_execute(
+            "CREATE TABLE csv_rejects_limit (
+                filename TEXT,
+                line_number BIGINT,
+                raw_row TEXT,
+                error TEXT
+            )",
+        )
+        .await
+        .expect("create rejects");
+
+    let copy_sql = format!(
+        "COPY copy_quarantine_limit FROM {} WITH \
+         (FORMAT csv, HEADER true, IGNORE_ERRORS = true, MAX_ERRORS = 1, REJECT_TABLE = 'csv_rejects_limit')",
+        sql_string(csv_path.to_str().expect("utf8 path"))
+    );
+    let err = client
+        .batch_execute(&copy_sql)
+        .await
+        .expect_err("copy exceeds max_errors");
+    let message = err
+        .as_db_error()
+        .map(|db| db.message().to_string())
+        .unwrap_or_else(|| err.to_string());
+    assert!(message.contains("COPY max_errors exceeded"), "{message}");
+    assert_eq!(select_count(&client, "copy_quarantine_limit").await, 0);
+    assert_eq!(select_count(&client, "csv_rejects_limit").await, 0);
+
+    shutdown(client, server_handle).await;
+}
+
 /// `COPY t FROM STDIN` handles typed Date and Decimal payloads without
 /// leaking their physical int storage representation back to clients.
 #[tokio::test]

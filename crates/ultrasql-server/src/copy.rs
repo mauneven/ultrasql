@@ -62,6 +62,12 @@ pub struct CopyOptions {
     pub header: bool,
     /// Whether CSV COPY should sniff delimiter/header before reading rows.
     pub auto_detect: bool,
+    /// Whether bad COPY FROM rows should be skipped/quarantined.
+    pub ignore_errors: bool,
+    /// Maximum bad rows tolerated while `ignore_errors` is enabled.
+    pub max_errors: u64,
+    /// Optional table receiving quarantined rows.
+    pub reject_table: Option<String>,
 }
 
 impl Default for CopyOptions {
@@ -72,6 +78,9 @@ impl Default for CopyOptions {
             null_str: r"\N".to_string(),
             header: false,
             auto_detect: false,
+            ignore_errors: false,
+            max_errors: 0,
+            reject_table: None,
         }
     }
 }

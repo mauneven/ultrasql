@@ -1012,6 +1012,13 @@ pub enum LogicalPlan {
         /// Whether CSV COPY should infer dialect/header metadata from
         /// the source before streaming rows.
         auto_detect: bool,
+        /// Whether bad COPY FROM rows are quarantined instead of
+        /// aborting the whole load.
+        ignore_errors: bool,
+        /// Maximum bad rows tolerated before aborting COPY FROM.
+        max_errors: u64,
+        /// Optional reject table for quarantined bad rows.
+        reject_table: Option<String>,
         /// Row shape of the data stream — derived from `columns` and
         /// the target table's schema.
         schema: Schema,
