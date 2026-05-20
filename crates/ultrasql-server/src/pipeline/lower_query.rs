@@ -250,6 +250,7 @@ pub fn lower_query(
         } => lower_real_delete(table, input, returning, schema, ctx),
         LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }

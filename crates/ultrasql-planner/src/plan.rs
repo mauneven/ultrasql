@@ -529,6 +529,26 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// Create an append-only materialized view over one source relation.
+    ///
+    /// The binder stores both the heap-backed output schema (`columns`)
+    /// and the bound SELECT plan that feeds initial population and
+    /// append-only maintenance.
+    CreateMaterializedView {
+        /// Case-folded bare materialized-view name.
+        table_name: String,
+        /// SQL namespace, usually `"public"`.
+        namespace: String,
+        /// Heap-backed row shape of the materialized view.
+        columns: Schema,
+        /// Bound SELECT source.
+        source: Box<Self>,
+        /// Whether `IF NOT EXISTS` was specified.
+        if_not_exists: bool,
+        /// Always [`Schema::empty`]; DDL emits no rows.
+        schema: Schema,
+    },
+
     /// Join two child plans.
     ///
     /// For `LEFT JOIN`, every column on the right side of `schema` is
@@ -1341,6 +1361,7 @@ impl LogicalPlan {
                 | Self::Delete { .. }
                 | Self::Truncate { .. }
                 | Self::CreateTable { .. }
+                | Self::CreateMaterializedView { .. }
                 | Self::CreateIndex { .. }
                 | Self::DropTable { .. }
                 | Self::AlterTable { .. }
@@ -1393,6 +1414,7 @@ impl LogicalPlan {
             | Self::FunctionScan { .. }
             | Self::Truncate { .. }
             | Self::CreateTable { .. }
+            | Self::CreateMaterializedView { .. }
             | Self::CreateIndex { .. }
             | Self::DropTable { .. }
             | Self::AlterTable { .. }
@@ -1431,6 +1453,7 @@ impl LogicalPlan {
             | Self::Delete { schema, .. }
             | Self::Truncate { schema, .. }
             | Self::CreateTable { schema, .. }
+            | Self::CreateMaterializedView { schema, .. }
             | Self::Join { schema, .. }
             | Self::Aggregate { schema, .. }
             | Self::SetOp { schema, .. }
@@ -1729,6 +1752,35 @@ impl LogicalPlan {
                         ),
                     );
                 }
+            }
+            Self::CreateMaterializedView {
+                table_name,
+                namespace,
+                columns,
+                source,
+                if_not_exists,
+                ..
+            } => {
+                out.push_str(&pad);
+                out.push_str("CreateMaterializedView: ");
+                out.push_str(namespace);
+                out.push('.');
+                out.push_str(table_name);
+                if *if_not_exists {
+                    out.push_str(" IF NOT EXISTS");
+                }
+                out.push_str(" (");
+                for (i, f) in columns.fields().iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = fmt::write(out, format_args!("{} {:?}", f.name, f.data_type));
+                    if !f.nullable {
+                        out.push_str(" NOT NULL");
+                    }
+                }
+                out.push_str(")\n");
+                source.display_into(indent + 2, out);
             }
             Self::Join {
                 left,

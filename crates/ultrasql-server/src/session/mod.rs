@@ -95,6 +95,10 @@ pub(crate) struct Session<RW> {
     /// transaction block. Flushed to server-level maintenance hooks on
     /// COMMIT, cleared on ROLLBACK.
     pub(super) pending_table_modifications: std::collections::HashMap<String, u64>,
+    /// Materialized-view row counters accumulated inside the current
+    /// transaction. Applied only after COMMIT so rollback cannot advance
+    /// append offsets.
+    pub(super) pending_materialized_view_rows: Vec<(Arc<crate::MaterializedViewRuntime>, u64)>,
     /// Per-session sequence state used by `currval` / `lastval`.
     pub(super) sequence_state: crate::SequenceSessionState,
     /// `true` when an autocommit statement committed successfully and
@@ -136,6 +140,7 @@ where
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             jsonb_shape_cache: std::cell::RefCell::new(jsonb_ingest::JsonbShapeCache::default()),
             pending_table_modifications: std::collections::HashMap::new(),
+            pending_materialized_view_rows: Vec::new(),
             sequence_state: crate::SequenceSessionState::default(),
             pending_post_commit_maintenance: false,
         }

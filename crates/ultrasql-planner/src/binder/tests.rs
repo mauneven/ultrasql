@@ -430,6 +430,40 @@ fn binds_create_table_vector_family_column_types() {
 }
 
 #[test]
+fn binds_create_materialized_view_derives_and_aliases_columns() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS user_mv (user_id, username) AS \
+         SELECT id, name FROM users",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateMaterializedView {
+        table_name,
+        namespace,
+        columns,
+        source,
+        if_not_exists,
+        schema,
+    } = plan
+    else {
+        panic!("expected CreateMaterializedView");
+    };
+    assert_eq!(table_name, "user_mv");
+    assert_eq!(namespace, "public");
+    assert!(if_not_exists);
+    assert_eq!(schema, Schema::empty());
+    assert_eq!(columns.fields()[0].name, "user_id");
+    assert_eq!(columns.fields()[0].data_type, DataType::Int32);
+    assert_eq!(columns.fields()[1].name, "username");
+    assert_eq!(
+        columns.fields()[1].data_type,
+        DataType::Text { max_len: None }
+    );
+    assert!(matches!(*source, LogicalPlan::Project { .. }));
+}
+
+#[test]
 fn binds_create_table_rejects_zero_dimensional_vector() {
     let cat = InMemoryCatalog::new();
     let err = parse_and_bind("CREATE TABLE t (embedding VECTOR(0))", &cat).unwrap_err();

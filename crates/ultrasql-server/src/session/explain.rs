@@ -243,6 +243,7 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Empty { .. } => "Empty",
         LogicalPlan::Truncate { .. } => "Truncate",
         LogicalPlan::CreateTable { .. } => "CreateTable",
+        LogicalPlan::CreateMaterializedView { .. } => "CreateMaterializedView",
         LogicalPlan::CreateIndex { .. } => "CreateIndex",
         LogicalPlan::DropTable { .. } => "DropTable",
         LogicalPlan::AlterTable { .. } => "AlterTable",

@@ -67,6 +67,7 @@ pub fn execute_portal(
     if matches!(
         &plan,
         LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateMaterializedView { .. }
             | LogicalPlan::CreateSequence { .. }
             | LogicalPlan::AlterSequence { .. }
             | LogicalPlan::DropSequence { .. }

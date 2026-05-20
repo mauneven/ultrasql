@@ -241,6 +241,7 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
         LogicalPlan::Scan { .. }
         | LogicalPlan::Empty { .. }
         | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }

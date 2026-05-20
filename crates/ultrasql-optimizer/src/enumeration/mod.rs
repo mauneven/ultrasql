@@ -169,6 +169,7 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Values { .. }
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
@@ -430,6 +431,7 @@ pub fn reorder_inner_joins_with_stats(plan: &LogicalPlan, stats: &dyn StatsSourc
         | LogicalPlan::Values { .. }
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }

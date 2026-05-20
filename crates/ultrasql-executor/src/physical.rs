@@ -170,6 +170,7 @@ pub fn build_operator(
             Err(BuildError::Unsupported("TRUNCATE not supported in v0.5"))
         }
         LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }

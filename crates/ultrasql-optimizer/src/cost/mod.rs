@@ -304,6 +304,7 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::Delete { .. }
             | LogicalPlan::Truncate { .. }
             | LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateMaterializedView { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }

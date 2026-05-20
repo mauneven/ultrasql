@@ -286,6 +286,7 @@ where
         let is_ddl = matches!(
             &plan,
             LogicalPlan::CreateTable { .. }
+                | LogicalPlan::CreateMaterializedView { .. }
                 | LogicalPlan::CreateIndex { .. }
                 | LogicalPlan::CreateSequence { .. }
                 | LogicalPlan::AlterSequence { .. }
@@ -303,6 +304,9 @@ where
         match &plan {
             LogicalPlan::CreateTable { .. } => {
                 return self.execute_create_table(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::CreateMaterializedView { .. } => {
+                return self.execute_create_materialized_view(&plan, &catalog_snapshot);
             }
             LogicalPlan::CreateIndex { .. } => {
                 return self.execute_create_index(&plan, &catalog_snapshot);
@@ -743,6 +747,7 @@ where
                 return Ok(result);
             }
         }
+        self.reject_non_append_materialized_view_source_write(plan)?;
 
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => {
@@ -837,6 +842,7 @@ where
                     self.pending_post_commit_maintenance = true;
                     let rows = result.rows;
                     self.note_dml_effect(plan, rows);
+                    self.maintain_append_only_materialized_views_after_commit(plan)?;
                 }
                 Ok(result)
             }
@@ -1226,6 +1232,181 @@ where
         })
     }
 
+    pub(crate) fn maintain_append_only_materialized_views(
+        &mut self,
+        plan: &LogicalPlan,
+        txn: &Transaction,
+    ) -> Result<Vec<(Arc<crate::MaterializedViewRuntime>, u64)>, ServerError> {
+        let LogicalPlan::Insert { table, .. } = plan else {
+            return Ok(Vec::new());
+        };
+        let views = self.materialized_views_for_source(table);
+        self.materialize_view_deltas(views, txn)
+    }
+
+    fn materialized_views_for_source(
+        &self,
+        table: &str,
+    ) -> Vec<Arc<crate::MaterializedViewRuntime>> {
+        let folded = table.to_ascii_lowercase();
+        self.state
+            .materialized_views
+            .iter()
+            .filter_map(|entry| {
+                let view = entry.value();
+                if view.source_table == folded {
+                    Some(Arc::clone(view))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    }
+
+    fn reject_non_append_materialized_view_source_write(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<(), ServerError> {
+        let table = match plan {
+            LogicalPlan::Update { table, .. } | LogicalPlan::Delete { table, .. } => table,
+            _ => return Ok(()),
+        };
+        if self.materialized_views_for_source(table).is_empty() {
+            return Ok(());
+        }
+        Err(ServerError::Unsupported(
+            "UPDATE/DELETE on append-only materialized view source is not supported",
+        ))
+    }
+
+    fn materialize_view_deltas(
+        &mut self,
+        views: Vec<Arc<crate::MaterializedViewRuntime>>,
+        txn: &Transaction,
+    ) -> Result<Vec<(Arc<crate::MaterializedViewRuntime>, u64)>, ServerError> {
+        let mut materialized_rows = Vec::with_capacity(views.len());
+        for view in views {
+            let rows = self.materialize_view_delta(&view, txn)?;
+            if rows > 0 {
+                materialized_rows.push((view, rows));
+            }
+        }
+        Ok(materialized_rows)
+    }
+
+    pub(crate) fn maintain_append_only_materialized_views_after_commit(
+        &mut self,
+        plan: &LogicalPlan,
+    ) -> Result<(), ServerError> {
+        let LogicalPlan::Insert { .. } = plan else {
+            return Ok(());
+        };
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let rows = match self.maintain_append_only_materialized_views(plan, &txn) {
+            Ok(rows) => rows,
+            Err(e) => {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    tracing::warn!(
+                        error = %abort_err,
+                        "materialized-view maintenance rollback failed",
+                    );
+                }
+                return Err(e);
+            }
+        };
+        if let Err(commit_err) = self.state.txn_manager.commit(txn) {
+            tracing::warn!(
+                error = %commit_err,
+                "materialized-view maintenance commit failed",
+            );
+        }
+        self.pending_materialized_view_rows.extend(rows);
+        self.flush_pending_materialized_view_rows();
+        Ok(())
+    }
+
+    pub(crate) fn maintain_materialized_views_for_tables_after_commit(
+        &mut self,
+        tables: &[String],
+    ) -> Result<(), ServerError> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let mut rows = Vec::new();
+        for table in tables {
+            let views = self.materialized_views_for_source(table);
+            match self.materialize_view_deltas(views, &txn) {
+                Ok(mut view_rows) => rows.append(&mut view_rows),
+                Err(e) => {
+                    if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                        tracing::warn!(
+                            error = %abort_err,
+                            "materialized-view maintenance rollback failed",
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        if let Err(commit_err) = self.state.txn_manager.commit(txn) {
+            tracing::warn!(
+                error = %commit_err,
+                "materialized-view maintenance commit failed",
+            );
+        }
+        self.pending_materialized_view_rows.extend(rows);
+        self.flush_pending_materialized_view_rows();
+        Ok(())
+    }
+
+    pub(crate) fn materialize_view_delta(
+        &mut self,
+        view: &Arc<crate::MaterializedViewRuntime>,
+        txn: &Transaction,
+    ) -> Result<u64, ServerError> {
+        let committed = view
+            .materialized_rows
+            .load(std::sync::atomic::Ordering::Acquire);
+        let pending = self
+            .pending_materialized_view_rows
+            .iter()
+            .filter(|(pending_view, _)| pending_view.view_table == view.view_table)
+            .map(|(_, rows)| *rows)
+            .fold(0_u64, u64::saturating_add);
+        let offset = committed.saturating_add(pending);
+        let source = LogicalPlan::Limit {
+            input: Box::new(view.source.clone()),
+            n: u64::MAX,
+            offset,
+        };
+        let insert = LogicalPlan::Insert {
+            table: view.view_table.clone(),
+            columns: Vec::new(),
+            source: Box::new(source),
+            on_conflict: None,
+            returning: Vec::new(),
+            schema: ultrasql_core::Schema::empty(),
+        };
+        let catalog_snapshot = self.state.catalog_snapshot();
+        let result = run_plan_in_txn(
+            &insert,
+            txn,
+            catalog_snapshot,
+            Arc::clone(&self.state.table_constraints),
+            Arc::clone(&self.state.sequences),
+            Some(self.sequence_state.clone()),
+            &self.state.tables,
+            Arc::clone(&self.state.heap),
+            Arc::clone(&self.state.vm),
+            Arc::clone(&self.state.txn_manager),
+            self.jit_config(),
+            Some(self.cancel_flag.clone()),
+            &mut self.write_buf,
+        )?;
+        Ok(result.rows)
+    }
+
     pub(crate) fn note_dml_effect(&mut self, plan: &LogicalPlan, rows: u64) {
         if rows == 0 {
             return;
@@ -1277,6 +1458,18 @@ where
         }
     }
 
+    pub(crate) fn flush_pending_materialized_view_rows(&mut self) {
+        let drained = std::mem::take(&mut self.pending_materialized_view_rows);
+        for (view, rows) in drained {
+            if rows == 0 {
+                continue;
+            }
+            view.materialized_rows
+                .fetch_add(rows, std::sync::atomic::Ordering::AcqRel);
+            self.state.note_table_modifications(&view.view_table, rows);
+        }
+    }
+
     pub(crate) fn run_post_response_maintenance(&mut self) {
         if self.pending_post_commit_maintenance {
             self.pending_post_commit_maintenance = false;
@@ -1287,6 +1480,7 @@ where
 
     pub(crate) fn clear_pending_dml_effects(&mut self) {
         self.pending_table_modifications.clear();
+        self.pending_materialized_view_rows.clear();
     }
 
     pub(crate) fn dml_target_table(plan: &LogicalPlan) -> Option<&str> {

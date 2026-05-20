@@ -406,6 +406,7 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
         | LogicalPlan::Values { .. }
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }

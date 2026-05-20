@@ -224,6 +224,7 @@ where
         | LogicalPlan::Empty { .. }
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }

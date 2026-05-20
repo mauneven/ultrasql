@@ -11,10 +11,10 @@ use ultrasql_core::{DataType, Field, GeometryType, MAX_VECTOR_DIMS, RangeType, S
 use ultrasql_parser::ast::{
     AlterSequenceStmt, AlterTableAction, AlterTableStmt, ColumnConstraint, CommentStmt,
     CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat, CopyOption,
-    CopySource as AstCopySource, CopyStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
-    DropSequenceStmt, DropTableStmt, Expr, Identifier, Literal, ObjectName,
-    ReferentialAction as AstReferentialAction, SequenceOption, TableConstraint, TruncateStmt,
-    TypeName,
+    CopySource as AstCopySource, CopyStmt, CreateIndexStmt, CreateMaterializedViewStmt,
+    CreateSequenceStmt, CreateTableStmt, DropSequenceStmt, DropTableStmt, Expr, Identifier,
+    Literal, ObjectName, ReferentialAction as AstReferentialAction, SequenceOption,
+    TableConstraint, TruncateStmt, TypeName,
 };
 
 use super::expr_bind::coerce_literal_to_type;
@@ -337,6 +337,58 @@ fn column_generated_stored(constraints: &[ColumnConstraint]) -> Result<Option<&E
         }
     }
     Ok(out)
+}
+
+pub(super) fn bind_create_materialized_view(
+    s: &CreateMaterializedViewStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
+    let table_name = object_name_simple(&s.name);
+    let namespace = object_name_namespace(&s.name);
+    if !s.if_not_exists && catalog.lookup_table(&table_name).is_some() {
+        return Err(PlanError::DuplicateTable(table_name));
+    }
+
+    let mut scope = ScopeStack::new();
+    let source = bind_select(&s.source, catalog, &mut scope)?;
+    let columns = materialized_view_schema(source.schema(), &s.columns)?;
+    if columns.is_empty() {
+        return Err(PlanError::NotSupported(
+            "CREATE MATERIALIZED VIEW: zero columns",
+        ));
+    }
+
+    Ok(LogicalPlan::CreateMaterializedView {
+        table_name,
+        namespace,
+        columns,
+        source: Box::new(source),
+        if_not_exists: s.if_not_exists,
+        schema: Schema::empty(),
+    })
+}
+
+fn materialized_view_schema(
+    source_schema: &Schema,
+    aliases: &[Identifier],
+) -> Result<Schema, PlanError> {
+    if aliases.is_empty() {
+        return Ok(source_schema.clone());
+    }
+    if aliases.len() != source_schema.len() {
+        return Err(PlanError::TypeMismatch(format!(
+            "CREATE MATERIALIZED VIEW column list has {} names but query returns {} columns",
+            aliases.len(),
+            source_schema.len()
+        )));
+    }
+    let mut fields = Vec::with_capacity(source_schema.len());
+    for (field, alias) in source_schema.fields().iter().zip(aliases) {
+        let mut renamed = field.clone();
+        renamed.name = alias.value.clone();
+        fields.push(renamed);
+    }
+    Schema::new(fields).map_err(|e| PlanError::TypeMismatch(e.to_string()))
 }
 
 fn collect_column_constraints<'a>(

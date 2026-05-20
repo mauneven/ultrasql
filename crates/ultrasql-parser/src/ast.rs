@@ -60,6 +60,8 @@ pub enum Statement {
     CreateTable(Box<CreateTableStmt>),
     /// `CREATE TABLE … AS SELECT …`.
     CreateTableAs(Box<CreateTableAsStmt>),
+    /// `CREATE MATERIALIZED VIEW … AS SELECT …`.
+    CreateMaterializedView(Box<CreateMaterializedViewStmt>),
     /// `DROP TABLE …`.
     DropTable(DropTableStmt),
     /// `ALTER TABLE …`.
@@ -174,6 +176,7 @@ impl Statement {
             Self::Begin { span, .. } | Self::Commit { span } | Self::Rollback { span } => *span,
             Self::CreateTable(s) => s.span,
             Self::CreateTableAs(s) => s.span,
+            Self::CreateMaterializedView(s) => s.span,
             Self::DropTable(s) => s.span,
             Self::AlterTable(s) => s.span,
             Self::CreateSchema(s) => s.span,
@@ -311,6 +314,21 @@ pub struct CreateTableAsStmt {
     /// Whether `IF NOT EXISTS` was specified.
     pub if_not_exists: bool,
     /// Table name (possibly schema-qualified).
+    pub name: ObjectName,
+    /// Optional explicit column-name list `(col1, col2, …)`.
+    pub columns: Vec<Identifier>,
+    /// The SELECT statement that provides rows.
+    pub source: Box<SelectStmt>,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// `CREATE MATERIALIZED VIEW name [(cols...)] AS SELECT …`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateMaterializedViewStmt {
+    /// Whether `IF NOT EXISTS` was specified.
+    pub if_not_exists: bool,
+    /// Materialized view name (possibly schema-qualified).
     pub name: ObjectName,
     /// Optional explicit column-name list `(col1, col2, …)`.
     pub columns: Vec<Identifier>,

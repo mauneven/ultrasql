@@ -318,10 +318,18 @@ impl<'src> Parser<'src> {
         let create_tok = self.advance()?; // CREATE
         let start = create_tok.span.start;
 
-        let tok = self.peek()?;
+        let tok = *self.peek()?;
         match tok.kind {
             TokenKind::KwTable => self.parse_create_table(start),
             TokenKind::KwSchema => self.parse_create_schema(start).map(Statement::CreateSchema),
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("materialized")) =>
+            {
+                self.parse_create_materialized_view(start)
+                    .map(|s| Statement::CreateMaterializedView(Box::new(s)))
+            }
             TokenKind::KwIndex => self
                 .parse_create_index(start, false)
                 .map(|s| Statement::CreateIndex(Box::new(s))),
@@ -335,7 +343,7 @@ impl<'src> Parser<'src> {
                 .parse_create_sequence(start)
                 .map(|s| Statement::CreateSequence(Box::new(s))),
             other => Err(ParseError::Expected {
-                expected: "TABLE, SCHEMA, INDEX, UNIQUE, or SEQUENCE after CREATE",
+                expected: "TABLE, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, or SEQUENCE after CREATE",
                 found: other,
                 offset: tok.span.start as usize,
             }),

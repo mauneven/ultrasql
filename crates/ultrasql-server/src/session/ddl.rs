@@ -386,6 +386,102 @@ where
         Ok(run_ddl_command("CREATE TABLE"))
     }
 
+    /// Persist and populate an append-only materialized view.
+    pub(crate) fn execute_create_materialized_view(
+        &mut self,
+        plan: &LogicalPlan,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::CreateMaterializedView {
+            table_name,
+            namespace,
+            columns,
+            source,
+            if_not_exists,
+            ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_create_materialized_view called with wrong plan",
+            ));
+        };
+        let exists_persistent = snapshot.tables.contains_key(table_name);
+        let exists_fallback = self.state.catalog.lookup_table(table_name).is_some();
+        if exists_persistent || exists_fallback {
+            if *if_not_exists {
+                return Ok(run_ddl_command("CREATE MATERIALIZED VIEW"));
+            }
+            return Err(ServerError::Catalog(
+                ultrasql_catalog::CatalogError::already_exists(table_name.clone()),
+            ));
+        }
+        let Some(source_table) = crate::append_only_materialized_source_table(source) else {
+            return Err(ServerError::Unsupported(
+                "CREATE MATERIALIZED VIEW supports append-only SELECT/FILTER/PROJECT over one table",
+            ));
+        };
+
+        let oid = self.state.persistent_catalog.next_oid();
+        let entry = TableEntry::new(oid, table_name.clone(), namespace.clone(), columns.clone());
+        self.state.persistent_catalog.create_table(entry.clone())?;
+
+        let runtime = Arc::new(crate::MaterializedViewRuntime {
+            view_table: table_name.clone(),
+            source_table: source_table.to_ascii_lowercase(),
+            source: source.as_ref().clone(),
+            materialized_rows: std::sync::atomic::AtomicU64::new(0),
+        });
+        let attr_has_defaults = vec![false; columns.len()];
+        let ddl_txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let ddl_xid = ddl_txn.xid;
+        let ddl_command_id = ddl_txn.current_command;
+        let materialized_rows = (|| -> Result<u64, ServerError> {
+            self.state
+                .persistent_catalog
+                .persist_relation_rows_with_defaults(
+                    &entry,
+                    ultrasql_catalog::persistent::RelKind::MaterializedView,
+                    &attr_has_defaults,
+                    self.state.heap.as_ref(),
+                    ddl_xid,
+                    ddl_command_id,
+                )?;
+            self.materialize_view_delta(&runtime, &ddl_txn)
+        })();
+        let materialized_rows = match materialized_rows {
+            Ok(rows) => rows,
+            Err(e) => {
+                if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                    tracing::warn!(
+                        error = %abort_err,
+                        "abort of materialized-view DDL txn failed",
+                    );
+                }
+                let _ = self.state.persistent_catalog.drop_table(table_name);
+                return Err(e);
+            }
+        };
+        if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
+            tracing::warn!(
+                error = %commit_err,
+                "materialized-view DDL txn failed to commit",
+            );
+        }
+        runtime
+            .materialized_rows
+            .store(materialized_rows, std::sync::atomic::Ordering::Release);
+        self.state
+            .note_table_modifications(table_name, materialized_rows);
+        self.state
+            .materialized_views
+            .insert(table_name.clone(), runtime);
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("CREATE MATERIALIZED VIEW"))
+    }
+
     fn create_table_unique_indexes(
         &self,
         table: &TableEntry,

@@ -241,6 +241,7 @@ pub(crate) fn row_description_for_plan(plan: &LogicalPlan) -> BackendMessage {
     let no_rows = matches!(
         plan,
         LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateMaterializedView { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }

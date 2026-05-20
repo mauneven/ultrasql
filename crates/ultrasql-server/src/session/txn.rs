@@ -346,6 +346,11 @@ where
             }),
             TxnState::InTransaction(mut txn) => {
                 self.state.txn_manager.refresh_snapshot(&mut txn);
+                let modified_tables = self
+                    .pending_table_modifications
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
                 if !self.pending_table_modifications.is_empty() {
                     if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
                         let xid = txn.xid;
@@ -369,6 +374,13 @@ where
                     tracing::warn!(error = %e, "explicit COMMIT failed to finalise");
                 } else {
                     self.state.note_commit_for_gc();
+                    if let Err(e) =
+                        self.maintain_materialized_views_for_tables_after_commit(&modified_tables)
+                    {
+                        self.flush_pending_dml_effects();
+                        return Err(e);
+                    }
+                    self.flush_pending_materialized_view_rows();
                     self.flush_pending_dml_effects();
                 }
                 Ok(SelectResult {

@@ -86,6 +86,7 @@ pub fn lower_plan(
         // missed a case; surface it as a planner-pipeline bug rather
         // than as a silent fall-through.
         LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }

@@ -223,6 +223,33 @@ pub struct TableRuntimeConstraints {
     pub indexes: std::collections::HashMap<ultrasql_core::Oid, RuntimeIndexMetadata>,
 }
 
+/// Runtime metadata for one append-only materialized view.
+///
+/// The catalog stores the view as a heap-backed relation. This sidecar keeps
+/// the bound source query and how many source-query output rows have already
+/// been copied into the materialized heap.
+#[derive(Debug)]
+pub struct MaterializedViewRuntime {
+    /// Folded materialized-view table name.
+    pub view_table: String,
+    /// Folded single source table name.
+    pub source_table: String,
+    /// Bound append-safe source query.
+    pub source: LogicalPlan,
+    /// Number of source-query output rows already materialized.
+    pub materialized_rows: std::sync::atomic::AtomicU64,
+}
+
+pub(crate) fn append_only_materialized_source_table(plan: &LogicalPlan) -> Option<&str> {
+    match plan {
+        LogicalPlan::Scan { table, .. } => Some(table.as_str()),
+        LogicalPlan::Filter { input, .. } | LogicalPlan::Project { input, .. } => {
+            append_only_materialized_source_table(input)
+        }
+        _ => None,
+    }
+}
+
 /// Runtime metadata for one index beyond plain attnum keys.
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeIndexMetadata {
@@ -773,6 +800,8 @@ pub struct Server {
     pub table_constraints: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
     /// Same-process sequence registry keyed by folded sequence name.
     pub sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
+    /// Same-process append-only materialized-view registry keyed by view name.
+    pub materialized_views: Arc<dashmap::DashMap<String, Arc<MaterializedViewRuntime>>>,
     /// Accumulated tuple modifications since the last analyze pass,
     /// keyed by folded table name.
     pub table_modifications: dashmap::DashMap<String, u64>,
@@ -1590,6 +1619,7 @@ impl Server {
             stats_catalog: parking_lot::RwLock::new(InMemoryStatsCatalog::new()),
             table_constraints: Arc::new(dashmap::DashMap::new()),
             sequences: Arc::new(dashmap::DashMap::new()),
+            materialized_views: Arc::new(dashmap::DashMap::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,
@@ -1948,6 +1978,7 @@ impl Server {
             stats_catalog: parking_lot::RwLock::new(InMemoryStatsCatalog::new()),
             table_constraints: Arc::new(dashmap::DashMap::new()),
             sequences,
+            materialized_views: Arc::new(dashmap::DashMap::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             two_phase,

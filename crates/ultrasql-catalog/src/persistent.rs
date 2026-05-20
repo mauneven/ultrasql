@@ -668,7 +668,7 @@ impl PersistentCatalog {
             user_relations = user_relations.saturating_add(1);
             highest_oid = highest_oid.max(class_row.oid.raw().saturating_add(1));
             match class_row.relkind {
-                RelKind::Table => {
+                RelKind::Table | RelKind::MaterializedView => {
                     let attrs = attrs_by_relation.remove(&class_row.oid).unwrap_or_default();
                     let schema = schema_from_attributes(attrs).map_err(|e| {
                         CatalogError::schema_conflict(format!(
@@ -1045,8 +1045,28 @@ impl PersistentCatalog {
         xmin: ultrasql_core::Xid,
         command_id: ultrasql_core::CommandId,
     ) -> Result<(), CatalogError> {
+        self.persist_relation_rows_with_defaults(
+            entry,
+            RelKind::Table,
+            attr_has_defaults,
+            heap,
+            xmin,
+            command_id,
+        )
+    }
+
+    /// Insert `pg_class` + `pg_attribute` rows for a heap-backed relation kind.
+    pub fn persist_relation_rows_with_defaults<L: PageLoader>(
+        &self,
+        entry: &TableEntry,
+        relkind: RelKind,
+        attr_has_defaults: &[bool],
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
         use crate::encoding::encode_attribute_row;
-        use crate::persistent::{AttributeRow, ClassRow, RelKind};
+        use crate::persistent::{AttributeRow, ClassRow};
         use ultrasql_storage::heap::InsertOptions;
 
         let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
@@ -1062,7 +1082,7 @@ impl PersistentCatalog {
             oid: entry.oid,
             relname: entry.name.clone(),
             relnamespace: namespace_oid,
-            relkind: RelKind::Table,
+            relkind,
             relpages: entry.n_blocks,
             reltuples: 0.0,
             relfilenode: entry.root_block.raw(),
