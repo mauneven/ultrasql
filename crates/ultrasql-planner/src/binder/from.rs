@@ -3,13 +3,15 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::Cursor;
+use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use arrow_ipc::reader::FileReader as ArrowFileReader;
 use arrow_schema::DataType as ArrowDataType;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::errors::{ParquetError, Result as ParquetResult};
+use parquet::file::reader::{ChunkReader, Length};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use ultrasql_core::{
     DataType, Field, Schema, Value,
@@ -20,7 +22,8 @@ use ultrasql_core::{
 };
 use ultrasql_iceberg::read_iceberg_schema;
 use ultrasql_objectstore::{
-    expand_object_store_specs, is_object_store_uri, read_first_object_bytes, read_object_bytes,
+    ObjectLocation, expand_object_store_specs, is_object_store_uri, read_first_object_bytes,
+    read_object_bytes, read_object_range, read_object_range_with_metadata,
 };
 use ultrasql_parser::ast::{JoinCondition, JoinOp, JsonTableColumnKind, TableRef, TypeName};
 
@@ -534,16 +537,138 @@ fn read_parquet_arrow_schema(path: &Path) -> Result<arrow_schema::SchemaRef, Pla
 }
 
 fn read_parquet_object_schema(patterns: &[String]) -> Result<arrow_schema::SchemaRef, PlanError> {
-    let (location, bytes) = read_first_object_bytes(patterns)
+    let objects = expand_object_store_specs(patterns)
         .map_err(|err| PlanError::TypeMismatch(format!("read_parquet: {err}")))?;
-    let bytes = Bytes::from(bytes);
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|err| {
+    let location = objects.first().ok_or_else(|| {
+        PlanError::TypeMismatch("read_parquet object path list is empty".to_owned())
+    })?;
+    let reader = PlannerObjectRangeChunkReader::new(location.clone())?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|err| {
         PlanError::TypeMismatch(format!(
             "read_parquet cannot inspect {}: {err}",
             location.display_uri()
         ))
     })?;
     Ok(builder.schema().clone())
+}
+
+#[derive(Clone, Debug)]
+struct PlannerObjectRangeChunkReader {
+    location: ObjectLocation,
+    display: String,
+    len: u64,
+}
+
+impl PlannerObjectRangeChunkReader {
+    fn new(location: ObjectLocation) -> Result<Self, PlanError> {
+        let display = location.display_uri();
+        let probe = read_object_range_with_metadata(&location, 0, 1)
+            .map_err(|err| PlanError::TypeMismatch(format!("read_parquet: {err}")))?;
+        let len = probe.object_size().ok_or_else(|| {
+            PlanError::TypeMismatch(format!(
+                "read_parquet cannot determine object size for {display}: missing Content-Range"
+            ))
+        })?;
+        Ok(Self {
+            location,
+            display,
+            len,
+        })
+    }
+}
+
+impl Length for PlannerObjectRangeChunkReader {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl ChunkReader for PlannerObjectRangeChunkReader {
+    type T = PlannerObjectRangeReadCursor;
+
+    fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
+        if start > self.len {
+            return Err(planner_parquet_range_error(format!(
+                "read_parquet range start {start} beyond {} length {}",
+                self.display, self.len
+            )));
+        }
+        Ok(PlannerObjectRangeReadCursor {
+            location: self.location.clone(),
+            display: self.display.clone(),
+            pos: start,
+            len: self.len,
+        })
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
+        let length = validate_planner_object_range(&self.display, start, length, self.len)?;
+        let bytes = read_object_range(&self.location, start, length).map_err(|err| {
+            planner_parquet_range_error(format!(
+                "read_parquet range GET {} bytes {start}+{length}: {err}",
+                self.display
+            ))
+        })?;
+        Ok(Bytes::from(bytes))
+    }
+}
+
+#[derive(Debug)]
+struct PlannerObjectRangeReadCursor {
+    location: ObjectLocation,
+    display: String,
+    pos: u64,
+    len: u64,
+}
+
+impl Read for PlannerObjectRangeReadCursor {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.len {
+            return Ok(0);
+        }
+        let remaining = self.len - self.pos;
+        let requested = remaining.min(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+        let bytes = read_object_range(&self.location, self.pos, requested).map_err(|err| {
+            io::Error::other(format!(
+                "read_parquet range GET {} bytes {}+{}: {err}",
+                self.display, self.pos, requested
+            ))
+        })?;
+        let read = bytes.len().min(buf.len());
+        buf[..read].copy_from_slice(&bytes[..read]);
+        self.pos = self
+            .pos
+            .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        Ok(read)
+    }
+}
+
+fn validate_planner_object_range(
+    display: &str,
+    start: u64,
+    length: usize,
+    object_len: u64,
+) -> ParquetResult<u64> {
+    let length = u64::try_from(length).map_err(|err| {
+        planner_parquet_range_error(format!(
+            "read_parquet range length overflow for {display}: {err}"
+        ))
+    })?;
+    let end = start.checked_add(length).ok_or_else(|| {
+        planner_parquet_range_error(format!(
+            "read_parquet range overflows for {display}: start={start} length={length}"
+        ))
+    })?;
+    if end > object_len {
+        return Err(planner_parquet_range_error(format!(
+            "read_parquet range beyond {display}: start={start} length={length} object_len={object_len}"
+        )));
+    }
+    Ok(length)
+}
+
+fn planner_parquet_range_error(message: String) -> ParquetError {
+    ParquetError::External(Box::new(io::Error::other(message)))
 }
 
 fn parquet_arrow_type_to_sql(data_type: &ArrowDataType) -> Result<DataType, PlanError> {

@@ -1,8 +1,9 @@
-//! Local Parquet table-function scan.
+//! Parquet table-function scan for local files and object-store URIs.
 
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fs::{self, File};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
@@ -19,13 +20,16 @@ use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{
     ArrowPredicateFn, ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder, RowFilter,
 };
+use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::metadata::ParquetMetaData;
+use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::statistics::Statistics;
 use ultrasql_arrow::record_batch_to_ultrasql_batch;
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_executor::{ExecError, Operator};
 use ultrasql_objectstore::{
-    ObjectLocation, expand_object_store_specs, is_object_store_uri, read_object_bytes,
+    ObjectLocation, expand_object_store_specs, is_object_store_uri, read_object_range,
+    read_object_range_with_metadata,
 };
 use ultrasql_planner::{BinaryOp, LogicalPlan, ScalarExpr};
 
@@ -269,7 +273,126 @@ type ParquetWorkerMessage = Result<ultrasql_vec::Batch, String>;
 #[derive(Clone, Debug)]
 enum ParquetWorkerSource {
     Path(PathBuf),
-    Bytes(Bytes),
+    Object(ObjectRangeChunkReader),
+}
+
+#[derive(Clone, Debug)]
+struct ObjectRangeChunkReader {
+    location: ObjectLocation,
+    display: String,
+    len: u64,
+}
+
+impl ObjectRangeChunkReader {
+    fn new(location: ObjectLocation) -> Result<Self, ServerError> {
+        let display = location.display_uri();
+        let probe = read_object_range_with_metadata(&location, 0, 1)
+            .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
+        let len = probe.object_size().ok_or_else(|| {
+            ServerError::CopyFormat(format!(
+                "read_parquet cannot determine object size for {display}: missing Content-Range"
+            ))
+        })?;
+        Ok(Self {
+            location,
+            display,
+            len,
+        })
+    }
+}
+
+impl Length for ObjectRangeChunkReader {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl ChunkReader for ObjectRangeChunkReader {
+    type T = ObjectRangeReadCursor;
+
+    fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
+        if start > self.len {
+            return Err(parquet_range_error(format!(
+                "read_parquet range start {start} beyond {} length {}",
+                self.display, self.len
+            )));
+        }
+        Ok(ObjectRangeReadCursor {
+            location: self.location.clone(),
+            display: self.display.clone(),
+            pos: start,
+            len: self.len,
+        })
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
+        let length = validate_object_range(&self.display, start, length, self.len)?;
+        let bytes = read_object_range(&self.location, start, length).map_err(|err| {
+            parquet_range_error(format!(
+                "read_parquet range GET {} bytes {start}+{length}: {err}",
+                self.display
+            ))
+        })?;
+        Ok(Bytes::from(bytes))
+    }
+}
+
+#[derive(Debug)]
+struct ObjectRangeReadCursor {
+    location: ObjectLocation,
+    display: String,
+    pos: u64,
+    len: u64,
+}
+
+impl Read for ObjectRangeReadCursor {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.len {
+            return Ok(0);
+        }
+        let remaining = self.len - self.pos;
+        let requested = remaining.min(u64::try_from(buf.len()).unwrap_or(u64::MAX));
+        let bytes = read_object_range(&self.location, self.pos, requested).map_err(|err| {
+            io::Error::other(format!(
+                "read_parquet range GET {} bytes {}+{}: {err}",
+                self.display, self.pos, requested
+            ))
+        })?;
+        let read = bytes.len().min(buf.len());
+        buf[..read].copy_from_slice(&bytes[..read]);
+        self.pos = self
+            .pos
+            .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        Ok(read)
+    }
+}
+
+fn validate_object_range(
+    display: &str,
+    start: u64,
+    length: usize,
+    object_len: u64,
+) -> ParquetResult<u64> {
+    let length = u64::try_from(length).map_err(|err| {
+        parquet_range_error(format!(
+            "read_parquet range length overflow for {display}: {err}"
+        ))
+    })?;
+    let end = start.checked_add(length).ok_or_else(|| {
+        parquet_range_error(format!(
+            "read_parquet range overflows for {display}: start={start} length={length}"
+        ))
+    })?;
+    if end > object_len {
+        return Err(parquet_range_error(format!(
+            "read_parquet range beyond {display}: start={start} length={length} object_len={object_len}"
+        )));
+    }
+    Ok(length)
+}
+
+fn parquet_range_error(message: String) -> ParquetError {
+    ParquetError::External(Box::new(io::Error::other(message)))
 }
 
 /// Predicate shape that can be pushed into a Parquet scan.
@@ -395,10 +518,8 @@ fn open_object_reader(
     predicate: Option<&ParquetPredicate>,
 ) -> Result<Option<ActiveParquetReader>, ServerError> {
     let display = object.display_uri();
-    let bytes = read_object_bytes(object)
-        .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
-    let bytes = Bytes::from(bytes);
-    let builder = ParquetRecordBatchReaderBuilder::try_new(bytes.clone()).map_err(|err| {
+    let reader = ObjectRangeChunkReader::new(object.clone())?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(reader.clone()).map_err(|err| {
         ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
     })?;
     if builder.schema().as_ref() != expected_schema {
@@ -413,7 +534,7 @@ fn open_object_reader(
     }
     spawn_parquet_row_group_workers(
         display,
-        ParquetWorkerSource::Bytes(bytes),
+        ParquetWorkerSource::Object(reader),
         projection,
         predicate,
         &row_groups,
@@ -519,8 +640,8 @@ fn build_row_group_reader(
             })?;
             build_row_group_reader_from_builder(builder, display, projection, predicate, row_groups)
         }
-        ParquetWorkerSource::Bytes(bytes) => {
-            let builder = ParquetRecordBatchReaderBuilder::try_new(bytes).map_err(|err| {
+        ParquetWorkerSource::Object(reader) => {
+            let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|err| {
                 ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
             })?;
             build_row_group_reader_from_builder(builder, display, projection, predicate, row_groups)
@@ -719,9 +840,8 @@ fn parquet_object_row_group_summary(
     predicate: Option<&ParquetPredicate>,
 ) -> Result<ParquetRowGroupSummary, ServerError> {
     let display = object.display_uri();
-    let bytes = read_object_bytes(object)
-        .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes)).map_err(|err| {
+    let reader = ObjectRangeChunkReader::new(object.clone())?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|err| {
         ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
     })?;
     let predicate = predicate
@@ -754,9 +874,8 @@ fn read_object_arrow_schema(
     object: &ultrasql_objectstore::ObjectLocation,
 ) -> Result<arrow_schema::SchemaRef, ServerError> {
     let display = object.display_uri();
-    let bytes = read_object_bytes(object)
-        .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(bytes)).map_err(|err| {
+    let reader = ObjectRangeChunkReader::new(object.clone())?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(reader).map_err(|err| {
         ServerError::CopyFormat(format!("read_parquet cannot inspect {display}: {err}"))
     })?;
     Ok(builder.schema().clone())

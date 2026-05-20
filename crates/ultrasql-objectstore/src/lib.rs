@@ -47,6 +47,30 @@ impl ObjectLocation {
     }
 }
 
+/// Bytes returned by a ranged object read and optional total object size.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectRangeRead {
+    bytes: Vec<u8>,
+    object_size: Option<u64>,
+}
+
+impl ObjectRangeRead {
+    /// Return bytes fetched for the requested range.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Consume the range response and return its bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Return total object size when the server supplied `Content-Range`.
+    pub fn object_size(&self) -> Option<u64> {
+        self.object_size
+    }
+}
+
 /// Return true when `spec` is an object-store URI handled by this crate.
 pub fn is_object_store_uri(spec: &str) -> bool {
     ObjectScheme::from_spec(spec).is_some()
@@ -73,7 +97,7 @@ pub fn expand_object_store_specs(patterns: &[String]) -> Result<Vec<ObjectLocati
 /// Read object bytes from a concrete object location.
 pub fn read_object_bytes(location: &ObjectLocation) -> Result<Vec<u8>> {
     let request = object_request(&location.uri, Vec::new())?;
-    get_bytes(request, ResponseExpectation::Success)
+    get_response(request, ResponseExpectation::Success).map(ObjectResponse::into_bytes)
 }
 
 /// Read a byte range from a concrete object location.
@@ -81,8 +105,23 @@ pub fn read_object_bytes(location: &ObjectLocation) -> Result<Vec<u8>> {
 /// `start` is zero-based and `len` is the requested byte count. Empty ranges
 /// return an empty buffer without issuing an HTTP request.
 pub fn read_object_range(location: &ObjectLocation, start: u64, len: u64) -> Result<Vec<u8>> {
+    read_object_range_with_metadata(location, start, len).map(ObjectRangeRead::into_bytes)
+}
+
+/// Read a byte range and return response metadata needed by columnar readers.
+///
+/// `object_size` is populated from `Content-Range` when the object store
+/// includes the total length, as S3-compatible stores do for byte ranges.
+pub fn read_object_range_with_metadata(
+    location: &ObjectLocation,
+    start: u64,
+    len: u64,
+) -> Result<ObjectRangeRead> {
     if len == 0 {
-        return Ok(Vec::new());
+        return Ok(ObjectRangeRead {
+            bytes: Vec::new(),
+            object_size: None,
+        });
     }
     let end = start.checked_add(len - 1).ok_or_else(|| {
         ObjectStoreError::InvalidRange(format!(
@@ -93,7 +132,11 @@ pub fn read_object_range(location: &ObjectLocation, start: u64, len: u64) -> Res
     request
         .headers
         .push(("range", format!("bytes={start}-{end}")));
-    get_bytes(request, ResponseExpectation::PartialContent)
+    let response = get_response(request, ResponseExpectation::PartialContent)?;
+    Ok(ObjectRangeRead {
+        bytes: response.bytes,
+        object_size: response.object_size,
+    })
 }
 
 /// Expand `patterns`, read the first object, and return both location and bytes.
@@ -216,6 +259,18 @@ enum ResponseExpectation {
     PartialContent,
 }
 
+#[derive(Debug)]
+struct ObjectResponse {
+    bytes: Vec<u8>,
+    object_size: Option<u64>,
+}
+
+impl ObjectResponse {
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Credentials {
     access_key: String,
@@ -238,9 +293,11 @@ fn expand_object_store_pattern(pattern: &str) -> Result<Vec<ObjectLocation>> {
     let mut matches = Vec::new();
     loop {
         let request = object_request(&uri.with_key(""), query.clone())?;
-        let body = String::from_utf8(get_bytes(request, ResponseExpectation::Success)?).map_err(
-            |err| ObjectStoreError::Http(format!("object listing returned invalid UTF-8: {err}")),
-        )?;
+        let body =
+            String::from_utf8(get_response(request, ResponseExpectation::Success)?.into_bytes())
+                .map_err(|err| {
+                    ObjectStoreError::Http(format!("object listing returned invalid UTF-8: {err}"))
+                })?;
         for key in parse_xml_tag_values(&body, "Key") {
             if wildcard_match(&uri.key, &key) {
                 matches.push(ObjectLocation {
@@ -321,7 +378,10 @@ fn object_request(uri: &ObjectUri, query: Vec<(String, String)>) -> Result<Objec
     })
 }
 
-fn get_bytes(request: ObjectRequest, expectation: ResponseExpectation) -> Result<Vec<u8>> {
+fn get_response(
+    request: ObjectRequest,
+    expectation: ResponseExpectation,
+) -> Result<ObjectResponse> {
     let mut builder = ureq::get(&request.url);
     if let Some(credentials) = credentials_for(request.scheme) {
         for (name, value) in signed_headers(&request, &credentials) {
@@ -351,12 +411,18 @@ fn get_bytes(request: ObjectRequest, expectation: ResponseExpectation) -> Result
         }
         ResponseExpectation::Success | ResponseExpectation::PartialContent => {}
     }
-    response
+    let object_size = response
+        .headers()
+        .get("content-range")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_content_range_size);
+    let bytes = response
         .body_mut()
         .with_config()
         .limit(u64::MAX)
         .read_to_vec()
-        .map_err(|err| ObjectStoreError::Http(format!("object GET {} body: {err}", request.url)))
+        .map_err(|err| ObjectStoreError::Http(format!("object GET {} body: {err}", request.url)))?;
+    Ok(ObjectResponse { bytes, object_size })
 }
 
 fn host_from_url(url: &str) -> Result<String> {
@@ -529,6 +595,14 @@ fn canonical_query_string(mut query: Vec<(String, String)>) -> String {
         .join("&")
 }
 
+fn parse_content_range_size(value: &str) -> Option<u64> {
+    let (_, size) = value.rsplit_once('/')?;
+    if size == "*" {
+        return None;
+    }
+    size.parse().ok()
+}
+
 fn literal_prefix(pattern: &str) -> String {
     let first_wildcard = pattern
         .char_indices()
@@ -686,9 +760,10 @@ mod tests {
         let _guard = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", endpoint);
         let objects = expand_object_store_specs(&["s3://bucket/path/file.parquet".to_owned()])
             .expect("expand object");
-        let bytes = read_object_range(&objects[0], 4, 6).expect("read range");
+        let range = read_object_range_with_metadata(&objects[0], 4, 6).expect("read range");
 
-        assert_eq!(bytes, b"456789");
+        assert_eq!(range.bytes(), b"456789");
+        assert_eq!(range.object_size(), Some(16));
         let request = request_rx.recv().expect("request text");
         assert!(request.starts_with("GET /bucket/path/file.parquet HTTP/1.1"));
         assert!(request.contains("\r\nrange: bytes=4-9\r\n"));

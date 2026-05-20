@@ -22,7 +22,7 @@ use apache_avro::{Codec, Schema as AvroSchema, Writer, types::Value as AvroValue
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_ipc::writer::FileWriter as ArrowFileWriter;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
@@ -66,15 +66,33 @@ struct MockS3 {
     endpoint: String,
     shutdown: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+    requests: Arc<Mutex<Vec<MockS3Request>>>,
 }
 
 impl MockS3 {
     fn new(objects: Vec<(&str, Vec<u8>)>) -> Self {
+        Self::with_mode(objects, MockS3Mode::AllowFullObject)
+    }
+
+    fn range_only(objects: Vec<(&str, Vec<u8>)>) -> Self {
+        Self::with_mode(objects, MockS3Mode::RangeOnly)
+    }
+
+    fn requests(&self) -> Vec<MockS3Request> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn with_mode(objects: Vec<(&str, Vec<u8>)>, mode: MockS3Mode) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock s3");
         listener.set_nonblocking(true).expect("mock s3 nonblocking");
         let endpoint = format!("http://{}", listener.local_addr().expect("mock addr"));
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let thread_requests = Arc::clone(&requests);
         let objects = objects
             .into_iter()
             .map(|(path, body)| (path.to_owned(), body))
@@ -82,7 +100,9 @@ impl MockS3 {
         let handle = thread::spawn(move || {
             while !thread_shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
-                    Ok((mut stream, _addr)) => handle_mock_s3_stream(&mut stream, &objects),
+                    Ok((mut stream, _addr)) => {
+                        handle_mock_s3_stream(&mut stream, &objects, &thread_requests, mode);
+                    }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -94,8 +114,21 @@ impl MockS3 {
             endpoint,
             shutdown,
             handle: Some(handle),
+            requests,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum MockS3Mode {
+    AllowFullObject,
+    RangeOnly,
+}
+
+#[derive(Clone, Debug)]
+struct MockS3Request {
+    path: String,
+    range: Option<String>,
 }
 
 impl Drop for MockS3 {
@@ -115,12 +148,15 @@ impl Drop for MockS3 {
 fn handle_mock_s3_stream(
     stream: &mut std::net::TcpStream,
     objects: &std::collections::BTreeMap<String, Vec<u8>>,
+    requests: &Arc<Mutex<Vec<MockS3Request>>>,
+    mode: MockS3Mode,
 ) {
     let mut buf = [0_u8; 4096];
     let Ok(n) = stream.read(&mut buf) else {
         return;
     };
     let request = String::from_utf8_lossy(&buf[..n]);
+    let range = header_value(&request, "range");
     let Some(target) = request
         .lines()
         .next()
@@ -129,6 +165,13 @@ fn handle_mock_s3_stream(
         return;
     };
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(MockS3Request {
+            path: path.to_owned(),
+            range: range.clone(),
+        });
     if query.contains("list-type=2") {
         let prefix = query_param(query, "prefix").unwrap_or_default();
         let bucket = path.trim_start_matches('/');
@@ -151,10 +194,37 @@ fn handle_mock_s3_stream(
         return;
     }
     if let Some(body) = objects.get(path) {
-        write_mock_response(stream, 200, "application/octet-stream", body);
+        if let Some(range) = range {
+            if let Some((start, end)) = parse_bytes_range(&range, body.len()) {
+                write_mock_range_response(stream, body, start, end);
+            } else {
+                write_mock_response(stream, 416, "text/plain", b"bad range");
+            }
+        } else if matches!(mode, MockS3Mode::RangeOnly) {
+            write_mock_response(stream, 400, "text/plain", b"range required");
+        } else {
+            write_mock_response(stream, 200, "application/octet-stream", body);
+        }
     } else {
         write_mock_response(stream, 404, "text/plain", b"not found");
     }
+}
+
+fn header_value(request: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}:");
+    request.lines().find_map(|line| {
+        line.to_ascii_lowercase()
+            .strip_prefix(&prefix)
+            .map(|_| line[prefix.len()..].trim().to_owned())
+    })
+}
+
+fn parse_bytes_range(range: &str, len: usize) -> Option<(usize, usize)> {
+    let range = range.strip_prefix("bytes=")?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok()?.min(len.checked_sub(1)?);
+    (start <= end && end < len).then_some((start, end))
 }
 
 fn query_param(query: &str, name: &str) -> Option<String> {
@@ -193,13 +263,36 @@ fn write_mock_response(
     content_type: &str,
     body: &[u8],
 ) {
-    let reason = if status == 200 { "OK" } else { "Not Found" };
+    let reason = match status {
+        200 => "OK",
+        206 => "Partial Content",
+        400 => "Bad Request",
+        404 => "Not Found",
+        416 => "Range Not Satisfiable",
+        _ => "Status",
+    };
     let header = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body);
+}
+
+fn write_mock_range_response(
+    stream: &mut std::net::TcpStream,
+    body: &[u8],
+    start: usize,
+    end: usize,
+) {
+    let slice = &body[start..=end];
+    let header = format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+        slice.len(),
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(slice);
 }
 
 fn write_people_parquet(
@@ -237,6 +330,42 @@ fn people_batch(schema: Arc<ArrowSchema>, rows: &[(i64, &str, i64)]) -> RecordBa
         ],
     )
     .expect("record batch")
+}
+
+fn parquet_column_ranges(path: &std::path::Path, column: &str) -> Vec<(u64, u64)> {
+    let file = fs::File::open(path).expect("open parquet for metadata");
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("parquet metadata");
+    let column_index = builder
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| field.name() == column)
+        .expect("metadata column");
+    (0..builder.metadata().num_row_groups())
+        .map(|row_group| {
+            let (start, len) = builder
+                .metadata()
+                .row_group(row_group)
+                .column(column_index)
+                .byte_range();
+            (start, start + len.saturating_sub(1))
+        })
+        .collect()
+}
+
+fn request_overlaps_any_range(request: &MockS3Request, ranges: &[(u64, u64)]) -> bool {
+    let Some((start, end)) = request.range.as_deref().and_then(request_range_bounds) else {
+        return false;
+    };
+    ranges
+        .iter()
+        .any(|(range_start, range_end)| start <= *range_end && end >= *range_start)
+}
+
+fn request_range_bounds(range: &str) -> Option<(u64, u64)> {
+    let range = range.strip_prefix("bytes=")?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
 }
 
 fn write_people_arrow(path: &std::path::Path, rows: &[(i64, &str, i64)]) {
@@ -1026,6 +1155,65 @@ async fn read_parquet_s3_glob_reads_matching_objects() {
     );
 
     shutdown(client, server_handle).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn read_parquet_s3_uses_ranges_for_footer_and_projected_columns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let parquet_path = dir.path().join("ranged.parquet");
+    write_people_parquet(
+        &parquet_path,
+        &[(10, "Alpha", 1), (20, "Beta", 2)],
+        &[(100, "Zed", 99)],
+    );
+    let object_bytes = fs::read(&parquet_path).expect("read parquet bytes");
+    let object_len = object_bytes.len();
+    let whole_object_range = format!("bytes=0-{}", object_len.saturating_sub(1));
+    let score_ranges = parquet_column_ranges(&parquet_path, "score");
+    let mock = MockS3::range_only(vec![("/lake/parquet/ranged.parquet", object_bytes)]);
+    let _env = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", &mock.endpoint);
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let rows = client
+        .query(
+            "SELECT name FROM read_parquet('s3://lake/parquet/ranged.parquet') WHERE id >= 100",
+            &[],
+        )
+        .await
+        .expect("read_parquet s3 ranges");
+    let values: Vec<String> = rows.iter().map(|row| row.get::<_, String>(0)).collect();
+    assert_eq!(values, vec!["Zed".to_string()]);
+    shutdown(client, server_handle).await;
+
+    let object_requests = mock
+        .requests()
+        .into_iter()
+        .filter(|request| request.path == "/lake/parquet/ranged.parquet")
+        .collect::<Vec<_>>();
+    assert!(
+        object_requests
+            .iter()
+            .all(|request| request.range.is_some()),
+        "object data requests must be ranged: {object_requests:?}"
+    );
+    assert!(
+        object_requests
+            .iter()
+            .any(|request| request.range.as_deref() == Some("bytes=0-0")),
+        "object length probe must use a one-byte range: {object_requests:?}"
+    );
+    assert!(
+        object_requests
+            .iter()
+            .all(|request| { request.range.as_deref() != Some(whole_object_range.as_str()) }),
+        "read_parquet must not fetch whole S3 object: {object_requests:?}"
+    );
+    assert!(
+        object_requests
+            .iter()
+            .all(|request| !request_overlaps_any_range(request, &score_ranges)),
+        "projected-out score column chunks must not be ranged: {object_requests:?}; score ranges: {score_ranges:?}"
+    );
 }
 
 #[tokio::test]
