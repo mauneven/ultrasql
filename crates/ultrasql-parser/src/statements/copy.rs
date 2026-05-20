@@ -216,9 +216,10 @@ impl Parser<'_> {
                             "text" => CopyFormat::Text,
                             "csv" => CopyFormat::Csv,
                             "binary" => CopyFormat::Binary,
+                            "parquet" => CopyFormat::Parquet,
                             _ => {
                                 return Err(ParseError::Expected {
-                                    expected: "TEXT, CSV, or BINARY after FORMAT",
+                                    expected: "TEXT, CSV, BINARY, or PARQUET after FORMAT",
                                     found: fmt_tok.kind,
                                     offset: fmt_tok.span.start as usize,
                                 });
@@ -228,7 +229,7 @@ impl Parser<'_> {
                     TokenKind::KwCsv => CopyFormat::Csv,
                     _ => {
                         return Err(ParseError::Expected {
-                            expected: "TEXT or CSV after FORMAT",
+                            expected: "TEXT, CSV, BINARY, or PARQUET after FORMAT",
                             found: fmt_tok.kind,
                             offset: fmt_tok.span.start as usize,
                         });
@@ -501,6 +502,12 @@ mod tests {
     fn copy_binary_format_is_accepted() {
         let stmt = parse_copy("COPY t FROM STDIN WITH (FORMAT binary)");
         assert_eq!(stmt.format, CopyFormat::Binary);
+    }
+
+    #[test]
+    fn copy_parquet_format_is_accepted() {
+        let stmt = parse_copy("COPY t FROM 'file.parquet' WITH (FORMAT parquet)");
+        assert_eq!(stmt.format, CopyFormat::Parquet);
     }
 
     #[test]

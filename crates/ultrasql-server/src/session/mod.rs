@@ -27,6 +27,7 @@ mod ext;
 mod io;
 mod meta_stmt;
 mod notify;
+mod parquet_copy;
 mod run;
 mod sequence;
 mod startup;

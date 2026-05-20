@@ -1,0 +1,549 @@
+//! Parquet-backed server-side `COPY` helpers.
+
+use std::fs::File;
+use std::sync::Arc;
+
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    LargeStringArray, RecordBatch, StringArray,
+};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
+use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tracing::warn;
+use ultrasql_catalog::TableEntry;
+use ultrasql_core::{DataType, RelationId, Schema, Value};
+use ultrasql_executor::RowCodec;
+use ultrasql_txn::IsolationLevel;
+
+use super::Session;
+use crate::error::ServerError;
+
+const PARQUET_COPY_BATCH_ROWS: usize = 4096;
+
+impl<RW> Session<RW>
+where
+    RW: AsyncRead + AsyncWrite + Unpin,
+{
+    pub(super) fn copy_to_parquet_file(
+        &mut self,
+        entry: &TableEntry,
+        columns: &[usize],
+        stream_schema: &Schema,
+        path: &str,
+    ) -> Result<u64, ServerError> {
+        let arrow_schema = Arc::new(copy_arrow_schema(stream_schema)?);
+        let file = File::create(path)
+            .map_err(|err| ServerError::Io(std::io::Error::other(format!("{path}: {err}"))))?;
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&arrow_schema), None)
+            .map_err(|err| ServerError::CopyFormat(format!("COPY TO parquet {path}: {err}")))?;
+
+        let rel = RelationId(entry.oid);
+        let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
+        let mut batch = ParquetBatchBuilder::new(stream_schema)?;
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let codec = RowCodec::new(entry.schema.clone());
+        let mut rows = 0_u64;
+
+        let scan_result = {
+            let scan = self.state.heap.scan_visible(
+                rel,
+                block_count,
+                &txn.snapshot,
+                self.state.txn_manager.as_ref(),
+            );
+            for tuple in scan {
+                let tuple = tuple
+                    .map_err(|err| ServerError::ddl(format!("COPY TO parquet heap scan: {err}")))?;
+                let row = codec.decode(&tuple.data).map_err(|err| {
+                    ServerError::CopyFormat(format!("COPY TO parquet row decode: {err}"))
+                })?;
+                batch.push_projected_row(&row, &entry.schema, columns)?;
+                if batch.len() == PARQUET_COPY_BATCH_ROWS {
+                    let record_batch = batch.take_record_batch(Arc::clone(&arrow_schema))?;
+                    writer.write(&record_batch).map_err(|err| {
+                        ServerError::CopyFormat(format!("COPY TO parquet {path}: {err}"))
+                    })?;
+                }
+                rows = rows.saturating_add(1);
+            }
+            if !batch.is_empty() {
+                let record_batch = batch.take_record_batch(Arc::clone(&arrow_schema))?;
+                writer.write(&record_batch).map_err(|err| {
+                    ServerError::CopyFormat(format!("COPY TO parquet {path}: {err}"))
+                })?;
+            }
+            Ok(rows)
+        };
+
+        let rows = match scan_result {
+            Ok(rows) => rows,
+            Err(err) => {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    warn!(error = %abort_err, "COPY TO parquet abort failed");
+                }
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = writer.close() {
+            if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                warn!(error = %abort_err, "COPY TO parquet abort failed");
+            }
+            return Err(ServerError::CopyFormat(format!(
+                "COPY TO parquet {path}: {err}"
+            )));
+        }
+        if let Err(err) = self.state.txn_manager.commit(txn) {
+            warn!(error = %err, "COPY TO parquet scan commit failed");
+        }
+        Ok(rows)
+    }
+
+    pub(super) fn copy_from_parquet_file(
+        &mut self,
+        entry: &TableEntry,
+        columns: &[usize],
+        stream_schema: &Schema,
+        path: &str,
+    ) -> Result<u64, ServerError> {
+        let file = File::open(path)
+            .map_err(|err| ServerError::Io(std::io::Error::other(format!("{path}: {err}"))))?;
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|err| {
+            ServerError::CopyFormat(format!("COPY FROM parquet cannot inspect {path}: {err}"))
+        })?;
+        validate_parquet_copy_schema(builder.schema().as_ref(), stream_schema, path)?;
+        let reader = builder
+            .with_batch_size(PARQUET_COPY_BATCH_ROWS)
+            .build()
+            .map_err(|err| {
+                ServerError::CopyFormat(format!("COPY FROM parquet cannot read {path}: {err}"))
+            })?;
+
+        let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let codec = RowCodec::new(entry.schema.clone());
+        let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(PARQUET_COPY_BATCH_ROWS);
+        let mut rows_inserted = 0_u64;
+
+        let import_result = {
+            for batch in reader {
+                let batch = batch.map_err(|err| {
+                    ServerError::CopyFormat(format!("COPY FROM parquet read {path}: {err}"))
+                })?;
+                validate_parquet_copy_schema(batch.schema().as_ref(), stream_schema, path)?;
+                for row_index in 0..batch.num_rows() {
+                    let row = parquet_batch_row_to_values(&batch, row_index, entry, columns)?;
+                    let payload = codec.encode(&row).map_err(|err| {
+                        ServerError::CopyFormat(format!("COPY FROM parquet row encode: {err}"))
+                    })?;
+                    payload_batch.push(payload);
+                    if payload_batch.len() == PARQUET_COPY_BATCH_ROWS {
+                        let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+                        self.flush_copy_insert_batch(entry, &payload_batch, &txn)?;
+                        rows_inserted = rows_inserted.saturating_add(batch_len);
+                        payload_batch.clear();
+                    }
+                }
+            }
+            if !payload_batch.is_empty() {
+                let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+                self.flush_copy_insert_batch(entry, &payload_batch, &txn)?;
+                rows_inserted = rows_inserted.saturating_add(batch_len);
+                payload_batch.clear();
+            }
+            Ok(rows_inserted)
+        };
+
+        let rows = match import_result {
+            Ok(rows) => rows,
+            Err(err) => {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    warn!(error = %abort_err, "COPY FROM parquet abort failed");
+                }
+                return Err(err);
+            }
+        };
+        if let Err(err) = self.state.txn_manager.commit(txn) {
+            warn!(error = %err, "COPY FROM parquet commit failed");
+        }
+        Ok(rows)
+    }
+}
+
+struct ParquetBatchBuilder<'a> {
+    schema: &'a Schema,
+    columns: Vec<ParquetColumnBuffer>,
+    rows: usize,
+}
+
+impl<'a> ParquetBatchBuilder<'a> {
+    fn new(schema: &'a Schema) -> Result<Self, ServerError> {
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| ParquetColumnBuffer::new(&field.data_type))
+            .collect::<Result<Vec<_>, ServerError>>()?;
+        Ok(Self {
+            schema,
+            columns,
+            rows: 0,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
+
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn push_projected_row(
+        &mut self,
+        row: &[Value],
+        table_schema: &Schema,
+        columns: &[usize],
+    ) -> Result<(), ServerError> {
+        for (stream_index, field) in self.schema.fields().iter().enumerate() {
+            let table_index = projected_column_index(columns, stream_index);
+            let value = row.get(table_index).ok_or_else(|| {
+                ServerError::CopyFormat(format!(
+                    "COPY TO parquet row missing column {stream_index}"
+                ))
+            })?;
+            let table_field = table_schema.field_at(table_index);
+            self.columns[stream_index].push(value, &table_field.data_type)?;
+            if table_field.data_type != field.data_type {
+                return Err(ServerError::CopyFormat(format!(
+                    "COPY TO parquet schema mismatch for column {}",
+                    field.name
+                )));
+            }
+        }
+        self.rows += 1;
+        Ok(())
+    }
+
+    fn take_record_batch(
+        &mut self,
+        arrow_schema: Arc<ArrowSchema>,
+    ) -> Result<RecordBatch, ServerError> {
+        let arrays = self
+            .columns
+            .iter_mut()
+            .map(ParquetColumnBuffer::take_array)
+            .collect::<Vec<_>>();
+        self.rows = 0;
+        RecordBatch::try_new(arrow_schema, arrays)
+            .map_err(|err| ServerError::CopyFormat(format!("COPY parquet batch: {err}")))
+    }
+}
+
+enum ParquetColumnBuffer {
+    Bool(Vec<Option<bool>>),
+    Int32(Vec<Option<i32>>),
+    Int64(Vec<Option<i64>>),
+    Float32(Vec<Option<f32>>),
+    Float64(Vec<Option<f64>>),
+    Utf8(Vec<Option<String>>),
+}
+
+impl ParquetColumnBuffer {
+    fn new(data_type: &DataType) -> Result<Self, ServerError> {
+        Ok(match data_type {
+            DataType::Bool => Self::Bool(Vec::with_capacity(PARQUET_COPY_BATCH_ROWS)),
+            DataType::Int16 | DataType::Int32 => {
+                Self::Int32(Vec::with_capacity(PARQUET_COPY_BATCH_ROWS))
+            }
+            DataType::Int64 => Self::Int64(Vec::with_capacity(PARQUET_COPY_BATCH_ROWS)),
+            DataType::Float32 => Self::Float32(Vec::with_capacity(PARQUET_COPY_BATCH_ROWS)),
+            DataType::Float64 => Self::Float64(Vec::with_capacity(PARQUET_COPY_BATCH_ROWS)),
+            DataType::Text { .. } => Self::Utf8(Vec::with_capacity(PARQUET_COPY_BATCH_ROWS)),
+            other => {
+                return Err(ServerError::CopyFormat(format!(
+                    "COPY parquet unsupported type: {other}"
+                )));
+            }
+        })
+    }
+
+    fn push(&mut self, value: &Value, data_type: &DataType) -> Result<(), ServerError> {
+        if matches!(value, Value::Null) {
+            self.push_null();
+            return Ok(());
+        }
+        match (self, data_type, value) {
+            (Self::Bool(values), DataType::Bool, Value::Bool(value)) => values.push(Some(*value)),
+            (Self::Int32(values), DataType::Int16, Value::Int16(value)) => {
+                values.push(Some(i32::from(*value)));
+            }
+            (Self::Int32(values), DataType::Int32, Value::Int32(value)) => {
+                values.push(Some(*value));
+            }
+            (Self::Int64(values), DataType::Int64, Value::Int64(value)) => {
+                values.push(Some(*value));
+            }
+            (Self::Float32(values), DataType::Float32, Value::Float32(value)) => {
+                values.push(Some(*value));
+            }
+            (Self::Float64(values), DataType::Float64, Value::Float64(value)) => {
+                values.push(Some(*value));
+            }
+            (Self::Utf8(values), DataType::Text { .. }, Value::Text(value)) => {
+                values.push(Some(value.clone()));
+            }
+            (_, expected, got) => {
+                return Err(ServerError::CopyFormat(format!(
+                    "COPY parquet type mismatch: expected {expected}, got {}",
+                    got.data_type()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn push_null(&mut self) {
+        match self {
+            Self::Bool(values) => values.push(None),
+            Self::Int32(values) => values.push(None),
+            Self::Int64(values) => values.push(None),
+            Self::Float32(values) => values.push(None),
+            Self::Float64(values) => values.push(None),
+            Self::Utf8(values) => values.push(None),
+        }
+    }
+
+    fn take_array(&mut self) -> ArrayRef {
+        match self {
+            Self::Bool(values) => Arc::new(BooleanArray::from(std::mem::take(values))),
+            Self::Int32(values) => Arc::new(Int32Array::from(std::mem::take(values))),
+            Self::Int64(values) => Arc::new(Int64Array::from(std::mem::take(values))),
+            Self::Float32(values) => Arc::new(Float32Array::from(std::mem::take(values))),
+            Self::Float64(values) => Arc::new(Float64Array::from(std::mem::take(values))),
+            Self::Utf8(values) => {
+                let owned = std::mem::take(values);
+                let refs = owned.iter().map(Option::as_deref).collect::<Vec<_>>();
+                Arc::new(StringArray::from(refs))
+            }
+        }
+    }
+}
+
+fn parquet_batch_row_to_values(
+    batch: &RecordBatch,
+    row_index: usize,
+    entry: &TableEntry,
+    columns: &[usize],
+) -> Result<Vec<Value>, ServerError> {
+    let mut row = vec![Value::Null; entry.schema.len()];
+    for (stream_index, arrow_field) in batch.schema().fields().iter().enumerate() {
+        let table_index = projected_column_index(columns, stream_index);
+        let field = entry.schema.field_at(table_index);
+        if !arrow_field.name().eq_ignore_ascii_case(&field.name) {
+            return Err(ServerError::CopyFormat(format!(
+                "COPY FROM parquet column {} expected {}, got {}",
+                stream_index,
+                field.name,
+                arrow_field.name()
+            )));
+        }
+        row[table_index] = arrow_cell_to_value(
+            batch.column(stream_index).as_ref(),
+            row_index,
+            &field.data_type,
+        )?;
+    }
+    Ok(row)
+}
+
+fn copy_arrow_schema(schema: &Schema) -> Result<ArrowSchema, ServerError> {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Ok(ArrowField::new(
+                field.name.clone(),
+                copy_arrow_data_type(&field.data_type)?,
+                field.nullable,
+            ))
+        })
+        .collect::<Result<Vec<_>, ServerError>>()?;
+    Ok(ArrowSchema::new(fields))
+}
+
+fn validate_parquet_copy_schema(
+    arrow_schema: &ArrowSchema,
+    stream_schema: &Schema,
+    path: &str,
+) -> Result<(), ServerError> {
+    if arrow_schema.fields().len() != stream_schema.len() {
+        return Err(ServerError::CopyFormat(format!(
+            "COPY FROM parquet {path}: expected {} columns, got {}",
+            stream_schema.len(),
+            arrow_schema.fields().len()
+        )));
+    }
+    for (index, (arrow_field, field)) in arrow_schema
+        .fields()
+        .iter()
+        .zip(stream_schema.fields())
+        .enumerate()
+    {
+        if !arrow_field.name().eq_ignore_ascii_case(&field.name) {
+            return Err(ServerError::CopyFormat(format!(
+                "COPY FROM parquet {path}: column {index} expected {}, got {}",
+                field.name,
+                arrow_field.name()
+            )));
+        }
+        if !arrow_type_matches_copy(arrow_field.data_type(), &field.data_type) {
+            return Err(ServerError::CopyFormat(format!(
+                "COPY FROM parquet {path}: column {} expected {}, got {}",
+                field.name,
+                copy_arrow_data_type(&field.data_type)?,
+                arrow_field.data_type()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn copy_arrow_data_type(data_type: &DataType) -> Result<ArrowDataType, ServerError> {
+    match data_type {
+        DataType::Bool => Ok(ArrowDataType::Boolean),
+        DataType::Int16 | DataType::Int32 => Ok(ArrowDataType::Int32),
+        DataType::Int64 => Ok(ArrowDataType::Int64),
+        DataType::Float32 => Ok(ArrowDataType::Float32),
+        DataType::Float64 => Ok(ArrowDataType::Float64),
+        DataType::Text { .. } => Ok(ArrowDataType::Utf8),
+        other => Err(ServerError::CopyFormat(format!(
+            "COPY parquet unsupported type: {other}"
+        ))),
+    }
+}
+
+fn arrow_type_matches_copy(arrow_type: &ArrowDataType, data_type: &DataType) -> bool {
+    match (arrow_type, data_type) {
+        (ArrowDataType::Utf8 | ArrowDataType::LargeUtf8, DataType::Text { .. }) => true,
+        (_, _) => copy_arrow_data_type(data_type).is_ok_and(|expected| &expected == arrow_type),
+    }
+}
+
+fn projected_column_index(columns: &[usize], stream_index: usize) -> usize {
+    columns.get(stream_index).copied().unwrap_or(stream_index)
+}
+
+fn arrow_cell_to_value(
+    array: &dyn Array,
+    row_index: usize,
+    data_type: &DataType,
+) -> Result<Value, ServerError> {
+    if array.is_null(row_index) {
+        return Ok(Value::Null);
+    }
+    match data_type {
+        DataType::Bool => bool_cell(array, row_index),
+        DataType::Int16 => int16_cell(array, row_index),
+        DataType::Int32 => int32_cell(array, row_index),
+        DataType::Int64 => int64_cell(array, row_index),
+        DataType::Float32 => float32_cell(array, row_index),
+        DataType::Float64 => float64_cell(array, row_index),
+        DataType::Text { .. } => text_cell(array, row_index),
+        other => Err(ServerError::CopyFormat(format!(
+            "COPY parquet unsupported type: {other}"
+        ))),
+    }
+}
+
+fn bool_cell(array: &dyn Array, row_index: usize) -> Result<Value, ServerError> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| {
+            ServerError::CopyFormat("COPY FROM parquet Boolean downcast failed".to_owned())
+        })?;
+    Ok(Value::Bool(typed.value(row_index)))
+}
+
+fn int16_cell(array: &dyn Array, row_index: usize) -> Result<Value, ServerError> {
+    if let Some(typed) = array.as_any().downcast_ref::<Int16Array>() {
+        return Ok(Value::Int16(typed.value(row_index)));
+    }
+    if let Some(typed) = array.as_any().downcast_ref::<Int32Array>() {
+        let value = i16::try_from(typed.value(row_index)).map_err(|_| {
+            ServerError::CopyFormat("COPY FROM parquet SMALLINT overflow".to_owned())
+        })?;
+        return Ok(Value::Int16(value));
+    }
+    Err(ServerError::CopyFormat(
+        "COPY FROM parquet Int16 downcast failed".to_owned(),
+    ))
+}
+
+fn int32_cell(array: &dyn Array, row_index: usize) -> Result<Value, ServerError> {
+    if let Some(typed) = array.as_any().downcast_ref::<Int16Array>() {
+        return Ok(Value::Int32(i32::from(typed.value(row_index))));
+    }
+    if let Some(typed) = array.as_any().downcast_ref::<Int32Array>() {
+        return Ok(Value::Int32(typed.value(row_index)));
+    }
+    if let Some(typed) = array.as_any().downcast_ref::<Int64Array>() {
+        let value = i32::try_from(typed.value(row_index)).map_err(|_| {
+            ServerError::CopyFormat("COPY FROM parquet INTEGER overflow".to_owned())
+        })?;
+        return Ok(Value::Int32(value));
+    }
+    Err(ServerError::CopyFormat(
+        "COPY FROM parquet Int32 downcast failed".to_owned(),
+    ))
+}
+
+fn int64_cell(array: &dyn Array, row_index: usize) -> Result<Value, ServerError> {
+    if let Some(typed) = array.as_any().downcast_ref::<Int16Array>() {
+        return Ok(Value::Int64(i64::from(typed.value(row_index))));
+    }
+    if let Some(typed) = array.as_any().downcast_ref::<Int32Array>() {
+        return Ok(Value::Int64(i64::from(typed.value(row_index))));
+    }
+    if let Some(typed) = array.as_any().downcast_ref::<Int64Array>() {
+        return Ok(Value::Int64(typed.value(row_index)));
+    }
+    Err(ServerError::CopyFormat(
+        "COPY FROM parquet Int64 downcast failed".to_owned(),
+    ))
+}
+
+fn float32_cell(array: &dyn Array, row_index: usize) -> Result<Value, ServerError> {
+    let typed = array
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .ok_or_else(|| {
+            ServerError::CopyFormat("COPY FROM parquet Float32 downcast failed".to_owned())
+        })?;
+    Ok(Value::Float32(typed.value(row_index)))
+}
+
+fn float64_cell(array: &dyn Array, row_index: usize) -> Result<Value, ServerError> {
+    if let Some(typed) = array.as_any().downcast_ref::<Float32Array>() {
+        return Ok(Value::Float64(f64::from(typed.value(row_index))));
+    }
+    if let Some(typed) = array.as_any().downcast_ref::<Float64Array>() {
+        return Ok(Value::Float64(typed.value(row_index)));
+    }
+    Err(ServerError::CopyFormat(
+        "COPY FROM parquet Float64 downcast failed".to_owned(),
+    ))
+}
+
+fn text_cell(array: &dyn Array, row_index: usize) -> Result<Value, ServerError> {
+    if let Some(typed) = array.as_any().downcast_ref::<StringArray>() {
+        return Ok(Value::Text(typed.value(row_index).to_owned()));
+    }
+    if let Some(typed) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(Value::Text(typed.value(row_index).to_owned()));
+    }
+    Err(ServerError::CopyFormat(
+        "COPY FROM parquet Utf8 downcast failed".to_owned(),
+    ))
+}

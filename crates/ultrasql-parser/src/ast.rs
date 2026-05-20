@@ -238,12 +238,14 @@ pub enum CopyFormat {
     Csv,
     /// PostgreSQL binary COPY format.
     Binary,
+    /// Apache Parquet file format for server-side file COPY.
+    Parquet,
 }
 
 /// One `WITH (…)` option of a `COPY` statement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CopyOption {
-    /// `FORMAT { TEXT | CSV }`.
+    /// `FORMAT { TEXT | CSV | BINARY | PARQUET }`.
     Format(CopyFormat),
     /// `DELIMITER 'c'` — single-character column delimiter.
     Delimiter(char),

@@ -195,6 +195,7 @@ where
                 PlanCopyFormat::Text => ServerCopyFormat::Text,
                 PlanCopyFormat::Csv => ServerCopyFormat::Csv,
                 PlanCopyFormat::Binary => ServerCopyFormat::Binary,
+                PlanCopyFormat::Parquet => ServerCopyFormat::Parquet,
             },
             delimiter: *delimiter,
             null_str: null_str.clone(),
@@ -261,6 +262,11 @@ where
         opts: &CopyOptions,
         emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
+        if opts.format == ServerCopyFormat::Parquet {
+            return Err(ServerError::Unsupported(
+                "parquet COPY TO requires a server-side file path",
+            ));
+        }
         let n_columns = schema.len();
         self.write_buf.clear();
         let format_code = copy_format_code(opts.format);
@@ -312,7 +318,7 @@ where
             let bytes = match opts.format {
                 ServerCopyFormat::Text => encode_text_row(&header_cells, opts),
                 ServerCopyFormat::Csv => encode_csv_row(&header_cells, opts),
-                ServerCopyFormat::Binary => Vec::new(),
+                ServerCopyFormat::Binary | ServerCopyFormat::Parquet => Vec::new(),
             };
             encode_backend(&BackendMessage::CopyData(bytes), &mut wire_buf);
         }
@@ -359,7 +365,7 @@ where
                 let bytes = match opts.format {
                     ServerCopyFormat::Text => encode_text_row(&cells, opts),
                     ServerCopyFormat::Csv => encode_csv_row(&cells, opts),
-                    ServerCopyFormat::Binary => Vec::new(),
+                    ServerCopyFormat::Binary | ServerCopyFormat::Parquet => Vec::new(),
                 };
                 encode_backend(&BackendMessage::CopyData(bytes), &mut wire_buf);
                 rows_sent = rows_sent.saturating_add(1);
@@ -409,6 +415,11 @@ where
         opts: &CopyOptions,
         emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
+        if opts.format == ServerCopyFormat::Parquet {
+            return Err(ServerError::Unsupported(
+                "parquet COPY FROM requires a server-side file path",
+            ));
+        }
         let n_columns = schema.len();
         let format_code = copy_format_code(opts.format);
         self.send(&copy_in_response_with_format(n_columns, format_code))
@@ -623,6 +634,13 @@ where
         path: &str,
         emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
+        if opts.format == ServerCopyFormat::Parquet {
+            let rows = self.copy_from_parquet_file(entry, columns, schema, path)?;
+            self.state.note_commit_for_gc();
+            self.state.note_table_modifications(&entry.name, rows);
+            self.plan_cache_invalidate();
+            return self.send_copy_complete(rows, emit_ready_for_query).await;
+        }
         if opts.format == ServerCopyFormat::Binary {
             let bytes = fs::read(path)
                 .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
@@ -971,6 +989,9 @@ where
         opts: &CopyOptions,
         path: &str,
     ) -> Result<u64, ServerError> {
+        if opts.format == ServerCopyFormat::Parquet {
+            return self.copy_to_parquet_file(entry, columns, schema, path);
+        }
         let (bytes, rows) = if opts.format == ServerCopyFormat::Binary {
             self.encode_table_binary_copy(entry, columns, schema)?
         } else {
@@ -989,6 +1010,11 @@ where
         opts: &CopyOptions,
         emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
+        if opts.format == ServerCopyFormat::Parquet {
+            return Err(ServerError::Unsupported(
+                "parquet COPY for query targets is not yet supported",
+            ));
+        }
         if opts.format == ServerCopyFormat::Binary {
             return Err(ServerError::Unsupported(
                 "binary COPY for query targets is not yet supported",
@@ -1091,7 +1117,7 @@ where
                 ServerCopyFormat::Csv => {
                     out.extend_from_slice(&encode_csv_row(&header_cells, opts))
                 }
-                ServerCopyFormat::Binary => {}
+                ServerCopyFormat::Binary | ServerCopyFormat::Parquet => {}
             }
         }
         let mut rows = 0_u64;
@@ -1111,7 +1137,7 @@ where
             match opts.format {
                 ServerCopyFormat::Text => out.extend_from_slice(&encode_text_row(&cells, opts)),
                 ServerCopyFormat::Csv => out.extend_from_slice(&encode_csv_row(&cells, opts)),
-                ServerCopyFormat::Binary => {}
+                ServerCopyFormat::Binary | ServerCopyFormat::Parquet => {}
             }
             rows = rows.saturating_add(1);
         }
@@ -1156,7 +1182,7 @@ where
         Ok((out, rows))
     }
 
-    fn flush_copy_insert_batch(
+    pub(super) fn flush_copy_insert_batch(
         &self,
         entry: &TableEntry,
         payloads: &[Vec<u8>],
@@ -1323,6 +1349,7 @@ fn copy_format_code(format: ServerCopyFormat) -> u8 {
     match format {
         ServerCopyFormat::Text | ServerCopyFormat::Csv => 0,
         ServerCopyFormat::Binary => 1,
+        ServerCopyFormat::Parquet => 0,
     }
 }
 
@@ -1370,7 +1397,7 @@ fn copy_rows_from_select_result(
         match opts.format {
             ServerCopyFormat::Text => out.extend_from_slice(&encode_text_row(&header_cells, opts)),
             ServerCopyFormat::Csv => out.extend_from_slice(&encode_csv_row(&header_cells, opts)),
-            ServerCopyFormat::Binary => {}
+            ServerCopyFormat::Binary | ServerCopyFormat::Parquet => {}
         }
     }
     let mut rows = 0_u64;
@@ -1382,6 +1409,11 @@ fn copy_rows_from_select_result(
                 ServerCopyFormat::Binary => {
                     return Err(ServerError::Unsupported(
                         "binary COPY for query targets is not yet supported",
+                    ));
+                }
+                ServerCopyFormat::Parquet => {
+                    return Err(ServerError::Unsupported(
+                        "parquet COPY for query targets is not yet supported",
                     ));
                 }
             }
@@ -1648,7 +1680,7 @@ fn decode_one_copy_row(
     let raw_cells = match opts.format {
         ServerCopyFormat::Text => parse_text_row(line, opts)?,
         ServerCopyFormat::Csv => parse_csv_row(line, opts)?,
-        ServerCopyFormat::Binary => {
+        ServerCopyFormat::Binary | ServerCopyFormat::Parquet => {
             return Err(ServerError::CopyFormat(
                 "binary COPY rows are decoded by binary parser".to_string(),
             ));

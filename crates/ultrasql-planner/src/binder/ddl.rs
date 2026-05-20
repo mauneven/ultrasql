@@ -1569,9 +1569,12 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
             AstCopyFormat::Text => CopyFormat::Text,
             AstCopyFormat::Csv => CopyFormat::Csv,
             AstCopyFormat::Binary => CopyFormat::Binary,
+            AstCopyFormat::Parquet => CopyFormat::Parquet,
         };
         let (mut delimiter, mut null_str) = match format {
-            CopyFormat::Text | CopyFormat::Binary => ('\t', String::from(r"\N")),
+            CopyFormat::Text | CopyFormat::Binary | CopyFormat::Parquet => {
+                ('\t', String::from(r"\N"))
+            }
             CopyFormat::Csv => (',', String::new()),
         };
         let mut header = false;
@@ -1654,14 +1657,22 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
         AstCopySource::Stdout => CopySource::Stdout,
         AstCopySource::File(path) => CopySource::File(path.clone()),
     };
-    let format = match s.format {
+    let mut format = match s.format {
         AstCopyFormat::Text => CopyFormat::Text,
         AstCopyFormat::Csv => CopyFormat::Csv,
         AstCopyFormat::Binary => CopyFormat::Binary,
+        AstCopyFormat::Parquet => CopyFormat::Parquet,
     };
+    if !copy_has_explicit_format(&s.options) {
+        if let AstCopySource::File(path) = &s.source {
+            if copy_file_extension_is(path, "parquet") {
+                format = CopyFormat::Parquet;
+            }
+        }
+    }
 
     let (mut delimiter, mut null_str) = match format {
-        CopyFormat::Text | CopyFormat::Binary => ('\t', String::from(r"\N")),
+        CopyFormat::Text | CopyFormat::Binary | CopyFormat::Parquet => ('\t', String::from(r"\N")),
         CopyFormat::Csv => (',', String::new()),
     };
     let mut header = false;
@@ -1698,4 +1709,17 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
         reject_table,
         schema: stream_schema,
     })
+}
+
+fn copy_has_explicit_format(options: &[CopyOption]) -> bool {
+    options
+        .iter()
+        .any(|option| matches!(option, CopyOption::Format(_)))
+}
+
+fn copy_file_extension_is(path: &str, extension: &str) -> bool {
+    std::path::Path::new(path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
 }

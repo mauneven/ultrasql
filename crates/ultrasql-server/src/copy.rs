@@ -47,6 +47,8 @@ pub enum CopyFormat {
     Csv,
     /// PostgreSQL binary COPY format.
     Binary,
+    /// Apache Parquet file format for server-side file COPY.
+    Parquet,
 }
 
 /// Options parsed from a `COPY … WITH (…)` clause.

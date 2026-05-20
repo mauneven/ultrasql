@@ -20,13 +20,53 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::SinkExt;
+use parquet::arrow::ArrowWriter;
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
 fn sql_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+fn write_copy_parquet(path: &std::path::Path, rows: &[(i64, &str, f64, bool)]) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, false),
+        ArrowField::new("label", ArrowDataType::Utf8, false),
+        ArrowField::new("score", ArrowDataType::Float64, false),
+        ArrowField::new("active", ArrowDataType::Boolean, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, label, _, _)| *label)
+                    .collect::<Vec<&str>>(),
+            )),
+            Arc::new(Float64Array::from(
+                rows.iter()
+                    .map(|(_, _, score, _)| *score)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter()
+                    .map(|(_, _, _, active)| *active)
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("parquet record batch");
+    let file = std::fs::File::create(path).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
 }
 
 /// Spin up an in-process server on an ephemeral TCP port and return a
@@ -391,6 +431,134 @@ async fn copy_from_file_csv_stops_after_max_errors() {
     assert!(message.contains("COPY max_errors exceeded"), "{message}");
     assert_eq!(select_count(&client, "copy_quarantine_limit").await, 0);
     assert_eq!(select_count(&client, "csv_rejects_limit").await, 0);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn copy_table_to_parquet_exports_queryable_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let parquet_path = dir.path().join("export.parquet");
+
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute(
+            "CREATE TABLE copy_to_parquet (
+                id BIGINT,
+                label TEXT,
+                score FLOAT8,
+                active BOOLEAN
+            )",
+        )
+        .await
+        .expect("create parquet export table");
+    client
+        .batch_execute(
+            "INSERT INTO copy_to_parquet VALUES
+                (2, 'beta', 20.5, false),
+                (1, 'alpha', 10.25, true)",
+        )
+        .await
+        .expect("seed parquet export table");
+    assert_eq!(select_count(&client, "copy_to_parquet").await, 2);
+
+    let copy_sql = format!(
+        "COPY copy_to_parquet TO {}",
+        sql_string(parquet_path.to_str().expect("utf8 parquet path"))
+    );
+    client
+        .batch_execute(&copy_sql)
+        .await
+        .expect("copy to parquet");
+
+    let read_sql = format!(
+        "SELECT id, label, score, active FROM read_parquet({}) ORDER BY id",
+        sql_string(parquet_path.to_str().expect("utf8 parquet path"))
+    );
+    let rows = client.query(&read_sql, &[]).await.expect("read export");
+    let values: Vec<(i64, String, f64, bool)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, i64>(0),
+                row.get::<_, String>(1),
+                row.get::<_, f64>(2),
+                row.get::<_, bool>(3),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (1, "alpha".to_owned(), 10.25, true),
+            (2, "beta".to_owned(), 20.5, false),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn copy_table_from_parquet_imports_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let parquet_path = dir.path().join("import.parquet");
+    write_copy_parquet(
+        &parquet_path,
+        &[
+            (3, "gamma", 30.75, true),
+            (1, "alpha", 10.25, true),
+            (2, "beta", 20.5, false),
+        ],
+    );
+
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute(
+            "CREATE TABLE copy_from_parquet (
+                id BIGINT,
+                label TEXT,
+                score FLOAT8,
+                active BOOLEAN
+            )",
+        )
+        .await
+        .expect("create parquet import table");
+
+    let copy_sql = format!(
+        "COPY copy_from_parquet FROM {}",
+        sql_string(parquet_path.to_str().expect("utf8 parquet path"))
+    );
+    client
+        .batch_execute(&copy_sql)
+        .await
+        .expect("copy from parquet");
+
+    let rows = client
+        .query(
+            "SELECT id, label, score, active FROM copy_from_parquet ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("select parquet import");
+    let values: Vec<(i64, String, f64, bool)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, i64>(0),
+                row.get::<_, String>(1),
+                row.get::<_, f64>(2),
+                row.get::<_, bool>(3),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (1, "alpha".to_owned(), 10.25, true),
+            (2, "beta".to_owned(), 20.5, false),
+            (3, "gamma".to_owned(), 30.75, true),
+        ]
+    );
 
     shutdown(client, server_handle).await;
 }

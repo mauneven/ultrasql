@@ -1219,6 +1219,8 @@ pub enum CopyFormat {
     Csv,
     /// PostgreSQL binary COPY format.
     Binary,
+    /// Apache Parquet file format for server-side file COPY.
+    Parquet,
 }
 
 /// Resolved window function applied by a [`LogicalPlan::Window`] node.
@@ -2154,6 +2156,7 @@ impl LogicalPlan {
                     CopyFormat::Text => "TEXT",
                     CopyFormat::Csv => "CSV",
                     CopyFormat::Binary => "BINARY",
+                    CopyFormat::Parquet => "PARQUET",
                 };
                 let cols = if columns.is_empty() {
                     String::from("*")
