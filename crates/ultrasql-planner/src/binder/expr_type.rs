@@ -52,6 +52,12 @@ pub(super) fn binary_result_type(
         | BinaryOp::LtEq
         | BinaryOp::Gt
         | BinaryOp::GtEq => {
+            if is_vector_comparison_operand(&lt, &rt) {
+                return Err(PlanError::TypeMismatch(format!(
+                    "vector comparison operator {} is not supported; use <->, <#>, <=>, <+>, or vector distance functions",
+                    display_binary(op)
+                )));
+            }
             if comparable(&lt, &rt) {
                 Ok(DataType::Bool)
             } else {
@@ -206,6 +212,10 @@ pub(super) fn comparable(a: &DataType, b: &DataType) -> bool {
         return true;
     }
     false
+}
+
+const fn is_vector_comparison_operand(left: &DataType, right: &DataType) -> bool {
+    matches!(left, DataType::Vector { .. }) || matches!(right, DataType::Vector { .. })
 }
 
 fn vector_operands_compatible(left: &DataType, right: &DataType) -> bool {

@@ -440,6 +440,62 @@ fn binds_vector_distance_rejects_dimension_mismatch() {
 }
 
 #[test]
+fn rejects_unsupported_vector_comparison_operators_explicitly() {
+    let cat = embeddings_catalog();
+    for (op, sql) in [
+        ("=", "SELECT embedding = VECTOR '[1,2,3]' FROM embeddings"),
+        ("<>", "SELECT embedding <> VECTOR '[1,2,3]' FROM embeddings"),
+        ("<", "SELECT embedding < VECTOR '[1,2,3]' FROM embeddings"),
+        ("<=", "SELECT embedding <= VECTOR '[1,2,3]' FROM embeddings"),
+        (">", "SELECT embedding > VECTOR '[1,2,3]' FROM embeddings"),
+        (">=", "SELECT embedding >= VECTOR '[1,2,3]' FROM embeddings"),
+    ] {
+        let err = parse_and_bind(sql, &cat).unwrap_err();
+        let PlanError::TypeMismatch(message) = err else {
+            panic!("expected TypeMismatch for {op}, got {err:?}");
+        };
+        assert!(
+            message.contains("vector comparison operator"),
+            "{op} should name vector comparison, got {message}"
+        );
+        assert!(
+            message.contains(op),
+            "{op} should appear in diagnostic, got {message}"
+        );
+    }
+}
+
+#[test]
+fn rejects_vector_comparison_against_non_vector_explicitly() {
+    let cat = embeddings_catalog();
+    let err = parse_and_bind("SELECT embedding = 7 FROM embeddings", &cat).unwrap_err();
+    let PlanError::TypeMismatch(message) = err else {
+        panic!("expected TypeMismatch, got {err:?}");
+    };
+    assert!(
+        message.contains("vector comparison operator ="),
+        "diagnostic should name vector comparison, got {message}"
+    );
+}
+
+#[test]
+fn rejects_between_on_vector_with_comparison_diagnostic() {
+    let cat = embeddings_catalog();
+    let err = parse_and_bind(
+        "SELECT embedding BETWEEN VECTOR '[1,2,3]' AND VECTOR '[4,5,6]' FROM embeddings",
+        &cat,
+    )
+    .unwrap_err();
+    let PlanError::TypeMismatch(message) = err else {
+        panic!("expected TypeMismatch, got {err:?}");
+    };
+    assert!(
+        message.contains("vector comparison operator >="),
+        "BETWEEN should fail through rewritten comparison, got {message}"
+    );
+}
+
+#[test]
 fn binds_vector_inner_product_functions_as_float64() {
     let cat = embeddings_catalog();
     let plan = parse_and_bind(
