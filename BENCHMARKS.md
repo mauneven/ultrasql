@@ -103,7 +103,7 @@ workload:
 ## Cross-engine comparisons
 
 When comparing against another engine (PostgreSQL, MySQL, SQLite,
-DuckDB, ClickHouse), the comparison records the competitor's
+DuckDB, ClickHouse, Firebolt), the comparison records the competitor's
 configuration with the same level of detail:
 
 ```yaml
@@ -241,6 +241,33 @@ raw per-engine artifacts under `benchmarks/results/latest/raw/`, and the
 `≥ 5× PostgreSQL` pass/fail decision. Missing dataset, `psql`, or DSNs
 also write `passed: false` summaries so roadmap status never depends on
 an absent artifact.
+
+### Firebolt Aggregating Index
+
+Firebolt comparison artifacts are recorded by:
+
+```text
+FIREBOLT_URL="http://127.0.0.1:3473" \
+benchmarks/firebolt_aggregate_index.sh smoke
+```
+
+The runner targets Firebolt's documented aggregating-index strength:
+repeated dashboard-style filtered `GROUP BY` queries over a fact table.
+It creates deterministic `(tenant_id, bucket, amount)` rows and measures
+`SELECT tenant_id, bucket, SUM(amount), COUNT(*) ... WHERE tenant_id = 7
+GROUP BY tenant_id, bucket ORDER BY tenant_id, bucket`. The Firebolt leg
+creates `CREATE AGGREGATING INDEX ... (tenant_id, bucket, SUM(amount),
+COUNT(*))`, runs `EXPLAIN`, and refuses to mark the Firebolt artifact
+measured unless the plan text reports `Aggregating Index` usage.
+
+Without `FIREBOLT_URL`, Firebolt writes `status: "not_available"` and no
+benchmark claim exists. UltraSQL is measured through
+`target/release/cross_compare_sql --workload dashboard-aggregate` using
+the same generated data shape. `FIREBOLT_AGG_ROWS`,
+`FIREBOLT_AGG_ITERS`, `FIREBOLT_AGG_WARMUP`, `FIREBOLT_AGG_ENGINES`, and
+`FIREBOLT_AGG_OUT_DIR` control smoke versus publishable runs. Raw
+artifacts land under `benchmarks/results/latest/raw/`, and the suite
+manifest is `benchmarks/results/latest/firebolt_aggregate_index_manifest.json`.
 
 ### Exact Vector Top-K
 

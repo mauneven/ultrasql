@@ -2,7 +2,7 @@
 # Public benchmark arena.
 #
 # One command:
-#   benchmarks/arena.sh --engines ultrasql,duckdb,clickhouse,postgres
+#   benchmarks/arena.sh --engines ultrasql,duckdb,clickhouse,postgres,firebolt
 #
 # The arena publishes artifacts only. It does not rank engines, render winner
 # tables, or invent claims. Missing prerequisites and unimplemented
@@ -14,8 +14,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
 PROFILE="${BENCH_ARENA_PROFILE:-smoke}"
-ENGINES="${BENCH_ARENA_ENGINES:-ultrasql,duckdb,clickhouse,postgres}"
-SUITES="${BENCH_ARENA_SUITES:-csv,parquet,tpch,clickbench,sqllogictest,vector,jsonb}"
+ENGINES="${BENCH_ARENA_ENGINES:-ultrasql,duckdb,clickhouse,postgres,firebolt}"
+SUITES="${BENCH_ARENA_SUITES:-csv,parquet,tpch,clickbench,sqllogictest,vector,jsonb,aggregate-index}"
 OUT_DIR="${BENCH_ARENA_OUT_DIR:-benchmarks/results/latest}"
 RAW_DIR="$OUT_DIR/raw"
 MANIFEST="$OUT_DIR/benchmark_arena_manifest.json"
@@ -24,12 +24,12 @@ ARTIFACTS_MD="$OUT_DIR/benchmark_arena_artifacts.md"
 usage() {
     cat <<'EOF'
 Usage:
-  benchmarks/arena.sh --engines ultrasql,duckdb,clickhouse,postgres
+  benchmarks/arena.sh --engines ultrasql,duckdb,clickhouse,postgres,firebolt
 
 Options:
   --profile smoke|full       Dataset/runtime profile. Default: smoke.
-  --engines a,b,c            Engines: ultrasql,duckdb,clickhouse,postgres.
-  --suites a,b,c             Suites: csv,parquet,tpch,clickbench,sqllogictest,vector,jsonb.
+  --engines a,b,c            Engines: ultrasql,duckdb,clickhouse,postgres,firebolt.
+  --suites a,b,c             Suites: csv,parquet,tpch,clickbench,sqllogictest,vector,jsonb,aggregate-index.
   --out-dir PATH             Artifact directory. Default: benchmarks/results/latest.
   --help                     Show this help.
 
@@ -105,7 +105,7 @@ IFS=',' read -r -a REQUESTED_SUITES <<<"$SUITES"
 
 for engine in "${REQUESTED_ENGINES[@]}"; do
     case "$engine" in
-        ultrasql|duckdb|clickhouse|postgres)
+        ultrasql|duckdb|clickhouse|postgres|firebolt)
             ;;
         *)
             echo "arena.sh: unknown engine '$engine'" >&2
@@ -116,7 +116,7 @@ done
 
 for suite in "${REQUESTED_SUITES[@]}"; do
     case "$suite" in
-        csv|parquet|tpch|clickbench|sqllogictest|vector|jsonb)
+        csv|parquet|tpch|clickbench|sqllogictest|vector|jsonb|aggregate-index)
             ;;
         *)
             echo "arena.sh: unknown suite '$suite'" >&2
@@ -372,6 +372,27 @@ run_vector_suite() {
         "recall_at_k,p50_latency_us,p95_latency_us,p99_latency_us,build_time_us,memory_bytes"
 }
 
+run_aggregate_index_suite() {
+    local supported selected
+    supported="ultrasql,firebolt"
+    selected="$(requested_supported_csv "$supported")"
+    if [[ -n "$selected" ]]; then
+        run_suite \
+            "aggregate-index" \
+            "$OUT_DIR/firebolt_aggregate_index_manifest.json" \
+            env \
+                FIREBOLT_AGG_PROFILE="$PROFILE" \
+                FIREBOLT_AGG_ENGINES="$selected" \
+                FIREBOLT_AGG_OUT_DIR="$OUT_DIR" \
+                RAW_DIR="$RAW_DIR" \
+                benchmarks/firebolt_aggregate_index.sh "$PROFILE"
+    fi
+    emit_unsupported_engines \
+        "aggregate-index" \
+        "$supported" \
+        "median_us,min_us,load_time_us,index_build_us,aggregating_index_used"
+}
+
 suite_requested() {
     local needle="$1"
     local suite
@@ -409,6 +430,9 @@ if suite_requested jsonb; then
         "jsonb" \
         "runner_not_implemented" \
         "ingest_rows_per_second,parse_us,query_median_us,shape_cache_hit_rate"
+fi
+if suite_requested aggregate-index; then
+    run_aggregate_index_suite
 fi
 
 python3 - "$PROFILE" "$ENGINES" "$SUITES" "$MANIFEST" "$ARTIFACTS_MD" "$STATUS_FILE" <<'PY'

@@ -77,6 +77,13 @@ enum Workload {
     /// Filtered analytical aggregate
     /// `SELECT SUM(x) FROM t WHERE x > <threshold>`.
     FilterSum,
+    /// Repeated dashboard-style filtered `GROUP BY` aggregate over a
+    /// preloaded fact table:
+    /// `SELECT tenant_id, bucket, SUM(amount), COUNT(*) ... GROUP BY
+    /// tenant_id, bucket`. This mirrors Firebolt's documented
+    /// aggregating-index sweet spot and gives UltraSQL a stable exact
+    /// baseline artifact for that competitor class.
+    DashboardAggregate,
     /// Bulk UPDATE: preload `--rows` (id INT, val INT) tuples, then
     /// time one `UPDATE bench_update_{ix} SET val = val + 1 WHERE
     /// id < <rows>`. Matches the shape of
@@ -137,6 +144,9 @@ impl Workload {
             Self::SumScalar => format!("select_sum_{}_i64", k_or_raw(n_rows)),
             Self::AvgScalar => format!("select_avg_{}_i64", k_or_raw(n_rows)),
             Self::FilterSum => format!("filter_sum_{}_i64", k_or_raw(n_rows)),
+            Self::DashboardAggregate => {
+                format!("firebolt_aggregate_index_{}", k_or_raw(n_rows))
+            }
             Self::UpdateBulk => format!("update_throughput_{}", k_or_raw(n_rows)),
             Self::DeleteBulk => format!("delete_throughput_{}", k_or_raw(n_rows)),
             // The competitor scripts hard-code the id without a row-
@@ -313,6 +323,18 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Workload::DashboardAggregate => {
+            answer = Some(
+                run_shared_dashboard_aggregate(
+                    bound,
+                    args.rows,
+                    args.warmup,
+                    total_iters,
+                    &mut iters_us,
+                )
+                .await?,
+            );
+        }
         Workload::WindowRowNumber => {
             run_shared_window_row_number(bound, args.rows, args.warmup, total_iters, &mut iters_us)
                 .await?;
@@ -432,6 +454,7 @@ async fn main() -> Result<()> {
                     | Workload::SumScalar
                     | Workload::AvgScalar
                     | Workload::FilterSum
+                    | Workload::DashboardAggregate
                     | Workload::WindowRowNumber
                     | Workload::VectorTopK
                     | Workload::CsvColdRead
@@ -1196,6 +1219,122 @@ where
     Ok(())
 }
 
+const DASHBOARD_TENANTS: usize = 32;
+const DASHBOARD_BUCKETS: usize = 64;
+const DASHBOARD_FILTER_TENANT: usize = 7;
+
+async fn preload_dashboard_aggregate_chunked(
+    client: &tokio_postgres::Client,
+    table: &str,
+    n_rows: usize,
+) -> Result<()> {
+    let mut start = 0;
+    while start < n_rows {
+        let end = (start + PRELOAD_CHUNK_ROWS).min(n_rows);
+        let mut sql = String::with_capacity((end - start) * 40 + 64);
+        sql.push_str("INSERT INTO ");
+        sql.push_str(table);
+        sql.push_str(" VALUES ");
+        for row_id in start..end {
+            if row_id > start {
+                sql.push(',');
+            }
+            let tenant_id = row_id % DASHBOARD_TENANTS;
+            let bucket = (row_id / DASHBOARD_TENANTS) % DASHBOARD_BUCKETS;
+            let amount_mod = row_id.wrapping_mul(17) % 1_000;
+            let amount = i64::try_from(amount_mod).unwrap_or(0) - 500;
+
+            sql.push('(');
+            sql.push_str(&row_id.to_string());
+            sql.push(',');
+            sql.push_str(&tenant_id.to_string());
+            sql.push(',');
+            sql.push_str(&bucket.to_string());
+            sql.push(',');
+            sql.push_str(&amount.to_string());
+            sql.push(')');
+        }
+        client.batch_execute(&sql).await.with_context(|| {
+            format!("preload dashboard chunk [{start}, {end}) INSERT into {table}")
+        })?;
+        start = end;
+    }
+    Ok(())
+}
+
+/// Shared-table dashboard aggregate workload: preload a deterministic
+/// fact table once, then run the same filtered grouped aggregate many
+/// times. The key order intentionally matches Firebolt's aggregating
+/// index shape: filter on the first grouping column, group by the
+/// indexed dimensions, and compute `SUM` + `COUNT(*)`.
+async fn run_shared_dashboard_aggregate(
+    server: SocketAddr,
+    n_rows: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<serde_json::Value> {
+    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .context("tokio-postgres connect to ultrasqld")?;
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("tokio-postgres connection error: {e}");
+        }
+    });
+
+    let table = "bench_dashboard_aggregate_shared";
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (
+                id INT NOT NULL,
+                tenant_id INT NOT NULL,
+                bucket INT NOT NULL,
+                amount BIGINT NOT NULL
+            )"
+        ))
+        .await
+        .with_context(|| format!("CREATE TABLE {table}"))?;
+    preload_dashboard_aggregate_chunked(&client, table, n_rows).await?;
+
+    let query = format!(
+        "SELECT tenant_id, bucket, SUM(amount), COUNT(*) \
+         FROM {table} \
+         WHERE tenant_id = {DASHBOARD_FILTER_TENANT} \
+         GROUP BY tenant_id, bucket \
+         ORDER BY tenant_id, bucket"
+    );
+    let mut answer_rows = Vec::new();
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(&query)
+            .await
+            .with_context(|| format!("dashboard aggregate on {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let rows = simple_query_rows(&messages);
+        if rows.is_empty() {
+            anyhow::bail!("dashboard aggregate returned no rows");
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+            answer_rows = rows;
+        }
+    }
+
+    drop(client);
+    conn_handle.abort();
+    Ok(serde_json::json!({
+        "rows": answer_rows,
+        "query_shape": "filtered_group_by_sum_count",
+        "firebolt_index_shape": concat!(
+            "CREATE AGGREGATING INDEX idx ON fact_events ",
+            "(tenant_id, bucket, SUM(amount), COUNT(*))"
+        ),
+    }))
+}
+
 /// Shared-table window-function workload: preload `n_rows` once,
 /// then drain `SELECT id, row_number() OVER (ORDER BY x) FROM t` N
 /// times against the same `(id INT, x INT)` relation under a single
@@ -1546,6 +1685,24 @@ mod tests {
         assert_eq!(
             Workload::VectorTopK.registry_id_with_shape(10_000, 8, 10),
             "vector_topk_exact_10k_8d_k10"
+        );
+    }
+
+    #[test]
+    fn dashboard_aggregate_workload_id_matches_firebolt_suite() {
+        let args = Args::try_parse_from([
+            "cross_compare_sql",
+            "--workload",
+            "dashboard-aggregate",
+            "--rows",
+            "1000",
+        ])
+        .expect("dashboard aggregate workload parses");
+
+        assert_eq!(args.workload, Workload::DashboardAggregate);
+        assert_eq!(
+            Workload::DashboardAggregate.registry_id(1_000),
+            "firebolt_aggregate_index_1k"
         );
     }
 }
