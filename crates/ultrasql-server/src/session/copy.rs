@@ -56,6 +56,7 @@ use crate::copy::{
 use crate::error::ServerError;
 
 const COPY_INSERT_BATCH_ROWS: usize = 4096;
+const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 impl<RW> Session<RW>
 where
@@ -1361,7 +1362,11 @@ fn decode_copy_cell(
             .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}"))),
         DataType::Decimal { scale, .. } => parse_copy_decimal(s, scale.unwrap_or(0), column_idx),
         DataType::Date => parse_copy_date(s, column_idx).map(Value::Date),
+        DataType::Time => parse_copy_time(s, column_idx).map(Value::Time),
+        DataType::Timestamp => parse_copy_timestamp(s, column_idx).map(Value::Timestamp),
+        DataType::TimestampTz => parse_copy_timestamp(s, column_idx).map(Value::TimestampTz),
         DataType::Text { .. } => Ok(Value::Text(s.to_string())),
+        DataType::Jsonb => Ok(Value::Jsonb(s.to_string())),
         DataType::Bytea => Ok(Value::Bytea(bytes.to_vec())),
         DataType::Uuid => Value::parse_uuid(s).map(Value::Uuid).ok_or_else(|| {
             ServerError::CopyFormat(format!("column {column_idx}: invalid uuid literal"))
@@ -1522,6 +1527,84 @@ fn parse_copy_date(s: &str, column_idx: usize) -> Result<i32, ServerError> {
         )));
     }
     Ok(days_since_epoch(year, month, day))
+}
+
+fn parse_copy_timestamp(s: &str, column_idx: usize) -> Result<i64, ServerError> {
+    let raw = s.trim();
+    let split = raw.find(' ').or_else(|| raw.find('T')).ok_or_else(|| {
+        ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid timestamp literal {raw:?}"
+        ))
+    })?;
+    let date_micros = i64::from(parse_copy_date(&raw[..split], column_idx)?)
+        .checked_mul(MICROS_PER_DAY)
+        .ok_or_else(|| {
+            ServerError::CopyFormat(format!("column {column_idx}: timestamp overflow"))
+        })?;
+    let time_micros = parse_copy_time(&raw[split + 1..], column_idx)?;
+    date_micros
+        .checked_add(time_micros)
+        .ok_or_else(|| ServerError::CopyFormat(format!("column {column_idx}: timestamp overflow")))
+}
+
+fn parse_copy_time(s: &str, column_idx: usize) -> Result<i64, ServerError> {
+    let raw = s.trim();
+    let mut parts = raw.splitn(3, ':');
+    let hour = parts
+        .next()
+        .ok_or_else(|| {
+            ServerError::CopyFormat(format!("column {column_idx}: invalid time literal {raw:?}"))
+        })?
+        .parse::<i64>()
+        .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}")))?;
+    let minute = parts
+        .next()
+        .ok_or_else(|| {
+            ServerError::CopyFormat(format!("column {column_idx}: invalid time literal {raw:?}"))
+        })?
+        .parse::<i64>()
+        .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}")))?;
+    let second_text = parts.next().ok_or_else(|| {
+        ServerError::CopyFormat(format!("column {column_idx}: invalid time literal {raw:?}"))
+    })?;
+    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
+        return Err(ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid time literal {raw:?}"
+        )));
+    }
+    let (second_part, frac_part) = second_text
+        .split_once('.')
+        .map_or((second_text, ""), |(sec, frac)| (sec, frac));
+    let second = second_part
+        .parse::<i64>()
+        .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}")))?;
+    if !(0..=59).contains(&second) {
+        return Err(ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid time literal {raw:?}"
+        )));
+    }
+
+    let mut frac_micros = 0_i64;
+    let mut scale = 100_000_i64;
+    for ch in frac_part.chars().take(6) {
+        let digit = i64::from(ch.to_digit(10).ok_or_else(|| {
+            ServerError::CopyFormat(format!("column {column_idx}: invalid time literal {raw:?}"))
+        })?);
+        frac_micros = frac_micros
+            .checked_add(digit.checked_mul(scale).ok_or_else(|| {
+                ServerError::CopyFormat(format!("column {column_idx}: time overflow"))
+            })?)
+            .ok_or_else(|| {
+                ServerError::CopyFormat(format!("column {column_idx}: time overflow"))
+            })?;
+        scale /= 10;
+    }
+
+    hour.checked_mul(3_600_000_000)
+        .and_then(|v| v.checked_add(minute.checked_mul(60_000_000)?))
+        .and_then(|v| v.checked_add(second.checked_mul(1_000_000)?))
+        .and_then(|v| v.checked_add(frac_micros))
+        .ok_or_else(|| ServerError::CopyFormat(format!("column {column_idx}: time overflow")))
 }
 
 fn is_leap_year(year: i32) -> bool {

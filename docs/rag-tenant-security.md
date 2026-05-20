@@ -18,6 +18,7 @@ The default table set is:
 - `rag_embeddings`
 - `rag_retrieval_events`
 - `rag_answer_citations`
+- `rag_embedding_jobs`
 
 ## Tenant Id Pattern
 
@@ -78,6 +79,48 @@ INSERT INTO rag_chunks (
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12);
 ```
 
+Bulk document and chunk ingestion uses visible `COPY FROM STDIN` statements
+with explicit column lists. The first CSV column remains `tenant_id`, so high
+throughput loads keep the same tenant boundary as single-row inserts:
+
+```sql
+COPY rag_documents (
+    tenant_id,
+    document_id,
+    source_uri,
+    title,
+    body_hash,
+    metadata,
+    created_at,
+    updated_at,
+    indexed_at,
+    version,
+    is_current
+) FROM STDIN WITH (FORMAT CSV, HEADER true);
+```
+
+```sql
+COPY rag_chunks (
+    tenant_id,
+    chunk_id,
+    document_id,
+    chunk_index,
+    content,
+    token_start,
+    token_end,
+    metadata,
+    created_at,
+    updated_at,
+    version,
+    is_current
+) FROM STDIN WITH (FORMAT CSV, HEADER true);
+```
+
+Background embedding work is modeled as ordinary rows in
+`rag_embedding_jobs`. Workers claim tenant-scoped pending jobs with visible
+status, priority, lock, attempt, and availability columns; there is no hidden
+scheduler or privileged helper.
+
 These helpers are safe default building blocks, not a substitute for database
 row-level security. Until UltraSQL enforces RLS, callers must use tenant-scoped
 queries for every RAG read and write path.
@@ -96,9 +139,9 @@ WITH CHECK (tenant_id = current_setting('ultrasql.tenant_id', true));
 
 The same policy shape applies to `rag_chunks` and `rag_embeddings`.
 The same policy shape also applies to `rag_retrieval_events` and
-`rag_answer_citations`. `USING` gates reads and deletes. `WITH CHECK` gates
-inserts and updates. The session setting is intentionally named in SQL so
-application code can audit the security boundary.
+`rag_answer_citations`, and `rag_embedding_jobs`. `USING` gates reads and
+deletes. `WITH CHECK` gates inserts and updates. The session setting is
+intentionally named in SQL so application code can audit the security boundary.
 
 ## Current Enforcement Boundary
 

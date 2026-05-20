@@ -4,10 +4,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures::SinkExt;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 use ultrasql_catalog::rag::{
-    RagSchemaConfig, create_rag_table_statements, filter_rag_documents_by_metadata_sql,
-    insert_rag_chunk_sql, search_rag_embeddings_sql,
+    RagSchemaConfig, copy_rag_chunks_sql, copy_rag_documents_sql, create_rag_table_statements,
+    filter_rag_documents_by_metadata_sql, insert_rag_chunk_sql, search_rag_embeddings_sql,
 };
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
@@ -67,6 +69,19 @@ fn bind_sql(template: &str, values: &[(&str, &str)]) -> String {
     sql
 }
 
+async fn copy_in_payload(client: &tokio_postgres::Client, sql: &str, payload: &[u8]) -> u64 {
+    let sink = client
+        .copy_in::<_, Bytes>(sql)
+        .await
+        .expect("copy_in establishes COPY FROM STDIN");
+    futures::pin_mut!(sink);
+    sink.as_mut()
+        .send(Bytes::from(payload.to_vec()))
+        .await
+        .expect("send CopyData");
+    sink.finish().await.expect("finish copy_in")
+}
+
 #[tokio::test]
 async fn rag_helpers_execute_as_plain_sql() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
@@ -82,18 +97,16 @@ async fn rag_helpers_execute_as_plain_sql() {
             .expect("create rag primitive table");
     }
 
-    client
-        .batch_execute(
-            "INSERT INTO rag_documents VALUES \
-             ('tenant-a', 'doc-a', 's3://bucket/a.md', 'Doc A', 'hash-a', '{\"kind\":\"guide\"}', \
-              TIMESTAMP '2026-05-19 10:00:00', TIMESTAMP '2026-05-20 10:00:00', \
-              TIMESTAMP '2026-05-20 10:05:00', 2, true), \
-             ('tenant-b', 'doc-b', 's3://bucket/b.md', 'Doc B', 'hash-b', '{\"kind\":\"guide\"}', \
-              TIMESTAMP '2026-05-19 10:00:00', TIMESTAMP '2026-05-20 10:00:00', \
-              TIMESTAMP '2026-05-20 10:05:00', 2, true)",
-        )
-        .await
-        .expect("insert document");
+    let document_payload = b"tenant_id,document_id,source_uri,title,body_hash,metadata,created_at,updated_at,indexed_at,version,is_current\n\
+tenant-a,doc-a,s3://bucket/a.md,Doc A,hash-a,\"{\"\"kind\"\":\"\"guide\"\"}\",2026-05-19 10:00:00,2026-05-20 10:00:00,2026-05-20 10:05:00,2,true\n\
+tenant-b,doc-b,s3://bucket/b.md,Doc B,hash-b,\"{\"\"kind\"\":\"\"guide\"\"}\",2026-05-19 10:00:00,2026-05-20 10:00:00,2026-05-20 10:05:00,2,true\n";
+    let documents_inserted = copy_in_payload(
+        &client,
+        &copy_rag_documents_sql(&config).expect("build document COPY helper"),
+        document_payload,
+    )
+    .await;
+    assert_eq!(documents_inserted, 2);
 
     let chunk_sql = bind_sql(
         &insert_rag_chunk_sql(&config).expect("build chunk helper"),
@@ -128,15 +141,15 @@ async fn rag_helpers_execute_as_plain_sql() {
         ]]
     );
 
-    client
-        .batch_execute(
-            "INSERT INTO rag_chunks VALUES \
-             ('tenant-b', 'chunk-b-0', 'doc-b', 0, 'other tenant content', 0, 3, \
-              '{\"section\":\"body\"}', TIMESTAMP '2026-05-20 10:00:01', \
-              TIMESTAMP '2026-05-20 10:00:02', 9, true)",
-        )
-        .await
-        .expect("insert other tenant chunk");
+    let chunk_payload = b"tenant_id,chunk_id,document_id,chunk_index,content,token_start,token_end,metadata,created_at,updated_at,version,is_current\n\
+tenant-b,chunk-b-0,doc-b,0,other tenant content,0,3,\"{\"\"section\"\":\"\"body\"\"}\",2026-05-20 10:00:01,2026-05-20 10:00:02,9,true\n";
+    let chunks_inserted = copy_in_payload(
+        &client,
+        &copy_rag_chunks_sql(&config).expect("build chunk COPY helper"),
+        chunk_payload,
+    )
+    .await;
+    assert_eq!(chunks_inserted, 1);
 
     client
         .batch_execute(

@@ -2,9 +2,9 @@
 //!
 //! These primitives are ordinary SQL tables, not hidden system catalogs. They
 //! give applications a reproducible baseline for storing source documents,
-//! chunks, embeddings, retrieval events, answer citations, metadata, recency,
-//! and version state while the SQL layer grows higher-level RAG helpers around
-//! them.
+//! chunks, embeddings, embedding jobs, retrieval events, answer citations,
+//! metadata, recency, and version state while the SQL layer grows higher-level
+//! RAG helpers around them.
 
 use std::fmt;
 
@@ -20,7 +20,7 @@ pub const DEFAULT_RAG_TENANT_SETTING: &str = "ultrasql.tenant_id";
 pub struct RagSchemaConfig {
     /// Prefix used for table names. The default creates `rag_documents`,
     /// `rag_chunks`, `rag_embeddings`, `rag_retrieval_events`, and
-    /// `rag_answer_citations`.
+    /// `rag_answer_citations`, and `rag_embedding_jobs`.
     pub prefix: String,
     /// Vector dimension for the embeddings table.
     pub embedding_dims: u32,
@@ -48,9 +48,11 @@ pub struct RagTableNames {
     pub retrieval_events: String,
     /// Answer-citations table name.
     pub answer_citations: String,
+    /// Background embedding-job queue table name.
+    pub embedding_jobs: String,
 }
 
-/// Canonical schemas for the five RAG primitive tables.
+/// Canonical schemas for the RAG primitive tables.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RagPrimitiveSchemas {
     /// Source document rows.
@@ -63,6 +65,8 @@ pub struct RagPrimitiveSchemas {
     pub retrieval_events: Schema,
     /// Answer citations linking generated answers to source chunks.
     pub answer_citations: Schema,
+    /// Tenant-scoped embedding jobs for background ingestion workers.
+    pub embedding_jobs: Schema,
 }
 
 /// Error returned for invalid RAG schema configuration.
@@ -98,6 +102,7 @@ impl RagSchemaConfig {
             embeddings: format!("{}_embeddings", self.prefix),
             retrieval_events: format!("{}_retrieval_events", self.prefix),
             answer_citations: format!("{}_answer_citations", self.prefix),
+            embedding_jobs: format!("{}_embedding_jobs", self.prefix),
         })
     }
 }
@@ -112,11 +117,12 @@ impl RagPrimitiveSchemas {
             embeddings: embeddings_schema(embedding_dims)?,
             retrieval_events: retrieval_events_schema(embedding_dims)?,
             answer_citations: answer_citations_schema()?,
+            embedding_jobs: embedding_jobs_schema()?,
         })
     }
 }
 
-/// Return SQL that creates the five RAG primitive tables.
+/// Return SQL that creates the RAG primitive tables.
 ///
 /// The generated DDL is deliberately plain PostgreSQL-compatible SQL so tests
 /// can execute it through the normal wire path. IDs are `TEXT` today because
@@ -226,6 +232,30 @@ created_at TIMESTAMPTZ NOT NULL\
             documents = names.documents,
             chunks = names.chunks
         ),
+        format!(
+            "\
+CREATE TABLE IF NOT EXISTS {embedding_jobs} (\
+tenant_id TEXT NOT NULL CHECK (tenant_id <> ''), \
+job_id TEXT PRIMARY KEY, \
+chunk_id TEXT NOT NULL REFERENCES {chunks}(chunk_id), \
+document_id TEXT NOT NULL REFERENCES {documents}(document_id), \
+model TEXT NOT NULL, \
+model_version TEXT NOT NULL, \
+priority INTEGER NOT NULL, \
+status TEXT NOT NULL, \
+attempt_count INTEGER NOT NULL, \
+max_attempts INTEGER NOT NULL, \
+last_error TEXT, \
+locked_by TEXT, \
+locked_at TIMESTAMPTZ, \
+available_at TIMESTAMPTZ NOT NULL, \
+created_at TIMESTAMPTZ NOT NULL, \
+updated_at TIMESTAMPTZ NOT NULL\
+)",
+            embedding_jobs = names.embedding_jobs,
+            chunks = names.chunks,
+            documents = names.documents
+        ),
     ])
 }
 
@@ -246,6 +276,120 @@ metadata, created_at, updated_at, version, is_current\
 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
 RETURNING tenant_id, chunk_id, document_id, chunk_index, version, is_current",
         chunks = names.chunks
+    ))
+}
+
+/// Return plain `COPY FROM STDIN` SQL for fast document ingestion.
+///
+/// The generated statement uses an explicit column list and CSV headers so
+/// callers can stream files without relying on table column order.
+pub fn copy_rag_documents_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(format!(
+        "\
+COPY {documents} (\
+tenant_id, document_id, source_uri, title, body_hash, metadata, created_at, \
+updated_at, indexed_at, version, is_current\
+) FROM STDIN WITH (FORMAT CSV, HEADER true)",
+        documents = names.documents
+    ))
+}
+
+/// Return plain `COPY FROM STDIN` SQL for fast chunk ingestion.
+///
+/// Chunks are normally bulk-loaded after documents and before embedding jobs
+/// are enqueued, so the helper keeps metadata, recency, and version columns
+/// visible in the streamed CSV contract.
+pub fn copy_rag_chunks_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(format!(
+        "\
+COPY {chunks} (\
+tenant_id, chunk_id, document_id, chunk_index, content, token_start, token_end, \
+metadata, created_at, updated_at, version, is_current\
+) FROM STDIN WITH (FORMAT CSV, HEADER true)",
+        chunks = names.chunks
+    ))
+}
+
+/// Return plain SQL that enqueues embedding jobs for current tenant chunks.
+///
+/// Parameters are `tenant_id`, `model`, `model_version`, `priority`,
+/// `max_attempts`, and the ingestion timestamp used for availability and
+/// audit columns.
+pub fn enqueue_rag_embedding_jobs_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(format!(
+        "\
+INSERT INTO {embedding_jobs} (\
+tenant_id, job_id, chunk_id, document_id, model, model_version, priority, \
+status, attempt_count, max_attempts, last_error, locked_by, locked_at, \
+available_at, created_at, updated_at\
+) \
+SELECT c.tenant_id, c.chunk_id || ':' || $2 || ':' || $3 AS job_id, c.chunk_id, \
+c.document_id, $2 AS model, $3 AS model_version, $4 AS priority, 'pending' AS status, \
+0 AS attempt_count, $5 AS max_attempts, NULL AS last_error, NULL AS locked_by, \
+NULL AS locked_at, $6 AS available_at, $6 AS created_at, $6 AS updated_at \
+FROM {chunks} c \
+WHERE c.tenant_id = $1 AND c.is_current = true \
+RETURNING tenant_id, job_id, chunk_id, status",
+        embedding_jobs = names.embedding_jobs,
+        chunks = names.chunks
+    ))
+}
+
+/// Return plain SQL that atomically claims pending embedding jobs.
+///
+/// Parameters are `tenant_id`, worker id, claim limit, and claim timestamp.
+/// The CTE keeps PostgreSQL-compatible ordering and limit semantics visible.
+pub fn claim_rag_embedding_jobs_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(format!(
+        "\
+WITH claimable AS (\
+SELECT job_id FROM {embedding_jobs} \
+WHERE tenant_id = $1 AND status = 'pending' AND available_at <= $4 AND attempt_count < max_attempts \
+ORDER BY priority DESC, available_at ASC, created_at ASC \
+LIMIT $3\
+) \
+UPDATE {embedding_jobs} \
+SET status = 'running', locked_by = $2, locked_at = $4, updated_at = $4 \
+WHERE tenant_id = $1 AND job_id IN (SELECT job_id FROM claimable) \
+RETURNING tenant_id, job_id, chunk_id, document_id, model, model_version, attempt_count",
+        embedding_jobs = names.embedding_jobs
+    ))
+}
+
+/// Return plain SQL that marks one running embedding job succeeded.
+///
+/// Parameters are `tenant_id`, `job_id`, and completion timestamp.
+pub fn complete_rag_embedding_job_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(format!(
+        "\
+UPDATE {embedding_jobs} \
+SET status = 'succeeded', locked_by = NULL, locked_at = NULL, updated_at = $3 \
+WHERE tenant_id = $1 AND job_id = $2 AND status = 'running' \
+RETURNING tenant_id, job_id, chunk_id, status",
+        embedding_jobs = names.embedding_jobs
+    ))
+}
+
+/// Return plain SQL that records a failed embedding job attempt.
+///
+/// Parameters are `tenant_id`, `job_id`, error text, and next availability
+/// timestamp. Jobs stay pending until `max_attempts` is reached.
+pub fn fail_rag_embedding_job_sql(config: &RagSchemaConfig) -> Result<String, RagSchemaError> {
+    let names = config.table_names()?;
+    Ok(format!(
+        "\
+UPDATE {embedding_jobs} \
+SET attempt_count = attempt_count + 1, \
+status = CASE WHEN attempt_count + 1 >= max_attempts THEN 'failed' ELSE 'pending' END, \
+last_error = $3, locked_by = NULL, locked_at = NULL, available_at = $4, updated_at = $4 \
+WHERE tenant_id = $1 AND job_id = $2 AND status = 'running' \
+RETURNING tenant_id, job_id, chunk_id, status, attempt_count",
+        embedding_jobs = names.embedding_jobs
     ))
 }
 
@@ -306,6 +450,7 @@ pub fn create_rag_tenant_policy_statements(
         tenant_policy_statements_for(&names.embeddings),
         tenant_policy_statements_for(&names.retrieval_events),
         tenant_policy_statements_for(&names.answer_citations),
+        tenant_policy_statements_for(&names.embedding_jobs),
     ]
     .into_iter()
     .flatten()
@@ -427,6 +572,28 @@ fn answer_citations_schema() -> Result<Schema, RagSchemaError> {
         Field::required("created_at", DataType::TimestampTz),
     ])
     .map_err(|err| RagSchemaError::new(format!("rag answer citations schema: {err}")))
+}
+
+fn embedding_jobs_schema() -> Result<Schema, RagSchemaError> {
+    Schema::new([
+        Field::required("tenant_id", DataType::Text { max_len: None }),
+        Field::required("job_id", DataType::Text { max_len: None }),
+        Field::required("chunk_id", DataType::Text { max_len: None }),
+        Field::required("document_id", DataType::Text { max_len: None }),
+        Field::required("model", DataType::Text { max_len: None }),
+        Field::required("model_version", DataType::Text { max_len: None }),
+        Field::required("priority", DataType::Int32),
+        Field::required("status", DataType::Text { max_len: None }),
+        Field::required("attempt_count", DataType::Int32),
+        Field::required("max_attempts", DataType::Int32),
+        Field::nullable("last_error", DataType::Text { max_len: None }),
+        Field::nullable("locked_by", DataType::Text { max_len: None }),
+        Field::nullable("locked_at", DataType::TimestampTz),
+        Field::required("available_at", DataType::TimestampTz),
+        Field::required("created_at", DataType::TimestampTz),
+        Field::required("updated_at", DataType::TimestampTz),
+    ])
+    .map_err(|err| RagSchemaError::new(format!("rag embedding jobs schema: {err}")))
 }
 
 fn tenant_policy_statements_for(table: &str) -> Vec<String> {

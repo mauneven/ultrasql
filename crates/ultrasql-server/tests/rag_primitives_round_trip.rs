@@ -139,6 +139,18 @@ async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
         )
         .await
         .expect("insert answer citations");
+    client
+        .batch_execute(
+            "INSERT INTO rag_embedding_jobs VALUES \
+             ('tenant-a', 'job-a-0', 'chunk-a-0', 'doc-a', 'test-model', 'v1', 10, 'pending', \
+              0, 3, NULL, NULL, NULL, TIMESTAMP '2026-05-20 10:01:00', \
+              TIMESTAMP '2026-05-20 10:00:00', TIMESTAMP '2026-05-20 10:00:00'), \
+             ('tenant-b', 'job-b-0', 'chunk-b-0', 'doc-b', 'test-model', 'v1', 5, 'pending', \
+              0, 3, NULL, NULL, NULL, TIMESTAMP '2026-05-20 10:31:00', \
+              TIMESTAMP '2026-05-20 10:30:00', TIMESTAMP '2026-05-20 10:30:00')",
+        )
+        .await
+        .expect("insert embedding jobs");
 
     let recent = client
         .simple_query(
@@ -219,6 +231,25 @@ async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
             "answer-a".to_owned(),
             "chunk-a-0".to_owned(),
             "0.99".to_owned()
+        ]]
+    );
+
+    let jobs = client
+        .simple_query(
+            "SELECT job_id, chunk_id, status, priority \
+             FROM rag_embedding_jobs \
+             WHERE tenant_id = 'tenant-a' \
+             ORDER BY priority DESC, available_at ASC",
+        )
+        .await
+        .expect("query embedding jobs");
+    assert_eq!(
+        simple_rows(&jobs),
+        vec![vec![
+            "job-a-0".to_owned(),
+            "chunk-a-0".to_owned(),
+            "pending".to_owned(),
+            "10".to_owned()
         ]]
     );
 
