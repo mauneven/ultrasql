@@ -8,7 +8,7 @@ use ultrasql_core::{BlockNumber, DataType, Field, RelationId, TupleId, Value};
 use ultrasql_executor::{Filter, IndexOnlyScan, IndexScan, Operator, RowCodec};
 use ultrasql_mvcc::{Visibility, is_visible};
 use ultrasql_planner::{BinaryOp, LogicalIndexMethod, LogicalPlan, ScalarExpr, SortKey};
-use ultrasql_storage::access_method::{BrinIndex, HnswIndex, HnswMetric};
+use ultrasql_storage::access_method::{BrinIndex, HnswIndex, HnswMetric, IvfFlatIndex};
 use ultrasql_storage::btree::BTree;
 
 use crate::BlankPageLoader;
@@ -191,10 +191,10 @@ fn try_brin_index_scan(
     Ok(Some(Box::new(Filter::new(scan, predicate.clone()))))
 }
 
-/// Try to lower `ORDER BY vector_distance LIMIT k` through an available HNSW
-/// runtime graph.
+/// Try to lower `ORDER BY vector_distance LIMIT k` through an available vector
+/// ANN runtime index.
 ///
-/// Missing or invalid HNSW metadata returns `Ok(None)`, letting the caller use
+/// Missing or invalid ANN metadata returns `Ok(None)`, letting the caller use
 /// exact `Sort + Limit`. This is the correctness fallback for restarts, DML
 /// invalidation, unsupported metrics, and non-top-k shapes.
 pub(super) fn try_hnsw_top_k_limit(
@@ -260,16 +260,26 @@ fn try_hnsw_sorted_scan(
     let Some((col_idx, metric, probe)) = match_hnsw_sort_key(&key.expr) else {
         return Ok(None);
     };
-    let Some(hnsw) = find_hnsw_index(ctx, table_entry, col_idx, metric) else {
+    let hits = if let Some(hnsw) = find_hnsw_index(ctx, table_entry, col_idx, metric) {
+        hnsw.search(&probe, limit)
+            .map_err(|e| ServerError::ddl(format!("HNSW search: {e}")))?
+            .into_iter()
+            .map(|hit| VectorSearchHit { tid: hit.tid })
+            .collect::<Vec<_>>()
+    } else if let Some(ivfflat) = find_ivfflat_index(ctx, table_entry, col_idx, metric) {
+        ivfflat
+            .search(&probe, limit)
+            .map_err(|e| ServerError::ddl(format!("IVFFlat search: {e}")))?
+            .into_iter()
+            .map(|hit| VectorSearchHit { tid: hit.tid })
+            .collect::<Vec<_>>()
+    } else {
         return Ok(None);
     };
-    let hits = hnsw
-        .search(&probe, limit)
-        .map_err(|e| ServerError::ddl(format!("HNSW search: {e}")))?;
     if hits.is_empty() {
         return Ok(None);
     }
-    let payloads = fetch_hnsw_visible_payloads(&hits, table_entry, col_idx, metric, &probe, ctx)?;
+    let payloads = fetch_vector_visible_payloads(&hits, table_entry, col_idx, metric, &probe, ctx)?;
     let codec = RowCodec::new(table_entry.schema.clone());
     Ok(Some(Box::new(IndexScan::new(payloads, codec))))
 }
@@ -343,8 +353,42 @@ fn find_hnsw_index(
     })
 }
 
-fn fetch_hnsw_visible_payloads(
-    hits: &[ultrasql_storage::access_method::HnswSearchResult],
+fn find_ivfflat_index(
+    ctx: &LowerCtx<'_>,
+    table_entry: &TableEntry,
+    col_idx: usize,
+    metric: HnswMetric,
+) -> Option<Arc<IvfFlatIndex>> {
+    let attnum = u16::try_from(col_idx).ok()?;
+    let indexes = ctx
+        .catalog_snapshot
+        .indexes_by_table
+        .get(&table_entry.oid)?;
+    let constraints = ctx.table_constraints.get(&table_entry.oid)?;
+    indexes.iter().find_map(|index| {
+        if index.columns.as_slice() != [attnum] {
+            return None;
+        }
+        let metadata = constraints.indexes.get(&index.oid)?;
+        if metadata.method != LogicalIndexMethod::IvfFlat {
+            return None;
+        }
+        let ivfflat = metadata.ivfflat.as_ref()?;
+        if ivfflat.metric() == metric && ivfflat.is_available() {
+            Some(Arc::clone(ivfflat))
+        } else {
+            None
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VectorSearchHit {
+    tid: TupleId,
+}
+
+fn fetch_vector_visible_payloads(
+    hits: &[VectorSearchHit],
     table_entry: &TableEntry,
     col_idx: usize,
     metric: HnswMetric,
@@ -357,22 +401,22 @@ fn fetch_hnsw_visible_payloads(
         let tuple = ctx
             .heap
             .fetch(hit.tid)
-            .map_err(|e| ServerError::ddl(format!("HNSW heap fetch: {e}")))?;
+            .map_err(|e| ServerError::ddl(format!("vector ANN heap fetch: {e}")))?;
         let visibility = is_visible(&tuple.header, &ctx.snapshot, ctx.oracle.as_ref());
         if !matches!(visibility, Visibility::Visible) {
             continue;
         }
         let row = codec
             .decode(&tuple.data)
-            .map_err(|e| ServerError::ddl(format!("HNSW heap decode: {e}")))?;
+            .map_err(|e| ServerError::ddl(format!("vector ANN heap decode: {e}")))?;
         let Some(Value::Vector(vector)) = row.get(col_idx) else {
             return Err(ServerError::ddl(
-                "HNSW heap recheck: key column did not decode as vector",
+                "vector ANN heap recheck: key column did not decode as vector",
             ));
         };
         if vector.len() != probe.len() {
             return Err(ServerError::ddl(
-                "HNSW heap recheck: vector dimension mismatch",
+                "vector ANN heap recheck: vector dimension mismatch",
             ));
         }
         let distance = metric_distance(metric, vector, probe);

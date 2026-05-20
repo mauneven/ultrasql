@@ -2523,6 +2523,34 @@ fn binds_create_hnsw_vector_opclass() {
 }
 
 #[test]
+fn binds_create_ivfflat_with_lists_and_probes() {
+    let cat = embeddings_catalog();
+    let LogicalPlan::CreateIndex {
+        method,
+        columns,
+        opclasses,
+        index_options,
+        ..
+    } = parse_and_bind(
+        "CREATE INDEX embeddings_ivf_idx ON embeddings \
+         USING ivfflat (embedding vector_l2_ops) WITH (lists = 8, probes = 3)",
+        &cat,
+    )
+    .expect("bind ivfflat")
+    else {
+        panic!("expected CreateIndex plan");
+    };
+    assert_eq!(method, LogicalIndexMethod::IvfFlat);
+    assert_eq!(columns, vec![1]);
+    assert_eq!(opclasses, vec![Some("vector_l2_ops".to_owned())]);
+    assert_eq!(index_options.len(), 2);
+    assert_eq!(index_options[0].name, "lists");
+    assert_eq!(index_options[0].value, "8");
+    assert_eq!(index_options[1].name, "probes");
+    assert_eq!(index_options[1].value, "3");
+}
+
+#[test]
 fn rejects_unique_inverted_search_and_brin_index_methods() {
     let cat = users_catalog();
     for sql in [

@@ -12,7 +12,7 @@ use ultrasql_parser::ast::{
     AlterSequenceStmt, AlterTableAction, AlterTableStmt, ColumnConstraint, CommentStmt,
     CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat, CopyOption,
     CopySource as AstCopySource, CopyStmt, CreateIndexStmt, CreateSequenceStmt, CreateTableStmt,
-    DropSequenceStmt, DropTableStmt, Expr, Identifier, ObjectName,
+    DropSequenceStmt, DropTableStmt, Expr, Identifier, Literal, ObjectName,
     ReferentialAction as AstReferentialAction, SequenceOption, TableConstraint, TruncateStmt,
     TypeName,
 };
@@ -25,8 +25,8 @@ use super::{
 use crate::plan::{
     CopyDirection, CopyFormat, CopySource, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalExclusionConstraint, LogicalExclusionElement, LogicalForeignKeyConstraint,
-    LogicalIndexMethod, LogicalReferentialAction, LogicalSequenceChange, LogicalSequenceOptions,
-    LogicalUniqueConstraint,
+    LogicalIndexMethod, LogicalIndexOption, LogicalReferentialAction, LogicalSequenceChange,
+    LogicalSequenceOptions, LogicalUniqueConstraint,
 };
 
 struct RawUniqueConstraint {
@@ -589,8 +589,9 @@ fn bind_index_method(method: &str) -> Result<LogicalIndexMethod, PlanError> {
         "gist" => Ok(LogicalIndexMethod::Gist),
         "brin" => Ok(LogicalIndexMethod::Brin),
         "hnsw" => Ok(LogicalIndexMethod::Hnsw),
+        "ivfflat" => Ok(LogicalIndexMethod::IvfFlat),
         _ => Err(PlanError::NotSupported(
-            "only btree, hash, gin, gist, brin, and hnsw methods are supported",
+            "only btree, hash, gin, gist, brin, hnsw, and ivfflat methods are supported",
         )),
     }
 }
@@ -1140,9 +1141,10 @@ pub(super) fn bind_create_index(
         Some(method) if method == "gist" => LogicalIndexMethod::Gist,
         Some(method) if method == "brin" => LogicalIndexMethod::Brin,
         Some(method) if method == "hnsw" => LogicalIndexMethod::Hnsw,
+        Some(method) if method == "ivfflat" => LogicalIndexMethod::IvfFlat,
         Some(_) => {
             return Err(PlanError::NotSupported(
-                "CREATE INDEX: only btree, hash, gin, gist, brin, and hnsw methods are supported",
+                "CREATE INDEX: only btree, hash, gin, gist, brin, hnsw, and ivfflat methods are supported",
             ));
         }
     };
@@ -1169,9 +1171,13 @@ pub(super) fn bind_create_index(
             "CREATE UNIQUE INDEX: gin, gist, and brin indexes do not enforce uniqueness",
         ));
     }
-    if method == LogicalIndexMethod::Hnsw && s.unique {
+    if matches!(
+        method,
+        LogicalIndexMethod::Hnsw | LogicalIndexMethod::IvfFlat
+    ) && s.unique
+    {
         return Err(PlanError::NotSupported(
-            "CREATE UNIQUE INDEX USING hnsw: hnsw indexes do not enforce uniqueness",
+            "CREATE UNIQUE INDEX USING vector ANN: hnsw and ivfflat indexes do not enforce uniqueness",
         ));
     }
     let mut col_indices: Vec<usize> = Vec::with_capacity(s.columns.len());
@@ -1208,10 +1214,13 @@ pub(super) fn bind_create_index(
         col_indices.clear();
     }
 
-    if method == LogicalIndexMethod::Hnsw {
+    if matches!(
+        method,
+        LogicalIndexMethod::Hnsw | LogicalIndexMethod::IvfFlat
+    ) {
         if s.columns.len() != 1 || col_indices.len() != 1 {
             return Err(PlanError::NotSupported(
-                "CREATE INDEX USING hnsw: exactly one vector column key is supported",
+                "CREATE INDEX USING vector ANN: exactly one vector column key is supported",
             ));
         }
         let field = table_schema
@@ -1219,7 +1228,7 @@ pub(super) fn bind_create_index(
             .ok_or_else(|| PlanError::ColumnNotFound(format!("column index {}", col_indices[0])))?;
         if !matches!(field.data_type, DataType::Vector { dims: Some(_) }) {
             return Err(PlanError::TypeMismatch(format!(
-                "CREATE INDEX USING hnsw requires a vector(n) column, got {}",
+                "CREATE INDEX USING vector ANN requires a vector(n) column, got {}",
                 field.data_type
             )));
         }
@@ -1230,18 +1239,42 @@ pub(super) fn bind_create_index(
             )
         {
             return Err(PlanError::NotSupported(
-                "CREATE INDEX USING hnsw: supported vector opclasses are vector_l2_ops, vector_cosine_ops, vector_ip_ops, vector_l1_ops",
+                "CREATE INDEX USING vector ANN: supported vector opclasses are vector_l2_ops, vector_cosine_ops, vector_ip_ops, vector_l1_ops",
             ));
         }
         if !s.include.is_empty() {
             return Err(PlanError::NotSupported(
-                "CREATE INDEX USING hnsw: INCLUDE columns are not supported in this wave",
+                "CREATE INDEX USING vector ANN: INCLUDE columns are not supported in this wave",
             ));
         }
         if s.r#where.is_some() {
             return Err(PlanError::NotSupported(
-                "CREATE INDEX USING hnsw: partial indexes are not supported in this wave",
+                "CREATE INDEX USING vector ANN: partial indexes are not supported in this wave",
             ));
+        }
+    }
+
+    let index_options = s
+        .options
+        .iter()
+        .map(|option| {
+            let name = option.name.value.to_ascii_lowercase();
+            let value = index_option_value_to_string(&option.value)?;
+            Ok(LogicalIndexOption { name, value })
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    if method != LogicalIndexMethod::IvfFlat && !index_options.is_empty() {
+        return Err(PlanError::NotSupported(
+            "CREATE INDEX WITH options are supported only for ivfflat in this wave",
+        ));
+    }
+    if method == LogicalIndexMethod::IvfFlat {
+        for option in &index_options {
+            if !matches!(option.name.as_str(), "lists" | "probes") {
+                return Err(PlanError::NotSupported(
+                    "CREATE INDEX USING ivfflat supports only lists and probes options",
+                ));
+            }
         }
     }
 
@@ -1279,6 +1312,7 @@ pub(super) fn bind_create_index(
         columns: col_indices,
         key_exprs,
         opclasses,
+        index_options,
         include_columns,
         predicate,
         method,
@@ -1302,6 +1336,20 @@ fn index_expr_name_part(expr: &ScalarExpr) -> String {
         .collect::<String>()
         .trim_matches('_')
         .to_owned()
+}
+
+fn index_option_value_to_string(expr: &Expr) -> Result<String, PlanError> {
+    match expr {
+        Expr::Literal(Literal::Integer { text, .. })
+        | Expr::Literal(Literal::Float { text, .. }) => Ok(text.clone()),
+        Expr::Literal(Literal::String { value, .. })
+        | Expr::Literal(Literal::Typed { value, .. }) => Ok(value.clone()),
+        Expr::Literal(Literal::Bool { value, .. }) => {
+            Ok(if *value { "true" } else { "false" }.to_owned())
+        }
+        Expr::Column { name } if name.parts.len() == 1 => Ok(name.parts[0].value.clone()),
+        _ => Err(PlanError::NotSupported("CREATE INDEX WITH option value")),
+    }
 }
 
 /// Build a stable default index name when the user did not supply one:

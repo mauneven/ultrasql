@@ -207,6 +207,8 @@ pub struct RuntimeIndexMetadata {
     pub brin: Option<Arc<ultrasql_storage::access_method::BrinIndex>>,
     /// Runtime HNSW graph for vector top-k scans.
     pub hnsw: Option<Arc<ultrasql_storage::access_method::HnswIndex>>,
+    /// Runtime IVFFlat inverted lists for vector top-k scans.
+    pub ivfflat: Option<Arc<ultrasql_storage::access_method::IvfFlatIndex>>,
 }
 
 /// One runtime CHECK constraint.

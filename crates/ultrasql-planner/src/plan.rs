@@ -96,6 +96,17 @@ pub enum LogicalIndexMethod {
     Brin,
     /// Hierarchical navigable small world vector index method.
     Hnsw,
+    /// Inverted-file flat vector index method.
+    IvfFlat,
+}
+
+/// Bound `CREATE INDEX ... WITH (...)` storage option.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalIndexOption {
+    /// Lowercase option name.
+    pub name: String,
+    /// Literal option value rendered as text.
+    pub value: String,
 }
 
 /// Planner-selected execution family for a logical pipeline.
@@ -658,6 +669,8 @@ pub enum LogicalPlan {
         key_exprs: Vec<ScalarExpr>,
         /// Optional operator class per key (`vector_l2_ops`, etc.).
         opclasses: Vec<Option<String>>,
+        /// Bound index storage options from `WITH (...)`.
+        index_options: Vec<LogicalIndexOption>,
         /// 0-based table columns listed in `INCLUDE (...)`.
         include_columns: Vec<usize>,
         /// Bound partial-index predicate, if any.
@@ -1872,6 +1885,7 @@ impl LogicalPlan {
                     LogicalIndexMethod::Gist => "gist",
                     LogicalIndexMethod::Brin => "brin",
                     LogicalIndexMethod::Hnsw => "hnsw",
+                    LogicalIndexMethod::IvfFlat => "ivfflat",
                 };
                 let _ = fmt::write(
                     out,

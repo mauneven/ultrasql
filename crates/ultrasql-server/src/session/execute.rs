@@ -1070,6 +1070,22 @@ where
                 .map_err(|e| ServerError::ddl(format!("VACUUM HNSW {}: {e}", index.name)))?;
                 continue;
             }
+            if let Some(ivfflat) =
+                self.state
+                    .table_constraints
+                    .get(&entry.oid)
+                    .and_then(|constraints| {
+                        let metadata = constraints.indexes.get(&index.oid)?;
+                        (metadata.method == ultrasql_planner::LogicalIndexMethod::IvfFlat)
+                            .then(|| metadata.ivfflat.clone())
+                            .flatten()
+                    })
+            {
+                ivfflat
+                    .compact_deleted()
+                    .map_err(|e| ServerError::ddl(format!("VACUUM IVFFlat {}: {e}", index.name)))?;
+                continue;
+            }
             if index.root_block == BlockNumber::INVALID {
                 continue;
             }

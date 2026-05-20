@@ -31,7 +31,7 @@ use std::sync::Arc;
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Value, Xid};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::access_method::{AccessMethod, BrinIndex, HnswIndex};
+use ultrasql_storage::access_method::{AccessMethod, BrinIndex, HnswIndex, IvfFlatIndex};
 use ultrasql_storage::btree::{BTree, BTreeError};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions, UpdatePayload};
 use ultrasql_storage::sequence::Sequence;
@@ -224,16 +224,31 @@ impl<L: PageLoader> InsertIndexMaintainer<L> {
 pub struct VectorIndexMaintainer {
     name: String,
     index_rel: RelationId,
-    hnsw: Arc<HnswIndex>,
+    runtime: VectorIndexRuntime,
     encode: VectorIndexEncoder,
     xid: Xid,
     wal: Option<Arc<dyn WalSink>>,
+}
+
+enum VectorIndexRuntime {
+    Hnsw(Arc<HnswIndex>),
+    IvfFlat(Arc<IvfFlatIndex>),
+}
+
+impl std::fmt::Debug for VectorIndexRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hnsw(_) => f.write_str("Hnsw"),
+            Self::IvfFlat(_) => f.write_str("IvfFlat"),
+        }
+    }
 }
 
 impl std::fmt::Debug for VectorIndexMaintainer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VectorIndexMaintainer")
             .field("name", &self.name)
+            .field("runtime", &self.runtime)
             .finish_non_exhaustive()
     }
 }
@@ -241,7 +256,7 @@ impl std::fmt::Debug for VectorIndexMaintainer {
 impl VectorIndexMaintainer {
     /// Construct a maintainer for one runtime HNSW graph.
     #[must_use]
-    pub fn new<N: Into<String>>(
+    pub fn new_hnsw<N: Into<String>>(
         name: N,
         index_rel: RelationId,
         hnsw: Arc<HnswIndex>,
@@ -252,7 +267,27 @@ impl VectorIndexMaintainer {
         Self {
             name: name.into(),
             index_rel,
-            hnsw,
+            runtime: VectorIndexRuntime::Hnsw(hnsw),
+            encode,
+            xid,
+            wal,
+        }
+    }
+
+    /// Construct a maintainer for one runtime IVFFlat index.
+    #[must_use]
+    pub fn new_ivfflat<N: Into<String>>(
+        name: N,
+        index_rel: RelationId,
+        ivfflat: Arc<IvfFlatIndex>,
+        encode: VectorIndexEncoder,
+        xid: Xid,
+        wal: Option<Arc<dyn WalSink>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            index_rel,
+            runtime: VectorIndexRuntime::IvfFlat(ivfflat),
             encode,
             xid,
             wal,
@@ -264,15 +299,25 @@ impl VectorIndexMaintainer {
     }
 
     fn insert_vector(&self, vector: &[f32], tid: TupleId) -> Result<(), ExecError> {
-        self.hnsw
-            .insert_vector_logged(self.index_rel, vector, tid, self.xid, self.wal.as_deref())
-            .map_err(|e| ExecError::TypeMismatch(format!("hnsw insert {}: {e}", self.name)))
+        match &self.runtime {
+            VectorIndexRuntime::Hnsw(hnsw) => hnsw
+                .insert_vector_logged(self.index_rel, vector, tid, self.xid, self.wal.as_deref())
+                .map_err(|e| ExecError::TypeMismatch(format!("hnsw insert {}: {e}", self.name))),
+            VectorIndexRuntime::IvfFlat(ivfflat) => ivfflat
+                .insert_vector(vector, tid)
+                .map_err(|e| ExecError::TypeMismatch(format!("ivfflat insert {}: {e}", self.name))),
+        }
     }
 
     fn delete_tid(&self, tid: TupleId) -> Result<(), ExecError> {
-        self.hnsw
-            .mark_deleted_logged(self.index_rel, tid, self.xid, self.wal.as_deref())
-            .map_err(|e| ExecError::TypeMismatch(format!("hnsw delete {}: {e}", self.name)))
+        match &self.runtime {
+            VectorIndexRuntime::Hnsw(hnsw) => hnsw
+                .mark_deleted_logged(self.index_rel, tid, self.xid, self.wal.as_deref())
+                .map_err(|e| ExecError::TypeMismatch(format!("hnsw delete {}: {e}", self.name))),
+            VectorIndexRuntime::IvfFlat(ivfflat) => ivfflat
+                .mark_deleted(tid)
+                .map_err(|e| ExecError::TypeMismatch(format!("ivfflat delete {}: {e}", self.name))),
+        }
     }
 }
 

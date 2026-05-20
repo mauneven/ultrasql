@@ -96,14 +96,14 @@ pub(super) fn lower_real_insert(
     };
     let rel = RelationId(entry.oid);
     let insert_indexes = build_insert_index_maintainers(entry, ctx)?;
-    let insert_vector_indexes = build_hnsw_index_maintainers(entry, ctx)?;
+    let insert_vector_indexes = build_vector_index_maintainers(entry, ctx)?;
     let update_indexes = if matches!(on_conflict, Some(LogicalOnConflict::DoUpdate { .. })) {
         build_insert_index_maintainers(entry, ctx)?
     } else {
         Vec::new()
     };
     let update_vector_indexes = if matches!(on_conflict, Some(LogicalOnConflict::DoUpdate { .. })) {
-        build_hnsw_index_maintainers(entry, ctx)?
+        build_vector_index_maintainers(entry, ctx)?
     } else {
         Vec::new()
     };
@@ -1225,7 +1225,10 @@ fn build_one_insert_index_maintainer(
     let method = runtime
         .as_ref()
         .map_or(LogicalIndexMethod::Btree, |metadata| metadata.method);
-    if method == LogicalIndexMethod::Hnsw {
+    if matches!(
+        method,
+        LogicalIndexMethod::Hnsw | LogicalIndexMethod::IvfFlat
+    ) {
         return Ok(None);
     }
     if index.root_block == BlockNumber::INVALID {
@@ -1308,7 +1311,7 @@ fn build_one_insert_index_maintainer(
     ))
 }
 
-fn build_hnsw_index_maintainers(
+fn build_vector_index_maintainers(
     entry: &TableEntry,
     ctx: &LowerCtx<'_>,
 ) -> Result<Vec<VectorIndexMaintainer>, ServerError> {
@@ -1323,15 +1326,15 @@ fn build_hnsw_index_maintainers(
         let Some(metadata) = constraints.indexes.get(&index.oid) else {
             continue;
         };
-        if metadata.method != LogicalIndexMethod::Hnsw {
-            continue;
-        }
-        let Some(hnsw) = metadata.hnsw.clone() else {
+        if !matches!(
+            metadata.method,
+            LogicalIndexMethod::Hnsw | LogicalIndexMethod::IvfFlat
+        ) {
             continue;
         };
         let [attnum] = index.columns.as_slice() else {
             return Err(ServerError::Unsupported(
-                "CREATE INDEX USING hnsw: exactly one vector column key is supported",
+                "CREATE INDEX USING vector ANN: exactly one vector column key is supported",
             ));
         };
         let col = usize::from(*attnum);
@@ -1339,26 +1342,47 @@ fn build_hnsw_index_maintainers(
         let encoder: VectorIndexEncoder = Arc::new(move |row: &[Value]| {
             let value = row.get(col).ok_or_else(|| {
                 ultrasql_executor::ExecError::TypeMismatch(format!(
-                    "hnsw index {index_name}: row missing key column {col}"
+                    "vector index {index_name}: row missing key column {col}"
                 ))
             })?;
             match value {
                 Value::Vector(vector) => Ok(Some(vector.clone())),
                 Value::Null => Ok(None),
                 other => Err(ultrasql_executor::ExecError::TypeMismatch(format!(
-                    "hnsw index {index_name}: expected vector key, got {:?}",
+                    "vector index {index_name}: expected vector key, got {:?}",
                     other.data_type()
                 ))),
             }
         });
-        out.push(VectorIndexMaintainer::new(
-            index.name.clone(),
-            RelationId::new(index.oid.raw()),
-            hnsw,
-            encoder,
-            ctx.xid,
-            ctx.heap.wal_sink().cloned(),
-        ));
+        match metadata.method {
+            LogicalIndexMethod::Hnsw => {
+                let Some(hnsw) = metadata.hnsw.clone() else {
+                    continue;
+                };
+                out.push(VectorIndexMaintainer::new_hnsw(
+                    index.name.clone(),
+                    RelationId::new(index.oid.raw()),
+                    hnsw,
+                    encoder,
+                    ctx.xid,
+                    ctx.heap.wal_sink().cloned(),
+                ));
+            }
+            LogicalIndexMethod::IvfFlat => {
+                let Some(ivfflat) = metadata.ivfflat.clone() else {
+                    continue;
+                };
+                out.push(VectorIndexMaintainer::new_ivfflat(
+                    index.name.clone(),
+                    RelationId::new(index.oid.raw()),
+                    ivfflat,
+                    encoder,
+                    ctx.xid,
+                    ctx.heap.wal_sink().cloned(),
+                ));
+            }
+            _ => {}
+        }
     }
     Ok(out)
 }
@@ -1642,7 +1666,7 @@ pub(super) fn lower_real_update(
     let modify = if has_indexes {
         modify
             .with_update_indexes(build_insert_index_maintainers(entry, ctx)?)
-            .with_update_vector_indexes(build_hnsw_index_maintainers(entry, ctx)?)
+            .with_update_vector_indexes(build_vector_index_maintainers(entry, ctx)?)
     } else {
         modify
     };
@@ -1818,7 +1842,7 @@ pub(super) fn lower_real_delete(
     let modify = if has_indexes {
         modify
             .with_delete_indexes(build_insert_index_maintainers(entry, ctx)?)
-            .with_delete_vector_indexes(build_hnsw_index_maintainers(entry, ctx)?)
+            .with_delete_vector_indexes(build_vector_index_maintainers(entry, ctx)?)
     } else {
         modify
     };

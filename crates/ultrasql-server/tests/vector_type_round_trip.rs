@@ -461,6 +461,65 @@ async fn hnsw_l2_opclass_survives_insert_update_delete_and_vacuum() {
 }
 
 #[tokio::test]
+async fn ivfflat_l2_opclass_uses_lists_probes_and_survives_dml() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE ann_ivf (id INT NOT NULL, embedding VECTOR(2))")
+        .await
+        .expect("create vector table");
+    client
+        .batch_execute(
+            "INSERT INTO ann_ivf VALUES \
+             (1, '[0,0]'), \
+             (2, '[1,0]'), \
+             (3, '[9,0]'), \
+             (4, '[10,0]')",
+        )
+        .await
+        .expect("insert initial vectors");
+    client
+        .batch_execute(
+            "CREATE INDEX ann_ivf_embedding_idx \
+             ON ann_ivf USING ivfflat (embedding vector_l2_ops) \
+             WITH (lists = 2, probes = 1)",
+        )
+        .await
+        .expect("create ivfflat index");
+    client
+        .batch_execute("INSERT INTO ann_ivf VALUES (5, '[9.5,0]')")
+        .await
+        .expect("insert into ivfflat");
+    client
+        .batch_execute("UPDATE ann_ivf SET embedding = VECTOR '[8.5,0]' WHERE id = 3")
+        .await
+        .expect("update ivfflat");
+    client
+        .batch_execute("DELETE FROM ann_ivf WHERE id = 1")
+        .await
+        .expect("delete ivfflat");
+
+    let messages = client
+        .simple_query(
+            "SELECT id FROM ann_ivf \
+             ORDER BY embedding <-> VECTOR '[9.4,0]' LIMIT 3",
+        )
+        .await
+        .expect("ivfflat top-k query");
+    let rows = simple_rows(&messages);
+    assert_eq!(
+        rows,
+        vec![
+            vec!["5".to_owned()],
+            vec!["4".to_owned()],
+            vec!["3".to_owned()]
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn insert_rejects_vector_dimension_mismatch() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

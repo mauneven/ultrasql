@@ -660,7 +660,7 @@ pub enum SetValue {
     Values(Vec<Expr>),
 }
 
-/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON table [USING method] (columns) [INCLUDE (...)] [WHERE expr]`.
+/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON table [USING method] (columns) [INCLUDE (...)] [WITH (...)] [WHERE expr]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateIndexStmt {
     /// Whether `UNIQUE` was specified.
@@ -681,6 +681,19 @@ pub struct CreateIndexStmt {
     pub r#where: Option<Expr>,
     /// `INCLUDE (col, …)` covering columns.
     pub include: Vec<Identifier>,
+    /// `WITH (name = value, …)` index storage options.
+    pub options: Vec<IndexOption>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// One `WITH (…)` storage option of a `CREATE INDEX` statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexOption {
+    /// Option name.
+    pub name: Identifier,
+    /// Option value expression.
+    pub value: Expr,
     /// Source span.
     pub span: Span,
 }

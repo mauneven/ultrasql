@@ -20,10 +20,12 @@ use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, Stat
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
     Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalCommentTarget,
-    LogicalPlan, TableMeta, bind,
+    LogicalIndexMethod, LogicalIndexOption, LogicalPlan, TableMeta, bind,
 };
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
-use ultrasql_storage::access_method::{AccessMethod, BrinIndex, HnswIndex, HnswMetric};
+use ultrasql_storage::access_method::{
+    AccessMethod, BrinIndex, HnswIndex, HnswMetric, IvfFlatIndex,
+};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions};
@@ -477,6 +479,7 @@ where
             columns,
             key_exprs,
             opclasses,
+            index_options,
             include_columns,
             predicate,
             method,
@@ -507,7 +510,146 @@ where
             ))
         })?;
 
-        if *method == ultrasql_planner::LogicalIndexMethod::Hnsw {
+        if *method == LogicalIndexMethod::IvfFlat {
+            if *unique {
+                return Err(ServerError::Unsupported(
+                    "CREATE UNIQUE INDEX USING ivfflat: ivfflat indexes do not enforce uniqueness",
+                ));
+            }
+            if columns.len() != 1 || key_exprs.len() != 1 || !include_columns.is_empty() {
+                return Err(ServerError::Unsupported(
+                    "CREATE INDEX USING ivfflat: exactly one vector column key is supported",
+                ));
+            }
+            if predicate.is_some() {
+                return Err(ServerError::Unsupported(
+                    "CREATE INDEX USING ivfflat: partial indexes are not supported in this wave",
+                ));
+            }
+            let vector_col = columns[0];
+            let field = table.schema.field(vector_col).ok_or_else(|| {
+                ServerError::ddl(format!(
+                    "CREATE INDEX USING ivfflat: key column {vector_col} missing"
+                ))
+            })?;
+            let dims = match &field.data_type {
+                DataType::Vector { dims: Some(dims) } => *dims,
+                other => {
+                    return Err(ServerError::ddl(format!(
+                        "CREATE INDEX USING ivfflat requires vector(n), got {other}"
+                    )));
+                }
+            };
+            let metric = hnsw_metric_for_opclass(opclasses.first().and_then(Option::as_deref))?;
+            let (lists, probes) = ivfflat_options(index_options)?;
+            let index_oid = self.state.persistent_catalog.next_oid();
+            let ivfflat = Arc::new(
+                IvfFlatIndex::new(dims, metric, lists, probes)
+                    .map_err(|e| ServerError::ddl(format!("CREATE INDEX ivfflat init: {e}")))?,
+            );
+            let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+            let table_rel = RelationId(table.oid);
+            let block_count = self.state.heap.block_count(table_rel).max(table.n_blocks);
+            let codec = ultrasql_executor::RowCodec::new(table.schema.clone());
+            let scan = self.state.heap.scan_visible(
+                table_rel,
+                block_count,
+                &txn.snapshot,
+                self.state.txn_manager.as_ref(),
+            );
+            let build_result = (|| -> Result<(), ServerError> {
+                let mut rows = Vec::new();
+                for result in scan {
+                    let tuple = result.map_err(|e| {
+                        ServerError::ddl(format!("CREATE INDEX ivfflat heap scan: {e}"))
+                    })?;
+                    let row = codec.decode(&tuple.data).map_err(|e| {
+                        ServerError::ddl(format!("CREATE INDEX ivfflat decode: {e}"))
+                    })?;
+                    let vector = match row.get(vector_col) {
+                        Some(Value::Vector(vector)) => vector.clone(),
+                        Some(Value::Null) => continue,
+                        _ => {
+                            return Err(ServerError::ddl(
+                                "CREATE INDEX ivfflat: key column did not decode as vector",
+                            ));
+                        }
+                    };
+                    rows.push((vector, tuple.tid));
+                }
+                ivfflat
+                    .bulk_load(rows)
+                    .map_err(|e| ServerError::ddl(format!("CREATE INDEX ivfflat bulk load: {e}")))
+            })();
+            if let Err(e) = self.state.txn_manager.commit(txn) {
+                tracing::warn!(error = %e, "autocommit (CREATE INDEX ivfflat) failed to finalise");
+            }
+            build_result?;
+            let attnum = u16::try_from(vector_col).map_err(|_| {
+                ServerError::Unsupported(
+                    "CREATE INDEX: column index does not fit in u16 attnum field",
+                )
+            })?;
+            let entry = IndexEntry::new(
+                index_oid,
+                index_name.clone(),
+                table.oid,
+                vec![attnum],
+                false,
+            );
+            self.state.persistent_catalog.create_index(entry.clone())?;
+            let ddl_txn = self
+                .state
+                .txn_manager
+                .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+            if let Err(e) = self.state.persistent_catalog.persist_index_rows(
+                &entry,
+                self.state.heap.as_ref(),
+                ddl_txn.xid,
+                ddl_txn.current_command,
+            ) {
+                if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                    tracing::warn!(
+                        error = %abort_err,
+                        "abort of catalog-write txn failed after persist_index_rows error",
+                    );
+                }
+                let _ = self.state.persistent_catalog.drop_index(index_name);
+                return Err(e.into());
+            }
+            if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
+                tracing::warn!(
+                    error = %commit_err,
+                    "catalog-write txn failed to commit; restart visibility may differ",
+                );
+            }
+            let mut constraints = self
+                .state
+                .table_constraints
+                .get(&table.oid)
+                .map(|entry| entry.value().as_ref().clone())
+                .unwrap_or_default();
+            constraints.indexes.insert(
+                index_oid,
+                crate::RuntimeIndexMetadata {
+                    key_exprs: Vec::new(),
+                    predicate: None,
+                    include_columns: Vec::new(),
+                    method: *method,
+                    brin: None,
+                    hnsw: None,
+                    ivfflat: Some(ivfflat),
+                },
+            );
+            self.state
+                .table_constraints
+                .insert(table.oid, Arc::new(constraints));
+            self.plan_cache_invalidate();
+
+            return Ok(run_ddl_command("CREATE INDEX"));
+        }
+
+        if *method == LogicalIndexMethod::Hnsw {
             if *unique {
                 return Err(ServerError::Unsupported(
                     "CREATE UNIQUE INDEX USING hnsw: hnsw indexes do not enforce uniqueness",
@@ -640,6 +782,7 @@ where
                     method: *method,
                     brin: None,
                     hnsw: Some(hnsw),
+                    ivfflat: None,
                 },
             );
             self.state
@@ -808,6 +951,7 @@ where
                     method: *method,
                     brin: brin_summary.clone(),
                     hnsw: None,
+                    ivfflat: None,
                 },
             );
             self.state
@@ -1003,6 +1147,35 @@ fn hnsw_metric_for_opclass(opclass: Option<&str>) -> Result<HnswMetric, ServerEr
             "CREATE INDEX USING hnsw: unsupported vector opclass {other}"
         ))),
     }
+}
+
+fn ivfflat_options(options: &[LogicalIndexOption]) -> Result<(usize, usize), ServerError> {
+    let mut lists = 100_usize;
+    let mut probes = 1_usize;
+    for option in options {
+        let parsed = option.value.parse::<usize>().map_err(|_| {
+            ServerError::ddl(format!(
+                "CREATE INDEX USING ivfflat: option {} must be a positive integer",
+                option.name
+            ))
+        })?;
+        if parsed == 0 {
+            return Err(ServerError::ddl(format!(
+                "CREATE INDEX USING ivfflat: option {} must be greater than zero",
+                option.name
+            )));
+        }
+        match option.name.as_str() {
+            "lists" => lists = parsed,
+            "probes" => probes = parsed,
+            other => {
+                return Err(ServerError::ddl(format!(
+                    "CREATE INDEX USING ivfflat: unsupported option {other}"
+                )));
+            }
+        }
+    }
+    Ok((lists, probes))
 }
 
 fn constraint_attnums(columns: &[usize], name: &str) -> Result<Vec<i16>, ServerError> {

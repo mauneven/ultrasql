@@ -6,9 +6,10 @@
 //! - `CREATE INDEX IF NOT EXISTS …`
 //! - `CREATE INDEX … USING method`
 //! - `CREATE INDEX … INCLUDE (col, …)`
+//! - `CREATE INDEX … WITH (option = value, …)`
 //! - `CREATE INDEX … WHERE expr` (partial index)
 
-use crate::ast::{CreateIndexStmt, IndexColumn, NullsOrder, SortDirection};
+use crate::ast::{CreateIndexStmt, IndexColumn, IndexOption, NullsOrder, SortDirection};
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
 use crate::token::TokenKind;
@@ -56,6 +57,13 @@ impl Parser<'_> {
             Vec::new()
         };
 
+        // Optional WITH (option = value, …)
+        let options = if self.match_kw(TokenKind::KwWith) {
+            self.parse_index_options()?
+        } else {
+            Vec::new()
+        };
+
         // Optional WHERE predicate (partial index)
         let r#where = if self.match_kw(TokenKind::KwWhere) {
             Some(self.parse_expr()?)
@@ -74,6 +82,7 @@ impl Parser<'_> {
             columns,
             r#where,
             include,
+            options,
             span: Span::new(create_start, end),
         })
     }
@@ -147,6 +156,30 @@ impl Parser<'_> {
             span: Span::new(start, end),
         })
     }
+
+    fn parse_index_options(&mut self) -> Result<Vec<IndexOption>, ParseError> {
+        self.expect(TokenKind::LParen, "(")?;
+        let mut options = Vec::new();
+        loop {
+            let name = self.parse_identifier()?;
+            let start = name.span.start;
+            self.expect(TokenKind::Eq, "=")?;
+            let value = self.parse_expr()?;
+            let end = value.span().end;
+            options.push(IndexOption {
+                name,
+                value,
+                span: Span::new(start, end),
+            });
+            if self.peek()?.kind == TokenKind::Comma {
+                self.advance()?;
+            } else {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen, ")")?;
+        Ok(options)
+    }
 }
 
 #[cfg(test)]
@@ -214,6 +247,18 @@ mod tests {
             stmt.columns[0].opclass.as_ref().expect("opclass").value,
             "vector_l2_ops"
         );
+    }
+
+    #[test]
+    fn create_index_parses_ivfflat_with_lists_and_probes() {
+        let stmt = parse_create_index(
+            "CREATE INDEX idx ON docs USING ivfflat (embedding vector_l2_ops) \
+             WITH (lists = 4, probes = 2)",
+        );
+        assert_eq!(stmt.method.as_ref().unwrap().value, "ivfflat");
+        assert_eq!(stmt.options.len(), 2);
+        assert_eq!(stmt.options[0].name.value, "lists");
+        assert_eq!(stmt.options[1].name.value, "probes");
     }
 
     #[test]
