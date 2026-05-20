@@ -1,14 +1,19 @@
 //! Small CSV parser shared by file-backed SQL surfaces.
 //!
 //! The parser implements the RFC-4180 pieces UltraSQL needs for local CSV
-//! table functions: comma delimiter, double-quoted fields, doubled quote
-//! escapes, CRLF/LF records, and quoted newlines. Type inference lives above
-//! this layer; parsed cells are UTF-8 strings.
+//! table functions: configurable delimiter, quoted fields, doubled quote
+//! escapes, CRLF/LF records, and quoted newlines. Sniffing is deliberately
+//! conservative: it reports a reproducible dialect + type guess, but the data
+//! reader still treats cells as UTF-8 strings until typed CSV scans land.
 
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+const DEFAULT_DELIMITER: char = ',';
+const DEFAULT_QUOTE: char = '"';
+const DEFAULT_ESCAPE: char = '"';
 
 /// Error returned when CSV input is malformed.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +37,152 @@ impl fmt::Display for CsvError {
 
 impl StdError for CsvError {}
 
+/// Parser options for one CSV dialect candidate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CsvParseOptions {
+    /// Single-character field delimiter.
+    pub delimiter: char,
+    /// Optional quote character for quoted fields.
+    pub quote: Option<char>,
+    /// Optional escape character used inside quoted fields.
+    pub escape: Option<char>,
+}
+
+impl Default for CsvParseOptions {
+    fn default() -> Self {
+        Self {
+            delimiter: DEFAULT_DELIMITER,
+            quote: Some(DEFAULT_QUOTE),
+            escape: Some(DEFAULT_ESCAPE),
+        }
+    }
+}
+
+/// Type inferred for one CSV column.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CsvInferredType {
+    /// SQL boolean values.
+    Boolean,
+    /// Signed 64-bit integer values.
+    BigInt,
+    /// 64-bit floating-point values.
+    Double,
+    /// ISO `YYYY-MM-DD` date values.
+    Date,
+    /// ISO timestamp values.
+    Timestamp,
+    /// Fallback UTF-8 text values.
+    Text,
+}
+
+impl CsvInferredType {
+    /// SQL type name emitted in `sniff_csv.Columns` and `sniff_csv.Prompt`.
+    #[must_use]
+    pub const fn sql_name(self) -> &'static str {
+        match self {
+            Self::Boolean => "BOOLEAN",
+            Self::BigInt => "BIGINT",
+            Self::Double => "DOUBLE",
+            Self::Date => "DATE",
+            Self::Timestamp => "TIMESTAMP",
+            Self::Text => "TEXT",
+        }
+    }
+}
+
+/// One column reported by the CSV sniffer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CsvSniffColumn {
+    /// Column name from the header row, or generated `columnN`.
+    pub name: String,
+    /// Type inferred from sampled data rows.
+    pub data_type: CsvInferredType,
+}
+
+/// Result produced by `sniff_csv(path)`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CsvSniff {
+    /// Original path argument.
+    pub path: String,
+    /// Detected delimiter.
+    pub delimiter: char,
+    /// Detected quote character.
+    pub quote: Option<char>,
+    /// Detected escape character.
+    pub escape: Option<char>,
+    /// Detected newline delimiter, escaped for display (`\n`, `\r\n`, `\r`).
+    pub newline: String,
+    /// Whether the first row looks like a header row.
+    pub has_header: bool,
+    /// Columns and their inferred types.
+    pub columns: Vec<CsvSniffColumn>,
+}
+
+impl CsvSniff {
+    /// Parser options represented by this sniff result.
+    #[must_use]
+    pub const fn parse_options(&self) -> CsvParseOptions {
+        CsvParseOptions {
+            delimiter: self.delimiter,
+            quote: self.quote,
+            escape: self.escape,
+        }
+    }
+
+    /// Delimiter text for SQL result display.
+    #[must_use]
+    pub fn delimiter_text(&self) -> String {
+        display_char(self.delimiter)
+    }
+
+    /// Quote text for SQL result display.
+    #[must_use]
+    pub fn quote_text(&self) -> String {
+        self.quote.map_or_else(String::new, display_char)
+    }
+
+    /// Escape text for SQL result display.
+    #[must_use]
+    pub fn escape_text(&self) -> String {
+        self.escape.map_or_else(String::new, display_char)
+    }
+
+    /// DuckDB-style columns argument.
+    #[must_use]
+    pub fn columns_sql(&self) -> String {
+        let columns = self
+            .columns
+            .iter()
+            .map(|column| {
+                format!(
+                    "'{}': '{}'",
+                    escape_sql_literal(&column.name),
+                    column.data_type.sql_name()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("{{{columns}}}")
+    }
+
+    /// Runnable `FROM read_csv(...)` prompt.
+    #[must_use]
+    pub fn prompt_sql(&self) -> String {
+        format!("FROM read_csv('{}')", escape_sql_literal(&self.path))
+    }
+}
+
+/// Parsed CSV file with sniffer-derived column names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CsvReadData {
+    /// Column names from header row or generated by the sniffer.
+    pub header: Vec<String>,
+    /// Data records, excluding the header row when one is present.
+    pub records: Vec<Vec<String>>,
+    /// Whether the source file contained a header row.
+    pub has_header: bool,
+}
+
 /// Parse UTF-8 CSV text into records.
 ///
 /// Empty physical lines are skipped. Non-empty records keep empty cells as
@@ -41,6 +192,18 @@ impl StdError for CsvError {}
 ///
 /// Returns [`CsvError`] when a quoted field is not closed by end-of-input.
 pub fn parse_csv_records(input: &str) -> Result<Vec<Vec<String>>, CsvError> {
+    parse_csv_records_with_options(input, CsvParseOptions::default())
+}
+
+/// Parse UTF-8 CSV text using explicit dialect options.
+///
+/// # Errors
+///
+/// Returns [`CsvError`] when a quoted field is not closed by end-of-input.
+pub fn parse_csv_records_with_options(
+    input: &str,
+    options: CsvParseOptions,
+) -> Result<Vec<Vec<String>>, CsvError> {
     let mut records = Vec::new();
     let mut row = Vec::new();
     let mut field = String::new();
@@ -50,13 +213,32 @@ pub fn parse_csv_records(input: &str) -> Result<Vec<Vec<String>>, CsvError> {
 
     while let Some(ch) = chars.next() {
         if in_quotes {
-            if ch == '"' {
-                if chars.peek() == Some(&'"') {
+            if options
+                .escape
+                .is_some_and(|escape| escape == ch && options.quote == Some(ch))
+            {
+                if chars
+                    .peek()
+                    .is_some_and(|next| Some(*next) == options.quote)
+                {
                     chars.next();
-                    field.push('"');
+                    field.push(ch);
                 } else {
                     in_quotes = false;
                 }
+            } else if options.escape.is_some_and(|escape| escape == ch) {
+                if let Some(next) = chars.peek().copied() {
+                    if Some(next) == options.quote || Some(next) == options.escape {
+                        chars.next();
+                        field.push(next);
+                    } else {
+                        field.push(ch);
+                    }
+                } else {
+                    field.push(ch);
+                }
+            } else if options.quote == Some(ch) {
+                in_quotes = false;
             } else {
                 field.push(ch);
             }
@@ -64,11 +246,13 @@ pub fn parse_csv_records(input: &str) -> Result<Vec<Vec<String>>, CsvError> {
         }
 
         match ch {
-            '"' if !field_started => {
+            quote if options.quote == Some(quote) && !field_started => {
                 in_quotes = true;
                 field_started = true;
             }
-            ',' => finish_field(&mut row, &mut field, &mut field_started),
+            delimiter if delimiter == options.delimiter => {
+                finish_field(&mut row, &mut field, &mut field_started);
+            }
             '\n' => finish_record(&mut records, &mut row, &mut field, &mut field_started),
             '\r' => {
                 if chars.peek() == Some(&'\n') {
@@ -90,6 +274,76 @@ pub fn parse_csv_records(input: &str) -> Result<Vec<Vec<String>>, CsvError> {
         finish_record(&mut records, &mut row, &mut field, &mut field_started);
     }
     Ok(records)
+}
+
+/// Sniff one local CSV file and return dialect, header, type, and prompt data.
+///
+/// # Errors
+///
+/// Returns [`CsvError`] on file I/O, UTF-8, CSV syntax, or empty-file input.
+pub fn sniff_csv_path(path: &Path) -> Result<CsvSniff, CsvError> {
+    let text = fs::read_to_string(path)
+        .map_err(|err| CsvError::new(format!("sniff_csv cannot read {}: {err}", path.display())))?;
+    sniff_csv_text(&path.display().to_string(), &text)
+}
+
+/// Sniff CSV text and return dialect, header, type, and prompt data.
+///
+/// This helper exists so tests can exercise sniffer behavior without touching
+/// the filesystem; SQL execution uses [`sniff_csv_path`].
+///
+/// # Errors
+///
+/// Returns [`CsvError`] when the text cannot be parsed as a consistent CSV
+/// sample.
+pub fn sniff_csv_text(path: &str, input: &str) -> Result<CsvSniff, CsvError> {
+    let newline = detect_newline(input);
+    let candidate = choose_dialect(input)?;
+    let records = parse_csv_records_with_options(input, candidate.options)?;
+    if records.is_empty() {
+        return Err(CsvError::new("sniff_csv file has no rows"));
+    }
+    let width = candidate.width;
+    if width == 0 {
+        return Err(CsvError::new("sniff_csv file has no columns"));
+    }
+    for (row_index, record) in records.iter().enumerate() {
+        if record.len() != width {
+            return Err(CsvError::new(format!(
+                "sniff_csv row {} has {} columns, expected {}",
+                row_index + 1,
+                record.len(),
+                width
+            )));
+        }
+    }
+
+    let has_header = detect_header(&records);
+    let data_rows = if has_header {
+        records.get(1..).unwrap_or(&[])
+    } else {
+        records.as_slice()
+    };
+    let names = if has_header {
+        records.first().expect("records checked non-empty").to_vec()
+    } else {
+        (0..width).map(|idx| format!("column{idx}")).collect()
+    };
+    let types = infer_column_types(data_rows, width);
+    let columns = names
+        .into_iter()
+        .zip(types)
+        .map(|(name, data_type)| CsvSniffColumn { name, data_type })
+        .collect();
+    Ok(CsvSniff {
+        path: path.to_owned(),
+        delimiter: candidate.options.delimiter,
+        quote: candidate.options.quote,
+        escape: candidate.options.escape,
+        newline,
+        has_header,
+        columns,
+    })
 }
 
 /// Expand a `read_csv` path or single-directory wildcard pattern.
@@ -146,16 +400,54 @@ pub fn expand_csv_paths(pattern: &str) -> Result<Vec<PathBuf>, CsvError> {
     Ok(paths)
 }
 
-/// Read and parse one UTF-8 CSV file.
+/// Read data records from one UTF-8 CSV file using sniffer metadata.
+///
+/// When a header is detected, it is excluded from the returned records.
 ///
 /// # Errors
 ///
 /// Returns [`CsvError`] on file I/O, UTF-8, or CSV syntax failure.
 pub fn read_csv_records_from_path(path: &Path) -> Result<Vec<Vec<String>>, CsvError> {
+    Ok(read_csv_data_from_path(path)?.records)
+}
+
+/// Read one UTF-8 CSV file using sniffer-derived dialect and header metadata.
+///
+/// # Errors
+///
+/// Returns [`CsvError`] on file I/O, UTF-8, CSV syntax, or inconsistent row
+/// width.
+pub fn read_csv_data_from_path(path: &Path) -> Result<CsvReadData, CsvError> {
     let text = fs::read_to_string(path)
         .map_err(|err| CsvError::new(format!("read_csv cannot read {}: {err}", path.display())))?;
-    parse_csv_records(&text)
-        .map_err(|err| CsvError::new(format!("read_csv parse {}: {err}", path.display())))
+    let sniff = sniff_csv_text(&path.display().to_string(), &text)
+        .map_err(|err| CsvError::new(format!("read_csv sniff {}: {err}", path.display())))?;
+    let parsed = parse_csv_records_with_options(&text, sniff.parse_options())
+        .map_err(|err| CsvError::new(format!("read_csv parse {}: {err}", path.display())))?;
+    let width = sniff.columns.len();
+    let data_start = usize::from(sniff.has_header);
+    let mut records = Vec::new();
+    for (row_index, record) in parsed.iter().enumerate().skip(data_start) {
+        if record.len() != width {
+            return Err(CsvError::new(format!(
+                "read_csv row {} in {} has {} columns, expected {}",
+                row_index + 1,
+                path.display(),
+                record.len(),
+                width
+            )));
+        }
+        records.push(record.clone());
+    }
+    Ok(CsvReadData {
+        header: sniff
+            .columns
+            .into_iter()
+            .map(|column| column.name)
+            .collect(),
+        records,
+        has_header: sniff.has_header,
+    })
 }
 
 /// Read the header row from the first file matched by a `read_csv` pattern.
@@ -168,13 +460,8 @@ pub fn read_csv_header(pattern: &str) -> Result<Vec<String>, CsvError> {
     let first = paths
         .first()
         .expect("expand_csv_paths returns non-empty paths");
-    let records = read_csv_records_from_path(first)?;
-    let header = records.first().ok_or_else(|| {
-        CsvError::new(format!(
-            "read_csv file has no header row: {}",
-            first.display()
-        ))
-    })?;
+    let data = read_csv_data_from_path(first)?;
+    let header = &data.header;
     if header.is_empty() || header.iter().any(String::is_empty) {
         return Err(CsvError::new(format!(
             "read_csv header contains an empty column name: {}",
@@ -182,6 +469,246 @@ pub fn read_csv_header(pattern: &str) -> Result<Vec<String>, CsvError> {
         )));
     }
     Ok(header.clone())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DialectCandidate {
+    options: CsvParseOptions,
+    width: usize,
+    score: usize,
+}
+
+fn choose_dialect(input: &str) -> Result<DialectCandidate, CsvError> {
+    let mut best = None;
+    for delimiter in [',', ';', '\t', '|'] {
+        let options = CsvParseOptions {
+            delimiter,
+            quote: Some(DEFAULT_QUOTE),
+            escape: Some(DEFAULT_ESCAPE),
+        };
+        let Ok(records) = parse_csv_records_with_options(input, options) else {
+            continue;
+        };
+        let Some(candidate) = score_dialect(options, &records) else {
+            continue;
+        };
+        if best.is_none_or(|current: DialectCandidate| candidate.score > current.score) {
+            best = Some(candidate);
+        }
+    }
+    if let Some(best) = best {
+        return Ok(best);
+    }
+    let options = CsvParseOptions::default();
+    let records = parse_csv_records_with_options(input, options)?;
+    let width = records.first().map_or(0, Vec::len);
+    Ok(DialectCandidate {
+        options,
+        width,
+        score: 0,
+    })
+}
+
+fn score_dialect(options: CsvParseOptions, records: &[Vec<String>]) -> Option<DialectCandidate> {
+    let mut widths = Vec::new();
+    for record in records {
+        if !record.is_empty() {
+            widths.push(record.len());
+        }
+    }
+    let width = mode_width(&widths)?;
+    if width <= 1 {
+        return None;
+    }
+    let consistent_rows = widths
+        .iter()
+        .filter(|candidate| **candidate == width)
+        .count();
+    let score = width
+        .saturating_mul(10_000)
+        .saturating_add(consistent_rows.saturating_mul(100))
+        .saturating_add(records.len());
+    Some(DialectCandidate {
+        options,
+        width,
+        score,
+    })
+}
+
+fn mode_width(widths: &[usize]) -> Option<usize> {
+    let mut best_width = None;
+    let mut best_count = 0_usize;
+    for width in widths {
+        let count = widths
+            .iter()
+            .filter(|candidate| *candidate == width)
+            .count();
+        if count > best_count || (count == best_count && best_width.is_none_or(|w| *width > w)) {
+            best_width = Some(*width);
+            best_count = count;
+        }
+    }
+    best_width
+}
+
+fn detect_newline(input: &str) -> String {
+    if input.contains("\r\n") {
+        "\\r\\n".to_owned()
+    } else if input.contains('\n') {
+        "\\n".to_owned()
+    } else if input.contains('\r') {
+        "\\r".to_owned()
+    } else {
+        "\\n".to_owned()
+    }
+}
+
+fn detect_header(records: &[Vec<String>]) -> bool {
+    let Some(first) = records.first() else {
+        return false;
+    };
+    if first.is_empty() || !header_names_are_usable(first) {
+        return false;
+    }
+    let rest = records.get(1..).unwrap_or(&[]);
+    if rest.is_empty() {
+        return first
+            .iter()
+            .any(|cell| infer_cell_type(cell) == Some(CsvInferredType::Text));
+    }
+    let types = infer_column_types(rest, first.len());
+    first
+        .iter()
+        .zip(types)
+        .any(|(cell, data_type)| !cell_compatible_with_type(cell, data_type))
+}
+
+fn header_names_are_usable(names: &[String]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    for name in names {
+        if name.trim().is_empty() {
+            return false;
+        }
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn infer_column_types(rows: &[Vec<String>], width: usize) -> Vec<CsvInferredType> {
+    let mut types = vec![None; width];
+    for row in rows {
+        for (idx, cell) in row.iter().take(width).enumerate() {
+            if let Some(cell_type) = infer_cell_type(cell) {
+                types[idx] = Some(merge_types(types[idx], cell_type));
+            }
+        }
+    }
+    types
+        .into_iter()
+        .map(|data_type| data_type.unwrap_or(CsvInferredType::Text))
+        .collect()
+}
+
+fn merge_types(current: Option<CsvInferredType>, next: CsvInferredType) -> CsvInferredType {
+    let Some(current) = current else {
+        return next;
+    };
+    match (current, next) {
+        (CsvInferredType::Text, _) | (_, CsvInferredType::Text) => CsvInferredType::Text,
+        (left, right) if left == right => left,
+        (CsvInferredType::BigInt, CsvInferredType::Double)
+        | (CsvInferredType::Double, CsvInferredType::BigInt) => CsvInferredType::Double,
+        (CsvInferredType::Date, CsvInferredType::Timestamp)
+        | (CsvInferredType::Timestamp, CsvInferredType::Date) => CsvInferredType::Timestamp,
+        _ => CsvInferredType::Text,
+    }
+}
+
+fn infer_cell_type(cell: &str) -> Option<CsvInferredType> {
+    let trimmed = cell.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if parse_bool(trimmed).is_some() {
+        return Some(CsvInferredType::Boolean);
+    }
+    if trimmed.parse::<i64>().is_ok() {
+        return Some(CsvInferredType::BigInt);
+    }
+    if trimmed.parse::<f64>().is_ok_and(f64::is_finite) {
+        return Some(CsvInferredType::Double);
+    }
+    if is_iso_timestamp(trimmed) {
+        return Some(CsvInferredType::Timestamp);
+    }
+    if is_iso_date(trimmed) {
+        return Some(CsvInferredType::Date);
+    }
+    Some(CsvInferredType::Text)
+}
+
+fn cell_compatible_with_type(cell: &str, data_type: CsvInferredType) -> bool {
+    let trimmed = cell.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    match data_type {
+        CsvInferredType::Boolean => parse_bool(trimmed).is_some(),
+        CsvInferredType::BigInt => trimmed.parse::<i64>().is_ok(),
+        CsvInferredType::Double => trimmed.parse::<f64>().is_ok_and(f64::is_finite),
+        CsvInferredType::Date => is_iso_date(trimmed),
+        CsvInferredType::Timestamp => is_iso_timestamp(trimmed) || is_iso_date(trimmed),
+        CsvInferredType::Text => true,
+    }
+}
+
+fn parse_bool(input: &str) -> Option<bool> {
+    match input.to_ascii_lowercase().as_str() {
+        "true" | "t" => Some(true),
+        "false" | "f" => Some(false),
+        _ => None,
+    }
+}
+
+fn is_iso_date(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit)
+}
+
+fn is_iso_timestamp(input: &str) -> bool {
+    let Some((date, time)) = input.split_once(' ').or_else(|| input.split_once('T')) else {
+        return false;
+    };
+    if !is_iso_date(date) {
+        return false;
+    }
+    let bytes = time.as_bytes();
+    bytes.len() >= 8
+        && bytes[2] == b':'
+        && bytes[5] == b':'
+        && bytes[..2].iter().all(u8::is_ascii_digit)
+        && bytes[3..5].iter().all(u8::is_ascii_digit)
+        && bytes[6..8].iter().all(u8::is_ascii_digit)
+}
+
+fn display_char(ch: char) -> String {
+    match ch {
+        '\t' => "\\t".to_owned(),
+        '\n' => "\\n".to_owned(),
+        '\r' => "\\r".to_owned(),
+        other => other.to_string(),
+    }
+}
+
+fn escape_sql_literal(input: &str) -> String {
+    input.replace('\'', "''")
 }
 
 fn finish_field(row: &mut Vec<String>, field: &mut String, field_started: &mut bool) {
@@ -230,7 +757,7 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_csv_records;
+    use super::{CsvInferredType, CsvParseOptions, parse_csv_records, sniff_csv_text};
 
     #[test]
     fn parses_quoted_commas_and_quotes() {
@@ -256,6 +783,67 @@ mod tests {
                 vec!["1".to_string(), "hello\nworld".to_string()],
             ]
         );
+    }
+
+    #[test]
+    fn parses_configured_delimiter() {
+        let rows = super::parse_csv_records_with_options(
+            "id;name\n1;Ada\n",
+            CsvParseOptions {
+                delimiter: ';',
+                quote: Some('"'),
+                escape: Some('"'),
+            },
+        )
+        .expect("csv parses");
+        assert_eq!(
+            rows,
+            vec![
+                vec!["id".to_string(), "name".to_string()],
+                vec!["1".to_string(), "Ada".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn sniff_detects_dialect_header_and_types() {
+        let sniff = sniff_csv_text(
+            "metrics.csv",
+            "id;score;active;created;name\r\n1;9.5;true;2026-05-20;Ada\r\n",
+        )
+        .expect("sniffs csv");
+
+        assert_eq!(sniff.delimiter, ';');
+        assert_eq!(sniff.newline, "\\r\\n");
+        assert!(sniff.has_header);
+        let types = sniff
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.data_type))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            vec![
+                ("id", CsvInferredType::BigInt),
+                ("score", CsvInferredType::Double),
+                ("active", CsvInferredType::Boolean),
+                ("created", CsvInferredType::Date),
+                ("name", CsvInferredType::Text),
+            ]
+        );
+        assert_eq!(sniff.prompt_sql(), "FROM read_csv('metrics.csv')");
+        assert!(sniff.columns_sql().contains("'created': 'DATE'"));
+    }
+
+    #[test]
+    fn sniff_without_header_generates_column_names() {
+        let sniff = sniff_csv_text("numbers.csv", "1,2\n3,4\n").expect("sniffs csv");
+
+        assert!(!sniff.has_header);
+        assert_eq!(sniff.columns[0].name, "column0");
+        assert_eq!(sniff.columns[0].data_type, CsvInferredType::BigInt);
+        assert_eq!(sniff.columns[1].name, "column1");
+        assert_eq!(sniff.columns[1].data_type, CsvInferredType::BigInt);
     }
 
     #[test]

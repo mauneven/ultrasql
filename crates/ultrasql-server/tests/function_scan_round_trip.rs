@@ -6,8 +6,9 @@
 //! `TableRef::Function`; binder lowers it into
 //! `LogicalPlan::FunctionScan { name, args, schema }`; the server's
 //! `pipeline::lower_function_scan` constructs the matching executor
-//! operator. File-backed `read_csv(path_or_glob)` is lowered through the same
-//! table-function path without creating catalog tables.
+//! operator. File-backed `read_csv(path_or_glob)` and `sniff_csv(path)` are
+//! lowered through the same table-function path without creating catalog
+//! tables.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -168,6 +169,76 @@ async fn read_csv_glob_reads_matching_files_in_stable_order() {
         vec![
             ("1".to_string(), "Alpha".to_string()),
             ("2".to_string(), "Beta".to_string()),
+        ]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn sniff_csv_reports_dialect_types_and_prompt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv_path = dir.path().join("metrics.csv");
+    fs::write(
+        &csv_path,
+        "id;score;active;name\r\n1;9.5;true;Ada\r\n2;10;false;Grace\r\n",
+    )
+    .expect("write csv");
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT * FROM sniff_csv({})",
+        sql_string(csv_path.to_str().expect("utf8 path"))
+    );
+
+    let rows = client.query(&sql, &[]).await.expect("sniff_csv file");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.get::<_, String>("Delimiter"), ";");
+    assert_eq!(row.get::<_, String>("Quote"), "\"");
+    assert_eq!(row.get::<_, String>("Escape"), "\"");
+    assert_eq!(row.get::<_, String>("NewLineDelimiter"), "\\r\\n");
+    assert!(row.get::<_, bool>("HasHeader"));
+
+    let columns = row.get::<_, String>("Columns");
+    assert!(columns.contains("'id': 'BIGINT'"), "{columns}");
+    assert!(columns.contains("'score': 'DOUBLE'"), "{columns}");
+    assert!(columns.contains("'active': 'BOOLEAN'"), "{columns}");
+    assert!(columns.contains("'name': 'TEXT'"), "{columns}");
+
+    let prompt = row.get::<_, String>("Prompt");
+    assert!(prompt.starts_with("FROM read_csv("), "{prompt}");
+
+    let rows = client
+        .query(&format!("SELECT * {prompt} ORDER BY id"), &[])
+        .await
+        .expect("sniff_csv prompt can be queried");
+    let values: Vec<(String, String, String, String)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, String>(1),
+                row.get::<_, String>(2),
+                row.get::<_, String>(3),
+            )
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            (
+                "1".to_string(),
+                "9.5".to_string(),
+                "true".to_string(),
+                "Ada".to_string(),
+            ),
+            (
+                "2".to_string(),
+                "10".to_string(),
+                "false".to_string(),
+                "Grace".to_string(),
+            ),
         ]
     );
 

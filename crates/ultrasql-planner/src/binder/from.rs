@@ -207,9 +207,10 @@ fn bind_table_function(
             )
         }
         "read_csv" => bind_read_csv_table_function(&bound_args, &qualifier)?,
+        "sniff_csv" => bind_sniff_csv_table_function(&bound_args, &qualifier)?,
         _ => {
             return Err(PlanError::NotSupported(
-                "table function (only generate_series, unnest, and read_csv supported)",
+                "table function (only generate_series, unnest, read_csv, and sniff_csv supported)",
             ));
         }
     };
@@ -247,6 +248,51 @@ fn bind_read_csv_table_function(
         .collect::<Vec<_>>();
     let schema = Schema::new(fields.clone())
         .map_err(|err| PlanError::TypeMismatch(format!("read_csv schema: {err}")))?;
+    let from_scope = fields
+        .into_iter()
+        .enumerate()
+        .map(|(field_index, field)| ScopeEntry {
+            qualifier: qualifier.to_owned(),
+            field_index,
+            field,
+        })
+        .collect();
+    Ok((schema, from_scope))
+}
+
+fn bind_sniff_csv_table_function(
+    bound_args: &[ScalarExpr],
+    qualifier: &str,
+) -> Result<(Schema, Vec<ScopeEntry>), PlanError> {
+    if bound_args.len() != 1 {
+        return Err(PlanError::NotSupported(
+            "sniff_csv: expected one path argument",
+        ));
+    }
+    let ScalarExpr::Literal {
+        value: Value::Text(_),
+        ..
+    } = &bound_args[0]
+    else {
+        return Err(PlanError::TypeMismatch(
+            "sniff_csv: path argument must be a string literal".to_owned(),
+        ));
+    };
+    let fields = vec![
+        Field::nullable("Delimiter", DataType::Text { max_len: None }),
+        Field::nullable("Quote", DataType::Text { max_len: None }),
+        Field::nullable("Escape", DataType::Text { max_len: None }),
+        Field::nullable("NewLineDelimiter", DataType::Text { max_len: None }),
+        Field::required("SkipRows", DataType::Int64),
+        Field::required("HasHeader", DataType::Bool),
+        Field::nullable("Columns", DataType::Text { max_len: None }),
+        Field::nullable("DateFormat", DataType::Text { max_len: None }),
+        Field::nullable("TimestampFormat", DataType::Text { max_len: None }),
+        Field::nullable("UserArguments", DataType::Text { max_len: None }),
+        Field::nullable("Prompt", DataType::Text { max_len: None }),
+    ];
+    let schema = Schema::new(fields.clone())
+        .map_err(|err| PlanError::TypeMismatch(format!("sniff_csv schema: {err}")))?;
     let from_scope = fields
         .into_iter()
         .enumerate()
