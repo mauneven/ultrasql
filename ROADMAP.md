@@ -1730,6 +1730,66 @@ Every standard PostgreSQL driver and ORM works without modification.
   and catalog-backed pg_relation_size() are wired.
 - [x] Sequence: nextval(), currval(), lastval(), setval() (Simple Query path; Extended Query expression-function dispatch remains broader function-work)
 
+### Vector Search / RAG Readiness
+
+Audit status: no SQL embedding-vector type exists today. `DataType` has
+numeric, JSONB, range, geometry, array, record, and NULL variants, but no
+`Vector(n)` variant; `Value` likewise has no vector payload. Existing
+`ultrasql-vec` work is SIMD/vectorized query execution, not pgvector-style
+embedding search. `LogicalIndexMethod` accepts `btree`, `hash`, `gin`,
+`gist`, and `brin`; no `hnsw` or `ivfflat` access method exists. The
+compatibility target for this slice is the
+[pgvector](https://github.com/pgvector/pgvector) SQL surface:
+`vector(n)`, distance operators, exact `ORDER BY distance LIMIT k`, and
+HNSW/IVFFlat index methods.
+
+- [ ] **Vector type slice** — add `VECTOR(n)`/`vector(n)` parser and
+  binder support; add `DataType::Vector { dims }` and `Value::Vector`
+  with finite-only `f32` elements and a fixed dimension; implement text
+  casts from `[1,2,3]`, row-codec storage, WAL/recovery, COPY text/CSV
+  and binary COPY, PostgreSQL wire OID/format mapping, catalog bootstrap,
+  and round-trip/property tests for dimension mismatch, NULL, finite-only
+  rejection, persistence, and restart.
+- [ ] **Vector operators slice** — add parser/binder/eval support for
+  pgvector-style distance operators `<->` (L2), `<#>` (negative inner
+  product), `<=>` (cosine), and `<+>` (L1), plus vector arithmetic
+  `+`, `-`, `*`, and `||`; add functions `l2_distance`,
+  `inner_product`, `cosine_distance`, `l1_distance`, `l2_norm`,
+  `l2_normalize`, `subvector`, `sum(vector)`, and `avg(vector)`.
+  Tests must pin NULL semantics, dimension mismatch errors, cosine
+  zero-vector rejection, ordering stability, and scalar reference parity.
+- [ ] **Vector execution slice** — add exact nearest-neighbor lowering for
+  `ORDER BY embedding <op> $query LIMIT k` over heap scans; implement
+  SIMD kernels in `ultrasql-vec` for L2, cosine, inner product, and L1
+  over `f32` slices; add a top-k heap/select algorithm that avoids full
+  sort for small `k`; preserve metadata filters by applying scalar
+  predicates before or during distance evaluation; expose plan shape in
+  `EXPLAIN` / `EXPLAIN ANALYZE`.
+- [ ] **ANN index slice** — add planner/parser/catalog support for
+  `CREATE INDEX ... USING hnsw (embedding vector_l2_ops)` and
+  `CREATE INDEX ... USING ivfflat (embedding vector_l2_ops)` plus cosine
+  and inner-product opclasses; implement page-backed HNSW and IVFFlat
+  storage with WAL, recovery, VACUUM/delete handling, CREATE INDEX
+  CONCURRENTLY behaviour, filtered-query fallback/iterative scan policy,
+  tunables (`m`, `ef_construction`, `ef_search`, `lists`, `probes`), and
+  recall-vs-latency tests against exact scan.
+- [ ] **RAG primitives slice** — keep model execution outside the database,
+  but provide DB-native retrieval building blocks: vector + JSONB metadata
+  filtering, vector + full-text hybrid search, reciprocal-rank-fusion SQL
+  helper, chunk/document schema examples in docs, rerank-friendly CTE
+  patterns, and transactionally safe bulk embedding load through COPY.
+  This slice is blocked until vector type/operators/execution plus JSONB
+  and TSVECTOR/TSQUERY surfaces are end-to-end.
+- [ ] **Vector benchmark certification slice** — add
+  `benchmarks/vector_certify.sh` and raw JSON artifacts for exact scan,
+  filtered exact scan, HNSW, IVFFlat, bulk load, index build, update/delete
+  maintenance, WAL recovery, and hybrid RAG query shapes. Certification
+  must compare UltraSQL against PostgreSQL + pgvector on the same host and
+  report recall@k, p50/p95/p99 latency, throughput, index size, build
+  time, memory, and restart correctness. No v1.0 vector claim is allowed
+  without committed scripts, datasets or dataset fetch instructions, host
+  descriptor, and raw artifacts.
+
 ### Security
 - [ ] `CREATE ROLE / USER`, `ALTER ROLE`, `DROP ROLE`
 - [ ] `GRANT / REVOKE` on tables, schemas, databases, sequences, functions
@@ -1783,6 +1843,9 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [ ] TPC-H scale 1: throughput ≥ 2× PostgreSQL 17
 - [ ] TPC-H scale 10: throughput ≥ 2× DuckDB
 - [ ] Sysbench OLTP read/write: throughput ≥ 2× PostgreSQL
+- [ ] Vector/RAG certification: exact kNN, HNSW, IVFFlat, filtered ANN,
+  hybrid text+vector retrieval, and bulk embedding load certified against
+  PostgreSQL + pgvector with committed recall/latency/build-size artifacts
 
 ### Production Validation
 - [ ] Three independent operators run UltraSQL for 30 days and report
