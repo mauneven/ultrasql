@@ -157,6 +157,21 @@ fn postfix_cast_vector_with_modifier() {
 }
 
 #[test]
+fn postfix_cast_vector_family_with_modifier() {
+    for (sql, expected) in [
+        ("'[1,2,3]'::HALFVEC(3)", "halfvec(3)"),
+        ("'{1:1}/5'::SPARSEVEC(5)", "sparsevec(5)"),
+        ("'1010'::BITVEC(4)", "bitvec(4)"),
+    ] {
+        let expr = parse_expr(sql);
+        let Expr::PostfixCast { target, .. } = expr else {
+            panic!("expected postfix cast for {sql}")
+        };
+        assert_eq!(target.value, expected);
+    }
+}
+
+#[test]
 fn postfix_cast_chain() {
     // x::text::varchar — two successive casts.
     let expr = parse_expr("x::text::varchar");

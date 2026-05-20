@@ -231,6 +231,9 @@ const DT_RANGE: u8 = 0x12;
 const DT_GEOMETRY: u8 = 0x13;
 const DT_ARRAY: u8 = 0x14;
 const DT_VECTOR: u8 = 0x15;
+const DT_HALFVEC: u8 = 0x16;
+const DT_SPARSEVEC: u8 = 0x17;
+const DT_BITVEC: u8 = 0x18;
 
 fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError> {
     match ty {
@@ -259,6 +262,18 @@ fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError
         DataType::Jsonb => w.u8(DT_JSONB),
         DataType::Vector { dims } => {
             w.u8(DT_VECTOR);
+            w.opt_u32(*dims);
+        }
+        DataType::HalfVec { dims } => {
+            w.u8(DT_HALFVEC);
+            w.opt_u32(*dims);
+        }
+        DataType::SparseVec { dims } => {
+            w.u8(DT_SPARSEVEC);
+            w.opt_u32(*dims);
+        }
+        DataType::BitVec { dims } => {
+            w.u8(DT_BITVEC);
             w.opt_u32(*dims);
         }
         DataType::Null => w.u8(DT_NULL),
@@ -310,6 +325,9 @@ fn decode_data_type(r: &mut Reader<'_>) -> Result<DataType, DecodeError> {
         DT_UUID => DataType::Uuid,
         DT_JSONB => DataType::Jsonb,
         DT_VECTOR => DataType::Vector { dims: r.opt_u32()? },
+        DT_HALFVEC => DataType::HalfVec { dims: r.opt_u32()? },
+        DT_SPARSEVEC => DataType::SparseVec { dims: r.opt_u32()? },
+        DT_BITVEC => DataType::BitVec { dims: r.opt_u32()? },
         DT_NULL => DataType::Null,
         DT_RANGE => DataType::Range(decode_range_type(r.u8()?)?),
         DT_GEOMETRY => DataType::Geometry(decode_geometry_type(r.u8()?)?),
@@ -899,6 +917,12 @@ mod tests {
             },
             DataType::Vector { dims: Some(1536) },
             DataType::Vector { dims: None },
+            DataType::HalfVec { dims: Some(1536) },
+            DataType::HalfVec { dims: None },
+            DataType::SparseVec { dims: Some(1536) },
+            DataType::SparseVec { dims: None },
+            DataType::BitVec { dims: Some(512) },
+            DataType::BitVec { dims: None },
             DataType::Text { max_len: None },
             DataType::Text {
                 max_len: Some(1024),

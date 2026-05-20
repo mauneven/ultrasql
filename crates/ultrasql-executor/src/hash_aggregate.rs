@@ -61,7 +61,7 @@ impl PartialEq for KeyValue {
         match (&self.0, &other.0) {
             (Value::Float32(a), Value::Float32(b)) => a.to_bits() == b.to_bits(),
             (Value::Float64(a), Value::Float64(b)) => a.to_bits() == b.to_bits(),
-            (Value::Vector(a), Value::Vector(b)) => {
+            (Value::Vector(a), Value::Vector(b)) | (Value::HalfVec(a), Value::HalfVec(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(l, r)| l.to_bits() == r.to_bits())
             }
             _ => self.0 == other.0,
@@ -160,11 +160,20 @@ fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
             element_type.hash(state);
             elements.hash(state);
         }
-        Value::Vector(values) => {
+        Value::Vector(values) | Value::HalfVec(values) => {
             state.write_u8(19);
             for value in values {
                 value.to_bits().hash(state);
             }
+        }
+        Value::SparseVec(value) => {
+            state.write_u8(20);
+            value.hash(state);
+        }
+        Value::BitVec { dims, bytes } => {
+            state.write_u8(21);
+            dims.hash(state);
+            bytes.hash(state);
         }
     }
 }

@@ -406,6 +406,41 @@ impl RowCodec {
                 (DataType::Vector { dims }, Value::Vector(values)) => {
                     encode_vector_payload(&mut payload, values, *dims, col_idx, &field.data_type)?;
                 }
+                (DataType::HalfVec { dims }, Value::HalfVec(values)) => {
+                    encode_dense_vector_family_text(
+                        &mut payload,
+                        value,
+                        values,
+                        *dims,
+                        col_idx,
+                        &field.data_type,
+                    )?;
+                }
+                (DataType::SparseVec { dims }, Value::SparseVec(values)) => {
+                    encode_dimensioned_value_text(
+                        &mut payload,
+                        value,
+                        values.dims,
+                        *dims,
+                        col_idx,
+                        &field.data_type,
+                    )?;
+                }
+                (
+                    DataType::BitVec { dims },
+                    Value::BitVec {
+                        dims: actual_dims, ..
+                    },
+                ) => {
+                    encode_dimensioned_value_text(
+                        &mut payload,
+                        value,
+                        *actual_dims,
+                        *dims,
+                        col_idx,
+                        &field.data_type,
+                    )?;
+                }
                 (DataType::Array(expected), Value::Array { element_type, .. })
                     if expected.as_ref() == element_type =>
                 {
@@ -734,6 +769,33 @@ impl RowCodec {
                 }
                 DataType::Vector { dims } => {
                     decode_vector_value(bytes, &mut cursor, *dims, col_idx, &field.data_type)?
+                }
+                DataType::HalfVec { dims } => {
+                    let s = decode_varlena_text(bytes, &mut cursor, "halfvec column")?;
+                    decode_text_vector_family_value(
+                        Value::parse_halfvec(&s),
+                        *dims,
+                        col_idx,
+                        &field.data_type,
+                    )?
+                }
+                DataType::SparseVec { dims } => {
+                    let s = decode_varlena_text(bytes, &mut cursor, "sparsevec column")?;
+                    decode_text_vector_family_value(
+                        Value::parse_sparsevec(&s),
+                        *dims,
+                        col_idx,
+                        &field.data_type,
+                    )?
+                }
+                DataType::BitVec { dims } => {
+                    let s = decode_varlena_text(bytes, &mut cursor, "bitvec column")?;
+                    decode_text_vector_family_value(
+                        Value::parse_bitvec(&s),
+                        *dims,
+                        col_idx,
+                        &field.data_type,
+                    )?
                 }
                 DataType::Array(element_type) => {
                     let s = decode_varlena_text(bytes, &mut cursor, "array column")?;
@@ -1084,7 +1146,10 @@ impl RowCodec {
                     | DataType::Jsonb
                     | DataType::Range(_)
                     | DataType::Geometry(_)
-                    | DataType::Array(_),
+                    | DataType::Array(_)
+                    | DataType::HalfVec { .. }
+                    | DataType::SparseVec { .. }
+                    | DataType::BitVec { .. },
                     ColumnBuilder::Utf8 {
                         offsets,
                         values,
@@ -1321,6 +1386,9 @@ impl ColumnBuilder {
             DataType::Text { .. }
             | DataType::Jsonb
             | DataType::Vector { .. }
+            | DataType::HalfVec { .. }
+            | DataType::SparseVec { .. }
+            | DataType::BitVec { .. }
             | DataType::Range(_)
             | DataType::Geometry(_)
             | DataType::Array(_)
@@ -1473,6 +1541,9 @@ const fn is_supported_type(ty: &DataType) -> bool {
             | DataType::Text { .. }
             | DataType::Jsonb
             | DataType::Vector { .. }
+            | DataType::HalfVec { .. }
+            | DataType::SparseVec { .. }
+            | DataType::BitVec { .. }
             | DataType::Date
             | DataType::Time
             | DataType::Timestamp
@@ -1514,6 +1585,89 @@ fn encode_vector_payload(
         payload.extend_from_slice(&value.to_le_bytes());
     }
     Ok(())
+}
+
+fn encode_dense_vector_family_text(
+    payload: &mut Vec<u8>,
+    value: &Value,
+    values: &[f32],
+    expected_dims: Option<u32>,
+    column: usize,
+    ty: &DataType,
+) -> Result<(), RowCodecError> {
+    let actual_dims = u32::try_from(values.len()).map_err(|_| RowCodecError::UnsupportedType {
+        column,
+        ty: ty.clone(),
+    })?;
+    if actual_dims == 0
+        || actual_dims > MAX_VECTOR_DIMS
+        || expected_dims.is_some_and(|dims| dims != actual_dims)
+        || values.iter().any(|value| !value.is_finite())
+    {
+        return Err(RowCodecError::Type {
+            column,
+            expected: ty.clone(),
+            got: format!("{}({actual_dims})", ty_name_for_dimension_error(ty)),
+        });
+    }
+    encode_varlena_text(payload, &value.to_string(), column, ty)
+}
+
+fn encode_dimensioned_value_text(
+    payload: &mut Vec<u8>,
+    value: &Value,
+    actual_dims: u32,
+    expected_dims: Option<u32>,
+    column: usize,
+    ty: &DataType,
+) -> Result<(), RowCodecError> {
+    if actual_dims == 0
+        || actual_dims > MAX_VECTOR_DIMS
+        || expected_dims.is_some_and(|dims| dims != actual_dims)
+    {
+        return Err(RowCodecError::Type {
+            column,
+            expected: ty.clone(),
+            got: format!("{}({actual_dims})", ty_name_for_dimension_error(ty)),
+        });
+    }
+    encode_varlena_text(payload, &value.to_string(), column, ty)
+}
+
+fn decode_text_vector_family_value(
+    parsed: Option<Value>,
+    expected_dims: Option<u32>,
+    column: usize,
+    ty: &DataType,
+) -> Result<Value, RowCodecError> {
+    let value = parsed.ok_or_else(|| RowCodecError::Type {
+        column,
+        expected: ty.clone(),
+        got: format!("invalid {ty} literal"),
+    })?;
+    let actual_dims = value.data_type().vector_dims().flatten();
+    if actual_dims.is_none_or(|dims| {
+        dims == 0
+            || dims > MAX_VECTOR_DIMS
+            || expected_dims.is_some_and(|expected| expected != dims)
+    }) {
+        return Err(RowCodecError::Type {
+            column,
+            expected: ty.clone(),
+            got: value.data_type().to_string(),
+        });
+    }
+    Ok(value)
+}
+
+const fn ty_name_for_dimension_error(ty: &DataType) -> &'static str {
+    match ty {
+        DataType::Vector { .. } => "vector",
+        DataType::HalfVec { .. } => "halfvec",
+        DataType::SparseVec { .. } => "sparsevec",
+        DataType::BitVec { .. } => "bitvec",
+        _ => "value",
+    }
 }
 
 fn decode_vector_value(
@@ -1682,7 +1836,7 @@ pub enum RowCodecError {
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use ultrasql_core::{DataType, Field, Schema, Value};
+    use ultrasql_core::{DataType, Field, Schema, SparseVector, Value};
 
     use super::{ColumnBuilder, RowCodec, RowCodecError, VECTOR_DIMS_WIDTH, VECTOR_ELEMENT_WIDTH};
     use ultrasql_vec::column::Column;
@@ -1889,6 +2043,52 @@ mod tests {
             .decode(&encoded)
             .expect_err("non-finite vector payload");
         assert!(matches!(err, RowCodecError::Type { column: 0, .. }));
+    }
+
+    #[test]
+    fn round_trip_vector_family_values() {
+        let schema = Schema::new([
+            Field::required("h", DataType::HalfVec { dims: Some(3) }),
+            Field::required("s", DataType::SparseVec { dims: Some(5) }),
+            Field::required("b", DataType::BitVec { dims: Some(6) }),
+        ])
+        .unwrap();
+        let codec = RowCodec::new(schema);
+        let row = vec![
+            Value::HalfVec(vec![1.0, 2.5, -3.0]),
+            Value::SparseVec(SparseVector::new(5, vec![(1, 1.0), (3, 2.5)]).unwrap()),
+            Value::BitVec {
+                dims: 6,
+                bytes: vec![0b1010_0100],
+            },
+        ];
+        assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
+    }
+
+    #[test]
+    fn vector_family_encode_rejects_wrong_dimension() {
+        for (data_type, value) in [
+            (
+                DataType::HalfVec { dims: Some(3) },
+                Value::HalfVec(vec![1.0, 2.0]),
+            ),
+            (
+                DataType::SparseVec { dims: Some(5) },
+                Value::SparseVec(SparseVector::new(4, vec![(1, 1.0)]).unwrap()),
+            ),
+            (
+                DataType::BitVec { dims: Some(8) },
+                Value::BitVec {
+                    dims: 7,
+                    bytes: vec![0b1010_1010],
+                },
+            ),
+        ] {
+            let schema = Schema::new([Field::required("v", data_type)]).unwrap();
+            let codec = RowCodec::new(schema);
+            let err = codec.encode(&[value]).expect_err("dimension mismatch");
+            assert!(matches!(err, RowCodecError::Type { column: 0, .. }));
+        }
     }
 
     #[test]

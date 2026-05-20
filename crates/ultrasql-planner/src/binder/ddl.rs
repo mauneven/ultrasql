@@ -797,25 +797,12 @@ fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
             max_len: max_len_modifier(),
         }),
         "json" | "jsonb" => Ok(DataType::Jsonb),
-        "vector" => {
-            if t.type_modifiers.len() > 1 {
-                return Err(PlanError::TypeMismatch(
-                    "VECTOR accepts at most one dimension modifier".to_owned(),
-                ));
-            }
-            let dims = t.type_modifiers.first().copied();
-            if matches!(dims, Some(0)) {
-                return Err(PlanError::TypeMismatch(
-                    "VECTOR dimension must be at least 1".to_owned(),
-                ));
-            }
-            if matches!(dims, Some(n) if n > MAX_VECTOR_DIMS) {
-                return Err(PlanError::TypeMismatch(format!(
-                    "VECTOR dimension must be at most {MAX_VECTOR_DIMS}"
-                )));
-            }
-            Ok(DataType::Vector { dims })
+        "vector" => resolve_vector_family_type("VECTOR", t, |dims| DataType::Vector { dims }),
+        "halfvec" => resolve_vector_family_type("HALFVEC", t, |dims| DataType::HalfVec { dims }),
+        "sparsevec" => {
+            resolve_vector_family_type("SPARSEVEC", t, |dims| DataType::SparseVec { dims })
         }
+        "bitvec" => resolve_vector_family_type("BITVEC", t, |dims| DataType::BitVec { dims }),
         "bytea" => Ok(DataType::Bytea),
         // `DATE` columns are encoded by the row codec as 4-byte
         // little-endian i32 days since 2000-01-01 (see
@@ -857,6 +844,30 @@ fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
             "CREATE TABLE: column type not implemented in v0.5",
         )),
     }
+}
+
+fn resolve_vector_family_type(
+    sql_name: &str,
+    t: &TypeName,
+    build: fn(Option<u32>) -> DataType,
+) -> Result<DataType, PlanError> {
+    if t.type_modifiers.len() > 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "{sql_name} accepts at most one dimension modifier"
+        )));
+    }
+    let dims = t.type_modifiers.first().copied();
+    if matches!(dims, Some(0)) {
+        return Err(PlanError::TypeMismatch(format!(
+            "{sql_name} dimension must be at least 1"
+        )));
+    }
+    if matches!(dims, Some(n) if n > MAX_VECTOR_DIMS) {
+        return Err(PlanError::TypeMismatch(format!(
+            "{sql_name} dimension must be at most {MAX_VECTOR_DIMS}"
+        )));
+    }
+    Ok(build(dims))
 }
 
 /// Determine whether a column is nullable from its constraint list.

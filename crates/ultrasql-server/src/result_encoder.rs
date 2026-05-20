@@ -507,20 +507,53 @@ pub(crate) fn encode_text_value_typed(
             .to_string()
             .into(),
         ),
-        (DataType::Vector { dims }, Column::Utf8(_) | Column::DictionaryUtf8(_)) => col
+        (ty, Column::Utf8(_) | Column::DictionaryUtf8(_)) if ty.is_vector_family() => col
             .text_value(row)
-            .map(|text| encode_vector_text_value(text, *dims)),
+            .map(|text| encode_vector_family_text_value(text, ty)),
         _ => encode_text_value(col, row),
     }
 }
 
-fn encode_vector_text_value(text: &str, expected_dims: Option<u32>) -> Vec<u8> {
-    if let Some(Value::Vector(values)) = Value::parse_vector(text)
-        && expected_dims.is_none_or(|dims| u32::try_from(values.len()).ok() == Some(dims))
+fn encode_vector_family_text_value(text: &str, expected_type: &DataType) -> Vec<u8> {
+    let parsed = match expected_type {
+        DataType::Vector { .. } => Value::parse_vector(text),
+        DataType::HalfVec { .. } => Value::parse_halfvec(text),
+        DataType::SparseVec { .. } => Value::parse_sparsevec(text),
+        DataType::BitVec { .. } => Value::parse_bitvec(text),
+        _ => None,
+    };
+    if let Some(value) = parsed
+        && vector_family_value_matches(expected_type, &value)
     {
-        return Value::Vector(values).to_string().into_bytes();
+        return value.to_string().into_bytes();
     }
     text.as_bytes().to_vec()
+}
+
+fn vector_family_value_matches(expected: &DataType, value: &Value) -> bool {
+    let actual = value.data_type();
+    vector_family_kind(expected) == vector_family_kind(&actual)
+        && dims_compatible(
+            expected.vector_dims().flatten(),
+            actual.vector_dims().flatten(),
+        )
+}
+
+fn vector_family_kind(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::Vector { .. } => Some(0),
+        DataType::HalfVec { .. } => Some(1),
+        DataType::SparseVec { .. } => Some(2),
+        DataType::BitVec { .. } => Some(3),
+        _ => None,
+    }
+}
+
+const fn dims_compatible(left: Option<u32>, right: Option<u32>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 fn schema_is_int32_pair(schema: &Schema) -> bool {

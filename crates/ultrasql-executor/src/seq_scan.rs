@@ -1031,6 +1031,9 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
             DataType::Text { .. }
             | DataType::Jsonb
             | DataType::Vector { .. }
+            | DataType::HalfVec { .. }
+            | DataType::SparseVec { .. }
+            | DataType::BitVec { .. }
             | DataType::Range(_)
             | DataType::Geometry(_)
             | DataType::Array(_)
@@ -1043,6 +1046,12 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                         (DataType::Jsonb, Value::Jsonb(s)) => strings.push(Some(s.clone())),
                         (DataType::Vector { dims }, Value::Vector(values))
                             if dims.is_none() || u32::try_from(values.len()).ok() == *dims =>
+                        {
+                            strings.push(Some(row[col_idx].to_string()));
+                        }
+                        (expected, value)
+                            if expected.is_vector_family()
+                                && vector_family_value_matches(expected, value) =>
                         {
                             strings.push(Some(row[col_idx].to_string()));
                         }
@@ -1155,6 +1164,32 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
     }
 
     Batch::new(columns).map_err(ExecError::from)
+}
+
+fn vector_family_value_matches(expected: &DataType, value: &Value) -> bool {
+    let actual = value.data_type();
+    vector_family_kind(expected) == vector_family_kind(&actual)
+        && dims_compatible(
+            expected.vector_dims().flatten(),
+            actual.vector_dims().flatten(),
+        )
+}
+
+fn vector_family_kind(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::Vector { .. } => Some(0),
+        DataType::HalfVec { .. } => Some(1),
+        DataType::SparseVec { .. } => Some(2),
+        DataType::BitVec { .. } => Some(3),
+        _ => None,
+    }
+}
+
+const fn dims_compatible(left: Option<u32>, right: Option<u32>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 // ---------------------------------------------------------------------------

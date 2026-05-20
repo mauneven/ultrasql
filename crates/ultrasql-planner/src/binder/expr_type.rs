@@ -215,18 +215,34 @@ pub(super) fn comparable(a: &DataType, b: &DataType) -> bool {
 }
 
 const fn is_vector_comparison_operand(left: &DataType, right: &DataType) -> bool {
-    matches!(left, DataType::Vector { .. }) || matches!(right, DataType::Vector { .. })
+    left.is_vector_family() || right.is_vector_family()
 }
 
 fn vector_operands_compatible(left: &DataType, right: &DataType) -> bool {
     match (left, right) {
-        (DataType::Null, DataType::Vector { .. }) | (DataType::Vector { .. }, DataType::Null) => {
-            true
-        }
-        (DataType::Vector { dims: left_dims }, DataType::Vector { dims: right_dims }) => {
-            left_dims.is_none() || right_dims.is_none() || left_dims == right_dims
+        (DataType::Null, right) | (right, DataType::Null) if right.is_vector_family() => true,
+        (left, right) if left.is_vector_family() && right.is_vector_family() => {
+            vector_family_kind(left) == vector_family_kind(right)
+                && dims_compatible(left.vector_dims().flatten(), right.vector_dims().flatten())
         }
         _ => false,
+    }
+}
+
+fn vector_family_kind(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::Vector { .. } => Some(0),
+        DataType::HalfVec { .. } => Some(1),
+        DataType::SparseVec { .. } => Some(2),
+        DataType::BitVec { .. } => Some(3),
+        _ => None,
+    }
+}
+
+const fn dims_compatible(left: Option<u32>, right: Option<u32>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
     }
 }
 

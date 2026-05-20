@@ -631,6 +631,9 @@ fn build_empty_batch(schema: &Schema) -> Result<Batch, ExecError> {
             DataType::Text { .. }
             | DataType::Jsonb
             | DataType::Vector { .. }
+            | DataType::HalfVec { .. }
+            | DataType::SparseVec { .. }
+            | DataType::BitVec { .. }
             | DataType::Range(_)
             | DataType::Geometry(_)
             | DataType::Array(_) => Column::Utf8(StringColumn::from_data(vec![])),
@@ -784,6 +787,19 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                             }
                             row.push(vector);
                         }
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), ty) if ty.is_vector_family() => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => row.push(parse_vector_family_text_cell(
+                            v,
+                            ty,
+                            col_idx,
+                            field.name.as_str(),
+                        )?),
                         None => row.push(Value::Null),
                     }
                 }
@@ -947,6 +963,56 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
     }
 
     Ok(rows)
+}
+
+fn parse_vector_family_text_cell(
+    text: &str,
+    expected_type: &DataType,
+    col_idx: usize,
+    name: &str,
+) -> Result<Value, ExecError> {
+    let value = match expected_type {
+        DataType::Vector { .. } => Value::parse_vector(text),
+        DataType::HalfVec { .. } => Value::parse_halfvec(text),
+        DataType::SparseVec { .. } => Value::parse_sparsevec(text),
+        DataType::BitVec { .. } => Value::parse_bitvec(text),
+        _ => None,
+    }
+    .ok_or_else(|| {
+        ExecError::TypeMismatch(format!(
+            "column {col_idx} ({name}): invalid {expected_type} literal"
+        ))
+    })?;
+    let actual = value.data_type();
+    if vector_family_kind(expected_type) == vector_family_kind(&actual)
+        && dims_compatible(
+            expected_type.vector_dims().flatten(),
+            actual.vector_dims().flatten(),
+        )
+    {
+        Ok(value)
+    } else {
+        Err(ExecError::TypeMismatch(format!(
+            "column {col_idx} ({name}): invalid {expected_type} dimension"
+        )))
+    }
+}
+
+fn vector_family_kind(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::Vector { .. } => Some(0),
+        DataType::HalfVec { .. } => Some(1),
+        DataType::SparseVec { .. } => Some(2),
+        DataType::BitVec { .. } => Some(3),
+        _ => None,
+    }
+}
+
+const fn dims_compatible(left: Option<u32>, right: Option<u32>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -435,6 +435,12 @@ fn bind_cast_expr(
     if cast_result_matches(&target_type, &actual_type) || matches!(actual_type, DataType::Null) {
         return Ok(bound);
     }
+    if target_type.is_vector_family() {
+        return Err(PlanError::TypeMismatch(format!(
+            "cannot cast {} to {target_type}",
+            actual_type
+        )));
+    }
     Err(PlanError::NotSupported(
         "non-literal CAST expressions are not implemented",
     ))
@@ -601,8 +607,8 @@ pub(super) fn bind_literal(lit: &Literal) -> ScalarExpr {
 /// queries upstream of the executor.
 fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> ScalarExpr {
     let type_name = type_name.to_ascii_lowercase();
-    if let Some(dims) = parse_vector_type_name(&type_name) {
-        return bind_vector_literal(value, dims);
+    if let Some(target) = parse_vector_family_type_name(&type_name) {
+        return bind_vector_family_literal(value, target);
     }
     match type_name.as_str() {
         "date" => match parse_date_literal(value) {
@@ -654,26 +660,30 @@ fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> Scala
     }
 }
 
-fn bind_vector_literal(value: &str, declared_dims: Option<u32>) -> ScalarExpr {
-    let declared_type = DataType::Vector {
-        dims: declared_dims,
+fn bind_vector_family_literal(value: &str, declared_type: DataType) -> ScalarExpr {
+    let parsed = match declared_type {
+        DataType::Vector { .. } => Value::parse_vector(value),
+        DataType::HalfVec { .. } => Value::parse_halfvec(value),
+        DataType::SparseVec { .. } => Value::parse_sparsevec(value),
+        DataType::BitVec { .. } => Value::parse_bitvec(value),
+        _ => None,
     };
-    let Some(Value::Vector(values)) = Value::parse_vector(value) else {
+    let Some(parsed) = parsed else {
         return ScalarExpr::Literal {
             value: Value::Null,
             data_type: declared_type,
         };
     };
-    let actual_dims = u32::try_from(values.len()).ok();
-    if declared_dims.is_some() && declared_dims != actual_dims {
+    let actual_type = parsed.data_type();
+    if !vector_family_cast_matches(&declared_type, &actual_type) {
         return ScalarExpr::Literal {
             value: Value::Null,
             data_type: declared_type,
         };
     }
     ScalarExpr::Literal {
-        value: Value::Vector(values),
-        data_type: DataType::Vector { dims: actual_dims },
+        value: parsed,
+        data_type: actual_type,
     }
 }
 
@@ -1314,14 +1324,12 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                 *data_type = DataType::Geometry(*geometry_type);
             }
         }
-        (DataType::Vector { dims }, Value::Text(text)) => {
-            if let Some(parsed) = Value::parse_vector(text) {
-                if let Value::Vector(values) = &parsed {
-                    let actual_dims = u32::try_from(values.len()).ok();
-                    if dims.is_none() || actual_dims == *dims {
-                        *value = parsed;
-                        *data_type = DataType::Vector { dims: actual_dims };
-                    }
+        (target, Value::Text(text)) if target.is_vector_family() => {
+            if let Some(parsed) = parse_vector_family_value(target, text) {
+                let actual_type = parsed.data_type();
+                if vector_family_cast_matches(target, &actual_type) {
+                    *value = parsed;
+                    *data_type = actual_type;
                 }
             }
         }
@@ -1347,8 +1355,8 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
 
 fn resolve_cast_type(type_name: &str) -> Option<DataType> {
     let type_name = type_name.to_ascii_lowercase();
-    if let Some(dims) = parse_vector_type_name(&type_name) {
-        return Some(DataType::Vector { dims });
+    if let Some(data_type) = parse_vector_family_type_name(&type_name) {
+        return Some(data_type);
     }
     match type_name.as_str() {
         "int" | "integer" | "int4" => Some(DataType::Int32),
@@ -1387,18 +1395,69 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
     }
 }
 
-fn parse_vector_type_name(type_name: &str) -> Option<Option<u32>> {
-    if type_name == "vector" {
-        return Some(None);
+fn parse_vector_family_type_name(type_name: &str) -> Option<DataType> {
+    for base in ["vector", "halfvec", "sparsevec", "bitvec"] {
+        if type_name == base {
+            return build_vector_family_type(base, None);
+        }
+        if let Some(dim_text) = type_name
+            .strip_prefix(base)
+            .and_then(|rest| rest.strip_prefix('('))
+            .and_then(|rest| rest.strip_suffix(')'))
+        {
+            let dims: u32 = dim_text.parse().ok()?;
+            if dims == 0 || dims > MAX_VECTOR_DIMS {
+                return None;
+            }
+            return build_vector_family_type(base, Some(dims));
+        }
     }
-    let dim_text = type_name
-        .strip_prefix("vector(")
-        .and_then(|rest| rest.strip_suffix(')'))?;
-    let dims: u32 = dim_text.parse().ok()?;
-    if dims == 0 || dims > MAX_VECTOR_DIMS {
-        return None;
+    None
+}
+
+fn build_vector_family_type(base: &str, dims: Option<u32>) -> Option<DataType> {
+    match base {
+        "vector" => Some(DataType::Vector { dims }),
+        "halfvec" => Some(DataType::HalfVec { dims }),
+        "sparsevec" => Some(DataType::SparseVec { dims }),
+        "bitvec" => Some(DataType::BitVec { dims }),
+        _ => None,
     }
-    Some(Some(dims))
+}
+
+fn parse_vector_family_value(target: &DataType, text: &str) -> Option<Value> {
+    match target {
+        DataType::Vector { .. } => Value::parse_vector(text),
+        DataType::HalfVec { .. } => Value::parse_halfvec(text),
+        DataType::SparseVec { .. } => Value::parse_sparsevec(text),
+        DataType::BitVec { .. } => Value::parse_bitvec(text),
+        _ => None,
+    }
+}
+
+fn vector_family_cast_matches(target: &DataType, actual: &DataType) -> bool {
+    vector_family_kind(target) == vector_family_kind(actual)
+        && dims_compatible(
+            target.vector_dims().flatten(),
+            actual.vector_dims().flatten(),
+        )
+}
+
+fn vector_family_kind(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::Vector { .. } => Some(0),
+        DataType::HalfVec { .. } => Some(1),
+        DataType::SparseVec { .. } => Some(2),
+        DataType::BitVec { .. } => Some(3),
+        _ => None,
+    }
+}
+
+const fn dims_compatible(left: Option<u32>, right: Option<u32>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    }
 }
 
 fn cast_result_matches(target: &DataType, actual: &DataType) -> bool {
@@ -1410,6 +1469,9 @@ fn cast_result_matches(target: &DataType, actual: &DataType) -> bool {
                 DataType::Vector { dims: Some(_) }
             )
         )
+        || (target.is_vector_family()
+            && actual.is_vector_family()
+            && vector_family_cast_matches(target, actual))
 }
 
 pub(super) fn coerce_literal_to_match(left: &mut ScalarExpr, right: &mut ScalarExpr) {

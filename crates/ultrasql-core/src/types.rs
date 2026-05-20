@@ -158,6 +158,31 @@ pub enum DataType {
         dims: Option<u32>,
     },
 
+    /// pgvector-compatible half-precision embedding vector.
+    ///
+    /// Runtime values are kept as finite `f32` values at expression
+    /// boundaries; storage can choose a narrower binary layout while the
+    /// type system carries the declared dimension.
+    HalfVec {
+        /// Fixed dimension for `halfvec(n)`, or `None` for unconstrained
+        /// `halfvec`.
+        dims: Option<u32>,
+    },
+
+    /// pgvector-compatible sparse embedding vector.
+    SparseVec {
+        /// Fixed dimension for `sparsevec(n)`, or `None` for unconstrained
+        /// `sparsevec`.
+        dims: Option<u32>,
+    },
+
+    /// Dense bit-vector used by pgvector-style binary embeddings.
+    BitVec {
+        /// Fixed dimension for `bitvec(n)`, or `None` for unconstrained
+        /// `bitvec`.
+        dims: Option<u32>,
+    },
+
     /// PostgreSQL range value family.
     Range(RangeType),
 
@@ -246,6 +271,30 @@ impl DataType {
         )
     }
 
+    /// Whether this type is one of the vector-family embedding types.
+    #[must_use]
+    pub const fn is_vector_family(&self) -> bool {
+        matches!(
+            self,
+            Self::Vector { .. }
+                | Self::HalfVec { .. }
+                | Self::SparseVec { .. }
+                | Self::BitVec { .. }
+        )
+    }
+
+    /// Declared vector-family dimension metadata, if this is a vector type.
+    #[must_use]
+    pub const fn vector_dims(&self) -> Option<Option<u32>> {
+        match self {
+            Self::Vector { dims }
+            | Self::HalfVec { dims }
+            | Self::SparseVec { dims }
+            | Self::BitVec { dims } => Some(*dims),
+            _ => None,
+        }
+    }
+
     /// Whether values of this type are stored out-of-line (varlena).
     #[must_use]
     pub const fn is_varlena(&self) -> bool {
@@ -318,6 +367,12 @@ impl fmt::Display for DataType {
             Self::Jsonb => f.write_str("jsonb"),
             Self::Vector { dims: Some(dims) } => write!(f, "vector({dims})"),
             Self::Vector { dims: None } => f.write_str("vector"),
+            Self::HalfVec { dims: Some(dims) } => write!(f, "halfvec({dims})"),
+            Self::HalfVec { dims: None } => f.write_str("halfvec"),
+            Self::SparseVec { dims: Some(dims) } => write!(f, "sparsevec({dims})"),
+            Self::SparseVec { dims: None } => f.write_str("sparsevec"),
+            Self::BitVec { dims: Some(dims) } => write!(f, "bitvec({dims})"),
+            Self::BitVec { dims: None } => f.write_str("bitvec"),
             Self::Range(range_type) => write!(f, "{range_type}"),
             Self::Geometry(geometry_type) => write!(f, "{geometry_type}"),
             Self::Array(inner) => write!(f, "{inner}[]"),
@@ -399,6 +454,22 @@ mod tests {
     fn vector_display_renders_pgvector_style_type_name() {
         assert_eq!(DataType::Vector { dims: Some(3) }.to_string(), "vector(3)");
         assert_eq!(DataType::Vector { dims: None }.to_string(), "vector");
+    }
+
+    #[test]
+    fn vector_family_display_keeps_dimension_metadata() {
+        assert_eq!(
+            DataType::HalfVec { dims: Some(3) }.to_string(),
+            "halfvec(3)"
+        );
+        assert_eq!(DataType::HalfVec { dims: None }.to_string(), "halfvec");
+        assert_eq!(
+            DataType::SparseVec { dims: Some(5) }.to_string(),
+            "sparsevec(5)"
+        );
+        assert_eq!(DataType::SparseVec { dims: None }.to_string(), "sparsevec");
+        assert_eq!(DataType::BitVec { dims: Some(8) }.to_string(), "bitvec(8)");
+        assert_eq!(DataType::BitVec { dims: None }.to_string(), "bitvec");
     }
 
     #[test]

@@ -1317,6 +1317,9 @@ fn value_to_copy_cell_by_value(value: &Value) -> Option<Vec<u8>> {
         | Value::Geometry(_)
         | Value::Jsonb(_)
         | Value::Vector(_)
+        | Value::HalfVec(_)
+        | Value::SparseVec(_)
+        | Value::BitVec { .. }
         | Value::Array { .. } => Some(value.to_string().into_bytes()),
     }
 }
@@ -1373,6 +1376,15 @@ fn decode_copy_cell(
                 "column {column_idx}: invalid {dtype} literal"
             ))),
         },
+        DataType::HalfVec { dims } => {
+            parse_copy_vector_family(Value::parse_halfvec(s), *dims, dtype, column_idx)
+        }
+        DataType::SparseVec { dims } => {
+            parse_copy_vector_family(Value::parse_sparsevec(s), *dims, dtype, column_idx)
+        }
+        DataType::BitVec { dims } => {
+            parse_copy_vector_family(Value::parse_bitvec(s), *dims, dtype, column_idx)
+        }
         DataType::Range(range_type) => ultrasql_core::RangeValue::parse(*range_type, s)
             .map(Value::Range)
             .ok_or_else(|| {
@@ -1386,6 +1398,25 @@ fn decode_copy_cell(
         other => Err(ServerError::CopyFormat(format!(
             "column {column_idx}: unsupported COPY target type {other}"
         ))),
+    }
+}
+
+fn parse_copy_vector_family(
+    parsed: Option<Value>,
+    expected_dims: Option<u32>,
+    dtype: &DataType,
+    column_idx: usize,
+) -> Result<Value, ServerError> {
+    let value = parsed.ok_or_else(|| {
+        ServerError::CopyFormat(format!("column {column_idx}: invalid {dtype} literal"))
+    })?;
+    let actual_dims = value.data_type().vector_dims().flatten();
+    if actual_dims.is_some_and(|dims| expected_dims.is_none_or(|expected| expected == dims)) {
+        Ok(value)
+    } else {
+        Err(ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid {dtype} literal"
+        )))
     }
 }
 

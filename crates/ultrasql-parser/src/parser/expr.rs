@@ -370,8 +370,8 @@ impl<'src> Parser<'src> {
             TokenKind::KwRow => self.parse_row_expr(),
 
             TokenKind::Identifier | TokenKind::QuotedIdentifier => {
-                if self.looks_like_vector_typed_literal()? {
-                    self.parse_vector_typed_literal()
+                if self.looks_like_vector_family_typed_literal()? {
+                    self.parse_vector_family_typed_literal()
                 } else {
                     self.parse_ident_or_call()
                 }
@@ -663,12 +663,13 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn looks_like_vector_typed_literal(&mut self) -> Result<bool, ParseError> {
+    fn looks_like_vector_family_typed_literal(&mut self) -> Result<bool, ParseError> {
         let tok = *self.peek()?;
         if tok.kind != TokenKind::Identifier
-            || !tok
+            || tok
                 .text(self.source)
-                .is_some_and(|text| text.eq_ignore_ascii_case("vector"))
+                .and_then(vector_family_type_base)
+                .is_none()
         {
             return Ok(false);
         }
@@ -684,22 +685,26 @@ impl<'src> Parser<'src> {
         }
     }
 
-    fn parse_vector_typed_literal(&mut self) -> Result<Expr, ParseError> {
-        let vector_tok = self.advance()?;
-        let mut type_name = "vector".to_owned();
-        let mut span_end = vector_tok.span.end;
+    fn parse_vector_family_typed_literal(&mut self) -> Result<Expr, ParseError> {
+        let type_tok = self.advance()?;
+        let base = type_tok
+            .text(self.source)
+            .and_then(vector_family_type_base)
+            .expect("caller checked vector-family typed literal");
+        let mut type_name = base.to_owned();
+        let mut span_end = type_tok.span.end;
         if self.peek()?.kind == TokenKind::LParen {
             self.advance()?; // (
             let dim_tok = self.expect(TokenKind::Integer, "integer vector dimension")?;
             let dim = dim_tok.text(self.source).unwrap_or("");
             let rp = self.expect(TokenKind::RParen, ")")?;
-            type_name = format!("vector({dim})");
+            type_name = format!("{base}({dim})");
             span_end = rp.span.end;
         }
         let str_tok = self.advance()?;
         if !matches!(str_tok.kind, TokenKind::String | TokenKind::EscapedString) {
             return Err(ParseError::Expected {
-                expected: "vector literal string",
+                expected: "vector-family literal string",
                 found: str_tok.kind,
                 offset: str_tok.span.start as usize,
             });
@@ -715,20 +720,36 @@ impl<'src> Parser<'src> {
             type_name,
             value,
             unit: None,
-            span: Span::new(vector_tok.span.start, span_end),
+            span: Span::new(type_tok.span.start, span_end),
         }))
     }
 
     fn parse_cast_type_name(&mut self) -> Result<Identifier, ParseError> {
         let mut target = self.parse_type_name()?;
-        if target.value.eq_ignore_ascii_case("vector") && self.peek()?.kind == TokenKind::LParen {
+        if let Some(base) = vector_family_type_base(&target.value)
+            && self.peek()?.kind == TokenKind::LParen
+        {
             self.advance()?; // (
             let dim_tok = self.expect(TokenKind::Integer, "integer vector dimension")?;
             let dim = dim_tok.text(self.source).unwrap_or("");
             let rp = self.expect(TokenKind::RParen, ")")?;
-            target.value = format!("vector({dim})");
+            target.value = format!("{base}({dim})");
             target.span = Span::new(target.span.start, rp.span.end);
         }
         Ok(target)
+    }
+}
+
+fn vector_family_type_base(text: &str) -> Option<&'static str> {
+    if text.eq_ignore_ascii_case("vector") {
+        Some("vector")
+    } else if text.eq_ignore_ascii_case("halfvec") {
+        Some("halfvec")
+    } else if text.eq_ignore_ascii_case("sparsevec") {
+        Some("sparsevec")
+    } else if text.eq_ignore_ascii_case("bitvec") {
+        Some("bitvec")
+    } else {
+        None
     }
 }

@@ -62,7 +62,20 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Ordering {
         (Value::Geometry(la), Value::Geometry(lb)) if la.geometry_type == lb.geometry_type => {
             la.to_string().cmp(&lb.to_string())
         }
-        (Value::Vector(la), Value::Vector(lb)) => compare_f32_slices(la, lb),
+        (Value::Vector(la), Value::Vector(lb)) | (Value::HalfVec(la), Value::HalfVec(lb)) => {
+            compare_f32_slices(la, lb)
+        }
+        (Value::SparseVec(la), Value::SparseVec(lb)) => la.to_string().cmp(&lb.to_string()),
+        (
+            Value::BitVec {
+                dims: l_dims,
+                bytes: l_bytes,
+            },
+            Value::BitVec {
+                dims: r_dims,
+                bytes: r_bytes,
+            },
+        ) => l_dims.cmp(r_dims).then_with(|| l_bytes.cmp(r_bytes)),
         (
             Value::Array {
                 element_type: l_ty,
@@ -206,8 +219,8 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             }
             out
         }
-        Value::Vector(values) => {
-            let mut out = vec![20];
+        Value::Vector(values) | Value::HalfVec(values) => {
+            let mut out = vec![discriminant(v)];
             for value in values {
                 let bits = if value.is_nan() {
                     f32::NAN.to_bits()
@@ -216,6 +229,17 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
                 };
                 out.extend_from_slice(&bits.to_be_bytes());
             }
+            out
+        }
+        Value::SparseVec(value) => {
+            let mut out = vec![22];
+            out.extend_from_slice(value.to_string().as_bytes());
+            out
+        }
+        Value::BitVec { dims, bytes } => {
+            let mut out = vec![23];
+            out.extend_from_slice(&dims.to_be_bytes());
+            out.extend_from_slice(bytes);
             out
         }
     }
@@ -295,6 +319,9 @@ const fn discriminant(v: &Value) -> u8 {
         Value::Geometry(_) => 17,
         Value::Array { .. } => 19,
         Value::Vector(_) => 20,
+        Value::HalfVec(_) => 21,
+        Value::SparseVec(_) => 22,
+        Value::BitVec { .. } => 23,
     }
 }
 

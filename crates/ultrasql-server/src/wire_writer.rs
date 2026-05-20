@@ -408,7 +408,9 @@ fn write_cell_typed(sink: &mut BytesMut, col: &Column, row: usize, logical_type:
         return;
     }
     match (logical_type, col) {
-        (DataType::Date | DataType::Decimal { .. } | DataType::Vector { .. }, _) => {
+        (ty, _)
+            if matches!(ty, DataType::Date | DataType::Decimal { .. }) || ty.is_vector_family() =>
+        {
             let bytes = encode_text_value_typed(col, row, logical_type)
                 .expect("non-null typed cell must encode to Some(bytes)");
             sink.put_i32(i32_from_usize(bytes.len()));

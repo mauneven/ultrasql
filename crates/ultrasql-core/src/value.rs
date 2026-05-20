@@ -275,6 +275,59 @@ impl fmt::Display for GeometryValue {
     }
 }
 
+/// Runtime sparse vector with one-based element indexes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SparseVector {
+    /// Declared dense dimension count.
+    pub dims: u32,
+    /// Sorted, unique one-based non-zero entries.
+    pub entries: Vec<(u32, f32)>,
+}
+
+impl SparseVector {
+    /// Construct a sparse vector, validating dimension and entries.
+    #[must_use]
+    pub fn new(dims: u32, mut entries: Vec<(u32, f32)>) -> Option<Self> {
+        if dims == 0 || dims > MAX_VECTOR_DIMS {
+            return None;
+        }
+        entries.sort_unstable_by_key(|(idx, _)| *idx);
+        let mut previous = None;
+        for (idx, value) in &entries {
+            if *idx == 0 || *idx > dims || !value.is_finite() || previous == Some(*idx) {
+                return None;
+            }
+            previous = Some(*idx);
+        }
+        Some(Self { dims, entries })
+    }
+}
+
+impl Eq for SparseVector {}
+
+impl Hash for SparseVector {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.dims.hash(state);
+        for (idx, value) in &self.entries {
+            idx.hash(state);
+            value.to_bits().hash(state);
+        }
+    }
+}
+
+impl fmt::Display for SparseVector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("{")?;
+        for (entry_idx, (idx, value)) in self.entries.iter().enumerate() {
+            if entry_idx > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "{idx}:{value}")?;
+        }
+        write!(f, "}}/{}", self.dims)
+    }
+}
+
 /// Scalar value used at the row-at-a-time executor boundary.
 ///
 /// `Value` is the runtime, type-erased representation. `Datum` is an
@@ -310,6 +363,18 @@ pub enum Value {
     Jsonb(String),
     /// pgvector-compatible finite single-precision vector.
     Vector(Vec<f32>),
+    /// pgvector-compatible finite half-precision vector.
+    HalfVec(Vec<f32>),
+    /// pgvector-compatible sparse vector.
+    SparseVec(SparseVector),
+    /// Dense bit vector. Bits are packed most-significant-bit first
+    /// inside each byte; `dims` names the logical bit count.
+    BitVec {
+        /// Logical bit count.
+        dims: u32,
+        /// Packed bit payload.
+        bytes: Vec<u8>,
+    },
     /// Binary.
     Bytea(Vec<u8>),
     /// Microsecond-precision timestamp (no zone). Microseconds since
@@ -390,10 +455,15 @@ impl Hash for Value {
             Self::Float64(v) => v.to_bits().hash(state),
             Self::Text(v) => v.hash(state),
             Self::Jsonb(v) => v.hash(state),
-            Self::Vector(v) => {
+            Self::Vector(v) | Self::HalfVec(v) => {
                 for element in v {
                     element.to_bits().hash(state);
                 }
+            }
+            Self::SparseVec(v) => v.hash(state),
+            Self::BitVec { dims, bytes } => {
+                dims.hash(state);
+                bytes.hash(state);
             }
             Self::Bytea(v) => v.hash(state),
             Self::Timestamp(v) | Self::TimestampTz(v) | Self::Time(v) => v.hash(state),
@@ -445,6 +515,11 @@ impl Value {
             Self::Vector(v) => DataType::Vector {
                 dims: u32::try_from(v.len()).ok(),
             },
+            Self::HalfVec(v) => DataType::HalfVec {
+                dims: u32::try_from(v.len()).ok(),
+            },
+            Self::SparseVec(v) => DataType::SparseVec { dims: Some(v.dims) },
+            Self::BitVec { dims, .. } => DataType::BitVec { dims: Some(*dims) },
             Self::Bytea(_) => DataType::Bytea,
             Self::Timestamp(_) => DataType::Timestamp,
             Self::TimestampTz(_) => DataType::TimestampTz,
@@ -564,6 +639,65 @@ impl Value {
             return None;
         }
         Some(Self::Vector(values))
+    }
+
+    /// Parse a pgvector-style `halfvec` literal. Runtime values remain
+    /// finite `f32` values; the SQL type controls storage/precision policy.
+    #[must_use]
+    pub fn parse_halfvec(text: &str) -> Option<Self> {
+        let Self::Vector(values) = Self::parse_vector(text)? else {
+            return None;
+        };
+        Some(Self::HalfVec(values))
+    }
+
+    /// Parse a pgvector-style sparse vector literal, e.g. `{1:1,3:2}/5`.
+    #[must_use]
+    pub fn parse_sparsevec(text: &str) -> Option<Self> {
+        let trimmed = text.trim();
+        let (entries_text, dims_text) = split_once_unquoted_slash(trimmed)?;
+        let dims = dims_text.trim().parse::<u32>().ok()?;
+        let inner = entries_text
+            .trim()
+            .strip_prefix('{')?
+            .strip_suffix('}')?
+            .trim();
+        let mut entries = Vec::new();
+        if !inner.is_empty() {
+            for raw in inner.split(',') {
+                let (idx, value) = split_once_unquoted_colon(raw)?;
+                let idx = idx.trim().parse::<u32>().ok()?;
+                let value = value.trim().parse::<f32>().ok()?;
+                entries.push((idx, value));
+            }
+        }
+        SparseVector::new(dims, entries).map(Self::SparseVec)
+    }
+
+    /// Parse a dense bit-vector literal containing only `0` and `1`.
+    #[must_use]
+    pub fn parse_bitvec(text: &str) -> Option<Self> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let dims = u32::try_from(trimmed.len()).ok()?;
+        if dims == 0 || dims > MAX_VECTOR_DIMS {
+            return None;
+        }
+        let mut bytes = vec![0_u8; trimmed.len().div_ceil(8)];
+        for (idx, byte) in trimmed.bytes().enumerate() {
+            match byte {
+                b'0' => {}
+                b'1' => {
+                    let byte_idx = idx / 8;
+                    let bit_idx = idx % 8;
+                    bytes[byte_idx] |= 1_u8 << (7 - bit_idx);
+                }
+                _ => return None,
+            }
+        }
+        Some(Self::BitVec { dims, bytes })
     }
 
     /// Parse PostgreSQL's common text-array form, e.g. `{1,2,NULL}`.
@@ -711,7 +845,7 @@ impl fmt::Display for Value {
             } => write!(f, "{months}mon {days}d {microseconds}us"),
             Self::Range(v) => write!(f, "{v}"),
             Self::Geometry(v) => write!(f, "{v}"),
-            Self::Vector(values) => {
+            Self::Vector(values) | Self::HalfVec(values) => {
                 f.write_str("[")?;
                 for (idx, value) in values.iter().enumerate() {
                     if idx > 0 {
@@ -720,6 +854,18 @@ impl fmt::Display for Value {
                     write!(f, "{value}")?;
                 }
                 f.write_str("]")
+            }
+            Self::SparseVec(v) => write!(f, "{v}"),
+            Self::BitVec { dims, bytes } => {
+                let dims_usize =
+                    usize::try_from(*dims).expect("u32 fits in usize on supported targets");
+                for idx in 0..dims_usize {
+                    let byte_idx = idx / 8;
+                    let bit_idx = idx % 8;
+                    let bit = (bytes[byte_idx] >> (7 - bit_idx)) & 1;
+                    f.write_str(if bit == 1 { "1" } else { "0" })?;
+                }
+                Ok(())
             }
             Self::Array { elements, .. } => {
                 f.write_str("{")?;
@@ -862,6 +1008,16 @@ fn write_array_text(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
 
 fn split_once_unquoted_comma(s: &str) -> Option<(&str, &str)> {
     let idx = s.find(',')?;
+    Some((&s[..idx], &s[idx + 1..]))
+}
+
+fn split_once_unquoted_slash(s: &str) -> Option<(&str, &str)> {
+    let idx = s.find('/')?;
+    Some((&s[..idx], &s[idx + 1..]))
+}
+
+fn split_once_unquoted_colon(s: &str) -> Option<(&str, &str)> {
+    let idx = s.find(':')?;
     Some((&s[..idx], &s[idx + 1..]))
 }
 
@@ -1202,6 +1358,49 @@ mod tests {
         assert!(Value::parse_vector("[]").is_none());
         assert!(Value::parse_vector("[NaN]").is_none());
         assert!(Value::parse_vector("[Infinity]").is_none());
+    }
+
+    #[test]
+    fn vector_family_literals_parse_and_render() {
+        assert_eq!(
+            Value::parse_halfvec("[1, 2.5, -3]").unwrap(),
+            Value::HalfVec(vec![1.0, 2.5, -3.0])
+        );
+        assert_eq!(
+            Value::HalfVec(vec![1.0, 2.5, -3.0]).to_string(),
+            "[1,2.5,-3]"
+        );
+
+        assert_eq!(
+            Value::parse_sparsevec("{1:1,3:2.5}/5").unwrap(),
+            Value::SparseVec(SparseVector::new(5, vec![(1, 1.0), (3, 2.5)]).unwrap())
+        );
+        assert_eq!(
+            Value::SparseVec(SparseVector::new(5, vec![(1, 1.0), (3, 2.5)]).unwrap()).to_string(),
+            "{1:1,3:2.5}/5"
+        );
+
+        assert_eq!(
+            Value::parse_bitvec("101001").unwrap(),
+            Value::BitVec {
+                dims: 6,
+                bytes: vec![0b1010_0100]
+            }
+        );
+        assert_eq!(
+            (Value::BitVec {
+                dims: 6,
+                bytes: vec![0b1010_0100],
+            })
+            .to_string(),
+            "101001"
+        );
+
+        assert!(Value::parse_halfvec("[NaN]").is_none());
+        assert!(Value::parse_sparsevec("{0:1}/5").is_none());
+        assert!(Value::parse_sparsevec("{1:1}/0").is_none());
+        assert!(Value::parse_bitvec("102").is_none());
+        assert!(Value::parse_bitvec("").is_none());
     }
 
     #[test]

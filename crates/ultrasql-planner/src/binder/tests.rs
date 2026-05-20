@@ -405,10 +405,48 @@ fn binds_create_table_vector_column_type() {
 }
 
 #[test]
+fn binds_create_table_vector_family_column_types() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "CREATE TABLE t (h HALFVEC(3), s SPARSEVEC(5), b BITVEC(8))",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateTable { columns, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(
+        columns.fields()[0].data_type,
+        DataType::HalfVec { dims: Some(3) }
+    );
+    assert_eq!(
+        columns.fields()[1].data_type,
+        DataType::SparseVec { dims: Some(5) }
+    );
+    assert_eq!(
+        columns.fields()[2].data_type,
+        DataType::BitVec { dims: Some(8) }
+    );
+}
+
+#[test]
 fn binds_create_table_rejects_zero_dimensional_vector() {
     let cat = InMemoryCatalog::new();
     let err = parse_and_bind("CREATE TABLE t (embedding VECTOR(0))", &cat).unwrap_err();
     assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+}
+
+#[test]
+fn binds_create_table_rejects_zero_dimensional_vector_family() {
+    let cat = InMemoryCatalog::new();
+    for sql in [
+        "CREATE TABLE t (embedding HALFVEC(0))",
+        "CREATE TABLE t (embedding SPARSEVEC(0))",
+        "CREATE TABLE t (embedding BITVEC(0))",
+    ] {
+        let err = parse_and_bind(sql, &cat).unwrap_err();
+        assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+    }
 }
 
 #[test]
@@ -580,6 +618,62 @@ fn binds_vector_cast_with_dimension_modifier() {
                 data_type: DataType::Vector { dims: Some(3) },
             } if values == &vec![1.0, 2.0, 3.0]
         ));
+    }
+}
+
+#[test]
+fn binds_vector_family_casts_with_dimension_modifiers() {
+    let cat = InMemoryCatalog::new();
+    for (sql, expected_type) in [
+        (
+            "SELECT '[1,2,3]'::HALFVEC(3)",
+            DataType::HalfVec { dims: Some(3) },
+        ),
+        (
+            "SELECT '{1:1,3:2}/5'::SPARSEVEC(5)",
+            DataType::SparseVec { dims: Some(5) },
+        ),
+        (
+            "SELECT '1010'::BITVEC(4)",
+            DataType::BitVec { dims: Some(4) },
+        ),
+    ] {
+        let plan = parse_and_bind(sql, &cat).expect("bind ok");
+        let LogicalPlan::Project { exprs, schema, .. } = &plan else {
+            panic!("expected Project, got {plan:?}");
+        };
+        assert_eq!(
+            schema.field_at(0).data_type,
+            expected_type,
+            "schema type for {sql}"
+        );
+        assert_eq!(exprs[0].0.data_type(), expected_type, "expr type for {sql}");
+    }
+}
+
+#[test]
+fn vector_family_casts_reject_dimension_mismatch() {
+    let cat = InMemoryCatalog::new();
+    for sql in [
+        "SELECT '[1,2]'::HALFVEC(3)",
+        "SELECT '{1:1}/4'::SPARSEVEC(5)",
+        "SELECT '101'::BITVEC(4)",
+    ] {
+        let err = parse_and_bind(sql, &cat).unwrap_err();
+        assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+    }
+}
+
+#[test]
+fn vector_family_distance_rejects_dimension_mismatch() {
+    let cat = InMemoryCatalog::new();
+    for sql in [
+        "SELECT HALFVEC(3) '[1,2,3]' <-> HALFVEC(2) '[1,2]'",
+        "SELECT SPARSEVEC(5) '{1:1}/5' <-> SPARSEVEC(4) '{1:1}/4'",
+        "SELECT BITVEC(4) '1010' <-> BITVEC(3) '101'",
+    ] {
+        let err = parse_and_bind(sql, &cat).unwrap_err();
+        assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
     }
 }
 

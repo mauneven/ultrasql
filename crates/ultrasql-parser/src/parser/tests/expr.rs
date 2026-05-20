@@ -70,6 +70,28 @@ fn cast_expression_accepts_vector_type_modifier() {
 }
 
 #[test]
+fn cast_expression_accepts_vector_family_type_modifiers() {
+    for (sql, expected) in [
+        ("SELECT CAST('[1,2,3]' AS HALFVEC(3)) FROM t", "halfvec(3)"),
+        (
+            "SELECT CAST('{1:1}/5' AS SPARSEVEC(5)) FROM t",
+            "sparsevec(5)",
+        ),
+        ("SELECT CAST('1010' AS BITVEC(4)) FROM t", "bitvec(4)"),
+    ] {
+        let stmt = parse(sql);
+        let Statement::Select(s) = stmt else { panic!() };
+        let SelectItem::Expr { expr, .. } = &s.projection[0] else {
+            panic!()
+        };
+        let Expr::Cast { target, .. } = expr else {
+            panic!("expected CAST expression for {sql}");
+        };
+        assert_eq!(target.value, expected);
+    }
+}
+
+#[test]
 fn vector_typed_literal() {
     let expr = parse_expr("VECTOR '[1,2,3]'");
     let Expr::Literal(Literal::Typed {
@@ -93,6 +115,25 @@ fn vector_typed_literal_with_modifier() {
     };
     assert_eq!(type_name, "vector(3)");
     assert_eq!(value, "[1,2,3]");
+}
+
+#[test]
+fn vector_family_typed_literals_with_modifiers() {
+    for (sql, expected_type, expected_value) in [
+        ("HALFVEC(3) '[1,2,3]'", "halfvec(3)", "[1,2,3]"),
+        ("SPARSEVEC(5) '{1:1}/5'", "sparsevec(5)", "{1:1}/5"),
+        ("BITVEC(4) '1010'", "bitvec(4)", "1010"),
+    ] {
+        let expr = parse_expr(sql);
+        let Expr::Literal(Literal::Typed {
+            type_name, value, ..
+        }) = expr
+        else {
+            panic!("expected typed vector-family literal for {sql}");
+        };
+        assert_eq!(type_name, expected_type);
+        assert_eq!(value, expected_value);
+    }
 }
 
 #[test]

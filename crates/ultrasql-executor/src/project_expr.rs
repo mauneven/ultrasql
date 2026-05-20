@@ -253,14 +253,12 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
                 },
             )
         }
-        DataType::Vector { dims } => {
+        ty if ty.is_vector_family() => {
             let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
             for (i, v) in values.iter().enumerate() {
                 match v {
                     Value::Null => strings.push(None),
-                    Value::Vector(vector)
-                        if dims.is_none() || u32::try_from(vector.len()).ok() == *dims =>
-                    {
+                    value if vector_family_value_matches(ty, value) => {
                         strings.push(Some(v.to_string()));
                     }
                     other => {
@@ -373,5 +371,31 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
         other => Err(ExecError::TypeMismatch(format!(
             "projection: column type {other:?} not yet supported"
         ))),
+    }
+}
+
+fn vector_family_value_matches(expected: &DataType, value: &Value) -> bool {
+    let actual = value.data_type();
+    vector_family_kind(expected) == vector_family_kind(&actual)
+        && dims_compatible(
+            expected.vector_dims().flatten(),
+            actual.vector_dims().flatten(),
+        )
+}
+
+fn vector_family_kind(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::Vector { .. } => Some(0),
+        DataType::HalfVec { .. } => Some(1),
+        DataType::SparseVec { .. } => Some(2),
+        DataType::BitVec { .. } => Some(3),
+        _ => None,
+    }
+}
+
+const fn dims_compatible(left: Option<u32>, right: Option<u32>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
     }
 }

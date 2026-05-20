@@ -161,6 +161,89 @@ async fn vector_typed_literals_and_casts_round_trip() {
 }
 
 #[tokio::test]
+async fn vector_family_types_round_trip_text_form() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE vector_family (\
+             id INT NOT NULL, \
+             h HALFVEC(3), \
+             s SPARSEVEC(5), \
+             b BITVEC(4))",
+        )
+        .await
+        .expect("create vector family table");
+    client
+        .batch_execute(
+            "INSERT INTO vector_family VALUES \
+             (1, HALFVEC(3) '[1,2.5,-3]', SPARSEVEC(5) '{1:1,3:2.5}/5', BITVEC(4) '1010')",
+        )
+        .await
+        .expect("insert vector family row");
+
+    let messages = client
+        .simple_query("SELECT h, s, b FROM vector_family WHERE id = 1")
+        .await
+        .expect("select vector family row");
+    let rows = simple_rows(&messages);
+    assert_eq!(
+        rows,
+        vec![vec![
+            "[1,2.5,-3]".to_owned(),
+            "{1:1,3:2.5}/5".to_owned(),
+            "1010".to_owned()
+        ]]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn vector_family_dimension_mismatches_fail_explicitly() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE vector_family_bad (\
+             h HALFVEC(3), \
+             s SPARSEVEC(5), \
+             b BITVEC(4))",
+        )
+        .await
+        .expect("create vector family table");
+
+    for sql in [
+        "INSERT INTO vector_family_bad (h) VALUES ('[1,2]')",
+        "INSERT INTO vector_family_bad (s) VALUES ('{1:1}/4')",
+        "INSERT INTO vector_family_bad (b) VALUES ('101')",
+        "SELECT '[1,2]'::HALFVEC(3)",
+        "SELECT '{1:1}/4'::SPARSEVEC(5)",
+        "SELECT '101'::BITVEC(4)",
+        "SELECT HALFVEC(3) '[1,2,3]' <-> HALFVEC(2) '[1,2]'",
+        "SELECT SPARSEVEC(5) '{1:1}/5' <-> SPARSEVEC(4) '{1:1}/4'",
+        "SELECT BITVEC(4) '1010' <-> BITVEC(3) '101'",
+    ] {
+        let err = match client.batch_execute(sql).await {
+            Ok(()) => panic!("dimension mismatch accepted for {sql}"),
+            Err(err) => err,
+        };
+        let message = err
+            .as_db_error()
+            .map(tokio_postgres::error::DbError::message)
+            .unwrap_or_default();
+        assert!(
+            message.contains("dimension")
+                || message.contains("type mismatch")
+                || message.contains("cannot cast"),
+            "unexpected error for {sql}: {err}"
+        );
+    }
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn vector_distance_operators_execute_in_sql() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 
