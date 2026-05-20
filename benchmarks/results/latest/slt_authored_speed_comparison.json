@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "suite": "sqllogictest",
+  "generated_at_unix_ms": 1779239845039,
+  "benchmark_runs": 3,
+  "case_count": 26,
+  "input_paths": ["tests/slt/portable/basic.slt", "tests/slt/portable/predicates_aggregates_join.slt"],
+  "winner": "sqlite",
+  "engines": [
+    {"name": "ultrasql", "ok": true, "error": null, "statements": 15, "query_records": 11, "query_iterations": 33, "skipped": 0, "total_ns": 63939917, "avg_ns_per_query_iteration": 1937573},
+    {"name": "sqlite", "ok": true, "error": null, "statements": 15, "query_records": 11, "query_iterations": 33, "skipped": 0, "total_ns": 18426583, "avg_ns_per_query_iteration": 558381},
+    {"name": "duckdb", "ok": true, "error": null, "statements": 15, "query_records": 11, "query_iterations": 33, "skipped": 0, "total_ns": 56820917, "avg_ns_per_query_iteration": 1721845}
+  ]
+}

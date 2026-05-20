@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "suite": "sqllogictest",
+  "generated_at_unix_ms": 1779239992526,
+  "benchmark_runs": 1,
+  "case_count": 50,
+  "input_paths": ["tests/slt/portable/imported/hydromatic"],
+  "winner": "sqlite",
+  "engines": [
+    {"name": "ultrasql", "ok": true, "error": null, "statements": 19, "query_records": 28, "query_iterations": 28, "skipped": 3, "total_ns": 16972833, "avg_ns_per_query_iteration": 606172},
+    {"name": "sqlite", "ok": true, "error": null, "statements": 19, "query_records": 28, "query_iterations": 28, "skipped": 3, "total_ns": 9434542, "avg_ns_per_query_iteration": 336947},
+    {"name": "duckdb", "ok": true, "error": null, "statements": 19, "query_records": 28, "query_iterations": 28, "skipped": 3, "total_ns": 27964958, "avg_ns_per_query_iteration": 998748}
+  ]
+}
