@@ -28,8 +28,8 @@ use super::modify::{
 };
 use super::saturate_row_count;
 use super::scan::{
-    lower_catalog_or_sample_scan, lower_function_scan, try_lower_read_parquet_filter,
-    try_lower_read_parquet_project,
+    lower_catalog_or_sample_scan, lower_function_scan, try_lower_read_csv_project,
+    try_lower_read_parquet_filter, try_lower_read_parquet_project,
 };
 use super::time_partition::try_lower_time_partition_filter_scan;
 use super::tpch_q1::try_lower_tpch_q1;
@@ -156,6 +156,9 @@ pub fn lower_query(
                 return Ok(Box::new(ResultOp::new(scalars, schema.clone())));
             }
             if let Some(op) = try_index_only_scan(input, &exprs, ctx)? {
+                return Ok(op);
+            }
+            if let Some(op) = try_lower_read_csv_project(input, &exprs)? {
                 return Ok(op);
             }
             if let Some(op) = try_lower_read_parquet_project(input, &exprs)? {

@@ -25,7 +25,7 @@ const CSV_SNIFF_SAMPLE_BYTES_U64: u64 = 64 * 1024;
 #[derive(Debug)]
 pub(super) struct CsvTableScan {
     schema: Schema,
-    width: usize,
+    projection: CsvProjection,
     stream: CsvStream,
 }
 
@@ -34,23 +34,36 @@ impl CsvTableScan {
     pub(super) fn from_pattern(pattern: &str) -> Result<Self, ServerError> {
         let paths = expand_csv_paths(pattern)
             .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
-        Self::from_paths(paths)
+        Self::from_paths(paths, None)
     }
 
     /// Load CSV files from one or more path/glob specs into a query-local scan.
     pub(super) fn from_path_specs(patterns: &[String]) -> Result<Self, ServerError> {
+        Self::from_path_specs_with_projection(patterns, None)
+    }
+
+    /// Load CSV files and emit only the requested column names.
+    pub(super) fn from_path_specs_with_projection(
+        patterns: &[String],
+        projection: Option<&[String]>,
+    ) -> Result<Self, ServerError> {
         if path_specs_use_object_store("read_csv", patterns)? {
-            return Self::from_object_specs(patterns);
+            return Self::from_object_specs(patterns, projection);
         }
         if let [pattern] = patterns {
-            return Self::from_pattern(pattern);
+            if projection.is_none() {
+                return Self::from_pattern(pattern);
+            }
+            let paths = expand_csv_paths(pattern)
+                .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
+            return Self::from_paths(paths, projection);
         }
         let paths = expand_csv_path_specs(patterns)
             .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
-        Self::from_paths(paths)
+        Self::from_paths(paths, projection)
     }
 
-    fn from_paths(paths: Vec<PathBuf>) -> Result<Self, ServerError> {
+    fn from_paths(paths: Vec<PathBuf>, requested: Option<&[String]>) -> Result<Self, ServerError> {
         let mut expected_header: Option<Vec<String>> = None;
         let mut readers = VecDeque::new();
 
@@ -75,16 +88,19 @@ impl CsvTableScan {
                 "read_csv path expansion returned no files".to_owned(),
             ));
         };
-        let width = header.len();
-        let schema = csv_schema(&header)?;
+        let projection = CsvProjection::resolve(&header, requested)?;
+        let schema = projection.schema.clone();
         Ok(Self {
             schema,
-            width,
+            projection,
             stream: CsvStream::new(readers),
         })
     }
 
-    fn from_object_specs(patterns: &[String]) -> Result<Self, ServerError> {
+    fn from_object_specs(
+        patterns: &[String],
+        requested: Option<&[String]>,
+    ) -> Result<Self, ServerError> {
         let objects = expand_object_store_specs(patterns)
             .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
         let mut expected_header: Option<Vec<String>> = None;
@@ -116,11 +132,11 @@ impl CsvTableScan {
                 "read_csv object expansion returned no files".to_owned(),
             ));
         };
-        let width = header.len();
-        let schema = csv_schema(&header)?;
+        let projection = CsvProjection::resolve(&header, requested)?;
+        let schema = projection.schema.clone();
         Ok(Self {
             schema,
-            width,
+            projection,
             stream: CsvStream::new(readers),
         })
     }
@@ -128,31 +144,21 @@ impl CsvTableScan {
 
 impl Operator for CsvTableScan {
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
-        let mut data_columns = (0..self.width)
-            .map(|_| Vec::with_capacity(CSV_BATCH_TARGET_ROWS))
-            .collect::<Vec<_>>();
-        let mut filenames = Vec::with_capacity(CSV_BATCH_TARGET_ROWS);
-        let mut row_numbers = Vec::with_capacity(CSV_BATCH_TARGET_ROWS);
+        let mut columns = self.projection.new_buffers(CSV_BATCH_TARGET_ROWS);
+        let mut rows = 0_usize;
 
         for _ in 0..CSV_BATCH_TARGET_ROWS {
             let Some(row) = self.stream.next_row()? else {
                 break;
             };
-            for (column, value) in data_columns.iter_mut().zip(row.values) {
-                column.push(value);
-            }
-            filenames.push(row.filename);
-            row_numbers.push(row.row_number);
+            self.projection.push_row(&mut columns, row)?;
+            rows += 1;
         }
 
-        if row_numbers.is_empty() {
+        if rows == 0 {
             return Ok(None);
         }
-        Ok(Some(csv_batch_from_columns(
-            data_columns,
-            filenames,
-            row_numbers,
-        )?))
+        csv_batch_from_buffers(columns).map(Some)
     }
 
     fn schema(&self) -> &Schema {
@@ -190,6 +196,102 @@ struct CsvOutputRow {
     values: Vec<String>,
     filename: String,
     row_number: i64,
+}
+
+#[derive(Debug)]
+struct CsvProjection {
+    schema: Schema,
+    sources: Vec<CsvColumnSource>,
+}
+
+impl CsvProjection {
+    fn resolve(header: &[String], requested: Option<&[String]>) -> Result<Self, ServerError> {
+        let full_schema = csv_schema(header)?;
+        let indices = if let Some(columns) = requested {
+            columns
+                .iter()
+                .map(|name| {
+                    full_schema.index_of(name).map_err(|err| {
+                        ServerError::CopyFormat(format!("read_csv projection: {err}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            (0..full_schema.len()).collect()
+        };
+        let schema = full_schema
+            .project(&indices)
+            .map_err(|err| ServerError::CopyFormat(format!("read_csv projection: {err}")))?;
+        let sources = indices
+            .into_iter()
+            .map(|idx| {
+                if idx < header.len() {
+                    CsvColumnSource::Data(idx)
+                } else if idx == header.len() {
+                    CsvColumnSource::Filename
+                } else {
+                    CsvColumnSource::RowNumber
+                }
+            })
+            .collect();
+        Ok(Self { schema, sources })
+    }
+
+    fn new_buffers(&self, capacity: usize) -> Vec<CsvColumnBuffer> {
+        self.sources
+            .iter()
+            .map(|source| match source {
+                CsvColumnSource::Data(_) | CsvColumnSource::Filename => {
+                    CsvColumnBuffer::Text(Vec::with_capacity(capacity))
+                }
+                CsvColumnSource::RowNumber => CsvColumnBuffer::Int64(Vec::with_capacity(capacity)),
+            })
+            .collect()
+    }
+
+    fn push_row(
+        &self,
+        buffers: &mut [CsvColumnBuffer],
+        row: CsvOutputRow,
+    ) -> Result<(), ExecError> {
+        let CsvOutputRow {
+            mut values,
+            filename,
+            row_number,
+        } = row;
+        for (source, buffer) in self.sources.iter().zip(buffers) {
+            match (source, buffer) {
+                (CsvColumnSource::Data(idx), CsvColumnBuffer::Text(out_values)) => {
+                    let value = values
+                        .get_mut(*idx)
+                        .map(std::mem::take)
+                        .ok_or(ExecError::Internal("csv projection index out of bounds"))?;
+                    out_values.push(value);
+                }
+                (CsvColumnSource::Filename, CsvColumnBuffer::Text(out_values)) => {
+                    out_values.push(filename.clone());
+                }
+                (CsvColumnSource::RowNumber, CsvColumnBuffer::Int64(out_values)) => {
+                    out_values.push(row_number);
+                }
+                _ => return Err(ExecError::Internal("csv projection buffer type mismatch")),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CsvColumnSource {
+    Data(usize),
+    Filename,
+    RowNumber,
+}
+
+#[derive(Debug)]
+enum CsvColumnBuffer {
+    Text(Vec<String>),
+    Int64(Vec<i64>),
 }
 
 #[derive(Debug)]
@@ -361,17 +463,18 @@ impl CsvRecordSource {
     }
 }
 
-fn csv_batch_from_columns(
-    data_columns: Vec<Vec<String>>,
-    filenames: Vec<String>,
-    row_numbers: Vec<i64>,
-) -> Result<Batch, ExecError> {
-    let mut columns = Vec::with_capacity(data_columns.len() + 2);
-    for values in data_columns {
-        columns.push(Column::Utf8(StringColumn::from_data(values)));
+fn csv_batch_from_buffers(buffers: Vec<CsvColumnBuffer>) -> Result<Batch, ExecError> {
+    let mut columns = Vec::with_capacity(buffers.len());
+    for buffer in buffers {
+        match buffer {
+            CsvColumnBuffer::Text(values) => {
+                columns.push(Column::Utf8(StringColumn::from_data(values)));
+            }
+            CsvColumnBuffer::Int64(values) => {
+                columns.push(Column::Int64(NumericColumn::from_data(values)));
+            }
+        }
     }
-    columns.push(Column::Utf8(StringColumn::from_data(filenames)));
-    columns.push(Column::Int64(NumericColumn::from_data(row_numbers)));
     Batch::new(columns).map_err(ExecError::from)
 }
 

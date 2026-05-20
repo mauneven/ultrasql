@@ -14,7 +14,7 @@ use crate::error::ServerError;
 
 use super::LowerCtx;
 use super::catalog_views::try_virtual_catalog_scan;
-use super::csv_scan::CsvSniffScan;
+use super::csv_scan::{CsvSniffScan, CsvTableScan};
 use super::external_scan::{
     is_external_table_function, lower_external_parquet_scan, lower_external_table_scan,
     read_external_path_specs,
@@ -237,6 +237,27 @@ pub(super) fn lower_function_scan(
     )))
 }
 
+/// Lower `Project(read_csv(...))` with CSV projection pushdown when the
+/// expressions are direct column references.
+pub(super) fn try_lower_read_csv_project(
+    input: &LogicalPlan,
+    exprs: &[(ScalarExpr, String)],
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let Some(projection) = projection_names(exprs) else {
+        return Ok(None);
+    };
+    let LogicalPlan::FunctionScan { name, args, .. } = input else {
+        return Ok(None);
+    };
+    if name != "read_csv" {
+        return Ok(None);
+    }
+    let path_specs = read_external_path_specs("read_csv", args)?;
+    Ok(Some(Box::new(
+        CsvTableScan::from_path_specs_with_projection(&path_specs, Some(&projection))?,
+    )))
+}
+
 /// Lower `Project(read_parquet(...))` and
 /// `Project(Filter(read_parquet(...)))` with Parquet projection and
 /// predicate pushdown when the expressions have a direct Parquet shape.
@@ -310,4 +331,108 @@ fn projection_names(exprs: &[(ScalarExpr, String)]) -> Option<Vec<String>> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use ultrasql_core::{DataType, Field, Schema, Value};
+
+    fn text_lit(value: String) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Text(value),
+            data_type: DataType::Text { max_len: None },
+        }
+    }
+
+    fn text_col(name: &str, index: usize) -> (ScalarExpr, String) {
+        (
+            ScalarExpr::Column {
+                name: name.to_owned(),
+                index,
+                data_type: DataType::Text { max_len: None },
+            },
+            name.to_owned(),
+        )
+    }
+
+    #[test]
+    fn read_csv_project_pushdown_builds_only_wanted_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csv_path = dir.path().join("people.csv");
+        fs::write(&csv_path, "id,name,unused\n1,Ada,skip\n").expect("write csv");
+        let input_schema = Schema::new([
+            Field::nullable("id", DataType::Text { max_len: None }),
+            Field::nullable("name", DataType::Text { max_len: None }),
+            Field::nullable("unused", DataType::Text { max_len: None }),
+            Field::nullable("_filename", DataType::Text { max_len: None }),
+            Field::required("_row_number", DataType::Int64),
+        ])
+        .expect("schema");
+        let input = LogicalPlan::FunctionScan {
+            name: "read_csv".to_owned(),
+            args: vec![text_lit(csv_path.display().to_string())],
+            schema: input_schema,
+        };
+        let exprs = vec![text_col("name", 1)];
+
+        let mut scan = try_lower_read_csv_project(&input, &exprs)
+            .expect("lower read_csv project")
+            .expect("read_csv project pushdown");
+        assert_eq!(scan.schema().len(), 1);
+        assert_eq!(scan.schema().field_at(0).name, "name");
+
+        let batch = scan
+            .next_batch()
+            .expect("read projected csv batch")
+            .expect("projected csv batch");
+        assert_eq!(batch.width(), 1);
+        assert_eq!(batch.rows(), 1);
+    }
+
+    #[test]
+    fn read_csv_project_pushdown_preserves_virtual_columns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let csv_path = dir.path().join("people.csv");
+        fs::write(&csv_path, "id,name\n1,Ada\n").expect("write csv");
+        let input_schema = Schema::new([
+            Field::nullable("id", DataType::Text { max_len: None }),
+            Field::nullable("name", DataType::Text { max_len: None }),
+            Field::nullable("_filename", DataType::Text { max_len: None }),
+            Field::required("_row_number", DataType::Int64),
+        ])
+        .expect("schema");
+        let input = LogicalPlan::FunctionScan {
+            name: "read_csv".to_owned(),
+            args: vec![text_lit(csv_path.display().to_string())],
+            schema: input_schema,
+        };
+        let exprs = vec![
+            text_col("_filename", 2),
+            (
+                ScalarExpr::Column {
+                    name: "_row_number".to_owned(),
+                    index: 3,
+                    data_type: DataType::Int64,
+                },
+                "_row_number".to_owned(),
+            ),
+        ];
+
+        let mut scan = try_lower_read_csv_project(&input, &exprs)
+            .expect("lower read_csv project")
+            .expect("read_csv project pushdown");
+        assert_eq!(scan.schema().len(), 2);
+        assert_eq!(scan.schema().field_at(0).name, "_filename");
+        assert_eq!(scan.schema().field_at(1).name, "_row_number");
+
+        let batch = scan
+            .next_batch()
+            .expect("read projected csv batch")
+            .expect("projected csv batch");
+        assert_eq!(batch.width(), 2);
+        assert_eq!(batch.rows(), 1);
+    }
 }
