@@ -8,6 +8,7 @@ use ultrasql_executor::{
     CteScan, Eval, MemTableScan, Operator, ParallelSeqScan, Project, RowCodec, SeqScan,
     choose_parallel_seq_scan_workers,
 };
+use ultrasql_iceberg::plan_iceberg_scan;
 use ultrasql_planner::{LogicalPlan, ScalarExpr};
 
 use crate::error::ServerError;
@@ -183,6 +184,24 @@ pub(super) fn lower_function_scan(
             None,
         )?));
     }
+    if name == "iceberg_scan" {
+        if args.len() != 1 {
+            return Err(ServerError::Unsupported(
+                "iceberg_scan: expected one table root or metadata JSON path argument",
+            ));
+        }
+        let path = read_iceberg_path_arg(args)?;
+        let plan = plan_iceberg_scan(&path)
+            .map_err(|err| ServerError::CopyFormat(format!("iceberg_scan: {err}")))?;
+        if plan.data_files.is_empty() {
+            return Ok(Box::new(MemTableScan::new(plan.schema, vec![])));
+        }
+        return Ok(Box::new(ParquetTableScan::from_path_specs(
+            &plan.data_files,
+            None,
+            None,
+        )?));
+    }
     if name == "unnest" {
         if args.len() != 1 {
             return Err(ServerError::Unsupported(
@@ -206,7 +225,7 @@ pub(super) fn lower_function_scan(
     }
     if name != "generate_series" {
         return Err(ServerError::Unsupported(
-            "table function (only generate_series, unnest, read_csv, read_parquet, and sniff_csv supported)",
+            "table function (only generate_series, unnest, read_csv, read_parquet, iceberg_scan, and sniff_csv supported)",
         ));
     }
     if args.len() < 2 || args.len() > 3 {
@@ -346,6 +365,18 @@ fn read_parquet_path_specs(args: &[ScalarExpr]) -> Result<Vec<String>, ServerErr
             .collect(),
         _ => Err(ServerError::Unsupported(
             "read_parquet: argument must be a string literal or text array literal",
+        )),
+    }
+}
+
+fn read_iceberg_path_arg(args: &[ScalarExpr]) -> Result<String, ServerError> {
+    let value = Eval::new(args[0].clone())
+        .eval(&[])
+        .map_err(|e| ServerError::Ddl(format!("iceberg_scan argument evaluation failed: {e}")))?;
+    match value {
+        Value::Text(path) => Ok(path),
+        _ => Err(ServerError::Unsupported(
+            "iceberg_scan: argument must be a string literal",
         )),
     }
 }

@@ -11,6 +11,7 @@ use ultrasql_core::{
     DataType, Field, Schema, Value,
     csv::{read_csv_data_from_text, read_csv_header_from_specs},
 };
+use ultrasql_iceberg::read_iceberg_schema;
 use ultrasql_objectstore::{is_object_store_uri, read_first_object_bytes};
 use ultrasql_parser::ast::{JoinCondition, JoinOp, TableRef};
 
@@ -218,10 +219,11 @@ fn bind_table_function(
         }
         "read_csv" => bind_read_csv_table_function(&bound_args, &qualifier)?,
         "read_parquet" => bind_read_parquet_table_function(&bound_args, &qualifier)?,
+        "iceberg_scan" => bind_iceberg_scan_table_function(&bound_args, &qualifier)?,
         "sniff_csv" => bind_sniff_csv_table_function(&bound_args, &qualifier)?,
         _ => {
             return Err(PlanError::NotSupported(
-                "table function (only generate_series, unnest, read_csv, read_parquet, and sniff_csv supported)",
+                "table function (only generate_series, unnest, read_csv, read_parquet, iceberg_scan, and sniff_csv supported)",
             ));
         }
     };
@@ -268,6 +270,37 @@ fn bind_read_parquet_table_function(
         .map_err(|err| PlanError::TypeMismatch(format!("read_parquet schema: {err}")))?;
     let from_scope = fields
         .into_iter()
+        .enumerate()
+        .map(|(field_index, field)| ScopeEntry {
+            qualifier: qualifier.to_owned(),
+            field_index,
+            field,
+        })
+        .collect();
+    Ok((schema, from_scope))
+}
+
+fn bind_iceberg_scan_table_function(
+    bound_args: &[ScalarExpr],
+    qualifier: &str,
+) -> Result<(Schema, Vec<ScopeEntry>), PlanError> {
+    if bound_args.len() != 1 {
+        return Err(PlanError::NotSupported(
+            "iceberg_scan: expected one table root or metadata JSON path argument",
+        ));
+    }
+    let path_specs = read_file_path_specs("iceberg_scan", &bound_args[0])?;
+    let [path] = path_specs.as_slice() else {
+        return Err(PlanError::NotSupported(
+            "iceberg_scan: expected one table root or metadata JSON path argument",
+        ));
+    };
+    let schema = read_iceberg_schema(path)
+        .map_err(|err| PlanError::TypeMismatch(format!("iceberg_scan: {err}")))?;
+    let from_scope = schema
+        .fields()
+        .iter()
+        .cloned()
         .enumerate()
         .map(|(field_index, field)| ScopeEntry {
             qualifier: qualifier.to_owned(),

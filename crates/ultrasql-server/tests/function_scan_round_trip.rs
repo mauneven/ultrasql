@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
+use apache_avro::{Codec, Schema as AvroSchema, Writer, types::Value as AvroValue};
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use parquet::arrow::ArrowWriter;
@@ -235,6 +236,275 @@ fn people_batch(schema: Arc<ArrowSchema>, rows: &[(i64, &str, i64)]) -> RecordBa
         ],
     )
     .expect("record batch")
+}
+
+fn write_people_iceberg_table(table_dir: &std::path::Path) {
+    let metadata_dir = table_dir.join("metadata");
+    let data_dir = table_dir.join("data");
+    fs::create_dir_all(&metadata_dir).expect("create iceberg metadata dir");
+    fs::create_dir_all(&data_dir).expect("create iceberg data dir");
+
+    let data_path = data_dir.join("part-00001.parquet");
+    write_people_parquet(
+        &data_path,
+        &[(1, "Ada", 10)],
+        &[(2, "Grace", 20), (3, "Linus", 30)],
+    );
+
+    let manifest_path = metadata_dir.join("manifest-1.avro");
+    write_iceberg_manifest(&manifest_path, &data_path);
+    let manifest_list_path = metadata_dir.join("snap-1.avro");
+    write_iceberg_manifest_list(&manifest_list_path, &manifest_path);
+
+    fs::write(metadata_dir.join("version-hint.text"), "1\n").expect("write version hint");
+    let metadata_json = serde_json::json!({
+        "format-version": 2,
+        "table-uuid": "00000000-0000-0000-0000-000000000001",
+        "location": table_dir.to_str().expect("iceberg table utf8"),
+        "last-sequence-number": 1,
+        "last-updated-ms": 0,
+        "last-column-id": 3,
+        "schemas": [{
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [
+                {"id": 1, "name": "id", "required": true, "type": "long"},
+                {"id": 2, "name": "name", "required": true, "type": "string"},
+                {"id": 3, "name": "score", "required": true, "type": "long"}
+            ]
+        }],
+        "current-schema-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": []}],
+        "default-spec-id": 0,
+        "last-partition-id": 999,
+        "properties": {},
+        "current-snapshot-id": 1,
+        "snapshots": [{
+            "snapshot-id": 1,
+            "sequence-number": 1,
+            "timestamp-ms": 0,
+            "manifest-list": manifest_list_path.to_str().expect("manifest list utf8"),
+            "summary": {"operation": "append"}
+        }],
+        "snapshot-log": [{"timestamp-ms": 0, "snapshot-id": 1}],
+        "metadata-log": []
+    });
+    fs::write(
+        metadata_dir.join("v1.metadata.json"),
+        serde_json::to_string_pretty(&metadata_json).expect("serialize metadata json"),
+    )
+    .expect("write iceberg metadata json");
+}
+
+fn write_empty_iceberg_table(table_dir: &std::path::Path) {
+    let metadata_dir = table_dir.join("metadata");
+    fs::create_dir_all(&metadata_dir).expect("create empty iceberg metadata dir");
+    fs::write(metadata_dir.join("version-hint.text"), "1\n").expect("write version hint");
+    let metadata_json = serde_json::json!({
+        "format-version": 2,
+        "table-uuid": "00000000-0000-0000-0000-000000000002",
+        "location": table_dir.to_str().expect("iceberg table utf8"),
+        "last-sequence-number": 0,
+        "last-updated-ms": 0,
+        "last-column-id": 2,
+        "schemas": [{
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [
+                {"id": 1, "name": "id", "required": true, "type": "long"},
+                {"id": 2, "name": "name", "required": false, "type": "string"}
+            ]
+        }],
+        "current-schema-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": []}],
+        "default-spec-id": 0,
+        "last-partition-id": 999,
+        "properties": {},
+        "snapshots": [],
+        "snapshot-log": [],
+        "metadata-log": []
+    });
+    fs::write(
+        metadata_dir.join("v1.metadata.json"),
+        serde_json::to_string_pretty(&metadata_json).expect("serialize metadata json"),
+    )
+    .expect("write empty iceberg metadata json");
+}
+
+fn write_iceberg_manifest_list(path: &std::path::Path, manifest_path: &std::path::Path) {
+    let schema = AvroSchema::parse_str(
+        r#"{
+          "type": "record",
+          "name": "manifest_file",
+          "fields": [
+            {"name": "manifest_path", "type": "string"},
+            {"name": "manifest_length", "type": "long"},
+            {"name": "partition_spec_id", "type": "int"},
+            {"name": "content", "type": "int"},
+            {"name": "sequence_number", "type": "long"},
+            {"name": "min_sequence_number", "type": "long"},
+            {"name": "added_snapshot_id", "type": "long"},
+            {"name": "added_data_files_count", "type": "int"},
+            {"name": "existing_data_files_count", "type": "int"},
+            {"name": "deleted_data_files_count", "type": "int"},
+            {"name": "added_rows_count", "type": "long"},
+            {"name": "existing_rows_count", "type": "long"},
+            {"name": "deleted_rows_count", "type": "long"}
+          ]
+        }"#,
+    )
+    .expect("manifest-list avro schema");
+    let file = fs::File::create(path).expect("create manifest list");
+    let mut writer = Writer::with_codec(&schema, file, Codec::Null);
+    writer
+        .append(AvroValue::Record(vec![
+            (
+                "manifest_path".to_string(),
+                AvroValue::String(manifest_path.to_str().expect("manifest utf8").to_string()),
+            ),
+            ("manifest_length".to_string(), AvroValue::Long(0)),
+            ("partition_spec_id".to_string(), AvroValue::Int(0)),
+            ("content".to_string(), AvroValue::Int(0)),
+            ("sequence_number".to_string(), AvroValue::Long(1)),
+            ("min_sequence_number".to_string(), AvroValue::Long(1)),
+            ("added_snapshot_id".to_string(), AvroValue::Long(1)),
+            ("added_data_files_count".to_string(), AvroValue::Int(1)),
+            ("existing_data_files_count".to_string(), AvroValue::Int(0)),
+            ("deleted_data_files_count".to_string(), AvroValue::Int(0)),
+            ("added_rows_count".to_string(), AvroValue::Long(3)),
+            ("existing_rows_count".to_string(), AvroValue::Long(0)),
+            ("deleted_rows_count".to_string(), AvroValue::Long(0)),
+        ]))
+        .expect("write manifest list row");
+    writer.flush().expect("flush manifest list");
+}
+
+fn write_iceberg_manifest(path: &std::path::Path, data_path: &std::path::Path) {
+    let schema = AvroSchema::parse_str(
+        r#"{
+          "type": "record",
+          "name": "manifest_entry",
+          "fields": [
+            {"name": "status", "type": "int"},
+            {"name": "snapshot_id", "type": ["null", "long"], "default": null},
+            {"name": "sequence_number", "type": ["null", "long"], "default": null},
+            {"name": "file_sequence_number", "type": ["null", "long"], "default": null},
+            {
+              "name": "data_file",
+              "type": {
+                "type": "record",
+                "name": "data_file",
+                "fields": [
+                  {"name": "content", "type": "int"},
+                  {"name": "file_path", "type": "string"},
+                  {"name": "file_format", "type": "string"},
+                  {"name": "record_count", "type": "long"},
+                  {"name": "file_size_in_bytes", "type": "long"},
+                  {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
+                  {"name": "column_sizes", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                  {"name": "value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                  {"name": "null_value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                  {"name": "nan_value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                  {"name": "lower_bounds", "type": ["null", {"type": "map", "values": "bytes"}], "default": null},
+                  {"name": "upper_bounds", "type": ["null", {"type": "map", "values": "bytes"}], "default": null},
+                  {"name": "key_metadata", "type": ["null", "bytes"], "default": null},
+                  {"name": "split_offsets", "type": ["null", {"type": "array", "items": "long"}], "default": null},
+                  {"name": "equality_ids", "type": ["null", {"type": "array", "items": "int"}], "default": null},
+                  {"name": "sort_order_id", "type": ["null", "int"], "default": null}
+                ]
+              }
+            }
+          ]
+        }"#,
+    )
+    .expect("manifest avro schema");
+    let file = fs::File::create(path).expect("create manifest");
+    let mut writer = Writer::with_codec(&schema, file, Codec::Null);
+    writer
+        .append(AvroValue::Record(vec![
+            ("status".to_string(), AvroValue::Int(1)),
+            (
+                "snapshot_id".to_string(),
+                AvroValue::Union(1, Box::new(AvroValue::Long(1))),
+            ),
+            (
+                "sequence_number".to_string(),
+                AvroValue::Union(1, Box::new(AvroValue::Long(1))),
+            ),
+            (
+                "file_sequence_number".to_string(),
+                AvroValue::Union(1, Box::new(AvroValue::Long(1))),
+            ),
+            (
+                "data_file".to_string(),
+                AvroValue::Record(vec![
+                    ("content".to_string(), AvroValue::Int(0)),
+                    (
+                        "file_path".to_string(),
+                        AvroValue::String(data_path.to_str().expect("data utf8").to_string()),
+                    ),
+                    (
+                        "file_format".to_string(),
+                        AvroValue::String("PARQUET".to_string()),
+                    ),
+                    ("record_count".to_string(), AvroValue::Long(3)),
+                    (
+                        "file_size_in_bytes".to_string(),
+                        AvroValue::Long(
+                            data_path
+                                .metadata()
+                                .expect("data metadata")
+                                .len()
+                                .try_into()
+                                .expect("fixture parquet file length fits i64"),
+                        ),
+                    ),
+                    ("partition".to_string(), AvroValue::Record(vec![])),
+                    (
+                        "column_sizes".to_string(),
+                        AvroValue::Union(0, Box::new(AvroValue::Null)),
+                    ),
+                    (
+                        "value_counts".to_string(),
+                        AvroValue::Union(0, Box::new(AvroValue::Null)),
+                    ),
+                    (
+                        "null_value_counts".to_string(),
+                        AvroValue::Union(0, Box::new(AvroValue::Null)),
+                    ),
+                    (
+                        "nan_value_counts".to_string(),
+                        AvroValue::Union(0, Box::new(AvroValue::Null)),
+                    ),
+                    (
+                        "lower_bounds".to_string(),
+                        AvroValue::Union(0, Box::new(AvroValue::Null)),
+                    ),
+                    (
+                        "upper_bounds".to_string(),
+                        AvroValue::Union(0, Box::new(AvroValue::Null)),
+                    ),
+                    (
+                        "key_metadata".to_string(),
+                        AvroValue::Union(0, Box::new(AvroValue::Null)),
+                    ),
+                    (
+                        "split_offsets".to_string(),
+                        AvroValue::Union(0, Box::new(AvroValue::Null)),
+                    ),
+                    (
+                        "equality_ids".to_string(),
+                        AvroValue::Union(0, Box::new(AvroValue::Null)),
+                    ),
+                    (
+                        "sort_order_id".to_string(),
+                        AvroValue::Union(0, Box::new(AvroValue::Null)),
+                    ),
+                ]),
+            ),
+        ]))
+        .expect("write manifest row");
+    writer.flush().expect("flush manifest");
 }
 
 async fn start_server_and_connect() -> (
@@ -671,6 +941,49 @@ async fn read_parquet_rejects_mixed_local_and_object_paths() {
         "unexpected mixed read_parquet error: {}",
         db_err.message()
     );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn iceberg_scan_reads_current_snapshot_parquet_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let table_dir = dir.path().join("warehouse").join("people");
+    write_people_iceberg_table(&table_dir);
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT id, name FROM iceberg_scan({}) WHERE score >= 20 ORDER BY id",
+        sql_string(table_dir.to_str().expect("iceberg table utf8")),
+    );
+
+    let rows = client.query(&sql, &[]).await.expect("iceberg_scan table");
+    let values: Vec<(i64, String)> = rows
+        .iter()
+        .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
+        .collect();
+    assert_eq!(
+        values,
+        vec![(2, "Grace".to_string()), (3, "Linus".to_string())]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn iceberg_scan_empty_table_returns_zero_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let table_dir = dir.path().join("warehouse").join("empty_people");
+    write_empty_iceberg_table(&table_dir);
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let sql = format!(
+        "SELECT COUNT(*) FROM iceberg_scan({})",
+        sql_string(table_dir.to_str().expect("iceberg table utf8")),
+    );
+
+    let rows = client.query(&sql, &[]).await.expect("iceberg empty table");
+    assert_eq!(rows[0].get::<_, i64>(0), 0);
 
     shutdown(client, server_handle).await;
 }

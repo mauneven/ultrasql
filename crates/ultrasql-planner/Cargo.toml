@@ -16,6 +16,7 @@ ultrasql-core    = { workspace = true }
 ultrasql-parser  = { workspace = true }
 ultrasql-catalog = { workspace = true }
 ultrasql-objectstore = { workspace = true }
+ultrasql-iceberg = { workspace = true }
 thiserror        = { workspace = true }
 smallvec         = { workspace = true }
 tracing          = { workspace = true }
