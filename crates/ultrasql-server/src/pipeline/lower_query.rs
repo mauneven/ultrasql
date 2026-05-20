@@ -26,7 +26,10 @@ use super::modify::{
     lower_project_columns, lower_real_delete, lower_real_insert, lower_real_update,
 };
 use super::saturate_row_count;
-use super::scan::{lower_catalog_or_sample_scan, lower_function_scan};
+use super::scan::{
+    lower_catalog_or_sample_scan, lower_function_scan, try_lower_read_parquet_filter,
+    try_lower_read_parquet_project,
+};
 use super::tpch_q1::try_lower_tpch_q1;
 use super::tpch_q2::try_lower_tpch_q2;
 use super::tpch_q3::try_lower_tpch_q3;
@@ -153,6 +156,9 @@ pub fn lower_query(
             if let Some(op) = try_index_only_scan(input, &exprs, ctx)? {
                 return Ok(op);
             }
+            if let Some(op) = try_lower_read_parquet_project(input, &exprs)? {
+                return Ok(op);
+            }
             let child = lower_query(input, ctx)?;
             lower_project_columns(child, &exprs)
         }
@@ -181,6 +187,9 @@ pub fn lower_query(
             // heap tuple raised a storage error — those are not
             // recoverable by falling back, so we propagate.
             if let Some(op) = try_index_scan(input, predicate, ctx)? {
+                return Ok(op);
+            }
+            if let Some(op) = try_lower_read_parquet_filter(input, predicate)? {
                 return Ok(op);
             }
             let child = lower_query(input, ctx)?;

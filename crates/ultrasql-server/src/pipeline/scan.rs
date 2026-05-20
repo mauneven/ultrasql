@@ -8,13 +8,14 @@ use ultrasql_executor::{
     CteScan, Eval, MemTableScan, Operator, ParallelSeqScan, Project, RowCodec, SeqScan,
     choose_parallel_seq_scan_workers,
 };
-use ultrasql_planner::ScalarExpr;
+use ultrasql_planner::{LogicalPlan, ScalarExpr};
 
 use crate::error::ServerError;
 
 use super::LowerCtx;
 use super::catalog_views::try_virtual_catalog_scan;
 use super::csv_scan::{CsvSniffScan, CsvTableScan};
+use super::parquet_scan::{ParquetPredicate, ParquetTableScan};
 
 pub(super) fn lower_catalog_or_sample_scan(
     table: &str,
@@ -169,6 +170,19 @@ pub(super) fn lower_function_scan(
         let path_specs = read_csv_path_specs(&value)?;
         return Ok(Box::new(CsvTableScan::from_path_specs(&path_specs)?));
     }
+    if name == "read_parquet" {
+        if args.len() != 1 {
+            return Err(ServerError::Unsupported(
+                "read_parquet: expected one path, glob, or path-list argument",
+            ));
+        }
+        let path_specs = read_parquet_path_specs(args)?;
+        return Ok(Box::new(ParquetTableScan::from_path_specs(
+            &path_specs,
+            None,
+            None,
+        )?));
+    }
     if name == "unnest" {
         if args.len() != 1 {
             return Err(ServerError::Unsupported(
@@ -192,7 +206,7 @@ pub(super) fn lower_function_scan(
     }
     if name != "generate_series" {
         return Err(ServerError::Unsupported(
-            "table function (only generate_series, unnest, read_csv, and sniff_csv supported)",
+            "table function (only generate_series, unnest, read_csv, read_parquet, and sniff_csv supported)",
         ));
     }
     if args.len() < 2 || args.len() > 3 {
@@ -230,6 +244,110 @@ pub(super) fn lower_function_scan(
     Ok(Box::new(ultrasql_executor::FunctionScan::generate_series(
         start, stop, step,
     )))
+}
+
+/// Lower `Project(read_parquet(...))` and
+/// `Project(Filter(read_parquet(...)))` with Parquet projection and
+/// predicate pushdown when the expressions have a direct Parquet shape.
+pub(super) fn try_lower_read_parquet_project(
+    input: &LogicalPlan,
+    exprs: &[(ScalarExpr, String)],
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let Some(projection) = projection_names(exprs) else {
+        return Ok(None);
+    };
+    match input {
+        LogicalPlan::FunctionScan { name, args, .. } if name == "read_parquet" => {
+            let path_specs = read_parquet_path_specs(args)?;
+            Ok(Some(Box::new(ParquetTableScan::from_path_specs(
+                &path_specs,
+                Some(&projection),
+                None,
+            )?)))
+        }
+        LogicalPlan::Filter {
+            input, predicate, ..
+        } => {
+            let LogicalPlan::FunctionScan { name, args, .. } = input.as_ref() else {
+                return Ok(None);
+            };
+            if name != "read_parquet" {
+                return Ok(None);
+            }
+            let Some(predicate) = ParquetPredicate::from_scalar(predicate) else {
+                return Ok(None);
+            };
+            let path_specs = read_parquet_path_specs(args)?;
+            Ok(Some(Box::new(ParquetTableScan::from_path_specs(
+                &path_specs,
+                Some(&projection),
+                Some(&predicate),
+            )?)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Lower `Filter(read_parquet(...))` with Parquet predicate pushdown
+/// when the predicate is a simple `column OP literal` comparison.
+pub(super) fn try_lower_read_parquet_filter(
+    input: &LogicalPlan,
+    predicate: &ScalarExpr,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let LogicalPlan::FunctionScan { name, args, .. } = input else {
+        return Ok(None);
+    };
+    if name != "read_parquet" {
+        return Ok(None);
+    }
+    let Some(predicate) = ParquetPredicate::from_scalar(predicate) else {
+        return Ok(None);
+    };
+    let path_specs = read_parquet_path_specs(args)?;
+    Ok(Some(Box::new(ParquetTableScan::from_path_specs(
+        &path_specs,
+        None,
+        Some(&predicate),
+    )?)))
+}
+
+fn projection_names(exprs: &[(ScalarExpr, String)]) -> Option<Vec<String>> {
+    exprs
+        .iter()
+        .map(|(expr, alias)| match expr {
+            ScalarExpr::Column { name, .. } if name == alias => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn read_parquet_path_specs(args: &[ScalarExpr]) -> Result<Vec<String>, ServerError> {
+    if args.len() != 1 {
+        return Err(ServerError::Unsupported(
+            "read_parquet: expected one path, glob, or path-list argument",
+        ));
+    }
+    let value = Eval::new(args[0].clone())
+        .eval(&[])
+        .map_err(|e| ServerError::Ddl(format!("read_parquet argument evaluation failed: {e}")))?;
+    match value {
+        Value::Text(pattern) => Ok(vec![pattern]),
+        Value::Array {
+            element_type: DataType::Text { max_len: None },
+            elements,
+        } => elements
+            .into_iter()
+            .map(|element| match element {
+                Value::Text(path) => Ok(path),
+                _ => Err(ServerError::Unsupported(
+                    "read_parquet: path-list elements must be string literals",
+                )),
+            })
+            .collect(),
+        _ => Err(ServerError::Unsupported(
+            "read_parquet: argument must be a string literal or text array literal",
+        )),
+    }
 }
 
 fn read_csv_path_specs(value: &Value) -> Result<Vec<String>, ServerError> {

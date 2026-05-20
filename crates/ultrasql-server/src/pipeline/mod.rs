@@ -97,6 +97,7 @@ mod join;
 mod lower_query;
 mod lower_simple;
 mod modify;
+mod parquet_scan;
 mod scan;
 mod tpch_q1;
 mod tpch_q10;

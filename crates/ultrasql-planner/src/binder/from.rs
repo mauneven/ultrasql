@@ -1,6 +1,11 @@
 //! FROM clause and JOIN binding. Split out of `binder/mod.rs` to keep each
 //! file under the 600-line ceiling.
 
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use arrow_schema::DataType as ArrowDataType;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use ultrasql_core::{DataType, Field, Schema, Value, csv::read_csv_header_from_specs};
 use ultrasql_parser::ast::{JoinCondition, JoinOp, TableRef};
 
@@ -207,10 +212,11 @@ fn bind_table_function(
             )
         }
         "read_csv" => bind_read_csv_table_function(&bound_args, &qualifier)?,
+        "read_parquet" => bind_read_parquet_table_function(&bound_args, &qualifier)?,
         "sniff_csv" => bind_sniff_csv_table_function(&bound_args, &qualifier)?,
         _ => {
             return Err(PlanError::NotSupported(
-                "table function (only generate_series, unnest, read_csv, and sniff_csv supported)",
+                "table function (only generate_series, unnest, read_csv, read_parquet, and sniff_csv supported)",
             ));
         }
     };
@@ -220,6 +226,77 @@ fn bind_table_function(
         schema,
     };
     Ok((plan, from_scope))
+}
+
+fn bind_read_parquet_table_function(
+    bound_args: &[ScalarExpr],
+    qualifier: &str,
+) -> Result<(Schema, Vec<ScopeEntry>), PlanError> {
+    if bound_args.len() != 1 {
+        return Err(PlanError::NotSupported(
+            "read_parquet: expected one path, glob, or path-list argument",
+        ));
+    }
+    let path_specs = read_file_path_specs("read_parquet", &bound_args[0])?;
+    let first_path = expand_file_path_specs("read_parquet", &path_specs)?
+        .into_iter()
+        .next()
+        .expect("path expansion returns at least one file");
+    let arrow_schema = read_parquet_arrow_schema(&first_path)?;
+    let fields = arrow_schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let data_type = parquet_arrow_type_to_sql(field.data_type())?;
+            Ok(if field.is_nullable() {
+                Field::nullable(field.name().clone(), data_type)
+            } else {
+                Field::required(field.name().clone(), data_type)
+            })
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    let schema = Schema::new(fields.clone())
+        .map_err(|err| PlanError::TypeMismatch(format!("read_parquet schema: {err}")))?;
+    let from_scope = fields
+        .into_iter()
+        .enumerate()
+        .map(|(field_index, field)| ScopeEntry {
+            qualifier: qualifier.to_owned(),
+            field_index,
+            field,
+        })
+        .collect();
+    Ok((schema, from_scope))
+}
+
+fn read_parquet_arrow_schema(path: &Path) -> Result<arrow_schema::SchemaRef, PlanError> {
+    let file = File::open(path).map_err(|err| {
+        PlanError::TypeMismatch(format!(
+            "read_parquet cannot open {}: {err}",
+            path.display()
+        ))
+    })?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|err| {
+        PlanError::TypeMismatch(format!(
+            "read_parquet cannot inspect {}: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(builder.schema().clone())
+}
+
+fn parquet_arrow_type_to_sql(data_type: &ArrowDataType) -> Result<DataType, PlanError> {
+    match data_type {
+        ArrowDataType::Boolean => Ok(DataType::Bool),
+        ArrowDataType::Int32 => Ok(DataType::Int32),
+        ArrowDataType::Int64 => Ok(DataType::Int64),
+        ArrowDataType::Float32 => Ok(DataType::Float32),
+        ArrowDataType::Float64 => Ok(DataType::Float64),
+        ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => Ok(DataType::Text { max_len: None }),
+        other => Err(PlanError::TypeMismatch(format!(
+            "read_parquet unsupported Arrow type: {other}"
+        ))),
+    }
 }
 
 fn bind_read_csv_table_function(
@@ -258,6 +335,10 @@ fn bind_read_csv_table_function(
 }
 
 fn read_csv_path_specs(arg: &ScalarExpr) -> Result<Vec<String>, PlanError> {
+    read_file_path_specs("read_csv", arg)
+}
+
+fn read_file_path_specs(function_name: &str, arg: &ScalarExpr) -> Result<Vec<String>, PlanError> {
     match arg {
         ScalarExpr::Literal {
             value: Value::Text(pattern),
@@ -274,15 +355,100 @@ fn read_csv_path_specs(arg: &ScalarExpr) -> Result<Vec<String>, PlanError> {
             .iter()
             .map(|value| match value {
                 Value::Text(path) => Ok(path.clone()),
-                _ => Err(PlanError::TypeMismatch(
-                    "read_csv: path-list elements must be string literals".to_owned(),
-                )),
+                _ => Err(PlanError::TypeMismatch(format!(
+                    "{function_name}: path-list elements must be string literals"
+                ))),
             })
             .collect(),
-        _ => Err(PlanError::TypeMismatch(
-            "read_csv: argument must be a string literal or text array literal".to_owned(),
-        )),
+        _ => Err(PlanError::TypeMismatch(format!(
+            "{function_name}: argument must be a string literal or text array literal"
+        ))),
     }
+}
+
+fn expand_file_path_specs(
+    function_name: &str,
+    patterns: &[String],
+) -> Result<Vec<PathBuf>, PlanError> {
+    if patterns.is_empty() {
+        return Err(PlanError::TypeMismatch(format!(
+            "{function_name}: path list cannot be empty"
+        )));
+    }
+    let mut paths = Vec::new();
+    for pattern in patterns {
+        paths.extend(expand_file_paths(function_name, pattern)?);
+    }
+    Ok(paths)
+}
+
+fn expand_file_paths(function_name: &str, pattern: &str) -> Result<Vec<PathBuf>, PlanError> {
+    let path = Path::new(pattern);
+    let file_pattern = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            PlanError::TypeMismatch(format!(
+                "{function_name}: path must name a file or wildcard: {pattern}"
+            ))
+        })?;
+    if !contains_wildcard(file_pattern) {
+        return Ok(vec![path.to_path_buf()]);
+    }
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(parent).map_err(|err| {
+        PlanError::TypeMismatch(format!(
+            "{function_name}: cannot read directory {}: {err}",
+            parent.display()
+        ))
+    })? {
+        let entry =
+            entry.map_err(|err| PlanError::TypeMismatch(format!("{function_name}: {err}")))?;
+        let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if wildcard_match(file_pattern, &name) {
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    if paths.is_empty() {
+        return Err(PlanError::TypeMismatch(format!(
+            "{function_name}: pattern matched no files: {pattern}"
+        )));
+    }
+    Ok(paths)
+}
+
+fn contains_wildcard(s: &str) -> bool {
+    s.chars().any(|ch| matches!(ch, '*' | '?'))
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    let text = text.chars().collect::<Vec<_>>();
+    let mut dp = vec![vec![false; text.len() + 1]; pattern.len() + 1];
+    dp[0][0] = true;
+    for (i, ch) in pattern.iter().enumerate() {
+        if *ch == '*' {
+            dp[i + 1][0] = dp[i][0];
+        }
+    }
+    for (i, pattern_ch) in pattern.iter().enumerate() {
+        for (j, text_ch) in text.iter().enumerate() {
+            dp[i + 1][j + 1] = match pattern_ch {
+                '*' => dp[i][j + 1] || dp[i + 1][j],
+                '?' => dp[i][j],
+                ch => dp[i][j] && ch == text_ch,
+            };
+        }
+    }
+    dp[pattern.len()][text.len()]
 }
 
 fn bind_sniff_csv_table_function(

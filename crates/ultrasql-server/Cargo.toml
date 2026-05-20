@@ -36,6 +36,9 @@ tracing-subscriber = { workspace = true }
 clap               = { workspace = true }
 config             = { workspace = true }
 bytes              = { workspace = true }
+arrow-array        = { workspace = true }
+arrow-schema       = { workspace = true }
+parquet            = { workspace = true }
 # Auth / crypto
 hmac               = { workspace = true }
 sha2               = { workspace = true }

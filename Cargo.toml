@@ -76,6 +76,9 @@ ahash       = "0.8"
 bytes  = "1"
 byteorder = "1"
 bincode = "1"
+arrow-array  = "58.3.0"
+arrow-schema = "58.3.0"
+parquet      = "58.3.0"
 
 # Logging / tracing / metrics
 tracing            = "0.1"

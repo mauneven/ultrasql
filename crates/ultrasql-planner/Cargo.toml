@@ -18,6 +18,8 @@ ultrasql-catalog = { workspace = true }
 thiserror        = { workspace = true }
 smallvec         = { workspace = true }
 tracing          = { workspace = true }
+parquet          = { workspace = true }
+arrow-schema     = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
