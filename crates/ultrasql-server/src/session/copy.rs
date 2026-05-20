@@ -30,13 +30,15 @@
 
 #![allow(unused_imports)]
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::sync::Arc;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::warn;
 use ultrasql_catalog::{CatalogSnapshot, TableEntry};
+use ultrasql_core::csv::sniff_csv_text;
 use ultrasql_core::{DataType, RelationId, Schema, Value};
 use ultrasql_executor::RowCodec;
 use ultrasql_parser::Parser;
@@ -56,6 +58,7 @@ use crate::copy::{
 use crate::error::ServerError;
 
 const COPY_INSERT_BATCH_ROWS: usize = 4096;
+const COPY_AUTODETECT_SAMPLE_BYTES: usize = 64 * 1024;
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 
 impl<RW> Session<RW>
@@ -162,6 +165,7 @@ where
             delimiter,
             null_str,
             header,
+            auto_detect,
             schema,
         } = plan
         else {
@@ -179,6 +183,7 @@ where
             delimiter: *delimiter,
             null_str: null_str.clone(),
             header: *header,
+            auto_detect: *auto_detect,
         };
 
         if let Some(input) = input {
@@ -595,37 +600,133 @@ where
         path: &str,
         emit_ready_for_query: bool,
     ) -> Result<(), ServerError> {
-        let bytes = fs::read(path)
-            .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
         if opts.format == ServerCopyFormat::Binary {
+            let bytes = fs::read(path)
+                .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
             return self
                 .copy_binary_bytes_into_table(entry, columns, schema, &bytes, emit_ready_for_query)
                 .await;
         }
+
+        let effective_opts = self.effective_copy_file_options(path, opts)?;
+        let file = File::open(path)
+            .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+        let mut reader = BufReader::new(file);
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let codec = RowCodec::new(entry.schema.clone());
-        let mut payloads = Vec::new();
-        let mut header_skipped = !opts.header;
-        for line in bytes.split_inclusive(|b| *b == b'\n') {
-            if !header_skipped {
-                header_skipped = true;
-                continue;
+        let mut payload_batch: Vec<Vec<u8>> = Vec::with_capacity(COPY_INSERT_BATCH_ROWS);
+
+        let stream_result = self.copy_text_file_stream_into_table(
+            entry,
+            columns,
+            schema,
+            &effective_opts,
+            &codec,
+            &txn,
+            &mut reader,
+            &mut payload_batch,
+        );
+        let rows = match stream_result {
+            Ok(rows) => rows,
+            Err(err) => {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    warn!(error = %abort_err, "COPY FROM file abort failed");
+                }
+                return Err(err);
             }
-            if line.is_empty() {
-                continue;
-            }
-            payloads.push(decode_one_copy_row(
-                line, entry, columns, schema, &codec, opts,
-            )?);
-        }
-        let rows = u64::try_from(payloads.len()).unwrap_or(u64::MAX);
-        self.flush_copy_insert_batch(entry, &payloads, &txn)?;
+        };
         if let Err(e) = self.state.txn_manager.commit(txn) {
             warn!(error = %e, "COPY FROM file commit failed");
         }
         self.state.note_commit_for_gc();
         self.state.note_table_modifications(&entry.name, rows);
         self.send_copy_complete(rows, emit_ready_for_query).await
+    }
+
+    fn effective_copy_file_options(
+        &self,
+        path: &str,
+        opts: &CopyOptions,
+    ) -> Result<CopyOptions, ServerError> {
+        if opts.format != ServerCopyFormat::Csv || !opts.auto_detect {
+            return Ok(opts.clone());
+        }
+        let sample = read_copy_file_sample(path)?;
+        let sniff = sniff_csv_text(path, &sample)
+            .map_err(|err| ServerError::CopyFormat(format!("COPY AUTO_DETECT {path}: {err}")))?;
+        let mut detected = opts.clone();
+        detected.delimiter = sniff.delimiter;
+        detected.header = opts.header || sniff.has_header;
+        Ok(detected)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn copy_text_file_stream_into_table(
+        &self,
+        entry: &TableEntry,
+        columns: &[usize],
+        schema: &Schema,
+        opts: &CopyOptions,
+        codec: &RowCodec,
+        txn: &Transaction,
+        reader: &mut dyn BufRead,
+        payload_batch: &mut Vec<Vec<u8>>,
+    ) -> Result<u64, ServerError> {
+        let mut rows_inserted = 0_u64;
+        let mut header_skipped = !opts.header;
+        let mut record = Vec::new();
+        let mut line = Vec::new();
+
+        loop {
+            line.clear();
+            let bytes_read = reader
+                .read_until(b'\n', &mut line)
+                .map_err(|e| ServerError::Io(std::io::Error::other(format!("COPY FROM: {e}"))))?;
+            if bytes_read == 0 {
+                break;
+            }
+            record.extend_from_slice(&line);
+            if opts.format == ServerCopyFormat::Csv && !csv_record_complete(&record, opts)? {
+                continue;
+            }
+            if !header_skipped {
+                header_skipped = true;
+                record.clear();
+                continue;
+            }
+            if record.is_empty() {
+                continue;
+            }
+            let payload = decode_one_copy_row(&record, entry, columns, schema, codec, opts)?;
+            record.clear();
+            payload_batch.push(payload);
+            if payload_batch.len() == COPY_INSERT_BATCH_ROWS {
+                let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+                self.flush_copy_insert_batch(entry, payload_batch, txn)?;
+                rows_inserted = rows_inserted.saturating_add(batch_len);
+                payload_batch.clear();
+            }
+        }
+
+        if !record.is_empty() {
+            if opts.format == ServerCopyFormat::Csv && !csv_record_complete(&record, opts)? {
+                return Err(ServerError::CopyFormat(
+                    "unterminated quoted field in CSV input".to_string(),
+                ));
+            }
+            if header_skipped {
+                let payload = decode_one_copy_row(&record, entry, columns, schema, codec, opts)?;
+                payload_batch.push(payload);
+            }
+        }
+
+        if !payload_batch.is_empty() {
+            let batch_len = u64::try_from(payload_batch.len()).unwrap_or(u64::MAX);
+            self.flush_copy_insert_batch(entry, payload_batch, txn)?;
+            rows_inserted = rows_inserted.saturating_add(batch_len);
+            payload_batch.clear();
+        }
+        Ok(rows_inserted)
     }
 
     async fn copy_binary_bytes_into_table(
@@ -906,6 +1007,88 @@ where
             }
         }
     }
+}
+
+fn read_copy_file_sample(path: &str) -> Result<String, ServerError> {
+    let file = File::open(path)
+        .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+    let mut reader = BufReader::new(file);
+    let mut sample = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| ServerError::Io(std::io::Error::other(format!("{path}: {e}"))))?;
+        if bytes_read == 0 {
+            break;
+        }
+        sample.extend_from_slice(&line);
+        if sample.len() >= COPY_AUTODETECT_SAMPLE_BYTES && csv_sample_record_complete(&sample) {
+            break;
+        }
+    }
+    String::from_utf8(sample).map_err(|e| {
+        ServerError::CopyFormat(format!(
+            "COPY AUTO_DETECT {path}: invalid UTF-8 sample: {e}"
+        ))
+    })
+}
+
+fn csv_record_complete(record: &[u8], opts: &CopyOptions) -> Result<bool, ServerError> {
+    let delimiter = single_byte_delimiter(opts.delimiter)?;
+    let mut in_quotes = false;
+    let mut at_field_start = true;
+    let mut i = 0;
+    while i < record.len() {
+        let b = record[i];
+        if in_quotes {
+            if b == b'"' {
+                if i + 1 < record.len() && record[i + 1] == b'"' {
+                    i += 2;
+                    continue;
+                }
+                in_quotes = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' && at_field_start {
+            in_quotes = true;
+            at_field_start = false;
+        } else {
+            at_field_start = b == delimiter || b == b'\n' || b == b'\r';
+        }
+        i += 1;
+    }
+    Ok(!in_quotes)
+}
+
+fn csv_sample_record_complete(sample: &[u8]) -> bool {
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < sample.len() {
+        if sample[i] == b'"' {
+            if in_quotes && i + 1 < sample.len() && sample[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            in_quotes = !in_quotes;
+        }
+        i += 1;
+    }
+    !in_quotes
+}
+
+fn single_byte_delimiter(delimiter: char) -> Result<u8, ServerError> {
+    let mut bytes = [0_u8; 4];
+    let encoded = delimiter.encode_utf8(&mut bytes).as_bytes();
+    if encoded.len() != 1 {
+        return Err(ServerError::CopyFormat(
+            "COPY delimiter must be one byte for streaming CSV".to_string(),
+        ));
+    }
+    Ok(encoded[0])
 }
 
 fn copy_format_code(format: ServerCopyFormat) -> u8 {

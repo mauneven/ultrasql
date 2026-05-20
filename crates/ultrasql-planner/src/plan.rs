@@ -1009,6 +1009,9 @@ pub enum LogicalPlan {
         null_str: String,
         /// Whether the data stream contains a header row.
         header: bool,
+        /// Whether CSV COPY should infer dialect/header metadata from
+        /// the source before streaming rows.
+        auto_detect: bool,
         /// Row shape of the data stream — derived from `columns` and
         /// the target table's schema.
         schema: Schema,

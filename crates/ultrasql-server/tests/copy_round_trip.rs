@@ -25,6 +25,10 @@ use futures::SinkExt;
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
+fn sql_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
 /// Spin up an in-process server on an ephemeral TCP port and return a
 /// connected `tokio-postgres` client plus the join handles so the test
 /// can shut everything down cleanly.
@@ -239,6 +243,43 @@ async fn copy_from_stdin_csv_lands_rows() {
 
     let n = select_count(&client, "copy_csv").await;
     assert_eq!(n, 3);
+
+    shutdown(client, server_handle).await;
+}
+
+/// `COPY t FROM 'file.csv' WITH (... AUTO_DETECT true)` sniffs dialect,
+/// streams records, handles quoted newlines, and flushes multi-batch inserts.
+#[tokio::test]
+async fn copy_from_file_csv_autodetect_streams_batches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let csv_path = dir.path().join("bulk.csv");
+    let mut csv = String::from("id;label;note\r\n1;alpha;\"hello\nworld\"\r\n");
+    for id in 2..=4101 {
+        csv.push_str(&format!("{id};label-{id};note-{id}\r\n"));
+    }
+    std::fs::write(&csv_path, csv).expect("write csv");
+
+    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    client
+        .batch_execute("CREATE TABLE copy_file_auto (id INT, label TEXT, note TEXT)")
+        .await
+        .expect("create table");
+
+    let copy_sql = format!(
+        "COPY copy_file_auto FROM {} WITH (FORMAT csv, HEADER true, AUTO_DETECT true)",
+        sql_string(csv_path.to_str().expect("utf8 path"))
+    );
+    client.batch_execute(&copy_sql).await.expect("copy file");
+
+    let n = select_count(&client, "copy_file_auto").await;
+    assert_eq!(n, 4101);
+
+    let rows = client
+        .query("SELECT label, note FROM copy_file_auto WHERE id = 1", &[])
+        .await
+        .expect("select copied row");
+    assert_eq!(rows[0].get::<_, String>(0), "alpha");
+    assert_eq!(rows[0].get::<_, String>(1), "hello\nworld");
 
     shutdown(client, server_handle).await;
 }

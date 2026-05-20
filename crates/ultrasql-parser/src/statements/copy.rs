@@ -5,7 +5,8 @@
 //! ```text
 //! COPY table [(col_list)] { FROM | TO } { STDIN | STDOUT | 'file' }
 //! COPY (SELECT ...) TO { STDOUT | 'file' }
-//!     [WITH (FORMAT { TEXT | CSV | BINARY }, DELIMITER 'c', HEADER [bool], NULL 'string')]
+//!     [WITH (FORMAT { TEXT | CSV | BINARY }, DELIMITER 'c',
+//!            HEADER [bool], AUTO_DETECT [bool], NULL 'string')]
 //! ```
 
 use crate::ast::{CopyDirection, CopyFormat, CopyOption, CopySource, CopyStmt, Identifier};
@@ -252,18 +253,21 @@ impl Parser<'_> {
             }
             TokenKind::KwHeader => {
                 self.advance()?;
-                let header_value = match self.peek()?.kind {
-                    TokenKind::KwTrue => {
-                        self.advance()?;
-                        true
-                    }
-                    TokenKind::KwFalse => {
-                        self.advance()?;
-                        false
-                    }
-                    _ => true,
-                };
+                let header_value = self.parse_copy_optional_bool()?;
                 Ok(CopyOption::Header(header_value))
+            }
+            TokenKind::Identifier => {
+                let raw = tok.text(self.source).unwrap_or("");
+                if !raw.eq_ignore_ascii_case("auto_detect") {
+                    return Err(ParseError::Expected {
+                        expected: "FORMAT, DELIMITER, HEADER, AUTO_DETECT, or NULL inside COPY WITH",
+                        found: tok.kind,
+                        offset: tok.span.start as usize,
+                    });
+                }
+                self.advance()?;
+                let auto_detect = self.parse_copy_optional_bool()?;
+                Ok(CopyOption::AutoDetect(auto_detect))
             }
             TokenKind::KwNull => {
                 self.advance()?;
@@ -271,10 +275,24 @@ impl Parser<'_> {
                 Ok(CopyOption::Null(value))
             }
             other => Err(ParseError::Expected {
-                expected: "FORMAT, DELIMITER, HEADER, or NULL inside COPY WITH",
+                expected: "FORMAT, DELIMITER, HEADER, AUTO_DETECT, or NULL inside COPY WITH",
                 found: other,
                 offset: tok.span.start as usize,
             }),
+        }
+    }
+
+    fn parse_copy_optional_bool(&mut self) -> Result<bool, ParseError> {
+        match self.peek()?.kind {
+            TokenKind::KwTrue => {
+                self.advance()?;
+                Ok(true)
+            }
+            TokenKind::KwFalse => {
+                self.advance()?;
+                Ok(false)
+            }
+            _ => Ok(true),
         }
     }
 
@@ -374,6 +392,20 @@ mod tests {
             })
             .expect("header option present");
         assert!(hdr);
+    }
+
+    #[test]
+    fn copy_with_auto_detect() {
+        let stmt = parse_copy("COPY t FROM 'file.csv' WITH (FORMAT csv, AUTO_DETECT true)");
+        let auto_detect = stmt
+            .options
+            .iter()
+            .find_map(|o| match o {
+                CopyOption::AutoDetect(v) => Some(*v),
+                _ => None,
+            })
+            .expect("auto_detect option present");
+        assert!(auto_detect);
     }
 
     #[test]

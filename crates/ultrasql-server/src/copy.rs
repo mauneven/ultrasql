@@ -52,14 +52,16 @@ pub enum CopyFormat {
 /// Options parsed from a `COPY … WITH (…)` clause.
 #[derive(Clone, Debug)]
 pub struct CopyOptions {
-    /// Wire format. Only `Text` is supported in v0.5.
+    /// Wire format.
     pub format: CopyFormat,
-    /// Column delimiter (text format only). Default `\t`.
+    /// Column delimiter. Default `\t` for text, `,` for CSV.
     pub delimiter: char,
-    /// Representation of SQL NULL (text format only). Default `\N`.
+    /// Representation of SQL NULL. Default `\N` for text.
     pub null_str: String,
-    /// Whether the first row is a header (text format). Default `false`.
+    /// Whether the first row is a header. Default `false`.
     pub header: bool,
+    /// Whether CSV COPY should sniff delimiter/header before reading rows.
+    pub auto_detect: bool,
 }
 
 impl Default for CopyOptions {
@@ -69,6 +71,7 @@ impl Default for CopyOptions {
             delimiter: '\t',
             null_str: r"\N".to_string(),
             header: false,
+            auto_detect: false,
         }
     }
 }

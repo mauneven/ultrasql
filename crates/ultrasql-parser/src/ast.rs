@@ -249,6 +249,8 @@ pub enum CopyOption {
     Delimiter(char),
     /// `HEADER [boolean]` — whether the first row is a header.
     Header(bool),
+    /// `AUTO_DETECT [boolean]` — infer CSV dialect/header metadata.
+    AutoDetect(bool),
     /// `NULL 'string'` — string used to represent SQL NULL.
     Null(String),
 }

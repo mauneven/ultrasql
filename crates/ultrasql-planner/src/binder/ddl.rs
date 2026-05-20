@@ -1575,11 +1575,13 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
             CopyFormat::Csv => (',', String::new()),
         };
         let mut header = false;
+        let mut auto_detect = false;
         for opt in &s.options {
             match opt {
                 CopyOption::Format(_) => {}
                 CopyOption::Delimiter(c) => delimiter = *c,
                 CopyOption::Header(v) => header = *v,
+                CopyOption::AutoDetect(v) => auto_detect = *v,
                 CopyOption::Null(v) => null_str.clone_from(v),
             }
         }
@@ -1593,6 +1595,7 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
             delimiter,
             null_str,
             header,
+            auto_detect,
             schema,
         });
     }
@@ -1653,11 +1656,13 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
         CopyFormat::Csv => (',', String::new()),
     };
     let mut header = false;
+    let mut auto_detect = false;
     for opt in &s.options {
         match opt {
             CopyOption::Format(_) => { /* applied above */ }
             CopyOption::Delimiter(c) => delimiter = *c,
             CopyOption::Header(v) => header = *v,
+            CopyOption::AutoDetect(v) => auto_detect = *v,
             CopyOption::Null(v) => null_str.clone_from(v),
         }
     }
@@ -1672,6 +1677,7 @@ pub(super) fn bind_copy(s: &CopyStmt, catalog: &dyn Catalog) -> Result<LogicalPl
         delimiter,
         null_str,
         header,
+        auto_detect,
         schema: stream_schema,
     })
 }
