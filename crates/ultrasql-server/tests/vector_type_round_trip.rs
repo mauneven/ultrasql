@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_postgres::{NoTls, SimpleQueryMessage};
+use tokio_postgres::{NoTls, SimpleQueryMessage, types::Type};
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
 async fn start_server_and_connect() -> (
@@ -97,6 +97,30 @@ async fn insert_and_select_vector_column_round_trips_text_form() {
         .expect("select vector row");
     let rows = simple_rows(&messages);
     assert_eq!(rows, vec![vec!["[1,2.5,-3]".to_owned()]]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn tokio_postgres_extended_query_decodes_vector_as_text() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE embeddings (id INT NOT NULL, embedding VECTOR(3))")
+        .await
+        .expect("create vector table");
+    client
+        .batch_execute("INSERT INTO embeddings VALUES (1, '[1, 2.5, -3]')")
+        .await
+        .expect("insert vector row");
+
+    let row = client
+        .query_one("SELECT embedding FROM embeddings WHERE id = $1", &[&1_i32])
+        .await
+        .expect("select vector row");
+    assert_eq!(row.columns()[0].type_(), &Type::TEXT);
+    let embedding: String = row.get(0);
+    assert_eq!(embedding, "[1,2.5,-3]");
 
     shutdown(client, server_handle).await;
 }

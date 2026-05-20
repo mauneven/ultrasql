@@ -408,7 +408,7 @@ fn write_cell_typed(sink: &mut BytesMut, col: &Column, row: usize, logical_type:
         return;
     }
     match (logical_type, col) {
-        (DataType::Date | DataType::Decimal { .. }, _) => {
+        (DataType::Date | DataType::Decimal { .. } | DataType::Vector { .. }, _) => {
             let bytes = encode_text_value_typed(col, row, logical_type)
                 .expect("non-null typed cell must encode to Some(bytes)");
             sink.put_i32(i32_from_usize(bytes.len()));
@@ -598,8 +598,9 @@ fn format_i64_into(scratch: &mut [u8; 20], value: i64) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ultrasql_core::Field;
     use ultrasql_protocol::{BackendMessage, encode_backend};
-    use ultrasql_vec::column::{Column, NumericColumn};
+    use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 
     /// The hand-rolled writer must produce bit-identical bytes to the
     /// canonical `encode_backend(BackendMessage::DataRow { .. })` for
@@ -701,6 +702,28 @@ mod tests {
             write_data_row(&mut actual, &cols, row_usize);
             assert_eq!(&actual[..], &canonical[..], "row {row_usize} mismatch");
         }
+    }
+
+    #[test]
+    fn write_data_row_typed_encodes_vector_text() {
+        let schema = Schema::new([Field::required(
+            "embedding",
+            DataType::Vector { dims: Some(3) },
+        )])
+        .unwrap();
+        let cols = vec![Column::Utf8(StringColumn::from_data([
+            "[1, 2.500, -3]".to_owned()
+        ]))];
+        let canonical_msg = BackendMessage::DataRow {
+            columns: vec![Some(b"[1,2.5,-3]".to_vec())],
+        };
+        let mut canonical = BytesMut::new();
+        encode_backend(&canonical_msg, &mut canonical);
+
+        let mut actual = BytesMut::new();
+        write_data_row_typed(&mut actual, &cols, &schema, 0);
+
+        assert_eq!(&actual[..], &canonical[..]);
     }
 
     #[test]

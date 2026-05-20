@@ -294,6 +294,7 @@ pub(super) const fn pg_type_oid(ty: &DataType) -> u32 {
         DataType::Float32 => PG_OID_FLOAT4,
         DataType::Float64 => PG_OID_FLOAT8,
         DataType::Bytea => PG_OID_BYTEA,
+        DataType::Vector { .. } => PG_OID_TEXT,
         _ => PG_OID_TEXT,
     }
 }

@@ -507,8 +507,20 @@ pub(crate) fn encode_text_value_typed(
             .to_string()
             .into(),
         ),
+        (DataType::Vector { dims }, Column::Utf8(_) | Column::DictionaryUtf8(_)) => col
+            .text_value(row)
+            .map(|text| encode_vector_text_value(text, *dims)),
         _ => encode_text_value(col, row),
     }
+}
+
+fn encode_vector_text_value(text: &str, expected_dims: Option<u32>) -> Vec<u8> {
+    if let Some(Value::Vector(values)) = Value::parse_vector(text)
+        && expected_dims.is_none_or(|dims| u32::try_from(values.len()).ok() == Some(dims))
+    {
+        return Value::Vector(values).to_string().into_bytes();
+    }
+    text.as_bytes().to_vec()
 }
 
 fn schema_is_int32_pair(schema: &Schema) -> bool {
@@ -581,6 +593,7 @@ const fn pg_type_oid(ty: &DataType) -> u32 {
         DataType::Bytea => PG_OID_BYTEA,
         DataType::Uuid => PG_OID_UUID,
         DataType::Jsonb => PG_OID_JSONB,
+        DataType::Vector { .. } => PG_OID_TEXT,
         _ => PG_OID_TEXT,
     }
 }
@@ -604,7 +617,7 @@ mod tests {
     use ultrasql_core::{Field, Schema};
     use ultrasql_executor::MemTableScan;
     use ultrasql_vec::Batch;
-    use ultrasql_vec::column::{Column, NumericColumn};
+    use ultrasql_vec::column::{Column, NumericColumn, StringColumn};
 
     #[test]
     fn run_select_produces_row_description_then_data_rows() {
@@ -647,6 +660,7 @@ mod tests {
         assert_eq!(pg_type_oid(&DataType::Bool), 16);
         assert_eq!(pg_type_oid(&DataType::Text { max_len: None }), 25);
         assert_eq!(pg_type_oid(&DataType::Jsonb), 3802);
+        assert_eq!(pg_type_oid(&DataType::Vector { dims: Some(3) }), 25);
     }
 
     #[test]
@@ -674,6 +688,35 @@ mod tests {
             BackendMessage::DataRow { columns } => {
                 assert_eq!(columns[0], Some(b"2000-01-01".to_vec()));
                 assert_eq!(columns[1], Some(b"173665.47".to_vec()));
+            }
+            other => panic!("expected DataRow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_select_encodes_logical_vector_text() {
+        let schema = Schema::new([Field::required(
+            "embedding",
+            DataType::Vector { dims: Some(3) },
+        )])
+        .unwrap();
+        let batch = Batch::new([Column::Utf8(StringColumn::from_data([
+            "[1, 2.500, -3]".to_owned()
+        ]))])
+        .unwrap();
+        let mut scan = MemTableScan::new(schema, vec![batch]);
+        let result = run_select(&mut scan).expect("ok");
+
+        match &result.messages[0] {
+            BackendMessage::RowDescription { fields } => {
+                assert_eq!(fields[0].type_oid, PG_OID_TEXT);
+                assert_eq!(fields[0].type_size, -1);
+            }
+            other => panic!("expected RowDescription, got {other:?}"),
+        }
+        match &result.messages[1] {
+            BackendMessage::DataRow { columns } => {
+                assert_eq!(columns[0], Some(b"[1,2.5,-3]".to_vec()));
             }
             other => panic!("expected DataRow, got {other:?}"),
         }
