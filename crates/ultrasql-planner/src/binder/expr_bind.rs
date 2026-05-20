@@ -883,6 +883,11 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
         "pg_relation_size" => Ok(DataType::Int64),
         "version" | "current_database" | "current_user" | "session_user" | "pg_typeof"
         | "pg_size_pretty" => Ok(DataType::Text { max_len: None }),
+        "array_length" => Ok(DataType::Int32),
+        "array_to_string" => Ok(DataType::Text { max_len: None }),
+        "string_to_array" | "array_cat" => {
+            Ok(DataType::Array(Box::new(DataType::Text { max_len: None })))
+        }
         _ => Err(PlanError::NotSupported("non-aggregate function calls")),
     }
 }
@@ -909,6 +914,10 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "pg_typeof"
             | "pg_relation_size"
             | "pg_size_pretty"
+            | "array_length"
+            | "array_to_string"
+            | "string_to_array"
+            | "array_cat"
     )
 }
 

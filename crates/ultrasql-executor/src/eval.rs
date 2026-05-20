@@ -26,7 +26,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ultrasql_core::Value;
+use ultrasql_core::{DataType, Value};
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp};
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
@@ -255,6 +255,10 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "current_user" | "session_user" => eval_zero_arg_text(args, "user"),
         "pg_typeof" => eval_pg_typeof(args),
         "pg_size_pretty" => eval_pg_size_pretty(args),
+        "array_length" => eval_array_length(args),
+        "array_to_string" => eval_array_to_string(args),
+        "string_to_array" => eval_string_to_array(args),
+        "array_cat" => eval_array_cat(args),
         "coalesce" => Ok(args
             .iter()
             .find(|v| !matches!(v, Value::Null))
@@ -306,6 +310,153 @@ fn eval_pg_size_pretty(args: &[Value]) -> Result<Value, EvalError> {
         };
     };
     Ok(Value::Text(format_size_pretty(bytes)))
+}
+
+fn eval_array_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "array_length: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Value::Array { elements, .. } = &args[0] else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "array_length: array argument required, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let Some(dim) = args[1].as_i64() else {
+        return Err(EvalError::Type(format!(
+            "array_length: integer dimension required, got {:?}",
+            args[1].data_type()
+        )));
+    };
+    if dim != 1 {
+        return Ok(Value::Null);
+    }
+    let len = i32::try_from(elements.len())
+        .map_err(|_| EvalError::Type("array_length overflow".to_owned()))?;
+    Ok(Value::Int32(len))
+}
+
+fn eval_array_to_string(args: &[Value]) -> Result<Value, EvalError> {
+    if !(2..=3).contains(&args.len()) {
+        return Err(EvalError::Type(format!(
+            "array_to_string: expected 2 or 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Value::Array { elements, .. } = &args[0] else {
+        return if matches!(args[0], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "array_to_string: array argument required, got {:?}",
+                args[0].data_type()
+            )))
+        };
+    };
+    let Value::Text(delimiter) = &args[1] else {
+        return Err(EvalError::Type(format!(
+            "array_to_string: delimiter must be text, got {:?}",
+            args[1].data_type()
+        )));
+    };
+    let null_text = match args.get(2) {
+        Some(Value::Text(text)) => Some(text.as_str()),
+        Some(Value::Null) | None => None,
+        Some(other) => {
+            return Err(EvalError::Type(format!(
+                "array_to_string: null text must be text, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    let mut parts = Vec::with_capacity(elements.len());
+    for element in elements {
+        if element.is_null() {
+            if let Some(text) = null_text {
+                parts.push(text.to_owned());
+            }
+        } else {
+            parts.push(element.to_string());
+        }
+    }
+    Ok(Value::Text(parts.join(delimiter)))
+}
+
+fn eval_string_to_array(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "string_to_array: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let (Value::Text(input), Value::Text(delimiter)) = (&args[0], &args[1]) else {
+        return if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+            Ok(Value::Null)
+        } else {
+            Err(EvalError::Type(format!(
+                "string_to_array: text arguments required, got {:?} and {:?}",
+                args[0].data_type(),
+                args[1].data_type()
+            )))
+        };
+    };
+    let elements = if delimiter.is_empty() {
+        input
+            .chars()
+            .map(|ch| Value::Text(ch.to_string()))
+            .collect()
+    } else {
+        input
+            .split(delimiter)
+            .map(|part| Value::Text(part.to_owned()))
+            .collect()
+    };
+    Ok(Value::Array {
+        element_type: DataType::Text { max_len: None },
+        elements,
+    })
+}
+
+fn eval_array_cat(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "array_cat: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    match (&args[0], &args[1]) {
+        (
+            Value::Array {
+                element_type: left_ty,
+                elements: left,
+            },
+            Value::Array {
+                element_type: right_ty,
+                elements: right,
+            },
+        ) if left_ty == right_ty => {
+            let mut elements = Vec::with_capacity(left.len() + right.len());
+            elements.extend_from_slice(left);
+            elements.extend_from_slice(right);
+            Ok(Value::Array {
+                element_type: left_ty.clone(),
+                elements,
+            })
+        }
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (left, right) => Err(EvalError::Type(format!(
+            "array_cat: matching arrays required, got {:?} and {:?}",
+            left.data_type(),
+            right.data_type()
+        ))),
+    }
 }
 
 fn format_size_pretty(bytes: i64) -> String {
@@ -913,6 +1064,16 @@ fn overlaps_values(left: &Value, right: &Value) -> Option<bool> {
     match (left, right) {
         (Value::Range(l), Value::Range(r)) => Some(l.overlaps(r)),
         (Value::Geometry(l), Value::Geometry(r)) => Some(l.overlaps(r)),
+        (
+            Value::Array {
+                element_type: l_ty,
+                elements: l_vals,
+            },
+            Value::Array {
+                element_type: r_ty,
+                elements: r_vals,
+            },
+        ) if l_ty == r_ty => Some(l_vals.iter().any(|v| r_vals.contains(v))),
         (Value::Text(l), Value::Text(r)) => {
             let left = text_collection_values(l);
             let right = text_collection_values(r);
@@ -926,6 +1087,16 @@ fn contains_values(left: &Value, right: &Value) -> Option<bool> {
     match (left, right) {
         (Value::Range(l), Value::Range(r)) => Some(l.contains_range(r)),
         (Value::Geometry(l), Value::Geometry(r)) => Some(l.contains_geometry(r)),
+        (
+            Value::Array {
+                element_type: l_ty,
+                elements: l_vals,
+            },
+            Value::Array {
+                element_type: r_ty,
+                elements: r_vals,
+            },
+        ) if l_ty == r_ty => Some(r_vals.iter().all(|v| l_vals.contains(v))),
         (Value::Text(l), Value::Text(r)) => Some(text_contains(l, r)),
         _ => None,
     }
@@ -963,6 +1134,16 @@ fn json_has_key(left: &Value, right: &Value) -> Result<bool, EvalError> {
 fn json_has_key_set(left: &Value, right: &Value, require_all: bool) -> Result<bool, EvalError> {
     let keys = match right {
         Value::Text(text) => text_collection_values(text),
+        Value::Array { elements, .. } => elements
+            .iter()
+            .map(|value| match value {
+                Value::Text(text) => Ok(text.clone()),
+                other => Err(EvalError::Type(format!(
+                    "?|/?& requires text array keys, got {:?}",
+                    other.data_type()
+                ))),
+            })
+            .collect::<Result<Vec<_>, _>>()?,
         Value::Null => return Ok(false),
         other => {
             return Err(EvalError::Type(format!(
@@ -1751,6 +1932,27 @@ mod tests {
         }
     }
 
+    fn lit_text_array(items: &[&str]) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: items
+                    .iter()
+                    .map(|item| Value::Text((*item).to_owned()))
+                    .collect(),
+            },
+            data_type: DataType::Array(Box::new(DataType::Text { max_len: None })),
+        }
+    }
+
+    fn call(name: &str, args: Vec<ScalarExpr>, data_type: DataType) -> ScalarExpr {
+        ScalarExpr::FunctionCall {
+            name: name.to_owned(),
+            args,
+            data_type,
+        }
+    }
+
     fn lit_null() -> ScalarExpr {
         ScalarExpr::Literal {
             value: Value::Null,
@@ -1856,6 +2058,61 @@ mod tests {
             lit_text("{yellow,green}"),
         ));
         assert_eq!(overlaps.eval(&[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn native_array_contains_and_overlap_evaluate() {
+        let contains = Eval::new(binop(
+            BinaryOp::JsonContains,
+            lit_text_array(&["red", "green", "blue"]),
+            lit_text_array(&["red", "blue"]),
+        ));
+        assert_eq!(contains.eval(&[]).unwrap(), Value::Bool(true));
+
+        let overlaps = Eval::new(binop(
+            BinaryOp::Overlap,
+            lit_text_array(&["red", "green"]),
+            lit_text_array(&["yellow", "green"]),
+        ));
+        assert_eq!(overlaps.eval(&[]).unwrap(), Value::Bool(true));
+    }
+
+    #[test]
+    fn array_scalar_functions_evaluate() {
+        let string_to_array = call(
+            "string_to_array",
+            vec![lit_text("red,green,blue"), lit_text(",")],
+            DataType::Array(Box::new(DataType::Text { max_len: None })),
+        );
+        let parsed = Eval::new(string_to_array.clone()).eval(&[]).unwrap();
+        assert_eq!(
+            parsed,
+            Value::Array {
+                element_type: DataType::Text { max_len: None },
+                elements: vec![
+                    Value::Text("red".into()),
+                    Value::Text("green".into()),
+                    Value::Text("blue".into())
+                ]
+            }
+        );
+
+        let len = Eval::new(call(
+            "array_length",
+            vec![string_to_array.clone(), lit_i32(1)],
+            DataType::Int32,
+        ));
+        assert_eq!(len.eval(&[]).unwrap(), Value::Int32(3));
+
+        let joined = Eval::new(call(
+            "array_to_string",
+            vec![string_to_array, lit_text("|")],
+            DataType::Text { max_len: None },
+        ));
+        assert_eq!(
+            joined.eval(&[]).unwrap(),
+            Value::Text("red|green|blue".into())
+        );
     }
 
     #[test]
