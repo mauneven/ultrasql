@@ -1,20 +1,11 @@
 //! Contract tests for public benchmark arena orchestration.
 
+mod support;
+
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 
-fn bash_command() -> Command {
-    #[cfg(windows)]
-    {
-        let git_bash = PathBuf::from(r"C:\Program Files\Git\bin\bash.exe");
-        if git_bash.exists() {
-            return Command::new(git_bash);
-        }
-    }
-
-    Command::new("bash")
-}
+use support::bash_command;
 
 fn repo_path(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -81,7 +72,11 @@ fn arena_script_composes_existing_runners_without_claiming_winners() {
 #[test]
 fn arena_script_has_valid_bash_syntax() {
     let script = repo_path("benchmarks/arena.sh");
-    let status = bash_command()
+    let Some(mut bash) = bash_command() else {
+        eprintln!("skipping bash syntax check: Git Bash not found");
+        return;
+    };
+    let status = bash
         .arg("-n")
         .arg(&script)
         .status()
