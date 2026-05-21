@@ -80,6 +80,25 @@ impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
+    fn finalise_copy_from_commit(
+        &self,
+        txn: Transaction,
+        rows_changed: u64,
+        context: &str,
+    ) -> Result<(), ServerError> {
+        let xid = txn.xid;
+        self.state
+            .txn_manager
+            .commit(txn)
+            .map_err(|e| ServerError::ddl(format!("{context} commit failed: {e}")))?;
+        if rows_changed > 0
+            && let Some(commit_lsn) = self.state.append_commit_record(xid)?
+        {
+            self.state.wait_for_wal_durable(commit_lsn)?;
+        }
+        Ok(())
+    }
+
     /// Best-effort parse + bind that returns `Some(plan)` only when `sql`
     /// is a single `COPY` statement.
     ///
@@ -597,9 +616,7 @@ where
                 return Err(e);
             }
         }
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            warn!(error = %e, "COPY FROM autocommit commit failed");
-        }
+        self.finalise_copy_from_commit(txn, rows_inserted, "COPY FROM autocommit")?;
         self.state.note_commit_for_gc();
         self.state
             .note_table_modifications(&entry.name, rows_inserted);
@@ -697,9 +714,11 @@ where
                 return Err(err);
             }
         };
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            warn!(error = %e, "COPY FROM file commit failed");
-        }
+        let reject_rows = reject_state
+            .as_ref()
+            .and_then(|state| state.target.as_ref())
+            .map_or(0, |target| target.rows);
+        self.finalise_copy_from_commit(txn, rows.saturating_add(reject_rows), "COPY FROM file")?;
         self.state.note_commit_for_gc();
         self.state.note_table_modifications(&entry.name, rows);
         if let Some(reject_target) = reject_state.and_then(|state| state.target) {
@@ -999,9 +1018,7 @@ where
         let rows = u64::try_from(payloads.len()).unwrap_or(u64::MAX);
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         self.flush_copy_insert_batch(entry, &payloads, &txn)?;
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            warn!(error = %e, "binary COPY FROM commit failed");
-        }
+        self.finalise_copy_from_commit(txn, rows, "binary COPY FROM")?;
         self.state.note_commit_for_gc();
         self.state.note_table_modifications(&entry.name, rows);
         self.send_copy_complete(rows, emit_ready_for_query).await
@@ -1247,10 +1264,11 @@ where
             return Ok(());
         }
         let payload_refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
+        let wal = self.state.heap.wal_sink().map(Arc::as_ref);
         let insert_opts = InsertOptions {
             xmin: txn.current_xid(),
             command_id: txn.current_command,
-            wal: None,
+            wal,
             fsm: None,
             vm: Some(self.state.vm.as_ref()),
         };
