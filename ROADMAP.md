@@ -106,10 +106,10 @@ are grounds for revert.
 | v0.9 | TPC-B (OLTP, 32 connections) | ≥ 2× PostgreSQL 17, p99 < 5 ms | throughput + latency |
 | v1.0 | TPC-C (all 5 tx types, 32 connections) | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
 | v1.0 | Sysbench OLTP read/write | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
-| v1.0 | Firebolt aggregating-index dashboard aggregate | ≥ 2× Firebolt ⚠️ runner + UltraSQL smoke artifact exist; Firebolt Core artifact is `not_available` until local Core Docker runs | median query latency |
-| v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ runner + UltraSQL smoke artifact exist; Firebolt Core artifact is `not_available` until local Core Docker runs | median query latency |
-| v1.0 | Firebolt-style wide filter/projection late materialization | UltraSQL smoke artifact exists ⚠️ Firebolt same-host comparison open | median latency + candidates/fetched/skipped |
-| v1.0 | Firebolt HNSW vector search | recall/latency artifact vs UltraSQL HNSW ⚠️ runner added; Firebolt Core artifact is `not_available` until local Core Docker runs and vector support is verified | recall@k + p50/p95/p99 |
+| v1.0 | Firebolt aggregating-index dashboard aggregate | ≥ 2× Firebolt ⚠️ runner + UltraSQL smoke artifact exist; local Firebolt Core run pending measured artifact | median query latency |
+| v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ runner + UltraSQL smoke artifact exist; local Firebolt Core run pending measured artifact | median query latency |
+| v1.0 | Firebolt-style wide filter/projection late materialization | UltraSQL smoke artifact exists ⚠️ local Firebolt Core same-host run pending | median latency + candidates/fetched/skipped |
+| v1.0 | Firebolt HNSW vector search | recall/latency artifact vs UltraSQL HNSW ⚠️ runner added; local Firebolt Core run pending vector-support verification | recall@k + p50/p95/p99 |
 | v2.x | Star Schema Benchmark scale 100 | ≥ 2× ClickHouse | geometric mean query time |
 
 All comparisons follow the methodology in `BENCHMARKS.md`: same host,
@@ -1758,20 +1758,25 @@ Every standard PostgreSQL driver and ORM works without modification.
 
 ### Vector Search / RAG Readiness
 
-Audit status: SQL vector support exists, but production ANN durability does
-not. `DataType` and `Value` include `vector`, `halfvec`, `sparsevec`, and
+Audit status: SQL vector support and page-backed ANN indexes exist, but
+large-scale recovery certification is still open. `DataType` and `Value`
+include `vector`, `halfvec`, `sparsevec`, and
 `bitvec` families with dimension metadata; parser/binder/executor tests cover
 typed literals, casts, distance operators, vector functions, dimension
-mismatch, and wire-visible round trips. Runtime HNSW and IVFFlat indexes also
-exist behind `CREATE INDEX USING hnsw` and `CREATE INDEX USING ivfflat`, with
-DML maintenance, tombstones, VACUUM compaction, and exact-rerank behavior in
-tests. These ANN structures are still in-memory runtime access methods, not
-page-backed index relations with restart/recovery guarantees.
+mismatch, and wire-visible round trips. HNSW and IVFFlat indexes exist behind
+`CREATE INDEX USING hnsw` and `CREATE INDEX USING ivfflat`, use page-backed
+index objects in the SQL path, and have restart round trips that verify
+`EXPLAIN ANALYZE` still selects `page-backed hnsw` / `page-backed ivfflat`
+after server restart. Remaining durability work is larger-scale recovery
+certification, fuzz/property coverage, corruption/torn-write hardening, and
+public performance artifacts across build/search/update/delete/restart
+workloads.
 
 Production target remains the pgvector-shaped SQL surface plus storage-grade
 indexes: `vector(n)`, distance operators, exact `ORDER BY distance LIMIT k`,
 HNSW/IVFFlat access methods, WAL redo, recovery, deletes, VACUUM, rebuild,
-and benchmark certification against PostgreSQL + pgvector on the same host.
+fuzzing, and benchmark certification against PostgreSQL + pgvector on the
+same host.
 
 #### Implementation Status Matrix
 
@@ -1780,10 +1785,10 @@ and benchmark certification against PostgreSQL + pgvector on the same host.
 | `vector(n)` / `halfvec(n)` / `sparsevec` / `bitvec` values | ✅ typed literals, casts, `CREATE TABLE` | ✅ dimension/type checks | ✅ eval + row flow | ✅ catalog + row codec | ⚠️ heap row path only; restart certification still open | ✅ text output | ✅ parser/core/server round trips | ⚠️ exact top-k smoke exists; full cert open |
 | pgvector distance ops and functions | ✅ `<->`, `<#>`, `<=>`, `<+>` | ✅ unsupported vector comparisons fail explicitly | ✅ L2, cosine, inner product/dot, L1, norm, dims | n/a | n/a | ✅ result values | ✅ scalar/runtime tests | ⚠️ exact top-k artifacts only |
 | Exact vector top-k | n/a | ⚠️ shape recognized through `ORDER BY distance LIMIT` | ⚠️ top-k path exists; full-sort avoidance hardening open | n/a | n/a | n/a | ✅ server round trips | ⚠️ `vector_topk_exact` smoke, full pgvector cert open |
-| Runtime HNSW | ✅ `CREATE INDEX USING hnsw` | ✅ vector opclasses checked | ✅ in-memory ANN scan + exact fallback path | ⚠️ runtime graph, not pages | ⚠️ mutation WAL payloads exist; redo into pages open | n/a | ✅ insert/update/delete/vacuum tests | ✅ HNSW recall/latency smoke |
-| Production HNSW | ✅ SQL surface exists | ✅ SQL surface exists | ⚠️ planner can use runtime graph | ⚠️ page-backed arena has meta/node/overflow/free-list pages; relation wiring open | ⚠️ logical replay + page-image LSN redo-skip tests; restart recovery open | n/a | ⚠️ page arena/replay/LSN tests; restart integration open | ❌ certification open |
-| Runtime IVFFlat | ✅ `CREATE INDEX USING ivfflat` | ✅ `lists`/`probes` checked | ✅ centroid/list scan + exact rerank | ⚠️ runtime lists, not pages | ❌ no page redo/recovery | n/a | ✅ DML/vacuum tests | ❌ certification open |
-| Production IVFFlat | ✅ SQL surface exists | ✅ SQL surface exists | ⚠️ runtime path exists | ❌ page-backed centroids/lists open | ❌ bulk-build/insert/tombstone replay open | n/a | ❌ restart/recovery tests open | ❌ certification open |
+| Runtime HNSW | ✅ `CREATE INDEX USING hnsw` | ✅ vector opclasses checked | ✅ ANN scan + exact fallback path | ✅ page-backed graph relation in SQL path | ⚠️ restart smoke exists; large-scale recovery cert/fuzz open | n/a | ✅ insert/update/delete/vacuum + SQL restart tests | ✅ HNSW recall/latency smoke |
+| Production HNSW | ✅ SQL surface exists | ✅ SQL surface exists | ✅ planner can select page-backed HNSW | ✅ meta/node/overflow/free-list page layout wired | ⚠️ restart tests exist; crash/replay fuzz, torn-write, vacuum/rebuild cert open | n/a | ✅ page arena/replay/LSN + SQL restart tests | ⚠️ smoke only; large perf cert open |
+| Runtime IVFFlat | ✅ `CREATE INDEX USING ivfflat` | ✅ `lists`/`probes` checked | ✅ centroid/list scan + exact rerank | ✅ page-backed centroid/list relation in SQL path | ⚠️ restart smoke exists; large-scale recovery cert/fuzz open | n/a | ✅ DML/vacuum + SQL restart tests | ❌ certification open |
+| Production IVFFlat | ✅ SQL surface exists | ✅ SQL surface exists | ✅ planner can select page-backed IVFFlat | ✅ page-backed centroids/lists wired | ⚠️ restart tests exist; crash/replay fuzz, torn-write, compaction cert open | n/a | ✅ SQL restart tests | ❌ certification open |
 | RAG primitive schemas/helpers | n/a | n/a | ✅ normal SQL helpers + tenant RLS predicate injection | ✅ ordinary user tables | ⚠️ tenant RLS sidecar is same-process; restart policy persistence open | n/a | ✅ catalog/server helper tests + RLS wire round trip | ⚠️ RAG quality smoke + tenant RLS tests exist; full cert open |
 | CSV table functions | ✅ `read_csv`, globs, arrays, file literals | ✅ function scan + projection/filter pushdown shapes | ⚠️ external wrapper streams child; CSV reader still stores row buffers | file/object bytes only | n/a | ✅ query results | ✅ local/object/glob/projection/filter tests | ⚠️ CSV gauntlet smoke measured for UltraSQL/DuckDB; ClickHouse unavailable locally; full cert open |
 | Parquet table functions | ✅ `read_parquet`, globs, file literals | ✅ projection/predicate pushdown shapes | ✅ row-group workers yield batches lazily; no upfront full-file batch buffer | ✅ local files plus object range footer/column reads | n/a | ✅ query results | ✅ projection/filter/object-range/row-group-worker/EXPLAIN tests | ⚠️ UltraSQL arena smoke measured; cross-engine cert open |
@@ -1806,15 +1811,19 @@ and benchmark certification against PostgreSQL + pgvector on the same host.
   probe LIMIT k` always avoids a full sort, applies scalar filters before
   distance work, exposes the chosen kernel/index/fallback in `EXPLAIN
   ANALYZE`, and has raw artifacts for filtered and unfiltered exact search.
-- [x] **Runtime ANN slice** — HNSW and IVFFlat SQL surfaces, in-memory access
-  methods, DML maintenance, tombstones, VACUUM compaction, opclasses, and
-  exact rerank paths exist. This is useful as a correctness oracle and first
-  planner target, but it is not yet a production index storage layer.
-- [ ] **Production ANN slice** — continue from the page-backed HNSW arena and
-  redo-idempotent LSN tests into buffer-pool relation wiring, restart
-  recovery, deletes, VACUUM compaction, rebuild, CREATE INDEX CONCURRENTLY
-  behavior, filtered-query fallback/iterative scan policy, IVFFlat page
-  storage, and recall-vs-latency tests against exact scan.
+- [x] **Runtime ANN slice** — HNSW and IVFFlat SQL surfaces, earlier
+  in-memory access methods, DML maintenance, tombstones, VACUUM compaction,
+  opclasses, and exact rerank paths exist. This slice now has a page-backed
+  SQL path; the remaining gap is certification depth, not total absence of
+  persistent index relations.
+- [x] **Production ANN restart slice** — page-backed HNSW and IVFFlat objects
+  are wired through SQL, survive server restart, and report page-backed index
+  selection in `EXPLAIN ANALYZE`.
+- [ ] **Production ANN certification slice** — harden page-backed HNSW and
+  IVFFlat with large-scale crash/restart recovery certification, WAL replay
+  fuzz/property tests, torn-write/corruption handling, VACUUM/rebuild stress,
+  CREATE INDEX CONCURRENTLY behavior, filtered-query fallback/iterative scan
+  policy, and recall-vs-latency artifacts against exact scan.
 - [x] **RAG tenant RLS slice, narrow predicate** — `CREATE POLICY`,
   `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `SET ultrasql.tenant_id`, read
   predicate injection, and `INSERT ... VALUES` `WITH CHECK` enforcement work
@@ -1823,11 +1832,15 @@ and benchmark certification against PostgreSQL + pgvector on the same host.
   persistent policy catalog/restart bootstrap, full PostgreSQL RLS semantics,
   `INSERT ... SELECT`, update new-row checks, role-scoped policies, and tenant
   certification artifacts.
-- [ ] **Vector benchmark certification slice** — expand current exact top-k,
-  HNSW recall/latency, hybrid search latency, and RAG retrieval quality smoke
-  artifacts into committed certification artifacts for filtered exact scan,
-  IVFFlat, bulk load, index build, update/delete maintenance, WAL recovery, and
-  larger hybrid RAG query shapes.
+- [ ] **AI/vector benchmark certification slice** — current measured smoke
+  artifacts include exact top-k, HNSW ANN recall/latency, hybrid search
+  latency, and RAG retrieval quality. The AI gauntlet still emits
+  `not_available` for missing runner suites:
+  `filtered_vector_search`, `ingestion_throughput`,
+  `memory_per_million_vectors`, and `cold_start_index_load`. Expand the smoke
+  set into committed certification artifacts for those suites plus IVFFlat,
+  bulk load, index build, update/delete maintenance, WAL recovery, and larger
+  hybrid RAG query shapes.
   Certification must compare UltraSQL against PostgreSQL + pgvector on the
   same host and report recall@k, p50/p95/p99 latency, throughput, index size,
   build time, memory, and restart correctness. No v1.0 vector claim is allowed

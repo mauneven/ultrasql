@@ -258,6 +258,51 @@ raw per-engine artifacts under `benchmarks/results/latest/raw/`, and the
 also write `passed: false` summaries so roadmap status never depends on
 an absent artifact.
 
+### Firebolt Core Local Setup
+
+Firebolt comparison artifacts use Firebolt Core running locally in Docker.
+Firebolt Core is a closed-source Docker image pulled from Firebolt's
+published container registry. It is not vendored, copied, or redistributed
+by UltraSQL.
+
+UltraSQL's local helper is the only supported benchmark path:
+
+```text
+benchmarks/firebolt_core_local.sh start
+benchmarks/firebolt_core_local.sh status
+benchmarks/firebolt_core_local.sh query "SELECT 42;"
+benchmarks/firebolt_core_local.sh stop
+benchmarks/firebolt_core_local.sh clean
+```
+
+The helper defaults to `ghcr.io/firebolt-db/firebolt-core:preview-rc`,
+container name `ultrasql-firebolt-core`, data directory
+`target/firebolt-core-data`, and internal benchmark endpoint
+`http://127.0.0.1:3473`. Override only local Docker binding details with
+`FIREBOLT_CORE_ENDPOINT`, `FIREBOLT_CORE_IMAGE`, `FIREBOLT_CORE_TAG`,
+`FIREBOLT_CORE_CONTAINER`, `FIREBOLT_CORE_DATA_DIR`, or
+`FIREBOLT_CORE_WAIT_SECS`.
+
+The official local install/run command from Firebolt is also acceptable for
+manual setup, as long as the resulting Core process listens on the same local
+endpoint used by the benchmark helper:
+
+```text
+bash <(curl -s https://get-core.firebolt.io/) --auto-run
+```
+
+Record these hardware facts beside any publishable Firebolt artifact:
+same-host CPU model, core count, RAM, OS, Docker engine/Desktop version,
+Firebolt Core image tag or digest, UltraSQL git commit, benchmark profile,
+row count, warmup, iterations, and whether the run used Docker Desktop or
+Linux Docker Engine. If any of those are missing, keep the artifact raw-only.
+
+No claim policy: a Firebolt comparison exists only when the Firebolt artifact
+is `status: "measured"`, came from local Firebolt Core Docker on the same
+host/window as UltraSQL, and includes the required plan evidence for that
+suite. `not_available`, missing Docker, image pull failure, unsupported SQL,
+or missing plan evidence are visible setup gaps, not losses or wins.
+
 ### Firebolt Aggregating Index
 
 Firebolt comparison artifacts are recorded by:
@@ -267,12 +312,7 @@ benchmarks/firebolt_aggregate_index.sh smoke
 ```
 
 The runner auto-starts local Firebolt Core through
-`benchmarks/firebolt_core_local.sh wait` when Docker is available. The
-default internal endpoint is `http://127.0.0.1:3473`; override it only with
-`FIREBOLT_CORE_ENDPOINT` when the local Core container is bound elsewhere.
-Firebolt Core is a closed-source Docker image pulled from Firebolt's
-published container registry. It is not vendored, copied, or redistributed
-by UltraSQL.
+`benchmarks/firebolt_core_local.sh wait` when Docker is available.
 
 The runner targets Firebolt's documented aggregating-index strength:
 repeated dashboard-style filtered `GROUP BY` queries over a fact table.

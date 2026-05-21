@@ -90,6 +90,10 @@ fn firebolt_core_local_helper_manages_local_docker_core_only() {
     assert!(!script.contains(LEGACY_FIREBOLT_REMOTE_ENV));
     assert!(docs.contains("closed-source Docker image"));
     assert!(docs.contains("not vendored"));
+    assert!(docs.contains("benchmarks/firebolt_core_local.sh start"));
+    assert!(docs.contains("benchmarks/firebolt_core_local.sh query \"SELECT 42;\""));
+    assert!(docs.contains("same-host CPU model"));
+    assert!(docs.contains("No claim policy"));
     assert!(!docs.contains(LEGACY_FIREBOLT_REMOTE_ENV));
 }
 
