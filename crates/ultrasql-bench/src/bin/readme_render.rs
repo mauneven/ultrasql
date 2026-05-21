@@ -687,10 +687,21 @@ fn merge_latest_raw_results(
         return;
     }
 
-    let firebolt_readme_ids = [
+    let raw_pair_ids = [
         "firebolt_aggregate_index_10k",
         "late_materialization_10k",
         "vector_ann_hnsw_512_8d_k10",
+    ];
+    let raw_firebolt_generic_ids = [
+        "select_sum_65k_i64",
+        "filter_sum_1m_i64",
+        "select_avg_1m_i64",
+        "insert_throughput_10k",
+        "select_scan_10k",
+        "update_throughput_10k",
+        "delete_throughput_10k",
+        "mixed_oltp_pgbench_like",
+        "window_row_number_65k_i64",
     ];
     let mut rows_by_workload: HashMap<String, Vec<(String, f64)>> = HashMap::new();
     let Ok(entries) = std::fs::read_dir(&raw_dir) else {
@@ -711,7 +722,13 @@ fn merge_latest_raw_results(
         let Some(workload) = doc.get("workload").and_then(|value| value.as_str()) else {
             continue;
         };
-        if !firebolt_readme_ids.contains(&workload) {
+        let Some(engine) = doc.get("engine").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let is_pair_workload = raw_pair_ids.contains(&workload);
+        let is_generic_firebolt_workload = raw_firebolt_generic_ids.contains(&workload)
+            && engine.to_ascii_lowercase().contains("firebolt");
+        if !is_pair_workload && !is_generic_firebolt_workload {
             continue;
         }
         if doc
@@ -721,9 +738,6 @@ fn merge_latest_raw_results(
         {
             continue;
         }
-        let Some(engine) = doc.get("engine").and_then(|value| value.as_str()) else {
-            continue;
-        };
         let Some(latency_us) = readme_latency_us(&doc) else {
             continue;
         };
@@ -733,7 +747,7 @@ fn merge_latest_raw_results(
             .push((engine.to_string(), latency_us));
     }
 
-    for workload in firebolt_readme_ids {
+    for workload in raw_pair_ids {
         let Some(mut rows) = rows_by_workload.remove(workload) else {
             continue;
         };
@@ -742,6 +756,17 @@ fn merge_latest_raw_results(
         }
         rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         write_side.insert(workload.to_string(), rows);
+    }
+    for workload in raw_firebolt_generic_ids {
+        let Some(rows) = rows_by_workload.remove(workload) else {
+            continue;
+        };
+        let entry = write_side.entry(workload.to_string()).or_default();
+        for (engine, latency_us) in rows {
+            entry.retain(|(existing_engine, _)| existing_engine != &engine);
+            entry.push((engine, latency_us));
+        }
+        entry.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     }
 }
 
@@ -1089,6 +1114,44 @@ rest\n";
         assert!(rendered.contains("Firebolt aggregating-index dashboard aggregate"));
         assert!(rendered.contains("| **UltraSQL** | 185.42 µs | — |"));
         assert!(rendered.contains("| Firebolt Core | 5.20 ms | 2,703% slower |"));
+        assert!(!rendered.contains("stale content"));
+    }
+
+    #[test]
+    fn latest_raw_firebolt_artifacts_append_to_generic_tables() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let readme_path = dir.path().join("README.md");
+        let baselines_dir = dir.path().join("baselines");
+        let latest_dir = dir.path().join("latest");
+        let raw_dir = latest_dir.join("raw");
+        let latest_results = latest_dir.join("results.json");
+        std::fs::create_dir_all(&baselines_dir).expect("create baselines dir");
+        std::fs::create_dir_all(&raw_dir).expect("create raw dir");
+        std::fs::write(
+            &latest_results,
+            r#"{"workloads":{"select_sum_65k_i64":{"engines":[{"engine":"ultrasql","median_us":45.0},{"engine":"duckdb","median_us":90.0}]}}}"#,
+        )
+        .expect("write latest results");
+        std::fs::write(
+            raw_dir.join("select_sum_65k_i64-firebolt.json"),
+            r#"{"engine":"firebolt","workload":"select_sum_65k_i64","status":"measured","median_us":1200.0}"#,
+        )
+        .expect("write firebolt raw");
+        std::fs::write(
+            &readme_path,
+            "# Test\n\
+             <!-- BEGIN AUTO: BENCH:select_sum_65k_i64 -->\n\
+             stale content\n\
+             <!-- END AUTO: BENCH:select_sum_65k_i64 -->\n",
+        )
+        .expect("write readme");
+
+        run(&readme_path, &baselines_dir, &latest_results, false).expect("render readme");
+        let rendered = std::fs::read_to_string(&readme_path).expect("read rendered readme");
+
+        assert!(rendered.contains("| **UltraSQL** | 45.00 µs | — |"));
+        assert!(rendered.contains("| DuckDB | 90.00 µs | 100.0% slower |"));
+        assert!(rendered.contains("| Firebolt Core | 1.20 ms | 2,567% slower |"));
         assert!(!rendered.contains("stale content"));
     }
 

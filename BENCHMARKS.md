@@ -313,6 +313,25 @@ host/window as UltraSQL, and includes the required plan evidence for that
 suite. `not_available`, missing Docker, image pull failure, unsupported SQL,
 or missing plan evidence are visible setup gaps, not losses or wins.
 
+### Firebolt README Matrix Rows
+
+Firebolt rows in the generic README benchmark tables are recorded by:
+
+```text
+benchmarks/firebolt_readme_matrix.sh
+cargo run --package ultrasql-bench --bin readme-render
+```
+
+The runner emits local Core artifacts for the nine generic README workloads:
+`select_sum_65k_i64`, `filter_sum_1m_i64`, `select_avg_1m_i64`,
+`insert_throughput_10k`, `select_scan_10k`, `update_throughput_10k`,
+`delete_throughput_10k`, `mixed_oltp_pgbench_like`, and
+`window_row_number_65k_i64`. It defaults to 32 measured samples plus one
+warmup, uses `generate_series` to build deterministic Firebolt tables, and
+writes `benchmarks/results/latest/raw/<workload>-firebolt.json`.
+`readme-render` appends only `status: "measured"` Firebolt artifacts; missing
+or failed local Core runs do not create README rows.
+
 ### Firebolt Aggregating Index
 
 Firebolt comparison artifacts are recorded by:

@@ -103,6 +103,33 @@ fn firebolt_vector_script_declares_hnsw_vector_search_workload() {
 }
 
 #[test]
+fn firebolt_readme_matrix_declares_generic_workloads() {
+    let script = repo_file("benchmarks/firebolt_readme_matrix.sh");
+    let renderer = repo_file("crates/ultrasql-bench/src/bin/readme_render.rs");
+
+    for workload in [
+        "select_sum_65k_i64",
+        "filter_sum_1m_i64",
+        "select_avg_1m_i64",
+        "insert_throughput_10k",
+        "select_scan_10k",
+        "update_throughput_10k",
+        "delete_throughput_10k",
+        "mixed_oltp_pgbench_like",
+        "window_row_number_65k_i64",
+    ] {
+        assert!(script.contains(workload), "script missing {workload}");
+        assert!(renderer.contains(workload), "renderer missing {workload}");
+    }
+    assert!(script.contains("generate_series"));
+    assert!(script.contains("FIREBOLT_README_ITERS"));
+    assert!(script.contains("FIREBOLT_CORE_HELPER"));
+    assert!(script.contains("local_docker"));
+    assert!(script.contains("firebolt_readme_workload_failed"));
+    assert!(renderer.contains("raw_firebolt_generic_ids"));
+}
+
+#[test]
 fn firebolt_core_local_helper_manages_local_docker_core_only() {
     let script = repo_file("benchmarks/firebolt_core_local.sh");
     let docs = repo_file("BENCHMARKS.md");
@@ -337,6 +364,7 @@ fn firebolt_aggregate_script_has_valid_bash_syntax() {
         "benchmarks/firebolt_sparse_pruning.sh",
         "benchmarks/firebolt_vector_search.sh",
         "benchmarks/late_materialization.sh",
+        "benchmarks/firebolt_readme_matrix.sh",
     ] {
         assert_firebolt_script_has_valid_bash_syntax(script_name);
     }
