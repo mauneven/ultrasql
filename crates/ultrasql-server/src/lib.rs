@@ -2024,6 +2024,24 @@ impl Server {
         }
     }
 
+    /// Commit a transaction and, when it changed persistent heap/index state,
+    /// force its commit marker durable before reporting success.
+    pub(crate) fn commit_transaction(
+        &self,
+        txn: ultrasql_txn::Transaction,
+        durable_commit_marker: bool,
+        context: &str,
+    ) -> Result<(), ServerError> {
+        let xid = txn.xid;
+        self.txn_manager
+            .commit(txn)
+            .map_err(|e| ServerError::ddl(format!("{context} commit: {e}")))?;
+        if durable_commit_marker && let Some(commit_lsn) = self.append_commit_record(xid)? {
+            self.wait_for_wal_durable(commit_lsn)?;
+        }
+        Ok(())
+    }
+
     /// Flush dirty heap pages into the sample server's spill store.
     pub fn flush_dirty_heap_pages(&self) -> Result<usize, ServerError> {
         let loader = self.page_loader.clone();
@@ -3318,12 +3336,7 @@ impl Server {
             }
             return Err(ServerError::Catalog(e));
         }
-        if let Err(e) = self.txn_manager.commit(catalog_txn) {
-            tracing::warn!(
-                error = %e,
-                "ANALYZE catalog statistics transaction commit failed",
-            );
-        }
+        self.commit_transaction(catalog_txn, true, "ANALYZE catalog statistics transaction")?;
         self.stats_catalog.write().register(stats);
         self.persistent_catalog
             .replace_statistics(entry.oid, stat_rows);

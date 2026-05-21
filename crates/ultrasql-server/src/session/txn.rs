@@ -373,15 +373,13 @@ where
                         return Err(e);
                     }
                 }
-                let xid = txn.xid;
-                if let Err(e) = self.state.txn_manager.commit(txn) {
+                if let Err(e) = self.state.commit_transaction(
+                    txn,
+                    !modified_tables.is_empty(),
+                    "explicit COMMIT",
+                ) {
                     tracing::warn!(error = %e, "explicit COMMIT failed to finalise");
                 } else {
-                    if !modified_tables.is_empty()
-                        && let Some(commit_lsn) = self.state.append_commit_record(xid)?
-                    {
-                        self.state.wait_for_wal_durable(commit_lsn)?;
-                    }
                     self.state.note_commit_for_gc();
                     if let Err(e) =
                         self.maintain_aggregating_indexes_for_tables_after_commit(&modified_tables)

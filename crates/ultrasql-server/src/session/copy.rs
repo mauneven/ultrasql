@@ -86,17 +86,8 @@ where
         rows_changed: u64,
         context: &str,
     ) -> Result<(), ServerError> {
-        let xid = txn.xid;
         self.state
-            .txn_manager
-            .commit(txn)
-            .map_err(|e| ServerError::ddl(format!("{context} commit failed: {e}")))?;
-        if rows_changed > 0
-            && let Some(commit_lsn) = self.state.append_commit_record(xid)?
-        {
-            self.state.wait_for_wal_durable(commit_lsn)?;
-        }
-        Ok(())
+            .commit_transaction(txn, rows_changed > 0, context)
     }
 
     /// Best-effort parse + bind that returns `Some(plan)` only when `sql`

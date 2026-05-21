@@ -1448,14 +1448,15 @@ where
                         return Err(e);
                     }
                 }
-                if let Err(e) = self.state.txn_manager.commit(txn) {
+                if let Err(e) = self
+                    .state
+                    .commit_transaction(txn, is_dml, "autocommit statement")
+                {
+                    if is_dml {
+                        return Err(e);
+                    }
                     tracing::warn!(error = %e, "autocommit failed to finalise");
                 } else {
-                    if is_dml {
-                        if let Some(commit_lsn) = self.state.append_commit_record(xid)? {
-                            self.state.wait_for_wal_durable(commit_lsn)?;
-                        }
-                    }
                     self.pending_post_commit_maintenance = true;
                     let rows = result.rows;
                     let modified_table = (rows > 0)
@@ -1625,12 +1626,11 @@ where
             }
             return Err(ServerError::Catalog(e));
         }
-        if let Err(e) = self.state.txn_manager.commit(catalog_txn) {
-            tracing::warn!(
-                error = %e,
-                "CREATE STATISTICS catalog transaction commit failed",
-            );
-        }
+        self.state.commit_transaction(
+            catalog_txn,
+            true,
+            "CREATE STATISTICS catalog transaction",
+        )?;
         self.plan_cache_invalidate();
         Ok(result_encoder::SelectResult {
             messages: vec![BackendMessage::CommandComplete {

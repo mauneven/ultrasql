@@ -445,12 +445,8 @@ where
             }
             return Err(e.into());
         }
-        if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
-            tracing::warn!(
-                error = %commit_err,
-                "catalog-write txn failed to commit; restart visibility may differ",
-            );
-        }
+        self.state
+            .commit_transaction(ddl_txn, true, "CREATE TABLE catalog-write transaction")?;
         if let Some(partition) = partition {
             self.state.time_partitions.insert(
                 table_name.clone(),
@@ -548,12 +544,11 @@ where
                 return Err(e);
             }
         };
-        if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
-            tracing::warn!(
-                error = %commit_err,
-                "materialized-view DDL txn failed to commit",
-            );
-        }
+        self.state.commit_transaction(
+            ddl_txn,
+            true,
+            "CREATE MATERIALIZED VIEW catalog transaction",
+        )?;
         runtime
             .materialized_rows
             .store(materialized_rows, std::sync::atomic::Ordering::Release);
@@ -711,9 +706,8 @@ where
                 &txn.snapshot,
                 self.state.txn_manager.as_ref(),
             );
-            if let Err(e) = self.state.txn_manager.commit(txn) {
-                tracing::warn!(error = %e, "autocommit (CREATE AGGREGATING INDEX) failed to finalise");
-            }
+            self.state
+                .commit_transaction(txn, false, "CREATE AGGREGATING INDEX scan")?;
             let rows = build_result?;
             let attnums = columns
                 .iter()
@@ -752,12 +746,11 @@ where
                 let _ = self.state.persistent_catalog.drop_index(index_name);
                 return Err(e.into());
             }
-            if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
-                tracing::warn!(
-                    error = %commit_err,
-                    "catalog-write txn failed to commit; restart visibility may differ",
-                );
-            }
+            self.state.commit_transaction(
+                ddl_txn,
+                true,
+                "CREATE AGGREGATING INDEX catalog transaction",
+            )?;
             let mut constraints = self
                 .state
                 .table_constraints
@@ -858,9 +851,8 @@ where
                     .bulk_load_logged(rows, txn.xid, self.state.heap.wal_sink().map(Arc::as_ref))
                     .map_err(|e| ServerError::ddl(format!("CREATE INDEX ivfflat bulk load: {e}")))
             })();
-            if let Err(e) = self.state.txn_manager.commit(txn) {
-                tracing::warn!(error = %e, "autocommit (CREATE INDEX ivfflat) failed to finalise");
-            }
+            self.state
+                .commit_transaction(txn, true, "CREATE INDEX ivfflat build")?;
             build_result?;
             let attnum = u16::try_from(vector_col).map_err(|_| {
                 ServerError::Unsupported(
@@ -896,12 +888,11 @@ where
                 let _ = self.state.persistent_catalog.drop_index(index_name);
                 return Err(e.into());
             }
-            if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
-                tracing::warn!(
-                    error = %commit_err,
-                    "catalog-write txn failed to commit; restart visibility may differ",
-                );
-            }
+            self.state.commit_transaction(
+                ddl_txn,
+                true,
+                "CREATE IVFFLAT INDEX catalog transaction",
+            )?;
             let mut constraints = self
                 .state
                 .table_constraints
@@ -1001,9 +992,8 @@ where
                 }
                 Ok(())
             })();
-            if let Err(e) = self.state.txn_manager.commit(txn) {
-                tracing::warn!(error = %e, "autocommit (CREATE INDEX hnsw) failed to finalise");
-            }
+            self.state
+                .commit_transaction(txn, true, "CREATE INDEX hnsw build")?;
             build_result?;
             let attnum = u16::try_from(vector_col).map_err(|_| {
                 ServerError::Unsupported(
@@ -1039,12 +1029,11 @@ where
                 let _ = self.state.persistent_catalog.drop_index(index_name);
                 return Err(e.into());
             }
-            if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
-                tracing::warn!(
-                    error = %commit_err,
-                    "catalog-write txn failed to commit; restart visibility may differ",
-                );
-            }
+            self.state.commit_transaction(
+                ddl_txn,
+                true,
+                "CREATE HNSW INDEX catalog transaction",
+            )?;
             let mut constraints = self
                 .state
                 .table_constraints
@@ -1172,9 +1161,8 @@ where
 
         // Commit the txn regardless of build outcome so the XID does
         // not leak as in-progress forever.
-        if let Err(e) = self.state.txn_manager.commit(txn) {
-            tracing::warn!(error = %e, "autocommit (CREATE INDEX) failed to finalise");
-        }
+        self.state
+            .commit_transaction(txn, true, "CREATE INDEX build")?;
         let _ = insert_result?;
 
         // 4. Register the index entry. The columns vector uses the
@@ -1206,12 +1194,8 @@ where
             let _ = self.state.persistent_catalog.drop_index(index_name);
             return Err(e.into());
         }
-        if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
-            tracing::warn!(
-                error = %commit_err,
-                "catalog-write txn failed to commit; restart visibility may differ",
-            );
-        }
+        self.state
+            .commit_transaction(ddl_txn, true, "CREATE INDEX catalog transaction")?;
         if !expression_key_exprs.is_empty()
             || predicate.is_some()
             || !include_columns.is_empty()

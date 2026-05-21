@@ -508,11 +508,18 @@ where
                             return Err(e);
                         }
                     }
-                    if let Err(e) = self.state.txn_manager.commit(txn) {
-                        tracing::warn!(
-                            error = %e,
-                            "autocommit failed to finalise (Extended Execute)",
-                        );
+                    let is_dml = portal_plan
+                        .as_ref()
+                        .and_then(Self::dml_target_table)
+                        .is_some();
+                    if let Err(e) =
+                        self.state
+                            .commit_transaction(txn, is_dml, "Extended Execute autocommit")
+                    {
+                        if is_dml {
+                            return Err(e);
+                        }
+                        tracing::warn!(error = %e, "autocommit failed to finalise (Extended Execute)");
                     } else {
                         self.state.note_commit_for_gc();
                         if let (Some(plan), Ok(outcome)) = (portal_plan.as_ref(), res.as_ref()) {

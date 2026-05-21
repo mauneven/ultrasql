@@ -568,16 +568,17 @@ impl PersistentCatalog {
         let mut indexes_by_table: std::collections::HashMap<Oid, Vec<IndexEntry>> =
             initial.indexes_by_table.clone();
 
-        // Group attribute rows by `attrelid` so the per-relation schema
-        // can be rebuilt in one pass.
+        // Keep the latest attribute row per `(attrelid, attnum)`, then group
+        // by relation so append-only ALTER TABLE catalog rows replace older
+        // schema history during bootstrap.
         let attribute_blocks = heap.block_count(pg_attribute_rel);
-        let mut attrs_by_relation: std::collections::HashMap<
-            Oid,
-            Vec<(
+        let mut latest_attrs_by_key: std::collections::HashMap<
+            (Oid, i16),
+            (
                 crate::persistent::AttributeRow,
                 ultrasql_core::DataType,
                 bool,
-            )>,
+            ),
         > = std::collections::HashMap::new();
         let mut attribute_rows: std::collections::HashMap<(Oid, i16), AttributeRow> =
             std::collections::HashMap::new();
@@ -591,14 +592,25 @@ impl PersistentCatalog {
                 let (row, dt, nullable) = decode_attribute_row(&tuple.data).map_err(|e| {
                     CatalogError::schema_conflict(format!("decode pg_attribute row: {e}"))
                 })?;
-                attrs_by_relation.entry(row.attrelid).or_default().push((
-                    row.clone(),
-                    dt,
-                    nullable,
-                ));
-                attribute_rows.insert((row.attrelid, row.attnum), row);
+                let key = (row.attrelid, row.attnum);
+                attribute_rows.insert(key, row.clone());
+                latest_attrs_by_key.insert(key, (row, dt, nullable));
                 total_attrs = total_attrs.saturating_add(1);
             }
+        }
+        let mut attrs_by_relation: std::collections::HashMap<
+            Oid,
+            Vec<(
+                crate::persistent::AttributeRow,
+                ultrasql_core::DataType,
+                bool,
+            )>,
+        > = std::collections::HashMap::new();
+        for (_, (row, dt, nullable)) in latest_attrs_by_key {
+            attrs_by_relation
+                .entry(row.attrelid)
+                .or_default()
+                .push((row, dt, nullable));
         }
 
         let index_blocks = heap.block_count(pg_index_rel);
@@ -655,11 +667,13 @@ impl PersistentCatalog {
             }
         }
 
-        // Decode pg_class rows. Each user table maps to one TableEntry
-        // whose schema is rebuilt from the matching attribute rows.
+        // Decode pg_class rows. The catalog heap is append-only, so keep the
+        // latest row per OID before rebuilding tables. This lets ALTER TABLE
+        // replacement rows override CREATE-time rows without consuming the
+        // attribute set twice.
         let class_scan = heap.scan(pg_class_rel, class_blocks);
-        let mut user_relations: u32 = 0;
-        let mut user_index_classes: Vec<ClassRow> = Vec::new();
+        let mut latest_class_by_oid: std::collections::HashMap<Oid, ClassRow> =
+            std::collections::HashMap::new();
         let mut highest_oid: u32 = self.next_oid.load(Ordering::Acquire);
         for result in class_scan {
             let tuple = result.map_err(|e| {
@@ -671,8 +685,14 @@ impl PersistentCatalog {
             if class_row.oid.raw() < crate::memory::FIRST_USER_OID {
                 continue;
             }
-            user_relations = user_relations.saturating_add(1);
             highest_oid = highest_oid.max(class_row.oid.raw().saturating_add(1));
+            latest_class_by_oid.insert(class_row.oid, class_row);
+        }
+
+        let mut user_relations: u32 = 0;
+        let mut user_index_classes: Vec<ClassRow> = Vec::new();
+        for (_, class_row) in latest_class_by_oid {
+            user_relations = user_relations.saturating_add(1);
             match class_row.relkind {
                 RelKind::Table | RelKind::MaterializedView => {
                     let attrs = attrs_by_relation.remove(&class_row.oid).unwrap_or_default();
@@ -1041,6 +1061,110 @@ impl PersistentCatalog {
         command_id: ultrasql_core::CommandId,
     ) -> Result<(), CatalogError> {
         self.persist_table_rows_with_defaults(entry, &[], heap, xmin, command_id)
+    }
+
+    /// Append catalog rows for a table schema replacement.
+    ///
+    /// `pg_attribute` is append-only. To replace a compacted UltraSQL schema
+    /// after `ALTER TABLE`, write dropped markers for every old attnum first,
+    /// then write the new compacted attributes. Bootstrap keeps the latest row
+    /// per `(attrelid, attnum)`, so reused attnums resolve to the new schema
+    /// and old surplus attnums resolve to dropped columns.
+    pub fn persist_table_schema_replacement<L: PageLoader>(
+        &self,
+        old_entry: &TableEntry,
+        new_entry: &TableEntry,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::encode_attribute_row;
+        use crate::persistent::{AttributeRow, ClassRow};
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
+        let pg_attribute_rel = RelationId::new(bootstrap::PG_ATTRIBUTE_OID);
+        let namespace_oid = if new_entry.schema_name == "pg_catalog" {
+            Oid::new(bootstrap::PG_CATALOG_OID)
+        } else {
+            Oid::new(bootstrap::PUBLIC_OID)
+        };
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+        let class_row = ClassRow {
+            oid: new_entry.oid,
+            relname: new_entry.name.clone(),
+            relnamespace: namespace_oid,
+            relkind: RelKind::Table,
+            relpages: new_entry.n_blocks,
+            reltuples: 0.0,
+            relfilenode: new_entry.root_block.raw(),
+            relhasindex: false,
+        };
+        heap.insert(
+            pg_class_rel,
+            &class_row.encode(),
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_class insert: {e}")))?;
+
+        for (i, field) in old_entry.schema.fields().iter().enumerate() {
+            let attr_row = AttributeRow {
+                attrelid: new_entry.oid,
+                attname: field.name.clone(),
+                atttypid: 0,
+                attnum: i16::try_from(i + 1).unwrap_or(i16::MAX),
+                attnotnull: !field.nullable,
+                atthasdef: false,
+                attisdropped: true,
+            };
+            let bytes = encode_attribute_row(&attr_row, &field.data_type, field.nullable)
+                .map_err(|e| CatalogError::schema_conflict(format!("encode pg_attribute: {e}")))?;
+            heap.insert(
+                pg_attribute_rel,
+                &bytes,
+                InsertOptions {
+                    xmin,
+                    command_id,
+                    wal,
+                    fsm: None,
+                    vm: None,
+                },
+            )
+            .map_err(|e| CatalogError::schema_conflict(format!("pg_attribute insert: {e}")))?;
+        }
+
+        for (i, field) in new_entry.schema.fields().iter().enumerate() {
+            let attr_row = AttributeRow {
+                attrelid: new_entry.oid,
+                attname: field.name.clone(),
+                atttypid: 0,
+                attnum: i16::try_from(i + 1).unwrap_or(i16::MAX),
+                attnotnull: !field.nullable,
+                atthasdef: false,
+                attisdropped: false,
+            };
+            let bytes = encode_attribute_row(&attr_row, &field.data_type, field.nullable)
+                .map_err(|e| CatalogError::schema_conflict(format!("encode pg_attribute: {e}")))?;
+            heap.insert(
+                pg_attribute_rel,
+                &bytes,
+                InsertOptions {
+                    xmin,
+                    command_id,
+                    wal,
+                    fsm: None,
+                    vm: None,
+                },
+            )
+            .map_err(|e| CatalogError::schema_conflict(format!("pg_attribute insert: {e}")))?;
+        }
+        Ok(())
     }
 
     /// Append `pg_class` / `pg_attribute` rows for one user table with

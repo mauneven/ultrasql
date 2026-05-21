@@ -199,7 +199,7 @@ where
                         UpdateOptions {
                             xid: txn.xid,
                             command_id: ultrasql_core::CommandId::FIRST,
-                            wal: None,
+                            wal: self.state.heap.wal_sink().map(|sink| sink.as_ref()),
                             vm: Some(self.state.vm.as_ref()),
                             hot_eligible: true,
                         },
@@ -213,13 +213,32 @@ where
 
         match rewrite_result {
             Ok(()) => {
-                self.state
+                let updated_entry = self
+                    .state
                     .persistent_catalog
                     .alter_table_replace_schema(table_name, new_schema)
                     .map_err(ServerError::Catalog)?;
-                self.state.txn_manager.commit(txn).map_err(|e| {
-                    ServerError::ddl(format!("ALTER TABLE DROP COLUMN commit: {e}"))
-                })?;
+                if let Err(e) = self
+                    .state
+                    .persistent_catalog
+                    .persist_table_schema_replacement(
+                        entry,
+                        &updated_entry,
+                        self.state.heap.as_ref(),
+                        txn.xid,
+                        txn.current_command,
+                    )
+                {
+                    if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                        tracing::warn!(
+                            error = %abort_err,
+                            "ALTER TABLE DROP COLUMN catalog transaction abort failed",
+                        );
+                    }
+                    return Err(e.into());
+                }
+                self.state
+                    .commit_transaction(txn, true, "ALTER TABLE DROP COLUMN")?;
                 self.state.plan_cache.invalidate_all();
                 Ok(run_ddl_command(&format!(
                     "ALTER TABLE DROP COLUMN {column_name}"
@@ -363,7 +382,7 @@ where
                         UpdateOptions {
                             xid: txn.xid,
                             command_id: ultrasql_core::CommandId::FIRST,
-                            wal: None,
+                            wal: self.state.heap.wal_sink().map(|sink| sink.as_ref()),
                             vm: Some(self.state.vm.as_ref()),
                             hot_eligible: true,
                         },
@@ -379,12 +398,31 @@ where
         //    will mark aborted on rollback).
         match rewrite_result {
             Ok(()) => {
-                self.state
+                let updated_entry = self
+                    .state
                     .persistent_catalog
                     .alter_table_add_column(table_name, column)?;
-                if let Err(e) = self.state.txn_manager.commit(txn) {
-                    tracing::warn!(error = %e, "autocommit (ALTER TABLE) failed to finalise");
+                if let Err(e) = self
+                    .state
+                    .persistent_catalog
+                    .persist_table_schema_replacement(
+                        entry,
+                        &updated_entry,
+                        self.state.heap.as_ref(),
+                        txn.xid,
+                        txn.current_command,
+                    )
+                {
+                    if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                        tracing::warn!(
+                            error = %abort_err,
+                            "ALTER TABLE ADD COLUMN catalog transaction abort failed",
+                        );
+                    }
+                    return Err(e.into());
                 }
+                self.state
+                    .commit_transaction(txn, true, "ALTER TABLE ADD COLUMN")?;
                 // A schema change can invalidate any cached projection-
                 // pushdown / predicate-pushdown decision; clear all.
                 self.plan_cache_invalidate();
@@ -552,9 +590,7 @@ where
 
         match truncate_result {
             Ok(()) => {
-                if let Err(e) = self.state.txn_manager.commit(txn) {
-                    tracing::warn!(error = %e, "autocommit (TRUNCATE) failed to finalise");
-                }
+                self.state.commit_transaction(txn, true, "TRUNCATE")?;
                 for name in &tables {
                     self.state.columnar_storage.mark_dirty(name);
                 }

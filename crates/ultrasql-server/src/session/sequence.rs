@@ -80,12 +80,8 @@ where
             }
             return Err(e.into());
         }
-        if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
-            tracing::warn!(
-                error = %commit_err,
-                "catalog-write txn failed to commit; restart visibility may differ",
-            );
-        }
+        self.state
+            .commit_transaction(ddl_txn, true, "CREATE SEQUENCE catalog transaction")?;
         seq.emit_wal(
             SequenceOpKind::Create,
             sequence_name,
