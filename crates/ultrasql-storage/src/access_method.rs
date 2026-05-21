@@ -40,7 +40,7 @@ use std::collections::BTreeMap;
 use parking_lot::Mutex;
 use thiserror::Error;
 use ultrasql_core::constants::PAGE_SIZE;
-use ultrasql_core::{BlockNumber, MAX_VECTOR_DIMS, PageId, RelationId, TupleId, Xid};
+use ultrasql_core::{BlockNumber, Lsn, MAX_VECTOR_DIMS, PageId, RelationId, TupleId, Xid};
 use ultrasql_wal::WalRecord;
 use ultrasql_wal::payload::{HashOpKind, HashOpPayload, HnswOpKind, HnswOpPayload};
 use ultrasql_wal::record::RecordType;
@@ -1495,6 +1495,17 @@ pub struct PageBackedHnswStats {
     pub next_block_number: u32,
 }
 
+/// Snapshot of one page-backed HNSW page as it would cross the buffer-pool
+/// boundary.
+#[derive(Clone, Debug)]
+pub struct PageBackedHnswPageImage {
+    /// Physical page identifier in the index relation.
+    pub page_id: PageId,
+    /// Last WAL LSN whose effects are reflected in this page image.
+    pub lsn: Lsn,
+    page: HnswPersistentPage,
+}
+
 /// First page-backed HNSW storage model.
 ///
 /// This is deliberately narrower than the runtime [`HnswIndex`]: it stores
@@ -1533,6 +1544,7 @@ enum HnswPersistentPage {
 #[derive(Debug, Clone)]
 struct HnswMetaPage {
     page_id: PageId,
+    lsn: Lsn,
     dims: usize,
     metric: HnswMetric,
     m: usize,
@@ -1548,6 +1560,7 @@ struct HnswMetaPage {
 #[derive(Debug, Clone)]
 struct HnswNodePage {
     page_id: PageId,
+    lsn: Lsn,
     node_id: HnswNodeId,
     tid: TupleId,
     vector_len: usize,
@@ -1560,6 +1573,7 @@ struct HnswNodePage {
 #[derive(Debug, Clone)]
 struct HnswOverflowPage {
     page_id: PageId,
+    lsn: Lsn,
     owner_node: HnswNodeId,
     next: Option<BlockNumber>,
     payload: HnswOverflowPayload,
@@ -1574,6 +1588,7 @@ enum HnswOverflowPayload {
 #[derive(Debug, Clone)]
 struct HnswFreeListPage {
     page_id: PageId,
+    lsn: Lsn,
     blocks: Vec<BlockNumber>,
 }
 
@@ -1614,6 +1629,60 @@ impl PageBackedHnswIndex {
             m,
             ef_search,
         })
+    }
+
+    /// Rebuild a page-backed HNSW graph from buffer-pool page images.
+    pub fn from_page_images(
+        index_rel: RelationId,
+        dims: u32,
+        metric: HnswMetric,
+        m: usize,
+        ef_search: usize,
+        images: Vec<PageBackedHnswPageImage>,
+    ) -> Result<Self, AccessMethodError> {
+        if dims == 0 || dims > MAX_VECTOR_DIMS {
+            return Err(AccessMethodError::Storage(
+                "page-backed hnsw dims outside supported range".to_owned(),
+            ));
+        }
+        if m == 0 {
+            return Err(AccessMethodError::Storage(
+                "page-backed hnsw m must be greater than zero".to_owned(),
+            ));
+        }
+        if ef_search == 0 {
+            return Err(AccessMethodError::Storage(
+                "page-backed hnsw ef_search must be greater than zero".to_owned(),
+            ));
+        }
+        let dims = usize::try_from(dims).map_err(|_| {
+            AccessMethodError::Storage("page-backed hnsw dims do not fit usize".to_owned())
+        })?;
+        let storage =
+            PageBackedHnswStorage::from_page_images(index_rel, dims, metric, m, ef_search, images)?;
+        Ok(Self {
+            storage: Mutex::new(storage),
+            index_rel,
+            dims,
+            metric,
+            m,
+            ef_search,
+        })
+    }
+
+    /// Export buffer-pool-style page images in block-number order.
+    #[must_use]
+    pub fn page_images(&self) -> Vec<PageBackedHnswPageImage> {
+        let storage = self.storage.lock();
+        storage
+            .pages
+            .values()
+            .map(|page| PageBackedHnswPageImage {
+                page_id: page.page_id(),
+                lsn: page.lsn(),
+                page: page.clone(),
+            })
+            .collect()
     }
 
     /// Return page and tuple counts for this page-backed graph.
@@ -1659,7 +1728,7 @@ impl PageBackedHnswIndex {
 
     /// Insert one finite vector into page-backed HNSW pages.
     pub fn insert_vector(&self, vector: &[f32], tid: TupleId) -> Result<(), AccessMethodError> {
-        self.insert_vector_internal(vector, tid, false)
+        self.insert_vector_internal(vector, tid, false, Lsn::ZERO)
     }
 
     /// Insert one vector and emit a logical HNSW WAL record when `wal` is set.
@@ -1671,8 +1740,8 @@ impl PageBackedHnswIndex {
         wal: Option<&dyn WalSink>,
     ) -> Result<(), AccessMethodError> {
         self.validate_vector(vector)?;
-        self.emit_hnsw_wal(HnswOpKind::Insert, tid, vector, xid, wal)?;
-        self.insert_vector(vector, tid)
+        let page_lsn = self.emit_hnsw_wal(HnswOpKind::Insert, tid, vector, xid, wal)?;
+        self.insert_vector_internal(vector, tid, false, page_lsn)
     }
 
     /// Search live nodes using exact distance over page-backed vectors.
@@ -1712,7 +1781,7 @@ impl PageBackedHnswIndex {
     /// Mark a node tombstoned. VACUUM reclaims its pages later.
     pub fn mark_deleted(&self, tid: TupleId) -> Result<(), AccessMethodError> {
         let mut storage = self.storage.lock();
-        storage.mark_deleted(tid, false)
+        storage.mark_deleted(tid, false, Lsn::ZERO)
     }
 
     /// Mark a node tombstoned and emit a logical HNSW WAL record.
@@ -1722,14 +1791,15 @@ impl PageBackedHnswIndex {
         xid: Xid,
         wal: Option<&dyn WalSink>,
     ) -> Result<(), AccessMethodError> {
-        self.emit_hnsw_wal(HnswOpKind::Delete, tid, &[], xid, wal)?;
-        self.mark_deleted(tid)
+        let page_lsn = self.emit_hnsw_wal(HnswOpKind::Delete, tid, &[], xid, wal)?;
+        let mut storage = self.storage.lock();
+        storage.mark_deleted(tid, false, page_lsn)
     }
 
     /// Reclaim tombstoned node and overflow pages into the free-list page.
     pub fn vacuum_deleted(&self) -> Result<usize, AccessMethodError> {
         let mut storage = self.storage.lock();
-        storage.vacuum_deleted(self.metric, self.m)
+        storage.vacuum_deleted(self.metric, self.m, Lsn::ZERO)
     }
 
     /// VACUUM tombstoned pages and emit a logical compact WAL record.
@@ -1742,33 +1812,60 @@ impl PageBackedHnswIndex {
             return Ok(0);
         }
         let tid = TupleId::new(PageId::new(self.index_rel, BlockNumber::new(0)), 0);
-        self.emit_hnsw_wal(HnswOpKind::Compact, tid, &[], xid, wal)?;
-        self.vacuum_deleted()
+        let page_lsn = self.emit_hnsw_wal(HnswOpKind::Compact, tid, &[], xid, wal)?;
+        let mut storage = self.storage.lock();
+        storage.vacuum_deleted(self.metric, self.m, page_lsn)
     }
 
     /// Replay one decoded logical HNSW WAL payload into this page arena.
     pub fn apply_wal_payload(&self, payload: &HnswOpPayload) -> Result<(), AccessMethodError> {
+        self.apply_wal_payload_at(Lsn::ZERO, payload)
+    }
+
+    /// Replay one decoded logical HNSW WAL payload at its assigned WAL LSN.
+    pub fn apply_wal_payload_at(
+        &self,
+        lsn: Lsn,
+        payload: &HnswOpPayload,
+    ) -> Result<(), AccessMethodError> {
         if payload.index_rel != self.index_rel {
             return Ok(());
         }
+        if self.storage.lock().redo_covered(lsn) {
+            return Ok(());
+        }
         match payload.op {
-            HnswOpKind::Insert => self.insert_vector_internal(&payload.vector, payload.tid, true),
+            HnswOpKind::Insert => {
+                self.insert_vector_internal(&payload.vector, payload.tid, true, lsn)
+            }
             HnswOpKind::Delete => {
                 let mut storage = self.storage.lock();
-                storage.mark_deleted(payload.tid, true)
+                storage.mark_deleted(payload.tid, true, lsn)
             }
-            HnswOpKind::Compact => self.vacuum_deleted().map(|_| ()),
+            HnswOpKind::Compact => {
+                let mut storage = self.storage.lock();
+                storage.vacuum_deleted(self.metric, self.m, lsn).map(|_| ())
+            }
         }
     }
 
     /// Replay one WAL record, ignoring records that are not HNSW mutations.
     pub fn apply_wal_record(&self, record: &WalRecord) -> Result<(), AccessMethodError> {
+        self.apply_wal_record_at(Lsn::ZERO, record)
+    }
+
+    /// Replay one WAL record at its assigned WAL LSN.
+    pub fn apply_wal_record_at(
+        &self,
+        lsn: Lsn,
+        record: &WalRecord,
+    ) -> Result<(), AccessMethodError> {
         if record.header.record_type != RecordType::HnswOp {
             return Ok(());
         }
         let payload = HnswOpPayload::decode(&record.payload)
             .map_err(|e| AccessMethodError::Storage(format!("decode hnsw WAL payload: {e}")))?;
-        self.apply_wal_payload(&payload)
+        self.apply_wal_payload_at(lsn, &payload)
     }
 
     fn insert_vector_internal(
@@ -1776,6 +1873,7 @@ impl PageBackedHnswIndex {
         vector: &[f32],
         tid: TupleId,
         replay: bool,
+        page_lsn: Lsn,
     ) -> Result<(), AccessMethodError> {
         self.validate_vector(vector)?;
         let mut storage = self.storage.lock();
@@ -1812,6 +1910,7 @@ impl PageBackedHnswIndex {
         let node_block = storage.allocate_block()?;
         let node_page = HnswNodePage {
             page_id: PageId::new(self.index_rel, node_block),
+            lsn: Lsn::ZERO,
             node_id,
             tid,
             vector_len: vector.len(),
@@ -1841,6 +1940,7 @@ impl PageBackedHnswIndex {
             storage.write_neighbors(neighbor_id, &trimmed)?;
         }
         storage.sync_control_pages();
+        storage.stamp_all_pages(page_lsn);
         Ok(())
     }
 
@@ -1867,9 +1967,9 @@ impl PageBackedHnswIndex {
         vector: &[f32],
         xid: Xid,
         wal: Option<&dyn WalSink>,
-    ) -> Result<(), AccessMethodError> {
+    ) -> Result<Lsn, AccessMethodError> {
         let Some(sink) = wal else {
-            return Ok(());
+            return Ok(Lsn::ZERO);
         };
         let payload = HnswOpPayload {
             op,
@@ -1884,8 +1984,36 @@ impl PageBackedHnswIndex {
         let prev_lsn = sink.last_lsn_for(xid);
         let record = WalRecord::new(RecordType::HnswOp, xid, prev_lsn, 0, payload);
         sink.append(record)
-            .map(|_| ())
             .map_err(|e| AccessMethodError::Storage(format!("page-backed hnsw WAL append: {e}")))
+    }
+}
+
+impl HnswPersistentPage {
+    fn page_id(&self) -> PageId {
+        match self {
+            Self::Meta(page) => page.page_id,
+            Self::Node(page) => page.page_id,
+            Self::Overflow(page) => page.page_id,
+            Self::FreeList(page) => page.page_id,
+        }
+    }
+
+    fn lsn(&self) -> Lsn {
+        match self {
+            Self::Meta(page) => page.lsn,
+            Self::Node(page) => page.lsn,
+            Self::Overflow(page) => page.lsn,
+            Self::FreeList(page) => page.lsn,
+        }
+    }
+
+    fn set_lsn(&mut self, lsn: Lsn) {
+        match self {
+            Self::Meta(page) => page.lsn = lsn,
+            Self::Node(page) => page.lsn = lsn,
+            Self::Overflow(page) => page.lsn = lsn,
+            Self::FreeList(page) => page.lsn = lsn,
+        }
     }
 }
 
@@ -1901,6 +2029,7 @@ impl PageBackedHnswStorage {
         let free_block = BlockNumber::new(HNSW_FREE_LIST_BLOCK);
         let meta = HnswMetaPage {
             page_id: PageId::new(index_rel, meta_block),
+            lsn: Lsn::ZERO,
             dims,
             metric,
             m,
@@ -1914,6 +2043,7 @@ impl PageBackedHnswStorage {
         };
         let free_list = HnswFreeListPage {
             page_id: PageId::new(index_rel, free_block),
+            lsn: Lsn::ZERO,
             blocks: Vec::new(),
         };
         let mut pages = BTreeMap::new();
@@ -1926,6 +2056,89 @@ impl PageBackedHnswStorage {
             tid_to_node: BTreeMap::new(),
             node_to_block: BTreeMap::new(),
         }
+    }
+
+    fn from_page_images(
+        index_rel: RelationId,
+        dims: usize,
+        metric: HnswMetric,
+        m: usize,
+        ef_search: usize,
+        images: Vec<PageBackedHnswPageImage>,
+    ) -> Result<Self, AccessMethodError> {
+        if images.is_empty() {
+            return Err(AccessMethodError::Storage(
+                "hnsw page image set is empty".to_owned(),
+            ));
+        }
+        let mut pages = BTreeMap::new();
+        for image in images {
+            if image.page_id.relation != index_rel {
+                return Err(AccessMethodError::Storage(
+                    "hnsw page image relation mismatch".to_owned(),
+                ));
+            }
+            let block = image.page_id.block;
+            let mut page = image.page;
+            page.set_lsn(image.lsn);
+            pages.insert(block, page);
+        }
+
+        let meta = match pages.get(&BlockNumber::new(HNSW_META_BLOCK)) {
+            Some(HnswPersistentPage::Meta(meta)) => meta.clone(),
+            _ => {
+                return Err(AccessMethodError::Storage(
+                    "hnsw page image set missing meta page".to_owned(),
+                ));
+            }
+        };
+        if meta.dims != dims || meta.metric != metric || meta.m != m || meta.ef_search != ef_search
+        {
+            return Err(AccessMethodError::Storage(
+                "hnsw page image metadata mismatch".to_owned(),
+            ));
+        }
+        let free_list = match pages.get(&BlockNumber::new(HNSW_FREE_LIST_BLOCK)) {
+            Some(HnswPersistentPage::FreeList(free_list)) => free_list.clone(),
+            _ => {
+                return Err(AccessMethodError::Storage(
+                    "hnsw page image set missing free-list page".to_owned(),
+                ));
+            }
+        };
+
+        let mut tid_to_node = BTreeMap::new();
+        let mut node_to_block = BTreeMap::new();
+        let mut live_nodes = 0;
+        let mut tombstones = 0;
+        for (block, page) in &pages {
+            if let HnswPersistentPage::Node(node) = page {
+                tid_to_node.insert(node.tid, node.node_id);
+                node_to_block.insert(node.node_id, *block);
+                if node.deleted {
+                    tombstones += 1;
+                } else {
+                    live_nodes += 1;
+                }
+            }
+        }
+
+        let mut storage = Self {
+            pages,
+            meta,
+            free_list,
+            tid_to_node,
+            node_to_block,
+        };
+        storage.meta.live_nodes = live_nodes;
+        storage.meta.tombstones = tombstones;
+        storage.meta.entry_node = storage.first_live_node_id()?;
+        storage.sync_control_pages();
+        Ok(storage)
+    }
+
+    fn redo_covered(&self, lsn: Lsn) -> bool {
+        lsn != Lsn::ZERO && self.meta.lsn >= lsn
     }
 
     fn allocate_block(&mut self) -> Result<BlockNumber, AccessMethodError> {
@@ -1968,6 +2181,7 @@ impl PageBackedHnswStorage {
             let block = self.allocate_block()?;
             let page = HnswOverflowPage {
                 page_id: PageId::new(self.meta.page_id.relation, block),
+                lsn: Lsn::ZERO,
                 owner_node: node_id,
                 next: None,
                 payload: HnswOverflowPayload::Vector(chunk.to_vec()),
@@ -1997,6 +2211,7 @@ impl PageBackedHnswStorage {
             let block = self.allocate_block()?;
             let page = HnswOverflowPage {
                 page_id: PageId::new(self.meta.page_id.relation, block),
+                lsn: Lsn::ZERO,
                 owner_node: node_id,
                 next: None,
                 payload: HnswOverflowPayload::Neighbors(chunk.to_vec()),
@@ -2180,7 +2395,12 @@ impl PageBackedHnswStorage {
             .collect())
     }
 
-    fn mark_deleted(&mut self, tid: TupleId, replay: bool) -> Result<(), AccessMethodError> {
+    fn mark_deleted(
+        &mut self,
+        tid: TupleId,
+        replay: bool,
+        page_lsn: Lsn,
+    ) -> Result<(), AccessMethodError> {
         let Some(node_id) = self.tid_to_node.get(&tid).copied() else {
             return if replay {
                 Ok(())
@@ -2209,6 +2429,7 @@ impl PageBackedHnswStorage {
             self.meta.entry_node = self.first_live_node_id()?;
         }
         self.sync_meta_page();
+        self.stamp_all_pages(page_lsn);
         Ok(())
     }
 
@@ -2216,6 +2437,7 @@ impl PageBackedHnswStorage {
         &mut self,
         metric: HnswMetric,
         max_neighbors: usize,
+        page_lsn: Lsn,
     ) -> Result<usize, AccessMethodError> {
         let deleted_nodes: Vec<HnswNodeId> = self
             .node_to_block
@@ -2273,6 +2495,7 @@ impl PageBackedHnswStorage {
             .count();
         self.meta.entry_node = self.first_live_node_id()?;
         self.sync_control_pages();
+        self.stamp_all_pages(page_lsn);
         Ok(deleted_nodes.len())
     }
 
@@ -2322,6 +2545,18 @@ impl PageBackedHnswStorage {
     fn sync_control_pages(&mut self) {
         self.sync_meta_page();
         self.sync_free_list_page();
+    }
+
+    fn stamp_all_pages(&mut self, lsn: Lsn) {
+        if lsn == Lsn::ZERO {
+            return;
+        }
+        self.meta.lsn = lsn;
+        self.free_list.lsn = lsn;
+        for page in self.pages.values_mut() {
+            page.set_lsn(lsn);
+        }
+        self.sync_control_pages();
     }
 }
 
@@ -3043,7 +3278,7 @@ impl AccessMethod for BrinIndex {
 
 #[cfg(test)]
 mod tests {
-    use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
+    use ultrasql_core::{BlockNumber, Lsn, PageId, RelationId, TupleId, Xid};
     use ultrasql_wal::payload::{HashOpKind, HashOpPayload, HnswOpKind, HnswOpPayload};
     use ultrasql_wal::record::RecordType;
 
@@ -3541,6 +3776,73 @@ mod tests {
         let hits = recovered.search(&[0.0, 0.0, 0.0], 2).expect("search");
         let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
         assert_eq!(tids, vec![tid(1, 1)]);
+    }
+
+    #[test]
+    fn page_backed_hnsw_stamps_page_lsns_and_restores_page_images() {
+        let index_rel = RelationId::new(8803);
+        let am =
+            PageBackedHnswIndex::new(index_rel, 3, HnswMetric::L2, 4, 16).expect("hnsw config");
+        let sink = InMemoryWalSink::new();
+
+        am.insert_vector_logged(&[0.0, 0.0, 0.0], tid(1, 0), Xid::new(13), Some(&sink))
+            .expect("logged insert");
+
+        let records = sink.records();
+        let assigned_lsn = records[0].0;
+        assert!(assigned_lsn > Lsn::ZERO);
+        let images = am.page_images();
+        assert!(images.len() >= 4);
+        assert!(
+            images
+                .iter()
+                .all(|image| image.page_id.relation == index_rel && image.lsn == assigned_lsn)
+        );
+
+        let restored =
+            PageBackedHnswIndex::from_page_images(index_rel, 3, HnswMetric::L2, 4, 16, images)
+                .expect("restore hnsw pages");
+        assert_eq!(restored.page_stats().live_nodes, 1);
+        let hits = restored.search(&[0.1, 0.0, 0.0], 1).expect("search");
+        assert_eq!(hits[0].tid, tid(1, 0));
+    }
+
+    #[test]
+    fn page_backed_hnsw_redo_skips_records_covered_by_page_lsn() {
+        let index_rel = RelationId::new(8804);
+        let source =
+            PageBackedHnswIndex::new(index_rel, 3, HnswMetric::L2, 4, 16).expect("source config");
+        let sink = InMemoryWalSink::new();
+        source
+            .insert_vector_logged(&[0.0, 0.0, 0.0], tid(1, 0), Xid::new(14), Some(&sink))
+            .expect("logged insert one");
+        source
+            .insert_vector_logged(&[1.0, 0.0, 0.0], tid(1, 1), Xid::new(14), Some(&sink))
+            .expect("logged insert two");
+
+        let images_after_second = source.page_images();
+        let recovered = PageBackedHnswIndex::from_page_images(
+            index_rel,
+            3,
+            HnswMetric::L2,
+            4,
+            16,
+            images_after_second,
+        )
+        .expect("restore hnsw pages");
+        let stats_before = recovered.page_stats();
+
+        let records = sink.records();
+        for (lsn, record) in records {
+            recovered
+                .apply_wal_record_at(lsn, &record)
+                .expect("redo should skip covered LSN");
+        }
+
+        assert_eq!(recovered.page_stats(), stats_before);
+        let hits = recovered.search(&[0.0, 0.0, 0.0], 2).expect("search");
+        let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
+        assert_eq!(tids, vec![tid(1, 0), tid(1, 1)]);
     }
 
     #[test]
