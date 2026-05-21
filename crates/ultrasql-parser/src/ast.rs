@@ -708,11 +708,13 @@ pub enum SetValue {
     Values(Vec<Expr>),
 }
 
-/// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] [name] ON table [USING method] (columns) [INCLUDE (...)] [WITH (...)] [WHERE expr]`.
+/// `CREATE [UNIQUE|AGGREGATING] INDEX [IF NOT EXISTS] [name] ON table [USING method] (columns) [INCLUDE (...)] [WITH (...)] [WHERE expr]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateIndexStmt {
     /// Whether `UNIQUE` was specified.
     pub unique: bool,
+    /// Whether `AGGREGATING` was specified.
+    pub aggregating: bool,
     /// Whether `CONCURRENTLY` was specified.
     pub concurrently: bool,
     /// Whether `IF NOT EXISTS` was specified.

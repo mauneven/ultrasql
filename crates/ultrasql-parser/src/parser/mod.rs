@@ -331,19 +331,28 @@ impl<'src> Parser<'src> {
                     .map(|s| Statement::CreateMaterializedView(Box::new(s)))
             }
             TokenKind::KwIndex => self
-                .parse_create_index(start, false)
+                .parse_create_index(start, false, false)
                 .map(|s| Statement::CreateIndex(Box::new(s))),
             TokenKind::KwUnique => {
                 // CREATE UNIQUE INDEX …
                 self.advance()?; // UNIQUE
-                self.parse_create_index(start, true)
+                self.parse_create_index(start, true, false)
+                    .map(|s| Statement::CreateIndex(Box::new(s)))
+            }
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("aggregating")) =>
+            {
+                self.advance()?; // AGGREGATING
+                self.parse_create_index(start, false, true)
                     .map(|s| Statement::CreateIndex(Box::new(s)))
             }
             TokenKind::KwSequence => self
                 .parse_create_sequence(start)
                 .map(|s| Statement::CreateSequence(Box::new(s))),
             other => Err(ParseError::Expected {
-                expected: "TABLE, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, or SEQUENCE after CREATE",
+                expected: "TABLE, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, AGGREGATING, or SEQUENCE after CREATE",
                 found: other,
                 offset: tok.span.start as usize,
             }),

@@ -592,6 +592,7 @@ where
             include_columns,
             predicate,
             method,
+            aggregating,
             unique,
             if_not_exists,
             ..
@@ -618,6 +619,94 @@ where
                 table_name.clone(),
             ))
         })?;
+
+        if *method == LogicalIndexMethod::Aggregating {
+            if *unique {
+                return Err(ServerError::Unsupported(
+                    "CREATE UNIQUE AGGREGATING INDEX is not supported",
+                ));
+            }
+            let Some(spec) = aggregating.clone() else {
+                return Err(ServerError::ddl(
+                    "CREATE AGGREGATING INDEX missing aggregating metadata",
+                ));
+            };
+            let index_oid = self.state.persistent_catalog.next_oid();
+            let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
+            let build_result = crate::aggregating_index::build_aggregating_index_rows(
+                table,
+                &spec,
+                self.state.heap.as_ref(),
+                &txn.snapshot,
+                self.state.txn_manager.as_ref(),
+            );
+            if let Err(e) = self.state.txn_manager.commit(txn) {
+                tracing::warn!(error = %e, "autocommit (CREATE AGGREGATING INDEX) failed to finalise");
+            }
+            let rows = build_result?;
+            let attnums = columns
+                .iter()
+                .map(|col| {
+                    u16::try_from(*col).map_err(|_| {
+                        ServerError::Unsupported(
+                            "CREATE AGGREGATING INDEX: column index does not fit in u16 attnum field",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, false);
+            self.state.persistent_catalog.create_index(entry.clone())?;
+            let ddl_txn = self
+                .state
+                .txn_manager
+                .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+            if let Err(e) = self.state.persistent_catalog.persist_index_rows(
+                &entry,
+                self.state.heap.as_ref(),
+                ddl_txn.xid,
+                ddl_txn.current_command,
+            ) {
+                if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                    tracing::warn!(
+                        error = %abort_err,
+                        "abort of catalog-write txn failed after persist_index_rows error",
+                    );
+                }
+                let _ = self.state.persistent_catalog.drop_index(index_name);
+                return Err(e.into());
+            }
+            if let Err(commit_err) = self.state.txn_manager.commit(ddl_txn) {
+                tracing::warn!(
+                    error = %commit_err,
+                    "catalog-write txn failed to commit; restart visibility may differ",
+                );
+            }
+            let mut constraints = self
+                .state
+                .table_constraints
+                .get(&table.oid)
+                .map(|entry| entry.value().as_ref().clone())
+                .unwrap_or_default();
+            constraints.indexes.insert(
+                index_oid,
+                crate::RuntimeIndexMetadata {
+                    key_exprs: key_exprs.clone(),
+                    predicate: None,
+                    include_columns: Vec::new(),
+                    method: *method,
+                    brin: None,
+                    hnsw: None,
+                    ivfflat: None,
+                    aggregating: Some(Arc::new(crate::RuntimeAggregatingIndex::new(spec, rows))),
+                },
+            );
+            self.state
+                .table_constraints
+                .insert(table.oid, Arc::new(constraints));
+            self.plan_cache_invalidate();
+
+            return Ok(run_ddl_command("CREATE INDEX"));
+        }
 
         if *method == LogicalIndexMethod::IvfFlat {
             if *unique {
@@ -748,6 +837,7 @@ where
                     brin: None,
                     hnsw: None,
                     ivfflat: Some(ivfflat),
+                    aggregating: None,
                 },
             );
             self.state
@@ -892,6 +982,7 @@ where
                     brin: None,
                     hnsw: Some(hnsw),
                     ivfflat: None,
+                    aggregating: None,
                 },
             );
             self.state
@@ -1061,6 +1152,7 @@ where
                     brin: brin_summary.clone(),
                     hnsw: None,
                     ivfflat: None,
+                    aggregating: None,
                 },
             );
             self.state

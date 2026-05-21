@@ -31,6 +31,18 @@ fn embeddings_catalog() -> InMemoryCatalog {
     cat
 }
 
+fn fact_events_catalog() -> InMemoryCatalog {
+    let schema = Schema::new([
+        Field::required("tenant_id", DataType::Int32),
+        Field::required("bucket", DataType::Int32),
+        Field::required("amount", DataType::Int64),
+    ])
+    .expect("schema ok");
+    let mut cat = InMemoryCatalog::new();
+    cat.register("fact_events", TableMeta::new(schema));
+    cat
+}
+
 fn parse_and_bind(sql: &str, cat: &dyn Catalog) -> Result<LogicalPlan, PlanError> {
     let stmt = Parser::new(sql)
         .parse_statement()
@@ -2538,6 +2550,34 @@ fn binds_create_hash_index_method() {
         panic!("expected CreateIndex plan");
     };
     assert_eq!(method, LogicalIndexMethod::Hash);
+}
+
+#[test]
+fn binds_create_aggregating_index_metadata() {
+    let cat = fact_events_catalog();
+    let LogicalPlan::CreateIndex {
+        method,
+        columns,
+        aggregating,
+        ..
+    } = parse_and_bind(
+        "CREATE AGGREGATING INDEX fact_rollup ON fact_events \
+         (tenant_id, bucket, sum(amount), count(*))",
+        &cat,
+    )
+    .expect("bind aggregating index")
+    else {
+        panic!("expected CreateIndex plan");
+    };
+    assert_eq!(method, LogicalIndexMethod::Aggregating);
+    assert_eq!(columns, vec![0, 1]);
+    let aggregating = aggregating.expect("aggregating metadata");
+    assert_eq!(aggregating.group_columns, vec![0, 1]);
+    assert_eq!(aggregating.aggregates.len(), 2);
+    assert_eq!(aggregating.aggregates[0].func, AggregateFunc::Sum);
+    assert_eq!(aggregating.aggregates[0].arg_column, Some(2));
+    assert_eq!(aggregating.aggregates[1].func, AggregateFunc::CountStar);
+    assert_eq!(aggregating.aggregates[1].arg_column, None);
 }
 
 #[test]

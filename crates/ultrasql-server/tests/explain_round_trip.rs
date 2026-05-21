@@ -208,6 +208,7 @@ async fn explain_analyze_reports_runtime_evidence() {
         "SIMD Kernel:",
         "Index Decision:",
         "selected t_id_idx",
+        "Late Materialization:",
         "Pushdowns Applied:",
     ] {
         assert!(
@@ -215,6 +216,44 @@ async fn explain_analyze_reports_runtime_evidence() {
             "EXPLAIN ANALYZE missing {required:?}, got: {text}"
         );
     }
+
+    shutdown(client, server_handle).await;
+}
+
+/// When an indexed predicate feeds a projection that needs non-index
+/// payload columns, `EXPLAIN ANALYZE` reports the late-materialization
+/// prototype: B-tree TID probe first, heap payload fetch after candidate
+/// pruning.
+#[tokio::test]
+async fn explain_analyze_reports_late_materialization_selection() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t_late (id INT NOT NULL, payload INT NOT NULL)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO t_late VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .expect("seed");
+    client
+        .batch_execute("CREATE INDEX t_late_id_idx ON t_late (id)")
+        .await
+        .expect("create index");
+
+    let rows = client
+        .query(
+            "EXPLAIN ANALYZE SELECT payload FROM t_late WHERE id = 2",
+            &[],
+        )
+        .await
+        .expect("EXPLAIN ANALYZE");
+    let text = collect_plan_text(&rows);
+
+    assert!(
+        text.contains("Late Materialization: selected t_late_id_idx"),
+        "EXPLAIN ANALYZE must report late materialization selection, got: {text}"
+    );
 
     shutdown(client, server_handle).await;
 }

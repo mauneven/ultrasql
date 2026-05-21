@@ -98,6 +98,8 @@ pub enum LogicalIndexMethod {
     Hnsw,
     /// Inverted-file flat vector index method.
     IvfFlat,
+    /// Runtime aggregating-index summary method.
+    Aggregating,
 }
 
 /// Bound `CREATE INDEX ... WITH (...)` storage option.
@@ -107,6 +109,28 @@ pub struct LogicalIndexOption {
     pub name: String,
     /// Literal option value rendered as text.
     pub value: String,
+}
+
+/// Bound metadata for `CREATE AGGREGATING INDEX`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalAggregatingIndex {
+    /// Group-key table column indices, in declaration order.
+    pub group_columns: Vec<usize>,
+    /// Aggregate summaries maintained per group.
+    pub aggregates: Vec<LogicalAggregatingIndexExpr>,
+}
+
+/// One aggregate summary stored by an aggregating index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalAggregatingIndexExpr {
+    /// Aggregate function.
+    pub func: AggregateFunc,
+    /// Table column index for argument aggregates; `None` for `COUNT(*)`.
+    pub arg_column: Option<usize>,
+    /// Output name used in diagnostics.
+    pub output_name: String,
+    /// Aggregate result type.
+    pub data_type: DataType,
 }
 
 /// Planner-selected execution family for a logical pipeline.
@@ -699,6 +723,8 @@ pub enum LogicalPlan {
         predicate: Option<ScalarExpr>,
         /// Access method requested by `USING`.
         method: LogicalIndexMethod,
+        /// Aggregating-index metadata when this is `CREATE AGGREGATING INDEX`.
+        aggregating: Option<LogicalAggregatingIndex>,
         /// Whether `UNIQUE` was specified.
         unique: bool,
         /// Whether `CONCURRENTLY` was specified.
@@ -1961,6 +1987,7 @@ impl LogicalPlan {
                     LogicalIndexMethod::Brin => "brin",
                     LogicalIndexMethod::Hnsw => "hnsw",
                     LogicalIndexMethod::IvfFlat => "ivfflat",
+                    LogicalIndexMethod::Aggregating => "aggregating",
                 };
                 let _ = fmt::write(
                     out,

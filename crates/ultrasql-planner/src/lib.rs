@@ -35,7 +35,8 @@ pub use error::PlanError;
 pub use expr::{BinaryOp, ScalarExpr, UnaryOp};
 pub use plan::{
     AggregateFunc, ConflictTarget, CopyDirection, CopyFormat, CopySource, ExplainFormat,
-    LogicalAggregateExpr, LogicalAlterTableAction, LogicalCheckConstraint, LogicalCommentTarget,
+    LogicalAggregateExpr, LogicalAggregatingIndex, LogicalAggregatingIndexExpr,
+    LogicalAlterTableAction, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalForeignKeyConstraint, LogicalIndexMethod, LogicalIndexOption, LogicalJoinCondition,
     LogicalJoinType, LogicalOnConflict, LogicalPlan, LogicalReferentialAction,
     LogicalSequenceChange, LogicalSequenceOptions, LogicalSetOp, LogicalSetQuantifier,

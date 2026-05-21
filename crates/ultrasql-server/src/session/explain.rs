@@ -127,6 +127,8 @@ where
                 elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
                 simd_kernel: notes.simd_kernel,
                 index_decision: notes.index_decision,
+                late_materialization: notes.late_materialization,
+                aggregating_index: notes.aggregating_index,
                 pushdowns_applied: notes.pushdowns_applied,
                 parquet_row_groups: notes.parquet_row_groups,
             });
@@ -177,6 +179,8 @@ where
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
             simd_kernel: notes.simd_kernel,
             index_decision: notes.index_decision,
+            late_materialization: notes.late_materialization,
+            aggregating_index: notes.aggregating_index,
             pushdowns_applied: notes.pushdowns_applied,
             parquet_row_groups: notes.parquet_row_groups,
         })
@@ -240,6 +244,12 @@ where
         ExplainNotes {
             simd_kernel: simd_kernel_note(plan),
             index_decision: self.index_decision_note(plan, catalog_snapshot),
+            late_materialization: self.late_materialization_note(plan, catalog_snapshot),
+            aggregating_index: crate::aggregating_index::aggregating_index_note_for_snapshot(
+                plan,
+                catalog_snapshot,
+                self.state.table_constraints.as_ref(),
+            ),
             pushdowns_applied: pushdown_notes(plan),
             parquet_row_groups: parquet_row_group_note(plan),
         }
@@ -309,6 +319,45 @@ where
             },
         )
     }
+
+    fn late_materialization_note(
+        &self,
+        plan: &LogicalPlan,
+        catalog_snapshot: &Arc<CatalogSnapshot>,
+    ) -> String {
+        let Some((table, filter_col, projected_cols)) = first_project_filter_scan(plan) else {
+            return "not applicable (no Project(Filter(Scan)) shape)".to_owned();
+        };
+        let Some(table_entry) = catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
+            return format!("skipped {table}: not a persistent catalog table");
+        };
+        let Some(indexes) = catalog_snapshot.indexes_by_table.get(&table_entry.oid) else {
+            return format!("skipped {table}: no indexes on table");
+        };
+        let Ok(attnum) = u16::try_from(filter_col) else {
+            return format!("skipped {table}: predicate column index exceeds attnum");
+        };
+        let Some(index) = indexes.iter().find(|index| {
+            index.columns.as_slice() == [attnum]
+                && self.index_method(table_entry.oid, index.oid) == LogicalIndexMethod::Btree
+        }) else {
+            return format!("skipped {table}: no usable single-column btree index");
+        };
+        if projected_cols.iter().all(|col| {
+            u16::try_from(*col)
+                .ok()
+                .is_some_and(|col_attnum| index.columns.contains(&col_attnum))
+        }) {
+            return format!(
+                "not selected {}: projection covered by index key",
+                index.name
+            );
+        }
+        format!(
+            "selected {} on {table}: index TID probe with deferred heap payload fetch",
+            index.name
+        )
+    }
 }
 
 /// Wall-clock + row-count summary collected by `EXPLAIN ANALYZE`.
@@ -320,6 +369,8 @@ struct ExplainActuals {
     elapsed_ms: f64,
     simd_kernel: String,
     index_decision: String,
+    late_materialization: String,
+    aggregating_index: String,
     pushdowns_applied: Vec<String>,
     parquet_row_groups: Option<crate::pipeline::ParquetRowGroupSummary>,
 }
@@ -333,6 +384,8 @@ struct ExplainScanActuals {
 struct ExplainNotes {
     simd_kernel: String,
     index_decision: String,
+    late_materialization: String,
+    aggregating_index: String,
     pushdowns_applied: Vec<String>,
     parquet_row_groups: Option<crate::pipeline::ParquetRowGroupSummary>,
 }
@@ -371,6 +424,8 @@ fn render_text(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
              Disk Spill: {} ({} bytes; {})\n\
              SIMD Kernel: {}\n\
              Index Decision: {}\n\
+             Late Materialization: {}\n\
+             Aggregating Index: {}\n\
              Pushdowns Applied: {}\n\
              Parquet Row Groups: {}\n",
             a.elapsed_ms,
@@ -382,6 +437,8 @@ fn render_text(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
             a.disk_spill.reason,
             a.simd_kernel,
             a.index_decision,
+            a.late_materialization,
+            a.aggregating_index,
             pushdowns,
             format_parquet_row_groups(a.parquet_row_groups)
         ));
@@ -420,6 +477,8 @@ fn render_json(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
              \n    \"Disk Spill\": {{\"Used\": {}, \"Bytes\": {}, \"Reason\": \"{}\"}},\
              \n    \"SIMD Kernel\": \"{}\",\
              \n    \"Index Decision\": \"{}\",\
+             \n    \"Late Materialization\": \"{}\",\
+             \n    \"Aggregating Index\": \"{}\",\
              \n    \"Pushdowns Applied\": {},\
              \n    \"Parquet Row Groups\": {}",
             a.elapsed_ms,
@@ -431,6 +490,8 @@ fn render_json(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
             json_escape(a.disk_spill.reason),
             json_escape(&a.simd_kernel),
             json_escape(&a.index_decision),
+            json_escape(&a.late_materialization),
+            json_escape(&a.aggregating_index),
             pushdowns,
             format_parquet_row_groups_json(a.parquet_row_groups)
         ));
@@ -614,6 +675,48 @@ fn first_filter_scan_column(plan: &LogicalPlan) -> Option<(&str, usize)> {
             definition, body, ..
         } => first_filter_scan_column(definition).or_else(|| first_filter_scan_column(body)),
         LogicalPlan::Insert { source, .. } => first_filter_scan_column(source),
+        _ => None,
+    }
+}
+
+fn first_project_filter_scan(plan: &LogicalPlan) -> Option<(&str, usize, Vec<usize>)> {
+    match plan {
+        LogicalPlan::Project { input, exprs, .. } => {
+            let LogicalPlan::Filter {
+                input: filter_input,
+                predicate,
+            } = input.as_ref()
+            else {
+                return first_project_filter_scan(input);
+            };
+            let LogicalPlan::Scan { table, .. } = filter_input.as_ref() else {
+                return first_project_filter_scan(input);
+            };
+            let filter_col = indexable_column(predicate)?;
+            let projected = exprs
+                .iter()
+                .filter_map(|(expr, _)| match expr {
+                    ScalarExpr::Column { index, .. } => Some(*index),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            Some((table.as_str(), filter_col, projected))
+        }
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::LockRows { input, .. }
+        | LogicalPlan::Explain { input, .. }
+        | LogicalPlan::Update { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Delete { input, .. } => first_project_filter_scan(input),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            first_project_filter_scan(left).or_else(|| first_project_filter_scan(right))
+        }
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => first_project_filter_scan(definition).or_else(|| first_project_filter_scan(body)),
+        LogicalPlan::Insert { source, .. } => first_project_filter_scan(source),
         _ => None,
     }
 }

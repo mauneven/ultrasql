@@ -3,6 +3,7 @@
 //! Handles:
 //! - `CREATE INDEX name ON t (col [opclass] [ASC|DESC] [NULLS FIRST|LAST])`
 //! - `CREATE UNIQUE INDEX …`
+//! - `CREATE AGGREGATING INDEX …`
 //! - `CREATE INDEX IF NOT EXISTS …`
 //! - `CREATE INDEX … USING method`
 //! - `CREATE INDEX … INCLUDE (col, …)`
@@ -23,6 +24,7 @@ impl Parser<'_> {
         &mut self,
         create_start: u32,
         unique: bool,
+        aggregating: bool,
     ) -> Result<CreateIndexStmt, ParseError> {
         self.expect(TokenKind::KwIndex, "INDEX")?;
         let concurrently = self.match_kw(TokenKind::KwConcurrently);
@@ -74,6 +76,7 @@ impl Parser<'_> {
         let end = self.peek()?.span.start;
         Ok(CreateIndexStmt {
             unique,
+            aggregating,
             concurrently,
             if_not_exists,
             name,
@@ -259,6 +262,18 @@ mod tests {
         assert_eq!(stmt.options.len(), 2);
         assert_eq!(stmt.options[0].name.value, "lists");
         assert_eq!(stmt.options[1].name.value, "probes");
+    }
+
+    #[test]
+    fn create_aggregating_index_parses_group_and_aggregate_keys() {
+        let stmt = parse_create_index(
+            "CREATE AGGREGATING INDEX fact_rollup ON fact_events \
+             (tenant_id, bucket, sum(amount), count(*))",
+        );
+        assert!(stmt.aggregating);
+        assert_eq!(stmt.name.as_ref().unwrap().value, "fact_rollup");
+        assert_eq!(stmt.table.to_string(), "fact_events");
+        assert_eq!(stmt.columns.len(), 4);
     }
 
     #[test]

@@ -140,6 +140,7 @@ pub(super) fn lower_real_insert(
         }
     };
     let rel = RelationId(entry.oid);
+    crate::aggregating_index::mark_aggregating_indexes_dirty(entry, ctx);
     let insert_indexes = build_insert_index_maintainers(entry, ctx)?;
     let insert_vector_indexes = build_vector_index_maintainers(entry, ctx)?;
     let update_indexes = if matches!(on_conflict, Some(LogicalOnConflict::DoUpdate { .. })) {
@@ -1664,6 +1665,7 @@ pub(super) fn lower_real_update(
     }
 
     let child = build_filtered_tid_scan(table, entry, input, ctx)?;
+    crate::aggregating_index::mark_aggregating_indexes_dirty(entry, ctx);
 
     // Assignment value expressions stay unshifted: `apply_update`
     // strips the leading [tid_block, tid_slot] pair before passing the
@@ -1869,6 +1871,7 @@ pub(super) fn lower_real_delete(
     }
 
     let child = build_filtered_tid_scan(table, entry, input, ctx)?;
+    crate::aggregating_index::mark_aggregating_indexes_dirty(entry, ctx);
 
     let rel = RelationId(entry.oid);
     let modify = ModifyTable::new(

@@ -155,6 +155,11 @@ pub fn lower_query(
                 let scalars: Vec<ScalarExpr> = exprs.iter().map(|(e, _)| e.clone()).collect();
                 return Ok(Box::new(ResultOp::new(scalars, schema.clone())));
             }
+            if let Some(op) = crate::aggregating_index::try_lower_aggregating_index_project(
+                input, &exprs, schema, ctx,
+            )? {
+                return Ok(op);
+            }
             if let Some(op) = try_index_only_scan(input, &exprs, ctx)? {
                 return Ok(op);
             }

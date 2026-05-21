@@ -43,6 +43,7 @@
     clippy::cast_possible_wrap
 )]
 
+mod aggregating_index;
 pub mod auth;
 pub mod cancel;
 pub mod columnar_storage;
@@ -271,6 +272,36 @@ pub struct RuntimeIndexMetadata {
     pub hnsw: Option<Arc<ultrasql_storage::access_method::HnswIndex>>,
     /// Runtime IVFFlat inverted lists for vector top-k scans.
     pub ivfflat: Option<Arc<ultrasql_storage::access_method::IvfFlatIndex>>,
+    /// Runtime aggregating-index summary for dashboard-style GROUP BY scans.
+    pub aggregating: Option<Arc<RuntimeAggregatingIndex>>,
+}
+
+/// Runtime sidecar for `CREATE AGGREGATING INDEX`.
+#[derive(Debug)]
+pub struct RuntimeAggregatingIndex {
+    /// Bound aggregating-index metadata.
+    pub spec: ultrasql_planner::LogicalAggregatingIndex,
+    /// Materialized summary rows in `group columns + aggregates` order.
+    pub rows: std::sync::RwLock<Vec<Vec<Value>>>,
+    /// Set when DML touched the base table after the last summary build.
+    pub dirty: std::sync::atomic::AtomicBool,
+}
+
+impl RuntimeAggregatingIndex {
+    /// Build a clean runtime summary.
+    #[must_use]
+    pub fn new(spec: ultrasql_planner::LogicalAggregatingIndex, rows: Vec<Vec<Value>>) -> Self {
+        Self {
+            spec,
+            rows: std::sync::RwLock::new(rows),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Mark summary rows stale. Next matching read rebuilds lazily.
+    pub fn mark_dirty(&self) {
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// One runtime CHECK constraint.

@@ -22,8 +22,10 @@ use super::{
     Catalog, LogicalAlterTableAction, LogicalPlan, PlanError, ScalarExpr, ScopeStack, bind_expr,
     bind_select, object_name_simple,
 };
+use crate::catalog::TableMeta;
 use crate::plan::{
-    CopyDirection, CopyFormat, CopySource, LogicalCheckConstraint, LogicalCommentTarget,
+    AggregateFunc, CopyDirection, CopyFormat, CopySource, LogicalAggregatingIndex,
+    LogicalAggregatingIndexExpr, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalExclusionConstraint, LogicalExclusionElement, LogicalForeignKeyConstraint,
     LogicalIndexMethod, LogicalIndexOption, LogicalReferentialAction, LogicalSequenceChange,
     LogicalSequenceOptions, LogicalTimePartition, LogicalUniqueConstraint,
@@ -1210,24 +1212,36 @@ pub(super) fn bind_create_index(
         .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
     let table_schema = &meta.schema;
 
-    let method = match s.method.as_ref().map(|m| m.value.to_ascii_lowercase()) {
-        None => LogicalIndexMethod::Btree,
-        Some(method) if method == "btree" => LogicalIndexMethod::Btree,
-        Some(method) if method == "hash" => LogicalIndexMethod::Hash,
-        Some(method) if method == "gin" => LogicalIndexMethod::Gin,
-        Some(method) if method == "gist" => LogicalIndexMethod::Gist,
-        Some(method) if method == "brin" => LogicalIndexMethod::Brin,
-        Some(method) if method == "hnsw" => LogicalIndexMethod::Hnsw,
-        Some(method) if method == "ivfflat" => LogicalIndexMethod::IvfFlat,
-        Some(_) => {
+    let method = if s.aggregating {
+        if s.method.is_some() {
             return Err(PlanError::NotSupported(
-                "CREATE INDEX: only btree, hash, gin, gist, brin, hnsw, and ivfflat methods are supported",
+                "CREATE AGGREGATING INDEX may not also specify USING",
             ));
+        }
+        LogicalIndexMethod::Aggregating
+    } else {
+        match s.method.as_ref().map(|m| m.value.to_ascii_lowercase()) {
+            None => LogicalIndexMethod::Btree,
+            Some(method) if method == "btree" => LogicalIndexMethod::Btree,
+            Some(method) if method == "hash" => LogicalIndexMethod::Hash,
+            Some(method) if method == "gin" => LogicalIndexMethod::Gin,
+            Some(method) if method == "gist" => LogicalIndexMethod::Gist,
+            Some(method) if method == "brin" => LogicalIndexMethod::Brin,
+            Some(method) if method == "hnsw" => LogicalIndexMethod::Hnsw,
+            Some(method) if method == "ivfflat" => LogicalIndexMethod::IvfFlat,
+            Some(_) => {
+                return Err(PlanError::NotSupported(
+                    "CREATE INDEX: only btree, hash, gin, gist, brin, hnsw, and ivfflat methods are supported",
+                ));
+            }
         }
     };
 
     if s.columns.is_empty() {
         return Err(PlanError::NotSupported("CREATE INDEX: zero key columns"));
+    }
+    if method == LogicalIndexMethod::Aggregating {
+        return bind_create_aggregating_index(s, table_name, table_schema);
     }
     if method == LogicalIndexMethod::Hash && s.columns.len() != 1 {
         return Err(PlanError::NotSupported(
@@ -1393,11 +1407,197 @@ pub(super) fn bind_create_index(
         include_columns,
         predicate,
         method,
+        aggregating: None,
         unique: s.unique,
         concurrently: s.concurrently,
         if_not_exists: s.if_not_exists,
         schema: Schema::empty(),
     })
+}
+
+fn bind_create_aggregating_index(
+    s: &CreateIndexStmt,
+    table_name: String,
+    table_schema: &Schema,
+) -> Result<LogicalPlan, PlanError> {
+    if s.unique {
+        return Err(PlanError::NotSupported(
+            "CREATE UNIQUE AGGREGATING INDEX is not supported",
+        ));
+    }
+    if s.concurrently {
+        return Err(PlanError::NotSupported(
+            "CREATE AGGREGATING INDEX CONCURRENTLY is not supported",
+        ));
+    }
+    if !s.include.is_empty() {
+        return Err(PlanError::NotSupported(
+            "CREATE AGGREGATING INDEX does not support INCLUDE",
+        ));
+    }
+    if s.r#where.is_some() {
+        return Err(PlanError::NotSupported(
+            "CREATE AGGREGATING INDEX does not support partial predicates in this wave",
+        ));
+    }
+    if !s.options.is_empty() {
+        return Err(PlanError::NotSupported(
+            "CREATE AGGREGATING INDEX does not support WITH options in this wave",
+        ));
+    }
+
+    let mut group_columns = Vec::new();
+    let mut group_exprs = Vec::new();
+    let mut col_names = Vec::new();
+    let mut aggregates = Vec::new();
+    let mut saw_aggregate = false;
+
+    for key in &s.columns {
+        if key.opclass.is_some() {
+            return Err(PlanError::NotSupported(
+                "CREATE AGGREGATING INDEX does not support operator classes",
+            ));
+        }
+        match &key.expr {
+            Expr::Call { .. } => {
+                saw_aggregate = true;
+                let aggregate = bind_aggregating_index_call(&key.expr, table_schema)?;
+                col_names.push(aggregate.output_name.clone());
+                aggregates.push(aggregate);
+            }
+            _ => {
+                if saw_aggregate {
+                    return Err(PlanError::NotSupported(
+                        "CREATE AGGREGATING INDEX group columns must precede aggregates",
+                    ));
+                }
+                let mut scope = ScopeStack::new();
+                let bound = bind_expr(&key.expr, table_schema, &NoopCatalog, &mut scope)?;
+                let ScalarExpr::Column { name, index, .. } = bound else {
+                    return Err(PlanError::NotSupported(
+                        "CREATE AGGREGATING INDEX group keys must be bare columns",
+                    ));
+                };
+                group_columns.push(index);
+                group_exprs.push(ScalarExpr::Column {
+                    name: name.clone(),
+                    index,
+                    data_type: table_schema.field_at(index).data_type.clone(),
+                });
+                col_names.push(name.to_ascii_lowercase());
+            }
+        }
+    }
+
+    if group_columns.is_empty() || aggregates.is_empty() {
+        return Err(PlanError::NotSupported(
+            "CREATE AGGREGATING INDEX requires at least one group column and one aggregate",
+        ));
+    }
+
+    let index_name = s.name.as_ref().map_or_else(
+        || synthesise_index_name(&table_name, &col_names),
+        |ident| ident.value.to_ascii_lowercase(),
+    );
+
+    Ok(LogicalPlan::CreateIndex {
+        index_name,
+        table_name,
+        columns: group_columns.clone(),
+        key_exprs: group_exprs,
+        opclasses: vec![None; group_columns.len()],
+        index_options: Vec::new(),
+        include_columns: Vec::new(),
+        predicate: None,
+        method: LogicalIndexMethod::Aggregating,
+        aggregating: Some(LogicalAggregatingIndex {
+            group_columns,
+            aggregates,
+        }),
+        unique: false,
+        concurrently: false,
+        if_not_exists: s.if_not_exists,
+        schema: Schema::empty(),
+    })
+}
+
+struct NoopCatalog;
+
+impl Catalog for NoopCatalog {
+    fn lookup_table(&self, _name: &str) -> Option<TableMeta> {
+        None
+    }
+}
+
+fn bind_aggregating_index_call(
+    expr: &Expr,
+    table_schema: &Schema,
+) -> Result<LogicalAggregatingIndexExpr, PlanError> {
+    let Expr::Call {
+        name,
+        args,
+        distinct,
+        over,
+        ..
+    } = expr
+    else {
+        return Err(PlanError::NotSupported(
+            "CREATE AGGREGATING INDEX aggregate key must be a function call",
+        ));
+    };
+    if *distinct || over.is_some() {
+        return Err(PlanError::NotSupported(
+            "CREATE AGGREGATING INDEX does not support DISTINCT or window aggregates",
+        ));
+    }
+    let func_name = name
+        .parts
+        .last()
+        .map_or("", |part| part.value.as_str())
+        .to_ascii_lowercase();
+    let is_star_arg = args.len() == 1
+        && matches!(&args[0], Expr::Column { name }
+            if name.parts.len() == 1 && name.parts[0].value == "*");
+    match func_name.as_str() {
+        "count" if args.is_empty() || is_star_arg => Ok(LogicalAggregatingIndexExpr {
+            func: AggregateFunc::CountStar,
+            arg_column: None,
+            output_name: "count".to_owned(),
+            data_type: DataType::Int64,
+        }),
+        "sum" if args.len() == 1 => {
+            let mut scope = ScopeStack::new();
+            let bound = bind_expr(&args[0], table_schema, &NoopCatalog, &mut scope)?;
+            let ScalarExpr::Column {
+                name,
+                index,
+                data_type,
+            } = bound
+            else {
+                return Err(PlanError::NotSupported(
+                    "CREATE AGGREGATING INDEX sum() argument must be a bare column",
+                ));
+            };
+            if !data_type.is_numeric() {
+                return Err(PlanError::TypeMismatch(format!(
+                    "CREATE AGGREGATING INDEX sum({name}) requires numeric input, got {data_type}"
+                )));
+            }
+            let out_ty = match data_type {
+                DataType::Float32 | DataType::Float64 => DataType::Float64,
+                _ => DataType::Int64,
+            };
+            Ok(LogicalAggregatingIndexExpr {
+                func: AggregateFunc::Sum,
+                arg_column: Some(index),
+                output_name: format!("sum({})", name.to_ascii_lowercase()),
+                data_type: out_ty,
+            })
+        }
+        _ => Err(PlanError::NotSupported(
+            "CREATE AGGREGATING INDEX supports sum(column) and count(*) in this wave",
+        )),
+    }
 }
 
 fn index_expr_name_part(expr: &ScalarExpr) -> String {
