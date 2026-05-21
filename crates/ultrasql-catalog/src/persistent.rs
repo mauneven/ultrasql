@@ -157,6 +157,12 @@ pub struct IndexRow {
     /// planner-facing internal form durably and adds 1 only at SQL view
     /// boundaries that need PostgreSQL parity.
     pub indkey: Vec<i16>,
+    /// Internal access method name captured from `CREATE INDEX ... USING`.
+    pub indmethod: String,
+    /// Internal opclass names, one per key where present.
+    pub indopclasses: Vec<Option<String>>,
+    /// Internal storage options captured from `WITH (...)`.
+    pub indoptions: Vec<(String, String)>,
 }
 
 /// Constraint type, mirroring `pg_constraint.contype`.
@@ -753,6 +759,9 @@ impl PersistentCatalog {
                 index_row.indisunique,
             );
             entry.root_block = ultrasql_core::BlockNumber::new(class_row.relfilenode);
+            entry.access_method = index_row.indmethod.clone();
+            entry.opclasses = index_row.indopclasses.clone();
+            entry.options = index_row.indoptions.clone();
             indexes.insert(class_row.relname.to_ascii_lowercase(), entry.clone());
             indexes_by_table
                 .entry(index_row.indrelid)
@@ -901,6 +910,9 @@ impl PersistentCatalog {
             indisprimary: entry.name.ends_with("_pkey"),
             indisvalid: true,
             indkey,
+            indmethod: entry.access_method.clone(),
+            indopclasses: normalized_opclasses(entry),
+            indoptions: entry.options.clone(),
         };
         let bytes = encode_index_row(&index_row);
         heap.insert(
@@ -1316,6 +1328,14 @@ impl PersistentCatalog {
         self.pg_statistic_ext.insert(row.oid, row);
         self.rebuild_snapshot();
         Ok(())
+    }
+}
+
+fn normalized_opclasses(entry: &IndexEntry) -> Vec<Option<String>> {
+    if entry.opclasses.is_empty() {
+        vec![None; entry.columns.len()]
+    } else {
+        entry.opclasses.clone()
     }
 }
 
@@ -2054,6 +2074,67 @@ mod tests {
         assert_eq!(restored.root_block, BlockNumber::new(7));
         assert!(!restored.is_unique);
         assert_eq!(snap.indexes_by_table[&table_oid], vec![restored.clone()]);
+    }
+
+    #[test]
+    fn bootstrap_round_trip_preserves_index_method_opclass_and_options() {
+        use std::sync::Arc;
+        use ultrasql_core::{CommandId, DataType, Field, PageId, Schema, Xid};
+        use ultrasql_storage::buffer_pool::BufferPool;
+        use ultrasql_storage::heap::HeapAccess;
+        use ultrasql_storage::page::Page;
+
+        let pool = Arc::new(BufferPool::new(64, |_: PageId| Ok(Page::new_heap())));
+        let heap = HeapAccess::new(pool);
+
+        let cat = PersistentCatalog::new();
+        let table_oid = cat.next_oid();
+        let table = TableEntry::new(
+            table_oid,
+            "embeddings".to_owned(),
+            "public".to_owned(),
+            Schema::new(vec![
+                Field::required("id", DataType::Int64),
+                Field::required("embedding", DataType::Vector { dims: Some(3) }),
+            ])
+            .expect("schema"),
+        );
+        cat.persist_table_rows(&table, &heap, Xid::new(1), CommandId::new(0))
+            .expect("persist table");
+
+        let mut index = IndexEntry::new(
+            cat.next_oid(),
+            "embeddings_hnsw_idx",
+            table_oid,
+            vec![1],
+            false,
+        );
+        index.access_method = "hnsw".to_owned();
+        index.opclasses = vec![Some("vector_l2_ops".to_owned())];
+        index.options = vec![
+            ("m".to_owned(), "16".to_owned()),
+            ("ef_search".to_owned(), "64".to_owned()),
+        ];
+        cat.persist_index_rows(&index, &heap, Xid::new(2), CommandId::new(0))
+            .expect("persist index");
+
+        let cat2 = PersistentCatalog::new();
+        cat2.bootstrap_from_heap(&heap).expect("bootstrap");
+
+        let snap = cat2.snapshot();
+        let restored = snap
+            .indexes
+            .get("embeddings_hnsw_idx")
+            .expect("index restored");
+        assert_eq!(restored.access_method, "hnsw");
+        assert_eq!(restored.opclasses, vec![Some("vector_l2_ops".to_owned())]);
+        assert_eq!(
+            restored.options,
+            vec![
+                ("m".to_owned(), "16".to_owned()),
+                ("ef_search".to_owned(), "64".to_owned()),
+            ]
+        );
     }
 
     #[test]

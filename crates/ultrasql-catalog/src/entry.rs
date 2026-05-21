@@ -81,7 +81,8 @@ impl TableEntry {
 ///
 /// Mirrors the fields of `pg_index` that the planner needs: which table
 /// the index covers, which columns (by attnum) it indexes, where its
-/// root page lives, and whether duplicates are forbidden.
+/// root page lives, which access method/opclasses were requested, and
+/// whether duplicates are forbidden.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IndexEntry {
     /// Catalog-wide object identifier for the index itself.
@@ -98,6 +99,12 @@ pub struct IndexEntry {
     pub root_block: BlockNumber,
     /// Whether this index enforces uniqueness.
     pub is_unique: bool,
+    /// Access method requested by `CREATE INDEX ... USING`.
+    pub access_method: String,
+    /// Opclass names supplied per key column.
+    pub opclasses: Vec<Option<String>>,
+    /// Storage options supplied in `WITH (...)`.
+    pub options: Vec<(String, String)>,
 }
 
 impl IndexEntry {
@@ -122,7 +129,29 @@ impl IndexEntry {
             columns,
             root_block: BlockNumber::INVALID,
             is_unique,
+            access_method: "btree".to_owned(),
+            opclasses: Vec::new(),
+            options: Vec::new(),
         }
+    }
+
+    /// Attach an access method and per-column opclasses.
+    #[must_use]
+    pub fn with_access_method<M: Into<String>>(
+        mut self,
+        method: M,
+        opclasses: Vec<Option<String>>,
+    ) -> Self {
+        self.access_method = method.into();
+        self.opclasses = opclasses;
+        self
+    }
+
+    /// Attach storage options captured from `WITH (...)`.
+    #[must_use]
+    pub fn with_options(mut self, options: Vec<(String, String)>) -> Self {
+        self.options = options;
+        self
     }
 }
 

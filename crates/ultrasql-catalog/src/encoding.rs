@@ -135,6 +135,9 @@ impl<'a> Reader<'a> {
     const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, pos: 0 }
     }
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.pos)
+    }
     fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         if self.pos + n > self.bytes.len() {
             return Err(DecodeError::UnexpectedEnd {
@@ -606,6 +609,22 @@ pub fn encode_index_row(row: &IndexRow) -> Vec<u8> {
     for attnum in &row.indkey {
         w.i16(*attnum);
     }
+    w.str(&row.indmethod);
+    w.u32(u32::try_from(row.indopclasses.len()).expect("opclass length fits in u32"));
+    for opclass in &row.indopclasses {
+        match opclass {
+            Some(opclass) => {
+                w.bool(true);
+                w.str(opclass);
+            }
+            None => w.bool(false),
+        }
+    }
+    w.u32(u32::try_from(row.indoptions.len()).expect("option length fits in u32"));
+    for (name, value) in &row.indoptions {
+        w.str(name);
+        w.str(value);
+    }
     out
 }
 
@@ -626,6 +645,24 @@ pub fn decode_index_row(bytes: &[u8]) -> Result<IndexRow, DecodeError> {
     for _ in 0..key_len {
         indkey.push(r.i16()?);
     }
+    let (indmethod, indopclasses, indoptions) = if r.remaining() == 0 {
+        ("btree".to_owned(), vec![None; indkey.len()], Vec::new())
+    } else {
+        let indmethod = r.str()?;
+        let opclass_len =
+            usize::try_from(r.u32()?).expect("u32 length fits usize on supported targets");
+        let mut indopclasses = Vec::with_capacity(opclass_len);
+        for _ in 0..opclass_len {
+            indopclasses.push(if r.bool()? { Some(r.str()?) } else { None });
+        }
+        let option_len =
+            usize::try_from(r.u32()?).expect("u32 length fits usize on supported targets");
+        let mut indoptions = Vec::with_capacity(option_len);
+        for _ in 0..option_len {
+            indoptions.push((r.str()?, r.str()?));
+        }
+        (indmethod, indopclasses, indoptions)
+    };
     Ok(IndexRow {
         indexrelid,
         indrelid,
@@ -634,6 +671,9 @@ pub fn decode_index_row(bytes: &[u8]) -> Result<IndexRow, DecodeError> {
         indisprimary,
         indisvalid,
         indkey,
+        indmethod,
+        indopclasses,
+        indoptions,
     })
 }
 
@@ -1110,6 +1150,9 @@ mod tests {
             indisprimary: false,
             indisvalid: true,
             indkey: vec![0, 1],
+            indmethod: "hnsw".to_owned(),
+            indopclasses: vec![Some("vector_l2_ops".to_owned()), None],
+            indoptions: vec![("m".to_owned(), "16".to_owned())],
         };
         let bytes = encode_index_row(&row);
         let decoded = decode_index_row(&bytes).expect("decode");

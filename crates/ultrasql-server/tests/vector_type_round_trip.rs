@@ -1,6 +1,7 @@
 //! End-to-end VECTOR(n) type metadata tests.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,9 +13,29 @@ async fn start_server_and_connect() -> (
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
 ) {
+    start_server_and_connect_to(Arc::new(Server::with_sample_database())).await
+}
+
+async fn start_persistent_server_and_connect(
+    data_dir: &Path,
+) -> (
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+) {
+    let server = Arc::new(Server::init(data_dir).expect("persistent server init"));
+    start_server_and_connect_to(server).await
+}
+
+async fn start_server_and_connect_to(
+    server: Arc<Server>,
+) -> (
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+) {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
     let server_handle = tokio::spawn(serve_listener(listener, server));
     let conn_str = format!(
         "host={host} port={port} user=tester application_name=vector_type_test",
@@ -39,6 +60,7 @@ async fn shutdown(
     drop(client);
     tokio::time::sleep(Duration::from_millis(20)).await;
     server_handle.abort();
+    let _ = server_handle.await;
 }
 
 fn simple_rows(messages: &[SimpleQueryMessage]) -> Vec<Vec<String>> {
@@ -458,6 +480,76 @@ async fn hnsw_l2_opclass_survives_insert_update_delete_and_vacuum() {
     );
 
     shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn hnsw_page_backed_index_survives_sql_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        client
+            .batch_execute("CREATE TABLE ann_restart (id INT NOT NULL, embedding VECTOR(3))")
+            .await
+            .expect("create vector table");
+        client
+            .batch_execute(
+                "INSERT INTO ann_restart VALUES \
+                 (1, '[9,0,0]'), \
+                 (2, '[3,0,0]'), \
+                 (3, '[6,0,0]'), \
+                 (4, '[0,0,0]')",
+            )
+            .await
+            .expect("insert vectors");
+        client
+            .batch_execute(
+                "CREATE INDEX ann_restart_embedding_hnsw \
+                 ON ann_restart USING hnsw (embedding vector_l2_ops)",
+            )
+            .await
+            .expect("create hnsw index");
+        shutdown(client, server_handle).await;
+    }
+
+    {
+        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let messages = client
+            .simple_query(
+                "SELECT id FROM ann_restart \
+                 ORDER BY embedding <-> VECTOR '[0,0,0]' LIMIT 3",
+            )
+            .await
+            .expect("top-k after restart");
+        let rows = simple_rows(&messages);
+        assert_eq!(
+            rows,
+            vec![
+                vec!["4".to_owned()],
+                vec!["2".to_owned()],
+                vec!["3".to_owned()]
+            ]
+        );
+
+        let messages = client
+            .simple_query(
+                "EXPLAIN ANALYZE SELECT id FROM ann_restart \
+                 ORDER BY embedding <-> VECTOR '[0,0,0]' LIMIT 3",
+            )
+            .await
+            .expect("explain after restart");
+        let text = simple_rows(&messages)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Vector Index: selected ann_restart_embedding_hnsw (page-backed hnsw)"),
+            "EXPLAIN ANALYZE must report page-backed HNSW after restart, got: {text}"
+        );
+
+        shutdown(client, server_handle).await;
+    }
 }
 
 #[tokio::test]

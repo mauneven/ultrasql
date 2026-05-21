@@ -1726,6 +1726,18 @@ impl PageBackedHnswIndex {
         stats
     }
 
+    /// Distance metric attached to this graph.
+    #[must_use]
+    pub const fn metric(&self) -> HnswMetric {
+        self.metric
+    }
+
+    /// Whether the graph has at least one live node available for search.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        self.page_stats().live_nodes > 0
+    }
+
     /// Insert one finite vector into page-backed HNSW pages.
     pub fn insert_vector(&self, vector: &[f32], tid: TupleId) -> Result<(), AccessMethodError> {
         self.insert_vector_internal(vector, tid, false, Lsn::ZERO)

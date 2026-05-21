@@ -886,9 +886,10 @@ where
     ) -> Result<SelectResult, ServerError> {
         match outcome {
             Ok(result) => {
-                if Self::dml_target_table(plan).is_some() {
+                let xid = txn.xid;
+                let is_dml = Self::dml_target_table(plan).is_some();
+                if is_dml {
                     if let Err(e) = self.state.validate_deferred_foreign_keys(&txn) {
-                        let xid = txn.xid;
                         if let Err(rollback_err) = self.state.heap.rollback_in_place_updates(xid) {
                             tracing::warn!(
                                 error = %rollback_err,
@@ -907,6 +908,9 @@ where
                 if let Err(e) = self.state.txn_manager.commit(txn) {
                     tracing::warn!(error = %e, "autocommit failed to finalise");
                 } else {
+                    if is_dml {
+                        self.state.append_commit_record(xid)?;
+                    }
                     self.pending_post_commit_maintenance = true;
                     let rows = result.rows;
                     self.note_dml_effect(plan, rows);
@@ -1136,12 +1140,8 @@ where
                             .flatten()
                     })
             {
-                hnsw.compact_deleted_logged(
-                    RelationId::new(index.oid.raw()),
-                    oldest,
-                    self.state.heap.wal_sink().map(Arc::as_ref),
-                )
-                .map_err(|e| ServerError::ddl(format!("VACUUM HNSW {}: {e}", index.name)))?;
+                hnsw.vacuum_deleted_logged(oldest, self.state.heap.wal_sink().map(Arc::as_ref))
+                    .map_err(|e| ServerError::ddl(format!("VACUUM HNSW {}: {e}", index.name)))?;
                 continue;
             }
             if let Some(ivfflat) =

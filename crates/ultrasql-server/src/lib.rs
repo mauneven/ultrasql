@@ -74,7 +74,7 @@ use ultrasql_catalog::{
     CatalogSnapshot, MutableCatalog, PersistentCatalog, StatisticRow, TableEntry,
 };
 use ultrasql_core::constants::PAGE_SIZE;
-use ultrasql_core::{BlockNumber, PageId, RelationId, Value};
+use ultrasql_core::{BlockNumber, DataType, Lsn, PageId, RelationId, Value, Xid};
 use ultrasql_executor::{Eval, ExecError, MemTableScan, Operator, RowCodec, SeqScan};
 use ultrasql_optimizer::{
     AnalyzeOptions, AnalyzeRunner, InMemoryStatsCatalog, PgStatisticRow, PlanCache,
@@ -87,6 +87,7 @@ use ultrasql_planner::{
     LogicalPlan, ScalarExpr, TableMeta, bind,
 };
 use ultrasql_protocol::BackendMessage;
+use ultrasql_storage::access_method::{HnswMetric, PageBackedHnswIndex};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions};
@@ -110,6 +111,7 @@ use ultrasql_wal::payload::{
     HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload, HeapUpdateInPlacePayload,
     HeapUpdatePayload, SequenceOpKind, SequenceOpPayload,
 };
+use ultrasql_wal::{RecordType, WalRecord};
 
 pub use error::ServerError;
 pub use pipeline::{LowerCtx, SampleTables, build_sample_database};
@@ -268,8 +270,8 @@ pub struct RuntimeIndexMetadata {
     pub method: LogicalIndexMethod,
     /// In-memory BRIN min/max summaries for block-range pruning.
     pub brin: Option<Arc<ultrasql_storage::access_method::BrinIndex>>,
-    /// Runtime HNSW graph for vector top-k scans.
-    pub hnsw: Option<Arc<ultrasql_storage::access_method::HnswIndex>>,
+    /// Page-backed HNSW graph for vector top-k scans.
+    pub hnsw: Option<Arc<ultrasql_storage::access_method::PageBackedHnswIndex>>,
     /// Runtime IVFFlat inverted lists for vector top-k scans.
     pub ivfflat: Option<Arc<ultrasql_storage::access_method::IvfFlatIndex>>,
     /// Runtime aggregating-index summary for dashboard-style GROUP BY scans.
@@ -1705,6 +1707,21 @@ impl Server {
             .map(ultrasql_wal::WalWriter::flushed_lsn)
     }
 
+    /// Append a commit marker for WAL-backed SQL recovery.
+    pub(crate) fn append_commit_record(&self, xid: Xid) -> Result<(), ServerError> {
+        let Some(wal) = self.heap.wal_sink() else {
+            return Ok(());
+        };
+        let payload = CommitPayload {
+            commit_lsn: Lsn::ZERO,
+            commit_timestamp_micros: unix_timestamp_micros(),
+        };
+        let record = WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, payload.encode());
+        wal.append(record)
+            .map(|_| ())
+            .map_err(|e| ServerError::ddl(format!("commit WAL append: {e}")))
+    }
+
     /// Flush dirty heap pages into the sample server's spill store.
     pub fn flush_dirty_heap_pages(&self) -> Result<usize, ServerError> {
         let loader = self.page_loader.clone();
@@ -2015,7 +2032,7 @@ impl Server {
             two_phase_dir,
         ));
 
-        Ok(Self {
+        let server = Self {
             catalog,
             tables,
             data_dir: Some(data_dir.to_path_buf()),
@@ -2043,7 +2060,144 @@ impl Server {
             next_pid: std::sync::atomic::AtomicU32::new(1),
             standby_mode: std::sync::atomic::AtomicBool::new(false),
             wal_writer: Some(wal_writer),
+        };
+        server.recover_commit_status_from_wal()?;
+        server.rebuild_persistent_vector_indexes()?;
+        Ok(server)
+    }
+
+    fn recover_commit_status_from_wal(&self) -> Result<(), ServerError> {
+        let Some(data_dir) = &self.data_dir else {
+            return Ok(());
+        };
+        let wal_dir = data_dir.join("pg_wal");
+        ultrasql_wal::recover(&wal_dir, |record| {
+            self.txn_manager.recover_observed_xid(record.header.xid);
+            if record.header.record_type == RecordType::Commit {
+                self.txn_manager.recover_committed(record.header.xid);
+            }
+            Ok(())
         })
+        .map(|_| ())
+        .map_err(|e| ServerError::ddl(format!("recover commit status: {e}")))
+    }
+
+    fn rebuild_persistent_vector_indexes(&self) -> Result<(), ServerError> {
+        let snapshot = self.catalog_snapshot();
+        let mut hnsw_indexes = Vec::new();
+
+        for (table_oid, indexes) in &snapshot.indexes_by_table {
+            let Some(table) = snapshot.tables_by_oid.get(table_oid) else {
+                continue;
+            };
+            let mut constraints = self
+                .table_constraints
+                .get(table_oid)
+                .map(|entry| entry.value().as_ref().clone())
+                .unwrap_or_default();
+            let mut changed = false;
+
+            for index in indexes {
+                let method = logical_index_method_from_name(&index.access_method);
+                match method {
+                    LogicalIndexMethod::Hnsw => {
+                        let [attnum] = index.columns.as_slice() else {
+                            continue;
+                        };
+                        let col = usize::from(*attnum);
+                        let Some(field) = table.schema.field(col) else {
+                            continue;
+                        };
+                        let dims = match &field.data_type {
+                            DataType::Vector { dims: Some(dims) } => *dims,
+                            _ => continue,
+                        };
+                        let metric = hnsw_metric_for_opclass_name(
+                            index.opclasses.first().and_then(Option::as_deref),
+                        )?;
+                        let hnsw = Arc::new(
+                            PageBackedHnswIndex::new(
+                                RelationId::new(index.oid.raw()),
+                                dims,
+                                metric,
+                                16,
+                                64,
+                            )
+                            .map_err(|e| {
+                                ServerError::ddl(format!(
+                                    "rebuild HNSW {} from catalog: {e}",
+                                    index.name
+                                ))
+                            })?,
+                        );
+                        hnsw_indexes.push(Arc::clone(&hnsw));
+                        constraints.indexes.insert(
+                            index.oid,
+                            RuntimeIndexMetadata {
+                                key_exprs: Vec::new(),
+                                predicate: None,
+                                include_columns: Vec::new(),
+                                method,
+                                brin: None,
+                                hnsw: Some(hnsw),
+                                ivfflat: None,
+                                aggregating: None,
+                            },
+                        );
+                        changed = true;
+                    }
+                    LogicalIndexMethod::IvfFlat => {
+                        constraints.indexes.insert(
+                            index.oid,
+                            RuntimeIndexMetadata {
+                                key_exprs: Vec::new(),
+                                predicate: None,
+                                include_columns: Vec::new(),
+                                method,
+                                brin: None,
+                                hnsw: None,
+                                ivfflat: None,
+                                aggregating: None,
+                            },
+                        );
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+
+            if changed {
+                self.table_constraints
+                    .insert(*table_oid, Arc::new(constraints));
+            }
+        }
+
+        self.replay_hnsw_wal_into(&hnsw_indexes)
+    }
+
+    fn replay_hnsw_wal_into(
+        &self,
+        hnsw_indexes: &[Arc<PageBackedHnswIndex>],
+    ) -> Result<(), ServerError> {
+        if hnsw_indexes.is_empty() {
+            return Ok(());
+        }
+        let Some(data_dir) = &self.data_dir else {
+            return Ok(());
+        };
+        let wal_dir = data_dir.join("pg_wal");
+        ultrasql_wal::recover(&wal_dir, |record| {
+            if record.header.record_type == RecordType::HnswOp {
+                for hnsw in hnsw_indexes {
+                    hnsw.apply_wal_record(record).map_err(|e| {
+                        ultrasql_wal::RecoveryError::Applier(format!("replay HNSW WAL: {e}"))
+                    })?;
+                }
+            }
+            Ok(())
+        })
+        .map(|_| ())
+        .map_err(|e| ServerError::ddl(format!("recover HNSW index WAL: {e}")))
     }
 
     /// Allocate the next per-connection process id.
@@ -2856,6 +3010,38 @@ fn runtime_index_method(
         .get(&table_oid)
         .and_then(|constraints| constraints.indexes.get(&index_oid).map(|idx| idx.method))
         .unwrap_or(LogicalIndexMethod::Btree)
+}
+
+fn logical_index_method_from_name(name: &str) -> LogicalIndexMethod {
+    match name {
+        "hash" => LogicalIndexMethod::Hash,
+        "gin" => LogicalIndexMethod::Gin,
+        "gist" => LogicalIndexMethod::Gist,
+        "brin" => LogicalIndexMethod::Brin,
+        "hnsw" => LogicalIndexMethod::Hnsw,
+        "ivfflat" => LogicalIndexMethod::IvfFlat,
+        "aggregating" => LogicalIndexMethod::Aggregating,
+        _ => LogicalIndexMethod::Btree,
+    }
+}
+
+fn hnsw_metric_for_opclass_name(opclass: Option<&str>) -> Result<HnswMetric, ServerError> {
+    match opclass.unwrap_or("vector_l2_ops") {
+        "vector_l2_ops" => Ok(HnswMetric::L2),
+        "vector_cosine_ops" => Ok(HnswMetric::Cosine),
+        "vector_ip_ops" => Ok(HnswMetric::NegativeInnerProduct),
+        "vector_l1_ops" => Ok(HnswMetric::L1),
+        other => Err(ServerError::ddl(format!(
+            "CREATE INDEX USING hnsw: unsupported vector opclass {other}"
+        ))),
+    }
+}
+
+fn unix_timestamp_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros().try_into().unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn lock_rows_base_filter(plan: &LogicalPlan) -> Option<(&str, Option<&ScalarExpr>)> {

@@ -660,6 +660,29 @@ impl TransactionManager {
         Ok(())
     }
 
+    /// Restore a committed XID observed during WAL recovery.
+    pub fn recover_committed(&self, xid: Xid) {
+        if xid == Xid::INVALID || xid == Xid::FROZEN || xid == Xid::BOOTSTRAP {
+            return;
+        }
+        self.clog.insert(xid, XidStatus::Committed);
+        self.in_progress.lock().remove(&xid);
+        self.recover_observed_xid(xid);
+    }
+
+    /// Advance the allocator past an XID observed during WAL recovery.
+    pub fn recover_observed_xid(&self, xid: Xid) {
+        if xid == Xid::INVALID || xid == Xid::FROZEN || xid == Xid::BOOTSTRAP {
+            return;
+        }
+        let next = xid.raw().saturating_add(1);
+        let _ = self
+            .next_xid
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (current < next).then_some(next)
+            });
+    }
+
     // ── SSI pass-through methods ─────────────────────────────────────────────
 
     /// Record a predicate lock for a serializable transaction.

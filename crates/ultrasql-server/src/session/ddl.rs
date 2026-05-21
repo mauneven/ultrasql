@@ -24,7 +24,7 @@ use ultrasql_planner::{
 };
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
 use ultrasql_storage::access_method::{
-    AccessMethod, BrinIndex, HnswIndex, HnswMetric, IvfFlatIndex,
+    AccessMethod, BrinIndex, HnswMetric, IvfFlatIndex, PageBackedHnswIndex,
 };
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
@@ -794,7 +794,9 @@ where
                 table.oid,
                 vec![attnum],
                 false,
-            );
+            )
+            .with_access_method("ivfflat", opclasses.clone())
+            .with_options(index_options_as_pairs(index_options));
             self.state.persistent_catalog.create_index(entry.clone())?;
             let ddl_txn = self
                 .state
@@ -883,7 +885,7 @@ where
             let index_oid = self.state.persistent_catalog.next_oid();
             let index_rel = RelationId::new(index_oid.raw());
             let hnsw = Arc::new(
-                HnswIndex::new(dims, metric, 16, 64)
+                PageBackedHnswIndex::new(index_rel, dims, metric, 16, 64)
                     .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw init: {e}")))?,
             );
             let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
@@ -914,7 +916,6 @@ where
                         }
                     };
                     hnsw.insert_vector_logged(
-                        index_rel,
                         vector,
                         tuple.tid,
                         txn.xid,
@@ -939,7 +940,9 @@ where
                 table.oid,
                 vec![attnum],
                 false,
-            );
+            )
+            .with_access_method("hnsw", opclasses.clone())
+            .with_options(index_options_as_pairs(index_options));
             self.state.persistent_catalog.create_index(entry.clone())?;
             let ddl_txn = self
                 .state
@@ -1103,7 +1106,9 @@ where
         //    `IndexEntry` stores 0-based positions internally, so the
         //    cast is direct. We override `root_block` to match the
         //    freshly built tree.
-        let mut entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, *unique);
+        let mut entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, *unique)
+            .with_access_method(logical_index_method_name(*method), opclasses.clone())
+            .with_options(index_options_as_pairs(index_options));
         entry.root_block = root_block;
         self.state.persistent_catalog.create_index(entry.clone())?;
         let ddl_txn = self
@@ -1354,6 +1359,26 @@ fn hnsw_metric_for_opclass(opclass: Option<&str>) -> Result<HnswMetric, ServerEr
             "CREATE INDEX USING hnsw: unsupported vector opclass {other}"
         ))),
     }
+}
+
+fn logical_index_method_name(method: LogicalIndexMethod) -> &'static str {
+    match method {
+        LogicalIndexMethod::Btree => "btree",
+        LogicalIndexMethod::Hash => "hash",
+        LogicalIndexMethod::Gin => "gin",
+        LogicalIndexMethod::Gist => "gist",
+        LogicalIndexMethod::Brin => "brin",
+        LogicalIndexMethod::Hnsw => "hnsw",
+        LogicalIndexMethod::IvfFlat => "ivfflat",
+        LogicalIndexMethod::Aggregating => "aggregating",
+    }
+}
+
+fn index_options_as_pairs(options: &[LogicalIndexOption]) -> Vec<(String, String)> {
+    options
+        .iter()
+        .map(|option| (option.name.clone(), option.value.clone()))
+        .collect()
 }
 
 fn ivfflat_options(options: &[LogicalIndexOption]) -> Result<(usize, usize), ServerError> {

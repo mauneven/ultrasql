@@ -8,7 +8,7 @@ use ultrasql_core::{BlockNumber, DataType, Field, RelationId, TupleId, Value};
 use ultrasql_executor::{Filter, IndexOnlyScan, IndexScan, Limit, Operator, RowCodec, TopK};
 use ultrasql_mvcc::{Visibility, is_visible};
 use ultrasql_planner::{BinaryOp, LogicalIndexMethod, LogicalPlan, ScalarExpr, SortKey};
-use ultrasql_storage::access_method::{BrinIndex, HnswIndex, HnswMetric, IvfFlatIndex};
+use ultrasql_storage::access_method::{BrinIndex, HnswMetric, IvfFlatIndex, PageBackedHnswIndex};
 use ultrasql_storage::btree::BTree;
 
 use crate::BlankPageLoader;
@@ -329,7 +329,7 @@ fn find_hnsw_index(
     table_entry: &TableEntry,
     col_idx: usize,
     metric: HnswMetric,
-) -> Option<Arc<HnswIndex>> {
+) -> Option<Arc<PageBackedHnswIndex>> {
     let attnum = u16::try_from(col_idx).ok()?;
     let indexes = ctx
         .catalog_snapshot

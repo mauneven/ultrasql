@@ -1407,7 +1407,6 @@ fn build_vector_index_maintainers(
                 };
                 out.push(VectorIndexMaintainer::new_hnsw(
                     index.name.clone(),
-                    RelationId::new(index.oid.raw()),
                     hnsw,
                     encoder,
                     ctx.xid,
@@ -1420,7 +1419,6 @@ fn build_vector_index_maintainers(
                 };
                 out.push(VectorIndexMaintainer::new_ivfflat(
                     index.name.clone(),
-                    RelationId::new(index.oid.raw()),
                     ivfflat,
                     encoder,
                     ctx.xid,

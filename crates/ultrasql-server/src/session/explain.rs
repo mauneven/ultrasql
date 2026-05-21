@@ -29,6 +29,7 @@ use ultrasql_core::Field;
 use ultrasql_executor::Operator;
 use ultrasql_planner::{BinaryOp, ExplainFormat, LogicalIndexMethod, LogicalPlan, ScalarExpr};
 use ultrasql_protocol::messages::{BackendMessage, FieldDescription};
+use ultrasql_storage::access_method::HnswMetric;
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::Column;
 
@@ -127,6 +128,7 @@ where
                 elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
                 simd_kernel: notes.simd_kernel,
                 index_decision: notes.index_decision,
+                vector_index: notes.vector_index,
                 late_materialization: notes.late_materialization,
                 aggregating_index: notes.aggregating_index,
                 pushdowns_applied: notes.pushdowns_applied,
@@ -179,6 +181,7 @@ where
             elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
             simd_kernel: notes.simd_kernel,
             index_decision: notes.index_decision,
+            vector_index: notes.vector_index,
             late_materialization: notes.late_materialization,
             aggregating_index: notes.aggregating_index,
             pushdowns_applied: notes.pushdowns_applied,
@@ -244,6 +247,7 @@ where
         ExplainNotes {
             simd_kernel: simd_kernel_note(plan),
             index_decision: self.index_decision_note(plan, catalog_snapshot),
+            vector_index: self.vector_index_note(plan, catalog_snapshot),
             late_materialization: self.late_materialization_note(plan, catalog_snapshot),
             aggregating_index: crate::aggregating_index::aggregating_index_note_for_snapshot(
                 plan,
@@ -320,6 +324,57 @@ where
         )
     }
 
+    fn vector_index_note(
+        &self,
+        plan: &LogicalPlan,
+        catalog_snapshot: &Arc<CatalogSnapshot>,
+    ) -> String {
+        let Some((table, col_idx, metric)) = first_vector_sort_scan(plan) else {
+            return "not applicable (no ORDER BY vector distance LIMIT shape)".to_owned();
+        };
+        let Some(table_entry) = catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
+            return format!("skipped {table}: not a persistent catalog table");
+        };
+        let Ok(attnum) = u16::try_from(col_idx) else {
+            return format!("skipped {table}: vector column index exceeds attnum");
+        };
+        let Some(indexes) = catalog_snapshot.indexes_by_table.get(&table_entry.oid) else {
+            return format!("skipped {table}: no vector indexes on table");
+        };
+        let Some(constraints) = self.state.table_constraints.get(&table_entry.oid) else {
+            return format!("skipped {table}: vector index runtime metadata unavailable");
+        };
+        for index in indexes {
+            if index.columns.as_slice() != [attnum] {
+                continue;
+            }
+            let Some(metadata) = constraints.indexes.get(&index.oid) else {
+                continue;
+            };
+            if metadata.method == LogicalIndexMethod::Hnsw {
+                if metadata
+                    .hnsw
+                    .as_ref()
+                    .is_some_and(|hnsw| hnsw.metric() == metric && hnsw.is_available())
+                {
+                    return format!("selected {} (page-backed hnsw)", index.name);
+                }
+                return format!("skipped {}: page-backed hnsw unavailable", index.name);
+            }
+            if metadata.method == LogicalIndexMethod::IvfFlat {
+                if metadata
+                    .ivfflat
+                    .as_ref()
+                    .is_some_and(|ivfflat| ivfflat.metric() == metric && ivfflat.is_available())
+                {
+                    return format!("selected {} (runtime ivfflat)", index.name);
+                }
+                return format!("skipped {}: ivfflat runtime unavailable", index.name);
+            }
+        }
+        format!("skipped {table}: no matching vector index")
+    }
+
     fn late_materialization_note(
         &self,
         plan: &LogicalPlan,
@@ -369,6 +424,7 @@ struct ExplainActuals {
     elapsed_ms: f64,
     simd_kernel: String,
     index_decision: String,
+    vector_index: String,
     late_materialization: String,
     aggregating_index: String,
     pushdowns_applied: Vec<String>,
@@ -384,6 +440,7 @@ struct ExplainScanActuals {
 struct ExplainNotes {
     simd_kernel: String,
     index_decision: String,
+    vector_index: String,
     late_materialization: String,
     aggregating_index: String,
     pushdowns_applied: Vec<String>,
@@ -424,6 +481,7 @@ fn render_text(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
              Disk Spill: {} ({} bytes; {})\n\
              SIMD Kernel: {}\n\
              Index Decision: {}\n\
+             Vector Index: {}\n\
              Late Materialization: {}\n\
              Aggregating Index: {}\n\
              Pushdowns Applied: {}\n\
@@ -437,6 +495,7 @@ fn render_text(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
             a.disk_spill.reason,
             a.simd_kernel,
             a.index_decision,
+            a.vector_index,
             a.late_materialization,
             a.aggregating_index,
             pushdowns,
@@ -477,6 +536,7 @@ fn render_json(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
              \n    \"Disk Spill\": {{\"Used\": {}, \"Bytes\": {}, \"Reason\": \"{}\"}},\
              \n    \"SIMD Kernel\": \"{}\",\
              \n    \"Index Decision\": \"{}\",\
+             \n    \"Vector Index\": \"{}\",\
              \n    \"Late Materialization\": \"{}\",\
              \n    \"Aggregating Index\": \"{}\",\
              \n    \"Pushdowns Applied\": {},\
@@ -490,6 +550,7 @@ fn render_json(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
             json_escape(a.disk_spill.reason),
             json_escape(&a.simd_kernel),
             json_escape(&a.index_decision),
+            json_escape(&a.vector_index),
             json_escape(&a.late_materialization),
             json_escape(&a.aggregating_index),
             pushdowns,
@@ -717,6 +778,56 @@ fn first_project_filter_scan(plan: &LogicalPlan) -> Option<(&str, usize, Vec<usi
             definition, body, ..
         } => first_project_filter_scan(definition).or_else(|| first_project_filter_scan(body)),
         LogicalPlan::Insert { source, .. } => first_project_filter_scan(source),
+        _ => None,
+    }
+}
+
+fn first_vector_sort_scan(plan: &LogicalPlan) -> Option<(&str, usize, HnswMetric)> {
+    match plan {
+        LogicalPlan::Limit { input, .. } | LogicalPlan::Project { input, .. } => {
+            first_vector_sort_scan(input)
+        }
+        LogicalPlan::Sort { input, keys } => {
+            let key = keys.iter().find(|key| key.asc)?;
+            let (col_idx, metric) = vector_sort_key_column(&key.expr)?;
+            let table = first_scan_table(input)?;
+            Some((table, col_idx, metric))
+        }
+        _ => plan_children(plan)
+            .into_iter()
+            .find_map(first_vector_sort_scan),
+    }
+}
+
+fn first_scan_table(plan: &LogicalPlan) -> Option<&str> {
+    match plan {
+        LogicalPlan::Scan { table, .. } => Some(table.as_str()),
+        _ => plan_children(plan).into_iter().find_map(first_scan_table),
+    }
+}
+
+fn vector_sort_key_column(expr: &ScalarExpr) -> Option<(usize, HnswMetric)> {
+    let ScalarExpr::Binary {
+        op, left, right, ..
+    } = expr
+    else {
+        return None;
+    };
+    let metric = match op {
+        BinaryOp::VectorL2Distance => HnswMetric::L2,
+        BinaryOp::VectorCosineDistance => HnswMetric::Cosine,
+        BinaryOp::VectorNegativeInnerProduct => HnswMetric::NegativeInnerProduct,
+        BinaryOp::VectorL1Distance => HnswMetric::L1,
+        _ => return None,
+    };
+    vector_column_index(left)
+        .or_else(|| vector_column_index(right))
+        .map(|idx| (idx, metric))
+}
+
+fn vector_column_index(expr: &ScalarExpr) -> Option<usize> {
+    match expr {
+        ScalarExpr::Column { index, .. } => Some(*index),
         _ => None,
     }
 }
