@@ -405,6 +405,8 @@ for line in pathlib.Path(status_path).read_text(encoding="utf-8").splitlines():
 
 has_failed = any(entry["status"] == "failed" for entry in entries)
 has_unavailable = any(entry["status"] == "unavailable" for entry in entries)
+statuses = {entry["engine"]: entry["status"] for entry in entries}
+both_measured = statuses.get("ultrasql") == "measured" and statuses.get("firebolt") == "measured"
 doc = {
     "schema_version": 1,
     "suite": "firebolt_aggregate_index",
@@ -416,7 +418,21 @@ doc = {
     "generated_at_unix": int(time.time()),
     "status": "failed" if has_failed else "partial" if has_unavailable else "passed",
     "passed": not has_failed and not has_unavailable,
+    "both_engines_measured": both_measured,
+    "claim_status": "eligible" if both_measured else "not_claimed",
+    "same_workload": {
+        "dataset_generator": "row_id -> tenant_id=row_id%32, bucket=(row_id//32)%64, amount=((row_id*17)%1000)-500",
+        "query": (
+            "SELECT tenant_id, bucket, SUM(amount), COUNT(*) "
+            "WHERE tenant_id = 7 GROUP BY tenant_id, bucket "
+            "ORDER BY tenant_id, bucket"
+        ),
+        "rows": int(rows),
+        "warmup": int(warmup),
+        "iters": int(iters),
+    },
     "engines": entries,
+    "claim_policy": "No Firebolt aggregate-index benchmark claim may be made unless both UltraSQL and local Firebolt Core are measured on the same rows, query, warmup, and iters.",
     "policy": (
         "No Firebolt aggregate-index benchmark claim exists unless Firebolt "
         "has a measured local Core artifact and EXPLAIN shows "

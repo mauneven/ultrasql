@@ -2727,6 +2727,15 @@ async fn run_shared_dashboard_aggregate(
         .with_context(|| format!("CREATE TABLE {table}"))?;
     preload_dashboard_aggregate_chunked(&client, table, n_rows).await?;
 
+    let index_ddl = format!(
+        "CREATE AGGREGATING INDEX ix_dashboard_agg ON {table} \
+         (tenant_id, bucket, SUM(amount), COUNT(*))"
+    );
+    client
+        .batch_execute(&index_ddl)
+        .await
+        .with_context(|| format!("CREATE AGGREGATING INDEX ix_dashboard_agg ON {table}"))?;
+
     let query = format!(
         "SELECT tenant_id, bucket, SUM(amount), COUNT(*) \
          FROM {table} \
@@ -2734,6 +2743,23 @@ async fn run_shared_dashboard_aggregate(
          GROUP BY tenant_id, bucket \
          ORDER BY tenant_id, bucket"
     );
+    let explain_rows = simple_query_rows(
+        &client
+            .simple_query(&format!("EXPLAIN ANALYZE {query}"))
+            .await
+            .with_context(|| format!("EXPLAIN ANALYZE dashboard aggregate on {table}"))?,
+    );
+    let explain_aggregating_index = explain_rows
+        .iter()
+        .filter_map(|row| row.first().cloned())
+        .find(|line| line.starts_with("Aggregating Index:"))
+        .context("EXPLAIN ANALYZE did not emit Aggregating Index line")?;
+    if !explain_aggregating_index.contains("aggregating_index_used=true") {
+        anyhow::bail!(
+            "dashboard aggregate did not use aggregating index: {explain_aggregating_index}"
+        );
+    }
+
     let mut answer_rows = Vec::new();
     for i in 0..total_iters {
         let started = Instant::now();
@@ -2761,6 +2787,9 @@ async fn run_shared_dashboard_aggregate(
             "CREATE AGGREGATING INDEX idx ON fact_events ",
             "(tenant_id, bucket, SUM(amount), COUNT(*))"
         ),
+        "index_ddl": index_ddl,
+        "aggregating_index_used": true,
+        "explain_aggregating_index": explain_aggregating_index,
     }))
 }
 

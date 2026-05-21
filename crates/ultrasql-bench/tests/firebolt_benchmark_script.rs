@@ -39,6 +39,30 @@ fn firebolt_aggregate_script_declares_competitor_and_index_workload() {
 }
 
 #[test]
+fn firebolt_aggregate_script_requires_matched_local_core_claims() {
+    let script = repo_file("benchmarks/firebolt_aggregate_index.sh");
+
+    assert!(script.contains("--workload dashboard-aggregate"));
+    assert!(script.contains("--rows \"$ROWS\""));
+    assert!(script.contains("--warmup \"$WARMUP\""));
+    assert!(script.contains("--iters \"$ITERS\""));
+    assert!(script.contains("FIREBOLT_ROWS=\"$ROWS\""));
+    assert!(script.contains("FIREBOLT_WARMUP=\"$WARMUP\""));
+    assert!(script.contains("FIREBOLT_ITERS=\"$ITERS\""));
+    assert!(script.contains("tenant_id = row_id % 32"));
+    assert!(script.contains("bucket = (row_id // 32) % 64"));
+    assert!(script.contains("amount = ((row_id * 17) % 1000) - 500"));
+    assert!(script.contains("SELECT tenant_id, bucket, SUM(amount), COUNT(*)"));
+    assert!(script.contains("WHERE tenant_id = 7"));
+    assert!(script.contains("GROUP BY tenant_id, bucket"));
+    assert!(script.contains("\"both_engines_measured\": both_measured"));
+    assert!(
+        script.contains("\"claim_status\": \"eligible\" if both_measured else \"not_claimed\"")
+    );
+    assert!(script.contains("No Firebolt aggregate-index benchmark claim may be made unless both UltraSQL and local Firebolt Core are measured"));
+}
+
+#[test]
 fn firebolt_sparse_script_declares_primary_index_pruning_workload() {
     let script = repo_file("benchmarks/firebolt_sparse_pruning.sh");
 
@@ -182,6 +206,9 @@ fn cross_compare_sql_exposes_dashboard_aggregate_workload() {
 
     assert!(driver.contains("DashboardAggregate"));
     assert!(driver.contains("firebolt_aggregate_index"));
+    assert!(driver.contains("CREATE AGGREGATING INDEX ix_dashboard_agg"));
+    assert!(driver.contains("aggregating_index_used=true"));
+    assert!(driver.contains("explain_aggregating_index"));
     assert!(driver.contains("GROUP BY tenant_id, bucket"));
     assert!(driver.contains("COUNT(*)"));
 }
