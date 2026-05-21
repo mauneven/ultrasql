@@ -164,9 +164,7 @@ where
                 return Err(err);
             }
         };
-        if let Err(err) = self.state.txn_manager.commit(txn) {
-            warn!(error = %err, "COPY FROM parquet commit failed");
-        }
+        self.finalise_copy_from_commit(txn, rows, "COPY FROM parquet")?;
         Ok(rows)
     }
 }

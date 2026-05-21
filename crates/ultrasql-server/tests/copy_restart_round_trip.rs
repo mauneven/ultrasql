@@ -5,10 +5,54 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::SinkExt;
+use parquet::arrow::ArrowWriter;
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
+
+fn sql_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn write_copy_parquet(path: &Path, rows: &[(i64, &str, f64, bool)]) {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, false),
+        ArrowField::new("label", ArrowDataType::Utf8, false),
+        ArrowField::new("score", ArrowDataType::Float64, false),
+        ArrowField::new("active", ArrowDataType::Boolean, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(id, _, _, _)| *id).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|(_, label, _, _)| *label)
+                    .collect::<Vec<&str>>(),
+            )),
+            Arc::new(Float64Array::from(
+                rows.iter()
+                    .map(|(_, _, score, _)| *score)
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(BooleanArray::from(
+                rows.iter()
+                    .map(|(_, _, _, active)| *active)
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .expect("parquet record batch");
+    let file = std::fs::File::create(path).expect("create parquet");
+    let mut writer = ArrowWriter::try_new(file, schema, None).expect("parquet writer");
+    writer.write(&batch).expect("write parquet batch");
+    writer.close().expect("close parquet writer");
+}
 
 async fn start_persistent_server(
     data_dir: &Path,
@@ -96,5 +140,42 @@ async fn copy_from_stdin_rows_survive_restart() {
 
     let (client, _conn_handle, server_handle) = start_persistent_server(data_dir.path()).await;
     assert_eq!(select_count(&client, "copy_restart").await, 2);
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copy_from_parquet_rows_survive_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let parquet_dir = tempfile::TempDir::new().unwrap();
+    let parquet_path = parquet_dir.path().join("import.parquet");
+    write_copy_parquet(
+        &parquet_path,
+        &[(10, "alpha", 1.5, true), (20, "bravo", 2.5, false)],
+    );
+
+    let (client, _conn_handle, server_handle) = start_persistent_server(data_dir.path()).await;
+    client
+        .simple_query(
+            "CREATE TABLE parquet_restart (
+                id BIGINT,
+                label TEXT,
+                score DOUBLE,
+                active BOOL
+            )",
+        )
+        .await
+        .expect("create parquet restart table");
+    client
+        .simple_query(&format!(
+            "COPY parquet_restart FROM {}",
+            sql_string(parquet_path.to_str().expect("utf8 parquet path"))
+        ))
+        .await
+        .expect("copy parquet import");
+    assert_eq!(select_count(&client, "parquet_restart").await, 2);
+    shutdown(client, server_handle).await;
+
+    let (client, _conn_handle, server_handle) = start_persistent_server(data_dir.path()).await;
+    assert_eq!(select_count(&client, "parquet_restart").await, 2);
     shutdown(client, server_handle).await;
 }

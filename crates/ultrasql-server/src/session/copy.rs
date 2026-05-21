@@ -80,7 +80,7 @@ impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
-    fn finalise_copy_from_commit(
+    pub(crate) fn finalise_copy_from_commit(
         &self,
         txn: Transaction,
         rows_changed: u64,
