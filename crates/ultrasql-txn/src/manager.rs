@@ -705,6 +705,17 @@ impl TransactionManager {
             ssi.record_rw_conflict(reader, writer);
         }
     }
+
+    /// Record rw-anti-dependencies caused by `writer` modifying `tag`.
+    ///
+    /// Pass-through to [`SsiManager::record_write_conflicts`]. No-ops when no
+    /// [`SsiManager`] is installed. The returned XIDs are serializable readers
+    /// whose predicate locks covered the write target.
+    pub fn record_write_conflicts(&self, writer: Xid, tag: &PredicateLockTag) -> Vec<Xid> {
+        self.ssi
+            .as_ref()
+            .map_or_else(Vec::new, |ssi| ssi.record_write_conflicts(writer, tag))
+    }
 }
 
 impl XidStatusOracle for TransactionManager {

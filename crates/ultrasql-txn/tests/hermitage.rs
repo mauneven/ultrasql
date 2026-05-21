@@ -380,3 +380,96 @@ fn g2_anti_dependency_cycle_prevented_at_serializable() {
          got r1={r1:?} r2={r2:?} r3={r3:?}"
     );
 }
+
+#[test]
+fn g2_write_skew_via_predicate_writes_aborts_one_tx() {
+    use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
+    use ultrasql_txn::PredicateLockTag;
+
+    let mgr = mgr_ser();
+
+    let t1 = mgr.begin(IsolationLevel::Serializable);
+    let t2 = mgr.begin(IsolationLevel::Serializable);
+    let t1_xid = t1.xid;
+    let t2_xid = t2.xid;
+
+    let doctors = RelationId::new(700);
+    let all_doctors = PredicateLockTag::Relation(doctors);
+    mgr.record_predicate_lock(t1_xid, all_doctors.clone());
+    mgr.record_predicate_lock(t2_xid, all_doctors);
+
+    let alice = PredicateLockTag::Tuple(TupleId::new(PageId::new(doctors, BlockNumber::new(0)), 0));
+    let bob = PredicateLockTag::Tuple(TupleId::new(PageId::new(doctors, BlockNumber::new(0)), 1));
+
+    let alice_readers = mgr.record_write_conflicts(t1_xid, &alice);
+    assert!(alice_readers.contains(&t2_xid));
+    assert!(!alice_readers.contains(&t1_xid));
+
+    let bob_readers = mgr.record_write_conflicts(t2_xid, &bob);
+    assert!(bob_readers.contains(&t1_xid));
+    assert!(!bob_readers.contains(&t2_xid));
+
+    let r1 = mgr.commit(t1);
+    let r2 = mgr.commit(t2);
+
+    assert!(
+        r1.is_err() || r2.is_err(),
+        "write-skew dangerous structure must abort one tx; got r1={r1:?} r2={r2:?}"
+    );
+    assert!(
+        mgr.is_aborted(t1_xid) || mgr.is_aborted(t2_xid),
+        "serialization victim must be Aborted in oracle"
+    );
+}
+
+#[test]
+fn serializable_stress_many_hermitage_pivots_abort_correctly() {
+    use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId};
+    use ultrasql_txn::PredicateLockTag;
+
+    let mgr = mgr_ser();
+
+    for scenario in 0..16_u32 {
+        let t1 = mgr.begin(IsolationLevel::Serializable);
+        let pivot = mgr.begin(IsolationLevel::Serializable);
+        let t3 = mgr.begin(IsolationLevel::Serializable);
+
+        let left_rel = RelationId::new(800 + scenario * 2);
+        let right_rel = RelationId::new(801 + scenario * 2);
+        mgr.record_predicate_lock(t1.xid, PredicateLockTag::Relation(left_rel));
+        mgr.record_predicate_lock(pivot.xid, PredicateLockTag::Relation(right_rel));
+
+        let left_write =
+            PredicateLockTag::Tuple(TupleId::new(PageId::new(left_rel, BlockNumber::new(0)), 0));
+        let right_write =
+            PredicateLockTag::Tuple(TupleId::new(PageId::new(right_rel, BlockNumber::new(0)), 0));
+
+        assert_eq!(
+            mgr.record_write_conflicts(pivot.xid, &left_write),
+            vec![t1.xid]
+        );
+        assert_eq!(
+            mgr.record_write_conflicts(t3.xid, &right_write),
+            vec![pivot.xid]
+        );
+
+        let t1_xid = t1.xid;
+        let pivot_xid = pivot.xid;
+        let t3_xid = t3.xid;
+
+        let r1 = mgr.commit(t1);
+        assert!(r1.is_ok(), "left tx should commit: {r1:?}");
+
+        let rp = mgr.commit(pivot);
+        assert!(
+            rp.is_err(),
+            "pivot must abort in scenario {scenario}; got {rp:?}"
+        );
+        assert!(mgr.is_committed(t1_xid));
+        assert!(mgr.is_aborted(pivot_xid));
+
+        let r3 = mgr.commit(t3);
+        assert!(r3.is_ok(), "right tx should commit: {r3:?}");
+        assert!(mgr.is_committed(t3_xid));
+    }
+}

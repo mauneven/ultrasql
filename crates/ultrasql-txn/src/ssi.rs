@@ -173,6 +173,30 @@ impl SsiManager {
         }
     }
 
+    /// Record rw-anti-dependencies caused by `writer` modifying `tag`.
+    ///
+    /// Finds every registered serializable transaction whose predicate lock
+    /// covers `tag`, excludes `writer` itself, and records `reader --rw-->
+    /// writer` for each remaining holder. Returns the readers whose locks
+    /// matched in deterministic XID order so callers can expose or test the
+    /// conflict edge set.
+    pub fn record_write_conflicts(&self, writer: Xid, tag: &PredicateLockTag) -> Vec<Xid> {
+        if !self.rw_conflicts.contains_key(&writer) {
+            return Vec::new();
+        }
+
+        let mut readers = self.find_predicate_lock_holders(tag);
+        readers.retain(|reader| *reader != writer);
+        readers.sort_unstable();
+        readers.dedup();
+
+        for reader in readers.iter().copied() {
+            self.record_rw_conflict(reader, writer);
+        }
+
+        readers
+    }
+
     /// Check whether `xid` is the pivot of a dangerous structure.
     ///
     /// A dangerous structure exists when:
