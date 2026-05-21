@@ -12,13 +12,15 @@
     "csv",
     "parquet",
     "object-parquet-range",
+    "clickbench",
+    "sqllogictest",
     "vector",
     "jsonb",
     "aggregate-index",
     "sparse-pruning",
     "firebolt-vector"
   ],
-  "generated_at_unix": 1779343241,
+  "generated_at_unix": 1779369469,
   "status": "partial",
   "passed": false,
   "suites": [
@@ -101,9 +103,33 @@
       "artifact": "benchmarks/results/latest/raw/arena_object-parquet-range_smoke-firebolt.json"
     },
     {
-      "suite": "vector",
+      "suite": "clickbench",
       "status": "unavailable",
       "exit_code": 2,
+      "artifact": "benchmarks/results/latest/clickbench_certification.json"
+    },
+    {
+      "suite": "sqllogictest",
+      "status": "passed",
+      "exit_code": 0,
+      "artifact": "benchmarks/results/latest/slt_speed_comparison.json"
+    },
+    {
+      "suite": "sqllogictest:clickhouse",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_sqllogictest_smoke-clickhouse.json"
+    },
+    {
+      "suite": "sqllogictest:firebolt",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_sqllogictest_smoke-firebolt.json"
+    },
+    {
+      "suite": "vector",
+      "status": "passed",
+      "exit_code": 0,
       "artifact": "benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json"
     },
     {

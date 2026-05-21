@@ -1,1 +1,1 @@
-{"answer":{"rows":[["0"]]},"engine":"ultrasql","iterations_us":[2184.292],"median_us":2184.292,"min_us":2184.292,"n_rows":1000,"samples":1,"workload":"csv_join_table_1k"}
+{"answer":{"rows":[["0"]]},"engine":"ultrasql","host":{"cores":10,"cpu":"Apple M4","os":"macos unknown","ram_gb":16},"iterations_us":[2798.5],"median_us":2798.5,"min_us":2798.5,"n_rows":1000,"policy":"Raw measured samples only; no ranking or winner claim.","samples":1,"schema_version":1,"status":"measured","workload":"csv_join_table_1k"}

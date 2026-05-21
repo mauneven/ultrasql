@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "profile": "smoke",
-  "generated_at_unix": 1779348025,
+  "generated_at_unix": 1779369465,
   "status": "passed",
   "passed": true,
   "suites": [

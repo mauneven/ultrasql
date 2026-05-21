@@ -6,7 +6,16 @@
   "profile": "smoke",
   "status": "not_available",
   "reason": "runner_not_implemented_for_engine",
-  "generated_at_unix": 1779343241,
+  "generated_at_unix": 1779369468,
+  "host": {
+    "cpu": "arm",
+    "cores": 10,
+    "ram_gb": 16,
+    "os": "macOS-26.5-arm64-arm-64bit-Mach-O",
+    "memory_bytes": 17179869184
+  },
+  "host_cpu": "arm",
+  "host_memory": 17179869184,
   "required_metrics": [
     "recall_at_k",
     "p50_latency_us",

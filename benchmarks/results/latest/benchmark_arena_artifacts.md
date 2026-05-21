@@ -2,7 +2,7 @@
 
 - profile: `smoke`
 - engines: `ultrasql,duckdb,clickhouse,postgres,firebolt`
-- suites: `csv,parquet,object-parquet-range,vector,jsonb,aggregate-index,sparse-pruning,firebolt-vector`
+- suites: `csv,parquet,object-parquet-range,clickbench,sqllogictest,vector,jsonb,aggregate-index,sparse-pruning,firebolt-vector`
 - policy: artifacts only; no rankings or winner claims
 
 | suite | status | exit | artifact |
@@ -20,7 +20,11 @@
 | `object-parquet-range:clickhouse` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_object-parquet-range_smoke-clickhouse.json` |
 | `object-parquet-range:postgres` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_object-parquet-range_smoke-postgres.json` |
 | `object-parquet-range:firebolt` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_object-parquet-range_smoke-firebolt.json` |
-| `vector` | `unavailable` | 2 | `benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json` |
+| `clickbench` | `unavailable` | 2 | `benchmarks/results/latest/clickbench_certification.json` |
+| `sqllogictest` | `passed` | 0 | `benchmarks/results/latest/slt_speed_comparison.json` |
+| `sqllogictest:clickhouse` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_sqllogictest_smoke-clickhouse.json` |
+| `sqllogictest:firebolt` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_sqllogictest_smoke-firebolt.json` |
+| `vector` | `passed` | 0 | `benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json` |
 | `vector:firebolt` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_vector_smoke-firebolt.json` |
 | `jsonb:ultrasql` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_jsonb_smoke-ultrasql.json` |
 | `jsonb:duckdb` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_jsonb_smoke-duckdb.json` |

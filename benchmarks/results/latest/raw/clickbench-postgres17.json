@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "suite": "clickbench",
+  "engine": "postgres17",
+  "workload": "clickbench",
+  "upstream_ref": "c5eb5d8e9c10fbef5ce16e8750f3e67de24cef0a",
+  "dataset": "target/clickbench/hits.tsv",
+  "dataset_rows": null,
+  "query_count": null,
+  "samples": [],
+  "median_us": null,
+  "p95_us": null,
+  "geomean_ms": null,
+  "status": "not_available",
+  "reason": "dataset_missing",
+  "detail": "Set CLICKBENCH_DOWNLOAD=1 or CLICKBENCH_TSV=/path/to/hits.tsv.",
+  "host": {
+    "cpu": "arm",
+    "cores": 10,
+    "ram_gb": 16,
+    "os": "macOS-26.5-arm64-arm-64bit-Mach-O",
+    "memory_bytes": 17179869184
+  },
+  "host_cpu": "arm",
+  "host_memory": 17179869184,
+  "generated_at_unix": 1779369404,
+  "policy": "No ClickBench claim exists for this engine until this artifact contains measured samples from the pinned dataset."
+}

@@ -1,14 +1,44 @@
 {
   "format_version": 1,
   "suite": "sqllogictest",
-  "generated_at_unix_ms": 1779214041356,
+  "generated_at_unix_ms": 1779369449031,
   "benchmark_runs": 5,
   "case_count": 50,
-  "input_paths": ["tests/slt/portable"],
-  "winner": "sqlite",
+  "input_paths": [
+    "tests/slt/portable"
+  ],
   "engines": [
-    {"name": "ultrasql", "ok": true, "error": null, "statements": 28, "query_records": 19, "query_iterations": 95, "skipped": 3, "total_ns": 16123458, "avg_ns_per_query_iteration": 169720},
-    {"name": "sqlite", "ok": true, "error": null, "statements": 28, "query_records": 19, "query_iterations": 95, "skipped": 3, "total_ns": 11237083, "avg_ns_per_query_iteration": 118285},
-    {"name": "duckdb", "ok": true, "error": null, "statements": 28, "query_records": 19, "query_iterations": 95, "skipped": 3, "total_ns": 33101250, "avg_ns_per_query_iteration": 348434}
-  ]
+    {
+      "name": "ultrasql",
+      "ok": true,
+      "error": null,
+      "statements": 29,
+      "query_records": 19,
+      "query_iterations": 95,
+      "skipped": 2,
+      "total_ns": 15586334,
+      "avg_ns_per_query_iteration": 164066
+    },
+    {
+      "name": "duckdb",
+      "ok": true,
+      "error": null,
+      "statements": 29,
+      "query_records": 19,
+      "query_iterations": 95,
+      "skipped": 2,
+      "total_ns": 38818459,
+      "avg_ns_per_query_iteration": 408615
+    }
+  ],
+  "schema_version": 1,
+  "status": "measured",
+  "host": {
+    "cpu": "arm",
+    "cores": 10,
+    "ram_gb": 16,
+    "os": "macOS-26.5-arm64-arm-64bit-Mach-O",
+    "memory_bytes": 17179869184
+  },
+  "policy": "SQLLogicTest speed artifact records per-engine timings only; no winner or ranking claim is emitted by the arena."
 }

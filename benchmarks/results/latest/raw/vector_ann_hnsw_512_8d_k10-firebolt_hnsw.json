@@ -7,7 +7,7 @@
   "n_rows": 512,
   "vector_dims": 8,
   "top_k": 10,
-  "queries": 1,
+  "queries": 4,
   "warmup_queries": 0,
   "m": 16,
   "ef_search": 64,
@@ -23,7 +23,7 @@
   "p95_us": null,
   "status": "not_available",
   "reason": "docker_unavailable",
-  "generated_at_unix": 1779346252,
+  "generated_at_unix": 1779369468,
   "required_metrics": [
     "recall_at_k",
     "p50_latency_us",

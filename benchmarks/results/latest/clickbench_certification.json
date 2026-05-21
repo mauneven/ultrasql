@@ -1,12 +1,27 @@
 {
+  "schema_version": 1,
   "workload": "clickbench",
   "upstream_ref": "c5eb5d8e9c10fbef5ce16e8750f3e67de24cef0a",
-  "target": "UltraSQL geometric mean at least 5x faster than PostgreSQL",
+  "target": "UltraSQL and requested competitors publish honest ClickBench measured artifacts when local prerequisites exist",
+  "requested_engines": [
+    "ultrasql",
+    "duckdb",
+    "clickhouse",
+    "postgres",
+    "firebolt"
+  ],
   "passed": false,
   "reason": "dataset_missing",
   "detail": "Set CLICKBENCH_DOWNLOAD=1 or CLICKBENCH_TSV=/path/to/hits.tsv.",
   "dataset": "target/clickbench/hits.tsv",
   "postgres_dsn_set": false,
   "ultrasql_dsn_set": false,
-  "next_step": "Provide the dataset plus both POSTGRES_DSN and ULTRASQL_DSN, then rerun benchmarks/clickbench_certify.sh."
+  "artifacts": {
+    "postgres17": "benchmarks/results/latest/raw/clickbench-postgres17.json",
+    "ultrasql": "benchmarks/results/latest/raw/clickbench-ultrasql.json",
+    "duckdb": "benchmarks/results/latest/raw/clickbench-duckdb.json",
+    "clickhouse": "benchmarks/results/latest/raw/clickbench-clickhouse.json",
+    "firebolt": "benchmarks/results/latest/raw/clickbench-firebolt.json"
+  },
+  "next_step": "Provide the dataset plus any requested local engine prerequisites, then rerun benchmarks/clickbench_certify.sh."
 }
