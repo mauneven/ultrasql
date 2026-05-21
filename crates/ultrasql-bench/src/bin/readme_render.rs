@@ -285,6 +285,21 @@ static STATIC_DEFAULTS: &[StaticTable] = &[
             },
         ],
     },
+    StaticTable {
+        id: "firebolt_aggregate_index_10k",
+        heading: "Firebolt aggregating-index dashboard aggregate — 10 000 rows (local Core smoke)",
+        rows: &[],
+    },
+    StaticTable {
+        id: "late_materialization_10k",
+        heading: "Firebolt-style late materialization — 10 000 rows (local Core smoke)",
+        rows: &[],
+    },
+    StaticTable {
+        id: "vector_ann_hnsw_512_8d_k10",
+        heading: "HNSW vector search — 512 vectors, 8 dims, k=10 (local Core smoke)",
+        rows: &[],
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -360,6 +375,9 @@ fn display_engine_name(raw: &str) -> String {
         "duckdb" => "DuckDB".to_string(),
         "sqlite" | "sqlite3" => "SQLite".to_string(),
         "clickhouse" => "ClickHouse".to_string(),
+        "firebolt" => "Firebolt Core".to_string(),
+        "firebolt_hnsw" => "Firebolt Core (HNSW)".to_string(),
+        "ultrasql_hnsw" => "**UltraSQL** (HNSW)".to_string(),
         _ => raw.to_string(),
     }
 }
@@ -651,6 +669,93 @@ fn merge_latest_results(
     }
 }
 
+/// Reads selected raw JSON artifacts from `benchmarks/results/latest/raw/`
+/// and exposes Firebolt local-Core smoke comparisons to README tables.
+///
+/// Only measured same-shape artifacts are included. `not_available`,
+/// partial, missing, or malformed artifacts are skipped so README never
+/// fabricates Firebolt numbers.
+fn merge_latest_raw_results(
+    latest_results_path: &Path,
+    write_side: &mut HashMap<String, Vec<(String, f64)>>,
+) {
+    let Some(latest_dir) = latest_results_path.parent() else {
+        return;
+    };
+    let raw_dir = latest_dir.join("raw");
+    if !raw_dir.exists() {
+        return;
+    }
+
+    let firebolt_readme_ids = [
+        "firebolt_aggregate_index_10k",
+        "late_materialization_10k",
+        "vector_ann_hnsw_512_8d_k10",
+    ];
+    let mut rows_by_workload: HashMap<String, Vec<(String, f64)>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(&raw_dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(workload) = doc.get("workload").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !firebolt_readme_ids.contains(&workload) {
+            continue;
+        }
+        if doc
+            .get("status")
+            .and_then(|value| value.as_str())
+            .is_some_and(|status| status != "measured")
+        {
+            continue;
+        }
+        let Some(engine) = doc.get("engine").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(latency_us) = readme_latency_us(&doc) else {
+            continue;
+        };
+        rows_by_workload
+            .entry(workload.to_string())
+            .or_default()
+            .push((engine.to_string(), latency_us));
+    }
+
+    for workload in firebolt_readme_ids {
+        let Some(mut rows) = rows_by_workload.remove(workload) else {
+            continue;
+        };
+        if rows.len() < 2 {
+            continue;
+        }
+        rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        write_side.insert(workload.to_string(), rows);
+    }
+}
+
+fn readme_latency_us(doc: &serde_json::Value) -> Option<f64> {
+    for key in ["median_us", "p50_latency_us"] {
+        if let Some(value) = doc.get(key).and_then(|value| value.as_f64()) {
+            if value > 0.0 && value.is_finite() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Table resolution
 // ---------------------------------------------------------------------------
@@ -776,6 +881,7 @@ pub fn run(
     // contains non-zero UltraSQL latencies. The latest run takes
     // precedence over the stage-gate baselines.
     merge_latest_results(latest_results_path, &mut baseline, &mut write_side);
+    merge_latest_raw_results(latest_results_path, &mut write_side);
     let tables = build_tables(&baseline, &write_side);
 
     let original = std::fs::read_to_string(readme_path)
@@ -945,6 +1051,45 @@ rest\n";
             content.contains("stale content"),
             "check mode must not modify the file"
         );
+    }
+
+    #[test]
+    fn latest_raw_firebolt_artifacts_render_readme_tables() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let readme_path = dir.path().join("README.md");
+        let baselines_dir = dir.path().join("baselines");
+        let latest_dir = dir.path().join("latest");
+        let raw_dir = latest_dir.join("raw");
+        let latest_results = latest_dir.join("results.json");
+        std::fs::create_dir_all(&baselines_dir).expect("create baselines dir");
+        std::fs::create_dir_all(&raw_dir).expect("create raw dir");
+        std::fs::write(&latest_results, r#"{"workloads":{}}"#).expect("write latest results");
+        std::fs::write(
+            raw_dir.join("firebolt_aggregate_index_10k-ultrasql.json"),
+            r#"{"engine":"ultrasql","workload":"firebolt_aggregate_index_10k","status":"measured","median_us":185.416}"#,
+        )
+        .expect("write ultrasql raw");
+        std::fs::write(
+            raw_dir.join("firebolt_aggregate_index_10k-firebolt.json"),
+            r#"{"engine":"firebolt","workload":"firebolt_aggregate_index_10k","status":"measured","median_us":5197.583}"#,
+        )
+        .expect("write firebolt raw");
+        std::fs::write(
+            &readme_path,
+            "# Test\n\
+             <!-- BEGIN AUTO: BENCH:firebolt_aggregate_index_10k -->\n\
+             stale content\n\
+             <!-- END AUTO: BENCH:firebolt_aggregate_index_10k -->\n",
+        )
+        .expect("write readme");
+
+        run(&readme_path, &baselines_dir, &latest_results, false).expect("render readme");
+        let rendered = std::fs::read_to_string(&readme_path).expect("read rendered readme");
+
+        assert!(rendered.contains("Firebolt aggregating-index dashboard aggregate"));
+        assert!(rendered.contains("| **UltraSQL** | 185.42 µs | — |"));
+        assert!(rendered.contains("| Firebolt Core | 5.20 ms | 2,703% slower |"));
+        assert!(!rendered.contains("stale content"));
     }
 
     // -----------------------------------------------------------------------

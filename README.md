@@ -241,6 +241,38 @@ Write-side benchmarks land when the storage engine is wired (v0.3+):
 | PostgreSQL | 55.49 ms | 1,186% slower |
 <!-- END AUTO: BENCH:window_row_number_65k_i64 -->
 
+Firebolt Core local smoke comparisons are separate from the generic
+cross-engine matrix because they target Firebolt-specific shapes and use the
+local Firebolt Core Docker image. They are still auto-rendered from committed
+raw artifacts under `benchmarks/results/latest/raw/`.
+
+<!-- BEGIN AUTO: BENCH:firebolt_aggregate_index_10k -->
+### Firebolt aggregating-index dashboard aggregate — 10 000 rows (local Core smoke)
+
+| Engine | Median | vs fastest |
+| --- | ---: | ---: |
+| **UltraSQL** | 185.42 µs | — |
+| Firebolt Core | 5.20 ms | 2,703% slower |
+<!-- END AUTO: BENCH:firebolt_aggregate_index_10k -->
+
+<!-- BEGIN AUTO: BENCH:late_materialization_10k -->
+### Firebolt-style late materialization — 10 000 rows (local Core smoke)
+
+| Engine | Median | vs fastest |
+| --- | ---: | ---: |
+| **UltraSQL** | 550.88 µs | — |
+| Firebolt Core | 194.34 ms | 35,178% slower |
+<!-- END AUTO: BENCH:late_materialization_10k -->
+
+<!-- BEGIN AUTO: BENCH:vector_ann_hnsw_512_8d_k10 -->
+### HNSW vector search — 512 vectors, 8 dims, k=10 (local Core smoke)
+
+| Engine | Median | vs fastest |
+| --- | ---: | ---: |
+| **UltraSQL** (HNSW) | 138.29 µs | — |
+| Firebolt Core (HNSW) | 13.79 ms | 9,869% slower |
+<!-- END AUTO: BENCH:vector_ann_hnsw_512_8d_k10 -->
+
 Per-kernel microbenchmarks (in-process, no SQL surface) are kept under
 `crates/*/benches/` for internal regression tracking via `cargo bench`;
 they are not published as cross-engine comparisons because they bypass
