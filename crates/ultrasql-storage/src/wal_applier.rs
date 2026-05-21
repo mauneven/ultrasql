@@ -29,7 +29,7 @@
 use std::sync::atomic::Ordering;
 
 use ultrasql_core::endian::{read_i64_le, read_u16_le, read_u32_le};
-use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
+use ultrasql_core::{BlockNumber, Lsn, PageId, RelationId, TupleId, Xid};
 use ultrasql_mvcc::TupleHeader;
 use ultrasql_mvcc::tuple_header::{InfoMask, TUPLE_HEADER_SIZE};
 use ultrasql_wal::applier::{ApplyError, HeapTarget};
@@ -43,6 +43,19 @@ use crate::buffer_pool::PageLoader;
 use crate::heap::{HeapAccess, UndoEntry, UndoRelationLog};
 use crate::page::PageError;
 
+fn should_skip_redo(page: &crate::page::Page, record_lsn: Lsn) -> bool {
+    let raw = record_lsn.raw();
+    let page_lsn = page.header().lsn;
+    page_lsn > raw || (raw != 0 && page_lsn == raw)
+}
+
+fn stamp_replayed_lsn(page: &mut crate::page::Page, record_lsn: Lsn) {
+    let raw = record_lsn.raw();
+    if raw != 0 && page.header().lsn < raw {
+        page.set_lsn(raw);
+    }
+}
+
 impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// Apply a heap-insert record by writing the tuple bytes into the correct
     /// slot on the target page.
@@ -54,6 +67,15 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// is skipped.
     #[allow(clippy::significant_drop_tightening)]
     fn apply_insert(&self, payload: &HeapInsertPayload) -> Result<(), ApplyError> {
+        self.apply_insert_at_lsn(payload, Lsn::ZERO)
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn apply_insert_at_lsn(
+        &self,
+        payload: &HeapInsertPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
         let page_id = payload.tid.page;
         let rel = page_id.relation;
 
@@ -70,6 +92,9 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             })?;
 
         let mut page = guard.write();
+        if should_skip_redo(&page, record_lsn) {
+            return Ok(());
+        }
 
         // Idempotency check: if the page already has a slot at `tid.slot`
         // with data, skip the insert (the page was flushed past this record).
@@ -78,6 +103,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             if let Ok(existing) = page.read_tuple(payload.tid.slot) {
                 if !existing.is_empty() {
                     // Slot already exists and has content; skip.
+                    stamp_replayed_lsn(&mut page, record_lsn);
                     return Ok(());
                 }
             }
@@ -89,6 +115,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 operation: "heap_insert",
                 detail: format!("insert_tuple: {e}"),
             })?;
+        stamp_replayed_lsn(&mut page, record_lsn);
         Ok(())
     }
 
@@ -100,6 +127,15 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// page is written first and then the old page is stamped.
     #[allow(clippy::significant_drop_tightening)]
     fn apply_update(&self, payload: &HeapUpdatePayload) -> Result<(), ApplyError> {
+        self.apply_update_at_lsn(payload, Lsn::ZERO)
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn apply_update_at_lsn(
+        &self,
+        payload: &HeapUpdatePayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
         let new_page_id = payload.new_tid.page;
         let old_page_id = payload.old_tid.page;
 
@@ -119,17 +155,21 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                     detail: format!("buffer pool: {e}"),
                 })?;
             let mut page = guard.write();
-            let slot_count = page.header().slot_count();
-            if payload.new_tid.slot >= slot_count
-                || page
-                    .read_tuple(payload.new_tid.slot)
-                    .map_or(true, <[u8]>::is_empty)
-            {
-                page.insert_tuple(&payload.new_tuple_bytes)
-                    .map_err(|e| ApplyError::Refused {
-                        operation: "heap_update_new",
-                        detail: format!("insert_tuple: {e}"),
+            if !should_skip_redo(&page, record_lsn) {
+                let slot_count = page.header().slot_count();
+                if payload.new_tid.slot >= slot_count
+                    || page
+                        .read_tuple(payload.new_tid.slot)
+                        .map_or(true, <[u8]>::is_empty)
+                {
+                    page.insert_tuple(&payload.new_tuple_bytes).map_err(|e| {
+                        ApplyError::Refused {
+                            operation: "heap_update_new",
+                            detail: format!("insert_tuple: {e}"),
+                        }
                     })?;
+                }
+                stamp_replayed_lsn(&mut page, record_lsn);
             }
         }
 
@@ -143,6 +183,9 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                     detail: format!("buffer pool: {e}"),
                 })?;
             let mut page = guard.write();
+            if should_skip_redo(&page, record_lsn) {
+                return Ok(());
+            }
             // Read the existing header bytes.
             let existing =
                 page.read_tuple(payload.old_tid.slot)
@@ -194,6 +237,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             let item = crate::page::ItemId::from_raw(raw);
             let slot_off = item.offset() as usize;
             page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+            stamp_replayed_lsn(&mut page, record_lsn);
         }
 
         Ok(())
@@ -203,6 +247,15 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// header at `payload.tid`.
     #[allow(clippy::significant_drop_tightening)]
     fn apply_delete(&self, payload: &HeapDeletePayload) -> Result<(), ApplyError> {
+        self.apply_delete_at_lsn(payload, Lsn::ZERO)
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn apply_delete_at_lsn(
+        &self,
+        payload: &HeapDeletePayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
         let page_id = payload.tid.page;
         self.advance_counter(page_id.relation, page_id.block);
 
@@ -215,6 +268,9 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             })?;
 
         let mut page = guard.write();
+        if should_skip_redo(&page, record_lsn) {
+            return Ok(());
+        }
         let existing = page.read_tuple(payload.tid.slot).map_err(|e| match e {
             // If the slot doesn't exist, the record is already beyond
             // what's on this page — treat as idempotent no-op.
@@ -243,6 +299,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
 
         // Idempotency: if xmax is already set to the same xid, skip.
         if hdr.xmax == payload.xmax {
+            stamp_replayed_lsn(&mut page, record_lsn);
             return Ok(());
         }
         hdr.mark_deleted(payload.xmax, payload.cmax);
@@ -263,6 +320,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let item = crate::page::ItemId::from_raw(raw);
         let slot_off = item.offset() as usize;
         page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+        stamp_replayed_lsn(&mut page, record_lsn);
 
         Ok(())
     }
@@ -277,6 +335,15 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// already equals `writer_xid` is a no-op.
     #[allow(clippy::significant_drop_tightening)]
     fn apply_update_in_place(&self, payload: &HeapUpdateInPlacePayload) -> Result<(), ApplyError> {
+        self.apply_update_in_place_at_lsn(payload, Lsn::ZERO)
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn apply_update_in_place_at_lsn(
+        &self,
+        payload: &HeapUpdateInPlacePayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
         let page_id = payload.tid.page;
         let rel = page_id.relation;
         self.advance_counter(rel, page_id.block);
@@ -289,6 +356,9 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 detail: format!("buffer pool: {e}"),
             })?;
         let mut page = guard.write();
+        if should_skip_redo(&page, record_lsn) {
+            return Ok(());
+        }
         let existing = page
             .read_tuple(payload.tid.slot)
             .map_err(|e| ApplyError::Refused {
@@ -320,6 +390,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             && hdr.xmax == payload.writer_xid
             && hdr.infomask.contains(InfoMask::UPDATED_IN_PLACE)
         {
+            stamp_replayed_lsn(&mut page, record_lsn);
             return Ok(());
         }
 
@@ -354,6 +425,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let payload_off = slot_off + TUPLE_HEADER_SIZE;
         page_bytes[payload_off..payload_off + payload.post_image_bytes.len()]
             .copy_from_slice(&payload.post_image_bytes);
+        stamp_replayed_lsn(&mut page, record_lsn);
         drop(page);
         drop(guard);
 
@@ -400,6 +472,15 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// already-stamped slot with the same `xmax` is a no-op.
     #[allow(clippy::significant_drop_tightening)]
     fn apply_delete_in_place(&self, payload: &HeapDeleteInPlacePayload) -> Result<(), ApplyError> {
+        self.apply_delete_in_place_at_lsn(payload, Lsn::ZERO)
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn apply_delete_in_place_at_lsn(
+        &self,
+        payload: &HeapDeleteInPlacePayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
         let page_id = payload.tid.page;
         self.advance_counter(page_id.relation, page_id.block);
 
@@ -411,6 +492,9 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
                 detail: format!("buffer pool: {e}"),
             })?;
         let mut page = guard.write();
+        if should_skip_redo(&page, record_lsn) {
+            return Ok(());
+        }
         let existing = page
             .read_tuple(payload.tid.slot)
             .map_err(|e| ApplyError::Refused {
@@ -432,6 +516,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             })?;
 
         if hdr.xmax == payload.xmax {
+            stamp_replayed_lsn(&mut page, record_lsn);
             return Ok(());
         }
         hdr.mark_deleted(payload.xmax, payload.cmax);
@@ -452,6 +537,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         let item = crate::page::ItemId::from_raw(raw);
         let slot_off = item.offset() as usize;
         page_bytes[slot_off..slot_off + TUPLE_HEADER_SIZE].copy_from_slice(&hdr_bytes);
+        stamp_replayed_lsn(&mut page, record_lsn);
         drop(page);
         drop(guard);
 
@@ -468,6 +554,15 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
     /// can be re-applied correctly.
     #[allow(clippy::significant_drop_tightening)]
     fn apply_full_page_write(&self, payload: &FullPageWritePayload) -> Result<(), ApplyError> {
+        self.apply_full_page_write_at_lsn(payload, Lsn::ZERO)
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn apply_full_page_write_at_lsn(
+        &self,
+        payload: &FullPageWritePayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
         use ultrasql_core::constants::PAGE_SIZE;
 
         let page_id = payload.page;
@@ -482,6 +577,9 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
             })?;
 
         let mut page = guard.write();
+        if should_skip_redo(&page, record_lsn) {
+            return Ok(());
+        }
         if payload.page_bytes.len() != PAGE_SIZE {
             return Err(ApplyError::Refused {
                 operation: "fpw",
@@ -494,6 +592,7 @@ impl<L: PageLoader + 'static> HeapTarget for HeapAccess<L> {
         }
         page.as_bytes_mut()
             .copy_from_slice(&payload.page_bytes[..PAGE_SIZE]);
+        stamp_replayed_lsn(&mut page, record_lsn);
         Ok(())
     }
 
@@ -631,12 +730,12 @@ mod tests {
 
     use parking_lot::Mutex;
     use ultrasql_core::constants::PAGE_SIZE;
-    use ultrasql_core::{BlockNumber, CommandId, PageId, RelationId, Result, TupleId, Xid};
+    use ultrasql_core::{BlockNumber, CommandId, Lsn, PageId, RelationId, Result, TupleId, Xid};
     use ultrasql_mvcc::TupleHeader;
     use ultrasql_mvcc::tuple_header::TUPLE_HEADER_SIZE;
     use ultrasql_wal::applier::HeapTarget;
     use ultrasql_wal::payload::{
-        BTreeOpKind, BTreeOpPayload, HeapDeletePayload, HeapInsertPayload,
+        BTreeOpKind, BTreeOpPayload, FullPageWritePayload, HeapDeletePayload, HeapInsertPayload,
     };
 
     use crate::btree::BTree;
@@ -777,10 +876,81 @@ mod tests {
     }
 
     #[test]
-    fn apply_fpw_restores_page_image() {
-        use ultrasql_core::constants::PAGE_SIZE;
-        use ultrasql_wal::payload::FullPageWritePayload;
+    fn apply_delete_at_lsn_skips_when_page_lsn_is_newer() {
+        let heap = make_heap();
+        let tid = tuple_id(0, 0);
+        heap.insert(
+            rel(),
+            b"hello",
+            InsertOptions {
+                xmin: Xid::new(1),
+                command_id: CommandId::FIRST,
+                wal: None,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .unwrap();
+        {
+            let guard = heap.pool.get_page(page_id(0)).unwrap();
+            guard.write().set_lsn(200);
+        }
 
+        let payload = HeapDeletePayload {
+            tid,
+            xmax: Xid::new(2),
+            cmax: CommandId::new(1),
+        };
+        heap.apply_delete_at_lsn(&payload, Lsn::new(100)).unwrap();
+
+        let fetched = heap.fetch(tid).unwrap();
+        assert_eq!(
+            fetched.header.xmax,
+            Xid::INVALID,
+            "old delete redo must not overwrite newer page image"
+        );
+        let guard = heap.pool.get_page(page_id(0)).unwrap();
+        assert_eq!(guard.read().header().lsn, 200);
+    }
+
+    #[test]
+    fn apply_delete_at_lsn_skips_when_page_lsn_covers_record() {
+        let heap = make_heap();
+        let tid = tuple_id(0, 0);
+        heap.insert(
+            rel(),
+            b"hello",
+            InsertOptions {
+                xmin: Xid::new(1),
+                command_id: CommandId::FIRST,
+                wal: None,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .unwrap();
+        {
+            let guard = heap.pool.get_page(page_id(0)).unwrap();
+            guard.write().set_lsn(100);
+        }
+
+        let payload = HeapDeletePayload {
+            tid,
+            xmax: Xid::new(2),
+            cmax: CommandId::new(1),
+        };
+        heap.apply_delete_at_lsn(&payload, Lsn::new(100)).unwrap();
+
+        let fetched = heap.fetch(tid).unwrap();
+        assert_eq!(
+            fetched.header.xmax,
+            Xid::INVALID,
+            "equal page LSN means redo is already reflected"
+        );
+    }
+
+    #[test]
+    fn apply_fpw_restores_page_image() {
         let heap = make_heap();
         // Insert something to create page 0 for this relation.
         heap.insert(
@@ -812,6 +982,45 @@ mod tests {
         let guard = heap.pool.get_page(pid).unwrap();
         let actual = guard.read().as_bytes().to_vec();
         assert_eq!(actual, page_bytes, "FPW should restore page verbatim");
+    }
+
+    #[test]
+    fn apply_fpw_at_lsn_skips_when_page_lsn_is_newer() {
+        let heap = make_heap();
+        heap.insert(
+            rel(),
+            b"data",
+            InsertOptions {
+                xmin: Xid::new(1),
+                command_id: CommandId::FIRST,
+                wal: None,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .unwrap();
+        let pid = page_id(0);
+        let original = {
+            let guard = heap.pool.get_page(pid).unwrap();
+            let mut page = guard.write();
+            page.set_lsn(200);
+            page.as_bytes().to_vec()
+        };
+        let zeroed = crate::page::Page::new_heap();
+        let payload = FullPageWritePayload {
+            page: pid,
+            page_bytes: zeroed.as_bytes().to_vec(),
+        };
+
+        heap.apply_full_page_write_at_lsn(&payload, Lsn::new(100))
+            .unwrap();
+
+        let guard = heap.pool.get_page(pid).unwrap();
+        assert_eq!(
+            guard.read().as_bytes(),
+            original.as_slice(),
+            "old FPW redo must not replace newer page image"
+        );
     }
 
     #[test]

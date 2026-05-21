@@ -20,6 +20,7 @@ use crate::payload::{
 };
 use crate::record::{RecordType, WalRecord};
 use crate::recovery::RecoveryError;
+use ultrasql_core::Lsn;
 
 /// Errors that can arise when dispatching a WAL record to a [`HeapTarget`].
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +75,16 @@ pub trait HeapTarget: Send + Sync {
         })
     }
 
+    /// Apply a heap-insert record at its WAL stream LSN.
+    fn apply_insert_at_lsn(
+        &self,
+        payload: &HeapInsertPayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let _ = record_lsn;
+        self.apply_insert(payload)
+    }
+
     /// Apply a heap-update record by superseding the old slot with the new tuple.
     fn apply_update(&self, payload: &HeapUpdatePayload) -> Result<(), ApplyError> {
         let _ = payload;
@@ -83,6 +94,16 @@ pub trait HeapTarget: Send + Sync {
         })
     }
 
+    /// Apply a heap-update record at its WAL stream LSN.
+    fn apply_update_at_lsn(
+        &self,
+        payload: &HeapUpdatePayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let _ = record_lsn;
+        self.apply_update(payload)
+    }
+
     /// Apply a heap-delete record by stamping `xmax`/`cmax` into the tuple header.
     fn apply_delete(&self, payload: &HeapDeletePayload) -> Result<(), ApplyError> {
         let _ = payload;
@@ -90,6 +111,16 @@ pub trait HeapTarget: Send + Sync {
             operation: "heap_delete",
             detail: String::from("not implemented"),
         })
+    }
+
+    /// Apply a heap-delete record at its WAL stream LSN.
+    fn apply_delete_at_lsn(
+        &self,
+        payload: &HeapDeletePayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let _ = record_lsn;
+        self.apply_delete(payload)
     }
 
     /// Apply an in-place update record: rewrite the slot's payload
@@ -107,6 +138,16 @@ pub trait HeapTarget: Send + Sync {
         })
     }
 
+    /// Apply an in-place update record at its WAL stream LSN.
+    fn apply_update_in_place_at_lsn(
+        &self,
+        payload: &HeapUpdateInPlacePayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let _ = record_lsn;
+        self.apply_update_in_place(payload)
+    }
+
     /// Apply an in-place delete record: stamp `xmax`/`cmax` on the
     /// tuple header. Same semantic shape as `apply_delete`; kept as
     /// a distinct method so a future implementor can branch on
@@ -120,6 +161,16 @@ pub trait HeapTarget: Send + Sync {
         })
     }
 
+    /// Apply an in-place delete record at its WAL stream LSN.
+    fn apply_delete_in_place_at_lsn(
+        &self,
+        payload: &HeapDeleteInPlacePayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let _ = record_lsn;
+        self.apply_delete_in_place(payload)
+    }
+
     /// Apply a full-page-write record by restoring the page image verbatim.
     fn apply_full_page_write(&self, payload: &FullPageWritePayload) -> Result<(), ApplyError> {
         let _ = payload;
@@ -127,6 +178,16 @@ pub trait HeapTarget: Send + Sync {
             operation: "fpw",
             detail: String::from("not implemented"),
         })
+    }
+
+    /// Apply a full-page-write record at its WAL stream LSN.
+    fn apply_full_page_write_at_lsn(
+        &self,
+        payload: &FullPageWritePayload,
+        record_lsn: Lsn,
+    ) -> Result<(), ApplyError> {
+        let _ = record_lsn;
+        self.apply_full_page_write(payload)
     }
 
     /// Apply a B-tree mutation record.
@@ -233,19 +294,36 @@ pub trait HeapTarget: Send + Sync {
 /// decode for the declared record type, or [`ApplyError::Refused`] if the
 /// target implementation declines the operation.
 pub fn dispatch_record(target: &dyn HeapTarget, record: &WalRecord) -> Result<(), ApplyError> {
+    dispatch_record_at_lsn(target, record, Lsn::ZERO)
+}
+
+/// Dispatch one [`WalRecord`] into `target` with the record's WAL stream LSN.
+///
+/// Recovery callers use this variant so page-oriented storage engines can
+/// compare `record_lsn` with the page header's LSN and skip redo already
+/// reflected in a flushed page image.
+pub fn dispatch_record_at_lsn(
+    target: &dyn HeapTarget,
+    record: &WalRecord,
+    record_lsn: Lsn,
+) -> Result<(), ApplyError> {
     let bytes = &record.payload;
     match record.header.record_type {
-        RecordType::HeapInsert => target.apply_insert(&HeapInsertPayload::decode(bytes)?),
-        RecordType::HeapUpdate => target.apply_update(&HeapUpdatePayload::decode(bytes)?),
-        RecordType::HeapDelete => target.apply_delete(&HeapDeletePayload::decode(bytes)?),
-        RecordType::HeapUpdateInPlace => {
-            target.apply_update_in_place(&HeapUpdateInPlacePayload::decode(bytes)?)
+        RecordType::HeapInsert => {
+            target.apply_insert_at_lsn(&HeapInsertPayload::decode(bytes)?, record_lsn)
         }
-        RecordType::HeapDeleteInPlace => {
-            target.apply_delete_in_place(&HeapDeleteInPlacePayload::decode(bytes)?)
+        RecordType::HeapUpdate => {
+            target.apply_update_at_lsn(&HeapUpdatePayload::decode(bytes)?, record_lsn)
         }
+        RecordType::HeapDelete => {
+            target.apply_delete_at_lsn(&HeapDeletePayload::decode(bytes)?, record_lsn)
+        }
+        RecordType::HeapUpdateInPlace => target
+            .apply_update_in_place_at_lsn(&HeapUpdateInPlacePayload::decode(bytes)?, record_lsn),
+        RecordType::HeapDeleteInPlace => target
+            .apply_delete_in_place_at_lsn(&HeapDeleteInPlacePayload::decode(bytes)?, record_lsn),
         RecordType::FullPageWrite => {
-            target.apply_full_page_write(&FullPageWritePayload::decode(bytes)?)
+            target.apply_full_page_write_at_lsn(&FullPageWritePayload::decode(bytes)?, record_lsn)
         }
         RecordType::Commit => target.observe_commit(&CommitPayload::decode(bytes)?),
         RecordType::Abort => target.observe_abort(&AbortPayload::decode(bytes)?),
@@ -289,8 +367,16 @@ pub fn replay_into(
     wal_dir: impl AsRef<std::path::Path>,
     target: &dyn HeapTarget,
 ) -> Result<ultrasql_core::Lsn, RecoveryError> {
+    let mut record_lsn = ultrasql_core::Lsn::ZERO;
     crate::recovery::recover(wal_dir, |record| {
-        dispatch_record(target, record).map_err(|e| RecoveryError::Applier(e.to_string()))
+        let current_lsn = record_lsn;
+        record_lsn = ultrasql_core::Lsn::new(
+            record_lsn
+                .raw()
+                .saturating_add(u64::from(record.header.total_length)),
+        );
+        dispatch_record_at_lsn(target, record, current_lsn)
+            .map_err(|e| RecoveryError::Applier(e.to_string()))
     })
 }
 
@@ -323,6 +409,7 @@ mod tests {
     #[derive(Default)]
     struct MockHeap {
         inserts: Mutex<Vec<HeapInsertPayload>>,
+        insert_lsns: Mutex<Vec<Lsn>>,
         updates: Mutex<Vec<HeapUpdatePayload>>,
         deletes: Mutex<Vec<HeapDeletePayload>>,
         btree_ops: Mutex<Vec<BTreeOpPayload>>,
@@ -337,6 +424,16 @@ mod tests {
     impl HeapTarget for MockHeap {
         fn apply_insert(&self, p: &HeapInsertPayload) -> Result<(), ApplyError> {
             self.inserts.lock().push(p.clone());
+            Ok(())
+        }
+
+        fn apply_insert_at_lsn(
+            &self,
+            p: &HeapInsertPayload,
+            record_lsn: Lsn,
+        ) -> Result<(), ApplyError> {
+            self.inserts.lock().push(p.clone());
+            self.insert_lsns.lock().push(record_lsn);
             Ok(())
         }
 
@@ -550,6 +647,21 @@ mod tests {
         assert_eq!(mock.checkpoints.lock().len(), 1);
     }
 
+    #[test]
+    fn dispatch_record_at_lsn_passes_record_lsn_to_target() {
+        let mock = MockHeap::default();
+        let payload = HeapInsertPayload {
+            tid: tid(1, 0, 0),
+            tuple_bytes: b"row".to_vec(),
+        };
+        let rec = make_record(RecordType::HeapInsert, payload.encode().unwrap());
+
+        dispatch_record_at_lsn(&mock, &rec, Lsn::new(4096)).unwrap();
+
+        assert_eq!(mock.inserts.lock().len(), 1);
+        assert_eq!(mock.insert_lsns.lock().as_slice(), &[Lsn::new(4096)]);
+    }
+
     // ── Test 2: decode failure surfaces as ApplyError::Payload ────────────────
 
     /// Corrupted payload bytes produce `ApplyError::Payload`.
@@ -657,6 +769,11 @@ mod tests {
             "expected non-zero final LSN; got {final_lsn:?}"
         );
         assert_eq!(mock.inserts.lock().len(), 3, "expected 3 inserts");
+        let insert_lsns = mock.insert_lsns.lock().clone();
+        assert_eq!(insert_lsns.len(), 3, "expected 3 insert LSNs");
+        assert_eq!(insert_lsns[0], Lsn::ZERO);
+        assert!(insert_lsns[1] > insert_lsns[0]);
+        assert!(insert_lsns[2] > insert_lsns[1]);
         assert_eq!(mock.commits.lock().len(), 1, "expected 1 commit");
         assert_eq!(mock.deletes.lock().len(), 1, "expected 1 delete");
     }
