@@ -107,6 +107,8 @@ are grounds for revert.
 | v1.0 | TPC-C (all 5 tx types, 32 connections) | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
 | v1.0 | Sysbench OLTP read/write | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
 | v1.0 | Firebolt aggregating-index dashboard aggregate | ≥ 2× Firebolt ⚠️ runner added; Firebolt endpoint artifact pending | median query latency |
+| v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ runner added; Firebolt endpoint artifact pending | median query latency |
+| v1.0 | Firebolt HNSW vector search | recall/latency artifact vs UltraSQL HNSW ⚠️ runner added; Firebolt endpoint artifact pending | recall@k + p50/p95/p99 |
 | v2.x | Star Schema Benchmark scale 100 | ≥ 2× ClickHouse | geometric mean query time |
 
 All comparisons follow the methodology in `BENCHMARKS.md`: same host,

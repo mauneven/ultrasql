@@ -269,6 +269,47 @@ the same generated data shape. `FIREBOLT_AGG_ROWS`,
 artifacts land under `benchmarks/results/latest/raw/`, and the suite
 manifest is `benchmarks/results/latest/firebolt_aggregate_index_manifest.json`.
 
+### Firebolt Sparse Pruning
+
+Sparse primary-index pruning artifacts are recorded by:
+
+```text
+FIREBOLT_URL="http://127.0.0.1:3473" \
+benchmarks/firebolt_sparse_pruning.sh smoke
+```
+
+The runner targets Firebolt's sparse primary-index path. It creates
+correlated `(event_day, tenant_id, bucket, amount)` rows and measures a
+range-and-tenant filtered aggregate. The Firebolt leg creates a FACT
+table with `PRIMARY INDEX event_day, tenant_id, bucket` and
+`index_granularity`, runs `EXPLAIN`, and only marks Firebolt measured
+when the raw plan text contains primary-index pruning evidence. Missing
+`FIREBOLT_URL` or missing plan evidence is recorded as
+`status: "not_available"`.
+
+UltraSQL is measured through
+`target/release/cross_compare_sql --workload sparse-pruning` using the
+same generated query shape. Raw artifacts land under
+`benchmarks/results/latest/raw/`, and the suite manifest is
+`benchmarks/results/latest/firebolt_sparse_pruning_manifest.json`.
+
+### Firebolt Vector Search
+
+Firebolt HNSW vector-search artifacts are recorded by:
+
+```text
+FIREBOLT_URL="http://127.0.0.1:3473" \
+benchmarks/firebolt_vector_search.sh smoke
+```
+
+The UltraSQL leg reuses `benchmarks/vector_ann_hnsw.sh`. The Firebolt leg
+creates `ARRAY(DOUBLE NOT NULL)` embeddings, builds
+`CREATE INDEX ... USING HNSW (embedding vector_l2sq_ops)`, then queries
+`VECTOR_SEARCH(...)` with the same deterministic vectors and probes. If
+Firebolt Core is absent, unreachable, or lacks vector-search support, the
+Firebolt artifact is `not_available` rather than a failed or fabricated
+result.
+
 ### Exact Vector Top-K
 
 Exact vector nearest-neighbor top-k is recorded by:

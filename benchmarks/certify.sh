@@ -4,7 +4,7 @@
 # Usage:
 #   benchmarks/certify.sh smoke
 #   benchmarks/certify.sh full
-#   benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet,firebolt-aggregate
+#   benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
 #
 # Smoke is PR-safe: tiny datasets, crash/correctness checks, no external
 # benchmark assets. Full is nightly/manual: it attempts the full certification
@@ -29,7 +29,7 @@ case "$profile" in
         suites=(regression-gate vector-ann sysbench)
         ;;
     full)
-        suites=(tpch clickbench tpcb tpcc sysbench vector-topk vector-ann ai-gauntlet csv-gauntlet firebolt-aggregate)
+        suites=(tpch clickbench tpcb tpcc sysbench vector-topk vector-ann ai-gauntlet csv-gauntlet firebolt-aggregate firebolt-sparse-pruning firebolt-vector)
         ;;
     *)
         echo "certify.sh: profile must be smoke or full, got '$profile'" >&2
@@ -137,6 +137,22 @@ run_firebolt_aggregate_full() {
     FIREBOLT_AGG_PROFILE=full benchmarks/firebolt_aggregate_index.sh full
 }
 
+run_firebolt_sparse_pruning_smoke() {
+    FIREBOLT_SPARSE_PROFILE=smoke benchmarks/firebolt_sparse_pruning.sh smoke
+}
+
+run_firebolt_sparse_pruning_full() {
+    FIREBOLT_SPARSE_PROFILE=full benchmarks/firebolt_sparse_pruning.sh full
+}
+
+run_firebolt_vector_smoke() {
+    FIREBOLT_VECTOR_PROFILE=smoke benchmarks/firebolt_vector_search.sh smoke
+}
+
+run_firebolt_vector_full() {
+    FIREBOLT_VECTOR_PROFILE=full benchmarks/firebolt_vector_search.sh full
+}
+
 for suite in "${suites[@]}"; do
     case "$suite" in
         regression-gate)
@@ -171,6 +187,20 @@ for suite in "${suites[@]}"; do
                 run_suite "$suite" run_firebolt_aggregate_smoke
             else
                 run_suite "$suite" run_firebolt_aggregate_full
+            fi
+            ;;
+        firebolt-sparse-pruning)
+            if [[ "$profile" == "smoke" ]]; then
+                run_suite "$suite" run_firebolt_sparse_pruning_smoke
+            else
+                run_suite "$suite" run_firebolt_sparse_pruning_full
+            fi
+            ;;
+        firebolt-vector)
+            if [[ "$profile" == "smoke" ]]; then
+                run_suite "$suite" run_firebolt_vector_smoke
+            else
+                run_suite "$suite" run_firebolt_vector_full
             fi
             ;;
         sysbench)

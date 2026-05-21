@@ -15,7 +15,7 @@ cd "$REPO_ROOT"
 
 PROFILE="${BENCH_ARENA_PROFILE:-smoke}"
 ENGINES="${BENCH_ARENA_ENGINES:-ultrasql,duckdb,clickhouse,postgres,firebolt}"
-SUITES="${BENCH_ARENA_SUITES:-csv,parquet,tpch,clickbench,sqllogictest,vector,jsonb,aggregate-index}"
+SUITES="${BENCH_ARENA_SUITES:-csv,parquet,tpch,clickbench,sqllogictest,vector,jsonb,aggregate-index,sparse-pruning,firebolt-vector}"
 OUT_DIR="${BENCH_ARENA_OUT_DIR:-benchmarks/results/latest}"
 RAW_DIR="$OUT_DIR/raw"
 MANIFEST="$OUT_DIR/benchmark_arena_manifest.json"
@@ -29,7 +29,7 @@ Usage:
 Options:
   --profile smoke|full       Dataset/runtime profile. Default: smoke.
   --engines a,b,c            Engines: ultrasql,duckdb,clickhouse,postgres,firebolt.
-  --suites a,b,c             Suites: csv,parquet,tpch,clickbench,sqllogictest,vector,jsonb,aggregate-index.
+  --suites a,b,c             Suites: csv,parquet,tpch,clickbench,sqllogictest,vector,jsonb,aggregate-index,sparse-pruning,firebolt-vector.
   --out-dir PATH             Artifact directory. Default: benchmarks/results/latest.
   --help                     Show this help.
 
@@ -116,7 +116,7 @@ done
 
 for suite in "${REQUESTED_SUITES[@]}"; do
     case "$suite" in
-        csv|parquet|tpch|clickbench|sqllogictest|vector|jsonb|aggregate-index)
+        csv|parquet|tpch|clickbench|sqllogictest|vector|jsonb|aggregate-index|sparse-pruning|firebolt-vector)
             ;;
         *)
             echo "arena.sh: unknown suite '$suite'" >&2
@@ -425,6 +425,48 @@ run_aggregate_index_suite() {
         "median_us,min_us,load_time_us,index_build_us,aggregating_index_used"
 }
 
+run_sparse_pruning_suite() {
+    local supported selected
+    supported="ultrasql,firebolt"
+    selected="$(requested_supported_csv "$supported")"
+    if [[ -n "$selected" ]]; then
+        run_suite \
+            "sparse-pruning" \
+            "$OUT_DIR/firebolt_sparse_pruning_manifest.json" \
+            env \
+                FIREBOLT_SPARSE_PROFILE="$PROFILE" \
+                FIREBOLT_SPARSE_ENGINES="$selected" \
+                FIREBOLT_SPARSE_OUT_DIR="$OUT_DIR" \
+                RAW_DIR="$RAW_DIR" \
+                benchmarks/firebolt_sparse_pruning.sh "$PROFILE"
+    fi
+    emit_unsupported_engines \
+        "sparse-pruning" \
+        "$supported" \
+        "median_us,min_us,load_time_us,primary_index_pruning_evidence"
+}
+
+run_firebolt_vector_suite() {
+    local supported selected
+    supported="ultrasql,firebolt"
+    selected="$(requested_supported_csv "$supported")"
+    if [[ -n "$selected" ]]; then
+        run_suite \
+            "firebolt-vector" \
+            "$OUT_DIR/firebolt_vector_search_manifest.json" \
+            env \
+                FIREBOLT_VECTOR_PROFILE="$PROFILE" \
+                FIREBOLT_VECTOR_ENGINES="$selected" \
+                FIREBOLT_VECTOR_OUT_DIR="$OUT_DIR" \
+                RAW_DIR="$RAW_DIR" \
+                benchmarks/firebolt_vector_search.sh "$PROFILE"
+    fi
+    emit_unsupported_engines \
+        "firebolt-vector" \
+        "$supported" \
+        "recall_at_k,p50_latency_us,p95_latency_us,p99_latency_us,build_time_us,memory_bytes,index_size_bytes"
+}
+
 suite_requested() {
     local needle="$1"
     local suite
@@ -462,6 +504,12 @@ if suite_requested jsonb; then
 fi
 if suite_requested aggregate-index; then
     run_aggregate_index_suite
+fi
+if suite_requested sparse-pruning; then
+    run_sparse_pruning_suite
+fi
+if suite_requested firebolt-vector; then
+    run_firebolt_vector_suite
 fi
 
 python3 - "$PROFILE" "$ENGINES" "$SUITES" "$MANIFEST" "$ARTIFACTS_MD" "$STATUS_FILE" <<'PY'

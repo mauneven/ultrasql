@@ -132,6 +132,11 @@ enum Workload {
     /// aggregating-index sweet spot and gives UltraSQL a stable exact
     /// baseline artifact for that competitor class.
     DashboardAggregate,
+    /// Sparse-pruning analytical workload over correlated keys:
+    /// `WHERE event_day BETWEEN a AND b AND tenant_id = ? GROUP BY
+    /// event_day, tenant_id, bucket`. This mirrors Firebolt primary-index
+    /// sparse granule pruning without claiming UltraSQL has that index.
+    SparsePruning,
     /// Bulk UPDATE: preload `--rows` (id INT, val INT) tuples, then
     /// time one `UPDATE bench_update_{ix} SET val = val + 1 WHERE
     /// id < <rows>`. Matches the shape of
@@ -200,6 +205,7 @@ impl Workload {
             Self::DashboardAggregate => {
                 format!("firebolt_aggregate_index_{}", k_or_raw(n_rows))
             }
+            Self::SparsePruning => format!("firebolt_sparse_pruning_{}", k_or_raw(n_rows)),
             Self::UpdateBulk => format!("update_throughput_{}", k_or_raw(n_rows)),
             Self::DeleteBulk => format!("delete_throughput_{}", k_or_raw(n_rows)),
             // The competitor scripts hard-code the id without a row-
@@ -391,6 +397,18 @@ async fn main() -> Result<()> {
                 .await?,
             );
         }
+        Workload::SparsePruning => {
+            answer = Some(
+                run_shared_sparse_pruning(
+                    bound,
+                    args.rows,
+                    args.warmup,
+                    total_iters,
+                    &mut iters_us,
+                )
+                .await?,
+            );
+        }
         Workload::WindowRowNumber => {
             run_shared_window_row_number(bound, args.rows, args.warmup, total_iters, &mut iters_us)
                 .await?;
@@ -518,6 +536,7 @@ async fn main() -> Result<()> {
                     | Workload::AvgScalar
                     | Workload::FilterSum
                     | Workload::DashboardAggregate
+                    | Workload::SparsePruning
                     | Workload::WindowRowNumber
                     | Workload::VectorTopK
                     | Workload::CsvColdRead
@@ -1519,6 +1538,10 @@ where
 const DASHBOARD_TENANTS: usize = 32;
 const DASHBOARD_BUCKETS: usize = 64;
 const DASHBOARD_FILTER_TENANT: usize = 7;
+const SPARSE_ROWS_PER_DAY: usize = 256;
+const SPARSE_TENANTS: usize = 64;
+const SPARSE_BUCKETS: usize = 32;
+const SPARSE_FILTER_TENANT: usize = 7;
 
 async fn preload_dashboard_aggregate_chunked(
     client: &tokio_postgres::Client,
@@ -1629,6 +1652,132 @@ async fn run_shared_dashboard_aggregate(
             "CREATE AGGREGATING INDEX idx ON fact_events ",
             "(tenant_id, bucket, SUM(amount), COUNT(*))"
         ),
+    }))
+}
+
+fn sparse_filter_days(n_rows: usize) -> (usize, usize) {
+    let max_day = n_rows.saturating_sub(1) / SPARSE_ROWS_PER_DAY;
+    let start = max_day.saturating_sub(2) / 2;
+    let end = (start + 2).min(max_day);
+    (start, end)
+}
+
+async fn preload_sparse_pruning_chunked(
+    client: &tokio_postgres::Client,
+    table: &str,
+    n_rows: usize,
+) -> Result<()> {
+    let mut start = 0;
+    while start < n_rows {
+        let end = (start + PRELOAD_CHUNK_ROWS).min(n_rows);
+        let mut sql = String::with_capacity((end - start) * 56 + 64);
+        sql.push_str("INSERT INTO ");
+        sql.push_str(table);
+        sql.push_str(" VALUES ");
+        for row_id in start..end {
+            if row_id > start {
+                sql.push(',');
+            }
+            let event_day = row_id / SPARSE_ROWS_PER_DAY;
+            let tenant_id = ((event_day * 13) + (row_id / 8)) % SPARSE_TENANTS;
+            let bucket = row_id % SPARSE_BUCKETS;
+            let amount_mod = row_id.wrapping_mul(31) % 2_000;
+            let amount = i64::try_from(amount_mod).unwrap_or(0) - 1_000;
+
+            sql.push('(');
+            sql.push_str(&row_id.to_string());
+            sql.push(',');
+            sql.push_str(&event_day.to_string());
+            sql.push(',');
+            sql.push_str(&tenant_id.to_string());
+            sql.push(',');
+            sql.push_str(&bucket.to_string());
+            sql.push(',');
+            sql.push_str(&amount.to_string());
+            sql.push(')');
+        }
+        client.batch_execute(&sql).await.with_context(|| {
+            format!("preload sparse-pruning chunk [{start}, {end}) INSERT into {table}")
+        })?;
+        start = end;
+    }
+    Ok(())
+}
+
+/// Shared-table sparse-pruning workload. UltraSQL runs this as an honest
+/// heap-scan baseline; Firebolt's matching script uses `PRIMARY INDEX
+/// event_day, tenant_id, bucket` to test sparse granule pruning.
+async fn run_shared_sparse_pruning(
+    server: SocketAddr,
+    n_rows: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<serde_json::Value> {
+    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .context("tokio-postgres connect to ultrasqld")?;
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("tokio-postgres connection error: {e}");
+        }
+    });
+
+    let table = "bench_sparse_pruning_shared";
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (
+                id INT NOT NULL,
+                event_day INT NOT NULL,
+                tenant_id INT NOT NULL,
+                bucket INT NOT NULL,
+                amount BIGINT NOT NULL
+            )"
+        ))
+        .await
+        .with_context(|| format!("CREATE TABLE {table}"))?;
+    preload_sparse_pruning_chunked(&client, table, n_rows).await?;
+
+    let (day_start, day_end) = sparse_filter_days(n_rows);
+    let query = format!(
+        "SELECT event_day, tenant_id, bucket, SUM(amount), COUNT(*) \
+         FROM {table} \
+         WHERE event_day BETWEEN {day_start} AND {day_end} \
+           AND tenant_id = {SPARSE_FILTER_TENANT} \
+         GROUP BY event_day, tenant_id, bucket \
+         ORDER BY event_day, tenant_id, bucket"
+    );
+    let mut answer_rows = Vec::new();
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(&query)
+            .await
+            .with_context(|| format!("sparse pruning aggregate on {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let rows = simple_query_rows(&messages);
+        if rows.is_empty() {
+            anyhow::bail!("sparse pruning aggregate returned no rows");
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+            answer_rows = rows;
+        }
+    }
+
+    drop(client);
+    conn_handle.abort();
+    Ok(serde_json::json!({
+        "rows": answer_rows,
+        "query_shape": "correlated_key_range_filter_group_by_sum_count",
+        "firebolt_index_shape": concat!(
+            "CREATE FACT TABLE fact_events (...) PRIMARY INDEX ",
+            "event_day, tenant_id, bucket"
+        ),
+        "event_day_start": day_start,
+        "event_day_end": day_end,
+        "tenant_id": SPARSE_FILTER_TENANT,
     }))
 }
 
@@ -2026,6 +2175,24 @@ mod tests {
         assert_eq!(
             Workload::DashboardAggregate.registry_id(1_000),
             "firebolt_aggregate_index_1k"
+        );
+    }
+
+    #[test]
+    fn sparse_pruning_workload_id_matches_firebolt_suite() {
+        let args = Args::try_parse_from([
+            "cross_compare_sql",
+            "--workload",
+            "sparse-pruning",
+            "--rows",
+            "1000",
+        ])
+        .expect("sparse pruning workload parses");
+
+        assert_eq!(args.workload, Workload::SparsePruning);
+        assert_eq!(
+            Workload::SparsePruning.registry_id(1_000),
+            "firebolt_sparse_pruning_1k"
         );
     }
 }
