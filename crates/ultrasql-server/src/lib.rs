@@ -87,7 +87,7 @@ use ultrasql_planner::{
     LogicalPlan, ScalarExpr, TableMeta, bind,
 };
 use ultrasql_protocol::BackendMessage;
-use ultrasql_storage::access_method::{HnswMetric, PageBackedHnswIndex};
+use ultrasql_storage::access_method::{HnswMetric, PageBackedHnswIndex, PageBackedIvfFlatIndex};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions};
@@ -272,8 +272,8 @@ pub struct RuntimeIndexMetadata {
     pub brin: Option<Arc<ultrasql_storage::access_method::BrinIndex>>,
     /// Page-backed HNSW graph for vector top-k scans.
     pub hnsw: Option<Arc<ultrasql_storage::access_method::PageBackedHnswIndex>>,
-    /// Runtime IVFFlat inverted lists for vector top-k scans.
-    pub ivfflat: Option<Arc<ultrasql_storage::access_method::IvfFlatIndex>>,
+    /// Page-backed IVFFlat inverted lists for vector top-k scans.
+    pub ivfflat: Option<Arc<ultrasql_storage::access_method::PageBackedIvfFlatIndex>>,
     /// Runtime aggregating-index summary for dashboard-style GROUP BY scans.
     pub aggregating: Option<Arc<RuntimeAggregatingIndex>>,
 }
@@ -2085,6 +2085,7 @@ impl Server {
     fn rebuild_persistent_vector_indexes(&self) -> Result<(), ServerError> {
         let snapshot = self.catalog_snapshot();
         let mut hnsw_indexes = Vec::new();
+        let mut ivfflat_indexes = Vec::new();
 
         for (table_oid, indexes) in &snapshot.indexes_by_table {
             let Some(table) = snapshot.tables_by_oid.get(table_oid) else {
@@ -2147,6 +2148,37 @@ impl Server {
                         changed = true;
                     }
                     LogicalIndexMethod::IvfFlat => {
+                        let [attnum] = index.columns.as_slice() else {
+                            continue;
+                        };
+                        let col = usize::from(*attnum);
+                        let Some(field) = table.schema.field(col) else {
+                            continue;
+                        };
+                        let dims = match &field.data_type {
+                            DataType::Vector { dims: Some(dims) } => *dims,
+                            _ => continue,
+                        };
+                        let metric = hnsw_metric_for_opclass_name(
+                            index.opclasses.first().and_then(Option::as_deref),
+                        )?;
+                        let (lists, probes) = ivfflat_options_from_catalog(&index.options)?;
+                        let ivfflat = Arc::new(
+                            PageBackedIvfFlatIndex::new(
+                                RelationId::new(index.oid.raw()),
+                                dims,
+                                metric,
+                                lists,
+                                probes,
+                            )
+                            .map_err(|e| {
+                                ServerError::ddl(format!(
+                                    "rebuild IVFFlat {} from catalog: {e}",
+                                    index.name
+                                ))
+                            })?,
+                        );
+                        ivfflat_indexes.push(Arc::clone(&ivfflat));
                         constraints.indexes.insert(
                             index.oid,
                             RuntimeIndexMetadata {
@@ -2156,7 +2188,7 @@ impl Server {
                                 method,
                                 brin: None,
                                 hnsw: None,
-                                ivfflat: None,
+                                ivfflat: Some(ivfflat),
                                 aggregating: None,
                             },
                         );
@@ -2172,14 +2204,15 @@ impl Server {
             }
         }
 
-        self.replay_hnsw_wal_into(&hnsw_indexes)
+        self.replay_vector_index_wal_into(&hnsw_indexes, &ivfflat_indexes)
     }
 
-    fn replay_hnsw_wal_into(
+    fn replay_vector_index_wal_into(
         &self,
         hnsw_indexes: &[Arc<PageBackedHnswIndex>],
+        ivfflat_indexes: &[Arc<PageBackedIvfFlatIndex>],
     ) -> Result<(), ServerError> {
-        if hnsw_indexes.is_empty() {
+        if hnsw_indexes.is_empty() && ivfflat_indexes.is_empty() {
             return Ok(());
         }
         let Some(data_dir) = &self.data_dir else {
@@ -2194,10 +2227,17 @@ impl Server {
                     })?;
                 }
             }
+            if record.header.record_type == RecordType::IvfFlatOp {
+                for ivfflat in ivfflat_indexes {
+                    ivfflat.apply_wal_record(record).map_err(|e| {
+                        ultrasql_wal::RecoveryError::Applier(format!("replay IVFFlat WAL: {e}"))
+                    })?;
+                }
+            }
             Ok(())
         })
         .map(|_| ())
-        .map_err(|e| ServerError::ddl(format!("recover HNSW index WAL: {e}")))
+        .map_err(|e| ServerError::ddl(format!("recover vector index WAL: {e}")))
     }
 
     /// Allocate the next per-connection process id.
@@ -3035,6 +3075,35 @@ fn hnsw_metric_for_opclass_name(opclass: Option<&str>) -> Result<HnswMetric, Ser
             "CREATE INDEX USING hnsw: unsupported vector opclass {other}"
         ))),
     }
+}
+
+fn ivfflat_options_from_catalog(
+    options: &[(String, String)],
+) -> Result<(usize, usize), ServerError> {
+    let mut lists = 100_usize;
+    let mut probes = 1_usize;
+    for (name, value) in options {
+        let parsed = value.parse::<usize>().map_err(|_| {
+            ServerError::ddl(format!(
+                "rebuild IVFFlat: option {name} must be a positive integer"
+            ))
+        })?;
+        if parsed == 0 {
+            return Err(ServerError::ddl(format!(
+                "rebuild IVFFlat: option {name} must be greater than zero"
+            )));
+        }
+        match name.as_str() {
+            "lists" => lists = parsed,
+            "probes" => probes = parsed,
+            other => {
+                return Err(ServerError::ddl(format!(
+                    "rebuild IVFFlat: unsupported option {other}"
+                )));
+            }
+        }
+    }
+    Ok((lists, probes))
 }
 
 fn unix_timestamp_micros() -> u64 {

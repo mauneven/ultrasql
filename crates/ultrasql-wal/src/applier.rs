@@ -15,7 +15,8 @@
 use crate::payload::{
     AbortPayload, BTreeOpPayload, CheckpointPayload, CommitPayload, FullPageWritePayload,
     HashOpPayload, HeapDeleteInPlacePayload, HeapDeletePayload, HeapInsertPayload,
-    HeapUpdateInPlacePayload, HeapUpdatePayload, HnswOpPayload, PayloadError, SequenceOpPayload,
+    HeapUpdateInPlacePayload, HeapUpdatePayload, HnswOpPayload, IvfFlatOpPayload, PayloadError,
+    SequenceOpPayload,
 };
 use crate::record::{RecordType, WalRecord};
 use crate::recovery::RecoveryError;
@@ -155,6 +156,15 @@ pub trait HeapTarget: Send + Sync {
         Ok(())
     }
 
+    /// Apply an IVFFlat vector-index inverted-list mutation record.
+    ///
+    /// Heap-only recovery targets may ignore these records, so the default is
+    /// a no-op. Storage targets that own IVFFlat pages should override this.
+    fn apply_ivfflat_op(&self, payload: &IvfFlatOpPayload) -> Result<(), ApplyError> {
+        let _ = payload;
+        Ok(())
+    }
+
     /// Apply a sequence state change record.
     ///
     /// Heap-only recovery targets may ignore these records. A server-level
@@ -225,6 +235,7 @@ pub fn dispatch_record(target: &dyn HeapTarget, record: &WalRecord) -> Result<()
         RecordType::SequenceOp => target.apply_sequence_op(&SequenceOpPayload::decode(bytes)?),
         RecordType::HashOp => target.apply_hash_op(&HashOpPayload::decode(bytes)?),
         RecordType::HnswOp => target.apply_hnsw_op(&HnswOpPayload::decode(bytes)?),
+        RecordType::IvfFlatOp => target.apply_ivfflat_op(&IvfFlatOpPayload::decode(bytes)?),
         RecordType::Nop => Ok(()),
     }
 }

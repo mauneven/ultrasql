@@ -24,7 +24,7 @@ use ultrasql_planner::{
 };
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
 use ultrasql_storage::access_method::{
-    AccessMethod, BrinIndex, HnswMetric, IvfFlatIndex, PageBackedHnswIndex,
+    AccessMethod, BrinIndex, HnswMetric, PageBackedHnswIndex, PageBackedIvfFlatIndex,
 };
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
@@ -742,8 +742,14 @@ where
             let (lists, probes) = ivfflat_options(index_options)?;
             let index_oid = self.state.persistent_catalog.next_oid();
             let ivfflat = Arc::new(
-                IvfFlatIndex::new(dims, metric, lists, probes)
-                    .map_err(|e| ServerError::ddl(format!("CREATE INDEX ivfflat init: {e}")))?,
+                PageBackedIvfFlatIndex::new(
+                    RelationId::new(index_oid.raw()),
+                    dims,
+                    metric,
+                    lists,
+                    probes,
+                )
+                .map_err(|e| ServerError::ddl(format!("CREATE INDEX ivfflat init: {e}")))?,
             );
             let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
             let table_rel = RelationId(table.oid);
@@ -776,7 +782,7 @@ where
                     rows.push((vector, tuple.tid));
                 }
                 ivfflat
-                    .bulk_load(rows)
+                    .bulk_load_logged(rows, txn.xid, self.state.heap.wal_sink().map(Arc::as_ref))
                     .map_err(|e| ServerError::ddl(format!("CREATE INDEX ivfflat bulk load: {e}")))
             })();
             if let Err(e) = self.state.txn_manager.commit(txn) {

@@ -121,6 +121,8 @@ pub enum RecordType {
     HashOp = 12,
     /// An HNSW vector-index graph mutation was recorded.
     HnswOp = 13,
+    /// An IVFFlat vector-index list mutation was recorded.
+    IvfFlatOp = 14,
     /// A no-op marker (used to round records up to alignment
     /// boundaries; ignored on replay).
     Nop = 255,
@@ -143,6 +145,7 @@ impl RecordType {
             11 => Self::SequenceOp,
             12 => Self::HashOp,
             13 => Self::HnswOp,
+            14 => Self::IvfFlatOp,
             255 => Self::Nop,
             other => return Err(WalRecordError::UnknownType(other)),
         })
@@ -386,6 +389,7 @@ mod tests {
             RecordType::HeapDeleteInPlace,
             RecordType::HashOp,
             RecordType::HnswOp,
+            RecordType::IvfFlatOp,
             RecordType::Nop,
         ] {
             let raw = rt as u8;

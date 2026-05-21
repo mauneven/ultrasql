@@ -367,9 +367,9 @@ where
                     .as_ref()
                     .is_some_and(|ivfflat| ivfflat.metric() == metric && ivfflat.is_available())
                 {
-                    return format!("selected {} (runtime ivfflat)", index.name);
+                    return format!("selected {} (page-backed ivfflat)", index.name);
                 }
-                return format!("skipped {}: ivfflat runtime unavailable", index.name);
+                return format!("skipped {}: page-backed ivfflat unavailable", index.name);
             }
         }
         format!("skipped {table}: no matching vector index")

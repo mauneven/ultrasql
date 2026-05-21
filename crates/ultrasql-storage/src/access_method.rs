@@ -19,6 +19,8 @@
 //!   overflow-page chains.
 //! - [`HnswIndex`]: runtime ANN graph; [`PageBackedHnswIndex`] adds the
 //!   persistent page arena, WAL replay, and VACUUM reclamation seam.
+//! - [`IvfFlatIndex`]: runtime inverted-list ANN; [`PageBackedIvfFlatIndex`]
+//!   adds persistent centroid/list pages and logical WAL replay.
 //! - [`GinIndex`], [`GistIndex`], [`BrinIndex`]: provide the trait shape with
 //!   happy-path insert/lookup so the catalog and executor can reference the
 //!   concrete types. Full type-specific operator-class implementations are
@@ -42,7 +44,9 @@ use thiserror::Error;
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{BlockNumber, Lsn, MAX_VECTOR_DIMS, PageId, RelationId, TupleId, Xid};
 use ultrasql_wal::WalRecord;
-use ultrasql_wal::payload::{HashOpKind, HashOpPayload, HnswOpKind, HnswOpPayload};
+use ultrasql_wal::payload::{
+    HashOpKind, HashOpPayload, HnswOpKind, HnswOpPayload, IvfFlatOpKind, IvfFlatOpPayload,
+};
 use ultrasql_wal::record::RecordType;
 
 use crate::wal_sink::WalSink;
@@ -3057,6 +3061,870 @@ impl AccessMethod for IvfFlatIndex {
     }
 }
 
+const IVFFLAT_META_BLOCK: u32 = 0;
+const IVFFLAT_FIRST_ALLOC_BLOCK: u32 = 1;
+
+/// Page counts and MVCC-visible entry counts for a page-backed IVFFlat index.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageBackedIvfFlatStats {
+    /// Number of IVFFlat meta pages. Always one for a single index relation.
+    pub meta_pages: usize,
+    /// Number of centroid pages.
+    pub centroid_pages: usize,
+    /// Number of inverted-list directory pages.
+    pub list_pages: usize,
+    /// Number of physical entry pages, including tombstones before compaction.
+    pub entry_pages: usize,
+    /// Number of non-tombstoned entries.
+    pub live_entries: usize,
+    /// Number of tombstoned entries waiting for VACUUM.
+    pub tombstones: usize,
+    /// Next block number that would be allocated by the page arena.
+    pub next_block_number: u32,
+}
+
+/// First page-backed IVFFlat storage model.
+///
+/// The arena stores centroids, list directories, and entry records as
+/// page-shaped structures with logical WAL replay. Search still reranks exact
+/// distances from selected lists, so this serves as the persistent IVFFlat
+/// correctness baseline before a full buffer-pool integration.
+#[derive(Debug)]
+pub struct PageBackedIvfFlatIndex {
+    storage: Mutex<PageBackedIvfFlatStorage>,
+    index_rel: RelationId,
+    dims: usize,
+    metric: HnswMetric,
+    lists: usize,
+    probes: usize,
+}
+
+#[derive(Debug)]
+struct PageBackedIvfFlatStorage {
+    pages: BTreeMap<BlockNumber, IvfFlatPersistentPage>,
+    entries: Vec<IvfFlatEntry>,
+    centroids: Vec<Vec<f32>>,
+    lists: Vec<Vec<usize>>,
+    tid_to_entry: BTreeMap<TupleId, usize>,
+    next_block_number: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IvfFlatPageContext {
+    index_rel: RelationId,
+    dims: usize,
+    metric: HnswMetric,
+    lists: usize,
+    probes: usize,
+}
+
+#[derive(Debug, Clone)]
+enum IvfFlatPersistentPage {
+    Meta(IvfFlatMetaPage),
+    Centroid(IvfFlatCentroidPage),
+    List(IvfFlatListPage),
+    Entry(IvfFlatEntryPage),
+}
+
+#[derive(Debug, Clone)]
+struct IvfFlatMetaPage {
+    page_id: PageId,
+    lsn: Lsn,
+    dims: usize,
+    metric: HnswMetric,
+    lists: usize,
+    probes: usize,
+    live_entries: usize,
+    tombstones: usize,
+    next_block_number: u32,
+}
+
+#[derive(Debug, Clone)]
+struct IvfFlatCentroidPage {
+    page_id: PageId,
+    lsn: Lsn,
+    list_id: usize,
+    vector: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct IvfFlatListPage {
+    page_id: PageId,
+    lsn: Lsn,
+    list_id: usize,
+    entry_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct IvfFlatEntryPage {
+    page_id: PageId,
+    lsn: Lsn,
+    entry_id: usize,
+    list_id: usize,
+    vector: Vec<f32>,
+    tid: TupleId,
+    deleted: bool,
+}
+
+impl PageBackedIvfFlatIndex {
+    /// Create an empty page-backed IVFFlat index.
+    pub fn new(
+        index_rel: RelationId,
+        dims: u32,
+        metric: HnswMetric,
+        lists: usize,
+        probes: usize,
+    ) -> Result<Self, AccessMethodError> {
+        if dims == 0 || dims > MAX_VECTOR_DIMS {
+            return Err(AccessMethodError::Storage(
+                "page-backed ivfflat dims outside supported range".to_owned(),
+            ));
+        }
+        if lists == 0 {
+            return Err(AccessMethodError::Storage(
+                "page-backed ivfflat lists must be greater than zero".to_owned(),
+            ));
+        }
+        if probes == 0 {
+            return Err(AccessMethodError::Storage(
+                "page-backed ivfflat probes must be greater than zero".to_owned(),
+            ));
+        }
+        let dims = usize::try_from(dims).map_err(|_| {
+            AccessMethodError::Storage("page-backed ivfflat dims do not fit usize".to_owned())
+        })?;
+        Ok(Self {
+            storage: Mutex::new(PageBackedIvfFlatStorage::new(
+                index_rel, dims, metric, lists, probes,
+            )),
+            index_rel,
+            dims,
+            metric,
+            lists,
+            probes,
+        })
+    }
+
+    fn page_context(&self) -> IvfFlatPageContext {
+        IvfFlatPageContext {
+            index_rel: self.index_rel,
+            dims: self.dims,
+            metric: self.metric,
+            lists: self.lists,
+            probes: self.probes,
+        }
+    }
+
+    /// Return page and tuple counts for this page-backed index.
+    #[must_use]
+    pub fn page_stats(&self) -> PageBackedIvfFlatStats {
+        let storage = self.storage.lock();
+        let mut stats = PageBackedIvfFlatStats {
+            live_entries: storage
+                .entries
+                .iter()
+                .filter(|entry| !entry.deleted)
+                .count(),
+            tombstones: storage.entries.iter().filter(|entry| entry.deleted).count(),
+            next_block_number: storage.next_block_number,
+            ..PageBackedIvfFlatStats::default()
+        };
+        for page in storage.pages.values() {
+            match page {
+                IvfFlatPersistentPage::Meta(meta) => {
+                    let _ = (
+                        meta.page_id,
+                        meta.lsn,
+                        meta.dims,
+                        meta.metric,
+                        meta.lists,
+                        meta.probes,
+                        meta.live_entries,
+                        meta.tombstones,
+                        meta.next_block_number,
+                    );
+                    stats.meta_pages += 1;
+                }
+                IvfFlatPersistentPage::Centroid(centroid) => {
+                    let _ = (
+                        centroid.page_id,
+                        centroid.lsn,
+                        centroid.list_id,
+                        centroid.vector.len(),
+                    );
+                    stats.centroid_pages += 1;
+                }
+                IvfFlatPersistentPage::List(list) => {
+                    let _ = (
+                        list.page_id,
+                        list.lsn,
+                        list.list_id,
+                        list.entry_indices.len(),
+                    );
+                    stats.list_pages += 1;
+                }
+                IvfFlatPersistentPage::Entry(entry) => {
+                    let _ = (
+                        entry.page_id,
+                        entry.lsn,
+                        entry.entry_id,
+                        entry.list_id,
+                        entry.vector.len(),
+                        entry.tid,
+                        entry.deleted,
+                    );
+                    stats.entry_pages += 1;
+                }
+            }
+        }
+        stats
+    }
+
+    /// Return this index's distance metric.
+    #[must_use]
+    pub const fn metric(&self) -> HnswMetric {
+        self.metric
+    }
+
+    /// Return this index's vector dimension.
+    #[must_use]
+    pub const fn dims(&self) -> usize {
+        self.dims
+    }
+
+    /// Return configured probe count.
+    #[must_use]
+    pub const fn probes(&self) -> usize {
+        self.probes
+    }
+
+    /// Return number of trained centroids.
+    #[must_use]
+    pub fn centroid_count(&self) -> usize {
+        self.storage.lock().centroids.len()
+    }
+
+    /// Return number of materialized inverted lists.
+    #[must_use]
+    pub fn list_count(&self) -> usize {
+        self.storage.lock().lists.len()
+    }
+
+    /// Return number of live entries.
+    #[must_use]
+    pub fn live_len(&self) -> usize {
+        self.page_stats().live_entries
+    }
+
+    /// Return number of tombstoned entries awaiting compaction.
+    #[must_use]
+    pub fn tombstone_count(&self) -> usize {
+        self.page_stats().tombstones
+    }
+
+    /// Return whether the page-backed IVFFlat lists can currently be used.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        self.live_len() > 0 && self.centroid_count() > 0
+    }
+
+    /// Train centroids and bulk-load vectors into page-backed lists.
+    pub fn bulk_load(&self, rows: Vec<(Vec<f32>, TupleId)>) -> Result<(), AccessMethodError> {
+        self.bulk_load_logged(rows, Xid::FIRST_USER, None)
+    }
+
+    /// Train centroids, bulk-load vectors, and emit logical IVFFlat WAL.
+    pub fn bulk_load_logged(
+        &self,
+        rows: Vec<(Vec<f32>, TupleId)>,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        for (vector, _) in &rows {
+            self.validate_vector(vector)?;
+        }
+        {
+            let mut storage = self.storage.lock();
+            storage.clear(self.page_context())?;
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let centroid_count = self.lists.min(rows.len());
+        let centroids = self.train_centroids(&rows, centroid_count);
+        for (list_id, centroid) in centroids.iter().enumerate() {
+            let page_lsn =
+                self.emit_ivfflat_wal(IvfFlatOpKind::Centroid, list_id, None, centroid, xid, wal)?;
+            self.apply_centroid_internal(list_id, centroid, false, page_lsn)?;
+        }
+        for (vector, tid) in rows {
+            let list_id = nearest_vector(&centroids, &vector, self.metric).ok_or_else(|| {
+                AccessMethodError::Storage("page-backed ivfflat centroids missing".to_owned())
+            })?;
+            let page_lsn = self.emit_ivfflat_wal(
+                IvfFlatOpKind::Insert,
+                list_id,
+                Some(tid),
+                &vector,
+                xid,
+                wal,
+            )?;
+            self.apply_insert_internal(list_id, &vector, tid, false, page_lsn)?;
+        }
+        Ok(())
+    }
+
+    /// Insert one vector into the nearest trained page-backed list.
+    pub fn insert_vector(&self, vector: &[f32], tid: TupleId) -> Result<(), AccessMethodError> {
+        self.insert_vector_logged(vector, tid, Xid::FIRST_USER, None)
+    }
+
+    /// Insert one vector and emit logical IVFFlat WAL.
+    pub fn insert_vector_logged(
+        &self,
+        vector: &[f32],
+        tid: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        self.validate_vector(vector)?;
+        let mut centroids = self.storage.lock().centroids.clone();
+        if centroids.is_empty() {
+            let page_lsn =
+                self.emit_ivfflat_wal(IvfFlatOpKind::Centroid, 0, None, vector, xid, wal)?;
+            self.apply_centroid_internal(0, vector, false, page_lsn)?;
+            centroids.push(vector.to_vec());
+        }
+        let list_id = nearest_vector(&centroids, vector, self.metric).ok_or_else(|| {
+            AccessMethodError::Storage("page-backed ivfflat centroids missing".to_owned())
+        })?;
+        let page_lsn =
+            self.emit_ivfflat_wal(IvfFlatOpKind::Insert, list_id, Some(tid), vector, xid, wal)?;
+        self.apply_insert_internal(list_id, vector, tid, false, page_lsn)
+    }
+
+    /// Search nearest `k` tuples by probing nearest page-backed lists.
+    pub fn search(
+        &self,
+        probe: &[f32],
+        k: usize,
+    ) -> Result<Vec<IvfFlatSearchResult>, AccessMethodError> {
+        self.validate_vector(probe)?;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let storage = self.storage.lock();
+        if storage.centroids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list_ids = nearest_vectors(&storage.centroids, probe, self.metric, self.probes);
+        let mut candidate_indices = Vec::new();
+        for list_id in list_ids {
+            let Some(list) = storage.lists.get(list_id) else {
+                continue;
+            };
+            candidate_indices.extend(list.iter().copied().filter(|idx| {
+                storage
+                    .entries
+                    .get(*idx)
+                    .is_some_and(|entry| !entry.deleted)
+            }));
+        }
+        if candidate_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let vectors: Vec<&[f32]> = candidate_indices
+            .iter()
+            .map(|idx| storage.entries[*idx].vector.as_slice())
+            .collect();
+        let hits = ultrasql_vec::kernels::vector::exact_top_k_f32(
+            &vectors,
+            probe,
+            self.metric.vector_metric(),
+            k,
+        );
+        let mut out: Vec<IvfFlatSearchResult> = hits
+            .into_iter()
+            .map(|hit| {
+                let entry = &storage.entries[candidate_indices[hit.row]];
+                IvfFlatSearchResult {
+                    tid: entry.tid,
+                    distance: hit.distance,
+                }
+            })
+            .collect();
+        out.sort_by(compare_ivfflat_hits);
+        Ok(out)
+    }
+
+    /// Mark an indexed tuple ID deleted.
+    pub fn mark_deleted(&self, tid: TupleId) -> Result<(), AccessMethodError> {
+        self.mark_deleted_logged(tid, Xid::FIRST_USER, None)
+    }
+
+    /// Mark an indexed tuple ID deleted and emit logical IVFFlat WAL.
+    pub fn mark_deleted_logged(
+        &self,
+        tid: TupleId,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<(), AccessMethodError> {
+        let page_lsn = self.emit_ivfflat_wal(IvfFlatOpKind::Delete, 0, Some(tid), &[], xid, wal)?;
+        let mut storage = self.storage.lock();
+        storage.mark_deleted(self.page_context(), tid, false, page_lsn)
+    }
+
+    /// Compact tombstoned entries out of page-backed lists.
+    pub fn compact_deleted(&self) -> Result<usize, AccessMethodError> {
+        self.compact_deleted_logged(Xid::FIRST_USER, None)
+    }
+
+    /// Compact tombstoned entries and emit logical IVFFlat WAL.
+    pub fn compact_deleted_logged(
+        &self,
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<usize, AccessMethodError> {
+        if self.tombstone_count() == 0 {
+            return Ok(0);
+        }
+        let page_lsn = self.emit_ivfflat_wal(IvfFlatOpKind::Compact, 0, None, &[], xid, wal)?;
+        let mut storage = self.storage.lock();
+        storage.compact_deleted(self.page_context(), page_lsn)
+    }
+
+    /// Replay one decoded logical IVFFlat WAL payload into this page arena.
+    pub fn apply_wal_payload(&self, payload: &IvfFlatOpPayload) -> Result<(), AccessMethodError> {
+        self.apply_wal_payload_at(Lsn::ZERO, payload)
+    }
+
+    /// Replay one decoded logical IVFFlat WAL payload at its assigned WAL LSN.
+    pub fn apply_wal_payload_at(
+        &self,
+        lsn: Lsn,
+        payload: &IvfFlatOpPayload,
+    ) -> Result<(), AccessMethodError> {
+        if payload.index_rel != self.index_rel {
+            return Ok(());
+        }
+        let list_id = usize::try_from(payload.list_id).map_err(|_| {
+            AccessMethodError::Storage("page-backed ivfflat list_id overflow".to_owned())
+        })?;
+        match payload.op {
+            IvfFlatOpKind::Centroid => {
+                self.apply_centroid_internal(list_id, &payload.vector, true, lsn)
+            }
+            IvfFlatOpKind::Insert => {
+                self.apply_insert_internal(list_id, &payload.vector, payload.tid, true, lsn)
+            }
+            IvfFlatOpKind::Delete => {
+                let mut storage = self.storage.lock();
+                storage.mark_deleted(self.page_context(), payload.tid, true, lsn)
+            }
+            IvfFlatOpKind::Compact => {
+                let mut storage = self.storage.lock();
+                storage
+                    .compact_deleted(self.page_context(), lsn)
+                    .map(|_| ())
+            }
+        }
+    }
+
+    /// Replay one WAL record, ignoring records that are not IVFFlat mutations.
+    pub fn apply_wal_record(&self, record: &WalRecord) -> Result<(), AccessMethodError> {
+        self.apply_wal_record_at(Lsn::ZERO, record)
+    }
+
+    /// Replay one WAL record at its assigned WAL LSN.
+    pub fn apply_wal_record_at(
+        &self,
+        lsn: Lsn,
+        record: &WalRecord,
+    ) -> Result<(), AccessMethodError> {
+        if record.header.record_type != RecordType::IvfFlatOp {
+            return Ok(());
+        }
+        let payload = IvfFlatOpPayload::decode(&record.payload)
+            .map_err(|e| AccessMethodError::Storage(format!("decode ivfflat WAL payload: {e}")))?;
+        self.apply_wal_payload_at(lsn, &payload)
+    }
+
+    fn apply_centroid_internal(
+        &self,
+        list_id: usize,
+        vector: &[f32],
+        replay: bool,
+        page_lsn: Lsn,
+    ) -> Result<(), AccessMethodError> {
+        self.validate_vector(vector)?;
+        let mut storage = self.storage.lock();
+        if let Some(existing) = storage.centroids.get(list_id) {
+            if existing == vector {
+                return Ok(());
+            }
+            if replay {
+                storage.centroids[list_id] = vector.to_vec();
+                storage.sync_pages(self.page_context(), page_lsn)?;
+                return Ok(());
+            }
+            return Err(AccessMethodError::DuplicateKey);
+        }
+        storage.ensure_list_slot(list_id)?;
+        storage.centroids[list_id] = vector.to_vec();
+        storage.sync_pages(self.page_context(), page_lsn)
+    }
+
+    fn apply_insert_internal(
+        &self,
+        list_id: usize,
+        vector: &[f32],
+        tid: TupleId,
+        replay: bool,
+        page_lsn: Lsn,
+    ) -> Result<(), AccessMethodError> {
+        self.validate_vector(vector)?;
+        let mut storage = self.storage.lock();
+        if storage.tid_to_entry.contains_key(&tid) {
+            if replay {
+                return Ok(());
+            }
+            return Err(AccessMethodError::DuplicateKey);
+        }
+        storage.ensure_list_slot(list_id)?;
+        if storage.centroids.get(list_id).is_none() {
+            if replay {
+                storage.centroids[list_id] = vector.to_vec();
+            } else {
+                return Err(AccessMethodError::Storage(
+                    "page-backed ivfflat insert target list has no centroid".to_owned(),
+                ));
+            }
+        }
+        let idx = storage.entries.len();
+        storage.entries.push(IvfFlatEntry {
+            vector: vector.to_vec(),
+            tid,
+            list_id,
+            deleted: false,
+        });
+        storage.lists[list_id].push(idx);
+        storage.tid_to_entry.insert(tid, idx);
+        storage.sync_pages(self.page_context(), page_lsn)
+    }
+
+    fn validate_vector(&self, vector: &[f32]) -> Result<(), AccessMethodError> {
+        if vector.len() != self.dims {
+            return Err(AccessMethodError::Storage(format!(
+                "page-backed ivfflat vector dimension mismatch: expected {}, got {}",
+                self.dims,
+                vector.len()
+            )));
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(AccessMethodError::Storage(
+                "page-backed ivfflat vector elements must be finite".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn train_centroids(
+        &self,
+        rows: &[(Vec<f32>, TupleId)],
+        centroid_count: usize,
+    ) -> Vec<Vec<f32>> {
+        let mut centroids: Vec<Vec<f32>> = (0..centroid_count)
+            .map(|idx| rows[(idx * rows.len()) / centroid_count].0.clone())
+            .collect();
+        for _ in 0..8 {
+            let mut sums = vec![vec![0.0_f32; self.dims]; centroid_count];
+            let mut counts = vec![0_usize; centroid_count];
+            for (vector, _) in rows {
+                if let Some(list_id) = nearest_vector(&centroids, vector, self.metric) {
+                    for (sum, value) in sums[list_id].iter_mut().zip(vector) {
+                        *sum += *value;
+                    }
+                    counts[list_id] += 1;
+                }
+            }
+            for idx in 0..centroid_count {
+                let count = counts[idx];
+                if count == 0 {
+                    continue;
+                }
+                let denom = count as f32;
+                for value in &mut sums[idx] {
+                    *value /= denom;
+                }
+                centroids[idx] = sums[idx].clone();
+            }
+        }
+        centroids
+    }
+
+    fn emit_ivfflat_wal(
+        &self,
+        op: IvfFlatOpKind,
+        list_id: usize,
+        tid: Option<TupleId>,
+        vector: &[f32],
+        xid: Xid,
+        wal: Option<&dyn WalSink>,
+    ) -> Result<Lsn, AccessMethodError> {
+        let Some(sink) = wal else {
+            return Ok(Lsn::ZERO);
+        };
+        let list_id = u32::try_from(list_id).map_err(|_| {
+            AccessMethodError::Storage("page-backed ivfflat list_id does not fit u32".to_owned())
+        })?;
+        let tid = tid
+            .unwrap_or_else(|| TupleId::new(PageId::new(self.index_rel, BlockNumber::new(0)), 0));
+        let payload = IvfFlatOpPayload {
+            op,
+            index_rel: self.index_rel,
+            tid,
+            list_id,
+            vector: vector.to_vec(),
+        }
+        .encode()
+        .map_err(|e| {
+            AccessMethodError::Storage(format!("page-backed ivfflat WAL payload encode: {e}"))
+        })?;
+        let prev_lsn = sink.last_lsn_for(xid);
+        let record = WalRecord::new(RecordType::IvfFlatOp, xid, prev_lsn, 0, payload);
+        sink.append(record)
+            .map_err(|e| AccessMethodError::Storage(format!("page-backed ivfflat WAL append: {e}")))
+    }
+}
+
+impl PageBackedIvfFlatStorage {
+    fn new(
+        index_rel: RelationId,
+        dims: usize,
+        metric: HnswMetric,
+        lists: usize,
+        probes: usize,
+    ) -> Self {
+        let ctx = IvfFlatPageContext {
+            index_rel,
+            dims,
+            metric,
+            lists,
+            probes,
+        };
+        let mut storage = Self {
+            pages: BTreeMap::new(),
+            entries: Vec::new(),
+            centroids: Vec::new(),
+            lists: Vec::new(),
+            tid_to_entry: BTreeMap::new(),
+            next_block_number: IVFFLAT_FIRST_ALLOC_BLOCK,
+        };
+        storage
+            .sync_pages(ctx, Lsn::ZERO)
+            .expect("fresh page-backed ivfflat metadata must fit block numbers");
+        storage
+    }
+
+    fn clear(&mut self, ctx: IvfFlatPageContext) -> Result<(), AccessMethodError> {
+        self.entries.clear();
+        self.centroids.clear();
+        self.lists.clear();
+        self.tid_to_entry.clear();
+        self.sync_pages(ctx, Lsn::ZERO)
+    }
+
+    fn ensure_list_slot(&mut self, list_id: usize) -> Result<(), AccessMethodError> {
+        let needed = list_id
+            .checked_add(1)
+            .ok_or_else(|| AccessMethodError::Storage("ivfflat list id overflow".to_owned()))?;
+        while self.centroids.len() < needed {
+            self.centroids.push(Vec::new());
+        }
+        while self.lists.len() < needed {
+            self.lists.push(Vec::new());
+        }
+        Ok(())
+    }
+
+    fn mark_deleted(
+        &mut self,
+        ctx: IvfFlatPageContext,
+        tid: TupleId,
+        replay: bool,
+        page_lsn: Lsn,
+    ) -> Result<(), AccessMethodError> {
+        let Some(idx) = self.tid_to_entry.get(&tid).copied() else {
+            if replay {
+                return Ok(());
+            }
+            return Err(AccessMethodError::NotFound);
+        };
+        let Some(entry) = self.entries.get_mut(idx) else {
+            if replay {
+                return Ok(());
+            }
+            return Err(AccessMethodError::NotFound);
+        };
+        if entry.deleted {
+            return Ok(());
+        }
+        entry.deleted = true;
+        self.sync_pages(ctx, page_lsn)
+    }
+
+    fn compact_deleted(
+        &mut self,
+        ctx: IvfFlatPageContext,
+        page_lsn: Lsn,
+    ) -> Result<usize, AccessMethodError> {
+        let before = self.entries.len();
+        if before == 0 {
+            return Ok(0);
+        }
+        let mut remap = vec![None; before];
+        let mut entries = Vec::with_capacity(before);
+        for (old_idx, entry) in self.entries.iter().enumerate() {
+            if entry.deleted {
+                continue;
+            }
+            remap[old_idx] = Some(entries.len());
+            entries.push(IvfFlatEntry {
+                vector: entry.vector.clone(),
+                tid: entry.tid,
+                list_id: entry.list_id,
+                deleted: false,
+            });
+        }
+        let removed = before.saturating_sub(entries.len());
+        if removed == 0 {
+            return Ok(0);
+        }
+        let mut new_lists = vec![Vec::new(); self.centroids.len()];
+        for old_list in &self.lists {
+            for old_idx in old_list {
+                if let Some(new_idx) = remap.get(*old_idx).and_then(|idx| *idx) {
+                    let list_id = entries[new_idx].list_id;
+                    if list_id >= new_lists.len() {
+                        return Err(AccessMethodError::Storage(
+                            "page-backed ivfflat compact found invalid list id".to_owned(),
+                        ));
+                    }
+                    new_lists[list_id].push(new_idx);
+                }
+            }
+        }
+        self.entries = entries;
+        self.lists = new_lists;
+        self.tid_to_entry.clear();
+        for (idx, entry) in self.entries.iter().enumerate() {
+            self.tid_to_entry.insert(entry.tid, idx);
+        }
+        self.sync_pages(ctx, page_lsn)?;
+        Ok(removed)
+    }
+
+    fn sync_pages(&mut self, ctx: IvfFlatPageContext, lsn: Lsn) -> Result<(), AccessMethodError> {
+        self.pages.clear();
+        let live_entries = self.entries.iter().filter(|entry| !entry.deleted).count();
+        let tombstones = self.entries.iter().filter(|entry| entry.deleted).count();
+        let mut next_block = IVFFLAT_FIRST_ALLOC_BLOCK;
+        self.pages.insert(
+            BlockNumber::new(IVFFLAT_META_BLOCK),
+            IvfFlatPersistentPage::Meta(IvfFlatMetaPage {
+                page_id: PageId::new(ctx.index_rel, BlockNumber::new(IVFFLAT_META_BLOCK)),
+                lsn,
+                dims: ctx.dims,
+                metric: ctx.metric,
+                lists: ctx.lists,
+                probes: ctx.probes,
+                live_entries,
+                tombstones,
+                next_block_number: next_block,
+            }),
+        );
+        for (list_id, centroid) in self.centroids.iter().enumerate() {
+            if centroid.is_empty() {
+                continue;
+            }
+            let block = alloc_ivfflat_block(&mut next_block)?;
+            self.pages.insert(
+                block,
+                IvfFlatPersistentPage::Centroid(IvfFlatCentroidPage {
+                    page_id: PageId::new(ctx.index_rel, block),
+                    lsn,
+                    list_id,
+                    vector: centroid.clone(),
+                }),
+            );
+        }
+        for (list_id, entry_indices) in self.lists.iter().enumerate() {
+            let block = alloc_ivfflat_block(&mut next_block)?;
+            self.pages.insert(
+                block,
+                IvfFlatPersistentPage::List(IvfFlatListPage {
+                    page_id: PageId::new(ctx.index_rel, block),
+                    lsn,
+                    list_id,
+                    entry_indices: entry_indices.clone(),
+                }),
+            );
+        }
+        for (entry_id, entry) in self.entries.iter().enumerate() {
+            let block = alloc_ivfflat_block(&mut next_block)?;
+            self.pages.insert(
+                block,
+                IvfFlatPersistentPage::Entry(IvfFlatEntryPage {
+                    page_id: PageId::new(ctx.index_rel, block),
+                    lsn,
+                    entry_id,
+                    list_id: entry.list_id,
+                    vector: entry.vector.clone(),
+                    tid: entry.tid,
+                    deleted: entry.deleted,
+                }),
+            );
+        }
+        self.next_block_number = next_block;
+        if let Some(IvfFlatPersistentPage::Meta(meta)) =
+            self.pages.get_mut(&BlockNumber::new(IVFFLAT_META_BLOCK))
+        {
+            meta.next_block_number = next_block;
+        }
+        Ok(())
+    }
+}
+
+impl AccessMethod for PageBackedIvfFlatIndex {
+    fn name(&self) -> &'static str {
+        "ivfflat"
+    }
+
+    fn insert(&self, key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
+        let vector = decode_vector_key(key, self.dims, "page-backed ivfflat")?;
+        self.insert_vector(&vector, tid)
+    }
+
+    fn lookup(&self, _key: &[u8]) -> Result<Vec<TupleId>, AccessMethodError> {
+        Err(AccessMethodError::NotImplemented(
+            "ivfflat lookup requires vector top-k search",
+        ))
+    }
+
+    fn delete(&self, _key: &[u8], tid: TupleId) -> Result<(), AccessMethodError> {
+        self.mark_deleted(tid)
+    }
+}
+
+fn alloc_ivfflat_block(next_block: &mut u32) -> Result<BlockNumber, AccessMethodError> {
+    let block = *next_block;
+    *next_block = next_block
+        .checked_add(1)
+        .ok_or_else(|| AccessMethodError::Storage("ivfflat block number overflow".to_owned()))?;
+    Ok(BlockNumber::new(block))
+}
+
 fn nearest_vector(centroids: &[Vec<f32>], probe: &[f32], metric: HnswMetric) -> Option<usize> {
     nearest_vectors(centroids, probe, metric, 1)
         .into_iter()
@@ -3291,7 +4159,9 @@ impl AccessMethod for BrinIndex {
 #[cfg(test)]
 mod tests {
     use ultrasql_core::{BlockNumber, Lsn, PageId, RelationId, TupleId, Xid};
-    use ultrasql_wal::payload::{HashOpKind, HashOpPayload, HnswOpKind, HnswOpPayload};
+    use ultrasql_wal::payload::{
+        HashOpKind, HashOpPayload, HnswOpKind, HnswOpPayload, IvfFlatOpKind, IvfFlatOpPayload,
+    };
     use ultrasql_wal::record::RecordType;
 
     use super::*;
@@ -3896,5 +4766,72 @@ mod tests {
         assert_eq!(am.compact_deleted().expect("compact ivfflat"), 1);
         assert_eq!(am.tombstone_count(), 0);
         assert_eq!(am.live_len(), 2);
+    }
+
+    #[test]
+    fn page_backed_ivfflat_replays_centroids_lists_and_deletes() {
+        let index_rel = RelationId::new(9900);
+        let source = PageBackedIvfFlatIndex::new(index_rel, 2, HnswMetric::L2, 2, 1)
+            .expect("ivfflat config");
+        let sink = InMemoryWalSink::new();
+
+        source
+            .bulk_load_logged(
+                vec![
+                    (vec![0.0, 0.0], tid(1, 0)),
+                    (vec![1.0, 0.0], tid(1, 1)),
+                    (vec![9.0, 0.0], tid(2, 0)),
+                    (vec![10.0, 0.0], tid(2, 1)),
+                ],
+                Xid::new(30),
+                Some(&sink),
+            )
+            .expect("bulk load logged");
+        source
+            .insert_vector_logged(&[9.5, 0.0], tid(2, 2), Xid::new(31), Some(&sink))
+            .expect("logged insert");
+        source
+            .mark_deleted_logged(tid(1, 0), Xid::new(32), Some(&sink))
+            .expect("logged delete");
+        source
+            .compact_deleted_logged(Xid::new(33), Some(&sink))
+            .expect("logged compact");
+
+        let records = sink.records();
+        assert!(
+            records
+                .iter()
+                .any(|(_, record)| record.header.record_type == RecordType::IvfFlatOp)
+        );
+        let first_payload =
+            IvfFlatOpPayload::decode(&records[0].1.payload).expect("decode ivfflat WAL");
+        assert_eq!(first_payload.op, IvfFlatOpKind::Centroid);
+        assert_eq!(first_payload.index_rel, index_rel);
+
+        let recovered = PageBackedIvfFlatIndex::new(index_rel, 2, HnswMetric::L2, 2, 1)
+            .expect("recovered ivfflat config");
+        for (lsn, record) in &records {
+            recovered
+                .apply_wal_record_at(*lsn, record)
+                .expect("replay ivfflat WAL");
+        }
+        for (lsn, record) in &records {
+            recovered
+                .apply_wal_record_at(*lsn, record)
+                .expect("replay ivfflat WAL idempotently");
+        }
+
+        let stats = recovered.page_stats();
+        assert_eq!(stats.meta_pages, 1);
+        assert_eq!(stats.centroid_pages, 2);
+        assert_eq!(stats.list_pages, 2);
+        assert_eq!(stats.live_entries, 4);
+        assert_eq!(stats.tombstones, 0);
+        assert!(stats.entry_pages >= 4);
+        assert!(stats.next_block_number >= 5);
+
+        let hits = recovered.search(&[9.4, 0.0], 3).expect("search");
+        let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
+        assert_eq!(tids, vec![tid(2, 2), tid(2, 0), tid(2, 1)]);
     }
 }

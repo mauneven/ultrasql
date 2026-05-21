@@ -1370,6 +1370,196 @@ impl HnswOpPayload {
     }
 }
 
+/// Kind of IVFFlat inverted-list operation recorded in an
+/// [`IvfFlatOpPayload`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum IvfFlatOpKind {
+    /// Installed or replaced one centroid page.
+    Centroid = 1,
+    /// Inserted one vector into an inverted list.
+    Insert = 2,
+    /// Marked one tuple id tombstoned.
+    Delete = 3,
+    /// Compacted tombstoned entries out of list pages.
+    Compact = 4,
+}
+
+impl IvfFlatOpKind {
+    /// Parse an `IvfFlatOpKind` from its on-disk byte representation.
+    pub const fn from_u8(v: u8) -> Result<Self, PayloadError> {
+        match v {
+            1 => Ok(Self::Centroid),
+            2 => Ok(Self::Insert),
+            3 => Ok(Self::Delete),
+            4 => Ok(Self::Compact),
+            _ => Err(PayloadError::Malformed("ivfflat_op kind unknown")),
+        }
+    }
+}
+
+/// Payload for a `RecordType::IvfFlatOp` WAL record.
+///
+/// The record carries a redo-friendly logical mutation for page-backed
+/// IVFFlat storage: centroid materialization, list insert, tombstone, or
+/// compaction. Insert and centroid records include a finite `f32` vector;
+/// delete and compact records use an empty vector.
+///
+/// Wire layout (little-endian, no implicit padding):
+/// ```text
+///  0   1   op (u8) — IvfFlatOpKind discriminant
+///  1   3   reserved (zero)
+///  4   4   index_rel (RelationId/OID, u32)
+///  8  12   tid (TupleId)
+/// 20   4   list_id (u32)
+/// 24   4   dims (u32)
+/// 28   4   vector_len (u32)
+/// 32  ..   f32 vector values as little-endian bytes
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct IvfFlatOpPayload {
+    /// Mutation kind.
+    pub op: IvfFlatOpKind,
+    /// OID of the IVFFlat index relation.
+    pub index_rel: RelationId,
+    /// Heap tuple identifier affected by insert/delete.
+    pub tid: TupleId,
+    /// Inverted list or centroid slot affected by the operation.
+    pub list_id: u32,
+    /// Vector payload for centroid/insert records.
+    pub vector: Vec<f32>,
+}
+
+impl IvfFlatOpPayload {
+    /// Encode this payload into a freshly allocated byte vector.
+    pub fn encode(&self) -> Result<Vec<u8>, PayloadError> {
+        let vector_bytes_len = self
+            .vector
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or(PayloadError::Malformed("ivfflat_op vector length overflow"))?;
+        if vector_bytes_len > MAX_VARIABLE_PAYLOAD_BYTES {
+            return Err(PayloadError::Malformed(
+                "ivfflat_op vector length exceeds ceiling",
+            ));
+        }
+        let dims = u32::try_from(self.vector.len())
+            .map_err(|_| PayloadError::Malformed("ivfflat_op dims overflow"))?;
+        let vector_len = u32::try_from(self.vector.len())
+            .map_err(|_| PayloadError::Malformed("ivfflat_op vector_len overflow"))?;
+        let total = 32 + vector_bytes_len;
+        let mut out = vec![0_u8; total];
+        out[0] = self.op as u8;
+        write_u32_le(&mut out[4..8], self.index_rel.oid().raw());
+        write_u32_le(&mut out[8..12], self.tid.page.relation.oid().raw());
+        write_u32_le(&mut out[12..16], self.tid.page.block.raw());
+        write_u16_le(&mut out[16..18], self.tid.slot);
+        write_u16_le(&mut out[18..20], 0);
+        write_u32_le(&mut out[20..24], self.list_id);
+        write_u32_le(&mut out[24..28], dims);
+        write_u32_le(&mut out[28..32], vector_len);
+        let mut off = 32;
+        for value in &self.vector {
+            if !value.is_finite() {
+                return Err(PayloadError::Malformed(
+                    "ivfflat_op vector elements must be finite",
+                ));
+            }
+            out[off..off + 4].copy_from_slice(&value.to_le_bytes());
+            off += 4;
+        }
+        Ok(out)
+    }
+
+    /// Decode an `IvfFlatOpPayload` from a byte slice.
+    pub fn decode(bytes: &[u8]) -> Result<Self, PayloadError> {
+        const FIXED: usize = 32;
+        if bytes.len() < FIXED {
+            return Err(PayloadError::Truncated {
+                needed: FIXED,
+                have: bytes.len(),
+            });
+        }
+        let op = IvfFlatOpKind::from_u8(bytes[0])?;
+        if bytes[1] != 0 || bytes[2] != 0 || bytes[3] != 0 {
+            return Err(PayloadError::Malformed(
+                "ivfflat_op reserved prefix bytes must be zero",
+            ));
+        }
+        let index_rel = RelationId::new(
+            read_u32_le(&bytes[4..8])
+                .map_err(|_| PayloadError::Malformed("ivfflat_op index_rel"))?,
+        );
+        if bytes[18] != 0 || bytes[19] != 0 {
+            return Err(PayloadError::Malformed(
+                "ivfflat_op tid reserved bytes must be zero",
+            ));
+        }
+        let tid_rel = read_u32_le(&bytes[8..12])
+            .map_err(|_| PayloadError::Malformed("ivfflat_op tid relation"))?;
+        let tid_block = read_u32_le(&bytes[12..16])
+            .map_err(|_| PayloadError::Malformed("ivfflat_op tid block"))?;
+        let tid_slot = read_u16_le(&bytes[16..18])
+            .map_err(|_| PayloadError::Malformed("ivfflat_op tid slot"))?;
+        let tid = TupleId::new(
+            PageId::new(RelationId::new(tid_rel), BlockNumber::new(tid_block)),
+            tid_slot,
+        );
+        let list_id = read_u32_le(&bytes[20..24])
+            .map_err(|_| PayloadError::Malformed("ivfflat_op list_id"))?;
+        let dims = usize::try_from(
+            read_u32_le(&bytes[24..28]).map_err(|_| PayloadError::Malformed("ivfflat_op dims"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("ivfflat_op dims usize overflow"))?;
+        let vector_len = usize::try_from(
+            read_u32_le(&bytes[28..32])
+                .map_err(|_| PayloadError::Malformed("ivfflat_op vector_len"))?,
+        )
+        .map_err(|_| PayloadError::Malformed("ivfflat_op vector_len usize overflow"))?;
+        if dims != vector_len {
+            return Err(PayloadError::Malformed(
+                "ivfflat_op dims and vector_len disagree",
+            ));
+        }
+        let vector_bytes_len = vector_len
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or(PayloadError::Malformed("ivfflat_op vector length overflow"))?;
+        if vector_bytes_len > MAX_VARIABLE_PAYLOAD_BYTES {
+            return Err(PayloadError::Malformed(
+                "ivfflat_op vector length exceeds ceiling",
+            ));
+        }
+        let needed = FIXED + vector_bytes_len;
+        if bytes.len() < needed {
+            return Err(PayloadError::Truncated {
+                needed,
+                have: bytes.len(),
+            });
+        }
+        let mut vector = Vec::with_capacity(vector_len);
+        for chunk in bytes[FIXED..needed].chunks_exact(std::mem::size_of::<f32>()) {
+            let value = f32::from_le_bytes(
+                chunk
+                    .try_into()
+                    .map_err(|_| PayloadError::Malformed("ivfflat_op f32 chunk"))?,
+            );
+            if !value.is_finite() {
+                return Err(PayloadError::Malformed(
+                    "ivfflat_op vector elements must be finite",
+                ));
+            }
+            vector.push(value);
+        }
+        Ok(Self {
+            op,
+            index_rel,
+            tid,
+            list_id,
+            vector,
+        })
+    }
+}
+
 /// Kind of sequence operation recorded in a [`SequenceOpPayload`].
 ///
 /// Each WAL record carries the complete sequence state after the operation, so
@@ -2151,6 +2341,53 @@ mod tests {
             };
             prop_assert_eq!(HashOpPayload::decode(&p.encode().unwrap()).unwrap(), p);
         }
+    }
+
+    // ── IvfFlatOpPayload ─────────────────────────────────────────────────
+
+    #[test]
+    fn ivfflat_op_insert_round_trip() {
+        let p = IvfFlatOpPayload {
+            op: IvfFlatOpKind::Insert,
+            index_rel: RelationId::new(77),
+            tid: tid(77, 7, 3),
+            list_id: 4,
+            vector: vec![1.0, 2.0, 3.0],
+        };
+        assert_eq!(IvfFlatOpPayload::decode(&p.encode().unwrap()).unwrap(), p);
+    }
+
+    #[test]
+    fn ivfflat_op_unknown_kind_rejected() {
+        let p = IvfFlatOpPayload {
+            op: IvfFlatOpKind::Delete,
+            index_rel: RelationId::new(1),
+            tid: tid(1, 1, 0),
+            list_id: 0,
+            vector: Vec::new(),
+        };
+        let mut raw = p.encode().unwrap();
+        raw[0] = 99;
+        let err = IvfFlatOpPayload::decode(&raw).unwrap_err();
+        assert!(
+            matches!(err, PayloadError::Malformed(_)),
+            "expected Malformed for unknown IvfFlatOpKind, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn ivfflat_op_truncated_rejected() {
+        let p = IvfFlatOpPayload {
+            op: IvfFlatOpKind::Centroid,
+            index_rel: RelationId::new(1),
+            tid: tid(1, 1, 0),
+            list_id: 0,
+            vector: vec![0.0, 1.0],
+        };
+        let mut raw = p.encode().unwrap();
+        raw.truncate(raw.len() - 1);
+        let err = IvfFlatOpPayload::decode(&raw).unwrap_err();
+        assert!(matches!(err, PayloadError::Truncated { .. }), "got {err:?}");
     }
 
     // ── SequenceOpPayload ─────────────────────────────────────────────────

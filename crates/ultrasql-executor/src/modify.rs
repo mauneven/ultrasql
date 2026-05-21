@@ -31,7 +31,9 @@ use std::sync::Arc;
 use ultrasql_core::{CommandId, DataType, Field, RelationId, Schema, TupleId, Value, Xid};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::access_method::{AccessMethod, BrinIndex, IvfFlatIndex, PageBackedHnswIndex};
+use ultrasql_storage::access_method::{
+    AccessMethod, BrinIndex, PageBackedHnswIndex, PageBackedIvfFlatIndex,
+};
 use ultrasql_storage::btree::{BTree, BTreeError};
 use ultrasql_storage::heap::{DeleteOptions, HeapAccess, UpdateOptions, UpdatePayload};
 use ultrasql_storage::sequence::Sequence;
@@ -231,7 +233,7 @@ pub struct VectorIndexMaintainer {
 
 enum VectorIndexRuntime {
     Hnsw(Arc<PageBackedHnswIndex>),
-    IvfFlat(Arc<IvfFlatIndex>),
+    IvfFlat(Arc<PageBackedIvfFlatIndex>),
 }
 
 impl std::fmt::Debug for VectorIndexRuntime {
@@ -275,7 +277,7 @@ impl VectorIndexMaintainer {
     #[must_use]
     pub fn new_ivfflat<N: Into<String>>(
         name: N,
-        ivfflat: Arc<IvfFlatIndex>,
+        ivfflat: Arc<PageBackedIvfFlatIndex>,
         encode: VectorIndexEncoder,
         xid: Xid,
         wal: Option<Arc<dyn WalSink>>,
@@ -299,7 +301,7 @@ impl VectorIndexMaintainer {
                 .insert_vector_logged(vector, tid, self.xid, self.wal.as_deref())
                 .map_err(|e| ExecError::TypeMismatch(format!("hnsw insert {}: {e}", self.name))),
             VectorIndexRuntime::IvfFlat(ivfflat) => ivfflat
-                .insert_vector(vector, tid)
+                .insert_vector_logged(vector, tid, self.xid, self.wal.as_deref())
                 .map_err(|e| ExecError::TypeMismatch(format!("ivfflat insert {}: {e}", self.name))),
         }
     }
@@ -310,7 +312,7 @@ impl VectorIndexMaintainer {
                 .mark_deleted_logged(tid, self.xid, self.wal.as_deref())
                 .map_err(|e| ExecError::TypeMismatch(format!("hnsw delete {}: {e}", self.name))),
             VectorIndexRuntime::IvfFlat(ivfflat) => ivfflat
-                .mark_deleted(tid)
+                .mark_deleted_logged(tid, self.xid, self.wal.as_deref())
                 .map_err(|e| ExecError::TypeMismatch(format!("ivfflat delete {}: {e}", self.name))),
         }
     }

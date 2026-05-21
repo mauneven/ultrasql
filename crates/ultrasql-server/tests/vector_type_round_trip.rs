@@ -612,6 +612,87 @@ async fn ivfflat_l2_opclass_uses_lists_probes_and_survives_dml() {
 }
 
 #[tokio::test]
+async fn ivfflat_page_backed_index_survives_sql_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        client
+            .batch_execute("CREATE TABLE ann_ivf_restart (id INT NOT NULL, embedding VECTOR(2))")
+            .await
+            .expect("create vector table");
+        client
+            .batch_execute(
+                "INSERT INTO ann_ivf_restart VALUES \
+                 (1, '[0,0]'), \
+                 (2, '[1,0]'), \
+                 (3, '[8.5,0]'), \
+                 (4, '[10,0]')",
+            )
+            .await
+            .expect("insert vectors");
+        client
+            .batch_execute(
+                "CREATE INDEX ann_ivf_restart_embedding_idx \
+                 ON ann_ivf_restart USING ivfflat (embedding vector_l2_ops) \
+                 WITH (lists = 2, probes = 1)",
+            )
+            .await
+            .expect("create ivfflat index");
+        client
+            .batch_execute("INSERT INTO ann_ivf_restart VALUES (5, '[9.5,0]')")
+            .await
+            .expect("insert post-index vector");
+        client
+            .batch_execute("DELETE FROM ann_ivf_restart WHERE id = 1")
+            .await
+            .expect("delete post-index vector");
+        shutdown(client, server_handle).await;
+    }
+
+    {
+        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let messages = client
+            .simple_query(
+                "SELECT id FROM ann_ivf_restart \
+                 ORDER BY embedding <-> VECTOR '[9.4,0]' LIMIT 3",
+            )
+            .await
+            .expect("ivfflat top-k after restart");
+        let rows = simple_rows(&messages);
+        assert_eq!(
+            rows,
+            vec![
+                vec!["5".to_owned()],
+                vec!["4".to_owned()],
+                vec!["3".to_owned()]
+            ]
+        );
+
+        let messages = client
+            .simple_query(
+                "EXPLAIN ANALYZE SELECT id FROM ann_ivf_restart \
+                 ORDER BY embedding <-> VECTOR '[9.4,0]' LIMIT 3",
+            )
+            .await
+            .expect("explain after restart");
+        let text = simple_rows(&messages)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains(
+                "Vector Index: selected ann_ivf_restart_embedding_idx (page-backed ivfflat)"
+            ),
+            "EXPLAIN ANALYZE must report page-backed IVFFlat after restart, got: {text}"
+        );
+
+        shutdown(client, server_handle).await;
+    }
+}
+
+#[tokio::test]
 async fn insert_rejects_vector_dimension_mismatch() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

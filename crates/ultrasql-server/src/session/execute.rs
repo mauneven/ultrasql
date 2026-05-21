@@ -1156,7 +1156,7 @@ where
                     })
             {
                 ivfflat
-                    .compact_deleted()
+                    .compact_deleted_logged(oldest, self.state.heap.wal_sink().map(Arc::as_ref))
                     .map_err(|e| ServerError::ddl(format!("VACUUM IVFFlat {}: {e}", index.name)))?;
                 continue;
             }

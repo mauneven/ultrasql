@@ -27,7 +27,7 @@ pub use payload::{
     AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload,
     FullPageWritePayload, HashOpKind, HashOpPayload, HeapDeleteInPlacePayload, HeapDeletePayload,
     HeapInsertPayload, HeapUpdateInPlacePayload, HeapUpdatePayload, HnswOpKind, HnswOpPayload,
-    PayloadError, SequenceOpKind, SequenceOpPayload,
+    IvfFlatOpKind, IvfFlatOpPayload, PayloadError, SequenceOpKind, SequenceOpPayload,
 };
 pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};
 pub use recovery::{RecoveryError, recover};
