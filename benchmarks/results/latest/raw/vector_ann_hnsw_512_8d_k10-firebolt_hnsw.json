@@ -13,7 +13,7 @@
   "ef_search": 64,
   "seed": 1367265502,
   "status": "not_available",
-  "reason": "firebolt_url_missing",
+  "reason": "firebolt_core_unavailable",
   "generated_at_unix": 1779343241,
   "required_metrics": [
     "recall_at_k",
@@ -28,5 +28,5 @@
     "ddl": "CREATE INDEX idx ON documents USING HNSW (embedding vector_l2sq_ops) WITH (dimension = ?, m = ?, ef_construction = ?, quantization = 'f32')",
     "query": "SELECT id FROM VECTOR_SEARCH(INDEX idx, target_vector => ?, top_k => ?, ef_search => ?)"
   },
-  "policy": "No Firebolt vector-search benchmark claim exists until a configured FIREBOLT_URL emits measured VECTOR_SEARCH samples from reproducible inputs."
+  "policy": "No Firebolt vector-search benchmark claim exists until a configured local Firebolt Core emits measured VECTOR_SEARCH samples from reproducible inputs."
 }

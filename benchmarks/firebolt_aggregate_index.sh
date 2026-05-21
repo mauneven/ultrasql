@@ -3,8 +3,8 @@
 #
 # This runner targets Firebolt's documented dashboard/reporting strength:
 # repeated filtered GROUP BY queries backed by CREATE AGGREGATING INDEX.
-# It publishes raw artifacts only. Without FIREBOLT_URL, the Firebolt leg
-# records not_available instead of inventing a benchmark claim.
+# It publishes raw artifacts only. Firebolt uses local Firebolt Core Docker
+# through benchmarks/firebolt_core_local.sh; setup gaps record not_available.
 
 set -euo pipefail
 
@@ -16,7 +16,8 @@ OUT_DIR="${FIREBOLT_AGG_OUT_DIR:-benchmarks/results/latest}"
 RAW_DIR="${RAW_DIR:-$OUT_DIR/raw}"
 MANIFEST="$OUT_DIR/firebolt_aggregate_index_manifest.json"
 ENGINES="${FIREBOLT_AGG_ENGINES:-ultrasql,firebolt}"
-FIREBOLT_URL="${FIREBOLT_URL:-}"
+FIREBOLT_CORE_ENDPOINT="${FIREBOLT_CORE_ENDPOINT:-http://127.0.0.1:3473}"
+FIREBOLT_CORE_HELPER="${FIREBOLT_CORE_HELPER:-benchmarks/firebolt_core_local.sh}"
 
 case "$PROFILE" in
     smoke)
@@ -100,8 +101,8 @@ doc = {
     },
     "policy": (
         "No Firebolt aggregate-index benchmark claim exists until a "
-        "configured FIREBOLT_URL emits measured samples and an EXPLAIN "
-        "artifact showing Aggregating Index usage."
+        "local Firebolt Core Docker run emits measured samples and an "
+        "EXPLAIN artifact showing Aggregating Index usage."
     ),
 }
 pathlib.Path(out).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
@@ -125,11 +126,12 @@ run_ultrasql() {
 
 run_firebolt() {
     local out="$RAW_DIR/${WORKLOAD_ID}-firebolt.json"
-    if [[ -z "$FIREBOLT_URL" ]]; then
-        emit_not_available "firebolt" "firebolt_url_missing"
+    if ! FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" "$FIREBOLT_CORE_HELPER" wait >/dev/null; then
+        emit_not_available "firebolt" "firebolt_core_unavailable"
         return 2
     fi
 
+    FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" \
     FIREBOLT_ROWS="$ROWS" \
     FIREBOLT_WARMUP="$WARMUP" \
     FIREBOLT_ITERS="$ITERS" \
@@ -146,7 +148,7 @@ import urllib.parse
 import urllib.request
 
 
-endpoint = os.environ["FIREBOLT_URL"]
+endpoint = os.environ["FIREBOLT_CORE_ENDPOINT"]
 rows = int(os.environ["FIREBOLT_ROWS"])
 warmup = int(os.environ["FIREBOLT_WARMUP"])
 iters = int(os.environ["FIREBOLT_ITERS"])
@@ -164,12 +166,6 @@ def formatted_endpoint() -> str:
 
 def request(sql: str):
     headers = {"Content-Type": "text/plain; charset=utf-8"}
-    token = os.environ.get("FIREBOLT_TOKEN")
-    auth_header = os.environ.get("FIREBOLT_AUTH_HEADER")
-    if auth_header:
-        headers["Authorization"] = auth_header
-    elif token:
-        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
         formatted_endpoint(),
         data=sql.encode("utf-8"),
@@ -352,8 +348,8 @@ doc = {
     "engines": entries,
     "policy": (
         "No Firebolt aggregate-index benchmark claim exists unless Firebolt "
-        "has a measured artifact from FIREBOLT_URL and EXPLAIN shows "
-        "Aggregating Index usage. Missing endpoint is recorded as "
+        "has a measured local Core artifact and EXPLAIN shows "
+        "Aggregating Index usage. Missing local Core is recorded as "
         "not_available, not as a result."
     ),
 }

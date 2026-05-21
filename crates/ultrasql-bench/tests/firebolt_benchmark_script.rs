@@ -7,6 +7,8 @@ use std::path::PathBuf;
 
 use support::bash_command;
 
+const LEGACY_FIREBOLT_REMOTE_ENV: &str = concat!("FIREBOLT", "_URL");
+
 fn repo_path(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -22,7 +24,10 @@ fn repo_file(path: &str) -> String {
 fn firebolt_aggregate_script_declares_competitor_and_index_workload() {
     let script = repo_file("benchmarks/firebolt_aggregate_index.sh");
 
-    assert!(script.contains("FIREBOLT_URL"));
+    assert!(!script.contains(LEGACY_FIREBOLT_REMOTE_ENV));
+    assert!(script.contains("FIREBOLT_CORE_ENDPOINT"));
+    assert!(script.contains("FIREBOLT_CORE_HELPER"));
+    assert!(script.contains("wait"));
     assert!(script.contains("FIREBOLT_AGG_ENGINES"));
     assert!(script.contains("firebolt_aggregate_index_manifest.json"));
     assert!(script.contains("CREATE AGGREGATING INDEX"));
@@ -37,7 +42,10 @@ fn firebolt_aggregate_script_declares_competitor_and_index_workload() {
 fn firebolt_sparse_script_declares_primary_index_pruning_workload() {
     let script = repo_file("benchmarks/firebolt_sparse_pruning.sh");
 
-    assert!(script.contains("FIREBOLT_URL"));
+    assert!(!script.contains(LEGACY_FIREBOLT_REMOTE_ENV));
+    assert!(script.contains("FIREBOLT_CORE_ENDPOINT"));
+    assert!(script.contains("FIREBOLT_CORE_HELPER"));
+    assert!(script.contains("wait"));
     assert!(script.contains("FIREBOLT_SPARSE_ENGINES"));
     assert!(script.contains("firebolt_sparse_pruning_manifest.json"));
     assert!(script.contains("PRIMARY INDEX event_day, tenant_id, bucket"));
@@ -52,7 +60,10 @@ fn firebolt_sparse_script_declares_primary_index_pruning_workload() {
 fn firebolt_vector_script_declares_hnsw_vector_search_workload() {
     let script = repo_file("benchmarks/firebolt_vector_search.sh");
 
-    assert!(script.contains("FIREBOLT_URL"));
+    assert!(!script.contains(LEGACY_FIREBOLT_REMOTE_ENV));
+    assert!(script.contains("FIREBOLT_CORE_ENDPOINT"));
+    assert!(script.contains("FIREBOLT_CORE_HELPER"));
+    assert!(script.contains("wait"));
     assert!(script.contains("FIREBOLT_VECTOR_ENGINES"));
     assert!(script.contains("firebolt_vector_search_manifest.json"));
     assert!(script.contains("benchmarks/vector_ann_hnsw.sh"));
@@ -62,6 +73,24 @@ fn firebolt_vector_script_declares_hnsw_vector_search_workload() {
     assert!(script.contains("VECTOR_SEARCH"));
     assert!(script.contains("firebolt_hnsw"));
     assert!(script.contains("\"status\": \"not_available\""));
+}
+
+#[test]
+fn firebolt_core_local_helper_manages_local_docker_core_only() {
+    let script = repo_file("benchmarks/firebolt_core_local.sh");
+    let docs = repo_file("BENCHMARKS.md");
+
+    for command in ["start", "stop", "status", "wait", "query", "clean"] {
+        assert!(script.contains(command), "missing {command} command");
+    }
+    assert!(script.contains("http://127.0.0.1:3473"));
+    assert!(script.contains("FIREBOLT_CORE_ENDPOINT"));
+    assert!(script.contains("ghcr.io/firebolt-db/firebolt-core"));
+    assert!(script.contains("docker run"));
+    assert!(!script.contains(LEGACY_FIREBOLT_REMOTE_ENV));
+    assert!(docs.contains("closed-source Docker image"));
+    assert!(docs.contains("not vendored"));
+    assert!(!docs.contains(LEGACY_FIREBOLT_REMOTE_ENV));
 }
 
 #[test]
@@ -130,6 +159,7 @@ fn arena_and_certification_expose_firebolt_suite() {
 #[test]
 fn firebolt_aggregate_script_has_valid_bash_syntax() {
     for script_name in [
+        "benchmarks/firebolt_core_local.sh",
         "benchmarks/firebolt_aggregate_index.sh",
         "benchmarks/firebolt_sparse_pruning.sh",
         "benchmarks/firebolt_vector_search.sh",

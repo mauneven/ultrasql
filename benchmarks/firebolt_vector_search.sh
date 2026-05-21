@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Firebolt HNSW vector-search competitor benchmark.
 #
-# Runs UltraSQL's runtime HNSW artifact and, when FIREBOLT_URL points at
-# Firebolt Core/Cloud, records Firebolt VECTOR_SEARCH over a HNSW index.
-# Missing Firebolt or unsupported vector search is not_available, not a claim.
+# Runs UltraSQL's runtime HNSW artifact and local Firebolt Core Docker.
+# Missing Core or unsupported vector search is not_available, not a claim.
 
 set -euo pipefail
 
@@ -15,7 +14,8 @@ OUT_DIR="${FIREBOLT_VECTOR_OUT_DIR:-benchmarks/results/latest}"
 RAW_DIR="${RAW_DIR:-$OUT_DIR/raw}"
 MANIFEST="$OUT_DIR/firebolt_vector_search_manifest.json"
 ENGINES="${FIREBOLT_VECTOR_ENGINES:-ultrasql,firebolt}"
-FIREBOLT_URL="${FIREBOLT_URL:-}"
+FIREBOLT_CORE_ENDPOINT="${FIREBOLT_CORE_ENDPOINT:-http://127.0.0.1:3473}"
+FIREBOLT_CORE_HELPER="${FIREBOLT_CORE_HELPER:-benchmarks/firebolt_core_local.sh}"
 
 case "$PROFILE" in
     smoke)
@@ -129,8 +129,9 @@ doc = {
         "query": "SELECT id FROM VECTOR_SEARCH(INDEX idx, target_vector => ?, top_k => ?, ef_search => ?)",
     },
     "policy": (
-        "No Firebolt vector-search benchmark claim exists until a configured "
-        "FIREBOLT_URL emits measured VECTOR_SEARCH samples from reproducible inputs."
+        "No Firebolt vector-search benchmark claim exists until local "
+        "Firebolt Core Docker emits measured VECTOR_SEARCH samples from "
+        "reproducible inputs."
     ),
 }
 pathlib.Path(out).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
@@ -156,11 +157,12 @@ run_ultrasql() {
 
 run_firebolt() {
     local out="$RAW_DIR/${WORKLOAD_ID}-firebolt_hnsw.json"
-    if [[ -z "$FIREBOLT_URL" ]]; then
-        emit_not_available "firebolt_hnsw" "firebolt_url_missing"
+    if ! FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" "$FIREBOLT_CORE_HELPER" wait >/dev/null; then
+        emit_not_available "firebolt_hnsw" "firebolt_core_unavailable"
         return 2
     fi
 
+    FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" \
     FIREBOLT_ROWS="$ROWS" \
     FIREBOLT_DIMS="$DIMS" \
     FIREBOLT_TOP_K="$TOP_K" \
@@ -188,7 +190,7 @@ import urllib.request
 
 
 MASK = (1 << 64) - 1
-endpoint = os.environ["FIREBOLT_URL"]
+endpoint = os.environ["FIREBOLT_CORE_ENDPOINT"]
 rows = int(os.environ["FIREBOLT_ROWS"])
 dims = int(os.environ["FIREBOLT_DIMS"])
 top_k = int(os.environ["FIREBOLT_TOP_K"])
@@ -292,12 +294,6 @@ def write_not_available(reason, detail=None):
 
 def request(sql: str):
     headers = {"Content-Type": "text/plain; charset=utf-8"}
-    token = os.environ.get("FIREBOLT_TOKEN")
-    auth_header = os.environ.get("FIREBOLT_AUTH_HEADER")
-    if auth_header:
-        headers["Authorization"] = auth_header
-    elif token:
-        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
         formatted_endpoint(),
         data=sql.encode("utf-8"),
@@ -497,7 +493,7 @@ doc = {
     "engines": entries,
     "policy": (
         "No Firebolt vector-search benchmark claim exists unless Firebolt has "
-        "a measured VECTOR_SEARCH artifact from FIREBOLT_URL. Missing Core or "
+        "a measured local Core VECTOR_SEARCH artifact. Missing Core or "
         "unsupported VECTOR_SEARCH is recorded as not_available."
     ),
 }

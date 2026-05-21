@@ -8,7 +8,7 @@
   "warmup": 0,
   "iters": 1,
   "status": "not_available",
-  "reason": "firebolt_url_missing",
+  "reason": "firebolt_core_unavailable",
   "generated_at_unix": 1779343239,
   "required_shape": {
     "ddl": "CREATE AGGREGATING INDEX idx ON fact_events (tenant_id, bucket, SUM(amount), COUNT(*))",
@@ -16,5 +16,5 @@
     "firebolt_plan_marker": "Aggregating Index",
     "http_output_format": "output_format=JSON_Compact"
   },
-  "policy": "No Firebolt aggregate-index benchmark claim exists until a configured FIREBOLT_URL emits measured samples and an EXPLAIN artifact showing Aggregating Index usage."
+  "policy": "No Firebolt aggregate-index benchmark claim exists until a configured local Firebolt Core emits measured samples and an EXPLAIN artifact showing Aggregating Index usage."
 }

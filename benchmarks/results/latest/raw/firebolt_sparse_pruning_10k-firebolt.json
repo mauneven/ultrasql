@@ -8,7 +8,7 @@
   "warmup": 1,
   "iters": 3,
   "status": "not_available",
-  "reason": "firebolt_url_missing",
+  "reason": "firebolt_core_unavailable",
   "generated_at_unix": 1779343240,
   "required_metrics": [
     "median_us",
@@ -20,5 +20,5 @@
     "ddl": "CREATE FACT TABLE fact_events (...) PRIMARY INDEX event_day, tenant_id, bucket WITH (index_granularity = 1024)",
     "query": "SELECT event_day, tenant_id, bucket, SUM(amount), COUNT(*) FROM fact_events WHERE event_day BETWEEN ? AND ? AND tenant_id = 7 GROUP BY event_day, tenant_id, bucket"
   },
-  "policy": "No Firebolt sparse-pruning benchmark claim exists until a configured FIREBOLT_URL emits measured samples and a raw EXPLAIN artifact shows primary-index pruning evidence."
+  "policy": "No Firebolt sparse-pruning benchmark claim exists until a configured local Firebolt Core emits measured samples and a raw EXPLAIN artifact shows primary-index pruning evidence."
 }

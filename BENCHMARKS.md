@@ -144,8 +144,9 @@ The arena does not rank engines or render winner prose. Each suite writes a
 measured artifact, an explicit `not_available` artifact, or a manifest whose
 partial status explains the missing engine, dataset, DSN, or implementation.
 Current smoke artifacts include measured UltraSQL Parquet and object-store
-Parquet range runs. Firebolt entries stay `not_available` unless
-`FIREBOLT_URL` points at a running Firebolt Core endpoint.
+Parquet range runs. Firebolt entries use local Firebolt Core Docker only.
+If Docker is absent, the Core image cannot be pulled, or Core does not
+support the required SQL shape, Firebolt entries stay `not_available`.
 
 ### SQLLogicTest Replay Timing
 
@@ -262,9 +263,16 @@ an absent artifact.
 Firebolt comparison artifacts are recorded by:
 
 ```text
-FIREBOLT_URL="http://127.0.0.1:3473" \
 benchmarks/firebolt_aggregate_index.sh smoke
 ```
+
+The runner auto-starts local Firebolt Core through
+`benchmarks/firebolt_core_local.sh wait` when Docker is available. The
+default internal endpoint is `http://127.0.0.1:3473`; override it only with
+`FIREBOLT_CORE_ENDPOINT` when the local Core container is bound elsewhere.
+Firebolt Core is a closed-source Docker image pulled from Firebolt's
+published container registry. It is not vendored, copied, or redistributed
+by UltraSQL.
 
 The runner targets Firebolt's documented aggregating-index strength:
 repeated dashboard-style filtered `GROUP BY` queries over a fact table.
@@ -275,8 +283,8 @@ creates `CREATE AGGREGATING INDEX ... (tenant_id, bucket, SUM(amount),
 COUNT(*))`, runs `EXPLAIN`, and refuses to mark the Firebolt artifact
 measured unless the plan text reports `Aggregating Index` usage.
 
-Without `FIREBOLT_URL`, Firebolt writes `status: "not_available"` and no
-benchmark claim exists. UltraSQL is measured through
+Without local Firebolt Core, Firebolt writes `status: "not_available"` and
+no benchmark claim exists. UltraSQL is measured through
 `target/release/cross_compare_sql --workload dashboard-aggregate` using
 the same generated data shape. `FIREBOLT_AGG_ROWS`,
 `FIREBOLT_AGG_ITERS`, `FIREBOLT_AGG_WARMUP`, `FIREBOLT_AGG_ENGINES`, and
@@ -289,7 +297,6 @@ manifest is `benchmarks/results/latest/firebolt_aggregate_index_manifest.json`.
 Sparse primary-index pruning artifacts are recorded by:
 
 ```text
-FIREBOLT_URL="http://127.0.0.1:3473" \
 benchmarks/firebolt_sparse_pruning.sh smoke
 ```
 
@@ -299,7 +306,7 @@ range-and-tenant filtered aggregate. The Firebolt leg creates a FACT
 table with `PRIMARY INDEX event_day, tenant_id, bucket` and
 `index_granularity`, runs `EXPLAIN`, and only marks Firebolt measured
 when the raw plan text contains primary-index pruning evidence. Missing
-`FIREBOLT_URL` or missing plan evidence is recorded as
+local Firebolt Core or missing plan evidence is recorded as
 `status: "not_available"`.
 
 UltraSQL is measured through
@@ -329,7 +336,6 @@ same host.
 Firebolt HNSW vector-search artifacts are recorded by:
 
 ```text
-FIREBOLT_URL="http://127.0.0.1:3473" \
 benchmarks/firebolt_vector_search.sh smoke
 ```
 
