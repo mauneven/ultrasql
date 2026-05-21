@@ -120,6 +120,11 @@ pub fn handle_bind(
             "Bind supplied fewer parameters than the prepared statement requires",
         ));
     }
+    if result_formats.iter().any(|fmt| !matches!(*fmt, 0 | 1)) {
+        return Err(ServerError::Unsupported(
+            "Bind result format has unsupported format code",
+        ));
+    }
 
     // Resolve effective OIDs: client-declared (Parse) takes precedence;
     // unset slots fall back to inferred-from-plan OIDs so binary
