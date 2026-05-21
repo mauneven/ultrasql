@@ -1591,6 +1591,19 @@ const HNSW_NEIGHBOR_IDS_PER_OVERFLOW_PAGE: usize =
 
 type HnswNodeId = u64;
 
+fn ann_wal_index_rel(
+    payload: &[u8],
+    context: &str,
+) -> Result<Option<RelationId>, AccessMethodError> {
+    if payload.len() < 8 {
+        return Ok(None);
+    }
+    let raw = u32::from_le_bytes(payload[4..8].try_into().map_err(|_| {
+        AccessMethodError::Storage(format!("{context} WAL index relation decode failed"))
+    })?);
+    Ok(Some(RelationId::new(raw)))
+}
+
 /// Page counts and MVCC-visible node counts for a page-backed HNSW graph.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PageBackedHnswStats {
@@ -1646,6 +1659,7 @@ pub struct PageBackedHnswIndex {
 
 #[derive(Debug)]
 struct PageBackedHnswStorage {
+    valid: bool,
     pages: BTreeMap<BlockNumber, HnswPersistentPage>,
     meta: HnswMetaPage,
     free_list: HnswFreeListPage,
@@ -1877,7 +1891,19 @@ impl PageBackedHnswIndex {
     /// Whether the graph has at least one live node available for search.
     #[must_use]
     pub fn is_available(&self) -> bool {
-        self.page_stats().live_nodes > 0
+        let storage = self.storage.lock();
+        storage.valid && storage.meta.live_nodes > 0
+    }
+
+    /// Whether recovery still trusts this index relation.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.storage.lock().valid
+    }
+
+    /// Mark this index unavailable after corrupt or incomplete recovery.
+    pub fn invalidate(&self) {
+        self.storage.lock().valid = false;
     }
 
     /// Return the physical ANN payload family used by new entries.
@@ -1925,6 +1951,9 @@ impl PageBackedHnswIndex {
             return Ok(Vec::new());
         }
         let storage = self.storage.lock();
+        if !storage.valid {
+            return Ok(Vec::new());
+        }
         let mut hits = Vec::with_capacity(storage.meta.live_nodes.min(k.max(self.ef_search)));
         for node_id in storage.node_to_block.keys() {
             let Some(node) = storage.node_page(*node_id)? else {
@@ -1997,8 +2026,11 @@ impl PageBackedHnswIndex {
         if payload.index_rel != self.index_rel {
             return Ok(());
         }
-        if self.storage.lock().redo_covered(lsn) {
-            return Ok(());
+        {
+            let storage = self.storage.lock();
+            if !storage.valid || storage.redo_covered(lsn) {
+                return Ok(());
+            }
         }
         match payload.op {
             HnswOpKind::Insert => {
@@ -2027,6 +2059,11 @@ impl PageBackedHnswIndex {
         record: &WalRecord,
     ) -> Result<(), AccessMethodError> {
         if record.header.record_type != RecordType::HnswOp {
+            return Ok(());
+        }
+        if let Some(index_rel) = ann_wal_index_rel(&record.payload, "hnsw")?
+            && index_rel != self.index_rel
+        {
             return Ok(());
         }
         let payload = HnswOpPayload::decode(&record.payload)
@@ -2218,6 +2255,7 @@ impl PageBackedHnswStorage {
         pages.insert(meta_block, HnswPersistentPage::Meta(meta.clone()));
         pages.insert(free_block, HnswPersistentPage::FreeList(free_list.clone()));
         Self {
+            valid: true,
             pages,
             meta,
             free_list,
@@ -2292,6 +2330,7 @@ impl PageBackedHnswStorage {
         }
 
         let mut storage = Self {
+            valid: true,
             pages,
             meta,
             free_list,
@@ -3255,6 +3294,7 @@ pub struct PageBackedIvfFlatIndex {
 
 #[derive(Debug)]
 struct PageBackedIvfFlatStorage {
+    valid: bool,
     pages: BTreeMap<BlockNumber, IvfFlatPersistentPage>,
     entries: Vec<IvfFlatEntry>,
     centroids: Vec<Vec<f32>>,
@@ -3501,7 +3541,21 @@ impl PageBackedIvfFlatIndex {
     /// Return whether the page-backed IVFFlat lists can currently be used.
     #[must_use]
     pub fn is_available(&self) -> bool {
-        self.live_len() > 0 && self.centroid_count() > 0
+        let storage = self.storage.lock();
+        storage.valid
+            && storage.entries.iter().any(|entry| !entry.deleted)
+            && !storage.centroids.is_empty()
+    }
+
+    /// Whether recovery still trusts this index relation.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.storage.lock().valid
+    }
+
+    /// Mark this index unavailable after corrupt or incomplete recovery.
+    pub fn invalidate(&self) {
+        self.storage.lock().valid = false;
     }
 
     /// Return the physical ANN payload family used by new entries.
@@ -3603,7 +3657,7 @@ impl PageBackedIvfFlatIndex {
             return Ok(Vec::new());
         }
         let storage = self.storage.lock();
-        if storage.centroids.is_empty() {
+        if !storage.valid || storage.centroids.is_empty() {
             return Ok(Vec::new());
         }
         let list_ids = nearest_vectors(&storage.centroids, probe, self.metric, self.probes);
@@ -3696,6 +3750,9 @@ impl PageBackedIvfFlatIndex {
         if payload.index_rel != self.index_rel {
             return Ok(());
         }
+        if !self.storage.lock().valid {
+            return Ok(());
+        }
         let list_id = usize::try_from(payload.list_id).map_err(|_| {
             AccessMethodError::Storage("page-backed ivfflat list_id overflow".to_owned())
         })?;
@@ -3731,6 +3788,11 @@ impl PageBackedIvfFlatIndex {
         record: &WalRecord,
     ) -> Result<(), AccessMethodError> {
         if record.header.record_type != RecordType::IvfFlatOp {
+            return Ok(());
+        }
+        if let Some(index_rel) = ann_wal_index_rel(&record.payload, "ivfflat")?
+            && index_rel != self.index_rel
+        {
             return Ok(());
         }
         let payload = IvfFlatOpPayload::decode(&record.payload)
@@ -3904,6 +3966,7 @@ impl PageBackedIvfFlatStorage {
             payload_kind,
         };
         let mut storage = Self {
+            valid: true,
             pages: BTreeMap::new(),
             entries: Vec::new(),
             centroids: Vec::new(),
@@ -4349,11 +4412,12 @@ impl AccessMethod for BrinIndex {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use ultrasql_core::{BlockNumber, Lsn, PageId, RelationId, TupleId, Xid};
     use ultrasql_wal::payload::{
         HashOpKind, HashOpPayload, HnswOpKind, HnswOpPayload, IvfFlatOpKind, IvfFlatOpPayload,
     };
-    use ultrasql_wal::record::RecordType;
+    use ultrasql_wal::record::{RecordType, WalRecord};
 
     use super::*;
     use crate::wal_sink::test_support::InMemoryWalSink;
@@ -4916,6 +4980,26 @@ mod tests {
         let hits = recovered.search(&[0.0, 0.0, 0.0], 2).expect("search");
         let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
         assert_eq!(tids, vec![tid(1, 0), tid(1, 1)]);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn page_backed_hnsw_rejects_random_wal_payloads_without_panicking(
+            payload in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..128_usize),
+        ) {
+            let index = PageBackedHnswIndex::new(RelationId::new(8805), 3, HnswMetric::L2, 4, 16)
+                .expect("hnsw config");
+            let record = WalRecord::new(RecordType::HnswOp, Xid::new(15), Lsn::ZERO, 0, payload);
+
+            let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                index.apply_wal_record(&record)
+            }));
+
+            prop_assert!(replay.is_ok(), "HNSW WAL replay panicked");
+            if let Ok(Ok(())) = replay {
+                prop_assert!(index.page_stats().live_nodes <= 1);
+            }
+        }
     }
 
     #[test]

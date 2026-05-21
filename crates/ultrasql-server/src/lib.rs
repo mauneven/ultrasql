@@ -2270,16 +2270,30 @@ impl Server {
         ultrasql_wal::recover(&wal_dir, |record| {
             if record.header.record_type == RecordType::HnswOp {
                 for hnsw in hnsw_indexes {
-                    hnsw.apply_wal_record(record).map_err(|e| {
-                        ultrasql_wal::RecoveryError::Applier(format!("replay HNSW WAL: {e}"))
-                    })?;
+                    if !hnsw.is_valid() {
+                        continue;
+                    }
+                    if let Err(e) = hnsw.apply_wal_record(record) {
+                        hnsw.invalidate();
+                        tracing::warn!(
+                            error = %e,
+                            "HNSW WAL replay failed; marking index unavailable"
+                        );
+                    }
                 }
             }
             if record.header.record_type == RecordType::IvfFlatOp {
                 for ivfflat in ivfflat_indexes {
-                    ivfflat.apply_wal_record(record).map_err(|e| {
-                        ultrasql_wal::RecoveryError::Applier(format!("replay IVFFlat WAL: {e}"))
-                    })?;
+                    if !ivfflat.is_valid() {
+                        continue;
+                    }
+                    if let Err(e) = ivfflat.apply_wal_record(record) {
+                        ivfflat.invalidate();
+                        tracing::warn!(
+                            error = %e,
+                            "IVFFlat WAL replay failed; marking index unavailable"
+                        );
+                    }
                 }
             }
             Ok(())

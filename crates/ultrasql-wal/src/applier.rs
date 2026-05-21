@@ -147,19 +147,38 @@ pub trait HeapTarget: Send + Sync {
         Ok(())
     }
 
+    /// Return whether this target wants decoded HNSW vector-index records.
+    ///
+    /// Heap-only recovery targets keep this false so corrupt vector-index WAL
+    /// cannot block heap recovery before the vector-index replay pass decides
+    /// whether to trust or disable the index.
+    fn wants_hnsw_op(&self) -> bool {
+        false
+    }
+
     /// Apply an HNSW vector-index graph mutation record.
     ///
-    /// Heap-only recovery targets may ignore these records, so the default is
-    /// a no-op. Storage targets that own HNSW graph pages should override this.
+    /// Called only when [`Self::wants_hnsw_op`] returns true. This lets
+    /// heap-only recovery skip decoding vector-index payloads whose index will
+    /// be validated by the vector-index recovery pass.
     fn apply_hnsw_op(&self, payload: &HnswOpPayload) -> Result<(), ApplyError> {
         let _ = payload;
         Ok(())
     }
 
+    /// Return whether this target wants decoded IVFFlat vector-index records.
+    ///
+    /// Heap-only recovery targets keep this false so corrupt vector-index WAL
+    /// cannot block heap recovery before the vector-index replay pass decides
+    /// whether to trust or disable the index.
+    fn wants_ivfflat_op(&self) -> bool {
+        false
+    }
+
     /// Apply an IVFFlat vector-index inverted-list mutation record.
     ///
-    /// Heap-only recovery targets may ignore these records, so the default is
-    /// a no-op. Storage targets that own IVFFlat pages should override this.
+    /// Called only when [`Self::wants_ivfflat_op`] returns true. Heap-only
+    /// recovery leaves payload validation to the vector-index recovery pass.
     fn apply_ivfflat_op(&self, payload: &IvfFlatOpPayload) -> Result<(), ApplyError> {
         let _ = payload;
         Ok(())
@@ -234,8 +253,20 @@ pub fn dispatch_record(target: &dyn HeapTarget, record: &WalRecord) -> Result<()
         RecordType::BTreeOp => target.apply_btree_op(&BTreeOpPayload::decode(bytes)?),
         RecordType::SequenceOp => target.apply_sequence_op(&SequenceOpPayload::decode(bytes)?),
         RecordType::HashOp => target.apply_hash_op(&HashOpPayload::decode(bytes)?),
-        RecordType::HnswOp => target.apply_hnsw_op(&HnswOpPayload::decode(bytes)?),
-        RecordType::IvfFlatOp => target.apply_ivfflat_op(&IvfFlatOpPayload::decode(bytes)?),
+        RecordType::HnswOp => {
+            if target.wants_hnsw_op() {
+                target.apply_hnsw_op(&HnswOpPayload::decode(bytes)?)
+            } else {
+                Ok(())
+            }
+        }
+        RecordType::IvfFlatOp => {
+            if target.wants_ivfflat_op() {
+                target.apply_ivfflat_op(&IvfFlatOpPayload::decode(bytes)?)
+            } else {
+                Ok(())
+            }
+        }
         RecordType::Nop => Ok(()),
     }
 }

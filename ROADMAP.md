@@ -1768,9 +1768,12 @@ mismatch, and wire-visible round trips. HNSW and IVFFlat indexes exist behind
 index objects in the SQL path, and have restart round trips that verify
 `EXPLAIN ANALYZE` still selects `page-backed hnsw` / `page-backed ivfflat`
 after server restart. Remaining durability work is larger-scale recovery
-certification, fuzz/property coverage, corruption/torn-write hardening, and
+certification, broader fuzz/property coverage, vacuum/rebuild stress, and
 public performance artifacts across build/search/update/delete/restart
-workloads.
+workloads. Crash-during-build SQL tests now cover HNSW and IVFFlat exact-scan
+fallback after truncated index-build WAL, and corrupt vector-index WAL replay
+marks the affected ANN index unavailable instead of blocking restart or
+returning wrong results.
 
 Production target remains the pgvector-shaped SQL surface plus storage-grade
 indexes: `vector(n)`, distance operators, exact `ORDER BY distance LIMIT k`,
@@ -1785,10 +1788,10 @@ same host.
 | `vector(n)` / `halfvec(n)` / `sparsevec` / `bitvec` values | ✅ typed literals, casts, `CREATE TABLE` | ✅ dimension/type checks | ✅ eval + row flow | ✅ catalog + row codec | ⚠️ heap row path only; restart certification still open | ✅ text output | ✅ parser/core/server round trips | ⚠️ exact top-k smoke exists; full cert open |
 | pgvector distance ops and functions | ✅ `<->`, `<#>`, `<=>`, `<+>` | ✅ unsupported vector comparisons fail explicitly | ✅ L2, cosine, inner product/dot, L1, norm, dims | n/a | n/a | ✅ result values | ✅ scalar/runtime tests | ⚠️ exact top-k artifacts only |
 | Exact vector top-k | n/a | ⚠️ shape recognized through `ORDER BY distance LIMIT` | ⚠️ top-k path exists; full-sort avoidance hardening open | n/a | n/a | n/a | ✅ server round trips | ⚠️ `vector_topk_exact` smoke, full pgvector cert open |
-| Runtime HNSW | ✅ `CREATE INDEX USING hnsw` | ✅ vector opclasses checked | ✅ ANN scan + exact fallback path | ✅ page-backed graph relation in SQL path | ⚠️ restart smoke exists; large-scale recovery cert/fuzz open | n/a | ✅ insert/update/delete/vacuum + SQL restart tests | ✅ HNSW recall/latency smoke |
-| Production HNSW | ✅ SQL surface exists | ✅ SQL surface exists | ✅ planner can select page-backed HNSW | ✅ meta/node/overflow/free-list page layout wired | ⚠️ restart tests exist; crash/replay fuzz, torn-write, vacuum/rebuild cert open | n/a | ✅ page arena/replay/LSN + SQL restart tests | ⚠️ smoke only; large perf cert open |
-| Runtime IVFFlat | ✅ `CREATE INDEX USING ivfflat` | ✅ `lists`/`probes` checked | ✅ centroid/list scan + exact rerank | ✅ page-backed centroid/list relation in SQL path | ⚠️ restart smoke exists; large-scale recovery cert/fuzz open | n/a | ✅ DML/vacuum + SQL restart tests | ❌ certification open |
-| Production IVFFlat | ✅ SQL surface exists | ✅ SQL surface exists | ✅ planner can select page-backed IVFFlat | ✅ page-backed centroids/lists wired | ⚠️ restart tests exist; crash/replay fuzz, torn-write, compaction cert open | n/a | ✅ SQL restart tests | ❌ certification open |
+| Runtime HNSW | ✅ `CREATE INDEX USING hnsw` | ✅ vector opclasses checked | ✅ ANN scan + exact fallback path | ✅ page-backed graph relation in SQL path | ⚠️ restart + crash/corrupt-WAL tests exist; large-scale recovery cert open | n/a | ✅ insert/update/delete/vacuum, SQL restart, crash, corrupt-WAL tests | ✅ HNSW recall/latency smoke |
+| Production HNSW | ✅ SQL surface exists | ✅ SQL surface exists | ✅ planner can select page-backed HNSW | ✅ meta/node/overflow/free-list page layout wired | ⚠️ crash/corrupt replay and HNSW WAL fuzz exist; torn-write/vacuum/rebuild cert open | n/a | ✅ page arena/replay/LSN, SQL restart/crash/corrupt-WAL tests | ⚠️ smoke only; large perf cert open |
+| Runtime IVFFlat | ✅ `CREATE INDEX USING ivfflat` | ✅ `lists`/`probes` checked | ✅ centroid/list scan + exact rerank | ✅ page-backed centroid/list relation in SQL path | ⚠️ restart + crash/corrupt-WAL tests exist; large-scale recovery cert open | n/a | ✅ DML/vacuum, SQL restart/crash/corrupt-WAL tests | ❌ certification open |
+| Production IVFFlat | ✅ SQL surface exists | ✅ SQL surface exists | ✅ planner can select page-backed IVFFlat | ✅ page-backed centroids/lists wired | ⚠️ crash/corrupt replay tests exist; IVFFlat WAL fuzz, torn-write, compaction cert open | n/a | ✅ SQL restart/crash/corrupt-WAL tests | ❌ certification open |
 | RAG primitive schemas/helpers | n/a | n/a | ✅ normal SQL helpers + tenant RLS predicate injection | ✅ ordinary user tables | ⚠️ tenant RLS sidecar is same-process; restart policy persistence open | n/a | ✅ catalog/server helper tests + RLS wire round trip | ⚠️ RAG quality smoke + tenant RLS tests exist; full cert open |
 | CSV table functions | ✅ `read_csv`, globs, arrays, file literals | ✅ function scan + projection/filter pushdown shapes | ⚠️ external wrapper streams child; CSV reader still stores row buffers | file/object bytes only | n/a | ✅ query results | ✅ local/object/glob/projection/filter tests | ⚠️ CSV gauntlet smoke measured for UltraSQL/DuckDB; ClickHouse unavailable locally; full cert open |
 | Parquet table functions | ✅ `read_parquet`, globs, file literals | ✅ projection/predicate pushdown shapes | ✅ row-group workers yield batches lazily; no upfront full-file batch buffer | ✅ local files plus object range footer/column reads | n/a | ✅ query results | ✅ projection/filter/object-range/row-group-worker/EXPLAIN tests | ⚠️ UltraSQL arena smoke measured; cross-engine cert open |
