@@ -104,6 +104,26 @@ fn security_ethics_audit_lists_verifiable_release_checks() {
 }
 
 #[test]
+fn committed_slt_speed_artifacts_do_not_publish_winners() {
+    for path in [
+        "benchmarks/results/latest/slt_speed_comparison.json",
+        "benchmarks/results/latest/slt_authored_speed_comparison.json",
+        "benchmarks/results/latest/slt_hydromatic_smoke_comparison.json",
+    ] {
+        let artifact = repo_file(path);
+
+        assert!(
+            !artifact.contains("\"winner\""),
+            "{path} must not publish a winner field"
+        );
+        assert!(
+            artifact.contains("\"policy\""),
+            "{path} must record a no-claim policy"
+        );
+    }
+}
+
+#[test]
 fn ci_split_matches_release_policy() {
     let ci = repo_file(".github/workflows/ci.yml");
     let bench = repo_file(".github/workflows/bench.yml");
