@@ -1778,13 +1778,13 @@ and benchmark certification against PostgreSQL + pgvector on the same host.
 | pgvector distance ops and functions | ✅ `<->`, `<#>`, `<=>`, `<+>` | ✅ unsupported vector comparisons fail explicitly | ✅ L2, cosine, inner product/dot, L1, norm, dims | n/a | n/a | ✅ result values | ✅ scalar/runtime tests | ⚠️ exact top-k artifacts only |
 | Exact vector top-k | n/a | ⚠️ shape recognized through `ORDER BY distance LIMIT` | ⚠️ top-k path exists; full-sort avoidance hardening open | n/a | n/a | n/a | ✅ server round trips | ⚠️ `vector_topk_exact` smoke, full pgvector cert open |
 | Runtime HNSW | ✅ `CREATE INDEX USING hnsw` | ✅ vector opclasses checked | ✅ in-memory ANN scan + exact fallback path | ⚠️ runtime graph, not pages | ⚠️ mutation WAL payloads exist; redo into pages open | n/a | ✅ insert/update/delete/vacuum tests | ✅ HNSW recall/latency smoke |
-| Production HNSW | ✅ SQL surface exists | ✅ SQL surface exists | ⚠️ planner can use runtime graph | ❌ page-backed graph open | ❌ crash-safe replay/rebuild open | n/a | ❌ restart/recovery tests open | ❌ certification open |
+| Production HNSW | ✅ SQL surface exists | ✅ SQL surface exists | ⚠️ planner can use runtime graph | ⚠️ page-backed arena has meta/node/overflow/free-list pages; relation wiring open | ⚠️ logical replay + page-image LSN redo-skip tests; restart recovery open | n/a | ⚠️ page arena/replay/LSN tests; restart integration open | ❌ certification open |
 | Runtime IVFFlat | ✅ `CREATE INDEX USING ivfflat` | ✅ `lists`/`probes` checked | ✅ centroid/list scan + exact rerank | ⚠️ runtime lists, not pages | ❌ no page redo/recovery | n/a | ✅ DML/vacuum tests | ❌ certification open |
 | Production IVFFlat | ✅ SQL surface exists | ✅ SQL surface exists | ⚠️ runtime path exists | ❌ page-backed centroids/lists open | ❌ bulk-build/insert/tombstone replay open | n/a | ❌ restart/recovery tests open | ❌ certification open |
 | RAG primitive schemas/helpers | n/a | n/a | ⚠️ normal SQL helper patterns | ✅ ordinary user tables | ⚠️ inherits table durability; no RLS guarantee | n/a | ✅ catalog/server helper tests | ❌ RAG quality/tenant cert open |
-| CSV table functions | ✅ `read_csv`, globs, arrays, file literals | ✅ function scan | ⚠️ external wrapper streams child; CSV reader still stores rows | file/object bytes only | n/a | ✅ query results | ✅ local/object/glob tests | ⚠️ CSV gauntlet runner; latest artifacts sparse |
-| Parquet table functions | ✅ `read_parquet`, globs, file literals | ✅ projection/predicate pushdown shapes | ⚠️ external wrapper streams child; Parquet scan still buffers batches | file/object bytes only | n/a | ✅ query results | ✅ projection/filter/object tests | ⚠️ smoke artifacts sparse |
-| Object-store scans | ✅ `s3://`, `r2://`, `gs://` path specs | ✅ function scan paths | ⚠️ whole-object reads | ❌ no range reader | n/a | n/a | ✅ mocked object tests | ❌ lakehouse cert open |
+| CSV table functions | ✅ `read_csv`, globs, arrays, file literals | ✅ function scan + projection/filter pushdown shapes | ⚠️ external wrapper streams child; CSV reader still stores row buffers | file/object bytes only | n/a | ✅ query results | ✅ local/object/glob/projection/filter tests | ⚠️ CSV gauntlet runner; full cert open |
+| Parquet table functions | ✅ `read_parquet`, globs, file literals | ✅ projection/predicate pushdown shapes | ✅ row-group workers yield batches lazily; no upfront full-file batch buffer | ✅ local files plus object range footer/column reads | n/a | ✅ query results | ✅ projection/filter/object-range/row-group-worker/EXPLAIN tests | ⚠️ UltraSQL arena smoke artifact; cross-engine cert open |
+| Object-store scans | ✅ `s3://`, `r2://`, `gs://` path specs | ✅ function scan paths | ⚠️ Parquet uses ranges; CSV/JSON paths still use whole-object reads | ✅ `read_object_range` + metadata APIs exist | n/a | n/a | ✅ mocked range/object tests + Parquet range test | ❌ lakehouse cert open |
 | Iceberg read scan | ✅ `read_iceberg` / `iceberg_scan` | ✅ function scan | ⚠️ metadata planner feeds Parquet scan | metadata-only planner | n/a | ✅ query results | ✅ current snapshot tests | ❌ deletes/time-travel/catalog cert open |
 | Arrow bridge | ✅ `read_arrow` | ✅ function scan | ⚠️ buffered IPC file batches | IPC bytes only | n/a | ✅ query results | ✅ basic type tests | ❌ Flight/type-coverage cert open |
 
@@ -1807,11 +1807,11 @@ and benchmark certification against PostgreSQL + pgvector on the same host.
   methods, DML maintenance, tombstones, VACUUM compaction, opclasses, and
   exact rerank paths exist. This is useful as a correctness oracle and first
   planner target, but it is not yet a production index storage layer.
-- [ ] **Production ANN slice** — implement page-backed HNSW and IVFFlat
-  relations with meta pages, graph/list pages, overflow pages, free lists,
-  redo-idempotent WAL, restart recovery, deletes, VACUUM compaction, rebuild,
-  CREATE INDEX CONCURRENTLY behavior, filtered-query fallback/iterative scan
-  policy, and recall-vs-latency tests against exact scan.
+- [ ] **Production ANN slice** — continue from the page-backed HNSW arena and
+  redo-idempotent LSN tests into buffer-pool relation wiring, restart
+  recovery, deletes, VACUUM compaction, rebuild, CREATE INDEX CONCURRENTLY
+  behavior, filtered-query fallback/iterative scan policy, IVFFlat page
+  storage, and recall-vs-latency tests against exact scan.
 - [ ] **RAG guarantee slice** — RAG storage primitives and helper SQL exist as
   ordinary SQL/table patterns. Tenant-safe RAG is not a DB guarantee until
   row-level security policy catalog/enforcement lands and tenant predicates
