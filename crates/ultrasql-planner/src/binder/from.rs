@@ -15,17 +15,17 @@ use parquet::file::reader::{ChunkReader, Length};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use ultrasql_core::{
     DataType, Field, Schema, Value,
-    csv::{
-        CsvParseOptions, parse_csv_records_with_options, read_csv_data_from_text,
-        read_csv_header_from_specs,
-    },
+    csv::{CsvParseOptions, parse_csv_records_with_options, read_csv_header_from_specs},
 };
 use ultrasql_iceberg::read_iceberg_schema;
 use ultrasql_objectstore::{
     ObjectLocation, expand_object_store_specs, is_object_store_uri, read_first_object_bytes,
-    read_object_bytes, read_object_range, read_object_range_with_metadata,
+    read_object_range, read_object_range_with_metadata,
 };
 use ultrasql_parser::ast::{JoinCondition, JoinOp, JsonTableColumnKind, TableRef, TypeName};
+
+const READ_CSV_HEADER_SAMPLE_BYTES: u64 = 64 * 1024;
+const JSON_STREAM_CHUNK_BYTES: u64 = 64 * 1024;
 
 use super::ddl::resolve_type_name;
 use super::{
@@ -438,9 +438,7 @@ fn bind_json_table_function(
         )));
     }
     let path_specs = read_file_path_specs(function_name, &bound_args[0])?;
-    let sources = read_external_sources(function_name, &path_specs)?;
-    let rows = read_json_rows(function_name, kind, &sources)?;
-    let fields = infer_json_fields(function_name, &rows)?;
+    let fields = infer_json_fields_from_path_specs(function_name, kind, &path_specs)?;
     let schema = Schema::new(fields.clone())
         .map_err(|err| PlanError::TypeMismatch(format!("{function_name} schema: {err}")))?;
     let from_scope = scope_entries(qualifier, fields);
@@ -789,120 +787,363 @@ fn read_file_path_specs(function_name: &str, arg: &ScalarExpr) -> Result<Vec<Str
     }
 }
 
+type JsonObject = JsonMap<String, JsonValue>;
+
 #[derive(Clone, Debug)]
-struct ExternalBytes {
-    display: String,
-    bytes: Vec<u8>,
+enum PlannerStreamSpec {
+    Local(PathBuf),
+    Object(ObjectLocation),
 }
 
-fn read_external_sources(
+impl PlannerStreamSpec {
+    fn display(&self) -> String {
+        match self {
+            Self::Local(path) => path.display().to_string(),
+            Self::Object(object) => object.display_uri(),
+        }
+    }
+}
+
+fn planner_stream_specs(
     function_name: &str,
     path_specs: &[String],
-) -> Result<Vec<ExternalBytes>, PlanError> {
+) -> Result<Vec<PlannerStreamSpec>, PlanError> {
     if path_specs_use_object_store(function_name, path_specs)? {
         let objects = expand_object_store_specs(path_specs)
             .map_err(|err| PlanError::TypeMismatch(format!("{function_name}: {err}")))?;
-        return objects
-            .into_iter()
-            .map(|object| {
-                let display = object.display_uri();
-                let bytes = read_object_bytes(&object)
-                    .map_err(|err| PlanError::TypeMismatch(format!("{function_name}: {err}")))?;
-                Ok(ExternalBytes { display, bytes })
-            })
-            .collect();
+        return Ok(objects.into_iter().map(PlannerStreamSpec::Object).collect());
     }
-
-    expand_file_path_specs(function_name, path_specs)?
+    Ok(expand_file_path_specs(function_name, path_specs)?
         .into_iter()
-        .map(|path| {
-            let display = path.display().to_string();
-            let bytes = fs::read(&path).map_err(|err| {
-                PlanError::TypeMismatch(format!("{function_name} cannot read {display}: {err}"))
-            })?;
-            Ok(ExternalBytes { display, bytes })
-        })
-        .collect()
+        .map(PlannerStreamSpec::Local)
+        .collect())
 }
 
-type JsonObject = JsonMap<String, JsonValue>;
+fn open_planner_stream(
+    function_name: &str,
+    source: &PlannerStreamSpec,
+) -> Result<Box<dyn Read>, PlanError> {
+    match source {
+        PlannerStreamSpec::Local(path) => {
+            let display = path.display();
+            let file = File::open(path).map_err(|err| {
+                PlanError::TypeMismatch(format!("{function_name} cannot open {display}: {err}"))
+            })?;
+            Ok(Box::new(file))
+        }
+        PlannerStreamSpec::Object(object) => {
+            Ok(Box::new(PlannerObjectRangeReader::new(object.clone())))
+        }
+    }
+}
 
-fn read_json_rows(
+struct PlannerObjectRangeReader {
+    location: ObjectLocation,
+    display: String,
+    pos: u64,
+    object_size: Option<u64>,
+    buffer: Vec<u8>,
+    cursor: usize,
+    eof: bool,
+}
+
+impl PlannerObjectRangeReader {
+    fn new(location: ObjectLocation) -> Self {
+        let display = location.display_uri();
+        Self {
+            location,
+            display,
+            pos: 0,
+            object_size: None,
+            buffer: Vec::new(),
+            cursor: 0,
+            eof: false,
+        }
+    }
+
+    fn refill(&mut self) -> io::Result<()> {
+        if self.cursor < self.buffer.len() || self.eof {
+            return Ok(());
+        }
+        self.buffer.clear();
+        self.cursor = 0;
+        let requested = self.object_size.map_or(JSON_STREAM_CHUNK_BYTES, |size| {
+            size.saturating_sub(self.pos).min(JSON_STREAM_CHUNK_BYTES)
+        });
+        if requested == 0 {
+            self.eof = true;
+            return Ok(());
+        }
+        let range = read_object_range_with_metadata(&self.location, self.pos, requested)
+            .map_err(|err| io::Error::other(format!("{}: {err}", self.display)))?;
+        if let Some(size) = range.object_size() {
+            self.object_size = Some(size);
+        }
+        let bytes = range.into_bytes();
+        if bytes.is_empty() {
+            self.eof = true;
+            return Ok(());
+        }
+        let read_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        self.pos = self.pos.saturating_add(read_len);
+        if self.object_size.is_some_and(|size| self.pos >= size)
+            || self.object_size.is_none() && read_len < requested
+        {
+            self.eof = true;
+        }
+        self.buffer = bytes;
+        Ok(())
+    }
+}
+
+impl Read for PlannerObjectRangeReader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        self.refill()?;
+        let available = self.buffer.len().saturating_sub(self.cursor);
+        if available == 0 {
+            return Ok(0);
+        }
+        let n = available.min(out.len());
+        out[..n].copy_from_slice(&self.buffer[self.cursor..self.cursor + n]);
+        self.cursor += n;
+        Ok(n)
+    }
+}
+
+fn infer_json_fields_from_path_specs(
     function_name: &str,
     kind: JsonInputKind,
-    sources: &[ExternalBytes],
-) -> Result<Vec<JsonObject>, PlanError> {
-    let mut rows = Vec::new();
+    path_specs: &[String],
+) -> Result<Vec<Field>, PlanError> {
+    let sources = planner_stream_specs(function_name, path_specs)?;
+    let mut acc = JsonFieldAccumulator::default();
     for source in sources {
-        let text = String::from_utf8(source.bytes.clone()).map_err(|err| {
-            PlanError::TypeMismatch(format!(
-                "{function_name} cannot decode {} as UTF-8: {err}",
-                source.display
-            ))
-        })?;
-        match kind {
-            JsonInputKind::Json => {
-                rows.extend(parse_json_document(function_name, &source.display, &text)?);
-            }
-            JsonInputKind::Ndjson => {
-                rows.extend(parse_ndjson_document(
-                    function_name,
-                    &source.display,
-                    &text,
-                )?);
-            }
+        let display = source.display();
+        let mut reader =
+            PlannerJsonRecordReader::new(kind, open_planner_stream(function_name, &source)?);
+        while let Some((row_number, text)) = reader.next_text(function_name, &display)? {
+            let value = serde_json::from_str::<JsonValue>(&text).map_err(|err| {
+                PlanError::TypeMismatch(format!(
+                    "{function_name} parse {display} row {row_number}: {err}"
+                ))
+            })?;
+            let row = json_value_to_object(function_name, &display, row_number, value)?;
+            acc.observe(function_name, &row)?;
         }
     }
-    Ok(rows)
+    Ok(acc.finish())
 }
 
-fn parse_json_document(
-    function_name: &str,
-    display: &str,
-    text: &str,
-) -> Result<Vec<JsonObject>, PlanError> {
-    let value = serde_json::from_str::<JsonValue>(text).map_err(|err| {
-        PlanError::TypeMismatch(format!("{function_name} parse {display}: {err}"))
-    })?;
-    match value {
-        JsonValue::Array(values) => values
-            .into_iter()
-            .enumerate()
-            .map(|(idx, value)| json_value_to_object(function_name, display, idx + 1, value))
-            .collect(),
-        JsonValue::Object(object) => Ok(vec![object]),
-        _ => Err(PlanError::TypeMismatch(format!(
-            "{function_name} expected object or array of objects in {display}"
-        ))),
+enum PlannerJsonRecordReader {
+    Ndjson {
+        reader: Box<dyn Read>,
+        line_number: usize,
+    },
+    Json {
+        reader: Box<dyn Read>,
+        state: PlannerJsonDocumentState,
+        row_number: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannerJsonDocumentState {
+    Start,
+    Array,
+    Done,
+}
+
+impl PlannerJsonRecordReader {
+    fn new(kind: JsonInputKind, reader: Box<dyn Read>) -> Self {
+        match kind {
+            JsonInputKind::Ndjson => Self::Ndjson {
+                reader,
+                line_number: 0,
+            },
+            JsonInputKind::Json => Self::Json {
+                reader,
+                state: PlannerJsonDocumentState::Start,
+                row_number: 0,
+            },
+        }
+    }
+
+    fn next_text(
+        &mut self,
+        function_name: &str,
+        display: &str,
+    ) -> Result<Option<(usize, String)>, PlanError> {
+        match self {
+            Self::Ndjson {
+                reader,
+                line_number,
+            } => planner_next_ndjson_text(reader.as_mut(), line_number, function_name, display),
+            Self::Json {
+                reader,
+                state,
+                row_number,
+            } => planner_next_json_text(reader.as_mut(), state, row_number, function_name, display),
+        }
     }
 }
 
-fn parse_ndjson_document(
+fn planner_next_ndjson_text(
+    reader: &mut dyn Read,
+    line_number: &mut usize,
     function_name: &str,
     display: &str,
-    text: &str,
-) -> Result<Vec<JsonObject>, PlanError> {
-    let mut rows = Vec::new();
-    for (idx, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
+) -> Result<Option<(usize, String)>, PlanError> {
+    let mut bytes = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        bytes.clear();
+        loop {
+            let read = reader.read(&mut byte).map_err(|err| {
+                PlanError::TypeMismatch(format!("{function_name} cannot read {display}: {err}"))
+            })?;
+            if read == 0 {
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            bytes.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        *line_number = line_number.saturating_add(1);
+        let text = String::from_utf8(bytes.clone()).map_err(|err| {
+            PlanError::TypeMismatch(format!("{function_name} cannot decode {display}: {err}"))
+        })?;
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some((*line_number, trimmed.to_owned())));
+        }
+    }
+}
+
+fn planner_next_json_text(
+    reader: &mut dyn Read,
+    state: &mut PlannerJsonDocumentState,
+    row_number: &mut usize,
+    function_name: &str,
+    display: &str,
+) -> Result<Option<(usize, String)>, PlanError> {
+    loop {
+        match state {
+            PlannerJsonDocumentState::Start => {
+                let Some(byte) = planner_read_non_ws_byte(reader, function_name, display)? else {
+                    return Ok(None);
+                };
+                match byte {
+                    b'{' => {
+                        *state = PlannerJsonDocumentState::Done;
+                        *row_number = 1;
+                        return planner_read_json_container(reader, byte, function_name, display)
+                            .map(|text| Some((*row_number, text)));
+                    }
+                    b'[' => *state = PlannerJsonDocumentState::Array,
+                    other => {
+                        return Err(PlanError::TypeMismatch(format!(
+                            "{function_name} expected object or array of objects in {display}, got byte {other}"
+                        )));
+                    }
+                }
+            }
+            PlannerJsonDocumentState::Array => {
+                let Some(byte) = planner_read_non_ws_byte(reader, function_name, display)? else {
+                    return Err(PlanError::TypeMismatch(format!(
+                        "{function_name} array in {display} ended before closing bracket"
+                    )));
+                };
+                match byte {
+                    b']' => {
+                        *state = PlannerJsonDocumentState::Done;
+                        return Ok(None);
+                    }
+                    b',' => {}
+                    b'{' => {
+                        *row_number = row_number.saturating_add(1);
+                        return planner_read_json_container(reader, byte, function_name, display)
+                            .map(|text| Some((*row_number, text)));
+                    }
+                    other => {
+                        return Err(PlanError::TypeMismatch(format!(
+                            "{function_name} expected object in array {display}, got byte {other}"
+                        )));
+                    }
+                }
+            }
+            PlannerJsonDocumentState::Done => return Ok(None),
+        }
+    }
+}
+
+fn planner_read_non_ws_byte(
+    reader: &mut dyn Read,
+    function_name: &str,
+    display: &str,
+) -> Result<Option<u8>, PlanError> {
+    let mut buf = [0_u8; 1];
+    loop {
+        let read = reader.read(&mut buf).map_err(|err| {
+            PlanError::TypeMismatch(format!("{function_name} cannot read {display}: {err}"))
+        })?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if !buf[0].is_ascii_whitespace() {
+            return Ok(Some(buf[0]));
+        }
+    }
+}
+
+fn planner_read_json_container(
+    reader: &mut dyn Read,
+    first: u8,
+    function_name: &str,
+    display: &str,
+) -> Result<String, PlanError> {
+    let mut bytes = vec![first];
+    let mut depth = 1_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut byte = [0_u8; 1];
+    while depth > 0 {
+        let read = reader.read(&mut byte).map_err(|err| {
+            PlanError::TypeMismatch(format!("{function_name} cannot read {display}: {err}"))
+        })?;
+        if read == 0 {
+            return Err(PlanError::TypeMismatch(format!(
+                "{function_name} object in {display} ended before closing brace"
+            )));
+        }
+        let b = byte[0];
+        bytes.push(b);
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
             continue;
         }
-        let value = serde_json::from_str::<JsonValue>(line).map_err(|err| {
-            PlanError::TypeMismatch(format!(
-                "{function_name} parse {} line {}: {err}",
-                display,
-                idx + 1
-            ))
-        })?;
-        rows.push(json_value_to_object(
-            function_name,
-            display,
-            idx + 1,
-            value,
-        )?);
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth = depth.saturating_add(1),
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
     }
-    Ok(rows)
+    String::from_utf8(bytes).map_err(|err| {
+        PlanError::TypeMismatch(format!("{function_name} cannot decode {display}: {err}"))
+    })
 }
 
 fn json_value_to_object(
@@ -935,10 +1176,16 @@ struct JsonFieldSpec {
     nullable: bool,
 }
 
-fn infer_json_fields(function_name: &str, rows: &[JsonObject]) -> Result<Vec<Field>, PlanError> {
-    let mut columns: BTreeMap<String, JsonFieldSpec> = BTreeMap::new();
-    let mut present: BTreeMap<String, usize> = BTreeMap::new();
-    for row in rows {
+#[derive(Default)]
+struct JsonFieldAccumulator {
+    columns: BTreeMap<String, JsonFieldSpec>,
+    present: BTreeMap<String, usize>,
+    rows: usize,
+}
+
+impl JsonFieldAccumulator {
+    fn observe(&mut self, function_name: &str, row: &JsonObject) -> Result<(), PlanError> {
+        self.rows = self.rows.saturating_add(1);
         for (name, value) in row {
             if name.is_empty() {
                 return Err(PlanError::TypeMismatch(format!(
@@ -946,7 +1193,7 @@ fn infer_json_fields(function_name: &str, rows: &[JsonObject]) -> Result<Vec<Fie
                 )));
             }
             let kind = json_value_kind(value);
-            columns
+            self.columns
                 .entry(name.clone())
                 .and_modify(|spec| {
                     spec.kind = widen_json_kind(spec.kind, kind);
@@ -957,31 +1204,35 @@ fn infer_json_fields(function_name: &str, rows: &[JsonObject]) -> Result<Vec<Fie
                     kind,
                     nullable: value.is_null(),
                 });
-            *present.entry(name.clone()).or_insert(0) += 1;
+            *self.present.entry(name.clone()).or_insert(0) += 1;
         }
+        Ok(())
     }
-    for spec in columns.values_mut() {
-        if present.get(&spec.name).copied().unwrap_or(0) < rows.len() {
-            spec.nullable = true;
-        }
-    }
-    Ok(columns
-        .into_values()
-        .map(|spec| {
-            let data_type = match spec.kind {
-                JsonColumnKind::Unknown => DataType::Text { max_len: None },
-                JsonColumnKind::Bool => DataType::Bool,
-                JsonColumnKind::Int64 => DataType::Int64,
-                JsonColumnKind::Float64 => DataType::Float64,
-                JsonColumnKind::Text => DataType::Text { max_len: None },
-            };
-            if spec.nullable {
-                Field::nullable(spec.name, data_type)
-            } else {
-                Field::required(spec.name, data_type)
+
+    fn finish(mut self) -> Vec<Field> {
+        for spec in self.columns.values_mut() {
+            if self.present.get(&spec.name).copied().unwrap_or(0) < self.rows {
+                spec.nullable = true;
             }
-        })
-        .collect())
+        }
+        self.columns
+            .into_values()
+            .map(|spec| {
+                let data_type = match spec.kind {
+                    JsonColumnKind::Unknown => DataType::Text { max_len: None },
+                    JsonColumnKind::Bool => DataType::Bool,
+                    JsonColumnKind::Int64 => DataType::Int64,
+                    JsonColumnKind::Float64 => DataType::Float64,
+                    JsonColumnKind::Text => DataType::Text { max_len: None },
+                };
+                if spec.nullable {
+                    Field::nullable(spec.name, data_type)
+                } else {
+                    Field::required(spec.name, data_type)
+                }
+            })
+            .collect()
+    }
 }
 
 fn json_value_kind(value: &JsonValue) -> JsonColumnKind {
@@ -1064,9 +1315,7 @@ fn read_csv_header_from_path_specs_with_rejects(
 
 fn read_csv_header_from_first_record(path_specs: &[String]) -> Result<Vec<String>, PlanError> {
     let (display, bytes) = if path_specs_use_object_store("read_csv", path_specs)? {
-        let (location, bytes) = read_first_object_bytes(path_specs)
-            .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))?;
-        (location.display_uri(), bytes)
+        read_first_object_csv_sample(path_specs)?
     } else {
         let paths = expand_file_path_specs("read_csv", path_specs)?;
         let first = paths
@@ -1124,7 +1373,7 @@ fn first_csv_record_with_options(
         buffer.push_str(line);
         match parse_csv_records_with_options(&buffer, options) {
             Ok(mut records) if records.len() == 1 => {
-                return Ok(records.pop().expect("records length checked"));
+                return Ok(records.remove(0));
             }
             Ok(records) if records.is_empty() => buffer.clear(),
             Ok(_) => {
@@ -1142,7 +1391,7 @@ fn first_csv_record_with_options(
     let mut records = parse_csv_records_with_options(&buffer, options)
         .map_err(|err| format!("read_csv parse {display}: {err}"))?;
     if records.len() == 1 {
-        Ok(records.pop().expect("records length checked"))
+        Ok(records.remove(0))
     } else {
         Err(format!(
             "read_csv parse {display}: first-record buffer produced {} records",
@@ -1153,27 +1402,32 @@ fn first_csv_record_with_options(
 
 fn read_csv_header_from_path_specs(path_specs: &[String]) -> Result<Vec<String>, PlanError> {
     if path_specs_use_object_store("read_csv", path_specs)? {
-        let (location, bytes) = read_first_object_bytes(path_specs)
-            .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))?;
+        let (display, bytes) = read_first_object_csv_sample(path_specs)?;
         let text = String::from_utf8(bytes).map_err(|err| {
-            PlanError::TypeMismatch(format!(
-                "read_csv: {} is not UTF-8: {err}",
-                location.display_uri()
-            ))
+            PlanError::TypeMismatch(format!("read_csv: {display} is not UTF-8: {err}"))
         })?;
-        let data = read_csv_data_from_text(&location.display_uri(), &text)
-            .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))?;
-        let header = data.header;
+        let header = infer_csv_header_from_first_record(&display, &text)?;
         if header.is_empty() || header.iter().any(String::is_empty) {
             return Err(PlanError::TypeMismatch(format!(
-                "read_csv: header contains an empty column name: {}",
-                location.display_uri()
+                "read_csv: header contains an empty column name: {display}"
             )));
         }
         return Ok(header);
     }
     read_csv_header_from_specs(path_specs)
         .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))
+}
+
+fn read_first_object_csv_sample(path_specs: &[String]) -> Result<(String, Vec<u8>), PlanError> {
+    let objects = expand_object_store_specs(path_specs)
+        .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))?;
+    let first = objects
+        .first()
+        .ok_or_else(|| PlanError::TypeMismatch("read_csv: object path list is empty".to_owned()))?;
+    let bytes = read_object_range_with_metadata(first, 0, READ_CSV_HEADER_SAMPLE_BYTES)
+        .map_err(|err| PlanError::TypeMismatch(format!("read_csv: {err}")))?
+        .into_bytes();
+    Ok((first.display_uri(), bytes))
 }
 
 fn path_specs_use_object_store(

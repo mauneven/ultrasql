@@ -267,6 +267,9 @@ pub fn parse_csv_row(line: &[u8], opts: &CopyOptions) -> Result<Vec<Option<Vec<u
     } else {
         line
     };
+    if !line.contains(&b'"') {
+        return parse_unquoted_csv_row(line, opts);
+    }
     let delim_byte = {
         let mut b = [0u8; 4];
         opts.delimiter.encode_utf8(&mut b);
@@ -313,6 +316,50 @@ pub fn parse_csv_row(line: &[u8], opts: &CopyOptions) -> Result<Vec<Option<Vec<u
     }
     columns.push(finalise_csv_column(&current, field_was_quoted, opts));
     Ok(columns)
+}
+
+fn parse_unquoted_csv_row(
+    line: &[u8],
+    opts: &CopyOptions,
+) -> Result<Vec<Option<Vec<u8>>>, ServerError> {
+    let line = if line.ends_with(b"\n") {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    let line = if line.ends_with(b"\r") {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    if line.contains(&b'"') {
+        return Err(ServerError::CopyFormat(
+            "unquoted CSV fast path received quoted field".to_owned(),
+        ));
+    }
+    let delim_byte = {
+        let mut b = [0u8; 4];
+        opts.delimiter.encode_utf8(&mut b);
+        b[0]
+    };
+    Ok(parse_unquoted_csv_row_inner(line, delim_byte, opts))
+}
+
+fn parse_unquoted_csv_row_inner(
+    line: &[u8],
+    delim_byte: u8,
+    opts: &CopyOptions,
+) -> Vec<Option<Vec<u8>>> {
+    let mut columns = Vec::with_capacity(line.iter().filter(|&&b| b == delim_byte).count() + 1);
+    let mut start = 0_usize;
+    for (idx, &b) in line.iter().enumerate() {
+        if b == delim_byte {
+            columns.push(finalise_csv_column(&line[start..idx], false, opts));
+            start = idx.saturating_add(1);
+        }
+    }
+    columns.push(finalise_csv_column(&line[start..], false, opts));
+    columns
 }
 
 /// Decide whether a finished CSV column is SQL NULL or a real value.
@@ -451,6 +498,23 @@ mod tests {
         let line = encode_text_row(&original, &opts);
         let parsed = parse_text_row(&line, &opts).expect("parse ok");
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn parse_unquoted_csv_row_fast_path_preserves_nulls_and_crlf() {
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: ',',
+            null_str: "NULL".to_owned(),
+            ..CopyOptions::default()
+        };
+
+        let cols = parse_unquoted_csv_row(b"1,NULL,plain\r\n", &opts).expect("parse csv");
+
+        assert_eq!(
+            cols,
+            vec![Some(b"1".to_vec()), None, Some(b"plain".to_vec())]
+        );
     }
 
     // ── Protocol message builders ────────────────────────────────────────────

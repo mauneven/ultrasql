@@ -918,6 +918,48 @@ async fn read_csv_s3_glob_reads_matching_objects() {
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn read_csv_s3_uses_ranges_instead_of_whole_object_gets() {
+    let mut csv = String::from("id,name\n");
+    for id in 1..=10_000 {
+        csv.push_str(&format!("{id},name-{id}\n"));
+    }
+    let object_len = csv.len();
+    let whole_object_range = format!("bytes=0-{}", object_len - 1);
+    let mock = MockS3::range_only(vec![("/lake/logs/ranged.csv", csv.into_bytes())]);
+    let _env = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", &mock.endpoint);
+
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let rows = client
+        .query(
+            "SELECT COUNT(*) FROM read_csv('s3://lake/logs/ranged.csv')",
+            &[],
+        )
+        .await
+        .expect("read_csv s3 range stream");
+    assert_eq!(rows[0].get::<_, i64>(0), 10_000);
+    shutdown(client, server_handle).await;
+
+    let object_requests = mock
+        .requests()
+        .into_iter()
+        .filter(|request| request.path == "/lake/logs/ranged.csv")
+        .collect::<Vec<_>>();
+    assert!(!object_requests.is_empty(), "expected object data requests");
+    assert!(
+        object_requests
+            .iter()
+            .all(|request| request.range.is_some()),
+        "CSV object data requests must be ranged: {object_requests:?}"
+    );
+    assert!(
+        object_requests
+            .iter()
+            .all(|request| request.range.as_deref() != Some(whole_object_range.as_str())),
+        "read_csv must not request the whole S3 object: {object_requests:?}"
+    );
+}
+
 #[tokio::test]
 async fn read_csv_rejects_mixed_local_and_object_paths() {
     let dir = tempfile::tempdir().expect("tempdir");

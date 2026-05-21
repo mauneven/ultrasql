@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Cursor, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use ultrasql_core::csv::{
@@ -12,12 +12,16 @@ use ultrasql_core::csv::{
 };
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_executor::{ExecError, Operator};
-use ultrasql_objectstore::{expand_object_store_specs, is_object_store_uri, read_object_bytes};
+use ultrasql_objectstore::{
+    ObjectLocation, expand_object_store_specs, is_object_store_uri, read_object_range_with_metadata,
+};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 
 use crate::error::ServerError;
+
+use super::object_stream::ObjectRangeReader;
 
 const CSV_BATCH_TARGET_ROWS: usize = 4096;
 const CSV_SNIFF_SAMPLE_BYTES: usize = 64 * 1024;
@@ -119,13 +123,7 @@ impl CsvTableScan {
 
         for object in objects {
             let display = object.display_uri();
-            let bytes = read_object_bytes(&object)
-                .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
-            let text = String::from_utf8(bytes).map_err(|err| {
-                ServerError::CopyFormat(format!("read_csv cannot decode {display}: {err}"))
-            })?;
-            let (header, reader) =
-                CsvReaderState::from_text(display.clone(), text, reject_path.is_some())?;
+            let (header, reader) = CsvReaderState::from_object(object, reject_path.is_some())?;
             validate_object_header(&header, &display)?;
             if let Some(expected) = &expected_header {
                 if &header != expected {
@@ -552,17 +550,17 @@ impl CsvReaderState {
         Ok((header, state))
     }
 
-    fn from_text(
-        display: String,
-        text: String,
+    fn from_object(
+        object: ObjectLocation,
         allow_rejects: bool,
     ) -> Result<(Vec<String>, Self), ServerError> {
-        let sample = csv_sample_from_text(&text);
-        let sniff = sniff_csv_text_for_read_csv(&display, sample, allow_rejects)?;
+        let display = object.display_uri();
+        let sample = read_csv_sample_from_object(&object, &display)?;
+        let sniff = sniff_csv_text_for_read_csv(&display, &sample, allow_rejects)?;
         let header = sniff_header(&sniff);
         let reader = CsvRecordReader::new(
             display.clone(),
-            CsvRecordSource::Memory(BufReader::new(Cursor::new(text.into_bytes()))),
+            CsvRecordSource::Object(ObjectRangeReader::new(object)),
             sniff.parse_options(),
         );
         let mut state = Self {
@@ -744,16 +742,28 @@ impl CsvRecordReader {
 #[derive(Debug)]
 enum CsvRecordSource {
     File(BufReader<File>),
-    Memory(BufReader<Cursor<Vec<u8>>>),
+    Object(ObjectRangeReader),
 }
 
 impl CsvRecordSource {
     fn read_line(&mut self, buffer: &mut String) -> std::io::Result<usize> {
         match self {
             Self::File(reader) => reader.read_line(buffer),
-            Self::Memory(reader) => reader.read_line(buffer),
+            Self::Object(reader) => read_utf8_line(reader, buffer),
         }
     }
+}
+
+fn read_utf8_line(reader: &mut dyn BufRead, buffer: &mut String) -> std::io::Result<usize> {
+    let mut bytes = Vec::new();
+    let read = reader.read_until(b'\n', &mut bytes)?;
+    if read == 0 {
+        return Ok(0);
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    buffer.push_str(&text);
+    Ok(read)
 }
 
 fn csv_escape_reject_field(value: &str) -> String {
@@ -959,15 +969,36 @@ fn first_csv_record_with_options(
     sample: &str,
     options: CsvParseOptions,
 ) -> Result<Vec<String>, String> {
-    let mut reader = CsvRecordReader::new(
-        display.to_owned(),
-        CsvRecordSource::Memory(BufReader::new(Cursor::new(sample.as_bytes().to_vec()))),
-        options,
-    );
-    let Some(record) = reader.next_record().map_err(|err| err.message)? else {
+    let mut buffer = String::new();
+    for line in sample.split_inclusive('\n') {
+        buffer.push_str(line);
+        match parse_csv_records_with_options(&buffer, options) {
+            Ok(mut records) if records.len() == 1 => {
+                return Ok(records.pop().expect("records length checked"));
+            }
+            Ok(records) if records.is_empty() => buffer.clear(),
+            Ok(_) => {
+                return Err(format!(
+                    "read_csv parse {display}: first-record buffer produced multiple records"
+                ));
+            }
+            Err(err) if err.to_string().contains("unterminated quoted field") => {}
+            Err(err) => return Err(format!("read_csv parse {display}: {err}")),
+        }
+    }
+    if buffer.is_empty() {
         return Err("read_csv header missing".to_owned());
-    };
-    Ok(record.values)
+    }
+    let mut records = parse_csv_records_with_options(&buffer, options)
+        .map_err(|err| format!("read_csv parse {display}: {err}"))?;
+    if records.len() == 1 {
+        Ok(records.pop().expect("records length checked"))
+    } else {
+        Err(format!(
+            "read_csv parse {display}: first-record buffer produced {} records",
+            records.len()
+        ))
+    }
 }
 
 fn detect_sample_newline(sample: &str) -> &'static str {
@@ -1012,15 +1043,32 @@ fn read_csv_sample_from_path(path: &Path) -> Result<String, ServerError> {
     Ok(csv_sample_from_text_with_truncation(text, true).to_owned())
 }
 
-fn csv_sample_from_text(text: &str) -> &str {
-    if text.len() <= CSV_SNIFF_SAMPLE_BYTES {
-        return text;
+fn read_csv_sample_from_object(
+    object: &ObjectLocation,
+    display: &str,
+) -> Result<String, ServerError> {
+    let range = read_object_range_with_metadata(object, 0, CSV_SNIFF_SAMPLE_BYTES_U64)
+        .map_err(|err| ServerError::CopyFormat(format!("read_csv: {err}")))?;
+    let bytes = range.bytes();
+    let valid_len = match std::str::from_utf8(bytes) {
+        Ok(text) => {
+            return Ok(csv_sample_from_text_with_truncation(
+                text,
+                bytes.len() == CSV_SNIFF_SAMPLE_BYTES,
+            )
+            .to_owned());
+        }
+        Err(err) => err.valid_up_to(),
+    };
+    if valid_len == 0 {
+        return Err(ServerError::CopyFormat(format!(
+            "read_csv cannot decode {display}: invalid UTF-8"
+        )));
     }
-    let mut end = CSV_SNIFF_SAMPLE_BYTES;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    csv_sample_from_text_with_truncation(&text[..end], true)
+    let text = std::str::from_utf8(&bytes[..valid_len]).map_err(|err| {
+        ServerError::CopyFormat(format!("read_csv cannot decode {display}: {err}"))
+    })?;
+    Ok(csv_sample_from_text_with_truncation(text, true).to_owned())
 }
 
 fn csv_sample_from_text_with_truncation(text: &str, truncated: bool) -> &str {

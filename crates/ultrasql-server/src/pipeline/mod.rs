@@ -100,6 +100,7 @@ mod json_table_scan;
 mod lower_query;
 mod lower_simple;
 mod modify;
+mod object_stream;
 mod parquet_scan;
 pub(crate) use parquet_scan::{ParquetRowGroupSummary, parquet_row_group_summary_for_plan};
 mod scan;

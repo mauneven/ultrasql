@@ -5,8 +5,8 @@
 //! common scan contract seen by the rest of the executor.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
 use arrow_ipc::reader::FileReader as ArrowFileReader;
@@ -15,7 +15,9 @@ use ultrasql_arrow::{record_batch_to_ultrasql_batch, schema_from_arrow};
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_executor::{Eval, ExecError, MemTableScan, Operator};
 use ultrasql_iceberg::plan_iceberg_scan;
-use ultrasql_objectstore::{expand_object_store_specs, is_object_store_uri, read_object_bytes};
+use ultrasql_objectstore::{
+    ObjectLocation, expand_object_store_specs, is_object_store_uri, read_object_bytes,
+};
 use ultrasql_planner::ScalarExpr;
 use ultrasql_vec::Batch;
 use ultrasql_vec::Bitmap;
@@ -24,6 +26,7 @@ use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
 use crate::error::ServerError;
 
 use super::csv_scan::CsvTableScan;
+use super::object_stream::ObjectRangeReader;
 use super::parquet_scan::{ParquetPredicate, ParquetTableScan};
 
 const EXTERNAL_BATCH_TARGET_ROWS: usize = 4096;
@@ -247,12 +250,8 @@ impl ExternalTableScan {
     fn from_json(args: &[ScalarExpr], kind: JsonInputKind) -> Result<Self, ServerError> {
         let function_name = kind.function_name();
         let path_specs = read_external_path_specs(function_name, args)?;
-        let sources = read_external_sources(function_name, &path_specs)?;
-        let rows = read_json_rows(kind, &sources)?;
-        let columns = infer_json_columns(function_name, &rows)?;
-        let schema = json_schema(function_name, &columns)?;
-        let batches = json_batches(function_name, &columns, &rows)?;
-        Ok(Self::buffered(schema, batches))
+        let scan = JsonTableScan::from_path_specs(function_name, &path_specs, kind)?;
+        Ok(Self::streaming(Box::new(scan)))
     }
 
     fn from_arrow(args: &[ScalarExpr]) -> Result<Self, ServerError> {
@@ -294,6 +293,88 @@ impl Operator for ExternalTableScan {
 
     fn schema(&self) -> &Schema {
         &self.schema
+    }
+}
+
+#[derive(Clone, Debug)]
+enum ExternalStreamSpec {
+    Local(PathBuf),
+    Object(ObjectLocation),
+}
+
+impl ExternalStreamSpec {
+    fn display(&self) -> String {
+        match self {
+            Self::Local(path) => path.display().to_string(),
+            Self::Object(object) => object.display_uri(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ExternalStreamReader {
+    File(BufReader<File>),
+    Object(ObjectRangeReader),
+}
+
+impl Read for ExternalStreamReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(reader) => reader.read(out),
+            Self::Object(reader) => reader.read(out),
+        }
+    }
+}
+
+impl BufRead for ExternalStreamReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        match self {
+            Self::File(reader) => reader.fill_buf(),
+            Self::Object(reader) => reader.fill_buf(),
+        }
+    }
+
+    fn consume(&mut self, amt: usize) {
+        match self {
+            Self::File(reader) => reader.consume(amt),
+            Self::Object(reader) => reader.consume(amt),
+        }
+    }
+}
+
+fn external_stream_specs(
+    function_name: &str,
+    path_specs: &[String],
+) -> Result<Vec<ExternalStreamSpec>, ServerError> {
+    if path_specs_use_object_store(function_name, path_specs)? {
+        let objects = expand_object_store_specs(path_specs)
+            .map_err(|err| ServerError::CopyFormat(format!("{function_name}: {err}")))?;
+        return Ok(objects
+            .into_iter()
+            .map(ExternalStreamSpec::Object)
+            .collect());
+    }
+    Ok(expand_file_path_specs(function_name, path_specs)?
+        .into_iter()
+        .map(ExternalStreamSpec::Local)
+        .collect())
+}
+
+fn open_external_stream(
+    function_name: &str,
+    source: &ExternalStreamSpec,
+) -> Result<ExternalStreamReader, ServerError> {
+    match source {
+        ExternalStreamSpec::Local(path) => {
+            let display = path.display();
+            let file = File::open(path).map_err(|err| {
+                ServerError::CopyFormat(format!("{function_name} cannot open {display}: {err}"))
+            })?;
+            Ok(ExternalStreamReader::File(BufReader::new(file)))
+        }
+        ExternalStreamSpec::Object(object) => Ok(ExternalStreamReader::Object(
+            ObjectRangeReader::new(object.clone()),
+        )),
     }
 }
 
@@ -440,65 +521,359 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 
 type JsonObject = JsonMap<String, JsonValue>;
 
-fn read_json_rows(
+#[derive(Debug)]
+struct JsonTableScan {
+    schema: Schema,
+    columns: Vec<JsonColumnSpec>,
+    readers: VecDeque<JsonReaderState>,
     kind: JsonInputKind,
-    sources: &[ExternalBytes],
-) -> Result<Vec<JsonObject>, ServerError> {
-    let mut rows = Vec::new();
-    for source in sources {
-        let text = String::from_utf8(source.bytes.clone()).map_err(|err| {
-            ServerError::CopyFormat(format!(
-                "{} cannot decode {} as UTF-8: {err}",
-                kind.function_name(),
-                source.display
-            ))
-        })?;
-        match kind {
-            JsonInputKind::Json => rows.extend(parse_json_document(&source.display, &text)?),
-            JsonInputKind::Ndjson => rows.extend(parse_ndjson_document(&source.display, &text)?),
+}
+
+impl JsonTableScan {
+    fn from_path_specs(
+        function_name: &str,
+        path_specs: &[String],
+        kind: JsonInputKind,
+    ) -> Result<Self, ServerError> {
+        let sources = external_stream_specs(function_name, path_specs)?;
+        let columns = infer_json_columns_from_streams(function_name, kind, &sources)?;
+        let schema = json_schema(function_name, &columns)?;
+        let readers = sources
+            .iter()
+            .map(|source| JsonReaderState::open(function_name, kind, source))
+            .collect::<Result<VecDeque<_>, _>>()?;
+        Ok(Self {
+            schema,
+            columns,
+            readers,
+            kind,
+        })
+    }
+
+    fn next_json_row(&mut self) -> Result<Option<JsonObject>, ServerError> {
+        loop {
+            let Some(reader) = self.readers.front_mut() else {
+                return Ok(None);
+            };
+            match reader.next_object(self.kind)? {
+                Some(row) => return Ok(Some(row)),
+                None => {
+                    self.readers.pop_front();
+                }
+            }
         }
     }
-    Ok(rows)
 }
 
-fn parse_json_document(display: &str, text: &str) -> Result<Vec<JsonObject>, ServerError> {
-    let value = serde_json::from_str::<JsonValue>(text)
-        .map_err(|err| ServerError::CopyFormat(format!("read_json parse {display}: {err}")))?;
-    match value {
-        JsonValue::Array(values) => values
-            .into_iter()
-            .enumerate()
-            .map(|(idx, value)| json_value_to_object("read_json", display, idx + 1, value))
-            .collect(),
-        JsonValue::Object(object) => Ok(vec![object]),
-        _ => Err(ServerError::CopyFormat(format!(
-            "read_json expected object or array of objects in {display}"
-        ))),
+impl Operator for JsonTableScan {
+    fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+        let mut rows = Vec::with_capacity(EXTERNAL_BATCH_TARGET_ROWS);
+        for _ in 0..EXTERNAL_BATCH_TARGET_ROWS {
+            let Some(row) = self.next_json_row().map_err(|err| {
+                ExecError::TypeMismatch(format!("{} stream: {err}", self.kind.function_name()))
+            })?
+            else {
+                break;
+            };
+            rows.push(row);
+        }
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        json_batch(self.kind.function_name(), &self.columns, &rows)
+            .map(Some)
+            .map_err(|err| ExecError::TypeMismatch(err.to_string()))
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.schema
     }
 }
 
-fn parse_ndjson_document(display: &str, text: &str) -> Result<Vec<JsonObject>, ServerError> {
-    let mut rows = Vec::new();
-    for (idx, line) in text.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
+#[derive(Debug)]
+struct JsonReaderState {
+    display: String,
+    reader: JsonRecordReader,
+}
+
+impl JsonReaderState {
+    fn open(
+        function_name: &str,
+        kind: JsonInputKind,
+        source: &ExternalStreamSpec,
+    ) -> Result<Self, ServerError> {
+        let display = source.display();
+        let stream = open_external_stream(function_name, source)?;
+        Ok(Self {
+            display,
+            reader: JsonRecordReader::new(kind, stream),
+        })
+    }
+
+    fn next_object(&mut self, kind: JsonInputKind) -> Result<Option<JsonObject>, ServerError> {
+        match self.reader.next_text(&self.display)? {
+            Some((row_number, text)) => {
+                let value = serde_json::from_str::<JsonValue>(&text).map_err(|err| {
+                    ServerError::CopyFormat(format!(
+                        "{} parse {} row {}: {err}",
+                        kind.function_name(),
+                        self.display,
+                        row_number
+                    ))
+                })?;
+                json_value_to_object(kind.function_name(), &self.display, row_number, value)
+                    .map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum JsonRecordReader {
+    Ndjson {
+        reader: ExternalStreamReader,
+        line_number: usize,
+    },
+    Json {
+        reader: ExternalStreamReader,
+        state: JsonDocumentState,
+        row_number: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JsonDocumentState {
+    Start,
+    Array,
+    Done,
+}
+
+impl JsonRecordReader {
+    fn new(kind: JsonInputKind, reader: ExternalStreamReader) -> Self {
+        match kind {
+            JsonInputKind::Ndjson => Self::Ndjson {
+                reader,
+                line_number: 0,
+            },
+            JsonInputKind::Json => Self::Json {
+                reader,
+                state: JsonDocumentState::Start,
+                row_number: 0,
+            },
+        }
+    }
+
+    fn next_text(&mut self, display: &str) -> Result<Option<(usize, String)>, ServerError> {
+        match self {
+            Self::Ndjson {
+                reader,
+                line_number,
+            } => next_ndjson_text(reader, line_number, display),
+            Self::Json {
+                reader,
+                state,
+                row_number,
+            } => next_json_document_text(reader, state, row_number, display),
+        }
+    }
+}
+
+fn next_ndjson_text(
+    reader: &mut ExternalStreamReader,
+    line_number: &mut usize,
+    display: &str,
+) -> Result<Option<(usize, String)>, ServerError> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).map_err(|err| {
+            ServerError::CopyFormat(format!("read_ndjson cannot read {display}: {err}"))
+        })?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        *line_number = line_number.saturating_add(1);
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some((*line_number, trimmed.to_owned())));
+        }
+    }
+}
+
+fn next_json_document_text(
+    reader: &mut ExternalStreamReader,
+    state: &mut JsonDocumentState,
+    row_number: &mut usize,
+    display: &str,
+) -> Result<Option<(usize, String)>, ServerError> {
+    loop {
+        match state {
+            JsonDocumentState::Start => {
+                let Some(byte) = read_non_ws_byte(reader, display)? else {
+                    return Ok(None);
+                };
+                match byte {
+                    b'{' => {
+                        *state = JsonDocumentState::Done;
+                        *row_number = 1;
+                        return read_json_container(reader, byte, display)
+                            .map(|text| Some((*row_number, text)));
+                    }
+                    b'[' => *state = JsonDocumentState::Array,
+                    other => {
+                        return Err(ServerError::CopyFormat(format!(
+                            "read_json expected object or array of objects in {display}, got byte {other}"
+                        )));
+                    }
+                }
+            }
+            JsonDocumentState::Array => {
+                let Some(byte) = read_non_ws_byte(reader, display)? else {
+                    return Err(ServerError::CopyFormat(format!(
+                        "read_json array in {display} ended before closing bracket"
+                    )));
+                };
+                match byte {
+                    b']' => {
+                        *state = JsonDocumentState::Done;
+                        return Ok(None);
+                    }
+                    b',' => {}
+                    b'{' => {
+                        *row_number = row_number.saturating_add(1);
+                        return read_json_container(reader, byte, display)
+                            .map(|text| Some((*row_number, text)));
+                    }
+                    other => {
+                        return Err(ServerError::CopyFormat(format!(
+                            "read_json expected object in array {display}, got byte {other}"
+                        )));
+                    }
+                }
+            }
+            JsonDocumentState::Done => return Ok(None),
+        }
+    }
+}
+
+fn read_non_ws_byte(
+    reader: &mut ExternalStreamReader,
+    display: &str,
+) -> Result<Option<u8>, ServerError> {
+    let mut buf = [0_u8; 1];
+    loop {
+        let read = reader.read(&mut buf).map_err(|err| {
+            ServerError::CopyFormat(format!("read_json cannot read {display}: {err}"))
+        })?;
+        if read == 0 {
+            return Ok(None);
+        }
+        if !buf[0].is_ascii_whitespace() {
+            return Ok(Some(buf[0]));
+        }
+    }
+}
+
+fn read_json_container(
+    reader: &mut ExternalStreamReader,
+    first: u8,
+    display: &str,
+) -> Result<String, ServerError> {
+    let mut bytes = vec![first];
+    let mut depth = 1_i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut byte = [0_u8; 1];
+    while depth > 0 {
+        let read = reader.read(&mut byte).map_err(|err| {
+            ServerError::CopyFormat(format!("read_json cannot read {display}: {err}"))
+        })?;
+        if read == 0 {
+            return Err(ServerError::CopyFormat(format!(
+                "read_json object in {display} ended before closing brace"
+            )));
+        }
+        let b = byte[0];
+        bytes.push(b);
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
             continue;
         }
-        let value = serde_json::from_str::<JsonValue>(line).map_err(|err| {
-            ServerError::CopyFormat(format!(
-                "read_ndjson parse {} line {}: {err}",
-                display,
-                idx + 1
-            ))
-        })?;
-        rows.push(json_value_to_object(
-            "read_ndjson",
-            display,
-            idx + 1,
-            value,
-        )?);
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => depth = depth.saturating_add(1),
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
     }
-    Ok(rows)
+    String::from_utf8(bytes)
+        .map_err(|err| ServerError::CopyFormat(format!("read_json cannot decode {display}: {err}")))
+}
+
+fn infer_json_columns_from_streams(
+    function_name: &str,
+    kind: JsonInputKind,
+    sources: &[ExternalStreamSpec],
+) -> Result<Vec<JsonColumnSpec>, ServerError> {
+    let mut acc = JsonSchemaAccumulator::default();
+    for source in sources {
+        let mut reader = JsonReaderState::open(function_name, kind, source)?;
+        while let Some(row) = reader.next_object(kind)? {
+            acc.observe(function_name, &row)?;
+        }
+    }
+    Ok(acc.finish())
+}
+
+#[derive(Debug, Default)]
+struct JsonSchemaAccumulator {
+    columns: BTreeMap<String, JsonColumnSpec>,
+    present: BTreeMap<String, usize>,
+    rows: usize,
+}
+
+impl JsonSchemaAccumulator {
+    fn observe(&mut self, function_name: &str, row: &JsonObject) -> Result<(), ServerError> {
+        self.rows = self.rows.saturating_add(1);
+        for (name, value) in row {
+            if name.is_empty() {
+                return Err(ServerError::CopyFormat(format!(
+                    "{function_name}: JSON object contains an empty column name"
+                )));
+            }
+            let kind = json_value_kind(value);
+            let nullable = value.is_null();
+            self.columns
+                .entry(name.clone())
+                .and_modify(|spec| {
+                    spec.kind = widen_json_kind(spec.kind, kind);
+                    spec.nullable |= nullable;
+                })
+                .or_insert_with(|| JsonColumnSpec {
+                    name: name.clone(),
+                    kind,
+                    nullable,
+                });
+            *self.present.entry(name.clone()).or_insert(0) += 1;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Vec<JsonColumnSpec> {
+        for spec in self.columns.values_mut() {
+            if self.present.get(&spec.name).copied().unwrap_or(0) < self.rows {
+                spec.nullable = true;
+            }
+        }
+        self.columns.into_values().collect()
+    }
 }
 
 fn json_value_to_object(
@@ -529,43 +904,6 @@ struct JsonColumnSpec {
     name: String,
     kind: JsonColumnKind,
     nullable: bool,
-}
-
-fn infer_json_columns(
-    function_name: &str,
-    rows: &[JsonObject],
-) -> Result<Vec<JsonColumnSpec>, ServerError> {
-    let mut columns: BTreeMap<String, JsonColumnSpec> = BTreeMap::new();
-    let mut present: BTreeMap<String, usize> = BTreeMap::new();
-    for row in rows {
-        for (name, value) in row {
-            if name.is_empty() {
-                return Err(ServerError::CopyFormat(format!(
-                    "{function_name}: JSON object contains an empty column name"
-                )));
-            }
-            let kind = json_value_kind(value);
-            let nullable = value.is_null();
-            columns
-                .entry(name.clone())
-                .and_modify(|spec| {
-                    spec.kind = widen_json_kind(spec.kind, kind);
-                    spec.nullable |= nullable;
-                })
-                .or_insert_with(|| JsonColumnSpec {
-                    name: name.clone(),
-                    kind,
-                    nullable,
-                });
-            *present.entry(name.clone()).or_insert(0) += 1;
-        }
-    }
-    for spec in columns.values_mut() {
-        if present.get(&spec.name).copied().unwrap_or(0) < rows.len() {
-            spec.nullable = true;
-        }
-    }
-    Ok(columns.into_values().collect())
 }
 
 fn json_value_kind(value: &JsonValue) -> JsonColumnKind {
@@ -620,21 +958,6 @@ fn json_schema(function_name: &str, columns: &[JsonColumnSpec]) -> Result<Schema
         .collect::<Vec<_>>();
     Schema::new(fields)
         .map_err(|err| ServerError::CopyFormat(format!("{function_name} schema: {err}")))
-}
-
-fn json_batches(
-    function_name: &str,
-    columns: &[JsonColumnSpec],
-    rows: &[JsonObject],
-) -> Result<VecDeque<Batch>, ServerError> {
-    let mut batches = VecDeque::new();
-    for chunk in rows.chunks(EXTERNAL_BATCH_TARGET_ROWS) {
-        let batch = json_batch(function_name, columns, chunk)?;
-        if !batch.is_empty() {
-            batches.push_back(batch);
-        }
-    }
-    Ok(batches)
 }
 
 fn json_batch(
@@ -881,5 +1204,46 @@ mod tests {
         assert_eq!(batch.rows(), 2);
         assert_eq!(pulls.load(Ordering::SeqCst), 1);
         assert!(scan.next_batch().expect("stream eof").is_none());
+    }
+
+    fn text_lit(value: &str) -> ScalarExpr {
+        ScalarExpr::Literal {
+            value: Value::Text(value.to_owned()),
+            data_type: DataType::Text { max_len: None },
+        }
+    }
+
+    #[test]
+    fn read_json_uses_streaming_scan_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("people.json");
+        fs::write(&path, r#"[{"id":1,"name":"Ada"},{"id":2,"name":"Grace"}]"#).expect("write json");
+
+        let scan = ExternalTableScan::from_json(
+            &[text_lit(path.to_str().expect("utf8 path"))],
+            JsonInputKind::Json,
+        )
+        .expect("json scan");
+
+        assert!(matches!(scan.source, ExternalScanSource::Streaming(_)));
+    }
+
+    #[test]
+    fn read_ndjson_uses_streaming_scan_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("people.ndjson");
+        fs::write(
+            &path,
+            "{\"id\":1,\"name\":\"Ada\"}\n{\"id\":2,\"name\":\"Grace\"}\n",
+        )
+        .expect("write ndjson");
+
+        let scan = ExternalTableScan::from_json(
+            &[text_lit(path.to_str().expect("utf8 path"))],
+            JsonInputKind::Ndjson,
+        )
+        .expect("ndjson scan");
+
+        assert!(matches!(scan.source, ExternalScanSource::Streaming(_)));
     }
 }
