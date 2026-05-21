@@ -109,6 +109,14 @@ const RAG_RETRIEVAL_REQUIRED_METRICS: &[&str] = &[
     "latency_us",
     "answer_citation_coverage",
 ];
+const COLD_START_INDEX_LOAD_REQUIRED_METRICS: &[&str] = &[
+    "restart_time_us",
+    "first_query_us",
+    "second_query_us",
+    "index_loaded_from_disk",
+];
+const INGESTION_THROUGHPUT_REQUIRED_METRICS: &[&str] =
+    &["rows_per_sec", "wal_bytes", "index_update_us", "commit_us"];
 const PARQUET_SMOKE_ROW_GROUP_ROWS: usize = 4_096;
 const PARQUET_SMOKE_MIN_ROWS: usize = PARQUET_SMOKE_ROW_GROUP_ROWS * 2;
 
@@ -164,6 +172,12 @@ struct RagRetrievalCertification {
     precision_at_k: f64,
     mrr: f64,
     answer_citation_coverage: f64,
+}
+
+#[derive(Debug)]
+struct PersistentBenchServer {
+    bound: SocketAddr,
+    handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +286,14 @@ enum Workload {
     /// runs tenant-filtered exact vector retrieval, and records
     /// recall/precision/MRR/citation coverage.
     RagRetrievalQuality,
+    /// Persistent HNSW cold-start smoke. Builds a page-backed ANN index,
+    /// restarts the SQL server, then times the first and second top-k
+    /// queries and verifies the page-backed index is used after restart.
+    ColdStartIndexLoad,
+    /// Vector ingestion smoke. Inserts deterministic vector batches into
+    /// persistent tables with and without a pre-created ANN index, measuring
+    /// throughput, WAL growth, index-maintenance delta, and commit latency.
+    IngestionThroughput,
 }
 
 impl Workload {
@@ -319,6 +341,8 @@ impl Workload {
             Self::ObjectParquetRange => "object_parquet_range_smoke".to_string(),
             Self::HybridSearchLatency => "ai_gauntlet_hybrid_search_latency_smoke".to_string(),
             Self::RagRetrievalQuality => "ai_gauntlet_rag_retrieval_quality_smoke".to_string(),
+            Self::ColdStartIndexLoad => "ai_gauntlet_cold_start_index_load_smoke".to_string(),
+            Self::IngestionThroughput => "ai_gauntlet_ingestion_throughput_smoke".to_string(),
         }
     }
 }
@@ -398,6 +422,12 @@ async fn main() -> Result<()> {
         args.workload
             .registry_id_with_shape(args.rows, args.vector_dims, args.top_k)
     });
+    if matches!(args.workload, Workload::ColdStartIndexLoad) {
+        return run_cold_start_index_load_workload(&args, &workload_id).await;
+    }
+    if matches!(args.workload, Workload::IngestionThroughput) {
+        return run_ingestion_throughput_workload(&args, &workload_id).await;
+    }
 
     // Bring up an in-process ultrasqld on an ephemeral port.
     let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
@@ -700,7 +730,9 @@ async fn main() -> Result<()> {
                     | Workload::ParquetSmoke
                     | Workload::ObjectParquetRange
                     | Workload::HybridSearchLatency
-                    | Workload::RagRetrievalQuality => unreachable!("handled above"),
+                    | Workload::RagRetrievalQuality
+                    | Workload::ColdStartIndexLoad
+                    | Workload::IngestionThroughput => unreachable!("handled above"),
                 };
                 if i >= args.warmup {
                     iters_us.push(micros);
@@ -907,6 +939,332 @@ fn simple_query_rows(messages: &[tokio_postgres::SimpleQueryMessage]) -> Vec<Vec
             _ => None,
         })
         .collect()
+}
+
+async fn start_persistent_bench_server(data_dir: &Path) -> Result<PersistentBenchServer> {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
+    let server = Arc::new(Server::init(data_dir).context("persistent server init")?);
+    let (listener, bound) = bind_listener(bind_addr).await.context("bind listener")?;
+    let handle = tokio::spawn(serve_listener(listener, server));
+    Ok(PersistentBenchServer { bound, handle })
+}
+
+async fn shutdown_persistent_bench_server(
+    client: tokio_postgres::Client,
+    conn_handle: tokio::task::JoinHandle<()>,
+    server: PersistentBenchServer,
+) {
+    drop(client);
+    conn_handle.abort();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    server.handle.abort();
+    let _ = server.handle.await;
+}
+
+async fn run_cold_start_index_load_workload(args: &Args, workload_id: &str) -> Result<()> {
+    let dir = tempfile::tempdir().context("create cold-start tempdir")?;
+    let table = "bench_ai_cold_start";
+    let top_k = args.top_k.min(args.rows).max(1);
+
+    let setup_server = start_persistent_bench_server(dir.path()).await?;
+    let (setup_client, setup_conn) = connect_sql_server(setup_server.bound).await?;
+    setup_client
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (id INT NOT NULL, embedding VECTOR({dims}))",
+            dims = args.vector_dims
+        ))
+        .await
+        .with_context(|| format!("CREATE TABLE {table}"))?;
+    preload_vector_chunked(&setup_client, table, args.rows, args.vector_dims).await?;
+    setup_client
+        .batch_execute(&format!(
+            "CREATE INDEX {table}_embedding_hnsw \
+             ON {table} USING hnsw (embedding vector_l2_ops)"
+        ))
+        .await
+        .with_context(|| format!("CREATE INDEX {table}_embedding_hnsw"))?;
+    let loaded = simple_count(&setup_client, &format!("SELECT COUNT(*) FROM {table}")).await?;
+    if loaded != i64::try_from(args.rows).context("rows do not fit i64")? {
+        anyhow::bail!(
+            "cold-start preload count mismatch: expected {}, observed {loaded}",
+            args.rows
+        );
+    }
+    shutdown_persistent_bench_server(setup_client, setup_conn, setup_server).await;
+
+    let restart_started = Instant::now();
+    let query_server = start_persistent_bench_server(dir.path()).await?;
+    let (client, conn_handle) = connect_sql_server(query_server.bound).await?;
+    let restart_time_us = restart_started.elapsed().as_secs_f64() * 1e6;
+
+    let probe = vector_probe_literal(args.vector_dims);
+    let expected = expected_vector_topk_answer(args.rows, args.vector_dims, top_k);
+    let query = format!(
+        "SELECT id FROM {table} \
+         ORDER BY embedding <-> VECTOR '{probe}' LIMIT {top_k}"
+    );
+    let (first_query_us, first_answer) = timed_vector_id_query(&client, &query).await?;
+    if first_answer != expected {
+        anyhow::bail!(
+            "cold-start first query mismatch: expected ids {expected}, observed ids {first_answer}"
+        );
+    }
+    let (second_query_us, second_answer) = timed_vector_id_query(&client, &query).await?;
+    if second_answer != expected {
+        anyhow::bail!(
+            "cold-start second query mismatch: expected ids {expected}, observed ids {second_answer}"
+        );
+    }
+    let explain = simple_query_rows(
+        &client
+            .simple_query(&format!("EXPLAIN ANALYZE {query}"))
+            .await
+            .context("cold-start explain analyze")?,
+    )
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    let index_loaded_from_disk = explain.contains("page-backed hnsw");
+    shutdown_persistent_bench_server(client, conn_handle, query_server).await;
+
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "suite": "cold_start_index_load",
+        "engine": "ultrasql",
+        "workload": workload_id,
+        "profile": "smoke",
+        "status": "measured",
+        "required_metrics": COLD_START_INDEX_LOAD_REQUIRED_METRICS,
+        "n_rows": args.rows,
+        "vector_dims": args.vector_dims,
+        "top_k": top_k,
+        "restart_time_us": restart_time_us,
+        "first_query_us": first_query_us,
+        "second_query_us": second_query_us,
+        "index_loaded_from_disk": index_loaded_from_disk,
+        "answer": {
+            "expected_ids": expected,
+            "first_ids": first_answer,
+            "second_ids": second_answer,
+        },
+        "policy": "Cold-start artifact builds a persistent page-backed HNSW index, restarts the SQL server, and verifies the restarted query uses that index."
+    });
+    write_json_report(args.output.as_ref(), &report, "cross_compare_sql")
+}
+
+async fn timed_vector_id_query(
+    client: &tokio_postgres::Client,
+    query: &str,
+) -> Result<(f64, String)> {
+    let started = Instant::now();
+    let messages = client
+        .simple_query(query)
+        .await
+        .with_context(|| format!("vector id query: {query}"))?;
+    let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+    let answer = messages
+        .iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(ToOwned::to_owned),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Ok((elapsed_us, answer))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VectorIngestTiming {
+    insert_us: f64,
+    commit_us: f64,
+}
+
+async fn run_ingestion_throughput_workload(args: &Args, workload_id: &str) -> Result<()> {
+    let dir = tempfile::tempdir().context("create ingestion tempdir")?;
+    let server = start_persistent_bench_server(dir.path()).await?;
+    let (client, conn_handle) = connect_sql_server(server.bound).await?;
+    let wal_before = directory_size_bytes(&dir.path().join("pg_wal"))?;
+    let batch_size = 128_usize.min(args.rows.max(1));
+
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE bench_ai_ingest_plain (id INT NOT NULL, embedding VECTOR({dims}))",
+            dims = args.vector_dims
+        ))
+        .await
+        .context("create plain ingestion table")?;
+    let plain = ingest_vector_batches(
+        &client,
+        "bench_ai_ingest_plain",
+        args.rows,
+        args.vector_dims,
+        batch_size,
+    )
+    .await?;
+
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE bench_ai_ingest_indexed (id INT NOT NULL, embedding VECTOR({dims}))",
+            dims = args.vector_dims
+        ))
+        .await
+        .context("create indexed ingestion table")?;
+    client
+        .batch_execute(
+            "CREATE INDEX bench_ai_ingest_indexed_embedding_hnsw \
+             ON bench_ai_ingest_indexed USING hnsw (embedding vector_l2_ops)",
+        )
+        .await
+        .context("create ingestion hnsw index")?;
+    let indexed = ingest_vector_batches(
+        &client,
+        "bench_ai_ingest_indexed",
+        args.rows,
+        args.vector_dims,
+        batch_size,
+    )
+    .await?;
+
+    for table in ["bench_ai_ingest_plain", "bench_ai_ingest_indexed"] {
+        let count = simple_count(&client, &format!("SELECT COUNT(*) FROM {table}")).await?;
+        if count != i64::try_from(args.rows).context("rows do not fit i64")? {
+            anyhow::bail!(
+                "ingestion count mismatch for {table}: expected {}, observed {count}",
+                args.rows
+            );
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let wal_after = directory_size_bytes(&dir.path().join("pg_wal"))?;
+    shutdown_persistent_bench_server(client, conn_handle, server).await;
+
+    let indexed_total_us = indexed.insert_us + indexed.commit_us;
+    let rows_per_sec = if indexed_total_us > 0.0 {
+        args.rows as f64 * 1_000_000.0 / indexed_total_us
+    } else {
+        0.0
+    };
+    let plain_total_us = plain.insert_us + plain.commit_us;
+    let rows_per_sec_without_index = if plain_total_us > 0.0 {
+        args.rows as f64 * 1_000_000.0 / plain_total_us
+    } else {
+        0.0
+    };
+    let index_update_us = (indexed.insert_us - plain.insert_us).max(0.0);
+    let wal_bytes = wal_after.saturating_sub(wal_before);
+
+    let report = serde_json::json!({
+        "schema_version": 1,
+        "suite": "ingestion_throughput",
+        "engine": "ultrasql",
+        "workload": workload_id,
+        "profile": "smoke",
+        "status": "measured",
+        "required_metrics": INGESTION_THROUGHPUT_REQUIRED_METRICS,
+        "n_rows": args.rows,
+        "vector_dims": args.vector_dims,
+        "batch_size": batch_size,
+        "ingest_path": "insert_batches",
+        "rows_per_sec": rows_per_sec,
+        "rows_per_sec_with_index": rows_per_sec,
+        "rows_per_sec_without_index": rows_per_sec_without_index,
+        "wal_bytes": wal_bytes,
+        "index_update_us": index_update_us,
+        "commit_us": indexed.commit_us,
+        "commit_us_with_index": indexed.commit_us,
+        "commit_us_without_index": plain.commit_us,
+        "insert_us_with_index": indexed.insert_us,
+        "insert_us_without_index": plain.insert_us,
+        "policy": "Ingestion artifact inserts deterministic vector batches through SQL with and without a pre-created HNSW index; no cross-engine ranking."
+    });
+    write_json_report(args.output.as_ref(), &report, "cross_compare_sql")
+}
+
+async fn ingest_vector_batches(
+    client: &tokio_postgres::Client,
+    table: &str,
+    n_rows: usize,
+    dims: usize,
+    batch_size: usize,
+) -> Result<VectorIngestTiming> {
+    client
+        .batch_execute("BEGIN")
+        .await
+        .with_context(|| format!("BEGIN ingest for {table}"))?;
+    let insert_started = Instant::now();
+    let mut start = 0;
+    while start < n_rows {
+        let end = (start + batch_size).min(n_rows);
+        let mut sql = String::with_capacity((end - start) * (dims * 4 + 32) + 64);
+        sql.push_str("INSERT INTO ");
+        sql.push_str(table);
+        sql.push_str(" VALUES ");
+        for row_id in start..end {
+            if row_id > start {
+                sql.push(',');
+            }
+            sql.push('(');
+            sql.push_str(&row_id.to_string());
+            sql.push(',');
+            push_vector_literal_for_row(&mut sql, row_id, dims);
+            sql.push(')');
+        }
+        client
+            .batch_execute(&sql)
+            .await
+            .with_context(|| format!("ingest vector batch [{start}, {end}) into {table}"))?;
+        start = end;
+    }
+    let insert_us = insert_started.elapsed().as_secs_f64() * 1e6;
+    let commit_started = Instant::now();
+    client
+        .batch_execute("COMMIT")
+        .await
+        .with_context(|| format!("COMMIT ingest for {table}"))?;
+    let commit_us = commit_started.elapsed().as_secs_f64() * 1e6;
+    Ok(VectorIngestTiming {
+        insert_us,
+        commit_us,
+    })
+}
+
+fn directory_size_bytes(path: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry.with_context(|| format!("read entry in {}", path.display()))?;
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("metadata {}", entry.path().display()))?;
+        if metadata.is_dir() {
+            total = total
+                .checked_add(directory_size_bytes(&entry.path())?)
+                .context("directory size overflow")?;
+        } else if metadata.is_file() {
+            total = total
+                .checked_add(metadata.len())
+                .context("directory size overflow")?;
+        }
+    }
+    Ok(total)
+}
+
+fn write_json_report(
+    output: Option<&PathBuf>,
+    report: &serde_json::Value,
+    label: &str,
+) -> Result<()> {
+    let serialized = serde_json::to_string(report)?;
+    if let Some(path) = output {
+        std::fs::write(path, &serialized).with_context(|| format!("write {}", path.display()))?;
+        eprintln!("{label}: wrote {}", path.display());
+    } else {
+        println!("{serialized}");
+    }
+    Ok(())
 }
 
 async fn simple_count(client: &tokio_postgres::Client, sql: &str) -> Result<i64> {
@@ -3156,9 +3514,17 @@ mod tests {
         let rag =
             Args::try_parse_from(["cross_compare_sql", "--workload", "rag-retrieval-quality"])
                 .expect("rag retrieval workload parses");
+        let cold =
+            Args::try_parse_from(["cross_compare_sql", "--workload", "cold-start-index-load"])
+                .expect("cold-start workload parses");
+        let ingestion =
+            Args::try_parse_from(["cross_compare_sql", "--workload", "ingestion-throughput"])
+                .expect("ingestion workload parses");
 
         assert_eq!(hybrid.workload, Workload::HybridSearchLatency);
         assert_eq!(rag.workload, Workload::RagRetrievalQuality);
+        assert_eq!(cold.workload, Workload::ColdStartIndexLoad);
+        assert_eq!(ingestion.workload, Workload::IngestionThroughput);
         assert_eq!(
             Workload::HybridSearchLatency.registry_id(1_000),
             "ai_gauntlet_hybrid_search_latency_smoke"
@@ -3166,6 +3532,14 @@ mod tests {
         assert_eq!(
             Workload::RagRetrievalQuality.registry_id(1_000),
             "ai_gauntlet_rag_retrieval_quality_smoke"
+        );
+        assert_eq!(
+            Workload::ColdStartIndexLoad.registry_id(1_000),
+            "ai_gauntlet_cold_start_index_load_smoke"
+        );
+        assert_eq!(
+            Workload::IngestionThroughput.registry_id(1_000),
+            "ai_gauntlet_ingestion_throughput_smoke"
         );
     }
 

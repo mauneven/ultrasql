@@ -1,17 +1,1 @@
-{
-  "schema_version": 1,
-  "suite": "ingestion_throughput",
-  "engine": "ultrasql",
-  "workload": "ai_gauntlet_ingestion_throughput_smoke",
-  "profile": "smoke",
-  "status": "not_available",
-  "reason": "runner_not_implemented",
-  "generated_at_unix": 1779347157,
-  "required_metrics": [
-    "rows_per_second",
-    "bytes_per_second",
-    "copy_time_us",
-    "index_update_time_us"
-  ],
-  "policy": "No benchmark claim exists for this suite until a committed runner emits the required metrics from reproducible inputs."
-}
+{"batch_size":128,"commit_us":95.583,"commit_us_with_index":95.583,"commit_us_without_index":123.70799999999998,"engine":"ultrasql","index_update_us":14943.166000000005,"ingest_path":"insert_batches","insert_us_with_index":31960.500000000004,"insert_us_without_index":17017.334,"n_rows":512,"policy":"Ingestion artifact inserts deterministic vector batches through SQL with and without a pre-created HNSW index; no cross-engine ranking.","profile":"smoke","required_metrics":["rows_per_sec","wal_bytes","index_update_us","commit_us"],"rows_per_sec":15972.007559376483,"rows_per_sec_with_index":15972.007559376483,"rows_per_sec_without_index":29869.829383767923,"schema_version":1,"status":"measured","suite":"ingestion_throughput","vector_dims":8,"wal_bytes":174063,"workload":"ai_gauntlet_ingestion_throughput_smoke"}

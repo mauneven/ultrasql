@@ -442,13 +442,12 @@ benchmarks/ai_benchmark_gauntlet.sh full
 The gauntlet is the committed entrypoint for exact vector scan, ANN
 recall/latency, hybrid search latency, RAG retrieval quality, filtered
 vector search, ingestion throughput, memory per million vectors, and
-cold-start index load time. Today it runs the exact vector top-k, HNSW ANN,
-hybrid search latency, and RAG retrieval quality runners, then writes
-explicit `not_available` artifacts for suites whose runners are not
-implemented yet. The manifest is
-`benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json`; `partial`
-means at least one suite is still missing and no complete AI benchmark
-certification exists.
+cold-start index load time. All required UltraSQL AI suites must emit
+measured artifacts; smoke profiles may still record missing competitors
+inside child artifacts without failing the gauntlet. The manifest is
+`benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json`; `failed`
+means at least one required UltraSQL suite did not produce a measured
+artifact, so no complete AI benchmark certification exists.
 
 ### CSV Benchmark Gauntlet
 

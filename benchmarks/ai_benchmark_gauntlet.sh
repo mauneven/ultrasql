@@ -2,9 +2,9 @@
 # Reproducible AI database benchmark gauntlet.
 #
 # This runner is the single entrypoint for vector/RAG/AI workload artifacts.
-# Suites with committed runners execute those runners. Suites without runners
-# write explicit not_available artifacts so dashboards show gaps without
-# creating benchmark claims.
+# Required UltraSQL suites must emit measured artifacts. Competitor gaps inside
+# cross-engine child scripts remain allowed in smoke profiles and are recorded
+# by those child artifacts without failing this manifest.
 
 set -euo pipefail
 
@@ -30,7 +30,6 @@ esac
 status_file="$(mktemp)"
 trap 'rm -f "$status_file"' EXIT
 failed=0
-unavailable=0
 
 record_suite() {
     local suite="$1"
@@ -55,56 +54,11 @@ run_suite() {
         0)
             record_suite "$suite" "passed" "$code" "$artifact"
             ;;
-        2)
-            unavailable=1
-            record_suite "$suite" "unavailable" "$code" "$artifact"
-            ;;
         *)
             failed=1
             record_suite "$suite" "failed" "$code" "$artifact"
             ;;
     esac
-}
-
-emit_not_available() {
-    local suite="$1"
-    local metrics="$2"
-    local out="$RAW_DIR/ai_gauntlet_${suite}_${PROFILE}-ultrasql.json"
-
-    python3 - "$out" "$suite" "$PROFILE" "$metrics" <<'PY'
-import json
-import pathlib
-import sys
-import time
-
-out, suite, profile, metrics = sys.argv[1:]
-doc = {
-    "schema_version": 1,
-    "suite": suite,
-    "engine": "ultrasql",
-    "workload": f"ai_gauntlet_{suite}_{profile}",
-    "profile": profile,
-    "status": "not_available",
-    "reason": "runner_not_implemented",
-    "generated_at_unix": int(time.time()),
-    "required_metrics": [metric for metric in metrics.split(",") if metric],
-    "policy": (
-        "No benchmark claim exists for this suite until a committed runner "
-        "emits the required metrics from reproducible inputs."
-    ),
-}
-pathlib.Path(out).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
-print(out)
-PY
-}
-
-run_missing_suite() {
-    local suite="$1"
-    local metrics="$2"
-    local artifact
-    artifact="$(emit_not_available "$suite" "$metrics")"
-    record_suite "$suite" "unavailable" 2 "$artifact"
-    unavailable=1
 }
 
 run_exact_vector_scan() {
@@ -244,6 +198,27 @@ run_rag_retrieval_quality() {
         --output "$artifact"
 }
 
+run_ingestion_throughput() {
+    local rows dims artifact
+    if [[ "$PROFILE" == "smoke" ]]; then
+        rows="${AI_GAUNTLET_INGEST_ROWS:-${AI_GAUNTLET_VECTOR_ROWS:-512}}"
+        dims="${AI_GAUNTLET_VECTOR_DIMS:-8}"
+    else
+        rows="${AI_GAUNTLET_INGEST_ROWS:-${AI_GAUNTLET_VECTOR_ROWS:-10000}}"
+        dims="${AI_GAUNTLET_VECTOR_DIMS:-8}"
+    fi
+    artifact="$RAW_DIR/ai_gauntlet_ingestion_throughput_${PROFILE}-ultrasql.json"
+    CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
+        cargo build --release --package ultrasql-bench --features sql-bench \
+            --bin cross_compare_sql >/dev/null
+    target/release/cross_compare_sql \
+        --workload ingestion-throughput \
+        --rows "$rows" \
+        --vector-dims "$dims" \
+        --workload-id "ai_gauntlet_ingestion_throughput_${PROFILE}" \
+        --output "$artifact"
+}
+
 run_memory_per_million_vectors() {
     local rows dims lists probes artifact
     if [[ "$PROFILE" == "smoke" ]]; then
@@ -270,6 +245,30 @@ run_memory_per_million_vectors() {
         --output "$artifact"
 }
 
+run_cold_start_index_load() {
+    local rows dims top_k artifact
+    if [[ "$PROFILE" == "smoke" ]]; then
+        rows="${AI_GAUNTLET_COLD_START_ROWS:-${AI_GAUNTLET_VECTOR_ROWS:-512}}"
+        dims="${AI_GAUNTLET_VECTOR_DIMS:-8}"
+        top_k="${AI_GAUNTLET_COLD_START_K:-${AI_GAUNTLET_VECTOR_K:-5}}"
+    else
+        rows="${AI_GAUNTLET_COLD_START_ROWS:-${AI_GAUNTLET_VECTOR_ROWS:-10000}}"
+        dims="${AI_GAUNTLET_VECTOR_DIMS:-8}"
+        top_k="${AI_GAUNTLET_COLD_START_K:-${AI_GAUNTLET_VECTOR_K:-10}}"
+    fi
+    artifact="$RAW_DIR/ai_gauntlet_cold_start_index_load_${PROFILE}-ultrasql.json"
+    CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
+        cargo build --release --package ultrasql-bench --features sql-bench \
+            --bin cross_compare_sql >/dev/null
+    target/release/cross_compare_sql \
+        --workload cold-start-index-load \
+        --rows "$rows" \
+        --vector-dims "$dims" \
+        --top-k "$top_k" \
+        --workload-id "ai_gauntlet_cold_start_index_load_${PROFILE}" \
+        --output "$artifact"
+}
+
 run_suite \
     "exact_vector_scan" \
     "$RAW_DIR/vector_topk_exact_*-{ultrasql,postgres17_pgvector,duckdb_list,clickhouse_vector}.json" \
@@ -290,16 +289,18 @@ run_suite \
     "rag_retrieval_quality" \
     "$RAW_DIR/ai_gauntlet_rag_retrieval_quality_${PROFILE}-ultrasql.json" \
     run_rag_retrieval_quality
-run_missing_suite \
+run_suite \
     "ingestion_throughput" \
-    "rows_per_second,bytes_per_second,copy_time_us,index_update_time_us"
+    "$RAW_DIR/ai_gauntlet_ingestion_throughput_${PROFILE}-ultrasql.json" \
+    run_ingestion_throughput
 run_suite \
     "memory_per_million_vectors" \
     "$RAW_DIR/ai_gauntlet_memory_per_million_vectors_${PROFILE}-ultrasql.json" \
     run_memory_per_million_vectors
-run_missing_suite \
+run_suite \
     "cold_start_index_load" \
-    "load_time_us,ready_time_us,index_bytes"
+    "$RAW_DIR/ai_gauntlet_cold_start_index_load_${PROFILE}-ultrasql.json" \
+    run_cold_start_index_load
 
 python3 - "$PROFILE" "$MANIFEST" "$status_file" <<'PY'
 import json
@@ -321,18 +322,17 @@ for line in pathlib.Path(status_path).read_text(encoding="utf-8").splitlines():
     )
 
 has_failed = any(entry["status"] == "failed" for entry in entries)
-has_unavailable = any(entry["status"] == "unavailable" for entry in entries)
 doc = {
     "schema_version": 1,
     "profile": profile,
     "generated_at_unix": int(time.time()),
-    "status": "failed" if has_failed else "partial" if has_unavailable else "passed",
-    "passed": not has_failed and not has_unavailable,
+    "status": "failed" if has_failed else "passed",
+    "passed": not has_failed,
     "suites": entries,
     "policy": (
-        "AI benchmark gauntlet is complete only when every suite has a "
-        "committed runner and emits required reproducible metrics. "
-        "not_available artifacts are visible gaps, not benchmark claims."
+        "AI benchmark gauntlet requires every UltraSQL suite to emit measured "
+        "artifacts. Smoke profiles may record missing competitors inside child "
+        "artifacts, but UltraSQL runner gaps fail this manifest."
     ),
 }
 pathlib.Path(manifest_path).write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
@@ -341,8 +341,5 @@ PY
 
 if (( failed != 0 )); then
     exit 1
-fi
-if (( unavailable != 0 )); then
-    exit 2
 fi
 exit 0

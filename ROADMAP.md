@@ -1836,11 +1836,12 @@ same host.
   artifacts include exact top-k, HNSW ANN recall/latency, hybrid search
   latency, filtered vector search with tenant/category predicates, RAG
   retrieval quality with expected document ids, and page-backed HNSW/IVFFlat
-  memory accounting normalized per vector. The AI gauntlet still emits
-  `not_available` for missing runner suites: `ingestion_throughput` and
-  `cold_start_index_load`. Expand the smoke set into committed certification
-  artifacts for those suites plus IVFFlat recall/latency, bulk load, index
-  build, update/delete maintenance, WAL recovery, and larger hybrid RAG query
+  memory accounting normalized per vector, vector ingestion throughput with
+  and without HNSW index maintenance, and cold-start page-backed HNSW restart
+  latency. The AI gauntlet manifest now fails when any required UltraSQL
+  suite fails to emit a measured artifact. Expand the smoke set into committed
+  certification artifacts for IVFFlat recall/latency, larger bulk loads, index
+  build/update/delete maintenance, WAL recovery, and larger hybrid RAG query
   shapes.
   Certification must compare UltraSQL against PostgreSQL + pgvector on the
   same host and report recall@k, p50/p95/p99 latency, throughput, index size,

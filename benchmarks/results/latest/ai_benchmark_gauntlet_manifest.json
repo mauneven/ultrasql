@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
   "profile": "smoke",
-  "generated_at_unix": 1779347157,
-  "status": "partial",
-  "passed": false,
+  "generated_at_unix": 1779348025,
+  "status": "passed",
+  "passed": true,
   "suites": [
     {
       "suite": "exact_vector_scan",
@@ -37,8 +37,8 @@
     },
     {
       "suite": "ingestion_throughput",
-      "status": "unavailable",
-      "exit_code": 2,
+      "status": "passed",
+      "exit_code": 0,
       "artifact": "benchmarks/results/latest/raw/ai_gauntlet_ingestion_throughput_smoke-ultrasql.json"
     },
     {
@@ -49,10 +49,10 @@
     },
     {
       "suite": "cold_start_index_load",
-      "status": "unavailable",
-      "exit_code": 2,
+      "status": "passed",
+      "exit_code": 0,
       "artifact": "benchmarks/results/latest/raw/ai_gauntlet_cold_start_index_load_smoke-ultrasql.json"
     }
   ],
-  "policy": "AI benchmark gauntlet is complete only when every suite has a committed runner and emits required reproducible metrics. not_available artifacts are visible gaps, not benchmark claims."
+  "policy": "AI benchmark gauntlet requires every UltraSQL suite to emit measured artifacts. Smoke profiles may record missing competitors inside child artifacts, but UltraSQL runner gaps fail this manifest."
 }

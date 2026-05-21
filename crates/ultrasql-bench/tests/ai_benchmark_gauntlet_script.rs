@@ -42,24 +42,30 @@ fn ai_gauntlet_declares_required_suites_and_artifacts() {
     assert!(script.contains("--workload rag-retrieval-quality"));
     assert!(script.contains("VECTOR_TOPK_RENDER_RESULTS=0"));
     assert!(script.contains("ai_benchmark_gauntlet_manifest.json"));
-    assert!(script.contains("\"status\": \"not_available\""));
-    assert!(script.contains("runner_not_implemented"));
+    assert!(script.contains("has_failed"));
+    assert!(!script.contains("runner_not_implemented"));
 }
 
 #[test]
-fn phase3_ai_gauntlet_suites_have_real_runners() {
+fn required_ai_gauntlet_suites_have_real_ultrasql_runners() {
     let script = repo_file("benchmarks/ai_benchmark_gauntlet.sh");
 
     assert!(script.contains("run_filtered_vector_search"));
     assert!(script.contains("run_memory_per_million_vectors"));
+    assert!(script.contains("run_cold_start_index_load"));
+    assert!(script.contains("run_ingestion_throughput"));
     assert!(script.contains("ultrasql-bench filtered-vector"));
     assert!(script.contains("ultrasql-bench vector-memory"));
-    assert!(!script.contains("run_missing_suite \\\n    \"filtered_vector_search\""));
-    assert!(!script.contains("run_missing_suite \\\n    \"memory_per_million_vectors\""));
+    assert!(script.contains("--workload cold-start-index-load"));
+    assert!(script.contains("--workload ingestion-throughput"));
+    assert!(
+        !script.contains("run_missing_suite"),
+        "all required UltraSQL AI gauntlet suites must have real runners"
+    );
 }
 
 #[test]
-fn phase3_ai_gauntlet_smoke_artifacts_are_measured() {
+fn ai_gauntlet_smoke_artifacts_are_measured() {
     let filtered = repo_json(
         "benchmarks/results/latest/raw/ai_gauntlet_filtered_vector_search_smoke-ultrasql.json",
     );
@@ -76,6 +82,18 @@ fn phase3_ai_gauntlet_smoke_artifacts_are_measured() {
         assert!(
             filtered.get(field).is_some(),
             "filtered vector artifact missing {field}"
+        );
+    }
+
+    let ingestion = repo_json(
+        "benchmarks/results/latest/raw/ai_gauntlet_ingestion_throughput_smoke-ultrasql.json",
+    );
+    assert_eq!(ingestion["suite"], "ingestion_throughput");
+    assert_eq!(ingestion["status"], "measured");
+    for field in ["rows_per_sec", "wal_bytes", "index_update_us", "commit_us"] {
+        assert!(
+            ingestion.get(field).is_some(),
+            "ingestion artifact missing {field}"
         );
     }
 
@@ -111,6 +129,37 @@ fn phase3_ai_gauntlet_smoke_artifacts_are_measured() {
             "memory artifact missing {field}"
         );
     }
+
+    let cold = repo_json(
+        "benchmarks/results/latest/raw/ai_gauntlet_cold_start_index_load_smoke-ultrasql.json",
+    );
+    assert_eq!(cold["suite"], "cold_start_index_load");
+    assert_eq!(cold["status"], "measured");
+    for field in [
+        "restart_time_us",
+        "first_query_us",
+        "second_query_us",
+        "index_loaded_from_disk",
+    ] {
+        assert!(
+            cold.get(field).is_some(),
+            "cold-start artifact missing {field}"
+        );
+    }
+    assert_eq!(cold["index_loaded_from_disk"], true);
+}
+
+#[test]
+fn ai_gauntlet_manifest_gate_requires_ultrasql_measurements() {
+    let manifest = repo_json("benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json");
+
+    assert_eq!(manifest["status"], "passed");
+    assert_eq!(manifest["passed"], true);
+    let suites = manifest["suites"].as_array().expect("suites array");
+    assert!(
+        suites.iter().all(|suite| suite["status"] == "passed"),
+        "required UltraSQL AI suites must be passed: {suites:?}"
+    );
 }
 
 #[test]
