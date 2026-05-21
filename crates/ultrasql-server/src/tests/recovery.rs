@@ -77,3 +77,20 @@ fn server_init_retains_wal_writer_and_flushes_on_drop() {
     assert_eq!(seen_nop, 1);
     assert!(recovered_lsn.raw() > appended_lsn.raw());
 }
+
+#[test]
+fn persistent_server_can_force_commit_marker_durable() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let server = Server::init(data_dir.path()).unwrap();
+
+    let commit_lsn = server
+        .append_commit_record(Xid::FIRST_USER)
+        .unwrap()
+        .expect("persistent server must append a commit marker");
+    server.wait_for_wal_durable(commit_lsn).unwrap();
+
+    let flushed_lsn = server
+        .runtime_wal_flushed_lsn()
+        .expect("persistent server must own a WAL writer");
+    assert!(flushed_lsn.raw() >= commit_lsn.raw());
+}

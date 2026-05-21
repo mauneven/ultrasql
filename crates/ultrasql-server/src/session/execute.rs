@@ -1452,7 +1452,9 @@ where
                     tracing::warn!(error = %e, "autocommit failed to finalise");
                 } else {
                     if is_dml {
-                        self.state.append_commit_record(xid)?;
+                        if let Some(commit_lsn) = self.state.append_commit_record(xid)? {
+                            self.state.wait_for_wal_durable(commit_lsn)?;
+                        }
                     }
                     self.pending_post_commit_maintenance = true;
                     let rows = result.rows;

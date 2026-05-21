@@ -1939,9 +1939,9 @@ impl Server {
     }
 
     /// Append a commit marker for WAL-backed SQL recovery.
-    pub(crate) fn append_commit_record(&self, xid: Xid) -> Result<(), ServerError> {
+    pub(crate) fn append_commit_record(&self, xid: Xid) -> Result<Option<Lsn>, ServerError> {
         let Some(wal) = self.heap.wal_sink() else {
-            return Ok(());
+            return Ok(None);
         };
         let payload = CommitPayload {
             commit_lsn: Lsn::ZERO,
@@ -1949,8 +1949,41 @@ impl Server {
         };
         let record = WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, payload.encode());
         wal.append(record)
-            .map(|_| ())
+            .map(Some)
             .map_err(|e| ServerError::ddl(format!("commit WAL append: {e}")))
+    }
+
+    /// Wait until the runtime WAL writer has fsynced at least `lsn`.
+    pub(crate) fn wait_for_wal_durable(&self, lsn: Lsn) -> Result<(), ServerError> {
+        let Some(writer) = &self.wal_writer else {
+            return Ok(());
+        };
+        if lsn == Lsn::ZERO {
+            return Ok(());
+        }
+
+        const WAL_DURABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const WAL_DURABILITY_POLL: std::time::Duration = std::time::Duration::from_micros(50);
+
+        let started = std::time::Instant::now();
+        loop {
+            let flushed = writer.flushed_lsn();
+            if flushed.raw() >= lsn.raw() {
+                return Ok(());
+            }
+            if started.elapsed() >= WAL_DURABILITY_TIMEOUT {
+                return Err(ServerError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "WAL durability wait timed out at flushed_lsn={} target_lsn={}",
+                        flushed.raw(),
+                        lsn.raw()
+                    ),
+                )));
+            }
+            writer.notify();
+            std::thread::sleep(WAL_DURABILITY_POLL);
+        }
     }
 
     /// Flush dirty heap pages into the sample server's spill store.
