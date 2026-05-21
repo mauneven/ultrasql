@@ -749,6 +749,21 @@ to show before/after numbers in the PR description.
 - No other `benchmarks/results/*` directories are permitted on `main`.
   The CI check `benchmarks/check_no_legacy_dirs.sh` enforces this.
 
+## README Benchmark Fairness Policy
+
+README benchmark tables are SQL-surface comparisons only. A row is eligible
+only when the measured path enters through a public SQL/client interface:
+UltraSQL through PostgreSQL wire, PostgreSQL through libpq/`psql`, SQLite
+through `sqlite3`, DuckDB through `duckdb`, ClickHouse through
+`clickhouse-client`, and Firebolt through local Firebolt Core SQL HTTP.
+
+`cargo bench`, `crates/*/benches/`, executor-only harnesses, storage kernels,
+and in-process helper APIs are internal regression tools. They may be useful
+for finding hot paths, but they must not be rendered into README cross-engine
+tables or used for competitor claims. If a benchmark bypasses parser, binder,
+planner/optimizer, executor dispatch, or client/wire serialization, keep it
+out of README tables.
+
 ## Output Format
 
 Cross-engine comparison runs write per-engine raw JSON to

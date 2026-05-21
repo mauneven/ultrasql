@@ -15,10 +15,11 @@ and predictably.
 ## Benchmarks
 
 Cross-engine measurements on Apple M4 Mac mini, hot cache, median of 32 runs.
-**Every row is measured through that engine's full SQL pipeline.** Competitor
-rows come from each engine's native client (`sqlite3`, `psql`/libpq for
-PostgreSQL 17, `duckdb`, `clickhouse-client`); UltraSQL rows are measured via
-`tokio-postgres` against an in-process `ultrasqld` (see
+**Every headline row is measured through that engine's SQL surface.**
+Competitor rows come from each engine's native client (`sqlite3`,
+`psql`/libpq for PostgreSQL 17, `duckdb`, `clickhouse-client`, local
+Firebolt Core HTTP SQL); UltraSQL rows are measured via `tokio-postgres`
+against an in-process `ultrasqld` (see
 [`crates/ultrasql-bench/src/bin/cross_compare_sql.rs`](crates/ultrasql-bench/src/bin/cross_compare_sql.rs))
 — so the comparison goes parse → bind → plan → optimize → execute →
 serialize on every side.
@@ -29,14 +30,14 @@ slowest, shortest bar = fastest).
 
 ### What these numbers measure honestly — and what they don't
 
-The `cross_compare_sql` matrix covers nine kernel-style workloads — eight
-OLTP / OLAP shapes plus a v0.5 window-function pass — on one fixed
+The `cross_compare_sql` matrix covers nine SQL-surface microbench workloads —
+eight OLTP / OLAP shapes plus a v0.5 window-function pass — on one fixed
 `(id INT, val INT)` / `(id INT, x INT)` schema. Real-application coverage
 still needs more variety (`ORDER BY` ranking, multi-column `JOIN`,
 `IndexScan` paths, multi-row `INSERT ... SELECT`, etc.) — many of those
 are kernel-complete inside UltraSQL but **not yet reachable through
 `lower_query`** in v0.5 / v0.6. Treat the matrix as a microbench suite,
-not a full PostgreSQL replacement claim.
+not a production-readiness claim.
 
 On the `window_row_number_65k_i64` workload UltraSQL takes first
 place. The columnar fast path in `WindowAgg::try_columnar_row_number`
@@ -172,7 +173,7 @@ rows in the generic matrix.
 | PostgreSQL | 42.10 ms | 88,215% slower |
 <!-- END AUTO: BENCH:select_avg_1m_i64 -->
 
-Write-side benchmarks land when the storage engine is wired (v0.3+):
+Write-side SQL-surface benchmarks:
 
 <!-- BEGIN AUTO: BENCH:insert_throughput_10k -->
 ### INSERT throughput — 10 000 rows
@@ -285,9 +286,10 @@ but are still auto-rendered from committed raw artifacts under
 <!-- END AUTO: BENCH:vector_ann_hnsw_512_8d_k10 -->
 
 Per-kernel microbenchmarks (in-process, no SQL surface) are kept under
-`crates/*/benches/` for internal regression tracking via `cargo bench`;
-they are not published as cross-engine comparisons because they bypass
-UltraSQL's parser, planner, and wire stack.
+`crates/*/benches/` for internal regression tracking via `cargo bench`.
+They are not valid README comparison rows, not read by `readme-render`, and
+not published as cross-engine claims because they bypass UltraSQL's parser,
+planner, optimizer, executor dispatch, and PostgreSQL wire stack.
 
 ---
 

@@ -382,6 +382,16 @@ fn display_engine_name(raw: &str) -> String {
     }
 }
 
+/// Returns whether a row is eligible for README cross-engine tables.
+///
+/// README rows must represent full SQL/client-surface measurements. Kernel
+/// and in-process-only labels are intentionally rejected so internal
+/// regression numbers cannot leak into public competitor comparisons.
+fn is_publishable_readme_row(engine: &str) -> bool {
+    let normalized = engine.to_ascii_lowercase();
+    !normalized.contains("kernel") && !normalized.contains("in-process")
+}
+
 /// Format the slowdown of `this_us` relative to `baseline_us` as a
 /// percentage string suffixed with " slower". For ratios under 10×
 /// (i.e. < 900% slower) the result has one decimal place; beyond that
@@ -830,6 +840,7 @@ fn build_tables(
         // Sort ascending by median (fastest first). The
         // slowest row sets the scale for the ASCII relative-time bar
         // rendered alongside each engine.
+        rows.retain(|(engine, _)| is_publishable_readme_row(engine));
         rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let table = render_table(static_table.heading, &rows);
@@ -1153,6 +1164,30 @@ rest\n";
         assert!(rendered.contains("| DuckDB | 90.00 µs | 100.0% slower |"));
         assert!(rendered.contains("| Firebolt Core | 1.20 ms | 2,567% slower |"));
         assert!(!rendered.contains("stale content"));
+    }
+
+    #[test]
+    fn readme_tables_reject_kernel_or_in_process_rows() {
+        let mut write_side = HashMap::new();
+        write_side.insert(
+            "select_sum_65k_i64".to_string(),
+            vec![
+                ("ultrasql".to_string(), 45.0),
+                ("**UltraSQL** (kernel)".to_string(), 4.0),
+                ("DuckDB".to_string(), 90.0),
+                ("local in-process helper".to_string(), 3.0),
+            ],
+        );
+
+        let tables = build_tables(&HashMap::new(), &write_side);
+        let table = tables
+            .get("select_sum_65k_i64")
+            .expect("select_sum table exists");
+
+        assert!(table.contains("| **UltraSQL** | 45.00 µs | — |"));
+        assert!(table.contains("| DuckDB | 90.00 µs | 100.0% slower |"));
+        assert!(!table.to_ascii_lowercase().contains("kernel"));
+        assert!(!table.to_ascii_lowercase().contains("in-process"));
     }
 
     // -----------------------------------------------------------------------
