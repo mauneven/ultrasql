@@ -312,6 +312,7 @@ fn compute_record_crc(header: &WalRecordHeader, payload: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn rec(rt: RecordType, payload: &[u8]) -> WalRecord {
         WalRecord::new(rt, Xid::new(42), Lsn::new(100), 0, payload.to_vec())
@@ -448,5 +449,33 @@ mod tests {
         bytes[RTYPE_OFFSET] = RecordType::HeapInsert as u8;
         let err = WalRecord::decode(&bytes).unwrap_err();
         assert!(matches!(err, WalRecordError::Malformed(_)), "got {err:?}");
+    }
+
+    proptest! {
+        #[test]
+        fn random_wal_bytes_never_panic(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096_usize),
+        ) {
+            let result = std::panic::catch_unwind(|| WalRecord::decode(&bytes));
+            prop_assert!(result.is_ok(), "decoder panicked on random WAL bytes");
+        }
+
+        #[test]
+        fn mutated_valid_wal_bytes_never_panic(
+            payload in proptest::collection::vec(any::<u8>(), 0..1024_usize),
+            mutations in proptest::collection::vec((0_usize..2048_usize, any::<u8>()), 0..32_usize),
+        ) {
+            let mut bytes = rec(RecordType::HeapInsert, &payload).encode();
+            for (idx, mask) in mutations {
+                let pos = idx % bytes.len();
+                bytes[pos] ^= mask;
+            }
+
+            let result = std::panic::catch_unwind(|| WalRecord::decode(&bytes));
+            prop_assert!(result.is_ok(), "decoder panicked on mutated valid WAL bytes");
+            if let Ok(Ok((_record, used))) = result {
+                prop_assert!(used <= bytes.len());
+            }
+        }
     }
 }
