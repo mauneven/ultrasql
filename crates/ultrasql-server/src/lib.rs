@@ -249,10 +249,53 @@ pub struct TableRowSecurity {
 pub struct RuntimeRlsPolicy {
     /// Policy name.
     pub name: String,
+    /// Permissive/restrictive combination mode.
+    pub permissiveness: RuntimeRlsPermissiveness,
+    /// Command class this policy applies to.
+    pub command: RuntimeRlsCommand,
     /// Read visibility predicate.
     pub using: Option<RuntimeTenantPolicyExpr>,
     /// Write acceptance predicate.
     pub with_check: Option<RuntimeTenantPolicyExpr>,
+}
+
+/// Runtime row-security policy combination mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeRlsPermissiveness {
+    /// PostgreSQL `AS PERMISSIVE`.
+    Permissive,
+    /// PostgreSQL `AS RESTRICTIVE`.
+    Restrictive,
+}
+
+/// Runtime row-security policy command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeRlsCommand {
+    /// `FOR ALL`.
+    All,
+    /// `FOR SELECT`.
+    Select,
+    /// `FOR INSERT`.
+    Insert,
+    /// `FOR UPDATE`.
+    Update,
+    /// `FOR DELETE`.
+    Delete,
+}
+
+impl RuntimeRlsCommand {
+    /// Return whether this policy command applies to a statement command.
+    #[must_use]
+    pub const fn applies_to(self, statement: Self) -> bool {
+        matches!(self, Self::All)
+            || matches!(
+                (self, statement),
+                (Self::Select, Self::Select)
+                    | (Self::Insert, Self::Insert)
+                    | (Self::Update, Self::Update)
+                    | (Self::Delete, Self::Delete)
+            )
+    }
 }
 
 /// Runtime tenant predicate of the form `column = current_setting(setting, true)`.

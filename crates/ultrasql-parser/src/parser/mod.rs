@@ -29,7 +29,7 @@
 //! - `binary_ops` holds the binary-operator detection helpers used
 //!   by the Pratt loop (`peek_binary_op` and `consume_binary_op`).
 
-use crate::ast::{CreatePolicyStmt, Expr, Statement};
+use crate::ast::{CreatePolicyStmt, Expr, PolicyCommand, PolicyPermissiveness, Statement};
 use crate::lexer::{Lexer, LexerError};
 use crate::token::{Token, TokenKind};
 
@@ -372,6 +372,16 @@ impl<'src> Parser<'src> {
         let name = self.parse_identifier()?;
         self.expect(TokenKind::KwOn, "ON")?;
         let table = self.parse_object_name()?;
+        let permissiveness = if self.match_kw(TokenKind::KwAs) {
+            self.parse_policy_permissiveness()?
+        } else {
+            PolicyPermissiveness::Permissive
+        };
+        let command = if self.match_kw(TokenKind::KwFor) {
+            self.parse_policy_command()?
+        } else {
+            PolicyCommand::All
+        };
         let mut using = None;
         let mut with_check = None;
         loop {
@@ -392,10 +402,57 @@ impl<'src> Parser<'src> {
         Ok(CreatePolicyStmt {
             name,
             table,
+            permissiveness,
+            command,
             using,
             with_check,
             span: crate::span::Span::new(create_start, end),
         })
+    }
+
+    fn parse_policy_permissiveness(&mut self) -> Result<PolicyPermissiveness, ParseError> {
+        let tok = *self.peek()?;
+        if tok.kind == TokenKind::Identifier {
+            if tok
+                .text(self.source)
+                .is_some_and(|text| text.eq_ignore_ascii_case("permissive"))
+            {
+                self.advance()?;
+                return Ok(PolicyPermissiveness::Permissive);
+            }
+            if tok
+                .text(self.source)
+                .is_some_and(|text| text.eq_ignore_ascii_case("restrictive"))
+            {
+                self.advance()?;
+                return Ok(PolicyPermissiveness::Restrictive);
+            }
+        }
+        Err(ParseError::Expected {
+            expected: "PERMISSIVE or RESTRICTIVE",
+            found: tok.kind,
+            offset: tok.span.start as usize,
+        })
+    }
+
+    fn parse_policy_command(&mut self) -> Result<PolicyCommand, ParseError> {
+        let tok = *self.peek()?;
+        let command = match tok.kind {
+            TokenKind::KwAll => PolicyCommand::All,
+            TokenKind::KwSelect => PolicyCommand::Select,
+            TokenKind::KwInsert => PolicyCommand::Insert,
+            TokenKind::KwUpdate => PolicyCommand::Update,
+            TokenKind::KwDelete => PolicyCommand::Delete,
+            other => {
+                return Err(ParseError::Expected {
+                    expected: "ALL, SELECT, INSERT, UPDATE, or DELETE",
+                    found: other,
+                    offset: tok.span.start as usize,
+                });
+            }
+        };
+        self.advance()?;
+        Ok(command)
     }
 
     fn parse_parenthesized_policy_expr(&mut self) -> Result<Expr, ParseError> {

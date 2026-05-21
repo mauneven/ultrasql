@@ -1833,10 +1833,11 @@ same host.
   policy, and recall-vs-latency artifacts against exact scan.
 - [x] **RAG tenant RLS slice, narrow predicate** — `CREATE POLICY`,
   `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `SET ultrasql.tenant_id`, read
-  predicate injection, and `INSERT ... VALUES` `WITH CHECK` enforcement work
+  predicate injection, command-specific policies, permissive/restrictive
+  policy combination, and `INSERT ... VALUES` `WITH CHECK` enforcement work
   for the documented RAG policy shape
   `tenant_id = current_setting('ultrasql.tenant_id', true)`. Remaining work:
-  persistent policy catalog/restart bootstrap, full PostgreSQL RLS semantics,
+  persistent policy catalog/restart bootstrap, owner/bypass behavior,
   `INSERT ... SELECT`, update new-row checks, role-scoped policies, and tenant
   certification artifacts.
 - [ ] **AI/vector benchmark certification slice** — current measured smoke
@@ -1862,7 +1863,7 @@ same host.
 - [ ] Column-level privileges
 - [ ] Role inheritance + `SET ROLE`
 - [ ] Default privileges (`ALTER DEFAULT PRIVILEGES`)
-- [ ] Row-level security: full PostgreSQL policy semantics (tenant `CREATE POLICY` / `ENABLE ROW LEVEL SECURITY` slice done)
+- [ ] Row-level security: role/owner/bypass/restart semantics (tenant command-specific + permissive/restrictive policy slice done)
 - [ ] `log_connections`, `log_min_duration_statement`, `log_statement`
 
 ### ORM Compatibility

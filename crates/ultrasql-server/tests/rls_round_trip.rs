@@ -130,3 +130,150 @@ async fn rls_tenant_policy_filters_reads_and_checks_inserts() {
 
     shutdown(client, server_handle).await;
 }
+
+#[tokio::test]
+async fn rls_insert_uses_insert_policies_not_select_using_predicates() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE tenant_docs_insert (\
+                tenant_id TEXT NOT NULL, \
+                doc_id TEXT NOT NULL, \
+                body TEXT\
+             )",
+        )
+        .await
+        .expect("create tenant table");
+    client
+        .batch_execute(
+            "INSERT INTO tenant_docs_insert VALUES \
+                ('tenant-a', 'doc-a', 'alpha'), \
+                ('tenant-b', 'doc-b', 'bravo')",
+        )
+        .await
+        .expect("insert seed rows");
+    client
+        .batch_execute(
+            "CREATE POLICY tenant_docs_insert_read ON tenant_docs_insert \
+                FOR SELECT \
+                USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect("create select policy");
+    client
+        .batch_execute("ALTER TABLE tenant_docs_insert ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect("enable table rls");
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set tenant guc");
+
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT doc_id FROM tenant_docs_insert ORDER BY doc_id")
+            .await
+            .expect("select tenant-a rows"),
+    );
+    assert_eq!(rows, vec![vec!["doc-a".to_owned()]]);
+
+    let err = client
+        .batch_execute("INSERT INTO tenant_docs_insert VALUES ('tenant-a', 'doc-a-2', 'alpha-2')")
+        .await
+        .expect_err("SELECT policy must not authorize INSERT");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("row-level security")),
+        "unexpected error: {err}"
+    );
+
+    client
+        .batch_execute(
+            "CREATE POLICY tenant_docs_insert_write ON tenant_docs_insert \
+                FOR INSERT \
+                WITH CHECK (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect("create insert policy");
+    client
+        .batch_execute("INSERT INTO tenant_docs_insert VALUES ('tenant-a', 'doc-a-3', 'alpha-3')")
+        .await
+        .expect("same-tenant insert passes after FOR INSERT policy");
+    let err = client
+        .batch_execute("INSERT INTO tenant_docs_insert VALUES ('tenant-b', 'doc-b-2', 'bravo-2')")
+        .await
+        .expect_err("cross-tenant insert must fail INSERT policy");
+    assert!(
+        err.as_db_error()
+            .is_some_and(|db| db.message().contains("row-level security")),
+        "unexpected error: {err}"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn rls_restrictive_select_policies_narrow_permissive_visibility() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE tenant_docs_restrictive (\
+                tenant_id TEXT NOT NULL, \
+                visibility TEXT NOT NULL, \
+                doc_id TEXT NOT NULL\
+             )",
+        )
+        .await
+        .expect("create tenant table");
+    client
+        .batch_execute(
+            "INSERT INTO tenant_docs_restrictive VALUES \
+                ('tenant-a', 'public', 'doc-a-public'), \
+                ('tenant-a', 'private', 'doc-a-private'), \
+                ('tenant-b', 'public', 'doc-b-public')",
+        )
+        .await
+        .expect("insert seed rows");
+    client
+        .batch_execute(
+            "CREATE POLICY tenant_docs_restrictive_tenant ON tenant_docs_restrictive \
+                AS PERMISSIVE \
+                FOR SELECT \
+                USING (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        )
+        .await
+        .expect("create permissive tenant policy");
+    client
+        .batch_execute(
+            "CREATE POLICY tenant_docs_restrictive_visibility ON tenant_docs_restrictive \
+                AS RESTRICTIVE \
+                FOR SELECT \
+                USING (visibility = current_setting('ultrasql.visibility', true))",
+        )
+        .await
+        .expect("create restrictive visibility policy");
+    client
+        .batch_execute("ALTER TABLE tenant_docs_restrictive ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect("enable table rls");
+    client
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set tenant guc");
+    client
+        .batch_execute("SET ultrasql.visibility = 'public'")
+        .await
+        .expect("set visibility guc");
+
+    let rows = simple_rows(
+        &client
+            .simple_query("SELECT doc_id FROM tenant_docs_restrictive ORDER BY doc_id")
+            .await
+            .expect("select narrowed rows"),
+    );
+    assert_eq!(rows, vec![vec!["doc-a-public".to_owned()]]);
+
+    shutdown(client, server_handle).await;
+}

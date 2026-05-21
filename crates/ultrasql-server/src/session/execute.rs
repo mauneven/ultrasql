@@ -79,6 +79,20 @@ fn bool_literal(value: bool) -> ScalarExpr {
     }
 }
 
+fn combine_rls_predicates(mut predicates: Vec<ScalarExpr>, op: BinaryOp) -> Option<ScalarExpr> {
+    let first = predicates.pop()?;
+    Some(
+        predicates
+            .into_iter()
+            .fold(first, |left, right| ScalarExpr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+                data_type: DataType::Bool,
+            }),
+    )
+}
+
 fn parse_bool_guc(value: &str) -> Result<bool, ServerError> {
     match value.to_ascii_lowercase().as_str() {
         "on" | "true" | "1" | "yes" => Ok(true),
@@ -796,15 +810,22 @@ where
         &self,
         plan: &LogicalPlan,
         catalog_snapshot: &CatalogSnapshot,
+        command: crate::RuntimeRlsCommand,
     ) -> Result<Option<LogicalPlan>, ServerError> {
         match plan {
             LogicalPlan::Scan {
                 table,
                 schema,
                 projection,
-            } => self.rls_scan_plan(table, schema, projection.as_deref(), catalog_snapshot),
+            } => self.rls_scan_plan(
+                table,
+                schema,
+                projection.as_deref(),
+                catalog_snapshot,
+                command,
+            ),
             LogicalPlan::Filter { input, predicate } => self
-                .apply_row_security(input, catalog_snapshot)?
+                .apply_row_security(input, catalog_snapshot, command)?
                 .map(|input| LogicalPlan::Filter {
                     input: Box::new(input),
                     predicate: predicate.clone(),
@@ -815,7 +836,7 @@ where
                 exprs,
                 schema,
             } => self
-                .apply_row_security(input, catalog_snapshot)?
+                .apply_row_security(input, catalog_snapshot, command)?
                 .map(|input| LogicalPlan::Project {
                     input: Box::new(input),
                     exprs: exprs.clone(),
@@ -823,7 +844,7 @@ where
                 })
                 .transpose_ok(),
             LogicalPlan::Limit { input, n, offset } => self
-                .apply_row_security(input, catalog_snapshot)?
+                .apply_row_security(input, catalog_snapshot, command)?
                 .map(|input| LogicalPlan::Limit {
                     input: Box::new(input),
                     n: *n,
@@ -831,7 +852,7 @@ where
                 })
                 .transpose_ok(),
             LogicalPlan::Sort { input, keys } => self
-                .apply_row_security(input, catalog_snapshot)?
+                .apply_row_security(input, catalog_snapshot, command)?
                 .map(|input| LogicalPlan::Sort {
                     input: Box::new(input),
                     keys: keys.clone(),
@@ -845,7 +866,7 @@ where
                 output_name,
                 schema,
             } => self
-                .apply_row_security(input, catalog_snapshot)?
+                .apply_row_security(input, catalog_snapshot, command)?
                 .map(|input| LogicalPlan::Window {
                     input: Box::new(input),
                     partition_by: partition_by.clone(),
@@ -861,7 +882,7 @@ where
                 aggregates,
                 schema,
             } => self
-                .apply_row_security(input, catalog_snapshot)?
+                .apply_row_security(input, catalog_snapshot, command)?
                 .map(|input| LogicalPlan::Aggregate {
                     input: Box::new(input),
                     group_by: group_by.clone(),
@@ -876,8 +897,8 @@ where
                 condition,
                 schema,
             } => {
-                let new_left = self.apply_row_security(left, catalog_snapshot)?;
-                let new_right = self.apply_row_security(right, catalog_snapshot)?;
+                let new_left = self.apply_row_security(left, catalog_snapshot, command)?;
+                let new_right = self.apply_row_security(right, catalog_snapshot, command)?;
                 if new_left.is_none() && new_right.is_none() {
                     return Ok(None);
                 }
@@ -896,8 +917,8 @@ where
                 right,
                 schema,
             } => {
-                let new_left = self.apply_row_security(left, catalog_snapshot)?;
-                let new_right = self.apply_row_security(right, catalog_snapshot)?;
+                let new_left = self.apply_row_security(left, catalog_snapshot, command)?;
+                let new_right = self.apply_row_security(right, catalog_snapshot, command)?;
                 if new_left.is_none() && new_right.is_none() {
                     return Ok(None);
                 }
@@ -916,8 +937,9 @@ where
                 body,
                 schema,
             } => {
-                let new_definition = self.apply_row_security(definition, catalog_snapshot)?;
-                let new_body = self.apply_row_security(body, catalog_snapshot)?;
+                let new_definition =
+                    self.apply_row_security(definition, catalog_snapshot, command)?;
+                let new_body = self.apply_row_security(body, catalog_snapshot, command)?;
                 if new_definition.is_none() && new_body.is_none() {
                     return Ok(None);
                 }
@@ -937,7 +959,7 @@ where
                 wait_policy,
                 schema,
             } => self
-                .apply_row_security(input, catalog_snapshot)?
+                .apply_row_security(input, catalog_snapshot, command)?
                 .map(|input| LogicalPlan::LockRows {
                     input: Box::new(input),
                     strength: *strength,
@@ -953,7 +975,7 @@ where
                 returning,
                 schema,
             } => self
-                .apply_row_security(source, catalog_snapshot)?
+                .apply_row_security(source, catalog_snapshot, crate::RuntimeRlsCommand::Select)?
                 .map(|source| LogicalPlan::Insert {
                     table: table.clone(),
                     columns: columns.clone(),
@@ -970,7 +992,7 @@ where
                 returning,
                 schema,
             } => self
-                .apply_row_security(input, catalog_snapshot)?
+                .apply_row_security(input, catalog_snapshot, crate::RuntimeRlsCommand::Update)?
                 .map(|input| LogicalPlan::Update {
                     table: table.clone(),
                     assignments: assignments.clone(),
@@ -985,7 +1007,7 @@ where
                 returning,
                 schema,
             } => self
-                .apply_row_security(input, catalog_snapshot)?
+                .apply_row_security(input, catalog_snapshot, crate::RuntimeRlsCommand::Delete)?
                 .map(|input| LogicalPlan::Delete {
                     table: table.clone(),
                     input: Box::new(input),
@@ -999,7 +1021,7 @@ where
                 input,
                 schema,
             } => self
-                .apply_row_security(input, catalog_snapshot)?
+                .apply_row_security(input, catalog_snapshot, command)?
                 .map(|input| LogicalPlan::Explain {
                     analyze: *analyze,
                     format: *format,
@@ -1026,7 +1048,7 @@ where
                 let Some(input) = input else {
                     return Ok(None);
                 };
-                self.apply_row_security(input, catalog_snapshot)?
+                self.apply_row_security(input, catalog_snapshot, command)?
                     .map(|input| LogicalPlan::Copy {
                         relation: relation.clone(),
                         input: Some(Box::new(input)),
@@ -1055,6 +1077,7 @@ where
         schema: &ultrasql_core::Schema,
         projection: Option<&[usize]>,
         catalog_snapshot: &CatalogSnapshot,
+        command: crate::RuntimeRlsCommand,
     ) -> Result<Option<LogicalPlan>, ServerError> {
         let Some(entry) = catalog_snapshot.tables.get(table) else {
             return Ok(None);
@@ -1062,7 +1085,7 @@ where
         let Some(runtime) = self.enabled_row_security(entry.oid) else {
             return Ok(None);
         };
-        let predicate = self.rls_using_predicate(&runtime)?;
+        let predicate = self.rls_using_predicate(&runtime, command)?;
         let full_scan = LogicalPlan::Scan {
             table: table.to_owned(),
             schema: entry.schema.clone(),
@@ -1110,23 +1133,39 @@ where
     fn rls_using_predicate(
         &self,
         runtime: &crate::TableRowSecurity,
+        command: crate::RuntimeRlsCommand,
     ) -> Result<ScalarExpr, ServerError> {
-        let mut predicates = runtime
+        let mut permissive = Vec::new();
+        let mut restrictive = Vec::new();
+        for policy in runtime
             .policies
             .iter()
-            .filter_map(|policy| policy.using.as_ref())
-            .map(|expr| self.rls_tenant_predicate(expr));
-        let Some(first) = predicates.next() else {
+            .filter(|policy| policy.command.applies_to(command))
+        {
+            let Some(expr) = policy.using.as_ref() else {
+                continue;
+            };
+            match policy.permissiveness {
+                crate::RuntimeRlsPermissiveness::Permissive => {
+                    permissive.push(self.rls_tenant_predicate(expr)?);
+                }
+                crate::RuntimeRlsPermissiveness::Restrictive => {
+                    restrictive.push(self.rls_tenant_predicate(expr)?);
+                }
+            }
+        }
+        let Some(mut predicate) = combine_rls_predicates(permissive, BinaryOp::Or) else {
             return Ok(bool_literal(false));
         };
-        predicates.try_fold(first?, |left, right| {
-            Ok(ScalarExpr::Binary {
-                op: BinaryOp::Or,
-                left: Box::new(left),
-                right: Box::new(right?),
+        if let Some(restrictive) = combine_rls_predicates(restrictive, BinaryOp::And) {
+            predicate = ScalarExpr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(predicate),
+                right: Box::new(restrictive),
                 data_type: DataType::Bool,
-            })
-        })
+            };
+        }
+        Ok(predicate)
     }
 
     fn rls_tenant_predicate(
@@ -1174,13 +1213,20 @@ where
         let Some(runtime) = self.enabled_row_security(entry.oid) else {
             return Ok(());
         };
-        let checks = runtime
+        let mut permissive_checks = Vec::new();
+        let mut restrictive_checks = Vec::new();
+        for policy in runtime
             .policies
             .iter()
-            .filter_map(|policy| policy.with_check.as_ref().or(policy.using.as_ref()))
-            .collect::<Vec<_>>();
-        if checks.is_empty() {
-            return Ok(());
+            .filter(|policy| policy.command.applies_to(crate::RuntimeRlsCommand::Insert))
+        {
+            let Some(check) = policy.with_check.as_ref().or(policy.using.as_ref()) else {
+                continue;
+            };
+            match policy.permissiveness {
+                crate::RuntimeRlsPermissiveness::Permissive => permissive_checks.push(check),
+                crate::RuntimeRlsPermissiveness::Restrictive => restrictive_checks.push(check),
+            }
         }
         let LogicalPlan::Values { rows, .. } = source.as_ref() else {
             return Err(ServerError::Unsupported(
@@ -1189,10 +1235,18 @@ where
         };
         for row in rows {
             let mut accepted = false;
-            for check in &checks {
+            for check in &permissive_checks {
                 if self.rls_insert_row_matches(check, columns, row)? {
                     accepted = true;
                     break;
+                }
+            }
+            if accepted {
+                for check in &restrictive_checks {
+                    if !self.rls_insert_row_matches(check, columns, row)? {
+                        accepted = false;
+                        break;
+                    }
                 }
             }
             if !accepted {
@@ -1255,7 +1309,8 @@ where
         plan: &LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
     ) -> Result<SelectResult, ServerError> {
-        let rls_plan = self.apply_row_security(plan, catalog_snapshot)?;
+        let rls_plan =
+            self.apply_row_security(plan, catalog_snapshot, crate::RuntimeRlsCommand::Select)?;
         let plan = rls_plan.as_ref().unwrap_or(plan);
         self.check_rls_insert_values(plan, catalog_snapshot)?;
         let _operator_span =

@@ -361,13 +361,42 @@ pub struct CreateMaterializedViewStmt {
     pub span: Span,
 }
 
-/// `CREATE POLICY name ON table [USING (expr)] [WITH CHECK (expr)]`.
+/// `CREATE POLICY` permissiveness mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyPermissiveness {
+    /// `AS PERMISSIVE`; matching rows from any permissive policy are allowed
+    /// before restrictive policies narrow them.
+    Permissive,
+    /// `AS RESTRICTIVE`; matching rows must also satisfy permissive policy.
+    Restrictive,
+}
+
+/// Command a row-level security policy applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyCommand {
+    /// `FOR ALL`.
+    All,
+    /// `FOR SELECT`.
+    Select,
+    /// `FOR INSERT`.
+    Insert,
+    /// `FOR UPDATE`.
+    Update,
+    /// `FOR DELETE`.
+    Delete,
+}
+
+/// `CREATE POLICY name ON table [AS mode] [FOR command] [USING ...] [WITH CHECK ...]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatePolicyStmt {
     /// Policy name.
     pub name: Identifier,
     /// Target table.
     pub table: ObjectName,
+    /// Permissive/restrictive combination mode.
+    pub permissiveness: PolicyPermissiveness,
+    /// Command class this policy applies to.
+    pub command: PolicyCommand,
     /// Read visibility predicate.
     pub using: Option<Expr>,
     /// Write acceptance predicate.

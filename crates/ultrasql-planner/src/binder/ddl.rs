@@ -13,8 +13,9 @@ use ultrasql_parser::ast::{
     CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat, CopyOption,
     CopySource as AstCopySource, CopyStmt, CreateIndexStmt, CreateMaterializedViewStmt,
     CreatePolicyStmt, CreateSequenceStmt, CreateTableStmt, DropSequenceStmt, DropTableStmt, Expr,
-    Identifier, Literal, ObjectName, ReferentialAction as AstReferentialAction, SequenceOption,
-    TableConstraint, TruncateStmt, TypeName,
+    Identifier, Literal, ObjectName, PolicyCommand as AstPolicyCommand,
+    PolicyPermissiveness as AstPolicyPermissiveness, ReferentialAction as AstReferentialAction,
+    SequenceOption, TableConstraint, TruncateStmt, TypeName,
 };
 
 use super::expr_bind::coerce_literal_to_type;
@@ -27,9 +28,9 @@ use crate::plan::{
     AggregateFunc, CopyDirection, CopyFormat, CopySource, LogicalAggregatingIndex,
     LogicalAggregatingIndexExpr, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalExclusionConstraint, LogicalExclusionElement, LogicalForeignKeyConstraint,
-    LogicalIndexMethod, LogicalIndexOption, LogicalReferentialAction, LogicalRlsPolicy,
-    LogicalSequenceChange, LogicalSequenceOptions, LogicalTenantPolicyExpr, LogicalTimePartition,
-    LogicalUniqueConstraint,
+    LogicalIndexMethod, LogicalIndexOption, LogicalReferentialAction, LogicalRlsCommand,
+    LogicalRlsPermissiveness, LogicalRlsPolicy, LogicalSequenceChange, LogicalSequenceOptions,
+    LogicalTenantPolicyExpr, LogicalTimePartition, LogicalUniqueConstraint,
 };
 
 struct RawUniqueConstraint {
@@ -394,6 +395,17 @@ pub(super) fn bind_create_policy(
         policy: LogicalRlsPolicy {
             policy_name: s.name.value.to_ascii_lowercase(),
             table_name,
+            permissiveness: match s.permissiveness {
+                AstPolicyPermissiveness::Permissive => LogicalRlsPermissiveness::Permissive,
+                AstPolicyPermissiveness::Restrictive => LogicalRlsPermissiveness::Restrictive,
+            },
+            command: match s.command {
+                AstPolicyCommand::All => LogicalRlsCommand::All,
+                AstPolicyCommand::Select => LogicalRlsCommand::Select,
+                AstPolicyCommand::Insert => LogicalRlsCommand::Insert,
+                AstPolicyCommand::Update => LogicalRlsCommand::Update,
+                AstPolicyCommand::Delete => LogicalRlsCommand::Delete,
+            },
             using,
             with_check,
         },

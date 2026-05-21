@@ -206,10 +206,14 @@ UltraSQL currently enforces the RAG tenant policy shape through the normal wire
 path:
 
 - `CREATE POLICY ... ON table USING (...) WITH CHECK (...)`.
+- `CREATE POLICY ... AS { PERMISSIVE | RESTRICTIVE } FOR { ALL | SELECT | INSERT | UPDATE | DELETE }`.
 - `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`.
 - `SET ultrasql.tenant_id = 'tenant-key'`.
 - Read predicates are injected for table scans.
-- `INSERT ... VALUES` rows are checked against `WITH CHECK`.
+- Command-specific policies are honored for scans and `INSERT ... VALUES`
+  checks.
+- Restrictive policies narrow permissive policy matches.
+- `INSERT ... VALUES` rows are checked against applicable `WITH CHECK` clauses.
 
 The enforced predicate shape is intentionally narrow:
 
@@ -218,9 +222,8 @@ tenant_id = current_setting('ultrasql.tenant_id', true)
 ```
 
 Broader PostgreSQL RLS features remain open: role-qualified policies,
-restrictive/permissive policy modes, command-specific policies, policy
-persistence through restart, `INSERT ... SELECT` `WITH CHECK`, and full
-`UPDATE` new-row checks.
+owner/bypass behavior, policy persistence through restart, `INSERT ... SELECT`
+`WITH CHECK`, and full `UPDATE` new-row checks.
 
 RAG helper enforcement also comes from:
 

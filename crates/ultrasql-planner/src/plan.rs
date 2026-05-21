@@ -1405,10 +1405,38 @@ pub struct LogicalRlsPolicy {
     pub policy_name: String,
     /// Target table.
     pub table_name: String,
+    /// Permissive/restrictive combination mode.
+    pub permissiveness: LogicalRlsPermissiveness,
+    /// Command class this policy applies to.
+    pub command: LogicalRlsCommand,
     /// Read visibility predicate.
     pub using: Option<LogicalTenantPolicyExpr>,
     /// Write acceptance predicate.
     pub with_check: Option<LogicalTenantPolicyExpr>,
+}
+
+/// Logical row-security policy combination mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalRlsPermissiveness {
+    /// PostgreSQL `AS PERMISSIVE`.
+    Permissive,
+    /// PostgreSQL `AS RESTRICTIVE`.
+    Restrictive,
+}
+
+/// Logical row-security policy command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalRlsCommand {
+    /// `FOR ALL`.
+    All,
+    /// `FOR SELECT`.
+    Select,
+    /// `FOR INSERT`.
+    Insert,
+    /// `FOR UPDATE`.
+    Update,
+    /// `FOR DELETE`.
+    Delete,
 }
 
 impl LogicalPlan {

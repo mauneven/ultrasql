@@ -20,7 +20,8 @@ use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, Stat
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
     Catalog as PlannerCatalog, InMemoryCatalog, LogicalAlterTableAction, LogicalCommentTarget,
-    LogicalIndexMethod, LogicalIndexOption, LogicalPlan, TableMeta, bind,
+    LogicalIndexMethod, LogicalIndexOption, LogicalPlan, LogicalRlsCommand,
+    LogicalRlsPermissiveness, TableMeta, bind,
 };
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
 use ultrasql_storage::access_method::{
@@ -86,6 +87,19 @@ where
         }
         runtime.policies.push(crate::RuntimeRlsPolicy {
             name: policy.policy_name.clone(),
+            permissiveness: match policy.permissiveness {
+                LogicalRlsPermissiveness::Permissive => crate::RuntimeRlsPermissiveness::Permissive,
+                LogicalRlsPermissiveness::Restrictive => {
+                    crate::RuntimeRlsPermissiveness::Restrictive
+                }
+            },
+            command: match policy.command {
+                LogicalRlsCommand::All => crate::RuntimeRlsCommand::All,
+                LogicalRlsCommand::Select => crate::RuntimeRlsCommand::Select,
+                LogicalRlsCommand::Insert => crate::RuntimeRlsCommand::Insert,
+                LogicalRlsCommand::Update => crate::RuntimeRlsCommand::Update,
+                LogicalRlsCommand::Delete => crate::RuntimeRlsCommand::Delete,
+            },
             using: policy
                 .using
                 .as_ref()
