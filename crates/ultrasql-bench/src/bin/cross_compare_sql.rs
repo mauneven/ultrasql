@@ -187,6 +187,11 @@ enum Workload {
     /// Filtered analytical aggregate
     /// `SELECT SUM(x) FROM t WHERE x > <threshold>`.
     FilterSum,
+    /// Wide-table payload projection behind a selective indexed filter:
+    /// `SELECT amount, pad_c FROM t WHERE tenant_id = ?`. This is the
+    /// UltraSQL late-materialization smoke workload for Firebolt-style
+    /// wide fact-table filter/projection queries.
+    LateMaterialization,
     /// Repeated dashboard-style filtered `GROUP BY` aggregate over a
     /// preloaded fact table:
     /// `SELECT tenant_id, bucket, SUM(amount), COUNT(*) ... GROUP BY
@@ -276,6 +281,9 @@ impl Workload {
             Self::SumScalar => format!("select_sum_{}_i64", k_or_raw(n_rows)),
             Self::AvgScalar => format!("select_avg_{}_i64", k_or_raw(n_rows)),
             Self::FilterSum => format!("filter_sum_{}_i64", k_or_raw(n_rows)),
+            Self::LateMaterialization => {
+                format!("late_materialization_{}", k_or_raw(n_rows))
+            }
             Self::DashboardAggregate => {
                 format!("firebolt_aggregate_index_{}", k_or_raw(n_rows))
             }
@@ -464,6 +472,18 @@ async fn main() -> Result<()> {
                 move |t| format!("SELECT SUM(x) FROM {t} WHERE x > {threshold}"),
             )
             .await?;
+        }
+        Workload::LateMaterialization => {
+            answer = Some(
+                run_shared_late_materialization(
+                    bound,
+                    args.rows,
+                    args.warmup,
+                    total_iters,
+                    &mut iters_us,
+                )
+                .await?,
+            );
         }
         Workload::DashboardAggregate => {
             answer = Some(
@@ -658,6 +678,7 @@ async fn main() -> Result<()> {
                     | Workload::SumScalar
                     | Workload::AvgScalar
                     | Workload::FilterSum
+                    | Workload::LateMaterialization
                     | Workload::DashboardAggregate
                     | Workload::SparsePruning
                     | Workload::WindowRowNumber
@@ -700,6 +721,26 @@ async fn main() -> Result<()> {
     });
     if let Some(answer) = answer {
         report["answer"] = answer;
+    }
+    if matches!(args.workload, Workload::LateMaterialization) {
+        report["schema_version"] = serde_json::json!(1);
+        report["suite"] = serde_json::json!("late_materialization");
+        report["profile"] = serde_json::json!("smoke");
+        report["status"] = serde_json::json!("measured");
+        report["required_metrics"] = serde_json::json!([
+            "median_us",
+            "p50_latency_us",
+            "p95_latency_us",
+            "p99_latency_us",
+            "explain_late_materialization",
+            "rows"
+        ]);
+        report["p50_latency_us"] = serde_json::json!(p50_latency_us);
+        report["p95_latency_us"] = serde_json::json!(p95_latency_us);
+        report["p99_latency_us"] = serde_json::json!(p99_latency_us);
+        report["policy"] = serde_json::json!(
+            "Late-materialization smoke validates EXPLAIN counters before recording latency."
+        );
     }
     if let Some(certification) = vector_topk_certification {
         report["status"] = serde_json::json!("measured");
@@ -2089,10 +2130,156 @@ where
 const DASHBOARD_TENANTS: usize = 32;
 const DASHBOARD_BUCKETS: usize = 64;
 const DASHBOARD_FILTER_TENANT: usize = 7;
+const LATE_MAT_TENANTS: usize = 32;
+const LATE_MAT_BUCKETS: usize = 128;
+const LATE_MAT_FILTER_TENANT: usize = 7;
 const SPARSE_ROWS_PER_DAY: usize = 256;
 const SPARSE_TENANTS: usize = 64;
 const SPARSE_BUCKETS: usize = 32;
 const SPARSE_FILTER_TENANT: usize = 7;
+
+async fn preload_late_materialization_chunked(
+    client: &tokio_postgres::Client,
+    table: &str,
+    n_rows: usize,
+) -> Result<()> {
+    let mut start = 0;
+    while start < n_rows {
+        let end = (start + PRELOAD_CHUNK_ROWS).min(n_rows);
+        let mut sql = String::with_capacity((end - start) * 128 + 64);
+        sql.push_str("INSERT INTO ");
+        sql.push_str(table);
+        sql.push_str(" VALUES ");
+        for row_id in start..end {
+            if row_id > start {
+                sql.push(',');
+            }
+            let tenant_id = row_id % LATE_MAT_TENANTS;
+            let bucket = (row_id / LATE_MAT_TENANTS) % LATE_MAT_BUCKETS;
+            let amount_mod = row_id.wrapping_mul(19) % 2_000;
+            let amount = i64::try_from(amount_mod).unwrap_or(0) - 1_000;
+
+            sql.push('(');
+            sql.push_str(&row_id.to_string());
+            sql.push(',');
+            sql.push_str(&tenant_id.to_string());
+            sql.push(',');
+            sql.push_str(&bucket.to_string());
+            sql.push(',');
+            sql.push_str(&amount.to_string());
+            sql.push_str(",'segment_");
+            sql.push_str(&(row_id % 64).to_string());
+            sql.push_str("','region_");
+            sql.push_str(&(row_id % 17).to_string());
+            sql.push_str("','payload_");
+            sql.push_str(&(row_id % 251).to_string());
+            sql.push_str("','trace_");
+            sql.push_str(&(row_id % 997).to_string());
+            sql.push_str("')");
+        }
+        client.batch_execute(&sql).await.with_context(|| {
+            format!("preload late-materialization chunk [{start}, {end}) INSERT into {table}")
+        })?;
+        start = end;
+    }
+    Ok(())
+}
+
+async fn run_shared_late_materialization(
+    server: SocketAddr,
+    n_rows: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<serde_json::Value> {
+    let conn_str = format!("host=127.0.0.1 port={} user=ultrasql_bench", server.port());
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .context("tokio-postgres connect to ultrasqld")?;
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("tokio-postgres connection error: {e}");
+        }
+    });
+
+    let table = "bench_late_materialization_shared";
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (
+                id INT NOT NULL,
+                tenant_id INT NOT NULL,
+                bucket INT NOT NULL,
+                amount BIGINT NOT NULL,
+                pad_a TEXT NOT NULL,
+                pad_b TEXT NOT NULL,
+                pad_c TEXT NOT NULL,
+                pad_d TEXT NOT NULL
+            )"
+        ))
+        .await
+        .with_context(|| format!("CREATE TABLE {table}"))?;
+    preload_late_materialization_chunked(&client, table, n_rows).await?;
+    client
+        .batch_execute(&format!(
+            "CREATE INDEX ix_late_tenant ON {table}(tenant_id)"
+        ))
+        .await
+        .with_context(|| format!("CREATE INDEX ix_late_tenant ON {table}"))?;
+
+    let query = format!(
+        "SELECT amount, pad_c FROM {table} \
+         WHERE tenant_id = {LATE_MAT_FILTER_TENANT}"
+    );
+    let explain_rows = simple_query_rows(
+        &client
+            .simple_query(&format!("EXPLAIN ANALYZE {query}"))
+            .await
+            .with_context(|| format!("EXPLAIN ANALYZE late materialization on {table}"))?,
+    );
+    let explain_text = explain_rows
+        .iter()
+        .filter_map(|row| row.first().cloned())
+        .collect::<Vec<_>>();
+    let late_line = explain_text
+        .iter()
+        .find(|line| line.starts_with("Late Materialization:"))
+        .cloned()
+        .context("EXPLAIN ANALYZE did not emit Late Materialization line")?;
+    if !late_line.contains("candidates=")
+        || !late_line.contains("fetched=")
+        || !late_line.contains("skipped=")
+    {
+        anyhow::bail!("late materialization EXPLAIN line lacks counters: {late_line}");
+    }
+
+    let mut answer_rows = 0_usize;
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(&query)
+            .await
+            .with_context(|| format!("late materialization query on {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let rows = simple_query_rows(&messages);
+        if rows.is_empty() {
+            anyhow::bail!("late materialization returned no rows");
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+            answer_rows = rows.len();
+        }
+    }
+
+    drop(client);
+    conn_handle.abort();
+    Ok(serde_json::json!({
+        "rows": answer_rows,
+        "tenant_id": LATE_MAT_FILTER_TENANT,
+        "query_shape": "wide_payload_projection_with_selective_index_filter",
+        "firebolt_style_shape": "wide fact table, selective tenant filter, payload projection",
+        "explain_late_materialization": late_line,
+    }))
+}
 
 async fn preload_dashboard_aggregate_chunked(
     client: &tokio_postgres::Client,
@@ -2968,6 +3155,24 @@ mod tests {
         assert_eq!(
             Workload::DashboardAggregate.registry_id(1_000),
             "firebolt_aggregate_index_1k"
+        );
+    }
+
+    #[test]
+    fn late_materialization_workload_id_matches_smoke_artifact() {
+        let args = Args::try_parse_from([
+            "cross_compare_sql",
+            "--workload",
+            "late-materialization",
+            "--rows",
+            "1000",
+        ])
+        .expect("late materialization workload parses");
+
+        assert_eq!(args.workload, Workload::LateMaterialization);
+        assert_eq!(
+            Workload::LateMaterialization.registry_id(1_000),
+            "late_materialization_1k"
         );
     }
 

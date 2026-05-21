@@ -4,7 +4,7 @@
 # Usage:
 #   benchmarks/certify.sh smoke
 #   benchmarks/certify.sh full
-#   benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet,object-parquet-range,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
+#   benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
 #
 # Smoke is PR-safe: tiny datasets, crash/correctness checks, no external
 # benchmark assets. Full is nightly/manual: it attempts the full certification
@@ -29,7 +29,7 @@ case "$profile" in
         suites=(regression-gate vector-ann sysbench)
         ;;
     full)
-        suites=(tpch clickbench tpcb tpcc sysbench vector-topk vector-ann ai-gauntlet csv-gauntlet object-parquet-range firebolt-aggregate firebolt-sparse-pruning firebolt-vector)
+        suites=(tpch clickbench tpcb tpcc sysbench vector-topk vector-ann ai-gauntlet csv-gauntlet object-parquet-range late-materialization firebolt-aggregate firebolt-sparse-pruning firebolt-vector)
         ;;
     *)
         echo "certify.sh: profile must be smoke or full, got '$profile'" >&2
@@ -137,6 +137,17 @@ run_object_parquet_range_full() {
     OBJECT_PARQUET_RANGE_PROFILE=full benchmarks/object_parquet_range.sh full
 }
 
+run_late_materialization_smoke() {
+    LATE_MAT_ROWS=10000 \
+        LATE_MAT_WARMUP=0 \
+        LATE_MAT_ITERS=1 \
+        benchmarks/late_materialization.sh smoke
+}
+
+run_late_materialization_full() {
+    benchmarks/late_materialization.sh full
+}
+
 run_firebolt_aggregate_smoke() {
     FIREBOLT_AGG_PROFILE=smoke benchmarks/firebolt_aggregate_index.sh smoke
 }
@@ -195,6 +206,13 @@ for suite in "${suites[@]}"; do
                 run_suite "$suite" run_object_parquet_range_smoke
             else
                 run_suite "$suite" run_object_parquet_range_full
+            fi
+            ;;
+        late-materialization)
+            if [[ "$profile" == "smoke" ]]; then
+                run_suite "$suite" run_late_materialization_smoke
+            else
+                run_suite "$suite" run_late_materialization_full
             fi
             ;;
         firebolt-aggregate)

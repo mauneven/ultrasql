@@ -308,6 +308,22 @@ same generated query shape. Raw artifacts land under
 `benchmarks/results/latest/raw/`, and the suite manifest is
 `benchmarks/results/latest/firebolt_sparse_pruning_manifest.json`.
 
+### Late Materialization
+
+UltraSQL late-materialization smoke artifacts are recorded by:
+
+```text
+benchmarks/late_materialization.sh smoke
+```
+
+The runner builds a wide deterministic fact table, creates a B-tree index on
+`tenant_id`, and measures `SELECT amount, pad_c FROM ... WHERE tenant_id = 7`.
+The artifact is only valid when `EXPLAIN ANALYZE` reports `Late
+Materialization` with candidate, fetched, and skipped counters. This is a
+Firebolt-style wide filter/projection baseline for UltraSQL; it is not a
+Firebolt comparison unless a separate Firebolt artifact is measured on the
+same host.
+
 ### Firebolt Vector Search
 
 Firebolt HNSW vector-search artifacts are recorded by:
@@ -513,7 +529,7 @@ certification attempts:
 ```text
 benchmarks/certify.sh smoke
 benchmarks/certify.sh full
-benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet,object-parquet-range,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
+benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet,object-parquet-range,late-materialization,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
 ```
 
 Smoke profile:
@@ -525,8 +541,8 @@ Smoke profile:
 Full profile:
 - attempts TPC-H SF10, ClickBench, TPC-B, TPC-C, sysbench-style OLTP,
   exact vector top-k, HNSW ANN vector search, the AI benchmark gauntlet,
-  the CSV benchmark gauntlet, object Parquet range smoke, and Firebolt
-  aggregate/sparse-pruning/vector runners;
+  the CSV benchmark gauntlet, object Parquet range smoke, late-materialization
+  smoke, and Firebolt aggregate/sparse-pruning/vector runners;
 - writes `benchmarks/results/latest/benchmark_certification_manifest.json`;
 - treats exit code 2 from a child runner as `unavailable`, meaning a required
   dataset, DSN, engine, or implementation is missing and no benchmark claim

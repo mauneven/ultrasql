@@ -25,6 +25,8 @@ fn certification_runner_splits_smoke_and_full_profiles() {
     assert!(script.contains("benchmarks/tpcc_certify.sh"));
     assert!(script.contains("benchmarks/sysbench_certify.sh"));
     assert!(script.contains("benchmarks/vector_topk_exact.sh"));
+    assert!(script.contains("late-materialization"));
+    assert!(script.contains("benchmarks/late_materialization.sh"));
     assert!(script.contains("benchmark_certification_manifest.json"));
 }
 

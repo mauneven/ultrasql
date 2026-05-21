@@ -129,6 +129,7 @@ mod tpch_q9;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use index_scan::late_materialization_summary_for_plan;
 pub use lower_query::lower_query;
 pub use lower_simple::{build_sample_database, lower_plan};
 

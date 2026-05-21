@@ -108,6 +108,7 @@ are grounds for revert.
 | v1.0 | Sysbench OLTP read/write | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
 | v1.0 | Firebolt aggregating-index dashboard aggregate | ≥ 2× Firebolt ⚠️ runner + UltraSQL smoke artifact exist; Firebolt artifact is `not_available` until `FIREBOLT_URL` is configured | median query latency |
 | v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ runner + UltraSQL smoke artifact exist; Firebolt artifact is `not_available` until `FIREBOLT_URL` is configured | median query latency |
+| v1.0 | Firebolt-style wide filter/projection late materialization | UltraSQL smoke artifact exists ⚠️ Firebolt same-host comparison open | median latency + candidates/fetched/skipped |
 | v1.0 | Firebolt HNSW vector search | recall/latency artifact vs UltraSQL HNSW ⚠️ runner added; Firebolt artifact is `not_available` until `FIREBOLT_URL` is configured and vector support is verified | recall@k + p50/p95/p99 |
 | v2.x | Star Schema Benchmark scale 100 | ≥ 2× ClickHouse | geometric mean query time |
 

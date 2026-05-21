@@ -380,38 +380,47 @@ where
         plan: &LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
     ) -> String {
-        let Some((table, filter_col, projected_cols)) = first_project_filter_scan(plan) else {
-            return "not applicable (no Project(Filter(Scan)) shape)".to_owned();
+        let txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let outcome = {
+            let ctx = LowerCtx {
+                tables: &self.state.tables,
+                catalog_snapshot: Arc::clone(catalog_snapshot),
+                table_constraints: Arc::clone(&self.state.table_constraints),
+                sequences: Arc::clone(&self.state.sequences),
+                persistent_catalog: Arc::clone(&self.state.persistent_catalog),
+                time_partitions: Arc::clone(&self.state.time_partitions),
+                workload_recorder: Arc::clone(&self.state.workload_recorder),
+                sequence_state: Some(self.sequence_state.clone()),
+                heap: Arc::clone(&self.state.heap),
+                vm: Arc::clone(&self.state.vm),
+                snapshot: txn.snapshot.clone(),
+                oracle: Arc::clone(&self.state.txn_manager),
+                xid: txn.current_xid(),
+                command_id: txn.current_command,
+                cte_buffers: std::collections::HashMap::new(),
+                jit: self.jit_config(),
+                cancel_flag: Some(self.cancel_flag.clone()),
+                work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+            };
+            crate::pipeline::late_materialization_summary_for_plan(plan, &ctx)
         };
-        let Some(table_entry) = catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
-            return format!("skipped {table}: not a persistent catalog table");
-        };
-        let Some(indexes) = catalog_snapshot.indexes_by_table.get(&table_entry.oid) else {
-            return format!("skipped {table}: no indexes on table");
-        };
-        let Ok(attnum) = u16::try_from(filter_col) else {
-            return format!("skipped {table}: predicate column index exceeds attnum");
-        };
-        let Some(index) = indexes.iter().find(|index| {
-            index.columns.as_slice() == [attnum]
-                && self.index_method(table_entry.oid, index.oid) == LogicalIndexMethod::Btree
-        }) else {
-            return format!("skipped {table}: no usable single-column btree index");
-        };
-        if projected_cols.iter().all(|col| {
-            u16::try_from(*col)
-                .ok()
-                .is_some_and(|col_attnum| index.columns.contains(&col_attnum))
-        }) {
-            return format!(
-                "not selected {}: projection covered by index key",
-                index.name
-            );
+        match outcome {
+            Ok(summary) => {
+                if let Err(e) = self.state.txn_manager.commit(txn) {
+                    tracing::warn!(error = %e, "EXPLAIN ANALYZE late materialization note commit failed");
+                }
+                summary.note
+            }
+            Err(e) => {
+                if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                    tracing::warn!(error = %abort_err, "EXPLAIN ANALYZE late materialization note abort failed");
+                }
+                format!("skipped: {e}")
+            }
         }
-        format!(
-            "selected {} on {table}: index TID probe with deferred heap payload fetch",
-            index.name
-        )
     }
 }
 
@@ -737,48 +746,6 @@ fn first_filter_scan_column(plan: &LogicalPlan) -> Option<(&str, usize)> {
             definition, body, ..
         } => first_filter_scan_column(definition).or_else(|| first_filter_scan_column(body)),
         LogicalPlan::Insert { source, .. } => first_filter_scan_column(source),
-        _ => None,
-    }
-}
-
-fn first_project_filter_scan(plan: &LogicalPlan) -> Option<(&str, usize, Vec<usize>)> {
-    match plan {
-        LogicalPlan::Project { input, exprs, .. } => {
-            let LogicalPlan::Filter {
-                input: filter_input,
-                predicate,
-            } = input.as_ref()
-            else {
-                return first_project_filter_scan(input);
-            };
-            let LogicalPlan::Scan { table, .. } = filter_input.as_ref() else {
-                return first_project_filter_scan(input);
-            };
-            let filter_col = indexable_column(predicate)?;
-            let projected = exprs
-                .iter()
-                .filter_map(|(expr, _)| match expr {
-                    ScalarExpr::Column { index, .. } => Some(*index),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            Some((table.as_str(), filter_col, projected))
-        }
-        LogicalPlan::Limit { input, .. }
-        | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Aggregate { input, .. }
-        | LogicalPlan::LockRows { input, .. }
-        | LogicalPlan::Explain { input, .. }
-        | LogicalPlan::Update { input, .. }
-        | LogicalPlan::Window { input, .. }
-        | LogicalPlan::Delete { input, .. } => first_project_filter_scan(input),
-        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
-            first_project_filter_scan(left).or_else(|| first_project_filter_scan(right))
-        }
-        LogicalPlan::Cte {
-            definition, body, ..
-        } => first_project_filter_scan(definition).or_else(|| first_project_filter_scan(body)),
-        LogicalPlan::Insert { source, .. } => first_project_filter_scan(source),
         _ => None,
     }
 }

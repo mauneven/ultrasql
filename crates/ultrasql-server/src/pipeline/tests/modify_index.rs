@@ -4,7 +4,9 @@ use super::select::{
     between_id_literal, build_filter_scan_plan, build_index_fixture, drain_id_val, eq_id_literal,
 };
 use super::{collect_pairs, column, int_row, schema_int_col, synthetic_ctx};
-use crate::pipeline::index_scan::{match_indexable_predicate, match_simple_comparison};
+use crate::pipeline::index_scan::{
+    late_materialization_summary_for_plan, match_indexable_predicate, match_simple_comparison,
+};
 use crate::pipeline::*;
 use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_planner::{
@@ -277,6 +279,71 @@ fn lower_query_project_index_key_without_all_visible_falls_back_to_heap_index_sc
     );
     let ids = drain_single_i32(op.as_mut());
     assert_eq!(ids, vec![3, 4, 5]);
+}
+
+#[test]
+fn lower_query_project_payload_column_picks_late_materialization_scan() {
+    let rows: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
+    let (fix, _entry, _tids) = build_index_fixture("t_late_mat", &rows, true);
+    let tables = SampleTables::new();
+    let ctx = fix.ctx(&tables);
+    let schema = Schema::new([Field::nullable("val", DataType::Int32)]).expect("schema");
+    let plan = LogicalPlan::Project {
+        input: Box::new(build_filter_scan_plan(
+            "t_late_mat",
+            between_id_literal(3, 5),
+        )),
+        exprs: vec![(
+            ScalarExpr::Column {
+                name: "val".into(),
+                index: 1,
+                data_type: DataType::Int32,
+            },
+            "val".into(),
+        )],
+        schema,
+    };
+    let mut op = lower_query(&plan, &ctx).expect("lowers");
+    let debug = format!("{op:?}");
+    assert!(
+        debug.starts_with("LateMaterializeScan"),
+        "expected LateMaterializeScan, got: {debug}"
+    );
+    let vals = drain_single_i32(op.as_mut());
+    assert_eq!(vals, vec![30, 40, 50]);
+}
+
+#[test]
+fn late_materialization_summary_reports_candidate_fetch_counts() {
+    let rows: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
+    let (fix, _entry, _tids) = build_index_fixture("t_late_mat_summary", &rows, true);
+    let tables = SampleTables::new();
+    let ctx = fix.ctx(&tables);
+    let schema = Schema::new([Field::nullable("val", DataType::Int32)]).expect("schema");
+    let plan = LogicalPlan::Project {
+        input: Box::new(build_filter_scan_plan(
+            "t_late_mat_summary",
+            between_id_literal(3, 5),
+        )),
+        exprs: vec![(
+            ScalarExpr::Column {
+                name: "val".into(),
+                index: 1,
+                data_type: DataType::Int32,
+            },
+            "val".into(),
+        )],
+        schema,
+    };
+
+    let summary =
+        late_materialization_summary_for_plan(&plan, &ctx).expect("summary probe must work");
+    assert_eq!(summary.candidate_tids, 3);
+    assert_eq!(summary.fetched_rows, 3);
+    assert_eq!(summary.skipped_invisible, 0);
+    assert!(summary.note.contains("candidates=3"));
+    assert!(summary.note.contains("fetched=3"));
+    assert!(summary.note.contains("skipped=0"));
 }
 
 fn drain_single_i32(op: &mut dyn Operator) -> Vec<i32> {

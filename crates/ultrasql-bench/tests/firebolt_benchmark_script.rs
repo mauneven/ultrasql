@@ -85,6 +85,21 @@ fn cross_compare_sql_exposes_sparse_pruning_workload() {
 }
 
 #[test]
+fn late_materialization_script_declares_firebolt_style_workload() {
+    let script = repo_file("benchmarks/late_materialization.sh");
+    let driver = repo_file("crates/ultrasql-bench/src/bin/cross_compare_sql.rs");
+    let certify = repo_file("benchmarks/certify.sh");
+
+    assert!(script.contains("--workload late-materialization"));
+    assert!(script.contains("Late-materialization smoke/full runner"));
+    assert!(driver.contains("LateMaterialization"));
+    assert!(driver.contains("wide_payload_projection_with_selective_index_filter"));
+    assert!(driver.contains("explain_late_materialization"));
+    assert!(certify.contains("late-materialization"));
+    assert!(certify.contains("run_late_materialization_smoke"));
+}
+
+#[test]
 fn arena_and_certification_expose_firebolt_suite() {
     let arena = repo_file("benchmarks/arena.sh");
     let certify = repo_file("benchmarks/certify.sh");
@@ -118,6 +133,7 @@ fn firebolt_aggregate_script_has_valid_bash_syntax() {
         "benchmarks/firebolt_aggregate_index.sh",
         "benchmarks/firebolt_sparse_pruning.sh",
         "benchmarks/firebolt_vector_search.sh",
+        "benchmarks/late_materialization.sh",
     ] {
         assert_firebolt_script_has_valid_bash_syntax(script_name);
     }

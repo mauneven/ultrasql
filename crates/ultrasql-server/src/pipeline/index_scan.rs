@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use ultrasql_catalog::{CatalogSnapshot, IndexEntry, TableEntry};
-use ultrasql_core::{BlockNumber, DataType, Field, RelationId, TupleId, Value};
+use ultrasql_core::{BlockNumber, DataType, Field, RelationId, Schema, TupleId, Value};
 use ultrasql_executor::{Filter, IndexOnlyScan, IndexScan, Limit, Operator, RowCodec, TopK};
 use ultrasql_mvcc::{Visibility, is_visible};
 use ultrasql_planner::{BinaryOp, LogicalIndexMethod, LogicalPlan, ScalarExpr, SortKey};
@@ -12,6 +12,8 @@ use ultrasql_storage::access_method::{
     BrinIndex, HnswMetric, PageBackedHnswIndex, PageBackedIvfFlatIndex,
 };
 use ultrasql_storage::btree::BTree;
+use ultrasql_storage::heap::HeapAccess;
+use ultrasql_txn::TransactionManager;
 
 use crate::BlankPageLoader;
 use crate::error::ServerError;
@@ -661,6 +663,274 @@ pub(super) fn try_index_only_scan(
         Vec::new(),
         output_schema,
     ))))
+}
+
+/// Counters reported by the late-materialization prototype.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct LateMaterializationSummary {
+    /// TIDs emitted by the index probe before visibility checks.
+    pub(crate) candidate_tids: u64,
+    /// MVCC-visible heap rows fetched by the payload phase.
+    pub(crate) fetched_rows: u64,
+    /// Candidate TIDs skipped because the heap tuple was not visible.
+    pub(crate) skipped_invisible: u64,
+    /// Human-readable EXPLAIN note.
+    pub(crate) note: String,
+}
+
+impl LateMaterializationSummary {
+    fn not_applicable(reason: impl Into<String>) -> Self {
+        Self {
+            note: reason.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// Try to lower `Project(Filter(Scan), payload_cols)` into a two-phase
+/// B-tree TID probe followed by deferred heap payload fetch.
+pub(super) fn try_late_materialization_project(
+    input: &LogicalPlan,
+    exprs: &[(ScalarExpr, String)],
+    output_schema: &Schema,
+    ctx: &LowerCtx<'_>,
+) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let Some(shape) = late_materialization_shape(input, exprs, ctx)? else {
+        return Ok(None);
+    };
+    let entries = probe_index_entries_ordered(shape.index_entry, shape.range, true, ctx)?;
+    let tids = entries.into_iter().map(|(_, tid)| tid).collect();
+    let codec = RowCodec::new(shape.table_entry.schema.clone());
+    Ok(Some(Box::new(LateMaterializeScan::new(
+        tids,
+        codec,
+        shape.projected_cols,
+        output_schema.clone(),
+        Arc::clone(&ctx.heap),
+        ctx.snapshot.clone(),
+        Arc::clone(&ctx.oracle),
+    ))))
+}
+
+/// Return the same counters printed by `EXPLAIN ANALYZE`.
+pub(crate) fn late_materialization_summary_for_plan(
+    plan: &LogicalPlan,
+    ctx: &LowerCtx<'_>,
+) -> Result<LateMaterializationSummary, ServerError> {
+    let LogicalPlan::Project { input, exprs, .. } = plan else {
+        return Ok(LateMaterializationSummary::not_applicable(
+            "not applicable (no Project(Filter(Scan)) shape)",
+        ));
+    };
+    let Some(shape) = late_materialization_shape(input, exprs, ctx)? else {
+        return Ok(LateMaterializationSummary::not_applicable(
+            "not selected (shape, index, or projection not eligible)",
+        ));
+    };
+    let entries = probe_index_entries_ordered(shape.index_entry, shape.range, true, ctx)?;
+    let mut fetched_rows = 0_u64;
+    let mut skipped_invisible = 0_u64;
+    for (_, tid) in &entries {
+        if fetch_visible_index_payload(*tid, ctx)?.is_some() {
+            fetched_rows = fetched_rows.saturating_add(1);
+        } else {
+            skipped_invisible = skipped_invisible.saturating_add(1);
+        }
+    }
+    let candidate_tids = u64::try_from(entries.len()).unwrap_or(u64::MAX);
+    Ok(LateMaterializationSummary {
+        candidate_tids,
+        fetched_rows,
+        skipped_invisible,
+        note: format!(
+            "selected {} on {}: candidates={} fetched={} skipped={} via index TID probe then deferred heap payload fetch",
+            shape.index_entry.name,
+            shape.table_name,
+            candidate_tids,
+            fetched_rows,
+            skipped_invisible
+        ),
+    })
+}
+
+struct LateMaterializationShape<'a> {
+    table_name: &'a str,
+    table_entry: &'a TableEntry,
+    index_entry: &'a IndexEntry,
+    range: IndexKeyRange,
+    projected_cols: Vec<usize>,
+}
+
+fn late_materialization_shape<'a>(
+    input: &'a LogicalPlan,
+    exprs: &[(ScalarExpr, String)],
+    ctx: &'a LowerCtx<'_>,
+) -> Result<Option<LateMaterializationShape<'a>>, ServerError> {
+    if exprs.is_empty() {
+        return Ok(None);
+    }
+    let LogicalPlan::Filter {
+        input: filter_input,
+        predicate,
+    } = input
+    else {
+        return Ok(None);
+    };
+    let LogicalPlan::Scan { table, .. } = filter_input.as_ref() else {
+        return Ok(None);
+    };
+    let Some(table_entry) = ctx.catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
+        return Ok(None);
+    };
+    let Some((predicate_col_idx, range)) = match_indexable_predicate(predicate) else {
+        return Ok(None);
+    };
+    let Some(index_entry) =
+        find_single_column_index(&ctx.catalog_snapshot, table_entry, predicate_col_idx, ctx)
+    else {
+        return Ok(None);
+    };
+    let Some(_widen) = key_type_for_btree(table_entry, predicate_col_idx) else {
+        return Ok(None);
+    };
+    let Some(projected_cols) = simple_projected_columns(exprs, table_entry.schema.len()) else {
+        return Ok(None);
+    };
+    if projected_cols.iter().all(|col| *col == predicate_col_idx) {
+        return Ok(None);
+    }
+    if projected_cols.len() >= table_entry.schema.len() {
+        return Ok(None);
+    }
+    Ok(Some(LateMaterializationShape {
+        table_name: table.as_str(),
+        table_entry,
+        index_entry,
+        range,
+        projected_cols,
+    }))
+}
+
+fn simple_projected_columns(
+    exprs: &[(ScalarExpr, String)],
+    table_width: usize,
+) -> Option<Vec<usize>> {
+    let mut projected_cols = Vec::with_capacity(exprs.len());
+    for (expr, _) in exprs {
+        let ScalarExpr::Column { index, .. } = expr else {
+            return None;
+        };
+        if *index >= table_width {
+            return None;
+        }
+        projected_cols.push(*index);
+    }
+    Some(projected_cols)
+}
+
+struct LateMaterializeScan {
+    tids: std::vec::IntoIter<TupleId>,
+    codec: RowCodec,
+    projection: Vec<usize>,
+    output_schema: Schema,
+    heap: Arc<HeapAccess<BlankPageLoader>>,
+    snapshot: ultrasql_mvcc::Snapshot,
+    oracle: Arc<TransactionManager>,
+    eof: bool,
+    candidate_tids: u64,
+    fetched_rows: u64,
+    skipped_invisible: u64,
+}
+
+impl std::fmt::Debug for LateMaterializeScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LateMaterializeScan")
+            .field("remaining_tids", &self.tids.len())
+            .field("projection", &self.projection)
+            .field("candidate_tids", &self.candidate_tids)
+            .field("fetched_rows", &self.fetched_rows)
+            .field("skipped_invisible", &self.skipped_invisible)
+            .finish()
+    }
+}
+
+impl LateMaterializeScan {
+    fn new(
+        tids: Vec<TupleId>,
+        codec: RowCodec,
+        projection: Vec<usize>,
+        output_schema: Schema,
+        heap: Arc<HeapAccess<BlankPageLoader>>,
+        snapshot: ultrasql_mvcc::Snapshot,
+        oracle: Arc<TransactionManager>,
+    ) -> Self {
+        let candidate_tids = u64::try_from(tids.len()).unwrap_or(u64::MAX);
+        Self {
+            tids: tids.into_iter(),
+            codec,
+            projection,
+            output_schema,
+            heap,
+            snapshot,
+            oracle,
+            eof: false,
+            candidate_tids,
+            fetched_rows: 0,
+            skipped_invisible: 0,
+        }
+    }
+}
+
+impl Operator for LateMaterializeScan {
+    fn next_batch(&mut self) -> Result<Option<ultrasql_vec::Batch>, ultrasql_executor::ExecError> {
+        if self.eof {
+            return Ok(None);
+        }
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(4096);
+        while rows.len() < 4096 {
+            let Some(tid) = self.tids.next() else {
+                self.eof = true;
+                break;
+            };
+            let tuple = self.heap.fetch(tid).map_err(|_| {
+                ultrasql_executor::ExecError::Internal("LateMaterializeScan heap fetch failed")
+            })?;
+            let visibility = is_visible(&tuple.header, &self.snapshot, self.oracle.as_ref());
+            if !matches!(visibility, Visibility::Visible) {
+                self.skipped_invisible = self.skipped_invisible.saturating_add(1);
+                continue;
+            }
+            let decoded = self
+                .codec
+                .decode(&tuple.data)
+                .map_err(|e| ultrasql_executor::ExecError::TypeMismatch(e.to_string()))?;
+            let mut row = Vec::with_capacity(self.projection.len());
+            for idx in &self.projection {
+                let value =
+                    decoded
+                        .get(*idx)
+                        .cloned()
+                        .ok_or(ultrasql_executor::ExecError::Internal(
+                            "LateMaterializeScan projection index out of bounds",
+                        ))?;
+                row.push(value);
+            }
+            self.fetched_rows = self.fetched_rows.saturating_add(1);
+            rows.push(row);
+        }
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        ultrasql_executor::build_batch(&rows, &self.output_schema).map(Some)
+    }
+
+    fn schema(&self) -> &Schema {
+        &self.output_schema
+    }
+
+    fn estimated_row_count(&self) -> Option<usize> {
+        Some(self.tids.len())
+    }
 }
 
 /// Decode a `WHERE` predicate into an `(column_index, IndexKeyRange)`

@@ -20,8 +20,8 @@ use super::agg_fuse::{
 use super::cte_helpers::{lower_recursive_cte, lower_set_op_real};
 use super::hybrid_search::try_lower_hybrid_search_limit;
 use super::index_scan::{
-    try_hnsw_top_k_limit, try_index_only_scan, try_index_scan, try_ordered_index_scan,
-    try_ordered_index_scan_limit,
+    try_hnsw_top_k_limit, try_index_only_scan, try_index_scan, try_late_materialization_project,
+    try_ordered_index_scan, try_ordered_index_scan_limit,
 };
 use super::join::{LowerJoinArgs, lower_join};
 use super::modify::{
@@ -162,6 +162,9 @@ pub fn lower_query(
                 return Ok(op);
             }
             if let Some(op) = try_index_only_scan(input, &exprs, ctx)? {
+                return Ok(op);
+            }
+            if let Some(op) = try_late_materialization_project(input, &exprs, schema, ctx)? {
                 return Ok(op);
             }
             if let Some(op) = try_lower_read_csv_project(input, &exprs)? {
