@@ -75,3 +75,14 @@ fn roadmap_tpch_sf10_matches_complete_artifact() {
     assert!(!roadmap.contains("remained in the `lineitem` load"));
     assert!(!roadmap.contains("- [ ] TPC-H scale 10:"));
 }
+
+#[test]
+fn roadmap_tracks_columnar_scan_mvcc_contract() {
+    let roadmap = repo_file("ROADMAP.md");
+    let normalized = collapse_ws(&roadmap);
+
+    assert!(normalized.contains("Columnar scan path"));
+    assert!(normalized.contains("heap rows remain the OLTP/MVCC source of truth"));
+    assert!(normalized.contains("HeapAccess::column_cache"));
+    assert!(normalized.contains("committed DML invalidation"));
+}

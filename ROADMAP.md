@@ -1914,6 +1914,10 @@ same host.
   `vector_topk`, `hash_aggregate`, `joins`, `tpch_q1`, `tpch_q5`, and
   `tpch_q6`. Missing profiler tools or TPC-H data are recorded as
   `not_available`, not benchmark claims.
+- [x] Columnar scan path: heap rows remain the OLTP/MVCC source of truth,
+  while `HeapAccess::column_cache` supplies the OLAP shadow path.
+  `columnar_storage_round_trip.rs` now covers committed DML invalidation,
+  rebuild, and update/delete/insert visibility after cache rebuild.
 - [ ] TPC-B: correctness verified, throughput ≥ 2× PostgreSQL, p99 < 5 ms at 32 connections — `benchmarks/tpcb_certify.sh` exists and the wire harness now validates UltraSQL balance invariants with indexed TPC-B tables; latest local reduced smoke is correct at 986.20 tx/s, but p99 is 39.884 ms and PostgreSQL 17 comparison is still missing, so certification remains open.
 - [ ] TPC-C: correctness verified (all 5 transaction types), throughput ≥ 2× PostgreSQL
 - [x] TPC-H scale 1: all 22 harness queries return correct results
