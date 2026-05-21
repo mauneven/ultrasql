@@ -172,6 +172,7 @@ pub fn build_operator(
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

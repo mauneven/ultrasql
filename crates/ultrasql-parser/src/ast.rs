@@ -62,6 +62,8 @@ pub enum Statement {
     CreateTableAs(Box<CreateTableAsStmt>),
     /// `CREATE MATERIALIZED VIEW … AS SELECT …`.
     CreateMaterializedView(Box<CreateMaterializedViewStmt>),
+    /// `CREATE POLICY name ON table USING (...) WITH CHECK (...)`.
+    CreatePolicy(Box<CreatePolicyStmt>),
     /// `DROP TABLE …`.
     DropTable(DropTableStmt),
     /// `ALTER TABLE …`.
@@ -177,6 +179,7 @@ impl Statement {
             Self::CreateTable(s) => s.span,
             Self::CreateTableAs(s) => s.span,
             Self::CreateMaterializedView(s) => s.span,
+            Self::CreatePolicy(s) => s.span,
             Self::DropTable(s) => s.span,
             Self::AlterTable(s) => s.span,
             Self::CreateSchema(s) => s.span,
@@ -355,6 +358,21 @@ pub struct CreateMaterializedViewStmt {
     /// The SELECT statement that provides rows.
     pub source: Box<SelectStmt>,
     /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// `CREATE POLICY name ON table [USING (expr)] [WITH CHECK (expr)]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatePolicyStmt {
+    /// Policy name.
+    pub name: Identifier,
+    /// Target table.
+    pub table: ObjectName,
+    /// Read visibility predicate.
+    pub using: Option<Expr>,
+    /// Write acceptance predicate.
+    pub with_check: Option<Expr>,
+    /// Source span.
     pub span: Span,
 }
 
@@ -641,6 +659,11 @@ pub enum AlterTableAction {
         name: Identifier,
         /// Whether `CASCADE` was specified.
         cascade: bool,
+        /// Source span.
+        span: Span,
+    },
+    /// `ENABLE ROW LEVEL SECURITY`.
+    EnableRowLevelSecurity {
         /// Source span.
         span: Span,
     },

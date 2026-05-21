@@ -306,6 +306,7 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::CreateTable { .. }
             | LogicalPlan::CreateMaterializedView { .. }
             | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::CreatePolicy { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }
             | LogicalPlan::CreateSequence { .. }

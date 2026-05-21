@@ -29,7 +29,7 @@
 //! - `binary_ops` holds the binary-operator detection helpers used
 //!   by the Pratt loop (`peek_binary_op` and `consume_binary_op`).
 
-use crate::ast::Statement;
+use crate::ast::{CreatePolicyStmt, Expr, Statement};
 use crate::lexer::{Lexer, LexerError};
 use crate::token::{Token, TokenKind};
 
@@ -348,15 +348,81 @@ impl<'src> Parser<'src> {
                 self.parse_create_index(start, false, true)
                     .map(|s| Statement::CreateIndex(Box::new(s)))
             }
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("policy")) =>
+            {
+                self.parse_create_policy(start)
+                    .map(|s| Statement::CreatePolicy(Box::new(s)))
+            }
             TokenKind::KwSequence => self
                 .parse_create_sequence(start)
                 .map(|s| Statement::CreateSequence(Box::new(s))),
             other => Err(ParseError::Expected {
-                expected: "TABLE, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, AGGREGATING, or SEQUENCE after CREATE",
+                expected: "TABLE, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, AGGREGATING, POLICY, or SEQUENCE after CREATE",
                 found: other,
                 offset: tok.span.start as usize,
             }),
         }
+    }
+
+    fn parse_create_policy(&mut self, create_start: u32) -> Result<CreatePolicyStmt, ParseError> {
+        self.expect_identifier_keyword("policy", "POLICY")?;
+        let name = self.parse_identifier()?;
+        self.expect(TokenKind::KwOn, "ON")?;
+        let table = self.parse_object_name()?;
+        let mut using = None;
+        let mut with_check = None;
+        loop {
+            match self.peek()?.kind {
+                TokenKind::KwUsing => {
+                    self.advance()?; // USING
+                    using = Some(self.parse_parenthesized_policy_expr()?);
+                }
+                TokenKind::KwWith => {
+                    self.advance()?; // WITH
+                    self.expect(TokenKind::KwCheck, "CHECK")?;
+                    with_check = Some(self.parse_parenthesized_policy_expr()?);
+                }
+                _ => break,
+            }
+        }
+        let end = self.peek()?.span.start;
+        Ok(CreatePolicyStmt {
+            name,
+            table,
+            using,
+            with_check,
+            span: crate::span::Span::new(create_start, end),
+        })
+    }
+
+    fn parse_parenthesized_policy_expr(&mut self) -> Result<Expr, ParseError> {
+        self.expect(TokenKind::LParen, "(")?;
+        let expr = self.parse_expr()?;
+        self.expect(TokenKind::RParen, ")")?;
+        Ok(expr)
+    }
+
+    pub(crate) fn expect_identifier_keyword(
+        &mut self,
+        word: &'static str,
+        expected: &'static str,
+    ) -> Result<Token, ParseError> {
+        let tok = *self.peek()?;
+        if tok.kind == TokenKind::Identifier
+            && tok
+                .text(self.source)
+                .is_some_and(|text| text.eq_ignore_ascii_case(word))
+        {
+            return self.advance();
+        }
+        Err(ParseError::Expected {
+            expected,
+            found: tok.kind,
+            offset: tok.span.start as usize,
+        })
     }
 
     /// Dispatch `DROP …` to the appropriate sub-parser based on the

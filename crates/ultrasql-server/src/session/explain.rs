@@ -618,6 +618,7 @@ fn plan_node_type(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::CreateTable { .. } => "CreateTable",
         LogicalPlan::CreateMaterializedView { .. } => "CreateMaterializedView",
         LogicalPlan::CreateIndex { .. } => "CreateIndex",
+        LogicalPlan::CreatePolicy { .. } => "CreatePolicy",
         LogicalPlan::DropTable { .. } => "DropTable",
         LogicalPlan::AlterTable { .. } => "AlterTable",
         LogicalPlan::CreateSequence { .. } => "CreateSequence",

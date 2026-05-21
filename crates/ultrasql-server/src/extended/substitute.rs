@@ -466,6 +466,7 @@ where
             output_name: output_name.clone(),
             schema: schema.clone(),
         },
+        LogicalPlan::CreatePolicy { .. } => plan.clone(),
     }
 }
 

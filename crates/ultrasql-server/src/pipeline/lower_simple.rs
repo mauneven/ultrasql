@@ -89,6 +89,7 @@ pub fn lower_plan(
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

@@ -248,6 +248,7 @@ fn infer_into(
         LogicalPlan::Window { input, .. } => {
             infer_into(input, catalog, out);
         }
+        LogicalPlan::CreatePolicy { .. } => {}
     }
 }
 
@@ -535,6 +536,7 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
                 _ => {}
             }
         }
+        LogicalPlan::CreatePolicy { .. } => {}
     }
 }
 

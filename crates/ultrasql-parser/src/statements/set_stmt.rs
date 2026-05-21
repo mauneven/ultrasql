@@ -24,7 +24,7 @@ impl Parser<'_> {
 
         match tok.kind {
             TokenKind::KwShow => {
-                let name = self.parse_identifier()?;
+                let name = self.parse_set_name()?;
                 let end = self.peek()?.span.start;
                 return Ok(SetVarStmt {
                     scope: SetScope::Show,
@@ -34,7 +34,7 @@ impl Parser<'_> {
                 });
             }
             TokenKind::KwReset => {
-                let name = self.parse_identifier()?;
+                let name = self.parse_set_name()?;
                 let end = self.peek()?.span.start;
                 return Ok(SetVarStmt {
                     scope: SetScope::Reset,
@@ -57,7 +57,7 @@ impl Parser<'_> {
             SetScope::Session
         };
 
-        let name = self.parse_identifier()?;
+        let name = self.parse_set_name()?;
 
         // `=` or `TO`
         match self.peek()?.kind {
@@ -110,6 +110,24 @@ impl Parser<'_> {
             name,
             value,
             span: Span::new(start, end),
+        })
+    }
+
+    fn parse_set_name(&mut self) -> Result<Identifier, ParseError> {
+        let first = self.parse_identifier()?;
+        let mut value = first.value.clone();
+        let mut end = first.span.end;
+        while self.peek()?.kind == TokenKind::Dot {
+            self.advance()?; // dot
+            let next = self.parse_identifier()?;
+            value.push('.');
+            value.push_str(&next.value);
+            end = next.span.end;
+        }
+        Ok(Identifier {
+            value,
+            quoted: first.quoted,
+            span: Span::new(first.span.start, end),
         })
     }
 }

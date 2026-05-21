@@ -106,7 +106,32 @@ where
             LogicalAlterTableAction::RenameTable { new_name } => {
                 self.execute_alter_rename_table(table_name, new_name)
             }
+            LogicalAlterTableAction::EnableRowLevelSecurity => {
+                self.execute_alter_enable_row_security(table_name, snapshot)
+            }
         }
+    }
+
+    pub(crate) fn execute_alter_enable_row_security(
+        &self,
+        table_name: &str,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let entry = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        let mut runtime = self
+            .state
+            .row_security
+            .get(&entry.oid)
+            .map(|guard| guard.as_ref().clone())
+            .unwrap_or_default();
+        runtime.enabled = true;
+        self.state.row_security.insert(entry.oid, Arc::new(runtime));
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("ALTER TABLE"))
     }
 
     /// Execute `ALTER TABLE t DROP COLUMN c`: rewrite every visible

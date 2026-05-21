@@ -1783,7 +1783,7 @@ and benchmark certification against PostgreSQL + pgvector on the same host.
 | Production HNSW | ✅ SQL surface exists | ✅ SQL surface exists | ⚠️ planner can use runtime graph | ⚠️ page-backed arena has meta/node/overflow/free-list pages; relation wiring open | ⚠️ logical replay + page-image LSN redo-skip tests; restart recovery open | n/a | ⚠️ page arena/replay/LSN tests; restart integration open | ❌ certification open |
 | Runtime IVFFlat | ✅ `CREATE INDEX USING ivfflat` | ✅ `lists`/`probes` checked | ✅ centroid/list scan + exact rerank | ⚠️ runtime lists, not pages | ❌ no page redo/recovery | n/a | ✅ DML/vacuum tests | ❌ certification open |
 | Production IVFFlat | ✅ SQL surface exists | ✅ SQL surface exists | ⚠️ runtime path exists | ❌ page-backed centroids/lists open | ❌ bulk-build/insert/tombstone replay open | n/a | ❌ restart/recovery tests open | ❌ certification open |
-| RAG primitive schemas/helpers | n/a | n/a | ⚠️ normal SQL helper patterns | ✅ ordinary user tables | ⚠️ inherits table durability; no RLS guarantee | n/a | ✅ catalog/server helper tests | ❌ RAG quality/tenant cert open |
+| RAG primitive schemas/helpers | n/a | n/a | ✅ normal SQL helpers + tenant RLS predicate injection | ✅ ordinary user tables | ⚠️ tenant RLS sidecar is same-process; restart policy persistence open | n/a | ✅ catalog/server helper tests + RLS wire round trip | ❌ RAG quality/tenant cert open |
 | CSV table functions | ✅ `read_csv`, globs, arrays, file literals | ✅ function scan + projection/filter pushdown shapes | ⚠️ external wrapper streams child; CSV reader still stores row buffers | file/object bytes only | n/a | ✅ query results | ✅ local/object/glob/projection/filter tests | ⚠️ CSV gauntlet runner; full cert open |
 | Parquet table functions | ✅ `read_parquet`, globs, file literals | ✅ projection/predicate pushdown shapes | ✅ row-group workers yield batches lazily; no upfront full-file batch buffer | ✅ local files plus object range footer/column reads | n/a | ✅ query results | ✅ projection/filter/object-range/row-group-worker/EXPLAIN tests | ⚠️ UltraSQL arena smoke artifact; cross-engine cert open |
 | Object-store scans | ✅ `s3://`, `r2://`, `gs://` path specs | ✅ function scan paths | ⚠️ Parquet uses ranges; CSV/JSON paths still use whole-object reads | ✅ `read_object_range` + metadata APIs exist | n/a | n/a | ✅ mocked range/object tests + Parquet range test | ❌ lakehouse cert open |
@@ -1814,10 +1814,14 @@ and benchmark certification against PostgreSQL + pgvector on the same host.
   recovery, deletes, VACUUM compaction, rebuild, CREATE INDEX CONCURRENTLY
   behavior, filtered-query fallback/iterative scan policy, IVFFlat page
   storage, and recall-vs-latency tests against exact scan.
-- [ ] **RAG guarantee slice** — RAG storage primitives and helper SQL exist as
-  ordinary SQL/table patterns. Tenant-safe RAG is not a DB guarantee until
-  row-level security policy catalog/enforcement lands and tenant predicates
-  are injected for reads and writes.
+- [x] **RAG tenant RLS slice, narrow predicate** — `CREATE POLICY`,
+  `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`, `SET ultrasql.tenant_id`, read
+  predicate injection, and `INSERT ... VALUES` `WITH CHECK` enforcement work
+  for the documented RAG policy shape
+  `tenant_id = current_setting('ultrasql.tenant_id', true)`. Remaining work:
+  persistent policy catalog/restart bootstrap, full PostgreSQL RLS semantics,
+  `INSERT ... SELECT`, update new-row checks, role-scoped policies, and tenant
+  certification artifacts.
 - [ ] **Vector benchmark certification slice** — expand current exact top-k
   and HNSW smoke runners into committed certification artifacts for exact
   scan, filtered exact scan, HNSW, IVFFlat, bulk load, index build,
@@ -1834,7 +1838,7 @@ and benchmark certification against PostgreSQL + pgvector on the same host.
 - [ ] Column-level privileges
 - [ ] Role inheritance + `SET ROLE`
 - [ ] Default privileges (`ALTER DEFAULT PRIVILEGES`)
-- [ ] Row-level security: `CREATE POLICY`, `ALTER TABLE ... ENABLE ROW LEVEL SECURITY`
+- [ ] Row-level security: full PostgreSQL policy semantics (tenant `CREATE POLICY` / `ENABLE ROW LEVEL SECURITY` slice done)
 - [ ] `log_connections`, `log_min_duration_statement`, `log_statement`
 
 ### ORM Compatibility

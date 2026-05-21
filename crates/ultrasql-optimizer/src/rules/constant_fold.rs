@@ -408,6 +408,7 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

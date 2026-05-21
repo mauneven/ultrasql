@@ -368,6 +368,7 @@ fn walk_plan_for_max_param(plan: &LogicalPlan, max_idx: &mut u32) {
                 _ => {}
             }
         }
+        LogicalPlan::CreatePolicy { .. } => {}
     }
 }
 

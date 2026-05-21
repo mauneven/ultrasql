@@ -85,6 +85,8 @@ pub(crate) struct Session<RW> {
     pub(super) jit_enabled: bool,
     /// Session-local row threshold, controlled by `SET jit_above_cost`.
     pub(super) jit_above_rows: usize,
+    /// Session-local custom GUCs used by row-level security policies.
+    pub(super) session_settings: std::collections::HashMap<String, String>,
     /// Receiver half of the per-connection notification channel.
     ///
     /// `LISTEN` registers the session under [`Self::pid`] and the hub
@@ -139,6 +141,7 @@ where
             cancel_flag,
             jit_enabled: false,
             jit_above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
+            session_settings: std::collections::HashMap::new(),
             notify_rx,
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),
             jsonb_shape_cache: std::cell::RefCell::new(jsonb_ingest::JsonbShapeCache::default()),

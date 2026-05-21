@@ -38,10 +38,10 @@ pub use plan::{
     LogicalAggregateExpr, LogicalAggregatingIndex, LogicalAggregatingIndexExpr,
     LogicalAlterTableAction, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalForeignKeyConstraint, LogicalIndexMethod, LogicalIndexOption, LogicalJoinCondition,
-    LogicalJoinType, LogicalOnConflict, LogicalPlan, LogicalReferentialAction,
+    LogicalJoinType, LogicalOnConflict, LogicalPlan, LogicalReferentialAction, LogicalRlsPolicy,
     LogicalSequenceChange, LogicalSequenceOptions, LogicalSetOp, LogicalSetQuantifier,
-    LogicalSetVariableAction, LogicalUniqueConstraint, LogicalWindowFunc, SortKey,
-    TxnIsolationLevel,
+    LogicalSetVariableAction, LogicalTenantPolicyExpr, LogicalUniqueConstraint, LogicalWindowFunc,
+    SortKey, TxnIsolationLevel,
 };
 
 #[cfg(test)]

@@ -118,6 +118,7 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

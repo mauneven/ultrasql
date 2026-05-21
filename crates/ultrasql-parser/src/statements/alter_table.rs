@@ -7,6 +7,7 @@
 //! - `RENAME TO new_name`
 //! - `ADD CONSTRAINT name constraint`
 //! - `DROP CONSTRAINT name [CASCADE|RESTRICT]`
+//! - `ENABLE ROW LEVEL SECURITY`
 
 use crate::ast::{AlterTableAction, AlterTableStmt};
 use crate::parser::{ParseError, Parser};
@@ -33,7 +34,7 @@ impl Parser<'_> {
     }
 
     fn parse_alter_table_action(&mut self) -> Result<AlterTableAction, ParseError> {
-        let tok = self.peek()?;
+        let tok = *self.peek()?;
         let start = tok.span.start;
         match tok.kind {
             TokenKind::KwAdd => {
@@ -102,6 +103,20 @@ impl Parser<'_> {
                 Ok(AlterTableAction::RenameColumn {
                     old,
                     new,
+                    span: Span::new(start, end),
+                })
+            }
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("enable")) =>
+            {
+                self.expect_identifier_keyword("enable", "ENABLE")?;
+                self.expect(TokenKind::KwRow, "ROW")?;
+                self.expect(TokenKind::KwLevel, "LEVEL")?;
+                self.expect_identifier_keyword("security", "SECURITY")?;
+                let end = self.peek()?.span.start;
+                Ok(AlterTableAction::EnableRowLevelSecurity {
                     span: Span::new(start, end),
                 })
             }

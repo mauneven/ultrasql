@@ -9,11 +9,11 @@
 
 use ultrasql_core::{DataType, Field, GeometryType, MAX_VECTOR_DIMS, RangeType, Schema};
 use ultrasql_parser::ast::{
-    AlterSequenceStmt, AlterTableAction, AlterTableStmt, ColumnConstraint, CommentStmt,
+    AlterSequenceStmt, AlterTableAction, AlterTableStmt, BinaryOp, ColumnConstraint, CommentStmt,
     CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat, CopyOption,
     CopySource as AstCopySource, CopyStmt, CreateIndexStmt, CreateMaterializedViewStmt,
-    CreateSequenceStmt, CreateTableStmt, DropSequenceStmt, DropTableStmt, Expr, Identifier,
-    Literal, ObjectName, ReferentialAction as AstReferentialAction, SequenceOption,
+    CreatePolicyStmt, CreateSequenceStmt, CreateTableStmt, DropSequenceStmt, DropTableStmt, Expr,
+    Identifier, Literal, ObjectName, ReferentialAction as AstReferentialAction, SequenceOption,
     TableConstraint, TruncateStmt, TypeName,
 };
 
@@ -27,8 +27,9 @@ use crate::plan::{
     AggregateFunc, CopyDirection, CopyFormat, CopySource, LogicalAggregatingIndex,
     LogicalAggregatingIndexExpr, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalExclusionConstraint, LogicalExclusionElement, LogicalForeignKeyConstraint,
-    LogicalIndexMethod, LogicalIndexOption, LogicalReferentialAction, LogicalSequenceChange,
-    LogicalSequenceOptions, LogicalTimePartition, LogicalUniqueConstraint,
+    LogicalIndexMethod, LogicalIndexOption, LogicalReferentialAction, LogicalRlsPolicy,
+    LogicalSequenceChange, LogicalSequenceOptions, LogicalTenantPolicyExpr, LogicalTimePartition,
+    LogicalUniqueConstraint,
 };
 
 struct RawUniqueConstraint {
@@ -364,6 +365,117 @@ fn column_generated_stored(constraints: &[ColumnConstraint]) -> Result<Option<&E
         }
     }
     Ok(out)
+}
+
+pub(super) fn bind_create_policy(
+    s: &CreatePolicyStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
+    let table_name = object_name_simple(&s.table);
+    let meta = catalog
+        .lookup_table(&table_name)
+        .ok_or_else(|| PlanError::TableNotFound(table_name.clone()))?;
+    let using = s
+        .using
+        .as_ref()
+        .map(|expr| bind_tenant_policy_expr(expr, &meta.schema))
+        .transpose()?;
+    let with_check = s
+        .with_check
+        .as_ref()
+        .map(|expr| bind_tenant_policy_expr(expr, &meta.schema))
+        .transpose()?;
+    if using.is_none() && with_check.is_none() {
+        return Err(PlanError::NotSupported(
+            "CREATE POLICY requires USING or WITH CHECK",
+        ));
+    }
+    Ok(LogicalPlan::CreatePolicy {
+        policy: LogicalRlsPolicy {
+            policy_name: s.name.value.to_ascii_lowercase(),
+            table_name,
+            using,
+            with_check,
+        },
+        schema: Schema::empty(),
+    })
+}
+
+fn bind_tenant_policy_expr(
+    expr: &Expr,
+    table_schema: &Schema,
+) -> Result<LogicalTenantPolicyExpr, PlanError> {
+    let expr = unparen_expr(expr);
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = expr
+    else {
+        return Err(PlanError::NotSupported(
+            "CREATE POLICY currently supports tenant equality predicates",
+        ));
+    };
+    bind_tenant_policy_pair(left, right, table_schema)
+        .or_else(|| bind_tenant_policy_pair(right, left, table_schema))
+        .ok_or(PlanError::NotSupported(
+            "CREATE POLICY predicate must compare a column to current_setting(setting, true)",
+        ))
+}
+
+fn bind_tenant_policy_pair(
+    column_expr: &Expr,
+    setting_expr: &Expr,
+    table_schema: &Schema,
+) -> Option<LogicalTenantPolicyExpr> {
+    let Expr::Column { name } = unparen_expr(column_expr) else {
+        return None;
+    };
+    if name.parts.len() != 1 {
+        return None;
+    }
+    let column_name = name.parts[0].value.to_ascii_lowercase();
+    let (column_index, field) = table_schema.find(&column_name)?;
+    if !field.data_type.is_textlike() {
+        return None;
+    }
+    let setting_name = extract_current_setting_name(setting_expr)?;
+    Some(LogicalTenantPolicyExpr {
+        column_index,
+        column_name,
+        setting_name,
+    })
+}
+
+fn extract_current_setting_name(expr: &Expr) -> Option<String> {
+    let Expr::Call {
+        name,
+        args,
+        distinct: false,
+        over: None,
+        ..
+    } = unparen_expr(expr)
+    else {
+        return None;
+    };
+    if object_name_simple(name) != "current_setting" || args.len() != 2 {
+        return None;
+    }
+    let Expr::Literal(Literal::String { value, .. }) = unparen_expr(&args[0]) else {
+        return None;
+    };
+    let Expr::Literal(Literal::Bool { value: true, .. }) = unparen_expr(&args[1]) else {
+        return None;
+    };
+    Some(value.to_ascii_lowercase())
+}
+
+fn unparen_expr(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren { expr, .. } => unparen_expr(expr),
+        _ => expr,
+    }
 }
 
 pub(super) fn bind_create_materialized_view(
@@ -1783,6 +1895,9 @@ pub(super) fn bind_alter_table(
                 return Err(PlanError::DuplicateTable(new));
             }
             LogicalAlterTableAction::RenameTable { new_name: new }
+        }
+        AlterTableAction::EnableRowLevelSecurity { .. } => {
+            LogicalAlterTableAction::EnableRowLevelSecurity
         }
         AlterTableAction::AddConstraint { .. } => {
             return Err(PlanError::NotSupported(

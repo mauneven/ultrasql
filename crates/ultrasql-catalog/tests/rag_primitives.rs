@@ -419,7 +419,8 @@ fn rag_tenant_security_docs_state_enforcement_boundary() {
     let docs = include_str!("../../../docs/rag-tenant-security.md");
 
     assert!(docs.contains("tenant_id TEXT NOT NULL"));
-    assert!(docs.contains("UltraSQL does not yet enforce `CREATE POLICY`"));
+    assert!(docs.contains("first database-enforced tenant RLS slice"));
+    assert!(docs.contains("Do not claim full PostgreSQL RLS compatibility yet"));
     assert!(docs.contains("tenant_id = $1"));
     assert!(docs.contains("Metadata filters run before answer context"));
     assert!(docs.contains("Every retrieved chunk must be audited"));

@@ -770,6 +770,14 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// `CREATE POLICY name ON table USING (...) WITH CHECK (...)`.
+    CreatePolicy {
+        /// Bound row-security policy metadata.
+        policy: LogicalRlsPolicy,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
     /// `CREATE SEQUENCE [IF NOT EXISTS] name ...`.
     CreateSequence {
         /// Case-folded sequence name.
@@ -1375,6 +1383,32 @@ pub enum LogicalAlterTableAction {
         /// New table name.
         new_name: String,
     },
+    /// `ALTER TABLE t ENABLE ROW LEVEL SECURITY`.
+    EnableRowLevelSecurity,
+}
+
+/// Tenant row-security predicate supported by the v1 RLS path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalTenantPolicyExpr {
+    /// Target table column index.
+    pub column_index: usize,
+    /// Target table column name.
+    pub column_name: String,
+    /// Session setting read through `current_setting(setting, true)`.
+    pub setting_name: String,
+}
+
+/// Bound `CREATE POLICY` metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalRlsPolicy {
+    /// Policy name.
+    pub policy_name: String,
+    /// Target table.
+    pub table_name: String,
+    /// Read visibility predicate.
+    pub using: Option<LogicalTenantPolicyExpr>,
+    /// Write acceptance predicate.
+    pub with_check: Option<LogicalTenantPolicyExpr>,
 }
 
 impl LogicalPlan {
@@ -1400,6 +1434,7 @@ impl LogicalPlan {
                 | Self::CreateTable { .. }
                 | Self::CreateMaterializedView { .. }
                 | Self::CreateIndex { .. }
+                | Self::CreatePolicy { .. }
                 | Self::DropTable { .. }
                 | Self::AlterTable { .. }
                 | Self::CreateSequence { .. }
@@ -1453,6 +1488,7 @@ impl LogicalPlan {
             | Self::CreateTable { .. }
             | Self::CreateMaterializedView { .. }
             | Self::CreateIndex { .. }
+            | Self::CreatePolicy { .. }
             | Self::DropTable { .. }
             | Self::AlterTable { .. }
             | Self::CreateSequence { .. }
@@ -1497,6 +1533,7 @@ impl LogicalPlan {
             | Self::Cte { schema, .. }
             | Self::LockRows { schema, .. }
             | Self::CreateIndex { schema, .. }
+            | Self::CreatePolicy { schema, .. }
             | Self::DropTable { schema, .. }
             | Self::AlterTable { schema, .. }
             | Self::CreateSequence { schema, .. }
@@ -2064,7 +2101,23 @@ impl LogicalPlan {
                             format_args!("AlterTable: {table_name} RENAME TO {new_name}\n"),
                         );
                     }
+                    LogicalAlterTableAction::EnableRowLevelSecurity => {
+                        let _ = fmt::write(
+                            out,
+                            format_args!("AlterTable: {table_name} ENABLE ROW LEVEL SECURITY\n"),
+                        );
+                    }
                 }
+            }
+            Self::CreatePolicy { policy, .. } => {
+                out.push_str(&pad);
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "CreatePolicy: {} ON {}\n",
+                        policy.policy_name, policy.table_name
+                    ),
+                );
             }
             Self::CreateSequence {
                 sequence_name,

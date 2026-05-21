@@ -52,6 +52,62 @@ impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
 {
+    /// Register a row-level security policy for one table.
+    pub(crate) fn execute_create_policy(
+        &self,
+        plan: &LogicalPlan,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::CreatePolicy { policy, .. } = plan else {
+            return Err(ServerError::Unsupported(
+                "execute_create_policy called with non-CreatePolicy plan",
+            ));
+        };
+        let entry = snapshot.tables.get(&policy.table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                policy.table_name.clone(),
+            ))
+        })?;
+        let mut runtime = self
+            .state
+            .row_security
+            .get(&entry.oid)
+            .map(|guard| guard.as_ref().clone())
+            .unwrap_or_default();
+        if runtime
+            .policies
+            .iter()
+            .any(|existing| existing.name == policy.policy_name)
+        {
+            return Err(ServerError::ddl(format!(
+                "row-level security policy '{}' already exists on {}",
+                policy.policy_name, policy.table_name
+            )));
+        }
+        runtime.policies.push(crate::RuntimeRlsPolicy {
+            name: policy.policy_name.clone(),
+            using: policy
+                .using
+                .as_ref()
+                .map(|expr| crate::RuntimeTenantPolicyExpr {
+                    column_index: expr.column_index,
+                    column_name: expr.column_name.clone(),
+                    setting_name: expr.setting_name.clone(),
+                }),
+            with_check: policy
+                .with_check
+                .as_ref()
+                .map(|expr| crate::RuntimeTenantPolicyExpr {
+                    column_index: expr.column_index,
+                    column_name: expr.column_name.clone(),
+                    setting_name: expr.setting_name.clone(),
+                }),
+        });
+        self.state.row_security.insert(entry.oid, Arc::new(runtime));
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("CREATE POLICY"))
+    }
+
     /// Persist a `CREATE TABLE` into the catalog.
     ///
     /// Honors `IF NOT EXISTS` by short-circuiting when the relation
