@@ -132,6 +132,21 @@ The comparison must:
 
 A comparison that violates any of these is invalid.
 
+### Public Benchmark Arena
+
+The public arena publishes raw artifacts only:
+
+```text
+benchmarks/arena.sh --engines ultrasql,duckdb,clickhouse,postgres,firebolt
+```
+
+The arena does not rank engines or render winner prose. Each suite writes a
+measured artifact, an explicit `not_available` artifact, or a manifest whose
+partial status explains the missing engine, dataset, DSN, or implementation.
+Current smoke artifacts include measured UltraSQL Parquet and object-store
+Parquet range runs. Firebolt entries stay `not_available` unless
+`FIREBOLT_URL` points at a running Firebolt Core endpoint.
+
 ### SQLLogicTest Replay Timing
 
 SQLLogicTest replay timing is a smoke benchmark for portable SQL compatibility
@@ -365,9 +380,10 @@ benchmarks/ai_benchmark_gauntlet.sh full
 The gauntlet is the committed entrypoint for exact vector scan, ANN
 recall/latency, hybrid search latency, RAG retrieval quality, filtered
 vector search, ingestion throughput, memory per million vectors, and
-cold-start index load time. Today it runs the exact vector top-k and HNSW
-ANN runners above, then writes explicit `not_available` artifacts for
-suites whose runners are not implemented yet. The manifest is
+cold-start index load time. Today it runs the exact vector top-k, HNSW ANN,
+hybrid search latency, and RAG retrieval quality runners, then writes
+explicit `not_available` artifacts for suites whose runners are not
+implemented yet. The manifest is
 `benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json`; `partial`
 means at least one suite is still missing and no complete AI benchmark
 certification exists.
@@ -397,6 +413,24 @@ artifacts land under `benchmarks/results/latest/raw/` as
 `csv_<workload>_<rows>-<engine>.json`. `CSV_GAUNTLET_ROWS`,
 `CSV_GAUNTLET_ITERS`, `CSV_GAUNTLET_WARMUP`, and
 `CSV_GAUNTLET_ENGINES` control local smoke versus full runs.
+
+### Object Parquet Range
+
+Object-store Parquet range-read smoke is recorded by:
+
+```text
+benchmarks/object_parquet_range.sh smoke
+```
+
+The runner builds a deterministic Parquet file, serves it through the mocked
+object-store path, and verifies the raw request log. A measured artifact must
+show ranged metadata/column reads, no whole-object fetch, and no fetch of a
+projected-out column. The manifest is
+`benchmarks/results/latest/object_parquet_range_manifest.json`, and raw
+results land under
+`benchmarks/results/latest/raw/object_parquet_range_smoke-ultrasql.json`.
+This is lakehouse plumbing evidence only; cross-engine S3/R2/GCS
+certification remains open.
 
 ### TPC-B Certification
 
@@ -479,7 +513,7 @@ certification attempts:
 ```text
 benchmarks/certify.sh smoke
 benchmarks/certify.sh full
-benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet
+benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet,object-parquet-range,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
 ```
 
 Smoke profile:
@@ -491,7 +525,8 @@ Smoke profile:
 Full profile:
 - attempts TPC-H SF10, ClickBench, TPC-B, TPC-C, sysbench-style OLTP,
   exact vector top-k, HNSW ANN vector search, the AI benchmark gauntlet,
-  and the CSV benchmark gauntlet;
+  the CSV benchmark gauntlet, object Parquet range smoke, and Firebolt
+  aggregate/sparse-pruning/vector runners;
 - writes `benchmarks/results/latest/benchmark_certification_manifest.json`;
 - treats exit code 2 from a child runner as `unavailable`, meaning a required
   dataset, DSN, engine, or implementation is missing and no benchmark claim

@@ -106,9 +106,9 @@ are grounds for revert.
 | v0.9 | TPC-B (OLTP, 32 connections) | ≥ 2× PostgreSQL 17, p99 < 5 ms | throughput + latency |
 | v1.0 | TPC-C (all 5 tx types, 32 connections) | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
 | v1.0 | Sysbench OLTP read/write | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
-| v1.0 | Firebolt aggregating-index dashboard aggregate | ≥ 2× Firebolt ⚠️ runner added; Firebolt endpoint artifact pending | median query latency |
-| v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ runner added; Firebolt endpoint artifact pending | median query latency |
-| v1.0 | Firebolt HNSW vector search | recall/latency artifact vs UltraSQL HNSW ⚠️ runner added; Firebolt endpoint artifact pending | recall@k + p50/p95/p99 |
+| v1.0 | Firebolt aggregating-index dashboard aggregate | ≥ 2× Firebolt ⚠️ runner + UltraSQL smoke artifact exist; Firebolt artifact is `not_available` until `FIREBOLT_URL` is configured | median query latency |
+| v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ runner + UltraSQL smoke artifact exist; Firebolt artifact is `not_available` until `FIREBOLT_URL` is configured | median query latency |
+| v1.0 | Firebolt HNSW vector search | recall/latency artifact vs UltraSQL HNSW ⚠️ runner added; Firebolt artifact is `not_available` until `FIREBOLT_URL` is configured and vector support is verified | recall@k + p50/p95/p99 |
 | v2.x | Star Schema Benchmark scale 100 | ≥ 2× ClickHouse | geometric mean query time |
 
 All comparisons follow the methodology in `BENCHMARKS.md`: same host,
@@ -1783,10 +1783,10 @@ and benchmark certification against PostgreSQL + pgvector on the same host.
 | Production HNSW | ✅ SQL surface exists | ✅ SQL surface exists | ⚠️ planner can use runtime graph | ⚠️ page-backed arena has meta/node/overflow/free-list pages; relation wiring open | ⚠️ logical replay + page-image LSN redo-skip tests; restart recovery open | n/a | ⚠️ page arena/replay/LSN tests; restart integration open | ❌ certification open |
 | Runtime IVFFlat | ✅ `CREATE INDEX USING ivfflat` | ✅ `lists`/`probes` checked | ✅ centroid/list scan + exact rerank | ⚠️ runtime lists, not pages | ❌ no page redo/recovery | n/a | ✅ DML/vacuum tests | ❌ certification open |
 | Production IVFFlat | ✅ SQL surface exists | ✅ SQL surface exists | ⚠️ runtime path exists | ❌ page-backed centroids/lists open | ❌ bulk-build/insert/tombstone replay open | n/a | ❌ restart/recovery tests open | ❌ certification open |
-| RAG primitive schemas/helpers | n/a | n/a | ✅ normal SQL helpers + tenant RLS predicate injection | ✅ ordinary user tables | ⚠️ tenant RLS sidecar is same-process; restart policy persistence open | n/a | ✅ catalog/server helper tests + RLS wire round trip | ❌ RAG quality/tenant cert open |
-| CSV table functions | ✅ `read_csv`, globs, arrays, file literals | ✅ function scan + projection/filter pushdown shapes | ⚠️ external wrapper streams child; CSV reader still stores row buffers | file/object bytes only | n/a | ✅ query results | ✅ local/object/glob/projection/filter tests | ⚠️ CSV gauntlet runner; full cert open |
-| Parquet table functions | ✅ `read_parquet`, globs, file literals | ✅ projection/predicate pushdown shapes | ✅ row-group workers yield batches lazily; no upfront full-file batch buffer | ✅ local files plus object range footer/column reads | n/a | ✅ query results | ✅ projection/filter/object-range/row-group-worker/EXPLAIN tests | ⚠️ UltraSQL arena smoke artifact; cross-engine cert open |
-| Object-store scans | ✅ `s3://`, `r2://`, `gs://` path specs | ✅ function scan paths | ⚠️ Parquet uses ranges; CSV/JSON paths still use whole-object reads | ✅ `read_object_range` + metadata APIs exist | n/a | n/a | ✅ mocked range/object tests + Parquet range test | ❌ lakehouse cert open |
+| RAG primitive schemas/helpers | n/a | n/a | ✅ normal SQL helpers + tenant RLS predicate injection | ✅ ordinary user tables | ⚠️ tenant RLS sidecar is same-process; restart policy persistence open | n/a | ✅ catalog/server helper tests + RLS wire round trip | ⚠️ RAG quality smoke + tenant RLS tests exist; full cert open |
+| CSV table functions | ✅ `read_csv`, globs, arrays, file literals | ✅ function scan + projection/filter pushdown shapes | ⚠️ external wrapper streams child; CSV reader still stores row buffers | file/object bytes only | n/a | ✅ query results | ✅ local/object/glob/projection/filter tests | ⚠️ CSV gauntlet smoke measured for UltraSQL/DuckDB; ClickHouse unavailable locally; full cert open |
+| Parquet table functions | ✅ `read_parquet`, globs, file literals | ✅ projection/predicate pushdown shapes | ✅ row-group workers yield batches lazily; no upfront full-file batch buffer | ✅ local files plus object range footer/column reads | n/a | ✅ query results | ✅ projection/filter/object-range/row-group-worker/EXPLAIN tests | ⚠️ UltraSQL arena smoke measured; cross-engine cert open |
+| Object-store scans | ✅ `s3://`, `r2://`, `gs://` path specs | ✅ function scan paths | ⚠️ Parquet uses ranges; CSV/JSON paths still use whole-object reads | ✅ `read_object_range` + metadata APIs exist | n/a | n/a | ✅ mocked range/object tests + Parquet range test | ⚠️ object Parquet range smoke measured; full lakehouse cert open |
 | Iceberg read scan | ✅ `read_iceberg` / `iceberg_scan` | ✅ function scan | ⚠️ metadata planner feeds Parquet scan | metadata-only planner | n/a | ✅ query results | ✅ current snapshot tests | ❌ deletes/time-travel/catalog cert open |
 | Arrow bridge | ✅ `read_arrow` | ✅ function scan | ⚠️ buffered IPC file batches | IPC bytes only | n/a | ✅ query results | ✅ basic type tests | ❌ Flight/type-coverage cert open |
 
@@ -1822,10 +1822,11 @@ and benchmark certification against PostgreSQL + pgvector on the same host.
   persistent policy catalog/restart bootstrap, full PostgreSQL RLS semantics,
   `INSERT ... SELECT`, update new-row checks, role-scoped policies, and tenant
   certification artifacts.
-- [ ] **Vector benchmark certification slice** — expand current exact top-k
-  and HNSW smoke runners into committed certification artifacts for exact
-  scan, filtered exact scan, HNSW, IVFFlat, bulk load, index build,
-  update/delete maintenance, WAL recovery, and hybrid RAG query shapes.
+- [ ] **Vector benchmark certification slice** — expand current exact top-k,
+  HNSW recall/latency, hybrid search latency, and RAG retrieval quality smoke
+  artifacts into committed certification artifacts for filtered exact scan,
+  IVFFlat, bulk load, index build, update/delete maintenance, WAL recovery, and
+  larger hybrid RAG query shapes.
   Certification must compare UltraSQL against PostgreSQL + pgvector on the
   same host and report recall@k, p50/p95/p99 latency, throughput, index size,
   build time, memory, and restart correctness. No v1.0 vector claim is allowed
@@ -1892,9 +1893,10 @@ and benchmark certification against PostgreSQL + pgvector on the same host.
 - [ ] TPC-H scale 1: throughput ≥ 2× PostgreSQL 17
 - [ ] TPC-H scale 10: throughput ≥ 2× DuckDB
 - [ ] Sysbench OLTP read/write: throughput ≥ 2× PostgreSQL
-- [ ] Vector/RAG certification: exact kNN, HNSW, IVFFlat, filtered ANN,
-  hybrid text+vector retrieval, and bulk embedding load certified against
-  PostgreSQL + pgvector with committed recall/latency/build-size artifacts
+- [ ] Vector/RAG certification: exact kNN and HNSW smoke artifacts exist;
+  hybrid text+vector retrieval and RAG quality smoke artifacts exist; IVFFlat,
+  filtered ANN, bulk embedding load, recovery, and same-host pgvector
+  certification remain open
 
 ### Production Validation
 - [ ] Three independent operators run UltraSQL for 30 days and report
