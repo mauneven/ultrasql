@@ -837,7 +837,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::mpsc;
+    use std::sync::{Mutex, MutexGuard, OnceLock as TestOnceLock, mpsc};
     use std::thread;
 
     #[test]
@@ -864,6 +864,7 @@ mod tests {
 
     #[test]
     fn read_object_range_requests_byte_slice() {
+        let _test_guard = objectstore_env_test_lock();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
         let (request_tx, request_rx) = mpsc::channel();
@@ -906,6 +907,7 @@ mod tests {
 
     #[test]
     fn read_object_range_cache_reuses_identical_ranges() {
+        let _test_guard = objectstore_env_test_lock();
         reset_object_range_cache_for_tests();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
         let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
@@ -955,6 +957,13 @@ mod tests {
         assert_eq!(metrics.cache_hits, 1);
         handle.join().expect("mock server done");
         reset_object_range_cache_for_tests();
+    }
+
+    fn objectstore_env_test_lock() -> MutexGuard<'static, ()> {
+        static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("objectstore env test lock")
     }
 
     struct EnvVarGuard {
