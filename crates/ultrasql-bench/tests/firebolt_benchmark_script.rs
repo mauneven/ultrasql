@@ -231,8 +231,14 @@ fn late_materialization_script_declares_firebolt_style_workload() {
 
     assert!(script.contains("--workload late-materialization"));
     assert!(script.contains("Late-materialization smoke/full runner"));
+    assert!(script.contains("LATE_MAT_ENGINES"));
+    assert!(script.contains("ultrasql-late,ultrasql-eager,duckdb,clickhouse"));
+    assert!(script.contains("not_available"));
     assert!(driver.contains("LateMaterialization"));
+    assert!(driver.contains("LATE_MAT_WIDE_COLUMNS: usize = 100"));
     assert!(driver.contains("wide_payload_projection_with_selective_index_filter"));
+    assert!(driver.contains("eager_scan_median_us"));
+    assert!(driver.contains("late_materialization_median_us"));
     assert!(driver.contains("explain_late_materialization"));
     assert!(certify.contains("late-materialization"));
     assert!(certify.contains("run_late_materialization_smoke"));

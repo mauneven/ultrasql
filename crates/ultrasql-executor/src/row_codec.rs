@@ -835,6 +835,234 @@ impl RowCodec {
         Ok(row)
     }
 
+    /// Decode only `projection` columns from a stored row payload.
+    ///
+    /// The row layout is still row-oriented, so the decoder must scan
+    /// earlier columns to advance offsets. It skips unprojected values
+    /// without constructing [`Value`] objects for them, which is the
+    /// payload phase late materialization needs for wide rows.
+    pub fn decode_projected(
+        &self,
+        bytes: &[u8],
+        projection: &[usize],
+    ) -> Result<Vec<Value>, RowCodecError> {
+        let n = self.schema.len();
+        let bitmap_bytes = n.div_ceil(8);
+        if bytes.len() < bitmap_bytes {
+            return Err(RowCodecError::Truncated {
+                needed: bitmap_bytes,
+                have: bytes.len(),
+            });
+        }
+        let mut targets = vec![Vec::new(); n];
+        for (out_idx, &col_idx) in projection.iter().enumerate() {
+            if col_idx >= n {
+                return Err(RowCodecError::Arity {
+                    schema: n,
+                    row: col_idx.saturating_add(1),
+                });
+            }
+            targets[col_idx].push(out_idx);
+        }
+
+        let bitmap = &bytes[..bitmap_bytes];
+        let mut cursor = bitmap_bytes;
+        let mut projected = vec![Value::Null; projection.len()];
+
+        for (col_idx, field) in self.schema.fields().iter().enumerate() {
+            let null_bit = (bitmap[col_idx / 8] >> (col_idx % 8)) & 1;
+            if null_bit != 0 {
+                continue;
+            }
+            if targets[col_idx].is_empty() {
+                Self::skip_one_value(bytes, &mut cursor, col_idx, &field.data_type)?;
+                continue;
+            }
+            let value = Self::decode_one_value(bytes, &mut cursor, col_idx, &field.data_type)?;
+            for &out_idx in &targets[col_idx] {
+                projected[out_idx] = value.clone();
+            }
+        }
+
+        Ok(projected)
+    }
+
+    fn decode_one_value(
+        bytes: &[u8],
+        cursor: &mut usize,
+        col_idx: usize,
+        data_type: &DataType,
+    ) -> Result<Value, RowCodecError> {
+        match data_type {
+            DataType::Bool => {
+                let needed = cursor.saturating_add(1);
+                if bytes.len() < needed {
+                    return Err(RowCodecError::Truncated {
+                        needed,
+                        have: bytes.len(),
+                    });
+                }
+                let value = Value::Bool(bytes[*cursor] != 0);
+                *cursor = needed;
+                Ok(value)
+            }
+            DataType::Int16 => {
+                let raw = read_fixed::<2>(bytes, cursor)?;
+                Ok(Value::Int16(i16::from_le_bytes(raw)))
+            }
+            DataType::Int32 => {
+                let raw = read_fixed::<4>(bytes, cursor)?;
+                Ok(Value::Int32(i32::from_le_bytes(raw)))
+            }
+            DataType::Int64 => {
+                let raw = read_fixed::<8>(bytes, cursor)?;
+                Ok(Value::Int64(i64::from_le_bytes(raw)))
+            }
+            DataType::Float32 => {
+                let raw = read_fixed::<4>(bytes, cursor)?;
+                Ok(Value::Float32(f32::from_le_bytes(raw)))
+            }
+            DataType::Float64 => {
+                let raw = read_fixed::<8>(bytes, cursor)?;
+                Ok(Value::Float64(f64::from_le_bytes(raw)))
+            }
+            DataType::Date => {
+                let raw = read_fixed::<4>(bytes, cursor)?;
+                Ok(Value::Date(i32::from_le_bytes(raw)))
+            }
+            DataType::Decimal { scale, .. } => {
+                let raw = read_fixed::<8>(bytes, cursor)?;
+                Ok(Value::Decimal {
+                    value: i64::from_le_bytes(raw),
+                    scale: scale.unwrap_or(0),
+                })
+            }
+            DataType::Timestamp | DataType::TimestampTz | DataType::Time => {
+                let raw = read_fixed::<8>(bytes, cursor)?;
+                let value = i64::from_le_bytes(raw);
+                match data_type {
+                    DataType::Timestamp => Ok(Value::Timestamp(value)),
+                    DataType::TimestampTz => Ok(Value::TimestampTz(value)),
+                    DataType::Time => Ok(Value::Time(value)),
+                    _ => unreachable!(),
+                }
+            }
+            DataType::Uuid => {
+                let raw = read_fixed::<16>(bytes, cursor)?;
+                Ok(Value::Uuid(raw))
+            }
+            DataType::Bytea => Ok(Value::Bytea(decode_varlena_bytes(bytes, cursor)?)),
+            DataType::Text { .. } => Ok(Value::Text(decode_varlena_text(
+                bytes,
+                cursor,
+                "text column",
+            )?)),
+            DataType::Range(range_type) => {
+                let s = decode_varlena_text(bytes, cursor, "range column")?;
+                Ok(Value::Range(
+                    RangeValue::parse(*range_type, &s).ok_or_else(|| RowCodecError::Type {
+                        column: col_idx,
+                        expected: data_type.clone(),
+                        got: "invalid range literal".to_owned(),
+                    })?,
+                ))
+            }
+            DataType::Jsonb => Ok(Value::Jsonb(decode_varlena_text(
+                bytes,
+                cursor,
+                "jsonb column",
+            )?)),
+            DataType::Vector { dims } => {
+                decode_vector_value(bytes, cursor, *dims, col_idx, data_type)
+            }
+            DataType::HalfVec { dims } => {
+                let s = decode_varlena_text(bytes, cursor, "halfvec column")?;
+                decode_text_vector_family_value(Value::parse_halfvec(&s), *dims, col_idx, data_type)
+            }
+            DataType::SparseVec { dims } => {
+                let s = decode_varlena_text(bytes, cursor, "sparsevec column")?;
+                decode_text_vector_family_value(
+                    Value::parse_sparsevec(&s),
+                    *dims,
+                    col_idx,
+                    data_type,
+                )
+            }
+            DataType::BitVec { dims } => {
+                let s = decode_varlena_text(bytes, cursor, "bitvec column")?;
+                decode_text_vector_family_value(Value::parse_bitvec(&s), *dims, col_idx, data_type)
+            }
+            DataType::Array(element_type) => {
+                let s = decode_varlena_text(bytes, cursor, "array column")?;
+                Value::parse_array((**element_type).clone(), &s).ok_or_else(|| {
+                    RowCodecError::Type {
+                        column: col_idx,
+                        expected: data_type.clone(),
+                        got: "invalid array literal".to_owned(),
+                    }
+                })
+            }
+            DataType::Geometry(geometry_type) => {
+                let s = decode_varlena_text(bytes, cursor, "geometry column")?;
+                Ok(Value::Geometry(
+                    GeometryValue::parse(*geometry_type, &s).ok_or_else(|| {
+                        RowCodecError::Type {
+                            column: col_idx,
+                            expected: data_type.clone(),
+                            got: "invalid geometry literal".to_owned(),
+                        }
+                    })?,
+                ))
+            }
+            DataType::Null => Err(RowCodecError::UnsupportedType {
+                column: col_idx,
+                ty: DataType::Null,
+            }),
+            other => Err(RowCodecError::UnsupportedType {
+                column: col_idx,
+                ty: other.clone(),
+            }),
+        }
+    }
+
+    fn skip_one_value(
+        bytes: &[u8],
+        cursor: &mut usize,
+        col_idx: usize,
+        data_type: &DataType,
+    ) -> Result<(), RowCodecError> {
+        match data_type {
+            DataType::Bool => skip_fixed(bytes, cursor, 1),
+            DataType::Int16 => skip_fixed(bytes, cursor, 2),
+            DataType::Int32 | DataType::Float32 | DataType::Date => skip_fixed(bytes, cursor, 4),
+            DataType::Int64
+            | DataType::Float64
+            | DataType::Decimal { .. }
+            | DataType::Timestamp
+            | DataType::TimestampTz
+            | DataType::Time => skip_fixed(bytes, cursor, 8),
+            DataType::Uuid => skip_fixed(bytes, cursor, 16),
+            DataType::Bytea
+            | DataType::Text { .. }
+            | DataType::Range(_)
+            | DataType::Jsonb
+            | DataType::HalfVec { .. }
+            | DataType::SparseVec { .. }
+            | DataType::BitVec { .. }
+            | DataType::Array(_)
+            | DataType::Geometry(_) => skip_varlena_payload(bytes, cursor),
+            DataType::Vector { dims } => skip_vector_value(bytes, cursor, *dims, col_idx),
+            DataType::Null => Err(RowCodecError::UnsupportedType {
+                column: col_idx,
+                ty: DataType::Null,
+            }),
+            other => Err(RowCodecError::UnsupportedType {
+                column: col_idx,
+                ty: other.clone(),
+            }),
+        }
+    }
+
     /// Initialise a `Vec<ColumnBuilder>` matching this codec's schema.
     ///
     /// # Errors
@@ -1660,6 +1888,93 @@ fn decode_text_vector_family_value(
     Ok(value)
 }
 
+fn read_fixed<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Result<[u8; N], RowCodecError> {
+    let needed = cursor.saturating_add(N);
+    if bytes.len() < needed {
+        return Err(RowCodecError::Truncated {
+            needed,
+            have: bytes.len(),
+        });
+    }
+    let raw: [u8; N] = bytes[*cursor..needed]
+        .try_into()
+        .map_err(|_| RowCodecError::Truncated {
+            needed,
+            have: bytes.len(),
+        })?;
+    *cursor = needed;
+    Ok(raw)
+}
+
+fn skip_fixed(bytes: &[u8], cursor: &mut usize, width: usize) -> Result<(), RowCodecError> {
+    let needed = cursor.saturating_add(width);
+    if bytes.len() < needed {
+        return Err(RowCodecError::Truncated {
+            needed,
+            have: bytes.len(),
+        });
+    }
+    *cursor = needed;
+    Ok(())
+}
+
+fn decode_varlena_bytes(bytes: &[u8], cursor: &mut usize) -> Result<Vec<u8>, RowCodecError> {
+    let payload = read_varlena_slice(bytes, cursor)?;
+    Ok(payload.to_vec())
+}
+
+fn skip_varlena_payload(bytes: &[u8], cursor: &mut usize) -> Result<(), RowCodecError> {
+    let _ = read_varlena_slice(bytes, cursor)?;
+    Ok(())
+}
+
+fn read_varlena_slice<'a>(bytes: &'a [u8], cursor: &mut usize) -> Result<&'a [u8], RowCodecError> {
+    let len_raw = read_fixed::<4>(bytes, cursor)?;
+    let value_len =
+        usize::try_from(u32::from_le_bytes(len_raw)).expect("u32 fits in usize on all targets");
+    let end = cursor.saturating_add(value_len);
+    if bytes.len() < end {
+        return Err(RowCodecError::Truncated {
+            needed: end,
+            have: bytes.len(),
+        });
+    }
+    let payload = &bytes[*cursor..end];
+    *cursor = end;
+    Ok(payload)
+}
+
+fn skip_vector_value(
+    bytes: &[u8],
+    cursor: &mut usize,
+    expected_dims: Option<u32>,
+    column: usize,
+) -> Result<(), RowCodecError> {
+    let dims_raw = read_fixed::<VECTOR_DIMS_WIDTH>(bytes, cursor)?;
+    let dims = u32::from_le_bytes(dims_raw);
+    if dims == 0 || dims > MAX_VECTOR_DIMS || expected_dims.is_some_and(|expected| expected != dims)
+    {
+        return Err(RowCodecError::Type {
+            column,
+            expected: DataType::Vector {
+                dims: expected_dims,
+            },
+            got: format!("vector({dims})"),
+        });
+    }
+    let dims_usize = usize::try_from(dims).expect("u32 fits in usize on supported targets");
+    let byte_len =
+        dims_usize
+            .checked_mul(VECTOR_ELEMENT_WIDTH)
+            .ok_or(RowCodecError::UnsupportedType {
+                column,
+                ty: DataType::Vector {
+                    dims: expected_dims,
+                },
+            })?;
+    skip_fixed(bytes, cursor, byte_len)
+}
+
 const fn ty_name_for_dimension_error(ty: &DataType) -> &'static str {
     match ty {
         DataType::Vector { .. } => "vector",
@@ -2112,6 +2427,23 @@ mod tests {
             Value::Float64(9.9),
         ];
         assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
+    }
+
+    #[test]
+    fn decode_projected_returns_requested_columns_in_output_order() {
+        let codec = RowCodec::new(schema_mixed());
+        let row = vec![Value::Int32(7), Value::Text("payload".into()), Value::Null];
+        let bytes = codec.encode(&row).unwrap();
+
+        assert_eq!(
+            codec.decode_projected(&bytes, &[2, 0, 1, 1]).unwrap(),
+            vec![
+                Value::Null,
+                Value::Int32(7),
+                Value::Text("payload".into()),
+                Value::Text("payload".into())
+            ]
+        );
     }
 
     #[test]

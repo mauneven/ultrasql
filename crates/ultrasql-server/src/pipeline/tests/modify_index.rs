@@ -282,7 +282,7 @@ fn lower_query_project_index_key_without_all_visible_falls_back_to_heap_index_sc
 }
 
 #[test]
-fn lower_query_project_payload_column_picks_late_materialization_scan() {
+fn lower_query_project_payload_column_skips_late_materialization_on_narrow_table() {
     let rows: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
     let (fix, _entry, _tids) = build_index_fixture("t_late_mat", &rows, true);
     let tables = SampleTables::new();
@@ -306,15 +306,15 @@ fn lower_query_project_payload_column_picks_late_materialization_scan() {
     let mut op = lower_query(&plan, &ctx).expect("lowers");
     let debug = format!("{op:?}");
     assert!(
-        debug.starts_with("LateMaterializeScan"),
-        "expected LateMaterializeScan, got: {debug}"
+        !debug.starts_with("LateMaterializeScan"),
+        "narrow table should not use LateMaterializeScan, got: {debug}"
     );
     let vals = drain_single_i32(op.as_mut());
     assert_eq!(vals, vec![30, 40, 50]);
 }
 
 #[test]
-fn late_materialization_summary_reports_candidate_fetch_counts() {
+fn late_materialization_summary_skips_narrow_tables() {
     let rows: Vec<(i32, i32)> = (1..=8).map(|i| (i, i * 10)).collect();
     let (fix, _entry, _tids) = build_index_fixture("t_late_mat_summary", &rows, true);
     let tables = SampleTables::new();
@@ -338,12 +338,10 @@ fn late_materialization_summary_reports_candidate_fetch_counts() {
 
     let summary =
         late_materialization_summary_for_plan(&plan, &ctx).expect("summary probe must work");
-    assert_eq!(summary.candidate_tids, 3);
-    assert_eq!(summary.fetched_rows, 3);
+    assert_eq!(summary.candidate_tids, 0);
+    assert_eq!(summary.fetched_rows, 0);
     assert_eq!(summary.skipped_invisible, 0);
-    assert!(summary.note.contains("candidates=3"));
-    assert!(summary.note.contains("fetched=3"));
-    assert!(summary.note.contains("skipped=0"));
+    assert!(summary.note.contains("not selected"));
 }
 
 fn drain_single_i32(op: &mut dyn Operator) -> Vec<i32> {

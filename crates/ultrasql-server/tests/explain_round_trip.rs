@@ -229,11 +229,27 @@ async fn explain_analyze_reports_late_materialization_selection() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 
     client
-        .batch_execute("CREATE TABLE t_late (id INT NOT NULL, payload INT NOT NULL)")
+        .batch_execute(
+            "CREATE TABLE t_late (
+                id INT NOT NULL,
+                payload INT NOT NULL,
+                pad01 TEXT,
+                pad02 TEXT,
+                pad03 TEXT,
+                pad04 TEXT,
+                pad05 TEXT,
+                pad06 TEXT
+            )",
+        )
         .await
         .expect("create");
     client
-        .batch_execute("INSERT INTO t_late VALUES (1, 10), (2, 20), (3, 30)")
+        .batch_execute(
+            "INSERT INTO t_late VALUES
+                (1, 10, 'a1', 'b1', 'c1', 'd1', 'e1', 'f1'),
+                (2, 20, 'a2', 'b2', 'c2', 'd2', 'e2', 'f2'),
+                (3, 30, 'a3', 'b3', 'c3', 'd3', 'e3', 'f3')",
+        )
         .await
         .expect("seed");
     client
@@ -254,6 +270,121 @@ async fn explain_analyze_reports_late_materialization_selection() {
         text.contains("Late Materialization: selected t_late_id_idx"),
         "EXPLAIN ANALYZE must report late materialization selection, got: {text}"
     );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn explain_analyze_skips_late_materialization_on_narrow_table() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t_late_narrow (id INT NOT NULL, payload INT NOT NULL)")
+        .await
+        .expect("create");
+    client
+        .batch_execute("INSERT INTO t_late_narrow VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .expect("seed");
+    client
+        .batch_execute("CREATE INDEX t_late_narrow_id_idx ON t_late_narrow (id)")
+        .await
+        .expect("create index");
+
+    let rows = client
+        .query(
+            "EXPLAIN ANALYZE SELECT payload FROM t_late_narrow WHERE id = 2",
+            &[],
+        )
+        .await
+        .expect("EXPLAIN ANALYZE");
+    let text = collect_plan_text(&rows);
+
+    assert!(
+        text.contains("Late Materialization: not selected"),
+        "narrow table must not use late materialization, got: {text}"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn explain_analyze_late_materialization_handles_limit_order_nulls_and_dml() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE t_late_wide (
+                id INT NOT NULL,
+                payload INT,
+                pad01 TEXT,
+                pad02 TEXT,
+                pad03 TEXT,
+                pad04 TEXT,
+                pad05 TEXT,
+                pad06 TEXT,
+                pad07 TEXT,
+                pad08 TEXT
+            )",
+        )
+        .await
+        .expect("create");
+    client
+        .batch_execute(
+            "INSERT INTO t_late_wide VALUES
+                (1, 10, 'a1', 'b1', 'c1', 'd1', 'e1', 'f1', 'g1', 'h1'),
+                (2, NULL, 'a2', 'b2', 'c2', 'd2', 'e2', 'f2', 'g2', 'h2'),
+                (3, 30, 'a3', 'b3', 'c3', 'd3', 'e3', 'f3', 'g3', 'h3'),
+                (4, 40, 'a4', 'b4', 'c4', 'd4', 'e4', 'f4', 'g4', 'h4'),
+                (5, 50, 'a5', 'b5', 'c5', 'd5', 'e5', 'f5', 'g5', 'h5')",
+        )
+        .await
+        .expect("seed");
+    client
+        .batch_execute("CREATE INDEX t_late_wide_id_idx ON t_late_wide (id)")
+        .await
+        .expect("create index");
+    client
+        .batch_execute("UPDATE t_late_wide SET payload = 333, pad08 = 'updated' WHERE id = 3")
+        .await
+        .expect("update");
+    client
+        .batch_execute("DELETE FROM t_late_wide WHERE id = 4")
+        .await
+        .expect("delete");
+
+    let selected = client
+        .query(
+            "SELECT payload FROM t_late_wide WHERE id >= 2 ORDER BY id LIMIT 3",
+            &[],
+        )
+        .await
+        .expect("select");
+    let payloads = selected
+        .iter()
+        .map(|row| row.get::<_, Option<i32>>(0))
+        .collect::<Vec<_>>();
+    assert_eq!(payloads, vec![None, Some(333), Some(50)]);
+
+    let rows = client
+        .query(
+            "EXPLAIN ANALYZE SELECT payload FROM t_late_wide WHERE id >= 2 ORDER BY id LIMIT 3",
+            &[],
+        )
+        .await
+        .expect("EXPLAIN ANALYZE");
+    let text = collect_plan_text(&rows);
+    for needle in [
+        "Late Materialization: selected t_late_wide_id_idx",
+        "candidates=3",
+        "fetched=3",
+        "skipped=0",
+    ] {
+        assert!(
+            text.contains(needle),
+            "late materialization EXPLAIN missing {needle}, got: {text}"
+        );
+    }
 
     shutdown(client, server_handle).await;
 }

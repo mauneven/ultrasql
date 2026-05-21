@@ -772,6 +772,8 @@ async fn main() -> Result<()> {
             "p95_latency_us",
             "p99_latency_us",
             "explain_late_materialization",
+            "eager_scan_median_us",
+            "late_materialization_median_us",
             "rows"
         ]);
         report["p50_latency_us"] = serde_json::json!(p50_latency_us);
@@ -2501,13 +2503,37 @@ where
 const DASHBOARD_TENANTS: usize = 32;
 const DASHBOARD_BUCKETS: usize = 64;
 const DASHBOARD_FILTER_TENANT: usize = 7;
+const LATE_MAT_WIDE_COLUMNS: usize = 100;
 const LATE_MAT_TENANTS: usize = 32;
 const LATE_MAT_BUCKETS: usize = 128;
 const LATE_MAT_FILTER_TENANT: usize = 7;
+const LATE_MAT_PAD_COLUMNS: usize = LATE_MAT_WIDE_COLUMNS - 4;
 const SPARSE_ROWS_PER_DAY: usize = 256;
 const SPARSE_TENANTS: usize = 64;
 const SPARSE_BUCKETS: usize = 32;
 const SPARSE_FILTER_TENANT: usize = 7;
+
+fn late_materialization_table_ddl(table: &str) -> String {
+    let mut sql = format!(
+        "CREATE TABLE {table} (
+                id INT NOT NULL,
+                tenant_id INT NOT NULL,
+                bucket INT NOT NULL,
+                amount BIGINT NOT NULL"
+    );
+    for idx in 1..=LATE_MAT_PAD_COLUMNS {
+        sql.push_str(&format!(", pad{idx:03} TEXT NOT NULL"));
+    }
+    sql.push(')');
+    sql
+}
+
+fn late_materialization_query(table: &str) -> String {
+    format!(
+        "SELECT amount, pad003, pad096 FROM {table} \
+         WHERE tenant_id = {LATE_MAT_FILTER_TENANT}"
+    )
+}
 
 async fn preload_late_materialization_chunked(
     client: &tokio_postgres::Client,
@@ -2538,15 +2564,14 @@ async fn preload_late_materialization_chunked(
             sql.push_str(&bucket.to_string());
             sql.push(',');
             sql.push_str(&amount.to_string());
-            sql.push_str(",'segment_");
-            sql.push_str(&(row_id % 64).to_string());
-            sql.push_str("','region_");
-            sql.push_str(&(row_id % 17).to_string());
-            sql.push_str("','payload_");
-            sql.push_str(&(row_id % 251).to_string());
-            sql.push_str("','trace_");
-            sql.push_str(&(row_id % 997).to_string());
-            sql.push_str("')");
+            for pad_idx in 1..=LATE_MAT_PAD_COLUMNS {
+                sql.push_str(",'p");
+                sql.push_str(&pad_idx.to_string());
+                sql.push('_');
+                sql.push_str(&(row_id % (pad_idx + 17)).to_string());
+                sql.push('\'');
+            }
+            sql.push(')');
         }
         client.batch_execute(&sql).await.with_context(|| {
             format!("preload late-materialization chunk [{start}, {end}) INSERT into {table}")
@@ -2573,39 +2598,41 @@ async fn run_shared_late_materialization(
         }
     });
 
-    let table = "bench_late_materialization_shared";
+    let late_table = "bench_late_materialization_late";
+    let eager_table = "bench_late_materialization_eager";
+    client
+        .batch_execute(&late_materialization_table_ddl(late_table))
+        .await
+        .with_context(|| format!("CREATE TABLE {late_table}"))?;
+    client
+        .batch_execute(&late_materialization_table_ddl(eager_table))
+        .await
+        .with_context(|| format!("CREATE TABLE {eager_table}"))?;
+    preload_late_materialization_chunked(&client, late_table, n_rows).await?;
+    preload_late_materialization_chunked(&client, eager_table, n_rows).await?;
     client
         .batch_execute(&format!(
-            "CREATE TABLE {table} (
-                id INT NOT NULL,
-                tenant_id INT NOT NULL,
-                bucket INT NOT NULL,
-                amount BIGINT NOT NULL,
-                pad_a TEXT NOT NULL,
-                pad_b TEXT NOT NULL,
-                pad_c TEXT NOT NULL,
-                pad_d TEXT NOT NULL
-            )"
+            "CREATE INDEX ix_late_tenant ON {late_table}(tenant_id)"
         ))
         .await
-        .with_context(|| format!("CREATE TABLE {table}"))?;
-    preload_late_materialization_chunked(&client, table, n_rows).await?;
-    client
-        .batch_execute(&format!(
-            "CREATE INDEX ix_late_tenant ON {table}(tenant_id)"
-        ))
-        .await
-        .with_context(|| format!("CREATE INDEX ix_late_tenant ON {table}"))?;
+        .with_context(|| format!("CREATE INDEX ix_late_tenant ON {late_table}"))?;
 
-    let query = format!(
-        "SELECT amount, pad_c FROM {table} \
-         WHERE tenant_id = {LATE_MAT_FILTER_TENANT}"
-    );
+    let late_query = late_materialization_query(late_table);
+    let eager_query = late_materialization_query(eager_table);
+    let eager = measure_simple_query(
+        &client,
+        "late-materialization eager baseline",
+        &eager_query,
+        warmup,
+        total_iters,
+    )
+    .await?;
+
     let explain_rows = simple_query_rows(
         &client
-            .simple_query(&format!("EXPLAIN ANALYZE {query}"))
+            .simple_query(&format!("EXPLAIN ANALYZE {late_query}"))
             .await
-            .with_context(|| format!("EXPLAIN ANALYZE late materialization on {table}"))?,
+            .with_context(|| format!("EXPLAIN ANALYZE late materialization on {late_table}"))?,
     );
     let explain_text = explain_rows
         .iter()
@@ -2623,32 +2650,38 @@ async fn run_shared_late_materialization(
         anyhow::bail!("late materialization EXPLAIN line lacks counters: {late_line}");
     }
 
-    let mut answer_rows = 0_usize;
-    for i in 0..total_iters {
-        let started = Instant::now();
-        let messages = client
-            .simple_query(&query)
-            .await
-            .with_context(|| format!("late materialization query on {table}"))?;
-        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
-        let rows = simple_query_rows(&messages);
-        if rows.is_empty() {
-            anyhow::bail!("late materialization returned no rows");
-        }
-        if i >= warmup {
-            iters_us.push(elapsed_us);
-            answer_rows = rows.len();
-        }
+    let late = measure_simple_query(
+        &client,
+        "late-materialization indexed late path",
+        &late_query,
+        warmup,
+        total_iters,
+    )
+    .await?;
+    iters_us.extend(late.samples_us.iter().copied());
+    if late.rows != eager.rows {
+        anyhow::bail!(
+            "late materialization answer mismatch: eager={:?} late={:?}",
+            eager.rows,
+            late.rows
+        );
     }
 
     drop(client);
     conn_handle.abort();
     Ok(serde_json::json!({
-        "rows": answer_rows,
+        "rows": late.rows.len(),
         "tenant_id": LATE_MAT_FILTER_TENANT,
+        "wide_columns": LATE_MAT_WIDE_COLUMNS,
+        "projected_columns": ["amount", "pad003", "pad096"],
         "query_shape": "wide_payload_projection_with_selective_index_filter",
         "firebolt_style_shape": "wide fact table, selective tenant filter, payload projection",
         "explain_late_materialization": late_line,
+        "eager_scan_median_us": eager.median_us,
+        "eager_scan_samples_us": eager.samples_us,
+        "late_materialization_median_us": late.median_us,
+        "late_materialization_samples_us": late.samples_us,
+        "comparison_policy": "UltraSQL eager and late paths share deterministic rows and query; external competitor artifacts are recorded separately when installed."
     }))
 }
 

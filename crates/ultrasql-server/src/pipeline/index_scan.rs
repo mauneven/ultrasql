@@ -21,6 +21,12 @@ use crate::error::ServerError;
 use super::LowerCtx;
 use super::modify::lower_project_columns;
 
+const LATE_MATERIALIZATION_MIN_TABLE_WIDTH: usize = 8;
+const LATE_MATERIALIZATION_MAX_PROJECTED_COLUMNS: usize = 3;
+
+type LateMaterializationProjectShape<'a> =
+    (&'a LogicalPlan, &'a [(ScalarExpr, String)], Option<u64>);
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct IndexKeyRange {
     /// Inclusive lower bound, or `None` for unbounded below.
@@ -698,7 +704,8 @@ pub(super) fn try_late_materialization_project(
     let Some(shape) = late_materialization_shape(input, exprs, ctx)? else {
         return Ok(None);
     };
-    let entries = probe_index_entries_ordered(shape.index_entry, shape.range, true, ctx)?;
+    let entries =
+        probe_index_entries_ordered(shape.index_entry, shape.range, shape.ascending, ctx)?;
     let tids = entries.into_iter().map(|(_, tid)| tid).collect();
     let codec = RowCodec::new(shape.table_entry.schema.clone());
     Ok(Some(Box::new(LateMaterializeScan::new(
@@ -717,7 +724,7 @@ pub(crate) fn late_materialization_summary_for_plan(
     plan: &LogicalPlan,
     ctx: &LowerCtx<'_>,
 ) -> Result<LateMaterializationSummary, ServerError> {
-    let LogicalPlan::Project { input, exprs, .. } = plan else {
+    let Some((input, exprs, visible_cap)) = late_materialization_project_shape(plan) else {
         return Ok(LateMaterializationSummary::not_applicable(
             "not applicable (no Project(Filter(Scan)) shape)",
         ));
@@ -727,17 +734,22 @@ pub(crate) fn late_materialization_summary_for_plan(
             "not selected (shape, index, or projection not eligible)",
         ));
     };
-    let entries = probe_index_entries_ordered(shape.index_entry, shape.range, true, ctx)?;
+    let entries =
+        probe_index_entries_ordered(shape.index_entry, shape.range, shape.ascending, ctx)?;
     let mut fetched_rows = 0_u64;
     let mut skipped_invisible = 0_u64;
+    let mut candidate_tids = 0_u64;
     for (_, tid) in &entries {
+        candidate_tids = candidate_tids.saturating_add(1);
         if fetch_visible_index_payload(*tid, ctx)?.is_some() {
             fetched_rows = fetched_rows.saturating_add(1);
+            if visible_cap.is_some_and(|cap| fetched_rows >= cap) {
+                break;
+            }
         } else {
             skipped_invisible = skipped_invisible.saturating_add(1);
         }
     }
-    let candidate_tids = u64::try_from(entries.len()).unwrap_or(u64::MAX);
     Ok(LateMaterializationSummary {
         candidate_tids,
         fetched_rows,
@@ -753,12 +765,34 @@ pub(crate) fn late_materialization_summary_for_plan(
     })
 }
 
+fn late_materialization_project_shape(
+    plan: &LogicalPlan,
+) -> Option<LateMaterializationProjectShape<'_>> {
+    match plan {
+        LogicalPlan::Project { input, exprs, .. } => Some((input, exprs, None)),
+        LogicalPlan::Limit { input, n, offset } => {
+            let LogicalPlan::Project {
+                input: project_input,
+                exprs,
+                ..
+            } = input.as_ref()
+            else {
+                return None;
+            };
+            let visible_cap = n.checked_add(*offset).or(Some(u64::MAX));
+            Some((project_input, exprs, visible_cap))
+        }
+        _ => None,
+    }
+}
+
 struct LateMaterializationShape<'a> {
     table_name: &'a str,
     table_entry: &'a TableEntry,
     index_entry: &'a IndexEntry,
     range: IndexKeyRange,
     projected_cols: Vec<usize>,
+    ascending: bool,
 }
 
 fn late_materialization_shape<'a>(
@@ -769,6 +803,10 @@ fn late_materialization_shape<'a>(
     if exprs.is_empty() {
         return Ok(None);
     }
+    let (input, sort_keys) = match input {
+        LogicalPlan::Sort { input, keys } => (input.as_ref(), Some(keys.as_slice())),
+        other => (other, None),
+    };
     let LogicalPlan::Filter {
         input: filter_input,
         predicate,
@@ -799,16 +837,41 @@ fn late_materialization_shape<'a>(
     if projected_cols.iter().all(|col| *col == predicate_col_idx) {
         return Ok(None);
     }
-    if projected_cols.len() >= table_entry.schema.len() {
+    if !late_materialization_is_worthwhile(table_entry.schema.len(), projected_cols.len()) {
         return Ok(None);
     }
+    let ascending = if let Some(keys) = sort_keys {
+        let Some(ascending) = sort_keys_preserve_index_order(keys, predicate_col_idx) else {
+            return Ok(None);
+        };
+        ascending
+    } else {
+        true
+    };
     Ok(Some(LateMaterializationShape {
         table_name: table.as_str(),
         table_entry,
         index_entry,
         range,
         projected_cols,
+        ascending,
     }))
+}
+
+fn late_materialization_is_worthwhile(table_width: usize, projected_width: usize) -> bool {
+    table_width >= LATE_MATERIALIZATION_MIN_TABLE_WIDTH
+        && projected_width <= LATE_MATERIALIZATION_MAX_PROJECTED_COLUMNS
+        && projected_width.saturating_mul(4) <= table_width
+}
+
+fn sort_keys_preserve_index_order(keys: &[SortKey], predicate_col_idx: usize) -> Option<bool> {
+    let [key] = keys else {
+        return None;
+    };
+    let ScalarExpr::Column { index, .. } = &key.expr else {
+        return None;
+    };
+    (*index == predicate_col_idx).then_some(key.asc)
 }
 
 fn simple_projected_columns(
@@ -900,21 +963,10 @@ impl Operator for LateMaterializeScan {
                 self.skipped_invisible = self.skipped_invisible.saturating_add(1);
                 continue;
             }
-            let decoded = self
+            let row = self
                 .codec
-                .decode(&tuple.data)
+                .decode_projected(&tuple.data, &self.projection)
                 .map_err(|e| ultrasql_executor::ExecError::TypeMismatch(e.to_string()))?;
-            let mut row = Vec::with_capacity(self.projection.len());
-            for idx in &self.projection {
-                let value =
-                    decoded
-                        .get(*idx)
-                        .cloned()
-                        .ok_or(ultrasql_executor::ExecError::Internal(
-                            "LateMaterializeScan projection index out of bounds",
-                        ))?;
-                row.push(value);
-            }
             self.fetched_rows = self.fetched_rows.saturating_add(1);
             rows.push(row);
         }
