@@ -5003,6 +5003,25 @@ mod tests {
     }
 
     #[test]
+    fn page_backed_ivfflat_rejects_random_wal_payloads_without_panicking() {
+        proptest!(|(payload in proptest::collection::vec(any::<u8>(), 0..128_usize))| {
+            let index =
+                PageBackedIvfFlatIndex::new(RelationId::new(9903), 3, HnswMetric::L2, 2, 1)
+                    .expect("ivfflat config");
+            let record = WalRecord::new(RecordType::IvfFlatOp, Xid::new(16), Lsn::ZERO, 0, payload);
+
+            let replay = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                index.apply_wal_record(&record)
+            }));
+
+            prop_assert!(replay.is_ok(), "IVFFlat WAL replay panicked");
+            if let Ok(Ok(())) = replay {
+                prop_assert!(index.page_stats().live_entries <= 1);
+            }
+        });
+    }
+
+    #[test]
     fn ivfflat_bulk_load_trains_centroids_and_reranks_candidates() {
         let am = IvfFlatIndex::new(2, HnswMetric::L2, 2, 1).expect("ivfflat config");
         am.bulk_load(vec![

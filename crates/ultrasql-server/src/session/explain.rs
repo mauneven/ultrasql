@@ -329,7 +329,7 @@ where
         plan: &LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
     ) -> String {
-        let Some((table, col_idx, metric)) = first_vector_sort_scan(plan) else {
+        let Some((table, col_idx, metric, has_filter)) = first_vector_sort_scan(plan) else {
             return "not applicable (no ORDER BY vector distance LIMIT shape)".to_owned();
         };
         let Some(table_entry) = catalog_snapshot.tables.get(&table.to_ascii_lowercase()) else {
@@ -352,24 +352,42 @@ where
                 continue;
             };
             if metadata.method == LogicalIndexMethod::Hnsw {
-                if metadata
-                    .hnsw
-                    .as_ref()
-                    .is_some_and(|hnsw| hnsw.metric() == metric && hnsw.is_available())
-                {
-                    return format!("selected {} (page-backed hnsw)", index.name);
+                let Some(hnsw) = metadata.hnsw.as_ref() else {
+                    return format!("skipped {}: page-backed hnsw unavailable", index.name);
+                };
+                if hnsw.metric() != metric || !hnsw.is_available() {
+                    return format!("skipped {}: page-backed hnsw unavailable", index.name);
                 }
-                return format!("skipped {}: page-backed hnsw unavailable", index.name);
+                if has_filter {
+                    return format!(
+                        "method=exact index={} fallback_used=true fallback_reason=filtered vector top-k requires exact recheck recall_mode=n/a",
+                        index.name
+                    );
+                }
+                let stats = hnsw.page_stats();
+                return format!(
+                    "selected {} (page-backed hnsw); method=hnsw candidates_scanned={} exact_rerank_count={} recall_mode=n/a fallback_used=false deleted_candidates_skipped={}",
+                    index.name, stats.live_nodes, stats.live_nodes, stats.tombstones
+                );
             }
             if metadata.method == LogicalIndexMethod::IvfFlat {
-                if metadata
-                    .ivfflat
-                    .as_ref()
-                    .is_some_and(|ivfflat| ivfflat.metric() == metric && ivfflat.is_available())
-                {
-                    return format!("selected {} (page-backed ivfflat)", index.name);
+                let Some(ivfflat) = metadata.ivfflat.as_ref() else {
+                    return format!("skipped {}: page-backed ivfflat unavailable", index.name);
+                };
+                if ivfflat.metric() != metric || !ivfflat.is_available() {
+                    return format!("skipped {}: page-backed ivfflat unavailable", index.name);
                 }
-                return format!("skipped {}: page-backed ivfflat unavailable", index.name);
+                if has_filter {
+                    return format!(
+                        "method=exact index={} fallback_used=true fallback_reason=filtered vector top-k requires exact recheck recall_mode=n/a",
+                        index.name
+                    );
+                }
+                let stats = ivfflat.page_stats();
+                return format!(
+                    "selected {} (page-backed ivfflat); method=ivfflat candidates_scanned={} exact_rerank_count={} recall_mode=n/a fallback_used=false deleted_candidates_skipped={}",
+                    index.name, stats.live_entries, stats.live_entries, stats.tombstones
+                );
             }
         }
         format!("skipped {table}: no matching vector index")
@@ -750,7 +768,7 @@ fn first_filter_scan_column(plan: &LogicalPlan) -> Option<(&str, usize)> {
     }
 }
 
-fn first_vector_sort_scan(plan: &LogicalPlan) -> Option<(&str, usize, HnswMetric)> {
+fn first_vector_sort_scan(plan: &LogicalPlan) -> Option<(&str, usize, HnswMetric, bool)> {
     match plan {
         LogicalPlan::Limit { input, .. } | LogicalPlan::Project { input, .. } => {
             first_vector_sort_scan(input)
@@ -759,11 +777,18 @@ fn first_vector_sort_scan(plan: &LogicalPlan) -> Option<(&str, usize, HnswMetric
             let key = keys.iter().find(|key| key.asc)?;
             let (col_idx, metric) = vector_sort_key_column(&key.expr)?;
             let table = first_scan_table(input)?;
-            Some((table, col_idx, metric))
+            Some((table, col_idx, metric, contains_filter(input)))
         }
         _ => plan_children(plan)
             .into_iter()
             .find_map(first_vector_sort_scan),
+    }
+}
+
+fn contains_filter(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Filter { .. } => true,
+        _ => plan_children(plan).into_iter().any(contains_filter),
     }
 }
 
