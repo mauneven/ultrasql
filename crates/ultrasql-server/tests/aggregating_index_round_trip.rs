@@ -273,6 +273,74 @@ async fn create_aggregating_index_rewrites_rollup_and_refreshes_after_dml() {
 }
 
 #[tokio::test]
+async fn aggregating_index_explain_analyze_reports_runtime_counters() {
+    let server = Arc::new(Server::with_sample_database());
+    let (client, _conn, server_handle) = start_server_and_connect_to(Arc::clone(&server)).await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE fact_events_explain (
+                tenant_id INT NOT NULL,
+                bucket INT NOT NULL,
+                amount BIGINT NOT NULL
+             )",
+        )
+        .await
+        .expect("create table");
+    client
+        .batch_execute(
+            "INSERT INTO fact_events_explain VALUES
+                (7, 1, 10),
+                (7, 1, 20),
+                (7, 2, 5),
+                (8, 1, 100)",
+        )
+        .await
+        .expect("seed");
+    client
+        .batch_execute(
+            "CREATE AGGREGATING INDEX fact_events_explain_rollup
+                ON fact_events_explain (tenant_id, bucket, sum(amount), count(*))",
+        )
+        .await
+        .expect("setup aggregating index");
+
+    let runtime = aggregating_runtime(&server, "fact_events_explain", "fact_events_explain_rollup");
+    runtime.mark_dirty();
+
+    let rows = client
+        .query(
+            "EXPLAIN ANALYZE SELECT tenant_id, bucket, SUM(amount), COUNT(*) \
+             FROM fact_events_explain \
+             WHERE tenant_id = 7 \
+             GROUP BY tenant_id, bucket \
+             ORDER BY tenant_id, bucket",
+            &[],
+        )
+        .await
+        .expect("EXPLAIN ANALYZE");
+    let text = collect_plan_text(&rows);
+    for needle in [
+        "Aggregating Index: selected fact_events_explain_rollup",
+        "aggregating_index_used=true",
+        "stale_rebuild_used=true",
+        "summary_rows_read=2",
+        "base_rows_skipped=3",
+    ] {
+        assert!(
+            text.contains(needle),
+            "EXPLAIN ANALYZE missing {needle}, got: {text}"
+        );
+    }
+    assert!(
+        !runtime.dirty.load(Ordering::Acquire),
+        "EXPLAIN ANALYZE should rebuild stale summary before serving rows"
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn aggregating_index_update_group_key_moves_summary_between_groups() {
     let server = Arc::new(Server::with_sample_database());
     let (client, _conn, server_handle) = start_server_and_connect_to(Arc::clone(&server)).await;

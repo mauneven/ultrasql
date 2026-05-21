@@ -113,13 +113,13 @@ where
         inner: &LogicalPlan,
         catalog_snapshot: &Arc<CatalogSnapshot>,
     ) -> Result<ExplainActuals, ServerError> {
-        let notes = self.explain_notes(inner, catalog_snapshot);
         let started = Instant::now();
         if !matches!(
             inner,
             LogicalPlan::Insert { .. } | LogicalPlan::Update { .. } | LogicalPlan::Delete { .. }
         ) {
             let scan = self.run_explain_select_analyze(inner, catalog_snapshot)?;
+            let notes = self.explain_notes(inner, catalog_snapshot);
             return Ok(ExplainActuals {
                 rows: scan.rows,
                 batches: scan.batches,
@@ -136,6 +136,7 @@ where
             });
         }
 
+        let notes = self.explain_notes(inner, catalog_snapshot);
         let txn = self
             .state
             .txn_manager

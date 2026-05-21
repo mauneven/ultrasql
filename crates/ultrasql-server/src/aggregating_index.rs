@@ -14,11 +14,11 @@ use std::sync::atomic::Ordering;
 
 use ultrasql_catalog::{IndexEntry, TableEntry};
 use ultrasql_core::{DataType, RelationId, Schema, Value};
-use ultrasql_executor::{Eval, Operator, RowCodec, ValuesScan};
+use ultrasql_executor::{Eval, Operator, RowCodec, Sort, ValuesScan};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_planner::{
     AggregateFunc, BinaryOp, LogicalAggregateExpr, LogicalAggregatingIndex,
-    LogicalAggregatingIndexExpr, LogicalPlan, ScalarExpr,
+    LogicalAggregatingIndexExpr, LogicalPlan, ScalarExpr, SortKey,
 };
 use ultrasql_txn::TransactionManager;
 
@@ -433,6 +433,15 @@ pub(crate) fn try_lower_aggregating_index_project(
     schema: &Schema,
     ctx: &LowerCtx<'_>,
 ) -> Result<Option<Box<dyn Operator>>, ServerError> {
+    let (input, sort_keys) = match input {
+        LogicalPlan::Sort { input, keys } => {
+            if !sort_keys_compatible_with_project(keys, exprs) {
+                return Ok(None);
+            }
+            (input.as_ref(), Some(keys))
+        }
+        other => (other, None),
+    };
     let LogicalPlan::Aggregate {
         input: aggregate_input,
         group_by,
@@ -475,7 +484,25 @@ pub(crate) fn try_lower_aggregating_index_project(
         projected.push(out);
     }
 
-    Ok(Some(Box::new(ValuesScan::new(projected, schema.clone()))))
+    let scan: Box<dyn Operator> = Box::new(ValuesScan::new(projected, schema.clone()));
+    if let Some(keys) = sort_keys {
+        return Ok(Some(Box::new(
+            Sort::new(scan, keys.clone(), schema.clone())
+                .with_work_mem_budget(Arc::clone(&ctx.work_mem)),
+        )));
+    }
+    Ok(Some(scan))
+}
+
+fn sort_keys_compatible_with_project(keys: &[SortKey], exprs: &[(ScalarExpr, String)]) -> bool {
+    keys.iter().all(|key| {
+        let ScalarExpr::Column { index, .. } = &key.expr else {
+            return false;
+        };
+        exprs
+            .get(*index)
+            .is_some_and(|(expr, _)| matches!(expr, ScalarExpr::Column { index: project_index, .. } if project_index == index))
+    })
 }
 
 /// Return EXPLAIN text without requiring a full lowerer context.
@@ -504,8 +531,18 @@ pub(crate) fn aggregating_index_note_for_snapshot(
         .find_map(|index| {
             let metadata = constraints.indexes.get(&index.oid)?;
             let runtime = metadata.aggregating.as_ref()?;
-            aggregating_spec_matches(&runtime.spec, group_by, aggregates)
-                .then(|| format!("selected {} on {table_name}", index.name))
+            if !aggregating_spec_matches(&runtime.spec, group_by, aggregates) {
+                return None;
+            }
+            let stats = runtime.explain_stats_snapshot();
+            Some(format!(
+                "selected {} on {table_name}; aggregating_index_used={} stale_rebuild_used={} summary_rows_read={} base_rows_skipped={}",
+                index.name,
+                stats.aggregating_index_used,
+                stats.stale_rebuild_used,
+                stats.summary_rows_read,
+                stats.base_rows_skipped
+            ))
         })
         .unwrap_or_else(|| format!("skipped {table_name}: no matching aggregating index"))
 }
@@ -521,7 +558,7 @@ fn current_summary_rows(
     {
         return Ok(None);
     }
-    rebuild_runtime_if_dirty(
+    let stale_rebuild_used = rebuild_runtime_if_dirty(
         table,
         runtime,
         ctx.heap.as_ref(),
@@ -533,9 +570,8 @@ fn current_summary_rows(
         .read()
         .map_err(|_| ServerError::ddl("aggregating index lock poisoned"))?
         .clone();
-    if let Some(pred) = predicate {
-        return rows
-            .into_iter()
+    let rows = if let Some(pred) = predicate {
+        rows.into_iter()
             .map(|row| {
                 let keep = summary_row_matches_predicate(
                     pred,
@@ -550,9 +586,12 @@ fn current_summary_rows(
                 Ok(keep.then_some(row))
             })
             .filter_map(Result::transpose)
-            .collect::<Result<Vec<_>, ServerError>>()
-            .map(Some);
-    }
+            .collect::<Result<Vec<_>, ServerError>>()?
+    } else {
+        rows
+    };
+    let base_rows_skipped = summary_base_rows_represented(&runtime.spec, &rows);
+    runtime.record_explain_read(stale_rebuild_used, rows.len(), base_rows_skipped);
     Ok(Some(rows))
 }
 
@@ -562,13 +601,13 @@ fn rebuild_runtime_if_dirty(
     heap: &ultrasql_storage::heap::HeapAccess<BlankPageLoader>,
     snapshot: &Snapshot,
     oracle: &TransactionManager,
-) -> Result<(), ServerError> {
+) -> Result<bool, ServerError> {
     if runtime
         .dirty
         .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
-        return Ok(());
+        return Ok(false);
     }
     match build_aggregating_index_rows(table, &runtime.spec, heap, snapshot, oracle) {
         Ok(rows) => {
@@ -577,12 +616,36 @@ fn rebuild_runtime_if_dirty(
                 .write()
                 .map_err(|_| ServerError::ddl("aggregating index lock poisoned"))?;
             *guard = rows;
-            Ok(())
+            Ok(true)
         }
         Err(err) => {
             runtime.dirty.store(true, Ordering::Release);
             Err(err)
         }
+    }
+}
+
+fn summary_base_rows_represented(spec: &LogicalAggregatingIndex, rows: &[Vec<Value>]) -> u64 {
+    let Some(count_offset) = spec
+        .aggregates
+        .iter()
+        .position(|aggregate| aggregate.func == AggregateFunc::CountStar)
+    else {
+        return 0;
+    };
+    let count_column = spec.group_columns.len().saturating_add(count_offset);
+    rows.iter()
+        .filter_map(|row| row.get(count_column))
+        .filter_map(nonnegative_count_value)
+        .fold(0_u64, u64::saturating_add)
+}
+
+fn nonnegative_count_value(value: &Value) -> Option<u64> {
+    match value {
+        Value::Int16(v) => u64::try_from(*v).ok(),
+        Value::Int32(v) => u64::try_from(*v).ok(),
+        Value::Int64(v) => u64::try_from(*v).ok(),
+        _ => None,
     }
 }
 

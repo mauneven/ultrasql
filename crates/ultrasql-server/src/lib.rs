@@ -323,6 +323,23 @@ pub struct RuntimeAggregatingIndex {
     pub rows: std::sync::RwLock<Vec<Vec<Value>>>,
     /// Set when DML touched the base table after the last summary build.
     pub dirty: std::sync::atomic::AtomicBool,
+    pub(crate) explain_stats: RuntimeAggregatingIndexExplainStats,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AggregatingIndexExplainStats {
+    pub aggregating_index_used: bool,
+    pub stale_rebuild_used: bool,
+    pub summary_rows_read: u64,
+    pub base_rows_skipped: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeAggregatingIndexExplainStats {
+    aggregating_index_used: std::sync::atomic::AtomicBool,
+    stale_rebuild_used: std::sync::atomic::AtomicBool,
+    summary_rows_read: std::sync::atomic::AtomicU64,
+    base_rows_skipped: std::sync::atomic::AtomicU64,
 }
 
 impl RuntimeAggregatingIndex {
@@ -333,12 +350,55 @@ impl RuntimeAggregatingIndex {
             spec,
             rows: std::sync::RwLock::new(rows),
             dirty: std::sync::atomic::AtomicBool::new(false),
+            explain_stats: RuntimeAggregatingIndexExplainStats::default(),
         }
     }
 
     /// Mark summary rows stale. Next matching read rebuilds lazily.
     pub fn mark_dirty(&self) {
         self.dirty.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn record_explain_read(
+        &self,
+        stale_rebuild_used: bool,
+        summary_rows_read: usize,
+        base_rows_skipped: u64,
+    ) {
+        self.explain_stats
+            .aggregating_index_used
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.explain_stats
+            .stale_rebuild_used
+            .store(stale_rebuild_used, std::sync::atomic::Ordering::Release);
+        self.explain_stats.summary_rows_read.store(
+            u64::try_from(summary_rows_read).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Release,
+        );
+        self.explain_stats
+            .base_rows_skipped
+            .store(base_rows_skipped, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn explain_stats_snapshot(&self) -> AggregatingIndexExplainStats {
+        AggregatingIndexExplainStats {
+            aggregating_index_used: self
+                .explain_stats
+                .aggregating_index_used
+                .load(std::sync::atomic::Ordering::Acquire),
+            stale_rebuild_used: self
+                .explain_stats
+                .stale_rebuild_used
+                .load(std::sync::atomic::Ordering::Acquire),
+            summary_rows_read: self
+                .explain_stats
+                .summary_rows_read
+                .load(std::sync::atomic::Ordering::Acquire),
+            base_rows_skipped: self
+                .explain_stats
+                .base_rows_skipped
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
     }
 }
 
