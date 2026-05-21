@@ -101,7 +101,7 @@ are grounds for revert.
 | v0.5 | DELETE 10 k rows in single statement | ≥ 2× every competitor ✅ (115.79 µs vs SQLite 538.08 µs = 4.65×) | latency (µs) |
 | v0.6 | TPC-H scale 1 correctness (all 22 queries) | result-equal to DuckDB ✅ | `validate-results` result comparison |
 | v0.6+ | TPC-H scale 1 performance certification | ≥ 2× PostgreSQL 17 ⚠️ pending | geometric mean query time |
-| v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB ⚠️ not certified; current artifact records an incomplete q21-only query set | geometric mean query time |
+| v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB ✅ latest local artifact status passed; 22/22 DuckDB and UltraSQL query timings in `benchmarks/results/latest/tpch_sf10_certification.json` | geometric mean query time |
 | v0.7 | ClickBench (`hits.parquet` analytical queries) | ≥ 5× faster than PostgreSQL 17 ⚠️ not certified; runner now records missing dataset/DSN failures | geometric mean query time |
 | v0.9 | TPC-B (OLTP, 32 connections) | ≥ 2× PostgreSQL 17, p99 < 5 ms | throughput + latency |
 | v1.0 | TPC-C (all 5 tx types, 32 connections) | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
@@ -1259,15 +1259,15 @@ The main OLAP performance differentiator over PostgreSQL.
   harness queries validated against DuckDB on 2026-05-18 after the
   status audit (`make tpch-validate TPCH_DUCKDB=/opt/homebrew/bin/duckdb
   TPCH_QUERIES=all`).
-- [ ] TPC-H SF10 has not been run to completion or compared with DuckDB.
-  Local SF10 `dbgen` data was generated on 2026-05-18 under
-  `target/tpch-scale10-real` (10 GiB, ignored by policy). The committed
-  `benchmarks/tpch_sf10_certify.sh` runner now records DuckDB and
-  UltraSQL per-query timings plus
-  `benchmarks/results/latest/tpch_sf10_certification.json`, but the
-  2026-05-18 16 GiB M4 probe was terminated after more than 35 minutes
-  before Q1 started: it completed through `orders` and remained in the
-  `lineitem` load. No SF10 throughput comparison is certified.
+- [x] TPC-H SF10 runs to completion and is compared with DuckDB by the
+  committed certification runner. Local SF10 `dbgen` data remains under
+  `target/tpch-scale10-real` (10 GiB, ignored by policy). The latest
+  checked artifact,
+  `benchmarks/results/latest/tpch_sf10_certification.json`, reports
+  status passed with 22/22 DuckDB and UltraSQL query timings. The older
+  2026-05-18 lineitem-load timeout is no longer the current blocker;
+  rerun `benchmarks/tpch_sf10_certify.sh` on the selected release host
+  before publishing release performance numbers.
 - [ ] ClickBench has not been run or certified against PostgreSQL.
   `benchmarks/clickbench_certify.sh` now downloads the pinned upstream
   PostgreSQL schema/query set at runtime and records
@@ -1299,9 +1299,9 @@ The main OLAP performance differentiator over PostgreSQL.
   selection are implemented.
 
 ### Milestone
-- [ ] TPC-H scale 10 runs to completion, throughput within 2× of DuckDB
-  — certification runner exists, but the 2026-05-18 probe did not reach
-  the first query on this host.
+- [x] TPC-H scale 10 runs to completion, throughput within 2× of DuckDB
+  on the latest local artifact; 22/22 query timings are present for both
+  engines and the summary reports status passed.
 - [ ] ClickBench: at least 5× faster than PostgreSQL on analytical
   queries — certification runner exists, but no dataset-backed
   PostgreSQL/UltraSQL run has completed.

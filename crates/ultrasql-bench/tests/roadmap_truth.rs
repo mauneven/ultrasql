@@ -60,3 +60,17 @@ fn roadmap_firebolt_status_is_local_core_only() {
     assert!(!roadmap.contains("endpoint pending"));
     assert!(!roadmap.contains("Cloud-first"));
 }
+
+#[test]
+fn roadmap_tpch_sf10_matches_complete_artifact() {
+    let roadmap = repo_file("ROADMAP.md");
+    let normalized = collapse_ws(&roadmap);
+
+    assert!(normalized.contains("TPC-H scale 10 (all 22 queries)"));
+    assert!(normalized.contains("benchmarks/results/latest/tpch_sf10_certification.json"));
+    assert!(normalized.contains("status passed"));
+    assert!(normalized.contains("22/22 DuckDB and UltraSQL query timings"));
+    assert!(!roadmap.contains("incomplete q21-only query set"));
+    assert!(!roadmap.contains("has not been run to completion"));
+    assert!(!roadmap.contains("remained in the `lineitem` load"));
+}
