@@ -59,6 +59,8 @@ fn arena_script_composes_existing_runners_without_claiming_winners() {
     assert!(script.contains("BENCH_CERT_OUT_DIR=\"$OUT_DIR\""));
     assert!(script.contains("benchmarks/slt_speed_compare.sh"));
     assert!(script.contains("benchmarks/ai_benchmark_gauntlet.sh"));
+    assert!(script.contains("run_parquet_suite"));
+    assert!(script.contains("--workload parquet-smoke"));
     assert!(script.contains("if (( ${#selected[@]} > 0 )); then"));
     assert!(script.contains("slt_refs=\"ultrasql\""));
     assert!(script.contains("SLT_BENCH_ENGINES=\"$slt_refs\""));
@@ -67,6 +69,7 @@ fn arena_script_composes_existing_runners_without_claiming_winners() {
     assert!(script.contains("No benchmark claim"));
     assert!(script.contains("artifacts only"));
     assert!(!script.contains("results-render"));
+    assert!(!script.contains("\"parquet\" \\\n        \"runner_not_implemented\""));
 }
 
 #[test]

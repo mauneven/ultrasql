@@ -54,7 +54,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use clap::{Parser, ValueEnum};
+use parquet::arrow::ArrowWriter;
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
@@ -67,11 +70,40 @@ const VECTOR_CERTIFICATION_METRICS: &[&str] = &[
     "memory_bytes",
     "index_size_bytes",
 ];
+const PARQUET_SMOKE_REQUIRED_METRICS: &[&str] = &[
+    "scan_us",
+    "projection_pushdown_us",
+    "predicate_pushdown_us",
+    "row_group_pruning_us",
+];
+const PARQUET_SMOKE_ROW_GROUP_ROWS: usize = 4_096;
+const PARQUET_SMOKE_MIN_ROWS: usize = PARQUET_SMOKE_ROW_GROUP_ROWS * 2;
 
 #[derive(Debug, Clone)]
 struct VectorTopKCertification {
     answer: String,
     build_time_us: f64,
+}
+
+#[derive(Debug, Clone)]
+struct ParquetSmokeMetrics {
+    rows: usize,
+    scan_us: f64,
+    projection_pushdown_us: f64,
+    predicate_pushdown_us: f64,
+    row_group_pruning_us: f64,
+    scan_samples_us: Vec<f64>,
+    projection_pushdown_samples_us: Vec<f64>,
+    predicate_pushdown_samples_us: Vec<f64>,
+    row_group_pruning_samples_us: Vec<f64>,
+    answer: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct TimedQueryMetric {
+    median_us: f64,
+    samples_us: Vec<f64>,
+    rows: Vec<Vec<String>>,
 }
 
 /// Workload selector. New workloads will be added as the wire
@@ -146,6 +178,11 @@ enum Workload {
     /// Malformed CSV ingestion through `COPY ... IGNORE_ERRORS` into a
     /// reject table.
     CsvMalformedBehavior,
+    /// UltraSQL Parquet arena smoke. Generates a deterministic Parquet
+    /// file with multiple row groups, then measures full scan,
+    /// projection pushdown, predicate pushdown, and row-group pruning
+    /// through `read_parquet`.
+    ParquetSmoke,
 }
 
 impl Workload {
@@ -185,6 +222,7 @@ impl Workload {
             Self::CsvFilter => format!("csv_filter_{}", k_or_raw(n_rows)),
             Self::CsvJoinTable => format!("csv_join_table_{}", k_or_raw(n_rows)),
             Self::CsvMalformedBehavior => format!("csv_malformed_behavior_{}", k_or_raw(n_rows)),
+            Self::ParquetSmoke => "arena_parquet_smoke".to_string(),
         }
     }
 }
@@ -298,6 +336,7 @@ async fn main() -> Result<()> {
     // peers.
     let mut answer: Option<serde_json::Value> = None;
     let mut vector_topk_certification = None;
+    let mut parquet_smoke_metrics = None;
     match args.workload {
         Workload::SelectScan => {
             run_shared_select_scan(bound, args.rows, args.warmup, total_iters, &mut iters_us)
@@ -460,6 +499,13 @@ async fn main() -> Result<()> {
                 .await?,
             );
         }
+        Workload::ParquetSmoke => {
+            let metrics =
+                run_parquet_smoke(bound, args.rows, args.warmup, total_iters, &mut iters_us)
+                    .await?;
+            answer = Some(metrics.answer.clone());
+            parquet_smoke_metrics = Some(metrics);
+        }
         _ => {
             for i in 0..total_iters {
                 let micros = match args.workload {
@@ -480,7 +526,8 @@ async fn main() -> Result<()> {
                     | Workload::CsvGroupBy
                     | Workload::CsvFilter
                     | Workload::CsvJoinTable
-                    | Workload::CsvMalformedBehavior => unreachable!("handled above"),
+                    | Workload::CsvMalformedBehavior
+                    | Workload::ParquetSmoke => unreachable!("handled above"),
                 };
                 if i >= args.warmup {
                     iters_us.push(micros);
@@ -526,6 +573,29 @@ async fn main() -> Result<()> {
         report["memory_status"] = serde_json::json!("not_measured");
         report["index_size_bytes"] = serde_json::Value::Null;
         report["index_size_status"] = serde_json::json!("not_applicable_exact_scan");
+    }
+    if let Some(metrics) = parquet_smoke_metrics {
+        report["schema_version"] = serde_json::json!(1);
+        report["suite"] = serde_json::json!("parquet");
+        report["profile"] = serde_json::json!("smoke");
+        report["status"] = serde_json::json!("measured");
+        report["n_rows"] = serde_json::json!(metrics.rows);
+        report["required_metrics"] = serde_json::json!(PARQUET_SMOKE_REQUIRED_METRICS);
+        report["scan_us"] = serde_json::json!(metrics.scan_us);
+        report["projection_pushdown_us"] = serde_json::json!(metrics.projection_pushdown_us);
+        report["predicate_pushdown_us"] = serde_json::json!(metrics.predicate_pushdown_us);
+        report["row_group_pruning_us"] = serde_json::json!(metrics.row_group_pruning_us);
+        report["scan_samples_us"] = serde_json::json!(metrics.scan_samples_us);
+        report["projection_pushdown_samples_us"] =
+            serde_json::json!(metrics.projection_pushdown_samples_us);
+        report["predicate_pushdown_samples_us"] =
+            serde_json::json!(metrics.predicate_pushdown_samples_us);
+        report["row_group_pruning_samples_us"] =
+            serde_json::json!(metrics.row_group_pruning_samples_us);
+        report["row_group_rows"] = serde_json::json!(PARQUET_SMOKE_ROW_GROUP_ROWS);
+        report["policy"] = serde_json::json!(
+            "Artifact contains measured UltraSQL samples only; no cross-engine ranking."
+        );
     }
     let serialized = serde_json::to_string(&report)?;
     if let Some(path) = args.output.as_ref() {
@@ -596,6 +666,189 @@ async fn simple_count(client: &tokio_postgres::Client, sql: &str) -> Result<i64>
             _ => None,
         })
         .with_context(|| format!("scalar query returned no integer row: {sql}"))
+}
+
+fn sorted_f64(mut values: Vec<f64>) -> Vec<f64> {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    values
+}
+
+fn median_sorted(values: &[f64]) -> f64 {
+    values[values.len() / 2]
+}
+
+async fn run_parquet_smoke(
+    server: SocketAddr,
+    requested_rows: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<ParquetSmokeMetrics> {
+    let rows = requested_rows.max(PARQUET_SMOKE_MIN_ROWS);
+    let dir = tempfile::tempdir().context("create parquet smoke tempdir")?;
+    let parquet_path = dir.path().join("arena_parquet_smoke.parquet");
+    write_parquet_smoke_file(&parquet_path, rows)?;
+
+    let (client, conn_handle) = connect_sql_server(server).await?;
+    let path_sql = sql_string(&parquet_path);
+    let pruning_threshold = rows / 2;
+    let workloads = [
+        (
+            "scan",
+            format!("SELECT COUNT(*) FROM read_parquet({path_sql})"),
+        ),
+        (
+            "projection",
+            format!("SELECT metric FROM read_parquet({path_sql})"),
+        ),
+        (
+            "predicate",
+            format!("SELECT COUNT(*) FROM read_parquet({path_sql}) WHERE category = 'alpha'"),
+        ),
+        (
+            "row_group_pruning",
+            format!(
+                "SELECT COUNT(*) FROM read_parquet({path_sql}) WHERE id >= {pruning_threshold}"
+            ),
+        ),
+    ];
+
+    let scan = measure_simple_query(
+        &client,
+        workloads[0].0,
+        &workloads[0].1,
+        warmup,
+        total_iters,
+    )
+    .await?;
+    iters_us.extend(scan.samples_us.iter().copied());
+    let projection = measure_simple_query(
+        &client,
+        workloads[1].0,
+        &workloads[1].1,
+        warmup,
+        total_iters,
+    )
+    .await?;
+    let predicate = measure_simple_query(
+        &client,
+        workloads[2].0,
+        &workloads[2].1,
+        warmup,
+        total_iters,
+    )
+    .await?;
+    let row_group_pruning = measure_simple_query(
+        &client,
+        workloads[3].0,
+        &workloads[3].1,
+        warmup,
+        total_iters,
+    )
+    .await?;
+
+    drop(client);
+    conn_handle.abort();
+    Ok(ParquetSmokeMetrics {
+        rows,
+        scan_us: scan.median_us,
+        projection_pushdown_us: projection.median_us,
+        predicate_pushdown_us: predicate.median_us,
+        row_group_pruning_us: row_group_pruning.median_us,
+        scan_samples_us: scan.samples_us,
+        projection_pushdown_samples_us: projection.samples_us,
+        predicate_pushdown_samples_us: predicate.samples_us,
+        row_group_pruning_samples_us: row_group_pruning.samples_us,
+        answer: serde_json::json!({
+            "scan_rows": scan.rows,
+            "projection_rows": projection.rows.len(),
+            "predicate_rows": predicate.rows,
+            "row_group_pruning_rows": row_group_pruning.rows,
+            "row_group_pruning_threshold": pruning_threshold,
+            "source": "generated_arrow_parquet_with_flushed_row_groups",
+        }),
+    })
+}
+
+async fn measure_simple_query(
+    client: &tokio_postgres::Client,
+    label: &str,
+    query: &str,
+    warmup: usize,
+    total_iters: usize,
+) -> Result<TimedQueryMetric> {
+    let mut samples = Vec::with_capacity(total_iters.saturating_sub(warmup));
+    let mut answer_rows = Vec::new();
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(query)
+            .await
+            .with_context(|| format!("Parquet smoke {label}: {query}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let rows = simple_query_rows(&messages);
+        if rows.is_empty() {
+            anyhow::bail!("Parquet smoke {label} returned no rows: {query}");
+        }
+        if i >= warmup {
+            samples.push(elapsed_us);
+            answer_rows = rows;
+        }
+    }
+    let samples = sorted_f64(samples);
+    Ok(TimedQueryMetric {
+        median_us: median_sorted(&samples),
+        samples_us: samples,
+        rows: answer_rows,
+    })
+}
+
+fn write_parquet_smoke_file(path: &Path, rows: usize) -> Result<()> {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, false),
+        ArrowField::new("category", ArrowDataType::Utf8, false),
+        ArrowField::new("metric", ArrowDataType::Int64, false),
+    ]));
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("create parquet smoke file {}", path.display()))?;
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
+        .with_context(|| format!("open parquet smoke writer {}", path.display()))?;
+    for start in (0..rows).step_by(PARQUET_SMOKE_ROW_GROUP_ROWS) {
+        let end = (start + PARQUET_SMOKE_ROW_GROUP_ROWS).min(rows);
+        let ids = (start..end)
+            .map(|row| i64::try_from(row).unwrap_or(i64::MAX))
+            .collect::<Vec<_>>();
+        let categories = (start..end)
+            .map(|row| match row % 4 {
+                0 => "alpha",
+                1 => "beta",
+                2 => "gamma",
+                _ => "delta",
+            })
+            .collect::<Vec<_>>();
+        let metrics = (start..end)
+            .map(|row| i64::try_from(row.wrapping_mul(17) % 1_000).unwrap_or(0))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids)),
+                Arc::new(StringArray::from(categories)),
+                Arc::new(Int64Array::from(metrics)),
+            ],
+        )
+        .context("build parquet smoke record batch")?;
+        writer
+            .write(&batch)
+            .with_context(|| format!("write parquet smoke rows [{start}, {end})"))?;
+        writer
+            .flush()
+            .with_context(|| format!("flush parquet smoke row group ending at {end}"))?;
+    }
+    writer
+        .close()
+        .with_context(|| format!("close parquet smoke file {}", path.display()))?;
+    Ok(())
 }
 
 async fn run_csv_query_workload(
@@ -1734,6 +1987,18 @@ mod tests {
         assert_eq!(
             Workload::VectorTopK.registry_id_with_shape(10_000, 8, 10),
             "vector_topk_exact_10k_8d_k10"
+        );
+    }
+
+    #[test]
+    fn parquet_smoke_cli_exposes_arena_workload() {
+        let args = Args::try_parse_from(["cross_compare_sql", "--workload", "parquet-smoke"])
+            .expect("parquet smoke workload parses");
+
+        assert_eq!(args.workload, Workload::ParquetSmoke);
+        assert_eq!(
+            Workload::ParquetSmoke.registry_id(1_000),
+            "arena_parquet_smoke"
         );
     }
 

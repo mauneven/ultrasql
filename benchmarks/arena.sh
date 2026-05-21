@@ -287,6 +287,38 @@ run_csv_suite() {
         "cold_read_us,warm_read_us,copy_import_us,group_by_us,filter_us,join_us,bad_row_behavior"
 }
 
+run_parquet_suite() {
+    local supported selected artifact
+    supported="ultrasql"
+    selected="$(requested_supported_csv "$supported")"
+    if [[ -n "$selected" ]]; then
+        artifact="$RAW_DIR/arena_parquet_${PROFILE}-ultrasql.json"
+        run_suite \
+            "parquet:ultrasql" \
+            "$artifact" \
+            env \
+                CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
+                PARQUET_SMOKE_ROWS="${PARQUET_SMOKE_ROWS:-8192}" \
+                PARQUET_SMOKE_WARMUP="${PARQUET_SMOKE_WARMUP:-1}" \
+                PARQUET_SMOKE_ITERS="${PARQUET_SMOKE_ITERS:-3}" \
+                PARQUET_SMOKE_OUT="$artifact" \
+                bash -c '
+                    cargo build --release --package ultrasql-bench --features sql-bench --bin cross_compare_sql &&
+                    target/release/cross_compare_sql \
+                        --workload parquet-smoke \
+                        --rows "$PARQUET_SMOKE_ROWS" \
+                        --warmup "$PARQUET_SMOKE_WARMUP" \
+                        --iters "$PARQUET_SMOKE_ITERS" \
+                        --workload-id "arena_parquet_smoke" \
+                        --output "$PARQUET_SMOKE_OUT"
+                '
+    fi
+    emit_unsupported_engines \
+        "parquet" \
+        "$supported" \
+        "scan_us,projection_pushdown_us,predicate_pushdown_us,row_group_pruning_us"
+}
+
 run_tpch_suite() {
     local supported selected
     supported="ultrasql,duckdb"
@@ -408,10 +440,7 @@ if suite_requested csv; then
     run_csv_suite
 fi
 if suite_requested parquet; then
-    emit_suite_gap \
-        "parquet" \
-        "runner_not_implemented" \
-        "scan_us,projection_pushdown_us,predicate_pushdown_us,row_group_pruning_us"
+    run_parquet_suite
 fi
 if suite_requested tpch; then
     run_tpch_suite
