@@ -72,7 +72,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{
-    CatalogSnapshot, MutableCatalog, PersistentCatalog, StatisticRow, TableEntry,
+    CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, StatisticRow, TableEntry,
 };
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{BlockNumber, DataType, Lsn, PageId, RelationId, Value, Xid};
@@ -2340,6 +2340,15 @@ impl Server {
             for index in indexes {
                 let method = logical_index_method_from_name(&index.access_method);
                 match method {
+                    LogicalIndexMethod::Btree | LogicalIndexMethod::Hash => {
+                        let rows = self.rebuild_btree_index_pages(table, index, method)?;
+                        tracing::info!(
+                            table = %table.name,
+                            index = %index.name,
+                            rows,
+                            "rebuilt persistent btree index pages"
+                        );
+                    }
                     LogicalIndexMethod::Hnsw => {
                         let [attnum] = index.columns.as_slice() else {
                             continue;
@@ -2478,6 +2487,80 @@ impl Server {
         }
 
         self.replay_vector_index_wal_into(&hnsw_indexes, &ivfflat_indexes)
+    }
+
+    fn rebuild_btree_index_pages(
+        &self,
+        table: &TableEntry,
+        index: &IndexEntry,
+        method: LogicalIndexMethod,
+    ) -> Result<u64, ServerError> {
+        if index.root_block == BlockNumber::INVALID || index.columns.is_empty() {
+            return Ok(0);
+        }
+        let columns: Vec<usize> = index
+            .columns
+            .iter()
+            .map(|attnum| usize::from(*attnum))
+            .collect();
+        let encoding = if method == LogicalIndexMethod::Hash {
+            crate::index_key::IndexKeyEncoding::Int64
+        } else {
+            crate::index_key::IndexKeyEncoding::for_columns(&table.schema, &columns)?
+        };
+        let key_col_idx = columns.first().copied();
+        let index_rel = RelationId::new(index.oid.raw());
+        let mut btree = BTree::create(Arc::clone(self.heap.buffer_pool()), index_rel)
+            .map_err(|e| ServerError::ddl(format!("restart rebuild {}: {e}", index.name)))?;
+        let txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let table_rel = RelationId(table.oid);
+        let block_count = self.heap.block_count(table_rel).max(table.n_blocks);
+        let scan = self.heap.scan_visible(
+            table_rel,
+            block_count,
+            &txn.snapshot,
+            self.txn_manager.as_ref(),
+        );
+        let result = (|| -> Result<u64, ServerError> {
+            let mut inserted = 0_u64;
+            for tuple in scan {
+                let tuple = tuple.map_err(|e| {
+                    ServerError::ddl(format!(
+                        "restart rebuild {} heap scan failed: {e}",
+                        index.name
+                    ))
+                })?;
+                let Some(key) = decode_key_column(
+                    &tuple.data,
+                    &table.schema,
+                    key_col_idx,
+                    &[],
+                    None,
+                    method,
+                    &encoding,
+                )?
+                else {
+                    continue;
+                };
+                if index.is_unique {
+                    btree.insert(key, tuple.tid, txn.xid, None).map_err(|e| {
+                        ServerError::ddl(format!("restart rebuild {}: {e}", index.name))
+                    })?;
+                } else {
+                    btree
+                        .insert_non_unique(key, tuple.tid, txn.xid, None)
+                        .map_err(|e| {
+                            ServerError::ddl(format!("restart rebuild {}: {e}", index.name))
+                        })?;
+                }
+                inserted = inserted.saturating_add(1);
+            }
+            Ok(inserted)
+        })();
+        if let Err(e) = self.txn_manager.commit(txn) {
+            tracing::warn!(error = %e, "restart btree rebuild txn failed to finalise");
+        }
+        result
     }
 
     fn rebuild_aggregating_index_rows(
