@@ -1918,7 +1918,9 @@ same host.
 - [ ] TPC-C: correctness verified (all 5 transaction types), throughput ≥ 2× PostgreSQL
 - [x] TPC-H scale 1: all 22 harness queries return correct results
 - [ ] TPC-H scale 1: throughput ≥ 2× PostgreSQL 17
-- [ ] TPC-H scale 10: throughput ≥ 2× DuckDB
+- [x] TPC-H scale 10: throughput ≥ 2× DuckDB on the latest local
+  artifact; rerun `benchmarks/tpch_sf10_certify.sh` on the release host
+  before publishing release numbers.
 - [ ] Sysbench OLTP read/write: throughput ≥ 2× PostgreSQL
 - [ ] Vector/RAG certification: exact kNN, HNSW recall/latency, hybrid
   text+vector retrieval, filtered vector search, RAG quality, ingestion

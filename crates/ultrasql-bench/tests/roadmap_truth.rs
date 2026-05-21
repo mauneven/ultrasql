@@ -73,4 +73,5 @@ fn roadmap_tpch_sf10_matches_complete_artifact() {
     assert!(!roadmap.contains("incomplete q21-only query set"));
     assert!(!roadmap.contains("has not been run to completion"));
     assert!(!roadmap.contains("remained in the `lineitem` load"));
+    assert!(!roadmap.contains("- [ ] TPC-H scale 10:"));
 }
