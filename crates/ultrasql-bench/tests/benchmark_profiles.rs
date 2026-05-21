@@ -103,3 +103,34 @@ fn clickbench_runner_declares_complete_engine_artifacts_and_host_metadata() {
     assert!(clickbench.contains("\"status\": \"not_available\""));
     assert!(clickbench.contains("runner_not_implemented_for_engine"));
 }
+
+#[test]
+fn hot_path_profile_runner_covers_required_flamegraphs() {
+    let script = repo_file("benchmarks/hot_path_profiles.sh");
+    let docs = repo_file("BENCHMARKS.md");
+
+    assert!(script.contains("hot_path_profiles_manifest.json"));
+    assert!(script.contains("release-with-debug"));
+    assert!(script.contains("flamegraph"));
+    assert!(script.contains("\"status\""));
+    assert!(script.contains("\"flamegraph\""));
+    for workload in [
+        "csv_copy",
+        "parquet_filter",
+        "vector_topk",
+        "hash_aggregate",
+        "joins",
+        "tpch_q1",
+        "tpch_q5",
+        "tpch_q6",
+    ] {
+        assert!(
+            script.contains(workload),
+            "missing hot profile workload {workload}"
+        );
+        assert!(
+            docs.contains(workload),
+            "BENCHMARKS.md missing hot profile docs for {workload}"
+        );
+    }
+}

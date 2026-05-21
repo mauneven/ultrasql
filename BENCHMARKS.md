@@ -607,6 +607,41 @@ certify TPC-H, ClickBench, TPC-B/C, Sysbench, exact vector top-k, or HNSW
 performance. Full profile results still report `unavailable` when required
 DSNs, datasets, engines, or implementations are absent.
 
+## Hot-Path Flamegraphs
+
+Use the hot-path profile runner before adding SIMD kernels or executor
+special cases:
+
+```text
+benchmarks/hot_path_profiles.sh smoke
+benchmarks/hot_path_profiles.sh full
+benchmarks/hot_path_profiles.sh full csv_copy parquet_filter vector_topk
+```
+
+The runner builds `ultrasql-bench` with `--profile release-with-debug`,
+records SVG flamegraphs under
+`benchmarks/results/latest/profiles/hot_path/`, writes raw timing JSON under
+`benchmarks/results/latest/raw/`, and writes
+`benchmarks/results/latest/hot_path_profiles_manifest.json`.
+
+Required workloads:
+
+| Workload | Path covered |
+|----------|--------------|
+| `csv_copy` | CSV `COPY FROM` import |
+| `parquet_filter` | Parquet predicate/row-group filter scan |
+| `vector_topk` | exact vector nearest-neighbor top-k |
+| `hash_aggregate` | dashboard-style SQL `GROUP BY` aggregate |
+| `joins` | CSV-to-table join path |
+| `tpch_q1` | TPC-H Q1 over local `.tbl` data |
+| `tpch_q5` | TPC-H Q5 over local `.tbl` data |
+| `tpch_q6` | TPC-H Q6 over local `.tbl` data |
+
+Set `TPCH_DATA_DIR` for TPC-H profiles. If profile tooling or local TPC-H
+data is missing, the runner records `not_available` artifacts instead of
+claiming a measured profile. These artifacts are diagnostic only; they do
+not rank UltraSQL against another engine.
+
 ## Pre-Push Gate vs Full Sweep
 
 The `pre-push` hook runs `regression-gate --smoke`:
