@@ -138,8 +138,9 @@ fn main() -> std::process::ExitCode {
     let outcome = runtime.block_on(async move {
         if let Some(ops_addr) = cli.ops_listen {
             let pg_addr = cli.listen;
+            let ops_state = Arc::clone(&state);
             tokio::spawn(async move {
-                if let Err(e) = run_ops_endpoint(ops_addr, pg_addr).await {
+                if let Err(e) = run_ops_endpoint(ops_addr, pg_addr, ops_state).await {
                     error!(target: "ultrasqld", error = %e, "ops endpoint terminated");
                 }
             });
@@ -186,15 +187,19 @@ fn init_tracing(
     Ok(())
 }
 
-async fn run_ops_endpoint(addr: SocketAddr, pg_addr: SocketAddr) -> std::io::Result<()> {
+async fn run_ops_endpoint(
+    addr: SocketAddr,
+    pg_addr: SocketAddr,
+    state: Arc<Server>,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     loop {
         let (stream, _) = listener.accept().await?;
-        tokio::spawn(handle_ops_request(stream, pg_addr));
+        tokio::spawn(handle_ops_request(stream, pg_addr, Arc::clone(&state)));
     }
 }
 
-async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr) {
+async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr, state: Arc<Server>) {
     let mut buf = [0_u8; 1024];
     let n = match stream.read(&mut buf).await {
         Ok(n) => n,
@@ -238,19 +243,7 @@ async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr) {
                 )
             }
         }
-        "/metrics" => (
-            "200 OK",
-            "text/plain; version=0.0.4",
-            format!(
-                "# HELP ultrasql_up Whether ultrasqld process is running.\n\
-                 # TYPE ultrasql_up gauge\n\
-                 ultrasql_up 1\n\
-                 # HELP ultrasql_build_info Build metadata.\n\
-                 # TYPE ultrasql_build_info gauge\n\
-                 ultrasql_build_info{{version=\"{}\"}} 1\n",
-                env!("CARGO_PKG_VERSION")
-            ),
-        ),
+        "/metrics" => ("200 OK", "text/plain; version=0.0.4", metrics_body(&state)),
         _ => (
             "404 Not Found",
             "application/json",
@@ -263,4 +256,181 @@ async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr) {
         body.len()
     );
     let _ = stream.write_all(response.as_bytes()).await;
+}
+
+fn metrics_body(state: &Server) -> String {
+    let buffer = state.heap.buffer_pool().stats();
+    let wal = state.wal_writer_stats().unwrap_or_default();
+    let object = ultrasql_objectstore::object_range_cache_metrics();
+    let ann = state.ann_system_metrics();
+    let latency = state.workload_recorder.latency_histogram();
+
+    let mut body = String::new();
+    body.push_str(
+        "# HELP ultrasql_up Whether ultrasqld process is running.\n\
+         # TYPE ultrasql_up gauge\n\
+         ultrasql_up 1\n\
+         # HELP ultrasql_build_info Build metadata.\n\
+         # TYPE ultrasql_build_info gauge\n",
+    );
+    body.push_str(&format!(
+        "ultrasql_build_info{{version=\"{}\"}} 1\n",
+        env!("CARGO_PKG_VERSION")
+    ));
+    body.push_str(
+        "# HELP ultrasql_buffer_pool_hits_total Buffer-pool page hits.\n\
+         # TYPE ultrasql_buffer_pool_hits_total counter\n",
+    );
+    push_metric(&mut body, "ultrasql_buffer_pool_hits_total", buffer.hits);
+    body.push_str(
+        "# HELP ultrasql_buffer_pool_misses_total Buffer-pool page misses.\n\
+         # TYPE ultrasql_buffer_pool_misses_total counter\n",
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_buffer_pool_misses_total",
+        buffer.misses,
+    );
+    push_metric(&mut body, "ultrasql_buffer_pool_gets_total", buffer.gets);
+    push_metric(
+        &mut body,
+        "ultrasql_buffer_pool_evictions_total",
+        buffer.evictions,
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_buffer_pool_resident_pages",
+        usize_to_u64_saturated(buffer.resident),
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_buffer_pool_pinned_pages",
+        usize_to_u64_saturated(buffer.pinned),
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_buffer_pool_dirty_pages",
+        usize_to_u64_saturated(buffer.dirty),
+    );
+
+    body.push_str(
+        "# HELP ultrasql_wal_fsync_latency_us WAL fsync latency in microseconds.\n\
+         # TYPE ultrasql_wal_fsync_latency_us summary\n",
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_wal_fsync_latency_us_count",
+        wal.fsync_count,
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_wal_fsync_latency_us_sum",
+        wal.fsync_total_us,
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_wal_fsync_latency_us_max",
+        wal.fsync_max_us,
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_wal_fsync_latency_us_last",
+        wal.fsync_last_us,
+    );
+
+    body.push_str(
+        "# HELP ultrasql_object_store_remote_bytes_total Object-store bytes fetched remotely.\n\
+         # TYPE ultrasql_object_store_remote_bytes_total counter\n",
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_object_store_remote_bytes_total",
+        object.remote_bytes,
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_object_store_range_requests_total",
+        object.range_requests,
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_object_store_cache_hits_total",
+        object.cache_hits,
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_object_store_cache_misses_total",
+        object.cache_misses,
+    );
+
+    body.push_str(
+        "# HELP ultrasql_ann_candidates ANN candidates available in runtime vector indexes.\n\
+         # TYPE ultrasql_ann_candidates gauge\n",
+    );
+    push_metric(&mut body, "ultrasql_ann_candidates", ann.candidates);
+    push_metric(&mut body, "ultrasql_ann_tombstones", ann.tombstones);
+    push_metric(&mut body, "ultrasql_ann_hnsw_indexes", ann.hnsw_indexes);
+    push_metric(
+        &mut body,
+        "ultrasql_ann_ivfflat_indexes",
+        ann.ivfflat_indexes,
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_vector_index_memory_bytes",
+        ann.vector_index_memory_bytes,
+    );
+
+    body.push_str(
+        "# HELP ultrasql_query_latency_us Query latency histogram in microseconds.\n\
+         # TYPE ultrasql_query_latency_us histogram\n",
+    );
+    for bucket in latency.buckets {
+        let le = if bucket.le_us == u64::MAX {
+            "+Inf".to_string()
+        } else {
+            bucket.le_us.to_string()
+        };
+        body.push_str(&format!(
+            "ultrasql_query_latency_us_bucket{{le=\"{le}\"}} {}\n",
+            bucket.count
+        ));
+    }
+    push_metric(&mut body, "ultrasql_query_latency_us_count", latency.count);
+    push_metric(&mut body, "ultrasql_query_latency_us_sum", latency.sum_us);
+    body
+}
+
+fn push_metric(body: &mut String, name: &str, value: u64) {
+    body.push_str(&format!("{name} {value}\n"));
+}
+
+fn usize_to_u64_saturated(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_body_reports_system_counters() {
+        let state = Server::with_sample_database();
+        let body = metrics_body(&state);
+
+        for metric in [
+            "ultrasql_buffer_pool_hits_total",
+            "ultrasql_buffer_pool_misses_total",
+            "ultrasql_wal_fsync_latency_us_count",
+            "ultrasql_wal_fsync_latency_us_sum",
+            "ultrasql_object_store_remote_bytes_total",
+            "ultrasql_ann_candidates",
+            "ultrasql_vector_index_memory_bytes",
+            "ultrasql_query_latency_us_bucket",
+            "ultrasql_query_latency_us_count",
+            "ultrasql_query_latency_us_sum",
+        ] {
+            assert!(body.contains(metric), "missing metric {metric}");
+        }
+    }
 }

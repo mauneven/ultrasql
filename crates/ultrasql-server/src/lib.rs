@@ -357,6 +357,21 @@ pub struct RuntimeIndexMetadata {
     pub aggregating: Option<Arc<RuntimeAggregatingIndex>>,
 }
 
+/// Process-wide ANN/vector-index counters for ops metrics.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AnnSystemMetrics {
+    /// Approximate candidate count available across runtime ANN sidecars.
+    pub candidates: u64,
+    /// Tombstoned ANN entries waiting for VACUUM cleanup.
+    pub tombstones: u64,
+    /// Approximate memory footprint of page-backed vector-index pages.
+    pub vector_index_memory_bytes: u64,
+    /// Number of runtime HNSW indexes.
+    pub hnsw_indexes: u64,
+    /// Number of runtime IVFFlat indexes.
+    pub ivfflat_indexes: u64,
+}
+
 /// Runtime sidecar for `CREATE AGGREGATING INDEX`.
 #[derive(Debug)]
 pub struct RuntimeAggregatingIndex {
@@ -1674,6 +1689,15 @@ pub(crate) fn tpch_q21_cache() -> Option<Arc<Vec<TpchQ21ResultRow>>> {
     tpch_q21_cache_cell().read().clone()
 }
 
+fn usize_to_u64_saturated(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn pages_to_bytes_saturated(pages: usize) -> u64 {
+    usize_to_u64_saturated(pages)
+        .saturating_mul(usize_to_u64_saturated(ultrasql_core::constants::PAGE_SIZE))
+}
+
 impl Server {
     /// Execute one read-only SQL query without opening a server socket.
     ///
@@ -2471,6 +2495,59 @@ impl Server {
     #[must_use]
     pub fn catalog_snapshot(&self) -> Arc<CatalogSnapshot> {
         self.persistent_catalog.snapshot()
+    }
+
+    /// Return live WAL writer counters when WAL-backed storage is enabled.
+    #[must_use]
+    pub fn wal_writer_stats(&self) -> Option<ultrasql_wal::WalWriterStats> {
+        self.wal_writer.as_ref().map(ultrasql_wal::WalWriter::stats)
+    }
+
+    /// Return process-local ANN/vector-index counters for ops metrics.
+    #[must_use]
+    pub fn ann_system_metrics(&self) -> AnnSystemMetrics {
+        let mut metrics = AnnSystemMetrics::default();
+        for entry in self.table_constraints.iter() {
+            for runtime in entry.value().indexes.values() {
+                if let Some(hnsw) = &runtime.hnsw {
+                    let stats = hnsw.page_stats();
+                    metrics.hnsw_indexes = metrics.hnsw_indexes.saturating_add(1);
+                    metrics.candidates = metrics
+                        .candidates
+                        .saturating_add(usize_to_u64_saturated(stats.live_nodes));
+                    metrics.tombstones = metrics
+                        .tombstones
+                        .saturating_add(usize_to_u64_saturated(stats.tombstones));
+                    let pages = stats
+                        .meta_pages
+                        .saturating_add(stats.node_pages)
+                        .saturating_add(stats.overflow_pages)
+                        .saturating_add(stats.free_list_pages);
+                    metrics.vector_index_memory_bytes = metrics
+                        .vector_index_memory_bytes
+                        .saturating_add(pages_to_bytes_saturated(pages));
+                }
+                if let Some(ivfflat) = &runtime.ivfflat {
+                    let stats = ivfflat.page_stats();
+                    metrics.ivfflat_indexes = metrics.ivfflat_indexes.saturating_add(1);
+                    metrics.candidates = metrics
+                        .candidates
+                        .saturating_add(usize_to_u64_saturated(stats.live_entries));
+                    metrics.tombstones = metrics
+                        .tombstones
+                        .saturating_add(usize_to_u64_saturated(stats.tombstones));
+                    let pages = stats
+                        .meta_pages
+                        .saturating_add(stats.centroid_pages)
+                        .saturating_add(stats.list_pages)
+                        .saturating_add(stats.entry_pages);
+                    metrics.vector_index_memory_bytes = metrics
+                        .vector_index_memory_bytes
+                        .saturating_add(pages_to_bytes_saturated(pages));
+                }
+            }
+        }
+        metrics
     }
 
     /// Validate foreign keys that were declared `DEFERRABLE INITIALLY DEFERRED`.

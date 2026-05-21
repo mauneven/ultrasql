@@ -31,4 +31,4 @@ pub use payload::{
 };
 pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};
 pub use recovery::{RecoveryError, recover};
-pub use writer::{WalWriter, WalWriterConfig, WalWriterError};
+pub use writer::{WalWriter, WalWriterConfig, WalWriterError, WalWriterStats};

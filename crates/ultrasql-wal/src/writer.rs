@@ -79,6 +79,19 @@ pub struct WalWriterConfig {
     pub fsync_batch_bytes: usize,
 }
 
+/// Live WAL writer counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalWriterStats {
+    /// Number of completed file flush + fsync calls.
+    pub fsync_count: u64,
+    /// Sum of completed fsync latencies in microseconds.
+    pub fsync_total_us: u64,
+    /// Maximum completed fsync latency in microseconds.
+    pub fsync_max_us: u64,
+    /// Most recent completed fsync latency in microseconds.
+    pub fsync_last_us: u64,
+}
+
 impl Default for WalWriterConfig {
     fn default() -> Self {
         Self {
@@ -111,6 +124,44 @@ struct Shared {
     /// Most recently published durable LSN, mirrored from the buffer
     /// so [`WalWriter::flushed_lsn`] is a lock-free atomic read.
     durable_lsn: AtomicU64,
+    /// Completed fsync count.
+    fsync_count: AtomicU64,
+    /// Sum of fsync latencies in microseconds.
+    fsync_total_us: AtomicU64,
+    /// Maximum observed fsync latency in microseconds.
+    fsync_max_us: AtomicU64,
+    /// Most recent observed fsync latency in microseconds.
+    fsync_last_us: AtomicU64,
+}
+
+impl Shared {
+    fn record_fsync_latency(&self, elapsed_us: u64) {
+        self.fsync_count.fetch_add(1, Ordering::Relaxed);
+        self.fsync_total_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        self.fsync_last_us.store(elapsed_us, Ordering::Relaxed);
+
+        let mut current = self.fsync_max_us.load(Ordering::Relaxed);
+        while elapsed_us > current {
+            match self.fsync_max_us.compare_exchange_weak(
+                current,
+                elapsed_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    fn stats(&self) -> WalWriterStats {
+        WalWriterStats {
+            fsync_count: self.fsync_count.load(Ordering::Relaxed),
+            fsync_total_us: self.fsync_total_us.load(Ordering::Relaxed),
+            fsync_max_us: self.fsync_max_us.load(Ordering::Relaxed),
+            fsync_last_us: self.fsync_last_us.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Owning handle to the background WAL writer thread.
@@ -144,6 +195,10 @@ impl WalWriter {
             wake_mutex: Mutex::new(WakeState::default()),
             wake_cv: Condvar::new(),
             durable_lsn: AtomicU64::new(initial_durable),
+            fsync_count: AtomicU64::new(0),
+            fsync_total_us: AtomicU64::new(0),
+            fsync_max_us: AtomicU64::new(0),
+            fsync_last_us: AtomicU64::new(0),
         });
 
         let thread_shared = Arc::clone(&shared);
@@ -183,6 +238,12 @@ impl WalWriter {
         Lsn::new(self.shared.durable_lsn.load(Ordering::Acquire))
     }
 
+    /// Return live WAL writer counters.
+    #[must_use]
+    pub fn stats(&self) -> WalWriterStats {
+        self.shared.stats()
+    }
+
     /// Signal the writer thread to stop, wait for it to drain
     /// remaining bytes, fsync, and exit. Consumes the handle.
     pub fn shutdown(mut self) -> Result<(), WalWriterError> {
@@ -217,6 +278,30 @@ impl Drop for WalWriter {
                 Err(_) => error!("wal writer thread panicked during Drop"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn wal_writer_stats_snapshot_starts_empty() {
+        let shared = Arc::new(Shared {
+            wake_mutex: Mutex::new(WakeState::default()),
+            wake_cv: Condvar::new(),
+            durable_lsn: AtomicU64::new(0),
+            fsync_count: AtomicU64::new(0),
+            fsync_total_us: AtomicU64::new(0),
+            fsync_max_us: AtomicU64::new(0),
+            fsync_last_us: AtomicU64::new(0),
+        });
+        let writer = WalWriter {
+            shared,
+            handle: None,
+        };
+
+        assert_eq!(writer.stats(), WalWriterStats::default());
     }
 }
 
@@ -405,8 +490,11 @@ impl WriterDriver {
 
     fn flush_current(&mut self) -> Result<(), WalWriterError> {
         if let Some(file) = self.current_file.as_mut() {
+            let started = Instant::now();
             file.flush()?;
             full_fsync(file)?;
+            let elapsed_us = duration_as_micros_saturated(started.elapsed());
+            self.shared.record_fsync_latency(elapsed_us);
         }
         self.unflushed_bytes = 0;
         self.durable_lsn = self.pending_lsn;
@@ -415,6 +503,10 @@ impl WriterDriver {
         self.buffer.publish_durable_lsn(self.durable_lsn);
         Ok(())
     }
+}
+
+fn duration_as_micros_saturated(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Read the `total_length` u32 from the front of an encoded WAL

@@ -6,6 +6,11 @@ use std::time::Duration;
 
 use ultrasql_planner::LogicalPlan;
 
+const LATENCY_BUCKETS_US: [u64; 9] = [
+    100, 500, 1_000, 5_000, 10_000, 50_000, 100_000, 500_000, 1_000_000,
+];
+const LATENCY_BUCKET_COUNT: usize = LATENCY_BUCKETS_US.len() + 1;
+
 /// Aggregated pg_stat_statements-style metrics for one normalized query.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkloadStatementStats {
@@ -75,12 +80,75 @@ pub struct WorkloadQueryRecord {
     pub bind_params_redacted: bool,
 }
 
+/// One cumulative latency histogram bucket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkloadLatencyBucket {
+    /// Inclusive upper bound in microseconds. `u64::MAX` represents `+Inf`.
+    pub le_us: u64,
+    /// Cumulative observations up to this bound.
+    pub count: u64,
+}
+
+/// Process-local query latency histogram snapshot.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkloadLatencyHistogram {
+    /// Cumulative bucket counts.
+    pub buckets: Vec<WorkloadLatencyBucket>,
+    /// Total observations.
+    pub count: u64,
+    /// Sum of observed query latencies in microseconds.
+    pub sum_us: u64,
+}
+
+#[derive(Debug, Default)]
+struct LatencyHistogramState {
+    bucket_counts: [u64; LATENCY_BUCKET_COUNT],
+    count: u64,
+    sum_us: u64,
+}
+
+impl LatencyHistogramState {
+    fn observe(&mut self, elapsed: Duration) {
+        let elapsed_us = duration_as_micros_saturated(elapsed);
+        self.count = self.count.saturating_add(1);
+        self.sum_us = self.sum_us.saturating_add(elapsed_us);
+        let bucket = LATENCY_BUCKETS_US
+            .iter()
+            .position(|upper| elapsed_us <= *upper)
+            .unwrap_or(LATENCY_BUCKET_COUNT - 1);
+        self.bucket_counts[bucket] = self.bucket_counts[bucket].saturating_add(1);
+    }
+
+    fn snapshot(&self) -> WorkloadLatencyHistogram {
+        let mut buckets = Vec::with_capacity(LATENCY_BUCKET_COUNT);
+        let mut cumulative = 0_u64;
+        for (idx, upper) in LATENCY_BUCKETS_US.iter().copied().enumerate() {
+            cumulative = cumulative.saturating_add(self.bucket_counts[idx]);
+            buckets.push(WorkloadLatencyBucket {
+                le_us: upper,
+                count: cumulative,
+            });
+        }
+        cumulative = cumulative.saturating_add(self.bucket_counts[LATENCY_BUCKET_COUNT - 1]);
+        buckets.push(WorkloadLatencyBucket {
+            le_us: u64::MAX,
+            count: cumulative,
+        });
+        WorkloadLatencyHistogram {
+            buckets,
+            count: self.count,
+            sum_us: self.sum_us,
+        }
+    }
+}
+
 /// In-process workload recorder.
 #[derive(Debug)]
 pub struct WorkloadRecorder {
     stats: parking_lot::Mutex<HashMap<u64, WorkloadStatementStats>>,
     slow_log: parking_lot::Mutex<VecDeque<SlowQueryRecord>>,
     slow_query_threshold: parking_lot::RwLock<Option<Duration>>,
+    latency_histogram: parking_lot::Mutex<LatencyHistogramState>,
     slow_log_capacity: usize,
 }
 
@@ -98,6 +166,7 @@ impl WorkloadRecorder {
             stats: parking_lot::Mutex::new(HashMap::new()),
             slow_log: parking_lot::Mutex::new(VecDeque::new()),
             slow_query_threshold: parking_lot::RwLock::new(None),
+            latency_histogram: parking_lot::Mutex::new(LatencyHistogramState::default()),
             slow_log_capacity: 1024,
         }
     }
@@ -118,6 +187,7 @@ impl WorkloadRecorder {
         if query.is_empty() {
             return;
         }
+        self.latency_histogram.lock().observe(record.elapsed);
         let query_id = stable_hash(&query);
         let plan_hash = if record.plan_hash == 0 {
             stable_hash(&format!("sql:{query}"))
@@ -193,6 +263,12 @@ impl WorkloadRecorder {
     pub fn slow_queries(&self) -> Vec<SlowQueryRecord> {
         self.slow_log.lock().iter().cloned().collect()
     }
+
+    /// Return cumulative query latency histogram counters.
+    #[must_use]
+    pub fn latency_histogram(&self) -> WorkloadLatencyHistogram {
+        self.latency_histogram.lock().snapshot()
+    }
 }
 
 /// Hash a bound logical plan without exposing literal values to logs.
@@ -221,4 +297,52 @@ fn stable_hash<T: Hash>(value: &T) -> u64 {
     value.hash(&mut hasher);
     let hash = hasher.finish();
     if hash == 0 { 1 } else { hash }
+}
+
+fn duration_as_micros_saturated(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workload_recorder_tracks_latency_histogram() {
+        let recorder = WorkloadRecorder::new();
+        recorder.record(WorkloadQueryRecord {
+            query: "SELECT 1".to_string(),
+            plan_hash: 0,
+            elapsed: Duration::from_micros(250),
+            rows: 1,
+            error: None,
+            bind_param_count: 0,
+            bind_params_redacted: false,
+        });
+        recorder.record(WorkloadQueryRecord {
+            query: "SELECT 2".to_string(),
+            plan_hash: 0,
+            elapsed: Duration::from_micros(2_500),
+            rows: 1,
+            error: None,
+            bind_param_count: 0,
+            bind_params_redacted: false,
+        });
+
+        let histogram = recorder.latency_histogram();
+        assert_eq!(histogram.count, 2);
+        assert_eq!(histogram.sum_us, 2_750);
+        assert!(
+            histogram
+                .buckets
+                .iter()
+                .any(|bucket| bucket.le_us == 500 && bucket.count == 1)
+        );
+        assert!(
+            histogram
+                .buckets
+                .iter()
+                .any(|bucket| bucket.le_us == u64::MAX && bucket.count == 2)
+        );
+    }
 }
