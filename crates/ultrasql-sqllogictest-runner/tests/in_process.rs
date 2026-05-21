@@ -182,6 +182,28 @@ fn portable_corpus_includes_curated_filter_setops_shard() {
 }
 
 #[test]
+fn portable_corpus_includes_scalar_expression_shard() {
+    let suite = repo_root().join("tests/slt/portable/scalar_expressions.slt");
+    let text = fs::read_to_string(&suite).expect("curated scalar expression SLT shard exists");
+    assert!(
+        text.contains("UltraSQL-authored portable SQLLogicTest shard"),
+        "{} must document authored provenance",
+        suite.display()
+    );
+    assert!(
+        text.contains("portable scalar expression coverage"),
+        "{} must name its reviewed scope",
+        suite.display()
+    );
+    let case_count = count_slt_cases(&text);
+    assert!(
+        (8..=24).contains(&case_count),
+        "{} must stay as a small reviewed shard, got {case_count} cases",
+        suite.display()
+    );
+}
+
+#[test]
 fn imported_sqllogictest_shards_stay_small_and_provenanced() {
     let imported_root = repo_root().join("tests/slt/portable/imported");
     let mut imported_suites = 0usize;
@@ -228,6 +250,138 @@ fn imported_sqllogictest_shards_stay_small_and_provenanced() {
         "{} should contain at least one audited imported shard",
         imported_root.display()
     );
+}
+
+#[test]
+fn postgres_compat_subset_preserves_public_provenance() {
+    let subset = repo_root().join("tests/slt/postgres_compat/regression_subset");
+    for required in ["README.md", "IMPORT_MANIFEST.txt", "LICENSE.upstream"] {
+        assert!(
+            subset.join(required).is_file(),
+            "{} missing required provenance file {required}",
+            subset.display()
+        );
+    }
+    let manifest =
+        fs::read_to_string(subset.join("IMPORT_MANIFEST.txt")).expect("read PostgreSQL manifest");
+    assert!(
+        manifest.contains("source=https://github.com/postgres/postgres"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        manifest.contains("commit=ddd12d1a5c4d980c5f31dc7d096012547b724e55"),
+        "manifest:\n{manifest}"
+    );
+    assert!(
+        manifest.contains("derived_from=src/test/regress/sql/select.sql"),
+        "manifest:\n{manifest}"
+    );
+    let shard = subset.join("select_basics.slt");
+    let text = fs::read_to_string(&shard).expect("read PostgreSQL compatibility shard");
+    assert!(
+        text.contains("# ultrasql:skip row-value IN compatibility not implemented yet"),
+        "{} must keep unsupported PostgreSQL regression coverage as explicit skip",
+        shard.display()
+    );
+}
+
+#[test]
+fn skip_directive_requires_explicit_reason() {
+    let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
+    let suite = temp_artifact_path("ultrasql-slt-empty-skip", "test");
+    fs::write(
+        &suite,
+        "# ultrasql:skip\n\nquery I nosort\nSELECT 1\n----\n1\n",
+    )
+    .expect("write temporary SLT with empty skip");
+
+    let output = Command::new(bin)
+        .arg("--mode")
+        .arg("in-process")
+        .arg(&suite)
+        .output()
+        .expect("run SQLLogicTest runner");
+
+    let _ = fs::remove_file(suite);
+    assert!(
+        !output.status.success(),
+        "runner unexpectedly accepted empty skip reason\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skip directive requires an explicit reason"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn skip_filter_requires_explicit_reason() {
+    let bin = env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner");
+    let suite = temp_artifact_path("ultrasql-slt-filter-reason", "test");
+    let filter = temp_artifact_path("ultrasql-slt-filter-reason", "txt");
+    fs::write(&suite, "query I nosort\nSELECT 1\n----\n1\n").expect("write temporary SLT");
+    fs::write(&filter, "SELECT 1\n").expect("write skip filter without reason");
+
+    let output = Command::new(bin)
+        .arg("--mode")
+        .arg("in-process")
+        .arg("--skip-filter")
+        .arg(&filter)
+        .arg(&suite)
+        .output()
+        .expect("run SQLLogicTest runner");
+
+    let _ = fs::remove_file(suite);
+    let _ = fs::remove_file(filter);
+    assert!(
+        !output.status.success(),
+        "runner unexpectedly accepted skip filter without reason\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skip filter requires `pattern<TAB>reason`"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn differential_wrong_rows_fail() {
+    let temp_dir = temp_dir("ultrasql-slt-bad-sqlite");
+    fs::create_dir_all(&temp_dir).expect("create temp directory");
+    let sqlite = temp_dir.join("sqlite3");
+    write_executable(&sqlite, "#!/bin/sh\nprintf '999\\n'\nexit 0\n");
+    let suite = temp_dir.join("wrong_rows.test");
+    fs::write(&suite, "query I nosort\nSELECT 1\n----\n1\n").expect("write mismatch SLT");
+
+    let path = format!(
+        "{}:{}",
+        temp_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_ultrasql-sqllogictest-runner"))
+        .env("PATH", path)
+        .arg("--mode")
+        .arg("in-process")
+        .arg("--reference-engine")
+        .arg("sqlite")
+        .arg(&suite)
+        .output()
+        .expect("run SQLLogicTest runner");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(
+        !output.status.success(),
+        "runner unexpectedly accepted wrong reference rows\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("reference mismatch"), "stderr:\n{stderr}");
 }
 
 #[test]
@@ -296,12 +450,32 @@ fn command_available(program: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+#[cfg(unix)]
+fn write_executable(path: &Path, text: &str) {
+    fs::write(path, text).expect("write executable script");
+    let mut perms = fs::metadata(path)
+        .expect("stat executable script")
+        .permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("chmod executable script");
+}
+
 fn temp_artifact_path(prefix: &str, extension: &str) -> std::path::PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock after Unix epoch")
         .as_nanos();
     std::env::temp_dir().join(format!("{prefix}-{}-{nanos}.{extension}", process::id()))
+}
+
+#[cfg(unix)]
+fn temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock after Unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", process::id()))
 }
 
 fn repo_root() -> PathBuf {

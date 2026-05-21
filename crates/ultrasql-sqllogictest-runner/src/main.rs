@@ -184,14 +184,28 @@ impl SkipFilters {
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                let (pattern, reason) = line.split_once('\t').unwrap_or((line, "unsupported"));
+                let Some((pattern, reason)) = line.split_once('\t') else {
+                    bail!(
+                        "{}:{} skip filter requires `pattern<TAB>reason`",
+                        path.display(),
+                        idx + 1
+                    );
+                };
                 let pattern = pattern.trim();
                 if pattern.is_empty() {
                     bail!("{}:{} empty skip pattern", path.display(), idx + 1);
                 }
+                let reason = reason.trim();
+                if reason.is_empty() {
+                    bail!(
+                        "{}:{} skip filter requires an explicit reason",
+                        path.display(),
+                        idx + 1
+                    );
+                }
                 filters.patterns.push(SkipPattern {
                     pattern: pattern.to_owned(),
-                    reason: reason.trim().to_owned(),
+                    reason: reason.to_owned(),
                 });
             }
         }
@@ -1354,16 +1368,24 @@ fn parse_directive(line: &str, directives: &mut Directives) -> Result<bool> {
         return Ok(false);
     };
     let rest = rest.trim();
-    if let Some(reason) = rest.strip_prefix("skip ") {
-        directives.next_skip = Some(reason.trim().to_owned());
+    if rest == "skip" || rest.starts_with("skip ") {
+        let reason = rest.strip_prefix("skip").unwrap_or_default().trim();
+        if reason.is_empty() {
+            bail!("skip directive requires an explicit reason");
+        }
+        directives.next_skip = Some(reason.to_owned());
         return Ok(true);
     }
     if let Some(feature) = rest.strip_prefix("require ") {
         directives.next_requires.push(feature.trim().to_owned());
         return Ok(true);
     }
-    if let Some(reason) = rest.strip_prefix("file-skip ") {
-        directives.file_skip = Some(reason.trim().to_owned());
+    if rest == "file-skip" || rest.starts_with("file-skip ") {
+        let reason = rest.strip_prefix("file-skip").unwrap_or_default().trim();
+        if reason.is_empty() {
+            bail!("file-skip directive requires an explicit reason");
+        }
+        directives.file_skip = Some(reason.to_owned());
         return Ok(true);
     }
     if let Some(feature) = rest.strip_prefix("file-require ") {

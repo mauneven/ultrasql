@@ -116,8 +116,56 @@ fn differential_script_does_not_leak_postgres_url_into_cli_engines() {
     );
 }
 
+#[test]
+fn postgres_compat_script_exists_and_skips_without_reference_url() {
+    let output = Command::new(postgres_compat_script())
+        .env("ULTRASQL_SLT_RUNNER", "/bin/false")
+        .env_remove("ULTRASQL_SLT_REFERENCE_URL")
+        .env_remove("POSTGRES_URL")
+        .output()
+        .expect("run PostgreSQL compatibility script");
+
+    assert!(
+        output.status.success(),
+        "script failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("skip postgres_compat: set ULTRASQL_SLT_REFERENCE_URL or POSTGRES_URL"),
+        "stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn postgres_compat_script_rejects_non_compat_paths() {
+    let output = Command::new(postgres_compat_script())
+        .env("SLT_PG_COMPAT_PATHS", "tests/slt/portable/basic.slt")
+        .env("ULTRASQL_SLT_REFERENCE_URL", "postgres://example")
+        .env("ULTRASQL_SLT_RUNNER", "/bin/false")
+        .output()
+        .expect("run PostgreSQL compatibility script");
+
+    assert!(
+        !output.status.success(),
+        "script unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("non-PostgreSQL-compat SQLLogicTest path"),
+        "stderr:\n{stderr}"
+    );
+}
+
 fn differential_script() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/slt/run_differential.sh")
+}
+
+fn postgres_compat_script() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/slt/run_postgres_compat.sh")
 }
 
 fn assert_engine_was_run_or_skipped(stderr: &str, engine: &str, skip_reason: &str) {

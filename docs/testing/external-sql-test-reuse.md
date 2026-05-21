@@ -77,6 +77,9 @@ Supported UltraSQL directives:
 - `# ultrasql:file-require <feature>` requires a feature for the rest of the
   file.
 
+Skip reasons are mandatory. Empty skip directives fail parsing so unsupported
+coverage remains auditable instead of becoming silent debt.
+
 ## Filters
 
 `third_party/sqllogictest/filters/unsupported.txt` is a text denylist. Each
@@ -89,6 +92,7 @@ pattern<TAB>reason
 If the pattern appears in a test path or SQL body, the runner reports an
 explicit skip. Skips are visible in the summary; unsupported syntax is not
 silently ignored.
+Filter lines without an explicit tab-separated reason are rejected.
 
 ## Differential comparison
 
@@ -122,8 +126,30 @@ Use `--reference-db PATH` to keep or reuse a SQLite/DuckDB reference database.
 For statements, the runner compares success/error class. For queries, it
 compares formatted row values after applying the same SQLLogicTest sort mode.
 
+Documented normalizations are intentionally narrow:
+
+- PostgreSQL wire rows are formatted as SQLLogicTest scalar values.
+- SQLite/DuckDB CLI output uses one value per line, `NULL` for nulls, and
+  carriage-return stripping for cross-platform shells.
+- `rowsort` sorts complete SQLLogicTest rows before value comparison.
+
+Any row-value mismatch after those normalizations is a failure.
+
 SQLite and DuckDB comparison is intended only for portable subsets. PostgreSQL
 compatibility tests should use PostgreSQL as the reference.
+
+Run the PostgreSQL regression-derived compatibility subset with:
+
+```sh
+POSTGRES_URL="host=127.0.0.1 port=5432 user=postgres dbname=ultrasql_slt" \
+tests/slt/run_postgres_compat.sh
+```
+
+The first curated shard lives under
+`tests/slt/postgres_compat/regression_subset/`. It pins PostgreSQL commit
+`ddd12d1a5c4d980c5f31dc7d096012547b724e55`, records
+`src/test/regress/sql/select.sql` as the source, and carries the PostgreSQL
+license next to the SLT file.
 
 Multiple reference engines can run in one pass:
 

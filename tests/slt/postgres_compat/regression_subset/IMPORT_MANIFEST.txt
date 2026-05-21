@@ -1,0 +1,6 @@
+source=https://github.com/postgres/postgres
+commit=ddd12d1a5c4d980c5f31dc7d096012547b724e55
+license=COPYRIGHT
+derived_from=src/test/regress/sql/select.sql
+file=select_basics.slt
+notes=hand-curated SQLLogicTest translation with local deterministic fixtures; no full upstream regression dump

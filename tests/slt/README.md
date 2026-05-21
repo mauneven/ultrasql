@@ -15,6 +15,9 @@ External imports must go through `third_party/sqllogictest/import.py` and keep
 license/provenance records. Imported shards stay small and filtered; expand the
 portable corpus with reviewed slices, not broad third-party dumps.
 
+Skips must always name a reason. Empty `# ultrasql:skip` directives and
+skip-filter lines without `pattern<TAB>reason` are rejected.
+
 Run portable correctness plus replay timing:
 
 ```sh
@@ -38,6 +41,17 @@ when `ULTRASQL_SLT_REFERENCE_URL` or `POSTGRES_URL` is set, against DuckDB when
 engines are skipped with explicit reasons on stderr. Use `SLT_DIFF_PATHS` only
 for reviewed portable paths and `SLT_DIFF_ENGINES=postgres,duckdb,sqlite` to
 choose engines.
+
+Run the PostgreSQL compatibility subset only against PostgreSQL as reference:
+
+```sh
+POSTGRES_URL="host=127.0.0.1 port=5432 user=postgres dbname=ultrasql_slt" \
+tests/slt/run_postgres_compat.sh
+```
+
+`postgres_compat/regression_subset/` pins PostgreSQL `REL_17_STABLE` commit
+`ddd12d1a5c4d980c5f31dc7d096012547b724e55` and preserves the upstream license
+beside the curated SQLLogicTest translation.
 
 The first imported open suite shard lives under
 `portable/imported/hydromatic/`. It comes from the MIT-licensed Hydromatic SQL
