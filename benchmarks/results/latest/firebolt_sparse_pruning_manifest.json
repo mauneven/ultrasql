@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "suite": "firebolt_sparse_pruning",
+  "profile": "smoke",
+  "requested_engines": [
+    "ultrasql",
+    "firebolt"
+  ],
+  "n_rows": 10000,
+  "warmup": 0,
+  "iters": 1,
+  "generated_at_unix": 1779334902,
+  "status": "partial",
+  "passed": false,
+  "engines": [
+    {
+      "engine": "ultrasql",
+      "status": "measured",
+      "exit_code": 0,
+      "artifact": "benchmarks/results/latest/raw/firebolt_sparse_pruning_10k-ultrasql.json"
+    },
+    {
+      "engine": "firebolt",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/firebolt_sparse_pruning_10k-firebolt.json"
+    }
+  ],
+  "policy": "No Firebolt sparse-pruning benchmark claim exists unless Firebolt has a measured artifact from FIREBOLT_URL and EXPLAIN shows primary-index pruning evidence."
+}

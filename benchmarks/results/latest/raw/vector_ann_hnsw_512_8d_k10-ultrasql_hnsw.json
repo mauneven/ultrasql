@@ -18,16 +18,16 @@
   "ef_search": 64,
   "seed": 1367265502,
   "recall_at_k": 1.0,
-  "p50_latency_us": 215.667,
-  "p95_latency_us": 225.375,
-  "p99_latency_us": 225.375,
-  "build_time_us": 9782.959,
+  "p50_latency_us": 136.541,
+  "p95_latency_us": 154.917,
+  "p99_latency_us": 154.917,
+  "build_time_us": 4160.125,
   "memory_bytes": 175560,
   "query_iterations_us": [
-    206.208,
-    215.667,
-    225.375,
-    219.791
+    136.541,
+    149.875,
+    154.917,
+    126.25
   ],
   "recall_iterations": [
     1.0,
