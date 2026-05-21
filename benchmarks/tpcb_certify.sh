@@ -20,11 +20,91 @@ TPCB_DURATION="${TPCB_DURATION:-60}"
 TPCB_WARMUP="${TPCB_WARMUP:-30}"
 TPCB_CONNECTIONS="${TPCB_CONNECTIONS:-32}"
 ALLOW_ULTRASQL_ONLY="${TPCB_ALLOW_ULTRASQL_ONLY:-0}"
+AUTO_POSTGRES="${TPCB_AUTO_POSTGRES:-1}"
+POSTGRES_IMAGE="${TPCB_POSTGRES_IMAGE:-postgres:17}"
+POSTGRES_CONTAINER="${TPCB_POSTGRES_CONTAINER:-ultrasql-postgres-tpcb}"
+POSTGRES_PORT="${TPCB_POSTGRES_PORT:-55432}"
+POSTGRES_PASSWORD="${TPCB_POSTGRES_PASSWORD:-postgres}"
 OUT_DIR="benchmarks/results/latest"
 RAW_DIR="$OUT_DIR/raw"
 SUMMARY_OUT="$OUT_DIR/tpcb_certification.json"
 
 mkdir -p "$RAW_DIR"
+
+docker_context_host() {
+    local context
+    context="${DOCKER_CONTEXT:-}"
+    if [[ -z "$context" ]]; then
+        context="$(docker context show 2>/dev/null || true)"
+    fi
+    if [[ -n "$context" ]]; then
+        docker context inspect "$context" --format '{{ .Endpoints.docker.Host }}' 2>/dev/null || true
+    fi
+}
+
+docker_without_desktop_creds() {
+    local tmp_config
+    local context_host
+    tmp_config="$(mktemp -d)"
+    printf '{"auths":{}}\n' > "$tmp_config/config.json"
+    context_host="$(docker_context_host)"
+    if [[ -n "$context_host" ]]; then
+        DOCKER_CONFIG="$tmp_config" DOCKER_HOST="$context_host" docker "$@"
+    else
+        DOCKER_CONFIG="$tmp_config" docker "$@"
+    fi
+    local status=$?
+    rm -rf "$tmp_config"
+    return "$status"
+}
+
+docker_cmd() {
+    docker_without_desktop_creds "$@"
+}
+
+postgres_tcp_ready() {
+    python3 - "$POSTGRES_PORT" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+try:
+    with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+        pass
+except OSError:
+    raise SystemExit(1)
+PY
+}
+
+try_start_local_postgres() {
+    if [[ "$AUTO_POSTGRES" == "0" ]] || ! command -v docker >/dev/null 2>&1; then
+        return 1
+    fi
+
+    if docker_cmd inspect "$POSTGRES_CONTAINER" >/dev/null 2>&1; then
+        docker_cmd start "$POSTGRES_CONTAINER" >/dev/null || return 1
+    else
+        docker_cmd run -d \
+            --name "$POSTGRES_CONTAINER" \
+            -e POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+            -e POSTGRES_DB=postgres \
+            -p "127.0.0.1:${POSTGRES_PORT}:5432" \
+            "$POSTGRES_IMAGE" >/dev/null || return 1
+    fi
+
+    for _ in $(seq 1 60); do
+        if docker_cmd exec "$POSTGRES_CONTAINER" pg_isready -U postgres -d postgres >/dev/null 2>&1 && postgres_tcp_ready; then
+            POSTGRES_DSN="host=127.0.0.1 port=${POSTGRES_PORT} user=postgres password=${POSTGRES_PASSWORD} dbname=postgres"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+if [[ -z "$POSTGRES_RESULT" && -z "$POSTGRES_DSN" && "$ALLOW_ULTRASQL_ONLY" != "1" ]]; then
+    try_start_local_postgres || true
+fi
 
 if [[ -z "$POSTGRES_RESULT" && -z "$POSTGRES_DSN" && "$ALLOW_ULTRASQL_ONLY" != "1" ]]; then
     python3 - "$SUMMARY_OUT" <<'PY'
@@ -41,7 +121,8 @@ doc = {
     "postgres_result": None,
     "ultrasql_result": None,
     "next_step": (
-        "Set POSTGRES_DSN or POSTGRES_TPCB_RESULT for certification. "
+        "Set POSTGRES_DSN or POSTGRES_TPCB_RESULT for certification, or "
+        "install Docker so TPCB_AUTO_POSTGRES=1 can start a local postgres:17. "
         "Set TPCB_ALLOW_ULTRASQL_ONLY=1 only for local UltraSQL-only smoke."
     ),
 }
@@ -60,6 +141,7 @@ target/release/regression-gate --stage v0_9 --smoke \
 
 if [[ -z "$ULTRASQL_RESULT" ]]; then
     ULTRASQL_RESULT="$RAW_DIR/tpcb_32conn-ultrasql.json"
+    TMP_ULTRASQL_RESULT="${ULTRASQL_RESULT}.tmp.$$"
     ULTRASQL_ARGS=(
         tpcb
         --engine ultrasql
@@ -67,7 +149,6 @@ if [[ -z "$ULTRASQL_RESULT" ]]; then
         --duration "$TPCB_DURATION"
         --warmup "$TPCB_WARMUP"
         --connections "$TPCB_CONNECTIONS"
-        --output "$ULTRASQL_RESULT"
     )
     if [[ -n "$TPCB_ACCOUNTS" ]]; then
         ULTRASQL_ARGS+=(--accounts "$TPCB_ACCOUNTS")
@@ -75,12 +156,18 @@ if [[ -z "$ULTRASQL_RESULT" ]]; then
     if [[ -n "$ULTRASQL_DSN" ]]; then
         ULTRASQL_ARGS+=(--dsn "$ULTRASQL_DSN")
     fi
-    target/release/ultrasql-bench "${ULTRASQL_ARGS[@]}" || true
+    ULTRASQL_ARGS+=(--output "$TMP_ULTRASQL_RESULT")
+    if target/release/ultrasql-bench "${ULTRASQL_ARGS[@]}"; then
+        mv "$TMP_ULTRASQL_RESULT" "$ULTRASQL_RESULT"
+    else
+        rm -f "$TMP_ULTRASQL_RESULT" "$ULTRASQL_RESULT"
+    fi
 fi
 
 if [[ -z "$POSTGRES_RESULT" ]]; then
     POSTGRES_RESULT="$RAW_DIR/tpcb_32conn-postgres17.json"
     if [[ -n "$POSTGRES_DSN" ]]; then
+        TMP_POSTGRES_RESULT="${POSTGRES_RESULT}.tmp.$$"
         POSTGRES_ARGS=(
             tpcb
             --engine postgres17
@@ -89,12 +176,16 @@ if [[ -z "$POSTGRES_RESULT" ]]; then
             --duration "$TPCB_DURATION"
             --warmup "$TPCB_WARMUP"
             --connections "$TPCB_CONNECTIONS"
-            --output "$POSTGRES_RESULT"
         )
         if [[ -n "$TPCB_ACCOUNTS" ]]; then
             POSTGRES_ARGS+=(--accounts "$TPCB_ACCOUNTS")
         fi
-        target/release/ultrasql-bench "${POSTGRES_ARGS[@]}" || true
+        POSTGRES_ARGS+=(--output "$TMP_POSTGRES_RESULT")
+        if target/release/ultrasql-bench "${POSTGRES_ARGS[@]}"; then
+            mv "$TMP_POSTGRES_RESULT" "$POSTGRES_RESULT"
+        else
+            rm -f "$TMP_POSTGRES_RESULT" "$POSTGRES_RESULT"
+        fi
     fi
 fi
 
@@ -158,8 +249,9 @@ doc = {
     "ultrasql_p99_latency_us": ul_p99_us,
     "kernel_smoke_result": "benchmarks/results/latest/raw/tpcb_32conn-ultrasql-kernel.json",
     "next_step": (
-        "Set POSTGRES_DSN for PostgreSQL 17 and rerun the same command on a quiet host "
-        "if certification is not yet passed."
+        "Set POSTGRES_DSN for PostgreSQL 17 or let TPCB_AUTO_POSTGRES=1 start "
+        "local postgres:17, then rerun the same command on a quiet host if "
+        "certification is not yet passed."
     ),
 }
 pathlib.Path(summary_path).write_text(json.dumps(doc, indent=2) + "\n")

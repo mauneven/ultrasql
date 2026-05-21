@@ -5,19 +5,19 @@
   "accounts": 1000,
   "branches": 1,
   "tellers": 10,
-  "connections": 8,
+  "connections": 32,
   "warmup_secs": 1,
   "duration_secs": 5,
-  "transactions": 4952,
-  "throughput_per_sec": 986.2021074543571,
-  "p50_latency_us": 5359.792,
-  "p99_latency_us": 39884.458,
+  "transactions": 3357,
+  "throughput_per_sec": 665.9854550026466,
+  "p50_latency_us": 22407.0,
+  "p99_latency_us": 531380.791,
   "correctness": {
     "passed": true,
-    "history_row_count": 5859,
-    "history_delta_sum": -4303,
-    "accounts_balance_sum": -4303,
-    "tellers_balance_sum": -4303,
-    "branches_balance_sum": -4303
+    "history_row_count": 4085,
+    "history_delta_sum": -685,
+    "accounts_balance_sum": -685,
+    "tellers_balance_sum": -685,
+    "branches_balance_sum": -685
   }
 }

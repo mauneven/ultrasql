@@ -67,6 +67,13 @@ fn setup_missing_certifications_are_unavailable_not_failed() {
 
     assert!(tpcb.contains("missing_cross_engine_results"));
     assert!(tpcb.contains("TPCB_ALLOW_ULTRASQL_ONLY"));
+    assert!(tpcb.contains("TPCB_AUTO_POSTGRES"));
+    assert!(tpcb.contains("postgres:17"));
+    assert!(tpcb.contains("ultrasql-postgres-tpcb"));
+    assert!(tpcb.contains("docker_without_desktop_creds"));
+    assert!(tpcb.contains("TMP_ULTRASQL_RESULT"));
+    assert!(tpcb.contains("mv \"$TMP_ULTRASQL_RESULT\" \"$ULTRASQL_RESULT\""));
+    assert!(tpcb.contains("rm -f \"$TMP_ULTRASQL_RESULT\" \"$ULTRASQL_RESULT\""));
     assert!(tpcb.contains("postgres_dsn_missing"));
     assert!(tpcb.contains("sys.exit(2 if reason == \"missing_cross_engine_results\""));
 

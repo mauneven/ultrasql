@@ -364,7 +364,7 @@ fn next_tx(config: &TpcbConfig, rng: &mut SplitMix64) -> Result<TpcbTx> {
 }
 
 async fn execute_tx(client: &Client, tx: &TpcbTx) -> Result<()> {
-    const MAX_RETRIES: usize = 1_024;
+    const MAX_RETRIES: usize = 16_384;
     for attempt in 0..MAX_RETRIES {
         match execute_tx_once(client, tx).await {
             Ok(()) => return Ok(()),
@@ -373,10 +373,11 @@ async fn execute_tx(client: &Client, tx: &TpcbTx) -> Result<()> {
                 if attempt < 128 {
                     tokio::task::yield_now().await;
                 } else {
-                    let backoff_us = 50_u64
+                    let backoff_us = 100_u64
                         + u64::try_from(attempt.saturating_sub(128))
-                            .unwrap_or(950)
-                            .min(950);
+                            .unwrap_or(4_900)
+                            .saturating_mul(10)
+                            .min(4_900);
                     tokio::time::sleep(Duration::from_micros(backoff_us)).await;
                 }
             }
@@ -400,6 +401,7 @@ fn is_retryable_conflict(err: &anyhow::Error) -> bool {
     let text = format!("{err:#}");
     text.contains("update on deleted tuple")
         || text.contains("write conflict")
+        || text.contains("row lock not available")
         || text.contains("serialization")
         || text.contains("could not serialize")
 }
@@ -519,5 +521,19 @@ impl SplitMix64 {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_retryable_conflict;
+
+    #[test]
+    fn row_lock_conflict_is_retryable() {
+        let err = anyhow::anyhow!(
+            "execution error: type mismatch: write conflict: row lock not available"
+        );
+
+        assert!(is_retryable_conflict(&err));
     }
 }

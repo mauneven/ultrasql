@@ -517,19 +517,29 @@ POSTGRES_DSN="host=localhost user=postgres dbname=tpcb_pg" \
 benchmarks/tpcb_certify.sh
 ```
 
+When `POSTGRES_DSN` and `POSTGRES_TPCB_RESULT` are absent, the script tries
+to start local Docker `postgres:17` automatically through
+`TPCB_AUTO_POSTGRES=1` (default), container `ultrasql-postgres-tpcb`, and port
+`55432`. Set `TPCB_AUTO_POSTGRES=0` to require an explicit DSN. The Docker
+path is same-host only; it never uses a hosted database endpoint.
+
 The script always writes
 `benchmarks/results/latest/tpcb_certification.json`. It passes only when both
 same-host 32-client PostgreSQL-wire result artifacts exist, both engines pass
 the TPC-B balance-sum correctness check, UltraSQL throughput is at least 2×
 PostgreSQL 17, and UltraSQL p99 latency is below 5 ms. If `ULTRASQL_DSN` is
 not set, the script starts an in-process UltraSQL server and measures it over
-`tokio-postgres`; PostgreSQL requires `POSTGRES_DSN` or a pre-existing
-`POSTGRES_TPCB_RESULT`. When neither is present the script writes
+`tokio-postgres`; PostgreSQL uses the explicit DSN/result first, then local
+Docker if available. When no PostgreSQL path is available the script writes
 `reason: "postgres_dsn_missing"` and exits with code 2 so full certification
 manifests mark the suite unavailable instead of spending the run budget on a
 non-certifying UltraSQL-only measurement. `TPCB_SCALE`, `TPCB_DURATION`,
 `TPCB_WARMUP`, `TPCB_CONNECTIONS`, and `TPCB_ACCOUNTS` control local smoke
 versus publishable runs.
+
+UltraSQL and PostgreSQL raw artifacts are written through temporary files and
+renamed into place only after the benchmark command succeeds. A failed current
+run therefore cannot accidentally reuse a stale previous JSON artifact.
 
 For local UltraSQL-only smoke, set `TPCB_ALLOW_ULTRASQL_ONLY=1` alongside
 small shape controls such as `TPCB_CONNECTIONS=8`, `TPCB_ACCOUNTS=1000`,

@@ -1691,7 +1691,7 @@ behavior are implemented and validated.
   interoperability remains pending.
 - [x] `pg_ctl` equivalent: `initdb`, `start`, `stop`, `reload`, `status`, `promote` — `ultrasql --ctl ...`; start/stop delegate to service manager instead of daemonizing
 - [x] `pg_isready` equivalent — `ultrasql --isready`
-- [ ] `pgbench` compatible baseline (default TPC-B transactions) — local `tpcb_32conn` kernel stage gate + `benchmarks/tpcb_certify.sh`; same-host PostgreSQL-wire certification still open
+- [ ] `pgbench` compatible baseline (default TPC-B transactions) — local `tpcb_32conn` kernel stage gate + `benchmarks/tpcb_certify.sh`; same-host PostgreSQL 17 reduced smoke now runs through Docker, but full target remains open
 - [ ] `pg_waldump` equivalent (WAL inspection CLI) — `ultrasql --waldump PATH` emits deterministic offset/hex dump; semantic WAL record decoding pending
 
 ### Milestone
@@ -1918,7 +1918,7 @@ same host.
   while `HeapAccess::column_cache` supplies the OLAP shadow path.
   `columnar_storage_round_trip.rs` now covers committed DML invalidation,
   rebuild, and update/delete/insert visibility after cache rebuild.
-- [ ] TPC-B: correctness verified, throughput ≥ 2× PostgreSQL, p99 < 5 ms at 32 connections — `benchmarks/tpcb_certify.sh` exists and the wire harness now validates UltraSQL balance invariants with indexed TPC-B tables; latest local reduced smoke is correct at 986.20 tx/s, but p99 is 39.884 ms and PostgreSQL 17 comparison is still missing, so certification remains open.
+- [ ] TPC-B: correctness verified, throughput ≥ 2× PostgreSQL, p99 < 5 ms at 32 connections — `benchmarks/tpcb_certify.sh` now auto-starts local Docker `postgres:17` when no DSN is supplied and writes atomic raw artifacts. Latest reduced 32-connection smoke is correct for both engines, but target still fails: UltraSQL 665.99 tx/s vs PostgreSQL 419.54 tx/s (1.59×, below 2×) and UltraSQL p99 is 531.381 ms (above 5 ms), so certification remains open.
 - [ ] TPC-C: correctness verified (all 5 transaction types), throughput ≥ 2× PostgreSQL
 - [x] TPC-H scale 1: all 22 harness queries return correct results
 - [ ] TPC-H scale 1: throughput ≥ 2× PostgreSQL 17
