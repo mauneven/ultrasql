@@ -498,6 +498,7 @@ impl IndexFixture {
             work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(
                 u64::MAX,
             )),
+            profile_operators: false,
         }
     }
 }

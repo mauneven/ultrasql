@@ -547,6 +547,10 @@ impl Operator for SortAggregate {
     fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.child.as_ref()]
+    }
 }
 
 impl SortAggregate {

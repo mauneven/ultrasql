@@ -97,6 +97,14 @@ impl Operator for Gather {
     fn estimated_row_count(&self) -> Option<usize> {
         self.row_hint
     }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        self.children
+            .iter()
+            .filter_map(std::option::Option::as_ref)
+            .map(std::convert::AsRef::as_ref)
+            .collect()
+    }
 }
 
 /// K-way ordered fan-in for sorted parallel worker streams.
@@ -208,6 +216,13 @@ impl Operator for GatherMerge {
 
     fn estimated_row_count(&self) -> Option<usize> {
         self.row_hint
+    }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        self.children
+            .iter()
+            .map(|child| child.input.as_ref())
+            .collect()
     }
 }
 

@@ -220,6 +220,64 @@ async fn explain_analyze_reports_runtime_evidence() {
     shutdown(client, server_handle).await;
 }
 
+/// `EXPLAIN ANALYZE` exposes one metrics row per physical operator so
+/// performance regressions have counters below the statement summary.
+#[tokio::test]
+async fn explain_analyze_reports_operator_metrics() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE t_metrics (id INT NOT NULL, payload TEXT)")
+        .await
+        .expect("create");
+    client
+        .batch_execute(
+            "INSERT INTO t_metrics VALUES
+                (0, 'payload-0'),
+                (1, 'payload-1'),
+                (2, 'payload-2'),
+                (3, 'payload-3'),
+                (4, 'payload-4'),
+                (5, 'payload-5'),
+                (6, 'payload-6'),
+                (7, 'payload-7')",
+        )
+        .await
+        .expect("seed");
+
+    let rows = client
+        .query(
+            "EXPLAIN ANALYZE SELECT id FROM t_metrics WHERE id > 1 ORDER BY id LIMIT 2",
+            &[],
+        )
+        .await
+        .expect("EXPLAIN ANALYZE");
+    let text = collect_plan_text(&rows);
+
+    for required in [
+        "Operator Metrics:",
+        "operator=Limit",
+        "operator=Sort",
+        "operator=Filter",
+        "operator=Seq Scan",
+        "rows_in=",
+        "rows_out=",
+        "batches=",
+        "time_us=",
+        "memory_bytes=",
+        "spills=",
+        "io_bytes=",
+        "pruning=",
+    ] {
+        assert!(
+            text.contains(required),
+            "EXPLAIN ANALYZE missing {required:?}, got: {text}"
+        );
+    }
+
+    shutdown(client, server_handle).await;
+}
+
 /// When an indexed predicate feeds a projection that needs non-index
 /// payload columns, `EXPLAIN ANALYZE` reports the late-materialization
 /// prototype: B-tree TID probe first, heap payload fetch after candidate

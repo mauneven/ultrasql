@@ -22,7 +22,7 @@ use crate::filter_op::batch_to_rows;
 use crate::seq_scan::build_batch;
 use crate::sort::{Sort, compare_values_nullable};
 use crate::work_mem::WorkMemBudget;
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, OperatorSpillProfile};
 
 const BATCH_TARGET_ROWS: usize = 4096;
 
@@ -196,6 +196,28 @@ impl Operator for TopK {
 
     fn estimated_row_count(&self) -> Option<usize> {
         Some(self.cap)
+    }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        if let Some(delegate) = &self.spill_delegate {
+            delegate.sort.profile_children()
+        } else {
+            vec![self.child.as_ref()]
+        }
+    }
+
+    fn spill_profile(&self) -> OperatorSpillProfile {
+        self.spill_delegate
+            .as_ref()
+            .map_or_else(OperatorSpillProfile::default, |delegate| {
+                delegate.sort.spill_profile()
+            })
+    }
+
+    fn io_bytes(&self) -> u64 {
+        self.spill_delegate
+            .as_ref()
+            .map_or(0, |delegate| delegate.sort.io_bytes())
     }
 }
 

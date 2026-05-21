@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ultrasql_core::{RelationId, Schema, Value, constants::PAGE_SIZE};
 use ultrasql_executor::unique::UniqueMode;
 use ultrasql_executor::{
-    Filter, HashAggregate, Limit, Operator, ResultOp, Sort, Unique, ValuesScan,
+    Filter, HashAggregate, Limit, Operator, ProfiledOperator, ResultOp, Sort, Unique, ValuesScan,
 };
 use ultrasql_planner::{LogicalPlan, ScalarExpr};
 use ultrasql_vec::Batch;
@@ -57,6 +57,21 @@ use super::tpch_q21::try_lower_tpch_q21;
 use super::{CteBuffer, LowerCtx};
 
 pub fn lower_query(
+    plan: &LogicalPlan,
+    ctx: &LowerCtx<'_>,
+) -> Result<Box<dyn Operator>, ServerError> {
+    let op = lower_query_inner(plan, ctx)?;
+    if ctx.profile_operators {
+        Ok(Box::new(ProfiledOperator::new(
+            profile_operator_name(plan),
+            op,
+        )))
+    } else {
+        Ok(op)
+    }
+}
+
+fn lower_query_inner(
     plan: &LogicalPlan,
     ctx: &LowerCtx<'_>,
 ) -> Result<Box<dyn Operator>, ServerError> {
@@ -514,6 +529,55 @@ pub fn lower_query(
     }
 }
 
+fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
+    match plan {
+        LogicalPlan::Scan { .. } => "Seq Scan",
+        LogicalPlan::Filter { .. } => "Filter",
+        LogicalPlan::Project { .. } => "Result",
+        LogicalPlan::Limit { .. } => "Limit",
+        LogicalPlan::Sort { .. } => "Sort",
+        LogicalPlan::Join { .. } => "Hash Join",
+        LogicalPlan::Aggregate { .. } => "Aggregate",
+        LogicalPlan::Values { .. } => "Values Scan",
+        LogicalPlan::SetOp { .. } => "Set Op",
+        LogicalPlan::Cte { .. } => "CTE",
+        LogicalPlan::LockRows { .. } => "LockRows",
+        LogicalPlan::FunctionScan { .. } => "Function Scan",
+        LogicalPlan::Window { .. } => "WindowAgg",
+        LogicalPlan::Insert { .. } => "Insert",
+        LogicalPlan::Update { .. } => "Update",
+        LogicalPlan::Delete { .. } => "Delete",
+        LogicalPlan::Empty { .. } => "Empty",
+        LogicalPlan::Truncate { .. } => "Truncate",
+        LogicalPlan::CreateTable { .. } => "CreateTable",
+        LogicalPlan::CreateMaterializedView { .. } => "CreateMaterializedView",
+        LogicalPlan::CreateIndex { .. } => "CreateIndex",
+        LogicalPlan::CreatePolicy { .. } => "CreatePolicy",
+        LogicalPlan::DropTable { .. } => "DropTable",
+        LogicalPlan::AlterTable { .. } => "AlterTable",
+        LogicalPlan::CreateSequence { .. } => "CreateSequence",
+        LogicalPlan::AlterSequence { .. } => "AlterSequence",
+        LogicalPlan::DropSequence { .. } => "DropSequence",
+        LogicalPlan::Comment { .. } => "Comment",
+        LogicalPlan::Begin { .. } => "Begin",
+        LogicalPlan::Commit { .. } => "Commit",
+        LogicalPlan::Rollback { .. } => "Rollback",
+        LogicalPlan::Savepoint { .. } => "Savepoint",
+        LogicalPlan::RollbackToSavepoint { .. } => "RollbackToSavepoint",
+        LogicalPlan::ReleaseSavepoint { .. } => "ReleaseSavepoint",
+        LogicalPlan::PrepareTransaction { .. } => "PrepareTransaction",
+        LogicalPlan::CommitPrepared { .. } => "CommitPrepared",
+        LogicalPlan::RollbackPrepared { .. } => "RollbackPrepared",
+        LogicalPlan::SetTransaction { .. } => "SetTransaction",
+        LogicalPlan::SetVariable { .. } => "SetVariable",
+        LogicalPlan::Explain { .. } => "Explain",
+        LogicalPlan::Listen { .. } => "Listen",
+        LogicalPlan::Notify { .. } => "Notify",
+        LogicalPlan::Unlisten { .. } => "Unlisten",
+        LogicalPlan::Copy { .. } => "Copy",
+    }
+}
+
 fn rewrite_catalog_scalar_functions(
     exprs: &[(ScalarExpr, String)],
     ctx: &super::LowerCtx<'_>,
@@ -766,6 +830,7 @@ pub(super) fn lower_cte(
         jit: ctx.jit,
         cancel_flag: ctx.cancel_flag.clone(),
         work_mem: std::sync::Arc::clone(&ctx.work_mem),
+        profile_operators: ctx.profile_operators,
     };
 
     lower_query(body, &child_ctx)

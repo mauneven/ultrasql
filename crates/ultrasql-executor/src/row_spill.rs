@@ -112,6 +112,11 @@ impl RowSpillFile {
         }
         Ok(())
     }
+
+    /// Bytes written to this spill file, including record-length prefixes.
+    pub(crate) const fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 /// Return encoded row bytes including the record-length prefix.

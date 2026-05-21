@@ -150,6 +150,10 @@ impl Operator for NestedLoopJoin {
     fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.left.as_ref()]
+    }
 }
 
 impl NestedLoopJoin {

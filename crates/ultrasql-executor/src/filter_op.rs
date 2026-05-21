@@ -271,6 +271,10 @@ impl Operator for Filter {
             .clamp(1.0, child_rows as f64);
         Some(estimated.to_usize().unwrap_or(child_rows))
     }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.child.as_ref()]
+    }
 }
 
 fn estimate_predicate_selectivity(expr: &ScalarExpr) -> f64 {

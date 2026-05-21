@@ -1721,6 +1721,7 @@ impl Server {
             },
             cancel_flag: None,
             work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+            profile_operators: false,
         };
         let outcome = (|| {
             let mut op = pipeline::lower_query(&plan, &ctx)?;
@@ -3045,6 +3046,7 @@ fn run_plan_in_txn(
         jit,
         cancel_flag,
         work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+        profile_operators: false,
     };
     match plan {
         LogicalPlan::Insert { returning, .. } => {

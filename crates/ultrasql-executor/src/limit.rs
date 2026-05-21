@@ -124,6 +124,10 @@ impl Operator for Limit {
     fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.child.as_ref()]
+    }
 }
 
 /// Build a new [`Batch`] containing rows `[start, end)` of `input`.

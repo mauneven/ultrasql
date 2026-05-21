@@ -253,6 +253,10 @@ impl Operator for SetOp {
     fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.left.as_ref(), self.right.as_ref()]
+    }
 }
 
 impl SetOp {

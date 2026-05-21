@@ -41,7 +41,7 @@ use crate::row_codec::RowCodec;
 use crate::row_spill::RowSpillFile;
 use crate::seq_scan::build_batch;
 use crate::work_mem::WorkMemBudget;
-use crate::{CancelFlag, ExecError, Operator};
+use crate::{CancelFlag, ExecError, Operator, OperatorSpillProfile};
 
 /// Maximum rows per emitted batch, matching the `ARCHITECTURE.md` section 9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -246,6 +246,10 @@ pub struct HashAggregate {
     work_mem: Option<Arc<WorkMemBudget>>,
     /// Whether this execution wrote input partitions to temp storage.
     spilled_to_disk: bool,
+    /// Number of hash partitions spilled during the build phase.
+    spill_partition_count: u64,
+    /// Bytes written to hash-aggregate spill partitions.
+    spill_bytes: u64,
     /// When `true`, the build phase skips the column-oriented fast path
     /// and uses the row-at-a-time scalar loop. Test-only knob used by
     /// the cross-validation tests; production callers leave it `false`.
@@ -281,6 +285,8 @@ impl HashAggregate {
             cancel_flag: None,
             work_mem: None,
             spilled_to_disk: false,
+            spill_partition_count: 0,
+            spill_bytes: 0,
             #[cfg(test)]
             force_scalar_path: false,
         }
@@ -350,6 +356,21 @@ impl Operator for HashAggregate {
 
     fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.child.as_ref()]
+    }
+
+    fn spill_profile(&self) -> OperatorSpillProfile {
+        OperatorSpillProfile {
+            spills: self.spill_partition_count,
+            bytes: self.spill_bytes,
+        }
+    }
+
+    fn io_bytes(&self) -> u64 {
+        self.spill_bytes.saturating_mul(2)
     }
 }
 
@@ -574,6 +595,13 @@ impl HashAggregate {
         if !saw_any_row {
             return Ok(Vec::new());
         }
+
+        self.spill_partition_count =
+            u64::try_from(partitions.iter().filter(|p| p.is_some()).count()).unwrap_or(u64::MAX);
+        self.spill_bytes = partitions
+            .iter()
+            .filter_map(std::option::Option::as_ref)
+            .fold(0_u64, |acc, spill| acc.saturating_add(spill.bytes()));
 
         let mut output = Vec::new();
         for partition in partitions.into_iter().flatten() {

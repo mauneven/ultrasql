@@ -479,6 +479,7 @@ where
                     work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(
                         u64::MAX,
                     )),
+                    profile_operators: false,
                 };
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
@@ -562,6 +563,7 @@ where
                     work_mem: std::sync::Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(
                         u64::MAX,
                     )),
+                    profile_operators: false,
                 };
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);

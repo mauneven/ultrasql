@@ -124,7 +124,7 @@ where
                 rows: scan.rows,
                 batches: scan.batches,
                 peak_output_memory_bytes: scan.peak_output_memory_bytes,
-                disk_spill: DiskSpillSummary::none(),
+                disk_spill: DiskSpillSummary::from_profile(scan.operator_profile.as_ref()),
                 elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
                 simd_kernel: notes.simd_kernel,
                 index_decision: notes.index_decision,
@@ -134,6 +134,7 @@ where
                 pushdowns_applied: notes.pushdowns_applied,
                 parquet_row_groups: notes.parquet_row_groups,
                 parquet_columns_read: notes.parquet_columns_read,
+                operator_profile: scan.operator_profile,
             });
         }
 
@@ -189,6 +190,7 @@ where
             pushdowns_applied: notes.pushdowns_applied,
             parquet_row_groups: notes.parquet_row_groups,
             parquet_columns_read: notes.parquet_columns_read,
+            operator_profile: None,
         })
     }
 
@@ -221,9 +223,12 @@ where
                 jit: self.jit_config(),
                 cancel_flag: Some(self.cancel_flag.clone()),
                 work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+                profile_operators: true,
             };
             let mut op = crate::pipeline::lower_query(inner, &ctx)?;
-            drain_explain_operator(op.as_mut())
+            let mut actuals = drain_explain_operator(op.as_mut())?;
+            actuals.operator_profile = op.runtime_profile();
+            Ok(actuals)
         })();
 
         match outcome {
@@ -426,6 +431,7 @@ where
                 jit: self.jit_config(),
                 cancel_flag: Some(self.cancel_flag.clone()),
                 work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+                profile_operators: false,
             };
             crate::pipeline::late_materialization_summary_for_plan(plan, &ctx)
         };
@@ -461,12 +467,14 @@ struct ExplainActuals {
     pushdowns_applied: Vec<String>,
     parquet_row_groups: Option<crate::pipeline::ParquetRowGroupSummary>,
     parquet_columns_read: Option<Vec<String>>,
+    operator_profile: Option<ultrasql_executor::OperatorRuntimeProfile>,
 }
 
 struct ExplainScanActuals {
     rows: u64,
     batches: u64,
     peak_output_memory_bytes: u64,
+    operator_profile: Option<ultrasql_executor::OperatorRuntimeProfile>,
 }
 
 struct ExplainNotes {
@@ -492,6 +500,22 @@ impl DiskSpillSummary {
             used: false,
             bytes: 0,
             reason: "no executor spill path reported disk writes",
+        }
+    }
+
+    fn from_profile(profile: Option<&ultrasql_executor::OperatorRuntimeProfile>) -> Self {
+        let Some(profile) = profile else {
+            return Self::none();
+        };
+        let (spills, bytes) = profile_spill_totals(profile);
+        if spills == 0 {
+            Self::none()
+        } else {
+            Self {
+                used: true,
+                bytes,
+                reason: "operator profile reported spill files",
+            }
         }
     }
 }
@@ -536,6 +560,10 @@ fn render_text(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
             format_parquet_row_groups(a.parquet_row_groups),
             format_parquet_columns_read(a.parquet_columns_read.as_deref())
         ));
+        if let Some(profile) = &a.operator_profile {
+            body.push_str("Operator Metrics:\n");
+            write_operator_metrics_text(profile, 1, &mut body);
+        }
     }
     body
 }
@@ -576,7 +604,8 @@ fn render_json(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
              \n    \"Aggregating Index\": \"{}\",\
              \n    \"Pushdowns Applied\": {},\
              \n    \"Parquet Row Groups\": {},\
-             \n    \"Parquet Columns Read\": {}",
+             \n    \"Parquet Columns Read\": {},\
+             \n    \"Operator Metrics\": {}",
             a.elapsed_ms,
             a.rows,
             a.batches,
@@ -591,7 +620,8 @@ fn render_json(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
             json_escape(&a.aggregating_index),
             pushdowns,
             format_parquet_row_groups_json(a.parquet_row_groups),
-            format_parquet_columns_read_json(a.parquet_columns_read.as_deref())
+            format_parquet_columns_read_json(a.parquet_columns_read.as_deref()),
+            format_operator_metrics_json(a.operator_profile.as_ref())
         ));
     }
     buf.push_str("\n  }\n]");
@@ -721,6 +751,7 @@ fn drain_explain_operator(op: &mut dyn Operator) -> Result<ExplainScanActuals, S
         rows,
         batches,
         peak_output_memory_bytes,
+        operator_profile: None,
     })
 }
 
@@ -748,6 +779,86 @@ fn estimate_column_memory(column: &Column) -> usize {
 
 fn bitmap_bytes(bitmap: Option<&ultrasql_vec::Bitmap>) -> usize {
     bitmap.map_or(0, |bits| bits.len().div_ceil(8))
+}
+
+fn write_operator_metrics_text(
+    profile: &ultrasql_executor::OperatorRuntimeProfile,
+    depth: usize,
+    out: &mut String,
+) {
+    let indent = "  ".repeat(depth);
+    let pruning = if profile.pruning.is_empty() {
+        "none".to_owned()
+    } else {
+        profile.pruning.join(",")
+    };
+    out.push_str(&format!(
+        "{indent}operator={} rows_in={} rows_out={} batches={} time_us={} \
+         memory_bytes={} spills={} spill_bytes={} io_bytes={} pruning={}\n",
+        profile.operator,
+        profile.rows_in,
+        profile.rows_out,
+        profile.batches,
+        profile.time_us,
+        profile.memory_bytes,
+        profile.spills,
+        profile.spill_bytes,
+        profile.io_bytes,
+        pruning
+    ));
+    for child in &profile.children {
+        write_operator_metrics_text(child, depth + 1, out);
+    }
+}
+
+fn format_operator_metrics_json(
+    profile: Option<&ultrasql_executor::OperatorRuntimeProfile>,
+) -> String {
+    profile.map_or_else(|| "null".to_owned(), operator_profile_json)
+}
+
+fn operator_profile_json(profile: &ultrasql_executor::OperatorRuntimeProfile) -> String {
+    let pruning = profile
+        .pruning
+        .iter()
+        .map(|entry| format!("\"{}\"", json_escape(entry)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let children = profile
+        .children
+        .iter()
+        .map(operator_profile_json)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{{\"Operator\":\"{}\",\"Rows In\":{},\"Rows Out\":{},\"Batches\":{},\
+         \"Time Us\":{},\"Memory Bytes\":{},\"Spills\":{},\"Spill Bytes\":{},\
+         \"IO Bytes\":{},\"Pruning\":[{}],\"Children\":[{}]}}",
+        json_escape(&profile.operator),
+        profile.rows_in,
+        profile.rows_out,
+        profile.batches,
+        profile.time_us,
+        profile.memory_bytes,
+        profile.spills,
+        profile.spill_bytes,
+        profile.io_bytes,
+        pruning,
+        children
+    )
+}
+
+fn profile_spill_totals(profile: &ultrasql_executor::OperatorRuntimeProfile) -> (u64, u64) {
+    profile.children.iter().fold(
+        (profile.spills, profile.spill_bytes),
+        |(spills, bytes), child| {
+            let (child_spills, child_bytes) = profile_spill_totals(child);
+            (
+                spills.saturating_add(child_spills),
+                bytes.saturating_add(child_bytes),
+            )
+        },
+    )
 }
 
 fn first_filter_scan_column(plan: &LogicalPlan) -> Option<(&str, usize)> {

@@ -51,7 +51,7 @@ use crate::filter_op::batch_to_rows;
 use crate::row_codec::RowCodec;
 use crate::seq_scan::build_batch;
 use crate::work_mem::{WorkMemBudget, temp_file_limit};
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, OperatorSpillProfile};
 
 /// Maximum rows per emitted batch, matching the `ARCHITECTURE.md` section 9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -430,6 +430,24 @@ impl Operator for HashJoin {
 
     fn schema(&self) -> &Schema {
         &self.schema
+    }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.left.as_ref(), self.right.as_ref()]
+    }
+
+    fn spill_profile(&self) -> OperatorSpillProfile {
+        if !self.spilled_to_disk {
+            return OperatorSpillProfile::default();
+        }
+        OperatorSpillProfile {
+            spills: 1,
+            bytes: self.spill.as_ref().map_or(0, |spill| spill.bytes),
+        }
+    }
+
+    fn io_bytes(&self) -> u64 {
+        self.spill_profile().bytes.saturating_mul(2)
     }
 }
 

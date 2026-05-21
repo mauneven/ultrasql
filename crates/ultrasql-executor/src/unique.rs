@@ -248,6 +248,10 @@ impl Operator for Unique {
     fn estimated_row_count(&self) -> Option<usize> {
         self.child.estimated_row_count()
     }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.child.as_ref()]
+    }
 }
 
 impl Unique {

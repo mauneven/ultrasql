@@ -101,6 +101,10 @@ impl Operator for LockRows {
     fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.child.as_ref()]
+    }
 }
 
 #[cfg(test)]

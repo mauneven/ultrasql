@@ -269,6 +269,12 @@ pub struct LowerCtx<'a> {
     /// (`ultrasql_executor::work_mem::temp_file_limit`) caps temp-file bytes
     /// each spill writer may generate.
     pub work_mem: std::sync::Arc<ultrasql_executor::work_mem::WorkMemBudget>,
+    /// Wrap every lowered physical node in a runtime profiler.
+    ///
+    /// This is enabled for `EXPLAIN ANALYZE` only. Normal query execution
+    /// keeps direct operators so benchmark and production paths avoid
+    /// profiling overhead.
+    pub profile_operators: bool,
 }
 
 /// Materialised non-recursive CTE binding.

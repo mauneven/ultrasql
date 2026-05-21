@@ -28,7 +28,7 @@ use crate::row_codec::RowCodec;
 use crate::row_spill::{RowSpillFile, encoded_row_bytes};
 use crate::seq_scan::build_batch;
 use crate::work_mem::WorkMemBudget;
-use crate::{ExecError, Operator};
+use crate::{ExecError, Operator, OperatorSpillProfile};
 
 /// Maximum rows per emitted batch, matching the `ARCHITECTURE.md` §9 contract.
 const BATCH_TARGET_ROWS: usize = 4096;
@@ -167,6 +167,28 @@ impl Operator for Sort {
     fn schema(&self) -> &Schema {
         &self.schema
     }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.child.as_ref()]
+    }
+
+    fn spill_profile(&self) -> OperatorSpillProfile {
+        if !self.spilled_to_disk {
+            return OperatorSpillProfile::default();
+        }
+        self.external.as_ref().map_or(
+            OperatorSpillProfile {
+                spills: 1,
+                bytes: 0,
+            },
+            ExternalSortCursor::spill_profile,
+        )
+    }
+
+    fn io_bytes(&self) -> u64 {
+        let spill = self.spill_profile();
+        spill.bytes.saturating_mul(2)
+    }
 }
 
 impl Sort {
@@ -301,6 +323,16 @@ impl ExternalSortCursor {
             }
         }
         best
+    }
+
+    fn spill_profile(&self) -> OperatorSpillProfile {
+        self.runs
+            .iter()
+            .fold(OperatorSpillProfile::default(), |mut acc, run| {
+                acc.spills = acc.spills.saturating_add(1);
+                acc.bytes = acc.bytes.saturating_add(run.spill.bytes());
+                acc
+            })
     }
 }
 

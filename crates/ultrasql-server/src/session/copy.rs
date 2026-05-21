@@ -1092,6 +1092,7 @@ where
             jit: self.jit_config(),
             cancel_flag: Some(self.cancel_flag.clone()),
             work_mem: Arc::new(ultrasql_executor::work_mem::WorkMemBudget::new(u64::MAX)),
+            profile_operators: false,
         };
         let result = match crate::pipeline::lower_query(input, &ctx)
             .and_then(|mut op| crate::result_encoder::run_select(op.as_mut()))

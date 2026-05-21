@@ -89,6 +89,7 @@ pub mod modify;
 mod nested_loop_join;
 pub mod parallel_seq_scan;
 pub mod physical;
+mod profile;
 mod project;
 pub mod project_expr;
 pub mod push_pipeline;
@@ -138,6 +139,7 @@ pub use modify::{
 };
 pub use nested_loop_join::{NestedLoopJoin, RightFactory};
 pub use parallel_seq_scan::{ParallelSeqScan, choose_parallel_seq_scan_workers};
+pub use profile::{OperatorRuntimeProfile, OperatorSpillProfile, ProfiledOperator};
 pub use project::Project;
 pub use project_expr::ProjectExprs;
 pub use result_op::ResultOp;
@@ -351,6 +353,39 @@ pub trait Operator: Send + Debug {
     /// violation — the encoder grows past the reservation as usual.
     fn estimated_row_count(&self) -> Option<usize> {
         None
+    }
+
+    /// Child operators whose runtime profiles should be nested under
+    /// this operator in `EXPLAIN ANALYZE`.
+    ///
+    /// Implementations only expose owned physical children. Leaf
+    /// operators keep the default empty list.
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        Vec::new()
+    }
+
+    /// Runtime profile collected by an opt-in profiling wrapper.
+    ///
+    /// Plain operators return `None`; [`ProfiledOperator`] returns the
+    /// measured counters and recursively asks any exposed children for
+    /// their profiles.
+    fn runtime_profile(&self) -> Option<OperatorRuntimeProfile> {
+        None
+    }
+
+    /// Disk-spill counters for operators with a bounded-memory fallback.
+    fn spill_profile(&self) -> OperatorSpillProfile {
+        OperatorSpillProfile::default()
+    }
+
+    /// Operator-owned IO bytes when directly attributable.
+    fn io_bytes(&self) -> u64 {
+        0
+    }
+
+    /// Pruning notes for scans or indexes.
+    fn pruning_stats(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 

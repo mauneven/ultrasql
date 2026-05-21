@@ -88,6 +88,10 @@ impl Operator for ProjectExprs {
     fn estimated_row_count(&self) -> Option<usize> {
         self.child.estimated_row_count()
     }
+
+    fn profile_children(&self) -> Vec<&dyn Operator> {
+        vec![self.child.as_ref()]
+    }
 }
 
 /// Assemble a column-oriented batch column from a column-major
