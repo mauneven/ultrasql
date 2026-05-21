@@ -133,6 +133,7 @@ where
                 aggregating_index: notes.aggregating_index,
                 pushdowns_applied: notes.pushdowns_applied,
                 parquet_row_groups: notes.parquet_row_groups,
+                parquet_columns_read: notes.parquet_columns_read,
             });
         }
 
@@ -187,6 +188,7 @@ where
             aggregating_index: notes.aggregating_index,
             pushdowns_applied: notes.pushdowns_applied,
             parquet_row_groups: notes.parquet_row_groups,
+            parquet_columns_read: notes.parquet_columns_read,
         })
     }
 
@@ -257,6 +259,7 @@ where
             ),
             pushdowns_applied: pushdown_notes(plan),
             parquet_row_groups: parquet_row_group_note(plan),
+            parquet_columns_read: parquet_columns_read_note(plan),
         }
     }
 
@@ -457,6 +460,7 @@ struct ExplainActuals {
     aggregating_index: String,
     pushdowns_applied: Vec<String>,
     parquet_row_groups: Option<crate::pipeline::ParquetRowGroupSummary>,
+    parquet_columns_read: Option<Vec<String>>,
 }
 
 struct ExplainScanActuals {
@@ -473,6 +477,7 @@ struct ExplainNotes {
     aggregating_index: String,
     pushdowns_applied: Vec<String>,
     parquet_row_groups: Option<crate::pipeline::ParquetRowGroupSummary>,
+    parquet_columns_read: Option<Vec<String>>,
 }
 
 struct DiskSpillSummary {
@@ -513,7 +518,8 @@ fn render_text(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
              Late Materialization: {}\n\
              Aggregating Index: {}\n\
              Pushdowns Applied: {}\n\
-             Parquet Row Groups: {}\n",
+             Parquet Row Groups: {}\n\
+             Parquet Columns Read: {}\n",
             a.elapsed_ms,
             a.rows,
             a.batches,
@@ -527,7 +533,8 @@ fn render_text(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
             a.late_materialization,
             a.aggregating_index,
             pushdowns,
-            format_parquet_row_groups(a.parquet_row_groups)
+            format_parquet_row_groups(a.parquet_row_groups),
+            format_parquet_columns_read(a.parquet_columns_read.as_deref())
         ));
     }
     body
@@ -568,7 +575,8 @@ fn render_json(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
              \n    \"Late Materialization\": \"{}\",\
              \n    \"Aggregating Index\": \"{}\",\
              \n    \"Pushdowns Applied\": {},\
-             \n    \"Parquet Row Groups\": {}",
+             \n    \"Parquet Row Groups\": {},\
+             \n    \"Parquet Columns Read\": {}",
             a.elapsed_ms,
             a.rows,
             a.batches,
@@ -582,7 +590,8 @@ fn render_json(plan: &LogicalPlan, actuals: Option<&ExplainActuals>) -> String {
             json_escape(&a.late_materialization),
             json_escape(&a.aggregating_index),
             pushdowns,
-            format_parquet_row_groups_json(a.parquet_row_groups)
+            format_parquet_row_groups_json(a.parquet_row_groups),
+            format_parquet_columns_read_json(a.parquet_columns_read.as_deref())
         ));
     }
     buf.push_str("\n  }\n]");
@@ -953,10 +962,27 @@ fn parquet_row_group_note(plan: &LogicalPlan) -> Option<crate::pipeline::Parquet
     }
 }
 
+fn parquet_columns_read_note(plan: &LogicalPlan) -> Option<Vec<String>> {
+    match crate::pipeline::parquet_columns_read_for_plan(plan) {
+        Ok(columns) => columns,
+        Err(err) => {
+            tracing::warn!(error = %err, "EXPLAIN ANALYZE parquet columns_read summary failed");
+            None
+        }
+    }
+}
+
 fn format_parquet_row_groups(summary: Option<crate::pipeline::ParquetRowGroupSummary>) -> String {
     summary.map_or_else(
         || "not applicable".to_owned(),
         |summary| format!("scanned={} skipped={}", summary.scanned, summary.skipped),
+    )
+}
+
+fn format_parquet_columns_read(columns: Option<&[String]>) -> String {
+    columns.map_or_else(
+        || "not applicable".to_owned(),
+        |columns| format!("columns_read={} count={}", columns.join(","), columns.len()),
     )
 }
 
@@ -970,6 +996,20 @@ fn format_parquet_row_groups_json(
                 "{{\"Scanned\": {}, \"Skipped\": {}}}",
                 summary.scanned, summary.skipped
             )
+        },
+    )
+}
+
+fn format_parquet_columns_read_json(columns: Option<&[String]>) -> String {
+    columns.map_or_else(
+        || "null".to_owned(),
+        |columns| {
+            let quoted = columns
+                .iter()
+                .map(|column| format!("\"{}\"", json_escape(column)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{\"Columns\": [{quoted}], \"Count\": {}}}", columns.len())
         },
     )
 }

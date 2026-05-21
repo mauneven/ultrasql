@@ -763,6 +763,15 @@ pub(crate) fn parquet_row_group_summary_for_plan(
     Ok(summary)
 }
 
+/// Summarize physical Parquet columns read by a lowered plan shape.
+pub(crate) fn parquet_columns_read_for_plan(
+    plan: &LogicalPlan,
+) -> Result<Option<Vec<String>>, ServerError> {
+    let mut columns = None;
+    collect_parquet_columns_read(plan, &mut columns)?;
+    Ok(columns)
+}
+
 fn collect_parquet_row_group_summary(
     plan: &LogicalPlan,
     summary: &mut Option<ParquetRowGroupSummary>,
@@ -805,6 +814,74 @@ fn collect_parquet_row_group_summary(
     }
 }
 
+fn collect_parquet_columns_read(
+    plan: &LogicalPlan,
+    columns: &mut Option<Vec<String>>,
+) -> Result<(), ServerError> {
+    match plan {
+        LogicalPlan::Project { input, exprs, .. } => {
+            let projection = projection_names_from_exprs(exprs);
+            match input.as_ref() {
+                LogicalPlan::FunctionScan { name, args, .. } if name == "read_parquet" => {
+                    add_parquet_columns_read(args, projection.as_deref(), None, columns)?;
+                    Ok(())
+                }
+                LogicalPlan::Filter {
+                    input, predicate, ..
+                } => {
+                    if let LogicalPlan::FunctionScan { name, args, .. } = input.as_ref()
+                        && name == "read_parquet"
+                    {
+                        let pushed = ParquetPredicate::from_scalar(predicate);
+                        add_parquet_columns_read(
+                            args,
+                            projection.as_deref(),
+                            pushed.as_ref(),
+                            columns,
+                        )?;
+                        return Ok(());
+                    }
+                    collect_parquet_columns_read(input, columns)
+                }
+                _ => collect_parquet_columns_read(input, columns),
+            }
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            if let LogicalPlan::FunctionScan { name, args, .. } = input.as_ref()
+                && name == "read_parquet"
+            {
+                let pushed = ParquetPredicate::from_scalar(predicate);
+                add_parquet_columns_read(args, None, pushed.as_ref(), columns)?;
+                return Ok(());
+            }
+            collect_parquet_columns_read(input, columns)
+        }
+        LogicalPlan::FunctionScan { name, args, .. } if name == "read_parquet" => {
+            add_parquet_columns_read(args, None, None, columns)
+        }
+        LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::LockRows { input, .. }
+        | LogicalPlan::Explain { input, .. }
+        | LogicalPlan::Update { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::Delete { input, .. } => collect_parquet_columns_read(input, columns),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            collect_parquet_columns_read(left, columns)?;
+            collect_parquet_columns_read(right, columns)
+        }
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => {
+            collect_parquet_columns_read(definition, columns)?;
+            collect_parquet_columns_read(body, columns)
+        }
+        LogicalPlan::Insert { source, .. } => collect_parquet_columns_read(source, columns),
+        _ => Ok(()),
+    }
+}
+
 fn add_parquet_function_summary(
     args: &[ScalarExpr],
     predicate: Option<&ParquetPredicate>,
@@ -816,6 +893,26 @@ fn add_parquet_function_summary(
         summary.add(next);
     } else {
         *summary = Some(next);
+    }
+    Ok(())
+}
+
+fn add_parquet_columns_read(
+    args: &[ScalarExpr],
+    projection: Option<&[String]>,
+    predicate: Option<&ParquetPredicate>,
+    columns: &mut Option<Vec<String>>,
+) -> Result<(), ServerError> {
+    let path_specs = super::external_scan::read_external_path_specs("read_parquet", args)?;
+    let mut next = parquet_columns_read_for_path_specs(&path_specs, projection, predicate)?;
+    if let Some(columns) = columns {
+        columns.append(&mut next);
+        columns.sort();
+        columns.dedup();
+    } else {
+        next.sort();
+        next.dedup();
+        *columns = Some(next);
     }
     Ok(())
 }
@@ -838,6 +935,60 @@ fn parquet_row_group_summary_for_path_specs(
         summary.add(parquet_path_row_group_summary(&path, predicate)?);
     }
     Ok(summary)
+}
+
+fn parquet_columns_read_for_path_specs(
+    patterns: &[String],
+    projection: Option<&[String]>,
+    predicate: Option<&ParquetPredicate>,
+) -> Result<Vec<String>, ServerError> {
+    let schema = if path_specs_use_object_store("read_parquet", patterns)? {
+        let objects = expand_object_store_specs(patterns)
+            .map_err(|err| ServerError::CopyFormat(format!("read_parquet: {err}")))?;
+        let Some(first) = objects.first() else {
+            return Err(ServerError::CopyFormat(
+                "read_parquet object expansion returned no files".to_owned(),
+            ));
+        };
+        read_object_arrow_schema(first)?
+    } else {
+        let paths = expand_parquet_path_specs(patterns)?;
+        let Some(first) = paths.first() else {
+            return Err(ServerError::CopyFormat(
+                "read_parquet path expansion returned no files".to_owned(),
+            ));
+        };
+        read_arrow_schema(first)?
+    };
+    let mut columns = match projection {
+        Some(projection) => {
+            resolve_projection_names(schema.as_ref(), Some(projection))?.unwrap_or_default()
+        }
+        None => schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>(),
+    };
+    if let Some(predicate) = predicate {
+        let predicate = predicate.resolved_for_schema(schema.as_ref())?;
+        if !columns.iter().any(|column| column == &predicate.column) {
+            columns.push(predicate.column);
+        }
+    }
+    columns.sort();
+    columns.dedup();
+    Ok(columns)
+}
+
+fn projection_names_from_exprs(exprs: &[(ScalarExpr, String)]) -> Option<Vec<String>> {
+    exprs
+        .iter()
+        .map(|(expr, alias)| match expr {
+            ScalarExpr::Column { name, .. } if name == alias => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn parquet_path_row_group_summary(

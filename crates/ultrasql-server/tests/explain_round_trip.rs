@@ -411,6 +411,10 @@ async fn explain_analyze_reports_parquet_row_groups_scanned_and_skipped() {
         text.contains("Parquet Row Groups: scanned=1 skipped=1"),
         "EXPLAIN ANALYZE must report parquet row groups, got: {text}"
     );
+    assert!(
+        text.contains("Parquet Columns Read: columns_read=id count=1"),
+        "EXPLAIN ANALYZE must report projected parquet columns_read, got: {text}"
+    );
 
     shutdown(client, server_handle).await;
 }

@@ -102,7 +102,9 @@ mod lower_simple;
 mod modify;
 mod object_stream;
 mod parquet_scan;
-pub(crate) use parquet_scan::{ParquetRowGroupSummary, parquet_row_group_summary_for_plan};
+pub(crate) use parquet_scan::{
+    ParquetRowGroupSummary, parquet_columns_read_for_plan, parquet_row_group_summary_for_plan,
+};
 mod scan;
 mod time_partition;
 mod tpch_q1;
