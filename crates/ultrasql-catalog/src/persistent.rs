@@ -94,6 +94,8 @@ pub enum RelKind {
     Toast,
     /// Foreign table (`'f'`).
     ForeignTable,
+    /// Append-only tombstone for a dropped relation.
+    Dropped,
 }
 
 /// A row in `pg_class`.
@@ -692,9 +694,9 @@ impl PersistentCatalog {
         let mut user_relations: u32 = 0;
         let mut user_index_classes: Vec<ClassRow> = Vec::new();
         for (_, class_row) in latest_class_by_oid {
-            user_relations = user_relations.saturating_add(1);
             match class_row.relkind {
                 RelKind::Table | RelKind::MaterializedView => {
+                    user_relations = user_relations.saturating_add(1);
                     let attrs = attrs_by_relation.remove(&class_row.oid).unwrap_or_default();
                     let schema = schema_from_attributes(attrs).map_err(|e| {
                         CatalogError::schema_conflict(format!(
@@ -721,6 +723,7 @@ impl PersistentCatalog {
                     tables_by_oid.insert(entry.oid, entry);
                 }
                 RelKind::Index => {
+                    user_relations = user_relations.saturating_add(1);
                     user_index_classes.push(class_row);
                 }
                 _ => {}
@@ -1163,6 +1166,84 @@ impl PersistentCatalog {
                 },
             )
             .map_err(|e| CatalogError::schema_conflict(format!("pg_attribute insert: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Append a durable `pg_class` tombstone for a dropped table.
+    ///
+    /// Catalog heaps are append-only today. Bootstrap keeps the newest
+    /// `pg_class` row per OID, so a `RelKind::Dropped` marker suppresses
+    /// older CREATE/ALTER rows after restart without needing heap delete
+    /// support first.
+    pub fn persist_table_drop_tombstone<L: PageLoader>(
+        &self,
+        entry: &TableEntry,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::encode_attribute_row;
+        use crate::persistent::{AttributeRow, ClassRow};
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
+        let pg_attribute_rel = RelationId::new(bootstrap::PG_ATTRIBUTE_OID);
+        let namespace_oid = if entry.schema_name == "pg_catalog" {
+            Oid::new(bootstrap::PG_CATALOG_OID)
+        } else {
+            Oid::new(bootstrap::PUBLIC_OID)
+        };
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+        let class_row = ClassRow {
+            oid: entry.oid,
+            relname: entry.name.clone(),
+            relnamespace: namespace_oid,
+            relkind: RelKind::Dropped,
+            relpages: entry.n_blocks,
+            reltuples: 0.0,
+            relfilenode: entry.root_block.raw(),
+            relhasindex: false,
+        };
+        heap.insert(
+            pg_class_rel,
+            &class_row.encode(),
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_class tombstone insert: {e}")))?;
+
+        for (i, field) in entry.schema.fields().iter().enumerate() {
+            let attr_row = AttributeRow {
+                attrelid: entry.oid,
+                attname: field.name.clone(),
+                atttypid: 0,
+                attnum: i16::try_from(i + 1).unwrap_or(i16::MAX),
+                attnotnull: !field.nullable,
+                atthasdef: false,
+                attisdropped: true,
+            };
+            let bytes = encode_attribute_row(&attr_row, &field.data_type, field.nullable)
+                .map_err(|e| CatalogError::schema_conflict(format!("encode pg_attribute: {e}")))?;
+            heap.insert(
+                pg_attribute_rel,
+                &bytes,
+                InsertOptions {
+                    xmin,
+                    command_id,
+                    wal,
+                    fsm: None,
+                    vm: None,
+                },
+            )
+            .map_err(|e| {
+                CatalogError::schema_conflict(format!("pg_attribute tombstone insert: {e}"))
+            })?;
         }
         Ok(())
     }

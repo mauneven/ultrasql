@@ -1276,6 +1276,51 @@ where
                 )));
             }
         }
+        let mut durable_drop_entries = Vec::new();
+        for name in tables {
+            let Some(entry) = self.state.persistent_catalog.lookup_table(name) else {
+                continue;
+            };
+            durable_drop_entries.push(entry);
+            if let Some(runtime) = self.state.time_partitions.get(name) {
+                for chunk in runtime.chunks.iter() {
+                    if let Some(chunk_entry) = self
+                        .state
+                        .persistent_catalog
+                        .lookup_table(&chunk.value().table_name)
+                    {
+                        durable_drop_entries.push(chunk_entry);
+                    }
+                }
+            }
+        }
+        if !durable_drop_entries.is_empty() {
+            let ddl_txn = self
+                .state
+                .txn_manager
+                .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+            let ddl_xid = ddl_txn.xid;
+            let ddl_command_id = ddl_txn.current_command;
+            let persist_result = durable_drop_entries.iter().try_for_each(|entry| {
+                self.state.persistent_catalog.persist_table_drop_tombstone(
+                    entry,
+                    self.state.heap.as_ref(),
+                    ddl_xid,
+                    ddl_command_id,
+                )
+            });
+            if let Err(e) = persist_result {
+                if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                    tracing::warn!(
+                        error = %abort_err,
+                        "abort of DROP TABLE catalog txn failed",
+                    );
+                }
+                return Err(e.into());
+            }
+            self.state
+                .commit_transaction(ddl_txn, true, "DROP TABLE catalog transaction")?;
+        }
         for name in tables {
             if let Some(entry) = self.state.persistent_catalog.lookup_table(name) {
                 if *cascade {

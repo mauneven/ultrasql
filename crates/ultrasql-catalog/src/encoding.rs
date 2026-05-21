@@ -410,6 +410,7 @@ const RK_MAT_VIEW: u8 = b'm';
 const RK_COMP: u8 = b'c';
 const RK_TOAST: u8 = b't';
 const RK_FOREIGN: u8 = b'f';
+const RK_DROPPED: u8 = b'd';
 
 const fn encode_relkind(k: RelKind) -> u8 {
     match k {
@@ -421,6 +422,7 @@ const fn encode_relkind(k: RelKind) -> u8 {
         RelKind::CompositeType => RK_COMP,
         RelKind::Toast => RK_TOAST,
         RelKind::ForeignTable => RK_FOREIGN,
+        RelKind::Dropped => RK_DROPPED,
     }
 }
 
@@ -434,6 +436,7 @@ fn decode_relkind(b: u8, offset: usize) -> Result<RelKind, DecodeError> {
         RK_COMP => RelKind::CompositeType,
         RK_TOAST => RelKind::Toast,
         RK_FOREIGN => RelKind::ForeignTable,
+        RK_DROPPED => RelKind::Dropped,
         other => return Err(DecodeError::InvalidTag { tag: other, offset }),
     })
 }
@@ -901,6 +904,7 @@ mod tests {
             RelKind::CompositeType,
             RelKind::Toast,
             RelKind::ForeignTable,
+            RelKind::Dropped,
         ] {
             let mut row = sample_class_row(7);
             row.relkind = k;
