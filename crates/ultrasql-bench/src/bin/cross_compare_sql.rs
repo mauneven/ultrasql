@@ -64,6 +64,7 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as Arr
 use clap::{Parser, ValueEnum};
 use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 use tokio_postgres::NoTls;
+use ultrasql_bench::registry::HostInfo;
 use ultrasql_catalog::rag::{RagSchemaConfig, create_rag_table_statements};
 use ultrasql_objectstore::object_range_cache_metrics;
 use ultrasql_server::{Server, bind_listener, serve_listener};
@@ -757,13 +758,17 @@ async fn main() -> Result<()> {
     let p99_latency_us = percentile_nearest_rank(&iters_us, 0.99);
 
     let mut report = serde_json::json!({
+        "schema_version": 1,
         "engine": "ultrasql",
         "workload": workload_id,
+        "status": "measured",
         "n_rows": args.rows,
         "samples": iters_us.len(),
         "median_us": median_us,
         "min_us": min_us,
         "iterations_us": iters_us,
+        "host": HostInfo::from_env(),
+        "policy": "Raw measured samples only; no ranking or winner claim.",
     });
     if let Some(answer) = answer {
         report["answer"] = answer;
@@ -1269,7 +1274,13 @@ fn write_json_report(
     report: &serde_json::Value,
     label: &str,
 ) -> Result<()> {
-    let serialized = serde_json::to_string(report)?;
+    let mut enriched = report.clone();
+    if let Some(object) = enriched.as_object_mut()
+        && !object.contains_key("host")
+    {
+        object.insert("host".to_string(), serde_json::json!(HostInfo::from_env()));
+    }
+    let serialized = serde_json::to_string(&enriched)?;
     if let Some(path) = output {
         std::fs::write(path, &serialized).with_context(|| format!("write {}", path.display()))?;
         eprintln!("{label}: wrote {}", path.display());

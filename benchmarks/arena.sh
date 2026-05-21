@@ -182,11 +182,36 @@ emit_not_available() {
 
     python3 - "$out" "$suite" "$engine" "$PROFILE" "$reason" "$metrics" <<'PY'
 import json
+import os
 import pathlib
+import platform
+import subprocess
 import sys
 import time
 
 out, suite, engine, profile, reason, metrics = sys.argv[1:]
+def host_memory_bytes():
+    try:
+        if sys.platform == "darwin":
+            return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+        meminfo = pathlib.Path("/proc/meminfo")
+        if meminfo.exists():
+            for line in meminfo.read_text(encoding="utf-8").splitlines():
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return 0
+    return 0
+
+host_memory = host_memory_bytes()
+host_cpu = os.environ.get("BENCH_CPU_MODEL") or platform.processor() or platform.machine()
+host = {
+    "cpu": host_cpu,
+    "cores": os.cpu_count() or 0,
+    "ram_gb": round(host_memory / (1024 ** 3)) if host_memory else 0,
+    "os": platform.platform(),
+    "memory_bytes": host_memory,
+}
 doc = {
     "schema_version": 1,
     "suite": suite,
@@ -196,6 +221,9 @@ doc = {
     "status": "not_available",
     "reason": reason,
     "generated_at_unix": int(time.time()),
+    "host": host,
+    "host_cpu": host_cpu,
+    "host_memory": host_memory,
     "required_metrics": [metric for metric in metrics.split(",") if metric],
     "policy": (
         "No benchmark claim exists for this suite/engine until a committed "
@@ -359,7 +387,7 @@ run_tpch_suite() {
 
 run_clickbench_suite() {
     local supported selected
-    supported="ultrasql,postgres"
+    supported="ultrasql,postgres,duckdb,clickhouse,firebolt"
     selected="$(requested_supported_csv "$supported")"
     if [[ -n "$selected" ]]; then
         run_suite \
@@ -367,6 +395,7 @@ run_clickbench_suite() {
             "$OUT_DIR/clickbench_certification.json" \
             env \
                 BENCH_CERT_OUT_DIR="$OUT_DIR" \
+                CLICKBENCH_ENGINES="$selected" \
                 benchmarks/clickbench_certify.sh
     fi
     emit_unsupported_engines \
@@ -595,6 +624,15 @@ pathlib.Path(md_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 print(json.dumps(doc, indent=2))
 PY
+
+schema_gate_status=0
+set +e
+benchmarks/validate_artifacts.py "$MANIFEST"
+schema_gate_status=$?
+set -e
+if (( schema_gate_status != 0 )); then
+    failed=1
+fi
 
 if (( failed != 0 )); then
     exit 1

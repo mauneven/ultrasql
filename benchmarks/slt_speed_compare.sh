@@ -75,3 +75,46 @@ for path in $PATHS; do
 done
 
 cargo "${args[@]}"
+
+python3 - "$OUT" <<'PY'
+import json
+import os
+import pathlib
+import platform
+import subprocess
+import sys
+
+path = pathlib.Path(sys.argv[1])
+doc = json.loads(path.read_text(encoding="utf-8"))
+
+def host_memory_bytes():
+    try:
+        if sys.platform == "darwin":
+            return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip())
+        meminfo = pathlib.Path("/proc/meminfo")
+        if meminfo.exists():
+            for line in meminfo.read_text(encoding="utf-8").splitlines():
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        return 0
+    return 0
+
+host_memory = host_memory_bytes()
+host_cpu = os.environ.get("BENCH_CPU_MODEL") or platform.processor() or platform.machine()
+doc["schema_version"] = 1
+doc.pop("winner", None)
+doc["status"] = "measured" if all(engine.get("ok") for engine in doc.get("engines", [])) else "failed"
+doc["host"] = {
+    "cpu": host_cpu,
+    "cores": os.cpu_count() or 0,
+    "ram_gb": round(host_memory / (1024 ** 3)) if host_memory else 0,
+    "os": platform.platform(),
+    "memory_bytes": host_memory,
+}
+doc["policy"] = (
+    "SQLLogicTest speed artifact records per-engine timings only; no winner "
+    "or ranking claim is emitted by the arena."
+)
+path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+PY

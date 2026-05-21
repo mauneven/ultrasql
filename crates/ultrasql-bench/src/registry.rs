@@ -275,16 +275,15 @@ impl HostInfo {
     /// | `BENCH_OS_VERSION` | appended to `os` |
     #[must_use]
     pub fn from_env() -> Self {
-        let cpu =
-            std::env::var("BENCH_CPU_MODEL").unwrap_or_else(|_| std::env::consts::ARCH.to_string());
+        let cpu = std::env::var("BENCH_CPU_MODEL").unwrap_or_else(|_| detect_cpu_model());
         let cores = std::env::var("BENCH_CPU_CORES")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0_u32);
+            .unwrap_or_else(detect_cpu_cores);
         let ram_gb = std::env::var("BENCH_RAM_GB")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(0_u32);
+            .unwrap_or_else(detect_ram_gb);
         let os = format!(
             "{} {}",
             std::env::consts::OS,
@@ -297,6 +296,65 @@ impl HostInfo {
             os,
         }
     }
+}
+
+fn detect_cpu_model() -> String {
+    if cfg!(target_os = "macos")
+        && let Ok(output) = std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+        && output.status.success()
+    {
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+        for line in cpuinfo.lines() {
+            if let Some(model) = line.strip_prefix("model name\t: ") {
+                return model.to_string();
+            }
+        }
+    }
+    std::env::consts::ARCH.to_string()
+}
+
+fn detect_cpu_cores() -> u32 {
+    std::thread::available_parallelism()
+        .ok()
+        .and_then(|cores| u32::try_from(cores.get()).ok())
+        .unwrap_or(0)
+}
+
+fn detect_ram_gb() -> u32 {
+    let bytes = if cfg!(target_os = "macos") {
+        std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .and_then(|output| {
+                output
+                    .status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&output.stdout).trim().parse().ok())
+                    .flatten()
+            })
+    } else {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|meminfo| {
+                meminfo.lines().find_map(|line| {
+                    let kb = line.strip_prefix("MemTotal:")?.split_whitespace().next()?;
+                    kb.parse::<u64>()
+                        .ok()
+                        .and_then(|value| value.checked_mul(1024))
+                })
+            })
+    };
+    bytes
+        .and_then(|value| u32::try_from(value / 1_073_741_824).ok())
+        .unwrap_or(0)
 }
 
 /// The result produced by a single benchmark run.

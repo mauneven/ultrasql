@@ -77,6 +77,21 @@ fn arena_script_composes_existing_runners_without_claiming_winners() {
 }
 
 #[test]
+fn arena_script_validates_artifact_schema_before_success() {
+    let script = repo_file("benchmarks/arena.sh");
+    let validator = repo_file("benchmarks/validate_artifacts.py");
+
+    assert!(script.contains("benchmarks/validate_artifacts.py"));
+    assert!(script.contains("schema_gate_status"));
+    assert!(validator.contains("schema_version"));
+    assert!(validator.contains("host"));
+    assert!(validator.contains("host_cpu"));
+    assert!(validator.contains("host_memory"));
+    assert!(validator.contains("winner"));
+    assert!(validator.contains("fake win"));
+}
+
+#[test]
 fn object_parquet_range_script_declares_range_certification() {
     let script = repo_file("benchmarks/object_parquet_range.sh");
     let certify = repo_file("benchmarks/certify.sh");

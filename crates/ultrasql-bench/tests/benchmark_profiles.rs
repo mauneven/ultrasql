@@ -73,3 +73,33 @@ fn setup_missing_certifications_are_unavailable_not_failed() {
     assert!(tpch.contains("write_setup_summary \"data_dir_missing\""));
     assert!(tpch.contains("write_setup_summary \"duckdb_missing\""));
 }
+
+#[test]
+fn tpch_sf10_runner_refuses_partial_and_writes_raw_atomically() {
+    let tpch = repo_file("benchmarks/tpch_sf10_certify.sh");
+
+    assert!(tpch.contains("partial_query_set_refused"));
+    assert!(tpch.contains("TPCH_TIMEOUT_SECONDS"));
+    assert!(tpch.contains("TMP_DUCKDB_OUT"));
+    assert!(tpch.contains("TMP_ULTRA_OUT"));
+    assert!(tpch.contains("mv \"$TMP_DUCKDB_OUT\" \"$DUCKDB_OUT\""));
+    assert!(tpch.contains("mv \"$TMP_ULTRA_OUT\" \"$ULTRA_OUT\""));
+    assert!(tpch.contains("trap cleanup EXIT"));
+}
+
+#[test]
+fn clickbench_runner_declares_complete_engine_artifacts_and_host_metadata() {
+    let clickbench = repo_file("benchmarks/clickbench_certify.sh");
+
+    assert!(clickbench.contains("CLICKBENCH_ENGINES"));
+    assert!(clickbench.contains("duckdb"));
+    assert!(clickbench.contains("clickhouse"));
+    assert!(clickbench.contains("firebolt"));
+    assert!(clickbench.contains("clickbench-duckdb.json"));
+    assert!(clickbench.contains("clickbench-clickhouse.json"));
+    assert!(clickbench.contains("clickbench-firebolt.json"));
+    assert!(clickbench.contains("\"schema_version\": 1"));
+    assert!(clickbench.contains("\"host\""));
+    assert!(clickbench.contains("\"status\": \"not_available\""));
+    assert!(clickbench.contains("runner_not_implemented_for_engine"));
+}

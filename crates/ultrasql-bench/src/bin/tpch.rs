@@ -25,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use sha2::{Digest, Sha256};
 
+use ultrasql_bench::registry::HostInfo;
 use ultrasql_bench::tpch::{baseline, data_gen, load, queries, runner, schema};
 
 // ---------------------------------------------------------------------------
@@ -611,22 +612,12 @@ fn duckdb_engine_string(duckdb_bin: &Path) -> String {
 /// Collects a host descriptor using `std::env::consts` when `sysinfo` is
 /// not available.
 fn collect_host_descriptor() -> baseline::HostDescriptor {
+    let host = HostInfo::from_env();
     baseline::HostDescriptor {
-        cpu: std::env::var("BENCH_CPU_MODEL")
-            .unwrap_or_else(|_| std::env::consts::ARCH.to_string()),
-        cores: std::env::var("BENCH_CPU_CORES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0),
-        ram_gb: std::env::var("BENCH_RAM_GB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0),
-        os: format!(
-            "{} {}",
-            std::env::consts::OS,
-            std::env::var("BENCH_OS_VERSION").unwrap_or_else(|_| "unknown".to_string())
-        ),
+        cpu: host.cpu,
+        cores: host.cores,
+        ram_gb: host.ram_gb,
+        os: host.os,
     }
 }
 
