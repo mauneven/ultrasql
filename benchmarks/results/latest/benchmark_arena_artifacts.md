@@ -9,7 +9,7 @@
 | --- | --- | ---: | --- |
 | `csv` | `unavailable` | 2 | `benchmarks/results/latest/csv_benchmark_gauntlet_manifest.json` |
 | `csv:postgres` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_csv_smoke-postgres.json` |
-| `parquet:ultrasql` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_parquet_smoke-ultrasql.json` |
+| `parquet:ultrasql` | `passed` | 0 | `benchmarks/results/latest/raw/arena_parquet_smoke-ultrasql.json` |
 | `parquet:duckdb` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_parquet_smoke-duckdb.json` |
 | `parquet:clickhouse` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_parquet_smoke-clickhouse.json` |
 | `parquet:postgres` | `unavailable` | 2 | `benchmarks/results/latest/raw/arena_parquet_smoke-postgres.json` |

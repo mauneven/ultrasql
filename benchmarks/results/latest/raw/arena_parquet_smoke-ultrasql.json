@@ -1,17 +1,59 @@
 {
-  "schema_version": 1,
-  "suite": "parquet",
+  "answer": {
+    "predicate_rows": [
+      [
+        "2048"
+      ]
+    ],
+    "projection_rows": 8192,
+    "row_group_pruning_rows": [
+      [
+        "4096"
+      ]
+    ],
+    "row_group_pruning_threshold": 4096,
+    "scan_rows": [
+      [
+        "8192"
+      ]
+    ],
+    "source": "generated_arrow_parquet_with_flushed_row_groups"
+  },
   "engine": "ultrasql",
-  "workload": "arena_parquet_smoke",
+  "iterations_us": [
+    2884.208
+  ],
+  "median_us": 2884.208,
+  "min_us": 2884.208,
+  "n_rows": 8192,
+  "policy": "Artifact contains measured UltraSQL samples only; no cross-engine ranking.",
+  "predicate_pushdown_samples_us": [
+    1192.958
+  ],
+  "predicate_pushdown_us": 1192.958,
   "profile": "smoke",
-  "status": "not_available",
-  "reason": "runner_not_implemented",
-  "generated_at_unix": 1779318633,
+  "projection_pushdown_samples_us": [
+    1654.792
+  ],
+  "projection_pushdown_us": 1654.792,
   "required_metrics": [
     "scan_us",
     "projection_pushdown_us",
     "predicate_pushdown_us",
     "row_group_pruning_us"
   ],
-  "policy": "No benchmark claim exists for this suite/engine until a committed runner emits measured samples from reproducible inputs."
+  "row_group_pruning_samples_us": [
+    444.33299999999997
+  ],
+  "row_group_pruning_us": 444.33299999999997,
+  "row_group_rows": 4096,
+  "samples": 1,
+  "scan_samples_us": [
+    2884.208
+  ],
+  "scan_us": 2884.208,
+  "schema_version": 1,
+  "status": "measured",
+  "suite": "parquet",
+  "workload": "arena_parquet_smoke"
 }

@@ -31,8 +31,8 @@
     },
     {
       "suite": "parquet:ultrasql",
-      "status": "unavailable",
-      "exit_code": 2,
+      "status": "passed",
+      "exit_code": 0,
       "artifact": "benchmarks/results/latest/raw/arena_parquet_smoke-ultrasql.json"
     },
     {
