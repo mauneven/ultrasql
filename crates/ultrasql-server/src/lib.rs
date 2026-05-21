@@ -46,6 +46,7 @@
 mod aggregating_index;
 pub mod auth;
 pub mod cancel;
+pub mod catalog_version;
 pub mod columnar_storage;
 pub mod copy;
 pub mod error;
@@ -2200,6 +2201,13 @@ impl Server {
         use std::sync::Arc;
         use ultrasql_wal::{WalBuffer, WalWriter, WalWriterConfig};
         use wal_sink::WalBufferSink;
+
+        let catalog_version = catalog_version::ensure_catalog_version(data_dir)?;
+        tracing::info!(
+            version = catalog_version.observed_version,
+            created = catalog_version.created,
+            "catalog version marker checked"
+        );
 
         // 1. WAL buffer — 8 MiB ring.
         const WAL_BUFFER_BYTES: usize = 8 * 1024 * 1024;
