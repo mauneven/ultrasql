@@ -607,6 +607,28 @@ certify TPC-H, ClickBench, TPC-B/C, Sysbench, exact vector top-k, or HNSW
 performance. Full profile results still report `unavailable` when required
 DSNs, datasets, engines, or implementations are absent.
 
+## Backup/Restore Smoke
+
+Release backup evidence is recorded by:
+
+```text
+benchmarks/backup_restore_smoke.sh
+```
+
+The runner creates a local source table, takes a physical base backup, writes an
+UltraSQL dump archive, restores it into a new data directory, validates the
+restored directory, and checks both `SELECT COUNT(*) FROM backup_restore_smoke`
+and `SELECT payload FROM backup_restore_smoke WHERE id = 2`. It writes:
+
+```text
+benchmarks/results/latest/backup_restore_smoke_manifest.json
+```
+
+The artifact is `measured` only when the restored row count and indexed point
+query both match the source. Missing local tools are recorded as
+`not_available`; no durability or performance claim exists from an unavailable
+artifact.
+
 ## Hot-Path Flamegraphs
 
 Use the hot-path profile runner before adding SIMD kernels or executor

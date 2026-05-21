@@ -1,0 +1,23 @@
+{
+  "basebackup_dir": "target/backup-restore-smoke/basebackup",
+  "created_at_unix": 1779382643.9323761,
+  "dump_path": "target/backup-restore-smoke/backup_restore_smoke.dump",
+  "host": {
+    "cpu": "arm",
+    "machine": "arm64",
+    "os": "macOS-26.5-arm64-arm-64bit-Mach-O"
+  },
+  "index_query_result": "bravo",
+  "index_query_verified": true,
+  "policy": "Backup/restore is measured only when basebackup, pg-dump, pg-restore, restored row count, and restored indexed query all pass.",
+  "profile": "smoke",
+  "reason": "ok",
+  "restore_data_dir": "target/backup-restore-smoke/restored-data",
+  "restored_row_count": "3",
+  "row_count_verified": true,
+  "schema_version": 1,
+  "source_data_dir": "target/backup-restore-smoke/source-data",
+  "source_row_count": "3",
+  "status": "measured",
+  "suite": "backup_restore_smoke"
+}

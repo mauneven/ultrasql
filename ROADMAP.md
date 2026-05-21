@@ -1939,6 +1939,26 @@ same host.
 - [ ] Fuzz testing: 1 week clean on parser, protocol, WAL decoder, planner
 
 ### Release Checklist
+- [x] Catalog upgrade story: v1.0 data directories carry
+  `catalog.version = 1`; startup creates missing v1 markers, accepts current
+  markers, and refuses unknown newer markers. Evidence:
+  `crates/ultrasql-server/src/catalog_version.rs`,
+  `crates/ultrasql-server/tests/catalog_version_round_trip.rs`, and
+  `docs/catalog-upgrades.md`.
+- [x] Backup/restore smoke: `benchmarks/backup_restore_smoke.sh` exercises
+  `ultrasql --basebackup`, `--pg-dump`, `--pg-restore`, restored validation,
+  row counts, and an indexed point query; artifact path:
+  `benchmarks/results/latest/backup_restore_smoke_manifest.json`.
+- [x] Config docs: `docs/configuration.md` records memory, WAL,
+  object-store, ANN, benchmark modes, RLS, and ops surfaces.
+- [x] Security/ethics audit: `docs/security-ethics-audit.md` records the
+  no-AI-credit, no-proprietary-tests, no-copied-closed-source-code, and
+  no-fake-benchmark-claims release checks.
+- [x] CI split: PR gates stay in `.github/workflows/ci.yml` plus smoke
+  benchmark checks; scheduled/manual full benchmark, fuzz, sanitizer, and
+  Miri gates stay in `bench.yml`, `fuzz.yml`, and `sanitizers.yml`.
+- [x] Release checklist: `docs/release-checklist.md` maps v1.0 boxes to
+  code, test, benchmark or reason, docs, and artifact.
 - [ ] `CHANGELOG.md` documenting every user-visible change
 - [ ] Official documentation site (`docs.ultrasql.org`)
 - [ ] Getting started guide
