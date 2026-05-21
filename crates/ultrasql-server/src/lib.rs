@@ -729,7 +729,7 @@ pub struct BlankPageLoader {
 enum BlankPageBacking {
     Segment {
         manager: Arc<SegmentFileManager>,
-        _dir: tempfile::TempDir,
+        _temp_dir: Option<tempfile::TempDir>,
     },
     Memory(Arc<dashmap::DashMap<PageId, Arc<[u8; PAGE_SIZE]>>>),
 }
@@ -770,7 +770,7 @@ impl BlankPageLoader {
             }) {
             Ok((dir, manager)) => BlankPageBacking::Segment {
                 manager: Arc::new(manager),
-                _dir: dir,
+                _temp_dir: Some(dir),
             },
             Err(e) => {
                 warn!(
@@ -783,6 +783,22 @@ impl BlankPageLoader {
         Self {
             backing: Arc::new(backing),
         }
+    }
+
+    /// Create a loader backed by stable segment files under `base_dir`.
+    pub fn persistent(base_dir: impl AsRef<std::path::Path>) -> Result<Self, SegmentError> {
+        let config = SegmentConfig {
+            use_mmap: false,
+            verify_checksums: false,
+            ..SegmentConfig::default()
+        };
+        let manager = SegmentFileManager::open(base_dir.as_ref().to_path_buf(), config)?;
+        Ok(Self {
+            backing: Arc::new(BlankPageBacking::Segment {
+                manager: Arc::new(manager),
+                _temp_dir: None,
+            }),
+        })
     }
 
     /// Persist a dirty page so the buffer pool may evict its frame safely.
@@ -988,6 +1004,12 @@ pub struct Server {
     pub heap: Arc<HeapAccess<BlankPageLoader>>,
     /// Backing loader used to spill dirty heap pages out of the buffer pool.
     page_loader: BlankPageLoader,
+    /// Background checkpointer for persistent server instances.
+    ///
+    /// `None` means sample/in-memory mode. `Some` periodically flushes
+    /// WAL-safe dirty heap pages into `<data_dir>/base` and is shut down
+    /// before the WAL writer drops.
+    checkpointer: Option<ultrasql_storage::Checkpointer>,
     /// Shared visibility map for heap relations. Mutations clear touched
     /// pages; maintenance marks pages all-visible after certification.
     pub vm: Arc<VisibilityMap>,
@@ -1103,6 +1125,21 @@ pub struct Server {
     /// installed a [`wal_sink::WalBufferSink`] into the buffer pool and this
     /// handle keeps the drain/fsync thread alive until the server drops.
     wal_writer: Option<ultrasql_wal::WalWriter>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        if let Some(checkpointer) = self.checkpointer.take()
+            && let Err(e) = checkpointer.shutdown()
+        {
+            warn!(error = %e, "checkpointer shutdown failed during server drop");
+        }
+        if self.wal_writer.is_some()
+            && let Err(e) = self.flush_dirty_heap_pages()
+        {
+            warn!(error = %e, "final dirty heap page flush failed during server drop");
+        }
+    }
 }
 
 /// Authentication policy for incoming connections.
@@ -1911,6 +1948,7 @@ impl Server {
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
             standby_mode: std::sync::atomic::AtomicBool::new(false),
+            checkpointer: None,
             wal_writer: None,
         }
     }
@@ -2252,7 +2290,9 @@ impl Server {
             Arc::new(WalBufferSink::new(Arc::clone(&wal_buffer)));
 
         // 3. Buffer pool with WAL.
-        let page_loader = BlankPageLoader::new();
+        let page_loader = BlankPageLoader::persistent(data_dir.join("base")).map_err(|e| {
+            ServerError::Io(std::io::Error::other(format!("heap segment store: {e}")))
+        })?;
         let pool = Arc::new(BufferPool::with_wal(
             IN_MEMORY_POOL_FRAMES,
             page_loader.clone(),
@@ -2281,6 +2321,13 @@ impl Server {
             WalWriterConfig::default(),
         )
         .map_err(|e| ServerError::Io(std::io::Error::other(format!("WAL writer: {e}"))))?;
+        let checkpointer_loader = page_loader.clone();
+        let checkpointer = Some(ultrasql_storage::Checkpointer::spawn(
+            &pool,
+            None,
+            move |page_id, page| checkpointer_loader.store(page_id, page),
+            ultrasql_storage::CheckpointerConfig::default(),
+        ));
 
         let persistent_catalog = Arc::new(PersistentCatalog::new());
         match persistent_catalog.bootstrap_from_heap(heap.as_ref()) {
@@ -2331,6 +2378,7 @@ impl Server {
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
             standby_mode: std::sync::atomic::AtomicBool::new(false),
+            checkpointer,
             wal_writer: Some(wal_writer),
         };
         server.recover_commit_status_from_wal()?;
