@@ -1834,13 +1834,14 @@ same host.
   certification artifacts.
 - [ ] **AI/vector benchmark certification slice** — current measured smoke
   artifacts include exact top-k, HNSW ANN recall/latency, hybrid search
-  latency, and RAG retrieval quality. The AI gauntlet still emits
-  `not_available` for missing runner suites:
-  `filtered_vector_search`, `ingestion_throughput`,
-  `memory_per_million_vectors`, and `cold_start_index_load`. Expand the smoke
-  set into committed certification artifacts for those suites plus IVFFlat,
-  bulk load, index build, update/delete maintenance, WAL recovery, and larger
-  hybrid RAG query shapes.
+  latency, filtered vector search with tenant/category predicates, RAG
+  retrieval quality with expected document ids, and page-backed HNSW/IVFFlat
+  memory accounting normalized per vector. The AI gauntlet still emits
+  `not_available` for missing runner suites: `ingestion_throughput` and
+  `cold_start_index_load`. Expand the smoke set into committed certification
+  artifacts for those suites plus IVFFlat recall/latency, bulk load, index
+  build, update/delete maintenance, WAL recovery, and larger hybrid RAG query
+  shapes.
   Certification must compare UltraSQL against PostgreSQL + pgvector on the
   same host and report recall@k, p50/p95/p99 latency, throughput, index size,
   build time, memory, and restart correctness. No v1.0 vector claim is allowed

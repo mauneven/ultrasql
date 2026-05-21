@@ -1,18 +1,88 @@
 {
   "schema_version": 1,
   "suite": "filtered_vector_search",
-  "engine": "ultrasql",
+  "engine": "ultrasql_hnsw",
   "workload": "ai_gauntlet_filtered_vector_search_smoke",
   "profile": "smoke",
-  "status": "not_available",
-  "reason": "runner_not_implemented",
-  "generated_at_unix": 1779343239,
+  "status": "measured",
   "required_metrics": [
+    "recall_at_k",
     "p50_latency_us",
     "p95_latency_us",
     "p99_latency_us",
-    "recall_at_k",
-    "filter_selectivity"
+    "filter_selectivity",
+    "candidate_expansion_count"
   ],
-  "policy": "No benchmark claim exists for this suite until a committed runner emits the required metrics from reproducible inputs."
+  "host": {
+    "cpu": "aarch64",
+    "cores": 0,
+    "ram_gb": 0,
+    "os": "macos unknown"
+  },
+  "n_rows": 512,
+  "filtered_rows": 16,
+  "vector_dims": 8,
+  "top_k": 5,
+  "queries": 4,
+  "warmup_queries": 0,
+  "tenant_count": 8,
+  "category_count": 4,
+  "tenant_id": 3,
+  "category_id": 2,
+  "filter_selectivity": 0.03125,
+  "recall_at_k": 1.0,
+  "p50_latency_us": 51.666000000000004,
+  "p95_latency_us": 70.792,
+  "p99_latency_us": 70.792,
+  "exact_p50_latency_us": 0.5419999999999999,
+  "exact_p95_latency_us": 9.875,
+  "exact_p99_latency_us": 9.875,
+  "ann_p50_latency_us": 51.666000000000004,
+  "ann_p95_latency_us": 70.792,
+  "ann_p99_latency_us": 70.792,
+  "candidate_expansion_count": 320,
+  "m": 16,
+  "ef_search": 1024,
+  "seed": 1367261406,
+  "build_time_us": 3960.333,
+  "memory_bytes": 174920,
+  "exact_iterations_us": [
+    9.875,
+    0.709,
+    0.5419999999999999,
+    0.5
+  ],
+  "ann_iterations_us": [
+    70.792,
+    51.666000000000004,
+    52.209,
+    50.791000000000004
+  ],
+  "recall_iterations": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "candidate_expansion_iterations": [
+    320,
+    160,
+    160,
+    160
+  ],
+  "first_exact_answer": [
+    211,
+    115,
+    499,
+    243,
+    403
+  ],
+  "first_ann_answer": [
+    211,
+    115,
+    499,
+    243,
+    403
+  ],
+  "policy": "Filtered vector artifact compares exact metadata-filtered scan with runtime HNSW candidate expansion; no cross-engine ranking."
 }

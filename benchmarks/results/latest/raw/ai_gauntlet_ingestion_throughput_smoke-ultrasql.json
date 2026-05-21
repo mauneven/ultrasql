@@ -6,7 +6,7 @@
   "profile": "smoke",
   "status": "not_available",
   "reason": "runner_not_implemented",
-  "generated_at_unix": 1779343239,
+  "generated_at_unix": 1779347157,
   "required_metrics": [
     "rows_per_second",
     "bytes_per_second",

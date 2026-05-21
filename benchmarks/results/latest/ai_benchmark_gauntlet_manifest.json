@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "profile": "smoke",
-  "generated_at_unix": 1779343239,
+  "generated_at_unix": 1779347157,
   "status": "partial",
   "passed": false,
   "suites": [
@@ -18,6 +18,12 @@
       "artifact": "benchmarks/results/latest/raw/vector_ann_hnsw_*-ultrasql_hnsw.json"
     },
     {
+      "suite": "filtered_vector_search",
+      "status": "passed",
+      "exit_code": 0,
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_filtered_vector_search_smoke-ultrasql.json"
+    },
+    {
       "suite": "hybrid_search_latency",
       "status": "passed",
       "exit_code": 0,
@@ -30,12 +36,6 @@
       "artifact": "benchmarks/results/latest/raw/ai_gauntlet_rag_retrieval_quality_smoke-ultrasql.json"
     },
     {
-      "suite": "filtered_vector_search",
-      "status": "unavailable",
-      "exit_code": 2,
-      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_filtered_vector_search_smoke-ultrasql.json"
-    },
-    {
       "suite": "ingestion_throughput",
       "status": "unavailable",
       "exit_code": 2,
@@ -43,8 +43,8 @@
     },
     {
       "suite": "memory_per_million_vectors",
-      "status": "unavailable",
-      "exit_code": 2,
+      "status": "passed",
+      "exit_code": 0,
       "artifact": "benchmarks/results/latest/raw/ai_gauntlet_memory_per_million_vectors_smoke-ultrasql.json"
     },
     {

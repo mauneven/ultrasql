@@ -1,15 +1,55 @@
 {
   "schema_version": 1,
   "suite": "memory_per_million_vectors",
-  "engine": "ultrasql",
+  "engine": "ultrasql_page_backed_ann",
   "workload": "ai_gauntlet_memory_per_million_vectors_smoke",
   "profile": "smoke",
-  "status": "not_available",
-  "reason": "runner_not_implemented",
-  "generated_at_unix": 1779343239,
+  "status": "measured",
   "required_metrics": [
-    "memory_bytes_per_million_vectors",
-    "index_bytes_per_million_vectors"
+    "index_size_bytes",
+    "memory_bytes",
+    "bytes_per_vector",
+    "build_time_us"
   ],
-  "policy": "No benchmark claim exists for this suite until a committed runner emits the required metrics from reproducible inputs."
+  "host": {
+    "cpu": "aarch64",
+    "cores": 0,
+    "ram_gb": 0,
+    "os": "macos unknown"
+  },
+  "n_rows": 512,
+  "vector_dims": 8,
+  "seed": 1367261406,
+  "index_size_bytes": 17063936,
+  "memory_bytes": 17080320,
+  "bytes_per_vector": 33360.0,
+  "memory_bytes_per_million_vectors": 33360000000.0,
+  "index_bytes_per_million_vectors": 33328000000.0,
+  "build_time_us": 35451.291,
+  "hnsw_build_time_us": 24272.75,
+  "ivfflat_build_time_us": 11178.541000000001,
+  "hnsw_index_size_bytes": 12599296,
+  "ivfflat_index_size_bytes": 4464640,
+  "vector_data_bytes": 16384,
+  "m": 16,
+  "ef_search": 64,
+  "lists": 16,
+  "probes": 4,
+  "hnsw_pages": {
+    "meta_pages": 1,
+    "node_pages": 512,
+    "overflow_pages": 1024,
+    "free_list_pages": 1,
+    "live_nodes": 512,
+    "tombstones": 0
+  },
+  "ivfflat_pages": {
+    "meta_pages": 1,
+    "centroid_pages": 16,
+    "list_pages": 16,
+    "entry_pages": 512,
+    "live_entries": 512,
+    "tombstones": 0
+  },
+  "policy": "Vector memory artifact records page-backed HNSW and IVFFlat accounting for deterministic vectors; no cross-engine ranking."
 }

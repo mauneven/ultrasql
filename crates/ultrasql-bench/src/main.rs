@@ -10,6 +10,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use serde::Serialize;
+use ultrasql_bench::ai_gauntlet::{
+    FilteredVectorConfig, VectorMemoryConfig, run_filtered_vector_search, run_vector_memory,
+};
 use ultrasql_bench::ann_vector::{AnnBenchmarkConfig, run_hnsw_ann_benchmark};
 use ultrasql_bench::registry::HostInfo;
 
@@ -30,6 +34,10 @@ struct Cli {
 enum Command {
     /// Run deterministic runtime-HNSW ANN vector benchmark.
     AnnVector(AnnVectorArgs),
+    /// Run filtered vector search exact-vs-ANN benchmark.
+    FilteredVector(FilteredVectorArgs),
+    /// Run page-backed HNSW/IVFFlat memory accounting benchmark.
+    VectorMemory(VectorMemoryArgs),
     /// Run a PostgreSQL-wire TPC-B-shaped benchmark.
     Tpcb(TpcbArgs),
 }
@@ -59,6 +67,91 @@ struct AnnVectorArgs {
     #[arg(long = "ef-search", default_value_t = 64)]
     ef_search: usize,
     /// Deterministic data/probe seed.
+    #[arg(long, default_value_t = 0x51_7e_c0_de)]
+    seed: u64,
+    /// Output JSON path. Writes to stdout when omitted.
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+/// Filtered vector search benchmark arguments.
+#[derive(Clone, Debug, Args)]
+struct FilteredVectorArgs {
+    /// Stable workload id written into the artifact.
+    #[arg(long = "workload-id")]
+    workload_id: Option<String>,
+    /// AI gauntlet profile label.
+    #[arg(long, default_value = "smoke")]
+    profile: String,
+    /// Number of vectors to index.
+    #[arg(long, default_value_t = 10_000)]
+    rows: usize,
+    /// Vector dimensions.
+    #[arg(long, default_value_t = 8)]
+    dims: usize,
+    /// Nearest neighbors requested after filtering.
+    #[arg(long = "top-k", default_value_t = 10)]
+    top_k: usize,
+    /// Measured queries.
+    #[arg(long, default_value_t = 50)]
+    queries: usize,
+    /// Warmup queries excluded from latency percentiles.
+    #[arg(long = "warmup", default_value_t = 5)]
+    warmup_queries: usize,
+    /// Tenant cardinality in deterministic metadata.
+    #[arg(long = "tenant-count", default_value_t = 8)]
+    tenant_count: usize,
+    /// Category cardinality in deterministic metadata.
+    #[arg(long = "category-count", default_value_t = 4)]
+    category_count: usize,
+    /// Tenant selected by the filter.
+    #[arg(long = "tenant-id", default_value_t = 3)]
+    tenant_id: usize,
+    /// Category selected by the filter.
+    #[arg(long = "category-id", default_value_t = 2)]
+    category_id: usize,
+    /// HNSW neighbor cap.
+    #[arg(long, default_value_t = 16)]
+    m: usize,
+    /// HNSW search breadth.
+    #[arg(long = "ef-search", default_value_t = 1_024)]
+    ef_search: usize,
+    /// Deterministic data/probe seed.
+    #[arg(long, default_value_t = 0x51_7e_c0_de)]
+    seed: u64,
+    /// Output JSON path. Writes to stdout when omitted.
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
+/// Vector memory benchmark arguments.
+#[derive(Clone, Debug, Args)]
+struct VectorMemoryArgs {
+    /// Stable workload id written into the artifact.
+    #[arg(long = "workload-id")]
+    workload_id: Option<String>,
+    /// AI gauntlet profile label.
+    #[arg(long, default_value = "smoke")]
+    profile: String,
+    /// Number of vectors to build.
+    #[arg(long, default_value_t = 10_000)]
+    rows: usize,
+    /// Vector dimensions.
+    #[arg(long, default_value_t = 8)]
+    dims: usize,
+    /// HNSW neighbor cap.
+    #[arg(long, default_value_t = 16)]
+    m: usize,
+    /// HNSW search breadth.
+    #[arg(long = "ef-search", default_value_t = 64)]
+    ef_search: usize,
+    /// IVFFlat list count.
+    #[arg(long, default_value_t = 64)]
+    lists: usize,
+    /// IVFFlat probe count.
+    #[arg(long, default_value_t = 8)]
+    probes: usize,
+    /// Deterministic data seed.
     #[arg(long, default_value_t = 0x51_7e_c0_de)]
     seed: u64,
     /// Output JSON path. Writes to stdout when omitted.
@@ -110,6 +203,8 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::AnnVector(args)) => run_ann_vector(args),
+        Some(Command::FilteredVector(args)) => run_filtered_vector(args),
+        Some(Command::VectorMemory(args)) => run_vector_memory_command(args),
         Some(Command::Tpcb(args)) => run_tpcb(args),
         None => {
             eprintln!(
@@ -148,6 +243,80 @@ fn run_ann_vector(args: AnnVectorArgs) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn run_filtered_vector(args: FilteredVectorArgs) -> ExitCode {
+    let workload = args
+        .workload_id
+        .clone()
+        .unwrap_or_else(|| format!("ai_gauntlet_filtered_vector_search_{}", args.profile));
+    let config = FilteredVectorConfig {
+        workload,
+        profile: args.profile,
+        rows: args.rows,
+        dims: args.dims,
+        top_k: args.top_k,
+        queries: args.queries,
+        warmup_queries: args.warmup_queries,
+        tenant_count: args.tenant_count,
+        category_count: args.category_count,
+        tenant_id: args.tenant_id,
+        category_id: args.category_id,
+        m: args.m,
+        ef_search: args.ef_search,
+        seed: args.seed,
+    };
+    match run_filtered_vector_search(&config, HostInfo::from_env()).and_then(|artifact| {
+        write_artifact("filtered-vector benchmark", args.output.as_ref(), &artifact)
+    }) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("filtered-vector benchmark failed: {err:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_vector_memory_command(args: VectorMemoryArgs) -> ExitCode {
+    let workload = args
+        .workload_id
+        .clone()
+        .unwrap_or_else(|| format!("ai_gauntlet_memory_per_million_vectors_{}", args.profile));
+    let config = VectorMemoryConfig {
+        workload,
+        profile: args.profile,
+        rows: args.rows,
+        dims: args.dims,
+        m: args.m,
+        ef_search: args.ef_search,
+        lists: args.lists,
+        probes: args.probes,
+        seed: args.seed,
+    };
+    match run_vector_memory(&config, HostInfo::from_env()).and_then(|artifact| {
+        write_artifact("vector-memory benchmark", args.output.as_ref(), &artifact)
+    }) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("vector-memory benchmark failed: {err:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn write_artifact<T: Serialize>(
+    label: &str,
+    output: Option<&PathBuf>,
+    artifact: &T,
+) -> anyhow::Result<()> {
+    let serialized = serde_json::to_string_pretty(artifact)?;
+    if let Some(path) = output {
+        std::fs::write(path, serialized)?;
+        eprintln!("{label}: wrote {}", path.display());
+    } else {
+        println!("{serialized}");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "sql-bench")]
@@ -216,6 +385,42 @@ mod tests {
                 assert!(args.output.is_none());
             }
             _ => panic!("ann-vector subcommand should parse"),
+        }
+    }
+
+    #[test]
+    fn filtered_vector_cli_defaults_to_phase3_artifact_shape() {
+        let cli = Cli::try_parse_from(["ultrasql-bench", "filtered-vector"])
+            .expect("parse filtered-vector args");
+        match cli.command {
+            Some(Command::FilteredVector(args)) => {
+                assert_eq!(args.rows, 10_000);
+                assert_eq!(args.dims, 8);
+                assert_eq!(args.top_k, 10);
+                assert_eq!(args.queries, 50);
+                assert_eq!(args.warmup_queries, 5);
+                assert_eq!(args.tenant_count, 8);
+                assert_eq!(args.category_count, 4);
+                assert!(args.output.is_none());
+            }
+            _ => panic!("filtered-vector subcommand should parse"),
+        }
+    }
+
+    #[test]
+    fn vector_memory_cli_defaults_to_phase3_artifact_shape() {
+        let cli = Cli::try_parse_from(["ultrasql-bench", "vector-memory"])
+            .expect("parse vector-memory args");
+        match cli.command {
+            Some(Command::VectorMemory(args)) => {
+                assert_eq!(args.rows, 10_000);
+                assert_eq!(args.dims, 8);
+                assert_eq!(args.m, 16);
+                assert_eq!(args.lists, 64);
+                assert_eq!(args.probes, 8);
+                assert!(args.output.is_none());
+            }
+            _ => panic!("vector-memory subcommand should parse"),
         }
     }
 

@@ -101,9 +101,12 @@ const HYBRID_SEARCH_REQUIRED_METRICS: &[&str] = &[
     "vector_score",
 ];
 const RAG_RETRIEVAL_REQUIRED_METRICS: &[&str] = &[
+    "expected_doc_ids",
+    "observed_doc_ids",
     "recall_at_k",
     "precision_at_k",
     "mrr",
+    "latency_us",
     "answer_citation_coverage",
 ];
 const PARQUET_SMOKE_ROW_GROUP_ROWS: usize = 4_096;
@@ -153,6 +156,8 @@ struct HybridSearchCertification {
 
 #[derive(Debug, Clone)]
 struct RagRetrievalCertification {
+    expected_doc_ids: Vec<String>,
+    observed_doc_ids: Vec<String>,
     expected_chunks: Vec<String>,
     observed_chunks: Vec<String>,
     recall_at_k: f64,
@@ -662,6 +667,8 @@ async fn main() -> Result<()> {
             )
             .await?;
             answer = Some(serde_json::json!({
+                "expected_doc_ids": certification.expected_doc_ids.clone(),
+                "observed_doc_ids": certification.observed_doc_ids.clone(),
                 "expected_chunks": certification.expected_chunks.clone(),
                 "observed_chunks": certification.observed_chunks.clone(),
             }));
@@ -832,9 +839,15 @@ async fn main() -> Result<()> {
         report["status"] = serde_json::json!("measured");
         report["required_metrics"] = serde_json::json!(RAG_RETRIEVAL_REQUIRED_METRICS);
         report["top_k"] = serde_json::json!(certification.expected_chunks.len());
+        report["expected_doc_ids"] = serde_json::json!(certification.expected_doc_ids);
+        report["observed_doc_ids"] = serde_json::json!(certification.observed_doc_ids);
         report["recall_at_k"] = serde_json::json!(certification.recall_at_k);
         report["precision_at_k"] = serde_json::json!(certification.precision_at_k);
         report["mrr"] = serde_json::json!(certification.mrr);
+        report["latency_us"] = serde_json::json!(p50_latency_us);
+        report["p50_latency_us"] = serde_json::json!(p50_latency_us);
+        report["p95_latency_us"] = serde_json::json!(p95_latency_us);
+        report["p99_latency_us"] = serde_json::json!(p99_latency_us);
         report["answer_citation_coverage"] =
             serde_json::json!(certification.answer_citation_coverage);
         report["policy"] = serde_json::json!(
@@ -2909,6 +2922,7 @@ async fn run_rag_retrieval_quality(
         .into_iter()
         .take(top_k)
         .collect::<Vec<_>>();
+    let expected_doc_ids = doc_ids_for_rag_chunks(&expected_chunks);
     let query = format!(
         "SELECT chunk_id FROM bench_rag_embeddings \
          WHERE tenant_id = 'tenant-a' AND is_current = true \
@@ -2941,7 +2955,10 @@ async fn run_rag_retrieval_quality(
 
     drop(client);
     conn_handle.abort();
+    let observed_doc_ids = doc_ids_for_rag_chunks(&observed_chunks);
     Ok(RagRetrievalCertification {
+        expected_doc_ids,
+        observed_doc_ids,
         expected_chunks,
         observed_chunks,
         recall_at_k: 1.0,
@@ -2949,6 +2966,27 @@ async fn run_rag_retrieval_quality(
         mrr: 1.0,
         answer_citation_coverage: 1.0,
     })
+}
+
+fn doc_ids_for_rag_chunks(chunks: &[String]) -> Vec<String> {
+    let mut doc_ids = Vec::new();
+    for chunk in chunks {
+        let Some(doc_id) = rag_doc_id_for_chunk(chunk) else {
+            continue;
+        };
+        if !doc_ids.iter().any(|existing| existing == doc_id) {
+            doc_ids.push(doc_id.to_owned());
+        }
+    }
+    doc_ids
+}
+
+fn rag_doc_id_for_chunk(chunk_id: &str) -> Option<&'static str> {
+    match chunk_id {
+        "chunk-alpha" | "chunk-omega" => Some("doc-a"),
+        "chunk-tenant-b" => Some("doc-b"),
+        _ => None,
+    }
 }
 
 /// Mixed-OLTP pgbench-like 1-second-window workload.

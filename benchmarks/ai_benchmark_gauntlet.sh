@@ -160,6 +160,39 @@ run_ann_recall_latency() {
         benchmarks/vector_ann_hnsw.sh
 }
 
+run_filtered_vector_search() {
+    local rows dims top_k queries warmup tenant_count category_count artifact
+    if [[ "$PROFILE" == "smoke" ]]; then
+        rows="${AI_GAUNTLET_FILTERED_ROWS:-${AI_GAUNTLET_VECTOR_ROWS:-512}}"
+        dims="${AI_GAUNTLET_VECTOR_DIMS:-8}"
+        top_k="${AI_GAUNTLET_FILTERED_K:-${AI_GAUNTLET_VECTOR_K:-5}}"
+        queries="${AI_GAUNTLET_FILTERED_QUERIES:-${AI_GAUNTLET_QUERIES:-4}}"
+        warmup="${AI_GAUNTLET_WARMUP:-0}"
+    else
+        rows="${AI_GAUNTLET_FILTERED_ROWS:-${AI_GAUNTLET_VECTOR_ROWS:-10000}}"
+        dims="${AI_GAUNTLET_VECTOR_DIMS:-8}"
+        top_k="${AI_GAUNTLET_FILTERED_K:-${AI_GAUNTLET_VECTOR_K:-10}}"
+        queries="${AI_GAUNTLET_FILTERED_QUERIES:-${AI_GAUNTLET_QUERIES:-50}}"
+        warmup="${AI_GAUNTLET_WARMUP:-5}"
+    fi
+    tenant_count="${AI_GAUNTLET_FILTERED_TENANTS:-8}"
+    category_count="${AI_GAUNTLET_FILTERED_CATEGORIES:-4}"
+    artifact="$RAW_DIR/ai_gauntlet_filtered_vector_search_${PROFILE}-ultrasql.json"
+    CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
+        cargo build --release --package ultrasql-bench --bin ultrasql-bench >/dev/null
+    target/release/ultrasql-bench filtered-vector \
+        --profile "$PROFILE" \
+        --workload-id "ai_gauntlet_filtered_vector_search_${PROFILE}" \
+        --rows "$rows" \
+        --dims "$dims" \
+        --top-k "$top_k" \
+        --queries "$queries" \
+        --warmup "$warmup" \
+        --tenant-count "$tenant_count" \
+        --category-count "$category_count" \
+        --output "$artifact"
+}
+
 run_hybrid_search_latency() {
     local rows top_k iters warmup artifact
     if [[ "$PROFILE" == "smoke" ]]; then
@@ -211,6 +244,32 @@ run_rag_retrieval_quality() {
         --output "$artifact"
 }
 
+run_memory_per_million_vectors() {
+    local rows dims lists probes artifact
+    if [[ "$PROFILE" == "smoke" ]]; then
+        rows="${AI_GAUNTLET_MEMORY_ROWS:-512}"
+        dims="${AI_GAUNTLET_VECTOR_DIMS:-8}"
+        lists="${AI_GAUNTLET_IVFFLAT_LISTS:-16}"
+        probes="${AI_GAUNTLET_IVFFLAT_PROBES:-4}"
+    else
+        rows="${AI_GAUNTLET_MEMORY_ROWS:-10000}"
+        dims="${AI_GAUNTLET_VECTOR_DIMS:-8}"
+        lists="${AI_GAUNTLET_IVFFLAT_LISTS:-64}"
+        probes="${AI_GAUNTLET_IVFFLAT_PROBES:-8}"
+    fi
+    artifact="$RAW_DIR/ai_gauntlet_memory_per_million_vectors_${PROFILE}-ultrasql.json"
+    CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
+        cargo build --release --package ultrasql-bench --bin ultrasql-bench >/dev/null
+    target/release/ultrasql-bench vector-memory \
+        --profile "$PROFILE" \
+        --workload-id "ai_gauntlet_memory_per_million_vectors_${PROFILE}" \
+        --rows "$rows" \
+        --dims "$dims" \
+        --lists "$lists" \
+        --probes "$probes" \
+        --output "$artifact"
+}
+
 run_suite \
     "exact_vector_scan" \
     "$RAW_DIR/vector_topk_exact_*-{ultrasql,postgres17_pgvector,duckdb_list,clickhouse_vector}.json" \
@@ -220,6 +279,10 @@ run_suite \
     "$RAW_DIR/vector_ann_hnsw_*-ultrasql_hnsw.json" \
     run_ann_recall_latency
 run_suite \
+    "filtered_vector_search" \
+    "$RAW_DIR/ai_gauntlet_filtered_vector_search_${PROFILE}-ultrasql.json" \
+    run_filtered_vector_search
+run_suite \
     "hybrid_search_latency" \
     "$RAW_DIR/ai_gauntlet_hybrid_search_latency_${PROFILE}-ultrasql.json" \
     run_hybrid_search_latency
@@ -228,14 +291,12 @@ run_suite \
     "$RAW_DIR/ai_gauntlet_rag_retrieval_quality_${PROFILE}-ultrasql.json" \
     run_rag_retrieval_quality
 run_missing_suite \
-    "filtered_vector_search" \
-    "p50_latency_us,p95_latency_us,p99_latency_us,recall_at_k,filter_selectivity"
-run_missing_suite \
     "ingestion_throughput" \
     "rows_per_second,bytes_per_second,copy_time_us,index_update_time_us"
-run_missing_suite \
+run_suite \
     "memory_per_million_vectors" \
-    "memory_bytes_per_million_vectors,index_bytes_per_million_vectors"
+    "$RAW_DIR/ai_gauntlet_memory_per_million_vectors_${PROFILE}-ultrasql.json" \
+    run_memory_per_million_vectors
 run_missing_suite \
     "cold_start_index_load" \
     "load_time_us,ready_time_us,index_bytes"
