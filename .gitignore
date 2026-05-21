@@ -13,6 +13,10 @@ perf.data
 perf.data.old
 cargo-timing*.html
 
+# Python test caches
+__pycache__/
+*.py[cod]
+
 # IDE
 .idea/
 .vscode/
