@@ -9,7 +9,7 @@
   "n_rows": 10000,
   "warmup": 1,
   "iters": 3,
-  "generated_at_unix": 1779369468,
+  "generated_at_unix": 1779397803,
   "status": "partial",
   "passed": false,
   "engines": [

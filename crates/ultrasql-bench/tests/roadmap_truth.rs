@@ -56,7 +56,8 @@ fn roadmap_firebolt_status_is_local_core_only() {
     let roadmap = repo_file("ROADMAP.md");
 
     assert!(roadmap.contains("local Firebolt Core runner exists"));
-    assert!(roadmap.contains("local Firebolt Core run pending measured artifact"));
+    assert!(roadmap.contains("local Firebolt Core smoke measured"));
+    assert!(roadmap.contains("Firebolt artifact remains not_available"));
     assert!(!roadmap.contains("endpoint pending"));
     assert!(!roadmap.contains("Cloud-first"));
 }

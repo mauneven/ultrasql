@@ -9,11 +9,11 @@
   "n_rows": 10000,
   "warmup": 1,
   "iters": 3,
-  "generated_at_unix": 1779369466,
-  "status": "partial",
-  "passed": false,
-  "both_engines_measured": false,
-  "claim_status": "not_claimed",
+  "generated_at_unix": 1779397795,
+  "status": "passed",
+  "passed": true,
+  "both_engines_measured": true,
+  "claim_status": "eligible",
   "same_workload": {
     "dataset_generator": "row_id -> tenant_id=row_id%32, bucket=(row_id//32)%64, amount=((row_id*17)%1000)-500",
     "query": "SELECT tenant_id, bucket, SUM(amount), COUNT(*) WHERE tenant_id = 7 GROUP BY tenant_id, bucket ORDER BY tenant_id, bucket",
@@ -30,8 +30,8 @@
     },
     {
       "engine": "firebolt",
-      "status": "unavailable",
-      "exit_code": 2,
+      "status": "measured",
+      "exit_code": 0,
       "artifact": "benchmarks/results/latest/raw/firebolt_aggregate_index_10k-firebolt.json"
     }
   ],

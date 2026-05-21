@@ -17,17 +17,15 @@
   "median_us": null,
   "p95_us": null,
   "status": "not_available",
-  "reason": "docker_unavailable",
-  "generated_at_unix": 1779369468,
+  "reason": "primary_index_pruning_evidence_missing",
+  "detail": "{\"data\": [[\"[0] [Projection] ultrasql_firebolt_sparse_1779397803_34613.event_day, c_0: 7, ultrasql_firebolt_sparse_1779397803_34613.bucket, sum_0, count_0\\n|   [Types]: c_0: integer not null\\n \\\\_[1] [Sort] OrderBy: [ultrasql_firebolt_sparse_1779397803_34613.event_day Ascending Last, ultrasql_firebolt_sparse_1779397803_34613.bucket Ascending Last]\\n    \\\\_[2] [Aggregate] GroupBy: [ultrasql_firebolt_sparse_1779397803_34613.event_day, ultrasql_firebolt_sparse_1779397803_34613.bucket] Aggregates: [sum_0: sum(ultrasql_firebolt_sparse_1779397803_34613.amount), count_0: count(*)]\\n      |   [Types]: sum_0: numeric(38, 0) null, count_0: bigint not null\\n       \\\\_[3] [Projection] ultrasql_firebolt_sparse_1779397803_34613.event_day, ultrasql_firebolt_sparse_1779397803_34613.bucket, ultrasql_firebolt_sparse_1779397803_34613.amount\\n          \\\\_[4] [Filter] (ultrasql_firebolt_sparse_1779397803_34613.event_day >= 18), (ultrasql_firebolt_sparse_1779397803_34613.event_day <= 20), (ultrasql_firebol",
+  "primary_index": "event_day, tenant_id, bucket",
+  "index_granularity": 1024,
   "required_metrics": [
     "median_us",
     "min_us",
     "load_time_us",
     "primary_index_pruning_evidence"
   ],
-  "required_shape": {
-    "ddl": "CREATE FACT TABLE fact_events (...) PRIMARY INDEX event_day, tenant_id, bucket WITH (index_granularity = 1024)",
-    "query": "SELECT event_day, tenant_id, bucket, SUM(amount), COUNT(*) FROM fact_events WHERE event_day BETWEEN ? AND ? AND tenant_id = 7 GROUP BY event_day, tenant_id, bucket"
-  },
-  "policy": "No Firebolt sparse-pruning benchmark claim exists until local Firebolt Core Docker emits measured samples and a raw EXPLAIN artifact shows primary-index pruning evidence."
+  "policy": "No Firebolt sparse-pruning benchmark claim exists until this artifact is measured and EXPLAIN shows primary-index pruning."
 }

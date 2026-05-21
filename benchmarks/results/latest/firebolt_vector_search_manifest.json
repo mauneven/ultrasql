@@ -11,9 +11,9 @@
   "top_k": 10,
   "queries": 4,
   "warmup_queries": 0,
-  "generated_at_unix": 1779369468,
-  "status": "partial",
-  "passed": false,
+  "generated_at_unix": 1779397834,
+  "status": "passed",
+  "passed": true,
   "engines": [
     {
       "engine": "ultrasql",
@@ -23,8 +23,8 @@
     },
     {
       "engine": "firebolt",
-      "status": "unavailable",
-      "exit_code": 2,
+      "status": "measured",
+      "exit_code": 0,
       "artifact": "benchmarks/results/latest/raw/vector_ann_hnsw_512_8d_k10-firebolt_hnsw.json"
     }
   ],

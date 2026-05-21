@@ -257,6 +257,9 @@ uses the upstream pinned `firebolt/create.sql` and `firebolt/queries.sql`
 files, mounts the Parquet directory into the Core container, and records
 `status: "not_available"` with `reason: "clickbench_parquet_missing"` or
 `reason: "firebolt_core_unavailable"` when local prerequisites are absent.
+Set `CLICKBENCH_FIREBOLT_LOAD_LIMIT=N` only for smoke runs on small local
+hosts; artifacts with this field are labelled `certification_scope:
+"smoke_subset"` and must not be used as full ClickBench certification.
 The script writes
 `benchmarks/results/latest/clickbench_certification.json`, including
 per-query runtimes, unsupported-query errors as `null`, geometric means,

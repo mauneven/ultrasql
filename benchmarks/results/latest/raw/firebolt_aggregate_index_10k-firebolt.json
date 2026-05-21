@@ -5,25 +5,34 @@
   "suite": "firebolt_aggregate_index",
   "profile": "smoke",
   "n_rows": 10000,
-  "warmup": 1,
-  "iters": 3,
   "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
-  "firebolt_version": null,
+  "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
   "core_mode": "local_docker",
   "host_cpu": "arm",
   "host_memory": 17179869184,
   "dataset_rows": 10000,
-  "samples": 0,
-  "median_us": null,
-  "p95_us": null,
-  "status": "not_available",
-  "reason": "docker_unavailable",
-  "generated_at_unix": 1779369466,
-  "required_shape": {
-    "ddl": "CREATE AGGREGATING INDEX idx ON fact_events (tenant_id, bucket, SUM(amount), COUNT(*))",
-    "query": "SELECT tenant_id, bucket, SUM(amount), COUNT(*) FROM fact_events WHERE tenant_id = 7 GROUP BY tenant_id, bucket ORDER BY tenant_id, bucket",
-    "firebolt_plan_marker": "Aggregating Index",
-    "http_output_format": "output_format=JSON_Compact"
+  "samples": 3,
+  "median_us": 5197.582999244332,
+  "p95_us": 5296.959076076746,
+  "min_us": 5150.250042788684,
+  "iterations_us": [
+    5150.250042788684,
+    5296.959076076746,
+    5197.582999244332
+  ],
+  "load_time_us": 443784.62503664196,
+  "index_build_us": 19634.334021247923,
+  "result_row_count": 64,
+  "query": "SELECT tenant_id, bucket, SUM(amount), COUNT(*) FROM ultrasql_firebolt_agg_1779397795_34202 WHERE tenant_id = 7 GROUP BY tenant_id, bucket ORDER BY tenant_id, bucket",
+  "index_ddl": "CREATE AGGREGATING INDEX ultrasql_firebolt_agg_1779397795_34202_idx ON ultrasql_firebolt_agg_1779397795_34202 (tenant_id, bucket, SUM(amount), COUNT(*))",
+  "explain_contains": "Aggregating Index",
+  "explain_evidence": {
+    "materialized_index_relation": true,
+    "summerge": true,
+    "countmerge": true
   },
-  "policy": "No Firebolt aggregate-index benchmark claim exists until a local Firebolt Core Docker run emits measured samples and an EXPLAIN artifact showing Aggregating Index usage."
+  "aggregating_index_used": true,
+  "http_output_format": "output_format=JSON_Compact",
+  "status": "measured",
+  "policy": "No Firebolt aggregate-index benchmark claim may be made unless this raw artifact is committed with its runner inputs."
 }

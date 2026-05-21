@@ -10,6 +10,7 @@
     "firebolt"
   ],
   "passed": false,
+  "comparison_ready": false,
   "status": "partial",
   "postgres_result": "benchmarks/results/latest/raw/clickbench-postgres17.json",
   "ultrasql_result": "benchmarks/results/latest/raw/clickbench-ultrasql.json",
@@ -24,9 +25,9 @@
       "workload": "clickbench",
       "upstream_ref": "c5eb5d8e9c10fbef5ce16e8750f3e67de24cef0a",
       "dataset": "target/clickbench/hits.parquet",
-      "dataset_rows": null,
+      "dataset_rows": 100000,
       "query_count": 43,
-      "status": "not_available",
+      "status": "measured",
       "host": {
         "cpu": "arm",
         "cores": 10,
@@ -36,16 +37,364 @@
       },
       "host_cpu": "arm",
       "host_memory": 17179869184,
-      "policy": "ClickBench artifact records raw measured samples only; no ranking or winner claim is made unless all compared engines are measured.",
-      "reason": "clickbench_parquet_missing",
-      "detail": "Set CLICKBENCH_DOWNLOAD_PARQUET=1 or CLICKBENCH_PARQUET=/path/to/hits.parquet.",
-      "samples": [],
-      "median_us": null,
-      "p95_us": null,
-      "geomean_ms": null,
+      "policy": "ClickBench Firebolt artifact is eligible only when measured through local Firebolt Core Docker using the pinned upstream Firebolt SQL and the local Parquet dataset mounted into the Core container. Artifacts with CLICKBENCH_FIREBOLT_LOAD_LIMIT are smoke-only and not full ClickBench certification.",
+      "queries": [
+        {
+          "query": 1,
+          "median_ms": 2.8807909693568945,
+          "runs_ms": [
+            2.8807909693568945
+          ],
+          "error": null
+        },
+        {
+          "query": 2,
+          "median_ms": 6.777166971005499,
+          "runs_ms": [
+            6.777166971005499
+          ],
+          "error": null
+        },
+        {
+          "query": 3,
+          "median_ms": 7.249084068462253,
+          "runs_ms": [
+            7.249084068462253
+          ],
+          "error": null
+        },
+        {
+          "query": 4,
+          "median_ms": 7.347458973526955,
+          "runs_ms": [
+            7.347458973526955
+          ],
+          "error": null
+        },
+        {
+          "query": 5,
+          "median_ms": 7.418958004564047,
+          "runs_ms": [
+            7.418958004564047
+          ],
+          "error": null
+        },
+        {
+          "query": 6,
+          "median_ms": 8.042291970923543,
+          "runs_ms": [
+            8.042291970923543
+          ],
+          "error": null
+        },
+        {
+          "query": 7,
+          "median_ms": 5.601832992397249,
+          "runs_ms": [
+            5.601832992397249
+          ],
+          "error": null
+        },
+        {
+          "query": 8,
+          "median_ms": 6.183166988193989,
+          "runs_ms": [
+            6.183166988193989
+          ],
+          "error": null
+        },
+        {
+          "query": 9,
+          "median_ms": 9.230417083017528,
+          "runs_ms": [
+            9.230417083017528
+          ],
+          "error": null
+        },
+        {
+          "query": 10,
+          "median_ms": 10.34525001887232,
+          "runs_ms": [
+            10.34525001887232
+          ],
+          "error": null
+        },
+        {
+          "query": 11,
+          "median_ms": 7.055416004732251,
+          "runs_ms": [
+            7.055416004732251
+          ],
+          "error": null
+        },
+        {
+          "query": 12,
+          "median_ms": 9.237708058208227,
+          "runs_ms": [
+            9.237708058208227
+          ],
+          "error": null
+        },
+        {
+          "query": 13,
+          "median_ms": 7.285458035767078,
+          "runs_ms": [
+            7.285458035767078
+          ],
+          "error": null
+        },
+        {
+          "query": 14,
+          "median_ms": 9.056583978235722,
+          "runs_ms": [
+            9.056583978235722
+          ],
+          "error": null
+        },
+        {
+          "query": 15,
+          "median_ms": 9.060459095053375,
+          "runs_ms": [
+            9.060459095053375
+          ],
+          "error": null
+        },
+        {
+          "query": 16,
+          "median_ms": 7.597791031002998,
+          "runs_ms": [
+            7.597791031002998
+          ],
+          "error": null
+        },
+        {
+          "query": 17,
+          "median_ms": 9.882083046250045,
+          "runs_ms": [
+            9.882083046250045
+          ],
+          "error": null
+        },
+        {
+          "query": 18,
+          "median_ms": 9.952666936442256,
+          "runs_ms": [
+            9.952666936442256
+          ],
+          "error": null
+        },
+        {
+          "query": 19,
+          "median_ms": 12.616457999683917,
+          "runs_ms": [
+            12.616457999683917
+          ],
+          "error": null
+        },
+        {
+          "query": 20,
+          "median_ms": 6.739874952472746,
+          "runs_ms": [
+            6.739874952472746
+          ],
+          "error": null
+        },
+        {
+          "query": 21,
+          "median_ms": 11.886499938555062,
+          "runs_ms": [
+            11.886499938555062
+          ],
+          "error": null
+        },
+        {
+          "query": 22,
+          "median_ms": 13.612999930046499,
+          "runs_ms": [
+            13.612999930046499
+          ],
+          "error": null
+        },
+        {
+          "query": 23,
+          "median_ms": 15.589082962833345,
+          "runs_ms": [
+            15.589082962833345
+          ],
+          "error": null
+        },
+        {
+          "query": 24,
+          "median_ms": 90.47054103575647,
+          "runs_ms": [
+            90.47054103575647
+          ],
+          "error": null
+        },
+        {
+          "query": 25,
+          "median_ms": 6.442999932914972,
+          "runs_ms": [
+            6.442999932914972
+          ],
+          "error": null
+        },
+        {
+          "query": 26,
+          "median_ms": 5.258333985693753,
+          "runs_ms": [
+            5.258333985693753
+          ],
+          "error": null
+        },
+        {
+          "query": 27,
+          "median_ms": 6.315000005997717,
+          "runs_ms": [
+            6.315000005997717
+          ],
+          "error": null
+        },
+        {
+          "query": 28,
+          "median_ms": 12.891125050373375,
+          "runs_ms": [
+            12.891125050373375
+          ],
+          "error": null
+        },
+        {
+          "query": 29,
+          "median_ms": 16.874958062544465,
+          "runs_ms": [
+            16.874958062544465
+          ],
+          "error": null
+        },
+        {
+          "query": 30,
+          "median_ms": 11.75724994391203,
+          "runs_ms": [
+            11.75724994391203
+          ],
+          "error": null
+        },
+        {
+          "query": 31,
+          "median_ms": 7.200249936431646,
+          "runs_ms": [
+            7.200249936431646
+          ],
+          "error": null
+        },
+        {
+          "query": 32,
+          "median_ms": 8.45979095902294,
+          "runs_ms": [
+            8.45979095902294
+          ],
+          "error": null
+        },
+        {
+          "query": 33,
+          "median_ms": 10.049458011053503,
+          "runs_ms": [
+            10.049458011053503
+          ],
+          "error": null
+        },
+        {
+          "query": 34,
+          "median_ms": 14.01599997188896,
+          "runs_ms": [
+            14.01599997188896
+          ],
+          "error": null
+        },
+        {
+          "query": 35,
+          "median_ms": 3.8811659906059504,
+          "runs_ms": [
+            3.8811659906059504
+          ],
+          "error": null
+        },
+        {
+          "query": 36,
+          "median_ms": 6.245582946576178,
+          "runs_ms": [
+            6.245582946576178
+          ],
+          "error": null
+        },
+        {
+          "query": 37,
+          "median_ms": 4.410958965308964,
+          "runs_ms": [
+            4.410958965308964
+          ],
+          "error": null
+        },
+        {
+          "query": 38,
+          "median_ms": 4.272666992619634,
+          "runs_ms": [
+            4.272666992619634
+          ],
+          "error": null
+        },
+        {
+          "query": 39,
+          "median_ms": 4.019833984784782,
+          "runs_ms": [
+            4.019833984784782
+          ],
+          "error": null
+        },
+        {
+          "query": 40,
+          "median_ms": 4.023666027933359,
+          "runs_ms": [
+            4.023666027933359
+          ],
+          "error": null
+        },
+        {
+          "query": 41,
+          "median_ms": 4.583957954309881,
+          "runs_ms": [
+            4.583957954309881
+          ],
+          "error": null
+        },
+        {
+          "query": 42,
+          "median_ms": 4.030667012557387,
+          "runs_ms": [
+            4.030667012557387
+          ],
+          "error": null
+        },
+        {
+          "query": 43,
+          "median_ms": 4.496083012782037,
+          "runs_ms": [
+            4.496083012782037
+          ],
+          "error": null
+        }
+      ],
+      "samples": 1,
+      "load_time_us": 3177622.6660003886,
+      "load_limit": 100000,
+      "certification_scope": "smoke_subset",
       "core_mode": "local_docker",
       "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
-      "firebolt_version": null
+      "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+      "firebolt_core_endpoint": "http://127.0.0.1:3473",
+      "geomean_ms": 7.86874572584773,
+      "median_us": 7868.74572584773,
+      "p95_us": 15589.082962833345
     }
   ],
   "host": {

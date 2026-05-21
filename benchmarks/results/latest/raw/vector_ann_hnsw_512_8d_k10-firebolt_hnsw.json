@@ -9,21 +9,67 @@
   "top_k": 10,
   "queries": 4,
   "warmup_queries": 0,
+  "metric": "l2",
   "m": 16,
+  "ef_construction": 128,
   "ef_search": 64,
   "seed": 1367265502,
   "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
-  "firebolt_version": null,
+  "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
   "core_mode": "local_docker",
   "host_cpu": "arm",
   "host_memory": 17179869184,
   "dataset_rows": 512,
-  "samples": 0,
-  "median_us": null,
-  "p95_us": null,
-  "status": "not_available",
-  "reason": "docker_unavailable",
-  "generated_at_unix": 1779369468,
+  "samples": 4,
+  "median_us": 13786.520925350487,
+  "p95_us": 18154.666060581803,
+  "recall_at_k": 1.0,
+  "p50_latency_us": 12920.332956127822,
+  "p95_latency_us": 18154.666060581803,
+  "p99_latency_us": 18154.666060581803,
+  "build_time_us": 147279.45893537253,
+  "build_time_scope": "create_table_index_and_insert",
+  "memory_bytes": null,
+  "memory_status": "not_measured",
+  "index_size_bytes": null,
+  "index_size_status": "not_measured",
+  "query_iterations_us": [
+    18154.666060581803,
+    14652.708894573152,
+    12920.332956127822,
+    11762.750102207065
+  ],
+  "recall_iterations": [
+    1.0,
+    1.0,
+    1.0,
+    1.0
+  ],
+  "first_exact_answer": [
+    454,
+    420,
+    366,
+    169,
+    284,
+    367,
+    241,
+    471,
+    218,
+    161
+  ],
+  "first_ann_answer": [
+    454,
+    420,
+    366,
+    169,
+    284,
+    367,
+    241,
+    471,
+    218,
+    161
+  ],
+  "status": "measured",
   "required_metrics": [
     "recall_at_k",
     "p50_latency_us",
@@ -33,9 +79,5 @@
     "memory_bytes",
     "index_size_bytes"
   ],
-  "required_shape": {
-    "ddl": "CREATE INDEX idx ON documents USING HNSW (embedding vector_l2sq_ops) WITH (dimension = ?, m = ?, ef_construction = ?, quantization = 'f32')",
-    "query": "SELECT id FROM VECTOR_SEARCH(INDEX idx, target_vector => ?, top_k => ?, ef_search => ?)"
-  },
-  "policy": "No Firebolt vector-search benchmark claim exists until local Firebolt Core Docker emits measured VECTOR_SEARCH samples from reproducible inputs."
+  "policy": "No Firebolt vector-search benchmark claim may be made unless this raw artifact is committed with its runner inputs."
 }

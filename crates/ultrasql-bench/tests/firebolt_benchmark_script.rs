@@ -32,6 +32,9 @@ fn firebolt_aggregate_script_declares_competitor_and_index_workload() {
     assert!(script.contains("firebolt_aggregate_index_manifest.json"));
     assert!(script.contains("CREATE AGGREGATING INDEX"));
     assert!(script.contains("Aggregating Index"));
+    assert!(script.contains("summerge"));
+    assert!(script.contains("countmerge"));
+    assert!(script.contains("import math"));
     assert!(script.contains("output_format=JSON_Compact"));
     assert!(script.contains("target/release/cross_compare_sql"));
     assert!(script.contains("\"status\": \"not_available\""));
@@ -111,6 +114,9 @@ fn firebolt_core_local_helper_manages_local_docker_core_only() {
     assert!(script.contains("FIREBOLT_CORE_ENDPOINT"));
     assert!(script.contains("ghcr.io/firebolt-db/firebolt-core"));
     assert!(script.contains("docker run"));
+    assert!(script.contains("FIREBOLT_CORE_DOCKER_CONFIG"));
+    assert!(script.contains("docker_context_host"));
+    assert!(script.contains("docker_pull_image"));
     assert!(script.contains("SELECT 42;"));
     assert!(script.contains("wait_ready"));
     assert!(script.contains("clean --yes"));
@@ -183,7 +189,6 @@ fn firebolt_artifacts_have_required_local_core_schema() {
         "median_us",
         "p95_us",
         "status",
-        "docker_unavailable",
     ];
     for path in [
         "benchmarks/firebolt_aggregate_index.sh",
@@ -197,6 +202,18 @@ fn firebolt_artifacts_have_required_local_core_schema() {
         for field in required_fields {
             assert!(text.contains(field), "{path} missing {field}");
         }
+    }
+
+    for path in [
+        "benchmarks/firebolt_aggregate_index.sh",
+        "benchmarks/firebolt_sparse_pruning.sh",
+        "benchmarks/firebolt_vector_search.sh",
+    ] {
+        let text = repo_file(path);
+        assert!(
+            text.contains("docker_unavailable"),
+            "{path} missing docker_unavailable"
+        );
     }
 }
 
@@ -279,6 +296,7 @@ fn clickbench_certification_uses_local_firebolt_core_runner() {
     assert!(!script.contains(LEGACY_FIREBOLT_REMOTE_ENV));
     assert!(script.contains("CLICKBENCH_PARQUET"));
     assert!(script.contains("CLICKBENCH_DOWNLOAD_PARQUET"));
+    assert!(script.contains("CLICKBENCH_FIREBOLT_LOAD_LIMIT"));
     assert!(script.contains("firebolt/create.sql"));
     assert!(script.contains("firebolt/queries.sql"));
     assert!(script.contains("FIREBOLT_CORE_HELPER"));
@@ -289,7 +307,10 @@ fn clickbench_certification_uses_local_firebolt_core_runner() {
     assert!(script.contains("local Firebolt Core Docker"));
     assert!(script.contains("core_mode"));
     assert!(script.contains("local_docker"));
-    assert!(!script.contains("Firebolt Core local ClickBench loader/query runner is not wired yet."));
+    assert!(script.contains("comparison_ready"));
+    assert!(
+        !script.contains("Firebolt Core local ClickBench loader/query runner is not wired yet.")
+    );
 }
 
 #[test]

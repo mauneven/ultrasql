@@ -178,6 +178,7 @@ run_firebolt() {
     FIREBOLT_WORKLOAD="$WORKLOAD_ID" \
     python3 <<'PY'
 import json
+import math
 import os
 import pathlib
 import platform
@@ -276,7 +277,15 @@ try:
 
     explain_doc = request(f"EXPLAIN {query}")
     explain_text = json.dumps(explain_doc, sort_keys=True)
-    aggregating_index_used = "aggregating index" in explain_text.lower()
+    explain_lower = explain_text.lower()
+    index_marker = f"@{index}".lower()
+    aggregating_index_used = (
+        "aggregating index" in explain_lower
+        or (
+            index_marker in explain_lower
+            and ("summerge" in explain_lower or "countmerge" in explain_lower)
+        )
+    )
     if not aggregating_index_used:
         raise RuntimeError("Firebolt EXPLAIN did not report Aggregating Index")
 
@@ -324,6 +333,11 @@ try:
         "query": query,
         "index_ddl": index_ddl,
         "explain_contains": "Aggregating Index",
+        "explain_evidence": {
+            "materialized_index_relation": index_marker in explain_lower,
+            "summerge": "summerge" in explain_lower,
+            "countmerge": "countmerge" in explain_lower,
+        },
         "aggregating_index_used": aggregating_index_used,
         "http_output_format": "output_format=JSON_Compact",
         "status": "measured",

@@ -502,6 +502,7 @@ def firebolt_split_statements(sql: str):
     return [stmt.strip() for stmt in sql.split(";") if stmt.strip()]
 
 def run_firebolt():
+    load_limit = int(os.environ.get("CLICKBENCH_FIREBOLT_LOAD_LIMIT", "0") or "0")
     if not firebolt_parquet_path.exists():
         return not_available(
             "firebolt",
@@ -540,6 +541,11 @@ def run_firebolt():
 
     raw_schema = firebolt_schema_path.read_text(encoding="utf-8")
     raw_schema = raw_schema.replace("file:///firebolt-core/clickbench", "file:///firebolt-core/volume")
+    if load_limit > 0:
+        unlimited = "FROM\n    hits_external;"
+        limited = f"FROM\n    hits_external\nLIMIT {load_limit};"
+        if unlimited in raw_schema:
+            raw_schema = raw_schema.replace(unlimited, limited)
     fb_queries = [
         q.strip()
         for q in firebolt_queries_path.read_text(encoding="utf-8").split(";")
@@ -558,8 +564,18 @@ def run_firebolt():
     except Exception as exc:
         doc = not_available("firebolt", "firebolt_load_failed", str(exc))
         doc["load_time_us"] = (time.perf_counter() - started) * 1_000_000.0
+        doc["load_limit"] = load_limit or None
         return doc
     load_time_us = (time.perf_counter() - started) * 1_000_000.0
+
+    loaded_rows = row_count
+    try:
+        count_doc = firebolt_request("SELECT COUNT(*) FROM hits")
+        count_rows = count_doc.get("data") if isinstance(count_doc, dict) else None
+        if count_rows and count_rows[0]:
+            loaded_rows = int(count_rows[0][0])
+    except Exception:
+        pass
 
     q_results = []
     for idx, query in enumerate(fb_queries, start=1):
@@ -582,11 +598,13 @@ def run_firebolt():
 
     doc = artifact_base("firebolt", "measured")
     doc["dataset"] = str(firebolt_parquet_path)
-    doc["dataset_rows"] = row_count
+    doc["dataset_rows"] = loaded_rows
     doc["query_count"] = len(fb_queries)
     doc["queries"] = q_results
     doc["samples"] = runs
     doc["load_time_us"] = load_time_us
+    doc["load_limit"] = load_limit or None
+    doc["certification_scope"] = "smoke_subset" if load_limit > 0 else "full_dataset"
     doc["core_mode"] = "local_docker"
     doc["docker_image"] = firebolt_image
     doc["firebolt_version"] = firebolt_version()
@@ -594,7 +612,9 @@ def run_firebolt():
     doc["policy"] = (
         "ClickBench Firebolt artifact is eligible only when measured through "
         "local Firebolt Core Docker using the pinned upstream Firebolt SQL and "
-        "the local Parquet dataset mounted into the Core container."
+        "the local Parquet dataset mounted into the Core container. Artifacts "
+        "with CLICKBENCH_FIREBOLT_LOAD_LIMIT are smoke-only and not full "
+        "ClickBench certification."
     )
     return doc
 
@@ -661,11 +681,14 @@ for result in results:
 
 pg = next((r for r in results if r["engine"] == "postgres17"), None)
 ul = next((r for r in results if r["engine"] == "ultrasql"), None)
-passed = (
+comparison_ready = (
     pg is not None
     and ul is not None
     and pg["geomean_ms"] is not None
     and ul["geomean_ms"] is not None
+)
+passed = (
+    comparison_ready
     and ul["geomean_ms"] * 5.0 <= pg["geomean_ms"]
 )
 doc = {
@@ -678,7 +701,8 @@ doc = {
     "target": "UltraSQL geometric mean at least 5x faster than PostgreSQL when both are measured; other requested engines publish measured or not_available artifacts",
     "requested_engines": requested_engines,
     "passed": passed,
-    "status": "passed" if passed else "partial" if any(r.get("status") == "not_available" for r in results) else "failed",
+    "comparison_ready": comparison_ready,
+    "status": "passed" if passed else "partial" if (not comparison_ready or any(r.get("status") == "not_available" for r in results)) else "failed",
     "postgres_result": str(raw_dir / "clickbench-postgres17.json"),
     "ultrasql_result": str(raw_dir / "clickbench-ultrasql.json"),
     "duckdb_result": str(raw_dir / "clickbench-duckdb.json"),
@@ -693,7 +717,7 @@ if passed:
     sys.exit(0)
 if any(r.get("status") == "failed" for r in results):
     sys.exit(1)
-if any(r.get("status") == "not_available" for r in results):
+if not comparison_ready or any(r.get("status") == "not_available" for r in results):
     sys.exit(2)
 sys.exit(1)
 PY

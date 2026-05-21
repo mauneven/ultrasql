@@ -16,6 +16,7 @@ FIREBOLT_CORE_REPO="${FIREBOLT_CORE_REPO:-ghcr.io/firebolt-db/firebolt-core}"
 FIREBOLT_CORE_TAG="${FIREBOLT_CORE_TAG:-preview-rc}"
 FIREBOLT_CORE_IMAGE="${FIREBOLT_CORE_IMAGE:-${FIREBOLT_CORE_REPO}:${FIREBOLT_CORE_TAG}}"
 FIREBOLT_CORE_DATA_DIR="${FIREBOLT_CORE_DATA_DIR:-$REPO_ROOT/target/firebolt-core-data}"
+FIREBOLT_CORE_DOCKER_CONFIG="${FIREBOLT_CORE_DOCKER_CONFIG:-$REPO_ROOT/target/firebolt-core-docker-config}"
 FIREBOLT_CORE_WAIT_SECS="${FIREBOLT_CORE_WAIT_SECS:-30}"
 
 endpoint_with_format() {
@@ -50,6 +51,34 @@ container_running() {
 
 container_exists() {
     docker ps -a --filter "name=^/${FIREBOLT_CORE_CONTAINER}$" --format '{{.ID}}' | grep -q .
+}
+
+docker_context_host() {
+    local context
+    context="$(docker context show 2>/dev/null || true)"
+    if [[ -n "$context" ]]; then
+        docker context inspect "$context" --format '{{(index .Endpoints "docker").Host}}' 2>/dev/null || true
+    fi
+}
+
+docker_pull_image() {
+    if docker pull --quiet "$FIREBOLT_CORE_IMAGE" >/dev/null; then
+        return 0
+    fi
+
+    mkdir -p "$FIREBOLT_CORE_DOCKER_CONFIG"
+    if [[ ! -f "$FIREBOLT_CORE_DOCKER_CONFIG/config.json" ]]; then
+        printf '{"auths":{}}\n' >"$FIREBOLT_CORE_DOCKER_CONFIG/config.json"
+    fi
+    local docker_host
+    docker_host="$(docker_context_host)"
+    if [[ -n "$docker_host" ]]; then
+        DOCKER_CONFIG="$FIREBOLT_CORE_DOCKER_CONFIG" \
+        DOCKER_HOST="$docker_host" \
+            docker pull --quiet "$FIREBOLT_CORE_IMAGE" >/dev/null
+    else
+        DOCKER_CONFIG="$FIREBOLT_CORE_DOCKER_CONFIG" docker pull --quiet "$FIREBOLT_CORE_IMAGE" >/dev/null
+    fi
 }
 
 core_ready() {
@@ -90,7 +119,7 @@ start_core() {
 
     mkdir -p "$FIREBOLT_CORE_DATA_DIR"
     chmod 777 "$FIREBOLT_CORE_DATA_DIR" >/dev/null 2>&1 || true
-    if ! docker pull --quiet "$FIREBOLT_CORE_IMAGE" >/dev/null; then
+    if ! docker_pull_image; then
         echo "firebolt_core_local.sh: failed to pull $FIREBOLT_CORE_IMAGE" >&2
         return 2
     fi

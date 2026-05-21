@@ -102,14 +102,14 @@ are grounds for revert.
 | v0.6 | TPC-H scale 1 correctness (all 22 queries) | result-equal to DuckDB ✅ | `validate-results` result comparison |
 | v0.6+ | TPC-H scale 1 performance certification | ≥ 2× PostgreSQL 17 ⚠️ pending | geometric mean query time |
 | v0.7 | TPC-H scale 10 (all 22 queries) | ≥ 2× DuckDB ✅ latest local artifact status passed; 22/22 DuckDB and UltraSQL query timings in `benchmarks/results/latest/tpch_sf10_certification.json` | geometric mean query time |
-| v0.7 | ClickBench (`hits.parquet` analytical queries) | ≥ 5× faster than PostgreSQL 17 ⚠️ not certified; runner records missing dataset/DSN failures and now includes a local Firebolt Core Parquet leg; measured dataset/Core artifacts remain pending | geometric mean query time |
+| v0.7 | ClickBench (`hits.parquet` analytical queries) | ≥ 5× faster than PostgreSQL 17 ⚠️ not certified; runner records missing dataset/DSN failures and includes a local Firebolt Core Parquet leg; local Core smoke-subset artifact measured at 100k rows, full dataset load timed out on 16 GiB Colima host | geometric mean query time |
 | v0.9 | TPC-B (OLTP, 32 connections) | ≥ 2× PostgreSQL 17, p99 < 5 ms | throughput + latency |
 | v1.0 | TPC-C (all 5 tx types, 32 connections) | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
 | v1.0 | Sysbench OLTP read/write | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
-| v1.0 | Firebolt aggregating-index dashboard aggregate | ≥ 2× Firebolt ⚠️ local Firebolt Core runner exists; UltraSQL smoke artifact exists; local Firebolt Core run pending measured artifact | median query latency |
-| v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ local Firebolt Core runner exists; UltraSQL smoke artifact exists; local Firebolt Core run pending measured artifact | median query latency |
+| v1.0 | Firebolt aggregating-index dashboard aggregate | ≥ 2× Firebolt ✅ local Firebolt Core smoke measured; both UltraSQL and Firebolt artifacts present and EXPLAIN uses Firebolt aggregate-index backing relation | median query latency |
+| v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ local Firebolt Core runner exists and UltraSQL smoke artifact measured; Core EXPLAIN does not expose primary-index pruning evidence on 10k smoke, so Firebolt artifact remains not_available instead of a claim | median query latency |
 | v1.0 | Firebolt-style wide filter/projection late materialization | UltraSQL smoke artifact exists ⚠️ local Firebolt Core same-host runner/artifact pending | median latency + candidates/fetched/skipped |
-| v1.0 | Firebolt HNSW vector search | recall/latency artifact vs UltraSQL HNSW ⚠️ local Firebolt Core runner exists; measured vector-support artifact pending | recall@k + p50/p95/p99 |
+| v1.0 | Firebolt HNSW vector search | recall/latency artifact vs UltraSQL HNSW ✅ local Firebolt Core smoke measured; UltraSQL and Firebolt HNSW artifacts present | recall@k + p50/p95/p99 |
 | v2.x | Star Schema Benchmark scale 100 | ≥ 2× ClickHouse | geometric mean query time |
 
 All comparisons follow the methodology in `BENCHMARKS.md`: same host,
