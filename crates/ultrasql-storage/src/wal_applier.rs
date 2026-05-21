@@ -754,6 +754,17 @@ mod tests {
         fn new() -> Self {
             Self::default()
         }
+
+        fn with_page(page_id: PageId, page: &Page) -> Self {
+            let loader = Self::new();
+            let mut copy: Box<[u8; PAGE_SIZE]> = vec![0_u8; PAGE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .expect("alloc matches PAGE_SIZE");
+            copy.copy_from_slice(page.as_bytes());
+            loader.store.lock().insert(page_id, copy);
+            loader
+        }
     }
 
     impl PageLoader for MapLoader {
@@ -982,6 +993,48 @@ mod tests {
         let guard = heap.pool.get_page(pid).unwrap();
         let actual = guard.read().as_bytes().to_vec();
         assert_eq!(actual, page_bytes, "FPW should restore page verbatim");
+    }
+
+    #[test]
+    fn apply_fpw_repairs_torn_page_before_tuple_redo() {
+        let tid = tuple_id(0, 0);
+        let mut torn_page = Page::new_heap();
+        torn_page.insert_tuple(&minimal_tuple(99, tid)).unwrap();
+        torn_page.set_lsn(1);
+        let loader = MapLoader::with_page(page_id(0), &torn_page);
+        let heap = HeapAccess::new(Arc::new(BufferPool::new(64, loader)));
+
+        let torn_tuple = heap.fetch(tid).unwrap();
+        assert_eq!(
+            torn_tuple.header.xmin,
+            Xid::new(99),
+            "test setup must expose the wrong torn-page row before FPW"
+        );
+
+        let checkpoint_image = Page::new_heap();
+        let fpw = FullPageWritePayload {
+            page: page_id(0),
+            page_bytes: checkpoint_image.as_bytes().to_vec(),
+        };
+        heap.apply_full_page_write_at_lsn(&fpw, Lsn::new(100))
+            .unwrap();
+
+        let good_tuple = minimal_tuple(7, tid);
+        heap.apply_insert_at_lsn(
+            &HeapInsertPayload {
+                tid,
+                tuple_bytes: good_tuple,
+            },
+            Lsn::new(128),
+        )
+        .unwrap();
+
+        let recovered = heap.fetch(tid).unwrap();
+        assert_eq!(
+            recovered.header.xmin,
+            Xid::new(7),
+            "FPW replay must repair torn bytes before row redo"
+        );
     }
 
     #[test]
