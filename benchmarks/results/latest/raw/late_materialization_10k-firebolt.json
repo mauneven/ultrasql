@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "suite": "late_materialization",
+  "engine": "firebolt",
+  "workload": "late_materialization_10k",
+  "profile": "smoke",
+  "wide_columns": 100,
+  "projected_columns": [
+    "amount",
+    "pad003",
+    "pad096"
+  ],
+  "dataset_rows": 10000,
+  "n_rows": 10000,
+  "warmup": 0,
+  "iters": 1,
+  "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+  "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+  "core_mode": "local_docker",
+  "local_docker": true,
+  "host_cpu": "arm",
+  "host_memory": 17179869184,
+  "samples": 1,
+  "median_us": 194335.4590330273,
+  "p95_us": 194335.4590330273,
+  "min_us": 194335.4590330273,
+  "iterations_us": [
+    194335.4590330273
+  ],
+  "load_time_us": 29300290.12495652,
+  "result_row_count": 313,
+  "query": "SELECT amount, pad003, pad096 FROM ultrasql_late_mat_1779399924_11162 WHERE tenant_id = 7",
+  "status": "measured",
+  "policy": "No Firebolt late-materialization comparison claim may be made unless this local Core artifact and the matching UltraSQL artifact are committed from the same host/profile."
+}

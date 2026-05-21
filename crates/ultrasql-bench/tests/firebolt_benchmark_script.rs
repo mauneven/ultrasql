@@ -197,6 +197,7 @@ fn firebolt_artifacts_have_required_local_core_schema() {
         "benchmarks/results/latest/raw/firebolt_aggregate_index_10k-firebolt.json",
         "benchmarks/results/latest/raw/firebolt_sparse_pruning_10k-firebolt.json",
         "benchmarks/results/latest/raw/vector_ann_hnsw_512_8d_k10-firebolt_hnsw.json",
+        "benchmarks/results/latest/raw/late_materialization_10k-firebolt.json",
     ] {
         let text = repo_file(path);
         for field in required_fields {
@@ -249,9 +250,16 @@ fn late_materialization_script_declares_firebolt_style_workload() {
     assert!(script.contains("--workload late-materialization"));
     assert!(script.contains("Late-materialization smoke/full runner"));
     assert!(script.contains("LATE_MAT_ENGINES"));
-    assert!(script.contains("ultrasql-late,ultrasql-eager,duckdb,clickhouse"));
+    assert!(script.contains("ultrasql-late,ultrasql-eager,duckdb,clickhouse,firebolt"));
+    assert!(script.contains("FIREBOLT_CORE_HELPER"));
+    assert!(script.contains("FIREBOLT_CORE_ENDPOINT"));
+    assert!(script.contains("local_docker"));
+    assert!(script.contains("firebolt_late_materialization_failed"));
     assert!(script.contains("not_available"));
     assert!(driver.contains("LateMaterialization"));
+    assert!(driver.contains("answer_order"));
+    assert!(driver.contains("eager_rows.sort()"));
+    assert!(driver.contains("late_rows.sort()"));
     assert!(driver.contains("LATE_MAT_WIDE_COLUMNS: usize = 100"));
     assert!(driver.contains("wide_payload_projection_with_selective_index_filter"));
     assert!(driver.contains("eager_scan_median_us"));

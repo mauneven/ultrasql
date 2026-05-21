@@ -108,7 +108,7 @@ are grounds for revert.
 | v1.0 | Sysbench OLTP read/write | ≥ 2× PostgreSQL 17 | throughput (tx/s) |
 | v1.0 | Firebolt aggregating-index dashboard aggregate | ≥ 2× Firebolt ✅ local Firebolt Core smoke measured; both UltraSQL and Firebolt artifacts present and EXPLAIN uses Firebolt aggregate-index backing relation | median query latency |
 | v1.0 | Firebolt sparse primary-index pruning | ≥ 2× Firebolt ⚠️ local Firebolt Core runner exists and UltraSQL smoke artifact measured; Core EXPLAIN does not expose primary-index pruning evidence on 10k smoke, so Firebolt artifact remains not_available instead of a claim | median query latency |
-| v1.0 | Firebolt-style wide filter/projection late materialization | UltraSQL smoke artifact exists ⚠️ local Firebolt Core same-host runner/artifact pending | median latency + candidates/fetched/skipped |
+| v1.0 | Firebolt-style wide filter/projection late materialization | UltraSQL and local Firebolt Core smoke artifacts measured ✅ 10k-row same-host run: UltraSQL late path 550.875 µs vs Firebolt Core 194335.459 µs; UltraSQL EXPLAIN shows Late Materialization counters | median latency + candidates/fetched/skipped |
 | v1.0 | Firebolt HNSW vector search | recall/latency artifact vs UltraSQL HNSW ✅ local Firebolt Core smoke measured; UltraSQL and Firebolt HNSW artifacts present | recall@k + p50/p95/p99 |
 | v2.x | Star Schema Benchmark scale 100 | ≥ 2× ClickHouse | geometric mean query time |
 

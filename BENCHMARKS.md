@@ -367,7 +367,8 @@ same generated query shape. Raw artifacts land under
 
 ### Late Materialization
 
-UltraSQL late-materialization smoke artifacts are recorded by:
+UltraSQL and local Firebolt Core late-materialization smoke artifacts are
+recorded by:
 
 ```text
 benchmarks/late_materialization.sh smoke
@@ -376,10 +377,14 @@ benchmarks/late_materialization.sh smoke
 The runner builds a wide deterministic fact table, creates a B-tree index on
 `tenant_id`, and measures `SELECT amount, pad_c FROM ... WHERE tenant_id = 7`.
 The artifact is only valid when `EXPLAIN ANALYZE` reports `Late
-Materialization` with candidate, fetched, and skipped counters. This is a
-Firebolt-style wide filter/projection baseline for UltraSQL; it is not a
-Firebolt comparison unless a separate Firebolt artifact is measured on the
-same host.
+Materialization` with candidate, fetched, and skipped counters. The Firebolt
+leg uses local Firebolt Core Docker only, builds the same 100-column
+deterministic table, and measures the same `amount, pad003, pad096`
+projection over `tenant_id = 7`. UltraSQL eager/indexed path equality sorts the
+unordered result rows before comparison so heap and index output order do not
+create a false mismatch. Missing Docker/Core support records
+`status: "not_available"`; no remote Firebolt endpoint or unmeasured claim is
+allowed.
 
 ### Firebolt Vector Search
 

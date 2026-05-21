@@ -2691,7 +2691,11 @@ async fn run_shared_late_materialization(
     )
     .await?;
     iters_us.extend(late.samples_us.iter().copied());
-    if late.rows != eager.rows {
+    let mut eager_rows = eager.rows.clone();
+    let mut late_rows = late.rows.clone();
+    eager_rows.sort();
+    late_rows.sort();
+    if late_rows != eager_rows {
         anyhow::bail!(
             "late materialization answer mismatch: eager={:?} late={:?}",
             eager.rows,
@@ -2708,6 +2712,7 @@ async fn run_shared_late_materialization(
         "projected_columns": ["amount", "pad003", "pad096"],
         "query_shape": "wide_payload_projection_with_selective_index_filter",
         "firebolt_style_shape": "wide fact table, selective tenant filter, payload projection",
+        "answer_order": "unordered rows sorted before eager/late equality check",
         "explain_late_materialization": late_line,
         "eager_scan_median_us": eager.median_us,
         "eager_scan_samples_us": eager.samples_us,
