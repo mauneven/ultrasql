@@ -150,6 +150,20 @@ pub enum Workload {
     TpchQ1,
     /// TPC-H query 22 — correlated subquery over customer demographics.
     TpchQ22,
+    /// CSV cold read through the local benchmark gate.
+    CsvColdRead,
+    /// CSV warm read through the local benchmark gate.
+    CsvWarmRead,
+    /// CSV filter predicate workload.
+    CsvFilter,
+    /// CSV group-by workload.
+    CsvGroupBy,
+    /// CSV join-to-table workload.
+    CsvJoinTable,
+    /// CSV copy/import workload.
+    CsvCopyImport,
+    /// CSV malformed-row quarantine workload.
+    CsvMalformedBehavior,
 }
 
 /// External database engines against which UltraSQL is compared.
@@ -387,7 +401,7 @@ const fn stub_run(_ctx: &BenchContext) -> BenchResult {
 ///    `benchmarks/baselines/<stage>.json`.
 pub static REGISTRY: &[BenchSpec] = &SPECS;
 
-static SPECS: [BenchSpec; 17] = [
+static SPECS: [BenchSpec; 24] = [
     // ------------------------------------------------------------------
     // v0.3 — write-side (storage) benchmarks
     //
@@ -636,6 +650,58 @@ static SPECS: [BenchSpec; 17] = [
         // 5 TPC-C transaction types are implemented.
         run: crate::runs::tpcc::run,
     },
+    // CSV gauntlet regression guard. Cross-engine claims remain in the
+    // artifact-producing gauntlet script; these local specs catch UltraSQL CSV
+    // workload regressions without inventing competitor numbers.
+    BenchSpec {
+        id: "csv_cold_read_10k",
+        stage: Stage::V1_0,
+        workload: Workload::CsvColdRead,
+        competitor_floors: &[],
+        run: crate::runs::csv_gauntlet::run_cold_read,
+    },
+    BenchSpec {
+        id: "csv_warm_read_10k",
+        stage: Stage::V1_0,
+        workload: Workload::CsvWarmRead,
+        competitor_floors: &[],
+        run: crate::runs::csv_gauntlet::run_warm_read,
+    },
+    BenchSpec {
+        id: "csv_filter_10k",
+        stage: Stage::V1_0,
+        workload: Workload::CsvFilter,
+        competitor_floors: &[],
+        run: crate::runs::csv_gauntlet::run_filter,
+    },
+    BenchSpec {
+        id: "csv_group_by_10k",
+        stage: Stage::V1_0,
+        workload: Workload::CsvGroupBy,
+        competitor_floors: &[],
+        run: crate::runs::csv_gauntlet::run_group_by,
+    },
+    BenchSpec {
+        id: "csv_join_table_10k",
+        stage: Stage::V1_0,
+        workload: Workload::CsvJoinTable,
+        competitor_floors: &[],
+        run: crate::runs::csv_gauntlet::run_join_table,
+    },
+    BenchSpec {
+        id: "csv_copy_import_10k",
+        stage: Stage::V1_0,
+        workload: Workload::CsvCopyImport,
+        competitor_floors: &[],
+        run: crate::runs::csv_gauntlet::run_copy_import,
+    },
+    BenchSpec {
+        id: "csv_malformed_behavior_10k",
+        stage: Stage::V1_0,
+        workload: Workload::CsvMalformedBehavior,
+        competitor_floors: &[],
+        run: crate::runs::csv_gauntlet::run_malformed_behavior,
+    },
 ];
 
 // ---------------------------------------------------------------------------
@@ -693,6 +759,28 @@ mod tests {
         for (engine, expected) in engines {
             assert_eq!(engine.as_str(), expected);
             assert_eq!(engine.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn registry_tracks_csv_gauntlet_workloads() {
+        let expected = [
+            ("csv_cold_read_10k", Workload::CsvColdRead),
+            ("csv_warm_read_10k", Workload::CsvWarmRead),
+            ("csv_filter_10k", Workload::CsvFilter),
+            ("csv_group_by_10k", Workload::CsvGroupBy),
+            ("csv_join_table_10k", Workload::CsvJoinTable),
+            ("csv_copy_import_10k", Workload::CsvCopyImport),
+            ("csv_malformed_behavior_10k", Workload::CsvMalformedBehavior),
+        ];
+
+        for (id, workload) in expected {
+            let spec = REGISTRY
+                .iter()
+                .find(|spec| spec.id == id)
+                .unwrap_or_else(|| panic!("missing CSV regression-gate spec {id}"));
+            assert_eq!(spec.stage, Stage::V1_0);
+            assert_eq!(spec.workload, workload);
         }
     }
 

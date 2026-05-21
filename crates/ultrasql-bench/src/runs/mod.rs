@@ -38,6 +38,7 @@ pub(crate) fn smoke_row_count(prod: usize, smoke: usize) -> usize {
 }
 
 pub mod btree_point_lookup;
+pub mod csv_gauntlet;
 pub mod delete_throughput;
 pub mod filter_sum_10m;
 pub mod hash_aggregate;

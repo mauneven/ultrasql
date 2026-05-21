@@ -1,0 +1,58 @@
+{
+  "stage": "v1_0",
+  "host": {
+    "cpu": "unrecorded",
+    "cores": 0,
+    "ram_gb": 0,
+    "os": "unrecorded"
+  },
+  "git_commit": "unrecorded",
+  "captured_at": "1970-01-01T00:00:00Z",
+  "tolerance_pct": 5.0,
+  "benchmarks": {
+    "tpcc_5types": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {
+        "postgres17": 0.0,
+        "sqlite3": 0.0,
+        "cockroachdb": 0.0
+      }
+    },
+    "csv_cold_read_10k": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {}
+    },
+    "csv_warm_read_10k": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {}
+    },
+    "csv_filter_10k": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {}
+    },
+    "csv_group_by_10k": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {}
+    },
+    "csv_join_table_10k": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {}
+    },
+    "csv_copy_import_10k": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {}
+    },
+    "csv_malformed_behavior_10k": {
+      "throughput_per_sec": 0.0,
+      "p99_us": 0.0,
+      "competitors": {}
+    }
+  }
+}
