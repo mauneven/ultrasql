@@ -3317,6 +3317,7 @@ dependencies = [
  "ultrasql-core",
  "ultrasql-executor",
  "ultrasql-mvcc",
+ "ultrasql-objectstore",
  "ultrasql-planner",
  "ultrasql-protocol",
  "ultrasql-server",

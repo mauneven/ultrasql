@@ -5,7 +5,10 @@
 //! planning uses the same helpers as execution so schema inference and row
 //! production agree on listing order and error messages.
 
+use std::collections::{HashMap, VecDeque};
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use chrono::Utc;
 use hmac::{Hmac, Mac};
@@ -52,6 +55,19 @@ impl ObjectLocation {
 pub struct ObjectRangeRead {
     bytes: Vec<u8>,
     object_size: Option<u64>,
+}
+
+/// Process-local object range cache counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ObjectRangeCacheMetrics {
+    /// Bytes fetched from remote object-store range GETs.
+    pub remote_bytes: u64,
+    /// Remote range GET count after cache misses.
+    pub range_requests: u64,
+    /// Logical range reads served from cache.
+    pub cache_hits: u64,
+    /// Logical range reads that missed cache and fetched remote bytes.
+    pub cache_misses: u64,
 }
 
 impl ObjectRangeRead {
@@ -132,11 +148,38 @@ pub fn read_object_range_with_metadata(
     request
         .headers
         .push(("range", format!("bytes={start}-{end}")));
+    let cache_key = ObjectRangeCacheKey {
+        url: request.url.clone(),
+        start,
+        len,
+    };
+    if let Some(cached) = object_range_cache_lookup(&cache_key) {
+        OBJECT_RANGE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        return Ok(cached);
+    }
+    OBJECT_RANGE_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
     let response = get_response(request, ResponseExpectation::PartialContent)?;
-    Ok(ObjectRangeRead {
+    OBJECT_RANGE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    OBJECT_RANGE_REMOTE_BYTES.fetch_add(
+        u64::try_from(response.bytes.len()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    let range = ObjectRangeRead {
         bytes: response.bytes,
         object_size: response.object_size,
-    })
+    };
+    object_range_cache_insert(cache_key, range.clone());
+    Ok(range)
+}
+
+/// Return current process-local object range cache counters.
+pub fn object_range_cache_metrics() -> ObjectRangeCacheMetrics {
+    ObjectRangeCacheMetrics {
+        remote_bytes: OBJECT_RANGE_REMOTE_BYTES.load(Ordering::Relaxed),
+        range_requests: OBJECT_RANGE_REQUESTS.load(Ordering::Relaxed),
+        cache_hits: OBJECT_RANGE_CACHE_HITS.load(Ordering::Relaxed),
+        cache_misses: OBJECT_RANGE_CACHE_MISSES.load(Ordering::Relaxed),
+    }
 }
 
 /// Expand `patterns`, read the first object, and return both location and bytes.
@@ -423,6 +466,97 @@ fn get_response(
         .read_to_vec()
         .map_err(|err| ObjectStoreError::Http(format!("object GET {} body: {err}", request.url)))?;
     Ok(ObjectResponse { bytes, object_size })
+}
+
+const OBJECT_RANGE_CACHE_MAX_ENTRIES: usize = 1024;
+const OBJECT_RANGE_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+static OBJECT_RANGE_REMOTE_BYTES: AtomicU64 = AtomicU64::new(0);
+static OBJECT_RANGE_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static OBJECT_RANGE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static OBJECT_RANGE_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static OBJECT_RANGE_CACHE: OnceLock<Mutex<ObjectRangeCache>> = OnceLock::new();
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ObjectRangeCacheKey {
+    url: String,
+    start: u64,
+    len: u64,
+}
+
+#[derive(Debug, Default)]
+struct ObjectRangeCache {
+    entries: HashMap<ObjectRangeCacheKey, ObjectRangeRead>,
+    order: VecDeque<ObjectRangeCacheKey>,
+    bytes: u64,
+}
+
+impl ObjectRangeCache {
+    fn lookup(&self, key: &ObjectRangeCacheKey) -> Option<ObjectRangeRead> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: ObjectRangeCacheKey, value: ObjectRangeRead) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        let entry_bytes = u64::try_from(value.bytes.len()).unwrap_or(u64::MAX);
+        if entry_bytes > OBJECT_RANGE_CACHE_MAX_BYTES {
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(entry_bytes);
+        self.order.push_back(key.clone());
+        self.entries.insert(key, value);
+        self.evict_over_budget();
+    }
+
+    fn evict_over_budget(&mut self) {
+        while (self.entries.len() > OBJECT_RANGE_CACHE_MAX_ENTRIES
+            || self.bytes > OBJECT_RANGE_CACHE_MAX_BYTES)
+            && !self.order.is_empty()
+        {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(value) = self.entries.remove(&oldest) {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(u64::try_from(value.bytes.len()).unwrap_or(u64::MAX));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+}
+
+fn object_range_cache() -> &'static Mutex<ObjectRangeCache> {
+    OBJECT_RANGE_CACHE.get_or_init(|| Mutex::new(ObjectRangeCache::default()))
+}
+
+fn object_range_cache_lookup(key: &ObjectRangeCacheKey) -> Option<ObjectRangeRead> {
+    object_range_cache().lock().ok()?.lookup(key)
+}
+
+fn object_range_cache_insert(key: ObjectRangeCacheKey, value: ObjectRangeRead) {
+    if let Ok(mut cache) = object_range_cache().lock() {
+        cache.insert(key, value);
+    }
+}
+
+#[cfg(test)]
+fn reset_object_range_cache_for_tests() {
+    if let Ok(mut cache) = object_range_cache().lock() {
+        cache.clear();
+    }
+    OBJECT_RANGE_REMOTE_BYTES.store(0, Ordering::Relaxed);
+    OBJECT_RANGE_REQUESTS.store(0, Ordering::Relaxed);
+    OBJECT_RANGE_CACHE_HITS.store(0, Ordering::Relaxed);
+    OBJECT_RANGE_CACHE_MISSES.store(0, Ordering::Relaxed);
 }
 
 fn host_from_url(url: &str) -> Result<String> {
@@ -768,6 +902,59 @@ mod tests {
         assert!(request.starts_with("GET /bucket/path/file.parquet HTTP/1.1"));
         assert!(request.contains("\r\nrange: bytes=4-9\r\n"));
         handle.join().expect("mock server done");
+    }
+
+    #[test]
+    fn read_object_range_cache_reuses_identical_ranges() {
+        reset_object_range_cache_for_tests();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let endpoint = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (request_tx, request_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buf).expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx
+                .send(String::from_utf8(request).expect("request utf8"))
+                .expect("send request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 6\r\nContent-Range: bytes 4-9/16\r\n\r\n456789",
+                )
+                .expect("write response");
+        });
+
+        let _guard = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", endpoint);
+        let objects = expand_object_store_specs(&["s3://bucket/path/file.parquet".to_owned()])
+            .expect("expand object");
+        let first = read_object_range_with_metadata(&objects[0], 4, 6).expect("first range");
+        let second = read_object_range_with_metadata(&objects[0], 4, 6).expect("cached range");
+
+        assert_eq!(first.bytes(), b"456789");
+        assert_eq!(second.bytes(), b"456789");
+        let request = request_rx.recv().expect("request text");
+        assert!(request.contains("\r\nrange: bytes=4-9\r\n"));
+        assert!(
+            request_rx.try_recv().is_err(),
+            "cache should avoid second HTTP GET"
+        );
+        let metrics = object_range_cache_metrics();
+        assert_eq!(metrics.range_requests, 1);
+        assert_eq!(metrics.remote_bytes, 6);
+        assert_eq!(metrics.cache_misses, 1);
+        assert_eq!(metrics.cache_hits, 1);
+        handle.join().expect("mock server done");
+        reset_object_range_cache_for_tests();
     }
 
     struct EnvVarGuard {

@@ -29,6 +29,7 @@ sql-bench = [
     "dep:arrow-array",
     "dep:arrow-schema",
     "dep:parquet",
+    "dep:ultrasql-objectstore",
     "dep:ultrasql-catalog",
     "dep:ultrasql-server",
     "dep:ultrasql-txn",
@@ -95,6 +96,7 @@ ultrasql-vec      = { workspace = true }
 ultrasql-storage  = { workspace = true }
 ultrasql-wal      = { workspace = true }
 ultrasql-catalog  = { workspace = true, optional = true }
+ultrasql-objectstore = { workspace = true, optional = true }
 ultrasql-txn      = { workspace = true, optional = true }
 anyhow            = { workspace = true }
 arrow-array       = { workspace = true, optional = true }

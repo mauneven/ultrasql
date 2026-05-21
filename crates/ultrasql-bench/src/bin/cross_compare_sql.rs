@@ -65,6 +65,7 @@ use clap::{Parser, ValueEnum};
 use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 use tokio_postgres::NoTls;
 use ultrasql_catalog::rag::{RagSchemaConfig, create_rag_table_statements};
+use ultrasql_objectstore::object_range_cache_metrics;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
 const VECTOR_CERTIFICATION_METRICS: &[&str] = &[
@@ -88,6 +89,9 @@ const OBJECT_PARQUET_RANGE_REQUIRED_METRICS: &[&str] = &[
     "p95_latency_us",
     "p99_latency_us",
     "range_request_count",
+    "remote_bytes",
+    "cache_hits",
+    "cache_misses",
     "whole_object_fetched",
     "projected_out_column_fetched",
 ];
@@ -148,6 +152,9 @@ struct ObjectParquetRangeMetrics {
     object_bytes: usize,
     range_request_count: usize,
     requested_range_bytes: u64,
+    remote_bytes: u64,
+    cache_hits: u64,
+    cache_misses: u64,
     length_probe_seen: bool,
     whole_object_fetched: bool,
     projected_out_column_fetched: bool,
@@ -838,6 +845,9 @@ async fn main() -> Result<()> {
         report["object_bytes"] = serde_json::json!(metrics.object_bytes);
         report["range_request_count"] = serde_json::json!(metrics.range_request_count);
         report["requested_range_bytes"] = serde_json::json!(metrics.requested_range_bytes);
+        report["remote_bytes"] = serde_json::json!(metrics.remote_bytes);
+        report["cache_hits"] = serde_json::json!(metrics.cache_hits);
+        report["cache_misses"] = serde_json::json!(metrics.cache_misses);
         report["length_probe_seen"] = serde_json::json!(metrics.length_probe_seen);
         report["whole_object_fetched"] = serde_json::json!(metrics.whole_object_fetched);
         report["projected_out_column"] = serde_json::json!("score");
@@ -1493,6 +1503,7 @@ async fn run_object_parquet_range_smoke(
     let (client, conn_handle) = connect_sql_server(server).await?;
     let query =
         "SELECT name FROM read_parquet('s3://lake/parquet/object_range.parquet') WHERE id >= 100";
+    let cache_metrics_before = object_range_cache_metrics();
     let timed =
         measure_simple_query(&client, "object_parquet_range", query, warmup, total_iters).await?;
     iters_us.extend(timed.samples_us.iter().copied());
@@ -1547,6 +1558,7 @@ async fn run_object_parquet_range_smoke(
             })
         })
         .collect::<Vec<_>>();
+    let cache_metrics_after = object_range_cache_metrics();
 
     Ok(ObjectParquetRangeMetrics {
         query_median_us: timed.median_us,
@@ -1558,6 +1570,15 @@ async fn run_object_parquet_range_smoke(
         object_bytes: object_len,
         range_request_count: object_requests.len(),
         requested_range_bytes,
+        remote_bytes: cache_metrics_after
+            .remote_bytes
+            .saturating_sub(cache_metrics_before.remote_bytes),
+        cache_hits: cache_metrics_after
+            .cache_hits
+            .saturating_sub(cache_metrics_before.cache_hits),
+        cache_misses: cache_metrics_after
+            .cache_misses
+            .saturating_sub(cache_metrics_before.cache_misses),
         length_probe_seen,
         whole_object_fetched,
         projected_out_column_fetched,
@@ -3566,6 +3587,17 @@ mod tests {
             Workload::ObjectParquetRange.registry_id(1_000),
             "object_parquet_range_smoke"
         );
+        for required_metric in [
+            "remote_bytes",
+            "range_request_count",
+            "cache_hits",
+            "cache_misses",
+        ] {
+            assert!(
+                OBJECT_PARQUET_RANGE_REQUIRED_METRICS.contains(&required_metric),
+                "object parquet range artifact must require {required_metric}"
+            );
+        }
     }
 
     #[test]
