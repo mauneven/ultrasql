@@ -3407,6 +3407,7 @@ dependencies = [
  "apache-avro",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "ultrasql-core",
  "ultrasql-objectstore",

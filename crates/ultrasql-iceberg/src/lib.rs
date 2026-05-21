@@ -2,7 +2,7 @@
 //!
 //! This crate resolves a table root or metadata JSON file into the current
 //! snapshot's live Parquet data files. It intentionally does not perform
-//! writes, catalog commits, or time travel; those belong in later slices.
+//! writes or catalog commits; those belong in later slices.
 
 use std::fs;
 use std::io::Cursor;
@@ -43,6 +43,45 @@ pub struct IcebergScanPlan {
     pub schema: Schema,
     /// Live Parquet data file locations in manifest order.
     pub data_files: Vec<String>,
+    /// Snapshot id selected for the scan, or `None` when table has no snapshot.
+    pub snapshot_id: Option<i64>,
+    /// Data-content manifests read after manifest-list pruning.
+    pub manifests_scanned: usize,
+    /// Data-content manifests skipped by manifest-list partition summaries.
+    pub manifests_skipped: usize,
+    /// Data files retained after partition pruning.
+    pub data_files_scanned: usize,
+    /// Data files skipped by data-file partition values.
+    pub data_files_skipped: usize,
+}
+
+/// Iceberg scan planning options.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IcebergScanOptions {
+    /// Explicit snapshot id for time-travel planning. Defaults to current snapshot.
+    pub snapshot_id: Option<i64>,
+    /// Optional identity-partition equality filter for pruning.
+    pub partition_filter: Option<IcebergPartitionFilter>,
+}
+
+/// Identity-partition equality filter used by read-only Iceberg planning.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergPartitionFilter {
+    /// Partition field name from the Iceberg partition spec.
+    pub field: String,
+    /// Literal value to match.
+    pub value: String,
+}
+
+impl IcebergPartitionFilter {
+    /// Build an equality filter for an identity partition field.
+    #[must_use]
+    pub fn equals(field: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            value: value.into(),
+        }
+    }
 }
 
 /// Read only the current schema from an Iceberg table root or metadata file.
@@ -53,10 +92,26 @@ pub fn read_iceberg_schema(table: &str) -> Result<Schema> {
 
 /// Plan live Parquet data files for the current Iceberg snapshot.
 pub fn plan_iceberg_scan(table: &str) -> Result<IcebergScanPlan> {
+    plan_iceberg_scan_with_options(table, &IcebergScanOptions::default())
+}
+
+/// Plan live Parquet data files with snapshot and partition pruning options.
+pub fn plan_iceberg_scan_with_options(
+    table: &str,
+    options: &IcebergScanOptions,
+) -> Result<IcebergScanPlan> {
     let metadata = load_metadata(table)?;
     let schema = metadata.schema()?;
-    let data_files = metadata.current_data_files()?;
-    Ok(IcebergScanPlan { schema, data_files })
+    let planned_files = metadata.data_files(options)?;
+    Ok(IcebergScanPlan {
+        schema,
+        data_files: planned_files.data_files,
+        snapshot_id: planned_files.snapshot_id,
+        manifests_scanned: planned_files.manifests_scanned,
+        manifests_skipped: planned_files.manifests_skipped,
+        data_files_scanned: planned_files.data_files_scanned,
+        data_files_skipped: planned_files.data_files_skipped,
+    })
 }
 
 #[derive(Debug)]
@@ -94,9 +149,10 @@ impl LoadedMetadata {
             .map_err(|err| IcebergError::InvalidMetadata(format!("iceberg_scan schema: {err}")))
     }
 
-    fn current_data_files(&self) -> Result<Vec<String>> {
-        let Some(snapshot_id) = self.metadata.current_snapshot_id else {
-            return Ok(Vec::new());
+    fn data_files(&self, options: &IcebergScanOptions) -> Result<PlannedDataFiles> {
+        let snapshot_id = options.snapshot_id.or(self.metadata.current_snapshot_id);
+        let Some(snapshot_id) = snapshot_id else {
+            return Ok(PlannedDataFiles::default());
         };
         let snapshot = self
             .metadata
@@ -109,14 +165,83 @@ impl LoadedMetadata {
                 ))
             })?;
         let manifest_list = resolve_location(&self.table_root, &snapshot.manifest_list);
-        let manifest_paths = read_manifest_list(&manifest_list)?;
-        let mut data_files = Vec::new();
-        for manifest_path in manifest_paths {
-            let manifest_path = resolve_location(&self.table_root, &manifest_path);
-            data_files.extend(read_manifest_data_files(&self.table_root, &manifest_path)?);
+        let manifest_entries = read_manifest_list(&manifest_list)?;
+        let mut planned = PlannedDataFiles {
+            snapshot_id: Some(snapshot_id),
+            ..PlannedDataFiles::default()
+        };
+        for manifest in manifest_entries {
+            if !self.manifest_matches_partition_filter(&manifest, options.partition_filter.as_ref())
+            {
+                planned.manifests_skipped += 1;
+                continue;
+            }
+            planned.manifests_scanned += 1;
+            let manifest_path = resolve_location(&self.table_root, &manifest.manifest_path);
+            let manifest_files = read_manifest_data_files(
+                &self.table_root,
+                &manifest_path,
+                options.partition_filter.as_ref(),
+            )?;
+            planned.data_files_scanned += manifest_files.scanned;
+            planned.data_files_skipped += manifest_files.skipped;
+            planned.data_files.extend(manifest_files.data_files);
         }
-        Ok(data_files)
+        Ok(planned)
     }
+
+    fn manifest_matches_partition_filter(
+        &self,
+        manifest: &ManifestListEntry,
+        filter: Option<&IcebergPartitionFilter>,
+    ) -> bool {
+        let Some(filter) = filter else {
+            return true;
+        };
+        let Some(summary_index) = self.partition_field_index(manifest.partition_spec_id, filter)
+        else {
+            return true;
+        };
+        let Some(summary) = manifest.partitions.get(summary_index) else {
+            return true;
+        };
+        let filter_value = filter.value.as_bytes();
+        if let Some(lower) = summary.lower_bound.as_deref() {
+            if filter_value < lower {
+                return false;
+            }
+        }
+        if let Some(upper) = summary.upper_bound.as_deref() {
+            if filter_value > upper {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn partition_field_index(
+        &self,
+        spec_id: i32,
+        filter: &IcebergPartitionFilter,
+    ) -> Option<usize> {
+        self.metadata
+            .partition_specs
+            .iter()
+            .find(|spec| spec.spec_id == spec_id)?
+            .fields
+            .iter()
+            .position(|field| field.name == filter.field)
+    }
+}
+
+#[derive(Debug, Default)]
+struct PlannedDataFiles {
+    data_files: Vec<String>,
+    snapshot_id: Option<i64>,
+    manifests_scanned: usize,
+    manifests_skipped: usize,
+    data_files_scanned: usize,
+    data_files_skipped: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +253,8 @@ struct TableMetadata {
     current_snapshot_id: Option<i64>,
     #[serde(default)]
     snapshots: Vec<IcebergSnapshot>,
+    #[serde(rename = "partition-specs", default)]
+    partition_specs: Vec<IcebergPartitionSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +278,19 @@ struct IcebergSnapshot {
     snapshot_id: i64,
     #[serde(rename = "manifest-list")]
     manifest_list: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct IcebergPartitionSpec {
+    #[serde(rename = "spec-id")]
+    spec_id: i32,
+    #[serde(default)]
+    fields: Vec<IcebergPartitionField>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IcebergPartitionField {
+    name: String,
 }
 
 fn load_metadata(table: &str) -> Result<LoadedMetadata> {
@@ -283,7 +423,27 @@ fn object_table_root_from_metadata(path: &str) -> String {
     root.to_owned()
 }
 
-fn read_manifest_list(path: &str) -> Result<Vec<String>> {
+#[derive(Clone, Debug, Default)]
+struct ManifestListEntry {
+    manifest_path: String,
+    partition_spec_id: i32,
+    partitions: Vec<PartitionSummary>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PartitionSummary {
+    lower_bound: Option<Vec<u8>>,
+    upper_bound: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Default)]
+struct ManifestDataFiles {
+    data_files: Vec<String>,
+    scanned: usize,
+    skipped: usize,
+}
+
+fn read_manifest_list(path: &str) -> Result<Vec<ManifestListEntry>> {
     let mut manifests = Vec::new();
     for value in read_avro_values(path)? {
         let content = avro_record_field(&value, "content")
@@ -299,13 +459,28 @@ fn read_manifest_list(path: &str) -> Result<Vec<String>> {
                     "iceberg_scan manifest list {path} missing manifest_path"
                 ))
             })?;
-        manifests.push(manifest_path.to_owned());
+        let partition_spec_id = avro_record_field(&value, "partition_spec_id")
+            .and_then(avro_i32)
+            .unwrap_or(0);
+        let partitions = avro_record_field(&value, "partitions")
+            .and_then(avro_array)
+            .map(|values| values.iter().map(partition_summary_from_avro).collect())
+            .unwrap_or_default();
+        manifests.push(ManifestListEntry {
+            manifest_path: manifest_path.to_owned(),
+            partition_spec_id,
+            partitions,
+        });
     }
     Ok(manifests)
 }
 
-fn read_manifest_data_files(table_root: &str, path: &str) -> Result<Vec<String>> {
-    let mut data_files = Vec::new();
+fn read_manifest_data_files(
+    table_root: &str,
+    path: &str,
+    filter: Option<&IcebergPartitionFilter>,
+) -> Result<ManifestDataFiles> {
+    let mut data_files = ManifestDataFiles::default();
     for value in read_avro_values(path)? {
         let status = avro_record_field(&value, "status")
             .and_then(avro_i32)
@@ -338,6 +513,12 @@ fn read_manifest_data_files(table_root: &str, path: &str) -> Result<Vec<String>>
                 "iceberg_scan data file format not supported: {format}"
             )));
         }
+        if let Some(filter) = filter {
+            if let Some(false) = partition_matches_filter(data_file, filter) {
+                data_files.skipped += 1;
+                continue;
+            }
+        }
         let file_path = avro_record_field(data_file, "file_path")
             .and_then(avro_string)
             .ok_or_else(|| {
@@ -345,9 +526,33 @@ fn read_manifest_data_files(table_root: &str, path: &str) -> Result<Vec<String>>
                     "iceberg_scan manifest {path} missing data_file.file_path"
                 ))
             })?;
-        data_files.push(resolve_location(table_root, file_path));
+        data_files.scanned += 1;
+        data_files
+            .data_files
+            .push(resolve_location(table_root, file_path));
     }
     Ok(data_files)
+}
+
+fn partition_summary_from_avro(value: &AvroValue) -> PartitionSummary {
+    PartitionSummary {
+        lower_bound: avro_record_field(value, "lower_bound")
+            .and_then(avro_bytes)
+            .map(ToOwned::to_owned),
+        upper_bound: avro_record_field(value, "upper_bound")
+            .and_then(avro_bytes)
+            .map(ToOwned::to_owned),
+    }
+}
+
+fn partition_matches_filter(
+    data_file: &AvroValue,
+    filter: &IcebergPartitionFilter,
+) -> Option<bool> {
+    let partition = avro_record_field(data_file, "partition")?;
+    let value = avro_record_field(partition, &filter.field)?;
+    let value = avro_scalar_to_string(value)?;
+    Some(value == filter.value)
 }
 
 fn read_avro_values(path: &str) -> Result<Vec<AvroValue>> {
@@ -432,9 +637,36 @@ fn avro_i32(value: &AvroValue) -> Option<i32> {
     }
 }
 
+fn avro_array(value: &AvroValue) -> Option<&[AvroValue]> {
+    match avro_union_inner(value) {
+        AvroValue::Array(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn avro_bytes(value: &AvroValue) -> Option<&[u8]> {
+    match avro_union_inner(value) {
+        AvroValue::Bytes(value) => Some(value),
+        AvroValue::Fixed(_, value) => Some(value),
+        _ => None,
+    }
+}
+
 fn avro_string(value: &AvroValue) -> Option<&str> {
     match avro_union_inner(value) {
         AvroValue::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn avro_scalar_to_string(value: &AvroValue) -> Option<String> {
+    match avro_union_inner(value) {
+        AvroValue::String(value) => Some(value.clone()),
+        AvroValue::Int(value) => Some(value.to_string()),
+        AvroValue::Long(value) => Some(value.to_string()),
+        AvroValue::Boolean(value) => Some(value.to_string()),
+        AvroValue::Float(value) => Some(value.to_string()),
+        AvroValue::Double(value) => Some(value.to_string()),
         _ => None,
     }
 }
@@ -489,6 +721,9 @@ fn percent_decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    use apache_avro::{Codec, Schema as AvroSchema, Writer};
 
     #[test]
     fn metadata_version_parses_v_prefix() {
@@ -508,5 +743,338 @@ mod tests {
             resolve_location("/tmp/table", "file:///tmp/table/data/a.parquet"),
             "/tmp/table/data/a.parquet"
         );
+    }
+
+    #[test]
+    fn scan_options_select_snapshot_and_prune_partitions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path();
+        write_iceberg_metadata(table);
+        let metadata_dir = table.join("metadata");
+        let old_manifest = metadata_dir.join("old.avro");
+        let new_manifest = metadata_dir.join("new.avro");
+        let old_list = metadata_dir.join("old-list.avro");
+        let new_list = metadata_dir.join("new-list.avro");
+
+        write_manifest_with_partitions(&old_manifest, &[("old.parquet", &[("category", "old")])]);
+        write_manifest_with_partitions(
+            &new_manifest,
+            &[
+                ("keep.parquet", &[("category", "keep")]),
+                ("skip.parquet", &[("category", "skip")]),
+            ],
+        );
+        write_manifest_list_with_bounds(&old_list, &[(&old_manifest, "old", "old")]);
+        write_manifest_list_with_bounds(&new_list, &[(&new_manifest, "keep", "skip")]);
+
+        let plan = plan_iceberg_scan_with_options(
+            &table.display().to_string(),
+            &IcebergScanOptions {
+                snapshot_id: Some(2),
+                partition_filter: Some(IcebergPartitionFilter::equals("category", "keep")),
+            },
+        )
+        .expect("plan iceberg scan with pruning");
+
+        assert_eq!(plan.snapshot_id, Some(2));
+        assert_eq!(plan.manifests_scanned, 1);
+        assert_eq!(plan.manifests_skipped, 0);
+        assert_eq!(
+            plan.data_files,
+            vec![table.join("keep.parquet").display().to_string()]
+        );
+        assert_eq!(plan.data_files_scanned, 1);
+        assert_eq!(plan.data_files_skipped, 1);
+    }
+
+    #[test]
+    fn manifest_partition_bounds_skip_unmatched_manifests() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let table = temp.path();
+        write_iceberg_metadata(table);
+        let metadata_dir = table.join("metadata");
+        let skip_manifest = metadata_dir.join("skip.avro");
+        let keep_manifest = metadata_dir.join("keep.avro");
+        let new_list = metadata_dir.join("new-list.avro");
+
+        write_manifest_with_partitions(
+            &skip_manifest,
+            &[("skip.parquet", &[("category", "skip")])],
+        );
+        write_manifest_with_partitions(
+            &keep_manifest,
+            &[("keep.parquet", &[("category", "keep")])],
+        );
+        write_manifest_list_with_bounds(
+            &new_list,
+            &[
+                (&skip_manifest, "skip", "skip"),
+                (&keep_manifest, "keep", "keep"),
+            ],
+        );
+
+        let plan = plan_iceberg_scan_with_options(
+            &table.display().to_string(),
+            &IcebergScanOptions {
+                snapshot_id: Some(2),
+                partition_filter: Some(IcebergPartitionFilter::equals("category", "keep")),
+            },
+        )
+        .expect("plan iceberg scan with manifest pruning");
+
+        assert_eq!(plan.manifests_scanned, 1);
+        assert_eq!(plan.manifests_skipped, 1);
+        assert_eq!(
+            plan.data_files,
+            vec![table.join("keep.parquet").display().to_string()]
+        );
+    }
+
+    fn write_iceberg_metadata(table_dir: &Path) {
+        let metadata_dir = table_dir.join("metadata");
+        fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        fs::write(metadata_dir.join("version-hint.text"), "1\n").expect("version hint");
+        let metadata_json = serde_json::json!({
+            "format-version": 2,
+            "table-uuid": "00000000-0000-0000-0000-000000000045",
+            "location": table_dir.to_str().expect("table path utf8"),
+            "last-sequence-number": 0,
+            "last-updated-ms": 0,
+            "last-column-id": 2,
+            "schemas": [{
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [
+                    {"id": 1, "name": "id", "required": true, "type": "long"},
+                    {"id": 2, "name": "category", "required": false, "type": "string"}
+                ]
+            }],
+            "current-schema-id": 0,
+            "partition-specs": [{
+                "spec-id": 0,
+                "fields": [{
+                    "source-id": 2,
+                    "field-id": 1000,
+                    "name": "category",
+                    "transform": "identity"
+                }]
+            }],
+            "default-spec-id": 0,
+            "last-partition-id": 1000,
+            "properties": {},
+            "current-snapshot-id": 2,
+            "snapshots": [
+                {
+                    "snapshot-id": 1,
+                    "sequence-number": 1,
+                    "timestamp-ms": 0,
+                    "manifest-list": metadata_dir.join("old-list.avro").to_str().expect("old list utf8")
+                },
+                {
+                    "snapshot-id": 2,
+                    "sequence-number": 2,
+                    "timestamp-ms": 0,
+                    "manifest-list": metadata_dir.join("new-list.avro").to_str().expect("new list utf8")
+                }
+            ],
+            "snapshot-log": [
+                {"timestamp-ms": 0, "snapshot-id": 1},
+                {"timestamp-ms": 1, "snapshot-id": 2}
+            ],
+            "metadata-log": []
+        });
+        fs::write(
+            metadata_dir.join("v1.metadata.json"),
+            serde_json::to_string_pretty(&metadata_json).expect("metadata json"),
+        )
+        .expect("write metadata json");
+    }
+
+    fn write_manifest_list_with_bounds(path: &Path, manifests: &[(&Path, &str, &str)]) {
+        let schema = AvroSchema::parse_str(
+            r#"{
+              "type": "record",
+              "name": "manifest_file",
+              "fields": [
+                {"name": "manifest_path", "type": "string"},
+                {"name": "manifest_length", "type": "long"},
+                {"name": "partition_spec_id", "type": "int"},
+                {"name": "content", "type": "int"},
+                {"name": "sequence_number", "type": "long"},
+                {"name": "min_sequence_number", "type": "long"},
+                {"name": "added_snapshot_id", "type": "long"},
+                {"name": "added_data_files_count", "type": "int"},
+                {"name": "existing_data_files_count", "type": "int"},
+                {"name": "deleted_data_files_count", "type": "int"},
+                {"name": "added_rows_count", "type": "long"},
+                {"name": "existing_rows_count", "type": "long"},
+                {"name": "deleted_rows_count", "type": "long"},
+                {
+                  "name": "partitions",
+                  "type": ["null", {
+                    "type": "array",
+                    "items": {
+                      "type": "record",
+                      "name": "field_summary",
+                      "fields": [
+                        {"name": "contains_null", "type": "boolean"},
+                        {"name": "contains_nan", "type": ["null", "boolean"], "default": null},
+                        {"name": "lower_bound", "type": ["null", "bytes"], "default": null},
+                        {"name": "upper_bound", "type": ["null", "bytes"], "default": null}
+                      ]
+                    }
+                  }],
+                  "default": null
+                }
+              ]
+            }"#,
+        )
+        .expect("manifest-list avro schema");
+        let file = fs::File::create(path).expect("create manifest list");
+        let mut writer = Writer::with_codec(&schema, file, Codec::Null);
+        for (manifest_path, lower, upper) in manifests {
+            writer
+                .append(AvroValue::Record(vec![
+                    (
+                        "manifest_path".to_string(),
+                        AvroValue::String(
+                            manifest_path.to_str().expect("manifest utf8").to_string(),
+                        ),
+                    ),
+                    ("manifest_length".to_string(), AvroValue::Long(0)),
+                    ("partition_spec_id".to_string(), AvroValue::Int(0)),
+                    ("content".to_string(), AvroValue::Int(0)),
+                    ("sequence_number".to_string(), AvroValue::Long(1)),
+                    ("min_sequence_number".to_string(), AvroValue::Long(1)),
+                    ("added_snapshot_id".to_string(), AvroValue::Long(2)),
+                    ("added_data_files_count".to_string(), AvroValue::Int(1)),
+                    ("existing_data_files_count".to_string(), AvroValue::Int(0)),
+                    ("deleted_data_files_count".to_string(), AvroValue::Int(0)),
+                    ("added_rows_count".to_string(), AvroValue::Long(1)),
+                    ("existing_rows_count".to_string(), AvroValue::Long(0)),
+                    ("deleted_rows_count".to_string(), AvroValue::Long(0)),
+                    (
+                        "partitions".to_string(),
+                        AvroValue::Union(
+                            1,
+                            Box::new(AvroValue::Array(vec![AvroValue::Record(vec![
+                                ("contains_null".to_string(), AvroValue::Boolean(false)),
+                                (
+                                    "contains_nan".to_string(),
+                                    AvroValue::Union(0, Box::new(AvroValue::Null)),
+                                ),
+                                (
+                                    "lower_bound".to_string(),
+                                    AvroValue::Union(
+                                        1,
+                                        Box::new(AvroValue::Bytes(lower.as_bytes().to_vec())),
+                                    ),
+                                ),
+                                (
+                                    "upper_bound".to_string(),
+                                    AvroValue::Union(
+                                        1,
+                                        Box::new(AvroValue::Bytes(upper.as_bytes().to_vec())),
+                                    ),
+                                ),
+                            ])])),
+                        ),
+                    ),
+                ]))
+                .expect("write manifest list row");
+        }
+        writer.flush().expect("flush manifest list");
+    }
+
+    fn write_manifest_with_partitions(path: &Path, files: &[(&str, &[(&str, &str)])]) {
+        let schema = AvroSchema::parse_str(
+            r#"{
+              "type": "record",
+              "name": "manifest_entry",
+              "fields": [
+                {"name": "status", "type": "int"},
+                {"name": "snapshot_id", "type": ["null", "long"], "default": null},
+                {"name": "sequence_number", "type": ["null", "long"], "default": null},
+                {"name": "file_sequence_number", "type": ["null", "long"], "default": null},
+                {
+                  "name": "data_file",
+                  "type": {
+                    "type": "record",
+                    "name": "data_file",
+                    "fields": [
+                      {"name": "content", "type": "int"},
+                      {"name": "file_path", "type": "string"},
+                      {"name": "file_format", "type": "string"},
+                      {"name": "record_count", "type": "long"},
+                      {"name": "file_size_in_bytes", "type": "long"},
+                      {"name": "partition", "type": {
+                        "type": "record",
+                        "name": "partition",
+                        "fields": [{"name": "category", "type": ["null", "string"], "default": null}]
+                      }}
+                    ]
+                  }
+                }
+              ]
+            }"#,
+        )
+        .expect("manifest avro schema");
+        let file = fs::File::create(path).expect("create manifest");
+        let mut writer = Writer::with_codec(&schema, file, Codec::Null);
+        let table_dir = path
+            .parent()
+            .and_then(Path::parent)
+            .expect("manifest under table metadata");
+        for (file_name, partitions) in files {
+            let category = partitions
+                .iter()
+                .find_map(|(field, value)| (*field == "category").then_some(*value))
+                .unwrap_or_default();
+            writer
+                .append(AvroValue::Record(vec![
+                    ("status".to_string(), AvroValue::Int(1)),
+                    (
+                        "snapshot_id".to_string(),
+                        AvroValue::Union(1, Box::new(AvroValue::Long(2))),
+                    ),
+                    (
+                        "sequence_number".to_string(),
+                        AvroValue::Union(1, Box::new(AvroValue::Long(2))),
+                    ),
+                    (
+                        "file_sequence_number".to_string(),
+                        AvroValue::Union(1, Box::new(AvroValue::Long(2))),
+                    ),
+                    (
+                        "data_file".to_string(),
+                        AvroValue::Record(vec![
+                            ("content".to_string(), AvroValue::Int(0)),
+                            (
+                                "file_path".to_string(),
+                                AvroValue::String(file_name.to_string()),
+                            ),
+                            (
+                                "file_format".to_string(),
+                                AvroValue::String("PARQUET".to_string()),
+                            ),
+                            ("record_count".to_string(), AvroValue::Long(1)),
+                            ("file_size_in_bytes".to_string(), AvroValue::Long(1)),
+                            (
+                                "partition".to_string(),
+                                AvroValue::Record(vec![(
+                                    "category".to_string(),
+                                    AvroValue::Union(
+                                        1,
+                                        Box::new(AvroValue::String(category.to_string())),
+                                    ),
+                                )]),
+                            ),
+                        ]),
+                    ),
+                ]))
+                .expect("write manifest row");
+            fs::write(table_dir.join(file_name), b"PAR1").expect("write data placeholder");
+        }
+        writer.flush().expect("flush manifest");
     }
 }
