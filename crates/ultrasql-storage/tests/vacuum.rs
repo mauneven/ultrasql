@@ -69,9 +69,38 @@ fn pair_payload(id: i32, val: i32) -> [u8; 9] {
     out
 }
 
+fn pair_decode(bytes: &[u8]) -> (i32, i32) {
+    assert_eq!(bytes.len(), 9);
+    let id = i32::from_le_bytes(bytes[1..5].try_into().expect("id slice"));
+    let val = i32::from_le_bytes(bytes[5..9].try_into().expect("val slice"));
+    (id, val)
+}
+
 fn make_heap() -> HeapAccess<MapLoader> {
     let pool = Arc::new(BufferPool::new(64, MapLoader::default()));
     HeapAccess::new(pool)
+}
+
+fn visible_pairs(
+    heap: &HeapAccess<MapLoader>,
+    block_count: u32,
+    snapshot: &Snapshot,
+    oracle: &MapOracle,
+) -> Vec<(i32, i32)> {
+    let mut out = Vec::new();
+    heap.for_each_visible(
+        rel(),
+        block_count,
+        snapshot,
+        oracle,
+        |_tid, _header, data| {
+            out.push(pair_decode(data));
+            Ok(())
+        },
+    )
+    .expect("visible scan");
+    out.sort_by_key(|(id, _)| *id);
+    out
 }
 
 #[test]
@@ -203,4 +232,99 @@ fn vacuum_undo_log_no_op_when_threshold_below_every_writer() {
     let trimmed = heap.vacuum_undo_log(Xid::new(5)).expect("vacuum");
     assert_eq!(trimmed, 0);
     assert_eq!(heap.undo_log_len(rel()), before);
+}
+
+#[test]
+fn long_snapshot_survives_update_delete_and_vacuum() {
+    const ROWS: usize = 12;
+    let heap = make_heap();
+    let oracle = MapOracle::new();
+    oracle.set_committed(Xid::new(1));
+
+    let expected_original: Vec<(i32, i32)> =
+        (0..ROWS).map(|i| (i as i32, (i as i32) * 10)).collect();
+    for (id, val) in &expected_original {
+        heap.insert(
+            rel(),
+            &pair_payload(*id, *val),
+            InsertOptions {
+                xmin: Xid::new(1),
+                command_id: CommandId::FIRST,
+                wal: None,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .expect("insert");
+    }
+    let block_count = heap.block_count(rel());
+    let long_snapshot = Snapshot::new(
+        Xid::new(2),
+        Xid::new(2),
+        Xid::new(100),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+
+    let writer_update = Snapshot::new(
+        Xid::new(2),
+        Xid::new(3),
+        Xid::new(2),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let updated = heap
+        .update_int32_pair_inplace_undo(
+            rel(),
+            block_count,
+            &writer_update,
+            &oracle,
+            |id, _val| id % 2 == 0,
+            1,
+            1000,
+            Xid::new(2),
+            CommandId::FIRST,
+            None,
+            None,
+        )
+        .expect("update");
+    oracle.set_committed(Xid::new(2));
+    assert_eq!(updated, ROWS / 2);
+    assert_eq!(heap.undo_log_len(rel()), updated);
+
+    let writer_delete = Snapshot::new(
+        Xid::new(3),
+        Xid::new(4),
+        Xid::new(3),
+        CommandId::FIRST,
+        std::iter::empty(),
+    );
+    let deleted = heap
+        .delete_int32_pair_inplace(
+            rel(),
+            block_count,
+            &writer_delete,
+            &oracle,
+            |id, _val| id % 2 != 0 && id % 3 == 0,
+            Xid::new(3),
+            CommandId::FIRST,
+            None,
+            None,
+        )
+        .expect("delete");
+    oracle.set_committed(Xid::new(3));
+    assert_eq!(deleted, 2);
+
+    let heap_vacuum = heap
+        .vacuum_heap(rel(), Xid::new(2), &oracle)
+        .expect("heap vacuum");
+    assert_eq!(heap_vacuum.tuples_reclaimed, 0);
+    let undo_trimmed = heap.vacuum_undo_log(Xid::new(2)).expect("undo vacuum");
+    assert_eq!(undo_trimmed, 0);
+
+    assert_eq!(
+        visible_pairs(&heap, block_count, &long_snapshot, &oracle),
+        expected_original,
+        "long reader must keep its original view across writers and vacuum"
+    );
 }
