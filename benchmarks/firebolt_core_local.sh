@@ -56,7 +56,7 @@ core_ready() {
     command -v curl >/dev/null 2>&1 || return 1
     local response
     response="$(curl -fsS "$(endpoint_with_format)" --data-binary "SELECT 42;" 2>/dev/null || true)"
-    [[ "$response" == $'?column?\nint\n42' ]]
+    [[ "$(printf '%s\n' "$response" | tail -n 1)" == "42" ]]
 }
 
 wait_ready() {
@@ -157,12 +157,17 @@ query_core() {
 }
 
 clean_core() {
-    stop_core
-    if [[ -n "$FIREBOLT_CORE_DATA_DIR" && "$FIREBOLT_CORE_DATA_DIR" == "$REPO_ROOT"/target/* ]]; then
-        rm -rf "$FIREBOLT_CORE_DATA_DIR"
-    else
-        echo "firebolt_core_local.sh: refusing to remove custom data dir $FIREBOLT_CORE_DATA_DIR" >&2
+    local confirm="${1:-}"
+    if [[ "$confirm" != "--yes" ]]; then
+        echo "firebolt_core_local.sh: refusing to clean $FIREBOLT_CORE_DATA_DIR without clean --yes" >&2
+        return 2
     fi
+    stop_core
+    if [[ -z "$FIREBOLT_CORE_DATA_DIR" || "$FIREBOLT_CORE_DATA_DIR" == "/" ]]; then
+        echo "firebolt_core_local.sh: refusing unsafe data dir $FIREBOLT_CORE_DATA_DIR" >&2
+        return 2
+    fi
+    rm -rf -- "$FIREBOLT_CORE_DATA_DIR"
 }
 
 case "$COMMAND" in
@@ -183,7 +188,8 @@ case "$COMMAND" in
         query_core "$@"
         ;;
     clean)
-        clean_core
+        shift || true
+        clean_core "$@"
         ;;
     *)
         echo "usage: benchmarks/firebolt_core_local.sh {start|stop|status|wait|query|clean}" >&2

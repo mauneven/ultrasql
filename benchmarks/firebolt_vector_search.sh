@@ -15,6 +15,7 @@ RAW_DIR="${RAW_DIR:-$OUT_DIR/raw}"
 MANIFEST="$OUT_DIR/firebolt_vector_search_manifest.json"
 ENGINES="${FIREBOLT_VECTOR_ENGINES:-ultrasql,firebolt}"
 FIREBOLT_CORE_ENDPOINT="${FIREBOLT_CORE_ENDPOINT:-http://127.0.0.1:3473}"
+FIREBOLT_CORE_IMAGE="${FIREBOLT_CORE_IMAGE:-ghcr.io/firebolt-db/firebolt-core:preview-rc}"
 FIREBOLT_CORE_HELPER="${FIREBOLT_CORE_HELPER:-benchmarks/firebolt_core_local.sh}"
 
 case "$PROFILE" in
@@ -67,6 +68,20 @@ row_label() {
 ROW_LABEL="$(row_label "$ROWS")"
 WORKLOAD_ID="vector_ann_hnsw_${ROW_LABEL}_${DIMS}d_k${TOP_K}"
 
+firebolt_unavailable_reason() {
+    local status
+    status="$(
+        FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" \
+        FIREBOLT_CORE_IMAGE="$FIREBOLT_CORE_IMAGE" \
+            "$FIREBOLT_CORE_HELPER" status 2>/dev/null || true
+    )"
+    if [[ "$status" == *docker_unavailable* ]]; then
+        echo "docker_unavailable"
+    else
+        echo "firebolt_core_unavailable"
+    fi
+}
+
 record_engine() {
     local engine="$1"
     local status="$2"
@@ -80,9 +95,11 @@ emit_not_available() {
     local reason="$2"
     local out="$RAW_DIR/${WORKLOAD_ID}-${engine}.json"
 
-    python3 - "$out" "$engine" "$PROFILE" "$ROWS" "$DIMS" "$TOP_K" "$QUERIES" "$WARMUP" "$M" "$EF_SEARCH" "$SEED" "$reason" "$WORKLOAD_ID" "$REQUIRED_VECTOR_METRICS" <<'PY'
+    python3 - "$out" "$engine" "$PROFILE" "$ROWS" "$DIMS" "$TOP_K" "$QUERIES" "$WARMUP" "$M" "$EF_SEARCH" "$SEED" "$reason" "$WORKLOAD_ID" "$REQUIRED_VECTOR_METRICS" "$FIREBOLT_CORE_IMAGE" <<'PY'
 import json
+import os
 import pathlib
+import platform
 import sys
 import time
 
@@ -101,7 +118,19 @@ import time
     reason,
     workload,
     metrics,
+    docker_image,
 ) = sys.argv[1:]
+
+def host_memory_bytes():
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if isinstance(pages, int) and isinstance(page_size, int):
+            return pages * page_size
+    except (AttributeError, OSError, ValueError):
+        return None
+    return None
+
 doc = {
     "schema_version": 1,
     "engine": engine,
@@ -116,6 +145,15 @@ doc = {
     "m": int(m),
     "ef_search": int(ef_search),
     "seed": int(seed),
+    "docker_image": docker_image,
+    "firebolt_version": None,
+    "core_mode": "local_docker",
+    "host_cpu": os.environ.get("ULTRASQL_HOST_CPU") or platform.processor() or platform.machine(),
+    "host_memory": host_memory_bytes(),
+    "dataset_rows": int(rows),
+    "samples": 0,
+    "median_us": None,
+    "p95_us": None,
     "status": "not_available",
     "reason": reason,
     "generated_at_unix": int(time.time()),
@@ -157,12 +195,13 @@ run_ultrasql() {
 
 run_firebolt() {
     local out="$RAW_DIR/${WORKLOAD_ID}-firebolt_hnsw.json"
-    if ! FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" "$FIREBOLT_CORE_HELPER" wait >/dev/null; then
-        emit_not_available "firebolt_hnsw" "firebolt_core_unavailable"
+    if ! FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" FIREBOLT_CORE_IMAGE="$FIREBOLT_CORE_IMAGE" "$FIREBOLT_CORE_HELPER" wait >/dev/null; then
+        emit_not_available "firebolt_hnsw" "$(firebolt_unavailable_reason)"
         return 2
     fi
 
     FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" \
+    FIREBOLT_CORE_IMAGE="$FIREBOLT_CORE_IMAGE" \
     FIREBOLT_ROWS="$ROWS" \
     FIREBOLT_DIMS="$DIMS" \
     FIREBOLT_TOP_K="$TOP_K" \
@@ -181,6 +220,7 @@ import json
 import math
 import os
 import pathlib
+import platform
 import statistics
 import sys
 import time
@@ -207,6 +247,17 @@ required_metrics = os.environ["FIREBOLT_REQUIRED_METRICS"].split(",")
 timeout = float(os.environ.get("FIREBOLT_TIMEOUT_SECS", "120"))
 table = f"ultrasql_firebolt_vec_{int(time.time())}_{os.getpid()}"
 index = f"{table}_hnsw"
+
+
+def host_memory_bytes():
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if isinstance(pages, int) and isinstance(page_size, int):
+            return pages * page_size
+    except (AttributeError, OSError, ValueError):
+        return None
+    return None
 
 
 def u64(value: int) -> int:
@@ -279,6 +330,15 @@ def write_not_available(reason, detail=None):
         "m": m,
         "ef_search": ef_search,
         "seed": seed,
+        "docker_image": os.environ["FIREBOLT_CORE_IMAGE"],
+        "firebolt_version": None,
+        "core_mode": "local_docker",
+        "host_cpu": os.environ.get("ULTRASQL_HOST_CPU") or platform.processor() or platform.machine(),
+        "host_memory": host_memory_bytes(),
+        "dataset_rows": rows,
+        "samples": 0,
+        "median_us": None,
+        "p95_us": None,
         "status": "not_available",
         "reason": reason,
         "detail": detail,
@@ -364,6 +424,13 @@ try:
         write_not_available("no_measured_iterations")
         sys.exit(2)
 
+    try:
+        version_doc = request("SELECT version()")
+        version_rows = version_doc.get("data", [])
+        firebolt_version = str(version_rows[0][0]) if version_rows and version_rows[0] else None
+    except Exception:
+        firebolt_version = None
+
     doc = {
         "schema_version": 1,
         "engine": "firebolt_hnsw",
@@ -380,6 +447,15 @@ try:
         "ef_construction": ef_construction,
         "ef_search": ef_search,
         "seed": seed,
+        "docker_image": os.environ["FIREBOLT_CORE_IMAGE"],
+        "firebolt_version": firebolt_version,
+        "core_mode": "local_docker",
+        "host_cpu": os.environ.get("ULTRASQL_HOST_CPU") or platform.processor() or platform.machine(),
+        "host_memory": host_memory_bytes(),
+        "dataset_rows": rows,
+        "samples": len(iterations_us),
+        "median_us": statistics.median(iterations_us),
+        "p95_us": percentile_nearest_rank(iterations_us, 0.95),
         "recall_at_k": statistics.mean(recall_iterations),
         "p50_latency_us": percentile_nearest_rank(iterations_us, 0.50),
         "p95_latency_us": percentile_nearest_rank(iterations_us, 0.95),

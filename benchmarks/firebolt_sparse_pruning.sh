@@ -16,6 +16,7 @@ RAW_DIR="${RAW_DIR:-$OUT_DIR/raw}"
 MANIFEST="$OUT_DIR/firebolt_sparse_pruning_manifest.json"
 ENGINES="${FIREBOLT_SPARSE_ENGINES:-ultrasql,firebolt}"
 FIREBOLT_CORE_ENDPOINT="${FIREBOLT_CORE_ENDPOINT:-http://127.0.0.1:3473}"
+FIREBOLT_CORE_IMAGE="${FIREBOLT_CORE_IMAGE:-ghcr.io/firebolt-db/firebolt-core:preview-rc}"
 FIREBOLT_CORE_HELPER="${FIREBOLT_CORE_HELPER:-benchmarks/firebolt_core_local.sh}"
 
 case "$PROFILE" in
@@ -57,6 +58,20 @@ ROW_LABEL="$(row_label "$ROWS")"
 WORKLOAD_ID="firebolt_sparse_pruning_${ROW_LABEL}"
 REQUIRED_METRICS="median_us,min_us,load_time_us,primary_index_pruning_evidence"
 
+firebolt_unavailable_reason() {
+    local status
+    status="$(
+        FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" \
+        FIREBOLT_CORE_IMAGE="$FIREBOLT_CORE_IMAGE" \
+            "$FIREBOLT_CORE_HELPER" status 2>/dev/null || true
+    )"
+    if [[ "$status" == *docker_unavailable* ]]; then
+        echo "docker_unavailable"
+    else
+        echo "firebolt_core_unavailable"
+    fi
+}
+
 record_engine() {
     local engine="$1"
     local status="$2"
@@ -70,13 +85,26 @@ emit_not_available() {
     local reason="$2"
     local out="$RAW_DIR/${WORKLOAD_ID}-${engine}.json"
 
-    python3 - "$out" "$engine" "$PROFILE" "$ROWS" "$WARMUP" "$ITERS" "$reason" "$WORKLOAD_ID" "$REQUIRED_METRICS" <<'PY'
+    python3 - "$out" "$engine" "$PROFILE" "$ROWS" "$WARMUP" "$ITERS" "$reason" "$WORKLOAD_ID" "$REQUIRED_METRICS" "$FIREBOLT_CORE_IMAGE" <<'PY'
 import json
+import os
 import pathlib
+import platform
 import sys
 import time
 
-out, engine, profile, rows, warmup, iters, reason, workload, metrics = sys.argv[1:]
+out, engine, profile, rows, warmup, iters, reason, workload, metrics, docker_image = sys.argv[1:]
+
+def host_memory_bytes():
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if isinstance(pages, int) and isinstance(page_size, int):
+            return pages * page_size
+    except (AttributeError, OSError, ValueError):
+        return None
+    return None
+
 doc = {
     "schema_version": 1,
     "engine": engine,
@@ -86,6 +114,15 @@ doc = {
     "n_rows": int(rows),
     "warmup": int(warmup),
     "iters": int(iters),
+    "docker_image": docker_image,
+    "firebolt_version": None,
+    "core_mode": "local_docker",
+    "host_cpu": os.environ.get("ULTRASQL_HOST_CPU") or platform.processor() or platform.machine(),
+    "host_memory": host_memory_bytes(),
+    "dataset_rows": int(rows),
+    "samples": 0,
+    "median_us": None,
+    "p95_us": None,
     "status": "not_available",
     "reason": reason,
     "generated_at_unix": int(time.time()),
@@ -129,12 +166,13 @@ run_ultrasql() {
 
 run_firebolt() {
     local out="$RAW_DIR/${WORKLOAD_ID}-firebolt.json"
-    if ! FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" "$FIREBOLT_CORE_HELPER" wait >/dev/null; then
-        emit_not_available "firebolt" "firebolt_core_unavailable"
+    if ! FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" FIREBOLT_CORE_IMAGE="$FIREBOLT_CORE_IMAGE" "$FIREBOLT_CORE_HELPER" wait >/dev/null; then
+        emit_not_available "firebolt" "$(firebolt_unavailable_reason)"
         return 2
     fi
 
     FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" \
+    FIREBOLT_CORE_IMAGE="$FIREBOLT_CORE_IMAGE" \
     FIREBOLT_ROWS="$ROWS" \
     FIREBOLT_WARMUP="$WARMUP" \
     FIREBOLT_ITERS="$ITERS" \
@@ -143,8 +181,10 @@ run_firebolt() {
     FIREBOLT_SPARSE_PROFILE="$PROFILE" \
     python3 <<'PY'
 import json
+import math
 import os
 import pathlib
+import platform
 import statistics
 import sys
 import time
@@ -167,6 +207,23 @@ filter_tenant = 7
 index_granularity = int(os.environ.get("FIREBOLT_SPARSE_INDEX_GRANULARITY", "1024"))
 
 
+def host_memory_bytes():
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if isinstance(pages, int) and isinstance(page_size, int):
+            return pages * page_size
+    except (AttributeError, OSError, ValueError):
+        return None
+    return None
+
+
+def percentile_nearest_rank(values, percentile):
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * percentile) - 1))
+    return ordered[index]
+
+
 def formatted_endpoint() -> str:
     separator = "&" if urllib.parse.urlparse(endpoint).query else "?"
     return f"{endpoint}{separator}output_format=JSON_Compact"
@@ -182,6 +239,15 @@ def write_not_available(reason, detail=None):
         "n_rows": rows,
         "warmup": warmup,
         "iters": iters,
+        "docker_image": os.environ["FIREBOLT_CORE_IMAGE"],
+        "firebolt_version": None,
+        "core_mode": "local_docker",
+        "host_cpu": os.environ.get("ULTRASQL_HOST_CPU") or platform.processor() or platform.machine(),
+        "host_memory": host_memory_bytes(),
+        "dataset_rows": rows,
+        "samples": 0,
+        "median_us": None,
+        "p95_us": None,
         "status": "not_available",
         "reason": reason,
         "detail": detail,
@@ -286,6 +352,13 @@ try:
         write_not_available("no_measured_iterations")
         sys.exit(2)
 
+    try:
+        version_doc = request("SELECT version()")
+        version_rows = version_doc.get("data", [])
+        firebolt_version = str(version_rows[0][0]) if version_rows and version_rows[0] else None
+    except Exception:
+        firebolt_version = None
+
     doc = {
         "schema_version": 1,
         "engine": "firebolt",
@@ -293,8 +366,15 @@ try:
         "suite": "firebolt_sparse_pruning",
         "profile": profile,
         "n_rows": rows,
+        "docker_image": os.environ["FIREBOLT_CORE_IMAGE"],
+        "firebolt_version": firebolt_version,
+        "core_mode": "local_docker",
+        "host_cpu": os.environ.get("ULTRASQL_HOST_CPU") or platform.processor() or platform.machine(),
+        "host_memory": host_memory_bytes(),
+        "dataset_rows": rows,
         "samples": len(iterations_us),
         "median_us": statistics.median(iterations_us),
+        "p95_us": percentile_nearest_rank(iterations_us, 0.95),
         "min_us": min(iterations_us),
         "iterations_us": iterations_us,
         "load_time_us": load_time_us,

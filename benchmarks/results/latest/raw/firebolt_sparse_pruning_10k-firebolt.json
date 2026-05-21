@@ -5,11 +5,20 @@
   "suite": "firebolt_sparse_pruning",
   "profile": "smoke",
   "n_rows": 10000,
-  "warmup": 1,
-  "iters": 3,
+  "warmup": 0,
+  "iters": 1,
+  "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+  "firebolt_version": null,
+  "core_mode": "local_docker",
+  "host_cpu": "arm",
+  "host_memory": 17179869184,
+  "dataset_rows": 10000,
+  "samples": 0,
+  "median_us": null,
+  "p95_us": null,
   "status": "not_available",
-  "reason": "firebolt_core_unavailable",
-  "generated_at_unix": 1779343240,
+  "reason": "docker_unavailable",
+  "generated_at_unix": 1779346252,
   "required_metrics": [
     "median_us",
     "min_us",
@@ -20,5 +29,5 @@
     "ddl": "CREATE FACT TABLE fact_events (...) PRIMARY INDEX event_day, tenant_id, bucket WITH (index_granularity = 1024)",
     "query": "SELECT event_day, tenant_id, bucket, SUM(amount), COUNT(*) FROM fact_events WHERE event_day BETWEEN ? AND ? AND tenant_id = 7 GROUP BY event_day, tenant_id, bucket"
   },
-  "policy": "No Firebolt sparse-pruning benchmark claim exists until a configured local Firebolt Core emits measured samples and a raw EXPLAIN artifact shows primary-index pruning evidence."
+  "policy": "No Firebolt sparse-pruning benchmark claim exists until local Firebolt Core Docker emits measured samples and a raw EXPLAIN artifact shows primary-index pruning evidence."
 }

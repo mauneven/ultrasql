@@ -87,14 +87,93 @@ fn firebolt_core_local_helper_manages_local_docker_core_only() {
     assert!(script.contains("FIREBOLT_CORE_ENDPOINT"));
     assert!(script.contains("ghcr.io/firebolt-db/firebolt-core"));
     assert!(script.contains("docker run"));
+    assert!(script.contains("SELECT 42;"));
+    assert!(script.contains("wait_ready"));
+    assert!(script.contains("clean --yes"));
+    assert!(script.contains("refusing to clean"));
     assert!(!script.contains(LEGACY_FIREBOLT_REMOTE_ENV));
     assert!(docs.contains("closed-source Docker image"));
     assert!(docs.contains("not vendored"));
     assert!(docs.contains("benchmarks/firebolt_core_local.sh start"));
     assert!(docs.contains("benchmarks/firebolt_core_local.sh query \"SELECT 42;\""));
+    assert!(docs.contains("benchmarks/firebolt_core_local.sh clean --yes"));
     assert!(docs.contains("same-host CPU model"));
     assert!(docs.contains("No claim policy"));
     assert!(!docs.contains(LEGACY_FIREBOLT_REMOTE_ENV));
+}
+
+#[test]
+fn firebolt_core_clean_requires_explicit_yes() {
+    let Some(mut bash) = bash_command() else {
+        eprintln!("skipping clean safety check: Git Bash not found");
+        return;
+    };
+    let data_dir = std::env::temp_dir().join(format!(
+        "ultrasql-firebolt-clean-test-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&data_dir).expect("create temp firebolt data dir");
+    fs::write(data_dir.join("sentinel"), b"keep").expect("write sentinel");
+
+    let script = repo_path("benchmarks/firebolt_core_local.sh");
+    let output = bash
+        .arg(&script)
+        .arg("clean")
+        .env("FIREBOLT_CORE_DATA_DIR", &data_dir)
+        .output()
+        .unwrap_or_else(|err| panic!("run {} clean: {err}", script.display()));
+
+    assert!(!output.status.success(), "clean without --yes must fail");
+    assert!(
+        data_dir.join("sentinel").exists(),
+        "clean without --yes must not delete persistent data"
+    );
+
+    let mut bash = bash_command().expect("bash available after earlier check");
+    let status = bash
+        .arg(&script)
+        .arg("clean")
+        .arg("--yes")
+        .env("FIREBOLT_CORE_DATA_DIR", &data_dir)
+        .status()
+        .unwrap_or_else(|err| panic!("run {} clean --yes: {err}", script.display()));
+
+    assert!(status.success(), "clean --yes should succeed");
+    assert!(
+        !data_dir.exists(),
+        "clean --yes should remove explicit data dir"
+    );
+}
+
+#[test]
+fn firebolt_artifacts_have_required_local_core_schema() {
+    let required_fields = [
+        "docker_image",
+        "firebolt_version",
+        "core_mode",
+        "local_docker",
+        "host_cpu",
+        "host_memory",
+        "dataset_rows",
+        "samples",
+        "median_us",
+        "p95_us",
+        "status",
+        "docker_unavailable",
+    ];
+    for path in [
+        "benchmarks/firebolt_aggregate_index.sh",
+        "benchmarks/firebolt_sparse_pruning.sh",
+        "benchmarks/firebolt_vector_search.sh",
+        "benchmarks/results/latest/raw/firebolt_aggregate_index_10k-firebolt.json",
+        "benchmarks/results/latest/raw/firebolt_sparse_pruning_10k-firebolt.json",
+        "benchmarks/results/latest/raw/vector_ann_hnsw_512_8d_k10-firebolt_hnsw.json",
+    ] {
+        let text = repo_file(path);
+        for field in required_fields {
+            assert!(text.contains(field), "{path} missing {field}");
+        }
+    }
 }
 
 #[test]

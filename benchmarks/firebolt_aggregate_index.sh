@@ -17,6 +17,7 @@ RAW_DIR="${RAW_DIR:-$OUT_DIR/raw}"
 MANIFEST="$OUT_DIR/firebolt_aggregate_index_manifest.json"
 ENGINES="${FIREBOLT_AGG_ENGINES:-ultrasql,firebolt}"
 FIREBOLT_CORE_ENDPOINT="${FIREBOLT_CORE_ENDPOINT:-http://127.0.0.1:3473}"
+FIREBOLT_CORE_IMAGE="${FIREBOLT_CORE_IMAGE:-ghcr.io/firebolt-db/firebolt-core:preview-rc}"
 FIREBOLT_CORE_HELPER="${FIREBOLT_CORE_HELPER:-benchmarks/firebolt_core_local.sh}"
 
 case "$PROFILE" in
@@ -57,6 +58,20 @@ row_label() {
 ROW_LABEL="$(row_label "$ROWS")"
 WORKLOAD_ID="firebolt_aggregate_index_${ROW_LABEL}"
 
+firebolt_unavailable_reason() {
+    local status
+    status="$(
+        FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" \
+        FIREBOLT_CORE_IMAGE="$FIREBOLT_CORE_IMAGE" \
+            "$FIREBOLT_CORE_HELPER" status 2>/dev/null || true
+    )"
+    if [[ "$status" == *docker_unavailable* ]]; then
+        echo "docker_unavailable"
+    else
+        echo "firebolt_core_unavailable"
+    fi
+}
+
 record_engine() {
     local engine="$1"
     local status="$2"
@@ -70,13 +85,27 @@ emit_not_available() {
     local reason="$2"
     local out="$RAW_DIR/${WORKLOAD_ID}-${engine}.json"
 
-    python3 - "$out" "$engine" "$PROFILE" "$ROWS" "$WARMUP" "$ITERS" "$reason" "$WORKLOAD_ID" <<'PY'
+    python3 - "$out" "$engine" "$PROFILE" "$ROWS" "$WARMUP" "$ITERS" "$reason" "$WORKLOAD_ID" "$FIREBOLT_CORE_IMAGE" <<'PY'
 import json
+import math
+import os
 import pathlib
+import platform
 import sys
 import time
 
-out, engine, profile, rows, warmup, iters, reason, workload = sys.argv[1:]
+out, engine, profile, rows, warmup, iters, reason, workload, docker_image = sys.argv[1:]
+
+def host_memory_bytes():
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if isinstance(pages, int) and isinstance(page_size, int):
+            return pages * page_size
+    except (AttributeError, OSError, ValueError):
+        return None
+    return None
+
 doc = {
     "schema_version": 1,
     "engine": engine,
@@ -86,6 +115,15 @@ doc = {
     "n_rows": int(rows),
     "warmup": int(warmup),
     "iters": int(iters),
+    "docker_image": docker_image,
+    "firebolt_version": None,
+    "core_mode": "local_docker",
+    "host_cpu": os.environ.get("ULTRASQL_HOST_CPU") or platform.processor() or platform.machine(),
+    "host_memory": host_memory_bytes(),
+    "dataset_rows": int(rows),
+    "samples": 0,
+    "median_us": None,
+    "p95_us": None,
     "status": "not_available",
     "reason": reason,
     "generated_at_unix": int(time.time()),
@@ -126,12 +164,13 @@ run_ultrasql() {
 
 run_firebolt() {
     local out="$RAW_DIR/${WORKLOAD_ID}-firebolt.json"
-    if ! FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" "$FIREBOLT_CORE_HELPER" wait >/dev/null; then
-        emit_not_available "firebolt" "firebolt_core_unavailable"
+    if ! FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" FIREBOLT_CORE_IMAGE="$FIREBOLT_CORE_IMAGE" "$FIREBOLT_CORE_HELPER" wait >/dev/null; then
+        emit_not_available "firebolt" "$(firebolt_unavailable_reason)"
         return 2
     fi
 
     FIREBOLT_CORE_ENDPOINT="$FIREBOLT_CORE_ENDPOINT" \
+    FIREBOLT_CORE_IMAGE="$FIREBOLT_CORE_IMAGE" \
     FIREBOLT_ROWS="$ROWS" \
     FIREBOLT_WARMUP="$WARMUP" \
     FIREBOLT_ITERS="$ITERS" \
@@ -141,6 +180,7 @@ run_firebolt() {
 import json
 import os
 import pathlib
+import platform
 import statistics
 import time
 import urllib.error
@@ -157,6 +197,23 @@ workload = os.environ["FIREBOLT_WORKLOAD"]
 timeout = float(os.environ.get("FIREBOLT_TIMEOUT_SECS", "120"))
 table = f"ultrasql_firebolt_agg_{int(time.time())}_{os.getpid()}"
 index = f"{table}_idx"
+
+
+def host_memory_bytes():
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if isinstance(pages, int) and isinstance(page_size, int):
+            return pages * page_size
+    except (AttributeError, OSError, ValueError):
+        return None
+    return None
+
+
+def percentile_nearest_rank(values, percentile):
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * percentile) - 1))
+    return ordered[index]
 
 
 def formatted_endpoint() -> str:
@@ -236,6 +293,13 @@ try:
     if not iterations_us:
         raise RuntimeError("no measured Firebolt iterations")
 
+    try:
+        version_doc = request("SELECT version()")
+        version_rows = version_doc.get("data", [])
+        firebolt_version = str(version_rows[0][0]) if version_rows and version_rows[0] else None
+    except Exception:
+        firebolt_version = None
+
     doc = {
         "schema_version": 1,
         "engine": "firebolt",
@@ -243,8 +307,15 @@ try:
         "suite": "firebolt_aggregate_index",
         "profile": os.environ.get("FIREBOLT_AGG_PROFILE", "smoke"),
         "n_rows": rows,
+        "docker_image": os.environ["FIREBOLT_CORE_IMAGE"],
+        "firebolt_version": firebolt_version,
+        "core_mode": "local_docker",
+        "host_cpu": os.environ.get("ULTRASQL_HOST_CPU") or platform.processor() or platform.machine(),
+        "host_memory": host_memory_bytes(),
+        "dataset_rows": rows,
         "samples": len(iterations_us),
         "median_us": statistics.median(iterations_us),
+        "p95_us": percentile_nearest_rank(iterations_us, 0.95),
         "min_us": min(iterations_us),
         "iterations_us": iterations_us,
         "load_time_us": load_time_us,

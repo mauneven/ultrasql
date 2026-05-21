@@ -272,7 +272,7 @@ benchmarks/firebolt_core_local.sh start
 benchmarks/firebolt_core_local.sh status
 benchmarks/firebolt_core_local.sh query "SELECT 42;"
 benchmarks/firebolt_core_local.sh stop
-benchmarks/firebolt_core_local.sh clean
+benchmarks/firebolt_core_local.sh clean --yes
 ```
 
 The helper defaults to `ghcr.io/firebolt-db/firebolt-core:preview-rc`,

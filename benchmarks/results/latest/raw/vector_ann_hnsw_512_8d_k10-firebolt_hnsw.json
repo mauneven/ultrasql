@@ -7,14 +7,23 @@
   "n_rows": 512,
   "vector_dims": 8,
   "top_k": 10,
-  "queries": 4,
+  "queries": 1,
   "warmup_queries": 0,
   "m": 16,
   "ef_search": 64,
   "seed": 1367265502,
+  "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+  "firebolt_version": null,
+  "core_mode": "local_docker",
+  "host_cpu": "arm",
+  "host_memory": 17179869184,
+  "dataset_rows": 512,
+  "samples": 0,
+  "median_us": null,
+  "p95_us": null,
   "status": "not_available",
-  "reason": "firebolt_core_unavailable",
-  "generated_at_unix": 1779343241,
+  "reason": "docker_unavailable",
+  "generated_at_unix": 1779346252,
   "required_metrics": [
     "recall_at_k",
     "p50_latency_us",
@@ -28,5 +37,5 @@
     "ddl": "CREATE INDEX idx ON documents USING HNSW (embedding vector_l2sq_ops) WITH (dimension = ?, m = ?, ef_construction = ?, quantization = 'f32')",
     "query": "SELECT id FROM VECTOR_SEARCH(INDEX idx, target_vector => ?, top_k => ?, ef_search => ?)"
   },
-  "policy": "No Firebolt vector-search benchmark claim exists until a configured local Firebolt Core emits measured VECTOR_SEARCH samples from reproducible inputs."
+  "policy": "No Firebolt vector-search benchmark claim exists until local Firebolt Core Docker emits measured VECTOR_SEARCH samples from reproducible inputs."
 }
