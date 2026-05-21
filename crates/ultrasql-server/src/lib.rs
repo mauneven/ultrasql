@@ -2102,7 +2102,7 @@ impl Server {
             wal_writer: Some(wal_writer),
         };
         server.recover_commit_status_from_wal()?;
-        server.rebuild_persistent_vector_indexes()?;
+        server.rebuild_persistent_index_sidecars()?;
         Ok(server)
     }
 
@@ -2122,7 +2122,7 @@ impl Server {
         .map_err(|e| ServerError::ddl(format!("recover commit status: {e}")))
     }
 
-    fn rebuild_persistent_vector_indexes(&self) -> Result<(), ServerError> {
+    fn rebuild_persistent_index_sidecars(&self) -> Result<(), ServerError> {
         let snapshot = self.catalog_snapshot();
         let mut hnsw_indexes = Vec::new();
         let mut ivfflat_indexes = Vec::new();
@@ -2242,6 +2242,32 @@ impl Server {
                         );
                         changed = true;
                     }
+                    LogicalIndexMethod::Aggregating => {
+                        let Some(spec) =
+                            crate::aggregating_index::aggregating_index_spec_from_catalog(
+                                table, index,
+                            )?
+                        else {
+                            continue;
+                        };
+                        let rows = self.rebuild_aggregating_index_rows(table, &spec)?;
+                        constraints.indexes.insert(
+                            index.oid,
+                            RuntimeIndexMetadata {
+                                key_exprs: aggregating_group_key_exprs(table, &spec)?,
+                                predicate: None,
+                                include_columns: Vec::new(),
+                                method,
+                                brin: None,
+                                hnsw: None,
+                                ivfflat: None,
+                                aggregating: Some(Arc::new(RuntimeAggregatingIndex::new(
+                                    spec, rows,
+                                ))),
+                            },
+                        );
+                        changed = true;
+                    }
                     _ => {}
                 }
             }
@@ -2253,6 +2279,25 @@ impl Server {
         }
 
         self.replay_vector_index_wal_into(&hnsw_indexes, &ivfflat_indexes)
+    }
+
+    fn rebuild_aggregating_index_rows(
+        &self,
+        table: &TableEntry,
+        spec: &ultrasql_planner::LogicalAggregatingIndex,
+    ) -> Result<Vec<Vec<Value>>, ServerError> {
+        let txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let rows = crate::aggregating_index::build_aggregating_index_rows(
+            table,
+            spec,
+            self.heap.as_ref(),
+            &txn.snapshot,
+            self.txn_manager.as_ref(),
+        );
+        if let Err(e) = self.txn_manager.commit(txn) {
+            tracing::warn!(error = %e, "restart aggregating-index rebuild txn failed to finalise");
+        }
+        rows
     }
 
     fn replay_vector_index_wal_into(
@@ -3125,6 +3170,28 @@ fn logical_index_method_from_name(name: &str) -> LogicalIndexMethod {
         "aggregating" => LogicalIndexMethod::Aggregating,
         _ => LogicalIndexMethod::Btree,
     }
+}
+
+fn aggregating_group_key_exprs(
+    table: &TableEntry,
+    spec: &ultrasql_planner::LogicalAggregatingIndex,
+) -> Result<Vec<ScalarExpr>, ServerError> {
+    spec.group_columns
+        .iter()
+        .map(|col| {
+            let field = table.schema.field(*col).ok_or_else(|| {
+                ServerError::ddl(format!(
+                    "aggregating index group column {} missing from table {}",
+                    col, table.name
+                ))
+            })?;
+            Ok(ScalarExpr::Column {
+                name: field.name.clone(),
+                index: *col,
+                data_type: field.data_type.clone(),
+            })
+        })
+        .collect()
 }
 
 fn hnsw_metric_for_opclass_name(opclass: Option<&str>) -> Result<HnswMetric, ServerError> {

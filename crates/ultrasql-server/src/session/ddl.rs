@@ -711,7 +711,13 @@ where
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, false);
+            let entry = IndexEntry::new(index_oid, index_name.clone(), table.oid, attnums, false)
+                .with_access_method("aggregating", vec![None; spec.group_columns.len()])
+                .with_options(
+                    crate::aggregating_index::catalog_options_for_aggregating_index(
+                        &spec, table.oid, index_oid,
+                    ),
+                );
             self.state.persistent_catalog.create_index(entry.clone())?;
             let ddl_txn = self
                 .state

@@ -1,15 +1,15 @@
 //! Runtime support for `CREATE AGGREGATING INDEX`.
 //!
-//! This first slice is deliberately a runtime summary, not a page-backed
-//! production index. It gives the planner/executor a real rewrite target
-//! for Firebolt-style dashboard aggregates while preserving correctness
-//! through lazy rebuilds after DML.
+//! The summary itself is a runtime sidecar: DML marks it dirty and the
+//! next matching read rebuilds it lazily. Durable catalog metadata records
+//! the exact group/aggregate shape, then restart rebuilds clean summary
+//! rows from the heap rather than trusting same-process-only state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use ultrasql_catalog::TableEntry;
+use ultrasql_catalog::{IndexEntry, TableEntry};
 use ultrasql_core::{DataType, RelationId, Schema, Value};
 use ultrasql_executor::{Eval, Operator, RowCodec, ValuesScan};
 use ultrasql_mvcc::Snapshot;
@@ -22,6 +22,15 @@ use ultrasql_txn::TransactionManager;
 use crate::error::ServerError;
 use crate::pipeline::LowerCtx;
 use crate::{BlankPageLoader, RuntimeAggregatingIndex};
+
+const CATALOG_VERSION: &str = "1";
+const OPTION_SOURCE_TABLE_OID: &str = "aggregating.source_table_oid";
+const OPTION_INDEX_OID: &str = "aggregating.index_oid";
+const OPTION_GROUP_COLUMNS: &str = "aggregating.group_columns";
+const OPTION_AGGREGATES: &str = "aggregating.aggregates";
+const OPTION_STALE: &str = "aggregating.stale";
+const OPTION_VERSION: &str = "aggregating.version";
+const OPTION_DURABLE_STATE: &str = "aggregating.durable_state";
 
 #[derive(Clone, Debug)]
 struct AggregateState {
@@ -166,6 +175,210 @@ pub(crate) fn build_aggregating_index_rows(
         .collect::<Vec<_>>();
     rows.sort_by_key(|row| display_key(row));
     Ok(rows)
+}
+
+/// Encode the durable metadata needed to rebuild an aggregating-index
+/// runtime sidecar from catalog + heap rows after restart.
+pub(crate) fn catalog_options_for_aggregating_index(
+    spec: &LogicalAggregatingIndex,
+    source_table_oid: ultrasql_core::Oid,
+    index_oid: ultrasql_core::Oid,
+) -> Vec<(String, String)> {
+    vec![
+        (
+            OPTION_SOURCE_TABLE_OID.to_owned(),
+            source_table_oid.raw().to_string(),
+        ),
+        (OPTION_INDEX_OID.to_owned(), index_oid.raw().to_string()),
+        (
+            OPTION_GROUP_COLUMNS.to_owned(),
+            spec.group_columns
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        (
+            OPTION_AGGREGATES.to_owned(),
+            spec.aggregates
+                .iter()
+                .map(encode_aggregate_spec)
+                .collect::<Vec<_>>()
+                .join(";"),
+        ),
+        (OPTION_STALE.to_owned(), "false".to_owned()),
+        (OPTION_VERSION.to_owned(), CATALOG_VERSION.to_owned()),
+        (
+            OPTION_DURABLE_STATE.to_owned(),
+            "rebuild_on_restart".to_owned(),
+        ),
+    ]
+}
+
+/// Decode durable aggregating-index metadata from `pg_index.indoptions`.
+pub(crate) fn aggregating_index_spec_from_catalog(
+    table: &TableEntry,
+    index: &IndexEntry,
+) -> Result<Option<LogicalAggregatingIndex>, ServerError> {
+    if index.access_method != "aggregating" {
+        return Ok(None);
+    }
+    let version = required_option(index, OPTION_VERSION)?;
+    if version != CATALOG_VERSION {
+        return Err(ServerError::ddl(format!(
+            "aggregating index {} has unsupported metadata version {version}",
+            index.name
+        )));
+    }
+    let source_oid = parse_u32_option(index, OPTION_SOURCE_TABLE_OID)?;
+    if source_oid != table.oid.raw() {
+        return Err(ServerError::ddl(format!(
+            "aggregating index {} source table oid {} does not match table oid {}",
+            index.name,
+            source_oid,
+            table.oid.raw()
+        )));
+    }
+    let index_oid = parse_u32_option(index, OPTION_INDEX_OID)?;
+    if index_oid != index.oid.raw() {
+        return Err(ServerError::ddl(format!(
+            "aggregating index {} catalog index oid {} does not match index oid {}",
+            index.name,
+            index_oid,
+            index.oid.raw()
+        )));
+    }
+    let group_columns = parse_group_columns(required_option(index, OPTION_GROUP_COLUMNS)?)?;
+    let index_columns = index
+        .columns
+        .iter()
+        .map(|col| usize::from(*col))
+        .collect::<Vec<_>>();
+    if group_columns != index_columns {
+        return Err(ServerError::ddl(format!(
+            "aggregating index {} group columns {:?} do not match index columns {:?}",
+            index.name, group_columns, index_columns
+        )));
+    }
+    let aggregates = parse_aggregates(table, required_option(index, OPTION_AGGREGATES)?)?;
+    if aggregates.is_empty() {
+        return Err(ServerError::ddl(format!(
+            "aggregating index {} has no aggregate metadata",
+            index.name
+        )));
+    }
+    Ok(Some(LogicalAggregatingIndex {
+        group_columns,
+        aggregates,
+    }))
+}
+
+fn encode_aggregate_spec(spec: &LogicalAggregatingIndexExpr) -> String {
+    match spec.func {
+        AggregateFunc::Sum => format!(
+            "sum:{}",
+            spec.arg_column
+                .map(|col| col.to_string())
+                .unwrap_or_else(|| "*".to_owned())
+        ),
+        AggregateFunc::CountStar => "count:*".to_owned(),
+        other => format!("{other:?}:*").to_ascii_lowercase(),
+    }
+}
+
+fn required_option<'a>(index: &'a IndexEntry, name: &str) -> Result<&'a str, ServerError> {
+    index
+        .options
+        .iter()
+        .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+        .ok_or_else(|| {
+            ServerError::ddl(format!(
+                "aggregating index {} missing catalog option {name}",
+                index.name
+            ))
+        })
+}
+
+fn parse_u32_option(index: &IndexEntry, name: &str) -> Result<u32, ServerError> {
+    required_option(index, name)?.parse::<u32>().map_err(|e| {
+        ServerError::ddl(format!(
+            "aggregating index {} invalid catalog option {name}: {e}",
+            index.name
+        ))
+    })
+}
+
+fn parse_group_columns(raw: &str) -> Result<Vec<usize>, ServerError> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    raw.split(',')
+        .map(|part| {
+            part.parse::<usize>().map_err(|e| {
+                ServerError::ddl(format!(
+                    "aggregating index invalid group column {part}: {e}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn parse_aggregates(
+    table: &TableEntry,
+    raw: &str,
+) -> Result<Vec<LogicalAggregatingIndexExpr>, ServerError> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    raw.split(';')
+        .map(|part| parse_aggregate(table, part))
+        .collect()
+}
+
+fn parse_aggregate(
+    table: &TableEntry,
+    raw: &str,
+) -> Result<LogicalAggregatingIndexExpr, ServerError> {
+    let (func, arg) = raw.split_once(':').ok_or_else(|| {
+        ServerError::ddl(format!(
+            "aggregating index invalid aggregate metadata {raw}"
+        ))
+    })?;
+    match (func, arg) {
+        ("count", "*") => Ok(LogicalAggregatingIndexExpr {
+            func: AggregateFunc::CountStar,
+            arg_column: None,
+            output_name: "count".to_owned(),
+            data_type: DataType::Int64,
+        }),
+        ("sum", arg) => {
+            let col = arg.parse::<usize>().map_err(|e| {
+                ServerError::ddl(format!("aggregating index invalid sum column {arg}: {e}"))
+            })?;
+            let field = table.schema.field(col).ok_or_else(|| {
+                ServerError::ddl(format!("aggregating index sum column {col} missing"))
+            })?;
+            if !field.data_type.is_numeric() {
+                return Err(ServerError::ddl(format!(
+                    "aggregating index sum({}) requires numeric input, got {}",
+                    field.name, field.data_type
+                )));
+            }
+            let data_type = match field.data_type {
+                DataType::Float32 | DataType::Float64 => DataType::Float64,
+                _ => DataType::Int64,
+            };
+            Ok(LogicalAggregatingIndexExpr {
+                func: AggregateFunc::Sum,
+                arg_column: Some(col),
+                output_name: format!("sum({})", field.name.to_ascii_lowercase()),
+                data_type,
+            })
+        }
+        _ => Err(ServerError::ddl(format!(
+            "aggregating index unsupported aggregate metadata {raw}"
+        ))),
+    }
 }
 
 fn display_key(row: &[Value]) -> String {
