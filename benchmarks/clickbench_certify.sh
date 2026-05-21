@@ -13,6 +13,15 @@ cd "$REPO_ROOT"
 CLICKBENCH_REF="${CLICKBENCH_REF:-c5eb5d8e9c10fbef5ce16e8750f3e67de24cef0a}"
 CLICKBENCH_WORK="${CLICKBENCH_WORK:-target/clickbench}"
 CLICKBENCH_TSV="${CLICKBENCH_TSV:-$CLICKBENCH_WORK/hits.tsv}"
+CLICKBENCH_PARQUET="${CLICKBENCH_PARQUET:-$CLICKBENCH_WORK/hits.parquet}"
+CLICKBENCH_PARQUET_DIR="$(dirname "$CLICKBENCH_PARQUET")"
+mkdir -p "$CLICKBENCH_PARQUET_DIR"
+if [[ -z "${FIREBOLT_CORE_DATA_DIR+x}" ]]; then
+    FIREBOLT_CORE_DATA_DIR="$(cd "$CLICKBENCH_PARQUET_DIR" && pwd)"
+fi
+FIREBOLT_CORE_ENDPOINT="${FIREBOLT_CORE_ENDPOINT:-http://127.0.0.1:3473}"
+FIREBOLT_CORE_IMAGE="${FIREBOLT_CORE_IMAGE:-ghcr.io/firebolt-db/firebolt-core:preview-rc}"
+FIREBOLT_CORE_HELPER="${FIREBOLT_CORE_HELPER:-benchmarks/firebolt_core_local.sh}"
 POSTGRES_DSN="${POSTGRES_DSN:-}"
 ULTRASQL_DSN="${ULTRASQL_DSN:-}"
 CLICKBENCH_ENGINES="${CLICKBENCH_ENGINES:-postgres,ultrasql,duckdb,clickhouse,firebolt}"
@@ -31,8 +40,26 @@ FIREBOLT_OUT="$RAW_DIR/clickbench-firebolt.json"
 mkdir -p "$CLICKBENCH_WORK" "$OUT_DIR" "$RAW_DIR"
 
 base="https://raw.githubusercontent.com/ClickHouse/ClickBench/$CLICKBENCH_REF/postgresql"
+firebolt_base="https://raw.githubusercontent.com/ClickHouse/ClickBench/$CLICKBENCH_REF/firebolt"
 schema="$CLICKBENCH_WORK/create.sql"
 queries="$CLICKBENCH_WORK/queries.sql"
+firebolt_schema="$CLICKBENCH_WORK/firebolt_create.sql"
+firebolt_queries="$CLICKBENCH_WORK/firebolt_queries.sql"
+
+engine_requested() {
+    case ",$CLICKBENCH_ENGINES," in
+        *,"$1",*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+needs_tsv_dataset() {
+    engine_requested postgres || engine_requested ultrasql || engine_requested duckdb
+}
+
+needs_psql() {
+    engine_requested postgres || engine_requested ultrasql
+}
 
 emit_not_available_artifacts() {
     local reason="$1"
@@ -171,9 +198,14 @@ PY
 
 curl -L --fail --silent "$base/create.sql" -o "$schema"
 curl -L --fail --silent "$base/queries.sql" -o "$queries"
+if engine_requested firebolt; then
+    curl -L --fail --silent "$firebolt_base/create.sql" -o "$firebolt_schema"
+    curl -L --fail --silent "$firebolt_base/queries.sql" -o "$firebolt_queries"
+fi
 
-if [[ ! -f "$CLICKBENCH_TSV" ]]; then
+if needs_tsv_dataset && [[ ! -f "$CLICKBENCH_TSV" ]]; then
     if [[ "${CLICKBENCH_DOWNLOAD:-0}" == "1" ]]; then
+        mkdir -p "$(dirname "$CLICKBENCH_TSV")"
         curl -L --fail "https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz" \
             | gunzip > "$CLICKBENCH_TSV"
     else
@@ -189,7 +221,13 @@ EOF
     fi
 fi
 
-if ! command -v psql >/dev/null 2>&1; then
+if engine_requested firebolt && [[ ! -f "$CLICKBENCH_PARQUET" && "${CLICKBENCH_DOWNLOAD_PARQUET:-0}" == "1" ]]; then
+    mkdir -p "$(dirname "$CLICKBENCH_PARQUET")"
+    curl -L --fail "https://datasets.clickhouse.com/hits_compatible/hits.parquet" \
+        -o "$CLICKBENCH_PARQUET"
+fi
+
+if needs_psql && ! command -v psql >/dev/null 2>&1; then
     write_failure_summary "psql_missing" "psql must be available on PATH."
     echo "psql missing. Install PostgreSQL client tools or add psql to PATH." >&2
     exit 2
@@ -199,7 +237,7 @@ if [[ "$ALLOW_PARTIAL" != "1" && ( -z "$POSTGRES_DSN" || -z "$ULTRASQL_DSN" ) ]]
     echo "ClickBench missing PostgreSQL-wire DSN; runner will emit not_available artifacts for those engines." >&2
 fi
 
-python3 - "$schema" "$queries" "$CLICKBENCH_TSV" "$RUNS" "$POSTGRES_DSN" "$ULTRASQL_DSN" "$SUMMARY_OUT" "$RAW_DIR" "$CLICKBENCH_REF" "$CLICKBENCH_ENGINES" "$DUCKDB_BIN" <<'PY'
+python3 - "$schema" "$queries" "$CLICKBENCH_TSV" "$RUNS" "$POSTGRES_DSN" "$ULTRASQL_DSN" "$SUMMARY_OUT" "$RAW_DIR" "$CLICKBENCH_REF" "$CLICKBENCH_ENGINES" "$DUCKDB_BIN" "$firebolt_schema" "$firebolt_queries" "$CLICKBENCH_PARQUET" "$FIREBOLT_CORE_HELPER" "$FIREBOLT_CORE_ENDPOINT" "$FIREBOLT_CORE_IMAGE" "$FIREBOLT_CORE_DATA_DIR" <<'PY'
 import json
 import math
 import os
@@ -209,6 +247,9 @@ import statistics
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 (
     schema_path,
@@ -222,11 +263,21 @@ import time
     upstream_ref,
     engines_raw,
     duckdb_bin,
+    firebolt_schema_path,
+    firebolt_queries_path,
+    firebolt_parquet_path,
+    firebolt_helper,
+    firebolt_endpoint,
+    firebolt_image,
+    firebolt_data_dir,
 ) = sys.argv[1:]
 runs = int(runs_raw)
 queries = [q.strip() for q in pathlib.Path(queries_path).read_text().split(";") if q.strip()]
 schema = pathlib.Path(schema_path).read_text()
 data_path = pathlib.Path(data_path)
+firebolt_schema_path = pathlib.Path(firebolt_schema_path)
+firebolt_queries_path = pathlib.Path(firebolt_queries_path)
+firebolt_parquet_path = pathlib.Path(firebolt_parquet_path)
 out_path = pathlib.Path(out_path)
 raw_dir = pathlib.Path(raw_dir)
 raw_dir.mkdir(parents=True, exist_ok=True)
@@ -256,6 +307,8 @@ host = {
 }
 
 def dataset_rows():
+    if not data_path.exists():
+        return None
     with data_path.open("rb") as data:
         return sum(1 for _ in data)
 
@@ -293,7 +346,9 @@ def not_available(engine, reason, detail=None):
     })
     if engine == "firebolt":
         doc["core_mode"] = "local_docker"
-        doc["docker_image"] = os.environ.get("FIREBOLT_CORE_IMAGE", "firebolt-core")
+        doc["docker_image"] = firebolt_image
+        doc["firebolt_version"] = None
+        doc["dataset"] = str(firebolt_parquet_path)
     return doc
 
 def psql(dsn, sql, *, capture=False):
@@ -409,6 +464,140 @@ def run_duckdb():
     doc["samples"] = runs
     return doc
 
+def firebolt_formatted_endpoint() -> str:
+    separator = "&" if urllib.parse.urlparse(firebolt_endpoint).query else "?"
+    return f"{firebolt_endpoint}{separator}output_format=JSON_Compact"
+
+def firebolt_request(sql: str):
+    req = urllib.request.Request(
+        firebolt_formatted_endpoint(),
+        data=sql.encode("utf-8"),
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+        method="POST",
+    )
+    timeout = float(os.environ.get("FIREBOLT_CORE_TIMEOUT_SECS", "180"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Firebolt Core HTTP {exc.code}: {body}") from exc
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        return {"raw": body}
+
+def firebolt_version():
+    for sql in ["SELECT version()", "SELECT current_version()"]:
+        try:
+            doc = firebolt_request(sql)
+            data = doc.get("data") if isinstance(doc, dict) else None
+            if data and data[0]:
+                return str(data[0][0])
+        except Exception:
+            continue
+    return None
+
+def firebolt_split_statements(sql: str):
+    return [stmt.strip() for stmt in sql.split(";") if stmt.strip()]
+
+def run_firebolt():
+    if not firebolt_parquet_path.exists():
+        return not_available(
+            "firebolt",
+            "clickbench_parquet_missing",
+            "Set CLICKBENCH_DOWNLOAD_PARQUET=1 or CLICKBENCH_PARQUET=/path/to/hits.parquet.",
+        )
+    if not firebolt_schema_path.exists() or not firebolt_queries_path.exists():
+        return not_available(
+            "firebolt",
+            "clickbench_firebolt_sql_missing",
+            "Pinned upstream firebolt/create.sql or firebolt/queries.sql was not downloaded.",
+        )
+
+    helper_env = os.environ.copy()
+    helper_env.update({
+        "FIREBOLT_CORE_ENDPOINT": firebolt_endpoint,
+        "FIREBOLT_CORE_IMAGE": firebolt_image,
+        "FIREBOLT_CORE_DATA_DIR": firebolt_data_dir,
+    })
+    try:
+        subprocess.run(
+            [firebolt_helper, "wait"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=helper_env,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        stderr = getattr(exc, "stderr", None)
+        return not_available(
+            "firebolt",
+            "firebolt_core_unavailable",
+            (stderr or str(exc)).strip(),
+        )
+
+    raw_schema = firebolt_schema_path.read_text(encoding="utf-8")
+    raw_schema = raw_schema.replace("file:///firebolt-core/clickbench", "file:///firebolt-core/volume")
+    fb_queries = [
+        q.strip()
+        for q in firebolt_queries_path.read_text(encoding="utf-8").split(";")
+        if q.strip()
+    ]
+
+    started = time.perf_counter()
+    try:
+        for cleanup in ["DROP TABLE IF EXISTS hits", "DROP TABLE IF EXISTS hits_external"]:
+            try:
+                firebolt_request(cleanup)
+            except Exception:
+                pass
+        for stmt in firebolt_split_statements(raw_schema):
+            firebolt_request(stmt)
+    except Exception as exc:
+        doc = not_available("firebolt", "firebolt_load_failed", str(exc))
+        doc["load_time_us"] = (time.perf_counter() - started) * 1_000_000.0
+        return doc
+    load_time_us = (time.perf_counter() - started) * 1_000_000.0
+
+    q_results = []
+    for idx, query in enumerate(fb_queries, start=1):
+        samples = []
+        error = None
+        for _ in range(runs):
+            start = time.perf_counter()
+            try:
+                firebolt_request(query)
+            except Exception as exc:
+                error = str(exc)
+                break
+            samples.append((time.perf_counter() - start) * 1000.0)
+        q_results.append({
+            "query": idx,
+            "median_ms": statistics.median(samples) if samples else None,
+            "runs_ms": samples,
+            "error": error,
+        })
+
+    doc = artifact_base("firebolt", "measured")
+    doc["dataset"] = str(firebolt_parquet_path)
+    doc["dataset_rows"] = row_count
+    doc["query_count"] = len(fb_queries)
+    doc["queries"] = q_results
+    doc["samples"] = runs
+    doc["load_time_us"] = load_time_us
+    doc["core_mode"] = "local_docker"
+    doc["docker_image"] = firebolt_image
+    doc["firebolt_version"] = firebolt_version()
+    doc["firebolt_core_endpoint"] = firebolt_endpoint
+    doc["policy"] = (
+        "ClickBench Firebolt artifact is eligible only when measured through "
+        "local Firebolt Core Docker using the pinned upstream Firebolt SQL and "
+        "the local Parquet dataset mounted into the Core container."
+    )
+    return doc
+
 def geomean(result):
     vals = [q["median_ms"] for q in result["queries"] if q["median_ms"]]
     if len(vals) != len(result["queries"]):
@@ -433,11 +622,7 @@ if "clickhouse" in requested_engines:
         "ClickHouse ClickBench local loader/query runner is not wired yet.",
     ))
 if "firebolt" in requested_engines:
-    results.append(not_available(
-        "firebolt",
-        "runner_not_implemented_for_engine",
-        "Firebolt Core local ClickBench loader/query runner is not wired yet.",
-    ))
+    results.append(run_firebolt())
 if not results:
     doc = {
         "schema_version": 1,

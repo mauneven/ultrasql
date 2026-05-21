@@ -273,6 +273,34 @@ fn arena_and_certification_expose_firebolt_suite() {
 }
 
 #[test]
+fn clickbench_certification_uses_local_firebolt_core_runner() {
+    let script = repo_file("benchmarks/clickbench_certify.sh");
+
+    assert!(!script.contains(LEGACY_FIREBOLT_REMOTE_ENV));
+    assert!(script.contains("CLICKBENCH_PARQUET"));
+    assert!(script.contains("CLICKBENCH_DOWNLOAD_PARQUET"));
+    assert!(script.contains("firebolt/create.sql"));
+    assert!(script.contains("firebolt/queries.sql"));
+    assert!(script.contains("FIREBOLT_CORE_HELPER"));
+    assert!(script.contains("FIREBOLT_CORE_ENDPOINT"));
+    assert!(script.contains("FIREBOLT_CORE_DATA_DIR"));
+    assert!(script.contains("firebolt_core_unavailable"));
+    assert!(script.contains("clickbench_parquet_missing"));
+    assert!(script.contains("local Firebolt Core Docker"));
+    assert!(script.contains("core_mode"));
+    assert!(script.contains("local_docker"));
+    assert!(!script.contains("Firebolt Core local ClickBench loader/query runner is not wired yet."));
+}
+
+#[test]
+fn clickbench_firebolt_only_path_does_not_require_psql() {
+    let script = repo_file("benchmarks/clickbench_certify.sh");
+
+    assert!(script.contains("needs_psql()"));
+    assert!(script.contains("if needs_psql && ! command -v psql"));
+}
+
+#[test]
 fn firebolt_aggregate_script_has_valid_bash_syntax() {
     for script_name in [
         "benchmarks/firebolt_core_local.sh",

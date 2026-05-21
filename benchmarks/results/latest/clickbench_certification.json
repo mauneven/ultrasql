@@ -2,26 +2,57 @@
   "schema_version": 1,
   "workload": "clickbench",
   "upstream_ref": "c5eb5d8e9c10fbef5ce16e8750f3e67de24cef0a",
-  "target": "UltraSQL and requested competitors publish honest ClickBench measured artifacts when local prerequisites exist",
+  "dataset": "target/clickbench/hits.tsv",
+  "dataset_rows": null,
+  "query_count": 43,
+  "target": "UltraSQL geometric mean at least 5x faster than PostgreSQL when both are measured; other requested engines publish measured or not_available artifacts",
   "requested_engines": [
-    "ultrasql",
-    "duckdb",
-    "clickhouse",
-    "postgres",
     "firebolt"
   ],
   "passed": false,
-  "reason": "dataset_missing",
-  "detail": "Set CLICKBENCH_DOWNLOAD=1 or CLICKBENCH_TSV=/path/to/hits.tsv.",
-  "dataset": "target/clickbench/hits.tsv",
-  "postgres_dsn_set": false,
-  "ultrasql_dsn_set": false,
-  "artifacts": {
-    "postgres17": "benchmarks/results/latest/raw/clickbench-postgres17.json",
-    "ultrasql": "benchmarks/results/latest/raw/clickbench-ultrasql.json",
-    "duckdb": "benchmarks/results/latest/raw/clickbench-duckdb.json",
-    "clickhouse": "benchmarks/results/latest/raw/clickbench-clickhouse.json",
-    "firebolt": "benchmarks/results/latest/raw/clickbench-firebolt.json"
-  },
-  "next_step": "Provide the dataset plus any requested local engine prerequisites, then rerun benchmarks/clickbench_certify.sh."
+  "status": "partial",
+  "postgres_result": "benchmarks/results/latest/raw/clickbench-postgres17.json",
+  "ultrasql_result": "benchmarks/results/latest/raw/clickbench-ultrasql.json",
+  "duckdb_result": "benchmarks/results/latest/raw/clickbench-duckdb.json",
+  "clickhouse_result": "benchmarks/results/latest/raw/clickbench-clickhouse.json",
+  "firebolt_result": "benchmarks/results/latest/raw/clickbench-firebolt.json",
+  "results": [
+    {
+      "schema_version": 1,
+      "suite": "clickbench",
+      "engine": "firebolt",
+      "workload": "clickbench",
+      "upstream_ref": "c5eb5d8e9c10fbef5ce16e8750f3e67de24cef0a",
+      "dataset": "target/clickbench/hits.parquet",
+      "dataset_rows": null,
+      "query_count": 43,
+      "status": "not_available",
+      "host": {
+        "cpu": "arm",
+        "cores": 10,
+        "ram_gb": 16,
+        "os": "macOS-26.5-arm64-arm-64bit-Mach-O",
+        "memory_bytes": 17179869184
+      },
+      "host_cpu": "arm",
+      "host_memory": 17179869184,
+      "policy": "ClickBench artifact records raw measured samples only; no ranking or winner claim is made unless all compared engines are measured.",
+      "reason": "clickbench_parquet_missing",
+      "detail": "Set CLICKBENCH_DOWNLOAD_PARQUET=1 or CLICKBENCH_PARQUET=/path/to/hits.parquet.",
+      "samples": [],
+      "median_us": null,
+      "p95_us": null,
+      "geomean_ms": null,
+      "core_mode": "local_docker",
+      "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+      "firebolt_version": null
+    }
+  ],
+  "host": {
+    "cpu": "arm",
+    "cores": 10,
+    "ram_gb": 16,
+    "os": "macOS-26.5-arm64-arm-64bit-Mach-O",
+    "memory_bytes": 17179869184
+  }
 }

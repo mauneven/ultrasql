@@ -250,7 +250,14 @@ benchmarks/clickbench_certify.sh
 
 Set `CLICKBENCH_DOWNLOAD=1` to fetch
 `https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz` into
-`target/clickbench/hits.tsv`. The script writes
+`target/clickbench/hits.tsv`. Set `CLICKBENCH_DOWNLOAD_PARQUET=1` to fetch
+`https://datasets.clickhouse.com/hits_compatible/hits.parquet` into
+`target/clickbench/hits.parquet` for the local Firebolt Core leg. Firebolt
+uses the upstream pinned `firebolt/create.sql` and `firebolt/queries.sql`
+files, mounts the Parquet directory into the Core container, and records
+`status: "not_available"` with `reason: "clickbench_parquet_missing"` or
+`reason: "firebolt_core_unavailable"` when local prerequisites are absent.
+The script writes
 `benchmarks/results/latest/clickbench_certification.json`, including
 per-query runtimes, unsupported-query errors as `null`, geometric means,
 raw per-engine artifacts under `benchmarks/results/latest/raw/`, and the
