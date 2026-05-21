@@ -257,16 +257,7 @@ pub fn encode_csv_row(columns: &[Option<Vec<u8>>], opts: &CopyOptions) -> Vec<u8
 ///
 /// Returns [`ServerError::CopyFormat`] if a quoted field is never closed.
 pub fn parse_csv_row(line: &[u8], opts: &CopyOptions) -> Result<Vec<Option<Vec<u8>>>, ServerError> {
-    let line = if line.ends_with(b"\n") {
-        &line[..line.len() - 1]
-    } else {
-        line
-    };
-    let line = if line.ends_with(b"\r") {
-        &line[..line.len() - 1]
-    } else {
-        line
-    };
+    let line = strip_copy_line_ending(line);
     if !line.contains(&b'"') {
         return parse_unquoted_csv_row(line, opts);
     }
@@ -322,6 +313,23 @@ fn parse_unquoted_csv_row(
     line: &[u8],
     opts: &CopyOptions,
 ) -> Result<Vec<Option<Vec<u8>>>, ServerError> {
+    parse_unquoted_csv_row_slices(line, opts).map(|cells| {
+        cells
+            .into_iter()
+            .map(|cell| cell.map(<[u8]>::to_vec))
+            .collect()
+    })
+}
+
+/// Parse an unquoted CSV row into borrowed cell slices.
+///
+/// This is the COPY hot path for machine-generated CSV without quoted
+/// fields: numeric casts can read directly from the input line and avoid a
+/// per-field `Vec<u8>` allocation before row encoding.
+pub(crate) fn parse_unquoted_csv_row_slices<'a>(
+    line: &'a [u8],
+    opts: &CopyOptions,
+) -> Result<Vec<Option<&'a [u8]>>, ServerError> {
     let line = if line.ends_with(b"\n") {
         &line[..line.len() - 1]
     } else {
@@ -345,21 +353,34 @@ fn parse_unquoted_csv_row(
     Ok(parse_unquoted_csv_row_inner(line, delim_byte, opts))
 }
 
-fn parse_unquoted_csv_row_inner(
-    line: &[u8],
+fn parse_unquoted_csv_row_inner<'a>(
+    line: &'a [u8],
     delim_byte: u8,
     opts: &CopyOptions,
-) -> Vec<Option<Vec<u8>>> {
+) -> Vec<Option<&'a [u8]>> {
     let mut columns = Vec::with_capacity(line.iter().filter(|&&b| b == delim_byte).count() + 1);
     let mut start = 0_usize;
     for (idx, &b) in line.iter().enumerate() {
         if b == delim_byte {
-            columns.push(finalise_csv_column(&line[start..idx], false, opts));
+            columns.push(finalise_csv_column_slice(&line[start..idx], false, opts));
             start = idx.saturating_add(1);
         }
     }
-    columns.push(finalise_csv_column(&line[start..], false, opts));
+    columns.push(finalise_csv_column_slice(&line[start..], false, opts));
     columns
+}
+
+fn strip_copy_line_ending(line: &[u8]) -> &[u8] {
+    let line = if line.ends_with(b"\n") {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    if line.ends_with(b"\r") {
+        &line[..line.len() - 1]
+    } else {
+        line
+    }
 }
 
 /// Decide whether a finished CSV column is SQL NULL or a real value.
@@ -372,6 +393,18 @@ fn finalise_csv_column(
         None
     } else {
         Some(bytes.to_vec())
+    }
+}
+
+fn finalise_csv_column_slice<'a>(
+    bytes: &'a [u8],
+    field_was_quoted: bool,
+    opts: &CopyOptions,
+) -> Option<&'a [u8]> {
+    if !field_was_quoted && bytes == opts.null_str.as_bytes() {
+        None
+    } else {
+        Some(bytes)
     }
 }
 
@@ -515,6 +548,20 @@ mod tests {
             cols,
             vec![Some(b"1".to_vec()), None, Some(b"plain".to_vec())]
         );
+    }
+
+    #[test]
+    fn parse_unquoted_csv_row_slices_borrows_cells() {
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: ',',
+            null_str: "NULL".to_owned(),
+            ..CopyOptions::default()
+        };
+
+        let cells = parse_unquoted_csv_row_slices(b"42,NULL,delta\n", &opts).expect("parse slices");
+
+        assert_eq!(cells, vec![Some(&b"42"[..]), None, Some(&b"delta"[..])]);
     }
 
     // ── Protocol message builders ────────────────────────────────────────────

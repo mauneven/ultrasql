@@ -55,6 +55,7 @@ use crate::CombinedCatalog;
 use crate::copy::{
     CopyFormat as ServerCopyFormat, CopyOptions, copy_in_response_with_format,
     copy_out_response_with_format, encode_csv_row, encode_text_row, parse_csv_row, parse_text_row,
+    parse_unquoted_csv_row_slices,
 };
 use crate::error::ServerError;
 
@@ -1742,15 +1743,43 @@ fn decode_one_copy_row(
     opts: &CopyOptions,
     jsonb_shape_cache: &mut JsonbShapeCache,
 ) -> Result<Vec<u8>, ServerError> {
-    let raw_cells = match opts.format {
-        ServerCopyFormat::Text => parse_text_row(line, opts)?,
-        ServerCopyFormat::Csv => parse_csv_row(line, opts)?,
+    match opts.format {
+        ServerCopyFormat::Csv if !line.contains(&b'"') => {
+            let raw_cells = parse_unquoted_csv_row_slices(line, opts)?;
+            return decode_copy_cells_to_payload(
+                &raw_cells,
+                entry,
+                columns,
+                schema,
+                codec,
+                jsonb_shape_cache,
+            );
+        }
+        ServerCopyFormat::Text | ServerCopyFormat::Csv => {}
         ServerCopyFormat::Binary | ServerCopyFormat::Parquet => {
             return Err(ServerError::CopyFormat(
                 "binary COPY rows are decoded by binary parser".to_string(),
             ));
         }
     };
+    let owned_cells = match opts.format {
+        ServerCopyFormat::Text => parse_text_row(line, opts)?,
+        ServerCopyFormat::Csv => parse_csv_row(line, opts)?,
+        ServerCopyFormat::Binary | ServerCopyFormat::Parquet => unreachable!(),
+    };
+    let raw_cells = owned_cells.iter().map(Option::as_deref).collect::<Vec<_>>();
+    decode_copy_cells_to_payload(&raw_cells, entry, columns, schema, codec, jsonb_shape_cache)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_copy_cells_to_payload(
+    raw_cells: &[Option<&[u8]>],
+    entry: &TableEntry,
+    columns: &[usize],
+    schema: &Schema,
+    codec: &RowCodec,
+    jsonb_shape_cache: &mut JsonbShapeCache,
+) -> Result<Vec<u8>, ServerError> {
     if raw_cells.len() != schema.len() {
         return Err(ServerError::CopyFormat(format!(
             "COPY FROM expected {} columns, got {}",
@@ -1763,18 +1792,13 @@ fn decode_one_copy_row(
     if columns.is_empty() {
         for (col_idx, raw) in raw_cells.iter().enumerate() {
             let field = entry.schema.field_at(col_idx);
-            row[col_idx] =
-                decode_copy_cell(raw.as_deref(), &field.data_type, col_idx, jsonb_shape_cache)?;
+            row[col_idx] = decode_copy_cell(*raw, &field.data_type, col_idx, jsonb_shape_cache)?;
         }
     } else {
         for (stream_idx, (table_col_idx, raw)) in columns.iter().zip(raw_cells.iter()).enumerate() {
             let field = entry.schema.field_at(*table_col_idx);
-            row[*table_col_idx] = decode_copy_cell(
-                raw.as_deref(),
-                &field.data_type,
-                stream_idx,
-                jsonb_shape_cache,
-            )?;
+            row[*table_col_idx] =
+                decode_copy_cell(*raw, &field.data_type, stream_idx, jsonb_shape_cache)?;
         }
     }
 
