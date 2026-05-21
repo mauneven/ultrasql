@@ -87,7 +87,9 @@ use ultrasql_planner::{
     LogicalPlan, ScalarExpr, TableMeta, bind,
 };
 use ultrasql_protocol::BackendMessage;
-use ultrasql_storage::access_method::{HnswMetric, PageBackedHnswIndex, PageBackedIvfFlatIndex};
+use ultrasql_storage::access_method::{
+    AnnPayloadKind, HnswMetric, PageBackedHnswIndex, PageBackedIvfFlatIndex,
+};
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
 use ultrasql_storage::heap::{HeapAccess, InsertOptions};
@@ -2109,20 +2111,24 @@ impl Server {
                         let Some(field) = table.schema.field(col) else {
                             continue;
                         };
-                        let dims = match &field.data_type {
-                            DataType::Vector { dims: Some(dims) } => *dims,
-                            _ => continue,
+                        let Some((dims, default_payload)) =
+                            ann_dims_and_default_payload(&field.data_type)
+                        else {
+                            continue;
                         };
                         let metric = hnsw_metric_for_opclass_name(
                             index.opclasses.first().and_then(Option::as_deref),
                         )?;
+                        let payload = ann_payload_option_from_catalog(&index.options)?
+                            .unwrap_or(default_payload);
                         let hnsw = Arc::new(
-                            PageBackedHnswIndex::new(
+                            PageBackedHnswIndex::new_with_payload_kind(
                                 RelationId::new(index.oid.raw()),
                                 dims,
                                 metric,
                                 16,
                                 64,
+                                payload,
                             )
                             .map_err(|e| {
                                 ServerError::ddl(format!(
@@ -2155,21 +2161,25 @@ impl Server {
                         let Some(field) = table.schema.field(col) else {
                             continue;
                         };
-                        let dims = match &field.data_type {
-                            DataType::Vector { dims: Some(dims) } => *dims,
-                            _ => continue,
+                        let Some((dims, default_payload)) =
+                            ann_dims_and_default_payload(&field.data_type)
+                        else {
+                            continue;
                         };
                         let metric = hnsw_metric_for_opclass_name(
                             index.opclasses.first().and_then(Option::as_deref),
                         )?;
-                        let (lists, probes) = ivfflat_options_from_catalog(&index.options)?;
+                        let (lists, probes, payload) =
+                            ivfflat_options_from_catalog(&index.options)?;
+                        let payload = payload.unwrap_or(default_payload);
                         let ivfflat = Arc::new(
-                            PageBackedIvfFlatIndex::new(
+                            PageBackedIvfFlatIndex::new_with_payload_kind(
                                 RelationId::new(index.oid.raw()),
                                 dims,
                                 metric,
                                 lists,
                                 probes,
+                                payload,
                             )
                             .map_err(|e| {
                                 ServerError::ddl(format!(
@@ -3077,25 +3087,50 @@ fn hnsw_metric_for_opclass_name(opclass: Option<&str>) -> Result<HnswMetric, Ser
     }
 }
 
+fn ann_dims_and_default_payload(data_type: &DataType) -> Option<(u32, AnnPayloadKind)> {
+    match data_type {
+        DataType::Vector { dims: Some(dims) } => Some((*dims, AnnPayloadKind::F32)),
+        DataType::HalfVec { dims: Some(dims) } => Some((*dims, AnnPayloadKind::Bf16)),
+        _ => None,
+    }
+}
+
+fn ann_payload_option_from_catalog(
+    options: &[(String, String)],
+) -> Result<Option<AnnPayloadKind>, ServerError> {
+    let mut payload = None;
+    for (name, value) in options {
+        if name == "payload" {
+            payload = Some(ann_payload_kind_from_value("rebuild vector ANN", value)?);
+        }
+    }
+    Ok(payload)
+}
+
+fn ann_payload_kind_from_value(context: &str, value: &str) -> Result<AnnPayloadKind, ServerError> {
+    match value.to_ascii_lowercase().as_str() {
+        "f32" | "float32" => Ok(AnnPayloadKind::F32),
+        "bf16" | "bfloat16" => Ok(AnnPayloadKind::Bf16),
+        "int8" | "i8" => Ok(AnnPayloadKind::Int8),
+        other => Err(ServerError::ddl(format!(
+            "{context}: unsupported payload {other}; expected f32, bf16, or int8"
+        ))),
+    }
+}
+
 fn ivfflat_options_from_catalog(
     options: &[(String, String)],
-) -> Result<(usize, usize), ServerError> {
+) -> Result<(usize, usize, Option<AnnPayloadKind>), ServerError> {
     let mut lists = 100_usize;
     let mut probes = 1_usize;
+    let mut payload = None;
     for (name, value) in options {
-        let parsed = value.parse::<usize>().map_err(|_| {
-            ServerError::ddl(format!(
-                "rebuild IVFFlat: option {name} must be a positive integer"
-            ))
-        })?;
-        if parsed == 0 {
-            return Err(ServerError::ddl(format!(
-                "rebuild IVFFlat: option {name} must be greater than zero"
-            )));
-        }
         match name.as_str() {
-            "lists" => lists = parsed,
-            "probes" => probes = parsed,
+            "lists" => lists = parse_positive_ivfflat_catalog_option(name, value)?,
+            "probes" => probes = parse_positive_ivfflat_catalog_option(name, value)?,
+            "payload" => {
+                payload = Some(ann_payload_kind_from_value("rebuild IVFFlat", value)?);
+            }
             other => {
                 return Err(ServerError::ddl(format!(
                     "rebuild IVFFlat: unsupported option {other}"
@@ -3103,7 +3138,21 @@ fn ivfflat_options_from_catalog(
             }
         }
     }
-    Ok((lists, probes))
+    Ok((lists, probes, payload))
+}
+
+fn parse_positive_ivfflat_catalog_option(name: &str, value: &str) -> Result<usize, ServerError> {
+    let parsed = value.parse::<usize>().map_err(|_| {
+        ServerError::ddl(format!(
+            "rebuild IVFFlat: option {name} must be a positive integer"
+        ))
+    })?;
+    if parsed == 0 {
+        return Err(ServerError::ddl(format!(
+            "rebuild IVFFlat: option {name} must be greater than zero"
+        )));
+    }
+    Ok(parsed)
 }
 
 fn unix_timestamp_micros() -> u64 {

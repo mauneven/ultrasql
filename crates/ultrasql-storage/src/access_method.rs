@@ -957,6 +957,121 @@ impl HnswMetric {
     }
 }
 
+/// Physical payload family stored by page-backed ANN indexes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnPayloadKind {
+    /// Store single-precision values directly.
+    F32,
+    /// Store a bfloat16 payload beside exact f32 rerank values.
+    Bf16,
+    /// Store symmetric int8 quantized payload beside exact f32 rerank values.
+    Int8,
+}
+
+/// Final rerank policy for quantized ANN candidates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnRerankPolicy {
+    /// Candidate recall may use a quantized payload; final ordering uses exact
+    /// f32 values preserved by the index entry.
+    ExactF32,
+}
+
+/// ANN entry payload with optional quantized storage and exact f32 rerank data.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AnnVectorPayload {
+    kind: AnnPayloadKind,
+    exact_f32: Vec<f32>,
+    quantized: AnnQuantizedPayload,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum AnnQuantizedPayload {
+    F32(Vec<f32>),
+    Bf16(Vec<u16>),
+    Int8 { scale: f32, values: Vec<i8> },
+}
+
+impl AnnVectorPayload {
+    /// Build an ANN payload, preserving exact f32 values for final rerank.
+    pub fn new(kind: AnnPayloadKind, vector: &[f32]) -> Result<Self, AccessMethodError> {
+        if vector.is_empty() {
+            return Err(AccessMethodError::Storage(
+                "ANN payload vector must be non-empty".to_owned(),
+            ));
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(AccessMethodError::Storage(
+                "ANN payload vector elements must be finite".to_owned(),
+            ));
+        }
+        let exact_f32 = vector.to_vec();
+        let quantized = match kind {
+            AnnPayloadKind::F32 => AnnQuantizedPayload::F32(exact_f32.clone()),
+            AnnPayloadKind::Bf16 => AnnQuantizedPayload::Bf16(
+                vector
+                    .iter()
+                    .map(|value| (value.to_bits() >> 16) as u16)
+                    .collect(),
+            ),
+            AnnPayloadKind::Int8 => {
+                let max_abs = vector
+                    .iter()
+                    .map(|value| value.abs())
+                    .fold(0.0_f32, f32::max);
+                let scale = if max_abs <= f32::EPSILON {
+                    1.0
+                } else {
+                    max_abs / 127.0
+                };
+                let values = vector
+                    .iter()
+                    .map(|value| {
+                        let quantized = (*value / scale).round().clamp(-127.0, 127.0);
+                        quantized as i8
+                    })
+                    .collect();
+                AnnQuantizedPayload::Int8 { scale, values }
+            }
+        };
+        Ok(Self {
+            kind,
+            exact_f32,
+            quantized,
+        })
+    }
+
+    /// Return the storage payload family.
+    #[must_use]
+    pub const fn kind(&self) -> AnnPayloadKind {
+        self.kind
+    }
+
+    /// Return the candidate rerank policy.
+    #[must_use]
+    pub const fn rerank_policy(&self) -> AnnRerankPolicy {
+        AnnRerankPolicy::ExactF32
+    }
+
+    /// Return exact f32 values used for final rerank.
+    #[must_use]
+    pub fn exact_f32(&self) -> &[f32] {
+        &self.exact_f32
+    }
+
+    /// Return quantized payload byte length excluding exact rerank values.
+    #[must_use]
+    pub fn quantized_len_bytes(&self) -> usize {
+        match &self.quantized {
+            AnnQuantizedPayload::F32(values) => values.len() * std::mem::size_of::<f32>(),
+            AnnQuantizedPayload::Bf16(values) => values.len() * std::mem::size_of::<u16>(),
+            AnnQuantizedPayload::Int8 { scale, values } => {
+                let _ = scale;
+                values.len()
+            }
+        }
+    }
+}
+
 /// One result from an HNSW search.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HnswSearchResult {
@@ -1526,6 +1641,7 @@ pub struct PageBackedHnswIndex {
     metric: HnswMetric,
     m: usize,
     ef_search: usize,
+    payload_kind: AnnPayloadKind,
 }
 
 #[derive(Debug)]
@@ -1553,6 +1669,7 @@ struct HnswMetaPage {
     metric: HnswMetric,
     m: usize,
     ef_search: usize,
+    payload_kind: AnnPayloadKind,
     entry_node: Option<HnswNodeId>,
     next_node_id: HnswNodeId,
     live_nodes: usize,
@@ -1585,7 +1702,7 @@ struct HnswOverflowPage {
 
 #[derive(Debug, Clone)]
 enum HnswOverflowPayload {
-    Vector(Vec<f32>),
+    Vector(AnnVectorPayload),
     Neighbors(Vec<HnswNodeId>),
 }
 
@@ -1604,6 +1721,18 @@ impl PageBackedHnswIndex {
         metric: HnswMetric,
         m: usize,
         ef_search: usize,
+    ) -> Result<Self, AccessMethodError> {
+        Self::new_with_payload_kind(index_rel, dims, metric, m, ef_search, AnnPayloadKind::F32)
+    }
+
+    /// Create an empty page-backed HNSW graph arena with an ANN payload kind.
+    pub fn new_with_payload_kind(
+        index_rel: RelationId,
+        dims: u32,
+        metric: HnswMetric,
+        m: usize,
+        ef_search: usize,
+        payload_kind: AnnPayloadKind,
     ) -> Result<Self, AccessMethodError> {
         if dims == 0 || dims > MAX_VECTOR_DIMS {
             return Err(AccessMethodError::Storage(
@@ -1625,13 +1754,19 @@ impl PageBackedHnswIndex {
         })?;
         Ok(Self {
             storage: Mutex::new(PageBackedHnswStorage::new(
-                index_rel, dims, metric, m, ef_search,
+                index_rel,
+                dims,
+                metric,
+                m,
+                ef_search,
+                payload_kind,
             )),
             index_rel,
             dims,
             metric,
             m,
             ef_search,
+            payload_kind,
         })
     }
 
@@ -1664,6 +1799,7 @@ impl PageBackedHnswIndex {
         })?;
         let storage =
             PageBackedHnswStorage::from_page_images(index_rel, dims, metric, m, ef_search, images)?;
+        let payload_kind = storage.meta.payload_kind;
         Ok(Self {
             storage: Mutex::new(storage),
             index_rel,
@@ -1671,6 +1807,7 @@ impl PageBackedHnswIndex {
             metric,
             m,
             ef_search,
+            payload_kind,
         })
     }
 
@@ -1709,6 +1846,7 @@ impl PageBackedHnswIndex {
                         meta.metric,
                         meta.m,
                         meta.ef_search,
+                        meta.payload_kind,
                         meta.free_list_page,
                     );
                     stats.meta_pages += 1;
@@ -1740,6 +1878,18 @@ impl PageBackedHnswIndex {
     #[must_use]
     pub fn is_available(&self) -> bool {
         self.page_stats().live_nodes > 0
+    }
+
+    /// Return the physical ANN payload family used by new entries.
+    #[must_use]
+    pub const fn payload_kind(&self) -> AnnPayloadKind {
+        self.payload_kind
+    }
+
+    /// Return the final candidate rerank policy.
+    #[must_use]
+    pub const fn rerank_policy(&self) -> AnnRerankPolicy {
+        AnnRerankPolicy::ExactF32
     }
 
     /// Insert one finite vector into page-backed HNSW pages.
@@ -1922,7 +2072,7 @@ impl PageBackedHnswIndex {
             .next_node_id
             .checked_add(1)
             .ok_or_else(|| AccessMethodError::Storage("hnsw node id overflow".to_owned()))?;
-        let vector_head = storage.allocate_vector_chain(node_id, vector)?;
+        let vector_head = storage.allocate_vector_chain(node_id, vector, self.payload_kind)?;
         let node_block = storage.allocate_block()?;
         let node_page = HnswNodePage {
             page_id: PageId::new(self.index_rel, node_block),
@@ -2040,6 +2190,7 @@ impl PageBackedHnswStorage {
         metric: HnswMetric,
         m: usize,
         ef_search: usize,
+        payload_kind: AnnPayloadKind,
     ) -> Self {
         let meta_block = BlockNumber::new(HNSW_META_BLOCK);
         let free_block = BlockNumber::new(HNSW_FREE_LIST_BLOCK);
@@ -2050,6 +2201,7 @@ impl PageBackedHnswStorage {
             metric,
             m,
             ef_search,
+            payload_kind,
             entry_node: None,
             next_node_id: 0,
             live_nodes: 0,
@@ -2189,6 +2341,7 @@ impl PageBackedHnswStorage {
         &mut self,
         node_id: HnswNodeId,
         vector: &[f32],
+        payload_kind: AnnPayloadKind,
     ) -> Result<BlockNumber, AccessMethodError> {
         let chunks = vector.chunks(HNSW_VECTOR_VALUES_PER_OVERFLOW_PAGE);
         let mut head = None;
@@ -2200,7 +2353,7 @@ impl PageBackedHnswStorage {
                 lsn: Lsn::ZERO,
                 owner_node: node_id,
                 next: None,
-                payload: HnswOverflowPayload::Vector(chunk.to_vec()),
+                payload: HnswOverflowPayload::Vector(AnnVectorPayload::new(payload_kind, chunk)?),
             };
             self.pages.insert(block, HnswPersistentPage::Overflow(page));
             if let Some(prev_block) = previous {
@@ -2310,7 +2463,7 @@ impl PageBackedHnswStorage {
                 ));
             };
             match &page.payload {
-                HnswOverflowPayload::Vector(values) => vector.extend(values),
+                HnswOverflowPayload::Vector(payload) => vector.extend(payload.exact_f32()),
                 HnswOverflowPayload::Neighbors(_) => {
                     return Err(AccessMethodError::Storage(
                         "hnsw vector chain points to neighbor payload".to_owned(),
@@ -3097,6 +3250,7 @@ pub struct PageBackedIvfFlatIndex {
     metric: HnswMetric,
     lists: usize,
     probes: usize,
+    payload_kind: AnnPayloadKind,
 }
 
 #[derive(Debug)]
@@ -3116,6 +3270,7 @@ struct IvfFlatPageContext {
     metric: HnswMetric,
     lists: usize,
     probes: usize,
+    payload_kind: AnnPayloadKind,
 }
 
 #[derive(Debug, Clone)]
@@ -3134,6 +3289,7 @@ struct IvfFlatMetaPage {
     metric: HnswMetric,
     lists: usize,
     probes: usize,
+    payload_kind: AnnPayloadKind,
     live_entries: usize,
     tombstones: usize,
     next_block_number: u32,
@@ -3161,7 +3317,7 @@ struct IvfFlatEntryPage {
     lsn: Lsn,
     entry_id: usize,
     list_id: usize,
-    vector: Vec<f32>,
+    payload: AnnVectorPayload,
     tid: TupleId,
     deleted: bool,
 }
@@ -3174,6 +3330,18 @@ impl PageBackedIvfFlatIndex {
         metric: HnswMetric,
         lists: usize,
         probes: usize,
+    ) -> Result<Self, AccessMethodError> {
+        Self::new_with_payload_kind(index_rel, dims, metric, lists, probes, AnnPayloadKind::F32)
+    }
+
+    /// Create an empty page-backed IVFFlat index with an ANN payload kind.
+    pub fn new_with_payload_kind(
+        index_rel: RelationId,
+        dims: u32,
+        metric: HnswMetric,
+        lists: usize,
+        probes: usize,
+        payload_kind: AnnPayloadKind,
     ) -> Result<Self, AccessMethodError> {
         if dims == 0 || dims > MAX_VECTOR_DIMS {
             return Err(AccessMethodError::Storage(
@@ -3195,13 +3363,19 @@ impl PageBackedIvfFlatIndex {
         })?;
         Ok(Self {
             storage: Mutex::new(PageBackedIvfFlatStorage::new(
-                index_rel, dims, metric, lists, probes,
+                index_rel,
+                dims,
+                metric,
+                lists,
+                probes,
+                payload_kind,
             )),
             index_rel,
             dims,
             metric,
             lists,
             probes,
+            payload_kind,
         })
     }
 
@@ -3212,6 +3386,7 @@ impl PageBackedIvfFlatIndex {
             metric: self.metric,
             lists: self.lists,
             probes: self.probes,
+            payload_kind: self.payload_kind,
         }
     }
 
@@ -3239,6 +3414,7 @@ impl PageBackedIvfFlatIndex {
                         meta.metric,
                         meta.lists,
                         meta.probes,
+                        meta.payload_kind,
                         meta.live_entries,
                         meta.tombstones,
                         meta.next_block_number,
@@ -3269,7 +3445,7 @@ impl PageBackedIvfFlatIndex {
                         entry.lsn,
                         entry.entry_id,
                         entry.list_id,
-                        entry.vector.len(),
+                        entry.payload.quantized_len_bytes(),
                         entry.tid,
                         entry.deleted,
                     );
@@ -3326,6 +3502,18 @@ impl PageBackedIvfFlatIndex {
     #[must_use]
     pub fn is_available(&self) -> bool {
         self.live_len() > 0 && self.centroid_count() > 0
+    }
+
+    /// Return the physical ANN payload family used by new entries.
+    #[must_use]
+    pub const fn payload_kind(&self) -> AnnPayloadKind {
+        self.payload_kind
+    }
+
+    /// Return the final candidate rerank policy.
+    #[must_use]
+    pub const fn rerank_policy(&self) -> AnnRerankPolicy {
+        AnnRerankPolicy::ExactF32
     }
 
     /// Train centroids and bulk-load vectors into page-backed lists.
@@ -3705,6 +3893,7 @@ impl PageBackedIvfFlatStorage {
         metric: HnswMetric,
         lists: usize,
         probes: usize,
+        payload_kind: AnnPayloadKind,
     ) -> Self {
         let ctx = IvfFlatPageContext {
             index_rel,
@@ -3712,6 +3901,7 @@ impl PageBackedIvfFlatStorage {
             metric,
             lists,
             probes,
+            payload_kind,
         };
         let mut storage = Self {
             pages: BTreeMap::new(),
@@ -3839,6 +4029,7 @@ impl PageBackedIvfFlatStorage {
                 metric: ctx.metric,
                 lists: ctx.lists,
                 probes: ctx.probes,
+                payload_kind: ctx.payload_kind,
                 live_entries,
                 tombstones,
                 next_block_number: next_block,
@@ -3880,7 +4071,7 @@ impl PageBackedIvfFlatStorage {
                     lsn,
                     entry_id,
                     list_id: entry.list_id,
-                    vector: entry.vector.clone(),
+                    payload: AnnVectorPayload::new(ctx.payload_kind, &entry.vector)?,
                     tid: entry.tid,
                     deleted: entry.deleted,
                 }),
@@ -4833,5 +5024,47 @@ mod tests {
         let hits = recovered.search(&[9.4, 0.0], 3).expect("search");
         let tids: Vec<TupleId> = hits.into_iter().map(|hit| hit.tid).collect();
         assert_eq!(tids, vec![tid(2, 2), tid(2, 0), tid(2, 1)]);
+    }
+
+    #[test]
+    fn ann_quantized_payloads_keep_exact_f32_rerank_vectors() {
+        let vector = vec![1.25, -2.5, 0.125];
+        let bf16 =
+            AnnVectorPayload::new(AnnPayloadKind::Bf16, &vector).expect("bf16 payload builds");
+        assert_eq!(bf16.kind(), AnnPayloadKind::Bf16);
+        assert_eq!(bf16.rerank_policy(), AnnRerankPolicy::ExactF32);
+        assert_eq!(bf16.exact_f32(), vector.as_slice());
+        assert_eq!(bf16.quantized_len_bytes(), vector.len() * 2);
+
+        let int8 =
+            AnnVectorPayload::new(AnnPayloadKind::Int8, &vector).expect("int8 payload builds");
+        assert_eq!(int8.kind(), AnnPayloadKind::Int8);
+        assert_eq!(int8.rerank_policy(), AnnRerankPolicy::ExactF32);
+        assert_eq!(int8.exact_f32(), vector.as_slice());
+        assert_eq!(int8.quantized_len_bytes(), vector.len());
+
+        let hnsw = PageBackedHnswIndex::new_with_payload_kind(
+            RelationId::new(9901),
+            3,
+            HnswMetric::L2,
+            4,
+            16,
+            AnnPayloadKind::Bf16,
+        )
+        .expect("hnsw bf16 config");
+        assert_eq!(hnsw.payload_kind(), AnnPayloadKind::Bf16);
+        assert_eq!(hnsw.rerank_policy(), AnnRerankPolicy::ExactF32);
+
+        let ivfflat = PageBackedIvfFlatIndex::new_with_payload_kind(
+            RelationId::new(9902),
+            3,
+            HnswMetric::L2,
+            2,
+            1,
+            AnnPayloadKind::Int8,
+        )
+        .expect("ivfflat int8 config");
+        assert_eq!(ivfflat.payload_kind(), AnnPayloadKind::Int8);
+        assert_eq!(ivfflat.rerank_policy(), AnnRerankPolicy::ExactF32);
     }
 }

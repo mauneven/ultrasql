@@ -24,7 +24,8 @@ use ultrasql_planner::{
 };
 use ultrasql_protocol::{BackendMessage, FrontendMessage, decode_frontend, encode_backend};
 use ultrasql_storage::access_method::{
-    AccessMethod, BrinIndex, HnswMetric, PageBackedHnswIndex, PageBackedIvfFlatIndex,
+    AccessMethod, AnnPayloadKind, BrinIndex, HnswMetric, PageBackedHnswIndex,
+    PageBackedIvfFlatIndex,
 };
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
@@ -730,24 +731,20 @@ where
                     "CREATE INDEX USING ivfflat: key column {vector_col} missing"
                 ))
             })?;
-            let dims = match &field.data_type {
-                DataType::Vector { dims: Some(dims) } => *dims,
-                other => {
-                    return Err(ServerError::ddl(format!(
-                        "CREATE INDEX USING ivfflat requires vector(n), got {other}"
-                    )));
-                }
-            };
+            let (dims, default_payload) =
+                ann_dims_and_default_payload("CREATE INDEX USING ivfflat", &field.data_type)?;
             let metric = hnsw_metric_for_opclass(opclasses.first().and_then(Option::as_deref))?;
-            let (lists, probes) = ivfflat_options(index_options)?;
+            let (lists, probes, payload) = ivfflat_options(index_options)?;
+            let payload = payload.unwrap_or(default_payload);
             let index_oid = self.state.persistent_catalog.next_oid();
             let ivfflat = Arc::new(
-                PageBackedIvfFlatIndex::new(
+                PageBackedIvfFlatIndex::new_with_payload_kind(
                     RelationId::new(index_oid.raw()),
                     dims,
                     metric,
                     lists,
                     probes,
+                    payload,
                 )
                 .map_err(|e| ServerError::ddl(format!("CREATE INDEX ivfflat init: {e}")))?,
             );
@@ -771,11 +768,11 @@ where
                         ServerError::ddl(format!("CREATE INDEX ivfflat decode: {e}"))
                     })?;
                     let vector = match row.get(vector_col) {
-                        Some(Value::Vector(vector)) => vector.clone(),
+                        Some(Value::Vector(vector) | Value::HalfVec(vector)) => vector.clone(),
                         Some(Value::Null) => continue,
                         _ => {
                             return Err(ServerError::ddl(
-                                "CREATE INDEX ivfflat: key column did not decode as vector",
+                                "CREATE INDEX ivfflat: key column did not decode as vector or halfvec",
                             ));
                         }
                     };
@@ -878,21 +875,18 @@ where
                     "CREATE INDEX USING hnsw: key column {vector_col} missing"
                 ))
             })?;
-            let dims = match &field.data_type {
-                DataType::Vector { dims: Some(dims) } => *dims,
-                other => {
-                    return Err(ServerError::ddl(format!(
-                        "CREATE INDEX USING hnsw requires vector(n), got {other}"
-                    )));
-                }
-            };
+            let (dims, default_payload) =
+                ann_dims_and_default_payload("CREATE INDEX USING hnsw", &field.data_type)?;
 
             let metric = hnsw_metric_for_opclass(opclasses.first().and_then(Option::as_deref))?;
+            let payload = hnsw_payload_option(index_options)?.unwrap_or(default_payload);
             let index_oid = self.state.persistent_catalog.next_oid();
             let index_rel = RelationId::new(index_oid.raw());
             let hnsw = Arc::new(
-                PageBackedHnswIndex::new(index_rel, dims, metric, 16, 64)
-                    .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw init: {e}")))?,
+                PageBackedHnswIndex::new_with_payload_kind(
+                    index_rel, dims, metric, 16, 64, payload,
+                )
+                .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw init: {e}")))?,
             );
             let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
             let table_rel = RelationId(table.oid);
@@ -913,11 +907,11 @@ where
                         .decode(&tuple.data)
                         .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw decode: {e}")))?;
                     let vector = match row.get(vector_col) {
-                        Some(Value::Vector(vector)) => vector,
+                        Some(Value::Vector(vector) | Value::HalfVec(vector)) => vector,
                         Some(Value::Null) => continue,
                         _ => {
                             return Err(ServerError::ddl(
-                                "CREATE INDEX hnsw: key column did not decode as vector",
+                                "CREATE INDEX hnsw: key column did not decode as vector or halfvec",
                             ));
                         }
                     };
@@ -1387,25 +1381,65 @@ fn index_options_as_pairs(options: &[LogicalIndexOption]) -> Vec<(String, String
         .collect()
 }
 
-fn ivfflat_options(options: &[LogicalIndexOption]) -> Result<(usize, usize), ServerError> {
-    let mut lists = 100_usize;
-    let mut probes = 1_usize;
+fn ann_dims_and_default_payload(
+    context: &str,
+    data_type: &DataType,
+) -> Result<(u32, AnnPayloadKind), ServerError> {
+    match data_type {
+        DataType::Vector { dims: Some(dims) } => Ok((*dims, AnnPayloadKind::F32)),
+        DataType::HalfVec { dims: Some(dims) } => Ok((*dims, AnnPayloadKind::Bf16)),
+        other => Err(ServerError::ddl(format!(
+            "{context} requires vector(n) or halfvec(n), got {other}"
+        ))),
+    }
+}
+
+fn hnsw_payload_option(
+    options: &[LogicalIndexOption],
+) -> Result<Option<AnnPayloadKind>, ServerError> {
+    let mut payload = None;
     for option in options {
-        let parsed = option.value.parse::<usize>().map_err(|_| {
-            ServerError::ddl(format!(
-                "CREATE INDEX USING ivfflat: option {} must be a positive integer",
-                option.name
-            ))
-        })?;
-        if parsed == 0 {
+        if option.name != "payload" {
             return Err(ServerError::ddl(format!(
-                "CREATE INDEX USING ivfflat: option {} must be greater than zero",
+                "CREATE INDEX USING hnsw: unsupported option {}",
                 option.name
             )));
         }
+        payload = Some(ann_payload_kind_from_value(
+            "CREATE INDEX USING hnsw",
+            &option.value,
+        )?);
+    }
+    Ok(payload)
+}
+
+fn ann_payload_kind_from_value(context: &str, value: &str) -> Result<AnnPayloadKind, ServerError> {
+    match value.to_ascii_lowercase().as_str() {
+        "f32" | "float32" => Ok(AnnPayloadKind::F32),
+        "bf16" | "bfloat16" => Ok(AnnPayloadKind::Bf16),
+        "int8" | "i8" => Ok(AnnPayloadKind::Int8),
+        other => Err(ServerError::ddl(format!(
+            "{context}: unsupported payload {other}; expected f32, bf16, or int8"
+        ))),
+    }
+}
+
+fn ivfflat_options(
+    options: &[LogicalIndexOption],
+) -> Result<(usize, usize, Option<AnnPayloadKind>), ServerError> {
+    let mut lists = 100_usize;
+    let mut probes = 1_usize;
+    let mut payload = None;
+    for option in options {
         match option.name.as_str() {
-            "lists" => lists = parsed,
-            "probes" => probes = parsed,
+            "lists" => lists = parse_positive_ivfflat_option(option)?,
+            "probes" => probes = parse_positive_ivfflat_option(option)?,
+            "payload" => {
+                payload = Some(ann_payload_kind_from_value(
+                    "CREATE INDEX USING ivfflat",
+                    &option.value,
+                )?);
+            }
             other => {
                 return Err(ServerError::ddl(format!(
                     "CREATE INDEX USING ivfflat: unsupported option {other}"
@@ -1413,7 +1447,23 @@ fn ivfflat_options(options: &[LogicalIndexOption]) -> Result<(usize, usize), Ser
             }
         }
     }
-    Ok((lists, probes))
+    Ok((lists, probes, payload))
+}
+
+fn parse_positive_ivfflat_option(option: &LogicalIndexOption) -> Result<usize, ServerError> {
+    let parsed = option.value.parse::<usize>().map_err(|_| {
+        ServerError::ddl(format!(
+            "CREATE INDEX USING ivfflat: option {} must be a positive integer",
+            option.name
+        ))
+    })?;
+    if parsed == 0 {
+        return Err(ServerError::ddl(format!(
+            "CREATE INDEX USING ivfflat: option {} must be greater than zero",
+            option.name
+        )));
+    }
+    Ok(parsed)
 }
 
 fn constraint_attnums(columns: &[usize], name: &str) -> Result<Vec<i16>, ServerError> {

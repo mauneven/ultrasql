@@ -310,14 +310,14 @@ fn hnsw_column_probe(
 ) -> Option<(usize, HnswMetric, Vec<f32>)> {
     let ScalarExpr::Column {
         index,
-        data_type: DataType::Vector { .. },
+        data_type: DataType::Vector { .. } | DataType::HalfVec { .. },
         ..
     } = column
     else {
         return None;
     };
     let ScalarExpr::Literal {
-        value: Value::Vector(values),
+        value: Value::Vector(values) | Value::HalfVec(values),
         ..
     } = probe
     else {
@@ -411,9 +411,9 @@ fn fetch_vector_visible_payloads(
         let row = codec
             .decode(&tuple.data)
             .map_err(|e| ServerError::ddl(format!("vector ANN heap decode: {e}")))?;
-        let Some(Value::Vector(vector)) = row.get(col_idx) else {
+        let Some(Value::Vector(vector) | Value::HalfVec(vector)) = row.get(col_idx) else {
             return Err(ServerError::ddl(
-                "vector ANN heap recheck: key column did not decode as vector",
+                "vector ANN heap recheck: key column did not decode as vector or halfvec",
             ));
         };
         if vector.len() != probe.len() {

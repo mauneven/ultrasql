@@ -422,6 +422,89 @@ async fn hnsw_index_after_insert_keeps_top_k_correct() {
 }
 
 #[tokio::test]
+async fn ann_quantized_payload_options_work_through_sql_indexes() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE ann_half_payload (id INT NOT NULL, embedding HALFVEC(2))")
+        .await
+        .expect("create halfvec table");
+    client
+        .batch_execute(
+            "INSERT INTO ann_half_payload VALUES \
+             (1, HALFVEC(2) '[0,0]'), \
+             (2, HALFVEC(2) '[8,0]')",
+        )
+        .await
+        .expect("insert initial halfvec rows");
+    client
+        .batch_execute(
+            "CREATE INDEX ann_half_payload_hnsw \
+             ON ann_half_payload USING hnsw (embedding vector_l2_ops) \
+             WITH (payload = bf16)",
+        )
+        .await
+        .expect("create bf16 hnsw index");
+    client
+        .batch_execute("INSERT INTO ann_half_payload VALUES (3, HALFVEC(2) '[0.5,0]')")
+        .await
+        .expect("maintain bf16 hnsw");
+
+    let messages = client
+        .simple_query(
+            "SELECT id FROM ann_half_payload \
+             ORDER BY embedding <-> HALFVEC(2) '[0,0]' LIMIT 2",
+        )
+        .await
+        .expect("halfvec hnsw top-k query");
+    assert_eq!(
+        simple_rows(&messages),
+        vec![vec!["1".to_owned()], vec!["3".to_owned()]]
+    );
+
+    client
+        .batch_execute("CREATE TABLE ann_int8_payload (id INT NOT NULL, embedding VECTOR(2))")
+        .await
+        .expect("create vector table");
+    client
+        .batch_execute(
+            "INSERT INTO ann_int8_payload VALUES \
+             (1, '[0,0]'), \
+             (2, '[1,0]'), \
+             (3, '[9,0]'), \
+             (4, '[10,0]')",
+        )
+        .await
+        .expect("insert initial int8 vectors");
+    client
+        .batch_execute(
+            "CREATE INDEX ann_int8_payload_ivf \
+             ON ann_int8_payload USING ivfflat (embedding vector_l2_ops) \
+             WITH (lists = 1, probes = 1, payload = int8)",
+        )
+        .await
+        .expect("create int8 ivfflat index");
+    client
+        .batch_execute("INSERT INTO ann_int8_payload VALUES (5, '[9.5,0]')")
+        .await
+        .expect("maintain int8 ivfflat");
+
+    let messages = client
+        .simple_query(
+            "SELECT id FROM ann_int8_payload \
+             ORDER BY embedding <-> VECTOR '[9.4,0]' LIMIT 2",
+        )
+        .await
+        .expect("int8 ivfflat top-k query");
+    assert_eq!(
+        simple_rows(&messages),
+        vec![vec!["5".to_owned()], vec!["3".to_owned()]]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn hnsw_l2_opclass_survives_insert_update_delete_and_vacuum() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

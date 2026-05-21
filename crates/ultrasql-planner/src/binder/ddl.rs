@@ -1317,9 +1317,12 @@ pub(super) fn bind_create_index(
         let field = table_schema
             .field(col_indices[0])
             .ok_or_else(|| PlanError::ColumnNotFound(format!("column index {}", col_indices[0])))?;
-        if !matches!(field.data_type, DataType::Vector { dims: Some(_) }) {
+        if !matches!(
+            field.data_type,
+            DataType::Vector { dims: Some(_) } | DataType::HalfVec { dims: Some(_) }
+        ) {
             return Err(PlanError::TypeMismatch(format!(
-                "CREATE INDEX USING vector ANN requires a vector(n) column, got {}",
+                "CREATE INDEX USING vector ANN requires a vector(n) or halfvec(n) column, got {}",
                 field.data_type
             )));
         }
@@ -1354,17 +1357,34 @@ pub(super) fn bind_create_index(
             Ok(LogicalIndexOption { name, value })
         })
         .collect::<Result<Vec<_>, PlanError>>()?;
-    if method != LogicalIndexMethod::IvfFlat && !index_options.is_empty() {
+    if !matches!(
+        method,
+        LogicalIndexMethod::Hnsw | LogicalIndexMethod::IvfFlat
+    ) && !index_options.is_empty()
+    {
         return Err(PlanError::NotSupported(
-            "CREATE INDEX WITH options are supported only for ivfflat in this wave",
+            "CREATE INDEX WITH options are supported only for hnsw and ivfflat in this wave",
         ));
+    }
+    if method == LogicalIndexMethod::Hnsw {
+        for option in &index_options {
+            if option.name != "payload" {
+                return Err(PlanError::NotSupported(
+                    "CREATE INDEX USING hnsw supports only the payload option",
+                ));
+            }
+            validate_ann_payload_option(&option.value)?;
+        }
     }
     if method == LogicalIndexMethod::IvfFlat {
         for option in &index_options {
-            if !matches!(option.name.as_str(), "lists" | "probes") {
+            if !matches!(option.name.as_str(), "lists" | "probes" | "payload") {
                 return Err(PlanError::NotSupported(
-                    "CREATE INDEX USING ivfflat supports only lists and probes options",
+                    "CREATE INDEX USING ivfflat supports only lists, probes, and payload options",
                 ));
+            }
+            if option.name == "payload" {
+                validate_ann_payload_option(&option.value)?;
             }
         }
     }
@@ -1626,6 +1646,15 @@ fn index_option_value_to_string(expr: &Expr) -> Result<String, PlanError> {
         }
         Expr::Column { name } if name.parts.len() == 1 => Ok(name.parts[0].value.clone()),
         _ => Err(PlanError::NotSupported("CREATE INDEX WITH option value")),
+    }
+}
+
+fn validate_ann_payload_option(value: &str) -> Result<(), PlanError> {
+    match value.to_ascii_lowercase().as_str() {
+        "f32" | "float32" | "bf16" | "bfloat16" | "int8" | "i8" => Ok(()),
+        _ => Err(PlanError::NotSupported(
+            "CREATE INDEX USING vector ANN payload supports f32, bf16, and int8",
+        )),
     }
 }
 

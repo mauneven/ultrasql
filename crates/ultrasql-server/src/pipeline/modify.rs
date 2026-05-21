@@ -1392,10 +1392,10 @@ fn build_vector_index_maintainers(
                 ))
             })?;
             match value {
-                Value::Vector(vector) => Ok(Some(vector.clone())),
+                Value::Vector(vector) | Value::HalfVec(vector) => Ok(Some(vector.clone())),
                 Value::Null => Ok(None),
                 other => Err(ultrasql_executor::ExecError::TypeMismatch(format!(
-                    "vector index {index_name}: expected vector key, got {:?}",
+                    "vector index {index_name}: expected vector or halfvec key, got {:?}",
                     other.data_type()
                 ))),
             }
