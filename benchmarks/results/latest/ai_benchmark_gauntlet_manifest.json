@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "profile": "smoke",
-  "generated_at_unix": 1779318653,
+  "generated_at_unix": 1779343239,
   "status": "partial",
   "passed": false,
   "suites": [
@@ -19,14 +19,14 @@
     },
     {
       "suite": "hybrid_search_latency",
-      "status": "unavailable",
-      "exit_code": 2,
+      "status": "passed",
+      "exit_code": 0,
       "artifact": "benchmarks/results/latest/raw/ai_gauntlet_hybrid_search_latency_smoke-ultrasql.json"
     },
     {
       "suite": "rag_retrieval_quality",
-      "status": "unavailable",
-      "exit_code": 2,
+      "status": "passed",
+      "exit_code": 0,
       "artifact": "benchmarks/results/latest/raw/ai_gauntlet_rag_retrieval_quality_smoke-ultrasql.json"
     },
     {

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "suite": "object_parquet_range",
+  "profile": "smoke",
+  "n_rows": 3,
+  "warmup": 0,
+  "iters": 1,
+  "generated_at_unix": 1779343236,
+  "status": "passed",
+  "passed": true,
+  "artifacts": [
+    {
+      "engine": "ultrasql",
+      "status": "measured",
+      "artifact": "benchmarks/results/latest/raw/object_parquet_range_smoke-ultrasql.json"
+    }
+  ],
+  "policy": "Object Parquet range certification requires a measured artifact whose raw request log proves ranged object-store reads and no whole-object fetch."
+}

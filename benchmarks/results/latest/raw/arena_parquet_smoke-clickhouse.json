@@ -5,8 +5,8 @@
   "workload": "arena_parquet_smoke",
   "profile": "smoke",
   "status": "not_available",
-  "reason": "runner_not_implemented",
-  "generated_at_unix": 1779318633,
+  "reason": "runner_not_implemented_for_engine",
+  "generated_at_unix": 1779343235,
   "required_metrics": [
     "scan_us",
     "projection_pushdown_us",

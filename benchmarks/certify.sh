@@ -4,7 +4,7 @@
 # Usage:
 #   benchmarks/certify.sh smoke
 #   benchmarks/certify.sh full
-#   benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
+#   benchmarks/certify.sh full tpch,clickbench,vector-ann,ai-gauntlet,csv-gauntlet,object-parquet-range,firebolt-aggregate,firebolt-sparse-pruning,firebolt-vector
 #
 # Smoke is PR-safe: tiny datasets, crash/correctness checks, no external
 # benchmark assets. Full is nightly/manual: it attempts the full certification
@@ -29,7 +29,7 @@ case "$profile" in
         suites=(regression-gate vector-ann sysbench)
         ;;
     full)
-        suites=(tpch clickbench tpcb tpcc sysbench vector-topk vector-ann ai-gauntlet csv-gauntlet firebolt-aggregate firebolt-sparse-pruning firebolt-vector)
+        suites=(tpch clickbench tpcb tpcc sysbench vector-topk vector-ann ai-gauntlet csv-gauntlet object-parquet-range firebolt-aggregate firebolt-sparse-pruning firebolt-vector)
         ;;
     *)
         echo "certify.sh: profile must be smoke or full, got '$profile'" >&2
@@ -129,6 +129,14 @@ run_csv_gauntlet_full() {
     CSV_GAUNTLET_PROFILE=full benchmarks/csv_benchmark_gauntlet.sh full
 }
 
+run_object_parquet_range_smoke() {
+    OBJECT_PARQUET_RANGE_PROFILE=smoke benchmarks/object_parquet_range.sh smoke
+}
+
+run_object_parquet_range_full() {
+    OBJECT_PARQUET_RANGE_PROFILE=full benchmarks/object_parquet_range.sh full
+}
+
 run_firebolt_aggregate_smoke() {
     FIREBOLT_AGG_PROFILE=smoke benchmarks/firebolt_aggregate_index.sh smoke
 }
@@ -180,6 +188,13 @@ for suite in "${suites[@]}"; do
                 run_suite "$suite" run_csv_gauntlet_smoke
             else
                 run_suite "$suite" run_csv_gauntlet_full
+            fi
+            ;;
+        object-parquet-range)
+            if [[ "$profile" == "smoke" ]]; then
+                run_suite "$suite" run_object_parquet_range_smoke
+            else
+                run_suite "$suite" run_object_parquet_range_full
             fi
             ;;
         firebolt-aggregate)

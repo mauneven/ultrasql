@@ -160,6 +160,57 @@ run_ann_recall_latency() {
         benchmarks/vector_ann_hnsw.sh
 }
 
+run_hybrid_search_latency() {
+    local rows top_k iters warmup artifact
+    if [[ "$PROFILE" == "smoke" ]]; then
+        rows="${AI_GAUNTLET_HYBRID_ROWS:-512}"
+        top_k="${AI_GAUNTLET_HYBRID_K:-2}"
+        iters="${AI_GAUNTLET_ITERS:-${N_ITERS:-1}}"
+        warmup="${AI_GAUNTLET_WARMUP:-${WARMUP:-0}}"
+    else
+        rows="${AI_GAUNTLET_HYBRID_ROWS:-10000}"
+        top_k="${AI_GAUNTLET_HYBRID_K:-2}"
+        iters="${AI_GAUNTLET_ITERS:-${N_ITERS:-8}}"
+        warmup="${AI_GAUNTLET_WARMUP:-${WARMUP:-2}}"
+    fi
+    artifact="$RAW_DIR/ai_gauntlet_hybrid_search_latency_${PROFILE}-ultrasql.json"
+    CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
+        cargo build --release --package ultrasql-bench --features sql-bench \
+            --bin cross_compare_sql >/dev/null
+    target/release/cross_compare_sql \
+        --workload hybrid-search-latency \
+        --rows "$rows" \
+        --top-k "$top_k" \
+        --warmup "$warmup" \
+        --iters "$iters" \
+        --workload-id "ai_gauntlet_hybrid_search_latency_${PROFILE}" \
+        --output "$artifact"
+}
+
+run_rag_retrieval_quality() {
+    local top_k iters warmup artifact
+    if [[ "$PROFILE" == "smoke" ]]; then
+        top_k="${AI_GAUNTLET_RAG_K:-2}"
+        iters="${AI_GAUNTLET_ITERS:-${N_ITERS:-1}}"
+        warmup="${AI_GAUNTLET_WARMUP:-${WARMUP:-0}}"
+    else
+        top_k="${AI_GAUNTLET_RAG_K:-2}"
+        iters="${AI_GAUNTLET_ITERS:-${N_ITERS:-8}}"
+        warmup="${AI_GAUNTLET_WARMUP:-${WARMUP:-2}}"
+    fi
+    artifact="$RAW_DIR/ai_gauntlet_rag_retrieval_quality_${PROFILE}-ultrasql.json"
+    CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}" \
+        cargo build --release --package ultrasql-bench --features sql-bench \
+            --bin cross_compare_sql >/dev/null
+    target/release/cross_compare_sql \
+        --workload rag-retrieval-quality \
+        --top-k "$top_k" \
+        --warmup "$warmup" \
+        --iters "$iters" \
+        --workload-id "ai_gauntlet_rag_retrieval_quality_${PROFILE}" \
+        --output "$artifact"
+}
+
 run_suite \
     "exact_vector_scan" \
     "$RAW_DIR/vector_topk_exact_*-{ultrasql,postgres17_pgvector,duckdb_list,clickhouse_vector}.json" \
@@ -168,13 +219,14 @@ run_suite \
     "ann_recall_latency" \
     "$RAW_DIR/vector_ann_hnsw_*-ultrasql_hnsw.json" \
     run_ann_recall_latency
-
-run_missing_suite \
+run_suite \
     "hybrid_search_latency" \
-    "p50_latency_us,p95_latency_us,p99_latency_us,bm25_score,vector_score,filter_selectivity"
-run_missing_suite \
+    "$RAW_DIR/ai_gauntlet_hybrid_search_latency_${PROFILE}-ultrasql.json" \
+    run_hybrid_search_latency
+run_suite \
     "rag_retrieval_quality" \
-    "recall_at_k,precision_at_k,mrr,answer_citation_coverage"
+    "$RAW_DIR/ai_gauntlet_rag_retrieval_quality_${PROFILE}-ultrasql.json" \
+    run_rag_retrieval_quality
 run_missing_suite \
     "filtered_vector_search" \
     "p50_latency_us,p95_latency_us,p99_latency_us,recall_at_k,filter_selectivity"

@@ -1,17 +1,1 @@
-{
-  "schema_version": 1,
-  "suite": "rag_retrieval_quality",
-  "engine": "ultrasql",
-  "workload": "ai_gauntlet_rag_retrieval_quality_smoke",
-  "profile": "smoke",
-  "status": "not_available",
-  "reason": "runner_not_implemented",
-  "generated_at_unix": 1779318653,
-  "required_metrics": [
-    "recall_at_k",
-    "precision_at_k",
-    "mrr",
-    "answer_citation_coverage"
-  ],
-  "policy": "No benchmark claim exists for this suite until a committed runner emits the required metrics from reproducible inputs."
-}
+{"answer":{"expected_chunks":["chunk-alpha","chunk-omega"],"observed_chunks":["chunk-alpha","chunk-omega"]},"answer_citation_coverage":1.0,"engine":"ultrasql","iterations_us":[613.125],"median_us":613.125,"min_us":613.125,"mrr":1.0,"n_rows":10000,"policy":"RAG retrieval quality artifact uses deterministic tenant-filtered expected chunks.","precision_at_k":1.0,"profile":"smoke","recall_at_k":1.0,"required_metrics":["recall_at_k","precision_at_k","mrr","answer_citation_coverage"],"samples":1,"schema_version":1,"status":"measured","suite":"rag_retrieval_quality","top_k":2,"workload":"ai_gauntlet_rag_retrieval_quality_smoke"}

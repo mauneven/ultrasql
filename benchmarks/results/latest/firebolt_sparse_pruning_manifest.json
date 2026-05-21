@@ -7,9 +7,9 @@
     "firebolt"
   ],
   "n_rows": 10000,
-  "warmup": 0,
-  "iters": 1,
-  "generated_at_unix": 1779334902,
+  "warmup": 1,
+  "iters": 3,
+  "generated_at_unix": 1779343240,
   "status": "partial",
   "passed": false,
   "engines": [

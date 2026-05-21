@@ -15,7 +15,7 @@ cd "$REPO_ROOT"
 
 PROFILE="${BENCH_ARENA_PROFILE:-smoke}"
 ENGINES="${BENCH_ARENA_ENGINES:-ultrasql,duckdb,clickhouse,postgres,firebolt}"
-SUITES="${BENCH_ARENA_SUITES:-csv,parquet,tpch,clickbench,sqllogictest,vector,jsonb,aggregate-index,sparse-pruning,firebolt-vector}"
+SUITES="${BENCH_ARENA_SUITES:-csv,parquet,object-parquet-range,tpch,clickbench,sqllogictest,vector,jsonb,aggregate-index,sparse-pruning,firebolt-vector}"
 OUT_DIR="${BENCH_ARENA_OUT_DIR:-benchmarks/results/latest}"
 RAW_DIR="$OUT_DIR/raw"
 MANIFEST="$OUT_DIR/benchmark_arena_manifest.json"
@@ -29,7 +29,7 @@ Usage:
 Options:
   --profile smoke|full       Dataset/runtime profile. Default: smoke.
   --engines a,b,c            Engines: ultrasql,duckdb,clickhouse,postgres,firebolt.
-  --suites a,b,c             Suites: csv,parquet,tpch,clickbench,sqllogictest,vector,jsonb,aggregate-index,sparse-pruning,firebolt-vector.
+  --suites a,b,c             Suites: csv,parquet,object-parquet-range,tpch,clickbench,sqllogictest,vector,jsonb,aggregate-index,sparse-pruning,firebolt-vector.
   --out-dir PATH             Artifact directory. Default: benchmarks/results/latest.
   --help                     Show this help.
 
@@ -116,7 +116,7 @@ done
 
 for suite in "${REQUESTED_SUITES[@]}"; do
     case "$suite" in
-        csv|parquet|tpch|clickbench|sqllogictest|vector|jsonb|aggregate-index|sparse-pruning|firebolt-vector)
+        csv|parquet|object-parquet-range|tpch|clickbench|sqllogictest|vector|jsonb|aggregate-index|sparse-pruning|firebolt-vector)
             ;;
         *)
             echo "arena.sh: unknown suite '$suite'" >&2
@@ -319,6 +319,26 @@ run_parquet_suite() {
         "scan_us,projection_pushdown_us,predicate_pushdown_us,row_group_pruning_us"
 }
 
+run_object_parquet_range_suite() {
+    local supported selected
+    supported="ultrasql"
+    selected="$(requested_supported_csv "$supported")"
+    if [[ -n "$selected" ]]; then
+        run_suite \
+            "object-parquet-range:ultrasql" \
+            "$OUT_DIR/object_parquet_range_manifest.json" \
+            env \
+                OBJECT_PARQUET_RANGE_PROFILE="$PROFILE" \
+                OBJECT_PARQUET_RANGE_OUT_DIR="$OUT_DIR" \
+                RAW_DIR="$RAW_DIR" \
+                benchmarks/object_parquet_range.sh "$PROFILE"
+    fi
+    emit_unsupported_engines \
+        "object-parquet-range" \
+        "$supported" \
+        "query_median_us,p50_latency_us,p95_latency_us,p99_latency_us,range_request_count,whole_object_fetched,projected_out_column_fetched"
+}
+
 run_tpch_suite() {
     local supported selected
     supported="ultrasql,duckdb"
@@ -483,6 +503,9 @@ if suite_requested csv; then
 fi
 if suite_requested parquet; then
     run_parquet_suite
+fi
+if suite_requested object-parquet-range; then
+    run_object_parquet_range_suite
 fi
 if suite_requested tpch; then
     run_tpch_suite

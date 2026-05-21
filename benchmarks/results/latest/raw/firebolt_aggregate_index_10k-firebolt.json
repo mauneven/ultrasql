@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "engine": "firebolt",
+  "workload": "firebolt_aggregate_index_10k",
+  "suite": "firebolt_aggregate_index",
+  "profile": "smoke",
+  "n_rows": 10000,
+  "warmup": 0,
+  "iters": 1,
+  "status": "not_available",
+  "reason": "firebolt_url_missing",
+  "generated_at_unix": 1779343239,
+  "required_shape": {
+    "ddl": "CREATE AGGREGATING INDEX idx ON fact_events (tenant_id, bucket, SUM(amount), COUNT(*))",
+    "query": "SELECT tenant_id, bucket, SUM(amount), COUNT(*) FROM fact_events WHERE tenant_id = 7 GROUP BY tenant_id, bucket ORDER BY tenant_id, bucket",
+    "firebolt_plan_marker": "Aggregating Index",
+    "http_output_format": "output_format=JSON_Compact"
+  },
+  "policy": "No Firebolt aggregate-index benchmark claim exists until a configured FIREBOLT_URL emits measured samples and an EXPLAIN artifact showing Aggregating Index usage."
+}

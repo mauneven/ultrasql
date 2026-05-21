@@ -2,7 +2,7 @@
   "schema_version": 1,
   "suite": "csv_benchmark_gauntlet",
   "profile": "smoke",
-  "generated_at_unix": 1779318633,
+  "generated_at_unix": 1779343234,
   "status": "partial",
   "passed": false,
   "artifacts": [

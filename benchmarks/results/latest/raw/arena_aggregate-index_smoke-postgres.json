@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "suite": "aggregate-index",
+  "engine": "postgres",
+  "workload": "arena_aggregate-index_smoke",
+  "profile": "smoke",
+  "status": "not_available",
+  "reason": "runner_not_implemented_for_engine",
+  "generated_at_unix": 1779343239,
+  "required_metrics": [
+    "median_us",
+    "min_us",
+    "load_time_us",
+    "index_build_us",
+    "aggregating_index_used"
+  ],
+  "policy": "No benchmark claim exists for this suite/engine until a committed runner emits measured samples from reproducible inputs."
+}

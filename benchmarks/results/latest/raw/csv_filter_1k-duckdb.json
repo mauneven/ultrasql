@@ -1,1 +1,1 @@
-{"schema_version":1,"suite":"csv_benchmark_gauntlet","engine":"duckdb","workload":"csv_filter_1k","profile":"smoke","n_rows":1000,"samples":1,"median_us":9590.4580084607,"min_us":9590.4580084607,"iterations_us":[9590.4580084607],"answer":[[250]]}
+{"schema_version":1,"suite":"csv_benchmark_gauntlet","engine":"duckdb","workload":"csv_filter_1k","profile":"smoke","n_rows":1000,"samples":1,"median_us":6201.707990840077,"min_us":6201.707990840077,"iterations_us":[6201.707990840077],"answer":[[250]]}

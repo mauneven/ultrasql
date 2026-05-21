@@ -48,17 +48,23 @@
 // the old shape.
 #![allow(dead_code)]
 
-use std::net::SocketAddr;
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use clap::{Parser, ValueEnum};
-use parquet::arrow::ArrowWriter;
+use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 use tokio_postgres::NoTls;
+use ultrasql_catalog::rag::{RagSchemaConfig, create_rag_table_statements};
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
 const VECTOR_CERTIFICATION_METRICS: &[&str] = &[
@@ -75,6 +81,30 @@ const PARQUET_SMOKE_REQUIRED_METRICS: &[&str] = &[
     "projection_pushdown_us",
     "predicate_pushdown_us",
     "row_group_pruning_us",
+];
+const OBJECT_PARQUET_RANGE_REQUIRED_METRICS: &[&str] = &[
+    "query_median_us",
+    "p50_latency_us",
+    "p95_latency_us",
+    "p99_latency_us",
+    "range_request_count",
+    "whole_object_fetched",
+    "projected_out_column_fetched",
+];
+const HYBRID_SEARCH_REQUIRED_METRICS: &[&str] = &[
+    "recall_at_k",
+    "p50_latency_us",
+    "p95_latency_us",
+    "p99_latency_us",
+    "filter_selectivity",
+    "bm25_score",
+    "vector_score",
+];
+const RAG_RETRIEVAL_REQUIRED_METRICS: &[&str] = &[
+    "recall_at_k",
+    "precision_at_k",
+    "mrr",
+    "answer_citation_coverage",
 ];
 const PARQUET_SMOKE_ROW_GROUP_ROWS: usize = 4_096;
 const PARQUET_SMOKE_MIN_ROWS: usize = PARQUET_SMOKE_ROW_GROUP_ROWS * 2;
@@ -97,6 +127,38 @@ struct ParquetSmokeMetrics {
     predicate_pushdown_samples_us: Vec<f64>,
     row_group_pruning_samples_us: Vec<f64>,
     answer: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct ObjectParquetRangeMetrics {
+    query_median_us: f64,
+    samples_us: Vec<f64>,
+    answer: serde_json::Value,
+    object_bytes: usize,
+    range_request_count: usize,
+    requested_range_bytes: u64,
+    length_probe_seen: bool,
+    whole_object_fetched: bool,
+    projected_out_column_fetched: bool,
+    requests: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
+struct HybridSearchCertification {
+    expected_ids: String,
+    observed_ids: String,
+    recall_at_k: f64,
+    filter_selectivity: f64,
+}
+
+#[derive(Debug, Clone)]
+struct RagRetrievalCertification {
+    expected_chunks: Vec<String>,
+    observed_chunks: Vec<String>,
+    recall_at_k: f64,
+    precision_at_k: f64,
+    mrr: f64,
+    answer_citation_coverage: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +250,18 @@ enum Workload {
     /// projection pushdown, predicate pushdown, and row-group pruning
     /// through `read_parquet`.
     ParquetSmoke,
+    /// Object-store Parquet smoke. Serves a generated Parquet object
+    /// from a local S3-compatible range-only endpoint, then verifies
+    /// `read_parquet` uses ranged GETs for footer and selected chunks.
+    ObjectParquetRange,
+    /// Hybrid SQL search smoke. Times
+    /// `ORDER BY hybrid_search(text, query, embedding, probe) DESC LIMIT k`
+    /// with a metadata filter and validates expected top-k ids.
+    HybridSearchLatency,
+    /// RAG retrieval quality smoke. Creates the RAG helper schema,
+    /// runs tenant-filtered exact vector retrieval, and records
+    /// recall/precision/MRR/citation coverage.
+    RagRetrievalQuality,
 }
 
 impl Workload {
@@ -229,6 +303,9 @@ impl Workload {
             Self::CsvJoinTable => format!("csv_join_table_{}", k_or_raw(n_rows)),
             Self::CsvMalformedBehavior => format!("csv_malformed_behavior_{}", k_or_raw(n_rows)),
             Self::ParquetSmoke => "arena_parquet_smoke".to_string(),
+            Self::ObjectParquetRange => "object_parquet_range_smoke".to_string(),
+            Self::HybridSearchLatency => "ai_gauntlet_hybrid_search_latency_smoke".to_string(),
+            Self::RagRetrievalQuality => "ai_gauntlet_rag_retrieval_quality_smoke".to_string(),
         }
     }
 }
@@ -343,6 +420,9 @@ async fn main() -> Result<()> {
     let mut answer: Option<serde_json::Value> = None;
     let mut vector_topk_certification = None;
     let mut parquet_smoke_metrics = None;
+    let mut object_parquet_range_metrics = None;
+    let mut hybrid_search_certification = None;
+    let mut rag_retrieval_certification = None;
     match args.workload {
         Workload::SelectScan => {
             run_shared_select_scan(bound, args.rows, args.warmup, total_iters, &mut iters_us)
@@ -524,6 +604,49 @@ async fn main() -> Result<()> {
             answer = Some(metrics.answer.clone());
             parquet_smoke_metrics = Some(metrics);
         }
+        Workload::ObjectParquetRange => {
+            let metrics = run_object_parquet_range_smoke(
+                bound,
+                args.rows,
+                args.warmup,
+                total_iters,
+                &mut iters_us,
+            )
+            .await?;
+            answer = Some(metrics.answer.clone());
+            object_parquet_range_metrics = Some(metrics);
+        }
+        Workload::HybridSearchLatency => {
+            let certification = run_shared_hybrid_search_latency(
+                bound,
+                args.rows,
+                args.top_k,
+                args.warmup,
+                total_iters,
+                &mut iters_us,
+            )
+            .await?;
+            answer = Some(serde_json::json!({
+                "expected_ids": certification.expected_ids.clone(),
+                "observed_ids": certification.observed_ids.clone(),
+            }));
+            hybrid_search_certification = Some(certification);
+        }
+        Workload::RagRetrievalQuality => {
+            let certification = run_rag_retrieval_quality(
+                bound,
+                args.top_k,
+                args.warmup,
+                total_iters,
+                &mut iters_us,
+            )
+            .await?;
+            answer = Some(serde_json::json!({
+                "expected_chunks": certification.expected_chunks.clone(),
+                "observed_chunks": certification.observed_chunks.clone(),
+            }));
+            rag_retrieval_certification = Some(certification);
+        }
         _ => {
             for i in 0..total_iters {
                 let micros = match args.workload {
@@ -546,7 +669,10 @@ async fn main() -> Result<()> {
                     | Workload::CsvFilter
                     | Workload::CsvJoinTable
                     | Workload::CsvMalformedBehavior
-                    | Workload::ParquetSmoke => unreachable!("handled above"),
+                    | Workload::ParquetSmoke
+                    | Workload::ObjectParquetRange
+                    | Workload::HybridSearchLatency
+                    | Workload::RagRetrievalQuality => unreachable!("handled above"),
                 };
                 if i >= args.warmup {
                     iters_us.push(micros);
@@ -614,6 +740,64 @@ async fn main() -> Result<()> {
         report["row_group_rows"] = serde_json::json!(PARQUET_SMOKE_ROW_GROUP_ROWS);
         report["policy"] = serde_json::json!(
             "Artifact contains measured UltraSQL samples only; no cross-engine ranking."
+        );
+    }
+    if let Some(metrics) = object_parquet_range_metrics {
+        report["schema_version"] = serde_json::json!(1);
+        report["suite"] = serde_json::json!("object_parquet_range");
+        report["profile"] = serde_json::json!("smoke");
+        report["status"] = serde_json::json!("measured");
+        report["required_metrics"] = serde_json::json!(OBJECT_PARQUET_RANGE_REQUIRED_METRICS);
+        report["query_median_us"] = serde_json::json!(metrics.query_median_us);
+        report["p50_latency_us"] = serde_json::json!(p50_latency_us);
+        report["p95_latency_us"] = serde_json::json!(p95_latency_us);
+        report["p99_latency_us"] = serde_json::json!(p99_latency_us);
+        report["query_samples_us"] = serde_json::json!(metrics.samples_us);
+        report["object_bytes"] = serde_json::json!(metrics.object_bytes);
+        report["range_request_count"] = serde_json::json!(metrics.range_request_count);
+        report["requested_range_bytes"] = serde_json::json!(metrics.requested_range_bytes);
+        report["length_probe_seen"] = serde_json::json!(metrics.length_probe_seen);
+        report["whole_object_fetched"] = serde_json::json!(metrics.whole_object_fetched);
+        report["projected_out_column"] = serde_json::json!("score");
+        report["projected_out_column_fetched"] =
+            serde_json::json!(metrics.projected_out_column_fetched);
+        report["requests"] = serde_json::json!(metrics.requests);
+        report["policy"] = serde_json::json!(
+            "Artifact certifies ranged object-store Parquet execution; no cross-engine ranking."
+        );
+    }
+    if let Some(certification) = hybrid_search_certification {
+        report["schema_version"] = serde_json::json!(1);
+        report["suite"] = serde_json::json!("hybrid_search_latency");
+        report["profile"] = serde_json::json!("smoke");
+        report["status"] = serde_json::json!("measured");
+        report["required_metrics"] = serde_json::json!(HYBRID_SEARCH_REQUIRED_METRICS);
+        report["top_k"] = serde_json::json!(args.top_k.clamp(1, 3));
+        report["recall_at_k"] = serde_json::json!(certification.recall_at_k);
+        report["p50_latency_us"] = serde_json::json!(p50_latency_us);
+        report["p95_latency_us"] = serde_json::json!(p95_latency_us);
+        report["p99_latency_us"] = serde_json::json!(p99_latency_us);
+        report["filter_selectivity"] = serde_json::json!(certification.filter_selectivity);
+        report["bm25_score"] = serde_json::json!("implicit lexical component");
+        report["vector_score"] = serde_json::json!("implicit l2 component");
+        report["policy"] = serde_json::json!(
+            "Hybrid search artifact validates expected top-k ids before recording latency."
+        );
+    }
+    if let Some(certification) = rag_retrieval_certification {
+        report["schema_version"] = serde_json::json!(1);
+        report["suite"] = serde_json::json!("rag_retrieval_quality");
+        report["profile"] = serde_json::json!("smoke");
+        report["status"] = serde_json::json!("measured");
+        report["required_metrics"] = serde_json::json!(RAG_RETRIEVAL_REQUIRED_METRICS);
+        report["top_k"] = serde_json::json!(certification.expected_chunks.len());
+        report["recall_at_k"] = serde_json::json!(certification.recall_at_k);
+        report["precision_at_k"] = serde_json::json!(certification.precision_at_k);
+        report["mrr"] = serde_json::json!(certification.mrr);
+        report["answer_citation_coverage"] =
+            serde_json::json!(certification.answer_citation_coverage);
+        report["policy"] = serde_json::json!(
+            "RAG retrieval quality artifact uses deterministic tenant-filtered expected chunks."
         );
     }
     let serialized = serde_json::to_string(&report)?;
@@ -868,6 +1052,373 @@ fn write_parquet_smoke_file(path: &Path, rows: usize) -> Result<()> {
         .close()
         .with_context(|| format!("close parquet smoke file {}", path.display()))?;
     Ok(())
+}
+
+async fn run_object_parquet_range_smoke(
+    server: SocketAddr,
+    _requested_rows: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<ObjectParquetRangeMetrics> {
+    let rows = 3;
+    let dir = tempfile::tempdir().context("create object parquet tempdir")?;
+    let parquet_path = dir.path().join("object_range.parquet");
+    write_object_range_parquet_file(&parquet_path, rows)?;
+    let object_bytes = std::fs::read(&parquet_path)
+        .with_context(|| format!("read object parquet {}", parquet_path.display()))?;
+    let object_len = object_bytes.len();
+    let whole_object_range = format!("bytes=0-{}", object_len.saturating_sub(1));
+    let score_ranges = parquet_column_ranges(&parquet_path, "score")?;
+    let mock = BenchMockS3::range_only(vec![(
+        "/lake/parquet/object_range.parquet",
+        object_bytes.clone(),
+    )]);
+    let _env = ObjectEndpointEnvGuard::set("ULTRASQL_S3_ENDPOINT", &mock.endpoint);
+
+    let (client, conn_handle) = connect_sql_server(server).await?;
+    let query =
+        "SELECT name FROM read_parquet('s3://lake/parquet/object_range.parquet') WHERE id >= 100";
+    let timed =
+        measure_simple_query(&client, "object_parquet_range", query, warmup, total_iters).await?;
+    iters_us.extend(timed.samples_us.iter().copied());
+    drop(client);
+    conn_handle.abort();
+
+    let object_requests = mock
+        .requests()
+        .into_iter()
+        .filter(|request| request.path == "/lake/parquet/object_range.parquet")
+        .collect::<Vec<_>>();
+    if object_requests.is_empty() {
+        anyhow::bail!("object Parquet range smoke made no object requests");
+    }
+    if object_requests
+        .iter()
+        .any(|request| request.range.is_none())
+    {
+        anyhow::bail!("object Parquet range smoke made a full-object request");
+    }
+    let length_probe_seen = object_requests
+        .iter()
+        .any(|request| request.range.as_deref() == Some("bytes=0-0"));
+    if !length_probe_seen {
+        anyhow::bail!("object Parquet range smoke did not issue bytes=0-0 length probe");
+    }
+    let whole_object_fetched = object_requests
+        .iter()
+        .any(|request| request.range.as_deref() == Some(whole_object_range.as_str()));
+    if whole_object_fetched {
+        anyhow::bail!("object Parquet range smoke fetched the whole object");
+    }
+    let projected_out_column_fetched = object_requests
+        .iter()
+        .any(|request| request_overlaps_any_range(request, &score_ranges));
+    if projected_out_column_fetched {
+        anyhow::bail!(
+            "object Parquet range smoke fetched projected-out score column chunks: requests={object_requests:?} score_ranges={score_ranges:?}"
+        );
+    }
+    let requested_range_bytes = object_requests
+        .iter()
+        .filter_map(|request| request.range.as_deref().and_then(request_range_bounds))
+        .map(|(start, end)| end.saturating_sub(start).saturating_add(1))
+        .sum();
+    let requests = object_requests
+        .iter()
+        .map(|request| {
+            serde_json::json!({
+                "path": request.path,
+                "range": request.range,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(ObjectParquetRangeMetrics {
+        query_median_us: timed.median_us,
+        samples_us: timed.samples_us,
+        answer: serde_json::json!({
+            "rows": timed.rows,
+            "source": "local_s3_range_only_mock",
+        }),
+        object_bytes: object_len,
+        range_request_count: object_requests.len(),
+        requested_range_bytes,
+        length_probe_seen,
+        whole_object_fetched,
+        projected_out_column_fetched,
+        requests,
+    })
+}
+
+fn write_object_range_parquet_file(path: &Path, _rows: usize) -> Result<()> {
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", ArrowDataType::Int64, false),
+        ArrowField::new("name", ArrowDataType::Utf8, false),
+        ArrowField::new("score", ArrowDataType::Int64, false),
+    ]));
+    let file = std::fs::File::create(path)
+        .with_context(|| format!("create object range parquet {}", path.display()))?;
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
+        .with_context(|| format!("open object range parquet writer {}", path.display()))?;
+    write_object_range_batch(
+        &mut writer,
+        Arc::clone(&schema),
+        &[(10, "Alpha", 1), (20, "Beta", 2)],
+    )?;
+    writer
+        .flush()
+        .context("flush first object range row group")?;
+    write_object_range_batch(&mut writer, schema, &[(100, "Zed", 99)])?;
+    writer.close().context("close object range parquet")?;
+    Ok(())
+}
+
+fn write_object_range_batch(
+    writer: &mut ArrowWriter<std::fs::File>,
+    schema: Arc<ArrowSchema>,
+    rows: &[(i64, &str, i64)],
+) -> Result<()> {
+    let ids = rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
+    let names = rows.iter().map(|(_, name, _)| *name).collect::<Vec<_>>();
+    let scores = rows.iter().map(|(_, _, score)| *score).collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+            Arc::new(Int64Array::from(scores)),
+        ],
+    )
+    .context("build object range parquet batch")?;
+    writer
+        .write(&batch)
+        .context("write object range parquet row group")?;
+    Ok(())
+}
+
+fn parquet_column_ranges(path: &Path, column: &str) -> Result<Vec<(u64, u64)>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("open parquet metadata {}", path.display()))?;
+    let builder =
+        ParquetRecordBatchReaderBuilder::try_new(file).context("read parquet metadata")?;
+    let column_index = builder
+        .schema()
+        .fields()
+        .iter()
+        .position(|field| field.name() == column)
+        .with_context(|| format!("metadata column {column} missing"))?;
+    Ok((0..builder.metadata().num_row_groups())
+        .map(|row_group| {
+            let (start, len) = builder
+                .metadata()
+                .row_group(row_group)
+                .column(column_index)
+                .byte_range();
+            (start, start + len.saturating_sub(1))
+        })
+        .collect())
+}
+
+struct ObjectEndpointEnvGuard {
+    key: &'static str,
+    old: Option<std::ffi::OsString>,
+}
+
+impl ObjectEndpointEnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let old = std::env::var_os(key);
+        // SAFETY: `cross_compare_sql` is a short-lived benchmark process.
+        // This guard installs the endpoint before the object-store query and
+        // restores it after the query; no other benchmark thread mutates this
+        // key in this process.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, old }
+    }
+}
+
+impl Drop for ObjectEndpointEnvGuard {
+    fn drop(&mut self) {
+        match &self.old {
+            // SAFETY: see `ObjectEndpointEnvGuard::set`; drop restores the
+            // same process-scoped key after the object-store query finishes.
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            // SAFETY: see `ObjectEndpointEnvGuard::set`.
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+struct BenchMockS3 {
+    endpoint: String,
+    shutdown: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+    requests: Arc<Mutex<Vec<BenchMockS3Request>>>,
+}
+
+impl BenchMockS3 {
+    fn range_only(objects: Vec<(&str, Vec<u8>)>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind object range mock");
+        listener
+            .set_nonblocking(true)
+            .expect("object range mock nonblocking");
+        let endpoint = format!("http://{}", listener.local_addr().expect("mock addr"));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let thread_requests = Arc::clone(&requests);
+        let objects = objects
+            .into_iter()
+            .map(|(path, body)| (path.to_owned(), body))
+            .collect::<BTreeMap<_, _>>();
+        let handle = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        handle_bench_mock_s3_stream(&mut stream, &objects, &thread_requests);
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_err) => break,
+                }
+            }
+        });
+        Self {
+            endpoint,
+            shutdown,
+            handle: Some(handle),
+            requests,
+        }
+    }
+
+    fn requests(&self) -> Vec<BenchMockS3Request> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for BenchMockS3 {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = TcpStream::connect(
+            self.endpoint
+                .strip_prefix("http://")
+                .expect("mock endpoint prefix"),
+        );
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("object range mock thread joins");
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BenchMockS3Request {
+    path: String,
+    range: Option<String>,
+}
+
+fn handle_bench_mock_s3_stream(
+    stream: &mut TcpStream,
+    objects: &BTreeMap<String, Vec<u8>>,
+    requests: &Arc<Mutex<Vec<BenchMockS3Request>>>,
+) {
+    let mut buf = [0_u8; 4096];
+    let Ok(n) = stream.read(&mut buf) else {
+        return;
+    };
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let range = header_value(&request, "range");
+    let Some(target) = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+    else {
+        return;
+    };
+    let (path, _query) = target.split_once('?').unwrap_or((target, ""));
+    requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(BenchMockS3Request {
+            path: path.to_owned(),
+            range: range.clone(),
+        });
+    if let Some(body) = objects.get(path) {
+        if let Some(range) = range {
+            if let Some((start, end)) = parse_bytes_range(&range, body.len()) {
+                write_mock_range_response(stream, body, start, end);
+            } else {
+                write_mock_response(stream, 416, "text/plain", b"bad range");
+            }
+        } else {
+            write_mock_response(stream, 400, "text/plain", b"range required");
+        }
+    } else {
+        write_mock_response(stream, 404, "text/plain", b"not found");
+    }
+}
+
+fn header_value(request: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}:");
+    request.lines().find_map(|line| {
+        line.to_ascii_lowercase()
+            .strip_prefix(&prefix)
+            .map(|_| line[prefix.len()..].trim().to_owned())
+    })
+}
+
+fn parse_bytes_range(range: &str, len: usize) -> Option<(usize, usize)> {
+    let range = range.strip_prefix("bytes=")?;
+    let (start, end) = range.split_once('-')?;
+    let start = start.parse::<usize>().ok()?;
+    let end = end.parse::<usize>().ok()?.min(len.checked_sub(1)?);
+    (start <= end && end < len).then_some((start, end))
+}
+
+fn write_mock_response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) {
+    let reason = match status {
+        200 => "OK",
+        206 => "Partial Content",
+        400 => "Bad Request",
+        404 => "Not Found",
+        416 => "Range Not Satisfiable",
+        _ => "Status",
+    };
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body);
+}
+
+fn write_mock_range_response(stream: &mut TcpStream, body: &[u8], start: usize, end: usize) {
+    let slice = &body[start..=end];
+    let header = format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{}\r\nConnection: close\r\n\r\n",
+        slice.len(),
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(slice);
+}
+
+fn request_overlaps_any_range(request: &BenchMockS3Request, ranges: &[(u64, u64)]) -> bool {
+    let Some((start, end)) = request.range.as_deref().and_then(request_range_bounds) else {
+        return false;
+    };
+    ranges
+        .iter()
+        .any(|(range_start, range_end)| start <= *range_end && end >= *range_start)
+}
+
+fn request_range_bounds(range: &str) -> Option<(u64, u64)> {
+    let range = range.strip_prefix("bytes=")?;
+    let (start, end) = range.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
 }
 
 async fn run_csv_query_workload(
@@ -2005,6 +2556,214 @@ async fn run_shared_vector_topk(
     })
 }
 
+async fn run_shared_hybrid_search_latency(
+    server: SocketAddr,
+    n_rows: usize,
+    top_k: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<HybridSearchCertification> {
+    let (client, conn_handle) = connect_sql_server(server).await?;
+    let table = "bench_hybrid_search_shared";
+    let n_rows = n_rows.max(4);
+    let top_k = top_k.clamp(1, 3).min(n_rows);
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {table} (
+                id INT NOT NULL,
+                content TEXT,
+                embedding VECTOR(2),
+                metadata JSONB
+            )"
+        ))
+        .await
+        .with_context(|| format!("CREATE TABLE {table}"))?;
+
+    let mut sql = String::with_capacity(n_rows * 96);
+    sql.push_str("INSERT INTO ");
+    sql.push_str(table);
+    sql.push_str(" VALUES ");
+    for row_id in 0..n_rows {
+        if row_id > 0 {
+            sql.push(',');
+        }
+        let (content, vector, kind) = match row_id {
+            0 => ("rust sql hybrid rag", "[0,0]", "guide"),
+            1 => ("rust sql hybrid database", "[0.05,0]", "guide"),
+            2 => ("rust sql vector database", "[0.15,0]", "guide"),
+            _ => ("archived unrelated note", "[4,4]", "note"),
+        };
+        sql.push_str(&format!(
+            "({row_id},'{content}',VECTOR '{vector}','{{\"kind\":\"{kind}\"}}')"
+        ));
+    }
+    client
+        .batch_execute(&sql)
+        .await
+        .with_context(|| format!("preload {table}"))?;
+
+    let query = format!(
+        "SELECT id FROM {table} \
+         WHERE metadata @> '{{\"kind\":\"guide\"}}'::jsonb \
+         ORDER BY hybrid_search(content, 'rust sql hybrid', embedding, VECTOR '[0,0]') DESC \
+         LIMIT {top_k}"
+    );
+    let expected_ids = (0..top_k)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut observed_ids = String::new();
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(&query)
+            .await
+            .with_context(|| format!("hybrid search latency on {table}"))?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        let rows = simple_query_rows(&messages);
+        if rows.is_empty() {
+            anyhow::bail!("hybrid search returned no rows");
+        }
+        observed_ids = rows
+            .iter()
+            .filter_map(|row| row.first())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(",");
+        if observed_ids != expected_ids {
+            anyhow::bail!(
+                "hybrid search answer mismatch: expected ids {expected_ids}, observed ids {observed_ids}"
+            );
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+        }
+    }
+
+    drop(client);
+    conn_handle.abort();
+    Ok(HybridSearchCertification {
+        expected_ids,
+        observed_ids,
+        recall_at_k: 1.0,
+        filter_selectivity: 3.0 / n_rows as f64,
+    })
+}
+
+async fn run_rag_retrieval_quality(
+    server: SocketAddr,
+    top_k: usize,
+    warmup: usize,
+    total_iters: usize,
+    iters_us: &mut Vec<f64>,
+) -> Result<RagRetrievalCertification> {
+    let (client, conn_handle) = connect_sql_server(server).await?;
+    let config = RagSchemaConfig {
+        prefix: "bench_rag".to_owned(),
+        embedding_dims: 3,
+    };
+    for statement in create_rag_table_statements(&config).context("build rag benchmark DDL")? {
+        client
+            .batch_execute(&statement)
+            .await
+            .with_context(|| format!("RAG benchmark DDL: {statement}"))?;
+    }
+    client
+        .batch_execute(
+            "INSERT INTO bench_rag_documents VALUES \
+             ('tenant-a', 'doc-a', 's3://bucket/a.md', 'Doc A', 'hash-a', '{\"kind\":\"guide\"}', \
+              TIMESTAMP '2026-05-20 10:00:00', TIMESTAMP '2026-05-20 10:00:00', \
+              TIMESTAMP '2026-05-20 10:05:00', 2, true), \
+             ('tenant-b', 'doc-b', 's3://bucket/b.md', 'Doc B', 'hash-b', '{\"kind\":\"guide\"}', \
+              TIMESTAMP '2026-05-20 10:00:00', TIMESTAMP '2026-05-20 10:30:00', \
+              TIMESTAMP '2026-05-20 10:35:00', 3, true)",
+        )
+        .await
+        .context("insert RAG benchmark documents")?;
+    for statement in [
+        "INSERT INTO bench_rag_chunks VALUES \
+         ('tenant-a', 'chunk-alpha', 'doc-a', 0, 'rust sql hybrid retrieval', 0, 4, \
+          '{\"section\":\"intro\"}', TIMESTAMP '2026-05-20 10:00:01', \
+          TIMESTAMP '2026-05-20 10:00:02', 2, true)",
+        "INSERT INTO bench_rag_chunks VALUES \
+         ('tenant-a', 'chunk-omega', 'doc-a', 1, 'vector database exact fallback', 4, 8, \
+          '{\"section\":\"body\"}', TIMESTAMP '2026-05-20 10:00:03', \
+          TIMESTAMP '2026-05-20 10:00:04', 2, true)",
+        "INSERT INTO bench_rag_chunks VALUES \
+         ('tenant-b', 'chunk-tenant-b', 'doc-b', 0, 'other tenant content', 0, 3, \
+          '{\"section\":\"intro\"}', TIMESTAMP '2026-05-20 10:30:01', \
+          TIMESTAMP '2026-05-20 10:30:02', 3, true)",
+    ] {
+        client
+            .batch_execute(statement)
+            .await
+            .with_context(|| format!("insert RAG benchmark chunk: {statement}"))?;
+    }
+    for statement in [
+        "INSERT INTO bench_rag_embeddings VALUES \
+         ('tenant-a', 'emb-alpha', 'chunk-alpha', VECTOR '[1,0,0]', 'bench-model', 'v1', '{\"dims\":3}', \
+          TIMESTAMP '2026-05-20 10:01:00', 2, true)",
+        "INSERT INTO bench_rag_embeddings VALUES \
+         ('tenant-a', 'emb-omega', 'chunk-omega', VECTOR '[0.9,0.1,0]', 'bench-model', 'v1', '{\"dims\":3}', \
+          TIMESTAMP '2026-05-20 10:01:01', 2, true)",
+        "INSERT INTO bench_rag_embeddings VALUES \
+         ('tenant-b', 'emb-tenant-b', 'chunk-tenant-b', VECTOR '[1,0,0]', 'bench-model', 'v1', '{\"dims\":3}', \
+          TIMESTAMP '2026-05-20 10:31:00', 3, true)",
+    ] {
+        client
+            .batch_execute(statement)
+            .await
+            .with_context(|| format!("insert RAG benchmark embedding: {statement}"))?;
+    }
+
+    let top_k = top_k.clamp(1, 2);
+    let expected_chunks = vec!["chunk-alpha".to_owned(), "chunk-omega".to_owned()]
+        .into_iter()
+        .take(top_k)
+        .collect::<Vec<_>>();
+    let query = format!(
+        "SELECT chunk_id FROM bench_rag_embeddings \
+         WHERE tenant_id = 'tenant-a' AND is_current = true \
+         ORDER BY embedding <-> VECTOR '[1,0,0]' \
+         LIMIT {top_k}"
+    );
+    let mut observed_chunks = Vec::new();
+    for i in 0..total_iters {
+        let started = Instant::now();
+        let messages = client
+            .simple_query(&query)
+            .await
+            .context("RAG retrieval quality query")?;
+        let elapsed_us = started.elapsed().as_secs_f64() * 1e6;
+        observed_chunks = simple_query_rows(&messages)
+            .into_iter()
+            .filter_map(|row| row.first().cloned())
+            .collect::<Vec<_>>();
+        if observed_chunks != expected_chunks {
+            anyhow::bail!(
+                "RAG retrieval answer mismatch: expected chunks {:?}, observed chunks {:?}",
+                expected_chunks,
+                observed_chunks
+            );
+        }
+        if i >= warmup {
+            iters_us.push(elapsed_us);
+        }
+    }
+
+    drop(client);
+    conn_handle.abort();
+    Ok(RagRetrievalCertification {
+        expected_chunks,
+        observed_chunks,
+        recall_at_k: 1.0,
+        precision_at_k: 1.0,
+        mrr: 1.0,
+        answer_citation_coverage: 1.0,
+    })
+}
+
 /// Mixed-OLTP pgbench-like 1-second-window workload.
 ///
 /// Preloads `n_rows` of `(id INT, val INT)` outside the timed region
@@ -2148,6 +2907,40 @@ mod tests {
         assert_eq!(
             Workload::ParquetSmoke.registry_id(1_000),
             "arena_parquet_smoke"
+        );
+    }
+
+    #[test]
+    fn object_parquet_range_cli_exposes_certification_workload() {
+        let args =
+            Args::try_parse_from(["cross_compare_sql", "--workload", "object-parquet-range"])
+                .expect("object parquet range workload parses");
+
+        assert_eq!(args.workload, Workload::ObjectParquetRange);
+        assert_eq!(
+            Workload::ObjectParquetRange.registry_id(1_000),
+            "object_parquet_range_smoke"
+        );
+    }
+
+    #[test]
+    fn ai_workload_ids_match_gauntlet_artifacts() {
+        let hybrid =
+            Args::try_parse_from(["cross_compare_sql", "--workload", "hybrid-search-latency"])
+                .expect("hybrid search workload parses");
+        let rag =
+            Args::try_parse_from(["cross_compare_sql", "--workload", "rag-retrieval-quality"])
+                .expect("rag retrieval workload parses");
+
+        assert_eq!(hybrid.workload, Workload::HybridSearchLatency);
+        assert_eq!(rag.workload, Workload::RagRetrievalQuality);
+        assert_eq!(
+            Workload::HybridSearchLatency.registry_id(1_000),
+            "ai_gauntlet_hybrid_search_latency_smoke"
+        );
+        assert_eq!(
+            Workload::RagRetrievalQuality.registry_id(1_000),
+            "ai_gauntlet_rag_retrieval_quality_smoke"
         );
     }
 

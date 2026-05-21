@@ -5,15 +5,20 @@
     "ultrasql",
     "duckdb",
     "clickhouse",
-    "postgres"
+    "postgres",
+    "firebolt"
   ],
   "requested_suites": [
     "csv",
     "parquet",
+    "object-parquet-range",
     "vector",
-    "jsonb"
+    "jsonb",
+    "aggregate-index",
+    "sparse-pruning",
+    "firebolt-vector"
   ],
-  "generated_at_unix": 1779318654,
+  "generated_at_unix": 1779343241,
   "status": "partial",
   "passed": false,
   "suites": [
@@ -28,6 +33,12 @@
       "status": "unavailable",
       "exit_code": 2,
       "artifact": "benchmarks/results/latest/raw/arena_csv_smoke-postgres.json"
+    },
+    {
+      "suite": "csv:firebolt",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_csv_smoke-firebolt.json"
     },
     {
       "suite": "parquet:ultrasql",
@@ -54,10 +65,52 @@
       "artifact": "benchmarks/results/latest/raw/arena_parquet_smoke-postgres.json"
     },
     {
+      "suite": "parquet:firebolt",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_parquet_smoke-firebolt.json"
+    },
+    {
+      "suite": "object-parquet-range:ultrasql",
+      "status": "passed",
+      "exit_code": 0,
+      "artifact": "benchmarks/results/latest/object_parquet_range_manifest.json"
+    },
+    {
+      "suite": "object-parquet-range:duckdb",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_object-parquet-range_smoke-duckdb.json"
+    },
+    {
+      "suite": "object-parquet-range:clickhouse",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_object-parquet-range_smoke-clickhouse.json"
+    },
+    {
+      "suite": "object-parquet-range:postgres",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_object-parquet-range_smoke-postgres.json"
+    },
+    {
+      "suite": "object-parquet-range:firebolt",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_object-parquet-range_smoke-firebolt.json"
+    },
+    {
       "suite": "vector",
       "status": "unavailable",
       "exit_code": 2,
       "artifact": "benchmarks/results/latest/ai_benchmark_gauntlet_manifest.json"
+    },
+    {
+      "suite": "vector:firebolt",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_vector_smoke-firebolt.json"
     },
     {
       "suite": "jsonb:ultrasql",
@@ -82,6 +135,84 @@
       "status": "unavailable",
       "exit_code": 2,
       "artifact": "benchmarks/results/latest/raw/arena_jsonb_smoke-postgres.json"
+    },
+    {
+      "suite": "jsonb:firebolt",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_jsonb_smoke-firebolt.json"
+    },
+    {
+      "suite": "aggregate-index",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/firebolt_aggregate_index_manifest.json"
+    },
+    {
+      "suite": "aggregate-index:duckdb",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_aggregate-index_smoke-duckdb.json"
+    },
+    {
+      "suite": "aggregate-index:clickhouse",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_aggregate-index_smoke-clickhouse.json"
+    },
+    {
+      "suite": "aggregate-index:postgres",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_aggregate-index_smoke-postgres.json"
+    },
+    {
+      "suite": "sparse-pruning",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/firebolt_sparse_pruning_manifest.json"
+    },
+    {
+      "suite": "sparse-pruning:duckdb",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_sparse-pruning_smoke-duckdb.json"
+    },
+    {
+      "suite": "sparse-pruning:clickhouse",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_sparse-pruning_smoke-clickhouse.json"
+    },
+    {
+      "suite": "sparse-pruning:postgres",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_sparse-pruning_smoke-postgres.json"
+    },
+    {
+      "suite": "firebolt-vector",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/firebolt_vector_search_manifest.json"
+    },
+    {
+      "suite": "firebolt-vector:duckdb",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_firebolt-vector_smoke-duckdb.json"
+    },
+    {
+      "suite": "firebolt-vector:clickhouse",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_firebolt-vector_smoke-clickhouse.json"
+    },
+    {
+      "suite": "firebolt-vector:postgres",
+      "status": "unavailable",
+      "exit_code": 2,
+      "artifact": "benchmarks/results/latest/raw/arena_firebolt-vector_smoke-postgres.json"
     }
   ],
   "policy": "Public benchmark arena publishes artifacts only. It does not rank engines or make benchmark claims; each claim must come from the referenced raw artifact and its reproducible runner."

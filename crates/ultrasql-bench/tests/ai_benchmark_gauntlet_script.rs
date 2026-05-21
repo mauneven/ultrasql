@@ -32,6 +32,8 @@ fn ai_gauntlet_declares_required_suites_and_artifacts() {
 
     assert!(script.contains("benchmarks/vector_topk_exact.sh"));
     assert!(script.contains("benchmarks/vector_ann_hnsw.sh"));
+    assert!(script.contains("--workload hybrid-search-latency"));
+    assert!(script.contains("--workload rag-retrieval-quality"));
     assert!(script.contains("VECTOR_TOPK_RENDER_RESULTS=0"));
     assert!(script.contains("ai_benchmark_gauntlet_manifest.json"));
     assert!(script.contains("\"status\": \"not_available\""));

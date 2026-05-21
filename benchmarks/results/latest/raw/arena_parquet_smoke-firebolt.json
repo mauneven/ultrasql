@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "suite": "parquet",
+  "engine": "firebolt",
+  "workload": "arena_parquet_smoke",
+  "profile": "smoke",
+  "status": "not_available",
+  "reason": "runner_not_implemented_for_engine",
+  "generated_at_unix": 1779343235,
+  "required_metrics": [
+    "scan_us",
+    "projection_pushdown_us",
+    "predicate_pushdown_us",
+    "row_group_pruning_us"
+  ],
+  "policy": "No benchmark claim exists for this suite/engine until a committed runner emits measured samples from reproducible inputs."
+}

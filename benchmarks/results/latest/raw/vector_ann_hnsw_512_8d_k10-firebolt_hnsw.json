@@ -14,7 +14,7 @@
   "seed": 1367265502,
   "status": "not_available",
   "reason": "firebolt_url_missing",
-  "generated_at_unix": 1779334936,
+  "generated_at_unix": 1779343241,
   "required_metrics": [
     "recall_at_k",
     "p50_latency_us",

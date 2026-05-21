@@ -1,1 +1,1 @@
-{"answer":{"cache_policy":"cold_read is first measured read in a fresh UltraSQL server; host OS page cache is not forcibly dropped","rows":[["1000"]]},"engine":"ultrasql","iterations_us":[9001.5],"median_us":9001.5,"min_us":9001.5,"n_rows":1000,"samples":1,"workload":"csv_cold_read_1k"}
+{"answer":{"cache_policy":"cold_read is first measured read in a fresh UltraSQL server; host OS page cache is not forcibly dropped","rows":[["1000"]]},"engine":"ultrasql","iterations_us":[4696.291],"median_us":4696.291,"min_us":4696.291,"n_rows":1000,"samples":1,"workload":"csv_cold_read_1k"}

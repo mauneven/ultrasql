@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "suite": "firebolt-vector",
+  "engine": "postgres",
+  "workload": "arena_firebolt-vector_smoke",
+  "profile": "smoke",
+  "status": "not_available",
+  "reason": "runner_not_implemented_for_engine",
+  "generated_at_unix": 1779343241,
+  "required_metrics": [
+    "recall_at_k",
+    "p50_latency_us",
+    "p95_latency_us",
+    "p99_latency_us",
+    "build_time_us",
+    "memory_bytes",
+    "index_size_bytes"
+  ],
+  "policy": "No benchmark claim exists for this suite/engine until a committed runner emits measured samples from reproducible inputs."
+}

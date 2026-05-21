@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "suite": "object-parquet-range",
+  "engine": "clickhouse",
+  "workload": "arena_object-parquet-range_smoke",
+  "profile": "smoke",
+  "status": "not_available",
+  "reason": "runner_not_implemented_for_engine",
+  "generated_at_unix": 1779343236,
+  "required_metrics": [
+    "query_median_us",
+    "p50_latency_us",
+    "p95_latency_us",
+    "p99_latency_us",
+    "range_request_count",
+    "whole_object_fetched",
+    "projected_out_column_fetched"
+  ],
+  "policy": "No benchmark claim exists for this suite/engine until a committed runner emits measured samples from reproducible inputs."
+}

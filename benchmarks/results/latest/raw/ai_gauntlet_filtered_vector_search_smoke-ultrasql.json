@@ -6,7 +6,7 @@
   "profile": "smoke",
   "status": "not_available",
   "reason": "runner_not_implemented",
-  "generated_at_unix": 1779318653,
+  "generated_at_unix": 1779343239,
   "required_metrics": [
     "p50_latency_us",
     "p95_latency_us",

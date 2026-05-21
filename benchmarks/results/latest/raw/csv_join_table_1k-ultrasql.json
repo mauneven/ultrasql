@@ -1,1 +1,1 @@
-{"answer":{"rows":[["0"]]},"engine":"ultrasql","iterations_us":[4764.5],"median_us":4764.5,"min_us":4764.5,"n_rows":1000,"samples":1,"workload":"csv_join_table_1k"}
+{"answer":{"rows":[["0"]]},"engine":"ultrasql","iterations_us":[2184.292],"median_us":2184.292,"min_us":2184.292,"n_rows":1000,"samples":1,"workload":"csv_join_table_1k"}
