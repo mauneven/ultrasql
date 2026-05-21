@@ -372,6 +372,54 @@ pub struct AnnSystemMetrics {
     pub ivfflat_indexes: u64,
 }
 
+/// One admin validation check result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationCheck {
+    /// Stable machine-readable check name.
+    pub name: &'static str,
+    /// Check outcome.
+    pub status: ValidationStatus,
+    /// Human-readable evidence for the outcome.
+    pub detail: String,
+}
+
+/// Admin validation status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ValidationStatus {
+    /// Check passed.
+    Ok,
+    /// Check failed and should make `ultrasql validate` exit non-zero.
+    Failed,
+}
+
+impl ValidationStatus {
+    /// Lowercase status for CLI output.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Full admin validation report.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ValidationReport {
+    /// Ordered checks run by the validator.
+    pub checks: Vec<ValidationCheck>,
+}
+
+impl ValidationReport {
+    /// Return true when every check passed.
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.checks
+            .iter()
+            .all(|check| check.status == ValidationStatus::Ok)
+    }
+}
+
 /// Runtime sidecar for `CREATE AGGREGATING INDEX`.
 #[derive(Debug)]
 pub struct RuntimeAggregatingIndex {
@@ -1694,8 +1742,23 @@ fn usize_to_u64_saturated(value: usize) -> u64 {
 }
 
 fn pages_to_bytes_saturated(pages: usize) -> u64 {
-    usize_to_u64_saturated(pages)
-        .saturating_mul(usize_to_u64_saturated(ultrasql_core::constants::PAGE_SIZE))
+    usize_to_u64_saturated(pages).saturating_mul(usize_to_u64_saturated(PAGE_SIZE))
+}
+
+fn validation_check(name: &'static str, errors: Vec<String>, ok_detail: String) -> ValidationCheck {
+    if errors.is_empty() {
+        ValidationCheck {
+            name,
+            status: ValidationStatus::Ok,
+            detail: ok_detail,
+        }
+    } else {
+        ValidationCheck {
+            name,
+            status: ValidationStatus::Failed,
+            detail: errors.join("; "),
+        }
+    }
 }
 
 impl Server {
@@ -2548,6 +2611,241 @@ impl Server {
             }
         }
         metrics
+    }
+
+    /// Run offline admin validation over catalog, indexes, WAL, heap visibility, and ANN tombstones.
+    #[must_use]
+    pub fn validate(&self) -> ValidationReport {
+        ValidationReport {
+            checks: vec![
+                self.validate_catalog_check(),
+                self.validate_indexes_check(),
+                self.validate_wal_check(),
+                self.validate_heap_visibility_check(),
+                self.validate_ann_tombstones_check(),
+            ],
+        }
+    }
+
+    fn validate_catalog_check(&self) -> ValidationCheck {
+        let snapshot = self.catalog_snapshot();
+        let mut errors = Vec::new();
+        for (folded, table) in &snapshot.tables {
+            if !snapshot.tables_by_oid.contains_key(&table.oid) {
+                errors.push(format!(
+                    "table {} oid {} missing from oid map",
+                    table.name,
+                    table.oid.raw()
+                ));
+            }
+            if folded != &table.name.to_ascii_lowercase() {
+                errors.push(format!(
+                    "table {} stored under non-folded key {}",
+                    table.name, folded
+                ));
+            }
+        }
+        for (oid, table) in &snapshot.tables_by_oid {
+            if !snapshot
+                .tables
+                .values()
+                .any(|named_table| named_table.oid == *oid)
+            {
+                errors.push(format!(
+                    "oid map table {} oid {} missing from name map",
+                    table.name,
+                    oid.raw()
+                ));
+            }
+        }
+        validation_check(
+            "catalog",
+            errors,
+            format!(
+                "{} table(s), {} oid entry(s), {} index(es)",
+                snapshot.tables.len(),
+                snapshot.tables_by_oid.len(),
+                snapshot.indexes.len()
+            ),
+        )
+    }
+
+    fn validate_indexes_check(&self) -> ValidationCheck {
+        let snapshot = self.catalog_snapshot();
+        let mut errors = Vec::new();
+        for index in snapshot.indexes.values() {
+            let Some(table) = snapshot.tables_by_oid.get(&index.table_oid) else {
+                errors.push(format!(
+                    "index {} references missing table oid {}",
+                    index.name,
+                    index.table_oid.raw()
+                ));
+                continue;
+            };
+            if !snapshot
+                .indexes_by_table
+                .get(&index.table_oid)
+                .is_some_and(|indexes| indexes.iter().any(|entry| entry.oid == index.oid))
+            {
+                errors.push(format!(
+                    "index {} oid {} missing from table index map",
+                    index.name,
+                    index.oid.raw()
+                ));
+            }
+            for column in &index.columns {
+                let idx = usize::from(*column);
+                if idx >= table.schema.len() {
+                    errors.push(format!(
+                        "index {} column {} out of range for table {}",
+                        index.name, column, table.name
+                    ));
+                }
+            }
+            let method = index.access_method.to_ascii_lowercase();
+            if method == "hnsw" || method == "ivfflat" {
+                let runtime = self
+                    .table_constraints
+                    .get(&index.table_oid)
+                    .and_then(|constraints| constraints.value().indexes.get(&index.oid).cloned());
+                match (method.as_str(), runtime) {
+                    ("hnsw", Some(runtime)) => match runtime.hnsw {
+                        Some(hnsw) if hnsw.is_valid() => {}
+                        Some(_) => errors.push(format!("hnsw index {} is invalid", index.name)),
+                        None => errors.push(format!(
+                            "hnsw index {} missing page-backed sidecar",
+                            index.name
+                        )),
+                    },
+                    ("ivfflat", Some(runtime)) => match runtime.ivfflat {
+                        Some(ivfflat) if ivfflat.is_valid() => {}
+                        Some(_) => errors.push(format!("ivfflat index {} is invalid", index.name)),
+                        None => errors.push(format!(
+                            "ivfflat index {} missing page-backed sidecar",
+                            index.name
+                        )),
+                    },
+                    _ => errors.push(format!(
+                        "{} index {} missing runtime metadata",
+                        method, index.name
+                    )),
+                }
+            }
+        }
+        validation_check(
+            "indexes",
+            errors,
+            format!(
+                "{} index(es), {} indexed table bucket(s)",
+                snapshot.indexes.len(),
+                snapshot.indexes_by_table.len()
+            ),
+        )
+    }
+
+    fn validate_wal_check(&self) -> ValidationCheck {
+        let Some(data_dir) = &self.data_dir else {
+            return validation_check(
+                "wal",
+                Vec::new(),
+                "in-memory server; no WAL directory configured".to_owned(),
+            );
+        };
+        let wal_dir = data_dir.join("pg_wal");
+        match ultrasql_wal::recover(&wal_dir, |_| Ok(())) {
+            Ok(lsn) => validation_check(
+                "wal",
+                Vec::new(),
+                format!("decoded WAL through lsn {}", lsn.raw()),
+            ),
+            Err(err) => validation_check("wal", vec![err.to_string()], String::new()),
+        }
+    }
+
+    fn validate_heap_visibility_check(&self) -> ValidationCheck {
+        let snapshot = self.catalog_snapshot();
+        let scan_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let scan_snapshot = scan_txn.snapshot.clone();
+        let mut errors = Vec::new();
+        let mut visible_rows = 0_u64;
+        for table in snapshot.tables.values() {
+            let rel = RelationId(table.oid);
+            let block_count = self.heap.block_count(rel).max(table.n_blocks);
+            let codec = RowCodec::new(table.schema.clone());
+            let mut decode_error: Option<String> = None;
+            let mut table_rows = 0_u64;
+            let scan_result = self.heap.for_each_visible(
+                rel,
+                block_count,
+                &scan_snapshot,
+                self.txn_manager.as_ref(),
+                |_tid, _hdr, payload| {
+                    if decode_error.is_none() {
+                        if let Err(err) = codec.decode(payload) {
+                            decode_error = Some(err.to_string());
+                        }
+                    }
+                    table_rows = table_rows.saturating_add(1);
+                    Ok(())
+                },
+            );
+            if let Err(err) = scan_result {
+                errors.push(format!("table {} heap scan failed: {err}", table.name));
+            }
+            if let Some(err) = decode_error {
+                errors.push(format!("table {} row decode failed: {err}", table.name));
+            }
+            visible_rows = visible_rows.saturating_add(table_rows);
+        }
+        if let Err(err) = self.txn_manager.abort(scan_txn) {
+            errors.push(format!("validation scan transaction abort failed: {err}"));
+        }
+        validation_check(
+            "heap_visibility",
+            errors,
+            format!(
+                "{} table(s), {} visible row(s)",
+                snapshot.tables.len(),
+                visible_rows
+            ),
+        )
+    }
+
+    fn validate_ann_tombstones_check(&self) -> ValidationCheck {
+        let mut errors = Vec::new();
+        let mut hnsw_indexes = 0_u64;
+        let mut ivfflat_indexes = 0_u64;
+        let mut tombstones = 0_u64;
+        for entry in self.table_constraints.iter() {
+            for runtime in entry.value().indexes.values() {
+                if let Some(hnsw) = &runtime.hnsw {
+                    hnsw_indexes = hnsw_indexes.saturating_add(1);
+                    let stats = hnsw.page_stats();
+                    tombstones =
+                        tombstones.saturating_add(usize_to_u64_saturated(stats.tombstones));
+                    if !hnsw.is_valid() {
+                        errors.push("hnsw sidecar is invalid".to_owned());
+                    }
+                }
+                if let Some(ivfflat) = &runtime.ivfflat {
+                    ivfflat_indexes = ivfflat_indexes.saturating_add(1);
+                    let stats = ivfflat.page_stats();
+                    tombstones =
+                        tombstones.saturating_add(usize_to_u64_saturated(stats.tombstones));
+                    if !ivfflat.is_valid() {
+                        errors.push("ivfflat sidecar is invalid".to_owned());
+                    }
+                }
+            }
+        }
+        validation_check(
+            "ann_tombstones",
+            errors,
+            format!(
+                "{} hnsw index(es), {} ivfflat index(es), {} tombstone(s)",
+                hnsw_indexes, ivfflat_indexes, tombstones
+            ),
+        )
     }
 
     /// Validate foreign keys that were declared `DEFERRABLE INITIALLY DEFERRED`.

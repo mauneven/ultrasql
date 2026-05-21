@@ -17,11 +17,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use rustyline::DefaultEditor;
 use tokio_postgres::{Client, Column, NoTls, Row};
 use tracing_subscriber::EnvFilter;
 use ultrasql_server::replication::{WalReceiver, WalSender};
+use ultrasql_server::{Server, ValidationReport};
 
 // ---------------------------------------------------------------------------
 // CLI argument definitions
@@ -141,9 +142,19 @@ struct Cli {
     #[arg(long, default_value = "target/ultrasql-data")]
     data_dir: PathBuf,
 
+    /// Admin subcommand.
+    #[command(subcommand)]
+    subcommand: Option<CliSubcommand>,
+
     /// Positional URL — postgresql:// or host shortcut.
     #[arg(hide = true)]
     positional_url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Subcommand)]
+enum CliSubcommand {
+    /// Validate catalog, indexes, WAL, heap visibility, and ANN tombstones.
+    Validate,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -941,6 +952,11 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    if matches!(cli.subcommand, Some(CliSubcommand::Validate)) {
+        run_validate(&cli.data_dir)?;
+        return Ok(());
+    }
+
     let params = resolve_params(&cli)?;
 
     if cli.isready {
@@ -1450,6 +1466,34 @@ fn run_restore_wal(wal_name: &str, archive_dir: &Path, output: &Path) -> Result<
         .with_context(|| format!("restore WAL {} to {}", source.display(), output.display()))?;
     println!("restored {} to {}", source.display(), output.display());
     Ok(())
+}
+
+fn run_validate(data_dir: &Path) -> Result<()> {
+    let server = Server::init(data_dir)
+        .with_context(|| format!("validate data directory {}", data_dir.display()))?;
+    let report = server.validate();
+    print_validation_report(&report);
+    if report.is_ok() {
+        Ok(())
+    } else {
+        anyhow::bail!("validation failed")
+    }
+}
+
+fn print_validation_report(report: &ValidationReport) {
+    if report.is_ok() {
+        println!("validation ok");
+    } else {
+        println!("validation failed");
+    }
+    for check in &report.checks {
+        println!(
+            "{}: {} - {}",
+            check.name,
+            check.status.as_str(),
+            check.detail
+        );
+    }
 }
 
 async fn run_ctl(

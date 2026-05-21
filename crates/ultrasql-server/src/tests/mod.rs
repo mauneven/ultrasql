@@ -49,6 +49,26 @@ fn server() -> Arc<Server> {
     Arc::new(Server::with_sample_database())
 }
 
+#[test]
+fn validation_report_covers_required_admin_checks() {
+    let server = Server::with_sample_database();
+    let report = server.validate();
+
+    assert!(report.is_ok(), "{report:?}");
+    for name in [
+        "catalog",
+        "indexes",
+        "wal",
+        "heap_visibility",
+        "ann_tombstones",
+    ] {
+        assert!(
+            report.checks.iter().any(|check| check.name == name),
+            "missing check {name}"
+        );
+    }
+}
+
 async fn complete_startup(client: &mut (impl AsyncRead + AsyncWrite + Unpin)) {
     send_frontend(
         client,
