@@ -517,6 +517,13 @@ where
                         if let (Some(plan), Ok(outcome)) = (portal_plan.as_ref(), res.as_ref()) {
                             let rows = Self::parse_affected_rows_tag(&outcome.messages);
                             self.note_committed_dml_effect(plan, rows);
+                            if rows > 0
+                                && let Some(table) = Self::dml_target_table(plan)
+                            {
+                                self.maintain_aggregating_indexes_for_tables_after_commit(&[
+                                    table.to_ascii_lowercase(),
+                                ])?;
+                            }
                         }
                     }
                 } else if let Err(e) = self.state.txn_manager.abort(txn) {

@@ -10,10 +10,12 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener};
+use ultrasql_core::Value;
+use ultrasql_server::{RuntimeAggregatingIndex, Server, bind_listener, serve_listener};
 
 async fn start_server_and_connect() -> (
     tokio_postgres::Client,
@@ -148,6 +150,56 @@ fn assert_aggregating_catalog_metadata(server: &Server) {
     );
 }
 
+fn aggregating_runtime(
+    server: &Server,
+    table_name: &str,
+    index_name: &str,
+) -> Arc<RuntimeAggregatingIndex> {
+    let snapshot = server.catalog_snapshot();
+    let table = snapshot
+        .tables
+        .get(table_name)
+        .unwrap_or_else(|| panic!("table catalog entry for {table_name}"));
+    let index = snapshot
+        .indexes
+        .get(index_name)
+        .unwrap_or_else(|| panic!("index catalog entry for {index_name}"));
+    let constraints = server
+        .table_constraints
+        .get(&table.oid)
+        .unwrap_or_else(|| panic!("runtime constraints for {table_name}"));
+    constraints
+        .indexes
+        .get(&index.oid)
+        .and_then(|metadata| metadata.aggregating.clone())
+        .unwrap_or_else(|| panic!("aggregating runtime for {index_name}"))
+}
+
+fn assert_runtime_clean_rows(runtime: &RuntimeAggregatingIndex, expected: &[&[&str]]) {
+    assert!(
+        !runtime.dirty.load(Ordering::Acquire),
+        "aggregating summary should be clean after committed maintenance"
+    );
+    let mut actual = runtime
+        .rows
+        .read()
+        .expect("aggregating runtime rows lock")
+        .iter()
+        .map(|row| row.iter().map(ToString::to_string).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    actual.sort();
+    let mut expected = expected
+        .iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(actual, expected);
+}
+
 #[tokio::test]
 async fn create_aggregating_index_rewrites_rollup_and_refreshes_after_dml() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
@@ -216,6 +268,176 @@ async fn create_aggregating_index_rewrites_rollup_and_refreshes_after_dml() {
         .await
         .expect("delete after index build");
     assert_eq!(tenant_rollup(&client).await, vec![(7, 1, 42, 3)]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn aggregating_index_update_group_key_moves_summary_between_groups() {
+    let server = Arc::new(Server::with_sample_database());
+    let (client, _conn, server_handle) = start_server_and_connect_to(Arc::clone(&server)).await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE fact_events_update (
+                tenant_id INT NOT NULL,
+                bucket INT NOT NULL,
+                amount BIGINT NOT NULL
+             )",
+        )
+        .await
+        .expect("create table");
+    client
+        .batch_execute(
+            "INSERT INTO fact_events_update VALUES
+                (7, 1, 10),
+                (7, 1, 20),
+                (7, 2, 5),
+                (8, 1, 100)",
+        )
+        .await
+        .expect("seed");
+    client
+        .batch_execute(
+            "CREATE AGGREGATING INDEX fact_events_update_rollup
+                ON fact_events_update (tenant_id, bucket, sum(amount), count(*))",
+        )
+        .await
+        .expect("setup aggregating index");
+    let runtime = aggregating_runtime(&server, "fact_events_update", "fact_events_update_rollup");
+
+    client
+        .batch_execute(
+            "UPDATE fact_events_update
+             SET bucket = 2, amount = 13
+             WHERE tenant_id = 7 AND bucket = 1 AND amount = 10",
+        )
+        .await
+        .expect("update group key");
+
+    assert_runtime_clean_rows(
+        &runtime,
+        &[
+            &["7", "1", "20", "1"],
+            &["7", "2", "18", "2"],
+            &["8", "1", "100", "1"],
+        ],
+    );
+    assert_eq!(
+        tenant_rollup_for(&client, "fact_events_update").await,
+        vec![(7, 1, 20, 1), (7, 2, 18, 2)]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn aggregating_index_delete_decrements_summary_and_omits_empty_group() {
+    let server = Arc::new(Server::with_sample_database());
+    let (client, _conn, server_handle) = start_server_and_connect_to(Arc::clone(&server)).await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE fact_events_delete (
+                tenant_id INT NOT NULL,
+                bucket INT NOT NULL,
+                amount BIGINT NOT NULL
+             )",
+        )
+        .await
+        .expect("create table");
+    client
+        .batch_execute(
+            "INSERT INTO fact_events_delete VALUES
+                (7, 1, 10),
+                (7, 1, 20),
+                (7, 2, 5),
+                (8, 1, 100)",
+        )
+        .await
+        .expect("seed");
+    client
+        .batch_execute(
+            "CREATE AGGREGATING INDEX fact_events_delete_rollup
+                ON fact_events_delete (tenant_id, bucket, sum(amount), count(*))",
+        )
+        .await
+        .expect("setup aggregating index");
+    let runtime = aggregating_runtime(&server, "fact_events_delete", "fact_events_delete_rollup");
+
+    client
+        .batch_execute("DELETE FROM fact_events_delete WHERE tenant_id = 7 AND bucket = 2")
+        .await
+        .expect("delete group");
+
+    assert_runtime_clean_rows(&runtime, &[&["7", "1", "30", "2"], &["8", "1", "100", "1"]]);
+    assert_eq!(
+        tenant_rollup_for(&client, "fact_events_delete").await,
+        vec![(7, 1, 30, 2)]
+    );
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn aggregating_index_vacuum_rebuilds_stale_summary_without_corruption() {
+    let server = Arc::new(Server::with_sample_database());
+    let (client, _conn, server_handle) = start_server_and_connect_to(Arc::clone(&server)).await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE fact_events_vacuum (
+                tenant_id INT NOT NULL,
+                bucket INT NOT NULL,
+                amount BIGINT NOT NULL
+             )",
+        )
+        .await
+        .expect("create table");
+    client
+        .batch_execute(
+            "INSERT INTO fact_events_vacuum VALUES
+                (7, 1, 10),
+                (7, 1, 20),
+                (7, 2, 5),
+                (8, 1, 100)",
+        )
+        .await
+        .expect("seed");
+    client
+        .batch_execute(
+            "CREATE AGGREGATING INDEX fact_events_vacuum_rollup
+                ON fact_events_vacuum (tenant_id, bucket, sum(amount), count(*))",
+        )
+        .await
+        .expect("setup aggregating index");
+    let runtime = aggregating_runtime(&server, "fact_events_vacuum", "fact_events_vacuum_rollup");
+
+    client
+        .batch_execute("DELETE FROM fact_events_vacuum WHERE tenant_id = 7 AND bucket = 2")
+        .await
+        .expect("delete before vacuum");
+    {
+        let mut rows = runtime.rows.write().expect("aggregating rows lock");
+        *rows = vec![vec![
+            Value::Int32(7),
+            Value::Int32(99),
+            Value::Int64(999),
+            Value::Int64(999),
+        ]];
+    }
+    runtime.mark_dirty();
+
+    client
+        .batch_execute("VACUUM fact_events_vacuum")
+        .await
+        .expect("vacuum");
+
+    assert_runtime_clean_rows(&runtime, &[&["7", "1", "30", "2"], &["8", "1", "100", "1"]]);
+    assert_eq!(
+        tenant_rollup_for(&client, "fact_events_vacuum").await,
+        vec![(7, 1, 30, 2)]
+    );
 
     shutdown(client, server_handle).await;
 }

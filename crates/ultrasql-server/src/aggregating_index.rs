@@ -1,9 +1,12 @@
 //! Runtime support for `CREATE AGGREGATING INDEX`.
 //!
-//! The summary itself is a runtime sidecar: DML marks it dirty and the
-//! next matching read rebuilds it lazily. Durable catalog metadata records
-//! the exact group/aggregate shape, then restart rebuilds clean summary
-//! rows from the heap rather than trusting same-process-only state.
+//! The summary itself is a runtime sidecar: DML marks it dirty, commit/VACUUM
+//! maintenance rebuilds dirty summaries from visible heap rows, and matching
+//! reads keep the same rebuild path as a correctness backstop. Empty groups
+//! are omitted because summary rows are derived only from currently visible
+//! base-table tuples. Durable catalog metadata records the exact
+//! group/aggregate shape, then restart rebuilds clean summary rows from the
+//! heap rather than trusting same-process-only state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -400,6 +403,29 @@ pub(crate) fn mark_aggregating_indexes_dirty(entry: &TableEntry, ctx: &LowerCtx<
     }
 }
 
+/// Rebuild dirty aggregating summaries for a table.
+pub(crate) fn refresh_dirty_aggregating_indexes(
+    table: &TableEntry,
+    table_constraints: &dashmap::DashMap<ultrasql_core::Oid, Arc<crate::TableRuntimeConstraints>>,
+    heap: &ultrasql_storage::heap::HeapAccess<BlankPageLoader>,
+    snapshot: &Snapshot,
+    oracle: &TransactionManager,
+) -> Result<(), ServerError> {
+    let Some(constraints) = table_constraints.get(&table.oid) else {
+        return Ok(());
+    };
+    let runtimes = constraints
+        .indexes
+        .values()
+        .filter_map(|metadata| metadata.aggregating.clone())
+        .collect::<Vec<_>>();
+    drop(constraints);
+    for runtime in runtimes {
+        rebuild_runtime_if_dirty(table, &runtime, heap, snapshot, oracle)?;
+    }
+    Ok(())
+}
+
 /// Try to lower `Project(Aggregate(...))` through a matching runtime summary.
 pub(crate) fn try_lower_aggregating_index_project(
     input: &LogicalPlan,
@@ -495,31 +521,13 @@ fn current_summary_rows(
     {
         return Ok(None);
     }
-    if runtime
-        .dirty
-        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
-    {
-        match build_aggregating_index_rows(
-            table,
-            &runtime.spec,
-            ctx.heap.as_ref(),
-            &ctx.snapshot,
-            ctx.oracle.as_ref(),
-        ) {
-            Ok(rows) => {
-                let mut guard = runtime
-                    .rows
-                    .write()
-                    .map_err(|_| ServerError::ddl("aggregating index lock poisoned"))?;
-                *guard = rows;
-            }
-            Err(err) => {
-                runtime.dirty.store(true, Ordering::Release);
-                return Err(err);
-            }
-        }
-    }
+    rebuild_runtime_if_dirty(
+        table,
+        runtime,
+        ctx.heap.as_ref(),
+        &ctx.snapshot,
+        ctx.oracle.as_ref(),
+    )?;
     let rows = runtime
         .rows
         .read()
@@ -546,6 +554,36 @@ fn current_summary_rows(
             .map(Some);
     }
     Ok(Some(rows))
+}
+
+fn rebuild_runtime_if_dirty(
+    table: &TableEntry,
+    runtime: &Arc<RuntimeAggregatingIndex>,
+    heap: &ultrasql_storage::heap::HeapAccess<BlankPageLoader>,
+    snapshot: &Snapshot,
+    oracle: &TransactionManager,
+) -> Result<(), ServerError> {
+    if runtime
+        .dirty
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Ok(());
+    }
+    match build_aggregating_index_rows(table, &runtime.spec, heap, snapshot, oracle) {
+        Ok(rows) => {
+            let mut guard = runtime
+                .rows
+                .write()
+                .map_err(|_| ServerError::ddl("aggregating index lock poisoned"))?;
+            *guard = rows;
+            Ok(())
+        }
+        Err(err) => {
+            runtime.dirty.store(true, Ordering::Release);
+            Err(err)
+        }
+    }
 }
 
 fn aggregate_input_scan(plan: &LogicalPlan) -> Option<(&str, Option<&ScalarExpr>)> {

@@ -375,6 +375,12 @@ where
                 } else {
                     self.state.note_commit_for_gc();
                     if let Err(e) =
+                        self.maintain_aggregating_indexes_for_tables_after_commit(&modified_tables)
+                    {
+                        self.flush_pending_dml_effects();
+                        return Err(e);
+                    }
+                    if let Err(e) =
                         self.maintain_materialized_views_for_tables_after_commit(&modified_tables)
                     {
                         self.flush_pending_dml_effects();

@@ -1401,7 +1401,16 @@ where
                     }
                     self.pending_post_commit_maintenance = true;
                     let rows = result.rows;
+                    let modified_table = (rows > 0)
+                        .then(|| Self::dml_target_table(plan))
+                        .flatten()
+                        .map(str::to_ascii_lowercase);
                     self.note_dml_effect(plan, rows);
+                    if let Some(table) = &modified_table {
+                        self.maintain_aggregating_indexes_for_tables_after_commit(
+                            std::slice::from_ref(table),
+                        )?;
+                    }
                     self.maintain_append_only_materialized_views_after_commit(plan)?;
                 }
                 Ok(result)
@@ -1596,6 +1605,9 @@ where
                 .map_err(|e| ServerError::ddl(format!("VACUUM heap: {e}")))?;
             self.state.vacuum_mark_visible_pages(oldest);
             self.resummarize_brin_indexes(&snapshot, &entry)?;
+            self.maintain_aggregating_indexes_for_tables_after_commit(std::slice::from_ref(
+                &entry.name,
+            ))?;
         }
         Ok(result_encoder::SelectResult {
             messages: vec![BackendMessage::CommandComplete {
@@ -1914,6 +1926,59 @@ where
         self.pending_materialized_view_rows.extend(rows);
         self.flush_pending_materialized_view_rows();
         Ok(())
+    }
+
+    pub(crate) fn maintain_aggregating_indexes_for_tables_after_commit(
+        &mut self,
+        tables: &[String],
+    ) -> Result<(), ServerError> {
+        if tables.is_empty() {
+            return Ok(());
+        }
+        let snapshot = self.state.catalog_snapshot();
+        let entries = tables
+            .iter()
+            .filter_map(|table| {
+                let entry = snapshot.tables.get(&table.to_ascii_lowercase()).cloned()?;
+                let has_aggregating_index = self
+                    .state
+                    .table_constraints
+                    .get(&entry.oid)
+                    .is_some_and(|constraints| {
+                        constraints
+                            .indexes
+                            .values()
+                            .any(|metadata| metadata.aggregating.is_some())
+                    });
+                has_aggregating_index.then_some(entry)
+            })
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let result = (|| -> Result<(), ServerError> {
+            for entry in &entries {
+                crate::aggregating_index::refresh_dirty_aggregating_indexes(
+                    entry,
+                    &self.state.table_constraints,
+                    self.state.heap.as_ref(),
+                    &txn.snapshot,
+                    self.state.txn_manager.as_ref(),
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(commit_err) = self.state.txn_manager.commit(txn) {
+            tracing::warn!(
+                error = %commit_err,
+                "aggregating-index maintenance commit failed",
+            );
+        }
+        result
     }
 
     pub(crate) fn materialize_view_delta(
