@@ -93,6 +93,7 @@ pub(crate) mod catalog_views;
 mod csv_scan;
 mod cte_helpers;
 mod external_scan;
+mod hybrid_search;
 mod index_scan;
 mod join;
 mod json_table_scan;

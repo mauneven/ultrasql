@@ -263,6 +263,9 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "cosine_distance" => eval_vector_metric(args, VectorDistanceOp::Cosine),
         "inner_product" | "dot_product" => eval_vector_metric(args, VectorDistanceOp::InnerProduct),
         "l1_distance" => eval_vector_metric(args, VectorDistanceOp::L1),
+        "hybrid_search" => Err(EvalError::Unsupported(
+            "hybrid_search requires ORDER BY hybrid_search(...) DESC LIMIT k",
+        )),
         "vector_norm" | "l2_norm" => eval_vector_norm(args),
         "vector_dims" => eval_vector_dims(args),
         "coalesce" => Ok(args

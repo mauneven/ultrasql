@@ -1022,6 +1022,7 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
         "l2_distance" | "cosine_distance" | "inner_product" | "dot_product" | "l1_distance" => {
             Ok(DataType::Float64)
         }
+        "hybrid_search" => Ok(DataType::Float64),
         "vector_norm" | "l2_norm" => Ok(DataType::Float64),
         "vector_dims" => Ok(DataType::Int32),
         _ => Err(PlanError::NotSupported("non-aggregate function calls")),
@@ -1059,6 +1060,7 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "inner_product"
             | "dot_product"
             | "l1_distance"
+            | "hybrid_search"
             | "vector_norm"
             | "l2_norm"
             | "vector_dims"
@@ -1070,6 +1072,7 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
         "l2_distance" | "cosine_distance" | "inner_product" | "dot_product" | "l1_distance" => {
             validate_vector_metric_args(func_name, args)
         }
+        "hybrid_search" => validate_hybrid_search_args(args),
         "vector_norm" | "l2_norm" => validate_vector_norm_args(func_name, args),
         "vector_dims" => validate_vector_dims_args(args),
         _ => Ok(()),
@@ -1149,12 +1152,70 @@ fn validate_vector_dims_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
     )))
 }
 
+fn validate_hybrid_search_args(args: &mut [ScalarExpr]) -> Result<(), PlanError> {
+    if args.len() != 4 {
+        return Err(PlanError::TypeMismatch(format!(
+            "hybrid_search: expected 4 arguments, got {}",
+            args.len()
+        )));
+    }
+
+    let text_type = args[0].data_type();
+    if !matches!(text_type, DataType::Text { .. } | DataType::Jsonb) {
+        return Err(PlanError::TypeMismatch(format!(
+            "hybrid_search: first argument must be text or jsonb, got {text_type}"
+        )));
+    }
+
+    let query_type = args[1].data_type();
+    if !matches!(query_type, DataType::Text { .. }) {
+        return Err(PlanError::TypeMismatch(format!(
+            "hybrid_search: second argument must be text, got {query_type}"
+        )));
+    }
+
+    coerce_hybrid_vector_literals(args);
+    let vector_type = args[2].data_type();
+    let probe_type = args[3].data_type();
+    if dense_vector_family_kind(&vector_type).is_some()
+        && dense_vector_family_kind(&vector_type) == dense_vector_family_kind(&probe_type)
+        && dims_compatible(
+            vector_type.vector_dims().flatten(),
+            probe_type.vector_dims().flatten(),
+        )
+    {
+        return Ok(());
+    }
+    Err(PlanError::TypeMismatch(format!(
+        "hybrid_search: third and fourth arguments must be compatible vector or halfvec values, got {vector_type} and {probe_type}"
+    )))
+}
+
+fn coerce_hybrid_vector_literals(args: &mut [ScalarExpr]) {
+    let vector_type = args[2].data_type();
+    let probe_type = args[3].data_type();
+    if dense_vector_family_kind(&vector_type).is_some() {
+        coerce_literal_to_type(&mut args[3], &vector_type);
+    }
+    if dense_vector_family_kind(&probe_type).is_some() {
+        coerce_literal_to_type(&mut args[2], &probe_type);
+    }
+}
+
 fn vector_metric_family_kind(data_type: &DataType) -> Option<u8> {
     match data_type {
         DataType::Vector { .. } => Some(0),
         DataType::HalfVec { .. } => Some(1),
         DataType::SparseVec { .. } => Some(2),
         DataType::BitVec { .. } => None,
+        _ => None,
+    }
+}
+
+fn dense_vector_family_kind(data_type: &DataType) -> Option<u8> {
+    match data_type {
+        DataType::Vector { .. } => Some(0),
+        DataType::HalfVec { .. } => Some(1),
         _ => None,
     }
 }

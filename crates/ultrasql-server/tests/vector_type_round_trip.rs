@@ -776,6 +776,47 @@ async fn ivfflat_page_backed_index_survives_sql_restart() {
 }
 
 #[tokio::test]
+async fn hybrid_search_function_orders_candidates_through_executor() {
+    let (client, _conn, server_handle) = start_server_and_connect().await;
+
+    client
+        .batch_execute(
+            "CREATE TABLE hybrid_docs (\
+                id INT NOT NULL, \
+                content TEXT, \
+                embedding VECTOR(2), \
+                metadata JSONB\
+             )",
+        )
+        .await
+        .expect("create hybrid docs");
+    client
+        .batch_execute(
+            "INSERT INTO hybrid_docs VALUES \
+             (1, 'rust sql vector database', '[0,0]', '{\"kind\":\"guide\"}'), \
+             (2, 'rust sql hybrid rag', '[0.05,0]', '{\"kind\":\"guide\"}'), \
+             (3, 'unrelated stale note', '[0.01,0]', '{\"kind\":\"note\"}'), \
+             (4, 'rust sql old guide', '[0.35,0]', '{\"kind\":\"guide\"}')",
+        )
+        .await
+        .expect("insert hybrid docs");
+
+    let messages = client
+        .simple_query(
+            "SELECT id FROM hybrid_docs \
+             WHERE metadata @> '{\"kind\":\"guide\"}' \
+             ORDER BY hybrid_search(content, 'rust sql hybrid', embedding, VECTOR '[0,0]') DESC \
+             LIMIT 2",
+        )
+        .await
+        .expect("hybrid search query");
+    let rows = simple_rows(&messages);
+    assert_eq!(rows, vec![vec!["2".to_owned()], vec!["1".to_owned()]]);
+
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
 async fn insert_rejects_vector_dimension_mismatch() {
     let (client, _conn, server_handle) = start_server_and_connect().await;
 

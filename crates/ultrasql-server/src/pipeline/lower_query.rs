@@ -18,6 +18,7 @@ use super::agg_fuse::{
     try_lower_fused_filter_sum_int,
 };
 use super::cte_helpers::{lower_recursive_cte, lower_set_op_real};
+use super::hybrid_search::try_lower_hybrid_search_limit;
 use super::index_scan::{
     try_hnsw_top_k_limit, try_index_only_scan, try_index_scan, try_ordered_index_scan,
     try_ordered_index_scan_limit,
@@ -212,6 +213,9 @@ pub fn lower_query(
             Ok(Box::new(Filter::new(child, predicate.clone())))
         }
         LogicalPlan::Limit { input, n, offset } => {
+            if let Some(op) = try_lower_hybrid_search_limit(input, *n, *offset, ctx)? {
+                return Ok(op);
+            }
             if let Some(op) = try_hnsw_top_k_limit(input, *n, *offset, ctx)? {
                 return Ok(op);
             }
