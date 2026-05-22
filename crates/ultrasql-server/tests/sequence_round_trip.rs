@@ -1,79 +1,10 @@
 //! End-to-end sequence DDL and function tests.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-
 use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener};
 
 mod support;
 
-use support::{shutdown as graceful_shutdown, start_persistent_server};
-
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=sequence_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
-
-async fn start_server_and_connect_two() -> (
-    tokio_postgres::Client,
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=sequence_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (a, a_conn) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("connect a");
-    tokio::spawn(async move {
-        let _ = a_conn.await;
-    });
-    let (b, b_conn) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("connect b");
-    tokio::spawn(async move {
-        let _ = b_conn.await;
-    });
-    (a, b, server_handle)
-}
-
-async fn shutdown(
-    client: tokio_postgres::Client,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
-    let _ = server_handle.await;
-}
+use support::{shutdown as graceful_shutdown, start_persistent_server, start_sample_server};
 
 async fn simple_i64(client: &tokio_postgres::Client, sql: &str) -> i64 {
     let rows = client.simple_query(sql).await.expect("simple query");
@@ -87,22 +18,23 @@ async fn simple_i64(client: &tokio_postgres::Client, sql: &str) -> i64 {
 
 #[tokio::test]
 async fn create_sequence_nextval_currval_setval_and_drop() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("sequence_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE SEQUENCE s START WITH 10 INCREMENT BY 5")
         .await
         .expect("create sequence");
 
-    assert_eq!(simple_i64(&client, "SELECT nextval('s')").await, 10);
-    assert_eq!(simple_i64(&client, "SELECT nextval('s')").await, 15);
-    assert_eq!(simple_i64(&client, "SELECT currval('s')").await, 15);
-    assert_eq!(simple_i64(&client, "SELECT lastval()").await, 15);
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 10);
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 15);
+    assert_eq!(simple_i64(client, "SELECT currval('s')").await, 15);
+    assert_eq!(simple_i64(client, "SELECT lastval()").await, 15);
     assert_eq!(
-        simple_i64(&client, "SELECT setval('s', 40, false)").await,
+        simple_i64(client, "SELECT setval('s', 40, false)").await,
         40
     );
-    assert_eq!(simple_i64(&client, "SELECT nextval('s')").await, 40);
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 40);
 
     client
         .batch_execute("DROP SEQUENCE s")
@@ -113,42 +45,44 @@ async fn create_sequence_nextval_currval_setval_and_drop() {
         .await
         .expect("drop sequence if exists");
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test]
 async fn alter_sequence_changes_increment() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("sequence_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE SEQUENCE s START WITH 1")
         .await
         .expect("create sequence");
-    assert_eq!(simple_i64(&client, "SELECT nextval('s')").await, 1);
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 1);
     client
         .batch_execute("ALTER SEQUENCE s INCREMENT BY 10")
         .await
         .expect("alter sequence");
-    assert_eq!(simple_i64(&client, "SELECT nextval('s')").await, 11);
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 11);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test]
 async fn alter_sequence_start_and_restart_follow_postgres_shape() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("sequence_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE SEQUENCE s START WITH 1")
         .await
         .expect("create sequence");
-    assert_eq!(simple_i64(&client, "SELECT nextval('s')").await, 1);
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 1);
     client
         .batch_execute("ALTER SEQUENCE s START WITH 50")
         .await
         .expect("alter start");
     assert_eq!(
-        simple_i64(&client, "SELECT nextval('s')").await,
+        simple_i64(client, "SELECT nextval('s')").await,
         2,
         "START WITH changes restart seed, not current value"
     );
@@ -156,24 +90,36 @@ async fn alter_sequence_start_and_restart_follow_postgres_shape() {
         .batch_execute("ALTER SEQUENCE s RESTART")
         .await
         .expect("restart at configured start");
-    assert_eq!(simple_i64(&client, "SELECT nextval('s')").await, 50);
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 50);
     client
         .batch_execute("ALTER SEQUENCE s RESTART WITH 7")
         .await
         .expect("restart with explicit value");
-    assert_eq!(simple_i64(&client, "SELECT nextval('s')").await, 7);
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 7);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test]
 async fn currval_is_session_local_but_nextval_is_global() {
-    let (a, b, server_handle) = start_server_and_connect_two().await;
+    let running = start_sample_server("sequence_test").await;
+    let a = &running.client;
+    let conn_str = format!(
+        "host={host} port={port} user=tester application_name=sequence_test",
+        host = running.bound.ip(),
+        port = running.bound.port()
+    );
+    let (b, b_conn) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("connect b");
+    let b_handle = tokio::spawn(async move {
+        let _ = b_conn.await;
+    });
 
     a.batch_execute("CREATE SEQUENCE s")
         .await
         .expect("create sequence");
-    assert_eq!(simple_i64(&a, "SELECT nextval('s')").await, 1);
+    assert_eq!(simple_i64(a, "SELECT nextval('s')").await, 1);
 
     let b_currval = b
         .simple_query("SELECT currval('s')")
@@ -183,29 +129,30 @@ async fn currval_is_session_local_but_nextval_is_global() {
 
     assert_eq!(simple_i64(&b, "SELECT nextval('s')").await, 2);
 
-    drop(a);
     drop(b);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
+    b_handle.await.expect("b connection task joins");
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test]
 async fn descending_sequence_uses_maxvalue_default_start() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("sequence_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE SEQUENCE s INCREMENT BY -1 MAXVALUE 5")
         .await
         .expect("create descending sequence");
-    assert_eq!(simple_i64(&client, "SELECT nextval('s')").await, 5);
-    assert_eq!(simple_i64(&client, "SELECT nextval('s')").await, 4);
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 5);
+    assert_eq!(simple_i64(client, "SELECT nextval('s')").await, 4);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test]
 async fn serial_column_creates_sequence_default_and_updates_currval() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("sequence_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id SERIAL, v INT)")
@@ -225,7 +172,7 @@ async fn serial_column_creates_sequence_default_and_updates_currval() {
     assert_eq!(rows[0].get::<_, i32>(1), 10);
     assert_eq!(rows[1].get::<_, i32>(0), 2);
     assert_eq!(rows[1].get::<_, i32>(1), 20);
-    assert_eq!(simple_i64(&client, "SELECT currval('t_id_seq')").await, 2);
+    assert_eq!(simple_i64(client, "SELECT currval('t_id_seq')").await, 2);
 
     client
         .batch_execute("DROP TABLE t")
@@ -236,12 +183,13 @@ async fn serial_column_creates_sequence_default_and_updates_currval() {
         .await
         .expect_err("owned serial sequence dropped with table");
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test]
 async fn generated_always_identity_uses_sequence_and_rejects_explicit_values() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("sequence_test").await;
+    let client = &running.client;
 
     client
         .batch_execute(
@@ -272,12 +220,13 @@ async fn generated_always_identity_uses_sequence_and_rejects_explicit_values() {
         .expect_err("GENERATED ALWAYS rejects explicit identity value");
     assert_eq!(err.code().expect("SQLSTATE").code(), "428C9");
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test]
 async fn generated_by_default_identity_allows_explicit_values() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("sequence_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT GENERATED BY DEFAULT AS IDENTITY, v INT)")
@@ -302,7 +251,7 @@ async fn generated_by_default_identity_allows_explicit_values() {
     assert_eq!(rows[1].get::<_, i32>(0), 1);
     assert_eq!(rows[1].get::<_, i32>(1), 20);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
