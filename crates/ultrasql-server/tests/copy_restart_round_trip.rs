@@ -3,15 +3,15 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use arrow_array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use bytes::Bytes;
 use futures::SinkExt;
 use parquet::arrow::ArrowWriter;
+use tokio::sync::oneshot;
 use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener};
+use ultrasql_server::{Server, bind_listener, serve_listener_with_shutdown};
 
 fn sql_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -54,17 +54,21 @@ fn write_copy_parquet(path: &Path, rows: &[(i64, &str, f64, bool)]) {
     writer.close().expect("close parquet writer");
 }
 
-async fn start_persistent_server(
-    data_dir: &Path,
-) -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
+struct RunningServer {
+    client: tokio_postgres::Client,
+    conn_handle: tokio::task::JoinHandle<()>,
+    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+    shutdown_tx: oneshot::Sender<()>,
+}
+
+async fn start_persistent_server(data_dir: &Path) -> RunningServer {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
     let server = Arc::new(Server::init(data_dir).expect("persistent server init"));
-    let server_handle = tokio::spawn(serve_listener(listener, server));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_handle = tokio::spawn(serve_listener_with_shutdown(listener, server, async move {
+        let _ = shutdown_rx.await;
+    }));
 
     let conn_str = format!(
         "host={host} port={port} user=tester application_name=copy_restart_test",
@@ -79,16 +83,23 @@ async fn start_persistent_server(
             eprintln!("connection error: {e}");
         }
     });
-    (client, conn_handle, server_handle)
+    RunningServer {
+        client,
+        conn_handle,
+        server_handle,
+        shutdown_tx,
+    }
 }
 
-async fn shutdown(
-    client: tokio_postgres::Client,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
+async fn shutdown(running: RunningServer) {
+    drop(running.client);
+    running.conn_handle.await.expect("connection task joins");
+    let _ = running.shutdown_tx.send(());
+    running
+        .server_handle
+        .await
+        .expect("server task joins")
+        .expect("listener exits cleanly");
 }
 
 async fn select_count(client: &tokio_postgres::Client, table: &str) -> i64 {
@@ -123,24 +134,25 @@ async fn copy_in_payload(client: &tokio_postgres::Client, sql: &str, payload: &[
 async fn copy_from_stdin_rows_survive_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let (client, _conn_handle, server_handle) = start_persistent_server(data_dir.path()).await;
-    client
+    let running = start_persistent_server(data_dir.path()).await;
+    running
+        .client
         .simple_query("CREATE TABLE copy_restart (id INT, label TEXT)")
         .await
         .expect("create table");
     let copied = copy_in_payload(
-        &client,
+        &running.client,
         "COPY copy_restart (id, label) FROM STDIN WITH (FORMAT csv)",
         b"1,alpha\n2,bravo\n",
     )
     .await;
     assert_eq!(copied, 2);
-    assert_eq!(select_count(&client, "copy_restart").await, 2);
-    shutdown(client, server_handle).await;
+    assert_eq!(select_count(&running.client, "copy_restart").await, 2);
+    shutdown(running).await;
 
-    let (client, _conn_handle, server_handle) = start_persistent_server(data_dir.path()).await;
-    assert_eq!(select_count(&client, "copy_restart").await, 2);
-    shutdown(client, server_handle).await;
+    let running = start_persistent_server(data_dir.path()).await;
+    assert_eq!(select_count(&running.client, "copy_restart").await, 2);
+    shutdown(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -153,8 +165,9 @@ async fn copy_from_parquet_rows_survive_restart() {
         &[(10, "alpha", 1.5, true), (20, "bravo", 2.5, false)],
     );
 
-    let (client, _conn_handle, server_handle) = start_persistent_server(data_dir.path()).await;
-    client
+    let running = start_persistent_server(data_dir.path()).await;
+    running
+        .client
         .simple_query(
             "CREATE TABLE parquet_restart (
                 id BIGINT,
@@ -165,17 +178,18 @@ async fn copy_from_parquet_rows_survive_restart() {
         )
         .await
         .expect("create parquet restart table");
-    client
+    running
+        .client
         .simple_query(&format!(
             "COPY parquet_restart FROM {}",
             sql_string(parquet_path.to_str().expect("utf8 parquet path"))
         ))
         .await
         .expect("copy parquet import");
-    assert_eq!(select_count(&client, "parquet_restart").await, 2);
-    shutdown(client, server_handle).await;
+    assert_eq!(select_count(&running.client, "parquet_restart").await, 2);
+    shutdown(running).await;
 
-    let (client, _conn_handle, server_handle) = start_persistent_server(data_dir.path()).await;
-    assert_eq!(select_count(&client, "parquet_restart").await, 2);
-    shutdown(client, server_handle).await;
+    let running = start_persistent_server(data_dir.path()).await;
+    assert_eq!(select_count(&running.client, "parquet_restart").await, 2);
+    shutdown(running).await;
 }
