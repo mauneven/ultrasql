@@ -1727,7 +1727,9 @@ behavior are implemented and validated.
 - [x] `pg_ctl` equivalent: `initdb`, `start`, `stop`, `reload`, `status`, `promote` — `ultrasql --ctl ...`; start/stop delegate to service manager instead of daemonizing
 - [x] `pg_isready` equivalent — `ultrasql --isready`
 - [ ] `pgbench` compatible baseline (default TPC-B transactions) — local `tpcb_32conn` kernel stage gate + `benchmarks/tpcb_certify.sh`; same-host PostgreSQL 17 reduced smoke now runs through Docker, but full target remains open
-- [ ] `pg_waldump` equivalent (WAL inspection CLI) — `ultrasql --waldump PATH` emits deterministic offset/hex dump; semantic WAL record decoding pending
+- [x] `pg_waldump` equivalent (WAL inspection CLI) — `ultrasql --waldump PATH`
+  emits deterministic typed record summaries with semantic payload decoding
+  plus raw offset/hex output for byte-level inspection.
 
 ### Milestone
 - [x] First documented operations runbook — `OPERATIONS.md`

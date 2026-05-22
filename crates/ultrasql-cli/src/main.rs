@@ -1197,6 +1197,11 @@ fn run_waldump(path: &PathBuf) -> Result<()> {
         fs::read(path).with_context(|| format!("cannot read WAL file: {}", path.display()))?;
     println!("file: {}", path.display());
     println!("bytes: {}", bytes.len());
+    println!("records:");
+    for line in waldump_record_lines(&bytes) {
+        println!("{line}");
+    }
+    println!("hex:");
     for (offset, chunk) in bytes.chunks(32).enumerate() {
         let absolute = offset * 32;
         let hex = chunk
@@ -1207,6 +1212,85 @@ fn run_waldump(path: &PathBuf) -> Result<()> {
         println!("{absolute:08x}: {hex}");
     }
     Ok(())
+}
+
+fn waldump_record_lines(bytes: &[u8]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        match ultrasql_wal::WalRecord::decode(&bytes[offset..]) {
+            Ok((record, used)) => {
+                let decoded = decode_wal_payload(&record);
+                lines.push(format!(
+                    "{offset:08x}: type={:?} xid={:?} prev_lsn={:?} flags={} len={} payload_len={} {decoded}",
+                    record.header.record_type,
+                    record.header.xid,
+                    record.header.prev_lsn,
+                    record.header.flags,
+                    record.header.total_length,
+                    record.payload.len()
+                ));
+                offset = offset.saturating_add(used);
+            }
+            Err(err) => {
+                lines.push(format!("{offset:08x}: record_error={err}"));
+                break;
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push("00000000: empty".to_string());
+    }
+    lines
+}
+
+fn decode_wal_payload(record: &ultrasql_wal::WalRecord) -> String {
+    use ultrasql_wal::RecordType;
+
+    match record.header.record_type {
+        RecordType::HeapInsert => {
+            format_decoded(ultrasql_wal::HeapInsertPayload::decode(&record.payload))
+        }
+        RecordType::HeapUpdate => {
+            format_decoded(ultrasql_wal::HeapUpdatePayload::decode(&record.payload))
+        }
+        RecordType::HeapDelete => {
+            format_decoded(ultrasql_wal::HeapDeletePayload::decode(&record.payload))
+        }
+        RecordType::FullPageWrite => {
+            format_decoded(ultrasql_wal::FullPageWritePayload::decode(&record.payload))
+        }
+        RecordType::Commit => format_decoded(ultrasql_wal::CommitPayload::decode(&record.payload)),
+        RecordType::Abort => format_decoded(ultrasql_wal::AbortPayload::decode(&record.payload)),
+        RecordType::Checkpoint => {
+            format_decoded(ultrasql_wal::CheckpointPayload::decode(&record.payload))
+        }
+        RecordType::BTreeOp => {
+            format_decoded(ultrasql_wal::BTreeOpPayload::decode(&record.payload))
+        }
+        RecordType::HeapUpdateInPlace => format_decoded(
+            ultrasql_wal::HeapUpdateInPlacePayload::decode(&record.payload),
+        ),
+        RecordType::HeapDeleteInPlace => format_decoded(
+            ultrasql_wal::HeapDeleteInPlacePayload::decode(&record.payload),
+        ),
+        RecordType::SequenceOp => {
+            format_decoded(ultrasql_wal::SequenceOpPayload::decode(&record.payload))
+        }
+        RecordType::HashOp => format_decoded(ultrasql_wal::HashOpPayload::decode(&record.payload)),
+        RecordType::HnswOp => format_decoded(ultrasql_wal::HnswOpPayload::decode(&record.payload)),
+        RecordType::IvfFlatOp => {
+            format_decoded(ultrasql_wal::IvfFlatOpPayload::decode(&record.payload))
+        }
+        RecordType::Nop => "decoded=Nop".to_string(),
+    }
+}
+
+fn format_decoded<T: std::fmt::Debug>(decoded: Result<T, ultrasql_wal::PayloadError>) -> String {
+    match decoded {
+        Ok(payload) => format!("decoded={payload:?}"),
+        Err(err) => format!("payload_error={err}"),
+    }
 }
 
 fn run_basebackup(data_dir: &PathBuf, dest: &PathBuf) -> Result<()> {
@@ -1730,6 +1814,36 @@ mod tests {
         // Each column: width + 2 spaces + border
         // "+-----+-------+"
         assert_eq!(sep, "+-----+-------+");
+    }
+
+    #[test]
+    fn waldump_decodes_heap_insert_payload() {
+        use ultrasql_core::{BlockNumber, Lsn, PageId, RelationId, TupleId, Xid};
+        use ultrasql_wal::{HeapInsertPayload, RecordType, WalRecord};
+
+        let tid = TupleId::new(PageId::new(RelationId::new(7), BlockNumber::new(3)), 2);
+        let payload = HeapInsertPayload {
+            tid,
+            tuple_bytes: vec![1, 2, 3],
+        }
+        .encode()
+        .expect("heap insert payload encodes");
+        let record = WalRecord::new(RecordType::HeapInsert, Xid::new(42), Lsn::ZERO, 0, payload);
+
+        let lines = waldump_record_lines(&record.encode());
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("type=HeapInsert"));
+        assert!(lines[0].contains("decoded=HeapInsertPayload"));
+        assert!(lines[0].contains("tuple_bytes: [1, 2, 3]"));
+    }
+
+    #[test]
+    fn waldump_reports_malformed_tail() {
+        let lines = waldump_record_lines(&[0, 1, 2]);
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("record_error="));
     }
 
     // --- pgpass lookup with missing file ---
