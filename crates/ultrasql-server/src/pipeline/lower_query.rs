@@ -865,6 +865,7 @@ pub(super) fn lower_cte(
         workload_recorder: Arc::clone(&ctx.workload_recorder),
         autovacuum_config: ctx.autovacuum_config,
         logging_config: ctx.logging_config,
+        wal_archive_config: ctx.wal_archive_config.clone(),
         data_dir: ctx.data_dir.clone(),
         logical_replication: Arc::clone(&ctx.logical_replication),
         sequence_state: ctx.sequence_state.clone(),

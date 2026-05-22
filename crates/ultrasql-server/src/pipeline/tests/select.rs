@@ -487,6 +487,7 @@ impl IndexFixture {
             workload_recorder: StdArc::new(crate::workload::WorkloadRecorder::new()),
             autovacuum_config: crate::AutovacuumConfig::default(),
             logging_config: crate::LoggingConfig::default(),
+            wal_archive_config: crate::WalArchiveConfig::default(),
             data_dir: None,
             logical_replication: Arc::new(crate::replication::LogicalReplicationRuntime::new()),
             sequence_state: None,

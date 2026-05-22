@@ -1091,6 +1091,7 @@ where
             workload_recorder: Arc::clone(&self.state.workload_recorder),
             autovacuum_config: self.state.autovacuum_config(),
             logging_config: self.state.logging_config(),
+            wal_archive_config: self.state.wal_archive_config(),
             data_dir: self.state.data_dir.clone(),
             logical_replication: Arc::clone(&self.state.logical_replication),
             sequence_state: Some(self.sequence_state.clone()),
