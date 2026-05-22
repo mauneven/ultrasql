@@ -138,6 +138,8 @@ fn ci_split_matches_release_policy() {
     assert!(bench.contains("benchmarks/certify.sh full"));
     assert!(fuzz.contains("-max_total_time=900"));
     assert!(sanitizers.contains("cargo +nightly test --workspace -Zbuild-std"));
+    assert!(sanitizers.contains("cargo +nightly test \\"));
+    assert!(sanitizers.contains("-p ultrasql-executor"));
     assert!(sanitizers.contains("cargo +nightly miri setup"));
     assert!(sanitizers.contains("cargo +nightly miri test"));
     assert!(docs.contains("PR gate"));

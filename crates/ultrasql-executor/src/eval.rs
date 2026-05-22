@@ -310,9 +310,7 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
             .unwrap_or(Value::Null)),
         "case_searched" => eval_case_searched(args),
         "case_simple" => eval_case_simple(args),
-        other => Err(EvalError::Unsupported(Box::leak(
-            format!("function `{other}` not implemented").into_boxed_str(),
-        ))),
+        _other => Err(EvalError::Unsupported("function not implemented")),
     }
 }
 
