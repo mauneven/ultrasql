@@ -1694,7 +1694,9 @@ behavior are implemented and validated.
   the PostgreSQL-compatible view shape; fsync latency remains available
   through ops metrics.
 - [ ] `pg_stat_progress_analyze`, `pg_stat_progress_create_index` — empty compatibility views exist
-- [ ] Prometheus `/metrics` HTTP endpoint — process/build metrics exposed via `--ops-listen`; live query/WAL/buffer counters pending
+- [x] Prometheus `/metrics` HTTP endpoint — `--ops-listen` exposes
+  process/build metadata plus live buffer-pool, WAL fsync, WAL append,
+  object-store, ANN, and query-latency counters.
 - [x] OpenTelemetry tracing with spans per query and per operator — server
   emits structured `tracing` spans around SQL statements and logical operator
   execution; exporter wiring is deployment configuration.

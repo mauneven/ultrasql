@@ -305,6 +305,11 @@ async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr, state: A
 
 fn metrics_body(state: &Server) -> String {
     let buffer = state.heap.buffer_pool().stats();
+    let wal_sink = state
+        .heap
+        .wal_sink()
+        .map(|sink| sink.stats())
+        .unwrap_or_default();
     let wal = state.wal_writer_stats().unwrap_or_default();
     let object = ultrasql_objectstore::object_range_cache_metrics();
     let ann = state.ann_system_metrics();
@@ -382,6 +387,18 @@ fn metrics_body(state: &Server) -> String {
         "ultrasql_wal_fsync_latency_us_last",
         wal.fsync_last_us,
     );
+    body.push_str(
+        "# HELP ultrasql_wal_records_total WAL records appended.\n\
+         # TYPE ultrasql_wal_records_total counter\n",
+    );
+    push_metric(
+        &mut body,
+        "ultrasql_wal_records_total",
+        wal_sink.wal_records,
+    );
+    push_metric(&mut body, "ultrasql_wal_fpi_total", wal_sink.wal_fpi);
+    push_metric(&mut body, "ultrasql_wal_bytes_total", wal_sink.wal_bytes);
+    push_metric(&mut body, "ultrasql_wal_write_total", wal_sink.wal_write);
 
     body.push_str(
         "# HELP ultrasql_object_store_remote_bytes_total Object-store bytes fetched remotely.\n\
@@ -468,6 +485,8 @@ mod tests {
             "ultrasql_buffer_pool_misses_total",
             "ultrasql_wal_fsync_latency_us_count",
             "ultrasql_wal_fsync_latency_us_sum",
+            "ultrasql_wal_records_total",
+            "ultrasql_wal_bytes_total",
             "ultrasql_object_store_remote_bytes_total",
             "ultrasql_ann_candidates",
             "ultrasql_vector_index_memory_bytes",
