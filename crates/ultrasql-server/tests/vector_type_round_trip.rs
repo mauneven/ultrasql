@@ -10,6 +10,10 @@ use tokio_postgres::{NoTls, SimpleQueryMessage, types::Type};
 use ultrasql_server::{Server, bind_listener, serve_listener};
 use ultrasql_wal::{RecordType, WalRecord};
 
+mod support;
+
+use support::{shutdown as graceful_shutdown, start_persistent_server};
+
 async fn start_server_and_connect() -> (
     tokio_postgres::Client,
     tokio::task::JoinHandle<()>,
@@ -18,15 +22,17 @@ async fn start_server_and_connect() -> (
     start_server_and_connect_to(Arc::new(Server::with_sample_database())).await
 }
 
-async fn start_persistent_server_and_connect(
+async fn start_crash_persistent_server_and_connect(
     data_dir: &Path,
 ) -> (
     tokio_postgres::Client,
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
 ) {
-    let server = Arc::new(Server::init(data_dir).expect("persistent server init"));
-    start_server_and_connect_to(server).await
+    start_server_and_connect_to(Arc::new(
+        Server::init(data_dir).expect("persistent server init"),
+    ))
+    .await
 }
 
 async fn start_server_and_connect_to(
@@ -91,7 +97,7 @@ fn sorted_wal_segments(data_dir: &Path) -> Vec<PathBuf> {
     segments
 }
 
-fn truncate_wal_after_first(data_dir: &Path, record_type: RecordType) {
+fn truncate_wal_before_first(data_dir: &Path, record_type: RecordType) {
     let segments = sorted_wal_segments(data_dir);
     for (segment_idx, segment) in segments.iter().enumerate() {
         let bytes =
@@ -101,13 +107,18 @@ fn truncate_wal_after_first(data_dir: &Path, record_type: RecordType) {
             let (record, used) = WalRecord::decode(&bytes[offset..])
                 .unwrap_or_else(|e| panic!("decode WAL segment {segment:?} at {offset}: {e}"));
             if record.header.record_type == record_type {
-                let keep_len = u64::try_from(offset + used).expect("WAL offset fits u64");
-                let file = fs::OpenOptions::new()
-                    .write(true)
-                    .open(segment)
-                    .unwrap_or_else(|e| panic!("open WAL segment {segment:?}: {e}"));
-                file.set_len(keep_len)
-                    .unwrap_or_else(|e| panic!("truncate WAL segment {segment:?}: {e}"));
+                let keep_len = u64::try_from(offset).expect("WAL offset fits u64");
+                if keep_len == 0 {
+                    fs::remove_file(segment)
+                        .unwrap_or_else(|e| panic!("remove WAL segment {segment:?}: {e}"));
+                } else {
+                    let file = fs::OpenOptions::new()
+                        .write(true)
+                        .open(segment)
+                        .unwrap_or_else(|e| panic!("open WAL segment {segment:?}: {e}"));
+                    file.set_len(keep_len)
+                        .unwrap_or_else(|e| panic!("truncate WAL segment {segment:?}: {e}"));
+                }
                 for later in segments.iter().skip(segment_idx + 1) {
                     fs::remove_file(later)
                         .unwrap_or_else(|e| panic!("remove later WAL segment {later:?}: {e}"));
@@ -650,7 +661,8 @@ async fn hnsw_page_backed_index_survives_sql_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         client
             .batch_execute("CREATE TABLE ann_restart (id INT NOT NULL, embedding VECTOR(3))")
             .await
@@ -672,11 +684,12 @@ async fn hnsw_page_backed_index_survives_sql_restart() {
             )
             .await
             .expect("create hnsw index");
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         let messages = client
             .simple_query(
                 "SELECT id FROM ann_restart \
@@ -711,7 +724,7 @@ async fn hnsw_page_backed_index_survives_sql_restart() {
             "EXPLAIN ANALYZE must report page-backed HNSW after restart, got: {text}"
         );
 
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 }
 
@@ -720,7 +733,8 @@ async fn hnsw_crash_during_index_build_uses_exact_scan_after_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         client
             .batch_execute("CREATE TABLE ann_hnsw_crash (id INT NOT NULL, embedding VECTOR(3))")
             .await
@@ -735,6 +749,12 @@ async fn hnsw_crash_during_index_build_uses_exact_scan_after_restart() {
             )
             .await
             .expect("insert vectors");
+        graceful_shutdown(running).await;
+    }
+
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
         client
             .batch_execute(
                 "CREATE INDEX ann_hnsw_crash_embedding_idx \
@@ -745,10 +765,11 @@ async fn hnsw_crash_during_index_build_uses_exact_scan_after_restart() {
         shutdown(client, server_handle).await;
     }
 
-    truncate_wal_after_first(dir.path(), RecordType::HnswOp);
+    truncate_wal_before_first(dir.path(), RecordType::HnswOp);
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         let messages = client
             .simple_query(
                 "SELECT id FROM ann_hnsw_crash \
@@ -784,7 +805,7 @@ async fn hnsw_crash_during_index_build_uses_exact_scan_after_restart() {
             "partial HNSW build must be ignored after restart, got: {text}"
         );
 
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 }
 
@@ -793,7 +814,8 @@ async fn hnsw_corrupt_index_wal_marks_index_unavailable_after_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         client
             .batch_execute("CREATE TABLE ann_hnsw_corrupt (id INT NOT NULL, embedding VECTOR(3))")
             .await
@@ -815,13 +837,14 @@ async fn hnsw_corrupt_index_wal_marks_index_unavailable_after_restart() {
             )
             .await
             .expect("create hnsw index");
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 
     corrupt_first_vector_wal_payload(dir.path(), RecordType::HnswOp);
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         let messages = client
             .simple_query(
                 "SELECT id FROM ann_hnsw_corrupt \
@@ -857,7 +880,7 @@ async fn hnsw_corrupt_index_wal_marks_index_unavailable_after_restart() {
             "corrupt HNSW WAL must mark index unavailable, got: {text}"
         );
 
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 }
 
@@ -925,7 +948,8 @@ async fn ivfflat_page_backed_index_survives_sql_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         client
             .batch_execute("CREATE TABLE ann_ivf_restart (id INT NOT NULL, embedding VECTOR(2))")
             .await
@@ -956,11 +980,12 @@ async fn ivfflat_page_backed_index_survives_sql_restart() {
             .batch_execute("DELETE FROM ann_ivf_restart WHERE id = 1")
             .await
             .expect("delete post-index vector");
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         let messages = client
             .simple_query(
                 "SELECT id FROM ann_ivf_restart \
@@ -997,7 +1022,7 @@ async fn ivfflat_page_backed_index_survives_sql_restart() {
             "EXPLAIN ANALYZE must report page-backed IVFFlat after restart, got: {text}"
         );
 
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 }
 
@@ -1418,7 +1443,8 @@ async fn ivfflat_crash_during_index_build_uses_exact_scan_after_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         client
             .batch_execute("CREATE TABLE ann_ivf_crash (id INT NOT NULL, embedding VECTOR(2))")
             .await
@@ -1433,6 +1459,12 @@ async fn ivfflat_crash_during_index_build_uses_exact_scan_after_restart() {
             )
             .await
             .expect("insert vectors");
+        graceful_shutdown(running).await;
+    }
+
+    {
+        let (client, _conn, server_handle) =
+            start_crash_persistent_server_and_connect(dir.path()).await;
         client
             .batch_execute(
                 "CREATE INDEX ann_ivf_crash_embedding_idx \
@@ -1444,10 +1476,11 @@ async fn ivfflat_crash_during_index_build_uses_exact_scan_after_restart() {
         shutdown(client, server_handle).await;
     }
 
-    truncate_wal_after_first(dir.path(), RecordType::IvfFlatOp);
+    truncate_wal_before_first(dir.path(), RecordType::IvfFlatOp);
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         let messages = client
             .simple_query(
                 "SELECT id FROM ann_ivf_crash \
@@ -1483,7 +1516,7 @@ async fn ivfflat_crash_during_index_build_uses_exact_scan_after_restart() {
             "partial IVFFlat build must be ignored after restart, got: {text}"
         );
 
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 }
 
@@ -1492,7 +1525,8 @@ async fn ivfflat_corrupt_index_wal_marks_index_unavailable_after_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         client
             .batch_execute("CREATE TABLE ann_ivf_corrupt (id INT NOT NULL, embedding VECTOR(2))")
             .await
@@ -1515,13 +1549,14 @@ async fn ivfflat_corrupt_index_wal_marks_index_unavailable_after_restart() {
             )
             .await
             .expect("create ivfflat index");
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 
     corrupt_first_vector_wal_payload(dir.path(), RecordType::IvfFlatOp);
 
     {
-        let (client, _conn, server_handle) = start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "vector_type_test").await;
+        let client = &running.client;
         let messages = client
             .simple_query(
                 "SELECT id FROM ann_ivf_corrupt \
@@ -1557,7 +1592,7 @@ async fn ivfflat_corrupt_index_wal_marks_index_unavailable_after_restart() {
             "corrupt IVFFlat WAL must mark index unavailable, got: {text}"
         );
 
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 }
 

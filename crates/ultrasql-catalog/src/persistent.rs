@@ -743,41 +743,52 @@ impl PersistentCatalog {
 
         let mut loaded_indexes: u32 = 0;
         for class_row in user_index_classes {
-            let index_row = index_rows_by_oid.get(&class_row.oid).ok_or_else(|| {
-                CatalogError::schema_conflict(format!(
-                    "pg_class index '{}' oid {} has no pg_index row",
-                    class_row.relname,
-                    class_row.oid.raw()
-                ))
-            })?;
+            let Some(index_row) = index_rows_by_oid.get(&class_row.oid) else {
+                tracing::warn!(
+                    index = %class_row.relname,
+                    oid = class_row.oid.raw(),
+                    "skipping orphaned pg_class index row without pg_index metadata"
+                );
+                continue;
+            };
             if !index_row.indisvalid {
                 continue;
             }
             if usize::from(index_row.indnatts) != index_row.indkey.len() {
-                return Err(CatalogError::schema_conflict(format!(
-                    "pg_index row {} indnatts {} does not match indkey length {}",
-                    index_row.indexrelid.raw(),
-                    index_row.indnatts,
-                    index_row.indkey.len()
-                )));
+                tracing::warn!(
+                    index_oid = index_row.indexrelid.raw(),
+                    indnatts = index_row.indnatts,
+                    indkey_len = index_row.indkey.len(),
+                    "skipping malformed pg_index row with mismatched key count"
+                );
+                continue;
             }
             if !tables_by_oid.contains_key(&index_row.indrelid) {
-                return Err(CatalogError::schema_conflict(format!(
-                    "pg_index row {} references unknown table oid {}",
-                    index_row.indexrelid.raw(),
-                    index_row.indrelid.raw()
-                )));
+                tracing::warn!(
+                    index_oid = index_row.indexrelid.raw(),
+                    table_oid = index_row.indrelid.raw(),
+                    "skipping pg_index row referencing unknown table"
+                );
+                continue;
             }
             let mut columns = Vec::with_capacity(index_row.indkey.len());
+            let mut invalid_column = None;
             for &attnum in &index_row.indkey {
-                let column = u16::try_from(attnum).map_err(|_| {
-                    CatalogError::schema_conflict(format!(
-                        "pg_index row {} has negative column position {}",
-                        index_row.indexrelid.raw(),
-                        attnum
-                    ))
-                })?;
-                columns.push(column);
+                match u16::try_from(attnum) {
+                    Ok(column) => columns.push(column),
+                    Err(_) => {
+                        invalid_column = Some(attnum);
+                        break;
+                    }
+                }
+            }
+            if let Some(attnum) = invalid_column {
+                tracing::warn!(
+                    index_oid = index_row.indexrelid.raw(),
+                    attnum,
+                    "skipping pg_index row with invalid column position"
+                );
+                continue;
             }
             let mut entry = IndexEntry::new(
                 class_row.oid,
