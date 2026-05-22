@@ -314,6 +314,28 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
         "autovacuum_vacuum_threshold"
     );
     assert_eq!(autovacuum_settings[1].get::<_, String>(1), "50");
+    let logging_settings = client
+        .query(
+            "SELECT name, setting \
+             FROM pg_catalog.pg_settings \
+             WHERE name IN ('log_connections', 'log_min_duration_statement', 'log_statement') \
+             ORDER BY name",
+            &[],
+        )
+        .await
+        .expect("pg_settings logging query");
+    let logging_pairs: Vec<(String, String)> = logging_settings
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        logging_pairs,
+        vec![
+            ("log_connections".to_owned(), "off".to_owned()),
+            ("log_min_duration_statement".to_owned(), "-1".to_owned()),
+            ("log_statement".to_owned(), "none".to_owned()),
+        ]
+    );
 
     client
         .batch_execute("CREATE TABLE stat_t (id INT)")

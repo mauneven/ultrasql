@@ -165,6 +165,23 @@ where
                 }
             }
         }
+        if self.state.logging_config.log_connections {
+            let user = params
+                .iter()
+                .find(|(key, _)| key == "user")
+                .map_or("", |(_, value)| value.as_str());
+            let database = params
+                .iter()
+                .find(|(key, _)| key == "database")
+                .map_or("", |(_, value)| value.as_str());
+            info!(
+                target: "ultrasqld",
+                pid = self.pid,
+                user,
+                database,
+                "connection authorized"
+            );
+        }
         self.send(&BackendMessage::AuthenticationOk).await?;
         // Send the full set of `ParameterStatus` messages that
         // PostgreSQL emits at startup. Several PostgreSQL drivers

@@ -1875,6 +1875,8 @@ impl LogStatementMode {
 /// Runtime statement logging configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoggingConfig {
+    /// Log each successful connection after authentication.
+    pub log_connections: bool,
     /// `log_min_duration_statement` in milliseconds; `-1` disables duration
     /// logging, matching PostgreSQL's user-facing convention.
     pub log_min_duration_statement_ms: i64,
@@ -1885,6 +1887,7 @@ pub struct LoggingConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
+            log_connections: false,
             log_min_duration_statement_ms: -1,
             log_statement: LogStatementMode::None,
         }

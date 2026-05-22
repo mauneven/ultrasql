@@ -1914,7 +1914,7 @@ same host.
 - [ ] Role inheritance + `SET ROLE`
 - [ ] Default privileges (`ALTER DEFAULT PRIVILEGES`)
 - [ ] Row-level security: role/owner/bypass/restart semantics (tenant command-specific + permissive/restrictive policy slice done)
-- [ ] `log_connections`, `log_min_duration_statement`, `log_statement`
+- [x] `log_connections`, `log_min_duration_statement`, `log_statement`
 
 ### ORM Compatibility
 - [ ] SQLAlchemy (Python) — full dialect support

@@ -65,6 +65,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
 
+    /// Log each successful connection after authentication.
+    #[arg(long, default_value_t = false)]
+    log_connections: bool,
+
     /// Minimum statement duration to log in milliseconds; -1 disables.
     #[arg(long, default_value_t = -1)]
     log_min_duration_statement_ms: i64,
@@ -274,6 +278,7 @@ fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String> {
         return Err("log_min_duration_statement_ms must be -1 or greater".to_string());
     }
     Ok(LoggingConfig {
+        log_connections: cli.log_connections,
         log_min_duration_statement_ms: cli.log_min_duration_statement_ms,
         log_statement: cli.log_statement.into(),
     })
@@ -562,6 +567,7 @@ mod tests {
             ops_listen: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
+            log_connections: false,
             log_min_duration_statement_ms: -1,
             log_statement: CliLogStatementMode::None,
             autovacuum_interval_ms: 1000,
@@ -587,6 +593,7 @@ mod tests {
             ops_listen: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
+            log_connections: false,
             log_min_duration_statement_ms: -1,
             log_statement: CliLogStatementMode::None,
             autovacuum_interval_ms: 1000,
@@ -607,6 +614,7 @@ mod tests {
             ops_listen: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
+            log_connections: false,
             log_min_duration_statement_ms: -2,
             log_statement: CliLogStatementMode::Mod,
             autovacuum_interval_ms: 1000,
@@ -627,6 +635,7 @@ mod tests {
             ops_listen: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Json,
+            log_connections: true,
             log_min_duration_statement_ms: 25,
             log_statement: CliLogStatementMode::All,
             autovacuum_interval_ms: 1000,
@@ -638,6 +647,7 @@ mod tests {
 
         let config = logging_config_from_cli(&cli).expect("valid logging config");
 
+        assert!(config.log_connections);
         assert_eq!(config.log_min_duration_statement_ms, 25);
         assert_eq!(config.log_statement, LogStatementMode::All);
     }

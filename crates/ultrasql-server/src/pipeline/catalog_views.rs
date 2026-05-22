@@ -1219,6 +1219,19 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             v_text("postmaster"),
         ],
         vec![
+            v_text("log_connections"),
+            v_text(if ctx.logging_config.log_connections {
+                "on"
+            } else {
+                "off"
+            }),
+            Value::Null,
+            v_text("Reporting and Logging / What to Log"),
+            v_text("Logs each successful connection."),
+            v_text("bool"),
+            v_text("sighup"),
+        ],
+        vec![
             v_text("log_min_duration_statement"),
             v_text(ctx.logging_config.log_min_duration_statement_ms.to_string()),
             v_text("ms"),
