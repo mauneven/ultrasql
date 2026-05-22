@@ -6,6 +6,7 @@
 
 use ultrasql_core::{DataType, Field, Oid, Schema, Value};
 use ultrasql_executor::{MemTableScan, Operator, build_batch};
+use ultrasql_mvcc::{Visibility, XidStatusOracle, is_visible};
 use ultrasql_planner::LogicalReferentialAction;
 
 use crate::error::ServerError;
@@ -1330,14 +1331,15 @@ fn rows_pg_stat_user_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             entry.schema_name != "pg_catalog" && entry.schema_name != "information_schema"
         })
         .map(|entry| {
+            let (live_tuples, dead_tuples) = table_tuple_counts(ctx, &entry);
             vec![
                 v_i64(entry.oid.raw()),
                 v_text(entry.schema_name),
                 v_text(entry.name),
                 Value::Int64(0),
                 Value::Int64(0),
-                Value::Int64(0),
-                Value::Int64(0),
+                Value::Int64(live_tuples),
+                Value::Int64(dead_tuples),
                 Value::Null,
                 Value::Null,
                 Value::Null,
@@ -1345,6 +1347,42 @@ fn rows_pg_stat_user_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             ]
         })
         .collect()
+}
+
+fn table_tuple_counts(ctx: &LowerCtx<'_>, entry: &ultrasql_catalog::TableEntry) -> (i64, i64) {
+    let rel = ultrasql_core::RelationId(entry.oid);
+    let block_count = ctx.heap.block_count(rel).max(entry.n_blocks);
+    if block_count == 0 {
+        return (0, 0);
+    }
+
+    let oldest = ctx.oracle.oldest_in_progress();
+    let mut live = 0_u64;
+    let mut dead = 0_u64;
+    for tuple in ctx.heap.scan(rel, block_count) {
+        let tuple = match tuple {
+            Ok(tuple) => tuple,
+            Err(err) => {
+                tracing::warn!(
+                    table = %entry.name,
+                    error = %err,
+                    "pg_stat_user_tables tuple-count scan failed",
+                );
+                return (0, 0);
+            }
+        };
+        if matches!(
+            is_visible(&tuple.header, &ctx.snapshot, ctx.oracle.as_ref()),
+            Visibility::Visible | Visibility::VisiblePreImage
+        ) {
+            live = live.saturating_add(1);
+        }
+        let xmax = tuple.header.xmax;
+        if !xmax.is_invalid() && xmax < oldest && ctx.oracle.is_committed(xmax) {
+            dead = dead.saturating_add(1);
+        }
+    }
+    (u64_to_i64_saturating(live), u64_to_i64_saturating(dead))
 }
 
 fn schema_pg_stat_user_indexes() -> Schema {

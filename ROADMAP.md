@@ -1666,7 +1666,9 @@ behavior are implemented and validated.
 - [ ] `pg_stat_subscription` view — compatibility shape exists; live subscription rows pending
 
 ### Observability
-- [ ] `pg_stat_user_tables` — compatibility view shape exists; live counters pending
+- [x] `pg_stat_user_tables` — live/dead tuple counters now scan the
+  same MVCC heap state exposed to user queries; seq/idx scan counters remain
+  part of the broader statistics-counter slice.
 - [ ] `pg_stat_user_indexes` — compatibility view shape exists; live counters pending
 - [ ] `pg_statio_user_tables` — compatibility view shape exists; live counters pending
 - [ ] `pg_stat_database` — compatibility view shape exists; live counters pending

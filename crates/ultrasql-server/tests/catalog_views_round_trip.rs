@@ -294,6 +294,47 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
     assert_eq!(settings.len(), 1);
     assert_eq!(settings[0].get::<_, String>(0), "UTF8");
 
+    client
+        .batch_execute("CREATE TABLE stat_t (id INT)")
+        .await
+        .expect("create stats table");
+    client
+        .batch_execute("INSERT INTO stat_t VALUES (1), (2), (3)")
+        .await
+        .expect("insert stats rows");
+    client
+        .batch_execute("DELETE FROM stat_t WHERE id = 2")
+        .await
+        .expect("delete stats row");
+    let table_stats = client
+        .query(
+            "SELECT n_live_tup, n_dead_tup \
+             FROM pg_catalog.pg_stat_user_tables \
+             WHERE relname = 'stat_t'",
+            &[],
+        )
+        .await
+        .expect("pg_stat_user_tables tuple counters");
+    assert_eq!(table_stats.len(), 1);
+    assert_eq!(table_stats[0].get::<_, i64>(0), 2);
+    assert_eq!(table_stats[0].get::<_, i64>(1), 1);
+    client
+        .batch_execute("VACUUM stat_t")
+        .await
+        .expect("vacuum stats table");
+    let vacuumed_stats = client
+        .query(
+            "SELECT n_live_tup, n_dead_tup \
+             FROM pg_catalog.pg_stat_user_tables \
+             WHERE relname = 'stat_t'",
+            &[],
+        )
+        .await
+        .expect("pg_stat_user_tables tuple counters after vacuum");
+    assert_eq!(vacuumed_stats.len(), 1);
+    assert_eq!(vacuumed_stats[0].get::<_, i64>(0), 2);
+    assert_eq!(vacuumed_stats[0].get::<_, i64>(1), 0);
+
     let meta_t_oid = server
         .catalog_snapshot()
         .tables
