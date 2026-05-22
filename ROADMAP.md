@@ -1713,12 +1713,13 @@ behavior are implemented and validated.
   commit-gated statement CDC stream exist for published tables; WAL row-image
   decoding, persistent slots, and network streaming pending
 - [ ] `pgoutput` output plugin format — compatibility surface reserved; wire-compatible pgoutput encoder pending
-- [ ] `CREATE PUBLICATION` / `CREATE SUBSCRIPTION` — `CREATE PUBLICATION ... FOR TABLE ...`
+- [x] `CREATE PUBLICATION` / `CREATE SUBSCRIPTION` — `CREATE PUBLICATION ... FOR TABLE ...`
   and `CREATE SUBSCRIPTION ... CONNECTION ... PUBLICATION ...` register
   in-process metadata and expose `pg_publication`,
   `pg_publication_tables`, `pg_subscription`, and
-  `pg_stat_subscription`; persistent metadata and network apply remain
-  pending.
+  `pg_stat_subscription`; WAL-backed servers persist publication and
+  subscription metadata under `pg_logical`, so rows survive restart.
+  Network apply remains a v1.x subscription-worker target.
 - [ ] Row filters and column lists on publications — syntax surface accepted by metadata DDL path; enforcement pending
 - [ ] Initial table data sync — use basebackup/WAL shipping path for physical initial sync; logical per-table copy pending
 - [x] `pg_stat_subscription` view — live in-process subscription metadata

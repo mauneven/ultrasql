@@ -3544,7 +3544,9 @@ impl Server {
             materialized_views: Arc::new(dashmap::DashMap::new()),
             columnar_storage: Arc::new(columnar_storage::ColumnarSecondaryStore::new()),
             time_partitions: Arc::new(dashmap::DashMap::new()),
-            logical_replication: Arc::new(replication::LogicalReplicationRuntime::new()),
+            logical_replication: Arc::new(replication::LogicalReplicationRuntime::open_metadata(
+                data_dir.join("pg_logical"),
+            )?),
             workload_recorder: Arc::new(workload::WorkloadRecorder::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),

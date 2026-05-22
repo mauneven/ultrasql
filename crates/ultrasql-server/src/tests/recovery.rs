@@ -117,6 +117,38 @@ fn server_init_reopens_base_heap_pages_from_data_dir() {
 }
 
 #[test]
+fn server_init_reopens_logical_replication_metadata() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    {
+        let server = Server::init(data_dir.path()).unwrap();
+        server
+            .logical_replication
+            .create_publication("pub_events", vec!["events".to_string()])
+            .unwrap();
+        server
+            .logical_replication
+            .create_subscription(
+                "sub_events",
+                "host=127.0.0.1 port=5433",
+                vec!["pub_events".to_string()],
+                Some("sub_slot".to_string()),
+            )
+            .unwrap();
+    }
+
+    let server = Server::init(data_dir.path()).unwrap();
+    let publication = server
+        .logical_replication
+        .publication("pub_events")
+        .expect("publication survives restart");
+    assert!(publication.publishes_table("events"));
+    let subscriptions = server.logical_replication.subscriptions();
+    assert_eq!(subscriptions.len(), 1);
+    assert_eq!(subscriptions[0].name, "sub_events");
+    assert_eq!(subscriptions[0].slot_name, "sub_slot");
+}
+
+#[test]
 fn recovery_target_lsn_file_parses_postgres_lsn() {
     let data_dir = tempfile::TempDir::new().unwrap();
     fs::write(

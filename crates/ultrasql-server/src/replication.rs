@@ -108,6 +108,7 @@ pub struct LogicalReplicationRuntime {
     subscriptions: dashmap::DashMap<String, Subscription>,
     changes: parking_lot::Mutex<Vec<LogicalChange>>,
     next_lsn: AtomicU64,
+    metadata_dir: Option<PathBuf>,
 }
 
 impl Default for LogicalReplicationRuntime {
@@ -125,7 +126,18 @@ impl LogicalReplicationRuntime {
             subscriptions: dashmap::DashMap::new(),
             changes: parking_lot::Mutex::new(Vec::new()),
             next_lsn: AtomicU64::new(1),
+            metadata_dir: None,
         }
+    }
+
+    /// Open a logical replication metadata store rooted at `metadata_dir`.
+    pub fn open_metadata(metadata_dir: impl Into<PathBuf>) -> Result<Self, ServerError> {
+        let runtime = Self {
+            metadata_dir: Some(metadata_dir.into()),
+            ..Self::new()
+        };
+        runtime.load_metadata()?;
+        Ok(runtime)
     }
 
     /// Register a publication for explicit table names.
@@ -157,6 +169,7 @@ impl LogicalReplicationRuntime {
             name: name.clone(),
             tables,
         };
+        self.persist_publication(&publication)?;
         self.publications.insert(name, publication.clone());
         Ok(publication)
     }
@@ -164,7 +177,12 @@ impl LogicalReplicationRuntime {
     /// Remove a publication, returning whether it existed.
     #[must_use]
     pub fn drop_publication(&self, name: &str) -> bool {
-        self.publications.remove(&fold_identifier(name)).is_some()
+        let name = fold_identifier(name);
+        let removed = self.publications.remove(&name).is_some();
+        if removed {
+            let _ = self.remove_metadata_file("publications", &name);
+        }
+        removed
     }
 
     /// Look up a publication by name.
@@ -234,6 +252,7 @@ impl LogicalReplicationRuntime {
             publications,
             enabled: true,
         };
+        self.persist_subscription(&subscription)?;
         self.subscriptions.insert(name, subscription.clone());
         Ok(subscription)
     }
@@ -241,7 +260,12 @@ impl LogicalReplicationRuntime {
     /// Remove a subscription, returning whether it existed.
     #[must_use]
     pub fn drop_subscription(&self, name: &str) -> bool {
-        self.subscriptions.remove(&fold_identifier(name)).is_some()
+        let name = fold_identifier(name);
+        let removed = self.subscriptions.remove(&name).is_some();
+        if removed {
+            let _ = self.remove_metadata_file("subscriptions", &name);
+        }
+        removed
     }
 
     /// Return subscriptions in deterministic name order.
@@ -298,6 +322,78 @@ impl LogicalReplicationRuntime {
             });
         }
     }
+
+    fn load_metadata(&self) -> Result<(), ServerError> {
+        let Some(root) = &self.metadata_dir else {
+            return Ok(());
+        };
+        fs::create_dir_all(root.join("publications")).map_err(ServerError::Io)?;
+        fs::create_dir_all(root.join("subscriptions")).map_err(ServerError::Io)?;
+        for entry in fs::read_dir(root.join("publications")).map_err(ServerError::Io)? {
+            let entry = entry.map_err(ServerError::Io)?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let text = fs::read_to_string(path).map_err(ServerError::Io)?;
+            if let Some(publication) = parse_publication_metadata(&text) {
+                self.publications
+                    .insert(publication.name.clone(), publication);
+            }
+        }
+        for entry in fs::read_dir(root.join("subscriptions")).map_err(ServerError::Io)? {
+            let entry = entry.map_err(ServerError::Io)?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let text = fs::read_to_string(path).map_err(ServerError::Io)?;
+            if let Some(subscription) = parse_subscription_metadata(&text) {
+                self.subscriptions
+                    .insert(subscription.name.clone(), subscription);
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_publication(&self, publication: &Publication) -> Result<(), ServerError> {
+        let Some(root) = &self.metadata_dir else {
+            return Ok(());
+        };
+        let dir = root.join("publications");
+        fs::create_dir_all(&dir).map_err(ServerError::Io)?;
+        let tables = publication.tables().collect::<Vec<_>>().join(",");
+        let body = format!("name={}\ntables={tables}\n", publication.name);
+        fs::write(metadata_path(&dir, &publication.name), body).map_err(ServerError::Io)
+    }
+
+    fn persist_subscription(&self, subscription: &Subscription) -> Result<(), ServerError> {
+        let Some(root) = &self.metadata_dir else {
+            return Ok(());
+        };
+        let dir = root.join("subscriptions");
+        fs::create_dir_all(&dir).map_err(ServerError::Io)?;
+        let body = format!(
+            "name={}\nconninfo={}\nslot_name={}\npublications={}\nenabled={}\n",
+            subscription.name,
+            subscription.conninfo.replace('\n', " "),
+            subscription.slot_name,
+            subscription.publications.join(","),
+            subscription.enabled
+        );
+        fs::write(metadata_path(&dir, &subscription.name), body).map_err(ServerError::Io)
+    }
+
+    fn remove_metadata_file(&self, kind: &str, name: &str) -> Result<(), ServerError> {
+        let Some(root) = &self.metadata_dir else {
+            return Ok(());
+        };
+        match fs::remove_file(metadata_path(&root.join(kind), name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(ServerError::Io(e)),
+        }
+    }
 }
 
 fn fold_identifier(ident: &str) -> String {
@@ -306,6 +402,60 @@ fn fold_identifier(ident: &str) -> String {
         .trim_matches('"')
         .trim_end_matches(';')
         .to_ascii_lowercase()
+}
+
+fn metadata_path(dir: &Path, name: &str) -> PathBuf {
+    dir.join(format!("{}.meta", hex_name(name)))
+}
+
+fn hex_name(value: &str) -> String {
+    let mut out = String::with_capacity(value.len().saturating_mul(2));
+    for byte in value.as_bytes() {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn metadata_field<'a>(text: &'a str, field: &str) -> Option<&'a str> {
+    let prefix = format!("{field}=");
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix.as_str()))
+}
+
+fn parse_publication_metadata(text: &str) -> Option<Publication> {
+    let name = fold_identifier(metadata_field(text, "name")?);
+    let tables = metadata_field(text, "tables")?
+        .split(',')
+        .map(fold_identifier)
+        .filter(|table| !table.is_empty())
+        .collect::<BTreeSet<_>>();
+    if name.is_empty() || tables.is_empty() {
+        return None;
+    }
+    Some(Publication { name, tables })
+}
+
+fn parse_subscription_metadata(text: &str) -> Option<Subscription> {
+    let name = fold_identifier(metadata_field(text, "name")?);
+    let conninfo = metadata_field(text, "conninfo")?.to_string();
+    let slot_name = fold_identifier(metadata_field(text, "slot_name")?);
+    let publications = metadata_field(text, "publications")?
+        .split(',')
+        .map(fold_identifier)
+        .filter(|publication| !publication.is_empty())
+        .collect::<Vec<_>>();
+    if name.is_empty() || slot_name.is_empty() || publications.is_empty() {
+        return None;
+    }
+    let enabled = metadata_field(text, "enabled") != Some("false");
+    Some(Subscription {
+        name,
+        conninfo,
+        slot_name,
+        publications,
+        enabled,
+    })
 }
 
 /// File-backed replication slot store under `pg_replslot`.
@@ -548,6 +698,35 @@ mod tests {
             Some("0000000100000000")
         );
         assert_eq!(slots[1].name, "standby_b");
+    }
+
+    #[test]
+    fn logical_replication_metadata_survives_reopen() {
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        {
+            let runtime =
+                LogicalReplicationRuntime::open_metadata(dir.path()).expect("metadata runtime");
+            runtime
+                .create_publication("pub_events", vec!["events".to_string()])
+                .expect("create publication");
+            runtime
+                .create_subscription(
+                    "sub_events",
+                    "host=127.0.0.1 port=5433",
+                    vec!["pub_events".to_string()],
+                    Some("sub_slot".to_string()),
+                )
+                .expect("create subscription");
+        }
+
+        let reopened = LogicalReplicationRuntime::open_metadata(dir.path()).expect("reopen");
+        let publication = reopened.publication("pub_events").expect("publication");
+        assert!(publication.publishes_table("events"));
+        let subscriptions = reopened.subscriptions();
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].name, "sub_events");
+        assert_eq!(subscriptions[0].slot_name, "sub_slot");
+        assert_eq!(subscriptions[0].publications, vec!["pub_events"]);
     }
 
     #[test]
