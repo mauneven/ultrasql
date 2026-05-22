@@ -4,57 +4,16 @@
 //! (`23505`), DEFAULT, and the basic non-deferrable FOREIGN KEY
 //! (`23503`) slice wired for v0.8.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-
-use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener};
-
 mod support;
 
-use support::{shutdown as graceful_shutdown, start_persistent_server};
-
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=constraint_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
-
-async fn shutdown(
-    client: tokio_postgres::Client,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
-    let _ = server_handle.await;
-}
+use support::{shutdown as graceful_shutdown, start_persistent_server, start_sample_server};
 
 /// `INSERT INTO t VALUES (NULL, ...)` on a NOT NULL column fails with
 /// SQLSTATE `23502`.
 #[tokio::test]
 async fn insert_null_into_not_null_column_returns_23502() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT)")
@@ -79,13 +38,14 @@ async fn insert_null_into_not_null_column_returns_23502() {
         .expect("select after rejected INSERT");
     assert!(rows.is_empty(), "rejected INSERT must not leak rows");
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `INSERT INTO t VALUES (..., NULL)` on a nullable column succeeds.
 #[tokio::test]
 async fn insert_null_into_nullable_column_succeeds() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT)")
@@ -105,13 +65,14 @@ async fn insert_null_into_nullable_column_succeeds() {
     let v: Option<i32> = rows[0].get(1);
     assert!(v.is_none(), "nullable column carries NULL");
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Omitted INSERT columns with no DEFAULT are filled with NULL.
 #[tokio::test]
 async fn insert_column_list_omitted_nullable_columns_fill_null() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT)")
@@ -131,14 +92,15 @@ async fn insert_column_list_omitted_nullable_columns_fill_null() {
     let v: Option<i32> = rows[0].get(1);
     assert!(v.is_none(), "omitted nullable column carries NULL");
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// INSERT column lists map source positions to named target columns,
 /// not physical table order.
 #[tokio::test]
 async fn insert_column_list_respects_target_order() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
@@ -157,14 +119,15 @@ async fn insert_column_list_respects_target_order() {
     assert_eq!(rows[0].get::<_, i32>(0), 2);
     assert_eq!(rows[0].get::<_, i32>(1), 20);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Multi-row INSERT where one row violates NOT NULL must be atomic in
 /// the sense that the rejected statement leaves no rows behind.
 #[tokio::test]
 async fn multi_row_insert_aborts_on_not_null_violation() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
@@ -187,14 +150,15 @@ async fn multi_row_insert_aborts_on_not_null_violation() {
         "rejected multi-row INSERT must not leak partial rows, got {rows:?}"
     );
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `UPDATE t SET col = NULL` on a NOT NULL column fails with
 /// SQLSTATE `23502` and leaves the original tuple visible.
 #[tokio::test]
 async fn update_null_into_not_null_column_returns_23502_and_preserves_row() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
@@ -224,14 +188,15 @@ async fn update_null_into_not_null_column_returns_23502_and_preserves_row() {
     assert_eq!(rows[0].get::<_, i32>(0), 1);
     assert_eq!(rows[0].get::<_, i32>(1), 10);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Omitted columns with DEFAULT expressions get the default value, while
 /// explicit NULL remains NULL on nullable columns.
 #[tokio::test]
 async fn insert_omitted_column_uses_default_expression() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT DEFAULT 7)")
@@ -257,7 +222,7 @@ async fn insert_omitted_column_uses_default_expression() {
     let v: Option<i32> = rows[1].get(1);
     assert!(v.is_none());
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -291,7 +256,8 @@ async fn default_expression_survives_restart() {
 /// Stored generated columns are computed on INSERT and recomputed on UPDATE.
 #[tokio::test]
 async fn generated_stored_column_is_computed_and_recomputed() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a + 1) STORED)")
@@ -322,7 +288,7 @@ async fn generated_stored_column_is_computed_and_recomputed() {
     assert_eq!(updated[0].get::<_, i32>(0), 8);
     assert_eq!(updated[0].get::<_, i32>(1), 9);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -363,7 +329,8 @@ async fn generated_stored_column_survives_restart() {
 /// Explicit INSERT/UPDATE values for stored generated columns are rejected.
 #[tokio::test]
 async fn generated_stored_column_rejects_explicit_values() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a + 1) STORED)")
@@ -386,14 +353,15 @@ async fn generated_stored_column_rejects_explicit_values() {
         .expect_err("explicit generated UPDATE rejected");
     assert_eq!(update_err.code().expect("SQLSTATE").code(), "428C9");
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// CHECK constraints reject false predicates on INSERT and keep the heap
 /// unchanged.
 #[tokio::test]
 async fn check_constraint_rejects_insert_with_23514() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL CHECK (id > 0), v INT)")
@@ -413,13 +381,14 @@ async fn check_constraint_rejects_insert_with_23514() {
         .expect("select after rejected CHECK");
     assert!(rows.is_empty());
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// CHECK constraints also run after UPDATE assignments.
 #[tokio::test]
 async fn check_constraint_rejects_update_and_preserves_row() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT CHECK (v >= 0))")
@@ -444,7 +413,7 @@ async fn check_constraint_rejects_update_and_preserves_row() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>(0), 10);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -473,7 +442,8 @@ async fn check_constraint_survives_restart() {
 /// PRIMARY KEY creates a unique B-tree and implies NOT NULL.
 #[tokio::test]
 async fn primary_key_enforces_not_null_and_unique() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
@@ -504,7 +474,7 @@ async fn primary_key_enforces_not_null_and_unique() {
     assert_eq!(rows[0].get::<_, i32>(0), 1);
     assert_eq!(rows[0].get::<_, i32>(1), 10);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Basic non-deferrable FOREIGN KEY enforcement: child writes must find
@@ -512,7 +482,8 @@ async fn primary_key_enforces_not_null_and_unique() {
 /// child references them.
 #[tokio::test]
 async fn foreign_key_rejects_missing_parent_and_restricts_parent_key() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
@@ -555,7 +526,7 @@ async fn foreign_key_rejects_missing_parent_and_restricts_parent_key() {
         .expect_err("parent key update restricted");
     assert_eq!(parent_update.code().expect("SQLSTATE").code(), "23503");
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -594,7 +565,8 @@ async fn foreign_key_survives_restart() {
 /// the child-side FK while keeping the child table.
 #[tokio::test]
 async fn drop_table_restricts_and_cascade_drops_foreign_key_dependency() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE parent_drop (id INT PRIMARY KEY)")
@@ -627,14 +599,15 @@ async fn drop_table_restricts_and_cascade_drops_foreign_key_dependency() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>(0), 123);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `ON DELETE CASCADE` removes referencing child rows and keeps child
 /// indexes in sync.
 #[tokio::test]
 async fn foreign_key_on_delete_cascade_deletes_child_rows() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
@@ -683,14 +656,15 @@ async fn foreign_key_on_delete_cascade_deletes_child_rows() {
         "cascaded delete must remove child index entries"
     );
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `ON DELETE SET NULL` rewrites referencing child rows and removes
 /// old child index entries.
 #[tokio::test]
 async fn foreign_key_on_delete_set_null_updates_child_rows() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
@@ -742,14 +716,15 @@ async fn foreign_key_on_delete_set_null_updates_child_rows() {
         "SET NULL must remove old child index entry"
     );
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `ON DELETE SET DEFAULT` evaluates the child column default and rewrites
 /// child indexes to the replacement key.
 #[tokio::test]
 async fn foreign_key_on_delete_set_default_updates_child_rows() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
@@ -796,14 +771,15 @@ async fn foreign_key_on_delete_set_default_updates_child_rows() {
     assert_eq!(index_rows.len(), 1);
     assert_eq!(index_rows[0].get::<_, i32>(0), 10);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `ON UPDATE CASCADE` propagates parent key changes into child rows and
 /// keeps child indexes in sync.
 #[tokio::test]
 async fn foreign_key_on_update_cascade_updates_child_rows() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
@@ -851,13 +827,14 @@ async fn foreign_key_on_update_cascade_updates_child_rows() {
         .expect("old index probe after ON UPDATE CASCADE");
     assert!(old_key_rows.is_empty());
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `ON UPDATE SET NULL` rewrites referencing child rows to NULL.
 #[tokio::test]
 async fn foreign_key_on_update_set_null_updates_child_rows() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
@@ -896,13 +873,14 @@ async fn foreign_key_on_update_set_null_updates_child_rows() {
     assert_eq!(rows[1].get::<_, i32>(0), 2);
     assert_eq!(rows[1].get::<_, i32>(1), 20);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `ON UPDATE SET DEFAULT` evaluates the child default and rewrites rows.
 #[tokio::test]
 async fn foreign_key_on_update_set_default_updates_child_rows() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
@@ -938,14 +916,15 @@ async fn foreign_key_on_update_set_default_updates_child_rows() {
     assert_eq!(rows[0].get::<_, i32>(0), 7);
     assert_eq!(rows[0].get::<_, i32>(1), 10);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `DEFERRABLE INITIALLY DEFERRED` foreign keys are checked at COMMIT,
 /// so child-before-parent writes inside one transaction can succeed.
 #[tokio::test]
 async fn deferrable_foreign_key_allows_child_before_parent_until_commit() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
@@ -978,13 +957,14 @@ async fn deferrable_foreign_key_allows_child_before_parent_until_commit() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>(0), 1);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// A deferred FK violation surfaces at COMMIT with SQLSTATE `23503`.
 #[tokio::test]
 async fn deferrable_foreign_key_violation_fails_at_commit() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE parent (id INT PRIMARY KEY)")
@@ -1016,14 +996,15 @@ async fn deferrable_foreign_key_violation_fails_at_commit() {
         .expect("select child after failed commit");
     assert!(rows.is_empty());
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `EXCLUDE USING gist` rejects overlapping range keys and reports
 /// PostgreSQL's `exclusion_violation` SQLSTATE.
 #[tokio::test]
 async fn exclusion_constraint_rejects_overlapping_int4range() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute(
@@ -1061,7 +1042,7 @@ async fn exclusion_constraint_rejects_overlapping_int4range() {
     let rooms: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
     assert_eq!(rooms, vec![101, 102]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1098,7 +1079,8 @@ async fn exclusion_constraint_survives_restart() {
 /// Geometric `&&` uses GiST-style bounding-box overlap semantics.
 #[tokio::test]
 async fn geometric_overlap_predicate_filters_boxes() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("constraint_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE shapes (id INT NOT NULL, b BOX NOT NULL)")
@@ -1120,5 +1102,5 @@ async fn geometric_overlap_predicate_filters_boxes() {
     let ids: Vec<i32> = rows.iter().map(|row| row.get(0)).collect();
     assert_eq!(ids, vec![1]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
