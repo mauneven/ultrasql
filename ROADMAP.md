@@ -1653,7 +1653,10 @@ behavior are implemented and validated.
 - [ ] WAL archiving (`archive_command`) — CLI archive utility exists via `ultrasql --archive-wal`; server-side config execution pending
 - [ ] WAL restore (`restore_command`) — CLI restore utility exists via `ultrasql --restore-wal`; recovery integration pending
 - [ ] Base backup (`pg_basebackup` equivalent) — `ultrasql --basebackup DEST --data-dir DIR` copies files and writes `backup_manifest.json`; online checkpoint fencing pending
-- [ ] `recovery.signal` / `standby.signal` support — CLI signal-file helpers via `ultrasql --ctl recovery|standby`; server startup/replay handling pending
+- [x] `recovery.signal` / `standby.signal` support — CLI signal-file
+  helpers via `ultrasql --ctl recovery|standby`; server startup detects
+  either file and enters hot-standby read-only mode before accepting
+  sessions while normal WAL replay runs through `Server::init`.
 - [ ] `recovery_target_time`, `recovery_target_lsn`, `recovery_target_xid` — CLI writes `recovery.targets`; WAL replay targeting pending
 - [x] `pg_start_backup()` / `pg_stop_backup()` for online backup — SQL
   compatibility functions write `backup_label` / `backup_stop` marker files

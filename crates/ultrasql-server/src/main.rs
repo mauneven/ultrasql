@@ -10,7 +10,7 @@
 //! socket.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
@@ -198,8 +198,7 @@ fn main() -> std::process::ExitCode {
         }
     };
     if let Some(path) = &cli.data_dir {
-        if path.join("standby.signal").exists() || path.join("recovery.signal").exists() {
-            state.set_standby_mode(true);
+        if apply_startup_signal_files(state.as_ref(), path) {
             info!(target: "ultrasqld", data_dir = %path.display(), "hot standby read-only mode enabled");
         }
     }
@@ -278,6 +277,15 @@ fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String> {
         log_min_duration_statement_ms: cli.log_min_duration_statement_ms,
         log_statement: cli.log_statement.into(),
     })
+}
+
+fn apply_startup_signal_files(state: &Server, data_dir: &Path) -> bool {
+    let enabled =
+        data_dir.join("standby.signal").exists() || data_dir.join("recovery.signal").exists();
+    if enabled {
+        state.set_standby_mode(true);
+    }
+    enabled
 }
 
 async fn run_ops_endpoint(
@@ -632,5 +640,18 @@ mod tests {
 
         assert_eq!(config.log_min_duration_statement_ms, 25);
         assert_eq!(config.log_statement, LogStatementMode::All);
+    }
+
+    #[test]
+    fn startup_signal_files_enable_standby_mode() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let server = Server::with_sample_database();
+
+        assert!(!apply_startup_signal_files(&server, dir.path()));
+        assert!(!server.is_standby_mode());
+
+        std::fs::write(dir.path().join("standby.signal"), b"standby\n").expect("write signal");
+        assert!(apply_startup_signal_files(&server, dir.path()));
+        assert!(server.is_standby_mode());
     }
 }
