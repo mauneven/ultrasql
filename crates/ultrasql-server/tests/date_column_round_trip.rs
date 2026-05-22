@@ -13,60 +13,25 @@
 //! Pinning these here means a regression on any link in the chain
 //! trips an integration test rather than the TPC-H runner.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+mod support;
 
-use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener};
-
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=date_round_trip",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
-
-async fn shutdown(
-    client: tokio_postgres::Client,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
-}
+use support::{shutdown, start_sample_server};
 
 #[tokio::test]
 async fn create_table_with_date_column() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("date_round_trip").await;
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE events (id INT NOT NULL, d DATE NOT NULL)")
         .await
         .expect("CREATE TABLE with DATE column");
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn insert_date_literal_and_scan() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("date_round_trip").await;
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE events (id INT NOT NULL, d DATE NOT NULL)")
         .await
@@ -89,12 +54,13 @@ async fn insert_date_literal_and_scan() {
         .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
         .collect();
     assert_eq!(rows.len(), 3, "all three rows survive the round-trip");
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn filters_date_column_with_interval_bound() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("date_round_trip").await;
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE events (id INT NOT NULL, d DATE NOT NULL)")
         .await
@@ -130,7 +96,7 @@ async fn filters_date_column_with_interval_bound() {
         })
         .collect();
     assert_eq!(ids, vec![3], "only 1994-01-01 is before 1995-01-01");
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
@@ -138,17 +104,19 @@ async fn accepts_decimal_column() {
     // DECIMAL columns are wired through the v0.6 milestone landing:
     // scaled i64 codec, Decimal column-builder arm, batch_to_rows
     // re-tagging the value with the schema-side scale.
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("date_round_trip").await;
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE prices (id INT NOT NULL, p DECIMAL(15, 2) NOT NULL)")
         .await
         .expect("CREATE TABLE with DECIMAL column");
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn filters_decimal_column_with_decimal_literal() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("date_round_trip").await;
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE prices (id INT NOT NULL, p DECIMAL(15, 2) NOT NULL)")
         .await
@@ -180,7 +148,7 @@ async fn filters_decimal_column_with_decimal_literal() {
         })
         .collect();
     assert_eq!(ids, vec![1], "only the 0.06 row should match");
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
@@ -188,17 +156,19 @@ async fn accepts_timestamp_column() {
     // TIMESTAMP / TIMESTAMPTZ / TIME columns wired through the same
     // codec template as Decimal: 8-byte little-endian i64 microsecond
     // payload, Int64 column builder, schema-side semantic tag.
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("date_round_trip").await;
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE evt (id INT NOT NULL, ts TIMESTAMP NOT NULL, t TIME NOT NULL)")
         .await
         .expect("CREATE TABLE with TIMESTAMP/TIME columns");
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn scans_decimal_column_in_wide_tpch_like_table() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("date_round_trip").await;
+    let client = &running.client;
     client
         .batch_execute(
             "CREATE TABLE orders_probe (\
@@ -239,12 +209,13 @@ async fn scans_decimal_column_in_wide_tpch_like_table() {
         })
         .collect();
     assert_eq!(values, vec!["173665.47".to_owned()]);
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn filters_wide_tpch_like_table_without_decimal_type_mismatch() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("date_round_trip").await;
+    let client = &running.client;
     client
         .batch_execute(
             "CREATE TABLE orders_probe (\
@@ -288,12 +259,13 @@ async fn filters_wide_tpch_like_table_without_decimal_type_mismatch() {
         })
         .collect();
     assert_eq!(values, vec!["1".to_owned()]);
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn joins_wide_tpch_like_tables_without_hidden_decimal_mismatch() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("date_round_trip").await;
+    let client = &running.client;
     client
         .batch_execute(
             "CREATE TABLE customer_probe (\
@@ -360,12 +332,13 @@ async fn joins_wide_tpch_like_tables_without_hidden_decimal_mismatch() {
         })
         .collect();
     assert_eq!(values, vec!["1".to_owned()]);
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn aggregates_over_joined_wide_tables_without_hidden_decimal_mismatch() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("date_round_trip").await;
+    let client = &running.client;
     client
         .batch_execute(
             "CREATE TABLE customer_probe (\
@@ -435,12 +408,13 @@ async fn aggregates_over_joined_wide_tables_without_hidden_decimal_mismatch() {
         values,
         vec![("Customer#000000001".to_owned(), "1".to_owned())]
     );
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn aggregates_empty_filtered_wide_table_without_decimal_mismatch() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("date_round_trip").await;
+    let client = &running.client;
     client
         .batch_execute(
             "CREATE TABLE orders_probe (\
@@ -479,5 +453,5 @@ async fn aggregates_empty_filtered_wide_table_without_decimal_mismatch() {
         .filter(|message| matches!(message, tokio_postgres::SimpleQueryMessage::Row(_)))
         .collect();
     assert!(rows.is_empty(), "no groups should survive the empty filter");
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
