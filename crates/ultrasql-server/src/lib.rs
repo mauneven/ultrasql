@@ -86,7 +86,7 @@ use ultrasql_parser::Parser;
 use ultrasql_planner::plan::{LockStrength, LockWaitPolicy};
 use ultrasql_planner::{
     AggregateFunc, BinaryOp, Catalog as PlannerCatalog, InMemoryCatalog, LogicalIndexMethod,
-    LogicalPlan, ScalarExpr, TableMeta, bind,
+    LogicalPlan, ScalarExpr, TableMeta, UnaryOp, bind,
 };
 use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::access_method::{
@@ -440,6 +440,416 @@ fn parse_rls_expr(
         column_name: metadata_unescape(column_name)?,
         setting_name: metadata_unescape(setting_name)?,
     }))
+}
+
+fn data_type_token(ty: &DataType) -> Option<&'static str> {
+    match ty {
+        DataType::Bool => Some("bool"),
+        DataType::Int16 => Some("i16"),
+        DataType::Int32 => Some("i32"),
+        DataType::Int64 => Some("i64"),
+        DataType::Float32 => Some("f32"),
+        DataType::Float64 => Some("f64"),
+        DataType::Text { .. } => Some("text"),
+        DataType::Date => Some("date"),
+        DataType::Time => Some("time"),
+        DataType::Timestamp => Some("ts"),
+        DataType::TimestampTz => Some("tstz"),
+        DataType::Null => Some("null"),
+        _ => None,
+    }
+}
+
+fn data_type_from_token(token: &str) -> Option<DataType> {
+    match token {
+        "bool" => Some(DataType::Bool),
+        "i16" => Some(DataType::Int16),
+        "i32" => Some(DataType::Int32),
+        "i64" => Some(DataType::Int64),
+        "f32" => Some(DataType::Float32),
+        "f64" => Some(DataType::Float64),
+        "text" => Some(DataType::Text { max_len: None }),
+        "date" => Some(DataType::Date),
+        "time" => Some(DataType::Time),
+        "ts" => Some(DataType::Timestamp),
+        "tstz" => Some(DataType::TimestampTz),
+        "null" => Some(DataType::Null),
+        _ => None,
+    }
+}
+
+fn binary_op_token(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "add",
+        BinaryOp::Sub => "sub",
+        BinaryOp::Mul => "mul",
+        BinaryOp::Div => "div",
+        BinaryOp::Mod => "mod",
+        BinaryOp::Pow => "pow",
+        BinaryOp::Concat => "concat",
+        BinaryOp::Eq => "eq",
+        BinaryOp::NotEq => "ne",
+        BinaryOp::Lt => "lt",
+        BinaryOp::LtEq => "le",
+        BinaryOp::Gt => "gt",
+        BinaryOp::GtEq => "ge",
+        BinaryOp::And => "and",
+        BinaryOp::Or => "or",
+        BinaryOp::Like => "like",
+        BinaryOp::NotLike => "not_like",
+        BinaryOp::Ilike => "ilike",
+        BinaryOp::NotIlike => "not_ilike",
+        BinaryOp::RegexMatch => "regex",
+        BinaryOp::RegexIMatch => "iregex",
+        BinaryOp::RegexNotMatch => "not_regex",
+        BinaryOp::RegexNotIMatch => "not_iregex",
+        BinaryOp::BitAnd => "bit_and",
+        BinaryOp::BitOr => "bit_or",
+        BinaryOp::BitXor => "bit_xor",
+        BinaryOp::ShiftLeft => "shl",
+        BinaryOp::ShiftRight => "shr",
+        BinaryOp::JsonGet => "json_get",
+        BinaryOp::JsonGetText => "json_get_text",
+        BinaryOp::JsonGetPath => "json_get_path",
+        BinaryOp::JsonGetPathText => "json_get_path_text",
+        BinaryOp::JsonContains => "json_contains",
+        BinaryOp::JsonContained => "json_contained",
+        BinaryOp::JsonHasKey => "json_has_key",
+        BinaryOp::JsonHasAnyKey => "json_has_any_key",
+        BinaryOp::JsonHasAllKeys => "json_has_all_keys",
+        BinaryOp::TextSearchMatch => "text_search",
+        BinaryOp::Overlap => "overlap",
+        BinaryOp::VectorL2Distance => "vec_l2",
+        BinaryOp::VectorNegativeInnerProduct => "vec_ip",
+        BinaryOp::VectorCosineDistance => "vec_cos",
+        BinaryOp::VectorL1Distance => "vec_l1",
+    }
+}
+
+fn binary_op_from_token(token: &str) -> Option<BinaryOp> {
+    Some(match token {
+        "add" => BinaryOp::Add,
+        "sub" => BinaryOp::Sub,
+        "mul" => BinaryOp::Mul,
+        "div" => BinaryOp::Div,
+        "mod" => BinaryOp::Mod,
+        "pow" => BinaryOp::Pow,
+        "concat" => BinaryOp::Concat,
+        "eq" => BinaryOp::Eq,
+        "ne" => BinaryOp::NotEq,
+        "lt" => BinaryOp::Lt,
+        "le" => BinaryOp::LtEq,
+        "gt" => BinaryOp::Gt,
+        "ge" => BinaryOp::GtEq,
+        "and" => BinaryOp::And,
+        "or" => BinaryOp::Or,
+        "like" => BinaryOp::Like,
+        "not_like" => BinaryOp::NotLike,
+        "ilike" => BinaryOp::Ilike,
+        "not_ilike" => BinaryOp::NotIlike,
+        "regex" => BinaryOp::RegexMatch,
+        "iregex" => BinaryOp::RegexIMatch,
+        "not_regex" => BinaryOp::RegexNotMatch,
+        "not_iregex" => BinaryOp::RegexNotIMatch,
+        "bit_and" => BinaryOp::BitAnd,
+        "bit_or" => BinaryOp::BitOr,
+        "bit_xor" => BinaryOp::BitXor,
+        "shl" => BinaryOp::ShiftLeft,
+        "shr" => BinaryOp::ShiftRight,
+        "json_get" => BinaryOp::JsonGet,
+        "json_get_text" => BinaryOp::JsonGetText,
+        "json_get_path" => BinaryOp::JsonGetPath,
+        "json_get_path_text" => BinaryOp::JsonGetPathText,
+        "json_contains" => BinaryOp::JsonContains,
+        "json_contained" => BinaryOp::JsonContained,
+        "json_has_key" => BinaryOp::JsonHasKey,
+        "json_has_any_key" => BinaryOp::JsonHasAnyKey,
+        "json_has_all_keys" => BinaryOp::JsonHasAllKeys,
+        "text_search" => BinaryOp::TextSearchMatch,
+        "overlap" => BinaryOp::Overlap,
+        "vec_l2" => BinaryOp::VectorL2Distance,
+        "vec_ip" => BinaryOp::VectorNegativeInnerProduct,
+        "vec_cos" => BinaryOp::VectorCosineDistance,
+        "vec_l1" => BinaryOp::VectorL1Distance,
+        _ => return None,
+    })
+}
+
+fn unary_op_token(op: UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::Neg => "neg",
+        UnaryOp::Pos => "pos",
+        UnaryOp::Not => "not",
+        UnaryOp::BitNot => "bit_not",
+    }
+}
+
+fn unary_op_from_token(token: &str) -> Option<UnaryOp> {
+    Some(match token {
+        "neg" => UnaryOp::Neg,
+        "pos" => UnaryOp::Pos,
+        "not" => UnaryOp::Not,
+        "bit_not" => UnaryOp::BitNot,
+        _ => return None,
+    })
+}
+
+fn value_token(value: &Value) -> Option<String> {
+    Some(match value {
+        Value::Null => String::new(),
+        Value::Bool(v) => v.to_string(),
+        Value::Int16(v) => v.to_string(),
+        Value::Int32(v) => v.to_string(),
+        Value::Int64(v) => v.to_string(),
+        Value::Float32(v) => v.to_bits().to_string(),
+        Value::Float64(v) => v.to_bits().to_string(),
+        Value::Text(v) | Value::Jsonb(v) => metadata_escape(v),
+        Value::Date(v) => v.to_string(),
+        Value::Time(v) | Value::Timestamp(v) | Value::TimestampTz(v) => v.to_string(),
+        _ => return None,
+    })
+}
+
+fn value_from_token(ty: &DataType, token: &str) -> Result<Value, ServerError> {
+    Ok(match ty {
+        DataType::Null => Value::Null,
+        DataType::Bool => Value::Bool(
+            token
+                .parse::<bool>()
+                .map_err(|err| ServerError::Ddl(format!("bad bool literal: {err}")))?,
+        ),
+        DataType::Int16 => Value::Int16(
+            token
+                .parse::<i16>()
+                .map_err(|err| ServerError::Ddl(format!("bad int16 literal: {err}")))?,
+        ),
+        DataType::Int32 => Value::Int32(
+            token
+                .parse::<i32>()
+                .map_err(|err| ServerError::Ddl(format!("bad int32 literal: {err}")))?,
+        ),
+        DataType::Int64 => Value::Int64(
+            token
+                .parse::<i64>()
+                .map_err(|err| ServerError::Ddl(format!("bad int64 literal: {err}")))?,
+        ),
+        DataType::Float32 => {
+            Value::Float32(f32::from_bits(token.parse::<u32>().map_err(|err| {
+                ServerError::Ddl(format!("bad float32 literal: {err}"))
+            })?))
+        }
+        DataType::Float64 => {
+            Value::Float64(f64::from_bits(token.parse::<u64>().map_err(|err| {
+                ServerError::Ddl(format!("bad float64 literal: {err}"))
+            })?))
+        }
+        DataType::Text { .. } => Value::Text(metadata_unescape(token)?),
+        DataType::Date => Value::Date(
+            token
+                .parse::<i32>()
+                .map_err(|err| ServerError::Ddl(format!("bad date literal: {err}")))?,
+        ),
+        DataType::Time => Value::Time(
+            token
+                .parse::<i64>()
+                .map_err(|err| ServerError::Ddl(format!("bad time literal: {err}")))?,
+        ),
+        DataType::Timestamp => Value::Timestamp(
+            token
+                .parse::<i64>()
+                .map_err(|err| ServerError::Ddl(format!("bad timestamp literal: {err}")))?,
+        ),
+        DataType::TimestampTz => Value::TimestampTz(
+            token
+                .parse::<i64>()
+                .map_err(|err| ServerError::Ddl(format!("bad timestamptz literal: {err}")))?,
+        ),
+        _ => {
+            return Err(ServerError::Ddl(format!(
+                "unsupported persisted literal type {ty:?}"
+            )));
+        }
+    })
+}
+
+fn encode_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>) -> Option<()> {
+    match expr {
+        ScalarExpr::Column {
+            name,
+            index,
+            data_type,
+        } => {
+            out.push("col".to_owned());
+            out.push(index.to_string());
+            out.push(metadata_escape(name));
+            out.push(data_type_token(data_type)?.to_owned());
+        }
+        ScalarExpr::Literal { value, data_type } => {
+            out.push("lit".to_owned());
+            out.push(data_type_token(data_type)?.to_owned());
+            out.push(value_token(value)?);
+        }
+        ScalarExpr::Unary {
+            op,
+            expr,
+            data_type,
+        } => {
+            out.push("unary".to_owned());
+            out.push(unary_op_token(*op).to_owned());
+            out.push(data_type_token(data_type)?.to_owned());
+            encode_scalar_expr(expr, out)?;
+        }
+        ScalarExpr::Binary {
+            op,
+            left,
+            right,
+            data_type,
+        } => {
+            out.push("binary".to_owned());
+            out.push(binary_op_token(*op).to_owned());
+            out.push(data_type_token(data_type)?.to_owned());
+            encode_scalar_expr(left, out)?;
+            encode_scalar_expr(right, out)?;
+        }
+        ScalarExpr::IsNull { expr, negated } => {
+            out.push("isnull".to_owned());
+            out.push(negated.to_string());
+            encode_scalar_expr(expr, out)?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn encode_scalar_expr_field(expr: &ScalarExpr) -> Option<String> {
+    let mut tokens = Vec::new();
+    encode_scalar_expr(expr, &mut tokens)?;
+    Some(tokens.join("\u{1f}"))
+}
+
+fn decode_scalar_expr(tokens: &[&str], pos: &mut usize) -> Result<ScalarExpr, ServerError> {
+    let Some(kind) = tokens.get(*pos).copied() else {
+        return Err(ServerError::Ddl(
+            "truncated scalar expression metadata".to_owned(),
+        ));
+    };
+    *pos += 1;
+    match kind {
+        "col" => {
+            let index = tokens
+                .get(*pos)
+                .ok_or_else(|| ServerError::Ddl("truncated column expr".to_owned()))?
+                .parse::<usize>()
+                .map_err(|err| ServerError::Ddl(format!("bad column index: {err}")))?;
+            *pos += 1;
+            let name = metadata_unescape(
+                tokens
+                    .get(*pos)
+                    .ok_or_else(|| ServerError::Ddl("truncated column name".to_owned()))?,
+            )?;
+            *pos += 1;
+            let data_type = data_type_from_token(
+                tokens
+                    .get(*pos)
+                    .ok_or_else(|| ServerError::Ddl("truncated column type".to_owned()))?,
+            )
+            .ok_or_else(|| ServerError::Ddl("unknown column type".to_owned()))?;
+            *pos += 1;
+            Ok(ScalarExpr::Column {
+                name,
+                index,
+                data_type,
+            })
+        }
+        "lit" => {
+            let data_type = data_type_from_token(
+                tokens
+                    .get(*pos)
+                    .ok_or_else(|| ServerError::Ddl("truncated literal type".to_owned()))?,
+            )
+            .ok_or_else(|| ServerError::Ddl("unknown literal type".to_owned()))?;
+            *pos += 1;
+            let value = value_from_token(
+                &data_type,
+                tokens
+                    .get(*pos)
+                    .ok_or_else(|| ServerError::Ddl("truncated literal value".to_owned()))?,
+            )?;
+            *pos += 1;
+            Ok(ScalarExpr::Literal { value, data_type })
+        }
+        "unary" => {
+            let op = unary_op_from_token(
+                tokens
+                    .get(*pos)
+                    .ok_or_else(|| ServerError::Ddl("truncated unary op".to_owned()))?,
+            )
+            .ok_or_else(|| ServerError::Ddl("unknown unary op".to_owned()))?;
+            *pos += 1;
+            let data_type = data_type_from_token(
+                tokens
+                    .get(*pos)
+                    .ok_or_else(|| ServerError::Ddl("truncated unary type".to_owned()))?,
+            )
+            .ok_or_else(|| ServerError::Ddl("unknown unary type".to_owned()))?;
+            *pos += 1;
+            let expr = Box::new(decode_scalar_expr(tokens, pos)?);
+            Ok(ScalarExpr::Unary {
+                op,
+                expr,
+                data_type,
+            })
+        }
+        "binary" => {
+            let op = binary_op_from_token(
+                tokens
+                    .get(*pos)
+                    .ok_or_else(|| ServerError::Ddl("truncated binary op".to_owned()))?,
+            )
+            .ok_or_else(|| ServerError::Ddl("unknown binary op".to_owned()))?;
+            *pos += 1;
+            let data_type = data_type_from_token(
+                tokens
+                    .get(*pos)
+                    .ok_or_else(|| ServerError::Ddl("truncated binary type".to_owned()))?,
+            )
+            .ok_or_else(|| ServerError::Ddl("unknown binary type".to_owned()))?;
+            *pos += 1;
+            let left = Box::new(decode_scalar_expr(tokens, pos)?);
+            let right = Box::new(decode_scalar_expr(tokens, pos)?);
+            Ok(ScalarExpr::Binary {
+                op,
+                left,
+                right,
+                data_type,
+            })
+        }
+        "isnull" => {
+            let negated = tokens
+                .get(*pos)
+                .ok_or_else(|| ServerError::Ddl("truncated isnull flag".to_owned()))?
+                .parse::<bool>()
+                .map_err(|err| ServerError::Ddl(format!("bad isnull flag: {err}")))?;
+            *pos += 1;
+            let expr = Box::new(decode_scalar_expr(tokens, pos)?);
+            Ok(ScalarExpr::IsNull { expr, negated })
+        }
+        other => Err(ServerError::Ddl(format!(
+            "unknown scalar expression token {other}"
+        ))),
+    }
+}
+
+fn decode_scalar_expr_field(raw: &str) -> Result<ScalarExpr, ServerError> {
+    let tokens = raw.split('\u{1f}').collect::<Vec<_>>();
+    let mut pos = 0;
+    let expr = decode_scalar_expr(&tokens, &mut pos)?;
+    if pos != tokens.len() {
+        return Err(ServerError::Ddl(
+            "trailing scalar expression metadata tokens".to_owned(),
+        ));
+    }
+    Ok(expr)
 }
 
 fn materialized_view_projection_indices(plan: &LogicalPlan) -> Option<Vec<usize>> {
@@ -2631,6 +3041,22 @@ impl Server {
                     out.push_str(&format!("identity_always\t{}\t{}\n", oid.raw(), idx));
                 }
             }
+            for check in &constraints.checks {
+                let Some(expr) = encode_scalar_expr_field(&check.expr) else {
+                    tracing::warn!(
+                        table = %table_name,
+                        constraint = %check.name,
+                        "CHECK expression is outside restart-persistable subset",
+                    );
+                    continue;
+                };
+                out.push_str(&format!(
+                    "check\t{}\t{}\t{}\n",
+                    oid.raw(),
+                    metadata_escape(&check.name),
+                    metadata_escape(&expr)
+                ));
+            }
         }
         let tmp = path.with_extension("meta.tmp");
         std::fs::write(&tmp, out).map_err(ServerError::Io)?;
@@ -2653,6 +3079,8 @@ impl Server {
         let mut sequence_defaults: std::collections::HashMap<Oid, Vec<(usize, String)>> =
             std::collections::HashMap::new();
         let mut identity_always: std::collections::HashMap<Oid, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut checks: std::collections::HashMap<Oid, Vec<RuntimeCheckConstraint>> =
             std::collections::HashMap::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
@@ -2702,6 +3130,18 @@ impl Server {
                     })?;
                     identity_always.entry(oid).or_default().push(idx);
                 }
+                Some("check") if parts.len() == 4 => {
+                    let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    checks.entry(oid).or_default().push(RuntimeCheckConstraint {
+                        name: metadata_unescape(parts[2])?,
+                        expr: decode_scalar_expr_field(&metadata_unescape(parts[3])?)?,
+                    });
+                }
                 _ => {
                     return Err(ServerError::Ddl(format!(
                         "malformed table-runtime metadata line {}",
@@ -2748,6 +3188,9 @@ impl Server {
                         runtime.identity_always[idx] = true;
                     }
                 }
+            }
+            if let Some(checks) = checks.remove(&oid) {
+                runtime.checks = checks;
             }
             self.table_constraints.insert(oid, Arc::new(runtime));
         }
