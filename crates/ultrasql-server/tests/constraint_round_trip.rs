@@ -5,12 +5,15 @@
 //! (`23503`) slice wired for v0.8.
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
+
+mod support;
+
+use support::{shutdown as graceful_shutdown, start_persistent_server};
 
 async fn start_server_and_connect() -> (
     tokio_postgres::Client,
@@ -23,33 +26,6 @@ async fn start_server_and_connect() -> (
     let server_handle = tokio::spawn(serve_listener(listener, server));
     let conn_str = format!(
         "host={host} port={port} user=tester application_name=constraint_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
-
-async fn start_persistent_server_and_connect(
-    data_dir: &Path,
-) -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::init(data_dir).expect("persistent server init"));
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=constraint_restart_test",
         host = bound.ip(),
         port = bound.port()
     );
@@ -288,14 +264,16 @@ async fn insert_omitted_column_uses_default_expression() {
 async fn default_expression_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "constraint_restart_test").await;
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE default_restart (id INT NOT NULL, v INT DEFAULT 7)")
         .await
         .expect("create");
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "constraint_restart_test").await;
+    let client = &running.client;
     client
         .batch_execute("INSERT INTO default_restart (id) VALUES (1)")
         .await
@@ -307,7 +285,7 @@ async fn default_expression_survives_restart() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, i32>(0), 1);
     assert_eq!(rows[0].get::<_, i32>(1), 7);
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Stored generated columns are computed on INSERT and recomputed on UPDATE.
@@ -351,16 +329,18 @@ async fn generated_stored_column_is_computed_and_recomputed() {
 async fn generated_stored_column_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "constraint_restart_test").await;
+    let client = &running.client;
     client
         .batch_execute(
             "CREATE TABLE generated_restart (a INT, b INT GENERATED ALWAYS AS (a + 1) STORED)",
         )
         .await
         .expect("create");
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "constraint_restart_test").await;
+    let client = &running.client;
     client
         .batch_execute("INSERT INTO generated_restart (a) VALUES (4)")
         .await
@@ -377,7 +357,7 @@ async fn generated_stored_column_survives_restart() {
         .await
         .expect_err("explicit generated insert rejected after restart");
     assert_eq!(err.code().expect("SQLSTATE").code(), "428C9");
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Explicit INSERT/UPDATE values for stored generated columns are rejected.
@@ -471,21 +451,23 @@ async fn check_constraint_rejects_update_and_preserves_row() {
 async fn check_constraint_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "constraint_restart_test").await;
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE check_restart (id INT NOT NULL CHECK (id > 0), v INT)")
         .await
         .expect("create");
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "constraint_restart_test").await;
+    let client = &running.client;
     let err = client
         .batch_execute("INSERT INTO check_restart VALUES (-1, 10)")
         .await
         .expect_err("CHECK rejects row after restart");
     let sqlstate = err.code().expect("server-sent SQLSTATE present");
     assert_eq!(sqlstate.code(), "23514");
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// PRIMARY KEY creates a unique B-tree and implies NOT NULL.
@@ -580,7 +562,8 @@ async fn foreign_key_rejects_missing_parent_and_restricts_parent_key() {
 async fn foreign_key_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "constraint_restart_test").await;
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE fk_parent_restart (id INT PRIMARY KEY)")
         .await
@@ -595,15 +578,16 @@ async fn foreign_key_survives_restart() {
         .batch_execute("INSERT INTO fk_parent_restart VALUES (1)")
         .await
         .expect("insert parent");
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "constraint_restart_test").await;
+    let client = &running.client;
     let missing = client
         .batch_execute("INSERT INTO fk_child_restart VALUES (2, 20)")
         .await
         .expect_err("missing parent rejected after restart");
     assert_eq!(missing.code().expect("SQLSTATE").code(), "23503");
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `DROP TABLE parent` respects live FK dependencies; CASCADE removes
@@ -1084,7 +1068,8 @@ async fn exclusion_constraint_rejects_overlapping_int4range() {
 async fn exclusion_constraint_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "constraint_restart_test").await;
+    let client = &running.client;
     client
         .batch_execute(
             "CREATE TABLE bookings_restart (\
@@ -1098,15 +1083,16 @@ async fn exclusion_constraint_survives_restart() {
         .batch_execute("INSERT INTO bookings_restart VALUES (101, '[1,10)'::int4range)")
         .await
         .expect("insert booking");
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "constraint_restart_test").await;
+    let client = &running.client;
     let err = client
         .batch_execute("INSERT INTO bookings_restart VALUES (101, '[5,6)'::int4range)")
         .await
         .expect_err("overlap rejected after restart");
     assert_eq!(err.code().expect("SQLSTATE").code(), "23P01");
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Geometric `&&` uses GiST-style bounding-box overlap semantics.
