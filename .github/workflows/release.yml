@@ -87,10 +87,10 @@ jobs:
             os: ubuntu-24.04-arm
             archive: tar
           - target: x86_64-apple-darwin
-            os: macos-15-intel
+            os: macos-14
             archive: tar
           - target: aarch64-apple-darwin
-            os: macos-15
+            os: macos-14
             archive: tar
           - target: x86_64-pc-windows-msvc
             os: windows-latest
