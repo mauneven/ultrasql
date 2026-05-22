@@ -109,21 +109,34 @@ pub(crate) fn write_data_row_typed(
     sink[length_index..length_index + 4].copy_from_slice(&length.to_be_bytes());
 }
 
+/// Start a two-column PostgreSQL `DataRow` and return the row tag offset.
+fn begin_two_column_data_row(sink: &mut BytesMut) -> usize {
+    let row_start = sink.len();
+    sink.put_u8(DATA_ROW_TAG);
+    sink.put_i32(0);
+    sink.put_i16(2);
+    row_start
+}
+
+/// Back-fill the length field for a row started by [`begin_two_column_data_row`].
+fn finish_data_row(sink: &mut BytesMut, row_start: usize) {
+    let length = i32_from_usize(sink.len() - row_start - 1);
+    sink[row_start + 1..row_start + 5].copy_from_slice(&length.to_be_bytes());
+}
+
 /// Fast bulk DataRow writer for the common `(Int32, Int32)` shape.
 ///
 /// Streams every row of a two-column non-nullable `Int32` batch into
-/// `sink` with no per-row enum dispatch and no per-cell length-
-/// placeholder back-fill. Both columns' bytes share a single
-/// `BytesMut::reserve` call sized to the worst-case wire footprint
-/// for this batch. For a 10 000-row scan this drops ~10 µs of
-/// `bytes::BytesMut::reserve` re-resize work plus the per-row enum
+/// `sink` with no per-row enum dispatch. Both columns' bytes share a
+/// single `BytesMut::reserve` call sized to the worst-case wire
+/// footprint for this batch. For a 10 000-row scan this drops ~10 µs
+/// of `bytes::BytesMut::reserve` re-resize work plus the per-row enum
 /// match in `write_cell`.
 ///
-/// The hot loop uses raw pointer writes against a freshly-reserved
-/// region of `sink`. Every offset is bounded above by the
-/// `n * MAX_ROW_BYTES` reserve at the top of the function, so we can
-/// safely skip the per-byte slice bounds checks the safe `[off]`
-/// indexing would emit.
+/// The hot loop uses safe `BytesMut` appends after one worst-case
+/// reserve. This preserves the no-allocation cell formatting path
+/// while avoiding raw pointer writes, manual `set_len`, and spare-
+/// capacity initialization proofs in the wire encoder.
 ///
 /// Caller verifies the shape upfront (`fast_int32_pair_data_rows`).
 pub(crate) fn write_int32_pair_data_rows(sink: &mut BytesMut, a: &[i32], b: &[i32]) {
@@ -138,72 +151,11 @@ pub(crate) fn write_int32_pair_data_rows(sink: &mut BytesMut, a: &[i32], b: &[i3
     const MAX_ROW_BYTES: usize = 37;
     sink.reserve(n * MAX_ROW_BYTES);
 
-    let base_len = sink.len();
-    // SAFETY: `reserve(n * MAX_ROW_BYTES)` guarantees the spare region
-    // starting at `base_len` has at least `n * MAX_ROW_BYTES`
-    // writable bytes. We write straight through a raw pointer and
-    // `set_len` once at the end — no aliased mutable borrows, every
-    // offset is bounded by `n * MAX_ROW_BYTES`.
-    let dst_base: *mut u8 = unsafe { sink.as_mut_ptr().add(base_len) };
-
-    let mut off: usize = 0;
-    let mut scratch_a = [0u8; 12];
-    let mut scratch_b = [0u8; 12];
     for row in 0..n {
-        // SAFETY: bounded by the per-row 37-byte reserve above.
-        unsafe {
-            let dst = dst_base.add(off);
-            // DataRow tag.
-            *dst = DATA_ROW_TAG;
-            // 4-byte length placeholder; back-filled below once we
-            // know the payload size. The two-step write tracks the
-            // index for the placeholder.
-            let length_ptr = dst.add(1);
-            // ncols = 2 (big-endian i16): bytes [0x00, 0x02] at
-            // offset +5.
-            *dst.add(5) = 0;
-            *dst.add(6) = 2;
-            off += 7; // tag + length placeholder + ncols
-
-            let a_text = format_i32_into(&mut scratch_a, a[row]);
-            let a_len = a_text.len();
-            // 4-byte big-endian column length.
-            let a_len_be = i32_from_usize(a_len).to_be_bytes();
-            std::ptr::copy_nonoverlapping(a_len_be.as_ptr(), dst_base.add(off), 4);
-            off += 4;
-            std::ptr::copy_nonoverlapping(a_text.as_ptr(), dst_base.add(off), a_len);
-            off += a_len;
-
-            let b_text = format_i32_into(&mut scratch_b, b[row]);
-            let b_len = b_text.len();
-            let b_len_be = i32_from_usize(b_len).to_be_bytes();
-            std::ptr::copy_nonoverlapping(b_len_be.as_ptr(), dst_base.add(off), 4);
-            off += 4;
-            std::ptr::copy_nonoverlapping(b_text.as_ptr(), dst_base.add(off), b_len);
-            off += b_len;
-
-            // Back-fill the 4-byte length placeholder. `payload_len`
-            // is the bytes after the length field itself, so the wire
-            // length (which includes the length field) is
-            // `(off - (length_index + 4)) + 4 = off - length_index`.
-            // `length_index = (dst - dst_base) + 1`, so the on-wire
-            // value is `off - ((dst - dst_base) + 1)`. We compute it
-            // via the captured row-start offset below.
-            // `off` at this point sits past the row. The row started
-            // at `off - row_bytes_written` where row_bytes_written =
-            // 7 + (4 + a_len) + (4 + b_len). The length field begins
-            // 1 byte into the row, so the length value is
-            // `row_bytes_written - 1`.
-            let row_bytes = 7 + 4 + a_len + 4 + b_len;
-            let length = i32_from_usize(row_bytes - 1).to_be_bytes();
-            std::ptr::copy_nonoverlapping(length.as_ptr(), length_ptr, 4);
-        }
-    }
-    // SAFETY: `off` ≤ `n * MAX_ROW_BYTES` because every row writes
-    // at most MAX_ROW_BYTES; `dst_base` is the spare region of
-    // `sink` we reserved above.
-    unsafe {
-        sink.set_len(base_len + off);
+        let row_start = begin_two_column_data_row(sink);
+        write_length_prefixed_int32(sink, a[row]);
+        write_length_prefixed_int32(sink, b[row]);
+        finish_data_row(sink, row_start);
     }
 }
 
@@ -216,16 +168,15 @@ pub(crate) fn write_int32_pair_data_rows(sink: &mut BytesMut, a: &[i32], b: &[i3
 /// `WindowAgg::try_columnar_row_number` columnar fast path lands here.
 ///
 /// Streams every row of a two-column `(Int32, Int64)` batch into
-/// `sink` with no per-row enum dispatch and no per-cell length
-/// placeholder back-fill. Both columns' bytes share a single
-/// `BytesMut::reserve` call sized to the worst-case wire footprint
-/// (37 + 9 = 46 bytes per row: 11-byte i32 vs. 20-byte i64 maxima).
+/// `sink` with no per-row enum dispatch. Both columns' bytes share a
+/// single `BytesMut::reserve` call sized to the worst-case wire
+/// footprint (37 + 9 = 46 bytes per row: 11-byte i32 vs. 20-byte i64
+/// maxima).
 ///
-/// The hot loop uses raw pointer writes against a freshly reserved
-/// region of `sink`. Every offset is bounded above by the
-/// `n * MAX_ROW_BYTES` reserve at the top of the function, so we can
-/// safely skip the per-byte slice bounds checks the safe `[off]`
-/// indexing would emit.
+/// The hot loop uses safe `BytesMut` appends after one worst-case
+/// reserve. This keeps the same zero-allocation integer formatting
+/// while removing manual spare-capacity initialization from the wire
+/// path.
 ///
 /// `a_nulls` / `b_nulls` track the optional validity bitmaps from
 /// the source columns. When both are `None` the inner loop is the
@@ -255,56 +206,15 @@ pub(crate) fn write_int32_int64_pair_data_rows(
     const MAX_ROW_BYTES: usize = 46;
     sink.reserve(n * MAX_ROW_BYTES);
 
-    let base_len = sink.len();
-    // SAFETY: `reserve(n * MAX_ROW_BYTES)` guarantees the spare region
-    // starting at `base_len` has at least `n * MAX_ROW_BYTES`
-    // writable bytes. We write straight through a raw pointer and
-    // `set_len` once at the end — no aliased mutable borrows, every
-    // offset is bounded by `n * MAX_ROW_BYTES`.
-    let dst_base: *mut u8 = unsafe { sink.as_mut_ptr().add(base_len) };
-
-    let mut off: usize = 0;
-    let mut scratch_a = [0u8; 12];
-    let mut scratch_b = [0u8; 20];
-
     // Fast path: no validity bitmaps anywhere. The inner loop is
     // branch-free per cell; the optimiser can hoist the bitmap-load
     // out of the hot loop entirely.
     if a_nulls.is_none() && b_nulls.is_none() {
         for row in 0..n {
-            // SAFETY: bounded by the per-row 46-byte reserve above.
-            unsafe {
-                let dst = dst_base.add(off);
-                // DataRow tag.
-                *dst = DATA_ROW_TAG;
-                // 4-byte length placeholder; back-filled below once
-                // we know the payload size.
-                let length_ptr = dst.add(1);
-                // ncols = 2 (big-endian i16).
-                *dst.add(5) = 0;
-                *dst.add(6) = 2;
-                off += 7; // tag + length placeholder + ncols
-
-                let a_text = format_i32_into(&mut scratch_a, a[row]);
-                let a_len = a_text.len();
-                let a_len_be = i32_from_usize(a_len).to_be_bytes();
-                std::ptr::copy_nonoverlapping(a_len_be.as_ptr(), dst_base.add(off), 4);
-                off += 4;
-                std::ptr::copy_nonoverlapping(a_text.as_ptr(), dst_base.add(off), a_len);
-                off += a_len;
-
-                let b_text = format_i64_into(&mut scratch_b, b[row]);
-                let b_len = b_text.len();
-                let b_len_be = i32_from_usize(b_len).to_be_bytes();
-                std::ptr::copy_nonoverlapping(b_len_be.as_ptr(), dst_base.add(off), 4);
-                off += 4;
-                std::ptr::copy_nonoverlapping(b_text.as_ptr(), dst_base.add(off), b_len);
-                off += b_len;
-
-                let row_bytes = 7 + 4 + a_len + 4 + b_len;
-                let length = i32_from_usize(row_bytes - 1).to_be_bytes();
-                std::ptr::copy_nonoverlapping(length.as_ptr(), length_ptr, 4);
-            }
+            let row_start = begin_two_column_data_row(sink);
+            write_length_prefixed_int32(sink, a[row]);
+            write_length_prefixed_int64(sink, b[row]);
+            finish_data_row(sink, row_start);
         }
     } else {
         // Slow path: at least one column carries a validity bitmap.
@@ -314,59 +224,19 @@ pub(crate) fn write_int32_int64_pair_data_rows(
         for row in 0..n {
             let a_null = a_nulls.is_some_and(|nulls| !nulls.get(row));
             let b_null = b_nulls.is_some_and(|nulls| !nulls.get(row));
-            // SAFETY: bounded by the per-row 46-byte reserve above.
-            unsafe {
-                let dst = dst_base.add(off);
-                *dst = DATA_ROW_TAG;
-                let length_ptr = dst.add(1);
-                *dst.add(5) = 0;
-                *dst.add(6) = 2;
-                off += 7;
-
-                let a_payload_len = if a_null {
-                    // -1 length, no payload bytes.
-                    let neg_one = (-1_i32).to_be_bytes();
-                    std::ptr::copy_nonoverlapping(neg_one.as_ptr(), dst_base.add(off), 4);
-                    off += 4;
-                    0
-                } else {
-                    let a_text = format_i32_into(&mut scratch_a, a[row]);
-                    let a_len = a_text.len();
-                    let a_len_be = i32_from_usize(a_len).to_be_bytes();
-                    std::ptr::copy_nonoverlapping(a_len_be.as_ptr(), dst_base.add(off), 4);
-                    off += 4;
-                    std::ptr::copy_nonoverlapping(a_text.as_ptr(), dst_base.add(off), a_len);
-                    off += a_len;
-                    a_len
-                };
-
-                let b_payload_len = if b_null {
-                    let neg_one = (-1_i32).to_be_bytes();
-                    std::ptr::copy_nonoverlapping(neg_one.as_ptr(), dst_base.add(off), 4);
-                    off += 4;
-                    0
-                } else {
-                    let b_text = format_i64_into(&mut scratch_b, b[row]);
-                    let b_len = b_text.len();
-                    let b_len_be = i32_from_usize(b_len).to_be_bytes();
-                    std::ptr::copy_nonoverlapping(b_len_be.as_ptr(), dst_base.add(off), 4);
-                    off += 4;
-                    std::ptr::copy_nonoverlapping(b_text.as_ptr(), dst_base.add(off), b_len);
-                    off += b_len;
-                    b_len
-                };
-
-                let row_bytes = 7 + 4 + a_payload_len + 4 + b_payload_len;
-                let length = i32_from_usize(row_bytes - 1).to_be_bytes();
-                std::ptr::copy_nonoverlapping(length.as_ptr(), length_ptr, 4);
+            let row_start = begin_two_column_data_row(sink);
+            if a_null {
+                sink.put_i32(-1);
+            } else {
+                write_length_prefixed_int32(sink, a[row]);
             }
+            if b_null {
+                sink.put_i32(-1);
+            } else {
+                write_length_prefixed_int64(sink, b[row]);
+            }
+            finish_data_row(sink, row_start);
         }
-    }
-    // SAFETY: `off` ≤ `n * MAX_ROW_BYTES` because every row writes
-    // at most MAX_ROW_BYTES; `dst_base` is the spare region of
-    // `sink` we reserved above.
-    unsafe {
-        sink.set_len(base_len + off);
     }
 }
 
@@ -500,15 +370,15 @@ pub(crate) fn write_int64_text(sink: &mut BytesMut, value: i64) {
 const DIGIT_PAIRS: [u8; 200] = {
     let mut out = [0u8; 200];
     let mut i: u8 = 0;
+    let mut base: usize = 0;
     while i < 100 {
         // `i / 10` and `i % 10` are in 0..=9, so `b'0' + ...` fits
-        // in `u8` without wrap. The two byte stores share the same
-        // base offset; `usize::from(i) * 2` is the lossless idiom
-        // for indexing.
-        let base = (i as usize) * 2; // wrap-free: i < 100, base < 200.
+        // in `u8` without wrap. `base` advances by two bytes per
+        // iteration and remains below 200 while `i < 100`.
         out[base] = b'0' + i / 10;
         out[base + 1] = b'0' + i % 10;
         i += 1;
+        base += 2;
     }
     out
 };

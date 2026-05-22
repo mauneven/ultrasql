@@ -490,18 +490,13 @@ impl ClassRow {
         let reltuples = r.f64()?;
         let relfilenode = r.u32()?;
         let relhasindex = r.bool()?;
-        let reloptions = if r.remaining() == 0 {
-            Vec::new()
-        } else {
-            let count = r.u32()?;
-            let mut options = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
-            for _ in 0..count {
-                let key = r.str()?;
-                let value = r.str()?;
-                options.push((key, value));
-            }
-            options
-        };
+        let count = r.u32()?;
+        let mut reloptions = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+        for _ in 0..count {
+            let key = r.str()?;
+            let value = r.str()?;
+            reloptions.push((key, value));
+        }
         Ok(Self {
             oid,
             relname,

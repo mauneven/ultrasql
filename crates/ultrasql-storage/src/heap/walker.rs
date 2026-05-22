@@ -98,6 +98,15 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> std::fmt::Debug for VisibleHeap
 }
 
 impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
+    /// Return the block/slot position where a future walker should resume.
+    ///
+    /// After [`Self::try_next`] yields a tuple, this position points to
+    /// the next slot after that tuple. After EOF, `block >= block_count`.
+    #[must_use]
+    pub const fn resume_position(&self) -> (u32, u16) {
+        (self.current_block, self.current_slot)
+    }
+
     /// Advance to the next MVCC-visible tuple and return a borrowed
     /// view of its `(TupleId, TupleHeader, payload_bytes)`.
     ///
@@ -134,7 +143,6 @@ impl<L: PageLoader, O: XidStatusOracle + ?Sized> VisibleHeapWalker<'_, L, O> {
                     self.page_scratch
                         .extend_from_slice(page.as_bytes().as_slice());
                 }
-                self.current_slot = 0;
                 self.current_block_all_visible = self
                     .vm
                     .is_some_and(|vm| vm.is_all_visible(self.rel, page_id.block));
@@ -290,6 +298,6 @@ fn lookup_undo_pre_image_owned<O: XidStatusOracle + ?Sized>(
 /// `pub(crate)`-private and so unreachable from the walker's
 /// inline slot-dir parse.
 #[inline]
-const fn ultrasql_storage_page_item_id_offset(slot: u16) -> usize {
-    crate::page::PAGE_HEADER_SIZE + (slot as usize) * crate::page::ITEMID_SIZE
+fn ultrasql_storage_page_item_id_offset(slot: u16) -> usize {
+    crate::page::PAGE_HEADER_SIZE + usize::from(slot) * crate::page::ITEMID_SIZE
 }

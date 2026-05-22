@@ -53,14 +53,6 @@
 //!   crash durability; `F_FULLFSYNC` flushes the platter / NAND. The
 //!   call is a no-op on Linux.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_lossless,
-    reason = "on-disk format / fixed-width packing; narrowings bounded by PAGE_SIZE / relation size"
-)]
-
 use std::fs::{self, File, OpenOptions};
 use std::io;
 #[cfg(unix)]
@@ -80,6 +72,10 @@ use ultrasql_core::{BlockNumber, Error, PageId, RelationId, Result, SegmentId};
 
 use crate::buffer_pool::PageLoader;
 use crate::page::{Page, PageError};
+
+fn page_size_u64() -> u64 {
+    u64::try_from(PAGE_SIZE).expect("PAGE_SIZE fits in u64 on supported targets")
+}
 
 /// Default number of pages per segment file (1 GiB at 8 KiB pages).
 pub const DEFAULT_SEGMENT_SIZE_PAGES: u32 = 131_072;
@@ -196,12 +192,13 @@ impl SegmentFile {
         let file = opts.open(&path)?;
         let meta = file.metadata()?;
         let len = meta.len();
-        if len % PAGE_SIZE as u64 != 0 {
+        let page_size = page_size_u64();
+        if len % page_size != 0 {
             return Err(SegmentError::Layout(
                 "segment file length is not a multiple of PAGE_SIZE",
             ));
         }
-        let pages_u64 = len / PAGE_SIZE as u64;
+        let pages_u64 = len / page_size;
         let pages = u32::try_from(pages_u64)
             .map_err(|_| SegmentError::Layout("segment file holds more pages than u32"))?;
         if pages > cap {
@@ -264,7 +261,7 @@ impl SegmentFile {
         if new_pages > self.cap {
             return Err(SegmentError::Layout("grow past segment cap"));
         }
-        let new_len = u64::from(new_pages) * PAGE_SIZE as u64;
+        let new_len = u64::from(new_pages) * page_size_u64();
         // Drop the existing map BEFORE resizing the file. On macOS,
         // resizing a mapped file is technically allowed but the kernel
         // may surprise us with SIGBUS on access past the old size; on
@@ -286,7 +283,7 @@ impl SegmentFile {
         if new_pages >= self.pages {
             return Ok(());
         }
-        let new_len = u64::from(new_pages) * PAGE_SIZE as u64;
+        let new_len = u64::from(new_pages) * page_size_u64();
         self.mmap = None;
         self.file.set_len(new_len)?;
         self.pages = new_pages;
@@ -304,7 +301,7 @@ impl SegmentFile {
         dst: &mut [u8; PAGE_SIZE],
     ) -> Result<(), SegmentError> {
         debug_assert!(block_in_segment < self.pages);
-        let offset = u64::from(block_in_segment) * PAGE_SIZE as u64;
+        let offset = u64::from(block_in_segment) * page_size_u64();
         if let Some(map) = self.mmap.as_ref() {
             let start = usize::try_from(offset)
                 .map_err(|_| SegmentError::Layout("offset overflowed usize"))?;
@@ -328,7 +325,7 @@ impl SegmentFile {
         src: &[u8; PAGE_SIZE],
     ) -> Result<(), SegmentError> {
         debug_assert!(block_in_segment < self.pages);
-        let offset = u64::from(block_in_segment) * PAGE_SIZE as u64;
+        let offset = u64::from(block_in_segment) * page_size_u64();
         if let Some(map) = self.mmap.as_mut() {
             let start = usize::try_from(offset)
                 .map_err(|_| SegmentError::Layout("offset overflowed usize"))?;
@@ -373,8 +370,10 @@ fn pread_exact(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
 fn pread_exact(file: &File, dst: &mut [u8], offset: u64) -> io::Result<()> {
     let mut filled = 0_usize;
     while filled < dst.len() {
+        let filled_u64 = u64::try_from(filled)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
         let cur_off = offset
-            .checked_add(filled as u64)
+            .checked_add(filled_u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
         match file.seek_read(&mut dst[filled..], cur_off)? {
             0 => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "short read")),
@@ -398,8 +397,10 @@ fn pwrite_all(file: &File, src: &[u8], offset: u64) -> io::Result<()> {
 fn pwrite_all(file: &File, src: &[u8], offset: u64) -> io::Result<()> {
     let mut written = 0_usize;
     while written < src.len() {
+        let written_u64 = u64::try_from(written)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
         let cur_off = offset
-            .checked_add(written as u64)
+            .checked_add(written_u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
         match file.seek_write(&src[written..], cur_off)? {
             0 => {
@@ -1052,8 +1053,8 @@ mod tests {
         assert!(seg1.exists());
         let meta0 = std::fs::metadata(&seg0).unwrap();
         let meta1 = std::fs::metadata(&seg1).unwrap();
-        assert_eq!(meta0.len(), 4 * PAGE_SIZE as u64);
-        assert_eq!(meta1.len(), 2 * PAGE_SIZE as u64);
+        assert_eq!(meta0.len(), 4 * page_size_u64());
+        assert_eq!(meta1.len(), 2 * page_size_u64());
     }
 
     #[test]
@@ -1065,8 +1066,12 @@ mod tests {
             for i in 0..6_u32 {
                 let blk = mgr.allocate_block(r).unwrap();
                 let mut p = Page::new_heap();
-                p.insert_tuple(&make_payload((i as u8).wrapping_add(1)))
-                    .unwrap();
+                p.insert_tuple(&make_payload(
+                    u8::try_from(i)
+                        .expect("test value fits in u8")
+                        .wrapping_add(1),
+                ))
+                .unwrap();
                 mgr.write_page(PageId::new(r, blk), &p).unwrap();
             }
             mgr.fsync_relation(r).unwrap();
@@ -1077,7 +1082,15 @@ mod tests {
         for i in 0..6_u32 {
             let page = mgr.read_page(pid(11, i)).unwrap();
             let tup = page.read_tuple(0).unwrap();
-            assert_eq!(tup, make_payload((i as u8).wrapping_add(1)).as_slice());
+            assert_eq!(
+                tup,
+                make_payload(
+                    u8::try_from(i)
+                        .expect("test value fits in u8")
+                        .wrapping_add(1)
+                )
+                .as_slice()
+            );
         }
     }
 
@@ -1178,7 +1191,7 @@ mod tests {
         assert!(!tmp.path().join("23").join("1").exists());
         assert!(!tmp.path().join("23").join("2").exists());
         let meta = std::fs::metadata(tmp.path().join("23").join("0")).unwrap();
-        assert_eq!(meta.len(), 3 * PAGE_SIZE as u64);
+        assert_eq!(meta.len(), 3 * page_size_u64());
     }
 
     #[test]
@@ -1204,7 +1217,10 @@ mod tests {
         for i in 0..8_u32 {
             let blk = mgr.allocate_block(r).unwrap();
             let mut p = Page::new_heap();
-            p.insert_tuple(&make_payload(i as u8)).unwrap();
+            p.insert_tuple(&make_payload(
+                u8::try_from(i).expect("test value fits in u8"),
+            ))
+            .unwrap();
             mgr.write_page(PageId::new(r, blk), &p).unwrap();
         }
 
@@ -1216,7 +1232,11 @@ mod tests {
                     for b in 0..8_u32 {
                         let page = mgr.read_page(pid(31, b)).unwrap();
                         let t = page.read_tuple(0).unwrap();
-                        assert_eq!(t, make_payload(b as u8).as_slice());
+                        assert_eq!(
+                            t,
+                            make_payload(u8::try_from(b).expect("test value fits in u8"))
+                                .as_slice()
+                        );
                     }
                 }
                 thread_id
@@ -1235,7 +1255,10 @@ mod tests {
         for i in 0..6_u32 {
             let blk = mgr.allocate_block(r).unwrap();
             let mut p = Page::new_heap();
-            p.insert_tuple(&make_payload(i as u8)).unwrap();
+            p.insert_tuple(&make_payload(
+                u8::try_from(i).expect("test value fits in u8"),
+            ))
+            .unwrap();
             mgr.write_page(PageId::new(r, blk), &p).unwrap();
         }
         let mut handles = Vec::new();

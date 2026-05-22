@@ -129,29 +129,12 @@ pub(super) fn read_error_fields(
 // panic on bad input.
 // ---------------------------------------------------------------------------
 
-#[allow(
-    clippy::cast_sign_loss,
-    reason = "non-negative guard above proves the cast cannot lose the sign"
-)]
-pub(super) const fn usize_from_i32(
-    value: i32,
-    _what: &'static str,
-) -> Result<usize, ProtocolError> {
-    if value < 0 {
-        return Err(ProtocolError::Malformed("negative length"));
-    }
-    Ok(value as usize)
+pub(super) fn usize_from_i32(value: i32, _what: &'static str) -> Result<usize, ProtocolError> {
+    usize::try_from(value).map_err(|_| ProtocolError::Malformed("negative length"))
 }
 
-#[allow(
-    clippy::cast_sign_loss,
-    reason = "non-negative guard above proves the cast cannot lose the sign"
-)]
-pub(super) const fn nonneg_usize(value: i16, _what: &'static str) -> Result<usize, ProtocolError> {
-    if value < 0 {
-        return Err(ProtocolError::Malformed("negative count"));
-    }
-    Ok(value as usize)
+pub(super) fn nonneg_usize(value: i16, _what: &'static str) -> Result<usize, ProtocolError> {
+    usize::try_from(value).map_err(|_| ProtocolError::Malformed("negative count"))
 }
 
 /// Encoder helper. The wire length is encoded as a signed 32-bit

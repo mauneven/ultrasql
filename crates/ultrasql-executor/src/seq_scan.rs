@@ -14,24 +14,21 @@
 //! v0.5 "materialise everything into `Vec<Vec<Value>>` before
 //! yielding the first batch" hack is gone.
 //!
-//! # Iterator self-reference
+//! # Walker lifetime model
 //!
-//! [`VisibleHeapScan`] borrows from the [`HeapAccess`], the
-//! [`Snapshot`], and the [`XidStatusOracle`] used to construct it.
-//! The operator owns those three behind heap-stable handles
-//! (`Arc<HeapAccess<L>>`, `Box<Snapshot>`, `Arc<O>`) and stashes the
-//! iterator with a lifetime-extended-via-`transmute` reference. Drop
-//! order is encoded in the struct's field order: the iterator is
-//! declared first and therefore dropped first, before the data it
-//! borrows from. See [`SeqScan`]'s `# Safety` block for the full
-//! reasoning.
+//! [`VisibleHeapWalker`] borrows from [`HeapAccess`], [`Snapshot`], and
+//! [`XidStatusOracle`]. `SeqScan` avoids a self-referential struct by
+//! storing only the next `(block, slot)` resume position. Each
+//! [`Operator::next_batch`] call creates a short-lived walker borrowing
+//! from `self`, streams up to one output batch, then stores the walker's
+//! resume position before the borrow ends.
 
 use std::sync::Arc;
 
 use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
 use ultrasql_mvcc::{Snapshot, XidStatusOracle};
 use ultrasql_storage::PageLoader;
-use ultrasql_storage::heap::{HeapAccess, VisibleHeapWalker};
+use ultrasql_storage::heap::HeapAccess;
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
@@ -57,41 +54,9 @@ const BATCH_TARGET_ROWS: usize = 4096;
 ///
 /// The operator is `Send` because every owned field —
 /// `Arc<HeapAccess<L>>`, `Box<Snapshot>`, `Arc<O>`, and the column
-/// builders — is `Send + Sync`. The `unsafe` lifetime extension on the
-/// stored iterator does not weaken `Send`: the borrows it carries
-/// point to `Arc`/`Box` payloads that move with the struct without
-/// reallocating.
-///
-/// # Safety
-///
-/// `iter` is stored with `'static` lifetime after construction. The
-/// real borrow targets are:
-/// - the inner `HeapAccess<L>` reachable through `heap` (heap-stable
-///   behind `Arc`);
-/// - the inner `Snapshot` reachable through `snapshot` (heap-stable
-///   behind `Box`);
-/// - the inner `O` reachable through `oracle` (heap-stable behind
-///   `Arc`).
-///
-/// None of those targets are deallocated or moved while the iterator
-/// is alive. The `iter` field is declared first so that Rust drops
-/// it before the fields it borrows from, preventing a use-after-free
-/// at struct destruction time.
+/// builders — is `Send + Sync`. The heap walker is never stored across
+/// calls, so no lifetime erasure is required.
 pub struct SeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'static> {
-    /// Active heap walker. Lifetime-erased to `'static`; the real
-    /// borrows live as long as `heap`, `snapshot`, and `oracle`.
-    ///
-    /// Uses the zero-alloc [`VisibleHeapWalker`] which writes each
-    /// slot's bytes into an internal scratch buffer and hands the
-    /// caller a borrowed slice — no per-tuple `Vec<u8>` allocations
-    /// in the streaming path.
-    ///
-    /// `None` once the scan has reached end-of-stream **or** the
-    /// scan is reading from a cached columnar projection
-    /// ([`Self::cache_read`]) — the column cache fully replaces the
-    /// heap walker for repeat scans over an unchanged relation.
-    /// Declared first so it drops before the data it references.
-    iter: Option<VisibleHeapWalker<'static, L, O>>,
     /// Reusable typed column builders. Sized to
     /// [`BATCH_TARGET_ROWS`] capacity on every fresh allocation and
     /// swapped out wholesale when a batch is emitted.
@@ -133,8 +98,12 @@ pub struct SeqScan<L: PageLoader + 'static, O: XidStatusOracle + ?Sized + 'stati
     vm: Option<Arc<VisibilityMap>>,
     /// Static metadata captured at construction.
     relation: RelationId,
-    /// Number of allocated blocks at scan-open time.
+    /// Exclusive end block for this scan.
     block_count: u32,
+    /// Block where the next short-lived walker should resume.
+    next_block: u32,
+    /// Slot where the next short-lived walker should resume.
+    next_slot: u16,
     /// Row codec; owns the schema and drives `decode_into_builders`.
     codec: RowCodec,
     /// `true` if the operator should prepend `tid_block` / `tid_slot`
@@ -390,8 +359,6 @@ where
         allow_cache: bool,
         output_schema: Schema,
     ) -> Self {
-        // Heap-allocate the snapshot so its address is stable across
-        // moves of `Self`.
         let snapshot_box: Box<Snapshot> = Box::new(snapshot);
 
         // Column-cache eligibility:
@@ -434,51 +401,6 @@ where
             build_initial_builders(&codec, with_tids)
         };
 
-        // Defer the walker construction past the cache decision: on
-        // a cache hit the walker is built and immediately dropped,
-        // pinning a buffer-pool frame for no reason. The walker
-        // also lifetime-erases borrows of `heap`/`snapshot_box`/`oracle`,
-        // so skipping it leaves those pins acquired only when the
-        // scan actually walks the heap.
-        let iter = if cache_hit {
-            None
-        } else {
-            // SAFETY: `heap`, `snapshot_box`, and `oracle` keep
-            // their referents at stable heap addresses for the
-            // lifetime of the `SeqScan`. The iterator is declared
-            // as the first field and therefore dropped first,
-            // before the borrows go away. See the type-level
-            // `# Safety` doc for the full argument.
-            let walker: VisibleHeapWalker<'static, L, O> = unsafe {
-                let heap_ref: &'static HeapAccess<L> =
-                    std::mem::transmute::<&HeapAccess<L>, &'static HeapAccess<L>>(&*heap);
-                let snap_ref: &'static Snapshot =
-                    std::mem::transmute::<&Snapshot, &'static Snapshot>(&*snapshot_box);
-                let oracle_ref: &'static O = std::mem::transmute::<&O, &'static O>(&*oracle);
-                if let Some(vm) = vm.as_deref() {
-                    let vm_ref: &'static VisibilityMap =
-                        std::mem::transmute::<&VisibilityMap, &'static VisibilityMap>(vm);
-                    heap_ref.scan_visible_walker_range_with_vm(
-                        relation,
-                        start_block,
-                        block_count,
-                        snap_ref,
-                        oracle_ref,
-                        vm_ref,
-                    )
-                } else {
-                    heap_ref.scan_visible_walker_range(
-                        relation,
-                        start_block,
-                        block_count,
-                        snap_ref,
-                        oracle_ref,
-                    )
-                }
-            };
-            Some(walker)
-        };
-
         // Decide whether this scan should populate the cache as a
         // side effect. Skip the build when (a) the scan is reading
         // from the cache already, (b) the scan is TID-augmented, or
@@ -494,7 +416,6 @@ where
         };
 
         Self {
-            iter,
             builders,
             cache_read,
             cache_build,
@@ -504,6 +425,8 @@ where
             vm,
             relation,
             block_count,
+            next_block: start_block.min(block_count),
+            next_slot: 0,
             codec,
             with_tids,
             output_schema,
@@ -585,7 +508,25 @@ where
         let mut rows_buffered: usize = 0;
         let mut iter_exhausted = true;
 
-        if let Some(walker) = self.iter.as_mut() {
+        if self.next_block < self.block_count {
+            let mut walker = if let Some(vm) = self.vm.as_deref() {
+                self.heap.scan_visible_walker_range_from_position_with_vm(
+                    self.relation,
+                    (self.next_block, self.next_slot),
+                    self.block_count,
+                    &self.snapshot,
+                    self.oracle.as_ref(),
+                    vm,
+                )
+            } else {
+                self.heap.scan_visible_walker_range_from_position(
+                    self.relation,
+                    (self.next_block, self.next_slot),
+                    self.block_count,
+                    &self.snapshot,
+                    self.oracle.as_ref(),
+                )
+            };
             while rows_buffered < BATCH_TARGET_ROWS {
                 let item = walker.try_next().map_err(|e| {
                     tracing::warn!(error = %e, "heap scan error");
@@ -642,11 +583,13 @@ where
             if rows_buffered >= BATCH_TARGET_ROWS {
                 iter_exhausted = false;
             }
+            let (next_block, next_slot) = walker.resume_position();
+            self.next_block = next_block;
+            self.next_slot = next_slot;
         }
 
         if rows_buffered == 0 {
             self.eof = true;
-            self.iter = None;
             // Finalise the cache build, if any. The walker is
             // exhausted: we have every visible row in
             // `cache_build.builders`. Store the result and let the
@@ -666,7 +609,6 @@ where
 
         if iter_exhausted {
             self.eof = true;
-            self.iter = None;
             // Walker is done — finalise the cache build before the
             // operator emits its EOF marker on the next call.
             self.finalise_cache_build();
