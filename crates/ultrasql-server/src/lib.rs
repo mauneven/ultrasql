@@ -76,7 +76,7 @@ use ultrasql_catalog::{
     TableEntry,
 };
 use ultrasql_core::constants::PAGE_SIZE;
-use ultrasql_core::{BlockNumber, DataType, Lsn, PageId, RelationId, Value, Xid};
+use ultrasql_core::{BlockNumber, DataType, Lsn, Oid, PageId, RelationId, Value, Xid};
 use ultrasql_executor::{Eval, ExecError, MemTableScan, Operator, RowCodec, SeqScan};
 use ultrasql_optimizer::{
     AnalyzeOptions, AnalyzeRunner, InMemoryStatsCatalog, PgStatisticRow, PlanCache,
@@ -2577,9 +2577,181 @@ impl Server {
         };
         server.recover_commit_status_from_wal()?;
         server.rebuild_persistent_index_sidecars()?;
+        server.rebuild_table_runtime_constraint_sidecars()?;
         server.rebuild_row_security_sidecars()?;
         server.rebuild_materialized_view_runtime_sidecars()?;
         Ok(server)
+    }
+
+    fn table_runtime_metadata_path(&self) -> Option<std::path::PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join("pg_table_runtime.meta"))
+    }
+
+    pub(crate) fn persist_table_runtime_constraints_metadata(&self) -> Result<(), ServerError> {
+        let Some(path) = self.table_runtime_metadata_path() else {
+            return Ok(());
+        };
+        let snapshot = self.catalog_snapshot();
+        let mut entries = self
+            .table_constraints
+            .iter()
+            .filter_map(|entry| {
+                let table = snapshot.tables_by_oid.get(entry.key())?;
+                Some((
+                    *entry.key(),
+                    table.name.clone(),
+                    entry.value().as_ref().clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(oid, _, _)| oid.raw());
+
+        let mut out = String::from("# ultrasql table runtime constraints v1\n");
+        for (oid, table_name, constraints) in entries {
+            out.push_str(&format!(
+                "table\t{}\t{}\n",
+                metadata_escape(&table_name),
+                oid.raw()
+            ));
+            for (idx, seq_name) in constraints.sequence_defaults.iter().enumerate() {
+                let Some(seq_name) = seq_name else {
+                    continue;
+                };
+                out.push_str(&format!(
+                    "sequence_default\t{}\t{}\t{}\n",
+                    oid.raw(),
+                    idx,
+                    metadata_escape(seq_name)
+                ));
+            }
+            for (idx, identity_always) in constraints.identity_always.iter().enumerate() {
+                if *identity_always {
+                    out.push_str(&format!("identity_always\t{}\t{}\n", oid.raw(), idx));
+                }
+            }
+        }
+        let tmp = path.with_extension("meta.tmp");
+        std::fs::write(&tmp, out).map_err(ServerError::Io)?;
+        std::fs::rename(tmp, path).map_err(ServerError::Io)?;
+        Ok(())
+    }
+
+    fn rebuild_table_runtime_constraint_sidecars(&self) -> Result<(), ServerError> {
+        let Some(path) = self.table_runtime_metadata_path() else {
+            return Ok(());
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(ServerError::Io(err)),
+        };
+        let snapshot = self.catalog_snapshot();
+        let mut table_names: std::collections::HashMap<Oid, String> =
+            std::collections::HashMap::new();
+        let mut sequence_defaults: std::collections::HashMap<Oid, Vec<(usize, String)>> =
+            std::collections::HashMap::new();
+        let mut identity_always: std::collections::HashMap<Oid, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (line_no, line) in text.lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts = line.split('\t').collect::<Vec<_>>();
+            match parts.first().copied() {
+                Some("table") if parts.len() == 3 => {
+                    let oid = Oid::new(parts[2].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    table_names.insert(oid, metadata_unescape(parts[1])?);
+                }
+                Some("sequence_default") if parts.len() == 4 => {
+                    let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    let idx = parts[2].parse::<usize>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad column index: {err}",
+                            line_no + 1
+                        ))
+                    })?;
+                    sequence_defaults
+                        .entry(oid)
+                        .or_default()
+                        .push((idx, metadata_unescape(parts[3])?));
+                }
+                Some("identity_always") if parts.len() == 3 => {
+                    let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    let idx = parts[2].parse::<usize>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad column index: {err}",
+                            line_no + 1
+                        ))
+                    })?;
+                    identity_always.entry(oid).or_default().push(idx);
+                }
+                _ => {
+                    return Err(ServerError::Ddl(format!(
+                        "malformed table-runtime metadata line {}",
+                        line_no + 1
+                    )));
+                }
+            }
+        }
+        for (oid, table_name) in table_names {
+            let Some(table) = snapshot.tables_by_oid.get(&oid) else {
+                continue;
+            };
+            if table.name != table_name {
+                continue;
+            }
+            let width = table.schema.fields().len();
+            let mut runtime = self
+                .table_constraints
+                .get(&oid)
+                .map(|existing| existing.as_ref().clone())
+                .unwrap_or_default();
+            if runtime.defaults.len() < width {
+                runtime.defaults.resize(width, None);
+            }
+            if runtime.sequence_defaults.len() < width {
+                runtime.sequence_defaults.resize(width, None);
+            }
+            if runtime.identity_always.len() < width {
+                runtime.identity_always.resize(width, false);
+            }
+            if runtime.generated_stored.len() < width {
+                runtime.generated_stored.resize(width, None);
+            }
+            if let Some(defaults) = sequence_defaults.remove(&oid) {
+                for (idx, seq_name) in defaults {
+                    if idx < runtime.sequence_defaults.len() {
+                        runtime.sequence_defaults[idx] = Some(seq_name);
+                    }
+                }
+            }
+            if let Some(always_columns) = identity_always.remove(&oid) {
+                for idx in always_columns {
+                    if idx < runtime.identity_always.len() {
+                        runtime.identity_always[idx] = true;
+                    }
+                }
+            }
+            self.table_constraints.insert(oid, Arc::new(runtime));
+        }
+        Ok(())
     }
 
     fn row_security_metadata_path(&self) -> Option<std::path::PathBuf> {

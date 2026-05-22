@@ -458,6 +458,7 @@ where
         }
         self.state
             .commit_transaction(ddl_txn, true, "CREATE TABLE catalog-write transaction")?;
+        self.state.persist_table_runtime_constraints_metadata()?;
         if let Some(partition) = partition {
             self.state.time_partitions.insert(
                 table_name.clone(),
