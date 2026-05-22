@@ -121,6 +121,19 @@ pub struct VacuumProgressSnapshot {
     pub heap_blks_vacuumed: i64,
 }
 
+/// Cumulative usage counters for one SQL index.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IndexUsageStats {
+    /// Index relation OID.
+    pub indexrelid: u32,
+    /// Number of executor paths that used this index.
+    pub idx_scan: u64,
+    /// Index entries returned by the access method before heap visibility.
+    pub idx_tup_read: u64,
+    /// Heap rows fetched and found visible through this index.
+    pub idx_tup_fetch: u64,
+}
+
 #[derive(Debug, Default)]
 struct LatencyHistogramState {
     bucket_counts: [u64; LATENCY_BUCKET_COUNT],
@@ -171,6 +184,7 @@ pub struct WorkloadRecorder {
     slow_query_threshold: parking_lot::RwLock<Option<Duration>>,
     latency_histogram: parking_lot::Mutex<LatencyHistogramState>,
     vacuum_progress: parking_lot::Mutex<HashMap<u32, VacuumProgressSnapshot>>,
+    index_usage: parking_lot::Mutex<HashMap<u32, IndexUsageStats>>,
     slow_log_capacity: usize,
 }
 
@@ -190,6 +204,7 @@ impl WorkloadRecorder {
             slow_query_threshold: parking_lot::RwLock::new(None),
             latency_histogram: parking_lot::Mutex::new(LatencyHistogramState::default()),
             vacuum_progress: parking_lot::Mutex::new(HashMap::new()),
+            index_usage: parking_lot::Mutex::new(HashMap::new()),
             slow_log_capacity: 1024,
         }
     }
@@ -342,6 +357,38 @@ impl WorkloadRecorder {
         rows.sort_by_key(|row| row.pid);
         rows
     }
+
+    /// Add one completed index access to cumulative `pg_stat_user_indexes`
+    /// counters.
+    pub fn record_index_usage(&self, indexrelid: u32, tuples_read: u64, tuples_fetched: u64) {
+        let mut usage = self.index_usage.lock();
+        usage
+            .entry(indexrelid)
+            .and_modify(|stats| {
+                stats.idx_scan = stats.idx_scan.saturating_add(1);
+                stats.idx_tup_read = stats.idx_tup_read.saturating_add(tuples_read);
+                stats.idx_tup_fetch = stats.idx_tup_fetch.saturating_add(tuples_fetched);
+            })
+            .or_insert(IndexUsageStats {
+                indexrelid,
+                idx_scan: 1,
+                idx_tup_read: tuples_read,
+                idx_tup_fetch: tuples_fetched,
+            });
+    }
+
+    /// Return cumulative usage counters for one index, if any.
+    #[must_use]
+    pub fn index_usage_for(&self, indexrelid: u32) -> IndexUsageStats {
+        self.index_usage
+            .lock()
+            .get(&indexrelid)
+            .cloned()
+            .unwrap_or(IndexUsageStats {
+                indexrelid,
+                ..IndexUsageStats::default()
+            })
+    }
 }
 
 /// Hash a bound logical plan without exposing literal values to logs.
@@ -447,5 +494,29 @@ mod tests {
 
         recorder.finish_vacuum(7);
         assert!(recorder.vacuum_progress().is_empty());
+    }
+
+    #[test]
+    fn workload_recorder_accumulates_index_usage() {
+        let recorder = WorkloadRecorder::new();
+        recorder.record_index_usage(99, 3, 2);
+        recorder.record_index_usage(99, 4, 4);
+
+        assert_eq!(
+            recorder.index_usage_for(99),
+            IndexUsageStats {
+                indexrelid: 99,
+                idx_scan: 2,
+                idx_tup_read: 7,
+                idx_tup_fetch: 6,
+            }
+        );
+        assert_eq!(
+            recorder.index_usage_for(100),
+            IndexUsageStats {
+                indexrelid: 100,
+                ..IndexUsageStats::default()
+            }
+        );
     }
 }

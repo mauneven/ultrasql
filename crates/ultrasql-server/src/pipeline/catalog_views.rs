@@ -1405,15 +1405,16 @@ fn rows_pg_stat_user_indexes(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         .into_iter()
         .filter_map(|idx| {
             let table = ctx.catalog_snapshot.tables_by_oid.get(&idx.table_oid)?;
+            let usage = ctx.workload_recorder.index_usage_for(idx.oid.raw());
             Some(vec![
                 v_i64(table.oid.raw()),
                 v_i64(idx.oid.raw()),
                 v_text(table.schema_name.clone()),
                 v_text(table.name.clone()),
                 v_text(idx.name.clone()),
-                Value::Int64(0),
-                Value::Int64(0),
-                Value::Int64(0),
+                Value::Int64(u64_to_i64_saturating(usage.idx_scan)),
+                Value::Int64(u64_to_i64_saturating(usage.idx_tup_read)),
+                Value::Int64(u64_to_i64_saturating(usage.idx_tup_fetch)),
             ])
         })
         .collect()

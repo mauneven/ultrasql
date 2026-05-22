@@ -196,6 +196,9 @@ fn try_brin_index_scan(
         high_key.as_ref().map(|k| k.as_slice()),
     );
     let payloads = scan_brin_candidate_ranges(table_entry, &candidate_ranges, ctx)?;
+    let visible_rows = usize_to_u64_saturating(payloads.len());
+    ctx.workload_recorder
+        .record_index_usage(index_entry.oid.raw(), visible_rows, visible_rows);
     let codec = RowCodec::new(table_entry.schema.clone());
     let scan = Box::new(IndexScan::new(payloads, codec));
     Ok(Some(Box::new(Filter::new(scan, predicate.clone()))))
@@ -642,6 +645,7 @@ pub(super) fn try_index_only_scan(
     })?;
 
     let entries = probe_index_entries_ordered(index_entry, range, true, ctx)?;
+    let tuples_read = usize_to_u64_saturating(entries.len());
     let table_rel = RelationId(table_entry.oid);
     if entries
         .iter()
@@ -662,6 +666,8 @@ pub(super) fn try_index_only_scan(
     let Some(projected_rows) = projected_rows else {
         return Ok(None);
     };
+    ctx.workload_recorder
+        .record_index_usage(index_entry.oid.raw(), tuples_read, 0);
     let vm = vec![true; projected_rows.len()];
     Ok(Some(Box::new(IndexOnlyScan::new(
         projected_rows,
@@ -1287,7 +1293,14 @@ fn probe_index_ordered(
     ctx: &LowerCtx<'_>,
 ) -> Result<Vec<Vec<u8>>, ServerError> {
     let entries = probe_index_entries_ordered(index_entry, range, ascending, ctx)?;
-    fetch_visible_index_payloads(entries.into_iter().map(|(_, tid)| tid), ctx)
+    let tuples_read = usize_to_u64_saturating(entries.len());
+    let payloads = fetch_visible_index_payloads(entries.into_iter().map(|(_, tid)| tid), ctx)?;
+    ctx.workload_recorder.record_index_usage(
+        index_entry.oid.raw(),
+        tuples_read,
+        usize_to_u64_saturating(payloads.len()),
+    );
+    Ok(payloads)
 }
 
 fn probe_index_ordered_limited(
@@ -1305,6 +1318,7 @@ fn probe_index_ordered_limited(
     let btree: BTree<BlankPageLoader> =
         BTree::open(Arc::clone(pool), index_rel, index_entry.root_block);
     let mut payloads = Vec::new();
+    let mut tuples_read = 0_u64;
 
     match (range.low, range.high, ascending) {
         (Some(lo), Some(hi), true) if lo == hi => {
@@ -1313,6 +1327,7 @@ fn probe_index_ordered_limited(
                     .lookup::<i64>(lo)
                     .map_err(|e| ServerError::ddl(format!("IndexScan btree lookup: {e}")))?
                 {
+                    tuples_read = tuples_read.saturating_add(1);
                     push_visible_index_payload(&mut payloads, tid, ctx, limit)?;
                 }
             } else {
@@ -1320,6 +1335,7 @@ fn probe_index_ordered_limited(
                     .lookup_all::<i64>(lo)
                     .map_err(|e| ServerError::ddl(format!("IndexScan btree lookup: {e}")))?
                 {
+                    tuples_read = tuples_read.saturating_add(1);
                     if push_visible_index_payload(&mut payloads, tid, ctx, limit)? {
                         break;
                     }
@@ -1332,6 +1348,7 @@ fn probe_index_ordered_limited(
             for entry in btree.range_scan::<i64>(start, end_exclusive) {
                 let (_key, tid) =
                     entry.map_err(|e| ServerError::ddl(format!("IndexScan btree scan: {e}")))?;
+                tuples_read = tuples_read.saturating_add(1);
                 if push_visible_index_payload(&mut payloads, tid, ctx, limit)? {
                     break;
                 }
@@ -1346,12 +1363,18 @@ fn probe_index_ordered_limited(
             {
                 let (_key, tid) = entry
                     .map_err(|e| ServerError::ddl(format!("IndexScan btree backward scan: {e}")))?;
+                tuples_read = tuples_read.saturating_add(1);
                 if push_visible_index_payload(&mut payloads, tid, ctx, limit)? {
                     break;
                 }
             }
         }
     }
+    ctx.workload_recorder.record_index_usage(
+        index_entry.oid.raw(),
+        tuples_read,
+        usize_to_u64_saturating(payloads.len()),
+    );
     Ok(payloads)
 }
 
@@ -1471,6 +1494,10 @@ fn fetch_visible_index_payload(
     } else {
         Ok(None)
     }
+}
+
+fn usize_to_u64_saturating(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 fn scan_brin_candidate_ranges(

@@ -1669,7 +1669,8 @@ behavior are implemented and validated.
 - [x] `pg_stat_user_tables` — live/dead tuple counters now scan the
   same MVCC heap state exposed to user queries; seq/idx scan counters remain
   part of the broader statistics-counter slice.
-- [ ] `pg_stat_user_indexes` — compatibility view shape exists; live counters pending
+- [x] `pg_stat_user_indexes` — live index usage counters now track
+  scans, index tuples read, and visible heap tuples fetched for SQL index paths.
 - [ ] `pg_statio_user_tables` — compatibility view shape exists; live counters pending
 - [ ] `pg_stat_database` — compatibility view shape exists; live counters pending
 - [ ] `pg_stat_bgwriter` — compatibility view shape exists; live counters pending

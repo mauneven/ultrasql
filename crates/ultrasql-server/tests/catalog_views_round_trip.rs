@@ -335,6 +335,38 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
     assert_eq!(vacuumed_stats[0].get::<_, i64>(0), 2);
     assert_eq!(vacuumed_stats[0].get::<_, i64>(1), 0);
 
+    client
+        .batch_execute("CREATE TABLE stat_idx_t (id INT)")
+        .await
+        .expect("create index stats table");
+    client
+        .batch_execute("INSERT INTO stat_idx_t VALUES (1), (2), (3)")
+        .await
+        .expect("insert index stats rows");
+    client
+        .batch_execute("CREATE INDEX stat_idx_t_id_idx ON stat_idx_t(id)")
+        .await
+        .expect("create stats index");
+    let selected = client
+        .query("SELECT id FROM stat_idx_t WHERE id = 2", &[])
+        .await
+        .expect("run indexed point lookup");
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].get::<_, i32>(0), 2);
+    let index_stats = client
+        .query(
+            "SELECT idx_scan, idx_tup_read, idx_tup_fetch \
+             FROM pg_catalog.pg_stat_user_indexes \
+             WHERE indexrelname = 'stat_idx_t_id_idx'",
+            &[],
+        )
+        .await
+        .expect("pg_stat_user_indexes counters");
+    assert_eq!(index_stats.len(), 1);
+    assert!(index_stats[0].get::<_, i64>(0) >= 1);
+    assert!(index_stats[0].get::<_, i64>(1) >= 1);
+    assert!(index_stats[0].get::<_, i64>(2) >= 1);
+
     let meta_t_oid = server
         .catalog_snapshot()
         .tables
