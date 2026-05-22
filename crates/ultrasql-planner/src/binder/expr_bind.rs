@@ -1007,6 +1007,10 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
     match func_name {
         "extract" => Ok(DataType::Int64),
         "abs" => Ok(DataType::Int64),
+        "ceil" | "floor" | "round" | "trunc" | "mod" | "power" | "sqrt" | "exp" | "ln" | "log"
+        | "random" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "pi" => {
+            Ok(DataType::Float64)
+        }
         "length" | "position" => Ok(DataType::Int32),
         "lower" | "upper" | "trim" | "lpad" | "rpad" | "left" | "right" | "substr"
         | "substring" | "replace" | "split_part" | "concat" | "concat_ws" | "repeat"
@@ -1041,6 +1045,24 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
         func_name,
         "abs"
             | "extract"
+            | "ceil"
+            | "floor"
+            | "round"
+            | "trunc"
+            | "mod"
+            | "power"
+            | "sqrt"
+            | "exp"
+            | "ln"
+            | "log"
+            | "random"
+            | "sin"
+            | "cos"
+            | "tan"
+            | "asin"
+            | "acos"
+            | "atan"
+            | "pi"
             | "length"
             | "lower"
             | "upper"

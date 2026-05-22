@@ -27,6 +27,7 @@ use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use num_traits::ToPrimitive;
 use ultrasql_core::{DataType, SparseVector, Value};
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp};
 
@@ -246,6 +247,24 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match name {
         "abs" => eval_abs(args),
         "extract" => eval_extract(args),
+        "ceil" => eval_numeric_unary(args, "ceil", f64::ceil),
+        "floor" => eval_numeric_unary(args, "floor", f64::floor),
+        "round" => eval_numeric_unary(args, "round", f64::round),
+        "trunc" => eval_numeric_unary(args, "trunc", f64::trunc),
+        "mod" => eval_numeric_binary(args, "mod", |left, right| left % right),
+        "power" => eval_numeric_binary(args, "power", f64::powf),
+        "sqrt" => eval_numeric_unary(args, "sqrt", f64::sqrt),
+        "exp" => eval_numeric_unary(args, "exp", f64::exp),
+        "ln" => eval_numeric_unary(args, "ln", f64::ln),
+        "log" => eval_numeric_unary(args, "log", f64::log10),
+        "random" => eval_random(args),
+        "sin" => eval_numeric_unary(args, "sin", f64::sin),
+        "cos" => eval_numeric_unary(args, "cos", f64::cos),
+        "tan" => eval_numeric_unary(args, "tan", f64::tan),
+        "asin" => eval_numeric_unary(args, "asin", f64::asin),
+        "acos" => eval_numeric_unary(args, "acos", f64::acos),
+        "atan" => eval_numeric_unary(args, "atan", f64::atan),
+        "pi" => eval_pi(args),
         "length" => eval_length(args),
         "lower" => eval_text_case(args, TextCase::Lower),
         "upper" => eval_text_case(args, TextCase::Upper),
@@ -618,6 +637,100 @@ fn int_arg(func: &str, args: &[Value], idx: usize) -> Result<Option<i64>, EvalEr
             idx + 1
         ))),
     }
+}
+
+fn numeric_arg(func: &str, args: &[Value], idx: usize) -> Result<Option<f64>, EvalError> {
+    match args.get(idx) {
+        Some(Value::Float32(v)) => Ok(Some(f64::from(*v))),
+        Some(Value::Float64(v)) => Ok(Some(*v)),
+        Some(Value::Decimal { value, scale }) => {
+            let base = value.to_f64().ok_or(EvalError::Overflow)?;
+            Ok(Some(base / 10_f64.powi(*scale)))
+        }
+        Some(value) => match value.as_i64() {
+            Some(v) => v.to_f64().map(Some).ok_or(EvalError::Overflow),
+            None if matches!(value, Value::Null) => Ok(None),
+            None => Err(EvalError::Type(format!(
+                "{func}: argument {} must be numeric, got {:?}",
+                idx + 1,
+                value.data_type()
+            ))),
+        },
+        None => Err(EvalError::Type(format!(
+            "{func}: missing argument {}",
+            idx + 1
+        ))),
+    }
+}
+
+fn eval_numeric_unary(
+    args: &[Value],
+    func: &str,
+    op: impl FnOnce(f64) -> f64,
+) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "{func}: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(value) = numeric_arg(func, args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Float64(op(value)))
+}
+
+fn eval_numeric_binary(
+    args: &[Value],
+    func: &str,
+    op: impl FnOnce(f64, f64) -> f64,
+) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "{func}: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(left) = numeric_arg(func, args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(right) = numeric_arg(func, args, 1)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Float64(op(left, right)))
+}
+
+fn eval_pi(args: &[Value]) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::Type(format!(
+            "pi: expected 0 args, got {}",
+            args.len()
+        )));
+    }
+    Ok(Value::Float64(std::f64::consts::PI))
+}
+
+fn eval_random(args: &[Value]) -> Result<Value, EvalError> {
+    if !args.is_empty() {
+        return Err(EvalError::Type(format!(
+            "random: expected 0 args, got {}",
+            args.len()
+        )));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let low = u64::try_from(now & u128::from(u64::MAX)).unwrap_or(0);
+    let high = u64::try_from(now >> 64).unwrap_or(0);
+    let mut state =
+        low ^ high.rotate_left(11) ^ UUID_FALLBACK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    let mantissa = state & ((1_u64 << 53) - 1);
+    let numerator = mantissa.to_f64().ok_or(EvalError::Overflow)?;
+    Ok(Value::Float64(numerator / 9_007_199_254_740_992.0))
 }
 
 fn eval_length(args: &[Value]) -> Result<Value, EvalError> {

@@ -87,6 +87,57 @@ async fn scalar_string_functions_return_postgres_shaped_values() {
 }
 
 #[tokio::test]
+async fn scalar_math_functions_return_postgres_shaped_values() {
+    let running = start_sample_server("system_functions_test").await;
+    let client = &running.client;
+
+    let row = client
+        .query_one(
+            "SELECT \
+             ceil(1.2), floor(1.8), round(1.6), trunc(1.9), \
+             mod(7, 3), power(2, 5), sqrt(9), exp(0), ln(1), log(100), \
+             pi(), sin(0), cos(0), tan(0), asin(0), acos(1), atan(0), random()",
+            &[],
+        )
+        .await
+        .expect("math functions");
+
+    let expected = [
+        2.0,
+        1.0,
+        2.0,
+        1.0,
+        1.0,
+        32.0,
+        3.0,
+        1.0,
+        0.0,
+        2.0,
+        std::f64::consts::PI,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ];
+    for (idx, expected_value) in expected.into_iter().enumerate() {
+        let got: f64 = row.get(idx);
+        assert!(
+            (got - expected_value).abs() < 1e-12,
+            "column {idx}: expected {expected_value}, got {got}"
+        );
+    }
+    let random_value: f64 = row.get(17);
+    assert!(
+        (0.0..1.0).contains(&random_value),
+        "random() out of range: {random_value}"
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn pg_relation_size_reports_heap_pages() {
     let running = start_sample_server("system_functions_test").await;
     let client = &running.client;

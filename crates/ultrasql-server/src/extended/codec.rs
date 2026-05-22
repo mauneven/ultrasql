@@ -237,6 +237,15 @@ pub(super) fn encode_binary_value_typed(
 /// Build a `RowDescription` for the output schema of `plan`, or
 /// `NoData` for plans that yield no rows.
 pub(crate) fn row_description_for_plan(plan: &LogicalPlan) -> BackendMessage {
+    row_description_for_plan_with_formats(plan, &[])
+}
+
+/// Build a `RowDescription` for the output schema of `plan`, using the
+/// result format codes negotiated for a bound portal.
+pub(crate) fn row_description_for_plan_with_formats(
+    plan: &LogicalPlan,
+    result_formats: &[i16],
+) -> BackendMessage {
     // DDL, transaction-control, and modify-without-returning produce no row data.
     let no_rows = matches!(
         plan,
@@ -273,17 +282,38 @@ pub(crate) fn row_description_for_plan(plan: &LogicalPlan) -> BackendMessage {
     let fields = schema
         .fields()
         .iter()
-        .map(|f| FieldDescription {
-            name: f.name.clone(),
-            table_oid: 0,
-            col_attnum: 0,
-            type_oid: pg_type_oid(&f.data_type),
-            type_size: pg_type_size(&f.data_type),
-            type_modifier: -1,
-            format_code: 0,
+        .enumerate()
+        .map(|(idx, f)| {
+            let format_code = result_format_for_column(&f.data_type, result_formats, idx);
+            FieldDescription {
+                name: f.name.clone(),
+                table_oid: 0,
+                col_attnum: 0,
+                type_oid: pg_type_oid(&f.data_type),
+                type_size: pg_type_size(&f.data_type),
+                type_modifier: -1,
+                format_code,
+            }
         })
         .collect();
     BackendMessage::RowDescription { fields }
+}
+
+const fn result_format_for_column(ty: &DataType, result_formats: &[i16], idx: usize) -> i16 {
+    match result_formats.len() {
+        0 => match ty {
+            DataType::Float32 | DataType::Float64 => 1,
+            _ => 0,
+        },
+        1 => result_formats[0],
+        _ => {
+            if idx < result_formats.len() {
+                result_formats[idx]
+            } else {
+                0
+            }
+        }
+    }
 }
 
 pub(super) const fn pg_type_oid(ty: &DataType) -> u32 {

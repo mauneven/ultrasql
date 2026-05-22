@@ -10,7 +10,10 @@ use ultrasql_protocol::{BackendMessage, DescribeKind};
 use crate::error::ServerError;
 use crate::workload::plan_hash_for_plan;
 
-use super::codec::{DecodeError, decode_param, pg_type_oid, row_description_for_plan};
+use super::codec::{
+    DecodeError, decode_param, pg_type_oid, row_description_for_plan,
+    row_description_for_plan_with_formats,
+};
 use super::params::{count_parameters_in_plan, infer_parameter_types};
 use super::substitute::substitute_parameters_in_plan;
 use super::{BoundPortal, ExtendedConnState, PreparedStatement};
@@ -247,10 +250,9 @@ pub fn handle_describe_portal(
         .portals
         .get(name)
         .ok_or(ServerError::Unsupported("Describe: portal not found"))?;
-    Ok(portal
-        .plan
-        .as_ref()
-        .map_or(BackendMessage::NoData, row_description_for_plan))
+    Ok(portal.plan.as_ref().map_or(BackendMessage::NoData, |plan| {
+        row_description_for_plan_with_formats(plan, &portal.result_formats)
+    }))
 }
 
 // ---------------------------------------------------------------------------
