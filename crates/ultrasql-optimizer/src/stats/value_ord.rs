@@ -242,6 +242,16 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             out.extend_from_slice(bytes);
             out
         }
+        Value::Record(fields) => {
+            let mut out = vec![24];
+            for (name, value) in fields {
+                out.extend_from_slice(name.as_bytes());
+                out.push(0);
+                out.extend_from_slice(&value_key(value));
+                out.push(0);
+            }
+            out
+        }
     }
 }
 
@@ -322,6 +332,7 @@ const fn discriminant(v: &Value) -> u8 {
         Value::HalfVec(_) => 21,
         Value::SparseVec(_) => 22,
         Value::BitVec { .. } => 23,
+        Value::Record(_) => 24,
     }
 }
 

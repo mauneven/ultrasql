@@ -422,6 +422,8 @@ pub enum Value {
         /// Array elements in logical order.
         elements: Vec<Value>,
     },
+    /// PostgreSQL record / row value.
+    Record(Vec<(String, Value)>),
 }
 
 /// `Eq` is satisfied because `PartialEq` is reflexive on the bit-pattern
@@ -491,6 +493,7 @@ impl Hash for Value {
                 element_type.hash(state);
                 elements.hash(state);
             }
+            Self::Record(fields) => fields.hash(state),
         }
     }
 }
@@ -534,6 +537,12 @@ impl Value {
             Self::Range(v) => DataType::Range(v.range_type),
             Self::Geometry(v) => DataType::Geometry(v.geometry_type),
             Self::Array { element_type, .. } => DataType::Array(Box::new(element_type.clone())),
+            Self::Record(fields) => DataType::Record(
+                fields
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.data_type()))
+                    .collect(),
+            ),
         }
     }
 
@@ -876,6 +885,16 @@ impl fmt::Display for Value {
                     write_array_element(f, element)?;
                 }
                 f.write_str("}")
+            }
+            Self::Record(fields) => {
+                f.write_str("(")?;
+                for (idx, (_, value)) in fields.iter().enumerate() {
+                    if idx > 0 {
+                        f.write_str(",")?;
+                    }
+                    write!(f, "{value}")?;
+                }
+                f.write_str(")")
             }
             Self::Uuid(u) => {
                 write!(

@@ -297,6 +297,8 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "quote_ident" => eval_quote_ident(args),
         "format" => eval_format(args),
         "regexp_replace" => eval_regexp_replace(args),
+        "row" => eval_row_constructor(args),
+        "row_to_json" => eval_row_to_json(args),
         "json_build_object" => eval_json_build_object(args),
         "jsonb_set" => eval_jsonb_set(args),
         "gen_random_uuid" => eval_gen_random_uuid(args),
@@ -1171,6 +1173,35 @@ fn eval_json_build_object(args: &[Value]) -> Result<Value, EvalError> {
         .map_err(|err| EvalError::Type(format!("json_build_object: encode failed: {err}")))
 }
 
+fn eval_row_constructor(args: &[Value]) -> Result<Value, EvalError> {
+    let fields = args
+        .iter()
+        .enumerate()
+        .map(|(idx, value)| (format!("f{}", idx + 1), value.clone()))
+        .collect();
+    Ok(Value::Record(fields))
+}
+
+fn eval_row_to_json(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "row_to_json: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    match &args[0] {
+        Value::Null => Ok(Value::Null),
+        Value::Record(_) => json_value_to_jsonb(sql_value_to_json(&args[0]), "row_to_json"),
+        Value::Jsonb(text) | Value::Text(text) => serde_json::from_str::<JsonValue>(text)
+            .map_err(|err| EvalError::Type(format!("row_to_json: invalid json: {err}")))
+            .and_then(|value| json_value_to_jsonb(value, "row_to_json")),
+        other => Err(EvalError::Type(format!(
+            "row_to_json: expected record, jsonb, or text, got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
 fn eval_jsonb_set(args: &[Value]) -> Result<Value, EvalError> {
     if !(args.len() == 3 || args.len() == 4) {
         return Err(EvalError::Type(format!(
@@ -1343,6 +1374,13 @@ fn sql_value_to_json(value: &Value) -> JsonValue {
         ),
         Value::Array { elements, .. } => {
             JsonValue::Array(elements.iter().map(sql_value_to_json).collect())
+        }
+        Value::Record(fields) => {
+            let mut object = JsonMap::new();
+            for (name, value) in fields {
+                object.insert(name.clone(), sql_value_to_json(value));
+            }
+            JsonValue::Object(object)
         }
         other => JsonValue::String(other.to_string()),
     }

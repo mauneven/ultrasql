@@ -1873,7 +1873,8 @@ fn value_to_copy_cell_by_value(value: &Value) -> Option<Vec<u8>> {
         | Value::HalfVec(_)
         | Value::SparseVec(_)
         | Value::BitVec { .. }
-        | Value::Array { .. } => Some(value.to_string().into_bytes()),
+        | Value::Array { .. }
+        | Value::Record(_) => Some(value.to_string().into_bytes()),
     }
 }
 

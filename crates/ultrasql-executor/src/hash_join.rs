@@ -1089,6 +1089,10 @@ impl std::hash::Hash for OrderedValue {
                 dims.hash(state);
                 bytes.hash(state);
             }
+            Value::Record(fields) => {
+                state.write_u8(22);
+                fields.hash(state);
+            }
         }
     }
 }

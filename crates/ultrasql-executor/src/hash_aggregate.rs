@@ -181,6 +181,10 @@ fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
             dims.hash(state);
             bytes.hash(state);
         }
+        Value::Record(fields) => {
+            state.write_u8(22);
+            fields.hash(state);
+        }
     }
 }
 

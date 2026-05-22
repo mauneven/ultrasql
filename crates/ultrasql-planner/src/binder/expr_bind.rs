@@ -117,6 +117,25 @@ pub(super) fn bind_expr_with_ctes(
                 data_type: return_type,
             })
         }
+        Expr::Row { fields, .. } => {
+            let bound_args: Result<Vec<ScalarExpr>, PlanError> = fields
+                .iter()
+                .map(|field| bind_expr_with_ctes(field, input, catalog, cte_catalog, scope))
+                .collect();
+            let bound_args = bound_args?;
+            let record_type = DataType::Record(
+                bound_args
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, expr)| (format!("f{}", idx + 1), expr.data_type()))
+                    .collect(),
+            );
+            Ok(ScalarExpr::FunctionCall {
+                name: "row".to_owned(),
+                args: bound_args,
+                data_type: record_type,
+            })
+        }
         Expr::Cast {
             expr: inner,
             target,
@@ -1022,7 +1041,7 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
         | "reverse" | "md5" | "sha256" | "quote_ident" | "format" | "regexp_replace" => {
             Ok(DataType::Text { max_len: None })
         }
-        "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
+        "row_to_json" | "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
         "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
         "gen_random_uuid" => Ok(DataType::Uuid),
         "pg_relation_size" => Ok(DataType::Int64),
@@ -1102,6 +1121,7 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "quote_ident"
             | "format"
             | "regexp_replace"
+            | "row_to_json"
             | "json_build_object"
             | "jsonb_set"
             | "gen_random_uuid"

@@ -1823,7 +1823,10 @@ Every standard PostgreSQL driver and ORM works without modification.
   values into `(key text, value jsonb)` rows through the PostgreSQL wire path.
 - [x] JSON path table function: `jsonb_path_query(jsonb, text)` supports
   basic `$.key`, `[*]`, and `[N]` paths through the PostgreSQL wire path.
-- [ ] JSON remaining: `row_to_json` and full SQL/JSON path parity.
+- [x] JSON row constructor scalar: `row_to_json(ROW(...))` serializes row
+  constructor values to JSONB with PostgreSQL-style `f1`, `f2`, ... keys.
+- [ ] JSON remaining: `row_to_json(table_alias)` whole-row references and
+  full SQL/JSON path parity.
 - [x] Array: array_length, array_cat, unnest, array_agg,
   array_to_string, string_to_array — implemented for native arrays
   over the current supported scalar element set.

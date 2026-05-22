@@ -179,6 +179,10 @@ impl Hash for KeyValue {
                 dims.hash(state);
                 bytes.hash(state);
             }
+            Value::Record(fields) => {
+                state.write_u8(22);
+                fields.hash(state);
+            }
         }
     }
 }
