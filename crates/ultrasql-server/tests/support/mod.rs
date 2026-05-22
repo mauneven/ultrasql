@@ -15,6 +15,7 @@ pub(crate) struct RunningServer {
     shutdown_tx: oneshot::Sender<()>,
 }
 
+#[allow(dead_code)]
 pub(crate) async fn start_persistent_server(
     data_dir: &Path,
     application_name: &str,
@@ -24,6 +25,11 @@ pub(crate) async fn start_persistent_server(
         application_name,
     )
     .await
+}
+
+#[allow(dead_code)]
+pub(crate) async fn start_sample_server(application_name: &str) -> RunningServer {
+    start_server(Arc::new(Server::with_sample_database()), application_name).await
 }
 
 async fn start_server(server: Arc<Server>, application_name: &str) -> RunningServer {

@@ -22,40 +22,9 @@
 //! but we go through the loopback TCP stack so the codec exercises real
 //! byte ordering on a real socket.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+mod support;
 
-use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener};
-
-/// Bring up a fresh in-process server bound to `127.0.0.1:0` and return
-/// `(client, server_task_join_handle)`.
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=extended_query_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
+use support::{shutdown, start_sample_server};
 
 /// Prepared-statement SELECT over the canonical sample table.
 ///
@@ -63,7 +32,8 @@ async fn start_server_and_connect() -> (
 /// hits by default).
 #[tokio::test]
 async fn prepared_select_all_returns_sample_rows() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("extended_query_test").await;
+    let client = &running.client;
 
     let stmt = client
         .prepare("SELECT id FROM users")
@@ -78,17 +48,15 @@ async fn prepared_select_all_returns_sample_rows() {
     ids.sort_unstable();
     assert_eq!(ids, vec![1, 2, 3]);
 
-    drop(client);
-    // Give the connection task a moment to wind down.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
+    shutdown(running).await;
 }
 
 /// Prepared SELECT with a positional parameter — the headline shape the
 /// roadmap calls out.
 #[tokio::test]
 async fn prepared_select_with_int_parameter() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("extended_query_test").await;
+    let client = &running.client;
 
     let stmt = client
         .prepare("SELECT id FROM users WHERE id = $1")
@@ -117,9 +85,7 @@ async fn prepared_select_with_int_parameter() {
         .expect("query succeeds");
     assert_eq!(rows.len(), 0);
 
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
+    shutdown(running).await;
 }
 
 /// `CREATE TABLE → INSERT VALUES (multi-row) → SELECT id,val → SELECT WHERE id=$1`
@@ -127,7 +93,8 @@ async fn prepared_select_with_int_parameter() {
 /// that the Simple Query tests cover.
 #[tokio::test]
 async fn prepared_create_insert_select_filter_round_trip() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("extended_query_test").await;
+    let client = &running.client;
 
     // CREATE TABLE — DDL is rejected by the Extended Query path
     // (documented gap). Use the Simple Query fallback via batch_execute.
@@ -178,15 +145,14 @@ async fn prepared_create_insert_select_filter_round_trip() {
     assert_eq!(rows[0].get::<_, i32>(0), 2);
     assert_eq!(rows[0].get::<_, i32>(1), 200);
 
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
+    shutdown(running).await;
 }
 
 /// Scalar aggregate over the prepared-statement path.
 #[tokio::test]
 async fn prepared_scalar_aggregate() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("extended_query_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE nums (id INT NOT NULL, x INT)")
@@ -214,15 +180,14 @@ async fn prepared_scalar_aggregate() {
     let total: i64 = rows[0].get(0);
     assert_eq!(total, 550);
 
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
+    shutdown(running).await;
 }
 
 /// Prepared UPDATE + DELETE round-trip.
 #[tokio::test]
 async fn prepared_update_and_delete() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("extended_query_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE things (id INT NOT NULL, val INT)")
@@ -278,16 +243,15 @@ async fn prepared_update_and_delete() {
     pairs.sort_unstable();
     assert_eq!(pairs, vec![(1, 10), (2, 999)]);
 
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
+    shutdown(running).await;
 }
 
 /// `tokio-postgres` calls `Close(Portal)` after every `query()`. Verify
 /// the close handler does not break the session.
 #[tokio::test]
 async fn repeated_executions_of_same_prepared_statement() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("extended_query_test").await;
+    let client = &running.client;
 
     let stmt = client
         .prepare("SELECT id FROM users WHERE id = $1")
@@ -300,7 +264,5 @@ async fn repeated_executions_of_same_prepared_statement() {
         assert_eq!(rows[0].get::<_, i32>(0), i);
     }
 
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
+    shutdown(running).await;
 }
