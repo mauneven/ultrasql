@@ -1644,9 +1644,11 @@ behavior are implemented and validated.
   is present; remote quorum apply remains a continuous replication hardening
   item.
 - [x] Replication slots — file-backed physical slot state under `pg_replslot`
-- [ ] `pg_replication_slots` view, `pg_stat_replication` view — catalog view
-  shapes exist for tool introspection; live replication rows await the
-  network sender/receiver loop.
+- [x] `pg_replication_slots` view — exposes persisted physical slot rows
+  from `pg_replslot/*.slot` through the PostgreSQL-compatible virtual
+  catalog shape.
+- [ ] `pg_stat_replication` view — catalog shape exists for tool
+  introspection; live sender/client rows await the network sender loop.
 - [ ] Cascading replication — file-backed receiver output is valid sender input; continuous network cascade pending
 
 ### Backup & PITR

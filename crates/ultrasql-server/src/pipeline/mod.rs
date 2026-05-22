@@ -229,6 +229,8 @@ pub struct LowerCtx<'a> {
     pub autovacuum_config: crate::AutovacuumConfig,
     /// Runtime statement logging settings used by virtual `pg_settings`.
     pub logging_config: crate::LoggingConfig,
+    /// Optional WAL-backed data directory used by replication catalog views.
+    pub data_dir: Option<std::path::PathBuf>,
     /// Session-local sequence observer for defaults that call `nextval`.
     pub sequence_state: Option<crate::SequenceSessionState>,
     /// Shared heap access handle.

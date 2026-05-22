@@ -168,7 +168,10 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
             schema_pg_stat_progress_create_index(),
             rows_pg_stat_progress_create_index(ctx),
         )),
-        "pg_catalog.pg_replication_slots" => Some((schema_pg_replication_slots(), Vec::new())),
+        "pg_catalog.pg_replication_slots" => Some((
+            schema_pg_replication_slots(),
+            rows_pg_replication_slots(ctx),
+        )),
         "pg_catalog.pg_stat_replication" => Some((schema_pg_stat_replication(), Vec::new())),
         "pg_catalog.pg_stat_subscription" => Some((schema_pg_stat_subscription(), Vec::new())),
         "pg_catalog.pg_publication" => Some((schema_pg_publication(), Vec::new())),
@@ -1667,6 +1670,34 @@ fn schema_pg_replication_slots() -> Schema {
         Field::nullable("restart_lsn", text()),
         Field::nullable("confirmed_flush_lsn", text()),
     ])
+}
+
+fn rows_pg_replication_slots(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let Some(data_dir) = &ctx.data_dir else {
+        return Vec::new();
+    };
+    let Ok(store) = crate::replication::ReplicationSlotStore::open(data_dir.join("pg_replslot"))
+    else {
+        return Vec::new();
+    };
+    let Ok(slots) = store.list() else {
+        return Vec::new();
+    };
+    slots
+        .into_iter()
+        .map(|slot| {
+            vec![
+                v_text(slot.name),
+                v_text(""),
+                v_text("physical"),
+                Value::Int64(1),
+                v_text("ultrasql"),
+                Value::Bool(false),
+                slot.restart_lsn.map_or(Value::Null, v_text),
+                slot.confirmed_flush_lsn.map_or(Value::Null, v_text),
+            ]
+        })
+        .collect()
 }
 
 fn schema_pg_stat_replication() -> Schema {

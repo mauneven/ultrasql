@@ -248,6 +248,28 @@ impl ReplicationSlotStore {
         fs::write(self.slot_path(&slot.name), body).map_err(ServerError::Io)
     }
 
+    /// Return all persisted slots in deterministic slot-name order.
+    pub fn list(&self) -> Result<Vec<ReplicationSlot>, ServerError> {
+        let mut slots = Vec::new();
+        if !self.root.exists() {
+            return Ok(slots);
+        }
+        for entry in fs::read_dir(&self.root).map_err(ServerError::Io)? {
+            let entry = entry.map_err(ServerError::Io)?;
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("slot") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let text = fs::read_to_string(&path).map_err(ServerError::Io)?;
+            slots.push(parse_slot(stem, &text));
+        }
+        slots.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(slots)
+    }
+
     fn slot_path(&self, name: &str) -> PathBuf {
         self.root.join(format!("{name}.slot"))
     }
@@ -356,4 +378,40 @@ fn parse_slot(name: &str, text: &str) -> ReplicationSlot {
         }
     }
     slot
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_store_lists_persisted_slots_in_name_order() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = ReplicationSlotStore::open(dir.path()).expect("slot store");
+        store
+            .save(&ReplicationSlot {
+                name: "standby_b".to_string(),
+                restart_lsn: Some("0000000200000000".to_string()),
+                confirmed_flush_lsn: Some("0000000200000000".to_string()),
+            })
+            .expect("save standby_b");
+        store
+            .save(&ReplicationSlot {
+                name: "standby_a".to_string(),
+                restart_lsn: None,
+                confirmed_flush_lsn: Some("0000000100000000".to_string()),
+            })
+            .expect("save standby_a");
+
+        let slots = store.list().expect("list slots");
+
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0].name, "standby_a");
+        assert_eq!(slots[0].restart_lsn, None);
+        assert_eq!(
+            slots[0].confirmed_flush_lsn.as_deref(),
+            Some("0000000100000000")
+        );
+        assert_eq!(slots[1].name, "standby_b");
+    }
 }
