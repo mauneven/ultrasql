@@ -160,9 +160,10 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
             schema_pg_stat_progress_vacuum(),
             rows_pg_stat_progress_vacuum(ctx),
         )),
-        "pg_catalog.pg_stat_progress_analyze" => {
-            Some((schema_pg_stat_progress_analyze(), Vec::new()))
-        }
+        "pg_catalog.pg_stat_progress_analyze" => Some((
+            schema_pg_stat_progress_analyze(),
+            rows_pg_stat_progress_analyze(ctx),
+        )),
         "pg_catalog.pg_stat_progress_create_index" => {
             Some((schema_pg_stat_progress_create_index(), Vec::new()))
         }
@@ -1602,6 +1603,24 @@ fn schema_pg_stat_progress_analyze() -> Schema {
         Field::required("sample_blks_total", DataType::Int64),
         Field::required("sample_blks_scanned", DataType::Int64),
     ])
+}
+
+fn rows_pg_stat_progress_analyze(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    ctx.workload_recorder
+        .analyze_progress()
+        .into_iter()
+        .map(|row| {
+            vec![
+                Value::Int32(row.pid),
+                Value::Int64(row.datid),
+                v_text(row.datname),
+                Value::Int64(row.relid),
+                v_text(row.phase),
+                Value::Int64(row.sample_blks_total),
+                Value::Int64(row.sample_blks_scanned),
+            ]
+        })
+        .collect()
 }
 
 fn schema_pg_stat_progress_create_index() -> Schema {

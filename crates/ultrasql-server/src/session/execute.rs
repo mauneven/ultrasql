@@ -1859,7 +1859,7 @@ where
     fn execute_analyze(&mut self, table: Option<&str>) -> Result<SelectResult, ServerError> {
         match table {
             Some(t) => {
-                if !self.state.analyze_table(t)? {
+                if !self.state.analyze_table_with_pid(t, self.pid)? {
                     return Err(self.fail_if_in_transaction(ServerError::Plan(
                         ultrasql_planner::PlanError::TableNotFound(t.to_string()),
                     )));
@@ -1869,7 +1869,7 @@ where
                 let snapshot = self.state.catalog_snapshot();
                 let tables: Vec<String> = snapshot.tables.keys().map(|k| k.to_string()).collect();
                 for name in tables {
-                    let _ = self.state.analyze_table(&name);
+                    let _ = self.state.analyze_table_with_pid(&name, self.pid);
                 }
             }
         }

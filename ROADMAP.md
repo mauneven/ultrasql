@@ -1693,7 +1693,10 @@ behavior are implemented and validated.
   full-page-write records, appended bytes, and write operations through
   the PostgreSQL-compatible view shape; fsync latency remains available
   through ops metrics.
-- [ ] `pg_stat_progress_analyze`, `pg_stat_progress_create_index` — empty compatibility views exist
+- [x] `pg_stat_progress_analyze` — ANALYZE publishes active phase/block
+  rows through the virtual catalog view and clears them on completion.
+- [ ] `pg_stat_progress_create_index` — empty compatibility view exists;
+  CREATE INDEX build loops still need phase/block progress publication.
 - [x] Prometheus `/metrics` HTTP endpoint — `--ops-listen` exposes
   process/build metadata plus live buffer-pool, WAL fsync, WAL append,
   object-store, ANN, and query-latency counters.

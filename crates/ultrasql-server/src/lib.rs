@@ -4826,6 +4826,11 @@ impl Server {
     /// Run `ANALYZE` for one table: refresh block-count hint and
     /// rebuild relation stats from MVCC-visible rows.
     pub fn analyze_table(&self, table: &str) -> Result<bool, ServerError> {
+        self.analyze_table_with_pid(table, 0)
+    }
+
+    /// Run `ANALYZE` for one table and publish progress under `pid`.
+    pub fn analyze_table_with_pid(&self, table: &str, pid: u32) -> Result<bool, ServerError> {
         let folded = table.to_ascii_lowercase();
         self.pending_analyze_tables.remove(&folded);
         let snapshot = self.catalog_snapshot();
@@ -4841,76 +4846,92 @@ impl Server {
             .update_table_size(entry.oid, block_count)
             .map_err(ServerError::Catalog)?;
 
-        let scan_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
-        let scan_snapshot = scan_txn.snapshot.clone();
-        let mut payloads: Vec<Vec<u8>> = Vec::new();
-        self.heap
-            .for_each_visible(
-                rel,
-                block_count,
-                &scan_snapshot,
-                self.txn_manager.as_ref(),
-                |_tid, _hdr, payload| {
-                    payloads.push(payload.to_vec());
-                    Ok(())
-                },
-            )
-            .map_err(|e| ServerError::Ddl(format!("ANALYZE scan failed: {e}")))?;
-        if let Err(e) = self.txn_manager.abort(scan_txn) {
-            tracing::warn!(error = %e, "ANALYZE scan transaction abort failed");
-        }
+        self.workload_recorder
+            .begin_analyze(pid, entry.oid.raw(), block_count);
+        let result = (|| -> Result<bool, ServerError> {
+            self.workload_recorder
+                .update_analyze(pid, "scanning table", 0);
 
-        let codec = RowCodec::new(entry.schema.clone());
-        let mut rows: Vec<Vec<ultrasql_core::Value>> = Vec::with_capacity(payloads.len());
-        for payload in payloads {
-            match codec.decode(&payload) {
-                Ok(row) => rows.push(row),
-                Err(e) => {
-                    tracing::warn!(table = %folded, error = %e, "ANALYZE skipped malformed tuple");
+            let scan_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
+            let scan_snapshot = scan_txn.snapshot.clone();
+            let mut payloads: Vec<Vec<u8>> = Vec::new();
+            self.heap
+                .for_each_visible(
+                    rel,
+                    block_count,
+                    &scan_snapshot,
+                    self.txn_manager.as_ref(),
+                    |_tid, _hdr, payload| {
+                        payloads.push(payload.to_vec());
+                        Ok(())
+                    },
+                )
+                .map_err(|e| ServerError::Ddl(format!("ANALYZE scan failed: {e}")))?;
+            if let Err(e) = self.txn_manager.abort(scan_txn) {
+                tracing::warn!(error = %e, "ANALYZE scan transaction abort failed");
+            }
+
+            self.workload_recorder
+                .update_analyze(pid, "computing statistics", block_count);
+            let codec = RowCodec::new(entry.schema.clone());
+            let mut rows: Vec<Vec<ultrasql_core::Value>> = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                match codec.decode(&payload) {
+                    Ok(row) => rows.push(row),
+                    Err(e) => {
+                        tracing::warn!(table = %folded, error = %e, "ANALYZE skipped malformed tuple");
+                    }
                 }
             }
-        }
-        let stats = AnalyzeRunner::new(AnalyzeOptions::default())
-            .run(&folded, &entry.schema, rows.into_iter())
-            .map_err(|e| ServerError::Ddl(format!("ANALYZE statistics failed: {e}")))?;
-        let mut stat_rows = Vec::with_capacity(stats.columns.len());
-        for col in &stats.columns {
-            let staattnum = i16::try_from(col.column_index.saturating_add(1))
-                .map_err(|_| ServerError::Ddl("ANALYZE table has too many columns".to_owned()))?;
-            let pg_row = PgStatisticRow::from_column_stats(
-                entry.oid.raw(),
-                u16::try_from(staattnum)
-                    .map_err(|_| ServerError::Ddl("ANALYZE invalid attribute number".to_owned()))?,
-                col,
-            );
-            stat_rows.push(StatisticRow {
-                starelid: entry.oid,
-                staattnum,
-                stanullfrac: pg_row.stanullfrac,
-                stadistinct: pg_row.stadistinct,
-            });
-        }
-        let catalog_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
-        if let Err(e) = self.persistent_catalog.persist_statistic_rows(
-            &stat_rows,
-            self.heap.as_ref(),
-            catalog_txn.xid,
-            catalog_txn.current_command,
-        ) {
-            if let Err(abort_err) = self.txn_manager.abort(catalog_txn) {
-                tracing::warn!(
-                    error = %abort_err,
-                    "ANALYZE catalog statistics transaction abort failed",
+            let stats = AnalyzeRunner::new(AnalyzeOptions::default())
+                .run(&folded, &entry.schema, rows.into_iter())
+                .map_err(|e| ServerError::Ddl(format!("ANALYZE statistics failed: {e}")))?;
+            let mut stat_rows = Vec::with_capacity(stats.columns.len());
+            for col in &stats.columns {
+                let staattnum =
+                    i16::try_from(col.column_index.saturating_add(1)).map_err(|_| {
+                        ServerError::Ddl("ANALYZE table has too many columns".to_owned())
+                    })?;
+                let pg_row = PgStatisticRow::from_column_stats(
+                    entry.oid.raw(),
+                    u16::try_from(staattnum).map_err(|_| {
+                        ServerError::Ddl("ANALYZE invalid attribute number".to_owned())
+                    })?,
+                    col,
                 );
+                stat_rows.push(StatisticRow {
+                    starelid: entry.oid,
+                    staattnum,
+                    stanullfrac: pg_row.stanullfrac,
+                    stadistinct: pg_row.stadistinct,
+                });
             }
-            return Err(ServerError::Catalog(e));
-        }
-        self.commit_transaction(catalog_txn, true, "ANALYZE catalog statistics transaction")?;
-        self.stats_catalog.write().register(stats);
-        self.persistent_catalog
-            .replace_statistics(entry.oid, stat_rows);
-        self.plan_cache.invalidate_all();
-        Ok(true)
+            self.workload_recorder
+                .update_analyze(pid, "writing statistics", block_count);
+            let catalog_txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
+            if let Err(e) = self.persistent_catalog.persist_statistic_rows(
+                &stat_rows,
+                self.heap.as_ref(),
+                catalog_txn.xid,
+                catalog_txn.current_command,
+            ) {
+                if let Err(abort_err) = self.txn_manager.abort(catalog_txn) {
+                    tracing::warn!(
+                        error = %abort_err,
+                        "ANALYZE catalog statistics transaction abort failed",
+                    );
+                }
+                return Err(ServerError::Catalog(e));
+            }
+            self.commit_transaction(catalog_txn, true, "ANALYZE catalog statistics transaction")?;
+            self.stats_catalog.write().register(stats);
+            self.persistent_catalog
+                .replace_statistics(entry.oid, stat_rows);
+            self.plan_cache.invalidate_all();
+            Ok(true)
+        })();
+        self.workload_recorder.finish_analyze(pid);
+        result
     }
 
     fn auto_analyze_threshold(&self, table: &str) -> u64 {

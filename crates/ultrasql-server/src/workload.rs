@@ -121,6 +121,25 @@ pub struct VacuumProgressSnapshot {
     pub heap_blks_vacuumed: i64,
 }
 
+/// One active `pg_stat_progress_analyze` row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnalyzeProgressSnapshot {
+    /// PostgreSQL backend pid owning ANALYZE; 0 means background worker.
+    pub pid: i32,
+    /// Database OID. UltraSQL exposes one database in this wave.
+    pub datid: i64,
+    /// Database name.
+    pub datname: String,
+    /// Relation OID being analyzed.
+    pub relid: i64,
+    /// Current ANALYZE phase.
+    pub phase: String,
+    /// Heap blocks in the relation at ANALYZE start.
+    pub sample_blks_total: i64,
+    /// Heap blocks scanned so far.
+    pub sample_blks_scanned: i64,
+}
+
 /// Cumulative usage counters for one SQL index.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexUsageStats {
@@ -184,6 +203,7 @@ pub struct WorkloadRecorder {
     slow_query_threshold: parking_lot::RwLock<Option<Duration>>,
     latency_histogram: parking_lot::Mutex<LatencyHistogramState>,
     vacuum_progress: parking_lot::Mutex<HashMap<u32, VacuumProgressSnapshot>>,
+    analyze_progress: parking_lot::Mutex<HashMap<u32, AnalyzeProgressSnapshot>>,
     index_usage: parking_lot::Mutex<HashMap<u32, IndexUsageStats>>,
     slow_log_capacity: usize,
 }
@@ -204,6 +224,7 @@ impl WorkloadRecorder {
             slow_query_threshold: parking_lot::RwLock::new(None),
             latency_histogram: parking_lot::Mutex::new(LatencyHistogramState::default()),
             vacuum_progress: parking_lot::Mutex::new(HashMap::new()),
+            analyze_progress: parking_lot::Mutex::new(HashMap::new()),
             index_usage: parking_lot::Mutex::new(HashMap::new()),
             slow_log_capacity: 1024,
         }
@@ -358,6 +379,48 @@ impl WorkloadRecorder {
         rows
     }
 
+    /// Start or replace one active ANALYZE progress row.
+    pub fn begin_analyze(&self, pid: u32, relid: u32, sample_blks_total: u32) {
+        self.analyze_progress.lock().insert(
+            pid,
+            AnalyzeProgressSnapshot {
+                pid: u32_to_i32_saturated(pid),
+                datid: 1,
+                datname: "ultrasql".to_string(),
+                relid: i64::from(relid),
+                phase: "initializing".to_string(),
+                sample_blks_total: i64::from(sample_blks_total),
+                sample_blks_scanned: 0,
+            },
+        );
+    }
+
+    /// Update counters and phase for an active ANALYZE progress row.
+    pub fn update_analyze(&self, pid: u32, phase: impl Into<String>, sample_blks_scanned: u32) {
+        if let Some(row) = self.analyze_progress.lock().get_mut(&pid) {
+            row.phase = phase.into();
+            row.sample_blks_scanned = i64::from(sample_blks_scanned);
+        }
+    }
+
+    /// Clear one active ANALYZE progress row.
+    pub fn finish_analyze(&self, pid: u32) {
+        self.analyze_progress.lock().remove(&pid);
+    }
+
+    /// Return active ANALYZE progress rows ordered by pid.
+    #[must_use]
+    pub fn analyze_progress(&self) -> Vec<AnalyzeProgressSnapshot> {
+        let mut rows = self
+            .analyze_progress
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row.pid);
+        rows
+    }
+
     /// Add one completed index access to cumulative `pg_stat_user_indexes`
     /// counters.
     pub fn record_index_usage(&self, indexrelid: u32, tuples_read: u64, tuples_fetched: u64) {
@@ -494,6 +557,31 @@ mod tests {
 
         recorder.finish_vacuum(7);
         assert!(recorder.vacuum_progress().is_empty());
+    }
+
+    #[test]
+    fn workload_recorder_tracks_analyze_progress_lifecycle() {
+        let recorder = WorkloadRecorder::new();
+        recorder.begin_analyze(8, 43, 10);
+        recorder.update_analyze(8, "computing statistics", 10);
+
+        let rows = recorder.analyze_progress();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            AnalyzeProgressSnapshot {
+                pid: 8,
+                datid: 1,
+                datname: "ultrasql".to_string(),
+                relid: 43,
+                phase: "computing statistics".to_string(),
+                sample_blks_total: 10,
+                sample_blks_scanned: 10,
+            }
+        );
+
+        recorder.finish_analyze(8);
+        assert!(recorder.analyze_progress().is_empty());
     }
 
     #[test]
