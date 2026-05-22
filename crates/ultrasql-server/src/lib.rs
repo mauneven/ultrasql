@@ -472,6 +472,33 @@ fn referential_action_token(action: LogicalReferentialAction) -> &'static str {
     }
 }
 
+fn index_method_token(method: LogicalIndexMethod) -> &'static str {
+    match method {
+        LogicalIndexMethod::Btree => "btree",
+        LogicalIndexMethod::Hash => "hash",
+        LogicalIndexMethod::Gin => "gin",
+        LogicalIndexMethod::Gist => "gist",
+        LogicalIndexMethod::Brin => "brin",
+        LogicalIndexMethod::Hnsw => "hnsw",
+        LogicalIndexMethod::IvfFlat => "ivfflat",
+        LogicalIndexMethod::Aggregating => "aggregating",
+    }
+}
+
+fn parse_index_method(raw: &str) -> Result<LogicalIndexMethod, ServerError> {
+    match raw {
+        "btree" => Ok(LogicalIndexMethod::Btree),
+        "hash" => Ok(LogicalIndexMethod::Hash),
+        "gin" => Ok(LogicalIndexMethod::Gin),
+        "gist" => Ok(LogicalIndexMethod::Gist),
+        "brin" => Ok(LogicalIndexMethod::Brin),
+        "hnsw" => Ok(LogicalIndexMethod::Hnsw),
+        "ivfflat" => Ok(LogicalIndexMethod::IvfFlat),
+        "aggregating" => Ok(LogicalIndexMethod::Aggregating),
+        other => Err(ServerError::Ddl(format!("unknown index method {other}"))),
+    }
+}
+
 fn parse_referential_action(raw: &str) -> Result<LogicalReferentialAction, ServerError> {
     match raw {
         "no_action" => Ok(LogicalReferentialAction::NoAction),
@@ -3115,6 +3142,21 @@ impl Server {
                     fk.initially_deferred
                 ));
             }
+            for exclusion in &constraints.exclusion_constraints {
+                let elements = exclusion
+                    .elements
+                    .iter()
+                    .map(|element| format!("{}:{}", element.column, binary_op_token(element.op)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                out.push_str(&format!(
+                    "exclusion\t{}\t{}\t{}\t{}\n",
+                    oid.raw(),
+                    metadata_escape(&exclusion.name),
+                    index_method_token(exclusion.method),
+                    elements
+                ));
+            }
         }
         let tmp = path.with_extension("meta.tmp");
         std::fs::write(&tmp, out).map_err(ServerError::Io)?;
@@ -3141,6 +3183,8 @@ impl Server {
         let mut checks: std::collections::HashMap<Oid, Vec<RuntimeCheckConstraint>> =
             std::collections::HashMap::new();
         let mut foreign_keys: std::collections::HashMap<Oid, Vec<RuntimeForeignKeyConstraint>> =
+            std::collections::HashMap::new();
+        let mut exclusions: std::collections::HashMap<Oid, Vec<RuntimeExclusionConstraint>> =
             std::collections::HashMap::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
@@ -3239,6 +3283,47 @@ impl Server {
                         })?,
                     });
                 }
+                Some("exclusion") if parts.len() == 5 => {
+                    let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    let mut elements = Vec::new();
+                    if !parts[4].is_empty() {
+                        for raw in parts[4].split(',') {
+                            let (column, op) = raw.split_once(':').ok_or_else(|| {
+                                ServerError::Ddl(format!(
+                                    "table-runtime metadata line {} bad exclusion element",
+                                    line_no + 1
+                                ))
+                            })?;
+                            elements.push(RuntimeExclusionElement {
+                                column: column.parse::<usize>().map_err(|err| {
+                                    ServerError::Ddl(format!(
+                                        "table-runtime metadata line {} bad exclusion column: {err}",
+                                        line_no + 1
+                                    ))
+                                })?,
+                                op: binary_op_from_token(op).ok_or_else(|| {
+                                    ServerError::Ddl(format!(
+                                        "table-runtime metadata line {} bad exclusion op",
+                                        line_no + 1
+                                    ))
+                                })?,
+                            });
+                        }
+                    }
+                    exclusions
+                        .entry(oid)
+                        .or_default()
+                        .push(RuntimeExclusionConstraint {
+                            name: metadata_unescape(parts[2])?,
+                            method: parse_index_method(parts[3])?,
+                            elements,
+                        });
+                }
                 _ => {
                     return Err(ServerError::Ddl(format!(
                         "malformed table-runtime metadata line {}",
@@ -3301,6 +3386,9 @@ impl Server {
                         Some(fk)
                     })
                     .collect();
+            }
+            if let Some(exclusions) = exclusions.remove(&oid) {
+                runtime.exclusion_constraints = exclusions;
             }
             self.table_constraints.insert(oid, Arc::new(runtime));
         }

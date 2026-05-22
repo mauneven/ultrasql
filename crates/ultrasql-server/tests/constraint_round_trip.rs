@@ -1021,6 +1021,35 @@ async fn exclusion_constraint_rejects_overlapping_int4range() {
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exclusion_constraint_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    client
+        .batch_execute(
+            "CREATE TABLE bookings_restart (\
+             room INT NOT NULL, \
+             during INT4RANGE NOT NULL, \
+             EXCLUDE USING gist (room WITH =, during WITH &&))",
+        )
+        .await
+        .expect("create bookings");
+    client
+        .batch_execute("INSERT INTO bookings_restart VALUES (101, '[1,10)'::int4range)")
+        .await
+        .expect("insert booking");
+    shutdown(client, server_handle).await;
+
+    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let err = client
+        .batch_execute("INSERT INTO bookings_restart VALUES (101, '[5,6)'::int4range)")
+        .await
+        .expect_err("overlap rejected after restart");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "23P01");
+    shutdown(client, server_handle).await;
+}
+
 /// Geometric `&&` uses GiST-style bounding-box overlap semantics.
 #[tokio::test]
 async fn geometric_overlap_predicate_filters_boxes() {
