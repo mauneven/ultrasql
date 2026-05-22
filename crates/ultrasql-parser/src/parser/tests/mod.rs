@@ -255,7 +255,7 @@ fn deeply_nested_parens_rejected_without_overflow() {
 /// reasonable ones.
 #[test]
 fn parens_below_limit_succeed() {
-    let depth = 256_usize;
+    let depth = (MAX_PARSE_DEPTH as usize) / 2;
     let mut sql = String::with_capacity(depth * 2 + 16);
     sql.push_str("SELECT ");
     for _ in 0..depth {

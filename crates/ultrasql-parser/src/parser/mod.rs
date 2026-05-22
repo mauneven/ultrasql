@@ -113,11 +113,12 @@ pub enum ParseError {
 /// before any other validation runs); legitimate SQL never approaches
 /// this depth.
 ///
-/// The value is intentionally conservative: the expression parser now
-/// supports many more constructs (CASE, BETWEEN, postfix casts, etc.) so
-/// each nesting level consumes a larger stack frame. 512 is still far above
-/// any reasonable real-world SQL nesting depth.
-pub const MAX_PARSE_DEPTH: u32 = 512;
+/// The value is intentionally conservative: the expression parser supports
+/// many constructs (CASE, BETWEEN, postfix casts, etc.) so each nesting level
+/// consumes a larger stack frame, especially under sanitizers. 128 is still
+/// far above any reasonable real-world SQL nesting depth and low enough for
+/// the guard to fire before sanitizer-instrumented test threads exhaust stack.
+pub const MAX_PARSE_DEPTH: u32 = 128;
 
 /// SQL parser.
 #[derive(Debug)]
