@@ -381,6 +381,31 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
     assert!(index_stats[0].get::<_, i64>(1) >= 1);
     assert!(index_stats[0].get::<_, i64>(2) >= 1);
 
+    let database_stats = client
+        .query(
+            "SELECT xact_commit, xact_rollback \
+             FROM pg_catalog.pg_stat_database \
+             WHERE datname = 'ultrasql'",
+            &[],
+        )
+        .await
+        .expect("pg_stat_database counters");
+    assert_eq!(database_stats.len(), 1);
+    assert!(database_stats[0].get::<_, i64>(0) > 0);
+    assert_eq!(database_stats[0].get::<_, i64>(1), 0);
+
+    let bgwriter_stats = client
+        .query(
+            "SELECT buffers_backend, buffers_alloc \
+             FROM pg_catalog.pg_stat_bgwriter",
+            &[],
+        )
+        .await
+        .expect("pg_stat_bgwriter counters");
+    assert_eq!(bgwriter_stats.len(), 1);
+    assert!(bgwriter_stats[0].get::<_, i64>(0) > 0);
+    assert!(bgwriter_stats[0].get::<_, i64>(1) > 0);
+
     let meta_t_oid = server
         .catalog_snapshot()
         .tables

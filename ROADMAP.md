@@ -1673,9 +1673,17 @@ behavior are implemented and validated.
   scans, index tuples read, and visible heap tuples fetched for SQL index paths.
 - [x] `pg_statio_user_tables` — heap block read/hit counters now come
   from per-relation buffer-pool access counters.
-- [ ] `pg_stat_database` — compatibility view shape exists; live counters pending
-- [ ] `pg_stat_bgwriter` — compatibility view shape exists; live counters pending
-- [ ] `pg_stat_wal` — compatibility view shape exists; live counters pending
+- [x] `pg_stat_database` — live workload-derived transaction counters
+  exposed (`xact_commit` from successful recorded statements,
+  `xact_rollback` from query-scoped errors); database/connection model
+  remains single-database in this wave.
+- [x] `pg_stat_bgwriter` — live buffer-pool counters exposed through the
+  PostgreSQL-compatible view shape (`buffers_backend`, `buffers_alloc`,
+  `buffers_clean`); checkpoint timing counters remain zero until the
+  checkpointer publishes per-cycle timing stats.
+- [ ] `pg_stat_wal` — compatibility view shape exists and now exposes
+  durable WAL bytes when WAL-backed storage is active; record/FPI/write
+  split counters remain pending.
 - [ ] `pg_stat_progress_analyze`, `pg_stat_progress_create_index` — empty compatibility views exist
 - [ ] Prometheus `/metrics` HTTP endpoint — process/build metrics exposed via `--ops-listen`; live query/WAL/buffer counters pending
 - [x] OpenTelemetry tracing with spans per query and per operator — server

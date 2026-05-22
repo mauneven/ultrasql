@@ -149,9 +149,13 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
             schema_pg_statio_user_tables(),
             rows_pg_statio_user_tables(ctx),
         )),
-        "pg_catalog.pg_stat_database" => Some((schema_pg_stat_database(), rows_pg_stat_database())),
-        "pg_catalog.pg_stat_bgwriter" => Some((schema_pg_stat_bgwriter(), rows_pg_stat_bgwriter())),
-        "pg_catalog.pg_stat_wal" => Some((schema_pg_stat_wal(), rows_pg_stat_wal())),
+        "pg_catalog.pg_stat_database" => {
+            Some((schema_pg_stat_database(), rows_pg_stat_database(ctx)))
+        }
+        "pg_catalog.pg_stat_bgwriter" => {
+            Some((schema_pg_stat_bgwriter(), rows_pg_stat_bgwriter(ctx)))
+        }
+        "pg_catalog.pg_stat_wal" => Some((schema_pg_stat_wal(), rows_pg_stat_wal(ctx))),
         "pg_catalog.pg_stat_progress_vacuum" => Some((
             schema_pg_stat_progress_vacuum(),
             rows_pg_stat_progress_vacuum(ctx),
@@ -1475,13 +1479,20 @@ fn schema_pg_stat_database() -> Schema {
     ])
 }
 
-fn rows_pg_stat_database() -> Vec<Vec<Value>> {
+fn rows_pg_stat_database(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let mut calls = 0_u64;
+    let mut errors = 0_u64;
+    for stat in ctx.workload_recorder.snapshot() {
+        calls = calls.saturating_add(stat.calls);
+        errors = errors.saturating_add(stat.errors);
+    }
+    let commits = calls.saturating_sub(errors);
     vec![vec![
         Value::Int64(1),
         v_text("ultrasql"),
         Value::Int32(1),
-        Value::Int64(0),
-        Value::Int64(0),
+        Value::Int64(u64_to_i64_saturating(commits)),
+        Value::Int64(u64_to_i64_saturating(errors)),
         Value::Int64(0),
     ]]
 }
@@ -1500,17 +1511,18 @@ fn schema_pg_stat_bgwriter() -> Schema {
     ])
 }
 
-fn rows_pg_stat_bgwriter() -> Vec<Vec<Value>> {
+fn rows_pg_stat_bgwriter(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let pool = ctx.heap.buffer_pool().stats();
     vec![vec![
         Value::Int64(0),
         Value::Int64(0),
         Value::Float64(0.0),
         Value::Float64(0.0),
         Value::Int64(0),
+        Value::Int64(u64_to_i64_saturating(pool.evictions)),
         Value::Int64(0),
-        Value::Int64(0),
-        Value::Int64(0),
-        Value::Int64(0),
+        Value::Int64(u64_to_i64_saturating(pool.gets)),
+        Value::Int64(u64_to_i64_saturating(pool.misses)),
     ]]
 }
 
@@ -1524,11 +1536,16 @@ fn schema_pg_stat_wal() -> Schema {
     ])
 }
 
-fn rows_pg_stat_wal() -> Vec<Vec<Value>> {
+fn rows_pg_stat_wal(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let wal_bytes = ctx
+        .heap
+        .wal_sink()
+        .map(|sink| sink.durable_lsn().raw())
+        .unwrap_or(0);
     vec![vec![
         Value::Int64(0),
         Value::Int64(0),
-        Value::Int64(0),
+        Value::Int64(u64_to_i64_saturating(wal_bytes)),
         Value::Int64(0),
         Value::Int64(0),
     ]]
