@@ -29,6 +29,7 @@ num-traits         = { workspace = true }
 tempfile           = { workspace = true }
 md5                = { workspace = true }
 sha2               = { workspace = true }
+regex              = { workspace = true }
 
 [dev-dependencies]
 criterion           = { workspace = true }

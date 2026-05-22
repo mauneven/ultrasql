@@ -1014,7 +1014,9 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
         "length" | "position" => Ok(DataType::Int32),
         "lower" | "upper" | "trim" | "lpad" | "rpad" | "left" | "right" | "substr"
         | "substring" | "replace" | "split_part" | "concat" | "concat_ws" | "repeat"
-        | "reverse" | "md5" | "sha256" => Ok(DataType::Text { max_len: None }),
+        | "reverse" | "md5" | "sha256" | "quote_ident" | "format" | "regexp_replace" => {
+            Ok(DataType::Text { max_len: None })
+        }
         "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
         "gen_random_uuid" => Ok(DataType::Uuid),
         "pg_relation_size" => Ok(DataType::Int64),
@@ -1083,6 +1085,9 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "reverse"
             | "md5"
             | "sha256"
+            | "quote_ident"
+            | "format"
+            | "regexp_replace"
             | "gen_random_uuid"
             | "version"
             | "current_database"

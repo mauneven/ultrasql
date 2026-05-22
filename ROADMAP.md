@@ -1798,7 +1798,10 @@ Every standard PostgreSQL driver and ORM works without modification.
 
 ### Built-in Functions Completeness
 - [x] Mathematical: abs, ceil, floor, round, trunc, mod, power, sqrt, exp, ln, log, random, common trig functions, pi()
-- [ ] String: length, lower, upper, trim, lpad, rpad, left, right, substr, position, replace, split_part, concat, concat_ws, repeat, reverse, md5, sha256 now have wire tests; regexp_replace, quote_ident, format remain open
+- [x] String: length, lower, upper, trim, lpad, rpad, left, right,
+  substr, position, replace, split_part, concat, concat_ws, repeat,
+  reverse, md5, sha256, regexp_replace, quote_ident, and format have
+  PostgreSQL-wire regression tests.
 - [ ] Date/Time: now(), current_timestamp, current_date, age(), date_trunc(), extract(), to_timestamp(), make_date(), date_bin()
 - [ ] Aggregate: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG, JSON_AGG, PERCENTILE_CONT, STDDEV, VARIANCE, CORR
 - [ ] Window: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE

@@ -111,6 +111,7 @@ config = "0.14"
 # Numerics / time
 num-traits = "0.2"
 chrono     = "0.4"
+regex      = "1"
 
 # JIT
 cranelift-codegen  = "0.120.0"

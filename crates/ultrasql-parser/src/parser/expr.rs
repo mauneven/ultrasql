@@ -381,6 +381,10 @@ impl<'src> Parser<'src> {
                 self.parse_keyword_function_call("right")
             }
 
+            TokenKind::KwFormat if self.lookahead_at(1)?.kind == TokenKind::LParen => {
+                self.parse_keyword_function_call("format")
+            }
+
             TokenKind::Identifier | TokenKind::QuotedIdentifier => {
                 if self.looks_like_vector_family_typed_literal()? {
                     self.parse_vector_family_typed_literal()
