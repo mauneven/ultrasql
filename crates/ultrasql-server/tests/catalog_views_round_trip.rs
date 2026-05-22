@@ -334,6 +334,20 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
     assert_eq!(vacuumed_stats.len(), 1);
     assert_eq!(vacuumed_stats[0].get::<_, i64>(0), 2);
     assert_eq!(vacuumed_stats[0].get::<_, i64>(1), 0);
+    let table_io = client
+        .query(
+            "SELECT heap_blks_read, heap_blks_hit \
+             FROM pg_catalog.pg_statio_user_tables \
+             WHERE relname = 'stat_t'",
+            &[],
+        )
+        .await
+        .expect("pg_statio_user_tables heap counters");
+    assert_eq!(table_io.len(), 1);
+    assert!(
+        table_io[0].get::<_, i64>(0) > 0 || table_io[0].get::<_, i64>(1) > 0,
+        "expected stat_t heap reads or hits to be recorded"
+    );
 
     client
         .batch_execute("CREATE TABLE stat_idx_t (id INT)")

@@ -50,7 +50,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use dashmap::DashMap;
 use parking_lot::{Mutex, RwLock};
 use ultrasql_core::cache::CachePadded;
-use ultrasql_core::{Error, PageId, Result};
+use ultrasql_core::{Error, PageId, RelationId, Result};
 
 use crate::page::Page;
 use crate::wal_sink::WalSink;
@@ -119,6 +119,17 @@ pub struct BufferPoolStats {
     pub dirty: usize,
 }
 
+/// Cumulative buffer-pool counters for one relation.
+#[derive(Debug)]
+pub struct BufferPoolRelationStats {
+    /// Relation these counters describe.
+    pub relation: RelationId,
+    /// Cumulative cache misses for pages in this relation.
+    pub reads: u64,
+    /// Cumulative cache hits for pages in this relation.
+    pub hits: u64,
+}
+
 /// The buffer pool itself.
 pub struct BufferPool<L: PageLoader> {
     frames: Vec<CachePadded<Frame>>,
@@ -140,6 +151,8 @@ pub struct BufferPool<L: PageLoader> {
     wal_sink: Option<Arc<dyn WalSink>>,
     /// Cumulative counters.
     counters: Counters,
+    /// Cumulative counters keyed by relation id.
+    relation_counters: DashMap<RelationId, RelationCounters>,
 }
 
 impl<L: PageLoader> std::fmt::Debug for BufferPool<L> {
@@ -157,6 +170,12 @@ struct Counters {
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct RelationCounters {
+    reads: AtomicU64,
+    hits: AtomicU64,
 }
 
 /// A buffer-pool frame.
@@ -212,6 +231,7 @@ impl<L: PageLoader> BufferPool<L> {
             miss_lock: Mutex::new(()),
             wal_sink: None,
             counters: Counters::default(),
+            relation_counters: DashMap::new(),
         }
     }
 
@@ -241,6 +261,7 @@ impl<L: PageLoader> BufferPool<L> {
             miss_lock: Mutex::new(()),
             wal_sink: Some(wal),
             counters: Counters::default(),
+            relation_counters: DashMap::new(),
         }
     }
 
@@ -393,6 +414,7 @@ impl<L: PageLoader> BufferPool<L> {
                 .clock_ref
                 .store(true, Ordering::Relaxed);
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            self.record_relation_hit(page_id.relation);
             return Ok(PageGuard {
                 pool: Arc::clone(self),
                 frame_idx,
@@ -409,6 +431,7 @@ impl<L: PageLoader> BufferPool<L> {
                 .clock_ref
                 .store(true, Ordering::Relaxed);
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
+            self.record_relation_hit(page_id.relation);
             return Ok(PageGuard {
                 pool: Arc::clone(self),
                 frame_idx,
@@ -416,6 +439,7 @@ impl<L: PageLoader> BufferPool<L> {
         }
 
         self.counters.misses.fetch_add(1, Ordering::Relaxed);
+        self.record_relation_read(page_id.relation);
 
         let frame_idx = self.acquire_frame_for(page_id)?;
         let new_page = match self.loader.load(page_id) {
@@ -468,6 +492,39 @@ impl<L: PageLoader> BufferPool<L> {
             pinned,
             dirty,
         }
+    }
+
+    /// Return cumulative counters for one relation.
+    #[must_use]
+    pub fn relation_stats(&self, relation: RelationId) -> BufferPoolRelationStats {
+        let Some(counters) = self.relation_counters.get(&relation) else {
+            return BufferPoolRelationStats {
+                relation,
+                reads: 0,
+                hits: 0,
+            };
+        };
+        BufferPoolRelationStats {
+            relation,
+            reads: counters.reads.load(Ordering::Relaxed),
+            hits: counters.hits.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_relation_hit(&self, relation: RelationId) {
+        self.relation_counters
+            .entry(relation)
+            .or_default()
+            .hits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_relation_read(&self, relation: RelationId) {
+        self.relation_counters
+            .entry(relation)
+            .or_default()
+            .reads
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn lookup(&self, page_id: PageId) -> Option<usize> {

@@ -1671,7 +1671,8 @@ behavior are implemented and validated.
   part of the broader statistics-counter slice.
 - [x] `pg_stat_user_indexes` — live index usage counters now track
   scans, index tuples read, and visible heap tuples fetched for SQL index paths.
-- [ ] `pg_statio_user_tables` — compatibility view shape exists; live counters pending
+- [x] `pg_statio_user_tables` — heap block read/hit counters now come
+  from per-relation buffer-pool access counters.
 - [ ] `pg_stat_database` — compatibility view shape exists; live counters pending
 - [ ] `pg_stat_bgwriter` — compatibility view shape exists; live counters pending
 - [ ] `pg_stat_wal` — compatibility view shape exists; live counters pending

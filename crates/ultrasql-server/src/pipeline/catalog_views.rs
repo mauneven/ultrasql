@@ -1443,12 +1443,16 @@ fn rows_pg_statio_user_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             entry.schema_name != "pg_catalog" && entry.schema_name != "information_schema"
         })
         .map(|entry| {
+            let heap_io = ctx
+                .heap
+                .buffer_pool()
+                .relation_stats(ultrasql_core::RelationId(entry.oid));
             vec![
                 v_i64(entry.oid.raw()),
                 v_text(entry.schema_name),
                 v_text(entry.name),
-                Value::Int64(0),
-                Value::Int64(i64::from(entry.n_blocks)),
+                Value::Int64(u64_to_i64_saturating(heap_io.reads)),
+                Value::Int64(u64_to_i64_saturating(heap_io.hits)),
                 Value::Int64(0),
                 Value::Int64(0),
                 Value::Int64(0),
