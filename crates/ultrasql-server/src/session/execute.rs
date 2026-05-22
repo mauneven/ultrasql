@@ -2176,8 +2176,20 @@ where
             if rows == 0 {
                 continue;
             }
-            view.materialized_rows
+            let previous = view
+                .materialized_rows
                 .fetch_add(rows, std::sync::atomic::Ordering::AcqRel);
+            let total = previous.saturating_add(rows);
+            if let Err(err) = self
+                .state
+                .persist_materialized_view_runtime_metadata(&view, total)
+            {
+                tracing::warn!(
+                    error = %err,
+                    view = %view.view_table,
+                    "persist materialized-view runtime metadata failed",
+                );
+            }
             self.state.note_table_modifications(&view.view_table, rows);
         }
     }

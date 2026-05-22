@@ -72,7 +72,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{
-    CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, StatisticRow, TableEntry,
+    Catalog, CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, StatisticRow,
+    TableEntry,
 };
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{BlockNumber, DataType, Lsn, PageId, RelationId, Value, Xid};
@@ -335,6 +336,77 @@ pub(crate) fn append_only_materialized_source_table(plan: &LogicalPlan) -> Optio
         }
         _ => None,
     }
+}
+
+fn materialized_view_projection_indices(plan: &LogicalPlan) -> Option<Vec<usize>> {
+    match plan {
+        LogicalPlan::Scan { schema, .. } => Some((0..schema.fields().len()).collect()),
+        LogicalPlan::Project { input, exprs, .. }
+            if matches!(input.as_ref(), LogicalPlan::Scan { .. }) =>
+        {
+            exprs
+                .iter()
+                .map(|(expr, _)| match expr {
+                    ScalarExpr::Column { index, .. } => Some(*index),
+                    _ => None,
+                })
+                .collect()
+        }
+        _ => None,
+    }
+}
+
+fn materialized_view_source_plan_from_metadata(
+    source_entry: &TableEntry,
+    view_entry: &TableEntry,
+    record: &MaterializedViewMetadataRecord,
+) -> Option<LogicalPlan> {
+    let source_scan = LogicalPlan::Scan {
+        table: record.source_table.clone(),
+        schema: source_entry.schema.clone(),
+        projection: None,
+    };
+    let source_width = source_entry.schema.fields().len();
+    let full_projection = record.projection.len() == source_width
+        && record
+            .projection
+            .iter()
+            .enumerate()
+            .all(|(idx, projected)| idx == *projected);
+    if full_projection && view_entry.schema == source_entry.schema {
+        return Some(source_scan);
+    }
+    if record.projection.len() != view_entry.schema.fields().len() {
+        return None;
+    }
+    let mut exprs = Vec::with_capacity(record.projection.len());
+    for (out_idx, source_idx) in record.projection.iter().copied().enumerate() {
+        let source_field = source_entry.schema.fields().get(source_idx)?;
+        let output_field = view_entry.schema.fields().get(out_idx)?;
+        exprs.push((
+            ScalarExpr::Column {
+                name: output_field.name.clone(),
+                index: source_idx,
+                data_type: source_field.data_type.clone(),
+            },
+            output_field.name.clone(),
+        ));
+    }
+    Some(LogicalPlan::Project {
+        input: Box::new(source_scan),
+        exprs,
+        schema: view_entry.schema.clone(),
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MaterializedViewMetadataRecord {
+    view_table: String,
+    view_oid: ultrasql_core::Oid,
+    source_table: String,
+    source_oid: ultrasql_core::Oid,
+    materialized_rows: u64,
+    projection: Vec<usize>,
 }
 
 /// Runtime metadata for one index beyond plain attnum keys.
@@ -2401,7 +2473,181 @@ impl Server {
         };
         server.recover_commit_status_from_wal()?;
         server.rebuild_persistent_index_sidecars()?;
+        server.rebuild_materialized_view_runtime_sidecars()?;
         Ok(server)
+    }
+
+    fn materialized_view_metadata_path(&self) -> Option<std::path::PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join("pg_materialized_views.meta"))
+    }
+
+    fn load_materialized_view_metadata(
+        &self,
+    ) -> Result<Vec<MaterializedViewMetadataRecord>, ServerError> {
+        let Some(path) = self.materialized_view_metadata_path() else {
+            return Ok(Vec::new());
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(ServerError::Io(err)),
+        };
+        let mut records = Vec::new();
+        for (line_no, line) in text.lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts = line.split('\t').collect::<Vec<_>>();
+            if parts.len() != 6 {
+                return Err(ServerError::Ddl(format!(
+                    "materialized-view metadata line {} has {} fields",
+                    line_no + 1,
+                    parts.len()
+                )));
+            }
+            let view_oid = parts[1].parse::<u32>().map_err(|err| {
+                ServerError::Ddl(format!(
+                    "materialized-view metadata line {} bad view oid: {err}",
+                    line_no + 1
+                ))
+            })?;
+            let source_oid = parts[3].parse::<u32>().map_err(|err| {
+                ServerError::Ddl(format!(
+                    "materialized-view metadata line {} bad source oid: {err}",
+                    line_no + 1
+                ))
+            })?;
+            let materialized_rows = parts[4].parse::<u64>().map_err(|err| {
+                ServerError::Ddl(format!(
+                    "materialized-view metadata line {} bad row count: {err}",
+                    line_no + 1
+                ))
+            })?;
+            let projection = if parts[5].is_empty() {
+                Vec::new()
+            } else {
+                parts[5]
+                    .split(',')
+                    .map(|raw| {
+                        raw.parse::<usize>().map_err(|err| {
+                            ServerError::Ddl(format!(
+                                "materialized-view metadata line {} bad projection index: {err}",
+                                line_no + 1
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            records.push(MaterializedViewMetadataRecord {
+                view_table: parts[0].to_owned(),
+                view_oid: ultrasql_core::Oid::new(view_oid),
+                source_table: parts[2].to_owned(),
+                source_oid: ultrasql_core::Oid::new(source_oid),
+                materialized_rows,
+                projection,
+            });
+        }
+        Ok(records)
+    }
+
+    fn write_materialized_view_metadata(
+        &self,
+        records: &[MaterializedViewMetadataRecord],
+    ) -> Result<(), ServerError> {
+        let Some(path) = self.materialized_view_metadata_path() else {
+            return Ok(());
+        };
+        let mut out = String::from("# ultrasql materialized views v1\n");
+        for record in records {
+            let projection = record
+                .projection
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\n",
+                record.view_table,
+                record.view_oid.raw(),
+                record.source_table,
+                record.source_oid.raw(),
+                record.materialized_rows,
+                projection
+            ));
+        }
+        let tmp = path.with_extension("meta.tmp");
+        std::fs::write(&tmp, out).map_err(ServerError::Io)?;
+        std::fs::rename(tmp, path).map_err(ServerError::Io)?;
+        Ok(())
+    }
+
+    pub(crate) fn persist_materialized_view_runtime_metadata(
+        &self,
+        runtime: &MaterializedViewRuntime,
+        materialized_rows: u64,
+    ) -> Result<(), ServerError> {
+        let Some(projection) = materialized_view_projection_indices(&runtime.source) else {
+            tracing::warn!(
+                view = %runtime.view_table,
+                "materialized-view source shape is not restart-maintainable yet",
+            );
+            return Ok(());
+        };
+        let Some(view_entry) = self.persistent_catalog.lookup_table(&runtime.view_table) else {
+            return Ok(());
+        };
+        let Some(source_entry) = self.persistent_catalog.lookup_table(&runtime.source_table) else {
+            return Ok(());
+        };
+        let mut records = self.load_materialized_view_metadata()?;
+        records.retain(|record| {
+            record.view_table != runtime.view_table && record.view_oid != view_entry.oid
+        });
+        records.push(MaterializedViewMetadataRecord {
+            view_table: runtime.view_table.clone(),
+            view_oid: view_entry.oid,
+            source_table: runtime.source_table.clone(),
+            source_oid: source_entry.oid,
+            materialized_rows,
+            projection,
+        });
+        self.write_materialized_view_metadata(&records)
+    }
+
+    fn rebuild_materialized_view_runtime_sidecars(&self) -> Result<(), ServerError> {
+        for record in self.load_materialized_view_metadata()? {
+            let Some(view_entry) = self.persistent_catalog.lookup_table(&record.view_table) else {
+                continue;
+            };
+            let Some(source_entry) = self.persistent_catalog.lookup_table(&record.source_table)
+            else {
+                continue;
+            };
+            if view_entry.oid != record.view_oid || source_entry.oid != record.source_oid {
+                continue;
+            }
+            let Some(source) =
+                materialized_view_source_plan_from_metadata(&source_entry, &view_entry, &record)
+            else {
+                tracing::warn!(
+                    view = %record.view_table,
+                    "materialized-view metadata references invalid projection",
+                );
+                continue;
+            };
+            self.materialized_views.insert(
+                record.view_table.clone(),
+                Arc::new(MaterializedViewRuntime {
+                    view_table: record.view_table.clone(),
+                    source_table: record.source_table.clone(),
+                    source,
+                    materialized_rows: std::sync::atomic::AtomicU64::new(record.materialized_rows),
+                }),
+            );
+        }
+        Ok(())
     }
 
     fn recover_commit_status_from_wal(&self) -> Result<(), ServerError> {

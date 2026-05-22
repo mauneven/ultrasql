@@ -67,6 +67,7 @@ async fn shutdown(
     drop(client);
     tokio::time::sleep(Duration::from_millis(20)).await;
     server_handle.abort();
+    let _ = server_handle.await;
 }
 
 #[tokio::test]
@@ -173,6 +174,42 @@ async fn appended_materialized_view_rows_survive_restart() {
         .query("SELECT id, amount FROM mv_restart_copy ORDER BY id", &[])
         .await
         .expect("select materialized view after restart");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2].get::<_, i32>(0), 3);
+    assert_eq!(rows[2].get::<_, i32>(1), 30);
+    shutdown(client, server_handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn materialized_view_keeps_maintaining_source_after_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    client
+        .batch_execute("CREATE TABLE mv_runtime_src (id INT NOT NULL, amount INT NOT NULL)")
+        .await
+        .expect("create source");
+    client
+        .batch_execute("INSERT INTO mv_runtime_src VALUES (1, 10), (2, 20)")
+        .await
+        .expect("seed source");
+    client
+        .batch_execute(
+            "CREATE MATERIALIZED VIEW mv_runtime_copy AS SELECT id, amount FROM mv_runtime_src",
+        )
+        .await
+        .expect("create materialized view");
+    shutdown(client, server_handle).await;
+
+    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    client
+        .batch_execute("INSERT INTO mv_runtime_src VALUES (3, 30)")
+        .await
+        .expect("append after restart");
+    let rows = client
+        .query("SELECT id, amount FROM mv_runtime_copy ORDER BY id", &[])
+        .await
+        .expect("select materialized view after restarted append");
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[2].get::<_, i32>(0), 3);
     assert_eq!(rows[2].get::<_, i32>(1), 30);

@@ -544,6 +544,19 @@ where
                 return Err(e);
             }
         };
+        if let Err(e) = self
+            .state
+            .persist_materialized_view_runtime_metadata(&runtime, materialized_rows)
+        {
+            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "abort of materialized-view metadata txn failed",
+                );
+            }
+            let _ = self.state.persistent_catalog.drop_table(table_name);
+            return Err(e);
+        }
         self.state.commit_transaction(
             ddl_txn,
             true,
