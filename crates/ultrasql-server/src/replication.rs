@@ -96,6 +96,15 @@ pub struct LogicalChange {
     pub rows_affected: u64,
 }
 
+/// Durable logical decoding slot progress.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalReplicationSlot {
+    /// Slot name.
+    pub name: String,
+    /// Last logical change LSN consumed by this slot.
+    pub confirmed_lsn: u64,
+}
+
 /// Same-process logical replication runtime.
 ///
 /// This is the first CDC layer: it records committed statement-level DML
@@ -106,6 +115,7 @@ pub struct LogicalChange {
 pub struct LogicalReplicationRuntime {
     publications: dashmap::DashMap<String, Publication>,
     subscriptions: dashmap::DashMap<String, Subscription>,
+    logical_slots: dashmap::DashMap<String, LogicalReplicationSlot>,
     changes: parking_lot::Mutex<Vec<LogicalChange>>,
     next_lsn: AtomicU64,
     metadata_dir: Option<PathBuf>,
@@ -124,6 +134,7 @@ impl LogicalReplicationRuntime {
         Self {
             publications: dashmap::DashMap::new(),
             subscriptions: dashmap::DashMap::new(),
+            logical_slots: dashmap::DashMap::new(),
             changes: parking_lot::Mutex::new(Vec::new()),
             next_lsn: AtomicU64::new(1),
             metadata_dir: None,
@@ -280,6 +291,53 @@ impl LogicalReplicationRuntime {
         subscriptions
     }
 
+    /// Create a durable logical decoding slot over the statement CDC stream.
+    pub fn create_logical_slot(&self, name: &str) -> Result<LogicalReplicationSlot, ServerError> {
+        let name = fold_identifier(name);
+        if name.is_empty() {
+            return Err(ServerError::ddl("logical replication slot requires a name"));
+        }
+        if self.logical_slots.contains_key(&name) {
+            return Err(ServerError::ddl(format!(
+                "logical replication slot \"{name}\" already exists"
+            )));
+        }
+        let slot = LogicalReplicationSlot {
+            name: name.clone(),
+            confirmed_lsn: 0,
+        };
+        self.persist_logical_slot(&slot)?;
+        self.logical_slots.insert(name, slot.clone());
+        Ok(slot)
+    }
+
+    /// Return a logical decoding slot by name.
+    #[must_use]
+    pub fn logical_slot(&self, name: &str) -> Option<LogicalReplicationSlot> {
+        self.logical_slots
+            .get(&fold_identifier(name))
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Decode changes after a slot's confirmed LSN and advance the slot.
+    pub fn decode_slot(&self, name: &str) -> Result<Vec<LogicalChange>, ServerError> {
+        let name = fold_identifier(name);
+        let Some(entry) = self.logical_slots.get(&name) else {
+            return Err(ServerError::ddl(format!(
+                "logical replication slot \"{name}\" does not exist"
+            )));
+        };
+        let mut slot = entry.value().clone();
+        drop(entry);
+        let changes = self.changes_since(slot.confirmed_lsn);
+        if let Some(last) = changes.last() {
+            slot.confirmed_lsn = last.lsn;
+            self.persist_logical_slot(&slot)?;
+            self.logical_slots.insert(name, slot);
+        }
+        Ok(changes)
+    }
+
     /// Return committed logical changes with `lsn` greater than `after_lsn`.
     #[must_use]
     pub fn changes_since(&self, after_lsn: u64) -> Vec<LogicalChange> {
@@ -329,6 +387,7 @@ impl LogicalReplicationRuntime {
         };
         fs::create_dir_all(root.join("publications")).map_err(ServerError::Io)?;
         fs::create_dir_all(root.join("subscriptions")).map_err(ServerError::Io)?;
+        fs::create_dir_all(root.join("logical_slots")).map_err(ServerError::Io)?;
         for entry in fs::read_dir(root.join("publications")).map_err(ServerError::Io)? {
             let entry = entry.map_err(ServerError::Io)?;
             let path = entry.path();
@@ -353,6 +412,21 @@ impl LogicalReplicationRuntime {
                     .insert(subscription.name.clone(), subscription);
             }
         }
+        let mut max_confirmed = 0_u64;
+        for entry in fs::read_dir(root.join("logical_slots")).map_err(ServerError::Io)? {
+            let entry = entry.map_err(ServerError::Io)?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let text = fs::read_to_string(path).map_err(ServerError::Io)?;
+            if let Some(slot) = parse_logical_slot_metadata(&text) {
+                max_confirmed = max_confirmed.max(slot.confirmed_lsn);
+                self.logical_slots.insert(slot.name.clone(), slot);
+            }
+        }
+        self.next_lsn
+            .store(max_confirmed.saturating_add(1).max(1), Ordering::Release);
         Ok(())
     }
 
@@ -382,6 +456,16 @@ impl LogicalReplicationRuntime {
             subscription.enabled
         );
         fs::write(metadata_path(&dir, &subscription.name), body).map_err(ServerError::Io)
+    }
+
+    fn persist_logical_slot(&self, slot: &LogicalReplicationSlot) -> Result<(), ServerError> {
+        let Some(root) = &self.metadata_dir else {
+            return Ok(());
+        };
+        let dir = root.join("logical_slots");
+        fs::create_dir_all(&dir).map_err(ServerError::Io)?;
+        let body = format!("name={}\nconfirmed_lsn={}\n", slot.name, slot.confirmed_lsn);
+        fs::write(metadata_path(&dir, &slot.name), body).map_err(ServerError::Io)
     }
 
     fn remove_metadata_file(&self, kind: &str, name: &str) -> Result<(), ServerError> {
@@ -455,6 +539,18 @@ fn parse_subscription_metadata(text: &str) -> Option<Subscription> {
         slot_name,
         publications,
         enabled,
+    })
+}
+
+fn parse_logical_slot_metadata(text: &str) -> Option<LogicalReplicationSlot> {
+    let name = fold_identifier(metadata_field(text, "name")?);
+    let confirmed_lsn = metadata_field(text, "confirmed_lsn")?.parse::<u64>().ok()?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(LogicalReplicationSlot {
+        name,
+        confirmed_lsn,
     })
 }
 
@@ -727,6 +823,45 @@ mod tests {
         assert_eq!(subscriptions[0].name, "sub_events");
         assert_eq!(subscriptions[0].slot_name, "sub_slot");
         assert_eq!(subscriptions[0].publications, vec!["pub_events"]);
+    }
+
+    #[test]
+    fn logical_decoding_slot_persists_confirmed_lsn() {
+        let dir = tempfile::TempDir::new().expect("metadata dir");
+        {
+            let runtime =
+                LogicalReplicationRuntime::open_metadata(dir.path()).expect("metadata runtime");
+            runtime
+                .create_publication("pub_events", vec!["events".to_string()])
+                .expect("publication");
+            runtime.create_logical_slot("slot_events").expect("slot");
+            runtime.record_committed_dml("events", LogicalChangeKind::Insert, 2);
+            let changes = runtime.decode_slot("slot_events").expect("decode");
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].lsn, 1);
+            assert_eq!(
+                runtime
+                    .logical_slot("slot_events")
+                    .expect("slot")
+                    .confirmed_lsn,
+                1
+            );
+        }
+
+        let runtime = LogicalReplicationRuntime::open_metadata(dir.path()).expect("reopen");
+        assert_eq!(
+            runtime
+                .logical_slot("slot_events")
+                .expect("slot")
+                .confirmed_lsn,
+            1
+        );
+        runtime.record_committed_dml("events", LogicalChangeKind::Update, 1);
+        let changes = runtime
+            .decode_slot("slot_events")
+            .expect("decode after reopen");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].lsn, 2);
     }
 
     #[test]
