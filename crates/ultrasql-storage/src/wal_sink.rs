@@ -17,6 +17,19 @@
 use ultrasql_core::{Lsn, Xid};
 use ultrasql_wal::WalRecord;
 
+/// Live WAL counters exposed by storage sinks.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WalSinkStats {
+    /// Number of WAL records accepted by the sink.
+    pub wal_records: u64,
+    /// Number of full-page-write records accepted by the sink.
+    pub wal_fpi: u64,
+    /// Number of serialized WAL bytes accepted by the sink.
+    pub wal_bytes: u64,
+    /// Number of WAL write operations observed by the sink.
+    pub wal_write: u64,
+}
+
 /// Errors that arise when a [`WalSink`] rejects a record.
 #[derive(Debug, thiserror::Error)]
 pub enum WalSinkError {
@@ -69,6 +82,11 @@ pub trait WalSink: Send + Sync {
     /// The heap uses this as the `prev_lsn` of the next record it appends for
     /// `xid` so records form a per-transaction linked list in the WAL.
     fn last_lsn_for(&self, xid: Xid) -> Lsn;
+
+    /// Return live append counters for observability views.
+    fn stats(&self) -> WalSinkStats {
+        WalSinkStats::default()
+    }
 }
 
 // ---------------------------------------------------------------------------

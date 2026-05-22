@@ -1689,9 +1689,10 @@ behavior are implemented and validated.
   PostgreSQL-compatible view shape (`buffers_backend`, `buffers_alloc`,
   `buffers_clean`); checkpoint timing counters remain zero until the
   checkpointer publishes per-cycle timing stats.
-- [ ] `pg_stat_wal` — compatibility view shape exists and now exposes
-  durable WAL bytes when WAL-backed storage is active; record/FPI/write
-  split counters remain pending.
+- [x] `pg_stat_wal` — live WAL sink counters expose appended records,
+  full-page-write records, appended bytes, and write operations through
+  the PostgreSQL-compatible view shape; fsync latency remains available
+  through ops metrics.
 - [ ] `pg_stat_progress_analyze`, `pg_stat_progress_create_index` — empty compatibility views exist
 - [ ] Prometheus `/metrics` HTTP endpoint — process/build metrics exposed via `--ops-listen`; live query/WAL/buffer counters pending
 - [x] OpenTelemetry tracing with spans per query and per operator — server

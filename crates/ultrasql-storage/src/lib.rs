@@ -47,4 +47,4 @@ pub use toast::{ToastDatum, ToastError, ToastPointer, ToastTable, maybe_toast};
 pub use vm::VisibilityMap;
 #[cfg(any(test, feature = "testing"))]
 pub use wal_sink::test_support;
-pub use wal_sink::{NullWalSink, WalSink, WalSinkError};
+pub use wal_sink::{NullWalSink, WalSink, WalSinkError, WalSinkStats};

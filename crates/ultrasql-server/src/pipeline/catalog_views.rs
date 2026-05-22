@@ -1546,17 +1546,17 @@ fn schema_pg_stat_wal() -> Schema {
 }
 
 fn rows_pg_stat_wal(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
-    let wal_bytes = ctx
+    let stats = ctx
         .heap
         .wal_sink()
-        .map(|sink| sink.durable_lsn().raw())
-        .unwrap_or(0);
+        .map(|sink| sink.stats())
+        .unwrap_or_default();
     vec![vec![
+        Value::Int64(u64_to_i64_saturating(stats.wal_records)),
+        Value::Int64(u64_to_i64_saturating(stats.wal_fpi)),
+        Value::Int64(u64_to_i64_saturating(stats.wal_bytes)),
         Value::Int64(0),
-        Value::Int64(0),
-        Value::Int64(u64_to_i64_saturating(wal_bytes)),
-        Value::Int64(0),
-        Value::Int64(0),
+        Value::Int64(u64_to_i64_saturating(stats.wal_write)),
     ]]
 }
 
