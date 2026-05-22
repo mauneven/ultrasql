@@ -151,9 +151,10 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_stat_database" => Some((schema_pg_stat_database(), rows_pg_stat_database())),
         "pg_catalog.pg_stat_bgwriter" => Some((schema_pg_stat_bgwriter(), rows_pg_stat_bgwriter())),
         "pg_catalog.pg_stat_wal" => Some((schema_pg_stat_wal(), rows_pg_stat_wal())),
-        "pg_catalog.pg_stat_progress_vacuum" => {
-            Some((schema_pg_stat_progress_vacuum(), Vec::new()))
-        }
+        "pg_catalog.pg_stat_progress_vacuum" => Some((
+            schema_pg_stat_progress_vacuum(),
+            rows_pg_stat_progress_vacuum(ctx),
+        )),
         "pg_catalog.pg_stat_progress_analyze" => {
             Some((schema_pg_stat_progress_analyze(), Vec::new()))
         }
@@ -1501,6 +1502,25 @@ fn schema_pg_stat_progress_vacuum() -> Schema {
         Field::required("heap_blks_scanned", DataType::Int64),
         Field::required("heap_blks_vacuumed", DataType::Int64),
     ])
+}
+
+fn rows_pg_stat_progress_vacuum(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    ctx.workload_recorder
+        .vacuum_progress()
+        .into_iter()
+        .map(|row| {
+            vec![
+                Value::Int32(row.pid),
+                Value::Int64(row.datid),
+                v_text(row.datname),
+                Value::Int64(row.relid),
+                v_text(row.phase),
+                Value::Int64(row.heap_blks_total),
+                Value::Int64(row.heap_blks_scanned),
+                Value::Int64(row.heap_blks_vacuumed),
+            ]
+        })
+        .collect()
 }
 
 fn schema_pg_stat_progress_analyze() -> Schema {

@@ -11,6 +11,7 @@ use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
 async fn start_server_and_connect() -> (
+    Arc<Server>,
     tokio_postgres::Client,
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
@@ -18,7 +19,7 @@ async fn start_server_and_connect() -> (
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
     let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
+    let server_handle = tokio::spawn(serve_listener(listener, Arc::clone(&server)));
     let conn_str = format!(
         "host={host} port={port} user=tester application_name=catalog_views_test",
         host = bound.ip(),
@@ -32,7 +33,7 @@ async fn start_server_and_connect() -> (
             eprintln!("connection error: {e}");
         }
     });
-    (client, conn_handle, server_handle)
+    (server, client, conn_handle, server_handle)
 }
 
 async fn shutdown(
@@ -46,7 +47,7 @@ async fn shutdown(
 
 #[tokio::test]
 async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let (server, client, _conn, server_handle) = start_server_and_connect().await;
 
     client
         .batch_execute("CREATE TABLE meta_t (id INT NOT NULL, name TEXT DEFAULT 'anon')")
@@ -292,6 +293,34 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
         .expect("pg_settings query");
     assert_eq!(settings.len(), 1);
     assert_eq!(settings[0].get::<_, String>(0), "UTF8");
+
+    let meta_t_oid = server
+        .catalog_snapshot()
+        .tables
+        .get("meta_t")
+        .expect("meta_t catalog entry")
+        .oid
+        .raw();
+    server.workload_recorder.begin_vacuum(42, meta_t_oid, 3);
+    server
+        .workload_recorder
+        .update_vacuum(42, "vacuuming heap", 2, 1);
+    let vacuum_progress = client
+        .query(
+            "SELECT relid, phase, heap_blks_total, heap_blks_scanned, heap_blks_vacuumed \
+             FROM pg_catalog.pg_stat_progress_vacuum \
+             WHERE pid = 42",
+            &[],
+        )
+        .await
+        .expect("pg_stat_progress_vacuum query");
+    assert_eq!(vacuum_progress.len(), 1);
+    assert_eq!(vacuum_progress[0].get::<_, i64>(0), i64::from(meta_t_oid));
+    assert_eq!(vacuum_progress[0].get::<_, String>(1), "vacuuming heap");
+    assert_eq!(vacuum_progress[0].get::<_, i64>(2), 3);
+    assert_eq!(vacuum_progress[0].get::<_, i64>(3), 2);
+    assert_eq!(vacuum_progress[0].get::<_, i64>(4), 1);
+    server.workload_recorder.finish_vacuum(42);
 
     let routines = client
         .query(

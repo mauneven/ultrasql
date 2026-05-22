@@ -1621,7 +1621,8 @@ behavior are implemented and validated.
   refresh heap visibility and reclaim dead tuples; aggressive
   wraparound-grade freezing remains tied to long-running transaction
   hardening.
-- [ ] `pg_stat_progress_vacuum` view — empty compatibility view exists; live progress rows pending
+- [x] `pg_stat_progress_vacuum` view — active VACUUM progress rows are
+  recorded per backend pid and exposed through the virtual catalog view.
 
 ### Physical Streaming Replication
 - [ ] WAL sender process — file-backed `WalSender` primitive plus `ultrasql --wal-send-once`; network process loop pending

@@ -100,6 +100,27 @@ pub struct WorkloadLatencyHistogram {
     pub sum_us: u64,
 }
 
+/// One active `pg_stat_progress_vacuum` row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VacuumProgressSnapshot {
+    /// PostgreSQL backend pid owning the VACUUM.
+    pub pid: i32,
+    /// Database OID. UltraSQL exposes one database in this wave.
+    pub datid: i64,
+    /// Database name.
+    pub datname: String,
+    /// Relation OID being vacuumed.
+    pub relid: i64,
+    /// Current VACUUM phase.
+    pub phase: String,
+    /// Heap blocks in the relation at VACUUM start.
+    pub heap_blks_total: i64,
+    /// Heap blocks scanned so far.
+    pub heap_blks_scanned: i64,
+    /// Heap blocks vacuumed so far.
+    pub heap_blks_vacuumed: i64,
+}
+
 #[derive(Debug, Default)]
 struct LatencyHistogramState {
     bucket_counts: [u64; LATENCY_BUCKET_COUNT],
@@ -149,6 +170,7 @@ pub struct WorkloadRecorder {
     slow_log: parking_lot::Mutex<VecDeque<SlowQueryRecord>>,
     slow_query_threshold: parking_lot::RwLock<Option<Duration>>,
     latency_histogram: parking_lot::Mutex<LatencyHistogramState>,
+    vacuum_progress: parking_lot::Mutex<HashMap<u32, VacuumProgressSnapshot>>,
     slow_log_capacity: usize,
 }
 
@@ -167,6 +189,7 @@ impl WorkloadRecorder {
             slow_log: parking_lot::Mutex::new(VecDeque::new()),
             slow_query_threshold: parking_lot::RwLock::new(None),
             latency_histogram: parking_lot::Mutex::new(LatencyHistogramState::default()),
+            vacuum_progress: parking_lot::Mutex::new(HashMap::new()),
             slow_log_capacity: 1024,
         }
     }
@@ -269,6 +292,56 @@ impl WorkloadRecorder {
     pub fn latency_histogram(&self) -> WorkloadLatencyHistogram {
         self.latency_histogram.lock().snapshot()
     }
+
+    /// Start or replace one active VACUUM progress row.
+    pub fn begin_vacuum(&self, pid: u32, relid: u32, heap_blks_total: u32) {
+        self.vacuum_progress.lock().insert(
+            pid,
+            VacuumProgressSnapshot {
+                pid: u32_to_i32_saturated(pid),
+                datid: 1,
+                datname: "ultrasql".to_string(),
+                relid: i64::from(relid),
+                phase: "initializing".to_string(),
+                heap_blks_total: i64::from(heap_blks_total),
+                heap_blks_scanned: 0,
+                heap_blks_vacuumed: 0,
+            },
+        );
+    }
+
+    /// Update counters and phase for an active VACUUM progress row.
+    pub fn update_vacuum(
+        &self,
+        pid: u32,
+        phase: impl Into<String>,
+        heap_blks_scanned: u32,
+        heap_blks_vacuumed: u32,
+    ) {
+        if let Some(row) = self.vacuum_progress.lock().get_mut(&pid) {
+            row.phase = phase.into();
+            row.heap_blks_scanned = i64::from(heap_blks_scanned);
+            row.heap_blks_vacuumed = i64::from(heap_blks_vacuumed);
+        }
+    }
+
+    /// Clear one active VACUUM progress row.
+    pub fn finish_vacuum(&self, pid: u32) {
+        self.vacuum_progress.lock().remove(&pid);
+    }
+
+    /// Return active VACUUM progress rows ordered by pid.
+    #[must_use]
+    pub fn vacuum_progress(&self) -> Vec<VacuumProgressSnapshot> {
+        let mut rows = self
+            .vacuum_progress
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row.pid);
+        rows
+    }
 }
 
 /// Hash a bound logical plan without exposing literal values to logs.
@@ -301,6 +374,10 @@ fn stable_hash<T: Hash>(value: &T) -> u64 {
 
 fn duration_as_micros_saturated(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn u32_to_i32_saturated(value: u32) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
 }
 
 #[cfg(test)]
@@ -344,5 +421,31 @@ mod tests {
                 .iter()
                 .any(|bucket| bucket.le_us == u64::MAX && bucket.count == 2)
         );
+    }
+
+    #[test]
+    fn workload_recorder_tracks_vacuum_progress_lifecycle() {
+        let recorder = WorkloadRecorder::new();
+        recorder.begin_vacuum(7, 42, 9);
+        recorder.update_vacuum(7, "vacuuming heap", 4, 3);
+
+        let rows = recorder.vacuum_progress();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            VacuumProgressSnapshot {
+                pid: 7,
+                datid: 1,
+                datname: "ultrasql".to_string(),
+                relid: 42,
+                phase: "vacuuming heap".to_string(),
+                heap_blks_total: 9,
+                heap_blks_scanned: 4,
+                heap_blks_vacuumed: 3,
+            }
+        );
+
+        recorder.finish_vacuum(7);
+        assert!(recorder.vacuum_progress().is_empty());
     }
 }

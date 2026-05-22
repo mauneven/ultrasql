@@ -1654,17 +1654,41 @@ where
         };
         let oldest = self.state.txn_manager.oldest_in_progress();
         for entry in tables {
-            self.vacuum_one_table_indexes(&snapshot, &entry, oldest)?;
             let rel = RelationId(entry.oid);
+            let block_count = self.state.heap.block_count(rel).max(entry.n_blocks);
             self.state
-                .heap
-                .vacuum_heap(rel, oldest, self.state.txn_manager.as_ref())
-                .map_err(|e| ServerError::ddl(format!("VACUUM heap: {e}")))?;
-            self.state.vacuum_mark_visible_pages(oldest);
-            self.resummarize_brin_indexes(&snapshot, &entry)?;
-            self.maintain_aggregating_indexes_for_tables_after_commit(std::slice::from_ref(
-                &entry.name,
-            ))?;
+                .workload_recorder
+                .begin_vacuum(self.pid, entry.oid.raw(), block_count);
+            let result = (|| -> Result<(), ServerError> {
+                self.state
+                    .workload_recorder
+                    .update_vacuum(self.pid, "vacuuming indexes", 0, 0);
+                self.vacuum_one_table_indexes(&snapshot, &entry, oldest)?;
+                self.state.workload_recorder.update_vacuum(
+                    self.pid,
+                    "vacuuming heap",
+                    block_count,
+                    0,
+                );
+                self.state
+                    .heap
+                    .vacuum_heap(rel, oldest, self.state.txn_manager.as_ref())
+                    .map_err(|e| ServerError::ddl(format!("VACUUM heap: {e}")))?;
+                self.state.workload_recorder.update_vacuum(
+                    self.pid,
+                    "performing final cleanup",
+                    block_count,
+                    block_count,
+                );
+                self.state.vacuum_mark_visible_pages(oldest);
+                self.resummarize_brin_indexes(&snapshot, &entry)?;
+                self.maintain_aggregating_indexes_for_tables_after_commit(std::slice::from_ref(
+                    &entry.name,
+                ))?;
+                Ok(())
+            })();
+            self.state.workload_recorder.finish_vacuum(self.pid);
+            result?;
         }
         Ok(result_encoder::SelectResult {
             messages: vec![BackendMessage::CommandComplete {
