@@ -17,52 +17,16 @@
 //! - `DROP TABLE` against a never-defined name fails with SQLSTATE
 //!   `42P01` and leaves the session in idle status.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+mod support;
 
-use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener};
-
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=drop_table_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
-
-async fn shutdown(
-    client: tokio_postgres::Client,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
-}
+use support::{shutdown, start_sample_server};
 
 /// `DROP TABLE` after `CREATE` + `INSERT` removes the relation; a
 /// subsequent `SELECT` errors with SQLSTATE `42P01`.
 #[tokio::test]
 async fn drop_table_then_select_fails_with_42p01() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("drop_table_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE doomed (id INT NOT NULL, v INT)")
@@ -96,13 +60,14 @@ async fn drop_table_then_select_fails_with_42p01() {
         "expected undefined_table, got {err:?}"
     );
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 /// After `DROP TABLE`, the name is available for `CREATE TABLE` reuse.
 #[tokio::test]
 async fn drop_then_recreate_same_name_succeeds() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("drop_table_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE reused (id INT NOT NULL)")
@@ -135,14 +100,15 @@ async fn drop_then_recreate_same_name_succeeds() {
     assert_eq!(rows[0].get::<_, i32>(0), 42);
     assert_eq!(rows[0].get::<_, i32>(1), 1);
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 /// `DROP TABLE` of a name that was never defined fails with SQLSTATE
 /// `42P01` and leaves the session alive.
 #[tokio::test]
 async fn drop_table_on_undefined_relation_fails_with_42p01() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("drop_table_test").await;
+    let client = &running.client;
 
     let err = client
         .batch_execute("DROP TABLE never_existed")
@@ -161,5 +127,5 @@ async fn drop_table_on_undefined_relation_fails_with_42p01() {
         .await
         .expect("session survives prior error");
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }

@@ -6,50 +6,16 @@
 //! now lowers those plans, emits row descriptions, returns the correct
 //! row images, and still tags the command as DML rather than `SELECT`.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use tokio_postgres::SimpleQueryMessage;
 
-use tokio_postgres::{NoTls, SimpleQueryMessage};
-use ultrasql_server::{Server, bind_listener, serve_listener};
+mod support;
 
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=returning_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
-
-async fn shutdown(
-    client: tokio_postgres::Client,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
-}
+use support::{shutdown, start_sample_server};
 
 #[tokio::test]
 async fn insert_returning_works_over_extended_query() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("returning_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
@@ -79,12 +45,13 @@ async fn insert_returning_works_over_extended_query() {
         .collect();
     assert_eq!(persisted_pairs, vec![(1, 10), (2, 20)]);
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn update_returning_works_over_extended_query() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("returning_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
@@ -115,12 +82,13 @@ async fn update_returning_works_over_extended_query() {
         .collect();
     assert_eq!(persisted_pairs, vec![(1, 10), (2, 25), (3, 35)]);
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn delete_returning_works_over_extended_query() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("returning_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
@@ -151,12 +119,13 @@ async fn delete_returning_works_over_extended_query() {
         .collect();
     assert_eq!(persisted_pairs, vec![(1, 10)]);
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn insert_returning_works_over_simple_query() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("returning_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
@@ -190,12 +159,13 @@ async fn insert_returning_works_over_simple_query() {
     assert_eq!(rows, vec![(7, 70)]);
     assert_eq!(affected, Some(1));
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test]
 async fn update_and_delete_returning_work_over_simple_query() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("returning_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE t (id INT NOT NULL, v INT NOT NULL)")
@@ -278,5 +248,5 @@ async fn update_and_delete_returning_work_over_simple_query() {
     assert_eq!(delete_count, Some(2));
     assert_eq!(deleted_rows, vec![(2, 25), (3, 35)]);
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }

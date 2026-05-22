@@ -20,52 +20,16 @@
 //! - Schema arity mismatch is rejected before any heap write.
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+mod support;
 
-use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener};
-
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=insert_select_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
-
-async fn shutdown(
-    client: tokio_postgres::Client,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
-}
+use support::{shutdown, start_sample_server};
 
 /// `INSERT INTO dst SELECT a, b FROM src WHERE a > 100` copies the
 /// rows that satisfy the predicate into the destination relation.
 #[tokio::test]
 async fn insert_select_with_predicate_copies_filtered_rows() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("insert_select_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE src (a INT NOT NULL, b INT NOT NULL)")
@@ -99,13 +63,14 @@ async fn insert_select_with_predicate_copies_filtered_rows() {
         .collect();
     assert_eq!(values, HashSet::from([(150, 15), (200, 20), (250, 25)]));
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 /// `INSERT INTO dst SELECT a, b FROM src` (no WHERE) copies every row.
 #[tokio::test]
 async fn insert_select_without_predicate_copies_all_rows() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("insert_select_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE src (a INT NOT NULL, b INT NOT NULL)")
@@ -136,14 +101,15 @@ async fn insert_select_without_predicate_copies_all_rows() {
         .collect();
     assert_eq!(values, HashSet::from([(1, 10), (2, 20), (3, 30)]));
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 /// Two `INSERT INTO dst SELECT …` statements double the destination's
 /// row count — verifies the path isn't a one-shot.
 #[tokio::test]
 async fn insert_select_runs_idempotently_twice() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("insert_select_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE src (a INT NOT NULL, b INT NOT NULL)")
@@ -174,14 +140,15 @@ async fn insert_select_runs_idempotently_twice() {
         .expect("select dst");
     assert_eq!(rows.len(), 4, "two SELECTs land 2 + 2 = 4 rows");
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 /// Explicit destination columns map source positions to target
 /// columns, just like VALUES inserts.
 #[tokio::test]
 async fn insert_select_respects_target_column_order() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("insert_select_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE src (x INT NOT NULL, y INT NOT NULL)")
@@ -209,14 +176,15 @@ async fn insert_select_respects_target_column_order() {
     assert_eq!(rows[0].get::<_, i32>(0), 70);
     assert_eq!(rows[0].get::<_, i32>(1), 7);
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 /// `INSERT … SELECT` with a column-count mismatch must be rejected
 /// before any tuple lands in the heap.
 #[tokio::test]
 async fn insert_select_arity_mismatch_is_rejected() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("insert_select_test").await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE src (a INT NOT NULL, b INT NOT NULL, c INT NOT NULL)")
@@ -252,5 +220,5 @@ async fn insert_select_arity_mismatch_is_rejected() {
         .expect("select dst");
     assert!(post.is_empty(), "rejected INSERT must not leak rows");
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
