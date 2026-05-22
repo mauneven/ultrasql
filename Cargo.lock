@@ -3513,6 +3513,7 @@ dependencies = [
  "arrow-schema",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "clap",
  "config",
  "dashmap",
