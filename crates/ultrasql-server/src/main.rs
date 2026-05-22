@@ -9,8 +9,10 @@
 //! duplex stream as well as by integration tests over a real TCP
 //! socket.
 
+use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use clap::{Parser, ValueEnum};
@@ -96,6 +98,15 @@ struct Cli {
     /// Fraction of estimated table rows added to the ANALYZE threshold.
     #[arg(long, default_value_t = 0.1)]
     autovacuum_analyze_scale_factor: f64,
+
+    /// Shell command used to archive completed WAL files. `%p` expands to the
+    /// source path and `%f` expands to the WAL filename.
+    #[arg(long, env = "ULTRASQL_ARCHIVE_COMMAND")]
+    archive_command: Option<String>,
+
+    /// Background WAL archive scan interval in milliseconds.
+    #[arg(long, default_value_t = 1000)]
+    archive_interval_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -148,6 +159,7 @@ Production-oriented v0.9 flags:
   - --log-format json   emit structured logs
   - --log-min-duration-statement-ms N
   - --log-statement none|ddl|mod|all
+  - --archive-command CMD  archive completed WAL files; %p=path, %f=name
 ";
 
 fn main() -> std::process::ExitCode {
@@ -228,6 +240,17 @@ fn main() -> std::process::ExitCode {
                 }
             });
         }
+        if let (Some(data_dir), Some(command)) = (
+            cli.data_dir.clone(),
+            cli.archive_command
+                .clone()
+                .filter(|command| !command.trim().is_empty()),
+        ) {
+            let interval_ms = cli.archive_interval_ms;
+            tokio::spawn(async move {
+                run_wal_archiver_loop(data_dir, command, interval_ms).await;
+            });
+        }
         run_server(cli.listen, state).await
     });
     match outcome {
@@ -271,6 +294,90 @@ fn autovacuum_config_from_cli(cli: &Cli) -> Result<AutovacuumConfig, String> {
             cli.autovacuum_analyze_scale_factor,
         )?,
     })
+}
+
+async fn run_wal_archiver_loop(data_dir: PathBuf, archive_command: String, interval_ms: u64) {
+    let interval_ms = interval_ms.max(1);
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+    loop {
+        ticker.tick().await;
+        match archive_wal_once(&data_dir, &archive_command) {
+            Ok(archived) if archived > 0 => {
+                info!(target: "ultrasqld", archived, "WAL archiver completed batch");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!(target: "ultrasqld", error = %e, "WAL archiver failed");
+            }
+        }
+    }
+}
+
+fn archive_wal_once(data_dir: &Path, archive_command: &str) -> Result<usize, String> {
+    let wal_dir = data_dir.join("pg_wal");
+    let status_dir = wal_dir.join("archive_status");
+    fs::create_dir_all(&status_dir).map_err(|e| format!("create archive_status: {e}"))?;
+
+    let mut files = fs::read_dir(&wal_dir)
+        .map_err(|e| format!("read {}: {e}", wal_dir.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| {
+            path.parent().is_some_and(|parent| {
+                parent.file_name().and_then(|n| n.to_str()) != Some("archive_status")
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+
+    // Conservative cut: skip newest segment candidate, because it is likely the
+    // currently-open WAL file. It will be archived after a later segment appears.
+    if !files.is_empty() {
+        files.pop();
+    }
+
+    let mut archived = 0_usize;
+    for path in files {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let done = status_dir.join(format!("{name}.done"));
+        if done.exists() {
+            continue;
+        }
+        let rendered = render_archive_command(archive_command, &path, name);
+        let status = run_archive_shell_command(&rendered)
+            .map_err(|e| format!("archive command spawn failed for {name}: {e}"))?;
+        if !status.success() {
+            let failed = status_dir.join(format!("{name}.failed"));
+            let _ = fs::write(&failed, rendered.as_bytes());
+            return Err(format!(
+                "archive command failed for {name} with status {status}"
+            ));
+        }
+        fs::write(&done, rendered.as_bytes())
+            .map_err(|e| format!("write {}: {e}", done.display()))?;
+        archived = archived.saturating_add(1);
+    }
+    Ok(archived)
+}
+
+fn render_archive_command(template: &str, path: &Path, filename: &str) -> String {
+    template
+        .replace("%p", &path.to_string_lossy())
+        .replace("%f", filename)
+}
+
+fn run_archive_shell_command(command: &str) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(windows)]
+    {
+        Command::new("cmd").args(["/C", command]).status()
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("sh").args(["-c", command]).status()
+    }
 }
 
 fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String> {
@@ -575,6 +682,8 @@ mod tests {
             autovacuum_vacuum_scale_factor: 0.25,
             autovacuum_analyze_threshold: 11,
             autovacuum_analyze_scale_factor: 0.125,
+            archive_command: None,
+            archive_interval_ms: 1000,
         };
 
         let config = autovacuum_config_from_cli(&cli).expect("valid autovacuum config");
@@ -601,6 +710,8 @@ mod tests {
             autovacuum_vacuum_scale_factor: f64::NAN,
             autovacuum_analyze_threshold: 50,
             autovacuum_analyze_scale_factor: 0.1,
+            archive_command: None,
+            archive_interval_ms: 1000,
         };
 
         assert!(autovacuum_config_from_cli(&cli).is_err());
@@ -622,6 +733,8 @@ mod tests {
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
             autovacuum_analyze_scale_factor: 0.1,
+            archive_command: None,
+            archive_interval_ms: 1000,
         };
 
         assert!(logging_config_from_cli(&cli).is_err());
@@ -643,6 +756,8 @@ mod tests {
             autovacuum_vacuum_scale_factor: 0.2,
             autovacuum_analyze_threshold: 50,
             autovacuum_analyze_scale_factor: 0.1,
+            archive_command: None,
+            archive_interval_ms: 1000,
         };
 
         let config = logging_config_from_cli(&cli).expect("valid logging config");
@@ -650,6 +765,65 @@ mod tests {
         assert!(config.log_connections);
         assert_eq!(config.log_min_duration_statement_ms, 25);
         assert_eq!(config.log_statement, LogStatementMode::All);
+    }
+
+    #[test]
+    fn archive_command_renderer_expands_path_and_filename() {
+        let rendered = render_archive_command(
+            "copy %p archive/%f",
+            Path::new("/data/pg_wal/000000010000000000000001"),
+            "000000010000000000000001",
+        );
+
+        assert_eq!(
+            rendered,
+            "copy /data/pg_wal/000000010000000000000001 archive/000000010000000000000001"
+        );
+    }
+
+    #[test]
+    fn archive_wal_once_marks_completed_files_done() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let wal_dir = dir.path().join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).expect("pg_wal");
+        std::fs::write(wal_dir.join("000000010000000000000001"), b"wal-a").expect("wal a");
+        std::fs::write(wal_dir.join("000000010000000000000002"), b"wal-b").expect("wal b");
+
+        let command = successful_archive_command();
+        assert_eq!(
+            archive_wal_once(dir.path(), command).expect("first archive"),
+            1
+        );
+        assert!(
+            wal_dir
+                .join("archive_status/000000010000000000000001.done")
+                .exists()
+        );
+        assert_eq!(
+            archive_wal_once(dir.path(), command).expect("second archive"),
+            0
+        );
+
+        std::fs::write(wal_dir.join("000000010000000000000003"), b"wal-c").expect("wal c");
+        assert_eq!(
+            archive_wal_once(dir.path(), command).expect("third archive"),
+            1
+        );
+        assert!(
+            wal_dir
+                .join("archive_status/000000010000000000000002.done")
+                .exists()
+        );
+    }
+
+    #[cfg(windows)]
+    fn successful_archive_command() -> &'static str {
+        "exit /B 0"
+    }
+
+    #[cfg(not(windows))]
+    fn successful_archive_command() -> &'static str {
+        "true"
     }
 
     #[test]

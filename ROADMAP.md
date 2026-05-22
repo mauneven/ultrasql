@@ -1672,7 +1672,11 @@ behavior are implemented and validated.
 - [ ] Cascading replication — file-backed receiver output is valid sender input; continuous network cascade pending
 
 ### Backup & PITR
-- [ ] WAL archiving (`archive_command`) — CLI archive utility exists via `ultrasql --archive-wal`; server-side config execution pending
+- [x] WAL archiving (`archive_command`) — CLI archive utility exists via
+  `ultrasql --archive-wal`; `ultrasqld --archive-command '...'` runs a
+  background server-side archiver, substitutes `%p` / `%f`, records
+  `pg_wal/archive_status/*.done`, and skips the newest WAL file to avoid
+  archiving the active segment.
 - [ ] WAL restore (`restore_command`) — CLI restore utility exists via `ultrasql --restore-wal`; recovery integration pending
 - [ ] Base backup (`pg_basebackup` equivalent) — `ultrasql --basebackup DEST --data-dir DIR` copies files and writes `backup_manifest.json`; online checkpoint fencing pending
 - [x] `recovery.signal` / `standby.signal` support — CLI signal-file
