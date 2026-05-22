@@ -403,6 +403,76 @@ fn cosine_distance_f32_neon_checked(left: &[f32], right: &[f32]) -> Option<f32> 
     unsafe { cosine_distance_f32_neon(left, right) }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+fn load_f32x4(chunk: &[f32]) -> std::arch::aarch64::float32x4_t {
+    debug_assert!(chunk.len() >= 4);
+    // SAFETY:
+    // - Callers pass slices produced by `chunks_exact(4)`, so at least four
+    //   initialized contiguous `f32` lanes are available.
+    // - `vld1q_f32` permits unaligned loads and does not outlive the slice.
+    unsafe { std::arch::aarch64::vld1q_f32(chunk.as_ptr()) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+fn store_f32x4(vector: std::arch::aarch64::float32x4_t, lanes: &mut [f32; 4]) {
+    // SAFETY:
+    // - `lanes` points to exactly four initialized `f32` slots on the stack.
+    // - `vst1q_f32` permits unaligned stores and writes exactly four lanes.
+    unsafe { std::arch::aarch64::vst1q_f32(lanes.as_mut_ptr(), vector) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn load_m256_f32(chunk: &[f32]) -> std::arch::x86_64::__m256 {
+    debug_assert!(chunk.len() >= 8);
+    // SAFETY:
+    // - Callers pass slices produced by `chunks_exact(8)`, so at least eight
+    //   initialized contiguous `f32` lanes are available.
+    // - `_mm256_loadu_ps` permits unaligned loads and does not outlive slice.
+    unsafe { std::arch::x86_64::_mm256_loadu_ps(chunk.as_ptr()) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+fn store_m256_f32(vector: std::arch::x86_64::__m256, lanes: &mut [f32; 8]) {
+    // SAFETY:
+    // - `lanes` points to exactly eight initialized `f32` slots on stack.
+    // - `_mm256_storeu_ps` permits unaligned stores and writes exactly eight
+    //   lanes.
+    unsafe { std::arch::x86_64::_mm256_storeu_ps(lanes.as_mut_ptr(), vector) };
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
+#[target_feature(enable = "avx512f")]
+#[inline]
+fn load_m512_f32(chunk: &[f32]) -> std::arch::x86_64::__m512 {
+    debug_assert!(chunk.len() >= 16);
+    // SAFETY:
+    // - Callers pass slices produced by `chunks_exact(16)`, so at least sixteen
+    //   initialized contiguous `f32` lanes are available.
+    // - `_mm512_loadu_ps` permits unaligned loads and does not outlive slice.
+    unsafe { std::arch::x86_64::_mm512_loadu_ps(chunk.as_ptr()) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
+#[target_feature(enable = "avx512f")]
+#[inline]
+fn store_m512_f32(vector: std::arch::x86_64::__m512, lanes: &mut [f32; 16]) {
+    // SAFETY:
+    // - `lanes` points to exactly sixteen initialized `f32` slots on stack.
+    // - `_mm512_storeu_ps` permits unaligned stores and writes exactly sixteen
+    //   lanes.
+    unsafe { std::arch::x86_64::_mm512_storeu_ps(lanes.as_mut_ptr(), vector) };
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn dot_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
@@ -410,11 +480,6 @@ fn dot_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
         return None;
     }
     debug_assert_eq!(left.len(), right.len());
-    // SAFETY:
-    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
-    // - Inputs are borrowed slices; the helper only performs unaligned loads
-    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
-    // - Callers already checked equal lengths before choosing this kernel.
     // SAFETY:
     // - Runtime CPUID confirmed AVX2.
     // - Inputs are borrowed slices; the target-feature helper only reads
@@ -431,11 +496,6 @@ fn l2_distance_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<f32>
     }
     debug_assert_eq!(left.len(), right.len());
     // SAFETY:
-    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
-    // - Inputs are borrowed slices; the helper only performs unaligned loads
-    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
-    // - Callers already checked equal lengths before choosing this kernel.
-    // SAFETY:
     // - Runtime CPUID confirmed AVX2.
     // - Inputs are borrowed slices; the target-feature helper only reads
     //   inside `chunks_exact` bounds and writes to stack lane arrays.
@@ -450,11 +510,6 @@ fn cosine_distance_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<
         return None;
     }
     debug_assert_eq!(left.len(), right.len());
-    // SAFETY:
-    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
-    // - Inputs are borrowed slices; the helper only performs unaligned loads
-    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
-    // - Callers already checked equal lengths before choosing this kernel.
     // SAFETY:
     // - Runtime CPUID confirmed AVX2.
     // - Inputs are borrowed slices; the target-feature helper only reads
@@ -471,12 +526,6 @@ fn dot_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
     }
     debug_assert_eq!(left.len(), right.len());
     // SAFETY:
-    // - Runtime CPUID confirmed AVX-512F before entering the target-feature
-    //   helper.
-    // - Inputs are borrowed slices; the helper only performs unaligned loads
-    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
-    // - Callers already checked equal lengths before choosing this kernel.
-    // SAFETY:
     // - Runtime CPUID confirmed AVX-512F.
     // - Inputs are borrowed slices; the target-feature helper only reads
     //   inside `chunks_exact` bounds and writes to stack lane arrays.
@@ -491,12 +540,6 @@ fn l2_distance_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Option<f3
         return None;
     }
     debug_assert_eq!(left.len(), right.len());
-    // SAFETY:
-    // - Runtime CPUID confirmed AVX-512F before entering the target-feature
-    //   helper.
-    // - Inputs are borrowed slices; the helper only performs unaligned loads
-    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
-    // - Callers already checked equal lengths before choosing this kernel.
     // SAFETY:
     // - Runtime CPUID confirmed AVX-512F.
     // - Inputs are borrowed slices; the target-feature helper only reads
@@ -513,12 +556,6 @@ fn cosine_distance_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Optio
     }
     debug_assert_eq!(left.len(), right.len());
     // SAFETY:
-    // - Runtime CPUID confirmed AVX-512F before entering the target-feature
-    //   helper.
-    // - Inputs are borrowed slices; the helper only performs unaligned loads
-    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
-    // - Callers already checked equal lengths before choosing this kernel.
-    // SAFETY:
     // - Runtime CPUID confirmed AVX-512F.
     // - Inputs are borrowed slices; the target-feature helper only reads
     //   inside `chunks_exact` bounds and writes to stack lane arrays.
@@ -533,7 +570,7 @@ fn cosine_distance_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Optio
 /// metric semantics stay centralized.
 #[target_feature(enable = "neon")]
 fn dot_f32_neon(left: &[f32], right: &[f32]) -> f32 {
-    use std::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
+    use std::arch::aarch64::vmulq_f32;
 
     debug_assert_eq!(left.len(), right.len());
 
@@ -543,14 +580,8 @@ fn dot_f32_neon(left: &[f32], right: &[f32]) -> f32 {
     let mut right_chunks = right.chunks_exact(4);
 
     for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
-        // SAFETY: chunks_exact(4) guarantees both loads read four contiguous
-        // `f32` lanes in-bounds. `lanes` has room for one 128-bit store.
-        unsafe {
-            let left_vec = vld1q_f32(left_chunk.as_ptr());
-            let right_vec = vld1q_f32(right_chunk.as_ptr());
-            let product = vmulq_f32(left_vec, right_vec);
-            vst1q_f32(lanes.as_mut_ptr(), product);
-        }
+        let product = vmulq_f32(load_f32x4(left_chunk), load_f32x4(right_chunk));
+        store_f32x4(product, &mut lanes);
         for value in lanes {
             sum += value;
         }
@@ -567,7 +598,7 @@ fn dot_f32_neon(left: &[f32], right: &[f32]) -> f32 {
 /// equal-length metric semantics stay centralized.
 #[target_feature(enable = "neon")]
 fn l2_distance_f32_neon(left: &[f32], right: &[f32]) -> f32 {
-    use std::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32, vsubq_f32};
+    use std::arch::aarch64::{vmulq_f32, vsubq_f32};
 
     debug_assert_eq!(left.len(), right.len());
 
@@ -577,15 +608,8 @@ fn l2_distance_f32_neon(left: &[f32], right: &[f32]) -> f32 {
     let mut right_chunks = right.chunks_exact(4);
 
     for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
-        // SAFETY: chunks_exact(4) guarantees both loads read four contiguous
-        // `f32` lanes in-bounds. `lanes` has room for one 128-bit store.
-        unsafe {
-            let left_vec = vld1q_f32(left_chunk.as_ptr());
-            let right_vec = vld1q_f32(right_chunk.as_ptr());
-            let delta = vsubq_f32(left_vec, right_vec);
-            let squared = vmulq_f32(delta, delta);
-            vst1q_f32(lanes.as_mut_ptr(), squared);
-        }
+        let delta = vsubq_f32(load_f32x4(left_chunk), load_f32x4(right_chunk));
+        store_f32x4(vmulq_f32(delta, delta), &mut lanes);
         for value in lanes {
             sum += value;
         }
@@ -602,7 +626,7 @@ fn l2_distance_f32_neon(left: &[f32], right: &[f32]) -> f32 {
 /// equal-length metric semantics stay centralized.
 #[target_feature(enable = "neon")]
 fn cosine_distance_f32_neon(left: &[f32], right: &[f32]) -> Option<f32> {
-    use std::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
+    use std::arch::aarch64::vmulq_f32;
 
     debug_assert_eq!(left.len(), right.len());
 
@@ -616,18 +640,11 @@ fn cosine_distance_f32_neon(left: &[f32], right: &[f32]) -> Option<f32> {
     let mut right_chunks = right.chunks_exact(4);
 
     for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
-        // SAFETY: chunks_exact(4) guarantees both loads read four contiguous
-        // `f32` lanes in-bounds. Each lane buffer has room for one 128-bit store.
-        unsafe {
-            let left_vec = vld1q_f32(left_chunk.as_ptr());
-            let right_vec = vld1q_f32(right_chunk.as_ptr());
-            vst1q_f32(dot_lanes.as_mut_ptr(), vmulq_f32(left_vec, right_vec));
-            vst1q_f32(left_norm_lanes.as_mut_ptr(), vmulq_f32(left_vec, left_vec));
-            vst1q_f32(
-                right_norm_lanes.as_mut_ptr(),
-                vmulq_f32(right_vec, right_vec),
-            );
-        }
+        let left_vec = load_f32x4(left_chunk);
+        let right_vec = load_f32x4(right_chunk);
+        store_f32x4(vmulq_f32(left_vec, right_vec), &mut dot_lanes);
+        store_f32x4(vmulq_f32(left_vec, left_vec), &mut left_norm_lanes);
+        store_f32x4(vmulq_f32(right_vec, right_vec), &mut right_norm_lanes);
         for idx in 0..4 {
             dot += dot_lanes[idx];
             left_norm += left_norm_lanes[idx];
@@ -653,7 +670,7 @@ fn cosine_distance_f32_neon(left: &[f32], right: &[f32]) -> Option<f32> {
 /// equal-length metric semantics stay centralized.
 #[target_feature(enable = "avx2")]
 fn dot_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
-    use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps};
+    use std::arch::x86_64::_mm256_mul_ps;
 
     debug_assert_eq!(left.len(), right.len());
 
@@ -663,14 +680,8 @@ fn dot_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
     let mut right_chunks = right.chunks_exact(8);
 
     for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
-        // SAFETY: chunks_exact(8) guarantees both loads read eight contiguous
-        // `f32` lanes in-bounds. `lanes` has room for one 256-bit store.
-        unsafe {
-            let left_vec = _mm256_loadu_ps(left_chunk.as_ptr());
-            let right_vec = _mm256_loadu_ps(right_chunk.as_ptr());
-            let product = _mm256_mul_ps(left_vec, right_vec);
-            _mm256_storeu_ps(lanes.as_mut_ptr(), product);
-        }
+        let product = _mm256_mul_ps(load_m256_f32(left_chunk), load_m256_f32(right_chunk));
+        store_m256_f32(product, &mut lanes);
         for value in lanes {
             sum += value;
         }
@@ -687,7 +698,7 @@ fn dot_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
 /// and equal-length metric semantics stay centralized.
 #[target_feature(enable = "avx2")]
 fn l2_distance_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
-    use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps, _mm256_sub_ps};
+    use std::arch::x86_64::{_mm256_mul_ps, _mm256_sub_ps};
 
     debug_assert_eq!(left.len(), right.len());
 
@@ -697,15 +708,8 @@ fn l2_distance_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
     let mut right_chunks = right.chunks_exact(8);
 
     for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
-        // SAFETY: chunks_exact(8) guarantees both loads read eight contiguous
-        // `f32` lanes in-bounds. `lanes` has room for one 256-bit store.
-        unsafe {
-            let left_vec = _mm256_loadu_ps(left_chunk.as_ptr());
-            let right_vec = _mm256_loadu_ps(right_chunk.as_ptr());
-            let delta = _mm256_sub_ps(left_vec, right_vec);
-            let squared = _mm256_mul_ps(delta, delta);
-            _mm256_storeu_ps(lanes.as_mut_ptr(), squared);
-        }
+        let delta = _mm256_sub_ps(load_m256_f32(left_chunk), load_m256_f32(right_chunk));
+        store_m256_f32(_mm256_mul_ps(delta, delta), &mut lanes);
         for value in lanes {
             sum += value;
         }
@@ -722,7 +726,7 @@ fn l2_distance_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
 /// policy and equal-length metric semantics stay centralized.
 #[target_feature(enable = "avx2")]
 fn cosine_distance_f32_avx2(left: &[f32], right: &[f32]) -> Option<f32> {
-    use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps};
+    use std::arch::x86_64::_mm256_mul_ps;
 
     debug_assert_eq!(left.len(), right.len());
 
@@ -736,21 +740,11 @@ fn cosine_distance_f32_avx2(left: &[f32], right: &[f32]) -> Option<f32> {
     let mut right_chunks = right.chunks_exact(8);
 
     for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
-        // SAFETY: chunks_exact(8) guarantees both loads read eight contiguous
-        // `f32` lanes in-bounds. Each lane buffer has room for one 256-bit store.
-        unsafe {
-            let left_vec = _mm256_loadu_ps(left_chunk.as_ptr());
-            let right_vec = _mm256_loadu_ps(right_chunk.as_ptr());
-            _mm256_storeu_ps(dot_lanes.as_mut_ptr(), _mm256_mul_ps(left_vec, right_vec));
-            _mm256_storeu_ps(
-                left_norm_lanes.as_mut_ptr(),
-                _mm256_mul_ps(left_vec, left_vec),
-            );
-            _mm256_storeu_ps(
-                right_norm_lanes.as_mut_ptr(),
-                _mm256_mul_ps(right_vec, right_vec),
-            );
-        }
+        let left_vec = load_m256_f32(left_chunk);
+        let right_vec = load_m256_f32(right_chunk);
+        store_m256_f32(_mm256_mul_ps(left_vec, right_vec), &mut dot_lanes);
+        store_m256_f32(_mm256_mul_ps(left_vec, left_vec), &mut left_norm_lanes);
+        store_m256_f32(_mm256_mul_ps(right_vec, right_vec), &mut right_norm_lanes);
         for idx in 0..8 {
             dot += dot_lanes[idx];
             left_norm += left_norm_lanes[idx];
@@ -777,7 +771,7 @@ fn cosine_distance_f32_avx2(left: &[f32], right: &[f32]) -> Option<f32> {
 #[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
 #[target_feature(enable = "avx512f")]
 fn dot_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
-    use std::arch::x86_64::{_mm512_loadu_ps, _mm512_mul_ps, _mm512_storeu_ps};
+    use std::arch::x86_64::_mm512_mul_ps;
 
     debug_assert_eq!(left.len(), right.len());
 
@@ -787,15 +781,8 @@ fn dot_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
     let mut right_chunks = right.chunks_exact(16);
 
     for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
-        // SAFETY: chunks_exact(16) guarantees both loads read sixteen
-        // contiguous `f32` lanes in-bounds. `lanes` has room for one
-        // 512-bit store.
-        unsafe {
-            let left_vec = _mm512_loadu_ps(left_chunk.as_ptr());
-            let right_vec = _mm512_loadu_ps(right_chunk.as_ptr());
-            let product = _mm512_mul_ps(left_vec, right_vec);
-            _mm512_storeu_ps(lanes.as_mut_ptr(), product);
-        }
+        let product = _mm512_mul_ps(load_m512_f32(left_chunk), load_m512_f32(right_chunk));
+        store_m512_f32(product, &mut lanes);
         for value in lanes {
             sum += value;
         }
@@ -813,7 +800,7 @@ fn dot_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
 #[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
 #[target_feature(enable = "avx512f")]
 fn l2_distance_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
-    use std::arch::x86_64::{_mm512_loadu_ps, _mm512_mul_ps, _mm512_storeu_ps, _mm512_sub_ps};
+    use std::arch::x86_64::{_mm512_mul_ps, _mm512_sub_ps};
 
     debug_assert_eq!(left.len(), right.len());
 
@@ -823,16 +810,8 @@ fn l2_distance_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
     let mut right_chunks = right.chunks_exact(16);
 
     for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
-        // SAFETY: chunks_exact(16) guarantees both loads read sixteen
-        // contiguous `f32` lanes in-bounds. `lanes` has room for one
-        // 512-bit store.
-        unsafe {
-            let left_vec = _mm512_loadu_ps(left_chunk.as_ptr());
-            let right_vec = _mm512_loadu_ps(right_chunk.as_ptr());
-            let delta = _mm512_sub_ps(left_vec, right_vec);
-            let squared = _mm512_mul_ps(delta, delta);
-            _mm512_storeu_ps(lanes.as_mut_ptr(), squared);
-        }
+        let delta = _mm512_sub_ps(load_m512_f32(left_chunk), load_m512_f32(right_chunk));
+        store_m512_f32(_mm512_mul_ps(delta, delta), &mut lanes);
         for value in lanes {
             sum += value;
         }
@@ -850,7 +829,7 @@ fn l2_distance_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
 #[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
 #[target_feature(enable = "avx512f")]
 fn cosine_distance_f32_avx512(left: &[f32], right: &[f32]) -> Option<f32> {
-    use std::arch::x86_64::{_mm512_loadu_ps, _mm512_mul_ps, _mm512_storeu_ps};
+    use std::arch::x86_64::_mm512_mul_ps;
 
     debug_assert_eq!(left.len(), right.len());
 
@@ -864,22 +843,11 @@ fn cosine_distance_f32_avx512(left: &[f32], right: &[f32]) -> Option<f32> {
     let mut right_chunks = right.chunks_exact(16);
 
     for (left_chunk, right_chunk) in (&mut left_chunks).zip(&mut right_chunks) {
-        // SAFETY: chunks_exact(16) guarantees both loads read sixteen
-        // contiguous `f32` lanes in-bounds. Each lane buffer has room
-        // for one 512-bit store.
-        unsafe {
-            let left_vec = _mm512_loadu_ps(left_chunk.as_ptr());
-            let right_vec = _mm512_loadu_ps(right_chunk.as_ptr());
-            _mm512_storeu_ps(dot_lanes.as_mut_ptr(), _mm512_mul_ps(left_vec, right_vec));
-            _mm512_storeu_ps(
-                left_norm_lanes.as_mut_ptr(),
-                _mm512_mul_ps(left_vec, left_vec),
-            );
-            _mm512_storeu_ps(
-                right_norm_lanes.as_mut_ptr(),
-                _mm512_mul_ps(right_vec, right_vec),
-            );
-        }
+        let left_vec = load_m512_f32(left_chunk);
+        let right_vec = load_m512_f32(right_chunk);
+        store_m512_f32(_mm512_mul_ps(left_vec, right_vec), &mut dot_lanes);
+        store_m512_f32(_mm512_mul_ps(left_vec, left_vec), &mut left_norm_lanes);
+        store_m512_f32(_mm512_mul_ps(right_vec, right_vec), &mut right_norm_lanes);
         for idx in 0..16 {
             dot += dot_lanes[idx];
             left_norm += left_norm_lanes[idx];
