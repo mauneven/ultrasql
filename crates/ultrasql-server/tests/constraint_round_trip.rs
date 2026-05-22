@@ -284,6 +284,32 @@ async fn insert_omitted_column_uses_default_expression() {
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_expression_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    client
+        .batch_execute("CREATE TABLE default_restart (id INT NOT NULL, v INT DEFAULT 7)")
+        .await
+        .expect("create");
+    shutdown(client, server_handle).await;
+
+    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    client
+        .batch_execute("INSERT INTO default_restart (id) VALUES (1)")
+        .await
+        .expect("omitted column uses default after restart");
+    let rows = client
+        .query("SELECT id, v FROM default_restart", &[])
+        .await
+        .expect("select default row");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 1);
+    assert_eq!(rows[0].get::<_, i32>(1), 7);
+    shutdown(client, server_handle).await;
+}
+
 /// Stored generated columns are computed on INSERT and recomputed on UPDATE.
 #[tokio::test]
 async fn generated_stored_column_is_computed_and_recomputed() {

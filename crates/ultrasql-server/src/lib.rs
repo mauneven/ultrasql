@@ -3106,6 +3106,25 @@ impl Server {
                     metadata_escape(seq_name)
                 ));
             }
+            for (idx, default_expr) in constraints.defaults.iter().enumerate() {
+                let Some(default_expr) = default_expr else {
+                    continue;
+                };
+                let Some(expr) = encode_scalar_expr_field(default_expr) else {
+                    tracing::warn!(
+                        table = %table_name,
+                        column = idx,
+                        "DEFAULT expression is outside restart-persistable subset",
+                    );
+                    continue;
+                };
+                out.push_str(&format!(
+                    "default\t{}\t{}\t{}\n",
+                    oid.raw(),
+                    idx,
+                    metadata_escape(&expr)
+                ));
+            }
             for (idx, identity_always) in constraints.identity_always.iter().enumerate() {
                 if *identity_always {
                     out.push_str(&format!("identity_always\t{}\t{}\n", oid.raw(), idx));
@@ -3178,6 +3197,8 @@ impl Server {
             std::collections::HashMap::new();
         let mut sequence_defaults: std::collections::HashMap<Oid, Vec<(usize, String)>> =
             std::collections::HashMap::new();
+        let mut defaults: std::collections::HashMap<Oid, Vec<(usize, ScalarExpr)>> =
+            std::collections::HashMap::new();
         let mut identity_always: std::collections::HashMap<Oid, Vec<usize>> =
             std::collections::HashMap::new();
         let mut checks: std::collections::HashMap<Oid, Vec<RuntimeCheckConstraint>> =
@@ -3218,6 +3239,24 @@ impl Server {
                         .entry(oid)
                         .or_default()
                         .push((idx, metadata_unescape(parts[3])?));
+                }
+                Some("default") if parts.len() == 4 => {
+                    let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    let idx = parts[2].parse::<usize>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad column index: {err}",
+                            line_no + 1
+                        ))
+                    })?;
+                    defaults.entry(oid).or_default().push((
+                        idx,
+                        decode_scalar_expr_field(&metadata_unescape(parts[3])?)?,
+                    ));
                 }
                 Some("identity_always") if parts.len() == 3 => {
                     let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
@@ -3361,6 +3400,13 @@ impl Server {
                 for (idx, seq_name) in defaults {
                     if idx < runtime.sequence_defaults.len() {
                         runtime.sequence_defaults[idx] = Some(seq_name);
+                    }
+                }
+            }
+            if let Some(defaults) = defaults.remove(&oid) {
+                for (idx, expr) in defaults {
+                    if idx < runtime.defaults.len() {
+                        runtime.defaults[idx] = Some(expr);
                     }
                 }
             }
