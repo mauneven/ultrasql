@@ -408,6 +408,7 @@ where
                 .as_ref()
                 .map_or(0, |out| Self::parse_command_rows_tag(&out.messages));
             let error = outcome.as_ref().err().map(ToString::to_string);
+            self.log_completed_statement(&query, elapsed, rows, error.as_deref());
             self.state.workload_recorder.record(WorkloadQueryRecord {
                 query,
                 plan_hash,
@@ -467,6 +468,7 @@ where
                     time_partitions: Arc::clone(&self.state.time_partitions),
                     workload_recorder: Arc::clone(&self.state.workload_recorder),
                     autovacuum_config: self.state.autovacuum_config(),
+                    logging_config: self.state.logging_config(),
                     sequence_state: Some(self.sequence_state.clone()),
                     heap: Arc::clone(&self.state.heap),
                     vm: Arc::clone(&self.state.vm),
@@ -555,6 +557,7 @@ where
                     time_partitions: Arc::clone(&self.state.time_partitions),
                     workload_recorder: Arc::clone(&self.state.workload_recorder),
                     autovacuum_config: self.state.autovacuum_config(),
+                    logging_config: self.state.logging_config(),
                     sequence_state: Some(self.sequence_state.clone()),
                     heap: Arc::clone(&self.state.heap),
                     vm: Arc::clone(&self.state.vm),

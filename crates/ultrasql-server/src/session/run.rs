@@ -7,7 +7,7 @@
 #![allow(unused_imports)]
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -213,6 +213,7 @@ where
         let elapsed = started.elapsed();
         let rows = outcome.as_ref().map_or(0, |result| result.rows);
         let error = outcome.as_ref().err().map(ToString::to_string);
+        self.log_completed_statement(trimmed, elapsed, rows, error.as_deref());
         self.state.workload_recorder.record(WorkloadQueryRecord {
             query: trimmed.to_string(),
             plan_hash: workload::plan_hash_for_sql(trimmed),
@@ -248,6 +249,44 @@ where
             }
         }
         Ok(())
+    }
+
+    pub(in crate::session) fn log_completed_statement(
+        &self,
+        sql: &str,
+        elapsed: Duration,
+        rows: u64,
+        error: Option<&str>,
+    ) {
+        let config = self.state.logging_config();
+        let class = statement_log_class(sql);
+        let duration_match = if config.log_min_duration_statement_ms >= 0 {
+            let threshold_ms =
+                u64::try_from(config.log_min_duration_statement_ms).unwrap_or(u64::MAX);
+            elapsed >= Duration::from_millis(threshold_ms)
+        } else {
+            false
+        };
+        let class_match = match config.log_statement {
+            crate::LogStatementMode::None => false,
+            crate::LogStatementMode::Ddl => class == "ddl",
+            crate::LogStatementMode::Mod => class == "ddl" || class == "mod",
+            crate::LogStatementMode::All => true,
+        };
+        if !duration_match && !class_match {
+            return;
+        }
+
+        let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        tracing::info!(
+            target: "ultrasqld::statement",
+            statement = %sql,
+            statement_class = class,
+            elapsed_us,
+            rows,
+            error = error.unwrap_or(""),
+            "statement completed"
+        );
     }
 
     /// Send the query result and the trailing `ReadyForQuery` in one
@@ -347,5 +386,28 @@ where
         res?;
         self.io.flush().await?;
         Ok(())
+    }
+}
+
+fn statement_log_class(sql: &str) -> &'static str {
+    let head = sql.split_whitespace().next().unwrap_or_default();
+    if head.eq_ignore_ascii_case("create")
+        || head.eq_ignore_ascii_case("alter")
+        || head.eq_ignore_ascii_case("drop")
+        || head.eq_ignore_ascii_case("truncate")
+        || head.eq_ignore_ascii_case("comment")
+        || head.eq_ignore_ascii_case("grant")
+        || head.eq_ignore_ascii_case("revoke")
+    {
+        "ddl"
+    } else if head.eq_ignore_ascii_case("insert")
+        || head.eq_ignore_ascii_case("update")
+        || head.eq_ignore_ascii_case("delete")
+        || head.eq_ignore_ascii_case("copy")
+        || head.eq_ignore_ascii_case("merge")
+    {
+        "mod"
+    } else {
+        "other"
     }
 }

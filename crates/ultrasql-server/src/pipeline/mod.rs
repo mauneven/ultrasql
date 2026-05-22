@@ -227,6 +227,8 @@ pub struct LowerCtx<'a> {
     pub workload_recorder: Arc<crate::workload::WorkloadRecorder>,
     /// Runtime autovacuum settings used by virtual `pg_settings`.
     pub autovacuum_config: crate::AutovacuumConfig,
+    /// Runtime statement logging settings used by virtual `pg_settings`.
+    pub logging_config: crate::LoggingConfig,
     /// Session-local sequence observer for defaults that call `nextval`.
     pub sequence_state: Option<crate::SequenceSessionState>,
     /// Shared heap access handle.

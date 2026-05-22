@@ -1211,7 +1211,7 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("log_min_duration_statement"),
-            v_text("-1"),
+            v_text(ctx.logging_config.log_min_duration_statement_ms.to_string()),
             v_text("ms"),
             v_text("Reporting and Logging / When to Log"),
             v_text("Logs statements running at least this long."),
@@ -1220,7 +1220,7 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("log_statement"),
-            v_text("none"),
+            v_text(ctx.logging_config.log_statement.as_str()),
             Value::Null,
             v_text("Reporting and Logging / What to Log"),
             v_text("Sets the statements logged by class."),

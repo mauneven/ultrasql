@@ -1706,7 +1706,11 @@ behavior are implemented and validated.
   execution; exporter wiring is deployment configuration.
 - [x] `EXPLAIN ANALYZE` with actual rows and actual time — buffers and WAL stats pending
 - [x] `EXPLAIN (FORMAT JSON)` for basic tooling integration — richer PostgreSQL-compatible fields pending
-- [ ] Structured JSON logging with `log_min_duration_statement`, `log_statement` — `ultrasqld --log-format json`; GUC rows exposed, per-statement duration filtering pending
+- [x] Structured JSON logging with `log_min_duration_statement`,
+  `log_statement` — `ultrasqld --log-format json` plus
+  `--log-min-duration-statement-ms` and `--log-statement
+  none|ddl|mod|all` drive per-statement structured `tracing` events and
+  live `pg_settings` values.
 
 ### COPY & Bulk Operations
 - [x] `COPY t FROM STDIN` / `COPY t TO STDOUT` — text + CSV formats end-to-end. Parser, binder, `LogicalPlan::Copy`, Simple Query + Extended Query session dispatch via `crates/ultrasql-server/src/session/copy.rs`. `crates/ultrasql-server/tests/copy_round_trip.rs` covers five shapes. §1.11.

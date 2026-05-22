@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use ultrasql_server::{AutovacuumConfig, Server, run_server};
+use ultrasql_server::{AutovacuumConfig, LogStatementMode, LoggingConfig, Server, run_server};
 
 /// `ultrasqld` v0.5: PostgreSQL-wire-compatible server with an
 /// in-memory sample database.
@@ -65,6 +65,14 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = LogFormat::Text)]
     log_format: LogFormat,
 
+    /// Minimum statement duration to log in milliseconds; -1 disables.
+    #[arg(long, default_value_t = -1)]
+    log_min_duration_statement_ms: i64,
+
+    /// Statement classes logged regardless of duration.
+    #[arg(long, value_enum, default_value_t = CliLogStatementMode::None)]
+    log_statement: CliLogStatementMode,
+
     /// Background autovacuum/analyze maintenance interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     autovacuum_interval_ms: u64,
@@ -92,6 +100,25 @@ enum LogFormat {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CliLogStatementMode {
+    None,
+    Ddl,
+    Mod,
+    All,
+}
+
+impl From<CliLogStatementMode> for LogStatementMode {
+    fn from(value: CliLogStatementMode) -> Self {
+        match value {
+            CliLogStatementMode::None => Self::None,
+            CliLogStatementMode::Ddl => Self::Ddl,
+            CliLogStatementMode::Mod => Self::Mod,
+            CliLogStatementMode::All => Self::All,
+        }
+    }
+}
+
 /// Long description shown by `--help`. Kept as a separate constant so
 /// rustfmt does not split it across lines that mangle the indentation.
 const LONG_ABOUT: &str = "UltraSQL database server (v0.5).
@@ -115,6 +142,8 @@ Production-oriented v0.9 flags:
   - --data-dir DIR      boot WAL-backed storage
   - --ops-listen ADDR   serve /health, /ready, /metrics
   - --log-format json   emit structured logs
+  - --log-min-duration-statement-ms N
+  - --log-statement none|ddl|mod|all
 ";
 
 fn main() -> std::process::ExitCode {
@@ -127,6 +156,13 @@ fn main() -> std::process::ExitCode {
         Ok(config) => config,
         Err(e) => {
             error!(target: "ultrasqld", error = %e, "invalid autovacuum configuration");
+            return std::process::ExitCode::from(1);
+        }
+    };
+    let logging_config = match logging_config_from_cli(&cli) {
+        Ok(config) => config,
+        Err(e) => {
+            error!(target: "ultrasqld", error = %e, "invalid logging configuration");
             return std::process::ExitCode::from(1);
         }
     };
@@ -146,6 +182,7 @@ fn main() -> std::process::ExitCode {
         Some(path) => match Server::init(path) {
             Ok(mut server) => {
                 server.set_autovacuum_config(autovacuum_config);
+                server.set_logging_config(logging_config);
                 Arc::new(server)
             }
             Err(e) => {
@@ -156,6 +193,7 @@ fn main() -> std::process::ExitCode {
         None => {
             let mut server = Server::with_sample_database();
             server.set_autovacuum_config(autovacuum_config);
+            server.set_logging_config(logging_config);
             Arc::new(server)
         }
     };
@@ -229,6 +267,16 @@ fn autovacuum_config_from_cli(cli: &Cli) -> Result<AutovacuumConfig, String> {
             "autovacuum_analyze_scale_factor",
             cli.autovacuum_analyze_scale_factor,
         )?,
+    })
+}
+
+fn logging_config_from_cli(cli: &Cli) -> Result<LoggingConfig, String> {
+    if cli.log_min_duration_statement_ms < -1 {
+        return Err("log_min_duration_statement_ms must be -1 or greater".to_string());
+    }
+    Ok(LoggingConfig {
+        log_min_duration_statement_ms: cli.log_min_duration_statement_ms,
+        log_statement: cli.log_statement.into(),
     })
 }
 
@@ -506,6 +554,8 @@ mod tests {
             ops_listen: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
+            log_min_duration_statement_ms: -1,
+            log_statement: CliLogStatementMode::None,
             autovacuum_interval_ms: 1000,
             autovacuum_vacuum_threshold: 7,
             autovacuum_vacuum_scale_factor: 0.25,
@@ -529,6 +579,8 @@ mod tests {
             ops_listen: None,
             log_level: "info".to_owned(),
             log_format: LogFormat::Text,
+            log_min_duration_statement_ms: -1,
+            log_statement: CliLogStatementMode::None,
             autovacuum_interval_ms: 1000,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: f64::NAN,
@@ -537,5 +589,48 @@ mod tests {
         };
 
         assert!(autovacuum_config_from_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn logging_config_from_cli_rejects_invalid_duration() {
+        let cli = Cli {
+            listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            data_dir: None,
+            ops_listen: None,
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Text,
+            log_min_duration_statement_ms: -2,
+            log_statement: CliLogStatementMode::Mod,
+            autovacuum_interval_ms: 1000,
+            autovacuum_vacuum_threshold: 50,
+            autovacuum_vacuum_scale_factor: 0.2,
+            autovacuum_analyze_threshold: 50,
+            autovacuum_analyze_scale_factor: 0.1,
+        };
+
+        assert!(logging_config_from_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn logging_config_from_cli_accepts_duration_and_statement_mode() {
+        let cli = Cli {
+            listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            data_dir: None,
+            ops_listen: None,
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Json,
+            log_min_duration_statement_ms: 25,
+            log_statement: CliLogStatementMode::All,
+            autovacuum_interval_ms: 1000,
+            autovacuum_vacuum_threshold: 50,
+            autovacuum_vacuum_scale_factor: 0.2,
+            autovacuum_analyze_threshold: 50,
+            autovacuum_analyze_scale_factor: 0.1,
+        };
+
+        let config = logging_config_from_cli(&cli).expect("valid logging config");
+
+        assert_eq!(config.log_min_duration_statement_ms, 25);
+        assert_eq!(config.log_statement, LogStatementMode::All);
     }
 }

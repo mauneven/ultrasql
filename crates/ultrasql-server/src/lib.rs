@@ -1740,6 +1740,8 @@ pub struct Server {
     pub pending_analyze_tables: dashmap::DashMap<String, ()>,
     /// Runtime autovacuum thresholds used by the launcher and `pg_settings`.
     pub autovacuum_config: AutovacuumConfig,
+    /// Runtime statement logging knobs used by SQL execution and `pg_settings`.
+    pub logging_config: LoggingConfig,
     /// Two-phase commit coordinator. Owns the on-disk state directory
     /// for prepared transactions; consulted by
     /// `PREPARE TRANSACTION 'gid'`, `COMMIT PREPARED 'gid'`, and
@@ -1841,6 +1843,52 @@ pub struct AutovacuumConfig {
     pub analyze_threshold: u64,
     /// ANALYZE scale factor in parts per million.
     pub analyze_scale_factor_ppm: u64,
+}
+
+/// Statement classes accepted by `log_statement`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LogStatementMode {
+    /// Do not log statements by class.
+    #[default]
+    None,
+    /// Log DDL statements.
+    Ddl,
+    /// Log DDL and data-modifying statements.
+    Mod,
+    /// Log every statement.
+    All,
+}
+
+impl LogStatementMode {
+    /// Return the PostgreSQL-compatible setting string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Ddl => "ddl",
+            Self::Mod => "mod",
+            Self::All => "all",
+        }
+    }
+}
+
+/// Runtime statement logging configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoggingConfig {
+    /// `log_min_duration_statement` in milliseconds; `-1` disables duration
+    /// logging, matching PostgreSQL's user-facing convention.
+    pub log_min_duration_statement_ms: i64,
+    /// Statement-class logging mode.
+    pub log_statement: LogStatementMode,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            log_min_duration_statement_ms: -1,
+            log_statement: LogStatementMode::None,
+        }
+    }
 }
 
 impl Default for AutovacuumConfig {
@@ -2568,6 +2616,7 @@ impl Server {
             time_partitions: Arc::clone(&self.time_partitions),
             workload_recorder: Arc::clone(&self.workload_recorder),
             autovacuum_config: self.autovacuum_config(),
+            logging_config: self.logging_config(),
             sequence_state: Some(SequenceSessionState::default()),
             heap: Arc::clone(&self.heap),
             vm: Arc::clone(&self.vm),
@@ -2679,6 +2728,7 @@ impl Server {
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             autovacuum_config: AutovacuumConfig::default(),
+            logging_config: LoggingConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,
             notify_hub: Arc::new(notify::NotifyHub::new()),
@@ -3130,6 +3180,7 @@ impl Server {
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
             autovacuum_config: AutovacuumConfig::default(),
+            logging_config: LoggingConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,
             notify_hub: Arc::new(notify::NotifyHub::new()),
@@ -4325,6 +4376,17 @@ impl Server {
         self.autovacuum_config = config;
     }
 
+    /// Return runtime statement logging settings.
+    #[must_use]
+    pub const fn logging_config(&self) -> LoggingConfig {
+        self.logging_config
+    }
+
+    /// Replace runtime statement logging settings before the listener starts.
+    pub fn set_logging_config(&mut self, config: LoggingConfig) {
+        self.logging_config = config;
+    }
+
     /// Return process-local ANN/vector-index counters for ops metrics.
     #[must_use]
     pub fn ann_system_metrics(&self) -> AnnSystemMetrics {
@@ -5189,6 +5251,7 @@ fn run_plan_in_txn(
     time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
     workload_recorder: Arc<workload::WorkloadRecorder>,
     autovacuum_config: AutovacuumConfig,
+    logging_config: LoggingConfig,
     sequence_state: Option<SequenceSessionState>,
     tables: &SampleTables,
     heap: Arc<HeapAccess<BlankPageLoader>>,
@@ -5221,6 +5284,7 @@ fn run_plan_in_txn(
         time_partitions,
         workload_recorder,
         autovacuum_config,
+        logging_config,
         sequence_state,
         heap,
         vm,
