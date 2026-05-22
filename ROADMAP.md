@@ -1457,20 +1457,23 @@ geometric, and full-text type surfaces.
 - [x] `minmax` operator class — `BrinIndex` maintains per-range min/max
   summaries on index build, insert/update index maintenance, and through
   explicit `summarize_range`.
-- [x] Auto-summarize on vacuum — `VACUUM table` now rebuilds same-process
-  BRIN summaries from visible heap tuples after heap cleanup; stale
-  delete over-inclusion is removed by the same round-trip regression.
+- [x] Auto-summarize on vacuum and restart — `VACUUM table` rebuilds
+  BRIN summaries from visible heap tuples after heap cleanup, and warm
+  server restart rebuilds persisted BRIN index sidecars from the durable
+  heap/catalog metadata. Stale delete over-inclusion and restart
+  summary loss are covered by `index_scan_round_trip`.
 
 ### Constraints
 - [x] Constraint runtime kernel — `crates/ultrasql-storage/src/constraints.rs` exposes `Constraint`, `ConstraintChecker`, and CHECK-expression IR for NotNull / Check / PrimaryKey / ForeignKey / UniqueSet validation
 - [x] `NOT NULL` DML enforcement — `ModifyTable::Insert` and `ModifyTable::Update` check schema `Field::nullable` before heap writes; wire regressions cover INSERT and UPDATE failures returning SQLSTATE `23502` without leaking partial rows
-- [x] `CHECK` DDL + executor wiring — column/table `CHECK` constraints bind into `LogicalCheckConstraint`, are stored in the server's same-process `TableRuntimeConstraints`, and are evaluated on INSERT/UPDATE before heap writes. Violations return SQLSTATE `23514`; `constraint_round_trip.rs` covers insert/update rejection.
+- [x] `CHECK` DDL + executor wiring — column/table `CHECK` constraints bind into `LogicalCheckConstraint`, persist through the table-runtime metadata sidecar, rehydrate on warm restart for the supported scalar-expression subset, and are evaluated on INSERT/UPDATE before heap writes. Violations return SQLSTATE `23514`; `constraint_round_trip.rs` covers insert/update rejection and restart enforcement.
 - [x] `UNIQUE` / `PRIMARY KEY` DDL + executor wiring — column/table constraints create unique B-tree indexes during `CREATE TABLE`; `PRIMARY KEY` also marks columns NOT NULL. INSERT/UPDATE index maintenance returns SQLSTATE `23505` on duplicates. Supported key encodings match current B-tree support: single fixed/text-prefix keys and narrow two-column packed keys.
-- [x] Basic `FOREIGN KEY` DDL + executor wiring — explicit target-column `REFERENCES parent(col)` and table-level `FOREIGN KEY (...) REFERENCES parent(...)` bind and run as non-deferrable NO ACTION checks. Child INSERT/UPDATE requires a visible parent row; parent DELETE and parent key UPDATE are restricted while children reference the key. Violations return SQLSTATE `23503`. Referential actions and deferral remain open below.
+- [x] Basic `FOREIGN KEY` DDL + executor wiring — explicit target-column `REFERENCES parent(col)` and table-level `FOREIGN KEY (...) REFERENCES parent(...)` bind, persist through the table-runtime metadata sidecar, rehydrate on warm restart, and run as non-deferrable NO ACTION checks. Child INSERT/UPDATE requires a visible parent row; parent DELETE and parent key UPDATE are restricted while children reference the key. Violations return SQLSTATE `23503`. Referential actions and deferral are covered below.
 - [x] INSERT column-list expansion — omitted nullable columns are filled with NULL and source positions respect explicit column order before DEFAULT / sequence defaults, NOT NULL checks, index maintenance, and heap encoding
 - [x] `DEFAULT expr` evaluated at INSERT when column omitted —
   immutable/literal scalar defaults bind into per-column runtime defaults
-  and execute only for omitted columns. Explicit NULL remains NULL.
+  persist through the table-runtime metadata sidecar, rehydrate on warm
+  restart, and execute only for omitted columns. Explicit NULL remains NULL.
   `pg_attribute.atthasdef` and virtual `pg_attrdef` rows now expose the
   default metadata through PostgreSQL catalog queries.
 - [x] FK referential action wiring:
@@ -1489,24 +1492,26 @@ geometric, and full-text type surfaces.
     `INITIALLY IMMEDIATE` remains immediate unless a future
     `SET CONSTRAINTS` command toggles it. Covered by
     `constraint_round_trip.rs::deferrable_foreign_key_*`.
-- [x] `GENERATED ALWAYS / BY DEFAULT AS IDENTITY` — parser accepts identity sequence options; binder expands integer identity columns into owned sequence-backed defaults; executor rejects explicit values for `GENERATED ALWAYS` with SQLSTATE `428C9` and allows explicit values for `BY DEFAULT`. Covered by `sequence_round_trip.rs`.
+- [x] `GENERATED ALWAYS / BY DEFAULT AS IDENTITY` — parser accepts identity sequence options; binder expands integer identity columns into owned sequence-backed defaults; table-runtime metadata restores the sequence default/identity flag after warm restart; executor rejects explicit values for `GENERATED ALWAYS` with SQLSTATE `428C9` and allows explicit values for `BY DEFAULT`. Covered by `sequence_round_trip.rs`.
 - [x] `GENERATED ALWAYS AS (expr) STORED` (computed columns) — parser,
   binder, table runtime constraints, INSERT, and UPDATE compute stored
   values from immutable row-local expressions, recompute on base-column
-  update, and reject explicit generated-column writes with SQLSTATE
+  update, persist/rebuild supported scalar expressions through warm
+  restart, and reject explicit generated-column writes with SQLSTATE
   `428C9`.
 - [x] `EXCLUDE USING gist (...)` exclusion constraints — parser accepts
   `EXCLUDE USING gist (col WITH op, ...)`, binder validates supported
   operators against range/geometric/equality columns, runtime DML checks
-  visible and same-statement rows, and violations return SQLSTATE
-  `23P01`. Physical GiST index-assisted probing remains a future
-  optimization.
+  visible and same-statement rows, table-runtime metadata restores
+  exclusion enforcement after warm restart, and violations return
+  SQLSTATE `23P01`. Physical GiST index-assisted probing remains a
+  future optimization.
 
 ### Sequences
 - [x] `CREATE SEQUENCE` with START, INCREMENT, MINVALUE, MAXVALUE, CYCLE, CACHE — parser, binder, and Simple Query server dispatch are wired. Descending sequences default START to MAXVALUE; `ALTER SEQUENCE START WITH` changes restart seed without advancing current value.
 - [x] `ALTER SEQUENCE` / `DROP SEQUENCE` — in-memory registry updates and command tags are wired; `ALTER SEQUENCE RESTART [WITH n]` follows PostgreSQL's current-value semantics.
 - [x] `NEXTVAL`, `CURRVAL`, `LASTVAL`, `SETVAL` — Simple Query sequence functions dispatch before generic SELECT lowering. `currval` / `lastval` are session-local and return SQLSTATE `55000` before first `nextval`.
-- [x] `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` sugar — `CREATE TABLE` expands pseudo-types to Int32/Int64/Int16 required columns, creates an owned same-process sequence, and installs a sequence-backed DEFAULT. INSERT of omitted serial columns calls `nextval` and updates session `currval`.
+- [x] `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` sugar — `CREATE TABLE` expands pseudo-types to Int32/Int64/Int16 required columns, creates an owned sequence, installs a sequence-backed DEFAULT, and restores that default after warm restart. INSERT of omitted serial columns calls `nextval` and updates session `currval`.
 - [x] Per-session `currval` state
 - [x] Sequence WAL logging and recovery — sequence create/nextval/setval,
   alter, and drop emit `SequenceOp` records; WAL replay restores the
@@ -1515,7 +1520,7 @@ geometric, and full-text type surfaces.
 
 ### Persistent Catalog
 - [x] `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type` (row shapes)
-- [x] `pg_index`, `pg_constraint`, `pg_sequence` (row shapes + virtual SQL scans for current same-process metadata)
+- [x] `pg_index`, `pg_constraint`, `pg_sequence` (row shapes + virtual SQL scans over live metadata)
 - [x] Catalog cache with `arc-swap` for wait-free reads
 - [x] Catalog snapshot for safe concurrent DDL
 - [x] Typed tuple decoder for bootstrap-from-heap —
@@ -1527,11 +1532,13 @@ geometric, and full-text type surfaces.
   planner-statistics snapshots on warm restart
 - [x] Persistent constraint/default/sequence metadata — `pg_constraint`
   and `pg_sequence` heap codecs/writeback/bootstrap rebuild durable
-  constraint and sequence maps; CREATE TABLE now persists default flags
-  into `pg_attribute.atthasdef`, and the catalog surface includes
-  `pg_attrdef` rows for default/identity/generated metadata. Full
-  expression rehydration into `TableRuntimeConstraints` after warm
-  restart remains v1.0 catalog-expression work.
+  constraint and sequence maps; CREATE TABLE persists default flags into
+  `pg_attribute.atthasdef`; the catalog surface includes `pg_attrdef`
+  rows for default/identity/generated metadata; and the table-runtime
+  metadata sidecar rehydrates supported scalar DEFAULT, generated stored,
+  CHECK, FK, EXCLUDE, sequence-default, and identity metadata after warm
+  restart. Moving the sidecar into typed catalog-expression heap rows
+  remains production-hardening work.
 - [x] `pg_depend` compatibility slice — virtual dependency rows are
   derived from live UNIQUE / CHECK / FOREIGN KEY metadata, and `DROP
   TABLE` now honours those FK dependencies: default / `RESTRICT` raises
@@ -1543,9 +1550,9 @@ geometric, and full-text type surfaces.
   bind, dispatch over
   Simple Query, update the active `PersistentCatalog` snapshot, and
   appear in `pg_catalog.pg_description`; `IS NULL` clears comments and
-  `DROP TABLE` clears attached rows. Persistent heap writeback and
-  restart bootstrap for comment rows remain open with the broader
-  persistent metadata item above.
+  `DROP TABLE` clears attached rows. Comment rows append to persistent
+  `pg_description`, warm restart replays set/clear tombstones, and
+  orphaned comments for dropped relations are filtered during bootstrap.
 - [x] `pg_statistic`, `pg_statistic_ext` (persistent) — ANALYZE and
   CREATE STATISTICS append durable rows, and warm bootstrap overlays the
   latest rows onto the initial catalog snapshot. Covered by
@@ -1794,7 +1801,7 @@ same host.
 | Exact vector top-k | n/a | ⚠️ shape recognized through `ORDER BY distance LIMIT` | ⚠️ top-k path exists; full-sort avoidance hardening open | n/a | n/a | n/a | ✅ server round trips | ⚠️ `vector_topk_exact` smoke, full pgvector cert open |
 | Page-backed HNSW | ✅ `CREATE INDEX USING hnsw` | ✅ vector opclasses checked | ✅ planner selects page-backed HNSW; exact/filter fallback path | ✅ page-backed graph relation with meta/node/overflow/free-list pages | ⚠️ restart + crash/corrupt-WAL tests and HNSW WAL fuzz exist; large-scale recovery certification plus torn-write/rebuild cert open | n/a | ✅ insert/update/delete/vacuum, SQL restart, crash, corrupt-WAL, EXPLAIN tests | ⚠️ HNSW recall/latency smoke exists; larger recall/latency artifacts open |
 | Page-backed IVFFlat | ✅ `CREATE INDEX USING ivfflat` | ✅ `lists`/`probes` checked | ✅ planner selects page-backed IVFFlat; centroid/list scan + exact rerank/filter fallback | ✅ page-backed centroid/list relation with centroid/list/entry pages | ⚠️ restart + crash/corrupt-WAL tests exist; WAL replay fuzz/property tests, large-scale recovery certification, and torn-write/compaction cert open | n/a | ✅ SQL restart/crash/corrupt-WAL/delete-vacuum/update/EXPLAIN tests | ⚠️ memory accounting smoke exists; larger recall/latency artifacts open |
-| RAG primitive schemas/helpers | n/a | n/a | ✅ normal SQL helpers + tenant RLS predicate injection | ✅ ordinary user tables | ⚠️ tenant RLS sidecar is same-process; restart policy persistence open | n/a | ✅ catalog/server helper tests + RLS wire round trip | ⚠️ RAG quality smoke + tenant RLS tests exist; full cert open |
+| RAG primitive schemas/helpers | n/a | n/a | ✅ normal SQL helpers + tenant RLS predicate injection | ✅ ordinary user tables | ⚠️ tenant RLS sidecar rehydrates after warm restart; typed catalog/WAL metadata still open | n/a | ✅ catalog/server helper tests + RLS wire + restart round trip | ⚠️ RAG quality smoke + tenant RLS tests exist; full cert open |
 | CSV table functions | ✅ `read_csv`, globs, arrays, file literals | ✅ function scan + projection/filter pushdown shapes | ⚠️ external wrapper streams child; CSV reader still stores row buffers | file/object bytes only | n/a | ✅ query results | ✅ local/object/glob/projection/filter tests | ⚠️ CSV gauntlet smoke measured for UltraSQL/DuckDB; ClickHouse unavailable locally; full cert open |
 | Parquet table functions | ✅ `read_parquet`, globs, file literals | ✅ projection/predicate pushdown shapes | ✅ row-group workers yield batches lazily; no upfront full-file batch buffer | ✅ local files plus object range footer/column reads | n/a | ✅ query results | ✅ projection/filter/object-range/row-group-worker/EXPLAIN tests | ⚠️ UltraSQL arena smoke measured; cross-engine cert open |
 | Object-store scans | ✅ `s3://`, `r2://`, `gs://` path specs | ✅ function scan paths | ⚠️ Parquet uses ranges; CSV/JSON paths still use whole-object reads | ✅ `read_object_range` + metadata APIs exist | n/a | n/a | ✅ mocked range/object tests + Parquet range test | ⚠️ object Parquet range smoke measured; full lakehouse cert open |
