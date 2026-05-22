@@ -63,6 +63,7 @@ pub mod wal_sink;
 pub mod wire_writer;
 pub mod workload;
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -4904,13 +4905,50 @@ pub async fn bind_listener(addr: SocketAddr) -> Result<(TcpListener, SocketAddr)
 /// integration tests that need the chosen ephemeral port before they
 /// start serving.
 pub async fn serve_listener(listener: TcpListener, state: Arc<Server>) -> Result<(), ServerError> {
+    serve_listener_with_shutdown(listener, state, std::future::pending::<()>()).await
+}
+
+/// Drive an already-bound [`TcpListener`] until `shutdown` resolves.
+///
+/// This is the production-safe sibling of [`serve_listener`]. It stops
+/// accepting new sockets and returns `Ok(())` when the shutdown future
+/// completes, allowing the owning task to drop its [`Server`] reference
+/// cleanly instead of aborting the accept loop.
+pub async fn serve_listener_with_shutdown<F>(
+    listener: TcpListener,
+    state: Arc<Server>,
+    shutdown: F,
+) -> Result<(), ServerError>
+where
+    F: Future<Output = ()> + Send,
+{
+    tokio::pin!(shutdown);
+    let mut sessions = tokio::task::JoinSet::new();
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(target: "ultrasqld", error = %e, "accept failed; continuing");
+        let (stream, peer) = tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                info!(target: "ultrasqld", "listener shutdown requested");
+                while let Some(joined) = sessions.join_next().await {
+                    if let Err(e) = joined {
+                        warn!(target: "ultrasqld", error = %e, "session task failed during shutdown");
+                    }
+                }
+                return Ok(());
+            }
+            joined = sessions.join_next(), if !sessions.is_empty() => {
+                if let Err(e) = joined.expect("non-empty JoinSet yields one task") {
+                    warn!(target: "ultrasqld", error = %e, "session task failed");
+                }
                 continue;
             }
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(target: "ultrasqld", error = %e, "accept failed; continuing");
+                    continue;
+                }
+            },
         };
         // Disable Nagle's algorithm: queries and their responses are
         // dispatched in single coalesced `write_all` calls already, so
@@ -4926,7 +4964,7 @@ pub async fn serve_listener(listener: TcpListener, state: Arc<Server>) -> Result
         }
         debug!(target: "ultrasqld", %peer, "connection accepted");
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
+        sessions.spawn(async move {
             if let Err(e) = handle_connection(stream, state).await {
                 if matches!(e, ServerError::UnexpectedEof) {
                     debug!(target: "ultrasqld", %peer, "connection closed by peer");
