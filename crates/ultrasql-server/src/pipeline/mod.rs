@@ -225,6 +225,8 @@ pub struct LowerCtx<'a> {
         Arc<dashmap::DashMap<String, Arc<crate::time_partition::TimePartitionRuntime>>>,
     /// Same-process workload recorder used by virtual statistics views.
     pub workload_recorder: Arc<crate::workload::WorkloadRecorder>,
+    /// Runtime autovacuum settings used by virtual `pg_settings`.
+    pub autovacuum_config: crate::AutovacuumConfig,
     /// Session-local sequence observer for defaults that call `nextval`.
     pub sequence_state: Option<crate::SequenceSessionState>,
     /// Shared heap access handle.

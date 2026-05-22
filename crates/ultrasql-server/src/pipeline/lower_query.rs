@@ -819,6 +819,7 @@ pub(super) fn lower_cte(
         persistent_catalog: Arc::clone(&ctx.persistent_catalog),
         time_partitions: Arc::clone(&ctx.time_partitions),
         workload_recorder: Arc::clone(&ctx.workload_recorder),
+        autovacuum_config: ctx.autovacuum_config,
         sequence_state: ctx.sequence_state.clone(),
         heap: Arc::clone(&ctx.heap),
         vm: Arc::clone(&ctx.vm),

@@ -132,7 +132,7 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_sequences" => Some((schema_pg_sequences(), rows_pg_sequences(ctx))),
         "pg_catalog.pg_roles" => Some((schema_pg_roles(), rows_pg_roles())),
         "pg_catalog.pg_user" => Some((schema_pg_user(), rows_pg_user())),
-        "pg_catalog.pg_settings" => Some((schema_pg_settings(), rows_pg_settings())),
+        "pg_catalog.pg_settings" => Some((schema_pg_settings(), rows_pg_settings(ctx))),
         "pg_catalog.pg_stat_statements" => {
             Some((schema_pg_stat_statements(), rows_pg_stat_statements(ctx)))
         }
@@ -1087,7 +1087,8 @@ fn schema_pg_settings() -> Schema {
     ])
 }
 
-fn rows_pg_settings() -> Vec<Vec<Value>> {
+fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let autovacuum = ctx.autovacuum_config;
     vec![
         vec![
             v_text("server_version"),
@@ -1145,7 +1146,7 @@ fn rows_pg_settings() -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("autovacuum_vacuum_threshold"),
-            v_text("50"),
+            v_text(autovacuum.vacuum_threshold.to_string()),
             Value::Null,
             v_text("Autovacuum"),
             v_text("Minimum dead tuples before vacuum."),
@@ -1154,7 +1155,7 @@ fn rows_pg_settings() -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("autovacuum_vacuum_scale_factor"),
-            v_text("0.2"),
+            v_text(format_scale_factor(autovacuum.vacuum_scale_factor())),
             Value::Null,
             v_text("Autovacuum"),
             v_text("Fraction of table size before vacuum."),
@@ -1163,7 +1164,7 @@ fn rows_pg_settings() -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("autovacuum_analyze_threshold"),
-            v_text("50"),
+            v_text(autovacuum.analyze_threshold.to_string()),
             Value::Null,
             v_text("Autovacuum"),
             v_text("Minimum changed tuples before analyze."),
@@ -1172,7 +1173,7 @@ fn rows_pg_settings() -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("autovacuum_analyze_scale_factor"),
-            v_text("0.1"),
+            v_text(format_scale_factor(autovacuum.analyze_scale_factor())),
             Value::Null,
             v_text("Autovacuum"),
             v_text("Fraction of table size before analyze."),
@@ -1225,6 +1226,14 @@ fn rows_pg_settings() -> Vec<Vec<Value>> {
             v_text("sighup"),
         ],
     ]
+}
+
+fn format_scale_factor(value: f64) -> String {
+    let rendered = format!("{value:.6}");
+    rendered
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
 }
 
 fn schema_pg_stat_statements() -> Schema {

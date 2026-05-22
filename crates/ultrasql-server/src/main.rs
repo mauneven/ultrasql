@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use ultrasql_server::{Server, run_server};
+use ultrasql_server::{AutovacuumConfig, Server, run_server};
 
 /// `ultrasqld` v0.5: PostgreSQL-wire-compatible server with an
 /// in-memory sample database.
@@ -68,6 +68,22 @@ struct Cli {
     /// Background autovacuum/analyze maintenance interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     autovacuum_interval_ms: u64,
+
+    /// Minimum tuple changes before autovacuum considers VACUUM work.
+    #[arg(long, default_value_t = 50)]
+    autovacuum_vacuum_threshold: u64,
+
+    /// Fraction of estimated table rows added to the VACUUM threshold.
+    #[arg(long, default_value_t = 0.2)]
+    autovacuum_vacuum_scale_factor: f64,
+
+    /// Minimum tuple changes before autovacuum considers ANALYZE work.
+    #[arg(long, default_value_t = 50)]
+    autovacuum_analyze_threshold: u64,
+
+    /// Fraction of estimated table rows added to the ANALYZE threshold.
+    #[arg(long, default_value_t = 0.1)]
+    autovacuum_analyze_scale_factor: f64,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -107,6 +123,13 @@ fn main() -> std::process::ExitCode {
         eprintln!("ultrasqld: failed to initialise tracing: {e}");
         return std::process::ExitCode::from(1);
     }
+    let autovacuum_config = match autovacuum_config_from_cli(&cli) {
+        Ok(config) => config,
+        Err(e) => {
+            error!(target: "ultrasqld", error = %e, "invalid autovacuum configuration");
+            return std::process::ExitCode::from(1);
+        }
+    };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -121,13 +144,20 @@ fn main() -> std::process::ExitCode {
 
     let state = match &cli.data_dir {
         Some(path) => match Server::init(path) {
-            Ok(server) => Arc::new(server),
+            Ok(mut server) => {
+                server.set_autovacuum_config(autovacuum_config);
+                Arc::new(server)
+            }
             Err(e) => {
                 error!(target: "ultrasqld", error = %e, data_dir = %path.display(), "server init failed");
                 return std::process::ExitCode::from(1);
             }
         },
-        None => Arc::new(Server::with_sample_database()),
+        None => {
+            let mut server = Server::with_sample_database();
+            server.set_autovacuum_config(autovacuum_config);
+            Arc::new(server)
+        }
     };
     if let Some(path) = &cli.data_dir {
         if path.join("standby.signal").exists() || path.join("recovery.signal").exists() {
@@ -185,6 +215,21 @@ fn init_tracing(
             .try_init()?,
     }
     Ok(())
+}
+
+fn autovacuum_config_from_cli(cli: &Cli) -> Result<AutovacuumConfig, String> {
+    Ok(AutovacuumConfig {
+        vacuum_threshold: cli.autovacuum_vacuum_threshold,
+        vacuum_scale_factor_ppm: AutovacuumConfig::scale_factor_to_ppm(
+            "autovacuum_vacuum_scale_factor",
+            cli.autovacuum_vacuum_scale_factor,
+        )?,
+        analyze_threshold: cli.autovacuum_analyze_threshold,
+        analyze_scale_factor_ppm: AutovacuumConfig::scale_factor_to_ppm(
+            "autovacuum_analyze_scale_factor",
+            cli.autovacuum_analyze_scale_factor,
+        )?,
+    })
 }
 
 async fn run_ops_endpoint(
@@ -432,5 +477,46 @@ mod tests {
         ] {
             assert!(body.contains(metric), "missing metric {metric}");
         }
+    }
+
+    #[test]
+    fn autovacuum_config_from_cli_converts_scale_factors() {
+        let cli = Cli {
+            listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            data_dir: None,
+            ops_listen: None,
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Text,
+            autovacuum_interval_ms: 1000,
+            autovacuum_vacuum_threshold: 7,
+            autovacuum_vacuum_scale_factor: 0.25,
+            autovacuum_analyze_threshold: 11,
+            autovacuum_analyze_scale_factor: 0.125,
+        };
+
+        let config = autovacuum_config_from_cli(&cli).expect("valid autovacuum config");
+
+        assert_eq!(config.vacuum_threshold, 7);
+        assert_eq!(config.vacuum_scale_factor_ppm, 250_000);
+        assert_eq!(config.analyze_threshold, 11);
+        assert_eq!(config.analyze_scale_factor_ppm, 125_000);
+    }
+
+    #[test]
+    fn autovacuum_config_from_cli_rejects_invalid_scale_factor() {
+        let cli = Cli {
+            listen: "127.0.0.1:5433".parse().expect("listen addr"),
+            data_dir: None,
+            ops_listen: None,
+            log_level: "info".to_owned(),
+            log_format: LogFormat::Text,
+            autovacuum_interval_ms: 1000,
+            autovacuum_vacuum_threshold: 50,
+            autovacuum_vacuum_scale_factor: f64::NAN,
+            autovacuum_analyze_threshold: 50,
+            autovacuum_analyze_scale_factor: 0.1,
+        };
+
+        assert!(autovacuum_config_from_cli(&cli).is_err());
     }
 }

@@ -1089,6 +1089,7 @@ where
             persistent_catalog: Arc::clone(&self.state.persistent_catalog),
             time_partitions: Arc::clone(&self.state.time_partitions),
             workload_recorder: Arc::clone(&self.state.workload_recorder),
+            autovacuum_config: self.state.autovacuum_config(),
             sequence_state: Some(self.sequence_state.clone()),
             heap: Arc::clone(&self.state.heap),
             vm: Arc::clone(&self.state.vm),

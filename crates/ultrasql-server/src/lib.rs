@@ -1738,6 +1738,8 @@ pub struct Server {
     /// Tables that crossed the autovacuum ANALYZE threshold and are
     /// waiting for the next maintenance pass.
     pub pending_analyze_tables: dashmap::DashMap<String, ()>,
+    /// Runtime autovacuum thresholds used by the launcher and `pg_settings`.
+    pub autovacuum_config: AutovacuumConfig,
     /// Two-phase commit coordinator. Owns the on-disk state directory
     /// for prepared transactions; consulted by
     /// `PREPARE TRANSACTION 'gid'`, `COMMIT PREPARED 'gid'`, and
@@ -1825,12 +1827,87 @@ pub enum AuthConfig {
 /// keep it out of the per-commit critical path.
 pub const UNDO_GC_INTERVAL_COMMITS: u64 = 64;
 
-/// Minimum number of modified tuples before autovacuum triggers ANALYZE.
-pub const AUTO_ANALYZE_BASE_THRESHOLD: u64 = 64;
+/// Fixed-point denominator used by autovacuum scale-factor settings.
+pub const AUTOVACUUM_SCALE_DENOMINATOR: u64 = 1_000_000;
 
-/// Scale factor for autovacuum analyze threshold:
-/// `threshold = base + estimated_rows / AUTO_ANALYZE_SCALE_DIVISOR`.
-pub const AUTO_ANALYZE_SCALE_DIVISOR: u64 = 5;
+/// Runtime autovacuum threshold configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutovacuumConfig {
+    /// Minimum modified/dead tuple count before VACUUM work is considered.
+    pub vacuum_threshold: u64,
+    /// VACUUM scale factor in parts per million.
+    pub vacuum_scale_factor_ppm: u64,
+    /// Minimum modified tuple count before ANALYZE work is considered.
+    pub analyze_threshold: u64,
+    /// ANALYZE scale factor in parts per million.
+    pub analyze_scale_factor_ppm: u64,
+}
+
+impl Default for AutovacuumConfig {
+    fn default() -> Self {
+        Self {
+            vacuum_threshold: 50,
+            vacuum_scale_factor_ppm: 200_000,
+            analyze_threshold: 50,
+            analyze_scale_factor_ppm: 100_000,
+        }
+    }
+}
+
+impl AutovacuumConfig {
+    /// Convert a user-facing floating-point scale factor into fixed-point ppm.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value is NaN, infinite, negative, or too large
+    /// to represent in the fixed-point counter space.
+    pub fn scale_factor_to_ppm(name: &str, value: f64) -> Result<u64, String> {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!("{name} must be a non-negative finite number"));
+        }
+        let scaled = (value * AUTOVACUUM_SCALE_DENOMINATOR as f64).round();
+        if scaled > u64::MAX as f64 {
+            return Err(format!("{name} is too large"));
+        }
+        format!("{scaled:.0}")
+            .parse::<u64>()
+            .map_err(|_| format!("{name} is too large"))
+    }
+
+    /// Return the configured VACUUM scale factor as a user-facing decimal.
+    #[must_use]
+    pub fn vacuum_scale_factor(self) -> f64 {
+        self.vacuum_scale_factor_ppm as f64 / AUTOVACUUM_SCALE_DENOMINATOR as f64
+    }
+
+    /// Return the configured ANALYZE scale factor as a user-facing decimal.
+    #[must_use]
+    pub fn analyze_scale_factor(self) -> f64 {
+        self.analyze_scale_factor_ppm as f64 / AUTOVACUUM_SCALE_DENOMINATOR as f64
+    }
+
+    fn vacuum_threshold_for_rows(self, estimated_rows: u64) -> u64 {
+        scaled_threshold(
+            self.vacuum_threshold,
+            self.vacuum_scale_factor_ppm,
+            estimated_rows,
+        )
+    }
+
+    fn analyze_threshold_for_rows(self, estimated_rows: u64) -> u64 {
+        scaled_threshold(
+            self.analyze_threshold,
+            self.analyze_scale_factor_ppm,
+            estimated_rows,
+        )
+    }
+}
+
+fn scaled_threshold(base: u64, scale_factor_ppm: u64, estimated_rows: u64) -> u64 {
+    let scaled = (u128::from(estimated_rows) * u128::from(scale_factor_ppm))
+        / u128::from(AUTOVACUUM_SCALE_DENOMINATOR);
+    base.saturating_add(u64::try_from(scaled).unwrap_or(u64::MAX))
+}
 
 /// Precomputed TPC-H Q1 aggregate group used by the certification loader.
 #[derive(Clone, Debug, Default)]
@@ -2490,6 +2567,7 @@ impl Server {
             persistent_catalog: Arc::clone(&self.persistent_catalog),
             time_partitions: Arc::clone(&self.time_partitions),
             workload_recorder: Arc::clone(&self.workload_recorder),
+            autovacuum_config: self.autovacuum_config(),
             sequence_state: Some(SequenceSessionState::default()),
             heap: Arc::clone(&self.heap),
             vm: Arc::clone(&self.vm),
@@ -2600,6 +2678,7 @@ impl Server {
             workload_recorder: Arc::new(workload::WorkloadRecorder::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
+            autovacuum_config: AutovacuumConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,
             notify_hub: Arc::new(notify::NotifyHub::new()),
@@ -2868,8 +2947,10 @@ impl Server {
                 .heap
                 .block_count(RelationId(entry.oid))
                 .max(entry.n_blocks);
-            let threshold = AUTO_ANALYZE_BASE_THRESHOLD
-                .saturating_add(u64::from(blocks).saturating_mul(64) / AUTO_ANALYZE_SCALE_DIVISOR);
+            let estimated_rows = u64::from(blocks).saturating_mul(64);
+            let threshold = self
+                .autovacuum_config
+                .vacuum_threshold_for_rows(estimated_rows);
             if modified < threshold {
                 continue;
             }
@@ -3048,6 +3129,7 @@ impl Server {
             workload_recorder: Arc::new(workload::WorkloadRecorder::new()),
             table_modifications: dashmap::DashMap::new(),
             pending_analyze_tables: dashmap::DashMap::new(),
+            autovacuum_config: AutovacuumConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,
             notify_hub: Arc::new(notify::NotifyHub::new()),
@@ -4232,6 +4314,17 @@ impl Server {
         self.wal_writer.as_ref().map(ultrasql_wal::WalWriter::stats)
     }
 
+    /// Return runtime autovacuum thresholds.
+    #[must_use]
+    pub const fn autovacuum_config(&self) -> AutovacuumConfig {
+        self.autovacuum_config
+    }
+
+    /// Replace runtime autovacuum thresholds before the launcher starts.
+    pub fn set_autovacuum_config(&mut self, config: AutovacuumConfig) {
+        self.autovacuum_config = config;
+    }
+
     /// Return process-local ANN/vector-index counters for ops metrics.
     #[must_use]
     pub fn ann_system_metrics(&self) -> AnnSystemMetrics {
@@ -4823,12 +4916,13 @@ impl Server {
     fn auto_analyze_threshold(&self, table: &str) -> u64 {
         let snapshot = self.catalog_snapshot();
         let Some(entry) = snapshot.tables.get(table) else {
-            return AUTO_ANALYZE_BASE_THRESHOLD;
+            return self.autovacuum_config.analyze_threshold;
         };
         let rel = RelationId(entry.oid);
         let blocks = u64::from(self.heap.block_count(rel).max(entry.n_blocks));
         let estimated_rows = blocks.saturating_mul(64);
-        AUTO_ANALYZE_BASE_THRESHOLD.saturating_add(estimated_rows / AUTO_ANALYZE_SCALE_DIVISOR)
+        self.autovacuum_config
+            .analyze_threshold_for_rows(estimated_rows)
     }
 
     fn run_one_pending_analyze(&self) {
@@ -5073,6 +5167,7 @@ fn run_plan_in_txn(
     persistent_catalog: Arc<PersistentCatalog>,
     time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
     workload_recorder: Arc<workload::WorkloadRecorder>,
+    autovacuum_config: AutovacuumConfig,
     sequence_state: Option<SequenceSessionState>,
     tables: &SampleTables,
     heap: Arc<HeapAccess<BlankPageLoader>>,
@@ -5104,6 +5199,7 @@ fn run_plan_in_txn(
         persistent_catalog,
         time_partitions,
         workload_recorder,
+        autovacuum_config,
         sequence_state,
         heap,
         vm,

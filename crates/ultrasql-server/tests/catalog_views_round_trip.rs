@@ -293,6 +293,27 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
         .expect("pg_settings query");
     assert_eq!(settings.len(), 1);
     assert_eq!(settings[0].get::<_, String>(0), "UTF8");
+    let autovacuum_settings = client
+        .query(
+            "SELECT name, setting \
+             FROM pg_catalog.pg_settings \
+             WHERE name IN ('autovacuum_vacuum_threshold', 'autovacuum_analyze_scale_factor') \
+             ORDER BY name",
+            &[],
+        )
+        .await
+        .expect("pg_settings autovacuum query");
+    assert_eq!(autovacuum_settings.len(), 2);
+    assert_eq!(
+        autovacuum_settings[0].get::<_, String>(0),
+        "autovacuum_analyze_scale_factor"
+    );
+    assert_eq!(autovacuum_settings[0].get::<_, String>(1), "0.1");
+    assert_eq!(
+        autovacuum_settings[1].get::<_, String>(0),
+        "autovacuum_vacuum_threshold"
+    );
+    assert_eq!(autovacuum_settings[1].get::<_, String>(1), "50");
 
     client
         .batch_execute("CREATE TABLE stat_t (id INT)")

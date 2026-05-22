@@ -485,6 +485,7 @@ impl IndexFixture {
             persistent_catalog: StdArc::new(ultrasql_catalog::persistent::PersistentCatalog::new()),
             time_partitions: StdArc::new(dashmap::DashMap::new()),
             workload_recorder: StdArc::new(crate::workload::WorkloadRecorder::new()),
+            autovacuum_config: crate::AutovacuumConfig::default(),
             sequence_state: None,
             heap: StdArc::clone(&self.heap),
             vm: StdArc::clone(&self.vm),

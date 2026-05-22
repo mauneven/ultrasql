@@ -1612,8 +1612,16 @@ behavior are implemented and validated.
 - [x] Worker per table triggered by dead tuple ratio — autovacuum now
   walks catalog tables on its interval and vacuums relations whose tracked
   modification count crosses the PostgreSQL-style base/scale threshold.
-- [ ] `autovacuum_vacuum_threshold`, `autovacuum_vacuum_scale_factor` — exposed in `pg_settings`; runtime tuning pending
-- [ ] `autovacuum_analyze_threshold`, `autovacuum_analyze_scale_factor` — exposed in `pg_settings`; runtime tuning pending
+- [x] `autovacuum_vacuum_threshold`, `autovacuum_vacuum_scale_factor` —
+  runtime-configurable via `ultrasqld`
+  `--autovacuum-vacuum-threshold` /
+  `--autovacuum-vacuum-scale-factor`; same values drive the launcher
+  and `pg_settings`.
+- [x] `autovacuum_analyze_threshold`, `autovacuum_analyze_scale_factor` —
+  runtime-configurable via `ultrasqld`
+  `--autovacuum-analyze-threshold` /
+  `--autovacuum-analyze-scale-factor`; same values drive DML-triggered
+  analyze scheduling and `pg_settings`.
 - [ ] Per-table autovacuum settings — v0.9 supports PostgreSQL-compatible
   global threshold knobs through `pg_settings`; per-relation storage
   overrides remain a catalog-extension item.
