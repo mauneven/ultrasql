@@ -4,10 +4,10 @@
 //! shape, `SUM(int_col) WHERE int_col > literal`, through Cranelift and
 //! falls back to the existing scalar/SIMD kernels if native JIT setup is
 //! unavailable. The generated code is process-lifetime cached; each
-//! backing [`cranelift_jit::JITModule`] is intentionally leaked so the
-//! returned function pointers can stay valid for the life of the server.
+//! backing [`cranelift_jit::JITModule`] is retained in a global owner so
+//! the returned function pointers stay valid for the life of the server.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::{
@@ -64,6 +64,24 @@ type FilterSumI64GtFn = unsafe extern "C" fn(*const i64, usize, i64) -> i64;
 static FILTER_SUM_I32_GT: OnceLock<Option<FilterSumI32GtFn>> = OnceLock::new();
 static FILTER_SUM_I64_GT: OnceLock<Option<FilterSumI64GtFn>> = OnceLock::new();
 static FILTER_SUM_ABS_I64_GT: OnceLock<Option<FilterSumI64GtFn>> = OnceLock::new();
+#[allow(dead_code)]
+struct RetainedJitModule(JITModule);
+
+// SAFETY: finalized JIT modules are inserted only to keep executable
+// memory alive for process lifetime. After insertion, UltraSQL never
+// reads, mutates, or drops them explicitly; callers use only copied
+// function pointers whose code pages are owned by these modules.
+unsafe impl Send for RetainedJitModule {}
+
+static JIT_MODULES: OnceLock<Mutex<Vec<RetainedJitModule>>> = OnceLock::new();
+
+fn keep_module_alive(module: JITModule) {
+    JIT_MODULES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("jit module owner mutex poisoned")
+        .push(RetainedJitModule(module));
+}
 
 /// Run the Cranelift-compiled `SUM(i32) WHERE i32 > threshold` kernel.
 ///
@@ -192,9 +210,9 @@ fn build_filter_sum_i32_gt() -> Option<FilterSumI32GtFn> {
     module.finalize_definitions().ok()?;
     let code = module.get_finalized_function(func_id);
     // Keep executable memory alive for process lifetime.
-    let _leaked = Box::leak(Box::new(module));
+    keep_module_alive(module);
     // SAFETY: Cranelift emitted code for the exact `FilterSumI32GtFn`
-    // signature declared above. The leaked module keeps the code page
+    // signature declared above. The retained module keeps the code page
     // alive for all future calls.
     Some(unsafe { std::mem::transmute::<*const u8, FilterSumI32GtFn>(code) })
 }
@@ -283,9 +301,9 @@ fn build_filter_sum_i64_gt() -> Option<FilterSumI64GtFn> {
     module.define_function(func_id, &mut ctx).ok()?;
     module.finalize_definitions().ok()?;
     let code = module.get_finalized_function(func_id);
-    let _leaked = Box::leak(Box::new(module));
+    keep_module_alive(module);
     // SAFETY: Cranelift emitted code for the exact `FilterSumI64GtFn`
-    // signature declared above. The leaked module keeps the code page
+    // signature declared above. The retained module keeps the code page
     // alive for all future calls.
     Some(unsafe { std::mem::transmute::<*const u8, FilterSumI64GtFn>(code) })
 }
@@ -378,9 +396,9 @@ fn build_filter_sum_abs_i64_gt() -> Option<FilterSumI64GtFn> {
     module.define_function(func_id, &mut ctx).ok()?;
     module.finalize_definitions().ok()?;
     let code = module.get_finalized_function(func_id);
-    let _leaked = Box::leak(Box::new(module));
+    keep_module_alive(module);
     // SAFETY: Cranelift emitted code for the exact `FilterSumI64GtFn`
-    // signature declared above. The leaked module keeps the code page alive.
+    // signature declared above. The retained module keeps the code page alive.
     Some(unsafe { std::mem::transmute::<*const u8, FilterSumI64GtFn>(code) })
 }
 
