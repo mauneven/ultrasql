@@ -1,12 +1,15 @@
 //! End-to-end append-only materialized view tests.
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 
 use tokio::sync::oneshot;
 use tokio_postgres::NoTls;
 use ultrasql_server::{Server, bind_listener, serve_listener_with_shutdown};
+
+mod support;
+
+use support::{shutdown as shutdown_persistent, start_persistent_server};
 
 struct RunningServer {
     client: tokio_postgres::Client,
@@ -25,35 +28,6 @@ async fn start_server_and_connect() -> RunningServer {
     }));
     let conn_str = format!(
         "host={host} port={port} user=tester application_name=materialized_view_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    RunningServer {
-        client,
-        conn_handle,
-        server_handle,
-        shutdown_tx,
-    }
-}
-
-async fn start_persistent_server_and_connect(data_dir: &Path) -> RunningServer {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::init(data_dir).expect("persistent server init"));
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server_handle = tokio::spawn(serve_listener_with_shutdown(listener, server, async move {
-        let _ = shutdown_rx.await;
-    }));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=materialized_view_restart_test",
         host = bound.ip(),
         port = bound.port()
     );
@@ -163,7 +137,7 @@ async fn materialized_view_snapshots_then_appends_from_source_inserts() {
 async fn appended_materialized_view_rows_survive_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let running = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "materialized_view_restart_test").await;
     running
         .client
         .batch_execute("CREATE TABLE mv_restart_src (id INT NOT NULL, amount INT NOT NULL)")
@@ -186,9 +160,9 @@ async fn appended_materialized_view_rows_survive_restart() {
         .batch_execute("INSERT INTO mv_restart_src VALUES (3, 30)")
         .await
         .expect("append source");
-    shutdown(running).await;
+    shutdown_persistent(running).await;
 
-    let running = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "materialized_view_restart_test").await;
     let rows = running
         .client
         .query("SELECT id, amount FROM mv_restart_copy ORDER BY id", &[])
@@ -197,14 +171,14 @@ async fn appended_materialized_view_rows_survive_restart() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[2].get::<_, i32>(0), 3);
     assert_eq!(rows[2].get::<_, i32>(1), 30);
-    shutdown(running).await;
+    shutdown_persistent(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialized_view_keeps_maintaining_source_after_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let running = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "materialized_view_restart_test").await;
     running
         .client
         .batch_execute("CREATE TABLE mv_runtime_src (id INT NOT NULL, amount INT NOT NULL)")
@@ -222,9 +196,9 @@ async fn materialized_view_keeps_maintaining_source_after_restart() {
         )
         .await
         .expect("create materialized view");
-    shutdown(running).await;
+    shutdown_persistent(running).await;
 
-    let running = start_persistent_server_and_connect(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "materialized_view_restart_test").await;
     running
         .client
         .batch_execute("INSERT INTO mv_runtime_src VALUES (3, 30)")
@@ -238,5 +212,5 @@ async fn materialized_view_keeps_maintaining_source_after_restart() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[2].get::<_, i32>(0), 3);
     assert_eq!(rows[2].get::<_, i32>(1), 30);
-    shutdown(running).await;
+    shutdown_persistent(running).await;
 }
