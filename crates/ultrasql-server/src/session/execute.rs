@@ -1939,12 +1939,11 @@ where
                 return Err(e);
             }
         };
-        if let Err(commit_err) = self.state.txn_manager.commit(txn) {
-            tracing::warn!(
-                error = %commit_err,
-                "materialized-view maintenance commit failed",
-            );
-        }
+        self.state.commit_transaction(
+            txn,
+            true,
+            "materialized-view insert maintenance transaction",
+        )?;
         self.pending_materialized_view_rows.extend(rows);
         self.flush_pending_materialized_view_rows();
         Ok(())
@@ -1974,12 +1973,11 @@ where
                 }
             }
         }
-        if let Err(commit_err) = self.state.txn_manager.commit(txn) {
-            tracing::warn!(
-                error = %commit_err,
-                "materialized-view maintenance commit failed",
-            );
-        }
+        self.state.commit_transaction(
+            txn,
+            true,
+            "materialized-view table maintenance transaction",
+        )?;
         self.pending_materialized_view_rows.extend(rows);
         self.flush_pending_materialized_view_rows();
         Ok(())
