@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use num_traits::ToPrimitive;
+use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{DataType, SparseVector, Value};
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp};
 
@@ -296,6 +297,7 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "quote_ident" => eval_quote_ident(args),
         "format" => eval_format(args),
         "regexp_replace" => eval_regexp_replace(args),
+        "json_build_object" => eval_json_build_object(args),
         "gen_random_uuid" => eval_gen_random_uuid(args),
         "version" => eval_zero_arg_text(args, "UltraSQL 0.0.1"),
         "current_database" => eval_zero_arg_text(args, "ultrasql"),
@@ -1143,6 +1145,56 @@ fn format_value_text(value: &Value) -> String {
     match value {
         Value::Text(text) => text.clone(),
         other => other.to_string(),
+    }
+}
+
+fn eval_json_build_object(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() % 2 != 0 {
+        return Err(EvalError::Type(format!(
+            "json_build_object: expected even number of args, got {}",
+            args.len()
+        )));
+    }
+
+    let mut object = JsonMap::new();
+    for pair in args.chunks_exact(2) {
+        if matches!(pair[0], Value::Null) {
+            return Err(EvalError::Type(
+                "json_build_object: key must not be null".to_owned(),
+            ));
+        }
+        object.insert(format_value_text(&pair[0]), sql_value_to_json(&pair[1]));
+    }
+    serde_json::to_string(&JsonValue::Object(object))
+        .map(Value::Jsonb)
+        .map_err(|err| EvalError::Type(format!("json_build_object: encode failed: {err}")))
+}
+
+fn sql_value_to_json(value: &Value) -> JsonValue {
+    match value {
+        Value::Null => JsonValue::Null,
+        Value::Bool(v) => JsonValue::Bool(*v),
+        Value::Int16(v) => JsonValue::Number(JsonNumber::from(i64::from(*v))),
+        Value::Int32(v) => JsonValue::Number(JsonNumber::from(i64::from(*v))),
+        Value::Int64(v) => JsonValue::Number(JsonNumber::from(*v)),
+        Value::Float32(v) => {
+            JsonNumber::from_f64(f64::from(*v)).map_or(JsonValue::Null, JsonValue::Number)
+        }
+        Value::Float64(v) => JsonNumber::from_f64(*v).map_or(JsonValue::Null, JsonValue::Number),
+        Value::Text(v) => JsonValue::String(v.clone()),
+        Value::Jsonb(v) => serde_json::from_str(v).unwrap_or_else(|_| JsonValue::String(v.clone())),
+        Value::Vector(values) | Value::HalfVec(values) => JsonValue::Array(
+            values
+                .iter()
+                .map(|v| {
+                    JsonNumber::from_f64(f64::from(*v)).map_or(JsonValue::Null, JsonValue::Number)
+                })
+                .collect(),
+        ),
+        Value::Array { elements, .. } => {
+            JsonValue::Array(elements.iter().map(sql_value_to_json).collect())
+        }
+        other => JsonValue::String(other.to_string()),
     }
 }
 

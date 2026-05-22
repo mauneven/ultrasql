@@ -1813,7 +1813,10 @@ Every standard PostgreSQL driver and ORM works without modification.
   PERCENTILE_DISC require multi-argument / ordered-set aggregate plan
   shape before they can be claimed at the SQL surface.
 - [ ] Window: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE
-- [ ] JSON: row_to_json, json_build_object, json_each, jsonb_set, jsonb_path_query
+- [x] JSON scalar: `json_build_object` returns queryable JSONB through the
+  PostgreSQL wire path.
+- [ ] JSON remaining: `row_to_json`, `json_each`, `jsonb_set`, and
+  `jsonb_path_query`.
 - [x] Array: array_length, array_cat, unnest, array_agg,
   array_to_string, string_to_array — implemented for native arrays
   over the current supported scalar element set.
