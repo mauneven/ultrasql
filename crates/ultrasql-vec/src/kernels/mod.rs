@@ -187,10 +187,8 @@ fn pack_eq_64(a: &[i32; 64], b: &[i32; 64]) -> u64 {
 fn pack_eq_64(a: &[i32; 64], b: &[i32; 64]) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: runtime CPUID confirmed AVX2 support; the
-            // function reads only inside the borrowed 64-lane arrays.
-            return unsafe { pack_eq_64_avx2(a, b) };
+        if let Some(mask) = pack_eq_64_avx2_if_available(a, b) {
+            return mask;
         }
     }
     let mut mask: u64 = 0;
@@ -212,8 +210,21 @@ fn pack_eq_64(a: &[i32; 64], b: &[i32; 64]) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[inline]
+fn pack_eq_64_avx2_if_available(a: &[i32; 64], b: &[i32; 64]) -> Option<u64> {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return None;
+    }
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
+    // - Both inputs are borrowed 64-lane arrays; helper loads stay inside
+    //   those arrays and produce one packed mask.
+    Some(unsafe { pack_eq_64_avx2(a, b) })
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn pack_eq_64_avx2(a: &[i32; 64], b: &[i32; 64]) -> u64 {
+fn pack_eq_64_avx2(a: &[i32; 64], b: &[i32; 64]) -> u64 {
     use std::arch::x86_64::{
         __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
     };
@@ -253,25 +264,22 @@ fn movemask_to_u32(mask: i32) -> u32 {
 /// reductions (sixteen NEON loads, eight compares, eight
 /// reductions) emit one 64-bit mask word.
 ///
-/// # Safety
-///
-/// The caller passes `&[i32; 64]` references; we read exactly 64
-/// `i32`s starting at each pointer. `vld1q_s32` requires only a
-/// 4-byte alignment, which is the minimum for `i32`.
+/// Call through [`pack_eq_64`] so target-feature policy stays centralized.
+/// The implementation reads exactly 64 `i32`s from borrowed array references.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-unsafe fn pack_eq_64_neon(a: &[i32; 64], b: &[i32; 64]) -> u64 {
+fn pack_eq_64_neon(a: &[i32; 64], b: &[i32; 64]) -> u64 {
     use core::arch::aarch64::{uint32x4_t, vaddvq_u32, vandq_u32, vceqq_s32, vld1q_s32, vld1q_u32};
 
     let a_ptr = a.as_ptr();
     let b_ptr = b.as_ptr();
 
     // Powers-of-two weights for the 4 lanes of each compare vector:
-    // bit positions 0..3 within the chunk byte. SAFETY: 16-byte
-    // aligned constant stack memory.
+    // bit positions 0..3 within the chunk byte.
     let w_lo: [u32; 4] = [1, 2, 4, 8];
 
-    // SAFETY: pointer is to a 16-byte-aligned constant array.
+    // SAFETY: `w_lo` has exactly four initialized `u32` lanes; NEON
+    // `vld1q_u32` permits unaligned loads.
     let weights: uint32x4_t = unsafe { vld1q_u32(w_lo.as_ptr()) };
 
     let mut mask: u64 = 0;
@@ -357,21 +365,39 @@ fn sum_i64_dense(data: &[i64]) -> i64 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: runtime CPUID confirmed AVX2 support.
-            return unsafe { sum_i64_dense_avx2(data) };
+        if let Some(sum) = sum_i64_dense_avx2_if_available(data) {
+            return sum;
         }
-        data.iter().fold(0_i64, |a, b| a.wrapping_add(*b))
+        sum_i64_dense_scalar(data)
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        data.iter().fold(0_i64, |a, b| a.wrapping_add(*b))
+        sum_i64_dense_scalar(data)
     }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn sum_i64_dense_scalar(data: &[i64]) -> i64 {
+    data.iter().fold(0_i64, |a, b| a.wrapping_add(*b))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn sum_i64_dense_avx2_if_available(data: &[i64]) -> Option<i64> {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return None;
+    }
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
+    // - Helper reads only full `chunks_exact(8)` groups and folds remainder
+    //   scalar; all loads and the final stack store are in-bounds.
+    Some(unsafe { sum_i64_dense_avx2(data) })
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn sum_i64_dense_avx2(data: &[i64]) -> i64 {
+fn sum_i64_dense_avx2(data: &[i64]) -> i64 {
     use std::arch::x86_64::{
         __m256i, _mm256_add_epi64, _mm256_loadu_si256, _mm256_setzero_si256, _mm256_storeu_si256,
     };
@@ -478,23 +504,40 @@ fn sum_i32_widening_dense(data: &[i32]) -> i64 {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: runtime CPUID confirmed AVX2 support.
-            return unsafe { sum_i32_widening_dense_avx2(data) };
+        if let Some(sum) = sum_i32_widening_dense_avx2_if_available(data) {
+            return sum;
         }
-        data.iter()
-            .fold(0_i64, |a, b| a.wrapping_add(i64::from(*b)))
+        sum_i32_widening_dense_scalar(data)
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
-        data.iter()
-            .fold(0_i64, |a, b| a.wrapping_add(i64::from(*b)))
+        sum_i32_widening_dense_scalar(data)
     }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+fn sum_i32_widening_dense_scalar(data: &[i32]) -> i64 {
+    data.iter()
+        .fold(0_i64, |a, b| a.wrapping_add(i64::from(*b)))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn sum_i32_widening_dense_avx2_if_available(data: &[i32]) -> Option<i64> {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return None;
+    }
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
+    // - Helper reads only full `chunks_exact(8)` groups and folds remainder
+    //   scalar; all loads and the final stack store are in-bounds.
+    Some(unsafe { sum_i32_widening_dense_avx2(data) })
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn sum_i32_widening_dense_avx2(data: &[i32]) -> i64 {
+fn sum_i32_widening_dense_avx2(data: &[i32]) -> i64 {
     use std::arch::x86_64::{
         __m128i, __m256i, _mm_loadu_si128, _mm256_add_epi64, _mm256_cvtepi32_epi64,
         _mm256_setzero_si256, _mm256_storeu_si256,
@@ -673,7 +716,8 @@ fn min_f64_nullable(data: &[f64], nulls: &Bitmap) -> Option<f64> {
         // Iterate over set bits using a `word & word-1` clearing trick.
         let mut w = word;
         while w != 0 {
-            let bit = w.trailing_zeros() as usize;
+            let bit = usize::try_from(w.trailing_zeros())
+                .unwrap_or_else(|_| unreachable!("u64 trailing_zeros fits usize"));
             let i = base + bit;
             if i >= data.len() {
                 break;
@@ -884,10 +928,8 @@ fn cmp_gt_i64_pack_into(a: &[i64], scalar: i64, words: &mut [u64]) {
 fn pack_cmp_gt_64(a: &[i64; 64], scalar: i64) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: runtime CPUID confirmed AVX2 support; the
-            // function reads only inside the borrowed 64-lane array.
-            return unsafe { pack_cmp_gt_64_avx2(a, scalar) };
+        if let Some(mask) = pack_cmp_gt_64_avx2_if_available(a, scalar) {
+            return mask;
         }
     }
     let mut mask: u64 = 0;
@@ -909,8 +951,21 @@ fn pack_cmp_gt_64(a: &[i64; 64], scalar: i64) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[inline]
+fn pack_cmp_gt_64_avx2_if_available(a: &[i64; 64], scalar: i64) -> Option<u64> {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return None;
+    }
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
+    // - Input is a borrowed 64-lane array; helper loads stay inside it and
+    //   produce one packed comparison mask.
+    Some(unsafe { pack_cmp_gt_64_avx2(a, scalar) })
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn pack_cmp_gt_64_avx2(a: &[i64; 64], scalar: i64) -> u64 {
+fn pack_cmp_gt_64_avx2(a: &[i64; 64], scalar: i64) -> u64 {
     use std::arch::x86_64::{
         __m256i, _mm256_castsi256_pd, _mm256_cmpgt_epi64, _mm256_loadu_si256, _mm256_movemask_pd,
         _mm256_set1_epi64x,
@@ -1202,10 +1257,8 @@ const fn cmp_i64_lane(op: CmpOp, a: i64, b: i64) -> bool {
 fn pack_cmp_i32_64(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: runtime CPUID confirmed AVX2 support; the
-            // function reads only inside the borrowed 64-lane array.
-            return unsafe { pack_cmp_i32_64_avx2(a, scalar, op) };
+        if let Some(mask) = pack_cmp_i32_64_avx2_if_available(a, scalar, op) {
+            return mask;
         }
     }
     let mut mask: u64 = 0;
@@ -1226,8 +1279,21 @@ fn pack_cmp_i32_64(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[inline]
+fn pack_cmp_i32_64_avx2_if_available(a: &[i32; 64], scalar: i32, op: CmpOp) -> Option<u64> {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return None;
+    }
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
+    // - Input is a borrowed 64-lane array; helper loads stay inside it and
+    //   produce one packed comparison mask.
+    Some(unsafe { pack_cmp_i32_64_avx2(a, scalar, op) })
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn pack_cmp_i32_64_avx2(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
+fn pack_cmp_i32_64_avx2(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
     use std::arch::x86_64::{
         __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_cmpgt_epi32, _mm256_loadu_si256,
         _mm256_movemask_ps, _mm256_set1_epi32,
@@ -1286,10 +1352,8 @@ fn cmp_i32_pack_into(a: &[i32], scalar: i32, op: CmpOp, words: &mut [u64]) {
 fn pack_cmp_i64_64(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx2") {
-            // SAFETY: runtime CPUID confirmed AVX2 support; the
-            // function reads only inside the borrowed 64-lane array.
-            return unsafe { pack_cmp_i64_64_avx2(a, scalar, op) };
+        if let Some(mask) = pack_cmp_i64_64_avx2_if_available(a, scalar, op) {
+            return mask;
         }
     }
     let mut mask: u64 = 0;
@@ -1310,8 +1374,21 @@ fn pack_cmp_i64_64(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[inline]
+fn pack_cmp_i64_64_avx2_if_available(a: &[i64; 64], scalar: i64, op: CmpOp) -> Option<u64> {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return None;
+    }
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
+    // - Input is a borrowed 64-lane array; helper loads stay inside it and
+    //   produce one packed comparison mask.
+    Some(unsafe { pack_cmp_i64_64_avx2(a, scalar, op) })
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn pack_cmp_i64_64_avx2(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
+fn pack_cmp_i64_64_avx2(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
     use std::arch::x86_64::{
         __m256i, _mm256_castsi256_pd, _mm256_cmpeq_epi64, _mm256_cmpgt_epi64, _mm256_loadu_si256,
         _mm256_movemask_pd, _mm256_set1_epi64x,
@@ -1450,12 +1527,16 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_wrap)]
     fn sum_i64_neon_matches_scalar_at_every_tail_size() {
         // Test sizes that exercise both the 8-wide main loop and
         // every possible tail length (0..=7).
         for n in [0_usize, 1, 7, 8, 15, 16, 23, 64, 100, 1_000, 4_096, 100_000] {
-            let data: Vec<i64> = (0..n).map(|i| i as i64 * 3 - 7).collect();
+            let data: Vec<i64> = (0..n)
+                .map(|i| {
+                    let v = i64::try_from(i).expect("test sizes bounded under i64::MAX");
+                    v * 3 - 7
+                })
+                .collect();
             let scalar: i64 = data.iter().fold(0_i64, |a, b| a.wrapping_add(*b));
             let c = NumericColumn::from_data(data);
             assert_eq!(sum_i64(&c), scalar, "size {n} mismatch");
@@ -1477,7 +1558,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_wrap)]
     fn sum_i32_widening_neon_matches_scalar_at_every_tail_size() {
         // 16-wide main loop; exercise tails 0..=15.
         for n in [
@@ -1840,8 +1920,9 @@ mod tests {
             0_usize, 1, 7, 8, 63, 64, 65, 127, 128, 129, 200, 1023, 1024, 1025, 4096,
         ] {
             // Deterministic but interesting input (LCG-style scramble).
+            let modulus = usize::try_from(i32::MAX).expect("i32::MAX fits usize");
             let scramble = |i: usize| -> i32 {
-                let k = i32::try_from(i % (i32::MAX as usize)).unwrap_or(0);
+                let k = i32::try_from(i % modulus).expect("modulo bounds value to i32");
                 k.wrapping_mul(48271_i32) ^ i32::from_ne_bytes([0x5A, 0x5A, 0x5A, 0x5A])
             };
             let a_data: Vec<i32> = (0..n).map(scramble).collect();
