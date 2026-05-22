@@ -174,9 +174,12 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         )),
         "pg_catalog.pg_stat_replication" => Some((schema_pg_stat_replication(), Vec::new())),
         "pg_catalog.pg_stat_subscription" => Some((schema_pg_stat_subscription(), Vec::new())),
-        "pg_catalog.pg_publication" => Some((schema_pg_publication(), Vec::new())),
+        "pg_catalog.pg_publication" => Some((schema_pg_publication(), rows_pg_publication(ctx))),
         "pg_catalog.pg_subscription" => Some((schema_pg_subscription(), Vec::new())),
-        "pg_catalog.pg_publication_tables" => Some((schema_pg_publication_tables(), Vec::new())),
+        "pg_catalog.pg_publication_tables" => Some((
+            schema_pg_publication_tables(),
+            rows_pg_publication_tables(ctx),
+        )),
         "pg_catalog.pg_proc" => Some((schema_pg_proc(), Vec::new())),
         "pg_catalog.pg_database" => Some((schema_pg_database(), rows_pg_database())),
         "information_schema.tables" => Some((
@@ -1739,6 +1742,26 @@ fn schema_pg_publication() -> Schema {
     ])
 }
 
+fn rows_pg_publication(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    ctx.logical_replication
+        .publications()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, publication)| {
+            vec![
+                Value::Int64(90_000 + i64::try_from(idx).unwrap_or(i64::MAX)),
+                v_text(publication.name),
+                Value::Int64(10),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(false),
+            ]
+        })
+        .collect()
+}
+
 fn schema_pg_subscription() -> Schema {
     schema([
         Field::required("oid", DataType::Int64),
@@ -1760,6 +1783,26 @@ fn schema_pg_publication_tables() -> Schema {
         Field::nullable("attnames", text()),
         Field::nullable("rowfilter", text()),
     ])
+}
+
+fn rows_pg_publication_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    ctx.logical_replication
+        .publications()
+        .into_iter()
+        .flat_map(|publication| {
+            let pubname = publication.name.clone();
+            let tables = publication.tables().map(str::to_owned).collect::<Vec<_>>();
+            tables.into_iter().map(move |table| {
+                vec![
+                    v_text(pubname.clone()),
+                    v_text("public"),
+                    v_text(table),
+                    Value::Null,
+                    Value::Null,
+                ]
+            })
+        })
+        .collect()
 }
 
 fn schema_pg_proc() -> Schema {

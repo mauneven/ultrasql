@@ -1092,6 +1092,7 @@ where
             autovacuum_config: self.state.autovacuum_config(),
             logging_config: self.state.logging_config(),
             data_dir: self.state.data_dir.clone(),
+            logical_replication: Arc::clone(&self.state.logical_replication),
             sequence_state: Some(self.sequence_state.clone()),
             heap: Arc::clone(&self.state.heap),
             vm: Arc::clone(&self.state.vm),

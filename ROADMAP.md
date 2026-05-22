@@ -1672,7 +1672,8 @@ behavior are implemented and validated.
   decoding, persistent slots, and network streaming pending
 - [ ] `pgoutput` output plugin format — compatibility surface reserved; wire-compatible pgoutput encoder pending
 - [ ] `CREATE PUBLICATION` / `CREATE SUBSCRIPTION` — `CREATE PUBLICATION ... FOR TABLE ...`
-  registers in-process metadata; `CREATE SUBSCRIPTION` remains explicit
+  registers in-process metadata and exposes `pg_publication` /
+  `pg_publication_tables`; `CREATE SUBSCRIPTION` remains explicit
   unsupported future work; persistent metadata pending
 - [ ] Row filters and column lists on publications — syntax surface accepted by metadata DDL path; enforcement pending
 - [ ] Initial table data sync — use basebackup/WAL shipping path for physical initial sync; logical per-table copy pending

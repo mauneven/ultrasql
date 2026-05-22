@@ -158,6 +158,18 @@ impl LogicalReplicationRuntime {
             .map(|entry| entry.value().clone())
     }
 
+    /// Return publications in deterministic name order.
+    #[must_use]
+    pub fn publications(&self) -> Vec<Publication> {
+        let mut publications = self
+            .publications
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        publications.sort_by(|left, right| left.name.cmp(&right.name));
+        publications
+    }
+
     /// Return committed logical changes with `lsn` greater than `after_lsn`.
     #[must_use]
     pub fn changes_since(&self, after_lsn: u64) -> Vec<LogicalChange> {
