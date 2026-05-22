@@ -271,6 +271,24 @@ fn bind_table_function(
                 ],
             )
         }
+        "jsonb_path_query" => {
+            if bound_args.len() != 2 {
+                return Err(PlanError::NotSupported(
+                    "jsonb_path_query: expected jsonb document and path",
+                ));
+            }
+            let field = Field::nullable("value", DataType::Jsonb);
+            let schema = Schema::new([field.clone()])
+                .map_err(|e| PlanError::TypeMismatch(format!("jsonb_path_query schema: {e}")))?;
+            (
+                schema,
+                vec![ScopeEntry {
+                    qualifier: qualifier.clone(),
+                    field_index: 0,
+                    field,
+                }],
+            )
+        }
         "read_csv" => bind_read_csv_table_function(&bound_args, &qualifier)?,
         "read_parquet" => bind_read_parquet_table_function(&bound_args, &qualifier)?,
         "read_json" => {
@@ -289,7 +307,7 @@ fn bind_table_function(
         "sniff_csv" => bind_sniff_csv_table_function(&bound_args, &qualifier)?,
         _ => {
             return Err(PlanError::NotSupported(
-                "table function (only generate_series, unnest, json_each, json_table, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
+                "table function (only generate_series, unnest, json_each, jsonb_path_query, json_table, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
             ));
         }
     };
