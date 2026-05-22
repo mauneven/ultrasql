@@ -56,10 +56,24 @@ struct CreateStatisticsSpec {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LogicalReplicationDdl {
-    CreatePublication { name: String, tables: Vec<String> },
-    DropPublication { name: String, if_exists: bool },
-    CreateSubscription,
-    DropSubscription,
+    CreatePublication {
+        name: String,
+        tables: Vec<String>,
+    },
+    DropPublication {
+        name: String,
+        if_exists: bool,
+    },
+    CreateSubscription {
+        name: String,
+        conninfo: String,
+        publications: Vec<String>,
+        slot_name: Option<String>,
+    },
+    DropSubscription {
+        name: String,
+        if_exists: bool,
+    },
 }
 
 trait RlsPlanOptionExt {
@@ -144,6 +158,91 @@ fn parse_publication_tables(input: &str) -> Result<Vec<String>, ServerError> {
         ));
     }
     Ok(tables)
+}
+
+fn parse_quoted_literal(input: &str) -> Result<(&str, &str), ServerError> {
+    let input = input.trim_start();
+    let Some(rest) = input.strip_prefix('\'') else {
+        return Err(ServerError::ddl(
+            "CREATE SUBSCRIPTION requires a quoted literal",
+        ));
+    };
+    let Some(end) = rest.find('\'') else {
+        return Err(ServerError::ddl("unterminated quoted literal"));
+    };
+    Ok((&rest[..end], rest[end + 1..].trim()))
+}
+
+fn parse_subscription_publications(input: &str) -> Result<Vec<String>, ServerError> {
+    let mut rest = input.trim();
+    if !rest
+        .get(.."PUBLICATION".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("PUBLICATION"))
+    {
+        return Err(ServerError::ddl("CREATE SUBSCRIPTION requires PUBLICATION"));
+    }
+    rest = rest["PUBLICATION".len()..].trim();
+    let publication_part = rest
+        .split_once("WITH")
+        .map_or(rest, |(publications, _)| publications)
+        .trim();
+    let publications = publication_part
+        .split(',')
+        .map(|publication| publication.trim().trim_matches('"').to_string())
+        .filter(|publication| !publication.is_empty())
+        .collect::<Vec<_>>();
+    if publications.is_empty() {
+        return Err(ServerError::ddl(
+            "CREATE SUBSCRIPTION requires at least one publication",
+        ));
+    }
+    Ok(publications)
+}
+
+fn parse_subscription_slot_name(input: &str) -> Result<Option<String>, ServerError> {
+    let Some((_, options)) = input.split_once("WITH") else {
+        return Ok(None);
+    };
+    let options = options.trim();
+    let options = options
+        .strip_prefix('(')
+        .and_then(|text| text.strip_suffix(')'))
+        .unwrap_or(options);
+    for option in options.split(',') {
+        let Some((name, value)) = option.split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("slot_name") {
+            return Ok(Some(
+                value
+                    .trim()
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_create_subscription(input: &str) -> Result<LogicalReplicationDdl, ServerError> {
+    let (name, rest) = split_first_token(input)?;
+    let rest = rest.trim();
+    if !rest
+        .get(.."CONNECTION".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("CONNECTION"))
+    {
+        return Err(ServerError::ddl("CREATE SUBSCRIPTION requires CONNECTION"));
+    }
+    let (conninfo, after_conninfo) = parse_quoted_literal(&rest["CONNECTION".len()..])?;
+    let publications = parse_subscription_publications(after_conninfo)?;
+    let slot_name = parse_subscription_slot_name(after_conninfo)?;
+    Ok(LogicalReplicationDdl::CreateSubscription {
+        name: name.to_string(),
+        conninfo: conninfo.to_string(),
+        publications,
+        slot_name,
+    })
 }
 
 impl<RW> Session<RW>
@@ -2309,11 +2408,28 @@ where
                 }
                 Ok(Some(run_ddl_command("DROP PUBLICATION")))
             }
-            LogicalReplicationDdl::CreateSubscription => {
-                Err(ServerError::Unsupported("CREATE SUBSCRIPTION"))
+            LogicalReplicationDdl::CreateSubscription {
+                name,
+                conninfo,
+                publications,
+                slot_name,
+            } => {
+                self.state.logical_replication.create_subscription(
+                    &name,
+                    &conninfo,
+                    publications,
+                    slot_name,
+                )?;
+                Ok(Some(run_ddl_command("CREATE SUBSCRIPTION")))
             }
-            LogicalReplicationDdl::DropSubscription => {
-                Err(ServerError::Unsupported("DROP SUBSCRIPTION"))
+            LogicalReplicationDdl::DropSubscription { name, if_exists } => {
+                if !self.state.logical_replication.drop_subscription(&name) && !if_exists {
+                    return Err(ServerError::ddl(format!(
+                        "subscription \"{}\" does not exist",
+                        name.to_ascii_lowercase()
+                    )));
+                }
+                Ok(Some(run_ddl_command("DROP SUBSCRIPTION")))
             }
         }
     }
@@ -2348,10 +2464,24 @@ where
             }));
         }
         if starts_with_keyword_pair(sql, "CREATE", "SUBSCRIPTION") {
-            return Ok(Some(LogicalReplicationDdl::CreateSubscription));
+            let rest = sql["CREATE SUBSCRIPTION".len()..].trim();
+            return Ok(Some(parse_create_subscription(rest)?));
         }
         if starts_with_keyword_pair(sql, "DROP", "SUBSCRIPTION") {
-            return Ok(Some(LogicalReplicationDdl::DropSubscription));
+            let rest = sql["DROP SUBSCRIPTION".len()..].trim();
+            let (if_exists, rest) = if rest
+                .get(.."IF EXISTS".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("IF EXISTS"))
+            {
+                (true, rest["IF EXISTS".len()..].trim())
+            } else {
+                (false, rest)
+            };
+            let (name, _) = split_first_token(rest)?;
+            return Ok(Some(LogicalReplicationDdl::DropSubscription {
+                name: name.to_string(),
+                if_exists,
+            }));
         }
         Ok(None)
     }

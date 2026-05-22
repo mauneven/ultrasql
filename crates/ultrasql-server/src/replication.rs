@@ -53,6 +53,21 @@ pub struct Publication {
     tables: BTreeSet<String>,
 }
 
+/// `CREATE SUBSCRIPTION` metadata kept by the in-process server runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Subscription {
+    /// Case-folded subscription name.
+    pub name: String,
+    /// Connection string supplied by SQL.
+    pub conninfo: String,
+    /// Replication slot name.
+    pub slot_name: String,
+    /// Publication names subscribed to, in deterministic order.
+    pub publications: Vec<String>,
+    /// Whether subscription apply is enabled.
+    pub enabled: bool,
+}
+
 impl Publication {
     /// Return `true` when this publication includes `table`.
     #[must_use]
@@ -90,6 +105,7 @@ pub struct LogicalChange {
 #[derive(Debug)]
 pub struct LogicalReplicationRuntime {
     publications: dashmap::DashMap<String, Publication>,
+    subscriptions: dashmap::DashMap<String, Subscription>,
     changes: parking_lot::Mutex<Vec<LogicalChange>>,
     next_lsn: AtomicU64,
 }
@@ -106,6 +122,7 @@ impl LogicalReplicationRuntime {
     pub fn new() -> Self {
         Self {
             publications: dashmap::DashMap::new(),
+            subscriptions: dashmap::DashMap::new(),
             changes: parking_lot::Mutex::new(Vec::new()),
             next_lsn: AtomicU64::new(1),
         }
@@ -168,6 +185,75 @@ impl LogicalReplicationRuntime {
             .collect::<Vec<_>>();
         publications.sort_by(|left, right| left.name.cmp(&right.name));
         publications
+    }
+
+    /// Register a subscription for explicit publication names.
+    pub fn create_subscription(
+        &self,
+        name: &str,
+        conninfo: &str,
+        publications: Vec<String>,
+        slot_name: Option<String>,
+    ) -> Result<Subscription, ServerError> {
+        let name = fold_identifier(name);
+        if name.is_empty() {
+            return Err(ServerError::ddl("CREATE SUBSCRIPTION requires a name"));
+        }
+        if self.subscriptions.contains_key(&name) {
+            return Err(ServerError::ddl(format!(
+                "subscription \"{name}\" already exists"
+            )));
+        }
+        let mut publications = publications
+            .into_iter()
+            .map(|publication| fold_identifier(&publication))
+            .filter(|publication| !publication.is_empty())
+            .collect::<Vec<_>>();
+        publications.sort();
+        publications.dedup();
+        if publications.is_empty() {
+            return Err(ServerError::ddl(
+                "CREATE SUBSCRIPTION requires at least one publication",
+            ));
+        }
+        for publication in &publications {
+            if !self.publications.contains_key(publication) {
+                return Err(ServerError::ddl(format!(
+                    "publication \"{publication}\" does not exist"
+                )));
+            }
+        }
+        let slot_name = slot_name
+            .map(|slot| fold_identifier(&slot))
+            .filter(|slot| !slot.is_empty())
+            .unwrap_or_else(|| name.clone());
+        let subscription = Subscription {
+            name: name.clone(),
+            conninfo: conninfo.to_string(),
+            slot_name,
+            publications,
+            enabled: true,
+        };
+        self.subscriptions.insert(name, subscription.clone());
+        Ok(subscription)
+    }
+
+    /// Remove a subscription, returning whether it existed.
+    #[must_use]
+    pub fn drop_subscription(&self, name: &str) -> bool {
+        self.subscriptions.remove(&fold_identifier(name)).is_some()
+    }
+
+    /// Return subscriptions in deterministic name order.
+    #[must_use]
+    pub fn subscriptions(&self) -> Vec<Subscription> {
+        let mut subscriptions = self
+            .subscriptions
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        subscriptions.sort_by(|left, right| left.name.cmp(&right.name));
+        subscriptions
     }
 
     /// Return committed logical changes with `lsn` greater than `after_lsn`.

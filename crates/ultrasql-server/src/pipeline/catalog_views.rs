@@ -173,9 +173,12 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
             rows_pg_replication_slots(ctx),
         )),
         "pg_catalog.pg_stat_replication" => Some((schema_pg_stat_replication(), Vec::new())),
-        "pg_catalog.pg_stat_subscription" => Some((schema_pg_stat_subscription(), Vec::new())),
+        "pg_catalog.pg_stat_subscription" => Some((
+            schema_pg_stat_subscription(),
+            rows_pg_stat_subscription(ctx),
+        )),
         "pg_catalog.pg_publication" => Some((schema_pg_publication(), rows_pg_publication(ctx))),
-        "pg_catalog.pg_subscription" => Some((schema_pg_subscription(), Vec::new())),
+        "pg_catalog.pg_subscription" => Some((schema_pg_subscription(), rows_pg_subscription(ctx))),
         "pg_catalog.pg_publication_tables" => Some((
             schema_pg_publication_tables(),
             rows_pg_publication_tables(ctx),
@@ -1729,6 +1732,24 @@ fn schema_pg_stat_subscription() -> Schema {
     ])
 }
 
+fn rows_pg_stat_subscription(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    ctx.logical_replication
+        .subscriptions()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, subscription)| {
+            vec![
+                Value::Int64(subscription_oid(idx)),
+                v_text(subscription.name),
+                Value::Int32(0),
+                Value::Int64(0),
+                Value::Null,
+                Value::Null,
+            ]
+        })
+        .collect()
+}
+
 fn schema_pg_publication() -> Schema {
     schema([
         Field::required("oid", DataType::Int64),
@@ -1773,6 +1794,30 @@ fn schema_pg_subscription() -> Schema {
         Field::required("subslotname", text()),
         Field::required("subpublications", text()),
     ])
+}
+
+fn rows_pg_subscription(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    ctx.logical_replication
+        .subscriptions()
+        .into_iter()
+        .enumerate()
+        .map(|(idx, subscription)| {
+            vec![
+                Value::Int64(subscription_oid(idx)),
+                Value::Int64(1),
+                v_text(subscription.name),
+                Value::Int64(10),
+                Value::Bool(subscription.enabled),
+                v_text(subscription.conninfo),
+                v_text(subscription.slot_name),
+                v_text(subscription.publications.join(",")),
+            ]
+        })
+        .collect()
+}
+
+fn subscription_oid(idx: usize) -> i64 {
+    91_000 + i64::try_from(idx).unwrap_or(i64::MAX)
 }
 
 fn schema_pg_publication_tables() -> Schema {

@@ -171,3 +171,58 @@ async fn rollback_does_not_emit_logical_changes() {
 
     shutdown(client, conn_handle, server_handle, shutdown_tx).await;
 }
+
+#[tokio::test]
+async fn create_subscription_populates_catalog_and_stat_views() {
+    let (_server, client, conn_handle, server_handle, shutdown_tx) =
+        start_server_and_connect().await;
+
+    client
+        .batch_execute("CREATE TABLE events (id INT NOT NULL)")
+        .await
+        .expect("create events table");
+    client
+        .batch_execute("CREATE PUBLICATION pub_events FOR TABLE events")
+        .await
+        .expect("create publication");
+    client
+        .batch_execute(
+            "CREATE SUBSCRIPTION sub_events \
+             CONNECTION 'host=127.0.0.1 port=5433' \
+             PUBLICATION pub_events \
+             WITH (slot_name = 'sub_events_slot')",
+        )
+        .await
+        .expect("create subscription");
+
+    let subscription_rows = client
+        .query(
+            "SELECT subname, subenabled, subslotname, subpublications \
+             FROM pg_catalog.pg_subscription \
+             WHERE subname = 'sub_events'",
+            &[],
+        )
+        .await
+        .expect("pg_subscription rows");
+    assert_eq!(subscription_rows.len(), 1);
+    assert_eq!(subscription_rows[0].get::<_, String>(0), "sub_events");
+    assert!(subscription_rows[0].get::<_, bool>(1));
+    assert_eq!(subscription_rows[0].get::<_, String>(2), "sub_events_slot");
+    assert_eq!(subscription_rows[0].get::<_, String>(3), "pub_events");
+
+    let stat_rows = client
+        .query(
+            "SELECT subname, pid, relid \
+             FROM pg_catalog.pg_stat_subscription \
+             WHERE subname = 'sub_events'",
+            &[],
+        )
+        .await
+        .expect("pg_stat_subscription rows");
+    assert_eq!(stat_rows.len(), 1);
+    assert_eq!(stat_rows[0].get::<_, String>(0), "sub_events");
+    assert_eq!(stat_rows[0].get::<_, i32>(1), 0);
+    assert_eq!(stat_rows[0].get::<_, i64>(2), 0);
+
+    shutdown(client, conn_handle, server_handle, shutdown_tx).await;
+}

@@ -1672,12 +1672,16 @@ behavior are implemented and validated.
   decoding, persistent slots, and network streaming pending
 - [ ] `pgoutput` output plugin format — compatibility surface reserved; wire-compatible pgoutput encoder pending
 - [ ] `CREATE PUBLICATION` / `CREATE SUBSCRIPTION` — `CREATE PUBLICATION ... FOR TABLE ...`
-  registers in-process metadata and exposes `pg_publication` /
-  `pg_publication_tables`; `CREATE SUBSCRIPTION` remains explicit
-  unsupported future work; persistent metadata pending
+  and `CREATE SUBSCRIPTION ... CONNECTION ... PUBLICATION ...` register
+  in-process metadata and expose `pg_publication`,
+  `pg_publication_tables`, `pg_subscription`, and
+  `pg_stat_subscription`; persistent metadata and network apply remain
+  pending.
 - [ ] Row filters and column lists on publications — syntax surface accepted by metadata DDL path; enforcement pending
 - [ ] Initial table data sync — use basebackup/WAL shipping path for physical initial sync; logical per-table copy pending
-- [ ] `pg_stat_subscription` view — compatibility shape exists; live subscription rows pending
+- [x] `pg_stat_subscription` view — live in-process subscription metadata
+  rows are exposed; apply-worker lag fields remain null until network
+  subscription workers land.
 
 ### Observability
 - [x] `pg_stat_user_tables` — live/dead tuple counters now scan the
