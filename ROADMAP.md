@@ -1644,8 +1644,16 @@ behavior are implemented and validated.
   recorded per backend pid and exposed through the virtual catalog view.
 
 ### Physical Streaming Replication
-- [ ] WAL sender process — file-backed `WalSender` primitive plus `ultrasql --wal-send-once`; network process loop pending
-- [ ] WAL receiver on standby — file-backed `WalReceiver` primitive plus `ultrasql --wal-receive-once`; continuous apply loop pending
+- [x] WAL sender process — file-backed `WalSender` primitive plus
+  `ultrasql --wal-send-once`; `--wal-send-interval-ms N` keeps the
+  process shipping archived WAL into the destination directory using
+  persisted slot state. PostgreSQL wire-protocol replication remains a
+  later compatibility target.
+- [x] WAL receiver on standby — file-backed `WalReceiver` primitive plus
+  `ultrasql --wal-receive-once`; `--wal-receive-interval-ms N` keeps the
+  process copying new shipped WAL into `--data-dir/pg_wal` and writes
+  `standby.signal`. Receiver copies are idempotent so already-present WAL
+  files are not counted or rewritten.
 - [x] Standby mode (`standby.signal`)
 - [x] Hot standby (read queries on standby) — `standby.signal` /
   `recovery.signal` at `ultrasqld --data-dir` startup enables read-only

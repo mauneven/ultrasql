@@ -15,6 +15,8 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -110,9 +112,17 @@ struct Cli {
     #[arg(long, value_name = "DEST")]
     wal_send_once: Option<PathBuf>,
 
+    /// Repeat `--wal-send-once` every N milliseconds. Zero means run once.
+    #[arg(long, default_value_t = 0)]
+    wal_send_interval_ms: u64,
+
     /// Receive shipped WAL files once from this source directory into `--data-dir/pg_wal`.
     #[arg(long, value_name = "SOURCE")]
     wal_receive_once: Option<PathBuf>,
+
+    /// Repeat `--wal-receive-once` every N milliseconds. Zero means run once.
+    #[arg(long, default_value_t = 0)]
+    wal_receive_interval_ms: u64,
 
     /// Replication slot name used by WAL sender.
     #[arg(long, default_value = "standby")]
@@ -1018,19 +1028,32 @@ async fn run(cli: Cli) -> Result<()> {
     if let Some(dest) = &cli.wal_send_once {
         let slots_dir = cli.data_dir.join("pg_replslot");
         let sender = WalSender::new(&cli.archive_dir, slots_dir)?;
-        let copied = sender.send_once(&cli.replication_slot, dest)?;
-        println!("sent {copied} WAL file(s) to {}", dest.display());
+        if cli.wal_send_interval_ms == 0 {
+            let copied = sender.send_once(&cli.replication_slot, dest)?;
+            println!("sent {copied} WAL file(s) to {}", dest.display());
+        } else {
+            run_wal_send_loop(
+                &sender,
+                &cli.replication_slot,
+                dest,
+                cli.wal_send_interval_ms,
+            )?;
+        }
         return Ok(());
     }
 
     if let Some(source) = &cli.wal_receive_once {
         let receiver = WalReceiver::new(source);
-        let copied = receiver.receive_once(&cli.data_dir.join("pg_wal"))?;
-        fs::write(cli.data_dir.join("standby.signal"), b"standby\n")?;
-        println!(
-            "received {copied} WAL file(s) into {}",
-            cli.data_dir.join("pg_wal").display()
-        );
+        if cli.wal_receive_interval_ms == 0 {
+            let copied = receiver.receive_once(&cli.data_dir.join("pg_wal"))?;
+            fs::write(cli.data_dir.join("standby.signal"), b"standby\n")?;
+            println!(
+                "received {copied} WAL file(s) into {}",
+                cli.data_dir.join("pg_wal").display()
+            );
+        } else {
+            run_wal_receive_loop(&receiver, &cli.data_dir, cli.wal_receive_interval_ms)?;
+        }
         return Ok(());
     }
 
@@ -1550,6 +1573,38 @@ fn run_restore_wal(wal_name: &str, archive_dir: &Path, output: &Path) -> Result<
         .with_context(|| format!("restore WAL {} to {}", source.display(), output.display()))?;
     println!("restored {} to {}", source.display(), output.display());
     Ok(())
+}
+
+fn run_wal_send_loop(sender: &WalSender, slot: &str, dest: &Path, interval_ms: u64) -> Result<()> {
+    let interval = Duration::from_millis(interval_ms);
+    println!(
+        "shipping WAL from archive every {interval_ms}ms to {}",
+        dest.display()
+    );
+    loop {
+        let copied = sender.send_once(slot, dest)?;
+        if copied > 0 {
+            println!("sent {copied} WAL file(s) to {}", dest.display());
+        }
+        thread::sleep(interval);
+    }
+}
+
+fn run_wal_receive_loop(receiver: &WalReceiver, data_dir: &Path, interval_ms: u64) -> Result<()> {
+    let interval = Duration::from_millis(interval_ms);
+    let wal_dir = data_dir.join("pg_wal");
+    fs::write(data_dir.join("standby.signal"), b"standby\n")?;
+    println!(
+        "receiving WAL every {interval_ms}ms into {}",
+        wal_dir.display()
+    );
+    loop {
+        let copied = receiver.receive_once(&wal_dir)?;
+        if copied > 0 {
+            println!("received {copied} WAL file(s) into {}", wal_dir.display());
+        }
+        thread::sleep(interval);
+    }
 }
 
 fn run_validate(data_dir: &Path) -> Result<()> {

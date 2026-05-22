@@ -439,11 +439,24 @@ impl WalReceiver {
             let Some(name) = file.file_name() else {
                 continue;
             };
-            fs::copy(&file, standby_wal_dir.join(name)).map_err(ServerError::Io)?;
-            copied = copied.saturating_add(1);
+            if copy_if_changed(&file, &standby_wal_dir.join(name))? {
+                copied = copied.saturating_add(1);
+            }
         }
         Ok(copied)
     }
+}
+
+fn copy_if_changed(source: &Path, dest: &Path) -> Result<bool, ServerError> {
+    if dest.exists() {
+        let source_len = fs::metadata(source).map_err(ServerError::Io)?.len();
+        let dest_len = fs::metadata(dest).map_err(ServerError::Io)?.len();
+        if source_len == dest_len {
+            return Ok(false);
+        }
+    }
+    fs::copy(source, dest).map_err(ServerError::Io)?;
+    Ok(true)
 }
 
 fn wal_files(dir: &Path) -> Result<Vec<PathBuf>, ServerError> {
@@ -511,5 +524,35 @@ mod tests {
             Some("0000000100000000")
         );
         assert_eq!(slots[1].name, "standby_b");
+    }
+
+    #[test]
+    fn wal_receiver_skips_files_already_present_on_standby() {
+        let source = tempfile::TempDir::new().expect("source dir");
+        let standby = tempfile::TempDir::new().expect("standby dir");
+        fs::write(source.path().join("000000010000000000000001"), b"wal-a").expect("wal a");
+        fs::write(source.path().join("000000010000000000000002"), b"wal-b").expect("wal b");
+
+        let receiver = WalReceiver::new(source.path());
+        assert_eq!(
+            receiver
+                .receive_once(standby.path())
+                .expect("first receive"),
+            2
+        );
+        assert_eq!(
+            receiver
+                .receive_once(standby.path())
+                .expect("second receive"),
+            0
+        );
+
+        fs::write(source.path().join("000000010000000000000003"), b"wal-c").expect("wal c");
+        assert_eq!(
+            receiver
+                .receive_once(standby.path())
+                .expect("third receive"),
+            1
+        );
     }
 }
