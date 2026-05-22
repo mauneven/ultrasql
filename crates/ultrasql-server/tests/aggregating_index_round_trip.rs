@@ -8,7 +8,6 @@
 //! catalog metadata; page-backed summary-row storage remains a later slice.
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -17,25 +16,16 @@ use tokio_postgres::NoTls;
 use ultrasql_core::Value;
 use ultrasql_server::{RuntimeAggregatingIndex, Server, bind_listener, serve_listener};
 
+mod support;
+
+use support::{shutdown as graceful_shutdown, start_persistent_server};
+
 async fn start_server_and_connect() -> (
     tokio_postgres::Client,
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
 ) {
     start_server_and_connect_to(Arc::new(Server::with_sample_database())).await
-}
-
-async fn start_persistent_server_and_connect(
-    data_dir: &Path,
-) -> (
-    Arc<Server>,
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let server = Arc::new(Server::init(data_dir).expect("persistent server init"));
-    let (client, conn, handle) = start_server_and_connect_to(Arc::clone(&server)).await;
-    (server, client, conn, handle)
 }
 
 async fn start_server_and_connect_to(
@@ -515,8 +505,9 @@ async fn aggregating_index_restarts_with_catalog_metadata_and_rebuilt_summary() 
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
-        let (server, client, _conn, server_handle) =
-            start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "aggregating_index_test").await;
+        let server = Arc::clone(&running.server);
+        let client = &running.client;
         client
             .batch_execute(
                 "CREATE TABLE fact_events_restart (
@@ -556,16 +547,17 @@ async fn aggregating_index_restarts_with_catalog_metadata_and_rebuilt_summary() 
             .await
             .expect("delete after index build");
 
-        shutdown(client, server_handle).await;
         drop(server);
+        graceful_shutdown(running).await;
     }
 
     {
-        let (server, client, _conn, server_handle) =
-            start_persistent_server_and_connect(dir.path()).await;
+        let running = start_persistent_server(dir.path(), "aggregating_index_test").await;
+        let server = Arc::clone(&running.server);
+        let client = &running.client;
         assert_aggregating_catalog_metadata(&server);
         assert_eq!(
-            tenant_rollup_for(&client, "fact_events_restart").await,
+            tenant_rollup_for(client, "fact_events_restart").await,
             vec![(7, 1, 42, 3)],
             "restart must rebuild aggregating-index summary from durable heap"
         );
@@ -587,7 +579,7 @@ async fn aggregating_index_restarts_with_catalog_metadata_and_rebuilt_summary() 
             "restart must rebuild runtime aggregating-index rewrite state, got: {text}"
         );
 
-        shutdown(client, server_handle).await;
         drop(server);
+        graceful_shutdown(running).await;
     }
 }
