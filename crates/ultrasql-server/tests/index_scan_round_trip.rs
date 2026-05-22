@@ -28,87 +28,16 @@
 //! contribution is the *behavioural* end-to-end correctness check
 //! plus the micro-bench at the bottom of the module.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use tokio_postgres::NoTls;
 use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
-use ultrasql_server::{Server, bind_listener, serve_listener};
 use ultrasql_storage::access_method::BrinIndex;
 use ultrasql_storage::btree::BTree;
 
 mod support;
 
-use support::{shutdown as graceful_shutdown, start_persistent_server};
-
-/// Spin up an in-process server on an ephemeral TCP port and return a
-/// connected `tokio-postgres` client plus the join handles so the test
-/// can shut everything down cleanly.
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=index_scan_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
-
-async fn start_server_and_connect_with_server() -> (
-    Arc<Server>,
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, Arc::clone(&server)));
-
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=index_scan_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (server, client, conn_handle, server_handle)
-}
-
-/// Tidy shutdown sequence — drop the client, give the connection task
-/// a beat to flush its socket teardown, then abort the listener.
-async fn shutdown(
-    client: tokio_postgres::Client,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
-    let _ = server_handle.await;
-}
+use support::{shutdown as graceful_shutdown, start_persistent_server, start_sample_server};
 
 /// Insert `n_rows` of `(id INT, val INT)` rows into `table_name` via a
 /// single multi-row VALUES statement.
@@ -149,8 +78,9 @@ fn rows_first_col(rows: &[tokio_postgres::SimpleQueryMessage]) -> Vec<String> {
 /// 42` when an index covers the column.
 #[tokio::test]
 async fn point_lookup_with_index_returns_one_row() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_point", 1000).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_point", 1000).await;
     client
         .batch_execute("CREATE INDEX ix_t_point_id ON t_point(id)")
         .await
@@ -173,15 +103,16 @@ async fn point_lookup_with_index_returns_one_row() {
         .collect();
     assert_eq!(pairs, vec![(42, 420)]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `CREATE INDEX CONCURRENTLY` is accepted on the wire and produces the same
 /// visible index state as the current non-blocking build path.
 #[tokio::test]
 async fn create_index_concurrently_then_point_lookup_round_trip() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_cic", 100).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_cic", 100).await;
 
     client
         .batch_execute("CREATE INDEX CONCURRENTLY ix_t_cic_id ON t_cic(id)")
@@ -194,7 +125,7 @@ async fn create_index_concurrently_then_point_lookup_round_trip() {
         .expect("query through concurrent index");
     assert_eq!(rows_first_col(&rows), vec!["420".to_string()]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Rows inserted after `CREATE INDEX` must be visible through the
@@ -202,8 +133,9 @@ async fn create_index_concurrently_then_point_lookup_round_trip() {
 /// populated the B-tree once but later INSERTs only touched the heap.
 #[tokio::test]
 async fn insert_after_create_index_updates_btree() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_insert_after_index", 10).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_insert_after_index", 10).await;
     client
         .batch_execute("CREATE INDEX ix_t_insert_after_index_id ON t_insert_after_index(id)")
         .await
@@ -230,16 +162,17 @@ async fn insert_after_create_index_updates_btree() {
         .collect();
     assert_eq!(pairs, vec![(999, 9990)]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// BRIN indexes keep min/max block-range summaries, use those ranges
 /// for heap scan pruning, and update summaries for post-index INSERTs.
 #[tokio::test]
 async fn brin_index_range_scan_and_insert_maintenance_round_trip() {
-    let (server, client, _conn_handle, server_handle) =
-        start_server_and_connect_with_server().await;
-    preload(&client, "t_brin_idx", 30_000).await;
+    let running = start_sample_server("index_scan_test").await;
+    let server = Arc::clone(&running.server);
+    let client = &running.client;
+    preload(client, "t_brin_idx", 30_000).await;
     client
         .batch_execute("CREATE INDEX ix_t_brin_idx_id ON t_brin_idx USING brin (id)")
         .await
@@ -307,7 +240,7 @@ async fn brin_index_range_scan_and_insert_maintenance_round_trip() {
             .is_empty()
     );
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test]
@@ -361,7 +294,8 @@ async fn brin_index_summary_rebuilds_after_restart() {
 /// Unique enforcement belongs only to UNIQUE / PRIMARY KEY indexes.
 #[tokio::test]
 async fn non_unique_index_returns_duplicate_key_rows() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE t_nonunique_idx (id INT NOT NULL, val INT NOT NULL)")
         .await
@@ -388,14 +322,15 @@ async fn non_unique_index_returns_duplicate_key_rows() {
         vec!["10".to_string(), "20".to_string(), "40".to_string()]
     );
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Duplicate keys rejected by insert-side index maintenance must fail
 /// before the heap write, preserving statement atomicity.
 #[tokio::test]
 async fn duplicate_insert_after_unique_index_returns_23505_and_preserves_heap() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE t_unique_idx (id INT NOT NULL, val INT NOT NULL)")
         .await
@@ -429,15 +364,16 @@ async fn duplicate_insert_after_unique_index_returns_23505_and_preserves_heap() 
         .collect();
     assert_eq!(vals, vec![10]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Updating a non-key column after `CREATE INDEX` must keep the
 /// indexed point lookup alive.
 #[tokio::test]
 async fn update_non_key_column_after_create_index_updates_btree_tid() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_update_indexed", 10).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_update_indexed", 10).await;
     client
         .batch_execute("CREATE INDEX ix_t_update_indexed_id ON t_update_indexed(id)")
         .await
@@ -461,15 +397,16 @@ async fn update_non_key_column_after_create_index_updates_btree_tid() {
         .collect();
     assert_eq!(vals, vec![777]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Updating the indexed key must move the B-tree entry from the old
 /// key to the new key.
 #[tokio::test]
 async fn update_indexed_key_after_create_index_moves_btree_entry() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_update_key", 10).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_update_key", 10).await;
     client
         .batch_execute("CREATE INDEX ix_t_update_key_id ON t_update_key(id)")
         .await
@@ -492,14 +429,15 @@ async fn update_indexed_key_after_create_index_moves_btree_entry() {
         .expect("query new key through index");
     assert_eq!(rows_first_col(&new_rows), vec!["70".to_string()]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Updating an indexed key to an existing key fails before heap write.
 #[tokio::test]
 async fn update_indexed_key_to_duplicate_returns_23505_and_preserves_rows() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_update_dup", 10).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_update_dup", 10).await;
     client
         .batch_execute("CREATE UNIQUE INDEX ix_t_update_dup_id ON t_update_dup(id)")
         .await
@@ -518,15 +456,16 @@ async fn update_indexed_key_to_duplicate_returns_23505_and_preserves_rows() {
         .expect("query original key through index");
     assert_eq!(rows_first_col(&rows), vec!["70".to_string()]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// DELETE on indexed tables removes the B-tree entry so future
 /// unique-key reuse is possible.
 #[tokio::test]
 async fn delete_on_indexed_table_removes_btree_entry() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_delete_indexed", 10).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_delete_indexed", 10).await;
     client
         .batch_execute("CREATE INDEX ix_t_delete_indexed_id ON t_delete_indexed(id)")
         .await
@@ -553,15 +492,16 @@ async fn delete_on_indexed_table_removes_btree_entry() {
         .expect("query reinserted key through index");
     assert_eq!(rows_first_col(&rows), vec!["700".to_string()]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// SQL `VACUUM table` runs the B-tree vacuum pass and reclaims stale
 /// index TIDs that point at committed-dead heap slots.
 #[tokio::test]
 async fn vacuum_reclaims_stale_index_entries() {
-    let (server, client, _conn_handle, server_handle) =
-        start_server_and_connect_with_server().await;
+    let running = start_sample_server("index_scan_test").await;
+    let server = Arc::clone(&running.server);
+    let client = &running.client;
     client
         .batch_execute("CREATE TABLE t_vacuum_idx (id INT NOT NULL, val INT NOT NULL)")
         .await
@@ -617,7 +557,7 @@ async fn vacuum_reclaims_stale_index_entries() {
             .is_empty()
     );
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `SELECT * FROM t WHERE id BETWEEN 100 AND 200` returns the 101 rows
@@ -626,8 +566,9 @@ async fn vacuum_reclaims_stale_index_entries() {
 /// bounded range and dispatches to `IndexScan`.
 #[tokio::test]
 async fn between_range_with_index_returns_inclusive_range() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_range", 500).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_range", 500).await;
     client
         .batch_execute("CREATE INDEX ix_t_range_id ON t_range(id)")
         .await
@@ -648,15 +589,16 @@ async fn between_range_with_index_returns_inclusive_range() {
     let expected: Vec<i32> = (100..=200).collect();
     assert_eq!(ids, expected);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `ORDER BY indexed_col DESC` uses the lowerer's directed B-tree path
 /// and returns rows in descending key order.
 #[tokio::test]
 async fn order_by_desc_with_index_returns_descending_rows() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_order_desc", 8).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_order_desc", 8).await;
     client
         .batch_execute("CREATE INDEX ix_t_order_desc_id ON t_order_desc(id)")
         .await
@@ -680,7 +622,7 @@ async fn order_by_desc_with_index_returns_descending_rows() {
     let expected: Vec<(i32, i32)> = (0..8).rev().map(|i| (i, i * 10)).collect();
     assert_eq!(pairs, expected);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `SELECT COUNT(*) FROM t WHERE id = 42` returns one row whose value
@@ -688,8 +630,9 @@ async fn order_by_desc_with_index_returns_descending_rows() {
 /// dispatcher composes with `HashAggregate`.
 #[tokio::test]
 async fn count_over_index_probe_returns_correct_count() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_count", 1000).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_count", 1000).await;
     client
         .batch_execute("CREATE INDEX ix_t_count_id ON t_count(id)")
         .await
@@ -708,7 +651,7 @@ async fn count_over_index_probe_returns_correct_count() {
         .collect();
     assert_eq!(counts, vec![1]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `WHERE val = N` on an unindexed column still works correctly
@@ -716,8 +659,9 @@ async fn count_over_index_probe_returns_correct_count() {
 /// dispatcher must leave on the fallback path.
 #[tokio::test]
 async fn unindexed_column_filter_still_works() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_unindexed", 1000).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_unindexed", 1000).await;
     client
         .batch_execute("CREATE INDEX ix_t_unindexed_id ON t_unindexed(id)")
         .await
@@ -741,14 +685,15 @@ async fn unindexed_column_filter_still_works() {
         .collect();
     assert_eq!(pairs, vec![(777, 7770)]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// `WHERE id < N` over an indexed column returns rows `0..N`.
 #[tokio::test]
 async fn less_than_with_index_returns_prefix() {
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_lt", 200).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_lt", 200).await;
     client
         .batch_execute("CREATE INDEX ix_t_lt_id ON t_lt(id)")
         .await
@@ -768,7 +713,7 @@ async fn less_than_with_index_returns_prefix() {
     ids.sort_unstable();
     assert_eq!(ids, vec![0, 1, 2, 3, 4]);
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 /// Micro-bench: point-lookup with an index should observably beat the
@@ -790,9 +735,10 @@ async fn point_lookup_with_index_is_faster_than_seq_scan() {
     const SAMPLES: usize = 8;
     const TARGET_KEY: i32 = N_ROWS / 2;
 
-    let (client, _conn_handle, server_handle) = start_server_and_connect().await;
-    preload(&client, "t_bench_idx", N_ROWS).await;
-    preload(&client, "t_bench_noidx", N_ROWS).await;
+    let running = start_sample_server("index_scan_test").await;
+    let client = &running.client;
+    preload(client, "t_bench_idx", N_ROWS).await;
+    preload(client, "t_bench_noidx", N_ROWS).await;
     client
         .batch_execute("CREATE UNIQUE INDEX ix_t_bench_idx_id ON t_bench_idx(id)")
         .await
@@ -867,5 +813,5 @@ async fn point_lookup_with_index_is_faster_than_seq_scan() {
         );
     }
 
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
