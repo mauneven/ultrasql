@@ -1456,12 +1456,37 @@ where
                 (entry.oid, *attnum)
             }
         };
-        self.state.persistent_catalog.set_description(
+        let classoid = ultrasql_core::Oid::new(ultrasql_catalog::bootstrap::PG_CLASS_OID);
+        let ddl_txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let row = ultrasql_catalog::persistent::DescriptionRow {
             objoid,
-            ultrasql_core::Oid::new(ultrasql_catalog::bootstrap::PG_CLASS_OID),
+            classoid,
             objsubid,
-            comment.clone(),
-        );
+            description: comment.clone().unwrap_or_default(),
+        };
+        if let Err(e) = self.state.persistent_catalog.persist_description_row(
+            &row,
+            comment.is_none(),
+            self.state.heap.as_ref(),
+            ddl_txn.xid,
+            ddl_txn.current_command,
+        ) {
+            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "abort of COMMENT catalog txn failed",
+                );
+            }
+            return Err(e.into());
+        }
+        self.state
+            .commit_transaction(ddl_txn, true, "COMMENT catalog transaction")?;
+        self.state
+            .persistent_catalog
+            .set_description(objoid, classoid, objsubid, comment.clone());
         self.plan_cache_invalidate();
         Ok(run_ddl_command("COMMENT"))
     }

@@ -25,7 +25,7 @@
 use ultrasql_core::{DataType, Error as CoreError, Field, GeometryType, Oid, RangeType, Schema};
 
 use crate::persistent::{
-    AttributeRow, ClassRow, ConType, ConstraintRow, IndexRow, RelKind, SequenceRow,
+    AttributeRow, ClassRow, ConType, ConstraintRow, DescriptionRow, IndexRow, RelKind, SequenceRow,
     StatisticExtRow, StatisticRow,
 };
 
@@ -84,6 +84,9 @@ impl Writer<'_> {
         self.0.push(v);
     }
     fn i16(&mut self, v: i16) {
+        self.0.extend_from_slice(&v.to_le_bytes());
+    }
+    fn i32(&mut self, v: i32) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
     fn u32(&mut self, v: u32) {
@@ -799,6 +802,38 @@ pub fn decode_sequence_row(bytes: &[u8]) -> Result<SequenceRow, DecodeError> {
         seqcache: r.i64()?,
         seqcycle: r.bool()?,
     })
+}
+
+// ---------------------------------------------------------------------------
+// DescriptionRow
+// ---------------------------------------------------------------------------
+
+/// Encode a `pg_description` row into the catalog's internal binary format.
+///
+/// `deleted` marks an append-only tombstone for `COMMENT ... IS NULL`.
+#[must_use]
+pub fn encode_description_row(row: &DescriptionRow, deleted: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(17 + row.description.len());
+    let mut w = Writer(&mut out);
+    w.u32(row.objoid.raw());
+    w.u32(row.classoid.raw());
+    w.i32(row.objsubid);
+    w.str(&row.description);
+    w.bool(deleted);
+    out
+}
+
+/// Decode a row produced by [`encode_description_row`].
+pub fn decode_description_row(bytes: &[u8]) -> Result<(DescriptionRow, bool), DecodeError> {
+    let mut r = Reader::new(bytes);
+    let row = DescriptionRow {
+        objoid: Oid::new(r.u32()?),
+        classoid: Oid::new(r.u32()?),
+        objsubid: r.i32()?,
+        description: r.str()?,
+    };
+    let deleted = r.bool()?;
+    Ok((row, deleted))
 }
 
 // ---------------------------------------------------------------------------

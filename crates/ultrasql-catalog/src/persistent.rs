@@ -304,6 +304,8 @@ pub struct CatalogStats {
     pub indexes: u32,
     /// Number of constraints loaded.
     pub constraints: u32,
+    /// Number of `pg_description` rows loaded.
+    pub descriptions: u32,
     /// Number of `pg_statistic` rows loaded.
     pub statistics: u32,
     /// Number of `pg_statistic_ext` rows loaded.
@@ -324,6 +326,7 @@ impl CatalogStats {
             attributes: 0,
             indexes: 0,
             constraints: 0,
+            descriptions: 0,
             statistics: 0,
             statistic_ext: 0,
         }
@@ -534,8 +537,9 @@ impl PersistentCatalog {
         heap: &HeapAccess<L>,
     ) -> Result<CatalogStats, CatalogError> {
         use crate::encoding::{
-            decode_attribute_row, decode_constraint_row, decode_index_row, decode_sequence_row,
-            decode_statistic_ext_row, decode_statistic_row, schema_from_attributes,
+            decode_attribute_row, decode_constraint_row, decode_description_row, decode_index_row,
+            decode_sequence_row, decode_statistic_ext_row, decode_statistic_row,
+            schema_from_attributes,
         };
 
         let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
@@ -543,6 +547,7 @@ impl PersistentCatalog {
         let pg_index_rel = RelationId::new(bootstrap::PG_INDEX_OID);
         let pg_constraint_rel = RelationId::new(bootstrap::PG_CONSTRAINT_OID);
         let pg_sequence_rel = RelationId::new(bootstrap::PG_SEQUENCE_OID);
+        let pg_description_rel = RelationId::new(bootstrap::PG_DESCRIPTION_OID);
         let pg_statistic_rel = RelationId::new(bootstrap::PG_STATISTIC_OID);
         let pg_statistic_ext_rel = RelationId::new(bootstrap::PG_STATISTIC_EXT_OID);
         let class_blocks = heap.block_count(pg_class_rel);
@@ -833,12 +838,34 @@ impl PersistentCatalog {
             }
         }
 
+        let description_blocks = heap.block_count(pg_description_rel);
+        let mut descriptions = initial.descriptions;
+        let mut total_description_rows: u32 = 0;
+        if description_blocks > 0 {
+            let description_scan = heap.scan(pg_description_rel, description_blocks);
+            for result in description_scan {
+                let tuple = result.map_err(|e| {
+                    CatalogError::schema_conflict(format!("heap scan error on pg_description: {e}"))
+                })?;
+                let (row, deleted) = decode_description_row(&tuple.data).map_err(|e| {
+                    CatalogError::schema_conflict(format!("decode pg_description row: {e}"))
+                })?;
+                let key = (row.objoid, row.classoid, row.objsubid);
+                if deleted {
+                    descriptions.remove(&key);
+                } else {
+                    descriptions.insert(key, row);
+                }
+                total_description_rows = total_description_rows.saturating_add(1);
+            }
+        }
+
         let snap = CatalogSnapshot {
             tables,
             tables_by_oid,
             indexes,
             indexes_by_table,
-            descriptions: initial.descriptions,
+            descriptions,
             statistics,
             statistic_ext,
         };
@@ -848,6 +875,7 @@ impl PersistentCatalog {
             attributes: total_attrs,
             indexes: loaded_indexes.max(total_index_rows),
             constraints: total_constraint_rows,
+            descriptions: total_description_rows,
             statistics: total_statistics,
             statistic_ext: total_statistic_ext,
         };
@@ -1479,6 +1507,36 @@ impl PersistentCatalog {
             self.pg_description.remove(&key);
         }
         self.rebuild_snapshot();
+    }
+
+    /// Append a durable `pg_description` row or deletion tombstone.
+    pub fn persist_description_row<L: PageLoader>(
+        &self,
+        row: &DescriptionRow,
+        deleted: bool,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::encode_description_row;
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_description_rel = RelationId::new(bootstrap::PG_DESCRIPTION_OID);
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+        let bytes = encode_description_row(row, deleted);
+        heap.insert(
+            pg_description_rel,
+            &bytes,
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_description insert: {e}")))?;
+        Ok(())
     }
 
     /// Clear every comment attached to one object OID.
