@@ -1,8 +1,9 @@
 //! Dense `f32` vector similarity kernels.
 //!
 //! Scalar fallback implementations are the source of truth. Public wrappers
-//! dispatch to NEON, AVX2, or AVX-512 when available and keep exact top-k scans
-//! on the same metric contract.
+//! use scalar safe Rust by default. Enabling the `simd-unsafe` feature lets
+//! wrappers dispatch to NEON, AVX2, or AVX-512 when available while keeping
+//! exact top-k scans on the same metric contract.
 
 use std::cmp::Ordering;
 
@@ -40,13 +41,13 @@ pub struct VectorTopKHit {
 #[inline]
 pub fn dot_f32(left: &[f32], right: &[f32]) -> f32 {
     assert_eq!(left.len(), right.len(), "dot_f32: vector length mismatch");
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
     {
         dot_f32_neon_checked(left, right)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(all(feature = "simd-unsafe", target_arch = "aarch64")))]
     {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
         {
             if let Some(result) = dot_f32_avx512_if_available(left, right) {
                 return result;
@@ -104,13 +105,13 @@ pub fn l2_distance_f32(left: &[f32], right: &[f32]) -> f32 {
         right.len(),
         "l2_distance_f32: vector length mismatch"
     );
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
     {
         l2_distance_f32_neon_checked(left, right)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(all(feature = "simd-unsafe", target_arch = "aarch64")))]
     {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
         {
             if let Some(result) = l2_distance_f32_avx512_if_available(left, right) {
                 return result;
@@ -169,13 +170,13 @@ pub fn cosine_distance_f32(left: &[f32], right: &[f32]) -> Option<f32> {
         right.len(),
         "cosine_distance_f32: vector length mismatch"
     );
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
     {
         cosine_distance_f32_neon_checked(left, right)
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(all(feature = "simd-unsafe", target_arch = "aarch64")))]
     {
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
         {
             if let Some(result) = cosine_distance_f32_avx512_if_available(left, right) {
                 return result;
@@ -352,15 +353,10 @@ fn l1_distance_f32_scalar_same_len(left: &[f32], right: &[f32]) -> f32 {
         })
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
 #[inline]
 fn dot_f32_neon_checked(left: &[f32], right: &[f32]) -> f32 {
     debug_assert_eq!(left.len(), right.len());
-    // SAFETY:
-    // - NEON is part of the aarch64 baseline.
-    // - Inputs are borrowed slices; the helper only performs unaligned loads
-    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
-    // - Callers already checked equal lengths before choosing this kernel.
     // SAFETY:
     // - NEON is part of the aarch64 baseline.
     // - Inputs are borrowed slices; the target-feature helper only reads
@@ -369,15 +365,10 @@ fn dot_f32_neon_checked(left: &[f32], right: &[f32]) -> f32 {
     unsafe { dot_f32_neon(left, right) }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
 #[inline]
 fn l2_distance_f32_neon_checked(left: &[f32], right: &[f32]) -> f32 {
     debug_assert_eq!(left.len(), right.len());
-    // SAFETY:
-    // - NEON is part of the aarch64 baseline.
-    // - Inputs are borrowed slices; the helper only performs unaligned loads
-    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
-    // - Callers already checked equal lengths before choosing this kernel.
     // SAFETY:
     // - NEON is part of the aarch64 baseline.
     // - Inputs are borrowed slices; the target-feature helper only reads
@@ -386,15 +377,10 @@ fn l2_distance_f32_neon_checked(left: &[f32], right: &[f32]) -> f32 {
     unsafe { l2_distance_f32_neon(left, right) }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
 #[inline]
 fn cosine_distance_f32_neon_checked(left: &[f32], right: &[f32]) -> Option<f32> {
     debug_assert_eq!(left.len(), right.len());
-    // SAFETY:
-    // - NEON is part of the aarch64 baseline.
-    // - Inputs are borrowed slices; the helper only performs unaligned loads
-    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
-    // - Callers already checked equal lengths before choosing this kernel.
     // SAFETY:
     // - NEON is part of the aarch64 baseline.
     // - Inputs are borrowed slices; the target-feature helper only reads
@@ -403,7 +389,7 @@ fn cosine_distance_f32_neon_checked(left: &[f32], right: &[f32]) -> Option<f32> 
     unsafe { cosine_distance_f32_neon(left, right) }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
 #[inline]
 fn load_f32x4(chunk: &[f32]) -> std::arch::aarch64::float32x4_t {
@@ -415,7 +401,7 @@ fn load_f32x4(chunk: &[f32]) -> std::arch::aarch64::float32x4_t {
     unsafe { std::arch::aarch64::vld1q_f32(chunk.as_ptr()) }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
 #[target_feature(enable = "neon")]
 #[inline]
 fn store_f32x4(vector: std::arch::aarch64::float32x4_t, lanes: &mut [f32; 4]) {
@@ -425,7 +411,7 @@ fn store_f32x4(vector: std::arch::aarch64::float32x4_t, lanes: &mut [f32; 4]) {
     unsafe { std::arch::aarch64::vst1q_f32(lanes.as_mut_ptr(), vector) };
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[inline]
 fn load_m256_f32(chunk: &[f32]) -> std::arch::x86_64::__m256 {
@@ -437,7 +423,7 @@ fn load_m256_f32(chunk: &[f32]) -> std::arch::x86_64::__m256 {
     unsafe { std::arch::x86_64::_mm256_loadu_ps(chunk.as_ptr()) }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[inline]
 fn store_m256_f32(vector: std::arch::x86_64::__m256, lanes: &mut [f32; 8]) {
@@ -448,7 +434,7 @@ fn store_m256_f32(vector: std::arch::x86_64::__m256, lanes: &mut [f32; 8]) {
     unsafe { std::arch::x86_64::_mm256_storeu_ps(lanes.as_mut_ptr(), vector) };
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 #[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
 #[target_feature(enable = "avx512f")]
 #[inline]
@@ -461,7 +447,7 @@ fn load_m512_f32(chunk: &[f32]) -> std::arch::x86_64::__m512 {
     unsafe { std::arch::x86_64::_mm512_loadu_ps(chunk.as_ptr()) }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 #[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
 #[target_feature(enable = "avx512f")]
 #[inline]
@@ -473,7 +459,7 @@ fn store_m512_f32(vector: std::arch::x86_64::__m512, lanes: &mut [f32; 16]) {
     unsafe { std::arch::x86_64::_mm512_storeu_ps(lanes.as_mut_ptr(), vector) };
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 #[inline]
 fn dot_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
     if !std::arch::is_x86_feature_detected!("avx2") {
@@ -488,7 +474,7 @@ fn dot_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
     Some(unsafe { dot_f32_avx2(left, right) })
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 #[inline]
 fn l2_distance_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
     if !std::arch::is_x86_feature_detected!("avx2") {
@@ -503,7 +489,7 @@ fn l2_distance_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<f32>
     Some(unsafe { l2_distance_f32_avx2(left, right) })
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 #[inline]
 fn cosine_distance_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<Option<f32>> {
     if !std::arch::is_x86_feature_detected!("avx2") {
@@ -518,7 +504,7 @@ fn cosine_distance_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<
     Some(unsafe { cosine_distance_f32_avx2(left, right) })
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 #[inline]
 fn dot_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
     if !std::arch::is_x86_feature_detected!("avx512f") {
@@ -533,7 +519,7 @@ fn dot_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
     Some(unsafe { dot_f32_avx512(left, right) })
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 #[inline]
 fn l2_distance_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
     if !std::arch::is_x86_feature_detected!("avx512f") {
@@ -548,7 +534,7 @@ fn l2_distance_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Option<f3
     Some(unsafe { l2_distance_f32_avx512(left, right) })
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 #[inline]
 fn cosine_distance_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Option<Option<f32>> {
     if !std::arch::is_x86_feature_detected!("avx512f") {
@@ -563,7 +549,7 @@ fn cosine_distance_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Optio
     Some(unsafe { cosine_distance_f32_avx512(left, right) })
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
 /// NEON target-feature kernel.
 ///
 /// Call through `dot_f32_neon_checked` so CPU-feature policy and equal-length
@@ -591,7 +577,7 @@ fn dot_f32_neon(left: &[f32], right: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
 /// NEON target-feature kernel.
 ///
 /// Call through `l2_distance_f32_neon_checked` so CPU-feature policy and
@@ -619,7 +605,7 @@ fn l2_distance_f32_neon(left: &[f32], right: &[f32]) -> f32 {
     sum.sqrt()
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
 /// NEON target-feature kernel.
 ///
 /// Call through `cosine_distance_f32_neon_checked` so CPU-feature policy and
@@ -663,7 +649,7 @@ fn cosine_distance_f32_neon(left: &[f32], right: &[f32]) -> Option<f32> {
     finish_cosine_distance(dot, left_norm, right_norm)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 /// AVX2 target-feature kernel.
 ///
 /// Call through `dot_f32_avx2_if_available` so runtime CPUID policy and
@@ -691,7 +677,7 @@ fn dot_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 /// AVX2 target-feature kernel.
 ///
 /// Call through `l2_distance_f32_avx2_if_available` so runtime CPUID policy
@@ -719,7 +705,7 @@ fn l2_distance_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
     sum.sqrt()
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 /// AVX2 target-feature kernel.
 ///
 /// Call through `cosine_distance_f32_avx2_if_available` so runtime CPUID
@@ -763,7 +749,7 @@ fn cosine_distance_f32_avx2(left: &[f32], right: &[f32]) -> Option<f32> {
     finish_cosine_distance(dot, left_norm, right_norm)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 /// AVX-512F target-feature kernel.
 ///
 /// Call through `dot_f32_avx512_if_available` so runtime CPUID policy and
@@ -792,7 +778,7 @@ fn dot_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
     sum
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 /// AVX-512F target-feature kernel.
 ///
 /// Call through `l2_distance_f32_avx512_if_available` so runtime CPUID policy
@@ -821,7 +807,7 @@ fn l2_distance_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
     sum.sqrt()
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
 /// AVX-512F target-feature kernel.
 ///
 /// Call through `cosine_distance_f32_avx512_if_available` so runtime CPUID
@@ -866,6 +852,7 @@ fn cosine_distance_f32_avx512(left: &[f32], right: &[f32]) -> Option<f32> {
     finish_cosine_distance(dot, left_norm, right_norm)
 }
 
+#[cfg(feature = "simd-unsafe")]
 #[inline]
 fn accumulate_dot_tail(left: &[f32], right: &[f32], sum: &mut f32) {
     for (&left_value, &right_value) in left.iter().zip(right.iter()) {
@@ -873,6 +860,7 @@ fn accumulate_dot_tail(left: &[f32], right: &[f32], sum: &mut f32) {
     }
 }
 
+#[cfg(feature = "simd-unsafe")]
 #[inline]
 fn accumulate_l2_squared_tail(left: &[f32], right: &[f32], sum: &mut f32) {
     for (&left_value, &right_value) in left.iter().zip(right.iter()) {
@@ -881,6 +869,7 @@ fn accumulate_l2_squared_tail(left: &[f32], right: &[f32], sum: &mut f32) {
     }
 }
 
+#[cfg(feature = "simd-unsafe")]
 #[inline]
 fn accumulate_cosine_tail(
     left: &[f32],
@@ -896,6 +885,7 @@ fn accumulate_cosine_tail(
     }
 }
 
+#[cfg(feature = "simd-unsafe")]
 #[inline]
 fn finish_cosine_distance(dot: f32, left_norm: f32, right_norm: f32) -> Option<f32> {
     if left_norm == 0.0 || right_norm == 0.0 {
@@ -960,6 +950,7 @@ mod tests {
         let _ = cosine_distance_f32(&[1.0], &[1.0, 2.0]);
     }
 
+    #[cfg(feature = "simd-unsafe")]
     fn vectors_for_tail_len(len: usize) -> (Vec<f32>, Vec<f32>) {
         const LEFT_PATTERN: [f32; 17] = [
             -2.0, -1.75, -1.5, -1.25, -1.0, -0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 1.0, 1.25,
@@ -978,7 +969,7 @@ mod tests {
         (left, right)
     }
 
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(feature = "simd-unsafe", target_arch = "aarch64"))]
     #[test]
     fn neon_kernels_match_scalar_at_tail_boundaries() {
         for len in 0..=35 {
@@ -1007,7 +998,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
     #[test]
     fn avx2_kernels_match_scalar_at_tail_boundaries_when_available() {
         if !std::arch::is_x86_feature_detected!("avx2") {
@@ -1044,7 +1035,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(feature = "simd-unsafe", target_arch = "x86_64"))]
     #[test]
     fn avx512_kernels_match_scalar_at_tail_boundaries_when_available() {
         if !std::arch::is_x86_feature_detected!("avx512f") {
