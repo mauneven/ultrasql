@@ -1776,17 +1776,36 @@ behavior are implemented and validated.
 Every standard PostgreSQL driver and ORM works without modification.
 
 ### Data Types Completeness
-- [ ] `SMALLINT/INT2`, `INTEGER/INT4`, `BIGINT/INT8`
-- [ ] `REAL/FLOAT4`, `DOUBLE PRECISION/FLOAT8`
-- [ ] `NUMERIC(p,s)` / `DECIMAL(p,s)` — arbitrary precision (critical for finance)
+- [x] `SMALLINT/INT2`, `INTEGER/INT4`, `BIGINT/INT8` — parser, binder,
+  row codec, executor, PostgreSQL wire OIDs, and wire round-trip coverage
+  exist (`core_type_surface_round_trip.rs`).
+- [x] `REAL/FLOAT4`, `DOUBLE PRECISION/FLOAT8` — parser, binder, row
+  codec, executor, PostgreSQL wire OIDs, and wire round-trip coverage exist
+  (`core_type_surface_round_trip.rs`).
+- [ ] `NUMERIC(p,s)` / `DECIMAL(p,s)` — scaled `DECIMAL(p,s)` storage and
+  TPC-H-style arithmetic exist; PostgreSQL-grade arbitrary precision remains
+  open and is critical for finance.
 - [ ] `MONEY`
-- [ ] `CHAR(n)`, `VARCHAR(n)`, `TEXT`, `BYTEA`
-- [ ] `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL`
-- [ ] `BOOLEAN`
+- [x] `VARCHAR(n)`, `TEXT`, `BYTEA` — parser, binder, row codec,
+  executor, PostgreSQL wire OIDs, COPY/BYTEA coverage, and core wire
+  round-trip coverage exist (`core_type_surface_round_trip.rs`,
+  `bytea_round_trip.rs`).
+- [ ] `CHAR(n)` — accepted as bounded text today; PostgreSQL `bpchar`
+  blank-padding/comparison semantics remain open.
+- [ ] `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL` —
+  `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ`, and `INTERVAL` runtime
+  types exist with targeted coverage; `TIMETZ` and full PostgreSQL
+  timezone/display coercions remain open.
+- [x] `BOOLEAN` — parser, binder, row codec, executor, PostgreSQL wire OID,
+  partial-index/index coverage, COPY coverage, and core wire round-trip
+  coverage exist.
 - [x] `UUID` + `gen_random_uuid()`
 - [ ] `BIT(n)` / `BIT VARYING(n)`
 - [ ] `INET`, `CIDR`, `MACADDR`, `MACADDR8`
-- [ ] `POINT`, `LINE`, `LSEG`, `BOX`, `PATH`, `POLYGON`, `CIRCLE`
+- [x] `POINT`, `LINE`, `LSEG`, `BOX`, `PATH`, `POLYGON`, `CIRCLE` —
+  geometric SQL types, parser/binder/runtime values, overlap operators, and
+  GiST exclusion coverage exist; full PostgreSQL geometric function catalog
+  remains tracked outside this type-surface checkbox.
 - [ ] `JSON`, `JSONB` — critical for modern apps. Native JSONB
   runtime values, row-codec storage, `CREATE TABLE ... JSON/JSONB`,
   JSONB wire OID, COPY rendering, and JSONB operator evaluation are
@@ -1799,7 +1818,10 @@ Every standard PostgreSQL driver and ORM works without modification.
   `unnest(...)` are implemented for currently supported element
   families. Multi-dimensional arrays, full PostgreSQL coercions, and
   every element type remain open.
-- [ ] `int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`, `daterange`
+- [x] `int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`,
+  `daterange` — range SQL types, runtime values, overlap/contains
+  operators, and GiST exclusion coverage exist; full PostgreSQL range
+  function catalog remains tracked separately.
 - [ ] `CREATE TYPE ... AS ENUM (...)`
 - [ ] `CREATE TYPE ... AS (composite)`
 - [ ] `CREATE DOMAIN`

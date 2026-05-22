@@ -614,7 +614,18 @@ impl Parser<'_> {
         let start = tok.span.start;
 
         // Accept keyword type names (integer, varchar, …) or identifiers.
-        let name = self.parse_type_name()?;
+        let mut name = self.parse_type_name()?;
+        if name.value == "double" && self.peek()?.kind == TokenKind::KwPrecision {
+            let precision = self.advance()?;
+            name.value = "double precision".to_owned();
+            name.span = Span::new(name.span.start, precision.span.end);
+        } else if name.value == "timestamp" && self.peek()?.kind == TokenKind::KwWith {
+            self.advance()?;
+            self.expect(TokenKind::KwTime, "TIME")?;
+            let zone = self.expect(TokenKind::KwZone, "ZONE")?;
+            name.value = "timestamp with time zone".to_owned();
+            name.span = Span::new(name.span.start, zone.span.end);
+        }
 
         // Optional type modifiers: `(255)`, `(10, 2)`, etc.
         let type_modifiers = if self.peek()?.kind == TokenKind::LParen {

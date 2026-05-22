@@ -1518,6 +1518,18 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
         return;
     }
     match (target, &*value) {
+        (DataType::Int16, Value::Int32(v)) => {
+            if let Ok(narrow) = i16::try_from(*v) {
+                *value = Value::Int16(narrow);
+                *data_type = DataType::Int16;
+            }
+        }
+        (DataType::Int16, Value::Int64(v)) => {
+            if let Ok(narrow) = i16::try_from(*v) {
+                *value = Value::Int16(narrow);
+                *data_type = DataType::Int16;
+            }
+        }
         (DataType::Int32, Value::Int64(v)) => {
             if let Ok(narrow) = i32::try_from(*v) {
                 *value = Value::Int32(narrow);
@@ -1653,13 +1665,13 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "smallint" | "int2" => Some(DataType::Int16),
         "bool" | "boolean" => Some(DataType::Bool),
         "real" | "float4" => Some(DataType::Float32),
-        "double" | "float" | "float8" => Some(DataType::Float64),
+        "double" | "double precision" | "float" | "float8" => Some(DataType::Float64),
         "text" | "varchar" | "char" | "character" => Some(DataType::Text { max_len: None }),
         "bytea" => Some(DataType::Bytea),
         "date" => Some(DataType::Date),
         "time" => Some(DataType::Time),
         "timestamp" => Some(DataType::Timestamp),
-        "timestamptz" => Some(DataType::TimestampTz),
+        "timestamptz" | "timestamp with time zone" => Some(DataType::TimestampTz),
         "uuid" => Some(DataType::Uuid),
         "json" | "jsonb" => Some(DataType::Jsonb),
         "tsvector" | "tsquery" => Some(DataType::Text { max_len: None }),

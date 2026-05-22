@@ -861,6 +861,17 @@ impl<'src> Parser<'src> {
 
     fn parse_cast_type_name(&mut self) -> Result<Identifier, ParseError> {
         let mut target = self.parse_type_name()?;
+        if target.value == "double" && self.peek()?.kind == TokenKind::KwPrecision {
+            let precision = self.advance()?;
+            target.value = "double precision".to_owned();
+            target.span = Span::new(target.span.start, precision.span.end);
+        } else if target.value == "timestamp" && self.peek()?.kind == TokenKind::KwWith {
+            self.advance()?;
+            self.expect(TokenKind::KwTime, "TIME")?;
+            let zone = self.expect(TokenKind::KwZone, "ZONE")?;
+            target.value = "timestamp with time zone".to_owned();
+            target.span = Span::new(target.span.start, zone.span.end);
+        }
         if let Some(base) = vector_family_type_base(&target.value)
             && self.peek()?.kind == TokenKind::LParen
         {
