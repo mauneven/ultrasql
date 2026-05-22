@@ -42,23 +42,17 @@ pub fn dot_f32(left: &[f32], right: &[f32]) -> f32 {
     assert_eq!(left.len(), right.len(), "dot_f32: vector length mismatch");
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is part of the aarch64 baseline; lengths were checked
-        // above and the helper reads only inside the borrowed slices.
-        unsafe { dot_f32_neon(left, right) }
+        dot_f32_neon_checked(left, right)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx512f") {
-                // SAFETY: runtime CPUID confirmed AVX-512F; lengths were
-                // checked above and the helper reads only inside borrowed slices.
-                return unsafe { dot_f32_avx512(left, right) };
+            if let Some(result) = dot_f32_avx512_if_available(left, right) {
+                return result;
             }
-            if std::arch::is_x86_feature_detected!("avx2") {
-                // SAFETY: runtime CPUID confirmed AVX2; lengths were checked
-                // above and the helper reads only inside the borrowed slices.
-                return unsafe { dot_f32_avx2(left, right) };
+            if let Some(result) = dot_f32_avx2_if_available(left, right) {
+                return result;
             }
         }
         dot_f32_scalar_same_len(left, right)
@@ -112,23 +106,17 @@ pub fn l2_distance_f32(left: &[f32], right: &[f32]) -> f32 {
     );
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is part of the aarch64 baseline; lengths were checked
-        // above and the helper reads only inside the borrowed slices.
-        unsafe { l2_distance_f32_neon(left, right) }
+        l2_distance_f32_neon_checked(left, right)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx512f") {
-                // SAFETY: runtime CPUID confirmed AVX-512F; lengths were
-                // checked above and the helper reads only inside borrowed slices.
-                return unsafe { l2_distance_f32_avx512(left, right) };
+            if let Some(result) = l2_distance_f32_avx512_if_available(left, right) {
+                return result;
             }
-            if std::arch::is_x86_feature_detected!("avx2") {
-                // SAFETY: runtime CPUID confirmed AVX2; lengths were checked
-                // above and the helper reads only inside the borrowed slices.
-                return unsafe { l2_distance_f32_avx2(left, right) };
+            if let Some(result) = l2_distance_f32_avx2_if_available(left, right) {
+                return result;
             }
         }
         l2_distance_f32_scalar_same_len(left, right)
@@ -183,23 +171,17 @@ pub fn cosine_distance_f32(left: &[f32], right: &[f32]) -> Option<f32> {
     );
     #[cfg(target_arch = "aarch64")]
     {
-        // SAFETY: NEON is part of the aarch64 baseline; lengths were checked
-        // above and the helper reads only inside the borrowed slices.
-        unsafe { cosine_distance_f32_neon(left, right) }
+        cosine_distance_f32_neon_checked(left, right)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         #[cfg(target_arch = "x86_64")]
         {
-            if std::arch::is_x86_feature_detected!("avx512f") {
-                // SAFETY: runtime CPUID confirmed AVX-512F; lengths were
-                // checked above and the helper reads only inside borrowed slices.
-                return unsafe { cosine_distance_f32_avx512(left, right) };
+            if let Some(result) = cosine_distance_f32_avx512_if_available(left, right) {
+                return result;
             }
-            if std::arch::is_x86_feature_detected!("avx2") {
-                // SAFETY: runtime CPUID confirmed AVX2; lengths were checked
-                // above and the helper reads only inside the borrowed slices.
-                return unsafe { cosine_distance_f32_avx2(left, right) };
+            if let Some(result) = cosine_distance_f32_avx2_if_available(left, right) {
+                return result;
             }
         }
         cosine_distance_f32_scalar_same_len(left, right)
@@ -371,8 +353,186 @@ fn l1_distance_f32_scalar_same_len(left: &[f32], right: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_f32_neon_checked(left: &[f32], right: &[f32]) -> f32 {
+    debug_assert_eq!(left.len(), right.len());
+    // SAFETY:
+    // - NEON is part of the aarch64 baseline.
+    // - Inputs are borrowed slices; the helper only performs unaligned loads
+    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
+    // - Callers already checked equal lengths before choosing this kernel.
+    // SAFETY:
+    // - NEON is part of the aarch64 baseline.
+    // - Inputs are borrowed slices; the target-feature helper only reads
+    //   inside `chunks_exact` bounds and writes to stack lane arrays.
+    // - Public wrapper checked equal lengths before dispatch.
+    unsafe { dot_f32_neon(left, right) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn l2_distance_f32_neon_checked(left: &[f32], right: &[f32]) -> f32 {
+    debug_assert_eq!(left.len(), right.len());
+    // SAFETY:
+    // - NEON is part of the aarch64 baseline.
+    // - Inputs are borrowed slices; the helper only performs unaligned loads
+    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
+    // - Callers already checked equal lengths before choosing this kernel.
+    // SAFETY:
+    // - NEON is part of the aarch64 baseline.
+    // - Inputs are borrowed slices; the target-feature helper only reads
+    //   inside `chunks_exact` bounds and writes to stack lane arrays.
+    // - Public wrapper checked equal lengths before dispatch.
+    unsafe { l2_distance_f32_neon(left, right) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn cosine_distance_f32_neon_checked(left: &[f32], right: &[f32]) -> Option<f32> {
+    debug_assert_eq!(left.len(), right.len());
+    // SAFETY:
+    // - NEON is part of the aarch64 baseline.
+    // - Inputs are borrowed slices; the helper only performs unaligned loads
+    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
+    // - Callers already checked equal lengths before choosing this kernel.
+    // SAFETY:
+    // - NEON is part of the aarch64 baseline.
+    // - Inputs are borrowed slices; the target-feature helper only reads
+    //   inside `chunks_exact` bounds and writes to stack lane arrays.
+    // - Public wrapper checked equal lengths before dispatch.
+    unsafe { cosine_distance_f32_neon(left, right) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dot_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return None;
+    }
+    debug_assert_eq!(left.len(), right.len());
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
+    // - Inputs are borrowed slices; the helper only performs unaligned loads
+    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
+    // - Callers already checked equal lengths before choosing this kernel.
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2.
+    // - Inputs are borrowed slices; the target-feature helper only reads
+    //   inside `chunks_exact` bounds and writes to stack lane arrays.
+    // - Public wrapper checked equal lengths before dispatch.
+    Some(unsafe { dot_f32_avx2(left, right) })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn l2_distance_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return None;
+    }
+    debug_assert_eq!(left.len(), right.len());
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
+    // - Inputs are borrowed slices; the helper only performs unaligned loads
+    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
+    // - Callers already checked equal lengths before choosing this kernel.
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2.
+    // - Inputs are borrowed slices; the target-feature helper only reads
+    //   inside `chunks_exact` bounds and writes to stack lane arrays.
+    // - Public wrapper checked equal lengths before dispatch.
+    Some(unsafe { l2_distance_f32_avx2(left, right) })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn cosine_distance_f32_avx2_if_available(left: &[f32], right: &[f32]) -> Option<Option<f32>> {
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        return None;
+    }
+    debug_assert_eq!(left.len(), right.len());
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
+    // - Inputs are borrowed slices; the helper only performs unaligned loads
+    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
+    // - Callers already checked equal lengths before choosing this kernel.
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX2.
+    // - Inputs are borrowed slices; the target-feature helper only reads
+    //   inside `chunks_exact` bounds and writes to stack lane arrays.
+    // - Public wrapper checked equal lengths before dispatch.
+    Some(unsafe { cosine_distance_f32_avx2(left, right) })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn dot_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
+    if !std::arch::is_x86_feature_detected!("avx512f") {
+        return None;
+    }
+    debug_assert_eq!(left.len(), right.len());
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX-512F before entering the target-feature
+    //   helper.
+    // - Inputs are borrowed slices; the helper only performs unaligned loads
+    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
+    // - Callers already checked equal lengths before choosing this kernel.
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX-512F.
+    // - Inputs are borrowed slices; the target-feature helper only reads
+    //   inside `chunks_exact` bounds and writes to stack lane arrays.
+    // - Public wrapper checked equal lengths before dispatch.
+    Some(unsafe { dot_f32_avx512(left, right) })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn l2_distance_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Option<f32> {
+    if !std::arch::is_x86_feature_detected!("avx512f") {
+        return None;
+    }
+    debug_assert_eq!(left.len(), right.len());
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX-512F before entering the target-feature
+    //   helper.
+    // - Inputs are borrowed slices; the helper only performs unaligned loads
+    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
+    // - Callers already checked equal lengths before choosing this kernel.
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX-512F.
+    // - Inputs are borrowed slices; the target-feature helper only reads
+    //   inside `chunks_exact` bounds and writes to stack lane arrays.
+    // - Public wrapper checked equal lengths before dispatch.
+    Some(unsafe { l2_distance_f32_avx512(left, right) })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn cosine_distance_f32_avx512_if_available(left: &[f32], right: &[f32]) -> Option<Option<f32>> {
+    if !std::arch::is_x86_feature_detected!("avx512f") {
+        return None;
+    }
+    debug_assert_eq!(left.len(), right.len());
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX-512F before entering the target-feature
+    //   helper.
+    // - Inputs are borrowed slices; the helper only performs unaligned loads
+    //   inside `chunks_exact` bounds and writes to fixed-size stack lane arrays.
+    // - Callers already checked equal lengths before choosing this kernel.
+    // SAFETY:
+    // - Runtime CPUID confirmed AVX-512F.
+    // - Inputs are borrowed slices; the target-feature helper only reads
+    //   inside `chunks_exact` bounds and writes to stack lane arrays.
+    // - Public wrapper checked equal lengths before dispatch.
+    Some(unsafe { cosine_distance_f32_avx512(left, right) })
+}
+
+#[cfg(target_arch = "aarch64")]
+/// NEON target-feature kernel.
+///
+/// Call through `dot_f32_neon_checked` so CPU-feature policy and equal-length
+/// metric semantics stay centralized.
 #[target_feature(enable = "neon")]
-unsafe fn dot_f32_neon(left: &[f32], right: &[f32]) -> f32 {
+fn dot_f32_neon(left: &[f32], right: &[f32]) -> f32 {
     use std::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
 
     debug_assert_eq!(left.len(), right.len());
@@ -401,8 +561,12 @@ unsafe fn dot_f32_neon(left: &[f32], right: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "aarch64")]
+/// NEON target-feature kernel.
+///
+/// Call through `l2_distance_f32_neon_checked` so CPU-feature policy and
+/// equal-length metric semantics stay centralized.
 #[target_feature(enable = "neon")]
-unsafe fn l2_distance_f32_neon(left: &[f32], right: &[f32]) -> f32 {
+fn l2_distance_f32_neon(left: &[f32], right: &[f32]) -> f32 {
     use std::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32, vsubq_f32};
 
     debug_assert_eq!(left.len(), right.len());
@@ -432,8 +596,12 @@ unsafe fn l2_distance_f32_neon(left: &[f32], right: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "aarch64")]
+/// NEON target-feature kernel.
+///
+/// Call through `cosine_distance_f32_neon_checked` so CPU-feature policy and
+/// equal-length metric semantics stay centralized.
 #[target_feature(enable = "neon")]
-unsafe fn cosine_distance_f32_neon(left: &[f32], right: &[f32]) -> Option<f32> {
+fn cosine_distance_f32_neon(left: &[f32], right: &[f32]) -> Option<f32> {
     use std::arch::aarch64::{vld1q_f32, vmulq_f32, vst1q_f32};
 
     debug_assert_eq!(left.len(), right.len());
@@ -479,8 +647,12 @@ unsafe fn cosine_distance_f32_neon(left: &[f32], right: &[f32]) -> Option<f32> {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// AVX2 target-feature kernel.
+///
+/// Call through `dot_f32_avx2_if_available` so runtime CPUID policy and
+/// equal-length metric semantics stay centralized.
 #[target_feature(enable = "avx2")]
-unsafe fn dot_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
+fn dot_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
     use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps};
 
     debug_assert_eq!(left.len(), right.len());
@@ -509,8 +681,12 @@ unsafe fn dot_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// AVX2 target-feature kernel.
+///
+/// Call through `l2_distance_f32_avx2_if_available` so runtime CPUID policy
+/// and equal-length metric semantics stay centralized.
 #[target_feature(enable = "avx2")]
-unsafe fn l2_distance_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
+fn l2_distance_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
     use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps, _mm256_sub_ps};
 
     debug_assert_eq!(left.len(), right.len());
@@ -540,8 +716,12 @@ unsafe fn l2_distance_f32_avx2(left: &[f32], right: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// AVX2 target-feature kernel.
+///
+/// Call through `cosine_distance_f32_avx2_if_available` so runtime CPUID
+/// policy and equal-length metric semantics stay centralized.
 #[target_feature(enable = "avx2")]
-unsafe fn cosine_distance_f32_avx2(left: &[f32], right: &[f32]) -> Option<f32> {
+fn cosine_distance_f32_avx2(left: &[f32], right: &[f32]) -> Option<f32> {
     use std::arch::x86_64::{_mm256_loadu_ps, _mm256_mul_ps, _mm256_storeu_ps};
 
     debug_assert_eq!(left.len(), right.len());
@@ -590,9 +770,13 @@ unsafe fn cosine_distance_f32_avx2(left: &[f32], right: &[f32]) -> Option<f32> {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// AVX-512F target-feature kernel.
+///
+/// Call through `dot_f32_avx512_if_available` so runtime CPUID policy and
+/// equal-length metric semantics stay centralized.
 #[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
 #[target_feature(enable = "avx512f")]
-unsafe fn dot_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
+fn dot_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
     use std::arch::x86_64::{_mm512_loadu_ps, _mm512_mul_ps, _mm512_storeu_ps};
 
     debug_assert_eq!(left.len(), right.len());
@@ -622,9 +806,13 @@ unsafe fn dot_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// AVX-512F target-feature kernel.
+///
+/// Call through `l2_distance_f32_avx512_if_available` so runtime CPUID policy
+/// and equal-length metric semantics stay centralized.
 #[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
 #[target_feature(enable = "avx512f")]
-unsafe fn l2_distance_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
+fn l2_distance_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
     use std::arch::x86_64::{_mm512_loadu_ps, _mm512_mul_ps, _mm512_storeu_ps, _mm512_sub_ps};
 
     debug_assert_eq!(left.len(), right.len());
@@ -655,9 +843,13 @@ unsafe fn l2_distance_f32_avx512(left: &[f32], right: &[f32]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+/// AVX-512F target-feature kernel.
+///
+/// Call through `cosine_distance_f32_avx512_if_available` so runtime CPUID
+/// policy and equal-length metric semantics stay centralized.
 #[allow(clippy::incompatible_msrv)] // AVX-512 intrinsics are runtime-gated and x86_64-only.
 #[target_feature(enable = "avx512f")]
-unsafe fn cosine_distance_f32_avx512(left: &[f32], right: &[f32]) -> Option<f32> {
+fn cosine_distance_f32_avx512(left: &[f32], right: &[f32]) -> Option<f32> {
     use std::arch::x86_64::{_mm512_loadu_ps, _mm512_mul_ps, _mm512_storeu_ps};
 
     debug_assert_eq!(left.len(), right.len());
@@ -824,24 +1016,18 @@ mod tests {
         for len in 0..=35 {
             let (left, right) = vectors_for_tail_len(len);
 
-            // SAFETY: aarch64 has baseline NEON, and helper preconditions are
-            // satisfied by same-length vectors generated above.
             assert_eq!(
-                unsafe { dot_f32_neon(&left, &right) }.to_bits(),
+                dot_f32_neon_checked(&left, &right).to_bits(),
                 dot_f32_scalar(&left, &right).to_bits(),
                 "dot len={len}"
             );
-            // SAFETY: aarch64 has baseline NEON, and helper preconditions are
-            // satisfied by same-length vectors generated above.
             assert_eq!(
-                unsafe { l2_distance_f32_neon(&left, &right) }.to_bits(),
+                l2_distance_f32_neon_checked(&left, &right).to_bits(),
                 l2_distance_f32_scalar(&left, &right).to_bits(),
                 "l2 len={len}"
             );
             match (
-                // SAFETY: aarch64 has baseline NEON, and helper preconditions
-                // are satisfied by same-length vectors generated above.
-                unsafe { cosine_distance_f32_neon(&left, &right) },
+                cosine_distance_f32_neon_checked(&left, &right),
                 cosine_distance_f32_scalar(&left, &right),
             ) {
                 (Some(got), Some(want)) => {
@@ -863,24 +1049,22 @@ mod tests {
         for len in 0..=35 {
             let (left, right) = vectors_for_tail_len(len);
 
-            // SAFETY: CPUID confirmed AVX2, and helper preconditions are
-            // satisfied by same-length vectors generated above.
             assert_eq!(
-                unsafe { dot_f32_avx2(&left, &right) }.to_bits(),
+                dot_f32_avx2_if_available(&left, &right)
+                    .expect("AVX2 checked above")
+                    .to_bits(),
                 dot_f32_scalar(&left, &right).to_bits(),
                 "dot len={len}"
             );
-            // SAFETY: CPUID confirmed AVX2, and helper preconditions are
-            // satisfied by same-length vectors generated above.
             assert_eq!(
-                unsafe { l2_distance_f32_avx2(&left, &right) }.to_bits(),
+                l2_distance_f32_avx2_if_available(&left, &right)
+                    .expect("AVX2 checked above")
+                    .to_bits(),
                 l2_distance_f32_scalar(&left, &right).to_bits(),
                 "l2 len={len}"
             );
             match (
-                // SAFETY: CPUID confirmed AVX2, and helper preconditions are
-                // satisfied by same-length vectors generated above.
-                unsafe { cosine_distance_f32_avx2(&left, &right) },
+                cosine_distance_f32_avx2_if_available(&left, &right).expect("AVX2 checked above"),
                 cosine_distance_f32_scalar(&left, &right),
             ) {
                 (Some(got), Some(want)) => {
@@ -902,24 +1086,23 @@ mod tests {
         for len in 0..=67 {
             let (left, right) = vectors_for_tail_len(len);
 
-            // SAFETY: CPUID confirmed AVX-512F, and helper preconditions are
-            // satisfied by same-length vectors generated above.
             assert_eq!(
-                unsafe { dot_f32_avx512(&left, &right) }.to_bits(),
+                dot_f32_avx512_if_available(&left, &right)
+                    .expect("AVX-512F checked above")
+                    .to_bits(),
                 dot_f32_scalar(&left, &right).to_bits(),
                 "dot len={len}"
             );
-            // SAFETY: CPUID confirmed AVX-512F, and helper preconditions are
-            // satisfied by same-length vectors generated above.
             assert_eq!(
-                unsafe { l2_distance_f32_avx512(&left, &right) }.to_bits(),
+                l2_distance_f32_avx512_if_available(&left, &right)
+                    .expect("AVX-512F checked above")
+                    .to_bits(),
                 l2_distance_f32_scalar(&left, &right).to_bits(),
                 "l2 len={len}"
             );
             match (
-                // SAFETY: CPUID confirmed AVX-512F, and helper preconditions
-                // are satisfied by same-length vectors generated above.
-                unsafe { cosine_distance_f32_avx512(&left, &right) },
+                cosine_distance_f32_avx512_if_available(&left, &right)
+                    .expect("AVX-512F checked above"),
                 cosine_distance_f32_scalar(&left, &right),
             ) {
                 (Some(got), Some(want)) => {
