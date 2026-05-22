@@ -1,5 +1,6 @@
 //! WAL recovery target tests.
 
+use std::fs;
 use std::sync::Arc;
 
 use ultrasql_core::{BlockNumber, Lsn, PageId, RelationId, Xid};
@@ -9,7 +10,9 @@ use ultrasql_storage::page::Page;
 use ultrasql_wal::payload::{SequenceOpKind, SequenceOpPayload};
 use ultrasql_wal::{HeapTarget, RecordType, WalRecord};
 
-use super::super::{BlankPageLoader, Server, ServerRecoveryTarget};
+use super::super::{
+    BlankPageLoader, Server, ServerRecoveryTarget, recovery_replay_target_from_data_dir,
+};
 
 fn recovery_target() -> ServerRecoveryTarget {
     let pool = Arc::new(BufferPool::new(16, BlankPageLoader::new()));
@@ -111,4 +114,73 @@ fn server_init_reopens_base_heap_pages_from_data_dir() {
     let server = Server::init(data_dir.path()).unwrap();
     let page = server.page_loader.load(page_id).unwrap();
     assert_eq!(page.header().lsn, 777);
+}
+
+#[test]
+fn recovery_target_lsn_file_parses_postgres_lsn() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    fs::write(
+        data_dir.path().join("recovery.targets"),
+        "recovery_target_lsn = '0/0000002A'\n",
+    )
+    .unwrap();
+
+    let target = recovery_replay_target_from_data_dir(data_dir.path()).unwrap();
+
+    assert_eq!(target.target_lsn, Some(Lsn::new(42)));
+}
+
+#[test]
+fn recovery_target_time_is_rejected_until_transaction_aware_replay_exists() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    fs::write(
+        data_dir.path().join("recovery.targets"),
+        "recovery_target_time = '2026-05-22 00:00:00Z'\n",
+    )
+    .unwrap();
+
+    let err = recovery_replay_target_from_data_dir(data_dir.path()).unwrap_err();
+
+    assert!(
+        err.to_string()
+            .contains("recovery_target_time/recovery_target_xid")
+    );
+}
+
+#[test]
+fn server_init_honors_recovery_target_lsn_before_installing_wal_writer() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let wal_dir = data_dir.path().join("pg_wal");
+    fs::create_dir_all(&wal_dir).unwrap();
+
+    let first = WalRecord::new(RecordType::Nop, Xid::new(10), Lsn::ZERO, 0, Vec::new());
+    let first_bytes = first.encode();
+    let second = WalRecord::new(RecordType::Nop, Xid::new(11), Lsn::ZERO, 0, Vec::new());
+    let target = Lsn::new(u64::try_from(first_bytes.len()).unwrap());
+    let mut segment = first_bytes;
+    segment.extend_from_slice(&second.encode());
+    fs::write(wal_dir.join("segment_0000000000"), segment).unwrap();
+    fs::write(
+        data_dir.path().join("recovery.targets"),
+        format!("recovery_target_lsn = '{}'\n", target.raw()),
+    )
+    .unwrap();
+
+    let server = Server::init(data_dir.path()).unwrap();
+    let sink = server
+        .heap
+        .buffer_pool()
+        .wal_sink()
+        .expect("recovered persistent server must install WAL sink");
+    let appended = sink
+        .append(WalRecord::new(
+            RecordType::Nop,
+            Xid::new(12),
+            Lsn::ZERO,
+            0,
+            Vec::new(),
+        ))
+        .unwrap();
+
+    assert_eq!(appended, target);
 }

@@ -25,6 +25,29 @@ use ultrasql_core::Lsn;
 use crate::record::{WalRecord, WalRecordError};
 use crate::segment::list_segments;
 
+/// Optional point-in-time recovery target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryTarget {
+    /// Stop before applying records whose end LSN is greater than this value.
+    pub target_lsn: Option<Lsn>,
+}
+
+impl RecoveryTarget {
+    /// Recover every valid WAL record.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self { target_lsn: None }
+    }
+
+    /// Recover only records whose end LSN is less than or equal to `target`.
+    #[must_use]
+    pub const fn up_to_lsn(target: Lsn) -> Self {
+        Self {
+            target_lsn: Some(target),
+        }
+    }
+}
+
 /// Errors that can arise during crash recovery.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryError {
@@ -61,6 +84,18 @@ pub fn recover(
     wal_dir: impl AsRef<Path>,
     mut apply: impl FnMut(&WalRecord) -> Result<(), RecoveryError>,
 ) -> Result<Lsn, RecoveryError> {
+    recover_with_target(wal_dir, RecoveryTarget::none(), |record| apply(record))
+}
+
+/// Replay records in `wal_dir` up to an optional recovery target.
+///
+/// The LSN target is a physical prefix target: records ending after the target
+/// are not applied, and the returned LSN is the end of the last applied record.
+pub fn recover_with_target(
+    wal_dir: impl AsRef<Path>,
+    target: RecoveryTarget,
+    mut apply: impl FnMut(&WalRecord) -> Result<(), RecoveryError>,
+) -> Result<Lsn, RecoveryError> {
     let dir = wal_dir.as_ref();
     let segments = list_segments(dir)?;
     if segments.is_empty() {
@@ -87,12 +122,24 @@ pub fn recover(
         while offset < buf.len() {
             match WalRecord::decode(&buf[offset..]) {
                 Ok((record, used)) => {
+                    let used_u64 = u64::try_from(used).unwrap_or(u64::MAX);
+                    let record_end = stream_pos.saturating_add(used_u64);
+                    if let Some(target_lsn) = target.target_lsn
+                        && record_end > target_lsn.raw()
+                    {
+                        info!(
+                            target_lsn = target_lsn.raw(),
+                            last_lsn = last_good_pos,
+                            "wal recovery: reached target lsn"
+                        );
+                        return Ok(Lsn::new(last_good_pos));
+                    }
                     apply(&record).map_err(|e| match e {
                         RecoveryError::Applier(s) => RecoveryError::Applier(s),
                         other => RecoveryError::Applier(other.to_string()),
                     })?;
                     offset += used;
-                    stream_pos = stream_pos.saturating_add(used as u64);
+                    stream_pos = record_end;
                     last_good_pos = stream_pos;
                     record_count = record_count.saturating_add(1);
                 }
@@ -128,6 +175,9 @@ pub fn recover(
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;
+    use ultrasql_core::Xid;
+
+    use crate::{RecordType, WalRecord};
 
     use super::*;
 
@@ -144,5 +194,28 @@ mod tests {
         let missing = dir.path().join("does-not-exist");
         let lsn = recover(&missing, |_| Ok(())).unwrap();
         assert_eq!(lsn, Lsn::ZERO);
+    }
+
+    #[test]
+    fn recover_with_lsn_target_stops_before_later_records() {
+        let dir = TempDir::new().unwrap();
+        let first = WalRecord::new(RecordType::Nop, Xid::new(10), Lsn::ZERO, 0, Vec::new());
+        let first_bytes = first.encode();
+        let second = WalRecord::new(RecordType::Nop, Xid::new(11), Lsn::ZERO, 0, Vec::new());
+        let target = Lsn::new(u64::try_from(first_bytes.len()).unwrap());
+        let mut segment = first_bytes;
+        segment.extend_from_slice(&second.encode());
+        std::fs::write(dir.path().join("segment_0000000000"), segment).unwrap();
+
+        let mut seen = Vec::new();
+        let recovered =
+            recover_with_target(dir.path(), RecoveryTarget::up_to_lsn(target), |record| {
+                seen.push(record.header.xid.raw());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(seen, vec![10]);
+        assert_eq!(recovered, target);
     }
 }

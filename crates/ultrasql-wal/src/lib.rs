@@ -21,7 +21,7 @@ pub mod recovery;
 pub(crate) mod segment;
 pub mod writer;
 
-pub use applier::{ApplyError, HeapTarget, dispatch_record, replay_into};
+pub use applier::{ApplyError, HeapTarget, dispatch_record, dispatch_record_at_lsn, replay_into};
 pub use buffer::{WalBuffer, WalBufferError};
 pub use payload::{
     AbortPayload, BTreeOpKind, BTreeOpPayload, CheckpointPayload, CommitPayload,
@@ -30,5 +30,5 @@ pub use payload::{
     IvfFlatOpKind, IvfFlatOpPayload, PayloadError, SequenceOpKind, SequenceOpPayload,
 };
 pub use record::{RECORD_HEADER_SIZE, RecordType, WalRecord, WalRecordError, WalRecordHeader};
-pub use recovery::{RecoveryError, recover};
+pub use recovery::{RecoveryError, RecoveryTarget, recover, recover_with_target};
 pub use writer::{WalWriter, WalWriterConfig, WalWriterError, WalWriterStats};

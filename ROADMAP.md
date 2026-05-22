@@ -1659,7 +1659,8 @@ behavior are implemented and validated.
   helpers via `ultrasql --ctl recovery|standby`; server startup detects
   either file and enters hot-standby read-only mode before accepting
   sessions while normal WAL replay runs through `Server::init`.
-- [ ] `recovery_target_time`, `recovery_target_lsn`, `recovery_target_xid` — CLI writes `recovery.targets`; WAL replay targeting pending
+- [x] `recovery_target_lsn` — server startup reads `recovery.targets` and replays only WAL records ending at or before the physical target LSN
+- [ ] `recovery_target_time`, `recovery_target_xid` — pending transaction-aware PITR replay; startup rejects these targets instead of silently performing wrong recovery
 - [x] `pg_start_backup()` / `pg_stop_backup()` for online backup — SQL
   compatibility functions write `backup_label` / `backup_stop` marker files
   in WAL-backed data directories and return a stable LSN-shaped value;

@@ -2566,6 +2566,59 @@ fn pages_to_bytes_saturated(pages: usize) -> u64 {
     usize_to_u64_saturated(pages).saturating_mul(usize_to_u64_saturated(PAGE_SIZE))
 }
 
+fn recovery_replay_target_from_data_dir(
+    data_dir: &Path,
+) -> Result<ultrasql_wal::RecoveryTarget, ServerError> {
+    let path = data_dir.join("recovery.targets");
+    if !path.exists() {
+        return Ok(ultrasql_wal::RecoveryTarget::none());
+    }
+    let text = std::fs::read_to_string(&path).map_err(ServerError::Io)?;
+    let mut target_lsn = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim().trim_matches('\'').trim_matches('"');
+        if key.eq_ignore_ascii_case("recovery_target_lsn") {
+            target_lsn = Some(parse_recovery_lsn(value)?);
+        } else if key.eq_ignore_ascii_case("recovery_target_time")
+            || key.eq_ignore_ascii_case("recovery_target_xid")
+        {
+            return Err(ServerError::Unsupported(
+                "recovery_target_time/recovery_target_xid require transaction-aware PITR replay",
+            ));
+        }
+    }
+    Ok(target_lsn.map_or_else(
+        ultrasql_wal::RecoveryTarget::none,
+        ultrasql_wal::RecoveryTarget::up_to_lsn,
+    ))
+}
+
+fn parse_recovery_lsn(value: &str) -> Result<Lsn, ServerError> {
+    let value = value.trim();
+    if let Some((high, low)) = value.split_once('/') {
+        let high = u64::from_str_radix(high, 16)
+            .map_err(|_| ServerError::ddl("invalid recovery_target_lsn high half"))?;
+        let low = u64::from_str_radix(low, 16)
+            .map_err(|_| ServerError::ddl("invalid recovery_target_lsn low half"))?;
+        if high > u64::from(u32::MAX) || low > u64::from(u32::MAX) {
+            return Err(ServerError::ddl("recovery_target_lsn half out of range"));
+        }
+        return Ok(Lsn::new((high << 32) | low));
+    }
+    value
+        .parse::<u64>()
+        .map(Lsn::new)
+        .map_err(|_| ServerError::ddl("invalid recovery_target_lsn"))
+}
+
 fn validation_check(name: &'static str, errors: Vec<String>, ok_detail: String) -> ValidationCheck {
     if errors.is_empty() {
         ValidationCheck {
@@ -3114,11 +3167,19 @@ impl Server {
         // 4. Replay existing WAL before accepting new appends. The recovery
         // target restores heap/index pages through `HeapAccess` and sequence
         // state through the shared registry.
-        let recovery_target = ServerRecoveryTarget {
+        let recovery_apply_target = ServerRecoveryTarget {
             heap: Arc::clone(&heap),
             sequences: Arc::clone(&sequences),
         };
-        let recovered_lsn = ultrasql_wal::replay_into(&wal_dir, &recovery_target)
+        let recovery_replay_target = recovery_replay_target_from_data_dir(data_dir)?;
+        let mut record_lsn = Lsn::ZERO;
+        let recovered_lsn =
+            ultrasql_wal::recover_with_target(&wal_dir, recovery_replay_target, |record| {
+                let current_lsn = record_lsn;
+                record_lsn = record_lsn.advance(u64::from(record.header.total_length));
+                ultrasql_wal::dispatch_record_at_lsn(&recovery_apply_target, record, current_lsn)
+                    .map_err(|e| ultrasql_wal::RecoveryError::Applier(e.to_string()))
+            })
             .map_err(|e| ServerError::Ddl(format!("WAL recovery: {e}")))?;
         wal_buffer.advance_to_lsn(recovered_lsn);
         tracing::info!(lsn = recovered_lsn.raw(), "WAL recovery complete");
