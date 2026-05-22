@@ -19,6 +19,24 @@ The GitHub `ci` workflow runs format, clippy, tests, docs, and cargo-deny.
 The `bench` workflow runs the PR-safe smoke certification profile for benchmark
 touches.
 
+## Release artifact gate
+
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`. The workflow:
+
+- checks that the tag version matches every local workspace crate version,
+- runs format, clippy, and full workspace tests before packaging,
+- builds `ultrasqld`, `ultrasql`, and `ultrasql-local` with
+  `--profile release-ship --locked`,
+- runs binary smoke checks (`--version` / `--help`) before packaging,
+- publishes Linux x86_64, Linux ARM64, macOS Intel, macOS Apple Silicon, and
+  Windows x86_64 archives,
+- uploads per-asset `.sha256` files plus `SHASUMS256.txt`,
+- marks `v0.*` releases as pre-releases.
+
+Install instructions live in `docs/install.md`. The release workflow provides
+distribution plumbing only; it does not override any open correctness,
+benchmark, security, or operator-soak gate in this checklist.
+
 ## Nightly/manual gate
 
 Run on schedule or by `workflow_dispatch`:
@@ -44,6 +62,7 @@ not in the PR-critical path.
 | 72 Security/ethics audit | repository rules and benchmark runners | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; provenance gate | `docs/security-ethics-audit.md` | audit command output in release notes |
 | 73 CI split | `.github/workflows/ci.yml`, `bench.yml`, `fuzz.yml`, `sanitizers.yml` | `crates/ultrasql-bench/tests/release_hardening.rs` | PR smoke vs nightly/manual full gates | this file | GitHub Actions run ids |
 | 74 Release checklist | this file | `crates/ultrasql-bench/tests/release_hardening.rs` | no benchmark; release evidence index | `docs/release-checklist.md` | completed release issue or tag notes |
+| 75 Binary installers | `.github/workflows/release.yml`, `scripts/install.sh`, `scripts/install.ps1` | release workflow binary smoke checks | no benchmark; distribution integrity gate | `docs/install.md` | release archives + `.sha256` files |
 
 ## Sign-off rule
 

@@ -1,33 +1,104 @@
 name: release
 
-# Builds release artifacts for tagged versions and uploads them as
-# GitHub Release assets. Triggered by tags of the form `vX.Y.Z`.
+# Builds signed-by-checksum release artifacts for tagged versions.
+# Tags must be `vX.Y.Z` and must match the workspace crate version.
 
 on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to build, for example v1.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  RUSTFLAGS: "-D warnings"
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
+  verify:
+    name: release gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: verify tag matches workspace version
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          tag = os.environ["RELEASE_TAG"]
+          if not tag.startswith("v"):
+              print(f"release tag must start with v: {tag}", file=sys.stderr)
+              sys.exit(1)
+          version = tag[1:]
+          metadata = json.loads(
+              subprocess.check_output(
+                  ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                  text=True,
+              )
+          )
+          local_versions = {
+              package["version"]
+              for package in metadata["packages"]
+              if package.get("source") is None
+          }
+          if local_versions != {version}:
+              print(
+                  "release tag/version mismatch: "
+                  f"tag={tag}, local crate versions={sorted(local_versions)}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+          PY
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features -- --nocapture
+
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+            archive: tar
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+            archive: tar
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive: tar
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
+            archive: tar
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -35,36 +106,89 @@ jobs:
       - name: build release binaries
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --target "$TARGET" --bin ultrasqld --bin ultrasql
-      - name: stage artifacts
-        env:
-          TAG: ${{ github.ref_name }}
-          TARGET: ${{ matrix.target }}
+        shell: bash
+        if: matrix.archive == 'tar'
         run: |
-          mkdir -p dist
-          cp "target/${TARGET}/release/ultrasqld" dist/
-          cp "target/${TARGET}/release/ultrasql"  dist/
-          (cd dist && tar -czf "ultrasql-${TAG}-${TARGET}.tar.gz" ultrasqld ultrasql)
+          cargo build --locked --profile release-ship --target "$TARGET" \
+            --bin ultrasqld \
+            --bin ultrasql \
+            --bin ultrasql-local
+          "target/${TARGET}/release-ship/ultrasqld" --version
+          "target/${TARGET}/release-ship/ultrasql" --version
+          "target/${TARGET}/release-ship/ultrasql-local" --help >/dev/null
+      - name: build release binaries
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        if: matrix.archive == 'zip'
+        run: |
+          cargo build --locked --profile release-ship --target $env:TARGET `
+            --bin ultrasqld `
+            --bin ultrasql `
+            --bin ultrasql-local
+          & "target/$env:TARGET/release-ship/ultrasqld.exe" --version
+          & "target/$env:TARGET/release-ship/ultrasql.exe" --version
+          & "target/$env:TARGET/release-ship/ultrasql-local.exe" --help | Out-Null
+      - name: package tarball
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        if: matrix.archive == 'tar'
+        run: |
+          name="ultrasql-${RELEASE_TAG}-${TARGET}"
+          mkdir -p "dist/${name}"
+          cp "target/${TARGET}/release-ship/ultrasqld" "dist/${name}/"
+          cp "target/${TARGET}/release-ship/ultrasql" "dist/${name}/"
+          cp "target/${TARGET}/release-ship/ultrasql-local" "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+      - name: package zip
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: pwsh
+        if: matrix.archive == 'zip'
+        run: |
+          $name = "ultrasql-$env:RELEASE_TAG-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/$env:TARGET/release-ship/ultrasqld.exe" "dist/$name/"
+          Copy-Item "target/$env:TARGET/release-ship/ultrasql.exe" "dist/$name/"
+          Copy-Item "target/$env:TARGET/release-ship/ultrasql-local.exe" "dist/$name/"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip" -Force
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$name.zip").Hash.ToLowerInvariant()
+          "$hash  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: ultrasql-${{ github.ref_name }}-${{ matrix.target }}
-          path: dist/ultrasql-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          name: ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}
+          path: |
+            dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz
+            dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.tar.gz.sha256
+            dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip
+            dist/ultrasql-${{ env.RELEASE_TAG }}-${{ matrix.target }}.zip.sha256
+          if-no-files-found: ignore
 
-  release:
+  publish:
     name: publish release
     runs-on: ubuntu-latest
     needs: build
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
+      - name: flatten assets and generate checksum manifest
+        shell: bash
+        run: |
+          mkdir -p release
+          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) \
+            -exec cp {} release/ \;
+          (cd release && shasum -a 256 *.tar.gz *.zip > SHASUMS256.txt)
+          ls -la release
       - name: publish github release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          files: dist/**/*.tar.gz
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: release/*
           generate_release_notes: true
           fail_on_unmatched_files: true
+          prerelease: ${{ startsWith(env.RELEASE_TAG, 'v0.') }}

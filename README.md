@@ -214,11 +214,28 @@ They are useful for regression tracking, but not for README comparison claims.
 
 ## Quick start
 
+Install the latest release archive:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.sh | sh
+```
+
+Windows PowerShell:
+
+```powershell
+iwr https://raw.githubusercontent.com/mauneven/ultrasql/main/scripts/install.ps1 -UseB | iex
+```
+
+See [docs/install.md](docs/install.md) for platform targets, checksum
+verification, and manual install steps.
+
+Build from source:
+
 ```bash
 git clone https://github.com/mauneven/ultrasql.git
 cd ultrasql
 git config core.hooksPath .githooks
-cargo build --release
+cargo build --locked --profile release-ship --bin ultrasqld --bin ultrasql --bin ultrasql-local
 cargo test --workspace
 cargo run --release --bin ultrasqld
 ```
@@ -238,6 +255,8 @@ fuzz/         fuzz targets and corpora
 ## Important docs
 
 - [ROADMAP.md](ROADMAP.md) — release plan and open gaps.
+- [docs/install.md](docs/install.md) — binary install and source build.
+- [docs/release-checklist.md](docs/release-checklist.md) — release gate.
 - [BENCHMARKS.md](BENCHMARKS.md) — benchmark methodology and artifact policy.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — subsystem design.
 - [PERFORMANCE.md](PERFORMANCE.md) — performance engineering rules.
