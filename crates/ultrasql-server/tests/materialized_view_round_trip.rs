@@ -3,20 +3,26 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
+use tokio::sync::oneshot;
 use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener};
+use ultrasql_server::{Server, bind_listener, serve_listener_with_shutdown};
 
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
+struct RunningServer {
+    client: tokio_postgres::Client,
+    conn_handle: tokio::task::JoinHandle<()>,
+    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+    shutdown_tx: oneshot::Sender<()>,
+}
+
+async fn start_server_and_connect() -> RunningServer {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
     let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_handle = tokio::spawn(serve_listener_with_shutdown(listener, server, async move {
+        let _ = shutdown_rx.await;
+    }));
     let conn_str = format!(
         "host={host} port={port} user=tester application_name=materialized_view_test",
         host = bound.ip(),
@@ -30,20 +36,22 @@ async fn start_server_and_connect() -> (
             eprintln!("connection error: {e}");
         }
     });
-    (client, conn_handle, server_handle)
+    RunningServer {
+        client,
+        conn_handle,
+        server_handle,
+        shutdown_tx,
+    }
 }
 
-async fn start_persistent_server_and_connect(
-    data_dir: &Path,
-) -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
+async fn start_persistent_server_and_connect(data_dir: &Path) -> RunningServer {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
     let server = Arc::new(Server::init(data_dir).expect("persistent server init"));
-    let server_handle = tokio::spawn(serve_listener(listener, server));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_handle = tokio::spawn(serve_listener_with_shutdown(listener, server, async move {
+        let _ = shutdown_rx.await;
+    }));
     let conn_str = format!(
         "host={host} port={port} user=tester application_name=materialized_view_restart_test",
         host = bound.ip(),
@@ -57,22 +65,29 @@ async fn start_persistent_server_and_connect(
             eprintln!("connection error: {e}");
         }
     });
-    (client, conn_handle, server_handle)
+    RunningServer {
+        client,
+        conn_handle,
+        server_handle,
+        shutdown_tx,
+    }
 }
 
-async fn shutdown(
-    client: tokio_postgres::Client,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
-    let _ = server_handle.await;
+async fn shutdown(running: RunningServer) {
+    drop(running.client);
+    running.conn_handle.await.expect("connection task joins");
+    let _ = running.shutdown_tx.send(());
+    running
+        .server_handle
+        .await
+        .expect("server task joins")
+        .expect("listener exits cleanly");
 }
 
 #[tokio::test]
 async fn materialized_view_snapshots_then_appends_from_source_inserts() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_server_and_connect().await;
+    let client = &running.client;
 
     client
         .batch_execute("CREATE TABLE mv_src (id INT NOT NULL, amount INT NOT NULL)")
@@ -141,77 +156,87 @@ async fn materialized_view_snapshots_then_appends_from_source_inserts() {
         db_err.message()
     );
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn appended_materialized_view_rows_survive_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
-    client
+    let running = start_persistent_server_and_connect(data_dir.path()).await;
+    running
+        .client
         .batch_execute("CREATE TABLE mv_restart_src (id INT NOT NULL, amount INT NOT NULL)")
         .await
         .expect("create source");
-    client
+    running
+        .client
         .batch_execute("INSERT INTO mv_restart_src VALUES (1, 10), (2, 20)")
         .await
         .expect("seed source");
-    client
+    running
+        .client
         .batch_execute(
             "CREATE MATERIALIZED VIEW mv_restart_copy AS SELECT id, amount FROM mv_restart_src",
         )
         .await
         .expect("create materialized view");
-    client
+    running
+        .client
         .batch_execute("INSERT INTO mv_restart_src VALUES (3, 30)")
         .await
         .expect("append source");
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
-    let rows = client
+    let running = start_persistent_server_and_connect(data_dir.path()).await;
+    let rows = running
+        .client
         .query("SELECT id, amount FROM mv_restart_copy ORDER BY id", &[])
         .await
         .expect("select materialized view after restart");
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[2].get::<_, i32>(0), 3);
     assert_eq!(rows[2].get::<_, i32>(1), 30);
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn materialized_view_keeps_maintaining_source_after_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
-    client
+    let running = start_persistent_server_and_connect(data_dir.path()).await;
+    running
+        .client
         .batch_execute("CREATE TABLE mv_runtime_src (id INT NOT NULL, amount INT NOT NULL)")
         .await
         .expect("create source");
-    client
+    running
+        .client
         .batch_execute("INSERT INTO mv_runtime_src VALUES (1, 10), (2, 20)")
         .await
         .expect("seed source");
-    client
+    running
+        .client
         .batch_execute(
             "CREATE MATERIALIZED VIEW mv_runtime_copy AS SELECT id, amount FROM mv_runtime_src",
         )
         .await
         .expect("create materialized view");
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
-    client
+    let running = start_persistent_server_and_connect(data_dir.path()).await;
+    running
+        .client
         .batch_execute("INSERT INTO mv_runtime_src VALUES (3, 30)")
         .await
         .expect("append after restart");
-    let rows = client
+    let rows = running
+        .client
         .query("SELECT id, amount FROM mv_runtime_copy ORDER BY id", &[])
         .await
         .expect("select materialized view after restarted append");
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[2].get::<_, i32>(0), 3);
     assert_eq!(rows[2].get::<_, i32>(1), 30);
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
