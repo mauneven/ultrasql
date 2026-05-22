@@ -131,20 +131,31 @@ fn recovery_target_lsn_file_parses_postgres_lsn() {
 }
 
 #[test]
-fn recovery_target_time_is_rejected_until_transaction_aware_replay_exists() {
+fn recovery_target_time_file_parses_rfc3339_timestamp() {
     let data_dir = tempfile::TempDir::new().unwrap();
     fs::write(
         data_dir.path().join("recovery.targets"),
-        "recovery_target_time = '2026-05-22 00:00:00Z'\n",
+        "recovery_target_time = '1970-01-01T00:00:01Z'\n",
     )
     .unwrap();
 
-    let err = recovery_replay_target_from_data_dir(data_dir.path()).unwrap_err();
+    let target = recovery_replay_target_from_data_dir(data_dir.path()).unwrap();
 
-    assert!(
-        err.to_string()
-            .contains("recovery_target_time/recovery_target_xid")
-    );
+    assert_eq!(target.target_time_micros, Some(1_000_000));
+}
+
+#[test]
+fn recovery_target_xid_file_parses_decimal_xid() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    fs::write(
+        data_dir.path().join("recovery.targets"),
+        "recovery_target_xid = '42'\n",
+    )
+    .unwrap();
+
+    let target = recovery_replay_target_from_data_dir(data_dir.path()).unwrap();
+
+    assert_eq!(target.target_xid, Some(Xid::new(42)));
 }
 
 #[test]

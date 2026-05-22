@@ -20,8 +20,10 @@ use std::io::Read;
 use std::path::Path;
 
 use tracing::{debug, info, warn};
-use ultrasql_core::Lsn;
+use ultrasql_core::{Lsn, Xid};
 
+use crate::RecordType;
+use crate::payload::CommitPayload;
 use crate::record::{WalRecord, WalRecordError};
 use crate::segment::list_segments;
 
@@ -30,13 +32,21 @@ use crate::segment::list_segments;
 pub struct RecoveryTarget {
     /// Stop before applying records whose end LSN is greater than this value.
     pub target_lsn: Option<Lsn>,
+    /// Stop after applying the commit record for this transaction ID.
+    pub target_xid: Option<Xid>,
+    /// Stop before applying the first commit newer than this Unix timestamp.
+    pub target_time_micros: Option<u64>,
 }
 
 impl RecoveryTarget {
     /// Recover every valid WAL record.
     #[must_use]
     pub const fn none() -> Self {
-        Self { target_lsn: None }
+        Self {
+            target_lsn: None,
+            target_xid: None,
+            target_time_micros: None,
+        }
     }
 
     /// Recover only records whose end LSN is less than or equal to `target`.
@@ -44,8 +54,60 @@ impl RecoveryTarget {
     pub const fn up_to_lsn(target: Lsn) -> Self {
         Self {
             target_lsn: Some(target),
+            target_xid: None,
+            target_time_micros: None,
         }
     }
+
+    /// Recover through the commit record for `target`.
+    #[must_use]
+    pub const fn up_to_xid(target: Xid) -> Self {
+        Self {
+            target_lsn: None,
+            target_xid: Some(target),
+            target_time_micros: None,
+        }
+    }
+
+    /// Recover commits whose timestamps are less than or equal to `target`.
+    #[must_use]
+    pub const fn up_to_time_micros(target: u64) -> Self {
+        Self {
+            target_lsn: None,
+            target_xid: None,
+            target_time_micros: Some(target),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayDecision {
+    Continue,
+    StopBeforeRecord,
+    StopAfterRecord,
+}
+
+fn replay_decision(
+    record: &WalRecord,
+    target: RecoveryTarget,
+) -> Result<ReplayDecision, RecoveryError> {
+    if record.header.record_type != RecordType::Commit {
+        return Ok(ReplayDecision::Continue);
+    }
+
+    if let Some(target_time_micros) = target.target_time_micros {
+        let payload = CommitPayload::decode(&record.payload)
+            .map_err(|err| RecoveryError::Applier(format!("commit payload decode: {err}")))?;
+        if payload.commit_timestamp_micros > target_time_micros {
+            return Ok(ReplayDecision::StopBeforeRecord);
+        }
+    }
+
+    if target.target_xid == Some(record.header.xid) {
+        return Ok(ReplayDecision::StopAfterRecord);
+    }
+
+    Ok(ReplayDecision::Continue)
 }
 
 /// Errors that can arise during crash recovery.
@@ -134,6 +196,15 @@ pub fn recover_with_target(
                         );
                         return Ok(Lsn::new(last_good_pos));
                     }
+                    let decision = replay_decision(&record, target)?;
+                    if decision == ReplayDecision::StopBeforeRecord {
+                        info!(
+                            last_lsn = last_good_pos,
+                            xid = record.header.xid.raw(),
+                            "wal recovery: reached target time"
+                        );
+                        return Ok(Lsn::new(last_good_pos));
+                    }
                     apply(&record).map_err(|e| match e {
                         RecoveryError::Applier(s) => RecoveryError::Applier(s),
                         other => RecoveryError::Applier(other.to_string()),
@@ -142,6 +213,14 @@ pub fn recover_with_target(
                     stream_pos = record_end;
                     last_good_pos = stream_pos;
                     record_count = record_count.saturating_add(1);
+                    if decision == ReplayDecision::StopAfterRecord {
+                        info!(
+                            last_lsn = last_good_pos,
+                            xid = record.header.xid.raw(),
+                            "wal recovery: reached target xid"
+                        );
+                        return Ok(Lsn::new(last_good_pos));
+                    }
                 }
                 Err(WalRecordError::Truncated { needed, have }) => {
                     warn!(
@@ -177,6 +256,7 @@ mod tests {
     use tempfile::TempDir;
     use ultrasql_core::Xid;
 
+    use crate::payload::CommitPayload;
     use crate::{RecordType, WalRecord};
 
     use super::*;
@@ -217,5 +297,69 @@ mod tests {
 
         assert_eq!(seen, vec![10]);
         assert_eq!(recovered, target);
+    }
+
+    #[test]
+    fn recover_with_xid_target_stops_after_target_commit() {
+        let dir = TempDir::new().unwrap();
+        let first = commit_record(Xid::new(10), 1_000);
+        let first_bytes = first.encode();
+        let second = commit_record(Xid::new(11), 2_000);
+        let mut segment = first_bytes.clone();
+        segment.extend_from_slice(&second.encode());
+        std::fs::write(dir.path().join("segment_0000000000"), segment).unwrap();
+
+        let mut seen = Vec::new();
+        let recovered = recover_with_target(
+            dir.path(),
+            RecoveryTarget::up_to_xid(Xid::new(10)),
+            |record| {
+                seen.push(record.header.xid.raw());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(seen, vec![10]);
+        assert_eq!(
+            recovered,
+            Lsn::new(u64::try_from(first_bytes.len()).unwrap())
+        );
+    }
+
+    #[test]
+    fn recover_with_time_target_stops_before_later_commit() {
+        let dir = TempDir::new().unwrap();
+        let first = commit_record(Xid::new(10), 1_000);
+        let first_bytes = first.encode();
+        let second = commit_record(Xid::new(11), 2_000);
+        let mut segment = first_bytes.clone();
+        segment.extend_from_slice(&second.encode());
+        std::fs::write(dir.path().join("segment_0000000000"), segment).unwrap();
+
+        let mut seen = Vec::new();
+        let recovered = recover_with_target(
+            dir.path(),
+            RecoveryTarget::up_to_time_micros(1_500),
+            |record| {
+                seen.push(record.header.xid.raw());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(seen, vec![10]);
+        assert_eq!(
+            recovered,
+            Lsn::new(u64::try_from(first_bytes.len()).unwrap())
+        );
+    }
+
+    fn commit_record(xid: Xid, commit_timestamp_micros: u64) -> WalRecord {
+        let payload = CommitPayload {
+            commit_lsn: Lsn::ZERO,
+            commit_timestamp_micros,
+        };
+        WalRecord::new(RecordType::Commit, xid, Lsn::ZERO, 0, payload.encode())
     }
 }

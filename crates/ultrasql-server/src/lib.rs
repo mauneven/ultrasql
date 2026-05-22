@@ -2577,7 +2577,7 @@ fn recovery_replay_target_from_data_dir(
         return Ok(ultrasql_wal::RecoveryTarget::none());
     }
     let text = std::fs::read_to_string(&path).map_err(ServerError::Io)?;
-    let mut target_lsn = None;
+    let mut target = ultrasql_wal::RecoveryTarget::none();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -2589,19 +2589,14 @@ fn recovery_replay_target_from_data_dir(
         let key = key.trim();
         let value = value.trim().trim_matches('\'').trim_matches('"');
         if key.eq_ignore_ascii_case("recovery_target_lsn") {
-            target_lsn = Some(parse_recovery_lsn(value)?);
-        } else if key.eq_ignore_ascii_case("recovery_target_time")
-            || key.eq_ignore_ascii_case("recovery_target_xid")
-        {
-            return Err(ServerError::Unsupported(
-                "recovery_target_time/recovery_target_xid require transaction-aware PITR replay",
-            ));
+            target.target_lsn = Some(parse_recovery_lsn(value)?);
+        } else if key.eq_ignore_ascii_case("recovery_target_time") {
+            target.target_time_micros = Some(parse_recovery_time_micros(value)?);
+        } else if key.eq_ignore_ascii_case("recovery_target_xid") {
+            target.target_xid = Some(parse_recovery_xid(value)?);
         }
     }
-    Ok(target_lsn.map_or_else(
-        ultrasql_wal::RecoveryTarget::none,
-        ultrasql_wal::RecoveryTarget::up_to_lsn,
-    ))
+    Ok(target)
 }
 
 fn parse_recovery_lsn(value: &str) -> Result<Lsn, ServerError> {
@@ -2620,6 +2615,30 @@ fn parse_recovery_lsn(value: &str) -> Result<Lsn, ServerError> {
         .parse::<u64>()
         .map(Lsn::new)
         .map_err(|_| ServerError::ddl("invalid recovery_target_lsn"))
+}
+
+fn parse_recovery_time_micros(value: &str) -> Result<u64, ServerError> {
+    let value = value.trim();
+    let normalized = if value.contains(' ') && !value.contains('T') {
+        value.replacen(' ', "T", 1)
+    } else {
+        value.to_owned()
+    };
+    let parsed = chrono::DateTime::parse_from_rfc3339(&normalized)
+        .map_err(|_| ServerError::ddl("invalid recovery_target_time"))?;
+    u64::try_from(parsed.timestamp_micros())
+        .map_err(|_| ServerError::ddl("recovery_target_time before Unix epoch"))
+}
+
+fn parse_recovery_xid(value: &str) -> Result<Xid, ServerError> {
+    let raw = value
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| ServerError::ddl("invalid recovery_target_xid"))?;
+    if raw == 0 {
+        return Err(ServerError::ddl("recovery_target_xid must be nonzero"));
+    }
+    Ok(Xid::new(raw))
 }
 
 fn validation_check(name: &'static str, errors: Vec<String>, ok_detail: String) -> ValidationCheck {
