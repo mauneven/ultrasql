@@ -1806,7 +1806,12 @@ Every standard PostgreSQL driver and ORM works without modification.
   date_trunc(), extract(), to_timestamp(), make_date(), and date_bin have
   PostgreSQL-wire regression coverage for the supported Date/Timestamp/
   TimestampTz/Interval value shapes.
-- [ ] Aggregate: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR, STRING_AGG, ARRAY_AGG, JSON_AGG, PERCENTILE_CONT, STDDEV, VARIANCE, CORR
+- [x] Aggregate: COUNT, SUM, AVG, MIN, MAX, BOOL_AND, BOOL_OR,
+  STRING_AGG, ARRAY_AGG, JSON_AGG, STDDEV, and VARIANCE have SQL-facing
+  executor coverage.
+- [ ] Aggregate ordered/stat extensions: CORR, PERCENTILE_CONT, and
+  PERCENTILE_DISC require multi-argument / ordered-set aggregate plan
+  shape before they can be claimed at the SQL surface.
 - [ ] Window: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE
 - [ ] JSON: row_to_json, json_build_object, json_each, jsonb_set, jsonb_path_query
 - [x] Array: array_length, array_cat, unnest, array_agg,

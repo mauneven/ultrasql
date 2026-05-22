@@ -176,6 +176,8 @@ pub enum AggregateFunc {
     StringAgg,
     /// `ARRAY_AGG(expr)`.
     ArrayAgg,
+    /// `JSON_AGG(expr)`.
+    JsonAgg,
     /// `STDDEV_SAMP(expr)` / `STDDEV(expr)` — sample standard
     /// deviation. `NULL` for fewer than two non-null inputs.
     StddevSamp,
@@ -1956,6 +1958,7 @@ impl LogicalPlan {
                         AggregateFunc::BoolOr => "bool_or",
                         AggregateFunc::StringAgg => "string_agg",
                         AggregateFunc::ArrayAgg => "array_agg",
+                        AggregateFunc::JsonAgg => "json_agg",
                         AggregateFunc::StddevSamp => "stddev_samp",
                         AggregateFunc::StddevPop => "stddev_pop",
                         AggregateFunc::VarSamp => "var_samp",

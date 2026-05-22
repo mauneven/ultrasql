@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use serde_json::{Number as JsonNumber, Value as JsonValue};
 use ultrasql_core::{DataType, Schema, Value};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
 use ultrasql_vec::column::{Column, NumericColumn};
@@ -1400,6 +1401,8 @@ enum AggState {
     StringAgg(Vec<String>, String),
     /// `ARRAY_AGG(expr)` — accumulated non-NULL values.
     ArrayAgg(Vec<Value>),
+    /// `JSON_AGG(expr)` — accumulated values, preserving SQL NULL.
+    JsonAgg(Vec<Value>),
     /// Welford running aggregate for STDDEV / VARIANCE: `(count,
     /// mean, M2)` where `M2` is the running sum of squared
     /// differences from the mean. Shared between `STDDEV_SAMP`,
@@ -1441,6 +1444,7 @@ fn init_state_for_func(func: AggregateFunc) -> AggState {
         AggregateFunc::BoolOr => AggState::BoolOr(None),
         AggregateFunc::StringAgg => AggState::StringAgg(Vec::new(), String::new()),
         AggregateFunc::ArrayAgg => AggState::ArrayAgg(Vec::new()),
+        AggregateFunc::JsonAgg => AggState::JsonAgg(Vec::new()),
         AggregateFunc::StddevSamp => AggState::Welford {
             count: 0,
             mean: 0.0,
@@ -1593,6 +1597,11 @@ fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), 
                 }
             }
         }
+        AggState::JsonAgg(items) => {
+            if let Some(v) = arg_val {
+                items.push(v);
+            }
+        }
         AggState::Welford {
             count, mean, m2, ..
         } => {
@@ -1664,6 +1673,13 @@ fn finalise(state: &AggState) -> Value {
                 }
             }
         }
+        AggState::JsonAgg(items) => {
+            if items.is_empty() {
+                Value::Null
+            } else {
+                Value::Jsonb(json_agg_text(items))
+            }
+        }
         AggState::Welford {
             count,
             m2,
@@ -1683,6 +1699,39 @@ fn finalise(state: &AggState) -> Value {
             let var = m2 / denom as f64;
             Value::Float64(if *sqrt { var.sqrt() } else { var })
         }
+    }
+}
+
+fn json_agg_text(items: &[Value]) -> String {
+    let values = JsonValue::Array(items.iter().map(sql_value_to_json).collect());
+    serde_json::to_string(&values).unwrap_or_else(|_| "[]".to_owned())
+}
+
+fn sql_value_to_json(value: &Value) -> JsonValue {
+    match value {
+        Value::Null => JsonValue::Null,
+        Value::Bool(v) => JsonValue::Bool(*v),
+        Value::Int16(v) => JsonValue::Number(JsonNumber::from(i64::from(*v))),
+        Value::Int32(v) => JsonValue::Number(JsonNumber::from(i64::from(*v))),
+        Value::Int64(v) => JsonValue::Number(JsonNumber::from(*v)),
+        Value::Float32(v) => {
+            JsonNumber::from_f64(f64::from(*v)).map_or(JsonValue::Null, JsonValue::Number)
+        }
+        Value::Float64(v) => JsonNumber::from_f64(*v).map_or(JsonValue::Null, JsonValue::Number),
+        Value::Text(v) => JsonValue::String(v.clone()),
+        Value::Jsonb(v) => serde_json::from_str(v).unwrap_or_else(|_| JsonValue::String(v.clone())),
+        Value::Vector(values) | Value::HalfVec(values) => JsonValue::Array(
+            values
+                .iter()
+                .map(|v| {
+                    JsonNumber::from_f64(f64::from(*v)).map_or(JsonValue::Null, JsonValue::Number)
+                })
+                .collect(),
+        ),
+        Value::Array { elements, .. } => {
+            JsonValue::Array(elements.iter().map(sql_value_to_json).collect())
+        }
+        other => JsonValue::String(other.to_string()),
     }
 }
 
