@@ -402,6 +402,31 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
     assert!(index_stats[0].get::<_, i64>(1) >= 1);
     assert!(index_stats[0].get::<_, i64>(2) >= 1);
 
+    server.workload_recorder.begin_create_index(321, 41, 42, 7);
+    server
+        .workload_recorder
+        .update_create_index(321, "building index", 3);
+    let create_index_progress = client
+        .query(
+            "SELECT pid, relid, index_relid, phase, blocks_total, blocks_done \
+             FROM pg_catalog.pg_stat_progress_create_index \
+             WHERE pid = 321",
+            &[],
+        )
+        .await
+        .expect("pg_stat_progress_create_index rows");
+    assert_eq!(create_index_progress.len(), 1);
+    assert_eq!(create_index_progress[0].get::<_, i32>(0), 321);
+    assert_eq!(create_index_progress[0].get::<_, i64>(1), 41);
+    assert_eq!(create_index_progress[0].get::<_, i64>(2), 42);
+    assert_eq!(
+        create_index_progress[0].get::<_, String>(3),
+        "building index"
+    );
+    assert_eq!(create_index_progress[0].get::<_, i64>(4), 7);
+    assert_eq!(create_index_progress[0].get::<_, i64>(5), 3);
+    server.workload_recorder.finish_create_index(321);
+
     let database_stats = client
         .query(
             "SELECT xact_commit, xact_rollback \

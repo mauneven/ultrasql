@@ -1695,8 +1695,9 @@ behavior are implemented and validated.
   through ops metrics.
 - [x] `pg_stat_progress_analyze` — ANALYZE publishes active phase/block
   rows through the virtual catalog view and clears them on completion.
-- [ ] `pg_stat_progress_create_index` — empty compatibility view exists;
-  CREATE INDEX build loops still need phase/block progress publication.
+- [x] `pg_stat_progress_create_index` — CREATE INDEX build loops publish
+  active phase/block rows through the virtual catalog view and clear them
+  on completion/error.
 - [x] Prometheus `/metrics` HTTP endpoint — `--ops-listen` exposes
   process/build metadata plus live buffer-pool, WAL fsync, WAL append,
   object-store, ANN, and query-latency counters.

@@ -140,6 +140,27 @@ pub struct AnalyzeProgressSnapshot {
     pub sample_blks_scanned: i64,
 }
 
+/// One active `pg_stat_progress_create_index` row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateIndexProgressSnapshot {
+    /// PostgreSQL backend pid owning CREATE INDEX.
+    pub pid: i32,
+    /// Database OID. UltraSQL exposes one database in this wave.
+    pub datid: i64,
+    /// Database name.
+    pub datname: String,
+    /// Relation OID being indexed.
+    pub relid: i64,
+    /// Index relation OID being built.
+    pub index_relid: i64,
+    /// Current CREATE INDEX phase.
+    pub phase: String,
+    /// Heap blocks in the relation at CREATE INDEX start.
+    pub blocks_total: i64,
+    /// Heap blocks processed so far.
+    pub blocks_done: i64,
+}
+
 /// Cumulative usage counters for one SQL index.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexUsageStats {
@@ -204,6 +225,7 @@ pub struct WorkloadRecorder {
     latency_histogram: parking_lot::Mutex<LatencyHistogramState>,
     vacuum_progress: parking_lot::Mutex<HashMap<u32, VacuumProgressSnapshot>>,
     analyze_progress: parking_lot::Mutex<HashMap<u32, AnalyzeProgressSnapshot>>,
+    create_index_progress: parking_lot::Mutex<HashMap<u32, CreateIndexProgressSnapshot>>,
     index_usage: parking_lot::Mutex<HashMap<u32, IndexUsageStats>>,
     slow_log_capacity: usize,
 }
@@ -225,6 +247,7 @@ impl WorkloadRecorder {
             latency_histogram: parking_lot::Mutex::new(LatencyHistogramState::default()),
             vacuum_progress: parking_lot::Mutex::new(HashMap::new()),
             analyze_progress: parking_lot::Mutex::new(HashMap::new()),
+            create_index_progress: parking_lot::Mutex::new(HashMap::new()),
             index_usage: parking_lot::Mutex::new(HashMap::new()),
             slow_log_capacity: 1024,
         }
@@ -371,6 +394,49 @@ impl WorkloadRecorder {
     pub fn vacuum_progress(&self) -> Vec<VacuumProgressSnapshot> {
         let mut rows = self
             .vacuum_progress
+            .lock()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|row| row.pid);
+        rows
+    }
+
+    /// Start or replace one active CREATE INDEX progress row.
+    pub fn begin_create_index(&self, pid: u32, relid: u32, index_relid: u32, blocks_total: u32) {
+        self.create_index_progress.lock().insert(
+            pid,
+            CreateIndexProgressSnapshot {
+                pid: u32_to_i32_saturated(pid),
+                datid: 1,
+                datname: "ultrasql".to_string(),
+                relid: i64::from(relid),
+                index_relid: i64::from(index_relid),
+                phase: "initializing".to_string(),
+                blocks_total: i64::from(blocks_total),
+                blocks_done: 0,
+            },
+        );
+    }
+
+    /// Update counters and phase for an active CREATE INDEX progress row.
+    pub fn update_create_index(&self, pid: u32, phase: impl Into<String>, blocks_done: u32) {
+        if let Some(row) = self.create_index_progress.lock().get_mut(&pid) {
+            row.phase = phase.into();
+            row.blocks_done = i64::from(blocks_done);
+        }
+    }
+
+    /// Clear one active CREATE INDEX progress row.
+    pub fn finish_create_index(&self, pid: u32) {
+        self.create_index_progress.lock().remove(&pid);
+    }
+
+    /// Return active CREATE INDEX progress rows ordered by pid.
+    #[must_use]
+    pub fn create_index_progress(&self) -> Vec<CreateIndexProgressSnapshot> {
+        let mut rows = self
+            .create_index_progress
             .lock()
             .values()
             .cloned()
@@ -582,6 +648,32 @@ mod tests {
 
         recorder.finish_analyze(8);
         assert!(recorder.analyze_progress().is_empty());
+    }
+
+    #[test]
+    fn workload_recorder_tracks_create_index_progress_lifecycle() {
+        let recorder = WorkloadRecorder::new();
+        recorder.begin_create_index(9, 44, 45, 11);
+        recorder.update_create_index(9, "building index", 7);
+
+        let rows = recorder.create_index_progress();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0],
+            CreateIndexProgressSnapshot {
+                pid: 9,
+                datid: 1,
+                datname: "ultrasql".to_string(),
+                relid: 44,
+                index_relid: 45,
+                phase: "building index".to_string(),
+                blocks_total: 11,
+                blocks_done: 7,
+            }
+        );
+
+        recorder.finish_create_index(9);
+        assert!(recorder.create_index_progress().is_empty());
     }
 
     #[test]

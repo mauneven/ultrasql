@@ -49,6 +49,35 @@ use crate::{
 
 const PG_OID_INT8: u32 = 20;
 
+struct CreateIndexProgressGuard<'a> {
+    recorder: &'a crate::workload::WorkloadRecorder,
+    pid: u32,
+}
+
+impl<'a> CreateIndexProgressGuard<'a> {
+    fn new(
+        recorder: &'a crate::workload::WorkloadRecorder,
+        pid: u32,
+        relid: u32,
+        index_relid: u32,
+        blocks_total: u32,
+    ) -> Self {
+        recorder.begin_create_index(pid, relid, index_relid, blocks_total);
+        Self { recorder, pid }
+    }
+
+    fn update(&self, phase: &'static str, blocks_done: u32) {
+        self.recorder
+            .update_create_index(self.pid, phase, blocks_done);
+    }
+}
+
+impl Drop for CreateIndexProgressGuard<'_> {
+    fn drop(&mut self) {
+        self.recorder.finish_create_index(self.pid);
+    }
+}
+
 impl<RW> Session<RW>
 where
     RW: AsyncRead + AsyncWrite + Unpin,
@@ -723,6 +752,19 @@ where
                 ));
             };
             let index_oid = self.state.persistent_catalog.next_oid();
+            let block_count = self
+                .state
+                .heap
+                .block_count(RelationId(table.oid))
+                .max(table.n_blocks);
+            let progress = CreateIndexProgressGuard::new(
+                self.state.workload_recorder.as_ref(),
+                self.pid,
+                table.oid.raw(),
+                index_oid.raw(),
+                block_count,
+            );
+            progress.update("building index", 0);
             let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
             let build_result = crate::aggregating_index::build_aggregating_index_rows(
                 table,
@@ -734,6 +776,7 @@ where
             self.state
                 .commit_transaction(txn, false, "CREATE AGGREGATING INDEX scan")?;
             let rows = build_result?;
+            progress.update("writing catalog", block_count);
             let attnums = columns
                 .iter()
                 .map(|col| {
@@ -845,6 +888,14 @@ where
             let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
             let table_rel = RelationId(table.oid);
             let block_count = self.state.heap.block_count(table_rel).max(table.n_blocks);
+            let progress = CreateIndexProgressGuard::new(
+                self.state.workload_recorder.as_ref(),
+                self.pid,
+                table.oid.raw(),
+                index_oid.raw(),
+                block_count,
+            );
+            progress.update("scanning table", 0);
             let codec = ultrasql_executor::RowCodec::new(table.schema.clone());
             let scan = self.state.heap.scan_visible(
                 table_rel,
@@ -854,10 +905,22 @@ where
             );
             let build_result = (|| -> Result<(), ServerError> {
                 let mut rows = Vec::new();
+                let mut last_progress_block = 0;
                 for result in scan {
                     let tuple = result.map_err(|e| {
                         ServerError::ddl(format!("CREATE INDEX ivfflat heap scan: {e}"))
                     })?;
+                    let blocks_done = tuple
+                        .tid
+                        .page
+                        .block
+                        .raw()
+                        .saturating_add(1)
+                        .min(block_count);
+                    if blocks_done != last_progress_block {
+                        progress.update("scanning table", blocks_done);
+                        last_progress_block = blocks_done;
+                    }
                     let row = codec.decode(&tuple.data).map_err(|e| {
                         ServerError::ddl(format!("CREATE INDEX ivfflat decode: {e}"))
                     })?;
@@ -872,6 +935,7 @@ where
                     };
                     rows.push((vector, tuple.tid));
                 }
+                progress.update("loading index", block_count);
                 ivfflat
                     .bulk_load_logged(rows, txn.xid, self.state.heap.wal_sink().map(Arc::as_ref))
                     .map_err(|e| ServerError::ddl(format!("CREATE INDEX ivfflat bulk load: {e}")))
@@ -879,6 +943,7 @@ where
             self.state
                 .commit_transaction(txn, true, "CREATE INDEX ivfflat build")?;
             build_result?;
+            progress.update("writing catalog", block_count);
             let attnum = u16::try_from(vector_col).map_err(|_| {
                 ServerError::Unsupported(
                     "CREATE INDEX: column index does not fit in u16 attnum field",
@@ -983,6 +1048,14 @@ where
             let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
             let table_rel = RelationId(table.oid);
             let block_count = self.state.heap.block_count(table_rel).max(table.n_blocks);
+            let progress = CreateIndexProgressGuard::new(
+                self.state.workload_recorder.as_ref(),
+                self.pid,
+                table.oid.raw(),
+                index_oid.raw(),
+                block_count,
+            );
+            progress.update("building index", 0);
             let codec = ultrasql_executor::RowCodec::new(table.schema.clone());
             let scan = self.state.heap.scan_visible(
                 table_rel,
@@ -991,10 +1064,22 @@ where
                 self.state.txn_manager.as_ref(),
             );
             let build_result = (|| -> Result<(), ServerError> {
+                let mut last_progress_block = 0;
                 for result in scan {
                     let tuple = result.map_err(|e| {
                         ServerError::ddl(format!("CREATE INDEX hnsw heap scan: {e}"))
                     })?;
+                    let blocks_done = tuple
+                        .tid
+                        .page
+                        .block
+                        .raw()
+                        .saturating_add(1)
+                        .min(block_count);
+                    if blocks_done != last_progress_block {
+                        progress.update("building index", blocks_done);
+                        last_progress_block = blocks_done;
+                    }
                     let row = codec
                         .decode(&tuple.data)
                         .map_err(|e| ServerError::ddl(format!("CREATE INDEX hnsw decode: {e}")))?;
@@ -1020,6 +1105,7 @@ where
             self.state
                 .commit_transaction(txn, true, "CREATE INDEX hnsw build")?;
             build_result?;
+            progress.update("writing catalog", block_count);
             let attnum = u16::try_from(vector_col).map_err(|_| {
                 ServerError::Unsupported(
                     "CREATE INDEX: column index does not fit in u16 attnum field",
@@ -1137,6 +1223,14 @@ where
         let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
         let table_rel = RelationId(table.oid);
         let block_count = self.state.heap.block_count(table_rel).max(table.n_blocks);
+        let progress = CreateIndexProgressGuard::new(
+            self.state.workload_recorder.as_ref(),
+            self.pid,
+            table.oid.raw(),
+            index_oid.raw(),
+            block_count,
+        );
+        progress.update("building index", 0);
         let scan = self.state.heap.scan_visible(
             table_rel,
             block_count,
@@ -1145,9 +1239,15 @@ where
         );
         let insert_result = (|| -> Result<u64, ServerError> {
             let mut inserted: u64 = 0;
+            let mut last_progress_block = 0;
             for result in scan {
                 let tup =
                     result.map_err(|e| ServerError::ddl(format!("CREATE INDEX heap scan: {e}")))?;
+                let blocks_done = tup.tid.page.block.raw().saturating_add(1).min(block_count);
+                if blocks_done != last_progress_block {
+                    progress.update("building index", blocks_done);
+                    last_progress_block = blocks_done;
+                }
                 let row = decode_key_column(
                     &tup.data,
                     &table.schema,
@@ -1189,6 +1289,7 @@ where
         self.state
             .commit_transaction(txn, true, "CREATE INDEX build")?;
         let _ = insert_result?;
+        progress.update("writing catalog", block_count);
 
         // 4. Register the index entry. The columns vector uses the
         //    1-based attnum convention shared with `pg_attribute`; the

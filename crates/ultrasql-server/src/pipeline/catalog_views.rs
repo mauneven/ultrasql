@@ -164,9 +164,10 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
             schema_pg_stat_progress_analyze(),
             rows_pg_stat_progress_analyze(ctx),
         )),
-        "pg_catalog.pg_stat_progress_create_index" => {
-            Some((schema_pg_stat_progress_create_index(), Vec::new()))
-        }
+        "pg_catalog.pg_stat_progress_create_index" => Some((
+            schema_pg_stat_progress_create_index(),
+            rows_pg_stat_progress_create_index(ctx),
+        )),
         "pg_catalog.pg_replication_slots" => Some((schema_pg_replication_slots(), Vec::new())),
         "pg_catalog.pg_stat_replication" => Some((schema_pg_stat_replication(), Vec::new())),
         "pg_catalog.pg_stat_subscription" => Some((schema_pg_stat_subscription(), Vec::new())),
@@ -1634,6 +1635,25 @@ fn schema_pg_stat_progress_create_index() -> Schema {
         Field::required("blocks_total", DataType::Int64),
         Field::required("blocks_done", DataType::Int64),
     ])
+}
+
+fn rows_pg_stat_progress_create_index(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    ctx.workload_recorder
+        .create_index_progress()
+        .into_iter()
+        .map(|row| {
+            vec![
+                Value::Int32(row.pid),
+                Value::Int64(row.datid),
+                v_text(row.datname),
+                Value::Int64(row.relid),
+                Value::Int64(row.index_relid),
+                v_text(row.phase),
+                Value::Int64(row.blocks_total),
+                Value::Int64(row.blocks_done),
+            ]
+        })
+        .collect()
 }
 
 fn schema_pg_replication_slots() -> Schema {
