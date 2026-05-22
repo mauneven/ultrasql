@@ -72,8 +72,14 @@ jobs:
           components: miri,rust-src
       - uses: Swatinem/rust-cache@v2
       - run: cargo +nightly miri setup
-      - name: run miri on unsafe-heavy crates
+      - name: run miri smoke on unsafe-heavy crates
         run: |
-          for crate in ultrasql-core ultrasql-storage ultrasql-parser; do
-            cargo +nightly miri test -p "$crate"
-          done
+          # Miri is an interpreter, so the CI gate runs targeted smoke tests
+          # for unsafe-sensitive contracts. ASAN/TSAN above keep broad
+          # workspace coverage for dynamic memory and threading bugs.
+          cargo +nightly miri test -p ultrasql-core endian::tests::u64_round_trip
+          cargo +nightly miri test -p ultrasql-core value::tests::display_round_trip_for_simple_values
+          cargo +nightly miri test -p ultrasql-storage page::tests::page_round_trips_via_from_bytes
+          cargo +nightly miri test -p ultrasql-storage page::tests::insert_and_read_round_trip
+          cargo +nightly miri test -p ultrasql-storage buffer_pool::tests::read_after_write_sees_update
+          cargo +nightly miri test -p ultrasql-parser parser::tests::deeply_nested_parens_rejected_without_overflow

@@ -141,7 +141,10 @@ fn ci_split_matches_release_policy() {
     assert!(sanitizers.contains("cargo +nightly test \\"));
     assert!(sanitizers.contains("-p ultrasql-executor"));
     assert!(sanitizers.contains("cargo +nightly miri setup"));
-    assert!(sanitizers.contains("cargo +nightly miri test"));
+    assert!(sanitizers.contains("run miri smoke on unsafe-heavy crates"));
+    assert!(sanitizers.contains(
+        "cargo +nightly miri test -p ultrasql-storage page::tests::page_round_trips_via_from_bytes"
+    ));
     assert!(docs.contains("PR gate"));
     assert!(docs.contains("Nightly/manual gate"));
 }
