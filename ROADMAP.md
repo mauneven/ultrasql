@@ -1817,7 +1817,9 @@ Every standard PostgreSQL driver and ORM works without modification.
   PostgreSQL wire path.
 - [x] JSON update scalar: `jsonb_set` supports object-path updates with
   PostgreSQL wire regression coverage.
-- [ ] JSON remaining: `row_to_json`, `json_each`, and `jsonb_path_query`.
+- [x] JSON table function: `json_each(jsonb)` expands object and array
+  values into `(key text, value jsonb)` rows through the PostgreSQL wire path.
+- [ ] JSON remaining: `row_to_json` and `jsonb_path_query`.
 - [x] Array: array_length, array_cat, unnest, array_agg,
   array_to_string, string_to_array — implemented for native arrays
   over the current supported scalar element set.

@@ -245,6 +245,32 @@ fn bind_table_function(
                 }],
             )
         }
+        "json_each" => {
+            if bound_args.len() != 1 {
+                return Err(PlanError::NotSupported(
+                    "json_each: expected one json/jsonb argument",
+                ));
+            }
+            let key = Field::required("key", DataType::Text { max_len: None });
+            let value = Field::nullable("value", DataType::Jsonb);
+            let schema = Schema::new([key.clone(), value.clone()])
+                .map_err(|e| PlanError::TypeMismatch(format!("json_each schema: {e}")))?;
+            (
+                schema,
+                vec![
+                    ScopeEntry {
+                        qualifier: qualifier.clone(),
+                        field_index: 0,
+                        field: key,
+                    },
+                    ScopeEntry {
+                        qualifier: qualifier.clone(),
+                        field_index: 1,
+                        field: value,
+                    },
+                ],
+            )
+        }
         "read_csv" => bind_read_csv_table_function(&bound_args, &qualifier)?,
         "read_parquet" => bind_read_parquet_table_function(&bound_args, &qualifier)?,
         "read_json" => {
@@ -263,7 +289,7 @@ fn bind_table_function(
         "sniff_csv" => bind_sniff_csv_table_function(&bound_args, &qualifier)?,
         _ => {
             return Err(PlanError::NotSupported(
-                "table function (only generate_series, unnest, json_table, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
+                "table function (only generate_series, unnest, json_each, json_table, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
             ));
         }
     };

@@ -2,11 +2,12 @@
 
 use std::sync::Arc;
 
+use serde_json::Value as JsonValue;
 use ultrasql_catalog::TableEntry;
-use ultrasql_core::{RelationId, Value};
+use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
 use ultrasql_executor::{
     CteScan, Eval, MemTableScan, Operator, ParallelSeqScan, Project, RowCodec, SeqScan,
-    choose_parallel_seq_scan_workers,
+    build_batch, choose_parallel_seq_scan_workers,
 };
 use ultrasql_planner::{LogicalPlan, ScalarExpr};
 
@@ -174,6 +175,9 @@ pub(super) fn lower_function_scan(
     if name == "json_table" {
         return lower_json_table_scan(args);
     }
+    if name == "json_each" {
+        return lower_json_each(args);
+    }
     if name == "unnest" {
         if args.len() != 1 {
             return Err(ServerError::Unsupported(
@@ -197,7 +201,7 @@ pub(super) fn lower_function_scan(
     }
     if name != "generate_series" {
         return Err(ServerError::Unsupported(
-            "table function (only generate_series, unnest, json_table, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
+            "table function (only generate_series, unnest, json_each, json_table, read_csv, read_parquet, read_json, read_ndjson, read_arrow, read_iceberg, iceberg_scan, and sniff_csv supported)",
         ));
     }
     if args.len() < 2 || args.len() > 3 {
@@ -235,6 +239,64 @@ pub(super) fn lower_function_scan(
     Ok(Box::new(ultrasql_executor::FunctionScan::generate_series(
         start, stop, step,
     )))
+}
+
+fn lower_json_each(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, ServerError> {
+    if args.len() != 1 {
+        return Err(ServerError::Unsupported(
+            "json_each: expected one json/jsonb argument",
+        ));
+    }
+    let value = Eval::new(args[0].clone())
+        .eval(&[])
+        .map_err(|e| ServerError::Ddl(format!("json_each argument evaluation failed: {e}")))?;
+    let document = match value {
+        Value::Jsonb(text) | Value::Text(text) => serde_json::from_str::<JsonValue>(&text)
+            .map_err(|err| ServerError::CopyFormat(format!("json_each parse jsonb: {err}")))?,
+        Value::Null => JsonValue::Null,
+        other => {
+            return Err(ServerError::CopyFormat(format!(
+                "json_each: argument must be jsonb or text, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    let schema = Schema::new([
+        Field::required("key", DataType::Text { max_len: None }),
+        Field::nullable("value", DataType::Jsonb),
+    ])
+    .map_err(|err| ServerError::CopyFormat(format!("json_each schema: {err}")))?;
+    let rows = match document {
+        JsonValue::Object(object) => object
+            .into_iter()
+            .map(|(key, value)| vec![Value::Text(key), Value::Jsonb(value.to_string())])
+            .collect::<Vec<_>>(),
+        JsonValue::Array(values) => values
+            .into_iter()
+            .enumerate()
+            .map(|(idx, value)| {
+                vec![
+                    Value::Text(idx.to_string()),
+                    Value::Jsonb(value.to_string()),
+                ]
+            })
+            .collect::<Vec<_>>(),
+        JsonValue::Null => Vec::new(),
+        other => {
+            return Err(ServerError::CopyFormat(format!(
+                "json_each: expected object or array, got {other}"
+            )));
+        }
+    };
+    let batches = if rows.is_empty() {
+        Vec::new()
+    } else {
+        vec![
+            build_batch(&rows, &schema)
+                .map_err(|err| ServerError::CopyFormat(format!("json_each batch: {err}")))?,
+        ]
+    };
+    Ok(Box::new(MemTableScan::new(schema, batches)))
 }
 
 /// Lower `Project(read_csv(...))` with CSV projection pushdown when the
