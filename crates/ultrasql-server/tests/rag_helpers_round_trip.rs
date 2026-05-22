@@ -1,52 +1,17 @@
 //! End-to-end RAG helper SQL tests.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-
 use bytes::Bytes;
 use futures::SinkExt;
-use tokio_postgres::{NoTls, SimpleQueryMessage};
+use tokio_postgres::SimpleQueryMessage;
 use ultrasql_catalog::rag::{
     RagSchemaConfig, audit_rag_retrieved_chunk_sql, copy_rag_chunks_sql, copy_rag_documents_sql,
     create_rag_table_statements, filter_rag_documents_by_metadata_sql, insert_rag_chunk_sql,
     search_rag_answer_context_sql, search_rag_embeddings_sql,
 };
-use ultrasql_server::{Server, bind_listener, serve_listener};
 
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=rag_helpers_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
+mod support;
 
-async fn shutdown(
-    client: tokio_postgres::Client,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
-}
+use support::{shutdown, start_sample_server};
 
 fn simple_rows(messages: &[SimpleQueryMessage]) -> Vec<Vec<String>> {
     messages
@@ -85,7 +50,8 @@ async fn copy_in_payload(client: &tokio_postgres::Client, sql: &str, payload: &[
 
 #[tokio::test]
 async fn rag_helpers_execute_as_plain_sql() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("rag_helpers_test").await;
+    let client = &running.client;
     let config = RagSchemaConfig {
         prefix: "rag".to_owned(),
         embedding_dims: 3,
@@ -102,7 +68,7 @@ async fn rag_helpers_execute_as_plain_sql() {
 tenant-a,doc-a,s3://bucket/a.md,Doc A,hash-a,\"{\"\"kind\"\":\"\"guide\"\"}\",2026-05-19 10:00:00,2026-05-20 10:00:00,2026-05-20 10:05:00,2,true\n\
 tenant-b,doc-b,s3://bucket/b.md,Doc B,hash-b,\"{\"\"kind\"\":\"\"guide\"\"}\",2026-05-19 10:00:00,2026-05-20 10:00:00,2026-05-20 10:05:00,2,true\n";
     let documents_inserted = copy_in_payload(
-        &client,
+        client,
         &copy_rag_documents_sql(&config).expect("build document COPY helper"),
         document_payload,
     )
@@ -145,7 +111,7 @@ tenant-b,doc-b,s3://bucket/b.md,Doc B,hash-b,\"{\"\"kind\"\":\"\"guide\"\"}\",20
     let chunk_payload = b"tenant_id,chunk_id,document_id,chunk_index,content,token_start,token_end,metadata,created_at,updated_at,version,is_current\n\
 tenant-b,chunk-b-0,doc-b,0,other tenant content,0,3,\"{\"\"section\"\":\"\"body\"\"}\",2026-05-20 10:00:01,2026-05-20 10:00:02,9,true\n";
     let chunks_inserted = copy_in_payload(
-        &client,
+        client,
         &copy_rag_chunks_sql(&config).expect("build chunk COPY helper"),
         chunk_payload,
     )
@@ -288,5 +254,5 @@ tenant-b,chunk-b-0,doc-b,0,other tenant content,0,3,\"{\"\"section\"\":\"\"body\
         "tenant-a retrieval must not audit tenant-b chunks"
     );
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }

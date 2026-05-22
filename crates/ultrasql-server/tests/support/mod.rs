@@ -10,6 +10,7 @@ use ultrasql_server::{Server, bind_listener, serve_listener_with_shutdown};
 pub(crate) struct RunningServer {
     pub(crate) server: Arc<Server>,
     pub(crate) client: tokio_postgres::Client,
+    #[allow(dead_code)]
     pub(crate) bound: SocketAddr,
     conn_handle: tokio::task::JoinHandle<()>,
     server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,

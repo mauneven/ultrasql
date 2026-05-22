@@ -1,46 +1,11 @@
 //! End-to-end RAG storage primitive tests.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-
-use tokio_postgres::{NoTls, SimpleQueryMessage};
+use tokio_postgres::SimpleQueryMessage;
 use ultrasql_catalog::rag::{RagSchemaConfig, create_rag_table_statements};
-use ultrasql_server::{Server, bind_listener, serve_listener};
 
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=rag_primitives_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
+mod support;
 
-async fn shutdown(
-    client: tokio_postgres::Client,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
-}
+use support::{shutdown, start_sample_server};
 
 fn simple_rows(messages: &[SimpleQueryMessage]) -> Vec<Vec<String>> {
     messages
@@ -58,7 +23,8 @@ fn simple_rows(messages: &[SimpleQueryMessage]) -> Vec<Vec<String>> {
 
 #[tokio::test]
 async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
-    let (client, _conn, server_handle) = start_server_and_connect().await;
+    let running = start_sample_server("rag_primitives_test").await;
+    let client = &running.client;
     let ddl = create_rag_table_statements(&RagSchemaConfig {
         prefix: "rag".to_owned(),
         embedding_dims: 3,
@@ -253,5 +219,5 @@ async fn rag_primitives_store_metadata_recency_versions_and_embeddings() {
         ]]
     );
 
-    shutdown(client, server_handle).await;
+    shutdown(running).await;
 }
