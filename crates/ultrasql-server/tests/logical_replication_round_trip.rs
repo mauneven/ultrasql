@@ -2,22 +2,30 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
+use tokio::sync::oneshot;
 use tokio_postgres::NoTls;
 use ultrasql_server::replication::LogicalChangeKind;
-use ultrasql_server::{Server, bind_listener, serve_listener};
+use ultrasql_server::{Server, bind_listener, serve_listener_with_shutdown};
 
 async fn start_server_and_connect() -> (
     Arc<Server>,
     tokio_postgres::Client,
     tokio::task::JoinHandle<()>,
     tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+    oneshot::Sender<()>,
 ) {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
     let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, Arc::clone(&server)));
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_handle = tokio::spawn(serve_listener_with_shutdown(
+        listener,
+        Arc::clone(&server),
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ));
     let conn_str = format!(
         "host={host} port={port} user=tester application_name=logical_replication_test",
         host = bound.ip(),
@@ -31,21 +39,28 @@ async fn start_server_and_connect() -> (
             eprintln!("connection error: {e}");
         }
     });
-    (server, client, conn_handle, server_handle)
+    (server, client, conn_handle, server_handle, shutdown_tx)
 }
 
 async fn shutdown(
     client: tokio_postgres::Client,
+    conn_handle: tokio::task::JoinHandle<()>,
     server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+    shutdown_tx: oneshot::Sender<()>,
 ) {
     drop(client);
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    server_handle.abort();
+    let _ = shutdown_tx.send(());
+    conn_handle.await.expect("connection task joins");
+    server_handle
+        .await
+        .expect("server task joins")
+        .expect("server shuts down cleanly");
 }
 
 #[tokio::test]
 async fn create_publication_records_committed_dml_stream() {
-    let (server, client, _conn, server_handle) = start_server_and_connect().await;
+    let (server, client, conn_handle, server_handle, shutdown_tx) =
+        start_server_and_connect().await;
 
     client
         .batch_execute("CREATE TABLE events (id INT NOT NULL, value INT NOT NULL)")
@@ -96,12 +111,13 @@ async fn create_publication_records_committed_dml_stream() {
     assert_eq!(changes[2].rows_affected, 1);
     assert!(changes.windows(2).all(|pair| pair[0].lsn < pair[1].lsn));
 
-    shutdown(client, server_handle).await;
+    shutdown(client, conn_handle, server_handle, shutdown_tx).await;
 }
 
 #[tokio::test]
 async fn rollback_does_not_emit_logical_changes() {
-    let (server, client, _conn, server_handle) = start_server_and_connect().await;
+    let (server, client, conn_handle, server_handle, shutdown_tx) =
+        start_server_and_connect().await;
 
     client
         .batch_execute("CREATE TABLE events (id INT NOT NULL)")
@@ -127,5 +143,5 @@ async fn rollback_does_not_emit_logical_changes() {
 
     assert!(server.logical_replication.changes_since(0).is_empty());
 
-    shutdown(client, server_handle).await;
+    shutdown(client, conn_handle, server_handle, shutdown_tx).await;
 }
