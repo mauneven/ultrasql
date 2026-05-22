@@ -2098,7 +2098,10 @@ partitioning, full-text search, remaining type coverage.
 - [ ] `HSTORE` built-in
 
 ### Additional pg_stat Views
-- [ ] `pg_stat_progress_vacuum`, `pg_stat_progress_analyze`, `pg_stat_progress_create_index`
+- [x] `pg_stat_progress_vacuum`, `pg_stat_progress_analyze`,
+  `pg_stat_progress_create_index` — virtual PostgreSQL-compatible row
+  shapes expose live workload-recorder progress rows and are validated
+  through PostgreSQL wire queries in `catalog_views_round_trip.rs`.
 - [ ] `pg_statio_user_indexes`
 - [ ] `pg_stat_bgwriter` full implementation
 - [ ] `pg_stat_replication` (if replication active)

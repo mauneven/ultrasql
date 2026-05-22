@@ -502,6 +502,29 @@ async fn pg_catalog_and_information_schema_reflect_runtime_objects() {
     assert_eq!(vacuum_progress[0].get::<_, i64>(4), 1);
     server.workload_recorder.finish_vacuum(42);
 
+    server.workload_recorder.begin_analyze(43, meta_t_oid, 5);
+    server
+        .workload_recorder
+        .update_analyze(43, "computing statistics", 4);
+    let analyze_progress = client
+        .query(
+            "SELECT relid, phase, sample_blks_total, sample_blks_scanned \
+             FROM pg_catalog.pg_stat_progress_analyze \
+             WHERE pid = 43",
+            &[],
+        )
+        .await
+        .expect("pg_stat_progress_analyze query");
+    assert_eq!(analyze_progress.len(), 1);
+    assert_eq!(analyze_progress[0].get::<_, i64>(0), i64::from(meta_t_oid));
+    assert_eq!(
+        analyze_progress[0].get::<_, String>(1),
+        "computing statistics"
+    );
+    assert_eq!(analyze_progress[0].get::<_, i64>(2), 5);
+    assert_eq!(analyze_progress[0].get::<_, i64>(3), 4);
+    server.workload_recorder.finish_analyze(43);
+
     let routines = client
         .query(
             "SELECT routine_schema, routine_name \
