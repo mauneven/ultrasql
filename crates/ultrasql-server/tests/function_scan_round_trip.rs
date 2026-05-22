@@ -101,7 +101,9 @@ impl MockS3 {
             while !thread_shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _addr)) => {
-                        handle_mock_s3_stream(&mut stream, &objects, &thread_requests, mode);
+                        if stream.set_nonblocking(false).is_ok() {
+                            handle_mock_s3_stream(&mut stream, &objects, &thread_requests, mode);
+                        }
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
