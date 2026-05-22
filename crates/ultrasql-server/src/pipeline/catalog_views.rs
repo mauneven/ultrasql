@@ -172,7 +172,9 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
             schema_pg_replication_slots(),
             rows_pg_replication_slots(ctx),
         )),
-        "pg_catalog.pg_stat_replication" => Some((schema_pg_stat_replication(), Vec::new())),
+        "pg_catalog.pg_stat_replication" => {
+            Some((schema_pg_stat_replication(), rows_pg_stat_replication(ctx)))
+        }
         "pg_catalog.pg_stat_subscription" => Some((
             schema_pg_stat_subscription(),
             rows_pg_stat_subscription(ctx),
@@ -1732,6 +1734,48 @@ fn schema_pg_stat_replication() -> Schema {
         Field::nullable("replay_lsn", text()),
         Field::required("sync_state", text()),
     ])
+}
+
+fn rows_pg_stat_replication(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let Some(data_dir) = &ctx.data_dir else {
+        return Vec::new();
+    };
+    let Ok(store) = crate::replication::ReplicationSlotStore::open(data_dir.join("pg_replslot"))
+    else {
+        return Vec::new();
+    };
+    let Ok(slots) = store.list() else {
+        return Vec::new();
+    };
+
+    slots
+        .into_iter()
+        .map(|slot| {
+            let sent_lsn = slot.restart_lsn.clone().map_or(Value::Null, v_text);
+            let confirmed_flush_lsn = slot.confirmed_flush_lsn.clone();
+            let write_lsn = confirmed_flush_lsn.clone().map_or(Value::Null, v_text);
+            let flush_lsn = confirmed_flush_lsn.clone().map_or(Value::Null, v_text);
+            let replay_lsn = confirmed_flush_lsn.map_or(Value::Null, v_text);
+            let state = match (&slot.restart_lsn, &slot.confirmed_flush_lsn) {
+                (Some(_), Some(_)) => "streaming",
+                (Some(_), None) => "catchup",
+                (None, _) => "startup",
+            };
+
+            vec![
+                Value::Int32(0),
+                v_text("ultrasql"),
+                v_text(slot.name),
+                v_text(""),
+                v_text(state),
+                sent_lsn,
+                write_lsn,
+                flush_lsn,
+                replay_lsn,
+                v_text("async"),
+            ]
+        })
+        .collect()
 }
 
 fn schema_pg_stat_subscription() -> Schema {

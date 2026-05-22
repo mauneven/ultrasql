@@ -1647,8 +1647,9 @@ behavior are implemented and validated.
 - [x] `pg_replication_slots` view — exposes persisted physical slot rows
   from `pg_replslot/*.slot` through the PostgreSQL-compatible virtual
   catalog shape.
-- [ ] `pg_stat_replication` view — catalog shape exists for tool
-  introspection; live sender/client rows await the network sender loop.
+- [x] `pg_stat_replication` view — exposes persisted physical slot sender
+  progress through the PostgreSQL wire path; live network pid/client fields
+  remain synthetic until the continuous sender loop lands.
 - [ ] Cascading replication — file-backed receiver output is valid sender input; continuous network cascade pending
 
 ### Backup & PITR
