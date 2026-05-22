@@ -90,7 +90,8 @@ use ultrasql_planner::{
 };
 use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::access_method::{
-    AnnPayloadKind, HnswMetric, PageBackedHnswIndex, PageBackedIvfFlatIndex,
+    AccessMethod, AnnPayloadKind, BrinIndex, HnswMetric, PageBackedHnswIndex,
+    PageBackedIvfFlatIndex,
 };
 use ultrasql_storage::btree::BTree;
 use ultrasql_storage::buffer_pool::{BufferPool, PageLoader};
@@ -3839,6 +3840,29 @@ impl Server {
                             "rebuilt persistent btree index pages"
                         );
                     }
+                    LogicalIndexMethod::Brin => {
+                        let (brin, rows) = self.rebuild_brin_summary(table, index)?;
+                        constraints.indexes.insert(
+                            index.oid,
+                            RuntimeIndexMetadata {
+                                key_exprs: Vec::new(),
+                                predicate: None,
+                                include_columns: Vec::new(),
+                                method,
+                                brin: Some(brin),
+                                hnsw: None,
+                                ivfflat: None,
+                                aggregating: None,
+                            },
+                        );
+                        changed = true;
+                        tracing::info!(
+                            table = %table.name,
+                            index = %index.name,
+                            rows,
+                            "rebuilt persistent brin summaries"
+                        );
+                    }
                     LogicalIndexMethod::Hnsw => {
                         let [attnum] = index.columns.as_slice() else {
                             continue;
@@ -4051,6 +4075,66 @@ impl Server {
             tracing::warn!(error = %e, "restart btree rebuild txn failed to finalise");
         }
         result
+    }
+
+    fn rebuild_brin_summary(
+        &self,
+        table: &TableEntry,
+        index: &IndexEntry,
+    ) -> Result<(Arc<BrinIndex>, u64), ServerError> {
+        if index.columns.is_empty() {
+            return Ok((Arc::new(BrinIndex::new(128)), 0));
+        }
+        let columns: Vec<usize> = index
+            .columns
+            .iter()
+            .map(|attnum| usize::from(*attnum))
+            .collect();
+        let encoding = crate::index_key::IndexKeyEncoding::for_columns(&table.schema, &columns)?;
+        let key_col_idx = columns.first().copied();
+        let brin = Arc::new(BrinIndex::new(128));
+        let txn = self.txn_manager.begin(IsolationLevel::ReadCommitted);
+        let table_rel = RelationId(table.oid);
+        let block_count = self.heap.block_count(table_rel).max(table.n_blocks);
+        let scan = self.heap.scan_visible(
+            table_rel,
+            block_count,
+            &txn.snapshot,
+            self.txn_manager.as_ref(),
+        );
+        let result = (|| -> Result<u64, ServerError> {
+            let mut inserted = 0_u64;
+            for tuple in scan {
+                let tuple = tuple.map_err(|e| {
+                    ServerError::ddl(format!(
+                        "restart rebuild {} BRIN heap scan failed: {e}",
+                        index.name
+                    ))
+                })?;
+                let Some(key) = decode_key_column(
+                    &tuple.data,
+                    &table.schema,
+                    key_col_idx,
+                    &[],
+                    None,
+                    LogicalIndexMethod::Brin,
+                    &encoding,
+                )?
+                else {
+                    continue;
+                };
+                let brin_key = BrinIndex::encode_i64_key(key);
+                brin.insert(&brin_key, tuple.tid).map_err(|e| {
+                    ServerError::ddl(format!("restart rebuild {} BRIN: {e}", index.name))
+                })?;
+                inserted = inserted.saturating_add(1);
+            }
+            Ok(inserted)
+        })();
+        if let Err(e) = self.txn_manager.commit(txn) {
+            tracing::warn!(error = %e, "restart brin rebuild txn failed to finalise");
+        }
+        result.map(|rows| (brin, rows))
     }
 
     fn rebuild_aggregating_index_rows(

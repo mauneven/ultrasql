@@ -29,6 +29,7 @@
 //! plus the micro-bench at the bottom of the module.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -94,6 +95,35 @@ async fn start_server_and_connect_with_server() -> (
     (server, client, conn_handle, server_handle)
 }
 
+async fn start_persistent_server_and_connect_with_server(
+    data_dir: &Path,
+) -> (
+    Arc<Server>,
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+) {
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
+    let (listener, bound) = bind_listener(addr).await.expect("bind");
+    let server = Arc::new(Server::init(data_dir).expect("persistent server init"));
+    let server_handle = tokio::spawn(serve_listener(listener, Arc::clone(&server)));
+
+    let conn_str = format!(
+        "host={host} port={port} user=tester application_name=index_scan_restart_test",
+        host = bound.ip(),
+        port = bound.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("tokio-postgres connect");
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+    (server, client, conn_handle, server_handle)
+}
+
 /// Tidy shutdown sequence — drop the client, give the connection task
 /// a beat to flush its socket teardown, then abort the listener.
 async fn shutdown(
@@ -103,6 +133,7 @@ async fn shutdown(
     drop(client);
     tokio::time::sleep(Duration::from_millis(20)).await;
     server_handle.abort();
+    let _ = server_handle.await;
 }
 
 /// Insert `n_rows` of `(id INT, val INT)` rows into `table_name` via a
@@ -303,6 +334,52 @@ async fn brin_index_range_scan_and_insert_maintenance_round_trip() {
     );
 
     shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn brin_index_summary_rebuilds_after_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    {
+        let (_server, client, _conn_handle, server_handle) =
+            start_persistent_server_and_connect_with_server(data_dir.path()).await;
+        preload(&client, "t_brin_restart", 10_000).await;
+        client
+            .batch_execute("CREATE INDEX ix_t_brin_restart_id ON t_brin_restart USING brin (id)")
+            .await
+            .expect("create brin index");
+        shutdown(client, server_handle).await;
+    }
+
+    {
+        let (server, client, _conn_handle, server_handle) =
+            start_persistent_server_and_connect_with_server(data_dir.path()).await;
+        let brin = {
+            let snapshot = server.persistent_catalog.snapshot();
+            let table = snapshot.tables.get("t_brin_restart").expect("table exists");
+            let constraints = server
+                .table_constraints
+                .get(&table.oid)
+                .expect("runtime index metadata exists after restart");
+            constraints
+                .indexes
+                .values()
+                .find_map(|metadata| metadata.brin.clone())
+                .expect("brin summary rebuilt after restart")
+        };
+        assert!(brin.summary_count() >= 1);
+        let rows = client
+            .simple_query(
+                "SELECT id FROM t_brin_restart WHERE id BETWEEN 9990 AND 9992 ORDER BY id",
+            )
+            .await
+            .expect("query through rebuilt brin");
+        assert_eq!(
+            rows_first_col(&rows),
+            vec!["9990".to_string(), "9991".to_string(), "9992".to_string()]
+        );
+        shutdown(client, server_handle).await;
+    }
 }
 
 /// Plain non-unique indexes must retain every duplicate key/TID pair.
