@@ -22,22 +22,40 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::{StreamExt, stream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_postgres::{AsyncMessage, NoTls};
-use ultrasql_server::{Server, bind_listener, serve_listener};
+use ultrasql_server::{Server, bind_listener, serve_listener_with_shutdown};
+
+struct RunningServer {
+    bound: SocketAddr,
+    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+    shutdown_tx: oneshot::Sender<()>,
+}
 
 /// Spin up an in-process `ultrasqld` on an ephemeral port and return its
-/// bound address along with the listener task handle. The caller is
-/// responsible for aborting the handle once the test is done.
-async fn start_server() -> (
-    SocketAddr,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
+/// bound address along with a graceful shutdown handle.
+async fn start_server() -> RunningServer {
     let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
     let (listener, bound) = bind_listener(addr).await.expect("bind");
     let server = Arc::new(Server::with_sample_database());
-    let handle = tokio::spawn(serve_listener(listener, server));
-    (bound, handle)
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_handle = tokio::spawn(serve_listener_with_shutdown(listener, server, async move {
+        let _ = shutdown_rx.await;
+    }));
+    RunningServer {
+        bound,
+        server_handle,
+        shutdown_tx,
+    }
+}
+
+async fn shutdown_server(running: RunningServer) {
+    let _ = running.shutdown_tx.send(());
+    tokio::time::timeout(Duration::from_secs(2), running.server_handle)
+        .await
+        .expect("server shutdown completes")
+        .expect("server task joins")
+        .expect("listener exits cleanly");
 }
 
 /// Connect a `tokio-postgres` client against `bound` and spawn a
@@ -92,7 +110,8 @@ async fn connect_with_async_stream(
 /// expected channel + payload.
 #[tokio::test]
 async fn listen_notify_round_trip_delivers_to_other_session() {
-    let (bound, server_handle) = start_server().await;
+    let server = start_server().await;
+    let bound = server.bound;
 
     // Session A subscribes.
     let (client_a, mut async_rx_a, driver_a) = connect_with_async_stream(bound).await;
@@ -137,14 +156,15 @@ async fn listen_notify_round_trip_delivers_to_other_session() {
         let _ = driver_b.await;
     })
     .await;
-    server_handle.abort();
+    shutdown_server(server).await;
 }
 
 /// `UNLISTEN channel` removes the subscription so subsequent `NOTIFY`
 /// calls no longer reach the unsubscribed session.
 #[tokio::test]
 async fn unlisten_drops_subscription() {
-    let (bound, server_handle) = start_server().await;
+    let server = start_server().await;
+    let bound = server.bound;
 
     let (client_a, mut async_rx_a, driver_a) = connect_with_async_stream(bound).await;
     client_a
@@ -197,13 +217,14 @@ async fn unlisten_drops_subscription() {
         let _ = driver_b.await;
     })
     .await;
-    server_handle.abort();
+    shutdown_server(server).await;
 }
 
 /// `UNLISTEN *` removes every subscription owned by the session.
 #[tokio::test]
 async fn unlisten_star_drops_every_subscription() {
-    let (bound, server_handle) = start_server().await;
+    let server = start_server().await;
+    let bound = server.bound;
 
     let (client_a, mut async_rx_a, driver_a) = connect_with_async_stream(bound).await;
     client_a
@@ -252,14 +273,15 @@ async fn unlisten_star_drops_every_subscription() {
         let _ = driver_b.await;
     })
     .await;
-    server_handle.abort();
+    shutdown_server(server).await;
 }
 
 /// Sanity check: the bare `NOTIFY` form (no payload) round-trips to a
 /// listener with an empty-string payload, matching PostgreSQL.
 #[tokio::test]
 async fn notify_without_payload_delivers_empty_string() {
-    let (bound, server_handle) = start_server().await;
+    let server = start_server().await;
+    let bound = server.bound;
 
     let (client_a, mut async_rx_a, driver_a) = connect_with_async_stream(bound).await;
     client_a
@@ -294,5 +316,5 @@ async fn notify_without_payload_delivers_empty_string() {
         let _ = driver_b.await;
     })
     .await;
-    server_handle.abort();
+    shutdown_server(server).await;
 }
