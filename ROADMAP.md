@@ -2025,11 +2025,11 @@ same host.
   Miri gates stay in `bench.yml`, `fuzz.yml`, and `sanitizers.yml`.
 - [x] Release checklist: `docs/release-checklist.md` maps v1.0 boxes to
   code, test, benchmark or reason, docs, and artifact.
-- [ ] `CHANGELOG.md` documenting every user-visible change
+- [x] `CHANGELOG.md` documenting user-visible change groups and known gaps.
 - [ ] Official documentation site (`docs.ultrasql.org`)
-- [ ] Getting started guide
-- [ ] Migration guide from PostgreSQL
-- [ ] Known incompatibilities documented
+- [x] Getting started guide: `docs/getting-started.md`.
+- [x] Migration guide from PostgreSQL: `docs/migration-from-postgresql.md`.
+- [x] Known incompatibilities documented: `docs/known-incompatibilities.md`.
 - [ ] Docker image published
 - [ ] Homebrew formula
 - [ ] Debian/Ubuntu and RPM packages

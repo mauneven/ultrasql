@@ -256,6 +256,9 @@ fuzz/         fuzz targets and corpora
 
 - [ROADMAP.md](ROADMAP.md) — release plan and open gaps.
 - [docs/install.md](docs/install.md) — binary install and source build.
+- [docs/getting-started.md](docs/getting-started.md) — local first steps.
+- [docs/migration-from-postgresql.md](docs/migration-from-postgresql.md) — migration validation path.
+- [docs/known-incompatibilities.md](docs/known-incompatibilities.md) — current PostgreSQL gaps.
 - [docs/release-checklist.md](docs/release-checklist.md) — release gate.
 - [BENCHMARKS.md](BENCHMARKS.md) — benchmark methodology and artifact policy.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — subsystem design.

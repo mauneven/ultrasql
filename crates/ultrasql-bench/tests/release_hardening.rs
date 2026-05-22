@@ -169,3 +169,46 @@ fn release_checklist_maps_69_to_74_to_artifacts() {
         assert!(docs.contains(needle), "release checklist missing {needle}");
     }
 }
+
+#[test]
+fn release_user_docs_exist_and_state_current_limits() {
+    let changelog = repo_file("CHANGELOG.md");
+    let getting_started = repo_file("docs/getting-started.md");
+    let migration = repo_file("docs/migration-from-postgresql.md");
+    let incompat = repo_file("docs/known-incompatibilities.md");
+
+    for needle in ["Unreleased", "Known gaps", "pre-1.0 releases"] {
+        assert!(changelog.contains(needle), "CHANGELOG missing {needle}");
+    }
+    for needle in [
+        "pre-alpha",
+        "Build from source",
+        "Run tests",
+        "SQLLogicTest",
+    ] {
+        assert!(
+            getting_started.contains(needle),
+            "getting started missing {needle}"
+        );
+    }
+    for needle in [
+        "not a drop-in production replacement yet",
+        "COPY",
+        "Validation rule",
+    ] {
+        assert!(
+            migration.contains(needle),
+            "migration guide missing {needle}"
+        );
+    }
+    for needle in [
+        "v1.0 is not released",
+        "Ordered-set aggregates",
+        "Firebolt comparisons use local Firebolt Core only",
+    ] {
+        assert!(
+            incompat.contains(needle),
+            "known incompatibilities missing {needle}"
+        );
+    }
+}
