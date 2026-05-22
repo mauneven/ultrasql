@@ -124,6 +124,11 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     wal_receive_interval_ms: u64,
 
+    /// Also copy received WAL into this archive directory so this standby can
+    /// cascade physical WAL to downstream receivers.
+    #[arg(long, value_name = "DIR")]
+    wal_receive_cascade_archive: Option<PathBuf>,
+
     /// Replication slot name used by WAL sender.
     #[arg(long, default_value = "standby")]
     replication_slot: String,
@@ -1044,15 +1049,22 @@ async fn run(cli: Cli) -> Result<()> {
 
     if let Some(source) = &cli.wal_receive_once {
         let receiver = WalReceiver::new(source);
+        let wal_dir = cli.data_dir.join("pg_wal");
         if cli.wal_receive_interval_ms == 0 {
-            let copied = receiver.receive_once(&cli.data_dir.join("pg_wal"))?;
+            let copied = receive_wal_once(
+                &receiver,
+                &wal_dir,
+                cli.wal_receive_cascade_archive.as_deref(),
+            )?;
             fs::write(cli.data_dir.join("standby.signal"), b"standby\n")?;
-            println!(
-                "received {copied} WAL file(s) into {}",
-                cli.data_dir.join("pg_wal").display()
-            );
+            println!("received {copied} WAL file(s) into {}", wal_dir.display());
         } else {
-            run_wal_receive_loop(&receiver, &cli.data_dir, cli.wal_receive_interval_ms)?;
+            run_wal_receive_loop(
+                &receiver,
+                &cli.data_dir,
+                cli.wal_receive_cascade_archive.as_deref(),
+                cli.wal_receive_interval_ms,
+            )?;
         }
         return Ok(());
     }
@@ -1677,7 +1689,12 @@ fn run_wal_send_loop(sender: &WalSender, slot: &str, dest: &Path, interval_ms: u
     }
 }
 
-fn run_wal_receive_loop(receiver: &WalReceiver, data_dir: &Path, interval_ms: u64) -> Result<()> {
+fn run_wal_receive_loop(
+    receiver: &WalReceiver,
+    data_dir: &Path,
+    cascade_archive_dir: Option<&Path>,
+    interval_ms: u64,
+) -> Result<()> {
     let interval = Duration::from_millis(interval_ms);
     let wal_dir = data_dir.join("pg_wal");
     fs::write(data_dir.join("standby.signal"), b"standby\n")?;
@@ -1686,11 +1703,24 @@ fn run_wal_receive_loop(receiver: &WalReceiver, data_dir: &Path, interval_ms: u6
         wal_dir.display()
     );
     loop {
-        let copied = receiver.receive_once(&wal_dir)?;
+        let copied = receive_wal_once(receiver, &wal_dir, cascade_archive_dir)?;
         if copied > 0 {
             println!("received {copied} WAL file(s) into {}", wal_dir.display());
         }
         thread::sleep(interval);
+    }
+}
+
+fn receive_wal_once(
+    receiver: &WalReceiver,
+    wal_dir: &Path,
+    cascade_archive_dir: Option<&Path>,
+) -> Result<usize> {
+    match cascade_archive_dir {
+        Some(archive_dir) => receiver
+            .receive_once_cascading(wal_dir, archive_dir)
+            .map_err(Into::into),
+        None => receiver.receive_once(wal_dir).map_err(Into::into),
     }
 }
 

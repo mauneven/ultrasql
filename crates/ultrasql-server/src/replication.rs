@@ -445,6 +445,30 @@ impl WalReceiver {
         }
         Ok(copied)
     }
+
+    /// Copy all received WAL files into standby `pg_wal` and into a local
+    /// archive directory that can feed a downstream [`WalSender`].
+    pub fn receive_once_cascading(
+        &self,
+        standby_wal_dir: &Path,
+        cascade_archive_dir: &Path,
+    ) -> Result<usize, ServerError> {
+        fs::create_dir_all(standby_wal_dir).map_err(ServerError::Io)?;
+        fs::create_dir_all(cascade_archive_dir).map_err(ServerError::Io)?;
+        let files = wal_files(&self.source_dir)?;
+        let mut copied = 0_usize;
+        for file in files {
+            let Some(name) = file.file_name() else {
+                continue;
+            };
+            let standby_changed = copy_if_changed(&file, &standby_wal_dir.join(name))?;
+            let archive_changed = copy_if_changed(&file, &cascade_archive_dir.join(name))?;
+            if standby_changed || archive_changed {
+                copied = copied.saturating_add(1);
+            }
+        }
+        Ok(copied)
+    }
 }
 
 fn copy_if_changed(source: &Path, dest: &Path) -> Result<bool, ServerError> {
@@ -553,6 +577,47 @@ mod tests {
                 .receive_once(standby.path())
                 .expect("third receive"),
             1
+        );
+    }
+
+    #[test]
+    fn wal_receiver_cascade_archive_can_feed_downstream_sender() {
+        let upstream = tempfile::TempDir::new().expect("upstream dir");
+        let standby_wal = tempfile::TempDir::new().expect("standby wal dir");
+        let standby_archive = tempfile::TempDir::new().expect("standby archive dir");
+        let slots = tempfile::TempDir::new().expect("slots dir");
+        let downstream = tempfile::TempDir::new().expect("downstream dir");
+        fs::write(upstream.path().join("000000010000000000000001"), b"wal-a").expect("wal a");
+        fs::write(upstream.path().join("000000010000000000000002"), b"wal-b").expect("wal b");
+
+        let receiver = WalReceiver::new(upstream.path());
+        assert_eq!(
+            receiver
+                .receive_once_cascading(standby_wal.path(), standby_archive.path())
+                .expect("cascade receive"),
+            2
+        );
+        assert!(standby_wal.path().join("000000010000000000000001").exists());
+        assert!(
+            standby_archive
+                .path()
+                .join("000000010000000000000001")
+                .exists()
+        );
+
+        let sender = WalSender::new(standby_archive.path(), slots.path()).expect("sender");
+        assert_eq!(
+            sender
+                .send_once("cascade", downstream.path())
+                .expect("downstream send"),
+            2
+        );
+        assert!(downstream.path().join("000000010000000000000002").exists());
+        assert_eq!(
+            receiver
+                .receive_once_cascading(standby_wal.path(), standby_archive.path())
+                .expect("second cascade receive"),
+            0
         );
     }
 }

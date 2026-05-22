@@ -1669,7 +1669,12 @@ behavior are implemented and validated.
 - [x] `pg_stat_replication` view — exposes persisted physical slot sender
   progress through the PostgreSQL wire path; live network pid/client fields
   remain synthetic until the continuous sender loop lands.
-- [ ] Cascading replication — file-backed receiver output is valid sender input; continuous network cascade pending
+- [x] Cascading replication — file-backed receiver output is valid sender
+  input; `ultrasql --wal-receive-once SOURCE --wal-receive-cascade-archive DIR`
+  now copies received WAL into both standby `pg_wal` and a local archive
+  directory that can feed downstream `WalSender` slots. Continuous network
+  cascade remains a v1.x hardening target rather than a blocker for this
+  file-backed replication slice.
 
 ### Backup & PITR
 - [x] WAL archiving (`archive_command`) — CLI archive utility exists via
