@@ -29,7 +29,6 @@
 //! plus the micro-bench at the bottom of the module.
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +37,10 @@ use ultrasql_core::{BlockNumber, PageId, RelationId, TupleId, Xid};
 use ultrasql_server::{Server, bind_listener, serve_listener};
 use ultrasql_storage::access_method::BrinIndex;
 use ultrasql_storage::btree::BTree;
+
+mod support;
+
+use support::{shutdown as graceful_shutdown, start_persistent_server};
 
 /// Spin up an in-process server on an ephemeral TCP port and return a
 /// connected `tokio-postgres` client plus the join handles so the test
@@ -81,35 +84,6 @@ async fn start_server_and_connect_with_server() -> (
 
     let conn_str = format!(
         "host={host} port={port} user=tester application_name=index_scan_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (server, client, conn_handle, server_handle)
-}
-
-async fn start_persistent_server_and_connect_with_server(
-    data_dir: &Path,
-) -> (
-    Arc<Server>,
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::init(data_dir).expect("persistent server init"));
-    let server_handle = tokio::spawn(serve_listener(listener, Arc::clone(&server)));
-
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=index_scan_restart_test",
         host = bound.ip(),
         port = bound.port()
     );
@@ -341,23 +315,23 @@ async fn brin_index_summary_rebuilds_after_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
     {
-        let (_server, client, _conn_handle, server_handle) =
-            start_persistent_server_and_connect_with_server(data_dir.path()).await;
-        preload(&client, "t_brin_restart", 10_000).await;
-        client
+        let running = start_persistent_server(data_dir.path(), "index_scan_restart_test").await;
+        preload(&running.client, "t_brin_restart", 10_000).await;
+        running
+            .client
             .batch_execute("CREATE INDEX ix_t_brin_restart_id ON t_brin_restart USING brin (id)")
             .await
             .expect("create brin index");
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 
     {
-        let (server, client, _conn_handle, server_handle) =
-            start_persistent_server_and_connect_with_server(data_dir.path()).await;
+        let running = start_persistent_server(data_dir.path(), "index_scan_restart_test").await;
         let brin = {
-            let snapshot = server.persistent_catalog.snapshot();
+            let snapshot = running.server.persistent_catalog.snapshot();
             let table = snapshot.tables.get("t_brin_restart").expect("table exists");
-            let constraints = server
+            let constraints = running
+                .server
                 .table_constraints
                 .get(&table.oid)
                 .expect("runtime index metadata exists after restart");
@@ -368,7 +342,8 @@ async fn brin_index_summary_rebuilds_after_restart() {
                 .expect("brin summary rebuilt after restart")
         };
         assert!(brin.summary_count() >= 1);
-        let rows = client
+        let rows = running
+            .client
             .simple_query(
                 "SELECT id FROM t_brin_restart WHERE id BETWEEN 9990 AND 9992 ORDER BY id",
             )
@@ -378,7 +353,7 @@ async fn brin_index_summary_rebuilds_after_restart() {
             rows_first_col(&rows),
             vec!["9990".to_string(), "9991".to_string(), "9992".to_string()]
         );
-        shutdown(client, server_handle).await;
+        graceful_shutdown(running).await;
     }
 }
 

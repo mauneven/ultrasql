@@ -1,12 +1,15 @@
 //! End-to-end row-level security tests.
 
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 use ultrasql_server::{Server, bind_listener, serve_listener};
+
+mod support;
+
+use support::{shutdown as graceful_shutdown, start_persistent_server};
 
 async fn start_server_and_connect() -> (
     tokio_postgres::Client,
@@ -19,33 +22,6 @@ async fn start_server_and_connect() -> (
     let server_handle = tokio::spawn(serve_listener(listener, server));
     let conn_str = format!(
         "host={host} port={port} user=tester application_name=rls_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    (client, conn_handle, server_handle)
-}
-
-async fn start_persistent_server_and_connect(
-    data_dir: &Path,
-) -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::init(data_dir).expect("persistent server init"));
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=rls_restart_test",
         host = bound.ip(),
         port = bound.port()
     );
@@ -164,8 +140,9 @@ async fn rls_tenant_policy_filters_reads_and_checks_inserts() {
 async fn rls_tenant_policy_survives_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
-    client
+    let running = start_persistent_server(data_dir.path(), "rls_restart_test").await;
+    running
+        .client
         .batch_execute(
             "CREATE TABLE tenant_docs_restart (\
                 tenant_id TEXT NOT NULL, \
@@ -175,7 +152,8 @@ async fn rls_tenant_policy_survives_restart() {
         )
         .await
         .expect("create tenant table");
-    client
+    running
+        .client
         .batch_execute(
             "INSERT INTO tenant_docs_restart VALUES \
                 ('tenant-a', 'doc-a', 'alpha'), \
@@ -183,7 +161,8 @@ async fn rls_tenant_policy_survives_restart() {
         )
         .await
         .expect("insert seed rows");
-    client
+    running
+        .client
         .batch_execute(
             "CREATE POLICY tenant_docs_restart_isolation ON tenant_docs_restart \
                 USING (tenant_id = current_setting('ultrasql.tenant_id', true)) \
@@ -191,25 +170,29 @@ async fn rls_tenant_policy_survives_restart() {
         )
         .await
         .expect("create tenant rls policy");
-    client
+    running
+        .client
         .batch_execute("ALTER TABLE tenant_docs_restart ENABLE ROW LEVEL SECURITY")
         .await
         .expect("enable table rls");
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 
-    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
-    client
+    let running = start_persistent_server(data_dir.path(), "rls_restart_test").await;
+    running
+        .client
         .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
         .await
         .expect("set tenant guc");
     let rows = simple_rows(
-        &client
+        &running
+            .client
             .simple_query("SELECT doc_id FROM tenant_docs_restart ORDER BY doc_id")
             .await
             .expect("select tenant-a rows after restart"),
     );
     assert_eq!(rows, vec![vec!["doc-a".to_owned()]]);
-    let err = client
+    let err = running
+        .client
         .batch_execute("INSERT INTO tenant_docs_restart VALUES ('tenant-b', 'doc-b-2', 'bravo-2')")
         .await
         .expect_err("cross-tenant insert must fail after restart");
@@ -218,7 +201,7 @@ async fn rls_tenant_policy_survives_restart() {
             .is_some_and(|db| db.message().contains("row-level security")),
         "expected RLS error after restart, got {err:?}"
     );
-    shutdown(client, server_handle).await;
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test]
