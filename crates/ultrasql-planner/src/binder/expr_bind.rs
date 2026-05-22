@@ -1007,9 +1007,11 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
     match func_name {
         "extract" => Ok(DataType::Int64),
         "abs" => Ok(DataType::Int64),
-        "lower" | "upper" => Ok(DataType::Text { max_len: None }),
+        "length" | "position" => Ok(DataType::Int32),
+        "lower" | "upper" | "trim" | "lpad" | "rpad" | "left" | "right" | "substr"
+        | "substring" | "replace" | "split_part" | "concat" | "concat_ws" | "repeat"
+        | "reverse" | "md5" | "sha256" => Ok(DataType::Text { max_len: None }),
         "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
-        "substring" => Ok(DataType::Text { max_len: None }),
         "gen_random_uuid" => Ok(DataType::Uuid),
         "pg_relation_size" => Ok(DataType::Int64),
         "version" | "current_database" | "current_user" | "session_user" | "pg_typeof"
@@ -1039,10 +1041,26 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
         func_name,
         "abs"
             | "extract"
+            | "length"
             | "lower"
             | "upper"
+            | "trim"
+            | "lpad"
+            | "rpad"
+            | "left"
+            | "right"
             | "pg_get_userbyid"
+            | "substr"
             | "substring"
+            | "position"
+            | "replace"
+            | "split_part"
+            | "concat"
+            | "concat_ws"
+            | "repeat"
+            | "reverse"
+            | "md5"
+            | "sha256"
             | "gen_random_uuid"
             | "version"
             | "current_database"

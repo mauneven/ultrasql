@@ -19,6 +19,7 @@
 //! - `IsNull { expr, negated }` -- SQL `IS [NOT] NULL`
 //! - Other variants (`Cast`, `Subquery`, `Exists`, ...) -- [`EvalError::Unsupported`]
 
+use std::fmt::Write as _;
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
@@ -245,10 +246,25 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
     match name {
         "abs" => eval_abs(args),
         "extract" => eval_extract(args),
+        "length" => eval_length(args),
         "lower" => eval_text_case(args, TextCase::Lower),
         "upper" => eval_text_case(args, TextCase::Upper),
         "pg_get_userbyid" => eval_pg_get_userbyid(args),
-        "substring" => eval_substring(args),
+        "trim" => eval_trim(args),
+        "lpad" => eval_pad(args, PadSide::Left),
+        "rpad" => eval_pad(args, PadSide::Right),
+        "left" => eval_left(args),
+        "right" => eval_right(args),
+        "substr" | "substring" => eval_substring(args),
+        "position" => eval_position(args),
+        "replace" => eval_replace(args),
+        "split_part" => eval_split_part(args),
+        "concat" => eval_concat(args),
+        "concat_ws" => eval_concat_ws(args),
+        "repeat" => eval_repeat(args),
+        "reverse" => eval_reverse(args),
+        "md5" => eval_md5(args),
+        "sha256" => eval_sha256(args),
         "gen_random_uuid" => eval_gen_random_uuid(args),
         "version" => eval_zero_arg_text(args, "UltraSQL 0.0.1"),
         "current_database" => eval_zero_arg_text(args, "ultrasql"),
@@ -567,6 +583,330 @@ fn eval_text_case(args: &[Value], mode: TextCase) -> Result<Value, EvalError> {
         TextCase::Lower => s.to_lowercase(),
         TextCase::Upper => s.to_uppercase(),
     };
+    Ok(Value::Text(out))
+}
+
+fn text_arg<'a>(func: &str, args: &'a [Value], idx: usize) -> Result<Option<&'a str>, EvalError> {
+    match args.get(idx) {
+        Some(Value::Text(text)) => Ok(Some(text.as_str())),
+        Some(Value::Null) => Ok(None),
+        Some(other) => Err(EvalError::Type(format!(
+            "{func}: argument {} must be text, got {:?}",
+            idx + 1,
+            other.data_type()
+        ))),
+        None => Err(EvalError::Type(format!(
+            "{func}: missing argument {}",
+            idx + 1
+        ))),
+    }
+}
+
+fn int_arg(func: &str, args: &[Value], idx: usize) -> Result<Option<i64>, EvalError> {
+    match args.get(idx) {
+        Some(value) => match value.as_i64() {
+            Some(v) => Ok(Some(v)),
+            None if matches!(value, Value::Null) => Ok(None),
+            None => Err(EvalError::Type(format!(
+                "{func}: argument {} must be integer, got {:?}",
+                idx + 1,
+                value.data_type()
+            ))),
+        },
+        None => Err(EvalError::Type(format!(
+            "{func}: missing argument {}",
+            idx + 1
+        ))),
+    }
+}
+
+fn eval_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "length: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("length", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let len = i32::try_from(text.chars().count())
+        .map_err(|_| EvalError::Type("length: result overflow".to_owned()))?;
+    Ok(Value::Int32(len))
+}
+
+fn eval_trim(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "trim: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("trim", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(text.trim().to_owned()))
+}
+
+#[derive(Clone, Copy)]
+enum PadSide {
+    Left,
+    Right,
+}
+
+fn eval_pad(args: &[Value], side: PadSide) -> Result<Value, EvalError> {
+    let func = match side {
+        PadSide::Left => "lpad",
+        PadSide::Right => "rpad",
+    };
+    if !(2..=3).contains(&args.len()) {
+        return Err(EvalError::Type(format!(
+            "{func}: expected 2 or 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg(func, args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(target_len) = int_arg(func, args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let fill = if args.len() == 3 {
+        let Some(fill) = text_arg(func, args, 2)? else {
+            return Ok(Value::Null);
+        };
+        fill
+    } else {
+        " "
+    };
+    let target = usize::try_from(target_len.max(0)).unwrap_or(usize::MAX);
+    let current = text.chars().count();
+    if target <= current {
+        return Ok(Value::Text(text.chars().take(target).collect()));
+    }
+    if fill.is_empty() {
+        return Err(EvalError::Type(format!(
+            "{func}: fill string cannot be empty"
+        )));
+    }
+    let pad_needed = target - current;
+    let mut padding = String::new();
+    for ch in fill.chars().cycle().take(pad_needed) {
+        padding.push(ch);
+    }
+    let out = match side {
+        PadSide::Left => format!("{padding}{text}"),
+        PadSide::Right => format!("{text}{padding}"),
+    };
+    Ok(Value::Text(out))
+}
+
+fn eval_left(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "left: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("left", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(count) = int_arg("left", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let keep = if count >= 0 {
+        usize::try_from(count)
+            .unwrap_or(usize::MAX)
+            .min(chars.len())
+    } else {
+        chars.len().saturating_sub(i64_abs_to_usize(count))
+    };
+    Ok(Value::Text(chars.into_iter().take(keep).collect()))
+}
+
+fn eval_right(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "right: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("right", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(count) = int_arg("right", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let skip = if count >= 0 {
+        chars
+            .len()
+            .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX))
+    } else {
+        i64_abs_to_usize(count).min(chars.len())
+    };
+    Ok(Value::Text(chars.into_iter().skip(skip).collect()))
+}
+
+fn i64_abs_to_usize(value: i64) -> usize {
+    usize::try_from(value.unsigned_abs()).unwrap_or(usize::MAX)
+}
+
+fn eval_position(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "position: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(needle) = text_arg("position", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(haystack) = text_arg("position", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let pos = haystack.find(needle).map_or(0_i32, |byte_idx| {
+        let chars_before = haystack[..byte_idx].chars().count();
+        i32::try_from(chars_before.saturating_add(1)).unwrap_or(i32::MAX)
+    });
+    Ok(Value::Int32(pos))
+}
+
+fn eval_replace(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Type(format!(
+            "replace: expected 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("replace", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(from) = text_arg("replace", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let Some(to) = text_arg("replace", args, 2)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(text.replace(from, to)))
+}
+
+fn eval_split_part(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Type(format!(
+            "split_part: expected 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("split_part", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(delimiter) = text_arg("split_part", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let Some(field) = int_arg("split_part", args, 2)? else {
+        return Ok(Value::Null);
+    };
+    if field <= 0 {
+        return Err(EvalError::Type(
+            "split_part: field position must be greater than zero".to_owned(),
+        ));
+    }
+    let target = usize::try_from(field.saturating_sub(1)).unwrap_or(usize::MAX);
+    Ok(Value::Text(
+        text.split(delimiter).nth(target).unwrap_or("").to_owned(),
+    ))
+}
+
+fn eval_concat(args: &[Value]) -> Result<Value, EvalError> {
+    let mut out = String::new();
+    for arg in args {
+        if !matches!(arg, Value::Null) {
+            out.push_str(&arg.to_string());
+        }
+    }
+    Ok(Value::Text(out))
+}
+
+fn eval_concat_ws(args: &[Value]) -> Result<Value, EvalError> {
+    if args.is_empty() {
+        return Err(EvalError::Type(
+            "concat_ws: expected at least 1 arg".to_owned(),
+        ));
+    }
+    let Some(separator) = text_arg("concat_ws", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let mut parts = Vec::new();
+    for arg in &args[1..] {
+        if !matches!(arg, Value::Null) {
+            parts.push(arg.to_string());
+        }
+    }
+    Ok(Value::Text(parts.join(separator)))
+}
+
+fn eval_repeat(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "repeat: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("repeat", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(count) = int_arg("repeat", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let count = usize::try_from(count.max(0)).unwrap_or(usize::MAX);
+    Ok(Value::Text(text.repeat(count)))
+}
+
+fn eval_reverse(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "reverse: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("reverse", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(text.chars().rev().collect()))
+}
+
+fn eval_md5(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "md5: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("md5", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Text(format!("{:x}", md5::compute(text.as_bytes()))))
+}
+
+fn eval_sha256(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "sha256: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(text) = text_arg("sha256", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(text.as_bytes());
+    let mut out = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        write!(&mut out, "{byte:02x}")
+            .map_err(|_| EvalError::Type("sha256: hex encoding failed".to_owned()))?;
+    }
     Ok(Value::Text(out))
 }
 

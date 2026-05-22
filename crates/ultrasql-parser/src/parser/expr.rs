@@ -9,7 +9,7 @@
 //! operators in [`super::binary_ops`].
 
 use super::{ParseError, Parser, is_type_name_keyword};
-use crate::ast::{Expr, Identifier, Literal, UnaryOp};
+use crate::ast::{Expr, Identifier, Literal, ObjectName, UnaryOp};
 use crate::span::Span;
 use crate::token::TokenKind;
 
@@ -373,6 +373,14 @@ impl<'src> Parser<'src> {
 
             TokenKind::KwRow => self.parse_row_expr(),
 
+            TokenKind::KwLeft if self.lookahead_at(1)?.kind == TokenKind::LParen => {
+                self.parse_keyword_function_call("left")
+            }
+
+            TokenKind::KwRight if self.lookahead_at(1)?.kind == TokenKind::LParen => {
+                self.parse_keyword_function_call("right")
+            }
+
             TokenKind::Identifier | TokenKind::QuotedIdentifier => {
                 if self.looks_like_vector_family_typed_literal()? {
                     self.parse_vector_family_typed_literal()
@@ -386,9 +394,43 @@ impl<'src> Parser<'src> {
             other => Err(ParseError::Expected {
                 expected: "expression",
                 found: other,
-                offset: tok.span.start as usize,
+                offset: tok_span.start as usize,
             }),
         }
+    }
+
+    fn parse_keyword_function_call(
+        &mut self,
+        function_name: &'static str,
+    ) -> Result<Expr, ParseError> {
+        let name_tok = self.advance()?;
+        self.expect(TokenKind::LParen, "(")?;
+        let mut args = Vec::new();
+        if self.peek()?.kind != TokenKind::RParen {
+            loop {
+                args.push(self.parse_expr()?);
+                if self.peek()?.kind != TokenKind::Comma {
+                    break;
+                }
+                self.advance()?;
+            }
+        }
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        let name = ObjectName {
+            parts: vec![Identifier {
+                value: function_name.to_owned(),
+                quoted: false,
+                span: name_tok.span,
+            }],
+            span: name_tok.span,
+        };
+        Ok(Expr::Call {
+            args,
+            distinct: false,
+            over: None,
+            span: Span::new(name_tok.span.start, rp.span.end),
+            name,
+        })
     }
 
     /// Parse a comma-separated expression list for function argument lists.
