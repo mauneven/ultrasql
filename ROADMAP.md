@@ -650,17 +650,18 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] RW-anti-dependency tracking
 - [x] Dangerous structure detection (T1 → T2 → T3 cycle)
 - [x] Safe snapshot optimization
-- [ ] True SERIALIZABLE end-to-end — `Server::with_sample_database` and
+- [x] True SERIALIZABLE end-to-end — `Server::with_sample_database` and
   `Server::init` construct the `TransactionManager` with a fresh
-  `SsiManager`, so `BEGIN ISOLATION LEVEL SERIALIZABLE` and
+  `SsiManager`; `BEGIN ISOLATION LEVEL SERIALIZABLE` and
   `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` register the txn with
-  SSI. The SSI dangerous-structure check detects 2-tx write-skew in
-  direct-manager tests, but predicate-lock recording from the executor
-  is still open; today the SsiManager is fed conflicts only by callers
-  that record them explicitly (Hermitage suite + integration tests).
-  Snapshot strategy continues to alias `RepeatableRead` for the
-  snapshot itself, which matches PostgreSQL's SSI architecture
-  (RR snapshot + SSI conflict graph)
+  SSI; simple-query and extended-query execution record relation-level
+  predicate locks for scanned relations and relation-level write conflicts
+  for DML targets; explicit `COMMIT` surfaces SQLSTATE `40001`; and a
+  two-session write-skew wire regression verifies that one transaction
+  aborts. Current granularity is relation-level, not predicate-precise.
+  Snapshot strategy continues to alias `RepeatableRead` for the snapshot
+  itself, matching PostgreSQL's SSI architecture (RR snapshot + SSI
+  conflict graph).
 
 ### Subtransactions
 - [x] `SAVEPOINT name` execution kernel

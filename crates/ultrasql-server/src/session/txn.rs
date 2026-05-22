@@ -379,6 +379,8 @@ where
                     "explicit COMMIT",
                 ) {
                     tracing::warn!(error = %e, "explicit COMMIT failed to finalise");
+                    self.clear_pending_dml_effects();
+                    return Err(e);
                 } else {
                     self.state.note_commit_for_gc();
                     if let Err(e) =

@@ -241,8 +241,17 @@ impl SsiManager {
                     continue;
                 }
 
-                let t1_committed = self.rw_conflicts.get(t1).is_some_and(|e| e.committed);
-                let t3_committed = self.rw_conflicts.get(t3).is_some_and(|e| e.committed);
+                let Some(t1_entry) = self.rw_conflicts.get(t1) else {
+                    continue;
+                };
+                let t1_committed = t1_entry.committed;
+                drop(t1_entry);
+
+                let Some(t3_entry) = self.rw_conflicts.get(t3) else {
+                    continue;
+                };
+                let t3_committed = t3_entry.committed;
+                drop(t3_entry);
 
                 // The structure is dangerous if any leg has committed.
                 if t1_committed || pivot_committed || t3_committed {

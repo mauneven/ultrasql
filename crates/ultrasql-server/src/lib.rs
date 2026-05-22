@@ -102,8 +102,8 @@ use ultrasql_storage::segment::{SegmentConfig, SegmentError, SegmentFileManager}
 use ultrasql_storage::sequence::{Sequence, SequenceSnapshot};
 use ultrasql_storage::vm::VisibilityMap;
 use ultrasql_txn::{
-    IsolationLevel, LockManager, LockMode, LockRequest, LockTag, RowLockMode, SsiManager,
-    Transaction, TransactionManager,
+    IsolationLevel, LockManager, LockMode, LockRequest, LockTag, PredicateLockTag, RowLockMode,
+    SsiManager, Transaction, TransactionManager, TxnError,
 };
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::Column;
@@ -3166,9 +3166,12 @@ impl Server {
         context: &str,
     ) -> Result<(), ServerError> {
         let xid = txn.xid;
-        self.txn_manager
-            .commit(txn)
-            .map_err(|e| ServerError::ddl(format!("{context} commit: {e}")))?;
+        self.txn_manager.commit(txn).map_err(|e| match e {
+            TxnError::SerializationFailure { detail, .. } => {
+                ServerError::SerializationFailure(detail)
+            }
+            other => ServerError::ddl(format!("{context} commit: {other}")),
+        })?;
         if durable_commit_marker && let Some(commit_lsn) = self.append_commit_record(xid)? {
             self.wait_for_wal_durable(commit_lsn)?;
         }
@@ -5582,6 +5585,93 @@ fn notice_warning(sqlstate: &str, message: &str) -> BackendMessage {
     }
 }
 
+pub(crate) fn record_serializable_predicate_locks(
+    plan: &LogicalPlan,
+    txn: &Transaction,
+    catalog_snapshot: &CatalogSnapshot,
+    oracle: &TransactionManager,
+) {
+    if txn.isolation != IsolationLevel::Serializable {
+        return;
+    }
+    oracle.register_serializable(txn.xid);
+    let mut tables = Vec::new();
+    collect_scan_tables(plan, &mut tables);
+    tables.sort_unstable();
+    tables.dedup();
+    for table in tables {
+        if let Some(entry) = catalog_snapshot.tables.get(table) {
+            oracle
+                .record_predicate_lock(txn.xid, PredicateLockTag::Relation(RelationId(entry.oid)));
+        }
+    }
+}
+
+pub(crate) fn record_serializable_write_conflicts(
+    plan: &LogicalPlan,
+    txn: &Transaction,
+    catalog_snapshot: &CatalogSnapshot,
+    oracle: &TransactionManager,
+) {
+    if txn.isolation != IsolationLevel::Serializable {
+        return;
+    }
+    oracle.register_serializable(txn.xid);
+    let Some(table) = dml_target_table_name(plan) else {
+        return;
+    };
+    let Some(entry) = catalog_snapshot.tables.get(table) else {
+        return;
+    };
+    let tag = PredicateLockTag::Relation(RelationId(entry.oid));
+    let readers = oracle.record_write_conflicts(txn.xid, &tag);
+    if !readers.is_empty() {
+        tracing::debug!(
+            table = %entry.name,
+            writer = ?txn.xid,
+            readers = ?readers,
+            "SSI recorded relation-level write conflicts",
+        );
+    }
+}
+
+fn dml_target_table_name(plan: &LogicalPlan) -> Option<&str> {
+    match plan {
+        LogicalPlan::Insert { table, .. }
+        | LogicalPlan::Update { table, .. }
+        | LogicalPlan::Delete { table, .. } => Some(table.as_str()),
+        _ => None,
+    }
+}
+
+fn collect_scan_tables<'a>(plan: &'a LogicalPlan, out: &mut Vec<&'a str>) {
+    match plan {
+        LogicalPlan::Scan { table, .. } => out.push(table.as_str()),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Window { input, .. }
+        | LogicalPlan::LockRows { input, .. } => collect_scan_tables(input, out),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {
+            collect_scan_tables(left, out);
+            collect_scan_tables(right, out);
+        }
+        LogicalPlan::Insert { source, .. } => collect_scan_tables(source, out),
+        LogicalPlan::Update { input, .. } | LogicalPlan::Delete { input, .. } => {
+            collect_scan_tables(input, out);
+        }
+        LogicalPlan::Cte {
+            definition, body, ..
+        } => {
+            collect_scan_tables(definition, out);
+            collect_scan_tables(body, out);
+        }
+        _ => {}
+    }
+}
+
 /// Run a non-DDL, non-transaction-control plan inside the given
 /// transaction and return the assembled wire-message result.
 ///
@@ -5622,6 +5712,8 @@ fn run_plan_in_txn(
     {
         return Ok(result);
     }
+    record_serializable_predicate_locks(plan, txn, &catalog_snapshot, oracle.as_ref());
+    record_serializable_write_conflicts(plan, txn, &catalog_snapshot, oracle.as_ref());
     acquire_simple_lock_rows(
         plan,
         &catalog_snapshot,

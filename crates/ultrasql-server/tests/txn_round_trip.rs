@@ -57,6 +57,42 @@ async fn start_server_and_connect() -> (
     (client, conn_handle, server_handle)
 }
 
+async fn start_server_and_connect_pair() -> (
+    tokio_postgres::Client,
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
+) {
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
+    let (listener, bound) = bind_listener(addr).await.expect("bind");
+    let server = Arc::new(Server::with_sample_database());
+    let server_handle = tokio::spawn(serve_listener(listener, server));
+
+    let conn_str = format!(
+        "host={host} port={port} user=tester application_name=txn_test",
+        host = bound.ip(),
+        port = bound.port()
+    );
+    let (a, a_connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("tokio-postgres connect a");
+    let (b, b_connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("tokio-postgres connect b");
+    let a_handle = tokio::spawn(async move {
+        if let Err(e) = a_connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+    let b_handle = tokio::spawn(async move {
+        if let Err(e) = b_connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+    (a, b, a_handle, b_handle, server_handle)
+}
+
 async fn shutdown(
     client: tokio_postgres::Client,
     server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
@@ -524,6 +560,80 @@ async fn begin_isolation_level_serializable_round_trip() {
     client.batch_execute("COMMIT").await.expect("COMMIT");
 
     shutdown(client, server_handle).await;
+}
+
+/// Two serializable transactions that both read a relation and then
+/// update disjoint rows form a classic SSI dangerous structure.
+#[tokio::test]
+async fn serializable_write_skew_aborts_pivot() {
+    let (a, b, a_handle, b_handle, server_handle) = start_server_and_connect_pair().await;
+
+    a.batch_execute("CREATE TABLE ssi_shift (id INT NOT NULL, on_call INT)")
+        .await
+        .expect("create table");
+    a.batch_execute("INSERT INTO ssi_shift VALUES (1, 1), (2, 1)")
+        .await
+        .expect("seed");
+
+    a.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin a");
+    b.batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin b");
+
+    assert_eq!(
+        a.query_one("SELECT COUNT(*) FROM ssi_shift WHERE on_call = 1", &[])
+            .await
+            .expect("read a")
+            .get::<_, i64>(0),
+        2
+    );
+    assert_eq!(
+        b.query_one("SELECT COUNT(*) FROM ssi_shift WHERE on_call = 1", &[])
+            .await
+            .expect("read b")
+            .get::<_, i64>(0),
+        2
+    );
+
+    a.batch_execute("UPDATE ssi_shift SET on_call = 0 WHERE id = 1")
+        .await
+        .expect("update a");
+    b.batch_execute("UPDATE ssi_shift SET on_call = 0 WHERE id = 2")
+        .await
+        .expect("update b");
+
+    let a_commit = a.batch_execute("COMMIT").await;
+    let b_commit = b.batch_execute("COMMIT").await;
+    let ok_commits = [&a_commit, &b_commit]
+        .iter()
+        .filter(|result| result.is_ok())
+        .count();
+    let serialization_failures = [&a_commit, &b_commit]
+        .iter()
+        .filter(|result| {
+            result
+                .as_ref()
+                .err()
+                .and_then(|err| err.code())
+                .is_some_and(|code| code.code() == "40001")
+        })
+        .count();
+    assert_eq!(
+        ok_commits, 1,
+        "one write-skew transaction should commit: a={a_commit:?}, b={b_commit:?}",
+    );
+    assert_eq!(
+        serialization_failures, 1,
+        "one write-skew transaction should abort with 40001: a={a_commit:?}, b={b_commit:?}",
+    );
+
+    drop(a);
+    drop(b);
+    a_handle.abort();
+    b_handle.abort();
+    server_handle.abort();
 }
 
 /// `SAVEPOINT` / `ROLLBACK TO SAVEPOINT` undoes writes performed

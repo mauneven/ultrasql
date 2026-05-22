@@ -104,6 +104,11 @@ pub enum ServerError {
     #[error("current transaction is aborted, commands ignored until end of transaction block")]
     TransactionAborted,
 
+    /// Serializable Snapshot Isolation detected a dangerous structure.
+    /// Maps to SQLSTATE `40001` (`serialization_failure`).
+    #[error("serialization failure: {0}")]
+    SerializationFailure(String),
+
     /// `SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` was issued
     /// outside a transaction block. Maps to PostgreSQL SQLSTATE
     /// `25P01` (`no_active_sql_transaction`). The string names the
@@ -180,6 +185,7 @@ impl ServerError {
                 | Self::Catalog(_)
                 | Self::DependentObjectsStillExist(_)
                 | Self::TransactionAborted
+                | Self::SerializationFailure(_)
                 | Self::Savepoint(_)
                 | Self::SavepointNotFound(_)
                 | Self::CopyFormat(_)
@@ -207,6 +213,7 @@ impl ServerError {
             Self::UnsupportedProtocol { .. } => "08P01",      // protocol_violation
             Self::DependentObjectsStillExist(_) => "2BP01",   // dependent_objects_still_exist
             Self::Catalog(_) => "42000",                      // generic catalog failure
+            Self::SerializationFailure(_) => "40001",         // serialization_failure
             Self::TransactionAborted => "25P02",              // in_failed_sql_transaction
             Self::Savepoint(_) => "25P01",                    // no_active_sql_transaction
             Self::SavepointNotFound(_) => "3B001",            // invalid_savepoint_specification

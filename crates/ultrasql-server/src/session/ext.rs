@@ -39,7 +39,7 @@ use crate::result_encoder::{
 use crate::workload::{WorkloadQueryRecord, plan_hash_for_plan};
 use crate::{
     BlankPageLoader, CombinedCatalog, Server, TxnState, decode_key_column, notice_warning,
-    run_plan_in_txn,
+    record_serializable_predicate_locks, record_serializable_write_conflicts, run_plan_in_txn,
 };
 
 impl<RW> Session<RW>
@@ -487,6 +487,20 @@ where
                     )),
                     profile_operators: false,
                 };
+                if let Some(plan) = portal_plan.as_ref() {
+                    record_serializable_predicate_locks(
+                        plan,
+                        &txn,
+                        &catalog_snapshot,
+                        self.state.txn_manager.as_ref(),
+                    );
+                    record_serializable_write_conflicts(
+                        plan,
+                        &txn,
+                        &catalog_snapshot,
+                        self.state.txn_manager.as_ref(),
+                    );
+                }
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
                 if res.is_ok() {
@@ -583,6 +597,20 @@ where
                     )),
                     profile_operators: false,
                 };
+                if let Some(plan) = portal_plan.as_ref() {
+                    record_serializable_predicate_locks(
+                        plan,
+                        &txn,
+                        &catalog_snapshot,
+                        self.state.txn_manager.as_ref(),
+                    );
+                    record_serializable_write_conflicts(
+                        plan,
+                        &txn,
+                        &catalog_snapshot,
+                        self.state.txn_manager.as_ref(),
+                    );
+                }
                 let res =
                     crate::extended::execute_portal(&mut self.extended, portal, max_rows, &ctx);
                 if let (Some(plan), Ok(outcome)) = (portal_plan.as_ref(), res.as_ref()) {
