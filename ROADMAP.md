@@ -2102,7 +2102,9 @@ partitioning, full-text search, remaining type coverage.
   `pg_stat_progress_create_index` — virtual PostgreSQL-compatible row
   shapes expose live workload-recorder progress rows and are validated
   through PostgreSQL wire queries in `catalog_views_round_trip.rs`.
-- [ ] `pg_statio_user_indexes`
+- [x] `pg_statio_user_indexes` — virtual PostgreSQL-compatible row shape
+  exposes catalog index rows with per-index buffer-pool read/hit counters
+  and is validated through PostgreSQL wire queries.
 - [ ] `pg_stat_bgwriter` full implementation
 - [ ] `pg_stat_replication` (if replication active)
 

@@ -60,6 +60,7 @@ pub(crate) fn virtual_catalog_schema(name: &str) -> Option<Schema> {
         "pg_catalog.pg_stat_user_tables" => Some(schema_pg_stat_user_tables()),
         "pg_catalog.pg_stat_user_indexes" => Some(schema_pg_stat_user_indexes()),
         "pg_catalog.pg_statio_user_tables" => Some(schema_pg_statio_user_tables()),
+        "pg_catalog.pg_statio_user_indexes" => Some(schema_pg_statio_user_indexes()),
         "pg_catalog.pg_stat_database" => Some(schema_pg_stat_database()),
         "pg_catalog.pg_stat_bgwriter" => Some(schema_pg_stat_bgwriter()),
         "pg_catalog.pg_stat_wal" => Some(schema_pg_stat_wal()),
@@ -148,6 +149,10 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_statio_user_tables" => Some((
             schema_pg_statio_user_tables(),
             rows_pg_statio_user_tables(ctx),
+        )),
+        "pg_catalog.pg_statio_user_indexes" => Some((
+            schema_pg_statio_user_indexes(),
+            rows_pg_statio_user_indexes(ctx),
         )),
         "pg_catalog.pg_stat_database" => {
             Some((schema_pg_stat_database(), rows_pg_stat_database(ctx)))
@@ -256,6 +261,7 @@ fn normalized_name(name: &str) -> String {
         | "pg_stat_user_tables"
         | "pg_stat_user_indexes"
         | "pg_statio_user_tables"
+        | "pg_statio_user_indexes"
         | "pg_stat_database"
         | "pg_stat_bgwriter"
         | "pg_stat_wal"
@@ -1499,6 +1505,42 @@ fn rows_pg_statio_user_tables(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Int64(0),
                 Value::Int64(0),
             ]
+        })
+        .collect()
+}
+
+fn schema_pg_statio_user_indexes() -> Schema {
+    schema([
+        Field::required("relid", DataType::Int64),
+        Field::required("indexrelid", DataType::Int64),
+        Field::required("schemaname", text()),
+        Field::required("relname", text()),
+        Field::required("indexrelname", text()),
+        Field::required("idx_blks_read", DataType::Int64),
+        Field::required("idx_blks_hit", DataType::Int64),
+    ])
+}
+
+fn rows_pg_statio_user_indexes(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let mut indexes: Vec<_> = ctx.catalog_snapshot.indexes.values().collect();
+    indexes.sort_by(|a, b| a.name.cmp(&b.name));
+    indexes
+        .into_iter()
+        .filter_map(|idx| {
+            let table = ctx.catalog_snapshot.tables_by_oid.get(&idx.table_oid)?;
+            let index_io = ctx
+                .heap
+                .buffer_pool()
+                .relation_stats(ultrasql_core::RelationId(idx.oid));
+            Some(vec![
+                v_i64(table.oid.raw()),
+                v_i64(idx.oid.raw()),
+                v_text(table.schema_name.clone()),
+                v_text(table.name.clone()),
+                v_text(idx.name.clone()),
+                Value::Int64(u64_to_i64_saturating(index_io.reads)),
+                Value::Int64(u64_to_i64_saturating(index_io.hits)),
+            ])
         })
         .collect()
 }
