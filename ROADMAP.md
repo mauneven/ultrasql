@@ -1677,7 +1677,12 @@ behavior are implemented and validated.
   background server-side archiver, substitutes `%p` / `%f`, records
   `pg_wal/archive_status/*.done`, and skips the newest WAL file to avoid
   archiving the active segment.
-- [ ] WAL restore (`restore_command`) — CLI restore utility exists via `ultrasql --restore-wal`; recovery integration pending
+- [x] WAL restore (`restore_command`) — CLI restore utility exists via
+  `ultrasql --restore-wal`; `ultrasqld --restore-command '...'`
+  restores bounded archived `segment_##########` WAL files into `pg_wal`
+  before `Server::init` recovery, substitutes `%p` / `%f`, records
+  `pg_wal/restore_status/*.done`, and stops at the first missing archive
+  segment.
 - [ ] Base backup (`pg_basebackup` equivalent) — `ultrasql --basebackup DEST --data-dir DIR` copies files and writes `backup_manifest.json`; online checkpoint fencing pending
 - [x] `recovery.signal` / `standby.signal` support — CLI signal-file
   helpers via `ultrasql --ctl recovery|standby`; server startup detects

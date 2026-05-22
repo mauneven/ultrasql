@@ -106,6 +106,17 @@ struct Cli {
     #[arg(long, env = "ULTRASQL_ARCHIVE_COMMAND")]
     archive_command: Option<String>,
 
+    /// Shell command used to restore archived WAL files before startup
+    /// recovery. `%p` expands to the destination path and `%f` expands to the
+    /// WAL filename.
+    #[arg(long, env = "ULTRASQL_RESTORE_COMMAND")]
+    restore_command: Option<String>,
+
+    /// Maximum number of WAL segment names to probe with `restore_command`.
+    /// Zero disables server-side startup restore.
+    #[arg(long, default_value_t = 0)]
+    restore_max_segments: u32,
+
     /// Background WAL archive scan interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     archive_interval_ms: u64,
@@ -162,6 +173,7 @@ Production-oriented v0.9 flags:
   - --log-min-duration-statement-ms N
   - --log-statement none|ddl|mod|all
   - --archive-command CMD  archive completed WAL files; %p=path, %f=name
+  - --restore-command CMD  restore archived WAL before recovery; %p=path, %f=name
 ";
 
 fn main() -> std::process::ExitCode {
@@ -186,6 +198,7 @@ fn main() -> std::process::ExitCode {
     };
     let wal_archive_config = WalArchiveConfig {
         archive_command: cli.archive_command.clone().unwrap_or_default(),
+        restore_command: cli.restore_command.clone().unwrap_or_default(),
     };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -200,18 +213,36 @@ fn main() -> std::process::ExitCode {
     };
 
     let state = match &cli.data_dir {
-        Some(path) => match Server::init(path) {
-            Ok(mut server) => {
-                server.set_autovacuum_config(autovacuum_config);
-                server.set_logging_config(logging_config);
-                server.set_wal_archive_config(wal_archive_config.clone());
-                Arc::new(server)
+        Some(path) => {
+            if let Some(command) = cli
+                .restore_command
+                .as_deref()
+                .filter(|command| !command.trim().is_empty())
+            {
+                match restore_wal_once(path, command, cli.restore_max_segments) {
+                    Ok(restored) if restored > 0 => {
+                        info!(target: "ultrasqld", restored, data_dir = %path.display(), "restored archived WAL before startup recovery");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!(target: "ultrasqld", error = %e, data_dir = %path.display(), "WAL restore failed");
+                        return std::process::ExitCode::from(1);
+                    }
+                }
             }
-            Err(e) => {
-                error!(target: "ultrasqld", error = %e, data_dir = %path.display(), "server init failed");
-                return std::process::ExitCode::from(1);
+            match Server::init(path) {
+                Ok(mut server) => {
+                    server.set_autovacuum_config(autovacuum_config);
+                    server.set_logging_config(logging_config);
+                    server.set_wal_archive_config(wal_archive_config.clone());
+                    Arc::new(server)
+                }
+                Err(e) => {
+                    error!(target: "ultrasqld", error = %e, data_dir = %path.display(), "server init failed");
+                    return std::process::ExitCode::from(1);
+                }
             }
-        },
+        }
         None => {
             let mut server = Server::with_sample_database();
             server.set_autovacuum_config(autovacuum_config);
@@ -370,13 +401,74 @@ fn archive_wal_once(data_dir: &Path, archive_command: &str) -> Result<usize, Str
     Ok(archived)
 }
 
+fn restore_wal_once(
+    data_dir: &Path,
+    restore_command: &str,
+    max_segments: u32,
+) -> Result<usize, String> {
+    if restore_command.trim().is_empty() || max_segments == 0 {
+        return Ok(0);
+    }
+
+    let wal_dir = data_dir.join("pg_wal");
+    let status_dir = wal_dir.join("restore_status");
+    fs::create_dir_all(&status_dir).map_err(|e| format!("create restore_status: {e}"))?;
+
+    let mut restored = 0_usize;
+    for index in 0..max_segments {
+        let name = wal_segment_filename(index);
+        let path = wal_dir.join(&name);
+        if path.is_file() {
+            continue;
+        }
+
+        let rendered = render_restore_command(restore_command, &path, &name);
+        let status = run_restore_shell_command(&rendered)
+            .map_err(|e| format!("restore command spawn failed for {name}: {e}"))?;
+        if !status.success() {
+            let missing = status_dir.join(format!("{name}.missing"));
+            let _ = fs::write(&missing, rendered.as_bytes());
+            break;
+        }
+        if !path.is_file() {
+            let missing = status_dir.join(format!("{name}.missing"));
+            let _ = fs::write(&missing, rendered.as_bytes());
+            break;
+        }
+
+        let done = status_dir.join(format!("{name}.done"));
+        fs::write(&done, rendered.as_bytes())
+            .map_err(|e| format!("write {}: {e}", done.display()))?;
+        restored = restored.saturating_add(1);
+    }
+    Ok(restored)
+}
+
+fn wal_segment_filename(index: u32) -> String {
+    format!("segment_{index:010}")
+}
+
 fn render_archive_command(template: &str, path: &Path, filename: &str) -> String {
     template
         .replace("%p", &path.to_string_lossy())
         .replace("%f", filename)
 }
 
+fn render_restore_command(template: &str, path: &Path, filename: &str) -> String {
+    template
+        .replace("%p", &path.to_string_lossy())
+        .replace("%f", filename)
+}
+
 fn run_archive_shell_command(command: &str) -> std::io::Result<std::process::ExitStatus> {
+    run_shell_command(command)
+}
+
+fn run_restore_shell_command(command: &str) -> std::io::Result<std::process::ExitStatus> {
+    run_shell_command(command)
+}
+
+fn run_shell_command(command: &str) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(windows)]
     {
         Command::new("cmd").args(["/C", command]).status()
@@ -690,6 +782,8 @@ mod tests {
             autovacuum_analyze_threshold: 11,
             autovacuum_analyze_scale_factor: 0.125,
             archive_command: None,
+            restore_command: None,
+            restore_max_segments: 0,
             archive_interval_ms: 1000,
         };
 
@@ -718,6 +812,8 @@ mod tests {
             autovacuum_analyze_threshold: 50,
             autovacuum_analyze_scale_factor: 0.1,
             archive_command: None,
+            restore_command: None,
+            restore_max_segments: 0,
             archive_interval_ms: 1000,
         };
 
@@ -741,6 +837,8 @@ mod tests {
             autovacuum_analyze_threshold: 50,
             autovacuum_analyze_scale_factor: 0.1,
             archive_command: None,
+            restore_command: None,
+            restore_max_segments: 0,
             archive_interval_ms: 1000,
         };
 
@@ -764,6 +862,8 @@ mod tests {
             autovacuum_analyze_threshold: 50,
             autovacuum_analyze_scale_factor: 0.1,
             archive_command: None,
+            restore_command: None,
+            restore_max_segments: 0,
             archive_interval_ms: 1000,
         };
 
@@ -831,6 +931,72 @@ mod tests {
     #[cfg(not(windows))]
     fn successful_archive_command() -> &'static str {
         "true"
+    }
+
+    #[test]
+    fn restore_command_renderer_expands_destination_and_filename() {
+        let rendered = render_restore_command(
+            "copy archive/%f %p",
+            Path::new("/data/pg_wal/segment_0000000007"),
+            "segment_0000000007",
+        );
+
+        assert_eq!(
+            rendered,
+            "copy archive/segment_0000000007 /data/pg_wal/segment_0000000007"
+        );
+    }
+
+    #[test]
+    fn restore_wal_once_restores_until_first_missing_segment() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let archive = tempfile::TempDir::new().expect("archive dir");
+        let wal_dir = dir.path().join("pg_wal");
+        std::fs::create_dir_all(&wal_dir).expect("pg_wal");
+        std::fs::write(archive.path().join("segment_0000000000"), b"wal-a").expect("wal a");
+        std::fs::write(archive.path().join("segment_0000000001"), b"wal-b").expect("wal b");
+
+        let command = copy_restore_command(archive.path());
+        assert_eq!(
+            restore_wal_once(dir.path(), &command, 3).expect("restore wal"),
+            2
+        );
+        assert_eq!(
+            std::fs::read(wal_dir.join("segment_0000000000")).expect("restored 0"),
+            b"wal-a"
+        );
+        assert_eq!(
+            std::fs::read(wal_dir.join("segment_0000000001")).expect("restored 1"),
+            b"wal-b"
+        );
+        assert!(
+            wal_dir
+                .join("restore_status/segment_0000000000.done")
+                .exists()
+        );
+        assert!(
+            wal_dir
+                .join("restore_status/segment_0000000001.done")
+                .exists()
+        );
+        assert!(
+            wal_dir
+                .join("restore_status/segment_0000000002.missing")
+                .exists()
+        );
+    }
+
+    #[cfg(windows)]
+    fn copy_restore_command(archive_dir: &Path) -> String {
+        format!(
+            "copy /Y \"{}\\%f\" \"%p\" >NUL 2>NUL",
+            archive_dir.display()
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn copy_restore_command(archive_dir: &Path) -> String {
+        format!("cp '{}/%f' '%p' 2>/dev/null", archive_dir.display())
     }
 
     #[test]

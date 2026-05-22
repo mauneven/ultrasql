@@ -2092,11 +2092,13 @@ pub struct LoggingConfig {
     pub log_statement: LogStatementMode,
 }
 
-/// Runtime WAL archive configuration.
+/// Runtime WAL archive/restore configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct WalArchiveConfig {
     /// Shell command used to archive completed WAL files; empty means off.
     pub archive_command: String,
+    /// Shell command used to restore archived WAL files; empty means off.
+    pub restore_command: String,
 }
 
 impl Default for LoggingConfig {

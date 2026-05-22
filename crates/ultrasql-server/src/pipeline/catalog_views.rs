@@ -1219,7 +1219,7 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("restore_command"),
-            v_text(""),
+            v_text(&ctx.wal_archive_config.restore_command),
             Value::Null,
             v_text("Write-Ahead Log / Recovery"),
             v_text("Command to restore archived WAL files."),
