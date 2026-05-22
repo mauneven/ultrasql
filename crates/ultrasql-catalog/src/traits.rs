@@ -146,6 +146,17 @@ pub trait MutableCatalog: Catalog {
         new_schema: ultrasql_core::Schema,
     ) -> Result<TableEntry, CatalogError>;
 
+    /// Replace relation storage options on the named table.
+    ///
+    /// # Errors
+    /// - [`CatalogError::NotFound`] when no table by `name` is
+    ///   registered.
+    fn alter_table_options(
+        &self,
+        name: &str,
+        options: Vec<(String, String)>,
+    ) -> Result<TableEntry, CatalogError>;
+
     /// Rename a table.
     ///
     /// The [`Oid`] is preserved. Dependent indexes keep their `table_oid`

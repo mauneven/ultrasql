@@ -2160,6 +2160,68 @@ impl AutovacuumConfig {
     }
 }
 
+pub(crate) fn validate_autovacuum_reloptions(
+    options: &[(String, String)],
+) -> Result<(), ServerError> {
+    let mut config = AutovacuumConfig::default();
+    apply_autovacuum_reloptions(&mut config, options)?;
+    Ok(())
+}
+
+fn autovacuum_config_for_table(base: AutovacuumConfig, entry: &TableEntry) -> AutovacuumConfig {
+    let mut config = base;
+    if let Err(error) = apply_autovacuum_reloptions(&mut config, &entry.options) {
+        tracing::warn!(
+            table = %entry.name,
+            error = %error,
+            "ignoring invalid autovacuum reloptions",
+        );
+        return base;
+    }
+    config
+}
+
+fn apply_autovacuum_reloptions(
+    config: &mut AutovacuumConfig,
+    options: &[(String, String)],
+) -> Result<(), ServerError> {
+    for (name, value) in options {
+        match name.as_str() {
+            "autovacuum_vacuum_threshold" => {
+                config.vacuum_threshold = parse_autovacuum_u64(name, value)?;
+            }
+            "autovacuum_vacuum_scale_factor" => {
+                config.vacuum_scale_factor_ppm = parse_autovacuum_scale(name, value)?;
+            }
+            "autovacuum_analyze_threshold" => {
+                config.analyze_threshold = parse_autovacuum_u64(name, value)?;
+            }
+            "autovacuum_analyze_scale_factor" => {
+                config.analyze_scale_factor_ppm = parse_autovacuum_scale(name, value)?;
+            }
+            _ => {
+                return Err(ServerError::Ddl(format!(
+                    "unsupported autovacuum reloption: {name}",
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_autovacuum_u64(name: &str, value: &str) -> Result<u64, ServerError> {
+    value
+        .parse::<u64>()
+        .map_err(|_| ServerError::Ddl(format!("{name} must be a non-negative integer")))
+}
+
+fn parse_autovacuum_scale(name: &str, value: &str) -> Result<u64, ServerError> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_| ServerError::Ddl(format!("{name} must be a non-negative finite number")))?;
+    AutovacuumConfig::scale_factor_to_ppm(name, parsed).map_err(ServerError::Ddl)
+}
+
 fn scaled_threshold(base: u64, scale_factor_ppm: u64, estimated_rows: u64) -> u64 {
     let scaled = (u128::from(estimated_rows) * u128::from(scale_factor_ppm))
         / u128::from(AUTOVACUUM_SCALE_DENOMINATOR);
@@ -3282,8 +3344,7 @@ impl Server {
                 .block_count(RelationId(entry.oid))
                 .max(entry.n_blocks);
             let estimated_rows = u64::from(blocks).saturating_mul(64);
-            let threshold = self
-                .autovacuum_config
+            let threshold = autovacuum_config_for_table(self.autovacuum_config, entry)
                 .vacuum_threshold_for_rows(estimated_rows);
             if modified < threshold {
                 continue;
@@ -5296,7 +5357,7 @@ impl Server {
         let rel = RelationId(entry.oid);
         let blocks = u64::from(self.heap.block_count(rel).max(entry.n_blocks));
         let estimated_rows = blocks.saturating_mul(64);
-        self.autovacuum_config
+        autovacuum_config_for_table(self.autovacuum_config, entry)
             .analyze_threshold_for_rows(estimated_rows)
     }
 

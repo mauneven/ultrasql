@@ -8,6 +8,7 @@
 //! - `ADD CONSTRAINT name constraint`
 //! - `DROP CONSTRAINT name [CASCADE|RESTRICT]`
 //! - `ENABLE ROW LEVEL SECURITY`
+//! - `SET (option = value, ...)`
 
 use crate::ast::{AlterTableAction, AlterTableStmt};
 use crate::parser::{ParseError, Parser};
@@ -106,6 +107,15 @@ impl Parser<'_> {
                     span: Span::new(start, end),
                 })
             }
+            TokenKind::KwSet => {
+                self.advance()?; // SET
+                let options = self.parse_index_options()?;
+                let end = self.peek()?.span.start;
+                Ok(AlterTableAction::SetOptions {
+                    options,
+                    span: Span::new(start, end),
+                })
+            }
             TokenKind::Identifier
                 if tok
                     .text(self.source)
@@ -121,7 +131,7 @@ impl Parser<'_> {
                 })
             }
             other => Err(ParseError::Expected {
-                expected: "ADD, DROP, or RENAME",
+                expected: "ADD, DROP, RENAME, or SET",
                 found: other,
                 offset: tok.span.start as usize,
             }),
@@ -214,6 +224,19 @@ mod tests {
         };
         assert_eq!(name.value, "fk_user");
         assert!(cascade);
+    }
+
+    #[test]
+    fn alter_table_set_options() {
+        let stmt = parse_alter(
+            "ALTER TABLE t SET (autovacuum_vacuum_threshold = 7, autovacuum_analyze_scale_factor = 0.05)",
+        );
+        let AlterTableAction::SetOptions { options, .. } = stmt.action else {
+            panic!("expected SetOptions")
+        };
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].name.value, "autovacuum_vacuum_threshold");
+        assert_eq!(options[1].name.value, "autovacuum_analyze_scale_factor");
     }
 
     // ---- negative case ----------------------------------------------------

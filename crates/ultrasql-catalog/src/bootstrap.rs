@@ -283,6 +283,7 @@ pub fn system_table_entries() -> Vec<TableEntry> {
                 created_at_lsn: Lsn::ZERO,
                 n_blocks: 0,
                 root_block: BlockNumber::INVALID,
+                options: Vec::new(),
             }
         };
     }

@@ -1629,9 +1629,12 @@ behavior are implemented and validated.
   `--autovacuum-analyze-threshold` /
   `--autovacuum-analyze-scale-factor`; same values drive DML-triggered
   analyze scheduling and `pg_settings`.
-- [ ] Per-table autovacuum settings — v0.9 supports PostgreSQL-compatible
-  global threshold knobs through `pg_settings`; per-relation storage
-  overrides remain a catalog-extension item.
+- [x] Per-table autovacuum settings — `ALTER TABLE ... SET
+  (autovacuum_vacuum_threshold = ..., autovacuum_vacuum_scale_factor =
+  ..., autovacuum_analyze_threshold = ...,
+  autovacuum_analyze_scale_factor = ...)` stores relation options in the
+  catalog, persists them through `pg_class`, and applies overrides to
+  autovacuum/analyze thresholds.
 - [x] Vacuum FREEZE to prevent XID age buildup — VACUUM/autovacuum now
   refresh heap visibility and reclaim dead tuples; aggressive
   wraparound-grade freezing remains tied to long-running transaction

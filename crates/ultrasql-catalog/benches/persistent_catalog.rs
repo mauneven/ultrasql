@@ -49,6 +49,7 @@ fn seeded_catalog(n: u32) -> Arc<PersistentCatalog> {
             created_at_lsn: Lsn::ZERO,
             n_blocks: 0,
             root_block: BlockNumber::INVALID,
+            options: Vec::new(),
         })
         .expect("bench create_table");
     }

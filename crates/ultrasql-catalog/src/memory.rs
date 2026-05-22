@@ -326,6 +326,29 @@ impl MutableCatalog for InMemoryCatalog {
         Ok(updated)
     }
 
+    fn alter_table_options(
+        &self,
+        name: &str,
+        options: Vec<(String, String)>,
+    ) -> Result<TableEntry, CatalogError> {
+        let key = fold_name(name);
+        let existing = self
+            .tables_by_name
+            .get(&key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .value()
+            .clone();
+        let mut updated = existing.clone();
+        updated.options = options;
+        if let Some(mut entry) = self.tables_by_name.get_mut(&key) {
+            *entry = updated.clone();
+        }
+        if let Some(mut entry) = self.tables_by_oid.get_mut(&existing.oid) {
+            *entry = updated.clone();
+        }
+        Ok(updated)
+    }
+
     fn alter_table_rename(
         &self,
         old_name: &str,
@@ -378,6 +401,7 @@ mod tests {
             created_at_lsn: Lsn::ZERO,
             n_blocks: 0,
             root_block: BlockNumber::INVALID,
+            options: Vec::new(),
         }
     }
 

@@ -160,7 +160,7 @@ impl Parser<'_> {
         })
     }
 
-    fn parse_index_options(&mut self) -> Result<Vec<IndexOption>, ParseError> {
+    pub(crate) fn parse_index_options(&mut self) -> Result<Vec<IndexOption>, ParseError> {
         self.expect(TokenKind::LParen, "(")?;
         let mut options = Vec::new();
         loop {

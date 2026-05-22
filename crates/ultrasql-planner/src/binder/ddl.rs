@@ -30,7 +30,7 @@ use crate::plan::{
     LogicalExclusionConstraint, LogicalExclusionElement, LogicalForeignKeyConstraint,
     LogicalIndexMethod, LogicalIndexOption, LogicalReferentialAction, LogicalRlsCommand,
     LogicalRlsPermissiveness, LogicalRlsPolicy, LogicalSequenceChange, LogicalSequenceOptions,
-    LogicalTenantPolicyExpr, LogicalTimePartition, LogicalUniqueConstraint,
+    LogicalTableOption, LogicalTenantPolicyExpr, LogicalTimePartition, LogicalUniqueConstraint,
 };
 
 struct RawUniqueConstraint {
@@ -1911,6 +1911,18 @@ pub(super) fn bind_alter_table(
         AlterTableAction::EnableRowLevelSecurity { .. } => {
             LogicalAlterTableAction::EnableRowLevelSecurity
         }
+        AlterTableAction::SetOptions { options, .. } => {
+            let options = options
+                .iter()
+                .map(|option| {
+                    let name = option.name.value.to_ascii_lowercase();
+                    validate_table_option_name(&name)?;
+                    let value = index_option_value_to_string(&option.value)?;
+                    Ok(LogicalTableOption { name, value })
+                })
+                .collect::<Result<Vec<_>, PlanError>>()?;
+            LogicalAlterTableAction::SetOptions { options }
+        }
         AlterTableAction::AddConstraint { .. } => {
             return Err(PlanError::NotSupported(
                 "ALTER TABLE: ADD CONSTRAINT not yet supported",
@@ -1928,6 +1940,18 @@ pub(super) fn bind_alter_table(
         action,
         schema: Schema::empty(),
     })
+}
+
+fn validate_table_option_name(name: &str) -> Result<(), PlanError> {
+    match name {
+        "autovacuum_vacuum_threshold"
+        | "autovacuum_vacuum_scale_factor"
+        | "autovacuum_analyze_threshold"
+        | "autovacuum_analyze_scale_factor" => Ok(()),
+        _ => Err(PlanError::NotSupported(
+            "ALTER TABLE SET supports autovacuum reloptions only",
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------

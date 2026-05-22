@@ -55,6 +55,8 @@ pub struct TableEntry {
     /// that have not been materialized yet (CREATE TABLE without any
     /// inserts).
     pub root_block: BlockNumber,
+    /// Relation storage options supplied by `ALTER TABLE ... SET (...)`.
+    pub options: Vec<(String, String)>,
 }
 
 impl TableEntry {
@@ -73,7 +75,15 @@ impl TableEntry {
             created_at_lsn: Lsn::ZERO,
             n_blocks: 0,
             root_block: BlockNumber::INVALID,
+            options: Vec::new(),
         }
+    }
+
+    /// Attach relation storage options.
+    #[must_use]
+    pub fn with_options(mut self, options: Vec<(String, String)>) -> Self {
+        self.options = options;
+        self
     }
 }
 

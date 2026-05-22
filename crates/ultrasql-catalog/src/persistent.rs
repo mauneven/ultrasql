@@ -117,6 +117,8 @@ pub struct ClassRow {
     pub relfilenode: u32,
     /// `relhasindex` — true when at least one index exists.
     pub relhasindex: bool,
+    /// Internal relation storage options captured from `ALTER TABLE ... SET`.
+    pub reloptions: Vec<(String, String)>,
 }
 
 /// A row in `pg_attribute`.
@@ -722,6 +724,7 @@ impl PersistentCatalog {
                         created_at_lsn: ultrasql_core::Lsn::ZERO,
                         n_blocks: class_row.relpages,
                         root_block: ultrasql_core::BlockNumber::new(class_row.relfilenode),
+                        options: class_row.reloptions.clone(),
                     };
                     let key = class_row.relname.to_ascii_lowercase();
                     tables.insert(key, entry.clone());
@@ -942,6 +945,7 @@ impl PersistentCatalog {
             reltuples: 0.0,
             relfilenode: entry.root_block.raw(),
             relhasindex: false,
+            reloptions: Vec::new(),
         };
         heap.insert(
             pg_class_rel,
@@ -1051,6 +1055,7 @@ impl PersistentCatalog {
             reltuples: 0.0,
             relfilenode: 0,
             relhasindex: false,
+            reloptions: Vec::new(),
         };
         heap.insert(
             pg_class_rel,
@@ -1147,6 +1152,7 @@ impl PersistentCatalog {
             reltuples: 0.0,
             relfilenode: new_entry.root_block.raw(),
             relhasindex: false,
+            reloptions: new_entry.options.clone(),
         };
         heap.insert(
             pg_class_rel,
@@ -1249,6 +1255,7 @@ impl PersistentCatalog {
             reltuples: 0.0,
             relfilenode: entry.root_block.raw(),
             relhasindex: false,
+            reloptions: entry.options.clone(),
         };
         heap.insert(
             pg_class_rel,
@@ -1349,6 +1356,7 @@ impl PersistentCatalog {
             reltuples: 0.0,
             relfilenode: entry.root_block.raw(),
             relhasindex: false,
+            reloptions: entry.options.clone(),
         };
         let class_bytes = class_row.encode();
         let wal = heap.wal_sink().map(|sink| sink.as_ref());
@@ -1811,6 +1819,31 @@ impl MutableCatalog for PersistentCatalog {
         Ok(updated)
     }
 
+    fn alter_table_options(
+        &self,
+        name: &str,
+        options: Vec<(String, String)>,
+    ) -> Result<TableEntry, CatalogError> {
+        let key = fold_name(name);
+        let _guard = self.write_lock.lock();
+        let existing = self
+            .tables_by_name
+            .get(&key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .value()
+            .clone();
+        let mut updated = existing.clone();
+        updated.options = options;
+        if let Some(mut entry) = self.tables_by_name.get_mut(&key) {
+            *entry = updated.clone();
+        }
+        if let Some(mut entry) = self.tables_by_oid.get_mut(&existing.oid) {
+            *entry = updated.clone();
+        }
+        self.rebuild_snapshot();
+        Ok(updated)
+    }
+
     fn alter_table_rename(
         &self,
         old_name: &str,
@@ -1867,6 +1900,7 @@ mod tests {
             created_at_lsn: Lsn::ZERO,
             n_blocks: 0,
             root_block: BlockNumber::INVALID,
+            options: Vec::new(),
         }
     }
 
@@ -1945,6 +1979,7 @@ mod tests {
                 reltuples: 0.0,
                 relfilenode: 0,
                 relhasindex: false,
+                reloptions: Vec::new(),
             },
         );
         assert!(cat.pg_class.contains_key(&oid));

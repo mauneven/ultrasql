@@ -111,6 +111,15 @@ pub struct LogicalIndexOption {
     pub value: String,
 }
 
+/// Bound `ALTER TABLE ... SET (...)` relation storage option.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalTableOption {
+    /// Lowercase option name.
+    pub name: String,
+    /// Literal option value rendered as text.
+    pub value: String,
+}
+
 /// Bound metadata for `CREATE AGGREGATING INDEX`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogicalAggregatingIndex {
@@ -1389,6 +1398,11 @@ pub enum LogicalAlterTableAction {
     },
     /// `ALTER TABLE t ENABLE ROW LEVEL SECURITY`.
     EnableRowLevelSecurity,
+    /// `ALTER TABLE t SET (...)`.
+    SetOptions {
+        /// Relation storage options.
+        options: Vec<LogicalTableOption>,
+    },
 }
 
 /// Tenant row-security predicate supported by the v1 RLS path.
@@ -2139,6 +2153,17 @@ impl LogicalPlan {
                         let _ = fmt::write(
                             out,
                             format_args!("AlterTable: {table_name} ENABLE ROW LEVEL SECURITY\n"),
+                        );
+                    }
+                    LogicalAlterTableAction::SetOptions { options } => {
+                        let rendered = options
+                            .iter()
+                            .map(|option| format!("{}={}", option.name, option.value))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = fmt::write(
+                            out,
+                            format_args!("AlterTable: {table_name} SET ({rendered})\n"),
                         );
                     }
                 }

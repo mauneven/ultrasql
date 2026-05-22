@@ -109,6 +109,13 @@ impl Writer<'_> {
         self.u32(u32::try_from(bytes.len()).expect("string fits in u32"));
         self.0.extend_from_slice(bytes);
     }
+    fn string_pairs(&mut self, pairs: &[(String, String)]) {
+        self.u32(u32::try_from(pairs.len()).expect("pair count fits in u32"));
+        for (key, value) in pairs {
+            self.str(key);
+            self.str(value);
+        }
+    }
     fn opt_u32(&mut self, v: Option<u32>) {
         match v {
             None => self.0.push(0),
@@ -463,6 +470,7 @@ impl ClassRow {
         w.f64(self.reltuples);
         w.u32(self.relfilenode);
         w.bool(self.relhasindex);
+        w.string_pairs(&self.reloptions);
         out
     }
 
@@ -482,6 +490,18 @@ impl ClassRow {
         let reltuples = r.f64()?;
         let relfilenode = r.u32()?;
         let relhasindex = r.bool()?;
+        let reloptions = if r.remaining() == 0 {
+            Vec::new()
+        } else {
+            let count = r.u32()?;
+            let mut options = Vec::with_capacity(usize::try_from(count).unwrap_or(0));
+            for _ in 0..count {
+                let key = r.str()?;
+                let value = r.str()?;
+                options.push((key, value));
+            }
+            options
+        };
         Ok(Self {
             oid,
             relname,
@@ -491,6 +511,7 @@ impl ClassRow {
             reltuples,
             relfilenode,
             relhasindex,
+            reloptions,
         })
     }
 }
@@ -917,6 +938,7 @@ mod tests {
             reltuples: 12345.5,
             relfilenode: 42,
             relhasindex: true,
+            reloptions: vec![("autovacuum_vacuum_threshold".to_owned(), "7".to_owned())],
         }
     }
 

@@ -696,6 +696,13 @@ pub enum AlterTableAction {
         /// Source span.
         span: Span,
     },
+    /// `SET (option = value, ...)`.
+    SetOptions {
+        /// Relation storage options.
+        options: Vec<IndexOption>,
+        /// Source span.
+        span: Span,
+    },
 }
 
 /// `CREATE SCHEMA [IF NOT EXISTS] name`.

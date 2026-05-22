@@ -109,7 +109,55 @@ where
             LogicalAlterTableAction::EnableRowLevelSecurity => {
                 self.execute_alter_enable_row_security(table_name, snapshot)
             }
+            LogicalAlterTableAction::SetOptions { options } => {
+                self.execute_alter_set_options(table_name, options, snapshot)
+            }
         }
+    }
+
+    fn execute_alter_set_options(
+        &self,
+        table_name: &str,
+        options: &[ultrasql_planner::LogicalTableOption],
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let entry = snapshot.tables.get(table_name).ok_or_else(|| {
+            ServerError::Plan(ultrasql_planner::PlanError::TableNotFound(
+                table_name.to_owned(),
+            ))
+        })?;
+        let pairs = options
+            .iter()
+            .map(|option| (option.name.clone(), option.value.clone()))
+            .collect::<Vec<_>>();
+        crate::validate_autovacuum_reloptions(&pairs)?;
+        let updated_entry = self
+            .state
+            .persistent_catalog
+            .alter_table_options(table_name, pairs)
+            .map_err(ServerError::Catalog)?;
+        let txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        if let Err(e) = self.state.persistent_catalog.persist_table_rows(
+            &updated_entry,
+            self.state.heap.as_ref(),
+            txn.xid,
+            txn.current_command,
+        ) {
+            if let Err(abort_err) = self.state.txn_manager.abort(txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "ALTER TABLE SET catalog transaction abort failed",
+                );
+            }
+            return Err(e.into());
+        }
+        self.state
+            .commit_transaction(txn, true, "ALTER TABLE SET catalog transaction")?;
+        self.state.plan_cache.invalidate_all();
+        Ok(run_ddl_command(&format!("ALTER TABLE {}", entry.name)))
     }
 
     pub(crate) fn execute_alter_enable_row_security(
