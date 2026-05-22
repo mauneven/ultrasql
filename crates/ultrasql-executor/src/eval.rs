@@ -298,6 +298,7 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "format" => eval_format(args),
         "regexp_replace" => eval_regexp_replace(args),
         "json_build_object" => eval_json_build_object(args),
+        "jsonb_set" => eval_jsonb_set(args),
         "gen_random_uuid" => eval_gen_random_uuid(args),
         "version" => eval_zero_arg_text(args, "UltraSQL 0.0.1"),
         "current_database" => eval_zero_arg_text(args, "ultrasql"),
@@ -1168,6 +1169,155 @@ fn eval_json_build_object(args: &[Value]) -> Result<Value, EvalError> {
     serde_json::to_string(&JsonValue::Object(object))
         .map(Value::Jsonb)
         .map_err(|err| EvalError::Type(format!("json_build_object: encode failed: {err}")))
+}
+
+fn eval_jsonb_set(args: &[Value]) -> Result<Value, EvalError> {
+    if !(args.len() == 3 || args.len() == 4) {
+        return Err(EvalError::Type(format!(
+            "jsonb_set: expected 3 or 4 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(mut target) = json_document_arg("jsonb_set", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(path) = json_path_arg("jsonb_set", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let Some(new_value) = json_document_arg("jsonb_set", args, 2)? else {
+        return Ok(Value::Null);
+    };
+    let create_missing = match args.get(3) {
+        Some(Value::Bool(v)) => *v,
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(other) => {
+            return Err(EvalError::Type(format!(
+                "jsonb_set: create_missing must be boolean, got {:?}",
+                other.data_type()
+            )));
+        }
+        None => true,
+    };
+
+    let changed = set_json_path(&mut target, &path, new_value, create_missing);
+    if !changed {
+        return json_value_to_jsonb(target, "jsonb_set");
+    }
+    json_value_to_jsonb(target, "jsonb_set")
+}
+
+fn json_document_arg(
+    function: &'static str,
+    args: &[Value],
+    idx: usize,
+) -> Result<Option<JsonValue>, EvalError> {
+    match args.get(idx) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Jsonb(text) | Value::Text(text)) => serde_json::from_str(text)
+            .map(Some)
+            .map_err(|err| EvalError::Type(format!("{function}: invalid jsonb: {err}"))),
+        Some(other) => Ok(Some(sql_value_to_json(other))),
+    }
+}
+
+fn json_path_arg(
+    function: &'static str,
+    args: &[Value],
+    idx: usize,
+) -> Result<Option<Vec<String>>, EvalError> {
+    match args.get(idx) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Array { elements, .. }) => elements
+            .iter()
+            .map(|value| match value {
+                Value::Null => Err(EvalError::Type(format!("{function}: path contains null"))),
+                other => Ok(format_value_text(other)),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(Value::Text(text) | Value::Jsonb(text)) => Ok(Some(parse_json_path_text(text))),
+        Some(other) => Err(EvalError::Type(format!(
+            "{function}: path must be text or text[], got {:?}",
+            other.data_type()
+        ))),
+    }
+}
+
+fn parse_json_path_text(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|v| v.strip_suffix('}'))
+        .unwrap_or(trimmed);
+    if inner.is_empty() {
+        return Vec::new();
+    }
+    inner
+        .split(',')
+        .map(|part| part.trim().trim_matches('"').to_owned())
+        .collect()
+}
+
+fn set_json_path(
+    current: &mut JsonValue,
+    path: &[String],
+    new_value: JsonValue,
+    create_missing: bool,
+) -> bool {
+    let Some((key, rest)) = path.split_first() else {
+        *current = new_value;
+        return true;
+    };
+    if rest.is_empty() {
+        return set_json_leaf(current, key, new_value, create_missing);
+    }
+    match current {
+        JsonValue::Object(map) => {
+            if !map.contains_key(key) {
+                if !create_missing {
+                    return false;
+                }
+                map.insert(key.clone(), JsonValue::Object(JsonMap::new()));
+            }
+            let Some(child) = map.get_mut(key) else {
+                return false;
+            };
+            set_json_path(child, rest, new_value, create_missing)
+        }
+        _ if create_missing => {
+            *current = JsonValue::Object(JsonMap::new());
+            set_json_path(current, path, new_value, create_missing)
+        }
+        _ => false,
+    }
+}
+
+fn set_json_leaf(
+    current: &mut JsonValue,
+    key: &str,
+    new_value: JsonValue,
+    create_missing: bool,
+) -> bool {
+    match current {
+        JsonValue::Object(map) if create_missing || map.contains_key(key) => {
+            map.insert(key.to_owned(), new_value);
+            true
+        }
+        JsonValue::Object(_) => false,
+        _ if create_missing => {
+            let mut map = JsonMap::new();
+            map.insert(key.to_owned(), new_value);
+            *current = JsonValue::Object(map);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn json_value_to_jsonb(value: JsonValue, function: &'static str) -> Result<Value, EvalError> {
+    serde_json::to_string(&value)
+        .map(Value::Jsonb)
+        .map_err(|err| EvalError::Type(format!("{function}: encode failed: {err}")))
 }
 
 fn sql_value_to_json(value: &Value) -> JsonValue {

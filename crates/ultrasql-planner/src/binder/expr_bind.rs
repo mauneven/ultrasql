@@ -1022,7 +1022,7 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
         | "reverse" | "md5" | "sha256" | "quote_ident" | "format" | "regexp_replace" => {
             Ok(DataType::Text { max_len: None })
         }
-        "json_build_object" => Ok(DataType::Jsonb),
+        "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
         "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
         "gen_random_uuid" => Ok(DataType::Uuid),
         "pg_relation_size" => Ok(DataType::Int64),
@@ -1103,6 +1103,7 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "format"
             | "regexp_replace"
             | "json_build_object"
+            | "jsonb_set"
             | "gen_random_uuid"
             | "version"
             | "current_database"

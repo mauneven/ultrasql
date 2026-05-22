@@ -1815,8 +1815,9 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [ ] Window: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE
 - [x] JSON scalar: `json_build_object` returns queryable JSONB through the
   PostgreSQL wire path.
-- [ ] JSON remaining: `row_to_json`, `json_each`, `jsonb_set`, and
-  `jsonb_path_query`.
+- [x] JSON update scalar: `jsonb_set` supports object-path updates with
+  PostgreSQL wire regression coverage.
+- [ ] JSON remaining: `row_to_json`, `json_each`, and `jsonb_path_query`.
 - [x] Array: array_length, array_cat, unnest, array_agg,
   array_to_string, string_to_array — implemented for native arrays
   over the current supported scalar element set.
