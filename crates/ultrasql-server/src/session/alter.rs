@@ -122,14 +122,25 @@ where
                 table_name.to_owned(),
             ))
         })?;
-        let mut runtime = self
+        let previous = self
             .state
             .row_security
             .get(&entry.oid)
-            .map(|guard| guard.as_ref().clone())
+            .map(|guard| guard.clone());
+        let mut runtime = previous
+            .as_ref()
+            .map(|existing| existing.as_ref().clone())
             .unwrap_or_default();
         runtime.enabled = true;
         self.state.row_security.insert(entry.oid, Arc::new(runtime));
+        if let Err(e) = self.state.persist_row_security_metadata() {
+            if let Some(previous) = previous {
+                self.state.row_security.insert(entry.oid, previous);
+            } else {
+                self.state.row_security.remove(&entry.oid);
+            }
+            return Err(e);
+        }
         self.plan_cache_invalidate();
         Ok(run_ddl_command("ALTER TABLE"))
     }

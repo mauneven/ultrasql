@@ -338,6 +338,110 @@ pub(crate) fn append_only_materialized_source_table(plan: &LogicalPlan) -> Optio
     }
 }
 
+fn metadata_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn metadata_unescape(raw: &str) -> Result<String, ServerError> {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some(other) => {
+                return Err(ServerError::Ddl(format!(
+                    "invalid escaped metadata byte \\{other}"
+                )));
+            }
+            None => return Err(ServerError::Ddl("trailing metadata escape".to_owned())),
+        }
+    }
+    Ok(out)
+}
+
+fn rls_permissiveness_name(value: RuntimeRlsPermissiveness) -> &'static str {
+    match value {
+        RuntimeRlsPermissiveness::Permissive => "permissive",
+        RuntimeRlsPermissiveness::Restrictive => "restrictive",
+    }
+}
+
+fn parse_rls_permissiveness(value: &str) -> Result<RuntimeRlsPermissiveness, ServerError> {
+    match value {
+        "permissive" => Ok(RuntimeRlsPermissiveness::Permissive),
+        "restrictive" => Ok(RuntimeRlsPermissiveness::Restrictive),
+        other => Err(ServerError::Ddl(format!(
+            "unknown RLS permissiveness {other}"
+        ))),
+    }
+}
+
+fn rls_command_name(value: RuntimeRlsCommand) -> &'static str {
+    match value {
+        RuntimeRlsCommand::All => "all",
+        RuntimeRlsCommand::Select => "select",
+        RuntimeRlsCommand::Insert => "insert",
+        RuntimeRlsCommand::Update => "update",
+        RuntimeRlsCommand::Delete => "delete",
+    }
+}
+
+fn parse_rls_command(value: &str) -> Result<RuntimeRlsCommand, ServerError> {
+    match value {
+        "all" => Ok(RuntimeRlsCommand::All),
+        "select" => Ok(RuntimeRlsCommand::Select),
+        "insert" => Ok(RuntimeRlsCommand::Insert),
+        "update" => Ok(RuntimeRlsCommand::Update),
+        "delete" => Ok(RuntimeRlsCommand::Delete),
+        other => Err(ServerError::Ddl(format!("unknown RLS command {other}"))),
+    }
+}
+
+fn rls_expr_fields(expr: Option<&RuntimeTenantPolicyExpr>) -> (String, String, String) {
+    expr.map_or_else(
+        || (String::new(), String::new(), String::new()),
+        |expr| {
+            (
+                expr.column_index.to_string(),
+                metadata_escape(&expr.column_name),
+                metadata_escape(&expr.setting_name),
+            )
+        },
+    )
+}
+
+fn parse_rls_expr(
+    index: &str,
+    column_name: &str,
+    setting_name: &str,
+) -> Result<Option<RuntimeTenantPolicyExpr>, ServerError> {
+    if index.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(RuntimeTenantPolicyExpr {
+        column_index: index
+            .parse::<usize>()
+            .map_err(|err| ServerError::Ddl(format!("bad RLS column index: {err}")))?,
+        column_name: metadata_unescape(column_name)?,
+        setting_name: metadata_unescape(setting_name)?,
+    }))
+}
+
 fn materialized_view_projection_indices(plan: &LogicalPlan) -> Option<Vec<usize>> {
     match plan {
         LogicalPlan::Scan { schema, .. } => Some((0..schema.fields().len()).collect()),
@@ -2473,8 +2577,144 @@ impl Server {
         };
         server.recover_commit_status_from_wal()?;
         server.rebuild_persistent_index_sidecars()?;
+        server.rebuild_row_security_sidecars()?;
         server.rebuild_materialized_view_runtime_sidecars()?;
         Ok(server)
+    }
+
+    fn row_security_metadata_path(&self) -> Option<std::path::PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join("pg_row_security.meta"))
+    }
+
+    pub(crate) fn persist_row_security_metadata(&self) -> Result<(), ServerError> {
+        let Some(path) = self.row_security_metadata_path() else {
+            return Ok(());
+        };
+        let snapshot = self.catalog_snapshot();
+        let mut entries = self
+            .row_security
+            .iter()
+            .filter_map(|entry| {
+                let table = snapshot.tables_by_oid.get(entry.key())?;
+                Some((
+                    *entry.key(),
+                    table.name.clone(),
+                    entry.value().as_ref().clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(oid, _, _)| oid.raw());
+
+        let mut out = String::from("# ultrasql row security v1\n");
+        for (oid, table_name, runtime) in entries {
+            out.push_str(&format!(
+                "table\t{}\t{}\t{}\n",
+                metadata_escape(&table_name),
+                oid.raw(),
+                runtime.enabled
+            ));
+            for policy in &runtime.policies {
+                let (using_idx, using_col, using_setting) = rls_expr_fields(policy.using.as_ref());
+                let (check_idx, check_col, check_setting) =
+                    rls_expr_fields(policy.with_check.as_ref());
+                out.push_str(&format!(
+                    "policy\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    oid.raw(),
+                    metadata_escape(&policy.name),
+                    rls_permissiveness_name(policy.permissiveness),
+                    rls_command_name(policy.command),
+                    using_idx,
+                    using_col,
+                    using_setting,
+                    check_idx,
+                    check_col,
+                    check_setting
+                ));
+            }
+        }
+        let tmp = path.with_extension("meta.tmp");
+        std::fs::write(&tmp, out).map_err(ServerError::Io)?;
+        std::fs::rename(tmp, path).map_err(ServerError::Io)?;
+        Ok(())
+    }
+
+    fn rebuild_row_security_sidecars(&self) -> Result<(), ServerError> {
+        let Some(path) = self.row_security_metadata_path() else {
+            return Ok(());
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(ServerError::Io(err)),
+        };
+        let snapshot = self.catalog_snapshot();
+        let mut rows: std::collections::HashMap<ultrasql_core::Oid, (String, TableRowSecurity)> =
+            std::collections::HashMap::new();
+        for (line_no, line) in text.lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts = line.split('\t').collect::<Vec<_>>();
+            match parts.first().copied() {
+                Some("table") if parts.len() == 4 => {
+                    let table_name = metadata_unescape(parts[1])?;
+                    let oid = ultrasql_core::Oid::new(parts[2].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "RLS metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    let enabled = parts[3].parse::<bool>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "RLS metadata line {} bad enabled flag: {err}",
+                            line_no + 1
+                        ))
+                    })?;
+                    rows.entry(oid)
+                        .or_insert_with(|| (table_name, TableRowSecurity::default()))
+                        .1
+                        .enabled = enabled;
+                }
+                Some("policy") if parts.len() == 11 => {
+                    let oid = ultrasql_core::Oid::new(parts[1].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "RLS metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    let policy = RuntimeRlsPolicy {
+                        name: metadata_unescape(parts[2])?,
+                        permissiveness: parse_rls_permissiveness(parts[3])?,
+                        command: parse_rls_command(parts[4])?,
+                        using: parse_rls_expr(parts[5], parts[6], parts[7])?,
+                        with_check: parse_rls_expr(parts[8], parts[9], parts[10])?,
+                    };
+                    rows.entry(oid)
+                        .or_insert_with(|| (String::new(), TableRowSecurity::default()))
+                        .1
+                        .policies
+                        .push(policy);
+                }
+                _ => {
+                    return Err(ServerError::Ddl(format!(
+                        "malformed RLS metadata line {}",
+                        line_no + 1
+                    )));
+                }
+            }
+        }
+        for (oid, (table_name, runtime)) in rows {
+            let Some(table) = snapshot.tables_by_oid.get(&oid) else {
+                continue;
+            };
+            if table.name != table_name {
+                continue;
+            }
+            self.row_security.insert(oid, Arc::new(runtime));
+        }
+        Ok(())
     }
 
     fn materialized_view_metadata_path(&self) -> Option<std::path::PathBuf> {
