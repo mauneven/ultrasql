@@ -34,7 +34,7 @@ jobs:
         target:
           - parser_fuzz
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-fuzz
@@ -58,13 +58,13 @@ jobs:
             -max_total_time=900 -rss_limit_mb=4096 -max_len=1024
       - name: upload corpus
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: fuzz/corpus/${{ matrix.target }}
       - name: upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
