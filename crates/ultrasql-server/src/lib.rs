@@ -86,7 +86,7 @@ use ultrasql_parser::Parser;
 use ultrasql_planner::plan::{LockStrength, LockWaitPolicy};
 use ultrasql_planner::{
     AggregateFunc, BinaryOp, Catalog as PlannerCatalog, InMemoryCatalog, LogicalIndexMethod,
-    LogicalPlan, ScalarExpr, TableMeta, UnaryOp, bind,
+    LogicalPlan, LogicalReferentialAction, ScalarExpr, TableMeta, UnaryOp, bind,
 };
 use ultrasql_protocol::BackendMessage;
 use ultrasql_storage::access_method::{
@@ -440,6 +440,49 @@ fn parse_rls_expr(
         column_name: metadata_unescape(column_name)?,
         setting_name: metadata_unescape(setting_name)?,
     }))
+}
+
+fn usize_list_token(values: &[usize]) -> String {
+    values
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_usize_list_token(raw: &str) -> Result<Vec<usize>, ServerError> {
+    if raw.is_empty() {
+        return Ok(Vec::new());
+    }
+    raw.split(',')
+        .map(|part| {
+            part.parse::<usize>()
+                .map_err(|err| ServerError::Ddl(format!("bad usize list entry: {err}")))
+        })
+        .collect()
+}
+
+fn referential_action_token(action: LogicalReferentialAction) -> &'static str {
+    match action {
+        LogicalReferentialAction::NoAction => "no_action",
+        LogicalReferentialAction::Restrict => "restrict",
+        LogicalReferentialAction::Cascade => "cascade",
+        LogicalReferentialAction::SetNull => "set_null",
+        LogicalReferentialAction::SetDefault => "set_default",
+    }
+}
+
+fn parse_referential_action(raw: &str) -> Result<LogicalReferentialAction, ServerError> {
+    match raw {
+        "no_action" => Ok(LogicalReferentialAction::NoAction),
+        "restrict" => Ok(LogicalReferentialAction::Restrict),
+        "cascade" => Ok(LogicalReferentialAction::Cascade),
+        "set_null" => Ok(LogicalReferentialAction::SetNull),
+        "set_default" => Ok(LogicalReferentialAction::SetDefault),
+        other => Err(ServerError::Ddl(format!(
+            "unknown referential action {other}"
+        ))),
+    }
 }
 
 fn data_type_token(ty: &DataType) -> Option<&'static str> {
@@ -3057,6 +3100,21 @@ impl Server {
                     metadata_escape(&expr)
                 ));
             }
+            for fk in &constraints.foreign_keys {
+                out.push_str(&format!(
+                    "foreign_key\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    oid.raw(),
+                    metadata_escape(&fk.name),
+                    usize_list_token(&fk.columns),
+                    metadata_escape(&fk.target_table),
+                    fk.target_oid.raw(),
+                    usize_list_token(&fk.target_columns),
+                    referential_action_token(fk.on_delete),
+                    referential_action_token(fk.on_update),
+                    fk.deferrable,
+                    fk.initially_deferred
+                ));
+            }
         }
         let tmp = path.with_extension("meta.tmp");
         std::fs::write(&tmp, out).map_err(ServerError::Io)?;
@@ -3081,6 +3139,8 @@ impl Server {
         let mut identity_always: std::collections::HashMap<Oid, Vec<usize>> =
             std::collections::HashMap::new();
         let mut checks: std::collections::HashMap<Oid, Vec<RuntimeCheckConstraint>> =
+            std::collections::HashMap::new();
+        let mut foreign_keys: std::collections::HashMap<Oid, Vec<RuntimeForeignKeyConstraint>> =
             std::collections::HashMap::new();
         for (line_no, line) in text.lines().enumerate() {
             if line.is_empty() || line.starts_with('#') {
@@ -3142,6 +3202,43 @@ impl Server {
                         expr: decode_scalar_expr_field(&metadata_unescape(parts[3])?)?,
                     });
                 }
+                Some("foreign_key") if parts.len() == 11 => {
+                    let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    foreign_keys
+                        .entry(oid)
+                        .or_default()
+                        .push(RuntimeForeignKeyConstraint {
+                        name: metadata_unescape(parts[2])?,
+                        columns: parse_usize_list_token(parts[3])?,
+                        target_table: metadata_unescape(parts[4])?,
+                        target_oid: Oid::new(parts[5].parse::<u32>().map_err(|err| {
+                            ServerError::Ddl(format!(
+                                "table-runtime metadata line {} bad target oid: {err}",
+                                line_no + 1
+                            ))
+                        })?),
+                        target_columns: parse_usize_list_token(parts[6])?,
+                        on_delete: parse_referential_action(parts[7])?,
+                        on_update: parse_referential_action(parts[8])?,
+                        deferrable: parts[9].parse::<bool>().map_err(|err| {
+                            ServerError::Ddl(format!(
+                                "table-runtime metadata line {} bad deferrable flag: {err}",
+                                line_no + 1
+                            ))
+                        })?,
+                        initially_deferred: parts[10].parse::<bool>().map_err(|err| {
+                            ServerError::Ddl(format!(
+                                "table-runtime metadata line {} bad initially_deferred flag: {err}",
+                                line_no + 1
+                            ))
+                        })?,
+                    });
+                }
                 _ => {
                     return Err(ServerError::Ddl(format!(
                         "malformed table-runtime metadata line {}",
@@ -3191,6 +3288,19 @@ impl Server {
             }
             if let Some(checks) = checks.remove(&oid) {
                 runtime.checks = checks;
+            }
+            if let Some(foreign_keys) = foreign_keys.remove(&oid) {
+                runtime.foreign_keys = foreign_keys
+                    .into_iter()
+                    .filter_map(|mut fk| {
+                        let target = snapshot.tables.get(&fk.target_table)?;
+                        if target.oid != fk.target_oid {
+                            return None;
+                        }
+                        fk.target_oid = target.oid;
+                        Some(fk)
+                    })
+                    .collect();
             }
             self.table_constraints.insert(oid, Arc::new(runtime));
         }

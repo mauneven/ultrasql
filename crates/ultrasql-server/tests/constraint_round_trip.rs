@@ -517,6 +517,36 @@ async fn foreign_key_rejects_missing_parent_and_restricts_parent_key() {
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn foreign_key_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    client
+        .batch_execute("CREATE TABLE fk_parent_restart (id INT PRIMARY KEY)")
+        .await
+        .expect("create parent");
+    client
+        .batch_execute(
+            "CREATE TABLE fk_child_restart (parent_id INT REFERENCES fk_parent_restart(id), v INT)",
+        )
+        .await
+        .expect("create child");
+    client
+        .batch_execute("INSERT INTO fk_parent_restart VALUES (1)")
+        .await
+        .expect("insert parent");
+    shutdown(client, server_handle).await;
+
+    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    let missing = client
+        .batch_execute("INSERT INTO fk_child_restart VALUES (2, 20)")
+        .await
+        .expect_err("missing parent rejected after restart");
+    assert_eq!(missing.code().expect("SQLSTATE").code(), "23503");
+    shutdown(client, server_handle).await;
+}
+
 /// `DROP TABLE parent` respects live FK dependencies; CASCADE removes
 /// the child-side FK while keeping the child table.
 #[tokio::test]
