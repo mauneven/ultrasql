@@ -122,3 +122,46 @@ async fn cleared_table_comment_stays_cleared_after_restart() {
         shutdown(client, server_handle).await;
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_table_comment_does_not_survive_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let dropped_oid;
+
+    {
+        let (server, client, _conn_handle, server_handle) =
+            start_persistent_server(data_dir.path()).await;
+        client
+            .batch_execute("CREATE TABLE comment_drop_restart (id INT)")
+            .await
+            .expect("create");
+        dropped_oid = server
+            .catalog_snapshot()
+            .tables
+            .get("comment_drop_restart")
+            .expect("table before drop")
+            .oid;
+        client
+            .batch_execute("COMMENT ON TABLE comment_drop_restart IS 'drop me'")
+            .await
+            .expect("comment");
+        client
+            .batch_execute("DROP TABLE comment_drop_restart")
+            .await
+            .expect("drop");
+        shutdown(client, server_handle).await;
+    }
+
+    {
+        let (server, client, _conn_handle, server_handle) =
+            start_persistent_server(data_dir.path()).await;
+        let snapshot = server.catalog_snapshot();
+        assert!(!snapshot.tables.contains_key("comment_drop_restart"));
+        assert!(
+            !snapshot
+                .descriptions
+                .contains_key(&(dropped_oid, Oid::new(PG_CLASS_OID), 0))
+        );
+        shutdown(client, server_handle).await;
+    }
+}

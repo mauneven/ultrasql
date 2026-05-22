@@ -859,6 +859,12 @@ impl PersistentCatalog {
                 total_description_rows = total_description_rows.saturating_add(1);
             }
         }
+        let mut live_description_oids: std::collections::HashSet<Oid> =
+            tables_by_oid.keys().copied().collect();
+        for index in indexes.values() {
+            live_description_oids.insert(index.oid);
+        }
+        descriptions.retain(|(objoid, _, _), _| live_description_oids.contains(objoid));
 
         let snap = CatalogSnapshot {
             tables,
