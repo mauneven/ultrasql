@@ -301,6 +301,12 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "row_to_json" => eval_row_to_json(args),
         "json_build_object" => eval_json_build_object(args),
         "jsonb_set" => eval_jsonb_set(args),
+        "pg_advisory_lock"
+        | "pg_try_advisory_lock"
+        | "pg_advisory_unlock"
+        | "pg_advisory_unlock_all" => Err(EvalError::Unsupported(
+            "advisory lock functions require session context",
+        )),
         "gen_random_uuid" => eval_gen_random_uuid(args),
         "version" => eval_zero_arg_text(args, "UltraSQL 0.0.1"),
         "current_database" => eval_zero_arg_text(args, "ultrasql"),

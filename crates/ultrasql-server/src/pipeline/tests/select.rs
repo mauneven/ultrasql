@@ -490,6 +490,7 @@ impl IndexFixture {
             data_dir: None,
             logical_replication: Arc::new(crate::replication::LogicalReplicationRuntime::new()),
             sequence_state: None,
+            advisory_state: None,
             heap: StdArc::clone(&self.heap),
             vm: StdArc::clone(&self.vm),
             snapshot: self.reader_snapshot.clone(),

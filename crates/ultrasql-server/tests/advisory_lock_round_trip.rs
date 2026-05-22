@@ -1,0 +1,101 @@
+//! PostgreSQL advisory-lock SQL function round trips.
+
+use tokio_postgres::NoTls;
+
+mod support;
+
+use support::{shutdown, start_sample_server};
+
+#[tokio::test]
+async fn try_advisory_lock_conflicts_across_sessions_and_unlocks() {
+    let running = start_sample_server("advisory_lock_test").await;
+    let a = &running.client;
+    let conn_str = format!(
+        "host={host} port={port} user=tester application_name=advisory_lock_test",
+        host = running.bound.ip(),
+        port = running.bound.port()
+    );
+    let (b, b_conn) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("connect b");
+    let b_handle = tokio::spawn(async move {
+        let _ = b_conn.await;
+    });
+
+    let row = a
+        .query_one("SELECT pg_try_advisory_lock(9001)", &[])
+        .await
+        .expect("session a try lock");
+    assert!(row.get::<_, bool>(0));
+
+    let row = b
+        .query_one("SELECT pg_try_advisory_lock(9001)", &[])
+        .await
+        .expect("session b conflicting try lock");
+    assert!(!row.get::<_, bool>(0));
+
+    let row = a
+        .query_one("SELECT pg_advisory_unlock(9001)", &[])
+        .await
+        .expect("session a unlock");
+    assert!(row.get::<_, bool>(0));
+
+    let row = b
+        .query_one("SELECT pg_try_advisory_lock(9001)", &[])
+        .await
+        .expect("session b try lock after unlock");
+    assert!(row.get::<_, bool>(0));
+
+    let row = b
+        .query_one("SELECT pg_advisory_unlock(9001)", &[])
+        .await
+        .expect("session b unlock");
+    assert!(row.get::<_, bool>(0));
+
+    drop(b);
+    b_handle.abort();
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn blocking_advisory_lock_simple_query_uses_same_lock_table() {
+    let running = start_sample_server("advisory_lock_test").await;
+    let a = &running.client;
+    let conn_str = format!(
+        "host={host} port={port} user=tester application_name=advisory_lock_test",
+        host = running.bound.ip(),
+        port = running.bound.port()
+    );
+    let (b, b_conn) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("connect b");
+    let b_handle = tokio::spawn(async move {
+        let _ = b_conn.await;
+    });
+
+    a.simple_query("SELECT pg_advisory_lock(9002)")
+        .await
+        .expect("session a blocking lock");
+
+    let row = b
+        .query_one("SELECT pg_try_advisory_lock(9002)", &[])
+        .await
+        .expect("session b conflicting try lock");
+    assert!(!row.get::<_, bool>(0));
+
+    let row = a
+        .query_one("SELECT pg_advisory_unlock(9002)", &[])
+        .await
+        .expect("session a unlock");
+    assert!(row.get::<_, bool>(0));
+
+    let row = b
+        .query_one("SELECT pg_try_advisory_lock(9002)", &[])
+        .await
+        .expect("session b try lock after unlock");
+    assert!(row.get::<_, bool>(0));
+
+    drop(b);
+    b_handle.abort();
+    shutdown(running).await;
+}

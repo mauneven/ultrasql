@@ -639,7 +639,11 @@ serializable (SSI). Real row-level locking. Deadlock detection.
 - [x] `SELECT FOR UPDATE` / `FOR SHARE` / `FOR NO KEY UPDATE` parser → planner → executor → `lower_query` arm (`pipeline.rs:275`, `pipeline.rs:806`); ✅ `tokio-postgres` round-trip in `crates/ultrasql-server/tests/lock_rows_round_trip.rs` covers FOR UPDATE / FOR SHARE / FOR NO KEY UPDATE plus pre-image visibility on a concurrent reader
 - [x] Advisory lock tag kernel (`LockTag::Advisory`) with lock-manager
   unit coverage
-- [ ] SQL surface for `pg_advisory_lock` / `pg_try_advisory_lock`
+- [x] SQL surface for `pg_advisory_lock`, `pg_try_advisory_lock`,
+  `pg_advisory_unlock`, and `pg_advisory_unlock_all`: session-owned
+  advisory locks share the transaction lock manager, re-enter per
+  session, release on disconnect, and have two-session wire round-trip
+  coverage.
 
 ### SSI (Serializable Snapshot Isolation)
 - [x] Predicate locks (`SIReadLock`)

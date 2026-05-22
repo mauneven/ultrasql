@@ -1094,6 +1094,7 @@ where
             data_dir: self.state.data_dir.clone(),
             logical_replication: Arc::clone(&self.state.logical_replication),
             sequence_state: Some(self.sequence_state.clone()),
+            advisory_state: Some(self.advisory_state.clone()),
             heap: Arc::clone(&self.state.heap),
             vm: Arc::clone(&self.state.vm),
             snapshot: txn.snapshot.clone(),

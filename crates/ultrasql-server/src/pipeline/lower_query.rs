@@ -639,6 +639,27 @@ fn rewrite_catalog_scalar_expr(
             name,
             args,
             data_type,
+        } if is_advisory_lock_function(name) => {
+            let rewritten_args: Result<Vec<_>, _> = args
+                .iter()
+                .map(|arg| rewrite_catalog_scalar_expr(arg, ctx))
+                .collect();
+            let rewritten_args = rewritten_args?;
+            let values = literal_values(name, &rewritten_args)?;
+            let Some(state) = ctx.advisory_state.as_ref() else {
+                return Err(ServerError::Unsupported(
+                    "advisory lock functions require session context",
+                ));
+            };
+            Ok(ScalarExpr::Literal {
+                value: state.evaluate_function(name, &values, &ctx.oracle.lock_manager)?,
+                data_type: data_type.clone(),
+            })
+        }
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
         } => {
             let rewritten_args: Result<Vec<_>, _> = args
                 .iter()
@@ -652,6 +673,29 @@ fn rewrite_catalog_scalar_expr(
         }
         _ => Ok(expr.clone()),
     }
+}
+
+fn is_advisory_lock_function(name: &str) -> bool {
+    matches!(
+        name,
+        "pg_advisory_lock"
+            | "pg_try_advisory_lock"
+            | "pg_advisory_unlock"
+            | "pg_advisory_unlock_all"
+    )
+}
+
+fn literal_values(name: &str, args: &[ScalarExpr]) -> Result<Vec<Value>, ServerError> {
+    args.iter()
+        .map(|arg| match arg {
+            ScalarExpr::Literal { value, .. } => Ok(value.clone()),
+            _ => Err(ServerError::Execute(
+                ultrasql_executor::ExecError::TypeMismatch(format!(
+                    "{name}: advisory lock arguments must be constants",
+                )),
+            )),
+        })
+        .collect()
 }
 
 fn relation_size_from_literal_args(
@@ -824,6 +868,7 @@ pub(super) fn lower_cte(
         data_dir: ctx.data_dir.clone(),
         logical_replication: Arc::clone(&ctx.logical_replication),
         sequence_state: ctx.sequence_state.clone(),
+        advisory_state: ctx.advisory_state.clone(),
         heap: Arc::clone(&ctx.heap),
         vm: Arc::clone(&ctx.vm),
         snapshot: ctx.snapshot.clone(),

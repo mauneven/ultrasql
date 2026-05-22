@@ -19,6 +19,7 @@ use crate::notify::NotificationRecord;
 use crate::replication::LogicalChangeKind;
 use crate::{READ_BUFFER_INITIAL, Server, TxnState};
 
+mod advisory;
 mod alter;
 mod copy;
 mod ddl;
@@ -106,6 +107,8 @@ pub(crate) struct Session<RW> {
     pub(super) pending_materialized_view_rows: Vec<(Arc<crate::MaterializedViewRuntime>, u64)>,
     /// Per-session sequence state used by `currval` / `lastval`.
     pub(super) sequence_state: crate::SequenceSessionState,
+    /// Per-session PostgreSQL advisory locks.
+    pub(super) advisory_state: crate::AdvisorySessionState,
     /// `true` when an autocommit statement committed successfully and
     /// its background-ish maintenance hook should run after the reply
     /// bytes are already on the wire.
@@ -149,6 +152,7 @@ where
             pending_logical_changes: Vec::new(),
             pending_materialized_view_rows: Vec::new(),
             sequence_state: crate::SequenceSessionState::default(),
+            advisory_state: crate::AdvisorySessionState::new(pid),
             pending_post_commit_maintenance: false,
         }
     }
@@ -173,6 +177,8 @@ impl<RW> Drop for Session<RW> {
     /// cancel registry on drop so the per-pid sender is released and any
     /// orphaned subscriptions are removed.
     fn drop(&mut self) {
+        self.advisory_state
+            .release_all(&self.state.txn_manager.lock_manager);
         self.state.notify_hub.deregister_connection(self.pid);
         self.state.cancel_registry.deregister(self.pid);
     }

@@ -372,6 +372,9 @@ where
         {
             return Ok(result);
         }
+        if let Some(result) = self.try_dispatch_advisory_lock_select(&stmt)? {
+            return Ok(result);
+        }
         if let Some(result) = self.try_dispatch_sequence_select(&stmt)? {
             return Ok(result);
         }
@@ -1470,6 +1473,7 @@ where
                     self.state.data_dir.clone(),
                     Arc::clone(&self.state.logical_replication),
                     Some(self.sequence_state.clone()),
+                    Some(self.advisory_state.clone()),
                     &self.state.tables,
                     Arc::clone(&self.state.heap),
                     Arc::clone(&self.state.vm),
@@ -1496,6 +1500,7 @@ where
                     self.state.data_dir.clone(),
                     Arc::clone(&self.state.logical_replication),
                     Some(self.sequence_state.clone()),
+                    Some(self.advisory_state.clone()),
                     &self.state.tables,
                     Arc::clone(&self.state.heap),
                     Arc::clone(&self.state.vm),
@@ -2210,6 +2215,7 @@ where
             self.state.data_dir.clone(),
             Arc::clone(&self.state.logical_replication),
             Some(self.sequence_state.clone()),
+            Some(self.advisory_state.clone()),
             &self.state.tables,
             Arc::clone(&self.state.heap),
             Arc::clone(&self.state.vm),

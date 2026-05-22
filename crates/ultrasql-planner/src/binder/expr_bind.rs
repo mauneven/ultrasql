@@ -1042,6 +1042,8 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
             Ok(DataType::Text { max_len: None })
         }
         "row_to_json" | "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
+        "pg_advisory_lock" | "pg_advisory_unlock_all" => Ok(DataType::Null),
+        "pg_try_advisory_lock" | "pg_advisory_unlock" => Ok(DataType::Bool),
         "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
         "gen_random_uuid" => Ok(DataType::Uuid),
         "pg_relation_size" => Ok(DataType::Int64),
@@ -1124,6 +1126,10 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "row_to_json"
             | "json_build_object"
             | "jsonb_set"
+            | "pg_advisory_lock"
+            | "pg_try_advisory_lock"
+            | "pg_advisory_unlock"
+            | "pg_advisory_unlock_all"
             | "gen_random_uuid"
             | "version"
             | "current_database"

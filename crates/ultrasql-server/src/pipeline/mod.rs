@@ -235,6 +235,8 @@ pub struct LowerCtx<'a> {
     pub logical_replication: Arc<crate::replication::LogicalReplicationRuntime>,
     /// Session-local sequence observer for defaults that call `nextval`.
     pub sequence_state: Option<crate::SequenceSessionState>,
+    /// Session-local PostgreSQL advisory-lock owner.
+    pub advisory_state: Option<crate::AdvisorySessionState>,
     /// Shared heap access handle.
     pub heap: Arc<HeapAccess<BlankPageLoader>>,
     /// Shared visibility map for persistent heap relations.
