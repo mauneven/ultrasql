@@ -1683,7 +1683,12 @@ behavior are implemented and validated.
   before `Server::init` recovery, substitutes `%p` / `%f`, records
   `pg_wal/restore_status/*.done`, and stops at the first missing archive
   segment.
-- [ ] Base backup (`pg_basebackup` equivalent) — `ultrasql --basebackup DEST --data-dir DIR` copies files and writes `backup_manifest.json`; online checkpoint fencing pending
+- [x] Base backup (`pg_basebackup` equivalent) — `ultrasql --basebackup DEST --data-dir DIR`
+  copies files and writes `backup_manifest.json`; when `--ops-endpoint`
+  points at a live `ultrasqld`, the CLI calls `/backup/start` before the
+  copy and `/backup/stop` after it. The server-side fence enters read-only
+  mode, flushes dirty heap pages, reports flushed WAL LSN metadata, and
+  records the checkpoint fence in `backup_label` plus the manifest.
 - [x] `recovery.signal` / `standby.signal` support — CLI signal-file
   helpers via `ultrasql --ctl recovery|standby`; server startup detects
   either file and enters hot-standby read-only mode before accepting

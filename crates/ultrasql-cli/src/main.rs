@@ -997,7 +997,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
 
     if let Some(dest) = &cli.basebackup {
-        run_basebackup(&cli.data_dir, dest)?;
+        run_basebackup(&cli.data_dir, dest, cli.ops_endpoint.as_deref()).await?;
         return Ok(());
     }
 
@@ -1192,15 +1192,24 @@ async fn run_isready(params: &ConnParams, ops_endpoint: Option<&str>) -> Result<
 }
 
 async fn check_http_ready(endpoint: &str) -> Result<bool> {
+    Ok(http_get_ops_endpoint(endpoint, "/ready").await?.ok)
+}
+
+struct OpsHttpResponse {
+    ok: bool,
+    body: String,
+}
+
+async fn http_get_ops_endpoint(endpoint: &str, path: &str) -> Result<OpsHttpResponse> {
     let endpoint = endpoint
         .strip_prefix("http://")
         .unwrap_or(endpoint)
         .trim_end_matches('/');
-    let (host_port, path) = endpoint
+    let host_port = endpoint
         .split_once('/')
-        .map_or((endpoint, "/ready"), |(host, path)| (host, path));
+        .map_or(endpoint, |(host, _path)| host);
     let path = if path.starts_with('/') {
-        path.to_owned()
+        path.to_string()
     } else {
         format!("/{path}")
     };
@@ -1212,7 +1221,15 @@ async fn check_http_ready(endpoint: &str) -> Result<bool> {
     stream.write_all(request.as_bytes()).await?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
-    Ok(response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200"))
+    let ok = response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200");
+    let body = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(&response[..], |idx| &response[idx + 4..]);
+    Ok(OpsHttpResponse {
+        ok,
+        body: String::from_utf8_lossy(body).into_owned(),
+    })
 }
 
 fn run_waldump(path: &PathBuf) -> Result<()> {
@@ -1316,26 +1333,59 @@ fn format_decoded<T: std::fmt::Debug>(decoded: Result<T, ultrasql_wal::PayloadEr
     }
 }
 
-fn run_basebackup(data_dir: &PathBuf, dest: &PathBuf) -> Result<()> {
+async fn run_basebackup(
+    data_dir: &PathBuf,
+    dest: &PathBuf,
+    ops_endpoint: Option<&str>,
+) -> Result<()> {
+    let checkpoint_fence = if let Some(endpoint) = ops_endpoint {
+        let response = http_get_ops_endpoint(endpoint, "/backup/start").await?;
+        if !response.ok {
+            anyhow::bail!("backup fence start failed: {}", response.body.trim());
+        }
+        Some(response.body)
+    } else {
+        None
+    };
+
+    let backup_result = run_basebackup_copy(data_dir, dest, checkpoint_fence.as_deref());
+    if let Some(endpoint) = ops_endpoint {
+        let stop_result = http_get_ops_endpoint(endpoint, "/backup/stop").await;
+        if backup_result.is_ok() {
+            let response = stop_result?;
+            if !response.ok {
+                anyhow::bail!("backup fence stop failed: {}", response.body.trim());
+            }
+        } else {
+            let _ = stop_result;
+        }
+    }
+    backup_result
+}
+
+fn run_basebackup_copy(
+    data_dir: &PathBuf,
+    dest: &PathBuf,
+    checkpoint_fence: Option<&str>,
+) -> Result<()> {
     if dest.exists() {
         anyhow::bail!("basebackup destination already exists: {}", dest.display());
     }
     fs::create_dir_all(dest)?;
     let mut manifest = Vec::new();
     copy_tree_with_manifest(data_dir, data_dir, dest, &mut manifest)?;
-    manifest.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut text = String::from("{\n  \"files\": [\n");
-    for (idx, (path, bytes, checksum)) in manifest.iter().enumerate() {
-        let comma = if idx + 1 == manifest.len() { "" } else { "," };
-        text.push_str(&format!(
-            "    {{\"path\":\"{}\",\"bytes\":{},\"checksum\":\"{}\"}}{}\n",
-            path.replace('\\', "\\\\").replace('"', "\\\""),
-            bytes,
-            checksum,
-            comma
+    if let Some(fence) = checkpoint_fence {
+        let label = backup_label_text(fence);
+        fs::write(dest.join("backup_label"), label.as_bytes())?;
+        let len = u64::try_from(label.len()).unwrap_or(u64::MAX);
+        manifest.push((
+            "backup_label".to_string(),
+            len,
+            checksum_hex(label.as_bytes()),
         ));
     }
-    text.push_str("  ]\n}\n");
+    manifest.sort_by(|a, b| a.0.cmp(&b.0));
+    let text = basebackup_manifest_text(&manifest, checkpoint_fence);
     fs::write(dest.join("backup_manifest.json"), text)?;
     println!(
         "base backup copied {} files to {}",
@@ -1343,6 +1393,43 @@ fn run_basebackup(data_dir: &PathBuf, dest: &PathBuf) -> Result<()> {
         dest.display()
     );
     Ok(())
+}
+
+fn backup_label_text(checkpoint_fence: &str) -> String {
+    format!("ULTRASQL BACKUP FENCE\n{checkpoint_fence}")
+}
+
+fn basebackup_manifest_text(
+    manifest: &[(String, u64, String)],
+    checkpoint_fence: Option<&str>,
+) -> String {
+    let mut text = String::from("{\n");
+    if let Some(fence) = checkpoint_fence {
+        text.push_str(&format!(
+            "  \"checkpoint_fence\":\"{}\",\n",
+            json_escape(fence)
+        ));
+    }
+    text.push_str("  \"files\": [\n");
+    for (idx, (path, bytes, checksum)) in manifest.iter().enumerate() {
+        let comma = if idx + 1 == manifest.len() { "" } else { "," };
+        text.push_str(&format!(
+            "    {{\"path\":\"{}\",\"bytes\":{},\"checksum\":\"{}\"}}{}\n",
+            json_escape(path),
+            bytes,
+            checksum,
+            comma
+        ));
+    }
+    text.push_str("  ]\n}\n");
+    text
+}
+
+fn json_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn run_pg_dump(data_dir: &Path, dest: &Path, format: DumpFormat) -> Result<()> {
@@ -1869,6 +1956,23 @@ mod tests {
         // Each column: width + 2 spaces + border
         // "+-----+-------+"
         assert_eq!(sep, "+-----+-------+");
+    }
+
+    #[test]
+    fn basebackup_manifest_records_checkpoint_fence_metadata() {
+        let manifest = vec![(
+            "pg_wal/segment_0000000000".to_string(),
+            3,
+            "abc".to_string(),
+        )];
+        let text = basebackup_manifest_text(
+            &manifest,
+            Some("{\"status\":\"backup_started\",\"flushed_lsn\":7}\n"),
+        );
+
+        assert!(text.contains("\"checkpoint_fence\""));
+        assert!(text.contains("backup_started"));
+        assert!(text.contains("\"files\""));
     }
 
     #[test]

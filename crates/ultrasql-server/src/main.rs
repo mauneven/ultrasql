@@ -57,7 +57,8 @@ struct Cli {
     #[arg(long, env = "ULTRASQL_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
-    /// Optional HTTP operations endpoint for `/health`, `/ready`, and `/metrics`.
+    /// Optional HTTP operations endpoint for `/health`, `/ready`, `/metrics`,
+    /// and backup fencing.
     #[arg(long, env = "ULTRASQL_OPS_LISTEN")]
     ops_listen: Option<SocketAddr>,
 
@@ -168,7 +169,7 @@ Supported query shapes in v0.5:
 
 Production-oriented v0.9 flags:
   - --data-dir DIR      boot WAL-backed storage
-  - --ops-listen ADDR   serve /health, /ready, /metrics
+  - --ops-listen ADDR   serve /health, /ready, /metrics, /backup/start, /backup/stop
   - --log-format json   emit structured logs
   - --log-min-duration-statement-ms N
   - --log-statement none|ddl|mod|all
@@ -499,6 +500,32 @@ fn apply_startup_signal_files(state: &Server, data_dir: &Path) -> bool {
     enabled
 }
 
+fn start_backup_fence(state: &Server) -> Result<String, String> {
+    state.set_standby_mode(true);
+    let flushed_pages = match state.flush_dirty_heap_pages() {
+        Ok(flushed) => flushed,
+        Err(e) => {
+            state.set_standby_mode(false);
+            return Err(format!(
+                "{{\"status\":\"backup_start_failed\",\"error\":\"{}\"}}\n",
+                json_escape(&e.to_string())
+            ));
+        }
+    };
+    let flushed_lsn = state
+        .runtime_wal_flushed_lsn()
+        .map_or_else(|| "null".to_string(), |lsn| lsn.raw().to_string());
+    Ok(format!(
+        "{{\"status\":\"backup_started\",\"read_only\":true,\"flushed_pages\":{},\"flushed_lsn\":{flushed_lsn}}}\n",
+        usize_to_u64_saturated(flushed_pages)
+    ))
+}
+
+fn stop_backup_fence(state: &Server) -> String {
+    state.set_standby_mode(false);
+    "{\"status\":\"backup_stopped\",\"read_only\":false}\n".to_string()
+}
+
 async fn run_ops_endpoint(
     addr: SocketAddr,
     pg_addr: SocketAddr,
@@ -556,6 +583,11 @@ async fn handle_ops_request(mut stream: TcpStream, pg_addr: SocketAddr, state: A
             }
         }
         "/metrics" => ("200 OK", "text/plain; version=0.0.4", metrics_body(&state)),
+        "/backup/start" => match start_backup_fence(&state) {
+            Ok(body) => ("200 OK", "application/json", body),
+            Err(body) => ("500 Internal Server Error", "application/json", body),
+        },
+        "/backup/stop" => ("200 OK", "application/json", stop_backup_fence(&state)),
         _ => (
             "404 Not Found",
             "application/json",
@@ -736,6 +768,10 @@ fn push_metric(body: &mut String, name: &str, value: u64) {
 
 fn usize_to_u64_saturated(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn json_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 #[cfg(test)]
@@ -997,6 +1033,22 @@ mod tests {
     #[cfg(not(windows))]
     fn copy_restore_command(archive_dir: &Path) -> String {
         format!("cp '{}/%f' '%p' 2>/dev/null", archive_dir.display())
+    }
+
+    #[test]
+    fn backup_fence_start_enables_read_only_and_reports_checkpoint() {
+        let server = Server::with_sample_database();
+
+        let body = start_backup_fence(&server).expect("backup fence");
+
+        assert!(server.is_standby_mode());
+        assert!(body.contains("\"status\":\"backup_started\""));
+        assert!(body.contains("\"read_only\":true"));
+        assert!(body.contains("\"flushed_pages\":0"));
+
+        let body = stop_backup_fence(&server);
+        assert!(!server.is_standby_mode());
+        assert!(body.contains("\"status\":\"backup_stopped\""));
     }
 
     #[test]
