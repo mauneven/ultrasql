@@ -347,6 +347,39 @@ async fn generated_stored_column_is_computed_and_recomputed() {
     shutdown(client, server_handle).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generated_stored_column_survives_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    client
+        .batch_execute(
+            "CREATE TABLE generated_restart (a INT, b INT GENERATED ALWAYS AS (a + 1) STORED)",
+        )
+        .await
+        .expect("create");
+    shutdown(client, server_handle).await;
+
+    let (client, _conn, server_handle) = start_persistent_server_and_connect(data_dir.path()).await;
+    client
+        .batch_execute("INSERT INTO generated_restart (a) VALUES (4)")
+        .await
+        .expect("generated column computes after restart");
+    let rows = client
+        .query("SELECT a, b FROM generated_restart", &[])
+        .await
+        .expect("select generated row");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 4);
+    assert_eq!(rows[0].get::<_, i32>(1), 5);
+    let err = client
+        .batch_execute("INSERT INTO generated_restart VALUES (1, 99)")
+        .await
+        .expect_err("explicit generated insert rejected after restart");
+    assert_eq!(err.code().expect("SQLSTATE").code(), "428C9");
+    shutdown(client, server_handle).await;
+}
+
 /// Explicit INSERT/UPDATE values for stored generated columns are rejected.
 #[tokio::test]
 async fn generated_stored_column_rejects_explicit_values() {

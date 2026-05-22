@@ -3130,6 +3130,25 @@ impl Server {
                     out.push_str(&format!("identity_always\t{}\t{}\n", oid.raw(), idx));
                 }
             }
+            for (idx, generated_expr) in constraints.generated_stored.iter().enumerate() {
+                let Some(generated_expr) = generated_expr else {
+                    continue;
+                };
+                let Some(expr) = encode_scalar_expr_field(generated_expr) else {
+                    tracing::warn!(
+                        table = %table_name,
+                        column = idx,
+                        "generated stored expression is outside restart-persistable subset",
+                    );
+                    continue;
+                };
+                out.push_str(&format!(
+                    "generated_stored\t{}\t{}\t{}\n",
+                    oid.raw(),
+                    idx,
+                    metadata_escape(&expr)
+                ));
+            }
             for check in &constraints.checks {
                 let Some(expr) = encode_scalar_expr_field(&check.expr) else {
                     tracing::warn!(
@@ -3200,6 +3219,8 @@ impl Server {
         let mut defaults: std::collections::HashMap<Oid, Vec<(usize, ScalarExpr)>> =
             std::collections::HashMap::new();
         let mut identity_always: std::collections::HashMap<Oid, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut generated_stored: std::collections::HashMap<Oid, Vec<(usize, ScalarExpr)>> =
             std::collections::HashMap::new();
         let mut checks: std::collections::HashMap<Oid, Vec<RuntimeCheckConstraint>> =
             std::collections::HashMap::new();
@@ -3272,6 +3293,24 @@ impl Server {
                         ))
                     })?;
                     identity_always.entry(oid).or_default().push(idx);
+                }
+                Some("generated_stored") if parts.len() == 4 => {
+                    let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    let idx = parts[2].parse::<usize>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "table-runtime metadata line {} bad column index: {err}",
+                            line_no + 1
+                        ))
+                    })?;
+                    generated_stored.entry(oid).or_default().push((
+                        idx,
+                        decode_scalar_expr_field(&metadata_unescape(parts[3])?)?,
+                    ));
                 }
                 Some("check") if parts.len() == 4 => {
                     let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
@@ -3414,6 +3453,13 @@ impl Server {
                 for idx in always_columns {
                     if idx < runtime.identity_always.len() {
                         runtime.identity_always[idx] = true;
+                    }
+                }
+            }
+            if let Some(generated) = generated_stored.remove(&oid) {
+                for (idx, expr) in generated {
+                    if idx < runtime.generated_stored.len() {
+                        runtime.generated_stored[idx] = Some(expr);
                     }
                 }
             }
