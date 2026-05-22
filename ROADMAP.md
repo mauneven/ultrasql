@@ -1812,7 +1812,9 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [ ] Aggregate ordered/stat extensions: CORR, PERCENTILE_CONT, and
   PERCENTILE_DISC require multi-argument / ordered-set aggregate plan
   shape before they can be claimed at the SQL surface.
-- [ ] Window: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE, NTILE
+- [x] Window: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE,
+  LAST_VALUE, NTH_VALUE, and NTILE have parser, binder, executor, and
+  PostgreSQL-wire coverage in `crates/ultrasql-server/tests/window_round_trip.rs`.
 - [x] JSON scalar: `json_build_object` returns queryable JSONB through the
   PostgreSQL wire path.
 - [x] JSON update scalar: `jsonb_set` supports object-path updates with
