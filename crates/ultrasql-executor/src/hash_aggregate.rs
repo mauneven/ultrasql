@@ -1407,6 +1407,15 @@ enum AggState {
     ArrayAgg(Vec<Value>),
     /// `JSON_AGG(expr)` — accumulated values, preserving SQL NULL.
     JsonAgg(Vec<Value>),
+    /// `CORR(y, x)` — sums needed for Pearson correlation.
+    Corr {
+        count: i64,
+        sum_x: f64,
+        sum_y: f64,
+        sum_xy: f64,
+        sum_x2: f64,
+        sum_y2: f64,
+    },
     /// Welford running aggregate for STDDEV / VARIANCE: `(count,
     /// mean, M2)` where `M2` is the running sum of squared
     /// differences from the mean. Shared between `STDDEV_SAMP`,
@@ -1449,6 +1458,14 @@ fn init_state_for_func(func: AggregateFunc) -> AggState {
         AggregateFunc::StringAgg => AggState::StringAgg(Vec::new(), String::new()),
         AggregateFunc::ArrayAgg => AggState::ArrayAgg(Vec::new()),
         AggregateFunc::JsonAgg => AggState::JsonAgg(Vec::new()),
+        AggregateFunc::Corr => AggState::Corr {
+            count: 0,
+            sum_x: 0.0,
+            sum_y: 0.0,
+            sum_xy: 0.0,
+            sum_x2: 0.0,
+            sum_y2: 0.0,
+        },
         AggregateFunc::StddevSamp => AggState::Welford {
             count: 0,
             mean: 0.0,
@@ -1606,6 +1623,26 @@ fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), 
                 items.push(v);
             }
         }
+        AggState::Corr {
+            count,
+            sum_x,
+            sum_y,
+            sum_xy,
+            sum_x2,
+            sum_y2,
+        } => {
+            if let Some(Value::Record(fields)) = arg_val
+                && fields.len() >= 2
+                && let (Some(y), Some(x)) = (value_as_f64(&fields[0].1), value_as_f64(&fields[1].1))
+            {
+                *count = count.saturating_add(1);
+                *sum_x += x;
+                *sum_y += y;
+                *sum_xy += x * y;
+                *sum_x2 += x * x;
+                *sum_y2 += y * y;
+            }
+        }
         AggState::Welford {
             count, mean, m2, ..
         } => {
@@ -1682,6 +1719,28 @@ fn finalise(state: &AggState) -> Value {
                 Value::Null
             } else {
                 Value::Jsonb(json_agg_text(items))
+            }
+        }
+        AggState::Corr {
+            count,
+            sum_x,
+            sum_y,
+            sum_xy,
+            sum_x2,
+            sum_y2,
+        } => {
+            if *count < 2 {
+                return Value::Null;
+            }
+            let n = *count as f64;
+            let numerator = n.mul_add(*sum_xy, -(*sum_x * *sum_y));
+            let x_term = n.mul_add(*sum_x2, -(*sum_x * *sum_x));
+            let y_term = n.mul_add(*sum_y2, -(*sum_y * *sum_y));
+            let denominator = (x_term * y_term).sqrt();
+            if denominator == 0.0 {
+                Value::Null
+            } else {
+                Value::Float64(numerator / denominator)
             }
         }
         AggState::Welford {

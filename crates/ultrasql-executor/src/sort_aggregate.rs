@@ -84,6 +84,7 @@ fn init_state(agg: &LogicalAggregateExpr) -> AggState {
         AggregateFunc::StringAgg => AggState::StringAgg(Vec::new(), String::new()),
         AggregateFunc::ArrayAgg => AggState::ArrayAgg(Vec::new()),
         AggregateFunc::JsonAgg => AggState::JsonAgg(Vec::new()),
+        AggregateFunc::Corr => AggState::Corr(0.0, 0.0, 0.0, 0.0, 0.0, 0),
         AggregateFunc::StddevSamp | AggregateFunc::StddevPop => AggState::Stddev(0.0, 0.0, 0),
         AggregateFunc::VarSamp | AggregateFunc::VarPop => AggState::Variance(0.0, 0.0, 0),
     }
@@ -208,18 +209,16 @@ fn accumulate(
             }
         }
         AggState::Corr(sx, sy, sxy, sx2, sy2, cnt) => {
-            // arg for CORR is a pair (y_expr, x_expr); we encode as two
-            // positional columns — for now treat arg as the single value
-            // and leave the second as a TODO.
-            if let Some(v) = arg {
-                if let Some(x) = to_f64(&v) {
-                    *sx += x;
-                    *sy += x;
-                    *sxy += x * x;
-                    *sx2 += x * x;
-                    *sy2 += x * x;
-                    *cnt = cnt.saturating_add(1);
-                }
+            if let Some(Value::Record(fields)) = arg
+                && fields.len() >= 2
+                && let (Some(y), Some(x)) = (to_f64(&fields[0].1), to_f64(&fields[1].1))
+            {
+                *sx += x;
+                *sy += y;
+                *sxy += x * y;
+                *sx2 += x * x;
+                *sy2 += y * y;
+                *cnt = cnt.saturating_add(1);
             }
         }
         AggState::PercentileCont(vals, _) | AggState::PercentileDisc(vals, _) => {

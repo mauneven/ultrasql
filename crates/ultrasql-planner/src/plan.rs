@@ -190,6 +190,8 @@ pub enum AggregateFunc {
     /// `VAR_POP(expr)` — population variance. `NULL` when no
     /// non-null input was seen.
     VarPop,
+    /// `CORR(y, x)` — Pearson correlation coefficient.
+    Corr,
 }
 
 /// A single aggregate call in a `GROUP BY` / aggregation node.
@@ -1963,6 +1965,7 @@ impl LogicalPlan {
                         AggregateFunc::StddevPop => "stddev_pop",
                         AggregateFunc::VarSamp => "var_samp",
                         AggregateFunc::VarPop => "var_pop",
+                        AggregateFunc::Corr => "corr",
                     };
                     if let Some(arg) = &agg.arg {
                         let dist = if agg.distinct { "DISTINCT " } else { "" };

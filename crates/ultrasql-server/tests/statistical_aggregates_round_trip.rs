@@ -111,6 +111,23 @@ async fn var_pop_matches_postgres() {
     shutdown(running).await;
 }
 
+/// `CORR(y, x)` returns the Pearson correlation coefficient.
+#[tokio::test]
+async fn corr_matches_postgres() {
+    let running = start_sample_server("stats_test").await;
+    let client = &running.client;
+    seed(client).await;
+
+    let r = client
+        .query_one("SELECT CORR(val, id) FROM t", &[])
+        .await
+        .expect("CORR");
+    let got: f64 = r.get(0);
+    approx_eq(got, 0.927_426_033_5, 1e-9);
+
+    shutdown(running).await;
+}
+
 /// Empty input yields NULL for both sample and population
 /// stddev/variance. PostgreSQL semantics: sample needs ≥ 2
 /// non-null inputs, population needs ≥ 1.

@@ -51,6 +51,7 @@ pub(super) fn is_aggregate_name(name: &str) -> bool {
             | "variance"
             | "var_samp"
             | "var_pop"
+            | "corr"
     )
 }
 
@@ -73,6 +74,7 @@ fn classify_aggregate(name: &str, args_empty: bool) -> Option<AggregateFunc> {
         "stddev_pop" => Some(AggregateFunc::StddevPop),
         "variance" | "var_samp" => Some(AggregateFunc::VarSamp),
         "var_pop" => Some(AggregateFunc::VarPop),
+        "corr" => Some(AggregateFunc::Corr),
         _ => None,
     }
 }
@@ -102,7 +104,8 @@ fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> DataType {
         AggregateFunc::StddevSamp
         | AggregateFunc::StddevPop
         | AggregateFunc::VarSamp
-        | AggregateFunc::VarPop => DataType::Float64,
+        | AggregateFunc::VarPop
+        | AggregateFunc::Corr => DataType::Float64,
     }
 }
 
@@ -262,6 +265,29 @@ fn collect_aggregates(
             if let Some(func) = classify_aggregate(&func_name, args_empty_or_star) {
                 let (arg_expr, arg_ty) = if args_empty_or_star {
                     (None, DataType::Null)
+                } else if func == AggregateFunc::Corr {
+                    if args.len() != 2 {
+                        return Err(PlanError::TypeMismatch(format!(
+                            "corr: expected 2 arguments, got {}",
+                            args.len()
+                        )));
+                    }
+                    let y =
+                        bind_expr_with_ctes(&args[0], input_schema, catalog, cte_catalog, scope)?;
+                    let x =
+                        bind_expr_with_ctes(&args[1], input_schema, catalog, cte_catalog, scope)?;
+                    let row_type = DataType::Record(vec![
+                        ("f1".to_owned(), y.data_type()),
+                        ("f2".to_owned(), x.data_type()),
+                    ]);
+                    (
+                        Some(ScalarExpr::FunctionCall {
+                            name: "row".to_owned(),
+                            args: vec![y, x],
+                            data_type: row_type.clone(),
+                        }),
+                        row_type,
+                    )
                 } else {
                     let bound =
                         bind_expr_with_ctes(&args[0], input_schema, catalog, cte_catalog, scope)?;
