@@ -37,46 +37,12 @@
 //!   surfacing `ExecError::Cancelled`;
 //! - the error path mapping it to SQLSTATE `57014`.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener};
+mod support;
 
-/// Start an in-process server and connect a single client. Returns the
-/// client, the connection-task handle (kept so the connection runs to
-/// completion in the background), the server-task handle, and the
-/// server's bound `SocketAddr` so the test can dial a raw cancel-peer
-/// connection without going through tokio-postgres.
-async fn start_server_and_connect() -> (
-    tokio_postgres::Client,
-    tokio::task::JoinHandle<()>,
-    tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-    SocketAddr,
-) {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=cancel_request_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            // tokio-postgres reports the connection-close that follows
-            // a successful cancel as an `unexpected EOF`. That is a
-            // benign side effect of the cancel, not a test failure.
-            eprintln!("conn A driver shut down: {e}");
-        }
-    });
-    (client, conn_handle, server_handle, bound)
-}
+use support::{shutdown, start_sample_server};
 
 /// Per-INSERT batch size for the bulk-load helper. Keeps each
 /// `INSERT … VALUES (..),(..),..` statement small enough to parse
@@ -143,7 +109,9 @@ const LONG_RUNNING_SQL: &str = "SELECT id, COUNT(*) FROM t GROUP BY id";
 // Cancel test now runs end-to-end after the protocol-side decode landed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cancel_request_aborts_in_flight_select_within_500ms() {
-    let (client_a, _conn_a, server_handle, server_addr) = start_server_and_connect().await;
+    let running = start_sample_server("cancel_request_test").await;
+    let server_addr = running.bound;
+    let client_a = &running.client;
 
     // Setup on a SEPARATE connection so the long-running SELECT's
     // session is fresh — its cancel_flag has been cloned into the
@@ -157,7 +125,7 @@ async fn cancel_request_aborts_in_flight_select_within_500ms() {
     let (setup_client, setup_conn) = tokio_postgres::connect(&conn_str, NoTls)
         .await
         .expect("setup connect");
-    let _setup_handle = tokio::spawn(async move {
+    let setup_handle = tokio::spawn(async move {
         let _ = setup_conn.await;
     });
     setup_client
@@ -166,6 +134,7 @@ async fn cancel_request_aborts_in_flight_select_within_500ms() {
         .expect("CREATE TABLE");
     populate(&setup_client, LONG_RUNNING_ROW_COUNT).await;
     drop(setup_client);
+    setup_handle.await.expect("setup connection task joins");
 
     // The long-running query runs on `client_a`. Capture `client_a`'s
     // cancel token (parsed out of its `BackendKeyData`) so connection
@@ -192,19 +161,16 @@ async fn cancel_request_aborts_in_flight_select_within_500ms() {
 
     // Conn A enters the executor with the flag already set.
     let query_started = Instant::now();
-    let conn_a_future = tokio::spawn(async move {
-        let res = client_a.simple_query(LONG_RUNNING_SQL).await;
-        (Instant::now(), res)
-    });
-
     // Conn A must resolve with a `query_canceled` error inside the
     // 500-ms budget. Anything else (success, different SQLSTATE,
     // timeout) is a test failure.
-    let timeout = tokio::time::timeout(Duration::from_millis(500), conn_a_future)
-        .await
-        .expect("conn A query future did not resolve inside 500 ms");
-    let (finished_at, query_result) = timeout.expect("conn A task did not panic");
-    let elapsed = finished_at - query_started;
+    let query_result = tokio::time::timeout(
+        Duration::from_millis(500),
+        client_a.simple_query(LONG_RUNNING_SQL),
+    )
+    .await
+    .expect("conn A query future did not resolve inside 500 ms");
+    let elapsed = query_started.elapsed();
 
     let err = match query_result {
         Ok(rows) => panic!(
@@ -233,7 +199,7 @@ async fn cancel_request_aborts_in_flight_select_within_500ms() {
     );
 
     drop(cancel_token);
-    server_handle.abort();
+    shutdown(running).await;
 }
 
 /// A CancelRequest carrying an unknown `(pid, secret)` pair must be a
@@ -253,24 +219,9 @@ async fn cancel_request_with_unknown_pid_is_silent_noop() {
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
 
-    // Spin up an isolated server so we can read its bound port for the
-    // raw CancelRequest. `start_server_and_connect` hides the port, so
-    // do the dance inline here.
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::with_sample_database());
-    let server_handle = tokio::spawn(serve_listener(listener, server));
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=cancel_request_test_noop",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let _conn = tokio::spawn(async move {
-        let _ = connection.await;
-    });
+    let running = start_sample_server("cancel_request_test_noop").await;
+    let bound = running.bound;
+    let client = &running.client;
 
     // Hand-crafted CancelRequest frame for a pid that the server
     // never issued. Layout (see PostgreSQL §55.2.2):
@@ -298,5 +249,5 @@ async fn cancel_request_with_unknown_pid_is_silent_noop() {
     let rows = client.query("SELECT 1", &[]).await.expect("SELECT 1");
     assert_eq!(rows.len(), 1);
 
-    server_handle.abort();
+    shutdown(running).await;
 }

@@ -10,6 +10,7 @@ use ultrasql_server::{Server, bind_listener, serve_listener_with_shutdown};
 pub(crate) struct RunningServer {
     pub(crate) server: Arc<Server>,
     pub(crate) client: tokio_postgres::Client,
+    pub(crate) bound: SocketAddr,
     conn_handle: tokio::task::JoinHandle<()>,
     server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
     shutdown_tx: oneshot::Sender<()>,
@@ -61,6 +62,7 @@ async fn start_server(server: Arc<Server>, application_name: &str) -> RunningSer
     RunningServer {
         server,
         client,
+        bound,
         conn_handle,
         server_handle,
         shutdown_tx,
@@ -71,6 +73,7 @@ pub(crate) async fn shutdown(running: RunningServer) {
     let RunningServer {
         server,
         client,
+        bound: _,
         conn_handle,
         server_handle,
         shutdown_tx,
