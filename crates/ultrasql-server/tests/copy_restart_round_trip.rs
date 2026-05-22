@@ -1,6 +1,5 @@
 //! Persistent `COPY FROM` restart coverage through the PostgreSQL wire path.
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,9 +8,10 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as Arr
 use bytes::Bytes;
 use futures::SinkExt;
 use parquet::arrow::ArrowWriter;
-use tokio::sync::oneshot;
-use tokio_postgres::NoTls;
-use ultrasql_server::{Server, bind_listener, serve_listener_with_shutdown};
+
+mod support;
+
+use support::{shutdown, start_persistent_server};
 
 fn sql_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -54,54 +54,6 @@ fn write_copy_parquet(path: &Path, rows: &[(i64, &str, f64, bool)]) {
     writer.close().expect("close parquet writer");
 }
 
-struct RunningServer {
-    client: tokio_postgres::Client,
-    conn_handle: tokio::task::JoinHandle<()>,
-    server_handle: tokio::task::JoinHandle<Result<(), ultrasql_server::ServerError>>,
-    shutdown_tx: oneshot::Sender<()>,
-}
-
-async fn start_persistent_server(data_dir: &Path) -> RunningServer {
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
-    let (listener, bound) = bind_listener(addr).await.expect("bind");
-    let server = Arc::new(Server::init(data_dir).expect("persistent server init"));
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let server_handle = tokio::spawn(serve_listener_with_shutdown(listener, server, async move {
-        let _ = shutdown_rx.await;
-    }));
-
-    let conn_str = format!(
-        "host={host} port={port} user=tester application_name=copy_restart_test",
-        host = bound.ip(),
-        port = bound.port()
-    );
-    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
-        .await
-        .expect("tokio-postgres connect");
-    let conn_handle = tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
-    RunningServer {
-        client,
-        conn_handle,
-        server_handle,
-        shutdown_tx,
-    }
-}
-
-async fn shutdown(running: RunningServer) {
-    drop(running.client);
-    running.conn_handle.await.expect("connection task joins");
-    let _ = running.shutdown_tx.send(());
-    running
-        .server_handle
-        .await
-        .expect("server task joins")
-        .expect("listener exits cleanly");
-}
-
 async fn select_count(client: &tokio_postgres::Client, table: &str) -> i64 {
     let rows = client
         .simple_query(&format!("SELECT COUNT(*) FROM {table}"))
@@ -134,7 +86,7 @@ async fn copy_in_payload(client: &tokio_postgres::Client, sql: &str, payload: &[
 async fn copy_from_stdin_rows_survive_restart() {
     let data_dir = tempfile::TempDir::new().unwrap();
 
-    let running = start_persistent_server(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "copy_restart_test").await;
     running
         .client
         .simple_query("CREATE TABLE copy_restart (id INT, label TEXT)")
@@ -150,7 +102,7 @@ async fn copy_from_stdin_rows_survive_restart() {
     assert_eq!(select_count(&running.client, "copy_restart").await, 2);
     shutdown(running).await;
 
-    let running = start_persistent_server(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "copy_restart_test").await;
     assert_eq!(select_count(&running.client, "copy_restart").await, 2);
     shutdown(running).await;
 }
@@ -165,7 +117,7 @@ async fn copy_from_parquet_rows_survive_restart() {
         &[(10, "alpha", 1.5, true), (20, "bravo", 2.5, false)],
     );
 
-    let running = start_persistent_server(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "copy_restart_test").await;
     running
         .client
         .simple_query(
@@ -189,7 +141,7 @@ async fn copy_from_parquet_rows_survive_restart() {
     assert_eq!(select_count(&running.client, "parquet_restart").await, 2);
     shutdown(running).await;
 
-    let running = start_persistent_server(data_dir.path()).await;
+    let running = start_persistent_server(data_dir.path(), "copy_restart_test").await;
     assert_eq!(select_count(&running.client, "parquet_restart").await, 2);
     shutdown(running).await;
 }
