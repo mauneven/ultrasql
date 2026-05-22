@@ -20,7 +20,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use ultrasql_server::{AutovacuumConfig, LogStatementMode, LoggingConfig, Server, run_server};
+use ultrasql_server::{
+    AutovacuumConfig, LogStatementMode, LoggingConfig, Server, WalArchiveConfig, run_server,
+};
 
 /// `ultrasqld` v0.5: PostgreSQL-wire-compatible server with an
 /// in-memory sample database.
@@ -182,6 +184,9 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     };
+    let wal_archive_config = WalArchiveConfig {
+        archive_command: cli.archive_command.clone().unwrap_or_default(),
+    };
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -199,6 +204,7 @@ fn main() -> std::process::ExitCode {
             Ok(mut server) => {
                 server.set_autovacuum_config(autovacuum_config);
                 server.set_logging_config(logging_config);
+                server.set_wal_archive_config(wal_archive_config.clone());
                 Arc::new(server)
             }
             Err(e) => {
@@ -210,6 +216,7 @@ fn main() -> std::process::ExitCode {
             let mut server = Server::with_sample_database();
             server.set_autovacuum_config(autovacuum_config);
             server.set_logging_config(logging_config);
+            server.set_wal_archive_config(wal_archive_config);
             Arc::new(server)
         }
     };

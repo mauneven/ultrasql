@@ -1210,7 +1210,7 @@ fn rows_pg_settings(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
         ],
         vec![
             v_text("archive_command"),
-            v_text(""),
+            v_text(&ctx.wal_archive_config.archive_command),
             Value::Null,
             v_text("Write-Ahead Log / Archiving"),
             v_text("Command to archive completed WAL files."),
