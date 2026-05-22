@@ -151,6 +151,43 @@ async fn scalar_math_functions_return_postgres_shaped_values() {
 }
 
 #[tokio::test]
+async fn scalar_datetime_functions_return_postgres_shaped_values() {
+    let running = start_sample_server("system_functions_test").await;
+    let client = &running.client;
+
+    let row = client
+        .query_one(
+            "SELECT \
+             extract(year FROM DATE '2024-05-22'), \
+             extract(hour FROM TIMESTAMP '2024-05-22 13:14:15'), \
+             extract(epoch FROM TIMESTAMP '2000-01-02 00:00:00'), \
+             extract(year FROM current_date) >= 2026, \
+             extract(epoch FROM to_timestamp(86400)), \
+             extract(day FROM make_date(2024, 2, 29)), \
+             extract(day FROM date_trunc('month', TIMESTAMP '2024-05-22 13:14:15')), \
+             extract(hour FROM date_trunc('day', TIMESTAMP '2024-05-22 13:14:15')), \
+             extract(day FROM age(TIMESTAMP '2024-05-22 13:14:15', TIMESTAMP '2024-05-20 12:14:15')), \
+             extract(day FROM date_bin(INTERVAL '1' DAY, TIMESTAMP '2000-01-03 15:00:00', TIMESTAMP '2000-01-01 00:00:00'))",
+            &[],
+        )
+        .await
+        .expect("datetime functions");
+
+    assert_eq!(row.get::<_, i64>(0), 2024);
+    assert_eq!(row.get::<_, i64>(1), 13);
+    assert_eq!(row.get::<_, i64>(2), 946_771_200);
+    assert!(row.get::<_, bool>(3));
+    assert_eq!(row.get::<_, i64>(4), 86_400);
+    assert_eq!(row.get::<_, i64>(5), 29);
+    assert_eq!(row.get::<_, i64>(6), 1);
+    assert_eq!(row.get::<_, i64>(7), 0);
+    assert_eq!(row.get::<_, i64>(8), 2);
+    assert_eq!(row.get::<_, i64>(9), 3);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
 async fn pg_relation_size_reports_heap_pages() {
     let running = start_sample_server("system_functions_test").await;
     let client = &running.client;

@@ -1006,6 +1006,11 @@ fn literal_numeric_as_f64(value: &Value) -> Option<f64> {
 fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
     match func_name {
         "extract" => Ok(DataType::Int64),
+        "current_date" | "make_date" => Ok(DataType::Date),
+        "now" | "current_timestamp" | "date_trunc" | "to_timestamp" | "date_bin" => {
+            Ok(DataType::TimestampTz)
+        }
+        "age" => Ok(DataType::Interval),
         "abs" => Ok(DataType::Int64),
         "ceil" | "floor" | "round" | "trunc" | "mod" | "power" | "sqrt" | "exp" | "ln" | "log"
         | "random" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "pi" => {
@@ -1047,6 +1052,14 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
         func_name,
         "abs"
             | "extract"
+            | "current_date"
+            | "current_timestamp"
+            | "now"
+            | "age"
+            | "date_trunc"
+            | "to_timestamp"
+            | "make_date"
+            | "date_bin"
             | "ceil"
             | "floor"
             | "round"

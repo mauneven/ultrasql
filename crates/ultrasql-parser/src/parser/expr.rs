@@ -365,6 +365,12 @@ impl<'src> Parser<'src> {
 
             TokenKind::KwCoalesce => self.parse_coalesce_expr(),
 
+            TokenKind::KwCurrentDate => self.parse_keyword_zero_arg_function("current_date"),
+
+            TokenKind::KwCurrentTimestamp => {
+                self.parse_keyword_zero_arg_function("current_timestamp")
+            }
+
             TokenKind::KwNullif => self.parse_nullif_expr(),
 
             TokenKind::KwGreatest => self.parse_greatest_least_expr(true),
@@ -433,6 +439,28 @@ impl<'src> Parser<'src> {
             distinct: false,
             over: None,
             span: Span::new(name_tok.span.start, rp.span.end),
+            name,
+        })
+    }
+
+    fn parse_keyword_zero_arg_function(
+        &mut self,
+        function_name: &'static str,
+    ) -> Result<Expr, ParseError> {
+        let name_tok = self.advance()?;
+        let name = ObjectName {
+            parts: vec![Identifier {
+                value: function_name.to_owned(),
+                quoted: false,
+                span: name_tok.span,
+            }],
+            span: name_tok.span,
+        };
+        Ok(Expr::Call {
+            args: Vec::new(),
+            distinct: false,
+            over: None,
+            span: name_tok.span,
             name,
         })
     }
