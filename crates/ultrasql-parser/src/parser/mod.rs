@@ -244,6 +244,9 @@ impl<'src> Parser<'src> {
             TokenKind::KwSet | TokenKind::KwShow | TokenKind::KwReset => {
                 let head_kind = head.kind;
                 let next_kind = self.lookahead_at(1).map(|t| t.kind).ok();
+                let next_is_role = self
+                    .lookahead_text_eq_ignore_ascii_case(1, "role")
+                    .unwrap_or(false);
                 if head_kind == TokenKind::KwSet && next_kind == Some(TokenKind::KwTransaction) {
                     let set_tok = self.advance()?; // SET
                     self.advance()?; // TRANSACTION
@@ -259,6 +262,10 @@ impl<'src> Parser<'src> {
                         isolation_level,
                         span: set_tok.span,
                     })
+                } else if (head_kind == TokenKind::KwSet || head_kind == TokenKind::KwReset)
+                    && next_is_role
+                {
+                    self.parse_set_role().map(Statement::SetRole)
                 } else {
                     self.parse_set_stmt().map(Statement::SetVar)
                 }
@@ -286,6 +293,8 @@ impl<'src> Parser<'src> {
                 let tok = self.advance()?;
                 self.parse_execute(tok.span.start)
             }
+            TokenKind::KwGrant => self.parse_grant_statement(),
+            TokenKind::KwRevoke => self.parse_revoke_statement(),
             TokenKind::KwDeallocate => {
                 let tok = self.advance()?;
                 self.parse_deallocate(tok.span.start)
@@ -307,8 +316,8 @@ impl<'src> Parser<'src> {
             other => Err(ParseError::Expected {
                 expected: "SELECT, INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, ALTER, \
                            COMMENT, REINDEX, SET, SHOW, RESET, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, \
-                           RELEASE, EXPLAIN, PREPARE, EXECUTE, DEALLOCATE, LISTEN, NOTIFY, \
-                           UNLISTEN, or COPY",
+                           RELEASE, EXPLAIN, PREPARE, EXECUTE, GRANT, REVOKE, DEALLOCATE, \
+                           LISTEN, NOTIFY, UNLISTEN, or COPY",
                 found: other,
                 offset: head.span.start as usize,
             }),
@@ -561,6 +570,9 @@ impl<'src> Parser<'src> {
 
         let tok = *self.peek()?;
         match tok.kind {
+            TokenKind::KwDefault => self
+                .parse_alter_default_privileges(start)
+                .map(|s| Statement::AlterDefaultPrivileges(Box::new(s))),
             TokenKind::KwTable => self
                 .parse_alter_table(start)
                 .map(|s| Statement::AlterTable(Box::new(s))),
@@ -584,7 +596,7 @@ impl<'src> Parser<'src> {
                     .map(|s| Statement::AlterRole(Box::new(s)))
             }
             other => Err(ParseError::Expected {
-                expected: "TABLE, SEQUENCE, ROLE, or USER after ALTER",
+                expected: "DEFAULT PRIVILEGES, TABLE, SEQUENCE, ROLE, or USER after ALTER",
                 found: other,
                 offset: tok.span.start as usize,
             }),
@@ -644,6 +656,24 @@ impl<'src> Parser<'src> {
             tok = tmp.next_token()?;
         }
         Ok(tok)
+    }
+
+    pub(crate) fn lookahead_text_eq_ignore_ascii_case(
+        &mut self,
+        distance: usize,
+        expected: &str,
+    ) -> Result<bool, ParseError> {
+        debug_assert!(distance >= 1);
+        let _ = self.peek()?;
+        let remainder = &self.source[self.lexer.offset()..];
+        let mut tmp = Lexer::new(remainder);
+        let mut tok = tmp.next_token()?;
+        for _ in 1..distance {
+            tok = tmp.next_token()?;
+        }
+        Ok(tok
+            .text(remainder)
+            .is_some_and(|text| text.eq_ignore_ascii_case(expected)))
     }
 
     pub(crate) fn lookahead_two_is(&mut self, a: TokenKind, b: TokenKind) -> bool {

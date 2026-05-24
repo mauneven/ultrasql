@@ -192,7 +192,8 @@ fn lower_query_inner(
             lower_project_columns(child, &exprs)
         }
         LogicalPlan::Filter { input, predicate } => {
-            if let Some(op) = try_lower_time_partition_filter_scan(input, predicate, ctx)? {
+            let predicate = rewrite_catalog_scalar_expr(predicate, ctx)?;
+            if let Some(op) = try_lower_time_partition_filter_scan(input, &predicate, ctx)? {
                 return Ok(op);
             }
             // Index-aware fast path: when the filter sits directly on top
@@ -218,17 +219,17 @@ fn lower_query_inner(
             // shape was recognised but probing the B-tree or fetching a
             // heap tuple raised a storage error — those are not
             // recoverable by falling back, so we propagate.
-            if let Some(op) = try_index_scan(input, predicate, ctx)? {
+            if let Some(op) = try_index_scan(input, &predicate, ctx)? {
                 return Ok(op);
             }
-            if let Some(op) = try_lower_read_csv_filter(input, predicate)? {
+            if let Some(op) = try_lower_read_csv_filter(input, &predicate)? {
                 return Ok(op);
             }
-            if let Some(op) = try_lower_read_parquet_filter(input, predicate)? {
+            if let Some(op) = try_lower_read_parquet_filter(input, &predicate)? {
                 return Ok(op);
             }
             let child = lower_query(input, ctx)?;
-            Ok(Box::new(Filter::new(child, predicate.clone())))
+            Ok(Box::new(Filter::new(child, predicate)))
         }
         LogicalPlan::Limit { input, n, offset } => {
             if let Some(op) = try_lower_hybrid_search_limit(input, *n, *offset, ctx)? {
@@ -315,6 +316,11 @@ fn lower_query_inner(
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::AlterRole { .. }
         | LogicalPlan::DropRole { .. }
+        | LogicalPlan::GrantPrivileges { .. }
+        | LogicalPlan::RevokePrivileges { .. }
+        | LogicalPlan::AlterDefaultPrivileges { .. }
+        | LogicalPlan::GrantRole { .. }
+        | LogicalPlan::RevokeRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }
@@ -333,7 +339,8 @@ fn lower_query_inner(
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
-        | LogicalPlan::SetVariable { .. } => Err(ServerError::Unsupported(
+        | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetRole { .. } => Err(ServerError::Unsupported(
             "session control reached operator lowerer; expected direct dispatch path",
         )),
         LogicalPlan::Listen { .. } | LogicalPlan::Notify { .. } | LogicalPlan::Unlisten { .. } => {
@@ -567,6 +574,11 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::CreateRole { .. } => "CreateRole",
         LogicalPlan::AlterRole { .. } => "AlterRole",
         LogicalPlan::DropRole { .. } => "DropRole",
+        LogicalPlan::GrantPrivileges { .. } => "GrantPrivileges",
+        LogicalPlan::RevokePrivileges { .. } => "RevokePrivileges",
+        LogicalPlan::AlterDefaultPrivileges { .. } => "AlterDefaultPrivileges",
+        LogicalPlan::GrantRole { .. } => "GrantRole",
+        LogicalPlan::RevokeRole { .. } => "RevokeRole",
         LogicalPlan::DropTable { .. } => "DropTable",
         LogicalPlan::AlterTable { .. } => "AlterTable",
         LogicalPlan::CreateSequence { .. } => "CreateSequence",
@@ -584,6 +596,7 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::RollbackPrepared { .. } => "RollbackPrepared",
         LogicalPlan::SetTransaction { .. } => "SetTransaction",
         LogicalPlan::SetVariable { .. } => "SetVariable",
+        LogicalPlan::SetRole { .. } => "SetRole",
         LogicalPlan::Explain { .. } => "Explain",
         LogicalPlan::Listen { .. } => "Listen",
         LogicalPlan::Notify { .. } => "Notify",
@@ -653,6 +666,41 @@ fn rewrite_catalog_scalar_expr(
             name,
             args,
             data_type,
+        } if is_privilege_check_function(name) => {
+            let rewritten_args: Result<Vec<_>, _> = args
+                .iter()
+                .map(|arg| rewrite_catalog_scalar_expr(arg, ctx))
+                .collect();
+            let rewritten_args = rewritten_args?;
+            Ok(ScalarExpr::Literal {
+                value: privilege_check_from_literal_args(name, &rewritten_args, ctx)?,
+                data_type: data_type.clone(),
+            })
+        }
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } if matches!(name.as_str(), "current_user" | "session_user") => {
+            if !args.is_empty() {
+                return Err(ServerError::Unsupported(Box::leak(
+                    format!("{name} expects zero arguments").into_boxed_str(),
+                )));
+            }
+            let value = if name == "current_user" {
+                ctx.current_user.clone()
+            } else {
+                ctx.session_user.clone()
+            };
+            Ok(ScalarExpr::Literal {
+                value: Value::Text(value),
+                data_type: data_type.clone(),
+            })
+        }
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
         } if is_advisory_lock_function(name) => {
             let rewritten_args: Result<Vec<_>, _> = args
                 .iter()
@@ -699,6 +747,18 @@ fn is_advisory_lock_function(name: &str) -> bool {
     )
 }
 
+fn is_privilege_check_function(name: &str) -> bool {
+    matches!(
+        name,
+        "has_table_privilege"
+            | "has_schema_privilege"
+            | "has_database_privilege"
+            | "has_sequence_privilege"
+            | "has_function_privilege"
+            | "has_column_privilege"
+    )
+}
+
 fn literal_values(name: &str, args: &[ScalarExpr]) -> Result<Vec<Value>, ServerError> {
     args.iter()
         .map(|arg| match arg {
@@ -710,6 +770,94 @@ fn literal_values(name: &str, args: &[ScalarExpr]) -> Result<Vec<Value>, ServerE
             )),
         })
         .collect()
+}
+
+fn privilege_check_from_literal_args(
+    name: &str,
+    args: &[ScalarExpr],
+    ctx: &super::LowerCtx<'_>,
+) -> Result<Value, ServerError> {
+    let expected = if name == "has_column_privilege" { 4 } else { 3 };
+    if args.len() != expected {
+        return Err(ServerError::Unsupported(Box::leak(
+            format!("{name} expects exactly {expected} text arguments").into_boxed_str(),
+        )));
+    }
+    let mut texts = Vec::with_capacity(expected);
+    for arg in args {
+        let ScalarExpr::Literal { value, .. } = arg else {
+            return Err(ServerError::Unsupported(Box::leak(
+                format!("{name} currently requires literal arguments").into_boxed_str(),
+            )));
+        };
+        match value {
+            Value::Null => return Ok(Value::Null),
+            Value::Text(text) => texts.push(text.as_str()),
+            other => {
+                return Err(ServerError::Unsupported(Box::leak(
+                    format!("{name} expects text arguments, got {:?}", other.data_type())
+                        .into_boxed_str(),
+                )));
+            }
+        }
+    }
+    if name == "has_column_privilege" {
+        let privilege = privilege_kind_from_text(texts[3])?;
+        let roles = ctx.role_catalog.inherited_role_names(texts[0]);
+        return Ok(Value::Bool(
+            ctx.privilege_catalog.has_column_privilege_for_roles(
+                &roles,
+                crate::auth::PrivilegeObjectKind::Table,
+                texts[1],
+                texts[2],
+                privilege,
+            ),
+        ));
+    }
+    let object_kind = privilege_object_kind_for_function(name).ok_or_else(|| {
+        ServerError::Unsupported(Box::leak(
+            format!("unsupported privilege check function {name}").into_boxed_str(),
+        ))
+    })?;
+    let privilege = privilege_kind_from_text(texts[2])?;
+    let roles = ctx.role_catalog.inherited_role_names(texts[0]);
+    Ok(Value::Bool(ctx.privilege_catalog.has_privilege_for_roles(
+        &roles,
+        object_kind,
+        texts[1],
+        privilege,
+    )))
+}
+
+fn privilege_object_kind_for_function(name: &str) -> Option<crate::auth::PrivilegeObjectKind> {
+    match name {
+        "has_table_privilege" => Some(crate::auth::PrivilegeObjectKind::Table),
+        "has_schema_privilege" => Some(crate::auth::PrivilegeObjectKind::Schema),
+        "has_database_privilege" => Some(crate::auth::PrivilegeObjectKind::Database),
+        "has_sequence_privilege" => Some(crate::auth::PrivilegeObjectKind::Sequence),
+        "has_function_privilege" => Some(crate::auth::PrivilegeObjectKind::Function),
+        _ => None,
+    }
+}
+
+fn privilege_kind_from_text(text: &str) -> Result<crate::auth::PrivilegeKind, ServerError> {
+    match text.trim().to_ascii_lowercase().as_str() {
+        "select" => Ok(crate::auth::PrivilegeKind::Select),
+        "insert" => Ok(crate::auth::PrivilegeKind::Insert),
+        "update" => Ok(crate::auth::PrivilegeKind::Update),
+        "delete" => Ok(crate::auth::PrivilegeKind::Delete),
+        "truncate" => Ok(crate::auth::PrivilegeKind::Truncate),
+        "references" => Ok(crate::auth::PrivilegeKind::References),
+        "trigger" => Ok(crate::auth::PrivilegeKind::Trigger),
+        "usage" => Ok(crate::auth::PrivilegeKind::Usage),
+        "create" => Ok(crate::auth::PrivilegeKind::Create),
+        "connect" => Ok(crate::auth::PrivilegeKind::Connect),
+        "temporary" | "temp" => Ok(crate::auth::PrivilegeKind::Temporary),
+        "execute" => Ok(crate::auth::PrivilegeKind::Execute),
+        other => Err(ServerError::Unsupported(Box::leak(
+            format!("unsupported privilege kind '{other}'").into_boxed_str(),
+        ))),
+    }
 }
 
 fn relation_size_from_literal_args(
@@ -875,6 +1023,9 @@ pub(super) fn lower_cte(
         table_constraints: Arc::clone(&ctx.table_constraints),
         sequences: Arc::clone(&ctx.sequences),
         role_catalog: Arc::clone(&ctx.role_catalog),
+        privilege_catalog: Arc::clone(&ctx.privilege_catalog),
+        current_user: ctx.current_user.clone(),
+        session_user: ctx.session_user.clone(),
         persistent_catalog: Arc::clone(&ctx.persistent_catalog),
         time_partitions: Arc::clone(&ctx.time_partitions),
         workload_recorder: Arc::clone(&ctx.workload_recorder),

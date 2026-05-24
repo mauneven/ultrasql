@@ -2067,9 +2067,9 @@ same host.
 
 ### Security
 - [x] `CREATE ROLE / USER`, `ALTER ROLE`, `DROP ROLE` — in-memory role catalog plus `pg_roles` / `pg_user` visibility.
-- [ ] `GRANT / REVOKE` on tables, schemas, databases, sequences, functions
-- [ ] Column-level privileges
-- [ ] Role inheritance + `SET ROLE`
+- [x] `GRANT / REVOKE` on tables, schemas, databases, sequences, functions — in-memory privilege catalog plus `has_*_privilege` checks.
+- [x] Column-level privileges — `GRANT SELECT(col) / INSERT(col) / UPDATE(col)` catalog rows, `has_column_privilege`, and Simple/Extended Query enforcement for SELECT reads plus INSERT/UPDATE target columns.
+- [x] Role inheritance + `SET ROLE` — `GRANT role TO role`, `REVOKE role FROM role`, transitive membership, cycle rejection, `INHERIT` / `NOINHERIT` automatic privilege application, `SET ROLE` / `RESET ROLE` identity changes, `current_user` / `session_user`, and Simple/Extended privilege enforcement now honor the effective role set. Covered by parser/binder/auth unit tests plus `privilege_catalog_round_trip.rs`.
 - [ ] Default privileges (`ALTER DEFAULT PRIVILEGES`)
 - [ ] Row-level security: role/owner/bypass/restart semantics (tenant command-specific + permissive/restrictive policy slice done)
 - [x] `log_connections`, `log_min_duration_statement`, `log_statement`

@@ -96,6 +96,11 @@ pub fn lower_plan(
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::AlterRole { .. }
         | LogicalPlan::DropRole { .. }
+        | LogicalPlan::GrantPrivileges { .. }
+        | LogicalPlan::RevokePrivileges { .. }
+        | LogicalPlan::AlterDefaultPrivileges { .. }
+        | LogicalPlan::GrantRole { .. }
+        | LogicalPlan::RevokeRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }
@@ -114,7 +119,8 @@ pub fn lower_plan(
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
-        | LogicalPlan::SetVariable { .. } => Err(ServerError::Unsupported(
+        | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetRole { .. } => Err(ServerError::Unsupported(
             "session control reached operator lowerer; expected direct dispatch path",
         )),
         LogicalPlan::Listen { .. } | LogicalPlan::Notify { .. } | LogicalPlan::Unlisten { .. } => {

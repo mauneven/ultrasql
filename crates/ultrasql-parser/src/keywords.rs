@@ -238,6 +238,9 @@ fn build_table() -> AHashMap<&'static str, TokenKind> {
         ("unlisten", TokenKind::KwUnlisten),
         // COPY — §1.11 wire surface.
         ("copy", TokenKind::KwCopy),
+        // Privilege DDL.
+        ("grant", TokenKind::KwGrant),
+        ("revoke", TokenKind::KwRevoke),
         ("stdin", TokenKind::KwStdin),
         ("stdout", TokenKind::KwStdout),
         ("csv", TokenKind::KwCsv),

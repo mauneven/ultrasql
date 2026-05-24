@@ -432,6 +432,10 @@ pub enum TokenKind {
     // ---- COPY keywords (§1.11 wire surface) ---------------------------------
     /// `COPY` — `COPY table { FROM | TO } { STDIN | STDOUT } [WITH (...)]`.
     KwCopy,
+    /// `GRANT` — assign object privileges to roles.
+    KwGrant,
+    /// `REVOKE` — remove object privileges from roles.
+    KwRevoke,
     /// `STDIN` — source of `COPY ... FROM STDIN`.
     KwStdin,
     /// `STDOUT` — sink of `COPY ... TO STDOUT`.

@@ -148,6 +148,11 @@ pub enum ServerError {
     /// session has called `nextval`. Maps to SQLSTATE `55000`.
     #[error("{0}")]
     ObjectNotInPrerequisiteState(String),
+
+    /// Role lacks the required object or column privilege. Maps to
+    /// SQLSTATE `42501`.
+    #[error("permission denied: {0}")]
+    InsufficientPrivilege(String),
 }
 
 impl ServerError {
@@ -191,6 +196,7 @@ impl ServerError {
                 | Self::CopyFormat(_)
                 | Self::CopyAborted(_)
                 | Self::ObjectNotInPrerequisiteState(_)
+                | Self::InsufficientPrivilege(_)
         )
     }
 
@@ -217,6 +223,7 @@ impl ServerError {
             Self::TransactionAborted => "25P02",              // in_failed_sql_transaction
             Self::Savepoint(_) => "25P01",                    // no_active_sql_transaction
             Self::SavepointNotFound(_) => "3B001",            // invalid_savepoint_specification
+            Self::InsufficientPrivilege(_) => "42501",        // insufficient_privilege
             // NOT-NULL constraint violation surfaced by `ModifyTable`
             // on INSERT / UPDATE. Mirrors PostgreSQL's
             // `not_null_violation`.

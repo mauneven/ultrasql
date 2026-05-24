@@ -29,6 +29,7 @@ where
     ) -> Result<SelectResult, ServerError> {
         let LogicalPlan::CreateSequence {
             sequence_name,
+            namespace,
             options,
             if_not_exists,
             ..
@@ -93,6 +94,12 @@ where
         self.state
             .sequences
             .insert(sequence_name.clone(), Arc::new(seq));
+        self.state.privilege_catalog.apply_default_privileges(
+            &self.current_user,
+            namespace,
+            crate::auth::PrivilegeObjectKind::Sequence,
+            sequence_name,
+        );
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("CREATE SEQUENCE"))
     }

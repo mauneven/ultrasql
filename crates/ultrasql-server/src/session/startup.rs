@@ -103,6 +103,12 @@ where
                 .await;
             return Err(ServerError::UnsupportedProtocol { major, minor });
         }
+        let startup_user = params
+            .iter()
+            .find(|(key, _)| key == "user")
+            .map_or("tester", |(_, value)| value.as_str());
+        self.auth_user = startup_user.to_ascii_lowercase();
+        self.current_user = self.auth_user.clone();
 
         // Authentication. The default `Trust` policy short-circuits to
         // `AuthenticationOk`. The `Md5` policy runs the standard
@@ -201,7 +207,7 @@ where
             ("extra_float_digits", "1"),
             ("application_name", ""),
             ("is_superuser", "off"),
-            ("session_authorization", "tester"),
+            ("session_authorization", startup_user),
             ("in_hot_standby", "off"),
         ];
         for (name, value) in params {

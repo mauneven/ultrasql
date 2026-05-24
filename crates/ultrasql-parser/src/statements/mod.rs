@@ -18,6 +18,7 @@ pub(crate) mod delete;
 pub(crate) mod drop_index;
 pub(crate) mod drop_table;
 pub(crate) mod explain;
+pub(crate) mod grant;
 pub(crate) mod insert;
 pub(crate) mod listen;
 pub(crate) mod prepare;

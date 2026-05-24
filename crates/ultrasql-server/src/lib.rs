@@ -2075,6 +2075,8 @@ pub struct Server {
     pub auth: AuthConfig,
     /// Same-process role catalog backing role DDL and virtual auth views.
     pub role_catalog: Arc<auth::InMemoryAuthCatalog>,
+    /// Same-process privilege catalog backing GRANT/REVOKE compatibility.
+    pub privilege_catalog: Arc<auth::InMemoryPrivilegeCatalog>,
     /// Async pub-sub hub backing `LISTEN` / `NOTIFY` / `UNLISTEN`.
     ///
     /// Shared across every connection task: a `NOTIFY` issued on one
@@ -3146,6 +3148,9 @@ impl Server {
             table_constraints: Arc::clone(&self.table_constraints),
             sequences: Arc::clone(&self.sequences),
             role_catalog: Arc::clone(&self.role_catalog),
+            privilege_catalog: Arc::clone(&self.privilege_catalog),
+            current_user: "ultrasql".to_owned(),
+            session_user: "ultrasql".to_owned(),
             persistent_catalog: Arc::clone(&self.persistent_catalog),
             time_partitions: Arc::clone(&self.time_partitions),
             workload_recorder: Arc::clone(&self.workload_recorder),
@@ -3273,6 +3278,7 @@ impl Server {
             two_phase,
             auth: AuthConfig::Trust,
             role_catalog: Arc::new(auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
+            privilege_catalog: Arc::new(auth::InMemoryPrivilegeCatalog::new()),
             notify_hub: Arc::new(notify::NotifyHub::new()),
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
@@ -3745,6 +3751,7 @@ impl Server {
             two_phase,
             auth: AuthConfig::Trust,
             role_catalog: Arc::new(auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
+            privilege_catalog: Arc::new(auth::InMemoryPrivilegeCatalog::new()),
             notify_hub: Arc::new(notify::NotifyHub::new()),
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
@@ -6073,6 +6080,9 @@ fn run_plan_in_txn(
     table_constraints: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
     sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
     role_catalog: Arc<auth::InMemoryAuthCatalog>,
+    privilege_catalog: Arc<auth::InMemoryPrivilegeCatalog>,
+    current_user: String,
+    session_user: String,
     persistent_catalog: Arc<PersistentCatalog>,
     time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
     workload_recorder: Arc<workload::WorkloadRecorder>,
@@ -6113,6 +6123,9 @@ fn run_plan_in_txn(
         table_constraints,
         sequences,
         role_catalog,
+        privilege_catalog,
+        current_user,
+        session_user,
         persistent_catalog,
         time_partitions,
         workload_recorder,

@@ -83,6 +83,11 @@ fn infer_into(
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::AlterRole { .. }
         | LogicalPlan::DropRole { .. }
+        | LogicalPlan::GrantPrivileges { .. }
+        | LogicalPlan::RevokePrivileges { .. }
+        | LogicalPlan::AlterDefaultPrivileges { .. }
+        | LogicalPlan::GrantRole { .. }
+        | LogicalPlan::RevokeRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }
@@ -100,6 +105,7 @@ fn infer_into(
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
@@ -406,6 +412,11 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::AlterRole { .. }
         | LogicalPlan::DropRole { .. }
+        | LogicalPlan::GrantPrivileges { .. }
+        | LogicalPlan::RevokePrivileges { .. }
+        | LogicalPlan::AlterDefaultPrivileges { .. }
+        | LogicalPlan::GrantRole { .. }
+        | LogicalPlan::RevokeRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }
@@ -423,6 +434,7 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }

@@ -8,7 +8,7 @@
 //! - `SHOW var`
 //! - `RESET var`
 
-use crate::ast::{Expr, Identifier, ObjectName, SetScope, SetValue, SetVarStmt};
+use crate::ast::{Expr, Identifier, ObjectName, SetRoleStmt, SetScope, SetValue, SetVarStmt};
 use crate::parser::{ParseError, Parser};
 use crate::span::Span;
 use crate::token::TokenKind;
@@ -113,6 +113,41 @@ impl Parser<'_> {
         })
     }
 
+    /// Parse `SET ROLE role` / `SET ROLE NONE` / `RESET ROLE`.
+    pub(crate) fn parse_set_role(&mut self) -> Result<SetRoleStmt, ParseError> {
+        let tok = self.advance()?;
+        let start = tok.span.start;
+        self.expect_identifier_keyword("role", "ROLE")?;
+        if tok.kind == TokenKind::KwReset {
+            let end = self.peek()?.span.start;
+            return Ok(SetRoleStmt {
+                role: None,
+                span: Span::new(start, end),
+            });
+        }
+        let next = *self.peek()?;
+        let role = match next.kind {
+            TokenKind::KwDefault => {
+                self.advance()?;
+                None
+            }
+            TokenKind::Identifier
+                if next
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("none")) =>
+            {
+                self.advance()?;
+                None
+            }
+            _ => Some(self.parse_identifier()?),
+        };
+        let end = self.peek()?.span.start;
+        Ok(SetRoleStmt {
+            role,
+            span: Span::new(start, end),
+        })
+    }
+
     fn parse_set_name(&mut self) -> Result<Identifier, ParseError> {
         let first = self.parse_identifier()?;
         let mut value = first.value.clone();
@@ -145,6 +180,16 @@ mod tests {
         {
             Statement::SetVar(s) => s,
             other => panic!("expected SetVar, got {other:?}"),
+        }
+    }
+
+    fn parse_set_role(src: &str) -> SetRoleStmt {
+        match Parser::new(src)
+            .parse_statement()
+            .unwrap_or_else(|e| panic!("parse failed for {src:?}: {e}"))
+        {
+            Statement::SetRole(s) => s,
+            other => panic!("expected SetRole, got {other:?}"),
         }
     }
 
@@ -187,6 +232,18 @@ mod tests {
     fn reset_var() {
         let stmt = parse_set("RESET search_path");
         assert_eq!(stmt.scope, SetScope::Reset);
+    }
+
+    #[test]
+    fn set_role_parses() {
+        let stmt = parse_set_role("SET ROLE support");
+        assert_eq!(stmt.role.expect("role").value, "support");
+    }
+
+    #[test]
+    fn set_role_none_and_reset_role_parse_as_reset() {
+        assert!(parse_set_role("SET ROLE NONE").role.is_none());
+        assert!(parse_set_role("RESET ROLE").role.is_none());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use ultrasql_planner::{LogicalPlan, LogicalRoleKind, LogicalRoleOptions};
 
 use super::Session;
 use crate::auth::scram::DEFAULT_ITERATIONS;
-use crate::auth::{PasswordHash, RoleEntry, RoleEntryChanges};
+use crate::auth::{AuthCatalog, PasswordHash, RoleEntry, RoleEntryChanges};
 use crate::error::ServerError;
 use crate::result_encoder::{self, SelectResult};
 
@@ -81,6 +81,87 @@ where
         }
         self.plan_cache_invalidate();
         Ok(result_encoder::run_ddl_command("DROP ROLE"))
+    }
+
+    pub(crate) fn execute_grant_role(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::GrantRole {
+            roles,
+            grantees,
+            admin_option,
+            ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_grant_role called with non-GrantRole plan",
+            ));
+        };
+        self.ensure_role_membership_admin()?;
+        self.state
+            .role_catalog
+            .grant_roles(&self.current_user, roles, grantees, *admin_option)?;
+        self.plan_cache_invalidate();
+        Ok(result_encoder::run_ddl_command("GRANT ROLE"))
+    }
+
+    pub(crate) fn execute_revoke_role(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::RevokeRole {
+            roles, grantees, ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_revoke_role called with non-RevokeRole plan",
+            ));
+        };
+        self.ensure_role_membership_admin()?;
+        self.state.role_catalog.revoke_roles(roles, grantees);
+        self.plan_cache_invalidate();
+        Ok(result_encoder::run_ddl_command("REVOKE ROLE"))
+    }
+
+    pub(crate) fn execute_set_role(
+        &mut self,
+        plan: &LogicalPlan,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::SetRole { role_name, .. } = plan else {
+            return Err(ServerError::Unsupported(
+                "execute_set_role called with non-SetRole plan",
+            ));
+        };
+        match role_name {
+            Some(role) => {
+                if !self.state.role_catalog.can_set_role(&self.auth_user, role) {
+                    return Err(ServerError::InsufficientPrivilege(format!(
+                        "permission denied to set role {role}"
+                    )));
+                }
+                self.current_user = role.clone();
+            }
+            None => {
+                self.current_user = self.auth_user.clone();
+            }
+        }
+        Ok(result_encoder::run_ddl_command("SET ROLE"))
+    }
+
+    fn ensure_role_membership_admin(&self) -> Result<(), ServerError> {
+        let allowed = self
+            .state
+            .role_catalog
+            .lookup_role(&self.current_user)
+            .is_some_and(|role| role.is_superuser || role.create_role);
+        if allowed {
+            Ok(())
+        } else {
+            Err(ServerError::InsufficientPrivilege(
+                "role membership management requires CREATEROLE".to_owned(),
+            ))
+        }
     }
 }
 

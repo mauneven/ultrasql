@@ -178,6 +178,11 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::AlterRole { .. }
         | LogicalPlan::DropRole { .. }
+        | LogicalPlan::GrantPrivileges { .. }
+        | LogicalPlan::RevokePrivileges { .. }
+        | LogicalPlan::AlterDefaultPrivileges { .. }
+        | LogicalPlan::GrantRole { .. }
+        | LogicalPlan::RevokeRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }
@@ -195,6 +200,7 @@ pub fn outer_join_subtree_is_barrier(plan: &LogicalPlan) -> bool {
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }
@@ -447,6 +453,11 @@ pub fn reorder_inner_joins_with_stats(plan: &LogicalPlan, stats: &dyn StatsSourc
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::AlterRole { .. }
         | LogicalPlan::DropRole { .. }
+        | LogicalPlan::GrantPrivileges { .. }
+        | LogicalPlan::RevokePrivileges { .. }
+        | LogicalPlan::AlterDefaultPrivileges { .. }
+        | LogicalPlan::GrantRole { .. }
+        | LogicalPlan::RevokeRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }
@@ -464,6 +475,7 @@ pub fn reorder_inner_joins_with_stats(plan: &LogicalPlan, stats: &dyn StatsSourc
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
         | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetRole { .. }
         | LogicalPlan::Listen { .. }
         | LogicalPlan::Notify { .. }
         | LogicalPlan::Unlisten { .. }

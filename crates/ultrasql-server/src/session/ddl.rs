@@ -820,6 +820,20 @@ where
         self.state
             .commit_transaction(ddl_txn, true, "CREATE TABLE catalog-write transaction")?;
         self.state.persist_table_runtime_constraints_metadata()?;
+        self.state.privilege_catalog.apply_default_privileges(
+            &self.current_user,
+            namespace,
+            crate::auth::PrivilegeObjectKind::Table,
+            table_name,
+        );
+        for (seq_name, _) in &serial_sequences {
+            self.state.privilege_catalog.apply_default_privileges(
+                &self.current_user,
+                namespace,
+                crate::auth::PrivilegeObjectKind::Sequence,
+                seq_name,
+            );
+        }
         if let Some(partition) = partition {
             self.state.time_partitions.insert(
                 table_name.clone(),

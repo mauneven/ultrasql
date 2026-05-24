@@ -51,7 +51,7 @@ use ultrasql_core::{DataType, Field, Schema, Value};
 use ultrasql_parser::ast::{
     BinaryOp, Distinct, ExplainFormat as AstExplainFormat, ExplainStmt, Expr as AstExpr, Literal,
     LockStrength as AstLockStrength, LockWaitPolicy as AstLockWaitPolicy, SelectStmt, SetOp,
-    SetQuantifier, SetScope, SetValue, SetVarStmt, Statement, UnaryOp,
+    SetQuantifier, SetRoleStmt, SetScope, SetValue, SetVarStmt, Statement, UnaryOp,
 };
 
 use crate::catalog::Catalog;
@@ -72,6 +72,7 @@ mod dml;
 mod expr_bind;
 mod expr_type;
 mod from;
+mod privilege;
 mod util;
 mod window;
 
@@ -88,6 +89,10 @@ use self::ddl::{
 use self::dml::{bind_delete, bind_insert, bind_update};
 use self::expr_bind::{bind_expr, bind_expr_with_ctes};
 use self::from::bind_from;
+use self::privilege::{
+    bind_alter_default_privileges, bind_grant_privileges, bind_grant_role,
+    bind_revoke_privileges, bind_revoke_role,
+};
 use self::util::{
     bind_order_by, bind_returning, bind_unsigned_literal, build_returning_schema,
     derive_output_name, object_name_simple, plan_contains_outer_column,
@@ -120,6 +125,11 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::CreateDomain(s) => bind_create_domain(s, catalog),
         Statement::CreatePolicy(s) => bind_create_policy(s, catalog),
         Statement::CreateRole(s) => bind_create_role(s),
+        Statement::Grant(s) => bind_grant_privileges(s),
+        Statement::Revoke(s) => bind_revoke_privileges(s),
+        Statement::AlterDefaultPrivileges(s) => bind_alter_default_privileges(s),
+        Statement::GrantRole(s) => bind_grant_role(s),
+        Statement::RevokeRole(s) => bind_revoke_role(s),
         Statement::CreateIndex(s) => bind_create_index(s, catalog),
         Statement::CreateSequence(s) => bind_create_sequence(s),
         Statement::AlterSequence(s) => bind_alter_sequence(s),
@@ -195,6 +205,7 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
             })
         }
         Statement::SetVar(s) => bind_set_var(s),
+        Statement::SetRole(s) => bind_set_role(s),
         Statement::Listen { channel, .. } => Ok(LogicalPlan::Listen {
             // Unquoted identifiers are case-folded at parse time, so the
             // value already lower-cases. Quoted identifiers retain their
@@ -253,6 +264,16 @@ fn bind_set_var(stmt: &SetVarStmt) -> Result<LogicalPlan, PlanError> {
         action,
         value,
         schema,
+    })
+}
+
+fn bind_set_role(stmt: &SetRoleStmt) -> Result<LogicalPlan, PlanError> {
+    Ok(LogicalPlan::SetRole {
+        role_name: stmt
+            .role
+            .as_ref()
+            .map(|role| role.value.to_ascii_lowercase()),
+        schema: Schema::empty(),
     })
 }
 

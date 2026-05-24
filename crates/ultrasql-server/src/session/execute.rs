@@ -471,6 +471,9 @@ where
         if matches!(&plan, LogicalPlan::SetVariable { .. }) {
             return self.execute_set_variable(&plan, true);
         }
+        if matches!(&plan, LogicalPlan::SetRole { .. }) {
+            return self.execute_set_role(&plan);
+        }
 
         // DDL is dispatched ahead of operator lowering: it never produces
         // rows, so the lowerer would only round-trip it through an
@@ -492,6 +495,11 @@ where
                 | LogicalPlan::CreateRole { .. }
                 | LogicalPlan::AlterRole { .. }
                 | LogicalPlan::DropRole { .. }
+                | LogicalPlan::GrantPrivileges { .. }
+                | LogicalPlan::RevokePrivileges { .. }
+                | LogicalPlan::AlterDefaultPrivileges { .. }
+                | LogicalPlan::GrantRole { .. }
+                | LogicalPlan::RevokeRole { .. }
                 | LogicalPlan::CreateSequence { .. }
                 | LogicalPlan::AlterSequence { .. }
                 | LogicalPlan::DropSequence { .. }
@@ -535,6 +543,21 @@ where
             }
             LogicalPlan::DropRole { .. } => {
                 return self.execute_drop_role(&plan);
+            }
+            LogicalPlan::GrantPrivileges { .. } => {
+                return self.execute_grant_privileges(&plan);
+            }
+            LogicalPlan::RevokePrivileges { .. } => {
+                return self.execute_revoke_privileges(&plan);
+            }
+            LogicalPlan::AlterDefaultPrivileges { .. } => {
+                return self.execute_alter_default_privileges(&plan);
+            }
+            LogicalPlan::GrantRole { .. } => {
+                return self.execute_grant_role(&plan);
+            }
+            LogicalPlan::RevokeRole { .. } => {
+                return self.execute_revoke_role(&plan);
             }
             LogicalPlan::CreateSequence { .. } => {
                 return self.execute_create_sequence(&plan);
@@ -1460,6 +1483,7 @@ where
             self.apply_row_security(plan, catalog_snapshot, crate::RuntimeRlsCommand::Select)?;
         let plan = rls_plan.as_ref().unwrap_or(plan);
         self.check_rls_insert_values(plan, catalog_snapshot)?;
+        self.enforce_column_privileges(plan, catalog_snapshot)?;
         let _operator_span =
             tracing::debug_span!("sql.operator", plan = ?std::mem::discriminant(plan)).entered();
         // The cached `(Int32, Int32)` full-scan fast path is already
@@ -1511,6 +1535,9 @@ where
                     Arc::clone(&self.state.table_constraints),
                     Arc::clone(&self.state.sequences),
                     Arc::clone(&self.state.role_catalog),
+                    Arc::clone(&self.state.privilege_catalog),
+                    self.current_user.clone(),
+                    self.auth_user.clone(),
                     Arc::clone(&self.state.persistent_catalog),
                     Arc::clone(&self.state.time_partitions),
                     Arc::clone(&self.state.workload_recorder),
@@ -1540,6 +1567,9 @@ where
                     Arc::clone(&self.state.table_constraints),
                     Arc::clone(&self.state.sequences),
                     Arc::clone(&self.state.role_catalog),
+                    Arc::clone(&self.state.privilege_catalog),
+                    self.current_user.clone(),
+                    self.auth_user.clone(),
                     Arc::clone(&self.state.persistent_catalog),
                     Arc::clone(&self.state.time_partitions),
                     Arc::clone(&self.state.workload_recorder),
@@ -2257,6 +2287,9 @@ where
             Arc::clone(&self.state.table_constraints),
             Arc::clone(&self.state.sequences),
             Arc::clone(&self.state.role_catalog),
+            Arc::clone(&self.state.privilege_catalog),
+            self.current_user.clone(),
+            self.auth_user.clone(),
             Arc::clone(&self.state.persistent_catalog),
             Arc::clone(&self.state.time_partitions),
             Arc::clone(&self.state.workload_recorder),

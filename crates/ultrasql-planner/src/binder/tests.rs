@@ -4,8 +4,8 @@ use ultrasql_parser::Parser;
 use ultrasql_parser::ast::BinaryOp;
 
 use super::*;
-use crate::LogicalIndexMethod;
 use crate::catalog::{InMemoryCatalog, TableMeta};
+use crate::{LogicalIndexMethod, LogicalPrivilegeKind, LogicalPrivilegeObjectKind};
 
 /// Catalog with a single `users` table: id INT, name TEXT, score FLOAT8.
 fn users_catalog() -> InMemoryCatalog {
@@ -53,6 +53,104 @@ fn parse_and_bind(sql: &str, cat: &dyn Catalog) -> Result<LogicalPlan, PlanError
 fn parse_bind_ok(sql: &str) -> LogicalPlan {
     let cat = users_catalog();
     parse_and_bind(sql, &cat).expect("bind ok")
+}
+
+#[test]
+fn binds_column_privilege_specs() {
+    let plan = parse_bind_ok("GRANT SELECT(id), UPDATE(name) ON TABLE users TO analyst");
+    let LogicalPlan::GrantPrivileges {
+        privileges,
+        object_kind,
+        objects,
+        grantees,
+        ..
+    } = plan
+    else {
+        panic!("expected GrantPrivileges");
+    };
+    assert_eq!(object_kind, LogicalPrivilegeObjectKind::Table);
+    assert_eq!(objects, vec!["users".to_owned()]);
+    assert_eq!(grantees, vec!["analyst".to_owned()]);
+    assert_eq!(privileges.len(), 2);
+    assert_eq!(privileges[0].kind, LogicalPrivilegeKind::Select);
+    assert_eq!(privileges[0].columns, vec!["id".to_owned()]);
+    assert_eq!(privileges[1].kind, LogicalPrivilegeKind::Update);
+    assert_eq!(privileges[1].columns, vec!["name".to_owned()]);
+}
+
+#[test]
+fn binds_role_membership_grant_and_set_role() {
+    let plan = parse_bind_ok("GRANT App_Group TO App_User WITH ADMIN OPTION");
+    let LogicalPlan::GrantRole {
+        roles,
+        grantees,
+        admin_option,
+        ..
+    } = plan
+    else {
+        panic!("expected GrantRole");
+    };
+    assert_eq!(roles, vec!["app_group".to_owned()]);
+    assert_eq!(grantees, vec!["app_user".to_owned()]);
+    assert!(admin_option);
+
+    let plan = parse_bind_ok("SET ROLE App_Group");
+    let LogicalPlan::SetRole { role_name, .. } = plan else {
+        panic!("expected SetRole");
+    };
+    assert_eq!(role_name, Some("app_group".to_owned()));
+}
+
+#[test]
+fn rejects_invalid_column_privilege_specs() {
+    let cat = users_catalog();
+    let err = parse_and_bind("GRANT SELECT(id) ON DATABASE ultrasql TO analyst", &cat)
+        .expect_err("column privileges are table-only");
+    assert!(matches!(err, PlanError::NotSupported(_)));
+
+    let err = parse_and_bind("GRANT DELETE(id) ON TABLE users TO analyst", &cat)
+        .expect_err("DELETE has no column privilege form");
+    assert!(matches!(err, PlanError::NotSupported(_)));
+}
+
+#[test]
+fn binds_alter_default_privileges() {
+    let cat = users_catalog();
+    let plan = parse_and_bind(
+        "ALTER DEFAULT PRIVILEGES FOR ROLE App_Owner IN SCHEMA App \
+         GRANT SELECT, INSERT ON TABLES TO Analyst WITH GRANT OPTION",
+        &cat,
+    )
+    .expect("default privilege grant binds");
+    let LogicalPlan::AlterDefaultPrivileges {
+        target_roles,
+        schemas,
+        operation,
+        privileges,
+        object_kind,
+        grantees,
+        grant_option,
+        ..
+    } = plan
+    else {
+        panic!("expected AlterDefaultPrivileges");
+    };
+    assert_eq!(target_roles, vec!["app_owner".to_owned()]);
+    assert_eq!(schemas, vec!["app".to_owned()]);
+    assert!(operation.is_grant());
+    assert_eq!(object_kind, LogicalPrivilegeObjectKind::Table);
+    assert_eq!(grantees, vec!["analyst".to_owned()]);
+    assert_eq!(privileges.len(), 2);
+    assert_eq!(privileges[0].kind, LogicalPrivilegeKind::Select);
+    assert_eq!(privileges[1].kind, LogicalPrivilegeKind::Insert);
+    assert!(grant_option);
+
+    let err = parse_and_bind(
+        "ALTER DEFAULT PRIVILEGES GRANT SELECT(id) ON TABLES TO analyst",
+        &cat,
+    )
+    .expect_err("default privileges reject column lists");
+    assert!(matches!(err, PlanError::NotSupported(_)));
 }
 
 #[test]

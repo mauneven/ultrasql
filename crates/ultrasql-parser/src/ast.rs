@@ -70,6 +70,14 @@ pub enum Statement {
     CreatePolicy(Box<CreatePolicyStmt>),
     /// `CREATE ROLE name ...` / `CREATE USER name ...`.
     CreateRole(Box<CreateRoleStmt>),
+    /// `GRANT ... ON ... TO ...`.
+    Grant(Box<GrantStmt>),
+    /// `REVOKE ... ON ... FROM ...`.
+    Revoke(Box<RevokeStmt>),
+    /// `GRANT role [, ...] TO role [, ...]`.
+    GrantRole(Box<GrantRoleStmt>),
+    /// `REVOKE role [, ...] FROM role [, ...]`.
+    RevokeRole(Box<RevokeRoleStmt>),
     /// `DROP TABLE …`.
     DropTable(DropTableStmt),
     /// `DROP ROLE name [, ...]` / `DROP USER name [, ...]`.
@@ -78,12 +86,16 @@ pub enum Statement {
     AlterTable(Box<AlterTableStmt>),
     /// `ALTER ROLE name ...` / `ALTER USER name ...`.
     AlterRole(Box<AlterRoleStmt>),
+    /// `ALTER DEFAULT PRIVILEGES ...`.
+    AlterDefaultPrivileges(Box<AlterDefaultPrivilegesStmt>),
     /// `CREATE SCHEMA …`.
     CreateSchema(CreateSchemaStmt),
     /// `DROP SCHEMA …`.
     DropSchema(DropSchemaStmt),
     /// `SET [SESSION|LOCAL] var = val` / `SHOW var` / `RESET var`.
     SetVar(SetVarStmt),
+    /// `SET ROLE role` / `SET ROLE NONE` / `RESET ROLE`.
+    SetRole(SetRoleStmt),
     /// `CREATE [UNIQUE] INDEX …`.
     CreateIndex(Box<CreateIndexStmt>),
     /// `DROP INDEX …`.
@@ -193,13 +205,19 @@ impl Statement {
             Self::CreateDomain(s) => s.span,
             Self::CreatePolicy(s) => s.span,
             Self::CreateRole(s) => s.span,
+            Self::Grant(s) => s.span,
+            Self::Revoke(s) => s.span,
+            Self::GrantRole(s) => s.span,
+            Self::RevokeRole(s) => s.span,
             Self::DropTable(s) => s.span,
             Self::DropRole(s) => s.span,
             Self::AlterTable(s) => s.span,
             Self::AlterRole(s) => s.span,
+            Self::AlterDefaultPrivileges(s) => s.span,
             Self::CreateSchema(s) => s.span,
             Self::DropSchema(s) => s.span,
             Self::SetVar(s) => s.span,
+            Self::SetRole(s) => s.span,
             Self::CreateIndex(s) => s.span,
             Self::DropIndex(s) => s.span,
             Self::Reindex(s) => s.span,
@@ -575,6 +593,168 @@ pub struct DropRoleStmt {
     pub span: Span,
 }
 
+/// Object class targeted by `GRANT` / `REVOKE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivilegeObjectKind {
+    /// Table or view privileges.
+    Table,
+    /// Schema privileges.
+    Schema,
+    /// Database privileges.
+    Database,
+    /// Sequence privileges.
+    Sequence,
+    /// Function or routine privileges.
+    Function,
+}
+
+/// One privilege keyword in `GRANT` / `REVOKE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrivilegeKind {
+    /// `ALL [PRIVILEGES]`.
+    All,
+    /// `SELECT`.
+    Select,
+    /// `INSERT`.
+    Insert,
+    /// `UPDATE`.
+    Update,
+    /// `DELETE`.
+    Delete,
+    /// `TRUNCATE`.
+    Truncate,
+    /// `REFERENCES`.
+    References,
+    /// `TRIGGER`.
+    Trigger,
+    /// `USAGE`.
+    Usage,
+    /// `CREATE`.
+    Create,
+    /// `CONNECT`.
+    Connect,
+    /// `TEMPORARY` / `TEMP`.
+    Temporary,
+    /// `EXECUTE`.
+    Execute,
+}
+
+/// One privilege item with optional column list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivilegeSpec {
+    /// Privilege keyword.
+    pub kind: PrivilegeKind,
+    /// Column list from `SELECT(col, ...)`, empty for object-level grants.
+    pub columns: Vec<Identifier>,
+}
+
+/// `GRANT privileges ON kind objects TO grantees`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrantStmt {
+    /// Privileges requested by the statement.
+    pub privileges: Vec<PrivilegeSpec>,
+    /// Object class named after `ON`.
+    pub object_kind: PrivilegeObjectKind,
+    /// Target object names.
+    pub objects: Vec<ObjectName>,
+    /// Recipient roles, including `PUBLIC` represented as `public`.
+    pub grantees: Vec<Identifier>,
+    /// Whether `WITH GRANT OPTION` was specified.
+    pub grant_option: bool,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `REVOKE privileges ON kind objects FROM grantees`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevokeStmt {
+    /// Whether the statement used `GRANT OPTION FOR`.
+    pub grant_option_for: bool,
+    /// Privileges requested by the statement.
+    pub privileges: Vec<PrivilegeSpec>,
+    /// Object class named after `ON`.
+    pub object_kind: PrivilegeObjectKind,
+    /// Target object names.
+    pub objects: Vec<ObjectName>,
+    /// Roles losing the privileges, including `PUBLIC` represented as `public`.
+    pub grantees: Vec<Identifier>,
+    /// Whether `CASCADE` was specified. `false` means `RESTRICT`.
+    pub cascade: bool,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Grant or revoke action inside `ALTER DEFAULT PRIVILEGES`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DefaultPrivilegeAction {
+    /// `GRANT privileges ON kind TO grantees [WITH GRANT OPTION]`.
+    Grant {
+        /// Default privileges to add.
+        privileges: Vec<PrivilegeSpec>,
+        /// Future object class named after `ON`.
+        object_kind: PrivilegeObjectKind,
+        /// Recipient roles.
+        grantees: Vec<Identifier>,
+        /// Whether future grants include grant option.
+        grant_option: bool,
+    },
+    /// `REVOKE [GRANT OPTION FOR] privileges ON kind FROM grantees`.
+    Revoke {
+        /// Whether the statement used `GRANT OPTION FOR`.
+        grant_option_for: bool,
+        /// Default privileges to remove.
+        privileges: Vec<PrivilegeSpec>,
+        /// Future object class named after `ON`.
+        object_kind: PrivilegeObjectKind,
+        /// Roles losing the default privileges.
+        grantees: Vec<Identifier>,
+        /// Whether `CASCADE` was specified. `false` means `RESTRICT`.
+        cascade: bool,
+    },
+}
+
+/// `ALTER DEFAULT PRIVILEGES [FOR ROLE ...] [IN SCHEMA ...] GRANT/REVOKE ...`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlterDefaultPrivilegesStmt {
+    /// Roles whose future objects receive the default ACL. Empty means
+    /// current role at execution time.
+    pub target_roles: Vec<Identifier>,
+    /// Schemas restricting the future objects. Empty means all schemas.
+    pub schemas: Vec<Identifier>,
+    /// Grant or revoke action.
+    pub action: DefaultPrivilegeAction,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `GRANT role [, ...] TO role [, ...]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrantRoleStmt {
+    /// Granted role names.
+    pub roles: Vec<Identifier>,
+    /// Recipient role names.
+    pub grantees: Vec<Identifier>,
+    /// Whether `WITH ADMIN OPTION` was specified.
+    pub admin_option: bool,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `REVOKE role [, ...] FROM role [, ...]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevokeRoleStmt {
+    /// Whether `ADMIN OPTION FOR` was specified.
+    pub admin_option_for: bool,
+    /// Revoked role names.
+    pub roles: Vec<Identifier>,
+    /// Recipient role names.
+    pub grantees: Vec<Identifier>,
+    /// Whether `CASCADE` was specified. `false` means `RESTRICT`.
+    pub cascade: bool,
+    /// Source span.
+    pub span: Span,
+}
+
 /// One column definition inside `CREATE TABLE`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ColumnDef {
@@ -937,6 +1117,15 @@ pub enum SetValue {
     Default,
     /// One or more expressions: `SET search_path TO schema, public`.
     Values(Vec<Expr>),
+}
+
+/// `SET ROLE role` / `SET ROLE NONE` / `RESET ROLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetRoleStmt {
+    /// Target role. `None` means reset to the session user.
+    pub role: Option<Identifier>,
+    /// Source span.
+    pub span: Span,
 }
 
 /// `CREATE [UNIQUE|AGGREGATING] INDEX [IF NOT EXISTS] [name] ON table [USING method] (columns) [INCLUDE (...)] [WITH (...)] [WHERE expr]`.

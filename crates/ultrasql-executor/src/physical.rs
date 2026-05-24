@@ -179,6 +179,11 @@ pub fn build_operator(
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::AlterRole { .. }
         | LogicalPlan::DropRole { .. }
+        | LogicalPlan::GrantPrivileges { .. }
+        | LogicalPlan::RevokePrivileges { .. }
+        | LogicalPlan::AlterDefaultPrivileges { .. }
+        | LogicalPlan::GrantRole { .. }
+        | LogicalPlan::RevokeRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }
@@ -197,7 +202,8 @@ pub fn build_operator(
         | LogicalPlan::CommitPrepared { .. }
         | LogicalPlan::RollbackPrepared { .. }
         | LogicalPlan::SetTransaction { .. }
-        | LogicalPlan::SetVariable { .. } => Err(BuildError::Unsupported(
+        | LogicalPlan::SetVariable { .. }
+        | LogicalPlan::SetRole { .. } => Err(BuildError::Unsupported(
             "session-control statements are dispatched outside the operator pipeline",
         )),
         LogicalPlan::Listen { .. } | LogicalPlan::Notify { .. } | LogicalPlan::Unlisten { .. } => {

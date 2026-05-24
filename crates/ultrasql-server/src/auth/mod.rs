@@ -23,8 +23,14 @@
 pub mod hba;
 pub mod md5;
 pub mod pg_authid;
+pub mod privileges;
 pub mod scram;
 
 pub use hba::{HbaConfig, HbaConnectionKind, HbaDatabaseMatch, HbaMethod, HbaRule, HbaUserMatch};
-pub use pg_authid::{AuthCatalog, InMemoryAuthCatalog, PasswordHash, RoleEntry, RoleEntryChanges};
+pub use pg_authid::{
+    AuthCatalog, InMemoryAuthCatalog, PasswordHash, RoleEntry, RoleEntryChanges, RoleMembership,
+};
+pub use privileges::{
+    InMemoryPrivilegeCatalog, PrivilegeGrant, PrivilegeKind, PrivilegeObjectKind, PrivilegeRequest,
+};
 pub use scram::{AuthError, ScramSha256Server};

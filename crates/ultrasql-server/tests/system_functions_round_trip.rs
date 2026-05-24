@@ -19,7 +19,7 @@ async fn scalar_system_functions_return_postgres_shaped_values() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, String>(0), "UltraSQL 0.0.1");
     assert_eq!(rows[0].get::<_, String>(1), "ultrasql");
-    assert_eq!(rows[0].get::<_, String>(2), "user");
+    assert_eq!(rows[0].get::<_, String>(2), "tester");
     assert_eq!(rows[0].get::<_, String>(3), "integer");
     assert_eq!(rows[0].get::<_, String>(4), "2 kB");
 
@@ -28,8 +28,8 @@ async fn scalar_system_functions_return_postgres_shaped_values() {
         .await
         .expect("bare user functions");
     assert_eq!(bare.len(), 1);
-    assert_eq!(bare[0].get::<_, String>(0), "user");
-    assert_eq!(bare[0].get::<_, String>(1), "user");
+    assert_eq!(bare[0].get::<_, String>(0), "tester");
+    assert_eq!(bare[0].get::<_, String>(1), "tester");
 
     shutdown(running).await;
 }

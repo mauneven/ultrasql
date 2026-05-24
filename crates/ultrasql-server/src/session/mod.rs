@@ -31,6 +31,9 @@ mod jsonb_ingest;
 mod meta_stmt;
 mod notify;
 mod parquet_copy;
+mod privilege;
+mod privilege_enforce;
+mod privilege_sources;
 mod role;
 mod run;
 mod sequence;
@@ -43,6 +46,10 @@ pub(crate) struct Session<RW> {
     pub(super) read_buf: BytesMut,
     pub(super) write_buf: BytesMut,
     pub(super) state: Arc<Server>,
+    /// Startup `user` parameter, folded as the stable `session_user`.
+    pub(super) auth_user: String,
+    /// Effective role used by `current_user` and privilege checks.
+    pub(super) current_user: String,
     pub(super) extended: ExtendedConnState,
     pub(super) txn_state: TxnState,
     /// Per-session parse+bind cache for Simple Query traffic.
@@ -141,6 +148,8 @@ where
             read_buf: BytesMut::with_capacity(READ_BUFFER_INITIAL),
             write_buf: BytesMut::with_capacity(READ_BUFFER_INITIAL),
             state,
+            auth_user: "tester".to_owned(),
+            current_user: "tester".to_owned(),
             extended: crate::extended::ExtendedConnState::new(),
             txn_state: TxnState::Idle,
             pid,

@@ -15,7 +15,7 @@
 //! from the buffer pool, replacing [`InMemoryAuthCatalog`] in
 //! production.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub use crate::auth::scram::PasswordHash;
@@ -105,6 +105,19 @@ pub struct RoleEntryChanges {
     pub valid_until: Option<Option<i64>>,
 }
 
+/// One role-membership edge: `member` has been granted `role`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleMembership {
+    /// Granted role name.
+    pub role: String,
+    /// Recipient role name.
+    pub member: String,
+    /// Granting role name.
+    pub grantor: String,
+    /// Whether `WITH ADMIN OPTION` was specified.
+    pub admin_option: bool,
+}
+
 /// Interface for looking up authentication data for a named role.
 ///
 /// # Contract
@@ -132,6 +145,7 @@ pub trait AuthCatalog: Send + Sync {
 #[derive(Debug)]
 pub struct InMemoryAuthCatalog {
     roles: RwLock<HashMap<String, RoleEntry>>,
+    memberships: RwLock<BTreeMap<(String, String), RoleMembership>>,
     next_oid: AtomicU32,
 }
 
@@ -139,6 +153,7 @@ impl Default for InMemoryAuthCatalog {
     fn default() -> Self {
         Self {
             roles: RwLock::new(HashMap::new()),
+            memberships: RwLock::new(BTreeMap::new()),
             next_oid: AtomicU32::new(FIRST_USER_ROLE_OID),
         }
     }
@@ -163,12 +178,14 @@ impl InMemoryAuthCatalog {
     ///
     /// Thread-safe: acquires a write lock, inserts the role, releases
     /// the lock.
-    pub fn add_role(&self, entry: RoleEntry) {
+    pub fn add_role(&self, mut entry: RoleEntry) {
+        entry.name = normalize_role_name(&entry.name);
         self.roles.write().insert(entry.name.clone(), entry);
     }
 
     /// Create a new role and allocate an OID if the caller supplied `0`.
     pub fn create_role(&self, mut entry: RoleEntry) -> Result<(), CatalogError> {
+        entry.name = normalize_role_name(&entry.name);
         let mut roles = self.roles.write();
         if roles.contains_key(&entry.name) {
             return Err(CatalogError::already_exists(entry.name));
@@ -182,10 +199,11 @@ impl InMemoryAuthCatalog {
 
     /// Apply partial role changes.
     pub fn alter_role(&self, name: &str, changes: RoleEntryChanges) -> Result<(), CatalogError> {
+        let name = normalize_role_name(name);
         let mut roles = self.roles.write();
         let entry = roles
-            .get_mut(name)
-            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?;
+            .get_mut(&name)
+            .ok_or_else(|| CatalogError::not_found(name.clone()))?;
         if let Some(value) = changes.password {
             entry.password = value;
         }
@@ -221,6 +239,7 @@ impl InMemoryAuthCatalog {
 
     /// Drop a role by name.
     pub fn drop_role(&self, name: &str) -> Result<(), CatalogError> {
+        let name = normalize_role_name(name);
         if name == "ultrasql" {
             return Err(CatalogError::schema_conflict(
                 "cannot drop bootstrap role ultrasql",
@@ -228,9 +247,122 @@ impl InMemoryAuthCatalog {
         }
         self.roles
             .write()
-            .remove(name)
-            .map(|_| ())
-            .ok_or_else(|| CatalogError::not_found(name.to_owned()))
+            .remove(&name)
+            .map(|_| {
+                self.memberships
+                    .write()
+                    .retain(|(role, member), _| role != &name && member != &name);
+            })
+            .ok_or_else(|| CatalogError::not_found(name))
+    }
+
+    /// Grant role memberships.
+    pub fn grant_roles(
+        &self,
+        grantor: &str,
+        roles: &[String],
+        members: &[String],
+        admin_option: bool,
+    ) -> Result<(), CatalogError> {
+        let roles = roles
+            .iter()
+            .map(|role| normalize_role_name(role))
+            .collect::<Vec<_>>();
+        let members = members
+            .iter()
+            .map(|member| normalize_role_name(member))
+            .collect::<Vec<_>>();
+        {
+            let existing = self.roles.read();
+            for role in roles.iter().chain(members.iter()) {
+                if !existing.contains_key(role) {
+                    return Err(CatalogError::not_found(role.clone()));
+                }
+            }
+        }
+        let mut memberships = self.memberships.write();
+        for role in &roles {
+            for member in &members {
+                if role == member || membership_path_exists(&memberships, role, member) {
+                    return Err(CatalogError::schema_conflict(format!(
+                        "role membership would create a cycle: {member} -> {role}"
+                    )));
+                }
+                memberships.insert(
+                    (role.clone(), member.clone()),
+                    RoleMembership {
+                        role: role.clone(),
+                        member: member.clone(),
+                        grantor: normalize_role_name(grantor),
+                        admin_option,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Revoke role memberships.
+    pub fn revoke_roles(&self, roles: &[String], members: &[String]) {
+        let roles = roles
+            .iter()
+            .map(|role| normalize_role_name(role))
+            .collect::<Vec<_>>();
+        let members = members
+            .iter()
+            .map(|member| normalize_role_name(member))
+            .collect::<Vec<_>>();
+        let mut memberships = self.memberships.write();
+        for role in roles {
+            for member in &members {
+                memberships.remove(&(role.clone(), member.clone()));
+            }
+        }
+    }
+
+    /// Return whether `member` is transitively a member of `role`.
+    #[must_use]
+    pub fn is_member_of(&self, member: &str, role: &str) -> bool {
+        let member = normalize_role_name(member);
+        let role = normalize_role_name(role);
+        if member == role {
+            return true;
+        }
+        membership_path_exists(&self.memberships.read(), &member, &role)
+    }
+
+    /// Return roles whose privileges apply automatically to `member`.
+    #[must_use]
+    pub fn inherited_role_names(&self, member: &str) -> Vec<String> {
+        let member = normalize_role_name(member);
+        let Some(entry) = self.lookup_role(&member) else {
+            return vec![member];
+        };
+        let mut roles = BTreeSet::from([member.clone()]);
+        if entry.inherit {
+            collect_memberships(&self.memberships.read(), &member, &mut roles);
+        }
+        roles.into_iter().collect()
+    }
+
+    /// Return whether `session_user` may `SET ROLE target`.
+    #[must_use]
+    pub fn can_set_role(&self, session_user: &str, target: &str) -> bool {
+        let session_user = normalize_role_name(session_user);
+        let target = normalize_role_name(target);
+        let Some(session_entry) = self.lookup_role(&session_user) else {
+            return false;
+        };
+        self.lookup_role(&target).is_some()
+            && (session_user == target
+                || session_entry.is_superuser
+                || self.is_member_of(&session_user, &target))
+    }
+
+    /// Return a deterministic snapshot of all role memberships.
+    #[must_use]
+    pub fn list_memberships(&self) -> Vec<RoleMembership> {
+        self.memberships.read().values().cloned().collect()
     }
 
     /// Return a deterministic snapshot of all roles.
@@ -244,7 +376,44 @@ impl InMemoryAuthCatalog {
 
 impl AuthCatalog for InMemoryAuthCatalog {
     fn lookup_role(&self, name: &str) -> Option<RoleEntry> {
-        self.roles.read().get(name).cloned()
+        self.roles.read().get(&normalize_role_name(name)).cloned()
+    }
+}
+
+fn normalize_role_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+fn membership_path_exists(
+    memberships: &BTreeMap<(String, String), RoleMembership>,
+    start_member: &str,
+    target_role: &str,
+) -> bool {
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![start_member.to_owned()];
+    while let Some(member) = stack.pop() {
+        if !seen.insert(member.clone()) {
+            continue;
+        }
+        for membership in memberships.values().filter(|edge| edge.member == member) {
+            if membership.role == target_role {
+                return true;
+            }
+            stack.push(membership.role.clone());
+        }
+    }
+    false
+}
+
+fn collect_memberships(
+    memberships: &BTreeMap<(String, String), RoleMembership>,
+    member: &str,
+    out: &mut BTreeSet<String>,
+) {
+    for membership in memberships.values().filter(|edge| edge.member == member) {
+        if out.insert(membership.role.clone()) {
+            collect_memberships(memberships, &membership.role, out);
+        }
     }
 }
 
@@ -256,12 +425,24 @@ mod tests {
         let cat = InMemoryAuthCatalog::new();
         let salt = PasswordHash::random_salt();
         let ph = PasswordHash::hash_password("secret", &salt, 4096);
-        cat.add_role(RoleEntry {
-            oid: 1,
-            name: "alice".to_owned(),
-            password: Some(ph),
+        let mut alice = test_role(1, "alice", true);
+        alice.password = Some(ph);
+        cat.add_role(alice);
+        let mut root = test_role(2, "root", true);
+        root.is_superuser = true;
+        root.create_role = true;
+        root.create_db = true;
+        cat.add_role(root);
+        cat
+    }
+
+    fn test_role(oid: u32, name: &str, inherit: bool) -> RoleEntry {
+        RoleEntry {
+            oid,
+            name: name.to_owned(),
+            password: None,
             is_superuser: false,
-            inherit: true,
+            inherit,
             create_role: false,
             create_db: false,
             can_login: true,
@@ -269,22 +450,7 @@ mod tests {
             bypass_rls: false,
             connection_limit: -1,
             valid_until: None,
-        });
-        cat.add_role(RoleEntry {
-            oid: 2,
-            name: "root".to_owned(),
-            password: None,
-            is_superuser: true,
-            inherit: true,
-            create_role: true,
-            create_db: true,
-            can_login: true,
-            replication: false,
-            bypass_rls: false,
-            connection_limit: -1,
-            valid_until: None,
-        });
-        cat
+        }
     }
 
     #[test]
@@ -316,25 +482,68 @@ mod tests {
         let cat = make_catalog();
         let salt = PasswordHash::random_salt();
         let ph2 = PasswordHash::hash_password("new_secret", &salt, 4096);
-        cat.add_role(RoleEntry {
-            oid: 1,
-            name: "alice".to_owned(),
-            password: Some(ph2),
-            is_superuser: true,
-            inherit: true,
-            create_role: false,
-            create_db: false,
-            can_login: false,
-            replication: false,
-            bypass_rls: false,
-            connection_limit: -1,
-            valid_until: None,
-        });
+        let mut replacement = test_role(1, "alice", true);
+        replacement.password = Some(ph2);
+        replacement.is_superuser = true;
+        replacement.can_login = false;
+        cat.add_role(replacement);
         let entry = cat.lookup_role("alice").expect("still exists");
         assert!(entry.is_superuser);
         assert!(!entry.can_login);
         // Stored key changed because password changed.
         assert!(entry.password.is_some());
+    }
+
+    #[test]
+    fn inherited_roles_respect_role_inherit_flag() {
+        let cat = make_catalog();
+        cat.add_role(test_role(3, "group_role", true));
+        cat.add_role(test_role(4, "inheriting_member", true));
+        cat.add_role(test_role(5, "noinherit_member", false));
+        cat.grant_roles(
+            "root",
+            &["group_role".to_owned()],
+            &[
+                "inheriting_member".to_owned(),
+                "noinherit_member".to_owned(),
+            ],
+            false,
+        )
+        .expect("grant role membership");
+
+        assert!(
+            cat.inherited_role_names("inheriting_member")
+                .contains(&"group_role".to_owned())
+        );
+        assert_eq!(
+            cat.inherited_role_names("noinherit_member"),
+            vec!["noinherit_member".to_owned()]
+        );
+        assert!(cat.can_set_role("noinherit_member", "group_role"));
+    }
+
+    #[test]
+    fn role_membership_cycle_is_rejected() {
+        let cat = make_catalog();
+        cat.add_role(test_role(3, "left_role", true));
+        cat.add_role(test_role(4, "right_role", true));
+        cat.grant_roles(
+            "root",
+            &["left_role".to_owned()],
+            &["right_role".to_owned()],
+            false,
+        )
+        .expect("grant first edge");
+
+        assert!(
+            cat.grant_roles(
+                "root",
+                &["right_role".to_owned()],
+                &["left_role".to_owned()],
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]

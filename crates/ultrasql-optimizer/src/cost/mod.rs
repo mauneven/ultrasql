@@ -313,6 +313,11 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::CreateRole { .. }
             | LogicalPlan::AlterRole { .. }
             | LogicalPlan::DropRole { .. }
+            | LogicalPlan::GrantPrivileges { .. }
+            | LogicalPlan::RevokePrivileges { .. }
+            | LogicalPlan::AlterDefaultPrivileges { .. }
+            | LogicalPlan::GrantRole { .. }
+            | LogicalPlan::RevokeRole { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }
             | LogicalPlan::CreateSequence { .. }
@@ -330,6 +335,7 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::RollbackPrepared { .. }
             | LogicalPlan::SetTransaction { .. }
             | LogicalPlan::SetVariable { .. }
+            | LogicalPlan::SetRole { .. }
             | LogicalPlan::Listen { .. }
             | LogicalPlan::Notify { .. }
             | LogicalPlan::Unlisten { .. }

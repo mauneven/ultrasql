@@ -358,6 +358,23 @@ where
                     }
                 }
             }
+            if matches!(plan, LogicalPlan::SetRole { .. }) {
+                match self.execute_set_role(plan) {
+                    Ok(result) => {
+                        for m in &result.messages {
+                            self.send(m).await?;
+                        }
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        if !e.is_query_scoped() {
+                            return Err(e);
+                        }
+                        self.extended.mark_failed();
+                        return self.send_error(&e.to_string(), e.sqlstate()).await;
+                    }
+                }
+            }
             // EXPLAIN: render the wrapped plan tree. Drop the leading
             // RowDescription because Extended Query delivers it via a
             // separate Describe message.
@@ -462,6 +479,9 @@ where
             .and_then(|p| p.plan.clone());
         match std::mem::replace(&mut self.txn_state, TxnState::Idle) {
             TxnState::Idle => {
+                if let Some(plan) = portal_plan.as_ref() {
+                    self.enforce_column_privileges(plan, &catalog_snapshot)?;
+                }
                 let txn = self.state.txn_manager.begin(IsolationLevel::ReadCommitted);
                 let ctx = pipeline::LowerCtx {
                     tables: &self.state.tables,
@@ -469,6 +489,9 @@ where
                     table_constraints: Arc::clone(&self.state.table_constraints),
                     sequences: Arc::clone(&self.state.sequences),
                     role_catalog: Arc::clone(&self.state.role_catalog),
+                    privilege_catalog: Arc::clone(&self.state.privilege_catalog),
+                    current_user: self.current_user.clone(),
+                    session_user: self.auth_user.clone(),
                     persistent_catalog: Arc::clone(&self.state.persistent_catalog),
                     time_partitions: Arc::clone(&self.state.time_partitions),
                     workload_recorder: Arc::clone(&self.state.workload_recorder),
@@ -571,12 +594,21 @@ where
             }
             TxnState::InTransaction(mut txn) => {
                 self.state.txn_manager.refresh_snapshot(&mut txn);
+                if let Some(plan) = portal_plan.as_ref()
+                    && let Err(e) = self.enforce_column_privileges(plan, &catalog_snapshot)
+                {
+                    self.txn_state = TxnState::Failed(txn);
+                    return Err(e);
+                }
                 let ctx = pipeline::LowerCtx {
                     tables: &self.state.tables,
                     catalog_snapshot: Arc::clone(&catalog_snapshot),
                     table_constraints: Arc::clone(&self.state.table_constraints),
                     sequences: Arc::clone(&self.state.sequences),
                     role_catalog: Arc::clone(&self.state.role_catalog),
+                    privilege_catalog: Arc::clone(&self.state.privilege_catalog),
+                    current_user: self.current_user.clone(),
+                    session_user: self.auth_user.clone(),
                     persistent_catalog: Arc::clone(&self.state.persistent_catalog),
                     time_partitions: Arc::clone(&self.state.time_partitions),
                     workload_recorder: Arc::clone(&self.state.workload_recorder),

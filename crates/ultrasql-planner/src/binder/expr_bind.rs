@@ -1242,6 +1242,12 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
         "jsonb_path_exists" => Ok(DataType::Bool),
         "pg_advisory_lock" | "pg_advisory_unlock_all" => Ok(DataType::Null),
         "pg_try_advisory_lock" | "pg_advisory_unlock" => Ok(DataType::Bool),
+        "has_table_privilege"
+        | "has_schema_privilege"
+        | "has_database_privilege"
+        | "has_sequence_privilege"
+        | "has_function_privilege"
+        | "has_column_privilege" => Ok(DataType::Bool),
         "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
         "gen_random_uuid" => Ok(DataType::Uuid),
         "pg_relation_size" => Ok(DataType::Int64),
@@ -1334,6 +1340,12 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "pg_try_advisory_lock"
             | "pg_advisory_unlock"
             | "pg_advisory_unlock_all"
+            | "has_table_privilege"
+            | "has_schema_privilege"
+            | "has_database_privilege"
+            | "has_sequence_privilege"
+            | "has_function_privilege"
+            | "has_column_privilege"
             | "gen_random_uuid"
             | "version"
             | "current_database"
@@ -1367,8 +1379,37 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
         "vector_norm" | "l2_norm" => validate_vector_norm_args(func_name, args),
         "vector_dims" => validate_vector_dims_args(args),
         "jsonb_path_exists" => validate_jsonb_path_exists_args(args),
+        "has_table_privilege"
+        | "has_schema_privilege"
+        | "has_database_privilege"
+        | "has_sequence_privilege"
+        | "has_function_privilege"
+        | "has_column_privilege" => validate_has_privilege_args(func_name, args),
         _ => Ok(()),
     }
+}
+
+fn validate_has_privilege_args(func_name: &str, args: &[ScalarExpr]) -> Result<(), PlanError> {
+    let expected = if func_name == "has_column_privilege" {
+        4
+    } else {
+        3
+    };
+    if args.len() != expected {
+        return Err(PlanError::TypeMismatch(format!(
+            "{func_name}: expected {expected} arguments, got {}",
+            args.len()
+        )));
+    }
+    for arg in args {
+        let data_type = arg.data_type();
+        if !matches!(data_type, DataType::Null | DataType::Text { .. }) {
+            return Err(PlanError::TypeMismatch(format!(
+                "{func_name}: text arguments required, got {data_type}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_jsonb_path_exists_args(args: &[ScalarExpr]) -> Result<(), PlanError> {

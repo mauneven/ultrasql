@@ -879,6 +879,91 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// `GRANT ... ON ... TO ...`.
+    GrantPrivileges {
+        /// Expanded privilege list, including optional columns.
+        privileges: Vec<LogicalPrivilegeSpec>,
+        /// Object class named after `ON`.
+        object_kind: LogicalPrivilegeObjectKind,
+        /// Folded target object names.
+        objects: Vec<String>,
+        /// Folded grantee role names.
+        grantees: Vec<String>,
+        /// Whether `WITH GRANT OPTION` was specified.
+        grant_option: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `REVOKE ... ON ... FROM ...`.
+    RevokePrivileges {
+        /// Expanded privilege list, including optional columns.
+        privileges: Vec<LogicalPrivilegeSpec>,
+        /// Object class named after `ON`.
+        object_kind: LogicalPrivilegeObjectKind,
+        /// Folded target object names.
+        objects: Vec<String>,
+        /// Folded grantee role names.
+        grantees: Vec<String>,
+        /// Whether `GRANT OPTION FOR` was specified.
+        grant_option_for: bool,
+        /// Whether `CASCADE` was specified.
+        cascade: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `ALTER DEFAULT PRIVILEGES ... GRANT/REVOKE ...`.
+    AlterDefaultPrivileges {
+        /// Roles whose future objects receive the default ACL. Empty
+        /// means the current role at execution time.
+        target_roles: Vec<String>,
+        /// Optional schema filter. Empty means every schema.
+        schemas: Vec<String>,
+        /// Whether the action grants or revokes default ACL entries.
+        operation: LogicalDefaultPrivilegeOperation,
+        /// Expanded privilege list. Column lists are rejected by the binder.
+        privileges: Vec<LogicalPrivilegeSpec>,
+        /// Future object class named after `ON`.
+        object_kind: LogicalPrivilegeObjectKind,
+        /// Folded grantee role names.
+        grantees: Vec<String>,
+        /// Whether `WITH GRANT OPTION` was specified for grant actions.
+        grant_option: bool,
+        /// Whether `GRANT OPTION FOR` was specified for revoke actions.
+        grant_option_for: bool,
+        /// Whether `CASCADE` was specified for revoke actions.
+        cascade: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `GRANT role [, ...] TO role [, ...]`.
+    GrantRole {
+        /// Folded granted role names.
+        roles: Vec<String>,
+        /// Folded recipient role names.
+        grantees: Vec<String>,
+        /// Whether `WITH ADMIN OPTION` was specified.
+        admin_option: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `REVOKE role [, ...] FROM role [, ...]`.
+    RevokeRole {
+        /// Folded revoked role names.
+        roles: Vec<String>,
+        /// Folded recipient role names.
+        grantees: Vec<String>,
+        /// Whether `ADMIN OPTION FOR` was specified.
+        admin_option_for: bool,
+        /// Whether `CASCADE` was specified.
+        cascade: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
     /// `CREATE SEQUENCE [IF NOT EXISTS] name ...`.
     CreateSequence {
         /// Case-folded sequence name.
@@ -1059,6 +1144,14 @@ pub enum LogicalPlan {
         /// Optional value string for `SET`.
         value: Option<String>,
         /// Empty for `SET` / `RESET`; one text column for `SHOW`.
+        schema: Schema,
+    },
+
+    /// `SET ROLE role` / `SET ROLE NONE` / `RESET ROLE`.
+    SetRole {
+        /// Folded target role. `None` resets to session user.
+        role_name: Option<String>,
+        /// Always [`Schema::empty`].
         schema: Schema,
     },
 
@@ -1376,6 +1469,76 @@ pub struct LogicalRoleOptions {
     pub valid_until: Option<String>,
 }
 
+/// Object class targeted by a privilege-management statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalPrivilegeObjectKind {
+    /// Table or view privileges.
+    Table,
+    /// Schema privileges.
+    Schema,
+    /// Database privileges.
+    Database,
+    /// Sequence privileges.
+    Sequence,
+    /// Function or routine privileges.
+    Function,
+}
+
+/// One concrete object privilege after `ALL PRIVILEGES` expansion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalPrivilegeKind {
+    /// `SELECT`.
+    Select,
+    /// `INSERT`.
+    Insert,
+    /// `UPDATE`.
+    Update,
+    /// `DELETE`.
+    Delete,
+    /// `TRUNCATE`.
+    Truncate,
+    /// `REFERENCES`.
+    References,
+    /// `TRIGGER`.
+    Trigger,
+    /// `USAGE`.
+    Usage,
+    /// `CREATE`.
+    Create,
+    /// `CONNECT`.
+    Connect,
+    /// `TEMPORARY`.
+    Temporary,
+    /// `EXECUTE`.
+    Execute,
+}
+
+/// One privilege item after binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalPrivilegeSpec {
+    /// Concrete object privilege.
+    pub kind: LogicalPrivilegeKind,
+    /// Folded column names, empty for object-level privileges.
+    pub columns: Vec<String>,
+}
+
+/// Operation carried by `ALTER DEFAULT PRIVILEGES`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalDefaultPrivilegeOperation {
+    /// Add default ACL entries for future objects.
+    Grant,
+    /// Remove default ACL entries for future objects.
+    Revoke,
+}
+
+impl LogicalDefaultPrivilegeOperation {
+    /// Return whether this operation grants default privileges.
+    #[must_use]
+    pub fn is_grant(self) -> bool {
+        matches!(self, Self::Grant)
+    }
+}
+
 /// EXPLAIN output format selector, mirrored from
 /// [`ultrasql_parser::ast::ExplainFormat`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1609,6 +1772,11 @@ impl LogicalPlan {
                 | Self::CreateRole { .. }
                 | Self::AlterRole { .. }
                 | Self::DropRole { .. }
+                | Self::GrantPrivileges { .. }
+                | Self::RevokePrivileges { .. }
+                | Self::AlterDefaultPrivileges { .. }
+                | Self::GrantRole { .. }
+                | Self::RevokeRole { .. }
                 | Self::DropTable { .. }
                 | Self::AlterTable { .. }
                 | Self::CreateSequence { .. }
@@ -1626,6 +1794,7 @@ impl LogicalPlan {
                 | Self::RollbackPrepared { .. }
                 | Self::SetTransaction { .. }
                 | Self::SetVariable { .. }
+                | Self::SetRole { .. }
                 | Self::Listen { .. }
                 | Self::Notify { .. }
                 | Self::Unlisten { .. }
@@ -1669,6 +1838,11 @@ impl LogicalPlan {
             | Self::CreateRole { .. }
             | Self::AlterRole { .. }
             | Self::DropRole { .. }
+            | Self::GrantPrivileges { .. }
+            | Self::RevokePrivileges { .. }
+            | Self::AlterDefaultPrivileges { .. }
+            | Self::GrantRole { .. }
+            | Self::RevokeRole { .. }
             | Self::DropTable { .. }
             | Self::AlterTable { .. }
             | Self::CreateSequence { .. }
@@ -1686,6 +1860,7 @@ impl LogicalPlan {
             | Self::RollbackPrepared { .. }
             | Self::SetTransaction { .. }
             | Self::SetVariable { .. }
+            | Self::SetRole { .. }
             | Self::Listen { .. }
             | Self::Notify { .. }
             | Self::Unlisten { .. }
@@ -1720,6 +1895,11 @@ impl LogicalPlan {
             | Self::CreateRole { schema, .. }
             | Self::AlterRole { schema, .. }
             | Self::DropRole { schema, .. }
+            | Self::GrantPrivileges { schema, .. }
+            | Self::RevokePrivileges { schema, .. }
+            | Self::AlterDefaultPrivileges { schema, .. }
+            | Self::GrantRole { schema, .. }
+            | Self::RevokeRole { schema, .. }
             | Self::DropTable { schema, .. }
             | Self::AlterTable { schema, .. }
             | Self::CreateSequence { schema, .. }
@@ -1737,6 +1917,7 @@ impl LogicalPlan {
             | Self::RollbackPrepared { schema, .. }
             | Self::SetTransaction { schema, .. }
             | Self::SetVariable { schema, .. }
+            | Self::SetRole { schema, .. }
             | Self::Listen { schema, .. }
             | Self::Notify { schema, .. }
             | Self::Unlisten { schema, .. }
@@ -2414,6 +2595,126 @@ impl LogicalPlan {
                     format_args!("Drop{keyword}{ie}: roles=[{}]{csc}\n", roles.join(", ")),
                 );
             }
+            Self::GrantPrivileges {
+                object_kind,
+                objects,
+                grantees,
+                grant_option,
+                ..
+            } => {
+                out.push_str(&pad);
+                let opt = if *grant_option {
+                    " WITH GRANT OPTION"
+                } else {
+                    ""
+                };
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "GrantPrivileges: {:?} objects=[{}] grantees=[{}]{opt}\n",
+                        object_kind,
+                        objects.join(", "),
+                        grantees.join(", ")
+                    ),
+                );
+            }
+            Self::RevokePrivileges {
+                object_kind,
+                objects,
+                grantees,
+                cascade,
+                ..
+            } => {
+                out.push_str(&pad);
+                let csc = if *cascade { " CASCADE" } else { "" };
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "RevokePrivileges: {:?} objects=[{}] grantees=[{}]{csc}\n",
+                        object_kind,
+                        objects.join(", "),
+                        grantees.join(", ")
+                    ),
+                );
+            }
+            Self::AlterDefaultPrivileges {
+                target_roles,
+                schemas,
+                operation,
+                object_kind,
+                grantees,
+                grant_option,
+                cascade,
+                ..
+            } => {
+                out.push_str(&pad);
+                let scope = if target_roles.is_empty() {
+                    "current role".to_owned()
+                } else {
+                    target_roles.join(", ")
+                };
+                let schema_scope = if schemas.is_empty() {
+                    "all schemas".to_owned()
+                } else {
+                    schemas.join(", ")
+                };
+                let opt = if *grant_option {
+                    " WITH GRANT OPTION"
+                } else if *cascade {
+                    " CASCADE"
+                } else {
+                    ""
+                };
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "AlterDefaultPrivileges: {:?} {:?} roles=[{}] schemas=[{}] grantees=[{}]{opt}\n",
+                        operation,
+                        object_kind,
+                        scope,
+                        schema_scope,
+                        grantees.join(", ")
+                    ),
+                );
+            }
+            Self::GrantRole {
+                roles,
+                grantees,
+                admin_option,
+                ..
+            } => {
+                out.push_str(&pad);
+                let opt = if *admin_option {
+                    " WITH ADMIN OPTION"
+                } else {
+                    ""
+                };
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "GrantRole: roles=[{}] grantees=[{}]{opt}\n",
+                        roles.join(", "),
+                        grantees.join(", ")
+                    ),
+                );
+            }
+            Self::RevokeRole {
+                roles,
+                grantees,
+                cascade,
+                ..
+            } => {
+                out.push_str(&pad);
+                let csc = if *cascade { " CASCADE" } else { "" };
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "RevokeRole: roles=[{}] grantees=[{}]{csc}\n",
+                        roles.join(", "),
+                        grantees.join(", ")
+                    ),
+                );
+            }
             Self::CreateSequence {
                 sequence_name,
                 namespace,
@@ -2528,6 +2829,11 @@ impl LogicalPlan {
                         let _ = fmt::write(out, format_args!("SetVariable: {action:?} {name}\n"));
                     }
                 }
+            }
+            Self::SetRole { role_name, .. } => {
+                out.push_str(&pad);
+                let role = role_name.as_deref().unwrap_or("NONE");
+                let _ = fmt::write(out, format_args!("SetRole: {role}\n"));
             }
             Self::Listen { channel, .. } => {
                 out.push_str(&pad);
