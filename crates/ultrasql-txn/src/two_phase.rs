@@ -410,7 +410,7 @@ fn escape_json_string(s: &str) -> String {
     out
 }
 
-/// Replace characters that are unsafe in filenames with underscores.
+/// Replace filename-hostile characters with underscores.
 ///
 /// This keeps GIDs that are ASCII identifiers intact while making path
 /// traversal and control-character attacks impossible.
@@ -599,7 +599,7 @@ mod tests {
     #[test]
     fn gid_with_special_chars_is_sanitized_in_filename() {
         let (coord, _dir) = make_coordinator();
-        // A GID with path-unsafe characters.
+        // A GID with path-hostile characters.
         coord.prepare("my/gid:with spaces", xid(500)).unwrap();
 
         let listed = coord.list_prepared();

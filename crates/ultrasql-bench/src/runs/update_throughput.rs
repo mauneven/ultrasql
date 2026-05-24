@@ -158,22 +158,6 @@ mod tests {
     use super::*;
     use crate::registry::{BenchContext, HostInfo};
 
-    /// Drops the env var on `Drop` so a panicking test cannot leak it.
-    struct SmokeGuard;
-    impl SmokeGuard {
-        fn new() -> Self {
-            // SAFETY: test-only; no concurrent threads touch this var.
-            unsafe { std::env::set_var("ULTRASQL_BENCH_SMOKE", "1") };
-            Self
-        }
-    }
-    impl Drop for SmokeGuard {
-        fn drop(&mut self) {
-            // SAFETY: test-only; no concurrent threads touch this var.
-            unsafe { std::env::remove_var("ULTRASQL_BENCH_SMOKE") };
-        }
-    }
-
     fn test_ctx() -> BenchContext {
         BenchContext {
             iterations: 2,
@@ -203,7 +187,7 @@ mod tests {
     #[test]
     #[allow(clippy::items_after_statements)] // const N_ITERS reads better near the loop it bounds
     fn update_bench_final_val_equals_original_plus_n_iterations() {
-        let _guard = SmokeGuard::new();
+        let _guard = crate::runs::enable_smoke_mode_for_process();
 
         const N_ITERS: usize = 3;
 

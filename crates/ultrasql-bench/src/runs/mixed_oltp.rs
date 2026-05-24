@@ -190,22 +190,6 @@ mod tests {
     use super::*;
     use crate::registry::{BenchContext, HostInfo};
 
-    /// Drops the env var on `Drop` so a panicking test cannot leak it.
-    struct SmokeGuard;
-    impl SmokeGuard {
-        fn new() -> Self {
-            // SAFETY: test-only; no concurrent threads touch this var.
-            unsafe { std::env::set_var("ULTRASQL_BENCH_SMOKE", "1") };
-            Self
-        }
-    }
-    impl Drop for SmokeGuard {
-        fn drop(&mut self) {
-            // SAFETY: test-only; no concurrent threads touch this var.
-            unsafe { std::env::remove_var("ULTRASQL_BENCH_SMOKE") };
-        }
-    }
-
     #[test]
     fn run_produces_two_samples_with_positive_throughput() {
         let ctx = BenchContext {
@@ -271,7 +255,7 @@ mod tests {
     /// relation; updates and reads do not change row count).
     #[test]
     fn mixed_oltp_op_ratios_and_row_count_are_honest() {
-        let _guard = SmokeGuard::new();
+        let _guard = crate::runs::enable_smoke_mode_for_process();
 
         // Build the heap manually so we can inspect it between iterations.
         let max_rows = INITIAL_ROWS + OPS_PER_ITER * 3; // 3 measured iters

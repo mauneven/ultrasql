@@ -332,7 +332,17 @@ impl ConnParams {
 /// (`*`) match any value.
 fn pgpass_lookup(host: &str, port: u16, dbname: &str, user: &str) -> Option<String> {
     let home = std::env::var("HOME").ok()?;
-    let pgpass = PathBuf::from(home).join(".pgpass");
+    pgpass_lookup_in_home(&PathBuf::from(home), host, port, dbname, user)
+}
+
+fn pgpass_lookup_in_home(
+    home: &std::path::Path,
+    host: &str,
+    port: u16,
+    dbname: &str,
+    user: &str,
+) -> Option<String> {
+    let pgpass = home.join(".pgpass");
     let content = fs::read_to_string(&pgpass).ok()?;
 
     let port_str = port.to_string();
@@ -1841,46 +1851,6 @@ fn escape_conf(value: &str) -> String {
 mod tests {
     use super::*;
 
-    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct HomeEnvGuard {
-        old_home: Option<std::ffi::OsString>,
-    }
-
-    impl HomeEnvGuard {
-        fn set(path: &std::path::Path) -> Self {
-            let old_home = std::env::var_os("HOME");
-            // SAFETY: tests that call this helper hold HOME_ENV_LOCK, so
-            // pgpass tests do not concurrently mutate or read HOME while it
-            // points at a test fixture directory.
-            unsafe {
-                std::env::set_var("HOME", path);
-            }
-            Self { old_home }
-        }
-    }
-
-    impl Drop for HomeEnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: the guard is dropped while HOME_ENV_LOCK is still held,
-            // restoring HOME before any other pgpass test can observe it.
-            unsafe {
-                match &self.old_home {
-                    Some(value) => std::env::set_var("HOME", value),
-                    None => std::env::remove_var("HOME"),
-                }
-            }
-        }
-    }
-
-    fn with_temp_home<T>(path: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _lock = HOME_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _home = HomeEnvGuard::set(path);
-        f()
-    }
-
     // --- URL parsing ---
 
     #[test]
@@ -1925,10 +1895,8 @@ mod tests {
         let path = dir.path().join(".pgpass");
         fs::write(&path, "*:5432:mydb:bob:hunter2\n").expect("write");
 
-        with_temp_home(dir.path(), || {
-            let pw = pgpass_lookup("anyhost", 5432, "mydb", "bob");
-            assert_eq!(pw.as_deref(), Some("hunter2"));
-        });
+        let pw = pgpass_lookup_in_home(dir.path(), "anyhost", 5432, "mydb", "bob");
+        assert_eq!(pw.as_deref(), Some("hunter2"));
     }
 
     #[test]
@@ -1937,10 +1905,8 @@ mod tests {
         let path = dir.path().join(".pgpass");
         fs::write(&path, "localhost:5432:mydb:alice:pw\n").expect("write");
 
-        with_temp_home(dir.path(), || {
-            let pw = pgpass_lookup("localhost", 5432, "mydb", "bob");
-            assert!(pw.is_none(), "wrong user must not match");
-        });
+        let pw = pgpass_lookup_in_home(dir.path(), "localhost", 5432, "mydb", "bob");
+        assert!(pw.is_none(), "wrong user must not match");
     }
 
     // --- Statement splitter ---
@@ -2041,9 +2007,7 @@ mod tests {
     fn pgpass_missing_file_returns_none() {
         let dir = tempfile::tempdir().expect("tempdir");
         // No .pgpass file in dir.
-        with_temp_home(dir.path(), || {
-            let pw = pgpass_lookup("localhost", 5432, "db", "user");
-            assert!(pw.is_none());
-        });
+        let pw = pgpass_lookup_in_home(dir.path(), "localhost", 5432, "db", "user");
+        assert!(pw.is_none());
     }
 }

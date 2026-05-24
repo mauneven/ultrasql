@@ -12,9 +12,8 @@
 //!   blob.
 //! - Bulk archival (`tar`, `cp`, `rsync`) chunks naturally on segment
 //!   boundaries; backup streams cap memory at one segment.
-//! - On macOS, our mmap path can map each segment with a private
-//!   `MmapMut`. Re-mapping a 1 GiB segment after a `set_len` growth is
-//!   cheap; re-mapping a 16 GiB relation is not.
+//! - Growth and truncation stay local to one segment instead of one
+//!   giant per-relation file.
 //!
 //! Layout on disk:
 //!
@@ -29,29 +28,15 @@
 //!     ...
 //! ```
 //!
-//! Two IO backends are available:
-//!
-//! - **mmap** — each segment is mapped read-write. Reads `memcpy` from
-//!   the map into a [`Page`] buffer (we don't expose the map to higher
-//!   layers because every consumer expects an owned 8 KiB box). Writes
-//!   `memcpy` into the map. Growth `set_len`s the file and re-mmaps.
-//! - **pread/pwrite** — `read_at`/`write_at_all` via
-//!   [`std::os::unix::fs::FileExt`]. This is the default on Linux where
-//!   mmap-of-relations interacts badly with the page cache and dirty-
-//!   page accounting (PostgreSQL has spent a decade not adopting mmap
-//!   for these reasons). On macOS the default is mmap because Darwin's
-//!   unified buffer cache makes the mmap path slightly faster in
-//!   microbenchmarks; both paths are exercised by the test suite on
-//!   either platform.
+//! IO uses safe positional reads and writes:
+//! [`std::os::unix::fs::FileExt::read_exact_at`] /
+//! [`std::os::unix::fs::FileExt::write_all_at`] on Unix, and matching
+//! seek-based positional APIs on Windows.
 //!
 //! Durability:
 //!
 //! - [`SegmentFileManager::fsync_relation`] syncs every segment file
-//!   owned by the relation. On macOS, after the syscall `fsync(2)` we
-//!   issue `fcntl(F_FULLFSYNC)`: Apple's `fsync(2)` is documented to
-//!   buffer through the on-disk write cache and is *not* sufficient for
-//!   crash durability; `F_FULLFSYNC` flushes the platter / NAND. The
-//!   call is a no-op on Linux.
+//!   owned by the relation via safe [`File::sync_all`].
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -64,7 +49,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use dashmap::DashMap;
-use memmap2::{MmapMut, MmapOptions};
 use parking_lot::{Mutex, RwLock};
 use tracing::{debug, trace};
 use ultrasql_core::constants::PAGE_SIZE;
@@ -127,13 +111,9 @@ pub struct SegmentConfig {
     /// enough for ergonomic backup tools while large enough that the
     /// segment-boundary crossover is rare.
     pub segment_size_pages: u32,
-    /// If `true`, use `memmap2::MmapMut` for the per-segment IO path.
-    /// If `false`, fall back to `read_at` / `write_all_at`.
-    ///
-    /// The default mirrors the platform: mmap on macOS, pread/pwrite on
-    /// Linux and other Unixes. Both paths are correct and pass the
-    /// same test suite; this is a performance, not a correctness,
-    /// switch.
+    /// Historical mmap preference retained for configuration
+    /// compatibility. The storage path currently always uses safe
+    /// positional file IO.
     pub use_mmap: bool,
     /// When opening, create `base_dir` (and per-relation subdirs on
     /// demand) if they do not exist. Set to `false` to fail fast in
@@ -151,7 +131,7 @@ impl Default for SegmentConfig {
     fn default() -> Self {
         Self {
             segment_size_pages: DEFAULT_SEGMENT_SIZE_PAGES,
-            use_mmap: cfg!(target_os = "macos"),
+            use_mmap: false,
             create_if_missing: true,
             verify_checksums: true,
         }
@@ -160,21 +140,15 @@ impl Default for SegmentConfig {
 
 /// File-level handle for a single segment.
 ///
-/// We store both the underlying [`File`] and an optional `MmapMut`. The
-/// file is the source of truth for size; the mmap is a view that must
-/// be re-created after a growth. We never drop the `File` while a map
-/// exists pointing at it: the map borrows the kernel's reference to the
-/// inode, but keeping the descriptor open is the simplest way to keep
-/// `fsync`/`F_FULLFSYNC` available for the durability path.
+/// We store the underlying [`File`] and use safe positional reads and
+/// writes for page IO. The file metadata is the source of truth for
+/// allocated segment length.
 #[derive(Debug)]
 struct SegmentFile {
     /// On-disk path of the segment file. Used by errors and tracing.
     path: PathBuf,
     /// Open descriptor. Read/write; we never re-open after construction.
     file: File,
-    /// Active mmap, or `None` for pread/pwrite mode. The map is
-    /// recreated on file growth.
-    mmap: Option<MmapMut>,
     /// Pages currently allocated in this segment. Always `<= cap`.
     pages: u32,
     /// Maximum pages this segment can hold.
@@ -183,7 +157,7 @@ struct SegmentFile {
 
 impl SegmentFile {
     /// Open an existing segment file or create one of size zero.
-    fn open(path: PathBuf, cap: u32, create: bool, use_mmap: bool) -> Result<Self, SegmentError> {
+    fn open(path: PathBuf, cap: u32, create: bool) -> Result<Self, SegmentError> {
         let mut opts = OpenOptions::new();
         opts.read(true).write(true);
         if create {
@@ -204,57 +178,18 @@ impl SegmentFile {
         if pages > cap {
             return Err(SegmentError::Layout("segment file exceeds configured cap"));
         }
-        let mmap = if use_mmap && pages > 0 {
-            Some(Self::map(&file, len)?)
-        } else {
-            None
-        };
         Ok(Self {
             path,
             file,
-            mmap,
             pages,
             cap,
         })
     }
 
-    /// Build a fresh mmap for the file's current length.
-    //
-    // TODO(security): the mmap-as-`&[u8]` view rests on the threat-model
-    // assumption that no concurrent OS process mutates the segment file
-    // while UltraSQL is reading. If that assumption is violated, the
-    // view technically violates Rust's aliasing rules; mitigation is
-    // either advisory file locking or `MAP_PRIVATE` semantics. The
-    // existing buffer-pool checksum catches integrity violations, but
-    // not the soundness problem. Deferred — fix is non-trivial and the
-    // threat is documented in SECURITY.md.
-    fn map(file: &File, len: u64) -> Result<MmapMut, SegmentError> {
-        if len == 0 {
-            return Err(SegmentError::Layout("cannot map a zero-length segment"));
-        }
-        let len_usize = usize::try_from(len)
-            .map_err(|_| SegmentError::Layout("segment too large to map on this target"))?;
-        // SAFETY: We hold an open `File` for the duration of the map's
-        // lifetime (`mmap` is dropped before `file` because struct
-        // fields drop in declaration order). The mapping is rw shared,
-        // backed by a regular file we own exclusively in this process;
-        // no other entity in this address space maps the same range.
-        // Length matches the file's reported metadata, taken under the
-        // segment's exclusive growth lock.
-        //
-        // Threat model: external processes with write access to the
-        // segment file CAN race the mapping. UltraSQL's deployment
-        // contract is "the engine owns its data directory"; violating
-        // that assumption falls back to checksum-detect, not memory
-        // safety. See TODO(security) above.
-        let map = unsafe { MmapOptions::new().len(len_usize).map_mut(file)? };
-        Ok(map)
-    }
-
-    /// Grow the file to hold `new_pages` total pages, re-mmap if
+    /// Grow the file to hold `new_pages` total pages if
     /// necessary. The caller must already hold the relation-level
     /// growth lock so concurrent growers cannot race.
-    fn grow_to(&mut self, new_pages: u32, use_mmap: bool) -> Result<(), SegmentError> {
+    fn grow_to(&mut self, new_pages: u32) -> Result<(), SegmentError> {
         if new_pages <= self.pages {
             return Ok(());
         }
@@ -262,34 +197,19 @@ impl SegmentFile {
             return Err(SegmentError::Layout("grow past segment cap"));
         }
         let new_len = u64::from(new_pages) * page_size_u64();
-        // Drop the existing map BEFORE resizing the file. On macOS,
-        // resizing a mapped file is technically allowed but the kernel
-        // may surprise us with SIGBUS on access past the old size; on
-        // Linux the `MAP_SHARED` mapping's behavior is "undefined past
-        // the original end." Drop and re-map.
-        self.mmap = None;
         self.file.set_len(new_len)?;
         self.pages = new_pages;
-        if use_mmap {
-            self.mmap = Some(Self::map(&self.file, new_len)?);
-        }
         Ok(())
     }
 
-    /// Truncate to `new_pages` pages. Drops the map first (see
-    /// `grow_to` rationale) and re-maps after if mmap mode and pages
-    /// remain.
-    fn truncate_to(&mut self, new_pages: u32, use_mmap: bool) -> Result<(), SegmentError> {
+    /// Truncate to `new_pages` pages.
+    fn truncate_to(&mut self, new_pages: u32) -> Result<(), SegmentError> {
         if new_pages >= self.pages {
             return Ok(());
         }
         let new_len = u64::from(new_pages) * page_size_u64();
-        self.mmap = None;
         self.file.set_len(new_len)?;
         self.pages = new_pages;
-        if use_mmap && new_pages > 0 {
-            self.mmap = Some(Self::map(&self.file, new_len)?);
-        }
         Ok(())
     }
 
@@ -302,18 +222,6 @@ impl SegmentFile {
     ) -> Result<(), SegmentError> {
         debug_assert!(block_in_segment < self.pages);
         let offset = u64::from(block_in_segment) * page_size_u64();
-        if let Some(map) = self.mmap.as_ref() {
-            let start = usize::try_from(offset)
-                .map_err(|_| SegmentError::Layout("offset overflowed usize"))?;
-            let end = start
-                .checked_add(PAGE_SIZE)
-                .ok_or(SegmentError::Layout("offset overflowed usize"))?;
-            if end > map.len() {
-                return Err(SegmentError::Layout("mmap shorter than expected"));
-            }
-            dst.copy_from_slice(&map[start..end]);
-            return Ok(());
-        }
         pread_exact(&self.file, dst, offset)?;
         Ok(())
     }
@@ -326,30 +234,13 @@ impl SegmentFile {
     ) -> Result<(), SegmentError> {
         debug_assert!(block_in_segment < self.pages);
         let offset = u64::from(block_in_segment) * page_size_u64();
-        if let Some(map) = self.mmap.as_mut() {
-            let start = usize::try_from(offset)
-                .map_err(|_| SegmentError::Layout("offset overflowed usize"))?;
-            let end = start
-                .checked_add(PAGE_SIZE)
-                .ok_or(SegmentError::Layout("offset overflowed usize"))?;
-            if end > map.len() {
-                return Err(SegmentError::Layout("mmap shorter than expected"));
-            }
-            map[start..end].copy_from_slice(src);
-            return Ok(());
-        }
         pwrite_all(&self.file, src, offset)?;
         Ok(())
     }
 
-    /// Flush mmap writes (if applicable) and `fsync` the file. On
-    /// macOS, follows with `F_FULLFSYNC` for actual durability.
+    /// Flush file contents and metadata.
     fn fsync(&self) -> Result<(), SegmentError> {
-        if let Some(map) = self.mmap.as_ref() {
-            map.flush()?;
-        }
         self.file.sync_all()?;
-        full_fsync(&self.file)?;
         Ok(())
     }
 }
@@ -415,34 +306,6 @@ fn pwrite_all(file: &File, src: &[u8], offset: u64) -> io::Result<()> {
     Ok(())
 }
 
-/// Issue an OS-level "really flush to platter" call after the regular
-/// `fsync`. Mac's `fsync(2)` is famously documented to leave data in
-/// the drive's volatile cache; `fcntl(F_FULLFSYNC)` is the documented
-/// way to force the flush. On Linux this is a no-op because `fsync(2)`
-/// already does the right thing (modulo a few exotic file systems with
-/// their own knobs).
-#[cfg(target_os = "macos")]
-fn full_fsync(file: &File) -> Result<(), SegmentError> {
-    use std::os::unix::io::AsRawFd;
-    // SAFETY: `file` is an open, owned descriptor for the entirety of
-    // this call. `libc::F_FULLFSYNC` is the documented Apple-specific
-    // command code; `fcntl` returns -1 and sets errno on failure.
-    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
-    if rc == -1 {
-        return Err(SegmentError::Io(io::Error::last_os_error()));
-    }
-    Ok(())
-}
-
-// Linux fallback: ordinary fsync (`sync_all`) is already invoked at
-// the call site; this stub keeps the macOS / non-macOS function
-// signatures identical so the caller does not need a cfg arm.
-#[cfg(not(target_os = "macos"))]
-#[allow(clippy::unnecessary_wraps, clippy::missing_const_for_fn)]
-fn full_fsync(_file: &File) -> Result<(), SegmentError> {
-    Ok(())
-}
-
 /// Per-relation file set.
 ///
 /// Holds the open segment files for one relation. Growing the relation
@@ -457,8 +320,6 @@ pub struct RelationFiles {
     dir: PathBuf,
     /// Maximum pages per segment.
     segment_cap: u32,
-    /// Use mmap?
-    use_mmap: bool,
     /// Open segment files. `Vec` indexed by segment id; the entries are
     /// `Arc<RwLock<_>>` so callers can take a read lock without
     /// blocking peers and `allocate_block` can promote to write under
@@ -478,7 +339,7 @@ impl RelationFiles {
         rel: RelationId,
         dir: PathBuf,
         segment_cap: u32,
-        use_mmap: bool,
+        _use_mmap: bool,
         create_if_missing: bool,
     ) -> Result<Arc<Self>, SegmentError> {
         if !dir.exists() {
@@ -519,7 +380,7 @@ impl RelationFiles {
         let mut segments = Vec::with_capacity(entries.len());
         let mut total_blocks: u64 = 0;
         for (_idx, path) in entries {
-            let seg = SegmentFile::open(path, segment_cap, false, use_mmap)?;
+            let seg = SegmentFile::open(path, segment_cap, false)?;
             total_blocks += u64::from(seg.pages);
             segments.push(Arc::new(RwLock::new(seg)));
         }
@@ -552,7 +413,6 @@ impl RelationFiles {
             rel,
             dir,
             segment_cap,
-            use_mmap,
             segments: RwLock::new(segments),
             growth_lock: Mutex::new(()),
             n_blocks: AtomicU32::new(n_blocks_u32),
@@ -665,9 +525,9 @@ impl RelationFiles {
         match seg_idx.cmp(&current_seg_count) {
             std::cmp::Ordering::Equal => {
                 let path = self.dir.join(format!("{}", seg_id.raw()));
-                let mut new_seg = SegmentFile::open(path, self.segment_cap, true, self.use_mmap)?;
+                let mut new_seg = SegmentFile::open(path, self.segment_cap, true)?;
                 // Brand-new file is length zero; grow it to one page.
-                new_seg.grow_to(1, self.use_mmap)?;
+                new_seg.grow_to(1)?;
                 let mut guard = self.segments.write();
                 guard.push(Arc::new(RwLock::new(new_seg)));
             }
@@ -679,7 +539,7 @@ impl RelationFiles {
                 let mut seg = seg_arc.write();
                 // The next page index inside the segment is `within`;
                 // total page count becomes `within + 1`.
-                seg.grow_to(within + 1, self.use_mmap)?;
+                seg.grow_to(within + 1)?;
             }
             std::cmp::Ordering::Greater => {
                 return Err(SegmentError::Layout(
@@ -772,7 +632,7 @@ impl RelationFiles {
                 guard[segs_after_count - 1].clone()
             };
             let mut seg = seg_arc.write();
-            seg.truncate_to(within_after, self.use_mmap)?;
+            seg.truncate_to(within_after)?;
         }
 
         self.n_blocks.store(n_blocks, Ordering::Release);
@@ -887,8 +747,7 @@ impl SegmentFileManager {
         Ok(r.size_blocks())
     }
 
-    /// Flush all segments owned by `rel` to disk durably. On macOS,
-    /// this includes `F_FULLFSYNC`.
+    /// Flush all segments owned by `rel` to disk durably.
     pub fn fsync_relation(&self, rel: RelationId) -> Result<(), SegmentError> {
         let r = self.relation(rel)?;
         r.fsync()
@@ -1336,9 +1195,9 @@ mod tests {
     }
 
     #[test]
-    fn default_config_uses_platform_default_mmap() {
+    fn default_config_uses_safe_file_io() {
         let cfg = SegmentConfig::default();
-        assert_eq!(cfg.use_mmap, cfg!(target_os = "macos"));
+        assert!(!cfg.use_mmap);
         assert_eq!(cfg.segment_size_pages, DEFAULT_SEGMENT_SIZE_PAGES);
         assert!(cfg.create_if_missing);
         assert!(cfg.verify_checksums);

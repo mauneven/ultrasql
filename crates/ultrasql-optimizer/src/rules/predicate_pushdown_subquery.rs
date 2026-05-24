@@ -281,7 +281,7 @@ fn try_push_through_project(
     exprs: &[(ScalarExpr, String)],
     schema: &ultrasql_core::Schema,
 ) -> Result<Option<LogicalPlan>, OptimizeError> {
-    // Predicate must not contain parameters (unsafe to push under a barrier).
+    // Predicate must not contain parameters (not valid to push under a barrier).
     if predicate_has_parameter(predicate) {
         return Ok(None);
     }

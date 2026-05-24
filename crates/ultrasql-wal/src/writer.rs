@@ -22,15 +22,12 @@
 //! Platform fsync semantics
 //! ------------------------
 //!
-//! On macOS we issue `F_FULLFSYNC` (forces the on-device cache to
-//! flush) per Apple's guidance. Plain `fsync(2)` on macOS only flushes
-//! the file system cache — not the device — which is insufficient for
-//! durability. On Linux we use `fsync(2)` directly.
+//! Durability uses Rust's safe `File::sync_all`, which maps to the
+//! platform's strongest generally available equivalent of `fsync(2)` for
+//! the current handle.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-#[cfg(target_os = "macos")]
-use std::os::fd::AsRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -563,28 +560,7 @@ fn next_segment_index(dir: &Path) -> Result<u32, WalWriterError> {
     Ok(next)
 }
 
-/// Force the file's contents and the device's write cache to stable
-/// storage. On macOS we use `F_FULLFSYNC`; on other Unixes we use
-/// plain `fsync(2)`.
-#[cfg(target_os = "macos")]
-fn full_fsync(file: &File) -> std::io::Result<()> {
-    let fd = file.as_raw_fd();
-    // SAFETY: `fd` is a valid open file descriptor obtained from a
-    // `File` handle that outlives this call. `fcntl` with `F_FULLFSYNC`
-    // is documented to take no extra arguments, and we check the
-    // return value below.
-    let rc = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
-    if rc == -1 {
-        // Fall back to fsync if F_FULLFSYNC is not supported on this
-        // filesystem (e.g. tmpfs in CI). Without F_FULLFSYNC, fsync
-        // still flushes the FS cache, which is sufficient for tests
-        // even if not for production durability on macOS.
-        file.sync_all()?;
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
+/// Force the file's contents and metadata to stable storage.
 fn full_fsync(file: &File) -> std::io::Result<()> {
     file.sync_all()
 }

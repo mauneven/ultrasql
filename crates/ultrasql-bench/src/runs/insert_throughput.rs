@@ -190,24 +190,6 @@ mod tests {
     use super::*;
     use crate::registry::{BenchContext, HostInfo};
 
-    /// Drops the env var on `Drop` so a panicking test cannot leak it into
-    /// other tests running in the same process.
-    struct SmokeGuard;
-    impl SmokeGuard {
-        fn new() -> Self {
-            // SAFETY: test-only; no concurrent thread in this process modifies
-            // ULTRASQL_BENCH_SMOKE at the same time.
-            unsafe { std::env::set_var("ULTRASQL_BENCH_SMOKE", "1") };
-            Self
-        }
-    }
-    impl Drop for SmokeGuard {
-        fn drop(&mut self) {
-            // SAFETY: same as above.
-            unsafe { std::env::remove_var("ULTRASQL_BENCH_SMOKE") };
-        }
-    }
-
     fn test_ctx() -> BenchContext {
         BenchContext {
             iterations: 2,
@@ -237,7 +219,7 @@ mod tests {
     /// independent of any MVCC filtering quirk.
     #[test]
     fn insert_bench_actually_inserts_expected_row_count() {
-        let _guard = SmokeGuard::new();
+        let _guard = crate::runs::enable_smoke_mode_for_process();
 
         // Oracle: FIRST_USER is committed.
         let oracle = MapOracle::new();

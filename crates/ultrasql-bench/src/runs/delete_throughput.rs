@@ -148,22 +148,6 @@ mod tests {
     use super::*;
     use crate::registry::{BenchContext, HostInfo};
 
-    /// Drops the env var on `Drop` so a panicking test cannot leak it.
-    struct SmokeGuard;
-    impl SmokeGuard {
-        fn new() -> Self {
-            // SAFETY: test-only; no concurrent threads touch this var.
-            unsafe { std::env::set_var("ULTRASQL_BENCH_SMOKE", "1") };
-            Self
-        }
-    }
-    impl Drop for SmokeGuard {
-        fn drop(&mut self) {
-            // SAFETY: test-only; no concurrent threads touch this var.
-            unsafe { std::env::remove_var("ULTRASQL_BENCH_SMOKE") };
-        }
-    }
-
     fn test_ctx() -> BenchContext {
         BenchContext {
             iterations: 2,
@@ -191,7 +175,7 @@ mod tests {
     /// `DeleteOptions` the bench uses, and asserts the visible count is zero.
     #[test]
     fn delete_bench_leaves_zero_visible_rows() {
-        let _guard = SmokeGuard::new();
+        let _guard = crate::runs::enable_smoke_mode_for_process();
 
         let (_pool, heap, tids) = preload(ROWS_PER_ITER);
 

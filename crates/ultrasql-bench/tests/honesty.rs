@@ -1,8 +1,8 @@
 //! Honesty tests: every registered `BenchSpec` must report numbers that are
 //! consistent with the work it actually performed.
 //!
-//! For each non-stub spec we run with `ULTRASQL_BENCH_SMOKE=1` (tiny dataset)
-//! and a single iteration, then assert:
+//! For each non-stub spec we run with the process-local smoke guard (tiny
+//! dataset) and a single iteration, then assert:
 //!
 //! - `samples.len() == ctx.iterations` (the right number of samples was recorded)
 //! - `p99_us > 0` (real time elapsed — the bench is not a no-op)
@@ -14,27 +14,11 @@
 //! yet implemented.
 
 use ultrasql_bench::registry::{BenchContext, HostInfo, REGISTRY};
+use ultrasql_bench::runs::enable_smoke_mode_for_process;
 
 /// Stubs that return all-zero / empty results while their real implementation
 /// is not yet wired. Completely excluded from all assertions.
 const STUB_IDS: &[&str] = &["tpcb_32conn", "tpcc_5types"];
-
-/// Drops `ULTRASQL_BENCH_SMOKE` on `Drop` so a panicking test cannot leak it.
-struct SmokeGuard;
-impl SmokeGuard {
-    fn new() -> Self {
-        // SAFETY: integration tests run in a separate process; no other thread
-        // writes `ULTRASQL_BENCH_SMOKE` concurrently in this process.
-        unsafe { std::env::set_var("ULTRASQL_BENCH_SMOKE", "1") };
-        Self
-    }
-}
-impl Drop for SmokeGuard {
-    fn drop(&mut self) {
-        // SAFETY: same as above.
-        unsafe { std::env::remove_var("ULTRASQL_BENCH_SMOKE") };
-    }
-}
 
 fn smoke_ctx() -> BenchContext {
     BenchContext {
@@ -51,7 +35,7 @@ fn smoke_ctx() -> BenchContext {
 
 #[test]
 fn every_registered_spec_reports_honest_numbers() {
-    let _guard = SmokeGuard::new();
+    let _guard = enable_smoke_mode_for_process();
     let ctx = smoke_ctx();
 
     for spec in REGISTRY {

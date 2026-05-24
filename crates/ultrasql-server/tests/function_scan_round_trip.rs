@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -24,42 +24,11 @@ use arrow_ipc::writer::FileWriter as ArrowFileWriter;
 use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
 use tokio_postgres::NoTls;
+use ultrasql_objectstore::override_s3_endpoint_for_process;
 use ultrasql_server::{Server, bind_listener, serve_listener};
-
-static S3_ENDPOINT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn sql_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
-}
-
-struct EnvVarGuard<'a> {
-    _lock: MutexGuard<'a, ()>,
-    key: &'static str,
-    old: Option<std::ffi::OsString>,
-}
-
-impl EnvVarGuard<'_> {
-    fn set(key: &'static str, value: &str) -> Self {
-        let guard = S3_ENDPOINT_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let old = std::env::var_os(key);
-        unsafe { std::env::set_var(key, value) };
-        Self {
-            _lock: guard,
-            key,
-            old,
-        }
-    }
-}
-
-impl Drop for EnvVarGuard<'_> {
-    fn drop(&mut self) {
-        match &self.old {
-            Some(value) => unsafe { std::env::set_var(self.key, value) },
-            None => unsafe { std::env::remove_var(self.key) },
-        }
-    }
 }
 
 struct MockS3 {
@@ -877,7 +846,7 @@ async fn read_csv_s3_glob_reads_matching_objects() {
         ("/lake/logs/a.csv", b"id,name\n1,Alpha\n".to_vec()),
         ("/lake/logs/ignore.txt", b"id,name\n9,Nope\n".to_vec()),
     ]);
-    let _env = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", &mock.endpoint);
+    let _endpoint_override = override_s3_endpoint_for_process(mock.endpoint.clone());
 
     let (client, _conn, server_handle) = start_server_and_connect().await;
     let rows = client
@@ -929,7 +898,7 @@ async fn read_csv_s3_uses_ranges_instead_of_whole_object_gets() {
     let object_len = csv.len();
     let whole_object_range = format!("bytes=0-{}", object_len - 1);
     let mock = MockS3::range_only(vec![("/lake/logs/ranged.csv", csv.into_bytes())]);
-    let _env = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", &mock.endpoint);
+    let _endpoint_override = override_s3_endpoint_for_process(mock.endpoint.clone());
 
     let (client, _conn, server_handle) = start_server_and_connect().await;
     let rows = client
@@ -1175,7 +1144,7 @@ async fn read_parquet_s3_glob_reads_matching_objects() {
         ),
         ("/lake/parquet/ignore.txt", b"not parquet".to_vec()),
     ]);
-    let _env = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", &mock.endpoint);
+    let _endpoint_override = override_s3_endpoint_for_process(mock.endpoint.clone());
 
     let (client, _conn, server_handle) = start_server_and_connect().await;
     let rows = client
@@ -1215,7 +1184,7 @@ async fn read_parquet_s3_uses_ranges_for_footer_and_projected_columns() {
     let whole_object_range = format!("bytes=0-{}", object_len.saturating_sub(1));
     let score_ranges = parquet_column_ranges(&parquet_path, "score");
     let mock = MockS3::range_only(vec![("/lake/parquet/ranged.parquet", object_bytes)]);
-    let _env = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", &mock.endpoint);
+    let _endpoint_override = override_s3_endpoint_for_process(mock.endpoint.clone());
 
     let (client, _conn, server_handle) = start_server_and_connect().await;
     let rows = client

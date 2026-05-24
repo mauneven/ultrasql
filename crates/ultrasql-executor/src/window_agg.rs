@@ -708,7 +708,7 @@ fn scatter_rank_from_pairs(sorted: &[(i64, u32)], total: usize) -> Vec<i64> {
 ///
 /// # Safety / soundness
 ///
-/// No `unsafe`, no `Arc<Mutex<…>>`. `thread::scope` enforces the
+/// No raw memory code, no `Arc<Mutex<…>>`. `thread::scope` enforces the
 /// "no worker outlives the borrow" invariant; the merge passes use
 /// `split_at_mut` to obtain disjoint chunks of the destination
 /// buffer.

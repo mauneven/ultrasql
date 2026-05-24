@@ -214,14 +214,10 @@ fn run(args: Args) -> Result<i32> {
 
     if args.smoke {
         eprintln!("regression-gate: SMOKE mode — one run per benchmark, no competitor checks");
-        // Signal every run module to use tiny dataset sizes. Set before
-        // any benchmark fn fires. SAFETY: single-threaded process startup,
-        // no other thread can read this concurrently.
-        // SAFETY: we are still single-threaded at this point in `run`.
-        unsafe {
-            std::env::set_var("ULTRASQL_BENCH_SMOKE", "1");
-        }
     }
+    let _smoke_guard = args
+        .smoke
+        .then(ultrasql_bench::runs::enable_smoke_mode_for_process);
     eprintln!("regression-gate: stage = {stage}");
 
     // 2. Parse the engine filter (if any).
@@ -644,8 +640,13 @@ fn current_git_commit() -> String {
 ///
 /// Uses the `BENCH_TIMESTAMP` env override when set (useful in tests).
 fn now_iso8601() -> String {
-    if let Ok(ts) = std::env::var("BENCH_TIMESTAMP") {
-        return ts;
+    let override_ts = std::env::var("BENCH_TIMESTAMP").ok();
+    now_iso8601_with_override(override_ts.as_deref())
+}
+
+fn now_iso8601_with_override(override_ts: Option<&str>) -> String {
+    if let Some(ts) = override_ts {
+        return ts.to_owned();
     }
     // Minimal hand-rolled UTC timestamp: avoids pulling chrono into the
     // default feature set for this binary.
@@ -1095,13 +1096,7 @@ mod tests {
 
     #[test]
     fn now_iso8601_respects_env_override() {
-        // SAFETY: edition-2024 makes env::set_var/remove_var unsafe due to
-        // data-race risk across threads. This test is single-threaded and
-        // touches only a process-local variable read by the function under
-        // test in the same call frame.
-        unsafe { std::env::set_var("BENCH_TIMESTAMP", "2026-05-13T00:00:00Z") };
-        let ts = now_iso8601();
-        unsafe { std::env::remove_var("BENCH_TIMESTAMP") };
+        let ts = now_iso8601_with_override(Some("2026-05-13T00:00:00Z"));
         assert_eq!(ts, "2026-05-13T00:00:00Z");
     }
 
@@ -1171,8 +1166,8 @@ mod tests {
     /// panicking.  This is a pure correctness / "no crash" gate; it is not
     /// a performance gate.
     ///
-    /// The `ULTRASQL_BENCH_SMOKE` environment variable is set before
-    /// running so that each benchmark module selects its smoke-mode dataset
+    /// The process-local smoke guard is set before running so that each
+    /// benchmark module selects its smoke-mode dataset
     /// size (a few hundred rows) rather than the production size (up to
     /// 1 000 000 rows). This keeps the test fast in debug builds while still
     /// exercising every real code path.
@@ -1181,9 +1176,7 @@ mod tests {
         use std::time::Instant;
         use ultrasql_bench::registry::{BenchContext, HostInfo, REGISTRY, Stage};
 
-        // Enable smoke-mode sizing in benchmark modules.
-        // SAFETY: single-threaded test process; no other thread reads this var.
-        unsafe { std::env::set_var("ULTRASQL_BENCH_SMOKE", "1") };
+        let _smoke_guard = ultrasql_bench::runs::enable_smoke_mode_for_process();
 
         let ctx = BenchContext {
             iterations: 1,
@@ -1202,9 +1195,6 @@ mod tests {
             let _result = (spec.run)(&ctx);
         }
         let elapsed = start.elapsed();
-
-        // Clean up so we don't affect other tests in this process.
-        unsafe { std::env::remove_var("ULTRASQL_BENCH_SMOKE") };
 
         assert!(
             elapsed.as_secs() < 5,

@@ -8,7 +8,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use chrono::Utc;
 use hmac::{Hmac, Mac};
@@ -227,11 +227,13 @@ impl ObjectScheme {
 
     fn endpoint(self) -> Result<Option<String>> {
         match self {
-            Self::S3 => Ok(first_env(&[
-                "ULTRASQL_S3_ENDPOINT",
-                "AWS_ENDPOINT_URL_S3",
-                "AWS_ENDPOINT_URL",
-            ])),
+            Self::S3 => Ok(s3_endpoint_override().or_else(|| {
+                first_env(&[
+                    "ULTRASQL_S3_ENDPOINT",
+                    "AWS_ENDPOINT_URL_S3",
+                    "AWS_ENDPOINT_URL",
+                ])
+            })),
             Self::R2 => first_env(&["ULTRASQL_R2_ENDPOINT", "AWS_ENDPOINT_URL_S3"])
                 .map(Some)
                 .ok_or_else(|| {
@@ -243,6 +245,55 @@ impl ObjectScheme {
                 .or_else(|| Some("https://storage.googleapis.com".to_owned()))),
         }
     }
+}
+
+static S3_ENDPOINT_OVERRIDE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static S3_ENDPOINT_OVERRIDE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Guard for a process-local S3 endpoint override.
+///
+/// This is intended for in-process tests and benchmark smoke drivers that need
+/// object-store SQL paths to talk to a local mock endpoint without mutating the
+/// process environment. Dropping the guard restores the previous override.
+#[derive(Debug)]
+pub struct S3EndpointOverrideGuard {
+    _lock: MutexGuard<'static, ()>,
+    previous: Option<String>,
+}
+
+impl Drop for S3EndpointOverrideGuard {
+    fn drop(&mut self) {
+        replace_s3_endpoint_override(self.previous.take());
+    }
+}
+
+/// Overrides the S3 endpoint for this process until the returned guard drops.
+#[must_use]
+pub fn override_s3_endpoint_for_process(endpoint: impl Into<String>) -> S3EndpointOverrideGuard {
+    let lock = S3_ENDPOINT_OVERRIDE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("s3 endpoint override guard mutex");
+    S3EndpointOverrideGuard {
+        _lock: lock,
+        previous: replace_s3_endpoint_override(Some(endpoint.into())),
+    }
+}
+
+fn s3_endpoint_override() -> Option<String> {
+    S3_ENDPOINT_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("s3 endpoint override mutex")
+        .clone()
+}
+
+fn replace_s3_endpoint_override(value: Option<String>) -> Option<String> {
+    let mut guard = S3_ENDPOINT_OVERRIDE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("s3 endpoint override mutex");
+    std::mem::replace(&mut *guard, value)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -892,7 +943,7 @@ mod tests {
                 .expect("write response");
         });
 
-        let _guard = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", endpoint);
+        let _guard = override_s3_endpoint_for_process(endpoint);
         let objects = expand_object_store_specs(&["s3://bucket/path/file.parquet".to_owned()])
             .expect("expand object");
         let range = read_object_range_with_metadata(&objects[0], 4, 6).expect("read range");
@@ -936,7 +987,7 @@ mod tests {
                 .expect("write response");
         });
 
-        let _guard = EnvVarGuard::set("ULTRASQL_S3_ENDPOINT", endpoint);
+        let _guard = override_s3_endpoint_for_process(endpoint);
         let objects = expand_object_store_specs(&["s3://bucket/path/file.parquet".to_owned()])
             .expect("expand object");
         let first = read_object_range_with_metadata(&objects[0], 4, 6).expect("first range");
@@ -964,35 +1015,5 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .expect("objectstore env test lock")
-    }
-
-    struct EnvVarGuard {
-        name: &'static str,
-        old: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: String) -> Self {
-            let old = env::var(name).ok();
-            // SAFETY: this test mutates a single process environment key before
-            // starting the client request and restores it before returning.
-            unsafe {
-                env::set_var(name, value);
-            }
-            Self { name, old }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            // SAFETY: restores the environment key owned by this guard.
-            unsafe {
-                if let Some(value) = &self.old {
-                    env::set_var(self.name, value);
-                } else {
-                    env::remove_var(self.name);
-                }
-            }
-        }
     }
 }

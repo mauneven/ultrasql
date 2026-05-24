@@ -66,7 +66,7 @@ use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder}
 use tokio_postgres::NoTls;
 use ultrasql_bench::registry::HostInfo;
 use ultrasql_catalog::rag::{RagSchemaConfig, create_rag_table_statements};
-use ultrasql_objectstore::object_range_cache_metrics;
+use ultrasql_objectstore::{object_range_cache_metrics, override_s3_endpoint_for_process};
 use ultrasql_server::{Server, bind_listener, serve_listener};
 
 const VECTOR_CERTIFICATION_METRICS: &[&str] = &[
@@ -1509,7 +1509,7 @@ async fn run_object_parquet_range_smoke(
         "/lake/parquet/object_range.parquet",
         object_bytes.clone(),
     )]);
-    let _env = ObjectEndpointEnvGuard::set("ULTRASQL_S3_ENDPOINT", &mock.endpoint);
+    let _endpoint_override = override_s3_endpoint_for_process(mock.endpoint.clone());
 
     let (client, conn_handle) = connect_sql_server(server).await?;
     let query =
@@ -1664,35 +1664,6 @@ fn parquet_column_ranges(path: &Path, column: &str) -> Result<Vec<(u64, u64)>> {
             (start, start + len.saturating_sub(1))
         })
         .collect())
-}
-
-struct ObjectEndpointEnvGuard {
-    key: &'static str,
-    old: Option<std::ffi::OsString>,
-}
-
-impl ObjectEndpointEnvGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let old = std::env::var_os(key);
-        // SAFETY: `cross_compare_sql` is a short-lived benchmark process.
-        // This guard installs the endpoint before the object-store query and
-        // restores it after the query; no other benchmark thread mutates this
-        // key in this process.
-        unsafe { std::env::set_var(key, value) };
-        Self { key, old }
-    }
-}
-
-impl Drop for ObjectEndpointEnvGuard {
-    fn drop(&mut self) {
-        match &self.old {
-            // SAFETY: see `ObjectEndpointEnvGuard::set`; drop restores the
-            // same process-scoped key after the object-store query finishes.
-            Some(value) => unsafe { std::env::set_var(self.key, value) },
-            // SAFETY: see `ObjectEndpointEnvGuard::set`.
-            None => unsafe { std::env::remove_var(self.key) },
-        }
-    }
 }
 
 struct BenchMockS3 {

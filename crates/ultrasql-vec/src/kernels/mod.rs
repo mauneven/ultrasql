@@ -164,35 +164,9 @@ fn eq_i32_pack_into(a: &[i32], b: &[i32], words: &mut [u64]) {
 }
 
 /// Compare 64 `i32` lanes and produce a packed 64-bit mask.
-///
-/// On `aarch64` we use NEON intrinsics: eight `vceqq_s32` produce
-/// eight 4-lane all-ones-or-zero compare vectors, which we reduce to
-/// a single 64-bit mask using `vshrn` / bit-mask-and-add tricks
-/// (Wojciech Muła's "movemask emulation"). On every other target we
-/// fall back to a scalar loop that LLVM autovectorizes acceptably
-/// (still much faster than the prior per-row `set()` shape because
-/// the destination is a single word write).
-#[cfg(target_arch = "aarch64")]
 #[inline]
 fn pack_eq_64(a: &[i32; 64], b: &[i32; 64]) -> u64 {
-    // SAFETY: aarch64 NEON is unconditionally available on every
-    // ARMv8-A CPU, which is the floor of `aarch64-apple-darwin` and
-    // `aarch64-unknown-linux-gnu`. The pointer arithmetic stays
-    // inside the borrowed `[i32; 64]` arrays.
-    unsafe { pack_eq_64_neon(a, b) }
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-#[inline]
-fn pack_eq_64(a: &[i32; 64], b: &[i32; 64]) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if let Some(mask) = pack_eq_64_avx2_if_available(a, b) {
-            return mask;
-        }
-    }
     let mut mask: u64 = 0;
-    // 8 chunks × 8 lanes per chunk = 64 lanes / word.
     for chunk in 0..8_usize {
         let off = chunk * 8;
         let mut byte: u64 = 0;
@@ -205,109 +179,6 @@ fn pack_eq_64(a: &[i32; 64], b: &[i32; 64]) -> u64 {
         byte |= u64::from(a[off + 6] == b[off + 6]) << 6;
         byte |= u64::from(a[off + 7] == b[off + 7]) << 7;
         mask |= byte << (chunk * 8);
-    }
-    mask
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn pack_eq_64_avx2_if_available(a: &[i32; 64], b: &[i32; 64]) -> Option<u64> {
-    if !std::arch::is_x86_feature_detected!("avx2") {
-        return None;
-    }
-    // SAFETY:
-    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
-    // - Both inputs are borrowed 64-lane arrays; helper loads stay inside
-    //   those arrays and produce one packed mask.
-    Some(unsafe { pack_eq_64_avx2(a, b) })
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-fn pack_eq_64_avx2(a: &[i32; 64], b: &[i32; 64]) -> u64 {
-    use std::arch::x86_64::{
-        __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
-    };
-
-    let mut mask: u64 = 0;
-    for chunk in 0..8_usize {
-        let off = chunk * 8;
-        // SAFETY: off <= 56; each load reads 8 i32 lanes inside the
-        // 64-lane arrays. AVX2 is guaranteed by target_feature.
-        let av = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
-        let bv = unsafe { _mm256_loadu_si256(b.as_ptr().add(off).cast::<__m256i>()) };
-        let cmp = _mm256_cmpeq_epi32(av, bv);
-        let bits = movemask_to_u32(_mm256_movemask_ps(_mm256_castsi256_ps(cmp)));
-        mask |= u64::from(bits) << (chunk * 8);
-    }
-    mask
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn movemask_to_u32(mask: i32) -> u32 {
-    u32::try_from(mask).unwrap_or_else(|_| unreachable!("x86 movemask is non-negative"))
-}
-
-/// NEON specialization of [`pack_eq_64`].
-///
-/// Strategy: load `a` and `b` as 4-lane `int32x4_t` vectors, compare
-/// them with `vceqq_s32` to get 4-lane "all-ones per matching lane"
-/// results, then collapse each vector to a 4-bit nibble of the
-/// destination word.
-///
-/// We use the "and with a powers-of-two vector, then horizontal
-/// add" emulation: each compare lane is 0 or `0xFFFF_FFFF`,
-/// AND-ing against `[1, 2, 4, 8]` keeps only the matching weight,
-/// and `vaddvq_u32` reduces the 4 lanes to a single value in
-/// 0..=15 — exactly the desired 4-bit deposit. Eight such
-/// reductions (sixteen NEON loads, eight compares, eight
-/// reductions) emit one 64-bit mask word.
-///
-/// Call through [`pack_eq_64`] so target-feature policy stays centralized.
-/// The implementation reads exactly 64 `i32`s from borrowed array references.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-fn pack_eq_64_neon(a: &[i32; 64], b: &[i32; 64]) -> u64 {
-    use core::arch::aarch64::{uint32x4_t, vaddvq_u32, vandq_u32, vceqq_s32, vld1q_s32, vld1q_u32};
-
-    let a_ptr = a.as_ptr();
-    let b_ptr = b.as_ptr();
-
-    // Powers-of-two weights for the 4 lanes of each compare vector:
-    // bit positions 0..3 within the chunk byte.
-    let w_lo: [u32; 4] = [1, 2, 4, 8];
-
-    // SAFETY: `w_lo` has exactly four initialized `u32` lanes; NEON
-    // `vld1q_u32` permits unaligned loads.
-    let weights: uint32x4_t = unsafe { vld1q_u32(w_lo.as_ptr()) };
-
-    let mut mask: u64 = 0;
-    // We process 8 lanes per "pair" iteration → 8 pair iterations
-    // would be needed to cover 64 lanes, but the loop deposits 8
-    // lanes per byte and steps the byte position by 8 bits per
-    // iteration. (Lanes 0..7 → byte 0, lanes 8..15 → byte 1, …)
-    for pair in 0..8_usize {
-        let off = pair * 8;
-        // SAFETY: a_ptr.add(off) is in-bounds because off + 7 <= 63
-        // (pair <= 7 → off <= 56, and we read up to off + 7).
-        let av_lo = unsafe { vld1q_s32(a_ptr.add(off)) };
-        let bv_lo = unsafe { vld1q_s32(b_ptr.add(off)) };
-        let av_hi = unsafe { vld1q_s32(a_ptr.add(off + 4)) };
-        let bv_hi = unsafe { vld1q_s32(b_ptr.add(off + 4)) };
-
-        // Per-lane compare → 0xFFFFFFFF on match, 0 on miss.
-        let eq_lo = vceqq_s32(av_lo, bv_lo);
-        let eq_hi = vceqq_s32(av_hi, bv_hi);
-
-        // AND with [1, 2, 4, 8] then horizontal-add → a value in
-        // 0..=15 encoding which of the 4 lanes matched.
-        let nib_lo = u64::from(vaddvq_u32(vandq_u32(eq_lo, weights)));
-        let nib_hi = u64::from(vaddvq_u32(vandq_u32(eq_hi, weights)));
-        // Combine into one byte: low nibble = lanes 0..3, high
-        // nibble = lanes 4..7 (matching the scalar path bit order).
-        let byte = nib_lo | (nib_hi << 4);
-        mask |= byte << (pair * 8);
     }
     mask
 }
@@ -355,125 +226,15 @@ pub fn sum_i64(column: &NumericColumn<i64>) -> i64 {
     )
 }
 
-/// Dense (non-null) sum of an `i64` slice. Hand-vectorised on aarch64;
-/// scalar fallback on every other target.
+/// Dense (non-null) sum of an `i64` slice.
 #[inline]
 fn sum_i64_dense(data: &[i64]) -> i64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        sum_i64_dense_neon(data)
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if let Some(sum) = sum_i64_dense_avx2_if_available(data) {
-            return sum;
-        }
-        sum_i64_dense_scalar(data)
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        sum_i64_dense_scalar(data)
-    }
+    sum_i64_dense_scalar(data)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn sum_i64_dense_scalar(data: &[i64]) -> i64 {
     data.iter().fold(0_i64, |a, b| a.wrapping_add(*b))
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn sum_i64_dense_avx2_if_available(data: &[i64]) -> Option<i64> {
-    if !std::arch::is_x86_feature_detected!("avx2") {
-        return None;
-    }
-    // SAFETY:
-    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
-    // - Helper reads only full `chunks_exact(8)` groups and folds remainder
-    //   scalar; all loads and the final stack store are in-bounds.
-    Some(unsafe { sum_i64_dense_avx2(data) })
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-fn sum_i64_dense_avx2(data: &[i64]) -> i64 {
-    use std::arch::x86_64::{
-        __m256i, _mm256_add_epi64, _mm256_loadu_si256, _mm256_setzero_si256, _mm256_storeu_si256,
-    };
-
-    let mut acc0 = _mm256_setzero_si256();
-    let mut acc1 = _mm256_setzero_si256();
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        // SAFETY: chunks_exact(8) gives 8 i64 lanes; each AVX2 load
-        // reads 4 lanes in-bounds.
-        let v0 = unsafe { _mm256_loadu_si256(chunk.as_ptr().cast::<__m256i>()) };
-        let v1 = unsafe { _mm256_loadu_si256(chunk.as_ptr().add(4).cast::<__m256i>()) };
-        acc0 = _mm256_add_epi64(acc0, v0);
-        acc1 = _mm256_add_epi64(acc1, v1);
-    }
-    let total = _mm256_add_epi64(acc0, acc1);
-    let mut lanes = [0_i64; 4];
-    // SAFETY: lanes has 32 bytes, exactly one __m256i store.
-    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), total) };
-    let mut sum = lanes.into_iter().fold(0_i64, i64::wrapping_add);
-    for &v in chunks.remainder() {
-        sum = sum.wrapping_add(v);
-    }
-    sum
-}
-
-/// Hand-rolled aarch64 NEON kernel for `sum(i64 slice)`.
-///
-/// Processes 16 `i64` lanes per loop iteration through four parallel
-/// `int64x2_t` accumulators (8 lanes × 2 i64 / vec) so the CPU can
-/// dual-issue the dependent `vaddq_s64` chains. Tail of fewer than 16
-/// lanes folds through the standard scalar `wrapping_add` loop.
-///
-/// Bit-identical to the scalar fold under `i64::wrapping_add`. The
-/// `unsafe` block is sound because every `vld1q_s64` reads exactly two
-/// `i64` lanes from a slice we have indexed under bounds; no aliasing,
-/// no over-read.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn sum_i64_dense_neon(data: &[i64]) -> i64 {
-    use std::arch::aarch64::{int64x2_t, vaddq_s64, vaddvq_s64, vdupq_n_s64, vld1q_s64};
-
-    let mut a0: int64x2_t = unsafe { vdupq_n_s64(0) };
-    let mut a1: int64x2_t = unsafe { vdupq_n_s64(0) };
-    let mut a2: int64x2_t = unsafe { vdupq_n_s64(0) };
-    let mut a3: int64x2_t = unsafe { vdupq_n_s64(0) };
-
-    let chunks = data.chunks_exact(8);
-    let rem = chunks.remainder();
-    for c in chunks {
-        // SAFETY: `c` is `&[i64; 8]` (chunks_exact); each `vld1q_s64`
-        // reads 2 contiguous `i64` lanes within the chunk. No aliasing
-        // — `c` is a unique borrow into `data`. The pointer arithmetic
-        // stays inside `c.len() == 8`.
-        unsafe {
-            let v0 = vld1q_s64(c.as_ptr());
-            let v1 = vld1q_s64(c.as_ptr().add(2));
-            let v2 = vld1q_s64(c.as_ptr().add(4));
-            let v3 = vld1q_s64(c.as_ptr().add(6));
-            a0 = vaddq_s64(a0, v0);
-            a1 = vaddq_s64(a1, v1);
-            a2 = vaddq_s64(a2, v2);
-            a3 = vaddq_s64(a3, v3);
-        }
-    }
-    // Horizontal reduction.
-    let mut sum = unsafe {
-        let half0 = vaddq_s64(a0, a1);
-        let half1 = vaddq_s64(a2, a3);
-        let total = vaddq_s64(half0, half1);
-        vaddvq_s64(total)
-    };
-    for &v in rem {
-        sum = sum.wrapping_add(v);
-    }
-    sum
 }
 
 /// Sum of a non-null `i32` column widened to `i64` (the integer-add
@@ -498,120 +259,13 @@ pub fn sum_i32_widening(column: &NumericColumn<i32>) -> i64 {
 
 #[inline]
 fn sum_i32_widening_dense(data: &[i32]) -> i64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        sum_i32_widening_dense_neon(data)
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        if let Some(sum) = sum_i32_widening_dense_avx2_if_available(data) {
-            return sum;
-        }
-        sum_i32_widening_dense_scalar(data)
-    }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    {
-        sum_i32_widening_dense_scalar(data)
-    }
+    sum_i32_widening_dense_scalar(data)
 }
 
-#[cfg(not(target_arch = "aarch64"))]
 #[inline]
 fn sum_i32_widening_dense_scalar(data: &[i32]) -> i64 {
     data.iter()
         .fold(0_i64, |a, b| a.wrapping_add(i64::from(*b)))
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn sum_i32_widening_dense_avx2_if_available(data: &[i32]) -> Option<i64> {
-    if !std::arch::is_x86_feature_detected!("avx2") {
-        return None;
-    }
-    // SAFETY:
-    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
-    // - Helper reads only full `chunks_exact(8)` groups and folds remainder
-    //   scalar; all loads and the final stack store are in-bounds.
-    Some(unsafe { sum_i32_widening_dense_avx2(data) })
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-fn sum_i32_widening_dense_avx2(data: &[i32]) -> i64 {
-    use std::arch::x86_64::{
-        __m128i, __m256i, _mm_loadu_si128, _mm256_add_epi64, _mm256_cvtepi32_epi64,
-        _mm256_setzero_si256, _mm256_storeu_si256,
-    };
-
-    let mut acc0 = _mm256_setzero_si256();
-    let mut acc1 = _mm256_setzero_si256();
-    let mut chunks = data.chunks_exact(8);
-    for chunk in &mut chunks {
-        // SAFETY: chunks_exact(8) gives 8 i32 lanes; each 128-bit load
-        // reads 4 lanes in-bounds, then widens to four i64 lanes.
-        let lo = unsafe { _mm_loadu_si128(chunk.as_ptr().cast::<__m128i>()) };
-        let hi = unsafe { _mm_loadu_si128(chunk.as_ptr().add(4).cast::<__m128i>()) };
-        acc0 = _mm256_add_epi64(acc0, _mm256_cvtepi32_epi64(lo));
-        acc1 = _mm256_add_epi64(acc1, _mm256_cvtepi32_epi64(hi));
-    }
-    let total = _mm256_add_epi64(acc0, acc1);
-    let mut lanes = [0_i64; 4];
-    // SAFETY: lanes has 32 bytes, exactly one __m256i store.
-    unsafe { _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), total) };
-    let mut sum = lanes.into_iter().fold(0_i64, i64::wrapping_add);
-    for &v in chunks.remainder() {
-        sum = sum.wrapping_add(i64::from(v));
-    }
-    sum
-}
-
-/// Hand-rolled aarch64 NEON kernel for `sum(i32 slice)` widened to
-/// `i64`. Processes 16 `i32` lanes per iteration via `vpaddlq_s32`
-/// (pairwise add-and-widen, 4 i32 → 2 i64) into four parallel
-/// `int64x2_t` accumulators.
-///
-/// Equivalent to `data.iter().fold(0, |a, b| a.wrapping_add(i64::from(b)))`.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn sum_i32_widening_dense_neon(data: &[i32]) -> i64 {
-    use std::arch::aarch64::{
-        int64x2_t, vaddq_s64, vaddvq_s64, vdupq_n_s64, vld1q_s32, vpaddlq_s32,
-    };
-
-    let mut a0: int64x2_t = unsafe { vdupq_n_s64(0) };
-    let mut a1: int64x2_t = unsafe { vdupq_n_s64(0) };
-    let mut a2: int64x2_t = unsafe { vdupq_n_s64(0) };
-    let mut a3: int64x2_t = unsafe { vdupq_n_s64(0) };
-
-    let chunks = data.chunks_exact(16);
-    let rem = chunks.remainder();
-    for c in chunks {
-        // SAFETY: `c` is `&[i32; 16]`; each `vld1q_s32` reads 4
-        // contiguous i32 lanes inside the chunk. The 4 `vpaddlq_s32`
-        // calls then pairwise-widen 4 i32 → 2 i64. Final accumulators
-        // are `wrapping_add` over the widened i64 stream.
-        unsafe {
-            let v0 = vld1q_s32(c.as_ptr());
-            let v1 = vld1q_s32(c.as_ptr().add(4));
-            let v2 = vld1q_s32(c.as_ptr().add(8));
-            let v3 = vld1q_s32(c.as_ptr().add(12));
-            a0 = vaddq_s64(a0, vpaddlq_s32(v0));
-            a1 = vaddq_s64(a1, vpaddlq_s32(v1));
-            a2 = vaddq_s64(a2, vpaddlq_s32(v2));
-            a3 = vaddq_s64(a3, vpaddlq_s32(v3));
-        }
-    }
-    // Horizontal reduction of the four parallel accumulators.
-    let mut sum = unsafe {
-        let half0 = vaddq_s64(a0, a1);
-        let half1 = vaddq_s64(a2, a3);
-        let total = vaddq_s64(half0, half1);
-        vaddvq_s64(total)
-    };
-    for &v in rem {
-        sum = sum.wrapping_add(i64::from(v));
-    }
-    sum
 }
 
 /// Min of a non-null `f64` column. Returns `None` on empty / all-null
@@ -919,19 +573,9 @@ fn cmp_gt_i64_pack_into(a: &[i64], scalar: i64, words: &mut [u64]) {
     }
 }
 
-/// Compare 64 `i64` lanes against a scalar and pack into a 64-bit
-/// mask. LLVM lowers each 8-lane block to NEON `cmgt.2d` instructions;
-/// the bit deposit is shift-OR. The disassembly at
-/// `target-cpu=apple-m1` shows a tight NEON loop with no scalar
-/// fallback in the hot region.
+/// Compare 64 `i64` lanes against a scalar and pack into a 64-bit mask.
 #[inline]
 fn pack_cmp_gt_64(a: &[i64; 64], scalar: i64) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if let Some(mask) = pack_cmp_gt_64_avx2_if_available(a, scalar) {
-            return mask;
-        }
-    }
     let mut mask: u64 = 0;
     // 8 chunks × 8 lanes per chunk = 64 lanes per word.
     for chunk in 0..8_usize {
@@ -946,40 +590,6 @@ fn pack_cmp_gt_64(a: &[i64; 64], scalar: i64) -> u64 {
         byte |= u64::from(a[off + 6] > scalar) << 6;
         byte |= u64::from(a[off + 7] > scalar) << 7;
         mask |= byte << (chunk * 8);
-    }
-    mask
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn pack_cmp_gt_64_avx2_if_available(a: &[i64; 64], scalar: i64) -> Option<u64> {
-    if !std::arch::is_x86_feature_detected!("avx2") {
-        return None;
-    }
-    // SAFETY:
-    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
-    // - Input is a borrowed 64-lane array; helper loads stay inside it and
-    //   produce one packed comparison mask.
-    Some(unsafe { pack_cmp_gt_64_avx2(a, scalar) })
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-fn pack_cmp_gt_64_avx2(a: &[i64; 64], scalar: i64) -> u64 {
-    use std::arch::x86_64::{
-        __m256i, _mm256_castsi256_pd, _mm256_cmpgt_epi64, _mm256_loadu_si256, _mm256_movemask_pd,
-        _mm256_set1_epi64x,
-    };
-
-    let needle = _mm256_set1_epi64x(scalar);
-    let mut mask: u64 = 0;
-    for chunk in 0..16_usize {
-        let off = chunk * 4;
-        // SAFETY: off <= 60; load reads 4 i64 lanes inside the array.
-        let v = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
-        let cmp = _mm256_cmpgt_epi64(v, needle);
-        let bits = movemask_to_u32(_mm256_movemask_pd(_mm256_castsi256_pd(cmp)));
-        mask |= u64::from(bits) << (chunk * 4);
     }
     mask
 }
@@ -1009,51 +619,21 @@ pub fn cmp_gt_i64_scalar(column: &NumericColumn<i64>, scalar: i64) -> Bitmap {
 /// Fused predicate-and-sum over an `i32` column.
 ///
 /// Returns `sum(data[i] for i where data[i] > threshold)`, widening
-/// to `i64`. Skips both the intermediate `Bitmap` materialisation
-/// and the per-bit iteration that `cmp_i32_scalar` +
-/// `sum_i32_widening_with_mask` pay separately — the entire
-/// `filter_sum` operator collapses to one tight SIMD loop on aarch64.
-///
-/// Equivalent to:
-///
-/// ```ignore
-/// data.iter().filter(|&&v| v > threshold).fold(0_i64, |a, &v| a.wrapping_add(i64::from(v)))
-/// ```
-///
-/// Negative values are handled correctly: the AND-with-compare-
-/// mask trick relies on `vcgtq_s32` producing `0xFFFF_FFFF` for
-/// lanes where `v > threshold` and `0` otherwise, then
-/// `vandq_s32(v, mask)` preserves two's-complement negatives
-/// inside selected lanes (`-5 & -1 == -5`) and zeros out the
-/// rest, after which `vpaddlq_s32` widens to `i64` with sign
-/// extension.
+/// to `i64`. Skips both intermediate bitmap materialisation and
+/// per-bit iteration.
 #[must_use]
 pub fn filter_sum_i32_widening_gt(data: &[i32], threshold: i32) -> i64 {
-    #[cfg(target_arch = "aarch64")]
-    {
-        filter_sum_i32_widening_gt_neon(data, threshold)
+    let mut s: i64 = 0;
+    for &v in data {
+        let m = i32::from(v > threshold).wrapping_neg();
+        s = s.wrapping_add(i64::from(v & m));
     }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        // Branchless multiply-by-(0 or -1)-as-mask. LLVM
-        // autovectorises this to a tight SIMD loop on x86_64-v3
-        // (AVX2: `vpcmpgtd` + `vpand` + widening). Result is
-        // bit-identical to the aarch64 hand-NEON path.
-        let mut s: i64 = 0;
-        for &v in data {
-            let m = i32::from(v > threshold).wrapping_neg();
-            s = s.wrapping_add(i64::from(v & m));
-        }
-        s
-    }
+    s
 }
 
 /// Fused predicate-and-sum over an `i64` column.
 ///
-/// Returns `sum(data[i] for i where data[i] > threshold)`. This is the
-/// `BIGINT` sibling of [`filter_sum_i32_widening_gt`], used by the
-/// executor when `SUM(bigint_col) WHERE bigint_col > literal` matches a
-/// fused scalar-aggregate shape.
+/// Returns `sum(data[i] for i where data[i] > threshold)`.
 #[must_use]
 pub fn filter_sum_i64_gt(data: &[i64], threshold: i64) -> i64 {
     let mut s: i64 = 0;
@@ -1062,68 +642,6 @@ pub fn filter_sum_i64_gt(data: &[i64], threshold: i64) -> i64 {
         s = s.wrapping_add(v & m);
     }
     s
-}
-
-/// Hand-NEON `i32 > threshold ⇒ sum` over a contiguous slice.
-///
-/// Processes 16 `i32` lanes per iteration through 4 parallel
-/// `int64x2_t` accumulators. Per 4-lane group:
-///
-/// 1. `vld1q_s32` loads 4 `i32`s.
-/// 2. `vcgtq_s32(v, t)` builds a 0xFFFFFFFF / 0 lane mask.
-/// 3. `vandq_s32(v, mask)` keeps the value for set lanes, zeros
-///    the rest.
-/// 4. `vpaddlq_s32` pairwise-adds-and-widens 4 `i32` → 2 `i64`.
-/// 5. `vaddq_s64` accumulates into the running 128-bit sum.
-///
-/// Tail of fewer than 16 lanes falls back to the scalar branch.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-fn filter_sum_i32_widening_gt_neon(data: &[i32], threshold: i32) -> i64 {
-    use std::arch::aarch64::{
-        int64x2_t, vaddq_s64, vaddvq_s64, vandq_s32, vcgtq_s32, vdupq_n_s32, vdupq_n_s64,
-        vld1q_s32, vpaddlq_s32, vreinterpretq_s32_u32,
-    };
-
-    let mut a0: int64x2_t = unsafe { vdupq_n_s64(0) };
-    let mut a1: int64x2_t = unsafe { vdupq_n_s64(0) };
-    let mut a2: int64x2_t = unsafe { vdupq_n_s64(0) };
-    let mut a3: int64x2_t = unsafe { vdupq_n_s64(0) };
-    let t = unsafe { vdupq_n_s32(threshold) };
-
-    let chunks = data.chunks_exact(16);
-    let rem = chunks.remainder();
-    for c in chunks {
-        // SAFETY: `c` is `&[i32; 16]` (chunks_exact); every
-        // `vld1q_s32` reads 4 contiguous lanes inside the chunk.
-        // No aliasing — `c` is a unique borrow into `data`.
-        unsafe {
-            let v0 = vld1q_s32(c.as_ptr());
-            let v1 = vld1q_s32(c.as_ptr().add(4));
-            let v2 = vld1q_s32(c.as_ptr().add(8));
-            let v3 = vld1q_s32(c.as_ptr().add(12));
-            let m0 = vreinterpretq_s32_u32(vcgtq_s32(v0, t));
-            let m1 = vreinterpretq_s32_u32(vcgtq_s32(v1, t));
-            let m2 = vreinterpretq_s32_u32(vcgtq_s32(v2, t));
-            let m3 = vreinterpretq_s32_u32(vcgtq_s32(v3, t));
-            a0 = vaddq_s64(a0, vpaddlq_s32(vandq_s32(v0, m0)));
-            a1 = vaddq_s64(a1, vpaddlq_s32(vandq_s32(v1, m1)));
-            a2 = vaddq_s64(a2, vpaddlq_s32(vandq_s32(v2, m2)));
-            a3 = vaddq_s64(a3, vpaddlq_s32(vandq_s32(v3, m3)));
-        }
-    }
-    let mut sum = unsafe {
-        let half0 = vaddq_s64(a0, a1);
-        let half1 = vaddq_s64(a2, a3);
-        let total = vaddq_s64(half0, half1);
-        vaddvq_s64(total)
-    };
-    for &v in rem {
-        if v > threshold {
-            sum = sum.wrapping_add(i64::from(v));
-        }
-    }
-    sum
 }
 
 /// Sum an `i32` column widened to `i64`, masked by an external
@@ -1255,12 +773,6 @@ const fn cmp_i64_lane(op: CmpOp, a: i64, b: i64) -> bool {
 
 #[inline]
 fn pack_cmp_i32_64(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if let Some(mask) = pack_cmp_i32_64_avx2_if_available(a, scalar, op) {
-            return mask;
-        }
-    }
     let mut mask: u64 = 0;
     for chunk in 0..8_usize {
         let off = chunk * 8;
@@ -1274,55 +786,6 @@ fn pack_cmp_i32_64(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
         byte |= u64::from(cmp_i32_lane(op, a[off + 6], scalar)) << 6;
         byte |= u64::from(cmp_i32_lane(op, a[off + 7], scalar)) << 7;
         mask |= byte << (chunk * 8);
-    }
-    mask
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn pack_cmp_i32_64_avx2_if_available(a: &[i32; 64], scalar: i32, op: CmpOp) -> Option<u64> {
-    if !std::arch::is_x86_feature_detected!("avx2") {
-        return None;
-    }
-    // SAFETY:
-    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
-    // - Input is a borrowed 64-lane array; helper loads stay inside it and
-    //   produce one packed comparison mask.
-    Some(unsafe { pack_cmp_i32_64_avx2(a, scalar, op) })
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-fn pack_cmp_i32_64_avx2(a: &[i32; 64], scalar: i32, op: CmpOp) -> u64 {
-    use std::arch::x86_64::{
-        __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_cmpgt_epi32, _mm256_loadu_si256,
-        _mm256_movemask_ps, _mm256_set1_epi32,
-    };
-
-    let needle = _mm256_set1_epi32(scalar);
-    let mut mask: u64 = 0;
-    for chunk in 0..8_usize {
-        let off = chunk * 8;
-        // SAFETY: off <= 56; load reads 8 i32 lanes inside the array.
-        let v = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
-        let eq = movemask_to_u32(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(
-            v, needle,
-        ))));
-        let gt = movemask_to_u32(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(
-            v, needle,
-        ))));
-        let lt = movemask_to_u32(_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(
-            needle, v,
-        ))));
-        let bits = match op {
-            CmpOp::Eq => eq,
-            CmpOp::Ne => eq ^ 0xFF,
-            CmpOp::Lt => lt,
-            CmpOp::Le => lt | eq,
-            CmpOp::Gt => gt,
-            CmpOp::Ge => gt | eq,
-        } & 0xFF;
-        mask |= u64::from(bits) << (chunk * 8);
     }
     mask
 }
@@ -1350,12 +813,6 @@ fn cmp_i32_pack_into(a: &[i32], scalar: i32, op: CmpOp, words: &mut [u64]) {
 
 #[inline]
 fn pack_cmp_i64_64(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if let Some(mask) = pack_cmp_i64_64_avx2_if_available(a, scalar, op) {
-            return mask;
-        }
-    }
     let mut mask: u64 = 0;
     for chunk in 0..8_usize {
         let off = chunk * 8;
@@ -1369,55 +826,6 @@ fn pack_cmp_i64_64(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
         byte |= u64::from(cmp_i64_lane(op, a[off + 6], scalar)) << 6;
         byte |= u64::from(cmp_i64_lane(op, a[off + 7], scalar)) << 7;
         mask |= byte << (chunk * 8);
-    }
-    mask
-}
-
-#[cfg(target_arch = "x86_64")]
-#[inline]
-fn pack_cmp_i64_64_avx2_if_available(a: &[i64; 64], scalar: i64, op: CmpOp) -> Option<u64> {
-    if !std::arch::is_x86_feature_detected!("avx2") {
-        return None;
-    }
-    // SAFETY:
-    // - Runtime CPUID confirmed AVX2 before entering the target-feature helper.
-    // - Input is a borrowed 64-lane array; helper loads stay inside it and
-    //   produce one packed comparison mask.
-    Some(unsafe { pack_cmp_i64_64_avx2(a, scalar, op) })
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-fn pack_cmp_i64_64_avx2(a: &[i64; 64], scalar: i64, op: CmpOp) -> u64 {
-    use std::arch::x86_64::{
-        __m256i, _mm256_castsi256_pd, _mm256_cmpeq_epi64, _mm256_cmpgt_epi64, _mm256_loadu_si256,
-        _mm256_movemask_pd, _mm256_set1_epi64x,
-    };
-
-    let needle = _mm256_set1_epi64x(scalar);
-    let mut mask: u64 = 0;
-    for chunk in 0..16_usize {
-        let off = chunk * 4;
-        // SAFETY: off <= 60; load reads 4 i64 lanes inside the array.
-        let v = unsafe { _mm256_loadu_si256(a.as_ptr().add(off).cast::<__m256i>()) };
-        let eq = movemask_to_u32(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(
-            v, needle,
-        ))));
-        let gt = movemask_to_u32(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(
-            v, needle,
-        ))));
-        let lt = movemask_to_u32(_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(
-            needle, v,
-        ))));
-        let bits = match op {
-            CmpOp::Eq => eq,
-            CmpOp::Ne => eq ^ 0xF,
-            CmpOp::Lt => lt,
-            CmpOp::Le => lt | eq,
-            CmpOp::Gt => gt,
-            CmpOp::Ge => gt | eq,
-        } & 0xF;
-        mask |= u64::from(bits) << (chunk * 4);
     }
     mask
 }

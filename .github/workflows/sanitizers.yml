@@ -72,7 +72,7 @@ jobs:
           components: miri,rust-src
       - uses: Swatinem/rust-cache@v2
       - run: cargo +nightly miri setup
-      - name: run miri smoke on unsafe-heavy crates
+      - name: run miri smoke on memory-safety-sensitive crates
         run: |
           # Miri is an interpreter, so the CI gate runs targeted smoke tests
           # for unsafe-sensitive contracts. ASAN/TSAN above keep broad

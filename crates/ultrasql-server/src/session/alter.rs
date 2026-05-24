@@ -68,7 +68,7 @@ where
     ///   `ADD/DROP CONSTRAINT` are not yet bindable in
     ///   [`ultrasql_planner::bind`]; the binder returns
     ///   `NotSupported` for them so they never reach this arm.
-    /// - The rewrite is online-unsafe today: there is no per-relation
+    /// - The rewrite is not online-safe today: there is no per-relation
     ///   exclusive lock taken across steps 2 and 3, so a concurrent
     ///   INSERT during the rewrite may produce a tuple that scans see
     ///   under the new schema but was encoded against the old one. We

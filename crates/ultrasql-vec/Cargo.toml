@@ -13,9 +13,6 @@ workspace = true
 
 [features]
 default = []
-# Enable hand-written SIMD vector kernels that require small, audited `unsafe`
-# islands for target-feature dispatch and architecture intrinsics.
-simd-unsafe = []
 
 [dependencies]
 ultrasql-core = { workspace = true }
