@@ -46,6 +46,27 @@ async fn shutdown(
     let _ = server_handle.await;
 }
 
+async fn connect_as(
+    bound: SocketAddr,
+    user: &str,
+    application_name: &str,
+) -> (tokio_postgres::Client, tokio::task::JoinHandle<()>) {
+    let conn_str = format!(
+        "host={host} port={port} user={user} application_name={application_name}",
+        host = bound.ip(),
+        port = bound.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("tokio-postgres connect");
+    let conn_handle = tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+    (client, conn_handle)
+}
+
 fn simple_rows(messages: &[SimpleQueryMessage]) -> Vec<Vec<String>> {
     messages
         .iter()
@@ -134,6 +155,166 @@ async fn rls_tenant_policy_filters_reads_and_checks_inserts() {
     assert_eq!(rows, vec![vec!["doc-b".to_owned()]]);
 
     shutdown(client, server_handle).await;
+}
+
+#[tokio::test]
+async fn rls_owner_and_bypass_roles_skip_policy_filtering() {
+    let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
+    let (listener, bound) = bind_listener(addr).await.expect("bind");
+    let server = Arc::new(Server::with_sample_database());
+    let server_handle = tokio::spawn(serve_listener(listener, server));
+    let (admin, admin_conn) = connect_as(bound, "tester", "rls_owner_bypass_admin").await;
+
+    for sql in [
+        "CREATE ROLE tester SUPERUSER LOGIN",
+        "CREATE ROLE app_owner LOGIN",
+        "CREATE ROLE tenant_user LOGIN",
+        "CREATE ROLE rls_bypass LOGIN BYPASSRLS",
+        "SET ROLE app_owner",
+        "CREATE TABLE rls_owner_docs (tenant_id TEXT NOT NULL, doc_id TEXT NOT NULL)",
+        "RESET ROLE",
+        "INSERT INTO rls_owner_docs VALUES ('tenant-a', 'doc-a'), ('tenant-b', 'doc-b')",
+        "SET ROLE app_owner",
+        "CREATE POLICY rls_owner_docs_tenant ON rls_owner_docs \
+            USING (tenant_id = current_setting('ultrasql.tenant_id', true)) \
+            WITH CHECK (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        "ALTER TABLE rls_owner_docs ENABLE ROW LEVEL SECURITY",
+        "RESET ROLE",
+        "GRANT SELECT ON TABLE rls_owner_docs TO app_owner, tenant_user, rls_bypass",
+    ] {
+        admin.batch_execute(sql).await.expect(sql);
+    }
+
+    let (tenant, tenant_conn) = connect_as(bound, "tenant_user", "rls_owner_bypass_tenant").await;
+    tenant
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set tenant");
+    let rows = simple_rows(
+        &tenant
+            .simple_query("SELECT doc_id FROM rls_owner_docs ORDER BY doc_id")
+            .await
+            .expect("tenant sees filtered rows"),
+    );
+    assert_eq!(rows, vec![vec!["doc-a".to_owned()]]);
+
+    let (owner, owner_conn) = connect_as(bound, "app_owner", "rls_owner_bypass_owner").await;
+    let rows = simple_rows(
+        &owner
+            .simple_query("SELECT doc_id FROM rls_owner_docs ORDER BY doc_id")
+            .await
+            .expect("owner bypasses RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["doc-a".to_owned()], vec!["doc-b".to_owned()]]
+    );
+
+    let (bypass, bypass_conn) = connect_as(bound, "rls_bypass", "rls_owner_bypass_bypass").await;
+    let rows = simple_rows(
+        &bypass
+            .simple_query("SELECT doc_id FROM rls_owner_docs ORDER BY doc_id")
+            .await
+            .expect("BYPASSRLS role bypasses RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["doc-a".to_owned()], vec!["doc-b".to_owned()]]
+    );
+
+    drop(tenant);
+    drop(owner);
+    drop(bypass);
+    tenant_conn.await.expect("tenant connection joins");
+    owner_conn.await.expect("owner connection joins");
+    bypass_conn.await.expect("bypass connection joins");
+    drop(admin);
+    admin_conn.await.expect("admin connection joins");
+    server_handle.abort();
+    let _ = server_handle.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rls_owner_and_bypass_semantics_survive_restart() {
+    let data_dir = tempfile::TempDir::new().unwrap();
+
+    let running = start_persistent_server(data_dir.path(), "rls_owner_restart_setup").await;
+    for sql in [
+        "CREATE ROLE tester SUPERUSER LOGIN",
+        "CREATE ROLE app_owner LOGIN",
+        "SET ROLE app_owner",
+        "CREATE TABLE rls_restart_owner_docs (tenant_id TEXT NOT NULL, doc_id TEXT NOT NULL)",
+        "RESET ROLE",
+        "INSERT INTO rls_restart_owner_docs VALUES ('tenant-a', 'doc-a'), ('tenant-b', 'doc-b')",
+        "SET ROLE app_owner",
+        "CREATE POLICY rls_restart_owner_docs_tenant ON rls_restart_owner_docs \
+            USING (tenant_id = current_setting('ultrasql.tenant_id', true)) \
+            WITH CHECK (tenant_id = current_setting('ultrasql.tenant_id', true))",
+        "ALTER TABLE rls_restart_owner_docs ENABLE ROW LEVEL SECURITY",
+        "RESET ROLE",
+    ] {
+        running.client.batch_execute(sql).await.expect(sql);
+    }
+    graceful_shutdown(running).await;
+
+    let running = start_persistent_server(data_dir.path(), "rls_owner_restart_verify").await;
+    for sql in [
+        "CREATE ROLE tester SUPERUSER LOGIN",
+        "CREATE ROLE app_owner LOGIN",
+        "CREATE ROLE tenant_user LOGIN",
+        "CREATE ROLE rls_bypass LOGIN BYPASSRLS",
+        "GRANT SELECT ON TABLE rls_restart_owner_docs TO app_owner, tenant_user, rls_bypass",
+    ] {
+        running.client.batch_execute(sql).await.expect(sql);
+    }
+
+    let (tenant, tenant_conn) =
+        connect_as(running.bound, "tenant_user", "rls_owner_restart_tenant").await;
+    tenant
+        .batch_execute("SET ultrasql.tenant_id = 'tenant-a'")
+        .await
+        .expect("set tenant");
+    let rows = simple_rows(
+        &tenant
+            .simple_query("SELECT doc_id FROM rls_restart_owner_docs ORDER BY doc_id")
+            .await
+            .expect("tenant sees restarted policy"),
+    );
+    assert_eq!(rows, vec![vec!["doc-a".to_owned()]]);
+
+    let (owner, owner_conn) =
+        connect_as(running.bound, "app_owner", "rls_owner_restart_owner").await;
+    let rows = simple_rows(
+        &owner
+            .simple_query("SELECT doc_id FROM rls_restart_owner_docs ORDER BY doc_id")
+            .await
+            .expect("restarted owner bypasses RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["doc-a".to_owned()], vec!["doc-b".to_owned()]]
+    );
+
+    let (bypass, bypass_conn) =
+        connect_as(running.bound, "rls_bypass", "rls_owner_restart_bypass").await;
+    let rows = simple_rows(
+        &bypass
+            .simple_query("SELECT doc_id FROM rls_restart_owner_docs ORDER BY doc_id")
+            .await
+            .expect("restarted BYPASSRLS role bypasses RLS"),
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["doc-a".to_owned()], vec!["doc-b".to_owned()]]
+    );
+
+    drop(tenant);
+    drop(owner);
+    drop(bypass);
+    tenant_conn.await.expect("tenant connection joins");
+    owner_conn.await.expect("owner connection joins");
+    bypass_conn.await.expect("bypass connection joins");
+    graceful_shutdown(running).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

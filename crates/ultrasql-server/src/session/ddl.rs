@@ -182,6 +182,9 @@ where
             .as_ref()
             .map(|existing| existing.as_ref().clone())
             .unwrap_or_default();
+        if runtime.owner_role.is_empty() {
+            runtime.owner_role = self.current_user.to_ascii_lowercase();
+        }
         if runtime
             .policies
             .iter()
@@ -819,6 +822,16 @@ where
         }
         self.state
             .commit_transaction(ddl_txn, true, "CREATE TABLE catalog-write transaction")?;
+        let mut row_security = self
+            .state
+            .row_security
+            .get(&oid)
+            .map(|guard| guard.as_ref().clone())
+            .unwrap_or_default();
+        if row_security.owner_role.is_empty() {
+            row_security.owner_role = self.current_user.to_ascii_lowercase();
+        }
+        self.state.row_security.insert(oid, Arc::new(row_security));
         self.state.persist_table_runtime_constraints_metadata()?;
         self.state.privilege_catalog.apply_default_privileges(
             &self.current_user,

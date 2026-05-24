@@ -357,7 +357,7 @@ async fn role_inheritance_and_set_role_gate_privileges() {
 }
 
 #[tokio::test]
-async fn default_privileges_apply_to_future_tables_only() {
+async fn default_privileges_apply_to_future_objects_only() {
     let running = start_sample_server("default_privilege_catalog_test").await;
     let client = &running.client;
 
@@ -371,12 +371,13 @@ async fn default_privileges_apply_to_future_tables_only() {
         .expect("create analyst role");
     client
         .batch_execute(
-            "ALTER DEFAULT PRIVILEGES FOR ROLE tester GRANT SELECT ON TABLES TO analyst",
+            "ALTER DEFAULT PRIVILEGES FOR ROLE tester IN SCHEMA tenant \
+             GRANT SELECT ON TABLES TO analyst",
         )
         .await
         .expect("grant default table privilege");
     client
-        .batch_execute("CREATE TABLE default_acl_future (id INT, secret TEXT)")
+        .batch_execute("CREATE TABLE tenant.default_acl_future (id INT, secret TEXT)")
         .await
         .expect("create table after default grant");
     client
@@ -408,12 +409,13 @@ async fn default_privileges_apply_to_future_tables_only() {
 
     client
         .batch_execute(
-            "ALTER DEFAULT PRIVILEGES FOR ROLE tester REVOKE SELECT ON TABLES FROM analyst",
+            "ALTER DEFAULT PRIVILEGES FOR ROLE tester IN SCHEMA tenant \
+             REVOKE SELECT ON TABLES FROM analyst",
         )
         .await
         .expect("revoke default table privilege");
     client
-        .batch_execute("CREATE TABLE default_acl_later (id INT)")
+        .batch_execute("CREATE TABLE tenant.default_acl_later (id INT)")
         .await
         .expect("create table after default revoke");
 
@@ -433,6 +435,28 @@ async fn default_privileges_apply_to_future_tables_only() {
     assert!(
         !after_revoke.get::<_, bool>(1),
         "revoked default should not apply to later tables"
+    );
+
+    client
+        .batch_execute(
+            "ALTER DEFAULT PRIVILEGES FOR ROLE tester GRANT USAGE ON SEQUENCES TO analyst",
+        )
+        .await
+        .expect("grant default sequence privilege");
+    client
+        .batch_execute("CREATE SEQUENCE default_acl_seq")
+        .await
+        .expect("create sequence after default grant");
+    let sequence_granted = client
+        .query_one(
+            "SELECT has_sequence_privilege('analyst', 'default_acl_seq', 'USAGE')",
+            &[],
+        )
+        .await
+        .expect("default sequence privilege check");
+    assert!(
+        sequence_granted.get::<_, bool>(0),
+        "default USAGE should apply to future sequence"
     );
 
     shutdown(running).await;

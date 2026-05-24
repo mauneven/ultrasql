@@ -100,6 +100,25 @@ pub struct PrivilegeRequest {
     pub columns: Vec<String>,
 }
 
+/// Input for adding default privilege templates.
+#[derive(Clone, Copy, Debug)]
+pub struct DefaultPrivilegeUpdate<'a> {
+    /// Role that changed the default ACL.
+    pub grantor: &'a str,
+    /// Roles whose future objects receive the default ACL.
+    pub owner_roles: &'a [String],
+    /// Optional schema filters. Empty means every schema.
+    pub schemas: &'a [String],
+    /// Future object class.
+    pub object_kind: PrivilegeObjectKind,
+    /// Recipient roles.
+    pub grantees: &'a [String],
+    /// Privileges to apply to matching future objects.
+    pub privileges: &'a [PrivilegeRequest],
+    /// Whether applied grants include grant option.
+    pub grant_option: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct PrivilegeKey {
     object_kind: PrivilegeObjectKind,
@@ -203,32 +222,23 @@ impl InMemoryPrivilegeCatalog {
     }
 
     /// Add default privileges applied to future objects owned by listed roles.
-    pub fn grant_default_many(
-        &self,
-        grantor: &str,
-        owner_roles: &[String],
-        schemas: &[String],
-        object_kind: PrivilegeObjectKind,
-        grantees: &[String],
-        privileges: &[PrivilegeRequest],
-        grant_option: bool,
-    ) {
-        let grantor = grantor.to_ascii_lowercase();
-        let owner_roles = normalize_names(owner_roles);
-        let schema_names = normalize_default_schemas(schemas);
+    pub fn grant_default_many(&self, update: DefaultPrivilegeUpdate<'_>) {
+        let grantor = update.grantor.to_ascii_lowercase();
+        let owner_roles = normalize_names(update.owner_roles);
+        let schema_names = normalize_default_schemas(update.schemas);
         let mut default_grants = self.default_grants.write();
         for owner_role in owner_roles {
             for schema_name in &schema_names {
-                for grantee in grantees {
+                for grantee in update.grantees {
                     let grantee = grantee.to_ascii_lowercase();
-                    for request in privileges {
+                    for request in update.privileges {
                         if !request.columns.is_empty() {
                             continue;
                         }
                         let key = DefaultPrivilegeKey {
                             owner_role: owner_role.clone(),
                             schema_name: schema_name.clone(),
-                            object_kind,
+                            object_kind: update.object_kind,
                             grantee: grantee.clone(),
                             privilege: request.privilege,
                         };
@@ -237,11 +247,11 @@ impl InMemoryPrivilegeCatalog {
                             DefaultPrivilegeGrant {
                                 owner_role: owner_role.clone(),
                                 schema_name: schema_name.clone(),
-                                object_kind,
+                                object_kind: update.object_kind,
                                 grantee: grantee.clone(),
                                 privilege: request.privilege,
                                 grantor: grantor.clone(),
-                                grant_option,
+                                grant_option: update.grant_option,
                             },
                         );
                     }
@@ -589,18 +599,22 @@ mod tests {
     #[test]
     fn default_privileges_apply_by_owner_schema_and_future_object() {
         let catalog = InMemoryPrivilegeCatalog::new();
-        catalog.grant_default_many(
-            "owner",
-            &["owner".to_owned()],
-            &["tenant".to_owned()],
-            PrivilegeObjectKind::Table,
-            &["analyst".to_owned()],
-            &[PrivilegeRequest {
-                privilege: PrivilegeKind::Select,
-                columns: Vec::new(),
-            }],
-            false,
-        );
+        let owners = ["owner".to_owned()];
+        let schemas = ["tenant".to_owned()];
+        let grantees = ["analyst".to_owned()];
+        let privileges = [PrivilegeRequest {
+            privilege: PrivilegeKind::Select,
+            columns: Vec::new(),
+        }];
+        catalog.grant_default_many(DefaultPrivilegeUpdate {
+            grantor: "owner",
+            owner_roles: &owners,
+            schemas: &schemas,
+            object_kind: PrivilegeObjectKind::Table,
+            grantees: &grantees,
+            privileges: &privileges,
+            grant_option: false,
+        });
 
         catalog.apply_default_privileges("owner", "public", PrivilegeObjectKind::Table, "early");
         assert!(!catalog.has_privilege(

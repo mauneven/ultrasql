@@ -254,6 +254,8 @@ pub struct DomainRuntimeConstraints {
 /// helpers: `tenant_id = current_setting('ultrasql.tenant_id', true)`.
 #[derive(Clone, Debug, Default)]
 pub struct TableRowSecurity {
+    /// Role that owns the table for PostgreSQL-style owner bypass.
+    pub owner_role: String,
     /// Whether RLS is enabled for this table.
     pub enabled: bool,
     /// Policies attached to the table.
@@ -4360,6 +4362,9 @@ impl Server {
             .row_security
             .iter()
             .filter_map(|entry| {
+                if !entry.value().enabled && entry.value().policies.is_empty() {
+                    return None;
+                }
                 let table = snapshot.tables_by_oid.get(entry.key())?;
                 Some((
                     *entry.key(),
@@ -4370,13 +4375,14 @@ impl Server {
             .collect::<Vec<_>>();
         entries.sort_by_key(|(oid, _, _)| oid.raw());
 
-        let mut out = String::from("# ultrasql row security v1\n");
+        let mut out = String::from("# ultrasql row security v2\n");
         for (oid, table_name, runtime) in entries {
             out.push_str(&format!(
-                "table\t{}\t{}\t{}\n",
+                "table\t{}\t{}\t{}\t{}\n",
                 metadata_escape(&table_name),
                 oid.raw(),
-                runtime.enabled
+                runtime.enabled,
+                metadata_escape(&runtime.owner_role)
             ));
             for policy in &runtime.policies {
                 let (using_idx, using_col, using_setting) = rls_expr_fields(policy.using.as_ref());
@@ -4421,7 +4427,7 @@ impl Server {
             }
             let parts = line.split('\t').collect::<Vec<_>>();
             match parts.first().copied() {
-                Some("table") if parts.len() == 4 => {
+                Some("table") if parts.len() == 4 || parts.len() == 5 => {
                     let table_name = metadata_unescape(parts[1])?;
                     let oid = ultrasql_core::Oid::new(parts[2].parse::<u32>().map_err(|err| {
                         ServerError::Ddl(format!(
@@ -4435,10 +4441,17 @@ impl Server {
                             line_no + 1
                         ))
                     })?;
-                    rows.entry(oid)
-                        .or_insert_with(|| (table_name, TableRowSecurity::default()))
-                        .1
-                        .enabled = enabled;
+                    let owner_role = if parts.len() == 5 {
+                        metadata_unescape(parts[4])?.to_ascii_lowercase()
+                    } else {
+                        String::new()
+                    };
+                    let entry = rows
+                        .entry(oid)
+                        .or_insert_with(|| (String::new(), TableRowSecurity::default()));
+                    entry.0 = table_name;
+                    entry.1.enabled = enabled;
+                    entry.1.owner_role = owner_role;
                 }
                 Some("policy") if parts.len() == 11 => {
                     let oid = ultrasql_core::Oid::new(parts[1].parse::<u32>().map_err(|err| {

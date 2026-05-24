@@ -41,45 +41,38 @@ pub(super) fn bind_revoke_privileges(s: &RevokeStmt) -> Result<LogicalPlan, supe
 pub(super) fn bind_alter_default_privileges(
     s: &AlterDefaultPrivilegesStmt,
 ) -> Result<LogicalPlan, super::PlanError> {
-    let (
-        operation,
-        privileges,
-        object_kind,
-        grantees,
-        grant_option,
-        grant_option_for,
-        cascade,
-    ) = match &s.action {
-        DefaultPrivilegeAction::Grant {
-            privileges,
-            object_kind,
-            grantees,
-            grant_option,
-        } => (
-            LogicalDefaultPrivilegeOperation::Grant,
-            privileges,
-            *object_kind,
-            grantees,
-            *grant_option,
-            false,
-            false,
-        ),
-        DefaultPrivilegeAction::Revoke {
-            grant_option_for,
-            privileges,
-            object_kind,
-            grantees,
-            cascade,
-        } => (
-            LogicalDefaultPrivilegeOperation::Revoke,
-            privileges,
-            *object_kind,
-            grantees,
-            false,
-            *grant_option_for,
-            *cascade,
-        ),
-    };
+    let (operation, privileges, object_kind, grantees, grant_option, grant_option_for, cascade) =
+        match &s.action {
+            DefaultPrivilegeAction::Grant {
+                privileges,
+                object_kind,
+                grantees,
+                grant_option,
+            } => (
+                LogicalDefaultPrivilegeOperation::Grant,
+                privileges,
+                *object_kind,
+                grantees,
+                *grant_option,
+                false,
+                false,
+            ),
+            DefaultPrivilegeAction::Revoke {
+                grant_option_for,
+                privileges,
+                object_kind,
+                grantees,
+                cascade,
+            } => (
+                LogicalDefaultPrivilegeOperation::Revoke,
+                privileges,
+                *object_kind,
+                grantees,
+                false,
+                *grant_option_for,
+                *cascade,
+            ),
+        };
     let object_kind = bind_object_kind(object_kind);
     if object_kind == LogicalPrivilegeObjectKind::Database {
         return Err(PlanError::NotSupported(

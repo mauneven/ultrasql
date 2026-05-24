@@ -214,6 +214,8 @@ path:
   checks.
 - Restrictive policies narrow permissive policy matches.
 - `INSERT ... VALUES` rows are checked against applicable `WITH CHECK` clauses.
+- Table-owner, superuser, and `BYPASSRLS` roles bypass policy injection/checks.
+- Policy metadata, enabled state, and table owner rehydrate after restart.
 
 The enforced predicate shape is intentionally narrow:
 
@@ -222,8 +224,7 @@ tenant_id = current_setting('ultrasql.tenant_id', true)
 ```
 
 Broader PostgreSQL RLS features remain open: role-qualified policies,
-owner/bypass behavior, policy persistence through restart, `INSERT ... SELECT`
-`WITH CHECK`, and full `UPDATE` new-row checks.
+`INSERT ... SELECT` `WITH CHECK`, and full `UPDATE` new-row checks.
 
 RAG helper enforcement also comes from:
 

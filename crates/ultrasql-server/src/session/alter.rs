@@ -179,6 +179,9 @@ where
             .as_ref()
             .map(|existing| existing.as_ref().clone())
             .unwrap_or_default();
+        if runtime.owner_role.is_empty() {
+            runtime.owner_role = self.current_user.to_ascii_lowercase();
+        }
         runtime.enabled = true;
         self.state.row_security.insert(entry.oid, Arc::new(runtime));
         if let Err(e) = self.state.persist_row_security_metadata() {

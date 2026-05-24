@@ -31,6 +31,7 @@ pub use pg_authid::{
     AuthCatalog, InMemoryAuthCatalog, PasswordHash, RoleEntry, RoleEntryChanges, RoleMembership,
 };
 pub use privileges::{
-    InMemoryPrivilegeCatalog, PrivilegeGrant, PrivilegeKind, PrivilegeObjectKind, PrivilegeRequest,
+    DefaultPrivilegeUpdate, InMemoryPrivilegeCatalog, PrivilegeGrant, PrivilegeKind,
+    PrivilegeObjectKind, PrivilegeRequest,
 };
 pub use scram::{AuthError, ScramSha256Server};

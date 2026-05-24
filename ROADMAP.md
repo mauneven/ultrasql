@@ -2044,10 +2044,10 @@ same host.
   predicate injection, command-specific policies, permissive/restrictive
   policy combination, and `INSERT ... VALUES` `WITH CHECK` enforcement work
   for the documented RAG policy shape
-  `tenant_id = current_setting('ultrasql.tenant_id', true)`. Remaining work:
-  persistent policy catalog/restart bootstrap, owner/bypass behavior,
-  `INSERT ... SELECT`, update new-row checks, role-scoped policies, and tenant
-  certification artifacts.
+  `tenant_id = current_setting('ultrasql.tenant_id', true)`. Policy metadata
+  now persists across restart with table-owner, superuser, and `BYPASSRLS`
+  bypass semantics. Remaining work: `INSERT ... SELECT`, update new-row
+  checks, role-scoped policies, and tenant certification artifacts.
 - [ ] **AI/vector benchmark certification slice** — AI gauntlet measured artifacts
   now include exact top-k, HNSW ANN recall/latency, hybrid search
   latency, filtered vector search with tenant/category predicates, RAG
@@ -2070,8 +2070,8 @@ same host.
 - [x] `GRANT / REVOKE` on tables, schemas, databases, sequences, functions — in-memory privilege catalog plus `has_*_privilege` checks.
 - [x] Column-level privileges — `GRANT SELECT(col) / INSERT(col) / UPDATE(col)` catalog rows, `has_column_privilege`, and Simple/Extended Query enforcement for SELECT reads plus INSERT/UPDATE target columns.
 - [x] Role inheritance + `SET ROLE` — `GRANT role TO role`, `REVOKE role FROM role`, transitive membership, cycle rejection, `INHERIT` / `NOINHERIT` automatic privilege application, `SET ROLE` / `RESET ROLE` identity changes, `current_user` / `session_user`, and Simple/Extended privilege enforcement now honor the effective role set. Covered by parser/binder/auth unit tests plus `privilege_catalog_round_trip.rs`.
-- [ ] Default privileges (`ALTER DEFAULT PRIVILEGES`)
-- [ ] Row-level security: role/owner/bypass/restart semantics (tenant command-specific + permissive/restrictive policy slice done)
+- [x] Default privileges (`ALTER DEFAULT PRIVILEGES`) — parser/binder support for `FOR ROLE` / `IN SCHEMA` plus GRANT/REVOKE default ACL templates for future tables and sequences. CREATE TABLE, SERIAL-created sequences, and CREATE SEQUENCE apply matching templates; revoke changes future objects only. Covered by parser/binder/auth unit tests plus `privilege_catalog_round_trip.rs`.
+- [x] Row-level security: owner/bypass/restart semantics — RLS metadata records the table owner, persists policy/enable state through `pg_row_security.meta`, skips policy injection/checks for catalog-known table owners, superusers, and roles with `BYPASSRLS`, and rehydrates those semantics after restart. Covered by `rls_round_trip.rs`.
 - [x] `log_connections`, `log_min_duration_statement`, `log_statement`
 
 ### ORM Compatibility

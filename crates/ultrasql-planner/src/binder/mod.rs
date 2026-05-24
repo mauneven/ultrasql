@@ -90,8 +90,8 @@ use self::dml::{bind_delete, bind_insert, bind_update};
 use self::expr_bind::{bind_expr, bind_expr_with_ctes};
 use self::from::bind_from;
 use self::privilege::{
-    bind_alter_default_privileges, bind_grant_privileges, bind_grant_role,
-    bind_revoke_privileges, bind_revoke_role,
+    bind_alter_default_privileges, bind_grant_privileges, bind_grant_role, bind_revoke_privileges,
+    bind_revoke_role,
 };
 use self::util::{
     bind_order_by, bind_returning, bind_unsigned_literal, build_returning_schema,

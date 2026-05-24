@@ -35,6 +35,7 @@ use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
 use super::{PendingLogicalChange, Session};
+use crate::auth::AuthCatalog;
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
@@ -1297,7 +1298,22 @@ where
     ) -> Option<Arc<crate::TableRowSecurity>> {
         let guard = self.state.row_security.get(&table_oid)?;
         let runtime = Arc::clone(guard.value());
-        if runtime.enabled { Some(runtime) } else { None }
+        if runtime.enabled && !self.bypasses_row_security(&runtime) {
+            Some(runtime)
+        } else {
+            None
+        }
+    }
+
+    fn bypasses_row_security(&self, runtime: &crate::TableRowSecurity) -> bool {
+        let current_user = self.current_user.to_ascii_lowercase();
+        let Some(role) = self.state.role_catalog.lookup_role(&current_user) else {
+            return false;
+        };
+        role.is_superuser
+            || role.bypass_rls
+            || (!runtime.owner_role.is_empty()
+                && runtime.owner_role.eq_ignore_ascii_case(&current_user))
     }
 
     fn rls_using_predicate(

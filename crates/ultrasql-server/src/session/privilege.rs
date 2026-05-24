@@ -2,12 +2,14 @@
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use ultrasql_planner::{
-    LogicalDefaultPrivilegeOperation, LogicalPlan, LogicalPrivilegeKind, LogicalPrivilegeObjectKind,
-    LogicalPrivilegeSpec,
+    LogicalDefaultPrivilegeOperation, LogicalPlan, LogicalPrivilegeKind,
+    LogicalPrivilegeObjectKind, LogicalPrivilegeSpec,
 };
 
 use super::Session;
-use crate::auth::{AuthCatalog, PrivilegeKind, PrivilegeObjectKind, PrivilegeRequest};
+use crate::auth::{
+    AuthCatalog, DefaultPrivilegeUpdate, PrivilegeKind, PrivilegeObjectKind, PrivilegeRequest,
+};
 use crate::error::ServerError;
 use crate::result_encoder::{self, SelectResult};
 
@@ -96,15 +98,17 @@ where
         let privilege_requests = convert_privileges(privileges);
         match operation {
             LogicalDefaultPrivilegeOperation::Grant => {
-                self.state.privilege_catalog.grant_default_many(
-                    &self.current_user,
-                    &owner_roles,
-                    schemas,
-                    convert_object_kind(*object_kind),
-                    grantees,
-                    &privilege_requests,
-                    *grant_option,
-                );
+                self.state
+                    .privilege_catalog
+                    .grant_default_many(DefaultPrivilegeUpdate {
+                        grantor: &self.current_user,
+                        owner_roles: &owner_roles,
+                        schemas,
+                        object_kind: convert_object_kind(*object_kind),
+                        grantees,
+                        privileges: &privilege_requests,
+                        grant_option: *grant_option,
+                    });
             }
             LogicalDefaultPrivilegeOperation::Revoke => {
                 self.state.privilege_catalog.revoke_default_many(

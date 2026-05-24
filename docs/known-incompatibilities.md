@@ -26,11 +26,12 @@ release status.
 
 ## Security and administration
 
-- Role/privilege coverage is incomplete compared with PostgreSQL.
-- Column-level privileges, default privileges, full role inheritance, and broad
-  ecosystem admin-tool introspection remain open.
-- Row-level security has partial tenant/policy coverage but is not yet claimed
-  as full PostgreSQL parity.
+- Role/privilege persistence is incomplete compared with PostgreSQL; roles and
+  ACLs still use in-memory catalogs.
+- Broad ecosystem admin-tool introspection remains open.
+- Row-level security covers the documented tenant policy shape with
+  owner/bypass/restart semantics but is not yet claimed as full PostgreSQL
+  parity.
 
 ## Replication and backup
 
