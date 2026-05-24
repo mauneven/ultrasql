@@ -364,6 +364,12 @@ where
                 .map(|a| LogicalAggregateExpr {
                     func: a.func,
                     arg: a.arg.as_ref().map(f),
+                    direct_arg: a.direct_arg.as_ref().map(f),
+                    order_by: a.order_by.as_ref().map(|key| ultrasql_planner::SortKey {
+                        expr: f(&key.expr),
+                        asc: key.asc,
+                        nulls_first: key.nulls_first,
+                    }),
                     distinct: a.distinct,
                     output_name: a.output_name.clone(),
                     data_type: a.data_type.clone(),

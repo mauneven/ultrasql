@@ -1582,6 +1582,9 @@ pub enum Expr {
         args: Vec<Self>,
         /// Whether the argument list was `DISTINCT`-prefixed.
         distinct: bool,
+        /// Optional ordered-set aggregate sort specification from
+        /// `WITHIN GROUP (ORDER BY ...)`.
+        within_group: Option<Vec<OrderItem>>,
         /// Optional `OVER (...)` clause turning this into a window
         /// function call. `None` for ordinary scalar / aggregate calls.
         over: Option<WindowSpec>,

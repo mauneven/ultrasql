@@ -162,9 +162,13 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
             ..
         } => {
             group_by.iter().any(expr_contains_outer)
-                || aggregates
-                    .iter()
-                    .any(|a| a.arg.as_ref().is_some_and(expr_contains_outer))
+                || aggregates.iter().any(|a| {
+                    a.arg.as_ref().is_some_and(expr_contains_outer)
+                        || a.direct_arg.as_ref().is_some_and(expr_contains_outer)
+                        || a.order_by
+                            .as_ref()
+                            .is_some_and(|key| expr_contains_outer(&key.expr))
+                })
                 || plan_contains_outer_column(input)
         }
         LogicalPlan::Join { left, right, .. } | LogicalPlan::SetOp { left, right, .. } => {

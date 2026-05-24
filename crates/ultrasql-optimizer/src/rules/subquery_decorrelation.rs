@@ -2232,6 +2232,8 @@ mod tests {
             aggregates: vec![LogicalAggregateExpr {
                 func: AggregateFunc::Avg,
                 arg: Some(col("data", 1, DataType::Int32)),
+                direct_arg: None,
+                order_by: None,
                 distinct: false,
                 output_name: "avg".to_owned(),
                 data_type: DataType::Float64,

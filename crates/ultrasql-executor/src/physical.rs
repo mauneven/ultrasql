@@ -1098,6 +1098,8 @@ mod tests {
             aggregates: vec![LogicalAggregateExpr {
                 func: AggregateFunc::CountStar,
                 arg: None,
+                direct_arg: None,
+                order_by: None,
                 distinct: false,
                 output_name: "cnt".into(),
                 data_type: DataType::Int64,

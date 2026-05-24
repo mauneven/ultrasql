@@ -233,6 +233,12 @@ fn infer_into(
                 if let Some(e) = &a.arg {
                     infer_in_expr(e, None, out);
                 }
+                if let Some(e) = &a.direct_arg {
+                    infer_in_expr(e, None, out);
+                }
+                if let Some(key) = &a.order_by {
+                    infer_in_expr(&key.expr, None, out);
+                }
             }
         }
         LogicalPlan::SetOp { left, right, .. } => {
@@ -503,6 +509,12 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
             for a in aggregates {
                 if let Some(e) = &a.arg {
                     walk_expr(e, f);
+                }
+                if let Some(e) = &a.direct_arg {
+                    walk_expr(e, f);
+                }
+                if let Some(key) = &a.order_by {
+                    walk_expr(&key.expr, f);
                 }
             }
         }

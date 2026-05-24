@@ -68,6 +68,7 @@ fn rewrite_expr(expr: &Expr, out: &mut Vec<WindowExtraction>) -> Expr {
             distinct,
             over: Some(spec),
             span,
+            ..
         } => {
             let output_name = format!("$wn_{}", out.len());
             out.push(WindowExtraction {

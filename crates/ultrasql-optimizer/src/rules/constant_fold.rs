@@ -253,11 +253,22 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
                 .iter()
                 .map(|agg| {
                     let new_arg = agg.arg.as_ref().and_then(fold_expr);
-                    if new_arg.is_some() {
+                    let new_direct_arg = agg.direct_arg.as_ref().and_then(fold_expr);
+                    let new_order_by_expr = agg.order_by.as_ref().and_then(|key| {
+                        fold_expr(&key.expr).map(|expr| SortKey {
+                            expr,
+                            asc: key.asc,
+                            nulls_first: key.nulls_first,
+                        })
+                    });
+                    if new_arg.is_some() || new_direct_arg.is_some() || new_order_by_expr.is_some()
+                    {
                         aggs_changed = true;
                         ultrasql_planner::LogicalAggregateExpr {
                             func: agg.func,
                             arg: new_arg.or_else(|| agg.arg.clone()),
+                            direct_arg: new_direct_arg.or_else(|| agg.direct_arg.clone()),
+                            order_by: new_order_by_expr.or_else(|| agg.order_by.clone()),
                             distinct: agg.distinct,
                             output_name: agg.output_name.clone(),
                             data_type: agg.data_type.clone(),

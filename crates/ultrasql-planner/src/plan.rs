@@ -201,6 +201,10 @@ pub enum AggregateFunc {
     VarPop,
     /// `CORR(y, x)` — Pearson correlation coefficient.
     Corr,
+    /// `PERCENTILE_CONT(fraction) WITHIN GROUP (ORDER BY expr)`.
+    PercentileCont,
+    /// `PERCENTILE_DISC(fraction) WITHIN GROUP (ORDER BY expr)`.
+    PercentileDisc,
 }
 
 /// A single aggregate call in a `GROUP BY` / aggregation node.
@@ -213,6 +217,10 @@ pub struct LogicalAggregateExpr {
     pub func: AggregateFunc,
     /// The argument expression; `None` for `COUNT(*)`.
     pub arg: Option<ScalarExpr>,
+    /// Direct argument for ordered-set aggregates, such as percentile fraction.
+    pub direct_arg: Option<ScalarExpr>,
+    /// Ordered-set aggregate sort key from `WITHIN GROUP`.
+    pub order_by: Option<SortKey>,
     /// Whether `DISTINCT` was specified on the argument.
     pub distinct: bool,
     /// Output column name (from alias or derived from the call expression).
@@ -2080,6 +2088,8 @@ impl LogicalPlan {
                         AggregateFunc::VarSamp => "var_samp",
                         AggregateFunc::VarPop => "var_pop",
                         AggregateFunc::Corr => "corr",
+                        AggregateFunc::PercentileCont => "percentile_cont",
+                        AggregateFunc::PercentileDisc => "percentile_disc",
                     };
                     if let Some(arg) = &agg.arg {
                         let dist = if agg.distinct { "DISTINCT " } else { "" };
@@ -2669,6 +2679,8 @@ mod tests {
             aggregates: vec![LogicalAggregateExpr {
                 func: AggregateFunc::CountStar,
                 arg: None,
+                direct_arg: None,
+                order_by: None,
                 distinct: false,
                 output_name: "cnt".into(),
                 data_type: DataType::Int64,
@@ -2767,6 +2779,8 @@ mod tests {
             aggregates: vec![LogicalAggregateExpr {
                 func: AggregateFunc::Sum,
                 arg: Some(col("v", 0, DataType::Int32)),
+                direct_arg: None,
+                order_by: None,
                 distinct: false,
                 output_name: "total".into(),
                 data_type: DataType::Int64,

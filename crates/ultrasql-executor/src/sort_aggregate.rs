@@ -64,10 +64,19 @@ pub(crate) enum AggState {
     Stddev(f64, f64, i64),
     /// For CORR(y, x): (`sum_x`, `sum_y`, `sum_xy`, `sum_x2`, `sum_y2`, count).
     Corr(f64, f64, f64, f64, f64, i64),
-    /// `PERCENTILE_CONT`: accumulates all values for linear interpolation.
-    PercentileCont(Vec<f64>, f64 /* fraction */),
-    /// `PERCENTILE_DISC`: accumulates all values for discrete selection.
-    PercentileDisc(Vec<f64>, f64 /* fraction */),
+    /// `PERCENTILE_CONT`: accumulates numeric values for interpolation.
+    PercentileCont {
+        values: Vec<f64>,
+        fraction: Option<f64>,
+        asc: bool,
+    },
+    /// `PERCENTILE_DISC`: accumulates values and returns one ordered input.
+    PercentileDisc {
+        values: Vec<Value>,
+        fraction: Option<f64>,
+        asc: bool,
+        nulls_first: bool,
+    },
 }
 
 #[allow(clippy::missing_const_for_fn)]
@@ -87,6 +96,26 @@ fn init_state(agg: &LogicalAggregateExpr) -> AggState {
         AggregateFunc::Corr => AggState::Corr(0.0, 0.0, 0.0, 0.0, 0.0, 0),
         AggregateFunc::StddevSamp | AggregateFunc::StddevPop => AggState::Stddev(0.0, 0.0, 0),
         AggregateFunc::VarSamp | AggregateFunc::VarPop => AggState::Variance(0.0, 0.0, 0),
+        AggregateFunc::PercentileCont => {
+            let asc = agg.order_by.as_ref().is_none_or(|key| key.asc);
+            AggState::PercentileCont {
+                values: Vec::new(),
+                fraction: None,
+                asc,
+            }
+        }
+        AggregateFunc::PercentileDisc => {
+            let (asc, nulls_first) = agg
+                .order_by
+                .as_ref()
+                .map_or((true, false), |key| (key.asc, key.nulls_first));
+            AggState::PercentileDisc {
+                values: Vec::new(),
+                fraction: None,
+                asc,
+                nulls_first,
+            }
+        }
     }
 }
 
@@ -221,11 +250,29 @@ fn accumulate(
                 *cnt = cnt.saturating_add(1);
             }
         }
-        AggState::PercentileCont(vals, _) | AggState::PercentileDisc(vals, _) => {
+        AggState::PercentileCont {
+            values, fraction, ..
+        } => {
+            update_percentile_fraction(fraction, percentile_fraction(agg, row)?)?;
             if let Some(v) = arg {
-                if let Some(x) = to_f64(&v) {
-                    vals.push(x);
+                if !v.is_null() {
+                    let x = to_f64(&v).ok_or_else(|| {
+                        ExecError::TypeMismatch(
+                            "percentile_cont requires numeric order values".to_owned(),
+                        )
+                    })?;
+                    values.push(x);
                 }
+            }
+        }
+        AggState::PercentileDisc {
+            values, fraction, ..
+        } => {
+            update_percentile_fraction(fraction, percentile_fraction(agg, row)?)?;
+            if let Some(v) = arg
+                && !v.is_null()
+            {
+                values.push(v);
             }
         }
     }
@@ -306,65 +353,128 @@ fn finalise(state: &AggState) -> Value {
                 Value::Float64(num / den)
             }
         }
-        AggState::PercentileCont(vals, frac) => {
-            if vals.is_empty() {
-                return Value::Null;
-            }
-            let mut sorted = vals.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let n = sorted.len();
-            // Cast sample count to f64 for the percentile arithmetic.
-            // The aggregate state is `Vec<f64>`; sample counts above
-            // `2^53` are not representable so we accept the precision
-            // loss — the percentile is a statistic, not an index.
-            #[allow(
-                clippy::cast_precision_loss,
-                reason = "percentile arithmetic; sample count rarely above 2^53"
-            )]
-            let n_f64 = n as f64;
-            let row_number = frac * (n_f64 - 1.0);
-            // Truncate to usize index; row_number is non-negative and
-            // bounded by n - 1 above, so the cast cannot wrap.
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "row_number bounded by [0, n - 1]"
-            )]
-            let lo = row_number.floor() as usize;
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "row_number bounded by [0, n - 1]"
-            )]
-            let hi = row_number.ceil() as usize;
-            if lo == hi {
-                Value::Float64(sorted[lo])
-            } else {
-                #[allow(
-                    clippy::cast_precision_loss,
-                    reason = "lo is < 2^53 in practice; percentile interpolation"
-                )]
-                let frac_part = row_number - lo as f64;
-                Value::Float64(sorted[hi].mul_add(frac_part, sorted[lo] * (1.0 - frac_part)))
-            }
-        }
-        AggState::PercentileDisc(vals, frac) => {
-            if vals.is_empty() {
-                return Value::Null;
-            }
-            let mut sorted = vals.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            #[allow(
-                clippy::cast_precision_loss,
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                reason = "percentile_disc arithmetic; idx bounded by ceil(frac * len) ≤ len"
-            )]
-            let idx = (frac * sorted.len() as f64).ceil() as usize;
-            let idx = idx.saturating_sub(1).min(sorted.len() - 1);
-            Value::Float64(sorted[idx])
-        }
+        AggState::PercentileCont {
+            values,
+            fraction,
+            asc,
+        } => finalise_percentile_cont(values, *fraction, *asc),
+        AggState::PercentileDisc {
+            values,
+            fraction,
+            asc,
+            nulls_first,
+        } => finalise_percentile_disc(values, *fraction, *asc, *nulls_first),
     }
+}
+
+fn percentile_fraction(
+    agg: &LogicalAggregateExpr,
+    row: &[Value],
+) -> Result<Option<f64>, ExecError> {
+    let Some(direct_arg) = &agg.direct_arg else {
+        return Err(ExecError::TypeMismatch(
+            "ordered-set percentile missing fraction".to_owned(),
+        ));
+    };
+    let value = Eval::new(direct_arg.clone())
+        .eval(row)
+        .unwrap_or(Value::Null);
+    if value.is_null() {
+        return Ok(None);
+    }
+    let fraction = to_f64(&value)
+        .ok_or_else(|| ExecError::TypeMismatch("percentile fraction must be numeric".to_owned()))?;
+    if !(0.0..=1.0).contains(&fraction) || !fraction.is_finite() {
+        return Err(ExecError::TypeMismatch(
+            "percentile fraction must be between 0 and 1".to_owned(),
+        ));
+    }
+    Ok(Some(fraction))
+}
+
+fn update_percentile_fraction(slot: &mut Option<f64>, next: Option<f64>) -> Result<(), ExecError> {
+    let Some(next) = next else {
+        return Ok(());
+    };
+    if let Some(existing) = slot {
+        if (*existing - next).abs() > f64::EPSILON {
+            return Err(ExecError::TypeMismatch(
+                "percentile fraction must be constant per group".to_owned(),
+            ));
+        }
+    } else {
+        *slot = Some(next);
+    }
+    Ok(())
+}
+
+fn finalise_percentile_cont(values: &[f64], fraction: Option<f64>, asc: bool) -> Value {
+    let Some(fraction) = fraction else {
+        return Value::Null;
+    };
+    if values.is_empty() {
+        return Value::Null;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if !asc {
+        sorted.reverse();
+    }
+    let n = sorted.len();
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "percentile arithmetic; sample count rarely above 2^53"
+    )]
+    let n_f64 = n as f64;
+    let row_number = fraction * (n_f64 - 1.0);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "row_number bounded by [0, n - 1]"
+    )]
+    let lo = row_number.floor() as usize;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "row_number bounded by [0, n - 1]"
+    )]
+    let hi = row_number.ceil() as usize;
+    if lo == hi {
+        return Value::Float64(sorted[lo]);
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "lo is < 2^53 in practice; percentile interpolation"
+    )]
+    let frac_part = row_number - lo as f64;
+    Value::Float64(sorted[hi].mul_add(frac_part, sorted[lo] * (1.0 - frac_part)))
+}
+
+fn finalise_percentile_disc(
+    values: &[Value],
+    fraction: Option<f64>,
+    asc: bool,
+    nulls_first: bool,
+) -> Value {
+    let Some(fraction) = fraction else {
+        return Value::Null;
+    };
+    if values.is_empty() {
+        return Value::Null;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| {
+        let ord = crate::sort::compare_values_nullable(a, b, nulls_first);
+        if asc { ord } else { ord.reverse() }
+    });
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "percentile_disc arithmetic; idx bounded by ceil(frac * len) <= len"
+    )]
+    let idx = (fraction * sorted.len() as f64).ceil() as usize;
+    sorted[idx.saturating_sub(1).min(sorted.len() - 1)].clone()
 }
 
 fn json_agg_text(items: &[Value]) -> String {
@@ -708,8 +818,17 @@ pub(crate) const fn init_stat_state(func: &StatAggFunc) -> AggState {
         StatAggFunc::Stddev => AggState::Stddev(0.0, 0.0, 0),
         StatAggFunc::Variance => AggState::Variance(0.0, 0.0, 0),
         StatAggFunc::Corr => AggState::Corr(0.0, 0.0, 0.0, 0.0, 0.0, 0),
-        StatAggFunc::PercentileCont(f) => AggState::PercentileCont(Vec::new(), *f),
-        StatAggFunc::PercentileDisc(f) => AggState::PercentileDisc(Vec::new(), *f),
+        StatAggFunc::PercentileCont(f) => AggState::PercentileCont {
+            values: Vec::new(),
+            fraction: Some(*f),
+            asc: true,
+        },
+        StatAggFunc::PercentileDisc(f) => AggState::PercentileDisc {
+            values: Vec::new(),
+            fraction: Some(*f),
+            asc: true,
+            nulls_first: false,
+        },
     }
 }
 
@@ -722,8 +841,11 @@ pub(crate) fn accumulate_stat(state: &mut AggState, x: f64) {
             *sx2 += x * x;
             *cnt = cnt.saturating_add(1);
         }
-        AggState::PercentileCont(vals, _) | AggState::PercentileDisc(vals, _) => {
-            vals.push(x);
+        AggState::PercentileCont { values, .. } => {
+            values.push(x);
+        }
+        AggState::PercentileDisc { values, .. } => {
+            values.push(Value::Float64(x));
         }
         _ => {}
     }
@@ -781,6 +903,8 @@ mod tests {
         LogicalAggregateExpr {
             func: AggregateFunc::CountStar,
             arg: None,
+            direct_arg: None,
+            order_by: None,
             distinct: false,
             output_name: "cnt".into(),
             data_type: DataType::Int64,

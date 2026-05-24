@@ -109,6 +109,8 @@ fn bench_hash_aggregate(c: &mut Criterion) {
                     vec![LogicalAggregateExpr {
                         func: AggregateFunc::CountStar,
                         arg: None,
+                        direct_arg: None,
+                        order_by: None,
                         distinct: false,
                         output_name: "cnt".into(),
                         data_type: DataType::Int64,
@@ -152,6 +154,8 @@ fn bench_sort_aggregate(c: &mut Criterion) {
                     vec![LogicalAggregateExpr {
                         func: AggregateFunc::CountStar,
                         arg: None,
+                        direct_arg: None,
+                        order_by: None,
                         distinct: false,
                         output_name: "cnt".into(),
                         data_type: DataType::Int64,

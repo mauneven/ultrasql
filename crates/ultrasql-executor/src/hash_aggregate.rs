@@ -1478,6 +1478,19 @@ enum AggState {
         sample: bool,
         sqrt: bool,
     },
+    /// `PERCENTILE_CONT`: collect numeric samples for final interpolation.
+    PercentileCont {
+        values: Vec<f64>,
+        fraction: Option<f64>,
+        asc: bool,
+    },
+    /// `PERCENTILE_DISC`: collect ordered-set samples and return one input value.
+    PercentileDisc {
+        values: Vec<Value>,
+        fraction: Option<f64>,
+        asc: bool,
+        nulls_first: bool,
+    },
 }
 
 /// Initialise one [`AggState`] for the given aggregate descriptor.
@@ -1489,7 +1502,29 @@ fn init_state_for(agg: &LogicalAggregateExpr) -> AggState {
             seen: HashSet::new(),
         };
     }
-    init_state_for_func(agg.func)
+    match agg.func {
+        AggregateFunc::PercentileCont => {
+            let asc = agg.order_by.as_ref().is_none_or(|key| key.asc);
+            AggState::PercentileCont {
+                values: Vec::new(),
+                fraction: None,
+                asc,
+            }
+        }
+        AggregateFunc::PercentileDisc => {
+            let (asc, nulls_first) = agg
+                .order_by
+                .as_ref()
+                .map_or((true, false), |key| (key.asc, key.nulls_first));
+            AggState::PercentileDisc {
+                values: Vec::new(),
+                fraction: None,
+                asc,
+                nulls_first,
+            }
+        }
+        _ => init_state_for_func(agg.func),
+    }
 }
 
 #[allow(clippy::missing_const_for_fn)] // not const due to Vec::new() in variants
@@ -1542,6 +1577,17 @@ fn init_state_for_func(func: AggregateFunc) -> AggState {
             sample: false,
             sqrt: false,
         },
+        AggregateFunc::PercentileCont => AggState::PercentileCont {
+            values: Vec::new(),
+            fraction: None,
+            asc: true,
+        },
+        AggregateFunc::PercentileDisc => AggState::PercentileDisc {
+            values: Vec::new(),
+            fraction: None,
+            asc: true,
+            nulls_first: false,
+        },
     }
 }
 
@@ -1556,6 +1602,16 @@ fn accumulate(
     agg: &LogicalAggregateExpr,
     row: &[Value],
 ) -> Result<(), ExecError> {
+    match state {
+        AggState::PercentileCont {
+            values, fraction, ..
+        } => return accumulate_percentile_cont(values, fraction, agg, row),
+        AggState::PercentileDisc {
+            values, fraction, ..
+        } => return accumulate_percentile_disc(values, fraction, agg, row),
+        _ => {}
+    }
+
     // Evaluate the argument expression (if any).
     let arg_val: Option<Value> = agg
         .arg
@@ -1708,8 +1764,96 @@ fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), 
                 }
             }
         }
+        AggState::PercentileCont { .. } | AggState::PercentileDisc { .. } => {
+            unreachable!("percentile states handled before dispatch");
+        }
     }
     Ok(())
+}
+
+fn accumulate_percentile_cont(
+    values: &mut Vec<f64>,
+    fraction: &mut Option<f64>,
+    agg: &LogicalAggregateExpr,
+    row: &[Value],
+) -> Result<(), ExecError> {
+    update_percentile_fraction(fraction, percentile_fraction(agg, row)?)?;
+    let sample = percentile_sample(agg, row)?;
+    if sample.is_null() {
+        return Ok(());
+    }
+    let value = value_as_f64(&sample).ok_or_else(|| {
+        ExecError::TypeMismatch("percentile_cont requires numeric order values".to_owned())
+    })?;
+    values.push(value);
+    Ok(())
+}
+
+fn accumulate_percentile_disc(
+    values: &mut Vec<Value>,
+    fraction: &mut Option<f64>,
+    agg: &LogicalAggregateExpr,
+    row: &[Value],
+) -> Result<(), ExecError> {
+    update_percentile_fraction(fraction, percentile_fraction(agg, row)?)?;
+    let sample = percentile_sample(agg, row)?;
+    if !sample.is_null() {
+        values.push(sample);
+    }
+    Ok(())
+}
+
+fn percentile_fraction(
+    agg: &LogicalAggregateExpr,
+    row: &[Value],
+) -> Result<Option<f64>, ExecError> {
+    let direct_arg = agg.direct_arg.as_ref().ok_or_else(|| {
+        ExecError::TypeMismatch("ordered-set percentile missing fraction".to_owned())
+    })?;
+    let value = Eval::new(direct_arg.clone())
+        .eval(row)
+        .unwrap_or(Value::Null);
+    if value.is_null() {
+        return Ok(None);
+    }
+    let fraction = value_as_f64(&value)
+        .ok_or_else(|| ExecError::TypeMismatch("percentile fraction must be numeric".to_owned()))?;
+    if !(0.0..=1.0).contains(&fraction) || !fraction.is_finite() {
+        return Err(ExecError::TypeMismatch(
+            "percentile fraction must be between 0 and 1".to_owned(),
+        ));
+    }
+    Ok(Some(fraction))
+}
+
+fn update_percentile_fraction(slot: &mut Option<f64>, next: Option<f64>) -> Result<(), ExecError> {
+    let Some(next) = next else {
+        return Ok(());
+    };
+    if let Some(existing) = slot {
+        if (*existing - next).abs() > f64::EPSILON {
+            return Err(ExecError::TypeMismatch(
+                "percentile fraction must be constant per group".to_owned(),
+            ));
+        }
+    } else {
+        *slot = Some(next);
+    }
+    Ok(())
+}
+
+fn percentile_sample(agg: &LogicalAggregateExpr, row: &[Value]) -> Result<Value, ExecError> {
+    let sample_expr = agg
+        .order_by
+        .as_ref()
+        .map(|key| &key.expr)
+        .or(agg.arg.as_ref())
+        .ok_or_else(|| {
+            ExecError::TypeMismatch("ordered-set percentile missing order key".to_owned())
+        })?;
+    Ok(Eval::new(sample_expr.clone())
+        .eval(row)
+        .unwrap_or(Value::Null))
 }
 
 /// Coerce a numeric `Value` to `f64` for floating-point folds.
@@ -1720,6 +1864,7 @@ fn value_as_f64(v: &Value) -> Option<f64> {
         Value::Int64(x) => Some(*x as f64),
         Value::Float32(x) => Some(f64::from(*x)),
         Value::Float64(x) => Some(*x),
+        Value::Decimal { value, scale } => Some(decimal_to_f64(*value, *scale)),
         _ => None,
     }
 }
@@ -1810,7 +1955,87 @@ fn finalise(state: &AggState) -> Value {
             let var = m2 / denom as f64;
             Value::Float64(if *sqrt { var.sqrt() } else { var })
         }
+        AggState::PercentileCont {
+            values,
+            fraction,
+            asc,
+        } => finalise_percentile_cont(values, *fraction, *asc),
+        AggState::PercentileDisc {
+            values,
+            fraction,
+            asc,
+            nulls_first,
+        } => finalise_percentile_disc(values, *fraction, *asc, *nulls_first),
     }
+}
+
+fn finalise_percentile_cont(values: &[f64], fraction: Option<f64>, asc: bool) -> Value {
+    let Some(fraction) = fraction else {
+        return Value::Null;
+    };
+    if values.is_empty() {
+        return Value::Null;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if !asc {
+        sorted.reverse();
+    }
+    let n = sorted.len();
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "percentile arithmetic; sample count rarely above 2^53"
+    )]
+    let n_f64 = n as f64;
+    let row_number = fraction * (n_f64 - 1.0);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "row_number bounded by [0, n - 1]"
+    )]
+    let lo = row_number.floor() as usize;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "row_number bounded by [0, n - 1]"
+    )]
+    let hi = row_number.ceil() as usize;
+    if lo == hi {
+        return Value::Float64(sorted[lo]);
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "lo is < 2^53 in practice; percentile interpolation"
+    )]
+    let frac_part = row_number - lo as f64;
+    Value::Float64(sorted[hi].mul_add(frac_part, sorted[lo] * (1.0 - frac_part)))
+}
+
+fn finalise_percentile_disc(
+    values: &[Value],
+    fraction: Option<f64>,
+    asc: bool,
+    nulls_first: bool,
+) -> Value {
+    let Some(fraction) = fraction else {
+        return Value::Null;
+    };
+    if values.is_empty() {
+        return Value::Null;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| {
+        let ord = crate::sort::compare_values_nullable(a, b, nulls_first);
+        if asc { ord } else { ord.reverse() }
+    });
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "percentile_disc arithmetic; idx bounded by ceil(frac * len) <= len"
+    )]
+    let idx = (fraction * sorted.len() as f64).ceil() as usize;
+    sorted[idx.saturating_sub(1).min(sorted.len() - 1)].clone()
 }
 
 fn json_agg_text(items: &[Value]) -> String {
@@ -2004,6 +2229,8 @@ mod tests {
         LogicalAggregateExpr {
             func: AggregateFunc::CountStar,
             arg: None,
+            direct_arg: None,
+            order_by: None,
             distinct: false,
             output_name: "cnt".into(),
             data_type: DataType::Int64,
@@ -2014,6 +2241,8 @@ mod tests {
         LogicalAggregateExpr {
             func: AggregateFunc::Sum,
             arg: Some(col(name, index, DataType::Int64)),
+            direct_arg: None,
+            order_by: None,
             distinct: false,
             output_name: "total".into(),
             data_type: DataType::Int64,
@@ -2024,6 +2253,8 @@ mod tests {
         LogicalAggregateExpr {
             func: AggregateFunc::Count,
             arg: Some(col(name, index, data_type)),
+            direct_arg: None,
+            order_by: None,
             distinct: true,
             output_name: "distinct_count".into(),
             data_type: DataType::Int64,
@@ -2034,6 +2265,8 @@ mod tests {
         LogicalAggregateExpr {
             func: AggregateFunc::Min,
             arg: Some(col(name, index, DataType::Int64)),
+            direct_arg: None,
+            order_by: None,
             distinct: false,
             output_name: "mn".into(),
             data_type: DataType::Int64,
@@ -2044,6 +2277,8 @@ mod tests {
         LogicalAggregateExpr {
             func: AggregateFunc::Max,
             arg: Some(col(name, index, DataType::Int64)),
+            direct_arg: None,
+            order_by: None,
             distinct: false,
             output_name: "mx".into(),
             data_type: DataType::Int64,
@@ -2090,6 +2325,8 @@ mod tests {
                     scale: Some(2),
                 },
             }),
+            direct_arg: None,
+            order_by: None,
             distinct: false,
             output_name: "value".into(),
             data_type: DataType::Decimal {
@@ -2306,6 +2543,8 @@ mod tests {
         let count_expr_agg = LogicalAggregateExpr {
             func: AggregateFunc::Count,
             arg: Some(col("v", 0, DataType::Text { max_len: None })),
+            direct_arg: None,
+            order_by: None,
             distinct: false,
             output_name: "cnt".into(),
             data_type: DataType::Int64,
@@ -2330,6 +2569,8 @@ mod tests {
         let agg = LogicalAggregateExpr {
             func: AggregateFunc::ArrayAgg,
             arg: Some(col("val", 1, DataType::Int64)),
+            direct_arg: None,
+            order_by: None,
             distinct: false,
             output_name: "vals".into(),
             data_type: DataType::Array(Box::new(DataType::Int64)),
@@ -2451,6 +2692,8 @@ mod tests {
         let sum_val = LogicalAggregateExpr {
             func: AggregateFunc::Sum,
             arg: Some(col("val", 0, DataType::Int64)),
+            direct_arg: None,
+            order_by: None,
             distinct: false,
             output_name: "total".into(),
             data_type: DataType::Int64,
@@ -2501,6 +2744,8 @@ mod tests {
         let sum_val = LogicalAggregateExpr {
             func: AggregateFunc::Sum,
             arg: Some(col("val", 0, DataType::Int64)),
+            direct_arg: None,
+            order_by: None,
             distinct: false,
             output_name: "total".into(),
             data_type: DataType::Int64,
@@ -2550,6 +2795,8 @@ mod tests {
         let avg_v = LogicalAggregateExpr {
             func: AggregateFunc::Avg,
             arg: Some(col("v", 0, DataType::Int32)),
+            direct_arg: None,
+            order_by: None,
             distinct: false,
             output_name: "avg_v".into(),
             data_type: DataType::Float64,

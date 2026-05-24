@@ -1,9 +1,7 @@
 //! Wire-level tests for the statistical aggregates added in v0.5.
 //!
 //! Closes the v0.5 ROADMAP item "Statistical aggregates: STDDEV,
-//! VARIANCE" (CORR, PERCENTILE_CONT, and PERCENTILE_DISC are still
-//! tracked separately because they need ordered-set semantics that
-//! the executor does not expose yet).
+//! VARIANCE" plus the ordered-set percentile aggregates.
 //!
 //! Each test issues the aggregate against a known input and asserts
 //! the floating-point result inside a small tolerance.
@@ -124,6 +122,51 @@ async fn corr_matches_postgres() {
         .expect("CORR");
     let got: f64 = r.get(0);
     approx_eq(got, 0.927_426_033_5, 1e-9);
+
+    shutdown(running).await;
+}
+
+/// Ordered-set percentiles use the direct argument as the fraction and
+/// the `WITHIN GROUP` sort expression as the sample. `PERCENTILE_CONT`
+/// interpolates and returns `float8`; `PERCENTILE_DISC` returns the
+/// first ordered input whose cumulative distribution meets the fraction.
+#[tokio::test]
+async fn ordered_set_percentiles_match_postgres() {
+    let running = start_sample_server("stats_test").await;
+    let client = &running.client;
+    seed(client).await;
+
+    let r = client
+        .query_one(
+            "SELECT \
+             PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY val), \
+             PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY val) \
+             FROM t",
+            &[],
+        )
+        .await
+        .expect("ordered-set percentiles");
+
+    let continuous: f64 = r.get(0);
+    let discrete: i32 = r.get(1);
+    approx_eq(continuous, 4.5, 1e-9);
+    assert_eq!(discrete, 4);
+
+    let r = client
+        .query_one(
+            "SELECT \
+             PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY val DESC), \
+             PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY val DESC) \
+             FROM t",
+            &[],
+        )
+        .await
+        .expect("ordered-set percentiles descending");
+
+    let continuous_desc: f64 = r.get(0);
+    let discrete_desc: i32 = r.get(1);
+    approx_eq(continuous_desc, 5.5, 1e-9);
+    assert_eq!(discrete_desc, 7);
 
     shutdown(running).await;
 }

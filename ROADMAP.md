@@ -1933,9 +1933,9 @@ Every standard PostgreSQL driver and ORM works without modification.
   executor coverage.
 - [x] Aggregate statistical extension: `CORR(y, x)` has SQL-facing
   PostgreSQL-wire coverage.
-- [ ] Aggregate ordered-set extensions: PERCENTILE_CONT and
-  PERCENTILE_DISC require ordered-set aggregate plan shape before
-  SQL-surface parity can be claimed.
+- [x] Aggregate ordered-set extensions: PERCENTILE_CONT and
+  PERCENTILE_DISC have ordered-set plan shape plus PostgreSQL-wire
+  coverage for ASC/DESC percentile semantics.
 - [x] Window: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE,
   LAST_VALUE, NTH_VALUE, and NTILE have parser, binder, executor, and
   PostgreSQL-wire coverage in `crates/ultrasql-server/tests/window_round_trip.rs`.

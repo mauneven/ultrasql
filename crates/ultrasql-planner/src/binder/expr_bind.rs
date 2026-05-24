@@ -69,7 +69,12 @@ pub(super) fn bind_expr_with_ctes(
             )?),
             negated: *negated,
         }),
-        Expr::Call { name, args, .. } => {
+        Expr::Call {
+            name,
+            args,
+            within_group,
+            ..
+        } => {
             // If this is a known aggregate and we have an aggregate output schema,
             // try to resolve it as a column reference into that schema.
             let func_name = name
@@ -78,7 +83,8 @@ pub(super) fn bind_expr_with_ctes(
                 .map_or("", |p| p.value.as_str())
                 .to_ascii_lowercase();
             if is_aggregate_name(&func_name) {
-                let agg_col_name = derive_agg_output_name(&func_name, args);
+                let agg_col_name =
+                    derive_agg_output_name(&func_name, args, within_group.as_deref());
                 if let Some((i, f)) = input.find(&agg_col_name) {
                     return Ok(ScalarExpr::Column {
                         name: f.name.clone(),

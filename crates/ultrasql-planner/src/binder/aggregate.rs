@@ -2,14 +2,21 @@
 //! Split out of `binder/mod.rs` to keep each file under the 600-line ceiling.
 
 use ultrasql_core::{DataType, Field, Schema};
-use ultrasql_parser::ast::{Expr, SelectItem};
+use ultrasql_parser::ast::{Expr, NullsOrder, OrderItem, SelectItem, SortDirection};
 
 use super::expr_bind::{coerce_literal_to_match, is_supported_builtin};
 use super::expr_type::binary_result_type;
 use super::{
     AggregateFunc, Catalog, LogicalAggregateExpr, LogicalPlan, PlanError, ScalarExpr, ScopeEntry,
-    ScopeStack, bind_expr_with_ctes, derive_output_name, schema_for_qualified_binding,
+    ScopeStack, SortKey, bind_expr_with_ctes, derive_output_name, schema_for_qualified_binding,
 };
+
+struct BoundAggregateInput {
+    arg: Option<ScalarExpr>,
+    direct_arg: Option<ScalarExpr>,
+    order_by: Option<SortKey>,
+    arg_type: DataType,
+}
 
 pub(super) fn projection_item_has_aggregate(item: &SelectItem) -> bool {
     match item {
@@ -52,6 +59,8 @@ pub(super) fn is_aggregate_name(name: &str) -> bool {
             | "var_samp"
             | "var_pop"
             | "corr"
+            | "percentile_cont"
+            | "percentile_disc"
     )
 }
 
@@ -75,6 +84,8 @@ fn classify_aggregate(name: &str, args_empty: bool) -> Option<AggregateFunc> {
         "variance" | "var_samp" => Some(AggregateFunc::VarSamp),
         "var_pop" => Some(AggregateFunc::VarPop),
         "corr" => Some(AggregateFunc::Corr),
+        "percentile_cont" => Some(AggregateFunc::PercentileCont),
+        "percentile_disc" => Some(AggregateFunc::PercentileDisc),
         _ => None,
     }
 }
@@ -105,7 +116,9 @@ fn aggregate_return_type(func: AggregateFunc, arg_type: DataType) -> DataType {
         | AggregateFunc::StddevPop
         | AggregateFunc::VarSamp
         | AggregateFunc::VarPop
-        | AggregateFunc::Corr => DataType::Float64,
+        | AggregateFunc::Corr
+        | AggregateFunc::PercentileCont => DataType::Float64,
+        AggregateFunc::PercentileDisc => arg_type,
     }
 }
 
@@ -251,6 +264,7 @@ fn collect_aggregates(
             name,
             args,
             distinct,
+            within_group,
             ..
         } => {
             let func_name = name
@@ -263,8 +277,30 @@ fn collect_aggregates(
                     if n.parts.len() == 1 && n.parts[0].value == "*");
             let args_empty_or_star = args.is_empty() || is_star_arg;
             if let Some(func) = classify_aggregate(&func_name, args_empty_or_star) {
-                let (arg_expr, arg_ty) = if args_empty_or_star {
-                    (None, DataType::Null)
+                let bound = if matches!(
+                    func,
+                    AggregateFunc::PercentileCont | AggregateFunc::PercentileDisc
+                ) {
+                    bind_ordered_set_percentile(
+                        args,
+                        within_group.as_deref(),
+                        *distinct,
+                        input_schema,
+                        catalog,
+                        cte_catalog,
+                        scope,
+                    )?
+                } else if within_group.is_some() {
+                    return Err(PlanError::NotSupported(
+                        "WITHIN GROUP is supported for percentile aggregates",
+                    ));
+                } else if args_empty_or_star {
+                    BoundAggregateInput {
+                        arg: None,
+                        direct_arg: None,
+                        order_by: None,
+                        arg_type: DataType::Null,
+                    }
                 } else if func == AggregateFunc::Corr {
                     if args.len() != 2 {
                         return Err(PlanError::TypeMismatch(format!(
@@ -280,23 +316,30 @@ fn collect_aggregates(
                         ("f1".to_owned(), y.data_type()),
                         ("f2".to_owned(), x.data_type()),
                     ]);
-                    (
-                        Some(ScalarExpr::FunctionCall {
+                    BoundAggregateInput {
+                        arg: Some(ScalarExpr::FunctionCall {
                             name: "row".to_owned(),
                             args: vec![y, x],
                             data_type: row_type.clone(),
                         }),
-                        row_type,
-                    )
+                        direct_arg: None,
+                        order_by: None,
+                        arg_type: row_type,
+                    }
                 } else {
                     let bound =
                         bind_expr_with_ctes(&args[0], input_schema, catalog, cte_catalog, scope)?;
                     let ty = bound.data_type();
-                    (Some(bound), ty)
+                    BoundAggregateInput {
+                        arg: Some(bound),
+                        direct_arg: None,
+                        order_by: None,
+                        arg_type: ty,
+                    }
                 };
-                let ret_ty = aggregate_return_type(func, arg_ty);
+                let ret_ty = aggregate_return_type(func, bound.arg_type.clone());
                 let output_name = alias.map_or_else(
-                    || derive_agg_output_name(&func_name, args),
+                    || derive_agg_output_name(&func_name, args, within_group.as_deref()),
                     |a| a.value.clone(),
                 );
                 let already = out.iter().any(|a| {
@@ -306,7 +349,9 @@ fn collect_aggregates(
                 if !already {
                     out.push(LogicalAggregateExpr {
                         func,
-                        arg: arg_expr,
+                        arg: bound.arg,
+                        direct_arg: bound.direct_arg,
+                        order_by: bound.order_by,
                         distinct: *distinct,
                         output_name,
                         data_type: ret_ty,
@@ -336,7 +381,58 @@ fn collect_aggregates(
     }
 }
 
-pub(super) fn derive_agg_output_name(func_name: &str, args: &[Expr]) -> String {
+fn bind_ordered_set_percentile(
+    args: &[Expr],
+    within_group: Option<&[OrderItem]>,
+    distinct: bool,
+    input_schema: &Schema,
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<BoundAggregateInput, PlanError> {
+    if distinct {
+        return Err(PlanError::NotSupported(
+            "DISTINCT is not supported for ordered-set percentiles",
+        ));
+    }
+    if args.len() != 1 {
+        return Err(PlanError::TypeMismatch(format!(
+            "ordered-set percentile: expected 1 direct argument, got {}",
+            args.len()
+        )));
+    }
+    let Some([item]) = within_group else {
+        return Err(PlanError::NotSupported(
+            "ordered-set percentile requires one WITHIN GROUP order key",
+        ));
+    };
+    let direct_arg = bind_expr_with_ctes(&args[0], input_schema, catalog, cte_catalog, scope)?;
+    let order_expr = bind_expr_with_ctes(&item.expr, input_schema, catalog, cte_catalog, scope)?;
+    let order_type = order_expr.data_type();
+    let asc = matches!(item.direction, SortDirection::Asc);
+    let nulls_first = match item.nulls {
+        NullsOrder::First => true,
+        NullsOrder::Last => false,
+        NullsOrder::Default => !asc,
+    };
+    let order_by = SortKey {
+        expr: order_expr.clone(),
+        asc,
+        nulls_first,
+    };
+    Ok(BoundAggregateInput {
+        arg: Some(order_expr),
+        direct_arg: Some(direct_arg),
+        order_by: Some(order_by),
+        arg_type: order_type,
+    })
+}
+
+pub(super) fn derive_agg_output_name(
+    func_name: &str,
+    args: &[Expr],
+    within_group: Option<&[OrderItem]>,
+) -> String {
     let is_star_arg = args.len() == 1
         && matches!(&args[0], Expr::Column { name }
             if name.parts.len() == 1 && name.parts[0].value == "*");
@@ -348,7 +444,17 @@ pub(super) fn derive_agg_output_name(func_name: &str, args: &[Expr]) -> String {
         .map(|arg| format!("{arg:?}"))
         .collect::<Vec<_>>()
         .join(",");
-    format!("{func_name}({arg_key})")
+    let base = format!("{func_name}({arg_key})");
+    if let Some(items) = within_group {
+        let order_key = items
+            .iter()
+            .map(|item| format!("{item:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("{base} within group ({order_key})")
+    } else {
+        base
+    }
 }
 
 pub(super) fn bind_projection_agg(
@@ -411,7 +517,12 @@ fn bind_expr_or_agg_ref(
     scope: &mut ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
     match expr {
-        Expr::Call { name, args, .. } => {
+        Expr::Call {
+            name,
+            args,
+            within_group,
+            ..
+        } => {
             if let Some(alias) = alias_name {
                 if let Some((i, f)) = agg_schema.find(alias) {
                     return Ok(ScalarExpr::Column {
@@ -427,7 +538,7 @@ fn bind_expr_or_agg_ref(
                 .map_or("", |p| p.value.as_str())
                 .to_ascii_lowercase();
             if is_aggregate_name(&func_name) {
-                let agg_name = derive_agg_output_name(&func_name, args);
+                let agg_name = derive_agg_output_name(&func_name, args, within_group.as_deref());
                 if let Some((i, f)) = agg_schema.find(&agg_name) {
                     return Ok(ScalarExpr::Column {
                         name: f.name.clone(),

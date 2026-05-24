@@ -475,6 +475,7 @@ impl<'src> Parser<'src> {
         Ok(Expr::Call {
             args,
             distinct: false,
+            within_group: None,
             over: None,
             span: Span::new(name_tok.span.start, rp.span.end),
             name,
@@ -497,6 +498,7 @@ impl<'src> Parser<'src> {
         Ok(Expr::Call {
             args: Vec::new(),
             distinct: false,
+            within_group: None,
             over: None,
             span: name_tok.span,
             name,
@@ -571,6 +573,7 @@ impl<'src> Parser<'src> {
                         target,
                     ],
                     distinct: false,
+                    within_group: None,
                     over: None,
                     span: Span::new(name.span.start, rp.span.end),
                     name,
@@ -608,6 +611,7 @@ impl<'src> Parser<'src> {
                     return Ok(Expr::Call {
                         args,
                         distinct: false,
+                        within_group: None,
                         over: None,
                         span: Span::new(name.span.start, rp.span.end),
                         name,
@@ -624,6 +628,7 @@ impl<'src> Parser<'src> {
                 return Ok(Expr::Call {
                     args,
                     distinct: false,
+                    within_group: None,
                     over: None,
                     span: Span::new(name.span.start, rp.span.end),
                     name,
@@ -661,16 +666,25 @@ impl<'src> Parser<'src> {
                 }
             }
             let rp = self.expect(TokenKind::RParen, ")")?;
+            let (within_group, within_end) = if self.peek()?.kind == TokenKind::KwWithin {
+                let (items, end) = self.parse_within_group_clause()?;
+                (Some(items), Some(end))
+            } else {
+                (None, None)
+            };
             // Optional `OVER (...)` turning this into a window function call.
             let over = if self.peek()?.kind == TokenKind::KwOver {
                 Some(self.parse_over_clause()?)
             } else {
                 None
             };
-            let end = over.as_ref().map_or(rp.span.end, |s| s.span.end);
+            let end = over
+                .as_ref()
+                .map_or_else(|| within_end.unwrap_or(rp.span.end), |s| s.span.end);
             Ok(Expr::Call {
                 args,
                 distinct,
+                within_group,
                 over,
                 span: Span::new(name.span.start, end),
                 name,
@@ -678,6 +692,19 @@ impl<'src> Parser<'src> {
         } else {
             Ok(Expr::Column { name })
         }
+    }
+
+    fn parse_within_group_clause(
+        &mut self,
+    ) -> Result<(Vec<crate::ast::OrderItem>, u32), ParseError> {
+        self.expect(TokenKind::KwWithin, "WITHIN")?;
+        self.expect(TokenKind::KwGroup, "GROUP")?;
+        self.expect(TokenKind::LParen, "(")?;
+        self.expect(TokenKind::KwOrder, "ORDER")?;
+        self.expect(TokenKind::KwBy, "BY")?;
+        let items = self.parse_order_list()?;
+        let rp = self.expect(TokenKind::RParen, ")")?;
+        Ok((items, rp.span.end))
     }
 
     /// Parse `OVER ( [PARTITION BY expr (, expr)*] [ORDER BY item (, item)*] )`.
