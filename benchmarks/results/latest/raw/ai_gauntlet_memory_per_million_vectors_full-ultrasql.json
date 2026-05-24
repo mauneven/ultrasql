@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "suite": "memory_per_million_vectors",
+  "engine": "ultrasql_page_backed_ann",
+  "workload": "ai_gauntlet_memory_per_million_vectors_full",
+  "profile": "full",
+  "status": "measured",
+  "required_metrics": [
+    "index_size_bytes",
+    "memory_bytes",
+    "bytes_per_vector",
+    "build_time_us"
+  ],
+  "host": {
+    "cpu": "Apple M4",
+    "cores": 10,
+    "ram_gb": 16,
+    "os": "macos unknown"
+  },
+  "n_rows": 10000,
+  "vector_dims": 8,
+  "seed": 1367261406,
+  "index_size_bytes": 328753152,
+  "memory_bytes": 329073152,
+  "bytes_per_vector": 32907.3152,
+  "memory_bytes_per_million_vectors": 32907315199.999996,
+  "index_bytes_per_million_vectors": 32875315199.999996,
+  "build_time_us": 9685992.833,
+  "hnsw_build_time_us": 5687705.833,
+  "ivfflat_build_time_us": 3998287.0,
+  "hnsw_index_size_bytes": 245776384,
+  "ivfflat_index_size_bytes": 82976768,
+  "vector_data_bytes": 320000,
+  "m": 16,
+  "ef_search": 64,
+  "lists": 64,
+  "probes": 8,
+  "hnsw_pages": {
+    "meta_pages": 1,
+    "node_pages": 10000,
+    "overflow_pages": 20000,
+    "free_list_pages": 1,
+    "live_nodes": 10000,
+    "tombstones": 0
+  },
+  "ivfflat_pages": {
+    "meta_pages": 1,
+    "centroid_pages": 64,
+    "list_pages": 64,
+    "entry_pages": 10000,
+    "live_entries": 10000,
+    "tombstones": 0
+  },
+  "policy": "Vector memory artifact records page-backed HNSW and IVFFlat accounting for deterministic vectors; no cross-engine ranking."
+}

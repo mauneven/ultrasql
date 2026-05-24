@@ -1,7 +1,796 @@
 {
-  "rendered_at": "2026-06-04T21:38:44Z",
+  "rendered_at": "2026-06-08T02:52:00Z",
   "schema_version": 1,
   "workloads": {
+    "ai_gauntlet_hybrid_search_latency_smoke": {
+      "engines": [
+        {
+          "bm25_score": "implicit lexical component",
+          "engine": "ultrasql",
+          "filter_selectivity": 0.005859375,
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            1826.875
+          ],
+          "median_us": 1826.875,
+          "min_us": 1826.875,
+          "n_rows": 512,
+          "p50_latency_us": 1826.875,
+          "p95_latency_us": 1826.875,
+          "p99_latency_us": 1826.875,
+          "policy": "Hybrid search artifact validates expected top-k ids before recording latency.",
+          "profile": "smoke",
+          "rank": 1,
+          "recall_at_k": 1.0,
+          "required_metrics": [
+            "recall_at_k",
+            "p50_latency_us",
+            "p95_latency_us",
+            "p99_latency_us",
+            "filter_selectivity",
+            "bm25_score",
+            "vector_score"
+          ],
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured",
+          "suite": "hybrid_search_latency",
+          "top_k": 2,
+          "vector_score": "implicit l2 component"
+        }
+      ]
+    },
+    "ai_gauntlet_rag_retrieval_quality_smoke": {
+      "engines": [
+        {
+          "answer_citation_coverage": 1.0,
+          "engine": "ultrasql",
+          "expected_doc_ids": [
+            "doc-a"
+          ],
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            720.5
+          ],
+          "latency_us": 720.5,
+          "median_us": 720.5,
+          "min_us": 720.5,
+          "mrr": 1.0,
+          "n_rows": 10000,
+          "observed_doc_ids": [
+            "doc-a"
+          ],
+          "p50_latency_us": 720.5,
+          "p95_latency_us": 720.5,
+          "p99_latency_us": 720.5,
+          "policy": "RAG retrieval quality artifact uses deterministic tenant-filtered expected chunks.",
+          "precision_at_k": 1.0,
+          "profile": "smoke",
+          "rank": 1,
+          "recall_at_k": 1.0,
+          "required_metrics": [
+            "expected_doc_ids",
+            "observed_doc_ids",
+            "recall_at_k",
+            "precision_at_k",
+            "mrr",
+            "latency_us",
+            "answer_citation_coverage"
+          ],
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured",
+          "suite": "rag_retrieval_quality",
+          "top_k": 2
+        }
+      ]
+    },
+    "arena_parquet_smoke": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            558.625,
+            589.542,
+            717.042
+          ],
+          "median_us": 589.542,
+          "min_us": 558.625,
+          "n_rows": 8192,
+          "policy": "Artifact contains measured UltraSQL samples only; no cross-engine ranking.",
+          "predicate_pushdown_samples_us": [
+            292.916,
+            410.291,
+            651.708
+          ],
+          "predicate_pushdown_us": 410.291,
+          "profile": "smoke",
+          "projection_pushdown_samples_us": [
+            630.2919999999999,
+            704.75,
+            776.5409999999999
+          ],
+          "projection_pushdown_us": 704.75,
+          "rank": 1,
+          "required_metrics": [
+            "scan_us",
+            "projection_pushdown_us",
+            "predicate_pushdown_us",
+            "row_group_pruning_us"
+          ],
+          "row_group_pruning_samples_us": [
+            219.167,
+            232.458,
+            240.417
+          ],
+          "row_group_pruning_us": 232.458,
+          "row_group_rows": 4096,
+          "samples": 3,
+          "scan_samples_us": [
+            558.625,
+            589.542,
+            717.042
+          ],
+          "scan_us": 589.542,
+          "schema_version": 1,
+          "status": "measured",
+          "suite": "parquet"
+        }
+      ]
+    },
+    "clickbench": {
+      "engines": [
+        {
+          "certification_scope": "smoke_subset",
+          "core_mode": "local_docker",
+          "dataset": "target/clickbench/hits.parquet",
+          "dataset_rows": 100000,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "firebolt_core_endpoint": "http://127.0.0.1:3473",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "geomean_ms": 7.86874572584773,
+          "host": {
+            "cores": 10,
+            "cpu": "arm",
+            "memory_bytes": 17179869184,
+            "os": "macOS-26.5-arm64-arm-64bit-Mach-O",
+            "ram_gb": 16
+          },
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "iterations_us": [],
+          "load_limit": 100000,
+          "load_time_us": 3177622.666000389,
+          "median_us": 7868.74572584773,
+          "min_us": 0.0,
+          "n_rows": 0,
+          "p95_us": 15589.082962833343,
+          "policy": "ClickBench Firebolt artifact is eligible only when measured through local Firebolt Core Docker using the pinned upstream Firebolt SQL and the local Parquet dataset mounted into the Core container. Artifacts with CLICKBENCH_FIREBOLT_LOAD_LIMIT are smoke-only and not full ClickBench certification.",
+          "queries": [
+            {
+              "error": null,
+              "median_ms": 2.8807909693568945,
+              "query": 1,
+              "runs_ms": [
+                2.8807909693568945
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 6.777166971005499,
+              "query": 2,
+              "runs_ms": [
+                6.777166971005499
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 7.249084068462253,
+              "query": 3,
+              "runs_ms": [
+                7.249084068462253
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 7.347458973526955,
+              "query": 4,
+              "runs_ms": [
+                7.347458973526955
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 7.418958004564047,
+              "query": 5,
+              "runs_ms": [
+                7.418958004564047
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 8.042291970923543,
+              "query": 6,
+              "runs_ms": [
+                8.042291970923543
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 5.601832992397249,
+              "query": 7,
+              "runs_ms": [
+                5.601832992397249
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 6.183166988193989,
+              "query": 8,
+              "runs_ms": [
+                6.183166988193989
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 9.230417083017528,
+              "query": 9,
+              "runs_ms": [
+                9.230417083017528
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 10.34525001887232,
+              "query": 10,
+              "runs_ms": [
+                10.34525001887232
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 7.055416004732251,
+              "query": 11,
+              "runs_ms": [
+                7.055416004732251
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 9.237708058208227,
+              "query": 12,
+              "runs_ms": [
+                9.237708058208227
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 7.285458035767078,
+              "query": 13,
+              "runs_ms": [
+                7.285458035767078
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 9.056583978235722,
+              "query": 14,
+              "runs_ms": [
+                9.056583978235722
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 9.060459095053377,
+              "query": 15,
+              "runs_ms": [
+                9.060459095053377
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 7.597791031002998,
+              "query": 16,
+              "runs_ms": [
+                7.597791031002998
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 9.882083046250044,
+              "query": 17,
+              "runs_ms": [
+                9.882083046250044
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 9.952666936442256,
+              "query": 18,
+              "runs_ms": [
+                9.952666936442256
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 12.616457999683917,
+              "query": 19,
+              "runs_ms": [
+                12.616457999683917
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 6.739874952472746,
+              "query": 20,
+              "runs_ms": [
+                6.739874952472746
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 11.886499938555062,
+              "query": 21,
+              "runs_ms": [
+                11.886499938555062
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 13.6129999300465,
+              "query": 22,
+              "runs_ms": [
+                13.6129999300465
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 15.589082962833343,
+              "query": 23,
+              "runs_ms": [
+                15.589082962833343
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 90.47054103575648,
+              "query": 24,
+              "runs_ms": [
+                90.47054103575648
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 6.442999932914972,
+              "query": 25,
+              "runs_ms": [
+                6.442999932914972
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 5.258333985693753,
+              "query": 26,
+              "runs_ms": [
+                5.258333985693753
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 6.315000005997717,
+              "query": 27,
+              "runs_ms": [
+                6.315000005997717
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 12.891125050373375,
+              "query": 28,
+              "runs_ms": [
+                12.891125050373375
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 16.874958062544465,
+              "query": 29,
+              "runs_ms": [
+                16.874958062544465
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 11.75724994391203,
+              "query": 30,
+              "runs_ms": [
+                11.75724994391203
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 7.200249936431646,
+              "query": 31,
+              "runs_ms": [
+                7.200249936431646
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 8.45979095902294,
+              "query": 32,
+              "runs_ms": [
+                8.45979095902294
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 10.049458011053504,
+              "query": 33,
+              "runs_ms": [
+                10.049458011053504
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 14.01599997188896,
+              "query": 34,
+              "runs_ms": [
+                14.01599997188896
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 3.8811659906059504,
+              "query": 35,
+              "runs_ms": [
+                3.8811659906059504
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 6.245582946576178,
+              "query": 36,
+              "runs_ms": [
+                6.245582946576178
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 4.410958965308964,
+              "query": 37,
+              "runs_ms": [
+                4.410958965308964
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 4.272666992619634,
+              "query": 38,
+              "runs_ms": [
+                4.272666992619634
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 4.019833984784782,
+              "query": 39,
+              "runs_ms": [
+                4.019833984784782
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 4.023666027933359,
+              "query": 40,
+              "runs_ms": [
+                4.023666027933359
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 4.583957954309881,
+              "query": 41,
+              "runs_ms": [
+                4.583957954309881
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 4.030667012557387,
+              "query": 42,
+              "runs_ms": [
+                4.030667012557387
+              ]
+            },
+            {
+              "error": null,
+              "median_ms": 4.496083012782037,
+              "query": 43,
+              "runs_ms": [
+                4.496083012782037
+              ]
+            }
+          ],
+          "query_count": 43,
+          "rank": 1,
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured",
+          "suite": "clickbench",
+          "upstream_ref": "c5eb5d8e9c10fbef5ce16e8750f3e67de24cef0a"
+        }
+      ]
+    },
+    "csv_cold_read_1k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            4818.584
+          ],
+          "median_us": 4818.584,
+          "min_us": 4818.584,
+          "n_rows": 1000,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured"
+        },
+        {
+          "engine": "duckdb",
+          "iterations_us": [
+            16238.50001487881
+          ],
+          "median_us": 16238.50001487881,
+          "min_us": 16238.50001487881,
+          "n_rows": 1000,
+          "profile": "smoke",
+          "rank": 2,
+          "samples": 1,
+          "schema_version": 1,
+          "suite": "csv_benchmark_gauntlet"
+        }
+      ]
+    },
+    "csv_copy_import_1k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            1680.666
+          ],
+          "median_us": 1680.666,
+          "min_us": 1680.666,
+          "n_rows": 1000,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured"
+        },
+        {
+          "engine": "duckdb",
+          "iterations_us": [
+            3500.125021673739
+          ],
+          "median_us": 3500.125021673739,
+          "min_us": 3500.125021673739,
+          "n_rows": 1000,
+          "profile": "smoke",
+          "rank": 2,
+          "samples": 1,
+          "schema_version": 1,
+          "suite": "csv_benchmark_gauntlet"
+        }
+      ]
+    },
+    "csv_filter_1k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            1475.084
+          ],
+          "median_us": 1475.084,
+          "min_us": 1475.084,
+          "n_rows": 1000,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured"
+        },
+        {
+          "engine": "duckdb",
+          "iterations_us": [
+            5046.332953497767
+          ],
+          "median_us": 5046.332953497767,
+          "min_us": 5046.332953497767,
+          "n_rows": 1000,
+          "profile": "smoke",
+          "rank": 2,
+          "samples": 1,
+          "schema_version": 1,
+          "suite": "csv_benchmark_gauntlet"
+        }
+      ]
+    },
+    "csv_group_by_1k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            2167.209
+          ],
+          "median_us": 2167.209,
+          "min_us": 2167.209,
+          "n_rows": 1000,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured"
+        },
+        {
+          "engine": "duckdb",
+          "iterations_us": [
+            5785.2080790326
+          ],
+          "median_us": 5785.2080790326,
+          "min_us": 5785.2080790326,
+          "n_rows": 1000,
+          "profile": "smoke",
+          "rank": 2,
+          "samples": 1,
+          "schema_version": 1,
+          "suite": "csv_benchmark_gauntlet"
+        }
+      ]
+    },
+    "csv_join_table_1k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            2798.5
+          ],
+          "median_us": 2798.5,
+          "min_us": 2798.5,
+          "n_rows": 1000,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured"
+        },
+        {
+          "engine": "duckdb",
+          "iterations_us": [
+            4834.625055082142
+          ],
+          "median_us": 4834.625055082142,
+          "min_us": 4834.625055082142,
+          "n_rows": 1000,
+          "profile": "smoke",
+          "rank": 2,
+          "samples": 1,
+          "schema_version": 1,
+          "suite": "csv_benchmark_gauntlet"
+        }
+      ]
+    },
+    "csv_malformed_behavior_1k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            364.792
+          ],
+          "median_us": 364.792,
+          "min_us": 364.792,
+          "n_rows": 1000,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured"
+        }
+      ]
+    },
+    "csv_warm_read_1k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            1667.375
+          ],
+          "median_us": 1667.375,
+          "min_us": 1667.375,
+          "n_rows": 1000,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured"
+        },
+        {
+          "engine": "duckdb",
+          "iterations_us": [
+            5065.083969384432
+          ],
+          "median_us": 5065.083969384432,
+          "min_us": 5065.083969384432,
+          "n_rows": 1000,
+          "profile": "smoke",
+          "rank": 2,
+          "samples": 1,
+          "schema_version": 1,
+          "suite": "csv_benchmark_gauntlet"
+        }
+      ]
+    },
     "delete_throughput_10k": {
       "engines": [
         {
@@ -173,6 +962,64 @@
           "samples": 32
         },
         {
+          "core_mode": "local_docker",
+          "detail": null,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "generated_at_unix": 1779403003,
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "iterations_us": [
+            8111.040922813117,
+            9046.667022630572,
+            9456.834057345986,
+            9547.082940116525,
+            9564.416948705912,
+            9656.458045355976,
+            10171.083034947516,
+            10329.957935027778,
+            10333.957965485752,
+            10338.791995309291,
+            10346.374940127134,
+            10520.291049033403,
+            10627.250070683658,
+            10725.375032052398,
+            10731.708956882358,
+            10836.874949745834,
+            10842.790943570437,
+            10889.500030316412,
+            10923.499939963222,
+            10980.208055116236,
+            11102.417018264532,
+            11140.958056785166,
+            11253.042030148208,
+            11419.707909226418,
+            11478.708940558136,
+            11741.750058718026,
+            12037.833919748664,
+            12200.332945212722,
+            12433.249969035389,
+            12712.833005934954,
+            12878.832989372311,
+            23806.66695535183
+          ],
+          "iters": 32,
+          "local_docker": true,
+          "median_us": 10839.832946658134,
+          "min_us": 8111.040922813117,
+          "n_rows": 10000,
+          "p95_us": 12878.832989372311,
+          "policy": "README Firebolt row is eligible only from local Firebolt Core on the same SQL shape.",
+          "query": "DELETE FROM {table}",
+          "rank": 5,
+          "result_row_count": null,
+          "samples": 32,
+          "schema_version": 1,
+          "status": "measured",
+          "warmup": 1
+        },
+        {
           "engine": "postgres17",
           "iterations_us": [
             20908.750011585653,
@@ -211,7 +1058,7 @@
           "median_us": 21289.729,
           "min_us": 20908.75,
           "n_rows": 10000,
-          "rank": 5,
+          "rank": 6,
           "samples": 32
         }
       ]
@@ -345,6 +1192,64 @@
           "samples": 32
         },
         {
+          "core_mode": "local_docker",
+          "detail": null,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "generated_at_unix": 1779402995,
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "iterations_us": [
+            2235.167077742517,
+            2276.4999885112047,
+            2290.8750688657165,
+            2339.749946258962,
+            2384.7920820116997,
+            2387.249958701432,
+            2399.165998212993,
+            2425.790997222066,
+            2434.7089929506183,
+            2455.374924466014,
+            2460.3749625384808,
+            2491.8749695643783,
+            2513.2910814136267,
+            2550.833043642342,
+            2636.4580262452364,
+            2656.2908897176385,
+            2659.49999447912,
+            2718.7919477000833,
+            2887.3750707134604,
+            2968.9170187339187,
+            3110.6669921427965,
+            3166.7499570176005,
+            3225.250053219497,
+            3304.1660208255053,
+            3560.4159347712994,
+            3786.166082136333,
+            3807.3749747127295,
+            3845.1660657301545,
+            3845.5419708043337,
+            3977.500018663704,
+            3997.999941930175,
+            4027.9580280184746
+          ],
+          "iters": 32,
+          "local_docker": true,
+          "median_us": 2657.895442098379,
+          "min_us": 2235.167077742517,
+          "n_rows": 1000000,
+          "p95_us": 3997.999941930175,
+          "policy": "README Firebolt row is eligible only from local Firebolt Core on the same SQL shape.",
+          "query": "SELECT SUM(x) FROM ultrasql_readme_filter_1779402994_61468 WHERE x > 500000",
+          "rank": 4,
+          "result_row_count": 1,
+          "samples": 32,
+          "schema_version": 1,
+          "status": "measured",
+          "warmup": 1
+        },
+        {
           "engine": "sqlite3",
           "iterations_us": [
             15798.084088601172,
@@ -383,7 +1288,7 @@
           "median_us": 16233.125,
           "min_us": 15798.084,
           "n_rows": 1000000,
-          "rank": 4,
+          "rank": 5,
           "samples": 32
         },
         {
@@ -425,8 +1330,98 @@
           "median_us": 43026.187,
           "min_us": 34202.458,
           "n_rows": 1000000,
-          "rank": 5,
+          "rank": 6,
           "samples": 32
+        }
+      ]
+    },
+    "firebolt_aggregate_index_10k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            169.875,
+            185.416,
+            242.708
+          ],
+          "median_us": 185.416,
+          "min_us": 169.875,
+          "n_rows": 10000,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "samples": 3,
+          "schema_version": 1,
+          "status": "measured"
+        },
+        {
+          "aggregating_index_used": true,
+          "core_mode": "local_docker",
+          "dataset_rows": 10000,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "explain_contains": "Aggregating Index",
+          "explain_evidence": {
+            "countmerge": true,
+            "materialized_index_relation": true,
+            "summerge": true
+          },
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "http_output_format": "output_format=JSON_Compact",
+          "index_build_us": 19634.334021247923,
+          "index_ddl": "CREATE AGGREGATING INDEX ultrasql_firebolt_agg_1779397795_34202_idx ON ultrasql_firebolt_agg_1779397795_34202 (tenant_id, bucket, SUM(amount), COUNT(*))",
+          "iterations_us": [
+            5150.250042788684,
+            5197.582999244332,
+            5296.959076076746
+          ],
+          "load_time_us": 443784.6250366419,
+          "median_us": 5197.582999244332,
+          "min_us": 5150.250042788684,
+          "n_rows": 10000,
+          "p95_us": 5296.959076076746,
+          "policy": "No Firebolt aggregate-index benchmark claim may be made unless this raw artifact is committed with its runner inputs.",
+          "profile": "smoke",
+          "query": "SELECT tenant_id, bucket, SUM(amount), COUNT(*) FROM ultrasql_firebolt_agg_1779397795_34202 WHERE tenant_id = 7 GROUP BY tenant_id, bucket ORDER BY tenant_id, bucket",
+          "rank": 2,
+          "result_row_count": 64,
+          "samples": 3,
+          "schema_version": 1,
+          "status": "measured",
+          "suite": "firebolt_aggregate_index"
+        }
+      ]
+    },
+    "firebolt_sparse_pruning_10k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            108.25,
+            125.875,
+            301.54200000000003
+          ],
+          "median_us": 125.875,
+          "min_us": 108.25,
+          "n_rows": 10000,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "samples": 3,
+          "schema_version": 1,
+          "status": "measured"
         }
       ]
     },
@@ -517,6 +1512,64 @@
           "samples": 32
         },
         {
+          "core_mode": "local_docker",
+          "detail": null,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "generated_at_unix": 1779402997,
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "iterations_us": [
+            29450.041009113193,
+            32183.62503685057,
+            32184.41701028496,
+            32206.12509176135,
+            32787.25000564009,
+            32792.08403546363,
+            33714.3330834806,
+            34013.999975286424,
+            34676.583018153906,
+            34690.833068452775,
+            35608.12503565103,
+            36128.00000701099,
+            36352.167022414505,
+            36499.249981716275,
+            36901.79192926735,
+            36964.708007872105,
+            37887.792102992535,
+            38140.87493810803,
+            38198.124966584146,
+            39032.5419139117,
+            39589.2079686746,
+            39817.29201041162,
+            39883.49996507168,
+            40324.000059627,
+            40904.20808643103,
+            41034.66693777591,
+            41176.29199754447,
+            42885.8749801293,
+            44471.582979895175,
+            46033.20895694196,
+            46778.91707979143,
+            51032.999996095896
+          ],
+          "iters": 32,
+          "local_docker": true,
+          "median_us": 37426.25005543232,
+          "min_us": 29450.041009113193,
+          "n_rows": 10000,
+          "p95_us": 46778.91707979143,
+          "policy": "README Firebolt row is eligible only from local Firebolt Core on the same SQL shape.",
+          "query": "INSERT INTO {table} SELECT i AS id, (i * 17) AS val FROM generate_series(0, 9999) AS t(i)",
+          "rank": 3,
+          "result_row_count": null,
+          "samples": 32,
+          "schema_version": 1,
+          "status": "measured",
+          "warmup": 1
+        },
+        {
           "engine": "postgres17",
           "iterations_us": [
             40152.87500806153,
@@ -555,7 +1608,7 @@
           "median_us": 44029.646,
           "min_us": 40152.875,
           "n_rows": 10000,
-          "rank": 3,
+          "rank": 4,
           "samples": 32
         },
         {
@@ -597,7 +1650,7 @@
           "median_us": 57107.896,
           "min_us": 4182.458040304482,
           "n_rows": 10000,
-          "rank": 4,
+          "rank": 5,
           "samples": 32
         },
         {
@@ -639,8 +1692,82 @@
           "median_us": 66132.854,
           "min_us": 64646.75,
           "n_rows": 10000,
-          "rank": 5,
+          "rank": 6,
           "samples": 32
+        }
+      ]
+    },
+    "late_materialization_10k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            550.875
+          ],
+          "median_us": 550.875,
+          "min_us": 550.875,
+          "n_rows": 10000,
+          "p50_latency_us": 550.875,
+          "p95_latency_us": 550.875,
+          "p99_latency_us": 550.875,
+          "policy": "Late-materialization smoke validates EXPLAIN counters before recording latency.",
+          "profile": "smoke",
+          "rank": 1,
+          "required_metrics": [
+            "median_us",
+            "p50_latency_us",
+            "p95_latency_us",
+            "p99_latency_us",
+            "explain_late_materialization",
+            "eager_scan_median_us",
+            "late_materialization_median_us",
+            "rows"
+          ],
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured",
+          "suite": "late_materialization"
+        },
+        {
+          "core_mode": "local_docker",
+          "dataset_rows": 10000,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "iterations_us": [
+            194335.4590330273
+          ],
+          "iters": 1,
+          "load_time_us": 29300290.12495652,
+          "local_docker": true,
+          "median_us": 194335.4590330273,
+          "min_us": 194335.4590330273,
+          "n_rows": 10000,
+          "p95_us": 194335.4590330273,
+          "policy": "No Firebolt late-materialization comparison claim may be made unless this local Core artifact and the matching UltraSQL artifact are committed from the same host/profile.",
+          "profile": "smoke",
+          "projected_columns": [
+            "amount",
+            "pad003",
+            "pad096"
+          ],
+          "query": "SELECT amount, pad003, pad096 FROM ultrasql_late_mat_1779399924_11162 WHERE tenant_id = 7",
+          "rank": 2,
+          "result_row_count": 313,
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured",
+          "suite": "late_materialization",
+          "warmup": 0,
+          "wide_columns": 100
         }
       ]
     },
@@ -855,6 +1982,433 @@
           "n_rows": 10000,
           "rank": 5,
           "samples": 32
+        },
+        {
+          "core_mode": "local_docker",
+          "detail": {
+            "op_counts": [
+              37,
+              34,
+              45,
+              33,
+              37,
+              42,
+              41,
+              41,
+              27,
+              44,
+              35,
+              34,
+              43,
+              43,
+              42,
+              34,
+              32,
+              35,
+              38,
+              44,
+              39,
+              39,
+              36,
+              33,
+              38,
+              35,
+              34,
+              38,
+              34,
+              48,
+              36,
+              36
+            ],
+            "window_secs": 1.0
+          },
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "generated_at_unix": 1779403038,
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "iterations_us": [
+            20947.386270563584,
+            22450.823153162168,
+            22808.224431090905,
+            22860.02652412704,
+            24112.155999403534,
+            24122.773255438133,
+            24304.383930506272,
+            24466.561999671707,
+            24703.84326131482,
+            25505.401412729265,
+            25655.507462290236,
+            26656.219288461696,
+            26694.93639290235,
+            26752.545946062757,
+            27331.37936784739,
+            27996.66436233868,
+            28156.01127096326,
+            28181.574323113902,
+            28205.637723052252,
+            28718.335713659013,
+            28894.42856955741,
+            28926.05902808201,
+            29255.32380052443,
+            29947.580882649432,
+            29976.998794796495,
+            30205.995087539228,
+            30354.980379343033,
+            30576.26012190612,
+            30585.06129309535,
+            31551.743663537007,
+            31988.7083460344,
+            37432.28547844208
+          ],
+          "iters": 32,
+          "local_docker": true,
+          "median_us": 28076.337816650972,
+          "min_us": 20947.386270563584,
+          "n_rows": 10000,
+          "p95_us": 31988.7083460344,
+          "policy": "README Firebolt row is eligible only from local Firebolt Core on the same SQL shape.",
+          "query": "50% point SELECT, 30% point UPDATE, 20% INSERT over a 1-second window",
+          "rank": 6,
+          "result_row_count": null,
+          "samples": 32,
+          "schema_version": 1,
+          "status": "measured",
+          "warmup": 1
+        }
+      ]
+    },
+    "object_parquet_range_smoke": {
+      "engines": [
+        {
+          "cache_hits": 8,
+          "cache_misses": 69,
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            493216.209
+          ],
+          "length_probe_seen": true,
+          "median_us": 493216.209,
+          "min_us": 493216.209,
+          "n_rows": 3,
+          "object_bytes": 1558,
+          "p50_latency_us": 493216.209,
+          "p95_latency_us": 493216.209,
+          "p99_latency_us": 493216.209,
+          "policy": "Artifact certifies ranged object-store Parquet execution; no cross-engine ranking.",
+          "profile": "smoke",
+          "projected_out_column": "score",
+          "projected_out_column_fetched": false,
+          "query_median_us": 493216.209,
+          "query_samples_us": [
+            493216.209
+          ],
+          "range_request_count": 69,
+          "rank": 1,
+          "remote_bytes": 1123,
+          "requested_range_bytes": 1123,
+          "requests": [
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=0-0"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=1550-1557"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=517-1549"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=155-155"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=156-156"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=157-157"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=158-158"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=159-159"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=160-160"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=161-161"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=162-162"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=163-163"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=164-164"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=165-165"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=166-166"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=167-167"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=168-168"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=169-176"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=177-177"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=178-178"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=179-179"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=180-180"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=181-181"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=182-182"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=183-183"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=184-184"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=185-185"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=186-186"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=187-187"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=188-188"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=189-189"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=190-190"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=191-191"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=192-192"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=193-193"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=194-195"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=196-196"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=197-197"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=198-198"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=199-199"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=200-200"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=201-201"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=202-202"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=203-203"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=204-204"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=205-205"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=206-206"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=207-207"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=208-208"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=209-209"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=210-216"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=217-217"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=218-218"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=219-219"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=220-220"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=221-221"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=222-222"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=223-223"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=224-224"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=225-225"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=226-226"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=227-227"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=228-228"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=229-229"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=230-230"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=231-231"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=232-232"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=233-233"
+            },
+            {
+              "path": "/lake/parquet/object_range.parquet",
+              "range": "bytes=234-235"
+            }
+          ],
+          "required_metrics": [
+            "query_median_us",
+            "p50_latency_us",
+            "p95_latency_us",
+            "p99_latency_us",
+            "range_request_count",
+            "remote_bytes",
+            "cache_hits",
+            "cache_misses",
+            "whole_object_fetched",
+            "projected_out_column_fetched"
+          ],
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured",
+          "suite": "object_parquet_range",
+          "whole_object_fetched": false
         }
       ]
     },
@@ -987,6 +2541,64 @@
           "samples": 32
         },
         {
+          "core_mode": "local_docker",
+          "detail": null,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "generated_at_unix": 1779402995,
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "iterations_us": [
+            2607.1660686284304,
+            2855.541999451816,
+            3042.917000129819,
+            3095.083055086434,
+            3216.792014427483,
+            3288.332954980433,
+            3302.66694072634,
+            3320.8340173587203,
+            3447.041963227093,
+            3558.4999714046717,
+            3567.4170358106494,
+            3617.667010985315,
+            3678.375040180981,
+            3855.040995404124,
+            3939.541988074779,
+            3943.457966670394,
+            3981.74999281764,
+            4019.6250192821026,
+            4060.29203440994,
+            4201.875068247318,
+            4357.083002105355,
+            4435.167065821588,
+            4498.166963458061,
+            4574.041930027306,
+            4734.167014248669,
+            4845.834104344249,
+            5026.750033721328,
+            5041.000084020197,
+            5066.707963123918,
+            5790.2500266209245,
+            6184.249999932945,
+            6267.083925195038
+          ],
+          "iters": 32,
+          "local_docker": true,
+          "median_us": 3962.603979744017,
+          "min_us": 2607.1660686284304,
+          "n_rows": 1000000,
+          "p95_us": 6184.249999932945,
+          "policy": "README Firebolt row is eligible only from local Firebolt Core on the same SQL shape.",
+          "query": "SELECT AVG(x) FROM ultrasql_readme_avg_1779402994_61468",
+          "rank": 4,
+          "result_row_count": 1,
+          "samples": 32,
+          "schema_version": 1,
+          "status": "measured",
+          "warmup": 1
+        },
+        {
           "engine": "sqlite3",
           "iterations_us": [
             14300.541020929812,
@@ -1025,7 +2637,7 @@
           "median_us": 14773.812,
           "min_us": 14300.541,
           "n_rows": 1000000,
-          "rank": 4,
+          "rank": 5,
           "samples": 32
         },
         {
@@ -1067,7 +2679,7 @@
           "median_us": 42097.208,
           "min_us": 34865.708,
           "n_rows": 1000000,
-          "rank": 5,
+          "rank": 6,
           "samples": 32
         }
       ]
@@ -1243,6 +2855,64 @@
           "samples": 32
         },
         {
+          "core_mode": "local_docker",
+          "detail": null,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "generated_at_unix": 1779402997,
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "iterations_us": [
+            3641.6250513866544,
+            3737.249993719161,
+            3760.750056244433,
+            3866.374958306551,
+            3935.4159962385897,
+            4031.3329081982374,
+            4034.167039208114,
+            4111.7919608950615,
+            4141.249926760793,
+            4171.08298279345,
+            4233.584040775895,
+            4288.582946173847,
+            4291.000077500939,
+            4420.374985784292,
+            4429.79100625962,
+            4644.416039809585,
+            4780.99996689707,
+            4812.291939742863,
+            5219.791084527969,
+            5230.16694933176,
+            5365.042015910149,
+            5451.416946016252,
+            5466.583999805152,
+            5616.875016130507,
+            5844.083032570779,
+            5846.707965247333,
+            5875.24997536093,
+            5914.040957577527,
+            6031.665951013565,
+            6061.334046535194,
+            6188.499974086881,
+            6250.457954593003
+          ],
+          "iters": 32,
+          "local_docker": true,
+          "median_us": 4712.7080033533275,
+          "min_us": 3641.6250513866544,
+          "n_rows": 10000,
+          "p95_us": 6188.499974086881,
+          "policy": "README Firebolt row is eligible only from local Firebolt Core on the same SQL shape.",
+          "query": "SELECT id, val FROM ultrasql_readme_scan_1779402994_61468",
+          "rank": 5,
+          "result_row_count": 10000,
+          "samples": 32,
+          "schema_version": 1,
+          "status": "measured",
+          "warmup": 1
+        },
+        {
           "engine": "postgres17",
           "iterations_us": [
             24102.791910991073,
@@ -1281,7 +2951,7 @@
           "median_us": 25886.542,
           "min_us": 24102.792,
           "n_rows": 10000,
-          "rank": 5,
+          "rank": 6,
           "samples": 32
         }
       ]
@@ -1457,6 +3127,64 @@
           "samples": 32
         },
         {
+          "core_mode": "local_docker",
+          "detail": null,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "generated_at_unix": 1779402995,
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "iterations_us": [
+            2996.6250294819474,
+            3162.2499227523804,
+            3175.124991685152,
+            3192.6248921081424,
+            3204.0419755503535,
+            3218.0839916691184,
+            3228.2499596476555,
+            3336.5420531481504,
+            3420.4169642180204,
+            3430.2909625694156,
+            3440.2499441057444,
+            3506.37489464134,
+            3648.792044259608,
+            3795.041935518384,
+            3873.5000416636462,
+            4080.666927620769,
+            4089.750000275671,
+            4121.833015233278,
+            4148.66697974503,
+            4180.624964646995,
+            4218.667047098279,
+            4224.500036798418,
+            4253.625054843724,
+            4268.124932423234,
+            4302.4999322369695,
+            4385.250038467348,
+            4387.292079627514,
+            4437.5419383868575,
+            4455.4159976542,
+            4659.708007238805,
+            4828.082979656756,
+            5155.749968253076
+          ],
+          "iters": 32,
+          "local_docker": true,
+          "median_us": 4085.20846394822,
+          "min_us": 2996.6250294819474,
+          "n_rows": 65536,
+          "p95_us": 4828.082979656756,
+          "policy": "README Firebolt row is eligible only from local Firebolt Core on the same SQL shape.",
+          "query": "SELECT SUM(x) FROM ultrasql_readme_sum_1779402994_61468",
+          "rank": 5,
+          "result_row_count": 1,
+          "samples": 32,
+          "schema_version": 1,
+          "status": "measured",
+          "warmup": 1
+        },
+        {
           "engine": "postgres17",
           "iterations_us": [
             25457.374984398484,
@@ -1495,8 +3223,60 @@
           "median_us": 26598.167,
           "min_us": 25457.375,
           "n_rows": 65536,
-          "rank": 5,
+          "rank": 6,
           "samples": 32
+        }
+      ]
+    },
+    "sysbench_oltp_read_write_10k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            139.87393944055944,
+            140.97444702733165,
+            143.6347370609319,
+            148.24923455326717,
+            149.1440067104086
+          ],
+          "median_us": 143.6347370609319,
+          "min_us": 139.87393944055944,
+          "n_rows": 10000,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "samples": 5,
+          "schema_version": 1,
+          "status": "measured"
+        }
+      ]
+    },
+    "sysbench_oltp_read_write_1k": {
+      "engines": [
+        {
+          "engine": "ultrasql",
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "iterations_us": [
+            73.55251158343752
+          ],
+          "median_us": 73.55251158343752,
+          "min_us": 73.55251158343752,
+          "n_rows": 1000,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured"
         }
       ]
     },
@@ -1671,6 +3451,64 @@
           "samples": 32
         },
         {
+          "core_mode": "local_docker",
+          "detail": null,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "generated_at_unix": 1779403001,
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "iterations_us": [
+            36843.66692323238,
+            37460.166960954666,
+            39107.58311394602,
+            39182.20801278949,
+            39532.91708603501,
+            39893.24998110533,
+            40194.37497481704,
+            41752.833989448845,
+            41823.75001255423,
+            42040.000087581575,
+            42196.62502873689,
+            42815.957916900516,
+            42885.62503643334,
+            43717.58294291794,
+            44197.3329288885,
+            44504.9999980256,
+            44583.417009562254,
+            44628.20792105049,
+            44959.75002646446,
+            45078.33404932171,
+            45206.25004079193,
+            45751.37502979487,
+            46977.58296970278,
+            47255.95796480775,
+            47670.58393917978,
+            48875.29101688415,
+            49566.58405717462,
+            50510.208937339485,
+            54118.20800509304,
+            59847.834054380655,
+            66391.58295001835,
+            73619.58303954452
+          ],
+          "iters": 32,
+          "local_docker": true,
+          "median_us": 44544.208503793925,
+          "min_us": 36843.66692323238,
+          "n_rows": 10000,
+          "p95_us": 66391.58295001835,
+          "policy": "README Firebolt row is eligible only from local Firebolt Core on the same SQL shape.",
+          "query": "UPDATE {table} SET val = val + 1",
+          "rank": 5,
+          "result_row_count": null,
+          "samples": 32,
+          "schema_version": 1,
+          "status": "measured",
+          "warmup": 1
+        },
+        {
           "engine": "postgres17",
           "iterations_us": [
             41554.49999962002,
@@ -1709,8 +3547,275 @@
           "median_us": 47453.271,
           "min_us": 41554.5,
           "n_rows": 10000,
-          "rank": 5,
+          "rank": 6,
           "samples": 32
+        }
+      ]
+    },
+    "vector_ann_hnsw_512_8d_k10": {
+      "engines": [
+        {
+          "build_time_scope": "create_table_index_and_insert",
+          "build_time_us": 147279.45893537253,
+          "core_mode": "local_docker",
+          "dataset_rows": 512,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "ef_construction": 128,
+          "ef_search": 64,
+          "engine": "firebolt_hnsw",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "first_ann_answer": [
+            454,
+            420,
+            366,
+            169,
+            284,
+            367,
+            241,
+            471,
+            218,
+            161
+          ],
+          "first_exact_answer": [
+            454,
+            420,
+            366,
+            169,
+            284,
+            367,
+            241,
+            471,
+            218,
+            161
+          ],
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "index_size_bytes": null,
+          "index_size_status": "not_measured",
+          "iterations_us": [],
+          "m": 16,
+          "median_us": 13786.520925350487,
+          "memory_bytes": null,
+          "memory_status": "not_measured",
+          "metric": "l2",
+          "min_us": 0.0,
+          "n_rows": 512,
+          "p50_latency_us": 12920.332956127822,
+          "p95_latency_us": 18154.666060581803,
+          "p95_us": 18154.666060581803,
+          "p99_latency_us": 18154.666060581803,
+          "policy": "No Firebolt vector-search benchmark claim may be made unless this raw artifact is committed with its runner inputs.",
+          "profile": "smoke",
+          "queries": 4,
+          "query_iterations_us": [
+            18154.666060581803,
+            14652.708894573152,
+            12920.332956127822,
+            11762.750102207065
+          ],
+          "rank": 1,
+          "recall_at_k": 1.0,
+          "recall_iterations": [
+            1.0,
+            1.0,
+            1.0,
+            1.0
+          ],
+          "required_metrics": [
+            "recall_at_k",
+            "p50_latency_us",
+            "p95_latency_us",
+            "p99_latency_us",
+            "build_time_us",
+            "memory_bytes",
+            "index_size_bytes"
+          ],
+          "samples": 4,
+          "schema_version": 1,
+          "seed": 1367265502,
+          "status": "measured",
+          "suite": "firebolt_vector_search",
+          "top_k": 10,
+          "vector_dims": 8,
+          "warmup_queries": 0
+        }
+      ]
+    },
+    "vector_topk_exact_10k_8d_k10": {
+      "engines": [
+        {
+          "build_time_scope": "table_load_before_timed_query",
+          "build_time_us": 33430.583,
+          "engine": "ultrasql",
+          "exact": true,
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "index_size_bytes": null,
+          "index_size_status": "not_applicable_exact_scan",
+          "iterations_us": [
+            7224.0,
+            7267.334000000001,
+            7346.0,
+            7538.541,
+            7717.208,
+            7820.292,
+            8334.875,
+            8743.707999999999
+          ],
+          "median_us": 7717.208,
+          "memory_bytes": null,
+          "memory_status": "not_measured",
+          "metric": "l2",
+          "min_us": 7224.0,
+          "n_rows": 10000,
+          "p50_latency_us": 7538.541,
+          "p95_latency_us": 8743.707999999999,
+          "p99_latency_us": 8743.707999999999,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "recall_at_k": 1.0,
+          "required_metrics": [
+            "recall_at_k",
+            "p50_latency_us",
+            "p95_latency_us",
+            "p99_latency_us",
+            "build_time_us",
+            "memory_bytes",
+            "index_size_bytes"
+          ],
+          "samples": 8,
+          "schema_version": 1,
+          "status": "measured",
+          "top_k": 10,
+          "vector_dims": 8
+        },
+        {
+          "build_time_scope": "table_load_before_timed_query",
+          "build_time_us": 93029.7500017332,
+          "engine": "duckdb_list",
+          "exact": true,
+          "index_size_bytes": null,
+          "index_size_status": "not_applicable_exact_scan",
+          "iterations_us": [
+            24955.08300489746,
+            24966.37500007637,
+            25090.12501104735,
+            25162.33299684245,
+            25380.790990311652,
+            25503.291995846663,
+            25612.249999539927,
+            25643.74999201391
+          ],
+          "median_us": 25271.561993577052,
+          "memory_bytes": null,
+          "memory_status": "not_measured",
+          "metric": "l2",
+          "min_us": 24955.08300489746,
+          "n_rows": 10000,
+          "p50_latency_us": 25162.33299684245,
+          "p95_latency_us": 25643.74999201391,
+          "p99_latency_us": 25643.74999201391,
+          "rank": 2,
+          "recall_at_k": 1.0,
+          "required_metrics": [
+            "recall_at_k",
+            "p50_latency_us",
+            "p95_latency_us",
+            "p99_latency_us",
+            "build_time_us",
+            "memory_bytes",
+            "index_size_bytes"
+          ],
+          "samples": 8,
+          "status": "measured",
+          "top_k": 10,
+          "vector_dims": 8
+        }
+      ]
+    },
+    "vector_topk_exact_512_8d_k5": {
+      "engines": [
+        {
+          "build_time_scope": "table_load_before_timed_query",
+          "build_time_us": 4895.792,
+          "engine": "ultrasql",
+          "exact": true,
+          "host": {
+            "cores": 10,
+            "cpu": "Apple M4",
+            "os": "macos unknown",
+            "ram_gb": 16
+          },
+          "index_size_bytes": null,
+          "index_size_status": "not_applicable_exact_scan",
+          "iterations_us": [
+            1231.0839999999998
+          ],
+          "median_us": 1231.0839999999998,
+          "memory_bytes": null,
+          "memory_status": "not_measured",
+          "metric": "l2",
+          "min_us": 1231.0839999999998,
+          "n_rows": 512,
+          "p50_latency_us": 1231.0839999999998,
+          "p95_latency_us": 1231.0839999999998,
+          "p99_latency_us": 1231.0839999999998,
+          "policy": "Raw measured samples only; no ranking or winner claim.",
+          "rank": 1,
+          "recall_at_k": 1.0,
+          "required_metrics": [
+            "recall_at_k",
+            "p50_latency_us",
+            "p95_latency_us",
+            "p99_latency_us",
+            "build_time_us",
+            "memory_bytes",
+            "index_size_bytes"
+          ],
+          "samples": 1,
+          "schema_version": 1,
+          "status": "measured",
+          "top_k": 5,
+          "vector_dims": 8
+        },
+        {
+          "build_time_scope": "table_load_before_timed_query",
+          "build_time_us": 37488.66601381451,
+          "engine": "duckdb_list",
+          "exact": true,
+          "index_size_bytes": null,
+          "index_size_status": "not_applicable_exact_scan",
+          "iterations_us": [
+            31047.12499771267
+          ],
+          "median_us": 31047.12499771267,
+          "memory_bytes": null,
+          "memory_status": "not_measured",
+          "metric": "l2",
+          "min_us": 31047.12499771267,
+          "n_rows": 512,
+          "p50_latency_us": 31047.12499771267,
+          "p95_latency_us": 31047.12499771267,
+          "p99_latency_us": 31047.12499771267,
+          "rank": 2,
+          "recall_at_k": 1.0,
+          "required_metrics": [
+            "recall_at_k",
+            "p50_latency_us",
+            "p95_latency_us",
+            "p99_latency_us",
+            "build_time_us",
+            "memory_bytes",
+            "index_size_bytes"
+          ],
+          "samples": 1,
+          "status": "measured",
+          "top_k": 5,
+          "vector_dims": 8
         }
       ]
     },
@@ -1843,6 +3948,64 @@
           "samples": 32
         },
         {
+          "core_mode": "local_docker",
+          "detail": null,
+          "docker_image": "ghcr.io/firebolt-db/firebolt-core:preview-rc",
+          "engine": "firebolt",
+          "firebolt_version": "4.31.13-0.20260424104720.5698ca5339fc",
+          "generated_at_unix": 1779403039,
+          "host_cpu": "arm",
+          "host_memory": 17179869184,
+          "iterations_us": [
+            14163.749990984796,
+            14225.08293762803,
+            14246.625010855496,
+            14601.000002585351,
+            14728.000038303437,
+            14835.083042271435,
+            14899.083063937724,
+            15116.624999791384,
+            15136.333997361362,
+            15410.290914587677,
+            15464.791911654174,
+            15495.041967369616,
+            15584.625070914626,
+            15659.542055800555,
+            15682.084020227194,
+            15706.790960393846,
+            15738.79097122699,
+            15983.49993582815,
+            16135.375015437605,
+            16239.291988313198,
+            16481.874976307154,
+            16693.374956957996,
+            16812.624991871417,
+            17015.91699384153,
+            17117.500072345138,
+            17674.415954388678,
+            17929.70800306648,
+            18299.333984032273,
+            18681.540968827903,
+            19218.83295290172,
+            20216.37500729412,
+            21064.667031168938
+          ],
+          "iters": 32,
+          "local_docker": true,
+          "median_us": 15722.790965810418,
+          "min_us": 14163.749990984796,
+          "n_rows": 65536,
+          "p95_us": 20216.37500729412,
+          "policy": "README Firebolt row is eligible only from local Firebolt Core on the same SQL shape.",
+          "query": "SELECT x, ROW_NUMBER() OVER (ORDER BY x) FROM ultrasql_readme_window_1779402994_61468",
+          "rank": 4,
+          "result_row_count": 65536,
+          "samples": 32,
+          "schema_version": 1,
+          "status": "measured",
+          "warmup": 1
+        },
+        {
           "engine": "sqlite3",
           "iterations_us": [
             29009.291902184486,
@@ -1881,7 +4044,7 @@
           "median_us": 30384.271,
           "min_us": 29009.292,
           "n_rows": 65536,
-          "rank": 4,
+          "rank": 5,
           "samples": 32
         },
         {
@@ -1923,7 +4086,7 @@
           "median_us": 55490.896,
           "min_us": 46683.25,
           "n_rows": 65536,
-          "rank": 5,
+          "rank": 6,
           "samples": 32
         }
       ]

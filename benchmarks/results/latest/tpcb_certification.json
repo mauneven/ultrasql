@@ -2,13 +2,8 @@
   "workload": "tpcb_32conn",
   "target": "UltraSQL throughput >= 2x PostgreSQL 17 and p99 < 5 ms at 32 clients",
   "passed": false,
-  "reason": "target_not_met",
-  "postgres_result": "benchmarks/results/latest/raw/tpcb_32conn-postgres17.json",
-  "ultrasql_result": "benchmarks/results/latest/raw/tpcb_32conn-ultrasql.json",
-  "postgres_throughput_per_sec": 419.54048392129056,
-  "ultrasql_throughput_per_sec": 665.9854550026466,
-  "throughput_ratio_ultrasql_vs_postgres": 1.5874164246985787,
-  "ultrasql_p99_latency_us": 531380.791,
-  "kernel_smoke_result": "benchmarks/results/latest/raw/tpcb_32conn-ultrasql-kernel.json",
-  "next_step": "Set POSTGRES_DSN for PostgreSQL 17 or let TPCB_AUTO_POSTGRES=1 start local postgres:17, then rerun the same command on a quiet host if certification is not yet passed."
+  "reason": "postgres_dsn_missing",
+  "postgres_result": null,
+  "ultrasql_result": null,
+  "next_step": "Set POSTGRES_DSN or POSTGRES_TPCB_RESULT for certification, or install Docker so TPCB_AUTO_POSTGRES=1 can start a local postgres:17. Set TPCB_ALLOW_ULTRASQL_ONLY=1 only for local UltraSQL-only smoke."
 }

@@ -40,6 +40,8 @@ enum Command {
     VectorMemory(VectorMemoryArgs),
     /// Run a PostgreSQL-wire TPC-B-shaped benchmark.
     Tpcb(TpcbArgs),
+    /// Run a local five-transaction TPC-C-shaped kernel benchmark.
+    Tpcc(TpccArgs),
 }
 
 /// ANN vector benchmark arguments.
@@ -189,6 +191,23 @@ struct TpcbArgs {
     output: Option<PathBuf>,
 }
 
+/// TPC-C local kernel benchmark arguments.
+#[derive(Clone, Debug, Args)]
+struct TpccArgs {
+    /// Artifact profile label.
+    #[arg(long, default_value = "local-kernel")]
+    profile: String,
+    /// Number of measured iterations.
+    #[arg(long, default_value_t = 5)]
+    iterations: u32,
+    /// Number of warmup iterations excluded from samples.
+    #[arg(long, default_value_t = 1)]
+    warmup: u32,
+    /// Output JSON path. Writes to stdout when omitted.
+    #[arg(long)]
+    output: Option<PathBuf>,
+}
+
 /// Engine selector for TPC-B.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum TpcbEngine {
@@ -206,6 +225,7 @@ fn main() -> ExitCode {
         Some(Command::FilteredVector(args)) => run_filtered_vector(args),
         Some(Command::VectorMemory(args)) => run_vector_memory_command(args),
         Some(Command::Tpcb(args)) => run_tpcb(args),
+        Some(Command::Tpcc(args)) => run_tpcc(args),
         None => {
             eprintln!(
                 "ultrasql-bench {}: use --help or a subcommand",
@@ -304,6 +324,61 @@ fn run_vector_memory_command(args: VectorMemoryArgs) -> ExitCode {
     }
 }
 
+#[derive(Serialize)]
+struct TpccArtifact {
+    schema_version: u32,
+    workload: &'static str,
+    engine: &'static str,
+    profile: String,
+    transaction_types: [&'static str; 5],
+    iterations: u32,
+    warmup: u32,
+    host: HostInfo,
+    throughput_per_sec: f64,
+    p50_latency_us: f64,
+    p99_latency_us: f64,
+    samples: Vec<f64>,
+    certification_scope: &'static str,
+}
+
+fn run_tpcc(args: TpccArgs) -> ExitCode {
+    let host = HostInfo::from_env();
+    let ctx = ultrasql_bench::registry::BenchContext {
+        iterations: args.iterations,
+        warmup_iterations: args.warmup,
+        host: host.clone(),
+    };
+    let result = ultrasql_bench::runs::tpcc::run(&ctx);
+    let artifact = TpccArtifact {
+        schema_version: 1,
+        workload: "tpcc_5types",
+        engine: "ultrasql",
+        profile: args.profile,
+        transaction_types: [
+            "NewOrder",
+            "Payment",
+            "OrderStatus",
+            "Delivery",
+            "StockLevel",
+        ],
+        iterations: args.iterations,
+        warmup: args.warmup,
+        host,
+        throughput_per_sec: result.throughput_per_sec,
+        p50_latency_us: result.p50_latency_us,
+        p99_latency_us: result.p99_latency_us,
+        samples: result.samples,
+        certification_scope: "local_kernel_not_wire_certification",
+    };
+    match write_artifact("tpcc benchmark", args.output.as_ref(), &artifact) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("tpcc benchmark failed: {err:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn write_artifact<T: Serialize>(
     label: &str,
     output: Option<&PathBuf>,
@@ -366,6 +441,20 @@ mod tests {
                 assert!(args.output.is_none());
             }
             _ => panic!("tpcb subcommand should parse"),
+        }
+    }
+
+    #[test]
+    fn tpcc_cli_defaults_to_local_kernel_shape() {
+        let cli = Cli::try_parse_from(["ultrasql-bench", "tpcc"]).expect("parse tpcc args");
+        match cli.command {
+            Some(Command::Tpcc(args)) => {
+                assert_eq!(args.profile, "local-kernel");
+                assert_eq!(args.iterations, 5);
+                assert_eq!(args.warmup, 1);
+                assert!(args.output.is_none());
+            }
+            _ => panic!("tpcc subcommand should parse"),
         }
     }
 

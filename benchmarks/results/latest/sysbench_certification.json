@@ -1,0 +1,13 @@
+{
+  "workload": "sysbench_oltp_read_write",
+  "target": "UltraSQL PostgreSQL-wire mixed OLTP artifact completes with positive latency samples",
+  "passed": true,
+  "reason": null,
+  "rows": 10000,
+  "iterations": 5,
+  "warmup": 1,
+  "ultrasql_result": "benchmarks/results/latest/raw/sysbench_oltp_read_write_10k-ultrasql.json",
+  "median_us": 143.6347370609319,
+  "samples": 5,
+  "competitor_claim": null
+}

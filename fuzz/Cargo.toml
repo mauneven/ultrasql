@@ -9,11 +9,37 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys    = "0.4"
+bytes            = "1"
+ultrasql-core    = { path = "../crates/ultrasql-core" }
 ultrasql-parser  = { path = "../crates/ultrasql-parser" }
+ultrasql-planner = { path = "../crates/ultrasql-planner" }
+ultrasql-protocol = { path = "../crates/ultrasql-protocol" }
+ultrasql-wal     = { path = "../crates/ultrasql-wal" }
 
 [[bin]]
 name = "parser_fuzz"
 path = "fuzz_targets/parser_fuzz.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "planner_fuzz"
+path = "fuzz_targets/planner_fuzz.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "protocol_fuzz"
+path = "fuzz_targets/protocol_fuzz.rs"
+test = false
+doc  = false
+bench = false
+
+[[bin]]
+name = "wal_record_fuzz"
+path = "fuzz_targets/wal_record_fuzz.rs"
 test = false
 doc  = false
 bench = false

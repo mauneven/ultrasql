@@ -51,8 +51,9 @@ fn tpcc_and_sysbench_certification_wrappers_write_artifacts() {
 
     assert!(tpcc.contains("tpcc_5types"));
     assert!(tpcc.contains("tpcc_certification.json"));
-    assert!(tpcc.contains("runner_not_implemented"));
-    assert!(tpcc.contains("exit 2"));
+    assert!(tpcc.contains("postgres_result_missing"));
+    assert!(tpcc.contains("ultrasql_scope"));
+    assert!(tpcc.contains("exit_code = 2"));
 
     assert!(sysbench.contains("sysbench_oltp_read_write"));
     assert!(sysbench.contains("cross_compare_sql"));

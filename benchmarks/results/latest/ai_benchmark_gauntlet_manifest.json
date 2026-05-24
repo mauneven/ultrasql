@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "profile": "smoke",
-  "generated_at_unix": 1779369465,
+  "profile": "full",
+  "generated_at_unix": 1779591162,
   "status": "passed",
   "passed": true,
   "suites": [
@@ -21,37 +21,37 @@
       "suite": "filtered_vector_search",
       "status": "passed",
       "exit_code": 0,
-      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_filtered_vector_search_smoke-ultrasql.json"
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_filtered_vector_search_full-ultrasql.json"
     },
     {
       "suite": "hybrid_search_latency",
       "status": "passed",
       "exit_code": 0,
-      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_hybrid_search_latency_smoke-ultrasql.json"
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_hybrid_search_latency_full-ultrasql.json"
     },
     {
       "suite": "rag_retrieval_quality",
       "status": "passed",
       "exit_code": 0,
-      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_rag_retrieval_quality_smoke-ultrasql.json"
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_rag_retrieval_quality_full-ultrasql.json"
     },
     {
       "suite": "ingestion_throughput",
       "status": "passed",
       "exit_code": 0,
-      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_ingestion_throughput_smoke-ultrasql.json"
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_ingestion_throughput_full-ultrasql.json"
     },
     {
       "suite": "memory_per_million_vectors",
       "status": "passed",
       "exit_code": 0,
-      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_memory_per_million_vectors_smoke-ultrasql.json"
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_memory_per_million_vectors_full-ultrasql.json"
     },
     {
       "suite": "cold_start_index_load",
       "status": "passed",
       "exit_code": 0,
-      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_cold_start_index_load_smoke-ultrasql.json"
+      "artifact": "benchmarks/results/latest/raw/ai_gauntlet_cold_start_index_load_full-ultrasql.json"
     }
   ],
   "policy": "AI benchmark gauntlet requires every UltraSQL suite to emit measured artifacts. Smoke profiles may record missing competitors inside child artifacts, but UltraSQL runner gaps fail this manifest."

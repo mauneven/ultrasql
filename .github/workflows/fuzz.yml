@@ -8,6 +8,7 @@ on:
   pull_request:
     paths:
       - 'crates/ultrasql-parser/**'
+      - 'crates/ultrasql-planner/**'
       - 'crates/ultrasql-wal/**'
       - 'crates/ultrasql-protocol/**'
       - 'fuzz/**'
@@ -33,6 +34,9 @@ jobs:
       matrix:
         target:
           - parser_fuzz
+          - planner_fuzz
+          - protocol_fuzz
+          - wal_record_fuzz
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly

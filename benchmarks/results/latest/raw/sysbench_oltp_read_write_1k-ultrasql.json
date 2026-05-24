@@ -1,0 +1,1 @@
+{"engine":"ultrasql","host":{"cores":10,"cpu":"Apple M4","os":"macos unknown","ram_gb":16},"iterations_us":[73.55251158343752],"median_us":73.55251158343752,"min_us":73.55251158343752,"n_rows":1000,"policy":"Raw measured samples only; no ranking or winner claim.","samples":1,"schema_version":1,"status":"measured","workload":"sysbench_oltp_read_write_1k"}

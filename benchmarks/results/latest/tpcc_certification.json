@@ -1,0 +1,7 @@
+{
+  "workload": "tpcc_5types",
+  "target": "TPC-C NewOrder, Payment, OrderStatus, Delivery, and StockLevel with durable commits and concurrent PostgreSQL-wire sessions",
+  "passed": false,
+  "reason": "runner_not_implemented",
+  "next_step": "Replace crates/ultrasql-bench/src/runs/tpcc.rs placeholder with a real TPC-C runner, then make this script measure UltraSQL and PostgreSQL on the same host."
+}

@@ -18,16 +18,16 @@
   "ef_search": 64,
   "seed": 1367265502,
   "recall_at_k": 1.0,
-  "p50_latency_us": 138.291,
-  "p95_latency_us": 147.709,
-  "p99_latency_us": 147.709,
-  "build_time_us": 4787.790999999999,
+  "p50_latency_us": 278.83299999999997,
+  "p95_latency_us": 309.25,
+  "p99_latency_us": 309.25,
+  "build_time_us": 10106.291,
   "memory_bytes": 175560,
   "query_iterations_us": [
-    138.291,
-    144.792,
-    147.709,
-    123.04199999999999
+    309.25,
+    278.83299999999997,
+    295.20799999999997,
+    250.62499999999997
   ],
   "recall_iterations": [
     1.0,
