@@ -27,7 +27,7 @@
 //! workloads land on the fast path.
 
 use num_traits::ToPrimitive;
-use ultrasql_core::{DataType, GeometryValue, RangeValue, Schema, Value};
+use ultrasql_core::{DataType, GeometryValue, Oid, RangeValue, Schema, Value, unpack_timetz};
 use ultrasql_planner::{BinaryOp, ScalarExpr};
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn, StringColumn};
@@ -179,6 +179,12 @@ impl Filter {
                         |narrow| cmp_i32_scalar(c, narrow, *op),
                     )),
                     (Column::Int64(c), Value::Int64(v)) => Some(cmp_i64_scalar(c, *v, *op)),
+                    (Column::Int64(c), Value::Money(v)) => Some(cmp_i64_scalar(c, *v, *op)),
+                    (Column::Int64(c), Value::Oid(v))
+                    | (Column::Int64(c), Value::RegClass(v))
+                    | (Column::Int64(c), Value::RegType(v)) => {
+                        Some(cmp_i64_scalar(c, i64::from(v.raw()), *op))
+                    }
                     (Column::Int64(c), Value::Time(v))
                     | (Column::Int64(c), Value::Timestamp(v))
                     | (Column::Int64(c), Value::TimestampTz(v)) => Some(cmp_i64_scalar(c, *v, *op)),
@@ -511,6 +517,10 @@ fn raw_ordering_matches_logical_ordering(left: &DataType, right: &DataType) -> b
         (DataType::Int16, DataType::Int16)
         | (DataType::Int32, DataType::Int32)
         | (DataType::Int64, DataType::Int64)
+        | (DataType::Money, DataType::Money)
+        | (DataType::Oid, DataType::Oid)
+        | (DataType::RegClass, DataType::RegClass)
+        | (DataType::RegType, DataType::RegType)
         | (DataType::Date, DataType::Date)
         | (DataType::Time, DataType::Time)
         | (DataType::Timestamp, DataType::Timestamp)
@@ -625,15 +635,31 @@ fn build_empty_batch(schema: &Schema) -> Result<Batch, ExecError> {
             DataType::Int16 | DataType::Int32 | DataType::Date => {
                 Column::Int32(NumericColumn::from_data(vec![]))
             }
-            DataType::Int64 => Column::Int64(NumericColumn::from_data(vec![])),
+            DataType::Int64 | DataType::Oid | DataType::RegClass | DataType::RegType => {
+                Column::Int64(NumericColumn::from_data(vec![]))
+            }
             DataType::Decimal { .. }
+            | DataType::Money
             | DataType::Time
+            | DataType::TimeTz
             | DataType::Timestamp
             | DataType::TimestampTz => Column::Int64(NumericColumn::from_data(vec![])),
             DataType::Float32 => Column::Float32(NumericColumn::from_data(vec![])),
             DataType::Float64 => Column::Float64(NumericColumn::from_data(vec![])),
             DataType::Text { .. }
+            | DataType::Enum { .. }
+            | DataType::Composite { .. }
+            | DataType::Char { .. }
+            | DataType::Bit { .. }
+            | DataType::VarBit { .. }
+            | DataType::Inet
+            | DataType::Cidr
+            | DataType::MacAddr
+            | DataType::MacAddr8
+            | DataType::Json
             | DataType::Jsonb
+            | DataType::Xml
+            | DataType::PgLsn
             | DataType::Vector { .. }
             | DataType::HalfVec { .. }
             | DataType::SparseVec { .. }
@@ -684,7 +710,8 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
         let is_null = |nulls: Option<&ultrasql_vec::bitmap::Bitmap>, i: usize| -> bool {
             nulls.is_some_and(|b| !b.get(i))
         };
-        match (col, &field.data_type) {
+        let storage_type = field.data_type.storage_type();
+        match (col, storage_type) {
             (Column::Int32(c), DataType::Int16) => {
                 let nulls = c.nulls();
                 for (row_idx, row) in rows.iter_mut().enumerate() {
@@ -718,6 +745,38 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                         row.push(Value::Null);
                     } else {
                         row.push(Value::Int64(c.data()[row_idx]));
+                    }
+                }
+            }
+            (Column::Int64(c), DataType::Money) => {
+                let nulls = c.nulls();
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    if is_null(nulls, row_idx) {
+                        row.push(Value::Null);
+                    } else {
+                        row.push(Value::Money(c.data()[row_idx]));
+                    }
+                }
+            }
+            (Column::Int64(c), DataType::Oid | DataType::RegClass | DataType::RegType) => {
+                let nulls = c.nulls();
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    if is_null(nulls, row_idx) {
+                        row.push(Value::Null);
+                    } else {
+                        let raw = u32::try_from(c.data()[row_idx]).map_err(|_| {
+                            ExecError::TypeMismatch(format!(
+                                "column {col_idx} ({name}): OID value out of range",
+                                name = field.name,
+                            ))
+                        })?;
+                        let oid = Oid::new(raw);
+                        row.push(match storage_type {
+                            DataType::Oid => Value::Oid(oid),
+                            DataType::RegClass => Value::RegClass(oid),
+                            DataType::RegType => Value::RegType(oid),
+                            _ => unreachable!(),
+                        });
                     }
                 }
             }
@@ -759,10 +818,102 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                     }
                 }
             }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Enum { .. }) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => row.push(Value::Text(v.to_owned())),
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Composite { .. }) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => row.push(Value::Text(v.to_owned())),
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Char { .. }) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => row.push(Value::Char(v.to_owned())),
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (
+                Column::Utf8(_) | Column::DictionaryUtf8(_),
+                DataType::Bit { .. } | DataType::VarBit { .. },
+            ) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => row.push(parse_bit_string_text_cell(
+                            v,
+                            &field.data_type,
+                            col_idx,
+                            field.name.as_str(),
+                        )?),
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (
+                Column::Utf8(_) | Column::DictionaryUtf8(_),
+                DataType::Inet | DataType::Cidr | DataType::MacAddr | DataType::MacAddr8,
+            ) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => {
+                            row
+                                .push(Value::parse_network(&field.data_type, v).ok_or_else(|| {
+                                ExecError::TypeMismatch(format!(
+                                    "column {col_idx} ({name}): invalid {expected_type} literal",
+                                    name = field.name,
+                                    expected_type = field.data_type,
+                                ))
+                            })?)
+                        }
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Json) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => row.push(Value::Json(v.to_owned())),
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
             (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Jsonb) => {
                 for (row_idx, row) in rows.iter_mut().enumerate() {
                     match col.text_value(row_idx) {
                         Some(v) => row.push(Value::Jsonb(v.to_owned())),
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::Xml) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => row.push(Value::Xml(v.to_owned())),
+                        None => row.push(Value::Null),
+                    }
+                }
+            }
+            (Column::Utf8(_) | Column::DictionaryUtf8(_), DataType::PgLsn) => {
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    match col.text_value(row_idx) {
+                        Some(v) => {
+                            let lsn = Value::parse_pg_lsn_text(v).ok_or_else(|| {
+                                ExecError::TypeMismatch(format!(
+                                    "column {col_idx} ({name}): invalid pg_lsn literal",
+                                    name = field.name,
+                                ))
+                            })?;
+                            row.push(Value::PgLsn(lsn));
+                        }
                         None => row.push(Value::Null),
                     }
                 }
@@ -956,6 +1107,25 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
                     }
                 }
             }
+            (Column::Int64(c), DataType::TimeTz) => {
+                let nulls = c.nulls();
+                for (row_idx, row) in rows.iter_mut().enumerate() {
+                    if is_null(nulls, row_idx) {
+                        row.push(Value::Null);
+                    } else {
+                        let (micros, offset_seconds) = unpack_timetz(c.data()[row_idx])
+                            .ok_or_else(|| {
+                                ExecError::TypeMismatch(format!(
+                                    "invalid TimeTz payload at row {row_idx}"
+                                ))
+                            })?;
+                        row.push(Value::TimeTz {
+                            micros,
+                            offset_seconds,
+                        });
+                    }
+                }
+            }
             (col_var, expected_type) => {
                 return Err(ExecError::TypeMismatch(format!(
                     "column {col_idx} ({name}): batch column type {:?} does not match schema type {expected_type}",
@@ -967,6 +1137,25 @@ pub fn batch_to_rows(batch: &Batch, schema: &Schema) -> Result<Vec<Vec<Value>>, 
     }
 
     Ok(rows)
+}
+
+fn parse_bit_string_text_cell(
+    text: &str,
+    expected_type: &DataType,
+    col_idx: usize,
+    name: &str,
+) -> Result<Value, ExecError> {
+    let bits = Value::parse_bit_string(text).ok_or_else(|| {
+        ExecError::TypeMismatch(format!(
+            "column {col_idx} ({name}): invalid {expected_type} literal"
+        ))
+    })?;
+    match &bits {
+        Value::BitString(bit_string) if bit_string.matches_type(expected_type) => Ok(bits),
+        _ => Err(ExecError::TypeMismatch(format!(
+            "column {col_idx} ({name}): invalid {expected_type} length"
+        ))),
+    }
 }
 
 fn parse_vector_family_text_cell(

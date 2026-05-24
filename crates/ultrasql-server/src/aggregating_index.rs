@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use ultrasql_catalog::{IndexEntry, TableEntry};
-use ultrasql_core::{DataType, RelationId, Schema, Value};
+use ultrasql_core::{DataType, RelationId, Schema, Value, bpchar_semantic_text};
 use ultrasql_executor::{Eval, Operator, RowCodec, Sort, ValuesScan};
 use ultrasql_mvcc::Snapshot;
 use ultrasql_planner::{
@@ -829,6 +829,11 @@ fn compare_values(op: BinaryOp, left: &Value, right: &Value) -> Result<bool, Ser
     }
     match (op, left, right) {
         (BinaryOp::Eq, Value::Text(l), Value::Text(r)) => Ok(l == r),
+        (BinaryOp::Eq, Value::Char(l), Value::Char(r)) => {
+            Ok(bpchar_semantic_text(l) == bpchar_semantic_text(r))
+        }
+        (BinaryOp::Eq, Value::Char(l), Value::Text(r)) => Ok(bpchar_semantic_text(l) == r),
+        (BinaryOp::Eq, Value::Text(l), Value::Char(r)) => Ok(l == bpchar_semantic_text(r)),
         (BinaryOp::Eq, Value::Bool(l), Value::Bool(r)) => Ok(l == r),
         _ => Err(ServerError::Unsupported(
             "aggregating index summary predicate supports integer, text equality, and bool equality",

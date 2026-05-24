@@ -12,7 +12,9 @@
 //! single-file layout had.
 
 use ultrasql_core::{
-    DataType, GeometryType, GeometryValue, MAX_VECTOR_DIMS, RangeType, RangeValue, Value,
+    BitString, DataType, GeometryType, GeometryValue, MAX_VECTOR_DIMS, Oid, RangeType, RangeValue,
+    Value, coerce_bpchar_text, composite_text_matches_arity, parse_decimal_text, parse_money_text,
+    parse_time_text, parse_timetz_text,
 };
 use ultrasql_parser::ast::{BinaryOp, Expr, Literal, UnaryOp};
 
@@ -449,10 +451,19 @@ fn bind_cast_expr(
     cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
-    let target_type = resolve_cast_type(&target.value).ok_or(PlanError::NotSupported(
-        "CAST target type is not implemented",
-    ))?;
+    let target_type = resolve_cast_type_with_catalog(&target.value, catalog).ok_or(
+        PlanError::NotSupported("CAST target type is not implemented"),
+    )?;
     let mut bound = bind_expr_with_ctes(inner, input, catalog, cte_catalog, scope)?;
+    if coerce_literal_to_bpchar(&mut bound, &target_type, true) {
+        return Ok(bound);
+    }
+    if coerce_literal_to_bit_string(&mut bound, &target_type, true) {
+        return Ok(bound);
+    }
+    if coerce_literal_to_oid_alias_with_catalog(&mut bound, &target_type, catalog) {
+        return Ok(bound);
+    }
     coerce_literal_to_type(&mut bound, &target_type);
     let actual_type = bound.data_type();
     if cast_result_matches(&target_type, &actual_type) || matches!(actual_type, DataType::Null) {
@@ -575,7 +586,9 @@ pub(super) fn make_binary(
     mut left: ScalarExpr,
     mut right: ScalarExpr,
 ) -> Result<ScalarExpr, PlanError> {
-    coerce_literal_to_match(&mut left, &mut right);
+    if !binary_operator_uses_raw_text_pattern(op) {
+        coerce_literal_to_match(&mut left, &mut right);
+    }
     let data_type = binary_result_type(op, left.data_type(), right.data_type())?;
     Ok(ScalarExpr::Binary {
         op,
@@ -624,36 +637,84 @@ fn bind_array_literal(
     cte_catalog: &[(String, Schema)],
     scope: &mut ScopeStack,
 ) -> Result<ScalarExpr, PlanError> {
-    let mut values = Vec::with_capacity(elements.len());
+    let mut bound_elements = Vec::with_capacity(elements.len());
     let mut element_type: Option<DataType> = None;
     for element in elements {
         let bound = bind_expr_with_ctes(element, input, catalog, cte_catalog, scope)?;
+        let ScalarExpr::Literal { data_type, .. } = &bound else {
+            return Err(PlanError::TypeMismatch(
+                "array literal elements must be constant expressions".to_owned(),
+            ));
+        };
+        if !matches!(data_type, DataType::Null) {
+            element_type = Some(if let Some(expected) = element_type {
+                common_array_element_type(&expected, data_type)?
+            } else {
+                data_type.clone()
+            });
+        }
+        bound_elements.push(bound);
+    }
+
+    let element_type = element_type.unwrap_or(DataType::Null);
+    let mut values = Vec::with_capacity(elements.len());
+    for mut bound in bound_elements {
+        coerce_literal_to_type(&mut bound, &element_type);
         let ScalarExpr::Literal { value, data_type } = bound else {
             return Err(PlanError::TypeMismatch(
                 "array literal elements must be constant expressions".to_owned(),
             ));
         };
-        if data_type != DataType::Null {
-            if let Some(expected) = &element_type {
-                if expected != &data_type {
-                    return Err(PlanError::TypeMismatch(
-                        "array literal elements must share one type".to_owned(),
-                    ));
-                }
-            } else {
-                element_type = Some(data_type.clone());
-            }
+        if !matches!(data_type, DataType::Null) && data_type != element_type {
+            return Err(PlanError::TypeMismatch(
+                "array literal elements must share one type".to_owned(),
+            ));
         }
         values.push(value);
     }
-    let element_type = element_type.unwrap_or(DataType::Null);
+    let value = Value::Array {
+        element_type: element_type.clone(),
+        elements: values,
+    };
+    if value.array_dimensions().is_none() {
+        return Err(PlanError::TypeMismatch(
+            "multi-dimensional array literal must be rectangular".to_owned(),
+        ));
+    }
     Ok(ScalarExpr::Literal {
-        value: Value::Array {
-            element_type: element_type.clone(),
-            elements: values,
-        },
+        value,
         data_type: DataType::Array(Box::new(element_type)),
     })
+}
+
+fn common_array_element_type(left: &DataType, right: &DataType) -> Result<DataType, PlanError> {
+    if left == right || matches!(right, DataType::Null) {
+        return Ok(left.clone());
+    }
+    if matches!(left, DataType::Null) {
+        return Ok(right.clone());
+    }
+    match (left, right) {
+        (DataType::Array(left_inner), DataType::Array(right_inner)) => {
+            common_array_element_type(left_inner, right_inner)
+                .map(|inner| DataType::Array(Box::new(inner)))
+        }
+        (DataType::Array(_), _) | (_, DataType::Array(_)) => Err(PlanError::TypeMismatch(
+            "array literal dimensions must match".to_owned(),
+        )),
+        _ if left.is_numeric() && right.is_numeric() => left.numeric_join(right).map_err(|_| {
+            PlanError::TypeMismatch(format!(
+                "array literal elements must share a coercible type, got {left} and {right}"
+            ))
+        }),
+        _ if left.is_textlike() && right.is_textlike() => Ok(DataType::Text { max_len: None }),
+        (DataType::Json, DataType::Jsonb) | (DataType::Jsonb, DataType::Json) => {
+            Ok(DataType::Jsonb)
+        }
+        _ => Err(PlanError::TypeMismatch(format!(
+            "array literal elements must share a coercible type, got {left} and {right}"
+        ))),
+    }
 }
 
 /// Convert a `TYPENAME 'literal'` AST node into the matching
@@ -671,6 +732,12 @@ fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> Scala
     let type_name = type_name.to_ascii_lowercase();
     if let Some(target) = parse_vector_family_type_name(&type_name) {
         return bind_vector_family_literal(value, target);
+    }
+    if matches!(type_name.as_str(), "bit" | "varbit" | "bit varying") {
+        return bind_bit_string_literal(value, type_name.as_str());
+    }
+    if let Some(target) = parse_network_type_name(&type_name) {
+        return bind_network_literal(value, target);
     }
     match type_name.as_str() {
         "date" => match parse_date_literal(value) {
@@ -697,9 +764,88 @@ fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> Scala
                 data_type: DataType::Interval,
             },
         },
-        "json" | "jsonb" => ScalarExpr::Literal {
-            value: Value::Jsonb(value.to_owned()),
-            data_type: DataType::Jsonb,
+        "time" => match parse_time_of_day_micros(value) {
+            Some(micros) => ScalarExpr::Literal {
+                value: Value::Time(micros),
+                data_type: DataType::Time,
+            },
+            None => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::Time,
+            },
+        },
+        "timetz" | "time with time zone" => match parse_timetz_literal(value) {
+            Some((micros, offset_seconds)) => ScalarExpr::Literal {
+                value: Value::TimeTz {
+                    micros,
+                    offset_seconds,
+                },
+                data_type: DataType::TimeTz,
+            },
+            None => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::TimeTz,
+            },
+        },
+        "json" => match validate_json_text(value) {
+            Some(text) => ScalarExpr::Literal {
+                value: Value::Json(text),
+                data_type: DataType::Json,
+            },
+            None => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::Json,
+            },
+        },
+        "jsonb" => match normalize_jsonb_text(value) {
+            Some(text) => ScalarExpr::Literal {
+                value: Value::Jsonb(text),
+                data_type: DataType::Jsonb,
+            },
+            None => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::Jsonb,
+            },
+        },
+        "xml" => match Value::validate_xml_text(value) {
+            Some(text) => ScalarExpr::Literal {
+                value: Value::Xml(text),
+                data_type: DataType::Xml,
+            },
+            None => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::Xml,
+            },
+        },
+        "money" => match parse_money_text(value) {
+            Ok(money) => ScalarExpr::Literal {
+                value: money,
+                data_type: DataType::Money,
+            },
+            Err(_) => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::Money,
+            },
+        },
+        "oid" => match Value::parse_oid_text(value) {
+            Some(oid) => ScalarExpr::Literal {
+                value: Value::Oid(oid),
+                data_type: DataType::Oid,
+            },
+            None => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::Oid,
+            },
+        },
+        "pg_lsn" => match Value::parse_pg_lsn_text(value) {
+            Some(lsn) => ScalarExpr::Literal {
+                value: Value::PgLsn(lsn),
+                data_type: DataType::PgLsn,
+            },
+            None => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::PgLsn,
+            },
         },
         "timestamp" => match parse_timestamp_literal(value) {
             Some(micros) => ScalarExpr::Literal {
@@ -711,6 +857,16 @@ fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> Scala
                 data_type: DataType::Timestamp,
             },
         },
+        "timestamptz" | "timestamp with time zone" => match parse_timestamptz_literal(value) {
+            Some(micros) => ScalarExpr::Literal {
+                value: Value::TimestampTz(micros),
+                data_type: DataType::TimestampTz,
+            },
+            None => ScalarExpr::Literal {
+                value: Value::Null,
+                data_type: DataType::TimestampTz,
+            },
+        },
         "tsvector" | "tsquery" => ScalarExpr::Literal {
             value: Value::Text(value.to_owned()),
             data_type: DataType::Text { max_len: None },
@@ -719,6 +875,47 @@ fn bind_typed_literal(type_name: &str, value: &str, unit: Option<&str>) -> Scala
             value: Value::Null,
             data_type: DataType::Null,
         },
+    }
+}
+
+fn validate_json_text(value: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(value).ok()?;
+    Some(value.to_owned())
+}
+
+fn normalize_jsonb_text(value: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(value).ok()?;
+    serde_json::to_string(&parsed).ok()
+}
+
+fn bind_bit_string_literal(value: &str, type_name: &str) -> ScalarExpr {
+    let Some(Value::BitString(bits)) = Value::parse_bit_string(value) else {
+        return ScalarExpr::Literal {
+            value: Value::Null,
+            data_type: if type_name == "bit" {
+                DataType::Bit { len: None }
+            } else {
+                DataType::VarBit { max_len: None }
+            },
+        };
+    };
+    let len = Some(bits.len());
+    ScalarExpr::Literal {
+        value: Value::BitString(bits),
+        data_type: if type_name == "bit" {
+            DataType::Bit { len }
+        } else {
+            DataType::VarBit { max_len: len }
+        },
+    }
+}
+
+fn bind_network_literal(value: &str, data_type: DataType) -> ScalarExpr {
+    let parsed =
+        Value::parse_network(&data_type, value).unwrap_or_else(|| Value::Text(value.to_owned()));
+    ScalarExpr::Literal {
+        value: parsed,
+        data_type,
     }
 }
 
@@ -815,32 +1012,24 @@ fn parse_timestamp_literal(text: &str) -> Option<i64> {
     days.checked_mul(MICROS_PER_DAY)?.checked_add(micros)
 }
 
+fn parse_timestamptz_literal(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    let split = trimmed.find(' ').or_else(|| trimmed.find('T'))?;
+    let date = &trimmed[..split];
+    let time = &trimmed[split + 1..];
+    let days = i64::from(parse_date_literal(date)?);
+    let (micros, offset_seconds) = parse_timetz_literal(time)?;
+    days.checked_mul(MICROS_PER_DAY)?
+        .checked_add(micros)?
+        .checked_sub(i64::from(offset_seconds).checked_mul(1_000_000)?)
+}
+
 fn parse_time_of_day_micros(text: &str) -> Option<i64> {
-    let mut parts = text.splitn(3, ':');
-    let hour: i64 = parts.next()?.parse().ok()?;
-    let minute: i64 = parts.next()?.parse().ok()?;
-    let second_text = parts.next()?;
-    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
-        return None;
-    }
-    let (second_part, frac_part) = second_text
-        .split_once('.')
-        .map_or((second_text, ""), |(sec, frac)| (sec, frac));
-    let second: i64 = second_part.parse().ok()?;
-    if !(0..=59).contains(&second) {
-        return None;
-    }
-    let mut frac_micros = 0_i64;
-    let mut scale = 100_000_i64;
-    for ch in frac_part.chars().take(6) {
-        let digit = i64::from(ch.to_digit(10)?);
-        frac_micros = frac_micros.checked_add(digit.checked_mul(scale)?)?;
-        scale /= 10;
-    }
-    hour.checked_mul(3_600_000_000)?
-        .checked_add(minute.checked_mul(60_000_000)?)?
-        .checked_add(second.checked_mul(1_000_000)?)?
-        .checked_add(frac_micros)
+    parse_time_text(text)
+}
+
+fn parse_timetz_literal(text: &str) -> Option<(i64, i32)> {
+    parse_timetz_text(text)
 }
 
 #[allow(
@@ -1035,13 +1224,16 @@ fn builtin_return_type(func_name: &str) -> Result<DataType, PlanError> {
         | "random" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "pi" => {
             Ok(DataType::Float64)
         }
-        "length" | "position" => Ok(DataType::Int32),
+        "length" | "position" | "bit_length" | "octet_length" | "get_bit" => Ok(DataType::Int32),
+        "bit_count" => Ok(DataType::Int64),
+        "set_bit" => Ok(DataType::VarBit { max_len: None }),
         "lower" | "upper" | "trim" | "lpad" | "rpad" | "left" | "right" | "substr"
         | "substring" | "replace" | "split_part" | "concat" | "concat_ws" | "repeat"
         | "reverse" | "md5" | "sha256" | "quote_ident" | "format" | "regexp_replace" => {
             Ok(DataType::Text { max_len: None })
         }
         "row_to_json" | "json_build_object" | "jsonb_set" => Ok(DataType::Jsonb),
+        "jsonb_path_exists" => Ok(DataType::Bool),
         "pg_advisory_lock" | "pg_advisory_unlock_all" => Ok(DataType::Null),
         "pg_try_advisory_lock" | "pg_advisory_unlock" => Ok(DataType::Bool),
         "pg_get_userbyid" => Ok(DataType::Text { max_len: None }),
@@ -1101,6 +1293,11 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "atan"
             | "pi"
             | "length"
+            | "bit_length"
+            | "octet_length"
+            | "bit_count"
+            | "get_bit"
+            | "set_bit"
             | "lower"
             | "upper"
             | "trim"
@@ -1126,6 +1323,7 @@ pub(super) fn is_supported_builtin(func_name: &str) -> bool {
             | "row_to_json"
             | "json_build_object"
             | "jsonb_set"
+            | "jsonb_path_exists"
             | "pg_advisory_lock"
             | "pg_try_advisory_lock"
             | "pg_advisory_unlock"
@@ -1162,8 +1360,19 @@ fn validate_builtin_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(),
         "hybrid_search" => validate_hybrid_search_args(args),
         "vector_norm" | "l2_norm" => validate_vector_norm_args(func_name, args),
         "vector_dims" => validate_vector_dims_args(args),
+        "jsonb_path_exists" => validate_jsonb_path_exists_args(args),
         _ => Ok(()),
     }
+}
+
+fn validate_jsonb_path_exists_args(args: &[ScalarExpr]) -> Result<(), PlanError> {
+    if args.len() != 2 {
+        return Err(PlanError::TypeMismatch(format!(
+            "jsonb_path_exists: expected 2 arguments, got {}",
+            args.len()
+        )));
+    }
+    Ok(())
 }
 
 fn validate_vector_metric_args(func_name: &str, args: &mut [ScalarExpr]) -> Result<(), PlanError> {
@@ -1248,9 +1457,12 @@ fn validate_hybrid_search_args(args: &mut [ScalarExpr]) -> Result<(), PlanError>
     }
 
     let text_type = args[0].data_type();
-    if !matches!(text_type, DataType::Text { .. } | DataType::Jsonb) {
+    if !matches!(
+        text_type,
+        DataType::Text { .. } | DataType::Json | DataType::Jsonb
+    ) {
         return Err(PlanError::TypeMismatch(format!(
-            "hybrid_search: first argument must be text or jsonb, got {text_type}"
+            "hybrid_search: first argument must be text/json/jsonb, got {text_type}"
         )));
     }
 
@@ -1373,18 +1585,9 @@ fn parse_decimal_literal(text: &str) -> Option<(i64, i32)> {
     if text.contains('e') || text.contains('E') {
         return None;
     }
-    let (negative, unsigned) = text
-        .strip_prefix('-')
-        .map_or((false, text), |stripped| (true, stripped));
-    let (whole, frac) = unsigned.split_once('.')?;
-    let scale = i32::try_from(frac.len()).ok()?;
-    let mut digits = String::with_capacity(whole.len() + frac.len());
-    digits.push_str(if whole.is_empty() { "0" } else { whole });
-    digits.push_str(frac);
-    let mut value = digits.parse::<i64>().ok()?;
-    if negative {
-        value = value.checked_neg()?;
-    }
+    let Value::Decimal { value, scale } = parse_decimal_text(text, None).ok()? else {
+        return None;
+    };
     Some((value, scale))
 }
 
@@ -1436,6 +1639,128 @@ fn decimal_from_numeric_value(value: &Value, target_scale: Option<i32>) -> Optio
         } if *decimal_scale == scale => Some((*decimal_value, scale)),
         _ => None,
     }
+}
+
+fn money_from_literal_value(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int16(v) => i64::from(*v).checked_mul(100),
+        Value::Int32(v) => i64::from(*v).checked_mul(100),
+        Value::Int64(v) => v.checked_mul(100),
+        Value::Float32(_) | Value::Float64(_) => None,
+        Value::Decimal {
+            value: decimal_value,
+            scale,
+        } => {
+            let rendered = Value::Decimal {
+                value: *decimal_value,
+                scale: *scale,
+            }
+            .to_string();
+            let Value::Money(cents) = parse_money_text(&rendered).ok()? else {
+                return None;
+            };
+            Some(cents)
+        }
+        Value::Text(text) => {
+            let Value::Money(cents) = parse_money_text(text).ok()? else {
+                return None;
+            };
+            Some(cents)
+        }
+        Value::Money(cents) => Some(*cents),
+        _ => None,
+    }
+}
+
+fn oid_from_literal_value(value: &Value) -> Option<Oid> {
+    match value {
+        Value::Int16(v) => u32::try_from(*v).ok().map(Oid::new),
+        Value::Int32(v) => u32::try_from(*v).ok().map(Oid::new),
+        Value::Int64(v) => u32::try_from(*v).ok().map(Oid::new),
+        Value::Text(text) | Value::Char(text) => Value::parse_oid_text(text),
+        Value::Oid(oid) | Value::RegClass(oid) | Value::RegType(oid) => Some(*oid),
+        _ => None,
+    }
+}
+
+fn coerce_literal_to_oid_alias(expr: &mut ScalarExpr, target: &DataType) -> bool {
+    fold_signed_literal(expr);
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        return false;
+    };
+    if matches!(data_type, DataType::Null) && matches!(value, Value::Null) {
+        if target.is_oid_alias() || matches!(target, DataType::PgLsn) {
+            *data_type = target.clone();
+            return true;
+        }
+        return false;
+    }
+    match target {
+        DataType::Oid | DataType::RegClass | DataType::RegType => {
+            let Some(oid) = oid_from_literal_value(value) else {
+                return false;
+            };
+            *value = match target {
+                DataType::Oid => Value::Oid(oid),
+                DataType::RegClass => Value::RegClass(oid),
+                DataType::RegType => Value::RegType(oid),
+                _ => unreachable!(),
+            };
+            *data_type = target.clone();
+            true
+        }
+        DataType::PgLsn => {
+            let parsed = match value {
+                Value::PgLsn(lsn) => Some(*lsn),
+                Value::Text(text) | Value::Char(text) => Value::parse_pg_lsn_text(text),
+                _ => None,
+            };
+            let Some(lsn) = parsed else {
+                return false;
+            };
+            *value = Value::PgLsn(lsn);
+            *data_type = DataType::PgLsn;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn coerce_literal_to_oid_alias_with_catalog(
+    expr: &mut ScalarExpr,
+    target: &DataType,
+    catalog: &dyn Catalog,
+) -> bool {
+    fold_signed_literal(expr);
+    if matches!(target, DataType::RegClass | DataType::RegType) {
+        let ScalarExpr::Literal { value, data_type } = expr else {
+            return false;
+        };
+        if matches!(data_type, DataType::Null) && matches!(value, Value::Null) {
+            *data_type = target.clone();
+            return true;
+        }
+        let resolved = match (target, &*value) {
+            (DataType::RegClass, Value::Text(text) | Value::Char(text)) => {
+                Value::parse_oid_text(text).or_else(|| catalog.lookup_table_oid(text))
+            }
+            (DataType::RegType, Value::Text(text) | Value::Char(text)) => {
+                Value::parse_oid_text(text).or_else(|| catalog.lookup_type_oid(text))
+            }
+            _ => oid_from_literal_value(value),
+        };
+        let Some(oid) = resolved else {
+            return false;
+        };
+        *value = match target {
+            DataType::RegClass => Value::RegClass(oid),
+            DataType::RegType => Value::RegType(oid),
+            _ => unreachable!(),
+        };
+        *data_type = target.clone();
+        return true;
+    }
+    coerce_literal_to_oid_alias(expr, target)
 }
 
 fn decimal_from_f64(value: f64, scale: i32) -> Option<i64> {
@@ -1511,6 +1836,37 @@ fn fold_signed_literal(expr: &mut ScalarExpr) {
 
 pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
     fold_signed_literal(expr);
+    if let DataType::Domain { base_type, .. } = target {
+        coerce_literal_to_type(expr, base_type);
+        let ScalarExpr::Literal { data_type, .. } = expr else {
+            return;
+        };
+        if *data_type == **base_type || matches!(data_type, DataType::Null) {
+            *data_type = target.clone();
+        }
+        return;
+    }
+    if coerce_literal_to_bit_string(expr, target, false) {
+        return;
+    }
+    if coerce_literal_to_network(expr, target) {
+        return;
+    }
+    if coerce_literal_to_bpchar(expr, target, false) {
+        return;
+    }
+    if coerce_literal_to_enum(expr, target) {
+        return;
+    }
+    if coerce_literal_to_composite(expr, target) {
+        return;
+    }
+    if coerce_literal_to_array(expr, target) {
+        return;
+    }
+    if coerce_literal_to_oid_alias(expr, target) {
+        return;
+    }
     let ScalarExpr::Literal { value, data_type } = expr else {
         return;
     };
@@ -1535,6 +1891,10 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                 *value = Value::Int32(narrow);
                 *data_type = DataType::Int32;
             }
+        }
+        (DataType::Int32, Value::Int16(v)) => {
+            *value = Value::Int32(i32::from(*v));
+            *data_type = DataType::Int32;
         }
         (DataType::Int64, Value::Int16(v)) => {
             *value = Value::Int64(i64::from(*v));
@@ -1580,6 +1940,26 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
             *value = Value::Float32(narrow);
             *data_type = DataType::Float32;
         }
+        (DataType::Float32, Value::Int16(v)) => {
+            *value = Value::Float32(f32::from(*v));
+            *data_type = DataType::Float32;
+        }
+        (DataType::Float32, Value::Int32(v)) => {
+            #[allow(clippy::cast_precision_loss)]
+            let widened = *v as f32;
+            *value = Value::Float32(widened);
+            *data_type = DataType::Float32;
+        }
+        (DataType::Float32, Value::Int64(v)) => {
+            #[allow(clippy::cast_precision_loss)]
+            let widened = *v as f32;
+            *value = Value::Float32(widened);
+            *data_type = DataType::Float32;
+        }
+        (DataType::Text { .. }, Value::Char(text)) => {
+            *value = Value::Text(text.clone());
+            *data_type = DataType::Text { max_len: None };
+        }
         (DataType::TimestampTz, Value::Timestamp(v)) => {
             *value = Value::TimestampTz(*v);
             *data_type = DataType::TimestampTz;
@@ -1587,6 +1967,33 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
         (DataType::Timestamp, Value::TimestampTz(v)) => {
             *value = Value::Timestamp(*v);
             *data_type = DataType::Timestamp;
+        }
+        (DataType::Time, Value::Text(text)) => {
+            if let Some(micros) = parse_time_of_day_micros(text) {
+                *value = Value::Time(micros);
+                *data_type = DataType::Time;
+            }
+        }
+        (DataType::TimeTz, Value::Text(text)) => {
+            if let Some((micros, offset_seconds)) = parse_timetz_literal(text) {
+                *value = Value::TimeTz {
+                    micros,
+                    offset_seconds,
+                };
+                *data_type = DataType::TimeTz;
+            }
+        }
+        (DataType::Timestamp, Value::Text(text)) => {
+            if let Some(micros) = parse_timestamp_literal(text) {
+                *value = Value::Timestamp(micros);
+                *data_type = DataType::Timestamp;
+            }
+        }
+        (DataType::TimestampTz, Value::Text(text)) => {
+            if let Some(micros) = parse_timestamptz_literal(text) {
+                *value = Value::TimestampTz(micros);
+                *data_type = DataType::TimestampTz;
+            }
         }
         (
             DataType::Float32,
@@ -1600,6 +2007,22 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
             *value = Value::Float32(narrow);
             *data_type = DataType::Float32;
         }
+        (DataType::Decimal { scale, .. }, Value::Text(text)) => {
+            if let Ok(Value::Decimal {
+                value: decimal_value,
+                scale: decimal_scale,
+            }) = parse_decimal_text(text, *scale)
+            {
+                *value = Value::Decimal {
+                    value: decimal_value,
+                    scale: decimal_scale,
+                };
+                *data_type = DataType::Decimal {
+                    precision: None,
+                    scale: Some(decimal_scale),
+                };
+            }
+        }
         (DataType::Decimal { scale, .. }, _) => {
             if let Some((decimal_value, decimal_scale)) = decimal_from_numeric_value(value, *scale)
             {
@@ -1611,6 +2034,12 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                     precision: None,
                     scale: Some(decimal_scale),
                 };
+            }
+        }
+        (DataType::Money, _) => {
+            if let Some(cents) = money_from_literal_value(value) {
+                *value = Value::Money(cents);
+                *data_type = DataType::Money;
             }
         }
         (DataType::Range(range_type), Value::Text(text)) => {
@@ -1646,17 +2075,229 @@ pub(super) fn coerce_literal_to_type(expr: &mut ScalarExpr, target: &DataType) {
                 *data_type = DataType::Bytea;
             }
         }
-        (DataType::Jsonb, Value::Text(text)) => {
-            *value = Value::Jsonb(text.clone());
-            *data_type = DataType::Jsonb;
+        (DataType::Json, Value::Text(text)) => {
+            if let Some(parsed) = validate_json_text(text) {
+                *value = Value::Json(parsed);
+                *data_type = DataType::Json;
+            }
+        }
+        (DataType::Jsonb, Value::Text(text) | Value::Json(text)) => {
+            if let Some(parsed) = normalize_jsonb_text(text) {
+                *value = Value::Jsonb(parsed);
+                *data_type = DataType::Jsonb;
+            }
+        }
+        (DataType::Json, Value::Jsonb(text)) => {
+            *value = Value::Json(text.clone());
+            *data_type = DataType::Json;
+        }
+        (DataType::Xml, Value::Text(text)) => {
+            if let Some(parsed) = Value::validate_xml_text(text) {
+                *value = Value::Xml(parsed);
+                *data_type = DataType::Xml;
+            }
         }
         _ => {}
     }
 }
 
+fn coerce_literal_to_enum(expr: &mut ScalarExpr, target: &DataType) -> bool {
+    let DataType::Enum { labels, .. } = target else {
+        return false;
+    };
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        return false;
+    };
+    let Value::Text(text) = value else {
+        return false;
+    };
+    if !labels.iter().any(|label| label == text) {
+        return false;
+    }
+    *data_type = target.clone();
+    true
+}
+
+fn coerce_literal_to_composite(expr: &mut ScalarExpr, target: &DataType) -> bool {
+    let DataType::Composite { fields, .. } = target else {
+        return false;
+    };
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        return false;
+    };
+    let Value::Text(text) = value else {
+        return false;
+    };
+    if !composite_text_matches_arity(text, fields.len()) {
+        return false;
+    }
+    *data_type = target.clone();
+    true
+}
+
+fn coerce_literal_to_array(expr: &mut ScalarExpr, target: &DataType) -> bool {
+    let DataType::Array(target_element) = target else {
+        return false;
+    };
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        return false;
+    };
+    match value {
+        Value::Array { elements, .. } => {
+            let mut coerced_elements = Vec::with_capacity(elements.len());
+            for element in elements.iter() {
+                if element.is_null() {
+                    coerced_elements.push(Value::Null);
+                    continue;
+                }
+                let mut element_expr = ScalarExpr::Literal {
+                    value: element.clone(),
+                    data_type: element.data_type(),
+                };
+                coerce_literal_to_type(&mut element_expr, target_element);
+                let ScalarExpr::Literal {
+                    value: coerced_value,
+                    data_type: coerced_type,
+                } = element_expr
+                else {
+                    return false;
+                };
+                if !matches!(coerced_type, DataType::Null) && coerced_type != **target_element {
+                    return false;
+                }
+                coerced_elements.push(coerced_value);
+            }
+            let coerced = Value::Array {
+                element_type: (**target_element).clone(),
+                elements: coerced_elements,
+            };
+            if coerced.array_dimensions().is_none() {
+                return false;
+            }
+            *value = coerced;
+            *data_type = target.clone();
+            true
+        }
+        Value::Text(text) => {
+            let Some(parsed) = Value::parse_array((**target_element).clone(), text) else {
+                return false;
+            };
+            *value = parsed;
+            *data_type = target.clone();
+            true
+        }
+        Value::Null => true,
+        _ => false,
+    }
+}
+
+fn coerce_literal_to_bit_string(
+    expr: &mut ScalarExpr,
+    target: &DataType,
+    explicit_cast: bool,
+) -> bool {
+    fold_signed_literal(expr);
+    if !target.is_bit_string() {
+        return false;
+    }
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        return false;
+    };
+    if matches!(data_type, DataType::Null) {
+        return true;
+    }
+    let parsed = match &*value {
+        Value::BitString(bits) => Some(bits.clone()),
+        Value::Text(text) | Value::Char(text) => BitString::parse(text),
+        Value::Int16(v) if explicit_cast => bit_string_from_integer_target(i64::from(*v), target),
+        Value::Int32(v) if explicit_cast => bit_string_from_integer_target(i64::from(*v), target),
+        Value::Int64(v) if explicit_cast => bit_string_from_integer_target(*v, target),
+        _ => None,
+    };
+    let Some(bits) = parsed else {
+        return false;
+    };
+    let Some(coerced) = bits.coerce_to(target, explicit_cast) else {
+        return false;
+    };
+    *value = Value::BitString(coerced);
+    *data_type = target.clone();
+    true
+}
+
+fn coerce_literal_to_network(expr: &mut ScalarExpr, target: &DataType) -> bool {
+    if !target.is_network_address() {
+        return false;
+    }
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        return false;
+    };
+    if matches!(data_type, DataType::Null) || data_type == target {
+        return true;
+    }
+    let parsed = match &*value {
+        Value::Network(network) if network.data_type() == *target => Some(Value::Network(*network)),
+        Value::Text(text) | Value::Char(text) => Value::parse_network(target, text),
+        _ => None,
+    };
+    let Some(parsed) = parsed else {
+        return false;
+    };
+    *value = parsed;
+    *data_type = target.clone();
+    true
+}
+
+fn bit_string_from_integer_target(value: i64, target: &DataType) -> Option<BitString> {
+    let width = match target {
+        DataType::Bit { len: Some(len) } => *len,
+        DataType::Bit { len: None } => 1,
+        DataType::VarBit { max_len: Some(len) } => *len,
+        DataType::VarBit { max_len: None } => 64,
+        _ => return None,
+    };
+    BitString::from_i64(width, value)
+}
+
+fn coerce_literal_to_bpchar(expr: &mut ScalarExpr, target: &DataType, explicit_cast: bool) -> bool {
+    fold_signed_literal(expr);
+    let DataType::Char { len } = target else {
+        return false;
+    };
+    let ScalarExpr::Literal { value, data_type } = expr else {
+        return false;
+    };
+    if matches!(data_type, DataType::Null) || data_type == target {
+        return true;
+    }
+    let text = match (&*value, explicit_cast) {
+        (Value::Text(text) | Value::Char(text), _) => text.clone(),
+        (_, true) => value.to_string(),
+        (_, false) => return false,
+    };
+    let Ok(coerced) = coerce_bpchar_text(&text, *len, explicit_cast) else {
+        return false;
+    };
+    *value = Value::Char(coerced);
+    *data_type = target.clone();
+    true
+}
+
 fn resolve_cast_type(type_name: &str) -> Option<DataType> {
     let type_name = type_name.to_ascii_lowercase();
     if let Some(data_type) = parse_vector_family_type_name(&type_name) {
+        return Some(data_type);
+    }
+    if let Some(data_type) = parse_bpchar_type_name(&type_name) {
+        return Some(data_type);
+    }
+    if let Some(data_type) = parse_varchar_type_name(&type_name) {
+        return Some(data_type);
+    }
+    if let Some(data_type) = parse_bit_type_name(&type_name) {
+        return Some(data_type);
+    }
+    if let Some(data_type) = parse_network_type_name(&type_name) {
         return Some(data_type);
     }
     match type_name.as_str() {
@@ -1666,19 +2307,26 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "bool" | "boolean" => Some(DataType::Bool),
         "real" | "float4" => Some(DataType::Float32),
         "double" | "double precision" | "float" | "float8" => Some(DataType::Float64),
-        "text" | "varchar" | "char" | "character" => Some(DataType::Text { max_len: None }),
+        "text" | "tsvector" | "tsquery" => Some(DataType::Text { max_len: None }),
         "bytea" => Some(DataType::Bytea),
         "date" => Some(DataType::Date),
-        "time" => Some(DataType::Time),
+        "time" | "time without time zone" => Some(DataType::Time),
+        "timetz" | "time with time zone" => Some(DataType::TimeTz),
         "timestamp" => Some(DataType::Timestamp),
         "timestamptz" | "timestamp with time zone" => Some(DataType::TimestampTz),
         "uuid" => Some(DataType::Uuid),
-        "json" | "jsonb" => Some(DataType::Jsonb),
-        "tsvector" | "tsquery" => Some(DataType::Text { max_len: None }),
+        "json" => Some(DataType::Json),
+        "jsonb" => Some(DataType::Jsonb),
+        "xml" => Some(DataType::Xml),
         "numeric" | "decimal" => Some(DataType::Decimal {
             precision: None,
-            scale: Some(0),
+            scale: None,
         }),
+        "money" => Some(DataType::Money),
+        "oid" => Some(DataType::Oid),
+        "regclass" => Some(DataType::RegClass),
+        "regtype" => Some(DataType::RegType),
+        "pg_lsn" => Some(DataType::PgLsn),
         "int4range" => Some(DataType::Range(RangeType::Int4)),
         "int8range" => Some(DataType::Range(RangeType::Int8)),
         "numrange" => Some(DataType::Range(RangeType::Num)),
@@ -1694,6 +2342,65 @@ fn resolve_cast_type(type_name: &str) -> Option<DataType> {
         "polygon" => Some(DataType::Geometry(GeometryType::Polygon)),
         _ => None,
     }
+}
+
+fn resolve_cast_type_with_catalog(type_name: &str, catalog: &dyn Catalog) -> Option<DataType> {
+    resolve_cast_type(type_name).or_else(|| catalog.lookup_type(type_name))
+}
+
+fn parse_network_type_name(type_name: &str) -> Option<DataType> {
+    match type_name {
+        "inet" => Some(DataType::Inet),
+        "cidr" => Some(DataType::Cidr),
+        "macaddr" => Some(DataType::MacAddr),
+        "macaddr8" => Some(DataType::MacAddr8),
+        _ => None,
+    }
+}
+
+fn parse_bpchar_type_name(type_name: &str) -> Option<DataType> {
+    match type_name {
+        "char" | "character" => return Some(DataType::Char { len: Some(1) }),
+        "bpchar" => return Some(DataType::Char { len: None }),
+        _ => {}
+    }
+    let (base, len) = parse_single_type_modifier(type_name)?;
+    match base {
+        "char" | "character" | "bpchar" if len > 0 => Some(DataType::Char { len: Some(len) }),
+        _ => None,
+    }
+}
+
+fn parse_varchar_type_name(type_name: &str) -> Option<DataType> {
+    if type_name == "varchar" {
+        return Some(DataType::Text { max_len: None });
+    }
+    let (base, len) = parse_single_type_modifier(type_name)?;
+    (base == "varchar").then_some(DataType::Text { max_len: Some(len) })
+}
+
+fn parse_bit_type_name(type_name: &str) -> Option<DataType> {
+    match type_name {
+        "bit" => return Some(DataType::Bit { len: Some(1) }),
+        "varbit" | "bit varying" => return Some(DataType::VarBit { max_len: None }),
+        _ => {}
+    }
+    let (base, len) = parse_single_type_modifier(type_name)?;
+    if len == 0 {
+        return None;
+    }
+    match base {
+        "bit" => Some(DataType::Bit { len: Some(len) }),
+        "varbit" | "bit varying" => Some(DataType::VarBit { max_len: Some(len) }),
+        _ => None,
+    }
+}
+
+fn parse_single_type_modifier(type_name: &str) -> Option<(&str, u32)> {
+    let (base, rest) = type_name.split_once('(')?;
+    let len_text = rest.strip_suffix(')')?;
+    let len = len_text.parse::<u32>().ok()?;
+    Some((base, len))
 }
 
 fn parse_vector_family_type_name(type_name: &str) -> Option<DataType> {
@@ -1768,6 +2475,12 @@ fn cast_result_matches(target: &DataType, actual: &DataType) -> bool {
             (
                 DataType::Vector { dims: None },
                 DataType::Vector { dims: Some(_) }
+            ) | (
+                DataType::Decimal {
+                    precision: None,
+                    scale: None
+                },
+                DataType::Decimal { .. }
             )
         )
         || (target.is_vector_family()
@@ -1910,11 +2623,15 @@ pub(super) fn bind_unary(
             }
         }
         UnaryOp::BitNot => {
-            if inner_ty.is_integer() || matches!(inner_ty, DataType::Null) {
+            if inner_ty.is_integer()
+                || inner_ty.is_bit_string()
+                || inner_ty.is_network_address()
+                || matches!(inner_ty, DataType::Null)
+            {
                 inner_ty
             } else {
                 return Err(PlanError::TypeMismatch(format!(
-                    "bitwise NOT (~) requires integer operand, got {inner_ty}"
+                    "bitwise NOT (~) requires integer, bit string, or network operand, got {inner_ty}"
                 )));
             }
         }
@@ -1938,7 +2655,9 @@ pub(super) fn bind_binary(
 ) -> Result<ScalarExpr, PlanError> {
     let mut l = bind_expr_with_ctes(left, input, catalog, cte_catalog, scope)?;
     let mut r = bind_expr_with_ctes(right, input, catalog, cte_catalog, scope)?;
-    coerce_literal_to_match(&mut l, &mut r);
+    if !binary_operator_uses_raw_text_pattern(op) {
+        coerce_literal_to_match(&mut l, &mut r);
+    }
     if let Some(folded) = try_fold_literal_binary(op, &l, &r)? {
         return Ok(folded);
     }
@@ -1951,6 +2670,20 @@ pub(super) fn bind_binary(
     })
 }
 
+const fn binary_operator_uses_raw_text_pattern(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Like
+            | BinaryOp::NotLike
+            | BinaryOp::Ilike
+            | BinaryOp::NotIlike
+            | BinaryOp::RegexMatch
+            | BinaryOp::RegexIMatch
+            | BinaryOp::RegexNotMatch
+            | BinaryOp::RegexNotIMatch
+    )
+}
+
 #[cfg(test)]
 mod typed_literal_tests {
     use ultrasql_core::{DataType, Value};
@@ -1959,8 +2692,8 @@ mod typed_literal_tests {
 
     use super::{
         BinaryOp, ScalarExpr, bind_literal, coerce_literal_to_type, days_since_epoch,
-        fold_date_interval, parse_date_literal, parse_interval_literal, parse_timestamp_literal,
-        try_fold_literal_binary,
+        fold_date_interval, parse_date_literal, parse_interval_literal, parse_time_of_day_micros,
+        parse_timestamp_literal, parse_timetz_literal, try_fold_literal_binary,
     };
 
     #[test]
@@ -2007,6 +2740,23 @@ mod typed_literal_tests {
         assert_eq!(
             parse_timestamp_literal("2000-01-01 01:02:03.456789"),
             Some(3_723_456_789)
+        );
+        assert_eq!(
+            parse_timestamp_literal("2000-01-01 01:02:03.456789-08"),
+            Some(3_723_456_789),
+            "timestamp without time zone ignores input offset"
+        );
+    }
+
+    #[test]
+    fn time_and_timetz_literals_parse_postgres_shapes() {
+        assert_eq!(
+            parse_time_of_day_micros("01:02:03.456789-08"),
+            Some(3_723_456_789)
+        );
+        assert_eq!(
+            parse_timetz_literal("04:05:06.789-08:00"),
+            Some((14_706_789_000, -28_800))
         );
     }
 
@@ -2150,6 +2900,39 @@ mod typed_literal_tests {
         };
         assert_eq!(value, Value::Null);
         assert_eq!(data_type, DataType::Vector { dims: Some(3) });
+    }
+
+    #[test]
+    fn bind_time_and_timetz_literals_from_ast() {
+        let time_expr = bind_literal(&Literal::Typed {
+            type_name: "time".into(),
+            value: "04:05:06-08".into(),
+            unit: None,
+            span: Span::new(0, 0),
+        });
+        let ScalarExpr::Literal { value, data_type } = time_expr else {
+            panic!("expected time literal");
+        };
+        assert_eq!(data_type, DataType::Time);
+        assert_eq!(value, Value::Time(14_706_000_000));
+
+        let timetz_expr = bind_literal(&Literal::Typed {
+            type_name: "time with time zone".into(),
+            value: "04:05:06-08".into(),
+            unit: None,
+            span: Span::new(0, 0),
+        });
+        let ScalarExpr::Literal { value, data_type } = timetz_expr else {
+            panic!("expected timetz literal");
+        };
+        assert_eq!(data_type, DataType::TimeTz);
+        assert_eq!(
+            value,
+            Value::TimeTz {
+                micros: 14_706_000_000,
+                offset_seconds: -28_800,
+            }
+        );
     }
 
     #[test]

@@ -11,8 +11,9 @@ use ultrasql_core::{DataType, Field, GeometryType, MAX_VECTOR_DIMS, RangeType, S
 use ultrasql_parser::ast::{
     AlterSequenceStmt, AlterTableAction, AlterTableStmt, BinaryOp, ColumnConstraint, CommentStmt,
     CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat, CopyOption,
-    CopySource as AstCopySource, CopyStmt, CreateIndexStmt, CreateMaterializedViewStmt,
-    CreatePolicyStmt, CreateSequenceStmt, CreateTableStmt, DropSequenceStmt, DropTableStmt, Expr,
+    CopySource as AstCopySource, CopyStmt, CreateDomainStmt, CreateIndexStmt,
+    CreateMaterializedViewStmt, CreatePolicyStmt, CreateSequenceStmt, CreateTableStmt,
+    CreateTypeKind, CreateTypeStmt, DomainConstraint, DropSequenceStmt, DropTableStmt, Expr,
     Identifier, Literal, ObjectName, PolicyCommand as AstPolicyCommand,
     PolicyPermissiveness as AstPolicyPermissiveness, ReferentialAction as AstReferentialAction,
     SequenceOption, TableConstraint, TruncateStmt, TypeName,
@@ -96,7 +97,8 @@ pub(super) fn bind_create_table(
         if fields.iter().any(|f| f.name.to_ascii_lowercase() == folded) {
             return Err(PlanError::DuplicateColumn(name));
         }
-        let (dtype, serial_default) = resolve_column_type(&table_name, &name, &col.data_type)?;
+        let (dtype, serial_default) =
+            resolve_column_type(&table_name, &name, &col.data_type, catalog)?;
         let identity = column_identity(&col.constraints)?;
         let generated_stored = column_generated_stored(&col.constraints)?;
         if identity.is_some() && serial_default.is_some() {
@@ -137,11 +139,9 @@ pub(super) fn bind_create_table(
                 )
             };
         let nullable = resolve_column_nullability(&col.constraints)?;
-        let nullable = if sequence_default.is_some() {
-            false
-        } else {
-            nullable
-        };
+        let nullable = nullable
+            && sequence_default.is_none()
+            && !matches!(dtype, DataType::Domain { not_null: true, .. });
         let field = if nullable {
             Field::nullable(name, dtype)
         } else {
@@ -291,6 +291,120 @@ pub(super) fn bind_create_table(
         exclusion_constraints,
         partition,
         if_not_exists: s.if_not_exists,
+        schema: Schema::empty(),
+    })
+}
+
+pub(super) fn bind_create_type(
+    s: &CreateTypeStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
+    let type_name = object_name_simple(&s.name);
+    let namespace = object_name_namespace(&s.name);
+    if catalog.lookup_type(&type_name).is_some() {
+        return Err(PlanError::TypeMismatch(format!(
+            "type '{type_name}' already exists"
+        )));
+    }
+    match &s.kind {
+        CreateTypeKind::Enum { labels } => {
+            if labels.is_empty() {
+                return Err(PlanError::TypeMismatch(format!(
+                    "enum type '{type_name}' must have at least one label"
+                )));
+            }
+            let mut seen = std::collections::HashSet::with_capacity(labels.len());
+            for label in labels {
+                if !seen.insert(label) {
+                    return Err(PlanError::TypeMismatch(format!(
+                        "enum type '{type_name}' repeats label '{label}'"
+                    )));
+                }
+            }
+            Ok(LogicalPlan::CreateTypeEnum {
+                type_name,
+                namespace,
+                labels: labels.clone(),
+                schema: Schema::empty(),
+            })
+        }
+        CreateTypeKind::Composite { attributes } => {
+            if attributes.is_empty() {
+                return Err(PlanError::TypeMismatch(format!(
+                    "composite type '{type_name}' must have at least one attribute"
+                )));
+            }
+            let fields = attributes
+                .iter()
+                .map(|attr| {
+                    let data_type = resolve_type_name_with_catalog(&attr.data_type, catalog)?;
+                    Ok(Field::nullable(attr.name.value.clone(), data_type))
+                })
+                .collect::<Result<Vec<_>, PlanError>>()?;
+            let attributes =
+                Schema::new(fields).map_err(|e| PlanError::TypeMismatch(e.to_string()))?;
+            Ok(LogicalPlan::CreateTypeComposite {
+                type_name,
+                namespace,
+                attributes,
+                schema: Schema::empty(),
+            })
+        }
+    }
+}
+
+pub(super) fn bind_create_domain(
+    s: &CreateDomainStmt,
+    catalog: &dyn Catalog,
+) -> Result<LogicalPlan, PlanError> {
+    let domain_name = object_name_simple(&s.name);
+    let namespace = object_name_namespace(&s.name);
+    if catalog.lookup_type(&domain_name).is_some() {
+        return Err(PlanError::TypeMismatch(format!(
+            "type '{domain_name}' already exists"
+        )));
+    }
+    let base_type = resolve_type_name_with_catalog(&s.data_type, catalog)?;
+    if matches!(base_type, DataType::Domain { .. }) {
+        return Err(PlanError::NotSupported(
+            "CREATE DOMAIN over another domain is not implemented",
+        ));
+    }
+    let mut not_null = false;
+    let mut check_ordinal = 0usize;
+    let check_scope = Schema::new([Field::nullable("value", base_type.clone())])
+        .expect("single VALUE field is a valid domain-check scope");
+    let mut checks = Vec::new();
+    for constraint in &s.constraints {
+        match constraint {
+            DomainConstraint::NotNull { .. } => not_null = true,
+            DomainConstraint::Null { .. } => not_null = false,
+            DomainConstraint::Check { name, expr, .. } => {
+                check_ordinal += 1;
+                let mut scope = ScopeStack::new();
+                let bound = bind_expr(expr, &check_scope, catalog, &mut scope)?;
+                let ty = bound.data_type();
+                if ty != DataType::Bool && ty != DataType::Null {
+                    return Err(PlanError::TypeMismatch(format!(
+                        "CHECK constraint on domain '{domain_name}' has type {:?}, expected Bool",
+                        ty
+                    )));
+                }
+                checks.push(LogicalCheckConstraint {
+                    name: named_or(name.as_ref(), || {
+                        format!("{domain_name}_check_{check_ordinal}")
+                    }),
+                    expr: bound,
+                });
+            }
+        }
+    }
+    Ok(LogicalPlan::CreateDomain {
+        domain_name,
+        namespace,
+        base_type,
+        not_null,
+        checks,
         schema: Schema::empty(),
     })
 }
@@ -986,7 +1100,12 @@ pub(super) fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
     if t.is_array {
         let mut inner = t.clone();
         inner.is_array = false;
-        return resolve_type_name(&inner).map(|ty| DataType::Array(Box::new(ty)));
+        inner.array_dimensions = 0;
+        let mut ty = resolve_type_name(&inner)?;
+        for _ in 0..t.array_dimensions.max(1) {
+            ty = DataType::Array(Box::new(ty));
+        }
+        return Ok(ty);
     }
     let max_len_modifier = || t.type_modifiers.first().copied();
     match t.name.value.as_str() {
@@ -997,10 +1116,16 @@ pub(super) fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
         "real" | "float4" => Ok(DataType::Float32),
         "double" | "double precision" | "float" | "float8" => Ok(DataType::Float64),
         "text" => Ok(DataType::Text { max_len: None }),
-        "varchar" | "character varying" | "char" | "character" | "bpchar" => Ok(DataType::Text {
+        "varchar" | "character varying" => Ok(DataType::Text {
             max_len: max_len_modifier(),
         }),
-        "json" | "jsonb" => Ok(DataType::Jsonb),
+        "char" | "character" => resolve_bpchar_type(max_len_modifier().or(Some(1))),
+        "bpchar" => resolve_bpchar_type(max_len_modifier()),
+        "bit" => resolve_bit_type(max_len_modifier().or(Some(1))),
+        "varbit" | "bit varying" => resolve_varbit_type(max_len_modifier()),
+        "json" => Ok(DataType::Json),
+        "jsonb" => Ok(DataType::Jsonb),
+        "xml" => Ok(DataType::Xml),
         "vector" => resolve_vector_family_type("VECTOR", t, |dims| DataType::Vector { dims }),
         "halfvec" => resolve_vector_family_type("HALFVEC", t, |dims| DataType::HalfVec { dims }),
         "sparsevec" => {
@@ -1013,21 +1138,31 @@ pub(super) fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
         // `crates/ultrasql-executor/src/row_codec.rs`); the SQL
         // surface is enabled.
         "date" => Ok(DataType::Date),
-        // `DECIMAL(p, s)` / `NUMERIC(p, s)` columns store a scaled
-        // i64 payload at the row codec; the per-column scale lives
-        // in the schema entry. TPC-H `DECIMAL(15, 2)` fits in i64
-        // by a comfortable margin (max 10^17 vs i64::MAX ≈ 9.2×10^18).
+        // Bare `NUMERIC` is unconstrained. `NUMERIC(p)` gets scale
+        // zero, and `NUMERIC(p, s)` carries its declared display scale.
+        // The row codec stores values in PostgreSQL's base-10000 numeric
+        // payload shape; executor arithmetic still narrows runtime values
+        // to the current Decimal representation.
         "decimal" | "numeric" => {
             let precision = t.type_modifiers.first().copied();
-            let scale = t
-                .type_modifiers
-                .get(1)
-                .copied()
-                .and_then(|s| i32::try_from(s).ok())
-                .or(Some(0));
+            let scale = match t.type_modifiers.as_slice() {
+                [] => None,
+                [_] => Some(0),
+                [_, s, ..] => i32::try_from(*s).ok(),
+            };
             Ok(DataType::Decimal { precision, scale })
         }
-        "time" => Ok(DataType::Time),
+        "money" => Ok(DataType::Money),
+        "oid" => Ok(DataType::Oid),
+        "regclass" => Ok(DataType::RegClass),
+        "regtype" => Ok(DataType::RegType),
+        "pg_lsn" => Ok(DataType::PgLsn),
+        "inet" => Ok(DataType::Inet),
+        "cidr" => Ok(DataType::Cidr),
+        "macaddr" => Ok(DataType::MacAddr),
+        "macaddr8" => Ok(DataType::MacAddr8),
+        "time" | "time without time zone" => Ok(DataType::Time),
+        "timetz" | "time with time zone" => Ok(DataType::TimeTz),
         "timestamp" => Ok(DataType::Timestamp),
         "timestamptz" | "timestamp with time zone" => Ok(DataType::TimestampTz),
         "uuid" => Ok(DataType::Uuid),
@@ -1048,6 +1183,56 @@ pub(super) fn resolve_type_name(t: &TypeName) -> Result<DataType, PlanError> {
             "CREATE TABLE: column type not implemented in v0.5",
         )),
     }
+}
+
+fn resolve_type_name_with_catalog(
+    t: &TypeName,
+    catalog: &dyn Catalog,
+) -> Result<DataType, PlanError> {
+    if t.is_array {
+        let mut inner = t.clone();
+        inner.is_array = false;
+        inner.array_dimensions = 0;
+        let mut ty = resolve_type_name_with_catalog(&inner, catalog)?;
+        for _ in 0..t.array_dimensions.max(1) {
+            ty = DataType::Array(Box::new(ty));
+        }
+        return Ok(ty);
+    }
+    match resolve_type_name(t) {
+        Ok(dtype) => Ok(dtype),
+        Err(PlanError::NotSupported(_)) => catalog.lookup_type(&t.name.value).ok_or({
+            PlanError::NotSupported("CREATE TABLE: column type not implemented in v0.5")
+        }),
+        Err(err) => Err(err),
+    }
+}
+
+fn resolve_bpchar_type(len: Option<u32>) -> Result<DataType, PlanError> {
+    if matches!(len, Some(0)) {
+        return Err(PlanError::TypeMismatch(
+            "length for type character must be at least 1".to_owned(),
+        ));
+    }
+    Ok(DataType::Char { len })
+}
+
+fn resolve_bit_type(len: Option<u32>) -> Result<DataType, PlanError> {
+    if matches!(len, Some(0)) {
+        return Err(PlanError::TypeMismatch(
+            "length for type bit must be at least 1".to_owned(),
+        ));
+    }
+    Ok(DataType::Bit { len })
+}
+
+fn resolve_varbit_type(max_len: Option<u32>) -> Result<DataType, PlanError> {
+    if matches!(max_len, Some(0)) {
+        return Err(PlanError::TypeMismatch(
+            "length for type bit varying must be at least 1".to_owned(),
+        ));
+    }
+    Ok(DataType::VarBit { max_len })
 }
 
 fn resolve_vector_family_type(
@@ -1103,6 +1288,7 @@ fn resolve_column_type(
     table_name: &str,
     column_name: &str,
     t: &TypeName,
+    catalog: &dyn Catalog,
 ) -> Result<(DataType, Option<String>), PlanError> {
     if !t.type_modifiers.is_empty() {
         match t.name.value.as_str() {
@@ -1118,7 +1304,7 @@ fn resolve_column_type(
         "serial" | "serial4" => DataType::Int32,
         "bigserial" | "serial8" => DataType::Int64,
         "smallserial" | "serial2" => DataType::Int16,
-        _ => return resolve_type_name(t).map(|dtype| (dtype, None)),
+        _ => return resolve_type_name_with_catalog(t, catalog).map(|dtype| (dtype, None)),
     };
     Ok((
         dtype,
@@ -1862,7 +2048,7 @@ pub(super) fn bind_alter_table(
             if table_schema.find(&new_name.to_ascii_lowercase()).is_some() {
                 return Err(PlanError::DuplicateColumn(new_name));
             }
-            let dtype = resolve_type_name(&column.data_type)?;
+            let dtype = resolve_type_name_with_catalog(&column.data_type, catalog)?;
             let nullable = resolve_column_nullability(&column.constraints)?;
             let field = if nullable {
                 Field::nullable(new_name, dtype)

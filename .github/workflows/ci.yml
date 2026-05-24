@@ -102,7 +102,20 @@ jobs:
           command: check advisories bans licenses sources
 
   # -------------------------------------------------------------------
-  # 6. Aggregate status — required check for branch protection.
+  # 6. cargo-audit — direct RustSec advisory check.
+  # -------------------------------------------------------------------
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit --deny yanked
+
+  # -------------------------------------------------------------------
+  # 7. Aggregate status — required check for branch protection.
   #    Job result values are passed via `env:` so the run script does
   #    not interpolate workflow-context values directly into shell.
   # -------------------------------------------------------------------
@@ -110,7 +123,7 @@ jobs:
     name: ci-passed
     if: always()
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, test, doc, deny]
+    needs: [fmt, clippy, test, doc, deny, audit]
     steps:
       - name: check all required jobs succeeded
         env:
@@ -119,12 +132,14 @@ jobs:
           TEST_RESULT:   ${{ needs.test.result }}
           DOC_RESULT:    ${{ needs.doc.result }}
           DENY_RESULT:   ${{ needs.deny.result }}
+          AUDIT_RESULT:  ${{ needs.audit.result }}
         run: |
           if [ "$FMT_RESULT"    != "success" ] \
           || [ "$CLIPPY_RESULT" != "success" ] \
           || [ "$TEST_RESULT"   != "success" ] \
           || [ "$DOC_RESULT"    != "success" ] \
-          || [ "$DENY_RESULT"   != "success" ]; then
+          || [ "$DENY_RESULT"   != "success" ] \
+          || [ "$AUDIT_RESULT"  != "success" ]; then
             echo "::error::one or more required CI jobs did not succeed"
             exit 1
           fi

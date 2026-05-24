@@ -29,8 +29,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use num_traits::ToPrimitive;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
-use ultrasql_core::{DataType, SparseVector, Value};
+use ultrasql_core::{DataType, SparseVector, Value, bpchar_semantic_text, timetz_utc_micros};
 use ultrasql_planner::{BinaryOp, ScalarExpr, UnaryOp};
+
+use crate::json_path::{parse_json_path, select_json_path};
 
 const MICROS_PER_DAY: i64 = 86_400_000_000;
 const UNIX_TO_ENGINE_EPOCH_DAYS: i64 = 10_957;
@@ -221,11 +223,15 @@ pub(crate) fn eval_expr(
             "IN subquery reached the executor; decorrelation rule should have removed it",
         )),
 
-        ScalarExpr::FunctionCall { name, args, .. } => {
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => {
             let evaluated: Result<Vec<Value>, EvalError> =
                 args.iter().map(|a| eval_expr(a, row, params)).collect();
             let vals = evaluated?;
-            eval_function_call(name, &vals)
+            eval_function_call(name, &vals, data_type)
         }
     }
 }
@@ -246,7 +252,11 @@ pub(crate) fn eval_expr(
 ///
 /// Unknown function names return [`EvalError::Unsupported`] so the
 /// binder upgrade lands ahead of executor coverage without crashing.
-fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
+fn eval_function_call(
+    name: &str,
+    args: &[Value],
+    return_type: &DataType,
+) -> Result<Value, EvalError> {
     match name {
         "abs" => eval_abs(args),
         "extract" => eval_extract(args),
@@ -276,6 +286,11 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "atan" => eval_numeric_unary(args, "atan", f64::atan),
         "pi" => eval_pi(args),
         "length" => eval_length(args),
+        "bit_length" => eval_bit_length(args),
+        "octet_length" => eval_octet_length(args),
+        "bit_count" => eval_bit_count(args),
+        "get_bit" => eval_get_bit(args),
+        "set_bit" => eval_set_bit(args),
         "lower" => eval_text_case(args, TextCase::Lower),
         "upper" => eval_text_case(args, TextCase::Upper),
         "pg_get_userbyid" => eval_pg_get_userbyid(args),
@@ -297,10 +312,11 @@ fn eval_function_call(name: &str, args: &[Value]) -> Result<Value, EvalError> {
         "quote_ident" => eval_quote_ident(args),
         "format" => eval_format(args),
         "regexp_replace" => eval_regexp_replace(args),
-        "row" => eval_row_constructor(args),
+        "row" => eval_row_constructor(args, return_type),
         "row_to_json" => eval_row_to_json(args),
         "json_build_object" => eval_json_build_object(args),
         "jsonb_set" => eval_jsonb_set(args),
+        "jsonb_path_exists" => eval_jsonb_path_exists(args),
         "pg_advisory_lock"
         | "pg_try_advisory_lock"
         | "pg_advisory_unlock"
@@ -384,7 +400,7 @@ fn eval_array_length(args: &[Value]) -> Result<Value, EvalError> {
             args.len()
         )));
     }
-    let Value::Array { elements, .. } = &args[0] else {
+    let Value::Array { .. } = &args[0] else {
         return if matches!(args[0], Value::Null) {
             Ok(Value::Null)
         } else {
@@ -400,11 +416,19 @@ fn eval_array_length(args: &[Value]) -> Result<Value, EvalError> {
             args[1].data_type()
         )));
     };
-    if dim != 1 {
+    if dim < 1 {
         return Ok(Value::Null);
     }
-    let len = i32::try_from(elements.len())
-        .map_err(|_| EvalError::Type("array_length overflow".to_owned()))?;
+    let dimensions = args[0]
+        .array_dimensions()
+        .ok_or_else(|| EvalError::Type("array_length: ragged array value".to_owned()))?;
+    let dimension_idx =
+        usize::try_from(dim - 1).map_err(|_| EvalError::Type("array dimension overflow".into()))?;
+    let Some(len) = dimensions.get(dimension_idx) else {
+        return Ok(Value::Null);
+    };
+    let len =
+        i32::try_from(*len).map_err(|_| EvalError::Type("array_length overflow".to_owned()))?;
     Ok(Value::Int32(len))
 }
 
@@ -442,16 +466,28 @@ fn eval_array_to_string(args: &[Value]) -> Result<Value, EvalError> {
         }
     };
     let mut parts = Vec::with_capacity(elements.len());
+    append_array_to_string_parts(elements, null_text, &mut parts);
+    Ok(Value::Text(parts.join(delimiter)))
+}
+
+fn append_array_to_string_parts(
+    elements: &[Value],
+    null_text: Option<&str>,
+    parts: &mut Vec<String>,
+) {
     for element in elements {
-        if element.is_null() {
-            if let Some(text) = null_text {
-                parts.push(text.to_owned());
+        match element {
+            Value::Array { elements, .. } => {
+                append_array_to_string_parts(elements, null_text, parts);
             }
-        } else {
-            parts.push(element.to_string());
+            Value::Null => {
+                if let Some(text) = null_text {
+                    parts.push(text.to_owned());
+                }
+            }
+            other => parts.push(other.to_string()),
         }
     }
-    Ok(Value::Text(parts.join(delimiter)))
 }
 
 fn eval_string_to_array(args: &[Value]) -> Result<Value, EvalError> {
@@ -609,7 +645,7 @@ fn eval_text_case(args: &[Value], mode: TextCase) -> Result<Value, EvalError> {
             args.len()
         )));
     }
-    let Value::Text(s) = &args[0] else {
+    let (Value::Text(s) | Value::Char(s)) = &args[0] else {
         return if matches!(args[0], Value::Null) {
             Ok(Value::Null)
         } else {
@@ -628,7 +664,7 @@ fn eval_text_case(args: &[Value], mode: TextCase) -> Result<Value, EvalError> {
 
 fn text_arg<'a>(func: &str, args: &'a [Value], idx: usize) -> Result<Option<&'a str>, EvalError> {
     match args.get(idx) {
-        Some(Value::Text(text)) => Ok(Some(text.as_str())),
+        Some(Value::Text(text) | Value::Char(text)) => Ok(Some(text.as_str())),
         Some(Value::Null) => Ok(None),
         Some(other) => Err(EvalError::Type(format!(
             "{func}: argument {} must be text, got {:?}",
@@ -761,12 +797,110 @@ fn eval_length(args: &[Value]) -> Result<Value, EvalError> {
             args.len()
         )));
     }
-    let Some(text) = text_arg("length", args, 0)? else {
+    let len = match &args[0] {
+        Value::Text(text) => text.chars().count(),
+        Value::Char(text) => bpchar_semantic_text(text).chars().count(),
+        Value::BitString(bits) => usize::try_from(bits.len())
+            .map_err(|_| EvalError::Type("length: result overflow".to_owned()))?,
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::Type(format!(
+                "length: argument 1 must be text or bit string, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    let len =
+        i32::try_from(len).map_err(|_| EvalError::Type("length: result overflow".to_owned()))?;
+    Ok(Value::Int32(len))
+}
+
+fn eval_bit_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "bit_length: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(bits) = bit_string_arg("bit_length", args, 0)? else {
         return Ok(Value::Null);
     };
-    let len = i32::try_from(text.chars().count())
-        .map_err(|_| EvalError::Type("length: result overflow".to_owned()))?;
+    let len = i32::try_from(bits.len())
+        .map_err(|_| EvalError::Type("bit_length: result overflow".to_owned()))?;
     Ok(Value::Int32(len))
+}
+
+fn eval_octet_length(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "octet_length: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(bits) = bit_string_arg("octet_length", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let len = i32::try_from(bits.octet_len())
+        .map_err(|_| EvalError::Type("octet_length: result overflow".to_owned()))?;
+    Ok(Value::Int32(len))
+}
+
+fn eval_bit_count(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 1 {
+        return Err(EvalError::Type(format!(
+            "bit_count: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    let Some(bits) = bit_string_arg("bit_count", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Int64(i64::from(bits.bit_count())))
+}
+
+fn eval_get_bit(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "get_bit: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(bits) = bit_string_arg("get_bit", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(idx) = integer_arg_as_usize("get_bit", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let bit = bits
+        .bit(idx)
+        .ok_or_else(|| EvalError::Type("get_bit: bit index out of range".to_owned()))?;
+    Ok(Value::Int32(if bit { 1 } else { 0 }))
+}
+
+fn eval_set_bit(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 3 {
+        return Err(EvalError::Type(format!(
+            "set_bit: expected 3 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(bits) = bit_string_arg("set_bit", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let Some(idx) = integer_arg_as_usize("set_bit", args, 1)? else {
+        return Ok(Value::Null);
+    };
+    let Some(value) = integer_arg_as_usize("set_bit", args, 2)? else {
+        return Ok(Value::Null);
+    };
+    if value > 1 {
+        return Err(EvalError::Type(
+            "set_bit: new value must be 0 or 1".to_owned(),
+        ));
+    }
+    bits.set_bit(idx, value == 1)
+        .map(Value::BitString)
+        .ok_or_else(|| EvalError::Type("set_bit: bit index out of range".to_owned()))
 }
 
 fn eval_trim(args: &[Value]) -> Result<Value, EvalError> {
@@ -1179,11 +1313,20 @@ fn eval_json_build_object(args: &[Value]) -> Result<Value, EvalError> {
         .map_err(|err| EvalError::Type(format!("json_build_object: encode failed: {err}")))
 }
 
-fn eval_row_constructor(args: &[Value]) -> Result<Value, EvalError> {
-    let fields = args
-        .iter()
-        .enumerate()
-        .map(|(idx, value)| (format!("f{}", idx + 1), value.clone()))
+fn eval_row_constructor(args: &[Value], return_type: &DataType) -> Result<Value, EvalError> {
+    let field_names = match return_type {
+        DataType::Record(fields) if fields.len() == args.len() => fields
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>(),
+        _ => (0..args.len())
+            .map(|idx| format!("f{}", idx + 1))
+            .collect::<Vec<_>>(),
+    };
+    let fields = field_names
+        .into_iter()
+        .zip(args.iter())
+        .map(|(name, value)| (name, value.clone()))
         .collect();
     Ok(Value::Record(fields))
 }
@@ -1198,11 +1341,13 @@ fn eval_row_to_json(args: &[Value]) -> Result<Value, EvalError> {
     match &args[0] {
         Value::Null => Ok(Value::Null),
         Value::Record(_) => json_value_to_jsonb(sql_value_to_json(&args[0]), "row_to_json"),
-        Value::Jsonb(text) | Value::Text(text) => serde_json::from_str::<JsonValue>(text)
-            .map_err(|err| EvalError::Type(format!("row_to_json: invalid json: {err}")))
-            .and_then(|value| json_value_to_jsonb(value, "row_to_json")),
+        Value::Json(text) | Value::Jsonb(text) | Value::Text(text) => {
+            serde_json::from_str::<JsonValue>(text)
+                .map_err(|err| EvalError::Type(format!("row_to_json: invalid json: {err}")))
+                .and_then(|value| json_value_to_jsonb(value, "row_to_json"))
+        }
         other => Err(EvalError::Type(format!(
-            "row_to_json: expected record, jsonb, or text, got {:?}",
+            "row_to_json: expected record, json/jsonb, or text, got {:?}",
             other.data_type()
         ))),
     }
@@ -1243,6 +1388,31 @@ fn eval_jsonb_set(args: &[Value]) -> Result<Value, EvalError> {
     json_value_to_jsonb(target, "jsonb_set")
 }
 
+fn eval_jsonb_path_exists(args: &[Value]) -> Result<Value, EvalError> {
+    if args.len() != 2 {
+        return Err(EvalError::Type(format!(
+            "jsonb_path_exists: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    let Some(document) = json_document_arg("jsonb_path_exists", args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let path = match &args[1] {
+        Value::Text(text) | Value::Json(text) | Value::Jsonb(text) => text,
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(EvalError::Type(format!(
+                "jsonb_path_exists: path must be text, got {:?}",
+                other.data_type()
+            )));
+        }
+    };
+    let path = parse_json_path(path)
+        .map_err(|err| EvalError::Type(format!("jsonb_path_exists: invalid jsonpath: {err}")))?;
+    Ok(Value::Bool(!select_json_path(&document, &path).is_empty()))
+}
+
 fn json_document_arg(
     function: &'static str,
     args: &[Value],
@@ -1250,9 +1420,11 @@ fn json_document_arg(
 ) -> Result<Option<JsonValue>, EvalError> {
     match args.get(idx) {
         Some(Value::Null) | None => Ok(None),
-        Some(Value::Jsonb(text) | Value::Text(text)) => serde_json::from_str(text)
-            .map(Some)
-            .map_err(|err| EvalError::Type(format!("{function}: invalid jsonb: {err}"))),
+        Some(Value::Json(text) | Value::Jsonb(text) | Value::Text(text)) => {
+            serde_json::from_str(text)
+                .map(Some)
+                .map_err(|err| EvalError::Type(format!("{function}: invalid json/jsonb: {err}")))
+        }
         Some(other) => Ok(Some(sql_value_to_json(other))),
     }
 }
@@ -1272,7 +1444,9 @@ fn json_path_arg(
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
-        Some(Value::Text(text) | Value::Jsonb(text)) => Ok(Some(parse_json_path_text(text))),
+        Some(Value::Text(text) | Value::Json(text) | Value::Jsonb(text)) => {
+            Ok(Some(parse_json_path_text(text)))
+        }
         Some(other) => Err(EvalError::Type(format!(
             "{function}: path must be text or text[], got {:?}",
             other.data_type()
@@ -1368,8 +1542,10 @@ fn sql_value_to_json(value: &Value) -> JsonValue {
             JsonNumber::from_f64(f64::from(*v)).map_or(JsonValue::Null, JsonValue::Number)
         }
         Value::Float64(v) => JsonNumber::from_f64(*v).map_or(JsonValue::Null, JsonValue::Number),
-        Value::Text(v) => JsonValue::String(v.clone()),
-        Value::Jsonb(v) => serde_json::from_str(v).unwrap_or_else(|_| JsonValue::String(v.clone())),
+        Value::Text(v) | Value::Char(v) => JsonValue::String(v.clone()),
+        Value::Json(v) | Value::Jsonb(v) => {
+            serde_json::from_str(v).unwrap_or_else(|_| JsonValue::String(v.clone()))
+        }
         Value::Vector(values) | Value::HalfVec(values) => JsonValue::Array(
             values
                 .iter()
@@ -1645,6 +1821,7 @@ fn extract_datetime_part(unit: &str, source: &Value) -> Result<i64, EvalError> {
         }
         Value::Timestamp(us) | Value::TimestampTz(us) => extract_timestamp_part(unit, *us),
         Value::Time(us) => extract_time_part(unit, *us),
+        Value::TimeTz { micros, .. } => extract_time_part(unit, *micros),
         Value::Interval {
             months,
             days,
@@ -2088,8 +2265,10 @@ fn apply_unary(op: UnaryOp, val: Value) -> Result<Value, EvalError> {
             Value::Int16(v) => Ok(Value::Int16(!v)),
             Value::Int32(v) => Ok(Value::Int32(!v)),
             Value::Int64(v) => Ok(Value::Int64(!v)),
+            Value::BitString(bits) => Ok(Value::BitString(bits.bit_not())),
+            Value::Network(network) => Ok(Value::Network(network.bit_not())),
             other => Err(EvalError::Type(format!(
-                "bitwise NOT (~) requires integer operand, got {other:?}"
+                "bitwise NOT (~) requires integer, bit string, or network operand, got {other:?}"
             ))),
         },
     }
@@ -2134,6 +2313,8 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
             | BinaryOp::BitXor
             | BinaryOp::ShiftLeft
             | BinaryOp::ShiftRight
+            | BinaryOp::NetworkContainedEq
+            | BinaryOp::NetworkContainsEq
             | BinaryOp::JsonGet
             | BinaryOp::JsonGetText
             | BinaryOp::JsonGetPath
@@ -2156,8 +2337,8 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
         // ------------------------------------------------------------------
         // Arithmetic
         // ------------------------------------------------------------------
-        BinaryOp::Add => numeric_arith(lv, rv, ArithOp::Add),
-        BinaryOp::Sub => numeric_arith(lv, rv, ArithOp::Sub),
+        BinaryOp::Add => network_or_numeric_arith(lv, rv, ArithOp::Add),
+        BinaryOp::Sub => network_or_numeric_arith(lv, rv, ArithOp::Sub),
         BinaryOp::Mul => numeric_arith(lv, rv, ArithOp::Mul),
         BinaryOp::Div => numeric_arith(lv, rv, ArithOp::Div),
         BinaryOp::Mod => numeric_arith(lv, rv, ArithOp::Mod),
@@ -2181,7 +2362,11 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
         // String concatenation
         // ------------------------------------------------------------------
         BinaryOp::Concat => match (lv, rv) {
-            (Value::Text(l), Value::Text(r)) => {
+            (Value::BitString(l), Value::BitString(r)) => l
+                .concat(&r)
+                .map(Value::BitString)
+                .ok_or(EvalError::Overflow),
+            (Value::Text(l) | Value::Char(l), Value::Text(r) | Value::Char(r)) => {
                 let mut s = l;
                 s.push_str(&r);
                 Ok(Value::Text(s))
@@ -2198,7 +2383,10 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
             let case_insensitive = matches!(op, BinaryOp::Ilike | BinaryOp::NotIlike);
             let negated = matches!(op, BinaryOp::NotLike | BinaryOp::NotIlike);
             match (lv, rv) {
-                (Value::Text(haystack), Value::Text(pattern)) => {
+                (
+                    Value::Text(haystack) | Value::Char(haystack),
+                    Value::Text(pattern) | Value::Char(pattern),
+                ) => {
                     let matched = like_match(&haystack, &pattern, case_insensitive);
                     Ok(Value::Bool(matched ^ negated))
                 }
@@ -2211,11 +2399,13 @@ fn apply_binary(op: BinaryOp, lv: Value, rv: Value) -> Result<Value, EvalError> 
         // ------------------------------------------------------------------
         // Bitwise integer operators
         // ------------------------------------------------------------------
-        BinaryOp::BitAnd => integer_bitwise(lv, rv, |a, b| a & b),
-        BinaryOp::BitOr => integer_bitwise(lv, rv, |a, b| a | b),
-        BinaryOp::BitXor => integer_bitwise(lv, rv, |a, b| a ^ b),
-        BinaryOp::ShiftLeft => integer_bitwise(lv, rv, |a, b| a << (b & 63)),
-        BinaryOp::ShiftRight => integer_bitwise(lv, rv, |a, b| a >> (b & 63)),
+        BinaryOp::BitAnd => bitwise_or_integer(lv, rv, BitStringOp::And, |a, b| a & b),
+        BinaryOp::BitOr => bitwise_or_integer(lv, rv, BitStringOp::Or, |a, b| a | b),
+        BinaryOp::BitXor => bitwise_or_integer(lv, rv, BitStringOp::Xor, |a, b| a ^ b),
+        BinaryOp::ShiftLeft => shift_bit_string_or_integer(lv, rv, true),
+        BinaryOp::ShiftRight => shift_bit_string_or_integer(lv, rv, false),
+        BinaryOp::NetworkContainedEq => network_containment(lv, rv, false, true),
+        BinaryOp::NetworkContainsEq => network_containment(lv, rv, true, true),
 
         // ------------------------------------------------------------------
         // Vector distance operators
@@ -2583,6 +2773,7 @@ fn overlaps_values(left: &Value, right: &Value) -> Option<bool> {
     match (left, right) {
         (Value::Range(l), Value::Range(r)) => Some(l.overlaps(r)),
         (Value::Geometry(l), Value::Geometry(r)) => Some(l.overlaps(r)),
+        (Value::Network(l), Value::Network(r)) => Some(l.inet_addr()?.overlaps(r.inet_addr()?)),
         (
             Value::Array {
                 element_type: l_ty,
@@ -2630,7 +2821,7 @@ fn contains_values(left: &Value, right: &Value) -> Option<bool> {
 fn json_get(left: &Value, right: &Value, as_text: bool) -> Result<Value, EvalError> {
     let json = json_text(left).ok_or_else(|| {
         EvalError::Type(format!(
-            "JSON access requires JSONB, got {:?}",
+            "JSON access requires JSON/JSONB, got {:?}",
             left.data_type()
         ))
     })?;
@@ -2646,15 +2837,16 @@ fn json_get(left: &Value, right: &Value, as_text: bool) -> Result<Value, EvalErr
 }
 
 fn json_has_key(left: &Value, right: &Value) -> Result<bool, EvalError> {
-    let json = json_text(left)
-        .ok_or_else(|| EvalError::Type(format!("? requires JSONB, got {:?}", left.data_type())))?;
+    let json = json_text(left).ok_or_else(|| {
+        EvalError::Type(format!("? requires JSON/JSONB, got {:?}", left.data_type()))
+    })?;
     let key = json_key_text(right)?;
     Ok(json_object_value(json, &key).is_some())
 }
 
 fn json_text(value: &Value) -> Option<&str> {
     match value {
-        Value::Jsonb(text) | Value::Text(text) => Some(text.as_str()),
+        Value::Json(text) | Value::Jsonb(text) | Value::Text(text) => Some(text.as_str()),
         _ => None,
     }
 }
@@ -2808,6 +3000,75 @@ enum ArithOp {
     Div,
     Mod,
     Pow,
+}
+
+fn network_or_numeric_arith(lv: Value, rv: Value, op: ArithOp) -> Result<Value, EvalError> {
+    match (lv, rv, op) {
+        (Value::Network(network), value, ArithOp::Add) => {
+            let delta = integer_delta(&value)?;
+            let addr = network.inet_addr().ok_or_else(|| {
+                EvalError::Type(format!(
+                    "network arithmetic requires inet/cidr, got {network:?}"
+                ))
+            })?;
+            addr.checked_add(delta)
+                .map(ultrasql_core::NetworkValue::Inet)
+                .map(Value::Network)
+                .ok_or(EvalError::Overflow)
+        }
+        (value, Value::Network(network), ArithOp::Add) => {
+            let delta = integer_delta(&value)?;
+            let addr = network.inet_addr().ok_or_else(|| {
+                EvalError::Type(format!(
+                    "network arithmetic requires inet/cidr, got {network:?}"
+                ))
+            })?;
+            addr.checked_add(delta)
+                .map(ultrasql_core::NetworkValue::Inet)
+                .map(Value::Network)
+                .ok_or(EvalError::Overflow)
+        }
+        (Value::Network(left), Value::Network(right), ArithOp::Sub) => {
+            let left = left.inet_addr().ok_or_else(|| {
+                EvalError::Type(format!(
+                    "network subtraction requires inet/cidr, got {left:?}"
+                ))
+            })?;
+            let right = right.inet_addr().ok_or_else(|| {
+                EvalError::Type(format!(
+                    "network subtraction requires inet/cidr, got {right:?}"
+                ))
+            })?;
+            left.checked_sub_addr(right)
+                .map(Value::Int64)
+                .ok_or(EvalError::Overflow)
+        }
+        (Value::Network(network), value, ArithOp::Sub) => {
+            let delta = integer_delta(&value)?;
+            let delta = delta.checked_neg().ok_or(EvalError::Overflow)?;
+            let addr = network.inet_addr().ok_or_else(|| {
+                EvalError::Type(format!(
+                    "network arithmetic requires inet/cidr, got {network:?}"
+                ))
+            })?;
+            addr.checked_add(delta)
+                .map(ultrasql_core::NetworkValue::Inet)
+                .map(Value::Network)
+                .ok_or(EvalError::Overflow)
+        }
+        (left, right, op) => numeric_arith(left, right, op),
+    }
+}
+
+fn integer_delta(value: &Value) -> Result<i64, EvalError> {
+    match value {
+        Value::Int16(v) => Ok(i64::from(*v)),
+        Value::Int32(v) => Ok(i64::from(*v)),
+        Value::Int64(v) => Ok(*v),
+        other => Err(EvalError::Type(format!(
+            "network arithmetic requires integer offset, got {other:?}"
+        ))),
+    }
 }
 
 /// Evaluate an arithmetic binary operation.
@@ -3082,7 +3343,26 @@ fn decimal_arith(
             let numerator = i128::from(left_value)
                 .checked_mul(factor)
                 .ok_or(EvalError::Overflow)?;
-            let quotient = numerator / i128::from(right_value);
+            let denominator = i128::from(right_value);
+            let mut quotient = numerator / denominator;
+            let remainder = numerator % denominator;
+            if remainder != 0 {
+                let twice_remainder = remainder
+                    .checked_abs()
+                    .and_then(|r| r.checked_mul(2))
+                    .ok_or(EvalError::Overflow)?;
+                let divisor = denominator.checked_abs().ok_or(EvalError::Overflow)?;
+                if twice_remainder >= divisor {
+                    let adjustment = if (numerator >= 0) == (denominator >= 0) {
+                        1
+                    } else {
+                        -1
+                    };
+                    quotient = quotient
+                        .checked_add(adjustment)
+                        .ok_or(EvalError::Overflow)?;
+                }
+            }
             let value = i64::try_from(quotient).map_err(|_| EvalError::Overflow)?;
             Ok(Value::Decimal {
                 value,
@@ -3142,6 +3422,174 @@ fn float64_arith(l: f64, r: f64, op: ArithOp) -> Result<Value, EvalError> {
 // ---------------------------------------------------------------------------
 // Bitwise helpers
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum BitStringOp {
+    And,
+    Or,
+    Xor,
+}
+
+fn bit_string_arg<'a>(
+    function: &str,
+    args: &'a [Value],
+    idx: usize,
+) -> Result<Option<&'a ultrasql_core::BitString>, EvalError> {
+    match args.get(idx) {
+        Some(Value::BitString(bits)) => Ok(Some(bits)),
+        Some(Value::Null) => Ok(None),
+        Some(other) => Err(EvalError::Type(format!(
+            "{function}: argument {} must be bit string, got {:?}",
+            idx + 1,
+            other.data_type()
+        ))),
+        None => Err(EvalError::Type(format!(
+            "{function}: missing argument {}",
+            idx + 1
+        ))),
+    }
+}
+
+fn integer_arg_as_usize(
+    function: &str,
+    args: &[Value],
+    idx: usize,
+) -> Result<Option<usize>, EvalError> {
+    let value = match args.get(idx) {
+        Some(Value::Int16(v)) => i64::from(*v),
+        Some(Value::Int32(v)) => i64::from(*v),
+        Some(Value::Int64(v)) => *v,
+        Some(Value::Null) => return Ok(None),
+        Some(other) => {
+            return Err(EvalError::Type(format!(
+                "{function}: argument {} must be integer, got {:?}",
+                idx + 1,
+                other.data_type()
+            )));
+        }
+        None => {
+            return Err(EvalError::Type(format!(
+                "{function}: missing argument {}",
+                idx + 1
+            )));
+        }
+    };
+    if value < 0 {
+        return Err(EvalError::Type(format!(
+            "{function}: argument {} must be non-negative",
+            idx + 1
+        )));
+    }
+    usize::try_from(value)
+        .map(Some)
+        .map_err(|_| EvalError::Type(format!("{function}: integer argument out of range")))
+}
+
+fn bitwise_or_integer(
+    lv: Value,
+    rv: Value,
+    bit_op: BitStringOp,
+    int_op: impl Fn(i64, i64) -> i64,
+) -> Result<Value, EvalError> {
+    match (lv, rv) {
+        (Value::BitString(left), Value::BitString(right)) => {
+            let result = match bit_op {
+                BitStringOp::And => left.bit_and(&right),
+                BitStringOp::Or => left.bit_or(&right),
+                BitStringOp::Xor => left.bit_xor(&right),
+            };
+            result.map(Value::BitString).ok_or_else(|| {
+                EvalError::Type("bitwise operation requires equal-length bit strings".to_owned())
+            })
+        }
+        (Value::Network(left), Value::Network(right)) => left
+            .bitwise(right, |a, b| match bit_op {
+                BitStringOp::And => a & b,
+                BitStringOp::Or => a | b,
+                BitStringOp::Xor => a ^ b,
+            })
+            .map(Value::Network)
+            .ok_or_else(|| {
+                EvalError::Type(
+                    "network bitwise operation requires matching address families".to_owned(),
+                )
+            }),
+        (left, right) => integer_bitwise(left, right, int_op),
+    }
+}
+
+fn shift_bit_string_or_integer(lv: Value, rv: Value, left_shift: bool) -> Result<Value, EvalError> {
+    match (&lv, &rv) {
+        (Value::Network(_), Value::Network(_)) => network_containment(lv, rv, !left_shift, false),
+        (Value::BitString(bits), _) => {
+            let amount = shift_amount(&rv)?;
+            if left_shift {
+                bits.shift_left(amount)
+            } else {
+                bits.shift_right(amount)
+            }
+            .map(Value::BitString)
+            .ok_or(EvalError::Overflow)
+        }
+        _ => {
+            if left_shift {
+                integer_bitwise(lv, rv, |a, b| a << (b & 63))
+            } else {
+                integer_bitwise(lv, rv, |a, b| a >> (b & 63))
+            }
+        }
+    }
+}
+
+fn network_containment(
+    lv: Value,
+    rv: Value,
+    left_contains_right: bool,
+    allow_equal: bool,
+) -> Result<Value, EvalError> {
+    let (Value::Network(left), Value::Network(right)) = (lv, rv) else {
+        return Err(EvalError::Type(
+            "network containment requires inet/cidr operands".to_owned(),
+        ));
+    };
+    let left = left
+        .inet_addr()
+        .ok_or_else(|| EvalError::Type("network containment requires inet/cidr".to_owned()))?;
+    let right = right
+        .inet_addr()
+        .ok_or_else(|| EvalError::Type("network containment requires inet/cidr".to_owned()))?;
+    let result = if left_contains_right {
+        if allow_equal {
+            left.contains_or_equal(right)
+        } else {
+            left.contains_strict(right)
+        }
+    } else if allow_equal {
+        right.contains_or_equal(left)
+    } else {
+        right.contains_strict(left)
+    };
+    Ok(Value::Bool(result))
+}
+
+fn shift_amount(value: &Value) -> Result<usize, EvalError> {
+    let raw = match value {
+        Value::Int16(v) => i64::from(*v),
+        Value::Int32(v) => i64::from(*v),
+        Value::Int64(v) => *v,
+        other => {
+            return Err(EvalError::Type(format!(
+                "bit shift requires integer shift count, got {other:?}"
+            )));
+        }
+    };
+    if raw < 0 {
+        return Err(EvalError::Type(
+            "bit shift requires non-negative shift count".to_owned(),
+        ));
+    }
+    usize::try_from(raw).map_err(|_| EvalError::Overflow)
+}
 
 /// Evaluate a bitwise binary operation on integer operands.
 ///
@@ -3211,6 +3659,10 @@ fn compare_values(lv: &Value, rv: &Value) -> Result<std::cmp::Ordering, EvalErro
         (Value::Int16(l), Value::Int16(r)) => Ok(l.cmp(r)),
         (Value::Int32(l), Value::Int32(r)) => Ok(l.cmp(r)),
         (Value::Int64(l), Value::Int64(r)) => Ok(l.cmp(r)),
+        (Value::Oid(l), Value::Oid(r))
+        | (Value::RegClass(l), Value::RegClass(r))
+        | (Value::RegType(l), Value::RegType(r)) => Ok(l.cmp(r)),
+        (Value::PgLsn(l), Value::PgLsn(r)) => Ok(l.cmp(r)),
         (Value::Float32(l), Value::Float32(r)) => l
             .partial_cmp(r)
             .ok_or_else(|| EvalError::Type("comparison of NaN is undefined".to_owned())),
@@ -3218,6 +3670,15 @@ fn compare_values(lv: &Value, rv: &Value) -> Result<std::cmp::Ordering, EvalErro
             .partial_cmp(r)
             .ok_or_else(|| EvalError::Type("comparison of NaN is undefined".to_owned())),
         (Value::Text(l), Value::Text(r)) => Ok(l.cmp(r)),
+        (Value::Char(l), Value::Char(r)) => {
+            Ok(bpchar_semantic_text(l).cmp(bpchar_semantic_text(r)))
+        }
+        (Value::Char(l), Value::Text(r)) => Ok(bpchar_semantic_text(l).cmp(r)),
+        (Value::Text(l), Value::Char(r)) => Ok(l.as_str().cmp(bpchar_semantic_text(r))),
+        (Value::BitString(l), Value::BitString(r)) => Ok(l.to_bit_text().cmp(&r.to_bit_text())),
+        (Value::Network(l), Value::Network(r)) => (*l)
+            .cmp_network(*r)
+            .ok_or_else(|| EvalError::Type("network comparison type mismatch".to_owned())),
         (Value::Bool(l), Value::Bool(r)) => Ok(l.cmp(r)),
         (Value::Range(l), Value::Range(r)) if l.range_type == r.range_type => {
             if l == r {
@@ -3245,6 +3706,16 @@ fn compare_values(lv: &Value, rv: &Value) -> Result<std::cmp::Ordering, EvalErro
         ) => compare_decimal_values(*lv, *ls, *rv, *rs),
         (Value::Date(l), Value::Date(r)) => Ok(l.cmp(r)),
         (Value::Time(l), Value::Time(r)) => Ok(l.cmp(r)),
+        (
+            Value::TimeTz {
+                micros: lm,
+                offset_seconds: lo,
+            },
+            Value::TimeTz {
+                micros: rm,
+                offset_seconds: ro,
+            },
+        ) => Ok(timetz_utc_micros(*lm, *lo).cmp(&timetz_utc_micros(*rm, *ro))),
         (Value::Timestamp(l), Value::Timestamp(r))
         | (Value::TimestampTz(l), Value::TimestampTz(r))
         | (Value::Timestamp(l), Value::TimestampTz(r))
@@ -3704,6 +4175,74 @@ mod tests {
     }
 
     #[test]
+    fn multidimensional_array_length_evaluates_dimensions() {
+        let matrix_type = DataType::Array(Box::new(DataType::Array(Box::new(DataType::Int32))));
+        let matrix = ScalarExpr::Literal {
+            value: Value::Array {
+                element_type: DataType::Array(Box::new(DataType::Int32)),
+                elements: vec![
+                    Value::Array {
+                        element_type: DataType::Int32,
+                        elements: vec![Value::Int32(1), Value::Int32(2)],
+                    },
+                    Value::Array {
+                        element_type: DataType::Int32,
+                        elements: vec![Value::Int32(3), Value::Int32(4)],
+                    },
+                ],
+            },
+            data_type: matrix_type,
+        };
+
+        let len_dim_1 = Eval::new(call(
+            "array_length",
+            vec![matrix.clone(), lit_i32(1)],
+            DataType::Int32,
+        ));
+        assert_eq!(len_dim_1.eval(&[]).unwrap(), Value::Int32(2));
+
+        let len_dim_2 = Eval::new(call(
+            "array_length",
+            vec![matrix.clone(), lit_i32(2)],
+            DataType::Int32,
+        ));
+        assert_eq!(len_dim_2.eval(&[]).unwrap(), Value::Int32(2));
+
+        let len_dim_3 = Eval::new(call(
+            "array_length",
+            vec![matrix, lit_i32(3)],
+            DataType::Int32,
+        ));
+        assert_eq!(len_dim_3.eval(&[]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn multidimensional_array_to_string_flattens_elements() {
+        let matrix = ScalarExpr::Literal {
+            value: Value::Array {
+                element_type: DataType::Array(Box::new(DataType::Int32)),
+                elements: vec![
+                    Value::Array {
+                        element_type: DataType::Int32,
+                        elements: vec![Value::Int32(1), Value::Int32(2)],
+                    },
+                    Value::Array {
+                        element_type: DataType::Int32,
+                        elements: vec![Value::Int32(3), Value::Int32(4)],
+                    },
+                ],
+            },
+            data_type: DataType::Array(Box::new(DataType::Array(Box::new(DataType::Int32)))),
+        };
+        let joined = Eval::new(call(
+            "array_to_string",
+            vec![matrix, lit_text(":")],
+            DataType::Text { max_len: None },
+        ));
+        assert_eq!(joined.eval(&[]).unwrap(), Value::Text("1:2:3:4".into()));
+    }
+
+    #[test]
     fn tsvector_match_evaluates() {
         let ev = Eval::new(binop(
             BinaryOp::TextSearchMatch,
@@ -3820,6 +4359,18 @@ mod tests {
             panic!("expected Float64");
         };
         assert!((v - 17.635_714_285_714_286).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn decimal_division_rounds_to_result_scale() {
+        let ev = Eval::new(binop(BinaryOp::Div, lit_decimal(1, 0), lit_decimal(6, 0)));
+        assert_eq!(
+            ev.eval(&[]).unwrap(),
+            Value::Decimal {
+                value: 166_667,
+                scale: 6
+            }
+        );
     }
 
     #[test]
@@ -3946,6 +4497,40 @@ mod tests {
     fn concat_null_propagation() {
         let ev = Eval::new(binop(BinaryOp::Concat, lit_null(), lit_text("bar")));
         assert_eq!(ev.eval(&[]).unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn row_to_json_uses_record_field_names() {
+        let record_type = DataType::Record(vec![
+            ("id".to_owned(), DataType::Int32),
+            ("name".to_owned(), DataType::Text { max_len: None }),
+            ("meta".to_owned(), DataType::Jsonb),
+        ]);
+        let ev = Eval::new(call(
+            "row_to_json",
+            vec![call(
+                "row",
+                vec![
+                    lit_i32(1),
+                    lit_text("Ada"),
+                    lit_jsonb("{\"kind\":\"guide\"}"),
+                ],
+                record_type,
+            )],
+            DataType::Jsonb,
+        ));
+        let Value::Jsonb(json) = ev.eval(&[]).unwrap() else {
+            panic!("expected jsonb row object");
+        };
+        let got: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            got,
+            serde_json::json!({
+                "id": 1,
+                "name": "Ada",
+                "meta": {"kind": "guide"},
+            })
+        );
     }
 
     #[test]

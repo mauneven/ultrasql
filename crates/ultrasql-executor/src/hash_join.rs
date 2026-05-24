@@ -42,7 +42,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
-use ultrasql_core::{Schema, Value};
+use ultrasql_core::{Schema, Value, bpchar_semantic_text, timetz_utc_micros};
 use ultrasql_planner::{BinaryOp, LogicalJoinType, ScalarExpr};
 use ultrasql_vec::Batch;
 
@@ -904,13 +904,34 @@ fn compare_fast_values(left: &Value, right: &Value, op: BinaryOp) -> Option<bool
         (Value::Int16(l), Value::Int16(r)) => l.cmp(r),
         (Value::Int32(l), Value::Int32(r)) => l.cmp(r),
         (Value::Int64(l), Value::Int64(r)) => l.cmp(r),
+        (Value::Oid(l), Value::Oid(r))
+        | (Value::RegClass(l), Value::RegClass(r))
+        | (Value::RegType(l), Value::RegType(r)) => l.cmp(r),
+        (Value::PgLsn(l), Value::PgLsn(r)) => l.cmp(r),
         (Value::Date(l), Value::Date(r)) => l.cmp(r),
         (Value::Time(l), Value::Time(r)) => l.cmp(r),
+        (
+            Value::TimeTz {
+                micros: lm,
+                offset_seconds: lo,
+            },
+            Value::TimeTz {
+                micros: rm,
+                offset_seconds: ro,
+            },
+        ) => timetz_utc_micros(*lm, *lo).cmp(&timetz_utc_micros(*rm, *ro)),
         (Value::Timestamp(l), Value::Timestamp(r))
         | (Value::TimestampTz(l), Value::TimestampTz(r))
         | (Value::Timestamp(l), Value::TimestampTz(r))
         | (Value::TimestampTz(l), Value::Timestamp(r)) => l.cmp(r),
         (Value::Text(l), Value::Text(r)) => l.cmp(r),
+        (Value::Char(l), Value::Char(r)) => bpchar_semantic_text(l).cmp(bpchar_semantic_text(r)),
+        (Value::Char(l), Value::Text(r)) => bpchar_semantic_text(l).cmp(r),
+        (Value::Text(l), Value::Char(r)) => l.as_str().cmp(bpchar_semantic_text(r)),
+        (Value::BitString(l), Value::BitString(r)) => l.to_bit_text().cmp(&r.to_bit_text()),
+        (Value::Network(l), Value::Network(r)) => (*l)
+            .cmp_network(*r)
+            .unwrap_or_else(|| l.to_string().cmp(&r.to_string())),
         (Value::Bool(l), Value::Bool(r)) => l.cmp(r),
         (
             Value::Decimal {
@@ -983,6 +1004,8 @@ impl PartialEq for OrderedValue {
             (Value::Vector(a), Value::Vector(b)) | (Value::HalfVec(a), Value::HalfVec(b)) => {
                 a.len() == b.len() && a.iter().zip(b).all(|(l, r)| l.to_bits() == r.to_bits())
             }
+            (Value::Char(a), Value::Text(b)) => bpchar_semantic_text(a) == b,
+            (Value::Text(a), Value::Char(b)) => a == bpchar_semantic_text(b),
             _ => self.0 == other.0,
         }
     }
@@ -1010,6 +1033,26 @@ impl std::hash::Hash for OrderedValue {
                 state.write_u8(4);
                 v.hash(state);
             }
+            Value::Money(v) => {
+                state.write_u8(23);
+                v.hash(state);
+            }
+            Value::Oid(v) => {
+                state.write_u8(27);
+                v.hash(state);
+            }
+            Value::RegClass(v) => {
+                state.write_u8(28);
+                v.hash(state);
+            }
+            Value::RegType(v) => {
+                state.write_u8(29);
+                v.hash(state);
+            }
+            Value::PgLsn(v) => {
+                state.write_u8(30);
+                v.hash(state);
+            }
             Value::Float32(v) => {
                 state.write_u8(5);
                 // Hash the bit pattern so NaN is stable.
@@ -1023,8 +1066,20 @@ impl std::hash::Hash for OrderedValue {
                 state.write_u8(7);
                 s.hash(state);
             }
+            Value::Char(s) => {
+                state.write_u8(7);
+                bpchar_semantic_text(s).hash(state);
+            }
+            Value::Json(s) => {
+                state.write_u8(16);
+                s.hash(state);
+            }
             Value::Jsonb(s) => {
                 state.write_u8(17);
+                s.hash(state);
+            }
+            Value::Xml(s) => {
+                state.write_u8(31);
                 s.hash(state);
             }
             Value::Bytea(b) => {
@@ -1034,6 +1089,13 @@ impl std::hash::Hash for OrderedValue {
             Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) => {
                 state.write_u8(9);
                 v.hash(state);
+            }
+            Value::TimeTz {
+                micros,
+                offset_seconds,
+            } => {
+                state.write_u8(9);
+                timetz_utc_micros(*micros, *offset_seconds).hash(state);
             }
             Value::Date(v) => {
                 state.write_u8(10);
@@ -1088,6 +1150,14 @@ impl std::hash::Hash for OrderedValue {
                 state.write_u8(21);
                 dims.hash(state);
                 bytes.hash(state);
+            }
+            Value::BitString(bits) => {
+                state.write_u8(25);
+                bits.hash(state);
+            }
+            Value::Network(network) => {
+                state.write_u8(26);
+                network.hash(state);
             }
             Value::Record(fields) => {
                 state.write_u8(22);

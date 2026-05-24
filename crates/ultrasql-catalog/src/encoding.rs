@@ -25,8 +25,8 @@
 use ultrasql_core::{DataType, Error as CoreError, Field, GeometryType, Oid, RangeType, Schema};
 
 use crate::persistent::{
-    AttributeRow, ClassRow, ConType, ConstraintRow, DescriptionRow, IndexRow, RelKind, SequenceRow,
-    StatisticExtRow, StatisticRow,
+    AttributeRow, ClassRow, ConType, ConstraintRow, DescriptionRow, EnumRow, IndexRow, RelKind,
+    SequenceRow, StatisticExtRow, StatisticRow, TypeRow,
 };
 
 /// Errors raised while writing a row to bytes.
@@ -247,6 +247,24 @@ const DT_VECTOR: u8 = 0x15;
 const DT_HALFVEC: u8 = 0x16;
 const DT_SPARSEVEC: u8 = 0x17;
 const DT_BITVEC: u8 = 0x18;
+const DT_MONEY: u8 = 0x19;
+const DT_CHAR: u8 = 0x1a;
+const DT_TIMETZ: u8 = 0x1b;
+const DT_BIT: u8 = 0x1c;
+const DT_VARBIT: u8 = 0x1d;
+const DT_INET: u8 = 0x1e;
+const DT_CIDR: u8 = 0x1f;
+const DT_MACADDR: u8 = 0x20;
+const DT_MACADDR8: u8 = 0x21;
+const DT_JSON: u8 = 0x22;
+const DT_ENUM: u8 = 0x23;
+const DT_COMPOSITE: u8 = 0x24;
+const DT_DOMAIN: u8 = 0x25;
+const DT_OID: u8 = 0x26;
+const DT_REGCLASS: u8 = 0x27;
+const DT_REGTYPE: u8 = 0x28;
+const DT_PG_LSN: u8 = 0x29;
+const DT_XML: u8 = 0x2a;
 
 fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError> {
     match ty {
@@ -261,18 +279,73 @@ fn encode_data_type(w: &mut Writer<'_>, ty: &DataType) -> Result<(), EncodeError
             w.opt_u32(*precision);
             w.opt_i32(*scale);
         }
+        DataType::Money => w.u8(DT_MONEY),
+        DataType::Oid => w.u8(DT_OID),
+        DataType::RegClass => w.u8(DT_REGCLASS),
+        DataType::RegType => w.u8(DT_REGTYPE),
+        DataType::PgLsn => w.u8(DT_PG_LSN),
         DataType::Text { max_len } => {
             w.u8(DT_TEXT);
             w.opt_u32(*max_len);
         }
+        DataType::Char { len } => {
+            w.u8(DT_CHAR);
+            w.opt_u32(*len);
+        }
+        DataType::Enum { oid, name, labels } => {
+            w.u8(DT_ENUM);
+            w.u32(oid.raw());
+            w.str(name);
+            w.u32(u32::try_from(labels.len()).expect("enum label count fits in u32"));
+            for label in labels.iter() {
+                w.str(label);
+            }
+        }
+        DataType::Composite { oid, name, fields } => {
+            w.u8(DT_COMPOSITE);
+            w.u32(oid.raw());
+            w.str(name);
+            w.u32(u32::try_from(fields.len()).expect("composite field count fits in u32"));
+            for (field_name, field_type) in fields.iter() {
+                w.str(field_name);
+                encode_data_type(w, field_type)?;
+            }
+        }
+        DataType::Domain {
+            oid,
+            name,
+            base_type,
+            not_null,
+        } => {
+            w.u8(DT_DOMAIN);
+            w.u32(oid.raw());
+            w.str(name);
+            w.bool(*not_null);
+            encode_data_type(w, base_type)?;
+        }
+        DataType::Bit { len } => {
+            w.u8(DT_BIT);
+            w.opt_u32(*len);
+        }
+        DataType::VarBit { max_len } => {
+            w.u8(DT_VARBIT);
+            w.opt_u32(*max_len);
+        }
+        DataType::Inet => w.u8(DT_INET),
+        DataType::Cidr => w.u8(DT_CIDR),
+        DataType::MacAddr => w.u8(DT_MACADDR),
+        DataType::MacAddr8 => w.u8(DT_MACADDR8),
         DataType::Bytea => w.u8(DT_BYTEA),
         DataType::Timestamp => w.u8(DT_TIMESTAMP),
         DataType::TimestampTz => w.u8(DT_TIMESTAMPTZ),
         DataType::Date => w.u8(DT_DATE),
         DataType::Time => w.u8(DT_TIME),
+        DataType::TimeTz => w.u8(DT_TIMETZ),
         DataType::Interval => w.u8(DT_INTERVAL),
         DataType::Uuid => w.u8(DT_UUID),
+        DataType::Json => w.u8(DT_JSON),
         DataType::Jsonb => w.u8(DT_JSONB),
+        DataType::Xml => w.u8(DT_XML),
         DataType::Vector { dims } => {
             w.u8(DT_VECTOR);
             w.opt_u32(*dims);
@@ -326,17 +399,78 @@ fn decode_data_type(r: &mut Reader<'_>) -> Result<DataType, DecodeError> {
             precision: r.opt_u32()?,
             scale: r.opt_i32()?,
         },
+        DT_MONEY => DataType::Money,
+        DT_OID => DataType::Oid,
+        DT_REGCLASS => DataType::RegClass,
+        DT_REGTYPE => DataType::RegType,
+        DT_PG_LSN => DataType::PgLsn,
         DT_TEXT => DataType::Text {
             max_len: r.opt_u32()?,
         },
+        DT_CHAR => DataType::Char { len: r.opt_u32()? },
+        DT_ENUM => {
+            let oid = Oid::new(r.u32()?);
+            let name = r.str()?;
+            let label_count =
+                usize::try_from(r.u32()?).expect("u32 fits in usize on supported targets");
+            let mut labels = Vec::with_capacity(label_count);
+            for _ in 0..label_count {
+                labels.push(r.str()?);
+            }
+            DataType::Enum {
+                oid,
+                name: name.into(),
+                labels: labels.into(),
+            }
+        }
+        DT_COMPOSITE => {
+            let oid = Oid::new(r.u32()?);
+            let name = r.str()?;
+            let field_count =
+                usize::try_from(r.u32()?).expect("u32 fits in usize on supported targets");
+            let mut fields = Vec::with_capacity(field_count);
+            for _ in 0..field_count {
+                let field_name = r.str()?;
+                let field_type = decode_data_type(r)?;
+                fields.push((field_name, field_type));
+            }
+            DataType::Composite {
+                oid,
+                name: name.into(),
+                fields: fields.into(),
+            }
+        }
+        DT_DOMAIN => {
+            let oid = Oid::new(r.u32()?);
+            let name = r.str()?;
+            let not_null = r.bool()?;
+            let base_type = decode_data_type(r)?;
+            DataType::Domain {
+                oid,
+                name: name.into(),
+                base_type: Box::new(base_type),
+                not_null,
+            }
+        }
+        DT_BIT => DataType::Bit { len: r.opt_u32()? },
+        DT_VARBIT => DataType::VarBit {
+            max_len: r.opt_u32()?,
+        },
+        DT_INET => DataType::Inet,
+        DT_CIDR => DataType::Cidr,
+        DT_MACADDR => DataType::MacAddr,
+        DT_MACADDR8 => DataType::MacAddr8,
         DT_BYTEA => DataType::Bytea,
         DT_TIMESTAMP => DataType::Timestamp,
         DT_TIMESTAMPTZ => DataType::TimestampTz,
         DT_DATE => DataType::Date,
         DT_TIME => DataType::Time,
+        DT_TIMETZ => DataType::TimeTz,
         DT_INTERVAL => DataType::Interval,
         DT_UUID => DataType::Uuid,
+        DT_JSON => DataType::Json,
         DT_JSONB => DataType::Jsonb,
+        DT_XML => DataType::Xml,
         DT_VECTOR => DataType::Vector { dims: r.opt_u32()? },
         DT_HALFVEC => DataType::HalfVec { dims: r.opt_u32()? },
         DT_SPARSEVEC => DataType::SparseVec { dims: r.opt_u32()? },
@@ -610,6 +744,80 @@ pub fn schema_from_attributes(
         })
         .collect();
     Schema::new(fields).map_err(DecodeError::from)
+}
+
+// ---------------------------------------------------------------------------
+// TypeRow / EnumRow
+// ---------------------------------------------------------------------------
+
+/// Encode a `pg_type` row into the catalog's internal binary format.
+#[must_use]
+pub fn encode_type_row(row: &TypeRow) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32 + row.typname.len());
+    let mut w = Writer(&mut out);
+    w.u32(row.oid.raw());
+    w.str(&row.typname);
+    w.u32(row.typnamespace.raw());
+    w.str(&row.typtype.to_string());
+    w.str(&row.typcategory.to_string());
+    w.i16(row.typlen);
+    w.u32(row.typelem);
+    out
+}
+
+/// Decode a `pg_type` row from the catalog's internal binary format.
+pub fn decode_type_row(bytes: &[u8]) -> Result<TypeRow, DecodeError> {
+    let mut r = Reader::new(bytes);
+    let oid = Oid::new(r.u32()?);
+    let typname = r.str()?;
+    let typnamespace = Oid::new(r.u32()?);
+    let typtype = decode_single_char(&r.str()?)?;
+    let typcategory = decode_single_char(&r.str()?)?;
+    let typlen = r.i16()?;
+    let typelem = r.u32()?;
+    Ok(TypeRow {
+        oid,
+        typname,
+        typnamespace,
+        typtype,
+        typcategory,
+        typlen,
+        typelem,
+    })
+}
+
+/// Encode a `pg_enum` row into the catalog's internal binary format.
+#[must_use]
+pub fn encode_enum_row(row: &EnumRow) -> Vec<u8> {
+    let mut out = Vec::with_capacity(24 + row.enumlabel.len());
+    let mut w = Writer(&mut out);
+    w.u32(row.oid.raw());
+    w.u32(row.enumtypid.raw());
+    w.u32(row.enumsortorder);
+    w.str(&row.enumlabel);
+    out
+}
+
+/// Decode a `pg_enum` row from the catalog's internal binary format.
+pub fn decode_enum_row(bytes: &[u8]) -> Result<EnumRow, DecodeError> {
+    let mut r = Reader::new(bytes);
+    Ok(EnumRow {
+        oid: Oid::new(r.u32()?),
+        enumtypid: Oid::new(r.u32()?),
+        enumsortorder: r.u32()?,
+        enumlabel: r.str()?,
+    })
+}
+
+fn decode_single_char(text: &str) -> Result<char, DecodeError> {
+    let mut chars = text.chars();
+    let Some(ch) = chars.next() else {
+        return Err(DecodeError::InvalidUtf8);
+    };
+    if chars.next().is_some() {
+        return Err(DecodeError::InvalidUtf8);
+    }
+    Ok(ch)
 }
 
 // ---------------------------------------------------------------------------
@@ -994,14 +1202,18 @@ mod tests {
             DataType::Int64,
             DataType::Float32,
             DataType::Float64,
+            DataType::Money,
             DataType::Bytea,
             DataType::Date,
             DataType::Time,
+            DataType::TimeTz,
             DataType::Timestamp,
             DataType::TimestampTz,
             DataType::Interval,
             DataType::Uuid,
+            DataType::Json,
             DataType::Jsonb,
+            DataType::Xml,
             DataType::Null,
             DataType::Decimal {
                 precision: Some(20),
@@ -1019,6 +1231,14 @@ mod tests {
             DataType::SparseVec { dims: None },
             DataType::BitVec { dims: Some(512) },
             DataType::BitVec { dims: None },
+            DataType::Bit { len: Some(4) },
+            DataType::Bit { len: None },
+            DataType::VarBit { max_len: Some(64) },
+            DataType::VarBit { max_len: None },
+            DataType::Inet,
+            DataType::Cidr,
+            DataType::MacAddr,
+            DataType::MacAddr8,
             DataType::Text { max_len: None },
             DataType::Text {
                 max_len: Some(1024),

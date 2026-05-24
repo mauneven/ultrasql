@@ -159,6 +159,10 @@ pub enum TokenKind {
     ShiftLeft,
     /// `>>` — bitwise shift right.
     ShiftRight,
+    /// `<<=` — network contained-within-or-equal.
+    ShiftLeftEq,
+    /// `>>=` — network contains-or-equal.
+    ShiftRightEq,
     /// `?|` — JSON has-any-key.
     QuestionPipe,
     /// `?&` — JSON has-all-keys.

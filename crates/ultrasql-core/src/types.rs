@@ -10,8 +10,10 @@
 //! planning, type-checking, and execution.
 
 use std::fmt;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::id::Oid;
 
 /// Maximum number of `f32` elements in a pgvector-compatible `vector`
 /// value.
@@ -117,14 +119,106 @@ pub enum DataType {
         scale: Option<i32>,
     },
 
+    /// `MONEY` / `cash`, stored as signed 64-bit fractional currency
+    /// units.
+    Money,
+
+    /// PostgreSQL `oid`: unsigned 32-bit catalog object identifier.
+    Oid,
+
+    /// PostgreSQL `regclass`: relation OID alias.
+    RegClass,
+
+    /// PostgreSQL `regtype`: type OID alias.
+    RegType,
+
     /// Variable-length UTF-8 text. `max_len` is the declared cap if any.
     Text {
         /// Optional declared maximum length, in *characters*.
         max_len: Option<u32>,
     },
 
+    /// Blank-padded fixed-length character string (`CHAR(n)` / `bpchar`).
+    ///
+    /// Values store their padded bytes. Equality and ordering compare the
+    /// value with trailing ASCII pad spaces ignored.
+    Char {
+        /// Optional declared length, in *characters*. `None` represents
+        /// PostgreSQL's internal unconstrained `bpchar` family.
+        len: Option<u32>,
+    },
+
+    /// User-defined enum type created by `CREATE TYPE ... AS ENUM`.
+    ///
+    /// Values use the text storage path, while the type carries its catalog
+    /// OID so RowDescription can advertise the user type instead of `text`.
+    Enum {
+        /// `pg_type.oid` for the enum type.
+        oid: Oid,
+        /// Case-folded type name visible in SQL.
+        name: Arc<str>,
+        /// Allowed labels in declaration order.
+        labels: Arc<[String]>,
+    },
+
+    /// User-defined composite type created by `CREATE TYPE ... AS (...)`.
+    ///
+    /// Values currently use PostgreSQL-style composite text storage, while
+    /// the type carries its catalog OID so RowDescription advertises the
+    /// named type instead of anonymous `record`.
+    Composite {
+        /// `pg_type.oid` for the composite type.
+        oid: Oid,
+        /// Case-folded type name visible in SQL.
+        name: Arc<str>,
+        /// Attribute names and types in declaration order.
+        fields: Arc<[(String, Self)]>,
+    },
+
+    /// User-defined domain type created by `CREATE DOMAIN`.
+    ///
+    /// Values use the base type's physical storage path, while the type
+    /// carries its catalog OID so RowDescription can advertise the domain
+    /// instead of the base type. Runtime CHECK predicates live above core.
+    Domain {
+        /// `pg_type.oid` for the domain type.
+        oid: Oid,
+        /// Case-folded type name visible in SQL.
+        name: Arc<str>,
+        /// Underlying base type used for storage and expression coercion.
+        base_type: Box<Self>,
+        /// Domain-level NOT NULL constraint.
+        not_null: bool,
+    },
+
     /// Variable-length binary string.
     Bytea,
+
+    /// Fixed-length SQL bit string (`BIT(n)`).
+    Bit {
+        /// Exact bit length. `None` is reserved for internal
+        /// unconstrained-family metadata.
+        len: Option<u32>,
+    },
+
+    /// Variable-length SQL bit string (`VARBIT(n)` / `BIT VARYING(n)`).
+    VarBit {
+        /// Optional maximum bit length. `None` means unbounded
+        /// `BIT VARYING`.
+        max_len: Option<u32>,
+    },
+
+    /// IPv4/IPv6 host or network address with optional prefix length.
+    Inet,
+
+    /// IPv4/IPv6 network address. Host bits outside the prefix are zero.
+    Cidr,
+
+    /// Six-byte media access control address.
+    MacAddr,
+
+    /// Eight-byte media access control address.
+    MacAddr8,
 
     /// Microsecond-precision timestamp without time zone.
     Timestamp,
@@ -138,14 +232,27 @@ pub enum DataType {
     /// `TIME` without time zone (microseconds in the day).
     Time,
 
+    /// `TIME WITH TIME ZONE` (`timetz`), stored as packed time-of-day
+    /// microseconds plus fixed UTC offset seconds.
+    TimeTz,
+
+    /// PostgreSQL `pg_lsn`: 64-bit write-ahead-log byte position.
+    PgLsn,
+
     /// `INTERVAL` (months, days, microseconds).
     Interval,
 
     /// UUID.
     Uuid,
 
-    /// JSON-binary (JSONB-compatible).
+    /// Textual JSON. Values preserve the accepted input spelling.
+    Json,
+
+    /// JSON-binary (JSONB-compatible). Values use canonical text storage.
     Jsonb,
+
+    /// Textual XML. Values preserve the accepted input spelling.
+    Xml,
 
     /// pgvector-compatible single-precision embedding vector.
     ///
@@ -209,11 +316,22 @@ impl DataType {
         match self {
             Self::Bool => Some(1),
             Self::Int16 => Some(2),
-            Self::Int32 | Self::Float32 | Self::Date => Some(4),
-            Self::Int64 | Self::Float64 | Self::Time | Self::Timestamp | Self::TimestampTz => {
-                Some(8)
-            }
+            Self::Int32
+            | Self::Float32
+            | Self::Date
+            | Self::Oid
+            | Self::RegClass
+            | Self::RegType => Some(4),
+            Self::Int64
+            | Self::Money
+            | Self::Float64
+            | Self::Time
+            | Self::TimeTz
+            | Self::Timestamp
+            | Self::TimestampTz
+            | Self::PgLsn => Some(8),
             Self::Interval | Self::Uuid => Some(16),
+            Self::Domain { base_type, .. } => base_type.fixed_size(),
             _ => None,
         }
     }
@@ -225,7 +343,13 @@ impl DataType {
         match self {
             Self::Bool => 1,
             Self::Int16 => 2,
-            Self::Int32 | Self::Float32 | Self::Date => 4,
+            Self::Int32
+            | Self::Float32
+            | Self::Date
+            | Self::Oid
+            | Self::RegClass
+            | Self::RegType => 4,
+            Self::Domain { base_type, .. } => base_type.alignment(),
             _ => 8,
         }
     }
@@ -250,6 +374,12 @@ impl DataType {
         matches!(self, Self::Int16 | Self::Int32 | Self::Int64)
     }
 
+    /// PostgreSQL OID alias category (`oid`, `regclass`, `regtype`).
+    #[must_use]
+    pub const fn is_oid_alias(&self) -> bool {
+        matches!(self, Self::Oid | Self::RegClass | Self::RegType)
+    }
+
     /// Floating-point category.
     #[must_use]
     pub const fn is_float(&self) -> bool {
@@ -259,7 +389,64 @@ impl DataType {
     /// String-y category (subject to text functions).
     #[must_use]
     pub const fn is_textlike(&self) -> bool {
-        matches!(self, Self::Text { .. })
+        matches!(self, Self::Text { .. } | Self::Char { .. })
+    }
+
+    /// User-defined enum category.
+    #[must_use]
+    pub const fn is_enum(&self) -> bool {
+        matches!(self, Self::Enum { .. })
+    }
+
+    /// User-defined composite category.
+    #[must_use]
+    pub const fn is_composite(&self) -> bool {
+        matches!(self, Self::Composite { .. })
+    }
+
+    /// User-defined domain category.
+    #[must_use]
+    pub const fn is_domain(&self) -> bool {
+        matches!(self, Self::Domain { .. })
+    }
+
+    /// Physical storage type for values of this logical type.
+    ///
+    /// Domains use their base type's storage. All other types store as
+    /// themselves.
+    #[must_use]
+    pub fn storage_type(&self) -> &Self {
+        match self {
+            Self::Domain { base_type, .. } => base_type.storage_type(),
+            other => other,
+        }
+    }
+
+    /// SQL bit-string category.
+    #[must_use]
+    pub const fn is_bit_string(&self) -> bool {
+        matches!(self, Self::Bit { .. } | Self::VarBit { .. })
+    }
+
+    /// SQL network-address category (`inet`, `cidr`, `macaddr`, `macaddr8`).
+    #[must_use]
+    pub const fn is_network_address(&self) -> bool {
+        matches!(
+            self,
+            Self::Inet | Self::Cidr | Self::MacAddr | Self::MacAddr8
+        )
+    }
+
+    /// SQL IP network category (`inet`, `cidr`).
+    #[must_use]
+    pub const fn is_ip_network(&self) -> bool {
+        matches!(self, Self::Inet | Self::Cidr)
+    }
+
+    /// SQL MAC address category (`macaddr`, `macaddr8`).
+    #[must_use]
+    pub const fn is_mac_address(&self) -> bool {
+        matches!(self, Self::MacAddr | Self::MacAddr8)
     }
 
     /// Date/time category.
@@ -267,7 +454,12 @@ impl DataType {
     pub const fn is_temporal(&self) -> bool {
         matches!(
             self,
-            Self::Date | Self::Time | Self::Timestamp | Self::TimestampTz | Self::Interval
+            Self::Date
+                | Self::Time
+                | Self::TimeTz
+                | Self::Timestamp
+                | Self::TimestampTz
+                | Self::Interval
         )
     }
 
@@ -355,16 +547,37 @@ impl fmt::Display for DataType {
                 (Some(p), None) => write!(f, "numeric({p})"),
                 _ => f.write_str("numeric"),
             },
+            Self::Money => f.write_str("money"),
+            Self::Oid => f.write_str("oid"),
+            Self::RegClass => f.write_str("regclass"),
+            Self::RegType => f.write_str("regtype"),
             Self::Text { max_len: Some(n) } => write!(f, "varchar({n})"),
             Self::Text { max_len: None } => f.write_str("text"),
+            Self::Char { len: Some(n) } => write!(f, "character({n})"),
+            Self::Char { len: None } => f.write_str("bpchar"),
+            Self::Enum { name, .. } => f.write_str(name),
+            Self::Composite { name, .. } => f.write_str(name),
+            Self::Domain { name, .. } => f.write_str(name),
             Self::Bytea => f.write_str("bytea"),
+            Self::Bit { len: Some(n) } => write!(f, "bit({n})"),
+            Self::Bit { len: None } => f.write_str("bit"),
+            Self::VarBit { max_len: Some(n) } => write!(f, "varbit({n})"),
+            Self::VarBit { max_len: None } => f.write_str("varbit"),
+            Self::Inet => f.write_str("inet"),
+            Self::Cidr => f.write_str("cidr"),
+            Self::MacAddr => f.write_str("macaddr"),
+            Self::MacAddr8 => f.write_str("macaddr8"),
             Self::Timestamp => f.write_str("timestamp"),
             Self::TimestampTz => f.write_str("timestamptz"),
             Self::Date => f.write_str("date"),
             Self::Time => f.write_str("time"),
+            Self::TimeTz => f.write_str("timetz"),
+            Self::PgLsn => f.write_str("pg_lsn"),
             Self::Interval => f.write_str("interval"),
             Self::Uuid => f.write_str("uuid"),
+            Self::Json => f.write_str("json"),
             Self::Jsonb => f.write_str("jsonb"),
+            Self::Xml => f.write_str("xml"),
             Self::Vector { dims: Some(dims) } => write!(f, "vector({dims})"),
             Self::Vector { dims: None } => f.write_str("vector"),
             Self::HalfVec { dims: Some(dims) } => write!(f, "halfvec({dims})"),
@@ -391,6 +604,60 @@ impl fmt::Display for DataType {
     }
 }
 
+/// Count attributes in PostgreSQL-style composite text, e.g. `(a,b)`.
+///
+/// This parser is intentionally structural: it validates balanced outer
+/// parentheses, top-level commas, double-quoted fields, backslash escapes
+/// inside quotes, and nested parenthesised text. It does not coerce field
+/// values; callers use it to reject values whose arity cannot match a named
+/// composite type.
+#[must_use]
+pub fn composite_text_arity(value: &str) -> Option<usize> {
+    let trimmed = value.trim();
+    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+        return None;
+    }
+    let inner = &trimmed[1..trimmed.len().checked_sub(1)?];
+    if inner.is_empty() {
+        return Some(0);
+    }
+    let mut fields = 1_usize;
+    let mut depth = 0_usize;
+    let mut in_quote = false;
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if in_quote {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_quote = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_quote = true,
+            '(' => depth = depth.checked_add(1)?,
+            ')' => depth = depth.checked_sub(1)?,
+            ',' if depth == 0 => fields = fields.checked_add(1)?,
+            _ => {}
+        }
+    }
+    if in_quote || escaped || depth != 0 {
+        return None;
+    }
+    Some(fields)
+}
+
+/// Return `true` if composite text has exactly `expected` attributes.
+#[must_use]
+pub fn composite_text_matches_arity(value: &str, expected: usize) -> bool {
+    composite_text_arity(value) == Some(expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,11 +667,19 @@ mod tests {
         assert_eq!(DataType::Bool.fixed_size(), Some(1));
         assert_eq!(DataType::Int32.fixed_size(), Some(4));
         assert_eq!(DataType::Int64.fixed_size(), Some(8));
+        assert_eq!(DataType::Money.fixed_size(), Some(8));
+        assert_eq!(DataType::Oid.fixed_size(), Some(4));
+        assert_eq!(DataType::RegClass.fixed_size(), Some(4));
+        assert_eq!(DataType::RegType.fixed_size(), Some(4));
+        assert_eq!(DataType::PgLsn.fixed_size(), Some(8));
         assert_eq!(DataType::Timestamp.fixed_size(), Some(8));
         assert_eq!(DataType::Uuid.fixed_size(), Some(16));
         assert_eq!(DataType::Vector { dims: Some(3) }.fixed_size(), None);
         assert_eq!(DataType::Text { max_len: None }.fixed_size(), None);
         assert_eq!(DataType::Bytea.fixed_size(), None);
+        assert_eq!(DataType::Json.fixed_size(), None);
+        assert_eq!(DataType::Jsonb.fixed_size(), None);
+        assert_eq!(DataType::Xml.fixed_size(), None);
     }
 
     #[test]
@@ -414,6 +689,7 @@ mod tests {
             DataType::Int16,
             DataType::Int32,
             DataType::Int64,
+            DataType::Money,
             DataType::Float32,
             DataType::Float64,
             DataType::Timestamp,
@@ -454,6 +730,52 @@ mod tests {
     fn vector_display_renders_pgvector_style_type_name() {
         assert_eq!(DataType::Vector { dims: Some(3) }.to_string(), "vector(3)");
         assert_eq!(DataType::Vector { dims: None }.to_string(), "vector");
+    }
+
+    #[test]
+    fn money_display_matches_postgres_type_name() {
+        assert_eq!(DataType::Money.to_string(), "money");
+    }
+
+    #[test]
+    fn json_display_distinguishes_text_and_binary_json() {
+        assert_eq!(DataType::Json.to_string(), "json");
+        assert_eq!(DataType::Jsonb.to_string(), "jsonb");
+        assert!(DataType::Json.is_varlena());
+        assert!(DataType::Jsonb.is_varlena());
+    }
+
+    #[test]
+    fn xml_display_matches_postgres_type_name() {
+        assert_eq!(DataType::Xml.to_string(), "xml");
+        assert!(DataType::Xml.is_varlena());
+    }
+
+    #[test]
+    fn char_display_matches_postgres_bpchar_names() {
+        assert_eq!(DataType::Char { len: Some(4) }.to_string(), "character(4)");
+        assert_eq!(DataType::Char { len: None }.to_string(), "bpchar");
+        assert!(DataType::Char { len: Some(4) }.is_textlike());
+    }
+
+    #[test]
+    fn bit_display_matches_postgres_names() {
+        assert_eq!(DataType::Bit { len: Some(4) }.to_string(), "bit(4)");
+        assert_eq!(
+            DataType::VarBit { max_len: Some(6) }.to_string(),
+            "varbit(6)"
+        );
+        assert!(DataType::Bit { len: Some(4) }.is_bit_string());
+    }
+
+    #[test]
+    fn composite_text_arity_counts_top_level_fields() {
+        assert_eq!(composite_text_arity("(Main,90210)"), Some(2));
+        assert_eq!(composite_text_arity("(\"Main, East\",90210)"), Some(2));
+        assert_eq!(composite_text_arity("((nested,field),90210)"), Some(2));
+        assert_eq!(composite_text_arity("(OnlyStreet)"), Some(1));
+        assert_eq!(composite_text_arity("OnlyStreet"), None);
+        assert_eq!(composite_text_arity("(\"unterminated,90210)"), None);
     }
 
     #[test]

@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
+use ultrasql_core::{DataType, Field, RelationId, Schema, Value, coerce_bpchar_text, pack_timetz};
 use ultrasql_mvcc::{Snapshot, XidStatusOracle};
 use ultrasql_storage::PageLoader;
 use ultrasql_storage::heap::HeapAccess;
@@ -793,10 +793,13 @@ fn slice_column(col: &Column, start: usize, end: usize) -> Column {
 fn schema_all_fixed_numeric(schema: &Schema) -> bool {
     schema.fields().iter().all(|f| {
         matches!(
-            f.data_type,
+            f.data_type.storage_type(),
             DataType::Int16
                 | DataType::Int32
                 | DataType::Int64
+                | DataType::Oid
+                | DataType::RegClass
+                | DataType::RegType
                 | DataType::Float32
                 | DataType::Float64
         )
@@ -837,7 +840,8 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
 
     for col_idx in 0..n_cols {
         let field = schema.field_at(col_idx);
-        let col = match &field.data_type {
+        let storage_type = field.data_type.storage_type();
+        let col = match storage_type {
             DataType::Bool => {
                 let mut data: Vec<bool> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
@@ -926,6 +930,31 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 };
                 Column::Int64(col)
             }
+            DataType::Oid | DataType::RegClass | DataType::RegType => {
+                let mut data: Vec<i64> = Vec::with_capacity(n_rows);
+                for (row_idx, row) in rows.iter().enumerate() {
+                    let raw = match (&storage_type, &row[col_idx]) {
+                        (DataType::Oid, Value::Oid(v))
+                        | (DataType::RegClass, Value::RegClass(v))
+                        | (DataType::RegType, Value::RegType(v)) => i64::from(v.raw()),
+                        (_, Value::Null) => 0,
+                        (_, other) => {
+                            return Err(ExecError::TypeMismatch(format!(
+                                "expected {storage_type} at row {row_idx} col {col_idx}, got {:?}",
+                                other.data_type()
+                            )));
+                        }
+                    };
+                    data.push(raw);
+                }
+                let col = if let Some(nulls) = build_validity(col_idx) {
+                    NumericColumn::with_nulls(data, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?
+                } else {
+                    NumericColumn::from_data(data)
+                };
+                Column::Int64(col)
+            }
             DataType::Float32 => {
                 let mut data: Vec<f32> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
@@ -971,7 +1000,19 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 Column::Float64(col)
             }
             DataType::Text { .. }
+            | DataType::Enum { .. }
+            | DataType::Composite { .. }
+            | DataType::Char { .. }
+            | DataType::Bit { .. }
+            | DataType::VarBit { .. }
+            | DataType::Inet
+            | DataType::Cidr
+            | DataType::MacAddr
+            | DataType::MacAddr8
+            | DataType::Json
             | DataType::Jsonb
+            | DataType::Xml
+            | DataType::PgLsn
             | DataType::Vector { .. }
             | DataType::HalfVec { .. }
             | DataType::SparseVec { .. }
@@ -985,7 +1026,52 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 for (row_idx, row) in rows.iter().enumerate() {
                     match (&field.data_type, &row[col_idx]) {
                         (DataType::Text { .. }, Value::Text(s)) => strings.push(Some(s.clone())),
-                        (DataType::Jsonb, Value::Jsonb(s)) => strings.push(Some(s.clone())),
+                        (DataType::Enum { labels, .. }, Value::Text(s))
+                            if labels.iter().any(|label| label == s) =>
+                        {
+                            strings.push(Some(s.clone()));
+                        }
+                        (DataType::Composite { .. }, Value::Text(s)) => {
+                            strings.push(Some(s.clone()));
+                        }
+                        (DataType::Char { .. }, Value::Char(s)) => strings.push(Some(s.clone())),
+                        (DataType::Char { len }, Value::Text(s)) => {
+                            let coerced = coerce_bpchar_text(s, *len, false).map_err(|err| {
+                                ExecError::StringDataRightTruncation(err.to_string())
+                            })?;
+                            strings.push(Some(coerced));
+                        }
+                        (DataType::Json, Value::Json(s))
+                        | (DataType::Jsonb, Value::Jsonb(s))
+                        | (DataType::Xml, Value::Xml(s)) => strings.push(Some(s.clone())),
+                        (DataType::PgLsn, Value::PgLsn(lsn)) => {
+                            strings.push(Some(lsn.to_string()));
+                        }
+                        (
+                            DataType::Bit { .. } | DataType::VarBit { .. },
+                            Value::BitString(bits),
+                        ) if bits.matches_type(&field.data_type) => {
+                            strings.push(Some(bits.to_string()));
+                        }
+                        (
+                            DataType::Bit { .. } | DataType::VarBit { .. },
+                            Value::BitString(bits),
+                        ) => {
+                            return Err(ExecError::StringDataRightTruncation(format!(
+                                "bit string length {} does not match type {}",
+                                bits.len(),
+                                field.data_type
+                            )));
+                        }
+                        (
+                            DataType::Inet
+                            | DataType::Cidr
+                            | DataType::MacAddr
+                            | DataType::MacAddr8,
+                            Value::Network(network),
+                        ) if network.data_type() == field.data_type => {
+                            strings.push(Some(network.to_string()));
+                        }
                         (DataType::Vector { dims }, Value::Vector(values))
                             if dims.is_none() || u32::try_from(values.len()).ok() == *dims =>
                         {
@@ -1064,24 +1150,35 @@ pub fn build_batch(rows: &[Vec<Value>], schema: &Schema) -> Result<Batch, ExecEr
                 Column::Int32(col)
             }
             DataType::Decimal { .. }
+            | DataType::Money
             | DataType::Timestamp
             | DataType::TimestampTz
-            | DataType::Time => {
-                // Decimal / Timestamp / Time values share the Int64
+            | DataType::Time
+            | DataType::TimeTz => {
+                // Decimal / Money / Timestamp / Time values share the Int64
                 // batch column. Schema field carries the semantic
                 // tag (and scale, for Decimal).
                 let mut data: Vec<i64> = Vec::with_capacity(n_rows);
                 for (row_idx, row) in rows.iter().enumerate() {
                     let v_i64 = match &row[col_idx] {
                         Value::Decimal { value, .. } => *value,
+                        Value::Money(v) => *v,
                         Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) => *v,
+                        Value::TimeTz {
+                            micros,
+                            offset_seconds,
+                        } => pack_timetz(*micros, *offset_seconds).ok_or_else(|| {
+                            ExecError::TypeMismatch(format!(
+                                "invalid TimeTz at row {row_idx} col {col_idx}"
+                            ))
+                        })?,
                         Value::Int16(v) => i64::from(*v),
                         Value::Int32(v) => i64::from(*v),
                         Value::Int64(v) => *v,
                         Value::Null => 0,
                         other => {
                             return Err(ExecError::TypeMismatch(format!(
-                                "expected Decimal/Timestamp/Time at row {row_idx} col {col_idx}, got {:?}",
+                                "expected Decimal/Money/Timestamp/Time at row {row_idx} col {col_idx}, got {:?}",
                                 other.data_type()
                             )));
                         }

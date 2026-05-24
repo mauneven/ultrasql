@@ -181,7 +181,7 @@ fn accumulate(
             if let Some(v) = arg {
                 if !v.is_null() {
                     match v {
-                        Value::Text(s) => parts.push(s),
+                        Value::Text(s) | Value::Char(s) => parts.push(s),
                         other => parts.push(other.to_string()),
                     }
                 }
@@ -383,8 +383,10 @@ fn sql_value_to_json(value: &Value) -> JsonValue {
             JsonNumber::from_f64(f64::from(*v)).map_or(JsonValue::Null, JsonValue::Number)
         }
         Value::Float64(v) => JsonNumber::from_f64(*v).map_or(JsonValue::Null, JsonValue::Number),
-        Value::Text(v) => JsonValue::String(v.clone()),
-        Value::Jsonb(v) => serde_json::from_str(v).unwrap_or_else(|_| JsonValue::String(v.clone())),
+        Value::Text(v) | Value::Char(v) => JsonValue::String(v.clone()),
+        Value::Json(v) | Value::Jsonb(v) => {
+            serde_json::from_str(v).unwrap_or_else(|_| JsonValue::String(v.clone()))
+        }
         Value::Vector(values) | Value::HalfVec(values) => JsonValue::Array(
             values
                 .iter()

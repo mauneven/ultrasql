@@ -23,7 +23,7 @@
 //! noted here so the persistent implementation can be slotted in by a
 //! follow-up RFC without renaming fields.
 
-use ultrasql_core::{BlockNumber, Lsn, Oid, Schema};
+use ultrasql_core::{BlockNumber, DataType, Lsn, Oid, Schema};
 
 /// A table (relation) entry in the catalog.
 ///
@@ -162,6 +162,112 @@ impl IndexEntry {
     pub fn with_options(mut self, options: Vec<(String, String)>) -> Self {
         self.options = options;
         self
+    }
+}
+
+/// One label belonging to a user-defined enum type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumLabelEntry {
+    /// Catalog-wide object identifier for the `pg_enum` row.
+    pub oid: Oid,
+    /// Label text exactly as stored for comparisons and display.
+    pub label: String,
+    /// Declaration-order position. PostgreSQL exposes this as
+    /// `pg_enum.enumsortorder`; UltraSQL stores it as an integer to keep the
+    /// catalog entry deterministic and converts to `real` at the SQL view.
+    pub sort_order: u32,
+}
+
+/// A user-defined enum type entry in the catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumTypeEntry {
+    /// `pg_type.oid` for the enum type.
+    pub oid: Oid,
+    /// Bare type name, case-folded for unquoted identifiers.
+    pub name: String,
+    /// SQL namespace, usually `"public"`.
+    pub schema_name: String,
+    /// Ordered labels accepted by this type.
+    pub labels: Vec<EnumLabelEntry>,
+}
+
+impl EnumTypeEntry {
+    /// Return the planner/executor [`DataType`] carried by columns of this
+    /// enum type.
+    #[must_use]
+    pub fn data_type(&self) -> DataType {
+        DataType::Enum {
+            oid: self.oid,
+            name: self.name.clone().into(),
+            labels: self
+                .labels
+                .iter()
+                .map(|label| label.label.clone())
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+}
+
+/// A user-defined composite type entry in the catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompositeTypeEntry {
+    /// `pg_type.oid` and `pg_class.oid` for the composite row type.
+    pub oid: Oid,
+    /// Bare type name, case-folded for unquoted identifiers.
+    pub name: String,
+    /// SQL namespace, usually `"public"`.
+    pub schema_name: String,
+    /// Ordered attribute metadata. Composite attributes are nullable in
+    /// PostgreSQL's `CREATE TYPE ... AS (...)` form.
+    pub schema: Schema,
+}
+
+impl CompositeTypeEntry {
+    /// Return the planner/executor [`DataType`] carried by columns of this
+    /// composite type.
+    #[must_use]
+    pub fn data_type(&self) -> DataType {
+        DataType::Composite {
+            oid: self.oid,
+            name: self.name.clone().into(),
+            fields: self
+                .schema
+                .fields()
+                .iter()
+                .map(|field| (field.name.clone(), field.data_type.clone()))
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+}
+
+/// A user-defined domain type entry in the catalog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DomainTypeEntry {
+    /// `pg_type.oid` for the domain type.
+    pub oid: Oid,
+    /// Bare type name, case-folded for unquoted identifiers.
+    pub name: String,
+    /// SQL namespace, usually `"public"`.
+    pub schema_name: String,
+    /// Underlying base type used for storage.
+    pub base_type: DataType,
+    /// Domain-level NOT NULL constraint.
+    pub not_null: bool,
+}
+
+impl DomainTypeEntry {
+    /// Return the planner/executor [`DataType`] carried by columns of this
+    /// domain type.
+    #[must_use]
+    pub fn data_type(&self) -> DataType {
+        DataType::Domain {
+            oid: self.oid,
+            name: self.name.clone().into(),
+            base_type: Box::new(self.base_type.clone()),
+            not_null: self.not_null,
+        }
     }
 }
 

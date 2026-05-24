@@ -9,6 +9,10 @@ import sys
 from pathlib import Path
 
 
+def percent(covered: int, line_count: int) -> float:
+    return covered * 100.0 / line_count
+
+
 def crate_for_file(filename: str, root: Path) -> str | None:
     path = Path(filename)
     try:
@@ -34,17 +38,10 @@ def iter_files(report: dict):
         yield from data_entry.get("files", [])
 
 
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("report", type=Path)
-    parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--min-lines", type=float, default=80.0)
-    args = parser.parse_args(argv)
-
-    report = json.loads(args.report.read_text(encoding="utf-8"))
+def crate_rows(report: dict, root: Path, min_lines: float) -> list[dict[str, object]]:
     crates: dict[str, list[int]] = {}
     for file_entry in iter_files(report):
-        crate = crate_for_file(str(file_entry.get("filename", "")), args.root)
+        crate = crate_for_file(str(file_entry.get("filename", "")), root)
         if crate is None:
             continue
         line_count, covered = line_counts(file_entry)
@@ -54,16 +51,82 @@ def main(argv: list[str]) -> int:
         totals[0] += line_count
         totals[1] += covered
 
-    if not crates:
+    return [
+        {
+            "crate": crate,
+            "line_count": line_count,
+            "covered": covered,
+            "percent": percent(covered, line_count),
+            "meets_threshold": percent(covered, line_count) >= min_lines,
+        }
+        for crate, (line_count, covered) in sorted(crates.items())
+    ]
+
+
+def write_summary_json(path: Path, min_lines: float, rows: list[dict[str, object]]) -> None:
+    failed = [row for row in rows if not row["meets_threshold"]]
+    payload = {
+        "threshold": min_lines,
+        "failed": [row["crate"] for row in failed],
+        "crates": rows,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def write_summary_md(path: Path, min_lines: float, rows: list[dict[str, object]]) -> None:
+    failed_count = sum(1 for row in rows if not row["meets_threshold"])
+    lines = [
+        "# Per-crate Coverage",
+        "",
+        f"Threshold: {min_lines:.2f}% line coverage per crate.",
+        f"Crates checked: {len(rows)}.",
+        f"Crates below threshold: {failed_count}.",
+        "",
+        "| Crate | Lines | Covered | Coverage | Gate |",
+        "|-------|------:|--------:|---------:|------|",
+    ]
+    for row in rows:
+        gate = "pass" if row["meets_threshold"] else "fail"
+        lines.append(
+            "| {crate} | {line_count} | {covered} | {percent:.2f}% | {gate} |".format(
+                **row, gate=gate
+            )
+        )
+    lines.append("")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("report", type=Path)
+    parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument("--min-lines", type=float, default=80.0)
+    parser.add_argument("--summary-json", type=Path)
+    parser.add_argument("--summary-md", type=Path)
+    args = parser.parse_args(argv)
+
+    report = json.loads(args.report.read_text(encoding="utf-8"))
+    rows = crate_rows(report, args.root, args.min_lines)
+    if not rows:
         print("coverage gate: no crate source files found in llvm-cov report", file=sys.stderr)
         return 2
 
     failed = []
-    for crate, (line_count, covered) in sorted(crates.items()):
-        percent = covered * 100.0 / line_count
-        print(f"{crate}: {percent:.2f}% lines ({covered}/{line_count})")
-        if percent < args.min_lines:
-            failed.append((crate, percent))
+    for row in rows:
+        crate = row["crate"]
+        line_count = row["line_count"]
+        covered = row["covered"]
+        pct = row["percent"]
+        print(f"{crate}: {pct:.2f}% lines ({covered}/{line_count})")
+        if not row["meets_threshold"]:
+            failed.append((crate, pct))
+
+    if args.summary_json is not None:
+        write_summary_json(args.summary_json, args.min_lines, rows)
+    if args.summary_md is not None:
+        write_summary_md(args.summary_md, args.min_lines, rows)
 
     if failed:
         names = ", ".join(f"{crate}={percent:.2f}%" for crate, percent in failed)

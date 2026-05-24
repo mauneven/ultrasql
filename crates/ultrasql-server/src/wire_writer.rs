@@ -279,7 +279,16 @@ fn write_cell_typed(sink: &mut BytesMut, col: &Column, row: usize, logical_type:
     }
     match (logical_type, col) {
         (ty, _)
-            if matches!(ty, DataType::Date | DataType::Decimal { .. }) || ty.is_vector_family() =>
+            if matches!(
+                ty,
+                DataType::Date
+                    | DataType::Decimal { .. }
+                    | DataType::Money
+                    | DataType::Time
+                    | DataType::TimeTz
+                    | DataType::Timestamp
+                    | DataType::TimestampTz
+            ) || ty.is_vector_family() =>
         {
             let bytes = encode_text_value_typed(col, row, logical_type)
                 .expect("non-null typed cell must encode to Some(bytes)");

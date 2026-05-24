@@ -57,7 +57,7 @@
 //! representation that lets all three sites share the decision without
 //! routing a virtual-dispatch trait object through every helper.
 
-use ultrasql_core::{DataType, Schema, Value};
+use ultrasql_core::{DataType, Schema, Value, bpchar_semantic_text};
 
 use crate::error::ServerError;
 
@@ -199,7 +199,7 @@ impl IndexKeyEncoding {
             DataType::TimestampTz => Ok(Self::TimestampTz),
             DataType::Float32 => Ok(Self::Float32),
             DataType::Float64 => Ok(Self::Float64),
-            DataType::Text { .. } => Ok(Self::TextPrefix8),
+            DataType::Text { .. } | DataType::Char { .. } => Ok(Self::TextPrefix8),
             _ => Err(ServerError::Unsupported(
                 "CREATE INDEX: expression result type is not supported by the v0.5 B-tree",
             )),
@@ -223,7 +223,7 @@ impl IndexKeyEncoding {
             DataType::TimestampTz => Ok(Self::TimestampTz),
             DataType::Float32 => Ok(Self::Float32),
             DataType::Float64 => Ok(Self::Float64),
-            DataType::Text { .. } => Ok(Self::TextPrefix8),
+            DataType::Text { .. } | DataType::Char { .. } => Ok(Self::TextPrefix8),
             _ => Err(ServerError::Unsupported(
                 "CREATE INDEX: key column type is not supported by the v0.5 B-tree",
             )),
@@ -304,6 +304,9 @@ impl IndexKeyEncoding {
             (Self::Float32, Value::Float32(v)) => Ok(Some(encode_f32_orderly(*v))),
             (Self::Float64, Value::Float64(v)) => Ok(Some(encode_f64_orderly(*v))),
             (Self::TextPrefix8, Value::Text(s)) => Ok(Some(encode_text_prefix8(s.as_bytes()))),
+            (Self::TextPrefix8, Value::Char(s)) => Ok(Some(encode_text_prefix8(
+                bpchar_semantic_text(s).as_bytes(),
+            ))),
             (Self::CompositeTwoInts { .. }, _) => Err(ServerError::ddl(
                 "CREATE INDEX composite key: encode_value called with a single Value (use encode_row)",
             )),

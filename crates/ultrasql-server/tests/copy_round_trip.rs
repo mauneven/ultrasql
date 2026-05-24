@@ -166,7 +166,42 @@ fn binary_jsonb_copy_payload() -> Vec<u8> {
     out
 }
 
+fn pg_numeric_12_340() -> Vec<u8> {
+    vec![
+        0x00, 0x02, // ndigits
+        0x00, 0x00, // weight
+        0x00, 0x00, // sign
+        0x00, 0x03, // dscale
+        0x00, 0x0c, // 12
+        0x0d, 0x48, // 3400
+    ]
+}
+
+fn binary_numeric_copy_payload() -> Vec<u8> {
+    let mut out = Vec::new();
+    pg_binary_copy_header(&mut out);
+    pg_binary_copy_i16(&mut out, 2);
+    pg_binary_copy_field(&mut out, &1_i32.to_be_bytes());
+    pg_binary_copy_field(&mut out, &pg_numeric_12_340());
+    pg_binary_copy_i16(&mut out, -1);
+    out
+}
+
+fn binary_money_copy_payload() -> Vec<u8> {
+    let mut out = Vec::new();
+    pg_binary_copy_header(&mut out);
+    pg_binary_copy_i16(&mut out, 2);
+    pg_binary_copy_field(&mut out, &1_i32.to_be_bytes());
+    pg_binary_copy_field(&mut out, &123_456_i64.to_be_bytes());
+    pg_binary_copy_i16(&mut out, -1);
+    out
+}
+
 fn first_binary_copy_jsonb_field(bytes: &[u8]) -> &[u8] {
+    second_binary_copy_field(bytes)
+}
+
+fn second_binary_copy_field(bytes: &[u8]) -> &[u8] {
     let magic = b"PGCOPY\n\xff\r\n\0";
     let mut pos = magic.len() + 8;
     let field_count = i16::from_be_bytes([bytes[pos], bytes[pos + 1]]);
@@ -269,6 +304,88 @@ async fn copy_from_stdin_binary_jsonb_uses_pg_versioned_payload() {
     let jsonb_field = first_binary_copy_jsonb_field(&copied_out);
     assert_eq!(jsonb_field.first(), Some(&1_u8));
     assert_eq!(&jsonb_field[1..], br#"{"a":1,"b":"x"}"#);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn copy_from_stdin_binary_numeric_uses_pg_numeric_payload() {
+    let running = start_sample_server("copy_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE copy_binary_numeric (id INT, amount NUMERIC(12,3))")
+        .await
+        .expect("create table");
+
+    let rows_inserted = copy_in_payload(
+        client,
+        "COPY copy_binary_numeric FROM STDIN WITH (FORMAT binary)",
+        &binary_numeric_copy_payload(),
+    )
+    .await;
+    assert_eq!(rows_inserted, 1);
+
+    let selected = client
+        .simple_query("SELECT amount FROM copy_binary_numeric")
+        .await
+        .expect("select copied numeric");
+    let row = selected
+        .into_iter()
+        .find_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => Some(row),
+            _ => None,
+        })
+        .expect("selected row");
+    assert_eq!(row.get(0), Some("12.340"));
+
+    let stream = client
+        .copy_out("COPY copy_binary_numeric TO STDOUT WITH (FORMAT binary)")
+        .await
+        .expect("binary copy out");
+    let copied_out = collect_copy_out(stream).await;
+    assert_eq!(second_binary_copy_field(&copied_out), pg_numeric_12_340());
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn copy_from_stdin_binary_money_uses_pg_cash_payload() {
+    let running = start_sample_server("copy_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE copy_binary_money (id INT, amount MONEY)")
+        .await
+        .expect("create table");
+
+    let rows_inserted = copy_in_payload(
+        client,
+        "COPY copy_binary_money FROM STDIN WITH (FORMAT binary)",
+        &binary_money_copy_payload(),
+    )
+    .await;
+    assert_eq!(rows_inserted, 1);
+
+    let rows = client
+        .simple_query("SELECT amount FROM copy_binary_money")
+        .await
+        .expect("select money");
+    let amount = rows.into_iter().find_map(|message| match message {
+        tokio_postgres::SimpleQueryMessage::Row(row) => row.get("amount").map(str::to_owned),
+        _ => None,
+    });
+    assert_eq!(amount.as_deref(), Some("$1,234.56"));
+
+    let stream = client
+        .copy_out("COPY copy_binary_money TO STDOUT WITH (FORMAT binary)")
+        .await
+        .expect("binary copy out");
+    let copied_out = collect_copy_out(stream).await;
+    assert_eq!(
+        second_binary_copy_field(&copied_out),
+        123_456_i64.to_be_bytes()
+    );
 
     shutdown(running).await;
 }
@@ -684,6 +801,77 @@ async fn copy_from_stdin_text_lands_date_and_decimal() {
         .expect("copy_out");
     let echoed = collect_copy_out(stream).await;
     assert_eq!(echoed, payload);
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn copy_from_stdin_text_rounds_numeric_to_declared_scale() {
+    let running = start_sample_server("copy_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE copy_numeric_round (id INT, amount NUMERIC(8,2))")
+        .await
+        .expect("create table");
+
+    let payload = b"1\t1.235\n2\t-1.235\n3\t1.2\n".to_vec();
+    let rows_inserted =
+        copy_in_payload(client, "COPY copy_numeric_round FROM STDIN", &payload).await;
+    assert_eq!(rows_inserted, 3);
+
+    let rows = client
+        .simple_query("SELECT amount FROM copy_numeric_round ORDER BY id")
+        .await
+        .expect("select rounded numeric");
+    let values: Vec<String> = rows
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec!["1.24".to_owned(), "-1.24".to_owned(), "1.20".to_owned()]
+    );
+
+    shutdown(running).await;
+}
+
+#[tokio::test]
+async fn copy_from_stdin_text_money_accepts_currency_format() {
+    let running = start_sample_server("copy_test").await;
+    let client = &running.client;
+
+    client
+        .batch_execute("CREATE TABLE copy_money_text (id INT, amount MONEY)")
+        .await
+        .expect("create table");
+
+    let payload = b"1\t$1,234.56\n2\t-$1.23\n3\t12.345\n".to_vec();
+    let rows_inserted = copy_in_payload(client, "COPY copy_money_text FROM STDIN", &payload).await;
+    assert_eq!(rows_inserted, 3);
+
+    let rows = client
+        .simple_query("SELECT amount FROM copy_money_text ORDER BY id")
+        .await
+        .expect("select money");
+    let values: Vec<String> = rows
+        .into_iter()
+        .filter_map(|message| match message {
+            tokio_postgres::SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            "$1,234.56".to_owned(),
+            "-$1.23".to_owned(),
+            "$12.35".to_owned()
+        ]
+    );
 
     shutdown(running).await;
 }

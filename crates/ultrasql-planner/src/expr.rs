@@ -338,6 +338,8 @@ const fn display_binary(op: BinaryOp) -> &'static str {
         BinaryOp::BitXor => "#",
         BinaryOp::ShiftLeft => "<<",
         BinaryOp::ShiftRight => ">>",
+        BinaryOp::NetworkContainedEq => "<<=",
+        BinaryOp::NetworkContainsEq => ">>=",
         BinaryOp::JsonGet => "->",
         BinaryOp::JsonGetText => "->>",
         BinaryOp::JsonGetPath => "#>",

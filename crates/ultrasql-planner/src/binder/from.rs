@@ -232,7 +232,7 @@ fn bind_table_function(
                     "unnest: argument must be an array".to_owned(),
                 ));
             };
-            let col_type = *element_type;
+            let col_type = array_base_type(&element_type).clone();
             let field = Field::required("unnest", col_type);
             let schema = Schema::new([field.clone()])
                 .map_err(|e| PlanError::TypeMismatch(format!("unnest schema: {e}")))?;
@@ -414,9 +414,19 @@ fn json_table_type_name(data_type: &TypeName) -> String {
         out.push(')');
     }
     if data_type.is_array {
-        out.push_str("[]");
+        let dimensions = data_type.array_dimensions.max(1);
+        for _ in 0..dimensions {
+            out.push_str("[]");
+        }
     }
     out
+}
+
+fn array_base_type(ty: &DataType) -> &DataType {
+    match ty {
+        DataType::Array(inner) => array_base_type(inner),
+        other => other,
+    }
 }
 
 fn bind_read_parquet_table_function(

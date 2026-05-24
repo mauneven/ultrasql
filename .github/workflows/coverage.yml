@@ -37,14 +37,16 @@ jobs:
       - name: run workspace coverage
         run: |
           cargo llvm-cov clean --workspace
+          mkdir -p target/llvm-cov
           cargo llvm-cov --workspace --all-features \
-            --json --output-path target/llvm-cov/coverage.json \
-            --fail-under-lines 80
+            --json --output-path target/llvm-cov/coverage.json
+          cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
           python3 scripts/coverage_gate.py \
             target/llvm-cov/coverage.json \
             --root "$GITHUB_WORKSPACE" \
-            --min-lines 80
-          cargo llvm-cov report --lcov --output-path target/llvm-cov/lcov.info
+            --min-lines 80 \
+            --summary-json target/llvm-cov/per-crate-coverage.json \
+            --summary-md target/llvm-cov/per-crate-coverage.md
       - name: upload coverage artifact
         if: always()
         uses: actions/upload-artifact@v7
@@ -53,4 +55,6 @@ jobs:
           path: |
             target/llvm-cov/lcov.info
             target/llvm-cov/coverage.json
+            target/llvm-cov/per-crate-coverage.json
+            target/llvm-cov/per-crate-coverage.md
           if-no-files-found: warn

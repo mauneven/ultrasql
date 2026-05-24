@@ -61,9 +61,10 @@ The pre-push hook is a **fast smoke gate** (target < 90 s total):
 | `cargo deny check advisories` | CVE scan | skips bans/licenses |
 | `regression-gate --smoke` | 1 run/benchmark, no floors | ≤ 5 s |
 
-Full suite gates (integration tests, full `--deny`, full bench sweep) run on
-the remote CI at merge time. This is intentional: pre-push is a "did this
-compile and not obviously crash?" check, not a correctness gate.
+Full suite gates (integration tests, direct `cargo audit --deny yanked`,
+full `cargo-deny`, full bench sweep) run on the remote CI at merge time.
+This is intentional: pre-push is a "did this compile and not obviously
+crash?" check, not a correctness gate.
 
 **Before merging a performance-sensitive change**, run the full bench sweep
 locally and include before/after numbers in your PR description:

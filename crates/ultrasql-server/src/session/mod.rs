@@ -34,6 +34,7 @@ mod parquet_copy;
 mod run;
 mod sequence;
 mod startup;
+mod timeout;
 mod txn;
 
 pub(crate) struct Session<RW> {
@@ -86,6 +87,8 @@ pub(crate) struct Session<RW> {
     pub(super) jit_enabled: bool,
     /// Session-local row threshold, controlled by `SET jit_above_cost`.
     pub(super) jit_above_rows: usize,
+    /// Session-local `statement_timeout` in milliseconds; `0` disables it.
+    pub(super) statement_timeout_ms: u64,
     /// Session-local custom GUCs used by row-level security policies.
     pub(super) session_settings: std::collections::HashMap<String, String>,
     /// Receiver half of the per-connection notification channel.
@@ -144,6 +147,7 @@ where
             cancel_flag,
             jit_enabled: false,
             jit_above_rows: ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS,
+            statement_timeout_ms: 0,
             session_settings: std::collections::HashMap::new(),
             notify_rx,
             stmt_cache: std::cell::RefCell::new(std::collections::HashMap::new()),

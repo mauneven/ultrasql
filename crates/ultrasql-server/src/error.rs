@@ -233,6 +233,9 @@ impl ServerError {
             // generated_always — explicit INSERT value for a GENERATED
             // ALWAYS identity column.
             Self::Execute(ultrasql_executor::ExecError::GeneratedAlwaysViolation(_)) => "428C9",
+            // string_data_right_truncation — assignment to CHAR(n) /
+            // VARCHAR(n)-style width exceeded declared length.
+            Self::Execute(ultrasql_executor::ExecError::StringDataRightTruncation(_)) => "22001",
             // query_canceled — operator polled the `CancelFlag` between
             // batches and short-circuited after a peer `CancelRequest`
             // flipped it. Mirrors PostgreSQL's `query_canceled`.

@@ -11,6 +11,7 @@ pub(crate) mod create_index;
 pub(crate) mod create_schema;
 pub(crate) mod create_sequence;
 pub(crate) mod create_table;
+pub(crate) mod create_type;
 pub(crate) mod create_view;
 pub(crate) mod delete;
 pub(crate) mod drop_index;

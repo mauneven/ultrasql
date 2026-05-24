@@ -25,12 +25,29 @@ const PG_TYPE_INT8: i32 = 20;
 const PG_TYPE_FLOAT4: i32 = 700;
 const PG_TYPE_FLOAT8: i32 = 701;
 const PG_TYPE_TEXT: i32 = 25;
+const PG_TYPE_OID: i32 = 26;
+const PG_TYPE_REGCLASS: i32 = 2205;
+const PG_TYPE_REGTYPE: i32 = 2206;
+const PG_TYPE_PG_LSN: i32 = 3220;
+const PG_TYPE_BPCHAR: i32 = 1042;
+const PG_TYPE_BIT: i32 = 1560;
+const PG_TYPE_VARBIT: i32 = 1562;
+const PG_TYPE_CIDR: i32 = 650;
+const PG_TYPE_INET: i32 = 869;
+const PG_TYPE_MACADDR: i32 = 829;
+const PG_TYPE_MACADDR8: i32 = 774;
 const PG_TYPE_NUMERIC: i32 = 1700;
+const PG_TYPE_MONEY: i32 = 790;
 const PG_TYPE_DATE: i32 = 1082;
 const PG_TYPE_TIMESTAMP: i32 = 1114;
 const PG_TYPE_TIMESTAMPTZ: i32 = 1184;
 const PG_TYPE_TIME: i32 = 1083;
+const PG_TYPE_TIMETZ: i32 = 1266;
 const PG_TYPE_UUID: i32 = 2950;
+const PG_TYPE_JSON: i32 = 114;
+const PG_TYPE_JSONB: i32 = 3802;
+const PG_TYPE_XML: i32 = 142;
+const PG_TYPE_BYTEA: i32 = 17;
 
 /// Return the schema for a virtual catalog relation or view.
 #[must_use]
@@ -40,6 +57,8 @@ pub(crate) fn virtual_catalog_schema(name: &str) -> Option<Schema> {
         "pg_catalog.pg_class" => Some(schema_pg_class()),
         "pg_catalog.pg_attribute" => Some(schema_pg_attribute()),
         "pg_catalog.pg_attrdef" => Some(schema_pg_attrdef()),
+        "pg_catalog.pg_type" => Some(schema_pg_type()),
+        "pg_catalog.pg_enum" => Some(schema_pg_enum()),
         "pg_catalog.pg_index" => Some(schema_pg_index()),
         "pg_catalog.pg_constraint" => Some(schema_pg_constraint()),
         "pg_catalog.pg_sequence" => Some(schema_pg_sequence()),
@@ -118,6 +137,8 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_class" => Some((schema_pg_class(), rows_pg_class(ctx))),
         "pg_catalog.pg_attribute" => Some((schema_pg_attribute(), rows_pg_attribute(ctx))),
         "pg_catalog.pg_attrdef" => Some((schema_pg_attrdef(), rows_pg_attrdef(ctx))),
+        "pg_catalog.pg_type" => Some((schema_pg_type(), rows_pg_type(ctx))),
+        "pg_catalog.pg_enum" => Some((schema_pg_enum(), rows_pg_enum(ctx))),
         "pg_catalog.pg_index" => Some((schema_pg_index(), rows_pg_index(ctx))),
         "pg_catalog.pg_constraint" => Some((schema_pg_constraint(), rows_pg_constraint(ctx))),
         "pg_catalog.pg_sequence" => Some((schema_pg_sequence(), rows_pg_sequence(ctx))),
@@ -240,6 +261,8 @@ fn normalized_name(name: &str) -> String {
         | "pg_class"
         | "pg_attribute"
         | "pg_attrdef"
+        | "pg_type"
+        | "pg_enum"
         | "pg_index"
         | "pg_constraint"
         | "pg_sequence"
@@ -326,41 +349,79 @@ fn type_oid(dt: &DataType) -> i32 {
         DataType::Float32 => PG_TYPE_FLOAT4,
         DataType::Float64 => PG_TYPE_FLOAT8,
         DataType::Decimal { .. } => PG_TYPE_NUMERIC,
+        DataType::Money => PG_TYPE_MONEY,
+        DataType::Oid => PG_TYPE_OID,
+        DataType::RegClass => PG_TYPE_REGCLASS,
+        DataType::RegType => PG_TYPE_REGTYPE,
+        DataType::PgLsn => PG_TYPE_PG_LSN,
+        DataType::Char { .. } => PG_TYPE_BPCHAR,
+        DataType::Bit { .. } => PG_TYPE_BIT,
+        DataType::VarBit { .. } => PG_TYPE_VARBIT,
+        DataType::Inet => PG_TYPE_INET,
+        DataType::Cidr => PG_TYPE_CIDR,
+        DataType::MacAddr => PG_TYPE_MACADDR,
+        DataType::MacAddr8 => PG_TYPE_MACADDR8,
         DataType::Date => PG_TYPE_DATE,
         DataType::Timestamp => PG_TYPE_TIMESTAMP,
         DataType::TimestampTz => PG_TYPE_TIMESTAMPTZ,
         DataType::Time => PG_TYPE_TIME,
+        DataType::TimeTz => PG_TYPE_TIMETZ,
         DataType::Uuid => PG_TYPE_UUID,
+        DataType::Json => PG_TYPE_JSON,
+        DataType::Jsonb => PG_TYPE_JSONB,
+        DataType::Xml => PG_TYPE_XML,
+        DataType::Bytea => PG_TYPE_BYTEA,
+        DataType::Enum { oid, .. }
+        | DataType::Composite { oid, .. }
+        | DataType::Domain { oid, .. } => i32::try_from(oid.raw()).unwrap_or(PG_TYPE_TEXT),
         _ => PG_TYPE_TEXT,
     }
 }
 
-fn data_type_name(dt: &DataType) -> &'static str {
+fn data_type_name(dt: &DataType) -> std::borrow::Cow<'static, str> {
     match dt {
-        DataType::Bool => "boolean",
-        DataType::Int16 => "smallint",
-        DataType::Int32 => "integer",
-        DataType::Int64 => "bigint",
-        DataType::Float32 => "real",
-        DataType::Float64 => "double precision",
-        DataType::Decimal { .. } => "numeric",
-        DataType::Text { .. } => "text",
-        DataType::Bytea => "bytea",
-        DataType::Timestamp => "timestamp without time zone",
-        DataType::TimestampTz => "timestamp with time zone",
-        DataType::Date => "date",
-        DataType::Time => "time without time zone",
-        DataType::Interval => "interval",
-        DataType::Uuid => "uuid",
-        DataType::Jsonb => "jsonb",
-        DataType::Vector { .. } => "vector",
-        DataType::HalfVec { .. } => "halfvec",
-        DataType::SparseVec { .. } => "sparsevec",
-        DataType::BitVec { .. } => "bitvec",
-        DataType::Array(_) => "array",
-        DataType::Record(_) => "record",
-        DataType::Null => "unknown",
-        _ => "text",
+        DataType::Bool => "boolean".into(),
+        DataType::Int16 => "smallint".into(),
+        DataType::Int32 => "integer".into(),
+        DataType::Int64 => "bigint".into(),
+        DataType::Float32 => "real".into(),
+        DataType::Float64 => "double precision".into(),
+        DataType::Decimal { .. } => "numeric".into(),
+        DataType::Money => "money".into(),
+        DataType::Oid => "oid".into(),
+        DataType::RegClass => "regclass".into(),
+        DataType::RegType => "regtype".into(),
+        DataType::PgLsn => "pg_lsn".into(),
+        DataType::Text { .. } => "text".into(),
+        DataType::Char { .. } => "character".into(),
+        DataType::Enum { name, .. } => name.to_string().into(),
+        DataType::Composite { name, .. } => name.to_string().into(),
+        DataType::Domain { name, .. } => name.to_string().into(),
+        DataType::Bit { .. } => "bit".into(),
+        DataType::VarBit { .. } => "bit varying".into(),
+        DataType::Inet => "inet".into(),
+        DataType::Cidr => "cidr".into(),
+        DataType::MacAddr => "macaddr".into(),
+        DataType::MacAddr8 => "macaddr8".into(),
+        DataType::Bytea => "bytea".into(),
+        DataType::Timestamp => "timestamp without time zone".into(),
+        DataType::TimestampTz => "timestamp with time zone".into(),
+        DataType::Date => "date".into(),
+        DataType::Time => "time without time zone".into(),
+        DataType::TimeTz => "time with time zone".into(),
+        DataType::Interval => "interval".into(),
+        DataType::Uuid => "uuid".into(),
+        DataType::Json => "json".into(),
+        DataType::Jsonb => "jsonb".into(),
+        DataType::Xml => "xml".into(),
+        DataType::Vector { .. } => "vector".into(),
+        DataType::HalfVec { .. } => "halfvec".into(),
+        DataType::SparseVec { .. } => "sparsevec".into(),
+        DataType::BitVec { .. } => "bitvec".into(),
+        DataType::Array(_) => "array".into(),
+        DataType::Record(_) => "record".into(),
+        DataType::Null => "unknown".into(),
+        _ => "text".into(),
     }
 }
 
@@ -442,6 +503,24 @@ fn rows_pg_class(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
             Value::Bool(false),
         ]);
     }
+    let mut composites = ctx
+        .catalog_snapshot
+        .composite_types_by_oid
+        .values()
+        .collect::<Vec<_>>();
+    composites.sort_by_key(|entry| entry.oid.raw());
+    for entry in composites {
+        rows.push(vec![
+            v_i64(entry.oid.raw()),
+            v_text(entry.name.clone()),
+            Value::Int64(namespace_oid(&entry.schema_name)),
+            v_text("c"),
+            Value::Int32(0),
+            Value::Float64(0.0),
+            Value::Int32(0),
+            Value::Bool(false),
+        ]);
+    }
     rows
 }
 
@@ -468,6 +547,25 @@ fn rows_pg_attribute(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
                 Value::Int16(i16::try_from(idx + 1).unwrap_or(i16::MAX)),
                 Value::Bool(!field.nullable),
                 Value::Bool(column_default_expr(ctx, entry.oid, idx).is_some()),
+                Value::Bool(false),
+            ]);
+        }
+    }
+    let mut composites = ctx
+        .catalog_snapshot
+        .composite_types_by_oid
+        .values()
+        .collect::<Vec<_>>();
+    composites.sort_by_key(|entry| entry.oid.raw());
+    for entry in composites {
+        for (idx, field) in entry.schema.fields().iter().enumerate() {
+            rows.push(vec![
+                v_i64(entry.oid.raw()),
+                v_text(field.name.clone()),
+                Value::Int32(type_oid(&field.data_type)),
+                Value::Int16(i16::try_from(idx + 1).unwrap_or(i16::MAX)),
+                Value::Bool(!field.nullable),
+                Value::Bool(false),
                 Value::Bool(false),
             ]);
         }
@@ -507,6 +605,191 @@ fn attrdef_oid(relid: Oid, attnum: i16) -> i64 {
     i64::from(relid.raw())
         .saturating_mul(1_000)
         .saturating_add(i64::from(attnum))
+}
+
+fn schema_pg_type() -> Schema {
+    schema([
+        Field::required("oid", DataType::Int64),
+        Field::required("typname", text()),
+        Field::required("typnamespace", DataType::Int64),
+        Field::required("typtype", text()),
+        Field::required("typcategory", text()),
+        Field::required("typlen", DataType::Int16),
+        Field::required("typelem", DataType::Int32),
+    ])
+}
+
+fn rows_pg_type(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    const BUILTINS: &[(i32, &str, &str, &str, i16, i32)] = &[
+        (PG_TYPE_BOOL, "bool", "b", "B", 1, 0),
+        (PG_TYPE_INT2, "int2", "b", "N", 2, 0),
+        (PG_TYPE_INT4, "int4", "b", "N", 4, 0),
+        (PG_TYPE_INT8, "int8", "b", "N", 8, 0),
+        (PG_TYPE_FLOAT4, "float4", "b", "N", 4, 0),
+        (PG_TYPE_FLOAT8, "float8", "b", "N", 8, 0),
+        (PG_TYPE_TEXT, "text", "b", "S", -1, 0),
+        (PG_TYPE_BPCHAR, "bpchar", "b", "S", -1, 0),
+        (PG_TYPE_NUMERIC, "numeric", "b", "N", -1, 0),
+        (PG_TYPE_MONEY, "money", "b", "N", 8, 0),
+        (PG_TYPE_OID, "oid", "b", "N", 4, 0),
+        (PG_TYPE_REGCLASS, "regclass", "b", "N", 4, 0),
+        (PG_TYPE_REGTYPE, "regtype", "b", "N", 4, 0),
+        (PG_TYPE_PG_LSN, "pg_lsn", "b", "U", 8, 0),
+        (PG_TYPE_BYTEA, "bytea", "b", "U", -1, 0),
+        (PG_TYPE_JSON, "json", "b", "U", -1, 0),
+        (PG_TYPE_JSONB, "jsonb", "b", "U", -1, 0),
+        (PG_TYPE_XML, "xml", "b", "U", -1, 0),
+        (PG_TYPE_DATE, "date", "b", "D", 4, 0),
+        (PG_TYPE_TIME, "time", "b", "D", 8, 0),
+        (PG_TYPE_TIMETZ, "timetz", "b", "D", 8, 0),
+        (PG_TYPE_TIMESTAMP, "timestamp", "b", "D", 8, 0),
+        (PG_TYPE_TIMESTAMPTZ, "timestamptz", "b", "D", 8, 0),
+        (PG_TYPE_UUID, "uuid", "b", "U", 16, 0),
+        (PG_TYPE_BIT, "bit", "b", "V", -1, 0),
+        (PG_TYPE_VARBIT, "varbit", "b", "V", -1, 0),
+        (PG_TYPE_INET, "inet", "b", "I", -1, 0),
+        (PG_TYPE_CIDR, "cidr", "b", "I", -1, 0),
+        (PG_TYPE_MACADDR, "macaddr", "b", "U", -1, 0),
+        (PG_TYPE_MACADDR8, "macaddr8", "b", "U", -1, 0),
+    ];
+
+    let mut rows = BUILTINS
+        .iter()
+        .map(|(oid, name, typtype, typcategory, typlen, typelem)| {
+            vec![
+                Value::Int64(i64::from(*oid)),
+                v_text(*name),
+                Value::Int64(PG_CATALOG_OID),
+                v_text(*typtype),
+                v_text(*typcategory),
+                Value::Int16(*typlen),
+                Value::Int32(*typelem),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let mut enums = ctx
+        .catalog_snapshot
+        .enum_types_by_oid
+        .values()
+        .collect::<Vec<_>>();
+    enums.sort_by_key(|entry| entry.oid.raw());
+    for entry in enums {
+        rows.push(vec![
+            v_i64(entry.oid.raw()),
+            v_text(entry.name.clone()),
+            Value::Int64(namespace_oid(&entry.schema_name)),
+            v_text("e"),
+            v_text("E"),
+            Value::Int16(-1),
+            Value::Int32(0),
+        ]);
+    }
+    let mut composites = ctx
+        .catalog_snapshot
+        .composite_types_by_oid
+        .values()
+        .collect::<Vec<_>>();
+    composites.sort_by_key(|entry| entry.oid.raw());
+    for entry in composites {
+        rows.push(vec![
+            v_i64(entry.oid.raw()),
+            v_text(entry.name.clone()),
+            Value::Int64(namespace_oid(&entry.schema_name)),
+            v_text("c"),
+            v_text("C"),
+            Value::Int16(-1),
+            Value::Int32(0),
+        ]);
+    }
+    let mut domains = ctx
+        .catalog_snapshot
+        .domain_types_by_oid
+        .values()
+        .collect::<Vec<_>>();
+    domains.sort_by_key(|entry| entry.oid.raw());
+    for entry in domains {
+        rows.push(vec![
+            v_i64(entry.oid.raw()),
+            v_text(entry.name.clone()),
+            Value::Int64(namespace_oid(&entry.schema_name)),
+            v_text("d"),
+            v_text(type_category_text(&entry.base_type)),
+            Value::Int16(
+                entry
+                    .base_type
+                    .fixed_size()
+                    .and_then(|len| i16::try_from(len).ok())
+                    .unwrap_or(-1),
+            ),
+            Value::Int32(0),
+        ]);
+    }
+    rows
+}
+
+fn type_category_text(ty: &DataType) -> &'static str {
+    match ty {
+        DataType::Bool => "B",
+        DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal { .. }
+        | DataType::Money
+        | DataType::Oid
+        | DataType::RegClass
+        | DataType::RegType => "N",
+        DataType::Text { .. } | DataType::Char { .. } => "S",
+        DataType::Bit { .. } | DataType::VarBit { .. } => "V",
+        DataType::Date
+        | DataType::Time
+        | DataType::TimeTz
+        | DataType::Timestamp
+        | DataType::TimestampTz
+        | DataType::Interval => "D",
+        DataType::Array(_) => "A",
+        DataType::Enum { .. } => "E",
+        DataType::Composite { .. } | DataType::Record(_) => "C",
+        DataType::Domain { base_type, .. } => type_category_text(base_type),
+        _ => "U",
+    }
+}
+
+fn schema_pg_enum() -> Schema {
+    schema([
+        Field::required("oid", DataType::Int64),
+        Field::required("enumtypid", DataType::Int64),
+        Field::required("enumsortorder", DataType::Float32),
+        Field::required("enumlabel", text()),
+    ])
+}
+
+fn rows_pg_enum(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    let mut enums = ctx
+        .catalog_snapshot
+        .enum_types_by_oid
+        .values()
+        .collect::<Vec<_>>();
+    enums.sort_by_key(|entry| entry.oid.raw());
+    let mut rows = Vec::new();
+    for entry in enums {
+        let mut labels = entry.labels.clone();
+        labels.sort_by_key(|label| label.sort_order);
+        for label in labels {
+            rows.push(vec![
+                v_i64(label.oid.raw()),
+                v_i64(entry.oid.raw()),
+                Value::Float32(enum_sort_order_f32(label.sort_order)),
+                v_text(label.label),
+            ]);
+        }
+    }
+    rows
+}
+
+fn enum_sort_order_f32(sort_order: u32) -> f32 {
+    sort_order.to_string().parse::<f32>().unwrap_or(f32::MAX)
 }
 
 fn column_default_expr(ctx: &LowerCtx<'_>, relid: Oid, idx: usize) -> Option<String> {

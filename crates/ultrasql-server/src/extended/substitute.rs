@@ -225,6 +225,9 @@ where
         | LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::CreateTypeEnum { .. }
+        | LogicalPlan::CreateTypeComposite { .. }
+        | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }

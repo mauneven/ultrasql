@@ -23,7 +23,7 @@
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
-use ultrasql_core::{DataType, Schema, Value};
+use ultrasql_core::{DataType, Schema, Value, bpchar_semantic_text, timetz_utc_micros};
 use ultrasql_vec::Batch;
 use ultrasql_vec::column::Column;
 
@@ -85,6 +85,26 @@ impl Hash for KeyValue {
                 state.write_u8(4);
                 v.hash(state);
             }
+            Value::Money(v) => {
+                state.write_u8(23);
+                v.hash(state);
+            }
+            Value::Oid(v) => {
+                state.write_u8(27);
+                v.hash(state);
+            }
+            Value::RegClass(v) => {
+                state.write_u8(28);
+                v.hash(state);
+            }
+            Value::RegType(v) => {
+                state.write_u8(29);
+                v.hash(state);
+            }
+            Value::PgLsn(v) => {
+                state.write_u8(30);
+                v.hash(state);
+            }
             Value::Float32(v) => {
                 state.write_u8(5);
                 v.to_bits().hash(state);
@@ -97,8 +117,20 @@ impl Hash for KeyValue {
                 state.write_u8(7);
                 s.hash(state);
             }
+            Value::Char(s) => {
+                state.write_u8(24);
+                bpchar_semantic_text(s).hash(state);
+            }
+            Value::Json(s) => {
+                state.write_u8(16);
+                s.hash(state);
+            }
             Value::Jsonb(s) => {
                 state.write_u8(17);
+                s.hash(state);
+            }
+            Value::Xml(s) => {
+                state.write_u8(31);
                 s.hash(state);
             }
             Value::Bytea(b) => {
@@ -108,6 +140,13 @@ impl Hash for KeyValue {
             Value::Timestamp(x) | Value::TimestampTz(x) | Value::Time(x) => {
                 state.write_u8(9);
                 x.hash(state);
+            }
+            Value::TimeTz {
+                micros,
+                offset_seconds,
+            } => {
+                state.write_u8(9);
+                timetz_utc_micros(*micros, *offset_seconds).hash(state);
             }
             Value::Date(x) => {
                 state.write_u8(10);
@@ -162,6 +201,14 @@ impl Hash for KeyValue {
                 state.write_u8(21);
                 dims.hash(state);
                 bytes.hash(state);
+            }
+            Value::BitString(bits) => {
+                state.write_u8(25);
+                bits.hash(state);
+            }
+            Value::Network(network) => {
+                state.write_u8(26);
+                network.hash(state);
             }
             Value::Record(fields) => {
                 state.write_u8(22);

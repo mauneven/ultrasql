@@ -52,7 +52,9 @@ pub use encoding::{
     DecodeError as RowDecodeError, EncodeError as RowEncodeError, decode_attribute_row,
     encode_attribute_row, schema_from_attributes,
 };
-pub use entry::{IndexEntry, TableEntry};
+pub use entry::{
+    CompositeTypeEntry, DomainTypeEntry, EnumLabelEntry, EnumTypeEntry, IndexEntry, TableEntry,
+};
 pub use error::CatalogError;
 pub use memory::{FIRST_USER_OID, InMemoryCatalog};
 pub use persistent::{

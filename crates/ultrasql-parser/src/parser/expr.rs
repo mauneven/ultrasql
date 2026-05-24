@@ -212,6 +212,38 @@ impl<'src> Parser<'src> {
             | TokenKind::KwTimestamp
             | TokenKind::KwInterval
             | TokenKind::KwJson => {
+                if matches!(tok_kind, TokenKind::KwTime | TokenKind::KwTimestamp)
+                    && self.lookahead_at(1).map(|t| t.kind) == Ok(TokenKind::KwWith)
+                    && self.lookahead_at(2).map(|t| t.kind) == Ok(TokenKind::KwTime)
+                    && self.lookahead_at(3).map(|t| t.kind) == Ok(TokenKind::KwZone)
+                    && matches!(
+                        self.lookahead_at(4).map(|t| t.kind),
+                        Ok(TokenKind::String | TokenKind::EscapedString)
+                    )
+                {
+                    let type_tok = self.advance()?;
+                    self.advance()?; // WITH
+                    self.advance()?; // TIME
+                    self.advance()?; // ZONE
+                    let str_tok = self.advance()?;
+                    let raw = str_tok.text(self.source).unwrap_or("");
+                    let value = if matches!(str_tok.kind, TokenKind::String) {
+                        raw[1..raw.len() - 1].replace("''", "'")
+                    } else {
+                        raw.to_owned()
+                    };
+                    let type_name = if tok_kind == TokenKind::KwTime {
+                        "time with time zone"
+                    } else {
+                        "timestamp with time zone"
+                    };
+                    return Ok(Expr::Literal(Literal::Typed {
+                        type_name: type_name.to_owned(),
+                        value,
+                        unit: None,
+                        span: Span::new(type_tok.span.start, str_tok.span.end),
+                    }));
+                }
                 let next_is_string = matches!(
                     self.lookahead_at(1).map(|t| t.kind),
                     Ok(TokenKind::String | TokenKind::EscapedString)
@@ -394,8 +426,14 @@ impl<'src> Parser<'src> {
             TokenKind::Identifier | TokenKind::QuotedIdentifier => {
                 if self.looks_like_vector_family_typed_literal()? {
                     self.parse_vector_family_typed_literal()
-                } else if self.looks_like_json_typed_literal()? {
+                } else if self.looks_like_bit_string_typed_literal()? {
+                    self.parse_bit_string_typed_literal()
+                } else if self.looks_like_network_typed_literal()?
+                    || self.looks_like_json_typed_literal()?
+                {
                     self.parse_json_typed_literal()
+                } else if self.looks_like_temporal_alias_typed_literal()? {
+                    self.parse_temporal_alias_typed_literal()
                 } else {
                     self.parse_ident_or_call()
                 }
@@ -788,7 +826,7 @@ impl<'src> Parser<'src> {
         let tok = *self.peek()?;
         if tok.kind != TokenKind::Identifier
             || !tok.text(self.source).is_some_and(|text| {
-                text.eq_ignore_ascii_case("json") || text.eq_ignore_ascii_case("jsonb")
+                matches!(text.to_ascii_lowercase().as_str(), "json" | "jsonb" | "xml")
             })
         {
             return Ok(false);
@@ -797,6 +835,81 @@ impl<'src> Parser<'src> {
             self.lookahead_at(1)?.kind,
             TokenKind::String | TokenKind::EscapedString
         ))
+    }
+
+    fn looks_like_bit_string_typed_literal(&mut self) -> Result<bool, ParseError> {
+        let tok = *self.peek()?;
+        if tok.kind != TokenKind::Identifier
+            || !tok.text(self.source).is_some_and(|text| {
+                matches!(text.to_ascii_lowercase().as_str(), "b" | "bit" | "varbit")
+            })
+        {
+            return Ok(false);
+        }
+        Ok(matches!(
+            self.lookahead_at(1)?.kind,
+            TokenKind::String | TokenKind::EscapedString
+        ))
+    }
+
+    fn looks_like_network_typed_literal(&mut self) -> Result<bool, ParseError> {
+        let tok = *self.peek()?;
+        if tok.kind != TokenKind::Identifier
+            || !tok.text(self.source).is_some_and(|text| {
+                matches!(
+                    text.to_ascii_lowercase().as_str(),
+                    "inet" | "cidr" | "macaddr" | "macaddr8"
+                )
+            })
+        {
+            return Ok(false);
+        }
+        Ok(matches!(
+            self.lookahead_at(1)?.kind,
+            TokenKind::String | TokenKind::EscapedString
+        ))
+    }
+
+    fn parse_bit_string_typed_literal(&mut self) -> Result<Expr, ParseError> {
+        let type_tok = self.advance()?;
+        let raw_type_name = type_tok.text(self.source).unwrap_or("");
+        let type_name = if raw_type_name.eq_ignore_ascii_case("b") {
+            "bit".to_owned()
+        } else {
+            raw_type_name.to_ascii_lowercase()
+        };
+        let str_tok = self.advance()?;
+        let raw = str_tok.text(self.source).unwrap_or("");
+        let value = if matches!(str_tok.kind, TokenKind::String) {
+            raw[1..raw.len() - 1].replace("''", "'")
+        } else {
+            raw.to_owned()
+        };
+        Ok(Expr::Literal(Literal::Typed {
+            type_name,
+            value,
+            unit: None,
+            span: Span::new(type_tok.span.start, str_tok.span.end),
+        }))
+    }
+
+    fn looks_like_temporal_alias_typed_literal(&mut self) -> Result<bool, ParseError> {
+        let tok = *self.peek()?;
+        if tok.kind != TokenKind::Identifier
+            || !tok.text(self.source).is_some_and(|text| {
+                matches!(text.to_ascii_lowercase().as_str(), "timetz" | "timestamptz")
+            })
+        {
+            return Ok(false);
+        }
+        Ok(matches!(
+            self.lookahead_at(1)?.kind,
+            TokenKind::String | TokenKind::EscapedString
+        ))
+    }
+
+    fn parse_temporal_alias_typed_literal(&mut self) -> Result<Expr, ParseError> {
+        self.parse_json_typed_literal()
     }
 
     fn parse_json_typed_literal(&mut self) -> Result<Expr, ParseError> {
@@ -865,11 +978,17 @@ impl<'src> Parser<'src> {
             let precision = self.advance()?;
             target.value = "double precision".to_owned();
             target.span = Span::new(target.span.start, precision.span.end);
-        } else if target.value == "timestamp" && self.peek()?.kind == TokenKind::KwWith {
+        } else if target.value == "bit" && self.next_identifier_is("varying")? {
+            let varying = self.advance()?;
+            target.value = "bit varying".to_owned();
+            target.span = Span::new(target.span.start, varying.span.end);
+        } else if matches!(target.value.as_str(), "time" | "timestamp")
+            && self.peek()?.kind == TokenKind::KwWith
+        {
             self.advance()?;
             self.expect(TokenKind::KwTime, "TIME")?;
             let zone = self.expect(TokenKind::KwZone, "ZONE")?;
-            target.value = "timestamp with time zone".to_owned();
+            target.value = format!("{} with time zone", target.value);
             target.span = Span::new(target.span.start, zone.span.end);
         }
         if let Some(base) = vector_family_type_base(&target.value)
@@ -880,6 +999,15 @@ impl<'src> Parser<'src> {
             let dim = dim_tok.text(self.source).unwrap_or("");
             let rp = self.expect(TokenKind::RParen, ")")?;
             target.value = format!("{base}({dim})");
+            target.span = Span::new(target.span.start, rp.span.end);
+        } else if let Some(base) = single_modifier_cast_type_base(&target.value)
+            && self.peek()?.kind == TokenKind::LParen
+        {
+            self.advance()?; // (
+            let len_tok = self.expect(TokenKind::Integer, "integer type modifier")?;
+            let len = len_tok.text(self.source).unwrap_or("");
+            let rp = self.expect(TokenKind::RParen, ")")?;
+            target.value = format!("{base}({len})");
             target.span = Span::new(target.span.start, rp.span.end);
         }
         Ok(target)
@@ -897,5 +1025,35 @@ fn vector_family_type_base(text: &str) -> Option<&'static str> {
         Some("bitvec")
     } else {
         None
+    }
+}
+
+fn single_modifier_cast_type_base(text: &str) -> Option<&'static str> {
+    if text.eq_ignore_ascii_case("char") {
+        Some("char")
+    } else if text.eq_ignore_ascii_case("character") {
+        Some("character")
+    } else if text.eq_ignore_ascii_case("bpchar") {
+        Some("bpchar")
+    } else if text.eq_ignore_ascii_case("varchar") {
+        Some("varchar")
+    } else if text.eq_ignore_ascii_case("bit") {
+        Some("bit")
+    } else if text.eq_ignore_ascii_case("varbit") {
+        Some("varbit")
+    } else if text.eq_ignore_ascii_case("bit varying") {
+        Some("bit varying")
+    } else {
+        None
+    }
+}
+
+impl Parser<'_> {
+    pub(crate) fn next_identifier_is(&mut self, expected: &str) -> Result<bool, ParseError> {
+        let tok = *self.peek()?;
+        Ok(tok.kind == TokenKind::Identifier
+            && tok
+                .text(self.source)
+                .is_some_and(|text| text.eq_ignore_ascii_case(expected)))
     }
 }

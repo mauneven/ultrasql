@@ -123,13 +123,16 @@ Not in scope:
 ## 7. Hardening practices we follow
 
 - `forbid(unsafe_op_in_unsafe_fn)` workspace-wide.
-- `cargo audit` runs in CI.
+- `cargo audit --deny yanked` runs in CI and release verification.
 - ASAN and TSAN nightly jobs.
 - Fuzz targets for the parser, wire protocol, and WAL record decoder.
 - All untrusted input is parsed in dedicated parsers with bounded
   recursion and bounded allocation.
 - Resource quotas (memory, work_mem, statement_timeout) are enforced
   per-connection.
+- Persistent data directories are canonicalized before open; startup
+  rejects a symlinked data directory and, on Unix, a final directory
+  not owned by the server's effective UID.
 
 ---
 

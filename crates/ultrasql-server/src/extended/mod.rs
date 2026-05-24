@@ -71,16 +71,116 @@ const PG_OID_INT8: u32 = 20;
 const PG_OID_FLOAT4: u32 = 700;
 /// PostgreSQL type OID for `float8`.
 const PG_OID_FLOAT8: u32 = 701;
+/// PostgreSQL type OID for `numeric`.
+const PG_OID_NUMERIC: u32 = 1700;
+/// PostgreSQL type OID for `money`.
+const PG_OID_MONEY: u32 = 790;
 /// PostgreSQL type OID for `text`.
 const PG_OID_TEXT: u32 = 25;
 /// PostgreSQL type OID for `bytea`.
 const PG_OID_BYTEA: u32 = 17;
+/// PostgreSQL type OID for `json`.
+const PG_OID_JSON: u32 = 114;
+/// PostgreSQL type OID for `jsonb`.
+const PG_OID_JSONB: u32 = 3802;
+/// PostgreSQL type OID for `xml`.
+const PG_OID_XML: u32 = 142;
 /// PostgreSQL type OID for `varchar`.
 const PG_OID_VARCHAR: u32 = 1043;
 /// PostgreSQL type OID for `bpchar` (`char(n)`).
 const PG_OID_BPCHAR: u32 = 1042;
+/// PostgreSQL type OID for `bit`.
+const PG_OID_BIT: u32 = 1560;
+/// PostgreSQL type OID for `varbit`.
+const PG_OID_VARBIT: u32 = 1562;
+/// PostgreSQL type OID for `cidr`.
+const PG_OID_CIDR: u32 = 650;
+/// PostgreSQL type OID for `inet`.
+const PG_OID_INET: u32 = 869;
+/// PostgreSQL type OID for `macaddr`.
+const PG_OID_MACADDR: u32 = 829;
+/// PostgreSQL type OID for `macaddr8`.
+const PG_OID_MACADDR8: u32 = 774;
+/// PostgreSQL type OID for `date`.
+const PG_OID_DATE: u32 = 1082;
+/// PostgreSQL type OID for `time`.
+const PG_OID_TIME: u32 = 1083;
+/// PostgreSQL type OID for `timestamp`.
+const PG_OID_TIMESTAMP: u32 = 1114;
+/// PostgreSQL type OID for `timetz`.
+const PG_OID_TIMETZ: u32 = 1266;
+/// PostgreSQL type OID for `timestamptz`.
+const PG_OID_TIMESTAMPTZ: u32 = 1184;
 /// PostgreSQL type OID for `oid`.
 const PG_OID_OID: u32 = 26;
+/// PostgreSQL type OID for `regclass`.
+const PG_OID_REGCLASS: u32 = 2205;
+/// PostgreSQL type OID for `regtype`.
+const PG_OID_REGTYPE: u32 = 2206;
+/// PostgreSQL type OID for `pg_lsn`.
+const PG_OID_PG_LSN: u32 = 3220;
+/// PostgreSQL type OID for `uuid`.
+const PG_OID_UUID: u32 = 2950;
+/// PostgreSQL type OID for `bool[]`.
+const PG_OID_BOOL_ARRAY: u32 = 1000;
+/// PostgreSQL type OID for `int2[]`.
+const PG_OID_INT2_ARRAY: u32 = 1005;
+/// PostgreSQL type OID for `int4[]`.
+const PG_OID_INT4_ARRAY: u32 = 1007;
+/// PostgreSQL type OID for `int8[]`.
+const PG_OID_INT8_ARRAY: u32 = 1016;
+/// PostgreSQL type OID for `float4[]`.
+const PG_OID_FLOAT4_ARRAY: u32 = 1021;
+/// PostgreSQL type OID for `float8[]`.
+const PG_OID_FLOAT8_ARRAY: u32 = 1022;
+/// PostgreSQL type OID for `numeric[]`.
+const PG_OID_NUMERIC_ARRAY: u32 = 1231;
+/// PostgreSQL type OID for `money[]`.
+const PG_OID_MONEY_ARRAY: u32 = 791;
+/// PostgreSQL type OID for `text[]`.
+const PG_OID_TEXT_ARRAY: u32 = 1009;
+/// PostgreSQL type OID for `bpchar[]`.
+const PG_OID_BPCHAR_ARRAY: u32 = 1014;
+/// PostgreSQL type OID for `bit[]`.
+const PG_OID_BIT_ARRAY: u32 = 1561;
+/// PostgreSQL type OID for `varbit[]`.
+const PG_OID_VARBIT_ARRAY: u32 = 1563;
+/// PostgreSQL type OID for `cidr[]`.
+const PG_OID_CIDR_ARRAY: u32 = 651;
+/// PostgreSQL type OID for `inet[]`.
+const PG_OID_INET_ARRAY: u32 = 1041;
+/// PostgreSQL type OID for `macaddr[]`.
+const PG_OID_MACADDR_ARRAY: u32 = 1040;
+/// PostgreSQL type OID for `macaddr8[]`.
+const PG_OID_MACADDR8_ARRAY: u32 = 775;
+/// PostgreSQL type OID for `bytea[]`.
+const PG_OID_BYTEA_ARRAY: u32 = 1001;
+/// PostgreSQL type OID for `uuid[]`.
+const PG_OID_UUID_ARRAY: u32 = 2951;
+/// PostgreSQL type OID for `json[]`.
+const PG_OID_JSON_ARRAY: u32 = 199;
+/// PostgreSQL type OID for `jsonb[]`.
+const PG_OID_JSONB_ARRAY: u32 = 3807;
+/// PostgreSQL type OID for `xml[]`.
+const PG_OID_XML_ARRAY: u32 = 143;
+/// PostgreSQL type OID for `date[]`.
+const PG_OID_DATE_ARRAY: u32 = 1182;
+/// PostgreSQL type OID for `time[]`.
+const PG_OID_TIME_ARRAY: u32 = 1183;
+/// PostgreSQL type OID for `timestamp[]`.
+const PG_OID_TIMESTAMP_ARRAY: u32 = 1115;
+/// PostgreSQL type OID for `timetz[]`.
+const PG_OID_TIMETZ_ARRAY: u32 = 1270;
+/// PostgreSQL type OID for `timestamptz[]`.
+const PG_OID_TIMESTAMPTZ_ARRAY: u32 = 1185;
+/// PostgreSQL type OID for `oid[]`.
+const PG_OID_OID_ARRAY: u32 = 1028;
+/// PostgreSQL type OID for `regclass[]`.
+const PG_OID_REGCLASS_ARRAY: u32 = 2210;
+/// PostgreSQL type OID for `regtype[]`.
+const PG_OID_REGTYPE_ARRAY: u32 = 2211;
+/// PostgreSQL type OID for `pg_lsn[]`.
+const PG_OID_PG_LSN_ARRAY: u32 = 3221;
 
 mod codec;
 mod execute;

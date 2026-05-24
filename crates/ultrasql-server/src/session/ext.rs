@@ -30,6 +30,7 @@ use ultrasql_storage::page::Page;
 use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
 use super::Session;
+use super::timeout::StatementTimeoutGuard;
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
@@ -401,7 +402,10 @@ where
 
         // Non-txn-control path: route through TxnState.
         let started = Instant::now();
+        let timeout_guard =
+            StatementTimeoutGuard::arm(self.statement_timeout_ms, self.cancel_flag.clone());
         let outcome = self.run_portal_routed(portal, max_rows);
+        drop(timeout_guard);
         let elapsed = started.elapsed();
         if let Some((query, plan_hash, bind_param_count, bind_params_redacted)) = workload_meta {
             let rows = outcome

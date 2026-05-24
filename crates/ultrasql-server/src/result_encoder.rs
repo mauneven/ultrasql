@@ -20,7 +20,10 @@
 //! [`Batch`]: ultrasql_vec::Batch
 
 use bytes::BytesMut;
-use ultrasql_core::{DataType, Schema, Value};
+use ultrasql_core::{
+    DataType, Schema, Value, format_time_micros, format_timestamp_micros,
+    format_timestamptz_micros_utc, format_timetz, unpack_timetz,
+};
 use ultrasql_executor::Operator;
 use ultrasql_protocol::{BackendMessage, FieldDescription, encode_backend};
 use ultrasql_vec::column::Column;
@@ -42,14 +45,114 @@ const PG_OID_INT8: u32 = 20;
 const PG_OID_FLOAT4: u32 = 700;
 /// PostgreSQL type OID for `float8`.
 const PG_OID_FLOAT8: u32 = 701;
+/// PostgreSQL type OID for `numeric`.
+const PG_OID_NUMERIC: u32 = 1700;
+/// PostgreSQL type OID for `money`.
+const PG_OID_MONEY: u32 = 790;
+/// PostgreSQL type OID for `oid`.
+const PG_OID_OID: u32 = 26;
+/// PostgreSQL type OID for `regclass`.
+const PG_OID_REGCLASS: u32 = 2205;
+/// PostgreSQL type OID for `regtype`.
+const PG_OID_REGTYPE: u32 = 2206;
+/// PostgreSQL type OID for `pg_lsn`.
+const PG_OID_PG_LSN: u32 = 3220;
 /// PostgreSQL type OID for `text`.
 const PG_OID_TEXT: u32 = 25;
+/// PostgreSQL type OID for `bpchar` (`CHAR(n)`).
+const PG_OID_BPCHAR: u32 = 1042;
+/// PostgreSQL type OID for `bit`.
+const PG_OID_BIT: u32 = 1560;
+/// PostgreSQL type OID for `varbit`.
+const PG_OID_VARBIT: u32 = 1562;
+/// PostgreSQL type OID for `cidr`.
+const PG_OID_CIDR: u32 = 650;
+/// PostgreSQL type OID for `inet`.
+const PG_OID_INET: u32 = 869;
+/// PostgreSQL type OID for `macaddr`.
+const PG_OID_MACADDR: u32 = 829;
+/// PostgreSQL type OID for `macaddr8`.
+const PG_OID_MACADDR8: u32 = 774;
 /// PostgreSQL type OID for `bytea`.
 const PG_OID_BYTEA: u32 = 17;
 /// PostgreSQL type OID for `uuid`.
 const PG_OID_UUID: u32 = 2950;
+/// PostgreSQL type OID for `json`.
+const PG_OID_JSON: u32 = 114;
 /// PostgreSQL type OID for `jsonb`.
 const PG_OID_JSONB: u32 = 3802;
+/// PostgreSQL type OID for `xml`.
+const PG_OID_XML: u32 = 142;
+/// PostgreSQL type OID for `date`.
+const PG_OID_DATE: u32 = 1082;
+/// PostgreSQL type OID for `time`.
+const PG_OID_TIME: u32 = 1083;
+/// PostgreSQL type OID for `timestamp`.
+const PG_OID_TIMESTAMP: u32 = 1114;
+/// PostgreSQL type OID for `timetz`.
+const PG_OID_TIMETZ: u32 = 1266;
+/// PostgreSQL type OID for `timestamptz`.
+const PG_OID_TIMESTAMPTZ: u32 = 1184;
+/// PostgreSQL type OID for `bool[]`.
+const PG_OID_BOOL_ARRAY: u32 = 1000;
+/// PostgreSQL type OID for `int2[]`.
+const PG_OID_INT2_ARRAY: u32 = 1005;
+/// PostgreSQL type OID for `int4[]`.
+const PG_OID_INT4_ARRAY: u32 = 1007;
+/// PostgreSQL type OID for `int8[]`.
+const PG_OID_INT8_ARRAY: u32 = 1016;
+/// PostgreSQL type OID for `float4[]`.
+const PG_OID_FLOAT4_ARRAY: u32 = 1021;
+/// PostgreSQL type OID for `float8[]`.
+const PG_OID_FLOAT8_ARRAY: u32 = 1022;
+/// PostgreSQL type OID for `numeric[]`.
+const PG_OID_NUMERIC_ARRAY: u32 = 1231;
+/// PostgreSQL type OID for `money[]`.
+const PG_OID_MONEY_ARRAY: u32 = 791;
+/// PostgreSQL type OID for `oid[]`.
+const PG_OID_OID_ARRAY: u32 = 1028;
+/// PostgreSQL type OID for `regclass[]`.
+const PG_OID_REGCLASS_ARRAY: u32 = 2210;
+/// PostgreSQL type OID for `regtype[]`.
+const PG_OID_REGTYPE_ARRAY: u32 = 2211;
+/// PostgreSQL type OID for `pg_lsn[]`.
+const PG_OID_PG_LSN_ARRAY: u32 = 3221;
+/// PostgreSQL type OID for `text[]`.
+const PG_OID_TEXT_ARRAY: u32 = 1009;
+/// PostgreSQL type OID for `bpchar[]`.
+const PG_OID_BPCHAR_ARRAY: u32 = 1014;
+/// PostgreSQL type OID for `bit[]`.
+const PG_OID_BIT_ARRAY: u32 = 1561;
+/// PostgreSQL type OID for `varbit[]`.
+const PG_OID_VARBIT_ARRAY: u32 = 1563;
+/// PostgreSQL type OID for `cidr[]`.
+const PG_OID_CIDR_ARRAY: u32 = 651;
+/// PostgreSQL type OID for `inet[]`.
+const PG_OID_INET_ARRAY: u32 = 1041;
+/// PostgreSQL type OID for `macaddr[]`.
+const PG_OID_MACADDR_ARRAY: u32 = 1040;
+/// PostgreSQL type OID for `macaddr8[]`.
+const PG_OID_MACADDR8_ARRAY: u32 = 775;
+/// PostgreSQL type OID for `bytea[]`.
+const PG_OID_BYTEA_ARRAY: u32 = 1001;
+/// PostgreSQL type OID for `uuid[]`.
+const PG_OID_UUID_ARRAY: u32 = 2951;
+/// PostgreSQL type OID for `json[]`.
+const PG_OID_JSON_ARRAY: u32 = 199;
+/// PostgreSQL type OID for `jsonb[]`.
+const PG_OID_JSONB_ARRAY: u32 = 3807;
+/// PostgreSQL type OID for `xml[]`.
+const PG_OID_XML_ARRAY: u32 = 143;
+/// PostgreSQL type OID for `date[]`.
+const PG_OID_DATE_ARRAY: u32 = 1182;
+/// PostgreSQL type OID for `time[]`.
+const PG_OID_TIME_ARRAY: u32 = 1183;
+/// PostgreSQL type OID for `timestamp[]`.
+const PG_OID_TIMESTAMP_ARRAY: u32 = 1115;
+/// PostgreSQL type OID for `timetz[]`.
+const PG_OID_TIMETZ_ARRAY: u32 = 1270;
+/// PostgreSQL type OID for `timestamptz[]`.
+const PG_OID_TIMESTAMPTZ_ARRAY: u32 = 1185;
 /// PostgreSQL format code 0 = text.
 const FORMAT_TEXT: i16 = 0;
 
@@ -507,6 +610,21 @@ pub(crate) fn encode_text_value_typed(
             .to_string()
             .into(),
         ),
+        (DataType::Money, Column::Int64(c)) => Some(Value::Money(c.data()[row]).to_string().into()),
+        (DataType::Oid | DataType::RegClass | DataType::RegType, Column::Int64(c)) => {
+            u32::try_from(c.data()[row])
+                .ok()
+                .map(|raw| raw.to_string().into_bytes())
+        }
+        (DataType::Time, Column::Int64(c)) => Some(format_time_micros(c.data()[row]).into_bytes()),
+        (DataType::Timestamp, Column::Int64(c)) => {
+            Some(format_timestamp_micros(c.data()[row]).into_bytes())
+        }
+        (DataType::TimestampTz, Column::Int64(c)) => {
+            Some(format_timestamptz_micros_utc(c.data()[row]).into_bytes())
+        }
+        (DataType::TimeTz, Column::Int64(c)) => unpack_timetz(c.data()[row])
+            .map(|(micros, offset_seconds)| format_timetz(micros, offset_seconds).into_bytes()),
         (ty, Column::Utf8(_) | Column::DictionaryUtf8(_)) if ty.is_vector_family() => col
             .text_value(row)
             .map(|text| encode_vector_family_text_value(text, ty)),
@@ -615,7 +733,7 @@ fn format_f64(v: f64) -> Vec<u8> {
 /// Map an UltraSQL [`DataType`] to a PostgreSQL type OID. Types that
 /// have no representation yet fall back to `text`; that keeps the
 /// driver happy until proper coverage lands.
-const fn pg_type_oid(ty: &DataType) -> u32 {
+fn pg_type_oid(ty: &DataType) -> u32 {
     match ty {
         DataType::Bool => PG_OID_BOOL,
         DataType::Int16 => PG_OID_INT2,
@@ -623,11 +741,72 @@ const fn pg_type_oid(ty: &DataType) -> u32 {
         DataType::Int64 => PG_OID_INT8,
         DataType::Float32 => PG_OID_FLOAT4,
         DataType::Float64 => PG_OID_FLOAT8,
+        DataType::Decimal { .. } => PG_OID_NUMERIC,
+        DataType::Money => PG_OID_MONEY,
+        DataType::Oid => PG_OID_OID,
+        DataType::RegClass => PG_OID_REGCLASS,
+        DataType::RegType => PG_OID_REGTYPE,
+        DataType::PgLsn => PG_OID_PG_LSN,
+        DataType::Char { .. } => PG_OID_BPCHAR,
+        DataType::Bit { .. } => PG_OID_BIT,
+        DataType::VarBit { .. } => PG_OID_VARBIT,
+        DataType::Inet => PG_OID_INET,
+        DataType::Cidr => PG_OID_CIDR,
+        DataType::MacAddr => PG_OID_MACADDR,
+        DataType::MacAddr8 => PG_OID_MACADDR8,
+        DataType::Date => PG_OID_DATE,
+        DataType::Time => PG_OID_TIME,
+        DataType::Timestamp => PG_OID_TIMESTAMP,
+        DataType::TimeTz => PG_OID_TIMETZ,
+        DataType::TimestampTz => PG_OID_TIMESTAMPTZ,
         DataType::Bytea => PG_OID_BYTEA,
         DataType::Uuid => PG_OID_UUID,
+        DataType::Json => PG_OID_JSON,
         DataType::Jsonb => PG_OID_JSONB,
+        DataType::Xml => PG_OID_XML,
+        DataType::Enum { oid, .. }
+        | DataType::Composite { oid, .. }
+        | DataType::Domain { oid, .. } => oid.raw(),
+        DataType::Array(element) => pg_array_type_oid(element),
         DataType::Vector { .. } => PG_OID_TEXT,
         _ => PG_OID_TEXT,
+    }
+}
+
+fn pg_array_type_oid(element: &DataType) -> u32 {
+    match element {
+        DataType::Bool => PG_OID_BOOL_ARRAY,
+        DataType::Int16 => PG_OID_INT2_ARRAY,
+        DataType::Int32 => PG_OID_INT4_ARRAY,
+        DataType::Int64 => PG_OID_INT8_ARRAY,
+        DataType::Float32 => PG_OID_FLOAT4_ARRAY,
+        DataType::Float64 => PG_OID_FLOAT8_ARRAY,
+        DataType::Decimal { .. } => PG_OID_NUMERIC_ARRAY,
+        DataType::Money => PG_OID_MONEY_ARRAY,
+        DataType::Oid => PG_OID_OID_ARRAY,
+        DataType::RegClass => PG_OID_REGCLASS_ARRAY,
+        DataType::RegType => PG_OID_REGTYPE_ARRAY,
+        DataType::PgLsn => PG_OID_PG_LSN_ARRAY,
+        DataType::Text { .. } => PG_OID_TEXT_ARRAY,
+        DataType::Char { .. } => PG_OID_BPCHAR_ARRAY,
+        DataType::Bit { .. } => PG_OID_BIT_ARRAY,
+        DataType::VarBit { .. } => PG_OID_VARBIT_ARRAY,
+        DataType::Inet => PG_OID_INET_ARRAY,
+        DataType::Cidr => PG_OID_CIDR_ARRAY,
+        DataType::MacAddr => PG_OID_MACADDR_ARRAY,
+        DataType::MacAddr8 => PG_OID_MACADDR8_ARRAY,
+        DataType::Date => PG_OID_DATE_ARRAY,
+        DataType::Time => PG_OID_TIME_ARRAY,
+        DataType::Timestamp => PG_OID_TIMESTAMP_ARRAY,
+        DataType::TimeTz => PG_OID_TIMETZ_ARRAY,
+        DataType::TimestampTz => PG_OID_TIMESTAMPTZ_ARRAY,
+        DataType::Bytea => PG_OID_BYTEA_ARRAY,
+        DataType::Uuid => PG_OID_UUID_ARRAY,
+        DataType::Json => PG_OID_JSON_ARRAY,
+        DataType::Jsonb => PG_OID_JSONB_ARRAY,
+        DataType::Xml => PG_OID_XML_ARRAY,
+        DataType::Array(inner) => pg_array_type_oid(inner),
+        _ => PG_OID_TEXT_ARRAY,
     }
 }
 
@@ -637,8 +816,20 @@ const fn pg_type_size(ty: &DataType) -> i16 {
     match ty {
         DataType::Bool => 1,
         DataType::Int16 => 2,
-        DataType::Int32 | DataType::Float32 => 4,
-        DataType::Int64 | DataType::Float64 => 8,
+        DataType::Int32
+        | DataType::Float32
+        | DataType::Date
+        | DataType::Oid
+        | DataType::RegClass
+        | DataType::RegType => 4,
+        DataType::Int64
+        | DataType::Money
+        | DataType::Float64
+        | DataType::Time
+        | DataType::Timestamp
+        | DataType::TimestampTz
+        | DataType::PgLsn => 8,
+        DataType::TimeTz => 12,
         DataType::Uuid => 16,
         _ => -1,
     }
@@ -692,7 +883,27 @@ mod tests {
         assert_eq!(pg_type_oid(&DataType::Float64), 701);
         assert_eq!(pg_type_oid(&DataType::Bool), 16);
         assert_eq!(pg_type_oid(&DataType::Text { max_len: None }), 25);
+        assert_eq!(pg_type_oid(&DataType::Money), 790);
+        assert_eq!(pg_type_oid(&DataType::Json), 114);
         assert_eq!(pg_type_oid(&DataType::Jsonb), 3802);
+        assert_eq!(pg_type_oid(&DataType::Xml), 142);
+        assert_eq!(pg_type_oid(&DataType::Oid), 26);
+        assert_eq!(pg_type_oid(&DataType::RegClass), 2205);
+        assert_eq!(pg_type_oid(&DataType::RegType), 2206);
+        assert_eq!(pg_type_oid(&DataType::PgLsn), 3220);
+        assert_eq!(
+            pg_type_oid(&DataType::Array(Box::new(DataType::Array(Box::new(
+                DataType::Int32
+            ))))),
+            1007
+        );
+        assert_eq!(
+            pg_type_oid(&DataType::Decimal {
+                precision: Some(12),
+                scale: Some(3)
+            }),
+            1700
+        );
         assert_eq!(pg_type_oid(&DataType::Vector { dims: Some(3) }), 25);
     }
 
@@ -721,6 +932,28 @@ mod tests {
             BackendMessage::DataRow { columns } => {
                 assert_eq!(columns[0], Some(b"2000-01-01".to_vec()));
                 assert_eq!(columns[1], Some(b"173665.47".to_vec()));
+            }
+            other => panic!("expected DataRow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_select_encodes_logical_money_text_and_oid() {
+        let schema = Schema::new([Field::required("amount", DataType::Money)]).unwrap();
+        let batch = Batch::new([Column::Int64(NumericColumn::from_data(vec![123_456]))]).unwrap();
+        let mut scan = MemTableScan::new(schema, vec![batch]);
+        let result = run_select(&mut scan).expect("ok");
+
+        match &result.messages[0] {
+            BackendMessage::RowDescription { fields } => {
+                assert_eq!(fields[0].type_oid, 790);
+                assert_eq!(fields[0].type_size, 8);
+            }
+            other => panic!("expected RowDescription, got {other:?}"),
+        }
+        match &result.messages[1] {
+            BackendMessage::DataRow { columns } => {
+                assert_eq!(columns[0], Some(b"$1,234.56".to_vec()));
             }
             other => panic!("expected DataRow, got {other:?}"),
         }

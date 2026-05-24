@@ -2,7 +2,8 @@
 //!
 //! Encodes a `Vec<Value>` matching a `Schema` to a tightly-packed byte
 //! buffer suitable for use as the `payload` of a heap tuple. The codec
-//! is the inverse of `decode` and is stable for v0.5.
+//! is the inverse of `decode` and is bound to the workspace on-disk
+//! format version.
 //!
 //! Streaming decode (v0.6)
 //! -----------------------
@@ -11,7 +12,10 @@
 //! directly into a parallel slice of [`ColumnBuilder`]s, skipping the
 //! `Vec<Value>` row intermediate.
 
-use ultrasql_core::{DataType, GeometryValue, MAX_VECTOR_DIMS, RangeValue, Schema, Value};
+use ultrasql_core::{
+    DataType, GeometryValue, Lsn, MAX_VECTOR_DIMS, Oid, RangeValue, Schema, Value,
+    coerce_bpchar_text, composite_text_matches_arity, pack_timetz, unpack_timetz,
+};
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
 use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strings_auto};
@@ -20,6 +24,13 @@ use ultrasql_vec::{Batch, DictionaryEncodingPolicy, StringEncoding, encode_strin
 // followed by that many f32 little-endian elements.
 const VECTOR_DIMS_WIDTH: usize = std::mem::size_of::<u32>();
 const VECTOR_ELEMENT_WIDTH: usize = std::mem::size_of::<f32>();
+const NUMERIC_NBASE: u16 = 10_000;
+const NUMERIC_DEC_DIGITS: i32 = 4;
+const NUMERIC_DSCALE_MAX: i32 = 0x3fff;
+const NUMERIC_POS: u16 = 0x0000;
+const NUMERIC_NEG: u16 = 0x4000;
+const NUMERIC_BINARY_HEADER_WIDTH: usize = 8;
+const NUMERIC_DIGIT_WIDTH: usize = std::mem::size_of::<u16>();
 
 /// Binary codec bound to a fixed [`Schema`].
 ///
@@ -92,7 +103,7 @@ impl RowCodec {
     /// covered by a hand-rolled inline path.
     fn detect_decode_shape(schema: &Schema) -> DecodeShape {
         let fields = schema.fields();
-        let types: Vec<&DataType> = fields.iter().map(|f| &f.data_type).collect();
+        let types: Vec<&DataType> = fields.iter().map(|f| f.data_type.storage_type()).collect();
         match types.as_slice() {
             [DataType::Int32] => DecodeShape::I32x1,
             [DataType::Int32, DataType::Int32] => DecodeShape::I32x2,
@@ -339,7 +350,7 @@ impl RowCodec {
                 bitmap[byte] |= 1 << bit;
                 continue;
             }
-            match (&field.data_type, value) {
+            match (field.data_type.storage_type(), value) {
                 (DataType::Bool, Value::Bool(v)) => payload.push(u8::from(*v)),
                 (DataType::Int16, Value::Int16(v)) => {
                     payload.extend_from_slice(&v.to_le_bytes());
@@ -349,6 +360,17 @@ impl RowCodec {
                 }
                 (DataType::Int64, Value::Int64(v)) => {
                     payload.extend_from_slice(&v.to_le_bytes());
+                }
+                (DataType::Money, Value::Money(v)) => {
+                    payload.extend_from_slice(&v.to_le_bytes());
+                }
+                (DataType::Oid, Value::Oid(v))
+                | (DataType::RegClass, Value::RegClass(v))
+                | (DataType::RegType, Value::RegType(v)) => {
+                    payload.extend_from_slice(&v.raw().to_le_bytes());
+                }
+                (DataType::PgLsn, Value::PgLsn(v)) => {
+                    payload.extend_from_slice(&v.raw().to_le_bytes());
                 }
                 (DataType::Float32, Value::Float32(v)) => {
                     payload.extend_from_slice(&v.to_le_bytes());
@@ -364,11 +386,14 @@ impl RowCodec {
                     // surrounding executor.
                     payload.extend_from_slice(&v.to_le_bytes());
                 }
-                (DataType::Decimal { .. }, Value::Decimal { value, .. }) => {
-                    // Decimal storage: scaled i64 value, 8 bytes LE.
-                    // Per-column scale lives in the schema; the value
-                    // payload is the scaled integer.
-                    payload.extend_from_slice(&value.to_le_bytes());
+                (DataType::Decimal { .. }, Value::Decimal { value, scale }) => {
+                    encode_numeric_value_payload(
+                        &mut payload,
+                        *value,
+                        *scale,
+                        col_idx,
+                        &field.data_type,
+                    )?;
                 }
                 (DataType::Timestamp, Value::Timestamp(v))
                 | (DataType::TimestampTz, Value::TimestampTz(v))
@@ -377,6 +402,22 @@ impl RowCodec {
                     // (microseconds since 2000-01-01 for Timestamp/Tz,
                     // microseconds since midnight for Time).
                     payload.extend_from_slice(&v.to_le_bytes());
+                }
+                (
+                    DataType::TimeTz,
+                    Value::TimeTz {
+                        micros,
+                        offset_seconds,
+                    },
+                ) => {
+                    let packed = pack_timetz(*micros, *offset_seconds).ok_or_else(|| {
+                        RowCodecError::Type {
+                            column: col_idx,
+                            expected: field.data_type.clone(),
+                            got: value.data_type().to_string(),
+                        }
+                    })?;
+                    payload.extend_from_slice(&packed.to_le_bytes());
                 }
                 (DataType::Uuid, Value::Uuid(bytes)) => {
                     payload.extend_from_slice(bytes);
@@ -390,17 +431,69 @@ impl RowCodec {
                     payload.extend_from_slice(&len.to_le_bytes());
                     payload.extend_from_slice(bytes);
                 }
-                (DataType::Text { .. }, Value::Text(s)) => {
-                    let bytes = s.as_bytes();
-                    let len =
-                        u32::try_from(bytes.len()).map_err(|_| RowCodecError::UnsupportedType {
+                (DataType::Bit { .. } | DataType::VarBit { .. }, Value::BitString(bits)) => {
+                    let coerced = bits.coerce_to(&field.data_type, false).ok_or_else(|| {
+                        RowCodecError::StringDataRightTruncation {
                             column: col_idx,
                             ty: field.data_type.clone(),
-                        })?;
-                    payload.extend_from_slice(&len.to_le_bytes());
-                    payload.extend_from_slice(bytes);
+                            detail: format!(
+                                "bit string length {} does not match type {}",
+                                bits.len(),
+                                field.data_type
+                            ),
+                        }
+                    })?;
+                    encode_varlena_text(
+                        &mut payload,
+                        &coerced.to_string(),
+                        col_idx,
+                        &field.data_type,
+                    )?;
+                }
+                (
+                    DataType::Inet | DataType::Cidr | DataType::MacAddr | DataType::MacAddr8,
+                    Value::Network(network),
+                ) if network.data_type() == field.data_type => {
+                    encode_varlena_text(
+                        &mut payload,
+                        &network.to_string(),
+                        col_idx,
+                        &field.data_type,
+                    )?;
+                }
+                (DataType::Text { .. }, Value::Text(s)) => {
+                    encode_varlena_text(&mut payload, s, col_idx, &field.data_type)?;
+                }
+                (DataType::Enum { labels, .. }, Value::Text(s))
+                    if enum_label_is_valid(labels, s) =>
+                {
+                    encode_varlena_text(&mut payload, s, col_idx, &field.data_type)?;
+                }
+                (DataType::Composite { fields, .. }, Value::Text(s))
+                    if composite_text_matches_arity(s, fields.len()) =>
+                {
+                    encode_varlena_text(&mut payload, s, col_idx, &field.data_type)?;
+                }
+                (DataType::Char { len }, Value::Char(s) | Value::Text(s)) => {
+                    let coerced = coerce_bpchar_text(s, *len, false).map_err(|err| {
+                        RowCodecError::StringDataRightTruncation {
+                            column: col_idx,
+                            ty: field.data_type.clone(),
+                            detail: err.to_string(),
+                        }
+                    })?;
+                    encode_varlena_text(&mut payload, &coerced, col_idx, &field.data_type)?;
+                }
+                (DataType::Json, Value::Json(s)) => {
+                    validate_json_storage_text(s, col_idx, &field.data_type)?;
+                    encode_varlena_text(&mut payload, s, col_idx, &field.data_type)?;
                 }
                 (DataType::Jsonb, Value::Jsonb(s)) => {
+                    let canonical = normalize_jsonb_storage_text(s, col_idx, &field.data_type)?;
+                    encode_varlena_text(&mut payload, &canonical, col_idx, &field.data_type)?;
+                }
+                (DataType::Xml, Value::Xml(s)) => {
+                    validate_xml_storage_text(s, col_idx, &field.data_type)?;
                     encode_varlena_text(&mut payload, s, col_idx, &field.data_type)?;
                 }
                 (DataType::Vector { dims }, Value::Vector(values)) => {
@@ -514,7 +607,8 @@ impl RowCodec {
                 row.push(Value::Null);
                 continue;
             }
-            let value = match &field.data_type {
+            let storage_type = field.data_type.storage_type();
+            let value = match storage_type {
                 DataType::Bool => {
                     let needed = cursor + 1;
                     if bytes.len() < needed {
@@ -578,6 +672,63 @@ impl RowCodec {
                     cursor += 8;
                     Value::Int64(i64::from_le_bytes(raw))
                 }
+                DataType::Money => {
+                    let needed = cursor + 8;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 8] = bytes[cursor..cursor + 8].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 8;
+                    Value::Money(i64::from_le_bytes(raw))
+                }
+                DataType::Oid | DataType::RegClass | DataType::RegType => {
+                    let needed = cursor + 4;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 4] = bytes[cursor..cursor + 4].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 4;
+                    let oid = Oid::new(u32::from_le_bytes(raw));
+                    match storage_type {
+                        DataType::Oid => Value::Oid(oid),
+                        DataType::RegClass => Value::RegClass(oid),
+                        DataType::RegType => Value::RegType(oid),
+                        _ => unreachable!(),
+                    }
+                }
+                DataType::PgLsn => {
+                    let needed = cursor + 8;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 8] = bytes[cursor..cursor + 8].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 8;
+                    Value::PgLsn(Lsn::new(u64::from_le_bytes(raw)))
+                }
                 DataType::Float32 => {
                     let needed = cursor + 4;
                     if bytes.len() < needed {
@@ -631,30 +782,10 @@ impl RowCodec {
                     cursor += 4;
                     Value::Date(i32::from_le_bytes(raw))
                 }
-                DataType::Decimal { scale, .. } => {
-                    // Decimal storage: 8-byte little-endian scaled
-                    // i64 payload. Per-column scale lives in the
-                    // schema field; the codec reads it back here.
-                    let needed = cursor + 8;
-                    if bytes.len() < needed {
-                        return Err(RowCodecError::Truncated {
-                            needed,
-                            have: bytes.len(),
-                        });
-                    }
-                    let raw: [u8; 8] = bytes[cursor..cursor + 8].try_into().map_err(|_| {
-                        RowCodecError::Truncated {
-                            needed,
-                            have: bytes.len(),
-                        }
-                    })?;
-                    cursor += 8;
-                    Value::Decimal {
-                        value: i64::from_le_bytes(raw),
-                        scale: scale.unwrap_or(0),
-                    }
+                DataType::Decimal { .. } => {
+                    decode_numeric_value(bytes, &mut cursor, col_idx, &field.data_type)?
                 }
-                DataType::Timestamp | DataType::TimestampTz | DataType::Time => {
+                DataType::Timestamp | DataType::TimestampTz | DataType::Time | DataType::TimeTz => {
                     // Microsecond temporal: 8-byte little-endian i64.
                     let needed = cursor + 8;
                     if bytes.len() < needed {
@@ -671,10 +802,22 @@ impl RowCodec {
                     })?;
                     cursor += 8;
                     let v = i64::from_le_bytes(raw);
-                    match field.data_type {
+                    match storage_type {
                         DataType::Timestamp => Value::Timestamp(v),
                         DataType::TimestampTz => Value::TimestampTz(v),
                         DataType::Time => Value::Time(v),
+                        DataType::TimeTz => {
+                            let (micros, offset_seconds) =
+                                unpack_timetz(v).ok_or_else(|| RowCodecError::Type {
+                                    column: col_idx,
+                                    expected: field.data_type.clone(),
+                                    got: "invalid timetz payload".to_owned(),
+                                })?;
+                            Value::TimeTz {
+                                micros,
+                                offset_seconds,
+                            }
+                        }
                         _ => unreachable!(),
                     }
                 }
@@ -696,7 +839,16 @@ impl RowCodec {
                     cursor = needed;
                     Value::Uuid(raw)
                 }
-                DataType::Text { .. } => {
+                DataType::Text { .. }
+                | DataType::Enum { .. }
+                | DataType::Composite { .. }
+                | DataType::Char { .. }
+                | DataType::Bit { .. }
+                | DataType::VarBit { .. }
+                | DataType::Inet
+                | DataType::Cidr
+                | DataType::MacAddr
+                | DataType::MacAddr8 => {
                     let len_end = cursor + 4;
                     if bytes.len() < len_end {
                         return Err(RowCodecError::Truncated {
@@ -723,7 +875,19 @@ impl RowCodec {
                     let s = String::from_utf8(bytes[cursor..str_end].to_vec())
                         .map_err(|e| RowCodecError::InvalidUtf8(e, "text column"))?;
                     cursor += str_len;
-                    Value::Text(s)
+                    match storage_type {
+                        DataType::Char { .. } => Value::Char(s),
+                        DataType::Bit { .. } | DataType::VarBit { .. } => {
+                            decode_bit_string_value(&s, &field.data_type, col_idx)?
+                        }
+                        DataType::Inet
+                        | DataType::Cidr
+                        | DataType::MacAddr
+                        | DataType::MacAddr8 => {
+                            decode_network_value(&s, &field.data_type, col_idx)?
+                        }
+                        _ => Value::Text(s),
+                    }
                 }
                 DataType::Bytea => {
                     let len_end = cursor + 4;
@@ -763,9 +927,17 @@ impl RowCodec {
                         }
                     })?)
                 }
+                DataType::Json => {
+                    let s = decode_varlena_text(bytes, &mut cursor, "json column")?;
+                    Value::Json(s)
+                }
                 DataType::Jsonb => {
                     let s = decode_varlena_text(bytes, &mut cursor, "jsonb column")?;
                     Value::Jsonb(s)
+                }
+                DataType::Xml => {
+                    let s = decode_varlena_text(bytes, &mut cursor, "xml column")?;
+                    Value::Xml(s)
                 }
                 DataType::Vector { dims } => {
                     decode_vector_value(bytes, &mut cursor, *dims, col_idx, &field.data_type)?
@@ -875,10 +1047,15 @@ impl RowCodec {
                 continue;
             }
             if targets[col_idx].is_empty() {
-                Self::skip_one_value(bytes, &mut cursor, col_idx, &field.data_type)?;
+                Self::skip_one_value(bytes, &mut cursor, col_idx, field.data_type.storage_type())?;
                 continue;
             }
-            let value = Self::decode_one_value(bytes, &mut cursor, col_idx, &field.data_type)?;
+            let value = Self::decode_one_value(
+                bytes,
+                &mut cursor,
+                col_idx,
+                field.data_type.storage_type(),
+            )?;
             for &out_idx in &targets[col_idx] {
                 projected[out_idx] = value.clone();
             }
@@ -918,6 +1095,24 @@ impl RowCodec {
                 let raw = read_fixed::<8>(bytes, cursor)?;
                 Ok(Value::Int64(i64::from_le_bytes(raw)))
             }
+            DataType::Money => {
+                let raw = read_fixed::<8>(bytes, cursor)?;
+                Ok(Value::Money(i64::from_le_bytes(raw)))
+            }
+            DataType::Oid | DataType::RegClass | DataType::RegType => {
+                let raw = read_fixed::<4>(bytes, cursor)?;
+                let oid = Oid::new(u32::from_le_bytes(raw));
+                match data_type {
+                    DataType::Oid => Ok(Value::Oid(oid)),
+                    DataType::RegClass => Ok(Value::RegClass(oid)),
+                    DataType::RegType => Ok(Value::RegType(oid)),
+                    _ => unreachable!(),
+                }
+            }
+            DataType::PgLsn => {
+                let raw = read_fixed::<8>(bytes, cursor)?;
+                Ok(Value::PgLsn(Lsn::new(u64::from_le_bytes(raw))))
+            }
             DataType::Float32 => {
                 let raw = read_fixed::<4>(bytes, cursor)?;
                 Ok(Value::Float32(f32::from_le_bytes(raw)))
@@ -930,20 +1125,26 @@ impl RowCodec {
                 let raw = read_fixed::<4>(bytes, cursor)?;
                 Ok(Value::Date(i32::from_le_bytes(raw)))
             }
-            DataType::Decimal { scale, .. } => {
-                let raw = read_fixed::<8>(bytes, cursor)?;
-                Ok(Value::Decimal {
-                    value: i64::from_le_bytes(raw),
-                    scale: scale.unwrap_or(0),
-                })
-            }
-            DataType::Timestamp | DataType::TimestampTz | DataType::Time => {
+            DataType::Decimal { .. } => decode_numeric_value(bytes, cursor, col_idx, data_type),
+            DataType::Timestamp | DataType::TimestampTz | DataType::Time | DataType::TimeTz => {
                 let raw = read_fixed::<8>(bytes, cursor)?;
                 let value = i64::from_le_bytes(raw);
                 match data_type {
                     DataType::Timestamp => Ok(Value::Timestamp(value)),
                     DataType::TimestampTz => Ok(Value::TimestampTz(value)),
                     DataType::Time => Ok(Value::Time(value)),
+                    DataType::TimeTz => {
+                        let (micros, offset_seconds) =
+                            unpack_timetz(value).ok_or_else(|| RowCodecError::Type {
+                                column: col_idx,
+                                expected: data_type.clone(),
+                                got: "invalid timetz payload".to_owned(),
+                            })?;
+                        Ok(Value::TimeTz {
+                            micros,
+                            offset_seconds,
+                        })
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -957,6 +1158,29 @@ impl RowCodec {
                 cursor,
                 "text column",
             )?)),
+            DataType::Enum { .. } => Ok(Value::Text(decode_varlena_text(
+                bytes,
+                cursor,
+                "enum column",
+            )?)),
+            DataType::Composite { .. } => Ok(Value::Text(decode_varlena_text(
+                bytes,
+                cursor,
+                "composite column",
+            )?)),
+            DataType::Char { .. } => Ok(Value::Char(decode_varlena_text(
+                bytes,
+                cursor,
+                "bpchar column",
+            )?)),
+            DataType::Bit { .. } | DataType::VarBit { .. } => {
+                let s = decode_varlena_text(bytes, cursor, "bit string column")?;
+                decode_bit_string_value(&s, data_type, col_idx)
+            }
+            DataType::Inet | DataType::Cidr | DataType::MacAddr | DataType::MacAddr8 => {
+                let s = decode_varlena_text(bytes, cursor, "network column")?;
+                decode_network_value(&s, data_type, col_idx)
+            }
             DataType::Range(range_type) => {
                 let s = decode_varlena_text(bytes, cursor, "range column")?;
                 Ok(Value::Range(
@@ -967,10 +1191,20 @@ impl RowCodec {
                     })?,
                 ))
             }
+            DataType::Json => Ok(Value::Json(decode_varlena_text(
+                bytes,
+                cursor,
+                "json column",
+            )?)),
             DataType::Jsonb => Ok(Value::Jsonb(decode_varlena_text(
                 bytes,
                 cursor,
                 "jsonb column",
+            )?)),
+            DataType::Xml => Ok(Value::Xml(decode_varlena_text(
+                bytes,
+                cursor,
+                "xml column",
             )?)),
             DataType::Vector { dims } => {
                 decode_vector_value(bytes, cursor, *dims, col_idx, data_type)
@@ -1034,18 +1268,35 @@ impl RowCodec {
         match data_type {
             DataType::Bool => skip_fixed(bytes, cursor, 1),
             DataType::Int16 => skip_fixed(bytes, cursor, 2),
-            DataType::Int32 | DataType::Float32 | DataType::Date => skip_fixed(bytes, cursor, 4),
+            DataType::Int32
+            | DataType::Float32
+            | DataType::Date
+            | DataType::Oid
+            | DataType::RegClass
+            | DataType::RegType => skip_fixed(bytes, cursor, 4),
             DataType::Int64
+            | DataType::Money
             | DataType::Float64
-            | DataType::Decimal { .. }
             | DataType::Timestamp
             | DataType::TimestampTz
-            | DataType::Time => skip_fixed(bytes, cursor, 8),
+            | DataType::Time
+            | DataType::TimeTz
+            | DataType::PgLsn => skip_fixed(bytes, cursor, 8),
+            DataType::Decimal { .. } => skip_varlena_payload(bytes, cursor),
             DataType::Uuid => skip_fixed(bytes, cursor, 16),
             DataType::Bytea
             | DataType::Text { .. }
+            | DataType::Enum { .. }
+            | DataType::Composite { .. }
+            | DataType::Char { .. }
+            | DataType::Json
+            | DataType::Inet
+            | DataType::Cidr
+            | DataType::MacAddr
+            | DataType::MacAddr8
             | DataType::Range(_)
             | DataType::Jsonb
+            | DataType::Xml
             | DataType::HalfVec { .. }
             | DataType::SparseVec { .. }
             | DataType::BitVec { .. }
@@ -1074,7 +1325,11 @@ impl RowCodec {
     ) -> Result<Vec<ColumnBuilder>, RowCodecError> {
         let mut out: Vec<ColumnBuilder> = Vec::with_capacity(self.schema.len());
         for (idx, field) in self.schema.fields().iter().enumerate() {
-            out.push(ColumnBuilder::new(&field.data_type, capacity, idx)?);
+            out.push(ColumnBuilder::new(
+                field.data_type.storage_type(),
+                capacity,
+                idx,
+            )?);
         }
         Ok(out)
     }
@@ -1122,7 +1377,7 @@ impl RowCodec {
                 builders[col_idx].push_null();
                 continue;
             }
-            match (&field.data_type, &mut builders[col_idx]) {
+            match (field.data_type.storage_type(), &mut builders[col_idx]) {
                 (DataType::Bool, ColumnBuilder::Bool { data, nulls }) => {
                     let needed = cursor + 1;
                     if bytes.len() < needed {
@@ -1189,6 +1444,78 @@ impl RowCodec {
                     data.push(i64::from_le_bytes(raw));
                     nulls.push_valid();
                 }
+                (DataType::Money, ColumnBuilder::Int64 { data, nulls }) => {
+                    let needed = cursor + 8;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 8] = bytes[cursor..cursor + 8].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 8;
+                    data.push(i64::from_le_bytes(raw));
+                    nulls.push_valid();
+                }
+                (
+                    DataType::Oid | DataType::RegClass | DataType::RegType,
+                    ColumnBuilder::Int64 { data, nulls },
+                ) => {
+                    let needed = cursor + 4;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 4] = bytes[cursor..cursor + 4].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 4;
+                    data.push(i64::from(u32::from_le_bytes(raw)));
+                    nulls.push_valid();
+                }
+                (
+                    DataType::PgLsn,
+                    ColumnBuilder::Utf8 {
+                        offsets,
+                        values,
+                        nulls,
+                    },
+                ) => {
+                    let needed = cursor + 8;
+                    if bytes.len() < needed {
+                        return Err(RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        });
+                    }
+                    let raw: [u8; 8] = bytes[cursor..cursor + 8].try_into().map_err(|_| {
+                        RowCodecError::Truncated {
+                            needed,
+                            have: bytes.len(),
+                        }
+                    })?;
+                    cursor += 8;
+                    let text = Value::PgLsn(Lsn::new(u64::from_le_bytes(raw))).to_string();
+                    values.extend_from_slice(text.as_bytes());
+                    let new_end = u32::try_from(values.len()).map_err(|_| {
+                        RowCodecError::UnsupportedType {
+                            column: col_idx,
+                            ty: field.data_type.clone(),
+                        }
+                    })?;
+                    offsets.push(new_end);
+                    nulls.push_valid();
+                }
                 (DataType::Float32, ColumnBuilder::Float32 { data, nulls }) => {
                     let needed = cursor + 4;
                     if bytes.len() < needed {
@@ -1246,14 +1573,16 @@ impl RowCodec {
                     data.push(i32::from_le_bytes(raw));
                     nulls.push_valid();
                 }
-                (DataType::Decimal { .. }, ColumnBuilder::Int64 { data, nulls })
-                | (DataType::Timestamp, ColumnBuilder::Int64 { data, nulls })
+                (DataType::Decimal { .. }, ColumnBuilder::Int64 { data, nulls }) => {
+                    let value =
+                        decode_numeric_scaled_i64(bytes, &mut cursor, col_idx, &field.data_type)?;
+                    data.push(value);
+                    nulls.push_valid();
+                }
+                (DataType::Timestamp, ColumnBuilder::Int64 { data, nulls })
                 | (DataType::TimestampTz, ColumnBuilder::Int64 { data, nulls })
-                | (DataType::Time, ColumnBuilder::Int64 { data, nulls }) => {
-                    // Decimal / Timestamp / Time share the Int64
-                    // builder; the schema carries the scale (for
-                    // Decimal) and the semantic tag for the
-                    // surrounding executor.
+                | (DataType::Time, ColumnBuilder::Int64 { data, nulls })
+                | (DataType::TimeTz, ColumnBuilder::Int64 { data, nulls }) => {
                     let needed = cursor + 8;
                     if bytes.len() < needed {
                         return Err(RowCodecError::Truncated {
@@ -1371,7 +1700,18 @@ impl RowCodec {
                 }
                 (
                     DataType::Text { .. }
+                    | DataType::Enum { .. }
+                    | DataType::Composite { .. }
+                    | DataType::Char { .. }
+                    | DataType::Bit { .. }
+                    | DataType::VarBit { .. }
+                    | DataType::Inet
+                    | DataType::Cidr
+                    | DataType::MacAddr
+                    | DataType::MacAddr8
+                    | DataType::Json
                     | DataType::Jsonb
+                    | DataType::Xml
                     | DataType::Range(_)
                     | DataType::Geometry(_)
                     | DataType::Array(_)
@@ -1602,9 +1942,14 @@ impl ColumnBuilder {
                 nulls: NullTracker::default(),
             },
             DataType::Decimal { .. }
+            | DataType::Money
+            | DataType::Oid
+            | DataType::RegClass
+            | DataType::RegType
             | DataType::Timestamp
             | DataType::TimestampTz
-            | DataType::Time => Self::Int64 {
+            | DataType::Time
+            | DataType::TimeTz => Self::Int64 {
                 // `Decimal` / `Timestamp` / `Time` storage shares the
                 // `Int64` builder; the schema field carries the
                 // semantic tag and (for Decimal) the scale.
@@ -1612,7 +1957,18 @@ impl ColumnBuilder {
                 nulls: NullTracker::default(),
             },
             DataType::Text { .. }
+            | DataType::Enum { .. }
+            | DataType::Composite { .. }
+            | DataType::Char { .. }
+            | DataType::Bit { .. }
+            | DataType::VarBit { .. }
+            | DataType::Inet
+            | DataType::Cidr
+            | DataType::MacAddr
+            | DataType::MacAddr8
+            | DataType::Json
             | DataType::Jsonb
+            | DataType::Xml
             | DataType::Vector { .. }
             | DataType::HalfVec { .. }
             | DataType::SparseVec { .. }
@@ -1621,7 +1977,8 @@ impl ColumnBuilder {
             | DataType::Geometry(_)
             | DataType::Array(_)
             | DataType::Uuid
-            | DataType::Bytea => Self::Utf8 {
+            | DataType::Bytea
+            | DataType::PgLsn => Self::Utf8 {
                 offsets: {
                     let mut o = Vec::with_capacity(capacity + 1);
                     o.push(0);
@@ -1757,6 +2114,44 @@ fn text_column_from_parts(offsets: &[u32], values: &[u8], nulls: Option<Bitmap>)
     }
 }
 
+fn decode_bit_string_value(
+    text: &str,
+    expected_type: &DataType,
+    col_idx: usize,
+) -> Result<Value, RowCodecError> {
+    let Some(Value::BitString(bits)) = Value::parse_bit_string(text) else {
+        return Err(RowCodecError::Type {
+            column: col_idx,
+            expected: expected_type.clone(),
+            got: "invalid bit string literal".to_owned(),
+        });
+    };
+    let coerced = bits
+        .coerce_to(expected_type, false)
+        .ok_or_else(|| RowCodecError::Type {
+            column: col_idx,
+            expected: expected_type.clone(),
+            got: format!("bit string length {}", bits.len()),
+        })?;
+    Ok(Value::BitString(coerced))
+}
+
+fn decode_network_value(
+    text: &str,
+    expected_type: &DataType,
+    col_idx: usize,
+) -> Result<Value, RowCodecError> {
+    Value::parse_network(expected_type, text).ok_or_else(|| RowCodecError::Type {
+        column: col_idx,
+        expected: expected_type.clone(),
+        got: "invalid network address literal".to_owned(),
+    })
+}
+
+fn enum_label_is_valid(labels: &[String], value: &str) -> bool {
+    labels.iter().any(|label| label == value)
+}
+
 const fn is_supported_type(ty: &DataType) -> bool {
     matches!(
         ty,
@@ -1767,16 +2162,33 @@ const fn is_supported_type(ty: &DataType) -> bool {
             | DataType::Float32
             | DataType::Float64
             | DataType::Text { .. }
+            | DataType::Enum { .. }
+            | DataType::Composite { .. }
+            | DataType::Char { .. }
+            | DataType::Json
             | DataType::Jsonb
+            | DataType::Xml
             | DataType::Vector { .. }
             | DataType::HalfVec { .. }
             | DataType::SparseVec { .. }
             | DataType::BitVec { .. }
+            | DataType::Bit { .. }
+            | DataType::VarBit { .. }
+            | DataType::Inet
+            | DataType::Cidr
+            | DataType::MacAddr
+            | DataType::MacAddr8
             | DataType::Date
+            | DataType::Oid
+            | DataType::RegClass
+            | DataType::RegType
             | DataType::Time
+            | DataType::TimeTz
+            | DataType::PgLsn
             | DataType::Timestamp
             | DataType::TimestampTz
             | DataType::Decimal { .. }
+            | DataType::Money
             | DataType::Uuid
             | DataType::Bytea
             | DataType::Range(_)
@@ -1886,6 +2298,340 @@ fn decode_text_vector_family_value(
         });
     }
     Ok(value)
+}
+
+#[derive(Debug)]
+struct NumericBinaryParts {
+    weight: i16,
+    sign: u16,
+    dscale: i16,
+    digits: Vec<u16>,
+}
+
+fn encode_numeric_value_payload(
+    payload: &mut Vec<u8>,
+    value: i64,
+    scale: i32,
+    column: usize,
+    ty: &DataType,
+) -> Result<(), RowCodecError> {
+    let parts = decimal_to_numeric_parts(value, scale, column, ty)?;
+    let payload_len = NUMERIC_BINARY_HEADER_WIDTH
+        .checked_add(
+            parts
+                .digits
+                .len()
+                .checked_mul(NUMERIC_DIGIT_WIDTH)
+                .ok_or_else(|| numeric_type_error(column, ty, "numeric payload too large"))?,
+        )
+        .ok_or_else(|| numeric_type_error(column, ty, "numeric payload too large"))?;
+    let payload_len_u32 = u32::try_from(payload_len)
+        .map_err(|_| numeric_type_error(column, ty, "numeric payload too large"))?;
+    let ndigits = i16::try_from(parts.digits.len())
+        .map_err(|_| numeric_type_error(column, ty, "numeric has too many digit groups"))?;
+
+    payload.extend_from_slice(&payload_len_u32.to_le_bytes());
+    payload.extend_from_slice(&ndigits.to_be_bytes());
+    payload.extend_from_slice(&parts.weight.to_be_bytes());
+    payload.extend_from_slice(&parts.sign.to_be_bytes());
+    payload.extend_from_slice(&parts.dscale.to_be_bytes());
+    for digit in parts.digits {
+        payload.extend_from_slice(&digit.to_be_bytes());
+    }
+    Ok(())
+}
+
+fn decimal_to_numeric_parts(
+    value: i64,
+    scale: i32,
+    column: usize,
+    ty: &DataType,
+) -> Result<NumericBinaryParts, RowCodecError> {
+    let sign = if value < 0 { NUMERIC_NEG } else { NUMERIC_POS };
+    let mut magnitude = i128::from(value)
+        .checked_abs()
+        .ok_or_else(|| numeric_type_error(column, ty, "numeric magnitude overflow"))?;
+    let dscale_i32 = if scale < 0 {
+        let exp = scale
+            .checked_neg()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| numeric_type_error(column, ty, "numeric scale out of range"))?;
+        magnitude =
+            magnitude
+                .checked_mul(pow10_i128(exp).ok_or_else(|| {
+                    numeric_type_error(column, ty, "numeric negative scale overflow")
+                })?)
+                .ok_or_else(|| numeric_type_error(column, ty, "numeric negative scale overflow"))?;
+        0
+    } else {
+        scale
+    };
+    if dscale_i32 > NUMERIC_DSCALE_MAX {
+        return Err(numeric_type_error(
+            column,
+            ty,
+            "numeric display scale out of range",
+        ));
+    }
+    let dscale = i16::try_from(dscale_i32)
+        .map_err(|_| numeric_type_error(column, ty, "numeric display scale out of range"))?;
+    if magnitude == 0 {
+        return Ok(NumericBinaryParts {
+            weight: 0,
+            sign: NUMERIC_POS,
+            dscale,
+            digits: Vec::new(),
+        });
+    }
+
+    let magnitude_digits = magnitude.to_string();
+    let dscale_usize = usize::try_from(dscale_i32)
+        .map_err(|_| numeric_type_error(column, ty, "numeric display scale out of range"))?;
+    let digit_len = magnitude_digits.len();
+    let integer_digits = digit_len.saturating_sub(dscale_usize);
+    let groups_before_decimal =
+        integer_digits.div_ceil(usize::try_from(NUMERIC_DEC_DIGITS).expect("small const"));
+    let mut grouped = String::new();
+
+    if groups_before_decimal > 0 {
+        let padded_integer_digits = groups_before_decimal
+            .checked_mul(usize::try_from(NUMERIC_DEC_DIGITS).expect("small const"))
+            .ok_or_else(|| numeric_type_error(column, ty, "numeric payload too large"))?;
+        for _ in 0..padded_integer_digits.saturating_sub(integer_digits) {
+            grouped.push('0');
+        }
+        grouped.push_str(&magnitude_digits[..integer_digits]);
+    }
+
+    if dscale_usize > 0 {
+        if dscale_usize > digit_len {
+            for _ in 0..dscale_usize - digit_len {
+                grouped.push('0');
+            }
+            grouped.push_str(&magnitude_digits);
+        } else {
+            grouped.push_str(&magnitude_digits[digit_len - dscale_usize..]);
+        }
+        let rem = grouped.len() % usize::try_from(NUMERIC_DEC_DIGITS).expect("small const");
+        if rem != 0 {
+            for _ in 0..usize::try_from(NUMERIC_DEC_DIGITS).expect("small const") - rem {
+                grouped.push('0');
+            }
+        }
+    }
+
+    let mut digits = grouped
+        .as_bytes()
+        .chunks_exact(usize::try_from(NUMERIC_DEC_DIGITS).expect("small const"))
+        .map(decimal_group_to_u16)
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| numeric_type_error(column, ty, "invalid numeric digit group"))?;
+    let mut weight = i32::try_from(groups_before_decimal)
+        .map_err(|_| numeric_type_error(column, ty, "numeric weight out of range"))?
+        - 1;
+
+    let leading_zeroes = digits.iter().take_while(|digit| **digit == 0).count();
+    if leading_zeroes > 0 {
+        digits.drain(..leading_zeroes);
+        weight -= i32::try_from(leading_zeroes)
+            .map_err(|_| numeric_type_error(column, ty, "numeric weight out of range"))?;
+    }
+    while digits.last().is_some_and(|digit| *digit == 0) {
+        digits.pop();
+    }
+    if digits.is_empty() {
+        weight = 0;
+    }
+
+    Ok(NumericBinaryParts {
+        weight: i16::try_from(weight)
+            .map_err(|_| numeric_type_error(column, ty, "numeric weight out of range"))?,
+        sign,
+        dscale,
+        digits,
+    })
+}
+
+fn decimal_group_to_u16(group: &[u8]) -> Option<u16> {
+    let mut value = 0_u16;
+    for byte in group {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add(u16::from(*byte - b'0'))?;
+    }
+    Some(value)
+}
+
+fn decode_numeric_value(
+    bytes: &[u8],
+    cursor: &mut usize,
+    column: usize,
+    ty: &DataType,
+) -> Result<Value, RowCodecError> {
+    let payload = read_varlena_slice(bytes, cursor)?;
+    decode_numeric_payload(payload, column, ty)
+}
+
+fn decode_numeric_scaled_i64(
+    bytes: &[u8],
+    cursor: &mut usize,
+    column: usize,
+    ty: &DataType,
+) -> Result<i64, RowCodecError> {
+    match decode_numeric_value(bytes, cursor, column, ty)? {
+        Value::Decimal { value, .. } => Ok(value),
+        _ => unreachable!("decode_numeric_value always returns Decimal"),
+    }
+}
+
+fn decode_numeric_payload(
+    payload: &[u8],
+    column: usize,
+    ty: &DataType,
+) -> Result<Value, RowCodecError> {
+    if payload.len() < NUMERIC_BINARY_HEADER_WIDTH {
+        return Err(RowCodecError::Truncated {
+            needed: NUMERIC_BINARY_HEADER_WIDTH,
+            have: payload.len(),
+        });
+    }
+    let ndigits = i16::from_be_bytes([payload[0], payload[1]]);
+    if ndigits < 0 {
+        return Err(numeric_type_error(
+            column,
+            ty,
+            "negative numeric digit count",
+        ));
+    }
+    let ndigits_usize = usize::try_from(ndigits)
+        .map_err(|_| numeric_type_error(column, ty, "invalid numeric digit count"))?;
+    let weight = i16::from_be_bytes([payload[2], payload[3]]);
+    let sign = u16::from_be_bytes([payload[4], payload[5]]);
+    if !matches!(sign, NUMERIC_POS | NUMERIC_NEG) {
+        return Err(numeric_type_error(column, ty, "unsupported numeric sign"));
+    }
+    let dscale = i16::from_be_bytes([payload[6], payload[7]]);
+    if dscale < 0 {
+        return Err(numeric_type_error(
+            column,
+            ty,
+            "negative numeric display scale",
+        ));
+    }
+    let expected_len = NUMERIC_BINARY_HEADER_WIDTH
+        .checked_add(
+            ndigits_usize
+                .checked_mul(NUMERIC_DIGIT_WIDTH)
+                .ok_or_else(|| numeric_type_error(column, ty, "numeric payload too large"))?,
+        )
+        .ok_or_else(|| numeric_type_error(column, ty, "numeric payload too large"))?;
+    if payload.len() != expected_len {
+        return Err(numeric_type_error(
+            column,
+            ty,
+            "numeric payload length mismatch",
+        ));
+    }
+
+    let mut digits = Vec::with_capacity(ndigits_usize);
+    for raw in payload[NUMERIC_BINARY_HEADER_WIDTH..].chunks_exact(NUMERIC_DIGIT_WIDTH) {
+        let digit = u16::from_be_bytes([raw[0], raw[1]]);
+        if digit >= NUMERIC_NBASE {
+            return Err(numeric_type_error(
+                column,
+                ty,
+                "numeric digit outside base-10000",
+            ));
+        }
+        digits.push(digit);
+    }
+    numeric_parts_to_value(&digits, weight, sign, dscale, column, ty)
+}
+
+fn numeric_parts_to_value(
+    digits: &[u16],
+    weight: i16,
+    sign: u16,
+    dscale: i16,
+    column: usize,
+    ty: &DataType,
+) -> Result<Value, RowCodecError> {
+    if digits.is_empty() {
+        return Ok(Value::Decimal {
+            value: 0,
+            scale: i32::from(dscale),
+        });
+    }
+    let mut acc = 0_i128;
+    for (idx, digit) in digits.iter().enumerate() {
+        if *digit == 0 {
+            continue;
+        }
+        let idx_i32 = i32::try_from(idx)
+            .map_err(|_| numeric_type_error(column, ty, "numeric payload too large"))?;
+        let base_exp = i32::from(weight)
+            .checked_sub(idx_i32)
+            .ok_or_else(|| numeric_type_error(column, ty, "numeric exponent underflow"))?;
+        let decimal_exp = base_exp
+            .checked_mul(NUMERIC_DEC_DIGITS)
+            .and_then(|exp| exp.checked_add(i32::from(dscale)))
+            .ok_or_else(|| numeric_type_error(column, ty, "numeric exponent overflow"))?;
+        let term = if decimal_exp < 0 {
+            let divisor = pow10_i128(
+                decimal_exp
+                    .checked_neg()
+                    .and_then(|exp| u32::try_from(exp).ok())
+                    .ok_or_else(|| numeric_type_error(column, ty, "numeric exponent overflow"))?,
+            )
+            .ok_or_else(|| numeric_type_error(column, ty, "numeric exponent overflow"))?;
+            let digit = i128::from(*digit);
+            if digit % divisor != 0 {
+                return Err(numeric_type_error(
+                    column,
+                    ty,
+                    "numeric stores more fractional digits than display scale",
+                ));
+            }
+            digit / divisor
+        } else {
+            let pow = pow10_i128(
+                u32::try_from(decimal_exp)
+                    .map_err(|_| numeric_type_error(column, ty, "numeric exponent overflow"))?,
+            )
+            .ok_or_else(|| numeric_type_error(column, ty, "numeric exponent overflow"))?;
+            i128::from(*digit)
+                .checked_mul(pow)
+                .ok_or_else(|| numeric_type_error(column, ty, "numeric value overflow"))?
+        };
+        acc = acc
+            .checked_add(term)
+            .ok_or_else(|| numeric_type_error(column, ty, "numeric value overflow"))?;
+    }
+    if sign == NUMERIC_NEG {
+        acc = acc
+            .checked_neg()
+            .ok_or_else(|| numeric_type_error(column, ty, "numeric value overflow"))?;
+    }
+    Ok(Value::Decimal {
+        value: i64::try_from(acc)
+            .map_err(|_| numeric_type_error(column, ty, "numeric value overflows i64 runtime"))?,
+        scale: i32::from(dscale),
+    })
+}
+
+fn pow10_i128(exp: u32) -> Option<i128> {
+    (0..exp).try_fold(1_i128, |acc, _| acc.checked_mul(10))
+}
+
+fn numeric_type_error(column: usize, ty: &DataType, got: &str) -> RowCodecError {
+    RowCodecError::Type {
+        column,
+        expected: ty.clone(),
+        got: got.to_owned(),
+    }
 }
 
 fn read_fixed<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Result<[u8; N], RowCodecError> {
@@ -2071,6 +2817,52 @@ fn encode_varlena_text(
     Ok(())
 }
 
+fn normalize_jsonb_storage_text(
+    text: &str,
+    column: usize,
+    ty: &DataType,
+) -> Result<String, RowCodecError> {
+    let parsed =
+        serde_json::from_str::<serde_json::Value>(text).map_err(|err| RowCodecError::Type {
+            column,
+            expected: ty.clone(),
+            got: format!("invalid jsonb: {err}"),
+        })?;
+    serde_json::to_string(&parsed).map_err(|err| RowCodecError::Type {
+        column,
+        expected: ty.clone(),
+        got: format!("cannot encode jsonb: {err}"),
+    })
+}
+
+fn validate_json_storage_text(
+    text: &str,
+    column: usize,
+    ty: &DataType,
+) -> Result<(), RowCodecError> {
+    serde_json::from_str::<serde_json::Value>(text)
+        .map(|_| ())
+        .map_err(|err| RowCodecError::Type {
+            column,
+            expected: ty.clone(),
+            got: format!("invalid json: {err}"),
+        })
+}
+
+fn validate_xml_storage_text(
+    text: &str,
+    column: usize,
+    ty: &DataType,
+) -> Result<(), RowCodecError> {
+    Value::validate_xml_text(text)
+        .map(|_| ())
+        .ok_or_else(|| RowCodecError::Type {
+            column,
+            expected: ty.clone(),
+            got: "invalid xml".to_owned(),
+        })
+}
+
 fn decode_varlena_text(
     bytes: &[u8],
     cursor: &mut usize,
@@ -2127,6 +2919,16 @@ pub enum RowCodecError {
         /// Runtime type name.
         got: String,
     },
+    /// A character value exceeds its declared length.
+    #[error("{detail}")]
+    StringDataRightTruncation {
+        /// Column index.
+        column: usize,
+        /// Expected schema type.
+        ty: DataType,
+        /// User-facing error detail.
+        detail: String,
+    },
     /// Truncated payload.
     #[error("payload truncated: needed {needed}, have {have}")]
     Truncated {
@@ -2176,6 +2978,22 @@ mod tests {
     }
     fn schema_text() -> Schema {
         Schema::new([Field::required("s", DataType::Text { max_len: None })]).unwrap()
+    }
+    fn schema_char4() -> Schema {
+        Schema::new([Field::required("c", DataType::Char { len: Some(4) })]).unwrap()
+    }
+    fn schema_decimal(scale: Option<i32>) -> Schema {
+        Schema::new([Field::required(
+            "n",
+            DataType::Decimal {
+                precision: None,
+                scale,
+            },
+        )])
+        .unwrap()
+    }
+    fn schema_money() -> Schema {
+        Schema::new([Field::required("amount", DataType::Money)]).unwrap()
     }
     fn schema_mixed() -> Schema {
         Schema::new([
@@ -2257,6 +3075,169 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_bpchar_pads_text_assignment() {
+        let codec = RowCodec::new(schema_char4());
+        let encoded = codec.encode(&[Value::Text("ok".to_owned())]).unwrap();
+        assert_eq!(
+            codec.decode(&encoded).unwrap(),
+            vec![Value::Char("ok  ".to_owned())]
+        );
+        assert!(matches!(
+            codec.encode(&[Value::Text("toolong".to_owned())]),
+            Err(RowCodecError::StringDataRightTruncation { column: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn decimal_binary_layout_uses_postgres_numeric_groups() {
+        let codec = RowCodec::new(schema_decimal(Some(4)));
+        let encoded = codec
+            .encode(&[Value::Decimal {
+                value: 1_234_567_890_123,
+                scale: 4,
+            }])
+            .unwrap();
+
+        assert_eq!(
+            encoded,
+            vec![
+                0x00, // null bitmap: one non-null column
+                0x10, 0x00, 0x00, 0x00, // numeric payload length: 16 bytes
+                0x00, 0x04, // ndigits
+                0x00, 0x02, // weight
+                0x00, 0x00, // sign: NUMERIC_POS
+                0x00, 0x04, // dscale
+                0x00, 0x01, // 1
+                0x09, 0x29, // 2345
+                0x1a, 0x85, // 6789
+                0x00, 0x7b, // 0123
+            ]
+        );
+    }
+
+    #[test]
+    fn decimal_round_trip_preserves_fractional_weight() {
+        let codec = RowCodec::new(schema_decimal(Some(6)));
+        let row = vec![Value::Decimal {
+            value: -12,
+            scale: 6,
+        }];
+        let encoded = codec.encode(&row).unwrap();
+
+        assert_eq!(
+            encoded,
+            vec![
+                0x00, // null bitmap
+                0x0a, 0x00, 0x00, 0x00, // payload length: header + one digit
+                0x00, 0x01, // ndigits
+                0xff, 0xfe, // weight: -2
+                0x40, 0x00, // sign: NUMERIC_NEG
+                0x00, 0x06, // dscale
+                0x04, 0xb0, // 1200
+            ]
+        );
+        assert_eq!(codec.decode(&encoded).unwrap(), row);
+    }
+
+    #[test]
+    fn decimal_decode_rejects_digit_outside_nbase() {
+        let codec = RowCodec::new(schema_decimal(Some(0)));
+        let encoded = vec![
+            0x00, // null bitmap
+            0x0a, 0x00, 0x00, 0x00, // payload length
+            0x00, 0x01, // ndigits
+            0x00, 0x00, // weight
+            0x00, 0x00, // sign
+            0x00, 0x00, // dscale
+            0x27, 0x10, // 10000, invalid in base-10000
+        ];
+
+        let err = codec.decode(&encoded).expect_err("invalid numeric digit");
+        assert!(matches!(err, RowCodecError::Type { column: 0, .. }));
+    }
+
+    #[test]
+    fn money_round_trip_uses_i64_cash_storage() {
+        let codec = RowCodec::new(schema_money());
+        let row = vec![Value::Money(123_456)];
+        let encoded = codec.encode(&row).unwrap();
+
+        assert_eq!(
+            encoded,
+            vec![
+                0x00, // null bitmap
+                0x40, 0xe2, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(codec.decode(&encoded).unwrap(), row);
+    }
+
+    #[test]
+    fn decode_into_builders_reads_money_cash_payload() {
+        let schema = schema_money();
+        let codec = RowCodec::new(schema.clone());
+        let encoded = codec.encode(&[Value::Money(-123)]).unwrap();
+        let mut builders = vec![ColumnBuilder::new(&schema.field_at(0).data_type, 1, 0).unwrap()];
+
+        codec.decode_into_builders(&encoded, &mut builders).unwrap();
+        let batch = RowCodec::finish_batch(builders).unwrap();
+        match &batch.columns()[0] {
+            Column::Int64(c) => assert_eq!(c.data()[0], -123),
+            other => panic!("expected money Int64 builder output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_projected_skips_decimal_varlena_payload() {
+        let schema = Schema::new([
+            Field::required(
+                "n",
+                DataType::Decimal {
+                    precision: None,
+                    scale: Some(4),
+                },
+            ),
+            Field::required("id", DataType::Int32),
+        ])
+        .unwrap();
+        let codec = RowCodec::new(schema);
+        let encoded = codec
+            .encode(&[
+                Value::Decimal {
+                    value: 1_234_567_890_123,
+                    scale: 4,
+                },
+                Value::Int32(7),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            codec.decode_projected(&encoded, &[1]).unwrap(),
+            vec![Value::Int32(7)]
+        );
+    }
+
+    #[test]
+    fn decode_into_builders_reads_decimal_numeric_payload() {
+        let schema = schema_decimal(Some(4));
+        let codec = RowCodec::new(schema.clone());
+        let encoded = codec
+            .encode(&[Value::Decimal {
+                value: 1_234_567_890_123,
+                scale: 4,
+            }])
+            .unwrap();
+        let mut builders = vec![ColumnBuilder::new(&schema.field_at(0).data_type, 1, 0).unwrap()];
+
+        codec.decode_into_builders(&encoded, &mut builders).unwrap();
+        let batch = RowCodec::finish_batch(builders).unwrap();
+        match &batch.columns()[0] {
+            Column::Int64(c) => assert_eq!(c.data()[0], 1_234_567_890_123),
+            other => panic!("expected decimal Int64 builder output, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn round_trip_int_array() {
         let schema = Schema::new([Field::required(
             "xs",
@@ -2272,11 +3253,33 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_json_preserves_text() {
+        let schema = Schema::new([Field::required("doc", DataType::Json)]).unwrap();
+        let codec = RowCodec::new(schema);
+        let row = vec![Value::Json(r#"{"b": 2, "a": 1}"#.into())];
+        assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
+    }
+
+    #[test]
     fn round_trip_jsonb() {
         let schema = Schema::new([Field::required("doc", DataType::Jsonb)]).unwrap();
         let codec = RowCodec::new(schema);
-        let row = vec![Value::Jsonb(r#"{"a":1,"b":"x"}"#.into())];
+        let row = vec![Value::Jsonb(r#"{"b":"x","a":1}"#.into())];
+        assert_eq!(
+            codec.decode(&codec.encode(&row).unwrap()).unwrap(),
+            vec![Value::Jsonb(r#"{"a":1,"b":"x"}"#.into())]
+        );
+    }
+
+    #[test]
+    fn round_trip_xml_preserves_text_and_rejects_unbalanced_input() {
+        let schema = Schema::new([Field::required("doc", DataType::Xml)]).unwrap();
+        let codec = RowCodec::new(schema);
+        let row = vec![Value::Xml(
+            r#"<root attr="v"><child>text</child></root>"#.into(),
+        )];
         assert_eq!(codec.decode(&codec.encode(&row).unwrap()).unwrap(), row);
+        assert!(codec.encode(&[Value::Xml("<root>".into())]).is_err());
     }
 
     #[test]

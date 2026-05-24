@@ -205,7 +205,7 @@ impl HybridSearch {
             return Ok(Vec::new());
         };
         match row.get(spec.column) {
-            Some(Value::Text(text) | Value::Jsonb(text)) => Ok(tokenize(text)),
+            Some(Value::Text(text) | Value::Json(text) | Value::Jsonb(text)) => Ok(tokenize(text)),
             Some(Value::Null) => Ok(Vec::new()),
             Some(other) => Err(ExecError::TypeMismatch(format!(
                 "hybrid search text column must be Text, Jsonb, or Null, got {:?}",

@@ -7,7 +7,7 @@
 //! the binder lowers from a SELECT list — built-in function calls,
 //! CASE / COALESCE, arithmetic, etc.
 
-use ultrasql_core::{DataType, Schema, Value};
+use ultrasql_core::{DataType, Schema, Value, pack_timetz};
 use ultrasql_planner::ScalarExpr;
 use ultrasql_vec::bitmap::Bitmap;
 use ultrasql_vec::column::{BoolColumn, Column, NumericColumn};
@@ -203,22 +203,109 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
             0_i64,
             Int64
         ),
+        DataType::Money => numeric_column!(i64, Value::Money(v) => *v, 0_i64, Int64),
+        DataType::Oid | DataType::RegClass | DataType::RegType => {
+            let mut data: Vec<i64> = Vec::with_capacity(n);
+            for (i, v) in values.iter().enumerate() {
+                match (dt, v) {
+                    (_, Value::Null) => {
+                        nulls.set(i, false);
+                        any_null = true;
+                        data.push(0);
+                    }
+                    (DataType::Oid, Value::Oid(oid))
+                    | (DataType::RegClass, Value::RegClass(oid))
+                    | (DataType::RegType, Value::RegType(oid)) => data.push(i64::from(oid.raw())),
+                    other => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "projection: expected {dt:?} at row {i}, got {:?}",
+                            other.1.data_type()
+                        )));
+                    }
+                }
+            }
+            if any_null {
+                Ok(Column::Int64(
+                    NumericColumn::with_nulls(data, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?,
+                ))
+            } else {
+                Ok(Column::Int64(NumericColumn::from_data(data)))
+            }
+        }
         DataType::Timestamp | DataType::TimestampTz | DataType::Time => numeric_column!(
             i64,
             Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) => *v,
             0_i64,
             Int64
         ),
-        DataType::Text { .. } => {
-            let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
+        DataType::TimeTz => {
+            let mut data: Vec<i64> = Vec::with_capacity(n);
             for (i, v) in values.iter().enumerate() {
                 match v {
-                    Value::Null => strings.push(None),
-                    Value::Text(s) => strings.push(Some(s.clone())),
+                    Value::Null => {
+                        nulls.set(i, false);
+                        any_null = true;
+                        data.push(0);
+                    }
+                    Value::TimeTz {
+                        micros,
+                        offset_seconds,
+                    } => data.push(pack_timetz(*micros, *offset_seconds).ok_or_else(|| {
+                        ExecError::TypeMismatch(format!("projection: invalid TimeTz at row {i}"))
+                    })?),
                     other => {
                         return Err(ExecError::TypeMismatch(format!(
-                            "projection: expected Text at row {i}, got {:?}",
+                            "projection: expected {dt:?} at row {i}, got {:?}",
                             other.data_type()
+                        )));
+                    }
+                }
+            }
+            if any_null {
+                Ok(Column::Int64(
+                    NumericColumn::with_nulls(data, nulls)
+                        .map_err(|e| ExecError::TypeMismatch(e.to_string()))?,
+                ))
+            } else {
+                Ok(Column::Int64(NumericColumn::from_data(data)))
+            }
+        }
+        DataType::Text { .. }
+        | DataType::Enum { .. }
+        | DataType::Composite { .. }
+        | DataType::Char { .. }
+        | DataType::Bit { .. }
+        | DataType::VarBit { .. }
+        | DataType::Inet
+        | DataType::Cidr
+        | DataType::MacAddr
+        | DataType::MacAddr8
+        | DataType::PgLsn => {
+            let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
+            for (i, v) in values.iter().enumerate() {
+                match (dt, v) {
+                    (_, Value::Null) => strings.push(None),
+                    (DataType::Text { .. }, Value::Text(s))
+                    | (DataType::Enum { .. }, Value::Text(s))
+                    | (DataType::Composite { .. }, Value::Text(s))
+                    | (DataType::Char { .. }, Value::Char(s)) => strings.push(Some(s.clone())),
+                    (DataType::PgLsn, Value::PgLsn(lsn)) => strings.push(Some(lsn.to_string())),
+                    (DataType::Bit { .. } | DataType::VarBit { .. }, Value::BitString(bits))
+                        if bits.matches_type(dt) =>
+                    {
+                        strings.push(Some(bits.to_string()));
+                    }
+                    (
+                        DataType::Inet | DataType::Cidr | DataType::MacAddr | DataType::MacAddr8,
+                        Value::Network(network),
+                    ) if network.data_type() == *dt => {
+                        strings.push(Some(network.to_string()));
+                    }
+                    other => {
+                        return Err(ExecError::TypeMismatch(format!(
+                            "projection: expected {dt} at row {i}, got {:?}",
+                            other.1.data_type()
                         )));
                     }
                 }
@@ -233,16 +320,18 @@ fn build_column(dt: &DataType, values: Vec<Value>) -> Result<Column, ExecError> 
                 },
             )
         }
-        DataType::Jsonb => {
+        DataType::Json | DataType::Jsonb | DataType::Xml => {
             let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
             for (i, v) in values.iter().enumerate() {
-                match v {
-                    Value::Null => strings.push(None),
-                    Value::Jsonb(s) => strings.push(Some(s.clone())),
+                match (dt, v) {
+                    (_, Value::Null) => strings.push(None),
+                    (DataType::Json, Value::Json(s))
+                    | (DataType::Jsonb, Value::Jsonb(s))
+                    | (DataType::Xml, Value::Xml(s)) => strings.push(Some(s.clone())),
                     other => {
                         return Err(ExecError::TypeMismatch(format!(
-                            "projection: expected Jsonb at row {i}, got {:?}",
-                            other.data_type()
+                            "projection: expected {dt} at row {i}, got {:?}",
+                            other.1.data_type()
                         )));
                     }
                 }

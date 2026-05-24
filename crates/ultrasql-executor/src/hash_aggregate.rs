@@ -31,7 +31,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use serde_json::{Number as JsonNumber, Value as JsonValue};
-use ultrasql_core::{DataType, Schema, Value};
+use ultrasql_core::{DataType, Schema, Value, bpchar_semantic_text, timetz_utc_micros};
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, ScalarExpr};
 use ultrasql_vec::column::{Column, NumericColumn};
 use ultrasql_vec::{Batch, count_i64, max_i64, min_i64, sum_i64};
@@ -103,6 +103,26 @@ fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
             state.write_u8(4);
             x.hash(state);
         }
+        Value::Money(x) => {
+            state.write_u8(23);
+            x.hash(state);
+        }
+        Value::Oid(x) => {
+            state.write_u8(27);
+            x.hash(state);
+        }
+        Value::RegClass(x) => {
+            state.write_u8(28);
+            x.hash(state);
+        }
+        Value::RegType(x) => {
+            state.write_u8(29);
+            x.hash(state);
+        }
+        Value::PgLsn(x) => {
+            state.write_u8(30);
+            x.hash(state);
+        }
         Value::Float32(x) => {
             state.write_u8(5);
             x.to_bits().hash(state);
@@ -115,8 +135,20 @@ fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
             state.write_u8(7);
             s.hash(state);
         }
+        Value::Char(s) => {
+            state.write_u8(24);
+            bpchar_semantic_text(s).hash(state);
+        }
+        Value::Json(s) => {
+            state.write_u8(16);
+            s.hash(state);
+        }
         Value::Jsonb(s) => {
             state.write_u8(17);
+            s.hash(state);
+        }
+        Value::Xml(s) => {
+            state.write_u8(31);
             s.hash(state);
         }
         Value::Bytea(b) => {
@@ -126,6 +158,13 @@ fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
         Value::Timestamp(x) | Value::TimestampTz(x) | Value::Time(x) => {
             state.write_u8(9);
             x.hash(state);
+        }
+        Value::TimeTz {
+            micros,
+            offset_seconds,
+        } => {
+            state.write_u8(9);
+            timetz_utc_micros(*micros, *offset_seconds).hash(state);
         }
         Value::Date(x) => {
             state.write_u8(10);
@@ -180,6 +219,14 @@ fn hash_value<H: Hasher>(v: &Value, state: &mut H) {
             state.write_u8(21);
             dims.hash(state);
             bytes.hash(state);
+        }
+        Value::BitString(bits) => {
+            state.write_u8(25);
+            bits.hash(state);
+        }
+        Value::Network(network) => {
+            state.write_u8(26);
+            network.hash(state);
         }
         Value::Record(fields) => {
             state.write_u8(22);
@@ -848,6 +895,7 @@ fn numeric_storage_kind(data_type: &DataType) -> bool {
             | DataType::Timestamp
             | DataType::TimestampTz
             | DataType::Time
+            | DataType::TimeTz
     )
 }
 
@@ -1605,7 +1653,7 @@ fn accumulate_value(state: &mut AggState, arg_val: Option<Value>) -> Result<(), 
             if let Some(v) = arg_val {
                 if !v.is_null() {
                     match v {
-                        Value::Text(s) => parts.push(s),
+                        Value::Text(s) | Value::Char(s) => parts.push(s),
                         other => parts.push(other.to_string()),
                     }
                 }
@@ -1781,8 +1829,10 @@ fn sql_value_to_json(value: &Value) -> JsonValue {
             JsonNumber::from_f64(f64::from(*v)).map_or(JsonValue::Null, JsonValue::Number)
         }
         Value::Float64(v) => JsonNumber::from_f64(*v).map_or(JsonValue::Null, JsonValue::Number),
-        Value::Text(v) => JsonValue::String(v.clone()),
-        Value::Jsonb(v) => serde_json::from_str(v).unwrap_or_else(|_| JsonValue::String(v.clone())),
+        Value::Text(v) | Value::Char(v) => JsonValue::String(v.clone()),
+        Value::Json(v) | Value::Jsonb(v) => {
+            serde_json::from_str(v).unwrap_or_else(|_| JsonValue::String(v.clone()))
+        }
         Value::Vector(values) | Value::HalfVec(values) => JsonValue::Array(
             values
                 .iter()

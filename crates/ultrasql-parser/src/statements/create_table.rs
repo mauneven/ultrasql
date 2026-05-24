@@ -619,11 +619,17 @@ impl Parser<'_> {
             let precision = self.advance()?;
             name.value = "double precision".to_owned();
             name.span = Span::new(name.span.start, precision.span.end);
-        } else if name.value == "timestamp" && self.peek()?.kind == TokenKind::KwWith {
+        } else if name.value == "bit" && self.next_identifier_is("varying")? {
+            let varying = self.advance()?;
+            name.value = "bit varying".to_owned();
+            name.span = Span::new(name.span.start, varying.span.end);
+        } else if matches!(name.value.as_str(), "time" | "timestamp")
+            && self.peek()?.kind == TokenKind::KwWith
+        {
             self.advance()?;
             self.expect(TokenKind::KwTime, "TIME")?;
             let zone = self.expect(TokenKind::KwZone, "ZONE")?;
-            name.value = "timestamp with time zone".to_owned();
+            name.value = format!("{} with time zone", name.value);
             name.span = Span::new(name.span.start, zone.span.end);
         }
 
@@ -663,20 +669,27 @@ impl Parser<'_> {
             Vec::new()
         };
 
-        // Optional array suffix `[]`
-        let is_array = if self.peek()?.kind == TokenKind::LBracket {
-            self.advance()?; // [
+        // Optional repeated array suffixes: `[]`, `[][]`, ...
+        let mut array_dimensions = 0_u32;
+        while self.peek()?.kind == TokenKind::LBracket {
+            let bracket = self.advance()?; // [
             self.expect(TokenKind::RBracket, "]")?;
-            true
-        } else {
-            false
-        };
+            array_dimensions =
+                array_dimensions
+                    .checked_add(1)
+                    .ok_or(ParseError::InvalidInteger {
+                        text: "array dimension count".to_owned(),
+                        offset: bracket.span.start as usize,
+                    })?;
+        }
+        let is_array = array_dimensions > 0;
 
         let end = self.peek()?.span.start;
         Ok(TypeName {
             name,
             type_modifiers,
             is_array,
+            array_dimensions,
             span: Span::new(start, end),
         })
     }
@@ -789,6 +802,13 @@ mod tests {
         assert_eq!(stmt.columns[0].data_type.name.value, "vector");
         assert_eq!(stmt.columns[0].data_type.type_modifiers, vec![3]);
         assert!(!stmt.columns[0].data_type.is_array);
+    }
+
+    #[test]
+    fn create_table_parses_multi_dimensional_array_type_suffixes() {
+        let stmt = parse_create_table("CREATE TABLE matrices (id INT, cells INT[][])");
+        assert!(stmt.columns[1].data_type.is_array);
+        assert_eq!(stmt.columns[1].data_type.array_dimensions, 2);
     }
 
     #[test]

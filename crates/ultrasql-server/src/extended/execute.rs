@@ -68,6 +68,9 @@ pub fn execute_portal(
         &plan,
         LogicalPlan::CreateTable { .. }
             | LogicalPlan::CreateMaterializedView { .. }
+            | LogicalPlan::CreateTypeEnum { .. }
+            | LogicalPlan::CreateTypeComposite { .. }
+            | LogicalPlan::CreateDomain { .. }
             | LogicalPlan::CreateSequence { .. }
             | LogicalPlan::AlterSequence { .. }
             | LogicalPlan::DropSequence { .. }

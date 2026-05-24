@@ -39,7 +39,12 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::warn;
 use ultrasql_catalog::{CatalogSnapshot, TableEntry};
 use ultrasql_core::csv::sniff_csv_text;
-use ultrasql_core::{DataType, RelationId, Schema, Value};
+use ultrasql_core::{
+    BitString, DataType, NetworkValue, RelationId, Schema, Value, coerce_bpchar_text,
+    decode_pg_money_binary, decode_pg_numeric_binary, encode_pg_money_binary,
+    encode_pg_numeric_binary, parse_decimal_text, parse_money_text, parse_time_text,
+    parse_timetz_text,
+};
 use ultrasql_executor::RowCodec;
 use ultrasql_parser::Parser;
 use ultrasql_planner::{
@@ -50,7 +55,7 @@ use ultrasql_storage::heap::InsertOptions;
 use ultrasql_txn::{IsolationLevel, Transaction};
 
 use super::Session;
-use super::jsonb_ingest::{JsonbShapeCache, encode_pg_binary_jsonb};
+use super::jsonb_ingest::{JsonbShapeCache, encode_pg_binary_jsonb, parse_json_text};
 use crate::CombinedCatalog;
 use crate::copy::{
     CopyFormat as ServerCopyFormat, CopyOptions, copy_in_response_with_format,
@@ -1328,7 +1333,9 @@ enum RejectColumnType {
 
 fn reject_column_type_matches(data_type: &DataType, expected: RejectColumnType) -> bool {
     match expected {
-        RejectColumnType::Text => matches!(data_type, DataType::Text { .. }),
+        RejectColumnType::Text => {
+            matches!(data_type, DataType::Text { .. } | DataType::Char { .. })
+        }
         RejectColumnType::Int64 => *data_type == DataType::Int64,
     }
 }
@@ -1549,11 +1556,48 @@ fn binary_copy_cell_bytes(value: &Value, dtype: &DataType) -> Result<Vec<u8>, Se
         (DataType::Int16, Value::Int16(v)) => v.to_be_bytes().to_vec(),
         (DataType::Int32, Value::Int32(v)) => v.to_be_bytes().to_vec(),
         (DataType::Int64, Value::Int64(v)) => v.to_be_bytes().to_vec(),
+        (DataType::Money, Value::Money(v) | Value::Int64(v)) => encode_pg_money_binary(*v).to_vec(),
         (DataType::Float32, Value::Float32(v)) => v.to_bits().to_be_bytes().to_vec(),
         (DataType::Float64, Value::Float64(v)) => v.to_bits().to_be_bytes().to_vec(),
         (DataType::Date, Value::Date(v) | Value::Int32(v)) => v.to_be_bytes().to_vec(),
-        (DataType::Text { .. }, Value::Text(v)) => v.as_bytes().to_vec(),
+        (DataType::Time, Value::Time(v) | Value::Int64(v))
+        | (DataType::Timestamp, Value::Timestamp(v) | Value::Int64(v))
+        | (DataType::TimestampTz, Value::TimestampTz(v) | Value::Int64(v)) => {
+            v.to_be_bytes().to_vec()
+        }
+        (
+            DataType::TimeTz,
+            Value::TimeTz {
+                micros,
+                offset_seconds,
+            },
+        ) => {
+            let mut out = Vec::with_capacity(12);
+            out.extend_from_slice(&micros.to_be_bytes());
+            out.extend_from_slice(&offset_seconds.to_be_bytes());
+            out
+        }
+        (DataType::Decimal { .. }, Value::Decimal { value, scale }) => {
+            encode_pg_numeric_binary(*value, *scale)
+                .map_err(|err| ServerError::CopyFormat(format!("binary COPY numeric: {err}")))?
+        }
+        (DataType::Decimal { scale, .. }, Value::Int64(v)) => {
+            encode_pg_numeric_binary(*v, scale.unwrap_or(0))
+                .map_err(|err| ServerError::CopyFormat(format!("binary COPY numeric: {err}")))?
+        }
+        (DataType::Text { .. }, Value::Text(v)) | (DataType::Char { .. }, Value::Char(v)) => {
+            v.as_bytes().to_vec()
+        }
+        (DataType::Bit { .. } | DataType::VarBit { .. }, Value::BitString(bits)) => {
+            bits.to_pg_binary()
+        }
+        (
+            DataType::Inet | DataType::Cidr | DataType::MacAddr | DataType::MacAddr8,
+            Value::Network(network),
+        ) if network.data_type() == dtype.clone() => network.to_pg_binary(),
+        (DataType::Json, Value::Json(v)) => v.as_bytes().to_vec(),
         (DataType::Jsonb, Value::Jsonb(v)) => encode_pg_binary_jsonb(v),
+        (DataType::Xml, Value::Xml(v)) => v.as_bytes().to_vec(),
         (DataType::Bytea, Value::Bytea(v)) => v.clone(),
         (_, other) => other.to_string().into_bytes(),
     };
@@ -1731,12 +1775,65 @@ fn decode_binary_copy_cell(
                 bytes[0], bytes[1], bytes[2], bytes[3],
             ])))
         }
+        DataType::Time => {
+            exact(8)?;
+            Ok(Value::Time(i64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])))
+        }
+        DataType::Timestamp => {
+            exact(8)?;
+            Ok(Value::Timestamp(i64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])))
+        }
+        DataType::TimestampTz => {
+            exact(8)?;
+            Ok(Value::TimestampTz(i64::from_be_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])))
+        }
+        DataType::TimeTz => {
+            exact(12)?;
+            Ok(Value::TimeTz {
+                micros: i64::from_be_bytes([
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                ]),
+                offset_seconds: i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            })
+        }
+        DataType::Decimal { .. } => decode_pg_numeric_binary(bytes)
+            .map_err(|err| ServerError::CopyFormat(format!("column {column_idx}: {err}"))),
+        DataType::Money => decode_pg_money_binary(bytes)
+            .map_err(|err| ServerError::CopyFormat(format!("column {column_idx}: {err}"))),
+        DataType::Bit { .. } | DataType::VarBit { .. } => BitString::from_pg_binary(bytes)
+            .and_then(|bits| bits.coerce_to(dtype, false))
+            .map(Value::BitString)
+            .ok_or_else(|| {
+                ServerError::CopyFormat(format!("column {column_idx}: invalid {dtype} binary"))
+            }),
+        DataType::Inet | DataType::Cidr | DataType::MacAddr | DataType::MacAddr8 => {
+            NetworkValue::from_pg_binary(dtype, bytes)
+                .map(Value::Network)
+                .ok_or_else(|| {
+                    ServerError::CopyFormat(format!("column {column_idx}: invalid {dtype} binary"))
+                })
+        }
         DataType::Text { .. } => std::str::from_utf8(bytes)
             .map(|s| Value::Text(s.to_string()))
             .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}"))),
+        DataType::Char { len } => std::str::from_utf8(bytes)
+            .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}")))
+            .and_then(|s| {
+                coerce_bpchar_text(s, *len, false)
+                    .map(Value::Char)
+                    .map_err(|err| ServerError::CopyFormat(format!("column {column_idx}: {err}")))
+            }),
+        DataType::Json => parse_json_text(bytes, column_idx).map(Value::Json),
         DataType::Jsonb => jsonb_shape_cache
             .parse_pg_binary(bytes, column_idx)
             .map(Value::Jsonb),
+        DataType::Xml => parse_xml_text(bytes, column_idx).map(Value::Xml),
         DataType::Bytea => Ok(Value::Bytea(bytes.to_vec())),
         DataType::Uuid => {
             exact(16)?;
@@ -1846,6 +1943,32 @@ fn value_to_copy_cell(value: &Value, dtype: &DataType) -> Option<Vec<u8>> {
             .to_string()
             .into_bytes(),
         ),
+        (DataType::Money, Value::Int64(v) | Value::Money(v)) => {
+            Some(Value::Money(*v).to_string().into_bytes())
+        }
+        (DataType::Time, Value::Int64(v) | Value::Time(v)) => {
+            Some(Value::Time(*v).to_string().into_bytes())
+        }
+        (DataType::Timestamp, Value::Int64(v) | Value::Timestamp(v)) => {
+            Some(Value::Timestamp(*v).to_string().into_bytes())
+        }
+        (DataType::TimestampTz, Value::Int64(v) | Value::TimestampTz(v)) => {
+            Some(Value::TimestampTz(*v).to_string().into_bytes())
+        }
+        (
+            DataType::TimeTz,
+            Value::TimeTz {
+                micros,
+                offset_seconds,
+            },
+        ) => Some(
+            Value::TimeTz {
+                micros: *micros,
+                offset_seconds: *offset_seconds,
+            }
+            .to_string()
+            .into_bytes(),
+        ),
         (_, value) => value_to_copy_cell_by_value(value),
     }
 }
@@ -1857,20 +1980,30 @@ fn value_to_copy_cell_by_value(value: &Value) -> Option<Vec<u8>> {
         Value::Int16(v) => Some(v.to_string().into_bytes()),
         Value::Int32(v) => Some(v.to_string().into_bytes()),
         Value::Int64(v) => Some(v.to_string().into_bytes()),
+        Value::Oid(v) | Value::RegClass(v) | Value::RegType(v) => {
+            Some(v.raw().to_string().into_bytes())
+        }
+        Value::PgLsn(v) => Some(v.to_string().into_bytes()),
         Value::Float32(v) => Some(format_float_f32(*v)),
         Value::Float64(v) => Some(format_float_f64(*v)),
-        Value::Text(s) => Some(s.as_bytes().to_vec()),
+        Value::Text(s) | Value::Char(s) => Some(s.as_bytes().to_vec()),
         Value::Bytea(b) => Some(b.clone()),
         Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) => {
             Some(v.to_string().into_bytes())
         }
+        Value::TimeTz { .. } => Some(value.to_string().into_bytes()),
         Value::Date(v) => Some(v.to_string().into_bytes()),
         Value::Uuid(bytes) => Some(Value::Uuid(*bytes).to_string().into_bytes()),
         Value::Decimal { .. }
+        | Value::Money(_)
+        | Value::BitString(_)
+        | Value::Network(_)
         | Value::Interval { .. }
         | Value::Range(_)
         | Value::Geometry(_)
+        | Value::Json(_)
         | Value::Jsonb(_)
+        | Value::Xml(_)
         | Value::Vector(_)
         | Value::HalfVec(_)
         | Value::SparseVec(_)
@@ -1878,6 +2011,14 @@ fn value_to_copy_cell_by_value(value: &Value) -> Option<Vec<u8>> {
         | Value::Array { .. }
         | Value::Record(_) => Some(value.to_string().into_bytes()),
     }
+}
+
+fn parse_xml_text(bytes: &[u8], column_idx: usize) -> Result<String, ServerError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        ServerError::CopyFormat(format!("column {column_idx}: invalid UTF-8 in xml"))
+    })?;
+    Value::validate_xml_text(text)
+        .ok_or_else(|| ServerError::CopyFormat(format!("column {column_idx}: invalid xml")))
 }
 
 /// Decode a single COPY cell into a typed [`Value`] consistent with the
@@ -1908,6 +2049,22 @@ fn decode_copy_cell(
             .parse::<i64>()
             .map(Value::Int64)
             .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}"))),
+        DataType::Oid | DataType::RegClass | DataType::RegType => {
+            let oid = Value::parse_oid_text(s).ok_or_else(|| {
+                ServerError::CopyFormat(format!("column {column_idx}: invalid {dtype} literal"))
+            })?;
+            Ok(match dtype {
+                DataType::Oid => Value::Oid(oid),
+                DataType::RegClass => Value::RegClass(oid),
+                DataType::RegType => Value::RegType(oid),
+                _ => unreachable!(),
+            })
+        }
+        DataType::PgLsn => Value::parse_pg_lsn_text(s)
+            .map(Value::PgLsn)
+            .ok_or_else(|| {
+                ServerError::CopyFormat(format!("column {column_idx}: invalid {dtype} literal"))
+            }),
         DataType::Float32 => s
             .parse::<f32>()
             .map(Value::Float32)
@@ -1916,15 +2073,31 @@ fn decode_copy_cell(
             .parse::<f64>()
             .map(Value::Float64)
             .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}"))),
-        DataType::Decimal { scale, .. } => parse_copy_decimal(s, scale.unwrap_or(0), column_idx),
+        DataType::Decimal { scale, .. } => parse_copy_decimal(s, *scale, column_idx),
+        DataType::Money => parse_money_text(s)
+            .map_err(|err| ServerError::CopyFormat(format!("column {column_idx}: {err}"))),
         DataType::Date => parse_copy_date(s, column_idx).map(Value::Date),
         DataType::Time => parse_copy_time(s, column_idx).map(Value::Time),
+        DataType::TimeTz => parse_copy_timetz(s, column_idx),
         DataType::Timestamp => parse_copy_timestamp(s, column_idx).map(Value::Timestamp),
-        DataType::TimestampTz => parse_copy_timestamp(s, column_idx).map(Value::TimestampTz),
+        DataType::TimestampTz => parse_copy_timestamptz(s, column_idx).map(Value::TimestampTz),
         DataType::Text { .. } => Ok(Value::Text(s.to_string())),
+        DataType::Char { len } => coerce_bpchar_text(s, *len, false)
+            .map(Value::Char)
+            .map_err(|err| ServerError::CopyFormat(format!("column {column_idx}: {err}"))),
+        DataType::Bit { .. } | DataType::VarBit { .. } => {
+            parse_copy_bit_string(s, dtype, column_idx)
+        }
+        DataType::Inet | DataType::Cidr | DataType::MacAddr | DataType::MacAddr8 => {
+            Value::parse_network(dtype, s).ok_or_else(|| {
+                ServerError::CopyFormat(format!("column {column_idx}: invalid {dtype} literal"))
+            })
+        }
+        DataType::Json => parse_json_text(bytes, column_idx).map(Value::Json),
         DataType::Jsonb => jsonb_shape_cache
             .parse_text(bytes, column_idx)
             .map(Value::Jsonb),
+        DataType::Xml => parse_xml_text(bytes, column_idx).map(Value::Xml),
         DataType::Bytea => Ok(Value::Bytea(bytes.to_vec())),
         DataType::Uuid => Value::parse_uuid(s).map(Value::Uuid).ok_or_else(|| {
             ServerError::CopyFormat(format!("column {column_idx}: invalid uuid literal"))
@@ -1983,6 +2156,27 @@ fn parse_copy_vector_family(
     }
 }
 
+fn parse_copy_bit_string(
+    text: &str,
+    dtype: &DataType,
+    column_idx: usize,
+) -> Result<Value, ServerError> {
+    let bits = Value::parse_bit_string(text).ok_or_else(|| {
+        ServerError::CopyFormat(format!("column {column_idx}: invalid {dtype} literal"))
+    })?;
+    match bits {
+        Value::BitString(bit_string) if bit_string.matches_type(dtype) => {
+            Ok(Value::BitString(bit_string))
+        }
+        Value::BitString(_) => Err(ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid {dtype} length"
+        ))),
+        _ => Err(ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid {dtype} literal"
+        ))),
+    }
+}
+
 /// PostgreSQL-style boolean accept rules used by COPY text input.
 fn parse_copy_bool(s: &str, column_idx: usize) -> Result<bool, ServerError> {
     match s {
@@ -1994,67 +2188,13 @@ fn parse_copy_bool(s: &str, column_idx: usize) -> Result<bool, ServerError> {
     }
 }
 
-fn parse_copy_decimal(s: &str, scale: i32, column_idx: usize) -> Result<Value, ServerError> {
-    let raw = s.trim();
-    let scale_usize = usize::try_from(scale).map_err(|_| {
-        ServerError::CopyFormat(format!(
-            "column {column_idx}: negative decimal scale {scale} not supported by COPY"
-        ))
-    })?;
-    let (negative, digits) = match raw.as_bytes().first() {
-        Some(b'-') => (true, &raw[1..]),
-        Some(b'+') => (false, &raw[1..]),
-        _ => (false, raw),
-    };
-    let mut parts = digits.split('.');
-    let whole = parts.next().unwrap_or_default();
-    let frac = parts.next().unwrap_or_default();
-    if parts.next().is_some()
-        || (whole.is_empty() && frac.is_empty())
-        || !whole.bytes().all(|b| b.is_ascii_digit())
-        || !frac.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(ServerError::CopyFormat(format!(
-            "column {column_idx}: invalid decimal literal {raw:?}"
-        )));
-    }
-    if frac.len() > scale_usize && frac.as_bytes()[scale_usize..].iter().any(|&b| b != b'0') {
-        return Err(ServerError::CopyFormat(format!(
-            "column {column_idx}: decimal literal {raw:?} has scale greater than {scale}"
-        )));
-    }
-
-    let mut value: i128 = 0;
-    for digit in whole.bytes() {
-        value = value
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(i128::from(digit - b'0')))
-            .ok_or_else(|| {
-                ServerError::CopyFormat(format!("column {column_idx}: decimal overflow"))
-            })?;
-    }
-    for digit in frac.bytes().take(scale_usize) {
-        value = value
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(i128::from(digit - b'0')))
-            .ok_or_else(|| {
-                ServerError::CopyFormat(format!("column {column_idx}: decimal overflow"))
-            })?;
-    }
-    let missing_frac_digits = scale_usize.saturating_sub(frac.len().min(scale_usize));
-    for _ in 0..missing_frac_digits {
-        value = value.checked_mul(10).ok_or_else(|| {
-            ServerError::CopyFormat(format!("column {column_idx}: decimal overflow"))
-        })?;
-    }
-    if negative {
-        value = value.checked_neg().ok_or_else(|| {
-            ServerError::CopyFormat(format!("column {column_idx}: decimal overflow"))
-        })?;
-    }
-    let value = i64::try_from(value)
-        .map_err(|_| ServerError::CopyFormat(format!("column {column_idx}: decimal overflow")))?;
-    Ok(Value::Decimal { value, scale })
+fn parse_copy_decimal(
+    s: &str,
+    scale: Option<i32>,
+    column_idx: usize,
+) -> Result<Value, ServerError> {
+    parse_decimal_text(s, scale)
+        .map_err(|err| ServerError::CopyFormat(format!("column {column_idx}: {err}")))
 }
 
 fn parse_copy_date(s: &str, column_idx: usize) -> Result<i32, ServerError> {
@@ -2105,64 +2245,52 @@ fn parse_copy_timestamp(s: &str, column_idx: usize) -> Result<i64, ServerError> 
         .ok_or_else(|| ServerError::CopyFormat(format!("column {column_idx}: timestamp overflow")))
 }
 
-fn parse_copy_time(s: &str, column_idx: usize) -> Result<i64, ServerError> {
+fn parse_copy_timestamptz(s: &str, column_idx: usize) -> Result<i64, ServerError> {
     let raw = s.trim();
-    let mut parts = raw.splitn(3, ':');
-    let hour = parts
-        .next()
-        .ok_or_else(|| {
-            ServerError::CopyFormat(format!("column {column_idx}: invalid time literal {raw:?}"))
-        })?
-        .parse::<i64>()
-        .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}")))?;
-    let minute = parts
-        .next()
-        .ok_or_else(|| {
-            ServerError::CopyFormat(format!("column {column_idx}: invalid time literal {raw:?}"))
-        })?
-        .parse::<i64>()
-        .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}")))?;
-    let second_text = parts.next().ok_or_else(|| {
-        ServerError::CopyFormat(format!("column {column_idx}: invalid time literal {raw:?}"))
+    let split = raw.find(' ').or_else(|| raw.find('T')).ok_or_else(|| {
+        ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid timestamptz literal {raw:?}"
+        ))
     })?;
-    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) {
-        return Err(ServerError::CopyFormat(format!(
-            "column {column_idx}: invalid time literal {raw:?}"
-        )));
-    }
-    let (second_part, frac_part) = second_text
-        .split_once('.')
-        .map_or((second_text, ""), |(sec, frac)| (sec, frac));
-    let second = second_part
-        .parse::<i64>()
-        .map_err(|e| ServerError::CopyFormat(format!("column {column_idx}: {e}")))?;
-    if !(0..=59).contains(&second) {
-        return Err(ServerError::CopyFormat(format!(
-            "column {column_idx}: invalid time literal {raw:?}"
-        )));
-    }
+    let date_micros = i64::from(parse_copy_date(&raw[..split], column_idx)?)
+        .checked_mul(MICROS_PER_DAY)
+        .ok_or_else(|| {
+            ServerError::CopyFormat(format!("column {column_idx}: timestamptz overflow"))
+        })?;
+    let (time_micros, offset_seconds) = parse_timetz_text(&raw[split + 1..]).ok_or_else(|| {
+        ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid timestamptz literal {raw:?}"
+        ))
+    })?;
+    date_micros
+        .checked_add(time_micros)
+        .and_then(|v| v.checked_sub(i64::from(offset_seconds).checked_mul(1_000_000)?))
+        .ok_or_else(|| {
+            ServerError::CopyFormat(format!("column {column_idx}: timestamptz overflow"))
+        })
+}
 
-    let mut frac_micros = 0_i64;
-    let mut scale = 100_000_i64;
-    for ch in frac_part.chars().take(6) {
-        let digit = i64::from(ch.to_digit(10).ok_or_else(|| {
-            ServerError::CopyFormat(format!("column {column_idx}: invalid time literal {raw:?}"))
-        })?);
-        frac_micros = frac_micros
-            .checked_add(digit.checked_mul(scale).ok_or_else(|| {
-                ServerError::CopyFormat(format!("column {column_idx}: time overflow"))
-            })?)
-            .ok_or_else(|| {
-                ServerError::CopyFormat(format!("column {column_idx}: time overflow"))
-            })?;
-        scale /= 10;
-    }
+fn parse_copy_time(s: &str, column_idx: usize) -> Result<i64, ServerError> {
+    parse_time_text(s).ok_or_else(|| {
+        ServerError::CopyFormat(format!(
+            "column {column_idx}: invalid time literal {:?}",
+            s.trim()
+        ))
+    })
+}
 
-    hour.checked_mul(3_600_000_000)
-        .and_then(|v| v.checked_add(minute.checked_mul(60_000_000)?))
-        .and_then(|v| v.checked_add(second.checked_mul(1_000_000)?))
-        .and_then(|v| v.checked_add(frac_micros))
-        .ok_or_else(|| ServerError::CopyFormat(format!("column {column_idx}: time overflow")))
+fn parse_copy_timetz(s: &str, column_idx: usize) -> Result<Value, ServerError> {
+    parse_timetz_text(s)
+        .map(|(micros, offset_seconds)| Value::TimeTz {
+            micros,
+            offset_seconds,
+        })
+        .ok_or_else(|| {
+            ServerError::CopyFormat(format!(
+                "column {column_idx}: invalid timetz literal {:?}",
+                s.trim()
+            ))
+        })
 }
 
 fn is_leap_year(year: i32) -> bool {

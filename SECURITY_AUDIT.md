@@ -1,6 +1,7 @@
 # SECURITY_AUDIT.md — UltraSQL v0.5 adversarial pass
 
 **Date:** 2026-05-12
+**Last dependency refresh:** 2026-05-24
 **Auditor:** automated adversarial sweep, owner-directed
 **Scope:** workspace at `crates/`, dependencies in `Cargo.toml`/`Cargo.lock`
 **Baseline:** 420 tests green pre-audit; 438 tests green post-audit (18 new
@@ -11,6 +12,41 @@ the v0.5 surface. The pass focused on the new public network surface
 (PostgreSQL wire protocol parser, server connection handler) plus
 the durability path (WAL recovery, segment files) and the SQL frontend
 (lexer, parser).
+
+---
+
+## 0. 2026-05-24 dependency-audit refresh
+
+Scope: dependency advisory gate and CI/release enforcement only. This
+refresh did not re-run the full adversarial source review from
+2026-05-12.
+
+Commands run locally:
+
+- `cargo audit --deny yanked` — advisory DB fetched from
+  `https://github.com/RustSec/advisory-db.git`, 1098 advisories
+  loaded, 436 crate dependencies scanned, exit 0.
+- `cargo audit --deny warnings` — exit 1 because `paste 1.0.15` is
+  flagged unmaintained by `RUSTSEC-2024-0436`; dependency path is
+  `paste -> parquet 58.3.0 -> ultrasql-*`.
+- `cargo deny check advisories` — exit 0 (`advisories ok`).
+- `cargo tree -i paste --all-features` — confirms `paste` only enters
+  through `parquet 58.3.0`.
+- `cargo search parquet --limit 5` — crates.io reports `parquet =
+  "58.3.0"` as the current Apache Parquet crate, so there is no newer
+  upstream release to take for this warning.
+
+CI changes:
+
+- `.github/workflows/ci.yml` now has a `cargo-audit` job and the
+  `ci-passed` aggregate requires it.
+- `.github/workflows/release.yml` now runs `cargo audit --deny yanked`
+  during the release verification gate before clippy/tests.
+
+Gate policy: fail on known vulnerabilities and yanked crates. Allow the
+current unmaintained warning for transitive `paste` while it is pulled
+by the latest `parquet` release; keep it visible in audit output and
+re-check when Arrow/Parquet publishes a replacement path.
 
 ---
 
@@ -260,6 +296,12 @@ into the connection task. Touches `ultrasql-cli` and `ultrasql-server`
 public surfaces. Marker placed at the call site:
 `TODO(security): add per-connection slow-loris timeout`.
 
+**2026-05-24 refresh:** Fixed by the statement timeout / cancellation
+work and the configurable post-startup idle-session timeout. Regression
+coverage: `statement_timeout_round_trip.rs`,
+`idle_session_timeout_round_trip.rs`, and
+`cancel_request_round_trip.rs`.
+
 ### D-2. mmap-aliasing under hostile concurrent writers
 
 **Affected:** `crates/ultrasql-storage/src/segment.rs:217` (`SegmentFile::map`)
@@ -283,6 +325,15 @@ isolation strategies. Marker placed at the function:
 `TODO(security): the mmap-as-&[u8] view rests on the threat-model
 assumption ...`.
 
+**2026-05-24 refresh:** Fixed at the current runtime boundary by
+keeping heap segment reads/writes on positional file IO rather than
+`mmap`, rejecting a symlinked final data directory, canonicalizing the
+stored data-dir path, and refusing Unix data directories not owned by
+the server's effective UID. Regression coverage:
+`server_init_refuses_symlinked_data_dir`,
+`server_init_stores_canonical_data_dir`, and
+`data_dir_owner_check_rejects_unexpected_uid`.
+
 ### D-3. No `MAX_JOIN_DEPTH` in planner
 
 **Affected:** `crates/ultrasql-planner/` (no joins implemented in v0.5)
@@ -300,14 +351,18 @@ reject deeper queries as `PlanError::Unsupported`. Track as RFC.
 
 ## 5. Dependency advisories
 
-`cargo audit` (advisory DB updated 2026-05-12) reports:
-- **Crates scanned:** 236
-- **Advisories matched:** 0
-- **Yanked crates:** 0
+`cargo audit --deny yanked` (advisory DB fetched 2026-05-24) reports:
 
-`cargo deny` was not installed on this host; the manifest in `deny.toml`
-is unchanged. Recommended follow-up: `brew install cargo-deny &&
-cargo deny check`.
+- **Crates scanned:** 436
+- **Security vulnerabilities:** 0
+- **Yanked crates:** 0
+- **Allowed warnings:** 1 (`RUSTSEC-2024-0436`, unmaintained
+  `paste 1.0.15`, transitive through `parquet 58.3.0`)
+
+`cargo audit --deny warnings` intentionally is not the CI policy while
+the latest Apache Parquet crate still depends on `paste`; it exits 1 on
+the unmaintained warning but does not report a vulnerability. `cargo
+deny check advisories` reports `advisories ok`.
 
 ---
 
@@ -339,11 +394,13 @@ None. Three new public symbols (`MAX_PARSE_DEPTH`,
 
 ## 8. Process notes
 
-- `cargo-audit` was installed locally and run; result clean. Future CI
-  should add a `cargo audit` job per the workflow in
-  `.github/workflows/`.
-- `cargo deny` was not installed on this host. Recommend adding a
-  `cargo deny check` job to CI as a follow-up.
+- `cargo-audit` was installed locally and run; result is clean for
+  vulnerabilities and yanked crates, with one allowed unmaintained
+  warning documented above. CI now has a `cargo audit` job per
+  `.github/workflows/ci.yml`; release verification also runs
+  `cargo audit --deny yanked`.
+- `cargo deny check advisories` was installed locally and run; result
+  clean. Full `cargo-deny` remains in CI.
 - 420 → 438 tests green throughout the audit; no regression in the
   existing suite.
 - `cargo fmt --all -- --check` and `cargo clippy --workspace
@@ -354,11 +411,12 @@ None. Three new public symbols (`MAX_PARSE_DEPTH`,
 
 ## 9. Outstanding work for v0.6
 
-1. Land the per-connection timeout (D-1).
-2. Decide and document the mmap-aliasing isolation strategy (D-2).
-3. Wire `cargo audit` and `cargo deny` into CI.
-4. Add a `cargo fuzz` corpus for the wire-protocol codec, the WAL
+1. Add a `cargo fuzz` corpus for the wire-protocol codec, the WAL
    record decoder, and the SQL parser (referenced in AGENTS.md §8 but
    not yet bootstrapped).
-5. Add a public-IP slow-loris integration test (will require the timeout
-   work in D-1).
+2. Add a public-IP slow-loris integration test now that the timeout
+   work in D-1 has landed.
+3. Track upstream `parquet` releases for removal of transitive
+   `paste 1.0.15`; tighten the audit gate to `--deny warnings` once
+   the latest compatible Parquet stack no longer emits
+   `RUSTSEC-2024-0436`.

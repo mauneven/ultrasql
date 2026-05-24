@@ -80,9 +80,9 @@ use self::aggregate::{
     expr_has_aggregate, is_aggregate_name, projection_item_has_aggregate,
 };
 use self::ddl::{
-    bind_alter_sequence, bind_alter_table, bind_comment, bind_copy, bind_create_index,
-    bind_create_materialized_view, bind_create_policy, bind_create_sequence, bind_create_table,
-    bind_drop_sequence, bind_drop_table, bind_truncate,
+    bind_alter_sequence, bind_alter_table, bind_comment, bind_copy, bind_create_domain,
+    bind_create_index, bind_create_materialized_view, bind_create_policy, bind_create_sequence,
+    bind_create_table, bind_create_type, bind_drop_sequence, bind_drop_table, bind_truncate,
 };
 use self::dml::{bind_delete, bind_insert, bind_update};
 use self::expr_bind::{bind_expr, bind_expr_with_ctes};
@@ -115,6 +115,8 @@ pub fn bind(stmt: &Statement, catalog: &dyn Catalog) -> Result<LogicalPlan, Plan
         Statement::Truncate(s) => bind_truncate(s, catalog),
         Statement::CreateTable(s) => bind_create_table(s, catalog),
         Statement::CreateMaterializedView(s) => bind_create_materialized_view(s, catalog),
+        Statement::CreateType(s) => bind_create_type(s, catalog),
+        Statement::CreateDomain(s) => bind_create_domain(s, catalog),
         Statement::CreatePolicy(s) => bind_create_policy(s, catalog),
         Statement::CreateIndex(s) => bind_create_index(s, catalog),
         Statement::CreateSequence(s) => bind_create_sequence(s),

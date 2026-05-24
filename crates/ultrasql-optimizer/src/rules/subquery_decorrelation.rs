@@ -93,8 +93,8 @@ enum SubqueryKind {
     },
     /// `expr IN (SELECT col FROM sub)` — semi-join on equality.
     InSubquery {
-        outer_expr: ScalarExpr,
-        inner_col: ScalarExpr,
+        outer_expr: Box<ScalarExpr>,
+        inner_col: Box<ScalarExpr>,
         sub: Box<LogicalPlan>,
         negated: bool,
     },
@@ -1658,7 +1658,7 @@ fn rewrite_filter(outer: &LogicalPlan, kind: SubqueryKind) -> Option<LogicalPlan
             let inner_col_in_join = shift_column_index(&inner_col, outer_width);
             let eq_pred = ScalarExpr::Binary {
                 op: BinaryOp::Eq,
-                left: Box::new(outer_expr),
+                left: outer_expr,
                 right: Box::new(inner_col_in_join.clone()),
                 data_type: DataType::Bool,
             };
@@ -1768,8 +1768,8 @@ pub(crate) fn make_in_subquery_filter(
     negated: bool,
 ) -> LogicalPlan {
     let kind = SubqueryKind::InSubquery {
-        outer_expr,
-        inner_col,
+        outer_expr: Box::new(outer_expr),
+        inner_col: Box::new(inner_col),
         sub: Box::new(sub),
         negated,
     };

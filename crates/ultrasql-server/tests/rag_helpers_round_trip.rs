@@ -149,7 +149,7 @@ tenant-b,chunk-b-0,doc-b,0,other tenant content,0,3,\"{\"\"section\"\":\"\"body\
             "s3://bucket/a.md".to_owned(),
             "Doc A".to_owned(),
             "2".to_owned(),
-            "832586400000000".to_owned()
+            "2026-05-20 10:00:00+00".to_owned()
         ]]
     );
 

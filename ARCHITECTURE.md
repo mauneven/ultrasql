@@ -101,8 +101,9 @@ batches for clients that speak Arrow Flight.
   growing from the back).
 - **Segment / file manager.** Allocates and tracks 1 GiB segment
   files per relation. Each segment exposes a `read_page` /
-  `write_page` API backed by either `mmap` (default on macOS) or
-  positional `pread` / `pwrite` (default on Linux for predictability).
+  `write_page` API backed by positional `pread` / `pwrite`; the
+  historical `use_mmap` knob is retained for compatibility but does
+  not currently mmap heap segment files.
 - **Buffer pool.** CLOCK-Pro replacement with sharded page-table
   buckets keyed by `PageId`. Pins are reference-counted; a pinned page
   cannot be evicted. The pool is sized at startup; resizing is an

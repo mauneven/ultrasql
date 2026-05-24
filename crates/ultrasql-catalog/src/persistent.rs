@@ -51,12 +51,14 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use std::sync::Arc;
-use ultrasql_core::{Field, Oid, RelationId, Schema};
+use ultrasql_core::{DataType, Field, Oid, RelationId, Schema};
 use ultrasql_storage::buffer_pool::PageLoader;
 use ultrasql_storage::heap::HeapAccess;
 
 use crate::bootstrap::{self, initial_snapshot};
-use crate::entry::{IndexEntry, TableEntry};
+use crate::entry::{
+    CompositeTypeEntry, DomainTypeEntry, EnumLabelEntry, EnumTypeEntry, IndexEntry, TableEntry,
+};
 use crate::error::CatalogError;
 use crate::traits::{Catalog, MutableCatalog};
 
@@ -138,6 +140,38 @@ pub struct AttributeRow {
     pub atthasdef: bool,
     /// `attisdropped` — column has been dropped.
     pub attisdropped: bool,
+}
+
+/// A row in `pg_type`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeRow {
+    /// `oid`.
+    pub oid: Oid,
+    /// `typname`.
+    pub typname: String,
+    /// `typnamespace` — OID of the containing namespace.
+    pub typnamespace: Oid,
+    /// `typtype` (`'b'` built-in/base, `'e'` enum, etc.).
+    pub typtype: char,
+    /// `typcategory` (`'E'` for enum, `'S'` for string, etc.).
+    pub typcategory: char,
+    /// `typlen`; `-1` means varlena.
+    pub typlen: i16,
+    /// Element type OID for arrays, or 0.
+    pub typelem: u32,
+}
+
+/// A row in `pg_enum`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumRow {
+    /// `oid`.
+    pub oid: Oid,
+    /// `enumtypid` — owning enum type OID.
+    pub enumtypid: Oid,
+    /// `enumsortorder` in declaration order.
+    pub enumsortorder: u32,
+    /// `enumlabel`.
+    pub enumlabel: String,
 }
 
 /// A row in `pg_index`.
@@ -315,7 +349,7 @@ pub struct CatalogStats {
 }
 
 impl CatalogStats {
-    /// Stats for a fresh-database initial snapshot: 3 namespaces, 11 relations,
+    /// Stats for a fresh-database initial snapshot: 3 namespaces, 13 relations,
     /// no attributes, indexes, or constraints yet decoded from the heap.
     ///
     /// Used when `bootstrap_from_heap` detects an empty heap and installs the
@@ -324,7 +358,7 @@ impl CatalogStats {
     pub const fn initial() -> Self {
         Self {
             namespaces: 3,
-            relations: 11,
+            relations: 13,
             attributes: 0,
             indexes: 0,
             constraints: 0,
@@ -353,6 +387,18 @@ pub struct CatalogSnapshot {
     pub indexes: std::collections::HashMap<String, IndexEntry>,
     /// Indexes keyed by table OID.
     pub indexes_by_table: std::collections::HashMap<Oid, Vec<IndexEntry>>,
+    /// User-defined enum types keyed by folded name.
+    pub enum_types: std::collections::HashMap<String, EnumTypeEntry>,
+    /// User-defined enum types keyed by `pg_type.oid`.
+    pub enum_types_by_oid: std::collections::HashMap<Oid, EnumTypeEntry>,
+    /// User-defined composite types keyed by folded name.
+    pub composite_types: std::collections::HashMap<String, CompositeTypeEntry>,
+    /// User-defined composite types keyed by `pg_type.oid`.
+    pub composite_types_by_oid: std::collections::HashMap<Oid, CompositeTypeEntry>,
+    /// User-defined domain types keyed by folded name.
+    pub domain_types: std::collections::HashMap<String, DomainTypeEntry>,
+    /// User-defined domain types keyed by `pg_type.oid`.
+    pub domain_types_by_oid: std::collections::HashMap<Oid, DomainTypeEntry>,
     /// Comments keyed by `(objoid, classoid, objsubid)`.
     pub descriptions: std::collections::HashMap<(Oid, Oid, i32), DescriptionRow>,
     /// `pg_statistic` rows keyed by `(starelid, staattnum)`.
@@ -383,6 +429,8 @@ pub struct PersistentCatalog {
     pub pg_namespace: DashMap<Oid, NamespaceRow>,
     pub pg_class: DashMap<Oid, ClassRow>,
     pub pg_attribute: DashMap<(Oid, i16), AttributeRow>,
+    pub pg_type: DashMap<Oid, TypeRow>,
+    pub pg_enum: DashMap<(Oid, u32), EnumRow>,
     pub pg_index: DashMap<Oid, IndexRow>,
     pub pg_constraint: DashMap<Oid, ConstraintRow>,
     pub pg_sequence: DashMap<Oid, SequenceRow>,
@@ -396,6 +444,12 @@ pub struct PersistentCatalog {
     tables_by_oid: DashMap<Oid, TableEntry>,
     indexes_by_name: DashMap<String, IndexEntry>,
     indexes_by_table: DashMap<Oid, Vec<IndexEntry>>,
+    enum_types_by_name: DashMap<String, EnumTypeEntry>,
+    enum_types_by_oid: DashMap<Oid, EnumTypeEntry>,
+    composite_types_by_name: DashMap<String, CompositeTypeEntry>,
+    composite_types_by_oid: DashMap<Oid, CompositeTypeEntry>,
+    domain_types_by_name: DashMap<String, DomainTypeEntry>,
+    domain_types_by_oid: DashMap<Oid, DomainTypeEntry>,
 
     /// Wait-free snapshot for the binder.
     snapshot: ArcSwap<CatalogSnapshot>,
@@ -420,6 +474,12 @@ impl PersistentCatalog {
             tables_by_oid: std::collections::HashMap::new(),
             indexes: std::collections::HashMap::new(),
             indexes_by_table: std::collections::HashMap::new(),
+            enum_types: std::collections::HashMap::new(),
+            enum_types_by_oid: std::collections::HashMap::new(),
+            composite_types: std::collections::HashMap::new(),
+            composite_types_by_oid: std::collections::HashMap::new(),
+            domain_types: std::collections::HashMap::new(),
+            domain_types_by_oid: std::collections::HashMap::new(),
             descriptions: std::collections::HashMap::new(),
             statistics: std::collections::HashMap::new(),
             statistic_ext: std::collections::HashMap::new(),
@@ -428,6 +488,8 @@ impl PersistentCatalog {
             pg_namespace: DashMap::new(),
             pg_class: DashMap::new(),
             pg_attribute: DashMap::new(),
+            pg_type: DashMap::new(),
+            pg_enum: DashMap::new(),
             pg_index: DashMap::new(),
             pg_constraint: DashMap::new(),
             pg_sequence: DashMap::new(),
@@ -439,6 +501,12 @@ impl PersistentCatalog {
             tables_by_oid: DashMap::new(),
             indexes_by_name: DashMap::new(),
             indexes_by_table: DashMap::new(),
+            enum_types_by_name: DashMap::new(),
+            enum_types_by_oid: DashMap::new(),
+            composite_types_by_name: DashMap::new(),
+            composite_types_by_oid: DashMap::new(),
+            domain_types_by_name: DashMap::new(),
+            domain_types_by_oid: DashMap::new(),
             snapshot: ArcSwap::new(empty),
             write_lock: Mutex::new(()),
             next_oid: AtomicU32::new(crate::memory::FIRST_USER_OID),
@@ -479,6 +547,14 @@ impl PersistentCatalog {
         self.tables_by_oid.clear();
         self.indexes_by_name.clear();
         self.indexes_by_table.clear();
+        self.enum_types_by_name.clear();
+        self.enum_types_by_oid.clear();
+        self.composite_types_by_name.clear();
+        self.composite_types_by_oid.clear();
+        self.domain_types_by_name.clear();
+        self.domain_types_by_oid.clear();
+        self.pg_type.clear();
+        self.pg_enum.clear();
         self.pg_description.clear();
         self.pg_constraint.clear();
         self.pg_sequence.clear();
@@ -494,6 +570,45 @@ impl PersistentCatalog {
         }
         for (oid, entries) in &snap.indexes_by_table {
             self.indexes_by_table.insert(*oid, entries.clone());
+        }
+        for (name, entry) in &snap.enum_types {
+            self.enum_types_by_name.insert(name.clone(), entry.clone());
+            self.enum_types_by_oid.insert(entry.oid, entry.clone());
+            self.pg_type.insert(entry.oid, type_row_from_enum(entry));
+            for label in &entry.labels {
+                self.pg_enum.insert(
+                    (entry.oid, label.sort_order),
+                    enum_row_from_label(entry.oid, label),
+                );
+            }
+        }
+        for (name, entry) in &snap.composite_types {
+            self.composite_types_by_name
+                .insert(name.clone(), entry.clone());
+            self.composite_types_by_oid.insert(entry.oid, entry.clone());
+            self.pg_type
+                .insert(entry.oid, type_row_from_composite(entry));
+            self.pg_class
+                .insert(entry.oid, class_row_from_composite(entry));
+            for (idx, field) in entry.schema.fields().iter().enumerate() {
+                let attnum = i16::try_from(idx + 1).expect("attribute count fits in i16");
+                let attr = AttributeRow {
+                    attrelid: entry.oid,
+                    attname: field.name.clone(),
+                    atttypid: 0,
+                    attnum,
+                    attnotnull: !field.nullable,
+                    atthasdef: false,
+                    attisdropped: false,
+                };
+                self.pg_attribute.insert((entry.oid, attnum), attr);
+            }
+        }
+        for (name, entry) in &snap.domain_types {
+            self.domain_types_by_name
+                .insert(name.clone(), entry.clone());
+            self.domain_types_by_oid.insert(entry.oid, entry.clone());
+            self.pg_type.insert(entry.oid, type_row_from_domain(entry));
         }
         for (key, row) in &snap.descriptions {
             self.pg_description.insert(*key, row.clone());
@@ -539,13 +654,15 @@ impl PersistentCatalog {
         heap: &HeapAccess<L>,
     ) -> Result<CatalogStats, CatalogError> {
         use crate::encoding::{
-            decode_attribute_row, decode_constraint_row, decode_description_row, decode_index_row,
-            decode_sequence_row, decode_statistic_ext_row, decode_statistic_row,
-            schema_from_attributes,
+            decode_attribute_row, decode_constraint_row, decode_description_row, decode_enum_row,
+            decode_index_row, decode_sequence_row, decode_statistic_ext_row, decode_statistic_row,
+            decode_type_row, schema_from_attributes,
         };
 
         let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
         let pg_attribute_rel = RelationId::new(bootstrap::PG_ATTRIBUTE_OID);
+        let pg_type_rel = RelationId::new(bootstrap::PG_TYPE_OID);
+        let pg_enum_rel = RelationId::new(bootstrap::PG_ENUM_OID);
         let pg_index_rel = RelationId::new(bootstrap::PG_INDEX_OID);
         let pg_constraint_rel = RelationId::new(bootstrap::PG_CONSTRAINT_OID);
         let pg_sequence_rel = RelationId::new(bootstrap::PG_SEQUENCE_OID);
@@ -553,8 +670,10 @@ impl PersistentCatalog {
         let pg_statistic_rel = RelationId::new(bootstrap::PG_STATISTIC_OID);
         let pg_statistic_ext_rel = RelationId::new(bootstrap::PG_STATISTIC_EXT_OID);
         let class_blocks = heap.block_count(pg_class_rel);
+        let type_blocks = heap.block_count(pg_type_rel);
+        let enum_blocks = heap.block_count(pg_enum_rel);
 
-        if class_blocks == 0 {
+        if class_blocks == 0 && type_blocks == 0 && enum_blocks == 0 {
             // Fresh database — install the initial hard-coded snapshot.
             let snap = initial_snapshot();
             let stats = CatalogStats::initial();
@@ -576,6 +695,92 @@ impl PersistentCatalog {
         let mut indexes: std::collections::HashMap<String, IndexEntry> = initial.indexes.clone();
         let mut indexes_by_table: std::collections::HashMap<Oid, Vec<IndexEntry>> =
             initial.indexes_by_table.clone();
+        let mut enum_types: std::collections::HashMap<String, EnumTypeEntry> =
+            initial.enum_types.clone();
+        let mut enum_types_by_oid: std::collections::HashMap<Oid, EnumTypeEntry> =
+            initial.enum_types_by_oid.clone();
+        let mut composite_types: std::collections::HashMap<String, CompositeTypeEntry> =
+            initial.composite_types.clone();
+        let mut composite_types_by_oid: std::collections::HashMap<Oid, CompositeTypeEntry> =
+            initial.composite_types_by_oid.clone();
+        let domain_types: std::collections::HashMap<String, DomainTypeEntry> =
+            initial.domain_types.clone();
+        let domain_types_by_oid: std::collections::HashMap<Oid, DomainTypeEntry> =
+            initial.domain_types_by_oid.clone();
+        let mut highest_oid: u32 = self.next_oid.load(Ordering::Acquire);
+
+        let mut type_rows_by_oid: std::collections::HashMap<Oid, TypeRow> =
+            std::collections::HashMap::new();
+        if type_blocks > 0 {
+            let type_scan = heap.scan(pg_type_rel, type_blocks);
+            for result in type_scan {
+                let tuple = result.map_err(|e| {
+                    CatalogError::schema_conflict(format!("heap scan error on pg_type: {e}"))
+                })?;
+                let row = decode_type_row(&tuple.data).map_err(|e| {
+                    CatalogError::schema_conflict(format!("decode pg_type row: {e}"))
+                })?;
+                highest_oid = highest_oid.max(row.oid.raw().saturating_add(1));
+                if row.oid.raw() >= crate::memory::FIRST_USER_OID {
+                    type_rows_by_oid.insert(row.oid, row);
+                }
+            }
+        }
+
+        let mut enum_rows_by_type: std::collections::HashMap<Oid, Vec<EnumRow>> =
+            std::collections::HashMap::new();
+        if enum_blocks > 0 {
+            let enum_scan = heap.scan(pg_enum_rel, enum_blocks);
+            for result in enum_scan {
+                let tuple = result.map_err(|e| {
+                    CatalogError::schema_conflict(format!("heap scan error on pg_enum: {e}"))
+                })?;
+                let row = decode_enum_row(&tuple.data).map_err(|e| {
+                    CatalogError::schema_conflict(format!("decode pg_enum row: {e}"))
+                })?;
+                highest_oid = highest_oid.max(row.oid.raw().saturating_add(1));
+                if row.enumtypid.raw() >= crate::memory::FIRST_USER_OID {
+                    enum_rows_by_type
+                        .entry(row.enumtypid)
+                        .or_default()
+                        .push(row);
+                }
+            }
+        }
+
+        for (type_oid, type_row) in &type_rows_by_oid {
+            if type_row.typtype != 'e' {
+                continue;
+            }
+            let mut enum_rows = enum_rows_by_type.remove(type_oid).ok_or_else(|| {
+                CatalogError::schema_conflict(format!(
+                    "enum type '{}' has no pg_enum labels",
+                    type_row.typname
+                ))
+            })?;
+            enum_rows.sort_by_key(|row| row.enumsortorder);
+            let labels = enum_rows
+                .into_iter()
+                .map(|row| EnumLabelEntry {
+                    oid: row.oid,
+                    label: row.enumlabel,
+                    sort_order: row.enumsortorder,
+                })
+                .collect::<Vec<_>>();
+            let schema_name = if type_row.typnamespace.raw() == bootstrap::PG_CATALOG_OID {
+                "pg_catalog".to_owned()
+            } else {
+                "public".to_owned()
+            };
+            let entry = EnumTypeEntry {
+                oid: *type_oid,
+                name: type_row.typname.clone(),
+                schema_name,
+                labels,
+            };
+            enum_types.insert(fold_name(&entry.name), entry.clone());
+            enum_types_by_oid.insert(entry.oid, entry);
+        }
 
         // Keep the latest attribute row per `(attrelid, attnum)`, then group
         // by relation so append-only ALTER TABLE catalog rows replace older
@@ -683,7 +888,6 @@ impl PersistentCatalog {
         let class_scan = heap.scan(pg_class_rel, class_blocks);
         let mut latest_class_by_oid: std::collections::HashMap<Oid, ClassRow> =
             std::collections::HashMap::new();
-        let mut highest_oid: u32 = self.next_oid.load(Ordering::Acquire);
         for result in class_scan {
             let tuple = result.map_err(|e| {
                 CatalogError::schema_conflict(format!("heap scan error on pg_class: {e}"))
@@ -733,6 +937,45 @@ impl PersistentCatalog {
                 RelKind::Index => {
                     user_relations = user_relations.saturating_add(1);
                     user_index_classes.push(class_row);
+                }
+                RelKind::CompositeType => {
+                    user_relations = user_relations.saturating_add(1);
+                    let Some(type_row) = type_rows_by_oid.get(&class_row.oid) else {
+                        tracing::warn!(
+                            oid = class_row.oid.raw(),
+                            relname = %class_row.relname,
+                            "skipping composite pg_class row without pg_type metadata"
+                        );
+                        continue;
+                    };
+                    if type_row.typtype != 'c' {
+                        tracing::warn!(
+                            oid = class_row.oid.raw(),
+                            typtype = %type_row.typtype,
+                            "skipping composite pg_class row whose pg_type row is not composite"
+                        );
+                        continue;
+                    }
+                    let attrs = attrs_by_relation.remove(&class_row.oid).unwrap_or_default();
+                    let schema = schema_from_attributes(attrs).map_err(|e| {
+                        CatalogError::schema_conflict(format!(
+                            "rebuild composite schema for oid {}: {e}",
+                            class_row.oid.raw(),
+                        ))
+                    })?;
+                    let schema_name = if class_row.relnamespace.raw() == bootstrap::PG_CATALOG_OID {
+                        "pg_catalog".to_owned()
+                    } else {
+                        "public".to_owned()
+                    };
+                    let entry = CompositeTypeEntry {
+                        oid: class_row.oid,
+                        name: class_row.relname.clone(),
+                        schema_name,
+                        schema,
+                    };
+                    composite_types.insert(fold_name(&entry.name), entry.clone());
+                    composite_types_by_oid.insert(entry.oid, entry);
                 }
                 _ => {}
             }
@@ -885,6 +1128,12 @@ impl PersistentCatalog {
             tables_by_oid,
             indexes,
             indexes_by_table,
+            enum_types,
+            enum_types_by_oid,
+            composite_types,
+            composite_types_by_oid,
+            domain_types,
+            domain_types_by_oid,
             descriptions,
             statistics,
             statistic_ext,
@@ -914,6 +1163,382 @@ impl PersistentCatalog {
         }
         tracing::debug!(?stats, "catalog bootstrapped from heap");
         Ok(stats)
+    }
+
+    /// Register a user-defined enum type in the in-memory catalog snapshot.
+    ///
+    /// `entry.labels` must be non-empty and label text must be unique inside
+    /// the type. The durable heap rows are written separately by
+    /// [`Self::persist_enum_type_rows`] so DDL can coordinate catalog writes
+    /// with its transaction metadata.
+    pub fn create_enum_type(&self, entry: EnumTypeEntry) -> Result<(), CatalogError> {
+        if entry.oid.is_invalid() {
+            return Err(CatalogError::schema_conflict(
+                "cannot register enum type with INVALID oid",
+            ));
+        }
+        if entry.labels.is_empty() {
+            return Err(CatalogError::schema_conflict(format!(
+                "enum type '{}' must have at least one label",
+                entry.name
+            )));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(entry.labels.len());
+        for label in &entry.labels {
+            if label.oid.is_invalid() {
+                return Err(CatalogError::schema_conflict(format!(
+                    "enum type '{}' has label '{}' with INVALID oid",
+                    entry.name, label.label
+                )));
+            }
+            if !seen.insert(label.label.clone()) {
+                return Err(CatalogError::schema_conflict(format!(
+                    "enum type '{}' repeats label '{}'",
+                    entry.name, label.label
+                )));
+            }
+        }
+        let key = fold_name(&entry.name);
+        let _guard = self.write_lock.lock();
+        if self.enum_types_by_name.contains_key(&key)
+            || self.composite_types_by_name.contains_key(&key)
+            || self.domain_types_by_name.contains_key(&key)
+            || self.tables_by_name.contains_key(&key)
+        {
+            return Err(CatalogError::already_exists(entry.name));
+        }
+        if self.enum_types_by_oid.contains_key(&entry.oid)
+            || self.composite_types_by_oid.contains_key(&entry.oid)
+            || self.domain_types_by_oid.contains_key(&entry.oid)
+            || self.tables_by_oid.contains_key(&entry.oid)
+        {
+            return Err(CatalogError::already_exists(format!(
+                "oid {}",
+                entry.oid.raw()
+            )));
+        }
+        self.pg_type.insert(entry.oid, type_row_from_enum(&entry));
+        for label in &entry.labels {
+            self.pg_enum.insert(
+                (entry.oid, label.sort_order),
+                enum_row_from_label(entry.oid, label),
+            );
+        }
+        self.enum_types_by_name.insert(key, entry.clone());
+        self.enum_types_by_oid.insert(entry.oid, entry);
+        self.rebuild_snapshot();
+        Ok(())
+    }
+
+    /// Remove an enum type from the in-memory catalog snapshot.
+    ///
+    /// Used by DDL rollback paths when durable catalog-row writes fail after
+    /// the type has been published to the current process.
+    pub fn drop_enum_type(&self, name: &str) -> Result<(), CatalogError> {
+        let key = fold_name(name);
+        let _guard = self.write_lock.lock();
+        let removed = self
+            .enum_types_by_name
+            .remove(&key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .1;
+        self.enum_types_by_oid.remove(&removed.oid);
+        self.pg_type.remove(&removed.oid);
+        let enum_keys = self
+            .pg_enum
+            .iter()
+            .filter(|row| row.key().0 == removed.oid)
+            .map(|row| *row.key())
+            .collect::<Vec<_>>();
+        for enum_key in enum_keys {
+            self.pg_enum.remove(&enum_key);
+        }
+        self.rebuild_snapshot();
+        Ok(())
+    }
+
+    /// Append durable `pg_type` / `pg_enum` rows for one user enum type.
+    pub fn persist_enum_type_rows<L: PageLoader>(
+        &self,
+        entry: &EnumTypeEntry,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::{encode_enum_row, encode_type_row};
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_type_rel = RelationId::new(bootstrap::PG_TYPE_OID);
+        let pg_enum_rel = RelationId::new(bootstrap::PG_ENUM_OID);
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+
+        let type_row = type_row_from_enum(entry);
+        heap.insert(
+            pg_type_rel,
+            &encode_type_row(&type_row),
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_type insert: {e}")))?;
+
+        for label in &entry.labels {
+            let enum_row = enum_row_from_label(entry.oid, label);
+            heap.insert(
+                pg_enum_rel,
+                &encode_enum_row(&enum_row),
+                InsertOptions {
+                    xmin,
+                    command_id,
+                    wal,
+                    fsm: None,
+                    vm: None,
+                },
+            )
+            .map_err(|e| CatalogError::schema_conflict(format!("pg_enum insert: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Register a user-defined composite type in the in-memory catalog
+    /// snapshot.
+    pub fn create_composite_type(&self, entry: CompositeTypeEntry) -> Result<(), CatalogError> {
+        if entry.oid.is_invalid() {
+            return Err(CatalogError::schema_conflict(
+                "cannot register composite type with INVALID oid",
+            ));
+        }
+        if entry.schema.fields().is_empty() {
+            return Err(CatalogError::schema_conflict(format!(
+                "composite type '{}' must have at least one attribute",
+                entry.name
+            )));
+        }
+        let key = fold_name(&entry.name);
+        let _guard = self.write_lock.lock();
+        if self.composite_types_by_name.contains_key(&key)
+            || self.enum_types_by_name.contains_key(&key)
+            || self.domain_types_by_name.contains_key(&key)
+            || self.tables_by_name.contains_key(&key)
+        {
+            return Err(CatalogError::already_exists(entry.name));
+        }
+        if self.composite_types_by_oid.contains_key(&entry.oid)
+            || self.enum_types_by_oid.contains_key(&entry.oid)
+            || self.domain_types_by_oid.contains_key(&entry.oid)
+            || self.tables_by_oid.contains_key(&entry.oid)
+        {
+            return Err(CatalogError::already_exists(format!(
+                "oid {}",
+                entry.oid.raw()
+            )));
+        }
+        self.pg_type
+            .insert(entry.oid, type_row_from_composite(&entry));
+        self.pg_class
+            .insert(entry.oid, class_row_from_composite(&entry));
+        for (idx, field) in entry.schema.fields().iter().enumerate() {
+            let attnum = i16::try_from(idx + 1).unwrap_or(i16::MAX);
+            self.pg_attribute.insert(
+                (entry.oid, attnum),
+                AttributeRow {
+                    attrelid: entry.oid,
+                    attname: field.name.clone(),
+                    atttypid: 0,
+                    attnum,
+                    attnotnull: !field.nullable,
+                    atthasdef: false,
+                    attisdropped: false,
+                },
+            );
+        }
+        self.composite_types_by_name.insert(key, entry.clone());
+        self.composite_types_by_oid.insert(entry.oid, entry);
+        self.rebuild_snapshot();
+        Ok(())
+    }
+
+    /// Remove a composite type from the in-memory catalog snapshot.
+    pub fn drop_composite_type(&self, name: &str) -> Result<(), CatalogError> {
+        let key = fold_name(name);
+        let _guard = self.write_lock.lock();
+        let removed = self
+            .composite_types_by_name
+            .remove(&key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .1;
+        self.composite_types_by_oid.remove(&removed.oid);
+        self.pg_type.remove(&removed.oid);
+        self.pg_class.remove(&removed.oid);
+        let attr_keys = self
+            .pg_attribute
+            .iter()
+            .filter(|row| row.key().0 == removed.oid)
+            .map(|row| *row.key())
+            .collect::<Vec<_>>();
+        for attr_key in attr_keys {
+            self.pg_attribute.remove(&attr_key);
+        }
+        self.rebuild_snapshot();
+        Ok(())
+    }
+
+    /// Append durable `pg_type` / `pg_class` / `pg_attribute` rows for one
+    /// user composite type.
+    pub fn persist_composite_type_rows<L: PageLoader>(
+        &self,
+        entry: &CompositeTypeEntry,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::{encode_attribute_row, encode_type_row};
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_type_rel = RelationId::new(bootstrap::PG_TYPE_OID);
+        let pg_class_rel = RelationId::new(bootstrap::PG_CLASS_OID);
+        let pg_attribute_rel = RelationId::new(bootstrap::PG_ATTRIBUTE_OID);
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+
+        let type_row = type_row_from_composite(entry);
+        heap.insert(
+            pg_type_rel,
+            &encode_type_row(&type_row),
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_type insert: {e}")))?;
+
+        heap.insert(
+            pg_class_rel,
+            &class_row_from_composite(entry).encode(),
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_class insert: {e}")))?;
+
+        for (idx, field) in entry.schema.fields().iter().enumerate() {
+            let attr_row = AttributeRow {
+                attrelid: entry.oid,
+                attname: field.name.clone(),
+                atttypid: 0,
+                attnum: i16::try_from(idx + 1).unwrap_or(i16::MAX),
+                attnotnull: !field.nullable,
+                atthasdef: false,
+                attisdropped: false,
+            };
+            let bytes = encode_attribute_row(&attr_row, &field.data_type, field.nullable)
+                .map_err(|e| CatalogError::schema_conflict(format!("encode pg_attribute: {e}")))?;
+            heap.insert(
+                pg_attribute_rel,
+                &bytes,
+                InsertOptions {
+                    xmin,
+                    command_id,
+                    wal,
+                    fsm: None,
+                    vm: None,
+                },
+            )
+            .map_err(|e| CatalogError::schema_conflict(format!("pg_attribute insert: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Register a user-defined domain type in the in-memory catalog snapshot.
+    pub fn create_domain_type(&self, entry: DomainTypeEntry) -> Result<(), CatalogError> {
+        if entry.oid.is_invalid() {
+            return Err(CatalogError::schema_conflict(
+                "cannot register domain type with INVALID oid",
+            ));
+        }
+        if matches!(entry.base_type, DataType::Null) {
+            return Err(CatalogError::schema_conflict(format!(
+                "domain type '{}' must have a concrete base type",
+                entry.name
+            )));
+        }
+        let key = fold_name(&entry.name);
+        let _guard = self.write_lock.lock();
+        if self.domain_types_by_name.contains_key(&key)
+            || self.enum_types_by_name.contains_key(&key)
+            || self.composite_types_by_name.contains_key(&key)
+            || self.tables_by_name.contains_key(&key)
+        {
+            return Err(CatalogError::already_exists(entry.name));
+        }
+        if self.domain_types_by_oid.contains_key(&entry.oid)
+            || self.enum_types_by_oid.contains_key(&entry.oid)
+            || self.composite_types_by_oid.contains_key(&entry.oid)
+            || self.tables_by_oid.contains_key(&entry.oid)
+        {
+            return Err(CatalogError::already_exists(format!(
+                "oid {}",
+                entry.oid.raw()
+            )));
+        }
+        self.pg_type.insert(entry.oid, type_row_from_domain(&entry));
+        self.domain_types_by_name.insert(key, entry.clone());
+        self.domain_types_by_oid.insert(entry.oid, entry);
+        self.rebuild_snapshot();
+        Ok(())
+    }
+
+    /// Remove a domain type from the in-memory catalog snapshot.
+    pub fn drop_domain_type(&self, name: &str) -> Result<(), CatalogError> {
+        let key = fold_name(name);
+        let _guard = self.write_lock.lock();
+        let removed = self
+            .domain_types_by_name
+            .remove(&key)
+            .ok_or_else(|| CatalogError::not_found(name.to_owned()))?
+            .1;
+        self.domain_types_by_oid.remove(&removed.oid);
+        self.pg_type.remove(&removed.oid);
+        self.rebuild_snapshot();
+        Ok(())
+    }
+
+    /// Append durable `pg_type` rows for one user domain type.
+    pub fn persist_domain_type_rows<L: PageLoader>(
+        &self,
+        entry: &DomainTypeEntry,
+        heap: &HeapAccess<L>,
+        xmin: ultrasql_core::Xid,
+        command_id: ultrasql_core::CommandId,
+    ) -> Result<(), CatalogError> {
+        use crate::encoding::encode_type_row;
+        use ultrasql_storage::heap::InsertOptions;
+
+        let pg_type_rel = RelationId::new(bootstrap::PG_TYPE_OID);
+        let wal = heap.wal_sink().map(|sink| sink.as_ref());
+        heap.insert(
+            pg_type_rel,
+            &encode_type_row(&type_row_from_domain(entry)),
+            InsertOptions {
+                xmin,
+                command_id,
+                wal,
+                fsm: None,
+                vm: None,
+            },
+        )
+        .map_err(|e| CatalogError::schema_conflict(format!("pg_type insert: {e}")))?;
+        Ok(())
     }
 
     /// Encode and write `entry` into persistent `pg_class` / `pg_index` rows.
@@ -1481,6 +2106,36 @@ impl PersistentCatalog {
             .iter()
             .map(|r| (*r.key(), r.value().clone()))
             .collect();
+        let enum_types: std::collections::HashMap<String, EnumTypeEntry> = self
+            .enum_types_by_name
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect();
+        let enum_types_by_oid: std::collections::HashMap<Oid, EnumTypeEntry> = self
+            .enum_types_by_oid
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
+        let composite_types: std::collections::HashMap<String, CompositeTypeEntry> = self
+            .composite_types_by_name
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect();
+        let composite_types_by_oid: std::collections::HashMap<Oid, CompositeTypeEntry> = self
+            .composite_types_by_oid
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
+        let domain_types: std::collections::HashMap<String, DomainTypeEntry> = self
+            .domain_types_by_name
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect();
+        let domain_types_by_oid: std::collections::HashMap<Oid, DomainTypeEntry> = self
+            .domain_types_by_oid
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
         let descriptions: std::collections::HashMap<(Oid, Oid, i32), DescriptionRow> = self
             .pg_description
             .iter()
@@ -1501,6 +2156,12 @@ impl PersistentCatalog {
             tables_by_oid,
             indexes,
             indexes_by_table,
+            enum_types,
+            enum_types_by_oid,
+            composite_types,
+            composite_types_by_oid,
+            domain_types,
+            domain_types_by_oid,
             descriptions,
             statistics,
             statistic_ext,
@@ -1624,6 +2285,103 @@ fn normalized_opclasses(entry: &IndexEntry) -> Vec<Option<String>> {
         vec![None; entry.columns.len()]
     } else {
         entry.opclasses.clone()
+    }
+}
+
+fn type_row_from_enum(entry: &EnumTypeEntry) -> TypeRow {
+    TypeRow {
+        oid: entry.oid,
+        typname: entry.name.clone(),
+        typnamespace: namespace_oid_for_schema(&entry.schema_name),
+        typtype: 'e',
+        typcategory: 'E',
+        typlen: -1,
+        typelem: 0,
+    }
+}
+
+fn type_row_from_composite(entry: &CompositeTypeEntry) -> TypeRow {
+    TypeRow {
+        oid: entry.oid,
+        typname: entry.name.clone(),
+        typnamespace: namespace_oid_for_schema(&entry.schema_name),
+        typtype: 'c',
+        typcategory: 'C',
+        typlen: -1,
+        typelem: 0,
+    }
+}
+
+fn type_row_from_domain(entry: &DomainTypeEntry) -> TypeRow {
+    TypeRow {
+        oid: entry.oid,
+        typname: entry.name.clone(),
+        typnamespace: namespace_oid_for_schema(&entry.schema_name),
+        typtype: 'd',
+        typcategory: type_category_for(&entry.base_type),
+        typlen: entry
+            .base_type
+            .fixed_size()
+            .and_then(|len| i16::try_from(len).ok())
+            .unwrap_or(-1),
+        typelem: 0,
+    }
+}
+
+fn type_category_for(ty: &DataType) -> char {
+    match ty {
+        DataType::Bool => 'B',
+        DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal { .. }
+        | DataType::Money => 'N',
+        DataType::Text { .. } | DataType::Char { .. } => 'S',
+        DataType::Bit { .. } | DataType::VarBit { .. } => 'V',
+        DataType::Date
+        | DataType::Time
+        | DataType::TimeTz
+        | DataType::Timestamp
+        | DataType::TimestampTz
+        | DataType::Interval => 'D',
+        DataType::Array(_) => 'A',
+        DataType::Enum { .. } => 'E',
+        DataType::Composite { .. } | DataType::Record(_) => 'C',
+        DataType::Domain { base_type, .. } => type_category_for(base_type),
+        _ => 'U',
+    }
+}
+
+fn class_row_from_composite(entry: &CompositeTypeEntry) -> ClassRow {
+    ClassRow {
+        oid: entry.oid,
+        relname: entry.name.clone(),
+        relnamespace: namespace_oid_for_schema(&entry.schema_name),
+        relkind: RelKind::CompositeType,
+        relpages: 0,
+        reltuples: 0.0,
+        relfilenode: 0,
+        relhasindex: false,
+        reloptions: Vec::new(),
+    }
+}
+
+fn enum_row_from_label(enumtypid: Oid, label: &EnumLabelEntry) -> EnumRow {
+    EnumRow {
+        oid: label.oid,
+        enumtypid,
+        enumsortorder: label.sort_order,
+        enumlabel: label.label.clone(),
+    }
+}
+
+fn namespace_oid_for_schema(schema_name: &str) -> Oid {
+    if schema_name == "pg_catalog" {
+        Oid::new(bootstrap::PG_CATALOG_OID)
+    } else {
+        Oid::new(bootstrap::PUBLIC_OID)
     }
 }
 
@@ -2015,7 +2773,7 @@ mod tests {
     }
 
     /// `bootstrap_from_heap` on a fresh database (empty heap) installs the
-    /// initial snapshot that contains the 11 system relations.
+    /// initial snapshot that contains the 13 system relations.
     #[test]
     fn bootstrap_from_empty_heap_installs_initial_snapshot() {
         let cat = PersistentCatalog::new();
@@ -2026,14 +2784,16 @@ mod tests {
 
         // Stats reflect the initial snapshot counts.
         assert_eq!(stats.namespaces, 3);
-        assert_eq!(stats.relations, 11);
+        assert_eq!(stats.relations, 13);
 
-        // The snapshot contains all 11 system relations.
+        // The snapshot contains all 13 system relations.
         let snap = cat.snapshot();
-        assert_eq!(snap.tables.len(), 11);
+        assert_eq!(snap.tables.len(), 13);
         assert!(snap.tables.contains_key("pg_class"));
         assert!(snap.tables.contains_key("pg_attribute"));
         assert!(snap.tables.contains_key("pg_attrdef"));
+        assert!(snap.tables.contains_key("pg_type"));
+        assert!(snap.tables.contains_key("pg_enum"));
         assert!(snap.tables.contains_key("pg_namespace"));
     }
 
@@ -2048,18 +2808,18 @@ mod tests {
 
         // Capture snapshot before any mutation.
         let snap_before = cat.snapshot();
-        assert_eq!(snap_before.tables.len(), 11);
+        assert_eq!(snap_before.tables.len(), 13);
 
         // Add a table — this swaps in a new snapshot.
         cat.create_table(make_table(&cat, "user_orders"))
             .expect("create");
 
         // The old snapshot reference is still valid and unchanged.
-        assert_eq!(snap_before.tables.len(), 11);
+        assert_eq!(snap_before.tables.len(), 13);
 
         // A fresh snapshot call reflects the new state.
         let snap_after = cat.snapshot();
-        assert_eq!(snap_after.tables.len(), 12);
+        assert_eq!(snap_after.tables.len(), 14);
     }
 
     /// N threads each take a snapshot concurrently; all must see the same
@@ -2089,7 +2849,7 @@ mod tests {
         // Every thread must see the same count.
         let first = counts[0];
         assert!(counts.iter().all(|&c| c == first));
-        assert_eq!(first, 11);
+        assert_eq!(first, 13);
     }
 
     /// After installing a new snapshot via `install_snapshot`, the very next
@@ -2100,9 +2860,9 @@ mod tests {
         let heap = blank_heap();
         cat.bootstrap_from_heap(&heap).expect("bootstrap");
 
-        // Snapshot A: 11 system tables.
+        // Snapshot A: 13 system tables.
         let snap_a = cat.snapshot();
-        assert_eq!(snap_a.tables.len(), 11);
+        assert_eq!(snap_a.tables.len(), 13);
 
         // Build a richer snapshot with an additional table.
         let mut tables = snap_a.tables.clone();
@@ -2115,6 +2875,12 @@ mod tests {
             tables_by_oid,
             indexes: snap_a.indexes.clone(),
             indexes_by_table: snap_a.indexes_by_table.clone(),
+            enum_types: snap_a.enum_types.clone(),
+            enum_types_by_oid: snap_a.enum_types_by_oid.clone(),
+            composite_types: snap_a.composite_types.clone(),
+            composite_types_by_oid: snap_a.composite_types_by_oid.clone(),
+            domain_types: snap_a.domain_types.clone(),
+            domain_types_by_oid: snap_a.domain_types_by_oid.clone(),
             descriptions: snap_a.descriptions.clone(),
             statistics: snap_a.statistics.clone(),
             statistic_ext: snap_a.statistic_ext.clone(),
@@ -2123,7 +2889,7 @@ mod tests {
 
         // Snapshot B must be visible immediately.
         let snap_after = cat.snapshot();
-        assert_eq!(snap_after.tables.len(), 12);
+        assert_eq!(snap_after.tables.len(), 14);
         assert!(snap_after.tables.contains_key("extra_table"));
     }
 

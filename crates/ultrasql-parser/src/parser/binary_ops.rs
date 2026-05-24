@@ -53,6 +53,8 @@ impl<'src> Parser<'src> {
             TokenKind::Hash => BinaryOp::BitXor,
             TokenKind::ShiftLeft => BinaryOp::ShiftLeft,
             TokenKind::ShiftRight => BinaryOp::ShiftRight,
+            TokenKind::ShiftLeftEq => BinaryOp::NetworkContainedEq,
+            TokenKind::ShiftRightEq => BinaryOp::NetworkContainsEq,
             // JSON operators.
             TokenKind::Arrow => BinaryOp::JsonGet,
             TokenKind::ArrowDouble => BinaryOp::JsonGetText,

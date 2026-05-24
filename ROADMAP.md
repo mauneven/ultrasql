@@ -50,12 +50,14 @@ PR description.
 ### Test Coverage Gate: ≥ 80% line coverage per crate
 
 Release target is at least **80% line coverage** per crate measured by
-`cargo llvm-cov --workspace`. Current committed automation is not yet
-equivalent to this target: CI runs format, lint, tests, docs, and
-dependency audit gates, but no committed `llvm-cov` PR/pre-push
-threshold gate exists yet. A version must not claim this gate satisfied
-until coverage automation and artifacts prove every crate meets the
-threshold.
+`cargo llvm-cov --workspace`. The coverage workflow now runs
+`cargo llvm-cov --workspace --all-features`, emits raw JSON, LCOV,
+Markdown, and machine-readable per-crate summaries, then runs
+`scripts/coverage_gate.py --min-lines 80` as the authoritative gate.
+Current local evidence is recorded in
+`docs/testing/coverage-evidence-2026-05-24.md`: 9 of 19 crates pass,
+10 are below threshold. A version must not claim this gate satisfied
+until every crate clears 80%.
 
 Coverage layers required per subsystem:
 
@@ -286,6 +288,12 @@ real wire protocol.
    server drops. `server_init_retains_wal_writer_and_flushes_on_drop`
    covers the runtime bridge by appending through the server-owned WAL
    sink and recovering the flushed record from `data_dir/pg_wal`.
+   Before opening catalog, WAL, heap, two-phase, or logical metadata,
+   `Server::init(data_dir)` now rejects a symlinked data directory,
+   stores the canonical data-dir path, and on Unix refuses directories
+   not owned by the effective UID. `server_init_refuses_symlinked_data_dir`,
+   `server_init_stores_canonical_data_dir`, and
+   `data_dir_owner_check_rejects_unexpected_uid` cover the guard.
 2. **Shape specialisation.** `FusedUpdateInt32Add`,
    `FusedDeleteInt32Pair`, `write_int32_pair_data_rows`, and the
    in-place undo path all match exactly the `(Int32, Int32) col
@@ -830,7 +838,7 @@ driver can connect.
 - [x] `NoticeResponse` (warnings, hints, info messages) — `notice_warning(sqlstate, msg)` helper in `server/lib.rs` wraps `BackendMessage::NoticeResponse`; emitted from txn-control paths (nested BEGIN, COMMIT/ROLLBACK outside a tx, SET TRANSACTION outside a tx) and covered by in-crate tests in `src/tests/txn.rs`
 - [x] `LISTEN/NOTIFY/UNLISTEN` end-to-end — `notify.rs` `NotifyHub` shared across sessions, parser/binder/planner produce `LogicalPlan::Listen/Notify/Unlisten`, server `session/notify.rs` dispatches against the hub, and the run-loop races socket reads with `mpsc::UnboundedReceiver::recv` so idle sessions surface `NotificationResponse` immediately (covered by `crates/ultrasql-server/tests/listen_notify_round_trip.rs`)
 - [x] All expected `ParameterStatus` params — `session/startup.rs` now sends the full thirteen PostgreSQL emits: `server_version`, `server_encoding`, `client_encoding`, `DateStyle`, `IntervalStyle`, `TimeZone`, `integer_datetimes`, `standard_conforming_strings`, `extra_float_digits`, `application_name`, `is_superuser`, `session_authorization`, `in_hot_standby`
-- [x] Per-connection slow-loris timeout — `handle_connection` wraps `Session::startup` in `tokio::time::timeout(30s)`. A peer that opens TCP and sits silently is dropped after 30 s without consuming a session worker indefinitely
+- [x] Per-connection slow-loris timeout — `handle_connection` wraps `Session::startup` in `tokio::time::timeout(30s)`. After startup, `Session::run` applies configurable `Server::idle_session_timeout_ms` to idle frontend reads (`0` disables, `--idle-session-timeout-ms` wires production config). A peer that completes startup and then sits idle is dropped without consuming a session worker indefinitely; covered by `idle_session_timeout_round_trip.rs`.
 
 ### Wire-protocol benchmarks (`cross_compare_sql`)
 - [x] In-process `ultrasqld` driven via `tokio-postgres` for honest end-to-end measurement
@@ -1003,7 +1011,7 @@ tracked repository root.
 - [x] Parser: `expr [NOT] IN (SELECT …) AND …` — IN result feeds back into the Pratt loop instead of returning early; trailing booleans no longer dropped. Unblocks Q20 at parse stage.
 - [x] Binder: `DATE 'YYYY-MM-DD'` → `Value::Date(days)` via self-contained Howard-Hinnant `civil_from_days` (no chrono dep). 6-test suite in `binder::expr_bind::typed_literal_tests`.
 - [x] `Value::Decimal { value: i64, scale: i32 }` + `Value::Interval { months, days, microseconds }` added to [`ultrasql-core/src/value.rs`](crates/ultrasql-core/src/value.rs). All exhaustive match sites updated (value_ord, hash_aggregate, hash_join, set_op, unique, copy).
-- [x] Row codec ([`crates/ultrasql-executor/src/row_codec.rs`](crates/ultrasql-executor/src/row_codec.rs)) encodes/decodes `DataType::Date` (4-byte i32 LE), `DataType::Decimal { .. }` (8-byte scaled i64 LE), `DataType::Timestamp` / `DataType::TimestampTz` / `DataType::Time` (8-byte i64 micros LE). Decimal scale is read from the schema field.
+- [x] Row codec ([`crates/ultrasql-executor/src/row_codec.rs`](crates/ultrasql-executor/src/row_codec.rs)) encodes/decodes `DataType::Date` (4-byte i32 LE), `DataType::Decimal { .. }` (PostgreSQL-style varlena numeric payload: `ndigits`, `weight`, `sign`, `dscale`, base-10000 digit groups), `DataType::Timestamp` / `DataType::TimestampTz` / `DataType::Time` (8-byte i64 micros LE). Decimal scale is read from the stored numeric payload.
 - [x] `SeqScan::rows_to_columns` + `filter_op::batch_to_rows` handle Date / Decimal / Timestamp / TimestampTz / Time columns end-to-end. Column-builder pool uses Int32 backing for Date and Int64 backing for the wider temporal/decimal types; row materialiser re-tags the value with the correct `Value` variant on extraction.
 - [x] `CREATE TABLE` accepts `DATE` / `TIME` / `TIMESTAMP` / `TIMESTAMPTZ` / `DECIMAL(p, s)` / `NUMERIC(p, s)` columns. All eight TPC-H DDLs succeed. End-to-end coverage: [`crates/ultrasql-server/tests/date_column_round_trip.rs`](crates/ultrasql-server/tests/date_column_round_trip.rs) (4 tests: `create_table_with_date_column`, `insert_date_literal_and_scan`, `accepts_decimal_column`, `accepts_timestamp_column`).
 
@@ -1043,6 +1051,21 @@ tracked repository root.
   Decimal, Decimal literals are not folded through binary float, and
   Decimal-vs-Float arithmetic returns Float64. This fixed Q6, Q11, and
   Q17 correctness.
+- [x] NUMERIC/DECIMAL task-7 surface — shared decimal parser rounds text
+  and COPY input to declared scale, text literal casts to bare `numeric`
+  preserve literal scale, decimal division rounds to result scale, Extended
+  Query uses PostgreSQL `numeric` OID 1700 and base-10000 binary payloads
+  for numeric params/results, and binary COPY decodes/encodes the same
+  numeric payloads. Coverage: `numeric_round_trip.rs`,
+  `copy_round_trip.rs`, planner literal-cast tests, executor arithmetic
+  tests, and codec unit tests.
+- [x] MONEY task-8 surface — `DataType::Money` / `Value::Money(i64)`
+  store PostgreSQL `cash`-style signed cents, planner accepts `MONEY`
+  DDL and text casts, result metadata advertises OID 790 / size 8,
+  Extended Query binary/text and COPY text/binary round-trip with
+  PostgreSQL big-endian i64 money payloads, and catalog persistence can
+  restart MONEY tables. Coverage: `money_round_trip.rs`,
+  `copy_round_trip.rs`, planner/core/executor/server codec tests.
 - [x] `COUNT(DISTINCT expr)` in `HashAggregate` — distinct aggregate state
   tracks per-group seen values before updating the wrapped aggregate. This
   fixed Q16.
@@ -1772,7 +1795,7 @@ behavior are implemented and validated.
 - [x] CSV format (`FORMAT csv`, `DELIMITER`, `HEADER`, `NULL`) — custom `QUOTE` / `ESCAPE` options pending
 - [x] `COPY (SELECT ...) TO STDOUT` — parser/binder/session path copies query results to STDOUT or server-side file in text/CSV format
 - [ ] `COPY t FROM 'file'` / `COPY t TO 'file'` (server-side, superuser only) — server-side file import/export supported; privilege model pending role system
-- [x] Binary COPY format — table COPY FROM/TO supports PostgreSQL binary header/rows/trailer for core scalar types; query-target binary copy remains pending
+- [x] Binary COPY format — table COPY FROM/TO supports PostgreSQL binary header/rows/trailer for core scalar types, including PostgreSQL base-10000 numeric payloads; query-target binary copy remains pending
 - [x] LISTEN/NOTIFY/UNLISTEN end-to-end — `NotifyHub` shared across sessions; parser/binder/planner produce `LogicalPlan::Listen/Notify/Unlisten`; `session/notify.rs` dispatches against the hub; `BackendMessage::NotificationResponse` (tag `'A'`) plumbed through `ultrasql-protocol`; idle sessions push notifications immediately via a `tokio::select!` between `read_buf` and `notify_rx.recv` so listeners receive them without waiting for the next `Sync` round (`crates/ultrasql-server/tests/listen_notify_round_trip.rs`)
 
 ### External Tools
@@ -1812,26 +1835,47 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [x] `REAL/FLOAT4`, `DOUBLE PRECISION/FLOAT8` — parser, binder, row
   codec, executor, PostgreSQL wire OIDs, and wire round-trip coverage exist
   (`core_type_surface_round_trip.rs`).
-- [ ] `NUMERIC(p,s)` / `DECIMAL(p,s)` — scaled `DECIMAL(p,s)` storage and
-  TPC-H-style arithmetic exist; PostgreSQL-grade arbitrary precision remains
-  open and is critical for finance.
-- [ ] `MONEY`
+- [ ] `NUMERIC(p,s)` / `DECIMAL(p,s)` — parser, binder, PostgreSQL-style
+  base-10000 row/COPY/wire payloads, exact scaled-`i64` arithmetic with
+  scale rounding, text casts, and PostgreSQL wire OID coverage exist.
+  Remaining: PostgreSQL-grade arbitrary-precision runtime arithmetic,
+  precision enforcement, and variable-scale columnar bare-`NUMERIC`
+  result preservation.
+- [ ] `MONEY` full compatibility — type surface, signed-cent storage,
+  OID 790, wire, COPY, catalog persistence, and compatibility tests
+  exist. Remaining: `lc_monetary` locale-sensitive formatting/input,
+  PostgreSQL's full money arithmetic/operator/cast matrix, and range
+  parity beyond the current i64-cent runtime.
 - [x] `VARCHAR(n)`, `TEXT`, `BYTEA` — parser, binder, row codec,
   executor, PostgreSQL wire OIDs, COPY/BYTEA coverage, and core wire
   round-trip coverage exist (`core_type_surface_round_trip.rs`,
   `bytea_round_trip.rs`).
-- [ ] `CHAR(n)` — accepted as bounded text today; PostgreSQL `bpchar`
-  blank-padding/comparison semantics remain open.
+- [x] `CHAR(n)` / `bpchar` — parser, binder, row codec, executor,
+  PostgreSQL wire OID 1042, COPY, catalog persistence, blank-padding,
+  assignment/cast truncation, and trailing-space comparison semantics
+  are covered by `bpchar_round_trip.rs` plus core/planner/executor tests.
 - [ ] `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, `INTERVAL` —
-  `DATE`, `TIME`, `TIMESTAMP`, `TIMESTAMPTZ`, and `INTERVAL` runtime
-  types exist with targeted coverage; `TIMETZ` and full PostgreSQL
-  timezone/display coercions remain open.
+  `DATE`, `TIME`, `TIMETZ`, `TIMESTAMP`, `TIMESTAMPTZ`, and `INTERVAL`
+  runtime types exist with targeted coverage. `TIMETZ` now has parser,
+  binder, row codec, executor, COPY, catalog persistence, PostgreSQL wire
+  OID 1266, ISO display, text cast/coercion, and UTC-offset comparison
+  coverage in `timetz_round_trip.rs` plus core/planner tests. Remaining:
+  named time-zone databases and broader locale/DateStyle variants.
 - [x] `BOOLEAN` — parser, binder, row codec, executor, PostgreSQL wire OID,
   partial-index/index coverage, COPY coverage, and core wire round-trip
   coverage exist.
 - [x] `UUID` + `gen_random_uuid()`
-- [ ] `BIT(n)` / `BIT VARYING(n)`
-- [ ] `INET`, `CIDR`, `MACADDR`, `MACADDR8`
+- [x] `BIT(n)` / `BIT VARYING(n)` — parser, binder, packed runtime
+  storage, row codec/catalog persistence, bitwise ops/shifts, length/get/set
+  functions, PostgreSQL wire OIDs 1560/1562, COPY text/binary encoding hooks,
+  and end-to-end storage/operator/wire/COPY coverage exist in
+  `bit_varbit_round_trip.rs` plus focused core/catalog tests.
+- [x] `INET`, `CIDR`, `MACADDR`, `MACADDR8` — parser, binder,
+  runtime payloads, row codec/catalog persistence, containment/overlap,
+  comparison, IP arithmetic, MAC/IP bitwise operators, PostgreSQL wire
+  OIDs 869/650/829/774, COPY text/binary hooks, and end-to-end
+  storage/operator/wire/COPY coverage exist in `network_types_round_trip.rs`
+  plus focused core/extended-codec tests.
 - [x] `POINT`, `LINE`, `LSEG`, `BOX`, `PATH`, `POLYGON`, `CIRCLE` —
   geometric SQL types, parser/binder/runtime values, overlap operators, and
   GiST exclusion coverage exist; full PostgreSQL geometric function catalog
@@ -1839,25 +1883,40 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [ ] `JSON`, `JSONB` — critical for modern apps. Native JSONB
   runtime values, row-codec storage, `CREATE TABLE ... JSON/JSONB`,
   JSONB wire OID, COPY rendering, and JSONB operator evaluation are
-  implemented. Distinct JSON-vs-JSONB storage, JSON normalization, and
-  the full JSON function suite remain open.
+  implemented. JSON now has distinct runtime/catalog/wire identity,
+  validates while preserving accepted text, and JSONB normalizes on
+  planner, row-codec, COPY, and extended-param paths with regression
+  coverage in `json_jsonb_normalization_round_trip.rs`. Full JSON
+  function/path parity remains open.
 - [ ] `int[]`, `text[]`, any type as array. Native array runtime
-  values, catalog/row-codec storage, `CREATE TABLE ... []`, GIN-facing
-  operators, `array_agg`, `array_length`, `array_cat`,
-  `array_to_string`, `string_to_array`, and wire-visible
-  `unnest(...)` are implemented for currently supported element
-  families. Multi-dimensional arrays, full PostgreSQL coercions, and
-  every element type remain open.
+  values, catalog/row-codec storage, `CREATE TABLE ... []`/`[][]`,
+  rectangular multi-dimensional runtime/text round trips, GIN-facing
+  operators, `array_agg`, dimension-aware `array_length`, `array_cat`,
+  `array_to_string`, `string_to_array`, wire-visible `unnest(...)`,
+  PostgreSQL array OIDs for supported scalar families, and numeric/textlike
+  literal/assignment coercions are implemented for currently supported
+  element families. Full PostgreSQL coercion parity and every element
+  type remain open.
 - [x] `int4range`, `int8range`, `numrange`, `tsrange`, `tstzrange`,
   `daterange` — range SQL types, runtime values, overlap/contains
   operators, and GiST exclusion coverage exist; full PostgreSQL range
   function catalog remains tracked separately.
-- [ ] `CREATE TYPE ... AS ENUM (...)`
-- [ ] `CREATE TYPE ... AS (composite)`
-- [ ] `CREATE DOMAIN`
+- [x] `CREATE TYPE ... AS ENUM (...)` — parser/planner DDL, durable `pg_type`/`pg_enum`, enum-backed column storage validation, restart round-trip, and RowDescription type OID coverage.
+- [x] `CREATE TYPE ... AS (composite)` — parser/planner DDL, durable `pg_type`/`pg_class`/`pg_attribute`, named composite lookup for table columns, text-backed composite value storage with arity validation, restart round-trip, and RowDescription type OID coverage.
+- [x] `CREATE DOMAIN` — parser/planner DDL, durable domain `pg_type`
+  identity, restart-persisted base type / NOT NULL / CHECK metadata,
+  domain-backed table columns with base-type storage/coercion, CHECK
+  rewrite from `VALUE` to row constraints, and RowDescription domain OID
+  coverage.
 - [ ] `TSVECTOR`, `TSQUERY` (full-text search)
-- [ ] `OID`, `REGCLASS`, `REGTYPE`, `PG_LSN`
-- [ ] `XML` (basic storage)
+- [x] `OID`, `REGCLASS`, `REGTYPE`, `PG_LSN` — parser/binder type
+  surface, durable catalog persistence, row codec storage, executor
+  materialisation/comparison/hash-key support, PostgreSQL wire OIDs
+  26/2205/2206/3220, text/binary extended codec hooks, COPY text
+  parsing/rendering, catalog lookup casts for `regclass`/`regtype`,
+  and restart round-trip coverage exist in
+  `oid_alias_types_round_trip.rs`.
+- [x] `XML` (basic storage) - validated text storage, PostgreSQL OID 142 wire rendering, COPY, restart round-trip
 
 ### Built-in Functions Completeness
 - [x] Mathematical: abs, ceil, floor, round, trunc, mod, power, sqrt, exp, ln, log, random, common trig functions, pi()
@@ -1887,14 +1946,21 @@ Every standard PostgreSQL driver and ORM works without modification.
 - [x] JSON table function: `json_each(jsonb)` expands object and array
   values into `(key text, value jsonb)` rows through the PostgreSQL wire path.
 - [x] JSON path table function: `jsonb_path_query(jsonb, text)` supports
-  basic `$.key`, `[*]`, and `[N]` paths through the PostgreSQL wire path.
-- [x] JSON row constructor scalar: `row_to_json(ROW(...))` serializes row
-  constructor values to JSONB with PostgreSQL-style `f1`, `f2`, ... keys.
-- [ ] JSON remaining: `row_to_json(table_alias)` whole-row references and
-  full SQL/JSON path parity.
+  basic `$.key`, `[*]`, `[N]`, quoted-key, recursive-descent, and predicate
+  filter paths through the PostgreSQL wire path.
+- [x] JSON row scalar: `row_to_json(ROW(...))` and `row_to_json(table_alias)`
+  serialize row constructor and whole-row alias values to JSONB.
+- [x] JSON path scalar: `jsonb_path_exists(jsonb, text)` evaluates the same
+  SQL/JSON path subset as `jsonb_path_query`.
+- [x] JSON_TABLE path evaluation uses the shared SQL/JSON path subset for
+  row, value, and EXISTS column paths.
+- [ ] JSON remaining: full SQL/JSON path parity beyond the supported subset
+  (strict/lax modes, variables, methods, and full predicate algebra).
 - [x] Array: array_length, array_cat, unnest, array_agg,
   array_to_string, string_to_array — implemented for native arrays
-  over the current supported scalar element set.
+  over the current supported scalar element set. `array_length` now reads
+  rectangular multi-dimensional extents; `array_to_string` and `unnest`
+  flatten multi-dimensional arrays in row-major order.
 - [x] System: version(), current_database(), current_user/session_user
   (function-call and bare keyword forms), pg_typeof(), pg_size_pretty()
   and catalog-backed pg_relation_size() are wired.
@@ -2250,6 +2316,10 @@ items that block contributor velocity if neglected.
   strict docs, advisory audit when `cargo-deny` is installed,
   `regression-gate --smoke` for source diffs, and optional parser fuzz
   smoke when nightly + `cargo-fuzz` exist. Push is blocked on failure.
+- [x] CI/release security gates run direct `cargo audit --deny yanked`
+  plus full `cargo-deny`; the 2026-05-24 security-audit refresh records
+  the current clean vulnerability/yanked result and the allowed
+  `RUSTSEC-2024-0436` unmaintained-warning path through latest Parquet.
 - [ ] Workspace `cargo nextest` integration once `nextest`'s output integrates with the pre-push gate.
 - [ ] `sccache` for cross-machine compilation cache (contributor onboarding aid).
 

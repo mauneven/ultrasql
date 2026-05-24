@@ -31,6 +31,7 @@ use ultrasql_txn::{IsolationLevel, Transaction, TransactionManager};
 
 use super::Session;
 use super::notify::ReadOrNotify;
+use super::timeout::StatementTimeoutGuard;
 use crate::error::ServerError;
 use crate::extended;
 use crate::pipeline::{self, LowerCtx, SampleTables};
@@ -73,7 +74,29 @@ where
             //   dropped read future.
             // - `mpsc::UnboundedReceiver::poll_recv` only consumes a
             //   record when it returns `Poll::Ready(Some(_))`.
-            let msg = match self.read_frontend_or_notify().await? {
+            let idle_timeout_ms = self.state.idle_session_timeout_ms();
+            let read_outcome = if idle_timeout_ms == 0 {
+                self.read_frontend_or_notify().await?
+            } else {
+                match tokio::time::timeout(
+                    Duration::from_millis(idle_timeout_ms),
+                    self.read_frontend_or_notify(),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome?,
+                    Err(_) => {
+                        debug!(
+                            target: "ultrasqld",
+                            pid = self.pid,
+                            idle_timeout_ms,
+                            "idle session timeout; closing connection"
+                        );
+                        return Ok(());
+                    }
+                }
+            };
+            let msg = match read_outcome {
                 ReadOrNotify::Frontend(m) => m,
                 ReadOrNotify::Eof => return Ok(()),
                 ReadOrNotify::Notification(record) => {
@@ -209,7 +232,10 @@ where
         }
 
         let started = Instant::now();
+        let timeout_guard =
+            StatementTimeoutGuard::arm(self.statement_timeout_ms, self.cancel_flag.clone());
         let outcome = self.execute_query(trimmed);
+        drop(timeout_guard);
         let elapsed = started.elapsed();
         let rows = outcome.as_ref().map_or(0, |result| result.rows);
         let error = outcome.as_ref().err().map(ToString::to_string);

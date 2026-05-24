@@ -82,6 +82,10 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = CliLogStatementMode::None)]
     log_statement: CliLogStatementMode,
 
+    /// Close idle sessions after this many milliseconds; 0 disables.
+    #[arg(long, default_value_t = 0)]
+    idle_session_timeout_ms: u64,
+
     /// Background autovacuum/analyze maintenance interval in milliseconds.
     #[arg(long, default_value_t = 1000)]
     autovacuum_interval_ms: u64,
@@ -173,6 +177,7 @@ Production-oriented v0.9 flags:
   - --log-format json   emit structured logs
   - --log-min-duration-statement-ms N
   - --log-statement none|ddl|mod|all
+  - --idle-session-timeout-ms N
   - --archive-command CMD  archive completed WAL files; %p=path, %f=name
   - --restore-command CMD  restore archived WAL before recovery; %p=path, %f=name
 ";
@@ -235,6 +240,7 @@ fn main() -> std::process::ExitCode {
                 Ok(mut server) => {
                     server.set_autovacuum_config(autovacuum_config);
                     server.set_logging_config(logging_config);
+                    server.set_idle_session_timeout_ms(cli.idle_session_timeout_ms);
                     server.set_wal_archive_config(wal_archive_config.clone());
                     Arc::new(server)
                 }
@@ -248,6 +254,7 @@ fn main() -> std::process::ExitCode {
             let mut server = Server::with_sample_database();
             server.set_autovacuum_config(autovacuum_config);
             server.set_logging_config(logging_config);
+            server.set_idle_session_timeout_ms(cli.idle_session_timeout_ms);
             server.set_wal_archive_config(wal_archive_config);
             Arc::new(server)
         }
@@ -812,6 +819,7 @@ mod tests {
             log_connections: false,
             log_min_duration_statement_ms: -1,
             log_statement: CliLogStatementMode::None,
+            idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             autovacuum_vacuum_threshold: 7,
             autovacuum_vacuum_scale_factor: 0.25,
@@ -842,6 +850,7 @@ mod tests {
             log_connections: false,
             log_min_duration_statement_ms: -1,
             log_statement: CliLogStatementMode::None,
+            idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: f64::NAN,
@@ -867,6 +876,7 @@ mod tests {
             log_connections: false,
             log_min_duration_statement_ms: -2,
             log_statement: CliLogStatementMode::Mod,
+            idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,
@@ -892,6 +902,7 @@ mod tests {
             log_connections: true,
             log_min_duration_statement_ms: 25,
             log_statement: CliLogStatementMode::All,
+            idle_session_timeout_ms: 0,
             autovacuum_interval_ms: 1000,
             autovacuum_vacuum_threshold: 50,
             autovacuum_vacuum_scale_factor: 0.2,

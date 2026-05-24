@@ -612,6 +612,8 @@ impl<'src> Lexer<'src> {
             (b'<', Some(b'#'), Some(b'>')) => three(self, TokenKind::VectorNegativeInnerProduct),
             (b'<', Some(b'='), Some(b'>')) => three(self, TokenKind::VectorCosineDistance),
             (b'<', Some(b'+'), Some(b'>')) => three(self, TokenKind::VectorL1Distance),
+            (b'<', Some(b'<'), Some(b'=')) => three(self, TokenKind::ShiftLeftEq),
+            (b'>', Some(b'>'), Some(b'=')) => three(self, TokenKind::ShiftRightEq),
 
             // 2-byte operators.
             (b'<', Some(b'<'), _) => two(self, TokenKind::ShiftLeft),

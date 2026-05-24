@@ -14,7 +14,37 @@
 
 use std::collections::HashMap;
 
-use ultrasql_core::Schema;
+use ultrasql_core::{DataType, Oid, Schema};
+
+const PG_OID_BOOL: u32 = 16;
+const PG_OID_BYTEA: u32 = 17;
+const PG_OID_INT8: u32 = 20;
+const PG_OID_INT2: u32 = 21;
+const PG_OID_INT4: u32 = 23;
+const PG_OID_TEXT: u32 = 25;
+const PG_OID_OID: u32 = 26;
+const PG_OID_CIDR: u32 = 650;
+const PG_OID_FLOAT4: u32 = 700;
+const PG_OID_FLOAT8: u32 = 701;
+const PG_OID_MACADDR8: u32 = 774;
+const PG_OID_MONEY: u32 = 790;
+const PG_OID_MACADDR: u32 = 829;
+const PG_OID_INET: u32 = 869;
+const PG_OID_BPCHAR: u32 = 1042;
+const PG_OID_VARCHAR: u32 = 1043;
+const PG_OID_DATE: u32 = 1082;
+const PG_OID_TIME: u32 = 1083;
+const PG_OID_TIMESTAMP: u32 = 1114;
+const PG_OID_TIMESTAMPTZ: u32 = 1184;
+const PG_OID_TIMETZ: u32 = 1266;
+const PG_OID_NUMERIC: u32 = 1700;
+const PG_OID_REGCLASS: u32 = 2205;
+const PG_OID_REGTYPE: u32 = 2206;
+const PG_OID_UUID: u32 = 2950;
+const PG_OID_PG_LSN: u32 = 3220;
+const PG_OID_JSON: u32 = 114;
+const PG_OID_JSONB: u32 = 3802;
+const PG_OID_XML: u32 = 142;
 
 /// Metadata about a single table, sufficient for binding.
 ///
@@ -47,6 +77,28 @@ pub trait Catalog: Send + Sync {
     ///
     /// Returns `None` if no table by that name is registered.
     fn lookup_table(&self, name: &str) -> Option<TableMeta>;
+
+    /// Resolve a user-defined type by its case-folded SQL name.
+    ///
+    /// Built-in types are resolved directly by the binder; catalog
+    /// implementations only need to return user-defined type metadata such as
+    /// enum OIDs and labels. The default keeps existing lightweight catalogs
+    /// valid when they do not model custom types.
+    fn lookup_type(&self, name: &str) -> Option<DataType> {
+        let _ = name;
+        None
+    }
+
+    /// Resolve a relation name to its catalog OID.
+    fn lookup_table_oid(&self, name: &str) -> Option<Oid> {
+        let _ = name;
+        None
+    }
+
+    /// Resolve a type name to its `pg_type.oid`.
+    fn lookup_type_oid(&self, name: &str) -> Option<Oid> {
+        builtin_type_oid(name)
+    }
 }
 
 /// Simple hash-map catalog used by tests and by callers that do not
@@ -59,6 +111,7 @@ pub trait Catalog: Send + Sync {
 #[derive(Clone, Debug, Default)]
 pub struct InMemoryCatalog {
     tables: HashMap<String, TableMeta>,
+    types: HashMap<String, DataType>,
 }
 
 impl InMemoryCatalog {
@@ -67,6 +120,7 @@ impl InMemoryCatalog {
     pub fn new() -> Self {
         Self {
             tables: HashMap::new(),
+            types: HashMap::new(),
         }
     }
 
@@ -75,11 +129,76 @@ impl InMemoryCatalog {
     pub fn register(&mut self, name: &str, meta: TableMeta) -> Option<TableMeta> {
         self.tables.insert(name.to_ascii_lowercase(), meta)
     }
+
+    /// Register a user-defined type. If a type with the same case-folded name
+    /// already exists, the previous entry is returned.
+    pub fn register_type(&mut self, name: &str, data_type: DataType) -> Option<DataType> {
+        self.types.insert(name.to_ascii_lowercase(), data_type)
+    }
 }
 
 impl Catalog for InMemoryCatalog {
     fn lookup_table(&self, name: &str) -> Option<TableMeta> {
         self.tables.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    fn lookup_type(&self, name: &str) -> Option<DataType> {
+        self.types.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    fn lookup_type_oid(&self, name: &str) -> Option<Oid> {
+        self.lookup_type(name)
+            .as_ref()
+            .and_then(type_oid_for_data_type)
+            .or_else(|| builtin_type_oid(name))
+    }
+}
+
+/// PostgreSQL-compatible OID for a built-in type name.
+#[must_use]
+pub fn builtin_type_oid(name: &str) -> Option<Oid> {
+    let folded = name.to_ascii_lowercase();
+    let raw = match folded.as_str() {
+        "bool" | "boolean" => PG_OID_BOOL,
+        "bytea" => PG_OID_BYTEA,
+        "bigint" | "int8" => PG_OID_INT8,
+        "smallint" | "int2" => PG_OID_INT2,
+        "int" | "integer" | "int4" => PG_OID_INT4,
+        "text" => PG_OID_TEXT,
+        "oid" => PG_OID_OID,
+        "cidr" => PG_OID_CIDR,
+        "real" | "float4" => PG_OID_FLOAT4,
+        "double" | "double precision" | "float" | "float8" => PG_OID_FLOAT8,
+        "macaddr8" => PG_OID_MACADDR8,
+        "money" => PG_OID_MONEY,
+        "macaddr" => PG_OID_MACADDR,
+        "inet" => PG_OID_INET,
+        "char" | "character" | "bpchar" => PG_OID_BPCHAR,
+        "varchar" | "character varying" => PG_OID_VARCHAR,
+        "date" => PG_OID_DATE,
+        "time" | "time without time zone" => PG_OID_TIME,
+        "timestamp" => PG_OID_TIMESTAMP,
+        "timestamptz" | "timestamp with time zone" => PG_OID_TIMESTAMPTZ,
+        "timetz" | "time with time zone" => PG_OID_TIMETZ,
+        "numeric" | "decimal" => PG_OID_NUMERIC,
+        "regclass" => PG_OID_REGCLASS,
+        "regtype" => PG_OID_REGTYPE,
+        "uuid" => PG_OID_UUID,
+        "pg_lsn" => PG_OID_PG_LSN,
+        "json" => PG_OID_JSON,
+        "jsonb" => PG_OID_JSONB,
+        "xml" => PG_OID_XML,
+        _ => return None,
+    };
+    Some(Oid::new(raw))
+}
+
+fn type_oid_for_data_type(data_type: &DataType) -> Option<Oid> {
+    match data_type {
+        DataType::Enum { oid, .. }
+        | DataType::Composite { oid, .. }
+        | DataType::Domain { oid, .. } => Some(*oid),
+        other => builtin_type_oid(&other.to_string()),
     }
 }
 
@@ -100,6 +219,40 @@ impl Catalog for ultrasql_catalog::CatalogSnapshot {
         self.tables
             .get(&name.to_ascii_lowercase())
             .map(|entry| TableMeta::new(entry.schema.clone()))
+    }
+
+    fn lookup_type(&self, name: &str) -> Option<DataType> {
+        let key = name.to_ascii_lowercase();
+        self.enum_types
+            .get(&key)
+            .map(ultrasql_catalog::EnumTypeEntry::data_type)
+            .or_else(|| {
+                self.composite_types
+                    .get(&key)
+                    .map(ultrasql_catalog::CompositeTypeEntry::data_type)
+            })
+            .or_else(|| {
+                self.domain_types
+                    .get(&key)
+                    .map(ultrasql_catalog::DomainTypeEntry::data_type)
+            })
+    }
+
+    fn lookup_table_oid(&self, name: &str) -> Option<Oid> {
+        self.tables
+            .get(&name.to_ascii_lowercase())
+            .map(|entry| entry.oid)
+    }
+
+    fn lookup_type_oid(&self, name: &str) -> Option<Oid> {
+        builtin_type_oid(name).or_else(|| {
+            let key = name.to_ascii_lowercase();
+            self.enum_types
+                .get(&key)
+                .map(|entry| entry.oid)
+                .or_else(|| self.composite_types.get(&key).map(|entry| entry.oid))
+                .or_else(|| self.domain_types.get(&key).map(|entry| entry.oid))
+        })
     }
 }
 

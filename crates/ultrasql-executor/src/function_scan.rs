@@ -16,7 +16,7 @@ use ultrasql_vec::Batch;
 use ultrasql_vec::column::{Column, NumericColumn};
 
 use crate::seq_scan::build_batch;
-use crate::{ExecError, Operator};
+use crate::{CancelFlag, ExecError, Operator};
 
 const BATCH_TARGET_ROWS: usize = 4096;
 
@@ -54,6 +54,7 @@ pub struct FunctionScan {
     current: i64,
     /// Current offset for `unnest`.
     position: usize,
+    cancel_flag: Option<CancelFlag>,
     eof: bool,
 }
 
@@ -71,6 +72,7 @@ impl FunctionScan {
             schema,
             current: start,
             position: 0,
+            cancel_flag: None,
             eof: step == 0, // zero step immediately exhausted
         }
     }
@@ -81,14 +83,43 @@ impl FunctionScan {
     /// array element type.
     #[must_use]
     pub fn unnest(element_type: DataType, elements: Vec<Value>) -> Self {
+        let output_type = array_base_type(&element_type).clone();
+        let mut flattened = Vec::with_capacity(elements.len());
+        flatten_array_elements(&elements, &mut flattened);
         let schema =
-            Schema::new([Field::required("unnest", element_type)]).expect("schema is well-formed");
+            Schema::new([Field::required("unnest", output_type)]).expect("schema is well-formed");
         Self {
-            kind: SrfKind::Unnest { elements },
+            kind: SrfKind::Unnest {
+                elements: flattened,
+            },
             schema,
             current: 0,
             position: 0,
+            cancel_flag: None,
             eof: false,
+        }
+    }
+
+    /// Attach a query-scoped cancel flag.
+    #[must_use]
+    pub fn with_cancel_flag(mut self, flag: CancelFlag) -> Self {
+        self.cancel_flag = Some(flag);
+        self
+    }
+}
+
+fn array_base_type(ty: &DataType) -> &DataType {
+    match ty {
+        DataType::Array(inner) => array_base_type(inner),
+        other => other,
+    }
+}
+
+fn flatten_array_elements(elements: &[Value], out: &mut Vec<Value>) {
+    for element in elements {
+        match element {
+            Value::Array { elements, .. } => flatten_array_elements(elements, out),
+            other => out.push(other.clone()),
         }
     }
 }
@@ -96,6 +127,11 @@ impl FunctionScan {
 impl Operator for FunctionScan {
     #[allow(clippy::similar_names)]
     fn next_batch(&mut self) -> Result<Option<Batch>, ExecError> {
+        if let Some(flag) = self.cancel_flag.as_ref()
+            && flag.is_set()
+        {
+            return Err(ExecError::Cancelled);
+        }
         if self.eof {
             return Ok(None);
         }
@@ -165,8 +201,8 @@ mod tests {
     use ultrasql_core::{DataType, Value};
 
     use super::FunctionScan;
-    use crate::Operator;
     use crate::filter_op::batch_to_rows;
+    use crate::{CancelFlag, ExecError, Operator};
 
     fn drain_i64(op: &mut dyn Operator) -> Vec<i64> {
         let schema = op.schema().clone();
@@ -210,6 +246,14 @@ mod tests {
     }
 
     #[test]
+    fn generate_series_observes_cancel_flag_before_batch() {
+        let flag = CancelFlag::new();
+        flag.cancel();
+        let mut op = FunctionScan::generate_series(1, 5, 1).with_cancel_flag(flag);
+        assert!(matches!(op.next_batch(), Err(ExecError::Cancelled)));
+    }
+
+    #[test]
     fn unnest_text_array_emits_values_in_order() {
         let mut op = FunctionScan::unnest(
             DataType::Text { max_len: None },
@@ -225,6 +269,38 @@ mod tests {
             vec![
                 vec![Value::Text("red".into())],
                 vec![Value::Text("green".into())]
+            ]
+        );
+    }
+
+    #[test]
+    fn unnest_multidimensional_array_flattens_values_in_order() {
+        let mut op = FunctionScan::unnest(
+            DataType::Array(Box::new(DataType::Int32)),
+            vec![
+                Value::Array {
+                    element_type: DataType::Int32,
+                    elements: vec![Value::Int32(1), Value::Int32(2)],
+                },
+                Value::Array {
+                    element_type: DataType::Int32,
+                    elements: vec![Value::Int32(3), Value::Int32(4)],
+                },
+            ],
+        );
+        assert_eq!(op.schema().field_at(0).data_type, DataType::Int32);
+        let schema = op.schema().clone();
+        let mut out = Vec::new();
+        while let Some(batch) = op.next_batch().expect("ok") {
+            out.extend(crate::filter_op::batch_to_rows(&batch, &schema).expect("decode"));
+        }
+        assert_eq!(
+            out,
+            vec![
+                vec![Value::Int32(1)],
+                vec![Value::Int32(2)],
+                vec![Value::Int32(3)],
+                vec![Value::Int32(4)]
             ]
         );
     }

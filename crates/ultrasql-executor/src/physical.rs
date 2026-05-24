@@ -171,6 +171,9 @@ pub fn build_operator(
         }
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::CreateTypeEnum { .. }
+        | LogicalPlan::CreateTypeComposite { .. }
+        | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::DropTable { .. }

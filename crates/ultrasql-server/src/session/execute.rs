@@ -117,6 +117,18 @@ fn parse_bool_guc(value: &str) -> Result<bool, ServerError> {
     }
 }
 
+fn parse_statement_timeout_ms(value: &str) -> Result<u64, ServerError> {
+    let trimmed = value.trim();
+    if let Some(stripped) = trimmed.strip_prefix('-') {
+        if !stripped.is_empty() {
+            return Err(ServerError::Unsupported("invalid statement_timeout"));
+        }
+    }
+    trimmed
+        .parse::<u64>()
+        .map_err(|_| ServerError::Unsupported("invalid statement_timeout"))
+}
+
 fn starts_with_keyword_pair(sql: &str, first: &str, second: &str) -> bool {
     let mut words = sql.split_whitespace();
     words
@@ -472,6 +484,9 @@ where
             &plan,
             LogicalPlan::CreateTable { .. }
                 | LogicalPlan::CreateMaterializedView { .. }
+                | LogicalPlan::CreateTypeEnum { .. }
+                | LogicalPlan::CreateTypeComposite { .. }
+                | LogicalPlan::CreateDomain { .. }
                 | LogicalPlan::CreateIndex { .. }
                 | LogicalPlan::CreatePolicy { .. }
                 | LogicalPlan::CreateSequence { .. }
@@ -493,6 +508,15 @@ where
             }
             LogicalPlan::CreateMaterializedView { .. } => {
                 return self.execute_create_materialized_view(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::CreateTypeEnum { .. } => {
+                return self.execute_create_type_enum(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::CreateTypeComposite { .. } => {
+                return self.execute_create_type_composite(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::CreateDomain { .. } => {
+                return self.execute_create_domain(&plan, &catalog_snapshot);
             }
             LogicalPlan::CreateIndex { .. } => {
                 return self.execute_create_index(&plan, &catalog_snapshot);
@@ -610,6 +634,10 @@ where
                 self.jit_above_rows = ultrasql_vec::jit::DEFAULT_JIT_ABOVE_ROWS;
                 Ok(result_encoder::run_ddl_command("RESET"))
             }
+            "statement_timeout" => {
+                self.statement_timeout_ms = 0;
+                Ok(result_encoder::run_ddl_command("RESET"))
+            }
             "synchronous_commit" => Ok(result_encoder::run_ddl_command("RESET")),
             _ if name.contains('.') => {
                 self.session_settings.remove(&name.to_ascii_lowercase());
@@ -630,6 +658,10 @@ where
                     .parse::<usize>()
                     .map_err(|_| ServerError::Unsupported("invalid jit_above_cost"))?;
                 self.jit_above_rows = parsed;
+                Ok(())
+            }
+            "statement_timeout" => {
+                self.statement_timeout_ms = parse_statement_timeout_ms(value)?;
                 Ok(())
             }
             "synchronous_commit" => match value.to_ascii_lowercase().as_str() {
@@ -659,6 +691,7 @@ where
                 }
             }
             "jit_above_cost" => self.jit_above_rows.to_string(),
+            "statement_timeout" => self.statement_timeout_ms.to_string(),
             "synchronous_commit" => "on".to_owned(),
             _ if name.contains('.') => self
                 .session_settings

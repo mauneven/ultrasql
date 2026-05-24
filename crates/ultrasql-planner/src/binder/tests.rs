@@ -55,6 +55,64 @@ fn parse_bind_ok(sql: &str) -> LogicalPlan {
     parse_and_bind(sql, &cat).expect("bind ok")
 }
 
+#[test]
+fn binds_row_to_json_whole_row_alias_to_named_record() {
+    let plan = parse_bind_ok("SELECT row_to_json(u) FROM users u WHERE u.id = 1");
+    let LogicalPlan::Project { exprs, input, .. } = &plan else {
+        panic!("expected Project, got {plan:?}");
+    };
+    let LogicalPlan::Filter { predicate, .. } = input.as_ref() else {
+        panic!("expected Filter input, got {input:?}");
+    };
+    let ScalarExpr::Binary { left, right, .. } = predicate else {
+        panic!("expected binary predicate, got {predicate:?}");
+    };
+    assert!(
+        matches!(
+            left.as_ref(),
+            ScalarExpr::Column {
+                index: 0,
+                data_type: DataType::Int32,
+                ..
+            }
+        ),
+        "unexpected predicate left: {left:?}"
+    );
+    assert!(
+        matches!(
+            right.as_ref(),
+            ScalarExpr::Literal {
+                value: ultrasql_core::Value::Int32(1),
+                ..
+            }
+        ),
+        "unexpected predicate right: {right:?}"
+    );
+    let ScalarExpr::FunctionCall { name, args, .. } = &exprs[0].0 else {
+        panic!("expected row_to_json call, got {:?}", exprs[0].0);
+    };
+    assert_eq!(name, "row_to_json");
+    let [
+        ScalarExpr::FunctionCall {
+            name: row_name,
+            args: row_args,
+            data_type: DataType::Record(fields),
+        },
+    ] = args.as_slice()
+    else {
+        panic!("expected row constructor record arg, got {args:?}");
+    };
+    assert_eq!(row_name, "row");
+    assert_eq!(
+        fields
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "name", "score"]
+    );
+    assert_eq!(row_args.len(), 3);
+}
+
 // -----------------------------------------------------------------------
 // INSERT — happy paths
 // -----------------------------------------------------------------------
@@ -364,6 +422,130 @@ fn binds_create_table_resolves_basic_column_types() {
 }
 
 #[test]
+fn binds_create_type_enum_and_uses_catalog_type_in_create_table() {
+    let cat = InMemoryCatalog::new();
+    let plan =
+        parse_and_bind("CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')", &cat).expect("bind ok");
+    let LogicalPlan::CreateTypeEnum {
+        type_name,
+        namespace,
+        labels,
+        ..
+    } = plan
+    else {
+        panic!("expected CreateTypeEnum");
+    };
+    assert_eq!(type_name, "mood");
+    assert_eq!(namespace, "public");
+    assert_eq!(labels, ["sad", "ok", "happy"]);
+
+    let mut cat = InMemoryCatalog::new();
+    let enum_type = DataType::Enum {
+        oid: ultrasql_core::Oid::new(42_000),
+        name: "mood".into(),
+        labels: vec!["sad".to_owned(), "ok".to_owned(), "happy".to_owned()].into(),
+    };
+    cat.register_type("mood", enum_type.clone());
+    let plan =
+        parse_and_bind("CREATE TABLE enum_probe (id INT, mood mood)", &cat).expect("bind ok");
+    let LogicalPlan::CreateTable { columns, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(columns.fields()[1].data_type, enum_type);
+}
+
+#[test]
+fn binds_create_type_composite_and_uses_catalog_type_in_create_table() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("CREATE TYPE postal_address AS (street TEXT, zip INT)", &cat)
+        .expect("bind ok");
+    let LogicalPlan::CreateTypeComposite {
+        type_name,
+        namespace,
+        attributes,
+        ..
+    } = plan
+    else {
+        panic!("expected CreateTypeComposite");
+    };
+    assert_eq!(type_name, "postal_address");
+    assert_eq!(namespace, "public");
+    assert_eq!(attributes.fields()[0].name, "street");
+    assert_eq!(
+        attributes.fields()[0].data_type,
+        DataType::Text { max_len: None }
+    );
+    assert_eq!(attributes.fields()[1].name, "zip");
+    assert_eq!(attributes.fields()[1].data_type, DataType::Int32);
+
+    let mut cat = InMemoryCatalog::new();
+    let composite_type = DataType::Composite {
+        oid: ultrasql_core::Oid::new(42_001),
+        name: "postal_address".into(),
+        fields: vec![
+            ("street".to_owned(), DataType::Text { max_len: None }),
+            ("zip".to_owned(), DataType::Int32),
+        ]
+        .into(),
+    };
+    cat.register_type("postal_address", composite_type.clone());
+    let plan = parse_and_bind(
+        "CREATE TABLE contact_book (id INT, addr postal_address)",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateTable { columns, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(columns.fields()[1].data_type, composite_type);
+}
+
+#[test]
+fn binds_create_domain_and_uses_catalog_type_in_create_table() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "CREATE DOMAIN positive_int AS INT NOT NULL CHECK (VALUE > 0)",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateDomain {
+        domain_name,
+        namespace,
+        base_type,
+        not_null,
+        checks,
+        ..
+    } = plan
+    else {
+        panic!("expected CreateDomain");
+    };
+    assert_eq!(domain_name, "positive_int");
+    assert_eq!(namespace, "public");
+    assert_eq!(base_type, DataType::Int32);
+    assert!(not_null);
+    assert_eq!(checks.len(), 1);
+
+    let mut cat = InMemoryCatalog::new();
+    let domain_type = DataType::Domain {
+        oid: ultrasql_core::Oid::new(42_002),
+        name: "positive_int".into(),
+        base_type: Box::new(DataType::Int32),
+        not_null: true,
+    };
+    cat.register_type("positive_int", domain_type.clone());
+    let plan = parse_and_bind(
+        "CREATE TABLE domain_probe (id INT, score positive_int)",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateTable { columns, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(columns.fields()[1].data_type, domain_type);
+    assert!(!columns.fields()[1].nullable);
+}
+
+#[test]
 fn binds_create_table_range_partition_column() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind(
@@ -393,6 +575,144 @@ fn binds_create_table_with_varchar_modifier() {
 }
 
 #[test]
+fn binds_create_table_numeric_typmods_like_postgres() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "CREATE TABLE t (a NUMERIC, b NUMERIC(10), c DECIMAL(12,4))",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateTable { columns, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+
+    assert_eq!(
+        columns.fields()[0].data_type,
+        DataType::Decimal {
+            precision: None,
+            scale: None
+        }
+    );
+    assert_eq!(
+        columns.fields()[1].data_type,
+        DataType::Decimal {
+            precision: Some(10),
+            scale: Some(0)
+        }
+    );
+    assert_eq!(
+        columns.fields()[2].data_type,
+        DataType::Decimal {
+            precision: Some(12),
+            scale: Some(4)
+        }
+    );
+}
+
+#[test]
+fn binds_text_literal_cast_to_numeric_with_literal_scale() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("SELECT '12.340'::numeric AS amount", &cat).expect("bind ok");
+    let LogicalPlan::Project { exprs, schema, .. } = plan else {
+        panic!("expected Project");
+    };
+    assert_eq!(
+        schema.field_at(0).data_type,
+        DataType::Decimal {
+            precision: None,
+            scale: Some(3)
+        }
+    );
+    let ScalarExpr::Literal { value, data_type } = &exprs[0].0 else {
+        panic!("expected folded decimal literal");
+    };
+    assert_eq!(
+        value,
+        &Value::Decimal {
+            value: 12_340,
+            scale: 3
+        }
+    );
+    assert_eq!(
+        data_type,
+        &DataType::Decimal {
+            precision: None,
+            scale: Some(3)
+        }
+    );
+}
+
+#[test]
+fn binds_create_table_money_type() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("CREATE TABLE ledger (amount MONEY)", &cat).expect("bind ok");
+    let LogicalPlan::CreateTable { columns, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+
+    assert_eq!(columns.fields()[0].data_type, DataType::Money);
+}
+
+#[test]
+fn binds_text_literal_cast_to_money() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("SELECT '$1,234.56'::money AS amount", &cat).expect("bind ok");
+    let LogicalPlan::Project { exprs, schema, .. } = plan else {
+        panic!("expected Project");
+    };
+    assert_eq!(schema.field_at(0).data_type, DataType::Money);
+    let ScalarExpr::Literal { value, data_type } = &exprs[0].0 else {
+        panic!("expected folded money literal");
+    };
+    assert_eq!(value, &Value::Money(123_456));
+    assert_eq!(data_type, &DataType::Money);
+}
+
+#[test]
+fn binds_create_table_char_and_bpchar_types() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind(
+        "CREATE TABLE codes (c CHAR(4), b BPCHAR(3), d CHARACTER)",
+        &cat,
+    )
+    .expect("bind ok");
+    let LogicalPlan::CreateTable { columns, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+
+    assert_eq!(
+        columns.fields()[0].data_type,
+        DataType::Char { len: Some(4) }
+    );
+    assert_eq!(
+        columns.fields()[1].data_type,
+        DataType::Char { len: Some(3) }
+    );
+    assert_eq!(
+        columns.fields()[2].data_type,
+        DataType::Char { len: Some(1) }
+    );
+}
+
+#[test]
+fn binds_text_literal_cast_to_char_with_padding() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("SELECT CAST('abcdef' AS CHAR(3)) AS code", &cat).expect("bind ok");
+    let LogicalPlan::Project { exprs, schema, .. } = plan else {
+        panic!("expected Project");
+    };
+    assert_eq!(
+        schema.field_at(0).data_type,
+        DataType::Char { len: Some(3) }
+    );
+    let ScalarExpr::Literal { value, data_type } = &exprs[0].0 else {
+        panic!("expected folded char literal");
+    };
+    assert_eq!(value, &Value::Char("abc".to_owned()));
+    assert_eq!(data_type, &DataType::Char { len: Some(3) });
+}
+
+#[test]
 fn binds_create_table_array_column_types() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind("CREATE TABLE t (ids INT[], tags TEXT[])", &cat).expect("bind ok");
@@ -417,6 +737,16 @@ fn binds_create_table_jsonb_column_type() {
         panic!("expected CreateTable");
     };
     assert_eq!(columns.fields()[0].data_type, DataType::Jsonb);
+}
+
+#[test]
+fn binds_create_table_xml_column_type() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("CREATE TABLE t (doc XML)", &cat).expect("bind ok");
+    let LogicalPlan::CreateTable { columns, .. } = plan else {
+        panic!("expected CreateTable");
+    };
+    assert_eq!(columns.fields()[0].data_type, DataType::Xml);
 }
 
 #[test]
@@ -802,6 +1132,66 @@ fn binds_unnest_table_function_from_text_array() {
 }
 
 #[test]
+fn binds_unnest_multidimensional_array_to_base_element_type() {
+    let cat = InMemoryCatalog::new();
+    let plan = parse_and_bind("SELECT * FROM unnest([[1, 2], [3, 4]])", &cat).expect("bind ok");
+    assert_eq!(plan.schema().fields()[0].data_type, DataType::Int32);
+}
+
+#[test]
+fn binds_multidimensional_array_literal_and_numeric_common_type() {
+    let cat = InMemoryCatalog::new();
+    let plan =
+        parse_and_bind("SELECT [[1, 2], [3, 4]], [1::smallint, 2::bigint]", &cat).expect("bind ok");
+    let LogicalPlan::Project { exprs, schema, .. } = &plan else {
+        panic!("expected Project, got {plan:?}");
+    };
+    let matrix_type = DataType::Array(Box::new(DataType::Array(Box::new(DataType::Int32))));
+    assert_eq!(schema.field_at(0).data_type, matrix_type);
+    let ScalarExpr::Literal { value, data_type } = &exprs[0].0 else {
+        panic!("expected matrix literal, got {:?}", exprs[0].0);
+    };
+    assert_eq!(data_type, &matrix_type);
+    assert_eq!(
+        value,
+        &Value::Array {
+            element_type: DataType::Array(Box::new(DataType::Int32)),
+            elements: vec![
+                Value::Array {
+                    element_type: DataType::Int32,
+                    elements: vec![Value::Int32(1), Value::Int32(2)]
+                },
+                Value::Array {
+                    element_type: DataType::Int32,
+                    elements: vec![Value::Int32(3), Value::Int32(4)]
+                }
+            ]
+        }
+    );
+
+    let widened_type = DataType::Array(Box::new(DataType::Int64));
+    assert_eq!(schema.field_at(1).data_type, widened_type);
+    let ScalarExpr::Literal { value, data_type } = &exprs[1].0 else {
+        panic!("expected widened literal, got {:?}", exprs[1].0);
+    };
+    assert_eq!(data_type, &widened_type);
+    assert_eq!(
+        value,
+        &Value::Array {
+            element_type: DataType::Int64,
+            elements: vec![Value::Int64(1), Value::Int64(2)]
+        }
+    );
+}
+
+#[test]
+fn rejects_ragged_multidimensional_array_literal() {
+    let cat = InMemoryCatalog::new();
+    let err = parse_and_bind("SELECT [[1, 2], [3]]", &cat).unwrap_err();
+    assert!(matches!(err, PlanError::TypeMismatch(_)), "got {err:?}");
+}
+
+#[test]
 fn binds_json_table_declared_columns() {
     let cat = InMemoryCatalog::new();
     let plan = parse_and_bind(
@@ -1109,9 +1499,8 @@ fn binds_create_sequence_rejects_restart() {
 
 #[test]
 fn binds_create_table_rejects_unsupported_column_type() {
-    // XML remains outside the supported storage type set.
     let cat = InMemoryCatalog::new();
-    let err = parse_and_bind("CREATE TABLE t (id XML)", &cat).unwrap_err();
+    let err = parse_and_bind("CREATE TABLE t (id XMLTYPE)", &cat).unwrap_err();
     assert!(matches!(err, PlanError::NotSupported(_)), "got {err:?}");
 }
 
@@ -1134,6 +1523,12 @@ fn binds_create_table_persistent_catalog_via_snapshot_adapter() {
         tables_by_oid: std::collections::HashMap::new(),
         indexes: std::collections::HashMap::new(),
         indexes_by_table: std::collections::HashMap::new(),
+        enum_types: std::collections::HashMap::new(),
+        enum_types_by_oid: std::collections::HashMap::new(),
+        composite_types: std::collections::HashMap::new(),
+        composite_types_by_oid: std::collections::HashMap::new(),
+        domain_types: std::collections::HashMap::new(),
+        domain_types_by_oid: std::collections::HashMap::new(),
         descriptions: std::collections::HashMap::new(),
         statistics: std::collections::HashMap::new(),
         statistic_ext: std::collections::HashMap::new(),

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use parking_lot::RwLock;
 use ultrasql_catalog::CatalogSnapshot;
-use ultrasql_core::{DataType, RelationId, Schema, Value};
+use ultrasql_core::{DataType, RelationId, Schema, Value, bpchar_semantic_text};
 use ultrasql_executor::ValuesScan;
 use ultrasql_planner::{AggregateFunc, LogicalAggregateExpr, LogicalPlan, ScalarExpr, SortKey};
 use ultrasql_storage::column_cache::{
@@ -382,6 +382,9 @@ fn compare_projection_values(left: &Value, right: &Value, nulls_first: bool) -> 
         (Value::Int32(a), Value::Int32(b)) => a.cmp(b),
         (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
+        (Value::Char(a), Value::Char(b)) => bpchar_semantic_text(a).cmp(bpchar_semantic_text(b)),
+        (Value::Char(a), Value::Text(b)) => bpchar_semantic_text(a).cmp(b),
+        (Value::Text(a), Value::Char(b)) => a.as_str().cmp(bpchar_semantic_text(b)),
         _ => Ordering::Equal,
     }
 }
@@ -451,7 +454,11 @@ fn column_index(expr: &ScalarExpr) -> Option<usize> {
 fn is_supported_projection_type(data_type: &DataType) -> bool {
     matches!(
         data_type,
-        DataType::Bool | DataType::Int32 | DataType::Int64 | DataType::Text { .. }
+        DataType::Bool
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Text { .. }
+            | DataType::Char { .. }
     )
 }
 

@@ -307,6 +307,9 @@ fn lower_query_inner(
         LogicalPlan::Truncate { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::CreateTypeEnum { .. }
+        | LogicalPlan::CreateTypeComposite { .. }
+        | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::DropTable { .. }
@@ -335,7 +338,9 @@ fn lower_query_inner(
                 "LISTEN/NOTIFY/UNLISTEN reached operator lowerer; expected pubsub dispatch path",
             ))
         }
-        LogicalPlan::FunctionScan { name, args, .. } => lower_function_scan(name, args),
+        LogicalPlan::FunctionScan { name, args, .. } => {
+            lower_function_scan(name, args, ctx.cancel_flag.clone())
+        }
         LogicalPlan::Explain { .. } => Err(ServerError::Unsupported(
             "EXPLAIN reached operator lowerer; expected session dispatch path",
         )),
@@ -551,6 +556,9 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::Truncate { .. } => "Truncate",
         LogicalPlan::CreateTable { .. } => "CreateTable",
         LogicalPlan::CreateMaterializedView { .. } => "CreateMaterializedView",
+        LogicalPlan::CreateTypeEnum { .. } => "CreateTypeEnum",
+        LogicalPlan::CreateTypeComposite { .. } => "CreateTypeComposite",
+        LogicalPlan::CreateDomain { .. } => "CreateDomain",
         LogicalPlan::CreateIndex { .. } => "CreateIndex",
         LogicalPlan::CreatePolicy { .. } => "CreatePolicy",
         LogicalPlan::DropTable { .. } => "DropTable",

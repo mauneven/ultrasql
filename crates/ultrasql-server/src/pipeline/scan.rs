@@ -8,6 +8,7 @@ use ultrasql_core::{DataType, Field, RelationId, Schema, Value};
 use ultrasql_executor::{
     CteScan, Eval, MemTableScan, Operator, ParallelSeqScan, Project, RowCodec, SeqScan,
     build_batch, choose_parallel_seq_scan_workers,
+    json_path::{parse_json_path, select_json_path},
 };
 use ultrasql_planner::{LogicalPlan, ScalarExpr};
 
@@ -152,6 +153,7 @@ fn apply_projection(
 pub(super) fn lower_function_scan(
     name: &str,
     args: &[ScalarExpr],
+    cancel_flag: Option<ultrasql_executor::CancelFlag>,
 ) -> Result<Box<dyn Operator>, ServerError> {
     if name == "sniff_csv" {
         if args.len() != 1 {
@@ -197,10 +199,11 @@ pub(super) fn lower_function_scan(
         else {
             return Err(ServerError::Unsupported("unnest: argument must be array"));
         };
-        return Ok(Box::new(ultrasql_executor::FunctionScan::unnest(
-            element_type,
-            elements,
-        )));
+        let mut scan = ultrasql_executor::FunctionScan::unnest(element_type, elements);
+        if let Some(flag) = cancel_flag {
+            scan = scan.with_cancel_flag(flag);
+        }
+        return Ok(Box::new(scan));
     }
     if name != "generate_series" {
         return Err(ServerError::Unsupported(
@@ -239,9 +242,11 @@ pub(super) fn lower_function_scan(
     } else {
         1
     };
-    Ok(Box::new(ultrasql_executor::FunctionScan::generate_series(
-        start, stop, step,
-    )))
+    let mut scan = ultrasql_executor::FunctionScan::generate_series(start, stop, step);
+    if let Some(flag) = cancel_flag {
+        scan = scan.with_cancel_flag(flag);
+    }
+    Ok(Box::new(scan))
 }
 
 fn lower_json_each(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, ServerError> {
@@ -254,12 +259,14 @@ fn lower_json_each(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, ServerError
         .eval(&[])
         .map_err(|e| ServerError::Ddl(format!("json_each argument evaluation failed: {e}")))?;
     let document = match value {
-        Value::Jsonb(text) | Value::Text(text) => serde_json::from_str::<JsonValue>(&text)
-            .map_err(|err| ServerError::CopyFormat(format!("json_each parse jsonb: {err}")))?,
+        Value::Json(text) | Value::Jsonb(text) | Value::Text(text) => {
+            serde_json::from_str::<JsonValue>(&text)
+                .map_err(|err| ServerError::CopyFormat(format!("json_each parse jsonb: {err}")))?
+        }
         Value::Null => JsonValue::Null,
         other => {
             return Err(ServerError::CopyFormat(format!(
-                "json_each: argument must be jsonb or text, got {:?}",
+                "json_each: argument must be json/jsonb or text, got {:?}",
                 other.data_type()
             )));
         }
@@ -302,13 +309,6 @@ fn lower_json_each(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, ServerError
     Ok(Box::new(MemTableScan::new(schema, batches)))
 }
 
-#[derive(Debug)]
-enum BasicJsonPathStep {
-    Key(String),
-    All,
-    Index(usize),
-}
-
 fn lower_jsonb_path_query(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, ServerError> {
     if args.len() != 2 {
         return Err(ServerError::Unsupported(
@@ -319,14 +319,14 @@ fn lower_jsonb_path_query(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, Serv
         ServerError::Ddl(format!("jsonb_path_query document evaluation failed: {e}"))
     })?;
     let document = match document_value {
-        Value::Jsonb(text) | Value::Text(text) => serde_json::from_str::<JsonValue>(&text)
-            .map_err(|err| {
-                ServerError::CopyFormat(format!("jsonb_path_query parse jsonb: {err}"))
-            })?,
+        Value::Json(text) | Value::Jsonb(text) | Value::Text(text) => serde_json::from_str::<
+            JsonValue,
+        >(&text)
+        .map_err(|err| ServerError::CopyFormat(format!("jsonb_path_query parse jsonb: {err}")))?,
         Value::Null => JsonValue::Null,
         other => {
             return Err(ServerError::CopyFormat(format!(
-                "jsonb_path_query: document must be jsonb or text, got {:?}",
+                "jsonb_path_query: document must be json/jsonb or text, got {:?}",
                 other.data_type()
             )));
         }
@@ -340,8 +340,9 @@ fn lower_jsonb_path_query(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, Serv
             path_value.data_type()
         )));
     };
-    let steps = parse_basic_json_path(&path)?;
-    let selected = select_basic_json_path(&document, &steps);
+    let path = parse_json_path(&path)
+        .map_err(|err| ServerError::CopyFormat(format!("jsonb_path_query invalid path: {err}")))?;
+    let selected = select_json_path(&document, &path);
     let schema = Schema::new([Field::nullable("value", DataType::Jsonb)])
         .map_err(|err| ServerError::CopyFormat(format!("jsonb_path_query schema: {err}")))?;
     let rows = selected
@@ -357,98 +358,6 @@ fn lower_jsonb_path_query(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, Serv
         ]
     };
     Ok(Box::new(MemTableScan::new(schema, batches)))
-}
-
-fn parse_basic_json_path(path: &str) -> Result<Vec<BasicJsonPathStep>, ServerError> {
-    let bytes = path.as_bytes();
-    if bytes.first() != Some(&b'$') {
-        return Err(ServerError::CopyFormat(format!(
-            "jsonb_path_query path must start with $: {path}"
-        )));
-    }
-    let mut steps = Vec::new();
-    let mut idx = 1;
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'.' => {
-                idx += 1;
-                let start = idx;
-                while idx < bytes.len()
-                    && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_')
-                {
-                    idx += 1;
-                }
-                if start == idx {
-                    return Err(ServerError::CopyFormat(format!(
-                        "jsonb_path_query empty object key in path {path}"
-                    )));
-                }
-                steps.push(BasicJsonPathStep::Key(path[start..idx].to_owned()));
-            }
-            b'[' => {
-                idx += 1;
-                if idx < bytes.len() && bytes[idx] == b'*' {
-                    idx += 1;
-                    if bytes.get(idx) != Some(&b']') {
-                        return Err(ServerError::CopyFormat(format!(
-                            "jsonb_path_query expected ] in path {path}"
-                        )));
-                    }
-                    idx += 1;
-                    steps.push(BasicJsonPathStep::All);
-                } else {
-                    let start = idx;
-                    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
-                        idx += 1;
-                    }
-                    if bytes.get(idx) != Some(&b']') || start == idx {
-                        return Err(ServerError::CopyFormat(format!(
-                            "jsonb_path_query expected array index in path {path}"
-                        )));
-                    }
-                    let index = path[start..idx].parse::<usize>().map_err(|err| {
-                        ServerError::CopyFormat(format!("jsonb_path_query path index: {err}"))
-                    })?;
-                    idx += 1;
-                    steps.push(BasicJsonPathStep::Index(index));
-                }
-            }
-            _ => {
-                return Err(ServerError::CopyFormat(format!(
-                    "jsonb_path_query unsupported path syntax: {path}"
-                )));
-            }
-        }
-    }
-    Ok(steps)
-}
-
-fn select_basic_json_path<'a>(
-    root: &'a JsonValue,
-    steps: &[BasicJsonPathStep],
-) -> Vec<&'a JsonValue> {
-    let mut current = vec![root];
-    for step in steps {
-        let mut next = Vec::new();
-        for value in current {
-            match (step, value) {
-                (BasicJsonPathStep::Key(key), JsonValue::Object(object)) => {
-                    if let Some(value) = object.get(key) {
-                        next.push(value);
-                    }
-                }
-                (BasicJsonPathStep::All, JsonValue::Array(values)) => next.extend(values),
-                (BasicJsonPathStep::Index(index), JsonValue::Array(values)) => {
-                    if let Some(value) = values.get(*index) {
-                        next.push(value);
-                    }
-                }
-                _ => {}
-            }
-        }
-        current = next;
-    }
-    current
 }
 
 /// Lower `Project(read_csv(...))` with CSV projection pushdown when the

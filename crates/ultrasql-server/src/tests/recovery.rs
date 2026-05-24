@@ -82,6 +82,56 @@ fn server_init_retains_wal_writer_and_flushes_on_drop() {
     assert!(recovered_lsn.raw() > appended_lsn.raw());
 }
 
+#[cfg(unix)]
+#[test]
+fn server_init_refuses_symlinked_data_dir() {
+    use std::os::unix::fs::symlink;
+
+    let real = tempfile::TempDir::new().unwrap();
+    let link_parent = tempfile::TempDir::new().unwrap();
+    let link = link_parent.path().join("alias-data");
+    symlink(real.path(), &link).unwrap();
+
+    let err = Server::init(&link).expect_err("symlinked data dir must be rejected");
+    assert!(
+        err.to_string().contains("symlink"),
+        "expected symlink rejection, got {err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn data_dir_owner_check_rejects_unexpected_uid() {
+    use std::os::unix::fs::MetadataExt;
+
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let actual_uid = fs::metadata(data_dir.path()).unwrap().uid();
+    let unexpected_uid = if actual_uid == u32::MAX {
+        actual_uid - 1
+    } else {
+        actual_uid + 1
+    };
+
+    let err = super::super::validate_data_dir_owner(data_dir.path(), unexpected_uid)
+        .expect_err("uid mismatch must be rejected");
+    assert!(
+        err.to_string().contains("owned by uid"),
+        "expected owner rejection, got {err}"
+    );
+}
+
+#[test]
+fn server_init_stores_canonical_data_dir() {
+    let root = tempfile::TempDir::new().unwrap();
+    let child = root.path().join("child");
+    fs::create_dir(&child).unwrap();
+    let aliased = child.join("..");
+
+    let server = Server::init(&aliased).unwrap();
+    let stored = server.data_dir.as_ref().expect("persistent server path");
+    assert_eq!(stored, &root.path().canonicalize().unwrap());
+}
+
 #[test]
 fn persistent_server_can_force_commit_marker_durable() {
     let data_dir = tempfile::TempDir::new().unwrap();

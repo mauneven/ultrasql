@@ -16,7 +16,7 @@
 //!
 //! # System relations baked in
 //!
-//! The eleven core system tables that exist in every PostgreSQL-compatible
+//! The thirteen core system tables that exist in every PostgreSQL-compatible
 //! database.  Their OIDs are well-known constants used throughout the
 //! rest of the system.
 //!
@@ -25,6 +25,8 @@
 //! | 1259 | `pg_class`          |
 //! | 1249 | `pg_attribute`      |
 //! | 2604 | `pg_attrdef`        |
+//! | 1247 | `pg_type`           |
+//! | 3501 | `pg_enum`           |
 //! | 2615 | `pg_namespace`      |
 //! | 2610 | `pg_index`          |
 //! | 2606 | `pg_constraint`     |
@@ -66,6 +68,10 @@ pub const PG_CLASS_OID: u32 = 1259;
 pub const PG_ATTRIBUTE_OID: u32 = 1249;
 /// OID of `pg_attrdef`.
 pub const PG_ATTRDEF_OID: u32 = 2604;
+/// OID of `pg_type`.
+pub const PG_TYPE_OID: u32 = 1247;
+/// OID of `pg_enum`.
+pub const PG_ENUM_OID: u32 = 3501;
 /// OID of `pg_namespace`.
 pub const PG_NAMESPACE_OID: u32 = 2615;
 /// OID of `pg_index`.
@@ -135,6 +141,31 @@ fn pg_attrdef_schema() -> Schema {
         Field::required("adbin", DataType::Text { max_len: None }),
     ])
     .expect("pg_attrdef schema invariants hold")
+}
+
+/// Schema for `pg_type` (abridged to enum-compatible v1 column set).
+fn pg_type_schema() -> Schema {
+    Schema::new([
+        Field::required("oid", DataType::Int64),
+        Field::required("typname", DataType::Text { max_len: None }),
+        Field::required("typnamespace", DataType::Int64),
+        Field::required("typtype", DataType::Text { max_len: Some(1) }),
+        Field::required("typcategory", DataType::Text { max_len: Some(1) }),
+        Field::required("typlen", DataType::Int16),
+        Field::required("typelem", DataType::Int32),
+    ])
+    .expect("pg_type schema invariants hold")
+}
+
+/// Schema for `pg_enum` (abridged to enum-compatible v1 column set).
+fn pg_enum_schema() -> Schema {
+    Schema::new([
+        Field::required("oid", DataType::Int64),
+        Field::required("enumtypid", DataType::Int64),
+        Field::required("enumsortorder", DataType::Float32),
+        Field::required("enumlabel", DataType::Text { max_len: None }),
+    ])
+    .expect("pg_enum schema invariants hold")
 }
 
 /// Schema for `pg_index` (abridged to v0.8 column set).
@@ -234,9 +265,9 @@ fn pg_statistic_ext_schema() -> Schema {
 /// Pre-populates:
 /// - 3 namespaces: `pg_catalog` (OID 11), `information_schema` (OID 12),
 ///   `public` (OID 2200).
-/// - 11 system relations in `pg_catalog`: `pg_namespace`, `pg_class`,
-///   `pg_attribute`, `pg_attrdef`, `pg_index`, `pg_constraint`, `pg_sequence`,
-///   `pg_depend`, `pg_description`.
+/// - 13 system relations in `pg_catalog`: `pg_namespace`, `pg_class`,
+///   `pg_attribute`, `pg_attrdef`, `pg_type`, `pg_enum`, `pg_index`,
+///   `pg_constraint`, `pg_sequence`, `pg_depend`, `pg_description`.
 ///
 /// This snapshot is installed by [`crate::PersistentCatalog::bootstrap_from_heap`]
 /// when the on-disk heap is empty (fresh `initdb`-like boot), and is
@@ -258,13 +289,19 @@ pub fn initial_snapshot() -> CatalogSnapshot {
         tables_by_oid,
         indexes: HashMap::new(),
         indexes_by_table: HashMap::new(),
+        enum_types: HashMap::new(),
+        enum_types_by_oid: HashMap::new(),
+        composite_types: HashMap::new(),
+        composite_types_by_oid: HashMap::new(),
+        domain_types: HashMap::new(),
+        domain_types_by_oid: HashMap::new(),
         descriptions: HashMap::new(),
         statistics: HashMap::new(),
         statistic_ext: HashMap::new(),
     }
 }
 
-/// Enumerate the eleven system [`TableEntry`] values that exist in every
+/// Enumerate the thirteen system [`TableEntry`] values that exist in every
 /// fresh database.
 ///
 /// Used by both [`initial_snapshot`] and
@@ -293,6 +330,8 @@ pub fn system_table_entries() -> Vec<TableEntry> {
         sys_table!(PG_CLASS_OID, "pg_class", pg_class_schema),
         sys_table!(PG_ATTRIBUTE_OID, "pg_attribute", pg_attribute_schema),
         sys_table!(PG_ATTRDEF_OID, "pg_attrdef", pg_attrdef_schema),
+        sys_table!(PG_TYPE_OID, "pg_type", pg_type_schema),
+        sys_table!(PG_ENUM_OID, "pg_enum", pg_enum_schema),
         sys_table!(PG_INDEX_OID, "pg_index", pg_index_schema),
         sys_table!(PG_CONSTRAINT_OID, "pg_constraint", pg_constraint_schema),
         sys_table!(PG_SEQUENCE_OID, "pg_sequence", pg_sequence_schema),
@@ -317,12 +356,12 @@ mod tests {
 
     #[test]
     fn initial_snapshot_has_three_namespaces_worth_of_relations() {
-        // All eleven system tables live in pg_catalog.
+        // All thirteen system tables live in pg_catalog.
         let snap = initial_snapshot();
         assert_eq!(
             snap.tables.len(),
-            11,
-            "expected 11 system tables, got {}",
+            13,
+            "expected 13 system tables, got {}",
             snap.tables.len()
         );
     }
@@ -334,6 +373,8 @@ mod tests {
             "pg_namespace",
             "pg_class",
             "pg_attribute",
+            "pg_type",
+            "pg_enum",
             "pg_index",
             "pg_constraint",
             "pg_sequence",
@@ -355,6 +396,8 @@ mod tests {
         let snap = initial_snapshot();
         assert!(snap.tables_by_oid.contains_key(&Oid::new(PG_CLASS_OID)));
         assert!(snap.tables_by_oid.contains_key(&Oid::new(PG_ATTRIBUTE_OID)));
+        assert!(snap.tables_by_oid.contains_key(&Oid::new(PG_TYPE_OID)));
+        assert!(snap.tables_by_oid.contains_key(&Oid::new(PG_ENUM_OID)));
         assert!(snap.tables_by_oid.contains_key(&Oid::new(PG_NAMESPACE_OID)));
         assert!(snap.tables_by_oid.contains_key(&Oid::new(PG_INDEX_OID)));
         assert!(

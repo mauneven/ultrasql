@@ -13,7 +13,8 @@ use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{
-    Catalog, CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
+    Catalog, CatalogSnapshot, CompositeTypeEntry, DomainTypeEntry, EnumLabelEntry, EnumTypeEntry,
+    IndexEntry, MutableCatalog, PersistentCatalog, TableEntry,
 };
 use ultrasql_core::{DataType, PageId, RelationId, Value};
 use ultrasql_optimizer::{NoStats, PlanCache, PlanCacheConfig, PlanCacheKey, StatsSource};
@@ -75,6 +76,80 @@ impl<'a> CreateIndexProgressGuard<'a> {
 impl Drop for CreateIndexProgressGuard<'_> {
     fn drop(&mut self) {
         self.recorder.finish_create_index(self.pid);
+    }
+}
+
+fn rewrite_domain_value_expr(
+    expr: &ultrasql_planner::ScalarExpr,
+    column_index: usize,
+    column_name: &str,
+    base_type: &DataType,
+) -> ultrasql_planner::ScalarExpr {
+    use ultrasql_planner::ScalarExpr;
+
+    match expr {
+        ScalarExpr::Column { index: 0, .. } => ScalarExpr::Column {
+            name: column_name.to_owned(),
+            index: column_index,
+            data_type: base_type.clone(),
+        },
+        ScalarExpr::Unary {
+            op,
+            expr,
+            data_type,
+        } => ScalarExpr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_domain_value_expr(
+                expr,
+                column_index,
+                column_name,
+                base_type,
+            )),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::Binary {
+            op,
+            left,
+            right,
+            data_type,
+        } => ScalarExpr::Binary {
+            op: *op,
+            left: Box::new(rewrite_domain_value_expr(
+                left,
+                column_index,
+                column_name,
+                base_type,
+            )),
+            right: Box::new(rewrite_domain_value_expr(
+                right,
+                column_index,
+                column_name,
+                base_type,
+            )),
+            data_type: data_type.clone(),
+        },
+        ScalarExpr::IsNull { expr, negated } => ScalarExpr::IsNull {
+            expr: Box::new(rewrite_domain_value_expr(
+                expr,
+                column_index,
+                column_name,
+                base_type,
+            )),
+            negated: *negated,
+        },
+        ScalarExpr::FunctionCall {
+            name,
+            args,
+            data_type,
+        } => ScalarExpr::FunctionCall {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| rewrite_domain_value_expr(arg, column_index, column_name, base_type))
+                .collect(),
+            data_type: data_type.clone(),
+        },
+        other => other.clone(),
     }
 }
 
@@ -160,6 +235,261 @@ where
         }
         self.plan_cache_invalidate();
         Ok(run_ddl_command("CREATE POLICY"))
+    }
+
+    /// Persist a `CREATE TYPE name AS ENUM (...)` declaration.
+    pub(crate) fn execute_create_type_enum(
+        &self,
+        plan: &LogicalPlan,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::CreateTypeEnum {
+            type_name,
+            namespace,
+            labels,
+            ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_create_type_enum called with non-CreateTypeEnum plan",
+            ));
+        };
+        if snapshot.enum_types.contains_key(type_name)
+            || snapshot.composite_types.contains_key(type_name)
+            || snapshot.tables.contains_key(type_name)
+        {
+            return Err(ServerError::Catalog(
+                ultrasql_catalog::CatalogError::already_exists(type_name.clone()),
+            ));
+        }
+        let type_oid = self.state.persistent_catalog.next_oid();
+        let mut label_entries = Vec::with_capacity(labels.len());
+        for (idx, label) in labels.iter().enumerate() {
+            let sort_order = u32::try_from(idx + 1)
+                .map_err(|_| ServerError::ddl("CREATE TYPE enum label count overflow"))?;
+            label_entries.push(EnumLabelEntry {
+                oid: self.state.persistent_catalog.next_oid(),
+                label: label.clone(),
+                sort_order,
+            });
+        }
+        let entry = EnumTypeEntry {
+            oid: type_oid,
+            name: type_name.clone(),
+            schema_name: namespace.clone(),
+            labels: label_entries,
+        };
+        self.state
+            .persistent_catalog
+            .create_enum_type(entry.clone())?;
+        let ddl_txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let persist_result = self.state.persistent_catalog.persist_enum_type_rows(
+            &entry,
+            self.state.heap.as_ref(),
+            ddl_txn.xid,
+            ddl_txn.current_command,
+        );
+        if let Err(e) = persist_result {
+            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "abort of catalog-write txn failed after persist_enum_type_rows error",
+                );
+            }
+            let _ = self.state.persistent_catalog.drop_enum_type(type_name);
+            return Err(e.into());
+        }
+        self.state
+            .commit_transaction(ddl_txn, true, "CREATE TYPE catalog-write transaction")?;
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("CREATE TYPE"))
+    }
+
+    /// Persist a `CREATE TYPE name AS (...)` composite declaration.
+    pub(crate) fn execute_create_type_composite(
+        &self,
+        plan: &LogicalPlan,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::CreateTypeComposite {
+            type_name,
+            namespace,
+            attributes,
+            ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_create_type_composite called with non-CreateTypeComposite plan",
+            ));
+        };
+        if snapshot.enum_types.contains_key(type_name)
+            || snapshot.composite_types.contains_key(type_name)
+            || snapshot.tables.contains_key(type_name)
+        {
+            return Err(ServerError::Catalog(
+                ultrasql_catalog::CatalogError::already_exists(type_name.clone()),
+            ));
+        }
+        let entry = CompositeTypeEntry {
+            oid: self.state.persistent_catalog.next_oid(),
+            name: type_name.clone(),
+            schema_name: namespace.clone(),
+            schema: attributes.clone(),
+        };
+        self.state
+            .persistent_catalog
+            .create_composite_type(entry.clone())?;
+        let ddl_txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let persist_result = self.state.persistent_catalog.persist_composite_type_rows(
+            &entry,
+            self.state.heap.as_ref(),
+            ddl_txn.xid,
+            ddl_txn.current_command,
+        );
+        if let Err(e) = persist_result {
+            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "abort of catalog-write txn failed after persist_composite_type_rows error",
+                );
+            }
+            let _ = self.state.persistent_catalog.drop_composite_type(type_name);
+            return Err(e.into());
+        }
+        self.state
+            .commit_transaction(ddl_txn, true, "CREATE TYPE catalog-write transaction")?;
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("CREATE TYPE"))
+    }
+
+    /// Persist a `CREATE DOMAIN name AS base_type ...` declaration.
+    pub(crate) fn execute_create_domain(
+        &self,
+        plan: &LogicalPlan,
+        snapshot: &CatalogSnapshot,
+    ) -> Result<SelectResult, ServerError> {
+        let LogicalPlan::CreateDomain {
+            domain_name,
+            namespace,
+            base_type,
+            not_null,
+            checks,
+            ..
+        } = plan
+        else {
+            return Err(ServerError::Unsupported(
+                "execute_create_domain called with non-CreateDomain plan",
+            ));
+        };
+        if snapshot.enum_types.contains_key(domain_name)
+            || snapshot.composite_types.contains_key(domain_name)
+            || snapshot.domain_types.contains_key(domain_name)
+            || snapshot.tables.contains_key(domain_name)
+        {
+            return Err(ServerError::Catalog(
+                ultrasql_catalog::CatalogError::already_exists(domain_name.clone()),
+            ));
+        }
+        if crate::data_type_token(base_type).is_none() {
+            return Err(ServerError::ddl(format!(
+                "CREATE DOMAIN base type {base_type} is outside restart-persistable subset"
+            )));
+        }
+        let entry = DomainTypeEntry {
+            oid: self.state.persistent_catalog.next_oid(),
+            name: domain_name.clone(),
+            schema_name: namespace.clone(),
+            base_type: base_type.clone(),
+            not_null: *not_null,
+        };
+        self.state
+            .persistent_catalog
+            .create_domain_type(entry.clone())?;
+        let runtime = Arc::new(crate::DomainRuntimeConstraints {
+            base_type: base_type.clone(),
+            not_null: *not_null,
+            checks: checks
+                .iter()
+                .map(|check| crate::RuntimeCheckConstraint {
+                    name: check.name.clone(),
+                    expr: check.expr.clone(),
+                })
+                .collect(),
+        });
+        self.state.domain_constraints.insert(entry.oid, runtime);
+        let ddl_txn = self
+            .state
+            .txn_manager
+            .begin(ultrasql_txn::IsolationLevel::ReadCommitted);
+        let persist_result = self.state.persistent_catalog.persist_domain_type_rows(
+            &entry,
+            self.state.heap.as_ref(),
+            ddl_txn.xid,
+            ddl_txn.current_command,
+        );
+        if let Err(e) = persist_result {
+            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "abort of catalog-write txn failed after persist_domain_type_rows error",
+                );
+            }
+            let _ = self.state.persistent_catalog.drop_domain_type(domain_name);
+            self.state.domain_constraints.remove(&entry.oid);
+            return Err(e.into());
+        }
+        if let Err(e) = self.state.persist_domain_runtime_constraints_metadata() {
+            if let Err(abort_err) = self.state.txn_manager.abort(ddl_txn) {
+                tracing::warn!(
+                    error = %abort_err,
+                    "abort of catalog-write txn failed after domain-runtime metadata error",
+                );
+            }
+            let _ = self.state.persistent_catalog.drop_domain_type(domain_name);
+            self.state.domain_constraints.remove(&entry.oid);
+            return Err(e);
+        }
+        self.state
+            .commit_transaction(ddl_txn, true, "CREATE DOMAIN catalog-write transaction")?;
+        self.plan_cache_invalidate();
+        Ok(run_ddl_command("CREATE DOMAIN"))
+    }
+
+    fn domain_checks_for_columns(
+        &self,
+        columns: &ultrasql_core::Schema,
+    ) -> Result<Vec<crate::RuntimeCheckConstraint>, ServerError> {
+        let mut out = Vec::new();
+        for (idx, field) in columns.fields().iter().enumerate() {
+            let DataType::Domain {
+                oid,
+                name,
+                base_type,
+                ..
+            } = &field.data_type
+            else {
+                continue;
+            };
+            let runtime = self.state.domain_constraints.get(oid).ok_or_else(|| {
+                ServerError::ddl(format!(
+                    "domain metadata for '{}' was not loaded before CREATE TABLE",
+                    name
+                ))
+            })?;
+            for check in &runtime.checks {
+                out.push(crate::RuntimeCheckConstraint {
+                    name: format!("{}_{}", field.name, check.name),
+                    expr: rewrite_domain_value_expr(&check.expr, idx, &field.name, base_type),
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Persist a `CREATE TABLE` into the catalog.
@@ -302,9 +632,17 @@ where
                     .collect(),
             })
             .collect::<Vec<_>>();
+        let mut runtime_checks = checks
+            .iter()
+            .map(|check| crate::RuntimeCheckConstraint {
+                name: check.name.clone(),
+                expr: check.expr.clone(),
+            })
+            .collect::<Vec<_>>();
+        runtime_checks.extend(self.domain_checks_for_columns(columns)?);
         let mut persistent_constraint_rows = Vec::with_capacity(
             unique_constraints.len()
-                + checks.len()
+                + runtime_checks.len()
                 + runtime_foreign_keys.len()
                 + runtime_exclusion_constraints.len(),
         );
@@ -325,7 +663,7 @@ where
                 confkey: Vec::new(),
             });
         }
-        for check in checks {
+        for check in &runtime_checks {
             persistent_constraint_rows.push(ultrasql_catalog::persistent::ConstraintRow {
                 oid: self.state.persistent_catalog.next_oid(),
                 conname: check.name.clone(),
@@ -373,7 +711,7 @@ where
             || sequence_defaults.iter().any(Option::is_some)
             || identity_always.iter().any(|v| *v)
             || generated_stored.iter().any(Option::is_some)
-            || !checks.is_empty()
+            || !runtime_checks.is_empty()
             || !runtime_foreign_keys.is_empty()
             || !runtime_exclusion_constraints.is_empty()
         {
@@ -384,13 +722,7 @@ where
                     sequence_defaults: sequence_defaults.clone(),
                     identity_always: identity_always.clone(),
                     generated_stored: generated_stored.clone(),
-                    checks: checks
-                        .iter()
-                        .map(|check| crate::RuntimeCheckConstraint {
-                            name: check.name.clone(),
-                            expr: check.expr.clone(),
-                        })
-                        .collect(),
+                    checks: runtime_checks.clone(),
                     foreign_keys: runtime_foreign_keys.clone(),
                     exclusion_constraints: runtime_exclusion_constraints.clone(),
                     indexes: std::collections::HashMap::new(),

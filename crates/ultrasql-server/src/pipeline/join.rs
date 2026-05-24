@@ -415,9 +415,11 @@ const fn is_hash_friendly(dt: &DataType) -> bool {
             | DataType::Int32
             | DataType::Int64
             | DataType::Text { .. }
+            | DataType::Char { .. }
             | DataType::Bytea
             | DataType::Date
             | DataType::Time
+            | DataType::TimeTz
             | DataType::Timestamp
             | DataType::TimestampTz
             | DataType::Uuid

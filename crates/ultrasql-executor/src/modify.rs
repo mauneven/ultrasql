@@ -44,7 +44,7 @@ use ultrasql_vec::column::{Column, NumericColumn};
 
 use crate::eval::Eval;
 use crate::filter_op::batch_to_rows;
-use crate::row_codec::RowCodec;
+use crate::row_codec::{RowCodec, RowCodecError};
 use crate::seq_scan::build_batch;
 use crate::{ExecError, Operator};
 
@@ -61,6 +61,15 @@ fn check_not_null_violations(row: &[Value], schema: &Schema) -> Result<(), ExecE
         }
     }
     Ok(())
+}
+
+fn row_codec_error_to_exec(err: RowCodecError) -> ExecError {
+    match err {
+        RowCodecError::StringDataRightTruncation { detail, .. } => {
+            ExecError::StringDataRightTruncation(detail)
+        }
+        other => ExecError::TypeMismatch(other.to_string()),
+    }
 }
 
 /// Columnar UPDATE fast-path descriptor for the
@@ -1214,7 +1223,7 @@ impl<L: PageLoader + Send + Sync + std::fmt::Debug + 'static> Operator for Modif
                         let payload = self
                             .codec
                             .encode(target_row)
-                            .map_err(|e| ExecError::TypeMismatch(e.to_string()))?;
+                            .map_err(row_codec_error_to_exec)?;
                         if returning_active {
                             inserted_rows.push(target_row.to_vec());
                         }

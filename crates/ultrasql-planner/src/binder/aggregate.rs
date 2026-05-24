@@ -533,8 +533,14 @@ pub(super) fn bind_projection_with_scope(
                 }
             }
             SelectItem::Expr { expr, alias, .. } => {
-                let bound =
-                    bind_expr_with_ctes(expr, &binding_schema, catalog, cte_catalog, outer_scope)?;
+                let bound = bind_projection_expr_with_scope(
+                    expr,
+                    &binding_schema,
+                    from_scope,
+                    catalog,
+                    cte_catalog,
+                    outer_scope,
+                )?;
                 let name = alias
                     .as_ref()
                     .map_or_else(|| derive_output_name(expr, &bound), |a| a.value.clone());
@@ -543,4 +549,68 @@ pub(super) fn bind_projection_with_scope(
         }
     }
     Ok(out)
+}
+
+fn bind_projection_expr_with_scope(
+    expr: &Expr,
+    binding_schema: &Schema,
+    from_scope: &[ScopeEntry],
+    catalog: &dyn Catalog,
+    cte_catalog: &[(String, Schema)],
+    scope: &mut ScopeStack,
+) -> Result<ScalarExpr, PlanError> {
+    if let Some(expr) = bind_row_to_json_whole_row(expr, from_scope) {
+        return Ok(expr);
+    }
+    bind_expr_with_ctes(expr, binding_schema, catalog, cte_catalog, scope)
+}
+
+fn bind_row_to_json_whole_row(expr: &Expr, from_scope: &[ScopeEntry]) -> Option<ScalarExpr> {
+    let Expr::Call { name, args, .. } = expr else {
+        return None;
+    };
+    let func_name = name
+        .parts
+        .last()
+        .map_or("", |part| part.value.as_str())
+        .to_ascii_lowercase();
+    if func_name != "row_to_json" || args.len() != 1 {
+        return None;
+    }
+    let Expr::Column { name: arg_name } = &args[0] else {
+        return None;
+    };
+    if arg_name.parts.len() != 1 {
+        return None;
+    }
+    let qualifier = &arg_name.parts[0].value;
+    let entries = from_scope
+        .iter()
+        .filter(|entry| entry.qualifier.eq_ignore_ascii_case(qualifier))
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return None;
+    }
+    let fields = entries
+        .iter()
+        .map(|entry| (entry.field.name.clone(), entry.field.data_type.clone()))
+        .collect::<Vec<_>>();
+    let args = entries
+        .iter()
+        .map(|entry| ScalarExpr::Column {
+            name: entry.field.name.clone(),
+            index: entry.field_index,
+            data_type: entry.field.data_type.clone(),
+        })
+        .collect::<Vec<_>>();
+    let record_type = DataType::Record(fields);
+    Some(ScalarExpr::FunctionCall {
+        name: "row_to_json".to_owned(),
+        args: vec![ScalarExpr::FunctionCall {
+            name: "row".to_owned(),
+            args,
+            data_type: record_type,
+        }],
+        data_type: DataType::Jsonb,
+    })
 }

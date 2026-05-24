@@ -62,6 +62,10 @@ pub enum Statement {
     CreateTableAs(Box<CreateTableAsStmt>),
     /// `CREATE MATERIALIZED VIEW … AS SELECT …`.
     CreateMaterializedView(Box<CreateMaterializedViewStmt>),
+    /// `CREATE TYPE name AS ENUM (...)`.
+    CreateType(Box<CreateTypeStmt>),
+    /// `CREATE DOMAIN name AS base_type [constraints...]`.
+    CreateDomain(Box<CreateDomainStmt>),
     /// `CREATE POLICY name ON table USING (...) WITH CHECK (...)`.
     CreatePolicy(Box<CreatePolicyStmt>),
     /// `DROP TABLE …`.
@@ -179,6 +183,8 @@ impl Statement {
             Self::CreateTable(s) => s.span,
             Self::CreateTableAs(s) => s.span,
             Self::CreateMaterializedView(s) => s.span,
+            Self::CreateType(s) => s.span,
+            Self::CreateDomain(s) => s.span,
             Self::CreatePolicy(s) => s.span,
             Self::DropTable(s) => s.span,
             Self::AlterTable(s) => s.span,
@@ -359,6 +365,84 @@ pub struct CreateMaterializedViewStmt {
     pub source: Box<SelectStmt>,
     /// Source span of the entire statement.
     pub span: Span,
+}
+
+/// `CREATE TYPE name AS ...`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateTypeStmt {
+    /// Type name (possibly schema-qualified).
+    pub name: ObjectName,
+    /// Type body.
+    pub kind: CreateTypeKind,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// Body of a `CREATE TYPE` declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreateTypeKind {
+    /// `CREATE TYPE name AS ENUM ('label', ...)`.
+    Enum {
+        /// Enum labels in declaration order.
+        labels: Vec<String>,
+    },
+    /// `CREATE TYPE name AS (field type, ...)`.
+    Composite {
+        /// Composite attributes in declaration order.
+        attributes: Vec<CompositeTypeAttribute>,
+    },
+}
+
+/// One attribute in `CREATE TYPE name AS (...)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompositeTypeAttribute {
+    /// Attribute name.
+    pub name: Identifier,
+    /// Attribute type.
+    pub data_type: TypeName,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `CREATE DOMAIN name AS base_type [constraints...]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateDomainStmt {
+    /// Domain name (possibly schema-qualified).
+    pub name: ObjectName,
+    /// Underlying base type.
+    pub data_type: TypeName,
+    /// Domain constraints in declaration order.
+    pub constraints: Vec<DomainConstraint>,
+    /// Source span of the entire statement.
+    pub span: Span,
+}
+
+/// Constraint clause on a `CREATE DOMAIN` declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DomainConstraint {
+    /// `NOT NULL`.
+    NotNull {
+        /// Optional `CONSTRAINT name` prefix.
+        name: Option<Identifier>,
+        /// Source span.
+        span: Span,
+    },
+    /// `NULL`.
+    Null {
+        /// Optional `CONSTRAINT name` prefix.
+        name: Option<Identifier>,
+        /// Source span.
+        span: Span,
+    },
+    /// `CHECK (expr)`.
+    Check {
+        /// Optional `CONSTRAINT name` prefix.
+        name: Option<Identifier>,
+        /// Check expression; `VALUE` binds to the domain input value.
+        expr: Expr,
+        /// Source span.
+        span: Span,
+    },
 }
 
 /// `CREATE POLICY` permissiveness mode.
@@ -600,18 +684,20 @@ pub struct ExclusionElement {
     pub span: Span,
 }
 
-/// Parsed SQL type name, including optional type modifiers and array suffix.
+/// Parsed SQL type name, including optional type modifiers and array suffixes.
 ///
 /// Mirrors the CAST-target structure but is richer: it carries numeric
-/// modifiers (e.g. `VARCHAR(255)` → `[255]`) and an array flag.
+/// modifiers (e.g. `VARCHAR(255)` -> `[255]`) and array dimension count.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TypeName {
     /// Canonical lower-case type name.
     pub name: Identifier,
     /// Type modifiers: `VARCHAR(255)` → `[255]`, `NUMERIC(10,2)` → `[10, 2]`.
     pub type_modifiers: Vec<u32>,
-    /// Whether the type has a trailing `[]` (array type).
+    /// Whether the type has at least one trailing `[]` suffix.
     pub is_array: bool,
+    /// Number of trailing `[]` suffixes.
+    pub array_dimensions: u32,
     /// Source span.
     pub span: Span,
 }
@@ -1951,6 +2037,10 @@ pub enum BinaryOp {
     ShiftLeft,
     /// `>>` — bitwise shift right.
     ShiftRight,
+    /// `<<=` — network contained within or equal.
+    NetworkContainedEq,
+    /// `>>=` — network contains or equal.
+    NetworkContainsEq,
     /// `->` — JSON/JSONB element access by key, returns JSONB.
     JsonGet,
     /// `->>` — JSON/JSONB element access by key, returns text.
@@ -2014,7 +2104,9 @@ impl BinaryOp {
             | Self::RegexMatch
             | Self::RegexIMatch
             | Self::RegexNotMatch
-            | Self::RegexNotIMatch => 3,
+            | Self::RegexNotIMatch
+            | Self::NetworkContainedEq
+            | Self::NetworkContainsEq => 3,
             // JSON operators, concat, and bitwise and/or/xor
             Self::JsonGet
             | Self::JsonGetText

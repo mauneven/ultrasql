@@ -13,7 +13,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::warn;
 use ultrasql_catalog::TableEntry;
-use ultrasql_core::{DataType, RelationId, Schema, Value};
+use ultrasql_core::{DataType, RelationId, Schema, Value, coerce_bpchar_text};
 use ultrasql_executor::RowCodec;
 use ultrasql_txn::IsolationLevel;
 
@@ -257,7 +257,9 @@ impl ParquetColumnBuffer {
             DataType::Int64 => Self::Int64(Vec::with_capacity(PARQUET_COPY_BATCH_ROWS)),
             DataType::Float32 => Self::Float32(Vec::with_capacity(PARQUET_COPY_BATCH_ROWS)),
             DataType::Float64 => Self::Float64(Vec::with_capacity(PARQUET_COPY_BATCH_ROWS)),
-            DataType::Text { .. } => Self::Utf8(Vec::with_capacity(PARQUET_COPY_BATCH_ROWS)),
+            DataType::Text { .. } | DataType::Char { .. } => {
+                Self::Utf8(Vec::with_capacity(PARQUET_COPY_BATCH_ROWS))
+            }
             other => {
                 return Err(ServerError::CopyFormat(format!(
                     "COPY parquet unsupported type: {other}"
@@ -288,7 +290,8 @@ impl ParquetColumnBuffer {
             (Self::Float64(values), DataType::Float64, Value::Float64(value)) => {
                 values.push(Some(*value));
             }
-            (Self::Utf8(values), DataType::Text { .. }, Value::Text(value)) => {
+            (Self::Utf8(values), DataType::Text { .. }, Value::Text(value))
+            | (Self::Utf8(values), DataType::Char { .. }, Value::Char(value)) => {
                 values.push(Some(value.clone()));
             }
             (_, expected, got) => {
@@ -414,7 +417,7 @@ fn copy_arrow_data_type(data_type: &DataType) -> Result<ArrowDataType, ServerErr
         DataType::Int64 => Ok(ArrowDataType::Int64),
         DataType::Float32 => Ok(ArrowDataType::Float32),
         DataType::Float64 => Ok(ArrowDataType::Float64),
-        DataType::Text { .. } => Ok(ArrowDataType::Utf8),
+        DataType::Text { .. } | DataType::Char { .. } => Ok(ArrowDataType::Utf8),
         other => Err(ServerError::CopyFormat(format!(
             "COPY parquet unsupported type: {other}"
         ))),
@@ -423,7 +426,10 @@ fn copy_arrow_data_type(data_type: &DataType) -> Result<ArrowDataType, ServerErr
 
 fn arrow_type_matches_copy(arrow_type: &ArrowDataType, data_type: &DataType) -> bool {
     match (arrow_type, data_type) {
-        (ArrowDataType::Utf8 | ArrowDataType::LargeUtf8, DataType::Text { .. }) => true,
+        (
+            ArrowDataType::Utf8 | ArrowDataType::LargeUtf8,
+            DataType::Text { .. } | DataType::Char { .. },
+        ) => true,
         (_, _) => copy_arrow_data_type(data_type).is_ok_and(|expected| &expected == arrow_type),
     }
 }
@@ -448,6 +454,7 @@ fn arrow_cell_to_value(
         DataType::Float32 => float32_cell(array, row_index),
         DataType::Float64 => float64_cell(array, row_index),
         DataType::Text { .. } => text_cell(array, row_index),
+        DataType::Char { len } => char_cell(array, row_index, *len),
         other => Err(ServerError::CopyFormat(format!(
             "COPY parquet unsupported type: {other}"
         ))),
@@ -544,4 +551,15 @@ fn text_cell(array: &dyn Array, row_index: usize) -> Result<Value, ServerError> 
     Err(ServerError::CopyFormat(
         "COPY FROM parquet Utf8 downcast failed".to_owned(),
     ))
+}
+
+fn char_cell(array: &dyn Array, row_index: usize, len: Option<u32>) -> Result<Value, ServerError> {
+    let Value::Text(text) = text_cell(array, row_index)? else {
+        return Err(ServerError::CopyFormat(
+            "COPY FROM parquet Utf8 downcast failed".to_owned(),
+        ));
+    };
+    coerce_bpchar_text(&text, len, false)
+        .map(Value::Char)
+        .map_err(|err| ServerError::CopyFormat(err.to_string()))
 }

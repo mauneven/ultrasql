@@ -141,7 +141,10 @@ fn match_hybrid_text_column(expr: &ScalarExpr) -> Option<usize> {
     else {
         return None;
     };
-    if matches!(data_type, DataType::Text { .. } | DataType::Jsonb) {
+    if matches!(
+        data_type,
+        DataType::Text { .. } | DataType::Json | DataType::Jsonb
+    ) {
         Some(*index)
     } else {
         None

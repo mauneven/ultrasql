@@ -588,6 +588,46 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// Create a user-defined enum type.
+    CreateTypeEnum {
+        /// Case-folded bare type name.
+        type_name: String,
+        /// SQL namespace, usually `"public"`.
+        namespace: String,
+        /// Enum labels in declaration order.
+        labels: Vec<String>,
+        /// Always [`Schema::empty`]; DDL emits no rows.
+        schema: Schema,
+    },
+
+    /// Create a user-defined composite type.
+    CreateTypeComposite {
+        /// Case-folded bare type name.
+        type_name: String,
+        /// SQL namespace, usually `"public"`.
+        namespace: String,
+        /// Composite attributes in declaration order.
+        attributes: Schema,
+        /// Always [`Schema::empty`]; DDL emits no rows.
+        schema: Schema,
+    },
+
+    /// Create a user-defined domain type.
+    CreateDomain {
+        /// Case-folded bare domain name.
+        domain_name: String,
+        /// SQL namespace, usually `"public"`.
+        namespace: String,
+        /// Domain base type.
+        base_type: DataType,
+        /// Whether the domain rejects NULL values.
+        not_null: bool,
+        /// Domain CHECK predicates bound against a synthetic `VALUE` column.
+        checks: Vec<LogicalCheckConstraint>,
+        /// Always [`Schema::empty`]; DDL emits no rows.
+        schema: Schema,
+    },
+
     /// Join two child plans.
     ///
     /// For `LEFT JOIN`, every column on the right side of `schema` is
@@ -1479,6 +1519,9 @@ impl LogicalPlan {
                 | Self::Truncate { .. }
                 | Self::CreateTable { .. }
                 | Self::CreateMaterializedView { .. }
+                | Self::CreateTypeEnum { .. }
+                | Self::CreateTypeComposite { .. }
+                | Self::CreateDomain { .. }
                 | Self::CreateIndex { .. }
                 | Self::CreatePolicy { .. }
                 | Self::DropTable { .. }
@@ -1533,6 +1576,9 @@ impl LogicalPlan {
             | Self::Truncate { .. }
             | Self::CreateTable { .. }
             | Self::CreateMaterializedView { .. }
+            | Self::CreateTypeEnum { .. }
+            | Self::CreateTypeComposite { .. }
+            | Self::CreateDomain { .. }
             | Self::CreateIndex { .. }
             | Self::CreatePolicy { .. }
             | Self::DropTable { .. }
@@ -1573,6 +1619,9 @@ impl LogicalPlan {
             | Self::Truncate { schema, .. }
             | Self::CreateTable { schema, .. }
             | Self::CreateMaterializedView { schema, .. }
+            | Self::CreateTypeEnum { schema, .. }
+            | Self::CreateTypeComposite { schema, .. }
+            | Self::CreateDomain { schema, .. }
             | Self::Join { schema, .. }
             | Self::Aggregate { schema, .. }
             | Self::SetOp { schema, .. }
@@ -1901,6 +1950,57 @@ impl LogicalPlan {
                 }
                 out.push_str(")\n");
                 source.display_into(indent + 2, out);
+            }
+            Self::CreateTypeEnum {
+                type_name,
+                namespace,
+                labels,
+                ..
+            } => {
+                out.push_str(&pad);
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "CreateTypeEnum: {namespace}.{type_name} labels=[{}]\n",
+                        labels.join(", ")
+                    ),
+                );
+            }
+            Self::CreateTypeComposite {
+                type_name,
+                namespace,
+                attributes,
+                ..
+            } => {
+                out.push_str(&pad);
+                let _ = fmt::write(
+                    out,
+                    format_args!("CreateTypeComposite: {namespace}.{type_name} ("),
+                );
+                for (i, field) in attributes.fields().iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = fmt::write(out, format_args!("{} {}", field.name, field.data_type));
+                }
+                out.push_str(")\n");
+            }
+            Self::CreateDomain {
+                domain_name,
+                namespace,
+                base_type,
+                not_null,
+                checks,
+                ..
+            } => {
+                out.push_str(&pad);
+                let _ = fmt::write(
+                    out,
+                    format_args!(
+                        "CreateDomain: {namespace}.{domain_name} AS {base_type} not_null={not_null} checks={}\n",
+                        checks.len()
+                    ),
+                );
             }
             Self::Join {
                 left,

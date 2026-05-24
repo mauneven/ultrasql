@@ -80,6 +80,7 @@ mod hash_aggregate;
 mod hash_join;
 pub mod hybrid_search;
 pub mod index_scan;
+pub mod json_path;
 mod limit;
 pub mod lock_rows;
 pub mod materialize;
@@ -174,6 +175,11 @@ pub enum ExecError {
     /// caller is responsible for surfacing a richer message to the user.
     #[error("type mismatch: {0}")]
     TypeMismatch(String),
+
+    /// A string value exceeds the declared column width. The server maps
+    /// this to PostgreSQL SQLSTATE `22001`.
+    #[error("{0}")]
+    StringDataRightTruncation(String),
 
     /// A batch was produced that exceeds the configured maximum row
     /// count. The executor caps batches at 4096 rows
@@ -292,6 +298,11 @@ impl CancelFlag {
     /// Set the flag. Idempotent.
     pub fn cancel(&self) {
         self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Clear the flag after a query-scoped cancellation has been observed.
+    pub fn reset(&self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

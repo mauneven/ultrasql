@@ -35,6 +35,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-audit
       - name: verify tag matches workspace version
         shell: bash
         run: |
@@ -69,6 +70,7 @@ jobs:
               sys.exit(1)
           PY
       - run: cargo fmt --all -- --check
+      - run: cargo audit --deny yanked
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-features -- --nocapture
 

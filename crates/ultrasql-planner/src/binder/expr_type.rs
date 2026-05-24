@@ -14,12 +14,10 @@ pub(super) fn binary_result_type(
     rt: DataType,
 ) -> Result<DataType, PlanError> {
     match op {
-        BinaryOp::Add
-        | BinaryOp::Sub
-        | BinaryOp::Mul
-        | BinaryOp::Div
-        | BinaryOp::Mod
-        | BinaryOp::Pow => {
+        BinaryOp::Add | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::Pow => {
+            if matches!(op, BinaryOp::Add) && network_integer_add_type(&lt, &rt).is_some() {
+                return Ok(DataType::Inet);
+            }
             if matches!(lt, DataType::Null) {
                 Ok(rt)
             } else if matches!(rt, DataType::Null) {
@@ -35,8 +33,32 @@ pub(super) fn binary_result_type(
                 })
             }
         }
+        BinaryOp::Sub => {
+            if lt.is_ip_network() && rt.is_integer() {
+                Ok(DataType::Inet)
+            } else if lt.is_ip_network() && rt.is_ip_network() {
+                Ok(DataType::Int64)
+            } else if matches!(lt, DataType::Null) {
+                Ok(rt)
+            } else if matches!(rt, DataType::Null) {
+                Ok(lt)
+            } else if let Some(decimal_type) = decimal_arithmetic_type(op, &lt, &rt) {
+                Ok(decimal_type)
+            } else {
+                lt.numeric_join(&rt).map_err(|_| {
+                    PlanError::TypeMismatch(format!(
+                        "arithmetic operator {} on incompatible types {lt} and {rt}",
+                        display_binary(op)
+                    ))
+                })
+            }
+        }
         BinaryOp::Concat => {
-            if (lt.is_textlike() || matches!(lt, DataType::Null))
+            if (lt.is_bit_string() || matches!(lt, DataType::Null))
+                && (rt.is_bit_string() || matches!(rt, DataType::Null))
+            {
+                Ok(DataType::VarBit { max_len: None })
+            } else if (lt.is_textlike() || matches!(lt, DataType::Null))
                 && (rt.is_textlike() || matches!(rt, DataType::Null))
             {
                 Ok(DataType::Text { max_len: None })
@@ -110,15 +132,24 @@ pub(super) fn binary_result_type(
                 )))
             }
         }
-        BinaryOp::BitAnd
-        | BinaryOp::BitOr
-        | BinaryOp::BitXor
-        | BinaryOp::ShiftLeft
-        | BinaryOp::ShiftRight => {
+        BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor => {
             if matches!(lt, DataType::Null) {
                 Ok(rt)
             } else if matches!(rt, DataType::Null) {
                 Ok(lt)
+            } else if lt.is_network_address() && rt.is_network_address() {
+                if lt.is_ip_network() && rt.is_ip_network() {
+                    Ok(DataType::Inet)
+                } else if lt == rt {
+                    Ok(lt)
+                } else {
+                    Err(PlanError::TypeMismatch(format!(
+                        "network bitwise operator {} requires matching address families, got {lt} and {rt}",
+                        display_binary(op)
+                    )))
+                }
+            } else if lt.is_bit_string() && rt.is_bit_string() {
+                Ok(DataType::VarBit { max_len: None })
             } else if lt.is_integer() && rt.is_integer() {
                 lt.numeric_join(&rt).map_err(|_| {
                     PlanError::TypeMismatch(format!(
@@ -133,6 +164,41 @@ pub(super) fn binary_result_type(
                 )))
             }
         }
+        BinaryOp::ShiftLeft | BinaryOp::ShiftRight => {
+            if matches!(lt, DataType::Null) {
+                Ok(rt)
+            } else if matches!(rt, DataType::Null) {
+                Ok(lt)
+            } else if lt.is_ip_network() && rt.is_ip_network() {
+                Ok(DataType::Bool)
+            } else if lt.is_bit_string() && rt.is_integer() {
+                Ok(lt)
+            } else if lt.is_integer() && rt.is_integer() {
+                lt.numeric_join(&rt).map_err(|_| {
+                    PlanError::TypeMismatch(format!(
+                        "bitwise operator {} on incompatible types {lt} and {rt}",
+                        display_binary(op)
+                    ))
+                })
+            } else {
+                Err(PlanError::TypeMismatch(format!(
+                    "bitwise operator {} requires bit string/integer operands, got {lt} and {rt}",
+                    display_binary(op)
+                )))
+            }
+        }
+        BinaryOp::NetworkContainedEq | BinaryOp::NetworkContainsEq => {
+            if (lt.is_ip_network() || matches!(lt, DataType::Null))
+                && (rt.is_ip_network() || matches!(rt, DataType::Null))
+            {
+                Ok(DataType::Bool)
+            } else {
+                Err(PlanError::TypeMismatch(format!(
+                    "network operator {} requires inet/cidr operands, got {lt} and {rt}",
+                    display_binary(op)
+                )))
+            }
+        }
         BinaryOp::JsonGet | BinaryOp::JsonGetPath => Ok(DataType::Jsonb),
         BinaryOp::JsonGetText | BinaryOp::JsonGetPathText => Ok(DataType::Text { max_len: None }),
         BinaryOp::JsonContains
@@ -143,6 +209,11 @@ pub(super) fn binary_result_type(
         | BinaryOp::JsonHasAllKeys
         | BinaryOp::TextSearchMatch => Ok(DataType::Bool),
     }
+}
+
+fn network_integer_add_type(left: &DataType, right: &DataType) -> Option<DataType> {
+    ((left.is_ip_network() && right.is_integer()) || (left.is_integer() && right.is_ip_network()))
+        .then_some(DataType::Inet)
 }
 
 fn decimal_arithmetic_type(op: BinaryOp, lt: &DataType, rt: &DataType) -> Option<DataType> {
@@ -207,6 +278,12 @@ pub(super) fn comparable(a: &DataType, b: &DataType) -> bool {
     }
     if a.is_textlike() && b.is_textlike() {
         return true;
+    }
+    if a.is_bit_string() && b.is_bit_string() {
+        return true;
+    }
+    if a.is_network_address() && b.is_network_address() {
+        return (a.is_ip_network() && b.is_ip_network()) || a == b;
     }
     if a.is_temporal() && b.is_temporal() {
         return true;
@@ -296,6 +373,8 @@ pub(super) const fn display_binary(op: BinaryOp) -> &'static str {
         BinaryOp::BitXor => "#",
         BinaryOp::ShiftLeft => "<<",
         BinaryOp::ShiftRight => ">>",
+        BinaryOp::NetworkContainedEq => "<<=",
+        BinaryOp::NetworkContainsEq => ">>=",
         BinaryOp::JsonGet => "->",
         BinaryOp::JsonGetText => "->>",
         BinaryOp::JsonGetPath => "#>",

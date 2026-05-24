@@ -44,7 +44,7 @@ impl JsonbShapeCache {
         bytes: &[u8],
         column_idx: usize,
     ) -> Result<String, ServerError> {
-        let value = parse_json_value(bytes, column_idx)?;
+        let value = parse_json_value(bytes, column_idx, "jsonb")?;
         self.observe_shape(&value, bytes.len());
         serde_json::to_string(&value).map_err(|err| {
             ServerError::CopyFormat(format!("column {column_idx}: cannot encode jsonb: {err}"))
@@ -98,6 +98,13 @@ impl JsonbShapeCache {
     }
 }
 
+pub(super) fn parse_json_text(bytes: &[u8], column_idx: usize) -> Result<String, ServerError> {
+    parse_json_value(bytes, column_idx, "json")?;
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|err| ServerError::CopyFormat(format!("column {column_idx}: invalid json: {err}")))
+}
+
 pub(super) fn encode_pg_binary_jsonb(text: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(text.len() + 1);
     out.push(JSONB_BINARY_VERSION);
@@ -105,10 +112,14 @@ pub(super) fn encode_pg_binary_jsonb(text: &str) -> Vec<u8> {
     out
 }
 
-fn parse_json_value(bytes: &[u8], column_idx: usize) -> Result<JsonValue, ServerError> {
+fn parse_json_value(
+    bytes: &[u8],
+    column_idx: usize,
+    type_name: &str,
+) -> Result<JsonValue, ServerError> {
     let mut scratch = bytes.to_vec();
     simd_json::serde::from_slice::<JsonValue>(&mut scratch).map_err(|err| {
-        ServerError::CopyFormat(format!("column {column_idx}: invalid jsonb: {err}"))
+        ServerError::CopyFormat(format!("column {column_idx}: invalid {type_name}: {err}"))
     })
 }
 

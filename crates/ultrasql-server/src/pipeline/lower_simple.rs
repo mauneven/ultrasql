@@ -88,6 +88,9 @@ pub fn lower_plan(
         // than as a silent fall-through.
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::CreateTypeEnum { .. }
+        | LogicalPlan::CreateTypeComposite { .. }
+        | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
         | LogicalPlan::DropTable { .. }
@@ -116,7 +119,7 @@ pub fn lower_plan(
                 "LISTEN/NOTIFY/UNLISTEN reached operator lowerer; expected pubsub dispatch path",
             ))
         }
-        LogicalPlan::FunctionScan { name, args, .. } => lower_function_scan(name, args),
+        LogicalPlan::FunctionScan { name, args, .. } => lower_function_scan(name, args, None),
         LogicalPlan::Explain { .. } => Err(ServerError::Unsupported(
             "EXPLAIN reached operator lowerer; expected session dispatch path",
         )),

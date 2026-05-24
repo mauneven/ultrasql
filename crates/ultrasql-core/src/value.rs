@@ -13,7 +13,22 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use crate::bit_string::BitString;
+use crate::bpchar::{bpchar_semantic_text, coerce_bpchar_text};
+use crate::id::{Lsn, Oid};
+use crate::money::{format_money_text, parse_money_text};
+use crate::network::NetworkValue;
 use crate::types::{DataType, GeometryType, MAX_VECTOR_DIMS, RangeType};
+
+/// Microseconds in one civil day.
+pub const MICROS_PER_DAY: i64 = 86_400_000_000;
+
+const MICROS_PER_HOUR: i64 = 3_600_000_000;
+const MICROS_PER_MINUTE: i64 = 60_000_000;
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const TIMETZ_OFFSET_BITS: u32 = 18;
+const TIMETZ_OFFSET_BIAS_SECONDS: i32 = 86_400;
+const TIMETZ_OFFSET_MASK: i64 = (1_i64 << TIMETZ_OFFSET_BITS) - 1;
 
 /// Runtime representation for a PostgreSQL range value.
 ///
@@ -341,7 +356,7 @@ impl fmt::Display for SparseVector {
 /// implementation uses the raw bit pattern of `f32`/`f64` so that
 /// NaN-valued keys are treated as equal to themselves — an artificial
 /// but safe property for constraint enforcement.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Value {
     /// SQL NULL.
     Null,
@@ -353,14 +368,28 @@ pub enum Value {
     Int32(i32),
     /// `BIGINT`.
     Int64(i64),
+    /// PostgreSQL `oid`.
+    Oid(Oid),
+    /// PostgreSQL `regclass` relation OID alias.
+    RegClass(Oid),
+    /// PostgreSQL `regtype` type OID alias.
+    RegType(Oid),
+    /// PostgreSQL `pg_lsn`.
+    PgLsn(Lsn),
     /// `REAL`.
     Float32(f32),
     /// `DOUBLE PRECISION`.
     Float64(f64),
     /// UTF-8 text.
     Text(String),
-    /// JSONB-compatible textual payload.
+    /// Blank-padded `CHAR(n)` / `bpchar` text storage.
+    Char(String),
+    /// Textual JSON payload that preserves the accepted input spelling.
+    Json(String),
+    /// JSONB-compatible canonical textual payload.
     Jsonb(String),
+    /// Well-formed textual XML document payload.
+    Xml(String),
     /// pgvector-compatible finite single-precision vector.
     Vector(Vec<f32>),
     /// pgvector-compatible finite half-precision vector.
@@ -375,6 +404,10 @@ pub enum Value {
         /// Packed bit payload.
         bytes: Vec<u8>,
     },
+    /// SQL `BIT` / `VARBIT` value.
+    BitString(BitString),
+    /// SQL `INET` / `CIDR` / `MACADDR` / `MACADDR8` value.
+    Network(NetworkValue),
     /// Binary.
     Bytea(Vec<u8>),
     /// Microsecond-precision timestamp (no zone). Microseconds since
@@ -387,19 +420,29 @@ pub enum Value {
     Date(i32),
     /// Time — microseconds since midnight.
     Time(i64),
+    /// Time with time zone — microseconds since midnight plus fixed UTC
+    /// offset seconds, matching PostgreSQL `timetz` output semantics.
+    TimeTz {
+        /// Time of day in microseconds.
+        micros: i64,
+        /// UTC offset in seconds; east of UTC is positive.
+        offset_seconds: i32,
+    },
     /// UUID — raw 16 bytes.
     Uuid([u8; 16]),
-    /// Decimal/Numeric — scaled integer representation. The runtime
-    /// value is `value * 10^-scale`. Storage shape is `i64` to keep
-    /// the eval path numeric-fast; `DECIMAL(p, s)` columns whose
-    /// product or sum overflows i64 must be widened by the planner
-    /// before the operation lands here.
+    /// Decimal/Numeric — scaled integer runtime representation. The value
+    /// is `value * 10^-scale`. Heap storage uses the row codec's
+    /// PostgreSQL-style base-10000 numeric payload; the executor keeps
+    /// this shape to keep current eval paths numeric-fast.
     Decimal {
         /// Scaled integer payload.
         value: i64,
         /// Number of digits after the decimal point.
         scale: i32,
     },
+    /// Money — signed 64-bit cents, matching PostgreSQL's `Cash`
+    /// binary shape at the protocol boundary.
+    Money(i64),
     /// Interval — separate month / day / microsecond components, matching
     /// the PostgreSQL `INTERVAL` value shape so that `DATE + INTERVAL`
     /// month-aware arithmetic gives the same result.
@@ -430,6 +473,106 @@ pub enum Value {
 /// definition used by `Hash` below.
 impl Eq for Value {}
 
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Bool(left), Self::Bool(right)) => left == right,
+            (Self::Int16(left), Self::Int16(right)) => left == right,
+            (Self::Int32(left), Self::Int32(right)) => left == right,
+            (Self::Int64(left), Self::Int64(right)) => left == right,
+            (Self::Oid(left), Self::Oid(right))
+            | (Self::RegClass(left), Self::RegClass(right))
+            | (Self::RegType(left), Self::RegType(right)) => left == right,
+            (Self::PgLsn(left), Self::PgLsn(right)) => left == right,
+            (Self::Float32(left), Self::Float32(right)) => left == right,
+            (Self::Float64(left), Self::Float64(right)) => left == right,
+            (Self::Text(left), Self::Text(right)) => left == right,
+            (Self::Char(left), Self::Char(right)) => {
+                bpchar_semantic_text(left) == bpchar_semantic_text(right)
+            }
+            (Self::Json(left), Self::Json(right))
+            | (Self::Jsonb(left), Self::Jsonb(right))
+            | (Self::Xml(left), Self::Xml(right)) => left == right,
+            (Self::Vector(left), Self::Vector(right))
+            | (Self::HalfVec(left), Self::HalfVec(right)) => left == right,
+            (Self::SparseVec(left), Self::SparseVec(right)) => left == right,
+            (
+                Self::BitVec {
+                    dims: left_dims,
+                    bytes: left_bytes,
+                },
+                Self::BitVec {
+                    dims: right_dims,
+                    bytes: right_bytes,
+                },
+            ) => left_dims == right_dims && left_bytes == right_bytes,
+            (Self::BitString(left), Self::BitString(right)) => left == right,
+            (Self::Network(left), Self::Network(right)) => left == right,
+            (Self::Bytea(left), Self::Bytea(right)) => left == right,
+            (Self::Timestamp(left), Self::Timestamp(right))
+            | (Self::TimestampTz(left), Self::TimestampTz(right))
+            | (Self::Time(left), Self::Time(right)) => left == right,
+            (
+                Self::TimeTz {
+                    micros: left_micros,
+                    offset_seconds: left_offset,
+                },
+                Self::TimeTz {
+                    micros: right_micros,
+                    offset_seconds: right_offset,
+                },
+            ) => {
+                timetz_utc_micros(*left_micros, *left_offset)
+                    == timetz_utc_micros(*right_micros, *right_offset)
+            }
+            (Self::Date(left), Self::Date(right)) => left == right,
+            (Self::Uuid(left), Self::Uuid(right)) => left == right,
+            (
+                Self::Decimal {
+                    value: left_value,
+                    scale: left_scale,
+                },
+                Self::Decimal {
+                    value: right_value,
+                    scale: right_scale,
+                },
+            ) => left_value == right_value && left_scale == right_scale,
+            (Self::Money(left), Self::Money(right)) => left == right,
+            (
+                Self::Interval {
+                    months: left_months,
+                    days: left_days,
+                    microseconds: left_microseconds,
+                },
+                Self::Interval {
+                    months: right_months,
+                    days: right_days,
+                    microseconds: right_microseconds,
+                },
+            ) => {
+                left_months == right_months
+                    && left_days == right_days
+                    && left_microseconds == right_microseconds
+            }
+            (Self::Range(left), Self::Range(right)) => left == right,
+            (Self::Geometry(left), Self::Geometry(right)) => left == right,
+            (
+                Self::Array {
+                    element_type: left_type,
+                    elements: left_elements,
+                },
+                Self::Array {
+                    element_type: right_type,
+                    elements: right_elements,
+                },
+            ) => left_type == right_type && left_elements == right_elements,
+            (Self::Record(left), Self::Record(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
 #[allow(clippy::match_same_arms)] // Arms are spelled out per-variant for
 // explicitness; bodies look identical
 // because only two need special handling
@@ -447,6 +590,8 @@ impl Hash for Value {
             Self::Int16(v) => v.hash(state),
             Self::Int32(v) => v.hash(state),
             Self::Int64(v) => v.hash(state),
+            Self::Oid(v) | Self::RegClass(v) | Self::RegType(v) => v.hash(state),
+            Self::PgLsn(v) => v.hash(state),
             // Use the raw IEEE-754 bit pattern so the impl is consistent
             // with the `PartialEq` derive (which compares bits via f32 ==
             // for non-NaN, and treats NaN != NaN). For constraint checking
@@ -456,7 +601,8 @@ impl Hash for Value {
             Self::Float32(v) => v.to_bits().hash(state),
             Self::Float64(v) => v.to_bits().hash(state),
             Self::Text(v) => v.hash(state),
-            Self::Jsonb(v) => v.hash(state),
+            Self::Char(v) => bpchar_semantic_text(v).hash(state),
+            Self::Json(v) | Self::Jsonb(v) | Self::Xml(v) => v.hash(state),
             Self::Vector(v) | Self::HalfVec(v) => {
                 for element in v {
                     element.to_bits().hash(state);
@@ -467,14 +613,21 @@ impl Hash for Value {
                 dims.hash(state);
                 bytes.hash(state);
             }
+            Self::BitString(v) => v.hash(state),
+            Self::Network(v) => v.hash(state),
             Self::Bytea(v) => v.hash(state),
             Self::Timestamp(v) | Self::TimestampTz(v) | Self::Time(v) => v.hash(state),
+            Self::TimeTz {
+                micros,
+                offset_seconds,
+            } => timetz_utc_micros(*micros, *offset_seconds).hash(state),
             Self::Date(v) => v.hash(state),
             Self::Uuid(v) => v.hash(state),
             Self::Decimal { value, scale } => {
                 value.hash(state);
                 scale.hash(state);
             }
+            Self::Money(v) => v.hash(state),
             Self::Interval {
                 months,
                 days,
@@ -511,10 +664,19 @@ impl Value {
             Self::Int16(_) => DataType::Int16,
             Self::Int32(_) => DataType::Int32,
             Self::Int64(_) => DataType::Int64,
+            Self::Oid(_) => DataType::Oid,
+            Self::RegClass(_) => DataType::RegClass,
+            Self::RegType(_) => DataType::RegType,
+            Self::PgLsn(_) => DataType::PgLsn,
             Self::Float32(_) => DataType::Float32,
             Self::Float64(_) => DataType::Float64,
             Self::Text(_) => DataType::Text { max_len: None },
+            Self::Char(s) => DataType::Char {
+                len: u32::try_from(s.chars().count()).ok(),
+            },
+            Self::Json(_) => DataType::Json,
             Self::Jsonb(_) => DataType::Jsonb,
+            Self::Xml(_) => DataType::Xml,
             Self::Vector(v) => DataType::Vector {
                 dims: u32::try_from(v.len()).ok(),
             },
@@ -523,16 +685,22 @@ impl Value {
             },
             Self::SparseVec(v) => DataType::SparseVec { dims: Some(v.dims) },
             Self::BitVec { dims, .. } => DataType::BitVec { dims: Some(*dims) },
+            Self::BitString(v) => DataType::VarBit {
+                max_len: Some(v.len()),
+            },
+            Self::Network(v) => v.data_type(),
             Self::Bytea(_) => DataType::Bytea,
             Self::Timestamp(_) => DataType::Timestamp,
             Self::TimestampTz(_) => DataType::TimestampTz,
             Self::Date(_) => DataType::Date,
             Self::Time(_) => DataType::Time,
+            Self::TimeTz { .. } => DataType::TimeTz,
             Self::Uuid(_) => DataType::Uuid,
             Self::Decimal { scale, .. } => DataType::Decimal {
                 precision: None,
                 scale: Some(*scale),
             },
+            Self::Money(_) => DataType::Money,
             Self::Interval { .. } => DataType::Interval,
             Self::Range(v) => DataType::Range(v.range_type),
             Self::Geometry(v) => DataType::Geometry(v.geometry_type),
@@ -552,12 +720,20 @@ impl Value {
         match self {
             Self::Bool(_) => Some(1),
             Self::Int16(_) => Some(2),
-            Self::Int32(_) | Self::Float32(_) | Self::Date(_) => Some(4),
+            Self::Int32(_)
+            | Self::Float32(_)
+            | Self::Date(_)
+            | Self::Oid(_)
+            | Self::RegClass(_)
+            | Self::RegType(_) => Some(4),
             Self::Int64(_)
+            | Self::Money(_)
             | Self::Float64(_)
             | Self::Time(_)
+            | Self::TimeTz { .. }
             | Self::Timestamp(_)
-            | Self::TimestampTz(_) => Some(8),
+            | Self::TimestampTz(_)
+            | Self::PgLsn(_) => Some(8),
             Self::Uuid(_) => Some(16),
             _ => None,
         }
@@ -618,6 +794,21 @@ impl Value {
             out.push((hi << 4) | lo);
         }
         Some(out)
+    }
+
+    /// Validate a basic PostgreSQL `xml` literal and return stored text.
+    ///
+    /// The initial XML surface accepts one well-formed document with
+    /// balanced element tags, quoted attributes, comments, CDATA, and
+    /// processing instructions. It intentionally does not implement DTD
+    /// validation, namespaces, or XPath semantics.
+    #[must_use]
+    pub fn validate_xml_text(text: &str) -> Option<String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() || !xml_document_is_well_formed(trimmed) {
+            return None;
+        }
+        Some(trimmed.to_owned())
     }
 
     /// Parse a pgvector-style vector literal, such as `[1,2.5,-3]`.
@@ -709,6 +900,41 @@ impl Value {
         Some(Self::BitVec { dims, bytes })
     }
 
+    /// Parse a SQL bit-string literal containing only `0` and `1`.
+    #[must_use]
+    pub fn parse_bit_string(text: &str) -> Option<Self> {
+        BitString::parse(text).map(Self::BitString)
+    }
+
+    /// Parse a PostgreSQL network-address literal for a target type.
+    #[must_use]
+    pub fn parse_network(target: &DataType, text: &str) -> Option<Self> {
+        NetworkValue::parse_for_type(target, text).map(Self::Network)
+    }
+
+    /// Parse a PostgreSQL `oid` text literal.
+    #[must_use]
+    pub fn parse_oid_text(text: &str) -> Option<Oid> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') {
+            return None;
+        }
+        let raw = trimmed.parse::<u64>().ok()?;
+        u32::try_from(raw).ok().map(Oid::new)
+    }
+
+    /// Parse a PostgreSQL `pg_lsn` text literal (`HEX/HEX`).
+    #[must_use]
+    pub fn parse_pg_lsn_text(text: &str) -> Option<Lsn> {
+        let (high, low) = text.trim().split_once('/')?;
+        if high.is_empty() || low.is_empty() {
+            return None;
+        }
+        let high = u32::try_from(u64::from_str_radix(high, 16).ok()?).ok()?;
+        let low = u32::try_from(u64::from_str_radix(low, 16).ok()?).ok()?;
+        Some(Lsn::new((u64::from(high) << 32) | u64::from(low)))
+    }
+
     /// Parse PostgreSQL's common text-array form, e.g. `{1,2,NULL}`.
     ///
     /// The parser is intentionally conservative: it supports the
@@ -724,15 +950,17 @@ impl Value {
         let elements = if inner.is_empty() {
             Vec::new()
         } else {
-            split_array_elements(inner)
+            split_array_elements(inner)?
                 .into_iter()
                 .map(|part| parse_array_element(&element_type, part))
                 .collect::<Option<Vec<_>>>()?
         };
-        Some(Self::Array {
+        let value = Self::Array {
             element_type,
             elements,
-        })
+        };
+        value.array_dimensions()?;
+        Some(value)
     }
 
     /// Borrowed `i64` view if this is an integer type, widening from
@@ -743,6 +971,7 @@ impl Value {
             Self::Int16(v) => Some(i64::from(*v)),
             Self::Int32(v) => Some(i64::from(*v)),
             Self::Int64(v) => Some(*v),
+            Self::Oid(v) | Self::RegClass(v) | Self::RegType(v) => Some(i64::from(v.raw())),
             _ => None,
         }
     }
@@ -762,7 +991,7 @@ impl Value {
     #[must_use]
     pub fn as_text(&self) -> Option<&str> {
         match self {
-            Self::Text(s) => Some(s.as_str()),
+            Self::Text(s) | Self::Char(s) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -788,6 +1017,23 @@ impl Value {
         }
     }
 
+    /// Dimensions of a rectangular PostgreSQL array value.
+    ///
+    /// Returns `None` for non-array values and for ragged nested arrays.
+    /// Empty nested arrays report the dimensions that can be proven from
+    /// stored values, matching the runtime representation's lack of
+    /// explicit dimension headers.
+    #[must_use]
+    pub fn array_dimensions(&self) -> Option<Vec<usize>> {
+        match self {
+            Self::Array {
+                element_type,
+                elements,
+            } => array_dimensions(element_type, elements),
+            _ => None,
+        }
+    }
+
     /// Borrowed bool view. `None` for non-boolean.
     #[must_use]
     pub const fn as_bool(&self) -> Option<bool> {
@@ -796,6 +1042,192 @@ impl Value {
             _ => None,
         }
     }
+}
+
+fn xml_document_is_well_formed(text: &str) -> bool {
+    let mut stack: Vec<String> = Vec::new();
+    let mut cursor = 0_usize;
+    let mut saw_root = false;
+    let mut root_closed = false;
+
+    while let Some(relative) = text[cursor..].find('<') {
+        let open = cursor + relative;
+        if stack.is_empty() && root_closed && !text[cursor..open].trim().is_empty() {
+            return false;
+        }
+        let Some(next) = text.as_bytes().get(open + 1).copied() else {
+            return false;
+        };
+        match next {
+            b'?' => {
+                let Some(end) = text[open + 2..].find("?>") else {
+                    return false;
+                };
+                cursor = open + 2 + end + 2;
+            }
+            b'!' if text[open..].starts_with("<!--") => {
+                let Some(end) = text[open + 4..].find("-->") else {
+                    return false;
+                };
+                cursor = open + 4 + end + 3;
+            }
+            b'!' if text[open..].starts_with("<![CDATA[") => {
+                if stack.is_empty() {
+                    return false;
+                }
+                let Some(end) = text[open + 9..].find("]]>") else {
+                    return false;
+                };
+                cursor = open + 9 + end + 3;
+            }
+            b'!' => {
+                let Some(close) = xml_tag_end(text, open + 2) else {
+                    return false;
+                };
+                cursor = close + 1;
+            }
+            b'/' => {
+                let Some(close) = xml_tag_end(text, open + 2) else {
+                    return false;
+                };
+                let name = text[open + 2..close].trim();
+                if name.is_empty()
+                    || name.bytes().any(|byte| byte.is_ascii_whitespace())
+                    || xml_name_len(name.as_bytes()) != name.len()
+                    || stack.pop().as_deref() != Some(name)
+                {
+                    return false;
+                }
+                if stack.is_empty() {
+                    root_closed = true;
+                }
+                cursor = close + 1;
+            }
+            _ => {
+                if root_closed {
+                    return false;
+                }
+                let Some(close) = xml_tag_end(text, open + 1) else {
+                    return false;
+                };
+                let mut content = text[open + 1..close].trim();
+                let self_closing = content.ends_with('/');
+                if self_closing {
+                    content = content[..content.len() - 1].trim_end();
+                }
+                let name_len = xml_name_len(content.as_bytes());
+                if name_len == 0 {
+                    return false;
+                }
+                let name = &content[..name_len];
+                let rest = &content[name_len..];
+                if !xml_attributes_are_well_formed(rest) {
+                    return false;
+                }
+                saw_root = true;
+                if self_closing {
+                    if stack.is_empty() {
+                        root_closed = true;
+                    }
+                } else {
+                    stack.push(name.to_owned());
+                }
+                cursor = close + 1;
+            }
+        }
+    }
+
+    saw_root && stack.is_empty() && text[cursor..].trim().is_empty()
+}
+
+fn xml_tag_end(text: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, byte) in text.as_bytes().get(start..)?.iter().copied().enumerate() {
+        match (quote, byte) {
+            (Some(q), b) if b == q => quote = None,
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (None, b'>') => return Some(start + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn xml_name_len(bytes: &[u8]) -> usize {
+    let Some((&first, rest)) = bytes.split_first() else {
+        return 0;
+    };
+    if !xml_name_start_byte(first) {
+        return 0;
+    }
+    let mut len = 1_usize;
+    for byte in rest {
+        if !xml_name_byte(*byte) {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+fn xml_name_start_byte(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || matches!(byte, b'_' | b':')
+}
+
+fn xml_name_byte(byte: u8) -> bool {
+    xml_name_start_byte(byte) || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+}
+
+fn xml_attributes_are_well_formed(rest: &str) -> bool {
+    let bytes = rest.as_bytes();
+    let mut cursor = 0_usize;
+    while cursor < bytes.len() {
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            return true;
+        }
+        let name_len = xml_name_len(&bytes[cursor..]);
+        if name_len == 0 {
+            return false;
+        }
+        cursor += name_len;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'=') {
+            return false;
+        }
+        cursor += 1;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            cursor += 1;
+        }
+        let Some(quote @ (b'\'' | b'"')) = bytes.get(cursor).copied() else {
+            return false;
+        };
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(|byte| *byte != quote) {
+            if bytes[cursor] == b'<' {
+                return false;
+            }
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&quote) {
+            return false;
+        }
+        cursor += 1;
+    }
+    true
 }
 
 fn hex_nibble(byte: u8) -> Option<u8> {
@@ -815,10 +1247,13 @@ impl fmt::Display for Value {
             Self::Int16(v) => write!(f, "{v}"),
             Self::Int32(v) => write!(f, "{v}"),
             Self::Int64(v) => write!(f, "{v}"),
+            Self::Oid(v) | Self::RegClass(v) | Self::RegType(v) => write!(f, "{}", v.raw()),
+            Self::PgLsn(v) => write!(f, "{v}"),
             Self::Float32(v) => write!(f, "{v}"),
             Self::Float64(v) => write!(f, "{v}"),
-            Self::Text(s) => write!(f, "{s}"),
-            Self::Jsonb(s) => write!(f, "{s}"),
+            Self::Text(s) | Self::Char(s) | Self::Json(s) | Self::Jsonb(s) | Self::Xml(s) => {
+                write!(f, "{s}")
+            }
             Self::Bytea(b) => {
                 f.write_str("\\x")?;
                 for byte in b {
@@ -826,9 +1261,14 @@ impl fmt::Display for Value {
                 }
                 Ok(())
             }
-            Self::Timestamp(us) | Self::TimestampTz(us) => write!(f, "{us}us"),
+            Self::Timestamp(us) => f.write_str(&format_timestamp_micros(*us)),
+            Self::TimestampTz(us) => f.write_str(&format_timestamptz_micros_utc(*us)),
             Self::Date(d) => write!(f, "{}", format_date(*d)),
-            Self::Time(t) => write!(f, "{t}us"),
+            Self::Time(t) => f.write_str(&format_time_micros(*t)),
+            Self::TimeTz {
+                micros,
+                offset_seconds,
+            } => f.write_str(&format_timetz(*micros, *offset_seconds)),
             Self::Decimal { value, scale } => {
                 // PostgreSQL-style fixed-point text. `value` is the
                 // scaled integer; insert the decimal point `scale`
@@ -847,6 +1287,7 @@ impl fmt::Display for Value {
                     write!(f, "{sign}{whole}.{frac:0width$}", width = scale_u as usize)
                 }
             }
+            Self::Money(v) => f.write_str(&format_money_text(*v)),
             Self::Interval {
                 months,
                 days,
@@ -865,6 +1306,8 @@ impl fmt::Display for Value {
                 f.write_str("]")
             }
             Self::SparseVec(v) => write!(f, "{v}"),
+            Self::BitString(v) => write!(f, "{v}"),
+            Self::Network(v) => write!(f, "{v}"),
             Self::BitVec { dims, bytes } => {
                 let dims_usize =
                     usize::try_from(*dims).expect("u32 fits in usize on supported targets");
@@ -927,6 +1370,9 @@ fn parse_array_element(element_type: &DataType, raw: &str) -> Option<Value> {
     if trimmed.eq_ignore_ascii_case("NULL") {
         return Some(Value::Null);
     }
+    if let DataType::Array(inner) = element_type {
+        return Value::parse_array((**inner).clone(), trimmed);
+    }
     let text = unescape_array_text(trimmed)?;
     match element_type {
         DataType::Bool => match text.to_ascii_lowercase().as_str() {
@@ -937,21 +1383,30 @@ fn parse_array_element(element_type: &DataType, raw: &str) -> Option<Value> {
         DataType::Int16 => text.parse::<i16>().ok().map(Value::Int16),
         DataType::Int32 => text.parse::<i32>().ok().map(Value::Int32),
         DataType::Int64 => text.parse::<i64>().ok().map(Value::Int64),
+        DataType::Oid => Value::parse_oid_text(&text).map(Value::Oid),
+        DataType::RegClass => Value::parse_oid_text(&text).map(Value::RegClass),
+        DataType::RegType => Value::parse_oid_text(&text).map(Value::RegType),
+        DataType::PgLsn => Value::parse_pg_lsn_text(&text).map(Value::PgLsn),
         DataType::Float32 => text.parse::<f32>().ok().map(Value::Float32),
         DataType::Float64 => text.parse::<f64>().ok().map(Value::Float64),
         DataType::Text { .. } => Some(Value::Text(text)),
+        DataType::Char { len } => coerce_bpchar_text(&text, *len, false).ok().map(Value::Char),
+        DataType::Json => Some(Value::Json(text)),
         DataType::Jsonb => Some(Value::Jsonb(text)),
+        DataType::Xml => Value::validate_xml_text(&text).map(Value::Xml),
         DataType::Bytea => Value::parse_bytea(&text).map(Value::Bytea),
         DataType::Uuid => Value::parse_uuid(&text).map(Value::Uuid),
+        DataType::Money => parse_money_text(&text).ok(),
         _ => None,
     }
 }
 
-fn split_array_elements(text: &str) -> Vec<&str> {
+fn split_array_elements(text: &str) -> Option<Vec<&str>> {
     let mut out = Vec::new();
     let mut start = 0;
     let mut in_string = false;
     let mut escape = false;
+    let mut depth = 0_usize;
     for (idx, ch) in text.char_indices() {
         if escape {
             escape = false;
@@ -960,15 +1415,51 @@ fn split_array_elements(text: &str) -> Vec<&str> {
         match ch {
             '\\' if in_string => escape = true,
             '"' => in_string = !in_string,
-            ',' if !in_string => {
+            '{' if !in_string => {
+                depth = depth.checked_add(1)?;
+            }
+            '}' if !in_string => {
+                depth = depth.checked_sub(1)?;
+            }
+            ',' if !in_string && depth == 0 => {
                 out.push(&text[start..idx]);
                 start = idx + ch.len_utf8();
             }
             _ => {}
         }
     }
+    if in_string || escape || depth != 0 {
+        return None;
+    }
     out.push(&text[start..]);
-    out
+    Some(out)
+}
+
+fn array_dimensions(element_type: &DataType, elements: &[Value]) -> Option<Vec<usize>> {
+    let mut dims = vec![elements.len()];
+    if matches!(element_type, DataType::Array(_)) {
+        let mut nested_dims: Option<Vec<usize>> = None;
+        for element in elements {
+            if element.is_null() {
+                continue;
+            }
+            if !matches!(element, Value::Array { .. }) {
+                return None;
+            }
+            let dims = element.array_dimensions()?;
+            if let Some(expected) = &nested_dims {
+                if expected != &dims {
+                    return None;
+                }
+            } else {
+                nested_dims = Some(dims);
+            }
+        }
+        if let Some(mut nested) = nested_dims {
+            dims.append(&mut nested);
+        }
+    }
+    Some(dims)
 }
 
 fn unescape_array_text(text: &str) -> Option<String> {
@@ -1001,7 +1492,7 @@ fn unescape_array_text(text: &str) -> Option<String> {
 fn write_array_element(f: &mut fmt::Formatter<'_>, value: &Value) -> fmt::Result {
     match value {
         Value::Null => f.write_str("NULL"),
-        Value::Text(s) => write_array_text(f, s),
+        Value::Text(s) | Value::Char(s) => write_array_text(f, s),
         other => write!(f, "{other}"),
     }
 }
@@ -1172,6 +1663,227 @@ fn format_date(days_since_2000_01_01: i32) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
+/// Format `TIME` in PostgreSQL's default ISO style.
+#[must_use]
+pub fn format_time_micros(micros: i64) -> String {
+    if !(0..=MICROS_PER_DAY).contains(&micros) {
+        return format!("{micros}us");
+    }
+    let hour = micros / MICROS_PER_HOUR;
+    let rem = micros % MICROS_PER_HOUR;
+    let minute = rem / MICROS_PER_MINUTE;
+    let rem = rem % MICROS_PER_MINUTE;
+    let second = rem / MICROS_PER_SECOND;
+    let frac = rem % MICROS_PER_SECOND;
+    format_time_parts(hour, minute, second, frac)
+}
+
+/// Format `TIMESTAMP WITHOUT TIME ZONE` in PostgreSQL ISO style.
+#[must_use]
+pub fn format_timestamp_micros(micros: i64) -> String {
+    let days = micros.div_euclid(MICROS_PER_DAY);
+    let time = micros.rem_euclid(MICROS_PER_DAY);
+    let Ok(days) = i32::try_from(days) else {
+        return format!("{micros}us");
+    };
+    format!("{} {}", format_date(days), format_time_micros(time))
+}
+
+/// Format `TIMESTAMP WITH TIME ZONE` using UltraSQL's current UTC
+/// session timezone.
+#[must_use]
+pub fn format_timestamptz_micros_utc(micros: i64) -> String {
+    format!("{}+00", format_timestamp_micros(micros))
+}
+
+/// Format `TIME WITH TIME ZONE` in PostgreSQL ISO style.
+#[must_use]
+pub fn format_timetz(micros: i64, offset_seconds: i32) -> String {
+    format!(
+        "{}{}",
+        format_time_micros(micros),
+        format_timezone_offset(offset_seconds)
+    )
+}
+
+fn format_time_parts(hour: i64, minute: i64, second: i64, frac: i64) -> String {
+    if frac == 0 {
+        return format!("{hour:02}:{minute:02}:{second:02}");
+    }
+    let mut frac_text = format!("{frac:06}");
+    while frac_text.ends_with('0') {
+        frac_text.pop();
+    }
+    format!("{hour:02}:{minute:02}:{second:02}.{frac_text}")
+}
+
+fn format_timezone_offset(offset_seconds: i32) -> String {
+    let sign = if offset_seconds < 0 { '-' } else { '+' };
+    let abs = offset_seconds.unsigned_abs();
+    let hours = abs / 3_600;
+    let minutes = (abs % 3_600) / 60;
+    let seconds = abs % 60;
+    if seconds != 0 {
+        format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
+    } else if minutes != 0 {
+        format!("{sign}{hours:02}:{minutes:02}")
+    } else {
+        format!("{sign}{hours:02}")
+    }
+}
+
+/// Parse PostgreSQL-style `TIME` text. Any numeric timezone suffix is
+/// silently ignored, matching `time without time zone` coercion.
+#[must_use]
+pub fn parse_time_text(text: &str) -> Option<i64> {
+    parse_time_and_optional_offset(text).map(|(micros, _)| micros)
+}
+
+/// Parse PostgreSQL-style `TIMETZ` text into time-of-day and UTC offset.
+#[must_use]
+pub fn parse_timetz_text(text: &str) -> Option<(i64, i32)> {
+    parse_time_and_optional_offset(text).map(|(micros, offset)| (micros, offset.unwrap_or(0)))
+}
+
+fn parse_time_and_optional_offset(text: &str) -> Option<(i64, Option<i32>)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let (time_token, zone_token) = match tokens.as_slice() {
+        [single] => split_inline_timezone(single),
+        [first, second] if looks_like_iso_date(first) => (*second, None),
+        [first, second] => (*first, Some(*second)),
+        [first, second, third, ..] if looks_like_iso_date(first) => (*second, Some(*third)),
+        _ => return None,
+    };
+    let micros = parse_time_token(time_token)?;
+    let offset = match zone_token {
+        Some(zone) => Some(parse_timezone_offset(zone)?),
+        None => None,
+    };
+    Some((micros, offset))
+}
+
+fn looks_like_iso_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 10 && bytes.get(4) == Some(&b'-') && bytes.get(7) == Some(&b'-')
+}
+
+fn split_inline_timezone(token: &str) -> (&str, Option<&str>) {
+    let mut split_at = None;
+    for (idx, ch) in token.char_indices().skip(1) {
+        if ch == '+' || ch == '-' {
+            split_at = Some(idx);
+        }
+    }
+    split_at.map_or((token, None), |idx| (&token[..idx], Some(&token[idx..])))
+}
+
+fn parse_time_token(token: &str) -> Option<i64> {
+    let mut parts = token.splitn(3, ':');
+    let hour_text = parts.next()?;
+    let minute_text = parts.next()?;
+    let second_text = parts.next().unwrap_or("0");
+    let hour: i64 = hour_text.parse().ok()?;
+    let minute: i64 = minute_text.parse().ok()?;
+    let (second_part, frac_part) = second_text
+        .split_once('.')
+        .map_or((second_text, ""), |(sec, frac)| (sec, frac));
+    let second: i64 = second_part.parse().ok()?;
+    if !(0..=24).contains(&hour) || !(0..=59).contains(&minute) || !(0..=59).contains(&second) {
+        return None;
+    }
+    let mut frac_micros = 0_i64;
+    let mut scale = 100_000_i64;
+    for ch in frac_part.chars().take(6) {
+        let digit = i64::from(ch.to_digit(10)?);
+        frac_micros = frac_micros.checked_add(digit.checked_mul(scale)?)?;
+        scale /= 10;
+    }
+    if hour == 24 && (minute != 0 || second != 0 || frac_micros != 0) {
+        return None;
+    }
+    hour.checked_mul(MICROS_PER_HOUR)?
+        .checked_add(minute.checked_mul(MICROS_PER_MINUTE)?)?
+        .checked_add(second.checked_mul(MICROS_PER_SECOND)?)?
+        .checked_add(frac_micros)
+}
+
+fn parse_timezone_offset(token: &str) -> Option<i32> {
+    let lower = token.to_ascii_lowercase();
+    if matches!(lower.as_str(), "z" | "zulu" | "utc") {
+        return Some(0);
+    }
+    let sign = match token.as_bytes().first()? {
+        b'+' => 1_i32,
+        b'-' => -1_i32,
+        _ => return None,
+    };
+    let body = &token[1..];
+    let (hours, minutes, seconds) = if body.contains(':') {
+        let mut parts = body.split(':');
+        let hours = parts.next()?.parse::<i32>().ok()?;
+        let minutes = parts.next().unwrap_or("0").parse::<i32>().ok()?;
+        let seconds = parts.next().unwrap_or("0").parse::<i32>().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        (hours, minutes, seconds)
+    } else if body.len() > 2 {
+        let hours = body[..body.len() - 2].parse::<i32>().ok()?;
+        let minutes = body[body.len() - 2..].parse::<i32>().ok()?;
+        (hours, minutes, 0)
+    } else {
+        (body.parse::<i32>().ok()?, 0, 0)
+    };
+    if !(0..=15).contains(&hours) || !(0..=59).contains(&minutes) || !(0..=59).contains(&seconds) {
+        return None;
+    }
+    let total = hours
+        .checked_mul(3_600)?
+        .checked_add(minutes.checked_mul(60)?)?
+        .checked_add(seconds)?;
+    sign.checked_mul(total)
+}
+
+/// Pack `TIMETZ` into an `i64` batch payload.
+#[must_use]
+pub fn pack_timetz(micros: i64, offset_seconds: i32) -> Option<i64> {
+    if !(0..=MICROS_PER_DAY).contains(&micros)
+        || !(-TIMETZ_OFFSET_BIAS_SECONDS..=TIMETZ_OFFSET_BIAS_SECONDS).contains(&offset_seconds)
+    {
+        return None;
+    }
+    let biased = i64::from(offset_seconds.checked_add(TIMETZ_OFFSET_BIAS_SECONDS)?);
+    Some((micros << TIMETZ_OFFSET_BITS) | biased)
+}
+
+/// Unpack an `i64` batch payload into `TIMETZ` components.
+#[must_use]
+pub fn unpack_timetz(packed: i64) -> Option<(i64, i32)> {
+    if packed < 0 {
+        return None;
+    }
+    let micros = packed >> TIMETZ_OFFSET_BITS;
+    let biased = i32::try_from(packed & TIMETZ_OFFSET_MASK).ok()?;
+    let offset_seconds = biased.checked_sub(TIMETZ_OFFSET_BIAS_SECONDS)?;
+    if !(0..=MICROS_PER_DAY).contains(&micros) {
+        return None;
+    }
+    Some((micros, offset_seconds))
+}
+
+/// Normalize `TIMETZ` to UTC time-of-day micros for equality, hashing,
+/// ordering, and hash joins.
+#[must_use]
+pub fn timetz_utc_micros(micros: i64, offset_seconds: i32) -> i64 {
+    micros
+        .saturating_sub(i64::from(offset_seconds).saturating_mul(MICROS_PER_SECOND))
+        .rem_euclid(MICROS_PER_DAY)
+}
+
 /// Inverse of Howard Hinnant's `days_from_civil`, rebased on UltraSQL's
 /// 2000-01-01 date epoch.
 #[allow(
@@ -1252,12 +1964,48 @@ impl From<Vec<u8>> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse_money_text;
 
     #[test]
     fn date_display_uses_iso_calendar_text() {
         assert_eq!(Value::Date(0).to_string(), "2000-01-01");
         assert_eq!(Value::Date(-1).to_string(), "1999-12-31");
         assert_eq!(Value::Date(8_766).to_string(), "2024-01-01");
+    }
+
+    #[test]
+    fn temporal_display_uses_postgres_iso_text() {
+        assert_eq!(Value::Time(3_723_456_789).to_string(), "01:02:03.456789");
+        assert_eq!(
+            Value::Timestamp(90_245_006_789).to_string(),
+            "2000-01-02 01:04:05.006789"
+        );
+        assert_eq!(
+            Value::TimestampTz(90_245_000_000).to_string(),
+            "2000-01-02 01:04:05+00"
+        );
+        assert_eq!(
+            Value::TimeTz {
+                micros: 14_706_789_000,
+                offset_seconds: -28_800,
+            }
+            .to_string(),
+            "04:05:06.789-08"
+        );
+    }
+
+    #[test]
+    fn timetz_equality_uses_utc_time_of_day() {
+        assert_eq!(
+            Value::TimeTz {
+                micros: 64_800_000_000,
+                offset_seconds: -25_200,
+            },
+            Value::TimeTz {
+                micros: 61_200_000_000,
+                offset_seconds: -28_800,
+            }
+        );
     }
 
     #[test]
@@ -1270,6 +2018,7 @@ mod tests {
     fn data_type_matches_variant() {
         assert_eq!(Value::Int32(1).data_type(), DataType::Int32);
         assert_eq!(Value::Int64(1).data_type(), DataType::Int64);
+        assert_eq!(Value::Money(123).data_type(), DataType::Money);
         assert_eq!(Value::Bool(true).data_type(), DataType::Bool);
         assert_eq!(
             Value::Text("hi".into()).data_type(),
@@ -1283,11 +2032,28 @@ mod tests {
             .data_type(),
             DataType::Array(Box::new(DataType::Int32))
         );
+        assert_eq!(Value::Json(r#"{"a":1}"#.into()).data_type(), DataType::Json);
         assert_eq!(
             Value::Jsonb(r#"{"a":1}"#.into()).data_type(),
             DataType::Jsonb
         );
+        assert_eq!(Value::Xml("<root/>".into()).data_type(), DataType::Xml);
         assert_eq!(Value::Null.data_type(), DataType::Null);
+    }
+
+    #[test]
+    fn xml_validator_accepts_balanced_document_and_rejects_open_tag() {
+        assert_eq!(
+            Value::validate_xml_text(r#"<root attr="v"><child>text</child></root>"#),
+            Some(r#"<root attr="v"><child>text</child></root>"#.to_owned())
+        );
+        assert_eq!(
+            Value::validate_xml_text(r#"<?xml version="1.0"?><root><copy/></root>"#),
+            Some(r#"<?xml version="1.0"?><root><copy/></root>"#.to_owned())
+        );
+        assert_eq!(Value::validate_xml_text("<root>"), None);
+        assert_eq!(Value::validate_xml_text("<root attr=v/>"), None);
+        assert_eq!(Value::validate_xml_text("<a/><b/>"), None);
     }
 
     #[test]
@@ -1308,12 +2074,61 @@ mod tests {
     }
 
     #[test]
+    fn array_display_and_parse_multi_dimensional_round_trip() {
+        let matrix_type = DataType::Array(Box::new(DataType::Int32));
+        let value = Value::Array {
+            element_type: matrix_type.clone(),
+            elements: vec![
+                Value::Array {
+                    element_type: DataType::Int32,
+                    elements: vec![Value::Int32(1), Value::Int32(2)],
+                },
+                Value::Array {
+                    element_type: DataType::Int32,
+                    elements: vec![Value::Int32(3), Value::Int32(4)],
+                },
+            ],
+        };
+        assert_eq!(value.to_string(), "{{1,2},{3,4}}");
+        assert_eq!(value.array_dimensions(), Some(vec![2, 2]));
+        assert_eq!(
+            Value::parse_array(matrix_type.clone(), &value.to_string()),
+            Some(value)
+        );
+        assert_eq!(Value::parse_array(matrix_type, "{{1,2},{3}}"), None);
+    }
+
+    #[test]
     fn integer_widening_accessors() {
         assert_eq!(Value::Int16(7).as_i64(), Some(7));
         assert_eq!(Value::Int32(7).as_i64(), Some(7));
         assert_eq!(Value::Int64(7).as_i64(), Some(7));
         assert_eq!(Value::Float32(7.0).as_i64(), None);
         assert_eq!(Value::Null.as_i64(), None);
+    }
+
+    #[test]
+    fn money_display_and_parse_use_pg_cash_cents() {
+        assert_eq!(Value::Money(123_456).to_string(), "$1,234.56");
+        assert_eq!(Value::Money(-123).to_string(), "-$1.23");
+        assert_eq!(
+            parse_money_text("$1,234.565").expect("money parses"),
+            Value::Money(123_457)
+        );
+        assert_eq!(
+            parse_money_text("($1.23)").expect("parenthesized negative parses"),
+            Value::Money(-123)
+        );
+    }
+
+    #[test]
+    fn char_values_preserve_padding_but_compare_trimmed() {
+        assert_eq!(Value::Char("ok  ".to_owned()).to_string(), "ok  ");
+        assert_eq!(
+            Value::Char("ok  ".to_owned()).data_type(),
+            DataType::Char { len: Some(4) }
+        );
+        assert_eq!(Value::Char("ok  ".to_owned()), Value::Char("ok".to_owned()));
     }
 
     #[test]

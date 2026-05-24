@@ -5,7 +5,10 @@
 
 use serde_json::Value as JsonValue;
 use ultrasql_core::{DataType, Field, Schema, Value};
-use ultrasql_executor::{Eval, MemTableScan, Operator};
+use ultrasql_executor::{
+    Eval, MemTableScan, Operator,
+    json_path::{parse_json_path, select_json_path},
+};
 use ultrasql_planner::ScalarExpr;
 use ultrasql_vec::Batch;
 use ultrasql_vec::Bitmap;
@@ -33,13 +36,6 @@ enum JsonTableColumnKind {
     },
 }
 
-#[derive(Clone, Debug)]
-enum JsonPathStep {
-    Key(String),
-    All,
-    Index(usize),
-}
-
 /// Lower a `JSON_TABLE` logical function scan into a memory-backed scan.
 pub(super) fn lower_json_table_scan(args: &[ScalarExpr]) -> Result<Box<dyn Operator>, ServerError> {
     if args.len() != 3 {
@@ -55,7 +51,8 @@ pub(super) fn lower_json_table_scan(args: &[ScalarExpr]) -> Result<Box<dyn Opera
     let columns = parse_json_table_columns(&spec)?;
     let schema = json_table_schema(&columns)?;
     let document = parse_json_document(context)?;
-    let row_steps = parse_json_path(&row_path)?;
+    let row_steps = parse_json_path(&row_path)
+        .map_err(|err| ServerError::CopyFormat(format!("JSON_TABLE row path: {err}")))?;
     let row_items = select_json_path(&document, &row_steps);
     let rows = row_items
         .iter()
@@ -80,11 +77,11 @@ fn eval_text_arg(label: &str, expr: &ScalarExpr) -> Result<String, ServerError> 
 
 fn parse_json_document(value: Value) -> Result<JsonValue, ServerError> {
     match value {
-        Value::Jsonb(text) | Value::Text(text) => serde_json::from_str(&text)
+        Value::Json(text) | Value::Jsonb(text) | Value::Text(text) => serde_json::from_str(&text)
             .map_err(|err| ServerError::CopyFormat(format!("JSON_TABLE parse context: {err}"))),
         Value::Null => Ok(JsonValue::Null),
         other => Err(ServerError::CopyFormat(format!(
-            "JSON_TABLE context must be jsonb or text, got {other:?}"
+            "JSON_TABLE context must be json/jsonb or text, got {other:?}"
         ))),
     }
 }
@@ -154,7 +151,8 @@ fn json_table_data_type(type_name: &str) -> Result<DataType, ServerError> {
         "bigint" | "int8" => Ok(DataType::Int64),
         "float" | "float8" | "double" => Ok(DataType::Float64),
         "text" | "varchar" | "char" | "character" => Ok(DataType::Text { max_len: None }),
-        "json" | "jsonb" => Ok(DataType::Jsonb),
+        "json" => Ok(DataType::Json),
+        "jsonb" => Ok(DataType::Jsonb),
         other => Err(ServerError::CopyFormat(format!(
             "JSON_TABLE column type {other} is not supported"
         ))),
@@ -197,14 +195,18 @@ fn json_table_row(
                 let path = path
                     .as_deref()
                     .map_or_else(|| default_column_path(&column.name), ToOwned::to_owned);
-                let steps = parse_json_path(&path)?;
+                let steps = parse_json_path(&path).map_err(|err| {
+                    ServerError::CopyFormat(format!("JSON_TABLE column path {path}: {err}"))
+                })?;
                 row.push(Value::Bool(!select_json_path(item, &steps).is_empty()));
             }
             JsonTableColumnKind::Value { data_type, path } => {
                 let path = path
                     .as_deref()
                     .map_or_else(|| default_column_path(&column.name), ToOwned::to_owned);
-                let steps = parse_json_path(&path)?;
+                let steps = parse_json_path(&path).map_err(|err| {
+                    ServerError::CopyFormat(format!("JSON_TABLE column path {path}: {err}"))
+                })?;
                 let selected = select_json_path(item, &steps);
                 let value = selected
                     .first()
@@ -218,95 +220,6 @@ fn json_table_row(
 
 fn default_column_path(name: &str) -> String {
     format!("$.{name}")
-}
-
-fn parse_json_path(path: &str) -> Result<Vec<JsonPathStep>, ServerError> {
-    let bytes = path.as_bytes();
-    if bytes.first() != Some(&b'$') {
-        return Err(ServerError::CopyFormat(format!(
-            "JSON_TABLE path must start with $: {path}"
-        )));
-    }
-    let mut steps = Vec::new();
-    let mut idx = 1;
-    while idx < bytes.len() {
-        match bytes[idx] {
-            b'.' => {
-                idx += 1;
-                let start = idx;
-                while idx < bytes.len()
-                    && (bytes[idx].is_ascii_alphanumeric() || bytes[idx] == b'_')
-                {
-                    idx += 1;
-                }
-                if start == idx {
-                    return Err(ServerError::CopyFormat(format!(
-                        "JSON_TABLE empty object key in path {path}"
-                    )));
-                }
-                steps.push(JsonPathStep::Key(path[start..idx].to_owned()));
-            }
-            b'[' => {
-                idx += 1;
-                if idx < bytes.len() && bytes[idx] == b'*' {
-                    idx += 1;
-                    if bytes.get(idx) != Some(&b']') {
-                        return Err(ServerError::CopyFormat(format!(
-                            "JSON_TABLE expected ] in path {path}"
-                        )));
-                    }
-                    idx += 1;
-                    steps.push(JsonPathStep::All);
-                } else {
-                    let start = idx;
-                    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
-                        idx += 1;
-                    }
-                    if bytes.get(idx) != Some(&b']') || start == idx {
-                        return Err(ServerError::CopyFormat(format!(
-                            "JSON_TABLE expected array index in path {path}"
-                        )));
-                    }
-                    let index = path[start..idx].parse::<usize>().map_err(|err| {
-                        ServerError::CopyFormat(format!("JSON_TABLE path index {path}: {err}"))
-                    })?;
-                    idx += 1;
-                    steps.push(JsonPathStep::Index(index));
-                }
-            }
-            _ => {
-                return Err(ServerError::CopyFormat(format!(
-                    "JSON_TABLE unsupported path syntax: {path}"
-                )));
-            }
-        }
-    }
-    Ok(steps)
-}
-
-fn select_json_path<'a>(root: &'a JsonValue, steps: &[JsonPathStep]) -> Vec<&'a JsonValue> {
-    let mut current = vec![root];
-    for step in steps {
-        let mut next = Vec::new();
-        for value in current {
-            match (step, value) {
-                (JsonPathStep::Key(key), JsonValue::Object(object)) => {
-                    if let Some(value) = object.get(key) {
-                        next.push(value);
-                    }
-                }
-                (JsonPathStep::All, JsonValue::Array(values)) => next.extend(values),
-                (JsonPathStep::Index(index), JsonValue::Array(values)) => {
-                    if let Some(value) = values.get(*index) {
-                        next.push(value);
-                    }
-                }
-                _ => {}
-            }
-        }
-        current = next;
-    }
-    current
 }
 
 fn json_value_to_sql(value: &JsonValue, data_type: &DataType) -> Result<Value, ServerError> {
@@ -331,6 +244,7 @@ fn json_value_to_sql(value: &JsonValue, data_type: &DataType) -> Result<Value, S
             JsonValue::String(text) => text.clone(),
             other => other.to_string(),
         })),
+        DataType::Json => Ok(Value::Json(value.to_string())),
         DataType::Jsonb => Ok(Value::Jsonb(value.to_string())),
         other => Err(ServerError::CopyFormat(format!(
             "JSON_TABLE cannot project {other:?}"
@@ -441,12 +355,14 @@ fn values_to_column(
             }
             f64_column(values, validity)
         }
-        DataType::Text { .. } | DataType::Jsonb => {
+        DataType::Text { .. } | DataType::Json | DataType::Jsonb => {
             let mut values = Vec::with_capacity(rows.len());
             let mut validity = Bitmap::new(rows.len(), true);
             for (row_idx, row) in rows.iter().enumerate() {
                 match row.get(idx) {
-                    Some(Value::Text(value) | Value::Jsonb(value)) => values.push(value.clone()),
+                    Some(Value::Text(value) | Value::Json(value) | Value::Jsonb(value)) => {
+                        values.push(value.clone());
+                    }
                     Some(Value::Null) | None => {
                         values.push(String::new());
                         validity.set(row_idx, false);

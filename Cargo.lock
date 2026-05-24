@@ -3523,6 +3523,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "ipnet",
+ "libc",
  "md5",
  "parking_lot",
  "parquet",

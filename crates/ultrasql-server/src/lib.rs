@@ -65,7 +65,7 @@ pub mod workload;
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -73,8 +73,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
 use ultrasql_catalog::{
-    Catalog, CatalogSnapshot, IndexEntry, MutableCatalog, PersistentCatalog, StatisticRow,
-    TableEntry,
+    Catalog, CatalogSnapshot, DomainTypeEntry, IndexEntry, MutableCatalog, PersistentCatalog,
+    StatisticRow, TableEntry,
 };
 use ultrasql_core::constants::PAGE_SIZE;
 use ultrasql_core::{BlockNumber, DataType, Lsn, Oid, PageId, RelationId, Value, Xid};
@@ -235,6 +235,17 @@ pub struct TableRuntimeConstraints {
     /// slice; this side map lets same-process DML maintain indexes whose
     /// key is an expression or whose row membership is partial.
     pub indexes: std::collections::HashMap<ultrasql_core::Oid, RuntimeIndexMetadata>,
+}
+
+/// Runtime domain metadata keyed by domain `pg_type.oid`.
+#[derive(Clone, Debug)]
+pub struct DomainRuntimeConstraints {
+    /// Underlying base type used by storage and domain `VALUE` checks.
+    pub base_type: DataType,
+    /// Domain-level NOT NULL constraint.
+    pub not_null: bool,
+    /// Bound CHECK predicates against a synthetic `VALUE` column.
+    pub checks: Vec<RuntimeCheckConstraint>,
 }
 
 /// Same-process row-level security metadata keyed by table OID.
@@ -515,35 +526,78 @@ fn parse_referential_action(raw: &str) -> Result<LogicalReferentialAction, Serve
     }
 }
 
-fn data_type_token(ty: &DataType) -> Option<&'static str> {
+fn data_type_token(ty: &DataType) -> Option<String> {
     match ty {
-        DataType::Bool => Some("bool"),
-        DataType::Int16 => Some("i16"),
-        DataType::Int32 => Some("i32"),
-        DataType::Int64 => Some("i64"),
-        DataType::Float32 => Some("f32"),
-        DataType::Float64 => Some("f64"),
-        DataType::Text { .. } => Some("text"),
-        DataType::Date => Some("date"),
-        DataType::Time => Some("time"),
-        DataType::Timestamp => Some("ts"),
-        DataType::TimestampTz => Some("tstz"),
-        DataType::Null => Some("null"),
+        DataType::Bool => Some("bool".to_owned()),
+        DataType::Int16 => Some("i16".to_owned()),
+        DataType::Int32 => Some("i32".to_owned()),
+        DataType::Int64 => Some("i64".to_owned()),
+        DataType::Money => Some("money".to_owned()),
+        DataType::Float32 => Some("f32".to_owned()),
+        DataType::Float64 => Some("f64".to_owned()),
+        DataType::Text { .. } => Some("text".to_owned()),
+        DataType::Char { len: Some(len) } => Some(format!("char:{len}")),
+        DataType::Char { len: None } => Some("char".to_owned()),
+        DataType::Bit { len: Some(len) } => Some(format!("bit:{len}")),
+        DataType::Bit { len: None } => Some("bit".to_owned()),
+        DataType::VarBit {
+            max_len: Some(max_len),
+        } => Some(format!("varbit:{max_len}")),
+        DataType::VarBit { max_len: None } => Some("varbit".to_owned()),
+        DataType::Inet => Some("inet".to_owned()),
+        DataType::Cidr => Some("cidr".to_owned()),
+        DataType::MacAddr => Some("macaddr".to_owned()),
+        DataType::MacAddr8 => Some("macaddr8".to_owned()),
+        DataType::Date => Some("date".to_owned()),
+        DataType::Time => Some("time".to_owned()),
+        DataType::TimeTz => Some("timetz".to_owned()),
+        DataType::Timestamp => Some("ts".to_owned()),
+        DataType::TimestampTz => Some("tstz".to_owned()),
+        DataType::Null => Some("null".to_owned()),
         _ => None,
     }
 }
 
 fn data_type_from_token(token: &str) -> Option<DataType> {
+    if let Some(len_text) = token.strip_prefix("char:") {
+        return len_text
+            .parse::<u32>()
+            .ok()
+            .map(|len| DataType::Char { len: Some(len) });
+    }
+    if let Some(len_text) = token.strip_prefix("bit:") {
+        return len_text
+            .parse::<u32>()
+            .ok()
+            .map(|len| DataType::Bit { len: Some(len) });
+    }
+    if let Some(max_len_text) = token.strip_prefix("varbit:") {
+        return max_len_text
+            .parse::<u32>()
+            .ok()
+            .map(|max_len| DataType::VarBit {
+                max_len: Some(max_len),
+            });
+    }
     match token {
         "bool" => Some(DataType::Bool),
         "i16" => Some(DataType::Int16),
         "i32" => Some(DataType::Int32),
         "i64" => Some(DataType::Int64),
+        "money" => Some(DataType::Money),
         "f32" => Some(DataType::Float32),
         "f64" => Some(DataType::Float64),
         "text" => Some(DataType::Text { max_len: None }),
+        "char" => Some(DataType::Char { len: None }),
+        "bit" => Some(DataType::Bit { len: None }),
+        "varbit" => Some(DataType::VarBit { max_len: None }),
+        "inet" => Some(DataType::Inet),
+        "cidr" => Some(DataType::Cidr),
+        "macaddr" => Some(DataType::MacAddr),
+        "macaddr8" => Some(DataType::MacAddr8),
         "date" => Some(DataType::Date),
         "time" => Some(DataType::Time),
+        "timetz" => Some(DataType::TimeTz),
         "ts" => Some(DataType::Timestamp),
         "tstz" => Some(DataType::TimestampTz),
         "null" => Some(DataType::Null),
@@ -581,6 +635,8 @@ fn binary_op_token(op: BinaryOp) -> &'static str {
         BinaryOp::BitXor => "bit_xor",
         BinaryOp::ShiftLeft => "shl",
         BinaryOp::ShiftRight => "shr",
+        BinaryOp::NetworkContainedEq => "net_contained_eq",
+        BinaryOp::NetworkContainsEq => "net_contains_eq",
         BinaryOp::JsonGet => "json_get",
         BinaryOp::JsonGetText => "json_get_text",
         BinaryOp::JsonGetPath => "json_get_path",
@@ -629,6 +685,8 @@ fn binary_op_from_token(token: &str) -> Option<BinaryOp> {
         "bit_xor" => BinaryOp::BitXor,
         "shl" => BinaryOp::ShiftLeft,
         "shr" => BinaryOp::ShiftRight,
+        "net_contained_eq" => BinaryOp::NetworkContainedEq,
+        "net_contains_eq" => BinaryOp::NetworkContainsEq,
         "json_get" => BinaryOp::JsonGet,
         "json_get_text" => BinaryOp::JsonGetText,
         "json_get_path" => BinaryOp::JsonGetPath,
@@ -674,11 +732,20 @@ fn value_token(value: &Value) -> Option<String> {
         Value::Int16(v) => v.to_string(),
         Value::Int32(v) => v.to_string(),
         Value::Int64(v) => v.to_string(),
+        Value::Money(v) => v.to_string(),
         Value::Float32(v) => v.to_bits().to_string(),
         Value::Float64(v) => v.to_bits().to_string(),
-        Value::Text(v) | Value::Jsonb(v) => metadata_escape(v),
+        Value::Text(v) | Value::Char(v) | Value::Json(v) | Value::Jsonb(v) | Value::Xml(v) => {
+            metadata_escape(v)
+        }
+        Value::BitString(v) => metadata_escape(&v.to_string()),
+        Value::Network(v) => metadata_escape(&v.to_string()),
         Value::Date(v) => v.to_string(),
         Value::Time(v) | Value::Timestamp(v) | Value::TimestampTz(v) => v.to_string(),
+        Value::TimeTz {
+            micros,
+            offset_seconds,
+        } => format!("{micros}:{offset_seconds}"),
         _ => return None,
     })
 }
@@ -706,6 +773,11 @@ fn value_from_token(ty: &DataType, token: &str) -> Result<Value, ServerError> {
                 .parse::<i64>()
                 .map_err(|err| ServerError::Ddl(format!("bad int64 literal: {err}")))?,
         ),
+        DataType::Money => Value::Money(
+            token
+                .parse::<i64>()
+                .map_err(|err| ServerError::Ddl(format!("bad money literal: {err}")))?,
+        ),
         DataType::Float32 => {
             Value::Float32(f32::from_bits(token.parse::<u32>().map_err(|err| {
                 ServerError::Ddl(format!("bad float32 literal: {err}"))
@@ -717,6 +789,17 @@ fn value_from_token(ty: &DataType, token: &str) -> Result<Value, ServerError> {
             })?))
         }
         DataType::Text { .. } => Value::Text(metadata_unescape(token)?),
+        DataType::Char { .. } => Value::Char(metadata_unescape(token)?),
+        DataType::Bit { .. } | DataType::VarBit { .. } => {
+            let text = metadata_unescape(token)?;
+            Value::parse_bit_string(&text)
+                .ok_or_else(|| ServerError::Ddl("bad bit string literal".to_owned()))?
+        }
+        DataType::Inet | DataType::Cidr | DataType::MacAddr | DataType::MacAddr8 => {
+            let text = metadata_unescape(token)?;
+            Value::parse_network(ty, &text)
+                .ok_or_else(|| ServerError::Ddl("bad network literal".to_owned()))?
+        }
         DataType::Date => Value::Date(
             token
                 .parse::<i32>()
@@ -727,6 +810,19 @@ fn value_from_token(ty: &DataType, token: &str) -> Result<Value, ServerError> {
                 .parse::<i64>()
                 .map_err(|err| ServerError::Ddl(format!("bad time literal: {err}")))?,
         ),
+        DataType::TimeTz => {
+            let (micros, offset_seconds) = token
+                .split_once(':')
+                .ok_or_else(|| ServerError::Ddl("bad timetz literal".to_owned()))?;
+            Value::TimeTz {
+                micros: micros
+                    .parse::<i64>()
+                    .map_err(|err| ServerError::Ddl(format!("bad timetz time literal: {err}")))?,
+                offset_seconds: offset_seconds
+                    .parse::<i32>()
+                    .map_err(|err| ServerError::Ddl(format!("bad timetz offset literal: {err}")))?,
+            }
+        }
         DataType::Timestamp => Value::Timestamp(
             token
                 .parse::<i64>()
@@ -755,11 +851,11 @@ fn encode_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>) -> Option<()> {
             out.push("col".to_owned());
             out.push(index.to_string());
             out.push(metadata_escape(name));
-            out.push(data_type_token(data_type)?.to_owned());
+            out.push(data_type_token(data_type)?);
         }
         ScalarExpr::Literal { value, data_type } => {
             out.push("lit".to_owned());
-            out.push(data_type_token(data_type)?.to_owned());
+            out.push(data_type_token(data_type)?);
             out.push(value_token(value)?);
         }
         ScalarExpr::Unary {
@@ -769,7 +865,7 @@ fn encode_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>) -> Option<()> {
         } => {
             out.push("unary".to_owned());
             out.push(unary_op_token(*op).to_owned());
-            out.push(data_type_token(data_type)?.to_owned());
+            out.push(data_type_token(data_type)?);
             encode_scalar_expr(expr, out)?;
         }
         ScalarExpr::Binary {
@@ -780,7 +876,7 @@ fn encode_scalar_expr(expr: &ScalarExpr, out: &mut Vec<String>) -> Option<()> {
         } => {
             out.push("binary".to_owned());
             out.push(binary_op_token(*op).to_owned());
-            out.push(data_type_token(data_type)?.to_owned());
+            out.push(data_type_token(data_type)?);
             encode_scalar_expr(left, out)?;
             encode_scalar_expr(right, out)?;
         }
@@ -1739,6 +1835,19 @@ impl PlannerCatalog for CombinedCatalog<'_> {
         }
         self.fallback.lookup_table(name)
     }
+
+    fn lookup_type(&self, name: &str) -> Option<DataType> {
+        PlannerCatalog::lookup_type(self.snapshot, name).or_else(|| self.fallback.lookup_type(name))
+    }
+
+    fn lookup_table_oid(&self, name: &str) -> Option<Oid> {
+        PlannerCatalog::lookup_table_oid(self.snapshot, name)
+    }
+
+    fn lookup_type_oid(&self, name: &str) -> Option<Oid> {
+        PlannerCatalog::lookup_type_oid(self.snapshot, name)
+            .or_else(|| self.fallback.lookup_type_oid(name))
+    }
 }
 
 fn is_local_read_plan(plan: &LogicalPlan) -> bool {
@@ -1924,6 +2033,9 @@ pub struct Server {
     /// restart bootstrap are tracked separately because the catalog heap does
     /// not yet encode bound expressions.
     pub table_constraints: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
+    /// Same-process domain CHECK metadata keyed by domain OID.
+    pub domain_constraints:
+        Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<DomainRuntimeConstraints>>>,
     /// Same-process row-level security policies keyed by table OID.
     pub row_security: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRowSecurity>>>,
     /// Same-process sequence registry keyed by folded sequence name.
@@ -1948,6 +2060,8 @@ pub struct Server {
     pub autovacuum_config: AutovacuumConfig,
     /// Runtime statement logging knobs used by SQL execution and `pg_settings`.
     pub logging_config: LoggingConfig,
+    /// Idle-session timeout in milliseconds; `0` disables idle disconnects.
+    pub idle_session_timeout_ms: u64,
     /// Runtime WAL archive command exposed through `pg_settings`.
     pub wal_archive_config: WalArchiveConfig,
     /// Two-phase commit coordinator. Owns the on-disk state directory
@@ -2878,6 +2992,69 @@ fn recovery_replay_target_from_data_dir(
     Ok(target)
 }
 
+fn prepare_secure_data_dir(data_dir: &Path) -> Result<PathBuf, ServerError> {
+    reject_data_dir_symlink(data_dir)?;
+    std::fs::create_dir_all(data_dir).map_err(ServerError::Io)?;
+    reject_data_dir_symlink(data_dir)?;
+    let canonical = data_dir.canonicalize().map_err(ServerError::Io)?;
+    validate_data_dir_ownership(&canonical)?;
+    Ok(canonical)
+}
+
+fn reject_data_dir_symlink(data_dir: &Path) -> Result<(), ServerError> {
+    let metadata = match std::fs::symlink_metadata(data_dir) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(ServerError::Io(err)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(ServerError::ddl(format!(
+            "data directory {} is a symlink; use a canonical non-symlink path",
+            data_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_data_dir_ownership(data_dir: &Path) -> Result<(), ServerError> {
+    #[cfg(unix)]
+    {
+        validate_data_dir_owner(data_dir, effective_uid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = data_dir;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn validate_data_dir_owner(data_dir: &Path, expected_uid: u32) -> Result<(), ServerError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(data_dir).map_err(ServerError::Io)?;
+    if !metadata.is_dir() {
+        return Err(ServerError::ddl(format!(
+            "data directory {} is not a directory",
+            data_dir.display()
+        )));
+    }
+    let actual_uid = metadata.uid();
+    if actual_uid != expected_uid {
+        return Err(ServerError::ddl(format!(
+            "data directory {} is owned by uid {actual_uid}, expected effective uid {expected_uid}",
+            data_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and only reads process credentials.
+    unsafe { libc::geteuid() }
+}
+
 fn parse_recovery_lsn(value: &str) -> Result<Lsn, ServerError> {
     let value = value.trim();
     if let Some((high, low)) = value.split_once('/') {
@@ -3076,6 +3253,7 @@ impl Server {
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
             stats_catalog: parking_lot::RwLock::new(InMemoryStatsCatalog::new()),
             table_constraints: Arc::new(dashmap::DashMap::new()),
+            domain_constraints: Arc::new(dashmap::DashMap::new()),
             row_security: Arc::new(dashmap::DashMap::new()),
             sequences: Arc::new(dashmap::DashMap::new()),
             materialized_views: Arc::new(dashmap::DashMap::new()),
@@ -3087,6 +3265,7 @@ impl Server {
             pending_analyze_tables: dashmap::DashMap::new(),
             autovacuum_config: AutovacuumConfig::default(),
             logging_config: LoggingConfig::default(),
+            idle_session_timeout_ms: 0,
             wal_archive_config: WalArchiveConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,
@@ -3435,12 +3614,16 @@ impl Server {
     ///
     /// Returns [`ServerError::Io`] when `data_dir` cannot be opened, when
     /// the WAL writer thread cannot be spawned, or when the heap bootstrap
-    /// fails for a reason other than an empty heap.
+    /// fails for a reason other than an empty heap. Returns
+    /// [`ServerError::Ddl`] when the data directory itself is a symlink or
+    /// is not owned by the effective user on Unix.
     pub fn init(data_dir: &Path) -> Result<Self, ServerError> {
         use std::sync::Arc;
         use ultrasql_wal::{WalBuffer, WalWriter, WalWriterConfig};
         use wal_sink::WalBufferSink;
 
+        let data_dir = prepare_secure_data_dir(data_dir)?;
+        let data_dir = data_dir.as_path();
         let catalog_version = catalog_version::ensure_catalog_version(data_dir)?;
         tracing::info!(
             version = catalog_version.observed_version,
@@ -3539,6 +3722,7 @@ impl Server {
             vacuum_commit_counter: std::sync::atomic::AtomicU64::new(0),
             stats_catalog: parking_lot::RwLock::new(InMemoryStatsCatalog::new()),
             table_constraints: Arc::new(dashmap::DashMap::new()),
+            domain_constraints: Arc::new(dashmap::DashMap::new()),
             row_security: Arc::new(dashmap::DashMap::new()),
             sequences,
             materialized_views: Arc::new(dashmap::DashMap::new()),
@@ -3552,6 +3736,7 @@ impl Server {
             pending_analyze_tables: dashmap::DashMap::new(),
             autovacuum_config: AutovacuumConfig::default(),
             logging_config: LoggingConfig::default(),
+            idle_session_timeout_ms: 0,
             wal_archive_config: WalArchiveConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,
@@ -3564,10 +3749,164 @@ impl Server {
         };
         server.recover_commit_status_from_wal()?;
         server.rebuild_persistent_index_sidecars()?;
+        server.rebuild_domain_runtime_constraint_sidecars()?;
         server.rebuild_table_runtime_constraint_sidecars()?;
         server.rebuild_row_security_sidecars()?;
         server.rebuild_materialized_view_runtime_sidecars()?;
         Ok(server)
+    }
+
+    fn domain_runtime_metadata_path(&self) -> Option<std::path::PathBuf> {
+        self.data_dir
+            .as_ref()
+            .map(|dir| dir.join("pg_domain_runtime.meta"))
+    }
+
+    pub(crate) fn persist_domain_runtime_constraints_metadata(&self) -> Result<(), ServerError> {
+        let Some(path) = self.domain_runtime_metadata_path() else {
+            return Ok(());
+        };
+        let snapshot = self.catalog_snapshot();
+        let mut entries = snapshot
+            .domain_types_by_oid
+            .values()
+            .map(|entry| {
+                let runtime = self.domain_constraints.get(&entry.oid);
+                (entry.clone(), runtime.map(|guard| guard.as_ref().clone()))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(entry, _)| entry.oid.raw());
+
+        let mut out = String::from("# ultrasql domain runtime constraints v1\n");
+        for (entry, runtime) in entries {
+            let runtime = runtime.unwrap_or_else(|| DomainRuntimeConstraints {
+                base_type: entry.base_type.clone(),
+                not_null: entry.not_null,
+                checks: Vec::new(),
+            });
+            let Some(base_token) = data_type_token(&runtime.base_type) else {
+                return Err(ServerError::ddl(format!(
+                    "domain '{}' base type is outside restart-persistable metadata subset",
+                    entry.name
+                )));
+            };
+            out.push_str(&format!(
+                "domain\t{}\t{}\t{}\t{}\t{}\n",
+                metadata_escape(&entry.name),
+                entry.oid.raw(),
+                metadata_escape(&entry.schema_name),
+                metadata_escape(&base_token),
+                runtime.not_null
+            ));
+            for check in &runtime.checks {
+                let Some(expr) = encode_scalar_expr_field(&check.expr) else {
+                    return Err(ServerError::ddl(format!(
+                        "domain '{}' CHECK '{}' is outside restart-persistable metadata subset",
+                        entry.name, check.name
+                    )));
+                };
+                out.push_str(&format!(
+                    "check\t{}\t{}\t{}\n",
+                    entry.oid.raw(),
+                    metadata_escape(&check.name),
+                    metadata_escape(&expr)
+                ));
+            }
+        }
+        let tmp = path.with_extension("meta.tmp");
+        std::fs::write(&tmp, out).map_err(ServerError::Io)?;
+        std::fs::rename(tmp, path).map_err(ServerError::Io)?;
+        Ok(())
+    }
+
+    fn rebuild_domain_runtime_constraint_sidecars(&self) -> Result<(), ServerError> {
+        let Some(path) = self.domain_runtime_metadata_path() else {
+            return Ok(());
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(ServerError::Io(err)),
+        };
+        let mut domains: std::collections::HashMap<Oid, DomainTypeEntry> =
+            std::collections::HashMap::new();
+        let mut checks: std::collections::HashMap<Oid, Vec<RuntimeCheckConstraint>> =
+            std::collections::HashMap::new();
+        for (line_no, line) in text.lines().enumerate() {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let parts = line.split('\t').collect::<Vec<_>>();
+            match parts.first().copied() {
+                Some("domain") if parts.len() == 6 => {
+                    let oid = Oid::new(parts[2].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "domain-runtime metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    let base_token = metadata_unescape(parts[4])?;
+                    let base_type = data_type_from_token(&base_token).ok_or_else(|| {
+                        ServerError::Ddl(format!(
+                            "domain-runtime metadata line {} unknown base type",
+                            line_no + 1
+                        ))
+                    })?;
+                    let not_null = parts[5].parse::<bool>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "domain-runtime metadata line {} bad not-null flag: {err}",
+                            line_no + 1
+                        ))
+                    })?;
+                    domains.insert(
+                        oid,
+                        DomainTypeEntry {
+                            oid,
+                            name: metadata_unescape(parts[1])?,
+                            schema_name: metadata_unescape(parts[3])?,
+                            base_type,
+                            not_null,
+                        },
+                    );
+                }
+                Some("check") if parts.len() == 4 => {
+                    let oid = Oid::new(parts[1].parse::<u32>().map_err(|err| {
+                        ServerError::Ddl(format!(
+                            "domain-runtime metadata line {} bad oid: {err}",
+                            line_no + 1
+                        ))
+                    })?);
+                    checks.entry(oid).or_default().push(RuntimeCheckConstraint {
+                        name: metadata_unescape(parts[2])?,
+                        expr: decode_scalar_expr_field(&metadata_unescape(parts[3])?)?,
+                    });
+                }
+                _ => {
+                    return Err(ServerError::Ddl(format!(
+                        "malformed domain-runtime metadata line {}",
+                        line_no + 1
+                    )));
+                }
+            }
+        }
+        for (oid, entry) in domains {
+            if !self
+                .catalog_snapshot()
+                .domain_types_by_oid
+                .contains_key(&oid)
+            {
+                self.persistent_catalog.create_domain_type(entry.clone())?;
+            }
+            self.domain_constraints.insert(
+                oid,
+                Arc::new(DomainRuntimeConstraints {
+                    base_type: entry.base_type,
+                    not_null: entry.not_null,
+                    checks: checks.remove(&oid).unwrap_or_default(),
+                }),
+            );
+        }
+        Ok(())
     }
 
     fn table_runtime_metadata_path(&self) -> Option<std::path::PathBuf> {
@@ -4757,6 +5096,17 @@ impl Server {
     /// Replace runtime statement logging settings before the listener starts.
     pub fn set_logging_config(&mut self, config: LoggingConfig) {
         self.logging_config = config;
+    }
+
+    /// Return the idle-session timeout in milliseconds.
+    #[must_use]
+    pub const fn idle_session_timeout_ms(&self) -> u64 {
+        self.idle_session_timeout_ms
+    }
+
+    /// Replace the idle-session timeout before the listener starts.
+    pub const fn set_idle_session_timeout_ms(&mut self, timeout_ms: u64) {
+        self.idle_session_timeout_ms = timeout_ms;
     }
 
     /// Return runtime WAL archive settings.

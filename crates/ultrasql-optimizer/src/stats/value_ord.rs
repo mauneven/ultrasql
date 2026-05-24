@@ -19,7 +19,7 @@
 
 use std::cmp::Ordering;
 
-use ultrasql_core::Value;
+use ultrasql_core::{Value, bpchar_semantic_text, timetz_utc_micros};
 
 /// Compare two [`Value`]s under the statistics layer's total ordering.
 ///
@@ -48,14 +48,40 @@ pub(super) fn compare_values(a: &Value, b: &Value) -> Ordering {
         }
 
         (Value::Text(la), Value::Text(lb)) => la.cmp(lb),
-        (Value::Jsonb(la), Value::Jsonb(lb)) => la.cmp(lb),
+        (Value::Char(la), Value::Char(lb)) => {
+            bpchar_semantic_text(la).cmp(bpchar_semantic_text(lb))
+        }
+        (Value::Char(la), Value::Text(lb)) => bpchar_semantic_text(la).cmp(lb),
+        (Value::Text(la), Value::Char(lb)) => la.as_str().cmp(bpchar_semantic_text(lb)),
+        (Value::Json(la), Value::Json(lb))
+        | (Value::Jsonb(la), Value::Jsonb(lb))
+        | (Value::Xml(la), Value::Xml(lb)) => la.cmp(lb),
+        (Value::BitString(la), Value::BitString(lb)) => la.to_bit_text().cmp(&lb.to_bit_text()),
         (Value::Bytea(la), Value::Bytea(lb)) => la.cmp(lb),
         (Value::Bool(la), Value::Bool(lb)) => la.cmp(lb),
+        (Value::Money(la), Value::Money(lb)) => la.cmp(lb),
+        (Value::Oid(la), Value::Oid(lb))
+        | (Value::RegClass(la), Value::RegClass(lb))
+        | (Value::RegType(la), Value::RegType(lb)) => la.cmp(lb),
+        (Value::PgLsn(la), Value::PgLsn(lb)) => la.cmp(lb),
         (Value::Date(la), Value::Date(lb)) => la.cmp(lb),
         (Value::Time(la), Value::Time(lb))
         | (Value::Timestamp(la), Value::Timestamp(lb))
         | (Value::TimestampTz(la), Value::TimestampTz(lb)) => la.cmp(lb),
+        (
+            Value::TimeTz {
+                micros: la,
+                offset_seconds: lo,
+            },
+            Value::TimeTz {
+                micros: lb,
+                offset_seconds: ro,
+            },
+        ) => timetz_utc_micros(*la, *lo).cmp(&timetz_utc_micros(*lb, *ro)),
         (Value::Uuid(la), Value::Uuid(lb)) => la.cmp(lb),
+        (Value::Network(la), Value::Network(lb)) => (*la)
+            .cmp_network(*lb)
+            .unwrap_or_else(|| la.to_string().cmp(&lb.to_string())),
         (Value::Range(la), Value::Range(lb)) if la.range_type == lb.range_type => {
             la.to_string().cmp(&lb.to_string())
         }
@@ -117,6 +143,26 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             out.extend_from_slice(&i.to_be_bytes());
             out
         }
+        Value::Oid(oid) => {
+            let mut out = vec![30];
+            out.extend_from_slice(&oid.raw().to_be_bytes());
+            out
+        }
+        Value::RegClass(oid) => {
+            let mut out = vec![31];
+            out.extend_from_slice(&oid.raw().to_be_bytes());
+            out
+        }
+        Value::RegType(oid) => {
+            let mut out = vec![32];
+            out.extend_from_slice(&oid.raw().to_be_bytes());
+            out
+        }
+        Value::PgLsn(lsn) => {
+            let mut out = vec![33];
+            out.extend_from_slice(&lsn.raw().to_be_bytes());
+            out
+        }
         Value::Float32(f) => {
             // Normalize: canonicalize NaN to a single bit pattern;
             // use the bits directly for hashing.
@@ -144,8 +190,23 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             out.extend_from_slice(s.as_bytes());
             out
         }
+        Value::Char(s) => {
+            let mut out = vec![26];
+            out.extend_from_slice(bpchar_semantic_text(s).as_bytes());
+            out
+        }
+        Value::Json(s) => {
+            let mut out = vec![17];
+            out.extend_from_slice(s.as_bytes());
+            out
+        }
         Value::Jsonb(s) => {
             let mut out = vec![18];
+            out.extend_from_slice(s.as_bytes());
+            out
+        }
+        Value::Xml(s) => {
+            let mut out = vec![34];
             out.extend_from_slice(s.as_bytes());
             out
         }
@@ -174,6 +235,14 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             out.extend_from_slice(&t.to_be_bytes());
             out
         }
+        Value::TimeTz {
+            micros,
+            offset_seconds,
+        } => {
+            let mut out = vec![27];
+            out.extend_from_slice(&timetz_utc_micros(*micros, *offset_seconds).to_be_bytes());
+            out
+        }
         Value::Uuid(u) => {
             let mut out = vec![13];
             out.extend_from_slice(u);
@@ -183,6 +252,11 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             let mut out = vec![14];
             out.extend_from_slice(&value.to_be_bytes());
             out.extend_from_slice(&scale.to_be_bytes());
+            out
+        }
+        Value::Money(cents) => {
+            let mut out = vec![25];
+            out.extend_from_slice(&cents.to_be_bytes());
             out
         }
         Value::Interval {
@@ -240,6 +314,17 @@ pub(super) fn value_key(v: &Value) -> Vec<u8> {
             let mut out = vec![23];
             out.extend_from_slice(&dims.to_be_bytes());
             out.extend_from_slice(bytes);
+            out
+        }
+        Value::BitString(bits) => {
+            let mut out = vec![28];
+            out.extend_from_slice(&bits.len().to_be_bytes());
+            out.extend_from_slice(bits.bytes());
+            out
+        }
+        Value::Network(network) => {
+            let mut out = vec![29];
+            out.extend_from_slice(network.to_string().as_bytes());
             out
         }
         Value::Record(fields) => {
@@ -316,12 +401,16 @@ const fn discriminant(v: &Value) -> u8 {
         Value::Float32(_) => 5,
         Value::Float64(_) => 6,
         Value::Text(_) => 7,
+        Value::Char(_) => 26,
+        Value::Json(_) => 17,
         Value::Jsonb(_) => 18,
+        Value::Xml(_) => 34,
         Value::Bytea(_) => 8,
         Value::Timestamp(_) => 9,
         Value::TimestampTz(_) => 10,
         Value::Date(_) => 11,
         Value::Time(_) => 12,
+        Value::TimeTz { .. } => 27,
         Value::Uuid(_) => 13,
         Value::Decimal { .. } => 14,
         Value::Interval { .. } => 15,
@@ -333,6 +422,13 @@ const fn discriminant(v: &Value) -> u8 {
         Value::SparseVec(_) => 22,
         Value::BitVec { .. } => 23,
         Value::Record(_) => 24,
+        Value::Money(_) => 25,
+        Value::BitString(_) => 28,
+        Value::Network(_) => 29,
+        Value::Oid(_) => 30,
+        Value::RegClass(_) => 31,
+        Value::RegType(_) => 32,
+        Value::PgLsn(_) => 33,
     }
 }
 

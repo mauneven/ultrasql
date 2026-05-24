@@ -305,6 +305,9 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::Truncate { .. }
             | LogicalPlan::CreateTable { .. }
             | LogicalPlan::CreateMaterializedView { .. }
+            | LogicalPlan::CreateTypeEnum { .. }
+            | LogicalPlan::CreateTypeComposite { .. }
+            | LogicalPlan::CreateDomain { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::CreatePolicy { .. }
             | LogicalPlan::DropTable { .. }

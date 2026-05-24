@@ -22,23 +22,44 @@
     clippy::cast_possible_wrap
 )]
 
+pub mod bit_string;
+pub mod bpchar;
 pub mod cache;
 pub mod constants;
 pub mod csv;
+pub mod decimal;
 pub mod endian;
 pub mod error;
 pub mod id;
+pub mod money;
+pub mod network;
 pub mod schema;
 pub mod types;
 pub mod value;
 
+pub use bit_string::BitString;
+pub use bpchar::{BpCharError, bpchar_semantic_text, coerce_bpchar_text};
+pub use decimal::{
+    DecimalError, decode_pg_numeric_binary, encode_pg_numeric_binary, parse_decimal_text,
+};
 pub use error::{Error, Result};
 pub use id::{
     BlockNumber, CommandId, Lsn, Oid, PageId, RelationId, SegmentId, TableId, TupleId, Xid,
 };
+pub use money::{
+    MoneyError, decode_pg_money_binary, encode_pg_money_binary, format_money_text, parse_money_text,
+};
+pub use network::{InetAddr, MacAddr, MacAddr8, NetworkValue};
 pub use schema::{Field, Schema};
-pub use types::{DataType, GeometryType, MAX_VECTOR_DIMS, RangeType};
-pub use value::{BoundingBox, Datum, GeometryValue, RangeValue, SparseVector, Value};
+pub use types::{
+    DataType, GeometryType, MAX_VECTOR_DIMS, RangeType, composite_text_arity,
+    composite_text_matches_arity,
+};
+pub use value::{
+    BoundingBox, Datum, GeometryValue, MICROS_PER_DAY, RangeValue, SparseVector, Value,
+    format_time_micros, format_timestamp_micros, format_timestamptz_micros_utc, format_timetz,
+    pack_timetz, parse_time_text, parse_timetz_text, timetz_utc_micros, unpack_timetz,
+};
 
 /// Version of the on-disk page format. Bumping this is an RFC-level change.
 pub const ON_DISK_FORMAT_VERSION: u32 = 1;

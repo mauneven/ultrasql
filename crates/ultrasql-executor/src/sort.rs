@@ -18,7 +18,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use ultrasql_core::{Schema, Value};
+use ultrasql_core::{Schema, Value, bpchar_semantic_text, timetz_utc_micros};
 use ultrasql_planner::SortKey;
 use ultrasql_vec::Batch;
 
@@ -439,12 +439,38 @@ pub fn compare_values_nullable(a: &Value, b: &Value, nulls_first: bool) -> Order
         (Value::Int16(l), Value::Int16(r)) => l.cmp(r),
         (Value::Int32(l), Value::Int32(r)) => l.cmp(r),
         (Value::Int64(l), Value::Int64(r)) => l.cmp(r),
+        (Value::Oid(l), Value::Oid(r))
+        | (Value::RegClass(l), Value::RegClass(r))
+        | (Value::RegType(l), Value::RegType(r)) => l.cmp(r),
+        (Value::PgLsn(l), Value::PgLsn(r)) => l.cmp(r),
         (Value::Float32(l), Value::Float32(r)) => l.partial_cmp(r).unwrap_or(Ordering::Equal),
         (Value::Float64(l), Value::Float64(r)) => l.partial_cmp(r).unwrap_or(Ordering::Equal),
         (Value::Text(l), Value::Text(r)) => l.cmp(r),
+        (Value::Json(l), Value::Json(r))
+        | (Value::Jsonb(l), Value::Jsonb(r))
+        | (Value::Json(l), Value::Jsonb(r))
+        | (Value::Jsonb(l), Value::Json(r))
+        | (Value::Xml(l), Value::Xml(r)) => l.cmp(r),
+        (Value::Char(l), Value::Char(r)) => bpchar_semantic_text(l).cmp(bpchar_semantic_text(r)),
+        (Value::Char(l), Value::Text(r)) => bpchar_semantic_text(l).cmp(r),
+        (Value::Text(l), Value::Char(r)) => l.as_str().cmp(bpchar_semantic_text(r)),
+        (Value::BitString(l), Value::BitString(r)) => l.to_bit_text().cmp(&r.to_bit_text()),
+        (Value::Network(l), Value::Network(r)) => (*l)
+            .cmp_network(*r)
+            .unwrap_or_else(|| l.to_string().cmp(&r.to_string())),
         (Value::Timestamp(l), Value::Timestamp(r))
         | (Value::TimestampTz(l), Value::TimestampTz(r))
         | (Value::Time(l), Value::Time(r)) => l.cmp(r),
+        (
+            Value::TimeTz {
+                micros: lm,
+                offset_seconds: lo,
+            },
+            Value::TimeTz {
+                micros: rm,
+                offset_seconds: ro,
+            },
+        ) => timetz_utc_micros(*lm, *lo).cmp(&timetz_utc_micros(*rm, *ro)),
         (Value::Date(l), Value::Date(r)) => l.cmp(r),
         (
             Value::Decimal {
