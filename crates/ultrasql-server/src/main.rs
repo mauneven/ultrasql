@@ -1024,10 +1024,15 @@ mod tests {
 
     #[cfg(windows)]
     fn copy_restore_command(archive_dir: &Path) -> String {
+        let source = powershell_single_quoted_path(&archive_dir.join("%f"));
         format!(
-            "copy /Y \"{}\\%f\" \"%p\" >NUL 2>NUL",
-            archive_dir.display()
+            "powershell -NoProfile -NonInteractive -Command \"try {{ Copy-Item -LiteralPath {source} -Destination '%p' -Force -ErrorAction Stop; exit 0 }} catch {{ exit 1 }}\""
         )
+    }
+
+    #[cfg(windows)]
+    fn powershell_single_quoted_path(path: &Path) -> String {
+        format!("'{}'", path.to_string_lossy().replace('\'', "''"))
     }
 
     #[cfg(not(windows))]
