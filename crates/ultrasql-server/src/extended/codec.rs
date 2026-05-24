@@ -444,6 +444,9 @@ pub(crate) fn row_description_for_plan_with_formats(
             | LogicalPlan::CreateTypeComposite { .. }
             | LogicalPlan::CreateDomain { .. }
             | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::CreateRole { .. }
+            | LogicalPlan::AlterRole { .. }
+            | LogicalPlan::DropRole { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }
             | LogicalPlan::CreateSequence { .. }

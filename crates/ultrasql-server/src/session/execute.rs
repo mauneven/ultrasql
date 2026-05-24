@@ -489,6 +489,9 @@ where
                 | LogicalPlan::CreateDomain { .. }
                 | LogicalPlan::CreateIndex { .. }
                 | LogicalPlan::CreatePolicy { .. }
+                | LogicalPlan::CreateRole { .. }
+                | LogicalPlan::AlterRole { .. }
+                | LogicalPlan::DropRole { .. }
                 | LogicalPlan::CreateSequence { .. }
                 | LogicalPlan::AlterSequence { .. }
                 | LogicalPlan::DropSequence { .. }
@@ -523,6 +526,15 @@ where
             }
             LogicalPlan::CreatePolicy { .. } => {
                 return self.execute_create_policy(&plan, &catalog_snapshot);
+            }
+            LogicalPlan::CreateRole { .. } => {
+                return self.execute_create_role(&plan);
+            }
+            LogicalPlan::AlterRole { .. } => {
+                return self.execute_alter_role(&plan);
+            }
+            LogicalPlan::DropRole { .. } => {
+                return self.execute_drop_role(&plan);
             }
             LogicalPlan::CreateSequence { .. } => {
                 return self.execute_create_sequence(&plan);
@@ -1498,6 +1510,7 @@ where
                     Arc::clone(catalog_snapshot),
                     Arc::clone(&self.state.table_constraints),
                     Arc::clone(&self.state.sequences),
+                    Arc::clone(&self.state.role_catalog),
                     Arc::clone(&self.state.persistent_catalog),
                     Arc::clone(&self.state.time_partitions),
                     Arc::clone(&self.state.workload_recorder),
@@ -1526,6 +1539,7 @@ where
                     Arc::clone(catalog_snapshot),
                     Arc::clone(&self.state.table_constraints),
                     Arc::clone(&self.state.sequences),
+                    Arc::clone(&self.state.role_catalog),
                     Arc::clone(&self.state.persistent_catalog),
                     Arc::clone(&self.state.time_partitions),
                     Arc::clone(&self.state.workload_recorder),
@@ -2242,6 +2256,7 @@ where
             catalog_snapshot,
             Arc::clone(&self.state.table_constraints),
             Arc::clone(&self.state.sequences),
+            Arc::clone(&self.state.role_catalog),
             Arc::clone(&self.state.persistent_catalog),
             Arc::clone(&self.state.time_partitions),
             Arc::clone(&self.state.workload_recorder),

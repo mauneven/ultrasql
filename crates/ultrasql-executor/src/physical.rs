@@ -176,6 +176,9 @@ pub fn build_operator(
         | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::AlterRole { .. }
+        | LogicalPlan::DropRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

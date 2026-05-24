@@ -486,6 +486,7 @@ impl IndexFixture {
             catalog_snapshot: self.catalog.snapshot(),
             table_constraints: StdArc::new(dashmap::DashMap::new()),
             sequences: StdArc::new(dashmap::DashMap::new()),
+            role_catalog: StdArc::new(crate::auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
             persistent_catalog: StdArc::new(ultrasql_catalog::persistent::PersistentCatalog::new()),
             time_partitions: StdArc::new(dashmap::DashMap::new()),
             workload_recorder: StdArc::new(crate::workload::WorkloadRecorder::new()),

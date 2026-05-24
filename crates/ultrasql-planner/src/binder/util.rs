@@ -122,6 +122,9 @@ pub(super) fn plan_contains_outer_column(plan: &LogicalPlan) -> bool {
         | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::AlterRole { .. }
+        | LogicalPlan::DropRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

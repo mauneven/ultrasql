@@ -26,5 +26,5 @@ pub mod pg_authid;
 pub mod scram;
 
 pub use hba::{HbaConfig, HbaConnectionKind, HbaDatabaseMatch, HbaMethod, HbaRule, HbaUserMatch};
-pub use pg_authid::{AuthCatalog, InMemoryAuthCatalog, PasswordHash, RoleEntry};
+pub use pg_authid::{AuthCatalog, InMemoryAuthCatalog, PasswordHash, RoleEntry, RoleEntryChanges};
 pub use scram::{AuthError, ScramSha256Server};

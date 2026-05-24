@@ -9,14 +9,15 @@
 
 use ultrasql_core::{DataType, Field, GeometryType, MAX_VECTOR_DIMS, RangeType, Schema};
 use ultrasql_parser::ast::{
-    AlterSequenceStmt, AlterTableAction, AlterTableStmt, BinaryOp, ColumnConstraint, CommentStmt,
-    CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat, CopyOption,
-    CopySource as AstCopySource, CopyStmt, CreateDomainStmt, CreateIndexStmt,
-    CreateMaterializedViewStmt, CreatePolicyStmt, CreateSequenceStmt, CreateTableStmt,
-    CreateTypeKind, CreateTypeStmt, DomainConstraint, DropSequenceStmt, DropTableStmt, Expr,
-    Identifier, Literal, ObjectName, PolicyCommand as AstPolicyCommand,
-    PolicyPermissiveness as AstPolicyPermissiveness, ReferentialAction as AstReferentialAction,
-    SequenceOption, TableConstraint, TruncateStmt, TypeName,
+    AlterRoleStmt, AlterSequenceStmt, AlterTableAction, AlterTableStmt, BinaryOp, ColumnConstraint,
+    CommentStmt, CommentTarget, CopyDirection as AstCopyDirection, CopyFormat as AstCopyFormat,
+    CopyOption, CopySource as AstCopySource, CopyStmt, CreateDomainStmt, CreateIndexStmt,
+    CreateMaterializedViewStmt, CreatePolicyStmt, CreateRoleStmt, CreateSequenceStmt,
+    CreateTableStmt, CreateTypeKind, CreateTypeStmt, DomainConstraint, DropRoleStmt,
+    DropSequenceStmt, DropTableStmt, Expr, Identifier, Literal, ObjectName,
+    PolicyCommand as AstPolicyCommand, PolicyPermissiveness as AstPolicyPermissiveness,
+    ReferentialAction as AstReferentialAction, RoleOption as AstRoleOption,
+    RoleStmtKind as AstRoleStmtKind, SequenceOption, TableConstraint, TruncateStmt, TypeName,
 };
 
 use super::expr_bind::coerce_literal_to_type;
@@ -30,8 +31,9 @@ use crate::plan::{
     LogicalAggregatingIndexExpr, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalExclusionConstraint, LogicalExclusionElement, LogicalForeignKeyConstraint,
     LogicalIndexMethod, LogicalIndexOption, LogicalReferentialAction, LogicalRlsCommand,
-    LogicalRlsPermissiveness, LogicalRlsPolicy, LogicalSequenceChange, LogicalSequenceOptions,
-    LogicalTableOption, LogicalTenantPolicyExpr, LogicalTimePartition, LogicalUniqueConstraint,
+    LogicalRlsPermissiveness, LogicalRlsPolicy, LogicalRoleKind, LogicalRoleOptions,
+    LogicalSequenceChange, LogicalSequenceOptions, LogicalTableOption, LogicalTenantPolicyExpr,
+    LogicalTimePartition, LogicalUniqueConstraint,
 };
 
 struct RawUniqueConstraint {
@@ -1347,6 +1349,65 @@ pub(super) fn bind_drop_sequence(s: &DropSequenceStmt) -> Result<LogicalPlan, Pl
         cascade: s.cascade,
         schema: Schema::empty(),
     })
+}
+
+pub(super) fn bind_create_role(s: &CreateRoleStmt) -> Result<LogicalPlan, PlanError> {
+    Ok(LogicalPlan::CreateRole {
+        kind: bind_role_kind(s.kind),
+        role_name: s.name.value.to_ascii_lowercase(),
+        options: bind_role_options(&s.options),
+        if_not_exists: s.if_not_exists,
+        schema: Schema::empty(),
+    })
+}
+
+pub(super) fn bind_alter_role(s: &AlterRoleStmt) -> Result<LogicalPlan, PlanError> {
+    Ok(LogicalPlan::AlterRole {
+        kind: bind_role_kind(s.kind),
+        role_name: s.name.value.to_ascii_lowercase(),
+        options: bind_role_options(&s.options),
+        schema: Schema::empty(),
+    })
+}
+
+pub(super) fn bind_drop_role(s: &DropRoleStmt) -> Result<LogicalPlan, PlanError> {
+    Ok(LogicalPlan::DropRole {
+        kind: bind_role_kind(s.kind),
+        roles: s
+            .names
+            .iter()
+            .map(|name| name.value.to_ascii_lowercase())
+            .collect(),
+        if_exists: s.if_exists,
+        cascade: s.cascade,
+        schema: Schema::empty(),
+    })
+}
+
+fn bind_role_kind(kind: AstRoleStmtKind) -> LogicalRoleKind {
+    match kind {
+        AstRoleStmtKind::Role => LogicalRoleKind::Role,
+        AstRoleStmtKind::User => LogicalRoleKind::User,
+    }
+}
+
+fn bind_role_options(options: &[AstRoleOption]) -> LogicalRoleOptions {
+    let mut out = LogicalRoleOptions::default();
+    for option in options {
+        match option {
+            AstRoleOption::Superuser(value) => out.superuser = Some(*value),
+            AstRoleOption::Inherit(value) => out.inherit = Some(*value),
+            AstRoleOption::CreateRole(value) => out.create_role = Some(*value),
+            AstRoleOption::CreateDb(value) => out.create_db = Some(*value),
+            AstRoleOption::Login(value) => out.can_login = Some(*value),
+            AstRoleOption::Replication(value) => out.replication = Some(*value),
+            AstRoleOption::BypassRls(value) => out.bypass_rls = Some(*value),
+            AstRoleOption::ConnectionLimit(value) => out.connection_limit = Some(*value),
+            AstRoleOption::Password(value) => out.password = Some(value.clone()),
+            AstRoleOption::ValidUntil(value) => out.valid_until = Some(value.clone()),
+        }
+    }
+    out
 }
 
 pub(super) fn bind_comment(

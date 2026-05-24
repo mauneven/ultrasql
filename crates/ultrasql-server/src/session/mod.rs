@@ -31,6 +31,7 @@ mod jsonb_ingest;
 mod meta_stmt;
 mod notify;
 mod parquet_copy;
+mod role;
 mod run;
 mod sequence;
 mod startup;

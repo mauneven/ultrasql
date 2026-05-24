@@ -1091,6 +1091,7 @@ where
             catalog_snapshot: Arc::clone(&snapshot),
             table_constraints: Arc::clone(&self.state.table_constraints),
             sequences: Arc::clone(&self.state.sequences),
+            role_catalog: Arc::clone(&self.state.role_catalog),
             persistent_catalog: Arc::clone(&self.state.persistent_catalog),
             time_partitions: Arc::clone(&self.state.time_partitions),
             workload_recorder: Arc::clone(&self.state.workload_recorder),

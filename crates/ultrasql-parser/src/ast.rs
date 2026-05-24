@@ -68,10 +68,16 @@ pub enum Statement {
     CreateDomain(Box<CreateDomainStmt>),
     /// `CREATE POLICY name ON table USING (...) WITH CHECK (...)`.
     CreatePolicy(Box<CreatePolicyStmt>),
+    /// `CREATE ROLE name ...` / `CREATE USER name ...`.
+    CreateRole(Box<CreateRoleStmt>),
     /// `DROP TABLE …`.
     DropTable(DropTableStmt),
+    /// `DROP ROLE name [, ...]` / `DROP USER name [, ...]`.
+    DropRole(DropRoleStmt),
     /// `ALTER TABLE …`.
     AlterTable(Box<AlterTableStmt>),
+    /// `ALTER ROLE name ...` / `ALTER USER name ...`.
+    AlterRole(Box<AlterRoleStmt>),
     /// `CREATE SCHEMA …`.
     CreateSchema(CreateSchemaStmt),
     /// `DROP SCHEMA …`.
@@ -186,8 +192,11 @@ impl Statement {
             Self::CreateType(s) => s.span,
             Self::CreateDomain(s) => s.span,
             Self::CreatePolicy(s) => s.span,
+            Self::CreateRole(s) => s.span,
             Self::DropTable(s) => s.span,
+            Self::DropRole(s) => s.span,
             Self::AlterTable(s) => s.span,
+            Self::AlterRole(s) => s.span,
             Self::CreateSchema(s) => s.span,
             Self::DropSchema(s) => s.span,
             Self::SetVar(s) => s.span,
@@ -485,6 +494,83 @@ pub struct CreatePolicyStmt {
     pub using: Option<Expr>,
     /// Write acceptance predicate.
     pub with_check: Option<Expr>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// Role-management statement family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoleStmtKind {
+    /// `ROLE`.
+    Role,
+    /// `USER`, a PostgreSQL alias for a login-capable role.
+    User,
+}
+
+/// One role attribute supplied to `CREATE ROLE` / `ALTER ROLE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoleOption {
+    /// `SUPERUSER` / `NOSUPERUSER`.
+    Superuser(bool),
+    /// `INHERIT` / `NOINHERIT`.
+    Inherit(bool),
+    /// `CREATEROLE` / `NOCREATEROLE`.
+    CreateRole(bool),
+    /// `CREATEDB` / `NOCREATEDB`.
+    CreateDb(bool),
+    /// `LOGIN` / `NOLOGIN`.
+    Login(bool),
+    /// `REPLICATION` / `NOREPLICATION`.
+    Replication(bool),
+    /// `BYPASSRLS` / `NOBYPASSRLS`.
+    BypassRls(bool),
+    /// `CONNECTION LIMIT n`.
+    ConnectionLimit(i32),
+    /// `PASSWORD 'secret'` or `PASSWORD NULL`.
+    Password(Option<String>),
+    /// `VALID UNTIL 'timestamp'`.
+    ValidUntil(String),
+}
+
+/// `CREATE ROLE [IF NOT EXISTS] name [WITH] [options...]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateRoleStmt {
+    /// Whether the statement used `ROLE` or `USER`.
+    pub kind: RoleStmtKind,
+    /// Whether `IF NOT EXISTS` was specified.
+    pub if_not_exists: bool,
+    /// Role name.
+    pub name: Identifier,
+    /// Role attributes.
+    pub options: Vec<RoleOption>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `ALTER ROLE name [WITH] [options...]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlterRoleStmt {
+    /// Whether the statement used `ROLE` or `USER`.
+    pub kind: RoleStmtKind,
+    /// Role name.
+    pub name: Identifier,
+    /// Role attributes to change.
+    pub options: Vec<RoleOption>,
+    /// Source span.
+    pub span: Span,
+}
+
+/// `DROP ROLE [IF EXISTS] name [, ...]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DropRoleStmt {
+    /// Whether the statement used `ROLE` or `USER`.
+    pub kind: RoleStmtKind,
+    /// Whether `IF EXISTS` was specified.
+    pub if_exists: bool,
+    /// Role names.
+    pub names: Vec<Identifier>,
+    /// Whether `CASCADE` was specified.
+    pub cascade: bool,
     /// Source span.
     pub span: Span,
 }

@@ -2073,6 +2073,8 @@ pub struct Server {
     /// `Trust` accepts any startup, `Md5` runs a real password
     /// challenge with [`crate::auth::md5`].
     pub auth: AuthConfig,
+    /// Same-process role catalog backing role DDL and virtual auth views.
+    pub role_catalog: Arc<auth::InMemoryAuthCatalog>,
     /// Async pub-sub hub backing `LISTEN` / `NOTIFY` / `UNLISTEN`.
     ///
     /// Shared across every connection task: a `NOTIFY` issued on one
@@ -3143,6 +3145,7 @@ impl Server {
             catalog_snapshot,
             table_constraints: Arc::clone(&self.table_constraints),
             sequences: Arc::clone(&self.sequences),
+            role_catalog: Arc::clone(&self.role_catalog),
             persistent_catalog: Arc::clone(&self.persistent_catalog),
             time_partitions: Arc::clone(&self.time_partitions),
             workload_recorder: Arc::clone(&self.workload_recorder),
@@ -3269,6 +3272,7 @@ impl Server {
             wal_archive_config: WalArchiveConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,
+            role_catalog: Arc::new(auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
             notify_hub: Arc::new(notify::NotifyHub::new()),
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
@@ -3740,6 +3744,7 @@ impl Server {
             wal_archive_config: WalArchiveConfig::default(),
             two_phase,
             auth: AuthConfig::Trust,
+            role_catalog: Arc::new(auth::InMemoryAuthCatalog::with_bootstrap_superuser()),
             notify_hub: Arc::new(notify::NotifyHub::new()),
             cancel_registry: Arc::new(cancel::CancelRegistry::new()),
             next_pid: std::sync::atomic::AtomicU32::new(1),
@@ -6067,6 +6072,7 @@ fn run_plan_in_txn(
     catalog_snapshot: Arc<CatalogSnapshot>,
     table_constraints: Arc<dashmap::DashMap<ultrasql_core::Oid, Arc<TableRuntimeConstraints>>>,
     sequences: Arc<dashmap::DashMap<String, Arc<ultrasql_storage::sequence::Sequence>>>,
+    role_catalog: Arc<auth::InMemoryAuthCatalog>,
     persistent_catalog: Arc<PersistentCatalog>,
     time_partitions: Arc<dashmap::DashMap<String, Arc<time_partition::TimePartitionRuntime>>>,
     workload_recorder: Arc<workload::WorkloadRecorder>,
@@ -6106,6 +6112,7 @@ fn run_plan_in_txn(
         catalog_snapshot,
         table_constraints,
         sequences,
+        role_catalog,
         persistent_catalog,
         time_partitions,
         workload_recorder,

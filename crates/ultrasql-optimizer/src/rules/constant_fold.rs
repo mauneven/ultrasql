@@ -423,6 +423,9 @@ fn fold_plan(plan: &LogicalPlan) -> Result<Option<LogicalPlan>, OptimizeError> {
         | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::AlterRole { .. }
+        | LogicalPlan::DropRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

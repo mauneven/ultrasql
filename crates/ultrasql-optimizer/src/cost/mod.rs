@@ -310,6 +310,9 @@ impl<'s> CostModel<'s> {
             | LogicalPlan::CreateDomain { .. }
             | LogicalPlan::CreateIndex { .. }
             | LogicalPlan::CreatePolicy { .. }
+            | LogicalPlan::CreateRole { .. }
+            | LogicalPlan::AlterRole { .. }
+            | LogicalPlan::DropRole { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }
             | LogicalPlan::CreateSequence { .. }

@@ -312,6 +312,9 @@ fn lower_query_inner(
         | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::CreatePolicy { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::AlterRole { .. }
+        | LogicalPlan::DropRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }
@@ -561,6 +564,9 @@ fn profile_operator_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::CreateDomain { .. } => "CreateDomain",
         LogicalPlan::CreateIndex { .. } => "CreateIndex",
         LogicalPlan::CreatePolicy { .. } => "CreatePolicy",
+        LogicalPlan::CreateRole { .. } => "CreateRole",
+        LogicalPlan::AlterRole { .. } => "AlterRole",
+        LogicalPlan::DropRole { .. } => "DropRole",
         LogicalPlan::DropTable { .. } => "DropTable",
         LogicalPlan::AlterTable { .. } => "AlterTable",
         LogicalPlan::CreateSequence { .. } => "CreateSequence",
@@ -868,6 +874,7 @@ pub(super) fn lower_cte(
         catalog_snapshot: Arc::clone(&ctx.catalog_snapshot),
         table_constraints: Arc::clone(&ctx.table_constraints),
         sequences: Arc::clone(&ctx.sequences),
+        role_catalog: Arc::clone(&ctx.role_catalog),
         persistent_catalog: Arc::clone(&ctx.persistent_catalog),
         time_partitions: Arc::clone(&ctx.time_partitions),
         workload_recorder: Arc::clone(&ctx.workload_recorder),

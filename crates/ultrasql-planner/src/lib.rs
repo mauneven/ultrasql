@@ -39,10 +39,10 @@ pub use plan::{
     LogicalAlterTableAction, LogicalCheckConstraint, LogicalCommentTarget,
     LogicalForeignKeyConstraint, LogicalIndexMethod, LogicalIndexOption, LogicalJoinCondition,
     LogicalJoinType, LogicalOnConflict, LogicalPlan, LogicalReferentialAction, LogicalRlsCommand,
-    LogicalRlsPermissiveness, LogicalRlsPolicy, LogicalSequenceChange, LogicalSequenceOptions,
-    LogicalSetOp, LogicalSetQuantifier, LogicalSetVariableAction, LogicalTableOption,
-    LogicalTenantPolicyExpr, LogicalUniqueConstraint, LogicalWindowFunc, SortKey,
-    TxnIsolationLevel,
+    LogicalRlsPermissiveness, LogicalRlsPolicy, LogicalRoleKind, LogicalRoleOptions,
+    LogicalSequenceChange, LogicalSequenceOptions, LogicalSetOp, LogicalSetQuantifier,
+    LogicalSetVariableAction, LogicalTableOption, LogicalTenantPolicyExpr, LogicalUniqueConstraint,
+    LogicalWindowFunc, SortKey, TxnIsolationLevel,
 };
 
 #[cfg(test)]

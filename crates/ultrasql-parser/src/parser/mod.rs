@@ -29,7 +29,9 @@
 //! - `binary_ops` holds the binary-operator detection helpers used
 //!   by the Pratt loop (`peek_binary_op` and `consume_binary_op`).
 
-use crate::ast::{CreatePolicyStmt, Expr, PolicyCommand, PolicyPermissiveness, Statement};
+use crate::ast::{
+    CreatePolicyStmt, Expr, PolicyCommand, PolicyPermissiveness, RoleStmtKind, Statement,
+};
 use crate::lexer::{Lexer, LexerError};
 use crate::token::{Token, TokenKind};
 
@@ -373,11 +375,27 @@ impl<'src> Parser<'src> {
                 self.parse_create_policy(start)
                     .map(|s| Statement::CreatePolicy(Box::new(s)))
             }
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("role")) =>
+            {
+                self.parse_create_role(start, RoleStmtKind::Role)
+                    .map(|s| Statement::CreateRole(Box::new(s)))
+            }
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("user")) =>
+            {
+                self.parse_create_role(start, RoleStmtKind::User)
+                    .map(|s| Statement::CreateRole(Box::new(s)))
+            }
             TokenKind::KwSequence => self
                 .parse_create_sequence(start)
                 .map(|s| Statement::CreateSequence(Box::new(s))),
             other => Err(ParseError::Expected {
-                expected: "TABLE, TYPE, DOMAIN, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, AGGREGATING, POLICY, or SEQUENCE after CREATE",
+                expected: "TABLE, TYPE, DOMAIN, MATERIALIZED VIEW, SCHEMA, INDEX, UNIQUE, AGGREGATING, POLICY, ROLE, USER, or SEQUENCE after CREATE",
                 found: other,
                 offset: tok.span.start as usize,
             }),
@@ -505,14 +523,30 @@ impl<'src> Parser<'src> {
         let drop_tok = self.advance()?; // DROP
         let start = drop_tok.span.start;
 
-        let tok = self.peek()?;
+        let tok = *self.peek()?;
         match tok.kind {
             TokenKind::KwTable => self.parse_drop_table(start).map(Statement::DropTable),
             TokenKind::KwSchema => self.parse_drop_schema(start).map(Statement::DropSchema),
             TokenKind::KwIndex => self.parse_drop_index(start).map(Statement::DropIndex),
             TokenKind::KwSequence => self.parse_drop_sequence(start).map(Statement::DropSequence),
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("role")) =>
+            {
+                self.parse_drop_role(start, RoleStmtKind::Role)
+                    .map(Statement::DropRole)
+            }
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("user")) =>
+            {
+                self.parse_drop_role(start, RoleStmtKind::User)
+                    .map(Statement::DropRole)
+            }
             other => Err(ParseError::Expected {
-                expected: "TABLE, SCHEMA, INDEX, or SEQUENCE after DROP",
+                expected: "TABLE, SCHEMA, INDEX, SEQUENCE, ROLE, or USER after DROP",
                 found: other,
                 offset: tok.span.start as usize,
             }),
@@ -525,7 +559,7 @@ impl<'src> Parser<'src> {
         let alter_tok = self.advance()?; // ALTER
         let start = alter_tok.span.start;
 
-        let tok = self.peek()?;
+        let tok = *self.peek()?;
         match tok.kind {
             TokenKind::KwTable => self
                 .parse_alter_table(start)
@@ -533,8 +567,24 @@ impl<'src> Parser<'src> {
             TokenKind::KwSequence => self
                 .parse_alter_sequence(start)
                 .map(|s| Statement::AlterSequence(Box::new(s))),
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("role")) =>
+            {
+                self.parse_alter_role(start, RoleStmtKind::Role)
+                    .map(|s| Statement::AlterRole(Box::new(s)))
+            }
+            TokenKind::Identifier
+                if tok
+                    .text(self.source)
+                    .is_some_and(|text| text.eq_ignore_ascii_case("user")) =>
+            {
+                self.parse_alter_role(start, RoleStmtKind::User)
+                    .map(|s| Statement::AlterRole(Box::new(s)))
+            }
             other => Err(ParseError::Expected {
-                expected: "TABLE or SEQUENCE after ALTER",
+                expected: "TABLE, SEQUENCE, ROLE, or USER after ALTER",
                 found: other,
                 offset: tok.span.start as usize,
             }),

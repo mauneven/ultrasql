@@ -80,6 +80,9 @@ fn infer_into(
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::AlterRole { .. }
+        | LogicalPlan::DropRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }
@@ -400,6 +403,9 @@ pub(super) fn walk_plan_exprs<F: FnMut(&ScalarExpr)>(plan: &LogicalPlan, f: &mut
         | LogicalPlan::CreateTypeComposite { .. }
         | LogicalPlan::CreateDomain { .. }
         | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::AlterRole { .. }
+        | LogicalPlan::DropRole { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateSequence { .. }

@@ -2066,7 +2066,7 @@ same host.
   descriptor, and raw artifacts.
 
 ### Security
-- [ ] `CREATE ROLE / USER`, `ALTER ROLE`, `DROP ROLE`
+- [x] `CREATE ROLE / USER`, `ALTER ROLE`, `DROP ROLE` — in-memory role catalog plus `pg_roles` / `pg_user` visibility.
 - [ ] `GRANT / REVOKE` on tables, schemas, databases, sequences, functions
 - [ ] Column-level privileges
 - [ ] Role inheritance + `SET ROLE`

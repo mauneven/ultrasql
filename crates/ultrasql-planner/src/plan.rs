@@ -839,6 +839,46 @@ pub enum LogicalPlan {
         schema: Schema,
     },
 
+    /// `CREATE ROLE` / `CREATE USER`.
+    CreateRole {
+        /// Whether the statement used `ROLE` or `USER`.
+        kind: LogicalRoleKind,
+        /// Case-folded role name.
+        role_name: String,
+        /// Partial role attributes.
+        options: LogicalRoleOptions,
+        /// Whether `IF NOT EXISTS` was specified.
+        if_not_exists: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `ALTER ROLE` / `ALTER USER`.
+    AlterRole {
+        /// Whether the statement used `ROLE` or `USER`.
+        kind: LogicalRoleKind,
+        /// Case-folded role name.
+        role_name: String,
+        /// Partial role attributes to change.
+        options: LogicalRoleOptions,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
+    /// `DROP ROLE` / `DROP USER`.
+    DropRole {
+        /// Whether the statement used `ROLE` or `USER`.
+        kind: LogicalRoleKind,
+        /// Case-folded role names.
+        roles: Vec<String>,
+        /// Whether `IF EXISTS` was specified.
+        if_exists: bool,
+        /// Whether `CASCADE` was specified.
+        cascade: bool,
+        /// Always [`Schema::empty`].
+        schema: Schema,
+    },
+
     /// `CREATE SEQUENCE [IF NOT EXISTS] name ...`.
     CreateSequence {
         /// Case-folded sequence name.
@@ -1302,6 +1342,40 @@ pub struct LogicalSequenceChange {
     pub cycle: Option<bool>,
 }
 
+/// Role-management statement family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicalRoleKind {
+    /// `ROLE`.
+    Role,
+    /// `USER`, PostgreSQL shorthand for a login role.
+    User,
+}
+
+/// Partial role-attribute set from `CREATE ROLE` / `ALTER ROLE`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LogicalRoleOptions {
+    /// `SUPERUSER` / `NOSUPERUSER`.
+    pub superuser: Option<bool>,
+    /// `INHERIT` / `NOINHERIT`.
+    pub inherit: Option<bool>,
+    /// `CREATEROLE` / `NOCREATEROLE`.
+    pub create_role: Option<bool>,
+    /// `CREATEDB` / `NOCREATEDB`.
+    pub create_db: Option<bool>,
+    /// `LOGIN` / `NOLOGIN`.
+    pub can_login: Option<bool>,
+    /// `REPLICATION` / `NOREPLICATION`.
+    pub replication: Option<bool>,
+    /// `BYPASSRLS` / `NOBYPASSRLS`.
+    pub bypass_rls: Option<bool>,
+    /// `CONNECTION LIMIT`.
+    pub connection_limit: Option<i32>,
+    /// Password change. `Some(None)` means `PASSWORD NULL`.
+    pub password: Option<Option<String>>,
+    /// Raw `VALID UNTIL` timestamp text.
+    pub valid_until: Option<String>,
+}
+
 /// EXPLAIN output format selector, mirrored from
 /// [`ultrasql_parser::ast::ExplainFormat`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1532,6 +1606,9 @@ impl LogicalPlan {
                 | Self::CreateDomain { .. }
                 | Self::CreateIndex { .. }
                 | Self::CreatePolicy { .. }
+                | Self::CreateRole { .. }
+                | Self::AlterRole { .. }
+                | Self::DropRole { .. }
                 | Self::DropTable { .. }
                 | Self::AlterTable { .. }
                 | Self::CreateSequence { .. }
@@ -1589,6 +1666,9 @@ impl LogicalPlan {
             | Self::CreateDomain { .. }
             | Self::CreateIndex { .. }
             | Self::CreatePolicy { .. }
+            | Self::CreateRole { .. }
+            | Self::AlterRole { .. }
+            | Self::DropRole { .. }
             | Self::DropTable { .. }
             | Self::AlterTable { .. }
             | Self::CreateSequence { .. }
@@ -1637,6 +1717,9 @@ impl LogicalPlan {
             | Self::LockRows { schema, .. }
             | Self::CreateIndex { schema, .. }
             | Self::CreatePolicy { schema, .. }
+            | Self::CreateRole { schema, .. }
+            | Self::AlterRole { schema, .. }
+            | Self::DropRole { schema, .. }
             | Self::DropTable { schema, .. }
             | Self::AlterTable { schema, .. }
             | Self::CreateSequence { schema, .. }
@@ -2286,6 +2369,49 @@ impl LogicalPlan {
                         "CreatePolicy: {} ON {}\n",
                         policy.policy_name, policy.table_name
                     ),
+                );
+            }
+            Self::CreateRole {
+                kind,
+                role_name,
+                if_not_exists,
+                ..
+            } => {
+                out.push_str(&pad);
+                let ine = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+                let keyword = match kind {
+                    LogicalRoleKind::Role => "Role",
+                    LogicalRoleKind::User => "User",
+                };
+                let _ = fmt::write(out, format_args!("Create{keyword}{ine}: {role_name}\n"));
+            }
+            Self::AlterRole {
+                kind, role_name, ..
+            } => {
+                out.push_str(&pad);
+                let keyword = match kind {
+                    LogicalRoleKind::Role => "Role",
+                    LogicalRoleKind::User => "User",
+                };
+                let _ = fmt::write(out, format_args!("Alter{keyword}: {role_name}\n"));
+            }
+            Self::DropRole {
+                kind,
+                roles,
+                if_exists,
+                cascade,
+                ..
+            } => {
+                out.push_str(&pad);
+                let ie = if *if_exists { " IF EXISTS" } else { "" };
+                let csc = if *cascade { " CASCADE" } else { "" };
+                let keyword = match kind {
+                    LogicalRoleKind::Role => "Role",
+                    LogicalRoleKind::User => "User",
+                };
+                let _ = fmt::write(
+                    out,
+                    format_args!("Drop{keyword}{ie}: roles=[{}]{csc}\n", roles.join(", ")),
                 );
             }
             Self::CreateSequence {

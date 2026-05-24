@@ -152,8 +152,8 @@ fn virtual_rows(name: &str, ctx: &LowerCtx<'_>) -> Option<(Schema, Vec<Vec<Value
         "pg_catalog.pg_indexes" => Some((schema_pg_indexes(), rows_pg_indexes(ctx))),
         "pg_catalog.pg_views" => Some((schema_pg_views(), Vec::new())),
         "pg_catalog.pg_sequences" => Some((schema_pg_sequences(), rows_pg_sequences(ctx))),
-        "pg_catalog.pg_roles" => Some((schema_pg_roles(), rows_pg_roles())),
-        "pg_catalog.pg_user" => Some((schema_pg_user(), rows_pg_user())),
+        "pg_catalog.pg_roles" => Some((schema_pg_roles(), rows_pg_roles(ctx))),
+        "pg_catalog.pg_user" => Some((schema_pg_user(), rows_pg_user(ctx))),
         "pg_catalog.pg_settings" => Some((schema_pg_settings(), rows_pg_settings(ctx))),
         "pg_catalog.pg_stat_statements" => {
             Some((schema_pg_stat_statements(), rows_pg_stat_statements(ctx)))
@@ -1331,22 +1331,28 @@ fn schema_pg_roles() -> Schema {
     ])
 }
 
-fn rows_pg_roles() -> Vec<Vec<Value>> {
-    vec![vec![
-        v_text("ultrasql"),
-        Value::Bool(true),
-        Value::Bool(true),
-        Value::Bool(true),
-        Value::Bool(true),
-        Value::Bool(true),
-        Value::Bool(false),
-        Value::Bool(false),
-        Value::Int32(-1),
-        Value::Null,
-        Value::Null,
-        Value::Null,
-        Value::Int64(10),
-    ]]
+fn rows_pg_roles(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    ctx.role_catalog
+        .list_roles()
+        .into_iter()
+        .map(|role| {
+            vec![
+                v_text(&role.name),
+                Value::Bool(role.is_superuser),
+                Value::Bool(role.inherit),
+                Value::Bool(role.create_role),
+                Value::Bool(role.create_db),
+                Value::Bool(role.can_login),
+                Value::Bool(role.replication),
+                Value::Bool(role.bypass_rls),
+                Value::Int32(role.connection_limit),
+                masked_password_value(role.password.is_some()),
+                role.valid_until.map_or(Value::Null, Value::TimestampTz),
+                Value::Null,
+                Value::Int64(i64::from(role.oid)),
+            ]
+        })
+        .collect()
 }
 
 fn schema_pg_user() -> Schema {
@@ -1363,18 +1369,33 @@ fn schema_pg_user() -> Schema {
     ])
 }
 
-fn rows_pg_user() -> Vec<Vec<Value>> {
-    vec![vec![
-        v_text("ultrasql"),
-        Value::Int64(10),
-        Value::Bool(true),
-        Value::Bool(true),
-        Value::Bool(false),
-        Value::Bool(false),
-        Value::Null,
-        Value::Null,
-        Value::Null,
-    ]]
+fn rows_pg_user(ctx: &LowerCtx<'_>) -> Vec<Vec<Value>> {
+    ctx.role_catalog
+        .list_roles()
+        .into_iter()
+        .filter(|role| role.can_login)
+        .map(|role| {
+            vec![
+                v_text(&role.name),
+                Value::Int64(i64::from(role.oid)),
+                Value::Bool(role.create_db),
+                Value::Bool(role.is_superuser),
+                Value::Bool(role.replication),
+                Value::Bool(role.bypass_rls),
+                masked_password_value(role.password.is_some()),
+                role.valid_until.map_or(Value::Null, Value::TimestampTz),
+                Value::Null,
+            ]
+        })
+        .collect()
+}
+
+fn masked_password_value(has_password: bool) -> Value {
+    if has_password {
+        v_text("********")
+    } else {
+        Value::Null
+    }
 }
 
 fn schema_pg_settings() -> Schema {
