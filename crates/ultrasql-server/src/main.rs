@@ -1026,7 +1026,7 @@ mod tests {
     fn copy_restore_command(archive_dir: &Path) -> String {
         let source = powershell_single_quoted_path(&archive_dir.join("%f"));
         format!(
-            "powershell -NoProfile -NonInteractive -Command \"try {{ Copy-Item -LiteralPath {source} -Destination '%p' -Force -ErrorAction Stop; exit 0 }} catch {{ exit 1 }}\""
+            "powershell -NoProfile -NonInteractive -Command Copy-Item -LiteralPath {source} -Destination '%p' -Force -ErrorAction Stop"
         )
     }
 
